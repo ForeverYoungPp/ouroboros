@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import queue
 import threading
-import time
 from types import SimpleNamespace
 
 import ouroboros.loop as loop_mod
@@ -75,7 +74,13 @@ def test_drain_incoming_messages_preserves_image_payload():
 
 
 def test_owner_directives_survive_compaction_without_control_prose(tmp_path):
-    from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
+    from ouroboros import task_pacing
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.owner_mailbox import (
+        KIND_FINALIZE_NOW,
+        drain_owner_entries,
+        write_owner_message,
+    )
 
     ctx = SimpleNamespace()
     messages = [
@@ -90,6 +95,14 @@ def test_owner_directives_survive_compaction_without_control_prose(tmp_path):
         tmp_path, "deadline control", task_id="root", msg_id="control-1",
         kind=KIND_FINALIZE_NOW,
     )
+    control_entry = next(
+        row for row in drain_owner_entries(tmp_path, "root")
+        if row["msg_id"] == "control-1"
+    )
+    expected_deadline = (
+        parse_deadline_ts(control_entry["ts"]).timestamp()
+        + task_pacing.effective_finalization_reserve_sec(ctx)
+    )
 
     controls = _drain_incoming_messages(
         messages,
@@ -101,8 +114,9 @@ def test_owner_directives_survive_compaction_without_control_prose(tmp_path):
         owner_ctx=ctx,
     )
 
+    assert set(controls) == {"finalize_now", "finalize_deadline_ts"}
     assert controls["finalize_now"] == "deadline control"
-    assert time.time() < controls["finalize_deadline_ts"] <= time.time() + 121
+    assert controls["finalize_deadline_ts"] == expected_deadline
     assert [row["source"] for row in ctx._owner_directives] == [
         "initial_user", "direct_incoming", "owner_mailbox",
     ]
