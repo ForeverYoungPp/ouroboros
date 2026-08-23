@@ -46,6 +46,9 @@ SKILL_OWNER_STATE_FILENAMES = frozenset({
     "review_history.jsonl",
     "accepted_rebuttals.json",
     "clawhub.json",
+    # OuroborosHub publication receipt: forging it would fake a "published by
+    # this owner" fact that hub sync verdicts and adopt confirmations trust.
+    "ouroboroshub.json",
     "self_authored.json",
     "auth_token.json",
     # Owner/lifecycle state: forged deps.json would bypass dependency gates.
@@ -71,6 +74,7 @@ SKILL_OWNER_STATE_STEMS = (
     "accepted_rebuttals",
     "enabled",
     "clawhub",
+    "ouroboroshub",
     "deps",
     "self_authored",
     "auth_token",

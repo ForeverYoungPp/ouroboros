@@ -836,6 +836,14 @@ Publish never downloads the scanner automatically. Typed failures return the
 completed stage, external effects, and a repair hint; Ouroboros decides whether
 to inspect, repair, re-review, retry, clean up, or stop.
 
+A successful publication also writes a durable local receipt to
+`data/state/skills/<name>/ouroboroshub.json` (`published` section: slug,
+version, content hash, repository, PR number/url, timestamp). The receipt is
+best-effort: a write failure is disclosed as `publication_recorded: false` in
+the tool result and never cancels the real PR. The Skills UI reads it for the
+"Submitted PR #N" badge and the adopt confirmation copy; it survives
+uninstall and adopt, and a republish overwrites it.
+
 Publication succeeds only when the task records a validated pull-request
 receipt in the configured Hub repository for this exact skill. A branch,
 commit, refusal report, or unfinished attempt is partial progress, not

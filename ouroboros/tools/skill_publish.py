@@ -22,6 +22,7 @@ from ouroboros.config import (
     get_ouroboroshub_catalog_url,
 )
 from ouroboros.llm import LLMClient
+from ouroboros.marketplace.provenance import write_publication_record
 from ouroboros.skill_loader import SkillPayloadUnreadable, _sanitize_skill_name
 from ouroboros.skill_publish_eligibility import PUBLISHABLE_STATUSES
 from ouroboros.skill_publish_github import (
@@ -127,6 +128,7 @@ class _PublishAttempt:
         repair_hint: str = "",
         receipt: Mapping[str, Any] | None = None,
         expected_repository: str = "",
+        extra_fields: Mapping[str, Any] | None = None,
     ) -> str:
         return serialize_skill_publish_result(
             ok=ok,
@@ -144,6 +146,7 @@ class _PublishAttempt:
             repair_hint=repair_hint,
             receipt=receipt,
             expected_repository=expected_repository,
+            extra_fields=extra_fields,
         )
 
 
@@ -686,6 +689,42 @@ def _render_pr_body(
     return body_without_attestation.rstrip() + "\n\n" + attestation
 
 
+def _record_publication_receipt(
+    ctx: ToolContext, skill: str, version: str, receipt: Mapping[str, Any],
+) -> Tuple[bool, str]:
+    """Best-effort durable publication receipt beside the skill's review state.
+
+    Never raises; a write problem becomes ``(False, diagnostic)`` in the result
+    JSON instead of converting a real PR success into a failure. The mapping
+    mirrors the validated PR receipt (frozen contract).
+    """
+    try:
+        write_publication_record(canonical_data_root(ctx), skill, {
+            "slug": skill,
+            "version": str(version),
+            "content_hash": str(receipt.get("snapshot_hash") or "").lower(),
+            "repository": str(receipt.get("repository") or ""),
+            "pr_number": receipt.get("number"),
+            "pr_url": str(receipt.get("url") or ""),
+            "published_at": utc_now_iso(),
+        })
+        return True, ""
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"[:200]
+
+
+def _annotate_publication_recorded(serialized: str, recorded: bool, record_error: str) -> str:
+    """Add the receipt-write outcome beside the PR receipt; never raises."""
+    try:
+        envelope = json.loads(serialized)
+        envelope["publication_recorded"] = recorded
+        if not recorded:
+            envelope["publication_record_error"] = record_error
+        return json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return serialized
+
+
 def _submit_skill_to_hub(
     ctx: ToolContext,
     skill: str,
@@ -876,13 +915,44 @@ def _submit_skill_to_hub(
             branch=branch,
             commit_sha=commit_sha,
         )
-        return attempt.result(
+        serialized = attempt.result(
             ok=True,
             status="pr_opened",
             reason_code="",
             receipt=receipt,
             expected_repository=expected_repository,
         )
+        # State-plane receipt write happens only AFTER serializer receipt
+        # validation — and maps from the VALIDATED envelope receipt (canonical
+        # repository spelling, normalized fields), never the raw input.
+        try:
+            validated_receipt = json.loads(serialized).get("receipt") or receipt
+        except Exception:
+            validated_receipt = receipt
+        recorded, record_error = _record_publication_receipt(
+            ctx, safe_skill, snapshot.manifest.version, validated_receipt,
+        )
+        try:
+            # Re-serialize with the annotation INSIDE the cap loop so the added
+            # fields participate in findings trimming (a post-hoc append could
+            # push a just-under-cap envelope past the transport limit and get
+            # head-truncated into invalid JSON).
+            extra: Dict[str, Any] = {"publication_recorded": recorded}
+            if not recorded:
+                extra["publication_record_error"] = record_error
+            return attempt.result(
+                ok=True,
+                status="pr_opened",
+                reason_code="",
+                receipt=receipt,
+                expected_repository=expected_repository,
+                extra_fields=extra,
+            )
+        except Exception:
+            # Never lose a real PR success: fall back to the bounded post-hoc
+            # annotation (which itself never raises and never exceeds the cap
+            # by more than the annotation bytes).
+            return _annotate_publication_recorded(serialized, recorded, record_error)
     except SkillPublishSnapshotError as exc:
         return attempt.result(
             ok=False,

@@ -8,6 +8,7 @@ import inspect
 import logging
 import pathlib
 import shutil
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -53,7 +54,11 @@ _CHILD_DISPATCH_HEADER_DENYLIST = {
     "x-auth-token",
 }
 _CHILD_DISPATCH_BODY_CAP = 512 * 1024
-_OFFICIAL_HUB_VERIFIED_HINT_CACHE: dict[tuple[str, str], bool] = {}
+# (name, content_hash) -> (verdict, monotonic stamp). TTL-bounded: the verdict
+# also depends on the LIVE catalog, so an unexpiring memo could keep claiming
+# "published" after the hub advanced or dropped the slug (final-gate finding).
+_OFFICIAL_HUB_VERIFIED_HINT_CACHE: dict[tuple[str, str], tuple[bool, float]] = {}
+_OFFICIAL_HUB_VERIFIED_TTL_SEC = 300.0
 
 
 def _passive_submit_hub(
@@ -122,14 +127,23 @@ def _review_fields(
     if source == "ouroboroshub":
         try:
             key = (str(getattr(loaded, "name", "") or ""), str(getattr(loaded, "content_hash", "") or ""))
-            if key[0] and key[1] and key in _OFFICIAL_HUB_VERIFIED_HINT_CACHE:
-                official_hub_verified = _OFFICIAL_HUB_VERIFIED_HINT_CACHE[key]
+            cached = _OFFICIAL_HUB_VERIFIED_HINT_CACHE.get(key) if key[0] and key[1] else None
+            now = time.monotonic()
+            if cached is not None and (now - cached[1]) < _OFFICIAL_HUB_VERIFIED_TTL_SEC:
+                official_hub_verified = cached[0]
             else:
                 from ouroboros.skill_review import is_official_hub_payload_verified
 
                 official_hub_verified = bool(is_official_hub_payload_verified(loaded))
                 if key[0] and key[1]:
-                    _OFFICIAL_HUB_VERIFIED_HINT_CACHE[key] = official_hub_verified
+                    # Evict expired entries so superseded content hashes do
+                    # not accumulate across skill revisions.
+                    for stale_key in [
+                        k for k, (_, at) in _OFFICIAL_HUB_VERIFIED_HINT_CACHE.items()
+                        if (now - at) >= _OFFICIAL_HUB_VERIFIED_TTL_SEC
+                    ]:
+                        _OFFICIAL_HUB_VERIFIED_HINT_CACHE.pop(stale_key, None)
+                    _OFFICIAL_HUB_VERIFIED_HINT_CACHE[key] = (official_hub_verified, now)
         except Exception:
             official_hub_verified = False
     owner_attestable = (
@@ -307,9 +321,10 @@ def _build_extensions_index(drive_root, repo_path):
 
     # Inline ClawHub provenance so Installed UI avoids a second round-trip.
     try:
-        from ouroboros.marketplace.provenance import read_provenance
+        from ouroboros.marketplace.provenance import read_provenance, read_publication_record
     except Exception:  # pragma: no cover — defensive
         read_provenance = lambda *_a, **_kw: None  # type: ignore[assignment]
+        read_publication_record = lambda *_a, **_kw: (None, None)  # type: ignore[assignment]
     marketplace_enabled = True
 
     catalog = []
@@ -360,12 +375,19 @@ def _build_extensions_index(drive_root, repo_path):
             "is_self_authored": bool(getattr(s, "is_self_authored", False)),
             # Keep source explicit so marketplace skills are not mislabeled native.
             "source": s.source,
+            # Loader payload hash (§7.2): the hub UI's CAS/sync fact. Empty for
+            # broken/collision rows, whose loader hash never existed.
+            "content_hash": str(getattr(s, "content_hash", "") or ""),
             "payload_root": payload_root,
             "installed_at": _path_installed_at(s.skill_dir),
         }
         if bool(getattr(s, "identity_collision", False)):
             stale = True
             gate = skill_review_gate(s.review.status, stale=stale)
+            # Serialize the collision fact itself: hub_sync must fail closed
+            # (no-action conflict card) instead of first-wins joining one of
+            # several same-name occupants (scope-review reproduction).
+            entry["identity_collision"] = True
             entry.update({
                 "review_status": s.review.status,
                 "review_stale": stale,
@@ -416,6 +438,16 @@ def _build_extensions_index(drive_root, repo_path):
         presence_runtime = presence_runtime_card_projection(drive_root, s)
         if presence_runtime is not None:
             entry["presence_runtime"] = presence_runtime
+        # Durable OuroborosHub publication receipt (state-plane, survives bucket
+        # moves). Collision rows above deliberately never read state, so these
+        # fields are absent there. published=null when no valid record exists;
+        # published_malformed=true when the file exists but fails validation.
+        try:
+            published, published_diagnostic = read_publication_record(drive_root, s.name)
+        except Exception:  # pragma: no cover — defensive
+            published, published_diagnostic = None, None
+        entry["published"] = published
+        entry["published_malformed"] = published_diagnostic is not None
         if s.source == "clawhub":
             try:
                 prov = read_provenance(drive_root, s.name) or {}

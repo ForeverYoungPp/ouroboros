@@ -601,6 +601,22 @@
  * @property {string[]=} permissions
  * @property {string[]=} conflicts
  * @property {{code: "skill_conflict", skills: string[], omitted: number}=} conflict
+ * @property {string} content_hash
+ * @property {?{slug: string, version: string, content_hash: string, repository: string, pr_number: number, pr_url: string, published_at: string}=} published
+ * @property {boolean=} published_malformed
+ * @property {boolean=} identity_collision
+ */
+
+/**
+ * One `/api/marketplace/ouroboroshub/catalog` result row (additive hubflow fields).
+ * `POST /api/marketplace/ouroboroshub/install` additionally accepts the adopt
+ * body fields `{adopt: true, expected_content_hash: string}` (64 lowercase hex;
+ * adopt forces auto_review and conflicts with overwrite).
+ * @typedef {Object} HubCatalogRow
+ * @property {string} slug
+ * @property {string} sanitized_name
+ * @property {string} latest_version
+ * @property {boolean} identity_conflict
  */
 
 /**

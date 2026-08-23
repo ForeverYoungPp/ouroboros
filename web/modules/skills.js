@@ -12,6 +12,7 @@ import {
     boundedText,
     emitSkillLifecycle,
     escapeHtmlAttr as escapeHtml,
+    fetchJson,
     grantReady,
     renderSkillRepairPrompt,
     reviewTone,
@@ -75,6 +76,40 @@ function sortSkillsForDisplay(skills) {
         return installedTime(b) - installedTime(a) || String(a.name || '').localeCompare(String(b.name || ''));
     });
 }
+
+
+// OuroborosHub catalog snapshot for the display-only My-skills sync badges
+// (hub_sync verdict). Fetched once per Skills page open and reused across
+// re-renders; fail-soft — a failed fetch only hides catalog-derived badges.
+const hubCatalog = { promise: null, available: false, byName: new Map(), generation: 0 };
+
+function loadHubCatalog(force = false) {
+    if (force) hubCatalog.promise = null;
+    if (!hubCatalog.promise) {
+        // Generation guard: only the NEWEST request may commit its snapshot,
+        // so a slow older response cannot overwrite fresher catalog state.
+        const generation = ++hubCatalog.generation;
+        hubCatalog.promise = fetchJson('/api/marketplace/ouroboroshub/catalog')
+            .then((data) => {
+                if (generation !== hubCatalog.generation) return;
+                const byName = new Map();
+                for (const row of data.results || []) {
+                    const key = String(row.sanitized_name || row.slug || '');
+                    if (key && !byName.has(key)) byName.set(key, row);
+                }
+                hubCatalog.byName = byName;
+                hubCatalog.available = true;
+            })
+            .catch(() => {
+                if (generation !== hubCatalog.generation) return;
+                hubCatalog.byName = new Map();
+                hubCatalog.available = false;
+            });
+    }
+    return hubCatalog.promise;
+}
+
+let skillsRenderGeneration = 0;
 
 
 async function fetchSkills() {
@@ -193,6 +228,10 @@ function updateQueueBadges(events) {
 
 
 async function renderSkillsList(container, emptyEl, reviewingSkills = new Set(), repairingSkills = new Set()) {
+    // The hub catalog is display-only badge enrichment: it must never gate the
+    // local cards (a cold external fetch can take the full server timeout).
+    const renderGeneration = ++skillsRenderGeneration;
+    const catalogSettled = loadHubCatalog();
     const { skillsRepoConfigured, githubTokenConfigured, skills, live } = await fetchSkills();
     if (!skills.length && !skillsRepoConfigured) {
         container.innerHTML = '';
@@ -200,14 +239,27 @@ async function renderSkillsList(container, emptyEl, reviewingSkills = new Set(),
         return;
     }
     if (emptyEl) emptyEl.hidden = true;
-    container.innerHTML = sortSkillsForDisplay(skills).map((skill) => renderInstalledSkillCard(
-        skill,
-        reviewingSkills,
-        repairingSkills,
-        live,
-        { githubTokenConfigured },
-    )).join('')
-        || '<div class="muted">No skills yet. Add one from <b>ClawHub</b> or <b>OuroborosHub</b>.</div>';
+    const paint = () => {
+        container.innerHTML = sortSkillsForDisplay(skills).map((skill) => renderInstalledSkillCard(
+            skill,
+            reviewingSkills,
+            repairingSkills,
+            live,
+            {
+                githubTokenConfigured,
+                hubCatalogByName: hubCatalog.byName,
+                hubCatalogAvailable: hubCatalog.available,
+            },
+        )).join('')
+            || '<div class="muted">No skills yet. Add one from <b>ClawHub</b> or <b>OuroborosHub</b>.</div>';
+    };
+    paint();
+    catalogSettled.then(() => {
+        // Repaint only for the CURRENT render generation and a mounted
+        // container — an older render's stale skills array must never
+        // overwrite a newer paint (final-gate race finding).
+        if (renderGeneration === skillsRenderGeneration && container.isConnected) paint();
+    }).catch(() => {});
 }
 
 
@@ -667,9 +719,9 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
                 const source = target.dataset.source === 'ouroboroshub' ? 'ouroboroshub' : 'clawhub';
                 showToast(`${name}: updating from ${source === 'ouroboroshub' ? 'OuroborosHub' : 'ClawHub'} (this may take ~30s)`, 'muted');
                 const url = source === 'ouroboroshub'
-                    ? `/api/marketplace/ouroboroshub/install`
+                    ? `/api/marketplace/ouroboroshub/update/${encodeURIComponent(name)}`
                     : `/api/marketplace/clawhub/update/${encodeURIComponent(name)}`;
-                const body = source === 'ouroboroshub' ? { slug: name, overwrite: true, auto_review: true } : {};
+                const body = {};
                 const result = await postWithFeedback(url, body);
                 const tail = result.review_status ? ` — review ${result.review_status}` : '';
                 showToast(
@@ -855,6 +907,8 @@ export function initSkills(ctx) {
 
     window.addEventListener('ouro:page-shown', (event) => {
         if (event.detail?.page === 'skills') {
+            // Fresh catalog snapshot once per page open; re-renders reuse it.
+            loadHubCatalog(true);
             renderFn();
         }
     });
