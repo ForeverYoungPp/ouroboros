@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import pathlib
 import shutil
 import tempfile
@@ -13,10 +14,15 @@ import urllib.request
 
 from ouroboros.marketplace import AllowlistRedirectHandler
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import get_ouroboroshub_catalog_url, get_ouroboroshub_skills_dir
 from ouroboros.marketplace.fetcher import FetchError, land_staged_tree
+from ouroboros.marketplace.install import (
+    discard_payload_snapshot,
+    restore_payload_state,
+    snapshot_payload_state,
+)
 from ouroboros.marketplace.install_specs import install_specs_hash
 from ouroboros.marketplace.isolated_deps import DEPS_STATE_FILENAME, read_deps_state
 from ouroboros.skill_dependencies import normalize_declared_dependency_specs
@@ -25,7 +31,9 @@ from ouroboros.skill_loader import (
     _skill_location_conflict_error,
     skill_state_dir,
 )
-from ouroboros.utils import atomic_write_json, utc_now_iso
+from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
+
+log = logging.getLogger(__name__)
 
 
 _MAX_CATALOG_BYTES = 2 * 1024 * 1024
@@ -371,3 +379,163 @@ def uninstall(sanitized_name: str) -> HubInstallResult:
     except Exception:
         pass
     return HubInstallResult(True, name, target_dir=target)
+
+
+def serialize_hub_install_result(result: HubInstallResult) -> Dict[str, Any]:
+    """Project a :class:`HubInstallResult` into the gateway's JSON payload."""
+    payload: Dict[str, Any] = {
+        "ok": result.ok,
+        "sanitized_name": result.sanitized_name,
+        "error": result.error,
+        "provenance": result.provenance,
+        "summary": result.summary.to_dict() if result.summary else None,
+    }
+    if result.target_dir is not None:
+        payload["target_dir"] = str(result.target_dir)
+    return payload
+
+
+async def run_hub_update(
+    name: str,
+    *,
+    drive_root: pathlib.Path,
+    progress: Any,
+    run_blocking: Callable[..., Any],
+    apply_review_and_deps: Callable[[Dict[str, Any], str], Any],
+) -> Dict[str, Any]:
+    """Update-transaction body for the gateway's OuroborosHub update endpoint.
+
+    ``run_blocking`` (the lifecycle thread bridge) and ``apply_review_and_deps``
+    (the shared review/deps orchestration) are injected by the gateway so their
+    HTTP-layer seams — and the test monkeypatch points on the gateway module —
+    stay authoritative.
+    """
+    from ouroboros.skill_loader import review_status_allows_execution
+
+    drive_root = pathlib.Path(drive_root)
+    target_dir = drive_root / "skills" / "ouroboroshub" / name
+    marker = target_dir / ".ouroboroshub.json"
+    if not target_dir.exists():
+        return serialize_hub_install_result(
+            HubInstallResult(
+                False,
+                name,
+                error=f"{name} is not installed",
+            )
+        )
+    if not marker.is_file():
+        return serialize_hub_install_result(
+            HubInstallResult(
+                False,
+                name,
+                error="missing OuroborosHub provenance marker",
+                target_dir=target_dir,
+            )
+        )
+    marker_data = read_json_dict(marker) or {}
+    marker_name = str(marker_data.get("sanitized_name") or "").strip()
+    marker_slug = str(marker_data.get("slug") or "").strip()
+    if (
+        marker_data.get("schema_version") != 1
+        or str(marker_data.get("source") or "") != "ouroboroshub"
+        or marker_name != name
+        or not marker_slug
+        or _sanitize_skill_name(marker_slug) != name
+    ):
+        return serialize_hub_install_result(
+            HubInstallResult(
+                False,
+                name,
+                error="invalid OuroborosHub provenance marker",
+                target_dir=target_dir,
+            )
+        )
+    rollback_snapshot = snapshot_payload_state(drive_root, name, target_dir)
+    was_live = False
+
+    async def _restore_previous_live(log_label: str) -> None:
+        if not was_live:
+            return
+        try:
+            from ouroboros.config import load_settings
+            from ouroboros.extension_loader import reconcile_extension
+
+            await run_blocking(
+                reconcile_extension,
+                name,
+                drive_root,
+                load_settings,
+                log_label=log_label,
+            )
+        except Exception:
+            log.debug("OuroborosHub failed-update re-reconcile failed for %s", name, exc_info=True)
+
+    try:
+        try:
+            from ouroboros.extension_loader import is_extension_live, unload_extension
+
+            was_live = bool(is_extension_live(name, drive_root))
+            progress.set("Unloading existing extension…")
+            await run_blocking(
+                unload_extension,
+                name,
+                log_label="OuroborosHub update extension unload lifecycle operation",
+            )
+        except Exception:
+            log.debug("OuroborosHub pre-update extension unload failed for %s", name, exc_info=True)
+        progress.set("Downloading from OuroborosHub…")
+        result = await run_blocking(
+            install,
+            marker_slug,
+            overwrite=True,
+            log_label="OuroborosHub update lifecycle operation",
+        )
+        payload = serialize_hub_install_result(result)
+        if result.ok:
+            status, error, deps_status = await apply_review_and_deps(payload, result.sanitized_name)
+            if was_live and review_status_allows_execution(status) and not error and deps_status != "failed":
+                try:
+                    from ouroboros.config import load_settings
+                    from ouroboros.extension_loader import reconcile_extension
+
+                    progress.set("Reloading extension…")
+                    live_state = await run_blocking(
+                        reconcile_extension,
+                        result.sanitized_name,
+                        drive_root,
+                        load_settings,
+                        log_label="OuroborosHub update extension reload lifecycle operation",
+                    )
+                    payload.update({
+                        "extension_action": live_state.get("action"),
+                        "extension_reason": live_state.get("reason"),
+                    })
+                except Exception:
+                    log.debug("OuroborosHub post-update reconcile failed for %s", name, exc_info=True)
+            if deps_status == "failed" or error or not review_status_allows_execution(status):
+                restore_payload_state(rollback_snapshot)
+                payload["rolled_back"] = True
+                await _restore_previous_live("OuroborosHub non-executable update restore lifecycle operation")
+            else:
+                discard_payload_snapshot(rollback_snapshot)
+        elif was_live:
+            restore_payload_state(rollback_snapshot)
+            payload["rolled_back"] = True
+            await _restore_previous_live("OuroborosHub failed-update extension restore lifecycle operation")
+        else:
+            discard_payload_snapshot(rollback_snapshot)
+        return payload
+    except Exception as exc:
+        restore_payload_state(rollback_snapshot)
+        await _restore_previous_live("OuroborosHub exception-update extension restore lifecycle operation")
+        log.warning("OuroborosHub update failed after snapshot for %s", name, exc_info=True)
+        payload = serialize_hub_install_result(
+            HubInstallResult(
+                False,
+                name,
+                error=f"Update failed: {type(exc).__name__}: {exc}",
+                target_dir=target_dir,
+            )
+        )
+        payload["rolled_back"] = True
+        return payload
