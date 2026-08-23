@@ -216,6 +216,9 @@ class ChatOutbound(TypedDict):
     project_name: NotRequired[str]
     # Present on some transport re-broadcast paths.
     chat_id: NotRequired[int]
+    # Server-stamped when chat_id is a reserved Project thread: Main never
+    # adopts it, even before the browser has learned the project.
+    project_thread: NotRequired[bool]
 
 
 class PhotoOutbound(TypedDict):
@@ -234,6 +237,9 @@ class PhotoOutbound(TypedDict):
     client_message_id: NotRequired[str]
     transport: NotRequired[TransportMetadata]
     chat_id: NotRequired[int]
+    # Server-stamped when chat_id is a reserved Project thread: Main never
+    # adopts it, even before the browser has learned the project.
+    project_thread: NotRequired[bool]
     # Deprecated compatibility field: runtime emits ``transport`` instead.
     telegram_chat_id: NotRequired[int]
 
@@ -254,6 +260,9 @@ class VideoOutbound(TypedDict):
     client_message_id: NotRequired[str]
     transport: NotRequired[TransportMetadata]
     chat_id: NotRequired[int]
+    # Server-stamped when chat_id is a reserved Project thread: Main never
+    # adopts it, even before the browser has learned the project.
+    project_thread: NotRequired[bool]
     # Deprecated compatibility field: runtime emits ``transport`` instead.
     telegram_chat_id: NotRequired[int]
 
@@ -279,6 +288,9 @@ class DocumentOutbound(TypedDict):
     client_message_id: NotRequired[str]
     transport: NotRequired[TransportMetadata]
     chat_id: NotRequired[int]
+    # Server-stamped when chat_id is a reserved Project thread: Main never
+    # adopts it, even before the browser has learned the project.
+    project_thread: NotRequired[bool]
     # Deprecated compatibility field: runtime emits ``transport`` instead.
     telegram_chat_id: NotRequired[int]
 
@@ -291,6 +303,9 @@ class TypingOutbound(TypedDict):
     # Multi-project: stamps the thread so the client fan-out routes a project
     # task's typing indicator to its panel instead of defaulting to main.
     chat_id: NotRequired[int]
+    # Server-stamped when chat_id is a reserved Project thread: Main never
+    # adopts it, even before the browser has learned the project.
+    project_thread: NotRequired[bool]
     activity_id: NotRequired[str]
     client_message_id: NotRequired[str]
     phase: NotRequired[str]
@@ -308,6 +323,9 @@ class LogOutbound(TypedDict):
     # Multi-project: surfaced at top level so live task progress routes to the
     # owning project panel (and mirrors into main) by thread.
     chat_id: NotRequired[int]
+    # Server-stamped when chat_id is a reserved Project thread: Main never
+    # adopts it, even before the browser has learned the project.
+    project_thread: NotRequired[bool]
 
 
 class HeartbeatOutbound(TypedDict):

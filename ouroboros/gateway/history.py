@@ -487,6 +487,8 @@ def _annotate_terminal_task_truth(
     combined: list[Dict[str, Any]],
     data_dir: pathlib.Path,
     result_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+    floor: str = "",
+    active_children: Optional[set] = None,
 ) -> None:
     """Project bounded terminal truth and legacy child identity onto replay rows.
 
@@ -498,7 +500,15 @@ def _annotate_terminal_task_truth(
     then have evicted, leaving the surviving in-window card without the truth.
 
     ``result_cache`` (task_id -> effective result) lets the endpoint share the
-    task_results reads already performed by the pre-floor lineage pass."""
+    task_results reads already performed by the pre-floor lineage pass.
+
+    ``floor``/``active_children`` (already computed by ``_apply_window_quotas``)
+    extend the progress-stream lineage recency floor to chat FINALS: a
+    non-progress subagent row older than the floor whose child is not active
+    loses its lineage identity (raw fields stripped, legacy injection undone),
+    so an aged swarm's final cannot re-mint an orphaned "Working" parent card
+    on reload. Uses ONLY the floor + the pre-computed active set — zero extra
+    ``task_results`` reads."""
 
     try:
         from ouroboros.task_status import FINAL_STATUSES
@@ -581,6 +591,7 @@ def _annotate_terminal_task_truth(
             if previous is None or str(message.get("ts") or "") >= str(previous.get("ts") or ""):
                 latest_progress_by_task[task_id] = message
 
+        active = active_children or set()
         for message in combined:
             task_id = str(message.get("task_id") or "")
             if not task_id:
@@ -602,6 +613,25 @@ def _annotate_terminal_task_truth(
                 message.update(terminal_truth_by_task.get(task_id) or {})
             if (message.get("is_progress") or is_summary) and task_id in suggested_name_by_task:
                 message["suggested_name"] = suggested_name_by_task[task_id]
+            # Floor-symmetric closed lineage window for chat FINALS: strip runs
+            # AFTER the legacy setdefault injection above as the LAST writer —
+            # a strip before the legacy_final_task_ids scan would re-qualify
+            # the de-roled row for revival. (The active_children clause is
+            # load-bearing for mid-run child SPEECH rows (every child chat row
+            # carries lineage, not only finals) and symmetric with the progress
+            # floor; for terminal finals the clause is naturally unreachable.
+            # do not "simplify" it away.)
+            stale = (
+                not message.get("is_progress")
+                and str(message.get("delegation_role") or "").lower() == "subagent"
+                and bool(floor)
+                and str(message.get("ts") or "") < floor
+                and task_id not in active
+            )
+            if stale:
+                for key in SUBAGENT_MESSAGE_FIELDS:
+                    message.pop(key, None)
+                log.debug("Stripped stale subagent lineage from chat final %s", task_id)
     except Exception as exc:
         log.debug("Failed to annotate terminal task status in history: %s", exc)
 
@@ -957,11 +987,13 @@ def _apply_window_quotas(
     combined: list,
     n_human: int,
     n_progress: int,
-) -> tuple[list, Dict[str, Dict[str, Any]], bool, bool]:
+) -> tuple[list, Dict[str, Dict[str, Any]], bool, bool, str, set]:
     """Quota slicing, origin fallback, and the lineage floor/cap (perf2 P3).
 
-    Returns ``(messages, result_cache, human_rows_dropped, lineage_truncated)``
-    for the annotation pass and the window metadata.
+    Returns ``(messages, result_cache, human_rows_dropped, lineage_truncated,
+    floor, active_children)`` for the annotation pass and the window metadata
+    (the last two feed the chat-final lineage strip in
+    ``_annotate_terminal_task_truth``).
     """
     # Tail human conversation and progress telemetry with SEPARATE quotas so a
     # burst of progress messages can never push the user's real conversation out
@@ -1044,7 +1076,10 @@ def _apply_window_quotas(
         lineage = lineage[-_LINEAGE_CAP:]  # keep the most recent lineage events
     progress_tail = lineage + other_tail
     messages = sorted(human_tail + progress_tail, key=lambda m: m.get("ts", ""))
-    return messages, result_cache, human_rows_dropped, lineage_truncated
+    return (
+        messages, result_cache, human_rows_dropped, lineage_truncated,
+        floor, active_children,
+    )
 
 
 def _window_metadata(
@@ -1125,7 +1160,7 @@ def _assemble_history_response(
     lifecycle_row = _active_lifecycle_row()
     if lifecycle_row is not None:
         combined.append(lifecycle_row)
-    messages, result_cache, human_rows_dropped, lineage_truncated = (
+    messages, result_cache, human_rows_dropped, lineage_truncated, floor, active_children = (
         _apply_window_quotas(
             data_dir, thread_id, project_chat_ids, combined, n_human, n_progress
         )
@@ -1139,7 +1174,10 @@ def _assemble_history_response(
     # Runs AFTER the quota slice — on the rows actually emitted — so the
     # response pays only for in-window task ids and the truth always lands on
     # a row the client will see (see _annotate_terminal_task_truth).
-    _annotate_terminal_task_truth(messages, data_dir, result_cache=result_cache)
+    _annotate_terminal_task_truth(
+        messages, data_dir, result_cache=result_cache,
+        floor=floor, active_children=active_children,
+    )
 
     # Background consciousness writes no task_result, so its progress would
     # otherwise replay as a perpetual "thinking" card after reload. Mark its

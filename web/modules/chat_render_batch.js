@@ -115,7 +115,8 @@ export function orderBatchNodes(nodes) {
  * One rebuildAll replay batch: collects top-level nodes destined for the feed
  * (instead of per-row live-DOM chronological insertion), remembers which live
  * cards need their one final meta/count/layout pass, and defers the per-frame
- * typing/status writes to a single application after the mount.
+ * typing-indicator write to a single application after the mount (the header
+ * badge is written only by chat.js's status reducer, once after the batch).
  *
  * mount() performs the ONE DOM insertion of the whole replay: a stable sort,
  * one detached fragment, one insertBefore ahead of the typing indicator
@@ -128,7 +129,6 @@ export function createRebuildBatch(doc = null) {
     const touched = new Set();
     return {
         touched,
-        status: null,
         typingHidden: false,
         collect(node) {
             if (!node || seen.has(node)) return;

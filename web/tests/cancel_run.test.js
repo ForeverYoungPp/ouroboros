@@ -158,7 +158,10 @@ test('a timeout-retry root gains Cancel run: the host marker is the truth', () =
     assert.match(chat, /grantCancelAuthority && msg\?\.cancelable === true && msg\?\.task_id/);
     // Project-owned progress is now panel-local; Main only accepts its typed
     // terminal completion projection, so the old `!isMirror` branch is gone.
-    assert.match(chat, /const isMyThread = \(msg\) => \{[\s\S]{0,260}return !isKnownProjectFrame\(msg\);/);
+    // Main's gate is the pure mainThreadAccepts predicate (server project_thread
+    // stamp + known project set) — behaviour is node-tested in
+    // chat_thread_routing.test.js; here we pin only that Main routes through it.
+    assert.match(chat, /const isMyThread = \(msg\) => \{[\s\S]{0,260}return mainThreadAccepts\(msg, state\.projectChatIds\);/);
     assert.match(chat, /updateLiveCardFromProgressMessage\(msg, \{ grantCancelAuthority: true \}\)/);
     assert.doesNotMatch(chat, /frameRoot === taskId\) *&&[\s\S]{0,80}markTaskCancelable/);
     // ...and the eligibility reducer still refuses subagent/finished/reusable cards,

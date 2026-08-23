@@ -79,6 +79,9 @@ jobs:
       # so carried the same marker — so a provisioning miss looked like a green
       # run with a dozen quiet skips. The flag turns that into one loud failure.
       OUROBOROS_PREFLIGHT_REQUIRE_PLUGINS: "1"
+      # Same contract for the gate's node lane: this job provisions node 22, so
+      # the real-spawn node-lane tests must run here rather than skip.
+      OUROBOROS_PREFLIGHT_REQUIRE_NODE: "1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -101,6 +104,11 @@ jobs:
           git diff --exit-code -- docs/
       - name: Lint (deterministic F-rule gate — catches the NameError-under-except class)
         run: python -m ruff check . --select F
+      # The hermetic commit gate runs this exact suite (ouroboros/preflight_node.py);
+      # keeping the step here keeps gate and CI mirrored in both directions.
+      - name: Run browser-module tests (node --test — mirrored by the hermetic commit gate)
+        shell: bash
+        run: cd web && node --test tests/*.test.js
       # NOTE: a command-line `-m` REPLACES the pyproject `addopts` markexpr, so the default
       # `not integration and not browser ...` exclusions must be repeated here, then ANDed with
       # the serial split. --timeout guards against a hung test blocking the whole job.
@@ -143,11 +151,21 @@ jobs:
       # plugins, so the preflight gate's real-spawn regressions must run rather
       # than skip themselves into invisibility.
       OUROBOROS_PREFLIGHT_REQUIRE_PLUGINS: "1"
+      # ...and node 22 below, so the gate's real-spawn node-lane tests must run.
+      OUROBOROS_PREFLIGHT_REQUIRE_NODE: "1"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: ./.github/actions/setup-python-env
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      # The hermetic commit gate runs this exact suite (ouroboros/preflight_node.py);
+      # `shell: bash` keeps the glob working on the Windows runner too.
+      - name: Run browser-module tests (node --test — mirrored by the hermetic commit gate)
+        shell: bash
+        run: cd web && node --test tests/*.test.js
       # A command-line `-m` REPLACES the pyproject addopts markexpr, so repeat the default
       # marker-lane exclusions and AND them with the serial split. --timeout guards hangs.
       - name: Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)

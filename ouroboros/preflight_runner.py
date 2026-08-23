@@ -14,6 +14,12 @@ import time
 import uuid
 from typing import NamedTuple, Optional, Sequence
 
+# Node lane of the gate (`run_hermetic_pytest` calls it once the candidate is
+# assembled, as the first consumer of the shared budget): content-keyed on the
+# candidate's web/tests/*.test.js — see ouroboros/preflight_node.py. Imported
+# by name so tests/operators can stub `preflight_runner.run_node_tests`.
+from ouroboros.preflight_node import run_node_tests
+
 
 DEFAULT_PYTEST_ARGS = ["tests/", "-q", "--tb=line", "--no-header"]
 
@@ -1190,10 +1196,10 @@ def run_hermetic_pytest(
 ) -> Optional[str]:
     """Run pytest against the candidate diff in a disposable worktree.
 
-    Mirrors CI: a parallel ``not serial`` pass then a ``serial`` pass, both in
-    the SAME worktree and env, under ONE total budget (pass 2 gets whatever
-    pass 1 left). Fails fast on the first red pass so the returned output is a
-    single pass's and can never truncate the failing section away.
+    Mirrors CI: the web node lane (``preflight_node``, on candidates carrying
+    ``web/tests/*.test.js``), then a parallel ``not serial`` pass, then a
+    ``serial`` pass — one worktree/env, ONE shared total budget. Fails fast on
+    the first red lane, so the output never truncates the failing section away.
 
     Returns ``None`` on success, otherwise a bounded human-readable error.
     ``OUROBOROS_PREFLIGHT_TIMEOUT_SEC`` overrides ``timeout`` for all callers.
@@ -1361,10 +1367,10 @@ def run_hermetic_pytest(
                 "error in the body below. This is not a test failure.",
                 str(exc), max_output,
             )
-
         from ouroboros.platform_layer import kill_processes_referencing
-
         started = time.monotonic()
+        if node_error := (run_node_tests(worktree, temp_root, timeout, max_output) or {}).get("error"):
+            return node_error
         empty_passes = 0
         for spec in passes:
             # ONE total budget across passes; the later pass gets the exact

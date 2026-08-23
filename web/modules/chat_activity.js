@@ -1,6 +1,7 @@
 // Pure chat-activity helpers shared by chat.js and dependency-free node tests:
 // live-card presentation projections (moved verbatim from chat.js) plus the
 // in-flight direct/ephemeral turn status reducer and snapshot hydration.
+import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import {
     accountedUpperBound,
     accountedUpperBoundWithChildren,
@@ -263,6 +264,24 @@ export function createStateSnapshotSequencer(onApply, now = () => Date.now()) {
             return (Number(request?.generation) || 0) > appliedGeneration;
         },
     };
+}
+
+/**
+ * Main-thread fan-out gate for a live WS frame.
+ *
+ * Main adopts a frame only when the server did NOT stamp it as a Project
+ * thread AND its chat_id is not a project the client already knows. The
+ * server stamp (`project_thread`, set at the message_bus broadcast choke from
+ * the registry) closes the race where a fresh project's frames arrive before
+ * `projectChatIds` learns the project — previously Main adopted them and
+ * minted an empty "Working..." card. Frames without the stamp (main, legacy
+ * cid 0/missing, external transports such as Telegram) route exactly as
+ * before; no numeric-range heuristic is involved.
+ */
+export function mainThreadAccepts(msg, projectChatIds) {
+    if (msg && msg.project_thread) return false;
+    const cid = Number(msg?.chat_id ?? 1);
+    return !(projectChatIds instanceof Set && projectChatIds.has(cid));
 }
 
 /**
@@ -543,4 +562,37 @@ export function reconcileHydratedDirectActivities(
         disappearedManagedTaskIds,
         globallyActiveActivityIds,
     };
+}
+
+/**
+ * Card-set durable-truth reconcile (stuck "Working..." pill class). The header
+ * reducer reads hasActiveLiveCard — a pure DOM scan of mounted unfinished
+ * foreground cards — so a card minted by a replayed frame whose own terminal
+ * row never reached this client (lost task_done, lineage-only subagent final
+ * re-minting a finished parent) kept the pill on "Working..." forever: every
+ * existing terminal path keys on the card's OWN id reaching a snapshot or
+ * frame first. This selector closes the gap from the card side: given the
+ * compact card projection `{id, finished, isSubagent, connected}` and the set
+ * of ids the GLOBAL /api/state snapshot confirms live, it returns the mounted
+ * unfinished foreground card ids the snapshot does NOT vouch for. Each one is
+ * handed to observeMissingManagedTask, whose durable task-detail read finishes
+ * the card ONLY on a proven terminal status (isTerminalTaskDetail); a 404 or
+ * nonterminal detail keeps the id and retries on the next snapshot (owner
+ * Q3=A: no timers, no id-shape heuristics, no fabricated terminal).
+ *
+ * Skipped here: finished cards, detached roots (not part of the reducer's
+ * scan), subagent cards (their parent owns the lineage; observe filters them
+ * too), reusable slots ('bg-consciousness', 'active' — many cycles per id, no
+ * single durable result) and the 'chat' fallback group id. Pure for node tests.
+ */
+export function unconfirmedForegroundCardIds(cards, activeIds) {
+    const out = [];
+    for (const card of Array.isArray(cards) ? cards : []) {
+        const id = String(card?.id || '');
+        if (!id || id === 'chat' || REUSABLE_TASK_IDS.has(id)) continue;
+        if (card.finished || card.isSubagent || !card.connected) continue;
+        if (activeIds?.has(id)) continue;
+        out.push(id);
+    }
+    return out;
 }

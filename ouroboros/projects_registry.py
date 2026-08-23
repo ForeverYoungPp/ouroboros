@@ -423,6 +423,49 @@ def reserved_project_chat_ids(drive_root: Any) -> set:
     return out
 
 
+_THREAD_LENS_CACHE: Dict[str, tuple] = {}
+
+
+def project_thread_chat_ids(drive_root: Any) -> frozenset:
+    """Per-frame lens over :func:`reserved_project_chat_ids` for the live bus.
+
+    The broadcast choke (``supervisor.message_bus``) stamps every outbound
+    frame whose final ``chat_id`` is a reserved Project thread, so the browser
+    can keep a project it has not learned yet out of Main. One ``stat`` per
+    frame; the set is rebuilt only when the registry file changes.
+    """
+    path = _registry_path(drive_root)
+    try:
+        st = path.stat()
+        stamp: Any = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    key = str(path)
+    cached = _THREAD_LENS_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    ids = frozenset(reserved_project_chat_ids(drive_root))
+    _THREAD_LENS_CACHE[key] = (stamp, ids)
+    return ids
+
+
+def stamp_project_thread(drive_root: Any, payload: Dict[str, Any]) -> None:
+    """Set ``project_thread=True`` iff the payload's FINAL chat_id is a reserved
+    Project thread. Called by the live broadcast choke (``supervisor.message_bus``)
+    AFTER the envelope literal is built (constant-key assignment — the WS
+    envelope-parity scanner forbids ``**`` widening inside the literal), so
+    Main's fan-out can reject a not-yet-learned Project frame. Registry
+    MEMBERSHIP, never a numeric range: external transport ids (Telegram) are
+    not members and stay unstamped.
+    """
+    try:
+        chat_id = int(payload.get("chat_id") or 0)
+        if drive_root is not None and chat_id in project_thread_chat_ids(drive_root):
+            payload["project_thread"] = True
+    except Exception:
+        log.debug("Project thread lens failed", exc_info=True)
+
+
 def registered_project_chat_ids(drive_root: Any) -> set:
     """One-minor compatibility alias for :func:`reserved_project_chat_ids`."""
     key = str(pathlib.Path(drive_root).resolve(strict=False))

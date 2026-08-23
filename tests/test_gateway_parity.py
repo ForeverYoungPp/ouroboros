@@ -27,6 +27,8 @@ from ouroboros.gateway.contracts import (
     OwnerSkillPresenceRuntimeRequest,
     OwnerSkillPresenceRuntimeResponse,
     OwnerScopeReviewFloorResponse,
+    DocumentOutbound,
+    LogOutbound,
     PhotoOutbound,
     ProviderTestRequest,
     ProviderTestResponse,
@@ -324,6 +326,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     )
     assert _notrequired_fields(TypingOutbound) == {
         "chat_id", "activity_id", "client_message_id", "phase", "kind",
+        "project_thread",
     }, "TypingOutbound typed fields are stamped only for registry-tracked turns: keep them optional"
     turn_decl = re.search(r"@typedef \{Object\} ActiveDirectTurn\b([\s\S]*?)\*/", text)
     assert turn_decl and not re.search(r"@property \{[^}]*=\}", turn_decl.group(1)), (
@@ -370,6 +373,12 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         assert re.search(rf"@property \{{string=\}} {field}\b", text), f"ChatOutbound missing {field}"
     assert re.search(r"@property \{\?number=\} cost_usd\b", text), "ChatOutbound cost_usd must be nullable"
     assert re.search(r"@property \{number=\} chat_id\b", text), "ChatOutbound missing chat_id"
+    # Main-thread fan-out stamp: every card/bubble-MINTING outbound frame family
+    # declares the same additive-optional boolean in both mirrors (message_annotation
+    # is thread-routed but no-ops on unknown ids and stays unstamped by design).
+    for cls in (ChatOutbound, PhotoOutbound, VideoOutbound, DocumentOutbound, LogOutbound, TypingOutbound):
+        assert "project_thread" in get_type_hints(cls, include_extras=True), f"{cls.__name__} missing project_thread"
+    assert len(re.findall(r"@property \{boolean=\} project_thread\b", text)) >= 6, "api_types.js missing project_thread mirrors"
     assert re.search(r"@property \{boolean=\} worker_saturation_warning\b", text), "ChatOutbound missing worker_saturation_warning"
     assert "review_projection" in get_type_hints(ChatOutbound, include_extras=True)
     assert re.search(r"@property \{Object=\} review_projection\b", text)

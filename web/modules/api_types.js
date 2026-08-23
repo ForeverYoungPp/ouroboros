@@ -329,6 +329,7 @@
  * @property {string=} project_id
  * @property {string=} project_name
  * @property {number=} chat_id
+ * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
  */
 
 /**
@@ -336,6 +337,7 @@
  * @property {"typing"} type
  * @property {string} action
  * @property {number=} chat_id  // multi-project: routes the indicator to the owning panel
+ * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
  * @property {string=} activity_id
  * @property {string=} client_message_id
  * @property {string=} phase
@@ -357,6 +359,7 @@
  * @property {string=} client_message_id
  * @property {Object=} transport
  * @property {number=} chat_id
+ * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
  * @property {number=} telegram_chat_id
  */
 
@@ -375,6 +378,7 @@
  * @property {string=} client_message_id
  * @property {Object=} transport
  * @property {number=} chat_id
+ * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
  * @property {number=} telegram_chat_id
  */
 
@@ -395,6 +399,7 @@
  * @property {string=} client_message_id
  * @property {Object=} transport
  * @property {number=} chat_id
+ * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
  * @property {number=} telegram_chat_id
  */
 
@@ -403,6 +408,7 @@
  * @property {"log"} type
  * @property {Object} data
  * @property {number=} chat_id  // multi-project thread routing (v6.32.0); main chat = 1
+ * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
  */
 
 /**

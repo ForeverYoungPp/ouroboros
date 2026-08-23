@@ -2100,8 +2100,10 @@ that:
 
 ### The commit gate mirrors the CI split
 
-`ouroboros/preflight_runner.py::run_hermetic_pytest` runs the same two logical
-passes as CI in one disposable checkout and scrubbed temporary data root. The
+`ouroboros/preflight_runner.py::run_hermetic_pytest` runs the node test lane
+(`NODE_OPTIONS` scrubbed, as `PYTEST_*` is for the pytest passes)
+plus the same two logical pytest passes as CI in one disposable checkout and
+scrubbed temporary data root. The
 candidate is captured universally — one hardened worktree-vs-`HEAD` binary diff
 applied as raw bytes, assembled identically whether the source index is clean,
 dirty, or mid-merge — and a capture or apply failure is the typed
@@ -2113,13 +2115,27 @@ test failure:
 2. flag-free `serial` for tests whose real process/port/global-state behavior
    cannot be parallel-safe.
 
-Both passes share one total timeout. `LANE_EXCLUSION_EXPR` and
-`PARALLEL_PASS_FLAGS` are executable SSOTs pinned against both CI jobs. The
-selected interpreter must provide `pytest-xdist` and `pytest-timeout`; plugin
-presence is probed outside candidate control, forced on for the parallel pass,
-and proven by host-owned worker markers. `OUROBOROS_PREFLIGHT_SERIAL=1` is the
-explicit temporary rollback lever, never a silent fallback. Evidence runs set
-`OUROBOROS_PREFLIGHT_REQUIRE_PLUGINS=1`.
+Before those two pytest passes, one contained `node` subprocess runs the
+browser-module suite (`ouroboros/preflight_node.py`): when the assembled
+candidate carries `web/tests/*.test.js` files, the gate runs `node --test`
+over them from the candidate's `web/` directory — the same suite
+`web/package.json` scripts and both CI jobs run — resolving the bundled signed
+node first and PATH second, with a 20.11 version floor. The lane is
+content-keyed: a candidate without web tests never requires node, but while
+the lane is active a missing or unusable runtime is the typed
+`PREFLIGHT_NODE_MISSING`/`PREFLIGHT_NODE_TOO_OLD` hard block and a red suite
+is `NODE_TESTS_FAILED` — never a silent skip.
+
+All passes share one total timeout. `LANE_EXCLUSION_EXPR` and
+`PARALLEL_PASS_FLAGS` are executable SSOTs pinned against both CI jobs, and so
+is the node step (`cd web && node --test tests/*.test.js`, derived from the
+lane's own glob constants). The selected interpreter must provide
+`pytest-xdist` and `pytest-timeout`; plugin presence is probed outside
+candidate control, forced on for the parallel pass, and proven by host-owned
+worker markers. `OUROBOROS_PREFLIGHT_SERIAL=1` is the explicit temporary
+rollback lever, never a silent fallback. Evidence runs set
+`OUROBOROS_PREFLIGHT_REQUIRE_PLUGINS=1` (and `OUROBOROS_PREFLIGHT_REQUIRE_NODE=1`
+for the node lane's real-spawn tests).
 
 The candidate environment cannot weaken the pass with inherited `PYTEST_*`
 values, delete an inherited suite and earn green, or replace required plugins
