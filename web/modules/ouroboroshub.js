@@ -1,59 +1,168 @@
+/**
+ * OuroborosHub tab: official catalog joined with the GLOBAL skill listing.
+ *
+ * Identity-first (plan §2b law 1): the card truth comes from joining the
+ * catalog row with /api/extensions by the server-computed canonical name
+ * (catalogRow.sanitized_name === skill.name) — never from the bucket-scoped
+ * installed endpoint, whose bucket view made an externally-occupied name
+ * render as "Not installed" with a deterministically dead Install/Retry.
+ * The verdict itself is computed by the shared hub_sync helper (§7.5).
+ */
+
 import {
     clearPending,
     getPending,
-    getPendingBySlug,
-    lifecycleCardClassFor,
-    lifecycleSpinnerFor,
     setPending,
     startLifecyclePoller,
 } from './lifecycle_card.js';
+import { openConfirmDialog } from './confirm_dialog.js';
+import { hubListingRowFor, hubSyncVerdict } from './hub_sync.js';
 import {
     emitSkillLifecycle,
     escapeHtmlAttr as escapeHtml,
     fetchJson,
     renderHubCard,
+    safeExternalHrefAttr,
 } from './utils.js';
 
 
-function lifecycleFor(installed, pending) {
+function adoptHint(facts) {
+    if (facts.edited_since_submission && facts.receipt_pr !== null) {
+        return `Local files were edited since submission (PR #${facts.receipt_pr}).`;
+    }
+    if (facts.receipt_unreadable) return 'Local publish record is unreadable.';
+    if (facts.no_receipt) {
+        return 'No local publish record for this name - the hub skill may belong to someone else.';
+    }
+    return '';
+}
+
+
+/** State line (tone/label/hint) for one card, from the verdict or pending job. */
+function lifecycleForVerdict(verdict, pending, listingRow) {
     if (pending) {
         if (pending.failed === true) {
-            return {
-                tone: pending.tone || 'danger',
-                label: pending.label || 'Failed',
-                hint: pending.message || '',
-                button: pending.retry_label || 'Retry',
-                disabled: false,
-            };
+            return { tone: pending.tone || 'danger', label: pending.label || 'Failed', hint: pending.message || '' };
         }
-        return {
-            tone: pending.tone || 'warn',
-            label: pending.label || 'Working',
-            hint: pending.message || '',
-            button: pending.label || 'Working…',
-            disabled: true,
-        };
+        return { tone: pending.tone || 'warn', label: pending.label || 'Working', hint: pending.message || '' };
     }
-    if (installed) {
-        const review = installed.review_status ? `Review ${installed.review_status}` : 'Installed';
-        const executable = installed.review_gate && typeof installed.review_gate.executable_review === 'boolean'
-            ? installed.review_gate.executable_review
-            : ['clean', 'warnings'].includes(installed.review_status);
-        return {
-            tone: executable && !installed.review_stale ? 'ok' : 'warn',
-            label: review,
-            hint: installed.review_stale ? 'Review is stale; re-review from My skills before enabling.' : '',
-            button: 'Installed',
-            disabled: true,
-        };
+    const facts = verdict.copy_facts;
+    switch (verdict.action) {
+        case 'install':
+            return { tone: 'muted', label: 'Not installed', hint: 'Install starts security review automatically.' };
+        case 'installed':
+            return {
+                tone: listingRow?.review_stale ? 'warn' : 'ok',
+                label: `Installed v${facts.local_version}`,
+                hint: listingRow?.review_stale ? 'Review is stale; re-review from My skills before enabling.' : '',
+            };
+        case 'update':
+            return { tone: 'warn', label: `Installed v${facts.local_version}`, hint: `Hub has v${facts.catalog_version}.` };
+        case 'adopt':
+            return {
+                tone: 'warn',
+                label: `Name taken by a local skill (${facts.occupying_bucket})`,
+                hint: adoptHint(facts),
+            };
+        case 'wait_pr':
+            return {
+                tone: 'ok',
+                label: `Submitted PR #${facts.receipt_pr}`,
+                hint: 'Waiting for the hub to publish the submitted version.',
+            };
+        default: {
+            if (verdict.badges.includes('conflict')) {
+                return { tone: 'danger', label: 'Catalog entry conflict', hint: 'The catalog holds more than one entry with this name.' };
+            }
+            if (verdict.badges.includes('listing_unavailable')) {
+                return { tone: 'warn', label: 'Hub facts unavailable', hint: 'Installed skills could not be read; actions are hidden until the list loads.' };
+            }
+            if (facts.occupying_bucket) {
+                return {
+                    tone: 'warn',
+                    label: `Name taken by a local skill (${facts.occupying_bucket})`,
+                    hint: facts.occupying_bucket === 'clawhub'
+                        ? 'Adopting a ClawHub-installed skill is not supported yet.'
+                        : '',
+                };
+            }
+            return { tone: 'muted', label: 'Hub facts unavailable', hint: '' };
+        }
     }
-    return {
-        tone: 'muted',
-        label: 'Not installed',
-        hint: 'Install starts security review automatically.',
-        button: 'Install',
-        disabled: false,
-    };
+}
+
+
+function badgesHtmlFor(verdict) {
+    const facts = verdict.copy_facts;
+    const out = [];
+    for (const badge of verdict.badges) {
+        if (badge === 'submitted_pr' && facts.receipt_pr !== null) {
+            out.push(`<span class="skills-badge skills-badge-warn">Submitted PR #${escapeHtml(String(facts.receipt_pr))}</span>`);
+        } else if (badge === 'published') {
+            out.push(`<span class="skills-badge skills-badge-ok">Published v${escapeHtml(facts.local_version)}</span>`);
+        } else if (badge === 'update_available') {
+            out.push(`<span class="skills-badge skills-badge-warn">Update v${escapeHtml(facts.catalog_version)}</span>`);
+        } else if (badge === 'catalog_unavailable') {
+            out.push('<span class="skills-badge skills-badge-warn">Catalog unavailable</span>');
+        } else if (badge === 'listing_unavailable') {
+            out.push('<span class="skills-badge skills-badge-warn">Hub facts unavailable</span>');
+        } else if (badge === 'conflict') {
+            out.push('<span class="skills-badge skills-badge-danger">Catalog entry conflict</span>');
+        }
+    }
+    return out.join('');
+}
+
+
+function primaryHtmlFor(slug, verdict, pending) {
+    const slugAttr = escapeHtml(slug);
+    if (pending) {
+        if (pending.failed === true) {
+            const retryAction = escapeHtml(pending.retry_action || 'install');
+            return `<button class="btn btn-default" data-oh-action="${retryAction}" data-oh-slug="${slugAttr}">${escapeHtml(pending.retry_label || 'Retry')}</button>
+                <button class="btn btn-ghost" data-oh-dismiss="${slugAttr}">Dismiss</button>`;
+        }
+        return `<button class="btn btn-primary" disabled>${escapeHtml(pending.label || 'Working…')}</button>`;
+    }
+    const facts = verdict.copy_facts;
+    switch (verdict.action) {
+        case 'install':
+            return `<button class="btn btn-primary" data-oh-action="install" data-oh-slug="${slugAttr}">Install</button>`;
+        case 'update':
+            return `<button class="btn btn-primary" data-oh-action="update" data-oh-slug="${slugAttr}">Update v${escapeHtml(facts.catalog_version)}</button>`;
+        case 'adopt':
+            return `<button class="btn btn-primary" data-oh-action="adopt" data-oh-slug="${slugAttr}">Adopt hub version v${escapeHtml(facts.catalog_version)}</button>`;
+        case 'installed':
+            return `<button class="btn btn-default" disabled>Installed v${escapeHtml(facts.local_version)}</button>`;
+        case 'wait_pr':
+            return `<button class="btn btn-default" disabled>Submitted PR #${escapeHtml(String(facts.receipt_pr ?? ''))}</button>`;
+        default:
+            return '';
+    }
+}
+
+
+function secondaryHtmlFor(verdict, rawSkill) {
+    if (verdict.action !== 'wait_pr') return '';
+    const published = rawSkill?.published && typeof rawSkill.published === 'object' ? rawSkill.published : {};
+    const href = safeExternalHrefAttr(published.pr_url);
+    if (!href) return '';
+    return `<a class="btn btn-default" href="${href}" target="_blank" rel="noopener noreferrer">PR #${escapeHtml(String(verdict.copy_facts.receipt_pr ?? ''))}</a>`;
+}
+
+
+/** Typed lifecycle error text: "<code>: <message>" when the payload carries a code. */
+function typedErrorText(err) {
+    const body = err && typeof err === 'object' ? (err.body || err.payload) : null;
+    const code = body && typeof body === 'object' ? String(body.code || '') : '';
+    const message = String((body && typeof body === 'object' && (body.error || body.message)) || err?.message || err || 'request failed');
+    return code && !message.startsWith(code) ? `${code}: ${message}` : message;
+}
+
+function resultError(data) {
+    const error = new Error(String(data?.error || 'request failed'));
+    error.body = data;
+    return error;
 }
 
 
@@ -79,23 +188,17 @@ function template({ includeControls = true } = {}) {
 }
 
 
-function card(item, installed) {
-    const slug = item.slug;
-    const pending = getPending(slug);
-    const lifecycle = lifecycleFor(installed, pending);
-    const primaryHtml = (installed && !pending)
-        ? '<button class="btn btn-default" disabled>Installed</button>'
-        : `<button class="btn ${pending?.failed ? 'btn-default' : 'btn-primary'}" data-oh-install="${escapeHtml(slug)}" ${lifecycle.disabled ? 'disabled' : ''}>${escapeHtml(lifecycle.button)}</button>`;
-    return renderHubCard(item, { pending, installed, lifecycle, primaryHtml, official: true });
-}
-
-
 export function initOuroborosHub(pane, controlsHost = null) {
     pane.innerHTML = template({ includeControls: !controlsHost });
     if (controlsHost) {
         controlsHost.innerHTML = controlsTemplate();
     }
-    const state = { query: '', results: [], installed: new Map() };
+    const state = {
+        query: '',
+        results: [],
+        listingByName: new Map(),
+        listingUnavailable: false,
+    };
     const controlsRoot = controlsHost || pane;
     const queryInput = controlsRoot.querySelector('#oh-query');
     const results = pane.querySelector('#oh-results');
@@ -106,30 +209,177 @@ export function initOuroborosHub(pane, controlsHost = null) {
         status.textContent = message;
     };
 
-    function renderCards() {
-        results.innerHTML = state.results.map((item) => card(item, state.installed.get(item.slug))).join('')
-            || '<div class="muted">No official skills found.</div>';
+    function catalogRowFor(item) {
+        return {
+            slug: String(item.slug || ''),
+            sanitized_name: String(item.sanitized_name || item.slug || ''),
+            latest_version: String(item.latest_version || ''),
+            identity_conflict: item.identity_conflict === true,
+        };
     }
 
-    async function loadInstalled() {
-        const data = await fetchJson('/api/marketplace/ouroboroshub/installed').catch(() => ({ skills: [] }));
-        state.installed = new Map((data.skills || []).map((skill) => [skill.name, skill]));
+    function verdictFor(item) {
+        const catalogRow = catalogRowFor(item);
+        const rawSkill = state.listingByName.get(catalogRow.sanitized_name) || null;
+        const listingRow = rawSkill ? hubListingRowFor(rawSkill) : null;
+        const verdict = hubSyncVerdict(listingRow, catalogRow, {
+            listingUnavailable: state.listingUnavailable,
+        });
+        return { verdict, rawSkill, listingRow, catalogRow };
+    }
+
+    function card(item) {
+        const slug = String(item.slug || '');
+        const pending = getPending(slug);
+        const { verdict, rawSkill, listingRow } = verdictFor(item);
+        const lifecycle = lifecycleForVerdict(verdict, pending, listingRow);
+        const installed = ['installed', 'update'].includes(verdict.action) ? rawSkill : null;
+        return renderHubCard(item, {
+            pending,
+            installed,
+            lifecycle,
+            primaryHtml: primaryHtmlFor(slug, verdict, pending),
+            secondaryHtml: secondaryHtmlFor(verdict, rawSkill),
+            badgesHtml: badgesHtmlFor(verdict),
+            official: true,
+        });
+    }
+
+    function renderCards() {
+        results.innerHTML = state.results.map((item) => card(item)).join('')
+            || '<div class="muted">No official skills found.</div>';
     }
 
     async function refresh() {
         show('Loading OuroborosHub…', 'muted');
         try {
-            await loadInstalled();
             const params = new URLSearchParams();
             if (state.query.trim()) params.set('q', state.query.trim());
-            const data = await fetchJson(`/api/marketplace/ouroboroshub/catalog?${params}`);
-            state.results = data.results || [];
-            state.installed.pendingBySlug = getPendingBySlug();
+            // Global listing beside the catalog — a listing fetch failure is an
+            // honest "Hub facts unavailable" state, never "Not installed".
+            const [catalogData, listingData] = await Promise.all([
+                fetchJson(`/api/marketplace/ouroboroshub/catalog?${params}`),
+                fetchJson('/api/extensions').catch(() => null),
+            ]);
+            state.results = catalogData.results || [];
+            state.listingUnavailable = listingData === null;
+            state.listingByName = new Map();
+            for (const skill of listingData?.skills || []) {
+                if (skill?.name && !state.listingByName.has(skill.name)) {
+                    state.listingByName.set(skill.name, skill);
+                }
+            }
             renderCards();
             show(`${state.results.length} official skill${state.results.length === 1 ? '' : 's'}`, 'muted');
         } catch (err) {
             show(err.message || String(err), 'danger');
-            results.innerHTML = `<div class="skills-load-error">${escapeHtml(err.message || err)}</div>`;
+            results.innerHTML = `<div class="skills-load-error">Hub facts unavailable: ${escapeHtml(err.message || err)}</div>`;
+        }
+    }
+
+    async function confirmAdopt(item, verdict, rawSkill) {
+        const facts = verdict.copy_facts;
+        const name = String(item.sanitized_name || item.slug || '');
+        const bucket = facts.occupying_bucket || 'external';
+        const lines = [
+            `Replace the local copy (${bucket}, v${facts.local_version}) with hub v${facts.catalog_version}? `
+            + 'Local files will be replaced; skill settings, grants and review history are kept.',
+        ];
+        if (facts.edited_since_submission && facts.receipt_pr !== null) {
+            lines.push(`Local files were edited since submission (PR #${facts.receipt_pr}).`);
+        }
+        if (facts.no_receipt) {
+            lines.push('No local publish record for this name - the hub skill may belong to someone else.');
+        }
+        if (facts.receipt_unreadable) {
+            lines.push('Local publish record is unreadable.');
+        }
+        const payloadRoot = String(rawSkill?.payload_root || '');
+        const rows = [
+            { label: 'Occupying bucket', value: bucket },
+            ...(payloadRoot ? [{ label: 'Local folder', value: `data/${payloadRoot}/` }] : []),
+            { label: 'Local version', value: `v${facts.local_version}` },
+            { label: 'Hub version', value: `v${facts.catalog_version}` },
+            ...(facts.edited_since_submission && facts.receipt_pr !== null
+                ? [{ label: 'Local edits', value: `Edited since submission (PR #${facts.receipt_pr})` }]
+                : []),
+        ];
+        return openConfirmDialog({
+            title: `Adopt ${name}`,
+            body: lines.join('\n'),
+            details: { summary: 'Show details', rows },
+            confirmLabel: 'Adopt',
+            danger: true,
+        });
+    }
+
+    async function runAction(slug, action) {
+        const item = state.results.find((row) => String(row.slug || '') === slug);
+        if (!item) return;
+        const { verdict, rawSkill, listingRow } = verdictFor(item);
+        const target = String(item.sanitized_name || item.slug || '');
+        let body = null;
+        let pendingLabel = '';
+        let pendingMessage = '';
+        let doneWord = '';
+        if (action === 'adopt') {
+            if (verdict.action !== 'adopt') {
+                show(`${slug}: local state changed; refresh before adopting`, 'warn');
+                return;
+            }
+            const expected = String(listingRow?.content_hash || '');
+            if (!expected) {
+                show(`${slug}: local skill facts are unavailable; refresh and retry`, 'danger');
+                return;
+            }
+            const ok = await confirmAdopt(item, verdict, rawSkill);
+            if (!ok) return;
+            body = { slug, adopt: true, expected_content_hash: expected, auto_review: true };
+            pendingLabel = 'Adopting';
+            pendingMessage = 'Replacing the local copy with the hub version…';
+            doneWord = 'adopted hub version';
+        } else if (action === 'update') {
+            body = { slug, overwrite: true, auto_review: true };
+            pendingLabel = 'Updating';
+            pendingMessage = 'Updating official skill…';
+            doneWord = 'updated';
+        } else if (action === 'install') {
+            body = { slug, auto_review: true };
+            pendingLabel = 'Installing';
+            pendingMessage = 'Installing official skill…';
+            doneWord = 'installed';
+        } else {
+            return;
+        }
+        setPending(slug, { label: pendingLabel, tone: 'warn', message: pendingMessage, target });
+        show(`${pendingLabel} ${slug}…`, 'muted');
+        try {
+            const data = await fetchJson('/api/marketplace/ouroboroshub/install', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            if (!data.ok) throw resultError(data);
+            show(
+                data.review_status ? `${slug}: ${doneWord}, review ${data.review_status}` : `${slug}: ${doneWord}`,
+                'ok',
+            );
+            emitSkillLifecycle(action === 'adopt' ? 'install' : action, data.sanitized_name || slug, data);
+            clearPending(slug);
+        } catch (err) {
+            const message = typedErrorText(err);
+            setPending(slug, {
+                label: 'Failed',
+                tone: 'danger',
+                message,
+                failed: true,
+                retry_action: action,
+                retry_label: 'Retry',
+                target,
+            });
+            show(`${slug}: ${message}`, 'danger');
+        } finally {
+            refresh();
         }
     }
 
@@ -140,41 +390,25 @@ export function initOuroborosHub(pane, controlsHost = null) {
     });
     controlsRoot.querySelector('[data-oh-search]').addEventListener('click', refresh);
     startLifecyclePoller(() => {
-        state.installed.pendingBySlug = getPendingBySlug();
         renderCards();
     });
     results.addEventListener('click', async (event) => {
-        const install = event.target.closest('[data-oh-install]');
-        if (!install) return;
-        const slug = install.dataset.ohInstall;
-        install.disabled = true;
-        setPending(slug, { label: 'Installing', tone: 'warn', message: 'Installing official skill…' });
-        show(`Installing ${slug}…`, 'muted');
+        const dismiss = event.target.closest('[data-oh-dismiss]');
+        if (dismiss) {
+            clearPending(dismiss.dataset.ohDismiss);
+            renderCards();
+            return;
+        }
+        const actionBtn = event.target.closest('[data-oh-action]');
+        if (!actionBtn) return;
+        const slug = actionBtn.dataset.ohSlug;
+        const action = actionBtn.dataset.ohAction;
+        if (!slug || !action) return;
+        actionBtn.disabled = true;
         try {
-            const data = await fetchJson('/api/marketplace/ouroboroshub/install', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ slug, auto_review: true }),
-            });
-            if (!data.ok) throw new Error(data.error || 'install failed');
-            show(
-                data.review_status ? `${slug}: installed, review ${data.review_status}` : `${slug}: installed`,
-                data.ok ? 'ok' : 'warn',
-            );
-            emitSkillLifecycle('install', data.sanitized_name || slug, data);
-            clearPending(slug);
-        } catch (err) {
-            setPending(slug, {
-                label: 'Failed',
-                tone: 'danger',
-                message: err.message || String(err),
-                failed: true,
-                retry_label: 'Retry',
-            });
-            show(`${slug}: ${err.message || err}`, 'danger');
+            await runAction(slug, action);
         } finally {
-            install.disabled = false;
-            refresh();
+            actionBtn.disabled = false;
         }
     });
     pane._ouroboroshubRefresh = refresh;

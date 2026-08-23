@@ -160,3 +160,94 @@ test('ordinary skill card does not render Presence runtime controls', () => {
     const html = renderInstalledSkillCard(skill());
     assert.doesNotMatch(html, /data-presence-runtime-form/);
 });
+
+// ---------------------------------------------------------------------------
+// OuroborosHub sync badges (hubflow phase D): display-only, hub_sync verdict.
+// ---------------------------------------------------------------------------
+
+function hubOptions(rows, available = true) {
+    return {
+        hubCatalogByName: new Map(rows.map((row) => [row.sanitized_name, row])),
+        hubCatalogAvailable: available,
+    };
+}
+
+test('hub-bucket skill behind the catalog shows the Update available badge', () => {
+    const html = renderInstalledSkillCard(skill({
+        source: 'ouroboroshub',
+        payload_root: 'skills/ouroboroshub/telegram',
+        version: '1.0.0',
+    }), new Set(), new Set(), {}, hubOptions([
+        { slug: 'telegram', sanitized_name: 'telegram', latest_version: '2.0.0', identity_conflict: false },
+    ]));
+    assert.match(html, />Update available</);
+    assert.doesNotMatch(html, />Published v/);
+});
+
+test('hub-bucket skill at the served version claims no update', () => {
+    const html = renderInstalledSkillCard(skill({
+        source: 'ouroboroshub',
+        payload_root: 'skills/ouroboroshub/telegram',
+        version: '2.0.0',
+    }), new Set(), new Set(), {}, hubOptions([
+        { slug: 'telegram', sanitized_name: 'telegram', latest_version: '2.0.0', identity_conflict: false },
+    ]));
+    assert.doesNotMatch(html, />Update available</);
+});
+
+test('byte-verified hub skill shows Published even without a catalog snapshot', () => {
+    const html = renderInstalledSkillCard(skill({
+        source: 'ouroboroshub',
+        payload_root: 'skills/ouroboroshub/telegram',
+        version: '2.0.0',
+        official_hub_verified: true,
+    }));
+    assert.match(html, />Published v2\.0\.0</);
+});
+
+test('publish receipt unconfirmed by the catalog shows the Submitted PR badge', () => {
+    const html = renderInstalledSkillCard(skill({
+        source: 'external',
+        payload_root: 'skills/external/telegram',
+        version: '0.1.0',
+        content_hash: 'b'.repeat(64),
+        published: {
+            slug: 'telegram',
+            version: '0.1.0',
+            content_hash: 'a'.repeat(64),
+            repository: 'razzant/ouroboroshub',
+            pr_number: 7,
+            pr_url: 'https://github.com/razzant/ouroboroshub/pull/7',
+            published_at: '2026-08-20T00:00:00Z',
+        },
+    }), new Set(), new Set(), {}, hubOptions([]));
+    assert.match(html, />Submitted PR #7</);
+});
+
+test('without a catalog snapshot no catalog-derived badge is guessed', () => {
+    const html = renderInstalledSkillCard(skill({
+        source: 'ouroboroshub',
+        payload_root: 'skills/ouroboroshub/telegram',
+        version: '1.0.0',
+        published: {
+            slug: 'telegram',
+            version: '1.0.0',
+            content_hash: 'a'.repeat(64),
+            repository: 'razzant/ouroboroshub',
+            pr_number: 9,
+            pr_url: 'https://github.com/razzant/ouroboroshub/pull/9',
+            published_at: '2026-08-20T00:00:00Z',
+        },
+    }));
+    assert.doesNotMatch(html, />Update available</);
+    assert.doesNotMatch(html, />Submitted PR #/);
+});
+
+test('native cards never carry hub sync badges', () => {
+    const html = renderInstalledSkillCard(skill(), new Set(), new Set(), {}, hubOptions([
+        { slug: 'telegram', sanitized_name: 'telegram', latest_version: '9.9.9', identity_conflict: false },
+    ]));
+    assert.doesNotMatch(html, />Update available</);
+    assert.doesNotMatch(html, />Published v/);
+    assert.doesNotMatch(html, />Submitted PR #/);
+});
