@@ -67,7 +67,7 @@ function lifecycleForVerdict(verdict, pending, listingRow) {
         case 'wait_pr':
             return {
                 tone: 'ok',
-                label: `Submitted PR #${facts.receipt_pr}`,
+                label: `Submitted PR #${facts.receipt_pr ?? ''}`,
                 hint: 'Waiting for the hub to publish the submitted version.',
             };
         default: {
@@ -85,6 +85,12 @@ function lifecycleForVerdict(verdict, pending, listingRow) {
                         ? 'Adopting a ClawHub-installed skill is not supported yet.'
                         : '',
                 };
+            }
+            if (facts.local_version || facts.no_receipt || facts.receipt_unreadable) {
+                // A listing row exists but its bucket could not be classified
+                // (e.g. an empty payload_root): honest neutral copy, never the
+                // fetch-failure wording.
+                return { tone: 'warn', label: 'Name taken by a local skill', hint: '' };
             }
             return { tone: 'muted', label: 'Hub facts unavailable', hint: '' };
         }
@@ -318,15 +324,18 @@ export function initOuroborosHub(pane, controlsHost = null) {
         if (!item) return;
         const { verdict, rawSkill, listingRow } = verdictFor(item);
         const target = String(item.sanitized_name || item.slug || '');
+        if (verdict.action !== action) {
+            // A stale Retry (or any stale affordance) must never act against a
+            // state the fresh verdict forbids — frozen no-action states
+            // (conflict, listing_unavailable, wait_pr) included.
+            show(`${slug}: local state changed; refresh before retrying`, 'warn');
+            return;
+        }
         let body = null;
         let pendingLabel = '';
         let pendingMessage = '';
         let doneWord = '';
         if (action === 'adopt') {
-            if (verdict.action !== 'adopt') {
-                show(`${slug}: local state changed; refresh before adopting`, 'warn');
-                return;
-            }
             const expected = String(listingRow?.content_hash || '');
             if (!expected) {
                 show(`${slug}: local skill facts are unavailable; refresh and retry`, 'danger');
@@ -339,7 +348,7 @@ export function initOuroborosHub(pane, controlsHost = null) {
             pendingMessage = 'Replacing the local copy with the hub version…';
             doneWord = 'adopted hub version';
         } else if (action === 'update') {
-            body = { slug, overwrite: true, auto_review: true };
+            body = null; // update rides its own endpoint (unload/reload + rollback).
             pendingLabel = 'Updating';
             pendingMessage = 'Updating official skill…';
             doneWord = 'updated';
@@ -354,11 +363,17 @@ export function initOuroborosHub(pane, controlsHost = null) {
         setPending(slug, { label: pendingLabel, tone: 'warn', message: pendingMessage, target });
         show(`${pendingLabel} ${slug}…`, 'muted');
         try {
-            const data = await fetchJson('/api/marketplace/ouroboroshub/install', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-            });
+            const data = action === 'update'
+                ? await fetchJson(`/api/marketplace/ouroboroshub/update/${encodeURIComponent(target)}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({}),
+                })
+                : await fetchJson('/api/marketplace/ouroboroshub/install', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
             if (!data.ok) throw resultError(data);
             show(
                 data.review_status ? `${slug}: ${doneWord}, review ${data.review_status}` : `${slug}: ${doneWord}`,

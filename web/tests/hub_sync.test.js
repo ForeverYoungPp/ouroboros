@@ -402,3 +402,26 @@ test('hubListingRowFor normalizes junk published/malformed fields', () => {
     assert.equal(row.published_malformed, false);
     assert.equal(row.review_stale, false);
 });
+
+test('identity_collision on the listing row fails closed to a no-action conflict', () => {
+    const listing = {
+        name: 'demo', source: 'external', location: 'external', version: '1.0.0',
+        content_hash: 'a'.repeat(64), official_hub_verified: false,
+        published: null, published_malformed: false, review_stale: false,
+        identity_collision: true,
+    };
+    const catalog = { slug: 'demo', sanitized_name: 'demo', latest_version: '2.0.0', identity_conflict: false };
+    const verdict = hubSyncVerdict(listing, catalog, {});
+    assert.equal(verdict.action, 'none');
+    assert.ok(verdict.badges.includes('conflict'));
+});
+
+test('hubListingRowFor carries the identity_collision flag', () => {
+    const row = hubListingRowFor({
+        name: 'demo', source: 'external', payload_root: 'skills/external/demo',
+        version: '1.0.0', content_hash: 'a'.repeat(64), identity_collision: true,
+    });
+    assert.equal(row.identity_collision, true);
+    const clean = hubListingRowFor({ name: 'demo', source: 'external', payload_root: 'skills/external/demo' });
+    assert.equal(clean.identity_collision, false);
+});

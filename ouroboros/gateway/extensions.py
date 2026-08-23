@@ -370,6 +370,10 @@ def _build_extensions_index(drive_root, repo_path):
         if bool(getattr(s, "identity_collision", False)):
             stale = True
             gate = skill_review_gate(s.review.status, stale=stale)
+            # Serialize the collision fact itself: hub_sync must fail closed
+            # (no-action conflict card) instead of first-wins joining one of
+            # several same-name occupants (scope-review reproduction).
+            entry["identity_collision"] = True
             entry.update({
                 "review_status": s.review.status,
                 "review_stale": stale,

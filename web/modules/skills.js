@@ -221,28 +221,35 @@ function updateQueueBadges(events) {
 
 
 async function renderSkillsList(container, emptyEl, reviewingSkills = new Set(), repairingSkills = new Set()) {
-    const [{ skillsRepoConfigured, githubTokenConfigured, skills, live }] = await Promise.all([
-        fetchSkills(),
-        loadHubCatalog(),
-    ]);
+    // The hub catalog is display-only badge enrichment: it must never gate the
+    // local cards (a cold external fetch can take the full server timeout).
+    const catalogSettled = loadHubCatalog();
+    const { skillsRepoConfigured, githubTokenConfigured, skills, live } = await fetchSkills();
     if (!skills.length && !skillsRepoConfigured) {
         container.innerHTML = '';
         if (emptyEl) emptyEl.hidden = false;
         return;
     }
     if (emptyEl) emptyEl.hidden = true;
-    container.innerHTML = sortSkillsForDisplay(skills).map((skill) => renderInstalledSkillCard(
-        skill,
-        reviewingSkills,
-        repairingSkills,
-        live,
-        {
-            githubTokenConfigured,
-            hubCatalogByName: hubCatalog.byName,
-            hubCatalogAvailable: hubCatalog.available,
-        },
-    )).join('')
-        || '<div class="muted">No skills yet. Add one from <b>ClawHub</b> or <b>OuroborosHub</b>.</div>';
+    const paint = () => {
+        container.innerHTML = sortSkillsForDisplay(skills).map((skill) => renderInstalledSkillCard(
+            skill,
+            reviewingSkills,
+            repairingSkills,
+            live,
+            {
+                githubTokenConfigured,
+                hubCatalogByName: hubCatalog.byName,
+                hubCatalogAvailable: hubCatalog.available,
+            },
+        )).join('')
+            || '<div class="muted">No skills yet. Add one from <b>ClawHub</b> or <b>OuroborosHub</b>.</div>';
+    };
+    paint();
+    catalogSettled.then(() => {
+        // Repaint only if this container is still mounted in the document.
+        if (container.isConnected) paint();
+    }).catch(() => {});
 }
 
 
@@ -702,9 +709,9 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
                 const source = target.dataset.source === 'ouroboroshub' ? 'ouroboroshub' : 'clawhub';
                 showToast(`${name}: updating from ${source === 'ouroboroshub' ? 'OuroborosHub' : 'ClawHub'} (this may take ~30s)`, 'muted');
                 const url = source === 'ouroboroshub'
-                    ? `/api/marketplace/ouroboroshub/install`
+                    ? `/api/marketplace/ouroboroshub/update/${encodeURIComponent(name)}`
                     : `/api/marketplace/clawhub/update/${encodeURIComponent(name)}`;
-                const body = source === 'ouroboroshub' ? { slug: name, overwrite: true, auto_review: true } : {};
+                const body = {};
                 const result = await postWithFeedback(url, body);
                 const tail = result.review_status ? ` — review ${result.review_status}` : '';
                 showToast(

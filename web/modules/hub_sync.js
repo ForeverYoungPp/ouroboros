@@ -59,6 +59,7 @@ export function hubListingRowFor(skill) {
         published: skill.published && typeof skill.published === 'object' ? skill.published : null,
         published_malformed: skill.published_malformed === true,
         review_stale: skill.review_stale === true,
+        identity_collision: skill.identity_collision === true,
     };
 }
 
@@ -87,7 +88,14 @@ export function hubSyncVerdict(listingRow, catalogRow, flags = {}) {
     // A failed listing fetch means no local fact may be claimed at all.
     const listing = listingUnavailable ? null : (listingRow || null);
     const catalog = catalogUnavailable ? null : (catalogRow || null);
-    const conflict = Boolean(catalog && catalog.identity_conflict === true);
+    // Conflict is fail-closed from EITHER plane: a catalog whose slugs collide
+    // on one canonical name, or a local listing row the loader marked as an
+    // identity collision (several same-name occupants — no affordance may act
+    // on an ambiguous identity).
+    const conflict = Boolean(
+        (catalog && catalog.identity_conflict === true)
+        || (listing && listing.identity_collision === true),
+    );
 
     const published = listing && listing.published && typeof listing.published === 'object'
         ? listing.published
