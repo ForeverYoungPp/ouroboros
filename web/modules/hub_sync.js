@@ -66,7 +66,7 @@ export function hubListingRowFor(skill) {
 function listingLocation(skill) {
     const explicit = String(skill.location || '');
     if (explicit) return explicit;
-    const bucket = /^skills\/(external|clawhub|ouroboroshub)\//.exec(String(skill.payload_root || ''));
+    const bucket = /^skills\/(external|clawhub|ouroboroshub|native)\//.exec(String(skill.payload_root || ''));
     if (bucket) return bucket[1];
     const source = String(skill.source || '').toLowerCase();
     if (source === 'native' || source === 'user_repo') return source;

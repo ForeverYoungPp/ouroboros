@@ -425,3 +425,17 @@ test('hubListingRowFor carries the identity_collision flag', () => {
     const clean = hubListingRowFor({ name: 'demo', source: 'external', payload_root: 'skills/external/demo' });
     assert.equal(clean.identity_collision, false);
 });
+
+test('native-located payload without seed marker maps to a named no-action card', () => {
+    // Legacy user-managed payload physically under skills/native/ (no .seed-origin):
+    // source reads logical "external", but the LOCATION is native — no adopt, and
+    // the occupying bucket is named for the card copy.
+    const row = hubListingRowFor({
+        name: 'weather', source: 'external', payload_root: 'skills/native/weather',
+        version: '0.1.0', content_hash: 'a'.repeat(64),
+    });
+    assert.equal(row.location, 'native');
+    const verdict = hubSyncVerdict(row, { slug: 'weather', sanitized_name: 'weather', latest_version: '0.3.2', identity_conflict: false }, {});
+    assert.equal(verdict.action, 'none');
+    assert.equal(verdict.copy_facts.occupying_bucket, 'native');
+});
