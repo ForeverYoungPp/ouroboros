@@ -1155,7 +1155,8 @@ Before every commit, verify the following:
   session row, or finish with an explicitly typed zero-run receipt through
   `verify_and_record(contract_kind="delegation_zero_run", zero_run_decision,
   zero_run_basis)`. The decision may be complete, incomplete, or unknown; prose
-  alone is not a zero-run receipt.
+  alone is not a zero-run receipt. Once durably recorded, it is terminal for that
+  actor; a later physical start is refused rather than contradicting the receipt.
   This is an affordance, not a topology state machine: host code must not infer a
   required number or order of descendants. The canonical brief and its hash remain
   unchanged; any coordination appendix is additive and separately disclosed. A

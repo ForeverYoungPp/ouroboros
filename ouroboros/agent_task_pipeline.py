@@ -625,7 +625,6 @@ def _apply_terminal_custody_outcome(
         ),
     }
 
-
 def emit_task_results(
     env: Any, memory: Any, llm: Any,
     pending_events: List[Dict[str, Any]],
@@ -635,6 +634,8 @@ def emit_task_results(
     ctx: Any = None, event_queue: Any = None,
 ) -> None:
     """Emit all end-of-task events to supervisor and run post-task processing."""
+    from ouroboros.subagent_bootstrap import actor_first_terminal_projection
+    actor_fact, usage, llm_trace = actor_first_terminal_projection(ctx, task, usage, llm_trace, task.get("budget_drive_root") or getattr(env, "drive_root", None))
     loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)
     # FR3 observability: apply the receipt_absent / expected_output_ungrounded objective-axis
     # flag HERE — once — so the SAME flagged loop_outcome feeds events and the durable

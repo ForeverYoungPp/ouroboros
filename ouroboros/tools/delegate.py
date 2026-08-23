@@ -198,6 +198,48 @@ def _host_instructions(authority: "DelegatedRunShape", assignment: str = "",
     return text
 
 
+def _build_start_instructions(
+    authority: "DelegatedRunShape",
+    assignment: str = "",
+    payload_skill: str = "",
+    coordination_context: str = "",
+) -> tuple[str, str]:
+    """Build the bounded instruction field for a fresh physical start.
+
+    The canonical work order is a separate, immutable prompt field.  The
+    actor-first appendix is additive and hash-disclosed, but it is still sent to
+    the same Claudexor request and must not be allowed to grow without bound.
+    Reuse the existing per-field serializer budget and refuse before provisioning
+    or POSTing when the complete appendix would exceed it.  Truncation would make
+    the coordination hash describe bytes the vendor never received.
+    """
+    text = _host_instructions(authority, assignment, payload_skill)
+    context = str(coordination_context or "").strip()
+    if not context:
+        return text, ""
+    coordination_sha = sha256(context.encode("utf-8")).hexdigest()
+    appendix = (
+        "\n\nHOST COORDINATION CONTEXT (advisory appendix; canonical work-order "
+        f"authority remains unchanged; sha256={coordination_sha}):\n"
+        + context
+    )
+    required_chars = len(text) + len(appendix)
+    if required_chars > _ASSIGNMENT_FIELD_CHARS:
+        return "", _fail(
+            "delegate_start", "coordination_context_over_budget",
+            "The complete coordination appendix does not fit the existing host "
+            "instruction-field budget; it was not truncated and the physical leaf "
+            "was not started. Retry with a shorter coordination context or preserve "
+            "the details in a host artifact/tree note.",
+            coordination_context_chars=len(context),
+            required_instruction_chars=required_chars,
+            instruction_budget_chars=_ASSIGNMENT_FIELD_CHARS,
+            coordination_context_sha256=coordination_sha,
+            host_fallback=False,
+        )
+    return text + appendix, ""
+
+
 def _derive_authority(ctx: ToolContext) -> "DelegatedRunShape":
     """Derive the run shape from the task's own authority — one question, asked here.
 
@@ -740,6 +782,23 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             if refusal := _presence_delegate_read_refusal(ctx):
                 return refusal
 
+    instructions = ""
+    if not recovering:
+        assignment = "" if bool(actor.get("compiled_work_order")) else _assignment_instructions(ctx)
+        payload_skill = ""
+        if isinstance(payload_auth, dict):
+            payload_skill = str(
+                (payload_auth.get("resource_ref") or {}).get("skill_name") or ""
+            )
+        instructions, instruction_error = _build_start_instructions(
+            authority,
+            assignment,
+            payload_skill=payload_skill,
+            coordination_context=_coordination_context,
+        )
+        if instruction_error:
+            return instruction_error
+
     access = authority.access
     try:
         gateway = ensure_owned_gateway()
@@ -802,18 +861,6 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             # contract blocks differ are two different logical starts. The digest
             # is the LOOKUP identity only; the wire key stays the invocation id,
             # and a retry replays the STORED body byte-identically regardless.
-            instructions = _host_instructions(
-                authority, "" if bool(actor.get("compiled_work_order")) else _assignment_instructions(ctx),
-                payload_skill=(str((record_auth.get("resource_ref") or {})
-                                   .get("skill_name") or "")
-                               if payload_auth is not None else ""))
-            if _coordination_context:
-                coordination_sha = sha256(_coordination_context.encode("utf-8")).hexdigest()
-                instructions += (
-                    "\n\nHOST COORDINATION CONTEXT (advisory appendix; canonical work-order "
-                    f"authority remains unchanged; sha256={coordination_sha}):\n"
-                    + _coordination_context
-                )
             key = custody.idempotency_key(getattr(ctx, "task_id", ""), route.route_id, access,
                                           authority.mode, authority.isolation, root, text,
                                           instructions)

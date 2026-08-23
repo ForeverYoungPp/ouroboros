@@ -1390,14 +1390,17 @@ executable), with the owned config root and inherited daemon-socket override cle
 fake `hurry`: current Claudexor exposes cancel and answers to a pending interaction,
 not truthful arbitrary in-place steering. `delegate_start` now takes an exact
 `agent_session` `subagent_id` (or recovery-only `retry_of`). API actor ids are refused
-there and must be scheduled as recursive children. A scheduled configured nanny
-normally does not call start at all: `subagent_bootstrap.bootstrap_before_context`
-compiles the complete work order and calls the shared `exact_start` primitive before
-the nanny's first model call. Root-direct bounded work and same-nanny replacement use
-the same primitive with an explicit id. `delegate_start(subagent_id=..., prompt=...,
-root="skill_payload", bucket=..., skill_name=...)` remains the orthogonal
-exact-resource selector: the id
-chooses transport while the existing resource binding chooses payload authority.
+there and must be scheduled as recursive children. A scheduled configured nanny first
+receives an ordinary host actor context: `subagent_bootstrap.bootstrap_before_context`
+freezes the route and compiles the complete work order, but leaves the physical leaf
+pending. The first model turn may schedule host children, publish evidence, call the
+shared `exact_start` primitive for the exact assigned session, or record a typed
+zero-run decision. Root-direct bounded work and same-nanny replacement use the same
+primitive with an explicit id. The physical leaf is never started from a host fallback
+or from a coordination prefix. `delegate_start(subagent_id=..., prompt=...,
+root="skill_payload", bucket=..., skill_name=...)` remains the orthogonal exact-resource
+selector: the id chooses transport while the existing resource binding chooses payload
+authority.
 
 The configured-session work-order compiler has one total 250,000-character wire
 budget. This is an Ouroboros serializer integrity bound, not a vendor model
@@ -1536,10 +1539,15 @@ episode. The actor may schedule host-visible descendants, publish evidence, call
 existing `delegate_start` primitive for the immutable session snapshot, or finish
 with a typed zero-run receipt through `verify_and_record` carrying
 `zero_run_decision` (`complete`, `incomplete`, or `unknown`) and a
-`zero_run_basis`. This is an LLM-first affordance,
+`zero_run_basis`. Once durably recorded, the decision is terminal for that actor;
+a later physical start is refused rather than contradicting the receipt. This is
+an LLM-first affordance,
 not a host topology/state machine: host code does not choose a number or order of
 children. The canonical work order remains byte-complete and hash-bound; any
-coordination context is additive and separately disclosed. A route preflight/start
+coordination context is additive and separately disclosed. The appendix uses the
+existing host instruction-field budget; if the complete appendix does not fit, the
+host refuses before provisioning and never sends a truncated hash-mismatched prefix.
+A route preflight/start
 refusal is injected as a typed fact into that first episode, so the actor may retry
 the exact route or do visible host work without silent native/API substitution.
 When a start or recovery actually occurs, the custody-durable receipt injects the

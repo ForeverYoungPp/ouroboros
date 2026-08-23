@@ -5870,17 +5870,17 @@ def _nanny_finalization_message(
     # the existing task-result SSOT as well.  Neither path creates a second
     # ledger or infers topology from prose.
     host_coordination = bool(getattr(tools._ctx, "_nanny_coordination_activity", False))
+    metadata = getattr(tools._ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    status_root = pathlib.Path(str(
+        metadata.get("budget_drive_root")
+        or getattr(tools._ctx, "budget_drive_root", "")
+        or drive_root
+    ))
     if not host_coordination:
         try:
             from ouroboros.task_status import find_child_tasks
 
-            metadata = getattr(tools._ctx, "task_metadata", {})
-            metadata = metadata if isinstance(metadata, dict) else {}
-            status_root = pathlib.Path(str(
-                metadata.get("budget_drive_root")
-                or getattr(tools._ctx, "budget_drive_root", "")
-                or drive_root
-            ))
             host_coordination = bool(find_child_tasks(
                 status_root,
                 parent_task_id=str(task_id or ""),
@@ -5890,6 +5890,31 @@ def _nanny_finalization_message(
             ))
         except Exception:
             log.debug("nanny nudge: host coordination evidence read failed", exc_info=True)
+    # Actor-first has one additional truth obligation: a plain final answer is
+    # not evidence that the assigned physical leaf was intentionally skipped.
+    # Reuse the bootstrap/child evidence helper so a missing route or unreadable
+    # child store becomes a typed incomplete/unknown outcome rather than a clean
+    # result.  This remains a one-shot advisory reminder; the durable outcome
+    # projection enforces the same fact after the model returns.
+    try:
+        from ouroboros.subagent_bootstrap import actor_first_unresolved_fact
+
+        actor_fact = actor_first_unresolved_fact(
+            tools._ctx, task_id=str(task_id or ""), drive_root=status_root,
+        )
+    except Exception:
+        actor_fact = None
+    if actor_fact:
+        status = str(actor_fact.get("status") or "unknown")
+        code = "CONFIGURED_ACTOR_INCOMPLETE" if status == "incomplete" else "CONFIGURED_ACTOR_UNKNOWN"
+        return (
+            f"⚠️ {code}: this actor-first session is finalizing before its assigned "
+            "physical leaf started and without a direct host child result. Call "
+            "verify_and_record(contract_kind=delegation_zero_run, "
+            f"zero_run_decision={status!r}, zero_run_basis=...) to record the "
+            "typed terminal decision, or start the exact assigned session now. "
+            "A plain prose answer cannot close this evidence gap."
+        )
     if host_coordination:
         return ""
     return (

@@ -597,6 +597,97 @@ def test_actor_first_delegate_start_binds_snapshot_and_canonical_work_order(monk
     )]
 
 
+def test_actor_first_start_marks_physical_activity_and_closes_zero_run(monkeypatch, tmp_path):
+    """A started (including uncustodied) leaf cannot later be reported as zero-run."""
+    import ouroboros.subagent_runtime as runtime
+    import ouroboros.tools.delegate as delegate
+
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    ctx = SimpleNamespace(
+        task_id="child-start-marker", drive_root=tmp_path, budget_drive_root=str(tmp_path),
+        _configured_actor_bootstrap={
+            "snapshot": snapshot,
+            "selected_subagent_id": "session-builder",
+            "canonical_work_order": "OBJECTIVE\nBuild the patch",
+            "work_order_fingerprint": "full-work-order-sha",
+            "physical_started": False,
+            "exact_start_pending": True,
+        },
+    )
+    monkeypatch.setattr(delegate, "_delegate_start", lambda *_a, **_k: json.dumps({
+        "status": "started_uncustodied", "run_id": "run-live",
+    }))
+
+    started = json.loads(runtime.exact_start(
+        ctx,
+        "OBJECTIVE\nBuild the patch",
+        {"snapshot": snapshot, "compiled_work_order": True},
+    ))
+    assert started["status"] == "started_uncustodied"
+    assert ctx._configured_actor_bootstrap["physical_started"] is True
+    assert ctx._configured_actor_bootstrap["exact_start_pending"] is False
+    assert ctx._nanny_physical_activity_seed is True
+
+    # The opposite contradiction is guarded by exact_start as well: once a
+    # durable zero-run decision exists, a later physical invocation is refused.
+    ctx._configured_actor_bootstrap["physical_started"] = False
+    ctx._configured_actor_bootstrap["exact_start_pending"] = True
+    ctx._configured_actor_bootstrap["zero_run_receipt_recorded"] = True
+    refused = json.loads(runtime.exact_start(
+        ctx,
+        "OBJECTIVE\nBuild the patch",
+        {"snapshot": snapshot, "compiled_work_order": True},
+    ))
+    assert refused["status"] == "refused"
+    assert refused["reason"] == "zero_run_already_recorded"
+
+
+def test_actor_first_exact_start_hydrates_terminal_zero_run_receipt(monkeypatch, tmp_path):
+    import ouroboros.subagent_runtime as runtime
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.outcomes import append_verification_receipt
+
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    task_id = "hydrated-zero-run"
+    assert append_verification_receipt(tmp_path, task_id, {
+        "contract_kind": "delegation_zero_run",
+        "zero_run": True,
+        "zero_run_decision": "unknown",
+    })
+    ctx = SimpleNamespace(
+        task_id=task_id,
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        _configured_actor_bootstrap={
+            "physical_started": False,
+            "exact_start_pending": True,
+        },
+    )
+    monkeypatch.setattr(delegate, "_delegate_start", lambda *_a, **_k: pytest.fail("must not start"))
+    refused = json.loads(runtime.exact_start(
+        ctx,
+        "OBJECTIVE\nBuild the patch",
+        {"snapshot": snapshot, "compiled_work_order": True},
+    ))
+    assert refused["reason"] == "zero_run_already_recorded"
+    assert ctx._configured_actor_bootstrap["zero_run_decision"] == "unknown"
+
+
+def test_actor_first_coordination_appendix_refuses_without_truncation(monkeypatch):
+    import ouroboros.tools.delegate as delegate
+
+    authority = SimpleNamespace(delegated=False)
+    monkeypatch.setattr(delegate, "_host_instructions", lambda *_a, **_k: "base")
+    monkeypatch.setattr(delegate, "_ASSIGNMENT_FIELD_CHARS", 32)
+    instructions, refusal = delegate._build_start_instructions(
+        authority, coordination_context="x" * 100,
+    )
+    assert instructions == ""
+    payload = json.loads(refusal)
+    assert payload["reason"] == "coordination_context_over_budget"
+    assert payload["coordination_context_chars"] == 100
+
+
 def test_actor_first_delegate_start_rejects_alternate_snapshot(monkeypatch, tmp_path):
     import ouroboros.subagent_runtime as runtime
 

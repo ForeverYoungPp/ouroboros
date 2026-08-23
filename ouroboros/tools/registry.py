@@ -1753,9 +1753,34 @@ class ToolRegistry:
         tc = normalize_task_constraint(getattr(self._ctx, "task_constraint", None))
         return set(getattr(tc, "external_tool_grants", ()) or ()) if tc else set()
 
+    def _readonly_tool_allowed(self, name: str) -> bool:
+        """Return the read-only child allowlist, including the narrow actor receipt.
+
+        ``verify_and_record`` is normally an acting/workspace code tool because its
+        other contract kinds execute commands or inspect deliverables.  An
+        actor-first configured session needs one exceptional, non-shell use: a
+        typed ``delegation_zero_run`` receipt when its selected leaf is still
+        pending.  Keep that exception bound to the private host bootstrap marker;
+        the handler applies the same check again at execution time.
+        """
+        if name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES:
+            return True
+        if name != "verify_and_record" or not self._is_local_readonly_subagent():
+            return False
+        bootstrap = getattr(self._ctx, "_configured_actor_bootstrap", None)
+        return (
+            isinstance(bootstrap, dict)
+            and not bool(bootstrap.get("physical_started"))
+            and not bool(bootstrap.get("zero_run_receipt_recorded"))
+            and bool(bootstrap.get("exact_start_pending", True))
+        )
+
     def initial_tool_names(self) -> frozenset[str]:
         if self._is_local_readonly_subagent():
-            return LOCAL_READONLY_SUBAGENT_TOOL_NAMES
+            names = set(LOCAL_READONLY_SUBAGENT_TOOL_NAMES)
+            if self._readonly_tool_allowed("verify_and_record"):
+                names.add("verify_and_record")
+            return frozenset(names)
         if self._is_acting_subagent():
             return ACTING_SUBAGENT_TOOL_NAMES
         return frozenset(set(self.available_tools()) | set(META_TOOL_NAMES))
@@ -1770,14 +1795,34 @@ class ToolRegistry:
             if e.name not in disabled  # declarative tool policy (task_contract.disabled_tools)
             if _presence_tool_allowed(self._ctx, e.name)
             if _builtin_tool_availability(e.name, self._ctx)[0]
-            if not local_readonly_subagent or e.name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
+            if not local_readonly_subagent or self._readonly_tool_allowed(e.name)
             if not acting_subagent or e.name in ACTING_SUBAGENT_TOOL_NAMES
         ]
 
     def _schema_for_entry(self, entry: ToolEntry) -> Dict[str, Any]:
         schema = entry.schema
         if self._is_local_readonly_subagent():
-            if entry.name in {"read_file", "list_files", "search_code", "query_code"}:
+            if entry.name == "verify_and_record" and self._readonly_tool_allowed(entry.name):
+                # The read-only actor is allowed to mint exactly one kind of
+                # host receipt.  Do not expose the general verification schema,
+                # whose other kinds can execute shell commands or inspect files.
+                schema = copy.deepcopy(schema)
+                schema["description"] = (
+                    "Record the typed zero-run decision for this configured actor-first "
+                    "session. No physical leaf may have started. This receipt is the "
+                    "only verification available to a read-only actor."
+                )
+                parameters = schema.setdefault("parameters", {})
+                properties = parameters.setdefault("properties", {})
+                parameters["properties"] = {
+                    key: properties[key]
+                    for key in ("contract_kind", "criterion_id", "zero_run_decision", "zero_run_basis")
+                    if key in properties
+                }
+                if "contract_kind" in parameters["properties"]:
+                    parameters["properties"]["contract_kind"]["enum"] = ["delegation_zero_run"]
+                parameters["required"] = ["contract_kind", "zero_run_decision", "zero_run_basis"]
+            elif entry.name in {"read_file", "list_files", "search_code", "query_code"}:
                 schema = copy.deepcopy(schema)
                 root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
                 if entry.name == "search_code":
@@ -1848,7 +1893,7 @@ class ToolRegistry:
             if entry.name not in disabled_tools  # declarative tool policy (task_contract.disabled_tools)
             if _presence_tool_allowed(self._ctx, entry.name)
             if entry.name not in unavailable_tools
-            if not local_readonly_subagent or entry.name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
+            if not local_readonly_subagent or self._readonly_tool_allowed(entry.name)
             if not acting_subagent or entry.name in ACTING_SUBAGENT_TOOL_NAMES
             if not ephemeral_turn or entry.name in _EPHEMERAL_ALLOWED_TOOLS  # CW3: default-deny allowlist
             for schema in self._schemas_for_entry(entry)
@@ -1947,14 +1992,14 @@ class ToolRegistry:
                 continue
             if e.name in unavailable_tools:
                 continue
-            if local_readonly_subagent and e.name not in LOCAL_READONLY_SUBAGENT_TOOL_NAMES:
+            if local_readonly_subagent and not self._readonly_tool_allowed(e.name):
                 continue
             if acting_subagent and e.name not in ACTING_SUBAGENT_TOOL_NAMES:
                 continue
             if ephemeral_turn and e.name not in _EPHEMERAL_ALLOWED_TOOLS:
                 continue  # CW3: the core/initial envelope is allowlisted too, not just schemas(core_only=False)
             if (
-                (local_readonly_subagent and e.name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES)
+                (local_readonly_subagent and self._readonly_tool_allowed(e.name))
                 or (acting_subagent and e.name in ACTING_SUBAGENT_TOOL_NAMES)
                 or e.name in CORE_TOOL_NAMES
                 or e.name in ("list_available_tools", "enable_tools")
@@ -1998,7 +2043,7 @@ class ToolRegistry:
         if getattr(self._ctx, "is_ephemeral_turn", False) and requested not in _EPHEMERAL_ALLOWED_TOOLS:
             return "hidden on this ephemeral decision turn (allowlist)"
         acting_subagent = self._is_acting_subagent()
-        if self._is_local_readonly_subagent() and requested not in LOCAL_READONLY_SUBAGENT_TOOL_NAMES:
+        if self._is_local_readonly_subagent() and not self._readonly_tool_allowed(requested):
             return "hidden by the read-only subagent profile"
         if acting_subagent and requested not in ACTING_SUBAGENT_TOOL_NAMES:
             return "hidden by the acting subagent profile"
@@ -2030,7 +2075,7 @@ class ToolRegistry:
                 return None
             if getattr(self._ctx, "is_ephemeral_turn", False) and requested not in _EPHEMERAL_ALLOWED_TOOLS:
                 return None  # CW3: allowlist-consistent with schemas()/execute() (so enable_tools can't surface a denied tool)
-            if local_readonly_subagent and requested not in LOCAL_READONLY_SUBAGENT_TOOL_NAMES:
+            if local_readonly_subagent and not self._readonly_tool_allowed(requested):
                 return None
             if acting_subagent and requested not in ACTING_SUBAGENT_TOOL_NAMES:
                 return None
@@ -3273,7 +3318,7 @@ class ToolRegistry:
         """Early dispatch gates that return a block message (or "" to allow): the read-only and
         acting subagent tool-name allowlists, and the managed-update merge write-exclusivity
         (P2/SC2 — only the authorized resolution task may run code tools while a merge is staged)."""
-        if local_readonly_subagent and entry is not None and name not in LOCAL_READONLY_SUBAGENT_TOOL_NAMES:
+        if local_readonly_subagent and entry is not None and not self._readonly_tool_allowed(name):
             return (
                 "⚠️ LOCAL_READONLY_SUBAGENT_BLOCKED: this subagent may inspect "
                 "local repo/data/history plus web/browser surfaces and enabled "
@@ -3637,7 +3682,16 @@ class ToolRegistry:
                     action=f"run tool {name!r} against",
                 )
 
-        if name in _SHELL_GUARDED_TOOLS:
+        # ``delegation_zero_run`` is a typed host receipt and deliberately has
+        # no command/cwd to inspect.  Running the generic shell-CWD guard on its
+        # empty check would reject the receipt before the handler can append it.
+        # All command-bearing verify kinds still use the normal pre-execution
+        # shell guards, and the handler independently narrows read-only profiles.
+        zero_run_receipt = (
+            name == "verify_and_record"
+            and str(args.get("contract_kind") or "").strip() == "delegation_zero_run"
+        )
+        if name in _SHELL_GUARDED_TOOLS and not zero_run_receipt:
             if (
                 name == "start_service"
                 and _runtime_mode == "light"

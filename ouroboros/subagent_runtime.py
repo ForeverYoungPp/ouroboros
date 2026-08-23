@@ -571,6 +571,28 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
     """Shared exact-start primitive for atomic bootstrap and root-direct calls."""
 
     options = dict(spec or {})
+    bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+    if isinstance(bootstrap, dict) and not bool(bootstrap.get("zero_run_receipt_recorded")):
+        from ouroboros.subagent_bootstrap import _durable_zero_run_receipt
+
+        durable_zero_run = _durable_zero_run_receipt(ctx)
+        if durable_zero_run:
+            bootstrap.update({
+                "zero_run_receipt_recorded": True,
+                "zero_run_decision": str(durable_zero_run.get("zero_run_decision") or ""),
+                "zero_run_basis": str(durable_zero_run.get("zero_run_basis") or ""),
+                "exact_start_pending": False,
+            })
+    if isinstance(bootstrap, dict) and bool(bootstrap.get("zero_run_receipt_recorded")):
+        from ouroboros.delegate_shared import _fail
+
+        return _fail(
+            "delegate_start", "zero_run_already_recorded",
+            "This actor already recorded a terminal delegation_zero_run decision; "
+            "starting a physical leaf now would contradict that durable receipt. "
+            "Create a new explicitly bound task/retry after the parent disposes the result.",
+            zero_run_decision=str(bootstrap.get("zero_run_decision") or ""),
+        )
     selected_id = str(options.pop("subagent_id", "") or "").strip()
     selected_snapshot = options.pop("snapshot", None)
     compiled_work_order = bool(options.pop("compiled_work_order", False))
@@ -627,6 +649,13 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
             _work_order_source_request=work_order_source_request,
             _coordination_context=coordination_context,
         )
+        # Actor-first configured sessions keep the physical leaf pending until the
+        # ordinary host episode chooses ``delegate_start``.  Mark that choice from
+        # the host-owned typed result, including the uncustodied branch: a run may
+        # already be live even when its durable custody row could not be written.
+        # Without this marker the same episode could mint a false zero-run receipt
+        # after a successful start and nanny economics would miss real activity.
+        _mark_actor_physical_start(ctx, result)
         try:
             payload = json.loads(result)
         except (TypeError, ValueError):
@@ -647,6 +676,31 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
         return _fail("delegate_start", exc.code, exc.detail)
     finally:
         _EXACT_START_SELECTION.reset(token)
+
+
+def _mark_actor_physical_start(ctx: Any, result: Any) -> None:
+    """Record a successful actor-first physical start on the private bootstrap fact.
+
+    This is deliberately an internal projection, not a new lifecycle ABI.  The
+    durable custody/evidence rows remain authoritative; the projection only keeps
+    the current host episode from treating a started (possibly uncustodied) run as
+    a zero-run and seeds the existing nanny-activity accounting.
+    """
+    bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+    if not isinstance(bootstrap, dict):
+        return
+    try:
+        payload = json.loads(result) if isinstance(result, str) else result
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict) or str(payload.get("status") or "") not in {
+        "started", "started_uncustodied",
+    }:
+        return
+    bootstrap["physical_started"] = True
+    bootstrap["exact_start_pending"] = False
+    bootstrap["physical_start_status"] = str(payload.get("status") or "")
+    ctx._nanny_physical_activity_seed = True
 
 
 def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, **params: Any) -> str:

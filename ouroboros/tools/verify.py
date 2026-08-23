@@ -25,7 +25,9 @@ from ouroboros.platform_layer import bootstrap_process_path
 from ouroboros.shell_parse import normalize_check_argv
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
+    active_tool_profile,
     build_resolved_resource_binding,
+    canonical_data_root,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
 from ouroboros.utils import utc_now_iso
@@ -420,6 +422,21 @@ def _verify_and_record(
     kind = str(contract_kind or "").strip()
     if kind not in _CONTRACT_KINDS:
         return f"⚠️ TOOL_ARG_ERROR (verify_and_record): contract_kind must be one of {', '.join(_CONTRACT_KINDS)}."
+    if active_tool_profile(ctx) == "local_readonly_subagent":
+        # Read-only actor-first sessions need a host-owned zero-run disclosure,
+        # not the general command/artifact verification surface.  Keep the
+        # profile and lifecycle checks here as defense in depth for stale schemas
+        # or forced dispatches after the physical leaf has started.
+        bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+        if (
+            kind != "delegation_zero_run"
+            or not isinstance(bootstrap, dict)
+            or bool(bootstrap.get("physical_started"))
+        ):
+            return (
+                "⚠️ LOCAL_READONLY_SUBAGENT_BLOCKED: this profile may record only a "
+                "delegation_zero_run receipt before its selected physical leaf starts."
+            )
     match_mode = str(expected_match or "substring").strip().lower() or "substring"
     if match_mode not in _EXPECTED_MATCH_KINDS:
         return f"⚠️ TOOL_ARG_ERROR (verify_and_record): expected_match must be one of {', '.join(_EXPECTED_MATCH_KINDS)}."
@@ -458,6 +475,11 @@ def _verify_and_record(
                 "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run is no longer "
                 "available after the selected physical leaf has started."
             )
+        if bool(bootstrap.get("zero_run_receipt_recorded")):
+            return (
+                "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run already "
+                "has a durable terminal decision for this actor."
+            )
         decision = str(
             kwargs.get("zero_run_decision")
             or kwargs.get("decision")
@@ -494,8 +516,16 @@ def _verify_and_record(
         }
         if crit := str(criterion_id or "").strip():
             receipt["criterion_id"] = crit[:120]
-        append_verification_receipt(drive_root, task_id, receipt)
+        # A zero-run is lifecycle authority for the actor, so keep it on the
+        # canonical budget root rather than an ephemeral child drive. Ordinary
+        # verification receipts retain their historical caller-selected root.
+        if not append_verification_receipt(canonical_data_root(ctx), task_id, receipt):
+            return (
+                "⚠️ TOOL_ERROR (verify_and_record): the delegation_zero_run receipt "
+                "could not be durably written; no zero-run decision was recorded."
+            )
         bootstrap["zero_run_decision"] = decision
+        bootstrap["zero_run_basis"] = receipt["zero_run_basis"]
         bootstrap["zero_run_receipt_recorded"] = True
         return (
             "verify_and_record [delegation_zero_run] "

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from hashlib import sha256
+from pathlib import Path
 from typing import Any, Mapping
 
 from ouroboros.subagent_work_order import (
@@ -66,7 +67,11 @@ def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -
                 ),
                 "host_fallback": False,
                 "actor_first": True,
-                "exact_start_pending": True,
+                "exact_start_pending": bool(actor_bootstrap.get("exact_start_pending", True)),
+                **({
+                    "zero_run_receipt_recorded": True,
+                    "zero_run_decision": str(actor_bootstrap.get("zero_run_decision") or ""),
+                } if actor_bootstrap.get("zero_run_receipt_recorded") else {}),
             }
             custody.emit(custody.custody_root(ctx), "configured_subagent_startup_fault", {
                 "task_id": str(getattr(ctx, "task_id", "") or ""), **startup,
@@ -139,6 +144,164 @@ def _mark_physical_activity(ctx: Any) -> None:
         bootstrap["exact_start_pending"] = False
 
 
+def actor_first_unresolved_fact(
+    ctx: Any, *, task_id: str = "", drive_root: Any = None,
+) -> dict[str, Any] | None:
+    """Return a typed terminal fact when an actor-first turn has no completion path.
+
+    A plain final answer cannot prove that a configured actor either started its
+    assigned leaf or deliberately chose a zero-run.  Existing direct children are
+    a legitimate host-side path and therefore suppress this fact; their own
+    custody/absorption gates remain authoritative.  Failure to read the child
+    store is itself ``unknown`` rather than permission to finalize cleanly.
+    """
+    bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+    if not isinstance(bootstrap, dict):
+        return None
+    if bool(bootstrap.get("physical_started")) or bool(bootstrap.get("zero_run_receipt_recorded")):
+        return None
+    if not bool(bootstrap.get("exact_start_pending", True)):
+        return None
+    root = Path(
+        str(
+            drive_root
+            or getattr(ctx, "budget_drive_root", "")
+            or getattr(ctx, "drive_root", "")
+            or "."
+        )
+    )
+    child_id = str(task_id or getattr(ctx, "task_id", "") or "")
+    try:
+        from ouroboros.task_status import find_child_tasks
+
+        children = find_child_tasks(
+            root,
+            parent_task_id=child_id,
+            exclude_task_id=child_id,
+            scope="direct",
+            materialize_artifacts=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - unknown evidence must stay visible
+        return {
+            "status": "unknown",
+            "reason": "child_evidence_unavailable",
+            "detail": type(exc).__name__,
+            "route_available": bool(bootstrap.get("route_available")),
+        }
+    if children:
+        return None
+    route_available = bootstrap.get("route_available")
+    return {
+        "status": "incomplete" if route_available is not False else "unknown",
+        "reason": "physical_leaf_not_started_and_no_direct_child",
+        "route_available": route_available,
+        "selected_subagent_id": str(bootstrap.get("selected_subagent_id") or ""),
+        "work_order_fingerprint": str(bootstrap.get("work_order_fingerprint") or ""),
+    }
+
+
+def _durable_zero_run_receipt(ctx: Any) -> dict[str, Any] | None:
+    """Recover a previously written terminal zero-run fact for this task.
+
+    The in-memory bootstrap marker is intentionally process-local, while the
+    receipt is the continuity authority.  A resumed actor therefore has to
+    hydrate the marker before it can expose ``delegate_start`` again.  Receipt
+    parsing is best-effort here, matching the existing verification reader; an
+    unreadable store is disclosed through the normal lifecycle evidence path
+    rather than guessed to be a zero-run.
+    """
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    if not task_id:
+        return None
+    try:
+        from ouroboros.tool_access import canonical_data_root
+
+        canonical_root = canonical_data_root(ctx)
+    except Exception:
+        canonical_root = Path(
+            str(
+                getattr(ctx, "budget_drive_root", None)
+                or getattr(ctx, "drive_root", None)
+                or "."
+            )
+        )
+    roots = [canonical_root]
+    local_root = getattr(ctx, "drive_root", None)
+    if local_root:
+        local_path = Path(str(local_root)).resolve(strict=False)
+        if local_path != Path(canonical_root).resolve(strict=False):
+            roots.append(local_path)
+    try:
+        from ouroboros.outcomes import read_verification_receipts
+
+        receipts = []
+        seen_receipts: set[str] = set()
+        for root in roots:
+            for receipt in read_verification_receipts(root, task_id):
+                marker = json.dumps(
+                    receipt, ensure_ascii=False, sort_keys=True, default=str,
+                )
+                if marker not in seen_receipts:
+                    seen_receipts.add(marker)
+                    receipts.append(receipt)
+    except Exception:
+        return None
+    for receipt in reversed(receipts or []):
+        if not isinstance(receipt, dict):
+            continue
+        if (
+            str(receipt.get("contract_kind") or "") == "delegation_zero_run"
+            and bool(receipt.get("zero_run"))
+        ):
+            return dict(receipt)
+    return None
+
+
+def actor_first_terminal_projection(
+    ctx: Any, task: Mapping[str, Any], usage: Mapping[str, Any],
+    llm_trace: Mapping[str, Any], drive_root: Any,
+) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any]]:
+    """Attach the unresolved actor fact to the existing terminal projections."""
+    if ctx is None:
+        return None, dict(usage or {}), dict(llm_trace or {})
+    bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+    if isinstance(bootstrap, dict) and bool(bootstrap.get("zero_run_receipt_recorded")):
+        decision = str(bootstrap.get("zero_run_decision") or "unknown").strip().lower()
+        if decision in {"incomplete", "unknown"}:
+            fact = {
+                "status": decision,
+                "reason": f"configured_actor_zero_run_{decision}",
+                "zero_run": True,
+                "zero_run_decision": decision,
+                "zero_run_basis": str(bootstrap.get("zero_run_basis") or ""),
+                "route_available": bootstrap.get("route_available"),
+            }
+        else:
+            return None, dict(usage or {}), dict(llm_trace or {})
+    else:
+        fact = None
+    try:
+        if fact is None:
+            fact = actor_first_unresolved_fact(
+                ctx, task_id=str(task.get("id") or ""), drive_root=drive_root,
+            )
+    except Exception:
+        if not isinstance(bootstrap, dict):
+            return None, dict(usage or {}), dict(llm_trace or {})
+        fact = {
+            "status": "unknown",
+            "reason": "actor_terminal_projection_unavailable",
+            "route_available": bootstrap.get("route_available"),
+        }
+    if not fact:
+        return None, dict(usage or {}), dict(llm_trace or {})
+    updated_usage = dict(usage or {})
+    updated_usage["actor_first_terminal"] = dict(fact)
+    updated_trace = dict(llm_trace or {})
+    updated_trace["actor_first_terminal"] = dict(fact)
+    return fact, updated_usage, updated_trace
+
+
 def _prepare_actor_first_bootstrap(
     ctx: Any, task: Mapping[str, Any], dispatch: Any,
 ) -> str:
@@ -198,6 +361,14 @@ def _prepare_actor_first_bootstrap(
         "exact_start_pending": True,
         "physical_started": False,
     }
+    durable_zero_run = _durable_zero_run_receipt(ctx)
+    if durable_zero_run:
+        ctx._configured_actor_bootstrap.update({
+            "zero_run_receipt_recorded": True,
+            "zero_run_decision": str(durable_zero_run.get("zero_run_decision") or ""),
+            "zero_run_basis": str(durable_zero_run.get("zero_run_basis") or ""),
+            "exact_start_pending": False,
+        })
     return json.dumps({
         "status": "configured_session_actor_ready",
         "startup": {
@@ -209,8 +380,13 @@ def _prepare_actor_first_bootstrap(
             "work_order_complete": bool(work_order),
             **({"source_channel": source_channel} if source_channel else {}),
             "actor_first": True,
-            "exact_start_pending": True,
+            "exact_start_pending": not bool(durable_zero_run),
             "host_fallback": False,
+            **({
+                "zero_run_receipt_recorded": True,
+                "zero_run_decision": str(durable_zero_run.get("zero_run_decision") or ""),
+                "zero_run_basis": str(durable_zero_run.get("zero_run_basis") or ""),
+            } if durable_zero_run else {}),
         },
     }, ensure_ascii=False, indent=2)
 
@@ -225,7 +401,14 @@ def append_startup_receipt(
     except (TypeError, ValueError):
         receipt = {}
     receipt_status = str(receipt.get("status") or "") if isinstance(receipt, dict) else ""
-    if receipt_status in {"configured_session_wake", "configured_session_recovered_wake"}:
+    startup = receipt.get("startup") if isinstance(receipt, dict) else {}
+    if isinstance(startup, dict) and startup.get("zero_run_receipt_recorded"):
+        guidance = (
+            "A durable delegation_zero_run receipt already closes this actor's physical "
+            "run decision. Do not call delegate_start for the same task; continue only "
+            "with host evidence/children or an explicitly bound new task/retry."
+        )
+    elif receipt_status in {"configured_session_wake", "configured_session_recovered_wake"}:
         guidance = (
             "The receipt proves an existing physical run was started or recovered. "
             "Do not call delegate_start again for this work; supervise the run, inspect "

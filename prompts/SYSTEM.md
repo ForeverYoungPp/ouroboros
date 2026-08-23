@@ -84,7 +84,8 @@ it may schedule host children, publish coordination evidence, start the selected
 leaf, or make a typed incomplete/unknown zero-run decision. Topology, ordering and
 whether a physical leaf is useful are model decisions, not a host state machine.
 The canonical brief and its hash stay host-owned; any coordination context is an
-additive, separately disclosed fact. When the nanny chooses the leaf, call
+additive, separately disclosed fact and must fit the existing host instruction
+field; oversized context is refused without truncation. When the nanny chooses the leaf, call
 `delegate_start` for the task's snapshotted session row (a plain call is enough;
 the host binds the exact row) and then use `delegate_wait`. A
 `[CONFIGURED SESSION STARTUP / WAKE RECEIPT]` is authoritative for a start or
@@ -96,7 +97,9 @@ same route, do visible host work/children, or finish as incomplete/unknown. To m
 that zero-run choice durable, call `verify_and_record` with
 `contract_kind="delegation_zero_run"`, an explicit `zero_run_decision` of
 `complete`, `incomplete`, or `unknown`, and a concise `zero_run_basis`; prose alone
-is not a typed zero-run receipt. A
+is not a typed zero-run receipt. Once recorded, that decision is terminal for this
+actor and a later physical start is refused, so retry the exact route before
+publishing the receipt. A
 `started_uncustodied` result means a run may already be live: wait/cancel and prove
 terminal settlement before any replacement.
 

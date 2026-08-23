@@ -261,15 +261,21 @@ def verification_receipts_path(drive_root: Any, task_id: str, *, create: bool = 
     return artifact_dir / "verification_receipts.jsonl"
 
 
-def append_verification_receipt(drive_root: Any, task_id: str, receipt: Dict[str, Any]) -> None:
-    """Append a host-attested verification receipt for a task. Advisory: a write
-    failure never breaks the tool or task (receipts only shape a transparency flag)."""
+def append_verification_receipt(drive_root: Any, task_id: str, receipt: Dict[str, Any]) -> bool:
+    """Append a host-attested verification receipt and report custody of the write.
+
+    Ordinary verification remains advisory, so existing callers may ignore the
+    boolean.  Actor-first zero-run is different: its receipt is the only durable
+    fact that no physical leaf was started, therefore that caller must fail closed
+    when the append cannot be written rather than claiming a recorded decision.
+    """
     try:
         from ouroboros.utils import append_jsonl
 
-        append_jsonl(verification_receipts_path(drive_root, task_id, create=True), receipt)
+        return bool(append_jsonl(verification_receipts_path(drive_root, task_id, create=True), receipt))
     except Exception:  # advisory but never silent: the task would render unverified
         log.warning("Failed to append verification receipt for task %s", task_id, exc_info=True)
+        return False
 
 
 def read_verification_receipts(drive_root: Any, task_id: str) -> List[Dict[str, Any]]:
@@ -853,6 +859,11 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     usage_status = str(usage.get("execution_status") or usage.get("result_status") or "").strip()
     usage_reason = str(usage.get("reason_code") or "").strip()
     resource_limit = dict(usage.get("resource_limit") or {}) if isinstance(usage.get("resource_limit"), dict) else {}
+    actor_first_terminal = (
+        dict(usage.get("actor_first_terminal"))
+        if isinstance(usage.get("actor_first_terminal"), dict)
+        else {}
+    )
     text = str(final_text or "")
     failure: Dict[str, Any] | None = None
     execution_status = EXECUTION_OK
@@ -984,6 +995,23 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "tool_errors": tool_errors[:20],
         }
 
+    # A configured actor that reaches finalization with neither a started leaf,
+    # a direct host child, nor a typed zero-run receipt has an unresolved
+    # lifecycle fact.  Keep the task deliverable visible, but never let this
+    # path read as a clean execution merely because the model wrote prose.
+    if actor_first_terminal and execution_status == EXECUTION_OK:
+        actor_status = str(actor_first_terminal.get("status") or "unknown")
+        if actor_status not in {"incomplete", "unknown"}:
+            actor_status = "unknown"
+        reason_code = f"configured_actor_{actor_status}"
+        execution_status = EXECUTION_DEGRADED
+        failure = {
+            "kind": "configured_actor",
+            "status": actor_status,
+            "reason_code": reason_code,
+            **actor_first_terminal,
+        }
+
     # A skipped-or-bypassed eligible panel is not a verdict, but cannot remain clean;
     # preserve stronger classifications and degrade only the false-green remainder.
     # Honest reachability (measured, not asserted): the FORCED-rail bypass reasons
@@ -1007,6 +1035,12 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
 
     review = _review_axis(llm_trace)
     objective = _objective_axis(review)
+    if actor_first_terminal and objective.get("status") != OBJECTIVE_FAIL:
+        objective.update({
+            "status": OBJECTIVE_DEGRADED,
+            "source": "configured_actor_terminal",
+            "actor_status": str(actor_first_terminal.get("status") or "unknown"),
+        })
     plan_gate = _trace_mapping(llm_trace, "force_plan_decision")
     _plan_gate_status = str(plan_gate.get("status") or "")
     if str(plan_gate.get("enforcement") or "") == "blocking" and (
@@ -1102,6 +1136,7 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "cosmetic_tool_errors": cosmetic_tool_errors[:20],
             "ignored_tool_errors": ignored_tool_errors[:20],
             "policy_denials": policy_denials[:20],
+            **({"actor_first_terminal": actor_first_terminal} if actor_first_terminal else {}),
             **({"mutation_attribution": mutation_attribution} if mutation_attribution else {}),
         },
         "artifacts": {"status": "not_applicable"},
@@ -1131,6 +1166,7 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         # which downstream consumers must interpret via the contract, not as a failure.
         "final_answer_missing_sentinel": not final_answer_payload,
         "failure": headline_failure,
+        **({"actor_first_terminal": actor_first_terminal} if actor_first_terminal else {}),
         "recoveries": recovered_tool_errors[:20],
         "usage": {
             "cost_usd": (

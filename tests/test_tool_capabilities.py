@@ -655,6 +655,7 @@ def test_local_readonly_subagent_initial_schemas_are_allowlisted(tmp_path):
     assert LOCAL_READONLY_SUBAGENT_TOOL_NAMES <= names
     assert "enable_tools" not in names
     assert "schedule_subagent" in names
+    assert "verify_and_record" not in names
     assert "write_file" not in names
     assert "run_command" not in names
     assert "browse_page" in names
@@ -671,6 +672,70 @@ def test_local_readonly_subagent_initial_schemas_are_allowlisted(tmp_path):
     assert schemas["browse_page"]["parameters"]["properties"]["engine"]["enum"] == ["chromium", "webkit"]
     assert "device" in schemas["browse_page"]["parameters"]["properties"]
     assert list_non_core_tools(registry) == []
+
+
+def test_local_readonly_verify_is_typed_zero_run_only(tmp_path):
+    """Readonly actor-first sessions may disclose no-leaf state, never run generic checks."""
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.outcomes import read_verification_receipts
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    data = tmp_path / "data"
+    data.mkdir()
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        drive_root=data,
+        task_id="readonly-actor",
+        task_constraint=TaskConstraint(mode="local_readonly_subagent", allow_enable=False),
+    )
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+    }
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=data)
+    registry.set_context(ctx)
+
+    from ouroboros.tool_policy import initial_tool_schemas
+    initial_names = {item["function"]["name"] for item in initial_tool_schemas(registry)}
+    assert "verify_and_record" in initial_names
+    verify_schema = registry.get_schema_by_name("verify_and_record")
+    assert verify_schema is not None
+    assert verify_schema["function"]["parameters"]["properties"]["contract_kind"]["enum"] == ["delegation_zero_run"]
+    assert "check" not in verify_schema["function"]["parameters"]["properties"]
+
+    blocked = registry.execute(
+        "verify_and_record",
+        {"contract_kind": "explicit_command", "check": [sys.executable, "-c", "print('must not run')"]},
+    )
+    assert "local_readonly_subagent" in blocked
+    assert read_verification_receipts(data, "readonly-actor") == []
+
+    allowed = registry.execute(
+        "verify_and_record",
+        {
+            "contract_kind": "delegation_zero_run",
+            "zero_run_decision": "unknown",
+            "zero_run_basis": "The configured route has not started a physical leaf.",
+        },
+    )
+    assert "UNKNOWN" in allowed
+    receipts = read_verification_receipts(data, "readonly-actor")
+    assert receipts[-1]["contract_kind"] == "delegation_zero_run"
+    assert registry.get_schema_by_name("verify_and_record") is None
+
+    # A forced direct handler call must also fail closed after the physical leaf
+    # starts, even if a caller bypasses registry schema/dispatch discovery.
+    ctx._configured_actor_bootstrap["physical_started"] = True
+    assert registry.get_schema_by_name("verify_and_record") is None
+    from ouroboros.tools.verify import _verify_and_record
+    late = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="complete",
+        zero_run_basis="too late",
+    )
+    assert "LOCAL_READONLY_SUBAGENT_BLOCKED" in late
 
 
 def test_local_readonly_subagent_execute_blocks_forbidden_tools(tmp_path, monkeypatch):

@@ -329,6 +329,31 @@ def test_actor_first_host_coordination_suppresses_zero_leaf_accusation(tmp_path)
     assert _run(undispatched, [], []) is False
 
 
+def test_actor_first_plain_finalization_requires_typed_zero_run_or_leaf(tmp_path):
+    from ouroboros.loop import _nanny_finalization_message
+
+    drive = _custody_drive(tmp_path)
+    ctx = SimpleNamespace(
+        _nanny_route_dispatched=True,
+        _nanny_finalization_injected=False,
+        _nanny_coordination_activity=True,
+        task_id="actor-1",
+        task_metadata={"budget_drive_root": str(drive)},
+        _configured_actor_bootstrap={
+            "route_available": True,
+            "exact_start_pending": True,
+            "physical_started": False,
+            "zero_run_receipt_recorded": False,
+            "selected_subagent_id": "session-a",
+        },
+    )
+    message = _nanny_finalization_message(
+        _tools(ctx, ["delegate_start", "verify_and_record"]), drive, "actor-1",
+    )
+    assert "CONFIGURED_ACTOR_INCOMPLETE" in message
+    assert "delegation_zero_run" in message
+
+
 def _forced_run(tmp_path, nanny, tool_calls):
     import pathlib
     from unittest.mock import patch
