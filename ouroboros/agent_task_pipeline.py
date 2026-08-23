@@ -1010,9 +1010,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)
             # Apply FR3 before normalization so the persisted axes and ledger agree.
             apply_receipt_absent_flag(
-                loop_outcome, llm_trace,
-                env.drive_root,
-                str(task.get("id") or ""),
+                loop_outcome, llm_trace, env.drive_root, str(task.get("id") or ""),
                 expected_output=str(task.get("expected_output") or ""),
                 receipts=task_verification_receipts(None, env.drive_root, task),
             )

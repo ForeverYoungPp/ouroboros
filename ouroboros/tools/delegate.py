@@ -1470,7 +1470,7 @@ def get_tools() -> List[ToolEntry]:
                     "Complete task for a direct start; for an actor-first snapshotted session, "
                     "only optional advisory coordination context (the host supplies the canonical work order)."},
                 "subagent_id": {"type": "string", "description":
-                    "Required for a direct fresh start: exact agent_session actor id from Available "
+                    "Required for a fresh start made directly: exact agent_session actor id from Available "
                     "subagents. Omit for the current actor-first snapshotted route and for retry_of. API actor ids are refused here "
                     "and must be scheduled as recursive children."},
                 "root": {"type": "string", "enum": ["skill_payload"], "description":

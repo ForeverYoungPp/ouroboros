@@ -582,9 +582,7 @@ def test_actor_first_delegate_start_binds_snapshot_and_canonical_work_order(monk
         },
     )
 
-    out = json.loads(runtime.delegate_start_entry(
-        ctx, "Split the work into the smallest useful pass", subagent_id="session-builder",
-    ))
+    out = json.loads(runtime.delegate_start_entry(ctx, ""))
     assert out["status"] == "started"
     assert calls == [(
         "OBJECTIVE\nBuild the patch",
@@ -592,9 +590,22 @@ def test_actor_first_delegate_start_binds_snapshot_and_canonical_work_order(monk
             "snapshot": snapshot,
             "compiled_work_order": True,
             "work_order_fingerprint": "full-work-order-sha",
-            "_coordination_context": "Split the work into the smallest useful pass",
+            "_coordination_context": "",
         },
     )]
+
+
+def test_selectorless_fresh_start_outside_actor_first_is_refused(tmp_path):
+    import ouroboros.subagent_runtime as runtime
+    from ouroboros.tools.registry import ToolContext
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "ordinary-root"
+
+    out = json.loads(runtime.delegate_start_entry(ctx, ""))
+
+    assert out["status"] == "refused"
+    assert out["reason"] == "subagent_selection_required"
 
 
 def test_actor_first_start_marks_physical_activity_and_closes_zero_run(monkeypatch, tmp_path):
