@@ -56,6 +56,7 @@ import {
     isTerminalTaskDetail,
     isTerminalTaskPhase,
     liveLineRowToggleKey,
+    mainThreadAccepts,
     mergeStickyCostMeta,
     partitionLocalEchoJournal,
     projectCollapsedActivity,
@@ -65,6 +66,7 @@ import {
     routingAnnotationText,
     taskCostMeta,
     taskCostProjection,
+    unconfirmedForegroundCardIds,
 } from './chat_activity.js';
 
 export {
@@ -726,13 +728,9 @@ export function createChatInstance({
     }
 
     function setStatus(kind, text) {
-        // perf2 P4.3: replay frames write the composer status once per batch
-        // (last write wins), not once per historical frame.
-        if (_rebuildBatch) {
-            _rebuildBatch.status = { kind, text };
-            return;
-        }
-        if (!statusBadge) return;
+        // perf2 P4.3: replay frames never touch the badge; the reducer
+        // (syncChatStatus) writes it once after the batch.
+        if (_rebuildBatch || !statusBadge) return;
         statusBadge.className = `status-badge ${kind}`;
         statusBadge.textContent = text;
     }
@@ -3008,7 +3006,7 @@ export function createChatInstance({
         return hydrationGatePromise;
     }
 
-    // Apply deferred card/status/storage work once after the replay batch mounts.
+    // Apply deferred card/typing/storage work once after the replay batch mounts.
     function finalizeRebuildBatch(batch) {
         for (const record of batch.touched) {
             renderLiveCardMeta(record);
@@ -3016,13 +3014,6 @@ export function createChatInstance({
             syncLiveCardLayout(record);
         }
         if (batch.typingHidden) hideTypingIndicatorOnly();
-        if (batch.status) {
-            // Post-mount truth: an unfinished mounted foreground card keeps
-            // the composer on "Working..." exactly like the live path, where
-            // hasActiveLiveCard() sees connected roots during replay.
-            if (hasActiveLiveCard()) setStatus('thinking', 'Working...');
-            else setStatus(batch.status.kind, batch.status.text);
-        }
         persistVisibleHistory();
     }
 
@@ -4173,6 +4164,12 @@ export function createChatInstance({
         for (const taskId of globallyActiveActivityIds) missingManagedTaskIds.delete(taskId);
         for (const taskId of departedManagedTaskIds) revokeManagedTaskCancelAuthority(taskId);
         for (const taskId of disappearedManagedTaskIds) observeMissingManagedTask(taskId);
+        for (const taskId of unconfirmedForegroundCardIds(
+            Array.from(liveCardRecords, ([id, r]) => ({
+                id, finished: r.finished, isSubagent: r.isSubagent, connected: r.root?.isConnected,
+            })),
+            globallyActiveActivityIds,
+        )) observeMissingManagedTask(taskId);
         // Null or nonterminal detail retries on the next authoritative snapshot.
         for (const taskId of missingManagedTaskIds) {
             if (!activeDirectActivities.has(taskId)) void reconcileMissingManagedTask(taskId);
@@ -4211,7 +4208,7 @@ export function createChatInstance({
     const isMyThread = (msg) => {
         const cid = Number(msg?.chat_id ?? 1);
         if (isMain) {
-            return !isKnownProjectFrame(msg);
+            return mainThreadAccepts(msg, state.projectChatIds);
         }
         return cid === chatId;
     };

@@ -367,3 +367,91 @@ def test_budget_line_marks_quarantined_tail_nonfinal(monkeypatch, tmp_path):
 
     assert "cost_final no" in line
     assert "ledger_integrity DEGRADED (quarantined ledger tail)" in line
+
+
+def _registry_with_project(tmp_path):
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(tmp_path, "happy-farm", name="Happy Farm")
+    return int(project["chat_id"])
+
+
+def test_broadcast_stamps_project_thread_for_registry_chat_only(monkeypatch, tmp_path):
+    """The broadcast choke stamps ``project_thread`` when the final chat_id is a
+    reserved Project thread, so Main can reject a project it has not learned
+    yet; main (1), legacy (0) and transport-shaped ids stay unstamped."""
+    project_chat = _registry_with_project(tmp_path)
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+
+    bridge.send_message(project_chat, "in project", task_id="t-proj", is_progress=True)
+    bridge.send_message(1, "in main", task_id="t-main", is_progress=True)
+    bridge.send_message(197422551, "via telegram", task_id="t-tg", is_progress=True)
+    bridge.push_log({"type": "tool_call", "task_id": "t-proj", "chat_id": project_chat})
+    bridge.push_log({"type": "tool_call", "task_id": "t-main"})
+
+    chats = [f for f in frames if f.get("type") == "chat"]
+    assert chats[0]["chat_id"] == project_chat and chats[0]["project_thread"] is True
+    assert "project_thread" not in chats[1]
+    assert "project_thread" not in chats[2]
+    logs = [f for f in frames if f.get("type") == "log"]
+    assert logs[0]["project_thread"] is True
+    assert "project_thread" not in logs[1]
+
+
+def test_media_broadcasts_stamp_project_thread(monkeypatch, tmp_path):
+    project_chat = _registry_with_project(tmp_path)
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "store_chat_media_bytes", lambda *a, **k: "")
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+
+    bridge.send_photo(project_chat, b"\x89PNG", caption="p")
+    bridge.send_video(project_chat, b"\x00\x00", caption="v")
+    bridge.send_document(project_chat, b"%PDF", filename="a.pdf", caption="d")
+    bridge.send_photo(1, b"\x89PNG", caption="main")
+
+    media = [f for f in frames if f.get("type") in ("photo", "video", "document")]
+    assert [f.get("project_thread") for f in media] == [True, True, True, None]
+
+
+def test_project_thread_lens_follows_registry_file(monkeypatch, tmp_path):
+    """The lens is mtime-cached: a project created after the first lookup is
+    visible without a process restart."""
+    from ouroboros.projects_registry import create_project, project_thread_chat_ids
+
+    assert project_thread_chat_ids(tmp_path) == frozenset()
+    first = int(create_project(tmp_path, "one")["chat_id"])
+    assert first in project_thread_chat_ids(tmp_path)
+
+
+def test_project_thread_stamp_survives_meta_and_covers_typing_and_echo(monkeypatch, tmp_path):
+    """The marker is the LAST writer keyed on the FINAL chat_id (progress meta can
+    neither spoof nor erase it), and the typing + user-echo seams carry it too."""
+    project_chat = _registry_with_project(tmp_path)
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+
+    bridge.send_message(project_chat, "p", task_id="t1", is_progress=True,
+                        progress_meta={"project_thread": False})
+    bridge.send_message(1, "m", task_id="t2", is_progress=True,
+                        progress_meta={"project_thread": True})
+    bridge.send_chat_action(project_chat, "typing", activity_id="a1")
+    bridge.send_chat_action(1, "typing", activity_id="a2")
+    bridge.handle_web_message("hi", chat_id=project_chat)
+    bridge.handle_web_message("hi main", chat_id=1)
+
+    chats = [f for f in frames if f.get("type") == "chat" and f.get("role") != "user"]
+    assert chats[0]["project_thread"] is True      # meta cannot erase
+    assert "project_thread" not in chats[1]        # meta cannot spoof
+    typing = [f for f in frames if f.get("type") == "typing"]
+    assert typing[0]["project_thread"] is True
+    assert "project_thread" not in typing[1]
+    echoes = [f for f in frames if f.get("role") == "user"]
+    assert echoes[0]["project_thread"] is True
+    assert "project_thread" not in echoes[1]

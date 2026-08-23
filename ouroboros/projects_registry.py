@@ -423,6 +423,48 @@ def reserved_project_chat_ids(drive_root: Any) -> set:
     return out
 
 
+_THREAD_LENS_CACHE: Dict[str, tuple] = {}
+
+
+def project_thread_chat_ids(drive_root: Any) -> frozenset:
+    """Per-frame lens over :func:`reserved_project_chat_ids` for the live bus.
+
+    The broadcast choke (``supervisor.message_bus``) stamps every outbound
+    frame whose final ``chat_id`` is a reserved Project thread, so the browser
+    can keep a project it has not learned yet out of Main. One ``stat`` per
+    frame; the set is rebuilt only when the registry file changes.
+    """
+    path = _registry_path(drive_root)
+    try:
+        st = path.stat()
+        stamp: Any = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    key = str(path)
+    cached = _THREAD_LENS_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    ids = frozenset(reserved_project_chat_ids(drive_root))
+    _THREAD_LENS_CACHE[key] = (stamp, ids)
+    return ids
+
+
+def project_thread_marker(drive_root: Any, chat_id: int) -> Dict[str, bool]:
+    """``{"project_thread": True}`` iff ``chat_id`` is a reserved Project thread.
+
+    The live broadcast choke (``supervisor.message_bus``) spreads this into
+    every outbound frame so Main's fan-out can reject a not-yet-learned
+    Project frame. Registry MEMBERSHIP, never a numeric range: external
+    transport ids (Telegram) are not members and stay unstamped.
+    """
+    try:
+        if drive_root is not None and int(chat_id or 0) in project_thread_chat_ids(drive_root):
+            return {"project_thread": True}
+    except Exception:
+        log.debug("Project thread lens failed for chat %s", chat_id, exc_info=True)
+    return {}
+
+
 def registered_project_chat_ids(drive_root: Any) -> set:
     """One-minor compatibility alias for :func:`reserved_project_chat_ids`."""
     key = str(pathlib.Path(drive_root).resolve(strict=False))
