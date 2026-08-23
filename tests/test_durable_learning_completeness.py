@@ -355,7 +355,9 @@ def test_bgc_direct_identity_update_requires_complete_named_omission(tmp_path):
         # completeness guard binds the source's raw bytes.  Keep the fixture
         # platform-independent and prove the guard accepts a CRLF source.
         backlog = tmp_path / "memory" / "knowledge" / "improvement-backlog.md"
-        backlog.write_bytes(backlog.read_bytes().replace(b"\n", b"\r\n"))
+        backlog.write_bytes(
+            backlog.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        )
         context = bc._build_context()
         assert "knowledge_read" in context and "improvement-backlog" in context
         content = "I remain directly self-authoring after complete source materialization."
