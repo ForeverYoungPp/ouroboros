@@ -373,8 +373,9 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         assert re.search(rf"@property \{{string=\}} {field}\b", text), f"ChatOutbound missing {field}"
     assert re.search(r"@property \{\?number=\} cost_usd\b", text), "ChatOutbound cost_usd must be nullable"
     assert re.search(r"@property \{number=\} chat_id\b", text), "ChatOutbound missing chat_id"
-    # Main-thread fan-out stamp: every outbound frame family the browser routes by
-    # thread declares the same additive-optional boolean in both mirrors.
+    # Main-thread fan-out stamp: every card/bubble-MINTING outbound frame family
+    # declares the same additive-optional boolean in both mirrors (message_annotation
+    # is thread-routed but no-ops on unknown ids and stays unstamped by design).
     for cls in (ChatOutbound, PhotoOutbound, VideoOutbound, DocumentOutbound, LogOutbound, TypingOutbound):
         assert "project_thread" in get_type_hints(cls, include_extras=True), f"{cls.__name__} missing project_thread"
     assert len(re.findall(r"@property \{boolean=\} project_thread\b", text)) >= 6, "api_types.js missing project_thread mirrors"

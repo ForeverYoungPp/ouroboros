@@ -267,16 +267,6 @@ export function createStateSnapshotSequencer(onApply, now = () => Date.now()) {
 }
 
 /**
- * Single status reducer for the chat header (owner decisions 2A/5A; managed
- * activities added by the project-continuity contract). Priority: disconnected
- * > background live card (Working...) > admitted managed work (Working...) >
- * server-confirmed direct/ephemeral turns (Thinking...) > local pending
- * submissions (Sending...) > queue-admitted but unstarted managed work
- * (Queued...) > terminal attention > idle. A queued task ranks below
- * Sending... because an unacknowledged local submission is the more actionable
- * state. Pure over its inputs for dependency-free node tests.
- */
-/**
  * Main-thread fan-out gate for a live WS frame.
  *
  * Main adopts a frame only when the server did NOT stamp it as a Project
@@ -294,6 +284,16 @@ export function mainThreadAccepts(msg, projectChatIds) {
     return !(projectChatIds instanceof Set && projectChatIds.has(cid));
 }
 
+/**
+ * Single status reducer for the chat header (owner decisions 2A/5A; managed
+ * activities added by the project-continuity contract). Priority: disconnected
+ * > background live card (Working...) > admitted managed work (Working...) >
+ * server-confirmed direct/ephemeral turns (Thinking...) > local pending
+ * submissions (Sending...) > queue-admitted but unstarted managed work
+ * (Queued...) > terminal attention > idle. A queued task ranks below
+ * Sending... because an unacknowledged local submission is the more actionable
+ * state. Pure over its inputs for dependency-free node tests.
+ */
 export function computeDerivedChatStatus({
     isConnected = true,
     hasActiveLiveCard = false,

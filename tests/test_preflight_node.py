@@ -368,3 +368,6 @@ def test_node_options_cannot_green_a_red_suite(tmp_path, monkeypatch):
 
     assert result["returncode"] not in (0, None)
     assert "NODE_TESTS_FAILED" in result["error"]
+    # The suite genuinely EXECUTED and named its red test — the scrub, not an
+    # option-rejection exit, produced the failure (wave-2 hardening).
+    assert "boom_marker_test" in result["error"]

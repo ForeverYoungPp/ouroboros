@@ -446,9 +446,13 @@ def test_project_thread_stamp_survives_meta_and_covers_typing_and_echo(monkeypat
     bridge.handle_web_message("hi", chat_id=project_chat)
     bridge.handle_web_message("hi main", chat_id=1)
 
+    bridge.send_message(1, "rehomed", task_id="t3", is_progress=True,
+                        progress_meta={"chat_id": project_chat})
+
     chats = [f for f in frames if f.get("type") == "chat" and f.get("role") != "user"]
     assert chats[0]["project_thread"] is True      # meta cannot erase
     assert "project_thread" not in chats[1]        # meta cannot spoof
+    assert chats[2]["project_thread"] is True      # stamp keys on the FINAL chat_id
     typing = [f for f in frames if f.get("type") == "typing"]
     assert typing[0]["project_thread"] is True
     assert "project_thread" not in typing[1]
