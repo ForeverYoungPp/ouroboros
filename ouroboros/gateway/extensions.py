@@ -307,9 +307,10 @@ def _build_extensions_index(drive_root, repo_path):
 
     # Inline ClawHub provenance so Installed UI avoids a second round-trip.
     try:
-        from ouroboros.marketplace.provenance import read_provenance
+        from ouroboros.marketplace.provenance import read_provenance, read_publication_record
     except Exception:  # pragma: no cover — defensive
         read_provenance = lambda *_a, **_kw: None  # type: ignore[assignment]
+        read_publication_record = lambda *_a, **_kw: (None, None)  # type: ignore[assignment]
     marketplace_enabled = True
 
     catalog = []
@@ -416,6 +417,16 @@ def _build_extensions_index(drive_root, repo_path):
         presence_runtime = presence_runtime_card_projection(drive_root, s)
         if presence_runtime is not None:
             entry["presence_runtime"] = presence_runtime
+        # Durable OuroborosHub publication receipt (state-plane, survives bucket
+        # moves). Collision rows above deliberately never read state, so these
+        # fields are absent there. published=null when no valid record exists;
+        # published_malformed=true when the file exists but fails validation.
+        try:
+            published, published_diagnostic = read_publication_record(drive_root, s.name)
+        except Exception:  # pragma: no cover — defensive
+            published, published_diagnostic = None, None
+        entry["published"] = published
+        entry["published_malformed"] = published_diagnostic is not None
         if s.source == "clawhub":
             try:
                 prov = read_provenance(drive_root, s.name) or {}
