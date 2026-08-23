@@ -759,8 +759,9 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 assert page.locator(f"{progress_card} .chat-live-phase").inner_text().strip() == "Done"
                 _wait_status(page, "Online")
 
-                # Even a synthetically kind-stamped known subagent never gains
-                # root task-detail convergence authority.
+                # A kind-stamped known subagent still gains no convergence
+                # authority; the minted parent ROOT card is now named by the
+                # card-set reconcile — hence one extra parent-root read.
                 state["activities"] = []
                 page.evaluate(
                     """() => {
@@ -781,7 +782,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 page.wait_for_timeout(200)
                 assert page.evaluate("() => window.__taskDetailCalls") == [
                     "truth-root", "truth-root", "truth-root", "rehome-root", "active",
-                    "progress-only-root",
+                    "progress-only-root", "parent-root",
                 ]
             finally:
                 browser.close()
