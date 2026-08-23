@@ -50,6 +50,68 @@ def test_owner_state_policy_matches_legacy_wrappers(tmp_path, monkeypatch):
         assert gateway_files._is_owner_only_file(target) is True
 
 
+def test_publication_receipt_is_owner_state_across_wrappers(tmp_path, monkeypatch):
+    """The OuroborosHub publication receipt is owner state: filename, stem,
+    case-variant paths, and every legacy wrapper must all agree."""
+    from ouroboros import config as cfg
+    from ouroboros.contracts.skill_payload_policy import (
+        SKILL_OWNER_STATE_FILENAMES,
+        SKILL_OWNER_STATE_STEMS,
+    )
+    from ouroboros.gateway import files as gateway_files
+    from ouroboros.tools import core
+
+    assert "ouroboroshub.json" in SKILL_OWNER_STATE_FILENAMES
+    assert "ouroboroshub" in SKILL_OWNER_STATE_STEMS
+
+    data_root = tmp_path / "data"
+    monkeypatch.setattr(cfg, "DATA_DIR", data_root, raising=True)
+
+    for parts in (("state", "skills"), ("State", "Skills")):
+        target = data_root.joinpath(*parts) / "weather" / "ouroboroshub.json"
+        assert is_skill_owner_state_target(target, data_root) is True
+        assert core._is_skill_owner_state_target(target, data_root) is True
+        assert gateway_files._is_skill_owner_state_target(target) is True
+        assert gateway_files._is_owner_only_file(target) is True
+
+
+def test_publication_receipt_hardlink_alias_is_owner_state(tmp_path, monkeypatch):
+    from ouroboros import config as cfg
+    from ouroboros.gateway import files as gateway_files
+
+    data_root = tmp_path / "data"
+    state_dir = data_root / "state" / "skills" / "weather"
+    state_dir.mkdir(parents=True)
+    record = state_dir / "ouroboroshub.json"
+    record.write_text("{}", encoding="utf-8")
+    alias = data_root / "memory" / "receipt-copy.json"
+    alias.parent.mkdir(parents=True)
+    try:
+        os.link(record, alias)
+    except OSError:
+        pytest.skip("Hardlinks unavailable on this filesystem")
+    monkeypatch.setattr(cfg, "DATA_DIR", data_root, raising=True)
+
+    assert is_skill_owner_state_alias(alias, data_root) is True
+    assert gateway_files._is_owner_only_file(alias) is True
+
+
+def test_publication_receipt_stem_reaches_shell_guard(tmp_path):
+    from ouroboros.tools.registry import ToolRegistry
+
+    repo = tmp_path / "repo"
+    drive = tmp_path / "data"
+    repo.mkdir()
+    drive.mkdir()
+    reg = ToolRegistry(repo_dir=repo, drive_root=drive)
+    blocked = reg._run_shell_safety_check(
+        {"cmd": "rm data/state/skills/weather/ouroboroshub.json"},
+        "advanced",
+    )
+    assert blocked is not None
+    assert "SKILL_STATE_WRITE_BLOCKED" in blocked
+
+
 def test_owner_state_alias_policy_matches_files_api(tmp_path, monkeypatch):
     from ouroboros import config as cfg
     from ouroboros.gateway import files as gateway_files
