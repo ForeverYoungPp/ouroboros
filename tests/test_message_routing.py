@@ -10,6 +10,7 @@ import pathlib
 import sys
 import os
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -94,7 +95,9 @@ class TestOwnerInjectPerTask(unittest.TestCase):
         controls = _drain_incoming_messages(
             messages, _q.Queue(), self.drive_root, "t10", None, set()
         )
-        self.assertEqual(controls, {"finalize_now": "hard_timeout"})
+        self.assertEqual(controls["finalize_now"], "hard_timeout")
+        self.assertGreater(controls["finalize_deadline_ts"], time.time())
+        self.assertLessEqual(controls["finalize_deadline_ts"], time.time() + 121)
         joined = json.dumps(messages, ensure_ascii=False)
         self.assertIn("keep going please", joined)
         self.assertNotIn("hard_timeout", joined)

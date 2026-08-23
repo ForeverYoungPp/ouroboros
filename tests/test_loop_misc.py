@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 from types import SimpleNamespace
 
 import ouroboros.loop as loop_mod
@@ -100,7 +101,8 @@ def test_owner_directives_survive_compaction_without_control_prose(tmp_path):
         owner_ctx=ctx,
     )
 
-    assert controls == {"finalize_now": "deadline control"}
+    assert controls["finalize_now"] == "deadline control"
+    assert time.time() < controls["finalize_deadline_ts"] <= time.time() + 121
     assert [row["source"] for row in ctx._owner_directives] == [
         "initial_user", "direct_incoming", "owner_mailbox",
     ]
