@@ -518,6 +518,80 @@ def test_extensions_index_collision_does_not_reconcile_stale_review_job(
         _stop_patches(patches)
 
 
+def test_extensions_index_rows_carry_publication_receipt_fields(tmp_path, monkeypatch):
+    """Every unique row projects the state-plane OuroborosHub publication
+    receipt: absent -> published null / not malformed; valid record -> the
+    published object as stored; malformed record -> null + malformed flag."""
+    from ouroboros.marketplace.provenance import write_publication_record
+
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    _write_ext(
+        drive_root / "skills" / "external", "alpha",
+        permissions=[], plugin="def register(api):\n    pass\n",
+    )
+    published = {
+        "slug": "alpha",
+        "version": "0.1.0",
+        "content_hash": "d" * 64,
+        "repository": "hub/project",
+        "pr_number": 7,
+        "pr_url": "https://github.com/hub/project/pull/7",
+        "published_at": "2026-08-23T00:00:00+00:00",
+    }
+
+    def _row():
+        response = client.get("/api/extensions")
+        assert response.status_code == 200
+        rows = [row for row in response.json()["skills"] if row["name"] == "alpha"]
+        assert len(rows) == 1
+        return rows[0]
+
+    try:
+        row = _row()
+        assert row["published"] is None
+        assert row["published_malformed"] is False
+
+        write_publication_record(drive_root, "alpha", published)
+        row = _row()
+        assert row["published"] == published
+        assert row["published_malformed"] is False
+
+        record_path = drive_root / "state" / "skills" / "alpha" / "ouroboroshub.json"
+        record_path.write_text("not json", encoding="utf-8")
+        row = _row()
+        assert row["published"] is None
+        assert row["published_malformed"] is True
+    finally:
+        _stop_patches(patches)
+
+
+def test_extensions_index_collision_rows_omit_publication_receipt_fields(tmp_path, monkeypatch):
+    """Collision rows never read per-skill state (existing pin), so the
+    publication-receipt fields are absent there rather than null."""
+    checkout = tmp_path / "user-skills"
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(checkout))
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    _write_ext(
+        drive_root / "skills" / "external", "alpha",
+        permissions=[], plugin="def register(api):\n    pass\n",
+    )
+    _write_ext(
+        checkout, "alpha", permissions=[],
+        plugin="def register(api):\n    pass\n",
+    )
+    try:
+        response = client.get("/api/extensions")
+        assert response.status_code == 200
+        rows = response.json()["skills"]
+        assert len(rows) == 2
+        assert all("collision" in row["load_error"].lower() for row in rows)
+        for row in rows:
+            assert "published" not in row
+            assert "published_malformed" not in row
+    finally:
+        _stop_patches(patches)
+
+
 def test_api_extension_manifest_returns_metadata(tmp_path, monkeypatch):
     skills_root = tmp_path / "skills"
     plugin = "def register(api):\n    pass\n"
