@@ -12,6 +12,7 @@ import {
     boundedText,
     emitSkillLifecycle,
     escapeHtmlAttr as escapeHtml,
+    fetchJson,
     grantReady,
     renderSkillRepairPrompt,
     reviewTone,
@@ -74,6 +75,33 @@ function sortSkillsForDisplay(skills) {
         if (!a.lifecycle_virtual && b.lifecycle_virtual) return 1;
         return installedTime(b) - installedTime(a) || String(a.name || '').localeCompare(String(b.name || ''));
     });
+}
+
+
+// OuroborosHub catalog snapshot for the display-only My-skills sync badges
+// (hub_sync verdict). Fetched once per Skills page open and reused across
+// re-renders; fail-soft — a failed fetch only hides catalog-derived badges.
+const hubCatalog = { promise: null, available: false, byName: new Map() };
+
+function loadHubCatalog(force = false) {
+    if (force) hubCatalog.promise = null;
+    if (!hubCatalog.promise) {
+        hubCatalog.promise = fetchJson('/api/marketplace/ouroboroshub/catalog')
+            .then((data) => {
+                const byName = new Map();
+                for (const row of data.results || []) {
+                    const key = String(row.sanitized_name || row.slug || '');
+                    if (key && !byName.has(key)) byName.set(key, row);
+                }
+                hubCatalog.byName = byName;
+                hubCatalog.available = true;
+            })
+            .catch(() => {
+                hubCatalog.byName = new Map();
+                hubCatalog.available = false;
+            });
+    }
+    return hubCatalog.promise;
 }
 
 
@@ -193,7 +221,10 @@ function updateQueueBadges(events) {
 
 
 async function renderSkillsList(container, emptyEl, reviewingSkills = new Set(), repairingSkills = new Set()) {
-    const { skillsRepoConfigured, githubTokenConfigured, skills, live } = await fetchSkills();
+    const [{ skillsRepoConfigured, githubTokenConfigured, skills, live }] = await Promise.all([
+        fetchSkills(),
+        loadHubCatalog(),
+    ]);
     if (!skills.length && !skillsRepoConfigured) {
         container.innerHTML = '';
         if (emptyEl) emptyEl.hidden = false;
@@ -205,7 +236,11 @@ async function renderSkillsList(container, emptyEl, reviewingSkills = new Set(),
         reviewingSkills,
         repairingSkills,
         live,
-        { githubTokenConfigured },
+        {
+            githubTokenConfigured,
+            hubCatalogByName: hubCatalog.byName,
+            hubCatalogAvailable: hubCatalog.available,
+        },
     )).join('')
         || '<div class="muted">No skills yet. Add one from <b>ClawHub</b> or <b>OuroborosHub</b>.</div>';
 }
@@ -855,6 +890,8 @@ export function initSkills(ctx) {
 
     window.addEventListener('ouro:page-shown', (event) => {
         if (event.detail?.page === 'skills') {
+            // Fresh catalog snapshot once per page open; re-renders reuse it.
+            loadHubCatalog(true);
             renderFn();
         }
     });

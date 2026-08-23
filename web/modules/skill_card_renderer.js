@@ -6,6 +6,7 @@ import {
     safeExternalHrefAttr as safeExternalUrl,
 } from './utils.js';
 import { formatRelativeAge, installedTime, renderToneBadge } from './ui_helpers.js';
+import { hubListingRowFor, hubSyncVerdict } from './hub_sync.js';
 
 function hasSkillUiTab(skill, live = {}) {
     return (live?.ui_tabs || []).some((tab) => (tab?.skill || tab?.skill_name || tab?.extension || '') === skill.name);
@@ -112,6 +113,36 @@ function statusChip(skill, action, live) {
     } else if (skill.enabled) status = { tone: 'ok', label: 'Enabled' };
     const attrs = action.action ? `data-skill="${escapeHtml(skill.name)}" data-skill-action="${escapeHtml(action.action)}" role="button" tabindex="0"` : '';
     return `<span class="skills-status-chip skills-status-${status.tone} ${action.action ? 'is-clickable' : ''}" ${attrs}>${escapeHtml(status.label)}</span>`;
+}
+
+/**
+ * Display-only OuroborosHub sync badges for an installed card. The verdict
+ * comes from the shared hub_sync helper: "Update available" when the live
+ * catalog serves a different version for a hub-bucket skill, "Published vX"
+ * on the server's byte-exact verification, and "Submitted PR #N" from the
+ * local publish receipt while the catalog does not confirm it. Without a
+ * catalog snapshot (fetch failed or not passed) only listing-plane facts
+ * ("Published vX") may be claimed.
+ */
+function hubSyncBadges(skill, options = {}) {
+    const map = options.hubCatalogByName instanceof Map ? options.hubCatalogByName : null;
+    const verdict = hubSyncVerdict(
+        hubListingRowFor(skill),
+        map ? (map.get(skill.name) || null) : null,
+        { catalogUnavailable: options.hubCatalogAvailable !== true },
+    );
+    const facts = verdict.copy_facts;
+    const out = [];
+    if (verdict.badges.includes('update_available')) {
+        out.push('<span class="skills-badge skills-badge-warn">Update available</span>');
+    }
+    if (verdict.badges.includes('published')) {
+        out.push(`<span class="skills-badge skills-badge-ok">Published v${escapeHtml(skill.version || '')}</span>`);
+    }
+    if (verdict.badges.includes('submitted_pr') && facts.receipt_pr !== null) {
+        out.push(`<span class="skills-badge skills-badge-warn">Submitted PR #${escapeHtml(String(facts.receipt_pr))}</span>`);
+    }
+    return out.join(' ');
 }
 
 function sourceChip(skill) {
@@ -231,6 +262,7 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
     const payloadRoot = skill.payload_root || '';
     const localDelete = (source === 'self_authored' || source === 'external') && payloadRoot.startsWith('skills/external/');
     const prov = market ? skill.provenance : null;
+    const hubBadges = hubSyncBadges(skill, options);
     const submit = submitHubReady(skill, Boolean(options.githubTokenConfigured));
     // Instruction skills from a marketplace/external bucket can be converted into
     // runnable script skills by the repair agent (it authors scripts/<file> and
@@ -290,7 +322,7 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
     </details>`;
     return `<article class="skills-card" data-skill="${safeName}" ${reviewInProgress ? 'data-reviewing="1"' : ''} ${repairInProgress ? 'data-repairing="1"' : ''}>
         <header class="skills-card-head">
-            <div class="skills-card-title"><h3>${safeName}${sourceChip(skill) ? ` ${sourceChip(skill)}` : ''}</h3>${skill.description ? `<p class="skills-card-desc">${escapeHtml(skill.description)}</p>` : ''}${formatRelativeAge(installedTime(skill)) ? `<div class="skills-card-installed muted">${escapeHtml(formatRelativeAge(installedTime(skill)))}</div>` : ''}</div>
+            <div class="skills-card-title"><h3>${safeName}${sourceChip(skill) ? ` ${sourceChip(skill)}` : ''}${hubBadges ? ` ${hubBadges}` : ''}</h3>${skill.description ? `<p class="skills-card-desc">${escapeHtml(skill.description)}</p>` : ''}${formatRelativeAge(installedTime(skill)) ? `<div class="skills-card-installed muted">${escapeHtml(formatRelativeAge(installedTime(skill)))}</div>` : ''}</div>
             <div class="skills-card-toggle">${statusChip(skill, action, live)}${primary}${toggle}${menu}</div>
         </header>
         ${lockReason ? `<div class="skills-lock-hint ${action.action ? 'is-clickable' : ''}" title="${escapeHtml(lockReason)}" ${actionAttrs}>Locked: ${escapeHtml(lockReason)}</div>` : ''}
