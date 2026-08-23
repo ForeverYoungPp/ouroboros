@@ -22,6 +22,7 @@ from ouroboros.config import (
     get_ouroboroshub_catalog_url,
 )
 from ouroboros.llm import LLMClient
+from ouroboros.marketplace.provenance import write_publication_record
 from ouroboros.skill_loader import SkillPayloadUnreadable, _sanitize_skill_name
 from ouroboros.skill_publish_eligibility import PUBLISHABLE_STATUSES
 from ouroboros.skill_publish_github import (
@@ -686,6 +687,42 @@ def _render_pr_body(
     return body_without_attestation.rstrip() + "\n\n" + attestation
 
 
+def _record_publication_receipt(
+    ctx: ToolContext, skill: str, version: str, receipt: Mapping[str, Any],
+) -> Tuple[bool, str]:
+    """Best-effort durable publication receipt beside the skill's review state.
+
+    Never raises; a write problem becomes ``(False, diagnostic)`` in the result
+    JSON instead of converting a real PR success into a failure. The mapping
+    mirrors the validated PR receipt (frozen contract).
+    """
+    try:
+        write_publication_record(canonical_data_root(ctx), skill, {
+            "slug": skill,
+            "version": str(version),
+            "content_hash": str(receipt.get("snapshot_hash") or ""),
+            "repository": str(receipt.get("repository") or ""),
+            "pr_number": receipt.get("number"),
+            "pr_url": str(receipt.get("url") or ""),
+            "published_at": utc_now_iso(),
+        })
+        return True, ""
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"[:200]
+
+
+def _annotate_publication_recorded(serialized: str, recorded: bool, record_error: str) -> str:
+    """Add the receipt-write outcome beside the PR receipt; never raises."""
+    try:
+        envelope = json.loads(serialized)
+        envelope["publication_recorded"] = recorded
+        if not recorded:
+            envelope["publication_record_error"] = record_error
+        return json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return serialized
+
+
 def _submit_skill_to_hub(
     ctx: ToolContext,
     skill: str,
@@ -876,13 +913,18 @@ def _submit_skill_to_hub(
             branch=branch,
             commit_sha=commit_sha,
         )
-        return attempt.result(
+        serialized = attempt.result(
             ok=True,
             status="pr_opened",
             reason_code="",
             receipt=receipt,
             expected_repository=expected_repository,
         )
+        # State-plane receipt write happens only AFTER serializer receipt validation.
+        recorded, record_error = _record_publication_receipt(
+            ctx, safe_skill, snapshot.manifest.version, receipt,
+        )
+        return _annotate_publication_recorded(serialized, recorded, record_error)
     except SkillPublishSnapshotError as exc:
         return attempt.result(
             ok=False,

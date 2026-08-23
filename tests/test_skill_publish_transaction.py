@@ -238,6 +238,63 @@ def test_success_scans_every_outbound_artifact_before_first_mutation(monkeypatch
     assert captured["pr_body"].count("## Secret scan attestation") == 1
 
 
+def test_success_writes_state_plane_publication_receipt(monkeypatch, tmp_path):
+    from ouroboros.marketplace.provenance import read_publication_record
+
+    ctx, _events, _captured = _install_transaction_fakes(monkeypatch, tmp_path, snapshot=_snapshot())
+    monkeypatch.setattr(skill_publish, "utc_now_iso", lambda: "2026-08-23T00:00:00+00:00")
+    result = _submit(ctx)
+    assert result["ok"] is True
+    assert result["publication_recorded"] is True
+    assert "publication_record_error" not in result
+    record_path = tmp_path / "state" / "skills" / "demo" / "ouroboroshub.json"
+    assert json.loads(record_path.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "published": {
+            "slug": "demo",
+            "version": "1.0.0",
+            "content_hash": SNAPSHOT_SHA,
+            "repository": "hub/project",
+            "pr_number": 7,
+            "pr_url": "https://github.com/hub/project/pull/7",
+            "published_at": "2026-08-23T00:00:00+00:00",
+        },
+    }
+    published, diagnostic = read_publication_record(tmp_path, "demo")
+    assert diagnostic is None
+    assert published["pr_number"] == 7
+
+
+def test_receipt_write_failure_keeps_pr_success_and_is_typed(monkeypatch, tmp_path):
+    ctx, _events, _captured = _install_transaction_fakes(monkeypatch, tmp_path, snapshot=_snapshot())
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(skill_publish, "write_publication_record", _explode)
+    result = _submit(ctx)
+    # The PR success is never converted into a failure by the local write.
+    assert result["ok"] is True
+    assert result["status"] == "pr_opened"
+    assert result["receipt"]["number"] == 7
+    assert result["publication_recorded"] is False
+    assert result["publication_record_error"] == "RuntimeError: disk full"
+    assert not (tmp_path / "state" / "skills" / "demo" / "ouroboroshub.json").exists()
+
+
+def test_failed_publication_writes_no_receipt_and_no_flag(monkeypatch, tmp_path):
+    def scanner(named):
+        if "SKILL.md" in named:
+            return _scan_result(_finding("SKILL.md", confidence="high", disposition="blocker"))
+        return _scan_result()
+
+    ctx, _events, _captured = _install_transaction_fakes(monkeypatch, tmp_path, snapshot=_snapshot(), scanner=scanner)
+    result = _submit(ctx)
+    assert result["ok"] is False
+    assert "publication_recorded" not in result
+    assert not (tmp_path / "state" / "skills" / "demo" / "ouroboroshub.json").exists()
+
+
 def test_high_payload_finding_blocks_before_any_github_or_mutation(monkeypatch, tmp_path):
     def scanner(named):
         if "SKILL.md" in named:
