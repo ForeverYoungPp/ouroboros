@@ -36,8 +36,7 @@ from ouroboros.triad_review import (
     empty_array_is_verified_clean,
     extract_json_array,
 )
-from ouroboros.provider_models import provider_for_model
-from ouroboros.deadline_utils import bounded_seconds, llm_transport_timeout_sec
+from ouroboros.deadline_utils import bounded_seconds, llm_transport_timeout_sec, review_transport_timeout
 
 if TYPE_CHECKING:  # annotations only — importing the substrate here would cycle
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot
@@ -91,7 +90,9 @@ class ReviewSessionWaitingOnUser(RuntimeError):
 
 def _poll_detail(gateway: Any, run_id: str, seconds: float) -> Dict[str, Any]:
     from ouroboros.delegate_progress import bounded_poll, expiring_poll
-    return bounded_poll(gateway, run_id, seconds, strict=True) if seconds > 0 else (expiring_poll(gateway, run_id) or {})
+    if seconds > 0:
+        return bounded_poll(gateway, run_id, seconds, strict=True)
+    return expiring_poll(gateway, run_id, strict=True) or {}
 
 def _render_prompt_parts(request: ReviewRequest, slot: ReviewSlot) -> tuple[str, str, str]:
     """Return (stable_governance, task_stable, dynamic_evidence) for one slot.
@@ -314,6 +315,12 @@ class ReviewSlotExecutor:
     def execute(self) -> ReviewAttemptResult:
         raise NotImplementedError
 
+    def failure_custody(self) -> Dict[str, Any]:
+        return {}
+
+    def restore_custody(self, _state: Dict[str, Any]) -> None:
+        return None
+
 
 class ApiChatReviewExecutor(ReviewSlotExecutor):
     """The chat-completions route: the historical ``LLMClient.chat`` path."""
@@ -343,6 +350,7 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
     def _kwargs(self) -> Dict[str, Any]:
         if self._chat_kwargs is None:
             request, slot = self.assignment.request, self.assignment.slot
+            transport = review_transport_timeout(slot.model, getattr(slot, "transport_timeout_sec", None), getattr(request, "deadline_at", ""))
             self._chat_kwargs = {
                 "messages": self.messages,
                 "model": slot.model,
@@ -356,12 +364,7 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
                 # slot_id in the key — same-model slots keep today's
                 # provider-concentration behavior.
                 "cache_affinity": f"{request.surface}:{request.task_id or 'review'}",
-                "timeout": (
-                    llm_transport_timeout_sec(slot.transport_timeout_sec)
-                    if getattr(slot, "transport_timeout_sec", None) is not None
-                    or provider_for_model(slot.model) != "anthropic"
-                    else None
-                ),
+                "timeout": transport,
                 "use_local": bool(slot.use_local),
             }
         return self._chat_kwargs
@@ -1128,6 +1131,11 @@ def run_delegated_review_session(
             # Only effectiveAccess witnesses applied access; request echo is insufficient.
             "applied_access": str(summary.get("effectiveAccess") or ""),
         }
+    except BaseException as exc:
+        if run_id:
+            setattr(exc, "delegated_run_started", True)
+            setattr(exc, "delegated_run_id", run_id)
+        raise
     finally:
         gateway.close()
 def _effective_route_carries_schema(gateway: Any, route_id: str) -> bool:
@@ -1237,15 +1245,9 @@ def _full_session_text(gateway: Any, run_id: str, detail: Dict[str, Any]) -> str
         text = final_summary if isinstance(final_summary, str) else ""
     return text
 class AgentSessionReviewExecutor(ReviewSlotExecutor):
-    """The hosted-session route: one delegated Claudexor run per slot.
+    """One pinned Claudexor run per reviewer slot.
 
-    The COORDINATOR stays the owner of attempt policy, persistence, parsing,
-    actor projection and quorum; this class owns only delivery — it is the
-    nanny in host form: start the run, watch it, enforce the slot's own time
-    bound, bring the transcript home, and let the host's parsers judge it. It
-    never falls back to another route, provider, model or profile (§8), and a
-    repair resend NEVER restarts the session: the second ``execute`` performs
-    local extraction over the transcript already collected (plan 5.5).
+    The coordinator owns policy; this executor never restarts for format repair.
     """
     route = ReviewRouteKind.AGENT_SESSION
 
@@ -1257,13 +1259,9 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         self._run_id = ""
         self._session_usage: Dict[str, Any] = {}
         self._deltas: List[Dict[str, Any]] = []
-        # Caller-owned retry state for the explicit-retry contract: an
-        # unknown-outcome start leaves its invocation token here, so the slot's
-        # permitted second physical attempt replays THAT invocation instead of
-        # minting a second live run. It never crosses slot instances.
+        # Unknown starts retain the exact invocation token for the permitted retry.
         self._retry_state: Dict[str, Any] = {}
-        # The failure of a session that already RAN, remembered so the permitted
-        # resend re-raises it instead of buying a second billed run (see execute).
+        # A settled run failure is replayed rather than billed twice.
         self._settled_failure: Optional[BaseException] = None
 
     # -- prompt (route-owned; never the api pack) ------------------------------
@@ -1314,15 +1312,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             # collected transcript; it never launches a second session.
             return self._verdict_result(force_extraction=True)
         if self._settled_failure is not None:
-            # The same rule, one step earlier: the session ALREADY RAN. Whether it
-            # terminated on a typed refusal or succeeded and then refused to hand
-            # its transcript back, the money is spent and the second physical send
-            # would mint a NEW run — a fresh idempotency key, a fresh bill — for a
-            # cause that is deterministic and will refuse identically. The rail's
-            # second send exists for a transport transient BEFORE the run exists
-            # (the pending invocation replays the same key onto the same run), and
-            # that path is untouched: it leaves `_retry_state` pending and never
-            # reaches here.
+            # Pre-start transients retain a pending invocation and do not land here.
             raise self._settled_failure
         try:
             self._run_session()
@@ -1331,6 +1321,16 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 self._settled_failure = exc
             raise
         return self._verdict_result()
+
+    def failure_custody(self) -> Dict[str, Any]:
+        failure = self._settled_failure
+        run_id = self._run_id or str(getattr(failure, "delegated_run_id", "") or "")
+        pending = str(self._retry_state.get("pending_invocation_id") or "")
+        return {"delegated_run_started": bool(run_id), "delegated_run_id": run_id,
+                "pending_invocation_id": pending}
+
+    def restore_custody(self, state: Dict[str, Any]) -> None:
+        self._retry_state.update(state)
     def _session_route(self) -> Any:
         # 6.1: a structured row carries ITS OWN opaque target; the shared
         # session-route key stays as the legacy fallback for rows without one.

@@ -154,10 +154,20 @@ def logical_operation_timeout_sec(
     used (normally the transport bound only as a settlement wait, not as a
     cognition target).
     """
+    # ``None``/blank means "use the route fallback"; an explicit zero is a
+    # caller-owned one-second horizon, matching ``bounded_seconds``. Treating
+    # both shapes as the same sentinel silently widened a zero slot to the
+    # 2700-second transport fallback.
+    explicit_set = not (
+        explicit is None or (isinstance(explicit, str) and not explicit.strip())
+    )
     try:
-        requested = float(explicit)
+        requested = float(explicit) if explicit_set else 0.0
     except (TypeError, ValueError):
+        explicit_set = False
         requested = 0.0
+    if explicit_set and not math.isfinite(requested):
+        explicit_set = False
     remaining = seconds_until(deadline_at)
     if remaining is not None:
         try:
@@ -165,15 +175,31 @@ def logical_operation_timeout_sec(
         except (TypeError, ValueError):
             reserve = 0.0
         remaining = max(0.0, remaining - reserve)
-        if requested <= 0:
-            requested = 0.0
-        else:
-            requested = min(requested, remaining)
-        return max(0.001, requested if requested > 0 else remaining)
-    if requested > 0:
-        return requested
+        if explicit_set:
+            requested = 1.0 if requested <= 0 else requested
+            return max(0.001, min(requested, remaining))
+        return max(0.001, remaining)
+    if explicit_set:
+        return 1.0 if requested <= 0 else requested
     try:
         value = float(fallback)
     except (TypeError, ValueError):
         value = llm_transport_timeout_sec()
     return max(0.001, value)
+
+
+def review_transport_timeout(model: Any, explicit: Any = None, deadline_at: Any = None) -> Optional[float]:
+    """Resolve one review route's physical timeout without hiding an owner deadline."""
+    from ouroboros.config import get_finalization_grace_sec
+    from ouroboros.provider_models import provider_for_model
+
+    provider = provider_for_model(model)
+    deadline = str(deadline_at or "").strip()
+    if explicit is None and provider == "anthropic" and not deadline:
+        return None
+    native = 120 if provider == "anthropic" else None
+    return transport_timeout_with_deadline(
+        explicit if explicit is not None else native,
+        deadline_at=deadline or None,
+        reserve_sec=get_finalization_grace_sec(),
+    )

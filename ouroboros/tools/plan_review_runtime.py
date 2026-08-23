@@ -340,6 +340,9 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         "auth_route_receipt": usage.get("auth_route_receipt") or {},
         "profile_continuity_receipt": usage.get("profile_continuity_receipt") or {},
         "applied_profile": str(usage.get("applied_profile") or ""),
+        "operation_id": str(actor.get("operation_id") or ""),
+        "operation_state": str(actor.get("operation_state") or "settled"),
+        "late_result_pending": bool(actor.get("late_result_pending")),
     }
 
 
@@ -350,10 +353,18 @@ def plan_row_typed_facts(row: Dict[str, Any]) -> Dict[str, Any]:
     size pin, so the logic lives here). Every fact defaults to honest absence —
     rows from pre-B1 engines and typed-fact-free rows (``plan_slot_fit``'s
     preflight_oversize rows) behave exactly as before."""
-    return {
+    facts = {
         **_typed_facts_from(row, lambda source, key: source.get(key)),
         "capability_delta": row.get("capability_delta") or [],
     }
+    if row.get("operation_id") or row.get("late_result_pending") \
+            or str(row.get("operation_state") or "settled") != "settled":
+        facts.update({
+            "operation_id": str(row.get("operation_id") or ""),
+            "operation_state": str(row.get("operation_state") or "settled"),
+            "late_result_pending": bool(row.get("late_result_pending")),
+        })
+    return facts
 
 
 # Root exploration log (plan F3/S8): the task's OWN tool calls before this call,

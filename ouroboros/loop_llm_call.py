@@ -45,7 +45,12 @@ log = logging.getLogger(__name__)
 MAIN_LOOP_MAX_TOKENS = 65_536
 
 
-def _main_transport_timeout(model: str, deadline_ts: Optional[float]) -> float:
+def _main_transport_timeout(
+    model: str,
+    deadline_ts: Optional[float],
+    *,
+    reserve_sec: Optional[float] = None,
+) -> float:
     # Preserve the native Anthropic default while narrowing every route to an
     # owner deadline. Other routes use the shared dead-socket bound; local models
     # receive the same explicit bound their client already supports.
@@ -53,7 +58,9 @@ def _main_transport_timeout(model: str, deadline_ts: Optional[float]) -> float:
     return transport_timeout_with_deadline(
         explicit,
         deadline_ts=deadline_ts,
-        reserve_sec=get_finalization_grace_sec(),
+        reserve_sec=(
+            get_finalization_grace_sec() if reserve_sec is None else reserve_sec
+        ),
     )
 
 # Retrieval transparency (v6.78.0, owner Q20/Q22): native provider web search happens
@@ -993,6 +1000,7 @@ def call_llm_with_retry(
     physical_context: Optional[PhysicalAttemptContext] = None,
     candidate_predicate: Optional[Callable[[Any], Any]] = None,
     task_attempt: Any = None,
+    transport_reserve_sec: Optional[float] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
     """Call one model with failure-class retry budgets and usage events."""
     msg = None
@@ -1043,7 +1051,9 @@ def call_llm_with_retry(
                 "use_local": use_local,
                 "allow_server_web_search": bool(allow_server_web_search),
                 "bypass_response_cache": response_cache_bypass_requested,
-                "timeout": _main_transport_timeout(model, deadline_ts),
+                "timeout": _main_transport_timeout(
+                    model, deadline_ts, reserve_sec=transport_reserve_sec,
+                ),
             }
             if tools:
                 kwargs["tools"] = tools

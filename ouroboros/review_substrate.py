@@ -322,11 +322,11 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
         "quorum_contribution": bool(row.get("quorum_contribution")),
         "reason": _public_review_reason(reason),
         "enforcement_impact": str(row.get("enforcement_impact") or "abstains"),
-        # Forensic pointer to the full raw reviewer response in the private
-        # observability store (durable-copy reachability; never the raw text,
-        # never absolute host paths — exported task records must not leak the
-        # install layout). persist_call() nests the content hashes inside
-        # redacted_projection_ref/manifest_ref; project them flat.
+        # Preserve the physical identity when the logical actor times out.
+        "operation_id": str(row.get("operation_id") or ""),
+        "operation_state": str(row.get("operation_state") or "settled"),
+        "late_result_pending": bool(row.get("late_result_pending")),
+        # Flat, redacted pointer to the private full response artifact.
         "response_ref": _response_ref_projection(row.get("response_ref")),
     }
 
@@ -1085,8 +1085,8 @@ class ReviewCoordinator:
             task_id=task_id,
             usage_meta=usage_meta,
             review_usage_scope=review_usage_scope,
-            run_slot=lambda slot, operation_id: self._run_slot(
-                request, slot, operation_id=operation_id,
+            run_slot=lambda slot, operation_id, retry_state: self._run_slot(
+                request, slot, operation_id=operation_id, retry_state=retry_state,
             ),
             error_actor=lambda slot, error, operation_id="", operation_state="settled": self._error_actor(
                 request,
@@ -1360,6 +1360,7 @@ class ReviewCoordinator:
         slot: ReviewSlot,
         *,
         operation_id: str = "",
+        retry_state: Optional[Dict[str, Any]] = None,
     ) -> ReviewActorRecord:
         call_id = str(operation_id or new_call_id(f"review_{request.surface}_{slot.slot_id}"))
         base_call_type = request.call_type or f"{request.surface}_review"
@@ -1367,10 +1368,9 @@ class ReviewCoordinator:
             request=request, slot=slot, call_id=call_id, call_type=base_call_type,
             custody_root=self._custody_drive_root(),
         )
-        # Transport is chosen once, here, through the seam; the prompt itself is
-        # rendered by the route (lazily) rather than by this method, so a route
-        # that does not send an API pack never assembles one.
+        # The route lazily renders only the prompt it actually sends.
         executor = _review_route_executor(assignment, llm=self.llm)
+        executor.restore_custody(retry_state or {})
         prompt_projection = executor.prompt_payload()
         prompt_ref: Dict[str, Any] = {}
         response_ref: Dict[str, Any] = {}
@@ -1544,6 +1544,7 @@ class ReviewCoordinator:
                 failure_code=str(getattr(exc, "code", "") or ""),
                 reset_at=str(getattr(exc, "reset_at", "") or ""),
                 http_status=http_status if isinstance(http_status, int) and http_status else None,
+                usage=executor.failure_custody(),
                 prompt_ref=prompt_ref,
                 response_ref=response_ref,
                 duration_sec=round(time.time() - start, 3),

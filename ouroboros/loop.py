@@ -3180,11 +3180,7 @@ def _mark_owner_stop_control_drained(
 
 
 def _owner_stop_window_elapsed(ctx: "_RoundLimitContext") -> bool:
-    """Whether the durable owner-stop deadline already passed at consume.
-
-    Reads the SAME durable intent the custody sweep budgets from (no drain
-    stamp -> the conservative request+outer-cap anchor). Fail-soft: an
-    unreadable intent keeps the bounded summary running."""
+    """Bind the durable owner-stop deadline and report whether it passed."""
     try:
         from ouroboros.cancel_intents import STOP_POLICY_FINALIZE, active_intent, stop_policy
         from ouroboros.config import get_finalization_grace_sec
@@ -3197,6 +3193,8 @@ def _owner_stop_window_elapsed(ctx: "_RoundLimitContext") -> bool:
         if not isinstance(intent, dict) or stop_policy(intent) != STOP_POLICY_FINALIZE:
             return False
         deadline = owner_stop_deadline_ts(intent, float(get_finalization_grace_sec()))
+        if deadline:
+            ctx.deadline_ts = deadline
         return time.time() >= deadline if deadline else True
     except Exception:
         log.debug("owner-stop window check failed for %s", ctx.task_id, exc_info=True)
@@ -3249,6 +3247,11 @@ def _drain_incoming_messages(
             if kind == KIND_FINALIZE_NOW:
                 text = str(entry.get("text") or "deadline")
                 controls["finalize_now"] = text
+                opened = parse_deadline_ts(entry.get("ts"))
+                if opened is not None:
+                    controls["finalize_deadline_ts"] = (
+                        opened.timestamp() + task_pacing.effective_finalization_reserve_sec(owner_ctx)
+                    )
                 first_line = text.splitlines()[0].strip() if text else ""
                 if first_line == REASON_OWNER_REQUESTED_FINALIZATION:
                     # Owner-stop budget starts at delivery; first drain wins.
@@ -3585,9 +3588,10 @@ def _maybe_deadline_local_finalize(
 def _maybe_early_finalize(
     limit_ctx: _RoundLimitContext, tools: ToolRegistry, controls: Dict[str, Any]
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
-    """One early-exit gate per round: supervisor finalize_now first, then a
-    loop-local real-deadline finalize. Returns the forced answer or None."""
+    """Consume supervisor grace first, then a local deadline."""
     if controls.get("finalize_now"):
+        if controls.get("finalize_deadline_ts") is not None:
+            limit_ctx.deadline_ts = float(controls["finalize_deadline_ts"])
         return _handle_forced_finalization(limit_ctx, str(controls["finalize_now"]))
     return _maybe_deadline_local_finalize(limit_ctx, tools)
 
@@ -5087,7 +5091,7 @@ def _drain_forced_owner_directives(
 
 
 def _call_forced_model_once(ctx: _RoundLimitContext) -> str:
-    final_msg, _final_cost = call_llm_with_retry(
+    final_msg, _ = call_llm_with_retry(
         ctx.llm,
         ctx.messages,
         ctx.active_model,
@@ -5102,6 +5106,7 @@ def _call_forced_model_once(ctx: _RoundLimitContext) -> str:
         ctx.task_type,
         use_local=ctx.active_use_local,
         deadline_ts=ctx.deadline_ts,
+        transport_reserve_sec=0.0,
     )
     return str((final_msg or {}).get("content") or "").strip()
 
@@ -5472,11 +5477,7 @@ def _forced_final_answer(
     reason_code: str,
     single_semantic_turn: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Force one tool-less final answer; stamp the typed forced-finalization
-    reason code (the best_effort outcome gate reads it downstream).
-    ``single_semantic_turn`` (owner-stop rail, CF-03): exactly ONE logical
-    model call — the late-owner-directive semantic refresh is disabled because
-    steering is fenced while the stop intent is pending."""
+    """Emit a final answer; owner-stop permits one model call."""
     live_trace = getattr(ctx, "llm_trace", None)
     llm_trace = live_trace if isinstance(live_trace, dict) else {}
     _finalize_forced_services(ctx, llm_trace)
@@ -6794,7 +6795,7 @@ def run_llm_loop(
     else:
         active_context_mode = _preferred_context_mode
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
-    accumulated_usage: Dict[str, Any] = {}
+    accumulated_usage: Dict[str, Any] = {"_task_attempt": getattr(ctx, "task_attempt", None)}
     tools._ctx._accumulated_usage = accumulated_usage
     max_retries = 3
     cost_ceiling = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)

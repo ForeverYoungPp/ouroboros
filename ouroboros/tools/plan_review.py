@@ -37,7 +37,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
 
 from ouroboros.config import adaptive_quorum, get_finalization_grace_sec, get_llm_transport_read_timeout_sec, get_review_enforcement
-from ouroboros.deadline_utils import window_within_deadline
 from ouroboros.review_cycles import emit_review_cycles_exhausted, review_max_cycles
 from ouroboros.task_results import (
     load_plan_review_state, load_task_result, mark_current_plan_review_unavailable,
@@ -94,10 +93,6 @@ def _plan_task_tool_timeout_sec() -> float:
     return _plan_review_wrapper_timeout_sec() + get_finalization_grace_sec()
 _TASK_EVIDENCE_RESULT_CHARS = 6_000
 _RAW_TEXT_PREVIEW_CHARS = 2_000
-
-
-def _plan_review_wait_timeout(ctx: Any) -> float:
-    return float(window_within_deadline(ctx, int(_plan_review_wrapper_timeout_sec())))
 
 
 @dataclass(frozen=True)
@@ -278,22 +273,22 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
     request = _PlanRequest(
         goal=str(params.get("goal") or ""), plan=str(params.get("plan") or ""), spec=params.get("spec"),
     )
-    wait_timeout = _plan_review_wait_timeout(ctx)
+    # The ToolEntry envelope is the outer settlement bound. The substrate
+    # owns each review slot's logical window and late-result custody; nesting a
+    # second asyncio.wait_for here only cancels the coroutine while its
+    # executor worker keeps running, then asyncio.run waits for that worker
+    # during shutdown and defeats the apparent timeout. Let the existing
+    # tool-timeout callback own the late settlement instead.
     try:
         try:
             asyncio.get_running_loop()
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 return pool.submit(
                     asyncio.run,
-                    asyncio.wait_for(_run_plan_review_async(ctx, request), timeout=wait_timeout),
-                ).result(timeout=wait_timeout + 5)
+                    _run_plan_review_async(ctx, request),
+                ).result()
         except RuntimeError:
-            return asyncio.run(
-                asyncio.wait_for(_run_plan_review_async(ctx, request), timeout=wait_timeout)
-            )
-    except (concurrent.futures.TimeoutError, asyncio.TimeoutError):
-        return _plan_unavailable(
-            ctx, f"ERROR: Plan review timed out after {wait_timeout:g}s.", "review_timeout")
+            return asyncio.run(_run_plan_review_async(ctx, request))
     except Exception as e:
         log.error("plan_task failed: %s", e, exc_info=True)
         return _plan_unavailable(ctx, f"ERROR: Plan review failed: {e}", "review_failed")

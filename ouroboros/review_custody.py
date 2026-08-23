@@ -109,6 +109,9 @@ def _emit_operation(
             "kind": "review",
             "task_attempt": getattr(request, "task_attempt", None),
             "execution_id": str(getattr(usage_ctx, "execution_id", "") or ""),
+            # ReviewRequest has no separate round carrier; the unique physical
+            # operation is the stable round identity for both terminal events.
+            "round_id": str(getattr(request, "round_id", "") or entry.operation_id),
             "slot_id": str(getattr(slot, "slot_id", "") or ""),
             **extra,
         }
@@ -130,7 +133,7 @@ def run_custodied_review_slots(
     task_id: str,
     usage_meta: Dict[str, Any],
     review_usage_scope: Any,
-    run_slot: Callable[[Any, str], Any],
+    run_slot: Callable[[Any, str, Dict[str, Any]], Any],
     error_actor: Callable[..., Any],
 ) -> List[Any]:
     """Run slots with independent logical windows and late-result custody."""
@@ -145,6 +148,8 @@ def run_custodied_review_slots(
     def settle(entry: ActiveReviewAttempt, slot: Any, actor: Any) -> None:
         with _ACTIVE_LOCK:
             late = bool(entry.timed_out)
+            failure_custody = getattr(actor, "usage", None) or {}
+            pending_invocation = str(failure_custody.get("pending_invocation_id") or "")
             actor.operation_id = entry.operation_id
             actor.operation_state = "late_settled" if late else "settled"
             actor.late_result_pending = False
@@ -152,7 +157,19 @@ def run_custodied_review_slots(
             entry.event.set()
             if _ACTIVE.get(entry.key) is entry:
                 _ACTIVE.pop(entry.key, None)
-            if late and usage_ctx is not None:
+            # API transport errors may retry after settlement. A delegated
+            # session has already spent its one run even when it settled as an
+            # error, so replay that terminal actor instead of buying another.
+            pending = getattr(usage_ctx, "_review_pending_invocations", None)
+            if pending_invocation and usage_ctx is not None:
+                if not isinstance(pending, dict):
+                    pending = {}
+                    setattr(usage_ctx, "_review_pending_invocations", pending)
+                pending[entry.key] = {"pending_invocation_id": pending_invocation}
+            replayable = actor.status in {"ok", "empty"} or bool(
+                failure_custody.get("delegated_run_started") and not pending_invocation
+            )
+            if late and replayable and usage_ctx is not None:
                 settled = getattr(usage_ctx, "_review_settled_attempts", None)
                 if not isinstance(settled, dict):
                     settled = {}
@@ -187,6 +204,8 @@ def run_custodied_review_slots(
         nonlocal paid_stamped
         key = _attempt_key(request, slot)
         with _ACTIVE_LOCK:
+            pending_attempts = getattr(usage_ctx, "_review_pending_invocations", None)
+            retry_state = pending_attempts.pop(key, {}) if isinstance(pending_attempts, dict) else {}
             settled = getattr(usage_ctx, "_review_settled_attempts", None)
             cached_actor = settled.get(key) if isinstance(settled, dict) else None
             if cached_actor is not None:
@@ -216,7 +235,7 @@ def run_custodied_review_slots(
         slot_windows[slot_id] = _logical_timeout(slot, request, usage_meta)
         slot_deadlines[slot_id] = time.monotonic() + slot_windows[slot_id]
         if owner:
-            if not paid_stamped:
+            if not paid_stamped and not retry_state:
                 from ouroboros.review_dispatch import stamp_review_paid_on_dispatch
 
                 stamp_review_paid_on_dispatch(usage_ctx)
@@ -228,7 +247,7 @@ def run_custodied_review_slots(
                 )
                 try:
                     with usage_scope(review_usage_scope):
-                        actor = run_slot(slot, entry.operation_id)
+                        actor = run_slot(slot, entry.operation_id, retry_state)
                 except Exception as exc:
                     actor = error_actor(
                         slot, f"{type(exc).__name__}: {exc}", entry.operation_id,

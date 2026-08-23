@@ -1655,6 +1655,7 @@ def test_p3_scope_actor_retries_empty_same_slot_model_once_then_blocks(tmp_path,
     failed = scope_review.run_scope_review(ctx, "review scope", scope_model="scope/model")
     assert failed.blocked is True
     assert failed.status == "empty_response"
+    assert failed.operation_id
     assert empty_llm.chat.call_count == 2
 
 
@@ -1816,6 +1817,29 @@ def test_review_slot_timeout_is_not_used_as_transport_timeout(tmp_path):
     assert captured and captured[0]["timeout"] == 17
 
 
+def test_review_transport_timeout_is_narrowed_by_request_deadline(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    captured = []
+
+    class CapturingLLM:
+        def chat(self, **kwargs):
+            captured.append(kwargs)
+            return {"content": '{"verdict":"PASS","findings":[],"summary":"ok"}'}, {}
+
+    deadline = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    run_review_request(
+        ReviewRequest(
+            surface="scope", goal="review", task_id="deadline-transport",
+            deadline_at=deadline,
+        ),
+        slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=30)],
+        drive_root=tmp_path,
+        llm=CapturingLLM(),
+    )
+    assert captured and 0 < captured[0]["timeout"] <= 5
+
+
 def test_direct_anthropic_route_keeps_provider_default_transport(tmp_path):
     captured = []
 
@@ -1831,6 +1855,176 @@ def test_direct_anthropic_route_keeps_provider_default_transport(tmp_path):
         llm=CapturingLLM(),
     )
     assert captured and captured[0]["timeout"] is None
+
+
+def test_late_error_is_not_cached_as_a_permanent_review_verdict(tmp_path):
+    from types import SimpleNamespace
+
+    calls = []
+
+    class ErrorThenSuccess:
+        def chat(self, **_kwargs):
+            calls.append(1)
+            time.sleep(0.03)
+            if len(calls) == 1:
+                raise RuntimeError("transient provider failure")
+            return {"content": '{"verdict":"PASS","findings":[],"summary":"ok"}'}, {}
+
+    ctx = SimpleNamespace(task_id="late-error", event_queue=None, pending_events=[])
+    request = ReviewRequest(surface="plan_review", goal="review", task_id="late-error")
+    first = run_review_request(
+        request,
+        slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.005)],
+        drive_root=tmp_path,
+        llm=ErrorThenSuccess(),
+        usage_ctx=ctx,
+    )
+    assert first.actors[0]["operation_state"] == "in_flight"
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and len(calls) < 1:
+        time.sleep(0.01)
+    # The first physical operation must settle before the retry is admitted.
+    time.sleep(0.05)
+    second = run_review_request(
+        request,
+        slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.5)],
+        drive_root=tmp_path,
+        llm=ErrorThenSuccess(),
+        usage_ctx=ctx,
+    )
+    assert len(calls) >= 2
+    assert second.actors[0]["status"] == "ok"
+
+
+def test_late_agent_session_failure_is_replayed_without_a_second_run(tmp_path, monkeypatch):
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewCoordinator
+
+    calls = []
+
+    def slow_terminal_failure(self, request, slot, *, operation_id="", retry_state=None):
+        calls.append(operation_id)
+        time.sleep(0.03)
+        actor = self._error_actor(
+            request, slot, "delegated run settled failed",
+            operation_id=operation_id,
+        )
+        actor.usage = {"delegated_run_started": True, "delegated_run_id": "run-1"}
+        return actor
+
+    monkeypatch.setattr(ReviewCoordinator, "_run_slot", slow_terminal_failure)
+    ctx = SimpleNamespace(task_id="late-session-error", event_queue=None, pending_events=[])
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="late-session-error",
+        session_root=str(tmp_path), session_task="review this tree",
+    )
+    slot = ReviewSlot(
+        slot_id="slot_a", model="same/model", timeout_sec=0.005,
+        route=ReviewRouteKind.AGENT_SESSION,
+    )
+    first = run_review_request(
+        request, slots=[slot], drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
+    )
+    assert first.actors[0]["operation_state"] == "in_flight"
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and not getattr(ctx, "_review_settled_attempts", {}):
+        time.sleep(0.01)
+    second = run_review_request(
+        request, slots=[slot], drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
+    )
+    assert len(calls) == 1
+    assert second.actors[0]["status"] == "error"
+    assert second.actors[0]["operation_state"] == "late_settled"
+
+
+def test_late_agent_session_preflight_failure_can_retry(tmp_path, monkeypatch):
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewCoordinator
+
+    calls = []
+
+    def preflight_then_success(self, request, slot, *, operation_id="", retry_state=None):
+        calls.append(operation_id)
+        time.sleep(0.02)
+        if len(calls) == 1:
+            return self._error_actor(
+                request, slot, "route unavailable before dispatch",
+                operation_id=operation_id,
+            )
+        actor = self._error_actor(request, slot, "unused", operation_id=operation_id)
+        actor.status, actor.error, actor.raw_text = "ok", "", '{"verdict":"PASS","findings":[]}'
+        return actor
+
+    monkeypatch.setattr(ReviewCoordinator, "_run_slot", preflight_then_success)
+    ctx = SimpleNamespace(task_id="late-session-preflight", event_queue=None, pending_events=[])
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="late-session-preflight",
+        session_root=str(tmp_path), session_task="review this tree",
+    )
+    slot = ReviewSlot(
+        slot_id="slot_a", model="same/model", timeout_sec=0.005,
+        route=ReviewRouteKind.AGENT_SESSION,
+    )
+    first = run_review_request(
+        request, slots=[slot], drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
+    )
+    assert first.actors[0]["operation_state"] == "in_flight"
+    time.sleep(0.04)
+    second = run_review_request(
+        request, slots=[ReviewSlot(
+            slot_id="slot_a", model="same/model", timeout_sec=0.5,
+            route=ReviewRouteKind.AGENT_SESSION,
+        )], drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
+    )
+    assert len(calls) == 2
+    assert second.actors[0]["status"] == "ok"
+
+
+def test_late_unknown_session_start_restores_exact_pending_invocation(tmp_path, monkeypatch):
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewCoordinator
+
+    calls, paid = [], []
+
+    def pending_then_success(self, request, slot, *, operation_id="", retry_state=None):
+        calls.append(dict(retry_state or {}))
+        if len(calls) == 1:
+            time.sleep(0.02)
+            actor = self._error_actor(request, slot, "start outcome unknown", operation_id=operation_id)
+            actor.usage = {"pending_invocation_id": "invocation-1"}
+            return actor
+        assert retry_state == {"pending_invocation_id": "invocation-1"}
+        actor = self._error_actor(request, slot, "unused", operation_id=operation_id)
+        actor.status, actor.error, actor.raw_text = "ok", "", '{"verdict":"PASS","findings":[]}'
+        return actor
+
+    monkeypatch.setattr(ReviewCoordinator, "_run_slot", pending_then_success)
+    ctx = SimpleNamespace(
+        task_id="late-session-pending", event_queue=None, pending_events=[],
+        _review_paid_stamp=lambda: paid.append("paid"),
+    )
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="late-session-pending",
+        session_root=str(tmp_path), session_task="review this tree",
+    )
+    first_slot = ReviewSlot(
+        slot_id="slot_a", model="same/model", timeout_sec=0.005,
+        route=ReviewRouteKind.AGENT_SESSION,
+    )
+    first = run_review_request(
+        request, slots=[first_slot], drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
+    )
+    assert first.actors[0]["operation_state"] == "in_flight"
+    time.sleep(0.04)
+    second = run_review_request(
+        request, slots=[ReviewSlot(
+            slot_id="slot_a", model="same/model", timeout_sec=0.5,
+            route=ReviewRouteKind.AGENT_SESSION,
+        )], drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
+    )
+    assert calls == [{}, {"pending_invocation_id": "invocation-1"}]
+    assert paid == ["paid"]
+    assert second.actors[0]["status"] == "ok"
 
 
 def test_review_slots_keep_independent_logical_windows(tmp_path):
