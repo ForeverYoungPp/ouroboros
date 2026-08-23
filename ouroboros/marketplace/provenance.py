@@ -19,7 +19,7 @@ import re
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from ouroboros.skill_loader import skill_state_dir
-from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
+from ouroboros.utils import atomic_write_json, read_json_dict, update_json_locked, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -81,17 +81,24 @@ def merge_state_record(
     """Atomically merge *sections* into ``state/skills/<name>/<filename>``.
 
     Unknown sibling keys already present in the file survive; each provided
-    section is replaced wholesale (last-write-wins). A malformed existing
-    file is replaced by the provided sections alone — a reader never repairs
-    it, so the next write owns the record. Callers pass a module-level
-    filename constant such as ``PUBLICATION_FILENAME``.
+    section is replaced wholesale. The read-modify-write runs under the
+    shared ``update_json_locked`` sidecar lock, so concurrent writers of
+    different sections cannot drop each other. A malformed existing file is
+    replaced by the provided sections alone — a reader never repairs it, so
+    the next write owns the record. Callers pass a module-level filename
+    constant such as ``PUBLICATION_FILENAME``.
     """
     state_dir = skill_state_dir(drive_root, skill_name)
     target = state_dir / filename
-    existing = read_json_dict(target) if target.is_file() else None
-    payload: Dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
-    payload.update({str(key): value for key, value in sections.items()})
-    atomic_write_json(target, payload, trailing_newline=True)
+
+    def _merge(current: Dict[str, Any]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = dict(current) if isinstance(current, dict) else {}
+        payload.update({str(key): value for key, value in sections.items()})
+        return payload
+
+    # Locked read-modify-write (utils SSOT): closes the lost-update window
+    # between two concurrent section writers without a bespoke lock file.
+    update_json_locked(target, _merge)
     return target
 
 

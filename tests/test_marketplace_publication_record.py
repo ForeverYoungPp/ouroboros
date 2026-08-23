@@ -222,3 +222,139 @@ def test_publication_and_clawhub_records_are_separate_files(tmp_path):
     published, diagnostic = read_publication_record(tmp_path, "demo")
     assert diagnostic is None
     assert published == _published()
+
+
+def test_extra_fields_participate_in_transport_cap_trimming():
+    """E-fix A-1: the publication annotation joins the findings-trimming loop."""
+    from ouroboros.skill_publish_result import serialize_skill_publish_result
+    from ouroboros.tool_capabilities import tool_result_limit
+    import json as _json
+
+    sed = {"detector": "betterleaks", "confidence": "low",
+           "verification": "not_attempted", "disposition": "warning"}
+    findings = [
+        {**sed, "path": f"scripts/helper_{i}.py", "line": i + 1,
+         "reason": "x" * 240 + str(i)}
+        for i in range(60)
+    ]
+    receipt = {
+        "kind": "github_pull_request",
+        "repository": "razzant/OuroborosHub",
+        "url": "https://github.com/razzant/OuroborosHub/pull/999",
+        "number": 999,
+        "skill": "demo",
+        "snapshot_hash": "a" * 64,
+        "ruleset_sha256": "b" * 64,
+    }
+    base_kwargs = dict(
+        ok=True,
+        status="pr_opened",
+        reason_code="",
+        skill="demo",
+        snapshot_hash="a" * 64,
+        scanner={"engine": "betterleaks", "version": "1.8.1", "ruleset_sha256": "b" * 64},
+        completed_stage="pr_opened",
+        findings=findings,
+        warning_count=60,
+        receipt=receipt,
+        expected_repository="razzant/OuroborosHub",
+    )
+    limit = tool_result_limit("submit_skill_to_hub")
+    plain = serialize_skill_publish_result(**base_kwargs)
+    assert len(plain) < limit
+    annotated = serialize_skill_publish_result(
+        **base_kwargs,
+        extra_fields={
+            "publication_recorded": False,
+            "publication_record_error": "e" * 200,
+        },
+    )
+    assert len(annotated) < limit
+    parsed = _json.loads(annotated)
+    assert parsed["publication_recorded"] is False
+    assert parsed["publication_record_error"] == "e" * 200
+    # The annotation cost findings, never validity.
+    assert parsed["omitted_count"] >= _json.loads(plain)["omitted_count"]
+
+
+def test_extra_fields_reject_collisions_and_non_primitives():
+    from ouroboros.skill_publish_result import serialize_skill_publish_result
+
+    import pytest as _pytest
+
+    kwargs = dict(
+        ok=False,
+        status="blocked",
+        reason_code="not_confirmed",
+        skill="demo",
+    )
+    with _pytest.raises(ValueError, match="collides"):
+        serialize_skill_publish_result(**kwargs, extra_fields={"ok": True})
+    with _pytest.raises(ValueError, match="JSON primitive"):
+        serialize_skill_publish_result(**kwargs, extra_fields={"blob": {"nested": 1}})
+
+
+def test_merge_state_record_survives_concurrent_sibling_writers(tmp_path):
+    """E-fix A-3: locked merge — a paused writer cannot drop a sibling section."""
+    import threading
+
+    from ouroboros.marketplace import provenance as prov
+
+    barrier_read = threading.Event()
+    proceed = threading.Event()
+    orig = prov.update_json_locked
+    calls = {"n": 0}
+
+    def slow_locked(path, mutator, **kw):
+        # Writer A pauses INSIDE the helper boundary; because the lock is held
+        # for the whole read-modify-write, writer B serializes behind it.
+        calls["n"] += 1
+        if calls["n"] == 1:
+            barrier_read.set()
+            proceed.wait(timeout=5)
+        return orig(path, mutator, **kw)
+
+    prov.update_json_locked = slow_locked
+    try:
+        t_a = threading.Thread(
+            target=prov.merge_state_record,
+            args=(tmp_path, "demo", "ouroboroshub.json", {"section_a": {"v": 1}}),
+        )
+        t_a.start()
+        assert barrier_read.wait(timeout=5)
+        t_b = threading.Thread(
+            target=prov.merge_state_record,
+            args=(tmp_path, "demo", "ouroboroshub.json", {"section_b": {"v": 2}}),
+        )
+        t_b.start()
+        proceed.set()
+        t_a.join(timeout=10)
+        t_b.join(timeout=10)
+    finally:
+        prov.update_json_locked = orig
+    from ouroboros.utils import read_json_dict
+
+    final = read_json_dict(tmp_path / "state" / "skills" / "demo" / "ouroboroshub.json")
+    assert final.get("section_a") == {"v": 1}
+    assert final.get("section_b") == {"v": 2}
+
+
+def test_receipt_write_lowercases_snapshot_hash(tmp_path):
+    """E-fix A-2: a mixed-case validated hash persists lowercase for the reader."""
+    from ouroboros.tools import skill_publish as sp
+    from ouroboros.marketplace.provenance import read_publication_record
+
+    class _Ctx:
+        drive_root = tmp_path
+
+    receipt = {
+        "repository": "razzant/OuroborosHub",
+        "url": "https://github.com/razzant/OuroborosHub/pull/7",
+        "number": 7,
+        "snapshot_hash": "A" * 64,
+    }
+    recorded, err = sp._record_publication_receipt(_Ctx(), "demo", "1.0.0", receipt)
+    assert recorded, err
+    published, diagnostic = read_publication_record(tmp_path, "demo")
+    assert diagnostic is None
+    assert published["content_hash"] == "a" * 64

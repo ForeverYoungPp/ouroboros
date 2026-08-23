@@ -128,6 +128,7 @@ class _PublishAttempt:
         repair_hint: str = "",
         receipt: Mapping[str, Any] | None = None,
         expected_repository: str = "",
+        extra_fields: Mapping[str, Any] | None = None,
     ) -> str:
         return serialize_skill_publish_result(
             ok=ok,
@@ -145,6 +146,7 @@ class _PublishAttempt:
             repair_hint=repair_hint,
             receipt=receipt,
             expected_repository=expected_repository,
+            extra_fields=extra_fields,
         )
 
 
@@ -700,7 +702,7 @@ def _record_publication_receipt(
         write_publication_record(canonical_data_root(ctx), skill, {
             "slug": skill,
             "version": str(version),
-            "content_hash": str(receipt.get("snapshot_hash") or ""),
+            "content_hash": str(receipt.get("snapshot_hash") or "").lower(),
             "repository": str(receipt.get("repository") or ""),
             "pr_number": receipt.get("number"),
             "pr_url": str(receipt.get("url") or ""),
@@ -924,7 +926,27 @@ def _submit_skill_to_hub(
         recorded, record_error = _record_publication_receipt(
             ctx, safe_skill, snapshot.manifest.version, receipt,
         )
-        return _annotate_publication_recorded(serialized, recorded, record_error)
+        try:
+            # Re-serialize with the annotation INSIDE the cap loop so the added
+            # fields participate in findings trimming (a post-hoc append could
+            # push a just-under-cap envelope past the transport limit and get
+            # head-truncated into invalid JSON).
+            extra: Dict[str, Any] = {"publication_recorded": recorded}
+            if not recorded:
+                extra["publication_record_error"] = record_error
+            return attempt.result(
+                ok=True,
+                status="pr_opened",
+                reason_code="",
+                receipt=receipt,
+                expected_repository=expected_repository,
+                extra_fields=extra,
+            )
+        except Exception:
+            # Never lose a real PR success: fall back to the bounded post-hoc
+            # annotation (which itself never raises and never exceeds the cap
+            # by more than the annotation bytes).
+            return _annotate_publication_recorded(serialized, recorded, record_error)
     except SkillPublishSnapshotError as exc:
         return attempt.result(
             ok=False,

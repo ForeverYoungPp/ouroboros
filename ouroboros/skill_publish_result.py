@@ -359,8 +359,16 @@ def serialize_skill_publish_result(
     repair_hint: str = "",
     receipt: Mapping[str, Any] | None = None,
     expected_repository: str = "",
+    extra_fields: Mapping[str, Any] | None = None,
 ) -> str:
-    """Serialize one parseable envelope below the real tool-result cap."""
+    """Serialize one parseable envelope below the real tool-result cap.
+
+    ``extra_fields`` adds caller-owned top-level keys BEFORE the transport
+    cap loop, so late annotations (e.g. the publication-receipt write
+    outcome) participate in the findings-trimming discipline instead of
+    growing an already-fitted envelope past the cap. Keys must be new,
+    string-named, and JSON-primitive-valued.
+    """
 
     if type(ok) is not bool:
         raise ValueError("ok must be a boolean")
@@ -423,6 +431,15 @@ def serialize_skill_publish_result(
     }
     if safe_receipt is not None:
         envelope["receipt"] = safe_receipt
+
+    if extra_fields:
+        for raw_key, raw_value in extra_fields.items():
+            key = str(raw_key)
+            if key in envelope:
+                raise ValueError(f"extra field collides with envelope key: {key}")
+            if raw_value is not None and not isinstance(raw_value, (bool, int, float, str)):
+                raise ValueError(f"extra field must be a JSON primitive: {key}")
+            envelope[key] = raw_value
 
     limit = tool_result_limit("submit_skill_to_hub")
     while True:
