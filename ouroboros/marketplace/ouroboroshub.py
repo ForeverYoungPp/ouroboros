@@ -2,21 +2,31 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import logging
 import pathlib
 import shutil
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 from ouroboros.marketplace import AllowlistRedirectHandler
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import get_ouroboroshub_catalog_url, get_ouroboroshub_skills_dir
 from ouroboros.marketplace.fetcher import FetchError, land_staged_tree
+from ouroboros.marketplace.install import (
+    discard_payload_snapshot,
+    restore_payload_state,
+    snapshot_payload_state,
+)
 from ouroboros.marketplace.install_specs import install_specs_hash
 from ouroboros.marketplace.isolated_deps import DEPS_STATE_FILENAME, read_deps_state
 from ouroboros.skill_dependencies import normalize_declared_dependency_specs
@@ -25,7 +35,9 @@ from ouroboros.skill_loader import (
     _skill_location_conflict_error,
     skill_state_dir,
 )
-from ouroboros.utils import atomic_write_json, utc_now_iso
+from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
+
+log = logging.getLogger(__name__)
 
 
 _MAX_CATALOG_BYTES = 2 * 1024 * 1024
@@ -73,6 +85,11 @@ class HubSkillSummary:
     files: List[Dict[str, Any]] = field(default_factory=list)
     install_specs: Any = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
+    # Server-computed canonical identity facts (§7.2): the Python sanitizer is
+    # the only slug→name authority; JS never re-implements it. identity_conflict
+    # marks entries whose canonical name is shared by >1 catalog slugs.
+    sanitized_name: str = ""
+    identity_conflict: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -88,6 +105,8 @@ class HubSkillSummary:
             "stats": {},
             "badges": {"official": True},
             "is_plugin": False,
+            "sanitized_name": self.sanitized_name or _sanitize_skill_name(self.slug),
+            "identity_conflict": bool(self.identity_conflict),
         }
 
 
@@ -99,6 +118,9 @@ class HubInstallResult:
     target_dir: Optional[pathlib.Path] = None
     summary: Optional[HubSkillSummary] = None
     provenance: Dict[str, Any] = field(default_factory=dict)
+    # Typed error code (e.g. "catalog_identity_conflict"); empty for plain
+    # errors so existing payload shapes stay byte-identical.
+    code: str = ""
 
 
 def _fetch_bytes(url: str, *, max_bytes: int, timeout_sec: int = 15) -> bytes:
@@ -125,7 +147,52 @@ def _raw_base(catalog: Dict[str, Any], catalog_url: str) -> str:
     raise OuroborosHubError("catalog must include raw_base_url")
 
 
-def load_catalog() -> Dict[str, Any]:
+# Display-plane catalog memo (§7.1a): ONLY gateway display reads pass
+# ``fresh=False``. install/adopt/update and the official-hub verifier always
+# call ``load_catalog()`` with the fresh default and never consume the memo;
+# every successful fetch refreshes it so display lags at most the TTL.
+_CATALOG_CACHE_TTL_SEC = 120.0
+_CATALOG_CACHE_LOCK = threading.Lock()
+_CATALOG_CACHE: Optional[tuple[float, Dict[str, Any]]] = None
+
+
+def _catalog_cache_clear() -> None:
+    """Test hook: drop the display-plane catalog memo."""
+    global _CATALOG_CACHE
+    with _CATALOG_CACHE_LOCK:
+        _CATALOG_CACHE = None
+
+
+def _catalog_cache_inject(catalog: Dict[str, Any], *, age_sec: float = 0.0) -> None:
+    """Test hook: seed the display-plane memo with a catalog aged ``age_sec``."""
+    global _CATALOG_CACHE
+    with _CATALOG_CACHE_LOCK:
+        _CATALOG_CACHE = (time.monotonic() - float(age_sec), copy.deepcopy(catalog))
+
+
+def _catalog_cache_get() -> Optional[Dict[str, Any]]:
+    with _CATALOG_CACHE_LOCK:
+        if _CATALOG_CACHE is None:
+            return None
+        fetched_at, catalog = _CATALOG_CACHE
+        if (time.monotonic() - fetched_at) > _CATALOG_CACHE_TTL_SEC:
+            return None
+        # Defensive copy: callers may mutate the returned dict.
+        return copy.deepcopy(catalog)
+
+
+def _catalog_cache_store(catalog: Dict[str, Any]) -> None:
+    global _CATALOG_CACHE
+    with _CATALOG_CACHE_LOCK:
+        _CATALOG_CACHE = (time.monotonic(), copy.deepcopy(catalog))
+
+
+def load_catalog(fresh: bool = True) -> Dict[str, Any]:
+    """Fetch the hub catalog; ``fresh=False`` is reserved for display reads."""
+    if not fresh:
+        cached = _catalog_cache_get()
+        if cached is not None:
+            return cached
     url = get_ouroboroshub_catalog_url()
     data = _fetch_bytes(url, max_bytes=_MAX_CATALOG_BYTES)
     try:
@@ -135,6 +202,7 @@ def load_catalog() -> Dict[str, Any]:
     if not isinstance(catalog, dict):
         raise OuroborosHubError("catalog root must be an object")
     catalog.setdefault("raw_base_url", _raw_base(catalog, url))
+    _catalog_cache_store(catalog)
     return catalog
 
 
@@ -161,12 +229,20 @@ def _summaries(catalog: Dict[str, Any]) -> List[HubSkillSummary]:
                 raw=item,
             )
         )
+    # Canonical-name facts are catalog-wide: a slug whose canonical name is
+    # shared with another catalog entry stays flagged even after search filters.
+    counts: Dict[str, int] = {}
+    for entry in out:
+        entry.sanitized_name = _sanitize_skill_name(entry.slug)
+        counts[entry.sanitized_name] = counts.get(entry.sanitized_name, 0) + 1
+    for entry in out:
+        entry.identity_conflict = counts[entry.sanitized_name] > 1
     return out
 
 
-def search(query: str = "") -> List[HubSkillSummary]:
+def search(query: str = "", *, fresh: bool = True) -> List[HubSkillSummary]:
     q = str(query or "").strip().lower()
-    entries = _summaries(load_catalog())
+    entries = _summaries(load_catalog(fresh=fresh))
     if not q:
         return entries
     return [
@@ -291,6 +367,19 @@ def install(slug: str, *, overwrite: bool = False) -> HubInstallResult:
     if summary is None:
         return HubInstallResult(False, "", error=f"skill not found: {slug}")
     sanitized = _sanitize_skill_name(summary.slug)
+    if summary.identity_conflict:
+        # Server-side guard (§7.2/§7.3): >1 catalog slugs sanitize to the same
+        # canonical name — installing either would be an ambiguous identity.
+        return HubInstallResult(
+            False,
+            sanitized,
+            error=(
+                f"catalog identity conflict: multiple catalog entries sanitize to "
+                f"{sanitized!r}; refusing to install an ambiguous identity"
+            ),
+            summary=summary,
+            code="catalog_identity_conflict",
+        )
     target_root = get_ouroboroshub_skills_dir()
     target_dir = target_root / sanitized
     drive_root = target_root.parent.parent
@@ -371,3 +460,480 @@ def uninstall(sanitized_name: str) -> HubInstallResult:
     except Exception:
         pass
     return HubInstallResult(True, name, target_dir=target)
+
+
+def serialize_hub_install_result(result: HubInstallResult) -> Dict[str, Any]:
+    """Project a :class:`HubInstallResult` into the gateway's JSON payload."""
+    payload: Dict[str, Any] = {
+        "ok": result.ok,
+        "sanitized_name": result.sanitized_name,
+        "error": result.error,
+        "provenance": result.provenance,
+        "summary": result.summary.to_dict() if result.summary else None,
+    }
+    if result.target_dir is not None:
+        payload["target_dir"] = str(result.target_dir)
+    if result.code:
+        payload["code"] = result.code
+    return payload
+
+
+async def run_hub_update(
+    name: str,
+    *,
+    drive_root: pathlib.Path,
+    progress: Any,
+    run_blocking: Callable[..., Any],
+    apply_review_and_deps: Callable[[Dict[str, Any], str], Any],
+) -> Dict[str, Any]:
+    """Update-transaction body for the gateway's OuroborosHub update endpoint.
+
+    ``run_blocking`` (the lifecycle thread bridge) and ``apply_review_and_deps``
+    (the shared review/deps orchestration) are injected by the gateway so their
+    HTTP-layer seams — and the test monkeypatch points on the gateway module —
+    stay authoritative.
+    """
+    from ouroboros.skill_loader import review_status_allows_execution
+
+    drive_root = pathlib.Path(drive_root)
+    target_dir = drive_root / "skills" / "ouroboroshub" / name
+    marker = target_dir / ".ouroboroshub.json"
+    if not target_dir.exists():
+        return serialize_hub_install_result(
+            HubInstallResult(
+                False,
+                name,
+                error=f"{name} is not installed",
+            )
+        )
+    if not marker.is_file():
+        return serialize_hub_install_result(
+            HubInstallResult(
+                False,
+                name,
+                error="missing OuroborosHub provenance marker",
+                target_dir=target_dir,
+            )
+        )
+    marker_data = read_json_dict(marker) or {}
+    marker_name = str(marker_data.get("sanitized_name") or "").strip()
+    marker_slug = str(marker_data.get("slug") or "").strip()
+    if (
+        marker_data.get("schema_version") != 1
+        or str(marker_data.get("source") or "") != "ouroboroshub"
+        or marker_name != name
+        or not marker_slug
+        or _sanitize_skill_name(marker_slug) != name
+    ):
+        return serialize_hub_install_result(
+            HubInstallResult(
+                False,
+                name,
+                error="invalid OuroborosHub provenance marker",
+                target_dir=target_dir,
+            )
+        )
+    rollback_snapshot = snapshot_payload_state(drive_root, name, target_dir)
+    was_live = False
+
+    async def _restore_previous_live(log_label: str) -> None:
+        if not was_live:
+            return
+        try:
+            from ouroboros.config import load_settings
+            from ouroboros.extension_loader import reconcile_extension
+
+            await run_blocking(
+                reconcile_extension,
+                name,
+                drive_root,
+                load_settings,
+                log_label=log_label,
+            )
+        except Exception:
+            log.debug("OuroborosHub failed-update re-reconcile failed for %s", name, exc_info=True)
+
+    try:
+        try:
+            from ouroboros.extension_loader import is_extension_live, unload_extension
+
+            was_live = bool(is_extension_live(name, drive_root))
+            progress.set("Unloading existing extension…")
+            await run_blocking(
+                unload_extension,
+                name,
+                log_label="OuroborosHub update extension unload lifecycle operation",
+            )
+        except Exception:
+            log.debug("OuroborosHub pre-update extension unload failed for %s", name, exc_info=True)
+        progress.set("Downloading from OuroborosHub…")
+        result = await run_blocking(
+            install,
+            marker_slug,
+            overwrite=True,
+            log_label="OuroborosHub update lifecycle operation",
+        )
+        payload = serialize_hub_install_result(result)
+        if result.ok:
+            status, error, deps_status = await apply_review_and_deps(payload, result.sanitized_name)
+            if was_live and review_status_allows_execution(status) and not error and deps_status != "failed":
+                try:
+                    from ouroboros.config import load_settings
+                    from ouroboros.extension_loader import reconcile_extension
+
+                    progress.set("Reloading extension…")
+                    live_state = await run_blocking(
+                        reconcile_extension,
+                        result.sanitized_name,
+                        drive_root,
+                        load_settings,
+                        log_label="OuroborosHub update extension reload lifecycle operation",
+                    )
+                    payload.update({
+                        "extension_action": live_state.get("action"),
+                        "extension_reason": live_state.get("reason"),
+                    })
+                except Exception:
+                    log.debug("OuroborosHub post-update reconcile failed for %s", name, exc_info=True)
+            if deps_status == "failed" or error or not review_status_allows_execution(status):
+                restore_payload_state(rollback_snapshot)
+                payload["rolled_back"] = True
+                await _restore_previous_live("OuroborosHub non-executable update restore lifecycle operation")
+            else:
+                discard_payload_snapshot(rollback_snapshot)
+        elif was_live:
+            restore_payload_state(rollback_snapshot)
+            payload["rolled_back"] = True
+            await _restore_previous_live("OuroborosHub failed-update extension restore lifecycle operation")
+        else:
+            discard_payload_snapshot(rollback_snapshot)
+        return payload
+    except Exception as exc:
+        restore_payload_state(rollback_snapshot)
+        await _restore_previous_live("OuroborosHub exception-update extension restore lifecycle operation")
+        log.warning("OuroborosHub update failed after snapshot for %s", name, exc_info=True)
+        payload = serialize_hub_install_result(
+            HubInstallResult(
+                False,
+                name,
+                error=f"Update failed: {type(exc).__name__}: {exc}",
+                target_dir=target_dir,
+            )
+        )
+        payload["rolled_back"] = True
+        return payload
+
+
+# --- Adopt transaction (§7.3): replace an external occupant with the hub payload ---
+
+# The state files the adopt transaction may (re)write through install + review
+# + deps + auto-grant, snapshotted before the transaction and byte-restored on
+# rollback. review_history.jsonl / other append-only ledgers are intentionally
+# NOT restored (disclosed residual: abortive-review entries remain).
+_ADOPT_STATE_SNAPSHOT_FILENAMES = (
+    "review.json",
+    "review_job.json",
+    "deps.json",
+    "grants.json",
+    "accepted_rebuttals.json",
+)
+
+# Physical occupant location -> typed adopt_not_eligible reason (§7.3).
+_ADOPT_NOT_ELIGIBLE_REASONS = (
+    ("ouroboroshub", "already_hub"),
+    ("native", "native_seed"),
+    ("user_repo", "user_repo"),
+    ("clawhub", "clawhub_unsupported_v1"),
+)
+
+
+@dataclass
+class _AdoptContext:
+    """Rollback handle for one started adopt transaction."""
+
+    name: str
+    drive_root: pathlib.Path
+    source_dir: pathlib.Path
+    aside_dir: pathlib.Path
+    dest_dir: pathlib.Path
+    state_snapshot: Dict[str, Optional[bytes]]
+    was_live: bool = False
+
+
+def _adopt_refusal(sanitized: str, error: str, code: str = "", **extra: Any) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"ok": False, "sanitized_name": sanitized, "error": error}
+    if code:
+        payload["code"] = code
+    payload.update(extra)
+    return payload
+
+
+def _reconcile_extension_quiet(name: str, drive_root: pathlib.Path) -> None:
+    try:
+        from ouroboros.config import load_settings
+        from ouroboros.extension_loader import reconcile_extension
+
+        reconcile_extension(name, pathlib.Path(drive_root), load_settings)
+    except Exception:
+        log.debug("adopt reconcile failed for %s", name, exc_info=True)
+
+
+def _restore_adopt_state(drive_root: pathlib.Path, name: str, snapshot: Dict[str, Optional[bytes]]) -> None:
+    """Byte-restore the state quintet; files absent pre-adopt are removed."""
+    state_dir = skill_state_dir(pathlib.Path(drive_root), name)
+    for filename, blob in snapshot.items():
+        path = state_dir / filename
+        try:
+            if blob is None:
+                path.unlink(missing_ok=True)
+            else:
+                tmp = path.with_name(path.name + ".adopt-restore.tmp")
+                tmp.write_bytes(blob)
+                tmp.replace(path)
+        except OSError:
+            log.error("adopt rollback could not restore state file %s for %s", filename, name, exc_info=True)
+
+
+def _adopt_rollback(ctx: _AdoptContext) -> None:
+    """§7.3 rollback: remove dest payload, restore source payload + state quintet, reconcile."""
+    if ctx.dest_dir.exists():
+        shutil.rmtree(ctx.dest_dir, ignore_errors=True)
+    try:
+        if ctx.aside_dir.exists() and not ctx.source_dir.exists():
+            ctx.source_dir.parent.mkdir(parents=True, exist_ok=True)
+            ctx.aside_dir.rename(ctx.source_dir)
+    except OSError:
+        log.error("adopt rollback could not restore source payload for %s", ctx.name, exc_info=True)
+    _restore_adopt_state(ctx.drive_root, ctx.name, ctx.state_snapshot)
+    if ctx.was_live:
+        _reconcile_extension_quiet(ctx.name, ctx.drive_root)
+
+
+def _adopt_finalize(ctx: _AdoptContext) -> None:
+    """Retain the moved-aside source as the depth-1 pre-adopt snapshot (§7.3)."""
+    keep = ctx.aside_dir.parent / f"{ctx.name}.pre-adopt"
+    try:
+        if keep.exists():
+            shutil.rmtree(keep, ignore_errors=True)
+        ctx.aside_dir.rename(keep)
+    except OSError:
+        log.warning("adopt could not retain the pre-adopt snapshot for %s", ctx.name, exc_info=True)
+
+
+def _adopt_begin(slug: str, drive_root: pathlib.Path, expected_content_hash: str):
+    """§7.3 prelude: eligibility -> CAS -> unload -> state snapshot -> move-aside.
+
+    Returns a typed refusal payload (source payload untouched) or an
+    :class:`_AdoptContext` whose source dir is already moved aside into the
+    bucket's dot-prefixed (discovery-safe) ``.rollback`` area.
+    """
+    from ouroboros.skill_loader import _skill_location_inventory, load_skill
+
+    drive_root = pathlib.Path(drive_root)
+    sanitized = _sanitize_skill_name(slug)
+    try:
+        catalog = load_catalog()
+    except Exception as exc:
+        return _adopt_refusal(sanitized, f"OuroborosHub catalog unavailable: {exc}", "catalog_unavailable")
+    summary = next((item for item in _summaries(catalog) if item.slug == slug), None)
+    if summary is None:
+        return _adopt_refusal(sanitized, f"skill not found: {slug}")
+    if summary.identity_conflict:
+        return _adopt_refusal(
+            sanitized,
+            (
+                f"catalog identity conflict: multiple catalog entries sanitize to "
+                f"{sanitized!r}; refusing to adopt an ambiguous identity"
+            ),
+            "catalog_identity_conflict",
+        )
+
+    occupants = tuple(
+        item for item in _skill_location_inventory(drive_root) if item.name == sanitized
+    )
+    if not occupants:
+        return _adopt_refusal(
+            sanitized,
+            f"no local skill named {sanitized!r} occupies the identity - use install instead",
+            "adopt_not_eligible",
+            reason="no_local_occupant",
+        )
+    for location, reason in _ADOPT_NOT_ELIGIBLE_REASONS:
+        if any(item.location == location for item in occupants):
+            return _adopt_refusal(
+                sanitized,
+                f"local skill {sanitized!r} lives in the {location!r} bucket and cannot be adopted",
+                "adopt_not_eligible",
+                reason=reason,
+            )
+
+    # Only external occupants remain. CAS selects the exact payload the caller
+    # confirmed; with pathological same-name external duplicates the
+    # non-matching sibling keeps the identity occupied and the ordinary install
+    # precheck fails the transaction into rollback.
+    live_hashes: List[str] = []
+    selected = None
+    for candidate in occupants:
+        loaded = load_skill(candidate.skill_dir, drive_root)
+        live = str(getattr(loaded, "content_hash", "") or "") if loaded is not None else ""
+        live_hashes.append(live)
+        if live and live == expected_content_hash:
+            selected = candidate
+            break
+    if selected is None:
+        return _adopt_refusal(
+            sanitized,
+            "local payload does not match expected_content_hash - refresh the skill card and confirm again",
+            "adopt_cas_mismatch",
+            live_content_hash=live_hashes[0] if live_hashes else "",
+        )
+
+    was_live = False
+    try:
+        from ouroboros.extension_loader import is_extension_live, unload_extension
+
+        was_live = bool(is_extension_live(sanitized, drive_root))
+        unload_extension(sanitized)
+    except Exception:
+        log.debug("pre-adopt extension unload failed for %s", sanitized, exc_info=True)
+
+    try:
+        state_dir = skill_state_dir(drive_root, sanitized)
+        state_snapshot: Dict[str, Optional[bytes]] = {}
+        for filename in _ADOPT_STATE_SNAPSHOT_FILENAMES:
+            path = state_dir / filename
+            state_snapshot[filename] = path.read_bytes() if path.is_file() else None
+        rollback_root = selected.skill_dir.parent / ".rollback"
+        rollback_root.mkdir(parents=True, exist_ok=True)
+        aside_dir = rollback_root / f"{sanitized}.adopt.{uuid.uuid4().hex}"
+        selected.skill_dir.rename(aside_dir)
+    except Exception as exc:
+        log.warning("adopt move-aside failed for %s", sanitized, exc_info=True)
+        if was_live:
+            _reconcile_extension_quiet(sanitized, drive_root)
+        return _adopt_refusal(
+            sanitized,
+            f"Adopt failed before replacing the local copy: {type(exc).__name__}: {exc}",
+        )
+    return _AdoptContext(
+        name=sanitized,
+        drive_root=drive_root,
+        source_dir=selected.skill_dir,
+        aside_dir=aside_dir,
+        dest_dir=get_ouroboroshub_skills_dir() / sanitized,
+        state_snapshot=state_snapshot,
+        was_live=was_live,
+    )
+
+
+async def run_hub_adopt(
+    slug: str,
+    *,
+    drive_root: pathlib.Path,
+    expected_content_hash: str,
+    progress: Any,
+    run_blocking: Callable[..., Any],
+    apply_review_and_deps: Callable[[Dict[str, Any], str], Any],
+) -> Dict[str, Any]:
+    """§7.3 adopt transaction: move the external occupant aside, run the
+    ordinary install (its built-in identity precheck sees a clean tree), share
+    the update path's review/deps orchestration, then reload.
+
+    Any failure after the source payload was moved aside rolls back the dest
+    payload plus the state quintet and reports ``rolled_back: true``. Unlike
+    update, a reload/load_error failure is TERMINAL for adopt (disclosed
+    asymmetry; aligning update is a separate issue).
+    """
+    from ouroboros.skill_loader import review_status_allows_execution
+
+    drive_root = pathlib.Path(drive_root)
+    sanitized = _sanitize_skill_name(slug)
+    progress.set("Checking adopt eligibility…")
+    try:
+        prelude = await run_blocking(
+            _adopt_begin,
+            slug,
+            drive_root,
+            expected_content_hash,
+            log_label="OuroborosHub adopt eligibility lifecycle operation",
+        )
+    except Exception as exc:
+        log.warning("adopt prelude failed for %s", sanitized, exc_info=True)
+        return _adopt_refusal(sanitized, f"Adopt failed: {type(exc).__name__}: {exc}")
+    if isinstance(prelude, dict):
+        return prelude
+    ctx: _AdoptContext = prelude
+
+    async def _rollback() -> None:
+        await run_blocking(
+            _adopt_rollback,
+            ctx,
+            log_label="OuroborosHub adopt rollback lifecycle operation",
+        )
+
+    try:
+        progress.set("Downloading from OuroborosHub…")
+        result = await run_blocking(
+            install,
+            slug,
+            log_label="OuroborosHub adopt install lifecycle operation",
+        )
+        payload = serialize_hub_install_result(result)
+        if not result.ok:
+            await _rollback()
+            payload["rolled_back"] = True
+            return payload
+        status, error, deps_status = await apply_review_and_deps(payload, result.sanitized_name)
+        if deps_status == "failed" or error or not review_status_allows_execution(status):
+            await _rollback()
+            payload["ok"] = False
+            payload["rolled_back"] = True
+            if not payload.get("error"):
+                payload["error"] = error or f"review status {status!r} does not allow execution"
+            return payload
+        if ctx.was_live:
+            reload_error = ""
+            try:
+                from ouroboros.config import load_settings
+                from ouroboros.extension_loader import reconcile_extension
+
+                progress.set("Reloading extension…")
+                live_state = await run_blocking(
+                    reconcile_extension,
+                    result.sanitized_name,
+                    drive_root,
+                    load_settings,
+                    log_label="OuroborosHub adopt extension reload lifecycle operation",
+                )
+                payload.update({
+                    "extension_action": live_state.get("action"),
+                    "extension_reason": live_state.get("reason"),
+                })
+                if str(live_state.get("action") or "") == "extension_load_error" or live_state.get("load_error"):
+                    reload_error = str(live_state.get("load_error") or "extension reload failed")
+            except Exception as exc:
+                reload_error = f"{type(exc).__name__}: {exc}"
+            if reload_error:
+                # Terminal for adopt (§7.3): never leave a hub payload that
+                # cannot load where a loadable local copy used to live.
+                await _rollback()
+                payload["ok"] = False
+                payload["rolled_back"] = True
+                payload["error"] = f"extension reload failed after adopt: {reload_error}"
+                return payload
+        await run_blocking(
+            _adopt_finalize,
+            ctx,
+            log_label="OuroborosHub adopt finalize lifecycle operation",
+        )
+        payload["adopted"] = True
+        return payload
+    except Exception as exc:
+        log.warning("OuroborosHub adopt failed after move-aside for %s", sanitized, exc_info=True)
+        try:
+            await _rollback()
+        except Exception:
+            log.error("OuroborosHub adopt rollback itself failed for %s", sanitized, exc_info=True)
+        payload = _adopt_refusal(sanitized, f"Adopt failed: {type(exc).__name__}: {exc}")
+        payload["rolled_back"] = True
+        return payload

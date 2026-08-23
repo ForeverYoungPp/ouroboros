@@ -74,20 +74,24 @@ def _payload_sidecar_specs(skill_dir: pathlib.Path) -> List[Dict[str, Any]]:
 def auto_install_specs_for_skill(drive_root: pathlib.Path, loaded: Any) -> List[Dict[str, Any]]:
     """Return normalized auto-install specs declared for ``loaded``.
 
-    ClawHub provenance remains authoritative when present. Other sources can
-    declare dependencies in their reviewed manifest or, for official catalog
-    installs, in a payload sidecar.
+    ClawHub provenance remains authoritative for ClawHub-sourced skills only:
+    the state-plane ``clawhub.json`` survives payload transitions, so reading
+    it source-blind would let a stale record dictate dependencies for a skill
+    that now lives in another bucket. Other sources declare dependencies in
+    their reviewed manifest or, for official catalog installs, in a payload
+    sidecar.
     """
 
-    try:
-        from ouroboros.marketplace.provenance import read_provenance
+    if str(getattr(loaded, "source", "") or "") == "clawhub":
+        try:
+            from ouroboros.marketplace.provenance import read_provenance
 
-        prov = read_provenance(drive_root, loaded.name) or {}
-        auto = list((prov.get("install_specs") or {}).get("auto") or [])
-        if auto:
-            return auto
-    except Exception:
-        pass
+            prov = read_provenance(drive_root, loaded.name) or {}
+            auto = list((prov.get("install_specs") or {}).get("auto") or [])
+            if auto:
+                return auto
+        except Exception:
+            pass
 
     sidecar = _payload_sidecar_specs(pathlib.Path(loaded.skill_dir))
     if sidecar:
