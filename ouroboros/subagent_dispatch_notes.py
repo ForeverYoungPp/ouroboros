@@ -49,7 +49,7 @@ def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
                 "coordination episode: the host has not started a new physical leaf merely "
                 "because the row is configured. Choose whether to schedule host children, "
                 "publish evidence, start the snapshotted leaf with delegate_start, or record a "
-                "typed zero-run decision. A startup/wake receipt alone is not a zero-run decision; "
+                "typed zero-run decision. A typed startup/wake receipt alone is not a zero-run decision; "
                 "record the typed zero-run "
                 "decision through verify_and_record(contract_kind=delegation_zero_run, "
                 "zero_run_decision, zero_run_basis). That receipt is terminal for this actor: "
