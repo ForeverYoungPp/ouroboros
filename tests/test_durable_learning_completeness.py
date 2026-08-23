@@ -371,6 +371,37 @@ def test_bgc_direct_identity_update_requires_complete_named_omission(tmp_path):
         bc._tool_executor.shutdown(wait=False, cancel_futures=True)
 
 
+def test_bgc_source_mutation_after_read_cannot_authorize_identity_rewrite(tmp_path, monkeypatch):
+    bc = _bg_fixture(tmp_path)
+    try:
+        bc._build_context()
+        backlog = tmp_path / "memory" / "knowledge" / "improvement-backlog.md"
+        real_read_text = pathlib.Path.read_text
+        target_reads = 0
+
+        def mutate_after_read(self, *args, **kwargs):
+            nonlocal target_reads
+            text = real_read_text(self, *args, **kwargs)
+            if self == backlog:
+                target_reads += 1
+                if target_reads == 2:
+                    self.write_text(
+                        text + "\n### ibl-concurrent\n- summary: changed after materialization\n",
+                        encoding="utf-8",
+                    )
+            return text
+
+        monkeypatch.setattr(pathlib.Path, "read_text", mutate_after_read)
+        bc._execute_tool(_tool_call("knowledge_read", {"topic": "improvement-backlog"}, "r1"), [])
+        result = bc._execute_tool(
+            _tool_call("update_identity", {"content": "must remain blocked"}, "u1"), [],
+        )
+        assert target_reads == 2
+        assert "IDENTITY_UPDATE_ABSTAINED" in result
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
 def test_bgc_unavailable_named_omission_abstains_without_approval_flow(tmp_path):
     bc = _bg_fixture(tmp_path)
     try:
