@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
+import time
 from typing import Any, Optional
 
 
@@ -88,6 +90,54 @@ def llm_transport_timeout_sec(explicit: Any = None) -> float:
     from ouroboros.config import get_llm_transport_read_timeout_sec
 
     return float(get_llm_transport_read_timeout_sec())
+
+
+def transport_timeout_with_deadline(
+    explicit: Any = None,
+    *,
+    deadline_at: Any = None,
+    deadline_ts: Any = None,
+    reserve_sec: Any = 0.0,
+) -> float:
+    """Narrow a transport read/process timeout to the owner's remaining time.
+
+    This is deliberately a transport bound, not a logical-operation deadline:
+    absent an owner deadline it returns the configured dead-socket timeout, while
+    an existing deadline can only shorten it. Numeric epoch deadlines are useful
+    for in-process loop contexts; ISO deadlines remain the public task contract.
+    """
+    base = llm_transport_timeout_sec(explicit)
+    remaining: Optional[float] = None
+    try:
+        if deadline_ts is not None:
+            remaining = max(0.0, float(deadline_ts) - time.time())
+    except (TypeError, ValueError):
+        remaining = None
+    if remaining is None:
+        remaining = seconds_until(deadline_at)
+    if remaining is None:
+        return base
+    try:
+        reserve = max(0.0, float(reserve_sec or 0.0))
+    except (TypeError, ValueError):
+        reserve = 0.0
+    return max(0.001, min(base, remaining - reserve))
+
+
+def bounded_seconds(value: Any, *, default: float, maximum: float) -> int:
+    """Encode a positive engine horizon without widening an exhausted one."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raw = float(default)
+    else:
+        try:
+            raw = float(value)
+        except (TypeError, ValueError):
+            raw = float(default)
+    if not math.isfinite(raw):
+        raw = float(default)
+    if raw <= 0:
+        return 1
+    return max(1, min(math.ceil(raw), int(maximum)))
 
 
 def logical_operation_timeout_sec(

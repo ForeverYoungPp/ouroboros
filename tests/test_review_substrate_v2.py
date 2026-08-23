@@ -1748,6 +1748,53 @@ def test_review_paid_stamp_is_write_ahead_of_a_slow_worker(tmp_path):
     assert order[1] == "transport"
 
 
+def test_replayed_late_review_does_not_charge_same_context_twice(tmp_path):
+    from types import SimpleNamespace
+
+    calls = []
+
+    class SlowLLM:
+        def chat(self, **_kwargs):
+            calls.append(1)
+            time.sleep(0.06)
+            return {"content": '{"verdict":"PASS","findings":[],"summary":"late"}'}, {}
+
+    ctx = SimpleNamespace(
+        task_id="paid-replay", event_queue=None, pending_events=[],
+        _review_paid_stamp=lambda: calls.append("paid"),
+    )
+    request = ReviewRequest(surface="scope", goal="review", task_id="paid-replay")
+    first = run_review_request(
+        request,
+        slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.02)],
+        drive_root=tmp_path, llm=SlowLLM(), usage_ctx=ctx,
+    )
+    assert first.actors[0]["operation_state"] == "in_flight"
+    # The late result is cached only after the worker has actually settled.  Do
+    # not race the worker's provider return with the replay assertion.
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
+
+    key = _attempt_key(request, ReviewSlot(slot_id="slot_a", model="same/model"))
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        with _ACTIVE_LOCK:
+            settled = key in getattr(ctx, "_review_settled_attempts", {})
+            active = key in _ACTIVE
+        if settled and not active:
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("late review worker did not settle into same-context custody")
+    second = run_review_request(
+        request,
+        slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.01)],
+        drive_root=tmp_path, llm=SlowLLM(), usage_ctx=ctx,
+    )
+    assert calls.count("paid") == 1
+    assert sum(1 for item in calls if item == 1) == 1
+    assert second.actors[0]["operation_state"] == "late_settled"
+
+
 def test_review_slot_timeout_is_not_used_as_transport_timeout(tmp_path):
     captured = []
 

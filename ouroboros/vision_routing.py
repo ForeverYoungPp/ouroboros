@@ -9,6 +9,7 @@ import pathlib
 from typing import Any, Dict, List
 
 from ouroboros.config import get_image_input_mode, get_vision_caption_timeout_sec, get_vision_model, resolve_effort
+from ouroboros.deadline_utils import transport_timeout_with_deadline
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.provider_models import supports_vision
 from ouroboros.utils import emit_cognitive_operation_event
@@ -21,6 +22,14 @@ _CAPTION_PROMPT = (
 )
 
 
+def _vision_finalization_reserve() -> float:
+    try:
+        from ouroboros.config import get_finalization_grace_sec
+        return float(get_finalization_grace_sec())
+    except Exception:
+        return 0.0
+
+
 @dataclass
 class VisionRoutingContext:
     model: str
@@ -31,6 +40,7 @@ class VisionRoutingContext:
     event_queue: Any = None
     use_local: bool = False
     task_attempt: Any = None
+    deadline_ts: Any = None
 
 
 def resolve_vision_caption_model(ctx: Any, llm: Any, *, use_local: bool = False) -> str:
@@ -114,7 +124,11 @@ def _caption_for_block(
             [{"url": url}],
             model=model,
             reasoning_effort=resolve_effort("task"),
-            timeout=get_vision_caption_timeout_sec(),
+            timeout=transport_timeout_with_deadline(
+                get_vision_caption_timeout_sec(),
+                deadline_ts=getattr(ctx, "deadline_ts", None),
+                reserve_sec=_vision_finalization_reserve(),
+            ),
         )
         try:
             from ouroboros.llm import add_usage

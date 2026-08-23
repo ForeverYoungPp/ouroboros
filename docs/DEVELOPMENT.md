@@ -1674,7 +1674,10 @@ Before every commit, verify the following:
   An explicit slot deadline narrows the shared bound; otherwise the owner task
   deadline, then the transport bound as a settlement fallback, applies. A
   caller/task deadline always narrows nested waits, and Anthropic (120s) plus
-  VLM captioning (90s) retain their separate provider transport defaults.
+  VLM captioning (90s) retain their separate provider transport defaults as
+  ceilings, not promises to run past the owner deadline. Delegated review uses
+  an opt-in strict poll bound for the remaining logical window; the general
+  delegate-wait floor remains unchanged for its existing transport contract.
 - [ ] Every physical LLM/review/VLM/tool operation that can outlive a logical
   wait emits a typed `cognitive_operation` start and terminal fact. The
   supervisor uses the active-operation map only to spare the idle rail; the
@@ -1686,6 +1689,11 @@ Before every commit, verify the following:
   (delegated sessions); API/thread routes disclose an in-flight custody state
   until their physical result settles. Do not replace this with a keyword or
   model-name heuristic, a second scheduler, or a new global timing ledger.
+  A typed transport failure after a delegated run has an id is an unknown
+  outcome: retain the durable invocation token and replay that started run on
+  the permitted retry instead of posting a second paid run. A late tool worker
+  closes its own cognitive lease through its completion callback, and a partial
+  terminal event that lacks the stored correlation identity cannot close it.
 
 #### Loop / State-Machine Changes
 - [ ] Changes to `loop.py` or other task state-machine logic include adversarial tests for malformed output, false-completion prevention, replay/log durability, and failure modes — not just the happy path.

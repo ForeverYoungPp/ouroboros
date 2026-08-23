@@ -67,6 +67,13 @@ def _handle_cognitive_operation(evt: Dict[str, Any], ctx: Any) -> None:
                         return
                 except (TypeError, ValueError):
                     return
+            for key in ("execution_id", "round_id", "slot_id"):
+                supplied = str(evt.get(key) or "")
+                stored = str(row.get(key) or "")
+                if stored and not supplied:
+                    return
+                if supplied and stored and supplied != stored:
+                    return
         active.pop(operation_id, None)
         if not active:
             meta.pop("active_operation_leases", None)
@@ -93,6 +100,7 @@ def _handle_cognitive_operation(evt: Dict[str, Any], ctx: Any) -> None:
             "until_ts": until,
             "task_attempt": expected_attempt,
             "execution_id": str(evt.get("execution_id") or ""),
+            "round_id": str(evt.get("round_id") or ""),
             "slot_id": str(evt.get("slot_id") or ""),
         }
 

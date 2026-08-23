@@ -1583,9 +1583,6 @@ def run_review_request(
     usage_ctx: Any = None,
 ) -> ReviewRunResult:
     resolved_slots = reviewer_slots(role_hint=request.surface) if slots is None else slots
-    if resolved_slots:
-        # Write the paid fact before a worker can outlive this caller.
-        stamp_review_paid_on_dispatch(usage_ctx)
     coordinator = ReviewCoordinator(llm=llm, drive_root=drive_root, usage_ctx=usage_ctx)
     result = coordinator.run(request, resolved_slots)
     if request.surface == "task_acceptance":

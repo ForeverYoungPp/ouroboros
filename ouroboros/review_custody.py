@@ -53,7 +53,11 @@ def _attempt_key(request: Any, slot: Any) -> str:
         "retry_key": retry_key,
         "surface": getattr(request, "surface", ""),
         "task_id": getattr(request, "task_id", ""),
+        "task_attempt": getattr(request, "task_attempt", None),
         "call_type": getattr(request, "call_type", ""),
+        "max_tokens": getattr(request, "max_tokens", None),
+        "temperature": getattr(request, "temperature", None),
+        "no_proxy": getattr(request, "no_proxy", None),
         "slot": slot_data,
         "messages": slot_messages if slot_messages is not None else getattr(request, "messages", []),
         "goal": getattr(request, "goal", ""),
@@ -136,6 +140,8 @@ def run_custodied_review_slots(
     slot_entries: Dict[str, ActiveReviewAttempt] = {}
     slot_deadlines: Dict[str, float] = {}
     slot_windows: Dict[str, float] = {}
+    paid_stamped = False
+
     def settle(entry: ActiveReviewAttempt, slot: Any, actor: Any) -> None:
         with _ACTIVE_LOCK:
             late = bool(entry.timed_out)
@@ -178,6 +184,7 @@ def run_custodied_review_slots(
         result_queue.put(actor)
 
     def start(slot: Any) -> None:
+        nonlocal paid_stamped
         key = _attempt_key(request, slot)
         with _ACTIVE_LOCK:
             settled = getattr(usage_ctx, "_review_settled_attempts", None)
@@ -209,6 +216,11 @@ def run_custodied_review_slots(
         slot_windows[slot_id] = _logical_timeout(slot, request, usage_meta)
         slot_deadlines[slot_id] = time.monotonic() + slot_windows[slot_id]
         if owner:
+            if not paid_stamped:
+                from ouroboros.review_dispatch import stamp_review_paid_on_dispatch
+
+                stamp_review_paid_on_dispatch(usage_ctx)
+                paid_stamped = True
             def worker() -> None:
                 _emit_operation(
                     usage_ctx, task_id=task_id, request=request, entry=entry, slot=slot,

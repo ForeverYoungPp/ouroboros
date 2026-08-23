@@ -37,7 +37,7 @@ from ouroboros.triad_review import (
     extract_json_array,
 )
 from ouroboros.provider_models import provider_for_model
-from ouroboros.deadline_utils import llm_transport_timeout_sec
+from ouroboros.deadline_utils import bounded_seconds, llm_transport_timeout_sec
 
 if TYPE_CHECKING:  # annotations only — importing the substrate here would cycle
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot
@@ -91,7 +91,7 @@ class ReviewSessionWaitingOnUser(RuntimeError):
 
 def _poll_detail(gateway: Any, run_id: str, seconds: float) -> Dict[str, Any]:
     from ouroboros.delegate_progress import bounded_poll, expiring_poll
-    return bounded_poll(gateway, run_id, seconds) if seconds > 0 else (expiring_poll(gateway, run_id) or {})
+    return bounded_poll(gateway, run_id, seconds, strict=True) if seconds > 0 else (expiring_poll(gateway, run_id) or {})
 
 def _render_prompt_parts(request: ReviewRequest, slot: ReviewSlot) -> tuple[str, str, str]:
     """Return (stable_governance, task_stable, dynamic_evidence) for one slot.
@@ -961,7 +961,9 @@ def run_delegated_review_session(
                     surface=surface, slot_id=slot_id, task_id=task_id)
                 existing_project = project_id
             invocation_id = custody.new_invocation_id()
-            seconds = max(1, min(int(timeout_sec or 300), _CLAUDEXOR_MAX_SECONDS))
+            seconds = bounded_seconds(
+                timeout_sec, default=300, maximum=_CLAUDEXOR_MAX_SECONDS,
+            )
             run_request = {
                 "prompt": prompt,
                 "instructions": instructions,
@@ -986,7 +988,11 @@ def run_delegated_review_session(
             if schema_asked:
                 run_request["outputSchema"] = output_schema
         if not run_id:
-            seconds = int(run_request.get("maxSeconds") or timeout_sec or 300)
+            seconds = bounded_seconds(
+                run_request.get("maxSeconds"),
+                default=timeout_sec if timeout_sec is not None else 300,
+                maximum=_CLAUDEXOR_MAX_SECONDS,
+            )
             requested = custody.record_start_requested(
                 custody_drive, run_id="", task_id=task_id,
                 idempotency_key=key, invocation_id=invocation_id,
@@ -1063,8 +1069,17 @@ def run_delegated_review_session(
                 "isolation": shape.isolation, "delegated": shape.delegated,
                 "root": root, "surface": surface, "slot_id": slot_id,
             }))
-        detail = _poll_session_terminal(gateway, custody, custody_drive, entry,
-                                        run_id, float(timeout_sec or 300))
+        try:
+            detail = _poll_session_terminal(
+                gateway, custody, custody_drive, entry, run_id,
+                float(timeout_sec) if timeout_sec is not None else 300.0,
+            )
+        except ClaudexorUnavailable:
+            # A started run with an unreadable terminal state is still paid work.
+            # Preserve the exact durable invocation for the permitted retry rather
+            # than POSTing a second review against the same slot.
+            state["pending_invocation_id"] = invocation_id or retry_token
+            raise
         settlement = custody.settle_run(custody_drive, gateway, entry, detail)
         summary = custody.summary_of(detail)
         run_state = str(summary.get("state") or "")
@@ -1115,8 +1130,6 @@ def run_delegated_review_session(
         }
     finally:
         gateway.close()
-
-
 def _effective_route_carries_schema(gateway: Any, route_id: str) -> bool:
     """Can the EFFECTIVE route actually carry ``outputSchema`` on this run (D19)?
 
@@ -1146,14 +1159,12 @@ def _effective_route_carries_schema(gateway: Any, route_id: str) -> bool:
     except Exception:
         log.debug("harness manifest read failed", exc_info=True)
     return False
-
-
 def _poll_session_terminal(gateway: Any, custody: Any, custody_drive: Any, entry: Any,
                            run_id: str, seconds: float) -> Dict[str, Any]:
     """Poll a delegated review run on the slot clock; verified cancel and
     completion-wins semantics remain owned by the existing cancel seam."""
     from ouroboros.gateways.claudexor import pending_interactions as _cx_pending
-    deadline = time.monotonic() + max(1.0, float(seconds))
+    deadline = time.monotonic() + max(0.0, float(seconds))
     detail = _poll_detail(gateway, run_id, max(0.0, deadline - time.monotonic()))
     while not custody.is_terminal(detail):
         pending = _cx_pending(detail)
@@ -1199,8 +1210,6 @@ def _poll_session_terminal(gateway: Any, custody: Any, custody_drive: Any, entry
         remaining = max(0.0, deadline - time.monotonic())
         detail = _poll_detail(gateway, run_id, remaining)
     return detail
-
-
 def _full_session_text(gateway: Any, run_id: str, detail: Dict[str, Any]) -> str:
     """The session's final answer from the verified FULL primary output (D7).
 
@@ -1227,8 +1236,6 @@ def _full_session_text(gateway: Any, run_id: str, detail: Dict[str, Any]) -> str
         final_summary = detail.get("finalSummary")
         text = final_summary if isinstance(final_summary, str) else ""
     return text
-
-
 class AgentSessionReviewExecutor(ReviewSlotExecutor):
     """The hosted-session route: one delegated Claudexor run per slot.
 
@@ -1240,7 +1247,6 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
     repair resend NEVER restarts the session: the second ``execute`` performs
     local extraction over the transcript already collected (plan 5.5).
     """
-
     route = ReviewRouteKind.AGENT_SESSION
 
     def __init__(self, assignment: ReviewAssignment, *, llm: Any = None):
@@ -1300,7 +1306,6 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             ]
             self._session_prompt = "\n".join(parts)
         return self._session_prompt
-
     # -- delivery --------------------------------------------------------------
 
     def execute(self) -> ReviewAttemptResult:
@@ -1326,14 +1331,12 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 self._settled_failure = exc
             raise
         return self._verdict_result()
-
     def _session_route(self) -> Any:
         # 6.1: a structured row carries ITS OWN opaque target; the shared
         # session-route key stays as the legacy fallback for rows without one.
         spec = str(getattr(self.assignment.slot, "session_target", "") or "")
         if spec:
             import dataclasses
-
             from ouroboros.subagents import parse_subagent_harness
 
             route = parse_subagent_harness(spec)
@@ -1541,7 +1544,6 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             "verdict_method": method,
         }
         return ReviewAttemptResult(message=message, usage=usage, raw_text=canonical)
-
     def _emit_capability_delta(self, deltas: List[Dict[str, Any]], method: str) -> None:
         """Durable half of the disclosure (D4): every landing below what was
         asked reaches the event log, not only the actor record."""
@@ -1558,14 +1560,12 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         except Exception:
             log.warning("capability_delta disclosure write failed", exc_info=True)
 
-
 # Closed route table. Adding a route means adding an executor here; it never
 # means adding a branch to the coordinator.
 _REVIEW_ROUTE_EXECUTORS: Dict[ReviewRouteKind, type[ReviewSlotExecutor]] = {
     ReviewRouteKind.API_CHAT: ApiChatReviewExecutor,
     ReviewRouteKind.AGENT_SESSION: AgentSessionReviewExecutor,
 }
-
 
 def _review_route_executor(assignment: ReviewAssignment, *, llm: Any = None) -> ReviewSlotExecutor:
     """Bind a route to its executor. The ONLY place a review transport is chosen.

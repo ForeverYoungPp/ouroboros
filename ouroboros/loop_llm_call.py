@@ -20,10 +20,12 @@ import logging
 
 from ouroboros import model_concurrency
 from ouroboros.anthropic_native_custody import public_custody_projection
-from ouroboros.deadline_utils import seconds_until
+from ouroboros.config import get_finalization_grace_sec
+from ouroboros.deadline_utils import seconds_until, transport_timeout_with_deadline
 from ouroboros.llm import LLMClient, LocalContextTooLargeError, add_usage
 from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
+from ouroboros.provider_models import provider_for_model
 from ouroboros.usage_accounting import (
     PhysicalAttemptContext,
     UsageAccountingError,
@@ -41,6 +43,18 @@ from ouroboros.utils import (
 log = logging.getLogger(__name__)
 
 MAIN_LOOP_MAX_TOKENS = 65_536
+
+
+def _main_transport_timeout(model: str, deadline_ts: Optional[float]) -> float:
+    # Preserve the native Anthropic default while narrowing every route to an
+    # owner deadline. Other routes use the shared dead-socket bound; local models
+    # receive the same explicit bound their client already supports.
+    explicit = 120 if provider_for_model(model) == "anthropic" else None
+    return transport_timeout_with_deadline(
+        explicit,
+        deadline_ts=deadline_ts,
+        reserve_sec=get_finalization_grace_sec(),
+    )
 
 # Retrieval transparency (v6.78.0, owner Q20/Q22): native provider web search happens
 # INSIDE the solve model's own request, so `usage["web_search_sources"]` /
@@ -867,6 +881,7 @@ def _prepare_main_messages(
     event_queue: Optional[queue.Queue],
     use_local: bool,
     task_attempt: Any = None,
+    deadline_ts: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     try:
         from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
@@ -876,7 +891,7 @@ def _prepare_main_messages(
             routing=VisionRoutingContext(
                 model=model, llm=llm, accumulated_usage=accumulated_usage,
                 drive_root=drive_root, task_id=task_id, event_queue=event_queue,
-                use_local=use_local, task_attempt=task_attempt,
+                use_local=use_local, task_attempt=task_attempt, deadline_ts=deadline_ts,
             ),
         )
     except Exception:
@@ -1004,7 +1019,7 @@ def call_llm_with_retry(
             send_messages = _prepare_main_messages(
                 messages, model=model, llm=llm, accumulated_usage=accumulated_usage,
                 drive_root=drive_root, task_id=task_id, event_queue=event_queue,
-                use_local=use_local, task_attempt=task_attempt,
+                use_local=use_local, task_attempt=task_attempt, deadline_ts=deadline_ts,
             )
             _emit_live_log(event_queue, {
                 "type": "llm_round_started",
@@ -1028,6 +1043,7 @@ def call_llm_with_retry(
                 "use_local": use_local,
                 "allow_server_web_search": bool(allow_server_web_search),
                 "bypass_response_cache": response_cache_bypass_requested,
+                "timeout": _main_transport_timeout(model, deadline_ts),
             }
             if tools:
                 kwargs["tools"] = tools

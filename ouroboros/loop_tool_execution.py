@@ -155,6 +155,7 @@ def _emit_live_log(tools: ToolRegistry, payload: Dict[str, Any]) -> None:
             kind="tool",
             task_attempt=getattr(tool_ctx, "task_attempt", None),
             execution_id=str(enriched.get("execution_id") or ""),
+            round_id=str(enriched.get("round_id") or ""),
             tool=str(enriched.get("tool") or ""),
         )
     emit_log_event(
@@ -162,6 +163,37 @@ def _emit_live_log(tools: ToolRegistry, payload: Dict[str, Any]) -> None:
         {"ts": utc_now_iso(), **enriched},
         log_label="tool live",
     )
+
+
+def _attach_late_tool_settlement(
+    tools: ToolRegistry,
+    future: Any,
+    *,
+    task_id: str,
+    tool_call_id: str,
+    correlation: Dict[str, Any],
+) -> None:
+    """Close the cognitive lease when a timed-out worker finally settles."""
+    tool_ctx = getattr(tools, "_ctx", None)
+    event_queue = getattr(tool_ctx, "event_queue", None)
+
+    def _settled(_future: Any) -> None:
+        emit_cognitive_operation_event(
+            event_queue,
+            task_id=task_id,
+            operation_id=tool_call_id,
+            phase="finished",
+            kind="tool",
+            task_attempt=getattr(tool_ctx, "task_attempt", None),
+            execution_id=str(correlation.get("execution_id") or ""),
+            round_id=str(correlation.get("round_id") or ""),
+            tool=str(correlation.get("tool") or ""),
+        )
+
+    try:
+        future.add_done_callback(_settled)
+    except Exception:
+        log.debug("Failed to attach late tool settlement callback", exc_info=True)
 
 
 def _tool_correlation(tools: ToolRegistry) -> Dict[str, Any]:
@@ -886,6 +918,10 @@ def _execute_with_timeout(
             }, correlation, tool_call_id=tool_call_id))
             return result
         except (TimeoutError, concurrent.futures.TimeoutError):
+            _attach_late_tool_settlement(
+                tools, future, task_id=task_id, tool_call_id=tool_call_id,
+                correlation={**correlation, "tool": fn_name},
+            )
             stateful_executor.reset()
             reset_msg = "Browser state has been reset. "
             timeout_result = _make_timeout_result(
@@ -991,6 +1027,10 @@ def _execute_with_timeout(
                         return result
                     except (TimeoutError, concurrent.futures.TimeoutError):
                         # Hard ceiling records terminal state; late real result may overwrite.
+                        _attach_late_tool_settlement(
+                            tools, future, task_id=task_id, tool_call_id=tool_call_id,
+                            correlation={**correlation, "tool": fn_name},
+                        )
                         try:
                             from ouroboros.tools.commit_gate import _record_commit_attempt
                             ctx = getattr(tools, "_ctx", None)
@@ -1037,6 +1077,10 @@ def _execute_with_timeout(
                         }, correlation, tool_call_id=tool_call_id))
                         return timeout_result
                 else:
+                    _attach_late_tool_settlement(
+                        tools, future, task_id=task_id, tool_call_id=tool_call_id,
+                        correlation={**correlation, "tool": fn_name},
+                    )
                     timeout_result = _make_timeout_result(
                         fn_name, tool_call_id, is_code_tool, tc, drive_logs,
                         timeout_sec, task_id, reset_msg="", correlation=correlation

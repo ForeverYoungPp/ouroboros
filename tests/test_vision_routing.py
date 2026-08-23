@@ -108,6 +108,7 @@ def test_off_mode_ignores_existing_caption(monkeypatch):
 
 def test_caption_call_records_observability(monkeypatch, tmp_path):
     import queue
+    import time
     from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
 
     class FakeLLM:
@@ -115,6 +116,7 @@ def test_caption_call_records_observability(monkeypatch, tmp_path):
             return "google/gemini-3.5-flash"
 
         def vision_query(self, *args, **kwargs):
+            self.timeout = kwargs["timeout"]
             return "fresh caption", {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.01}
 
     monkeypatch.setenv("OUROBOROS_IMAGE_INPUT_MODE", "caption")
@@ -123,12 +125,17 @@ def test_caption_call_records_observability(monkeypatch, tmp_path):
     messages[0]["content"][1].pop("_caption")
 
     events = queue.Queue()
+    llm = FakeLLM()
     out = prepare_messages_for_send(
         messages,
-        routing=VisionRoutingContext("not/vision", FakeLLM(), {}, drive_root=tmp_path, task_id="task-1", event_queue=events),
+        routing=VisionRoutingContext(
+            "not/vision", llm, {}, drive_root=tmp_path, task_id="task-1",
+            event_queue=events, deadline_ts=time.time() + 10,
+        ),
     )
 
     assert out[0]["content"][1]["text"] == "[image caption: fresh caption]"
+    assert 0 < llm.timeout <= 10
     calls = list((tmp_path / "observability" / "calls").rglob("*.json"))
     assert calls
     event_rows = []

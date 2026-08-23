@@ -12,12 +12,31 @@ import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.config import get_vision_caption_timeout_sec, resolve_effort
+from ouroboros.deadline_utils import transport_timeout_with_deadline
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.usage_accounting import current_usage_scope
 from ouroboros.utils import emit_cognitive_operation_event
 from ouroboros.observability import new_call_id
 
 log = logging.getLogger(__name__)
+
+
+def _vision_timeout_for_context(ctx: Any) -> float:
+    metadata = getattr(ctx, "task_metadata", {})
+    deadline_at = metadata.get("deadline_at") if isinstance(metadata, dict) else None
+    deadline_ts = getattr(ctx, "deadline_ts", None)
+    try:
+        from ouroboros.config import get_finalization_grace_sec
+
+        reserve = get_finalization_grace_sec()
+    except Exception:
+        reserve = 0
+    return transport_timeout_with_deadline(
+        get_vision_caption_timeout_sec(),
+        deadline_at=deadline_at,
+        deadline_ts=deadline_ts,
+        reserve_sec=reserve,
+    )
 
 
 def _get_llm_client():
@@ -55,7 +74,7 @@ def _analyze_screenshot(ctx: ToolContext, prompt: str = "Describe what you see i
             images=[_image_payload_from_base64(b64, "image/png")],
             model=vlm_model,
             reasoning_effort=resolve_effort("task"),
-            timeout=float(get_vision_caption_timeout_sec()),
+            timeout=_vision_timeout_for_context(ctx),
         )
         emit_cognitive_operation_event(
             getattr(ctx, "event_queue", None),
@@ -612,7 +631,7 @@ def _vlm_query(ctx: ToolContext, prompt: str, image_url: str = "", image_base64:
             images=images,
             model=vlm_model,
             reasoning_effort=resolve_effort("task"),
-            timeout=float(get_vision_caption_timeout_sec()),
+            timeout=_vision_timeout_for_context(ctx),
         )
         emit_cognitive_operation_event(
             getattr(ctx, "event_queue", None),

@@ -7,7 +7,7 @@ The ``paid`` fact of Max-Review-Cycles accounting is recorded at PHYSICAL
 dispatch: a gate that must durably record "this wave spent reviewer money"
 installs a :class:`ReviewPaidStamp` on ``ctx._review_paid_stamp`` for the
 duration of its wave, and the shared reviewer transport entry
-(``review_substrate.run_review_request``) invokes it after slot resolution and
+(``review_custody.run_custodied_review_slots``) invokes it after slot resolution and
 immediately before worker fan-out. Assembly-only refusals (triad fit ladder,
 scope pack signals, skill prompt building) exit before the seam, so a $0
 attempt stays outside every ceiling; a worker that outlives its logical caller

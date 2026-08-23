@@ -75,6 +75,7 @@ class FakeGateway:
     detail = {}
     # Optional scripted behaviors.
     start_error = None            # exception raised on the FIRST start only
+    poll_error = None             # exception raised on the FIRST terminal read only
     artifact_bytes = None
     artifact_error = None
     nonterminal = False
@@ -108,6 +109,7 @@ class FakeGateway:
         cls.manifest_capabilities = {"json_schema_output": True}
         cls.detail = _terminal_detail('{"findings": []}', conformance="passed")
         cls.start_error = None
+        cls.poll_error = None
         cls.artifact_bytes = None
         cls.artifact_error = None
         cls.nonterminal = False
@@ -152,6 +154,10 @@ class FakeGateway:
 
     def get_run(self, run_id, **_kw):
         self.run_gets.append(run_id)
+        if FakeGateway.poll_error is not None:
+            exc = FakeGateway.poll_error
+            FakeGateway.poll_error = None
+            raise exc
         if FakeGateway.nonterminal:
             return {"summary": {"state": "running"}, "lastSeq": 1}
         return json.loads(json.dumps(FakeGateway.detail))
@@ -826,6 +832,19 @@ def test_transport_retry_reuses_the_pending_invocation_id(tmp_path, fake_route):
     assert len(keys) == 2 and keys[0] == keys[1]
     bodies = [b for inst in fake_route.instances for b in inst.start_requests]
     assert bodies[0] == bodies[1]  # byte-identical replay, maxSeconds included
+
+
+def test_terminal_read_transport_failure_reuses_started_run(tmp_path, fake_route):
+    """A run accepted by Claudexor must not be posted a second time when its
+    first terminal read is temporarily unavailable."""
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    fake_route.poll_error = ClaudexorUnavailable("daemon_unreachable", "boom", status_code=0)
+    result = run_review_request(_agent_request(), slots=[_agent_slot()],
+                                drive_root=tmp_path, llm=FakeLLM())
+    assert result.actors[0]["status"] == "ok"
+    assert sum(len(inst.start_requests) for inst in fake_route.instances) == 1
+    assert sum(len(inst.run_gets) for inst in fake_route.instances) == 2
 
 
 def _run_session_directly(tmp_path, **overrides):

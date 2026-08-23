@@ -329,7 +329,7 @@ def emit_external_wait_lease(ctx: Any, run_id: str, until_ts: float,
         log.debug("external-wait lease emission failed", exc_info=True)
 
 
-def poll_bound(seconds_left: float) -> float:
+def poll_bound(seconds_left: float, *, strict: bool = False) -> float:
     """What one call inside a clamped window may ASK the transport for.
 
     NARROWING in both directions, which is the only thing a bound is for. Never more
@@ -346,6 +346,8 @@ def poll_bound(seconds_left: float) -> float:
     """
     from ouroboros.gateways.claudexor import _READ_TIMEOUT_SEC, SHORT_POLL_TIMEOUT_SEC
 
+    if strict:
+        return min(_READ_TIMEOUT_SEC, max(0.001, float(seconds_left)))
     return min(_READ_TIMEOUT_SEC, max(SHORT_POLL_TIMEOUT_SEC, float(seconds_left)))
 
 
@@ -369,7 +371,9 @@ def is_transient_git_object_race(exc: Exception) -> bool:
     )
 
 
-def bounded_poll(gateway: Any, run_id: str, seconds_left: float) -> Dict[str, Any]:
+def bounded_poll(
+    gateway: Any, run_id: str, seconds_left: float, *, strict: bool = False,
+) -> Dict[str, Any]:
     """One poll that may not ask for longer than the window has left.
 
     The client's read default is minutes-scale, which is right for a call with all the
@@ -394,11 +398,11 @@ def bounded_poll(gateway: Any, run_id: str, seconds_left: float) -> Dict[str, An
     file mid-rename, not a daemon that stopped answering.
     """
     try:
-        return gateway.get_run(run_id, timeout_sec=poll_bound(seconds_left))
+        return gateway.get_run(run_id, timeout_sec=poll_bound(seconds_left, strict=strict))
     except Exception as exc:
         if seconds_left > 0 and is_transient_git_object_race(exc):
             log.debug("transient Git object race on poll of %s; one re-read", run_id)
-            return gateway.get_run(run_id, timeout_sec=poll_bound(seconds_left))
+            return gateway.get_run(run_id, timeout_sec=poll_bound(seconds_left, strict=strict))
         raise
 
 
