@@ -578,6 +578,56 @@ def test_install_endpoint_maps_catalog_identity_conflict_to_409(monkeypatch, tmp
     assert payload["code"] == "catalog_identity_conflict"
 
 
+def test_extensions_index_rows_expose_loader_content_hash(monkeypatch, tmp_path):
+    """§7.2: /api/extensions rows carry the loader content hash; collision rows
+    (whose loader hash never existed) carry the empty string."""
+    import ouroboros.gateway.extensions as extensions_api
+    import supervisor.queue as supervisor_queue
+    from ouroboros.contracts.skill_manifest import SkillManifest
+    from ouroboros.skill_loader import LoadedSkill, SkillReviewState
+
+    drive_root = tmp_path / "drive"
+    skill_dir = drive_root / "skills" / "external" / "demo"
+    skill_dir.mkdir(parents=True)
+    loaded = LoadedSkill(
+        name="demo",
+        skill_dir=skill_dir,
+        manifest=SkillManifest(name="demo", description="", version="1.0.0", type="instruction"),
+        content_hash="f" * 64,
+        enabled=False,
+        review=SkillReviewState(status="pending"),
+        load_error="",
+        source="external",
+    )
+    collision_dir = drive_root / "skills" / "clawhub" / "demo2"
+    collision_dir.mkdir(parents=True)
+    collision = LoadedSkill(
+        name="demo2",
+        skill_dir=collision_dir,
+        manifest=SkillManifest(name="demo2", description="", version="", type="instruction"),
+        content_hash="",
+        load_error="Skill name collision: clawhub and user_repo",
+        source="clawhub",
+        identity_collision=True,
+    )
+    monkeypatch.setattr(extensions_api, "discover_skills", lambda *_a, **_kw: [loaded, collision])
+    monkeypatch.setattr(
+        extensions_api,
+        "snapshot",
+        lambda: {"tools": [], "routes": [], "ws_handlers": [], "ui_tabs": [], "ui_tabs_pending": []},
+    )
+    monkeypatch.setattr(supervisor_queue, "sync_skill_schedules", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        "ouroboros.tools.github.github_token_from_env_or_settings", lambda: ""
+    )
+
+    payload = extensions_api._build_extensions_index(drive_root, repo_path="")
+
+    rows = {row["name"]: row for row in payload["skills"]}
+    assert rows["demo"]["content_hash"] == "f" * 64
+    assert rows["demo2"]["content_hash"] == ""
+
+
 def test_catalog_endpoint_serves_cached_rows_with_identity_facts(monkeypatch, tmp_path):
     _stub_marketplace_roots(monkeypatch, tmp_path)
     ouroboroshub._catalog_cache_clear()
