@@ -41,6 +41,9 @@ from ouroboros.tools.control_delegation import (
     durable_direct_child_count,
     stamp_depth_provenance,
 )
+from supervisor.task_dispatch import (
+    build_scheduled_task_payload as _build_scheduled_task_payload,
+)
 
 log = logging.getLogger(__name__)
 
@@ -519,128 +522,6 @@ def _compose_subagent_text(
         if len(budget_lines) > 2:
             parts.extend(budget_lines)
     return "\n".join(parts)
-
-
-def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
-    tid = str(fields.get("tid") or "")
-    chat_id = int(fields.get("chat_id") or 0)
-    text = str(fields.get("text") or "")
-    desc = str(fields.get("desc") or "")
-    expected_output = str(fields.get("expected_output") or "")
-    constraints = str(fields.get("constraints") or "")
-    role = str(fields.get("role") or "")
-    task_context = str(fields.get("task_context") or "")
-    depth = int(fields.get("depth") or 0)
-    root_task_id = str(fields.get("root_task_id") or "")
-    session_id = str(fields.get("session_id") or "")
-    actor_id = str(fields.get("actor_id") or "")
-    delegation_role = str(fields.get("delegation_role") or "")
-    memory_mode = str(fields.get("memory_mode") or "")
-    drive_root = str(fields.get("drive_root") or "")
-    child_drive_root = str(fields.get("child_drive_root") or "")
-    budget_drive_root = str(fields.get("budget_drive_root") or "")
-    task_constraint = fields.get("task_constraint") if isinstance(fields.get("task_constraint"), dict) else None
-    required_capabilities = fields.get("required_capabilities") if isinstance(fields.get("required_capabilities"), list) else []
-    workspace_root = str(fields.get("workspace_root") or "")
-    workspace_mode = str(fields.get("workspace_mode") or "")
-    project_id = str(fields.get("project_id") or "")
-    allowed_resources = fields.get("allowed_resources") if isinstance(fields.get("allowed_resources"), dict) else {}
-    task_contract = fields.get("task_contract") if isinstance(fields.get("task_contract"), dict) else {}
-    depth_provenance = fields.get("depth_provenance") if isinstance(fields.get("depth_provenance"), dict) else {}
-    parent_id = fields.get("parent_id")
-    # INTENT ONLY. `effective_model_lane`, `model`, `use_local_model`,
-    # `effective_executor`, `reasoning_effort` and `capability_delta` are DERIVED at
-    # dispatch and written by the worker onto the one record; carrying schedule-time
-    # values for them through here is what made two records of the same child.
-    requested_model_lane = str(fields.get("requested_model_lane") or fields.get("model_lane") or "auto")
-    parent_model_lane = str(fields.get("parent_model_lane") or "")
-    # An ADMISSION fact, not a derivation (F9): the lane an applicable
-    # non-advisory `require_lane` constraint verified this child against.
-    required_model_lane = str(fields.get("required_model_lane") or "")
-    requested_executor = str(fields.get("requested_executor") or "").strip().lower() or "auto"
-    task_group_id = str(fields.get("task_group_id") or "")
-    task_group = fields.get("task_group") if isinstance(fields.get("task_group"), dict) else {}
-    subagent_envelope = fields.get("subagent_envelope") if isinstance(fields.get("subagent_envelope"), dict) else {}
-    configured_subagent = fields.get("configured_subagent") if isinstance(fields.get("configured_subagent"), dict) else {}
-    parent_cognitive_route = fields.get("parent_cognitive_route") if isinstance(fields.get("parent_cognitive_route"), dict) else {}
-    task: Dict[str, Any] = {
-        "id": tid,
-        "type": "task",
-        "chat_id": chat_id,
-        "text": text,
-        "description": desc,
-        "objective": desc,
-        "expected_output": expected_output,
-        "constraints": constraints,
-        "role": role,
-        "context": task_context,
-        "depth": depth,
-        "root_task_id": root_task_id,
-        "session_id": session_id,
-        "actor_id": actor_id,
-        "delegation_role": delegation_role,
-        "memory_mode": memory_mode,
-        "drive_root": drive_root,
-        "child_drive_root": child_drive_root,
-        "budget_drive_root": budget_drive_root,
-        "task_constraint": task_constraint,
-        "required_capabilities": required_capabilities,
-        "workspace_root": workspace_root,
-        "workspace_mode": workspace_mode,
-        "project_id": project_id,
-        "allowed_resources": allowed_resources,
-        "task_contract": task_contract,
-        "depth_provenance": depth_provenance,
-        "model_lane": requested_model_lane,
-        "requested_model_lane": requested_model_lane,
-        "parent_model_lane": parent_model_lane,
-        "required_model_lane": required_model_lane,
-        "requested_executor": requested_executor,
-        "task_group_id": task_group_id,
-        "task_group": task_group,
-        "subagent_envelope": subagent_envelope,
-        "configured_subagent": configured_subagent,
-        "parent_cognitive_route": parent_cognitive_route,
-        "metadata": {
-            "parent_task_id": parent_id,
-            "root_task_id": root_task_id,
-            "session_id": session_id,
-            "actor_id": actor_id,
-            "delegation_role": delegation_role,
-            "role": role,
-            "memory_mode": memory_mode,
-            "task_constraint": task_constraint,
-            "required_capabilities": required_capabilities,
-            "child_drive_root": child_drive_root,
-            "workspace_root": workspace_root,
-            "workspace_mode": workspace_mode,
-            "allowed_resources": allowed_resources,
-            "task_contract": task_contract,
-            "depth_provenance": depth_provenance,
-            "model_lane": requested_model_lane,
-            "requested_model_lane": requested_model_lane,
-            "parent_model_lane": parent_model_lane,
-            "requested_executor": requested_executor,
-            "task_group_id": task_group_id,
-            "task_group": task_group,
-            "subagent_envelope": subagent_envelope,
-            "configured_subagent": configured_subagent,
-            "parent_cognitive_route": parent_cognitive_route,
-        },
-    }
-    if not drive_root:
-        task.pop("drive_root", None)
-    if not budget_drive_root:
-        task.pop("budget_drive_root", None)
-    if task_constraint is None:
-        task.pop("task_constraint", None)
-        task["metadata"].pop("task_constraint", None)
-    if not required_capabilities:
-        task.pop("required_capabilities", None)
-        task["metadata"].pop("required_capabilities", None)
-    if parent_id:
-        task["parent_task_id"] = parent_id
-    return task
 
 
 def _extract_task_description_and_context(task: Dict[str, Any]) -> tuple[str, str]:

@@ -31,10 +31,13 @@ def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -
     snapshot = task.get("configured_subagent") if isinstance(task.get("configured_subagent"), dict) else {}
     route = snapshot.get("route") if isinstance(snapshot.get("route"), dict) else {}
     if str(route.get("kind") or "") == "agent_session":
+        # Hydrate immutable route/work-order authority before every recovery
+        # branch. A recovered or already-settled physical run must never fall
+        # back to the generic selector/prompt path on the resumed nanny.
+        actor_ready = _prepare_actor_first_bootstrap(ctx, task, dispatch)
         recovery = _adopt_recovery_handoff(ctx, task)
         if recovery:
             return recovery
-        actor_ready = _prepare_actor_first_bootstrap(ctx, task, dispatch)
         if bool(getattr(dispatch, "blocked", False)):
             # A route fault is evidence for the ordinary host turn, never a
             # reason to silently spend on native/API fallback.
@@ -150,10 +153,11 @@ def actor_first_unresolved_fact(
     """Return a typed terminal fact when an actor-first turn has no completion path.
 
     A plain final answer cannot prove that a configured actor either started its
-    assigned leaf or deliberately chose a zero-run.  Existing direct children are
-    a legitimate host-side path and therefore suppress this fact; their own
-    custody/absorption gates remain authoritative.  Failure to read the child
-    store is itself ``unknown`` rather than permission to finalize cleanly.
+    assigned leaf or deliberately chose a zero-run. A completed, non-discarded
+    direct-child result is a legitimate host-side path; a merely failed/cancelled
+    child is only an attempted path and cannot make the actor clean. Existing
+    custody/absorption gates remain authoritative. Failure to read the child store
+    is itself ``unknown`` rather than permission to finalize cleanly.
     """
     bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
     if not isinstance(bootstrap, dict):
@@ -179,7 +183,7 @@ def actor_first_unresolved_fact(
             parent_task_id=child_id,
             exclude_task_id=child_id,
             scope="direct",
-            materialize_artifacts=False,
+            materialize_artifacts=True,
         )
     except Exception as exc:  # noqa: BLE001 - unknown evidence must stay visible
         return {
@@ -188,15 +192,29 @@ def actor_first_unresolved_fact(
             "detail": type(exc).__name__,
             "route_available": bool(bootstrap.get("route_available")),
         }
-    if children:
+    completed_children = [
+        child for child in children
+        if str(child.get("status") or "").strip().lower() == "completed"
+        and str(child.get("child_result_disposition") or "").strip().lower()
+        not in {"irrelevant", "deferred"}
+    ]
+    if completed_children:
         return None
     route_available = bootstrap.get("route_available")
     return {
         "status": "incomplete" if route_available is not False else "unknown",
-        "reason": "physical_leaf_not_started_and_no_direct_child",
+        "reason": (
+            "direct_children_without_completed_result"
+            if children else "physical_leaf_not_started_and_no_direct_child"
+        ),
         "route_available": route_available,
         "selected_subagent_id": str(bootstrap.get("selected_subagent_id") or ""),
         "work_order_fingerprint": str(bootstrap.get("work_order_fingerprint") or ""),
+        **({
+            "direct_child_statuses": sorted({
+                str(child.get("status") or "unknown") for child in children
+            }),
+        } if children else {}),
     }
 
 
@@ -225,25 +243,15 @@ def _durable_zero_run_receipt(ctx: Any) -> dict[str, Any] | None:
                 or "."
             )
         )
-    roots = [canonical_root]
+    roots = []
     local_root = getattr(ctx, "drive_root", None)
     if local_root:
-        local_path = Path(str(local_root)).resolve(strict=False)
-        if local_path != Path(canonical_root).resolve(strict=False):
-            roots.append(local_path)
+        roots.append(Path(str(local_root)).resolve(strict=False))
+    roots.append(canonical_root)
     try:
-        from ouroboros.outcomes import read_verification_receipts
+        from ouroboros.outcomes import read_verification_receipts_from_roots
 
-        receipts = []
-        seen_receipts: set[str] = set()
-        for root in roots:
-            for receipt in read_verification_receipts(root, task_id):
-                marker = json.dumps(
-                    receipt, ensure_ascii=False, sort_keys=True, default=str,
-                )
-                if marker not in seen_receipts:
-                    seen_receipts.add(marker)
-                    receipts.append(receipt)
+        receipts = read_verification_receipts_from_roots(roots, task_id)
     except Exception:
         return None
     for receipt in reversed(receipts or []):

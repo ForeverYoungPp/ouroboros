@@ -32,6 +32,7 @@ from ouroboros.outcomes import (
     maybe_write_verification_artifact,
     normalize_outcome_axes,
 )
+from ouroboros.outcome_receipt_store import task_verification_receipts
 from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.subagents import envelope_from_task, substrate_result_fields
 from ouroboros.subagent_messages import subagent_message_meta
@@ -637,13 +638,12 @@ def emit_task_results(
     from ouroboros.subagent_bootstrap import actor_first_terminal_projection
     actor_fact, usage, llm_trace = actor_first_terminal_projection(ctx, task, usage, llm_trace, task.get("budget_drive_root") or getattr(env, "drive_root", None))
     loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)
-    # FR3 observability: apply the receipt_absent / expected_output_ungrounded objective-axis
-    # flag HERE — once — so the SAME flagged loop_outcome feeds events and the durable
-    # task_result.json. _store_task_result reuses this loop_outcome, so the
-    # flag is no longer applied to a second, independently-derived outcome the events never saw.
+    receipt_root = pathlib.Path(str(getattr(env, "drive_root", None) or "."))
+    receipt_rows = task_verification_receipts(ctx, receipt_root, task)
+    # Apply FR3 once so events and the durable result share the same flagged outcome.
     apply_receipt_absent_flag(
-        loop_outcome, llm_trace, getattr(env, "drive_root", None), str(task.get("id") or ""),
-        expected_output=str(task.get("expected_output") or ""),
+        loop_outcome, llm_trace, receipt_root, str(task.get("id") or ""),
+        expected_output=str(task.get("expected_output") or ""), receipts=receipt_rows,
     )
     outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
     execution_status = str((outcome_axes.get("execution") or {}).get("status") or "")
@@ -1008,12 +1008,13 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
         existing = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
         if loop_outcome is None:
             loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)
-            # FR3: inject durable verification receipts into the trace and flag
-            # receipt_absent on a clean-but-unverified effects turn — BEFORE normalize so
-            # the persisted axes and the ledger agree (claudexor lockstep fix).
+            # Apply FR3 before normalization so the persisted axes and ledger agree.
             apply_receipt_absent_flag(
-                loop_outcome, llm_trace, env.drive_root, str(task.get("id") or ""),
+                loop_outcome, llm_trace,
+                env.drive_root,
+                str(task.get("id") or ""),
                 expected_output=str(task.get("expected_output") or ""),
+                receipts=task_verification_receipts(None, env.drive_root, task),
             )
         outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
         loop_outcome = _apply_terminal_custody_outcome(env, task, loop_outcome)

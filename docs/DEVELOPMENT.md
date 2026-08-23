@@ -1155,8 +1155,10 @@ Before every commit, verify the following:
   session row, or finish with an explicitly typed zero-run receipt through
   `verify_and_record(contract_kind="delegation_zero_run", zero_run_decision,
   zero_run_basis)`. The decision may be complete, incomplete, or unknown; prose
-  alone is not a zero-run receipt. Once durably recorded, it is terminal for that
-  actor; a later physical start is refused rather than contradicting the receipt.
+  alone is not a zero-run receipt. Before writing it, the host must prove from the
+  canonical custody root that no open run, ambiguous start invocation, or undisposed
+  physical result remains. Once durably recorded, it is terminal for that actor; a
+  later physical start is refused rather than contradicting the receipt.
   This is an affordance, not a topology state machine: host code must not infer a
   required number or order of descendants. The canonical brief and its hash remain
   unchanged; any coordination appendix is additive and separately disclosed. A
@@ -1191,10 +1193,14 @@ Before every commit, verify the following:
 - `delegate_wait` is an event-only model sleep. Renew bounded transport windows in
   `delegate_supervision` with zero LLM calls; journal progress may stream to the
   owner but is not a wake. Wake only for terminal/interaction/fault, an addressed
-  owner/task message, cancellation/deadline control, recovery judgment, or one
-  explicitly requested `checkpoint_after_sec` + `checkpoint_reason`. A real event
+  owner/task message, a direct-child attention beacon or terminal transition,
+  cancellation/deadline control, recovery judgment, or one explicitly requested
+  `checkpoint_after_sec` + `checkpoint_reason`. A real event
   consumes the one-shot checkpoint. Keep durable pending/ack/replay semantics for
-  wakes and message/interaction ids. On wake the nanny retains its full ordinary
+  wakes and message/interaction ids. An oversized combined wake must remain valid
+  bounded JSON with a hash-verified actor-readable source for the exact full payload;
+  if source staging or delivered-payload acknowledgement fails, leave the wake pending
+  and replay it rather than advancing the coordination cursor. On wake the nanny retains its full ordinary
   tool surface and inherited parent cognitive route; no-co-building is a
   prompt/review/receipt role contract, not a host allowlist.
 - Recovery is cause-specific. A proven non-signal worker crash and an explicit
@@ -1261,6 +1267,12 @@ Before every commit, verify the following:
   below the hard ceiling.
   Do not infer child needs from objective prose; the LLM declares them via the
   closed enum. Do not add fields to `contracts/task_contract.py` for this.
+- Preserve requested/permitted/attempted/achieved depth on every admitted child.
+  Root acceptance must summarize those persisted host-visible facts; do not
+  recompute historical permission from current Settings when child provenance exists,
+  do not fill missing historical permission from mutable live Settings, and do not
+  count opaque vendor-internal descendants as host depth. A tool-level over-cap
+  attempt must leave a typed durable rejected child result rather than only prose.
 - Treat a delegated 404 as scoped evidence. Project 404 discharges registration;
   run 404 after owned-daemon reprovisioning closes custody as unreachable, not
   settled, only after registration retirement and without invented usage/spend.
@@ -1270,10 +1282,20 @@ Before every commit, verify the following:
   (`constraint_id`, directive, scope, rationale). Consumers must read the payload,
   never parse the text. Overrides require an explicit reason and are recorded as
   decision rows.
+- `review_requested` is a typed, advisory task-tree beacon with the closed payload
+  `{evidence_ref, evidence_sha256}`. It wakes the waited/direct parent and preserves
+  separate typed concerns even when they reference the same bytes, but never starts
+  or waits for a reviewer. The full hash remains visible through `tree_read`/`peek_task`.
+  The parent/root decides whether to inspect, spawn an ordinary critic, or use the
+  root-owned acceptance path; if it launches a check, it carries the hash into the
+  existing accounting/deduplication path. The referenced bytes remain caller-authored
+  evidence until that parent/critic actually verifies them.
 - Subagent changes must keep writes, commits, review mutation, runtime control,
   tool expansion, skills lifecycle, and shell blocked — except bounded task-tree
   coordination via `tree_note`/`tree_read`, parent-only
-  `override_delegation_constraint`, and bounded media projection such as
+  `override_delegation_constraint`, existing lineage-gated `peek_task`/
+  `cancel_task`/`discard_child_result` over the caller's own direct children, and
+  bounded media projection such as
   `extract_video_frames` writing derived frames only under the task artifact store
   (`artifact_store/video_frames`) through a host-owned command shape (the permitted
   local coordination/projection paths; not arbitrary workspace or repo mutation).
@@ -1418,8 +1440,11 @@ Before every commit, verify the following:
   read-path only. `wait_task` and
   `get_task_result` keep the full handoff plus a bounded verification-receipt
   projection: every outstanding red/masked receipt first, then newest rows, with
-  an exact omitted count; read the canonical store and fall back to the recorded
-  child drive before copy-back. `wait_tasks` stays batch-compact:
+  an exact omitted count; union the canonical and recorded child-drive replicas
+  with exact-row de-duplication and stable receipt chronology before and during
+  copy-back, so neither a canonical zero-run fact nor a child-local ordinary check
+  can hide or erase the other and an older PASS cannot reconcile a newer FAIL.
+  `wait_tasks` stays batch-compact:
   `task_id, status, cost_usd (+ its honest alias accounted_upper_bound_usd and
   cost_final — C2), child_result_sha256, outcome_axes, result,
   trace_summary, capability_delta when disclosable, duplicate_of`; it points to
@@ -1703,8 +1728,9 @@ Before every commit, verify the following:
   Host supervision renews bounded transport windows while the run is non-terminal;
   ordinary journal progress streams to the owner and advances the cursor but neither
   returns to the model nor ends sleep. Only terminal/interaction/fault, addressed
-  task/owner message, control/recovery judgment, or a model-requested one-shot
-  checkpoint wakes it. A quiet transport-window expiry is an internal renewal with
+  task/owner message, direct-child attention/terminal state, control/recovery
+  judgment, or a model-requested one-shot checkpoint wakes it. A quiet
+  transport-window expiry is an internal renewal with
   zero LLM calls. Do not reintroduce caller-visible `wait_sec`, repeating timers,
   progress wakes, or a host semantic stall detector. Reviews and ordinary task waits
   keep their own existing progress-aware/re-decidable contracts.

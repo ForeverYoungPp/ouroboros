@@ -706,6 +706,15 @@ _PROCESS_COMMAND_TOOLS = frozenset({"run_command", "run_script", "start_service"
 # receipt, so they would only annotate the returned text, not gate the durable receipt —
 # adding them would give false assurance while the pre-exec guards already do the gating.
 _SHELL_GUARDED_TOOLS = _PROCESS_COMMAND_TOOLS | {"verify_and_record"}
+
+
+def _shell_guard_required(name: str, args: Dict[str, Any]) -> bool:
+    """Keep the command-less actor zero-run receipt outside shell-CWD guards."""
+
+    return name in _SHELL_GUARDED_TOOLS and not (
+        name == "verify_and_record"
+        and str(args.get("contract_kind") or "").strip() == "delegation_zero_run"
+    )
 # Path-bearing file tools whose active_workspace/system_repo path arg is normalized
 # ONCE at dispatch (execute) so the handler AND every guard (protected-path,
 # protected-artifact, shrink) resolve the identical target — no desync bypass.
@@ -3682,16 +3691,7 @@ class ToolRegistry:
                     action=f"run tool {name!r} against",
                 )
 
-        # ``delegation_zero_run`` is a typed host receipt and deliberately has
-        # no command/cwd to inspect.  Running the generic shell-CWD guard on its
-        # empty check would reject the receipt before the handler can append it.
-        # All command-bearing verify kinds still use the normal pre-execution
-        # shell guards, and the handler independently narrows read-only profiles.
-        zero_run_receipt = (
-            name == "verify_and_record"
-            and str(args.get("contract_kind") or "").strip() == "delegation_zero_run"
-        )
-        if name in _SHELL_GUARDED_TOOLS and not zero_run_receipt:
+        if _shell_guard_required(name, args):
             if (
                 name == "start_service"
                 and _runtime_mode == "light"

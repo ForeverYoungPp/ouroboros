@@ -81,13 +81,14 @@ An API model row creates an ordinary recursive Ouroboros child on that exact
 configured model. An Agent session row creates an ordinary recursive Ouroboros
 nanny over an external leaf. The nanny receives one ordinary host episode first:
 it may schedule host children, publish coordination evidence, start the selected
-leaf, or make a typed incomplete/unknown zero-run decision. Topology, ordering and
+leaf, or make a typed complete/incomplete/unknown zero-run decision. Topology, ordering and
 whether a physical leaf is useful are model decisions, not a host state machine.
 The canonical brief and its hash stay host-owned; any coordination context is an
 additive, separately disclosed fact and must fit the existing host instruction
 field; oversized context is refused without truncation. When the nanny chooses the leaf, call
-`delegate_start` for the task's snapshotted session row (a plain call is enough;
-the host binds the exact row) and then use `delegate_wait`. A
+`delegate_start(prompt="")` for the task's snapshotted session row (a non-empty
+prompt is only advisory coordination context; the host binds the exact row) and
+then use `delegate_wait`. A
 `[CONFIGURED SESSION STARTUP / WAKE RECEIPT]` is authoritative for a start or
 recovery that actually occurred, so never repeat it. Exact start either yields
 custody evidence for the selected route or a typed visible fault; it never becomes
@@ -153,11 +154,16 @@ over that workspace. Nested delegation (read-only or acting) is allowed when the
 inherited typed `delegation_budget` grants it and configured depth/cap limits leave
 room. Explicit `may_delegate=false` and `may_fan_out=false` are enforced at
 admission; omitted legacy grants remain permissive. Depth bounds how DEEP
-delegation goes, never how strong a descendant is. Children may request
-evidence-first intermediate review through existing tree/receipt surfaces; the
-parent or root decides whether a critic runs, with one tree-level accounting and
-exact-hash deduplication. Children inside a vendor session remain opaque unless
-Claudexor emits a host-visible boundary receipt.
+delegation goes, never how strong a descendant is. A child may request an
+evidence-first intermediate check without starting one: publish
+`tree_note(kind="review_requested", text=<why>, payload={"evidence_ref": <where>,
+"evidence_sha256": <64 hex>})`. Distinct concerns remain visible even when they
+reference the same bytes. The parent or root decides whether to inspect, spawn an
+ordinary critic, or use its root-owned acceptance path; when it launches a check,
+carry the exact hash into the existing accounting/deduplication path. The child never
+blocks in a self-review loop.
+Children inside a vendor session remain opaque unless Claudexor emits a
+host-visible boundary receipt.
 
 Runtime data is BY DESIGN never a `write_surface`: a folder under `data/` (an
 installed skill payload, memory, state) is deliberately not a git worktree, and that

@@ -142,7 +142,6 @@ BAND_PATHS = {
     "ouroboros/loop_tool_execution.py": None,
     "ouroboros/marketplace/ouroboroshub.py": "Entered the band from 373 lines: the hubflow sprint added the adopt transaction (eligibility prelude, CAS re-verification, move-aside + state-quintet snapshot, verified rollback with per-step error collection, retention finalize) beside the existing install/update flows (hubflow sprint, adopt-in-ouroboroshub owner decision D4).",
     "ouroboros/observability.py": "Entered the band from 820 lines: child task copy-back now promotes only promised observability CAS manifests/blobs and task-owned source handles into canonical storage before headless GC, with typed unavailable gaps and retry metadata.",
-    "ouroboros/outcomes.py": None,
     "ouroboros/platform_layer.py": None,
     "ouroboros/preflight_runner.py": None,
     "ouroboros/projects_registry.py": "Entered the band from 999 lines: the stuck-Working liveness sprint homed the project-thread membership lens (mtime-cached) and its broadcast-choke marker here \u2014 registry semantics belong to the registry, not to message_bus.",
@@ -209,7 +208,7 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/loop.py": 316873,
+    "ouroboros/loop.py": 316096,
     "tests/test_delegated_subagent_transport.py": 320571,
     "tests/test_devtools_benchmarks.py": 328282,
     "web/modules/chat.js": 225761,

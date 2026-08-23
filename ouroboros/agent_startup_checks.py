@@ -52,20 +52,11 @@ def _authority_verification_receipts(
     task_id = str(row.get("task_id") or row.get("id") or "").strip()
     if not task_id:
         return []
-    from ouroboros.outcomes import read_verification_receipts
-
-    receipts = read_verification_receipts(drive_root, task_id)
-    if receipts:
-        return receipts
+    from ouroboros.outcomes import read_verification_receipts_from_roots
     from ouroboros.task_status import _child_drive_candidates
 
-    for child_drive in _child_drive_candidates(row):
-        if pathlib.Path(child_drive) == pathlib.Path(drive_root):
-            continue
-        receipts = read_verification_receipts(child_drive, task_id)
-        if receipts:
-            return receipts
-    return []
+    roots = [*_child_drive_candidates(row), drive_root]
+    return read_verification_receipts_from_roots(roots, task_id)
 
 
 def task_result_authority_projection(

@@ -2864,25 +2864,13 @@ def assign_tasks() -> None:
                 if str(task.get("delegation_role") or "") == "subagent" and str(task.get("drive_root") or ""):
                     try:
                         from ouroboros.task_results import STATUS_RUNNING, write_task_result
-                        from ouroboros.tools.control_delegation import stamp_depth_provenance
+                        from ouroboros.tools.control_delegation import stamp_task_assignment_depth
                         from ouroboros.config import get_max_subagent_depth
 
-                        # Assignment is the first host-visible execution fact. Keep
-                        # queued/cancelled children at ``achieved_depth=None`` and
-                        # advance the projection only here, when a worker has
-                        # actually accepted the child. This does not claim that a
-                        # vendor run succeeded; custody/evidence owns that fact.
-                        _task_contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
-                        _depth = int(task.get("depth", 0) or 0)
-                        _achieved_contract, _achieved_provenance = stamp_depth_provenance(
-                            _task_contract,
-                            attempted_depth=_depth,
-                            max_depth=get_max_subagent_depth(),
-                            achieved_depth=_depth,
-                        )
-                        _depth_fields = (
-                            {"task_contract": _achieved_contract, "depth_provenance": _achieved_provenance}
-                            if _task_contract else {}
+                        # Assignment is the first host-visible execution fact. Stamp
+                        # the worker payload and canonical result from one projection.
+                        _depth_fields = stamp_task_assignment_depth(
+                            task, max_depth=get_max_subagent_depth(),
                         )
                         write_task_result(
                             DRIVE_ROOT,

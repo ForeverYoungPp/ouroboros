@@ -402,6 +402,97 @@ def _probe_artifact_lifecycle(
     return lifecycle, missing_after
 
 
+def _record_delegation_zero_run(
+    ctx: ToolContext,
+    *,
+    bootstrap: dict[str, Any],
+    task_id: str,
+    criterion_id: str,
+    criterion_basis: Any,
+    check: Any,
+    kwargs: dict[str, Any],
+) -> str:
+    """Record one actor-first no-physical-run decision after custody is clear."""
+
+    if bool(bootstrap.get("physical_started")):
+        return (
+            "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run is no longer "
+            "available after the selected physical leaf has started."
+        )
+    if bool(bootstrap.get("zero_run_receipt_recorded")):
+        return (
+            "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run already "
+            "has a durable terminal decision for this actor."
+        )
+    try:
+        from ouroboros import delegate_custody as custody
+        from ouroboros.delegate_recovery import unsettled_start_ids
+
+        blockers = unsettled_start_ids(custody.custody_root(ctx), task_id)
+    except Exception as exc:
+        return (
+            "⚠️ TOOL_ERROR (verify_and_record): zero_run_custody_unknown: "
+            "the host could not prove that no physical start/run remains; no "
+            f"zero-run receipt was written ({type(exc).__name__})."
+        )
+    if any(blockers.values()):
+        return (
+            "⚠️ TOOL_ERROR (verify_and_record): zero_run_requires_settlement: "
+            "this task has an open run, ambiguous start invocation, or undisposed "
+            "physical result. Reconcile it before claiming that no physical leaf "
+            "started. blockers="
+            + json.dumps(blockers, ensure_ascii=False, sort_keys=True)
+        )
+    decision = str(
+        kwargs.get("zero_run_decision") or kwargs.get("decision") or ""
+    ).strip().lower()
+    if decision not in _ZERO_RUN_DECISIONS:
+        return (
+            "⚠️ TOOL_ARG_ERROR (verify_and_record): zero_run_decision must be one of "
+            f"{', '.join(_ZERO_RUN_DECISIONS)}."
+        )
+    basis = " ".join(str(
+        kwargs.get("zero_run_basis")
+        or kwargs.get("reason")
+        or criterion_basis
+        or check
+        or ""
+    ).split()).strip()
+    if not basis:
+        return (
+            "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run requires a "
+            "non-empty zero_run_basis explaining the host-visible evidence or blocker."
+        )
+    receipt: dict[str, Any] = {
+        "tool": "verify_and_record",
+        "contract_kind": "delegation_zero_run",
+        "status": "declared",
+        "zero_run": True,
+        "zero_run_decision": decision,
+        "zero_run_basis": _bounded(basis, _RECEIPT_DECLARED_SUMMARY_CAP),
+        "physical_run_started": False,
+        "route": str(bootstrap.get("route_id") or ""),
+        "work_order_fingerprint": str(bootstrap.get("work_order_fingerprint") or ""),
+        "ts": utc_now_iso(),
+    }
+    if crit := str(criterion_id or "").strip():
+        receipt["criterion_id"] = crit[:120]
+    # A zero-run is lifecycle authority for the actor, so keep it on the
+    # canonical budget root rather than an ephemeral child drive.
+    if not append_verification_receipt(canonical_data_root(ctx), task_id, receipt):
+        return (
+            "⚠️ TOOL_ERROR (verify_and_record): the delegation_zero_run receipt "
+            "could not be durably written; no zero-run decision was recorded."
+        )
+    bootstrap["zero_run_decision"] = decision
+    bootstrap["zero_run_basis"] = receipt["zero_run_basis"]
+    bootstrap["zero_run_receipt_recorded"] = True
+    return (
+        "verify_and_record [delegation_zero_run] "
+        f"{decision.upper()}: no physical leaf was started; typed host receipt recorded."
+    )
+
+
 def _verify_and_record(
     ctx: ToolContext,
     contract_kind: str = "",
@@ -470,66 +561,14 @@ def _verify_and_record(
                 "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run is only "
                 "available to a configured actor-first session."
             )
-        if bool(bootstrap.get("physical_started")):
-            return (
-                "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run is no longer "
-                "available after the selected physical leaf has started."
-            )
-        if bool(bootstrap.get("zero_run_receipt_recorded")):
-            return (
-                "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run already "
-                "has a durable terminal decision for this actor."
-            )
-        decision = str(
-            kwargs.get("zero_run_decision")
-            or kwargs.get("decision")
-            or ""
-        ).strip().lower()
-        if decision not in _ZERO_RUN_DECISIONS:
-            return (
-                "⚠️ TOOL_ARG_ERROR (verify_and_record): zero_run_decision must be one of "
-                f"{', '.join(_ZERO_RUN_DECISIONS)}."
-            )
-        basis = " ".join(str(
-            kwargs.get("zero_run_basis")
-            or kwargs.get("reason")
-            or criterion_basis
-            or check
-            or ""
-        ).split()).strip()
-        if not basis:
-            return (
-                "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run requires a "
-                "non-empty zero_run_basis explaining the host-visible evidence or blocker."
-            )
-        receipt: dict[str, Any] = {
-            "tool": "verify_and_record",
-            "contract_kind": kind,
-            "status": "declared",
-            "zero_run": True,
-            "zero_run_decision": decision,
-            "zero_run_basis": _bounded(basis, _RECEIPT_DECLARED_SUMMARY_CAP),
-            "physical_run_started": False,
-            "route": str(bootstrap.get("route_id") or ""),
-            "work_order_fingerprint": str(bootstrap.get("work_order_fingerprint") or ""),
-            "ts": utc_now_iso(),
-        }
-        if crit := str(criterion_id or "").strip():
-            receipt["criterion_id"] = crit[:120]
-        # A zero-run is lifecycle authority for the actor, so keep it on the
-        # canonical budget root rather than an ephemeral child drive. Ordinary
-        # verification receipts retain their historical caller-selected root.
-        if not append_verification_receipt(canonical_data_root(ctx), task_id, receipt):
-            return (
-                "⚠️ TOOL_ERROR (verify_and_record): the delegation_zero_run receipt "
-                "could not be durably written; no zero-run decision was recorded."
-            )
-        bootstrap["zero_run_decision"] = decision
-        bootstrap["zero_run_basis"] = receipt["zero_run_basis"]
-        bootstrap["zero_run_receipt_recorded"] = True
-        return (
-            "verify_and_record [delegation_zero_run] "
-            f"{decision.upper()}: no physical leaf was started; typed host receipt recorded."
+        return _record_delegation_zero_run(
+            ctx,
+            bootstrap=bootstrap,
+            task_id=task_id,
+            criterion_id=criterion_id,
+            criterion_basis=criterion_basis,
+            check=check,
+            kwargs=kwargs,
         )
     receipt: dict[str, Any] = {"tool": "verify_and_record", "contract_kind": kind, "expected": expected_s, "expected_match": match_mode, "ts": utc_now_iso()}
     crit = str(criterion_id or "").strip()

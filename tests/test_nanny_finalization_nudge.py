@@ -87,6 +87,28 @@ def test_no_nudge_when_delegate_verbs_are_policy_hidden(tmp_path):
     assert not any("NANNY" in m.get("content", "") for m in msgs)
 
 
+def test_durable_zero_run_counts_as_host_coordination_after_resume(tmp_path):
+    from ouroboros.loop import _nanny_finalization_message
+
+    ctx = SimpleNamespace(
+        task_id="zero-run-child",
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        task_metadata={},
+        _configured_actor_bootstrap={
+            "zero_run_receipt_recorded": True,
+            "zero_run_decision": "complete",
+            "physical_started": False,
+            "exact_start_pending": False,
+        },
+    )
+    assert _nanny_finalization_message(
+        _tools(ctx, ["delegate_start", "delegate_wait"]),
+        _custody_drive(tmp_path),
+        "zero-run-child",
+    ) == ""
+
+
 def test_failed_delegated_run_gets_the_truthful_reminder(tmp_path):
     # F4b: a delegated run that STARTED but FAILED is an attempted route. The
     # durable custody evidence (not the per-execution trace) proves it, and the

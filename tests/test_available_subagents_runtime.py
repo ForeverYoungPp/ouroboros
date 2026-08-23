@@ -739,6 +739,7 @@ def test_actor_first_retry_cannot_turn_coordination_prompt_into_work_order_prefi
 
 def test_actor_first_bootstrap_adopts_existing_handoff_without_new_start(monkeypatch, tmp_path):
     import ouroboros.delegate_recovery as recovery
+    import ouroboros.subagent_runtime as runtime
     from ouroboros.subagent_bootstrap import bootstrap_before_context
 
     snapshot = _snapshot(_settings(_session_row()), "session-builder")
@@ -768,6 +769,13 @@ def test_actor_first_bootstrap_adopts_existing_handoff_without_new_start(monkeyp
     assert out["status"] == "configured_session_recovered_wake"
     assert out["recovery"]["run_id"] == "run-recovered"
     assert out["wake"]["status"] == "completed"
+    assert ctx._configured_actor_bootstrap["selected_subagent_id"] == "session-builder"
+    assert ctx._configured_actor_bootstrap["canonical_work_order"]
+    assert ctx._configured_actor_bootstrap["physical_started"] is True
+    mismatch = json.loads(runtime.delegate_start_entry(
+        ctx, "switch route", subagent_id="another-session",
+    ))
+    assert mismatch["reason"] == "configured_actor_route_mismatch"
 
 
 def test_started_uncustodied_wakes_without_entering_quiet_wait(monkeypatch, tmp_path):

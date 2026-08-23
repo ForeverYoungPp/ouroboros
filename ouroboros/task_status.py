@@ -832,7 +832,7 @@ def wait_for_effective_tasks(
             break
         if mode != "any_terminal" and all(terminal.values()):
             break
-        # Sliced wait hook: a child->parent attention beacon (blocker/question/interface_contract)
+        # Sliced wait hook: a child->parent attention beacon (including review_requested)
         # can break the wait early so a productively-waiting parent reacts mid-flight instead of only
         # at terminal. Never raises into the wait; a faulty hook just keeps polling.
         if callable(on_poll):

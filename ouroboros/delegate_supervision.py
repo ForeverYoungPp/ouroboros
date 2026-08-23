@@ -98,7 +98,7 @@ def _direct_children(ctx: Any) -> dict[str, dict[str, Any]]:
 
         children = find_child_tasks(
             custody.custody_root(ctx), parent_task_id=task_id,
-            root_task_id="", scope="direct", materialize_artifacts=False,
+            root_task_id="", scope="direct", materialize_artifacts=True,
         )
     except Exception:
         return {}
@@ -111,17 +111,24 @@ def _direct_children(ctx: Any) -> dict[str, dict[str, Any]]:
 
 
 def _child_marker(child: dict[str, Any]) -> dict[str, str]:
+    stored_hash = str(
+        child.get("child_result_sha256") or child.get("result_sha256") or ""
+    )
+    try:
+        from ouroboros.tools.join_ledger import _child_result_sha256
+
+        result_hash = _child_result_sha256(child)
+    except Exception:
+        result_hash = stored_hash
     return {
         "status": str(child.get("status") or "").strip().lower(),
         "updated_at": str(child.get("updated_at") or child.get("ts") or ""),
-        "result_sha256": str(
-            child.get("child_result_sha256") or child.get("result_sha256") or ""
-        ),
+        "result_sha256": result_hash,
     }
 
 
 def _coordination_wakes(
-    ctx: Any, state: dict[str, Any], *, seed: bool = False,
+    ctx: Any, state: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Collect direct-child beacons and terminal transitions on one cursor."""
     cursor = _coordination_cursor(state)
@@ -129,10 +136,6 @@ def _coordination_wakes(
     markers = {
         child_id: _child_marker(child) for child_id, child in children.items()
     }
-    if seed and "coordination_cursor" not in state:
-        cursor["children"] = markers
-        return [], cursor
-
     metadata = getattr(ctx, "task_metadata", {})
     root_id = str(metadata.get("root_task_id") or "").strip() if isinstance(metadata, dict) else ""
     root_id = root_id or str(getattr(ctx, "task_id", "") or "").strip()
@@ -254,6 +257,120 @@ def _wake_ids(value: Any) -> set[str]:
     return found
 
 
+def _wake_event_summary(event: Any) -> dict[str, Any]:
+    """Compact one wake event while retaining its routing/exact-evidence facts."""
+
+    if not isinstance(event, dict):
+        return {"type": "unknown"}
+    if str(event.get("type") or "") == "child_attention_beacon":
+        beacon = event.get("beacon") if isinstance(event.get("beacon"), dict) else {}
+        text = str(beacon.get("text") or "")
+        summary: dict[str, Any] = {
+            "type": "child_attention_beacon",
+            "beacon": {
+                key: beacon.get(key)
+                for key in ("ts", "kind", "task_id", "role", "needs_parent_attention")
+                if beacon.get(key) not in (None, "")
+            },
+        }
+        summary["beacon"]["text"] = text[:600]
+        if len(text) > 600:
+            summary["beacon"]["text_omitted_chars"] = len(text) - 600
+        payload = beacon.get("payload") if isinstance(beacon.get("payload"), dict) else {}
+        if str(beacon.get("kind") or "") == "review_requested":
+            evidence_ref = str(payload.get("evidence_ref") or "")
+            summary["beacon"]["payload"] = {
+                "evidence_ref": evidence_ref[:600],
+                "evidence_sha256": str(payload.get("evidence_sha256") or ""),
+            }
+            if len(evidence_ref) > 600:
+                summary["beacon"]["payload"]["evidence_ref_omitted_chars"] = (
+                    len(evidence_ref) - 600
+                )
+        elif payload:
+            summary["beacon"]["payload_available_in_full_source"] = True
+        return summary
+    summary = {
+        key: event.get(key)
+        for key in (
+            "type", "kind", "msg_id", "source_task_id", "child_task_id",
+            "status", "updated_at", "result_sha256",
+        )
+        if event.get(key) not in (None, "")
+    }
+    if "text" in event:
+        text = str(event.get("text") or "")
+        summary["text"] = text[:600]
+        if len(text) > 600:
+            summary["text_omitted_chars"] = len(text) - 600
+    return summary or {"type": str(event.get("type") or "unknown")}
+
+
+def _render_wake_payload(ctx: Any, payload: dict[str, Any]) -> str:
+    """Render valid bounded JSON, spilling an oversized exact wake to artifacts."""
+
+    raw = json.dumps(payload, ensure_ascii=False, indent=2)
+    from ouroboros.tool_capabilities import tool_result_limit
+
+    budget = tool_result_limit("delegate_wait")
+    if len(raw) <= budget:
+        return raw
+    wake_id = str(payload.get("supervision_wake_id") or "")
+    try:
+        from ouroboros.artifacts import store_actor_source_bytes, task_id_for_artifacts
+
+        source = store_actor_source_bytes(
+            pathlib.Path(getattr(ctx, "drive_root", custody.custody_root(ctx))),
+            task_id_for_artifacts(ctx),
+            category="tool_results",
+            source_id=f"delegate-wake-{wake_id or uuid.uuid4().hex}",
+            data=raw.encode("utf-8"),
+            extension="json",
+        )
+    except Exception:
+        # Keep the exact wake pending and let the ordinary outer truncation fail
+        # acknowledgement rather than falsely claiming lossy delivery.
+        _emit(ctx, "delegate_supervision_wake_source_failed", {
+            "run_id": str(payload.get("run_id") or ""),
+            "wake_id": wake_id,
+            "total_chars": len(raw),
+        })
+        return raw
+    events = payload.get("wake_events") if isinstance(payload.get("wake_events"), list) else []
+    summaries = [_wake_event_summary(event) for event in events]
+    envelope: dict[str, Any] = {
+        key: (str(value)[:600] if isinstance(value, str) else value)
+        for key in ("status", "run_id", "state", "last_seq", "reason")
+        if (value := payload.get(key)) not in (None, "")
+    }
+    envelope["supervision_wake_id"] = wake_id
+    envelope["wake_events"] = summaries
+    envelope["wake_delivery"] = {
+        "complete": False,
+        "total_chars": len(raw),
+        "wake_events_total": len(events),
+        "wake_events_summarized": len(summaries),
+        "wake_events_omitted": 0,
+        "source": source,
+        "note": (
+            "The exact combined delegate/coordination wake is staged at source. "
+            "Read it with the supplied read_file arguments before relying on omitted detail."
+        ),
+    }
+    rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+    while len(rendered) > budget and summaries:
+        summaries.pop()
+        envelope["wake_delivery"]["wake_events_summarized"] = len(summaries)
+        envelope["wake_delivery"]["wake_events_omitted"] = len(events) - len(summaries)
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+    if len(rendered) > budget:
+        envelope.pop("wake_events", None)
+        envelope["wake_delivery"]["wake_events_summarized"] = 0
+        envelope["wake_delivery"]["wake_events_omitted"] = len(events)
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+    return rendered
+
+
 def _pending_payload(ctx: Any, state: dict[str, Any]) -> dict[str, Any]:
     pending = state.get("pending_wake") if isinstance(state.get("pending_wake"), dict) else {}
     payload = pending.get("payload") if isinstance(pending.get("payload"), dict) else {}
@@ -282,7 +399,7 @@ def _pending_payload(ctx: Any, state: dict[str, Any]) -> dict[str, Any]:
 
 
 def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
-    """Durably ack one wake only after its full payload entered the transcript."""
+    """Ack only after the exact wake or its verified source handle was delivered."""
 
     state = _load_state(ctx, "")
     pending = state.get("pending_wake") if isinstance(state.get("pending_wake"), dict) else {}
@@ -290,20 +407,17 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
         return True
     expected = str(pending.get("wake_id") or "")
     attempt = _attempt_key(ctx)
-    delivered_wake = False
-    if delivered is not None:
-        try:
-            payload = json.loads(delivered) if isinstance(delivered, str) else delivered
-        except (TypeError, ValueError):
-            return False
-        payload = payload if isinstance(payload, dict) else {}
-        if expected and expected not in _wake_ids(payload):
-            return False
-        delivered_wake = True
-    if str(pending.get("attempt_key") or "") != attempt and not delivered_wake:
-        # A fresh physical attempt has not seen the predecessor's returned wake.
-        # Leave it pending so supervised_wait replays the exact payload first.
-        return True
+    if delivered is None:
+        # Observation, not acknowledgement: without the exact payload (or its
+        # host-staged source envelope) no attempt has proved transcript delivery.
+        return False
+    try:
+        payload = json.loads(delivered) if isinstance(delivered, str) else delivered
+    except (TypeError, ValueError):
+        return False
+    payload = payload if isinstance(payload, dict) else {}
+    if expected and expected not in _wake_ids(payload):
+        return False
     from ouroboros.owner_mailbox import acknowledge_task_messages
 
     mailbox_ids = [str(item) for item in (pending.get("mailbox_ids") or []) if str(item)]
@@ -437,7 +551,7 @@ def supervised_wait(
             "run_id": str(run_id),
             "wake_id": str(replay.get("supervision_wake_id") or ""),
         })
-        return json.dumps(replay, ensure_ascii=False, indent=2)
+        return _render_wake_payload(ctx, replay)
     snapshot = getattr(ctx, "task_metadata", {})
     snapshot = snapshot.get("configured_subagent") if isinstance(snapshot, dict) else {}
     snapshot = snapshot if isinstance(snapshot, dict) else {}
@@ -457,11 +571,10 @@ def supervised_wait(
             "run_id": str(run_id), "due_at_unix": state["checkpoint"]["due_at_unix"],
             "reason": state["checkpoint"]["reason"],
         })
-    # Seed the child projection before the first transport poll. A child that was
-    # already terminal when this sleep began is context, not a new transition.
-    if "coordination_cursor" not in state:
-        _events, initial_cursor = _coordination_wakes(ctx, state, seed=True)
-        state["coordination_cursor"] = initial_cursor
+    # Do not baseline already-terminal children before the first poll.  The model
+    # has not observed them yet; treating them as prior state loses a fast child
+    # forever when the physical leaf stays quiet.  The ordinary pending-wake
+    # cursor/ack path below publishes each existing terminal/attention fact once.
     _save_state(ctx, state)
     _emit(ctx, "delegate_supervision_wait_entered", {
         "run_id": str(run_id), "journal_cursor": int(state.get("journal_cursor") or 0),
@@ -539,7 +652,7 @@ def supervised_wait(
                 "mailbox_ids": list(state["pending_wake"]["mailbox_ids"]),
                 "interaction_ids": list(state["pending_wake"]["interaction_ids"]),
             })
-            return json.dumps(payload, ensure_ascii=False, indent=2)
+            return _render_wake_payload(ctx, payload)
         state["coordination_cursor"] = next_coordination_cursor
         state["quiet_renewals"] = int(state.get("quiet_renewals") or 0) + 1
         renewals = int(state["quiet_renewals"])
@@ -572,7 +685,6 @@ def delegate_wait_entry(
 ) -> str:
     """Event-only wait; hidden ``wait_sec`` is accepted only for old transcripts."""
 
-    acknowledge_pending_wake(ctx)
     if wait_sec is not None:
         _emit(ctx, "delegate_supervision_legacy_wait_ignored", {
             "run_id": str(run_id), "wait_sec": int(wait_sec),

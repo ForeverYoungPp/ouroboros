@@ -28,12 +28,12 @@ from ouroboros.contracts.task_contract import (
 )
 from ouroboros.tools.control_delegation import (
     _ensure_project_scope,
-    check_delegation_admission,
     child_budget_for_schedule,
-    durable_direct_child_count,
     normalize_required_capabilities,
     profile_from_task_constraint,
+    record_depth_limit_refusal,
     resolve_cooperative_write_root,
+    schedule_delegation_refusal,
 )
 from ouroboros.tools.registry import active_repo_dir_for, system_repo_dir_for
 from ouroboros.outcomes import normalize_outcome_axes
@@ -1818,7 +1818,10 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     new_depth = current_depth + 1
     max_depth = get_max_subagent_depth()
     if new_depth > max_depth:
-        return f"ERROR: Subtask depth limit ({max_depth}) exceeded. Simplify your approach."
+        return record_depth_limit_refusal(
+            ctx, fields, params, configured_subagent,
+            current_depth=current_depth, new_depth=new_depth, max_depth=max_depth,
+        )
 
     if getattr(ctx, 'is_direct_chat', False):
         from ouroboros.utils import append_jsonl
@@ -1850,13 +1853,8 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         current_chat_id = 0
     budget_drive_root = str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root)
     status_drive_root = Path(budget_drive_root)
-    parent_budget = parent_contract.get("delegation_budget") if isinstance(parent_contract, dict) else {}
-    rights = check_delegation_admission(
-        parent_budget if isinstance(parent_budget, dict) else {},
-        direct_child_count=durable_direct_child_count(status_drive_root, parent_task_id),
-    )
-    if not rights.ok:
-        return f"⚠️ TOOL_ERROR (schedule_subagent): {rights.reason_code}: {rights.detail}"
+    if refusal := schedule_delegation_refusal(parent_contract, status_drive_root, parent_task_id):
+        return refusal
     workspace_root = str(getattr(ctx, "workspace_root", "") or metadata.get("workspace_root") or "").strip()
     workspace_mode = str(getattr(ctx, "workspace_mode", "") or metadata.get("workspace_mode") or "").strip()
     workspace_root, workspace_mode = _inherited_workspace_from_active_repo(ctx, workspace_root, workspace_mode)
@@ -2346,25 +2344,16 @@ def _get_task_result(
     result = data.get("result", "")
     trace = data.get("trace_summary", "")
     try:
-        from ouroboros.outcomes import read_verification_receipts
+        from ouroboros.outcomes import read_verification_receipts_from_roots
+        from ouroboros.task_status import _child_drive_candidates
 
-        receipts = read_verification_receipts(status_drive_root, task_id)
-        if not receipts:
-            # Pre-copy-back window: the effective read above already serves a child's
-            # self-finalized result straight off its ISOLATED drive before the
-            # supervisor's task_done copy-back publishes verification_receipts.jsonl
-            # to the canonical root (headless._publish_child_verification_receipts).
-            # Fall back to the child drive recorded on that result (same candidate
-            # SSOT the effective read used) so the W2 receipt rows are never silently
-            # absent in the window the parent most often absorbs the child in.
-            from ouroboros.task_status import _child_drive_candidates
-
-            for child_drive in _child_drive_candidates(data):
-                if Path(child_drive) == status_drive_root:
-                    continue
-                receipts = read_verification_receipts(child_drive, task_id)
-                if receipts:
-                    break
+        # During the pre-copy-back window ordinary verification lives on the
+        # isolated child drive while a zero-run lifecycle receipt is already on
+        # the canonical root. Merge both replicas; a non-empty canonical file is
+        # not evidence that the local one contains nothing new.
+        receipts = read_verification_receipts_from_roots(
+            [*_child_drive_candidates(data), status_drive_root], task_id,
+        )
     except Exception:
         receipts = []
     outcome_summary = _subtask_outcome_summary(data, receipts=receipts)
@@ -2402,9 +2391,12 @@ def _get_task_result(
     return output
 
 
-def _wait_attention_poll(ctx: ToolContext, after_ts: str) -> Callable[..., Any]:
+def _wait_attention_poll(
+    ctx: ToolContext, after_ts: str, task_ids: List[str],
+) -> Callable[..., Any]:
     """on_poll hook: break a sliced wait early when a child appends an attention beacon
-    (blocker/question/interface_contract/delegation_constraint) after the wait started, so a waiting parent reacts mid-flight."""
+    (blocker/question/interface_contract/review_requested/delegation_constraint)
+    after the wait started, so a waiting parent reacts mid-flight."""
     # tree_note/tree_read live in ouroboros/tools/task_tree.py (extracted for module size).
     from ouroboros.tools.task_tree import tree_root_id
 
@@ -2416,7 +2408,7 @@ def _wait_attention_poll(ctx: ToolContext, after_ts: str) -> Callable[..., Any]:
         try:
             from ouroboros.task_tree_ledger import tree_ledger_attention_after
 
-            att = tree_ledger_attention_after(rid, after_ts)
+            att = tree_ledger_attention_after(rid, after_ts, task_ids=set(task_ids))
         except Exception:
             return None
         return {"reason": "child_attention_beacon", "beacons": att[-5:]} if att else None
@@ -2488,7 +2480,7 @@ def _wait_for_task(ctx: ToolContext, task_id: str, timeout_sec: int = 180) -> st
     status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
     waited = wait_for_effective_tasks(
         status_drive_root, [tid], timeout_sec=timeout,
-        on_poll=_wait_attention_poll(ctx, utc_now_iso()), poll_interval_sec=2.0,
+        on_poll=_wait_attention_poll(ctx, utc_now_iso(), [tid]), poll_interval_sec=2.0,
     )
     early = waited.get("early_return")
     if early:
@@ -2690,7 +2682,7 @@ def _wait_for_tasks(
     first_window = min(float(timeout), _UNMINTED_WAIT_GRACE_SEC) if _phantom_only else float(timeout)
     waited = wait_for_effective_tasks(
         status_drive_root, normalized_ids, timeout_sec=first_window, mode=normalized_mode,
-        on_poll=_wait_attention_poll(ctx, _wait_since), poll_interval_sec=2.0,
+        on_poll=_wait_attention_poll(ctx, _wait_since, normalized_ids), poll_interval_sec=2.0,
     )
     if _phantom_only and first_window < float(timeout) and waited.get("early_return") is None:
         entry_unknown_ids = _unminted_wait_ids(ctx, status_drive_root, normalized_ids)
@@ -2699,7 +2691,7 @@ def _wait_for_tasks(
             resumed = wait_for_effective_tasks(
                 status_drive_root, normalized_ids,
                 timeout_sec=max(0.0, float(timeout) - elapsed), mode=normalized_mode,
-                on_poll=_wait_attention_poll(ctx, _wait_since), poll_interval_sec=2.0,
+                on_poll=_wait_attention_poll(ctx, _wait_since, normalized_ids), poll_interval_sec=2.0,
             )
             resumed["elapsed_sec"] = float(resumed.get("elapsed_sec") or 0.0) + elapsed
             resumed["timeout_sec"] = float(timeout)
@@ -3121,7 +3113,7 @@ def get_tools() -> List[ToolEntry]:
         }, _get_task_result),
         ToolEntry("wait_task", {
             "name": "wait_task",
-            "description": "Wait for ONE subtask to reach a terminal status and return its effective result. May return EARLY (before terminal) if the child raises a tree_note blocker/question/interface_contract/delegation_constraint beacon — the result then carries a [CHILD_BEACONS] block so you can steer or override it. With SEVERAL children in flight, prefer wait_tasks(any_terminal) to absorb whichever finishes first rather than blocking serially on one id at a time.",
+            "description": "Wait for ONE subtask to reach a terminal status and return its effective result. May return EARLY (before terminal) if the child raises a tree_note blocker/question/interface_contract/review_requested/delegation_constraint beacon — the result then carries a [CHILD_BEACONS] block so you can steer, review, or override it. With SEVERAL children in flight, prefer wait_tasks(any_terminal) to absorb whichever finishes first rather than blocking serially on one id at a time.",
             "parameters": {"type": "object", "required": ["task_id"], "properties": {
                 "task_id": {"type": "string", "description": "Task ID to check"},
                 "timeout_sec": {"type": "integer", "default": 180, "description": "Maximum seconds to wait (default 180)."},
@@ -3129,7 +3121,7 @@ def get_tools() -> List[ToolEntry]:
         }, _wait_for_task, timeout_sec=7200),
         ToolEntry("wait_tasks", {
             "name": "wait_tasks",
-            "description": "Wait for MULTIPLE subtasks at once and return a compact structural projection per child (task_id, status, cost_usd, child_result_sha256, outcome_axes, result, trace_summary, capability_delta when the child has something to disclose, duplicate_of) — the right tool to ABSORB a batch of independent children you scheduled in one burst. The full per-child envelope stays on disk in task_results/<task_id>.json (child_result_sha256 pins the exact result you saw; get_task_result returns the full result text plus trace/outcome summaries). With mode=any_terminal it returns as soon as the FIRST child finishes (handle it, then call again for the rest) instead of blocking serially. The JSON also includes live_child_status (running/scheduled/terminal per child) and may early_return (before all terminal) on a child tree_note blocker/question/interface_contract/delegation_constraint beacon so you can steer or override mid-flight. An id no surface of this tree ever minted (no task result, no queue row, no tree-ledger row) is flagged unknown_task_id — 'not yet registered or never scheduled' — and unknown_task_ids + a compact children_roster of your ACTUAL direct children are attached so you can repair the wait set instead of re-polling phantoms.",
+            "description": "Wait for MULTIPLE subtasks at once and return a compact structural projection per child (task_id, status, cost_usd, child_result_sha256, outcome_axes, result, trace_summary, capability_delta when the child has something to disclose, duplicate_of) — the right tool to ABSORB a batch of independent children you scheduled in one burst. The full per-child envelope stays on disk in task_results/<task_id>.json (child_result_sha256 pins the exact result you saw; get_task_result returns the full result text plus trace/outcome summaries). With mode=any_terminal it returns as soon as the FIRST child finishes (handle it, then call again for the rest) instead of blocking serially. The JSON also includes live_child_status (running/scheduled/terminal per child) and may early_return (before all terminal) on a child tree_note blocker/question/interface_contract/review_requested/delegation_constraint beacon so you can steer, review, or override mid-flight. An id no surface of this tree ever minted (no task result, no queue row, no tree-ledger row) is flagged unknown_task_id — 'not yet registered or never scheduled' — and unknown_task_ids + a compact children_roster of your ACTUAL direct children are attached so you can repair the wait set instead of re-polling phantoms.",
             "parameters": {"type": "object", "required": ["task_ids"], "properties": {
                 "task_ids": {"type": "array", "items": {"type": "string"}, "description": "Task IDs returned by schedule_subagent."},
                 "timeout_sec": {"type": "integer", "default": 600, "description": "Maximum seconds to wait (default 600)."},

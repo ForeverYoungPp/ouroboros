@@ -10,6 +10,7 @@ cycle.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import threading
 import uuid
@@ -144,13 +145,22 @@ def durable_direct_child_count(
 
 def depth_provenance_for_schedule(
     parent_budget: Dict[str, Any], *, new_depth: int, max_depth: int,
-    achieved_depth: Any = None,
+    achieved_depth: Any = None, use_remaining_envelope: bool = False,
 ) -> Dict[str, Any]:
     """Carry requested/permitted/attempted/achieved depth as additive facts."""
     budget = parent_budget if isinstance(parent_budget, dict) else {}
     inherited = normalize_depth_provenance(budget.get("depth_provenance"))
     requested = inherited.get("requested_depth")
-    if requested is None and "depth_remaining" in budget and not inherited:
+    # Only the root scheduler can treat an explicitly supplied legacy envelope
+    # as request provenance. A descendant's remaining value is already narrowed
+    # and cannot reconstruct what the root originally requested.
+    if (
+        requested is None
+        and use_remaining_envelope
+        and new_depth == 1
+        and "depth_remaining" in budget
+        and not inherited
+    ):
         try:
             requested = max(0, int(budget.get("depth_remaining")))
         except (TypeError, ValueError):
@@ -159,7 +169,26 @@ def depth_provenance_for_schedule(
         cap = max(0, int(max_depth))
     except (TypeError, ValueError):
         cap = 0
-    permitted = cap if requested is None else min(cap, max(0, int(requested)))
+    current_permitted = cap if requested is None else min(cap, max(0, int(requested)))
+    remaining = budget.get("depth_remaining")
+    if (
+        use_remaining_envelope
+        and not inherited
+        and isinstance(remaining, int)
+        and not isinstance(remaining, bool)
+    ):
+        # A legacy descendant may lack provenance, but its already-narrowed
+        # remaining envelope still bounds authority: parent depth is new_depth-1.
+        current_permitted = min(
+            current_permitted,
+            max(0, int(new_depth) - 1) + max(0, remaining),
+        )
+    inherited_permitted = inherited.get("permitted_depth")
+    permitted = (
+        current_permitted
+        if inherited_permitted is None
+        else min(current_permitted, max(0, int(inherited_permitted)))
+    )
     try:
         attempted = max(0, int(new_depth))
     except (TypeError, ValueError):
@@ -180,16 +209,214 @@ def stamp_depth_provenance(
     task_contract: Dict[str, Any], *, attempted_depth: int, max_depth: int,
     achieved_depth: Any = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """Return a copied contract plus its compact depth projection."""
+    """Stamp an already-admitted task without inventing legacy root intent."""
     contract = dict(task_contract) if isinstance(task_contract, dict) else {}
     budget = dict(contract.get("delegation_budget") or {})
-    provenance = depth_provenance_for_schedule(
-        budget, new_depth=attempted_depth, max_depth=max_depth,
-        achieved_depth=achieved_depth,
-    )
+    inherited = normalize_depth_provenance(budget.get("depth_provenance"))
+    if inherited:
+        provenance = depth_provenance_for_schedule(
+            budget, new_depth=attempted_depth, max_depth=max_depth,
+            achieved_depth=achieved_depth,
+        )
+    else:
+        remaining = budget.get("depth_remaining")
+        permitted = None
+        if isinstance(remaining, int) and not isinstance(remaining, bool):
+            permitted = min(
+                max(0, int(max_depth)),
+                max(0, int(attempted_depth)) + max(0, remaining),
+            )
+        provenance = {
+            "requested_depth": None,
+            "permitted_depth": permitted,
+            "attempted_depth": max(0, int(attempted_depth)),
+            "achieved_depth": (
+                None if achieved_depth is None else max(0, int(achieved_depth))
+            ),
+        }
     budget["depth_provenance"] = provenance
     contract["delegation_budget"] = budget
     return contract, provenance
+
+
+def schedule_delegation_refusal(
+    parent_contract: Dict[str, Any], status_root: Any, parent_task_id: Any,
+) -> str:
+    """Return the typed direct-child rights refusal, or an empty string."""
+
+    budget = parent_contract.get("delegation_budget") if isinstance(parent_contract, dict) else {}
+    decision = check_delegation_admission(
+        budget if isinstance(budget, dict) else {},
+        direct_child_count=durable_direct_child_count(status_root, parent_task_id),
+    )
+    if decision.ok:
+        return ""
+    return f"⚠️ TOOL_ERROR (schedule_subagent): {decision.reason_code}: {decision.detail}"
+
+
+def stamp_task_assignment_depth(
+    task: Dict[str, Any], *, max_depth: int,
+) -> Dict[str, Any]:
+    """Stamp the first host-visible achieved-depth fact onto the worker payload."""
+
+    contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
+    if not contract:
+        return {}
+    depth = int(task.get("depth", 0) or 0)
+    budget = dict(contract.get("delegation_budget") or {})
+    admitted = normalize_depth_provenance(budget.get("depth_provenance"))
+    if admitted:
+        requested = admitted.get("requested_depth")
+        permitted = admitted.get("permitted_depth")
+        if permitted is None:
+            permitted = min(
+                max(0, int(max_depth)),
+                max(0, int(requested)) if requested is not None else max(0, int(max_depth)),
+            )
+        provenance = {
+            "requested_depth": requested,
+            "permitted_depth": permitted,
+            "attempted_depth": (
+                admitted.get("attempted_depth")
+                if admitted.get("attempted_depth") is not None
+                else depth
+            ),
+            "achieved_depth": depth,
+        }
+        budget["depth_provenance"] = provenance
+        achieved_contract = {**contract, "delegation_budget": budget}
+    else:
+        # A no-provenance assignment is a legacy/historical row. Its depth is
+        # observable, but mutable live Settings cannot reconstruct the request
+        # or permission that admitted it.
+        provenance = {
+            "requested_depth": None,
+            "permitted_depth": None,
+            "attempted_depth": depth,
+            "achieved_depth": depth,
+        }
+        budget["depth_provenance"] = provenance
+        achieved_contract = {**contract, "delegation_budget": budget}
+    task["task_contract"] = achieved_contract
+    task["depth_provenance"] = provenance
+    metadata = dict(task.get("metadata")) if isinstance(task.get("metadata"), dict) else {}
+    metadata["task_contract"] = achieved_contract
+    metadata["depth_provenance"] = provenance
+    task["metadata"] = metadata
+    return {"task_contract": achieved_contract, "depth_provenance": provenance}
+
+
+def record_depth_limit_refusal(
+    ctx: Any,
+    fields: Dict[str, Any],
+    params: Dict[str, Any],
+    configured_subagent: Dict[str, Any],
+    *,
+    current_depth: int,
+    new_depth: int,
+    max_depth: int,
+) -> str:
+    """Persist one normal over-cap spawn attempt without starting a child."""
+
+    metadata = (
+        getattr(ctx, "task_metadata", {})
+        if isinstance(getattr(ctx, "task_metadata", {}), dict)
+        else {}
+    )
+    parent_contract = (
+        metadata.get("task_contract")
+        if isinstance(metadata.get("task_contract"), dict)
+        else {}
+    )
+    if not parent_contract and isinstance(getattr(ctx, "task_contract", None), dict):
+        parent_contract = getattr(ctx, "task_contract")
+    parent_id = str(getattr(ctx, "task_id", "") or metadata.get("parent_task_id") or "")
+    task_id = uuid.uuid4().hex[:8]
+    root_id = str(metadata.get("root_task_id") or parent_id or task_id)
+    session_id = str(metadata.get("session_id") or "")
+    status_root = pathlib.Path(str(
+        metadata.get("budget_drive_root")
+        or getattr(ctx, "budget_drive_root", "")
+        or getattr(ctx, "drive_root", ".")
+    ))
+    child_budget = child_budget_for_schedule(
+        parent_contract,
+        current_depth=current_depth,
+        new_depth=new_depth,
+        max_depth=max_depth,
+        may_mutate=fields.get("may_mutate", False),
+        may_fan_out=params.get("may_fan_out", True),
+        max_children=params.get("max_children", 0),
+        intent_note=params.get("delegation_intent", ""),
+    )
+    from ouroboros.contracts.task_contract import build_task_contract
+
+    child_contract = build_task_contract({
+        "objective": fields.get("objective"),
+        "expected_output": fields.get("expected_output"),
+        "constraints": fields.get("constraints"),
+        "context": fields.get("context"),
+        "parent_task_id": parent_id,
+        "root_task_id": root_id,
+        "session_id": session_id,
+        "delegation_role": "subagent",
+        "allowed_resources": parent_contract.get("allowed_resources", {}),
+        "delegation_budget": child_budget,
+    })
+    child_contract, provenance = stamp_depth_provenance(
+        child_contract,
+        attempted_depth=new_depth,
+        max_depth=max_depth,
+        achieved_depth=None,
+    )
+    reason_code = "subtask_depth_limit"
+    detail = f"Subtask depth limit ({max_depth}) exceeded by attempted depth {new_depth}."
+    try:
+        from ouroboros.task_results import STATUS_FAILED, write_task_result
+
+        saved = write_task_result(
+            status_root,
+            task_id,
+            STATUS_FAILED,
+            parent_task_id=parent_id or None,
+            root_task_id=root_id,
+            session_id=session_id,
+            actor_id=f"subagent:{fields.get('role') or 'researcher'}",
+            delegation_role="subagent",
+            role=str(fields.get("role") or "researcher"),
+            description=str(fields.get("objective") or ""),
+            objective=str(fields.get("objective") or ""),
+            expected_output=str(fields.get("expected_output") or ""),
+            constraints=str(fields.get("constraints") or ""),
+            context=str(fields.get("context") or ""),
+            depth=new_depth,
+            task_contract=child_contract,
+            depth_provenance=provenance,
+            configured_subagent=dict(configured_subagent or {}),
+            budget_drive_root=str(status_root),
+            memory_mode=str(fields.get("memory_mode") or ""),
+            reason_code=reason_code,
+            delegation_admission={
+                "status": "rejected",
+                "reason_code": reason_code,
+                "attempted_depth": new_depth,
+                "permitted_depth": provenance.get("permitted_depth"),
+            },
+            result=f"Subagent rejected: {reason_code}: {detail}",
+        )
+        if not saved:
+            raise RuntimeError("task result transition was not persisted")
+    except Exception:
+        return (
+            "⚠️ TOOL_ERROR (schedule_subagent): depth_refusal_evidence_unavailable: "
+            f"{detail} The child was not started, but durable attempt evidence could "
+            "not be written; treat attempted depth as unknown."
+        )
+    return (
+        f"⚠️ TOOL_ERROR (schedule_subagent): {reason_code}: {detail} "
+        f"task_id={task_id}; depth_provenance="
+        + json.dumps(provenance, ensure_ascii=False, sort_keys=True)
+    )
 
 
 def _constraint_payload(row: Any) -> Dict[str, Any]:
@@ -504,11 +731,19 @@ def child_budget_for_schedule(
     may_mutate gates the child (no read-only escalation)."""
     parent_budget = parent_contract.get("delegation_budget") if isinstance(parent_contract, dict) else {}
     parent_budget = parent_budget if isinstance(parent_budget, dict) else {}
+    provenance = depth_provenance_for_schedule(
+        parent_budget, new_depth=new_depth, max_depth=max_depth,
+        use_remaining_envelope=True,
+    )
+    permitted_remaining = max(
+        0, int(provenance.get("permitted_depth") or 0) - int(new_depth),
+    )
     parent_depth_remaining = parent_budget.get("depth_remaining")
+    child_depth_remaining = permitted_remaining
     if isinstance(parent_depth_remaining, int):
-        child_depth_remaining = max(0, parent_depth_remaining - 1)
-    else:
-        child_depth_remaining = max(0, max_depth - new_depth)
+        child_depth_remaining = min(
+            child_depth_remaining, max(0, parent_depth_remaining - 1),
+        )
     child_budget = _narrow_child_delegation_budget(
         parent_budget,
         child_depth_remaining=child_depth_remaining,
@@ -518,9 +753,7 @@ def child_budget_for_schedule(
         intent_note=intent_note,
         parent_is_subagent=current_depth > 0,
     )
-    child_budget["depth_provenance"] = depth_provenance_for_schedule(
-        parent_budget, new_depth=new_depth, max_depth=max_depth,
-    )
+    child_budget["depth_provenance"] = provenance
     return child_budget
 
 

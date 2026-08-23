@@ -635,14 +635,20 @@ def test_child_finalization_publishes_receipts_to_canonical_root(tmp_path):
     append_verification_receipt(child_drive, tid, {
         "status": "pass", "check": "pytest tests/green.py", "criterion_id": "claim_green",
     })
-    assert read_verification_receipts(tmp_path, tid) == []
+    append_verification_receipt(tmp_path, tid, {
+        "status": "declared", "contract_kind": "delegation_zero_run",
+        "zero_run": True, "zero_run_decision": "complete",
+    })
 
     # Finalization copy-back publishes the receipts file to the canonical root
     # (no parent-side read has happened yet — the publish alone must carry them).
     copied = copy_child_task_result(tmp_path, {"id": tid, "drive_root": str(child_drive)})
     assert copied is not None
     canonical = read_verification_receipts(tmp_path, tid)
-    assert [r["criterion_id"] for r in canonical] == ["claim_red", "claim_green"]
+    assert [r.get("criterion_id") for r in canonical] == [
+        "claim_red", "claim_green", None,
+    ]
+    assert canonical[-1]["contract_kind"] == "delegation_zero_run"
 
     # Durability: the receipts survive child-drive pruning (retention GC / the
     # cancel path delete the drive; the canonical copy is the durable record).
@@ -650,15 +656,15 @@ def test_child_finalization_publishes_receipts_to_canonical_root(tmp_path):
 
     _shutil.rmtree(child_drive)
     rows = _receipt_rows_of(_get_task_result(SimpleNamespace(drive_root=tmp_path), tid))
-    assert rows is not None and len(rows) == 2
+    assert rows is not None and len(rows) == 3
     assert rows[0]["criterion_id"] == "claim_red"
     assert rows[0]["outstanding"] == "unreconciled_failed"
 
 
 def test_child_receipt_republish_is_idempotent_refresh(tmp_path):
     """S3 seam (a) re-entry: copy_child_task_result runs more than once per child
-    (task_done + reaper/cancel re-checks). The publish is a whole-file refresh of
-    the append-only child store — newer child receipts land, nothing duplicates."""
+    (task_done + reaper/cancel re-checks). The publish refreshes the union of the
+    append-only child and canonical stores — newer rows land, nothing duplicates."""
     from ouroboros.headless import copy_child_task_result, prepare_task_drive
     from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
@@ -683,15 +689,14 @@ def test_child_receipt_republish_is_idempotent_refresh(tmp_path):
     ]
 
 
-def test_get_task_result_falls_back_to_child_drive_receipts(tmp_path):
-    """S3 seam (b): before ANY canonical copy exists (child still running, or
-    self-finalized but the supervisor copy-back / effective-read sync has not
-    landed), _get_task_result falls back to the child drive recorded on the
-    result, so the W2 rows are never silently absent in the window the parent
-    most often absorbs the child in."""
+def test_get_task_result_merges_child_and_canonical_receipts(tmp_path):
+    """S3 seam (b): before copy-back, a canonical actor lifecycle receipt and
+    child-local ordinary checks are one effective evidence view rather than
+    competing fallback stores."""
+    from ouroboros.agent_startup_checks import task_result_authority_projection
     from ouroboros.headless import prepare_task_drive
-    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
-    from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
+    from ouroboros.outcomes import append_verification_receipt
+    from ouroboros.task_results import STATUS_SCHEDULED, load_task_result, write_task_result
     from ouroboros.tools.control import _get_task_result
 
     tid = "childlive"
@@ -705,12 +710,23 @@ def test_get_task_result_falls_back_to_child_drive_receipts(tmp_path):
     append_verification_receipt(child_drive, tid, {
         "status": "fail", "check": "pytest tests/red.py", "criterion_id": "claim_red",
     })
-    assert read_verification_receipts(tmp_path, tid) == []
+    append_verification_receipt(tmp_path, tid, {
+        "status": "declared", "contract_kind": "delegation_zero_run",
+        "zero_run": True, "zero_run_decision": "unknown",
+    })
 
     rows = _receipt_rows_of(_get_task_result(SimpleNamespace(drive_root=tmp_path), tid))
-    assert rows is not None and len(rows) == 1
+    assert rows is not None and len(rows) == 2
     assert rows[0]["criterion_id"] == "claim_red"
     assert rows[0]["outstanding"] == "unreconciled_failed"
+    assert rows[1]["status"] == "declared"
+
+    authority = task_result_authority_projection(
+        load_task_result(tmp_path, tid), drive_root=tmp_path,
+    )
+    assert [row.get("criterion_id") for row in authority["verification_receipts"]] == [
+        "claim_red", None,
+    ]
 
 
 def test_get_task_result_uses_child_terminal_over_stale_parent(tmp_path):
@@ -2131,6 +2147,19 @@ def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monk
     out = control._schedule_task(
         ctx, subagent_id="api-scout", objective="Delegate", expected_output="Something")
     assert "depth limit (0) exceeded" in out
+    assert "subtask_depth_limit" in out
+    refused_id = out.split("task_id=", 1)[1].split(";", 1)[0]
+    refused = json.loads(
+        (tmp_path / "task_results" / f"{refused_id}.json").read_text(encoding="utf-8")
+    )
+    assert refused["status"] == STATUS_FAILED
+    assert refused["delegation_admission"]["reason_code"] == "subtask_depth_limit"
+    assert refused["depth_provenance"] == {
+        "requested_depth": None,
+        "permitted_depth": 0,
+        "attempted_depth": 1,
+        "achieved_depth": None,
+    }
 
     monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     enqueued = []
@@ -2749,6 +2778,92 @@ def test_assign_tasks_honors_depth_reservation_for_first_grandchild(tmp_path, mo
 
     assert delivered and delivered[0]["id"] == "grandchild1"
     assert "grandchild1" in workers_module.RUNNING
+
+
+def test_assignment_depth_fact_reaches_worker_and_survives_child_copyback(tmp_path, monkeypatch):
+    from supervisor import queue as queue_module
+    from supervisor import workers as workers_module
+    from supervisor import state as state_module
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.headless import copy_child_task_result
+    from ouroboros.task_results import (
+        STATUS_COMPLETED,
+        load_task_result,
+        write_task_result,
+    )
+
+    delivered = []
+
+    class FakeWorkerQueue:
+        def put(self, task):
+            delivered.append(task)
+
+    child_drive = tmp_path / "state" / "headless_tasks" / "child-depth" / "data"
+    child_drive.mkdir(parents=True)
+    queued_contract = build_task_contract({
+        "delegation_budget": {
+            "depth_remaining": 2,
+            "depth_provenance": {
+                "requested_depth": 3,
+                "permitted_depth": 3,
+                "attempted_depth": 1,
+                "achieved_depth": None,
+            },
+        },
+    })
+    pending = [{
+        "id": "child-depth",
+        "type": "task",
+        "chat_id": 1,
+        "description": "Assigned depth child",
+        "depth": 1,
+        "root_task_id": "root-depth",
+        "parent_task_id": "root-depth",
+        "delegation_role": "subagent",
+        "drive_root": str(child_drive),
+        "child_drive_root": str(child_drive),
+        "budget_drive_root": str(tmp_path),
+        "task_contract": queued_contract,
+        "metadata": {"task_contract": queued_contract},
+    }]
+    monkeypatch.setattr(workers_module, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers_module, "PENDING", pending)
+    monkeypatch.setattr(workers_module, "RUNNING", {})
+    monkeypatch.setattr(
+        workers_module,
+        "WORKERS",
+        {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())},
+    )
+    monkeypatch.setattr(workers_module, "load_state", lambda: {})
+    monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+
+    workers_module.assign_tasks()
+
+    assert delivered and delivered[0]["depth_provenance"]["achieved_depth"] == 1
+    worker_contract = delivered[0]["task_contract"]
+    assert worker_contract["delegation_budget"]["depth_provenance"]["achieved_depth"] == 1
+    assert delivered[0]["metadata"]["task_contract"] == worker_contract
+
+    # Reproduce the real terminal replica: the worker writes the contract it
+    # received to its child drive, then the supervisor copies that result back.
+    write_task_result(
+        child_drive,
+        "child-depth",
+        STATUS_COMPLETED,
+        parent_task_id="root-depth",
+        root_task_id="root-depth",
+        delegation_role="subagent",
+        task_contract=worker_contract,
+        depth_provenance=delivered[0]["depth_provenance"],
+        result="done",
+    )
+    copied = copy_child_task_result(tmp_path, delivered[0])
+    assert copied is not None
+    canonical = load_task_result(tmp_path, "child-depth")
+    nested = canonical["task_contract"]["delegation_budget"]["depth_provenance"]
+    assert nested == canonical["depth_provenance"]
+    assert nested["achieved_depth"] == 1
 
 
 def test_override_delegation_constraint_requires_parent_lineage(tmp_path, monkeypatch):

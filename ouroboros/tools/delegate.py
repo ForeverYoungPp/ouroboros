@@ -27,7 +27,6 @@ a dict this process happens to still hold.
 from __future__ import annotations
 
 import datetime as _dt
-from hashlib import sha256
 import json
 import logging
 import time
@@ -49,6 +48,11 @@ from ouroboros.delegate_source_coverage import (
     record_started_custody,
 )
 from ouroboros.delegate_supervision import delegate_wait_entry as _delegate_wait_entry
+from ouroboros.delegate_start_instructions import (
+    HOST_INSTRUCTIONS as _HOST_INSTRUCTIONS,
+    UNPROVEN_BOUNDARY_INSTRUCTION as _UNPROVEN_BOUNDARY_INSTRUCTION,
+    append_coordination_context,
+)
 from ouroboros.subagent_runtime import (  # noqa: F401 - shared primitive re-export
     delegate_start_entry as _delegate_start_entry,
     exact_start,
@@ -144,40 +148,6 @@ _CLAUDEXOR_MAX_SECONDS = 604_800
 # above); re-bound here because sibling code and tests name it on this surface.
 _CUSTODY = custody._CUSTODY
 
-# Layered onto every lane by Claudexor (native system-prompt channel per harness). The
-# SAME prohibitions an ordinary subagent carries; a statement, not the enforcement —
-# that is the access profile plus the nanny's own workspace-patch capture.
-_HOST_INSTRUCTIONS = (
-    "You are a delegated worker running inside another agent's working tree. Your "
-    "authority is everything INSIDE this root and nothing outside it. Do not run git "
-    "commit, tag, push, rebase, reset or any other history-moving command: your host "
-    "takes the diff of this tree and integrates it itself, and a moved HEAD invalidates "
-    "that diff and destroys your work. Do not review or accept your own change, do not "
-    "touch the host's runtime controls, skills, or memory, and do not write outside "
-    "this root. If your environment offers a way to ask your host a clarifying "
-    "question, you may use it: your host may answer from its task context; a question "
-    "that carries an engine expiry times out benignly if unanswered — continue with "
-    "stated assumptions rather than blocking — while one without an expiry waits until "
-    "answered. If your harness cannot ask mid-run, do NOT end the run to ask — "
-    "state your assumption and continue."
-)
-
-# DESTINATION 2 of the disclosure ("Disclose instead of forbid": durable record, the
-# CHILD'S PROMPT, the parent's result). The OS boundary is a REQUEST — the engine applies
-# one only where it has a mechanism, and nothing at start knows which — so the child is
-# told the only true thing: behave as though nothing is stopping you, and do not claim an
-# isolation you cannot show. What was applied reaches the parent from the run's own
-# artifacts through `_containment_evidence`.
-_UNPROVEN_BOUNDARY_INSTRUCTION = (
-    " An OS-enforced filesystem boundary was REQUESTED for this run but is NOT guaranteed: "
-    "your engine applies one only where it has a mechanism for this host, and your host "
-    "reads back from your own attempt records what was actually applied. Work as if there "
-    "is no boundary — stay inside this root, do not read the operator's home directory, "
-    "credential stores, or the harness runtime tree, and do NOT describe yourself in your "
-    "answer as sandboxed or confined. If your own environment shows you whether a boundary "
-    "was in force, say so plainly."
-)
-
 
 def _host_instructions(authority: "DelegatedRunShape", assignment: str = "",
                        payload_skill: str = "") -> str:
@@ -204,40 +174,12 @@ def _build_start_instructions(
     payload_skill: str = "",
     coordination_context: str = "",
 ) -> tuple[str, str]:
-    """Build the bounded instruction field for a fresh physical start.
-
-    The canonical work order is a separate, immutable prompt field.  The
-    actor-first appendix is additive and hash-disclosed, but it is still sent to
-    the same Claudexor request and must not be allowed to grow without bound.
-    Reuse the existing per-field serializer budget and refuse before provisioning
-    or POSTing when the complete appendix would exceed it.  Truncation would make
-    the coordination hash describe bytes the vendor never received.
-    """
+    """Build the bounded instruction field for a fresh physical start."""
     text = _host_instructions(authority, assignment, payload_skill)
-    context = str(coordination_context or "").strip()
-    if not context:
-        return text, ""
-    coordination_sha = sha256(context.encode("utf-8")).hexdigest()
-    appendix = (
-        "\n\nHOST COORDINATION CONTEXT (advisory appendix; canonical work-order "
-        f"authority remains unchanged; sha256={coordination_sha}):\n"
-        + context
+    return append_coordination_context(
+        text, coordination_context,
+        instruction_budget_chars=_ASSIGNMENT_FIELD_CHARS,
     )
-    required_chars = len(text) + len(appendix)
-    if required_chars > _ASSIGNMENT_FIELD_CHARS:
-        return "", _fail(
-            "delegate_start", "coordination_context_over_budget",
-            "The complete coordination appendix does not fit the existing host "
-            "instruction-field budget; it was not truncated and the physical leaf "
-            "was not started. Retry with a shorter coordination context or preserve "
-            "the details in a host artifact/tree note.",
-            coordination_context_chars=len(context),
-            required_instruction_chars=required_chars,
-            instruction_budget_chars=_ASSIGNMENT_FIELD_CHARS,
-            coordination_context_sha256=coordination_sha,
-            host_fallback=False,
-        )
-    return text + appendix, ""
 
 
 def _derive_authority(ctx: ToolContext) -> "DelegatedRunShape":
@@ -1515,18 +1457,21 @@ def get_tools() -> List[ToolEntry]:
                 "delegate_cancel. The run's output is a CLAIM you must check — you are the "
                 "host, so verification receipts are still yours to write. If no route is "
                 "configured or it is unavailable you get a typed refusal: choose an "
-                "explicit configured alternative, wait, narrow, or report blocked. Fresh "
-                "starts require subagent_id; recovery retries use retry_of without a new "
-                "subagent selector."
+                "explicit configured alternative, wait, narrow, or report blocked. A direct "
+                "fresh start requires subagent_id. In an actor-first configured session the "
+                "host already froze the route and canonical work order: call delegate_start(prompt='') or "
+                "put only optional advisory coordination context in prompt; do not copy the canonical brief. Recovery retries use retry_of without a new selector."
             ),
             "parameters": {
                 "type": "object",
                 "required": ["prompt"],
                 "properties": {
-                "prompt": {"type": "string", "description": "The complete task for the delegated session."},
+                "prompt": {"type": "string", "description":
+                    "Complete task for a direct start; for an actor-first snapshotted session, "
+                    "only optional advisory coordination context (the host supplies the canonical work order)."},
                 "subagent_id": {"type": "string", "description":
-                    "Required for a fresh start: exact agent_session actor id from Available "
-                    "subagents. Omit when replaying retry_of. API actor ids are refused here "
+                    "Required for a direct fresh start: exact agent_session actor id from Available "
+                    "subagents. Omit for the current actor-first snapshotted route and for retry_of. API actor ids are refused here "
                     "and must be scheduled as recursive children."},
                 "root": {"type": "string", "enum": ["skill_payload"], "description":
                     "Optional exact-resource selector: 'skill_payload' delegates ONE "
@@ -1562,8 +1507,9 @@ def get_tools() -> List[ToolEntry]:
                 "Sleep on a delegated run until a meaningful event. Quiet transport windows "
                 "are renewed by the host with zero model calls; journal progress still streams "
                 "to the human but does not wake you. Terminal settlement, a new interaction, "
-                "fault, addressed owner/task message, cancel/deadline control, or an explicit "
-                "one-shot checkpoint wakes exactly once. A run that asks its "
+                "fault, addressed owner/task message, a direct-child attention/terminal event, "
+                "cancel/deadline control, recovery judgment, or an explicit one-shot checkpoint "
+                "wakes exactly once. A run that asks its "
                 "user a question returns IMMEDIATELY as status='waiting_on_user' with "
                 "the full question set (interaction/question ids ride WHOLE, never "
                 "truncated): answer it with delegate_answer, or escalate to your "

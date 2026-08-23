@@ -5,7 +5,12 @@ from types import SimpleNamespace
 
 from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.task_results import STATUS_RUNNING, write_task_result
-from ouroboros.tools.control_delegation import check_delegation_admission, child_budget_for_schedule
+from ouroboros.tools.control_delegation import (
+    check_delegation_admission,
+    child_budget_for_schedule,
+    stamp_depth_provenance,
+    stamp_task_assignment_depth,
+)
 
 
 def test_explicit_rights_are_typed_and_legacy_omission_stays_permissive():
@@ -48,6 +53,97 @@ def test_depth_provenance_follows_explicit_request_through_three_levels():
     assert depth_two["depth_remaining"] == 1
     assert depth_two["depth_provenance"]["requested_depth"] == 3
     assert depth_two["depth_provenance"]["attempted_depth"] == 2
+    depth_three = child_budget_for_schedule(
+        {"delegation_budget": depth_two}, current_depth=2, new_depth=3,
+        max_depth=3, may_mutate=False, may_fan_out=True, max_children=0,
+        intent_note="",
+    )
+    assert depth_three["depth_remaining"] == 0
+    assert depth_three["may_delegate"] is False
+    assert depth_three["depth_provenance"] == {
+        "requested_depth": 3, "permitted_depth": 3,
+        "attempted_depth": 3, "achieved_depth": None,
+    }
+
+
+def test_depth_permission_and_remaining_never_widen_after_settings_raise():
+    root = build_task_contract({"delegation_budget": {"depth_remaining": 3}})
+    depth_one = child_budget_for_schedule(
+        root, current_depth=0, new_depth=1, max_depth=2, may_mutate=False,
+        may_fan_out=True, max_children=0, intent_note="",
+    )
+    assert depth_one["depth_remaining"] == 1
+    assert depth_one["depth_provenance"]["permitted_depth"] == 2
+
+    depth_two = child_budget_for_schedule(
+        {"delegation_budget": depth_one}, current_depth=1, new_depth=2,
+        max_depth=7, may_mutate=False, may_fan_out=True, max_children=0,
+        intent_note="",
+    )
+    assert depth_two["depth_remaining"] == 0
+    assert depth_two["may_delegate"] is False
+    assert depth_two["depth_provenance"] == {
+        "requested_depth": 3, "permitted_depth": 2,
+        "attempted_depth": 2, "achieved_depth": None,
+    }
+
+
+def test_assignment_preserves_admitted_depth_authority_and_only_adds_achievement():
+    contract = build_task_contract({
+        "delegation_budget": {
+            "depth_remaining": 1,
+            "depth_provenance": {
+                "requested_depth": 3,
+                "permitted_depth": 2,
+                "attempted_depth": 1,
+                "achieved_depth": None,
+            },
+        },
+    })
+    task = {"depth": 1, "task_contract": contract, "metadata": {}}
+    fields = stamp_task_assignment_depth(task, max_depth=7)
+    assert fields["depth_provenance"] == {
+        "requested_depth": 3, "permitted_depth": 2,
+        "attempted_depth": 1, "achieved_depth": 1,
+    }
+    assert task["metadata"]["depth_provenance"] == fields["depth_provenance"]
+
+
+def test_assignment_does_not_reconstruct_legacy_depth_authority_from_live_settings():
+    contract = build_task_contract({
+        "delegation_budget": {"depth_remaining": 2},
+    })
+    task = {"depth": 1, "task_contract": contract, "metadata": {}}
+
+    fields = stamp_task_assignment_depth(task, max_depth=7)
+
+    assert fields["depth_provenance"] == {
+        "requested_depth": None,
+        "permitted_depth": None,
+        "attempted_depth": 1,
+        "achieved_depth": 1,
+    }
+
+
+def test_supervisor_ingress_bounds_legacy_permission_by_admitted_remaining_envelope():
+    contract = build_task_contract({
+        "delegation_budget": {"depth_remaining": 2},
+    })
+
+    stamped, provenance = stamp_depth_provenance(
+        contract,
+        attempted_depth=1,
+        max_depth=7,
+        achieved_depth=None,
+    )
+
+    assert provenance == {
+        "requested_depth": None,
+        "permitted_depth": 3,
+        "attempted_depth": 1,
+        "achieved_depth": None,
+    }
+    assert stamped["delegation_budget"]["depth_provenance"] == provenance
 
 
 def test_legacy_budget_reports_unknown_request_but_current_permission():
@@ -59,6 +155,19 @@ def test_legacy_budget_reports_unknown_request_but_current_permission():
         "requested_depth": None, "permitted_depth": 3,
         "attempted_depth": 1, "achieved_depth": None,
     }
+
+    # A legacy descendant's `depth_remaining` has already been narrowed by its
+    # ancestors. It is not proof of the root's requested envelope.
+    descendant = child_budget_for_schedule(
+        {"delegation_budget": {"depth_remaining": 2}},
+        current_depth=1, new_depth=2, max_depth=4, may_mutate=False,
+        may_fan_out=True, max_children=0, intent_note="",
+    )
+    assert descendant["depth_provenance"] == {
+        "requested_depth": None, "permitted_depth": 3,
+        "attempted_depth": 2, "achieved_depth": None,
+    }
+    assert descendant["depth_remaining"] == 1
 
 
 def test_legacy_contract_does_not_gain_provenance_during_recovery_normalization():

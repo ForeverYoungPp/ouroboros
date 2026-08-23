@@ -33,12 +33,19 @@ log = logging.getLogger(__name__)
 # Coordination artifacts + typed child->parent beacons, in one append-only ledger.
 COORDINATION_KINDS = ("contract", "decision", "fact", "note")
 DELEGATION_CONSTRAINT_KIND = "delegation_constraint"
-BEACON_KINDS = ("milestone", "partial_finding", "blocker", "question", "interface_contract", DELEGATION_CONSTRAINT_KIND)
+REVIEW_REQUESTED_KIND = "review_requested"
+BEACON_KINDS = (
+    "milestone", "partial_finding", "blocker", "question", "interface_contract",
+    REVIEW_REQUESTED_KIND, DELEGATION_CONSTRAINT_KIND,
+)
 LEDGER_KINDS = COORDINATION_KINDS + BEACON_KINDS
 # Beacons that ask the parent to look NOW (surface an early return from a sliced wait): a child is
 # stuck (blocker), needs an answer (question), or needs the shared seam/contract changed
 # (interface_contract) — each requires the parent to reconcile before the child can safely proceed.
-ATTENTION_KINDS = ("blocker", "question", "interface_contract", DELEGATION_CONSTRAINT_KIND)
+ATTENTION_KINDS = (
+    "blocker", "question", "interface_contract", REVIEW_REQUESTED_KIND,
+    DELEGATION_CONSTRAINT_KIND,
+)
 DELEGATION_CONSTRAINT_DIRECTIVES = ("halt_fanout", "cap_children", "require_lane", "block_surface")
 CHILD_RESULT_DISPOSITION_TYPE = "child_result_disposition"
 CHILD_RESULT_DISPOSITIONS = frozenset({"integrated", "irrelevant", "deferred"})
@@ -52,6 +59,38 @@ _CHILD_RESULT_DISPOSITION_FIELDS = frozenset({
 _MAX_TEXT_CHARS = 4000
 # Bound runaway growth — this is a coordination ledger, not a bulk-data store.
 _MAX_LEDGER_BYTES = 2 * 1024 * 1024
+_MAX_EVIDENCE_REF_CHARS = 1000
+
+
+def normalize_review_request_payload(payload: Any) -> Dict[str, str] | None:
+    """Validate the advisory, exact-evidence review-request capsule.
+
+    The row is only a non-blocking request to the parent.  It never launches a
+    reviewer or grants acceptance authority, so the generic reference remains
+    caller-authored; a parent/critic must still inspect the referenced bytes.
+    Keeping the two-key shape closed gives a later parent-selected review one
+    stable evidence hash for its existing accounting/deduplication path without
+    introducing a review job or a second accounting ledger here.  Distinct hints
+    are intentionally retained: identical bytes can need different reviews, and
+    every emitter's direct parent must receive its own notification.
+    """
+
+    if not isinstance(payload, dict) or set(payload) != {
+        "evidence_ref", "evidence_sha256",
+    }:
+        return None
+    evidence_ref = str(payload.get("evidence_ref") or "").strip()
+    evidence_sha256 = str(payload.get("evidence_sha256") or "").strip().lower()
+    if not evidence_ref or len(evidence_ref) > _MAX_EVIDENCE_REF_CHARS:
+        return None
+    if len(evidence_sha256) != 64 or any(
+        char not in "0123456789abcdef" for char in evidence_sha256
+    ):
+        return None
+    return {
+        "evidence_ref": evidence_ref,
+        "evidence_sha256": evidence_sha256,
+    }
 
 
 def tree_ledger_path(
@@ -158,7 +197,16 @@ def tree_ledger_append(
             "and move bulk detail to an artifact."
         )
     payload_out: Dict[str, Any] = {}
-    if kind_norm == DELEGATION_CONSTRAINT_KIND:
+    if kind_norm == REVIEW_REQUESTED_KIND:
+        normalized_review = normalize_review_request_payload(payload)
+        if normalized_review is None:
+            return (
+                "⚠️ TOOL_ARG_ERROR (tree_note): review_requested payload must contain "
+                "exactly evidence_ref (1..1000 chars) and evidence_sha256 (64-char "
+                "lower/upper-case hex). The request is advisory and does not start review."
+            )
+        payload_out = normalized_review
+    elif kind_norm == DELEGATION_CONSTRAINT_KIND:
         if not isinstance(payload, dict):
             return "⚠️ TOOL_ARG_ERROR (tree_note): delegation_constraint requires a structured payload object."
         directive = str(payload.get("directive") or "").strip().lower()
@@ -445,6 +493,11 @@ def _format_tree_ledger_row(row: Dict[str, Any]) -> str:
             f" {{child={payload.get('child_task_id')}, disposition={payload.get('disposition')}, "
             f"sha256={str(payload.get('child_result_sha256') or '')[:12]}}}"
         )
+    elif str(row.get("kind") or "") == REVIEW_REQUESTED_KIND and payload:
+        payload_note = (
+            f" {{evidence={payload.get('evidence_ref')}, "
+            f"sha256={str(payload.get('evidence_sha256') or '')}}}"
+        )
     return (
         f"- [{str(row.get('ts') or '')[:16]}] {str(row.get('kind') or 'note')}{flag} "
         f"({who}){payload_note}: {str(row.get('text') or '')}"
@@ -564,8 +617,8 @@ def tree_ledger_attention_after(
     """Return new attention beacons, optionally filtered to direct children.
 
     The ledger is whole-tree scoped, but a sleeping nanny may react only to its
-    own direct children. Existing wait tools omit the optional filters and keep
-    their historical whole-tree projection.
+    own direct children. Task waits pass their exact waited ids; callers that
+    deliberately omit the optional filters keep the whole-tree projection.
     """
     out: List[Dict[str, Any]] = []
     allowed = {str(item) for item in task_ids} if task_ids is not None else None
@@ -627,9 +680,11 @@ __all__ = [
     "ATTENTION_KINDS",
     "DELEGATION_CONSTRAINT_DIRECTIVES",
     "DELEGATION_CONSTRAINT_KIND",
+    "REVIEW_REQUESTED_KIND",
     "CHILD_RESULT_DISPOSITION_TYPE",
     "CHILD_RESULT_DISPOSITIONS",
     "normalize_child_result_disposition_payload",
+    "normalize_review_request_payload",
     "child_result_disposition_row",
     "record_subscription_window_exhausted",
     "tree_ledger_path",

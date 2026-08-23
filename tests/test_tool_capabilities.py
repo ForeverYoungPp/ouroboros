@@ -558,6 +558,7 @@ def test_schedule_subagent_in_initial_schemas():
     registry = ToolRegistry(repo_dir=tmp, drive_root=tmp)
     names = {s["function"]["name"] for s in initial_tool_schemas(registry)}
     assert "schedule_subagent" in names
+    assert {"peek_task", "cancel_task", "discard_child_result"} <= names
     schedule_schema = next(s for s in initial_tool_schemas(registry) if s["function"]["name"] == "schedule_subagent")
     props = schedule_schema["function"]["parameters"]["properties"]
     assert "required_capabilities" in props
@@ -672,6 +673,47 @@ def test_local_readonly_subagent_initial_schemas_are_allowlisted(tmp_path):
     assert schemas["browse_page"]["parameters"]["properties"]["engine"]["enum"] == ["chromium", "webkit"]
     assert "device" in schemas["browse_page"]["parameters"]["properties"]
     assert list_non_core_tools(registry) == []
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        pytest.param(
+            "readonly", id="local-readonly",
+        ),
+        pytest.param(
+            "acting", id="acting",
+        ),
+    ],
+)
+def test_child_profiles_expose_existing_descendant_controls(tmp_path, constraint):
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.tool_policy import initial_tool_schemas
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task_constraint = (
+        TaskConstraint(mode="local_readonly_subagent", allow_enable=False)
+        if constraint == "readonly"
+        else TaskConstraint(
+            mode="acting_subagent",
+            surface="external_workspace",
+            write_root=str(workspace),
+            allow_enable=False,
+        )
+    )
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path / "data")
+    registry.set_context(ToolContext(
+        repo_dir=tmp_path,
+        drive_root=tmp_path / "data",
+        workspace_root=workspace if constraint == "acting" else None,
+        workspace_mode="external" if constraint == "acting" else "",
+        task_constraint=task_constraint,
+    ))
+
+    names = {item["function"]["name"] for item in initial_tool_schemas(registry)}
+    assert {"peek_task", "cancel_task", "discard_child_result"} <= names
 
 
 def test_local_readonly_verify_is_typed_zero_run_only(tmp_path):

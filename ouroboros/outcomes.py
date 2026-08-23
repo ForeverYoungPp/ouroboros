@@ -61,6 +61,14 @@ from ouroboros.headless import (
     ARTIFACT_STATUS_PENDING,
     ARTIFACT_STATUS_READY,
 )
+from ouroboros.outcome_receipt_store import (  # noqa: F401 - public compatibility re-exports
+    append_verification_receipt,
+    merge_verification_receipts,
+    read_context_verification_receipts,
+    read_verification_receipts,
+    read_verification_receipts_from_roots,
+    verification_receipts_path,
+)
 from ouroboros.task_results import STATUS_CANCEL_REQUESTED, STATUS_REJECTED_DUPLICATE, validate_task_id
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
@@ -211,6 +219,38 @@ WARN_EXPECTED_OUTPUT_UNGROUNDED = "expected_output_ungrounded"
 # the trace, not a receipt), so it needs no receipt status here.
 _RECEIPT_GROUNDING_STATUSES = frozenset({"pass", "observed", "declared"})
 
+
+def _verification_receipt_is_grounding(receipt: Dict[str, Any]) -> bool:
+    """Whether one receipt grounds the task's declared deliverable.
+
+    ``delegation_zero_run`` is a typed lifecycle decision: it proves that the
+    configured actor deliberately closed the no-leaf branch, not that the
+    requested artifact or answer is correct.  It stays visible in the normal
+    receipt/acceptance packet, but must not suppress ``receipt_absent`` or turn a
+    lifecycle declaration into host-attested deliverable evidence.
+    """
+    return (
+        str(receipt.get("status") or "") in _RECEIPT_GROUNDING_STATUSES
+        and str(receipt.get("contract_kind") or "") != "delegation_zero_run"
+    )
+
+
+def _terminal_zero_run_receipt_present(receipts: List[Dict[str, Any]]) -> bool:
+    """True when the actor already made its terminal no-leaf decision.
+
+    Such a receipt is intentionally not grounding, but the local-readonly actor
+    also no longer exposes the general verification tool after this terminal
+    choice.  Do not inject an impossible ``call verify_and_record`` reminder;
+    the final outcome/acceptance projection still discloses missing deliverable
+    grounding independently.
+    """
+    return any(
+        str(receipt.get("contract_kind") or "") == "delegation_zero_run"
+        and bool(receipt.get("zero_run"))
+        for receipt in receipts
+        if isinstance(receipt, dict)
+    )
+
 # Historical name of the RED-reconciling statuses; the SSOT now lives next to the
 # reconciliation core it parameterizes (see `_outcome_receipts.RED_RECONCILING_STATUSES`).
 _RECEIPT_RED_RECONCILING_STATUSES = _outcome_receipts.RED_RECONCILING_STATUSES
@@ -251,43 +291,6 @@ def _merge_objective_warning(objective: Dict[str, Any], code: str) -> None:
         objective["warning"] = code
 
 
-def verification_receipts_path(drive_root: Any, task_id: str, *, create: bool = False) -> pathlib.Path:
-    """Durable per-task receipt store, a sibling of the verification-ledger artifact
-    under the canonical task-artifacts dir (``validate_task_id``-guarded)."""
-    safe = validate_task_id(task_id)
-    artifact_dir = pathlib.Path(drive_root) / "task_results" / "artifacts" / safe
-    if create:
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-    return artifact_dir / "verification_receipts.jsonl"
-
-
-def append_verification_receipt(drive_root: Any, task_id: str, receipt: Dict[str, Any]) -> bool:
-    """Append a host-attested verification receipt and report custody of the write.
-
-    Ordinary verification remains advisory, so existing callers may ignore the
-    boolean.  Actor-first zero-run is different: its receipt is the only durable
-    fact that no physical leaf was started, therefore that caller must fail closed
-    when the append cannot be written rather than claiming a recorded decision.
-    """
-    try:
-        from ouroboros.utils import append_jsonl
-
-        return bool(append_jsonl(verification_receipts_path(drive_root, task_id, create=True), receipt))
-    except Exception:  # advisory but never silent: the task would render unverified
-        log.warning("Failed to append verification receipt for task %s", task_id, exc_info=True)
-        return False
-
-
-def read_verification_receipts(drive_root: Any, task_id: str) -> List[Dict[str, Any]]:
-    try:
-        path = verification_receipts_path(drive_root, task_id, create=False)
-        if not path.exists():
-            return []
-        return _outcome_receipts.read_receipts(path)
-    except Exception:
-        return []
-
-
 def _trace_has_write_edit_grounding(llm_trace: Dict[str, Any]) -> bool:
     """Host-derived trivial grounding (FR3): a successful non-scratch write_file/
     edit_text IS its own file-exists receipt (the deliverable provably exists), so it
@@ -306,23 +309,34 @@ def _trace_has_write_edit_grounding(llm_trace: Dict[str, Any]) -> bool:
     return False
 
 
-def verification_grounding_present(llm_trace: Dict[str, Any], drive_root: Any, task_id: str) -> bool:
+def verification_grounding_present(
+    llm_trace: Dict[str, Any], drive_root: Any, task_id: str,
+    *, receipts: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
     """True when the turn already carries host-attested grounding — a verify_and_record
     receipt with a grounding status, or a trivial write/edit deliverable. Read-only
     (shared by the one-shot nudge gate and the receipt_absent flag)."""
-    receipts = read_verification_receipts(drive_root, task_id)
-    if any(str(r.get("status") or "") in _RECEIPT_GROUNDING_STATUSES for r in receipts):
+    receipt_rows = (
+        receipts if isinstance(receipts, list)
+        else read_verification_receipts(drive_root, task_id)
+    )
+    if any(_verification_receipt_is_grounding(receipt) for receipt in receipt_rows):
         return True
     return _trace_has_write_edit_grounding(llm_trace)
 
 
-def should_nudge_verification(llm_trace: Dict[str, Any], drive_root: Any, task_id: str) -> bool:
+def should_nudge_verification(
+    llm_trace: Dict[str, Any], drive_root: Any, task_id: str,
+    *, receipts: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
     """FR3 one-shot nudge gate: the turn produced real reviewable effects but recorded
     NO host-attested grounding yet — ping the agent ONCE to verify_and_record before it
     finalizes. Binary; the caller latches it so it fires at most once per task."""
     if not turn_has_reviewable_effects(llm_trace):
         return False
-    return not verification_grounding_present(llm_trace, drive_root, task_id)
+    return not verification_grounding_present(
+        llm_trace, drive_root, task_id, receipts=receipts,
+    )
 
 
 def latest_unreconciled_failed_receipt(receipts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -342,12 +356,16 @@ def latest_unreconciled_failed_receipt(receipts: List[Dict[str, Any]]) -> Option
     return _outcome_receipts.latest_unreconciled_failed(receipts, _RECEIPT_RED_RECONCILING_STATUSES)
 
 
-def latest_unreconciled_failed_verification(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
+def latest_unreconciled_failed_verification(
+    drive_root: Any, task_id: str,
+    *, receipts: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
     """Disk-backed wrapper of ``latest_unreconciled_failed_receipt`` — reads the task's
     durable receipts. Feeds the one-shot red-verification finalization nudge: finalizing over
     your own host-attested red is a self-contradiction (Bible P3/P12), distinct from the
     receipt_absent case."""
-    return latest_unreconciled_failed_receipt(read_verification_receipts(drive_root, task_id))
+    rows = receipts if isinstance(receipts, list) else read_verification_receipts(drive_root, task_id)
+    return latest_unreconciled_failed_receipt(rows)
 
 
 def latest_unreconciled_masked_pass(receipts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -365,24 +383,32 @@ def latest_unreconciled_masked_pass(receipts: List[Dict[str, Any]]) -> Optional[
     return _outcome_receipts.latest_unreconciled_masked(receipts, _RECEIPT_RED_RECONCILING_STATUSES)
 
 
-def latest_unreconciled_masked_verification(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
+def latest_unreconciled_masked_verification(
+    drive_root: Any, task_id: str,
+    *, receipts: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
     """Disk-backed wrapper of ``latest_unreconciled_masked_pass`` — feeds the one-shot ADVISORY
     masked-check finalization nudge (the agent may still finalize). Distinct from the red nudge:
     that fires on a RED check; this fires on a green check whose exit code may be laundered."""
-    return latest_unreconciled_masked_pass(read_verification_receipts(drive_root, task_id))
+    rows = receipts if isinstance(receipts, list) else read_verification_receipts(drive_root, task_id)
+    return latest_unreconciled_masked_pass(rows)
 
 
-def latest_agent_defined_verification(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
+def latest_agent_defined_verification(
+    drive_root: Any, task_id: str,
+    *, receipts: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
     """Newest verify receipt whose criterion was AGENT-DEFINED without a stated basis
     (v6.54.4) — feeds the one-shot advisory criterion-provenance nudge: the check
     passed, but the success criterion was synthesized by the agent, so the agent is
     asked once to confirm it is equivalent to what the task actually requires."""
-    receipts = read_verification_receipts(drive_root, task_id)
-    return _outcome_receipts.latest_agent_defined(receipts)
+    rows = receipts if isinstance(receipts, list) else read_verification_receipts(drive_root, task_id)
+    return _outcome_receipts.latest_agent_defined(rows)
 
 
 def apply_receipt_absent_flag(
-    loop_outcome: Dict[str, Any], llm_trace: Dict[str, Any], drive_root: Any, task_id: str, *, expected_output: str = ""
+    loop_outcome: Dict[str, Any], llm_trace: Dict[str, Any], drive_root: Any, task_id: str,
+    *, expected_output: str = "", receipts: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """FR3 flag (+ M2) — run by the host AFTER ``derive_loop_outcome`` and BEFORE the
     verification ledger. Inject durable verify_and_record receipts into the trace so
@@ -394,9 +420,12 @@ def apply_receipt_absent_flag(
     work and produced no structured FINAL ANSWER). Both are BINARY warnings that keep
     the result solved (never a downgrade — anti-oscillation). Applied before
     ``outcome_axes`` is normalized so the persisted axes and the ledger agree."""
-    receipts = read_verification_receipts(drive_root, task_id)
-    if receipts:
-        llm_trace["verification_receipts"] = receipts
+    receipt_rows = (
+        receipts if isinstance(receipts, list)
+        else read_verification_receipts(drive_root, task_id)
+    )
+    if receipt_rows:
+        llm_trace["verification_receipts"] = receipt_rows
     axes = loop_outcome.get("outcome_axes") if isinstance(loop_outcome.get("outcome_axes"), dict) else {}
     objective = axes.get("objective") if isinstance(axes.get("objective"), dict) else None
     execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
@@ -413,7 +442,9 @@ def apply_receipt_absent_flag(
         ):
             _merge_objective_warning(objective, WARN_EXPECTED_OUTPUT_UNGROUNDED)
         return
-    if verification_grounding_present(llm_trace, drive_root, task_id):
+    if verification_grounding_present(
+        llm_trace, drive_root, task_id, receipts=receipt_rows,
+    ):
         return
     _merge_objective_warning(objective, WARN_RECEIPT_ABSENT)
 
@@ -853,17 +884,49 @@ _INFRA_TEXT_PREFIXES = (
 )
 
 
+def _apply_actor_first_terminal_projection(
+    outcome: Dict[str, Any], usage: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Overlay the configured actor's unresolved terminal fact on normal outcome truth."""
+
+    actor = usage.get("actor_first_terminal")
+    if not isinstance(actor, dict) or not actor:
+        return outcome
+    actor = dict(actor)
+    axes = outcome.get("outcome_axes") if isinstance(outcome.get("outcome_axes"), dict) else {}
+    execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
+    if str(execution.get("status") or "") == EXECUTION_OK:
+        actor_status = str(actor.get("status") or "unknown")
+        if actor_status not in {"incomplete", "unknown"}:
+            actor_status = "unknown"
+        reason = f"configured_actor_{actor_status}"
+        failure = {
+            "kind": "configured_actor", "status": actor_status,
+            "reason_code": reason, **actor,
+        }
+        execution.update({
+            "status": EXECUTION_DEGRADED, "reason_code": reason,
+            "failure": failure,
+        })
+        outcome.update({"finish_reason": reason, "reason_code": reason, "failure": failure})
+    execution["actor_first_terminal"] = actor
+    objective = axes.get("objective") if isinstance(axes.get("objective"), dict) else {}
+    if objective.get("status") != OBJECTIVE_FAIL:
+        objective.update({
+            "status": OBJECTIVE_DEGRADED,
+            "source": "configured_actor_terminal",
+            "actor_status": str(actor.get("status") or "unknown"),
+        })
+    outcome["actor_first_terminal"] = actor
+    return outcome
+
+
 def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     """Return a typed LoopOutcome-compatible dict."""
 
     usage_status = str(usage.get("execution_status") or usage.get("result_status") or "").strip()
     usage_reason = str(usage.get("reason_code") or "").strip()
     resource_limit = dict(usage.get("resource_limit") or {}) if isinstance(usage.get("resource_limit"), dict) else {}
-    actor_first_terminal = (
-        dict(usage.get("actor_first_terminal"))
-        if isinstance(usage.get("actor_first_terminal"), dict)
-        else {}
-    )
     text = str(final_text or "")
     failure: Dict[str, Any] | None = None
     execution_status = EXECUTION_OK
@@ -995,23 +1058,6 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "tool_errors": tool_errors[:20],
         }
 
-    # A configured actor that reaches finalization with neither a started leaf,
-    # a direct host child, nor a typed zero-run receipt has an unresolved
-    # lifecycle fact.  Keep the task deliverable visible, but never let this
-    # path read as a clean execution merely because the model wrote prose.
-    if actor_first_terminal and execution_status == EXECUTION_OK:
-        actor_status = str(actor_first_terminal.get("status") or "unknown")
-        if actor_status not in {"incomplete", "unknown"}:
-            actor_status = "unknown"
-        reason_code = f"configured_actor_{actor_status}"
-        execution_status = EXECUTION_DEGRADED
-        failure = {
-            "kind": "configured_actor",
-            "status": actor_status,
-            "reason_code": reason_code,
-            **actor_first_terminal,
-        }
-
     # A skipped-or-bypassed eligible panel is not a verdict, but cannot remain clean;
     # preserve stronger classifications and degrade only the false-green remainder.
     # Honest reachability (measured, not asserted): the FORCED-rail bypass reasons
@@ -1035,12 +1081,6 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
 
     review = _review_axis(llm_trace)
     objective = _objective_axis(review)
-    if actor_first_terminal and objective.get("status") != OBJECTIVE_FAIL:
-        objective.update({
-            "status": OBJECTIVE_DEGRADED,
-            "source": "configured_actor_terminal",
-            "actor_status": str(actor_first_terminal.get("status") or "unknown"),
-        })
     plan_gate = _trace_mapping(llm_trace, "force_plan_decision")
     _plan_gate_status = str(plan_gate.get("status") or "")
     if str(plan_gate.get("enforcement") or "") == "blocking" and (
@@ -1136,14 +1176,13 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "cosmetic_tool_errors": cosmetic_tool_errors[:20],
             "ignored_tool_errors": ignored_tool_errors[:20],
             "policy_denials": policy_denials[:20],
-            **({"actor_first_terminal": actor_first_terminal} if actor_first_terminal else {}),
             **({"mutation_attribution": mutation_attribution} if mutation_attribution else {}),
         },
         "artifacts": {"status": "not_applicable"},
         "objective": objective,
         "review": review,
     }
-    return {
+    outcome = {
         "schema_version": 3,
         "outcome_axes": outcome_axes,
         "review_eligibility": str(review.get("eligibility") or "not_eligible"),
@@ -1166,7 +1205,6 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         # which downstream consumers must interpret via the contract, not as a failure.
         "final_answer_missing_sentinel": not final_answer_payload,
         "failure": headline_failure,
-        **({"actor_first_terminal": actor_first_terminal} if actor_first_terminal else {}),
         "recoveries": recovered_tool_errors[:20],
         "usage": {
             "cost_usd": (
@@ -1180,6 +1218,7 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         },
         "trace_refs": collect_trace_refs(usage, llm_trace),
     }
+    return _apply_actor_first_terminal_projection(outcome, usage)
 
 
 def collect_trace_refs(usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict[str, Any]:
