@@ -674,14 +674,29 @@ def _adopt_refusal(sanitized: str, error: str, code: str = "", **extra: Any) -> 
     return payload
 
 
-def _reconcile_extension_quiet(name: str, drive_root: pathlib.Path) -> None:
+def _reconcile_extension_quiet(name: str, drive_root: pathlib.Path) -> str:
+    """Reconcile the live extension; returns '' or the failure description.
+
+    The rollback caller counts a failed reconcile as a restore error — a
+    rollback that leaves the previously live extension offline (or a zombie
+    hub extension loaded over deleted files) must not report rolled_back:true.
+    """
     try:
         from ouroboros.config import load_settings
         from ouroboros.extension_loader import reconcile_extension
 
-        reconcile_extension(name, pathlib.Path(drive_root), load_settings)
-    except Exception:
-        log.debug("adopt reconcile failed for %s", name, exc_info=True)
+        state = reconcile_extension(name, pathlib.Path(drive_root), load_settings)
+        if isinstance(state, dict):
+            load_error = state.get("load_error") or (
+                str(state.get("reason") or "extension reload failed")
+                if str(state.get("action") or "") == "extension_load_error" else ""
+            )
+            if load_error:
+                return f"live_reconcile: {load_error}"
+        return ""
+    except Exception as exc:
+        log.warning("adopt reconcile failed for %s", name, exc_info=True)
+        return f"live_reconcile: {type(exc).__name__}: {exc}"
 
 
 def _restore_adopt_state(drive_root: pathlib.Path, name: str, snapshot: Dict[str, Optional[bytes]]) -> List[str]:
@@ -722,6 +737,14 @@ def _adopt_rollback(ctx: _AdoptContext) -> List[str]:
         if ctx.aside_dir.exists() and not ctx.source_dir.exists():
             ctx.source_dir.parent.mkdir(parents=True, exist_ok=True)
             ctx.aside_dir.rename(ctx.source_dir)
+        elif ctx.aside_dir.exists() and ctx.source_dir.exists():
+            # An out-of-band writer recreated the source while it was moved
+            # aside. Never clobber the newer occupant, but a rollback that did
+            # NOT byte-restore the pre-adopt payload may not claim success.
+            errors.append(
+                "source_restore: source path was recreated concurrently; "
+                f"pre-adopt payload preserved at {ctx.aside_dir}, not restored"
+            )
         elif not ctx.aside_dir.exists() and not ctx.source_dir.exists():
             errors.append("source_restore: aside tree missing and source absent")
     except OSError as exc:
@@ -729,9 +752,15 @@ def _adopt_rollback(ctx: _AdoptContext) -> List[str]:
         errors.append(
             f"source_restore: {type(exc).__name__}: {exc} (source preserved at {ctx.aside_dir})"
         )
-    errors.extend(_restore_adopt_state(ctx.drive_root, ctx.name, ctx.state_snapshot))
-    if ctx.was_live:
-        _reconcile_extension_quiet(ctx.name, ctx.drive_root)
+    try:
+        errors.extend(_restore_adopt_state(ctx.drive_root, ctx.name, ctx.state_snapshot))
+    except OSError as exc:
+        log.error("adopt rollback state restore crashed for %s", ctx.name, exc_info=True)
+        errors.append(f"state: {type(exc).__name__}: {exc}")
+    if ctx.desired_live or ctx.was_live:
+        reconcile_error = _reconcile_extension_quiet(ctx.name, ctx.drive_root)
+        if reconcile_error:
+            errors.append(reconcile_error)
     return errors
 
 
@@ -874,7 +903,9 @@ def _adopt_begin(slug: str, drive_root: pathlib.Path, expected_content_hash: str
                 log.error("adopt CAS-mismatch restore failed for %s", sanitized, exc_info=True)
                 restore_note = f" SOURCE NOT RESTORED ({type(exc).__name__}); preserved at {aside_dir}"
             if was_live:
-                _reconcile_extension_quiet(sanitized, drive_root)
+                reconcile_note = _reconcile_extension_quiet(sanitized, drive_root)
+                if reconcile_note:
+                    restore_note += f" ({reconcile_note})"
             return _adopt_refusal(
                 sanitized,
                 "local payload changed between confirmation and replacement - refresh the skill card and confirm again"

@@ -136,6 +136,13 @@ def _review_fields(
 
                 official_hub_verified = bool(is_official_hub_payload_verified(loaded))
                 if key[0] and key[1]:
+                    # Evict expired entries so superseded content hashes do
+                    # not accumulate across skill revisions.
+                    for stale_key in [
+                        k for k, (_, at) in _OFFICIAL_HUB_VERIFIED_HINT_CACHE.items()
+                        if (now - at) >= _OFFICIAL_HUB_VERIFIED_TTL_SEC
+                    ]:
+                        _OFFICIAL_HUB_VERIFIED_HINT_CACHE.pop(stale_key, None)
                     _OFFICIAL_HUB_VERIFIED_HINT_CACHE[key] = (official_hub_verified, now)
         except Exception:
             official_hub_verified = False

@@ -457,7 +457,7 @@
  * @typedef {Object} SkillReviewHistoryRowFields
  * @property {string=} skill
  * @property {string=} status
- * @property {string} content_hash
+ * @property {string=} content_hash
  * @property {string=} job_id
  * @property {number=} review_round
  * @property {number=} snapshot_attempt

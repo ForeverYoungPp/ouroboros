@@ -261,7 +261,12 @@ export function initOuroborosHub(pane, controlsHost = null) {
             || '<div class="muted">No official skills found.</div>';
     }
 
+    let refreshGeneration = 0;
+
     async function refresh() {
+        // Stale-response guard: a slow earlier refresh must never overwrite
+        // the results of a newer one (e.g. typed query racing initial load).
+        const generation = ++refreshGeneration;
         show('Loading OuroborosHub…', 'muted');
         try {
             const params = new URLSearchParams();
@@ -272,6 +277,7 @@ export function initOuroborosHub(pane, controlsHost = null) {
                 fetchJson(`/api/marketplace/ouroboroshub/catalog?${params}`),
                 fetchJson('/api/extensions').catch(() => null),
             ]);
+            if (generation !== refreshGeneration) return;
             state.results = catalogData.results || [];
             state.listingUnavailable = listingData === null;
             state.listingByName = new Map();
@@ -303,6 +309,7 @@ export function initOuroborosHub(pane, controlsHost = null) {
             renderCards();
             show(`${state.results.length} official skill${state.results.length === 1 ? '' : 's'}`, 'muted');
         } catch (err) {
+            if (generation !== refreshGeneration) return;
             show(err.message || String(err), 'danger');
             results.innerHTML = `<div class="skills-load-error">Hub facts unavailable: ${escapeHtml(err.message || err)}</div>`;
         }

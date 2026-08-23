@@ -714,6 +714,51 @@ def test_rollback_failure_reports_rolled_back_false(monkeypatch, tmp_path):
     assert "ROLLBACK INCOMPLETE" in outcome["error"]
 
 
+def test_adopt_rollback_discloses_concurrent_source_recreation(tmp_path):
+    """Aside AND source both present: keep the newer occupant, report failure."""
+    source = tmp_path / "skills" / "external" / "demo"
+    aside = tmp_path / "skills" / "external" / ".rollback" / "demo.adopt.x"
+    source.mkdir(parents=True)
+    aside.mkdir(parents=True)
+    ctx = ouroboroshub._AdoptContext(
+        name="demo",
+        drive_root=tmp_path,
+        source_dir=source,
+        aside_dir=aside,
+        dest_dir=tmp_path / "skills" / "ouroboroshub" / "demo",
+        state_snapshot={},
+        was_live=False,
+    )
+    errors = ouroboroshub._adopt_rollback(ctx)
+    assert any("recreated concurrently" in e for e in errors), errors
+    assert source.exists() and aside.exists()
+
+
+def test_adopt_rollback_counts_failed_live_reconcile(monkeypatch, tmp_path):
+    """A rollback whose live-extension reconcile fails is not rolled_back:true."""
+    source = tmp_path / "skills" / "external" / "demo"
+    aside = tmp_path / "skills" / "external" / ".rollback" / "demo.adopt.x"
+    aside.mkdir(parents=True)
+    (aside / "SKILL.md").write_text(_LOCAL_BODY, encoding="utf-8")
+    monkeypatch.setattr(
+        ouroboroshub, "_reconcile_extension_quiet",
+        lambda name, root: "live_reconcile: ImportError: boom",
+    )
+    ctx = ouroboroshub._AdoptContext(
+        name="demo",
+        drive_root=tmp_path,
+        source_dir=source,
+        aside_dir=aside,
+        dest_dir=tmp_path / "skills" / "ouroboroshub" / "demo",
+        state_snapshot={},
+        was_live=False,
+        desired_live=True,
+    )
+    errors = ouroboroshub._adopt_rollback(ctx)
+    assert any("live_reconcile" in e for e in errors), errors
+    assert source.exists() and not aside.exists()
+
+
 def test_adopt_rollback_collects_missing_source_error(tmp_path):
     """Unit: aside gone AND source gone is a collected error, never silence."""
     ctx = ouroboroshub._AdoptContext(
@@ -761,8 +806,12 @@ def test_enabled_but_not_live_occupant_gets_strict_reconcile(monkeypatch, tmp_pa
     calls = []
 
     def _reconcile(name, _drive, _settings):
+        # The hub payload fails to load; the restored original loads fine —
+        # so the rollback's own reconcile succeeds and rolled_back stays true.
         calls.append(name)
-        return {"action": "extension_load_error", "load_error": "import boom"}
+        if len(calls) == 1:
+            return {"action": "extension_load_error", "load_error": "import boom"}
+        return {"action": "loaded"}
 
     monkeypatch.setattr("ouroboros.extension_loader.reconcile_extension", _reconcile)
     outcome = asyncio.run(ouroboroshub.run_hub_adopt(
@@ -773,7 +822,7 @@ def test_enabled_but_not_live_occupant_gets_strict_reconcile(monkeypatch, tmp_pa
         run_blocking=_fake_run_blocking,
         apply_review_and_deps=_apply_result(),
     ))
-    assert calls, "reconcile must run for an enabled occupant even when not live"
+    assert len(calls) >= 2, "reconcile must run forward AND during rollback for an enabled occupant"
     assert outcome["ok"] is False
     assert outcome["rolled_back"] is True
     assert "reload failed" in outcome["error"]
