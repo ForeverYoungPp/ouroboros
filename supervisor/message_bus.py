@@ -14,7 +14,7 @@ from ouroboros.artifacts import store_chat_media_bytes
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.event_bus import CHAT_DOCUMENT, CHAT_OUTBOUND, CHAT_PHOTO, CHAT_TYPING, CHAT_VIDEO, publish_event
 from supervisor.state import append_jsonl, load_state
-from ouroboros.projects_registry import project_thread_marker
+from ouroboros.projects_registry import stamp_project_thread
 from ouroboros.utils import utc_now_iso
 from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS
 
@@ -245,7 +245,7 @@ class LocalChatBridge:
             return
         ts = utc_now_iso()
         if self._broadcast_fn:
-            self._broadcast_fn({
+            echo = {
                 "type": "chat",
                 "role": "user",
                 "content": clean_text,
@@ -254,8 +254,9 @@ class LocalChatBridge:
                 "chat_id": thread_id,
                 "sender_session_id": sender_session_id,
                 "client_message_id": client_message_id,
-                **project_thread_marker(DATA_DIR, thread_id),
-            })
+            }
+            stamp_project_thread(DATA_DIR, echo)
+            self._broadcast_fn(echo)
         metadata = dict(task_metadata or {})
         if str(project_id or "").strip():
             metadata.setdefault("project_id", str(project_id).strip())
@@ -376,10 +377,9 @@ class LocalChatBridge:
                 payload["system_type"] = str(system_type)
             if meta:
                 payload.update(meta)
-            # Marker is the LAST writer, keyed on the FINAL chat_id: progress
-            # meta can neither spoof nor erase the registry stamp.
+            # Last writer on the FINAL chat_id: meta cannot spoof/erase the stamp.
             payload.pop("project_thread", None)
-            payload.update(project_thread_marker(DATA_DIR, payload.get("chat_id")))
+            stamp_project_thread(DATA_DIR, payload)
             self._broadcast_fn(payload)
         if not is_a2a_chat_id(chat_id):
             event = {
@@ -470,8 +470,8 @@ class LocalChatBridge:
             "type": "typing",
             "action": action,
             "chat_id": int(chat_id or 0),
-            **project_thread_marker(DATA_DIR, chat_id),
         }
+        stamp_project_thread(DATA_DIR, payload)
         if activity_id:
             payload["activity_id"] = str(activity_id)
         if client_message_id:
@@ -516,8 +516,8 @@ class LocalChatBridge:
             "caption": caption,
             "ts": utc_now_iso(),
             "chat_id": int(chat_id or 0),
-            **project_thread_marker(DATA_DIR, chat_id),
         }
+        stamp_project_thread(DATA_DIR, msg)
         if self._broadcast_fn:
             self._broadcast_fn(msg)
         photo_transport = dict(self._chat_transports.get(int(chat_id or 0), {}) or {})
@@ -569,8 +569,8 @@ class LocalChatBridge:
             "caption": caption,
             "ts": utc_now_iso(),
             "chat_id": int(chat_id or 0),
-            **project_thread_marker(DATA_DIR, chat_id),
         }
+        stamp_project_thread(DATA_DIR, msg)
         if self._broadcast_fn:
             self._broadcast_fn(msg)
         video_transport = dict(self._chat_transports.get(int(chat_id or 0), {}) or {})
@@ -627,8 +627,8 @@ class LocalChatBridge:
             "download_url": str(download_url or ""),
             "ts": ts,
             "chat_id": int(chat_id or 0),
-            **project_thread_marker(DATA_DIR, chat_id),
         }
+        stamp_project_thread(DATA_DIR, msg)
         if self._broadcast_fn:
             self._broadcast_fn(msg)
         document_transport = dict(self._chat_transports.get(int(chat_id or 0), {}) or {})
@@ -681,9 +681,9 @@ class LocalChatBridge:
             # Surface the event's chat_id top-level so the browser's per-thread
             # fan-out (isMyThread) can route the live card to its project panel
             # instead of the main chat. Events without a chat_id default to main.
-            log_chat_id = int(event.get("chat_id") or 0)
-            self._broadcast_fn({"type": "log", "data": event, "chat_id": log_chat_id,
-                                **project_thread_marker(DATA_DIR, log_chat_id)})
+            frame = {"type": "log", "data": event, "chat_id": int(event.get("chat_id") or 0)}
+            stamp_project_thread(DATA_DIR, frame)
+            self._broadcast_fn(frame)
 
     def ui_poll_logs(self) -> list:
         """Drain pending log events for the web UI."""

@@ -258,7 +258,9 @@ def test_project_activity_stays_out_of_main_static_contract():
         chat.index("onWs('message_annotation'")
     ]
     assert "mirrorProject" not in fanout
-    assert "return !isKnownProjectFrame(msg);" in fanout
+    # Main's gate is the pure mainThreadAccepts predicate (server project_thread
+    # stamp + known-project set) — behavior pinned in chat_thread_routing.test.js.
+    assert "return mainThreadAccepts(msg, state.projectChatIds);" in fanout
     assert "msg.system_type === 'project_completion_summary'" in fanout
     assert "appendTaskSummaryToLiveCard(msg);" in fanout
     assert "updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true });" in fanout

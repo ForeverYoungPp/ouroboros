@@ -449,20 +449,21 @@ def project_thread_chat_ids(drive_root: Any) -> frozenset:
     return ids
 
 
-def project_thread_marker(drive_root: Any, chat_id: int) -> Dict[str, bool]:
-    """``{"project_thread": True}`` iff ``chat_id`` is a reserved Project thread.
-
-    The live broadcast choke (``supervisor.message_bus``) spreads this into
-    every outbound frame so Main's fan-out can reject a not-yet-learned
-    Project frame. Registry MEMBERSHIP, never a numeric range: external
-    transport ids (Telegram) are not members and stay unstamped.
+def stamp_project_thread(drive_root: Any, payload: Dict[str, Any]) -> None:
+    """Set ``project_thread=True`` iff the payload's FINAL chat_id is a reserved
+    Project thread. Called by the live broadcast choke (``supervisor.message_bus``)
+    AFTER the envelope literal is built (constant-key assignment — the WS
+    envelope-parity scanner forbids ``**`` widening inside the literal), so
+    Main's fan-out can reject a not-yet-learned Project frame. Registry
+    MEMBERSHIP, never a numeric range: external transport ids (Telegram) are
+    not members and stay unstamped.
     """
     try:
-        if drive_root is not None and int(chat_id or 0) in project_thread_chat_ids(drive_root):
-            return {"project_thread": True}
+        chat_id = int(payload.get("chat_id") or 0)
+        if drive_root is not None and chat_id in project_thread_chat_ids(drive_root):
+            payload["project_thread"] = True
     except Exception:
-        log.debug("Project thread lens failed for chat %s", chat_id, exc_info=True)
-    return {}
+        log.debug("Project thread lens failed", exc_info=True)
 
 
 def registered_project_chat_ids(drive_root: Any) -> set:
