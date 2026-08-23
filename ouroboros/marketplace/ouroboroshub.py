@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
 import pathlib
 import shutil
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -81,6 +84,11 @@ class HubSkillSummary:
     files: List[Dict[str, Any]] = field(default_factory=list)
     install_specs: Any = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
+    # Server-computed canonical identity facts (§7.2): the Python sanitizer is
+    # the only slug→name authority; JS never re-implements it. identity_conflict
+    # marks entries whose canonical name is shared by >1 catalog slugs.
+    sanitized_name: str = ""
+    identity_conflict: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -96,6 +104,8 @@ class HubSkillSummary:
             "stats": {},
             "badges": {"official": True},
             "is_plugin": False,
+            "sanitized_name": self.sanitized_name or _sanitize_skill_name(self.slug),
+            "identity_conflict": bool(self.identity_conflict),
         }
 
 
@@ -107,6 +117,9 @@ class HubInstallResult:
     target_dir: Optional[pathlib.Path] = None
     summary: Optional[HubSkillSummary] = None
     provenance: Dict[str, Any] = field(default_factory=dict)
+    # Typed error code (e.g. "catalog_identity_conflict"); empty for plain
+    # errors so existing payload shapes stay byte-identical.
+    code: str = ""
 
 
 def _fetch_bytes(url: str, *, max_bytes: int, timeout_sec: int = 15) -> bytes:
@@ -133,7 +146,52 @@ def _raw_base(catalog: Dict[str, Any], catalog_url: str) -> str:
     raise OuroborosHubError("catalog must include raw_base_url")
 
 
-def load_catalog() -> Dict[str, Any]:
+# Display-plane catalog memo (§7.1a): ONLY gateway display reads pass
+# ``fresh=False``. install/adopt/update and the official-hub verifier always
+# call ``load_catalog()`` with the fresh default and never consume the memo;
+# every successful fetch refreshes it so display lags at most the TTL.
+_CATALOG_CACHE_TTL_SEC = 120.0
+_CATALOG_CACHE_LOCK = threading.Lock()
+_CATALOG_CACHE: Optional[tuple[float, Dict[str, Any]]] = None
+
+
+def _catalog_cache_clear() -> None:
+    """Test hook: drop the display-plane catalog memo."""
+    global _CATALOG_CACHE
+    with _CATALOG_CACHE_LOCK:
+        _CATALOG_CACHE = None
+
+
+def _catalog_cache_inject(catalog: Dict[str, Any], *, age_sec: float = 0.0) -> None:
+    """Test hook: seed the display-plane memo with a catalog aged ``age_sec``."""
+    global _CATALOG_CACHE
+    with _CATALOG_CACHE_LOCK:
+        _CATALOG_CACHE = (time.monotonic() - float(age_sec), copy.deepcopy(catalog))
+
+
+def _catalog_cache_get() -> Optional[Dict[str, Any]]:
+    with _CATALOG_CACHE_LOCK:
+        if _CATALOG_CACHE is None:
+            return None
+        fetched_at, catalog = _CATALOG_CACHE
+        if (time.monotonic() - fetched_at) > _CATALOG_CACHE_TTL_SEC:
+            return None
+        # Defensive copy: callers may mutate the returned dict.
+        return copy.deepcopy(catalog)
+
+
+def _catalog_cache_store(catalog: Dict[str, Any]) -> None:
+    global _CATALOG_CACHE
+    with _CATALOG_CACHE_LOCK:
+        _CATALOG_CACHE = (time.monotonic(), copy.deepcopy(catalog))
+
+
+def load_catalog(fresh: bool = True) -> Dict[str, Any]:
+    """Fetch the hub catalog; ``fresh=False`` is reserved for display reads."""
+    if not fresh:
+        cached = _catalog_cache_get()
+        if cached is not None:
+            return cached
     url = get_ouroboroshub_catalog_url()
     data = _fetch_bytes(url, max_bytes=_MAX_CATALOG_BYTES)
     try:
@@ -143,6 +201,7 @@ def load_catalog() -> Dict[str, Any]:
     if not isinstance(catalog, dict):
         raise OuroborosHubError("catalog root must be an object")
     catalog.setdefault("raw_base_url", _raw_base(catalog, url))
+    _catalog_cache_store(catalog)
     return catalog
 
 
@@ -169,12 +228,20 @@ def _summaries(catalog: Dict[str, Any]) -> List[HubSkillSummary]:
                 raw=item,
             )
         )
+    # Canonical-name facts are catalog-wide: a slug whose canonical name is
+    # shared with another catalog entry stays flagged even after search filters.
+    counts: Dict[str, int] = {}
+    for entry in out:
+        entry.sanitized_name = _sanitize_skill_name(entry.slug)
+        counts[entry.sanitized_name] = counts.get(entry.sanitized_name, 0) + 1
+    for entry in out:
+        entry.identity_conflict = counts[entry.sanitized_name] > 1
     return out
 
 
-def search(query: str = "") -> List[HubSkillSummary]:
+def search(query: str = "", *, fresh: bool = True) -> List[HubSkillSummary]:
     q = str(query or "").strip().lower()
-    entries = _summaries(load_catalog())
+    entries = _summaries(load_catalog(fresh=fresh))
     if not q:
         return entries
     return [
@@ -299,6 +366,19 @@ def install(slug: str, *, overwrite: bool = False) -> HubInstallResult:
     if summary is None:
         return HubInstallResult(False, "", error=f"skill not found: {slug}")
     sanitized = _sanitize_skill_name(summary.slug)
+    if summary.identity_conflict:
+        # Server-side guard (§7.2/§7.3): >1 catalog slugs sanitize to the same
+        # canonical name — installing either would be an ambiguous identity.
+        return HubInstallResult(
+            False,
+            sanitized,
+            error=(
+                f"catalog identity conflict: multiple catalog entries sanitize to "
+                f"{sanitized!r}; refusing to install an ambiguous identity"
+            ),
+            summary=summary,
+            code="catalog_identity_conflict",
+        )
     target_root = get_ouroboroshub_skills_dir()
     target_dir = target_root / sanitized
     drive_root = target_root.parent.parent
@@ -392,6 +472,8 @@ def serialize_hub_install_result(result: HubInstallResult) -> Dict[str, Any]:
     }
     if result.target_dir is not None:
         payload["target_dir"] = str(result.target_dir)
+    if result.code:
+        payload["code"] = result.code
     return payload
 
 

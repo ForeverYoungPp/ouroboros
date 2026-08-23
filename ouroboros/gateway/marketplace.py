@@ -229,6 +229,21 @@ def _serialize_install_result(result: Any) -> Dict[str, Any]:
 # Serialization lives beside the transaction bodies in the marketplace layer.
 _serialize_hub_install_result = ouroboroshub.serialize_hub_install_result
 
+# Typed hub error codes carry their own HTTP status (§7.3); anything untyped
+# keeps the historical 200-or-400 contract.
+_HUB_ERROR_HTTP_STATUS = {
+    "adopt_cas_mismatch": 409,
+    "adopt_not_eligible": 409,
+    "catalog_identity_conflict": 409,
+    "catalog_unavailable": 502,
+}
+
+
+def _hub_payload_status(payload: Dict[str, Any]) -> int:
+    if payload.get("ok"):
+        return 200
+    return _HUB_ERROR_HTTP_STATUS.get(str(payload.get("code") or ""), 400)
+
 
 async def _apply_hub_review_and_deps(
     payload: Dict[str, Any],
@@ -632,7 +647,8 @@ async def api_marketplace_installed(request: Request) -> JSONResponse:
 async def api_ouroboroshub_catalog(request: Request) -> JSONResponse:
     query = str(request.query_params.get("q") or request.query_params.get("query") or "").strip()
     try:
-        results = await asyncio.to_thread(ouroboroshub.search, query)
+        # Display read: the only consumer of the §7.1a catalog TTL memo.
+        results = await asyncio.to_thread(ouroboroshub.search, query, fresh=False)
     except Exception as exc:
         log.warning("OuroborosHub catalog failed: %s", exc, exc_info=True)
         return json_exception(exc, 502)
@@ -720,7 +736,7 @@ async def api_ouroboroshub_install(request: Request) -> JSONResponse:
     # ok=false, changing scheduled-task readiness.
     _resync_skill_schedules_quiet(drive_root)
     _maybe_enqueue_repair_for_payload(drive_root, payload, source="ouroboroshub")
-    return JSONResponse(payload, status_code=200 if payload.get("ok") else 400)
+    return JSONResponse(payload, status_code=_hub_payload_status(payload))
 
 
 async def api_ouroboroshub_update(request: Request) -> JSONResponse:
@@ -775,7 +791,7 @@ async def api_ouroboroshub_update(request: Request) -> JSONResponse:
     # a follow-up deps step reports ok=false, changing scheduled-task readiness.
     _resync_skill_schedules_quiet(drive_root)
     _maybe_enqueue_repair_for_payload(drive_root, payload, source="ouroboroshub")
-    return JSONResponse(payload, status_code=200 if payload.get("ok") else 400)
+    return JSONResponse(payload, status_code=_hub_payload_status(payload))
 
 async def api_ouroboroshub_installed(request: Request) -> JSONResponse:
     drive_root = _request_drive_root(request)

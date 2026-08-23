@@ -360,6 +360,9 @@ def _build_extensions_index(drive_root, repo_path):
             "is_self_authored": bool(getattr(s, "is_self_authored", False)),
             # Keep source explicit so marketplace skills are not mislabeled native.
             "source": s.source,
+            # Loader payload hash (§7.2): the hub UI's CAS/sync fact. Empty for
+            # broken/collision rows, whose loader hash never existed.
+            "content_hash": str(getattr(s, "content_hash", "") or ""),
             "payload_root": payload_root,
             "installed_at": _path_installed_at(s.skill_dir),
         }
