@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import pathlib
+import re
 from typing import Any, Dict, Optional
 
 from starlette.requests import Request
@@ -666,12 +667,95 @@ async def api_ouroboroshub_preview(request: Request) -> JSONResponse:
     return JSONResponse({"summary": summary.to_dict(), "files": summary.files})
 
 
+_ADOPT_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _validate_adopt_body(body: Dict[str, Any], sanitized: str) -> Optional[JSONResponse]:
+    """§7.3 body validation for adopt=true; None means the body is acceptable."""
+    def _reject(error: str, code: str) -> JSONResponse:
+        return JSONResponse(
+            {"ok": False, "sanitized_name": sanitized, "error": error, "code": code},
+            status_code=400,
+        )
+
+    expected = str(body.get("expected_content_hash") or "").strip()
+    if not expected:
+        return _reject("adopt requires expected_content_hash", "adopt_expected_hash_missing")
+    if not _ADOPT_HASH_RE.fullmatch(expected):
+        return _reject(
+            "expected_content_hash must be 64 lowercase hex characters",
+            "adopt_expected_hash_invalid",
+        )
+    if "auto_review" in body and not _coerce_bool(body.get("auto_review"), True):
+        return _reject("adopt always runs auto review", "adopt_requires_auto_review")
+    if _coerce_bool(body.get("overwrite"), False):
+        return _reject("adopt and overwrite are mutually exclusive", "adopt_overwrite_conflict")
+    return None
+
+
+async def _api_ouroboroshub_adopt(request: Request, body: Dict[str, Any], slug: str) -> JSONResponse:
+    """Adopt dispatch (§7.3): validate the body, SKIP the pre-lifecycle identity
+    precheck (the transaction's move-aside makes the installer's own precheck
+    pass naturally), and run the transaction through the lifecycle machinery."""
+    from ouroboros.skill_loader import _sanitize_skill_name
+
+    sanitized = _sanitize_skill_name(slug)
+    refusal = _validate_adopt_body(body, sanitized)
+    if refusal is not None:
+        return refusal
+    expected = str(body.get("expected_content_hash") or "").strip()
+    drive_root = _request_drive_root(request)
+    repo_dir = _request_repo_dir(request)
+    adopt_progress = JobProgressTarget()
+
+    async def _apply_review_and_deps(payload: Dict[str, Any], skill_name: str) -> tuple[str, str, str]:
+        return await _apply_hub_review_and_deps(
+            payload,
+            drive_root=drive_root,
+            repo_dir=repo_dir,
+            skill_name=skill_name,
+            progress=adopt_progress,
+            review_log_label="OuroborosHub adopt review lifecycle operation",
+            deps_log_label="OuroborosHub adopt dependency lifecycle operation",
+        )
+
+    async def _run_adopt() -> Dict[str, Any]:
+        return await ouroboroshub.run_hub_adopt(
+            slug,
+            drive_root=drive_root,
+            expected_content_hash=expected,
+            progress=adopt_progress,
+            run_blocking=run_blocking_preserving_cancellation,
+            apply_review_and_deps=_apply_review_and_deps,
+        )
+
+    payload = await run_lifecycle_job(
+        kind="install",
+        target=slug,
+        source="ouroboroshub",
+        message=f"Adopting {slug}",
+        runner=_run_adopt,
+        options=_lifecycle_options(
+            "Adopted",
+            "adopt failed",
+            progress_target=adopt_progress,
+        ),
+    )
+    # Resync regardless of ok: a rolled-back adopt still restored payloads on
+    # disk and a successful one changed the scheduled-task inventory.
+    _resync_skill_schedules_quiet(drive_root)
+    _maybe_enqueue_repair_for_payload(drive_root, payload, source="ouroboroshub")
+    return JSONResponse(payload, status_code=_hub_payload_status(payload))
+
+
 async def api_ouroboroshub_install(request: Request) -> JSONResponse:
     body = await request_json_or(request, {}, exceptions=(Exception,))
     body = body if isinstance(body, dict) else {}
     slug = str(body.get("slug") or "").strip()
     if not slug:
         return json_error("missing slug", 400)
+    if _coerce_bool(body.get("adopt"), False):
+        return await _api_ouroboroshub_adopt(request, body, slug)
     overwrite = _coerce_bool(body.get("overwrite"), False)
     auto_review = _coerce_bool(body.get("auto_review"), True)
     drive_root = _request_drive_root(request)
