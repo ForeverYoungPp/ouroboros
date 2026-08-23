@@ -8,6 +8,7 @@ import inspect
 import logging
 import pathlib
 import shutil
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -53,7 +54,11 @@ _CHILD_DISPATCH_HEADER_DENYLIST = {
     "x-auth-token",
 }
 _CHILD_DISPATCH_BODY_CAP = 512 * 1024
-_OFFICIAL_HUB_VERIFIED_HINT_CACHE: dict[tuple[str, str], bool] = {}
+# (name, content_hash) -> (verdict, monotonic stamp). TTL-bounded: the verdict
+# also depends on the LIVE catalog, so an unexpiring memo could keep claiming
+# "published" after the hub advanced or dropped the slug (final-gate finding).
+_OFFICIAL_HUB_VERIFIED_HINT_CACHE: dict[tuple[str, str], tuple[bool, float]] = {}
+_OFFICIAL_HUB_VERIFIED_TTL_SEC = 300.0
 
 
 def _passive_submit_hub(
@@ -122,14 +127,16 @@ def _review_fields(
     if source == "ouroboroshub":
         try:
             key = (str(getattr(loaded, "name", "") or ""), str(getattr(loaded, "content_hash", "") or ""))
-            if key[0] and key[1] and key in _OFFICIAL_HUB_VERIFIED_HINT_CACHE:
-                official_hub_verified = _OFFICIAL_HUB_VERIFIED_HINT_CACHE[key]
+            cached = _OFFICIAL_HUB_VERIFIED_HINT_CACHE.get(key) if key[0] and key[1] else None
+            now = time.monotonic()
+            if cached is not None and (now - cached[1]) < _OFFICIAL_HUB_VERIFIED_TTL_SEC:
+                official_hub_verified = cached[0]
             else:
                 from ouroboros.skill_review import is_official_hub_payload_verified
 
                 official_hub_verified = bool(is_official_hub_payload_verified(loaded))
                 if key[0] and key[1]:
-                    _OFFICIAL_HUB_VERIFIED_HINT_CACHE[key] = official_hub_verified
+                    _OFFICIAL_HUB_VERIFIED_HINT_CACHE[key] = (official_hub_verified, now)
         except Exception:
             official_hub_verified = False
     owner_attestable = (

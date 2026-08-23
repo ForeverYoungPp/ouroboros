@@ -687,3 +687,119 @@ def test_adopt_cas_reverified_on_aside_tree(monkeypatch, tmp_path):
     rollback_root = skill_dir.parent / ".rollback"
     leftovers = list(rollback_root.glob("demo.adopt.*")) if rollback_root.is_dir() else []
     assert leftovers == []
+
+
+def test_rollback_failure_reports_rolled_back_false(monkeypatch, tmp_path):
+    """Final-gate fix: a failed restore may never claim rolled_back:true."""
+    drive = _setup_hub(monkeypatch, tmp_path)
+    skill_dir = _make_occupant(drive)
+    expected = _live_hash(drive, skill_dir)
+    monkeypatch.setattr(
+        ouroboroshub, "_adopt_rollback",
+        lambda ctx: ["source_restore: OSError: boom (source preserved at X)"],
+    )
+
+    outcome = asyncio.run(ouroboroshub.run_hub_adopt(
+        "demo",
+        drive_root=drive,
+        expected_content_hash=expected,
+        progress=_Progress(),
+        run_blocking=_fake_run_blocking,
+        apply_review_and_deps=_apply_result(deps_status="failed", deps_error="boom"),
+    ))
+
+    assert outcome["ok"] is False
+    assert outcome["rolled_back"] is False
+    assert any("source_restore" in e for e in outcome.get("rollback_errors", [])), outcome
+    assert "ROLLBACK INCOMPLETE" in outcome["error"]
+
+
+def test_adopt_rollback_collects_missing_source_error(tmp_path):
+    """Unit: aside gone AND source gone is a collected error, never silence."""
+    ctx = ouroboroshub._AdoptContext(
+        name="demo",
+        drive_root=tmp_path,
+        source_dir=tmp_path / "skills" / "external" / "demo",
+        aside_dir=tmp_path / "skills" / "external" / ".rollback" / "demo.adopt.x",
+        dest_dir=tmp_path / "skills" / "ouroboroshub" / "demo",
+        state_snapshot={},
+        was_live=False,
+    )
+    errors = ouroboroshub._adopt_rollback(ctx)
+    assert any("source_restore" in e for e in errors), errors
+
+
+def test_retention_failure_disclosed_on_success(monkeypatch, tmp_path):
+    """Final-gate fix: retention failure -> adopted:true + pre_adopt_retained:false."""
+    drive = _setup_hub(monkeypatch, tmp_path)
+    skill_dir = _make_occupant(drive)
+    expected = _live_hash(drive, skill_dir)
+    real_finalize = ouroboroshub._adopt_finalize
+    monkeypatch.setattr(ouroboroshub, "_adopt_finalize", lambda ctx: (False, "OSError: keep failed (source preserved at X)"))
+    outcome = asyncio.run(ouroboroshub.run_hub_adopt(
+        "demo",
+        drive_root=drive,
+        expected_content_hash=expected,
+        progress=_Progress(),
+        run_blocking=_fake_run_blocking,
+        apply_review_and_deps=_apply_result(),
+    ))
+    assert outcome.get("adopted") is True
+    assert outcome.get("pre_adopt_retained") is False
+    assert "keep failed" in str(outcome.get("retention_error"))
+    monkeypatch.setattr(ouroboroshub, "_adopt_finalize", real_finalize)
+
+
+def test_enabled_but_not_live_occupant_gets_strict_reconcile(monkeypatch, tmp_path):
+    """Final-gate fix: reconcile keys on ENABLED state, not only was_live."""
+    from ouroboros.skill_loader import save_enabled
+
+    drive = _setup_hub(monkeypatch, tmp_path)
+    skill_dir = _make_occupant(drive)
+    save_enabled(drive, "demo", True)
+    expected = _live_hash(drive, skill_dir)
+    calls = []
+
+    def _reconcile(name, _drive, _settings):
+        calls.append(name)
+        return {"action": "extension_load_error", "load_error": "import boom"}
+
+    monkeypatch.setattr("ouroboros.extension_loader.reconcile_extension", _reconcile)
+    outcome = asyncio.run(ouroboroshub.run_hub_adopt(
+        "demo",
+        drive_root=drive,
+        expected_content_hash=expected,
+        progress=_Progress(),
+        run_blocking=_fake_run_blocking,
+        apply_review_and_deps=_apply_result(),
+    ))
+    assert calls, "reconcile must run for an enabled occupant even when not live"
+    assert outcome["ok"] is False
+    assert outcome["rolled_back"] is True
+    assert "reload failed" in outcome["error"]
+    assert skill_dir.is_dir()
+
+
+def test_adopt_reuses_prelude_catalog_fetch(monkeypatch, tmp_path):
+    """Final-gate fix: install inside adopt must not refetch the catalog."""
+    drive = _setup_hub(monkeypatch, tmp_path)
+    skill_dir = _make_occupant(drive)
+    expected = _live_hash(drive, skill_dir)
+    fetches = {"n": 0}
+    orig = ouroboroshub.load_catalog
+
+    def _counting(*a, **k):
+        fetches["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(ouroboroshub, "load_catalog", _counting)
+    outcome = asyncio.run(ouroboroshub.run_hub_adopt(
+        "demo",
+        drive_root=drive,
+        expected_content_hash=expected,
+        progress=_Progress(),
+        run_blocking=_fake_run_blocking,
+        apply_review_and_deps=_apply_result(),
+    ))
+    assert outcome.get("adopted") is True
+    assert fetches["n"] == 1, f"expected exactly one catalog fetch, got {fetches['n']}"

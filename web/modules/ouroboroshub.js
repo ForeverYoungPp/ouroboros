@@ -228,9 +228,14 @@ export function initOuroborosHub(pane, controlsHost = null) {
         const catalogRow = catalogRowFor(item);
         const rawSkill = state.listingByName.get(catalogRow.sanitized_name) || null;
         const listingRow = rawSkill ? hubListingRowFor(rawSkill) : null;
-        const verdict = hubSyncVerdict(listingRow, catalogRow, {
-            listingUnavailable: state.listingUnavailable,
-        });
+        const verdict = hubSyncVerdict(
+            listingRow,
+            // A listing-only synthetic row has NO catalog entry: the verdict
+            // must see catalogRow=null (slug absent) for the frozen wait_pr/
+            // pending semantics, never a fabricated catalog fact.
+            item.listing_only === true ? null : catalogRow,
+            { listingUnavailable: state.listingUnavailable },
+        );
         return { verdict, rawSkill, listingRow, catalogRow };
     }
 
@@ -274,6 +279,26 @@ export function initOuroborosHub(pane, controlsHost = null) {
                 if (skill?.name && !state.listingByName.has(skill.name)) {
                     state.listingByName.set(skill.name, skill);
                 }
+            }
+            // A first-time submission is ABSENT from the catalog until its PR
+            // merges: synthesize a card row from the receipt-bearing listing
+            // entry so the frozen wait_pr/"Submitted PR #N" state is reachable
+            // (final-gate finding). Client-side query filter mirrors the
+            // server-side catalog search.
+            const catalogNames = new Set(state.results.map((row) => String(row.sanitized_name || row.slug || '')));
+            const query = state.query.trim().toLowerCase();
+            for (const [name, skill] of state.listingByName) {
+                if (catalogNames.has(name)) continue;
+                if (!skill.published || typeof skill.published !== 'object') continue;
+                if (query && !name.toLowerCase().includes(query)) continue;
+                state.results.push({
+                    slug: name,
+                    sanitized_name: name,
+                    display_name: name,
+                    summary: String(skill.description || ''),
+                    latest_version: '',
+                    listing_only: true,
+                });
             }
             renderCards();
             show(`${state.results.length} official skill${state.results.length === 1 ? '' : 's'}`, 'muted');

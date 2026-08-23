@@ -457,7 +457,7 @@
  * @typedef {Object} SkillReviewHistoryRowFields
  * @property {string=} skill
  * @property {string=} status
- * @property {string=} content_hash
+ * @property {string} content_hash
  * @property {string=} job_id
  * @property {number=} review_round
  * @property {number=} snapshot_attempt
@@ -601,7 +601,7 @@
  * @property {string[]=} permissions
  * @property {string[]=} conflicts
  * @property {{code: "skill_conflict", skills: string[], omitted: number}=} conflict
- * @property {string=} content_hash
+ * @property {string} content_hash
  * @property {?{slug: string, version: string, content_hash: string, repository: string, pr_number: number, pr_url: string, published_at: string}=} published
  * @property {boolean=} published_malformed
  * @property {boolean=} identity_collision
@@ -616,7 +616,7 @@
  * @property {string} slug
  * @property {string} sanitized_name
  * @property {string} latest_version
- * @property {boolean=} identity_conflict
+ * @property {boolean} identity_conflict
  */
 
 /**

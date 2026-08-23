@@ -18,7 +18,7 @@ import uuid
 
 from ouroboros.marketplace import AllowlistRedirectHandler
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.config import get_ouroboroshub_catalog_url, get_ouroboroshub_skills_dir
 from ouroboros.marketplace.fetcher import FetchError, land_staged_tree
@@ -360,8 +360,12 @@ def install_identity_error(
     )
 
 
-def install(slug: str, *, overwrite: bool = False) -> HubInstallResult:
-    catalog = load_catalog()
+def install(slug: str, *, overwrite: bool = False, catalog: Optional[Dict[str, Any]] = None) -> HubInstallResult:
+    # ``catalog`` lets the adopt transaction reuse its prelude fetch: no second
+    # network read (whose failure would be an untyped 400 instead of the typed
+    # 502), and no version drift between the confirm dialog and the download.
+    if catalog is None:
+        catalog = load_catalog()
     raw_base = str(catalog.get("raw_base_url") or "").rstrip("/")
     summary = next((item for item in _summaries(catalog) if item.slug == slug), None)
     if summary is None:
@@ -658,6 +662,8 @@ class _AdoptContext:
     dest_dir: pathlib.Path
     state_snapshot: Dict[str, Optional[bytes]]
     was_live: bool = False
+    desired_live: bool = False
+    catalog: Optional[Dict[str, Any]] = None
 
 
 def _adopt_refusal(sanitized: str, error: str, code: str = "", **extra: Any) -> Dict[str, Any]:
@@ -678,8 +684,9 @@ def _reconcile_extension_quiet(name: str, drive_root: pathlib.Path) -> None:
         log.debug("adopt reconcile failed for %s", name, exc_info=True)
 
 
-def _restore_adopt_state(drive_root: pathlib.Path, name: str, snapshot: Dict[str, Optional[bytes]]) -> None:
+def _restore_adopt_state(drive_root: pathlib.Path, name: str, snapshot: Dict[str, Optional[bytes]]) -> List[str]:
     """Byte-restore the state quintet; files absent pre-adopt are removed."""
+    errors: List[str] = []
     state_dir = skill_state_dir(pathlib.Path(drive_root), name)
     for filename, blob in snapshot.items():
         path = state_dir / filename
@@ -690,34 +697,62 @@ def _restore_adopt_state(drive_root: pathlib.Path, name: str, snapshot: Dict[str
                 tmp = path.with_name(path.name + ".adopt-restore.tmp")
                 tmp.write_bytes(blob)
                 tmp.replace(path)
-        except OSError:
+        except OSError as exc:
             log.error("adopt rollback could not restore state file %s for %s", filename, name, exc_info=True)
+            errors.append(f"state:{filename}: {type(exc).__name__}: {exc}")
+    return errors
 
 
-def _adopt_rollback(ctx: _AdoptContext) -> None:
-    """§7.3 rollback: remove dest payload, restore source payload + state quintet, reconcile."""
-    if ctx.dest_dir.exists():
-        shutil.rmtree(ctx.dest_dir, ignore_errors=True)
+def _adopt_rollback(ctx: _AdoptContext) -> List[str]:
+    """§7.3 rollback: remove dest, restore source payload + state quintet, reconcile.
+
+    Returns the list of restore failures. An empty list is the only state the
+    caller may report as ``rolled_back: true`` — a swallowed filesystem error
+    here previously let the API claim a completed rollback over a missing or
+    duplicated occupant (final-gate fault injection).
+    """
+    errors: List[str] = []
+    try:
+        if ctx.dest_dir.exists():
+            shutil.rmtree(ctx.dest_dir)
+    except OSError as exc:
+        log.error("adopt rollback could not remove the dest payload for %s", ctx.name, exc_info=True)
+        errors.append(f"dest_remove: {type(exc).__name__}: {exc}")
     try:
         if ctx.aside_dir.exists() and not ctx.source_dir.exists():
             ctx.source_dir.parent.mkdir(parents=True, exist_ok=True)
             ctx.aside_dir.rename(ctx.source_dir)
-    except OSError:
+        elif not ctx.aside_dir.exists() and not ctx.source_dir.exists():
+            errors.append("source_restore: aside tree missing and source absent")
+    except OSError as exc:
         log.error("adopt rollback could not restore source payload for %s", ctx.name, exc_info=True)
-    _restore_adopt_state(ctx.drive_root, ctx.name, ctx.state_snapshot)
+        errors.append(
+            f"source_restore: {type(exc).__name__}: {exc} (source preserved at {ctx.aside_dir})"
+        )
+    errors.extend(_restore_adopt_state(ctx.drive_root, ctx.name, ctx.state_snapshot))
     if ctx.was_live:
         _reconcile_extension_quiet(ctx.name, ctx.drive_root)
+    return errors
 
 
-def _adopt_finalize(ctx: _AdoptContext) -> None:
-    """Retain the moved-aside source as the depth-1 pre-adopt snapshot (§7.3)."""
+def _adopt_finalize(ctx: _AdoptContext) -> Tuple[bool, str]:
+    """Retain the moved-aside source as the depth-1 pre-adopt snapshot (§7.3).
+
+    Returns ``(retained, error)``; the adopt itself already succeeded, so a
+    retention failure is DISCLOSED on the success payload
+    (``pre_adopt_retained: false`` + ``retention_error``), never silently
+    swallowed — the aside tree stays in the dot-prefixed rollback area.
+    """
     keep = ctx.aside_dir.parent / f"{ctx.name}.pre-adopt"
     try:
         if keep.exists():
-            shutil.rmtree(keep, ignore_errors=True)
+            shutil.rmtree(keep)
         ctx.aside_dir.rename(keep)
-    except OSError:
+        return True, ""
+    except OSError as exc:
         log.warning("adopt could not retain the pre-adopt snapshot for %s", ctx.name, exc_info=True)
+        note = f"{type(exc).__name__}: {exc} (source preserved at {ctx.aside_dir})"
+        return False, note
 
 
 def _adopt_begin(slug: str, drive_root: pathlib.Path, expected_content_hash: str):
@@ -796,6 +831,16 @@ def _adopt_begin(slug: str, drive_root: pathlib.Path, expected_content_hash: str
         unload_extension(sanitized)
     except Exception:
         log.debug("pre-adopt extension unload failed for %s", sanitized, exc_info=True)
+    # Post-install reconcile must run for every ENABLED occupant, not only a
+    # LIVE one: an enabled extension whose previous load failed is exactly the
+    # case the strict load_error check exists for (final-gate finding).
+    desired_live = was_live
+    try:
+        from ouroboros.skill_loader import load_enabled
+
+        desired_live = was_live or bool(load_enabled(drive_root, sanitized))
+    except Exception:
+        log.debug("adopt enabled-state read failed for %s", sanitized, exc_info=True)
 
     try:
         state_dir = skill_state_dir(drive_root, sanitized)
@@ -819,12 +864,21 @@ def _adopt_begin(slug: str, drive_root: pathlib.Path, expected_content_hash: str
         except Exception:
             aside_live = ""
         if aside_live != expected_content_hash:
-            aside_dir.rename(selected.skill_dir)
+            try:
+                aside_dir.rename(selected.skill_dir)
+                restore_note = ""
+            except OSError as exc:
+                # The rename-back can lose a race with exactly the concurrent
+                # writer a CAS mismatch implies; never strand the payload
+                # silently — name where it survives.
+                log.error("adopt CAS-mismatch restore failed for %s", sanitized, exc_info=True)
+                restore_note = f" SOURCE NOT RESTORED ({type(exc).__name__}); preserved at {aside_dir}"
             if was_live:
                 _reconcile_extension_quiet(sanitized, drive_root)
             return _adopt_refusal(
                 sanitized,
-                "local payload changed between confirmation and replacement - refresh the skill card and confirm again",
+                "local payload changed between confirmation and replacement - refresh the skill card and confirm again"
+                + restore_note,
                 "adopt_cas_mismatch",
                 live_content_hash=aside_live,
             )
@@ -844,6 +898,8 @@ def _adopt_begin(slug: str, drive_root: pathlib.Path, expected_content_hash: str
         dest_dir=get_ouroboroshub_skills_dir() / sanitized,
         state_snapshot=state_snapshot,
         was_live=was_live,
+        desired_live=desired_live,
+        catalog=catalog,
     )
 
 
@@ -885,34 +941,44 @@ async def run_hub_adopt(
         return prelude
     ctx: _AdoptContext = prelude
 
-    async def _rollback() -> None:
-        await run_blocking(
+    async def _rollback() -> List[str]:
+        return await run_blocking(
             _adopt_rollback,
             ctx,
             log_label="OuroborosHub adopt rollback lifecycle operation",
         )
+
+    def _stamp_rollback(payload: Dict[str, Any], errors: List[str]) -> None:
+        # rolled_back is a VERIFIED claim: true only when every restore step
+        # landed. A partial rollback is disclosed with its exact failures.
+        payload["rolled_back"] = not errors
+        if errors:
+            payload["rollback_errors"] = errors
+            payload["error"] = (
+                str(payload.get("error") or "adopt failed")
+                + " ROLLBACK INCOMPLETE: " + "; ".join(errors)
+            )
 
     try:
         progress.set("Downloading from OuroborosHub…")
         result = await run_blocking(
             install,
             slug,
+            catalog=ctx.catalog,
             log_label="OuroborosHub adopt install lifecycle operation",
         )
         payload = serialize_hub_install_result(result)
         if not result.ok:
-            await _rollback()
-            payload["rolled_back"] = True
+            _stamp_rollback(payload, await _rollback())
             return payload
         status, error, deps_status = await apply_review_and_deps(payload, result.sanitized_name)
         if deps_status == "failed" or error or not review_status_allows_execution(status):
-            await _rollback()
             payload["ok"] = False
-            payload["rolled_back"] = True
             if not payload.get("error"):
                 payload["error"] = error or f"review status {status!r} does not allow execution"
+            _stamp_rollback(payload, await _rollback())
             return payload
-        if ctx.was_live:
+        if ctx.desired_live:
             reload_error = ""
             try:
                 from ouroboros.config import load_settings
@@ -937,24 +1003,27 @@ async def run_hub_adopt(
             if reload_error:
                 # Terminal for adopt (§7.3): never leave a hub payload that
                 # cannot load where a loadable local copy used to live.
-                await _rollback()
                 payload["ok"] = False
-                payload["rolled_back"] = True
                 payload["error"] = f"extension reload failed after adopt: {reload_error}"
+                _stamp_rollback(payload, await _rollback())
                 return payload
-        await run_blocking(
+        retained, retention_error = await run_blocking(
             _adopt_finalize,
             ctx,
             log_label="OuroborosHub adopt finalize lifecycle operation",
         )
         payload["adopted"] = True
+        payload["pre_adopt_retained"] = bool(retained)
+        if retention_error:
+            payload["retention_error"] = retention_error
         return payload
     except Exception as exc:
         log.warning("OuroborosHub adopt failed after move-aside for %s", sanitized, exc_info=True)
-        try:
-            await _rollback()
-        except Exception:
-            log.error("OuroborosHub adopt rollback itself failed for %s", sanitized, exc_info=True)
         payload = _adopt_refusal(sanitized, f"Adopt failed: {type(exc).__name__}: {exc}")
-        payload["rolled_back"] = True
+        try:
+            errors = await _rollback()
+        except Exception as rb_exc:
+            log.error("OuroborosHub adopt rollback itself failed for %s", sanitized, exc_info=True)
+            errors = [f"rollback_crashed: {type(rb_exc).__name__}: {rb_exc}"]
+        _stamp_rollback(payload, errors)
         return payload

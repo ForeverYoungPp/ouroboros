@@ -81,13 +81,17 @@ function sortSkillsForDisplay(skills) {
 // OuroborosHub catalog snapshot for the display-only My-skills sync badges
 // (hub_sync verdict). Fetched once per Skills page open and reused across
 // re-renders; fail-soft — a failed fetch only hides catalog-derived badges.
-const hubCatalog = { promise: null, available: false, byName: new Map() };
+const hubCatalog = { promise: null, available: false, byName: new Map(), generation: 0 };
 
 function loadHubCatalog(force = false) {
     if (force) hubCatalog.promise = null;
     if (!hubCatalog.promise) {
+        // Generation guard: only the NEWEST request may commit its snapshot,
+        // so a slow older response cannot overwrite fresher catalog state.
+        const generation = ++hubCatalog.generation;
         hubCatalog.promise = fetchJson('/api/marketplace/ouroboroshub/catalog')
             .then((data) => {
+                if (generation !== hubCatalog.generation) return;
                 const byName = new Map();
                 for (const row of data.results || []) {
                     const key = String(row.sanitized_name || row.slug || '');
@@ -97,12 +101,15 @@ function loadHubCatalog(force = false) {
                 hubCatalog.available = true;
             })
             .catch(() => {
+                if (generation !== hubCatalog.generation) return;
                 hubCatalog.byName = new Map();
                 hubCatalog.available = false;
             });
     }
     return hubCatalog.promise;
 }
+
+let skillsRenderGeneration = 0;
 
 
 async function fetchSkills() {
@@ -223,6 +230,7 @@ function updateQueueBadges(events) {
 async function renderSkillsList(container, emptyEl, reviewingSkills = new Set(), repairingSkills = new Set()) {
     // The hub catalog is display-only badge enrichment: it must never gate the
     // local cards (a cold external fetch can take the full server timeout).
+    const renderGeneration = ++skillsRenderGeneration;
     const catalogSettled = loadHubCatalog();
     const { skillsRepoConfigured, githubTokenConfigured, skills, live } = await fetchSkills();
     if (!skills.length && !skillsRepoConfigured) {
@@ -247,8 +255,10 @@ async function renderSkillsList(container, emptyEl, reviewingSkills = new Set(),
     };
     paint();
     catalogSettled.then(() => {
-        // Repaint only if this container is still mounted in the document.
-        if (container.isConnected) paint();
+        // Repaint only for the CURRENT render generation and a mounted
+        // container — an older render's stale skills array must never
+        // overwrite a newer paint (final-gate race finding).
+        if (renderGeneration === skillsRenderGeneration && container.isConnected) paint();
     }).catch(() => {});
 }
 

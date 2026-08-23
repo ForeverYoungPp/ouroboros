@@ -922,9 +922,15 @@ def _submit_skill_to_hub(
             receipt=receipt,
             expected_repository=expected_repository,
         )
-        # State-plane receipt write happens only AFTER serializer receipt validation.
+        # State-plane receipt write happens only AFTER serializer receipt
+        # validation — and maps from the VALIDATED envelope receipt (canonical
+        # repository spelling, normalized fields), never the raw input.
+        try:
+            validated_receipt = json.loads(serialized).get("receipt") or receipt
+        except Exception:
+            validated_receipt = receipt
         recorded, record_error = _record_publication_receipt(
-            ctx, safe_skill, snapshot.manifest.version, receipt,
+            ctx, safe_skill, snapshot.manifest.version, validated_receipt,
         )
         try:
             # Re-serialize with the annotation INSIDE the cap loop so the added
