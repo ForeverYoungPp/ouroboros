@@ -1352,7 +1352,7 @@ class BackgroundConsciousness:
                     current = path.read_text(encoding="utf-8")
                     if str(result) == current and result_str == current:
                         self._identity_source_reads[topic] = hashlib.sha256(
-                            current.encode("utf-8")
+                            path.read_bytes()
                         ).hexdigest()
                 except Exception:
                     pass
