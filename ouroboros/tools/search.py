@@ -32,6 +32,21 @@ DEFAULT_SEARCH_CONTEXT_SIZE = "medium"
 DEFAULT_REASONING_EFFORT = "high"
 
 
+def _web_search_transport_timeout(ctx: Any) -> float:
+    """One per-attempt dead-socket bound, narrowed by the owner deadline."""
+    from ouroboros.config import get_websearch_timeout_sec
+    from ouroboros.deadline_utils import transport_timeout_with_deadline
+    from ouroboros.task_pacing import effective_finalization_reserve_sec
+
+    metadata = getattr(ctx, "task_metadata", {})
+    deadline_at = metadata.get("deadline_at") if isinstance(metadata, dict) else None
+    return transport_timeout_with_deadline(
+        get_websearch_timeout_sec(),
+        deadline_at=deadline_at,
+        reserve_sec=effective_finalization_reserve_sec(ctx),
+    )
+
+
 def _accounting_scope(ctx: ToolContext, source: str) -> UsageScope:
     bound_scope = current_usage_scope()
     if bound_scope is not None:
@@ -224,6 +239,7 @@ def _web_search_openrouter(ctx: ToolContext, query: str, model: str = "", search
                 query=query,
                 search_context_size=search_context_size or DEFAULT_SEARCH_CONTEXT_SIZE,
                 accounting_scope=_accounting_scope(ctx, "web_search.openrouter"),
+                timeout=_web_search_transport_timeout(ctx),
             )
         message = response.choices[0].message if getattr(response, "choices", None) else None
         text = str(getattr(message, "content", "") or "").strip()
@@ -272,6 +288,7 @@ def _web_search_anthropic(ctx: ToolContext, query: str, model: str = "") -> str:
                 model=active_model,
                 query=query,
                 accounting_scope=_accounting_scope(ctx, "web_search.anthropic"),
+                timeout=_web_search_transport_timeout(ctx),
             )
         blocks = _obj_to_plain(getattr(response, "content", []) or [])
         text_parts: list[str] = []
@@ -426,18 +443,8 @@ def _web_search(
 
     try:
         from openai import OpenAI
-        from ouroboros.config import (
-            get_finalization_grace_sec,
-            get_websearch_timeout_sec,
-        )
-        from ouroboros.deadline_utils import deadline_remaining_sec, has_deadline
-        transport_timeout = float(get_websearch_timeout_sec())
-        if has_deadline(ctx):
-            remaining = deadline_remaining_sec(ctx) - float(get_finalization_grace_sec())
-            transport_timeout = max(
-                1.0,
-                min(transport_timeout, remaining),
-            )
+        from ouroboros.config import get_finalization_grace_sec
+        transport_timeout = _web_search_transport_timeout(ctx)
         # Explicit transport timeout (v6.54.3, D): without it the streaming SDK
         # call had NO client bound, so the ToolEntry 540s outer thread-kill was
         # the only stop for a wedged stream.

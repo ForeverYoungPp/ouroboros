@@ -155,14 +155,6 @@ def _caption_for_block(
         except Exception:
             pass
         caption = str(text or "").strip()
-        emit_cognitive_operation_event(
-            event_queue,
-            task_id=task_id,
-            operation_id=call_id,
-            phase="finished",
-            kind="vlm",
-            task_attempt=getattr(ctx, "task_attempt", None),
-        )
         if drive_root is not None:
             persist_call(
                 drive_root,
@@ -172,6 +164,14 @@ def _caption_for_block(
                 payload={"caption": caption, "usage": usage, "prompt_ref": prompt_ref},
                 manifest={"model": model},
             )
+        emit_cognitive_operation_event(
+            event_queue,
+            task_id=task_id,
+            operation_id=call_id,
+            phase="finished",
+            kind="vlm",
+            task_attempt=getattr(ctx, "task_attempt", None),
+        )
     except Exception as exc:
         emit_cognitive_operation_event(
             event_queue,

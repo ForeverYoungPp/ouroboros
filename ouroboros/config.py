@@ -989,7 +989,7 @@ def get_safety_call_timeout_sec() -> float:
 
 
 def get_websearch_timeout_sec() -> float:
-    """Transport timeout for the web_search OpenAI streaming call (v6.54.3, D)."""
+    """Per-attempt transport timeout for provider-backed web_search calls."""
     return _clamped_number_setting("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", low=30.0, high=3600.0)
 
 

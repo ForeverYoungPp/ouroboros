@@ -37,6 +37,16 @@ def test_transport_timeout_is_narrowed_by_numeric_owner_deadline(monkeypatch):
     assert deadlines.transport_timeout_with_deadline(90, deadline_ts=999.0) == 0.001
 
 
+def test_spent_web_search_deadline_never_reverts_to_the_provider_default(monkeypatch):
+    from types import SimpleNamespace
+    from ouroboros.tools.search import _web_search_transport_timeout
+
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "480")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+    ctx = SimpleNamespace(task_metadata={"deadline_at": "2000-01-01T00:00:00Z"})
+    assert _web_search_transport_timeout(ctx) == 0.001
+
+
 def test_bounded_engine_seconds_never_widens_explicit_zero():
     from ouroboros.deadline_utils import bounded_seconds
 
@@ -275,3 +285,37 @@ def test_forced_finalization_does_not_rebase_existing_grace(monkeypatch, tmp_pat
         reason_code="finalization_grace",
     )
     assert ctx.deadline_ts == deadline
+
+
+def test_expired_supervisor_grace_does_not_dispatch_a_paid_final_call(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    import time
+    import ouroboros.loop as loop_mod
+
+    observed = {}
+    ctx = loop_mod._RoundLimitContext(
+        messages=[], llm=object(), active_model="model", active_effort="high",
+        max_retries=1, drive_logs=tmp_path / "logs", task_id="task", round_idx=1,
+        event_queue=None, accumulated_usage={}, task_type="task",
+        active_use_local=False, max_rounds=1, deadline_ts=time.time() - 1,
+        tools=SimpleNamespace(_ctx=SimpleNamespace()), llm_trace={},
+    )
+    monkeypatch.setattr(loop_mod, "_finalize_forced_services", lambda *_args: None)
+    monkeypatch.setattr(
+        loop_mod,
+        "_forced_final_answer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("paid final call")),
+    )
+
+    def fake_fallback(_ctx, _trace, text, reason, **kwargs):
+        observed.update(text=text, reason=reason, **kwargs)
+        return text, _ctx.accumulated_usage, _trace
+
+    monkeypatch.setattr(loop_mod, "_forced_fallback_result", fake_fallback)
+    result = loop_mod._handle_forced_finalization(ctx, "idle_timeout")
+    assert result[0].startswith("⚠️ Task reached idle_timeout")
+    assert observed["source"] == "finalization_grace_window_elapsed"
+    assert ctx.accumulated_usage == {
+        "execution_status": "failed",
+        "reason_code": "finalization_grace",
+    }

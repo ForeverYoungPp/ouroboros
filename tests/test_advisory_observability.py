@@ -980,6 +980,26 @@ class TestLLMFallbackExtraction:
         result = self.mod._llm_extract_advisory_items(raw_text, self._make_ctx())
         assert result == expected
 
+    def test_fallback_extraction_inherits_the_owner_deadline(self, monkeypatch):
+        from datetime import datetime, timedelta, timezone
+
+        captured = {}
+        expected = [self._item("code_quality")]
+
+        def fake_chat(_self, **kwargs):
+            captured.update(kwargs)
+            return {"content": json.dumps(expected)}, {"cost": 0.001}
+
+        import ouroboros.llm as llm_mod
+        monkeypatch.setattr(llm_mod.LLMClient, "chat", fake_chat)
+        monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "1")
+        ctx = self._make_ctx()
+        ctx.task_metadata = {
+            "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat(),
+        }
+        assert self.mod._llm_extract_advisory_items("narrative", ctx) == expected
+        assert 0 < captured["timeout"] <= 4.1
+
     def test_mid_artifact_critical_survives_the_verdict(self, monkeypatch):
         """A critical raised in the MIDDLE of a long advisory must reach the verdict.
 

@@ -146,6 +146,45 @@ def test_caption_call_records_observability(monkeypatch, tmp_path):
     assert [event.get("phase") for event in operation_rows] == ["started", "finished"]
 
 
+def test_caption_persistence_failure_emits_one_failed_terminal(monkeypatch, tmp_path):
+    import queue
+    from ouroboros import vision_routing
+    from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
+
+    class FakeLLM:
+        def default_model(self):
+            return "google/gemini-3.5-flash"
+
+        def vision_query(self, *args, **kwargs):
+            return "fresh caption", {"cost": 0.01}
+
+    def fake_persist(_root, **kwargs):
+        if kwargs["call_type"] == "vision_caption_response":
+            raise OSError("response receipt unavailable")
+        return {"manifest_ref": "request.json"}
+
+    monkeypatch.setattr(vision_routing, "persist_call", fake_persist)
+    monkeypatch.setenv("OUROBOROS_IMAGE_INPUT_MODE", "caption")
+    monkeypatch.setenv("OUROBOROS_MODEL_VISION", "google/gemini-3.5-flash")
+    messages = _image_message()
+    messages[0]["content"][1].pop("_caption")
+    events = queue.Queue()
+    out = prepare_messages_for_send(
+        messages,
+        routing=VisionRoutingContext(
+            "not/vision", FakeLLM(), {}, drive_root=tmp_path,
+            task_id="task-1", event_queue=events,
+        ),
+    )
+    assert "caption unavailable" in out[0]["content"][1]["text"]
+    phases = []
+    while not events.empty():
+        event = events.get_nowait()
+        if event.get("type") == "cognitive_operation":
+            phases.append(event.get("phase"))
+    assert phases == ["started", "failed"]
+
+
 def test_caption_mode_does_not_treat_bracket_label_as_real_caption(monkeypatch):
     from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
 

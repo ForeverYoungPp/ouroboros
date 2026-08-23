@@ -1678,6 +1678,9 @@ Before every commit, verify the following:
   ceilings, not promises to run past the owner deadline. Delegated review uses
   an opt-in strict poll bound for the remaining logical window; the general
   delegate-wait floor remains unchanged for its existing transport contract.
+  Default reviewer slots intentionally have no short 300-second cognition cap:
+  an explicit slot window narrows them, otherwise the owner deadline and then
+  the transport settlement bound apply.
 - [ ] Every physical LLM/review/VLM/tool operation that can outlive a logical
   wait emits a typed `cognitive_operation` start and terminal fact. The
   supervisor uses the active-operation map only to spare the idle rail; the

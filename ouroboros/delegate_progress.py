@@ -445,8 +445,9 @@ def expiring_poll(
 ) -> Optional[Dict[str, Any]]:
     """The poll of a SPENT window. ``None`` when the daemon did not answer inside it.
 
-    A spent window still takes its poll rather than skipping it, at the floor: skipping
-    looked like the cheap trade and cost more, because terminal state and containment
+    A spent window still takes its poll rather than skipping it. The ordinary path uses
+    the short-poll floor; strict owner-deadline callers use their 1 ms total wall bound.
+    Skipping looked like the cheap trade and cost more, because terminal state and containment
     breach were then judged on data read BEFORE the last sleep — a run that finished
     during that sleep came back as ``progress``/``running`` with no settlement, and the
     model paid another full-context round for a run already done.

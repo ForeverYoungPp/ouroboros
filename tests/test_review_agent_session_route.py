@@ -438,6 +438,22 @@ def test_extraction_never_fabricates_a_clean_verdict():
     assert method == "unparsed"
 
 
+def test_light_extraction_transport_is_narrowed_by_the_request_deadline(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "1")
+    llm = FakeLLM(reply="[]")
+    deadline = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    text, method, _usage = canonicalize_session_verdict(
+        "narrative: clean",
+        conformance_passed=False,
+        llm=llm,
+        deadline_at=deadline,
+    )
+    assert method == "light_model_extraction" and text == "[]"
+    assert 0 < llm.calls[0]["timeout"] <= 4.1
+
+
 def test_a_fenced_verdict_stays_unparsed_at_this_layer():
     """Disclosed residual (audit 2026-08-05): a verdict wrapped in a ```json
     fence that only the coordinator's downstream scanner parses is telemetered
@@ -1350,8 +1366,12 @@ def test_session_is_never_restarted_for_format_repair(tmp_path, fake_route):
     fake_route.manifest_capabilities = {}
     fake_route.detail = _terminal_detail("prose without a verdict")
     llm = FakeLLM(reply="UNEXTRACTABLE")
+    from datetime import datetime, timedelta, timezone
+
+    deadline = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
     executor = AgentSessionReviewExecutor(
-        ReviewAssignment(request=_agent_request(), slot=_agent_slot(),
+        ReviewAssignment(request=_agent_request(deadline_at=deadline),
+                         slot=_agent_slot(transport_timeout_sec=17),
                          call_id="c1", call_type="scope_review",
                          custody_root=tmp_path),
         llm=llm,
@@ -1362,6 +1382,8 @@ def test_session_is_never_restarted_for_format_repair(tmp_path, fake_route):
     assert len(fake_route.instances[0].start_requests) == 1
     assert first.raw_text == second.raw_text == "prose without a verdict"
     assert len(llm.calls) == 2  # local extraction ran each time, no new session
+    assert all(0 < call["timeout"] <= 17 for call in llm.calls)
+    assert llm.calls[1]["timeout"] <= llm.calls[0]["timeout"]
 
 
 # ---------------------------------------------------------------------------
@@ -2434,6 +2456,27 @@ def test_slot_timeout_raise_carries_the_honest_cancel_outcome(
     if outcome != "confirmed":
         assert "host-cancelled" not in text
         assert outcome in text
+    assert stub.cancels == ["review_slot_timeout"]
+
+
+def test_clock_crossing_between_timeout_checks_still_cancels_the_running_session(
+        tmp_path, monkeypatch):
+    """The second clock read may cross the deadline before sleep is entered."""
+    from ouroboros import review_execution as rx
+
+    ticks = iter([0.0, 0.0, 0.5, 1.1, 1.2])
+    monkeypatch.setattr(rx.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        rx,
+        "_poll_detail",
+        lambda *_args, **_kwargs: {"lastSeq": 1, "summary": {"state": "running"}},
+    )
+    stub = _OutcomeCustodyStub("confirmed")
+    with pytest.raises(TimeoutError, match="exceeded the slot budget"):
+        rx._poll_session_terminal(
+            _RunningGateway(), stub, tmp_path,
+            SimpleNamespace(run_id="run-cross"), "run-cross", 1.0,
+        )
     assert stub.cancels == ["review_slot_timeout"]
 
 

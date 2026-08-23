@@ -583,11 +583,8 @@ def _strictly_parseable(text: str) -> bool:
 
 
 def canonicalize_session_verdict(
-    raw_text: str,
-    *,
-    conformance_passed: bool,
-    contract: str = "",
-    llm: Any = None,
+    raw_text: str, *, conformance_passed: bool, contract: str = "", llm: Any = None,
+    deadline_at: Any = None, transport_timeout_sec: Any = None,
 ) -> tuple[str, str, Dict[str, Any]]:
     """Return ``(canonical_text, method, extraction_usage)`` for a session answer.
 
@@ -618,7 +615,9 @@ def canonicalize_session_verdict(
         return text, "strict", {}
     if len(text) > _EXTRACT_MAX_CHARS:
         return text, "extraction_incomplete", {}
-    canonical, usage = _extract_verdict_via_light_model(text, contract=contract, llm=llm)
+    canonical, usage = _extract_verdict_via_light_model(
+        text, contract=contract, llm=llm, deadline_at=deadline_at,
+        transport_timeout_sec=transport_timeout_sec)
     if canonical is not None:
         return canonical, "light_model_extraction", usage
     # `unparsed` is the honest end of THIS layer's knowledge. The coordinator's
@@ -629,10 +628,9 @@ def canonicalize_session_verdict(
     # verdict that lands downstream is telemetered `unparsed` at this layer.
     return text, "unparsed", usage
 
-
 def _extract_verdict_via_light_model(
-    raw_text: str, *, contract: str = "", llm: Any = None,
-) -> tuple[Optional[str], Dict[str, Any]]:
+    raw_text: str, *, contract: str = "", llm: Any = None, deadline_at: Any = None,
+    transport_timeout_sec: Any = None) -> tuple[Optional[str], Dict[str, Any]]:
     """One bounded light-model call canonicalizing narrative to the contract."""
     from ouroboros.config import get_light_model
     from ouroboros.usage_accounting import physical_attempt_limit
@@ -659,16 +657,16 @@ def _extract_verdict_via_light_model(
         # sub-labeled `review_substrate.extraction`, so the small light-model
         # rows beside the $0.00 subscription settlements read as what they are —
         # verdict extraction, not review-slot spend.
-        _scope = _replace(current_usage_scope() or UsageScope(),
-                          source="review_substrate.extraction")
+        _scope = _replace(current_usage_scope() or UsageScope(), source="review_substrate.extraction")
+        chat_kwargs = dict(
+            messages=[{"role": "user", "content": prompt}], model=model,
+            max_tokens=8192, reasoning_effort="low", no_proxy=True,
+        )
+        transport = review_transport_timeout(model, transport_timeout_sec, deadline_at)
+        if transport is not None:
+            chat_kwargs["timeout"] = transport
         with physical_attempt_limit(1), usage_scope(_scope):
-            message, usage = llm.chat(
-                messages=[{"role": "user", "content": prompt}],
-                model=model,
-                max_tokens=8192,
-                reasoning_effort="low",
-                no_proxy=True,
-            )
+            message, usage = llm.chat(**chat_kwargs)
     except Exception as exc:
         log.warning("Review session verdict extraction failed: %s", exc)
         return None, {}
@@ -1213,7 +1211,7 @@ def _poll_session_terminal(gateway: Any, custody: Any, custody_drive: Any, entry
             )
         remaining = max(0.0, deadline - time.monotonic())
         if remaining <= 0:
-            break
+            continue
         time.sleep(min(_SESSION_POLL_SEC, remaining))
         remaining = max(0.0, deadline - time.monotonic())
         detail = _poll_detail(gateway, run_id, remaining)
@@ -1484,8 +1482,8 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 "reason": "session_route_resolves_its_own_model",
             })
         self._raw_transcript = facts["text"]
-        self._transcript = "" if (facts.get("profile_continuity_receipt") or {}).get(
-            "status") == "cannot_verify" else self._raw_transcript
+        continuity = (facts.get("profile_continuity_receipt") or {}).get("status")
+        self._transcript = "" if continuity == "cannot_verify" else self._raw_transcript
 
     def _verdict_result(self, force_extraction: bool = False) -> ReviewAttemptResult:
         text = self._raw_transcript
@@ -1494,6 +1492,8 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             conformance_passed=self._conformance_passed and not force_extraction,
             contract=self._output_contract(),
             llm=self.llm,
+            deadline_at=getattr(self.assignment.request, "deadline_at", "") or "",
+            transport_timeout_sec=getattr(self.assignment.slot, "transport_timeout_sec", None),
         )
         usage = dict(self._session_usage)
         deltas = list(self._deltas)

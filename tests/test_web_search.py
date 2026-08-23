@@ -205,6 +205,45 @@ def test_web_search_falls_back_to_openrouter_server_tool(monkeypatch):
     assert ctx.pending_events[0]["provider"] == "openrouter"
 
 
+def test_provider_owned_search_recomputes_the_owner_bounded_timeout(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from ouroboros import llm
+
+    captured = {}
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test-key")
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "480")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+    ctx = types.SimpleNamespace(
+        pending_events=[],
+        task_metadata={
+            "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=150)).isoformat(),
+        },
+    )
+
+    def fake_openrouter(**kwargs):
+        captured["openrouter"] = kwargs["timeout"]
+        message = types.SimpleNamespace(content="openrouter answer")
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)], usage=None)
+
+    def fake_anthropic(**kwargs):
+        captured["anthropic"] = kwargs["timeout"]
+        block = types.SimpleNamespace(type="text", text="anthropic answer")
+        return types.SimpleNamespace(content=[block], usage=None)
+
+    monkeypatch.setattr(llm, "openrouter_web_search_server_tool", fake_openrouter)
+    monkeypatch.setattr(llm, "anthropic_web_search_server_tool", fake_anthropic)
+    assert json.loads(search_module._web_search_openrouter(ctx, "q"))["answer"] == "openrouter answer"
+    assert json.loads(search_module._web_search_anthropic(ctx, "q"))["answer"] == "anthropic answer"
+    assert 0 < captured["anthropic"] <= captured["openrouter"] <= 31
+
+
+def test_provider_owned_search_without_deadline_uses_the_configured_transport_cap(monkeypatch):
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "321")
+    ctx = types.SimpleNamespace(task_metadata={})
+    assert search_module._web_search_transport_timeout(ctx) == 321
+
+
 def test_web_search_falls_back_to_ddgs(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)

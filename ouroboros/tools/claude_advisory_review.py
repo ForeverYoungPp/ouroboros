@@ -480,6 +480,7 @@ def _llm_extract_advisory_items(raw_text: str, ctx: object) -> list:
             # the trusted-schema branch is never taken on this path.
             conformance_passed=False,
             contract=_ADVISORY_EXTRACT_CONTRACT,
+            deadline_at=(getattr(ctx, "task_metadata", {}) or {}).get("deadline_at"),
         )
         if method == "extraction_incomplete":
             log.warning(

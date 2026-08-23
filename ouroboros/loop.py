@@ -3423,20 +3423,20 @@ def _handle_round_limit(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], D
 
 
 def _handle_forced_finalization(ctx: _RoundLimitContext, reason: str) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Cooperative finalize-and-exit when the supervisor opens a grace window.
-
-    The supervisor sends a typed finalize_now control through the owner
-    mailbox when the task deadline/hard-timeout is reached; this extracts one
-    tool-less best final answer inside the grace window so a deadline NEVER
-    returns emptiness. An OWNER-STOP control (its payload's first line is the
-    typed ``owner_requested_finalization`` literal, optionally followed by the
-    bounded child projection) routes to its own rail: the owner's stop must
-    never persist the deadline's false reason (CF-02).
-    """
+    """Cooperatively finalize; an expired grace never buys a paid call."""
     reason_lines = str(reason or "").splitlines()
     if reason_lines and reason_lines[0].strip() == REASON_OWNER_REQUESTED_FINALIZATION:
         return _handle_owner_stop_finalization(ctx, str(reason))
     fallback = f"⚠️ Task reached {reason or 'deadline'}; finalization grace produced no answer."
+    if ctx.deadline_ts is not None and time.time() >= float(ctx.deadline_ts):
+        llm_trace = ctx.llm_trace if isinstance(ctx.llm_trace, dict) else {}
+        _finalize_forced_services(ctx, llm_trace)
+        ctx.accumulated_usage.update(
+            execution_status="failed", reason_code="finalization_grace")
+        return _forced_fallback_result(
+            ctx, llm_trace, fallback, "finalization_grace",
+            source="finalization_grace_window_elapsed",
+        )
     prompt = (
         f"[FINALIZE_NOW] The supervisor opened a finalization grace window (reason: {reason or 'deadline'}). "
         "The task will be stopped shortly. Produce your best final answer NOW from the verified "
