@@ -2088,6 +2088,7 @@ that:
 ### The commit gate mirrors the CI split
 
 `ouroboros/preflight_runner.py::run_hermetic_pytest` runs the node test lane
+(`NODE_OPTIONS` scrubbed, as `PYTEST_*` is for the pytest passes)
 plus the same two logical pytest passes as CI in one disposable checkout and
 scrubbed temporary data root. The
 candidate is captured universally — one hardened worktree-vs-`HEAD` binary diff
