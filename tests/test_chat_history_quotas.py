@@ -13,6 +13,7 @@ import json
 from types import SimpleNamespace
 
 from ouroboros.gateway.history import make_chat_history_endpoint
+from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS
 
 
 def _run_full(tmp_path, params):
@@ -484,3 +485,129 @@ def test_terminal_silent_child_older_than_floor_stays_dropped(tmp_path):
     msgs = _run(tmp_path, {"n_progress": "5"})
     lineage = [m for m in msgs if m.get("delegation_role") == "subagent"]
     assert lineage == []  # terminal quiet child does NOT resurface
+
+
+# --- Stream S: closed lineage window on chat FINALS (floor-symmetric strip) ---
+
+
+def _child_final_row(ts, task_id, *, lineage=True):
+    row = {
+        "ts": ts, "direction": "out", "chat_id": 1,
+        "text": "child answer", "task_id": task_id,
+    }
+    if lineage:
+        row.update({
+            "delegation_role": "subagent", "parent_task_id": "root",
+            "root_task_id": "root", "subagent_task_id": task_id,
+        })
+    return json.dumps(row)
+
+
+def _fresh_noise_lines(count=5):
+    return [
+        json.dumps({"ts": f"2026-06-05T02:00:{i:02d}Z", "content": f"noise-{i}",
+                    "task_id": "other"})
+        for i in range(count)
+    ]
+
+
+def test_stale_child_final_loses_raw_lineage_fields(tmp_path):
+    """NEG-1: a child FINAL chat row (raw lineage fields) older than a fresh
+    progress floor, with the child settled, loses every subagent lineage field
+    on the emitted payload — so the client cannot re-mint an orphaned
+    "Working" parent card whose own rows aged out of the window."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text(
+        _child_final_row("2026-06-01T00:00:00Z", "child") + "\n", encoding="utf-8",
+    )
+    # Fresh non-lineage telemetry NEWER than the child final -> fresh floor.
+    (logs / "progress.jsonl").write_text(
+        "\n".join(_fresh_noise_lines()) + "\n", encoding="utf-8",
+    )
+    results = tmp_path / "task_results"
+    results.mkdir()
+    (results / "root.json").write_text(
+        json.dumps({"task_id": "root", "status": "completed"}), encoding="utf-8",
+    )
+    (results / "child.json").write_text(
+        json.dumps({"task_id": "child", "status": "completed"}), encoding="utf-8",
+    )
+
+    row = next(m for m in _run(tmp_path, {}) if m.get("task_id") == "child")
+    assert row["text"] == "child answer"  # the row itself survives, de-roled
+    assert not any(field in row for field in SUBAGENT_MESSAGE_FIELDS)
+
+
+def test_stale_legacy_child_final_skips_task_result_revival(tmp_path):
+    """NEG-2: a legacy child FINAL (no raw lineage fields in chat.jsonl) older
+    than a fresh floor must NOT get lineage re-injected from task_results."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text(
+        _child_final_row("2026-06-01T00:00:00Z", "child-legacy", lineage=False) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text(
+        "\n".join(_fresh_noise_lines()) + "\n", encoding="utf-8",
+    )
+    results = tmp_path / "task_results"
+    results.mkdir()
+    (results / "root.json").write_text(
+        json.dumps({"task_id": "root", "status": "completed"}), encoding="utf-8",
+    )
+    (results / "child-legacy.json").write_text(json.dumps({
+        "task_id": "child-legacy", "status": "completed",
+        "delegation_role": "subagent", "parent_task_id": "root",
+        "root_task_id": "root", "role": "reviewer",
+    }), encoding="utf-8")
+
+    row = next(m for m in _run(tmp_path, {}) if m.get("task_id") == "child-legacy")
+    assert not any(field in row for field in SUBAGENT_MESSAGE_FIELDS)
+
+
+def test_stale_child_final_keeps_lineage_while_child_active(tmp_path, monkeypatch):
+    """POS-2: a child final older than the floor keeps its lineage when the
+    child is still ACTIVE (non-terminal effective status + in-window lineage
+    progress row makes it active_children-eligible)."""
+    import ouroboros.task_status as ts_mod
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text(
+        _child_final_row("2026-06-01T00:00:00Z", "child1") + "\n", encoding="utf-8",
+    )
+    lines = _fresh_noise_lines()
+    lines.append(_lineage_row("2026-06-05T02:00:06Z", "child1", "update"))
+    (logs / "progress.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        ts_mod, "load_effective_task_result",
+        lambda _dr, tid, **_kw: {"status": "running"} if tid == "child1" else {},
+    )
+
+    finals = [m for m in _run(tmp_path, {"n_progress": "5"})
+              if m.get("task_id") == "child1" and not m.get("is_progress")]
+    assert finals and finals[0]["delegation_role"] == "subagent"
+    assert finals[0]["parent_task_id"] == "root"
+
+
+def test_recent_child_final_keeps_lineage_fields(tmp_path):
+    """POS-3: a child final with ts >= floor keeps its lineage fields — fresh
+    swarms keep the nested-card UX."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text(
+        _child_final_row("2026-06-05T03:00:00Z", "child2") + "\n", encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text(
+        "\n".join(_fresh_noise_lines()) + "\n", encoding="utf-8",
+    )
+    results = tmp_path / "task_results"
+    results.mkdir()
+    (results / "child2.json").write_text(
+        json.dumps({"task_id": "child2", "status": "completed"}), encoding="utf-8",
+    )
+
+    row = next(m for m in _run(tmp_path, {}) if m.get("task_id") == "child2")
+    assert row["delegation_role"] == "subagent"
+    assert row["parent_task_id"] == "root"
