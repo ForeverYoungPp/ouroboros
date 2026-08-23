@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 from ouroboros.config import get_image_input_mode, get_vision_caption_timeout_sec, get_vision_model, resolve_effort
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.provider_models import supports_vision
+from ouroboros.utils import emit_cognitive_operation_event
 
 
 _CAPTION_PROMPT = (
@@ -29,6 +30,7 @@ class VisionRoutingContext:
     task_id: str = ""
     event_queue: Any = None
     use_local: bool = False
+    task_attempt: Any = None
 
 
 def resolve_vision_caption_model(ctx: Any, llm: Any, *, use_local: bool = False) -> str:
@@ -89,6 +91,14 @@ def _caption_for_block(
         return ""
     call_id = new_call_id("vision_caption")
     prompt_ref = {}
+    emit_cognitive_operation_event(
+        event_queue,
+        task_id=task_id,
+        operation_id=call_id,
+        phase="started",
+        kind="vlm",
+        task_attempt=getattr(ctx, "task_attempt", None),
+    )
     try:
         if drive_root is not None:
             prompt_ref = persist_call(
@@ -131,6 +141,14 @@ def _caption_for_block(
         except Exception:
             pass
         caption = str(text or "").strip()
+        emit_cognitive_operation_event(
+            event_queue,
+            task_id=task_id,
+            operation_id=call_id,
+            phase="finished",
+            kind="vlm",
+            task_attempt=getattr(ctx, "task_attempt", None),
+        )
         if drive_root is not None:
             persist_call(
                 drive_root,
@@ -141,6 +159,14 @@ def _caption_for_block(
                 manifest={"model": model},
             )
     except Exception as exc:
+        emit_cognitive_operation_event(
+            event_queue,
+            task_id=task_id,
+            operation_id=call_id,
+            phase="failed",
+            kind="vlm",
+            task_attempt=getattr(ctx, "task_attempt", None),
+        )
         caption = f"[image caption unavailable: {type(exc).__name__}: {exc}]"
     memo[key] = caption
     return caption

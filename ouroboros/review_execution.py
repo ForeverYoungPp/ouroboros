@@ -36,6 +36,8 @@ from ouroboros.triad_review import (
     empty_array_is_verified_clean,
     extract_json_array,
 )
+from ouroboros.provider_models import provider_for_model
+from ouroboros.deadline_utils import llm_transport_timeout_sec
 
 if TYPE_CHECKING:  # annotations only — importing the substrate here would cycle
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot
@@ -86,6 +88,10 @@ class ReviewSessionWaitingOnUser(RuntimeError):
     deliberate non-goal (owner: no acceptance host-wait; see docs/ARCHITECTURE.md).
     """
 
+
+def _poll_detail(gateway: Any, run_id: str, seconds: float) -> Dict[str, Any]:
+    from ouroboros.delegate_progress import bounded_poll, expiring_poll
+    return bounded_poll(gateway, run_id, seconds) if seconds > 0 else (expiring_poll(gateway, run_id) or {})
 
 def _render_prompt_parts(request: ReviewRequest, slot: ReviewSlot) -> tuple[str, str, str]:
     """Return (stable_governance, task_stable, dynamic_evidence) for one slot.
@@ -350,10 +356,12 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
                 # slot_id in the key — same-model slots keep today's
                 # provider-concentration behavior.
                 "cache_affinity": f"{request.surface}:{request.task_id or 'review'}",
-                # Bound the socket to the logical slot timeout so a stalled
-                # connection cannot leave the whole review process unable to exit.
-                # The outer queue/wait_for still governs the logical deadline.
-                "timeout": float(slot.timeout_sec) if slot.timeout_sec else None,
+                "timeout": (
+                    llm_transport_timeout_sec(slot.transport_timeout_sec)
+                    if getattr(slot, "transport_timeout_sec", None) is not None
+                    or provider_for_model(slot.model) != "anthropic"
+                    else None
+                ),
                 "use_local": bool(slot.use_local),
             }
         return self._chat_kwargs
@@ -1142,29 +1150,11 @@ def _effective_route_carries_schema(gateway: Any, route_id: str) -> bool:
 
 def _poll_session_terminal(gateway: Any, custody: Any, custody_drive: Any, entry: Any,
                            run_id: str, seconds: float) -> Dict[str, Any]:
-    """Wait for the run's terminal state, bounded by the SLOT's own clock.
-
-    The nanny owns the time cap: on expiry the run is cancelled through the
-    verified-cancel path (an unverified stop must not read as stopped) and the
-    slot fails as an ordinary timeout on its own row.
-
-    A session that parks on an interactive question terminates the slot EARLY
-    (F18) — but only when the question has no engine expiry inside the slot's
-    remaining budget (``_interaction_outlives_slot``): review slots are
-    non-interactive, so such a question can only burn the slot in silence. The
-    run is cancelled through the same verified path under its own typed reason
-    and the failure names the pending question. A question whose ``timeout_at``
-    provably lands first is left to the engine's benign decline and the poll
-    continues (R2-2).
-
-    Both cancel sites are HONEST about what the cancel proved (BR1-1): the
-    typed outcome rides the raise, and a verify read that discovers a natural
-    SUCCESS terminal returns it as the slot's ordinary result instead of
-    raising over it — completion wins, no host-side waiting added."""
+    """Poll a delegated review run on the slot clock; verified cancel and
+    completion-wins semantics remain owned by the existing cancel seam."""
     from ouroboros.gateways.claudexor import pending_interactions as _cx_pending
-
     deadline = time.monotonic() + max(1.0, float(seconds))
-    detail = gateway.get_run(run_id)
+    detail = _poll_detail(gateway, run_id, max(0.0, deadline - time.monotonic()))
     while not custody.is_terminal(detail):
         pending = _cx_pending(detail)
         if (pending or bool(custody.summary_of(detail).get("waitingOnUser"))) \
@@ -1202,8 +1192,12 @@ def _poll_session_terminal(gateway: Any, custody: Any, custody_drive: Any, entry
                 f"of {seconds:g}s ("
                 + _cancel_honesty_clause(outcome, state) + ")"
             )
-        time.sleep(min(_SESSION_POLL_SEC, max(0.0, deadline - time.monotonic())))
-        detail = gateway.get_run(run_id)
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            break
+        time.sleep(min(_SESSION_POLL_SEC, remaining))
+        remaining = max(0.0, deadline - time.monotonic())
+        detail = _poll_detail(gateway, run_id, remaining)
     return detail
 
 
@@ -1379,6 +1373,12 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             raise ReviewRouteUnavailable(
                 "agent_session slot has no session root: the surface must name the "
                 "repository root the reviewer session runs in", code="session_root_missing")
+        from ouroboros.config import get_finalization_grace_sec
+        from ouroboros.deadline_utils import logical_operation_timeout_sec
+        logical_timeout = logical_operation_timeout_sec(getattr(slot, "timeout_sec", None),
+            deadline_at=getattr(request, "deadline_at", "") or "",
+            fallback=llm_transport_timeout_sec(getattr(slot, "transport_timeout_sec", None)),
+            reserve_sec=get_finalization_grace_sec())
         facts = run_delegated_review_session(
             prompt=self.session_prompt,
             root=root,
@@ -1387,7 +1387,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 task_id=str(request.task_id or ""),
                 surface=request.surface,
                 slot_id=slot.slot_id,
-                timeout_sec=float(slot.timeout_sec or 300),
+                timeout_sec=logical_timeout,
                 logical_key_extra=(self.assignment.call_id,),
                 output_schema=review_session_output_schema(request.surface),
                 session_route=self._session_route(),

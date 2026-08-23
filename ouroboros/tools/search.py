@@ -426,14 +426,25 @@ def _web_search(
 
     try:
         from openai import OpenAI
-        from ouroboros.config import get_websearch_timeout_sec
+        from ouroboros.config import (
+            get_finalization_grace_sec,
+            get_websearch_timeout_sec,
+        )
+        from ouroboros.deadline_utils import deadline_remaining_sec, has_deadline
+        transport_timeout = float(get_websearch_timeout_sec())
+        if has_deadline(ctx):
+            remaining = deadline_remaining_sec(ctx) - float(get_finalization_grace_sec())
+            transport_timeout = max(
+                1.0,
+                min(transport_timeout, remaining),
+            )
         # Explicit transport timeout (v6.54.3, D): without it the streaming SDK
         # call had NO client bound, so the ToolEntry 540s outer thread-kill was
         # the only stop for a wedged stream.
         client = OpenAI(
             api_key=api_key,
             base_url=base_url,
-            timeout=get_websearch_timeout_sec(),
+            timeout=transport_timeout,
             max_retries=0,
         )
 
@@ -592,6 +603,12 @@ def _web_search(
         # One retry on a genuine timeout before cascading: web search timeouts are
         # frequently transient, and the provider cascade is slower/less precise.
         if _attempt == 0 and _is_timeout_error(e):
+            from ouroboros.deadline_utils import deadline_remaining_sec, has_deadline
+
+            if has_deadline(ctx) and deadline_remaining_sec(ctx) <= max(
+                1.0, float(get_finalization_grace_sec())
+            ):
+                return _fallbacks([f"OpenAI web search timed out before a safe retry: {detail}"])
             log.debug("web_search OpenAI timeout; retrying once")
             return _web_search(
                 ctx, query, model=model, search_context_size=search_context_size,
@@ -601,6 +618,8 @@ def _web_search(
 
 
 def get_tools() -> List[ToolEntry]:
+    from ouroboros.config import get_finalization_grace_sec, get_websearch_timeout_sec
+
     backends = _available_web_search_backends()
     backend_note = ", ".join(backends) if backends else "unavailable (no key/backend configured)"
     return [
@@ -628,5 +647,8 @@ def get_tools() -> List[ToolEntry]:
                 "reasoning_effort": {"type": "string", "enum": ["low", "medium", "high"],
                                      "description": f"Reasoning effort (default: {DEFAULT_REASONING_EFFORT})"},
             }, "required": ["query"]},
-        }, _web_search, timeout_sec=540),
+        }, _web_search, timeout_sec=max(
+            600,
+            int(2.0 * get_websearch_timeout_sec() + get_finalization_grace_sec()),
+        )),
     ]

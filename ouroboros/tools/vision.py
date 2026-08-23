@@ -11,9 +11,11 @@ import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
-from ouroboros.config import resolve_effort
+from ouroboros.config import get_vision_caption_timeout_sec, resolve_effort
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.usage_accounting import current_usage_scope
+from ouroboros.utils import emit_cognitive_operation_event
+from ouroboros.observability import new_call_id
 
 log = logging.getLogger(__name__)
 
@@ -38,19 +40,45 @@ def _analyze_screenshot(ctx: ToolContext, prompt: str = "Describe what you see i
         vlm_model = _resolve_vlm_model(client, model, ctx=ctx)
         if not vlm_model:
             return _VLM_NO_VISION_MODEL_MSG
+        operation_id = new_call_id("vlm_analysis")
+        emit_cognitive_operation_event(
+            getattr(ctx, "event_queue", None),
+            task_id=getattr(ctx, "task_id", ""),
+            operation_id=operation_id,
+            phase="started",
+            kind="vlm",
+            task_attempt=getattr(ctx, "task_attempt", None),
+        )
         text, usage = _vision_query_with_timeout(
             client,
             prompt=prompt,
             images=[_image_payload_from_base64(b64, "image/png")],
             model=vlm_model,
             reasoning_effort=resolve_effort("task"),
-            timeout=_VLM_HTTP_TIMEOUT_SEC,
+            timeout=float(get_vision_caption_timeout_sec()),
+        )
+        emit_cognitive_operation_event(
+            getattr(ctx, "event_queue", None),
+            task_id=getattr(ctx, "task_id", ""),
+            operation_id=operation_id,
+            phase="finished",
+            kind="vlm",
+            task_attempt=getattr(ctx, "task_attempt", None),
         )
 
         _emit_usage(ctx, usage, vlm_model)
 
         return text or "(no response from VLM)"
     except Exception as e:
+        if "operation_id" in locals():
+            emit_cognitive_operation_event(
+                getattr(ctx, "event_queue", None),
+                task_id=getattr(ctx, "task_id", ""),
+                operation_id=operation_id,
+                phase="failed",
+                kind="vlm",
+                task_attempt=getattr(ctx, "task_attempt", None),
+            )
         log.warning("analyze_screenshot failed: %s", e, exc_info=True)
         return f"⚠️ VLM_ANALYSIS_FAILED: {e}"
 
@@ -65,13 +93,10 @@ _IMAGE_WEBP_MAGIC = (b'RIFF', b'WEBP')
 _VLM_MAX_FILE_BYTES = 20 * 1024 * 1024
 _VLM_MAX_PROVIDER_BYTES = 6 * 1024 * 1024
 _VLM_MAX_IMAGE_SIDE = 1600
-_VLM_HTTP_TIMEOUT_SEC = 90.0
-
-
 def _vision_query_with_timeout(client: Any, **kwargs: Any) -> tuple[str, dict]:
     """Run a VLM query behind a tracked, killable child process."""
     del client  # production path constructs the client in the tracked child.
-    timeout = float(kwargs.get("timeout") or _VLM_HTTP_TIMEOUT_SEC)
+    timeout = float(kwargs.get("timeout") or get_vision_caption_timeout_sec())
     payload = dict(kwargs)
     active_scope = current_usage_scope()
     if active_scope is not None:
@@ -572,19 +597,45 @@ def _vlm_query(ctx: ToolContext, prompt: str, image_url: str = "", image_base64:
         vlm_model = _resolve_vlm_model(client, model, ctx=ctx)
         if not vlm_model:
             return _VLM_NO_VISION_MODEL_MSG
+        operation_id = new_call_id("vlm_query")
+        emit_cognitive_operation_event(
+            getattr(ctx, "event_queue", None),
+            task_id=getattr(ctx, "task_id", ""),
+            operation_id=operation_id,
+            phase="started",
+            kind="vlm",
+            task_attempt=getattr(ctx, "task_attempt", None),
+        )
         text, usage = _vision_query_with_timeout(
             client,
             prompt=prompt,
             images=images,
             model=vlm_model,
             reasoning_effort=resolve_effort("task"),
-            timeout=_VLM_HTTP_TIMEOUT_SEC,
+            timeout=float(get_vision_caption_timeout_sec()),
+        )
+        emit_cognitive_operation_event(
+            getattr(ctx, "event_queue", None),
+            task_id=getattr(ctx, "task_id", ""),
+            operation_id=operation_id,
+            phase="finished",
+            kind="vlm",
+            task_attempt=getattr(ctx, "task_attempt", None),
         )
 
         _emit_usage(ctx, usage, vlm_model)
 
         return text or "(no response from VLM)"
     except Exception as e:
+        if "operation_id" in locals():
+            emit_cognitive_operation_event(
+                getattr(ctx, "event_queue", None),
+                task_id=getattr(ctx, "task_id", ""),
+                operation_id=operation_id,
+                phase="failed",
+                kind="vlm",
+                task_attempt=getattr(ctx, "task_attempt", None),
+            )
         log.warning("vlm_query failed: %s", e, exc_info=True)
         return f"⚠️ VLM_QUERY_FAILED: {e}"
 

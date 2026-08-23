@@ -25,7 +25,10 @@ def test_query_model_timeout_becomes_error_actor(monkeypatch):
 
     assert model == "fake/reviewer"
     assert headers is None
-    assert result["error"] == "Error: Timeout after 0.01s"
+    assert result["error"].startswith("Error: Timeout after 0.01s")
+    assert "physical review operation remains in flight" in result["error"]
+    assert result["operation_state"] == "in_flight"
+    assert result["late_result_pending"] is True
     assert result["prompt_ref"]["manifest_ref"]["path"]
     assert result["response_ref"]["manifest_ref"]["path"]
     prompt = read_blob_ref(

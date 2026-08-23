@@ -32,6 +32,7 @@ from ouroboros.tools.review_synthesis import PLAN_REVIEW_CONTROL_PREFIX
 from ouroboros.usage_accounting import UsageAccountingError
 from ouroboros.utils import (
     append_jsonl,
+    emit_cognitive_operation_event,
     emit_log_event,
     sanitize_tool_args_for_log,
     sanitize_tool_result_for_log,
@@ -139,6 +140,23 @@ def _emit_live_log(tools: ToolRegistry, payload: Dict[str, Any]) -> None:
     for key in ("parent_task_id", "root_task_id"):
         if meta.get(key) and not enriched.get(key):
             enriched[key] = meta.get(key)
+    # Tool execution is another physical wait surface.  Keep the idle rail
+    # aware of it through the same typed operation seam as LLM/review calls;
+    # a timeout/late notice deliberately does NOT close the lease because the
+    # worker thread may still be running after the logical caller returned.
+    operation_id = str(enriched.get("tool_call_id") or "")
+    event_type = str(enriched.get("type") or "")
+    if operation_id and event_type in {"tool_call_started", "tool_call_finished"}:
+        emit_cognitive_operation_event(
+            event_queue,
+            task_id=str(enriched.get("task_id") or getattr(tool_ctx, "task_id", "") or ""),
+            operation_id=operation_id,
+            phase="started" if event_type == "tool_call_started" else "finished",
+            kind="tool",
+            task_attempt=getattr(tool_ctx, "task_attempt", None),
+            execution_id=str(enriched.get("execution_id") or ""),
+            tool=str(enriched.get("tool") or ""),
+        )
     emit_log_event(
         event_queue,
         {"ts": utc_now_iso(), **enriched},
@@ -267,7 +285,7 @@ def _get_tool_timeout(
 # per-call/run_command machinery and the deadline milestones own those.
 _DEADLINE_CLAMPED_TOOLS = frozenset({
     "web_search", "browse_page", "browser_action", "youtube_transcript",
-    "wait_task", "wait_tasks",
+    "wait_task", "wait_tasks", "plan_task", "task_acceptance_review",
 })
 
 

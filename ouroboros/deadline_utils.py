@@ -72,3 +72,58 @@ def window_within_deadline(ctx: Any, requested: int) -> int:
     remaining = float(deadline_remaining_sec(ctx) or 0.0)
     return max(1, int(min(requested, remaining - float(effective_finalization_reserve_sec(ctx)))))
 
+
+def llm_transport_timeout_sec(explicit: Any = None) -> float:
+    """Return the transport/dead-socket timeout for one LLM request.
+
+    A caller may narrow this value explicitly.  The shared default is deliberately
+    read from ``config.py`` and is never used as a logical cognition deadline.
+    """
+    try:
+        requested = float(explicit)
+    except (TypeError, ValueError):
+        requested = 0.0
+    if requested > 0:
+        return requested
+    from ouroboros.config import get_llm_transport_read_timeout_sec
+
+    return float(get_llm_transport_read_timeout_sec())
+
+
+def logical_operation_timeout_sec(
+    explicit: Any = None,
+    *,
+    deadline_at: Any = None,
+    fallback: Any = None,
+    reserve_sec: Any = 0.0,
+) -> float:
+    """Choose a logical operation wait without borrowing a socket timeout.
+
+    An explicit slot/task value is the operation's requested window, but an
+    existing owner deadline always narrows it.  Absent both, ``fallback`` is
+    used (normally the transport bound only as a settlement wait, not as a
+    cognition target).
+    """
+    try:
+        requested = float(explicit)
+    except (TypeError, ValueError):
+        requested = 0.0
+    remaining = seconds_until(deadline_at)
+    if remaining is not None:
+        try:
+            reserve = max(0.0, float(reserve_sec or 0.0))
+        except (TypeError, ValueError):
+            reserve = 0.0
+        remaining = max(0.0, remaining - reserve)
+        if requested <= 0:
+            requested = 0.0
+        else:
+            requested = min(requested, remaining)
+        return max(0.001, requested if requested > 0 else remaining)
+    if requested > 0:
+        return requested
+    try:
+        value = float(fallback)
+    except (TypeError, ValueError):
+        value = llm_transport_timeout_sec()
+    return max(0.001, value)

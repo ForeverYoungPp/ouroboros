@@ -14,8 +14,6 @@ import json
 import logging
 import os
 import pathlib
-import queue
-import threading
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
@@ -55,7 +53,6 @@ from ouroboros.usage_accounting import (
     UsageScope,
     current_usage_scope,
     physical_attempt_limit,
-    usage_scope,
 )
 from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact
 
@@ -82,7 +79,7 @@ class ReviewSlot:
     slot_id: str
     model: str
     effort: str = "medium"
-    timeout_sec: float = 300
+    timeout_sec: Optional[float] = None
     max_tokens: int = 16_384
     temperature: float | None = None
     role_hint: str = ""
@@ -96,6 +93,7 @@ class ReviewSlot:
     session_target: str = ""
     # Optional manual credential pin (Q2-в); '' = the daemon's rotation (D28).
     session_profile: str = ""
+    transport_timeout_sec: Optional[float] = None
 
 
 @dataclass
@@ -123,6 +121,9 @@ class ReviewRequest:
     session_root: str = ""
     session_task: str = ""
     session_threads: Dict[str, str] = field(default_factory=dict)
+    deadline_at: str = ""
+    retry_key: str = ""
+    task_attempt: Any = None
 
 
 @dataclass
@@ -164,6 +165,11 @@ class ReviewActorRecord:
     quorum_contribution: bool = False
     reason: str = ""
     enforcement_impact: str = ""
+    # Physical operation identity survives a logical timeout.  A pending actor
+    # is custody/reconciliation state, not permission for a blind resend.
+    operation_id: str = ""
+    operation_state: str = "settled"
+    late_result_pending: bool = False
 
 
 # B1 typed failure facts, ONE shared key tuple (row/wave/last-execution projections).
@@ -1017,8 +1023,6 @@ class ReviewCoordinator:
                 panel_id=_review_panel_id(request, []),
             )
 
-        result_queue: "queue.Queue[ReviewActorRecord]" = queue.Queue()
-        started_slots: List[ReviewSlot] = []
         base_scope = current_usage_scope() or UsageScope()
         usage_meta = (
             getattr(self.usage_ctx, "task_metadata", {})
@@ -1027,6 +1031,12 @@ class ReviewCoordinator:
         )
         if not isinstance(usage_meta, dict):
             usage_meta = {}
+        if not str(getattr(request, "deadline_at", "") or "").strip():
+            inherited_deadline = str(usage_meta.get("deadline_at") or "").strip()
+            if inherited_deadline:
+                request.deadline_at = inherited_deadline
+        if getattr(request, "task_attempt", None) in (None, ""):
+            request.task_attempt = getattr(self.usage_ctx, "task_attempt", None)
         task_id = str(request.task_id or base_scope.task_id or "")
         root_task_id = str(
             usage_meta.get("root_task_id") or base_scope.root_task_id or task_id
@@ -1066,46 +1076,26 @@ class ReviewCoordinator:
             root_limit_usd=root_limit,
         )
 
-        def _start_slot(slot: ReviewSlot) -> None:
-            started_slots.append(slot)
+        from ouroboros.review_custody import run_custodied_review_slots
 
-            def _worker() -> None:
-                try:
-                    with usage_scope(review_usage_scope):
-                        result_queue.put(self._run_slot(request, slot))
-                except Exception as exc:
-                    result_queue.put(self._error_actor(request, slot, f"{type(exc).__name__}: {exc}"))
-
-            thread = threading.Thread(
-                target=_worker,
-                name=f"ouroboros-review-{request.surface}-{slot.slot_id}",
-                daemon=True,
-            )
-            thread.start()
-
-        for slot in slots:
-            _start_slot(slot)
-
-        actors: List[ReviewActorRecord] = []
-        slot_timeout = max(0.001, max(float(slot.timeout_sec or 1) for slot in slots))
-        deadline = time.monotonic() + slot_timeout
-        while len(actors) < len(slots):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            try:
-                actors.append(result_queue.get(timeout=remaining))
-            except queue.Empty:
-                break
-
-        seen = {actor.slot_id for actor in actors}
-        started_ids = {slot.slot_id for slot in started_slots}
-        for slot in slots:
-            if slot.slot_id not in seen:
-                if slot.slot_id in started_ids:
-                    actors.append(self._error_actor(request, slot, f"Timeout after {slot.timeout_sec:g}s"))
-                else:
-                    actors.append(self._error_actor(request, slot, "Not started before reviewer timeout budget expired"))
+        actors = run_custodied_review_slots(
+            request=request,
+            slots=slots,
+            usage_ctx=self.usage_ctx,
+            task_id=task_id,
+            usage_meta=usage_meta,
+            review_usage_scope=review_usage_scope,
+            run_slot=lambda slot, operation_id: self._run_slot(
+                request, slot, operation_id=operation_id,
+            ),
+            error_actor=lambda slot, error, operation_id="", operation_state="settled": self._error_actor(
+                request,
+                slot,
+                error,
+                operation_id=operation_id,
+                operation_state=operation_state,
+            ),
+        )
         slot_order = {slot.slot_id: idx for idx, slot in enumerate(slots)}
         slots_by_id = {slot.slot_id: slot for slot in slots}
         actors.sort(key=lambda actor: slot_order.get(actor.slot_id, len(slot_order)))
@@ -1304,7 +1294,15 @@ class ReviewCoordinator:
                 log.debug("custody root resolution failed; using coordinator drive", exc_info=True)
         return self.drive_root
 
-    def _error_actor(self, request: ReviewRequest, slot: ReviewSlot, error: str) -> ReviewActorRecord:
+    def _error_actor(
+        self,
+        request: ReviewRequest,
+        slot: ReviewSlot,
+        error: str,
+        *,
+        operation_id: str = "",
+        operation_state: str = "settled",
+    ) -> ReviewActorRecord:
         call_id = new_call_id(f"review_{request.surface}_{slot.slot_id}_error")
         base_call_type = request.call_type or f"{request.surface}_review"
         assignment = ReviewAssignment(
@@ -1351,10 +1349,19 @@ class ReviewCoordinator:
             error=sanitize_tool_result_for_log(error),
             prompt_ref=prompt_ref,
             response_ref=response_ref,
+            operation_id=str(operation_id or ""),
+            operation_state=str(operation_state or "settled"),
+            late_result_pending=str(operation_state or "") == "in_flight",
         )
 
-    def _run_slot(self, request: ReviewRequest, slot: ReviewSlot) -> ReviewActorRecord:
-        call_id = new_call_id(f"review_{request.surface}_{slot.slot_id}")
+    def _run_slot(
+        self,
+        request: ReviewRequest,
+        slot: ReviewSlot,
+        *,
+        operation_id: str = "",
+    ) -> ReviewActorRecord:
+        call_id = str(operation_id or new_call_id(f"review_{request.surface}_{slot.slot_id}"))
         base_call_type = request.call_type or f"{request.surface}_review"
         assignment = ReviewAssignment(
             request=request, slot=slot, call_id=call_id, call_type=base_call_type,
@@ -1575,13 +1582,12 @@ def run_review_request(
     llm: LLMClient | None = None,
     usage_ctx: Any = None,
 ) -> ReviewRunResult:
-    # Write-ahead paid stamp (Q16 dispatch seam): a gate that meters paid
-    # cycles installed a callback on ctx; it durably lands the paid fact
-    # BEFORE the first reviewer transport call. Assembly-only refusals never
-    # reach this line, so undispatched attempts stay outside every ceiling.
-    stamp_review_paid_on_dispatch(usage_ctx)
+    resolved_slots = reviewer_slots(role_hint=request.surface) if slots is None else slots
+    if resolved_slots:
+        # Write the paid fact before a worker can outlive this caller.
+        stamp_review_paid_on_dispatch(usage_ctx)
     coordinator = ReviewCoordinator(llm=llm, drive_root=drive_root, usage_ctx=usage_ctx)
-    result = coordinator.run(request, reviewer_slots(role_hint=request.surface) if slots is None else slots)
+    result = coordinator.run(request, resolved_slots)
     if request.surface == "task_acceptance":
         # D-Q5 annotation-only pass: feeds the clean bit + disclosure, never parse
         # validity/quorum/verdicts. Called UNGUARDED on purpose — the annotator is

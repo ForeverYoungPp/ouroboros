@@ -186,6 +186,13 @@ Used by `commit_reviewed` for all changes to the Ouroboros repository.
 | 28 | review_artifact_continuity | If the diff changes plan, triad, scope, advisory, or acceptance evidence, are exact artifact bodies, source selectors, candidate SHA, reviewer model/profile/thread/route continuity, and all omissions retained? A bounded hot index or partial reviewer view must remain DEGRADED/NOT_RUN rather than PASS. | critical when applicable |
 | 29 | display_identity_replay | If the diff changes routing, steering, task cards, or history replay, does it preserve the event-time human `Project › Task` presentation snapshot in both live and replay paths while keeping opaque IDs as internal/debug facts? | advisory when applicable |
 
+**Timeout-policy pointer for item 18 (2026-08-23):** cognitive/review waits must
+follow the layered policy in `DEVELOPMENT.md` and the timeout data-flow in
+`ARCHITECTURE.md`: transport is not a reasoning cutoff, active operations are
+typed idle-rail facts, owner deadlines narrow nested waits, and a late physical
+result stays in custody rather than enabling a blind retry. The checklist item
+does not create another timeout constant or a second scheduler.
+
 **Standing note for item 21 (2026-08-15), do not re-raise as a missing successor class:** the delegated-coding target class lost in the D10 migration — editing one exact non-Git installed skill payload — is restored through `delegate_start(subagent_id=..., prompt=..., root="skill_payload", bucket=..., skill_name=...)` (private standalone snapshot, explicit parent CAS apply, review goes stale), with a golden registry-level test pinning it.
 
 ### Severity rules

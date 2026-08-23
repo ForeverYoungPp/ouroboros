@@ -7,10 +7,11 @@ The ``paid`` fact of Max-Review-Cycles accounting is recorded at PHYSICAL
 dispatch: a gate that must durably record "this wave spent reviewer money"
 installs a :class:`ReviewPaidStamp` on ``ctx._review_paid_stamp`` for the
 duration of its wave, and the shared reviewer transport entry
-(``review_substrate.run_review_request``) invokes it immediately before the
-first transport call. Assembly-only refusals (triad fit ladder, scope pack
-signals, skill prompt building) exit before the seam, so a $0 attempt stays
-outside every ceiling; a crash after dispatch keeps the durable paid fact
+(``review_substrate.run_review_request``) invokes it after slot resolution and
+immediately before worker fan-out. Assembly-only refusals (triad fit ladder,
+scope pack signals, skill prompt building) exit before the seam, so a $0
+attempt stays outside every ceiling; a worker that outlives its logical caller
+cannot race the write-ahead fact, and a crash after dispatch keeps the durable paid fact
 (write-ahead). This seam is also where the L-review lane's two-phase
 admission slots in at synthesis.
 """

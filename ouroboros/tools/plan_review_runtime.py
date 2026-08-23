@@ -32,7 +32,10 @@ from ouroboros.tools.plan_review_artifacts import (  # noqa: E402, F401 - compat
     read_wave as read_plan_review_wave_artifact,
 )
 PLAN_REVIEW_EFFORT = "high"
-PLAN_REVIEW_SLOT_TIMEOUT_SEC = 560
+# ``None`` means no plan-local cognition cutoff.  The substrate settles against
+# the owner deadline or shared transport bound, keeping the historical 560s
+# number from being reused as an HTTP timeout.
+PLAN_REVIEW_SLOT_TIMEOUT_SEC = None
 # Per-slot provenance of what the reviewer read (BIBLE P3, retrieving reviewers):
 # an api_chat slot read exactly the host-assembled packet; an agent_session slot
 # retrieved with its own tools and the host did not observe what it opened.

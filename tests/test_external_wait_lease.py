@@ -280,3 +280,98 @@ def test_the_lease_never_spares_deadline_or_ceiling(monkeypatch, tmp_path):
     _enforcer(monkeypatch, tmp_path, {"t2": meta2})(2500.0)
     assert meta2.get("finalization_requested_at") == 2500.0
     assert meta2.get("finalization_reason") == "deadline"
+
+
+def test_parallel_cognitive_operations_are_independent_and_attempt_bound(
+    monkeypatch, tmp_path,
+):
+    from supervisor import events as events_mod
+
+    monkeypatch.setattr("ouroboros.config.get_task_abs_ceiling_sec", lambda: 10_000)
+    monkeypatch.setattr(events_mod.time, "time", lambda: 1100.0)
+
+    meta = {
+        "task": {"id": "t3", "chat_id": 7},
+        "attempt": 2,
+        "started_at": 1000.0,
+        "last_progress_at": 1000.0,
+        "worker_id": 0,
+    }
+    ctx = types.SimpleNamespace(RUNNING={"t3": meta})
+
+    for operation_id in ("llm-1", "review-1"):
+        events_mod._handle_cognitive_operation(
+            {
+                "type": "cognitive_operation", "task_id": "t3",
+                "operation_id": operation_id, "phase": "started",
+                "kind": "llm", "task_attempt": 2, "lease_until": 3000.0,
+            },
+            ctx,
+        )
+    assert set(meta["active_operation_leases"]) == {"llm-1", "review-1"}
+
+    # A late event from attempt 1 cannot close either operation of attempt 2.
+    events_mod._handle_cognitive_operation(
+        {
+            "type": "cognitive_operation", "task_id": "t3",
+            "operation_id": "llm-1", "phase": "finished",
+            "task_attempt": 1,
+        },
+        ctx,
+    )
+    assert set(meta["active_operation_leases"]) == {"llm-1", "review-1"}
+
+    # One operation may settle while the other still spares the idle rail.
+    events_mod._handle_cognitive_operation(
+        {
+            "type": "cognitive_operation", "task_id": "t3",
+            "operation_id": "llm-1", "phase": "finished",
+            "task_attempt": 2,
+        },
+        ctx,
+    )
+    assert set(meta["active_operation_leases"]) == {"review-1"}
+    _enforcer(monkeypatch, tmp_path, {"t3": meta})(2500.0)
+    assert "finalization_requested_at" not in meta
+
+    events_mod._handle_cognitive_operation(
+        {
+            "type": "cognitive_operation", "task_id": "t3",
+            "operation_id": "review-1", "phase": "failed",
+            "task_attempt": 2,
+        },
+        ctx,
+    )
+    assert "active_operation_leases" not in meta
+    _enforcer(monkeypatch, tmp_path, {"t3": meta})(2500.0)
+    assert meta.get("finalization_requested_at") == 2500.0
+
+
+def test_cognitive_operation_event_reaches_idle_enforcer_via_dispatch(
+    monkeypatch, tmp_path,
+):
+    from supervisor import events as events_mod
+
+    monkeypatch.setattr(events_mod.time, "time", lambda: 1100.0)
+    meta = {
+        "task": {"id": "t4", "chat_id": 7},
+        "attempt": 1,
+        "started_at": 1000.0,
+        "last_progress_at": 1000.0,
+        "worker_id": 0,
+    }
+    ctx = types.SimpleNamespace(
+        RUNNING={"t4": meta},
+        DRIVE_ROOT=tmp_path,
+        append_jsonl=lambda *_args, **_kwargs: None,
+    )
+    events_mod.dispatch_event(
+        {
+            "type": "cognitive_operation", "task_id": "t4",
+            "operation_id": "llm-live", "phase": "started", "kind": "llm",
+            "task_attempt": 1, "lease_until": 3000.0,
+        },
+        ctx,
+    )
+    _enforcer(monkeypatch, tmp_path, {"t4": meta})(2500.0)
+    assert "finalization_requested_at" not in meta

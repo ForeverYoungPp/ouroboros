@@ -81,7 +81,7 @@ _SCOPE_REQUIRED_ITEMS = SCOPE_REQUIRED_ITEMS  # compatibility export used by tes
 # spellings; the sentinel grants only 1M, a real probe/owner-ack supersedes.
 from ouroboros.tools.scope_window import SCOPE_MODEL_DEFAULT as _SCOPE_MODEL_DEFAULT  # noqa: E402
 _SCOPE_MAX_TOKENS = 100_000  # 100K output tokens
-_SCOPE_REVIEW_SLOT_TIMEOUT_SEC = 900
+_SCOPE_REVIEW_SLOT_TIMEOUT_SEC = None
 from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET as _SCOPE_BUDGET_TOKEN_LIMIT
 
 # The shared prompt-size SSOT (920K) governs INPUT only; the reviewer also reserves

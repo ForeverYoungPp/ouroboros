@@ -131,7 +131,12 @@ def test_caption_call_records_observability(monkeypatch, tmp_path):
     assert out[0]["content"][1]["text"] == "[image caption: fresh caption]"
     calls = list((tmp_path / "observability" / "calls").rglob("*.json"))
     assert calls
-    assert events.get_nowait()["source"] == "vision_caption"
+    event_rows = []
+    while not events.empty():
+        event_rows.append(events.get_nowait())
+    assert any(event.get("source") == "vision_caption" for event in event_rows)
+    operation_rows = [event for event in event_rows if event.get("type") == "cognitive_operation"]
+    assert [event.get("phase") for event in operation_rows] == ["started", "finished"]
 
 
 def test_caption_mode_does_not_treat_bracket_label_as_real_caption(monkeypatch):

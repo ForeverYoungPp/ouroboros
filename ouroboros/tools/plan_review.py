@@ -36,7 +36,8 @@ import pathlib
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
 
-from ouroboros.config import adaptive_quorum, get_review_enforcement
+from ouroboros.config import adaptive_quorum, get_finalization_grace_sec, get_llm_transport_read_timeout_sec, get_review_enforcement
+from ouroboros.deadline_utils import window_within_deadline
 from ouroboros.review_cycles import emit_review_cycles_exhausted, review_max_cycles
 from ouroboros.task_results import (
     load_plan_review_state, load_task_result, mark_current_plan_review_unavailable,
@@ -48,7 +49,6 @@ from ouroboros.tools.plan_render import _next_step, _quote_control_lines, _rende
 from ouroboros.tools.plan_review_runtime import (
     PLAN_NO_SNAPSHOT as _PLAN_NO_SNAPSHOT,
     PLAN_REVIEW_MAX_TOKENS as _PLAN_REVIEW_MAX_TOKENS,
-    PLAN_REVIEW_SLOT_TIMEOUT_SEC as _PLAN_REVIEW_SLOT_TIMEOUT_SEC,
     emit_plan_review_advisory_open as _emit_plan_review_advisory_open,
     plan_deadline_skip as _plan_deadline_skip,
     plan_health_epoch as _plan_health_epoch,
@@ -83,10 +83,21 @@ from ouroboros.utils import truncate_review_artifact, utc_now_iso
 
 log = logging.getLogger(__name__)
 
-_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC = _PLAN_REVIEW_SLOT_TIMEOUT_SEC + 60
-_PLAN_TASK_TOOL_TIMEOUT_SEC = _PLAN_REVIEW_WRAPPER_TIMEOUT_SEC + 10
+# These wrappers are outer settlement bounds, not cognition cutoffs.  Resolve
+# them when the tool is built/used so a settings reload cannot leave an old
+# transport bound baked into an imported module.
+def _plan_review_wrapper_timeout_sec() -> float:
+    return float(get_llm_transport_read_timeout_sec() + get_finalization_grace_sec())
+
+
+def _plan_task_tool_timeout_sec() -> float:
+    return _plan_review_wrapper_timeout_sec() + get_finalization_grace_sec()
 _TASK_EVIDENCE_RESULT_CHARS = 6_000
 _RAW_TEXT_PREVIEW_CHARS = 2_000
+
+
+def _plan_review_wait_timeout(ctx: Any) -> float:
+    return float(window_within_deadline(ctx, int(_plan_review_wrapper_timeout_sec())))
 
 
 @dataclass(frozen=True)
@@ -231,7 +242,7 @@ def get_tools():
                 },
             },
             handler=_handle_plan_task,
-            timeout_sec=_PLAN_TASK_TOOL_TIMEOUT_SEC,
+            timeout_sec=_plan_task_tool_timeout_sec(),
         )
     ]
 
@@ -267,21 +278,22 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
     request = _PlanRequest(
         goal=str(params.get("goal") or ""), plan=str(params.get("plan") or ""), spec=params.get("spec"),
     )
+    wait_timeout = _plan_review_wait_timeout(ctx)
     try:
         try:
             asyncio.get_running_loop()
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 return pool.submit(
                     asyncio.run,
-                    asyncio.wait_for(_run_plan_review_async(ctx, request), timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC),
-                ).result(timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC + 5)
+                    asyncio.wait_for(_run_plan_review_async(ctx, request), timeout=wait_timeout),
+                ).result(timeout=wait_timeout + 5)
         except RuntimeError:
             return asyncio.run(
-                asyncio.wait_for(_run_plan_review_async(ctx, request), timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC)
+                asyncio.wait_for(_run_plan_review_async(ctx, request), timeout=wait_timeout)
             )
     except (concurrent.futures.TimeoutError, asyncio.TimeoutError):
         return _plan_unavailable(
-            ctx, f"ERROR: Plan review timed out after {_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC}s.", "review_timeout")
+            ctx, f"ERROR: Plan review timed out after {wait_timeout:g}s.", "review_timeout")
     except Exception as e:
         log.error("plan_task failed: %s", e, exc_info=True)
         return _plan_unavailable(ctx, f"ERROR: Plan review failed: {e}", "review_failed")

@@ -29,7 +29,6 @@ log = logging.getLogger(__name__)
 
 MAX_MODELS = 10
 CONCURRENCY_LIMIT = 5
-DEFAULT_REVIEW_MODEL_TIMEOUT_SEC = 600.0
 
 _CONSTITUTIONAL_PREAMBLE = """\
 ## CONSTITUTIONAL CONTEXT — TOP PRIORITY
@@ -65,13 +64,14 @@ def _review_model_timeout_sec() -> float:
         value = 0.0
     if value > 0:
         return value
+    default_timeout = float(_cfg.get_llm_transport_read_timeout_sec())
     if raw:
         log.warning(
             "Invalid or non-positive OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC=%r; using %.0fs",
             raw,
-            DEFAULT_REVIEW_MODEL_TIMEOUT_SEC,
+            default_timeout,
         )
-    return DEFAULT_REVIEW_MODEL_TIMEOUT_SEC
+    return default_timeout
 
 
 # The window/limit names below stay importable and MONKEYPATCHABLE on this
@@ -155,7 +155,7 @@ def get_tools():
                 },
             },
             handler=_handle_task_acceptance_review,
-            timeout_sec=900,
+            timeout_sec=int(_cfg.get_llm_transport_read_timeout_sec() + _cfg.get_finalization_grace_sec()),
         )
     ]
 
@@ -392,6 +392,9 @@ def _review_output_budget() -> int:
     return max(8192, min(raw, 65536))
 
 
+def _review_operation_fields(actor: dict) -> dict:
+    return {"operation_id": actor.get("operation_id") or "", "operation_state": actor.get("operation_state") or "settled", "late_result_pending": bool(actor.get("late_result_pending"))}
+
 async def _query_model(
     llm_client: LLMClient,
     model: str,
@@ -429,6 +432,7 @@ async def _query_model(
                 session_task=session_task if delegated else "",
                 session_root=session_root if delegated else "",
                 policy={"output_contract": REVIEW_JSON_ARRAY_CONTRACT} if delegated else {},
+                task_attempt=getattr(ctx, "task_attempt", None) if ctx is not None else None,
             )
             slot = ReviewSlot(
                 slot_id=slot_id,
@@ -444,28 +448,24 @@ async def _query_model(
                 session_profile=session_profile if delegated else "",
             )
             loop = asyncio.get_running_loop()
-            run_result = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    lambda: run_review_request(
-                        request,
-                        slots=[slot],
-                        drive_root=review_drive_root(ctx),
-                        llm=llm_client,
-                        usage_ctx=ctx,
-                    ),
+            run_result = await loop.run_in_executor(
+                None,
+                lambda: run_review_request(
+                    request,
+                    slots=[slot],
+                    drive_root=review_drive_root(ctx),
+                    llm=llm_client,
+                    usage_ctx=ctx,
                 ),
-                timeout=timeout_sec,
             )
             actor = (run_result.actors or [{}])[0]
-            # The id the substrate REALLY ran under, so the durable actor record
-            # downstream carries it instead of re-deriving one from position.
             ran_as = str(actor.get("slot_id") or slot_id)
             if actor.get("status") not in {"ok", "empty"}:
                 return model, {
                     "error": f"Error: {actor.get('error') or actor.get('status') or 'review failed'}",
                     "usage": actor.get("usage") or {},
                     "slot_id": ran_as,
+                    **_review_operation_fields(actor),
                     "prompt_ref": actor.get("prompt_ref") or {},
                     "response_ref": actor.get("response_ref") or {},
                 }, None
@@ -473,13 +473,11 @@ async def _query_model(
                 "choices": [{"message": {"content": actor.get("raw_text") or ""}}],
                 "usage": actor.get("usage") or {},
                 "slot_id": ran_as,
+                **_review_operation_fields(actor),
                 "prompt_ref": actor.get("prompt_ref") or {},
                 "response_ref": actor.get("response_ref") or {},
             }
             return model, payload, None
-        except asyncio.TimeoutError:
-            error = f"Error: Timeout after {timeout_sec:g}s"
-            return model, _review_query_error_payload(ctx=ctx, model=model, messages=messages, slot_id=slot_id, error=error, slot=slot), None
         except Exception as e:
             # Preserve full review errors; helper adds an omission note if needed.
             error_msg = truncate_review_artifact(str(e), limit=4000)

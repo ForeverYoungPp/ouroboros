@@ -36,6 +36,7 @@ from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.subagents import intended_lane as intended_subagent_lane
 from ouroboros.subagent_messages import subagent_message_meta
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
+from supervisor.cognitive_operations import _handle_cognitive_operation, _handle_review_late_result
 
 log = logging.getLogger(__name__)
 
@@ -4324,6 +4325,8 @@ def _handle_external_wait_lease(evt: Dict[str, Any], ctx: Any) -> None:
 EVENT_HANDLERS = {
     "llm_usage": _handle_llm_usage,
     "external_wait_lease": _handle_external_wait_lease,
+    "cognitive_operation": _handle_cognitive_operation,
+    "review_late_result": _handle_review_late_result,
     "budget_pause": _handle_budget_pause,
     "budget_root_fence": _handle_budget_root_fence,
     "task_heartbeat": _handle_task_heartbeat,

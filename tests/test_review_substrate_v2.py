@@ -1677,6 +1677,135 @@ def test_review_substrate_persists_timeout_actor_refs(tmp_path):
     assert actor["response_ref"]["manifest_ref"]["path"]
 
 
+def test_late_review_result_is_replayed_without_a_second_paid_dispatch(tmp_path):
+    import threading
+    from types import SimpleNamespace
+
+    calls = []
+    settled = threading.Event()
+
+    class SlowLLM:
+        def chat(self, **_kwargs):
+            calls.append(dict(_kwargs))
+            time.sleep(0.08)
+            settled.set()
+            return {"content": '{"verdict":"PASS","findings":[],"summary":"late"}'}, {}
+
+    ctx = SimpleNamespace(
+        task_id="late-review",
+        task_attempt=1,
+        event_queue=None,
+        pending_events=[],
+    )
+    request = ReviewRequest(
+        surface="scope",
+        goal="review diff",
+        task_id="late-review",
+        task_attempt=1,
+    )
+    slot = ReviewSlot(
+        slot_id="slot_a", model="same/model", timeout_sec=0.05,
+        transport_timeout_sec=10,
+    )
+    first = run_review_request(request, slots=[slot], drive_root=tmp_path, llm=SlowLLM(), usage_ctx=ctx)
+    assert first.actors[0]["operation_state"] == "in_flight"
+    assert first.actors[0]["late_result_pending"] is True
+
+    assert settled.wait(1.0)
+    second_slot = ReviewSlot(
+        slot_id="slot_a", model="same/model", timeout_sec=0.02,
+        transport_timeout_sec=10,
+    )
+    second = run_review_request(request, slots=[second_slot], drive_root=tmp_path, llm=SlowLLM(), usage_ctx=ctx)
+    assert len(calls) == 1
+    assert second.actors[0]["status"] == "ok"
+    assert second.actors[0]["operation_state"] == "late_settled"
+    assert second.actors[0]["late_result_pending"] is False
+
+
+def test_review_paid_stamp_is_write_ahead_of_a_slow_worker(tmp_path):
+    from types import SimpleNamespace
+
+    order = []
+
+    class SlowLLM:
+        def chat(self, **_kwargs):
+            order.append("transport")
+            time.sleep(0.08)
+            return {"content": '{"verdict":"PASS","findings":[],"summary":"ok"}'}, {}
+
+    ctx = SimpleNamespace(
+        task_id="paid-before-worker", event_queue=None, pending_events=[],
+        _review_paid_stamp=lambda: order.append("paid"),
+    )
+    result = run_review_request(
+        ReviewRequest(surface="scope", goal="review", task_id="paid-before-worker"),
+        slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.02)],
+        drive_root=tmp_path, llm=SlowLLM(), usage_ctx=ctx,
+    )
+    assert result.actors[0]["operation_state"] == "in_flight"
+    assert order[0] == "paid"
+    assert order[1] == "transport"
+
+
+def test_review_slot_timeout_is_not_used_as_transport_timeout(tmp_path):
+    captured = []
+
+    class CapturingLLM:
+        def chat(self, **kwargs):
+            captured.append(kwargs)
+            return {"content": '{"verdict":"PASS","findings":[],"summary":"ok"}'}, {}
+
+    result = run_review_request(
+        ReviewRequest(surface="scope", goal="review", task_id="transport-separation"),
+        slots=[ReviewSlot(
+            slot_id="slot_a", model="same/model", timeout_sec=0.5,
+            transport_timeout_sec=17,
+        )],
+        drive_root=tmp_path,
+        llm=CapturingLLM(),
+    )
+    assert result.aggregate_signal == "PASS"
+    assert captured and captured[0]["timeout"] == 17
+
+
+def test_direct_anthropic_route_keeps_provider_default_transport(tmp_path):
+    captured = []
+
+    class CapturingLLM:
+        def chat(self, **kwargs):
+            captured.append(kwargs)
+            return {"content": '{"verdict":"PASS","findings":[],"summary":"ok"}'}, {}
+
+    run_review_request(
+        ReviewRequest(surface="scope", goal="review", task_id="anthropic-timeout"),
+        slots=[ReviewSlot(slot_id="slot_a", model="anthropic::claude-test", timeout_sec=0.5)],
+        drive_root=tmp_path,
+        llm=CapturingLLM(),
+    )
+    assert captured and captured[0]["timeout"] is None
+
+
+def test_review_slots_keep_independent_logical_windows(tmp_path):
+    class SlowLLM:
+        def chat(self, **kwargs):
+            time.sleep(0.25 if kwargs.get("model") == "short/model" else 0.1)
+            return {"content": '{"verdict":"PASS","findings":[],"summary":"ok"}'}, {}
+
+    result = run_review_request(
+        ReviewRequest(surface="scope", goal="review", task_id="independent-windows"),
+        slots=[
+            ReviewSlot(slot_id="short", model="short/model", timeout_sec=0.05),
+            ReviewSlot(slot_id="long", model="long/model", timeout_sec=0.5),
+        ],
+        drive_root=tmp_path,
+        llm=SlowLLM(),
+    )
+    rows = {actor["slot_id"]: actor for actor in result.actors}
+    assert rows["short"]["operation_state"] == "in_flight"
+    assert rows["long"]["status"] == "ok"
+
+
 def test_review_substrate_preserves_explicit_zero_budget_rails(tmp_path):
     from ouroboros.usage_accounting import UsageScope, current_usage_scope, usage_scope
 

@@ -1,0 +1,112 @@
+"""Typed active-operation facts shared by supervisor idle enforcement."""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Any, Dict
+
+from ouroboros.utils import append_jsonl, utc_now_iso
+
+log = logging.getLogger(__name__)
+
+
+def _active_operation_progressing(meta: Dict[str, Any], now: float) -> bool:
+    """Return whether a typed cognitive operation is physically in flight."""
+    active = meta.get("active_operation_leases") if isinstance(meta, dict) else None
+    if not isinstance(active, dict):
+        return False
+    live = False
+    for operation_id, row in list(active.items()):
+        try:
+            until = float(row.get("until_ts") if isinstance(row, dict) else row)
+        except (TypeError, ValueError):
+            until = 0.0
+        if until > now:
+            live = True
+        else:
+            active.pop(operation_id, None)
+    if not active:
+        meta.pop("active_operation_leases", None)
+    return live
+
+
+def _handle_cognitive_operation(evt: Dict[str, Any], ctx: Any) -> None:
+    """Track active LLM/review/VLM work for the idle rail only."""
+    task_id = str(evt.get("task_id") or "")
+    operation_id = str(evt.get("operation_id") or "")
+    phase = str(evt.get("phase") or "").strip().lower()
+    if not task_id or not operation_id or phase not in {"started", "finished", "failed"}:
+        return
+    running = getattr(ctx, "RUNNING", None)
+    meta = running.get(task_id) if isinstance(running, dict) else None
+    if not isinstance(meta, dict):
+        return
+    expected_attempt = meta.get("attempt")
+    if expected_attempt is None:
+        task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
+        expected_attempt = task.get("_attempt")
+    supplied_attempt = evt.get("task_attempt")
+    if supplied_attempt not in (None, ""):
+        try:
+            if int(supplied_attempt) != int(expected_attempt or 1):
+                return
+        except (TypeError, ValueError):
+            return
+    active = meta.get("active_operation_leases")
+    if not isinstance(active, dict):
+        active = {}
+        meta["active_operation_leases"] = active
+    if phase in {"finished", "failed"}:
+        row = active.get(operation_id)
+        if isinstance(row, dict):
+            stored_attempt = row.get("task_attempt")
+            if supplied_attempt not in (None, "") and stored_attempt not in (None, ""):
+                try:
+                    if int(stored_attempt) != int(supplied_attempt):
+                        return
+                except (TypeError, ValueError):
+                    return
+        active.pop(operation_id, None)
+        if not active:
+            meta.pop("active_operation_leases", None)
+        return
+    now = time.time()
+    try:
+        requested_until = float(evt.get("lease_until") or 0.0)
+    except (TypeError, ValueError):
+        requested_until = 0.0
+    from ouroboros.config import get_task_abs_ceiling_sec
+    from ouroboros.deadline_utils import parse_deadline_ts
+
+    started_at = float(meta.get("started_at") or now)
+    hard_until = started_at + float(get_task_abs_ceiling_sec())
+    task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    deadline = parse_deadline_ts(task.get("deadline_at") or metadata.get("deadline_at"))
+    if deadline is not None:
+        hard_until = min(hard_until, deadline.timestamp())
+    until = hard_until if requested_until <= 0 else min(requested_until, hard_until)
+    if until > now:
+        active[operation_id] = {
+            "kind": str(evt.get("kind") or "cognitive"),
+            "until_ts": until,
+            "task_attempt": expected_attempt,
+            "execution_id": str(evt.get("execution_id") or ""),
+            "slot_id": str(evt.get("slot_id") or ""),
+        }
+
+
+def _handle_review_late_result(evt: Dict[str, Any], ctx: Any) -> None:
+    """Persist a late review settlement without changing the aggregate row."""
+    payload = {"ts": evt.get("ts", utc_now_iso()), **{
+        key: value for key, value in evt.items() if key != "ts"
+    }}
+    try:
+        append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", payload)
+    except Exception:
+        log.debug("late review result persistence failed", exc_info=True)
+    try:
+        ctx.bridge.push_log(payload)
+    except Exception:
+        log.debug("late review result live projection failed", exc_info=True)

@@ -1666,6 +1666,26 @@ Before every commit, verify the following:
 - [ ] New numeric timeout constants are an SSOT in `config.py` `SETTINGS_DEFAULTS`
   with a getter and env registration; do not scatter magic wait numbers across
   call sites.
+- [ ] Cognitive waits use separate axes. A transport timeout only bounds a dead
+  socket; it is not a reasoning cutoff. The shared no-proxy LLM transport bound
+  is `OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC` (2700s), while review slots,
+  plan/acceptance wrappers, web-search attempts, delegated polling, and VLM
+  calls use their own logical deadline or provider-specific transport setting.
+  An explicit slot deadline narrows the shared bound; otherwise the owner task
+  deadline, then the transport bound as a settlement fallback, applies. A
+  caller/task deadline always narrows nested waits, and Anthropic (120s) plus
+  VLM captioning (90s) retain their separate provider transport defaults.
+- [ ] Every physical LLM/review/VLM/tool operation that can outlive a logical
+  wait emits a typed `cognitive_operation` start and terminal fact. The
+  supervisor uses the active-operation map only to spare the idle rail; the
+  task deadline, budget, cancellation and absolute ceiling still cut through.
+  A logical timeout with a live worker is custody/reconciliation-pending, never
+  permission for a blind paid retry. Late review results settle the original
+  attempt and remain bound to its retry identity.
+- [ ] Cooperative cancellation is used where the existing route supports it
+  (delegated sessions); API/thread routes disclose an in-flight custody state
+  until their physical result settles. Do not replace this with a keyword or
+  model-name heuristic, a second scheduler, or a new global timing ledger.
 
 #### Loop / State-Machine Changes
 - [ ] Changes to `loop.py` or other task state-machine logic include adversarial tests for malformed output, false-completion prevention, replay/log durability, and failure modes — not just the happy path.
