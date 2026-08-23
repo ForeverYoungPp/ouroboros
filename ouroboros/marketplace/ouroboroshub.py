@@ -807,6 +807,27 @@ def _adopt_begin(slug: str, drive_root: pathlib.Path, expected_content_hash: str
         rollback_root.mkdir(parents=True, exist_ok=True)
         aside_dir = rollback_root / f"{sanitized}.adopt.{uuid.uuid4().hex}"
         selected.skill_dir.rename(aside_dir)
+        # Re-verify the CAS on the moved-aside tree: the window between the
+        # eligibility CAS read and the rename is otherwise unguarded, and a
+        # concurrent writer's edits would be silently adopted over. A mismatch
+        # restores the source in place and refuses typed.
+        from ouroboros.skill_loader import compute_content_hash
+
+        aside_live = ""
+        try:
+            aside_live = str(compute_content_hash(aside_dir) or "")
+        except Exception:
+            aside_live = ""
+        if aside_live != expected_content_hash:
+            aside_dir.rename(selected.skill_dir)
+            if was_live:
+                _reconcile_extension_quiet(sanitized, drive_root)
+            return _adopt_refusal(
+                sanitized,
+                "local payload changed between confirmation and replacement - refresh the skill card and confirm again",
+                "adopt_cas_mismatch",
+                live_content_hash=aside_live,
+            )
     except Exception as exc:
         log.warning("adopt move-aside failed for %s", sanitized, exc_info=True)
         if was_live:

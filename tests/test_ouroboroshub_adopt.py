@@ -453,6 +453,9 @@ def test_adopt_body_validation_matrix(monkeypatch, tmp_path):
         ({}, "adopt_expected_hash_missing"),
         ({"expected_content_hash": "zz"}, "adopt_expected_hash_invalid"),
         ({"expected_content_hash": "A" * 64}, "adopt_expected_hash_invalid"),
+        ({"expected_content_hash": "a" * 63}, "adopt_expected_hash_invalid"),
+        ({"expected_content_hash": "a" * 65}, "adopt_expected_hash_invalid"),
+        ({"expected_content_hash": "g" + "a" * 63}, "adopt_expected_hash_invalid"),
         ({"expected_content_hash": _HEX64, "auto_review": False}, "adopt_requires_auto_review"),
         ({"expected_content_hash": _HEX64, "overwrite": True}, "adopt_overwrite_conflict"),
     ]
@@ -657,3 +660,30 @@ def test_catalog_endpoint_serves_cached_rows_with_identity_facts(monkeypatch, tm
         assert rows["other"]["identity_conflict"] is False
     finally:
         ouroboroshub._catalog_cache_clear()
+
+
+def test_adopt_cas_reverified_on_aside_tree(monkeypatch, tmp_path):
+    """E-fix BC-1: a payload mutated after the CAS read is refused, not adopted."""
+    from ouroboros.skill_loader import compute_content_hash
+
+    drive = _setup_hub(monkeypatch, tmp_path)
+    skill_dir = _make_occupant(drive)
+    expected = compute_content_hash(skill_dir)
+
+    def _mutating_unload(name):
+        # Mutate INSIDE the CAS->move window (the unload hook runs between them).
+        (skill_dir / "SKILL.md").write_text(_LOCAL_BODY + "# edited\n", encoding="utf-8")
+
+    monkeypatch.setattr("ouroboros.extension_loader.unload_extension", _mutating_unload)
+    monkeypatch.setattr("ouroboros.extension_loader.is_extension_live", lambda *a, **k: False)
+
+    outcome = ouroboroshub._adopt_begin("demo", drive, expected)
+
+    assert isinstance(outcome, dict), outcome
+    assert outcome.get("code") == "adopt_cas_mismatch"
+    # Source restored in place; no aside residue holds the payload.
+    assert skill_dir.is_dir()
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8").endswith("# edited\n")
+    rollback_root = skill_dir.parent / ".rollback"
+    leftovers = list(rollback_root.glob("demo.adopt.*")) if rollback_root.is_dir() else []
+    assert leftovers == []

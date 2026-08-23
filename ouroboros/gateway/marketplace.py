@@ -398,6 +398,12 @@ def _maybe_enqueue_marketplace_auto_repair(
 def _maybe_enqueue_repair_for_payload(drive_root: pathlib.Path, payload: Dict[str, Any], *, source: str) -> None:
     if str(payload.get("review_status") or "") != "blockers":
         return
+    if payload.get("rolled_back"):
+        # A rolled-back transaction restored the PREVIOUS payload (for adopt:
+        # the owner's own external copy). The blockers describe the discarded
+        # replacement tree, so a repair task aimed at the restored payload
+        # would "fix" files the findings never reviewed.
+        return
     skill_name = str(payload.get("sanitized_name") or "").strip()
     if not skill_name:
         return
