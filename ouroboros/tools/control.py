@@ -28,7 +28,9 @@ from ouroboros.contracts.task_contract import (
 )
 from ouroboros.tools.control_delegation import (
     _ensure_project_scope,
+    check_delegation_admission,
     child_budget_for_schedule,
+    durable_direct_child_count,
     normalize_required_capabilities,
     profile_from_task_constraint,
     resolve_cooperative_write_root,
@@ -323,7 +325,7 @@ def _finalize_schedule_emission(ctx: ToolContext, emission: Dict[str, Any]) -> s
     commitment = (
         "ordinary recursive API actor"
         if route_kind == "api_model"
-        else "recursive nanny; exact external start is committed before its first model call"
+        else "recursive nanny; exact route/work-order authority is frozen before its first model call"
     )
     legacy_note = (
         "\nDEPRECATED_LEGACY_SELECTOR: deterministically mapped to this exact configured row; "
@@ -1848,6 +1850,13 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         current_chat_id = 0
     budget_drive_root = str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root)
     status_drive_root = Path(budget_drive_root)
+    parent_budget = parent_contract.get("delegation_budget") if isinstance(parent_contract, dict) else {}
+    rights = check_delegation_admission(
+        parent_budget if isinstance(parent_budget, dict) else {},
+        direct_child_count=durable_direct_child_count(status_drive_root, parent_task_id),
+    )
+    if not rights.ok:
+        return f"⚠️ TOOL_ERROR (schedule_subagent): {rights.reason_code}: {rights.detail}"
     workspace_root = str(getattr(ctx, "workspace_root", "") or metadata.get("workspace_root") or "").strip()
     workspace_mode = str(getattr(ctx, "workspace_mode", "") or metadata.get("workspace_mode") or "").strip()
     workspace_root, workspace_mode = _inherited_workspace_from_active_repo(ctx, workspace_root, workspace_mode)

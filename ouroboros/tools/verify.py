@@ -52,8 +52,10 @@ _CONTRACT_KINDS = (
     "explicit_metric",
     "artifact_observation",
     "no_visible_machine_contract",
+    "delegation_zero_run",
 )
 _RUN_KINDS = frozenset({"visible_verifier", "explicit_command", "explicit_metric"})
+_ZERO_RUN_DECISIONS = ("complete", "incomplete", "unknown")
 # How `expected` is matched against the check output. `substring` is the DEFAULT
 # and keeps the historical behavior byte-identical when the param is omitted.
 # `bytes_equal` (v6.60.0) compares TWO FILES byte-for-byte (artifact_paths[0] vs
@@ -440,6 +442,65 @@ def _verify_and_record(
     task_id = str(getattr(ctx, "task_id", "") or "")
     drive_root = getattr(ctx, "drive_root", None)
     expected_s = str(expected or "").strip()
+    if kind == "delegation_zero_run":
+        # This is a typed actor-first disclosure, not a general-purpose way to
+        # relabel an ordinary task.  The private bootstrap marker is created by
+        # the host before the first model episode and is intentionally the only
+        # authority that can mint this receipt.
+        bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+        if not isinstance(bootstrap, dict):
+            return (
+                "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run is only "
+                "available to a configured actor-first session."
+            )
+        if bool(bootstrap.get("physical_started")):
+            return (
+                "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run is no longer "
+                "available after the selected physical leaf has started."
+            )
+        decision = str(
+            kwargs.get("zero_run_decision")
+            or kwargs.get("decision")
+            or ""
+        ).strip().lower()
+        if decision not in _ZERO_RUN_DECISIONS:
+            return (
+                "⚠️ TOOL_ARG_ERROR (verify_and_record): zero_run_decision must be one of "
+                f"{', '.join(_ZERO_RUN_DECISIONS)}."
+            )
+        basis = " ".join(str(
+            kwargs.get("zero_run_basis")
+            or kwargs.get("reason")
+            or criterion_basis
+            or check
+            or ""
+        ).split()).strip()
+        if not basis:
+            return (
+                "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run requires a "
+                "non-empty zero_run_basis explaining the host-visible evidence or blocker."
+            )
+        receipt: dict[str, Any] = {
+            "tool": "verify_and_record",
+            "contract_kind": kind,
+            "status": "declared",
+            "zero_run": True,
+            "zero_run_decision": decision,
+            "zero_run_basis": _bounded(basis, _RECEIPT_DECLARED_SUMMARY_CAP),
+            "physical_run_started": False,
+            "route": str(bootstrap.get("route_id") or ""),
+            "work_order_fingerprint": str(bootstrap.get("work_order_fingerprint") or ""),
+            "ts": utc_now_iso(),
+        }
+        if crit := str(criterion_id or "").strip():
+            receipt["criterion_id"] = crit[:120]
+        append_verification_receipt(drive_root, task_id, receipt)
+        bootstrap["zero_run_decision"] = decision
+        bootstrap["zero_run_receipt_recorded"] = True
+        return (
+            "verify_and_record [delegation_zero_run] "
+            f"{decision.upper()}: no physical leaf was started; typed host receipt recorded."
+        )
     receipt: dict[str, Any] = {"tool": "verify_and_record", "contract_kind": kind, "expected": expected_s, "expected_match": match_mode, "ts": utc_now_iso()}
     crit = str(criterion_id or "").strip()
     if crit:
@@ -613,7 +674,9 @@ def get_tools() -> List[ToolEntry]:
                 "(run `check`, pass on exit 0 and, if given, `expected` substring present) · explicit_metric "
                 "(run `check`, pass when the `expected` metric string appears) · artifact_observation (the host "
                 "confirms the declared artifact_paths exist) · no_visible_machine_contract (honest escape hatch: "
-                "no machine check exists; your best proxy + risk is recorded for review). Recording a receipt "
+                "no machine check exists; your best proxy + risk is recorded for review) · delegation_zero_run "
+                "(configured actor-first only: record a typed complete/incomplete/unknown decision when no "
+                "physical leaf was started, with zero_run_decision and zero_run_basis). Recording a receipt "
                 "suppresses the receipt_absent transparency flag on a clean turn. ANTI-CHEAT: verify ONLY against "
                 "PUBLIC task info — the instruction text, examples embedded in it, installed oracles, and your own "
                 "independent checks. NEVER read a hidden /tests/ dir, solution.sh, copied verifier code, or look up "
@@ -624,6 +687,8 @@ def get_tools() -> List[ToolEntry]:
                 "criterion_id": {"type": "string", "default": "", "description": "Optional id of the task_contract acceptance claim this receipt supports. Use ids from task_contract.acceptance_claims when present."},
                 "criterion_source": {"type": "string", "enum": ["task_stated", "agent_defined"], "default": "agent_defined", "description": "Where this success criterion came from: task_stated (the task/instructions state it) or agent_defined (you synthesized it). Flag-only honesty — an agent_defined criterion asks you to double-check it is equivalent to what the task actually requires."},
                 "criterion_basis": {"type": "string", "default": "", "description": "Optional one-line basis for an agent_defined criterion: why this check is sufficient evidence for the task's real requirement."},
+                "zero_run_decision": {"type": "string", "enum": list(_ZERO_RUN_DECISIONS), "description": "For delegation_zero_run only: the actor's typed decision when no selected physical leaf was started."},
+                "zero_run_basis": {"type": "string", "description": "For delegation_zero_run only: concise host-visible evidence or blocker; required and never inferred from final prose."},
                 "check": {"description": "The verification command: an argv list (['pytest','-q']) or a shell one-liner string. Required for visible_verifier/explicit_command/explicit_metric.", "type": ["array", "string"], "items": {"type": "string"}},
                 "expected": {"type": "string", "default": "", "description": "Optional expected substring/metric in the check output (explicit_command/explicit_metric)."},
                 "expected_match": {"type": "string", "enum": list(_EXPECTED_MATCH_KINDS), "default": "substring", "description": "How `expected` is matched: substring (default) · exact (whole stripped output equals expected) · exact_line (expected equals one stripped output line) · json_equals (output and expected parse to equal JSON, key-order tolerant) · bytes_equal (after the check runs, artifact_paths=[a, b] are compared BYTE-FOR-BYTE — golden files, migration parity; the receipt records a bounded hexdump of the first divergence). Use a stricter mode when the task gives a worked example / exact output."},

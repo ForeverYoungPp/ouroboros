@@ -826,7 +826,7 @@ export function renderSubagentsSection() {
                 </div>
                 <div class="form-field">
                     <label>Subagent depth</label>
-                    <input id="s-subagent-depth" type="number" min="0" max="10" value="2">
+                    <input id="s-subagent-depth" type="number" min="0" max="10" value="3">
                     <div class="settings-inline-note">How deep the chain may nest. <code>0</code> turns delegation off entirely.</div>
                 </div>
             </div>

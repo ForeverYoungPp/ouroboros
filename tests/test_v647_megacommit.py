@@ -958,6 +958,58 @@ def test_verify_and_record_handler_artifact_and_declared(tmp_path):
     assert read_verification_receipts(ctx.drive_root, "vhandler")[-1]["status"] == "declared"
 
 
+def test_configured_actor_can_record_typed_zero_run_only_before_leaf(tmp_path):
+    from ouroboros.outcomes import read_verification_receipts
+    from ouroboros.tools.verify import _verify_and_record
+
+    ctx = _verify_ctx(tmp_path)
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+    }
+    result = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="incomplete",
+        zero_run_basis="The selected route was unavailable and no host child produced the requested artifact.",
+    )
+    assert "INCOMPLETE" in result
+    receipt = read_verification_receipts(ctx.drive_root, ctx.task_id)[-1]
+    assert receipt["contract_kind"] == "delegation_zero_run"
+    assert receipt["status"] == "declared"
+    assert receipt["zero_run_decision"] == "incomplete"
+    assert receipt["physical_run_started"] is False
+    assert ctx._configured_actor_bootstrap["zero_run_receipt_recorded"] is True
+
+    ctx._configured_actor_bootstrap["physical_started"] = True
+    refused = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="unknown",
+        zero_run_basis="late decision",
+    )
+    assert "TOOL_ARG_ERROR" in refused
+
+
+def test_zero_run_requires_actor_marker_and_basis(tmp_path):
+    from ouroboros.tools.verify import _verify_and_record
+
+    ctx = _verify_ctx(tmp_path)
+    assert "TOOL_ARG_ERROR" in _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="unknown",
+        zero_run_basis="not an actor",
+    )
+    ctx._configured_actor_bootstrap = {"physical_started": False}
+    assert "TOOL_ARG_ERROR" in _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="unknown",
+    )
+
+
 def test_verify_and_record_receipt_truncation_is_disclosed(tmp_path, monkeypatch):
     # triad #C (BIBLE P1): a large check output is bounded in the durable receipt but the
     # truncation is DISCLOSED, never silent.

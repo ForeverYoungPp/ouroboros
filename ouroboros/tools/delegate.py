@@ -27,6 +27,7 @@ a dict this process happens to still hold.
 from __future__ import annotations
 
 import datetime as _dt
+from hashlib import sha256
 import json
 import logging
 import time
@@ -664,7 +665,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                     bucket: Optional[str] = None, skill_name: Optional[str] = None,
                     _resolved_binding: Any = None,
                     _canonical_work_order_fingerprint: str = "",
-                    _work_order_source_request: Any = None) -> str:
+                    _work_order_source_request: Any = None,
+                    _coordination_context: str = "") -> str:
     from ouroboros.claudexor_daemon import ensure_owned_gateway
     from ouroboros.delegate_evidence import record_start_blocked
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
@@ -805,6 +807,13 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 payload_skill=(str((record_auth.get("resource_ref") or {})
                                    .get("skill_name") or "")
                                if payload_auth is not None else ""))
+            if _coordination_context:
+                coordination_sha = sha256(_coordination_context.encode("utf-8")).hexdigest()
+                instructions += (
+                    "\n\nHOST COORDINATION CONTEXT (advisory appendix; canonical work-order "
+                    f"authority remains unchanged; sha256={coordination_sha}):\n"
+                    + _coordination_context
+                )
             key = custody.idempotency_key(getattr(ctx, "task_id", ""), route.route_id, access,
                                           authority.mode, authority.isolation, root, text,
                                           instructions)

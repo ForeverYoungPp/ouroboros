@@ -6,6 +6,7 @@ import json
 import pathlib
 import time
 import uuid
+from hashlib import sha256
 from typing import Any, Callable, Optional
 
 from ouroboros import delegate_custody as custody
@@ -20,6 +21,7 @@ from ouroboros.utils import atomic_write_json, utc_now_iso
 _TICK_SEC = 3
 _QUIET_STATUSES = {"progress", "no_progress"}
 _LOOP_CONTROL_KINDS = {KIND_FINALIZE_NOW, KIND_HURRY}
+_MAX_COORDINATION_SEEN = 256
 
 
 def _attempt_key(ctx: Any) -> str:
@@ -63,6 +65,132 @@ def _payload(raw: str) -> dict[str, Any]:
         return data if isinstance(data, dict) else {"status": "fault", "detail": raw}
     except (TypeError, ValueError):
         return {"status": "fault", "detail": str(raw or "")}
+
+
+def _coordination_cursor(state: dict[str, Any]) -> dict[str, Any]:
+    cursor = state.get("coordination_cursor")
+    if not isinstance(cursor, dict):
+        cursor = {}
+    seen = cursor.get("attention_seen")
+    return {
+        "attention_after_ts": str(cursor.get("attention_after_ts") or ""),
+        "attention_seen": [str(item) for item in seen if str(item)]
+        if isinstance(seen, list) else [],
+        "children": dict(cursor.get("children"))
+        if isinstance(cursor.get("children"), dict) else {},
+    }
+
+
+def _coordination_row_id(row: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+    )
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _direct_children(ctx: Any) -> dict[str, dict[str, Any]]:
+    """Read the existing durable direct-child projection for this nanny."""
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    if not task_id:
+        return {}
+    try:
+        from ouroboros.task_status import find_child_tasks
+
+        children = find_child_tasks(
+            custody.custody_root(ctx), parent_task_id=task_id,
+            root_task_id="", scope="direct", materialize_artifacts=False,
+        )
+    except Exception:
+        return {}
+    return {
+        str(child.get("task_id") or child.get("id") or ""): dict(child)
+        for child in children
+        if isinstance(child, dict)
+        and str(child.get("task_id") or child.get("id") or "")
+    }
+
+
+def _child_marker(child: dict[str, Any]) -> dict[str, str]:
+    return {
+        "status": str(child.get("status") or "").strip().lower(),
+        "updated_at": str(child.get("updated_at") or child.get("ts") or ""),
+        "result_sha256": str(
+            child.get("child_result_sha256") or child.get("result_sha256") or ""
+        ),
+    }
+
+
+def _coordination_wakes(
+    ctx: Any, state: dict[str, Any], *, seed: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Collect direct-child beacons and terminal transitions on one cursor."""
+    cursor = _coordination_cursor(state)
+    children = _direct_children(ctx)
+    markers = {
+        child_id: _child_marker(child) for child_id, child in children.items()
+    }
+    if seed and "coordination_cursor" not in state:
+        cursor["children"] = markers
+        return [], cursor
+
+    metadata = getattr(ctx, "task_metadata", {})
+    root_id = str(metadata.get("root_task_id") or "").strip() if isinstance(metadata, dict) else ""
+    root_id = root_id or str(getattr(ctx, "task_id", "") or "").strip()
+    attention: list[dict[str, Any]] = []
+    seen = {str(item) for item in cursor.get("attention_seen", []) if str(item)}
+    try:
+        from ouroboros.task_tree_ledger import tree_ledger_attention_after
+
+        attention = tree_ledger_attention_after(
+            root_id,
+            str(cursor.get("attention_after_ts") or ""),
+            task_ids=set(children),
+            seen_ids=seen,
+            data_root=custody.custody_root(ctx),
+        )
+    except Exception:
+        attention = []
+    new_attention = [row for row in attention if _coordination_row_id(row) not in seen]
+    terminal_events: list[dict[str, Any]] = []
+    prior_children = cursor.get("children") if isinstance(cursor.get("children"), dict) else {}
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    for child_id, marker in markers.items():
+        previous = prior_children.get(child_id) if isinstance(prior_children.get(child_id), dict) else {}
+        status = marker["status"]
+        if (
+            status in SETTLED_STATUSES
+            and str(previous.get("status") or "") not in SETTLED_STATUSES
+        ):
+            terminal_events.append({
+                "type": "child_terminal",
+                "child_task_id": child_id,
+                "status": status,
+                "updated_at": marker["updated_at"],
+                "result_sha256": marker["result_sha256"],
+            })
+    events = [
+        {"type": "child_attention_beacon", "beacon": row}
+        for row in new_attention
+    ] + terminal_events
+    next_cursor = {
+        "attention_after_ts": str(cursor.get("attention_after_ts") or ""),
+        "attention_seen": list(cursor.get("attention_seen", [])),
+        "children": {**prior_children, **markers},
+    }
+    if new_attention:
+        timestamps = [
+            str(row.get("ts") or "") for row in new_attention if str(row.get("ts") or "")
+        ]
+        if timestamps:
+            next_cursor["attention_after_ts"] = max(
+                str(next_cursor["attention_after_ts"] or ""), max(timestamps)
+            )
+        next_cursor["attention_seen"] = list(dict.fromkeys([
+            *next_cursor["attention_seen"],
+            *(_coordination_row_id(row) for row in new_attention),
+        ]))[-_MAX_COORDINATION_SEEN:]
+    return events, next_cursor
 
 
 def _addressed_wakes(ctx: Any, state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -221,6 +349,7 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
         "mailbox_ids": mailbox_ids,
         "attempt_key": attempt,
         "interaction_ids": list(pending.get("interaction_ids") or []),
+        "coordination": bool(pending.get("coordination_cursor")),
     }):
         return False
     interaction_ids = frozenset(
@@ -247,6 +376,9 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
         *(str(item) for item in (state.get("interaction_acknowledged_ids") or []) if str(item)),
         *interaction_ids,
     })
+    coordination_cursor = pending.get("coordination_cursor")
+    if isinstance(coordination_cursor, dict):
+        state["coordination_cursor"] = coordination_cursor
     pending["acknowledged_at"] = utc_now_iso()
     state["last_acknowledged_wake"] = pending
     state["pending_wake"] = {}
@@ -325,6 +457,11 @@ def supervised_wait(
             "run_id": str(run_id), "due_at_unix": state["checkpoint"]["due_at_unix"],
             "reason": state["checkpoint"]["reason"],
         })
+    # Seed the child projection before the first transport poll. A child that was
+    # already terminal when this sleep began is context, not a new transition.
+    if "coordination_cursor" not in state:
+        _events, initial_cursor = _coordination_wakes(ctx, state, seed=True)
+        state["coordination_cursor"] = initial_cursor
     _save_state(ctx, state)
     _emit(ctx, "delegate_supervision_wait_entered", {
         "run_id": str(run_id), "journal_cursor": int(state.get("journal_cursor") or 0),
@@ -342,7 +479,10 @@ def supervised_wait(
         cursor = payload.get("last_seq")
         if isinstance(cursor, int):
             state["journal_cursor"] = max(int(state.get("journal_cursor") or 0), cursor)
-        wakes = _addressed_wakes(ctx, state) + _control_wakes(ctx)
+        addressed_wakes = _addressed_wakes(ctx, state)
+        control_wakes = _control_wakes(ctx)
+        coordination_events, next_coordination_cursor = _coordination_wakes(ctx, state)
+        wakes = addressed_wakes + control_wakes + coordination_events
         checkpoint = state.get("checkpoint") if isinstance(state.get("checkpoint"), dict) else {}
         due = bool(
             checkpoint
@@ -389,6 +529,7 @@ def supervised_wait(
                     if str(item.get("msg_id") or "")
                 ],
                 "interaction_ids": sorted(_interaction_ids(payload)),
+                "coordination_cursor": next_coordination_cursor,
                 "created_at": utc_now_iso(),
             }
             _save_state(ctx, state)
@@ -399,6 +540,7 @@ def supervised_wait(
                 "interaction_ids": list(state["pending_wake"]["interaction_ids"]),
             })
             return json.dumps(payload, ensure_ascii=False, indent=2)
+        state["coordination_cursor"] = next_coordination_cursor
         state["quiet_renewals"] = int(state.get("quiet_renewals") or 0) + 1
         renewals = int(state["quiet_renewals"])
         if renewals == 1 or renewals & (renewals - 1) == 0:

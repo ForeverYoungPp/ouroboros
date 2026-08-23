@@ -280,8 +280,12 @@ def test_blocked_session_bootstrap_wakes_first_turn_with_alternatives(monkeypatc
     out = json.loads(bootstrap_before_context(
         ctx, {"id": "child1", "configured_subagent": snapshot}, dispatch,
     ))
-    assert out["status"] == "configured_session_start_wake"
-    assert out["startup"] == {
+    assert out["status"] == "configured_session_actor_ready"
+    startup = out["startup"]
+    assert {key: startup[key] for key in (
+        "status", "reason", "reset_at", "selected_subagent_id", "alternatives",
+        "host_fallback", "actor_first", "exact_start_pending",
+    )} == {
         "status": "temporarily_unavailable",
         "reason": "subscription_window_exhausted",
         "reset_at": "2030-01-01T00:00:00Z",
@@ -291,7 +295,13 @@ def test_blocked_session_bootstrap_wakes_first_turn_with_alternatives(monkeypatc
             "target_id": "google/gemini-3.7-flash", "availability": "check_at_dispatch",
         }],
         "host_fallback": False,
+        "actor_first": True,
+        "exact_start_pending": True,
     }
+    assert startup["route"] == "codex=gpt-5.6-sol"
+    assert len(startup["work_order_fingerprint"]) == 64
+    assert startup["work_order_chars"] > 0
+    assert startup["work_order_complete"] is True
     rows = [json.loads(line) for line in custody.event_log_path(tmp_path).read_text().splitlines()]
     assert rows[-1]["type"] == "configured_subagent_startup_fault"
 
@@ -499,7 +509,6 @@ def test_pending_over_budget_recovery_replays_compact_body_and_full_fingerprint(
 def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tmp_path):
     from ouroboros import agent as agent_module
     import ouroboros.claudexor_daemon as daemon
-    import ouroboros.subagent_bootstrap as bootstrap
     import ouroboros.subagents as subagents
     from ouroboros.agent import Env, OuroborosAgent
 
@@ -518,13 +527,6 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
         lambda *_a, **_k: ("", ""),
     )
     monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
-    monkeypatch.setattr(
-        bootstrap, "bootstrap_session_leaf",
-        lambda *_a, **_k: order.append("atomic_start_and_wait") or json.dumps({
-            "status": "configured_session_wake", "wake": {"status": "completed"},
-        }),
-    )
-
     def build_context(**_kwargs):
         order.append("context_build")
         return [], {}
@@ -534,7 +536,7 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
     agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
     agent.tools.available_tools = lambda: ["delegate_start", "delegate_wait", "delegate_cancel"]
     agent.llm.chat = lambda *_a, **_k: (_ for _ in ()).throw(
-        AssertionError("no nanny LLM call is legal before external custody")
+        AssertionError("_prepare_task_context must not call the model")
     )
     _ctx, messages, _caps = agent._prepare_task_context({
         "id": "child1", "type": "task", "chat_id": 1, "text": "Build",
@@ -546,9 +548,135 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
         "task_contract": {"objective": "Build", "expected_output": "Patch"},
         "drive_root": str(drive), "budget_drive_root": str(drive),
     })
-    assert order == ["atomic_start_and_wait", "context_build"]
+    assert order == ["context_build"]
     assert any("CONFIGURED SESSION STARTUP / WAKE RECEIPT" in item["content"] for item in messages)
-    assert _ctx._nanny_delegate_baseline == {"round": 0, "cost": 0.0}
+    receipt = next(item["content"] for item in messages if "CONFIGURED SESSION STARTUP / WAKE RECEIPT" in item["content"])
+    assert "exact_start_pending" in receipt
+    assert _ctx._configured_actor_bootstrap["selected_subagent_id"] == "session-builder"
+    assert _ctx._configured_actor_bootstrap["canonical_work_order"]
+    # No physical run exists yet, so the pacing baseline must not pretend a
+    # delegated activity already happened.
+    assert _ctx._nanny_delegate_baseline is None
+
+
+def test_actor_first_delegate_start_binds_snapshot_and_canonical_work_order(monkeypatch, tmp_path):
+    import ouroboros.subagent_runtime as runtime
+
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    calls = []
+
+    monkeypatch.setattr(
+        runtime, "exact_start",
+        lambda ctx, prompt, spec: calls.append((prompt, spec)) or json.dumps({
+            "status": "started", "run_id": "run-actor-first",
+        }),
+    )
+    ctx = SimpleNamespace(
+        task_id="child1", drive_root=tmp_path, budget_drive_root=str(tmp_path),
+        _configured_actor_bootstrap={
+            "snapshot": snapshot,
+            "selected_subagent_id": "session-builder",
+            "canonical_work_order": "OBJECTIVE\nBuild the patch",
+            "work_order_fingerprint": "full-work-order-sha",
+            "work_order_chars": 23,
+        },
+    )
+
+    out = json.loads(runtime.delegate_start_entry(
+        ctx, "Split the work into the smallest useful pass", subagent_id="session-builder",
+    ))
+    assert out["status"] == "started"
+    assert calls == [(
+        "OBJECTIVE\nBuild the patch",
+        {
+            "snapshot": snapshot,
+            "compiled_work_order": True,
+            "work_order_fingerprint": "full-work-order-sha",
+            "_coordination_context": "Split the work into the smallest useful pass",
+        },
+    )]
+
+
+def test_actor_first_delegate_start_rejects_alternate_snapshot(monkeypatch, tmp_path):
+    import ouroboros.subagent_runtime as runtime
+
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    ctx = SimpleNamespace(
+        task_id="child1", drive_root=tmp_path, budget_drive_root=str(tmp_path),
+        _configured_actor_bootstrap={
+            "snapshot": snapshot,
+            "selected_subagent_id": "session-builder",
+            "canonical_work_order": "OBJECTIVE\nBuild the patch",
+            "work_order_fingerprint": "full-work-order-sha",
+            "work_order_chars": 23,
+        },
+    )
+    out = json.loads(runtime.delegate_start_entry(
+        ctx, "retarget me", subagent_id="other-session",
+    ))
+    assert out["status"] == "refused"
+    assert out["reason"] == "configured_actor_route_mismatch"
+    assert out["host_fallback"] is False
+
+
+def test_actor_first_retry_cannot_turn_coordination_prompt_into_work_order_prefix(monkeypatch, tmp_path):
+    import ouroboros.subagent_runtime as runtime
+
+    ctx = SimpleNamespace(
+        task_id="child-over-budget", drive_root=tmp_path, budget_drive_root=str(tmp_path),
+        _configured_actor_bootstrap={
+            "selected_subagent_id": "session-builder",
+            "canonical_work_order": "",
+            "source_request": {"kind": "complete_work_order", "sha256": "f" * 64},
+            "source_channel": {"status": "unverified"},
+            "work_order_fingerprint": "f" * 64,
+            "work_order_chars": 250001,
+        },
+    )
+    monkeypatch.setattr(
+        runtime, "exact_start",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an over-budget retry must refuse before exact_start")
+        ),
+    )
+    out = json.loads(runtime.delegate_start_entry(
+        ctx, "coordination text is not the canonical assignment", retry_of="inv-1",
+    ))
+    assert out["status"] == "refused"
+    assert out["reason"] == "configured_work_order_unavailable"
+
+
+def test_actor_first_bootstrap_adopts_existing_handoff_without_new_start(monkeypatch, tmp_path):
+    import ouroboros.delegate_recovery as recovery
+    from ouroboros.subagent_bootstrap import bootstrap_before_context
+
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    monkeypatch.setattr(recovery, "adopt_handoff", lambda _ctx, _task: {
+        "status": "adopted", "run_id": "run-recovered",
+    })
+    monkeypatch.setattr(
+        "ouroboros.delegate_supervision.supervised_wait",
+        lambda _ctx, run_id: json.dumps({"status": "completed", "run_id": run_id}),
+    )
+    dispatch = SimpleNamespace(
+        blocked=False,
+        executor="harness",
+        executor_resolution=SimpleNamespace(reason="harness_ready"),
+    )
+    ctx = SimpleNamespace(task_id="child-recovery", drive_root=tmp_path, budget_drive_root=str(tmp_path))
+    out = json.loads(bootstrap_before_context(
+        ctx,
+        {
+            "id": "child-recovery",
+            "objective": "Recover",
+            "configured_subagent": snapshot,
+            "task_contract": {"objective": "Recover"},
+        },
+        dispatch,
+    ))
+    assert out["status"] == "configured_session_recovered_wake"
+    assert out["recovery"]["run_id"] == "run-recovered"
+    assert out["wake"]["status"] == "completed"
 
 
 def test_started_uncustodied_wakes_without_entering_quiet_wait(monkeypatch, tmp_path):

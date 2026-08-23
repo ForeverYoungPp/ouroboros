@@ -309,6 +309,22 @@ def test_a_delegating_nanny_and_a_native_child_are_not_nudged():
                              _nanny_finalization_injected=False)
     assert _run(native, [], []) is False
 
+
+def test_actor_first_host_coordination_suppresses_zero_leaf_accusation(tmp_path):
+    # Scheduling or inspecting a host child is a valid actor-first outcome. It
+    # must not be reported as if the nanny silently chose metered inline work.
+    from ouroboros.loop import _nanny_finalization_message
+
+    drive = _custody_drive(tmp_path)
+    ctx = SimpleNamespace(
+        _nanny_route_dispatched=True,
+        _nanny_finalization_injected=False,
+        _nanny_coordination_activity=True,
+        task_metadata={"budget_drive_root": str(drive)},
+    )
+    tools = _tools(ctx, ["delegate_start", "delegate_wait", "schedule_subagent"])
+    assert _nanny_finalization_message(tools, drive, "child-1") == ""
+
     undispatched = SimpleNamespace()  # a ctx that never saw a dispatch at all
     assert _run(undispatched, [], []) is False
 

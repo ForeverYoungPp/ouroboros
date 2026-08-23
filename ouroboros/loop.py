@@ -2753,6 +2753,15 @@ _DELEGATE_ACTIVITY_TOOLS = frozenset({
     "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
 })
 
+# Host-side coordination is a real nanny activity in the actor-first model.
+# These are existing typed tools, not a topology or scheduler policy: a model
+# may use any subset, and the marker only records that it did so.
+_HOST_COORDINATION_ACTIVITY_TOOLS = frozenset({
+    "schedule_subagent", "wait_task", "wait_tasks", "get_task_result", "peek_task",
+    "tree_note", "tree_read", "verify_and_record", "cancel_task",
+    "discard_child_result", "override_delegation_constraint", "forward_to_worker",
+})
+
 
 def _note_nanny_delegate_activity(
     ctx: Any, round_idx: int, accumulated_usage: Dict[str, Any],
@@ -2776,11 +2785,23 @@ def _note_nanny_delegate_activity(
     mark = {"round": int(round_idx), "cost": cost}
     ctx._nanny_metered_progress = mark
     verbs = set()
+    coordination_verbs = set()
     for call in tool_calls or []:
         fn = call.get("function") if isinstance(call, dict) else None
         name = str((fn or {}).get("name") or "").strip() if isinstance(fn, dict) else ""
         if name in _DELEGATE_ACTIVITY_TOOLS:
             verbs.add(name)
+        if name in _HOST_COORDINATION_ACTIVITY_TOOLS:
+            coordination_verbs.add(name)
+    if coordination_verbs:
+        # This is distinct from physical delegated-run custody, but it is still
+        # meaningful nanny pacing and must prevent a false zero-delegation
+        # accusation after an actor scheduled or inspected host children.
+        ctx._nanny_coordination_activity = True
+        ctx._nanny_coordination_tools = tuple(sorted(coordination_verbs))
+        ctx._nanny_delegate_baseline = dict(mark)
+        ctx._nanny_reminder_mark = None
+        return
     if not verbs:
         return
     if verbs == {"delegate_wait"}:
@@ -2902,8 +2923,14 @@ def _maybe_inject_nanny_economics_reminder(
     # activity" — the burn is measured from the task's start, and the wording
     # says so instead of implying an activity that never happened.
     _baseline_known = isinstance(getattr(ctx, "_nanny_delegate_baseline", None), dict)
-    since_phrase = ("since your last delegated-run activity" if _baseline_known
-                    else "since this task started (no delegated-run activity yet)")
+    coordination = bool(getattr(ctx, "_nanny_coordination_activity", False))
+    if _baseline_known:
+        since_phrase = (
+            "since your last delegated-run or host-coordination activity"
+            if coordination else "since your last delegated-run activity"
+        )
+    else:
+        since_phrase = "since this task started (no delegated-run activity yet)"
     # BR1-3: never an unconditional "$0" claim — the owner's wording law is
     # typed cost classes: known-zero only on a settled $0 spend, never "free"
     # unqualified (estimated/undisclosed spend is never zero).
@@ -5836,6 +5863,35 @@ def _nanny_finalization_message(
             "or state in your final answer that the delegated run failed and why "
             "the remaining work ran on metered API tokens."
         )
+    # Actor-first configured sessions may legitimately spend the episode on
+    # host-side coordination instead of starting a physical leaf.  A typed
+    # coordination tool call is enough evidence for this decision; when a
+    # continuation has already persisted a direct child, recover that fact from
+    # the existing task-result SSOT as well.  Neither path creates a second
+    # ledger or infers topology from prose.
+    host_coordination = bool(getattr(tools._ctx, "_nanny_coordination_activity", False))
+    if not host_coordination:
+        try:
+            from ouroboros.task_status import find_child_tasks
+
+            metadata = getattr(tools._ctx, "task_metadata", {})
+            metadata = metadata if isinstance(metadata, dict) else {}
+            status_root = pathlib.Path(str(
+                metadata.get("budget_drive_root")
+                or getattr(tools._ctx, "budget_drive_root", "")
+                or drive_root
+            ))
+            host_coordination = bool(find_child_tasks(
+                status_root,
+                parent_task_id=str(task_id or ""),
+                exclude_task_id=str(task_id or ""),
+                scope="direct",
+                materialize_artifacts=False,
+            ))
+        except Exception:
+            log.debug("nanny nudge: host coordination evidence read failed", exc_info=True)
+    if host_coordination:
+        return ""
     return (
         "⚠️ NANNY_DID_NOT_DELEGATE: this task was dispatched onto the delegated "
         "substrate (executor=harness), but you are finalizing with ZERO "

@@ -553,17 +553,42 @@ def tree_ledger_tail_digest(
     return "\n".join(lines)
 
 
-def tree_ledger_attention_after(root_id: str, after_ts: str) -> List[Dict[str, Any]]:
-    """Attention-beacons (blocker/question/interface_contract) strictly after after_ts — drives the
-    sliced wait's early return so a parent reacts to a child's beacon without waiting for it to
-    terminate."""
+def tree_ledger_attention_after(
+    root_id: str,
+    after_ts: str,
+    *,
+    task_ids: set[str] | None = None,
+    seen_ids: set[str] | None = None,
+    data_root: pathlib.Path | None = None,
+) -> List[Dict[str, Any]]:
+    """Return new attention beacons, optionally filtered to direct children.
+
+    The ledger is whole-tree scoped, but a sleeping nanny may react only to its
+    own direct children. Existing wait tools omit the optional filters and keep
+    their historical whole-tree projection.
+    """
     out: List[Dict[str, Any]] = []
-    for r in tree_ledger_rows(root_id):
+    allowed = {str(item) for item in task_ids} if task_ids is not None else None
+    seen = {str(item) for item in seen_ids} if seen_ids is not None else set()
+    for r in tree_ledger_rows(root_id, data_root=data_root):
         if not r.get("needs_parent_attention"):
             continue
-        ts = str(r.get("ts") or "")
-        if after_ts and ts <= after_ts:
+        if allowed is not None and str(r.get("task_id") or "") not in allowed:
             continue
+        ts = str(r.get("ts") or "")
+        if after_ts and ts < after_ts:
+            continue
+        if after_ts and ts == after_ts:
+            # Historical callers rely on the original strict-after contract.
+            # The sleeping-nanny rail passes seen_ids so equal-timestamp rows can
+            # still be admitted once and then de-duplicated by content hash.
+            if seen_ids is None:
+                continue
+            row_id = sha256(json.dumps(
+                r, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+            ).encode("utf-8")).hexdigest()
+            if row_id in seen:
+                continue
         out.append(r)
     return out
 

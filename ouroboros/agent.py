@@ -349,6 +349,9 @@ def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool, delegate_ac
     ctx._nanny_finalization_injected = False
     ctx._nanny_metered_progress = None
     ctx._nanny_delegate_baseline = ({"round": 0, "cost": 0.0} if delegate_activity_seed else None)
+    ctx._nanny_coordination_activity = False
+    ctx._nanny_coordination_tools = ()
+    ctx._nanny_physical_activity_seed = False
     ctx._nanny_reminder_mark = None
 
 
@@ -974,7 +977,11 @@ class OuroborosAgent:
             dispatch is not None
             and dispatch.executor_resolution is not None
             and dispatch.executor_resolution.executor == "harness"
-        ), delegate_activity_seed=bool(startup_wake))
+        ), delegate_activity_seed=bool(
+            isinstance(getattr(ctx, "_configured_actor_bootstrap", None), dict)
+            and getattr(ctx, "_configured_actor_bootstrap", {}).get("physical_started")
+            or getattr(ctx, "_nanny_physical_activity_seed", False)
+        ))
 
         budget_remaining = None
         budget_accounting_status = "available"

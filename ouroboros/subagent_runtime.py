@@ -577,6 +577,7 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
     canonical_work_order_fingerprint = str(
         options.pop("work_order_fingerprint", "") or ""
     ).strip()
+    coordination_context = str(options.pop("_coordination_context", "") or "").strip()
     work_order_source_request = options.pop("work_order_source_request", None)
     try:
         if str(options.get("retry_of") or "").strip() and (
@@ -624,6 +625,7 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
             _resolved_binding=options.pop("_resolved_binding", None),
             _canonical_work_order_fingerprint=canonical_work_order_fingerprint,
             _work_order_source_request=work_order_source_request,
+            _coordination_context=coordination_context,
         )
         try:
             payload = json.loads(result)
@@ -648,6 +650,99 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
 
 
 def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, **params: Any) -> str:
+    # Actor-first configured sessions bind every fresh start to the immutable
+    # snapshot captured before the episode. The model supplies only an advisory
+    # coordination appendix; the canonical work order remains host-owned.
+    bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+    retry_of = str(params.get("retry_of") or "").strip()
+    from ouroboros.delegate_shared import _fail
+    if isinstance(bootstrap, dict) and not retry_of:
+        expected_id = str(bootstrap.get("selected_subagent_id") or "")
+        requested_id = str(params.get("subagent_id") or "").strip()
+        if requested_id and requested_id != expected_id:
+            return _fail(
+                "delegate_start", "configured_actor_route_mismatch",
+                "This actor-first turn is bound to its scheduled configured session; "
+                "select another actor with schedule_subagent instead.",
+                selected_subagent_id=expected_id,
+                requested_subagent_id=requested_id,
+                host_fallback=False,
+            )
+        if any(str(params.get(key) or "").strip() for key in ("root", "bucket", "skill_name")):
+            return _fail(
+                "delegate_start", "configured_actor_resource_mismatch",
+                "An actor-first configured session may start only its assigned route, "
+                "not a skill-payload resource.",
+                selected_subagent_id=expected_id,
+                host_fallback=False,
+            )
+        canonical_work_order = str(bootstrap.get("canonical_work_order") or "")
+        source_request = bootstrap.get("source_request")
+        if not canonical_work_order and isinstance(source_request, dict) and source_request:
+            if str((bootstrap.get("source_channel") or {}).get("status") or "") != "available":
+                return _fail(
+                    "delegate_start", "work_order_source_channel_unavailable",
+                    "The complete canonical work order exceeds the host wire budget and "
+                    "the selected route has no verified interactive source channel; the "
+                    "physical leaf was not started from a prefix.",
+                    work_order_fingerprint=str(bootstrap.get("work_order_fingerprint") or ""),
+                    source_channel=bootstrap.get("source_channel") or {},
+                    host_fallback=False,
+                )
+            canonical_work_order = str(bootstrap.get("source_prompt") or "")
+        if not canonical_work_order:
+            return _fail(
+                "delegate_start", "configured_work_order_unavailable",
+                "The canonical work order is unavailable; do not start a physical leaf "
+                "from a prefix. Resolve the existing source-range interaction first.",
+                work_order_fingerprint=str(bootstrap.get("work_order_fingerprint") or ""),
+                work_order_chars=int(bootstrap.get("work_order_chars") or 0),
+                host_fallback=False,
+            )
+        bound = dict(params)
+        bound.pop("subagent_id", None)
+        bound.update({
+            "snapshot": dict(bootstrap.get("snapshot") or {}),
+            "compiled_work_order": True,
+            "work_order_fingerprint": str(bootstrap.get("work_order_fingerprint") or ""),
+            "_coordination_context": str(prompt or "").strip(),
+        })
+        if _resolved_binding is not None:
+            bound["_resolved_binding"] = _resolved_binding
+        if isinstance(source_request, dict) and source_request:
+            bound["work_order_source_request"] = dict(source_request)
+        return exact_start(ctx, canonical_work_order, bound)
+    if retry_of and isinstance(bootstrap, dict):
+        # Retry replays the stored canonical request byte-for-byte; do not let a
+        # new coordination sentence become a prefix when the original order was
+        # over the host wire budget.
+        canonical_work_order = str(bootstrap.get("canonical_work_order") or "")
+        if not canonical_work_order:
+            source_request = bootstrap.get("source_request")
+            source_channel = bootstrap.get("source_channel")
+            if (
+                isinstance(source_request, dict)
+                and source_request
+                and isinstance(source_channel, dict)
+                and str(source_channel.get("status") or "") == "available"
+            ):
+                canonical_work_order = str(bootstrap.get("source_prompt") or "")
+            if not canonical_work_order:
+                return _fail(
+                    "delegate_start", "configured_work_order_unavailable",
+                    "The retry has no complete canonical work order or verified source "
+                    "lens; the coordination prompt cannot replace the original assignment.",
+                    work_order_fingerprint=str(bootstrap.get("work_order_fingerprint") or ""),
+                    work_order_chars=int(bootstrap.get("work_order_chars") or 0),
+                    host_fallback=False,
+                )
+        retry_spec = {
+            "retry_of": retry_of,
+            "_resolved_binding": _resolved_binding,
+        }
+        if isinstance(bootstrap.get("source_request"), dict) and bootstrap.get("source_request"):
+            retry_spec["work_order_source_request"] = dict(bootstrap["source_request"])
+        return exact_start(ctx, canonical_work_order, retry_spec)
     return exact_start(ctx, prompt, {**params, "_resolved_binding": _resolved_binding})
 
 

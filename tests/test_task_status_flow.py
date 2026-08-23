@@ -2190,8 +2190,8 @@ def test_other_bounded_int_settings_keep_their_min_of_one(monkeypatch):
 
 def test_settings_ui_carries_a_configured_zero_subagent_depth():
     """The runtime honouring 0 is worthless if the Settings page silently reverts it: 0 is FALSY
-    in JS, so a stored 0 read through the plain `if (value)` branch displayed the fallback 2, and
-    the next Save (which posts every number field unconditionally) wrote 2 back — re-enabling two
+    in JS, so a stored 0 read through the plain `if (value)` branch displayed the fallback 3, and
+    the next Save (which posts every number field unconditionally) wrote 3 back — re-enabling three
     levels of delegation through the UI. All three carriers of the owner's 0 are pinned: the input
     can reach it, the depth entry is falsy-tolerant, and the load path still honours that flag
     (without which the flag is inert)."""
@@ -2203,7 +2203,7 @@ def test_settings_ui_carries_a_configured_zero_subagent_depth():
     settings_ui = (root / "web" / "modules" / "subagents_settings.js").read_text(encoding="utf-8")
     assert 'id="s-subagent-depth" type="number" min="0"' in settings_ui
     # The 4th tuple element is the falsy-tolerant flag consumed by the load path below.
-    assert "['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 2, true]" in settings_js
+    assert "['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 3, true]" in settings_js
     assert (
         "if (allowFalsy ? value !== null && value !== undefined : value) byId(id).value = value;"
         in settings_js

@@ -2864,6 +2864,26 @@ def assign_tasks() -> None:
                 if str(task.get("delegation_role") or "") == "subagent" and str(task.get("drive_root") or ""):
                     try:
                         from ouroboros.task_results import STATUS_RUNNING, write_task_result
+                        from ouroboros.tools.control_delegation import stamp_depth_provenance
+                        from ouroboros.config import get_max_subagent_depth
+
+                        # Assignment is the first host-visible execution fact. Keep
+                        # queued/cancelled children at ``achieved_depth=None`` and
+                        # advance the projection only here, when a worker has
+                        # actually accepted the child. This does not claim that a
+                        # vendor run succeeded; custody/evidence owns that fact.
+                        _task_contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
+                        _depth = int(task.get("depth", 0) or 0)
+                        _achieved_contract, _achieved_provenance = stamp_depth_provenance(
+                            _task_contract,
+                            attempted_depth=_depth,
+                            max_depth=get_max_subagent_depth(),
+                            achieved_depth=_depth,
+                        )
+                        _depth_fields = (
+                            {"task_contract": _achieved_contract, "depth_provenance": _achieved_provenance}
+                            if _task_contract else {}
+                        )
                         write_task_result(
                             DRIVE_ROOT,
                             str(task.get("id") or ""),
@@ -2885,6 +2905,7 @@ def assign_tasks() -> None:
                             child_drive_root=task.get("child_drive_root") or task.get("drive_root"),
                             budget_drive_root=task.get("budget_drive_root"),
                             task_constraint=task.get("task_constraint"),
+                            **_depth_fields,
                             # INTENT ONLY. This mirror is written at ASSIGNMENT, one
                             # step before the worker dispatches and resolves the
                             # child; naming `effective_model_lane`/`model` here wrote

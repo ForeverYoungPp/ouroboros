@@ -16,7 +16,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable
 
-from ouroboros.contracts.task_contract import _normalized_intent_note, normalize_bool
+from ouroboros.contracts.task_contract import (
+    _normalized_intent_note,
+    normalize_bool,
+    normalize_depth_provenance,
+)
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import utc_now_iso
 
@@ -39,6 +43,153 @@ class DelegationBudgetDecision:
     # dispatch-time policy default (auto+harness ⇒ light) must not override a
     # lane the admission gate just enforced.
     required_lane: str = ""
+
+
+@dataclass(frozen=True)
+class DelegationAdmissionDecision:
+    """Typed parent-rights admission outcome for one direct-child request."""
+
+    ok: bool
+    reason_code: str = ""
+    detail: str = ""
+    direct_child_count: int = 0
+
+
+def check_delegation_admission(
+    parent_budget: Dict[str, Any], *, direct_child_count: int = 0,
+) -> DelegationAdmissionDecision:
+    """Enforce explicit recursion rights while keeping omitted legacy permissive."""
+    budget = parent_budget if isinstance(parent_budget, dict) else {}
+    try:
+        count = max(0, int(direct_child_count or 0))
+    except (TypeError, ValueError):
+        count = 0
+    if not normalize_bool(budget.get("may_delegate", True)):
+        return DelegationAdmissionDecision(
+            False,
+            reason_code="delegation_rights_may_delegate",
+            detail="The parent delegation budget explicitly forbids descendants (may_delegate=false).",
+            direct_child_count=count,
+        )
+    depth_remaining = budget.get("depth_remaining")
+    try:
+        if depth_remaining is not None and int(depth_remaining) <= 0:
+            return DelegationAdmissionDecision(
+                False,
+                reason_code="delegation_rights_depth_exhausted",
+                detail="The parent delegation budget has no remaining descendant depth.",
+                direct_child_count=count,
+            )
+    except (TypeError, ValueError):
+        # Malformed depth is treated as unknown here; the existing configured
+        # depth gate remains authoritative and emits its own typed refusal.
+        pass
+    max_children = budget.get("max_children")
+    try:
+        if max_children is not None and int(max_children) > 0 and count >= int(max_children):
+            return DelegationAdmissionDecision(
+                False,
+                reason_code="delegation_rights_max_children",
+                detail=(
+                    "The parent delegation budget has reached its explicit direct-child "
+                    f"cap ({int(max_children)})."
+                ),
+                direct_child_count=count,
+            )
+    except (TypeError, ValueError):
+        pass
+    if not normalize_bool(budget.get("may_fan_out", True)) and count >= 1:
+        return DelegationAdmissionDecision(
+            False,
+            reason_code="delegation_rights_may_fan_out",
+            detail=(
+                "The parent delegation budget permits one direct child but forbids "
+                "additional direct children (may_fan_out=false)."
+            ),
+            direct_child_count=count,
+        )
+    return DelegationAdmissionDecision(ok=True, direct_child_count=count)
+
+
+def durable_direct_child_count(
+    drive_root: Any, parent_task_id: Any, *, exclude_task_id: Any = "",
+) -> int:
+    """Count the parent's already admitted direct children from task-result SSOT."""
+    parent = str(parent_task_id or "").strip()
+    excluded = str(exclude_task_id or "").strip()
+    if not parent or not str(drive_root or "").strip():
+        return 0
+    try:
+        from ouroboros.task_results import STATUS_REJECTED_DUPLICATE, STATUS_REQUESTED, list_task_results
+
+        rows = list_task_results(drive_root)
+    except Exception:
+        return 0
+    return sum(
+        1 for row in rows
+        if isinstance(row, dict)
+        and str(row.get("parent_task_id") or "").strip() == parent
+        and str(row.get("delegation_role") or "") == "subagent"
+        and str(row.get("status") or "") not in {STATUS_REQUESTED, STATUS_REJECTED_DUPLICATE}
+        and not (
+            str(row.get("status") or "") == "failed"
+            and (
+                not isinstance(row.get("delegation_admission"), dict)
+                or str(row["delegation_admission"].get("status") or "") != "accepted"
+            )
+        )
+        and str(row.get("id") or row.get("task_id") or "").strip() != excluded
+    )
+
+
+def depth_provenance_for_schedule(
+    parent_budget: Dict[str, Any], *, new_depth: int, max_depth: int,
+    achieved_depth: Any = None,
+) -> Dict[str, Any]:
+    """Carry requested/permitted/attempted/achieved depth as additive facts."""
+    budget = parent_budget if isinstance(parent_budget, dict) else {}
+    inherited = normalize_depth_provenance(budget.get("depth_provenance"))
+    requested = inherited.get("requested_depth")
+    if requested is None and "depth_remaining" in budget and not inherited:
+        try:
+            requested = max(0, int(budget.get("depth_remaining")))
+        except (TypeError, ValueError):
+            requested = None
+    try:
+        cap = max(0, int(max_depth))
+    except (TypeError, ValueError):
+        cap = 0
+    permitted = cap if requested is None else min(cap, max(0, int(requested)))
+    try:
+        attempted = max(0, int(new_depth))
+    except (TypeError, ValueError):
+        attempted = None
+    try:
+        achieved = None if achieved_depth is None else max(0, int(achieved_depth))
+    except (TypeError, ValueError):
+        achieved = None
+    return {
+        "requested_depth": requested,
+        "permitted_depth": permitted,
+        "attempted_depth": attempted,
+        "achieved_depth": achieved,
+    }
+
+
+def stamp_depth_provenance(
+    task_contract: Dict[str, Any], *, attempted_depth: int, max_depth: int,
+    achieved_depth: Any = None,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return a copied contract plus its compact depth projection."""
+    contract = dict(task_contract) if isinstance(task_contract, dict) else {}
+    budget = dict(contract.get("delegation_budget") or {})
+    provenance = depth_provenance_for_schedule(
+        budget, new_depth=attempted_depth, max_depth=max_depth,
+        achieved_depth=achieved_depth,
+    )
+    budget["depth_provenance"] = provenance
+    contract["delegation_budget"] = budget
+    return contract, provenance
 
 
 def _constraint_payload(row: Any) -> Dict[str, Any]:
@@ -306,9 +457,9 @@ def _narrow_child_delegation_budget(
     Legacy contracts carry no delegation_budget, so a missing parent authority defaults
     to True (unrestricted — pre-C3.1 behavior)."""
     parent_budget = parent_budget if isinstance(parent_budget, dict) else {}
-    parent_may_delegate = bool(parent_budget.get("may_delegate", True))
-    parent_may_mutate = bool(parent_budget.get("may_mutate", True))
-    parent_may_fan_out = bool(parent_budget.get("may_fan_out", True))
+    parent_may_delegate = normalize_bool(parent_budget.get("may_delegate", True))
+    parent_may_mutate = normalize_bool(parent_budget.get("may_mutate", True))
+    parent_may_fan_out = normalize_bool(parent_budget.get("may_fan_out", True))
     parent_max_children = parent_budget.get("max_children")
     if isinstance(max_children, int) and max_children > 0:
         child_max_children = max_children
@@ -358,7 +509,7 @@ def child_budget_for_schedule(
         child_depth_remaining = max(0, parent_depth_remaining - 1)
     else:
         child_depth_remaining = max(0, max_depth - new_depth)
-    return _narrow_child_delegation_budget(
+    child_budget = _narrow_child_delegation_budget(
         parent_budget,
         child_depth_remaining=child_depth_remaining,
         may_mutate=may_mutate,
@@ -367,6 +518,10 @@ def child_budget_for_schedule(
         intent_note=intent_note,
         parent_is_subagent=current_depth > 0,
     )
+    child_budget["depth_provenance"] = depth_provenance_for_schedule(
+        parent_budget, new_depth=new_depth, max_depth=max_depth,
+    )
+    return child_budget
 
 
 def _ensure_project_scope(ctx: ToolContext, project_name: str = "", project_id: str = "") -> str:
