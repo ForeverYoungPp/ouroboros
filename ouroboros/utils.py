@@ -383,9 +383,13 @@ def jsonl_append_lock_path(path: pathlib.Path) -> pathlib.Path:
     return path.parent / f".append_jsonl_{path_hash}.lock"
 
 
-def append_jsonl(path: pathlib.Path, obj: Dict[str, Any]) -> bool:
+def append_jsonl(
+    path: pathlib.Path, obj: Dict[str, Any], *, ensure_record_boundary: bool = False,
+) -> bool:
     """Append a JSON object as a line to a JSONL file (concurrent-safe).
 
+    ``ensure_record_boundary`` repairs a missing final newline before this
+    append; it is opt-in so high-volume event logs keep their established path.
     Returns ``True`` on successful write, ``False`` when all retries
     failed (which is also logged at WARNING). Important events
     (``task_done``, ``llm_round``, escalation messages) need that signal
@@ -430,11 +434,28 @@ def append_jsonl(path: pathlib.Path, obj: Dict[str, Any]) -> bool:
                 log.debug("Failed to acquire file lock for jsonl append", exc_info=True)
                 break
 
+        append_data = data
+        if ensure_record_boundary:
+            # A crashed receipt writer may leave its final object without a
+            # separator. Preserve those bytes while keeping this append a new
+            # record. Ordinary high-volume logs retain their existing fast path.
+            try:
+                if path.stat().st_size > 0:
+                    with path.open("rb") as existing:
+                        existing.seek(-1, os.SEEK_END)
+                        if existing.read(1) != b"\n":
+                            append_data = b"\n" + data
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Preserve historical behavior for unusual write-only files.
+                append_data = data
+
         for attempt in range(write_retries):
             try:
                 fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
                 try:
-                    os.write(fd, data)
+                    os.write(fd, append_data)
                 finally:
                     os.close(fd)
                 _written = True
@@ -446,7 +467,7 @@ def append_jsonl(path: pathlib.Path, obj: Dict[str, Any]) -> bool:
         for attempt in range(write_retries):
             try:
                 with path.open("a", encoding="utf-8") as f:
-                    f.write(line + "\n")
+                    f.write(append_data.decode("utf-8"))
                 _written = True
                 return True
             except Exception:

@@ -58,6 +58,8 @@ def test_sleeping_nanny_wakes_for_only_a_direct_child_beacon(tmp_path):
 
 
 def test_child_terminal_transition_coalesces_with_leaf_wake_and_replays_until_ack(tmp_path):
+    from ouroboros import delegate_custody as custody
+
     _child(tmp_path)
     ctx = _ctx(tmp_path)
     calls = []
@@ -81,6 +83,39 @@ def test_child_terminal_transition_coalesces_with_leaf_wake_and_replays_until_ac
     assert replay == first
     assert acknowledge_pending_wake(ctx, replay)
     assert calls == [1]
+    events = [
+        json.loads(line)
+        for line in custody.event_log_path(tmp_path).read_text().splitlines()
+    ]
+    acknowledged = [
+        event for event in events
+        if event.get("type") == "delegate_supervision_wake_acknowledged"
+    ]
+    assert acknowledged[-1]["coordination"] is True
+
+
+def test_physical_terminal_wake_is_not_mislabeled_as_coordination(tmp_path):
+    from ouroboros import delegate_custody as custody
+
+    ctx = _ctx(tmp_path)
+    wake = supervised_wait(
+        ctx,
+        "run-physical",
+        wait_once=lambda *_args: json.dumps({
+            "status": "completed", "run_id": "run-physical", "last_seq": 1,
+        }),
+    )
+
+    assert acknowledge_pending_wake(ctx, wake)
+    events = [
+        json.loads(line)
+        for line in custody.event_log_path(tmp_path).read_text().splitlines()
+    ]
+    acknowledged = [
+        event for event in events
+        if event.get("type") == "delegate_supervision_wake_acknowledged"
+    ]
+    assert acknowledged[-1]["coordination"] is False
 
 
 def test_child_terminal_before_first_sleep_is_not_lost_as_cursor_baseline(tmp_path):

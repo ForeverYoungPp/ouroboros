@@ -487,6 +487,9 @@ def _record_delegation_zero_run(
     bootstrap["zero_run_decision"] = decision
     bootstrap["zero_run_basis"] = receipt["zero_run_basis"]
     bootstrap["zero_run_receipt_recorded"] = True
+    bootstrap["exact_start_pending"] = False
+    bootstrap.pop("zero_run_evidence_status", None)
+    bootstrap.pop("zero_run_evidence_gaps", None)
     return (
         "verify_and_record [delegation_zero_run] "
         f"{decision.upper()}: no physical leaf was started; typed host receipt recorded."

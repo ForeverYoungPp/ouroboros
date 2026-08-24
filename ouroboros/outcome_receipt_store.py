@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ouroboros import _outcome_receipts
 from ouroboros.task_results import validate_task_id
+from ouroboros.utils import iter_jsonl_objects
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +36,9 @@ def append_verification_receipt(
 
         return bool(
             append_jsonl(
-                verification_receipts_path(drive_root, task_id, create=True), receipt,
+                verification_receipts_path(drive_root, task_id, create=True),
+                receipt,
+                ensure_record_boundary=True,
             )
         )
     except Exception:
@@ -47,14 +50,25 @@ def append_verification_receipt(
 
 
 def read_verification_receipts(
-    drive_root: Any, task_id: str,
+    drive_root: Any, task_id: str, *, gap_reasons: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
     try:
         path = verification_receipts_path(drive_root, task_id, create=False)
         if not path.exists():
             return []
-        return _outcome_receipts.read_receipts(path)
+        if gap_reasons is None:
+            # Preserve the historical all-or-nothing read used by observational
+            # acceptance/ledger callers. Gap-aware authority reads opt into the
+            # tolerant iterator below so partial green rows never become truth.
+            return _outcome_receipts.read_receipts(path)
+        return list(iter_jsonl_objects(path, gap_reasons=gap_reasons))
     except Exception:
+        if gap_reasons is not None:
+            gap_reasons.add("verification_receipts_unreadable")
+        log.warning(
+            "Failed to read verification receipts for task %s", task_id,
+            exc_info=True,
+        )
         return []
 
 
@@ -96,7 +110,7 @@ def merge_verification_receipts(
 
 
 def read_verification_receipts_from_roots(
-    roots: List[Any], task_id: str,
+    roots: List[Any], task_id: str, *, gap_reasons: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Read every distinct receipt replica, preserving supplied root order."""
 
@@ -108,12 +122,18 @@ def read_verification_receipts_from_roots(
         try:
             path = pathlib.Path(root).resolve(strict=False)
         except Exception:
+            if gap_reasons is not None:
+                gap_reasons.add("verification_receipts_root_unavailable")
             continue
         marker = str(path)
         if marker in seen_roots:
             continue
         seen_roots.add(marker)
-        groups.append(read_verification_receipts(path, task_id))
+        groups.append(
+            read_verification_receipts(
+                path, task_id, gap_reasons=gap_reasons,
+            )
+        )
     return merge_verification_receipts(*groups)
 
 

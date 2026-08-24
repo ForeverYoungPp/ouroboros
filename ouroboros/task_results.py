@@ -231,12 +231,21 @@ def list_task_results(
     drive_root: Any,
     *,
     statuses: Optional[List[str]] = None,
+    strict: bool = False,
 ) -> List[Dict[str, Any]]:
+    """List task results, optionally refusing an incomplete authority scan.
+
+    Most observational callers remain tolerant of a malformed historical row.
+    Authority reducers such as direct-child admission pass ``strict=True`` so
+    an unreadable row cannot be silently reinterpreted as an absent child.
+    """
     wanted = {str(item) for item in list(statuses or []) if str(item).strip()}
     results: List[Dict[str, Any]] = []
     for path in sorted(task_results_dir(drive_root, create=False).glob("*.json")):
         data = read_json_dict(path)
         if data is None:
+            if strict:
+                raise ValueError(f"task result is unreadable or invalid: {path}")
             continue
         if wanted and str(data.get("status") or "") not in wanted:
             continue

@@ -455,6 +455,125 @@ def test_depth3_control_plane_reaches_root_acceptance(tmp_path, monkeypatch):
     )[0] is True
 
 
+def test_depth3_waits_for_worker_slot_then_uses_active_cap_reservation(
+    tmp_path, monkeypatch,
+):
+    delivered = []
+
+    class WorkerQueue:
+        def put(self, task):
+            delivered.append(copy.deepcopy(task))
+
+    # Root + two ancestors + unrelated work occupy a four-worker install.
+    worker_map = {
+        idx: SimpleNamespace(
+            wid=idx,
+            busy_task_id=task_id,
+            reaping=False,
+            in_q=WorkerQueue(),
+        )
+        for idx, task_id in enumerate(("root", "l1", "l2", "other"))
+    }
+    running = {
+        "root": {"task": {
+            "id": "root", "root_task_id": "root", "delegation_role": "root",
+        }},
+        "l1": {"task": {
+            "id": "l1", "root_task_id": "root",
+            "parent_task_id": "root", "delegation_role": "subagent",
+        }},
+        "l2": {"task": {
+            "id": "l2", "root_task_id": "root",
+            "parent_task_id": "l1", "delegation_role": "subagent",
+        }},
+        "other": {"task": {
+            "id": "other", "root_task_id": "other", "delegation_role": "root",
+        }},
+    }
+    provenance = {
+        "requested_depth": 3,
+        "permitted_depth": 3,
+        "attempted_depth": 3,
+        "achieved_depth": None,
+    }
+    contract = build_task_contract({"delegation_budget": {
+        "depth_remaining": 0,
+        "depth_provenance": provenance,
+    }})
+    l3 = {
+        "id": "l3",
+        "type": "task",
+        "chat_id": 0,
+        "description": "depth three",
+        "objective": "depth three",
+        "expected_output": "typed result",
+        "depth": 3,
+        "root_task_id": "root",
+        "parent_task_id": "l2",
+        "delegation_role": "subagent",
+        "drive_root": str(tmp_path),
+        "child_drive_root": str(tmp_path),
+        "budget_drive_root": str(tmp_path),
+        "task_contract": contract,
+        "depth_provenance": provenance,
+    }
+    pending = [l3]
+    write_task_result(
+        tmp_path,
+        "l3",
+        STATUS_SCHEDULED,
+        parent_task_id="l2",
+        root_task_id="root",
+        delegation_role="subagent",
+        task_contract=contract,
+        depth_provenance=provenance,
+        result="Subagent accepted and scheduled.",
+    )
+
+    monkeypatch.setenv("OUROBOROS_MAX_WORKERS", "4")
+    monkeypatch.setenv("OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", "2")
+    monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "3")
+    monkeypatch.setattr(workers, "MAX_WORKERS", 4)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", running)
+    monkeypatch.setattr(workers, "WORKERS", worker_map)
+    monkeypatch.setattr(workers, "load_state", lambda: {})
+    monkeypatch.setattr(
+        state_module, "budget_remaining", lambda *_args, **_kwargs: 100.0,
+    )
+    monkeypatch.setattr(queue_module, "PENDING", pending)
+    monkeypatch.setattr(queue_module, "RUNNING", running)
+    monkeypatch.setattr(queue_module, "BUDGET_ROOT_FENCES", {})
+    monkeypatch.setattr(
+        queue_module, "persist_queue_snapshot", lambda reason="": None,
+    )
+
+    # Saturation preserves attempted-but-not-achieved evidence.
+    workers.assign_tasks()
+    assert [task["id"] for task in pending] == ["l3"]
+    assert delivered == []
+    scheduled = load_task_result(tmp_path, "l3")
+    assert scheduled["status"] == STATUS_SCHEDULED
+    assert scheduled["depth_provenance"]["achieved_depth"] is None
+    assert queue_module._has_pending_descendant("root") is True
+    assert queue_module._has_pending_descendant("l2") is True
+
+    # Only an explicit unrelated-task settlement creates capacity; this test
+    # does not promise progress for a permanently saturated ancestry-only pool.
+    running.pop("other")
+    worker_map[3].busy_task_id = None
+    workers.assign_tasks()
+
+    assert pending == []
+    assert delivered[-1]["id"] == "l3"
+    assert delivered[-1]["depth_provenance"]["achieved_depth"] == 3
+    assigned = load_task_result(tmp_path, "l3")
+    assert assigned["status"] == STATUS_RUNNING
+    assert assigned["depth_provenance"]["achieved_depth"] == 3
+    assert worker_map[3].busy_task_id == "l3"
+
+
 def test_real_over_cap_refusal_reaches_root_acceptance_depth_summary(tmp_path, monkeypatch):
     import ouroboros.review_evidence as review_evidence
 

@@ -2595,26 +2595,27 @@ def _reject_schedule_task(
     fallback_message: str = "",
     reason_code: Optional[str] = None,
     extra_fields: Optional[Dict[str, Any]] = None,
+    persist_result: bool = True,
 ) -> None:
-    """Persist and notify a terminal schedule rejection."""
+    """Clean up and notify a rejection, preserving an existing result when asked."""
     _cleanup_rejected_worktree(tid, result_fields)
     log.warning("Rejecting scheduled task %s: %s", tid, detail)
     write_fields = {**result_fields, **(extra_fields or {})}
     if reason_code:
         write_fields["reason_code"] = reason_code
-    try:
-        write_task_result(
-            ctx.DRIVE_ROOT,
-            tid,
-            status,
-            **write_fields,
-            result=detail,
-            cost_usd=0.0,
-        )
-    except Exception:
-        log.warning("Failed to persist schedule rejection for %s", tid, exc_info=True)
-    # The terminal result is already durable above; never let a notification
-    # failure (torn-down bus, etc.) propagate into the supervisor event loop.
+    if persist_result:
+        try:
+            write_task_result(
+                ctx.DRIVE_ROOT,
+                tid,
+                status,
+                **write_fields,
+                result=detail,
+                cost_usd=0.0,
+            )
+        except Exception:
+            log.warning("Failed to persist schedule rejection for %s", tid, exc_info=True)
+    # A torn-down notification bus must not escape into the supervisor loop.
     try:
         if chat_id:
             if delegation_role == "subagent":
@@ -3434,9 +3435,16 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         canonical_root = getattr(ctx, "DRIVE_ROOT", "")
         if canonical_root and str(canonical_root) != str(count_roots[0]):
             count_roots.append(canonical_root)
-        direct_child_count = max(
+        direct_child_counts = [
             durable_direct_child_count(root, parent_id, exclude_task_id=tid)
             for root in count_roots
+        ]
+        direct_child_count = (
+            max(count for count in direct_child_counts if count is not None)
+            if direct_child_counts and all(
+                count is not None for count in direct_child_counts
+            )
+            else None
         )
         rights = check_delegation_admission(
             parent_budget,
@@ -3706,7 +3714,28 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "parent_cognitive_route": parent_cognitive_route,
             "parent_id": parent_id,
         })
-        admitted = ctx.enqueue_task(task)
+        scheduled_failure_reason = ""
+        scheduled_failure_detail = ""
+        persist_scheduled_failure = False
+        if delegation_role == "subagent":
+            from supervisor.task_admission import enqueue_subagent_with_scheduled_result
+
+            (
+                admitted,
+                scheduled_failure_reason,
+                scheduled_failure_detail,
+                persist_scheduled_failure,
+            ) = enqueue_subagent_with_scheduled_result(
+                ctx,
+                task,
+                result_fields=result_fields,
+                admitted_task_contract=admitted_task_contract,
+                admitted_depth_provenance=admitted_depth_provenance,
+                direct_child_count=direct_child_count,
+                pending_ref=pending_ref,
+            )
+        else:
+            admitted = ctx.enqueue_task(task)
         if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
             blocked_reason = str(admitted.get("_admission_blocked") or "admission_fence")
             if blocked_reason.startswith("project_routing_fence"):
@@ -3762,23 +3791,40 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
                 extra_fields=extra,
             )
             return
-        result_fields["task_contract"] = admitted_task_contract
-        result_fields["depth_provenance"] = admitted_depth_provenance
-        if delegation_role == "subagent":
+        if scheduled_failure_reason:
             result_fields["delegation_admission"] = {
-                "status": "accepted",
+                "status": "rejected",
+                "reason_code": scheduled_failure_reason,
                 "direct_child_count": direct_child_count,
             }
-        try:
-            write_task_result(
-                ctx.DRIVE_ROOT,
-                tid,
-                STATUS_SCHEDULED,
-                **result_fields,
-                result="Subagent accepted and scheduled." if delegation_role == "subagent" else "Task accepted and scheduled.",
+            _reject_schedule_task(
+                ctx,
+                tid=tid,
+                chat_id=chat_id,
+                delegation_role=delegation_role,
+                parent_id=parent_id,
+                root_task_id=root_task_id,
+                role=role,
+                result_fields=result_fields,
+                detail=scheduled_failure_detail,
+                reason_code=scheduled_failure_reason,
+                persist_result=persist_scheduled_failure,
             )
-        except Exception:
-            log.warning("Failed to persist scheduled task status for %s", tid, exc_info=True)
+            ctx.persist_queue_snapshot(reason="schedule_subagent_receipt_rollback")
+            return
+        if delegation_role != "subagent":
+            result_fields["task_contract"] = admitted_task_contract
+            result_fields["depth_provenance"] = admitted_depth_provenance
+            try:
+                write_task_result(
+                    ctx.DRIVE_ROOT,
+                    tid,
+                    STATUS_SCHEDULED,
+                    **result_fields,
+                    result="Task accepted and scheduled.",
+                )
+            except Exception:
+                log.warning("Failed to persist scheduled task status for %s", tid, exc_info=True)
         progress_meta = {
             "root_task_id": root_task_id,
             "parent_task_id": parent_id,

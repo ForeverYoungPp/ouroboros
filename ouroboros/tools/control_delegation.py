@@ -53,18 +53,21 @@ class DelegationAdmissionDecision:
     ok: bool
     reason_code: str = ""
     detail: str = ""
-    direct_child_count: int = 0
+    direct_child_count: int | None = 0
 
 
 def check_delegation_admission(
-    parent_budget: Dict[str, Any], *, direct_child_count: int = 0,
+    parent_budget: Dict[str, Any], *, direct_child_count: int | None = 0,
 ) -> DelegationAdmissionDecision:
     """Enforce explicit recursion rights while keeping omitted legacy permissive."""
     budget = parent_budget if isinstance(parent_budget, dict) else {}
-    try:
-        count = max(0, int(direct_child_count or 0))
-    except (TypeError, ValueError):
-        count = 0
+    if direct_child_count is None:
+        count = None
+    else:
+        try:
+            count = max(0, int(direct_child_count))
+        except (TypeError, ValueError):
+            count = None
     if not normalize_bool(budget.get("may_delegate", True)):
         return DelegationAdmissionDecision(
             False,
@@ -86,20 +89,38 @@ def check_delegation_admission(
         # depth gate remains authoritative and emits its own typed refusal.
         pass
     max_children = budget.get("max_children")
+    max_children_limit = None
     try:
-        if max_children is not None and int(max_children) > 0 and count >= int(max_children):
-            return DelegationAdmissionDecision(
-                False,
-                reason_code="delegation_rights_max_children",
-                detail=(
-                    "The parent delegation budget has reached its explicit direct-child "
-                    f"cap ({int(max_children)})."
-                ),
-                direct_child_count=count,
-            )
+        if max_children is not None and int(max_children) > 0:
+            max_children_limit = int(max_children)
     except (TypeError, ValueError):
         pass
-    if not normalize_bool(budget.get("may_fan_out", True)) and count >= 1:
+    fan_out_allowed = normalize_bool(budget.get("may_fan_out", True))
+    if count is None and (max_children_limit is not None or not fan_out_allowed):
+        return DelegationAdmissionDecision(
+            False,
+            reason_code="delegation_rights_child_count_unknown",
+            detail=(
+                "The host could not prove the parent's current direct-child count, "
+                "so it cannot safely apply the explicit fan-out/child cap."
+            ),
+            direct_child_count=None,
+        )
+    if (
+        max_children_limit is not None
+        and count is not None
+        and count >= max_children_limit
+    ):
+        return DelegationAdmissionDecision(
+            False,
+            reason_code="delegation_rights_max_children",
+            detail=(
+                "The parent delegation budget has reached its explicit direct-child "
+                f"cap ({max_children_limit})."
+            ),
+            direct_child_count=count,
+        )
+    if not fan_out_allowed and count is not None and count >= 1:
         return DelegationAdmissionDecision(
             False,
             reason_code="delegation_rights_may_fan_out",
@@ -114,18 +135,18 @@ def check_delegation_admission(
 
 def durable_direct_child_count(
     drive_root: Any, parent_task_id: Any, *, exclude_task_id: Any = "",
-) -> int:
+) -> int | None:
     """Count the parent's already admitted direct children from task-result SSOT."""
     parent = str(parent_task_id or "").strip()
     excluded = str(exclude_task_id or "").strip()
     if not parent or not str(drive_root or "").strip():
-        return 0
+        return None
     try:
         from ouroboros.task_results import STATUS_REJECTED_DUPLICATE, STATUS_REQUESTED, list_task_results
 
-        rows = list_task_results(drive_root)
+        rows = list_task_results(drive_root, strict=True)
     except Exception:
-        return 0
+        return None
     return sum(
         1 for row in rows
         if isinstance(row, dict)
@@ -209,7 +230,7 @@ def stamp_depth_provenance(
     task_contract: Dict[str, Any], *, attempted_depth: int, max_depth: int,
     achieved_depth: Any = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """Stamp an already-admitted task without inventing legacy root intent."""
+    """Stamp admitted depth, deriving intent only from an explicit root envelope."""
     contract = dict(task_contract) if isinstance(task_contract, dict) else {}
     budget = dict(contract.get("delegation_budget") or {})
     inherited = normalize_depth_provenance(budget.get("depth_provenance"))
@@ -220,14 +241,17 @@ def stamp_depth_provenance(
         )
     else:
         remaining = budget.get("depth_remaining")
+        requested = None
         permitted = None
         if isinstance(remaining, int) and not isinstance(remaining, bool):
+            if max(0, int(attempted_depth)) == 0:
+                requested = max(0, remaining)
             permitted = min(
                 max(0, int(max_depth)),
                 max(0, int(attempted_depth)) + max(0, remaining),
             )
         provenance = {
-            "requested_depth": None,
+            "requested_depth": requested,
             "permitted_depth": permitted,
             "attempted_depth": max(0, int(attempted_depth)),
             "achieved_depth": (

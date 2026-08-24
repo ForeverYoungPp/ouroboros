@@ -339,6 +339,7 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "delegation_rights_may_fan_out": (False, "control_delegation.py explicit parent fan-out refusal"),
     "delegation_rights_depth_exhausted": (False, "control_delegation.py exhausted typed depth budget refusal"),
     "delegation_rights_max_children": (False, "control_delegation.py explicit direct-child budget cap refusal"),
+    "delegation_rights_child_count_unknown": (False, "control_delegation.py unavailable direct-child authority scan"),
     "delegation_constraint_block_surface": (False, "control_delegation.py:116 rejected call"),
     "delegation_constraint_child_cap": (False, "control_delegation.py:149 rejected call"),
     "delegation_constraint_halt_fanout": (False, "control_delegation.py:103 rejected call"),

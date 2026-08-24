@@ -719,7 +719,10 @@ def test_child_profiles_expose_existing_descendant_controls(tmp_path, constraint
 def test_local_readonly_verify_is_typed_zero_run_only(tmp_path):
     """Readonly actor-first sessions may disclose no-leaf state, never run generic checks."""
     from ouroboros.contracts.task_constraint import TaskConstraint
-    from ouroboros.outcomes import read_verification_receipts
+    from ouroboros.outcomes import (
+        read_verification_receipts,
+        verification_receipts_path,
+    )
     from ouroboros.tools.registry import ToolContext, ToolRegistry
 
     data = tmp_path / "data"
@@ -734,7 +737,14 @@ def test_local_readonly_verify_is_typed_zero_run_only(tmp_path):
         "route_id": "session-a",
         "work_order_fingerprint": "a" * 64,
         "physical_started": False,
+        "exact_start_pending": False,
+        "zero_run_evidence_status": "unknown",
+        "zero_run_evidence_gaps": ["malformed_jsonl"],
     }
+    verification_receipts_path(data, "readonly-actor", create=True).write_text(
+        '{"contract_kind":"delegation_zero_run","zero_run":true',
+        encoding="utf-8",
+    )
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=data)
     registry.set_context(ctx)
 
@@ -764,6 +774,9 @@ def test_local_readonly_verify_is_typed_zero_run_only(tmp_path):
     assert "UNKNOWN" in allowed
     receipts = read_verification_receipts(data, "readonly-actor")
     assert receipts[-1]["contract_kind"] == "delegation_zero_run"
+    assert ctx._configured_actor_bootstrap["exact_start_pending"] is False
+    assert "zero_run_evidence_status" not in ctx._configured_actor_bootstrap
+    assert "zero_run_evidence_gaps" not in ctx._configured_actor_bootstrap
     assert registry.get_schema_by_name("verify_and_record") is None
 
     # A forced direct handler call must also fail closed after the physical leaf

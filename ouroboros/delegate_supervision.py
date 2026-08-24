@@ -463,7 +463,11 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
         "mailbox_ids": mailbox_ids,
         "attempt_key": attempt,
         "interaction_ids": list(pending.get("interaction_ids") or []),
-        "coordination": bool(pending.get("coordination_cursor")),
+        "coordination": any(
+            isinstance(item, dict)
+            and str(item.get("type") or "").startswith("child_")
+            for item in wake_events
+        ),
     }):
         return False
     interaction_ids = frozenset(

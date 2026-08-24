@@ -533,9 +533,26 @@ def _publish_child_verification_receipts(
         dest = verification_receipts_path(parent_drive_root, task_id, create=True)
         if dest.exists() and os.path.samefile(src, dest):
             return  # shared-drive shape: already the canonical file
+        gaps: set[str] = set()
+        child_receipts = read_verification_receipts(
+            child_drive, task_id, gap_reasons=gaps,
+        )
+        canonical_receipts = read_verification_receipts(
+            parent_drive_root, task_id, gap_reasons=gaps,
+        )
+        if gaps:
+            # A whole-file union refresh may never erase the only evidence that
+            # a terminal actor receipt was torn or unreadable. Preserve both
+            # source files for later reconciliation instead of laundering UNKNOWN
+            # into a clean-looking parseable ledger.
+            log.warning(
+                "Skipped child receipt publication for task %s due to read gaps: %s",
+                task_id, ",".join(sorted(gaps)),
+            )
+            return
         merged = merge_verification_receipts(
-            read_verification_receipts(child_drive, task_id),
-            read_verification_receipts(parent_drive_root, task_id),
+            child_receipts,
+            canonical_receipts,
         )
         content = "".join(
             json.dumps(row, ensure_ascii=False) + "\n" for row in merged

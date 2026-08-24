@@ -75,6 +75,12 @@ def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -
                     "zero_run_receipt_recorded": True,
                     "zero_run_decision": str(actor_bootstrap.get("zero_run_decision") or ""),
                 } if actor_bootstrap.get("zero_run_receipt_recorded") else {}),
+                **({
+                    "zero_run_evidence_status": "unknown",
+                    "zero_run_evidence_gaps": list(
+                        actor_bootstrap.get("zero_run_evidence_gaps") or []
+                    ),
+                } if actor_bootstrap.get("zero_run_evidence_status") == "unknown" else {}),
             }
             custody.emit(custody.custody_root(ctx), "configured_subagent_startup_fault", {
                 "task_id": str(getattr(ctx, "task_id", "") or ""), **startup,
@@ -83,7 +89,7 @@ def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -
                 "status": "configured_session_actor_ready", "startup": startup,
             }, ensure_ascii=False, indent=2)
         return actor_ready
-    return bootstrap_session_leaf(ctx, task, dispatch)
+    return ""
 
 
 def _adopt_recovery_handoff(ctx: Any, task: Mapping[str, Any]) -> str:
@@ -164,7 +170,10 @@ def actor_first_unresolved_fact(
         return None
     if bool(bootstrap.get("physical_started")) or bool(bootstrap.get("zero_run_receipt_recorded")):
         return None
-    if not bool(bootstrap.get("exact_start_pending", True)):
+    zero_run_evidence_unknown = (
+        str(bootstrap.get("zero_run_evidence_status") or "") == "unknown"
+    )
+    if not bool(bootstrap.get("exact_start_pending", True)) and not zero_run_evidence_unknown:
         return None
     root = Path(
         str(
@@ -200,6 +209,17 @@ def actor_first_unresolved_fact(
     ]
     if completed_children:
         return None
+    if zero_run_evidence_unknown:
+        return {
+            "status": "unknown",
+            "reason": "zero_run_evidence_unavailable",
+            "zero_run": True,
+            "zero_run_evidence_status": "unknown",
+            "zero_run_evidence_gaps": list(
+                bootstrap.get("zero_run_evidence_gaps") or []
+            ),
+            "route_available": bootstrap.get("route_available"),
+        }
     route_available = bootstrap.get("route_available")
     return {
         "status": "incomplete" if route_available is not False else "unknown",
@@ -218,15 +238,17 @@ def actor_first_unresolved_fact(
     }
 
 
-def _durable_zero_run_receipt(ctx: Any) -> dict[str, Any] | None:
+def _durable_zero_run_receipt(
+    ctx: Any, *, gap_reasons: set[str] | None = None,
+) -> dict[str, Any] | None:
     """Recover a previously written terminal zero-run fact for this task.
 
     The in-memory bootstrap marker is intentionally process-local, while the
     receipt is the continuity authority.  A resumed actor therefore has to
-    hydrate the marker before it can expose ``delegate_start`` again.  Receipt
-    parsing is best-effort here, matching the existing verification reader; an
-    unreadable store is disclosed through the normal lifecycle evidence path
-    rather than guessed to be a zero-run.
+    hydrate the marker before it can expose ``delegate_start`` again. A
+    gap-aware read distinguishes clean absence from malformed or unreadable
+    authority. A valid terminal row still wins, while a store with gaps and no
+    valid terminal row leaves the actor in typed UNKNOWN and fences a new start.
     """
     task_id = str(getattr(ctx, "task_id", "") or "")
     if not task_id:
@@ -251,8 +273,12 @@ def _durable_zero_run_receipt(ctx: Any) -> dict[str, Any] | None:
     try:
         from ouroboros.outcomes import read_verification_receipts_from_roots
 
-        receipts = read_verification_receipts_from_roots(roots, task_id)
+        receipts = read_verification_receipts_from_roots(
+            roots, task_id, gap_reasons=gap_reasons,
+        )
     except Exception:
+        if gap_reasons is not None:
+            gap_reasons.add("verification_receipts_unavailable")
         return None
     for receipt in reversed(receipts or []):
         if not isinstance(receipt, dict):
@@ -369,7 +395,10 @@ def _prepare_actor_first_bootstrap(
         "exact_start_pending": True,
         "physical_started": False,
     }
-    durable_zero_run = _durable_zero_run_receipt(ctx)
+    zero_run_evidence_gaps: set[str] = set()
+    durable_zero_run = _durable_zero_run_receipt(
+        ctx, gap_reasons=zero_run_evidence_gaps,
+    )
     if durable_zero_run:
         ctx._configured_actor_bootstrap.update({
             "zero_run_receipt_recorded": True,
@@ -377,10 +406,23 @@ def _prepare_actor_first_bootstrap(
             "zero_run_basis": str(durable_zero_run.get("zero_run_basis") or ""),
             "exact_start_pending": False,
         })
+    elif zero_run_evidence_gaps:
+        # Clean absence leaves the exact start available. Malformed/unreadable
+        # lifecycle evidence is different: it may be a torn terminal zero-run
+        # row, so UNKNOWN must not mint a second physical invocation. The actor
+        # may still repair this state by recording a new durable zero-run fact.
+        ctx._configured_actor_bootstrap.update({
+            "zero_run_evidence_status": "unknown",
+            "zero_run_evidence_gaps": sorted(zero_run_evidence_gaps),
+            "exact_start_pending": False,
+        })
     return json.dumps({
         "status": "configured_session_actor_ready",
         "startup": {
-            "status": "pending",
+            "status": (
+                "zero_run_evidence_unknown"
+                if zero_run_evidence_gaps and not durable_zero_run else "pending"
+            ),
             "selected_subagent_id": str(snapshot.get("selected_subagent_id") or ""),
             "route": route_id,
             "work_order_fingerprint": work_order_fingerprint,
@@ -388,13 +430,19 @@ def _prepare_actor_first_bootstrap(
             "work_order_complete": bool(work_order),
             **({"source_channel": source_channel} if source_channel else {}),
             "actor_first": True,
-            "exact_start_pending": not bool(durable_zero_run),
+            "exact_start_pending": not bool(
+                durable_zero_run or zero_run_evidence_gaps
+            ),
             "host_fallback": False,
             **({
                 "zero_run_receipt_recorded": True,
                 "zero_run_decision": str(durable_zero_run.get("zero_run_decision") or ""),
                 "zero_run_basis": str(durable_zero_run.get("zero_run_basis") or ""),
             } if durable_zero_run else {}),
+            **({
+                "zero_run_evidence_status": "unknown",
+                "zero_run_evidence_gaps": sorted(zero_run_evidence_gaps),
+            } if zero_run_evidence_gaps and not durable_zero_run else {}),
         },
     }, ensure_ascii=False, indent=2)
 
@@ -410,7 +458,17 @@ def append_startup_receipt(
         receipt = {}
     receipt_status = str(receipt.get("status") or "") if isinstance(receipt, dict) else ""
     startup = receipt.get("startup") if isinstance(receipt, dict) else {}
-    if isinstance(startup, dict) and startup.get("zero_run_receipt_recorded"):
+    if (
+        isinstance(startup, dict)
+        and startup.get("zero_run_evidence_status") == "unknown"
+    ):
+        guidance = (
+            "The host could not prove whether the verification-receipt store already "
+            "contains a terminal delegation_zero_run decision. Do not start a physical "
+            "leaf from this task. Reconcile the durable evidence or record a new typed "
+            "delegation_zero_run fact after checking physical custody."
+        )
+    elif isinstance(startup, dict) and startup.get("zero_run_receipt_recorded"):
         guidance = (
             "A durable delegation_zero_run receipt already closes this actor's physical "
             "run decision. Do not call delegate_start for the same task; continue only "
@@ -449,199 +507,4 @@ def append_startup_receipt(
     acknowledge_pending_wake(ctx, startup_wake)
 
 
-def bootstrap_session_leaf(ctx: Any, task: Mapping[str, Any], dispatch: Any) -> str:
-    """Start exact external custody, then sleep until the first meaningful wake."""
-
-    snapshot = task.get("configured_subagent") if isinstance(task.get("configured_subagent"), dict) else {}
-    route = snapshot.get("route") if isinstance(snapshot.get("route"), dict) else {}
-    if str(route.get("kind") or "") != "agent_session":
-        return ""
-    if dispatch is None or str(getattr(dispatch, "executor", "") or "") != "harness":
-        return ""
-    from ouroboros.delegate_recovery import adopt_handoff
-
-    adoption = adopt_handoff(ctx, task)
-    if adoption.get("status") == "recovery_required":
-        return json.dumps({
-            "status": "configured_session_recovery_wake",
-            "recovery": adoption,
-        }, ensure_ascii=False, indent=2)
-    if adoption.get("status") == "settled_recovered":
-        return json.dumps({
-            "status": "configured_session_recovered_wake",
-            "recovery": adoption,
-            "wake": adoption.get("wake") if isinstance(adoption.get("wake"), dict) else {},
-        }, ensure_ascii=False, indent=2)
-    if adoption.get("status") == "adopted":
-        pending_wake = adoption.get("wake") if isinstance(adoption.get("wake"), dict) else {}
-        if pending_wake:
-            return json.dumps({
-                "status": "configured_session_recovered_wake",
-                "recovery": adoption,
-                "wake": pending_wake,
-            }, ensure_ascii=False, indent=2)
-        run_id = str(adoption.get("run_id") or "")
-        from ouroboros.delegate_supervision import supervised_wait
-
-        wake_raw = supervised_wait(ctx, run_id)
-        try:
-            wake = json.loads(wake_raw)
-        except (TypeError, ValueError):
-            wake = {"status": "wake_fault", "detail": wake_raw}
-        return json.dumps({
-            "status": "configured_session_recovered_wake",
-            "recovery": adoption,
-            "wake": wake,
-        }, ensure_ascii=False, indent=2)
-    from ouroboros.tools.delegate import exact_start
-
-    try:
-        work_order = compile_external_work_order(task)
-    except WorkOrderBudgetExceeded as exc:
-        source_prompt, source_request = build_work_order_source_request(task, exc)
-        route = getattr(getattr(dispatch, "executor_resolution", None), "route", None)
-        route_id = str(getattr(route, "route_id", "") or "")
-        channel = {"status": "unverified", "reason": "route_missing", "route": route_id}
-        gateway = None
-        try:
-            from ouroboros.claudexor_daemon import ensure_owned_gateway
-
-            gateway = ensure_owned_gateway()
-            channel = route_source_request_channel(gateway, route_id)
-        except Exception as channel_error:  # noqa: BLE001 - fail closed on unknown capability
-            channel = {
-                "status": "unverified",
-                "reason": "capability_probe_failed",
-                "detail": type(channel_error).__name__,
-                "route": route_id,
-            }
-        finally:
-            if gateway is not None:
-                try:
-                    gateway.close()
-                except Exception:
-                    pass
-
-        if channel.get("status") != "available":
-            reason = (
-                "work_order_source_channel_unavailable"
-                if channel.get("status") == "unavailable"
-                else "work_order_source_channel_unverified"
-            )
-            startup = {
-                "status": "refused",
-                "reason": reason,
-                "complete_chars": exc.chars,
-                "wire_budget_chars": exc.limit,
-                "complete_sha256": exc.sha256,
-                "source_request": source_request,
-                "source_channel": channel,
-                "detail": (
-                    "The complete brief was not truncated or sent. A live interactive "
-                    "question channel is required to resolve its named source ranges."
-                ),
-            }
-            from ouroboros import delegate_custody as custody
-
-            custody.emit(custody.custody_root(ctx), "configured_subagent_work_order_refused", {
-                "task_id": str(getattr(ctx, "task_id", "") or ""),
-                **startup,
-            })
-            return json.dumps({
-                "status": "configured_session_start_wake", "startup": startup,
-            }, ensure_ascii=False, indent=2)
-
-        from ouroboros import delegate_custody as custody
-
-        custody.emit(custody.custody_root(ctx), "configured_subagent_work_order_source_request", {
-            "task_id": str(getattr(ctx, "task_id", "") or ""),
-            "route": route_id,
-            **source_request,
-        })
-        started_raw = exact_start(ctx, source_prompt, {
-            "snapshot": snapshot,
-            "compiled_work_order": True,
-            "work_order_fingerprint": exc.sha256,
-            "work_order_source_request": source_request,
-        })
-        try:
-            started = json.loads(started_raw)
-        except (TypeError, ValueError):
-            return json.dumps({
-                "status": "startup_fault",
-                "reason": "unparseable_exact_start_result",
-                "detail": str(started_raw or ""),
-                "work_order_source_request": source_request,
-            }, ensure_ascii=False, indent=2)
-        if not isinstance(started, dict):
-            started = {"status": "startup_fault", "detail": str(started)}
-        started["work_order_source_request"] = source_request
-        if str(started.get("status") or "") != "started":
-            return json.dumps({
-                "status": "configured_session_start_wake",
-                "startup": started,
-            }, ensure_ascii=False, indent=2)
-        _mark_physical_activity(ctx)
-        run_id = str(started.get("run_id") or "")
-        if not run_id:
-            return json.dumps({
-                "status": "configured_session_start_wake",
-                "startup": started,
-                "reason": "started_without_run_id",
-            }, ensure_ascii=False, indent=2)
-        from ouroboros.delegate_supervision import supervised_wait
-
-        wake_raw = supervised_wait(ctx, run_id)
-        try:
-            wake = json.loads(wake_raw)
-        except (TypeError, ValueError):
-            wake = {"status": "wake_fault", "detail": wake_raw}
-        return json.dumps({
-            "status": "configured_session_wake",
-            "startup": started,
-            "wake": wake,
-        }, ensure_ascii=False, indent=2)
-    started_raw = exact_start(ctx, work_order, {
-        "snapshot": snapshot,
-        "compiled_work_order": True,
-    })
-    try:
-        started = json.loads(started_raw)
-    except (TypeError, ValueError):
-        return json.dumps({
-            "status": "startup_fault",
-            "reason": "unparseable_exact_start_result",
-            "detail": str(started_raw or ""),
-        }, ensure_ascii=False, indent=2)
-    if not isinstance(started, dict):
-        started = {"status": "startup_fault", "detail": str(started)}
-    # A POST with no durable STARTED row is intentionally NOT treated as healthy
-    # custody and does not enter quiet sleep. The nanny gets the exact evidence now.
-    if str(started.get("status") or "") != "started":
-        return json.dumps({
-            "status": "configured_session_start_wake",
-            "startup": started,
-        }, ensure_ascii=False, indent=2)
-    _mark_physical_activity(ctx)
-    run_id = str(started.get("run_id") or "")
-    if not run_id:
-        return json.dumps({
-            "status": "configured_session_start_wake",
-            "startup": started,
-            "reason": "started_without_run_id",
-        }, ensure_ascii=False, indent=2)
-    from ouroboros.delegate_supervision import supervised_wait
-
-    wake_raw = supervised_wait(ctx, run_id)
-    try:
-        wake = json.loads(wake_raw)
-    except (TypeError, ValueError):
-        wake = {"status": "wake_fault", "detail": wake_raw}
-    return json.dumps({
-        "status": "configured_session_wake",
-        "startup": started,
-        "wake": wake,
-    }, ensure_ascii=False, indent=2)
-
-
-__all__ = ["append_startup_receipt", "bootstrap_before_context", "bootstrap_session_leaf"]
+__all__ = ["append_startup_receipt", "bootstrap_before_context"]

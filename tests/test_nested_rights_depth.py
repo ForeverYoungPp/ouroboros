@@ -8,6 +8,8 @@ from ouroboros.task_results import STATUS_RUNNING, write_task_result
 from ouroboros.tools.control_delegation import (
     check_delegation_admission,
     child_budget_for_schedule,
+    durable_direct_child_count,
+    schedule_delegation_refusal,
     stamp_depth_provenance,
     stamp_task_assignment_depth,
 )
@@ -24,6 +26,15 @@ def test_explicit_rights_are_typed_and_legacy_omission_stays_permissive():
     capped = check_delegation_admission({"max_children": 1}, direct_child_count=1)
     assert capped.ok is False and capped.reason_code == "delegation_rights_max_children"
     assert check_delegation_admission({}, direct_child_count=99).ok
+    assert check_delegation_admission({}, direct_child_count=None).ok
+    unknown_fanout = check_delegation_admission(
+        {"may_fan_out": False}, direct_child_count=None,
+    )
+    assert unknown_fanout.reason_code == "delegation_rights_child_count_unknown"
+    unknown_cap = check_delegation_admission(
+        {"max_children": 1}, direct_child_count=None,
+    )
+    assert unknown_cap.reason_code == "delegation_rights_child_count_unknown"
 
     narrowed = child_budget_for_schedule(
         {"delegation_budget": {"may_delegate": "false", "may_fan_out": "false"}},
@@ -146,6 +157,34 @@ def test_supervisor_ingress_bounds_legacy_permission_by_admitted_remaining_envel
     assert stamped["delegation_budget"]["depth_provenance"] == provenance
 
 
+def test_supervisor_ingress_records_explicit_root_depth_request(tmp_path, monkeypatch):
+    from supervisor import events
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    contract = build_task_contract({
+        "delegation_budget": {"depth_remaining": 3},
+    })
+    event = _schedule_event("root", "", depth=0, drive_root=tmp_path)
+    event.update({
+        "type": "schedule_task",
+        "chat_id": 1,
+        "delegation_role": "root",
+        "root_task_id": "root",
+        "task_contract": contract,
+    })
+    enqueued = []
+
+    events._handle_schedule_task(event, _fake_ctx(tmp_path, enqueued))
+
+    assert len(enqueued) == 1
+    assert enqueued[0]["task_contract"]["delegation_budget"]["depth_provenance"] == {
+        "requested_depth": 3,
+        "permitted_depth": 3,
+        "attempted_depth": 0,
+        "achieved_depth": None,
+    }
+
+
 def test_legacy_budget_reports_unknown_request_but_current_permission():
     budget = child_budget_for_schedule(
         {}, current_depth=0, new_depth=1, max_depth=3, may_mutate=False,
@@ -249,6 +288,218 @@ def test_supervisor_admission_enforces_parent_rights_and_allows_one_non_fanout_c
     assert rejected["reason_code"] == "delegation_rights_may_fan_out"
 
 
+def test_supervisor_rolls_back_subagent_when_scheduled_result_write_fails(
+    tmp_path, monkeypatch,
+):
+    from supervisor import events, task_admission
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    parent_contract = build_task_contract({"delegation_budget": {"may_fan_out": False}})
+    write_task_result(
+        tmp_path, "parent", STATUS_RUNNING,
+        parent_task_id="", root_task_id="parent",
+        delegation_role="root", task_contract=parent_contract,
+    )
+    enqueued = []
+    ctx = _fake_ctx(tmp_path, enqueued)
+    write_task_result(
+        tmp_path, "child-1", "requested",
+        parent_task_id="parent", root_task_id="parent",
+        delegation_role="subagent", result="Awaiting supervisor acceptance.",
+    )
+
+    def enqueue_task(task):
+        admitted = dict(task)
+        enqueued.append(admitted)
+        ctx.PENDING.append(admitted)
+        return admitted
+
+    ctx.enqueue_task = enqueue_task
+    original_write = task_admission.write_task_result
+
+    def fail_first_scheduled(root, task_id, status, **fields):
+        if task_id == "child-1" and status == events.STATUS_SCHEDULED:
+            raise OSError("simulated scheduled receipt failure")
+        return original_write(root, task_id, status, **fields)
+
+    monkeypatch.setattr(task_admission, "write_task_result", fail_first_scheduled)
+
+    events._handle_schedule_task(
+        _schedule_event("child-1", "parent", drive_root=tmp_path), ctx,
+    )
+    assert [task["id"] for task in enqueued] == ["child-1"]
+    assert ctx.PENDING == []
+    rejected_first = json.loads(
+        (tmp_path / "task_results" / "child-1.json").read_text(encoding="utf-8")
+    )
+    assert rejected_first["status"] == "failed"
+    assert rejected_first["reason_code"] == "scheduled_result_persist_failed"
+    assert rejected_first["delegation_admission"]["status"] == "rejected"
+
+    events._handle_schedule_task(
+        _schedule_event("child-2", "parent", drive_root=tmp_path), ctx,
+    )
+    scheduled = json.loads(
+        (tmp_path / "task_results" / "child-2.json").read_text(encoding="utf-8")
+    )
+    assert [task["id"] for task in enqueued] == ["child-1", "child-2"]
+    assert [task["id"] for task in ctx.PENDING] == ["child-2"]
+    assert scheduled["status"] == "scheduled"
+    assert scheduled["delegation_admission"]["status"] == "accepted"
+    assert scheduled["delegation_admission"]["direct_child_count"] == 0
+    assert len(scheduled["delegation_admission"]["transition_id"]) == 32
+
+
+def test_supervisor_receipt_rollback_removes_only_its_enqueue_identity(
+    tmp_path, monkeypatch,
+):
+    from supervisor import events, task_admission
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    parent_contract = build_task_contract({"delegation_budget": {"may_fan_out": True}})
+    write_task_result(
+        tmp_path, "parent", STATUS_RUNNING,
+        root_task_id="parent", delegation_role="root", task_contract=parent_contract,
+    )
+    enqueued = []
+    ctx = _fake_ctx(tmp_path, enqueued)
+    preexisting = {
+        "id": "same-id",
+        "root_task_id": "parent",
+        "parent_task_id": "parent",
+        "delegation_role": "subagent",
+    }
+    ctx.PENDING.append(preexisting)
+    write_task_result(
+        tmp_path,
+        "same-id",
+        "scheduled",
+        parent_task_id="parent",
+        root_task_id="parent",
+        delegation_role="subagent",
+        delegation_admission={
+            "status": "accepted",
+            "direct_child_count": 0,
+            "transition_id": "old-transition",
+        },
+    )
+
+    def enqueue_task(task):
+        admitted = dict(task)
+        enqueued.append(admitted)
+        ctx.PENDING.append(admitted)
+        return admitted
+
+    ctx.enqueue_task = enqueue_task
+    original_write = task_admission.write_task_result
+
+    def fail_scheduled(root, task_id, status, **fields):
+        if task_id == "same-id" and status == events.STATUS_SCHEDULED:
+            raise OSError("simulated pre-commit failure")
+        return original_write(root, task_id, status, **fields)
+
+    monkeypatch.setattr(task_admission, "write_task_result", fail_scheduled)
+
+    events._handle_schedule_task(
+        _schedule_event("same-id", "parent", drive_root=tmp_path), ctx,
+    )
+
+    assert len(ctx.PENDING) == 1
+    assert ctx.PENDING[0] is preexisting
+    preserved = json.loads(
+        (tmp_path / "task_results" / "same-id.json").read_text(encoding="utf-8")
+    )
+    assert preserved["status"] == "scheduled"
+    assert preserved["delegation_admission"] == {
+        "status": "accepted",
+        "direct_child_count": 0,
+        "transition_id": "old-transition",
+    }
+
+
+def test_supervisor_keeps_admission_when_scheduled_write_raises_after_commit(
+    tmp_path, monkeypatch,
+):
+    from supervisor import events, task_admission
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    parent_contract = build_task_contract({"delegation_budget": {"may_fan_out": False}})
+    write_task_result(
+        tmp_path, "parent", STATUS_RUNNING,
+        root_task_id="parent", delegation_role="root", task_contract=parent_contract,
+    )
+    enqueued = []
+    ctx = _fake_ctx(tmp_path, enqueued)
+
+    def enqueue_task(task):
+        admitted = dict(task)
+        enqueued.append(admitted)
+        ctx.PENDING.append(admitted)
+        return admitted
+
+    ctx.enqueue_task = enqueue_task
+    original_write = task_admission.write_task_result
+
+    def commit_then_raise(root, task_id, status, **fields):
+        stored = original_write(root, task_id, status, **fields)
+        if task_id == "child" and status == events.STATUS_SCHEDULED:
+            raise OSError("simulated post-commit observer failure")
+        return stored
+
+    monkeypatch.setattr(task_admission, "write_task_result", commit_then_raise)
+
+    events._handle_schedule_task(
+        _schedule_event("child", "parent", drive_root=tmp_path), ctx,
+    )
+
+    assert [task["id"] for task in ctx.PENDING] == ["child"]
+    scheduled = json.loads(
+        (tmp_path / "task_results" / "child.json").read_text(encoding="utf-8")
+    )
+    assert scheduled["status"] == "scheduled"
+    assert scheduled["delegation_admission"]["status"] == "accepted"
+    assert len(scheduled["delegation_admission"]["transition_id"]) == 32
+    assert scheduled["delegation_admission"]["transition_id"] != "old-transition"
+
+
+def test_supervisor_rolls_back_when_monotonic_writer_returns_old_terminal(
+    tmp_path, monkeypatch,
+):
+    from supervisor import events
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    parent_contract = build_task_contract({"delegation_budget": {"may_fan_out": True}})
+    write_task_result(
+        tmp_path, "parent", STATUS_RUNNING,
+        root_task_id="parent", delegation_role="root", task_contract=parent_contract,
+    )
+    write_task_result(
+        tmp_path, "child", "completed",
+        parent_task_id="parent", root_task_id="parent",
+        delegation_role="subagent", result="old terminal child",
+    )
+    enqueued = []
+    ctx = _fake_ctx(tmp_path, enqueued)
+
+    def enqueue_task(task):
+        admitted = dict(task)
+        enqueued.append(admitted)
+        ctx.PENDING.append(admitted)
+        return admitted
+
+    ctx.enqueue_task = enqueue_task
+    events._handle_schedule_task(
+        _schedule_event("child", "parent", drive_root=tmp_path), ctx,
+    )
+
+    assert ctx.PENDING == []
+    terminal = json.loads(
+        (tmp_path / "task_results" / "child.json").read_text(encoding="utf-8")
+    )
+    assert terminal["status"] == "completed"
+    assert terminal["result"] == "old terminal child"
+
+
 def test_supervisor_admission_enforces_may_delegate_false_even_when_stringified(tmp_path):
     from supervisor import events
 
@@ -261,3 +512,46 @@ def test_supervisor_admission_enforces_may_delegate_false_even_when_stringified(
     rejected = json.loads((tmp_path / "task_results" / "child.json").read_text(encoding="utf-8"))
     assert enqueued == []
     assert rejected["reason_code"] == "delegation_rights_may_delegate"
+
+
+def test_direct_child_count_read_gap_is_typed_unknown(tmp_path):
+    results = tmp_path / "task_results"
+    results.mkdir()
+    (results / "corrupt-child.json").write_text("{not-json", encoding="utf-8")
+    contract = build_task_contract({"delegation_budget": {"max_children": 1}})
+
+    assert durable_direct_child_count(tmp_path, "parent") is None
+    refusal = schedule_delegation_refusal(contract, tmp_path, "parent")
+    assert "delegation_rights_child_count_unknown" in refusal
+
+
+def test_supervisor_rejects_count_bounded_child_when_count_scan_fails(
+    tmp_path, monkeypatch,
+):
+    from supervisor import events
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "ouroboros.task_results.list_task_results",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unreadable")),
+    )
+    parent_contract = build_task_contract({
+        "delegation_budget": {"may_fan_out": False, "max_children": 1},
+    })
+    write_task_result(
+        tmp_path, "parent", STATUS_RUNNING, root_task_id="parent",
+        delegation_role="root", task_contract=parent_contract,
+    )
+    enqueued = []
+    ctx = _fake_ctx(tmp_path, enqueued)
+
+    events._handle_schedule_task(
+        _schedule_event("child", "parent", drive_root=tmp_path), ctx,
+    )
+
+    rejected = json.loads(
+        (tmp_path / "task_results" / "child.json").read_text(encoding="utf-8")
+    )
+    assert enqueued == []
+    assert rejected["reason_code"] == "delegation_rights_child_count_unknown"
+    assert rejected["delegation_admission"]["direct_child_count"] is None

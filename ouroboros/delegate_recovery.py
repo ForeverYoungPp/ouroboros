@@ -276,10 +276,10 @@ def _holder_value(holder: Any, name: str, *, pending: bool) -> str:
 def _successor_binding_mismatch(row: Mapping[str, Any], task: Mapping[str, Any]) -> str:
     """Re-prove task authority plus the exact leaf binding reserved at handoff.
 
-    The first atomic leaf is bound to the task snapshot.  An explicit same-nanny
-    replacement (or a root-direct leaf) has its own later durable actor/work-order
-    binding, so recovery follows that unique custody holder rather than retargeting it
-    back to the task's initial actor.
+    The task's first physical invocation, when one exists, is bound to the task
+    snapshot.  An explicit same-nanny replacement (or a root-direct leaf) has its
+    own later durable actor/work-order binding, so recovery follows that unique
+    custody holder rather than retargeting it back to the task's initial actor.
     """
 
     if str(row.get("authority_fingerprint") or "") != authority_fingerprint_from_task(task):

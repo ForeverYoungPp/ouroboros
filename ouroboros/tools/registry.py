@@ -1781,7 +1781,10 @@ class ToolRegistry:
             isinstance(bootstrap, dict)
             and not bool(bootstrap.get("physical_started"))
             and not bool(bootstrap.get("zero_run_receipt_recorded"))
-            and bool(bootstrap.get("exact_start_pending", True))
+            and (
+                bool(bootstrap.get("exact_start_pending", True))
+                or str(bootstrap.get("zero_run_evidence_status") or "") == "unknown"
+            )
         )
 
     def initial_tool_names(self) -> frozenset[str]:

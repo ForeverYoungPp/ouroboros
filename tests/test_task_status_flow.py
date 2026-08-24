@@ -604,6 +604,26 @@ def _receipt_rows_of(output):
     return summary.get("verification_receipts")
 
 
+def test_default_receipt_read_stays_all_or_nothing_on_invalid_utf8(tmp_path):
+    from ouroboros.outcomes import (
+        read_verification_receipts,
+        verification_receipts_path,
+    )
+
+    path = verification_receipts_path(tmp_path, "invalid-utf8", create=True)
+    path.write_bytes(b'\xff\n{"status":"pass","criterion_id":"partial-green"}\n')
+
+    # Existing observational consumers must not receive a partial green view.
+    assert read_verification_receipts(tmp_path, "invalid-utf8") == []
+
+    gaps: set[str] = set()
+    rows = read_verification_receipts(
+        tmp_path, "invalid-utf8", gap_reasons=gaps,
+    )
+    assert [row["criterion_id"] for row in rows] == ["partial-green"]
+    assert "unreadable_bytes" in gaps
+
+
 def test_child_finalization_publishes_receipts_to_canonical_root(tmp_path):
     """S3 seam (a): every real schedule_subagent child runs memory_mode forked|empty
     on an ISOLATED drive, so verify_and_record writes its receipts under the CHILD
@@ -687,6 +707,26 @@ def test_child_receipt_republish_is_idempotent_refresh(tmp_path):
     assert [r["criterion_id"] for r in read_verification_receipts(tmp_path, tid)] == [
         "claim_red", "claim_red",
     ]
+
+
+def test_child_receipt_publish_preserves_corrupt_canonical_authority(tmp_path):
+    from ouroboros.headless import _publish_child_verification_receipts, prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt, verification_receipts_path
+
+    tid = "child-corrupt-authority"
+    child_drive = prepare_task_drive(tmp_path, tid, "forked")
+    assert append_verification_receipt(child_drive, tid, {
+        "status": "pass",
+        "check": "pytest tests/ordinary.py",
+        "criterion_id": "ordinary",
+    })
+    canonical = verification_receipts_path(tmp_path, tid, create=True)
+    corrupt = b'{"contract_kind":"delegation_zero_run","zero_run":true\n'
+    canonical.write_bytes(corrupt)
+
+    _publish_child_verification_receipts(tmp_path, tid, child_drive)
+
+    assert canonical.read_bytes() == corrupt
 
 
 def test_get_task_result_merges_child_and_canonical_receipts(tmp_path):
