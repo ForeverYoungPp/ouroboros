@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 pytest_plugins = ("tests.test_ui_smoke_playwright",)
@@ -393,6 +395,83 @@ def test_task_status_stays_factual_in_main_and_project_chat(
                 assert page.locator("#toast-stack .toast").count() == 0
                 assert page.locator('[data-nav-page="chat"] .unread-badge').count() == 0
                 assert project_row.locator(".nav-unread-dot").count() == 0
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
+def test_history_replay_keeps_finalizing_and_finishes_bare_final(
+    direct_server_with_data,
+):
+    """Open summaries stay live; a keyed final without summary falls back to Done."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    messages = [
+        {
+            "role": "assistant", "is_progress": True, "task_id": "replay-finalizing",
+            "text": "Post-task synthesis is still running.",
+            "content": "Post-task synthesis is still running.",
+            "task_phase": "finalizing", "ts": "2026-08-17T10:00:00+00:00",
+        },
+        {
+            "role": "system", "system_type": "task_summary",
+            "task_id": "replay-finalizing", "status": "completed",
+            "outcome_final": False, "task_phase": "finalizing",
+            "tool_calls": 1, "rounds": 2, "text": "Authored summary.",
+            "ts": "2026-08-17T10:00:01+00:00",
+        },
+        {
+            "role": "assistant", "task_id": "replay-finalizing",
+            "task_phase": "finalizing", "text": "Early answer.",
+            "ts": "2026-08-17T10:00:02+00:00",
+        },
+        {
+            "role": "assistant", "is_progress": True, "task_id": "replay-bare-final",
+            "text": "Last retained progress.", "content": "Last retained progress.",
+            "ts": "2026-08-17T10:01:00+00:00",
+        },
+        {
+            "role": "assistant", "task_id": "replay-bare-final",
+            "text": "Retained final answer.", "ts": "2026-08-17T10:01:01+00:00",
+        },
+    ]
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            try:
+                page.route(
+                    "**/api/chat/history*",
+                    lambda route: route.fulfill(
+                        content_type="application/json",
+                        body=json.dumps({"messages": messages}),
+                    ),
+                )
+                page.goto(
+                    direct_server_with_data["url"],
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+
+                open_card = page.locator(
+                    '.chat-live-card[data-task-id="replay-finalizing"]'
+                )
+                done_card = page.locator(
+                    '.chat-live-card[data-task-id="replay-bare-final"]'
+                )
+                open_card.wait_for(state="visible", timeout=10_000)
+                done_card.wait_for(state="visible", timeout=10_000)
+
+                assert open_card.get_attribute("data-finished") == "0"
+                assert open_card.locator(".chat-live-phase").inner_text().strip() == "Finalizing…"
+                assert done_card.get_attribute("data-finished") == "1"
+                assert done_card.locator(".chat-live-phase").inner_text().strip() == "Done"
             finally:
                 browser.close()
     except PlaywrightError as exc:

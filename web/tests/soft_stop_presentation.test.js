@@ -69,7 +69,10 @@ test('the chat.js terminal seam keeps soft-stop truth in the details', () => {
     // Pinned at source: the shared task presentation owns the factual headline,
     // and the details panel body carries the owner-request marker.
     assert.match(chat, /taskStoppedWithSummary\(msg \|\| \{\}\)/);
-    assert.match(chat, /taskPresentation\(taskTerminalPhase\(msg \|\| \{\}\)\)/);
+    assert.match(
+        chat,
+        /taskPresentation\(finalizing \? 'working' : taskTerminalPhase\(msg \|\| \{\}\)\)/,
+    );
     assert.match(chat, /softStopped \? OWNER_STOP_DETAIL_MARKER : ''/);
     assert.match(chat, /\[softStopDetail, reasonDetail, reviewDetails\]\.filter\(Boolean\)\.join\('\\n'\)/);
     assert.match(chat, /visible: Boolean\(softStopDetail \|\| reasonDetail \|\| reviewDetails\)/);

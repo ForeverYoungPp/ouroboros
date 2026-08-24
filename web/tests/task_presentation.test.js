@@ -13,6 +13,7 @@ import {
 import {
     captureLiveCardPhaseState,
     desiredLiveCardPhase,
+    replayTerminalPhase,
     restoreLiveCardPhaseState,
     setLiveCardPhase,
 } from '../modules/task_phase_chip.js';
@@ -61,7 +62,10 @@ test('live task_done and replay/log task truth have phase and headline parity', 
             assert.ok(replay.meta.includes('delegated_custody_unreconciled'));
         }
     }
-    assert.match(chatSource, /const presentation = taskPresentation\(taskTerminalPhase\(msg \|\| \{\}\)\);/);
+    assert.match(
+        chatSource,
+        /const presentation = taskPresentation\(finalizing \? 'working' : taskTerminalPhase\(msg \|\| \{\}\)\);/,
+    );
 });
 
 test('interrupted task_done remains retryable and cannot finish a root card', () => {
@@ -215,6 +219,39 @@ test('task-detail healing reuses the full terminal-summary projection', () => {
     assert.match(missingHeal, /isTerminalTaskDetail\(detail\)/);
     assert.match(missingHeal, /appendTaskSummaryToLiveCard\(\{ \.\.\.detail, task_id: taskId \}\)/);
     assert.doesNotMatch(missingHeal, /finishLiveCard\(/);
+});
+
+test('history replay keeps open summaries live and terminal fallbacks factual', () => {
+    const summary = chatSource.slice(
+        chatSource.indexOf('function appendTaskSummaryToLiveCard'),
+        chatSource.indexOf('// child task_id'),
+    );
+    assert.match(summary, /const finalizing = msg\?\.task_phase === 'finalizing';/);
+    assert.match(summary, /terminal: !finalizing/);
+    assert.match(summary, /record\.finalizingHold = true/);
+    assert.match(summary, /if \(finalizing\) return;\s*finishLiveCard/);
+
+    assert.equal(replayTerminalPhase({}, { finished: false, phaseEl: {
+        dataset: { phase: 'working' },
+    } }), 'done');
+    assert.equal(replayTerminalPhase({}, { finished: true, phaseEl: {
+        dataset: { phase: 'error' },
+    } }), 'error');
+    assert.equal(replayTerminalPhase({ completedPhase: 'warn' }, {}), 'warn');
+    assert.equal(
+        [...chatSource.matchAll(/finishLiveCard\(taskId, replayTerminalPhase\(taskState, record\)\)/g)].length,
+        2,
+    );
+    assert.doesNotMatch(
+        chatSource,
+        /taskState\?\.completedPhase \|\| record\?\.phaseEl\?\.dataset\?\.phase \|\| 'done'/,
+    );
+
+    const wsSummary = chatSource.slice(
+        chatSource.indexOf("if (msg.system_type === 'task_summary')"),
+        chatSource.indexOf("if (explicitTaskId && subagentChildParents.has", chatSource.indexOf("if (msg.system_type === 'task_summary')")),
+    );
+    assert.match(wsSummary, /if \(!finalizing\) markAssistantReply\(explicitTaskId\);/);
 });
 
 test('phase chips are contextual polite status regions without repeat announcements', () => {

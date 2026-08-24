@@ -41,6 +41,7 @@ import { openConfirmDialog } from './confirm_dialog.js';
 import {
     captureLiveCardPhaseState,
     desiredLiveCardPhase,
+    replayTerminalPhase,
     restoreLiveCardPhaseState,
     setLiveCardPhase,
 } from './task_phase_chip.js';
@@ -2349,12 +2350,11 @@ export function createChatInstance({
             finishLiveCard(taskId, 'done');
             return;
         }
-        // Cluster B: a card (re)built from a task_summary row also carries the coined name
-        // on reload (history attaches suggested_name to summary rows too) — apply it so the
-        // title survives even when no progress row was retained.
+        // Restore the coined task name even when history retained no progress row.
         if (msg?.suggested_name) applySuggestedName(taskId, msg.suggested_name);
+        const finalizing = msg?.task_phase === 'finalizing';
         const reviewDetails = formatReviewProjection(msg?.review_projection);
-        const taskState = getTaskUiState(taskId, Boolean(reviewDetails));
+        const taskState = getTaskUiState(taskId, Boolean(reviewDetails) || finalizing);
         if (!taskState) {
             finishLiveCard(taskId, 'done');
             return;
@@ -2362,10 +2362,10 @@ export function createChatInstance({
         if (reviewDetails) taskState.forceCard = true;
         revealBufferedCardIfNeeded(taskState, { suppressDomInsert, rawTs });
         if (!taskState.cardVisible) {
-            markAssistantReply(taskId);
+            if (!finalizing) markAssistantReply(taskId);
             return;
         }
-        const presentation = taskPresentation(taskTerminalPhase(msg || {}));
+        const presentation = taskPresentation(finalizing ? 'working' : taskTerminalPhase(msg || {}));
         // P5: a cancelled root says "Cancelled", never a generic "Done" headline.
         // №8/Q3: an owner-requested soft stop is a SUCCESS — its own headline,
         // never warn-styled, with the owner-request marker in the details.
@@ -2373,6 +2373,8 @@ export function createChatInstance({
         const softStopDetail = softStopped ? OWNER_STOP_DETAIL_MARKER : '';
         const reasonDetail = !softStopped && msg?.reason_code
             ? `Reason: ${String(msg.reason_code)}` : '';
+        const record = liveCardRecords.get(taskId);
+        if (finalizing && record && !record.finished) record.finalizingHold = true;
         applyLiveCardState(
             {
                 phase: presentation.phase,
@@ -2381,7 +2383,7 @@ export function createChatInstance({
                 visible: Boolean(softStopDetail || reasonDetail || reviewDetails),
                 human: false,
                 promote: true,
-                terminal: true,
+                terminal: !finalizing,
                 expandByDefault: Boolean(reviewDetails),
                 costProjection: taskCostProjection(msg, rawTs),
             },
@@ -2390,6 +2392,7 @@ export function createChatInstance({
             `task_done|${taskId}`,
             { suppressDomInsert, rawTs },
         );
+        if (finalizing) return;
         finishLiveCard(taskId, presentation.phase);
         scheduleTaskUiCleanup(taskState);
     }
@@ -3165,8 +3168,7 @@ export function createChatInstance({
                             routeSubagentFinalMessageToCard(taskId, msg);
                             const taskState = getTaskUiState(taskId, false);
                             const record = liveCardRecords.get(taskId);
-                            const preservedPhase = taskState?.completedPhase || record?.phaseEl?.dataset?.phase || 'done';
-                            finishLiveCard(taskId, preservedPhase);
+                            finishLiveCard(taskId, replayTerminalPhase(taskState, record));
                             continue;
                         }
                         insertCardIfNeeded(taskId);
@@ -3176,8 +3178,7 @@ export function createChatInstance({
                         } else {
                             const taskState = getTaskUiState(taskId, false);
                             const record = liveCardRecords.get(taskId);
-                            const preservedPhase = taskState?.completedPhase || record?.phaseEl?.dataset?.phase || 'done';
-                            finishLiveCard(taskId, preservedPhase);
+                            finishLiveCard(taskId, replayTerminalPhase(taskState, record));
                         }
                     }
                     // A replayed durable routing receipt carries the same
@@ -4259,7 +4260,7 @@ export function createChatInstance({
 
             if (msg.system_type === 'task_summary') {
                 appendTaskSummaryToLiveCard(msg);
-                markAssistantReply(explicitTaskId);
+                if (!finalizing) markAssistantReply(explicitTaskId);
                 incrementUnreadIfNeeded(msg);
                 syncChatStatus();
                 return;
