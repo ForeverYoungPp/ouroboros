@@ -558,10 +558,14 @@ PLAN_REVIEW_SESSION_OUTPUT_SCHEMA: dict = {
                 "properties": {
                     "id": {"type": "string"},
                     "class": {"type": "string", "enum": ["blocking", "note", "need_evidence"]},
-                    "breaks": {"type": "string"},
-                    "locator": {"type": "string"},
+                    # Optional fields admit null: models legitimately emit null for
+                    # an absent optional value, and a schema that rejects its own
+                    # optionality forces every schema-bearing route into
+                    # outputConformance=failed (v6.110 incident f0a6fb64c92d491f).
+                    "breaks": {"type": ["string", "null"]},
+                    "locator": {"type": ["string", "null"]},
                     "summary": {"type": "string"},
-                    "recommendation": {"type": "string"},
+                    "recommendation": {"type": ["string", "null"]},
                 },
             },
         },

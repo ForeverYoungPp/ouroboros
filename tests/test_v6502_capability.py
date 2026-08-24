@@ -89,6 +89,52 @@ def test_build_swarm_efficiency_rolls_up_fanout_events(tmp_path):
     assert roll["wave_count"] == 2
     assert roll["inter_wave_latency_sec_total"] == 194.0
     assert sorted(roll["lanes_requested"]) == ["heavy", "light"]
+    # A plain task's rollup carries no intent annotation (rc-phaseC).
+    assert "intent_source" not in roll and "requested_count" not in roll
+
+
+def _swarm_task(task_id):
+    return {"id": task_id, "metadata": {"force_plan": True, "force_plan_source": "swarm"}}
+
+
+def test_build_swarm_efficiency_zero_fanout_swarm_intent_returns_minimal_block(tmp_path):
+    # A Swarm-button task that spawned zero children must not vanish into None:
+    # it returns the minimal no_fanout_observed block. `planned` is null — never
+    # inferred as 0 from the absence of events.
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "events.jsonl").write_text("", encoding="utf-8")
+    block = _build_swarm_efficiency(_Env(tmp_path), _swarm_task("t-swarm"))
+    assert block == {
+        "intent_source": "swarm",
+        "planned": None,
+        "observed_started": 0,
+        "status": "no_fanout_observed",
+    }
+
+
+def test_build_swarm_efficiency_rollup_carries_intent_source_and_requested_count(tmp_path):
+    # With real fanout events present, the existing rollup keys stay unchanged and
+    # the swarm-intent task additionally carries intent_source plus the waves'
+    # requested_count sum under its existing event name (no synonyms).
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    events = [
+        {"type": "swarm_fanout", "parent_task_id": "t-swarm", "task_ids": ["c1", "c2"],
+         "requested_count": 2, "inter_wave_latency_sec": 0.0, "requested_model_lane": "heavy"},
+        {"type": "swarm_fanout", "parent_task_id": "t-swarm", "task_ids": ["run-1"],
+         "requested_count": 1, "inter_wave_latency_sec": 3.5, "requested_model_lane": "codex-route"},
+    ]
+    (logs / "events.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+    roll = _build_swarm_efficiency(_Env(tmp_path), _swarm_task("t-swarm"))
+    assert roll is not None
+    assert roll["subagent_count"] == 3
+    assert roll["wave_count"] == 2
+    assert roll["inter_wave_latency_sec_total"] == 3.5
+    assert roll["lanes_requested"] == ["heavy", "codex-route"]
+    assert roll["intent_source"] == "swarm"
+    assert roll["requested_count"] == 3
 
 
 # --- B2: burst/absorb advisory fires when >=1 OTHER child is still live ---

@@ -94,6 +94,103 @@ def test_project_name_limit_is_enforced_before_gateway_side_effects(tmp_path):
     assert get_project(tmp_path, "too-long") is None
 
 
+def test_create_project_reports_creation_fact_without_persisting_it(tmp_path):
+    """B1 contract: the returned dict carries the additive `created` key —
+    True only for the call that registered the row, False on the idempotent
+    replay — and the key never lands in the persisted registry entry."""
+    from ouroboros.projects_registry import create_project, get_project, list_projects
+
+    first = create_project(tmp_path, "alpha", name="Alpha")
+    assert first["created"] is True
+    replay = create_project(tmp_path, "alpha")
+    assert replay["created"] is False
+    assert replay["id"] == "alpha"
+    assert replay["chat_id"] == first["chat_id"]
+    assert all("created" not in row for row in list_projects(tmp_path))
+    assert "created" not in (get_project(tmp_path, "alpha") or {})
+
+
+def test_project_started_row_rides_outbox_pins_main_and_dedupes_durably(tmp_path, monkeypatch):
+    """B1: the agent-initiated `project_started` row mirrors the completion
+    mechanics — same terminal-delivery outbox, `project-start:<pid>` as the ONE
+    restart-surviving dedupe, and the send handler pins chat 1 (Main) even
+    though the task is already project-bound (lineage routing would otherwise
+    pull the row into the Project thread)."""
+    from ouroboros.project_dialogue import announce_project_started
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+    from supervisor import events, workers
+
+    project = create_project(tmp_path, "launch", name="Launch 🚀")
+    bind_task_to_project(
+        tmp_path, "root-project", project["id"], project["chat_id"],
+        origin={"absent": "system"},
+    )
+    queued = []
+    monkeypatch.setattr(
+        workers, "get_event_q", lambda: SimpleNamespace(put=queued.append),
+    )
+    events._DELIVERED_MESSAGE_IDS.clear()
+    task = {"id": "root-project", "project_id": "launch", "title": "Ship release"}
+
+    assert announce_project_started(tmp_path, project, "root-project", task=task) is True
+    assert announce_project_started(tmp_path, project, "root-project", task=task) is True
+    assert len(queued) == 2  # duplicate live copies share one durable delivery id
+    assert queued[0]["delivery_id"] == "project-start:launch"
+    assert queued[0]["system_type"] == "project_started"
+    assert queued[0]["role"] == "system"
+    assert queued[0]["chat_id"] == 1
+    assert queued[0]["text"] == (
+        "Launch 🚀 › Ship release · Started\nWork is running in this Project."
+    )
+    assert queued[0]["progress_meta"] == {
+        "project_id": "launch",
+        "project_name": "Launch 🚀",
+        "target_label": "Launch 🚀 › Ship release",
+    }
+
+    sent = []
+    ctx = SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING={},
+        send_with_budget=lambda *a, **k: sent.append((a, k)),
+        append_jsonl=lambda *_a, **_k: None,
+    )
+    events._handle_send_message(queued[0], ctx)
+    events._handle_send_message(queued[1], ctx)
+
+    assert len(sent) == 1  # second copy suppressed by the durable delivery id
+    assert sent[0][0][0] == 1  # pinned to Main despite the project binding
+    assert sent[0][1]["system_type"] == "project_started"
+    assert sent[0][1]["role"] == "system"
+    assert sent[0][1]["progress_meta"]["target_label"] == "Launch 🚀 › Ship release"
+
+
+def test_owner_api_create_does_not_announce_project_started(tmp_path, monkeypatch):
+    """Owner decision 2=A: manual/HTTP project creation stays silent — no
+    `project_started` row rides the terminal-delivery outbox from the owner
+    API seam (only the agent-initiated workers seams announce)."""
+    from ouroboros.gateway.projects import api_projects_create
+
+    delivered = []
+    monkeypatch.setattr(
+        "supervisor.terminal_delivery.enqueue_terminal_delivery",
+        lambda *_a, **_k: delivered.append(1) or True,
+    )
+
+    async def _json():
+        return {"id": "manual-room", "name": "Manual Room"}
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(drive_root=tmp_path)),
+        json=_json,
+    )
+    response = asyncio.run(api_projects_create(request))
+    assert response.status_code == 200
+    from ouroboros.projects_registry import get_project
+
+    assert get_project(tmp_path, "manual-room") is not None
+    assert delivered == []
+
+
 def test_chat_annotations_are_compact_and_torn_tail_tolerant(tmp_path):
     from ouroboros.project_dialogue import append_chat_annotation, latest_chat_annotations
 
@@ -261,7 +358,7 @@ def test_project_activity_stays_out_of_main_static_contract():
     # Main's gate is the pure mainThreadAccepts predicate (server project_thread
     # stamp + known-project set) — behavior pinned in chat_thread_routing.test.js.
     assert "return mainThreadAccepts(msg, state.projectChatIds);" in fanout
-    assert "msg.system_type === 'project_completion_summary'" in fanout
+    assert "PROJECT_ROW_TYPES.has(msg.system_type)" in fanout
     assert "appendTaskSummaryToLiveCard(msg);" in fanout
     assert "updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true });" in fanout
     assert "incrementUnreadIfNeeded(msg);" in fanout
@@ -274,10 +371,50 @@ def test_project_activity_stays_out_of_main_static_contract():
         chat.index("function cancelHistoryPaint")
     ]
     assert "appendTaskSummaryToLiveCard(msg" in history
-    assert "msg.system_type === 'project_completion_summary'" in history
+    assert "PROJECT_ROW_TYPES.has(msg.system_type)" in history
     assert "incrementUnreadIfNeeded" not in history
     assert "name: projectName || 'Project'" in chat
     assert "name: projectName || projectId" not in chat
+
+
+def test_project_lifecycle_rows_render_design_system_action_static_contract():
+    """B2 static guard (sol item 4 UI / fable 4.3): BOTH host-stamped Project
+    lifecycle rows render their action through the shared design-system helper
+    inside a `.system-message-actions` container; the custom pill class and its
+    bare `<br>` spacing are structurally gone from chat.js AND style.css."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    chat = (root / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
+    style = (root / "web" / "style.css").read_text(encoding="utf-8")
+    helpers = (root / "web" / "modules" / "ui_helpers.js").read_text(encoding="utf-8")
+
+    # One shared set drives render, history replay, and live fan-out.
+    assert (
+        "const PROJECT_ROW_TYPES = new Set(['project_started', 'project_completion_summary']);"
+        in chat
+    )
+    render = chat[
+        chat.index("if (PROJECT_ROW_TYPES.has(systemType) && projectId) {"):
+        chat.index("function renderRoutingAnnotation")
+    ]
+    assert "createSystemMessageAction({" in render
+    assert "'system-message-actions'" in render
+    assert "document.createElement('br')" not in render
+
+    # The custom pill is gone everywhere; the conversion-flow buttons moved to
+    # the shared design-system role beside their `btn btn-xs btn-danger` sibling.
+    assert "chat-live-project-btn" not in chat
+    assert "chat-live-project-btn" not in style
+    assert 'class="btn btn-xs btn-default" data-turn-into-project' in chat
+    # The identity chip keeps its own role untouched.
+    assert "chat-live-project-card-btn" in chat
+
+    # Layout-only container CSS; the helper owns the one semantic button role.
+    assert ".system-message-actions {" in style
+    assert ".system-message-action {" in style
+    assert "export function createSystemMessageAction(" in helpers
+    assert "'btn btn-default btn-sm system-message-action'" in helpers
 
 
 def test_chat_ws_subscriptions_flow_through_disposer_helper():

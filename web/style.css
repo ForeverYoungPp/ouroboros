@@ -427,26 +427,18 @@ body.resizing-panels { user-select: none; }
     content: ' ⏩';
 }
 
-.chat-live-project-btn {
-    min-height: 30px;
-    padding: 0 var(--space-3);
-    border-radius: 999px;
-    border: 1px solid var(--accent-18);
-    background: var(--accent-04);
-    color: var(--text-secondary);
-    font: inherit;
-    font-size: 12px;
-    cursor: pointer;
+/* Layout-only container for design-system actions on host-stamped system
+   rows (Project lifecycle rows). The buttons themselves are the shared
+   `.btn.btn-default.btn-sm` role — no new colors, radii, or variants. */
+.system-message-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    margin-top: var(--space-3);
 }
 
-.chat-live-project-btn:hover:not(:disabled) {
-    color: var(--accent);
-    background: var(--accent-10);
-}
-
-.chat-live-project-btn:disabled {
-    opacity: 0.6;
-    cursor: default;
+.system-message-action {
+    flex: 0 0 auto;
 }
 
 

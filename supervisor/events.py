@@ -1139,8 +1139,8 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             meta.get("root_task_id") or evt.get("root_task_id"),
         )
         system_type = str(evt.get("system_type") or "")
-        # Project completion summaries target cognitive Main; other messages keep lineage routing.
-        chat_id = int(evt["chat_id"]) if system_type == "project_completion_summary" else bound_chat or int(evt["chat_id"])
+        # Project lifecycle rows (started/completion) pin Main; others keep lineage routing.
+        chat_id = int(evt["chat_id"]) if system_type in ("project_started", "project_completion_summary") else bound_chat or int(evt["chat_id"])
         ctx.send_with_budget(
             chat_id,
             str(evt.get("text") or ""),
@@ -3027,7 +3027,7 @@ def _prepare_promote_source_off_loop(evt: Dict[str, Any], ctx: Any) -> None:
     try:
         from ouroboros.promotion_source import resolve_promote_source
 
-        folder, note, error, project_id = resolve_promote_source(
+        folder, note, error, project_id, source_created = resolve_promote_source(
             ctx,
             str(evt.get("source") or ""),
             str(evt.get("project_id") or ""),
@@ -3035,6 +3035,8 @@ def _prepare_promote_source_off_loop(evt: Dict[str, Any], ctx: Any) -> None:
         continuation["project_id"] = project_id
         continuation["_source_note"] = note
         continuation["_source_error"] = error
+        # Off-loop creation fact for the one workers-side announce gate.
+        continuation["_source_created"] = bool(source_created)
         if folder and not str(continuation.get("workspace_root") or "").strip():
             continuation["workspace_root"] = folder
     except Exception as exc:

@@ -954,7 +954,8 @@ def test_skipped_guidance_is_managed_aware():
     assert "agent route" in managed or "larger-window" in managed
 
     plain = _guidance(_skip_run("⚠️ ADVISORY_SKIPPED: advisory prompt too large"))
-    assert "Consider splitting the commit into smaller chunks" in plain
+    assert "did not fit the advisory route" in plain
+    assert "agent_session" in plain
 
 
 def test_prompt_size_gate_is_managed_aware(tmp_path, monkeypatch):

@@ -577,6 +577,12 @@ def create_project(
     ``working_dir`` is optional — file-less projects (research, presentations
     drafted in chat) are first-class. The per-project chat id is derived
     deterministically from the id (one allocator-free SSOT).
+
+    The returned dict carries an additive ``created`` key — ``True`` only when
+    THIS call registered the row, ``False`` on the idempotent replay of an
+    existing project. Callers that need "did a project actually come into
+    existence" (e.g. the agent-initiated ``project_started`` announcement)
+    branch on it; the key is never persisted into the registry file.
     """
     pid = sanitize_project_id(project_id)
     if not pid:
@@ -590,7 +596,7 @@ def create_project(
                         f"project id {pid!r} is permanently reserved by a "
                         f"{existing.get('lifecycle')} project"
                     )
-                return dict(existing)
+                return {**existing, "created": False}
         entry = {
             "id": pid,
             "name": _validated_name(name, pid),
@@ -607,7 +613,7 @@ def create_project(
         data["projects"].append(entry)
         _save(drive_root, data)
         log.info("Project registered: %s (chat_id=%s)", pid, entry["chat_id"])
-        return dict(entry)
+        return {**entry, "created": True}
 
 
 def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional[Dict[str, Any]]:

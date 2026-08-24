@@ -842,6 +842,12 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
                     get_bridge().broadcast({"type": "projects_changed", "project_id": pid, "chat_id": proj_chat})
                 except Exception:
                     log.debug("promote: projects_changed broadcast failed for %s", pid, exc_info=True)
+            if evt.get("_source_created") and not (project or {}).get("created"):
+                # The source-resolution half of THIS promote registered the
+                # project off-loop (_prepare_promote_source_off_loop) — same
+                # agent-initiated creation, so the announce gate honors it.
+                project = {**(project or {}), "created": True}
+            _announce_created_project(project, tid, task=task)
         except Exception:
             log.warning("promote: project registration failed for %s", pid, exc_info=True)
             return _reject_promoted_after_attachment_stage({
@@ -1105,6 +1111,22 @@ def _fail_promoted_task_loudly(ctx: Any, task: dict, ws_error: str) -> None:
         log.debug("promote loud-fail: chat message failed for %s", tid, exc_info=True)
 
 
+def _announce_created_project(project: Any, tid: str, task: Any = None) -> None:
+    """Agent-initiated creation (owner 2=A): owe the durable Main "project
+    started" row, only when THIS call actually created the project
+    (``created is True`` from ``create_project``; idempotent replays stay
+    silent). Fail-soft — a cosmetic row must never reject the promotion or
+    the mid-task scope call."""
+    if not isinstance(project, dict) or project.get("created") is not True:
+        return
+    try:
+        from ouroboros.project_dialogue import announce_project_started
+
+        announce_project_started(DRIVE_ROOT, project, tid, task=task)
+    except Exception:
+        log.debug("project started row failed for %s", project.get("id"), exc_info=True)
+
+
 def ensure_project_scope(evt: dict, ctx: Any) -> None:
     """Create/attach the registry project for an in-task ensure_project_scope call
     and bind the CURRENT (already-running) task to it, then broadcast so the UI moves
@@ -1169,6 +1191,11 @@ def ensure_project_scope(evt: dict, ctx: Any) -> None:
                 get_bridge().broadcast({"type": "projects_changed", "project_id": pid, "chat_id": proj_chat})
             except Exception:
                 log.debug("ensure_project_scope: projects_changed broadcast failed for %s", pid, exc_info=True)
+        running = getattr(ctx, "RUNNING", None)
+        row = running.get(tid) if isinstance(running, dict) else None
+        _announce_created_project(
+            project, tid, task=row.get("task") if isinstance(row, dict) else None,
+        )
     except Exception:
         log.debug("ensure_project_scope: project registration failed for %s", pid, exc_info=True)
 

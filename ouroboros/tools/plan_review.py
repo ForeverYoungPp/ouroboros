@@ -56,9 +56,11 @@ from ouroboros.tools.plan_review_runtime import (
     plan_panel_health_snapshot as _plan_panel_health_snapshot,
     plan_payload_roots as _plan_payload_roots,
     plan_quorum_unreachable_facts as _plan_quorum_unreachable_facts,
-    plan_review_slots as _plan_review_slots, plan_row_typed_facts as _plan_row_typed_facts,
+    plan_review_slots as _plan_review_slots, plan_row_disclosures as _plan_row_disclosures,
+    plan_row_typed_facts as _plan_row_typed_facts,
     plan_reviewer_config_fingerprint as _plan_reviewer_config_fingerprint,
     plan_slot_fit as _plan_slot_fit,
+    plan_wave_progress_line as _plan_wave_progress_line,
     plan_wave_replay_decision as _plan_wave_replay_decision,
     record_raw_plan_request_attempt as _record_raw_plan_request_attempt,
     root_exploration_log as _root_exploration_log,  # noqa: F401 - compatibility seam
@@ -66,6 +68,7 @@ from ouroboros.tools.plan_review_runtime import (
     build_plan_review_packet as _build_packet,
 )
 from ouroboros.tools.plan_review_artifacts import (
+    attach_continuation_restart_delta as _attach_continuation_restart_delta,
     authority_wave as _authority_wave,
     continuation_state as _continuation_state,
     exact_wave as _exact_wave,
@@ -571,7 +574,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         system_root=system_root, active_root=active_root, cycle_index=cycle_index,
         enforcement=enforcement, previous=previous,
     )
-    slots, slot_messages, session_threads, cannot_verify = _continuation_state(
+    slots, slot_messages, session_threads, cannot_verify, continuation_restarted = _continuation_state(
         state_root, task_id, previous, slots, manifest, user_content=user_content,
     )
     if cannot_verify:
@@ -630,13 +633,14 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
     ) if callable_slots else []
     # excluded slots stay configured rows: they count in the quorum denominator
     rows = list(rows) + oversize_rows + health_skip_rows
+    _attach_continuation_restart_delta(rows, continuation_restarted)
     ids = plan_spec.spec_ids(spec)
     seen_after: set[str] = set(str(s) for s in state.get("need_evidence_seen") or [])
     slot_results: List[dict] = []
     slot_records: List[dict] = []
     for row in rows:
         findings: List[dict] = []
-        disclosures: List[str] = []
+        disclosures: List[str] = _plan_row_disclosures(row)
         error = str(row.get("error") or "")
         ok = not error
         if ok:
@@ -644,9 +648,10 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             if parse_error:
                 ok, error = False, parse_error
             else:
-                findings, disclosures, slot_seen = plan_spec.validate_findings(
+                findings, finding_disclosures, slot_seen = plan_spec.validate_findings(
                     parsed, spec_ids=ids, seen_locators=seen_after, slot=str(row.get("slot_id") or ""),
                 )  # cumulative across the wave: the per-task memory cap is exact
+                disclosures += finding_disclosures
                 seen_after |= set(slot_seen)
         slot_results.append({"slot": row.get("slot_id"), "model": row.get("model"), "ok": ok,
                              "findings": findings, "error": error or None})
@@ -747,11 +752,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             getattr(ctx, "event_queue", None), state_root, surface="plan_review",
             task_id=task_id, cycles_paid=paid_now, cap=cap, enforcement=enforcement,
             fingerprint=fingerprint)
-    ctx.emit_progress_fn(
-        f"📐 plan_task: {aggregate} — {agg['counts']['blocking']} blocking / "
-        f"{agg['counts']['note']} note / {agg['counts']['need_evidence']} need_evidence; "
-        f"cycles paid {paid_now}{'' if cap is None else f'/{cap}'}"
-    )
+    ctx.emit_progress_fn(_plan_wave_progress_line(
+        aggregate, agg["counts"], cycles_paid=paid_now, cap=cap))
     return _render_wave(stored, cap=cap, cycles_paid=paid_now, enforcement=enforcement, reminder=reminder)
 
 

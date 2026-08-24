@@ -90,13 +90,19 @@ def profile_continuity_receipt(
         }
 
     if not rotations:
-        return result(
-            "matched" if expected == applied else "cannot_verify",
-            "profile_matched" if expected == applied else "unexplained_profile_drift",
-        )
+        if not expected:
+            # An expectation that was never recorded is not drift: unpinned slots
+            # legitimately let the engine choose the account. The receipt stays
+            # telemetry either way — it never gates parsing, counting, or PASS.
+            return result("matched", "no_expectation_recorded")
+        if expected == applied:
+            return result("matched", "profile_matched")
+        return result("cannot_verify", "unexplained_profile_drift")
     if len(chain) != len(rotations):
         return result("cannot_verify", "rotation_event_malformed")
-    current, previous_seq = expected, None
+    # No pinned expectation: a typed engine rotation on an unpinned slot walks
+    # from the chain's own first hop instead of comparing against "".
+    current, previous_seq = expected or str(chain[0].get("from_profile_id") or ""), None
     for row in chain:
         seq = row.get("seq")
         source = str(row.get("from_profile_id") or "")

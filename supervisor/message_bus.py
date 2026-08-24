@@ -911,7 +911,7 @@ def log_chat(
         for key in SUBAGENT_MESSAGE_FIELDS:
             if key in meta:
                 record[key] = meta[key]
-        if record_type == "project_completion_summary":
+        if record_type in ("project_started", "project_completion_summary"):
             for key in ("project_id", "project_name", "target_label", "status"):
                 if key in meta:
                     record[key] = meta[key]

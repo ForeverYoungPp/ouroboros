@@ -1065,7 +1065,8 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             artifact_axis.update(outcome_axes.get("artifacts") or {})
         artifact_axis["status"] = str(artifact_bundle.get("status") or artifact_axis.get("status") or "not_applicable")
         outcome_axes["artifacts"] = artifact_axis
-        # B1: swarm-efficiency rollup, only for a task that fanned out (None -> omitted).
+        # B1: swarm-efficiency rollup — observed fan-out, or the zero-fanout
+        # block for a host-attested Swarm task; None (omitted) for plain tasks.
         swarm_efficiency = _build_swarm_efficiency(env, task)
         subagent_envelope = task.get("subagent_envelope") if isinstance(task.get("subagent_envelope"), dict) else {}
         if str(task.get("delegation_role") or "").lower() == "subagent":
