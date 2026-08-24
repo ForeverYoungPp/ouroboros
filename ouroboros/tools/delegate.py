@@ -581,7 +581,7 @@ def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str,
 
 
 def _start_request(ctx: ToolContext, route: Any, authority: "DelegatedRunShape",
-                   root: str, text: str, seconds: int, instructions: str) -> Dict[str, Any]:
+                   root: str, text: str, seconds: int, instructions: str, execution_root: str = "") -> Dict[str, Any]:
     """The POST body for one delegated run, built from the derived SHAPE.
 
     Extracted so the caller stays inside the method-size gate, and so the body has ONE
@@ -628,10 +628,8 @@ def _start_request(ctx: ToolContext, route: Any, authority: "DelegatedRunShape",
         # Claudexor would otherwise hand the harness the operator's real `$HOME`
         # — daemon control token included. Sending one without the other is the
         # containment hole, so neither is assembled separately.
-        request["execution"] = {
-            "isolation": authority.isolation,
-            "delegated": authority.delegated,
-        }
+        request["execution"] = {"isolation": authority.isolation, "delegated": authority.delegated,
+                                **({"workspaceRoot": execution_root} if execution_root else {})}
     if route.model:
         request["model"] = route.model
     if route.effort:
@@ -654,7 +652,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     from ouroboros.claudexor_daemon import ensure_owned_gateway
     from ouroboros.delegate_evidence import record_start_blocked
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
-    from ouroboros.subagents import resolve_subagent_executor, route_health
+    from ouroboros.subagents import delegated_execution_workspace_root, resolve_subagent_executor, route_health
 
     text = str(prompt or "").strip()
     if not text:
@@ -807,7 +805,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                                           authority.mode, authority.isolation, root, text,
                                           instructions)
             seconds = _bounded_max_seconds(ctx, max_seconds)
-            request_body = _start_request(ctx, route, authority, root, text, seconds, instructions)
+            execution_root = delegated_execution_workspace_root(gateway, authority, root)
+            request_body = _start_request(ctx, route, authority, root, text, seconds, instructions, execution_root)
         lineage = getattr(ctx, "task_metadata", {}) or {}
         lineage = lineage if isinstance(lineage, dict) else {}
         # Fresh payload run: busy check + durable write = ONE atomic claim (fix 5).

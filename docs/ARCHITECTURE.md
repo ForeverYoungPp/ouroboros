@@ -1720,6 +1720,8 @@ subagent-worktree root (`subagent_worktrees.provision_execution_snapshot`), and
 scopes the run there: `scope.root` IS the snapshot. The typed binding
 `{target_root, execution_root, baseline_sha, authority_source, snapshot_id}` is recorded durably on the
 custody request/start rows BEFORE the POST, the canonical request carries it, and an
+engine whose strict schema supports the split (`3.8.1+`) also receives that same
+snapshot as `execution.workspaceRoot`; the strict `3.8.0` body omits the newer field.
 explicit retry reproduces it exactly (a GC-collected snapshot is a typed
 `execution_snapshot_missing` refusal, never a re-mint; a stored PRE-C1 mutating
 invocation, whose recorded body scopes the run at the LIVE tree and carries no

@@ -192,7 +192,16 @@ def test_acceptance_review_wallet_cap_and_root_initialization_are_atomic(
     assert claimed["status"] == "claimed"
     assert load_task_result(tmp_path, "new-root")["status"] == STATUS_RUNNING
 
-    write_task_result(tmp_path, "cap-root", STATUS_RUNNING, root_task_id="cap-root")
+    cap_contract = build_task_contract({
+        "budget_profile": {"max_improvement_passes": 0},
+    })
+    write_task_result(
+        tmp_path,
+        "cap-root",
+        STATUS_RUNNING,
+        root_task_id="cap-root",
+        task_contract=cap_contract,
+    )
     with ThreadPoolExecutor(max_workers=2) as pool:
         outcomes = list(pool.map(
             lambda binding: task_results.claim_task_acceptance_review_cycle(
@@ -205,6 +214,16 @@ def test_acceptance_review_wallet_cap_and_root_initialization_are_atomic(
             (_acceptance_binding("1"), _acceptance_binding("5")),
         ))
     assert sorted(row["status"] for row in outcomes) == ["claimed", "unavailable"]
+
+    write_task_result(
+        tmp_path, "malformed-cap-root", STATUS_RUNNING,
+        root_task_id="malformed-cap-root", task_contract=None,
+    )
+    with pytest.raises(ValueError, match="root contract is malformed"):
+        task_results.claim_task_acceptance_review_cycle(
+            tmp_path, "malformed-cap-root", _acceptance_binding("a"),
+            max_cycles=None, claimed_by_task_id="child",
+        )
 
     write_task_result(tmp_path, "racy-root", STATUS_RUNNING, root_task_id="racy-root")
     original_update = task_results.update_json_locked

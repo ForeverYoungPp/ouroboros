@@ -57,6 +57,43 @@ def effective_task_acceptance_review_cycles(
     return None if passes is None else max(1, int(passes) + 1)
 
 
+def _root_task_acceptance_review_cap(
+    root_result: Dict[str, Any], *, fallback_max_cycles: Optional[int],
+    allow_fallback: bool,
+) -> Optional[int]:
+    """Resolve one tree cap from the canonical root result.
+
+    The fallback is only for the root itself before its canonical contract
+    exists. Descendants cannot widen the shared wallet with their inherited
+    deadline or task-local pacing snapshot.
+    """
+
+    if not root_result or "task_contract" not in root_result:
+        if allow_fallback:
+            return fallback_max_cycles
+        raise ValueError(
+            "TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN: root cap authority is absent"
+        )
+
+    from ouroboros import config
+    from ouroboros.contracts.task_contract import normalize_budget_profile
+    from ouroboros.deadline_utils import parse_deadline_ts
+
+    root_contract = root_result.get("task_contract")
+    if not isinstance(root_contract, dict):
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN: root contract is malformed")
+    profile = normalize_budget_profile(root_contract.get("budget_profile"))
+    required_blocking = bool(
+        config.get_task_review_mode() == "required"
+        and config.get_review_enforcement() == "blocking"
+    )
+    return effective_task_acceptance_review_cycles(
+        profile,
+        has_deadline=parse_deadline_ts(root_result.get("deadline_at")) is not None,
+        required_blocking=required_blocking,
+    )
+
+
 def project_task_acceptance_review_capacity(
     ctx: Any, *, binding_hash: str = "",
 ) -> Dict[str, Any]:
@@ -68,8 +105,6 @@ def project_task_acceptance_review_capacity(
     """
 
     from ouroboros import config, task_pacing
-    from ouroboros.contracts.task_contract import normalize_budget_profile
-    from ouroboros.deadline_utils import parse_deadline_ts
 
     metadata = getattr(ctx, "task_metadata", {})
     metadata = metadata if isinstance(metadata, dict) else {}
@@ -108,31 +143,24 @@ def project_task_acceptance_review_capacity(
         if path.is_file() and root_result is None:
             raise ValueError("root result is malformed")
         root_result = root_result if isinstance(root_result, dict) else {}
-        root_contract = (
-            root_result.get("task_contract")
-            if isinstance(root_result.get("task_contract"), dict)
-            else {}
-        )
-        if not root_contract and lineage.get("is_root_task"):
-            root_contract = (
-                getattr(ctx, "task_contract", None)
-                if isinstance(getattr(ctx, "task_contract", None), dict)
-                else metadata.get("task_contract")
-                if isinstance(metadata.get("task_contract"), dict)
-                else {}
+        fallback_cap = None
+        if lineage.get("is_root_task"):
+            root_profile = task_pacing.resolve_budget_profile(ctx)
+            root_snapshot = task_pacing.build_budget_snapshot(
+                ctx, profile=root_profile,
             )
-        profile = normalize_budget_profile(root_contract.get("budget_profile"))
-        deadline_value = root_result.get("deadline_at")
-        if deadline_value is None and lineage.get("is_root_task"):
-            deadline_value = metadata.get("deadline_at")
-        required_blocking = bool(
-            config.get_task_review_mode() == "required"
-            and config.get_review_enforcement() == "blocking"
-        )
-        cap = effective_task_acceptance_review_cycles(
-            profile,
-            has_deadline=parse_deadline_ts(deadline_value) is not None,
-            required_blocking=required_blocking,
+            fallback_cap = effective_task_acceptance_review_cycles(
+                root_profile,
+                has_deadline=root_snapshot.has_deadline,
+                required_blocking=bool(
+                    config.get_task_review_mode() == "required"
+                    and config.get_review_enforcement() == "blocking"
+                ),
+            )
+        cap = _root_task_acceptance_review_cap(
+            root_result,
+            fallback_max_cycles=fallback_cap,
+            allow_fallback=bool(lineage.get("is_root_task")),
         )
         claims = state.get("claims_by_binding") or {}
         claimed = len(claims)
@@ -336,7 +364,9 @@ def load_task_acceptance_review_state(
 def _update_task_acceptance_review_state(
     results_drive_root: Any,
     root_task_id: str,
-    mutator: Callable[[Dict[str, Any]], Optional[Dict[str, Any]]],
+    mutator: Callable[
+        [Dict[str, Any], Dict[str, Any]], Optional[Dict[str, Any]]
+    ],
     *,
     allow_create: bool,
 ) -> Dict[str, Any]:
@@ -361,7 +391,7 @@ def _update_task_acceptance_review_state(
             if TASK_ACCEPTANCE_REVIEW_STATE_KEY in existing
             else _empty_task_acceptance_review_state(root_task_id)
         )
-        candidate = mutator(state)
+        candidate = mutator(state, existing)
         if candidate is None:
             return None
         updated = _validated_task_acceptance_review_state(
@@ -426,10 +456,19 @@ def claim_task_acceptance_review_cycle(
     claimant = str(claimed_by_task_id or "").strip()
     if not claimant:
         raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: claimant is absent")
-    cap = None if max_cycles is None else max(1, int(max_cycles))
+    fallback_cap = None if max_cycles is None else max(1, int(max_cycles))
     decision: Dict[str, Any] = {}
+    resolved: Dict[str, Optional[int]] = {}
 
-    def _claim(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _claim(
+        state: Dict[str, Any], root_result: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        cap = _root_task_acceptance_review_cap(
+            root_result,
+            fallback_max_cycles=fallback_cap,
+            allow_fallback=claimant == str(root_task_id),
+        )
+        resolved["cap"] = cap
         claims = dict(state.get("claims_by_binding") or {})
         prior = claims.get(binding)
         if prior is not None:
@@ -457,6 +496,7 @@ def claim_task_acceptance_review_cycle(
         allow_create=allow_create,
     )
     paid = len(state.get("claims_by_binding") or {})
+    cap = resolved.get("cap")
     return {
         **decision,
         "binding_hash": binding,
