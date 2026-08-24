@@ -1091,6 +1091,104 @@ def test_zero_run_refuses_ambiguous_physical_start_custody(tmp_path):
     assert ctx._configured_actor_bootstrap.get("zero_run_receipt_recorded") is not True
 
 
+def test_zero_run_refuses_unreadable_custody_without_fail_soft_scan(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import delegate_custody as custody
+    from ouroboros import delegate_recovery
+    from ouroboros.outcomes import read_verification_receipts
+    from ouroboros.tools.verify import _verify_and_record
+
+    ctx = _verify_ctx(tmp_path)
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+    }
+    monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: True)
+    monkeypatch.setattr(
+        delegate_recovery,
+        "unsettled_start_ids",
+        lambda *_a, **_k: pytest.fail("an unreadable authority must stop before scan"),
+    )
+    refused = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="complete",
+        zero_run_basis="no visible run",
+    )
+    assert "zero_run_custody_unknown" in refused
+    assert "custody_log_unreadable" in refused
+    assert read_verification_receipts(tmp_path, ctx.task_id) == []
+    assert ctx._configured_actor_bootstrap.get("zero_run_receipt_recorded") is not True
+
+
+def test_zero_run_and_fresh_start_share_one_atomic_actor_decision(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    from ouroboros import delegate_custody as custody
+    from ouroboros.outcomes import read_verification_receipts
+    from ouroboros.tools.delegate_integration import claimed_start_request
+    from ouroboros.tools.verify import _verify_and_record
+
+    ctx = _verify_ctx(tmp_path, task_id="actor-claim")
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+    }
+    drive = custody.custody_root(ctx)
+    barrier = threading.Barrier(2)
+
+    def claim_start():
+        barrier.wait()
+        return claimed_start_request(
+            drive,
+            claim_target="",
+            actor_ctx=ctx,
+            enforce_actor_idle=True,
+            run_id="",
+            task_id=ctx.task_id,
+            idempotency_key="actor-claim-invocation",
+            invocation_id="actor-claim-invocation",
+            max_seconds=30,
+            request={"prompt": "exact physical assignment"},
+            project_id="project-1",
+            project_owned=False,
+            route="codex",
+        )
+
+    def claim_zero_run():
+        barrier.wait()
+        return _verify_and_record(
+            ctx,
+            contract_kind="delegation_zero_run",
+            zero_run_decision="complete",
+            zero_run_basis="host-visible work completed without a physical leaf",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        start_future = pool.submit(claim_start)
+        zero_future = pool.submit(claim_zero_run)
+        start = start_future.result()
+        zero = zero_future.result()
+
+    start_won = start[0] is True
+    zero_won = "typed host receipt recorded" in zero
+    assert start_won is not zero_won
+    receipts = read_verification_receipts(drive, ctx.task_id)
+    pending = custody.pending_invocations(drive)
+    if start_won:
+        assert "zero_run_requires_settlement" in zero
+        assert receipts == []
+        assert [row["invocation_id"] for row in pending] == ["actor-claim-invocation"]
+    else:
+        assert start[1]["reason"] == "zero_run_already_recorded"
+        assert len(receipts) == 1 and receipts[0]["zero_run"] is True
+        assert pending == []
+
+
 def test_failed_direct_child_does_not_make_actor_first_terminal_clean(tmp_path):
     from ouroboros.subagent_bootstrap import actor_first_unresolved_fact
     from ouroboros.task_results import STATUS_FAILED, write_task_result

@@ -3344,12 +3344,15 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     session_id = str(evt.get("session_id") or "")
     actor_id = str(evt.get("actor_id") or "ouroboros")
     delegation_role = str(evt.get("delegation_role") or "subagent")
+    if delegation_role == "subagent":
+        from supervisor.task_admission import subagent_schedule_owned
+        if subagent_schedule_owned(ctx, tid):
+            return
     memory_mode = str(evt.get("memory_mode") or "").strip()
     drive_root = str(evt.get("drive_root") or "").strip()
     child_drive_root = str(evt.get("child_drive_root") or drive_root).strip()
     budget_drive_root = str(evt.get("budget_drive_root") or "").strip()
-    # INTENT ONLY (see `_build_scheduled_task_payload`): the supervisor forwards what
-    # the parent ASKED for. What the child gets is resolved once, at dispatch.
+    # Forward parent-requested intent; dispatch resolves it once.
     requested_model_lane = str(evt.get("requested_model_lane") or evt.get("model_lane") or "auto").strip() or "auto"
     parent_model_lane = str(evt.get("parent_model_lane") or "").strip()
     requested_executor = str(evt.get("requested_executor") or "").strip().lower() or "auto"
@@ -3657,10 +3660,7 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             )
             return
 
-        # Admission records an attempted depth, not achieved execution. A task
-        # can remain queued forever or be cancelled before a worker sees it, so
-        # ``achieved_depth`` stays unknown until the assignment seam proves a
-        # host worker actually received the child (see supervisor/workers.py).
+        # Assignment, not admission, proves achieved depth.
         admitted_task_contract, admitted_depth_provenance = stamp_depth_provenance(
             task_contract,
             attempted_depth=depth,
@@ -3792,6 +3792,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             )
             return
         if scheduled_failure_reason:
+            if scheduled_failure_reason == "scheduled_event_replay":
+                return
             result_fields["delegation_admission"] = {
                 "status": "rejected",
                 "reason_code": scheduled_failure_reason,

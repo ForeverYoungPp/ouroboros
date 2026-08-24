@@ -811,9 +811,9 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         lineage = getattr(ctx, "task_metadata", {}) or {}
         lineage = lineage if isinstance(lineage, dict) else {}
         # Fresh payload run: busy check + durable write = ONE atomic claim (fix 5).
-        requested, claim_holder = claimed_start_request(
-            drive, claim_target=(target_root if (not recovering and
-                                 authority_source == "skill_payload") else ""),
+        requested, claim_refusal = claimed_start_request(
+            drive, claim_target=(target_root if not recovering and authority_source == "skill_payload" else ""),
+            actor_ctx=ctx, enforce_actor_idle=not recovering,
             run_id="", task_id=str(getattr(ctx, "task_id", "") or ""),
             idempotency_key=key, invocation_id=invocation_id,
             max_seconds=seconds, request=request_body, project_id=project_id,
@@ -837,18 +837,19 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             authority_fingerprint=authority_fingerprint,
             work_order_source_request=work_order_source_request,
         )
-        if claim_holder:
+        if claim_refusal:
+            reason = str(claim_refusal.get("reason") or "replacement_custody_unknown")
+            detail = str(claim_refusal.get("detail") or "Actor start claim unavailable.")
+            facts = {key: value for key, value in claim_refusal.items()
+                     if key not in {"reason", "detail"}}
             return _fail(
-                "delegate_start", "payload_delegation_busy",
-                "Another delegated run claimed this exact payload first (the busy "
-                "check and the start-request write are one atomic claim). Finish "
-                "that run before starting another delegation against the same "
-                "skill.", holder=claim_holder,
+                "delegate_start", reason, detail,
+                **facts,
                 **_retire_orphaned_registration(ctx, gateway, owned_project_id,
-                                                definite_refusal=True,
-                                                reason="payload_delegation_busy",
-                                                invocation_id=invocation_id,
-                                                snapshot_id=snapshot_id))
+                    definite_refusal=True,
+                    reason=reason, invocation_id=invocation_id, snapshot_id=snapshot_id,
+                ),
+            )
         if not requested:
             # The POST is CONDITIONAL on the durable request row: a run started
             # without it is live and unfindable if this worker dies. A fresh

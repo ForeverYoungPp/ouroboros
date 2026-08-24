@@ -1593,6 +1593,15 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
         },
         task_id=ctx.task_id,
     )
+    if not slots:
+        return ReviewRunResult(
+            request={"surface": "task_acceptance", "task_id": str(ctx.task_id)},
+            actors=[],
+            parsed_findings=[],
+            aggregate_signal="DEGRADED",
+            degraded=True,
+            degraded_reasons=["no_review_slots"],
+        )
     # Budget admission for the whole acceptance wave (v6.69.0): a wave that
     # cannot fit the remaining root budget is declined up front as a terminal
     # DEGRADED (no-quorum semantics) instead of dying mid-wave. The estimate
@@ -1625,6 +1634,61 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
                 f"~${_admission.get('estimated_wave_usd')} > remaining "
                 f"${_admission.get('remaining_usd')} (no reviewer was called)"
             ],
+        )
+    # Q6: one strict tree-wide paid-cycle authority, claimed after every free
+    # launch refusal and immediately before the physical reviewer transport.
+    # The immutable exact binding is the dedupe key.  A crash after this claim
+    # remains an honest unknown and cannot silently buy the same panel again.
+    try:
+        from ouroboros.task_results import (
+            claim_task_acceptance_review_cycle,
+            resolve_task_lineage,
+        )
+
+        tools_ctx = ctx.tools._ctx
+        metadata = getattr(tools_ctx, "task_metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        lineage = resolve_task_lineage(ctx.task_id, metadata=metadata)
+        root_task_id = str(lineage.get("root_task_id") or ctx.task_id)
+        accounting_root = pathlib.Path(str(
+            metadata.get("budget_drive_root")
+            or getattr(tools_ctx, "budget_drive_root", "")
+            or ctx.drive_root
+            or getattr(tools_ctx, "drive_root", ".")
+        ))
+        required_blocking = bool(
+            ctx.mode == "required" and get_review_enforcement() == "blocking"
+        )
+        snapshot = task_pacing.build_budget_snapshot(
+            tools_ctx, profile=ctx.budget_profile,
+        )
+        max_cycles = task_pacing.effective_task_acceptance_review_cycles(
+            ctx.budget_profile,
+            has_deadline=snapshot.has_deadline,
+            required_blocking=required_blocking,
+        )
+        claim = claim_task_acceptance_review_cycle(
+            accounting_root,
+            root_task_id,
+            ctx.review_binding,
+            max_cycles=max_cycles,
+            claimed_by_task_id=ctx.task_id,
+            allow_create=bool(lineage.get("is_root_task")),
+        )
+    except Exception as exc:
+        claim = {
+            "status": "unknown",
+            "reason": f"review_capacity_claim_unknown:{type(exc).__name__}",
+        }
+    if claim.get("status") != "claimed":
+        reason = str(claim.get("reason") or "review_capacity_unknown")
+        return ReviewRunResult(
+            request={"surface": "task_acceptance", "task_id": str(ctx.task_id)},
+            actors=[],
+            parsed_findings=[],
+            aggregate_signal="DEGRADED",
+            degraded=True,
+            degraded_reasons=[f"{reason} (no reviewer was called)"],
         )
     started = time.monotonic()
     result = run_review_request(
@@ -5738,66 +5802,15 @@ def _nanny_finalization_message(
             "or state in your final answer that the delegated run failed and why "
             "the remaining work ran on metered API tokens."
         )
-    # Actor-first configured sessions may legitimately spend the episode on
-    # host-side coordination instead of starting a physical leaf.  A typed
-    # coordination tool call is enough evidence for this decision; when a
-    # continuation has already persisted a direct child, recover that fact from
-    # the existing task-result SSOT as well.  Neither path creates a second
-    # ledger or infers topology from prose.
-    host_coordination = bool(getattr(tools._ctx, "_nanny_coordination_activity", False))
-    bootstrap = getattr(tools._ctx, "_configured_actor_bootstrap", None)
-    if isinstance(bootstrap, dict) and bool(bootstrap.get("zero_run_receipt_recorded")):
-        # The durable no-leaf decision is itself the actor's explicit host-side
-        # coordination outcome. This marker is hydrated on resume from the exact
-        # receipt, so a continuation must not accuse the actor of doing nothing.
-        host_coordination = True
-    metadata = getattr(tools._ctx, "task_metadata", {})
-    metadata = metadata if isinstance(metadata, dict) else {}
-    status_root = pathlib.Path(str(
-        metadata.get("budget_drive_root")
-        or getattr(tools._ctx, "budget_drive_root", "")
-        or drive_root
-    ))
-    if not host_coordination:
-        try:
-            from ouroboros.task_status import find_child_tasks
+    from ouroboros.subagent_bootstrap import (
+        actor_first_coordination_finalization_message,
+    )
 
-            host_coordination = bool(find_child_tasks(
-                status_root,
-                parent_task_id=str(task_id or ""),
-                exclude_task_id=str(task_id or ""),
-                scope="direct",
-                materialize_artifacts=False,
-            ))
-        except Exception:
-            log.debug("nanny nudge: host coordination evidence read failed", exc_info=True)
-    # Actor-first has one additional truth obligation: a plain final answer is
-    # not evidence that the assigned physical leaf was intentionally skipped.
-    # Reuse the bootstrap/child evidence helper so a missing route or unreadable
-    # child store becomes a typed incomplete/unknown outcome rather than a clean
-    # result.  This remains a one-shot advisory reminder; the durable outcome
-    # projection enforces the same fact after the model returns.
-    try:
-        from ouroboros.subagent_bootstrap import actor_first_unresolved_fact
-
-        actor_fact = actor_first_unresolved_fact(
-            tools._ctx, task_id=str(task_id or ""), drive_root=status_root,
-        )
-    except Exception:
-        actor_fact = None
-    if actor_fact:
-        status = str(actor_fact.get("status") or "unknown")
-        code = "CONFIGURED_ACTOR_INCOMPLETE" if status == "incomplete" else "CONFIGURED_ACTOR_UNKNOWN"
-        return (
-            f"⚠️ {code}: this actor-first session is finalizing before its assigned "
-            "physical leaf started and without a direct host child result. Call "
-            "verify_and_record(contract_kind=delegation_zero_run, "
-            f"zero_run_decision={status!r}, zero_run_basis=...) to record the "
-            "typed terminal decision, or start the exact assigned session now. "
-            "A plain prose answer cannot close this evidence gap."
-        )
-    if host_coordination:
-        return ""
+    actor_first = actor_first_coordination_finalization_message(
+        tools._ctx, task_id=str(task_id or ""), fallback_root=drive_root,
+    )
+    if actor_first is not None:
+        return actor_first
     return (
         "⚠️ NANNY_DID_NOT_DELEGATE: this task was dispatched onto the delegated "
         "substrate (executor=harness), but you are finalizing with ZERO "

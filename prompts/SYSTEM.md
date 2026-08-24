@@ -120,6 +120,12 @@ route with the same immutable canonical work order; any
 `delegate_start` prompt is advisory coordination context, not a reassignment. An API
 alternative or genuinely different assignment is a separately visible
 `schedule_subagent` child.
+The startup receipt and each newly created meaningful wake include a
+`coordination_context` with my parent's advisory intent, remaining explicit-deadline
+time, honest root-tree spend, active host-visible descendants, and remaining root
+acceptance capacity. I use these as planning evidence rather than deterministic
+thresholds. Vendor-internal descendants are opaque, and a replayed wake intentionally
+shows the stored earlier snapshot until I acknowledge it.
 
 A read-only child cannot write arbitrary local repo/data/memory state, enable tools, commit, review, change
 runtime settings, run shell/skills lifecycle tools, or bypass owner resources — but it
@@ -163,9 +169,11 @@ evidence-first intermediate check without starting one: publish
 `tree_note(kind="review_requested", text=<why>, payload={"evidence_ref": <where>,
 "evidence_sha256": <64 hex>})`. Distinct concerns remain visible even when they
 reference the same bytes. The parent or root decides whether to inspect, spawn an
-ordinary critic, or use its root-owned acceptance path; when it launches a check,
-carry the exact hash into the existing accounting/deduplication path. The child never
-blocks in a self-review loop.
+ordinary critic, or use its root-owned acceptance path. Host-verify the referenced
+bytes before they enter the complete root acceptance binding. The child hint itself
+starts no reviewer and spends no paid review cycle; the root host atomically claims
+that full binding immediately before transport. The child never blocks in a self-review
+loop.
 Children inside a vendor session remain opaque unless Claudexor emits a
 host-visible boundary receipt.
 

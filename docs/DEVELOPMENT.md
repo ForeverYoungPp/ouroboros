@@ -1177,6 +1177,16 @@ Before every commit, verify the following:
   invocation is proven absent or terminal and any captured physical result is
   explicitly disposed; replay the original pending invocation/idempotency key after
   worker loss.
+  A fresh physical start and `delegation_zero_run` are mutually exclusive actor
+  decisions. Rebuild all run/start/patch blockers from one custody-log snapshot and
+  hold the existing short per-task file-lock seam only across the final recheck plus
+  START_REQUESTED/zero-run append (`delegate_start_claims` owns the start side);
+  never hold it across transport or waiting.
+  Treat supervisor delivery of one `schedule_subagent` event as at-least-once:
+  an exact task id with live or durable custody is an idempotent no-op before
+  write-surface provisioning, and the same identity check runs again under the
+  queue lock immediately before enqueue. Never use semantic duplicate judgement
+  as the physical identity fence.
   The complete external work-order wire budget is one total 250,000-character
   limit, not a model-context claim and not a per-field prefix rule. A brief that
   fits is sent byte-complete. A brief above that limit is never silently prefixed:
@@ -1199,6 +1209,11 @@ Before every commit, verify the following:
   source selector; timeout or another resolution remains incomplete. Until the union covers the whole brief, terminal delivery carries
   `work_order_verification.status=cannot_verify`, and `integrate_delegated_patch`
   may reject the captured result but may not apply it.
+  The manifest observation is a point-in-time preflight, not a lease: capability
+  may change before the later POST. Never call the probe delivery evidence or add
+  a second probe/lease to pretend the race vanished. Durable verified range coverage
+  remains the authority; a raced run stays `cannot_verify` and its patch stays
+  unapplied until coverage is complete.
 - `delegate_wait` is an event-only model sleep. Renew bounded transport windows in
   `delegate_supervision` with zero LLM calls; journal progress may stream to the
   owner but is not a wake. Wake only for terminal/interaction/fault, an addressed
@@ -1212,6 +1227,16 @@ Before every commit, verify the following:
   and replay it rather than advancing the coordination cursor. On wake the nanny retains its full ordinary
   tool surface and inherited parent cognitive route; no-co-building is a
   prompt/review/receipt role contract, not a host allowlist.
+  Actor-first startup and every newly minted meaningful wake carry one fresh
+  `coordination_context`: full parent-authored advisory `intent_note`, explicit
+  deadline time remaining, known/partial/unknown tree spend, active host-visible
+  descendants and root acceptance capacity. Vendor-internal descendants stay opaque.
+  Persist this context inside the pending wake so replay is identical; recompute only
+  after acknowledgement on a later wake. When the combined wake spills, preserve the
+  complete context in the exact source and keep only a typed bounded projection in the
+  envelope. These facts inform the LLM and never become an automatic fan-out, hurry,
+  review or stop state machine. Treat active descendants as known only from a fresh
+  queue snapshot and targeted live-row ancestry; stale/missing lineage is unknown.
 - Recovery is cause-specific. A proven non-signal worker crash and an explicit
   planned-self-restart transaction may adopt the same exact run before orphan
   cleanup/LLM/start. Owner restart, signals, panic, timeout/deadline, explicit
@@ -1296,9 +1321,14 @@ Before every commit, verify the following:
   separate typed concerns even when they reference the same bytes, but never starts
   or waits for a reviewer. The full hash remains visible through `tree_read`/`peek_task`.
   The parent/root decides whether to inspect, spawn an ordinary critic, or use the
-  root-owned acceptance path; if it launches a check, it carries the hash into the
-  existing accounting/deduplication path. The referenced bytes remain caller-authored
-  evidence until that parent/critic actually verifies them.
+  root-owned acceptance path. The beacon itself spends no cycle, and its hash remains
+  caller-authored until host bytes are actually read and verified. Immediately before
+  a real root acceptance transport, strictly claim the complete candidate/evidence/fence
+  binding in canonical `task_acceptance_review_accounting` under the root task-result
+  lock. Cap check and exact-binding dedupe are one mutation; missing/malformed authority,
+  lock failure, or a prior claim without a recoverable terminal run is typed unknown and
+  starts no reviewer. Ordinary critic children remain ordinary budgeted tasks, not a role-
+  parsed hidden review flow.
 - Subagent changes must keep writes, commits, review mutation, runtime control,
   tool expansion, skills lifecycle, and shell blocked — except bounded task-tree
   coordination via `tree_note`/`tree_read`, parent-only

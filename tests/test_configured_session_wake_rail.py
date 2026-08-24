@@ -118,6 +118,111 @@ def test_physical_terminal_wake_is_not_mislabeled_as_coordination(tmp_path):
     assert acknowledged[-1]["coordination"] is False
 
 
+def test_meaningful_wake_carries_live_tree_planning_facts_and_replays_exactly(
+    tmp_path, monkeypatch,
+):
+    from datetime import timedelta
+
+    from ouroboros import usage_accounting
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.deadline_utils import utc_now
+    from ouroboros.review_substrate import review_binding_hash
+    from ouroboros.task_results import claim_task_acceptance_review_cycle
+    from ouroboros.utils import atomic_write_json, utc_now_iso
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "3")
+    contract = build_task_contract({
+        "delegation_budget": {
+            "intent_note": "Prefer one strong critic and preserve time to synthesize.",
+        },
+    })
+    write_task_result(
+        tmp_path,
+        "root",
+        STATUS_RUNNING,
+        root_task_id="root",
+        delegation_role="root",
+        task_contract=contract,
+    )
+    _child(tmp_path)
+    _child(tmp_path, "grandchild", parent_task_id="child")
+    now = utc_now()
+    (tmp_path / "state").mkdir(exist_ok=True)
+    atomic_write_json(tmp_path / "state" / "queue_snapshot.json", {
+        "ts": utc_now_iso(),
+        "pending": [],
+        "running": [
+            {"id": "child", "task": {
+                "id": "child", "parent_task_id": "parent",
+                "root_task_id": "root", "delegation_role": "subagent",
+            }},
+            {"id": "grandchild", "task": {
+                "id": "grandchild", "parent_task_id": "child",
+                "root_task_id": "root", "delegation_role": "subagent",
+            }},
+        ],
+    })
+    components = {
+        "candidate_hash": "2" * 64,
+        "evidence_revision": "3" * 64,
+        "fence_hash": "4" * 64,
+    }
+    binding = {**components, "binding_hash": review_binding_hash(**components)}
+    assert claim_task_acceptance_review_cycle(
+        tmp_path,
+        "root",
+        binding,
+        max_cycles=3,
+        claimed_by_task_id="root",
+    )["status"] == "claimed"
+    monkeypatch.setattr(usage_accounting, "usage_breakdown", lambda *_a, **_k: {
+        "settled_usd": 1.25,
+        "accounted_usd": 1.75,
+        "cost_final": False,
+        "unknown_unmetered": 1,
+        "integrity_degraded": False,
+    })
+    ctx = _ctx(tmp_path)
+    ctx.task_contract = contract
+    ctx.task_metadata.update({
+        "task_contract": contract,
+        "created_at": (now - timedelta(seconds=30)).isoformat(),
+        "deadline_at": (now + timedelta(minutes=10)).isoformat(),
+    })
+
+    raw = supervised_wait(
+        ctx,
+        "run-live",
+        wait_once=lambda *_args: json.dumps({
+            "status": "completed", "run_id": "run-live", "last_seq": 1,
+        }),
+    )
+    wake = json.loads(raw)
+    facts = wake["coordination_context"]
+    assert facts["parent_intent"] == {
+        "state": "present",
+        "authority": "parent_authored_advisory",
+        "text": "Prefer one strong critic and preserve time to synthesize.",
+    }
+    assert facts["time"]["state"] == "known"
+    assert 0 < facts["time"]["remaining_sec"] <= 600
+    assert facts["settled_spend"]["state"] == "partial"
+    assert facts["settled_spend"]["settled_usd"] == 1.25
+    assert facts["active_descendants"]["count"] == 2
+    assert facts["active_descendants"]["vendor_internal"] == "opaque_not_counted"
+    assert facts["review_capacity"]["claimed_cycles"] == 1
+    assert facts["review_capacity"]["remaining_cycles"] == 2
+
+    replay = supervised_wait(
+        ctx,
+        "run-live",
+        wait_once=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("pending live facts must replay without recomputation")
+        ),
+    )
+    assert replay == raw
+
+
 def test_child_terminal_before_first_sleep_is_not_lost_as_cursor_baseline(tmp_path):
     from ouroboros.artifacts import copy_file_to_task_artifacts
     from ouroboros.task_status import load_effective_task_result
@@ -172,6 +277,9 @@ def test_oversized_coordination_wake_is_valid_bounded_json_with_exact_source(tmp
     from ouroboros.tool_capabilities import tool_result_limit
 
     ctx = _ctx(tmp_path)
+    ctx.task_contract = {
+        "delegation_budget": {"intent_note": "preserve-complete-intent:" + "y" * 30_000},
+    }
     for index in range(5):
         child_id = f"child-{index}"
         _child(tmp_path, task_id=child_id)
@@ -193,10 +301,12 @@ def test_oversized_coordination_wake_is_valid_bounded_json_with_exact_source(tmp
     assert delivered["supervision_wake_id"]
     assert delivered["wake_delivery"]["complete"] is False
     assert delivered["wake_delivery"]["wake_events_total"] == 5
+    assert delivered["coordination_context"]["state"] == "available_in_full_wake_source"
     source = delivered["wake_delivery"]["source"]
     full = json.loads(read_actor_source_bytes(tmp_path, "parent", source))
     assert len(full["wake_events"]) == 5
     assert all(len(item["beacon"]["text"]) > 3800 for item in full["wake_events"])
+    assert len(full["coordination_context"]["parent_intent"]["text"]) > 30_000
     assert acknowledge_pending_wake(ctx, raw)
 
     after = json.loads(supervised_wait(
@@ -210,6 +320,43 @@ def test_oversized_coordination_wake_is_valid_bounded_json_with_exact_source(tmp
         item.get("type") == "child_attention_beacon"
         for item in after.get("wake_events", [])
     )
+
+
+def test_live_descendant_fact_rejects_stale_queue_and_ignores_unrelated_corruption(
+    tmp_path,
+):
+    from ouroboros.delegate_supervision import coordination_live_context
+    from ouroboros.utils import atomic_write_json, utc_now_iso
+
+    ctx = _ctx(tmp_path)
+    _child(tmp_path)
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    snapshot = {
+        "ts": "2000-01-01T00:00:00Z",
+        "pending": [],
+        "running": [{"id": "child", "task": {
+            "id": "child", "parent_task_id": "parent",
+            "root_task_id": "root", "delegation_role": "subagent",
+        }}],
+    }
+    atomic_write_json(state / "queue_snapshot.json", snapshot)
+    stale = coordination_live_context(ctx)["active_descendants"]
+    assert stale["state"] == "unknown"
+    assert stale["count"] is None
+
+    unrelated = tmp_path / "task_results" / "unrelated-history.json"
+    unrelated.write_text("{broken", encoding="utf-8")
+    snapshot["ts"] = utc_now_iso()
+    atomic_write_json(state / "queue_snapshot.json", snapshot)
+    current = coordination_live_context(ctx)["active_descendants"]
+    assert current == {
+        "state": "known",
+        "count": 1,
+        "by_status": {"running": 1},
+        "scope": "host_visible_descendants",
+        "vendor_internal": "opaque_not_counted",
+    }
 
 
 def test_delegate_wait_entry_never_acks_an_undelivered_pending_wake(tmp_path, monkeypatch):

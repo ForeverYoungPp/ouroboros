@@ -728,7 +728,7 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     messages2 = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     tools2 = SimpleNamespace(_ctx=ctx2)
     result2 = _run_task_acceptance_review_once(
-        tools=tools2, content="done", task_id="t", task_type="task",
+        tools=tools2, content="done", task_id="t-blocked", task_type="task",
         llm_trace=trace2, drive_root=None, messages=messages2, emit_progress=lambda _m: None,
     )
     assert result2 is True                                        # capsule -> one bounded re-loop
@@ -746,7 +746,7 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
 
     monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: solved)
     replacement = _run_task_acceptance_review_once(
-        tools=tools2, content="revised", task_id="t", task_type="task",
+        tools=tools2, content="revised", task_id="t-blocked", task_type="task",
         llm_trace=trace2, drive_root=None, messages=messages2, emit_progress=lambda _m: None,
     )
     assert replacement is False
@@ -760,7 +760,7 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     trace_ok = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
     messages_ok = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     result_ok = _run_task_acceptance_review_once(
-        tools=tools2, content="revised", task_id="t", task_type="task",
+        tools=tools2, content="revised", task_id="t-ok", task_type="task",
         llm_trace=trace_ok, drive_root=None, messages=messages_ok, emit_progress=lambda _m: None,
     )
     assert result_ok is False
@@ -775,7 +775,7 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     result3 = _run_task_acceptance_review_once(
         # A changed candidate creates a fresh binding; an unchanged candidate
         # must reuse the already-paid host panel under the v6.65 contract.
-        tools=tools2, content="revised again", task_id="t", task_type="task",
+        tools=tools2, content="revised again", task_id="t-blocked-alt", task_type="task",
         llm_trace=trace3, drive_root=None, messages=messages3, emit_progress=lambda _m: None,
     )
     assert result3 is False                                       # capsule already spent -> finalize

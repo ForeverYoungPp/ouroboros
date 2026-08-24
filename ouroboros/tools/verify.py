@@ -424,25 +424,6 @@ def _record_delegation_zero_run(
             "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run already "
             "has a durable terminal decision for this actor."
         )
-    try:
-        from ouroboros import delegate_custody as custody
-        from ouroboros.delegate_recovery import unsettled_start_ids
-
-        blockers = unsettled_start_ids(custody.custody_root(ctx), task_id)
-    except Exception as exc:
-        return (
-            "⚠️ TOOL_ERROR (verify_and_record): zero_run_custody_unknown: "
-            "the host could not prove that no physical start/run remains; no "
-            f"zero-run receipt was written ({type(exc).__name__})."
-        )
-    if any(blockers.values()):
-        return (
-            "⚠️ TOOL_ERROR (verify_and_record): zero_run_requires_settlement: "
-            "this task has an open run, ambiguous start invocation, or undisposed "
-            "physical result. Reconcile it before claiming that no physical leaf "
-            "started. blockers="
-            + json.dumps(blockers, ensure_ascii=False, sort_keys=True)
-        )
     decision = str(
         kwargs.get("zero_run_decision") or kwargs.get("decision") or ""
     ).strip().lower()
@@ -477,9 +458,54 @@ def _record_delegation_zero_run(
     }
     if crit := str(criterion_id or "").strip():
         receipt["criterion_id"] = crit[:120]
-    # A zero-run is lifecycle authority for the actor, so keep it on the
-    # canonical budget root rather than an ephemeral child drive.
-    if not append_verification_receipt(canonical_data_root(ctx), task_id, receipt):
+    try:
+        from ouroboros import delegate_custody as custody
+        from ouroboros.delegate_recovery import unsettled_start_ids
+        from ouroboros.subagent_bootstrap import _durable_zero_run_receipt
+
+        drive_root = custody.custody_root(ctx)
+        with custody.actor_decision_lock(drive_root, task_id):
+            if custody.custody_log_unreadable(drive_root):
+                return (
+                    "⚠️ TOOL_ERROR (verify_and_record): zero_run_custody_unknown: "
+                    "the custody event log exists but cannot be read, so the host "
+                    "cannot prove that no physical start/run remains; no zero-run "
+                    "receipt was written (custody_log_unreadable)."
+                )
+            gaps: set[str] = set()
+            prior = _durable_zero_run_receipt(ctx, gap_reasons=gaps)
+            if prior:
+                return (
+                    "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run already "
+                    "has a durable terminal decision for this actor."
+                )
+            if gaps:
+                return (
+                    "⚠️ TOOL_ERROR (verify_and_record): zero_run_custody_unknown: "
+                    "the host cannot prove whether a prior zero-run receipt exists; "
+                    "no new receipt was written. gaps="
+                    + json.dumps(sorted(gaps), ensure_ascii=False)
+                )
+            blockers = unsettled_start_ids(drive_root, task_id)
+            if any(blockers.values()):
+                return (
+                    "⚠️ TOOL_ERROR (verify_and_record): zero_run_requires_settlement: "
+                    "this task has an open run, ambiguous start invocation, or "
+                    "undisposed physical result. blockers="
+                    + json.dumps(blockers, ensure_ascii=False, sort_keys=True)
+                )
+            # A zero-run is lifecycle authority for the actor, so keep it on the
+            # canonical budget root rather than an ephemeral child drive.
+            written = append_verification_receipt(
+                canonical_data_root(ctx), task_id, receipt,
+            )
+    except Exception as exc:
+        return (
+            "⚠️ TOOL_ERROR (verify_and_record): zero_run_custody_unknown: "
+            "the host could not atomically prove empty custody and claim the "
+            f"zero-run decision; no receipt was written ({type(exc).__name__})."
+        )
+    if not written:
         return (
             "⚠️ TOOL_ERROR (verify_and_record): the delegation_zero_run receipt "
             "could not be durably written; no zero-run decision was recorded."

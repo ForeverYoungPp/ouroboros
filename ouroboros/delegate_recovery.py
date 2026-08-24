@@ -183,18 +183,30 @@ def _selected_session(task: Mapping[str, Any]) -> dict[str, Any]:
     return snapshot if str(route.get("kind") or "") == "agent_session" else {}
 
 
-def unsettled_start_ids(drive_root: Any, task_id: str) -> dict[str, list[str]]:
-    """Durable run/start blockers which must settle before replacement."""
+def unsettled_start_ids(
+    drive_root: Any, task_id: str, *, rows: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, list[str]]:
+    """Durable run/start blockers from one consistent custody-log snapshot."""
 
     mine = str(task_id or "")
+    snapshot = list(rows) if rows is not None else list(
+        custody._iter_rows(custody.event_log_path(drive_root))
+    )
+    runs = custody.replay(drive_root, rows=snapshot)
     return {
-        "open_run_ids": [row.run_id for row in custody.open_runs(drive_root) if row.task_id == mine],
+        "open_run_ids": [
+            row.run_id for row in runs.values()
+            if row.task_id == mine and not row.settled
+        ],
         "pending_invocation_ids": [
-            str(row.get("invocation_id") or "") for row in custody.pending_invocations(drive_root)
+            str(row.get("invocation_id") or "")
+            for row in custody.pending_invocations(drive_root, rows=snapshot)
             if str(row.get("task_id") or "") == mine
         ],
         "undisposed_patch_run_ids": [
-            row.run_id for row in custody.undisposed_patches(drive_root) if row.task_id == mine
+            row.run_id for row in runs.values()
+            if row.task_id == mine and row.snapshot_id and row.settled
+            and not row.patch_disposed
         ],
     }
 

@@ -17,6 +17,29 @@ from ouroboros.task_results import (
 log = logging.getLogger(__name__)
 
 
+def subagent_schedule_owned(
+    ctx: Any, task_id: str, *, pending_ref: Any = None,
+) -> bool:
+    """Return whether an exact child id already has queue/lifecycle custody."""
+    from supervisor import queue
+
+    tid = str(task_id or "")
+    with queue._queue_lock:
+        pending = pending_ref if isinstance(pending_ref, list) else getattr(
+            ctx, "PENDING", queue.PENDING,
+        )
+        running = getattr(ctx, "RUNNING", queue.RUNNING)
+        status = str((load_task_result(ctx.DRIVE_ROOT, tid) or {}).get("status") or "")
+        return (
+            tid in running
+            or any(
+                isinstance(row, dict) and str(row.get("id") or "") == tid
+                for row in pending
+            )
+            or status not in {"", STATUS_REQUESTED}
+        )
+
+
 def enqueue_subagent_with_scheduled_result(
     ctx: Any,
     task: Dict[str, Any],
@@ -50,10 +73,19 @@ def enqueue_subagent_with_scheduled_result(
         )
 
     with queue._queue_lock:
+        previous = load_task_result(ctx.DRIVE_ROOT, tid) or {}
+        if subagent_schedule_owned(ctx, tid, pending_ref=pending_ref):
+            log.info("Ignoring replayed schedule event for task %s", tid)
+            return (
+                task,
+                "scheduled_event_replay",
+                "Subagent schedule replay ignored: this task id is already owned by "
+                "an existing queue or durable lifecycle row.",
+                False,
+            )
         admitted = ctx.enqueue_task(task)
         if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
             return admitted, "", "", False
-        previous = load_task_result(ctx.DRIVE_ROOT, tid) or {}
         result_fields["task_contract"] = admitted_task_contract
         result_fields["depth_provenance"] = admitted_depth_provenance
         result_fields["delegation_admission"] = {
@@ -204,4 +236,5 @@ __all__ = [
     "enqueue_subagent_with_scheduled_result",
     "release_task_admission",
     "reserve_task_admission",
+    "subagent_schedule_owned",
 ]

@@ -270,7 +270,17 @@ def test_blocked_session_bootstrap_wakes_first_turn_with_alternatives(monkeypatc
         "subagent_id": "api-scout", "route_kind": "api_model",
         "target_id": "google/gemini-3.7-flash", "availability": "check_at_dispatch",
     }])
-    ctx = SimpleNamespace(task_id="child1", drive_root=tmp_path, budget_drive_root=str(tmp_path))
+    ctx = SimpleNamespace(
+        task_id="child1",
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        task_metadata={
+            "root_task_id": "root",
+            "parent_task_id": "root",
+            "delegation_role": "subagent",
+            "budget_drive_root": str(tmp_path),
+        },
+    )
     dispatch = SimpleNamespace(
         blocked=True,
         executor_resolution=SimpleNamespace(
@@ -281,6 +291,8 @@ def test_blocked_session_bootstrap_wakes_first_turn_with_alternatives(monkeypatc
         ctx, {"id": "child1", "configured_subagent": snapshot}, dispatch,
     ))
     assert out["status"] == "configured_session_actor_ready"
+    assert out["coordination_context"]["parent_intent"]["state"] == "absent"
+    assert out["coordination_context"]["review_capacity"]["state"] == "unknown"
     startup = out["startup"]
     assert {key: startup[key] for key in (
         "status", "reason", "reset_at", "selected_subagent_id", "alternatives",
@@ -1105,6 +1117,11 @@ def test_one_shot_checkpoint_is_reasoned_and_consumed(monkeypatch, tmp_path):
     ))
     wake_id = out.pop("supervision_wake_id")
     assert wake_id
+    coordination_context = out.pop("coordination_context")
+    assert coordination_context["root_task_id"] == "child1"
+    assert coordination_context["parent_intent"]["state"] == "absent"
+    assert coordination_context["time"]["state"] == "not_set"
+    assert coordination_context["review_capacity"]["state"] == "available"
     assert out == {
         "status": "inspection_checkpoint",
         "run_id": "run-1",
@@ -1205,6 +1222,36 @@ def test_replacement_is_refused_before_gateway_or_post(monkeypatch, tmp_path):
     assert out["status"] == "refused"
     assert out["reason"] == "replacement_requires_settlement"
     assert out["undisposed_patch_run_ids"] == ["run-old"]
+
+
+def test_replacement_refuses_unreadable_custody_before_fail_soft_scan(
+    monkeypatch, tmp_path,
+):
+    from ouroboros import delegate_custody as custody
+    from ouroboros import delegate_recovery
+    import ouroboros.claudexor_daemon as daemon
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: True)
+    monkeypatch.setattr(
+        delegate_recovery,
+        "unsettled_start_ids",
+        lambda *_a, **_k: pytest.fail("unreadable custody must stop before scan"),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "ensure_owned_gateway",
+        lambda: pytest.fail("unreadable custody must stop before gateway work"),
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "child-unknown"
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    out = json.loads(delegate.exact_start(
+        ctx, "replacement work", {"snapshot": snapshot},
+    ))
+    assert out["status"] == "refused"
+    assert out["reason"] == "replacement_custody_unknown"
 
 
 def test_terminal_boundary_reaudits_durable_pending_starts(monkeypatch, tmp_path):
@@ -1521,67 +1568,3 @@ def test_only_approved_restart_causes_reserve_and_abrupt_gap_vetoes(monkeypatch,
     monkeypatch.setattr(custody, "reconcile_task_runs", lambda *_a, **_k: [])
     assert recovery.pre_adopt_planned_handoffs(tmp_path, []) == set()
     assert recovery._read(tmp_path, "child1")["veto_reason"] == "restart_transaction_missing"
-
-
-def test_planned_restart_kill_keeps_selected_child_even_if_parent_is_interrupted(
-    monkeypatch, tmp_path,
-):
-    from supervisor import queue as task_queue
-    from supervisor import workers
-
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    workers.init(repo, tmp_path, 2, 600, 1800, 100.0)
-    workers.WORKERS.clear()
-    workers.PENDING.clear()
-    workers.RUNNING.clear()
-    workers.RUNNING.update({
-        "parent": {"task": {"id": "parent", "root_task_id": "parent"}, "attempt": 1},
-        "child": {"task": {
-            "id": "child", "parent_task_id": "parent", "root_task_id": "parent",
-        }, "attempt": 1},
-    })
-    monkeypatch.setattr(workers, "_write_failure_result", lambda *_a, **_k: "cancelled")
-    monkeypatch.setattr(workers, "_emit_task_done_terminal", lambda *_a, **_k: True)
-    monkeypatch.setattr(task_queue, "persist_queue_snapshot", lambda *a, **k: True)
-    workers.kill_workers(
-        terminal_status="cancelled", preserve_pending=True,
-        preserve_running_task_ids={"child"},
-    )
-    assert [task["id"] for task in workers.PENDING] == ["child"]
-    assert workers.PENDING[0]["_attempt"] == 2
-    workers.PENDING.clear()
-    workers.RUNNING.clear()
-
-
-def test_api_row_is_refused_by_root_direct_exact_start_before_daemon(monkeypatch, tmp_path):
-    import ouroboros.tools.delegate as delegate
-    import ouroboros.claudexor_daemon as daemon
-    from ouroboros.tools.registry import ToolContext
-    settings = _settings(_api_row())
-    monkeypatch.setattr("ouroboros.config.load_settings", lambda: settings)
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: (_ for _ in ()).throw(
-        AssertionError("API rows never POST to Claudexor")))
-    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
-    ctx.task_id = "root1"
-    schema = next(e.schema for e in delegate.get_tools() if e.name == "delegate_start")["parameters"]
-    assert schema["required"] == ["prompt"] and not ({"anyOf", "oneOf", "allOf"} & schema.keys())
-    missing = json.loads(delegate.exact_start(ctx, "bounded leaf"))
-    assert missing["reason"] == "subagent_selection_required"
-    out = json.loads(delegate.exact_start(
-        ctx, "bounded leaf", {"subagent_id": "api-builder"},
-    ))
-    assert out["reason"] == "api_actor_requires_schedule_subagent"
-    retry = json.loads(delegate.exact_start(
-        ctx, "bounded leaf", {"subagent_id": "api-builder", "retry_of": "inv-old"},
-    ))
-    assert retry["reason"] == "retry_selector_conflict"
-def test_heavy_is_absent_from_active_runtime_and_vision_consumers(monkeypatch):
-    from ouroboros.llm import LLMClient
-    from ouroboros.tools.vision import _vision_capable_slot_candidates
-
-    monkeypatch.setenv("OUROBOROS_MODEL", "openai/main")
-    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "openai/light")
-    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "openai/legacy-heavy")
-    assert "openai/legacy-heavy" not in LLMClient().available_models()
-    assert "openai/legacy-heavy" not in _vision_capable_slot_candidates(LLMClient())

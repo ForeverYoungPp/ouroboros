@@ -23,6 +23,169 @@ STATUS_FAILED = "failed"
 STATUS_INTERRUPTED = "interrupted"
 STATUS_CANCELLED = "cancelled"
 
+
+def review_binding_hash(
+    *, candidate_hash: str, evidence_revision: str, fence_hash: str,
+) -> str:
+    """Digest the immutable task-acceptance binding components."""
+
+    import hashlib
+
+    payload = {
+        "candidate_hash": str(candidate_hash or ""),
+        "evidence_revision": str(evidence_revision or ""),
+        "fence_hash": str(fence_hash or ""),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def effective_task_acceptance_review_cycles(
+    profile: Dict[str, Any], *, has_deadline: bool = True,
+    required_blocking: bool = False,
+) -> Optional[int]:
+    """Project paid panels from the existing improvement-pass semantics."""
+
+    from ouroboros.task_pacing import effective_max_improvement_passes
+
+    passes = effective_max_improvement_passes(
+        profile,
+        has_deadline=has_deadline,
+        required_blocking=required_blocking,
+    )
+    return None if passes is None else max(1, int(passes) + 1)
+
+
+def project_task_acceptance_review_capacity(
+    ctx: Any, *, binding_hash: str = "",
+) -> Dict[str, Any]:
+    """Read the canonical root's paid acceptance-wallet projection.
+
+    Descendants may observe but never initialize root authority. A missing or
+    malformed canonical result is UNKNOWN for them; a live root may begin with
+    the known empty state. The atomic claim remains dispatch authority.
+    """
+
+    from ouroboros import config, task_pacing
+    from ouroboros.contracts.task_contract import normalize_budget_profile
+    from ouroboros.deadline_utils import parse_deadline_ts
+
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    lineage = resolve_task_lineage(
+        task_id,
+        metadata=metadata,
+        root_task_id=getattr(ctx, "root_task_id", None),
+        parent_task_id=getattr(ctx, "parent_task_id", None),
+        delegation_role=getattr(ctx, "delegation_role", None),
+        original_task_id=getattr(ctx, "original_task_id", None),
+        timeout_retry_from=getattr(ctx, "timeout_retry_from", None),
+    )
+    root_task_id = str(lineage.get("root_task_id") or task_id)
+    root = pathlib.Path(str(
+        metadata.get("budget_drive_root")
+        or getattr(ctx, "budget_drive_root", "")
+        or getattr(ctx, "drive_root", ".")
+    ))
+    base = {
+        "root_task_id": root_task_id,
+        "cap_cycles": None,
+        "claimed_cycles": None,
+        "remaining_cycles": None,
+        "binding_seen": False,
+        "dedupe": "task_acceptance_binding_sha256",
+    }
+    try:
+        state = load_task_acceptance_review_state(
+            root,
+            root_task_id,
+            require_root_result=not bool(lineage.get("is_root_task")),
+        )
+        path = task_result_path(root, root_task_id, create=False)
+        root_result = read_json_dict(path) if path.is_file() else {}
+        if path.is_file() and root_result is None:
+            raise ValueError("root result is malformed")
+        root_result = root_result if isinstance(root_result, dict) else {}
+        root_contract = (
+            root_result.get("task_contract")
+            if isinstance(root_result.get("task_contract"), dict)
+            else {}
+        )
+        if not root_contract and lineage.get("is_root_task"):
+            root_contract = (
+                getattr(ctx, "task_contract", None)
+                if isinstance(getattr(ctx, "task_contract", None), dict)
+                else metadata.get("task_contract")
+                if isinstance(metadata.get("task_contract"), dict)
+                else {}
+            )
+        profile = normalize_budget_profile(root_contract.get("budget_profile"))
+        deadline_value = root_result.get("deadline_at")
+        if deadline_value is None and lineage.get("is_root_task"):
+            deadline_value = metadata.get("deadline_at")
+        required_blocking = bool(
+            config.get_task_review_mode() == "required"
+            and config.get_review_enforcement() == "blocking"
+        )
+        cap = effective_task_acceptance_review_cycles(
+            profile,
+            has_deadline=parse_deadline_ts(deadline_value) is not None,
+            required_blocking=required_blocking,
+        )
+        claims = state.get("claims_by_binding") or {}
+        claimed = len(claims)
+        remaining = None if cap is None else max(0, cap - claimed)
+        requested_binding = str(binding_hash or "").strip().lower()
+        projection = {
+            **base,
+            "state": "available",
+            "reason": "",
+            "cap_cycles": cap,
+            "claimed_cycles": claimed,
+            "remaining_cycles": remaining,
+            "binding_seen": bool(requested_binding and requested_binding in claims),
+        }
+        try:
+            from ouroboros.cancel_intents import cancel_pending
+
+            if cancel_pending(root, root_task_id) or (
+                task_id != root_task_id and cancel_pending(root, task_id)
+            ):
+                projection.update({
+                    "state": "unavailable", "reason": "cancellation_pending",
+                })
+                return projection
+        except Exception as exc:
+            return {
+                **projection,
+                "state": "unknown",
+                "reason": f"cancellation_state_unknown:{type(exc).__name__}",
+            }
+        budget = task_pacing.build_budget_snapshot(
+            ctx, profile=task_pacing.resolve_budget_profile(ctx),
+        )
+        launch_ok, launch_reason = task_pacing.review_launch_allowed(
+            budget,
+            estimated_sec=task_pacing.acceptance_review_estimate_sec(
+                ctx, passes_done=claimed,
+            ),
+        )
+        if not launch_ok:
+            projection.update({"state": "unavailable", "reason": launch_reason})
+        elif remaining == 0:
+            projection.update({
+                "state": "unavailable", "reason": "review_cycles_exhausted",
+            })
+        return projection
+    except Exception as exc:
+        return {
+            **base,
+            "state": "unknown",
+            "reason": f"review_capacity_unknown:{type(exc).__name__}",
+        }
+
 # Intent latch: the agent/owner asked to cancel, but the supervisor has not yet
 # torn the task down. Ranks above running so a late running/scheduled mirror
 # cannot resurrect it, but below the truly-terminal statuses so the eventual
@@ -78,6 +241,229 @@ _PLAN_REVIEW_STATE_VERSION = 2
 _PLAN_REVIEW_STATE_MAX_BYTES = 1_000_000
 _PLAN_REVIEW_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _PLAN_REVIEW_REASON_MAX_CHARS = 2_000
+
+TASK_ACCEPTANCE_REVIEW_STATE_KEY = "task_acceptance_review_accounting"
+_TASK_ACCEPTANCE_REVIEW_STATE_VERSION = 1
+_TASK_ACCEPTANCE_REVIEW_STATE_MAX_BYTES = 1_000_000
+_TASK_ACCEPTANCE_REVIEW_CLAIM_FIELDS = frozenset({
+    "binding_hash", "candidate_hash", "evidence_revision", "fence_hash",
+    "claimed_at", "claimed_by_task_id",
+})
+
+
+def _empty_task_acceptance_review_state(root_task_id: str) -> Dict[str, Any]:
+    return {
+        "schema_version": _TASK_ACCEPTANCE_REVIEW_STATE_VERSION,
+        "root_task_id": str(root_task_id),
+        "claims_by_binding": {},
+    }
+
+
+def _validated_task_acceptance_review_state(
+    value: Any, root_task_id: str,
+) -> Dict[str, Any]:
+    """Strict private copy of the root tree's paid acceptance claims."""
+
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: unsupported schema")
+    if set(value) != {"schema_version", "root_task_id", "claims_by_binding"}:
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: state shape is invalid")
+    if str(value.get("root_task_id") or "") != str(root_task_id):
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: root identity mismatch")
+    claims = value.get("claims_by_binding")
+    if not isinstance(claims, dict):
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: claims must be an object")
+    for binding_hash, claim in claims.items():
+        if not _PLAN_REVIEW_HASH_RE.fullmatch(str(binding_hash or "")):
+            raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: claim key is invalid")
+        if not isinstance(claim, dict) or set(claim) != _TASK_ACCEPTANCE_REVIEW_CLAIM_FIELDS:
+            raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: claim shape is invalid")
+        if str(claim.get("binding_hash") or "") != str(binding_hash):
+            raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: claim identity mismatch")
+        for key in ("binding_hash", "candidate_hash", "evidence_revision", "fence_hash"):
+            if not _PLAN_REVIEW_HASH_RE.fullmatch(str(claim.get(key) or "")):
+                raise ValueError(
+                    f"TASK_ACCEPTANCE_REVIEW_STATE_INVALID: {key} is invalid"
+                )
+        expected_binding = review_binding_hash(
+            candidate_hash=str(claim["candidate_hash"]),
+            evidence_revision=str(claim["evidence_revision"]),
+            fence_hash=str(claim["fence_hash"]),
+        )
+        if expected_binding != str(binding_hash):
+            raise ValueError(
+                "TASK_ACCEPTANCE_REVIEW_STATE_INVALID: binding digest mismatch"
+            )
+        for key in ("claimed_at", "claimed_by_task_id"):
+            if not isinstance(claim.get(key), str) or not str(claim.get(key) or ""):
+                raise ValueError(
+                    f"TASK_ACCEPTANCE_REVIEW_STATE_INVALID: {key} must be non-empty text"
+                )
+    copied = copy.deepcopy(value)
+    if len(json.dumps(copied, ensure_ascii=False).encode("utf-8")) > _TASK_ACCEPTANCE_REVIEW_STATE_MAX_BYTES:
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: state is too large")
+    return copied
+
+
+def load_task_acceptance_review_state(
+    results_drive_root: Any,
+    root_task_id: str,
+    *,
+    require_root_result: bool = False,
+) -> Dict[str, Any]:
+    """Read the canonical root's shared paid-review claims without mutation."""
+
+    path = task_result_path(results_drive_root, root_task_id, create=False)
+    if not path.is_file():
+        if require_root_result:
+            raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN: root result is absent")
+        return _empty_task_acceptance_review_state(root_task_id)
+    result = read_json_dict(path)
+    if result is None:
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: root result is malformed")
+    if str(result.get("task_id") or "") != str(root_task_id):
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: root identity mismatch")
+    stored_root_id = str(result.get("root_task_id") or "")
+    if stored_root_id and stored_root_id != str(root_task_id):
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: root identity mismatch")
+    if TASK_ACCEPTANCE_REVIEW_STATE_KEY not in result:
+        return _empty_task_acceptance_review_state(root_task_id)
+    return _validated_task_acceptance_review_state(
+        result[TASK_ACCEPTANCE_REVIEW_STATE_KEY], root_task_id,
+    )
+
+
+def _update_task_acceptance_review_state(
+    results_drive_root: Any,
+    root_task_id: str,
+    mutator: Callable[[Dict[str, Any]], Optional[Dict[str, Any]]],
+    *,
+    allow_create: bool,
+) -> Dict[str, Any]:
+    """Strict root-result update; the file lock is the tree-wide claim fence."""
+
+    path = task_result_path(results_drive_root, root_task_id, create=allow_create)
+    if not allow_create and not path.is_file():
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN: root result is absent")
+
+    def _merge(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not allow_create and not existing:
+            raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN: root result is absent")
+        if existing and str(existing.get("task_id") or "") != str(root_task_id):
+            raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: root identity mismatch")
+        stored_root_id = str(existing.get("root_task_id") or "")
+        if stored_root_id and stored_root_id != str(root_task_id):
+            raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: root identity mismatch")
+        state = (
+            _validated_task_acceptance_review_state(
+                existing[TASK_ACCEPTANCE_REVIEW_STATE_KEY], root_task_id,
+            )
+            if TASK_ACCEPTANCE_REVIEW_STATE_KEY in existing
+            else _empty_task_acceptance_review_state(root_task_id)
+        )
+        candidate = mutator(state)
+        if candidate is None:
+            return None
+        updated = _validated_task_acceptance_review_state(
+            candidate, root_task_id,
+        )
+        now = utc_now_iso()
+        return {
+            **existing,
+            TASK_ACCEPTANCE_REVIEW_STATE_KEY: updated,
+            "task_id": str(root_task_id),
+            "status": str(existing.get("status") or STATUS_RUNNING),
+            "ts": str(existing.get("ts") or now),
+            "updated_at": now,
+        }
+
+    try:
+        updated = update_json_locked(
+            path,
+            _merge,
+            strict_existing_dict=True,
+            reject_existing_empty_dict=True,
+        )
+    except ValueError as exc:
+        if str(exc).startswith("update_json_locked:"):
+            raise ValueError(
+                "TASK_ACCEPTANCE_REVIEW_STATE_INVALID: root result is malformed"
+            ) from exc
+        raise
+    return _validated_task_acceptance_review_state(
+        updated.get(TASK_ACCEPTANCE_REVIEW_STATE_KEY), root_task_id,
+    )
+
+
+def claim_task_acceptance_review_cycle(
+    results_drive_root: Any,
+    root_task_id: str,
+    review_binding: Dict[str, Any],
+    *,
+    max_cycles: Optional[int],
+    claimed_by_task_id: str,
+    allow_create: bool = False,
+) -> Dict[str, Any]:
+    """Atomically dedupe and claim one paid root-acceptance panel dispatch."""
+
+    binding_fields = {
+        key: str((review_binding or {}).get(key) or "").strip().lower()
+        for key in ("binding_hash", "candidate_hash", "evidence_revision", "fence_hash")
+    }
+    if any(
+        not _PLAN_REVIEW_HASH_RE.fullmatch(value)
+        for value in binding_fields.values()
+    ):
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: review binding is invalid")
+    expected_binding = review_binding_hash(
+        candidate_hash=binding_fields["candidate_hash"],
+        evidence_revision=binding_fields["evidence_revision"],
+        fence_hash=binding_fields["fence_hash"],
+    )
+    if binding_fields["binding_hash"] != expected_binding:
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: binding digest mismatch")
+    binding = binding_fields["binding_hash"]
+    claimant = str(claimed_by_task_id or "").strip()
+    if not claimant:
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: claimant is absent")
+    cap = None if max_cycles is None else max(1, int(max_cycles))
+    decision: Dict[str, Any] = {}
+
+    def _claim(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        claims = dict(state.get("claims_by_binding") or {})
+        prior = claims.get(binding)
+        if prior is not None:
+            decision.update({
+                "status": "unknown",
+                "reason": "binding_dispatch_already_claimed",
+            })
+            return None
+        if cap is not None and len(claims) >= cap:
+            decision.update({"status": "unavailable", "reason": "review_cycles_exhausted"})
+            return None
+        claims[binding] = {
+            **binding_fields,
+            "claimed_at": utc_now_iso(),
+            "claimed_by_task_id": claimant,
+        }
+        state["claims_by_binding"] = claims
+        decision.update({"status": "claimed", "reason": ""})
+        return state
+
+    state = _update_task_acceptance_review_state(
+        results_drive_root,
+        root_task_id,
+        _claim,
+        allow_create=allow_create,
+    )
+    paid = len(state.get("claims_by_binding") or {})
+    return {
+        **decision,
+        "binding_hash": binding,
+        "cycles_paid": paid,
+        "max_cycles": cap,
+        "remaining_cycles": None if cap is None else max(0, cap - paid),
+    }
 
 
 def cancellation_blocks_child_result(result: Any) -> bool:

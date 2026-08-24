@@ -185,7 +185,6 @@ BAND_PATHS = {
     "tests/test_telegram_miniapp_lifecycle.py": None,
     "tests/test_tool_api_v2_public_surface.py": None,
     "tests/test_usage_accounting.py": None,
-    "tests/test_v647_megacommit.py": None,
     "tests/test_v6730_origin_invariant.py": None,
     "tests/test_v678_receipt_reconciliation.py": None,
     "web/modules/api_types.js": "The shared browser contract module now includes issue 265 publication-preflight types alongside the target settings and subagent contracts.",
@@ -208,7 +207,7 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/loop.py": 316096,
+    "ouroboros/loop.py": 315869,
     "tests/test_delegated_subagent_transport.py": 320571,
     "tests/test_devtools_benchmarks.py": 328282,
     "web/modules/chat.js": 225761,

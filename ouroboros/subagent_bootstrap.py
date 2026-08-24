@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping
@@ -13,6 +14,25 @@ from ouroboros.subagent_work_order import (
     compile_external_work_order,
     route_source_request_channel,
 )
+
+log = logging.getLogger(__name__)
+
+
+def _with_coordination_context(ctx: Any, raw: str) -> str:
+    """Attach one fresh planning snapshot to a startup/recovery receipt."""
+
+    if not raw:
+        return raw
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return raw
+        from ouroboros.delegate_supervision import coordination_live_context
+
+        payload["coordination_context"] = coordination_live_context(ctx)
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    except Exception:
+        return raw
 
 
 def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -> str:
@@ -37,7 +57,7 @@ def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -
         actor_ready = _prepare_actor_first_bootstrap(ctx, task, dispatch)
         recovery = _adopt_recovery_handoff(ctx, task)
         if recovery:
-            return recovery
+            return _with_coordination_context(ctx, recovery)
         if bool(getattr(dispatch, "blocked", False)):
             # A route fault is evidence for the ordinary host turn, never a
             # reason to silently spend on native/API fallback.
@@ -85,10 +105,10 @@ def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -
             custody.emit(custody.custody_root(ctx), "configured_subagent_startup_fault", {
                 "task_id": str(getattr(ctx, "task_id", "") or ""), **startup,
             })
-            return json.dumps({
+            return _with_coordination_context(ctx, json.dumps({
                 "status": "configured_session_actor_ready", "startup": startup,
-            }, ensure_ascii=False, indent=2)
-        return actor_ready
+            }, ensure_ascii=False, indent=2))
+        return _with_coordination_context(ctx, actor_ready)
     return ""
 
 
@@ -236,6 +256,58 @@ def actor_first_unresolved_fact(
             }),
         } if children else {}),
     }
+
+
+def actor_first_coordination_finalization_message(
+    ctx: Any, *, task_id: str, fallback_root: Any,
+) -> str | None:
+    """Resolve actor-first finalization, or defer to the legacy nanny message."""
+
+    host_coordination = bool(getattr(ctx, "_nanny_coordination_activity", False))
+    bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+    if isinstance(bootstrap, dict) and bootstrap.get("zero_run_receipt_recorded"):
+        host_coordination = True
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    status_root = Path(str(
+        metadata.get("budget_drive_root")
+        or getattr(ctx, "budget_drive_root", "")
+        or fallback_root
+    ))
+    if not host_coordination:
+        try:
+            from ouroboros.task_status import find_child_tasks
+
+            host_coordination = bool(find_child_tasks(
+                status_root,
+                parent_task_id=str(task_id or ""),
+                exclude_task_id=str(task_id or ""),
+                scope="direct",
+                materialize_artifacts=False,
+            ))
+        except Exception:
+            log.debug("nanny nudge: host coordination evidence read failed", exc_info=True)
+    try:
+        actor_fact = actor_first_unresolved_fact(
+            ctx, task_id=str(task_id or ""), drive_root=status_root,
+        )
+    except Exception:
+        actor_fact = None
+    if actor_fact:
+        status = str(actor_fact.get("status") or "unknown")
+        code = (
+            "CONFIGURED_ACTOR_INCOMPLETE"
+            if status == "incomplete" else "CONFIGURED_ACTOR_UNKNOWN"
+        )
+        return (
+            f"⚠️ {code}: this actor-first session is finalizing before its assigned "
+            "physical leaf started and without a direct host child result. Call "
+            "verify_and_record(contract_kind=delegation_zero_run, "
+            f"zero_run_decision={status!r}, zero_run_basis=...) to record the "
+            "typed terminal decision, or start the exact assigned session now. "
+            "A plain prose answer cannot close this evidence gap."
+        )
+    return "" if host_coordination else None
 
 
 def _durable_zero_run_receipt(
@@ -507,4 +579,8 @@ def append_startup_receipt(
     acknowledge_pending_wake(ctx, startup_wake)
 
 
-__all__ = ["append_startup_receipt", "bootstrap_before_context"]
+__all__ = [
+    "actor_first_coordination_finalization_message",
+    "append_startup_receipt",
+    "bootstrap_before_context",
+]

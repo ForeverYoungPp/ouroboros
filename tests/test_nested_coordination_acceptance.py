@@ -7,11 +7,12 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from ouroboros import task_tree_ledger
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.headless import copy_child_task_result
-from ouroboros.depth_evidence import build_depth_summary
 from ouroboros.outcome_receipt_store import merge_verification_receipts
 from ouroboros.outcomes import latest_unreconciled_failed_receipt
 from ouroboros.loop import (
@@ -35,6 +36,248 @@ from supervisor import (
     state as state_module,
     workers,
 )
+
+
+def _acceptance_binding(seed: str) -> dict[str, str]:
+    from ouroboros.review_substrate import review_binding_hash
+
+    components = {
+        "candidate_hash": chr(ord(seed) + 1) * 64,
+        "evidence_revision": chr(ord(seed) + 2) * 64,
+        "fence_hash": chr(ord(seed) + 3) * 64,
+    }
+    return {**components, "binding_hash": review_binding_hash(**components)}
+
+
+def test_root_acceptance_review_claims_share_one_atomic_exact_binding_wallet(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from ouroboros.task_results import (
+        claim_task_acceptance_review_cycle,
+        load_task_acceptance_review_state,
+    )
+
+    write_task_result(tmp_path, "root-wallet", STATUS_RUNNING, root_task_id="root-wallet")
+    first_binding = _acceptance_binding("1")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(
+            lambda _index: claim_task_acceptance_review_cycle(
+                tmp_path,
+                "root-wallet",
+                first_binding,
+                max_cycles=2,
+                claimed_by_task_id="root-wallet",
+            ),
+            range(2),
+        ))
+    assert sorted(row["status"] for row in outcomes) == ["claimed", "unknown"]
+    state = load_task_acceptance_review_state(tmp_path, "root-wallet")
+    assert list(state["claims_by_binding"]) == [first_binding["binding_hash"]]
+    result_path = tmp_path / "task_results" / "root-wallet.json"
+    before_duplicate = result_path.read_bytes()
+    duplicate = claim_task_acceptance_review_cycle(
+        tmp_path,
+        "root-wallet",
+        first_binding,
+        max_cycles=2,
+        claimed_by_task_id="root-wallet",
+    )
+    assert duplicate["status"] == "unknown"
+    assert duplicate["reason"] == "binding_dispatch_already_claimed"
+    assert result_path.read_bytes() == before_duplicate
+
+    second = claim_task_acceptance_review_cycle(
+        tmp_path,
+        "root-wallet",
+        _acceptance_binding("5"),
+        max_cycles=2,
+        claimed_by_task_id="root-wallet",
+    )
+    before_exhausted = result_path.read_bytes()
+    exhausted = claim_task_acceptance_review_cycle(
+        tmp_path,
+        "root-wallet",
+        _acceptance_binding("a"),
+        max_cycles=2,
+        claimed_by_task_id="root-wallet",
+    )
+    assert second["status"] == "claimed"
+    assert second["cycles_paid"] == 2
+    assert result_path.read_bytes() == before_exhausted
+    assert exhausted == {
+        "status": "unavailable",
+        "reason": "review_cycles_exhausted",
+        "binding_hash": _acceptance_binding("a")["binding_hash"],
+        "cycles_paid": 2,
+        "max_cycles": 2,
+        "remaining_cycles": 0,
+    }
+
+
+def test_acceptance_review_wallet_rejects_present_empty_or_tampered_authority(tmp_path):
+    from ouroboros.task_results import (
+        TASK_ACCEPTANCE_REVIEW_STATE_KEY,
+        claim_task_acceptance_review_cycle,
+        load_task_acceptance_review_state,
+    )
+
+    path = tmp_path / "task_results" / "root-invalid.json"
+    write_task_result(
+        tmp_path,
+        "root-invalid",
+        STATUS_RUNNING,
+        root_task_id="root-invalid",
+        **{TASK_ACCEPTANCE_REVIEW_STATE_KEY: {}},
+    )
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="TASK_ACCEPTANCE_REVIEW_STATE_INVALID"):
+        load_task_acceptance_review_state(tmp_path, "root-invalid")
+    with pytest.raises(ValueError, match="TASK_ACCEPTANCE_REVIEW_STATE_INVALID"):
+        claim_task_acceptance_review_cycle(
+            tmp_path,
+            "root-invalid",
+            _acceptance_binding("1"),
+            max_cycles=2,
+            claimed_by_task_id="root-invalid",
+        )
+    assert path.read_bytes() == before
+
+    write_task_result(
+        tmp_path,
+        "root-tampered",
+        STATUS_RUNNING,
+        root_task_id="root-tampered",
+    )
+    tampered = _acceptance_binding("5")
+    tampered["binding_hash"] = "f" * 64
+    tampered_path = tmp_path / "task_results" / "root-tampered.json"
+    before = tampered_path.read_bytes()
+    with pytest.raises(ValueError, match="binding digest mismatch"):
+        claim_task_acceptance_review_cycle(
+            tmp_path,
+            "root-tampered",
+            tampered,
+            max_cycles=2,
+            claimed_by_task_id="root-tampered",
+        )
+    assert tampered_path.read_bytes() == before
+
+
+def test_acceptance_review_wallet_cap_and_root_initialization_are_atomic(
+    tmp_path, monkeypatch,
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import ouroboros.task_results as task_results
+
+    with pytest.raises(ValueError, match="TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN"):
+        task_results.claim_task_acceptance_review_cycle(
+            tmp_path,
+            "missing-root",
+            _acceptance_binding("1"),
+            max_cycles=1,
+            claimed_by_task_id="child",
+            allow_create=False,
+        )
+    assert not (tmp_path / "task_results" / "missing-root.json").exists()
+
+    claimed = task_results.claim_task_acceptance_review_cycle(
+        tmp_path,
+        "new-root",
+        _acceptance_binding("1"),
+        max_cycles=1,
+        claimed_by_task_id="new-root",
+        allow_create=True,
+    )
+    assert claimed["status"] == "claimed"
+    assert load_task_result(tmp_path, "new-root")["status"] == STATUS_RUNNING
+
+    write_task_result(tmp_path, "cap-root", STATUS_RUNNING, root_task_id="cap-root")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(
+            lambda binding: task_results.claim_task_acceptance_review_cycle(
+                tmp_path,
+                "cap-root",
+                binding,
+                max_cycles=1,
+                claimed_by_task_id="cap-root",
+            ),
+            (_acceptance_binding("1"), _acceptance_binding("5")),
+        ))
+    assert sorted(row["status"] for row in outcomes) == ["claimed", "unavailable"]
+
+    write_task_result(tmp_path, "racy-root", STATUS_RUNNING, root_task_id="racy-root")
+    original_update = task_results.update_json_locked
+
+    def remove_before_locked_read(path, mutator, **kwargs):
+        path.unlink()
+        return original_update(path, mutator, **kwargs)
+
+    monkeypatch.setattr(task_results, "update_json_locked", remove_before_locked_read)
+    with pytest.raises(ValueError, match="TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN"):
+        task_results.claim_task_acceptance_review_cycle(
+            tmp_path,
+            "racy-root",
+            _acceptance_binding("a"),
+            max_cycles=1,
+            claimed_by_task_id="child",
+            allow_create=False,
+        )
+    assert not (tmp_path / "task_results" / "racy-root.json").exists()
+
+
+def test_descendant_cannot_initialize_missing_root_review_authority(tmp_path, monkeypatch):
+    from ouroboros.task_pacing import project_task_acceptance_review_capacity
+
+    ctx = SimpleNamespace(
+        task_id="child",
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        task_metadata={
+            "root_task_id": "missing-root",
+            "parent_task_id": "missing-root",
+            "delegation_role": "subagent",
+            "budget_drive_root": str(tmp_path),
+        },
+    )
+    projection = project_task_acceptance_review_capacity(ctx)
+    assert projection["state"] == "unknown"
+    assert projection["claimed_cycles"] is None
+    assert not (tmp_path / "task_results" / "missing-root.json").exists()
+
+
+def test_root_review_capacity_uses_existing_explicit_pass_semantics(tmp_path, monkeypatch):
+    from ouroboros.task_pacing import project_task_acceptance_review_capacity
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "2")
+    contract = build_task_contract({
+        "budget_profile": {"max_improvement_passes": 4},
+    })
+    write_task_result(
+        tmp_path,
+        "root-cap",
+        STATUS_RUNNING,
+        root_task_id="root-cap",
+        delegation_role="root",
+        task_contract=contract,
+    )
+    ctx = SimpleNamespace(
+        task_id="root-cap",
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        task_contract=contract,
+        task_metadata={
+            "root_task_id": "root-cap",
+            "delegation_role": "root",
+            "budget_drive_root": str(tmp_path),
+            "task_contract": contract,
+        },
+    )
+    projection = project_task_acceptance_review_capacity(ctx)
+    assert projection["state"] == "available"
+    assert projection["cap_cycles"] == 5
+    assert projection["claimed_cycles"] == 0
+    assert projection["remaining_cycles"] == 5
 
 
 def test_depth3_control_plane_reaches_root_acceptance(tmp_path, monkeypatch):
@@ -713,84 +956,6 @@ def test_real_over_cap_refusal_reaches_root_acceptance_depth_summary(tmp_path, m
         "achieved_depth": 2,
         "status": "capability_reduced",
         "host_visible_only": True,
-    }
-
-
-def test_depth_summary_reports_lower_cap_as_typed_reduction(monkeypatch):
-    # Live Settings may change after admission; persisted child provenance wins.
-    monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "7")
-    root_contract = build_task_contract({"delegation_budget": {"depth_remaining": 3}})
-    statuses = [
-        {
-            "task_id": f"child-{depth}",
-            "depth_provenance": {
-                "requested_depth": 3,
-                "permitted_depth": 2,
-                "attempted_depth": depth,
-                "achieved_depth": depth,
-            },
-        }
-        for depth in (1, 2)
-    ]
-
-    assert build_depth_summary(root_contract, statuses) == {
-        "requested_depth": 3,
-        "permitted_depth": 2,
-        "attempted_depth": 2,
-        "achieved_depth": 2,
-        "status": "capability_reduced",
-        "host_visible_only": True,
-    }
-
-
-def test_depth_summary_is_order_independent_and_allows_chosen_shallower():
-    root_contract = build_task_contract({
-        "delegation_budget": {
-            "depth_remaining": 3,
-            "depth_provenance": {
-                "requested_depth": 3,
-                "permitted_depth": 3,
-                "attempted_depth": 0,
-                "achieved_depth": None,
-            },
-        },
-    })
-    mixed = [
-        {
-            "depth_provenance": {
-                "requested_depth": 3, "permitted_depth": 3,
-                "attempted_depth": 1, "achieved_depth": 1,
-            },
-        },
-        {
-            "depth_provenance": {
-                "requested_depth": 3, "permitted_depth": 2,
-                "attempted_depth": 2, "achieved_depth": 2,
-            },
-        },
-    ]
-    expected = {
-        "requested_depth": 3, "permitted_depth": 2,
-        "attempted_depth": 2, "achieved_depth": 2,
-        "status": "capability_reduced", "host_visible_only": True,
-    }
-    assert build_depth_summary(root_contract, mixed) == expected
-    assert build_depth_summary(root_contract, reversed(mixed)) == expected
-
-    assert build_depth_summary(root_contract, [mixed[0]]) == {
-        "requested_depth": 3, "permitted_depth": 3,
-        "attempted_depth": 1, "achieved_depth": 1,
-        "status": "chosen_shallower", "host_visible_only": True,
-    }
-
-
-def test_depth_summary_never_recomputes_missing_history_from_live_settings(monkeypatch):
-    root_contract = build_task_contract({"delegation_budget": {"depth_remaining": 3}})
-    monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "7")
-    assert build_depth_summary(root_contract, []) == {
-        "requested_depth": 3, "permitted_depth": None,
-        "attempted_depth": 0, "achieved_depth": 0,
-        "status": "evidence_unknown", "host_visible_only": True,
     }
 
 

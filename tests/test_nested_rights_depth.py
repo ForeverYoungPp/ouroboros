@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 from ouroboros.contracts.task_contract import build_task_contract
+from ouroboros.depth_evidence import build_depth_summary
 from ouroboros.task_results import STATUS_RUNNING, write_task_result
 from ouroboros.tools.control_delegation import (
     check_delegation_admission,
@@ -43,6 +44,70 @@ def test_explicit_rights_are_typed_and_legacy_omission_stays_permissive():
     )
     assert narrowed["may_delegate"] is False
     assert narrowed["may_fan_out"] is False
+
+
+def test_depth_summary_reports_lower_cap_as_typed_reduction(monkeypatch):
+    monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "7")
+    root_contract = build_task_contract({"delegation_budget": {"depth_remaining": 3}})
+    statuses = [
+        {
+            "task_id": f"child-{depth}",
+            "depth_provenance": {
+                "requested_depth": 3, "permitted_depth": 2,
+                "attempted_depth": depth, "achieved_depth": depth,
+            },
+        }
+        for depth in (1, 2)
+    ]
+    assert build_depth_summary(root_contract, statuses) == {
+        "requested_depth": 3, "permitted_depth": 2,
+        "attempted_depth": 2, "achieved_depth": 2,
+        "status": "capability_reduced", "host_visible_only": True,
+    }
+
+
+def test_depth_summary_is_order_independent_and_allows_chosen_shallower():
+    root_contract = build_task_contract({
+        "delegation_budget": {
+            "depth_remaining": 3,
+            "depth_provenance": {
+                "requested_depth": 3, "permitted_depth": 3,
+                "attempted_depth": 0, "achieved_depth": None,
+            },
+        },
+    })
+    mixed = [
+        {"depth_provenance": {
+            "requested_depth": 3, "permitted_depth": 3,
+            "attempted_depth": 1, "achieved_depth": 1,
+        }},
+        {"depth_provenance": {
+            "requested_depth": 3, "permitted_depth": 2,
+            "attempted_depth": 2, "achieved_depth": 2,
+        }},
+    ]
+    expected = {
+        "requested_depth": 3, "permitted_depth": 2,
+        "attempted_depth": 2, "achieved_depth": 2,
+        "status": "capability_reduced", "host_visible_only": True,
+    }
+    assert build_depth_summary(root_contract, mixed) == expected
+    assert build_depth_summary(root_contract, reversed(mixed)) == expected
+    assert build_depth_summary(root_contract, [mixed[0]]) == {
+        "requested_depth": 3, "permitted_depth": 3,
+        "attempted_depth": 1, "achieved_depth": 1,
+        "status": "chosen_shallower", "host_visible_only": True,
+    }
+
+
+def test_depth_summary_never_recomputes_missing_history_from_live_settings(monkeypatch):
+    root_contract = build_task_contract({"delegation_budget": {"depth_remaining": 3}})
+    monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "7")
+    assert build_depth_summary(root_contract, []) == {
+        "requested_depth": 3, "permitted_depth": None,
+        "attempted_depth": 0, "achieved_depth": 0,
+        "status": "evidence_unknown", "host_visible_only": True,
+    }
 
 
 def test_depth_provenance_follows_explicit_request_through_three_levels():
@@ -415,6 +480,73 @@ def test_supervisor_receipt_rollback_removes_only_its_enqueue_identity(
         "direct_child_count": 0,
         "transition_id": "old-transition",
     }
+
+
+def test_replayed_schedule_event_keeps_one_physical_task_and_transition(
+    tmp_path, monkeypatch,
+):
+    from supervisor import events, queue, state, workers
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    write_task_result(
+        tmp_path, "parent", STATUS_RUNNING,
+        root_task_id="parent", delegation_role="root",
+        task_contract=build_task_contract({"delegation_budget": {"may_fan_out": True}}),
+    )
+    write_task_result(
+        tmp_path, "same-child", "requested",
+        parent_task_id="parent", root_task_id="parent",
+        delegation_role="subagent", result="Awaiting supervisor acceptance.",
+    )
+    ctx = _fake_ctx(tmp_path, [])
+
+    def enqueue_task(task):
+        admitted = dict(task)
+        ctx.PENDING.append(admitted)
+        return admitted
+
+    ctx.enqueue_task = enqueue_task
+    event = _schedule_event("same-child", "parent", drive_root=tmp_path)
+    events._handle_schedule_task(event, ctx)
+    first = json.loads(
+        (tmp_path / "task_results" / "same-child.json").read_text(encoding="utf-8")
+    )
+    transition_id = first["delegation_admission"]["transition_id"]
+
+    def unexpected_constraint_resolution(*_args, **_kwargs):
+        raise AssertionError("a replay must stop before workspace provisioning")
+
+    monkeypatch.setattr(events, "_resolve_subagent_constraint", unexpected_constraint_resolution)
+    events._handle_schedule_task(event, ctx)
+    replayed = json.loads(
+        (tmp_path / "task_results" / "same-child.json").read_text(encoding="utf-8")
+    )
+    assert [task["id"] for task in ctx.PENDING] == ["same-child"]
+    assert replayed["delegation_admission"]["transition_id"] == transition_id
+
+    delivered = []
+
+    class FakeWorkerQueue:
+        def put(self, task):
+            delivered.append(dict(task))
+
+    worker_map = {
+        wid: SimpleNamespace(wid=wid, busy_task_id=None, in_q=FakeWorkerQueue())
+        for wid in (1, 2)
+    }
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", ctx.PENDING)
+    monkeypatch.setattr(workers, "RUNNING", ctx.RUNNING)
+    monkeypatch.setattr(workers, "WORKERS", worker_map)
+    monkeypatch.setattr(workers, "load_state", lambda: {})
+    monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 100.0)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+
+    workers.assign_tasks()
+
+    assert [task["id"] for task in delivered] == ["same-child"]
+    assert sum(worker.busy_task_id == "same-child" for worker in worker_map.values()) == 1
+    assert ctx.RUNNING["same-child"]["worker_id"] in worker_map
 
 
 def test_supervisor_keeps_admission_when_scheduled_write_raises_after_commit(

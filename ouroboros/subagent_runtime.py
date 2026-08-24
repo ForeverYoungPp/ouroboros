@@ -547,6 +547,13 @@ def prepare_delegate_start_actor(
     snapshot, route = exact_session_binding(selected_snapshot)
     selected_id = str(snapshot.get("selected_subagent_id") or "")
     config_fingerprint = str(snapshot.get("config_fingerprint") or "")
+    if custody.custody_log_unreadable(drive_root):
+        return {}, _fail(
+            "delegate_start", "replacement_custody_unknown",
+            "The custody event log exists but cannot be read, so the host cannot "
+            "prove that no physical start/run remains. Repair or reconcile the "
+            "canonical custody record before starting a replacement.",
+        )
     blockers = unsettled_start_ids(
         drive_root, str(getattr(ctx, "task_id", "") or "")
     )

@@ -26,6 +26,7 @@ from ouroboros.config import get_review_models, review_model_uses_local
 from ouroboros.llm import LLMClient
 from ouroboros.observability import new_call_id, persist_call, redact_projection
 from ouroboros.provider_models import provider_for_model
+from ouroboros.task_results import review_binding_hash
 # Everything below the seam. Re-exported here because the substrate is the
 # historical import site for the api_chat prompt renderers; `review_execution`
 # owns them now and must never import this module back.
@@ -393,9 +394,7 @@ def build_review_binding(
         "evidence_revision": evidence_revision,
         "fence_hash": fence_hash,
     }
-    binding_hash = hashlib.sha256(
-        json.dumps(binding_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    binding_hash = review_binding_hash(**binding_payload)
     return {
         **binding_payload,
         "binding_hash": binding_hash,

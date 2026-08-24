@@ -78,16 +78,31 @@ def test_acceptance_panel_persists_timing_to_canonical_root(tmp_path, monkeypatc
     import ouroboros.loop as loop
     import ouroboros.review_evidence as evidence_mod
     import ouroboros.review_substrate as substrate
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from ouroboros.tools import review_helpers
 
     canonical = tmp_path / "canonical"
     child = tmp_path / "child"
     tool_ctx = SimpleNamespace(
+        task_id="root-timing",
         drive_root=child,
         budget_drive_root=str(canonical),
-        task_metadata={"budget_drive_root": str(canonical)},
+        task_metadata={
+            "root_task_id": "root-timing",
+            "delegation_role": "root",
+            "budget_drive_root": str(canonical),
+        },
+    )
+    write_task_result(
+        canonical, "root-timing", STATUS_RUNNING,
+        root_task_id="root-timing", delegation_role="root",
     )
     monkeypatch.setattr(evidence_mod, "build_task_acceptance_evidence", lambda *_a, **_k: {})
-    monkeypatch.setattr(substrate, "reviewer_slots", lambda **_k: [])
+    monkeypatch.setattr(
+        substrate, "reviewer_slots",
+        lambda **_k: [SimpleNamespace(model="test-reviewer")],
+    )
+    monkeypatch.setattr(review_helpers, "review_wave_budget_gate", lambda *_a, **_k: None)
     monkeypatch.setattr(
         substrate,
         "run_review_request",
@@ -106,6 +121,9 @@ def test_acceptance_panel_persists_timing_to_canonical_root(tmp_path, monkeypatc
         subtree_statuses=[],
         budget_profile={},
         passes_done=2,
+        review_binding=substrate.build_review_binding(
+            candidate="deliverable", evidence={}, fence_token_or_state="timing-test",
+        ),
     )
 
     loop._execute_task_acceptance_panel(ctx)
@@ -584,5 +602,4 @@ def test_clean_acceptance_requires_per_criterion_evidence(tmp_path):
         request, slots=slots, drive_root=tmp_path, llm=_CriterionLLM(structured=True),
     )
     assert clean.aggregate_signal == "PASS"
-
 
