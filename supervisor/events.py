@@ -3104,6 +3104,7 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
         elif outcome is None:
             outcome = promote_chat_to_task(evt, ctx)
         outcome = outcome if isinstance(outcome, dict) else {"status": "scheduled"}
+        admitted_task_contract = outcome.pop("_admitted_task_contract", None)
         if str(outcome.get("status") or "") == "scheduled":
             title = str(evt.get("title") or "").strip()[:80]
             receipt = _emit_routing_receipt(
@@ -3125,6 +3126,9 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
                 ctx.DRIVE_ROOT,
                 str(outcome.get("task_id") or task_id),
                 STATUS_SCHEDULED,
+                root_task_id=str(outcome.get("task_id") or task_id),
+                delegation_role="root",
+                task_contract=admitted_task_contract,
                 project_id=str(outcome.get("project_id") or evt.get("project_id") or ""),
                 description=str(evt.get("objective") or ""),
                 expected_output=str(evt.get("expected_output") or ""),

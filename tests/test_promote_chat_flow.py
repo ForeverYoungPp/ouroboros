@@ -1320,7 +1320,11 @@ def test_promoted_skill_repair_is_canonical_confined_managed_task(tmp_path, monk
         },
     }, ctx)
 
-    assert result == {"status": "scheduled", "task_id": "repair01"}
+    assert {key: result[key] for key in ("status", "task_id")} == {
+        "status": "scheduled",
+        "task_id": "repair01",
+    }
+    assert result["_admitted_task_contract"] == enqueued[0]["task_contract"]
     assert len(enqueued) == 1
     task = enqueued[0]
     assert task.get("_ephemeral_turn") is None

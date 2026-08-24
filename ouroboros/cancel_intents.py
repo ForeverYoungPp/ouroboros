@@ -918,7 +918,9 @@ def cancel_pending(drive_root: Any, task_id: str, *, strict: bool = False) -> bo
     try:
         from ouroboros.task_results import STATUS_CANCEL_REQUESTED, load_task_result
 
-        status = str((load_task_result(drive_root, task_id) or {}).get("status") or "")
+        status = str(
+            (load_task_result(drive_root, task_id, strict=strict) or {}).get("status") or ""
+        )
         return status == STATUS_CANCEL_REQUESTED
     except Exception:
         if strict:

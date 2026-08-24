@@ -645,6 +645,22 @@ def _relocate_promoted_attachments(task: dict, tid: str, manifest: list[dict]) -
         return False
 
 
+def _promoted_scheduled_outcome(task: dict, admitted: Any, tid: str) -> dict:
+    """Carry the exact admitted contract to the canonical result writer."""
+
+    admitted_contract = (
+        admitted.get("task_contract")
+        if isinstance(admitted, dict)
+        and isinstance(admitted.get("task_contract"), dict)
+        else task.get("task_contract")
+    )
+    return {
+        "status": "scheduled",
+        "task_id": tid,
+        "_admitted_task_contract": dict(admitted_contract or {}),
+    }
+
+
 def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     """Enqueue a first-class pooled owner task from a conversation-lane promote.
     The task carries the originating ``chat_id`` (its live card and replies
@@ -934,7 +950,9 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     # message seam (tests/test_heartbeat_presentation.py). While it is still
     # PENDING the Dashboard Activity row cancels it; the card action appears once
     # it starts.
-    outcome = {"status": "scheduled", "task_id": tid}
+    # A project root may execute from a forked child drive.  Its budget-root
+    # result therefore receives this admitted contract before worker startup.
+    outcome = _promoted_scheduled_outcome(task, admitted, tid)
     if attachment_manifest:
         outcome["attachment_manifest"] = [dict(row) for row in attachment_manifest]
     if effective_pid:

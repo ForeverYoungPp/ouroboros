@@ -354,6 +354,11 @@ def test_route_to_project_waits_for_same_durable_admission(monkeypatch, tmp_path
     import supervisor.workers as workers
     from ouroboros.projects_registry import create_project
     from ouroboros.project_dialogue import chat_annotation_receipt
+    from ouroboros.task_results import (
+        claim_task_acceptance_review_cycle,
+        load_task_result,
+        review_binding_hash,
+    )
     from ouroboros.tools import control
     from supervisor.events import _handle_promote_chat_to_task
 
@@ -364,8 +369,13 @@ def test_route_to_project_waits_for_same_durable_admission(monkeypatch, tmp_path
     pending = []
 
     def enqueue(task):
-        pending.append(dict(task))
-        return task
+        admitted = dict(task)
+        admitted["task_contract"] = {
+            **task["task_contract"],
+            "source": "queue_admitted_test",
+        }
+        pending.append(admitted)
+        return admitted
 
     handler_ctx = types.SimpleNamespace(
         DRIVE_ROOT=tmp_path,
@@ -400,6 +410,32 @@ def test_route_to_project_waits_for_same_durable_admission(monkeypatch, tmp_path
         assert outcome["status"] == "scheduled"
         assert text.startswith("✉️ Routed to project 'Racer'")
         assert "durably scheduled" in text
+        task = next(row for row in pending if row["id"] == event["task_id"])
+        assert task["budget_drive_root"] == str(tmp_path)
+        assert task["drive_root"] != str(tmp_path)
+        stored = load_task_result(tmp_path, event["task_id"])
+        assert stored["root_task_id"] == event["task_id"]
+        assert stored["delegation_role"] == "root"
+        assert stored["task_contract"] == task["task_contract"]
+        candidate_hash = "a" * 64
+        evidence_revision = "b" * 64
+        fence_hash = "c" * 64
+        claim = claim_task_acceptance_review_cycle(
+            tmp_path,
+            event["task_id"],
+            {
+                "binding_hash": review_binding_hash(
+                    candidate_hash=candidate_hash,
+                    evidence_revision=evidence_revision,
+                    fence_hash=fence_hash,
+                ),
+                "candidate_hash": candidate_hash,
+                "evidence_revision": evidence_revision,
+                "fence_hash": fence_hash,
+            },
+            claimed_by_task_id=event["task_id"],
+        )
+        assert claim["status"] == "claimed"
         receipt = chat_annotation_receipt(
             tmp_path, "route-owner-1", event["routing_token"]
         )

@@ -273,6 +273,36 @@ def test_empty_root_contract_cannot_mint_acceptance_wallet(tmp_path):
         )
 
 
+def test_corrupt_claimant_cancel_latch_cannot_spend_root_wallet(tmp_path):
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.task_results import (
+        STATUS_RUNNING, claim_task_acceptance_review_cycle, review_binding_hash,
+        write_task_result,
+    )
+
+    write_task_result(
+        tmp_path, "root-corrupt-claimant", STATUS_RUNNING,
+        root_task_id="root-corrupt-claimant", task_contract=build_task_contract({}),
+    )
+    root_path = tmp_path / "task_results" / "root-corrupt-claimant.json"
+    before = root_path.read_bytes()
+    claimant_path = tmp_path / "task_results" / "corrupt-claimant.json"
+    claimant_path.write_text("{", encoding="utf-8")
+    fields = {
+        "candidate_hash": "b" * 64,
+        "evidence_revision": "c" * 64,
+        "fence_hash": "d" * 64,
+    }
+    with pytest.raises(ValueError, match="task result authority is unreadable"):
+        claim_task_acceptance_review_cycle(
+            tmp_path, "root-corrupt-claimant",
+            {**fields, "binding_hash": review_binding_hash(**fields)},
+            claimed_by_task_id="corrupt-claimant",
+        )
+    assert root_path.read_bytes() == before
+    assert claimant_path.read_text(encoding="utf-8") == "{"
+
+
 def test_improvement_pass_gate_and_rails_follow_shared_cap(monkeypatch):
     snapshot = task_pacing.BudgetSnapshot(has_deadline=False)
     profile = normalize_budget_profile({})
