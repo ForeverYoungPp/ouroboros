@@ -122,7 +122,13 @@ def structured_reviewer_slots_present() -> bool:
 
 
 def _valid_effort(value: Any, where: str) -> str:
-    effort = str(value or "").strip().lower()
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} effort must be a string"
+        )
+    effort = value.strip().lower()
     if not effort:
         return ""
     from ouroboros.config import EFFORT_SCALE
@@ -138,7 +144,17 @@ def _valid_effort(value: Any, where: str) -> str:
 def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
     if not isinstance(row, dict):
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: {where} is not an object")
-    slot_id = str(row.get("slot_id") or "").strip()
+    unknown = sorted(set(row) - {"slot_id", "route", "effort"})
+    if unknown:
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} has unknown keys: {unknown}"
+        )
+    raw_slot_id = row.get("slot_id")
+    if not isinstance(raw_slot_id, str):
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} slot_id must be a string"
+        )
+    slot_id = raw_slot_id.strip()
     if not slot_id or len(slot_id) > _SLOT_ID_MAX_CHARS:
         raise ValueError(
             f"{REVIEWER_SLOTS_ENV}: {where} needs a stable non-empty slot_id "
@@ -157,6 +173,9 @@ def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
             ROUTE_KIND_SESSION: SHARED_ROUTE_KIND_SESSION,
         },
         pin_key="profile_id",
+        reject_unknown=True,
+        strict_strings=True,
+        reject_api_pin=True,
     )
     kind = ROUTE_KIND_SESSION if route.is_session else ROUTE_KIND_API
     effort = _valid_effort(row.get("effort"), where)
@@ -176,6 +195,19 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
         return AdvisorySlotConfig()
     if not isinstance(raw, dict):
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory must be an object")
+    unknown = sorted(set(raw) - {"enabled", "route", "kind", "target_id", "effort"})
+    if unknown:
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: advisory has unknown keys: {unknown}"
+        )
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory enabled must be a boolean")
+    for key in ("kind", "target_id"):
+        if key in raw and not isinstance(raw[key], str):
+            raise ValueError(
+                f"{REVIEWER_SLOTS_ENV}: advisory {key} must be a string"
+            )
     route = raw.get("route")
     if route is not None and not isinstance(route, dict):
         # Same typed refusal _parse_slot gives (:150). Without it a non-dict
@@ -185,37 +217,33 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
         # reviewer_slot_config_error's callers.
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory route must be an object "
                          "{kind, target_id}")
-    route = route or {}
-    kind = str(route.get("kind") or raw.get("kind") or "api").strip().lower()
-    if kind in ("", "api", "api_chat"):
-        kind = "api"
-    elif kind != ROUTE_KIND_SESSION:
-        raise ValueError(
-            f"{REVIEWER_SLOTS_ENV}: advisory names an unknown route kind {kind!r}; "
-            "valid: api, agent_session"
-        )
+    route_payload = dict(route or {})
+    if "kind" not in route_payload:
+        route_payload["kind"] = raw.get("kind") or "api"
+    if "target_id" not in route_payload:
+        route_payload["target_id"] = raw.get("target_id") or ""
     shared_route = parse_route_spec(
-        {
-            "kind": kind,
-            "target_id": route.get("target_id") or raw.get("target_id") or "",
-            "profile_id": route.get("profile_id") or "",
-        },
+        route_payload,
         setting=REVIEWER_SLOTS_ENV,
         where="advisory",
         kind_aliases={
             "api": SHARED_ROUTE_KIND_API,
+            ROUTE_KIND_API: SHARED_ROUTE_KIND_API,
             ROUTE_KIND_SESSION: SHARED_ROUTE_KIND_SESSION,
         },
         pin_key="profile_id",
         allow_empty_target=True,
+        reject_unknown=True,
+        strict_strings=True,
+        reject_api_pin=True,
     )
     effort = _valid_effort(raw.get("effort"), "advisory") or "low"
     validate_compound_session_effort(
         shared_route, effort, setting=REVIEWER_SLOTS_ENV, where="advisory",
     )
     return AdvisorySlotConfig(
-        enabled=bool(raw.get("enabled", True)),
-        kind=kind,
+        enabled=enabled,
+        kind=ROUTE_KIND_SESSION if shared_route.is_session else "api",
         target_id=shared_route.target_id,
         effort=effort,
         profile_id=shared_route.credential_profile_id,

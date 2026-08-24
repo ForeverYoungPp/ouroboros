@@ -109,6 +109,98 @@ def test_non_json_refuses_typed():
         parse_reviewer_slots("{nope")
 
 
+@pytest.mark.parametrize("mutate,fragment", [
+    (lambda row: row.__setitem__("effrot", "low"), "unknown keys"),
+    (lambda row: row.__setitem__("slot_id", ["t_api"]), "slot_id must be a string"),
+    (lambda row: row.__setitem__("effort", 1), "effort must be a string"),
+    (lambda row: row["route"].__setitem__("kind", ["api_chat"]), "route.kind must be a string"),
+    (lambda row: row["route"].__setitem__("target_id", ["model"]), "route.target_id must be a string"),
+    (lambda row: row["route"].__setitem__("profile_id", ["profile"]), "route.profile_id must be a string"),
+    (lambda row: row["route"].__setitem__("typo", True), "route has unknown keys"),
+    (lambda row: row["route"].__setitem__("profile_id", "api-profile"), "meaningful only for agent_session"),
+], ids=[
+    "unknown-row-key", "slot-id-type", "effort-type", "route-kind-type",
+    "route-target-type", "route-profile-type", "unknown-route-key", "api-profile-pin",
+])
+def test_structured_rows_never_coerce_or_ignore_malformed_fields(mutate, fragment):
+    payload = json.loads(json.dumps(_STRUCTURED))
+    row = payload["triad"][0]
+    mutate(row)
+    with pytest.raises(ValueError) as err:
+        parse_reviewer_slots(json.dumps(payload))
+    assert fragment in str(err.value)
+
+
+@pytest.mark.parametrize("advisory,fragment", [
+    ({"enabled": "false"}, "enabled must be a boolean"),
+    ({"enabled": True, "effrot": "low"}, "unknown keys"),
+    ({"enabled": True, "effort": 1}, "effort must be a string"),
+    ({"enabled": True, "kind": ["api"]}, "kind must be a string"),
+    ({"enabled": True, "target_id": ["model"]}, "target_id must be a string"),
+    ({"enabled": True, "route": {"kind": "api", "target_id": "", "typo": True}},
+     "route has unknown keys"),
+    ({"enabled": True, "route": {"kind": ["api"], "target_id": ""}},
+     "route.kind must be a string"),
+    ({"enabled": True, "route": {"kind": "api", "target_id": ["model"]}},
+     "route.target_id must be a string"),
+    ({"enabled": True, "route": {"kind": "agent_session", "target_id": "codex",
+                                   "profile_id": ["profile"]}},
+     "route.profile_id must be a string"),
+    ({"enabled": True, "route": {"kind": "api", "target_id": "",
+                                   "profile_id": "api-profile"}},
+     "meaningful only for agent_session"),
+], ids=[
+    "enabled-type", "unknown-advisory-key", "effort-type", "legacy-kind-type",
+    "legacy-target-type", "unknown-route-key", "route-kind-type", "route-target-type",
+    "route-profile-type", "api-profile-pin",
+])
+def test_advisory_never_coerces_or_ignores_malformed_fields(advisory, fragment):
+    payload = json.loads(json.dumps(_STRUCTURED))
+    payload["advisory"] = advisory
+    with pytest.raises(ValueError) as err:
+        parse_reviewer_slots(json.dumps(payload))
+    assert fragment in str(err.value)
+
+
+def test_advisory_keeps_recognized_legacy_shape_and_empty_api_target():
+    payload = json.loads(json.dumps(_STRUCTURED))
+    payload["advisory"] = {
+        "enabled": True,
+        "kind": "agent_session",
+        "target_id": "codex=claude-fable-5",
+        "effort": "high",
+    }
+    advisory = parse_reviewer_slots(json.dumps(payload)).advisory
+    assert (advisory.kind, advisory.target_id, advisory.effort) == (
+        "agent_session", "codex=claude-fable-5", "high",
+    )
+
+    payload["advisory"] = {"enabled": True, "route": {"kind": "api"}}
+    advisory = parse_reviewer_slots(json.dumps(payload)).advisory
+    assert (advisory.kind, advisory.target_id, advisory.effort) == ("api", "", "low")
+
+
+def test_settings_save_refuses_a_malformed_row_before_persistence():
+    from starlette.requests import Request
+
+    from ouroboros.gateway.settings import _api_settings_post_locked
+
+    payload = json.loads(json.dumps(_STRUCTURED))
+    payload["triad"][0]["effrot"] = "low"
+    request = Request({
+        "type": "http", "method": "POST", "path": "/api/settings",
+        "headers": [], "query_string": b"",
+    })
+    response = _api_settings_post_locked(
+        request,
+        {REVIEWER_SLOTS_ENV: json.dumps(payload)},
+    )
+    body = json.loads(response.body)
+    assert response.status_code == 400
+    assert body["saved"] is False
+    assert "triad[0] has unknown keys" in body["error"]
+
+
 # ---------------------------------------------------------------------------
 # reviewer_slot_config_error (#116): the loud-check facade for plan/skill review.
 # ---------------------------------------------------------------------------

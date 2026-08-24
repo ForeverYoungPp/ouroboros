@@ -98,10 +98,10 @@ def _effort(raw: Any, where: str) -> str:
 def _validate_session_target(route: RouteSpec, where: str) -> None:
     """Validate the Available-subagent ``harness[=model]`` public grammar.
 
-    Reviewer rows retain their established permissive parser.  New task actors
-    are stricter because their target is snapshotted as executable intent: a
-    legacy ``:effort`` suffix, an empty side of ``=``, or multiple separators
-    would otherwise be canonically persisted and fail only after dispatch.
+    Both actor and reviewer rows use the shared strict route shape. Task actors
+    additionally validate executable target grammar: a legacy ``:effort``
+    suffix, an empty side of ``=``, or multiple separators would otherwise be
+    canonically persisted and fail only after dispatch.
     """
     if not route.is_session:
         return
