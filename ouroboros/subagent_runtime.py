@@ -579,7 +579,18 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
     """Shared exact-start primitive for actor-first sessions and root-direct calls."""
 
     options = dict(spec or {})
+    retry_token = str(options.get("retry_of") or "").strip()
     bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+    recovering = False
+    if retry_token and isinstance(bootstrap, dict):
+        from ouroboros import delegate_custody as custody
+
+        invocation = custody.invocation_record(custody.custody_root(ctx), retry_token) or {}
+        recovering = (
+            str(invocation.get("state") or "") == "pending"
+            and str(invocation.get("task_id") or "")
+            == str(getattr(ctx, "task_id", "") or "")
+        )
     if isinstance(bootstrap, dict) and not bool(bootstrap.get("zero_run_receipt_recorded")):
         from ouroboros.subagent_bootstrap import _durable_zero_run_receipt
 
@@ -596,7 +607,7 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
             })
             bootstrap.pop("zero_run_evidence_status", None)
             bootstrap.pop("zero_run_evidence_gaps", None)
-        elif zero_run_evidence_gaps:
+        elif zero_run_evidence_gaps and not recovering:
             bootstrap.update({
                 "zero_run_evidence_status": "unknown",
                 "zero_run_evidence_gaps": sorted(zero_run_evidence_gaps),
@@ -613,7 +624,8 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
             zero_run_decision=str(bootstrap.get("zero_run_decision") or ""),
         )
     if (
-        isinstance(bootstrap, dict)
+        not recovering
+        and isinstance(bootstrap, dict)
         and str(bootstrap.get("zero_run_evidence_status") or "") == "unknown"
     ):
         from ouroboros.delegate_shared import _fail

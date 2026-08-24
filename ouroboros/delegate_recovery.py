@@ -285,6 +285,20 @@ def _holder_value(holder: Any, name: str, *, pending: bool) -> str:
     )
 
 
+def _run_probe_error(run_id: str) -> str:
+    gateway = None
+    try:
+        from ouroboros.claudexor_daemon import ensure_owned_gateway
+        gateway = ensure_owned_gateway()
+        gateway.get_run(run_id)
+        return ""
+    except Exception as exc:
+        return type(exc).__name__
+    finally:
+        if gateway is not None:  # pragma: no branch - paired with the acquisition above
+            gateway.close()
+
+
 def _successor_binding_mismatch(row: Mapping[str, Any], task: Mapping[str, Any]) -> str:
     """Re-prove task authority plus the exact leaf binding reserved at handoff.
 
@@ -859,18 +873,9 @@ def adopt_handoff(ctx: Any, task: Mapping[str, Any]) -> dict[str, Any]:
         if not _holder_matches(row, run, pending=False):
             veto_handoff(drive, task_id, "run_binding_mismatch")
             return {"status": "recovery_required", "reason": "run_binding_mismatch"}
-        gateway = None
-        try:
-            from ouroboros.claudexor_daemon import ensure_owned_gateway
-
-            gateway = ensure_owned_gateway()
-            gateway.get_run(run.run_id)
-        except Exception as exc:
-            veto_handoff(drive, task_id, f"run_unprovable:{type(exc).__name__}")
+        if probe_error := _run_probe_error(run.run_id):
+            veto_handoff(drive, task_id, f"run_unprovable:{probe_error}")
             return {"status": "recovery_required", "reason": "run_unprovable"}
-        finally:
-            if gateway is not None:
-                gateway.close()
         run_id = run.run_id
     else:
         pending_id = str(pending[0].get("invocation_id") or "")
@@ -878,7 +883,6 @@ def adopt_handoff(ctx: Any, task: Mapping[str, Any]) -> dict[str, Any]:
             veto_handoff(drive, task_id, "invocation_binding_mismatch")
             return {"status": "recovery_required", "reason": "invocation_binding_mismatch"}
         from ouroboros.tools.delegate import exact_start
-
         request = pending[0].get("request") if isinstance(pending[0], dict) else None
         replay_prompt = request.get("prompt") if isinstance(request, dict) else None
         if not isinstance(replay_prompt, str) or not replay_prompt:
@@ -888,15 +892,61 @@ def adopt_handoff(ctx: Any, task: Mapping[str, Any]) -> dict[str, Any]:
         source_request = pending[0].get("work_order_source_request")
         if isinstance(source_request, dict) and source_request:
             retry_spec["work_order_source_request"] = source_request
+        # Consume the reservation before transport: RUNNING protects this owner;
+        # a later crash can mint a fresh handoff from durable pending/run custody.
+        row.update({"status": "adopted", "adopted_at": utc_now_iso()})
+        try:
+            _write(drive, row)
+        except Exception:
+            return {"status": "recovery_required", "reason": "adoption_record_unwritable"}
         result = exact_start(ctx, replay_prompt, retry_spec)
         try:
             parsed = json.loads(result)
         except (TypeError, ValueError):
             parsed = {}
-        if str(parsed.get("status") or "") != "started":
-            veto_handoff(drive, task_id, "pending_recovery_failed")
-            return {"status": "recovery_required", "reason": "pending_recovery_failed", "detail": parsed}
         run_id = str(parsed.get("run_id") or "")
+        if str(parsed.get("status") or "") != "started" or not run_id:
+            # Durable fate, not transport prose, decides whether this exact POST
+            # remains pending, failed definitely, or became an adoptable run.
+            # Missing/ambiguous evidence stays fail-closed without a false pending id.
+            fate = custody.invocation_record(drive, pending_id) or {}
+            fate_state = str(fate.get("state") or "unknown")
+            if fate_state == "pending":
+                return {
+                    "status": "recovery_required", "reason": "pending_recovery_deferred",
+                    "pending_invocation_id": pending_id,
+                    "detail": parsed,
+                }
+            if fate_state == "failed_definite":
+                veto_handoff(drive, task_id, "pending_recovery_definitely_refused")
+                return {
+                    "status": "recovery_required",
+                    "reason": "pending_recovery_definitely_refused", "detail": parsed,
+                }
+            if fate_state == "started":
+                run_id = str(fate.get("run_id") or "")
+                started = custody.replay(drive).get(run_id)
+                rebound = {**row, "run_id": run_id}
+                if (
+                    started is None
+                    or str(started.invocation_id or "") != pending_id
+                    or not _holder_matches(rebound, started, pending=False)
+                ):
+                    run_id = ""
+                elif not started.settled and _run_probe_error(run_id):
+                    return {
+                        "status": "recovery_required",
+                        "reason": "pending_recovery_run_unprovable", "run_id": run_id,
+                        "detail": parsed,
+                    }
+            if not run_id:
+                return {
+                    "status": "recovery_required",
+                    "reason": "pending_recovery_state_unprovable",
+                    "invocation_id": pending_id,
+                    "invocation_state": fate_state,
+                    "detail": parsed,
+                }
     try:
         _restore_wait_checkpoint(drive, {**row, "run_id": run_id})
     except Exception:

@@ -169,15 +169,12 @@ def _host_instructions(authority: "DelegatedRunShape", assignment: str = "",
 
 
 def _build_start_instructions(
-    authority: "DelegatedRunShape",
-    assignment: str = "",
-    payload_skill: str = "",
+    authority: "DelegatedRunShape", assignment: str = "", payload_skill: str = "",
     coordination_context: str = "",
 ) -> tuple[str, str]:
     """Build the bounded instruction field for a fresh physical start."""
-    text = _host_instructions(authority, assignment, payload_skill)
     return append_coordination_context(
-        text, coordination_context,
+        _host_instructions(authority, assignment, payload_skill), coordination_context,
         instruction_budget_chars=_ASSIGNMENT_FIELD_CHARS,
     )
 
