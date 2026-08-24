@@ -137,8 +137,18 @@ def test_widgets_frame_geometry_and_teardown_contract():
     assert "height: var(--widget-frame-height, 320px);" in style
     assert "type: 'ouro-widget-resize'" in source
     assert "new ResizeObserver(report)" in source
-    assert "box.bottom - bodyTop" in source
+    assert "box.bottom - bodyTop + bodyBottomSpacing" in source
     assert "fixedViewportBody" in source
+    assert 'scrolling="no"' not in source
+    assert "syncModuleFrameScrolling" not in source
+    overflow_rule = source.split("verticalOverflowStyle.textContent = ", 1)[1].split("';", 1)[0]
+    assert "overflow-y: hidden !important" in overflow_rule
+    assert "overflow-x" not in overflow_rule
+    assert source.index("setVerticalOverflowSuppressed(true);") < source.index("const report = () =>")
+    assert "setVerticalOverflowSuppressed(outerHeight <" in source
+    assert "setVerticalOverflowSuppressed(false);" in source
+    assert "WIDGET_FRAME_DEFAULT_HEIGHT,\n                maxHeight,\n                WIDGET_FRAME_BORDER_RESERVE," in source
+    assert source.index("<script>${resizeBridge}</script>") < source.index("<script>${escapeScript(moduleSource)}</script>")
     assert "ouro-widget-dispose" in source
     assert "if (iframe?.parentNode === mount) iframe.remove();" in source
     assert "pendingRequests.forEach((controller) => controller.abort());" in source

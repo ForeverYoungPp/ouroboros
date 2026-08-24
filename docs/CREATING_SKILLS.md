@@ -687,9 +687,19 @@ module-only `max_height` lowers the ceiling. A fixed `height` disables
 auto-growth. Legacy route iframes accept explicit `height` only because the
 host cannot inspect their opaque document. The parent owns iframe removal and
 the module bootstrap rejects pending fetch promises on disposal, so module
-code must not invent a second resize or teardown protocol.
+code must not invent a second resize, vertical-scrolling, or teardown protocol.
 These geometry keys are valid only for framed `iframe` and `module` renders;
 declarative renders remain content-driven and reject them.
+
+For auto-height module CSS, prefer one owner of padding and box geometry between
+`body` and `#root`, and choose `border-box` deliberately. Nested percentage
+`min-height`/padding owners, especially with `overflow-x: hidden`, can compute
+`overflow-y: auto` and feed scrollbar width back into wrapping. This is author
+guidance, not a restriction: legal width-sensitive CSS remains supported by the
+host-owned resize contract. For auto-height modules, the host bootstrap
+suppresses only document-viewport `overflow-y` below the ceiling and releases
+it at the ceiling; horizontal document overflow remains author-controlled and
+reachable.
 
 For everything else, prefer declarative components (`form`, `action`, `poll`,
 `subscription`, `stream`, `table`, `chart`, `markdown`, `json`, `kv`, `status`,
