@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -139,9 +140,7 @@ def test_wave_9_and_65_remain_exactly_readable_after_hot_trimming(tmp_path) -> N
     for index in range(1, 66):
         fingerprint = f"{index:064x}"
         exact = {
-            "schema_version": 1,
-            "cycle_index": index,
-            "request_fingerprint": fingerprint,
+            "schema_version": 1, "cycle_index": index, "request_fingerprint": fingerprint,
             "findings": [{"id": f"tail-{index}", "summary": "x" * 5000}],
             "reviewer_outputs": [{"slot_id": "s1", "text": f"exact-wave-{index}"}],
         }
@@ -188,15 +187,15 @@ def test_compacted_wave_keeps_the_full_blocking_count() -> None:
 
 
 @pytest.mark.parametrize("current_ids", [("s1", "s2"), ("s1", "s2", "s3", "s4")])
-def test_continuation_refuses_a_changed_reviewer_assignment_set(tmp_path, current_ids) -> None:
+def test_continuation_roster_change_degrades_to_fresh_dispatch(tmp_path, current_ids) -> None:
+    """A changed reviewer roster is a cache miss, not a validity event: the wave
+    re-dispatches fresh with the self-contained packet and the typed cause."""
     from ouroboros.review_substrate import ReviewSlot
     from ouroboros.tools.plan_review_artifacts import continuation_inputs, persist_wave
 
     prior_slots = [ReviewSlot(slot_id=sid, model=f"model-{sid}") for sid in ("s1", "s2", "s3")]
     exact = {
-        "schema_version": 1,
-        "cycle_index": 1,
-        "request_fingerprint": "b" * 64,
+        "schema_version": 1, "cycle_index": 1, "request_fingerprint": "b" * 64,
         "slots": [
             {
                 "slot_id": slot.slot_id, "model": slot.model, "effort": slot.effort,
@@ -216,15 +215,19 @@ def test_continuation_refuses_a_changed_reviewer_assignment_set(tmp_path, curren
     ref = persist_wave(tmp_path, "task-1", exact)
     current = [ReviewSlot(slot_id=sid, model=f"model-{sid}") for sid in current_ids]
 
-    _slots, messages, threads, error = continuation_inputs(
+    slots_out, messages, threads, error, restarted = continuation_inputs(
         tmp_path, "task-1", {"wave_artifact": ref}, current, user_content="continue",
     )
 
-    assert error == "prior_reviewer_assignment_set_changed"
+    assert error is None
+    assert restarted == "prior_reviewer_assignment_set_changed"
     assert messages == {} and threads == {}
+    assert slots_out == current  # exactly as configured, never rebound to prior rows
 
 
-def test_continuation_repins_the_prior_applied_session_profile(tmp_path) -> None:
+def test_continuation_uses_the_currently_configured_slot_pin(tmp_path) -> None:
+    """The prior wave's applied account is telemetry, not a sticky repin: the
+    currently configured slot pin (or empty = rotation) always applies."""
     from ouroboros.review_substrate import ReviewSlot
     from ouroboros.tools.plan_review_artifacts import continuation_inputs, persist_wave, slot_row
 
@@ -233,9 +236,7 @@ def test_continuation_repins_the_prior_applied_session_profile(tmp_path) -> None
         session_target="claude=fable", session_profile="profile-a",
     )
     exact = {
-        "schema_version": 1,
-        "cycle_index": 1,
-        "request_fingerprint": "c" * 64,
+        "schema_version": 1, "cycle_index": 1, "request_fingerprint": "c" * 64,
         "slots": [slot_row(prior)],
         "reviewer_outputs": [{
             "slot_id": "s1", "review_thread_id": "thread-1",
@@ -244,13 +245,63 @@ def test_continuation_repins_the_prior_applied_session_profile(tmp_path) -> None
     }
     ref = persist_wave(tmp_path, "task-1", exact)
 
-    rebound, _messages, threads, error = continuation_inputs(
+    rebound, _messages, threads, error, restarted = continuation_inputs(
         tmp_path, "task-1", {"wave_artifact": ref}, [prior], user_content="continue",
     )
 
-    assert error is None
+    assert error is None and restarted == ""
     assert threads == {"s1": "thread-1"}
-    assert rebound[0].session_profile == "profile-b"
+    assert rebound[0].session_profile == "profile-a"
+
+
+def test_agent_session_continuation_restarts_fresh_when_prior_thread_is_missing(tmp_path) -> None:
+    from ouroboros.review_substrate import ReviewSlot
+    from ouroboros.tools.plan_review_artifacts import continuation_inputs, persist_wave, slot_row
+
+    slot = ReviewSlot(
+        slot_id="s1", model="claude=fable", route="agent_session",
+        session_target="claude=fable", session_profile="",
+    )
+    exact = {
+        "schema_version": 1, "cycle_index": 1, "request_fingerprint": "e" * 64,
+        "slots": [slot_row(slot)],
+        "reviewer_outputs": [{"slot_id": "s1", "text": "need evidence"}],
+    }
+    ref = persist_wave(tmp_path, "task-1", exact)
+
+    slots_out, messages, threads, error, restarted = continuation_inputs(
+        tmp_path, "task-1", {"wave_artifact": ref}, [slot], user_content="continue",
+    )
+
+    assert error is None
+    assert restarted == "prior_review_thread_missing:s1"
+    assert messages == {} and threads == {}
+    assert slots_out == [slot]
+
+
+def test_exact_wave_custody_gaps_stay_fail_closed(tmp_path) -> None:
+    """The dispositions custody chain keeps its refusals: a missing or unreadable
+    prior exact wave is never silently degraded to a fresh dispatch."""
+    from ouroboros.review_substrate import ReviewSlot
+    from ouroboros.tools.plan_review_artifacts import continuation_inputs
+
+    slot = ReviewSlot(slot_id="s1", model="model-s1")
+
+    for previous, expected in (
+        (None, "prior_exact_wave_missing"),
+        ({"paid": True}, "prior_exact_wave_ref_missing"),
+    ):
+        _slots, messages, threads, error, restarted = continuation_inputs(
+            tmp_path, "task-1", previous, [slot], user_content="continue",
+        )
+        assert error == expected and restarted == ""
+        assert messages == {} and threads == {}
+
+    ref = {"root": "artifact_store", "path": "missing-wave.json", "bytes": 3, "sha256": "0" * 64}
+    _slots, _messages, _threads, error, restarted = continuation_inputs(
+        tmp_path, "task-1", {"wave_artifact": ref}, [slot], user_content="continue",
+    )
+    assert str(error or "").startswith("prior_exact_wave_unreadable:") and restarted == ""
 
 
 def test_api_chat_continuation_uses_exact_slot_transcript() -> None:
@@ -281,7 +332,7 @@ def test_api_chat_continuation_uses_exact_slot_transcript() -> None:
     "prior_messages",
     [[], [{}], [{"role": "user"}], [{"role": "", "content": "prior"}]],
 )
-def test_api_chat_continuation_refuses_partial_or_invalid_transcript(
+def test_api_chat_continuation_restarts_fresh_on_invalid_transcript(
     tmp_path, prior_messages,
 ) -> None:
     from ouroboros.review_substrate import ReviewSlot
@@ -289,9 +340,7 @@ def test_api_chat_continuation_refuses_partial_or_invalid_transcript(
 
     slot = ReviewSlot(slot_id="s1", model="model-s1")
     exact = {
-        "schema_version": 1,
-        "cycle_index": 1,
-        "request_fingerprint": "d" * 64,
+        "schema_version": 1, "cycle_index": 1, "request_fingerprint": "d" * 64,
         "slots": [slot_row(slot)],
         "reviewer_outputs": [{
             "slot_id": "s1", "request_messages": prior_messages, "text": "need evidence",
@@ -299,11 +348,12 @@ def test_api_chat_continuation_refuses_partial_or_invalid_transcript(
     }
     ref = persist_wave(tmp_path, "task-1", exact)
 
-    _slots, messages, threads, error = continuation_inputs(
+    _slots, messages, threads, error, restarted = continuation_inputs(
         tmp_path, "task-1", {"wave_artifact": ref}, [slot], user_content="continue",
     )
 
-    assert error == "prior_api_transcript_invalid:s1"
+    assert error is None
+    assert restarted == "prior_api_transcript_invalid:s1"
     assert messages == {} and threads == {}
 
 
@@ -511,45 +561,37 @@ def _rotation(seq, source, target, *, reason="vendor_limit_rejected"):
 
 
 @pytest.mark.parametrize(
-    ("applied", "rotations", "expected_status", "expected_reason"),
+    ("expected", "applied", "rotations", "expected_status", "expected_reason"),
     [
-        (
-            "profile-b", [_rotation(10, "profile-a", "profile-b")],
-            "typed_rotation", "typed_rotation_chain",
-        ),
-        (
-            "profile-c",
-            [_rotation(10, "profile-a", "profile-b"), _rotation(20, "profile-b", "profile-c")],
-            "typed_rotation", "typed_rotation_chain",
-        ),
-        (
-            "profile-c",
-            [_rotation(10, "profile-a", "profile-b"), _rotation(20, "profile-x", "profile-c")],
-            "cannot_verify", "rotation_chain_gap",
-        ),
-        (
-            "profile-c", [_rotation(10, "profile-a", "profile-b")],
-            "cannot_verify", "rotation_terminal_mismatch",
-        ),
-        (
-            "profile-c",
-            [_rotation(20, "profile-a", "profile-b"), _rotation(10, "profile-b", "profile-c")],
-            "cannot_verify", "rotation_event_order_invalid",
-        ),
-        (
-            "profile-b",
-            [{**_rotation(10, "profile-a", "profile-b"), "reason": ""}],
-            "cannot_verify", "rotation_event_malformed",
-        ),
+        ("profile-a", "profile-b", [_rotation(10, "profile-a", "profile-b")],
+         "typed_rotation", "typed_rotation_chain"),
+        ("profile-a", "profile-c",
+         [_rotation(10, "profile-a", "profile-b"), _rotation(20, "profile-b", "profile-c")],
+         "typed_rotation", "typed_rotation_chain"),
+        # FIX 2: a typed engine rotation on an UNPINNED slot (no recorded
+        # expectation) walks from the chain's own first hop — never chain-gap noise.
+        ("", "profile-b", [_rotation(10, "profile-a", "profile-b")],
+         "typed_rotation", "typed_rotation_chain"),
+        ("profile-a", "profile-c",
+         [_rotation(10, "profile-a", "profile-b"), _rotation(20, "profile-x", "profile-c")],
+         "cannot_verify", "rotation_chain_gap"),
+        ("profile-a", "profile-c", [_rotation(10, "profile-a", "profile-b")],
+         "cannot_verify", "rotation_terminal_mismatch"),
+        ("profile-a", "profile-c",
+         [_rotation(20, "profile-a", "profile-b"), _rotation(10, "profile-b", "profile-c")],
+         "cannot_verify", "rotation_event_order_invalid"),
+        ("profile-a", "profile-b", [{**_rotation(10, "profile-a", "profile-b"), "reason": ""}],
+         "cannot_verify", "rotation_event_malformed"),
     ],
-    ids=("one-hop", "multi-hop", "broken-gap", "terminal-mismatch", "reordered", "malformed"),
+    ids=("one-hop", "multi-hop", "unpinned-chain", "broken-gap", "terminal-mismatch",
+         "reordered", "malformed"),
 )
 def test_profile_continuity_folds_only_one_ordered_engine_rotation_chain(
-    applied, rotations, expected_status, expected_reason,
+    expected, applied, rotations, expected_status, expected_reason,
 ) -> None:
     from ouroboros.review_thread_continuity import profile_continuity_receipt
 
-    receipt = profile_continuity_receipt("profile-a", applied, rotations)
+    receipt = profile_continuity_receipt(expected, applied, rotations)
 
     assert receipt["status"] == expected_status
     assert receipt["verification_reason"] == expected_reason
@@ -560,6 +602,23 @@ def test_profile_continuity_folds_only_one_ordered_engine_rotation_chain(
         assert receipt["rotation_receipt"] == {}
 
 
+def _session_run(**overrides):
+    """One settled delegated-session payload; each test overrides its deltas."""
+    return {
+        "run_id": "run-2", "thread_id": "thread-1", "turn_id": "turn-2",
+        "thread_receipt": {"continuity": {"kind": "native_resume"}},
+        "text": "[]\nNO_FINDINGS", "conformance": "passed", "schema_asked": True,
+        "custody_durable": True, "settlement": "settled", "route_id": "claude",
+        "effective_route_ids": ["claude"], "model": "fable", "spend": 0.0,
+        "spend_estimated": False, "applied_profile": "profile-a", "applied_access": "readonly",
+        "auth_route_receipt": {
+            "requested": "subscription", "effective": "subscription",
+            "reason": "subscription_preferred", "profileId": "profile-a",
+        },
+        **overrides,
+    }
+
+
 def test_agent_session_continuation_passes_the_real_thread_id(monkeypatch, tmp_path) -> None:
     from ouroboros.review_execution import AgentSessionReviewExecutor, ReviewAssignment
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot
@@ -568,18 +627,10 @@ def test_agent_session_continuation_passes_the_real_thread_id(monkeypatch, tmp_p
 
     def fake_run(*, prompt, root, custody_drive, invocation):
         captured.update({"prompt": prompt, "root": root, "invocation": invocation})
-        return {
-            "run_id": "run-2", "thread_id": "thread-1", "turn_id": "turn-2",
-            "thread_receipt": {"continuity": {"kind": "native_resume"}},
-            "text": "[]\nNO_FINDINGS", "conformance": "passed", "schema_asked": True,
-            "custody_durable": True, "settlement": "settled", "route_id": "claude",
-            "effective_route_ids": ["claude"], "model": "fable", "spend": 0.0,
-            "spend_estimated": False, "applied_profile": "profile-a", "applied_access": "readonly",
-            "auth_route_receipt": {
-                "requested": "subscription", "effective": "subscription",
-                "reason": "quota_exhausted", "profileId": "profile-a",
-            },
-        }
+        return _session_run(auth_route_receipt={
+            "requested": "subscription", "effective": "subscription",
+            "reason": "quota_exhausted", "profileId": "profile-a",
+        })
 
     monkeypatch.setattr("ouroboros.review_execution.run_delegated_review_session", fake_run)
     request = ReviewRequest(
@@ -603,27 +654,31 @@ def test_agent_session_continuation_passes_the_real_thread_id(monkeypatch, tmp_p
     assert result.usage["auth_route_receipt"]["reason"] == "quota_exhausted"
 
 
-def test_agent_session_rejects_unexplained_applied_profile_drift(monkeypatch, tmp_path) -> None:
+DRIFT_FINDINGS = (
+    '[{"id": "f4", "class": "blocking", "breaks": "goal", "locator": "",'
+    ' "summary": "swarm delegation dropped", "recommendation": "restore it"}]'
+)
+
+
+def test_agent_session_preserves_paid_findings_under_profile_drift(monkeypatch, tmp_path) -> None:
+    """Profile continuity is PURE TELEMETRY: a real pinned mismatch keeps the paid
+    transcript whole and parseable — the receipt rides the usage record and the
+    actor row's disclosure, never a blanked artifact or a fabricated parse cause."""
     from ouroboros.review_execution import AgentSessionReviewExecutor, ReviewAssignment
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot
+    from ouroboros.tools.plan_review_runtime import plan_row_disclosures
+
+    receipt = {
+        "expected_profile": "profile-a", "applied_profile": "profile-b",
+        "status": "cannot_verify", "verification_reason": "unexplained_profile_drift",
+        "rotation_receipt": {},
+    }
 
     def fake_run(*, prompt, root, custody_drive, invocation):
-        return {
-            "run_id": "run-2", "thread_id": "thread-1", "turn_id": "turn-2",
-            "thread_receipt": {"continuity": {"kind": "native_resume"}},
-            "profile_continuity_receipt": {
-                "expected_profile": "profile-a", "applied_profile": "profile-b",
-                "status": "cannot_verify", "rotation_receipt": {},
-            },
-            "text": "[]\nNO_FINDINGS", "conformance": "passed", "schema_asked": True,
-            "custody_durable": True, "settlement": "settled", "route_id": "claude",
-            "effective_route_ids": ["claude"], "model": "fable", "spend": 0.0,
-            "spend_estimated": False, "applied_profile": "profile-b", "applied_access": "readonly",
-            "auth_route_receipt": {
-                "requested": "subscription", "effective": "subscription",
-                "reason": "subscription_preferred", "profileId": "profile-b",
-            },
-        }
+        return _session_run(
+            profile_continuity_receipt=dict(receipt), text=DRIFT_FINDINGS,
+            applied_profile="profile-b",
+        )
 
     monkeypatch.setattr("ouroboros.review_execution.run_delegated_review_session", fake_run)
     request = ReviewRequest(
@@ -641,13 +696,125 @@ def test_agent_session_rejects_unexplained_applied_profile_drift(monkeypatch, tm
         ReviewAssignment(request=request, slot=slot, custody_root=tmp_path)
     ).execute()
 
-    assert result.raw_text == ""
-    assert result.usage["profile_continuity_receipt"] == {
-        "expected_profile": "profile-a",
-        "applied_profile": "profile-b",
-        "status": "cannot_verify",
-        "rotation_receipt": {},
-    }
+    assert result.message["session_transcript"] == DRIFT_FINDINGS
+    assert json.loads(result.raw_text)[0]["summary"] == "swarm delegation dropped"
+    assert result.usage["profile_continuity_receipt"] == receipt
+    assert plan_row_disclosures({"profile_continuity_receipt": result.usage[
+        "profile_continuity_receipt"]}) == [
+        "profile_continuity: cannot_verify (unexplained_profile_drift)"]
+
+
+def test_empty_profile_expectation_is_matched_telemetry_without_disclosure() -> None:
+    """An expectation that was never recorded is not drift: unpinned waves stay
+    `matched`/`no_expectation_recorded` — durable receipt only, no actor noise."""
+    from ouroboros.review_thread_continuity import profile_continuity_receipt
+    from ouroboros.tools.plan_review_runtime import plan_row_disclosures
+
+    for applied in ("profile-b", ""):  # FIX 4: ""/"" is no-expectation, not a false pin match
+        receipt = profile_continuity_receipt("", applied, [])
+        assert receipt["status"] == "matched"
+        assert receipt["verification_reason"] == "no_expectation_recorded"
+        assert plan_row_disclosures({"profile_continuity_receipt": receipt}) == []
+    matched = profile_continuity_receipt("profile-a", "profile-a", [])
+    assert (matched["status"], matched["verification_reason"]) == ("matched", "profile_matched")
+
+
+def test_profile_drift_disclosure_lands_in_the_wave_actor_record(_harness, monkeypatch) -> None:
+    """FIX 3 / owner decision 1=B: a cannot_verify continuity receipt riding one
+    reviewer's usage lands in the recorded wave actor's `disclosures`, while the
+    wave aggregate counts that reviewer's findings completely — telemetry only."""
+    import ouroboros.review_substrate as rs
+    from ouroboros.task_results import load_plan_review_state
+    from tests.test_plan_review_engine import CLEAN, _call, _finding
+
+    drift = json.dumps([_finding("f1", "blocking", breaks="goal", summary="drops swarm")])
+
+    def _sub(request, *, slots, drive_root, llm, usage_ctx=None):
+        actors = []
+        for slot in slots:
+            usage = {"prompt_tokens": 10, "completion_tokens": 5}
+            if slot.slot_id == "s1":
+                usage["profile_continuity_receipt"] = {
+                    "expected_profile": "profile-a", "applied_profile": "profile-b",
+                    "status": "cannot_verify",
+                    "verification_reason": "unexplained_profile_drift",
+                }
+            actors.append({
+                "slot_id": slot.slot_id, "model": slot.model, "status": "ok",
+                "raw_text": drift if slot.slot_id == "s1" else CLEAN, "error": "",
+                "usage": usage, "prompt_ref": {}, "response_ref": {},
+            })
+        return SimpleNamespace(actors=actors)
+
+    monkeypatch.setattr(rs, "run_review_request", _sub)
+    _call(_harness.make_ctx())
+
+    wave = load_plan_review_state(_harness.drive, "task-1")["waves"][-1]
+    actor = next(a for a in wave["actors"] if a["slot_id"] == "s1")
+    assert "profile_continuity: cannot_verify (unexplained_profile_drift)" in actor["disclosures"]
+    assert actor["ok"] is True  # the paid transcript stayed parseable
+    assert wave["aggregate"] == "REVIEW_REQUIRED"  # computed normally, never gated
+    assert wave["counts"] == {**wave["counts"], "parseable": 3, "blocking": 1}
+
+
+def test_agent_session_executor_is_structurally_unable_to_blank_the_transcript(tmp_path) -> None:
+    """The blanking field is gone: one transcript attribute feeds parser, provenance
+    and the durable message alike — an emptied copy can no longer exist."""
+    from ouroboros.review_execution import AgentSessionReviewExecutor, ReviewAssignment
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
+
+    executor = AgentSessionReviewExecutor(ReviewAssignment(
+        request=ReviewRequest(surface="plan_review", goal="review", task_id="task-1"),
+        slot=ReviewSlot(slot_id="s1", model="fable", route="agent_session"),
+        custody_root=tmp_path,
+    ))
+
+    assert "_transcript" not in vars(executor)
+    assert executor._raw_transcript is None
+
+
+def test_session_model_mismatch_is_disclosed_on_the_actor_row(monkeypatch, tmp_path) -> None:
+    """The protection the owner relies on: an effective session model that differs
+    from the slot's requested model records `session_route_resolves_its_own_model`
+    and the delta travels through actor usage into the wave actor record."""
+    from ouroboros.review_execution import AgentSessionReviewExecutor, ReviewAssignment
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
+    from ouroboros.tools.plan_review_runtime import _plan_row_from_actor, plan_row_typed_facts
+
+    def fake_run(*, prompt, root, custody_drive, invocation):
+        return _session_run(model="grok-4.6")
+
+    monkeypatch.setattr("ouroboros.review_execution.run_delegated_review_session", fake_run)
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="task-1",
+        session_root=str(tmp_path), session_task="review exact evidence",
+        session_threads={"slot_a": "thread-1"},
+        policy={"output_contract": "return findings"},
+    )
+    slot = ReviewSlot(
+        slot_id="slot_a", model="fable", route="agent_session",
+        session_target="claude=fable", session_profile="profile-a",
+    )
+
+    result = AgentSessionReviewExecutor(
+        ReviewAssignment(request=request, slot=slot, custody_root=tmp_path)
+    ).execute()
+
+    mismatch = [d for d in result.usage["capability_delta"]
+                if d.get("reason") == "session_route_resolves_its_own_model"]
+    assert mismatch == [{
+        "kind": "capability_delta",
+        "requested": "model fable",
+        "effective": "model grok-4.6",
+        "reason": "session_route_resolves_its_own_model",
+    }]
+    assert result.raw_text == "[]\nNO_FINDINGS"  # disclosed, never discarded
+    row = _plan_row_from_actor({
+        "slot_id": "slot_a", "status": "ok", "raw_text": result.raw_text,
+        "usage": result.usage, "prompt_ref": {}, "response_ref": {},
+    }, slot)
+    assert mismatch[0] in row["capability_delta"]
+    assert mismatch[0] in plan_row_typed_facts(row)["capability_delta"]
 
 
 def test_agent_session_accepts_only_a_typed_profile_rotation_receipt(monkeypatch, tmp_path) -> None:
@@ -661,28 +828,15 @@ def test_agent_session_accepts_only_a_typed_profile_rotation_receipt(monkeypatch
     }
 
     def fake_run(*, prompt, root, custody_drive, invocation):
-        return {
-            "run_id": "run-2", "thread_id": "thread-1", "turn_id": "turn-2",
-            "thread_receipt": {
-                "continuity": {
-                    "kind": "packet", "laneSwitchedFrom": {
-                        "harness": "claude", "profileId": "profile-a",
-                    },
-                },
-            },
-            "profile_continuity_receipt": {
+        return _session_run(
+            thread_receipt={"continuity": {"kind": "packet", "laneSwitchedFrom": {
+                "harness": "claude", "profileId": "profile-a"}}},
+            profile_continuity_receipt={
                 "expected_profile": "profile-a", "applied_profile": "profile-b",
                 "status": "typed_rotation", "rotation_receipt": rotation,
             },
-            "text": "[]\nNO_FINDINGS", "conformance": "passed", "schema_asked": True,
-            "custody_durable": True, "settlement": "settled", "route_id": "claude",
-            "effective_route_ids": ["claude"], "model": "fable", "spend": 0.0,
-            "spend_estimated": False, "applied_profile": "profile-b", "applied_access": "readonly",
-            "auth_route_receipt": {
-                "requested": "subscription", "effective": "subscription",
-                "reason": "subscription_preferred", "profileId": "profile-b",
-            },
-        }
+            applied_profile="profile-b",
+        )
 
     monkeypatch.setattr("ouroboros.review_execution.run_delegated_review_session", fake_run)
     request = ReviewRequest(
@@ -751,3 +905,95 @@ def test_33rd_blocker_is_dispositionable(_harness) -> None:
 
     assert "unknown finding ids" not in out
     assert "blocking_finding_below_quorum_stays_open" in out
+
+
+def test_roster_change_preserves_undisposed_prior_blocking_findings(_harness) -> None:
+    """Owner-decided contract: after a roster change the wave restarts FRESH (no
+    refusal), the new packet still carries the prior cycle's undisposed blocking
+    findings via prior_cycles, the recorded prior wave keeps them open, and every
+    actor row carries the typed continuation-restart capability delta."""
+    from ouroboros.task_results import load_plan_review_state
+    from tests.test_plan_review_engine import CLEAN, _call, _finding, _slots, _user_text
+
+    wave1 = json.dumps([
+        _finding("b1", "blocking", breaks="goal", summary="the plan drops swarm delegation"),
+        _finding("e1", "need_evidence", locator="notes.md::tail=16", summary="show the notes tail"),
+    ])
+    _harness.install({"s1": wave1, "s2": CLEAN, "s3": CLEAN})
+    _call(_harness.make_ctx())
+    prior = load_plan_review_state(_harness.drive, "task-1")["waves"][-1]
+    assert prior["closed"] is False
+
+    _harness.state["slots"] = _slots(("s1", "m/a"), ("s2", "m/b"), ("s3", "m/new"))
+    substrate = _harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
+    out = _call(_harness.make_ctx())
+
+    assert "cannot_verify" not in out
+    assert len(substrate.calls) == 1
+    user = _user_text(substrate.calls[0]["request"].messages[1]["content"])
+    assert "the plan drops swarm delegation" in user
+    state = load_plan_review_state(_harness.drive, "task-1")
+    wave2 = state["waves"][-1]
+    assert wave2["cycle_index"] == 2
+    for actor in wave2["actors"]:
+        assert {
+            "kind": "capability_delta",
+            "requested": "continuation of prior thread",
+            "effective": "fresh session, full packet",
+            "reason": "prior_reviewer_assignment_set_changed",
+        } in actor["capability_delta"]
+    recorded_prior = next(w for w in state["waves"] if w["cycle_index"] == 1)
+    assert recorded_prior["dispositions"] == [] and recorded_prior["closed"] is False
+
+
+def test_degraded_progress_line_discloses_untrusted_counts(_harness) -> None:
+    from tests.test_plan_review_engine import _call
+
+    _harness.install({"s1": "no json here", "s2": "no json here", "s3": "no json here"})
+    _harness.progress.clear()
+    _call(_harness.make_ctx())
+
+    assert (
+        "📐 plan_task: DEGRADED (0/3 parseable reviewers; counts are untrusted) — "
+        "0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"
+    ) in _harness.progress
+
+
+def test_clean_progress_line_stays_byte_identical(_harness) -> None:
+    from tests.test_plan_review_engine import CLEAN, _call
+
+    _harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
+    _harness.progress.clear()
+    _call(_harness.make_ctx())
+
+    assert (
+        "📐 plan_task: GREEN — 0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"
+    ) in _harness.progress
+
+
+def test_session_output_schema_admits_null_in_its_own_optional_fields() -> None:
+    """§1.4: a model that emits null for an absent optional field must conform.
+
+    The schema previously declared plain "string" for breaks/locator/recommendation,
+    so every schema-bearing route landed outputConformance=failed on legitimate
+    nulls (incident f0a6fb64c92d491f). Required fields stay strict strings.
+    """
+    from ouroboros.tools.plan_spec import PLAN_REVIEW_SESSION_OUTPUT_SCHEMA
+
+    props = PLAN_REVIEW_SESSION_OUTPUT_SCHEMA["properties"]["findings"]["items"]["properties"]
+    for optional in ("breaks", "locator", "recommendation"):
+        assert props[optional]["type"] == ["string", "null"], optional
+    for required in ("id", "summary"):
+        assert props[required]["type"] == "string", required
+
+
+def test_validate_findings_treats_null_optionals_as_absent() -> None:
+    from ouroboros.tools import plan_spec
+
+    rows, disclosures, _seen = plan_spec.validate_findings(
+        [{"id": "f1", "class": "note", "summary": "s",
+          "breaks": None, "locator": None, "recommendation": None}],
+        spec_ids=["goal", "claim_1"], seen_locators=[],
+    )
+    assert len(rows) == 1 and rows[0]["class"] == "note"
+    assert not rows[0].get("breaks")

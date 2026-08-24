@@ -1252,7 +1252,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
     def __init__(self, assignment: ReviewAssignment, *, llm: Any = None):
         super().__init__(assignment, llm=llm)
         self._session_prompt: Optional[str] = None
-        self._transcript: Optional[str] = None
+        self._raw_transcript: Optional[str] = None
         self._conformance_passed = False
         self._run_id = ""
         self._session_usage: Dict[str, Any] = {}
@@ -1310,7 +1310,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
     # -- delivery --------------------------------------------------------------
 
     def execute(self) -> ReviewAttemptResult:
-        if self._transcript is not None:
+        if self._raw_transcript is not None:
             # Plan 5.5: the permitted resend repairs FORMAT locally over the
             # collected transcript; it never launches a second session.
             return self._verdict_result(force_extraction=True)
@@ -1480,14 +1480,14 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 "effective": f"model {facts['model']}",
                 "reason": "session_route_resolves_its_own_model",
             })
+        # PAID EVIDENCE: the transcript always feeds the parser whole. A profile
+        # continuity `cannot_verify` is telemetry, never a reason to blank it.
         self._raw_transcript = facts["text"]
-        self._transcript = "" if (facts.get("profile_continuity_receipt") or {}).get(
-            "status") == "cannot_verify" else self._raw_transcript
 
     def _verdict_result(self, force_extraction: bool = False) -> ReviewAttemptResult:
-        text = self._raw_transcript
+        text = self._raw_transcript or ""
         canonical, method, extraction_usage = canonicalize_session_verdict(
-            self._transcript or "",
+            text,
             conformance_passed=self._conformance_passed and not force_extraction,
             contract=self._output_contract(),
             llm=self.llm,

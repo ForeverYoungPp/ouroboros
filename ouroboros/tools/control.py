@@ -136,6 +136,47 @@ def _emit_swarm_fanout(
         log.debug("Failed to emit swarm_fanout telemetry", exc_info=True)
 
 
+def maybe_emit_delegated_run_fanout(ctx: ToolContext, *, run_id: str, route_id: str,
+                                    objective: str, durable: bool) -> None:
+    """swarm_fanout for a delegated harness run, only under host-attested Swarm intent.
+
+    A task admitted through the Swarm button carries the typed metadata fact
+    ``force_plan_source == "swarm"`` — the gate reads exactly that admission fact,
+    never keywords or prompt text (P5). Only such a hosting task folds its
+    delegate_start into swarm telemetry; an ordinary delegated run on a task that
+    never asked for a swarm emits nothing. The event reuses the exact existing
+    ``swarm_fanout`` wave shape (``requested_count=1``, ``role="delegated_run"``,
+    requested lane = the selected session route) and means STARTED/REQUESTED, not
+    completed. An uncustodied start (``durable=False``) is not attested and emits
+    nothing. Telemetry must never break a start that already succeeded, so
+    failures stay logged, never raised.
+    """
+    metadata = getattr(ctx, "task_metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if not durable or metadata.get("force_plan_source") != "swarm":
+        return
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    try:
+        depth = int(getattr(ctx, "task_depth", 0) or 0) + 1
+    except (TypeError, ValueError):
+        depth = 1
+    try:
+        _emit_swarm_fanout(
+            ctx,
+            parent_task_id=task_id,
+            root_task_id=str(metadata.get("root_task_id") or task_id),
+            depth=depth,
+            task_group_id="",
+            task_ids=[str(run_id or "")],
+            role="delegated_run",
+            requested_model_lane=str(route_id or ""),
+            objective=str(objective or ""),
+            emitted_live=True,
+        )
+    except Exception:
+        log.debug("Failed to emit delegated-run swarm_fanout telemetry", exc_info=True)
+
+
 def _subagent_slot_note(ctx: ToolContext, root_task_id: str) -> str:
     """Compact slot-occupancy transparency for the schedule_subagent result (v6.54.3, 1.6).
 

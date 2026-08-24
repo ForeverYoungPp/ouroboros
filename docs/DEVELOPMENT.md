@@ -522,6 +522,12 @@ Every new or changed continuity surface is reviewed as one narrow chain:
   disposable under the unified retention owner; an unavailable legacy source is
   represented as an explicit gap, never silently treated as complete.
 
+**Control-plane distrust is metadata, not a data-plane operation.** Paid model
+output is evidence until a typed validity predicate fails. Control-plane
+distrust — profile, route, parser, window — is metadata on that evidence: it
+may lower authority to DEGRADED/SKIPPED/NOT_RUN, but it must not blank,
+rewrite, or relabel the artifact or its original cause.
+
 #### Context and growth matrix
 
 | Store / surface | Complete producer and source | Interactive projection / consumer | Growth and retention proof |
@@ -601,7 +607,7 @@ Concrete requirements:
 | Triad review (`tools/review.py`) | ✅ via preamble | ✅ via `load_governance_doc` | ✅ via `load_governance_doc` |
 | ↳ Anti-thrashing (v4.35.1) | — | — | Open obligations loaded from `review_state` via `load_state(drive_root)` + `make_repo_key(repo_dir)`, injected unconditionally into `_build_review_history_section` prompt context. Same mechanism in `scope_review.py::_build_scope_prompt` (best-effort when `drive_root` available). |
 | Background consciousness (`consciousness.py`) | ✅ full | ✅ full (max) / navigation map (low) | — (not yet required) |
-| Advisory pre-review (`tools/claude_advisory_review.py`) | ✅ via `load_governance_doc` | ✅ via `load_governance_doc` | ✅ via `load_governance_doc` |
+| Advisory pre-review (`tools/claude_advisory_review.py`) | Two delivery forms: an `api` row receives the full doc inline via `load_governance_doc`; an `agent_session` row receives a resolvable pointer marked MANDATORY FULL READ and the session reads the full doc itself — retrieval is disclosed and non-certifying (the mirror of plan review's `agent_session` delivery form) | same two delivery forms (`api` inline / `agent_session` pointer) | same two delivery forms (`api` inline / `agent_session` pointer) |
 | Scope review (`tools/scope_review.py`) | full canonical doc + Atlas accounting | full canonical doc + Atlas accounting | full canonical doc + Atlas accounting |
 | Plan review (`tools/plan_review.py`) | full for a SELF-MODIFICATION plan (structural path fact: a declared target resolves under the system repo); otherwise a heading-derived navigation map of BIBLE.md generated at runtime (never a copy) | inline, in full, for a self-modification plan; otherwise the lossless navigation map + a resolvable pointer (W3) | named on-demand pointer; a reviewer that needs it returns `need_evidence` and the host attaches it on the next cycle |
 | Deep self-review (`deep_self_review.py`) | full canonical doc + Atlas accounting | full (max) / navigation map (low) + Atlas accounting | full canonical doc + Atlas accounting |

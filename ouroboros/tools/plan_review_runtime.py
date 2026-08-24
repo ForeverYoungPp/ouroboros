@@ -353,6 +353,39 @@ def plan_row_typed_facts(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def plan_row_disclosures(row: Dict[str, Any]) -> List[str]:
+    """Producer-side telemetry disclosures seeding one actor record.
+
+    A REAL pinned-profile mismatch (receipt status ``cannot_verify``) is
+    disclosed on the actor row the agent reads; ``no_expectation_recorded``
+    stays a durable-receipt fact only (every unpinned wave would otherwise
+    carry noise). Profile continuity is telemetry: it never gates parsing,
+    counting, or PASS — the findings stand either way."""
+    receipt = row.get("profile_continuity_receipt") or {}
+    if str(receipt.get("status") or "") != "cannot_verify":
+        return []
+    reason = str(receipt.get("verification_reason") or "") or "unexplained_profile_drift"
+    return [f"profile_continuity: cannot_verify ({reason})"]
+
+
+def plan_wave_progress_line(aggregate: str, counts: Dict[str, Any], *, cycles_paid: int, cap: Any) -> str:
+    """The wave's final owner-visible progress line (pure; ``plan_review.py``
+    sits at its size pin, so the formatting lives here). Honest DEGRADED:
+    zero-count tails must never read as a clean result, so the
+    parseable/configured ratio and the distrust are named inline; every other
+    aggregate renders byte-identically to the plain form."""
+    verdict = (
+        f"DEGRADED ({counts['parseable']}/{counts['configured']} "
+        "parseable reviewers; counts are untrusted)"
+        if aggregate == "DEGRADED" else aggregate
+    )
+    return (
+        f"📐 plan_task: {verdict} — {counts['blocking']} blocking / "
+        f"{counts['note']} note / {counts['need_evidence']} need_evidence; "
+        f"cycles paid {cycles_paid}{'' if cap is None else f'/{cap}'}"
+    )
+
+
 # Root exploration log (plan F3/S8): the task's OWN tool calls before this call,
 # read from the task-local conversation — never a scan of tools.jsonl.
 _EXPLORATION_TAIL_CALLS = 40

@@ -713,9 +713,10 @@ def _make_thread_filter(
                 str(entry.get("root_task_id") or ""),
             ) if isinstance(entry, dict) else 0
         )
-        is_root_completion = bool(
+        is_project_lifecycle_row = bool(
             isinstance(entry, dict)
-            and str(entry.get("type") or "") == "project_completion_summary"
+            and str(entry.get("type") or "")
+            in {"project_started", "project_completion_summary"}
         )
         is_cognitive_projection = bool(
             isinstance(entry, dict)
@@ -723,19 +724,21 @@ def _make_thread_filter(
             in {"terminal_result_projection", "terminal_root_projection"}
         )
         if thread_id in project_chat_ids:
-            # The compact host-stamped completion belongs only to Main; the
-            # Project thread already owns the complete task timeline/result.
-            if is_root_completion:
+            # The compact host-stamped lifecycle rows (started + terminal
+            # completion) belong only to Main; the Project thread already owns
+            # the complete task timeline/result.
+            if is_project_lifecycle_row:
                 return False
             if bound_chat == thread_id:
                 return True
             if isinstance(entry, dict) and _matches_project_source(entry, project_source_refs):
                 return True
             return entry_chat == thread_id
-        # Main / non-project view: exactly one host-stamped terminal Project-root
-        # row is admitted from the canonical Main chat. Project progress, logs,
-        # child traffic, ordinary summaries and raw dialogue stay in Project.
-        if is_root_completion:
+        # Main / non-project view: exactly the two host-stamped Project-root
+        # lifecycle rows (started + terminal completion) are admitted from the
+        # canonical Main chat. Project progress, logs, child traffic, ordinary
+        # summaries and raw dialogue stay in Project.
+        if is_project_lifecycle_row:
             return entry_chat not in project_chat_ids
         if is_cognitive_projection:
             return False
@@ -813,7 +816,7 @@ def _collect_chat_rows(
                 "task_id": str(entry.get("task_id", "")),
                 "telegram_chat_id": int(entry.get("telegram_chat_id") or 0),
             }
-            if rec["system_type"] == "project_completion_summary":
+            if rec["system_type"] in {"project_started", "project_completion_summary"}:
                 for key in ("project_id", "project_name", "target_label", "status"):
                     if key in entry:
                         rec[key] = str(entry.get(key) or "")

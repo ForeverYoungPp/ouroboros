@@ -8,7 +8,6 @@ store, transport route, or review policy of its own.
 
 from __future__ import annotations
 
-import dataclasses
 from hashlib import sha256
 import json
 import pathlib
@@ -101,11 +100,11 @@ def hot_index_wave(wave: dict, *, page_size: int) -> dict:
 def continuation_state(
     state_root: pathlib.Path, task_id: str, previous: Optional[dict], slots: List[Any],
     manifest: dict, *, user_content: str,
-) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], str]:
-    """Resolve one evidence continuation and its fail-closed reason."""
+) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], str, str]:
+    """Resolve one evidence continuation: fail-closed reason + fresh-restart cause."""
     if not manifest.get("reviewer_requested"):
-        return slots, {}, {}, ""
-    rebound, messages, threads, error = continuation_inputs(
+        return slots, {}, {}, "", ""
+    rebound, messages, threads, error, restarted = continuation_inputs(
         state_root, task_id, previous, slots, user_content=user_content,
     )
     requested = {str(item) for item in manifest.get("reviewer_requested") or []}
@@ -118,7 +117,7 @@ def continuation_state(
             f"{item.get('locator')}={item.get('reason')}" for item in missing
         ) if missing else ""
     )
-    return rebound, messages, threads, str(reason or "")
+    return rebound, messages, threads, str(reason or ""), restarted
 
 
 def record_exact_wave(
@@ -175,46 +174,73 @@ def slot_row(slot: Any) -> dict:
     }
 
 
+def continuation_restart_delta(cause: str) -> dict:
+    """The existing-style disclosure of one continuation that restarted fresh."""
+    return {
+        "kind": "capability_delta",
+        "requested": "continuation of prior thread",
+        "effective": "fresh session, full packet",
+        "reason": str(cause or ""),
+    }
+
+
+def attach_continuation_restart_delta(rows: List[dict], cause: str) -> None:
+    """Disclose one fresh continuation restart on every slot row (no-op when
+    the continuation held). Thread memory was lost and the wave re-dispatched
+    fresh with the full packet: disclosed per slot through the existing
+    capability-delta lane."""
+    if not cause:
+        return
+    for row in rows:
+        row["capability_delta"] = [
+            *(row.get("capability_delta") or []),
+            continuation_restart_delta(cause),
+        ]
+
+
 def continuation_inputs(
     state_root: pathlib.Path, task_id: str, previous: Optional[dict], slots: List[Any],
     *, user_content: str,
-) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], Optional[str]]:
+) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], Optional[str], str]:
+    """Rebuild one evidence continuation from the prior exact wave.
+
+    Fail-closed ONLY for the dispositions custody chain (a missing or unreadable
+    prior exact wave). Thread-memory misses — a changed reviewer roster, a prior
+    slot receipt or thread that is gone, an invalid prior API transcript —
+    degrade to a FRESH dispatch instead: the packet is self-contained on every
+    send (prior findings, dispositions and spec delta already ride it), so a
+    lost vendor thread is a cache miss, not a validity event. The fifth element
+    names the typed cause of such a restart ('' when continuation held); slots
+    are returned exactly as currently configured, never rebound to prior rows."""
     if not previous:
-        return slots, {}, {}, "prior_exact_wave_missing"
+        return slots, {}, {}, "prior_exact_wave_missing", ""
     ref = previous.get("wave_artifact") if isinstance(previous.get("wave_artifact"), dict) else {}
     if not ref:
-        return slots, {}, {}, "prior_exact_wave_ref_missing"
+        return slots, {}, {}, "prior_exact_wave_ref_missing", ""
     try:
         exact = read_wave(state_root, task_id, ref)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        return slots, {}, {}, f"prior_exact_wave_unreadable:{type(exc).__name__}"
-    prior_slots = [r for r in exact.get("slots") or [] if isinstance(r, dict)]
-    if [slot_row(slot) for slot in slots] != prior_slots:
-        return slots, {}, {}, "prior_reviewer_assignment_set_changed"
-    configs = {str(r.get("slot_id") or ""): r for r in prior_slots}
-    outputs = {str(r.get("slot_id") or ""): r for r in exact.get("reviewer_outputs") or [] if isinstance(r, dict)}
-    rebound, slot_messages, session_threads = [], {}, {}
-    from ouroboros.review_execution import ReviewRouteKind
+        return slots, {}, {}, f"prior_exact_wave_unreadable:{type(exc).__name__}", ""
 
-    for current in slots:
-        sid = str(getattr(current, "slot_id", "") or "")
-        config, output = configs.get(sid), outputs.get(sid)
-        if not config or not output:
-            return slots, {}, {}, f"prior_slot_receipt_missing:{sid}"
-        route = ReviewRouteKind(str(config.get("route") or "api_chat"))
-        rebound.append(dataclasses.replace(
-            current, model=str(config.get("model") or ""), effort=str(config.get("effort") or ""),
-            route=route, session_target=str(config.get("session_target") or ""),
-            session_profile=str(config.get("session_profile") or ""),
-        ))
-        if route is ReviewRouteKind.AGENT_SESSION:
+    def fresh(cause: str) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], Optional[str], str]:
+        return slots, {}, {}, None, cause
+
+    current_rows = [slot_row(slot) for slot in slots]
+    if current_rows != [r for r in exact.get("slots") or [] if isinstance(r, dict)]:
+        return fresh("prior_reviewer_assignment_set_changed")
+    outputs = {str(r.get("slot_id") or ""): r for r in exact.get("reviewer_outputs") or [] if isinstance(r, dict)}
+    slot_messages: Dict[str, List[Dict[str, Any]]] = {}
+    session_threads: Dict[str, str] = {}
+    for config in current_rows:
+        sid = str(config.get("slot_id") or "")
+        output = outputs.get(sid)
+        if not output:
+            return fresh(f"prior_slot_receipt_missing:{sid}")
+        if str(config.get("route") or "") == "agent_session":
             thread_id = str(output.get("review_thread_id") or "")
             if not thread_id:
-                return slots, {}, {}, f"prior_review_thread_missing:{sid}"
+                return fresh(f"prior_review_thread_missing:{sid}")
             session_threads[sid] = thread_id
-            rebound[-1] = dataclasses.replace(
-                rebound[-1], session_profile=str(output.get("applied_profile") or ""),
-            )
         else:
             prior_messages = output.get("request_messages")
             if (
@@ -227,13 +253,13 @@ def continuation_inputs(
                     for row in prior_messages
                 )
             ):
-                return slots, {}, {}, f"prior_api_transcript_invalid:{sid}"
+                return fresh(f"prior_api_transcript_invalid:{sid}")
             slot_messages[sid] = [
                 *[dict(row) for row in prior_messages],
                 {"role": "assistant", "content": str(output.get("text") or "")},
                 {"role": "user", "content": user_content},
             ]
-    return rebound, slot_messages, session_threads, None
+    return slots, slot_messages, session_threads, None, ""
 
 
 def exact_wave(

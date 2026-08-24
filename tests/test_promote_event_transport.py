@@ -723,7 +723,7 @@ def test_project_registry_lookup_failure_prevents_clone(monkeypatch, tmp_path):
     )
     ctx = types.SimpleNamespace(DRIVE_ROOT=tmp_path, REPO_DIR=tmp_path / "repo")
 
-    folder, note, error, project_id = resolve_promote_source(
+    folder, note, error, project_id, source_created = resolve_promote_source(
         ctx, "https://github.com/example/project.git", "project"
     )
 
@@ -731,6 +731,7 @@ def test_project_registry_lookup_failure_prevents_clone(monkeypatch, tmp_path):
     assert note == ""
     assert error.startswith("project_lookup_failed: OSError: registry unreadable")
     assert project_id == "project"
+    assert source_created is False
 
 
 def test_duplicate_promote_uses_negative_annotation_without_overwriting_result(
@@ -808,7 +809,7 @@ def test_source_resolution_runs_off_supervisor_loop_and_continues_once(
     def slow_resolve(_ctx, _source, project_id):
         started.set()
         assert release.wait(2)
-        return "", "source checked", "", project_id
+        return "", "source checked", "", project_id, False
 
     monkeypatch.setattr(
         "ouroboros.promotion_source.resolve_promote_source", slow_resolve

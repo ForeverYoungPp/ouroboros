@@ -935,6 +935,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         authority_source=authority_source, resource_ref=resource_ref,
         capture_mode=(_CAPTURE_DELEGATED_SNAPSHOT if snapshot_id else ""),
     )
+    from ouroboros.tools.control import maybe_emit_delegated_run_fanout
+    maybe_emit_delegated_run_fanout(ctx, run_id=run_id, route_id=route.route_id, objective=text, durable=durable)
     return _started_payload(handle, run_id, route, access, authority, root,
                             durable=durable, recovering=recovering,
                             invocation_id=invocation_id,

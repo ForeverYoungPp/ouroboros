@@ -89,7 +89,7 @@ def test_chat_document_bubble_opens_externally_and_downloads_separately():
     assert "await downloadBridge(url, filename, true)" in helper
 
     # Bubble body click = open externally; separate ↓ button = download.
-    assert "import { downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';" in chat
+    assert "import { createSystemMessageAction, downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';" in chat
     assert "await openViaHostBridge(downloadUrl, filename);" in chat
     assert "await downloadViaHostBridge(downloadUrl, filename);" in chat
     assert 'class="chat-file-download"' in chat

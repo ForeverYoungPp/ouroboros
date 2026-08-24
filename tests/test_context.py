@@ -45,6 +45,10 @@ def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
     # write regions or plans the parent synthesis for the expected overlap.
     assert "cannot see each other's edits" in content
     assert "disjoint write regions" in content
+    # Owner intent as prose, not schema (rc-phaseC, P5): the plan must name its
+    # execution shape so reviewers can judge a silent zero-fan-out.
+    assert "State the chosen execution shape explicitly" in content
+    assert "delegation required, optional, or intentionally not used" in content
     assert content.rstrip().endswith("Fix the marketplace retry flow.")
 
 

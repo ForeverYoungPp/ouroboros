@@ -107,6 +107,24 @@ export function formatRelativeAge(time, freshLabel = 'Just installed') {
     return days < 45 ? `${days}d ago` : new Date(time).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+/**
+ * Shared design-system action button for host-stamped system chat rows
+ * (Project lifecycle rows and future system-message actions). One semantic
+ * button role — `.btn.btn-default.btn-sm` — plus the layout-only
+ * `.system-message-action` hook; callers place it inside a
+ * `.system-message-actions` container.
+ */
+export function createSystemMessageAction({ label, onClick, disabled = false, ariaLabel = '' } = {}) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-default btn-sm system-message-action';
+    btn.textContent = String(label || '');
+    if (disabled) btn.disabled = true;
+    if (ariaLabel) btn.setAttribute('aria-label', ariaLabel);
+    if (typeof onClick === 'function') btn.addEventListener('click', onClick);
+    return btn;
+}
+
 export function setInlineStatus(el, text, tone = 'muted') {
     if (!el) return;
     const next = text || '';

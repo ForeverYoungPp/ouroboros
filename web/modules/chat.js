@@ -6,7 +6,7 @@ import {
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
-import { downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
+import { createSystemMessageAction, downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
 import { clientSurfaceField } from './client_surface.js';
 import { apiClient, apiFetch, fetchTaskDetail } from './api_client.js';
 import {
@@ -88,6 +88,7 @@ export {
     taskCostProjection,
 };
 
+const PROJECT_ROW_TYPES = new Set(['project_started', 'project_completion_summary']);
 const CHAT_STORAGE_KEY = 'ouro_chat';
 const CHAT_DRAFT_KEY = 'ouro_chat_draft';
 const CHAT_INPUT_HISTORY_KEY = 'ouro_chat_input_history';
@@ -1242,7 +1243,7 @@ export function createChatInstance({
         const actions = record.turnProjectBtn?.parentElement || record.root.querySelector('.chat-live-actions');
         if (actions) {
             withStableViewport(() => {
-                actions.innerHTML = '<button type="button" class="chat-live-project-btn" disabled>Creating project…</button>';
+                actions.innerHTML = '<button type="button" class="btn btn-xs btn-default" disabled>Creating project…</button>';
                 record.cancelRunBtn = null;
             });
         }
@@ -1263,7 +1264,7 @@ export function createChatInstance({
             delete record.root.dataset.projectCreating;
             if (actions) {
                 withStableViewport(() => {
-                    actions.innerHTML = '<button type="button" class="chat-live-project-btn" data-turn-into-project>Turn into project</button>';
+                    actions.innerHTML = '<button type="button" class="btn btn-xs btn-default" data-turn-into-project>Turn into project</button>';
                     record.turnProjectBtn = actions.querySelector('[data-turn-into-project]');
                     // Re-wire the click handler — innerHTML replaced the original node,
                     // so without this the restored button would be dead after a
@@ -1546,7 +1547,7 @@ export function createChatInstance({
             && !alreadyBound
             && !ephemeralDecisionTaskIds.has(normalizedGroupId)
         )
-            ? `<div class="chat-live-actions"><button type="button" class="chat-live-project-btn" data-turn-into-project>Turn into project</button></div>`
+            ? `<div class="chat-live-actions"><button type="button" class="btn btn-xs btn-default" data-turn-into-project>Turn into project</button></div>`
             : '';
         root.innerHTML = `
             <button type="button" class="chat-live-summary-button" data-live-summary-button aria-expanded="false" aria-controls="${escapeHtmlAttr(timelineId)}">
@@ -2879,17 +2880,16 @@ export function createChatInstance({
             ${pendingHtml}
             ${timeHtml}
         `;
-        if (systemType === 'project_completion_summary' && projectId) {
-            const projectLink = document.createElement('button');
-            projectLink.type = 'button';
-            projectLink.className = 'chat-live-project-btn';
-            projectLink.textContent = 'Open Project ↗';
-            projectLink.addEventListener('click', () => {
-                window.dispatchEvent(new CustomEvent('ouro:open-project', {
+        if (PROJECT_ROW_TYPES.has(systemType) && projectId) {
+            const actions = document.createElement('div');
+            actions.className = 'system-message-actions';
+            actions.append(createSystemMessageAction({
+                label: 'Open Project ↗',
+                onClick: () => window.dispatchEvent(new CustomEvent('ouro:open-project', {
                     detail: { project: { id: projectId, name: projectName || 'Project' } },
-                }));
-            });
-            bubble.querySelector('.message')?.append(document.createElement('br'), projectLink);
+                })),
+            }));
+            bubble.querySelector('.message')?.append(actions);
         }
         wireSkillReviewDisclosure(bubble, () => requestAnimationFrame(() => !destroyed && updateMessagesPadding({ preserveStickiness: true })));
         stampNodeTimestamp(bubble, ts);
@@ -3187,7 +3187,7 @@ export function createChatInstance({
                         continue;
                     }
                     if (msg.system_type === 'task_summary') continue;
-                    if (msg.system_type === 'project_completion_summary') {
+                    if (PROJECT_ROW_TYPES.has(msg.system_type)) {
                         addMessage(msg.text, 'system', !!msg.markdown, msg.ts || null, false, {
                             systemType: msg.system_type,
                             taskId,
@@ -4241,7 +4241,7 @@ export function createChatInstance({
 
         if (msg.role === 'assistant' || msg.role === 'system') {
             const explicitTaskId = msg.task_id || '';
-            if (msg.system_type === 'project_completion_summary') {
+            if (PROJECT_ROW_TYPES.has(msg.system_type)) {
                 addMessage(msg.content, 'system', msg.markdown, msg.ts || null, false, {
                     systemType: msg.system_type,
                     taskId: explicitTaskId,

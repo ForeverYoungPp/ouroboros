@@ -185,7 +185,8 @@ def sealed_final_prompt_section(sealed_final: Dict[str, Any] | None) -> str:
 
 
 def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | None:
-    """Compact derived swarm-efficiency rollup for a task that fanned out subagents.
+    """Compact derived swarm-efficiency rollup: observed fan-out, or the
+    zero-fanout disclosure block for a host-attested Swarm-intent task.
 
     (Moved verbatim from ``agent_task_pipeline`` — that module sits at its
     line ceiling; this is the same finalization-time rollup.)
@@ -196,7 +197,14 @@ def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | N
     fanout events are written before any child starts, so effective lanes are not
     knowable here; they live on each child's own dispatch record.
     Returns None for a plain task (no fan-out), so the block only appears on real
-    swarms.
+    swarms — with ONE exception: a task admitted with host-attested Swarm intent
+    (typed metadata ``force_plan_source == "swarm"``, never prompt inspection) that
+    fanned out NOTHING returns a minimal ``no_fanout_observed`` block instead of
+    disappearing, so a Swarm-button task that spawned zero children is
+    distinguishable from a plain task. ``planned`` in that block is null — never
+    inferred as 0 from the absence of events; a real planned figure exists only as
+    the waves' ``requested_count`` sum, surfaced under that exact name on
+    swarm-intent rollups.
 
     OMITTED (no reliable structured source today): ``observed_max_concurrency`` —
     child task results carry only ``ts``/``updated_at``, not a per-child running-start
@@ -206,6 +214,8 @@ def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | N
     task_id = str(task.get("id") or task.get("task_id") or "")
     if not task_id:
         return None
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    swarm_intent = metadata.get("force_plan_source") == "swarm"
     try:
         from ouroboros.utils import iter_jsonl_objects
 
@@ -215,18 +225,23 @@ def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | N
         events_path = pathlib.Path(drive_root) / "logs" / "events.jsonl"
         child_ids: set[str] = set()
         wave_count = 0
+        requested_count_total = 0
         inter_wave_latency_total = 0.0
         lanes: list[str] = []
         # Read the FULL per-task events stream (not a tail window): the swarm_fanout
         # events can occur EARLY in a long fan-out task, so a bounded tail would
         # silently undercount waves/children (P1 no-silent-loss). This runs once at
-        # finalization (not a hot path) and only for fan-out tasks.
+        # finalization (not a hot path), for fan-out and Swarm-intent tasks.
         for ev in iter_jsonl_objects(events_path):
             if ev.get("type") != "swarm_fanout":
                 continue
             if str(ev.get("parent_task_id") or ev.get("task_id") or "") != task_id:
                 continue
             wave_count += 1
+            try:
+                requested_count_total += int(ev.get("requested_count") or 0)
+            except (TypeError, ValueError):
+                pass
             for tid in ev.get("task_ids") or []:
                 if str(tid or "").strip():
                     child_ids.add(str(tid))
@@ -241,13 +256,30 @@ def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | N
             if lane and lane not in lanes:
                 lanes.append(lane)
         if not child_ids:
+            if swarm_intent:
+                # The owner asked for a swarm and nothing fanned out: say so instead
+                # of vanishing — this is the zero-fan-out visibility the block exists
+                # for. ``planned`` is null because no requested counts were ever
+                # recorded; 0 would be an inference from absence, not an observation.
+                return {
+                    "intent_source": "swarm",
+                    "planned": None,
+                    "observed_started": 0,
+                    "status": "no_fanout_observed",
+                }
             return None
-        return {
+        rollup: Dict[str, Any] = {
             "subagent_count": len(child_ids),
             "wave_count": wave_count,
             "inter_wave_latency_sec_total": round(inter_wave_latency_total, 3),
             "lanes_requested": lanes,
         }
+        if swarm_intent:
+            rollup["intent_source"] = "swarm"
+            # The planned figure under its existing event name — the waves'
+            # requested_count sum, no synonyms (rc-phaseC, fable 2.3 disposition).
+            rollup["requested_count"] = requested_count_total
+        return rollup
     except Exception:
         log.debug("swarm efficiency rollup failed", exc_info=True)
         return None

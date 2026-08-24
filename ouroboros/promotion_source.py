@@ -16,13 +16,18 @@ def _source_project_id(source: str, is_git: bool) -> str:
 
 def resolve_promote_source(
     ctx: Any, source: str, project_id: str,
-) -> Tuple[str, str, str, str]:
+) -> Tuple[str, str, str, str, bool]:
     """Attach/clone only after the supervisor has admitted an executor.
 
-    Returns ``(workspace_root, note, error, effective_project_id)``.  Keeping
-    this side effect on the authoritative handler side prevents a stale tool
-    snapshot from cloning/registering a project after the worker pool was
-    disabled but before the queued event was rejected.
+    Returns ``(workspace_root, note, error, effective_project_id,
+    created_project)``.  Keeping this side effect on the authoritative handler
+    side prevents a stale tool snapshot from cloning/registering a project
+    after the worker pool was disabled but before the queued event was
+    rejected. ``created_project`` is True only when THIS resolution registered
+    the project row — the promote continuation carries it so the one
+    workers-side ``project_started`` announce still fires for a creation that
+    happened in this off-loop half (owner 2=A: it is the same agent-initiated
+    promote flow).
     """
     from ouroboros.config import DATA_DIR
     from ouroboros.project_sources import clone_project_repo, valid_git_url, validate_attach_path
@@ -31,7 +36,7 @@ def resolve_promote_source(
     pid = str(project_id or "").strip()
     drive_root = pathlib.Path(getattr(ctx, "DRIVE_ROOT", DATA_DIR))
     if not src:
-        return "", "", "", pid
+        return "", "", "", pid, False
     is_git = valid_git_url(src)
     pid = pid or _source_project_id(src, is_git)
     try:
@@ -39,19 +44,19 @@ def resolve_promote_source(
 
         existing = get_reserved_project(drive_root, pid)
     except Exception as exc:
-        return "", "", f"project_lookup_failed: {type(exc).__name__}: {exc}", pid
+        return "", "", f"project_lookup_failed: {type(exc).__name__}: {exc}", pid, False
     lifecycle = str((existing or {}).get("lifecycle") or "active")
     if existing is not None and lifecycle != "active":
-        return "", "", f"project_routing_fence: {pid!r} is {lifecycle}", pid
+        return "", "", f"project_routing_fence: {pid!r} is {lifecycle}", pid, False
     if is_git:
         if str((existing or {}).get("working_dir") or "").strip():
             return "", "", (
                 f"conflict: project {pid!r} already has folder {existing.get('working_dir')}; "
                 "use another project id or omit source"
-            ), pid
+            ), pid, False
         cloned, code, detail = clone_project_repo(src, pid)
         if code:
-            return "", "", f"{code}: {detail}", pid
+            return "", "", f"{code}: {detail}", pid, False
         folder, provenance, clone_url = cloned, "cloned", src
         note = f"cloned {src} -> {cloned}"
     else:
@@ -63,9 +68,9 @@ def resolve_promote_source(
             drive_root=drive_root,
         )
         if err:
-            return "", "", f"attach: {err}", pid
+            return "", "", f"attach: {err}", pid, False
         if not is_git_worktree_root(resolved):
-            return "", "", f"attach: {resolved} is not a git repository", pid
+            return "", "", f"attach: {resolved} is not a git repository", pid, False
         folder, provenance, clone_url = str(resolved), "attached", ""
         note = f"attached {resolved}"
     prior_wd = str((existing or {}).get("working_dir") or "").strip()
@@ -73,14 +78,16 @@ def resolve_promote_source(
         return "", "", (
             f"conflict: project {pid!r} already has folder {prior_wd}; use another project id "
             "or omit source"
-        ), pid
+        ), pid, False
     if prior_wd == folder and str((existing or {}).get("provenance") or "").strip() not in ("", "none"):
-        return folder, note, "", pid
+        return folder, note, "", pid, False
     try:
         from ouroboros.projects_registry import create_project, update_project
         from ouroboros.utils import utc_now_iso
 
-        create_project(drive_root, pid, origin="promote_chat_to_task")
+        created = bool(create_project(
+            drive_root, pid, origin="promote_chat_to_task",
+        ).get("created"))
         update_project(
             drive_root,
             pid,
@@ -90,8 +97,8 @@ def resolve_promote_source(
             trusted_at=utc_now_iso(),
         )
     except Exception as exc:
-        return "", "", f"register: {type(exc).__name__}: {exc}", pid
-    return folder, note, "", pid
+        return "", "", f"register: {type(exc).__name__}: {exc}", pid, False
+    return folder, note, "", pid, created
 
 
 __all__ = ["resolve_promote_source"]

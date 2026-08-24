@@ -91,7 +91,15 @@ ADVISORY_REVIEW_CHOICE_GUIDANCE = (
 )
 
 
-_ADVISORY_PROMPT_MAX_CHARS = 1_600_000  # ~400K tokens; non-blocking skip when exceeded
+# EMERGENCY SANITY CEILING ONLY — never the honest fit gate. The api route's
+# real admission bound is its route window from the reviewer-window SSOT
+# (``reviewer_window.resolve_reviewer_window``; see ``_api_window_skip_warning``),
+# and the agent_session route sends a compact pointer pack instead of inlined
+# governance bodies. This constant survives purely as a backstop against a
+# catastrophically mis-assembled prompt (~400K tokens).
+_ADVISORY_PROMPT_MAX_CHARS = 1_600_000
+
+
 def _json_response(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -290,6 +298,24 @@ def _build_blocking_history_section(drive_root: pathlib.Path, repo_key: str = ""
     )
 
 
+def _mandatory_read_pointer(repo_dir: pathlib.Path, rel_path: str, section: str = "") -> str:
+    """One governance doc as a resolvable absolute pointer for the agent_session route.
+
+    Mirrors the plan-review agent_session delivery form (a retrieving row
+    receives MANDATORY FULL READS at resolvable locators instead of inlined
+    bodies — ``plan_review_runtime`` and the DEVELOPMENT.md "Core Governance
+    Artifacts" table are the precedent): the session reads the document itself
+    with its own tools; that retrieval is disclosed by the delegated-route
+    telemetry and is non-certifying."""
+    path = (pathlib.Path(repo_dir) / rel_path).resolve(strict=False)
+    target = f"the '## {section}' section of {path}" if section else str(path)
+    return (
+        f"MANDATORY FULL READ (agent_session route — body not inlined): read {target} "
+        "in full with your own file tools BEFORE reviewing; do not review from memory "
+        "of this document."
+    )
+
+
 def _build_advisory_prompt(
     repo_dir: pathlib.Path,
     commit_message: str,
@@ -298,13 +324,19 @@ def _build_advisory_prompt(
     resolved_paths: Optional[List[str]] = None,
     drive_root: Optional[pathlib.Path] = None,
     prompt_context: Optional[dict] = None,
+    governance_by_retrieval: bool = False,
 ) -> str:
     """Build the read-only advisory prompt.
 
     Managed-resolution routing does NOT live here: ``_advisory_review_diff``
     (the only production diff source) resolves the subject before this builder
     runs and passes the finished diff in ``prompt_context``. The ``diff is
-    None`` branch below exists for direct callers (tests) only."""
+    None`` branch below exists for direct callers (tests) only.
+
+    ``governance_by_retrieval=True`` is the agent_session delivery form: every
+    other section is unchanged, but the governance BODIES are replaced by
+    resolvable pointers (see below) so the pack stays compact enough for any
+    real route window."""
     prompt_context = dict(prompt_context or {})
     diff: Optional[str] = prompt_context.get("diff")
     changed_files: Optional[str] = prompt_context.get("changed_files")
@@ -312,14 +344,30 @@ def _build_advisory_prompt(
     omitted_paths = prompt_context.get("omitted_paths")
     review_surface = str(prompt_context.get("review_surface") or "repo")
     expected_items = prompt_context.get("expected_items")
-    bible = load_governance_doc(repo_dir, "BIBLE.md", on_missing="placeholder", fallback="(BIBLE.md not found)")
-    try:
-        checklist_name = "Skill Review Checklist" if review_surface == "skill" else "Repo Commit Checklist"
-        checklists = load_checklist_section(checklist_name)
-    except Exception:
-        checklists = load_governance_doc(repo_dir, "docs/CHECKLISTS.md", on_missing="placeholder", fallback="(CHECKLISTS.md not found)")
-    dev_guide = load_governance_doc(repo_dir, "docs/DEVELOPMENT.md", on_missing="placeholder", fallback="(DEVELOPMENT.md not found)")
-    arch_doc = load_governance_doc(repo_dir, "docs/ARCHITECTURE.md", on_missing="placeholder", fallback="(ARCHITECTURE.md not found)")
+    checklist_name = "Skill Review Checklist" if review_surface == "skill" else "Repo Commit Checklist"
+    if governance_by_retrieval:
+        # agent_session delivery: do NOT inline the ~830KB governance bodies —
+        # each becomes a resolvable absolute pointer plus a mandatory-read
+        # instruction, and the session reads the docs itself with its own
+        # tools. The authority for this form is the plan-review agent_session
+        # precedent (plan_review_runtime's retrieving-session task and its
+        # DEVELOPMENT.md "Core Governance Artifacts" row), NOT BIBLE P3
+        # retrieving-scope. The advisory session pack deliberately contains
+        # only the staged diff, the changed-file pack, and PUBLIC repository
+        # documents — no redacted-class evidence — so the pointer form leaks
+        # nothing the api form redacts.
+        bible = _mandatory_read_pointer(repo_dir, "BIBLE.md")
+        checklists = _mandatory_read_pointer(repo_dir, "docs/CHECKLISTS.md", section=checklist_name)
+        dev_guide = _mandatory_read_pointer(repo_dir, "docs/DEVELOPMENT.md")
+        arch_doc = _mandatory_read_pointer(repo_dir, "docs/ARCHITECTURE.md")
+    else:
+        bible = load_governance_doc(repo_dir, "BIBLE.md", on_missing="placeholder", fallback="(BIBLE.md not found)")
+        try:
+            checklists = load_checklist_section(checklist_name)
+        except Exception:
+            checklists = load_governance_doc(repo_dir, "docs/CHECKLISTS.md", on_missing="placeholder", fallback="(CHECKLISTS.md not found)")
+        dev_guide = load_governance_doc(repo_dir, "docs/DEVELOPMENT.md", on_missing="placeholder", fallback="(DEVELOPMENT.md not found)")
+        arch_doc = load_governance_doc(repo_dir, "docs/ARCHITECTURE.md", on_missing="placeholder", fallback="(ARCHITECTURE.md not found)")
     if diff is None:
         diff = _get_staged_diff(repo_dir, paths=resolved_paths)
     if changed_files is None:
@@ -916,6 +964,7 @@ def _advisory_review_diff(
             "Advisory review skipped — non-blocking and audited; a managed "
             f"update merge {_MANAGED_SKIP_NOTE}. {gate_note}"
         )
+        _stamp_advisory_skip_meta(ctx, None, "managed_diff_too_large")
         return "", None, ("skipped", warning, len(subject.diff)), True
     if subject is not None:
         return subject.render_prompt_diff(), subject.touched_paths(), None, True
@@ -939,6 +988,175 @@ def _prompt_oversize_skip_warning(prompt_chars: int, managed: bool) -> str:
         f"{_ADVISORY_PROMPT_MAX_CHARS:,} char limit). "
         f"Advisory review skipped — non-blocking. {remedy}"
     )
+
+
+def _api_window_skip_warning(model: str, prompt: str, managed: bool) -> str:
+    """The api route's admission verdict against its REAL window, or ``""`` to proceed.
+
+    The window comes from the reviewer-window SSOT
+    (``reviewer_window.resolve_reviewer_window``) with the review family's
+    existing reserve scaling — never from ``_ADVISORY_PROMPT_MAX_CHARS`` (that
+    constant is only the emergency sanity ceiling). An unevidenced route keeps
+    the SSOT's full-window assumption, so this gate skips exactly when the
+    evidence proves the prompt cannot be admitted; the post-dispatch overflow
+    classification stays the honest net for routes without evidence. Oversize
+    is the EXISTING typed non-blocking ADVISORY_SKIPPED path, produced BEFORE
+    any provider dispatch, naming the window and the measured size."""
+    from ouroboros import reviewer_window as _rw
+    from ouroboros.tools.review import _review_output_budget
+    from ouroboros.utils import estimate_tokens
+
+    window = _rw.resolve_reviewer_window(model).sizing_window()
+    output_reserve, tokenizer_margin = _rw.window_scaled_reserves(
+        window,
+        output_reserve=_review_output_budget(),
+        tokenizer_margin=50_000,
+    )
+    input_limit = max(0, int(window) - int(output_reserve) - int(tokenizer_margin))
+    prompt_tokens = estimate_tokens(prompt)
+    if prompt_tokens <= input_limit:
+        return ""
+    remedy = (
+        f"A managed update merge {_MANAGED_SKIP_NOTE}; the "
+        "skip is audited and non-blocking."
+        if managed
+        else (
+            "Consider splitting the commit, or switch the advisory row to an "
+            "agent_session route (its compact pack sends governance docs as "
+            "pointers instead of inlining them)."
+        )
+    )
+    return (
+        f"⚠️ ADVISORY_SKIPPED: advisory prompt does not fit the api route window "
+        f"({len(prompt):,} chars, ~{prompt_tokens:,} estimated tokens > input limit "
+        f"{input_limit:,} of the {window:,}-token window for model {model or '(default)'}). "
+        f"Advisory review skipped — non-blocking and audited. {remedy}"
+    )
+
+
+def _overflow_failure_text(*texts: object) -> bool:
+    """Advisory-only overflow recognition for a DISPATCHED advisory failure.
+
+    Classifies failure text against the ``context_budget`` SSOT: structured
+    overflow codes, message markers, and the output/body-size precedence (an
+    output-limit rejection is NOT a window overflow). Deliberately NOT a
+    generic overflow-classification helper for other tools — the sprint's
+    not-build list keeps this advisory-local; other surfaces adopt the SSOT
+    themselves when they need it."""
+    from ouroboros.context_budget import (
+        CONTEXT_OVERFLOW_CODES,
+        context_overflow_message,
+        output_or_body_size_message,
+    )
+
+    combined = " ".join(str(t or "") for t in texts if str(t or "").strip())
+    if not combined:
+        return False
+    if output_or_body_size_message(combined):
+        return False
+    low = combined.lower()
+    return context_overflow_message(combined) or any(
+        code in low for code in CONTEXT_OVERFLOW_CODES
+    )
+
+
+def _overflow_skip_warning(route: str, prompt_chars: int, failure_head: str) -> str:
+    """Typed non-blocking skip for a provider/harness context-window rejection.
+
+    ``reason=context_window_exceeded``, carrying the delivery route and the
+    measured prompt size. No host-side retry or split — advisory is fail-open
+    by design; the pre-dispatch gates own prevention, this path owns honesty
+    (previously this failure was misfiled as a crashed harness inviting a
+    doomed retry of the identical oversize prompt)."""
+    tokens_approx = max(1, (int(prompt_chars) + 3) // 4)
+    head = " ".join(str(failure_head or "").split())
+    head = (head[:200] + "…") if len(head) > 200 else head
+    return (
+        "⚠️ ADVISORY_SKIPPED: context_window_exceeded — the advisory prompt "
+        f"exceeded the {route} route's context window at dispatch "
+        f"({prompt_chars:,} chars, ~{tokens_approx:,} estimated tokens). "
+        "Advisory review skipped — non-blocking and audited; no host-side retry "
+        f"or split. Provider signal: {head}"
+    )
+
+
+def _stamp_advisory_skip_meta(ctx: ToolContext, meta: Optional[dict], skip_reason: str) -> None:
+    """Record a typed advisory skip on the ctx meta snapshot (best-effort).
+
+    Pre-dispatch gates pass ``meta=None`` (no run meta exists yet) and stamp a
+    minimal skipped snapshot; the post-dispatch classifier passes its full run
+    meta so model/session/usage survive alongside the skip."""
+    try:
+        snapshot = dict(meta) if meta else {}
+        snapshot["status"] = "skipped"
+        snapshot["skip_reason"] = skip_reason
+        setattr(ctx, "_last_claude_advisory_meta", snapshot)
+    except Exception:
+        pass
+
+
+def _predispatch_size_skip(
+    ctx: ToolContext,
+    delegated_route: bool,
+    model: str,
+    prompt: str,
+    managed: bool,
+) -> Optional[tuple]:
+    """Both pre-dispatch size gates: the typed skip tuple, or ``None`` to dispatch.
+
+    First the emergency sanity ceiling (both routes — see the
+    ``_ADVISORY_PROMPT_MAX_CHARS`` note), then, on the api route only, the
+    honest admission gate against the REAL route window
+    (``_api_window_skip_warning``): the 1.6M constant is far above any real
+    route window and used to let oversize prompts die downstream as a false
+    "harness crashed / Retry" classification. Every skip stamps the meta
+    snapshot with ``status="skipped"`` and a ``skip_reason``."""
+    prompt_chars = len(prompt)
+    if prompt_chars > _ADVISORY_PROMPT_MAX_CHARS:
+        log.warning("Advisory skipped — prompt too large: %d chars", prompt_chars)
+        _stamp_advisory_skip_meta(ctx, None, "prompt_ceiling_exceeded")
+        return [], _prompt_oversize_skip_warning(prompt_chars, managed), model, prompt_chars
+    if delegated_route:
+        return None
+    window_skip = _api_window_skip_warning(model, prompt, managed)
+    if not window_skip:
+        return None
+    log.warning(
+        "Advisory skipped — prompt does not fit the api route window: %d chars",
+        prompt_chars,
+    )
+    _stamp_advisory_skip_meta(ctx, None, "route_window_exceeded")
+    return [], window_skip, model, prompt_chars
+
+
+def _maybe_overflow_skip(
+    ctx: ToolContext,
+    delegated_route: bool,
+    prompt_chars: int,
+    model: str,
+    meta: Optional[dict],
+    failure: object,
+    stderr_tail: object = "",
+    verb: str = "reported",
+) -> Optional[tuple]:
+    """Post-dispatch overflow classification: the typed skip tuple, or ``None``.
+
+    Runs BEFORE the generic error formatting (``context_budget`` SSOT): a
+    prompt the route could not admit is the same typed non-blocking skip the
+    pre-dispatch gates produce — never an ADVISORY_ERROR that reads as a
+    crashed harness and invites a doomed retry of the identical prompt.
+    Serves both dispatched-failure shapes: a returned failure result
+    (``verb="reported"``, with its stderr tail and run meta) and a raised
+    exception (``verb="raised"``)."""
+    if not _overflow_failure_text(failure, stderr_tail):
+        return None
+    route_name = "agent_session" if delegated_route else "api"
+    log.warning(
+        "Advisory skipped — %s route %s context overflow (%d chars)",
+        route_name, verb, prompt_chars,
+    )
+    _stamp_advisory_skip_meta(ctx, meta, "context_window_exceeded")
+    return [], _overflow_skip_warning(route_name, prompt_chars, str(failure or "")), model, prompt_chars
 
 
 def _note_meta_error(ctx: ToolContext, meta: dict, err_msg: str) -> None:
@@ -1037,6 +1255,8 @@ def _run_claude_advisory(
                 "review_surface": review_surface,
                 "expected_items": expected_items,
             },
+            # Route-aware pack: agent_session retrieves governance docs via pointers; api inlines them.
+            governance_by_retrieval=delegated_route,
         )
     except RuntimeError as exc:
         return [], f"⚠️ ADVISORY_ERROR: failed to build advisory prompt: {exc}", "", 0
@@ -1046,9 +1266,9 @@ def _run_claude_advisory(
     prompt_chars = len(prompt)
     diag = _get_runtime_diagnostics(model, prompt_chars, resolved_paths)
 
-    if prompt_chars > _ADVISORY_PROMPT_MAX_CHARS:
-        log.warning("Advisory skipped — prompt too large: %d chars", prompt_chars)
-        return [], _prompt_oversize_skip_warning(prompt_chars, managed_subject_diff), model, prompt_chars
+    size_skip = _predispatch_size_skip(ctx, delegated_route, model, prompt, managed_subject_diff)
+    if size_skip is not None:
+        return size_skip
 
     log.info(
         "Advisory SDK call: model=%s prompt_chars=%d touched=%s sdk=%s cli=%s",
@@ -1116,6 +1336,11 @@ def _run_claude_advisory(
             pass
 
         if not result.success:
+            skip = _maybe_overflow_skip(
+                ctx, delegated_route, prompt_chars, model, meta,
+                result.error, getattr(result, "stderr_tail", ""))
+            if skip is not None:
+                return skip
             err_msg = _format_advisory_error(
                 prefix="SDK/CLI returned failure",
                 result_error=result.error,
@@ -1231,6 +1456,9 @@ def _run_claude_advisory(
             "Install: pip install 'ouroboros[claude-sdk]'"
         ), "", 0
     except Exception as e:
+        skip = _maybe_overflow_skip(ctx, delegated_route, prompt_chars, model, None, str(e), verb="raised")
+        if skip is not None:
+            return skip
         err_msg = _format_advisory_error(
             prefix=f"SDK call raised {type(e).__name__}",
             result_error=str(e),
@@ -1595,7 +1823,12 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
                 "to an agent route or a larger-window model if advisory "
                 "coverage is wanted."
             )
-        return "Advisory was skipped — prompt exceeded the budget gate (prompt too large for advisory). commit_reviewed may proceed. Consider splitting the commit into smaller chunks so advisory can run on the next change."
+        return (
+            "Advisory was skipped — the assembled prompt did not fit the advisory "
+            "route (window/size gate). commit_reviewed may proceed. Split the "
+            "commit into smaller chunks, or switch the advisory row to an "
+            "agent_session route, which retrieves context instead of inlining it."
+        )
 
     if latest and latest.status == "bypassed":
         return "Advisory was bypassed (audited). No open obligations — commit_reviewed should proceed. Consider running advisory_review for a proper review."

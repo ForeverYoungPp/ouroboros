@@ -828,3 +828,82 @@ def test_main_history_keeps_only_host_project_root_completion_while_project_keep
     assert completion["status"] == "completed"
     assert any(row.get("is_progress") for row in project_rows)
     assert any(row.get("system_type") == "task_summary" for row in project_rows)
+
+
+def test_main_history_admits_project_started_row_and_project_thread_excludes_it(
+    tmp_path,
+):
+    """B1 admission: the durable `project_started` row is Main-only — admitted
+    to the Main view with its event-time metadata passthrough (same keys as the
+    completion row), excluded from the Project's own thread view, and stable
+    across a replayed read."""
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+
+    project = create_project(tmp_path, "launch", name="Launch 🚀")
+    project_chat = int(project["chat_id"])
+    bind_task_to_project(
+        tmp_path, "root-project", project["id"], project_chat,
+        origin={"absent": "system"},
+    )
+    logs = tmp_path / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "chat.jsonl").write_text(
+        "\n".join(
+            json.dumps(row, ensure_ascii=False)
+            for row in (
+                {
+                    "ts": "2026-08-21T00:00:01Z",
+                    "direction": "system",
+                    "chat_id": 1,
+                    "type": "project_started",
+                    "task_id": "root-project",
+                    "project_id": "launch",
+                    "project_name": "Launch 🚀",
+                    "target_label": "Launch 🚀 › Ship release",
+                    "text": "Launch 🚀 › Ship release · Started\nWork is running in this Project.",
+                },
+                {
+                    "ts": "2026-08-21T00:00:02Z",
+                    "direction": "system",
+                    "chat_id": project_chat,
+                    "type": "task_summary",
+                    "task_id": "root-project",
+                    "text": "Detailed Project summary",
+                    "tool_calls": 3,
+                    "rounds": 4,
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+
+    def _messages(chat_id):
+        return json.loads(
+            asyncio.run(
+                endpoint(SimpleNamespace(query_params={"chat_id": str(chat_id)}))
+            ).body
+        )["messages"]
+
+    main = _messages(1)
+    assert [row["system_type"] for row in main if row.get("system_type")] == [
+        "project_started"
+    ]
+    started = next(row for row in main if row["system_type"] == "project_started")
+    assert started["role"] == "system"
+    assert started["task_id"] == "root-project"
+    assert started["project_id"] == "launch"
+    assert started["project_name"] == "Launch 🚀"
+    assert started["target_label"] == "Launch 🚀 › Ship release"
+    assert "status" not in started  # the started row carries no outcome yet
+
+    project_rows = _messages(project_chat)
+    assert all(
+        row.get("system_type") != "project_started" for row in project_rows
+    )
+    assert any(row.get("system_type") == "task_summary" for row in project_rows)
+
+    # Replay-safe: a second read of the same durable stream is identical.
+    assert _messages(1) == main

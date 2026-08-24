@@ -610,7 +610,52 @@ def enqueue_project_completion_summary(
         return False
 
 
+def announce_project_started(
+    drive_root: Any, project: Dict[str, Any], task_id: str, *, task: Any = None,
+) -> bool:
+    """Owe Main's one durable entry row when the AGENT starts a Project.
+
+    Mirrors ``enqueue_project_completion_summary``'s delivery mechanics: the
+    same terminal-delivery outbox, with the restart-surviving
+    ``delivery_id=project-start:<project_id>`` dedupe as the ONLY dedupe.
+    Called exclusively from the agent-initiated creation seams (owner decision
+    2=A): the promote_chat_to_task bind and a REAL ensure_project_scope create
+    (``created is True`` from ``create_project``). Owner HTTP/API creation and
+    manual task-to-project conversion stay silent.
+    """
+    project = project if isinstance(project, dict) else {}
+    pid = str(project.get("id") or "").strip()
+    tid = str(task_id or "").strip()
+    if not pid:
+        return False
+    try:
+        from ouroboros.projects_registry import task_presentation_snapshot
+        from supervisor.terminal_delivery import enqueue_terminal_delivery
+
+        snapshot = task_presentation_snapshot(
+            drive_root, tid, task=task if isinstance(task, dict) else None,
+            project_id=pid,
+        )
+        event = {
+            "type": "send_message", "chat_id": 1, "task_id": tid,
+            "text": (f"{snapshot['target_label']} · Started\n"
+                     "Work is running in this Project."),
+            "role": "system", "system_type": "project_started",
+            "delivery_id": f"project-start:{pid}",
+            "progress_meta": {
+                "project_id": pid,
+                "project_name": snapshot["project_name"],
+                "target_label": snapshot["target_label"],
+            },
+        }
+        return bool(enqueue_terminal_delivery(drive_root, event))
+    except Exception:
+        log.warning("Failed to enqueue Project started row for %s", pid, exc_info=True)
+        return False
+
+
 __all__ = [
+    "announce_project_started",
     "append_chat_annotation",
     "append_canonical_task_summary",
     "append_terminal_task_projection",
