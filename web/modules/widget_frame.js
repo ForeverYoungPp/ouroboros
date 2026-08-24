@@ -71,21 +71,43 @@ export function moduleBridgeScript(nonce) {
     `;
 }
 
-export function moduleResizeScript(nonce) {
+export function moduleResizeScript(nonce, frameFloor, maxHeight, borderReserve) {
     return `
         (() => {
             const root = document.getElementById('root');
+            const verticalOverflowState = [document.documentElement, document.body]
+                .filter(Boolean)
+                .map((element) => ({
+                    element,
+                    value: element.style.getPropertyValue('overflow-y'),
+                    priority: element.style.getPropertyPriority('overflow-y'),
+                }));
+            let suppressingVerticalOverflow = false;
             let lastHeight = 0;
+            const setVerticalOverflowSuppressed = (suppressed) => {
+                if (suppressed === suppressingVerticalOverflow) return;
+                suppressingVerticalOverflow = suppressed;
+                verticalOverflowState.forEach(({ element, value, priority }) => {
+                    if (suppressed) element.style.setProperty('overflow-y', 'hidden', 'important');
+                    else if (value) element.style.setProperty('overflow-y', value, priority);
+                    else element.style.removeProperty('overflow-y');
+                });
+            };
+            setVerticalOverflowSuppressed(true);
             const report = () => {
                 if (!root) return;
                 const box = root.getBoundingClientRect();
                 const body = document.body;
                 const bodyTop = body?.getBoundingClientRect().top || 0;
-                // The root's bottom edge includes collapsed child margins and
-                // body padding that root.scrollHeight alone can omit. It also
-                // avoids treating a fixed 100vh body as content when the module
-                // is small.
+                // The root's bottom edge captures collapsed child margins; body
+                // bottom padding and border complete the measured body box. This
+                // also avoids treating a fixed 100vh body as small-module content.
                 const bodyStyle = body ? getComputedStyle(body) : null;
+                const paddingBottom = Number.parseFloat(bodyStyle?.paddingBottom);
+                const borderBottom = Number.parseFloat(bodyStyle?.borderBottomWidth);
+                const bodyBottomSpacing = Math.max(0,
+                    (Number.isFinite(paddingBottom) ? paddingBottom : 0)
+                    + (Number.isFinite(borderBottom) ? borderBottom : 0));
                 const bodyHeight = body?.scrollHeight || 0;
                 const bodyClientHeight = body?.clientHeight || 0;
                 const fixedViewportBody = bodyStyle
@@ -96,10 +118,18 @@ export function moduleResizeScript(nonce) {
                 const contentHeight = Math.max(
                     root.scrollHeight,
                     box.height,
-                    box.bottom - bodyTop,
+                    box.bottom - bodyTop + bodyBottomSpacing,
                     bodyContentHeight,
                 );
                 const height = Math.ceil(contentHeight);
+                const outerHeight = Math.min(
+                    ${JSON.stringify(maxHeight)},
+                    Math.max(
+                        ${JSON.stringify(frameFloor)},
+                        height + ${JSON.stringify(borderReserve)},
+                    ),
+                );
+                setVerticalOverflowSuppressed(outerHeight < ${JSON.stringify(maxHeight)});
                 if (!height || height === lastHeight) return;
                 lastHeight = height;
                 window.parent.postMessage({
@@ -115,6 +145,7 @@ export function moduleResizeScript(nonce) {
             window.__ouroWidgetOnDispose?.(() => {
                 observer?.disconnect();
                 window.removeEventListener('load', onLoad);
+                setVerticalOverflowSuppressed(false);
             });
             report();
         })();

@@ -571,10 +571,17 @@ geometry/overflow contract, a paired disposer for every long-lived resource,
 declared refresh/stream/error semantics, and a named real-consumer visual
 verification path. Intentional omissions record why they are safe to defer.
 For Widgets, framed `height` values are bounded and module auto-height is
-host-controlled; module source loading and declarative requests have a bounded
-host timeout; declarative job widgets keep their `job_id` and bounded
-retry/timeout behavior visible in the refresh contract rather than hiding them
-in an author script.
+host-controlled. Below its finite ceiling, applying a reported block size must
+not change the child's inline-size basis; the host owns vertical scrollbar mode
+without disabling the orthogonal horizontal overflow capability, and content
+measurement includes the measured document's bottom padding and border.
+Feedback-sensitive verification is event-driven on the relevant engine: it
+proves temporal convergence to a quiet fixed point with a real consumer or
+production-derived fixture that crosses the known wrapping threshold, rather
+than comparing two snapshots. Module source loading and declarative requests
+have a bounded host timeout; declarative job widgets keep their `job_id` and
+bounded retry/timeout behavior visible in the refresh contract rather than
+hiding them in an author script.
 Missing or malformed job status is an immediate protocol error, while unknown
 non-empty in-progress labels remain bounded pending states for producer
 compatibility.
