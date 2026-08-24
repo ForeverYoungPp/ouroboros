@@ -57,21 +57,9 @@ err on the side of NOT recommending it and explain the tension.
 
 
 def _review_model_timeout_sec() -> float:
-    raw = os.environ.get("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", "")
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        value = 0.0
-    if value > 0:
-        return value
-    default_timeout = float(_cfg.get_llm_transport_read_timeout_sec())
-    if raw:
-        log.warning(
-            "Invalid or non-positive OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC=%r; using %.0fs",
-            raw,
-            default_timeout,
-        )
-    return default_timeout
+    from ouroboros.deadline_utils import review_logical_fallback_timeout_sec
+
+    return review_logical_fallback_timeout_sec()
 
 
 # The window/limit names below stay importable and MONKEYPATCHABLE on this
@@ -329,7 +317,7 @@ def _handle_task_acceptance_review(
             "classify_outcome_tier": True,
             "max_physical_attempts_per_actor": 2,
         },
-        task_id=str(getattr(ctx, "task_id", "") or ""),
+        task_id=str(getattr(ctx, "task_id", "") or ""), retry_key=f"task_acceptance:{task_acceptance_evidence_revision(evidence)}",
     )
     # Task acceptance stays on the API by owner decision (D15: harness slots
     # only for commit triad, scope, advisory). No route_env_key = api_chat pin.
@@ -356,7 +344,8 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
                                 routes: list = None,
                                 session_task: str = "",
                                 session_root: str = "",
-                                row_plan: dict = None) -> str:
+                                row_plan: dict = None,
+                                retry_key: str = "") -> str:
     if models is None:
         models = []
     try:
@@ -367,11 +356,13 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
                 result = pool.submit(
                     asyncio.run,
                     _multi_model_review_async(content, prompt, models, ctx, stable_prefix_len,
-                                              routes, session_task, session_root, row_plan),
+                                              routes, session_task, session_root, row_plan,
+                                              retry_key),
                 ).result()
         except RuntimeError:
             result = asyncio.run(_multi_model_review_async(content, prompt, models, ctx, stable_prefix_len,
-                                                           routes, session_task, session_root, row_plan))
+                                                           routes, session_task, session_root, row_plan,
+                                                           retry_key))
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         log.error("Multi-model review failed: %s", e, exc_info=True)
@@ -403,6 +394,7 @@ async def _query_model(
     effort: str = "",
     session_target: str = "",
     session_profile: str = "",
+    retry_key: str = "",
 ):
     async with semaphore:
         timeout_sec = _review_model_timeout_sec()
@@ -428,6 +420,7 @@ async def _query_model(
                 session_root=session_root if delegated else "",
                 policy={"output_contract": REVIEW_JSON_ARRAY_CONTRACT} if delegated else {},
                 task_attempt=getattr(ctx, "task_attempt", None) if ctx is not None else None,
+                retry_key=str(retry_key or ""),
             )
             slot = ReviewSlot(
                 slot_id=slot_id,
@@ -486,7 +479,8 @@ async def _multi_model_review_async(content: str, prompt: str,
                                      routes: list = None,
                                      session_task: str = "",
                                      session_root: str = "",
-                                     row_plan: dict = None):
+                                     row_plan: dict = None,
+                                     retry_key: str = ""):
     from ouroboros.review_execution import ReviewRouteKind
 
     row_routes = list(routes or []) + [ReviewRouteKind.API_CHAT] * max(0, len(models) - len(routes or []))
@@ -552,7 +546,7 @@ async def _multi_model_review_async(content: str, prompt: str,
         _query_model(llm_client, m, messages, semaphore, ctx, slot_id=row_ids[idx],
                      route=row_routes[idx], session_task=session_task, session_root=session_root,
                      effort=row_efforts[idx], session_target=row_targets[idx],
-                     session_profile=row_profiles[idx])
+                     session_profile=row_profiles[idx], retry_key=retry_key)
         for idx, m in enumerate(models)
     ]
     results = await asyncio.gather(*tasks)
@@ -1449,6 +1443,7 @@ def _dispatch_unified_review(ctx: ToolContext, commit_message: str, prepared: di
             session_task=prepared["session_task"],
             session_root=str(prepared["target_repo"]),
             row_plan=prepared["row_plan"],
+            retry_key=str(prepared.get("retry_key") or ""),
         )
         result = json.loads(result_json)
     except Exception as e:

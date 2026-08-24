@@ -1427,14 +1427,15 @@ class ReviewCoordinator:
                 else contextlib.nullcontext()
             )
             with attempt_rail:
-                _prior_msg, _prior_usage, _prior_text, _has_prior = None, None, "", False
+                _prior_msg, _prior_usage, _prior_text = None, None, ""
+                _last_msg, _last_usage, _last_text, _has_prior = None, None, "", False
                 for actor_attempt in range(actor_attempts):
                     if (
                         actor_attempt and logical_deadline_monotonic is not None
                         and time.monotonic() >= logical_deadline_monotonic
                     ):
                         if _has_prior:
-                            msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
+                            msg, usage, raw_text = _last_msg, _last_usage, _last_text
                             break
                         raise TimeoutError("Review logical deadline expired before retry dispatch")
                     try:
@@ -1464,7 +1465,7 @@ class ReviewCoordinator:
                             msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
                             break
                         raise
-                    _prior_msg, _prior_usage, _prior_text, _has_prior = msg, usage, raw_text, True
+                    _last_msg, _last_usage, _last_text, _has_prior = msg, usage, raw_text, True
                     if raw_text.strip():
                         if (
                             acceptance_actor

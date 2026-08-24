@@ -1979,6 +1979,19 @@ owner deadline and finalization reserve), Anthropic's direct route keeps its
 review-reasoning cutoff. A spent owner window yields a typed `$0
 not_dispatched` row before fan-out; under blocking enforcement an in-flight
 triad row remains pending instead of becoming a final quorum verdict. A
+reviewed commit has no independent outer tool cutoff: the foreground caller
+retains custody until settlement, while inner review/preflight/lock bounds and
+the task/supervisor absolute deadline remain the actual stop axes. Retry custody
+uses an explicit material/cycle
+identity when supplied: mutable prompt or prior-round history is deliberately not
+part of that identity, while a changed snapshot, owner intent, reviewer route, or
+admitted cycle mints a new one. Commit review takes that material identity from
+the canonical staged tree/parent binding; plan review re-enters a recorded
+in-flight cycle only when its process-local custody can join or replay every
+previously dispatched row. That cycle retains its original physical actor set
+and `$0` health/fit rows even if live readiness changes; partial
+`need_evidence` findings enter the next envelope only after the whole cycle is
+terminal. A
 delegated poll that loses transport after a run id
 exists preserves the exact durable invocation for retry custody; it does not
 cancel an otherwise healthy unknown run or create a second one.
@@ -2466,7 +2479,7 @@ Runtime floors:
 | OUROBOROS_PER_TASK_COST_USD | 50.0 | Hard per-task cost cap in USD over the WHOLE task tree (own calls + subagents): wired as `UsageScope.root_limit_usd`, enforced pre-dispatch by the physical-attempt ledger (`reserve_attempt`), and latched as the durable root budget fence on first refusal. Since v6.91 the in-task graceful stop (`task_pacing.resolve_cost_ceiling`) also binds to it — min(pct-of-global, cap − absolute planning margin) against TREE-accounted spend — so a best-effort wrap-up fires before the fence. The cap stops the task on its own even when no finite global budget exists (`TOTAL_BUDGET` unset): the two axes are independent components of the ceiling, not a gate on one another. (The pre-v6.64 "soft threshold" semantics is gone; the label was stale from 2026-07-14 to v6.91.) |
 | OUROBOROS_RUB_USD_RATE | (empty) | Explicit RUB→USD divisor for cloud.ru catalog token costs. Empty/invalid means cloud.ru cost is unknown; there is no implicit FX fallback. |
 | OUROBOROS_PRICING_TTL_SEC | 21600 | Live-pricing (OpenRouter + cloud.ru catalog) refetch interval in seconds; prices/FX drift |
-| OUROBOROS_TOOL_TIMEOUT_SEC | 600 | Global tool timeout override (read live from settings.json on each tool call) |
+| OUROBOROS_TOOL_TIMEOUT_SEC | 600 | Global tool timeout override (read live from settings.json on each tool call). Reviewed commit tools retain foreground custody and do not use this generic wrapper as a terminal cutoff. |
 | OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC | 1800 | Upper bound (seconds) for an explicit per-call `run_command`/`run_script` `timeout_sec`/`timeout` override (v6.35.0). The handler clamps the requested value to this ceiling and to half the remaining task deadline; the matching outer tool-execution timeout rises to the same ceiling (plus a small margin) so a long approved command is not cut off by the static entry cap. |
 | OUROBOROS_FINALIZATION_GRACE_SEC | 120 | Grace window before hard task termination becomes final. The supervisor clamps this setting to 0-300 seconds and uses it to let headless/workspace artifact finalization, verifier handoff, and honest terminal result writing complete before process teardown. |
 | OUROBOROS_WEBSEARCH_MODEL | gpt-5.2 | Official OpenAI Responses model for `web_search` when `OPENAI_BASE_URL` is empty |

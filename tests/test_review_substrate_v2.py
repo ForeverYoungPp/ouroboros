@@ -1797,6 +1797,117 @@ def test_late_review_result_is_replayed_without_a_second_paid_dispatch(tmp_path)
     assert second.actors[0]["late_result_pending"] is False
 
 
+def test_explicit_retry_key_joins_worker_after_prompt_history_changes(tmp_path):
+    import threading
+
+    calls = []
+    settled = threading.Event()
+
+    class SlowLLM:
+        def chat(self, **kwargs):
+            calls.append(kwargs)
+            time.sleep(0.08)
+            settled.set()
+            return {"content": '{"verdict":"PASS","findings":[],"summary":"late"}'}, {}
+
+    ctx = SimpleNamespace(task_id="history-retry", event_queue=None, pending_events=[])
+    slot = ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.02)
+    first = run_review_request(
+        ReviewRequest(
+            surface="scope_review", goal="review", task_id="history-retry",
+            retry_key="snapshot-1/cycle-1", messages=[{"role": "user", "content": "first"}],
+        ),
+        slots=[slot], drive_root=tmp_path, llm=SlowLLM(), usage_ctx=ctx,
+    )
+    second = run_review_request(
+        ReviewRequest(
+            surface="scope_review", goal="review", task_id="history-retry",
+            retry_key="snapshot-1/cycle-1",
+            messages=[{"role": "user", "content": "first\nprior round: pending"}],
+        ),
+        slots=[slot], drive_root=tmp_path, llm=SlowLLM(), usage_ctx=ctx,
+    )
+
+    assert len(calls) == 1
+    assert first.actors[0]["operation_id"] == second.actors[0]["operation_id"]
+    assert first.actors[0]["operation_state"] == second.actors[0]["operation_state"] == "in_flight"
+    assert settled.wait(1.0)
+
+
+def test_explicit_retry_key_replays_normally_settled_actor_without_second_dispatch(tmp_path):
+    calls = []
+
+    class FastLLM:
+        def chat(self, **kwargs):
+            calls.append(kwargs)
+            return {"content": '{"verdict":"PASS","findings":[],"summary":"done"}'}, {}
+
+    ctx = SimpleNamespace(task_id="settled-retry", event_queue=None, pending_events=[])
+    slot = ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=1)
+    first = run_review_request(
+        ReviewRequest(
+            surface="plan_review", goal="review", task_id="settled-retry",
+            retry_key="plan-1/cycle-1", messages=[{"role": "user", "content": "first"}],
+        ),
+        slots=[slot], drive_root=tmp_path, llm=FastLLM(), usage_ctx=ctx,
+    )
+    second = run_review_request(
+        ReviewRequest(
+            surface="plan_review", goal="review", task_id="settled-retry",
+            retry_key="plan-1/cycle-1",
+            messages=[{"role": "user", "content": "first plus rendered history"}],
+        ),
+        slots=[slot], drive_root=tmp_path, llm=FastLLM(), usage_ctx=ctx,
+    )
+
+    assert len(calls) == 1
+    assert first.actors[0]["operation_id"] == second.actors[0]["operation_id"]
+    assert second.actors[0]["operation_state"] == "settled"
+
+
+def test_late_plan_api_error_replays_same_terminal_attempt(tmp_path):
+    calls = []
+
+    class SlowAPIError:
+        def chat(self, **kwargs):
+            calls.append(kwargs)
+            time.sleep(0.05)
+            raise RuntimeError("provider ended the paid request")
+
+    ctx = SimpleNamespace(task_id="late-plan-error", event_queue=None, pending_events=[])
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="late-plan-error",
+        retry_key="plan-envelope/cycle-1",
+    )
+    slot = ReviewSlot(
+        slot_id="slot_a", model="same/model", timeout_sec=0.01,
+        transport_timeout_sec=10,
+    )
+    first = run_review_request(
+        request, slots=[slot], drive_root=tmp_path, llm=SlowAPIError(), usage_ctx=ctx,
+    )
+    assert first.actors[0]["operation_state"] == "in_flight"
+    operation_id = first.actors[0]["operation_id"]
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        settled = getattr(ctx, "_review_settled_attempts", {})
+        if settled:
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("late plan API error was not retained for reconciliation")
+
+    second = run_review_request(
+        request, slots=[slot], drive_root=tmp_path, llm=SlowAPIError(), usage_ctx=ctx,
+    )
+    assert len(calls) == 1
+    assert second.actors[0]["status"] == "error"
+    assert second.actors[0]["operation_id"] == operation_id
+    assert second.actors[0]["operation_state"] == "late_settled"
+    assert "provider ended the paid request" in second.actors[0]["error"]
+
+
 def test_review_paid_stamp_is_write_ahead_of_a_slow_worker(tmp_path):
     from types import SimpleNamespace
 

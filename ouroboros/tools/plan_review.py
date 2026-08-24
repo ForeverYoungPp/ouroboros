@@ -49,25 +49,25 @@ from ouroboros.tools.plan_review_runtime import (
     PLAN_NO_SNAPSHOT as _PLAN_NO_SNAPSHOT,
     PLAN_REVIEW_MAX_TOKENS as _PLAN_REVIEW_MAX_TOKENS,
     emit_plan_review_advisory_open as _emit_plan_review_advisory_open,
+    plan_fanout_inputs as _plan_fanout_inputs,
+    plan_in_flight_custody_error as _plan_in_flight_custody_error,
     plan_deadline_skip as _plan_deadline_skip,
-    plan_health_epoch as _plan_health_epoch,
-    plan_health_skip_rows as _plan_health_skip_rows,
-    plan_panel_health_snapshot as _plan_panel_health_snapshot,
     plan_payload_roots as _plan_payload_roots,
-    plan_quorum_unreachable_facts as _plan_quorum_unreachable_facts,
-    plan_review_slots as _plan_review_slots, plan_row_typed_facts as _plan_row_typed_facts,
+    plan_review_slots as _plan_review_slots,
     plan_reviewer_config_fingerprint as _plan_reviewer_config_fingerprint,
-    plan_slot_fit as _plan_slot_fit,
     plan_wave_replay_decision as _plan_wave_replay_decision,
+    plan_wave_has_in_flight as _plan_wave_has_in_flight,
     record_raw_plan_request_attempt as _record_raw_plan_request_attempt,
     root_exploration_log as _root_exploration_log,  # noqa: F401 - compatibility seam
     run_plan_review_slots as _run_plan_review_slots,
+    synthesize_plan_review_wave as _synthesize_plan_review_wave,
     build_plan_review_packet as _build_packet,
 )
 from ouroboros.tools.plan_review_artifacts import (
     authority_wave as _authority_wave,
     continuation_state as _continuation_state,
     exact_wave as _exact_wave,
+    in_flight_resume_inputs as _plan_in_flight_resume_inputs,
     persist_wave as _persist_plan_review_wave_artifact,
     record_cannot_verify_attempt as _record_cannot_verify_attempt,
     record_exact_wave as _record_exact_wave,
@@ -92,7 +92,6 @@ def _plan_review_wrapper_timeout_sec() -> float:
 def _plan_task_tool_timeout_sec() -> float:
     return _plan_review_wrapper_timeout_sec() + get_finalization_grace_sec()
 _TASK_EVIDENCE_RESULT_CHARS = 6_000
-_RAW_TEXT_PREVIEW_CHARS = 2_000
 
 
 @dataclass(frozen=True)
@@ -497,6 +496,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
     previous_override: Optional[dict] = None
     replay_snapshot: Any = _PLAN_NO_SNAPSHOT
+    resume_in_flight = False
     existing = plan_review_wave(state, fingerprint)
     if existing is not None and not isinstance(existing.get("spec"), dict):
         existing = None  # C-09: a COMPACTED row (no frozen spec) is never authority
@@ -509,6 +509,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
                 "ERROR: Exact plan-review authority is unreadable; replay and disposition are refused.",
                 "plan_review_exact_artifact_unavailable",
             )
+        resume_in_flight = _plan_wave_has_in_flight(existing)
         # Identical requests replay free unless authority lapsed; fully rejected
         # blocking findings are the one earned-delta exception (4e133c8a).
         earned_delta = (
@@ -519,15 +520,15 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             and plan_spec.blocking_fully_rejected(
                 existing.get("findings"), existing.get("dispositions"))
         )
-        if earned_delta:
+        if earned_delta and not resume_in_flight:
             # the rejected wave IS the previous cycle for the delta panel
             previous_override = existing
-        elif bool(existing.get("closed")):
+        elif bool(existing.get("closed")) and not resume_in_flight:
             # A closed verdict is earned authority; later roster changes govern
             # future panels and do not retroactively void it (accepted 3a).
             return _render_wave(existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
                                 cached=True, reminder=reminder)
-        else:  # stale ⇒ replay authority lapsed: the identical envelope re-dispatches fresh
+        elif not resume_in_flight:  # stale ⇒ identical envelope re-dispatches fresh
             stale, replay_snapshot = _plan_wave_replay_decision(_plan_review_slots, existing)
             if not stale:
                 if enforcement == "advisory":
@@ -544,7 +545,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         except (OSError, TimeoutError, ValueError) as exc:
             return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
         return _plan_deadline_skip(ctx, emit=True) or deadline_skip
-    if cap is not None and cycles_paid >= cap:
+    if cap is not None and cycles_paid >= cap and not resume_in_flight:
         return _cycles_exhausted(ctx, state, state_root, task_id, cap=cap, cycles_paid=cycles_paid,
                                  enforcement=enforcement, reminder=reminder,
                                  request_fingerprint=fingerprint)
@@ -562,7 +563,17 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             ctx, "ERROR: No review models configured. Set OUROBOROS_REVIEW_MODELS in settings.",
             "review_models_unconfigured")
     configured_slots = list(slots)
-    previous = previous_override if previous_override is not None else _last_paid_wave(state)
+    resume = _plan_in_flight_resume_inputs(
+        existing, state, state_root, task_id, configured_slots,
+    ) if resume_in_flight else {}
+    if resume.get("error"):
+        return _render_wave(
+            existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
+            cached=True, reminder="\n".join(x for x in (reminder, resume["error"]) if x),
+        )
+    previous = resume.get("previous") if resume_in_flight else (
+        previous_override if previous_override is not None else _last_paid_wave(state)
+    )
     if previous is not None:
         try:
             previous = _authority_wave(state_root, task_id, previous)
@@ -572,7 +583,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
                 "ERROR: Prior exact plan-review authority is unreadable; a delta review is refused.",
                 "plan_review_exact_artifact_unavailable",
             )
-    cycle_index = cycles_paid + 1
+    cycle_index = int(resume.get("cycle_index") or cycles_paid + 1)
+    retry_key = str(resume.get("retry_key") or f"plan_review:{fingerprint}:{cycle_index}")
     system_prompt, user_content, session_task = _build_packet(
         ctx, spec=spec, request=request, manifest=manifest, constitutional=constitutional,
         system_root=system_root, active_root=active_root, cycle_index=cycle_index,
@@ -602,15 +614,31 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             reminder=reminder,
         )
     quorum = adaptive_quorum(len(slots))
-    # One health snapshot: typed unavailability skips at $0; unknown dispatches (B2b).
-    health_evidence = _plan_panel_health_snapshot(slots) if replay_snapshot is _PLAN_NO_SNAPSHOT else replay_snapshot
-    live_slots, health_skip_rows = _plan_health_skip_rows(slots, health_evidence)
-    # Oversize is a free typed row; live slots still dispatch when health already blocks quorum.
-    callable_slots, oversize_rows, fit_error = _plan_slot_fit(
-        live_slots, prompt_chars=len(system_prompt) + len(user_content), quorum=quorum)
-    if fit_error and not health_skip_rows:
-        return _plan_unavailable(ctx, fit_error, "review_context_unavailable")
-    admission = review_wave_budget_gate(  # priced on the slots that will actually be called
+    fanout = _plan_fanout_inputs(
+        slots, resume=resume if resume_in_flight else None, replay_snapshot=replay_snapshot,
+        prompt_chars=len(system_prompt) + len(user_content), quorum=quorum,
+    )
+    if fanout["error"]:
+        if not resume_in_flight:
+            return _plan_unavailable(ctx, fanout["error"], "review_context_unavailable")
+        return _render_wave(
+            existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
+            cached=True, reminder="\n".join(x for x in (reminder, fanout["error"]) if x),
+        )
+    callable_slots = fanout["callable_slots"]
+    health_skip_rows, oversize_rows = fanout["health_skip_rows"], fanout["oversize_rows"]
+    health_evidence = fanout["health_evidence"]
+    if resume_in_flight and callable_slots:
+        pending_note = _plan_in_flight_custody_error(
+            retry_key=retry_key, task_id=str(task_id), active_root=active_root,
+            callable_slots=list(callable_slots), ctx=ctx,
+        )
+        if pending_note:
+            return _render_wave(
+                existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
+                cached=True, reminder="\n".join(x for x in (reminder, pending_note) if x),
+            )
+    admission = None if resume_in_flight else review_wave_budget_gate(
         ctx, surface="plan_review", models=[str(s.model) for s in callable_slots],
         prompt_chars=len(system_prompt) + len(user_content), max_completion_tokens=_PLAN_REVIEW_MAX_TOKENS,
     )
@@ -634,88 +662,19 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         output_contract=plan_spec.PLAN_FINDINGS_ARRAY_CONTRACT,
         slot_messages=slot_messages,
         session_threads=session_threads,
+        retry_key=retry_key,
     ) if callable_slots else []
     # excluded slots stay configured rows: they count in the quorum denominator
     rows = list(rows) + oversize_rows + health_skip_rows
-    ids = plan_spec.spec_ids(spec)
-    seen_after: set[str] = set(str(s) for s in state.get("need_evidence_seen") or [])
-    slot_results: List[dict] = []
-    slot_records: List[dict] = []
-    for row in rows:
-        findings: List[dict] = []
-        disclosures: List[str] = []
-        error = str(row.get("error") or "")
-        ok = not error
-        if ok:
-            parsed, parse_error = plan_spec.parse_findings(str(row.get("text") or ""))
-            if parse_error:
-                ok, error = False, parse_error
-            else:
-                findings, disclosures, slot_seen = plan_spec.validate_findings(
-                    parsed, spec_ids=ids, seen_locators=seen_after, slot=str(row.get("slot_id") or ""),
-                )  # cumulative across the wave: the per-task memory cap is exact
-                seen_after |= set(slot_seen)
-        slot_results.append({"slot": row.get("slot_id"), "model": row.get("model"), "ok": ok,
-                             "findings": findings, "error": error or None})
-        slot_records.append({
-            "slot_id": row.get("slot_id"), "model": row.get("model"), "route": row.get("route"),
-            "host_file_read_attestation": row.get("host_file_read_attestation"),
-            "ok": ok, "error": error or None, "disclosures": disclosures, **_plan_row_typed_facts(row),
-            "prompt_ref": row.get("prompt_ref") or {}, "response_ref": row.get("response_ref") or {},
-            "tokens_in": row.get("tokens_in"), "tokens_out": row.get("tokens_out"), "cost": row.get("cost"),
-            "raw_text_preview": (
-                truncate_review_artifact(str(row.get("text") or ""), limit=_RAW_TEXT_PREVIEW_CHARS)
-                if not ok else ""
-            ),
-            "review_thread_id": str(row.get("review_thread_id") or ""),
-            "review_turn_id": str(row.get("review_turn_id") or ""),
-            "review_thread_receipt": row.get("review_thread_receipt") or {},
-            "auth_route_receipt": row.get("auth_route_receipt") or {},
-            "profile_continuity_receipt": row.get("profile_continuity_receipt") or {},
-            "applied_profile": str(row.get("applied_profile") or ""),
-        })
-    agg = plan_spec.aggregate(slot_results, quorum=quorum)
-    aggregate = str(agg["aggregate"])
-    wave = {
-        "schema_version": 2,
-        "cycle_index": cycle_index,
-        "request_fingerprint": fingerprint,
-        "previous_fingerprint": str((previous or {}).get("request_fingerprint") or ""),
-        "goal": spec["goal"],
-        "plan_prose_hash": sha256(request.plan.encode("utf-8")).hexdigest(),
-        "spec": spec,
-        "spec_hash": plan_spec.spec_hash(spec),
-        "evidence_manifest": {
-            "declared": list(manifest.get("declared") or []),
-            "attached": [{"locator": a.get("locator"), "sha256": a.get("sha256"), "bytes": a.get("bytes"),
-                          **({"secrets_redacted": True} if a.get("secrets_redacted") else {})}
-                         for a in manifest.get("attached") or []],
-            "omissions": list(manifest.get("omissions") or []),
-            "reviewer_requested": list(manifest.get("reviewer_requested") or []),
-            "reviewer_requested_dropped": list(manifest.get("reviewer_requested_dropped") or []),
-        },
-        "evidence_manifest_hash": manifest_hash,
-        "constitutional": bool(constitutional),
-        "constitutional_note": constitutional_note,
-        "findings": list(agg["findings"]),
-        "aggregate": aggregate,
-        "reasons": list(agg["reasons"]),
-        "counts": dict(agg["counts"]),
-        "closed": aggregate == "GREEN",
-        "dispositions": [],
-        "actors": slot_records,
-        "actors_degraded": [str(r["slot_id"]) for r in slot_records if not r["ok"]],
-        "enforcement": enforcement,
-        "cycle_cap": cap,
-        # B2: paid = at least one slot physically dispatched this wave (oversize/skip
-        # rows are $0 and never charge; a dispatched DEGRADED panel pays like any other).
-        "paid": bool(callable_slots),
-        # Material health epoch, roster identity, and structural unreachability (B2b).
-        "health_epoch": _plan_health_epoch(health_evidence),
-        "reviewer_config_fingerprint": _plan_reviewer_config_fingerprint(configured_slots),
-        **_plan_quorum_unreachable_facts(slot_records, quorum=quorum),
-        "reviewed_at": utc_now_iso(),
-    }
+    wave, seen_after, agg = _synthesize_plan_review_wave(
+        rows, state=state, spec=spec, request_plan=request.plan, fingerprint=fingerprint,
+        previous=previous, manifest=manifest, manifest_hash=manifest_hash,
+        constitutional=constitutional, constitutional_note=constitutional_note,
+        cycle_index=cycle_index, retry_key=retry_key, enforcement=enforcement, cap=cap,
+        quorum=quorum, configured_slots=configured_slots, callable_slots=callable_slots,
+        health_evidence=health_evidence,
+    )
+    aggregate = str(wave["aggregate"])
     exact_wave = _exact_wave(
         wave, plan_prose=request.plan, manifest=manifest, slots=configured_slots, rows=rows,
         system_prompt=system_prompt, user_content=user_content,
@@ -733,12 +692,18 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             stored = wave
     except (OSError, TimeoutError, ValueError) as exc:
         return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
-    paid_now = cycles_paid + (1 if wave["paid"] else 0)
+    try:
+        paid_now = int(load_plan_review_state(state_root, task_id).get("cycles_paid") or 0)
+    except (OSError, TimeoutError, ValueError) as exc:
+        return f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}"
     if enforcement == "advisory" and not stored.get("closed"):
         # B2: loud at the moment — ONE typed owner-visible event per recorded open wave.
         _emit_plan_review_advisory_open(ctx, state_root, task_id=task_id, wave=stored,
                                         cycles_paid=paid_now, cap=cap)
-    if (cap is not None and paid_now >= cap and not stored.get("closed")):
+    if (
+        cap is not None and paid_now >= cap and not stored.get("closed")
+        and not _plan_wave_has_in_flight(wave)
+    ):
         # Scope-gate finding (39c3a195): when the FINAL permitted cycle ends open, the typed
         # cap state must land NOW — not wait for a second envelope the agent may never send —
         # or the blocking gate holds a task that can never buy another panel (D27).

@@ -16,6 +16,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from ouroboros.deadline_utils import llm_transport_timeout_sec, logical_operation_timeout_sec
@@ -49,26 +50,36 @@ def _attempt_key(request: Any, slot: Any) -> str:
             "use_local", "route", "session_target", "session_profile",
         )
     }
-    payload = {
+    identity = {
         "retry_key": retry_key,
         "surface": getattr(request, "surface", ""),
         "task_id": getattr(request, "task_id", ""),
-        "task_attempt": getattr(request, "task_attempt", None),
         "call_type": getattr(request, "call_type", ""),
-        "max_tokens": getattr(request, "max_tokens", None),
-        "temperature": getattr(request, "temperature", None),
-        "no_proxy": getattr(request, "no_proxy", None),
-        "slot": slot_data,
-        "messages": slot_messages if slot_messages is not None else getattr(request, "messages", []),
-        "goal": getattr(request, "goal", ""),
-        "scope": getattr(request, "scope", ""),
-        "subject": getattr(request, "subject", ""),
-        "evidence_refs": getattr(request, "evidence_refs", []),
-        "evidence": getattr(request, "evidence", {}),
-        "policy": getattr(request, "policy", {}),
         "session_root": getattr(request, "session_root", ""),
-        "session_task": getattr(request, "session_task", ""),
+        "slot": slot_data,
     }
+    # An explicit retry key is the logical-operation identity. Mutable prompt
+    # history must not turn a retry of that operation into a second paid send.
+    # Callers change the key for genuinely new material/cycles; old callers
+    # without one retain the full content-addressed behavior byte-for-byte.
+    if retry_key:
+        payload = identity
+    else:
+        payload = {
+            **identity,
+            "task_attempt": getattr(request, "task_attempt", None),
+            "max_tokens": getattr(request, "max_tokens", None),
+            "temperature": getattr(request, "temperature", None),
+            "no_proxy": getattr(request, "no_proxy", None),
+            "messages": slot_messages if slot_messages is not None else getattr(request, "messages", []),
+            "goal": getattr(request, "goal", ""),
+            "scope": getattr(request, "scope", ""),
+            "subject": getattr(request, "subject", ""),
+            "evidence_refs": getattr(request, "evidence_refs", []),
+            "evidence": getattr(request, "evidence", {}),
+            "policy": getattr(request, "policy", {}),
+            "session_task": getattr(request, "session_task", ""),
+        }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
 
@@ -167,10 +178,27 @@ def run_custodied_review_slots(
                     pending = {}
                     setattr(usage_ctx, "_review_pending_invocations", pending)
                 pending[entry.key] = {"pending_invocation_id": pending_invocation}
-            replayable = actor.status in {"ok", "empty"} or bool(
+            explicit_retry = bool(str(getattr(request, "retry_key", "") or "").strip())
+            route = getattr(slot, "route", "")
+            route_value = str(getattr(route, "value", route) or "")
+            # A plan cycle owns one exact paid API attempt.  If its caller's
+            # logical window expired and that API attempt later settled as an
+            # error, retain the terminal actor so reconciliation can close the
+            # same cycle instead of either losing custody or paying again.
+            # Agent-session preflight errors remain retryable unless the
+            # delegated run actually started; commit-review bindings likewise
+            # keep their existing same-binding infrastructure retry semantics.
+            late_plan_api_error = bool(
+                late
+                and explicit_retry
+                and str(getattr(request, "surface", "") or "") == "plan_review"
+                and route_value != "agent_session"
+                and not pending_invocation
+            )
+            replayable = actor.status in {"ok", "empty"} or late_plan_api_error or bool(
                 failure_custody.get("delegated_run_started") and not pending_invocation
             )
-            if late and replayable and usage_ctx is not None:
+            if replayable and usage_ctx is not None and (late or explicit_retry):
                 settled = getattr(usage_ctx, "_review_settled_attempts", None)
                 if not isinstance(settled, dict):
                     settled = {}
@@ -348,3 +376,42 @@ def run_custodied_review_slots(
             "in_flight" if entry is not None else "settled",
         ))
     return actors
+
+
+def review_retry_custody_available(
+    *,
+    retry_key: str,
+    surface: str,
+    task_id: str,
+    call_type: str,
+    session_root: str,
+    slots: List[Any],
+    usage_ctx: Any,
+) -> bool:
+    """Whether a same-cycle retry can join/replay without a new dispatch.
+
+    This is intentionally process-local, matching the custody store itself. A
+    caller that recovered a durable ``in_flight`` wave after process loss must
+    report the outcome as unknown instead of turning absence of local custody
+    into permission for a second paid send.
+    """
+    request = SimpleNamespace(
+        retry_key=str(retry_key or ""),
+        surface=str(surface or ""),
+        task_id=str(task_id or ""),
+        call_type=str(call_type or ""),
+        session_root=str(session_root or ""),
+    )
+    settled = getattr(usage_ctx, "_review_settled_attempts", None)
+    pending = getattr(usage_ctx, "_review_pending_invocations", None)
+    with _ACTIVE_LOCK:
+        for slot in slots:
+            key = _attempt_key(request, slot)
+            if key in _ACTIVE:
+                continue
+            if isinstance(settled, dict) and key in settled:
+                continue
+            if isinstance(pending, dict) and key in pending:
+                continue
+            return False
+    return True

@@ -1561,6 +1561,7 @@ def _build_host_acceptance_evidence(ctx: _TaskAcceptanceContext) -> Dict[str, An
 
 def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
     """Perform the one substantive host panel over the pre-bound evidence."""
+    from ouroboros.review_evidence import task_acceptance_evidence_revision
     from ouroboros.review_substrate import (
         HARDNESS_ADVISORY_VISIBLE,
         ReviewRequest,
@@ -1588,14 +1589,10 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
             "classify_outcome_tier": True,
             "max_physical_attempts_per_actor": 2,
         },
-        task_id=ctx.task_id,
+        task_id=ctx.task_id, retry_key=f"task_acceptance:{task_acceptance_evidence_revision(evidence)}",
     )
-    # Budget admission for the whole acceptance wave (v6.69.0): a wave that
-    # cannot fit the remaining root budget is declined up front as a terminal
-    # DEGRADED (no-quorum semantics) instead of dying mid-wave. The estimate
-    # renders the REAL per-slot message pair; the rare second physical attempt
-    # is deliberately not multiplied in — a fail-open coarse filter, not a
-    # hard reservation.
+    # Budget-admit the whole panel from its real per-slot prompts. This coarse
+    # fail-open estimate excludes the rare repair resend; it is not a reservation.
     from ouroboros.tools.review_helpers import review_wave_budget_gate
 
     try:

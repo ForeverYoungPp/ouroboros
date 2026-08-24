@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 import math
+import os
 import time
 from typing import Any, Optional
+
+log = logging.getLogger(__name__)
 
 
 def parse_deadline_ts(value: Any) -> Optional[datetime]:
@@ -188,6 +192,25 @@ def logical_operation_timeout_sec(
     except (TypeError, ValueError):
         value = llm_transport_timeout_sec()
     return max(0.001, value)
+
+
+def review_logical_fallback_timeout_sec() -> float:
+    """Return the review-specific logical fallback, distinct from transport."""
+    raw = os.environ.get("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", "")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 0.0
+    if math.isfinite(value) and value > 0:
+        return value
+    fallback = llm_transport_timeout_sec()
+    if raw:
+        log.warning(
+            "Invalid or non-positive OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC=%r; using %.0fs",
+            raw,
+            fallback,
+        )
+    return fallback
 
 
 def review_transport_timeout(model: Any, explicit: Any = None, deadline_at: Any = None) -> Optional[float]:

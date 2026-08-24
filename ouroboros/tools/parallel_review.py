@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import concurrent.futures as _cf
 import hashlib
+import json
 import logging
 
 from ouroboros.utils import run_cmd
@@ -172,7 +173,7 @@ def _prepare_scope_rows(ctx, commit_message, *, goal, scope, review_rebuttal,
 
 
 def _run_scope(ctx, commit_message, scope_rows, dispatch, *, goal, scope,
-               review_rebuttal, history_snapshot, scope_history):
+               review_rebuttal, history_snapshot, scope_history, retry_key=""):
     """Dispatch (or, on an admission block, typed-placeholder) every scope row
     and aggregate the panel verdict — the dispatch half of the Q25-A split.
     ``dispatch=False`` renders prepared rows as $0 not_dispatched placeholders
@@ -202,6 +203,7 @@ def _run_scope(ctx, commit_message, scope_rows, dispatch, *, goal, scope,
                 session_target=slot.session_target,
                 session_profile=getattr(slot, "session_profile", ""),
                 prepared=row["prepared"],
+                retry_key=retry_key,
             )
 
         scope_slots = [row["slot"] for row in scope_rows]
@@ -382,7 +384,33 @@ def _run_scope(ctx, commit_message, scope_rows, dispatch, *, goal, scope,
         return result
 
 
-def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebuttal=""):
+def _commit_review_retry_key(
+    ctx, commit_message, *, goal, scope, review_rebuttal, binding_fingerprint="",
+):
+    """Bind one logical review cycle to canonical staged material and intent."""
+    material = str(binding_fingerprint or "").strip()
+    if not material:
+        try:
+            diff_bytes = run_cmd(
+                ["git", "diff", "--cached", "--binary", "--no-ext-diff"],
+                cwd=ctx.repo_dir,
+            ).encode()
+            tree_sha = run_cmd(["git", "write-tree"], cwd=ctx.repo_dir).strip()
+        except Exception:
+            diff_bytes, tree_sha = b"", ""
+        material = hashlib.sha256(tree_sha.encode() + b"\0" + diff_bytes).hexdigest()
+    return "commit_review:" + hashlib.sha256(json.dumps({
+        "binding": material, "commit_message": commit_message,
+        "goal": goal, "scope": scope,
+        "rebuttal": hashlib.sha256(str(review_rebuttal or "").encode()).hexdigest(),
+        "contract": str(getattr(ctx, "_current_review_contract_fingerprint", "") or ""),
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def run_parallel_review(
+    ctx, commit_message, *, goal="", scope="", review_rebuttal="",
+    review_binding_fingerprint="",
+):
     """Run the commit gate's triad and scope reviews against the staged diff.
 
     Q25-A ordering: BOTH gate packets (the triad api pack and every scope row's
@@ -405,10 +433,18 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
     ctx._managed_review_subject_memo = {}
 
     try:
-        diff_bytes = run_cmd(["git", "diff", "--cached"], cwd=ctx.repo_dir).encode()
+        diff_bytes = run_cmd(
+            ["git", "diff", "--cached", "--binary", "--no-ext-diff"], cwd=ctx.repo_dir,
+        ).encode()
     except Exception:
         diff_bytes = b""
-    snapshot_key = hashlib.sha256(diff_bytes).hexdigest()[:16]
+    snapshot_digest = hashlib.sha256(diff_bytes).hexdigest()
+    snapshot_key = snapshot_digest[:16]
+    retry_key = _commit_review_retry_key(
+        ctx, commit_message, goal=goal, scope=scope,
+        review_rebuttal=review_rebuttal,
+        binding_fingerprint=review_binding_fingerprint,
+    )
     _stored = getattr(ctx, '_scope_review_history', None) or {}
     _scope_history = _stored.get(snapshot_key, []) if isinstance(_stored, dict) else []
     _history_snapshot = list(getattr(ctx, '_review_history', []))
@@ -421,6 +457,8 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
     try:
         triad_prepared, triad_early, triad_exited = _prepare_unified_review(
             ctx, commit_message, review_rebuttal=review_rebuttal, goal=goal, scope=scope)
+        if triad_prepared is not None:
+            triad_prepared["retry_key"] = retry_key
     except Exception as e:
         log.warning("Triad review raised unexpected exception: %s", e)
         triad_early = (
@@ -480,7 +518,7 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
             scope_result = _run_scope(
                 ctx, commit_message, scope_rows, False, goal=goal, scope=scope,
                 review_rebuttal=review_rebuttal, history_snapshot=_history_snapshot,
-                scope_history=_scope_history)
+                scope_history=_scope_history, retry_key=retry_key)
     else:
         # ---- Phase 2: submit the assembled packets to the executor pool. ----
         with _cf.ThreadPoolExecutor(max_workers=2) as pool:
@@ -492,7 +530,7 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
                 pool.submit(_run_scope, ctx, commit_message, scope_rows, True,
                             goal=goal, scope=scope, review_rebuttal=review_rebuttal,
                             history_snapshot=_history_snapshot,
-                            scope_history=_scope_history)
+                            scope_history=_scope_history, retry_key=retry_key)
                 if scope_rows else None
             )
             if triad_fut is None:

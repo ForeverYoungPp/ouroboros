@@ -177,7 +177,6 @@ BAND_PATHS = {
     "tests/test_onboarding_complete_endpoint.py": None,
     "tests/test_onboarding_wizard.py": None,
     "tests/test_packaged_runtime_and_lifecycle.py": None,
-    "tests/test_plan_review_engine.py": "Contract tests for the redesigned plan-review engine (waves, cycles, dispositions, evidence, gate findings) grew past 1000 across the campaign's reviewed fix batches; one engine, one suite.",
     "tests/test_repo_health_smoke.py": "size-ratchet redesign: merge-aware previous, pairwise base-vs-tip, candidate-mode generator contract tests",
     "tests/test_review_fidelity.py": None,
     "tests/test_review_verification_v6544.py": None,
@@ -209,7 +208,7 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/loop.py": 316681,
+    "ouroboros/loop.py": 316584,
     "tests/test_delegated_subagent_transport.py": 320571,
     "tests/test_devtools_benchmarks.py": 328282,
     "web/modules/chat.js": 228080,

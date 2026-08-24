@@ -985,7 +985,7 @@ def _call_scope_llm(
     session_root: str = "",
     slot_effort: str = "",
     session_target: str = "",
-    session_profile: str = "",
+    session_profile: str = "", retry_key: str = "",
 ) -> tuple:
     """Execute the scope review call synchronously — api pack or agent session.
 
@@ -1041,7 +1041,7 @@ def _call_scope_llm(
             surface="scope_review",
             goal="Review the staged change and context above. Output ONLY a JSON array.",
             messages=messages,
-            task_id=str(getattr(ctx, "task_id", "") or "scope_review") if ctx is not None else "scope_review",
+            task_id=str(getattr(ctx, "task_id", "") or "scope_review") if ctx is not None else "scope_review", retry_key=str(retry_key or ""),
             call_type="scope_review",
             max_tokens=_scope_output_tokens,
             temperature=0.2,
@@ -1388,7 +1388,7 @@ def run_scope_review(
     slot_effort: str = "",  # the row's own effort (6.1); "" = global scope_review effort
     session_target: str = "",  # the row's own harness[=model] target; "" = shared route
     session_profile: str = "",  # optional credential pin (Q2-в); "" = rotation
-    prepared: Optional[dict] = None,  # pre-assembled packet (review_admission.prepare_scope_review)
+    prepared: Optional[dict] = None, retry_key: str = "",  # assembled packet + immutable cycle identity
 ) -> ScopeReviewResult:
     """Run blocking scope review from a prepared packet or a direct call."""
     if prepared is None:
@@ -1419,7 +1419,7 @@ def run_scope_review(
         prompt, scope_model=scope_model_id, ctx=ctx, slot_id=slot_id,
         route=route, session_task=session_task, session_root=str(repo_dir),
         slot_effort=slot_effort, session_target=session_target,
-        session_profile=session_profile,
+        session_profile=session_profile, retry_key=retry_key,
     )  # type: ignore[arg-type]
     _usage = dict(usage or {})
     _review_refs = dict(_usage.pop("_review_refs", {}) or {})

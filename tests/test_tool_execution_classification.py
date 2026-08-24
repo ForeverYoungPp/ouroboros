@@ -255,3 +255,46 @@ def test_live_tool_log_payload_includes_structured_result_metadata(tmp_path, mon
     payloads = [event.get("data") or {} for event in live_events]
     assert any(payload.get("type") == "tool_call_late" for payload in payloads)
     assert any(payload.get("terminal_wait") is True for payload in payloads)
+
+
+def test_reviewed_mutator_soft_timeout_keeps_foreground_custody(tmp_path, monkeypatch):
+    import time
+    from types import SimpleNamespace
+
+    import ouroboros.loop_tool_execution as execution
+
+    events = []
+    lifecycle = []
+    monkeypatch.setattr(execution, "REVIEWED_MUTATIVE_TOOLS", frozenset({"fake_reviewed"}))
+
+    def execute(_name, _args):
+        lifecycle.append("running")
+        time.sleep(0.05)
+        lifecycle.append("settled")
+        return "review settled"
+
+    tools = SimpleNamespace(
+        CODE_TOOLS={"fake_reviewed"},
+        _ctx=SimpleNamespace(
+            event_queue=SimpleNamespace(put_nowait=events.append), task_metadata={},
+        ),
+        execute=execute,
+    )
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    started = time.perf_counter()
+    result = execution._execute_with_timeout(
+        tools,
+        {"id": "review-call", "function": {"name": "fake_reviewed", "arguments": "{}"}},
+        logs,
+        timeout_sec=0.001,
+        task_id="task-review",
+    )
+
+    assert time.perf_counter() - started >= 0.04
+    assert lifecycle == ["running", "settled"]
+    assert result["result"] == "review settled"
+    payloads = [event.get("data") or {} for event in events]
+    started = next(payload for payload in payloads if payload.get("type") == "tool_call_started")
+    assert started.get("terminal_wait") is True and started.get("timeout_sec") is None
+    assert not any(payload.get("type") == "tool_call_timeout" for payload in payloads)

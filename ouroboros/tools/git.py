@@ -1040,6 +1040,7 @@ def _run_reviewed_stage_cycle(
                 goal=goal,
                 scope=scope,
                 review_rebuttal=review_rebuttal,
+                review_binding_fingerprint=str(pre_fingerprint.get("fingerprint") or ""),
             )
         finally:
             ctx._review_paid_stamp = None

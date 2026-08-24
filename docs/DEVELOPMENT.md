@@ -1692,6 +1692,20 @@ Before every commit, verify the following:
   not_dispatched` actor: no worker, paid stamp, or active lease is created.
   A blocking commit attempt cannot treat an in-flight reviewer as a final
   quorum verdict; advisory enforcement may proceed only with the durable warning.
+- [ ] A reviewed mutative wrapper must retain foreground custody until the
+  workflow settles. Inner phase bounds and the task/supervisor absolute deadline
+  are the stop axes; never use the global 600s tool default or a separately
+  guessed hard ceiling to abandon a still-live reviewer or commit pipeline.
+- [ ] A custody retry key names semantic material and an admitted cycle, not its
+  rendered prompt. Prior-round/history scaffolding may change while the same
+  physical operation is settling and must still join that operation; changed
+  snapshots, owner intent, route/model rows, or a genuinely new review cycle
+  must mint a new key. Use the canonical staged tree/parent binding for commit
+  review, pass the key immutably to every row, and do not admit the next paid
+  plan-review cycle while the previous cycle is still in flight. Reconciliation
+  freezes that cycle's originally dispatched rows and its `$0` skip rows instead
+  of re-running live health/fit admission; reviewer-requested evidence advances
+  the next envelope only after every actor in the current cycle is terminal.
 - [ ] Cooperative cancellation is used where the existing route supports it
   (delegated sessions); API/thread routes disclose an in-flight custody state
   until their physical result settles. Do not replace this with a keyword or

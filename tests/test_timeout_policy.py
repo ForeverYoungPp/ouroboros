@@ -82,6 +82,68 @@ def test_spent_owner_deadline_has_no_logical_review_window():
     ) == 0.0
 
 
+def test_review_timeout_override_rejects_non_finite_and_invalid_values(monkeypatch, caplog):
+    import ouroboros.deadline_utils as deadlines
+    from ouroboros.tools import git as git_tools
+
+    monkeypatch.setattr(deadlines, "llm_transport_timeout_sec", lambda *_args: 2700.0)
+    for raw in ("inf", "nan", "-1", "garbage"):
+        monkeypatch.setenv("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", raw)
+        assert deadlines.review_logical_fallback_timeout_sec() == 2700.0
+        assert any(raw in record.message for record in caplog.records)
+        # Tool registration must remain available under a malformed operator override.
+        assert {entry.name for entry in git_tools.get_tools()} >= {
+            "commit_reviewed", "vcs_commit_reviewed",
+        }
+
+
+def test_preflight_timeout_override_rejects_infinity(monkeypatch):
+    from ouroboros.preflight_runner import _resolve_preflight_timeout
+
+    monkeypatch.setenv("OUROBOROS_PREFLIGHT_TIMEOUT_SEC", "inf")
+    assert _resolve_preflight_timeout(900) == 900
+
+
+def test_commit_retry_key_uses_canonical_staged_binding_despite_external_diff(
+    tmp_path, monkeypatch,
+):
+    import subprocess
+    from types import SimpleNamespace
+
+    from ouroboros.tools.git import _fingerprint_staged_diff
+    from ouroboros.tools.parallel_review import _commit_review_retry_key
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    path = repo / "value.txt"
+    path.write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "add", "value.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    monkeypatch.setenv("GIT_EXTERNAL_DIFF", "/usr/bin/true")
+    ctx = SimpleNamespace(repo_dir=repo, _current_review_contract_fingerprint="contract")
+
+    path.write_text("two\n", encoding="utf-8")
+    subprocess.run(["git", "add", "value.txt"], cwd=repo, check=True)
+    first = _fingerprint_staged_diff(repo)
+    first_key = _commit_review_retry_key(
+        ctx, "msg", goal="goal", scope="scope", review_rebuttal="",
+        binding_fingerprint=first["fingerprint"],
+    )
+    path.write_text("three\n", encoding="utf-8")
+    subprocess.run(["git", "add", "value.txt"], cwd=repo, check=True)
+    second = _fingerprint_staged_diff(repo)
+    second_key = _commit_review_retry_key(
+        ctx, "msg", goal="goal", scope="scope", review_rebuttal="",
+        binding_fingerprint=second["fingerprint"],
+    )
+
+    assert first["fingerprint"] != second["fingerprint"]
+    assert first_key != second_key
+
+
 def test_bounded_delegate_poll_passes_remaining_transport_window():
     from ouroboros.delegate_progress import bounded_poll
 
