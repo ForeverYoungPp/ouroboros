@@ -1301,7 +1301,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 task,
                 "",
                 "OUTPUT CONTRACT (your host parses this structurally):",
-                self._output_contract(),
+                self._output_contract() + "\nThis contract governs the unwrapped substantive deliverable; emit any host-required transport metadata outside it exactly as separately instructed.",
                 f"Slot: {slot.slot_id}",
             ]
             self._session_prompt = "\n".join(parts)

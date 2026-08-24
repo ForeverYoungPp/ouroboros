@@ -240,6 +240,7 @@ def test_schema_conformant_clean_verdict_survives(tmp_path, fake_route):
     assert start["primaryHarness"] == "fake-review"
     assert start["model"] == "fake-small" and start["effort"] == "low"
     assert start["maxSeconds"] == 30
+    assert "unwrapped substantive deliverable" in start["prompt"]
     # The manifest declared a non-interactive structured-output transport, so
     # the schema was asked on the EFFECTIVE route (D19).
     assert "outputSchema" in start
