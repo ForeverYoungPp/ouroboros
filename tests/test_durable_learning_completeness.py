@@ -406,10 +406,13 @@ def test_bgc_source_mutation_after_read_cannot_authorize_identity_rewrite(tmp_pa
 def test_bgc_source_snapshot_cannot_mix_text_and_digest(tmp_path, monkeypatch):
     bc = _bg_fixture(tmp_path)
     try:
-        bc._build_context()
         backlog = tmp_path / "memory" / "knowledge" / "improvement-backlog.md"
+        backlog.write_bytes(
+            backlog.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        )
+        bc._build_context()
         original = backlog.read_bytes()
-        changed = original + b"\n### ibl-concurrent\n- summary: changed bytes\n"
+        changed = original + b"\r\n### ibl-concurrent\r\n- summary: changed bytes\r\n"
         real_read_bytes = pathlib.Path.read_bytes
         target_reads = 0
 
@@ -428,7 +431,7 @@ def test_bgc_source_snapshot_cannot_mix_text_and_digest(tmp_path, monkeypatch):
         materialized = bc._execute_tool(
             _tool_call("knowledge_read", {"topic": "improvement-backlog"}, "r1"), [],
         )
-        assert materialized == original.decode("utf-8")
+        assert materialized == original.decode("utf-8").replace("\r\n", "\n")
         backlog.write_bytes(changed)
         result = bc._execute_tool(
             _tool_call("update_identity", {"content": "must remain blocked"}, "u1"), [],
