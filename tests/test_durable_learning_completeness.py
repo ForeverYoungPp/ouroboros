@@ -378,27 +378,61 @@ def test_bgc_source_mutation_after_read_cannot_authorize_identity_rewrite(tmp_pa
     try:
         bc._build_context()
         backlog = tmp_path / "memory" / "knowledge" / "improvement-backlog.md"
-        real_read_text = pathlib.Path.read_text
+        changed = backlog.read_bytes() + (
+            b"\n### ibl-concurrent\n- summary: changed after materialization\n"
+        )
+        real_read_bytes = pathlib.Path.read_bytes
         target_reads = 0
 
-        def mutate_after_read(self, *args, **kwargs):
+        def mutate_before_snapshot(self, *args, **kwargs):
             nonlocal target_reads
-            text = real_read_text(self, *args, **kwargs)
             if self == backlog:
                 target_reads += 1
-                if target_reads == 2:
-                    self.write_text(
-                        text + "\n### ibl-concurrent\n- summary: changed after materialization\n",
-                        encoding="utf-8",
-                    )
-            return text
+                if target_reads == 1:
+                    self.write_bytes(changed)
+            return real_read_bytes(self, *args, **kwargs)
 
-        monkeypatch.setattr(pathlib.Path, "read_text", mutate_after_read)
+        monkeypatch.setattr(pathlib.Path, "read_bytes", mutate_before_snapshot)
         bc._execute_tool(_tool_call("knowledge_read", {"topic": "improvement-backlog"}, "r1"), [])
         result = bc._execute_tool(
             _tool_call("update_identity", {"content": "must remain blocked"}, "u1"), [],
         )
         assert target_reads == 2
+        assert "IDENTITY_UPDATE_ABSTAINED" in result
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_source_snapshot_cannot_mix_text_and_digest(tmp_path, monkeypatch):
+    bc = _bg_fixture(tmp_path)
+    try:
+        bc._build_context()
+        backlog = tmp_path / "memory" / "knowledge" / "improvement-backlog.md"
+        original = backlog.read_bytes()
+        changed = original + b"\n### ibl-concurrent\n- summary: changed bytes\n"
+        real_read_bytes = pathlib.Path.read_bytes
+        target_reads = 0
+
+        def oscillate_during_validation(self, *args, **kwargs):
+            nonlocal target_reads
+            if self == backlog:
+                target_reads += 1
+                if target_reads == 1:
+                    self.write_bytes(changed)
+                    raw = real_read_bytes(self, *args, **kwargs)
+                    self.write_bytes(original)
+                    return raw
+            return real_read_bytes(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "read_bytes", oscillate_during_validation)
+        materialized = bc._execute_tool(
+            _tool_call("knowledge_read", {"topic": "improvement-backlog"}, "r1"), [],
+        )
+        assert materialized == original.decode("utf-8")
+        backlog.write_bytes(changed)
+        result = bc._execute_tool(
+            _tool_call("update_identity", {"content": "must remain blocked"}, "u1"), [],
+        )
         assert "IDENTITY_UPDATE_ABSTAINED" in result
     finally:
         bc._tool_executor.shutdown(wait=False, cancel_futures=True)

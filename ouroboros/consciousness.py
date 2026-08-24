@@ -1350,7 +1350,7 @@ class BackgroundConsciousness:
             if path is not None:
                 try:
                     raw = path.read_bytes()
-                    current = path.read_text(encoding="utf-8")
+                    current = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
                     if str(result) == current and result_str == current:
                         self._identity_source_reads[topic] = hashlib.sha256(raw).hexdigest()
                 except Exception:
