@@ -221,6 +221,16 @@ def test_api_token_normalization_preserves_missing_zero_and_body_error_contracts
     assert (missing["cached_tokens"], missing["cache_write_tokens"]) == (None, None)
     assert cost is None and final is False
 
+    cache_only, cost, final = ua.usage_from_response({"usage": {"cached_tokens": 7}})
+    assert cache_only["prompt_tokens"] is None and cache_only["cached_tokens"] == 7
+    assert cost is None and final is False
+
+    anthropic, cost, final = ua.usage_from_response({
+        "usage": {"input_tokens": 3, "cache_read_input_tokens": 7},
+    })
+    assert anthropic["prompt_tokens"] == 10 and anthropic["cached_tokens"] == 7
+    assert cost is None and final is False
+
     zeros, cost, final = ua.usage_from_response({
         "usage": {
             "prompt_tokens": 0, "completion_tokens": 0,

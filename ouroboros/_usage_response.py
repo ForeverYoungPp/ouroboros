@@ -47,6 +47,8 @@ def usage_from_response(response: Any) -> Tuple[Dict[str, Any], Optional[float],
     usage = _plain(usage)
     if not isinstance(usage, dict):
         usage = {}
+    native_cache_read = _reported_token_count(usage, "cache_read_input_tokens")
+    native_cache_write = _reported_token_count(usage, "cache_creation_input_tokens")
     cache_read = _reported_token_count(
         usage, "cache_read_input_tokens", "cached_tokens", "precached_prompt_tokens",
     )
@@ -55,9 +57,11 @@ def usage_from_response(response: Any) -> Tuple[Dict[str, Any], Optional[float],
     )
     input_tokens = _reported_token_count(usage, "input_tokens")
     prompt = _reported_token_count(usage, "prompt_tokens")
-    if prompt is None and any(value is not None for value in (input_tokens, cache_read, cache_write)):
+    if prompt is None and any(
+        value is not None for value in (input_tokens, native_cache_read, native_cache_write)
+    ):
         # Anthropic native input_tokens excludes cache reads and writes.
-        prompt = int(input_tokens or 0) + int(cache_read or 0) + int(cache_write or 0)
+        prompt = int(input_tokens or 0) + int(native_cache_read or 0) + int(native_cache_write or 0)
     details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
     if isinstance(details, dict):
         detail_read = _reported_token_count(details, "cached_tokens")
