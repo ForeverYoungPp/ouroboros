@@ -352,13 +352,10 @@ def _durable_zero_run_receipt(
         if gap_reasons is not None:
             gap_reasons.add("verification_receipts_unavailable")
         return None
+    from ouroboros.outcome_receipt_store import terminal_zero_run_receipt
+
     for receipt in reversed(receipts or []):
-        if not isinstance(receipt, dict):
-            continue
-        if (
-            str(receipt.get("contract_kind") or "") == "delegation_zero_run"
-            and bool(receipt.get("zero_run"))
-        ):
+        if terminal_zero_run_receipt(receipt, gap_reasons=gap_reasons):
             return dict(receipt)
     return None
 

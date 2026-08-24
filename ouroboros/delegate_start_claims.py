@@ -87,7 +87,11 @@ def claimed_start_request(
                         "before this fresh request could be claimed."
                     ),
                 }
-            if actor_ctx is not None:
+            bootstrap = (
+                getattr(actor_ctx, "_configured_actor_bootstrap", None)
+                if actor_ctx is not None else None
+            )
+            if isinstance(bootstrap, dict):
                 from ouroboros.subagent_bootstrap import _durable_zero_run_receipt
 
                 gaps: set[str] = set()

@@ -244,12 +244,9 @@ def _terminal_zero_run_receipt_present(receipts: List[Dict[str, Any]]) -> bool:
     the final outcome/acceptance projection still discloses missing deliverable
     grounding independently.
     """
-    return any(
-        str(receipt.get("contract_kind") or "") == "delegation_zero_run"
-        and bool(receipt.get("zero_run"))
-        for receipt in receipts
-        if isinstance(receipt, dict)
-    )
+    from ouroboros.outcome_receipt_store import terminal_zero_run_receipt
+
+    return any(terminal_zero_run_receipt(receipt) for receipt in receipts)
 
 # Historical name of the RED-reconciling statuses; the SSOT now lives next to the
 # reconciliation core it parameterizes (see `_outcome_receipts.RED_RECONCILING_STATUSES`).

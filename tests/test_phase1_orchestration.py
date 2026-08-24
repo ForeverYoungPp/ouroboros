@@ -284,6 +284,35 @@ def test_review_requested_preserves_typed_concerns_and_exact_hash(monkeypatch, t
     )
 
 
+def test_wait_attention_cursor_delivers_preexisting_same_timestamp_rows_fifo(
+    monkeypatch, tmp_path,
+):
+    import ouroboros.task_tree_ledger as L
+    from ouroboros.tools.control import _wait_attention_poll
+
+    monkeypatch.setattr(L, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(L, "utc_now_iso", lambda: "2026-08-24T12:00:00Z")
+    for index in range(7):
+        assert L.tree_ledger_append(
+            "rootA", "question", f"question-{index}", task_id="childA",
+        ).startswith("OK:")
+
+    # All rows predate entry into the wait.  The response stays bounded, but
+    # advances only across rows it actually delivered, including a timestamp
+    # shared by more rows than the five-item response bound.
+    ctx = SimpleNamespace(task_id="parentA", task_metadata={"root_task_id": "rootA"})
+    first = _wait_attention_poll(ctx, "", ["childA"])({}, {})
+    assert [row["text"] for row in first["beacons"]] == [
+        f"question-{index}" for index in range(5)
+    ]
+    assert first["beacons_remaining"] == 2
+
+    second = _wait_attention_poll(ctx, "", ["childA"])({}, {})
+    assert [row["text"] for row in second["beacons"]] == ["question-5", "question-6"]
+    assert second["beacons_remaining"] == 0
+    assert _wait_attention_poll(ctx, "", ["childA"])({}, {}) is None
+
+
 def test_delegation_constraint_payload_and_override(monkeypatch, tmp_path):
     import ouroboros.task_tree_ledger as L
 

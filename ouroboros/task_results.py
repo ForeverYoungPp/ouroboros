@@ -58,38 +58,57 @@ def effective_task_acceptance_review_cycles(
 
 
 def _root_task_acceptance_review_cap(
-    root_result: Dict[str, Any], *, fallback_max_cycles: Optional[int],
-    allow_fallback: bool,
+    root_result: Dict[str, Any],
 ) -> Optional[int]:
     """Resolve one tree cap from the canonical root result.
 
-    The fallback is only for the root itself before its canonical contract
-    exists. Descendants cannot widen the shared wallet with their inherited
-    deadline or task-local pacing snapshot.
+    Claimants never supply a fallback: descendants could otherwise widen the
+    shared wallet with their own deadline, and a deleted root could be silently
+    recreated from process-local state.
     """
 
     if not root_result or "task_contract" not in root_result:
-        if allow_fallback:
-            return fallback_max_cycles
         raise ValueError(
             "TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN: root cap authority is absent"
         )
 
     from ouroboros import config
-    from ouroboros.contracts.task_contract import normalize_budget_profile
+    from ouroboros.contracts.task_contract import (
+        VALID_IMPROVEMENT_POLICIES,
+        normalize_budget_profile,
+    )
     from ouroboros.deadline_utils import parse_deadline_ts
 
     root_contract = root_result.get("task_contract")
-    if not isinstance(root_contract, dict):
+    if (
+        not isinstance(root_contract, dict)
+        or root_contract.get("schema_version") != 1
+        or "deadline_at" not in root_contract
+        or not isinstance(root_contract.get("budget_profile"), dict)
+    ):
         raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN: root contract is malformed")
-    profile = normalize_budget_profile(root_contract.get("budget_profile"))
+    raw_profile = root_contract["budget_profile"]
+    policy = raw_profile.get("improvement_policy")
+    max_passes = raw_profile.get("max_improvement_passes")
+    if policy not in VALID_IMPROVEMENT_POLICIES or (
+        max_passes is not None
+        and (not isinstance(max_passes, int) or max_passes < 0)
+    ):
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN: root budget profile is malformed")
+    deadline_at = root_contract["deadline_at"]
+    if not isinstance(deadline_at, str):
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN: root deadline is malformed")
+    deadline = parse_deadline_ts(deadline_at)
+    if deadline_at.strip() and deadline is None:
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN: root deadline is malformed")
+    profile = normalize_budget_profile(raw_profile)
     required_blocking = bool(
         config.get_task_review_mode() == "required"
         and config.get_review_enforcement() == "blocking"
     )
     return effective_task_acceptance_review_cycles(
         profile,
-        has_deadline=parse_deadline_ts(root_result.get("deadline_at")) is not None,
+        has_deadline=deadline is not None,
         required_blocking=required_blocking,
     )
 
@@ -132,6 +151,12 @@ def project_task_acceptance_review_capacity(
         "binding_seen": False,
         "dedupe": "task_acceptance_binding_sha256",
     }
+    if config.get_task_review_mode() == "off":
+        return {
+            **base,
+            "state": "unavailable",
+            "reason": "task_review_mode_off",
+        }
     try:
         state = load_task_acceptance_review_state(
             root,
@@ -143,25 +168,7 @@ def project_task_acceptance_review_capacity(
         if path.is_file() and root_result is None:
             raise ValueError("root result is malformed")
         root_result = root_result if isinstance(root_result, dict) else {}
-        fallback_cap = None
-        if lineage.get("is_root_task"):
-            root_profile = task_pacing.resolve_budget_profile(ctx)
-            root_snapshot = task_pacing.build_budget_snapshot(
-                ctx, profile=root_profile,
-            )
-            fallback_cap = effective_task_acceptance_review_cycles(
-                root_profile,
-                has_deadline=root_snapshot.has_deadline,
-                required_blocking=bool(
-                    config.get_task_review_mode() == "required"
-                    and config.get_review_enforcement() == "blocking"
-                ),
-            )
-        cap = _root_task_acceptance_review_cap(
-            root_result,
-            fallback_max_cycles=fallback_cap,
-            allow_fallback=bool(lineage.get("is_root_task")),
-        )
+        cap = _root_task_acceptance_review_cap(root_result)
         claims = state.get("claims_by_binding") or {}
         claimed = len(claims)
         remaining = None if cap is None else max(0, cap - claimed)
@@ -178,8 +185,9 @@ def project_task_acceptance_review_capacity(
         try:
             from ouroboros.cancel_intents import cancel_pending
 
-            if cancel_pending(root, root_task_id) or (
-                task_id != root_task_id and cancel_pending(root, task_id)
+            if cancel_pending(root, root_task_id, strict=True) or (
+                task_id != root_task_id
+                and cancel_pending(root, task_id, strict=True)
             ):
                 projection.update({
                     "state": "unavailable", "reason": "cancellation_pending",
@@ -375,6 +383,7 @@ def _update_task_acceptance_review_state(
     path = task_result_path(results_drive_root, root_task_id, create=allow_create)
     if not allow_create and not path.is_file():
         raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN: root result is absent")
+    observed_state: Dict[str, Any] = {}
 
     def _merge(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not allow_create and not existing:
@@ -391,6 +400,8 @@ def _update_task_acceptance_review_state(
             if TASK_ACCEPTANCE_REVIEW_STATE_KEY in existing
             else _empty_task_acceptance_review_state(root_task_id)
         )
+        observed_state.clear()
+        observed_state.update(copy.deepcopy(state))
         candidate = mutator(state, existing)
         if candidate is None:
             return None
@@ -420,8 +431,10 @@ def _update_task_acceptance_review_state(
                 "TASK_ACCEPTANCE_REVIEW_STATE_INVALID: root result is malformed"
             ) from exc
         raise
+    if TASK_ACCEPTANCE_REVIEW_STATE_KEY not in updated:
+        return _validated_task_acceptance_review_state(observed_state, root_task_id)
     return _validated_task_acceptance_review_state(
-        updated.get(TASK_ACCEPTANCE_REVIEW_STATE_KEY), root_task_id,
+        updated[TASK_ACCEPTANCE_REVIEW_STATE_KEY], root_task_id,
     )
 
 
@@ -430,9 +443,7 @@ def claim_task_acceptance_review_cycle(
     root_task_id: str,
     review_binding: Dict[str, Any],
     *,
-    max_cycles: Optional[int],
     claimed_by_task_id: str,
-    allow_create: bool = False,
 ) -> Dict[str, Any]:
     """Atomically dedupe and claim one paid root-acceptance panel dispatch."""
 
@@ -456,18 +467,21 @@ def claim_task_acceptance_review_cycle(
     claimant = str(claimed_by_task_id or "").strip()
     if not claimant:
         raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: claimant is absent")
-    fallback_cap = None if max_cycles is None else max(1, int(max_cycles))
     decision: Dict[str, Any] = {}
     resolved: Dict[str, Optional[int]] = {}
 
     def _claim(
         state: Dict[str, Any], root_result: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        cap = _root_task_acceptance_review_cap(
-            root_result,
-            fallback_max_cycles=fallback_cap,
-            allow_fallback=claimant == str(root_task_id),
-        )
+        from ouroboros.cancel_intents import cancel_pending
+
+        if cancel_pending(results_drive_root, root_task_id, strict=True) or (
+            claimant != str(root_task_id)
+            and cancel_pending(results_drive_root, claimant, strict=True)
+        ):
+            decision.update({"status": "unavailable", "reason": "cancellation_pending"})
+            return None
+        cap = _root_task_acceptance_review_cap(root_result)
         resolved["cap"] = cap
         claims = dict(state.get("claims_by_binding") or {})
         prior = claims.get(binding)
@@ -489,12 +503,15 @@ def claim_task_acceptance_review_cycle(
         decision.update({"status": "claimed", "reason": ""})
         return state
 
-    state = _update_task_acceptance_review_state(
-        results_drive_root,
-        root_task_id,
-        _claim,
-        allow_create=allow_create,
-    )
+    from ouroboros.cancel_intents import cancellation_projection_lock
+
+    with cancellation_projection_lock(results_drive_root):
+        state = _update_task_acceptance_review_state(
+            results_drive_root,
+            root_task_id,
+            _claim,
+            allow_create=False,
+        )
     paid = len(state.get("claims_by_binding") or {})
     cap = resolved.get("cap")
     return {
@@ -645,12 +662,31 @@ def task_result_path(drive_root: Any, task_id: str, *, create: bool = True) -> p
     return task_results_dir(drive_root, create=create) / f"{validate_task_id(task_id)}.json"
 
 
-def load_task_result(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
+def load_task_result(
+    drive_root: Any, task_id: str, *, strict: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Read one exact task result.
+
+    Observational callers retain the historical fail-soft default.  Admission
+    callers pass ``strict=True`` so an existing unreadable row cannot be
+    reinterpreted as an unused task identity.
+    """
     try:
-        path = task_result_path(drive_root, task_id, create=False)
+        tid = validate_task_id(task_id)
+        path = task_result_path(drive_root, tid, create=False)
     except ValueError:
+        if strict:
+            raise
         return None
-    return read_json_dict(path)
+    data = read_json_dict(path)
+    if strict and path.exists() and (
+        not data
+        or str(data.get("task_id") or "") != tid
+        or not isinstance(data.get("status"), str)
+        or not str(data.get("status") or "").strip()
+    ):
+        raise ValueError(f"task result authority is unreadable or invalid: {path}")
+    return data
 
 
 def list_task_results(
@@ -669,9 +705,14 @@ def list_task_results(
     results: List[Dict[str, Any]] = []
     for path in sorted(task_results_dir(drive_root, create=False).glob("*.json")):
         data = read_json_dict(path)
+        if strict and (
+            not data
+            or str(data.get("task_id") or "") != path.stem
+            or not isinstance(data.get("status"), str)
+            or not str(data.get("status") or "").strip()
+        ):
+            raise ValueError(f"task result is unreadable or invalid: {path}")
         if data is None:
-            if strict:
-                raise ValueError(f"task result is unreadable or invalid: {path}")
             continue
         if wanted and str(data.get("status") or "") not in wanted:
             continue

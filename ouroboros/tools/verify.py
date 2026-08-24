@@ -48,6 +48,16 @@ def _bounded(text: Any, cap: int) -> str:
         return t
     return t[:cap] + f"\n…[truncated {len(t) - cap} of {len(t)} chars]"
 
+
+def _receipt_custody_failure(kind: str, detail: str = "") -> str:
+    suffix = f" Observed result: {detail}" if detail else ""
+    return (
+        f"⚠️ TOOL_ERROR (verify_and_record): receipt_custody_failed for {kind}; "
+        "the check/observation may have run, but no durable receipt was recorded. "
+        "Do not treat this verification as attested; retry after receipt custody "
+        f"recovers.{suffix}"
+    )
+
 _CONTRACT_KINDS = (
     "visible_verifier",
     "explicit_command",
@@ -479,13 +489,6 @@ def _record_delegation_zero_run(
                     "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run already "
                     "has a durable terminal decision for this actor."
                 )
-            if gaps:
-                return (
-                    "⚠️ TOOL_ERROR (verify_and_record): zero_run_custody_unknown: "
-                    "the host cannot prove whether a prior zero-run receipt exists; "
-                    "no new receipt was written. gaps="
-                    + json.dumps(sorted(gaps), ensure_ascii=False)
-                )
             blockers = unsettled_start_ids(drive_root, task_id)
             if any(blockers.values()):
                 return (
@@ -494,6 +497,12 @@ def _record_delegation_zero_run(
                     "undisposed physical result. blockers="
                     + json.dumps(blockers, ensure_ascii=False, sort_keys=True)
                 )
+            if gaps:
+                # Empty physical custody is the authority needed to re-ground a
+                # damaged zero-run stream.  Preserve the evidence gap on the new
+                # typed receipt instead of turning recovery into a self-deadlock.
+                receipt["regrounds_zero_run_authority"] = True
+                receipt["prior_zero_run_evidence_gaps"] = sorted(gaps)
             # A zero-run is lifecycle authority for the actor, so keep it on the
             # canonical budget root rather than an ephemeral child drive.
             written = append_verification_receipt(
@@ -675,7 +684,10 @@ def _verify_and_record(
             # Same renderer as the completed-run receipt below, so it carries the same
             # stamp: a timeout red must be reconcilable by the later green of that argv.
             receipt.update({"status": "fail", "returncode": None, "matched": False, "check": shlex.join(argv), "check_rendering": CHECK_RENDERING_SHLEX_JOIN, "summary": f"check timed out after {timeout}s"})
-            append_verification_receipt(drive_root, task_id, receipt)
+            if not append_verification_receipt(drive_root, task_id, receipt):
+                return _receipt_custody_failure(
+                    kind, f"check timed out after {timeout}s",
+                )
             return (
                 f"verify_and_record [{kind}] FAIL: check timed out after {timeout}s. "
                 f"root={binding.root}, cwd={binding.target_path}. Receipt recorded."
@@ -722,7 +734,10 @@ def _verify_and_record(
         if _masked:
             receipt["check_exit_masking"] = True
             receipt["check_exit_masking_reasons"] = _mask_reasons
-        append_verification_receipt(drive_root, task_id, receipt)
+        if not append_verification_receipt(drive_root, task_id, receipt):
+            return _receipt_custody_failure(
+                kind, f"verdict={'PASS' if passed else 'FAIL'}, exit={rc}",
+            ) + f"\n\n{_bounded(out, _TOOL_OUTPUT_CAP)}"
         verdict = "PASS" if passed else "FAIL"
         exp_note = f" expected={expected_s!r}" if expected_s else ""
         return (
@@ -735,7 +750,8 @@ def _verify_and_record(
         paths = [str(p) for p in (artifact_paths or []) if str(p or "").strip()]
         obs_status, detail = _observe_artifacts(ctx, paths)
         receipt.update({"status": obs_status, "paths": paths[:20], "summary": detail})
-        append_verification_receipt(drive_root, task_id, receipt)
+        if not append_verification_receipt(drive_root, task_id, receipt):
+            return _receipt_custody_failure(kind, f"{obs_status}: {detail}")
         # refused_out_of_scope is a POLICY block, not a verification failure — surface it
         # honestly (not a red FAIL) so a deliverable outside the observable roots doesn't
         # force the agent to declare no_visible_machine_contract (v6.57.0).
@@ -754,7 +770,8 @@ def _verify_and_record(
     # best proxy + residual risk is recorded as a receipt and judged by a reviewer.
     # The agent's own text, not a render of an argv that ran — its own rendering stamp.
     receipt.update({"status": "declared", "check": str(check or ""), "check_rendering": CHECK_RENDERING_DECLARED_TEXT, "summary": _bounded(expected_s or str(check or ""), _RECEIPT_DECLARED_SUMMARY_CAP)})
-    append_verification_receipt(drive_root, task_id, receipt)
+    if not append_verification_receipt(drive_root, task_id, receipt):
+        return _receipt_custody_failure(kind, receipt["summary"])
     return (
         "verify_and_record [no_visible_machine_contract] DECLARED: no host-checkable contract; "
         "your stated proxy + residual risk recorded as a receipt for review."

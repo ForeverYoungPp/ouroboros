@@ -23,7 +23,7 @@ from ouroboros.post_task_checkpoint import project_replica_task_result_fields
 from ouroboros.task_results import (
     cancellation_blocks_child_result, load_task_result, validate_task_id, write_task_result,
 )
-from ouroboros.utils import atomic_write_json, utc_now_iso, write_text_atomic
+from ouroboros.utils import atomic_write_json, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -520,44 +520,11 @@ def _publish_child_verification_receipts(
     lifecycle fact. Exact-row de-duplication makes task_done + reaper/cancel
     re-entry idempotent. Fail-soft: logged, never blocks finalization."""
     try:
-        # Lazy import: ouroboros.outcomes imports from ouroboros.headless at module level.
-        from ouroboros.outcomes import (
-            merge_verification_receipts,
-            read_verification_receipts,
-            verification_receipts_path,
-        )
+        from ouroboros.outcome_receipt_store import publish_verification_receipt_union
 
-        src = verification_receipts_path(child_drive, task_id, create=False)
-        if not src.is_file():
-            return
-        dest = verification_receipts_path(parent_drive_root, task_id, create=True)
-        if dest.exists() and os.path.samefile(src, dest):
-            return  # shared-drive shape: already the canonical file
-        gaps: set[str] = set()
-        child_receipts = read_verification_receipts(
-            child_drive, task_id, gap_reasons=gaps,
+        publish_verification_receipt_union(
+            parent_drive_root, task_id, child_drive,
         )
-        canonical_receipts = read_verification_receipts(
-            parent_drive_root, task_id, gap_reasons=gaps,
-        )
-        if gaps:
-            # A whole-file union refresh may never erase the only evidence that
-            # a terminal actor receipt was torn or unreadable. Preserve both
-            # source files for later reconciliation instead of laundering UNKNOWN
-            # into a clean-looking parseable ledger.
-            log.warning(
-                "Skipped child receipt publication for task %s due to read gaps: %s",
-                task_id, ",".join(sorted(gaps)),
-            )
-            return
-        merged = merge_verification_receipts(
-            child_receipts,
-            canonical_receipts,
-        )
-        content = "".join(
-            json.dumps(row, ensure_ascii=False) + "\n" for row in merged
-        )
-        write_text_atomic(dest, content)
     except Exception:
         log.warning("Failed to publish child receipts for task %s", task_id, exc_info=True)
 

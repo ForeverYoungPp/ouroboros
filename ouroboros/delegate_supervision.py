@@ -6,7 +6,6 @@ import json
 import pathlib
 import time
 import uuid
-from hashlib import sha256
 from typing import Any, Callable, Optional
 
 from ouroboros import delegate_custody as custody
@@ -152,7 +151,12 @@ def _active_descendants_fact(ctx: Any) -> dict[str, Any]:
 
     try:
         from ouroboros.task_results import load_task_result
-        from ouroboros.task_status import _load_queue_snapshot, _snapshot_is_stale
+        from ouroboros.task_status import (
+            SETTLED_STATUSES,
+            _load_queue_snapshot,
+            _merge_queue_status,
+            _snapshot_is_stale,
+        )
 
         root = custody.custody_root(ctx)
         snapshot = _load_queue_snapshot(pathlib.Path(root))
@@ -169,8 +173,11 @@ def _active_descendants_fact(ctx: Any) -> dict[str, Any]:
                 task_id = str(item.get("id") or task.get("id") or "")
                 if not task_id:
                     raise ValueError("queue_snapshot_task_id_missing")
-                durable = load_task_result(root, task_id) or {}
-                rows[task_id] = {**durable, **task, "task_id": task_id, "status": status}
+                rows[task_id] = {
+                    **task,
+                    "task_id": task_id,
+                    "_queue_status": status,
+                }
         ancestor = str(getattr(ctx, "task_id", "") or "")
         lineage_cache = dict(rows)
 
@@ -185,15 +192,28 @@ def _active_descendants_fact(ctx: Any) -> dict[str, Any]:
                 seen.add(parent_id)
                 parent = lineage_cache.get(parent_id)
                 if parent is None:
-                    parent = load_task_result(root, parent_id)
+                    parent = load_task_result(root, parent_id, strict=True)
                     if not isinstance(parent, dict):
                         raise ValueError("task_lineage_unavailable")
                     lineage_cache[parent_id] = parent
                 parent_id = str(parent.get("parent_task_id") or "")
             return False
 
-        active = [row for task_id, row in rows.items()
-                  if task_id != ancestor and _belongs(row)]
+        active: list[dict[str, Any]] = []
+        for task_id, row in rows.items():
+            if task_id == ancestor or not _belongs(row):
+                continue
+            # Only exact rows proven to be descendants can poison this fact.
+            # Unrelated active tasks are outside the nanny's authority surface.
+            durable = load_task_result(root, task_id, strict=True) or {}
+            merged = {**durable, **row}
+            merged["status"] = _merge_queue_status(
+                str(durable.get("status") or ""),
+                str(row.get("_queue_status") or ""),
+            )
+            merged.pop("_queue_status", None)
+            if str(merged.get("status") or "").strip().lower() not in SETTLED_STATUSES:
+                active.append(merged)
         by_status: dict[str, int] = {}
         for row in active:
             status = str(row.get("status") or "unknown").strip().lower() or "unknown"
@@ -254,10 +274,9 @@ def _coordination_cursor(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _coordination_row_id(row: dict[str, Any]) -> str:
-    encoded = json.dumps(
-        row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
-    )
-    return sha256(encoded.encode("utf-8")).hexdigest()
+    from ouroboros.task_tree_ledger import tree_ledger_row_id
+
+    return tree_ledger_row_id(row)
 
 
 def _direct_children(ctx: Any) -> dict[str, dict[str, Any]]:

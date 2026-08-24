@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import logging
+import pathlib
 import threading
 from typing import Any, Callable, Iterator
 
@@ -35,6 +36,78 @@ _BOUND_API_PAID_STAMP: contextvars.ContextVar[Any] = contextvars.ContextVar(
 SLOT_ID_PREFIX = "slot"
 SCOPE_SLOT_ID_PREFIX = "scope_slot"
 PLAN_SLOT_ID_PREFIX = "plan_slot"
+
+
+def task_acceptance_zero_physical_refusal(evidence: Any) -> dict[str, str]:
+    """Describe an acceptance refusal that needs no reviewer transport."""
+    packet = evidence if isinstance(evidence, dict) else {}
+    if packet.get("__unresolved_partial_artifacts__"):
+        return {
+            "status": "degraded_partial_source",
+            "summary": (
+                "A decision-bearing tool result remains partial or its exact source "
+                "is unavailable; acceptance cannot treat that projection as complete."
+            ),
+        }
+    if packet.get("__immutable_core_overflow__"):
+        return {
+            "status": "degraded_core_overflow",
+            "summary": (
+                "Immutable owner requirements do not fit the acceptance evidence "
+                "budget; no requirement was silently truncated."
+            ),
+        }
+    return {}
+
+
+def run_zero_physical_task_acceptance(
+    request: Any, slots: Any, *, drive_root: Any, usage_ctx: Any,
+) -> Any:
+    """Return the substrate's synthetic refusal, or ``None`` for physical work."""
+    if not task_acceptance_zero_physical_refusal(request.evidence):
+        return None
+    from ouroboros.review_substrate import run_review_request
+
+    return run_review_request(
+        request, slots=slots, drive_root=pathlib.Path(drive_root), usage_ctx=usage_ctx,
+    )
+
+
+def claim_task_acceptance_dispatch(
+    drive_root: Any,
+    root_task_id: str,
+    task_id: str,
+    binding: dict[str, Any],
+) -> dict[str, Any]:
+    """Atomically claim the canonical wallet immediately before dispatch."""
+    from ouroboros.task_results import claim_task_acceptance_review_cycle
+
+    return claim_task_acceptance_review_cycle(
+        drive_root, root_task_id, binding, claimed_by_task_id=task_id,
+    )
+
+
+def task_acceptance_preclaim_refusal(ctx: Any) -> Any:
+    """Recheck the deadline rail after assembly and before a paid wallet claim."""
+    from ouroboros import task_pacing
+    from ouroboros.review_substrate import ReviewRunResult
+
+    budget = task_pacing.build_budget_snapshot(
+        ctx.tools._ctx, profile=ctx.budget_profile,
+    )
+    allowed, reason = task_pacing.review_launch_allowed(
+        budget,
+        estimated_sec=task_pacing.acceptance_review_estimate_sec(
+            ctx.tools._ctx, passes_done=ctx.passes_done,
+        ),
+    )
+    if allowed:
+        return None
+    return ReviewRunResult(
+        request={"surface": "task_acceptance", "task_id": str(ctx.task_id)},
+        actors=[], parsed_findings=[], aggregate_signal="DEGRADED", degraded=True,
+        degraded_reasons=[f"{reason} (no reviewer was called)"],
+    )
 
 
 def slot_id_for_row(index: int, *, prefix: str = SLOT_ID_PREFIX) -> str:

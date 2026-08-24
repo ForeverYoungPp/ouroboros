@@ -828,13 +828,9 @@ def wait_for_effective_tasks(
     while True:
         results = {tid: load_effective_task_result(pathlib.Path(drive_root), tid) for tid in ids}
         terminal = {tid: str(data.get("status") or "").strip().lower() in SETTLED_STATUSES for tid, data in results.items()}
-        if mode == "any_terminal" and any(terminal.values()):
-            break
-        if mode != "any_terminal" and all(terminal.values()):
-            break
         # Sliced wait hook: a child->parent attention beacon (including review_requested)
-        # can break the wait early so a productively-waiting parent reacts mid-flight instead of only
-        # at terminal. Never raises into the wait; a faulty hook just keeps polling.
+        # gets one preflight even when the child already terminalized, so a beacon
+        # written before this wait is not hidden by the terminal fast path.
         if callable(on_poll):
             try:
                 signal = on_poll(results, terminal)
@@ -843,6 +839,10 @@ def wait_for_effective_tasks(
             if signal is not None:
                 early = signal
                 break
+        if mode == "any_terminal" and any(terminal.values()):
+            break
+        if mode != "any_terminal" and all(terminal.values()):
+            break
         if time.monotonic() >= deadline:
             timed_out = True
             break

@@ -774,6 +774,8 @@ def test_local_readonly_verify_is_typed_zero_run_only(tmp_path):
     assert "UNKNOWN" in allowed
     receipts = read_verification_receipts(data, "readonly-actor")
     assert receipts[-1]["contract_kind"] == "delegation_zero_run"
+    assert receipts[-1]["regrounds_zero_run_authority"] is True
+    assert receipts[-1]["prior_zero_run_evidence_gaps"] == ["malformed_jsonl"]
     assert ctx._configured_actor_bootstrap["exact_start_pending"] is False
     assert "zero_run_evidence_status" not in ctx._configured_actor_bootstrap
     assert "zero_run_evidence_gaps" not in ctx._configured_actor_bootstrap
@@ -791,6 +793,62 @@ def test_local_readonly_verify_is_typed_zero_run_only(tmp_path):
         zero_run_basis="too late",
     )
     assert "LOCAL_READONLY_SUBAGENT_BLOCKED" in late
+
+
+def test_ordinary_fresh_start_ignores_actor_first_zero_run_receipt_surface(tmp_path):
+    from ouroboros.outcomes import verification_receipts_path
+    from ouroboros.tools.delegate_integration import claimed_start_request
+    from ouroboros.tools.registry import ToolContext
+
+    data = tmp_path / "data"
+    data.mkdir()
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        drive_root=data,
+        task_id="ordinary-root",
+    )
+    verification_receipts_path(data, ctx.task_id, create=True).write_text(
+        '{"contract_kind":"delegation_zero_run"', encoding="utf-8",
+    )
+
+    claimed, refusal = claimed_start_request(
+        data,
+        claim_target="",
+        actor_ctx=ctx,
+        enforce_actor_idle=True,
+        run_id="",
+        task_id=ctx.task_id,
+        idempotency_key="ordinary-root-invocation",
+        invocation_id="ordinary-root-invocation",
+        max_seconds=30,
+        request={"prompt": "ordinary root delegation"},
+        project_id="",
+        project_owned=False,
+        route="codex",
+    )
+
+    assert claimed is True
+    assert refusal == {}
+
+
+def test_verify_never_claims_recorded_when_receipt_custody_fails(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.tools.verify as verify
+    from ouroboros.tools.registry import ToolContext
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="receipt-fail")
+    monkeypatch.setattr(verify, "append_verification_receipt", lambda *_a, **_k: False)
+
+    output = verify._verify_and_record(
+        ctx,
+        contract_kind="no_visible_machine_contract",
+        check="manual visual check with disclosed residual risk",
+    )
+
+    assert "receipt_custody_failed" in output
+    assert "no durable receipt was recorded" in output
+    assert "recorded as a receipt" not in output
 
 
 def test_local_readonly_subagent_execute_blocks_forbidden_tools(tmp_path, monkeypatch):

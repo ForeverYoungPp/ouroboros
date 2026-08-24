@@ -263,12 +263,18 @@ def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token
                                   mode=str(request_body.get("mode") or ""),
                                   isolation=str(execution.get("isolation") or ""),
                                   delegated=bool(execution.get("delegated")))
-    root = str(scope.get("root") or "")
+    scope_root = str(scope.get("root") or "")
+    # Claudexor 3.8.1+ separates stable project identity (scope.root) from
+    # the one-shot execution snapshot.  Retry still replays the stored body
+    # byte-for-byte, but host custody/capture must keep naming the snapshot.
+    # On the strict 3.8.0 wire workspaceRoot is absent and scope.root remains
+    # the execution root, so this is byte-compatible with the legacy shape.
+    root = str(execution.get("workspaceRoot") or scope_root)
     project_id = str(record.get("project_id") or "")
     # The C1 isolation binding recorded at the original attempt. Pre-C1 rows
     # carry none; their scope.root IS the authority target (in-place regime).
     snapshot_id = str(record.get("snapshot_id") or "")
-    target_root = str(record.get("target_root") or "") or root
+    target_root = str(record.get("target_root") or "") or scope_root
     if authority.access == "workspace_write":
         binding_refusal = _retry_binding_refusal(record, retry_token)
         if binding_refusal:

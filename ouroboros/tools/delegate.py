@@ -776,7 +776,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             if authority.access == "workspace_write":
                 # C1: the run executes in a PRIVATE snapshot of the authority target,
                 # never in the shared tree. Provisioned (and durably registered)
-                # BEFORE the start intent below; scope.root becomes the snapshot.
+                # BEFORE start; 3.8.1+ separates it from the stable project root.
                 # A payload target gets the STANDALONE snapshot (the live payload
                 # is never initialized as Git); a Git target keeps the worktree
                 # snapshot byte-identically.
@@ -793,20 +793,22 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 baseline_sha = snapshot.baseline_sha
                 root = snapshot.path
                 resource_ref = dict(record_auth.get("resource_ref") or {})
-            existing_project = gateway.find_project_id(root)
-            project_id = existing_project or gateway.register_project(root)
+            execution_root = delegated_execution_workspace_root(gateway, authority, root)
+            scope_root = target_root if execution_root else root
+            existing_project = gateway.find_project_id(scope_root)
+            project_id = existing_project or gateway.register_project(scope_root)
             owned_project_id = "" if existing_project else project_id
             # The canonical ASSIGNMENT — prompt plus host-authored instructions —
             # is digested together: two starts whose prompts agree but whose
             # contract blocks differ are two different logical starts. The digest
             # is the LOOKUP identity only; the wire key stays the invocation id,
             # and a retry replays the STORED body byte-identically regardless.
-            key = custody.idempotency_key(getattr(ctx, "task_id", ""), route.route_id, access,
-                                          authority.mode, authority.isolation, root, text,
-                                          instructions)
+            key = custody.idempotency_key(getattr(ctx, "task_id", ""), route.route_id,
+                                          access, authority.mode, authority.isolation,
+                                          root, text, instructions)
             seconds = _bounded_max_seconds(ctx, max_seconds)
-            execution_root = delegated_execution_workspace_root(gateway, authority, root)
-            request_body = _start_request(ctx, route, authority, root, text, seconds, instructions, execution_root)
+            request_body = _start_request(ctx, route, authority, scope_root, text,
+                                          seconds, instructions, execution_root)
         lineage = getattr(ctx, "task_metadata", {}) or {}
         lineage = lineage if isinstance(lineage, dict) else {}
         # Fresh payload run: busy check + durable write = ONE atomic claim (fix 5).
@@ -997,9 +999,8 @@ def _started_payload(handle: Dict[str, Any], run_id: str, route: Any, access: st
     if not durable:
         payload["pending_invocation_id"] = str(invocation_id or "")
     if snapshot_id:
-        # The C1 binding, stated where the nanny can read it: the run's scope.root is
-        # the EXECUTION snapshot; the authority target receives nothing until the
-        # explicit apply.
+        # The C1 binding, stated where the nanny can read it: the run edits the
+        # EXECUTION snapshot; the authority target receives nothing until apply.
         payload["execution_root"] = root
         payload["authority_target_root"] = target_root
         payload["baseline_id"] = baseline_sha

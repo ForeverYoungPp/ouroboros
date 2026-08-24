@@ -57,7 +57,13 @@ def test_root_acceptance_review_claims_share_one_atomic_exact_binding_wallet(tmp
         load_task_acceptance_review_state,
     )
 
-    write_task_result(tmp_path, "root-wallet", STATUS_RUNNING, root_task_id="root-wallet")
+    contract = build_task_contract({
+        "budget_profile": {"max_improvement_passes": 1},
+    })
+    write_task_result(
+        tmp_path, "root-wallet", STATUS_RUNNING, root_task_id="root-wallet",
+        task_contract=contract,
+    )
     first_binding = _acceptance_binding("1")
     with ThreadPoolExecutor(max_workers=2) as pool:
         outcomes = list(pool.map(
@@ -65,7 +71,6 @@ def test_root_acceptance_review_claims_share_one_atomic_exact_binding_wallet(tmp
                 tmp_path,
                 "root-wallet",
                 first_binding,
-                max_cycles=2,
                 claimed_by_task_id="root-wallet",
             ),
             range(2),
@@ -79,7 +84,6 @@ def test_root_acceptance_review_claims_share_one_atomic_exact_binding_wallet(tmp
         tmp_path,
         "root-wallet",
         first_binding,
-        max_cycles=2,
         claimed_by_task_id="root-wallet",
     )
     assert duplicate["status"] == "unknown"
@@ -90,7 +94,6 @@ def test_root_acceptance_review_claims_share_one_atomic_exact_binding_wallet(tmp
         tmp_path,
         "root-wallet",
         _acceptance_binding("5"),
-        max_cycles=2,
         claimed_by_task_id="root-wallet",
     )
     before_exhausted = result_path.read_bytes()
@@ -98,7 +101,6 @@ def test_root_acceptance_review_claims_share_one_atomic_exact_binding_wallet(tmp
         tmp_path,
         "root-wallet",
         _acceptance_binding("a"),
-        max_cycles=2,
         claimed_by_task_id="root-wallet",
     )
     assert second["status"] == "claimed"
@@ -127,6 +129,7 @@ def test_acceptance_review_wallet_rejects_present_empty_or_tampered_authority(tm
         "root-invalid",
         STATUS_RUNNING,
         root_task_id="root-invalid",
+        task_contract=build_task_contract({}),
         **{TASK_ACCEPTANCE_REVIEW_STATE_KEY: {}},
     )
     before = path.read_bytes()
@@ -137,7 +140,6 @@ def test_acceptance_review_wallet_rejects_present_empty_or_tampered_authority(tm
             tmp_path,
             "root-invalid",
             _acceptance_binding("1"),
-            max_cycles=2,
             claimed_by_task_id="root-invalid",
         )
     assert path.read_bytes() == before
@@ -147,6 +149,7 @@ def test_acceptance_review_wallet_rejects_present_empty_or_tampered_authority(tm
         "root-tampered",
         STATUS_RUNNING,
         root_task_id="root-tampered",
+        task_contract=build_task_contract({}),
     )
     tampered = _acceptance_binding("5")
     tampered["binding_hash"] = "f" * 64
@@ -157,7 +160,6 @@ def test_acceptance_review_wallet_rejects_present_empty_or_tampered_authority(tm
             tmp_path,
             "root-tampered",
             tampered,
-            max_cycles=2,
             claimed_by_task_id="root-tampered",
         )
     assert tampered_path.read_bytes() == before
@@ -175,22 +177,16 @@ def test_acceptance_review_wallet_cap_and_root_initialization_are_atomic(
             tmp_path,
             "missing-root",
             _acceptance_binding("1"),
-            max_cycles=1,
             claimed_by_task_id="child",
-            allow_create=False,
         )
     assert not (tmp_path / "task_results" / "missing-root.json").exists()
 
-    claimed = task_results.claim_task_acceptance_review_cycle(
-        tmp_path,
-        "new-root",
-        _acceptance_binding("1"),
-        max_cycles=1,
-        claimed_by_task_id="new-root",
-        allow_create=True,
-    )
-    assert claimed["status"] == "claimed"
-    assert load_task_result(tmp_path, "new-root")["status"] == STATUS_RUNNING
+    with pytest.raises(ValueError, match="TASK_ACCEPTANCE_REVIEW_STATE_UNKNOWN"):
+        task_results.claim_task_acceptance_review_cycle(
+            tmp_path, "new-root", _acceptance_binding("1"),
+            claimed_by_task_id="new-root",
+        )
+    assert load_task_result(tmp_path, "new-root") is None
 
     cap_contract = build_task_contract({
         "budget_profile": {"max_improvement_passes": 0},
@@ -208,7 +204,6 @@ def test_acceptance_review_wallet_cap_and_root_initialization_are_atomic(
                 tmp_path,
                 "cap-root",
                 binding,
-                max_cycles=1,
                 claimed_by_task_id="cap-root",
             ),
             (_acceptance_binding("1"), _acceptance_binding("5")),
@@ -222,10 +217,13 @@ def test_acceptance_review_wallet_cap_and_root_initialization_are_atomic(
     with pytest.raises(ValueError, match="root contract is malformed"):
         task_results.claim_task_acceptance_review_cycle(
             tmp_path, "malformed-cap-root", _acceptance_binding("a"),
-            max_cycles=None, claimed_by_task_id="child",
+            claimed_by_task_id="child",
         )
 
-    write_task_result(tmp_path, "racy-root", STATUS_RUNNING, root_task_id="racy-root")
+    write_task_result(
+        tmp_path, "racy-root", STATUS_RUNNING, root_task_id="racy-root",
+        task_contract=build_task_contract({}),
+    )
     original_update = task_results.update_json_locked
 
     def remove_before_locked_read(path, mutator, **kwargs):
@@ -238,9 +236,7 @@ def test_acceptance_review_wallet_cap_and_root_initialization_are_atomic(
             tmp_path,
             "racy-root",
             _acceptance_binding("a"),
-            max_cycles=1,
             claimed_by_task_id="child",
-            allow_create=False,
         )
     assert not (tmp_path / "task_results" / "racy-root.json").exists()
 

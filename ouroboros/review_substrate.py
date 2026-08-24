@@ -895,15 +895,14 @@ def build_improvement_capsule(
     return "\n".join(lines)
 
 
-# The row-identity mint (slot_id_for_row + surface prefixes) moved whole to
-# ouroboros/review_dispatch.py at the module-size gate; the historical names
-# stay importable from here for every existing consumer.
+# Historical dispatch names remain re-exported for existing consumers.
 from ouroboros.review_dispatch import (  # noqa: E402,F401 — re-exports
     PLAN_SLOT_ID_PREFIX,
     SCOPE_SLOT_ID_PREFIX,
     SLOT_ID_PREFIX,
     slot_id_for_row,
     stamp_review_paid_on_dispatch,
+    task_acceptance_zero_physical_refusal,
 )
 
 
@@ -1384,12 +1383,16 @@ class ReviewCoordinator:
             )
         except Exception:
             prompt_ref = {}
-        incomplete_partial = request.evidence.get("__unresolved_partial_artifacts__")
-        if request.surface == "task_acceptance" and (request.evidence.get("__immutable_core_overflow__") or incomplete_partial):
+        free_refusal = (
+            task_acceptance_zero_physical_refusal(request.evidence)
+            if request.surface == "task_acceptance"
+            else {}
+        )
+        if free_refusal:
             raw_text = json.dumps({
                 "verdict": "DEGRADED",
                 "findings": [],
-                "summary": "A decision-bearing tool result remains partial or its exact source is unavailable; acceptance cannot treat that projection as complete." if incomplete_partial else "Immutable owner requirements do not fit the acceptance evidence budget; no requirement was silently truncated.",
+                "summary": free_refusal["summary"],
             })
             try:
                 response_ref = persist_call(
@@ -1400,7 +1403,7 @@ class ReviewCoordinator:
                     payload={"message": {"content": raw_text}, "usage": {}},
                     manifest={
                         "surface": request.surface, "slot_id": slot.slot_id,
-                        "model": slot.model, "status": "degraded_partial_source" if incomplete_partial else "degraded_core_overflow",
+                        "model": slot.model, "status": free_refusal["status"],
                         "physical_attempts": 0,
                     },
                 )

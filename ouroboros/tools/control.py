@@ -2395,23 +2395,85 @@ def _wait_attention_poll(
     ctx: ToolContext, after_ts: str, task_ids: List[str],
 ) -> Callable[..., Any]:
     """on_poll hook: break a sliced wait early when a child appends an attention beacon
-    (blocker/question/interface_contract/review_requested/delegation_constraint)
-    after the wait started, so a waiting parent reacts mid-flight."""
+    (blocker/question/interface_contract/review_requested/delegation_constraint).
+
+    The cursor is context-local and per child: a beacon written before this
+    particular tool call is still delivered, while a later wait in the same
+    actor context does not replay it.  Equal-timestamp rows use their stable
+    content identity, so the five-row response bound cannot strand the rest.
+    """
     # tree_note/tree_read live in ouroboros/tools/task_tree.py (extracted for module size).
     from ouroboros.tools.task_tree import tree_root_id
 
     rid = tree_root_id(ctx)
 
+    cursor_store = getattr(ctx, "_wait_attention_cursors", None)
+    if not isinstance(cursor_store, dict):
+        cursor_store = {}
+        try:
+            setattr(ctx, "_wait_attention_cursors", cursor_store)
+        except Exception:
+            # An exotic immutable context still gets correct delivery within
+            # this hook instance; ordinary ToolContext objects retain it across
+            # subsequent wait_task/wait_tasks calls.
+            pass
+
+    child_cursors: Dict[str, Dict[str, Any]] = {}
+    for task_id in task_ids:
+        key = f"{rid}:{task_id}"
+        cursor = cursor_store.get(key)
+        if not isinstance(cursor, dict):
+            cursor = {"after_ts": str(after_ts or ""), "seen_ids": set()}
+            cursor_store[key] = cursor
+        if not isinstance(cursor.get("seen_ids"), set):
+            cursor["seen_ids"] = {
+                str(item) for item in (cursor.get("seen_ids") or []) if str(item)
+            }
+        child_cursors[str(task_id)] = cursor
+
     def _hook(_results: Dict[str, Any], _terminal: Dict[str, bool]) -> Any:
         if not rid:
             return None
         try:
-            from ouroboros.task_tree_ledger import tree_ledger_attention_after
+            from ouroboros.task_tree_ledger import (
+                tree_ledger_attention_after,
+                tree_ledger_row_id,
+            )
 
-            att = tree_ledger_attention_after(rid, after_ts, task_ids=set(task_ids))
+            attention = tree_ledger_attention_after(rid, "", task_ids=set(task_ids))
         except Exception:
             return None
-        return {"reason": "child_attention_beacon", "beacons": att[-5:]} if att else None
+        pending: List[tuple[Dict[str, Any], str]] = []
+        for row in attention:
+            task_id = str(row.get("task_id") or "")
+            cursor = child_cursors.get(task_id)
+            if cursor is None:
+                continue
+            ts = str(row.get("ts") or "")
+            cursor_ts = str(cursor.get("after_ts") or "")
+            row_id = tree_ledger_row_id(row)
+            if ts < cursor_ts:
+                continue
+            if ts == cursor_ts and row_id in cursor["seen_ids"]:
+                continue
+            pending.append((row, row_id))
+        if not pending:
+            return None
+
+        delivered = pending[:5]
+        for row, row_id in delivered:
+            cursor = child_cursors[str(row.get("task_id") or "")]
+            ts = str(row.get("ts") or "")
+            cursor_ts = str(cursor.get("after_ts") or "")
+            if ts > cursor_ts:
+                cursor["after_ts"] = ts
+                cursor["seen_ids"] = set()
+            cursor["seen_ids"].add(row_id)
+        return {
+            "reason": "child_attention_beacon",
+            "beacons": [row for row, _row_id in delivered],
+            "beacons_remaining": len(pending) - len(delivered),
+        }
 
     return _hook
 
@@ -2480,7 +2542,7 @@ def _wait_for_task(ctx: ToolContext, task_id: str, timeout_sec: int = 180) -> st
     status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
     waited = wait_for_effective_tasks(
         status_drive_root, [tid], timeout_sec=timeout,
-        on_poll=_wait_attention_poll(ctx, utc_now_iso(), [tid]), poll_interval_sec=2.0,
+        on_poll=_wait_attention_poll(ctx, "", [tid]), poll_interval_sec=2.0,
     )
     early = waited.get("early_return")
     if early:
@@ -2672,7 +2734,7 @@ def _wait_for_tasks(
     entry_unknown_ids = _unminted_wait_ids(ctx, status_drive_root, normalized_ids)
     # One beacon cursor for the whole wait, so a two-phase window cannot skip an
     # attention beacon emitted during its first phase.
-    _wait_since = utc_now_iso()
+    _wait_since = ""
     # A wait set in which EVERY id is unminted cannot be satisfied by waiting —
     # nothing was ever scheduled to terminate. Spend only the registration-race
     # grace on it (wave1's root blocked its whole window on three hallucinated

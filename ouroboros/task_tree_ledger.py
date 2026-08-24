@@ -381,6 +381,15 @@ def tree_ledger_rows(
     return [r for r in iter_jsonl_objects(path) if isinstance(r, dict)]
 
 
+def tree_ledger_row_id(row: Dict[str, Any]) -> str:
+    """Stable content identity shared by ephemeral ledger cursors."""
+
+    encoded = json.dumps(
+        row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+    )
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def child_result_disposition_row(
     root_id: str,
     parent_task_id: str,
@@ -637,9 +646,7 @@ def tree_ledger_attention_after(
             # still be admitted once and then de-duplicated by content hash.
             if seen_ids is None:
                 continue
-            row_id = sha256(json.dumps(
-                r, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
-            ).encode("utf-8")).hexdigest()
+            row_id = tree_ledger_row_id(r)
             if row_id in seen:
                 continue
         out.append(r)
@@ -690,6 +697,7 @@ __all__ = [
     "tree_ledger_path",
     "tree_ledger_append",
     "tree_ledger_rows",
+    "tree_ledger_row_id",
     "tree_ledger_page",
     "tree_ledger_tail_digest",
     "tree_ledger_attention_after",

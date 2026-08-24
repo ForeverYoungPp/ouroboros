@@ -2915,6 +2915,8 @@ def _persist_promote_rejection(
 ) -> None:
     task_id = str(outcome.get("task_id") or evt.get("task_id") or "")
     reason = str(outcome.get("reason") or "admission_rejected")
+    if reason == "task_id_lookup_failed":
+        return  # preserve the unreadable exact-id authority byte-for-byte
     write_task_result(
         ctx.DRIVE_ROOT,
         task_id,
@@ -3345,8 +3347,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     actor_id = str(evt.get("actor_id") or "ouroboros")
     delegation_role = str(evt.get("delegation_role") or "subagent")
     if delegation_role == "subagent":
-        from supervisor.task_admission import subagent_schedule_owned
-        if subagent_schedule_owned(ctx, tid):
+        from supervisor.task_admission import subagent_schedule_preflight
+        if subagent_schedule_preflight(ctx, evt, chat_id):
             return
     memory_mode = str(evt.get("memory_mode") or "").strip()
     drive_root = str(evt.get("drive_root") or "").strip()
@@ -3737,46 +3739,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         else:
             admitted = ctx.enqueue_task(task)
         if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
-            blocked_reason = str(admitted.get("_admission_blocked") or "admission_fence")
-            if blocked_reason.startswith("project_routing_fence"):
-                fence_status = str(admitted.get("_project_lifecycle") or "unavailable")
-                detail = (
-                    "Subagent not scheduled: the target Project has closed its routing/admission "
-                    f"fence ({fence_status}) and cannot accept new work."
-                )
-                reason_code = blocked_reason
-                extra = {
-                    "project_id": str(admitted.get("_project_id") or project_id),
-                    "project_lifecycle": fence_status,
-                }
-            elif blocked_reason == "root_cancelled":
-                detail = (
-                    "Subagent not scheduled: its root's subtree cancellation has "
-                    "begun, so the tree accepts no new work."
-                )
-                reason_code = blocked_reason
-                extra = {"root_task_id": str(root_task_id or "")}
-            elif blocked_reason == "root_budget_fence":
-                detail = (
-                    "Subagent not scheduled: the root budget is paused and requires an "
-                    "explicit replay-safe resume, cancellation, or a new run."
-                )
-                reason_code = blocked_reason
-                extra = {
-                    "root_task_id": str(admitted.get("_budget_root_task_id") or root_task_id),
-                    "budget_fence_id": str(admitted.get("_budget_fence_id") or ""),
-                }
-            else:
-                fence_status = str(admitted.get("_acceptance_fence_status") or "active")
-                detail = (
-                    "Subagent not scheduled: the root task is in its atomic task-acceptance "
-                    f"phase ({fence_status}); admission is closed until an explicit revision round."
-                )
-                reason_code = "task_acceptance_fence"
-                extra = {
-                    "acceptance_fence_token": str(admitted.get("_acceptance_fence_token") or ""),
-                    "acceptance_fence_status": fence_status,
-                }
+            from supervisor.task_admission import scheduled_admission_rejection
+
             _reject_schedule_task(
                 ctx,
                 tid=tid,
@@ -3786,9 +3750,9 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
                 root_task_id=root_task_id,
                 role=role,
                 result_fields=result_fields,
-                detail=detail,
-                reason_code=reason_code,
-                extra_fields=extra,
+                **scheduled_admission_rejection(
+                    admitted, project_id=project_id, root_task_id=root_task_id,
+                ),
             )
             return
         if scheduled_failure_reason:

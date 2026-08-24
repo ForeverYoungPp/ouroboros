@@ -9,9 +9,39 @@ from typing import Any, Dict, List, Optional
 
 from ouroboros import _outcome_receipts
 from ouroboros.task_results import validate_task_id
-from ouroboros.utils import iter_jsonl_objects
+from ouroboros.platform_layer import (
+    acquire_exclusive_file_lock,
+    release_exclusive_file_lock,
+)
+from ouroboros.utils import (
+    iter_jsonl_objects,
+    jsonl_append_lock_path,
+    write_text_atomic,
+)
 
 log = logging.getLogger(__name__)
+
+_ZERO_RUN_DECISIONS = frozenset({"complete", "incomplete", "unknown"})
+
+
+def terminal_zero_run_receipt(
+    receipt: Any, *, gap_reasons: Optional[set[str]] = None,
+) -> bool:
+    """Validate the exact terminal no-physical-run receipt written by the host."""
+    if not isinstance(receipt, dict) or str(
+        receipt.get("contract_kind") or ""
+    ) != "delegation_zero_run":
+        return False
+    valid = (
+        receipt.get("zero_run") is True
+        and str(receipt.get("status") or "") == "declared"
+        and str(receipt.get("zero_run_decision") or "") in _ZERO_RUN_DECISIONS
+        and bool(str(receipt.get("zero_run_basis") or "").strip())
+        and receipt.get("physical_run_started") is False
+    )
+    if not valid and gap_reasons is not None:
+        gap_reasons.add("delegation_zero_run_receipt_invalid")
+    return valid
 
 
 def verification_receipts_path(
@@ -39,6 +69,7 @@ def append_verification_receipt(
                 verification_receipts_path(drive_root, task_id, create=True),
                 receipt,
                 ensure_record_boundary=True,
+                require_lock=True,
             )
         )
     except Exception:
@@ -107,6 +138,74 @@ def merge_verification_receipts(
         item[0],
     ))
     return [receipt for _index, receipt in indexed]
+
+
+def publish_verification_receipt_union(
+    canonical_root: Any, task_id: str, replica_root: Any,
+) -> bool:
+    """Publish one receipt replica without racing canonical appenders.
+
+    ``append_jsonl`` serializes receipt appends through a path-derived sidecar.
+    Whole-file reconciliation must use that exact lock too: otherwise an append
+    that lands after the canonical read but before the atomic replace is erased.
+    The replica may continue appending independently; a later publication will
+    pick up those rows, while the canonical store is re-read under its lock.
+    """
+
+    src = verification_receipts_path(replica_root, task_id, create=False)
+    if not src.is_file():
+        return False
+    dest = verification_receipts_path(canonical_root, task_id, create=True)
+    if dest.exists() and src.samefile(dest):
+        return True
+
+    replica_gaps: set[str] = set()
+    replica_receipts = read_verification_receipts(
+        replica_root, task_id, gap_reasons=replica_gaps,
+    )
+    if replica_gaps:
+        log.warning(
+            "Skipped receipt publication for task %s due to replica read gaps: %s",
+            task_id, ",".join(sorted(replica_gaps)),
+        )
+        return False
+
+    lock_path = jsonl_append_lock_path(dest)
+    lock_fd = acquire_exclusive_file_lock(
+        lock_path,
+        timeout_sec=2.0,
+        stale_sec=10.0,
+        poll_sec=0.01,
+        owner_aware_stale=True,
+    )
+    if lock_fd is None:
+        log.warning(
+            "Skipped receipt publication for task %s: canonical append lock timed out",
+            task_id,
+        )
+        return False
+    try:
+        canonical_gaps: set[str] = set()
+        canonical_receipts = read_verification_receipts(
+            canonical_root, task_id, gap_reasons=canonical_gaps,
+        )
+        if canonical_gaps:
+            log.warning(
+                "Skipped receipt publication for task %s due to canonical read gaps: %s",
+                task_id, ",".join(sorted(canonical_gaps)),
+            )
+            return False
+        merged = merge_verification_receipts(
+            replica_receipts,
+            canonical_receipts,
+        )
+        content = "".join(
+            json.dumps(row, ensure_ascii=False) + "\n" for row in merged
+        )
+        write_text_atomic(dest, content)
+        return True
+    finally:
+        release_exclusive_file_lock(lock_path, lock_fd)
 
 
 def read_verification_receipts_from_roots(

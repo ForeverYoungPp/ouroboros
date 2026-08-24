@@ -1571,6 +1571,11 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
         reviewer_slots,
         run_review_request,
     )
+    from ouroboros.review_dispatch import (
+        claim_task_acceptance_dispatch as _claim_dispatch,
+        run_zero_physical_task_acceptance as _free_dispatch,
+        task_acceptance_preclaim_refusal,
+    )
 
     evidence = ctx.evidence or _build_host_acceptance_evidence(ctx)
     slots = reviewer_slots(effort=resolve_effort("review"), role_hint="task acceptance")
@@ -1635,15 +1640,16 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
                 f"${_admission.get('remaining_usd')} (no reviewer was called)"
             ],
         )
-    # Q6: one strict tree-wide paid-cycle authority, claimed after every free
-    # launch refusal and immediately before the physical reviewer transport.
-    # The immutable exact binding is the dedupe key.  A crash after this claim
-    # remains an honest unknown and cannot silently buy the same panel again.
+    free_result = _free_dispatch(
+        request, slots, drive_root=ctx.drive_root or ctx.tools._ctx.drive_root, usage_ctx=ctx.tools._ctx)
+    if free_result is not None:
+        return free_result
+    refusal = task_acceptance_preclaim_refusal(ctx)
+    if refusal is not None:
+        return refusal
+    # Q6: claim the exact tree wallet after free refusals and before transport.
     try:
-        from ouroboros.task_results import (
-            claim_task_acceptance_review_cycle,
-            resolve_task_lineage,
-        )
+        from ouroboros.task_results import resolve_task_lineage
 
         tools_ctx = ctx.tools._ctx
         metadata = getattr(tools_ctx, "task_metadata", {})
@@ -1656,24 +1662,8 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
             or ctx.drive_root
             or getattr(tools_ctx, "drive_root", ".")
         ))
-        required_blocking = bool(
-            ctx.mode == "required" and get_review_enforcement() == "blocking"
-        )
-        snapshot = task_pacing.build_budget_snapshot(
-            tools_ctx, profile=ctx.budget_profile,
-        )
-        max_cycles = task_pacing.effective_task_acceptance_review_cycles(
-            ctx.budget_profile,
-            has_deadline=snapshot.has_deadline,
-            required_blocking=required_blocking,
-        )
-        claim = claim_task_acceptance_review_cycle(
-            accounting_root,
-            root_task_id,
-            ctx.review_binding,
-            max_cycles=max_cycles,
-            claimed_by_task_id=ctx.task_id,
-            allow_create=bool(lineage.get("is_root_task")),
+        claim = _claim_dispatch(
+            accounting_root, root_task_id, ctx.task_id, ctx.review_binding,
         )
     except Exception as exc:
         claim = {

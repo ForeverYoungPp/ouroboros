@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.depth_evidence import build_depth_summary
-from ouroboros.task_results import STATUS_RUNNING, write_task_result
+from ouroboros.task_results import STATUS_FAILED, STATUS_RUNNING, write_task_result
 from ouroboros.tools.control_delegation import (
     check_delegation_admission,
     child_budget_for_schedule,
@@ -655,6 +655,124 @@ def test_direct_child_count_read_gap_is_typed_unknown(tmp_path):
     assert durable_direct_child_count(tmp_path, "parent") is None
     refusal = schedule_delegation_refusal(contract, tmp_path, "parent")
     assert "delegation_rights_child_count_unknown" in refusal
+
+
+def test_direct_child_count_rejects_schema_empty_result(tmp_path):
+    results = tmp_path / "task_results"
+    results.mkdir()
+    (results / "empty-child.json").write_text("{}\n", encoding="utf-8")
+    contract = build_task_contract({"delegation_budget": {"max_children": 1}})
+
+    assert durable_direct_child_count(tmp_path, "parent") is None
+    assert "delegation_rights_child_count_unknown" in schedule_delegation_refusal(
+        contract, tmp_path, "parent",
+    )
+
+
+def test_schedule_exact_id_preserves_unreadable_result_and_does_not_enqueue(
+    tmp_path, monkeypatch,
+):
+    from supervisor import events
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    result_path = tmp_path / "task_results" / "child-malformed.json"
+    result_path.parent.mkdir()
+    malformed = b'{"status":"scheduled"'
+    result_path.write_bytes(malformed)
+    enqueued = []
+    notices = []
+    ctx = _fake_ctx(tmp_path, enqueued)
+    ctx.load_state = lambda: {"owner_chat_id": 7}
+    ctx.send_with_budget = lambda *args, **kwargs: notices.append((args, kwargs))
+
+    events._handle_schedule_task(
+        _schedule_event("child-malformed", "parent", drive_root=tmp_path), ctx,
+    )
+
+    assert enqueued == []
+    assert result_path.read_bytes() == malformed
+    assert notices
+    assert "unreadable" in notices[0][0][1]
+    assert notices[0][1]["progress_meta"]["status"] == STATUS_FAILED
+
+
+def test_late_schedule_lookup_failure_preserves_exact_result(tmp_path, monkeypatch):
+    from supervisor import events, task_admission
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    result_path = tmp_path / "task_results" / "late-corrupt.json"
+    result_path.parent.mkdir()
+    original = b"{late-corrupt"
+    monkeypatch.setattr(
+        task_admission, "subagent_schedule_owned", lambda *_args, **_kwargs: False,
+    )
+    def late_refusal(_task):
+        result_path.write_bytes(original)
+        return {"_admission_blocked": "task_id_lookup_failed"}
+
+    ctx = _fake_ctx(tmp_path, [])
+    ctx.enqueue_task = late_refusal
+    events._handle_schedule_task(
+        _schedule_event("late-corrupt", "parent", drive_root=tmp_path), ctx,
+    )
+    assert result_path.read_bytes() == original
+
+
+def test_generic_late_schedule_lookup_failure_preserves_exact_result(tmp_path, monkeypatch):
+    from supervisor import events, queue
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    result_path = tmp_path / "task_results" / "generic-late-corrupt.json"
+    result_path.parent.mkdir()
+    original = b"{generic-late-corrupt"
+    result_path.write_bytes(original)
+    pending = []
+    running = {}
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(queue, "RUNNING", running)
+    monkeypatch.setattr(queue, "ADMISSION_RESERVATIONS", {})
+    ctx = _fake_ctx(tmp_path, [])
+    ctx.PENDING = pending
+    ctx.RUNNING = running
+    ctx.enqueue_task = queue.enqueue_task
+    event = _schedule_event("generic-late-corrupt", "parent", drive_root=tmp_path)
+    event["delegation_role"] = "root"
+    event["chat_id"] = 7
+    events._handle_schedule_task(event, ctx)
+
+    assert pending == []
+    assert result_path.read_bytes() == original
+
+
+def test_generic_schedule_replay_preserves_valid_exact_result(tmp_path, monkeypatch):
+    from supervisor import events, queue
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    write_task_result(
+        tmp_path, "generic-existing", "completed",
+        root_task_id="generic-existing", delegation_role="root", result="keep me",
+    )
+    result_path = tmp_path / "task_results" / "generic-existing.json"
+    original = result_path.read_bytes()
+    pending = []
+    running = {}
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(queue, "RUNNING", running)
+    monkeypatch.setattr(queue, "ADMISSION_RESERVATIONS", {})
+    ctx = _fake_ctx(tmp_path, [])
+    ctx.PENDING = pending
+    ctx.RUNNING = running
+    ctx.enqueue_task = queue.enqueue_task
+    event = _schedule_event("generic-existing", "parent", drive_root=tmp_path)
+    event["delegation_role"] = "root"
+    event["chat_id"] = 7
+
+    events._handle_schedule_task(event, ctx)
+
+    assert pending == []
+    assert result_path.read_bytes() == original
 
 
 def test_supervisor_rejects_count_bounded_child_when_count_scan_fails(

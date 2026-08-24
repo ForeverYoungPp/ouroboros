@@ -186,6 +186,16 @@ def _admission_rejection_response(
     if not (isinstance(admitted, dict) and admitted.get("_admission_blocked")):
         return None
     reason_code = str(admitted.get("_admission_blocked") or "admission_fence")
+    if reason_code == "task_id_lookup_failed":
+        return JSONResponse(
+            {
+                "error": "Task identity authority is unreadable; no existing bytes were changed.",
+                "task_id": task_id,
+                "status": "rejected",
+                "admission": {"reason_code": reason_code},
+            },
+            status_code=409,
+        )
     if reason_code in {"duplicate_task_id", "admission_reservation_lost"}:
         return JSONResponse(
             {

@@ -739,9 +739,12 @@ def test_actor_first_exact_start_hydrates_terminal_zero_run_receipt(monkeypatch,
     snapshot = _snapshot(_settings(_session_row()), "session-builder")
     task_id = "hydrated-zero-run"
     assert append_verification_receipt(tmp_path, task_id, {
+        "status": "declared",
         "contract_kind": "delegation_zero_run",
         "zero_run": True,
         "zero_run_decision": "unknown",
+        "zero_run_basis": "No physical leaf was started.",
+        "physical_run_started": False,
     })
     ctx = SimpleNamespace(
         task_id=task_id,
@@ -762,7 +765,7 @@ def test_actor_first_exact_start_hydrates_terminal_zero_run_receipt(monkeypatch,
     assert ctx._configured_actor_bootstrap["zero_run_decision"] == "unknown"
 
 
-@pytest.mark.parametrize("gap_kind", ["malformed", "unreadable"])
+@pytest.mark.parametrize("gap_kind", ["malformed", "unreadable", "invalid_schema"])
 def test_actor_first_exact_start_blocks_unknown_zero_run_evidence(
     monkeypatch, tmp_path, gap_kind,
 ):
@@ -775,7 +778,17 @@ def test_actor_first_exact_start_blocks_unknown_zero_run_evidence(
     snapshot = _snapshot(_settings(_session_row()), "session-builder")
     task_id = f"unknown-zero-run-{gap_kind}"
     path = verification_receipts_path(tmp_path, task_id, create=True)
-    path.write_text('{"contract_kind":"delegation_zero_run","zero_run":true\n')
+    if gap_kind == "invalid_schema":
+        path.write_text(json.dumps({
+            "status": "declared",
+            "contract_kind": "delegation_zero_run",
+            "zero_run": "false",
+            "zero_run_decision": "complete",
+            "zero_run_basis": "malformed boolean",
+            "physical_run_started": False,
+        }) + "\n")
+    else:
+        path.write_text('{"contract_kind":"delegation_zero_run","zero_run":true\n')
     if gap_kind == "unreadable":
         monkeypatch.setattr(
             receipt_store,
@@ -829,9 +842,12 @@ def test_valid_zero_run_wins_over_unrelated_malformed_receipt(monkeypatch, tmp_p
     path = verification_receipts_path(tmp_path, task_id, create=True)
     path.write_text("not-json\n", encoding="utf-8")
     assert append_verification_receipt(tmp_path, task_id, {
+        "status": "declared",
         "contract_kind": "delegation_zero_run",
         "zero_run": True,
         "zero_run_decision": "complete",
+        "zero_run_basis": "No physical leaf was started.",
+        "physical_run_started": False,
     })
     ctx = SimpleNamespace(
         task_id=task_id,
@@ -1098,13 +1114,25 @@ def test_pending_wake_replays_until_post_injection_ack(tmp_path):
 
 def test_one_shot_checkpoint_is_reasoned_and_consumed(monkeypatch, tmp_path):
     from ouroboros import delegate_custody as custody
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
     import ouroboros.delegate_supervision as supervision
 
     now = [100.0]
     monkeypatch.setattr(supervision.time, "time", lambda: now[0])
+    contract = build_task_contract({})
+    write_task_result(
+        tmp_path, "child1", STATUS_RUNNING, root_task_id="child1",
+        delegation_role="root", task_contract=contract,
+    )
     ctx = SimpleNamespace(
         task_id="child1", drive_root=tmp_path, budget_drive_root=str(tmp_path),
-        task_metadata={"configured_subagent": {"config_fingerprint": "fp"}},
+        task_contract=contract,
+        task_metadata={
+            "configured_subagent": {"config_fingerprint": "fp"},
+            "root_task_id": "child1", "delegation_role": "root",
+            "task_contract": contract, "budget_drive_root": str(tmp_path),
+        },
     )
 
     def wait_once(_ctx, run_id, _sec, _since):

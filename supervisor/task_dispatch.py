@@ -121,4 +121,9 @@ def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
         task["metadata"].pop("required_capabilities", None)
     if parent_id:
         task["parent_task_id"] = parent_id
+    if delegation_role != "subagent":
+        # Generic/root schedule events do not have the subagent transition's
+        # own exact-id preflight. Ask the queue to perform its strict lookup
+        # under the queue lock before this payload can gain custody.
+        task["_require_unique_task_id"] = True
     return task

@@ -1,5 +1,6 @@
 import json
 import pathlib
+import threading
 import time
 from types import SimpleNamespace
 
@@ -729,6 +730,126 @@ def test_child_receipt_publish_preserves_corrupt_canonical_authority(tmp_path):
     assert canonical.read_bytes() == corrupt
 
 
+def test_child_receipt_publish_serializes_late_canonical_append(tmp_path, monkeypatch):
+    """An append arriving after union-read must survive the atomic refresh."""
+    import ouroboros.outcome_receipt_store as receipt_store
+    import ouroboros.utils as utils
+    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
+
+    tid = "child-late-canonical-append"
+    child_drive = tmp_path / "child"
+    assert append_verification_receipt(child_drive, tid, {
+        "status": "pass", "criterion_id": "child-check",
+    })
+    assert append_verification_receipt(tmp_path, tid, {
+        "status": "declared", "criterion_id": "canonical-before",
+    })
+
+    publisher_at_replace = threading.Event()
+    allow_replace = threading.Event()
+    real_write = receipt_store.write_text_atomic
+
+    def paused_write(path, content, **kwargs):
+        publisher_at_replace.set()
+        assert allow_replace.wait(timeout=2.0)
+        return real_write(path, content, **kwargs)
+
+    monkeypatch.setattr(receipt_store, "write_text_atomic", paused_write)
+    append_blocked_on_union = threading.Event()
+    real_sleep = utils.time.sleep
+
+    def observed_sleep(seconds):
+        if (
+            threading.current_thread().name == "late-receipt-append"
+            and seconds == 0.01
+        ):
+            append_blocked_on_union.set()
+        return real_sleep(seconds)
+
+    monkeypatch.setattr(utils.time, "sleep", observed_sleep)
+    publish_result = []
+    publish_thread = threading.Thread(
+        target=lambda: publish_result.append(
+            receipt_store.publish_verification_receipt_union(
+                tmp_path, tid, child_drive,
+            )
+        )
+    )
+    publish_thread.start()
+    assert publisher_at_replace.wait(timeout=2.0)
+
+    append_result = []
+    append_thread = threading.Thread(
+        name="late-receipt-append",
+        target=lambda: append_result.append(
+            append_verification_receipt(tmp_path, tid, {
+                "status": "declared", "criterion_id": "canonical-late",
+            })
+        )
+    )
+    append_thread.start()
+    assert append_blocked_on_union.wait(timeout=2.0)
+    assert append_result == [], "late append must wait on the union writer's sidecar"
+
+    allow_replace.set()
+    publish_thread.join(timeout=2.0)
+    append_thread.join(timeout=2.0)
+    assert not publish_thread.is_alive()
+    assert not append_thread.is_alive()
+    assert publish_result == [True]
+    assert append_result == [True]
+    assert [
+        row.get("criterion_id")
+        for row in read_verification_receipts(tmp_path, tid)
+    ] == ["child-check", "canonical-before", "canonical-late"]
+
+
+def test_verification_receipt_append_refuses_unlocked_timeout(tmp_path, monkeypatch):
+    import ouroboros.platform_layer as platform
+    from ouroboros.outcome_receipt_store import (
+        append_verification_receipt,
+        verification_receipts_path,
+    )
+
+    monkeypatch.setattr(
+        platform, "acquire_exclusive_file_lock", lambda *_args, **_kwargs: None,
+    )
+
+    assert append_verification_receipt(
+        tmp_path, "locked-receipt", {"status": "pass"},
+    ) is False
+    assert not verification_receipts_path(
+        tmp_path, "locked-receipt", create=False,
+    ).exists()
+
+
+def test_authority_lock_never_steals_from_live_owner_by_age(tmp_path):
+    import os
+
+    from ouroboros.platform_layer import (
+        acquire_exclusive_file_lock,
+        release_exclusive_file_lock,
+    )
+    from ouroboros.utils import jsonl_append_lock_path
+
+    receipt_path = tmp_path / "verification_receipts.jsonl"
+    lock_path = jsonl_append_lock_path(receipt_path)
+    owner_fd = acquire_exclusive_file_lock(lock_path)
+    assert owner_fd is not None
+    old = time.time() - 60.0
+    os.utime(lock_path, (old, old))
+    contender_fd = acquire_exclusive_file_lock(
+        lock_path, timeout_sec=0.05, stale_sec=0.01,
+        poll_sec=0.005, owner_aware_stale=True,
+    )
+    try:
+        assert contender_fd is None
+        assert lock_path.exists()
+    finally:
+        release_exclusive_file_lock(lock_path, contender_fd)
+        release_exclusive_file_lock(lock_path, owner_fd)
+
+
 def test_get_task_result_merges_child_and_canonical_receipts(tmp_path):
     """S3 seam (b): before copy-back, a canonical actor lifecycle receipt and
     child-local ordinary checks are one effective evidence view rather than
@@ -1046,6 +1167,71 @@ def test_wait_task_does_not_claim_completion_on_cancel_requested(tmp_path):
     output = _wait_for_task(SimpleNamespace(drive_root=tmp_path), "cancelling2", timeout_sec=0)
     assert output.startswith("Task wait timed out")
     assert not output.startswith("Task wait completed")
+
+
+def test_wait_tools_surface_preentry_beacons_once_per_actor_context(tmp_path, monkeypatch):
+    from ouroboros import task_tree_ledger
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from ouroboros.tools.control import _wait_for_task, _wait_for_tasks
+
+    monkeypatch.setattr(task_tree_ledger, "DATA_DIR", str(tmp_path))
+    for task_id in ("waitingchild1", "waitingchild2"):
+        write_task_result(
+            tmp_path, task_id, STATUS_RUNNING,
+            parent_task_id="waitparent2", root_task_id="waitparent2",
+            delegation_role="subagent",
+        )
+        assert task_tree_ledger.tree_ledger_append(
+            "waitparent2", "question", f"preentry-{task_id}", task_id=task_id,
+        ).startswith("OK:")
+
+    ctx = SimpleNamespace(
+        drive_root=tmp_path,
+        task_id="waitparent2",
+        task_metadata={"root_task_id": "waitparent2"},
+    )
+    single = _wait_for_task(ctx, "waitingchild1", timeout_sec=0)
+    assert single.startswith("Task wait interrupted by a child attention beacon")
+    assert "preentry-waitingchild1" in single
+
+    batch = json.loads(_wait_for_tasks(ctx, ["waitingchild2"], timeout_sec=0))
+    assert batch["early_return"]["reason"] == "child_attention_beacon"
+    assert [row["text"] for row in batch["early_return"]["beacons"]] == [
+        "preentry-waitingchild2"
+    ]
+
+    # A later wait in this same actor context does not replay either row.
+    assert _wait_for_task(ctx, "waitingchild1", timeout_sec=0).startswith("Task wait timed out")
+    assert "early_return" not in json.loads(
+        _wait_for_tasks(ctx, ["waitingchild2"], timeout_sec=0)
+    )
+
+
+def test_wait_surfaces_preentry_beacon_before_terminal_fast_path(tmp_path, monkeypatch):
+    from ouroboros import task_tree_ledger
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _wait_for_task
+
+    monkeypatch.setattr(task_tree_ledger, "DATA_DIR", str(tmp_path))
+    write_task_result(
+        tmp_path, "terminal-beacon-child", STATUS_COMPLETED,
+        parent_task_id="terminal-beacon-parent", root_task_id="terminal-beacon-parent",
+        delegation_role="subagent",
+    )
+    assert task_tree_ledger.tree_ledger_append(
+        "terminal-beacon-parent", "question", "answer me before completion",
+        task_id="terminal-beacon-child",
+    ).startswith("OK:")
+    ctx = SimpleNamespace(
+        drive_root=tmp_path, task_id="terminal-beacon-parent",
+        task_metadata={"root_task_id": "terminal-beacon-parent"},
+    )
+    first = _wait_for_task(ctx, "terminal-beacon-child", timeout_sec=0)
+    assert first.startswith("Task wait interrupted by a child attention beacon")
+    assert "answer me before completion" in first
+    assert _wait_for_task(ctx, "terminal-beacon-child", timeout_sec=0).startswith(
+        "Task wait completed"
+    )
 
 
 # --- v6.91 wait_tasks typed unknown ids + children roster ---------------------

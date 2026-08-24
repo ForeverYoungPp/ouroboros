@@ -385,11 +385,15 @@ def jsonl_append_lock_path(path: pathlib.Path) -> pathlib.Path:
 
 def append_jsonl(
     path: pathlib.Path, obj: Dict[str, Any], *, ensure_record_boundary: bool = False,
+    require_lock: bool = False,
 ) -> bool:
     """Append a JSON object as a line to a JSONL file (concurrent-safe).
 
     ``ensure_record_boundary`` repairs a missing final newline before this
     append; it is opt-in so high-volume event logs keep their established path.
+    ``require_lock`` is reserved for authority streams that also have atomic
+    whole-file reconciliation: unlike high-volume observational logs, they may
+    not fall back to an unlocked append after lock timeout.
     Returns ``True`` on successful write, ``False`` when all retries
     failed (which is also logged at WARNING). Important events
     (``task_done``, ``llm_round``, escalation messages) need that signal
@@ -414,25 +418,45 @@ def append_jsonl(
     _written = False
 
     try:
-        start = time.time()
-        while time.time() - start < lock_timeout_sec:
-            try:
-                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-                lock_acquired = True
-                break
-            except FileExistsError:
+        if require_lock:
+            from ouroboros.platform_layer import acquire_exclusive_file_lock
+
+            lock_fd = acquire_exclusive_file_lock(
+                lock_path,
+                timeout_sec=lock_timeout_sec,
+                stale_sec=lock_stale_sec,
+                poll_sec=lock_sleep_sec,
+                owner_aware_stale=True,
+            )
+            lock_acquired = lock_fd is not None
+        else:
+            start = time.time()
+            while time.time() - start < lock_timeout_sec:
                 try:
-                    stat = lock_path.stat()
-                    if time.time() - stat.st_mtime > lock_stale_sec:
-                        lock_path.unlink()
-                        continue
+                    lock_fd = os.open(
+                        str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644,
+                    )
+                    lock_acquired = True
+                    break
+                except FileExistsError:
+                    try:
+                        stat = lock_path.stat()
+                        if time.time() - stat.st_mtime > lock_stale_sec:
+                            lock_path.unlink()
+                            continue
+                    except Exception:
+                        log.debug(
+                            "Failed to read lock stat during lock acquisition retry",
+                            exc_info=True,
+                        )
+                    time.sleep(lock_sleep_sec)
                 except Exception:
-                    log.debug("Failed to read lock stat during lock acquisition retry", exc_info=True)
-                    pass
-                time.sleep(lock_sleep_sec)
-            except Exception:
-                log.debug("Failed to acquire file lock for jsonl append", exc_info=True)
-                break
+                    log.debug("Failed to acquire file lock for jsonl append", exc_info=True)
+                    break
+
+        if require_lock and not lock_acquired:
+            log.warning("append_jsonl: required lock unavailable for %s", path)
+            return False
 
         append_data = data
         if ensure_record_boundary:

@@ -172,7 +172,6 @@ def test_meaningful_wake_carries_live_tree_planning_facts_and_replays_exactly(
         tmp_path,
         "root",
         binding,
-        max_cycles=3,
         claimed_by_task_id="root",
     )["status"] == "claimed"
     monkeypatch.setattr(usage_accounting, "usage_breakdown", lambda *_a, **_k: {
@@ -357,6 +356,83 @@ def test_live_descendant_fact_rejects_stale_queue_and_ignores_unrelated_corrupti
         "scope": "host_visible_descendants",
         "vendor_internal": "opaque_not_counted",
     }
+
+
+def test_live_descendant_fact_terminal_result_wins_over_stale_running_row(tmp_path):
+    from ouroboros.delegate_supervision import coordination_live_context
+    from ouroboros.utils import atomic_write_json, utc_now_iso
+
+    ctx = _ctx(tmp_path)
+    _child(tmp_path, status=STATUS_COMPLETED)
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    atomic_write_json(state / "queue_snapshot.json", {
+        "ts": utc_now_iso(),
+        "pending": [],
+        "running": [{"id": "child", "task": {
+            "id": "child", "parent_task_id": "parent",
+            "root_task_id": "root", "delegation_role": "subagent",
+        }}],
+    })
+
+    assert coordination_live_context(ctx)["active_descendants"] == {
+        "state": "known",
+        "count": 0,
+        "by_status": {},
+        "scope": "host_visible_descendants",
+        "vendor_internal": "opaque_not_counted",
+    }
+
+
+def test_live_descendant_fact_is_unknown_for_corrupt_exact_queued_result(tmp_path):
+    from ouroboros.delegate_supervision import coordination_live_context
+    from ouroboros.utils import atomic_write_json, utc_now_iso
+
+    ctx = _ctx(tmp_path)
+    results = tmp_path / "task_results"
+    results.mkdir(exist_ok=True)
+    (results / "child.json").write_text("{", encoding="utf-8")
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    atomic_write_json(state / "queue_snapshot.json", {
+        "ts": utc_now_iso(), "pending": [],
+        "running": [{"id": "child", "task": {
+            "id": "child", "parent_task_id": "parent",
+            "root_task_id": "root", "delegation_role": "subagent",
+        }}],
+    })
+    fact = coordination_live_context(ctx)["active_descendants"]
+    assert fact["state"] == "unknown" and fact["count"] is None
+    assert fact["reason"] == "ValueError"
+
+
+def test_live_descendant_fact_ignores_corrupt_unrelated_active_root(tmp_path):
+    from ouroboros.delegate_supervision import coordination_live_context
+    from ouroboros.utils import atomic_write_json, utc_now_iso
+
+    ctx = _ctx(tmp_path)
+    _child(tmp_path)
+    results = tmp_path / "task_results"
+    (results / "unrelated-active.json").write_text("{", encoding="utf-8")
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    atomic_write_json(state / "queue_snapshot.json", {
+        "ts": utc_now_iso(), "pending": [],
+        "running": [
+            {"id": "child", "task": {
+                "id": "child", "parent_task_id": "parent",
+                "root_task_id": "root", "delegation_role": "subagent",
+            }},
+            {"id": "unrelated-active", "task": {
+                "id": "unrelated-active", "parent_task_id": "",
+                "root_task_id": "unrelated-active", "delegation_role": "root",
+            }},
+        ],
+    })
+
+    fact = coordination_live_context(ctx)["active_descendants"]
+    assert fact["state"] == "known"
+    assert fact["count"] == 1 and fact["by_status"] == {"running": 1}
 
 
 def test_delegate_wait_entry_never_acks_an_undelivered_pending_wake(tmp_path, monkeypatch):

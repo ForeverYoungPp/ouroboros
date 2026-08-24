@@ -196,7 +196,7 @@ def test_descendant_deadline_cannot_widen_root_acceptance_wallet(tmp_path, monke
     outcomes = [claim_task_acceptance_review_cycle(
         tmp_path, "root-tree-cap", binding(seed),
         # A deadline-bearing child used to pass None and widen this root wallet.
-        max_cycles=None, claimed_by_task_id="deadline-child",
+        claimed_by_task_id="deadline-child",
     ) for seed in ("1", "5", "a")]
     assert [row["status"] for row in outcomes] == [
         "claimed", "claimed", "unavailable",
@@ -217,20 +217,60 @@ def test_descendant_deadline_cannot_widen_root_acceptance_wallet(tmp_path, monke
     assert projection["remaining_cycles"] == 0
     assert projection["reason"] == "review_cycles_exhausted"
 
+    deadline_contract = build_task_contract({
+        "deadline_at": "2099-01-01T00:00:00+00:00",
+        "budget_profile": {"improvement_policy": "until_deadline"},
+    })
     write_task_result(
         tmp_path, "deadline-root", STATUS_RUNNING,
-        root_task_id="deadline-root", task_contract=contract,
-        deadline_at="2099-01-01T00:00:00+00:00",
+        root_task_id="deadline-root", task_contract=deadline_contract,
     )
     root_deadline_outcomes = [claim_task_acceptance_review_cycle(
         tmp_path, "deadline-root", binding(seed),
         # The inverse claimant mismatch also follows root authority.
-        max_cycles=2, claimed_by_task_id="no-deadline-child",
+        claimed_by_task_id="no-deadline-child",
     ) for seed in ("1", "5", "a")]
     assert [row["status"] for row in root_deadline_outcomes] == [
         "claimed", "claimed", "claimed",
     ]
     assert root_deadline_outcomes[-1]["max_cycles"] is None
+
+    # A non-authoritative top-level deadline cannot widen the canonical contract.
+    write_task_result(
+        tmp_path, "stale-deadline-root", STATUS_RUNNING,
+        root_task_id="stale-deadline-root", task_contract=contract,
+        deadline_at="2099-01-01T00:00:00+00:00",
+    )
+    stale_outcomes = [claim_task_acceptance_review_cycle(
+        tmp_path, "stale-deadline-root", binding(seed),
+        claimed_by_task_id="child",
+    ) for seed in ("1", "5", "a")]
+    assert [row["status"] for row in stale_outcomes] == [
+        "claimed", "claimed", "unavailable",
+    ]
+
+
+def test_empty_root_contract_cannot_mint_acceptance_wallet(tmp_path):
+    from ouroboros.task_results import (
+        STATUS_RUNNING, claim_task_acceptance_review_cycle, review_binding_hash,
+        write_task_result,
+    )
+
+    write_task_result(
+        tmp_path, "empty-contract-root", STATUS_RUNNING,
+        root_task_id="empty-contract-root", task_contract={},
+    )
+    fields = {
+        "candidate_hash": "b" * 64,
+        "evidence_revision": "c" * 64,
+        "fence_hash": "d" * 64,
+    }
+    with pytest.raises(ValueError, match="root contract is malformed"):
+        claim_task_acceptance_review_cycle(
+            tmp_path, "empty-contract-root",
+            {**fields, "binding_hash": review_binding_hash(**fields)},
+            claimed_by_task_id="child",
+        )
 
 
 def test_improvement_pass_gate_and_rails_follow_shared_cap(monkeypatch):

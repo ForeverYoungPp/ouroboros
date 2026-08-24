@@ -452,7 +452,9 @@ def _promote_duplicate_reason(task_id: str, ctx: Any) -> str:
         from ouroboros.task_results import load_task_result
 
         stored_duplicate = bool(
-            load_task_result(getattr(ctx, "DRIVE_ROOT", DRIVE_ROOT), task_id)
+            load_task_result(
+                getattr(ctx, "DRIVE_ROOT", DRIVE_ROOT), task_id, strict=True,
+            )
         )
     except Exception:
         log.warning("promote: duplicate-id lookup failed for %s", task_id, exc_info=True)

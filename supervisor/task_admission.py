@@ -17,6 +17,67 @@ from ouroboros.task_results import (
 log = logging.getLogger(__name__)
 
 
+def scheduled_admission_rejection(
+    admitted: Dict[str, Any], *, project_id: str, root_task_id: str,
+) -> Dict[str, Any]:
+    """Map a queue admission fence to the canonical durable rejection shape."""
+    reason = str(admitted.get("_admission_blocked") or "admission_fence")
+    if reason == "task_id_lookup_failed":
+        detail = (
+            "Task not scheduled: the exact task-result authority became unreadable "
+            "during admission and was preserved."
+        )
+        extra = {}
+    elif reason == "duplicate_task_id":
+        detail = (
+            "Task not scheduled: this exact task id already has queue or durable "
+            "lifecycle custody; the existing authority was preserved."
+        )
+        extra = {}
+    elif reason.startswith("project_routing_fence"):
+        lifecycle = str(admitted.get("_project_lifecycle") or "unavailable")
+        detail = (
+            "Subagent not scheduled: the target Project has closed its "
+            f"routing/admission fence ({lifecycle}) and cannot accept new work."
+        )
+        extra = {
+            "project_id": str(admitted.get("_project_id") or project_id),
+            "project_lifecycle": lifecycle,
+        }
+    elif reason == "root_cancelled":
+        detail = (
+            "Subagent not scheduled: its root's subtree cancellation has begun, "
+            "so the tree accepts no new work."
+        )
+        extra = {"root_task_id": str(root_task_id or "")}
+    elif reason == "root_budget_fence":
+        detail = (
+            "Subagent not scheduled: the root budget is paused and requires an "
+            "explicit replay-safe resume, cancellation, or a new run."
+        )
+        extra = {
+            "root_task_id": str(admitted.get("_budget_root_task_id") or root_task_id),
+            "budget_fence_id": str(admitted.get("_budget_fence_id") or ""),
+        }
+    else:
+        lifecycle = str(admitted.get("_acceptance_fence_status") or "active")
+        detail = (
+            "Subagent not scheduled: the root task is in its atomic task-acceptance "
+            f"phase ({lifecycle}); admission is closed until an explicit revision round."
+        )
+        reason = "task_acceptance_fence"
+        extra = {
+            "acceptance_fence_token": str(admitted.get("_acceptance_fence_token") or ""),
+            "acceptance_fence_status": lifecycle,
+        }
+    return {
+        "detail": detail,
+        "reason_code": reason,
+        "extra_fields": extra,
+        "persist_result": reason not in {"task_id_lookup_failed", "duplicate_task_id"},
+    }
+
+
 def subagent_schedule_owned(
     ctx: Any, task_id: str, *, pending_ref: Any = None,
 ) -> bool:
@@ -29,7 +90,9 @@ def subagent_schedule_owned(
             ctx, "PENDING", queue.PENDING,
         )
         running = getattr(ctx, "RUNNING", queue.RUNNING)
-        status = str((load_task_result(ctx.DRIVE_ROOT, tid) or {}).get("status") or "")
+        status = str((load_task_result(
+            ctx.DRIVE_ROOT, tid, strict=True,
+        ) or {}).get("status") or "")
         return (
             tid in running
             or any(
@@ -38,6 +101,28 @@ def subagent_schedule_owned(
             )
             or status not in {"", STATUS_REQUESTED}
         )
+
+
+def subagent_schedule_preflight(ctx: Any, evt: Dict[str, Any], chat_id: int) -> bool:
+    """Stop an owned or unreadable exact child id before provisioning side effects."""
+    tid = str(evt.get("task_id") or "")
+    try:
+        return subagent_schedule_owned(ctx, tid)
+    except (OSError, ValueError):
+        from supervisor.events import _reject_schedule_task
+
+        _reject_schedule_task(
+            ctx, tid=tid, chat_id=chat_id, delegation_role="subagent",
+            parent_id=evt.get("parent_task_id"),
+            root_task_id=str(evt.get("root_task_id") or evt.get("parent_task_id") or tid),
+            role=str(evt.get("role") or "researcher"), result_fields={},
+            detail=(
+                "Subagent not scheduled: the existing durable result for this task id "
+                "is unreadable, so its identity authority was preserved."
+            ),
+            reason_code="scheduled_result_authority_unknown", persist_result=False,
+        )
+        return True
 
 
 def enqueue_subagent_with_scheduled_result(
@@ -73,8 +158,25 @@ def enqueue_subagent_with_scheduled_result(
         )
 
     with queue._queue_lock:
-        previous = load_task_result(ctx.DRIVE_ROOT, tid) or {}
-        if subagent_schedule_owned(ctx, tid, pending_ref=pending_ref):
+        try:
+            previous = load_task_result(ctx.DRIVE_ROOT, tid, strict=True) or {}
+            already_owned = subagent_schedule_owned(
+                ctx, tid, pending_ref=pending_ref,
+            )
+        except (OSError, ValueError):
+            log.warning(
+                "Subagent schedule authority is unreadable for %s", tid,
+                exc_info=True,
+            )
+            return (
+                task,
+                "scheduled_result_authority_unknown",
+                "Subagent not scheduled: the existing durable result for this "
+                "task id is unreadable, so the host cannot prove that the id is "
+                "fresh. The existing result was preserved.",
+                False,
+            )
+        if already_owned:
             log.info("Ignoring replayed schedule event for task %s", tid)
             return (
                 task,
@@ -85,6 +187,12 @@ def enqueue_subagent_with_scheduled_result(
             )
         admitted = ctx.enqueue_task(task)
         if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
+            if admitted.get("_admission_blocked") == "task_id_lookup_failed":
+                return (
+                    task, "scheduled_result_authority_unknown",
+                    "Subagent not scheduled: the exact task-result authority became "
+                    "unreadable during admission and was preserved.", False,
+                )
             return admitted, "", "", False
         result_fields["task_contract"] = admitted_task_contract
         result_fields["depth_provenance"] = admitted_depth_provenance
@@ -183,7 +291,7 @@ def reserve_task_admission(
             from ouroboros.task_results import load_task_result
 
             existing = load_task_result(
-                pathlib.Path(drive_root or queue.DRIVE_ROOT), tid
+                pathlib.Path(drive_root or queue.DRIVE_ROOT), tid, strict=True,
             ) or {}
         except Exception:
             return {"status": "blocked", "reason": "task_id_lookup_failed"}
@@ -237,4 +345,5 @@ __all__ = [
     "release_task_admission",
     "reserve_task_admission",
     "subagent_schedule_owned",
+    "subagent_schedule_preflight",
 ]

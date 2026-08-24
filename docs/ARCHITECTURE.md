@@ -1716,13 +1716,15 @@ veto the workspace-patch capture applies, DECIDED BEFORE ANYTHING IS HASHED (a
 blanket `git add -A` would write a blob for every untracked file, `.env` included,
 into the object database the execution worktree shares) — into a synthetic baseline
 commit pinned by a `refs/ouroboros/delegated/` ref, checks out a detached worktree of it under the
-subagent-worktree root (`subagent_worktrees.provision_execution_snapshot`), and
-scopes the run there: `scope.root` IS the snapshot. The typed binding
+subagent-worktree root (`subagent_worktrees.provision_execution_snapshot`). On
+Claudexor `3.8.1+`, `scope.root` remains the stable authority target used for project
+identity/config/history while `execution.workspaceRoot` names that one-shot snapshot;
+the strict `3.8.0` wire stays byte-compatible by using the snapshot as `scope.root`.
+The typed binding
 `{target_root, execution_root, baseline_sha, authority_source, snapshot_id}` is recorded durably on the
 custody request/start rows BEFORE the POST, the canonical request carries it, and an
-engine whose strict schema supports the split (`3.8.1+`) also receives that same
-snapshot as `execution.workspaceRoot`; the strict `3.8.0` body omits the newer field.
-explicit retry reproduces it exactly (a GC-collected snapshot is a typed
+engine whose strict schema supports the split receives the snapshot separately.
+An explicit retry reproduces it exactly (a GC-collected snapshot is a typed
 `execution_snapshot_missing` refusal, never a re-mint; a stored PRE-C1 mutating
 invocation, whose recorded body scopes the run at the LIVE tree and carries no
 binding to reproduce, is the typed `retry_binding_absent` refusal — the in-place
