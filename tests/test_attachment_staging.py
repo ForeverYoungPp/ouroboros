@@ -320,8 +320,10 @@ class TestStageTaskAttachments:
             "id": "child", "objective": "inspect input", "task_contract": contract,
         })
         assert "INHERITED TASK INPUTS" in work_order
-        assert child_path in work_order
-        assert parent_path not in work_order
+        # The canonical work-order renderer serializes the manifest with
+        # Python's repr; Windows paths therefore carry escaped backslashes.
+        assert repr(child_path) in work_order
+        assert repr(parent_path) not in work_order
 
 
 class TestComposeTaskTextManifestLines:

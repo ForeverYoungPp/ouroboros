@@ -403,9 +403,11 @@ def test_configured_session_child_materializes_initial_and_steered_attachments(t
         child_ctx, child_manifest[1]["relpath"], root="artifact_store",
     )
     work_order = compile_external_work_order(event)
-    assert all(row["abs_path"] in work_order for row in child_manifest)
-    assert str(parent_manifest[0]["abs_path"]) not in work_order
-    assert str(steered_manifest[0]["abs_path"]) not in work_order
+    # The canonical work-order renderer serializes the manifest with Python's
+    # repr; assert the exact serialized value on both POSIX and Windows.
+    assert all(repr(row["abs_path"]) in work_order for row in child_manifest)
+    assert repr(parent_manifest[0]["abs_path"]) not in work_order
+    assert repr(steered_manifest[0]["abs_path"]) not in work_order
 
 
 def test_schedule_task_rejects_legacy_description_schema(tmp_path, monkeypatch):
