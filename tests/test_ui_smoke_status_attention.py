@@ -11,18 +11,22 @@ pytest_plugins = ("tests.test_ui_smoke_playwright",)
     [(1280, 800), (390, 844)],
     ids=["desktop", "narrow"],
 )
-def test_failed_child_stays_local_while_root_keeps_working(
+def test_task_status_stays_factual_in_main_and_project_chat(
     direct_server_with_data,
     width,
     height,
 ):
-    """A failed child stays factual and local while its root keeps working."""
+    """Task outcomes stay local and factual in both real Chat consumers."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
 
+    from ouroboros.projects_registry import create_project
+
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
+    project = create_project(data_dir, "status-attention", name="Status Attention")
+    project_chat_id = int(project["chat_id"])
     logs_dir = data_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     (logs_dir / "chat.jsonl").write_text("", encoding="utf-8")
@@ -55,6 +59,299 @@ def test_failed_child_stays_local_while_root_keeps_working(
             "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
         )
 
+    def emit_progress(page, chat_id, task_id, content):
+        emit(page, {
+            "type": "chat",
+            "role": "assistant",
+            "is_progress": True,
+            "chat_id": chat_id,
+            "task_id": task_id,
+            "content": content,
+            "ts": "2026-08-24T12:00:00+00:00",
+        })
+
+    def emit_task_done(page, chat_id, task_id, status):
+        lifecycle = "cancelled" if status == "cancelled" else "completed"
+        execution = "failed" if status == "failed" else "ok"
+        objective = "fail" if status == "failed" else "pass"
+        emit(page, {
+            "type": "log",
+            "chat_id": chat_id,
+            "data": {
+                "type": "task_done",
+                "task_id": task_id,
+                "status": status,
+                "reason_code": "provider_route_failed" if status == "failed" else "",
+                "outcome_axes": {
+                    "lifecycle": {"status": lifecycle},
+                    "execution": {"status": execution},
+                    "objective": {"status": objective},
+                },
+                "ts": "2026-08-24T12:00:09+00:00",
+            },
+        })
+
+    def direct_card(scope, task_id):
+        return scope.locator(
+            f'.chat-live-card:not(.subagent)[data-task-id="{task_id}"]'
+        )
+
+    def phase_node(card):
+        return card.locator(
+            ":scope > [data-live-summary-button] [data-live-phase]"
+        )
+
+    def phase_text(card):
+        return phase_node(card).inner_text()
+
+    def assert_phase_accessibility(card, kind, text):
+        phase = phase_node(card)
+        assert phase.get_attribute("role") == "status"
+        assert phase.get_attribute("aria-live") == "polite"
+        assert phase.get_attribute("aria-atomic") == "true"
+        assert phase.get_attribute("aria-label") == f"{kind} status: {text}"
+
+    def card_visual_state(card):
+        return card.evaluate(
+            """node => {
+                const style = getComputedStyle(node);
+                return {
+                    className: node.className,
+                    backgroundColor: style.backgroundColor,
+                    borderColor: style.borderColor,
+                    boxShadow: style.boxShadow,
+                };
+            }"""
+        )
+
+    def wait_for_phase(page, scope_selector, task_id, text):
+        page.wait_for_function(
+            """({scopeSelector, taskId, text}) => {
+                const scope = document.querySelector(scopeSelector);
+                const card = scope?.querySelector(
+                    `.chat-live-card[data-task-id="${taskId}"]`
+                );
+                return card?.querySelector(':scope > [data-live-summary-button] [data-live-phase]')
+                    ?.textContent === text;
+            }""",
+            arg={"scopeSelector": scope_selector, "taskId": task_id, "text": text},
+            timeout=30_000,
+        )
+
+    def assert_card_geometry(page, scope_selector, task_ids):
+        geometry = page.evaluate(
+            """({scopeSelector, taskIds}) => {
+                const scope = document.querySelector(scopeSelector);
+                const scopeRect = scope.getBoundingClientRect();
+                const cards = taskIds.map(taskId => {
+                    const card = scope.querySelector(
+                        `.chat-live-card[data-task-id="${taskId}"]`
+                    );
+                    const summary = card.querySelector(':scope > [data-live-summary-button]');
+                    const phase = summary.querySelector('[data-live-phase]');
+                    const title = summary.querySelector('[data-live-title]');
+                    const cardRect = card.getBoundingClientRect();
+                    const summaryRect = summary.getBoundingClientRect();
+                    return {
+                        taskId,
+                        cardLeft: cardRect.left,
+                        cardRight: cardRect.right,
+                        summaryLeft: summaryRect.left,
+                        summaryRight: summaryRect.right,
+                        cardClient: card.clientWidth,
+                        cardScroll: card.scrollWidth,
+                        summaryClient: summary.clientWidth,
+                        summaryScroll: summary.scrollWidth,
+                        phaseClient: phase.clientWidth,
+                        phaseScroll: phase.scrollWidth,
+                        titleClient: title.clientWidth,
+                        titleScroll: title.scrollWidth,
+                    };
+                });
+                return {
+                    viewportWidth: window.innerWidth,
+                    documentClient: document.documentElement.clientWidth,
+                    documentScroll: document.documentElement.scrollWidth,
+                    scopeLeft: scopeRect.left,
+                    scopeRight: scopeRect.right,
+                    scopeClient: scope.clientWidth,
+                    scopeScroll: scope.scrollWidth,
+                    cards,
+                };
+            }""",
+            {"scopeSelector": scope_selector, "taskIds": task_ids},
+        )
+        assert geometry["documentScroll"] <= geometry["documentClient"] + 1, geometry
+        assert geometry["scopeScroll"] <= geometry["scopeClient"] + 1, geometry
+        for card in geometry["cards"]:
+            assert card["cardLeft"] >= geometry["scopeLeft"] - 1, geometry
+            assert card["cardRight"] <= geometry["scopeRight"] + 1, geometry
+            assert card["cardLeft"] >= -1, geometry
+            assert card["cardRight"] <= geometry["viewportWidth"] + 1, geometry
+            assert card["summaryLeft"] >= card["cardLeft"] - 1, geometry
+            assert card["summaryRight"] <= card["cardRight"] + 1, geometry
+            assert card["cardScroll"] <= card["cardClient"] + 1, geometry
+            assert card["summaryScroll"] <= card["summaryClient"] + 1, geometry
+            assert card["phaseScroll"] <= card["phaseClient"] + 1, geometry
+            assert card["titleScroll"] <= card["titleClient"] + 1, geometry
+
+    def run_thread_flow(
+        page,
+        scope,
+        scope_selector,
+        chat_id,
+        prefix,
+        *,
+        check_header,
+    ):
+        continuing_root = f"{prefix}-continuing"
+        child_id = f"{prefix}-child"
+        failed_root = f"{prefix}-failed"
+
+        emit_progress(page, chat_id, continuing_root, "Parent continues the requested work")
+        emit(page, {
+            "type": "chat",
+            "role": "assistant",
+            "is_progress": True,
+            "chat_id": chat_id,
+            "task_id": child_id,
+            "delegation_role": "subagent",
+            "subagent_event": "scheduled",
+            "subagent_task_id": child_id,
+            "parent_task_id": continuing_root,
+            "root_task_id": continuing_root,
+            "subagent_role": "route-checker",
+            "content": "Child checks the delegated route",
+            "status": "scheduled",
+            "ts": "2026-08-24T12:00:01+00:00",
+        })
+
+        parent = direct_card(scope, continuing_root)
+        child = scope.locator(
+            f'.chat-live-card.subagent[data-task-id="{child_id}"]'
+        )
+        parent.wait_for(state="visible", timeout=30_000)
+        child.wait_for(state="visible", timeout=30_000)
+        assert phase_text(parent) == "Working"
+        assert phase_text(child) == "Working"
+        assert_phase_accessibility(parent, "Task", "Working")
+        assert_phase_accessibility(child, "Subagent", "Working")
+        parent_visual_before_child_failure = card_visual_state(parent)
+
+        emit(page, {
+            "type": "chat",
+            "role": "assistant",
+            "is_progress": True,
+            "chat_id": chat_id,
+            "task_id": child_id,
+            "delegation_role": "subagent",
+            "subagent_event": "failed",
+            "subagent_task_id": child_id,
+            "parent_task_id": continuing_root,
+            "root_task_id": continuing_root,
+            "subagent_role": "route-checker",
+            "content": "Child route finished unsuccessfully",
+            "status": "failed",
+            "reason_code": "delegated_route_unavailable",
+            "error": "The selected tool route was unavailable; the parent can continue.",
+            "ts": "2026-08-24T12:00:02+00:00",
+        })
+
+        assert child.evaluate(
+            "card => card.parentElement?.closest('.chat-live-card')?.dataset.taskId"
+        ) == continuing_root
+        assert parent.get_attribute("data-finished") == "0"
+        assert child.get_attribute("data-finished") == "1"
+        assert phase_text(parent) == "Working"
+        assert phase_text(child) == "Failed"
+        assert_phase_accessibility(parent, "Task", "Working")
+        assert_phase_accessibility(child, "Subagent", "Failed")
+        assert phase_node(parent).get_attribute("data-phase") == "working"
+        assert phase_node(child).get_attribute("data-phase") == "error"
+        assert card_visual_state(parent) == parent_visual_before_child_failure
+        assert "error" not in child.get_attribute("class").split()
+
+        if check_header:
+            page.wait_for_function(
+                "selector => document.querySelector(selector)?.textContent === 'Working...'",
+                arg=f"{scope_selector} #chat-status",
+                timeout=30_000,
+            )
+            assert "Attention" not in scope.locator("#chat-status").inner_text()
+        assert page.locator("#toast-stack .toast").count() == 0
+        assert page.locator('[data-nav-page="chat"] .unread-badge').count() == 0
+
+        child_summary = child.locator(":scope > [data-live-summary-button]")
+        assert child.get_attribute("data-expanded") == "0"
+        child_summary.focus()
+        child_summary.press("Enter")
+        assert child.get_attribute("data-expanded") == "1"
+        child_line_toggle = child.locator(
+            ":scope > [data-live-timeline] [data-live-line-toggle]"
+        ).last
+        child_line_toggle.focus()
+        child_line_toggle.press("Enter")
+        assert "Reason: delegated_route_unavailable" in child.locator(
+            ":scope > [data-live-timeline]"
+        ).inner_text()
+        assert "delegated_route_unavailable" not in child_summary.inner_text()
+        child_line_toggle.press("Space")
+        child_summary.press("Space")
+        assert child.get_attribute("data-expanded") == "0"
+
+        emit_task_done(page, chat_id, continuing_root, "completed")
+        wait_for_phase(page, scope_selector, continuing_root, "Done")
+        assert parent.get_attribute("data-finished") == "1"
+        assert phase_text(parent) == "Done"
+        assert phase_text(child) == "Failed"
+        assert_phase_accessibility(parent, "Task", "Done")
+        assert_phase_accessibility(child, "Subagent", "Failed")
+        if check_header:
+            page.wait_for_function(
+                "selector => document.querySelector(selector)?.textContent === 'Online'",
+                arg=f"{scope_selector} #chat-status",
+                timeout=30_000,
+            )
+
+        emit_progress(page, chat_id, failed_root, "A separate root starts")
+        failed = direct_card(scope, failed_root)
+        failed.wait_for(state="visible", timeout=30_000)
+        assert phase_text(failed) == "Working"
+        assert_phase_accessibility(failed, "Task", "Working")
+        emit_task_done(page, chat_id, failed_root, "failed")
+        wait_for_phase(page, scope_selector, failed_root, "Failed")
+        assert failed.get_attribute("data-finished") == "1"
+        assert phase_text(failed) == "Failed"
+        assert_phase_accessibility(failed, "Task", "Failed")
+        assert "provider_route_failed" not in failed.locator(
+            ":scope > [data-live-summary-button]"
+        ).inner_text()
+
+        if check_header:
+            status = scope.locator("#chat-status")
+            page.wait_for_function(
+                "selector => document.querySelector(selector)?.textContent === 'Online'",
+                arg=f"{scope_selector} #chat-status",
+                timeout=30_000,
+            )
+            assert status.inner_text() == "Online"
+            assert "Attention" not in status.inner_text()
+        scope_text = " ".join(scope.locator(".chat-live-card").all_inner_texts())
+        assert "Issue" not in scope_text
+        assert "Notice" not in scope_text
+        assert "Attention" not in " ".join(
+            scope.locator("[data-live-phase]").all_inner_texts()
+        )
+        assert page.locator("#toast-stack .toast").count() == 0
+        assert page.locator('[data-nav-page="chat"] .unread-badge').count() == 0
+        for card in (child, failed):
+            actions = " ".join(card.locator("button").all_inner_texts())
+            for manufactured in ("Retry", "Resume", "Repair", "Reconnect", "Grant access"):
+                assert manufactured not in actions
+
+        task_ids = [continuing_root, child_id, failed_root]
+        assert_card_geometry(page, scope_selector, task_ids)
+
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
@@ -68,147 +365,38 @@ def test_failed_child_stays_local_while_root_keeps_working(
                     timeout=30_000,
                 )
 
-                emit(page, {
-                    "type": "chat",
-                    "role": "assistant",
-                    "is_progress": True,
-                    "chat_id": 1,
-                    "task_id": "status-parent",
-                    "content": "Parent continues the requested work",
-                    "ts": "2026-08-24T12:00:00+00:00",
-                })
-                emit(page, {
-                    "type": "chat",
-                    "role": "assistant",
-                    "is_progress": True,
-                    "chat_id": 1,
-                    "task_id": "status-child",
-                    "delegation_role": "subagent",
-                    "subagent_event": "scheduled",
-                    "subagent_task_id": "status-child",
-                    "parent_task_id": "status-parent",
-                    "root_task_id": "status-parent",
-                    "subagent_role": "route-checker",
-                    "content": "Child checks the delegated route",
-                    "status": "scheduled",
-                    "ts": "2026-08-24T12:00:01+00:00",
-                })
-                emit(page, {
-                    "type": "chat",
-                    "role": "assistant",
-                    "is_progress": True,
-                    "chat_id": 1,
-                    "task_id": "status-child",
-                    "delegation_role": "subagent",
-                    "subagent_event": "failed",
-                    "subagent_task_id": "status-child",
-                    "parent_task_id": "status-parent",
-                    "root_task_id": "status-parent",
-                    "subagent_role": "route-checker",
-                    "content": "Child route finished unsuccessfully",
-                    "status": "failed",
-                    "reason_code": "delegated_route_unavailable",
-                    "error": "The selected tool route was unavailable; the parent can continue.",
-                    "ts": "2026-08-24T12:00:02+00:00",
-                })
-
-                parent = page.locator(
-                    '.chat-live-card:not(.subagent)[data-task-id="status-parent"]'
-                )
-                child = page.locator(
-                    '.chat-live-card.subagent[data-task-id="status-child"]'
-                )
-                parent.wait_for(state="visible", timeout=30_000)
-                child.wait_for(state="visible", timeout=30_000)
-                page.wait_for_function(
-                    "() => document.querySelector('#chat-status')?.textContent === 'Working...'",
-                    timeout=30_000,
+                run_thread_flow(
+                    page,
+                    page.locator("#page-chat"),
+                    "#page-chat",
+                    1,
+                    "main",
+                    check_header=True,
                 )
 
-                assert child.evaluate(
-                    "card => card.parentElement?.closest('.chat-live-card')?.dataset.taskId"
-                ) == "status-parent"
-                assert parent.get_attribute("data-finished") == "0"
-                assert child.get_attribute("data-finished") == "1"
-                assert parent.locator(
-                    ":scope > [data-live-summary-button] [data-live-phase]"
-                ).inner_text() == "Working"
-                assert child.locator(
-                    ":scope > [data-live-summary-button] [data-live-phase]"
-                ).inner_text() == "Failed"
-                assert "Failed" in child.inner_text()
+                project_row = page.locator(
+                    '.nav-project-row[data-project-id="status-attention"]'
+                )
+                if width <= 640 or not project_row.is_visible():
+                    page.locator("#page-chat [data-mobile-nav-toggle]").click()
+                    project_row.wait_for(state="visible", timeout=5_000)
+                project_row.scroll_into_view_if_needed()
+                project_row.click()
+                page.wait_for_selector("#project-panel:not([hidden])", timeout=30_000)
+                project_scope = page.locator("#project-panel .chat-instance-panel")
+                project_scope.wait_for(state="visible", timeout=30_000)
+                run_thread_flow(
+                    page,
+                    project_scope,
+                    "#project-panel .chat-instance-panel",
+                    project_chat_id,
+                    "project",
+                    check_header=False,
+                )
 
-                card_text = page.locator("#chat-messages").inner_text()
-                assert "Issue" not in card_text
-                assert "Notice" not in card_text
-                assert page.locator("#chat-status").inner_text() == "Working..."
-                assert "Attention" not in page.locator("#chat-status").inner_text()
                 assert page.locator("#toast-stack .toast").count() == 0
                 assert page.locator('[data-nav-page="chat"] .unread-badge').count() == 0
-
-                geometry = page.evaluate(
-                    """() => {
-                        const facts = card => {
-                            const summary = card.querySelector('[data-live-summary-button]');
-                            const phase = summary.querySelector('[data-live-phase]');
-                            const title = summary.querySelector('[data-live-title]');
-                            const cardRect = card.getBoundingClientRect();
-                            const summaryRect = summary.getBoundingClientRect();
-                            return {
-                                card: {
-                                    left: cardRect.left,
-                                    right: cardRect.right,
-                                    width: cardRect.width,
-                                },
-                                summary: {
-                                    left: summaryRect.left,
-                                    right: summaryRect.right,
-                                    width: summaryRect.width,
-                                },
-                                cardClientWidth: card.clientWidth,
-                                cardScrollWidth: card.scrollWidth,
-                                summaryClientWidth: summary.clientWidth,
-                                summaryScrollWidth: summary.scrollWidth,
-                                phaseClientWidth: phase.clientWidth,
-                                phaseScrollWidth: phase.scrollWidth,
-                                titleClientWidth: title.clientWidth,
-                                titleScrollWidth: title.scrollWidth,
-                            };
-                        };
-                        const parent = document.querySelector(
-                            '.chat-live-card:not(.subagent)[data-task-id="status-parent"]'
-                        );
-                        const child = document.querySelector(
-                            '.chat-live-card.subagent[data-task-id="status-child"]'
-                        );
-                        const status = document.querySelector('#chat-status').getBoundingClientRect();
-                        const messages = document.querySelector('#chat-messages');
-                        return {
-                            viewportWidth: window.innerWidth,
-                            documentClientWidth: document.documentElement.clientWidth,
-                            documentScrollWidth: document.documentElement.scrollWidth,
-                            messagesClientWidth: messages.clientWidth,
-                            messagesScrollWidth: messages.scrollWidth,
-                            statusLeft: status.left,
-                            statusRight: status.right,
-                            parent: facts(parent),
-                            child: facts(child),
-                        };
-                    }"""
-                )
-                assert geometry["documentScrollWidth"] <= geometry["documentClientWidth"] + 1, geometry
-                assert geometry["messagesScrollWidth"] <= geometry["messagesClientWidth"] + 1, geometry
-                assert geometry["statusLeft"] >= -1, geometry
-                assert geometry["statusRight"] <= geometry["viewportWidth"] + 1, geometry
-                for card in (geometry["parent"], geometry["child"]):
-                    assert card["card"]["left"] >= -1, geometry
-                    assert card["card"]["right"] <= geometry["viewportWidth"] + 1, geometry
-                    assert card["summary"]["left"] >= card["card"]["left"] - 1, geometry
-                    assert card["summary"]["right"] <= card["card"]["right"] + 1, geometry
-                    assert card["cardScrollWidth"] <= card["cardClientWidth"] + 1, geometry
-                    assert card["summaryScrollWidth"] <= card["summaryClientWidth"] + 1, geometry
-                    assert card["phaseScrollWidth"] <= card["phaseClientWidth"] + 1, geometry
-                    assert card["titleScrollWidth"] <= card["titleClientWidth"] + 1, geometry
+                assert project_row.locator(".nav-unread-dot").count() == 0
             finally:
                 browser.close()
     except PlaywrightError as exc:

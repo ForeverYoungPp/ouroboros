@@ -14,6 +14,7 @@ import {
     formatReviewProjection,
     getLogTaskGroupId,
     isGroupedTaskEvent,
+    isTerminalTaskDetail,
     normalizeLogTs,
     ownerHurryProjection,
     summarizeChatLiveEvent,
@@ -22,6 +23,7 @@ import {
     taskPresentation,
     taskSoftStopPending,
     taskStoppedWithSummary,
+    taskDoneIsTerminal,
     taskTerminalPhase,
 } from './log_events.js';
 import {
@@ -36,6 +38,7 @@ import {
     taskControlBusy,
 } from './task_control_menu.js';
 import { openConfirmDialog } from './confirm_dialog.js';
+import { desiredLiveCardPhase, setLiveCardPhase } from './task_phase_chip.js';
 import { renderSkillReviewDisclosure, wireSkillReviewDisclosure } from './skill_review_card.js';
 import {
     createHistoryResyncScheduler,
@@ -53,7 +56,6 @@ import {
     computeHydratedDirectActivities,
     formatMsgTime,
     headerBudgetPresentation,
-    isTerminalTaskDetail,
     isTerminalTaskPhase,
     liveLineRowToggleKey,
     mainThreadAccepts,
@@ -1342,9 +1344,10 @@ export function createChatInstance({
         if (!record || record.finished || !record.phaseEl) return;
         record.cancelPendingPolicy = soft ? 'finalize' : 'immediate';
         record.finalizingHold = false;  // owner cancel outranks the hold
-        record.phaseEl.dataset.phase = 'working';
-        record.phaseEl.textContent = soft ? 'Finalizing…' : 'Cancelling…';
-        record.phaseEl.className = 'chat-live-phase working cancelling';
+        setLiveCardPhase(
+            record, 'working', soft ? 'Finalizing…' : 'Cancelling…',
+            'chat-live-phase working cancelling',
+        );
     }
 
     // Early final stays live while post-task synthesis runs.
@@ -1353,9 +1356,7 @@ export function createChatInstance({
         if (!record || record.finished || !record.phaseEl) return;
         if (record.cancelPendingPolicy) return;
         record.finalizingHold = true;
-        record.phaseEl.dataset.phase = 'working';
-        record.phaseEl.textContent = 'Finalizing…';
-        record.phaseEl.className = 'chat-live-phase working finalizing';
+        setLiveCardPhase(record, 'working', 'Finalizing…', 'chat-live-phase working finalizing');
     }
 
     // Snapshot / restore of the live phase element around the optimistic
@@ -1372,9 +1373,7 @@ export function createChatInstance({
 
     function restoreLiveCardPhase(record, snapshot) {
         if (!record?.phaseEl || !snapshot || record.finished) return;
-        record.phaseEl.dataset.phase = snapshot.phase;
-        record.phaseEl.textContent = snapshot.text;
-        record.phaseEl.className = snapshot.className;
+        setLiveCardPhase(record, snapshot.phase, snapshot.text, snapshot.className);
     }
 
     // Task-detail reconciliation for the cancel flow (GR2-8b): the typed
@@ -1390,9 +1389,8 @@ export function createChatInstance({
             markLiveCardCancelPending(taskId, taskSoftStopPending(stored));
             return;
         }
-        const status = String(stored?.status || '');
-        if (['completed', 'failed', 'cancelled', 'cancel_requested', 'rejected_duplicate'].includes(status)) {
-            finishLiveCard(taskId, taskTerminalPhase(stored));
+        if (taskDoneIsTerminal(stored)) {
+            appendTaskSummaryToLiveCard({ ...stored, task_id: taskId });
         }
     }
 
@@ -1540,7 +1538,7 @@ export function createChatInstance({
             <button type="button" class="chat-live-summary-button" data-live-summary-button aria-expanded="false" aria-controls="${escapeHtmlAttr(timelineId)}">
                 <div class="chat-live-summary">
                     <div class="chat-live-summary-main">
-                        <span class="chat-live-phase working" data-live-phase>Working</span>
+                        <span class="chat-live-phase working" data-live-phase role="status" aria-live="polite" aria-atomic="true" aria-label="${options.isSubagent ? 'Subagent' : 'Task'} status: Working">Working</span>
                         <div class="chat-live-typing" data-live-typing aria-hidden="true">
                             <span></span><span></span><span></span>
                         </div>
@@ -1775,9 +1773,7 @@ export function createChatInstance({
         record._lastFrameMeta = [];
         clearStickyCardState(record);
         record.titleEl.textContent = 'Working...';
-        record.phaseEl.dataset.phase = 'working';
-        record.phaseEl.textContent = 'Working';
-        record.phaseEl.className = 'chat-live-phase working';
+        setLiveCardPhase(record, 'working');
         record.countEl.hidden = true;
         record.countEl.textContent = '0 notes';
         record.metaEl.innerHTML = '';
@@ -2161,16 +2157,8 @@ export function createChatInstance({
             ? (summary.phase || 'done')
             : (shouldPromote ? (summary.phase || 'working') : (record.phaseEl.dataset.phase || 'working'));
 
-        record.phaseEl.dataset.phase = activePhase;
-        const chipPhase = record.finished ? activePhase : 'working';
-        record.phaseEl.textContent = taskPresentation({}, chipPhase).headline;
-        record.phaseEl.className = `chat-live-phase ${activePhase}`;
-        // Sticky hold: post-task frames must not repaint "Working".
-        if (record.finalizingHold && !record.finished && !record.cancelPendingPolicy) {
-            record.phaseEl.dataset.phase = 'working';
-            record.phaseEl.textContent = 'Finalizing…';
-            record.phaseEl.className = 'chat-live-phase working finalizing';
-        }
+        const desiredPhase = desiredLiveCardPhase(record, activePhase);
+        setLiveCardPhase(record, desiredPhase.phase, desiredPhase.text, desiredPhase.className);
         // Cluster B: a coined project name takes the title slot; the live activity
         // headline still renders in the timeline lines below. Falls back to the
         // activity headline until the proactive namer has produced a name.
@@ -2337,11 +2325,9 @@ export function createChatInstance({
         // keeps the set from accumulating every task id of a long session (P3).
         cancelableTaskIds.delete(record.groupId);
         syncCancelRunButton(record);
-        const presentation = taskPresentation({}, phase || 'done');
+        const presentation = taskPresentation(phase || 'done');
         const activePhase = presentation.phase;
-        record.phaseEl.dataset.phase = activePhase;
-        record.phaseEl.textContent = presentation.headline;
-        record.phaseEl.className = `chat-live-phase ${activePhase}`;
+        setLiveCardPhase(record, activePhase, presentation.headline);
         if (!record.suggestedName && !record.lastHumanHeadline) {
             record.titleEl.textContent = presentation.headline;
         }
@@ -2382,7 +2368,7 @@ export function createChatInstance({
             markAssistantReply(taskId);
             return;
         }
-        const presentation = taskPresentation(msg || {});
+        const presentation = taskPresentation(taskTerminalPhase(msg || {}));
         // P5: a cancelled root says "Cancelled", never a generic "Done" headline.
         // №8/Q3: an owner-requested soft stop is a SUCCESS — its own headline,
         // never warn-styled, with the owner-request marker in the details.
@@ -2440,7 +2426,10 @@ export function createChatInstance({
             parentId, role: String(msg.subagent_role || '').trim(), model: msg.model,
         });
         const event = String(msg.subagent_event || '').toLowerCase();
-        if (msg.task_terminal_status || ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(event)) {
+        const replayTerminal = msg.task_terminal_status
+            ? taskDoneIsTerminal({ ...msg, status: String(msg.task_terminal_status) })
+            : false;
+        if (replayTerminal || ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(event)) {
             subagentTerminalChildren.add(childId);
         }
         return childId;
@@ -2532,6 +2521,7 @@ export function createChatInstance({
         // freeze a degraded review as a green completion.
         if (
             msg?.task_terminal_status
+            && taskDoneIsTerminal({ ...msg, status: String(msg.task_terminal_status) })
             && (msg?.outcome_axes || msg?.review_projection || msg?.reason_code)
         ) {
             appendTaskSummaryToLiveCard(msg);
@@ -2660,10 +2650,15 @@ export function createChatInstance({
         if (!info) return false;
         const status = String(evt.status || '').toLowerCase();
         const severity = taskOutcomeSeverity(evt);
+        const interrupted = status === 'interrupted';
         const failed = severity === 'error' || status === 'failed';
         const cancelled = status === 'cancelled' || status === 'cancel_requested';
         const rejected = status === 'rejected_duplicate';
-        const event = failed ? 'failed' : cancelled ? 'cancelled' : rejected ? 'rejected' : (severity === 'warn' ? 'completed_warn' : 'completed');
+        const event = interrupted ? 'interrupted'
+            : failed ? 'failed'
+                : cancelled ? 'cancelled'
+                    : rejected ? 'rejected'
+                        : (severity === 'warn' ? 'completed_warn' : 'completed');
         updateSubagentCardFromEvent({
             delegation_role: 'subagent',
             parent_task_id: info.parentId,
@@ -2674,6 +2669,7 @@ export function createChatInstance({
             review_projection: evt.review_projection,
             result: evt.result || '',
             error: evt.error || '',
+            reason_code: evt.reason_code || '',
             cost_usd: evt.cost_usd,
             accounted_upper_bound_usd: evt.accounted_upper_bound_usd,
             accounted_upper_bound_usd_with_children: evt.accounted_upper_bound_usd_with_children,
@@ -2760,7 +2756,7 @@ export function createChatInstance({
         });
         queueTaskLiveUpdate(presented, taskId, normalizeLogTs(rawTs), presented.dedupeKey || '', rawTs);
         updateSubagentCardFromEvent(evt, rawTs);
-        if (eventType === 'task_done') {
+        if (eventType === 'task_done' && summary.terminal) {
             recordTerminalActivity(taskId);
             syncChatStatus();
             const taskState = getTaskUiState(taskId, false);
@@ -3221,7 +3217,7 @@ export function createChatInstance({
                     }
                 }
                 for (const [tid, terminalRecord] of terminalTaskRecords) {
-                    const status = String(terminalRecord.status || '');
+                    if (!taskDoneIsTerminal(terminalRecord)) continue;
                     // Subagent terminal status resolves the child card, not the
                     // parent. Otherwise reload can revive a crashed/cancelled child.
                     if (subagentChildParents.has(tid)) {
@@ -4084,7 +4080,7 @@ export function createChatInstance({
                 || !isTerminalTaskDetail(detail)
             ) return;
             recordTerminalActivity(taskId);
-            finishLiveCard(taskId, taskTerminalPhase(detail));
+            appendTaskSummaryToLiveCard({ ...detail, task_id: taskId });
         } catch {
             // No terminal fact was proved. A later existing snapshot retries.
         } finally {

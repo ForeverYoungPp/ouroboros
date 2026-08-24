@@ -327,24 +327,42 @@ export function taskTerminalPhase(evt) {
     return 'done';
 }
 
-// One factual task-presentation vocabulary for task chips and terminal
-// headlines. Technical outcome truth stays in taskOutcomeSeverity() and
-// taskTerminalPhase(); this builder only translates that truth into compact
-// owner-facing words. A phase override lets terminal replay/fallback paths use
-// the same projection when only the already-derived phase is available.
-export function taskPresentation(evt = {}, phaseOverride = '') {
-    const type = String(evt?.type || evt?.event || '');
-    const status = String(evt?.outcome_axes?.lifecycle?.status || evt?.status || '').toLowerCase();
-    const hasTerminalTruth = type === 'task_done'
-        || ['done', 'completed', 'failed', 'cancelled', 'cancel_requested', 'rejected_duplicate'].includes(status)
-        || Boolean(evt?.outcome_axes || evt?.review_status || evt?.artifact_bundle || evt?.artifact_status);
-    const phase = String(phaseOverride || (hasTerminalTruth ? taskTerminalPhase(evt) : 'working'));
-    const headline = phase === 'done' ? 'Done'
-        : phase === 'warn' ? 'Done with warnings'
-            : phase === 'cancelled' ? 'Cancelled'
-                : ['error', 'timeout', 'lifecycle_error'].includes(phase) ? 'Failed'
+// Durable task detail is allowed to finish a card only at one of the task
+// result store's genuinely-settled statuses. In particular, interrupted and
+// the legacy cancel_requested latch remain retryable rather than becoming a
+// fabricated Done/Cancelled projection.
+const TERMINAL_TASK_DETAIL_STATUSES = new Set([
+    'completed', 'failed', 'cancelled', 'rejected_duplicate',
+]);
+const OPEN_POST_TASK_SYNTHESIS_STATUSES = new Set(['pending_once', 'running']);
+
+export function isTerminalTaskDetail(record) {
+    const status = String(record?.status || '').toLowerCase();
+    const synthesis = String(record?.root_phase_checkpoint?.post_task_synthesis || '').toLowerCase();
+    return TERMINAL_TASK_DETAIL_STATUSES.has(status)
+        && !(status === 'completed' && OPEN_POST_TASK_SYNTHESIS_STATUSES.has(synthesis));
+}
+
+// A task_done normally mirrors durable task detail. Keep the detail predicate
+// as the terminality authority; the two aliases below exist only on old event
+// frames, not in durable detail (`done`, and the pre-cancel-redesign settled
+// `cancel_requested` event spelling).
+export function taskDoneIsTerminal(evt) {
+    const status = String(evt?.status || '').toLowerCase();
+    return isTerminalTaskDetail(evt) || status === 'done' || status === 'cancel_requested';
+}
+
+// One factual phase -> presentation vocabulary for task chips and terminal
+// headlines. Technical outcome and terminality truth stay in their existing
+// reducers; this translator never inspects event payloads or infers completion.
+export function taskPresentation(phase = 'working') {
+    const normalizedPhase = typeof phase === 'string' && phase.trim() ? phase.trim() : 'working';
+    const headline = normalizedPhase === 'done' ? 'Done'
+        : normalizedPhase === 'warn' ? 'Done with warnings'
+            : normalizedPhase === 'cancelled' ? 'Cancelled'
+                : ['error', 'timeout', 'lifecycle_error'].includes(normalizedPhase) ? 'Failed'
                     : 'Working';
-    return { phase, headline };
+    return { phase: normalizedPhase, headline };
 }
 
 function taskOutcomeMeta(evt) {
@@ -571,7 +589,8 @@ export function summarizeLogEvent(evt) {
     }
 
     if (t === 'task_done') {
-        const presentation = taskPresentation(evt);
+        const terminal = taskDoneIsTerminal(evt);
+        const presentation = taskPresentation(terminal ? taskTerminalPhase(evt) : 'working');
         const reasonCode = evt.reason_code ? String(evt.reason_code) : '';
         const artifactStatus = evt.artifact_bundle?.status || evt.artifact_status || '';
         const reviewDetails = formatReviewProjection(evt.review_projection);
@@ -799,6 +818,7 @@ export function summarizeChatLiveEvent(evt) {
         const resultText = describeText(evt.result || '', 320);
         const traceText = describeText(evt.trace_summary || '', 320);
         const errorText = describeText(evt.error || '', 220);
+        const reasonDetail = evt.reason_code ? `Reason: ${String(evt.reason_code)}` : '';
         const reviewDetails = formatReviewProjection(evt.review_projection);
         const reviewText = describeText(reviewDetails, 240);
         const detailParts = [
@@ -807,6 +827,7 @@ export function summarizeChatLiveEvent(evt) {
             resultText.full ? `[RESULT]\n${resultText.full}` : '',
             traceText.full ? `[TRACE]\n${traceText.full}` : '',
             errorText.full ? `[ERROR]\n${errorText.full}` : '',
+            reasonDetail,
         ].filter(Boolean);
         // A generic "completed" event still carries authoritative outcome axes.
         // Normalize it once here so every live/replay route gets the same label,
@@ -829,7 +850,7 @@ export function summarizeChatLiveEvent(evt) {
                                 : 'working';
         const terminal = ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(event);
         const label = terminal
-            ? taskPresentation(evt, phase).headline
+            ? taskPresentation(phase).headline
             : (SUBAGENT_CARD_LABEL[event] || 'Working');
         // The compact activity line describes the child's work/result, never the
         // reviewer rationale. Review remains complete and auto-expanded below.
@@ -998,7 +1019,8 @@ export function summarizeChatLiveEvent(evt) {
     }
 
     if (t === 'task_done') {
-        const presentation = taskPresentation(evt);
+        const terminal = taskDoneIsTerminal(evt);
+        const presentation = taskPresentation(terminal ? taskTerminalPhase(evt) : 'working');
         const reviewDetails = formatReviewProjection(evt.review_projection);
         const unavailable = evt.cost_accounting_status === 'unavailable';
         // C13: the SHARED accessor and its null policy — same alias precedence as
@@ -1021,7 +1043,7 @@ export function summarizeChatLiveEvent(evt) {
             body: [reasonDetail, reviewDetails].filter(Boolean).join('\n'),
             visible: true,
             promote: true,
-            terminal: true,
+            terminal,
             expandByDefault: Boolean(reviewDetails),
             meta: [softStopped ? OWNER_STOP_DETAIL_MARKER : '', ownCost, childrenCost].filter(Boolean),
             dedupeKey: key(

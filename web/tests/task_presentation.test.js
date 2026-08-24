@@ -6,8 +6,11 @@ import {
     OWNER_STOP_DETAIL_MARKER,
     summarizeChatLiveEvent,
     summarizeLogEvent,
+    taskDoneIsTerminal,
     taskPresentation,
+    taskTerminalPhase,
 } from '../modules/log_events.js';
+import { desiredLiveCardPhase, setLiveCardPhase } from '../modules/task_phase_chip.js';
 
 const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
 const activitySource = readFileSync(new URL('../modules/chat_activity.js', import.meta.url), 'utf8');
@@ -25,12 +28,19 @@ const terminalCases = [
 ];
 
 test('factual task presentation uses the approved five-word family', () => {
-    assert.deepEqual(taskPresentation({ status: 'running' }), {
+    assert.deepEqual(taskPresentation('working'), {
         phase: 'working', headline: 'Working',
     });
     for (const [name, payload, expected] of terminalCases) {
-        assert.deepEqual(taskPresentation(payload), expected, name);
+        assert.deepEqual(taskPresentation(taskTerminalPhase(payload)), expected, name);
     }
+    // Incidental outcome/review/artifact facts cannot manufacture terminality;
+    // callers must first supply an explicit phase from the lifecycle authority.
+    assert.deepEqual(taskPresentation({
+        status: 'running',
+        outcome_axes: { review: { status: 'fail' } },
+        artifact_status: 'missing',
+    }), { phase: 'working', headline: 'Working' });
 });
 
 test('live task_done and replay/log task truth have phase and headline parity', () => {
@@ -46,7 +56,31 @@ test('live task_done and replay/log task truth have phase and headline parity', 
             assert.ok(replay.meta.includes('delegated_custody_unreconciled'));
         }
     }
-    assert.match(chatSource, /const presentation = taskPresentation\(msg \|\| \{\}\);/);
+    assert.match(chatSource, /const presentation = taskPresentation\(taskTerminalPhase\(msg \|\| \{\}\)\);/);
+});
+
+test('interrupted task_done remains retryable and cannot finish a root card', () => {
+    const evt = {
+        type: 'task_done', status: 'interrupted',
+        reason_code: 'worker_restart_interrupted',
+        outcome_axes: { lifecycle: { status: 'interrupted' } },
+    };
+    const live = summarizeChatLiveEvent(evt);
+    const replay = summarizeLogEvent(evt);
+    assert.equal(taskDoneIsTerminal(evt), false);
+    assert.deepEqual(
+        { phase: live.phase, headline: live.headline, terminal: live.terminal },
+        { phase: 'working', headline: 'Working', terminal: false },
+    );
+    assert.deepEqual({ phase: replay.phase, headline: replay.headline }, {
+        phase: 'working', headline: 'Working',
+    });
+    assert.match(chatSource, /if \(eventType === 'task_done' && summary\.terminal\)/);
+    assert.match(chatSource, /if \(!taskDoneIsTerminal\(terminalRecord\)\) continue;/);
+    assert.equal(taskDoneIsTerminal({
+        status: 'completed',
+        root_phase_checkpoint: { post_task_synthesis: 'running' },
+    }), false);
 });
 
 test('owner soft-stop is factual Done and keeps its marker in details', () => {
@@ -74,8 +108,15 @@ test('failed child remains a compact local fact without owner-alarm semantics', 
     assert.equal(child.terminal, true);
     assert.match(child.headline, /— Failed$/);
     assert.doesNotMatch(child.headline, /Issue|Attention|delegated_custody_unreconciled/);
+    assert.doesNotMatch(child.body, /delegated_custody_unreconciled/);
+    assert.match(child.fullBody, /Reason: delegated_custody_unreconciled/);
     assert.equal('ownerAlarm' in child, false);
     assert.equal('notification' in child, false);
+    const adapter = chatSource.slice(
+        chatSource.indexOf('function routeSubagentTerminalToCard'),
+        chatSource.indexOf('function updateLiveCardFromLogEvent'),
+    );
+    assert.match(adapter, /reason_code: evt\.reason_code \|\| ''/);
 });
 
 test('interrupted child stays retryable with a Working chip and inspectable detail', () => {
@@ -90,9 +131,102 @@ test('interrupted child stays retryable with a Working chip and inspectable deta
     assert.equal(child.visible, true);
     assert.match(child.headline, /— Working$/);
     assert.match(child.fullBody, /transport interrupted; retry remains available/);
-    assert.equal(taskPresentation({}, child.terminal ? child.phase : 'working').headline, 'Working');
-    assert.match(chatSource, /const chipPhase = record\.finished \? activePhase : 'working';/);
-    assert.match(chatSource, /taskPresentation\(\{\}, chipPhase\)\.headline/);
+    assert.equal(taskPresentation(child.terminal ? child.phase : 'working').headline, 'Working');
+    const applyState = chatSource.slice(
+        chatSource.indexOf('function applyLiveCardStateMutation'),
+        chatSource.indexOf('function finishLiveCard'),
+    );
+    assert.match(applyState, /const desiredPhase = desiredLiveCardPhase\(record, activePhase\);/);
+    assert.match(applyState, /setLiveCardPhase\(record, desiredPhase\.phase, desiredPhase\.text, desiredPhase\.className\);/);
+    assert.equal([...applyState.matchAll(/setLiveCardPhase\(/g)].length, 1);
+});
+
+test('desired phase-chip precedence keeps stop/finalizing state sticky', () => {
+    assert.deepEqual(desiredLiveCardPhase({ finished: true }, 'error'), {
+        phase: 'error', text: 'Failed', className: 'chat-live-phase error',
+    });
+    assert.deepEqual(desiredLiveCardPhase({
+        finished: false, cancelPendingPolicy: 'finalize', finalizingHold: true,
+    }, 'warn'), {
+        phase: 'working', text: 'Finalizing…', className: 'chat-live-phase working cancelling',
+    });
+    assert.deepEqual(desiredLiveCardPhase({
+        finished: false, cancelPendingPolicy: 'immediate', finalizingHold: true,
+    }, 'warn'), {
+        phase: 'working', text: 'Cancelling…', className: 'chat-live-phase working cancelling',
+    });
+    assert.deepEqual(desiredLiveCardPhase({ finished: false, finalizingHold: true }, 'warn'), {
+        phase: 'working', text: 'Finalizing…', className: 'chat-live-phase working finalizing',
+    });
+    assert.deepEqual(desiredLiveCardPhase({ finished: false }, 'warn'), {
+        phase: 'working', text: 'Working', className: 'chat-live-phase working',
+    });
+});
+
+test('task-detail healing reuses the full terminal-summary projection', () => {
+    const cancelHeal = chatSource.slice(
+        chatSource.indexOf('function reconcileCancelCardFromDetail'),
+        chatSource.indexOf('async function cancelRunFromCard'),
+    );
+    assert.match(cancelHeal, /taskDoneIsTerminal\(stored\)/);
+    assert.match(cancelHeal, /appendTaskSummaryToLiveCard\(\{ \.\.\.stored, task_id: taskId \}\)/);
+    assert.doesNotMatch(cancelHeal, /finishLiveCard\(/);
+
+    const missingHeal = chatSource.slice(
+        chatSource.indexOf('async function reconcileMissingManagedTask'),
+        chatSource.indexOf('function observeMissingManagedTask'),
+    );
+    assert.match(missingHeal, /isTerminalTaskDetail\(detail\)/);
+    assert.match(missingHeal, /appendTaskSummaryToLiveCard\(\{ \.\.\.detail, task_id: taskId \}\)/);
+    assert.doesNotMatch(missingHeal, /finishLiveCard\(/);
+});
+
+test('phase chips are contextual polite status regions without repeat announcements', () => {
+    const attrs = new Map();
+    const attrWrites = new Map();
+    let textContent = '';
+    let textWrites = 0;
+    const phaseEl = {
+        dataset: {},
+        className: '',
+        get textContent() { return textContent; },
+        set textContent(value) { textContent = value; textWrites += 1; },
+        getAttribute(name) { return attrs.get(name) ?? null; },
+        setAttribute(name, value) {
+            attrs.set(name, value);
+            attrWrites.set(name, (attrWrites.get(name) || 0) + 1);
+        },
+    };
+    const record = { phaseEl, isSubagent: true };
+    setLiveCardPhase(record, 'working');
+    assert.deepEqual({ ...phaseEl.dataset }, { phase: 'working' });
+    assert.equal(phaseEl.className, 'chat-live-phase working');
+    assert.equal(textContent, 'Working');
+    assert.equal(attrs.get('role'), 'status');
+    assert.equal(attrs.get('aria-live'), 'polite');
+    assert.equal(attrs.get('aria-atomic'), 'true');
+    assert.equal(attrs.get('aria-label'), 'Subagent status: Working');
+    const stableTextWrites = textWrites;
+    const stableLabelWrites = attrWrites.get('aria-label');
+    setLiveCardPhase(record, 'working');
+    assert.equal(textWrites, stableTextWrites);
+    assert.equal(attrWrites.get('aria-label'), stableLabelWrites);
+    setLiveCardPhase(record, 'error', 'Failed');
+    assert.equal(textContent, 'Failed');
+    assert.equal(attrs.get('aria-label'), 'Subagent status: Failed');
+    assert.equal(textWrites, stableTextWrites + 1);
+    assert.equal(attrWrites.get('aria-label'), stableLabelWrites + 1);
+    const sticky = desiredLiveCardPhase({ cancelPendingPolicy: 'finalize' }, 'warn');
+    setLiveCardPhase(record, sticky.phase, sticky.text, sticky.className);
+    const stickyTextWrites = textWrites;
+    const stickyLabelWrites = attrWrites.get('aria-label');
+    setLiveCardPhase(record, sticky.phase, sticky.text, sticky.className);
+    assert.equal(textContent, 'Finalizing…');
+    assert.equal(phaseEl.className, 'chat-live-phase working cancelling');
+    assert.equal(textWrites, stickyTextWrites);
+    assert.equal(attrWrites.get('aria-label'), stickyLabelWrites);
+    assert.match(chatSource, /aria-label="\$\{options\.isSubagent \? 'Subagent' : 'Task'\} status: Working"/);
+    assert.doesNotMatch(chatSource, /record\.phaseEl\.(?:dataset\.phase|textContent|className)\s*=/);
 });
 
 test('nonterminal diagnostics stay visible facts but never promote the task', () => {

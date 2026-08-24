@@ -1062,7 +1062,8 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                 assert card.is_visible()
                 assert card.get_attribute("data-expanded") == "1"
                 chat_text = card.inner_text()
-                assert "Notice" in chat_text
+                assert "Done with warnings" in chat_text
+                assert "Notice" not in chat_text
                 assert "Review panel panel_visual_truth" in chat_text
                 assert "Reviewer fable" in chat_text
                 assert "Reviewer sol" in chat_text

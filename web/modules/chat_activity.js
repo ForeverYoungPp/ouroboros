@@ -212,22 +212,6 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
     return Boolean(terminal) || ['done', 'lifecycle_error', 'cancelled'].includes(phase);
 }
 
-// Durable task detail is allowed to finish a card only at one of the task
-// result store's genuinely-settled statuses. In particular, interrupted and
-// the legacy cancel_requested latch remain retryable rather than becoming a
-// fabricated Done/Cancelled projection.
-const TERMINAL_TASK_DETAIL_STATUSES = new Set([
-    'completed', 'failed', 'cancelled', 'rejected_duplicate',
-]);
-const OPEN_POST_TASK_SYNTHESIS_STATUSES = new Set(['pending_once', 'running']);
-
-export function isTerminalTaskDetail(record) {
-    const status = String(record?.status || '').toLowerCase();
-    const synthesis = String(record?.root_phase_checkpoint?.post_task_synthesis || '').toLowerCase();
-    return TERMINAL_TASK_DETAIL_STATUSES.has(status)
-        && !(status === 'completed' && OPEN_POST_TASK_SYNTHESIS_STATUSES.has(synthesis));
-}
-
 // ---------------------------------------------------------------------------
 // In-flight chat activity status (owner decisions 1A-5A; managed continuity).
 // ---------------------------------------------------------------------------
@@ -572,7 +556,7 @@ export function reconcileHydratedDirectActivities(
  * of ids the GLOBAL /api/state snapshot confirms live, it returns the mounted
  * unfinished foreground card ids the snapshot does NOT vouch for. Each one is
  * handed to observeMissingManagedTask, whose durable task-detail read finishes
- * the card ONLY on a proven terminal status (isTerminalTaskDetail); a 404 or
+ * the card ONLY on a proven terminal status (`log_events.js::isTerminalTaskDetail`); a 404 or
  * nonterminal detail keeps the id and retries on the next snapshot (owner
  * Q3=A: no timers, no id-shape heuristics, no fabricated terminal).
  *

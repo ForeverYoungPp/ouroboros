@@ -7,11 +7,14 @@ import test from 'node:test';
 import {
     computeDerivedChatStatus,
     computeHydratedDirectActivities,
-    isTerminalTaskDetail,
     partitionLocalEchoJournal,
     reconcileHydratedDirectActivities,
 } from '../modules/chat_activity.js';
-import { summarizeChatLiveEvent, taskTerminalPhase } from '../modules/log_events.js';
+import {
+    isTerminalTaskDetail,
+    summarizeChatLiveEvent,
+    taskTerminalPhase,
+} from '../modules/log_events.js';
 
 // ---------------------------------------------------------------------------
 // Local-echo journal: a stale history snapshot must not erase the owner's row.
