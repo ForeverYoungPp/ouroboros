@@ -10,7 +10,12 @@ import {
     taskPresentation,
     taskTerminalPhase,
 } from '../modules/log_events.js';
-import { desiredLiveCardPhase, setLiveCardPhase } from '../modules/task_phase_chip.js';
+import {
+    captureLiveCardPhaseState,
+    desiredLiveCardPhase,
+    restoreLiveCardPhaseState,
+    setLiveCardPhase,
+} from '../modules/task_phase_chip.js';
 
 const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
 const activitySource = readFileSync(new URL('../modules/chat_activity.js', import.meta.url), 'utf8');
@@ -159,6 +164,37 @@ test('desired phase-chip precedence keeps stop/finalizing state sticky', () => {
         phase: 'working', text: 'Finalizing…', className: 'chat-live-phase working finalizing',
     });
     assert.deepEqual(desiredLiveCardPhase({ finished: false }, 'warn'), {
+        phase: 'working', text: 'Working', className: 'chat-live-phase working',
+    });
+});
+
+test('failed optimistic stop restores the finalizing fact, not only its DOM text', () => {
+    const record = {
+        finished: false,
+        cancelPendingPolicy: '',
+        finalizingHold: true,
+        phaseEl: { dataset: { phase: 'working' } },
+    };
+    const snapshot = captureLiveCardPhaseState(record);
+    record.cancelPendingPolicy = 'immediate';
+    record.finalizingHold = false;
+    const restored = restoreLiveCardPhaseState(record, snapshot);
+    assert.equal(record.cancelPendingPolicy, '');
+    assert.equal(record.finalizingHold, true);
+    assert.deepEqual(restored, {
+        phase: 'working', text: 'Finalizing…', className: 'chat-live-phase working finalizing',
+    });
+    // A previous cancel-pending visual is not resurrected after durable detail
+    // proves that no cancel intent remains.
+    const staleCancel = {
+        finished: false,
+        cancelPendingPolicy: 'finalize',
+        finalizingHold: false,
+        phaseEl: { dataset: { phase: 'working' } },
+    };
+    const staleSnapshot = captureLiveCardPhaseState(staleCancel);
+    staleCancel.cancelPendingPolicy = 'immediate';
+    assert.deepEqual(restoreLiveCardPhaseState(staleCancel, staleSnapshot), {
         phase: 'working', text: 'Working', className: 'chat-live-phase working',
     });
 });

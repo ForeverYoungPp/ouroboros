@@ -38,7 +38,12 @@ import {
     taskControlBusy,
 } from './task_control_menu.js';
 import { openConfirmDialog } from './confirm_dialog.js';
-import { desiredLiveCardPhase, setLiveCardPhase } from './task_phase_chip.js';
+import {
+    captureLiveCardPhaseState,
+    desiredLiveCardPhase,
+    restoreLiveCardPhaseState,
+    setLiveCardPhase,
+} from './task_phase_chip.js';
 import { renderSkillReviewDisclosure, wireSkillReviewDisclosure } from './skill_review_card.js';
 import {
     createHistoryResyncScheduler,
@@ -1359,22 +1364,10 @@ export function createChatInstance({
         setLiveCardPhase(record, 'working', 'Finalizing…', 'chat-live-phase working finalizing');
     }
 
-    // Snapshot / restore of the live phase element around the optimistic
+    // Snapshot / restore of the live phase state around the optimistic
     // "Cancelling…" mark (GR2-8a): a cancel request that FAILS must not leave
-    // the optimistic phase lying on a card whose cancellation is not pending.
-    function captureLiveCardPhase(record) {
-        if (!record?.phaseEl) return null;
-        return {
-            phase: record.phaseEl.dataset.phase,
-            text: record.phaseEl.textContent,
-            className: record.phaseEl.className,
-        };
-    }
-
-    function restoreLiveCardPhase(record, snapshot) {
-        if (!record?.phaseEl || !snapshot || record.finished) return;
-        setLiveCardPhase(record, snapshot.phase, snapshot.text, snapshot.className);
-    }
+    // the optimistic phase lying on a card whose cancellation is not pending,
+    // or erase an existing post-task finalization hold on the next progress frame.
 
     // Task-detail reconciliation for the cancel flow (GR2-8b): the typed
     // cancel_state projection is consulted FIRST — a live task wedged in the
@@ -1402,7 +1395,7 @@ export function createChatInstance({
         const soft = action === ACTION_FINALIZE;
         const btn = record.cancelRunBtn;
         if (btn) btn.disabled = true;
-        const priorPhase = captureLiveCardPhase(record);
+        const priorPhase = captureLiveCardPhaseState(record);
         markLiveCardCancelPending(taskId, soft);
         try {
             await requestStop(taskId, action);
@@ -1443,8 +1436,12 @@ export function createChatInstance({
             const stillPending = Boolean(taskCancelPending(stored));
             if (record.finished || stillPending) return;
             if (btn) btn.disabled = false;
-            restoreLiveCardPhase(record, priorPhase);
-            record.cancelPendingPolicy = '';
+            const restoredPhase = restoreLiveCardPhaseState(record, priorPhase);
+            if (restoredPhase) {
+                setLiveCardPhase(
+                    record, restoredPhase.phase, restoredPhase.text, restoredPhase.className,
+                );
+            }
         }
     }
 

@@ -199,10 +199,9 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         page,
         scope,
         scope_selector,
+        status_selector,
         chat_id,
         prefix,
-        *,
-        check_header,
     ):
         continuing_root = f"{prefix}-continuing"
         child_id = f"{prefix}-child"
@@ -271,13 +270,12 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         assert card_visual_state(parent) == parent_visual_before_child_failure
         assert "error" not in child.get_attribute("class").split()
 
-        if check_header:
-            page.wait_for_function(
-                "selector => document.querySelector(selector)?.textContent === 'Working...'",
-                arg=f"{scope_selector} #chat-status",
-                timeout=30_000,
-            )
-            assert "Attention" not in scope.locator("#chat-status").inner_text()
+        page.wait_for_function(
+            "selector => document.querySelector(selector)?.textContent === 'Working...'",
+            arg=f"{scope_selector} {status_selector}",
+            timeout=30_000,
+        )
+        assert "Attention" not in scope.locator(status_selector).inner_text()
         assert page.locator("#toast-stack .toast").count() == 0
         assert page.locator('[data-nav-page="chat"] .unread-badge').count() == 0
 
@@ -306,12 +304,11 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         assert phase_text(child) == "Failed"
         assert_phase_accessibility(parent, "Task", "Done")
         assert_phase_accessibility(child, "Subagent", "Failed")
-        if check_header:
-            page.wait_for_function(
-                "selector => document.querySelector(selector)?.textContent === 'Online'",
-                arg=f"{scope_selector} #chat-status",
-                timeout=30_000,
-            )
+        page.wait_for_function(
+            "selector => document.querySelector(selector)?.textContent === 'Online'",
+            arg=f"{scope_selector} {status_selector}",
+            timeout=30_000,
+        )
 
         emit_progress(page, chat_id, failed_root, "A separate root starts")
         failed = direct_card(scope, failed_root)
@@ -327,15 +324,14 @@ def test_task_status_stays_factual_in_main_and_project_chat(
             ":scope > [data-live-summary-button]"
         ).inner_text()
 
-        if check_header:
-            status = scope.locator("#chat-status")
-            page.wait_for_function(
-                "selector => document.querySelector(selector)?.textContent === 'Online'",
-                arg=f"{scope_selector} #chat-status",
-                timeout=30_000,
-            )
-            assert status.inner_text() == "Online"
-            assert "Attention" not in status.inner_text()
+        status = scope.locator(status_selector)
+        page.wait_for_function(
+            "selector => document.querySelector(selector)?.textContent === 'Online'",
+            arg=f"{scope_selector} {status_selector}",
+            timeout=30_000,
+        )
+        assert status.inner_text() == "Online"
+        assert "Attention" not in status.inner_text()
         scope_text = " ".join(scope.locator(".chat-live-card").all_inner_texts())
         assert "Issue" not in scope_text
         assert "Notice" not in scope_text
@@ -369,9 +365,9 @@ def test_task_status_stays_factual_in_main_and_project_chat(
                     page,
                     page.locator("#page-chat"),
                     "#page-chat",
+                    "#chat-status",
                     1,
                     "main",
-                    check_header=True,
                 )
 
                 project_row = page.locator(
@@ -389,9 +385,9 @@ def test_task_status_stays_factual_in_main_and_project_chat(
                     page,
                     project_scope,
                     "#project-panel .chat-instance-panel",
+                    f"#pchat-{project['id']}-status",
                     project_chat_id,
                     "project",
-                    check_header=False,
                 )
 
                 assert page.locator("#toast-stack .toast").count() == 0

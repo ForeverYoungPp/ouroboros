@@ -28,6 +28,23 @@ export function desiredLiveCardPhase(record = {}, terminalPhase = 'done') {
     return { phase: 'working', text: 'Working', className: 'chat-live-phase working' };
 }
 
+// Preserve the authoritative unfinished phase fact across an optimistic owner
+// stop. DOM text alone is insufficient: a failed request must also restore an
+// open post-task finalization hold so later progress cannot repaint Working.
+export function captureLiveCardPhaseState(record = {}) {
+    return {
+        phase: String(record?.phaseEl?.dataset?.phase || 'working'),
+        finalizingHold: Boolean(record?.finalizingHold),
+    };
+}
+
+export function restoreLiveCardPhaseState(record, snapshot) {
+    if (!record || !snapshot || record.finished) return null;
+    record.cancelPendingPolicy = '';
+    record.finalizingHold = Boolean(snapshot.finalizingHold);
+    return desiredLiveCardPhase(record, snapshot.phase || 'working');
+}
+
 // One writer for the stable factual task/subagent phase chip. Technical
 // nonterminal diagnostics stay in the card timeline/details.
 export function setLiveCardPhase(record, phase = 'working', text = '', className = '') {
