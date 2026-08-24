@@ -88,8 +88,18 @@ def usage_from_response(response: Any) -> Tuple[Dict[str, Any], Optional[float],
         if split:
             normalized["cache_write_tokens_by_ttl"] = split
     completion = normalized["completion_tokens"]
-    if (isinstance(payload, dict) and isinstance(payload.get("error"), dict)
-            and not (prompt or 0) and not (completion or 0)):
+    cache_usage_reported = bool(
+        (cache_read or 0)
+        or (cache_write or 0)
+        or any((normalized.get("cache_write_tokens_by_ttl") or {}).values())
+    )
+    if (
+        isinstance(payload, dict)
+        and isinstance(payload.get("error"), dict)
+        and not (prompt or 0)
+        and not (completion or 0)
+        and not cache_usage_reported
+    ):
         normalized.update(prompt_tokens=0, completion_tokens=0, cached_tokens=0, cache_write_tokens=0)
         return normalized, 0.0, True
     candidates = (

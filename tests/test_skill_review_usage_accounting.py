@@ -255,14 +255,19 @@ def test_api_token_normalization_preserves_missing_zero_and_body_error_contracts
     assert (rejected["prompt_tokens"], rejected["completion_tokens"]) == (0, 0)
     assert cost == 0.0 and final is True
 
-    rejected_cache, cost, final = ua.usage_from_response({
-        "error": {"code": 429}, "usage": {"cached_tokens": 7},
-    })
-    assert (
-        rejected_cache["prompt_tokens"], rejected_cache["completion_tokens"],
-        rejected_cache["cached_tokens"],
-    ) == (0, 0, 0)
-    assert cost == 0.0 and final is True
+    for usage, field in (
+        ({"cached_tokens": 7}, "cached_tokens"),
+        ({"cache_write_tokens": 7}, "cache_write_tokens"),
+        ({"prompt_tokens_details": {"cached_tokens": 7}}, "cached_tokens"),
+        ({"cache_creation": {"ephemeral_5m_input_tokens": 7}}, "cache_write_tokens_by_ttl"),
+    ):
+        rejected_cache, cost, final = ua.usage_from_response({
+            "error": {"code": 429}, "usage": usage,
+        })
+        assert rejected_cache["prompt_tokens"] is None
+        assert rejected_cache["completion_tokens"] is None
+        assert rejected_cache[field]
+        assert cost is None and final is False
 
 
 def test_skill_wave_token_gaps_exclude_nonphysical_rows_and_keep_explicit_zero(data_root):
