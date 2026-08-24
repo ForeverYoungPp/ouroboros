@@ -85,6 +85,11 @@ def _provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
 def _provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
     """Explain whether retrying later is likely to help."""
     kind = str(accumulated_usage.get("_last_llm_error_kind") or "").strip()
+    if kind == "provider_outcome_unknown":
+        return (
+            " The dispatched request has no terminal provider outcome, so no "
+            "retry or paid fallback was sent; either could duplicate live work."
+        )
     if kind == "subscription_window_exhausted":
         reset_at = str(accumulated_usage.get("_last_llm_reset_at") or "").strip()
         when = f" It resets at {reset_at}." if reset_at else ""
@@ -2398,15 +2403,7 @@ def _run_cross_model_fallback_chain(
     accumulated_usage, task_type, emit_progress, context_fit_plan,
     active_context_mode,
 ) -> tuple:
-    """F1 (v6.39): 429-aware cross-model fallback CHAIN. Mark the failed primary on
-    cooldown if its last failure was transient (a swarm stops stampeding it), then
-    walk the configured chain, skipping cooled-down models, until one responds; a
-    small per-candidate attempt cap keeps a multi-model chain from a retry storm,
-    and every call stays deadline-aware. The bench (FALLBACKS==main) dedupes to an
-    empty chain -> no cross-model fallback, by design. Returns the new ``(msg,
-    active_model, active_use_local, context_fit_plan, context_mode)``; ``msg`` is
-    None when the whole (cooled-down / empty) chain is exhausted, leaving the
-    caller to join the provider-unavailable shelf."""
+    """Try bounded fallbacks; an unknown dispatched outcome stops the chain."""
     from ouroboros import fallback_cooldown as _fcd
     from ouroboros.config import get_fallback_models
     from ouroboros.loop_llm_call import _COOLDOWN_ERROR_KINDS as _cooldown_kinds
@@ -2495,6 +2492,8 @@ def _run_cross_model_fallback_chain(
         tools._ctx.messages = messages
         tools._ctx.active_context_mode = active_context_mode
         _restore_context_fit_usage(accumulated_usage, primary_context_usage)
+        if str(accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown":
+            break
         _cooled(fallback_model, fallback_use_local)
     return (
         msg,
@@ -3487,14 +3486,7 @@ def _handle_owner_stop_finalization(
 
 
 def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Provider-death terminalization: the model returned no usable response
-    after the transport same-model reroute + retries (+ any configured
-    cross-model fallback). SALVAGE like the other forced rails — one tool-less
-    final answer (which itself benefits from the same-model reroute) and,
-    failing that, the last assistant text already produced — but terminalize as
-    an INFRA FAILURE, never as a completion: an outage interrupts the task with
-    the objective unmet, and calling that "completed (best effort)" was a lie
-    that hid a real outage from the owner (95 minutes of silence)."""
+    """Salvage provider failure as infra, without retrying an unknown send."""
     # A stale DeliveryCandidate is still the best complete text available when
     # the provider is dead. _forced_fallback_result preserves its original
     # evidence provenance and adds a host-owned resume disclosure rather than
@@ -3518,6 +3510,16 @@ def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str
             f"{_provider_failure_hint(ctx.accumulated_usage)}{_provider_recovery_hint(ctx.accumulated_usage)} "
             "Any files written so far are preserved in the workspace."
         )
+    if str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown":
+        live_trace = getattr(ctx, "llm_trace", None)
+        llm_trace = live_trace if isinstance(live_trace, dict) else {}
+        text, usage, llm_trace = _forced_fallback_result(
+            ctx, llm_trace, fallback, "provider_unavailable",
+            source="provider_outcome_unknown_no_resend",
+        )
+        if str(usage.get("reason_code") or "") == "provider_unavailable":
+            usage["execution_status"] = RESULT_INFRA_FAILED
+        return text, usage, llm_trace
     prompt = (
         "[PROVIDER_UNAVAILABLE] The model provider failed to return a usable response. "
         "The task is being INTERRUPTED by this outage, not completed. Summarize the "
@@ -5466,7 +5468,7 @@ def _forced_final_answer(
     reason_code: str,
     single_semantic_turn: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Emit a final answer; owner-stop permits one model call."""
+    """Return a forced answer or retained fallback."""
     live_trace = getattr(ctx, "llm_trace", None)
     llm_trace = live_trace if isinstance(live_trace, dict) else {}
     _finalize_forced_services(ctx, llm_trace)
@@ -5496,32 +5498,31 @@ def _forced_final_answer(
         ctx.accumulated_usage["reason_code"] = reason_code
         if not _drain_forced_owner_directives(ctx, llm_trace):
             break
+        if str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown":
+            return _forced_fallback_result(
+                ctx, llm_trace,
+                "⚠️ Provider outcome unknown; directive retained. Resume the task without a blind resend.",
+                reason_code,
+                source="provider_outcome_unknown_no_resend",
+            )
         if attempt == 1:
             return _forced_fallback_result(
                 ctx,
                 llm_trace,
-                (
-                    "⚠️ A new owner directive arrived during the forced refresh and could "
-                    "not be incorporated safely before the hard stop. Resume the task to "
-                    "produce an answer bound to the latest directive."
-                ),
+                "⚠️ Another directive arrived. Resume the task for a current answer.",
                 reason_code,
                 source="late_owner_directive_requires_resume",
             )
         _finalize_forced_services(ctx, llm_trace)
         _append_or_merge_user_message(
             ctx.messages,
-            "[FORCED_OWNER_REFRESH] A new typed owner directive arrived while the prior "
-            "forced answer was being generated. Discard that stale draft and produce one "
-            "new complete answer bound to every owner directive now present.",
+            "[FORCED_OWNER_REFRESH] Answer all current directives; ignore the stale draft.",
         )
 
     extracted, control_degraded = _resolve_forced_delivery_control(
         getattr(getattr(ctx, "tools", None), "_ctx", None), extracted,
     )
     if extracted:
-        # Typed fact for the best_effort outcome gate: a REAL model answer
-        # was extracted (host fallback strings never set this).
         ctx.accumulated_usage["_best_effort_extracted"] = True
         tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
         plan_suffix = (
@@ -6934,7 +6935,12 @@ def run_llm_loop(
             )
             tools._ctx._current_llm_call_meta = dict(accumulated_usage.get("_last_llm_call_meta") or {})
 
-            if msg is None and not bool(getattr(ctx, "exact_model_route", False)):
+            if (
+                msg is None
+                and not bool(getattr(ctx, "exact_model_route", False))
+                and str(accumulated_usage.get("_last_llm_error_kind") or "")
+                != "provider_outcome_unknown"
+            ):
                 (
                     msg,
                     active_model,

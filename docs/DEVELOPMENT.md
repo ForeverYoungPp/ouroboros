@@ -1643,8 +1643,9 @@ Before every commit, verify the following:
 - [ ] Provider failures must be classified before retrying the same request.
   Quota/auth/billing, hard bad-request, and request-too-large/context failures
   are non-retryable as-is: record the exact category and surface a recovery hint
-  instead of burning rounds on identical calls. Transient rate limits/timeouts may
-  still use the normal retry path.
+  instead of burning rounds on identical calls. A typed 408/429/5xx or a failure
+  proven pre-dispatch may retry; a dispatched request with no terminal provider
+  outcome must stop same-model and cross-model sends until it is reconciled.
 
 #### Timeout & Wait Control
 - [ ] For a session nanny, `delegate_wait` is **event-only** at the model surface.
@@ -1671,16 +1672,17 @@ Before every commit, verify the following:
   is `OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC` (2700s), while review slots,
   plan/acceptance wrappers, web-search attempts, delegated polling, and VLM
   calls use their own logical deadline or provider-specific transport setting.
-  An explicit slot deadline narrows the shared bound; otherwise the owner task
-  deadline, then the transport bound as a settlement fallback, applies. A
+  An explicit slot deadline narrows the route-owned bound. API review uses its
+  transport bound as a settlement fallback because that request ends there;
+  a delegated agent session instead inherits the existing task absolute ceiling
+  because the paid engine run can outlive an HTTP read. The owner deadline always
+  narrows either route. A
   caller/task deadline always narrows nested waits, and Anthropic (120s) plus
   VLM captioning (90s) retain their separate provider transport defaults as
   ceilings, not promises to run past the owner deadline. Delegated review uses
   an opt-in strict poll bound for the remaining logical window; the general
   delegate-wait floor remains unchanged for its existing transport contract.
-  Default reviewer slots intentionally have no short 300-second cognition cap:
-  an explicit slot window narrows them, otherwise the owner deadline and then
-  the transport settlement bound apply.
+  Default reviewer slots intentionally have no short cognition cap.
 - [ ] Every physical LLM/review/VLM/tool operation that can outlive a logical
   wait emits a typed `cognitive_operation` start and terminal fact. The
   supervisor uses the active-operation map only to spare the idle rail; the
@@ -1690,8 +1692,13 @@ Before every commit, verify the following:
   attempt and remain bound to its retry identity. Once the owner deadline minus
   finalization reserve is spent, an unstarted review row is a typed `$0
   not_dispatched` actor: no worker, paid stamp, or active lease is created.
-  A blocking commit attempt cannot treat an in-flight reviewer as a final
-  quorum verdict; advisory enforcement may proceed only with the durable warning.
+  A commit attempt cannot treat an in-flight reviewer as a final quorum verdict,
+  including under advisory enforcement.
+- [ ] A returned provider response (including an empty/incomplete body) or typed
+  terminal 408/429/5xx is settled and may use the surface's bounded retry/repair
+  rail. A dispatched request whose socket or stream ends without terminal
+  provider evidence is `provider_outcome_unknown`: no same-model, fallback,
+  provider, local-server, or forced-final resend until custody settles.
 - [ ] A reviewed mutative wrapper must retain foreground custody until the
   workflow settles. Inner phase bounds and the task/supervisor absolute deadline
   are the stop axes; never use the global 600s tool default or a separately
@@ -1702,10 +1709,16 @@ Before every commit, verify the following:
   snapshots, owner intent, route/model rows, or a genuinely new review cycle
   must mint a new key. Use the canonical staged tree/parent binding for commit
   review, pass the key immutably to every row, and do not admit the next paid
-  plan-review cycle while the previous cycle is still in flight. Reconciliation
-  freezes that cycle's originally dispatched rows and its `$0` skip rows instead
+  plan-review cycle while the previous cycle is still in flight. Plan-cycle
+  reconciliation freezes its originally dispatched rows and `$0` skip rows instead
   of re-running live health/fit admission; reviewer-requested evidence advances
   the next envelope only after every actor in the current cycle is terminal.
+- [ ] Commit review writes and rereads `paid=True` plus the exact nonempty retry
+  key before any reviewer worker starts. Exact resume keeps the durable actor
+  roster. Deterministic packet reassembly may reconstruct unchanged executor
+  inputs, but cannot erase a frozen row, admit an unmatched paid row, or replace
+  a pending row with a different `slot_id`/`operation_id`. Delegated pending rows
+  carry the durable invocation token; API rows without process custody stay unresolved.
 - [ ] Cooperative cancellation is used where the existing route supports it
   (delegated sessions); API/thread routes disclose an in-flight custody state
   until their physical result settles. Do not replace this with a keyword or
@@ -1715,6 +1728,8 @@ Before every commit, verify the following:
   the permitted retry instead of posting a second paid run. A late tool worker
   closes its own cognitive lease through its completion callback, and a partial
   terminal event that lacks the stored correlation identity cannot close it.
+  If process-local review custody is lost, keep the paid attempt unresolved and
+  require operator reconciliation; elapsed TTL is never authority to pay again.
 
 #### Loop / State-Machine Changes
 - [ ] Changes to `loop.py` or other task state-machine logic include adversarial tests for malformed output, false-completion prevention, replay/log durability, and failure modes — not just the happy path.

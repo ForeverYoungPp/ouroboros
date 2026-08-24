@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
-from ouroboros.deadline_utils import llm_transport_timeout_sec, logical_operation_timeout_sec
+from ouroboros.deadline_utils import review_operation_timeout_sec
 from ouroboros.observability import new_call_id
 from ouroboros.utils import emit_cognitive_operation_event
 
@@ -33,10 +33,141 @@ class ActiveReviewAttempt:
     event: threading.Event = field(default_factory=threading.Event)
     actor: Any = None
     timed_out: bool = False
+    retry_state: Dict[str, Any] = field(default_factory=dict)
 
 
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE: Dict[str, ActiveReviewAttempt] = {}
+_PENDING_STATES = {"in_flight", "custody_lost"}
+
+
+def _row_is_pending(row: Dict[str, Any]) -> bool:
+    return bool(row.get("late_result_pending")) or str(
+        row.get("operation_state") or ""
+    ) in _PENDING_STATES
+
+
+def prepare_frozen_review_reconciliation(usage_ctx: Any, attempt: Any) -> None:
+    """Expose one durable commit attempt as the exact reconciliation roster."""
+    triad = [copy.deepcopy(row) for row in list(
+        getattr(attempt, "triad_raw_results", None) or []
+    ) if isinstance(row, dict)]
+    scope_raw = getattr(attempt, "scope_raw_result", None) or {}
+    scope = list(scope_raw.get("raw_results") or []) if isinstance(scope_raw, dict) else []
+    if not scope and isinstance(scope_raw, dict) and scope_raw:
+        scope = [scope_raw]
+    frozen: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for surface, rows in (("multi_model_review", triad), ("scope_review", scope)):
+        by_slot: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            slot_id = str(row.get("slot_id") or row.get("slot") or "")
+            if not slot_id or slot_id in by_slot:
+                setattr(usage_ctx, "_review_custody_lost", True)
+                continue
+            by_slot[slot_id] = copy.deepcopy(row)
+        frozen[surface] = by_slot
+    setattr(usage_ctx, "_review_frozen_rows", frozen)
+    setattr(usage_ctx, "_review_frozen_scope_raw", copy.deepcopy(scope_raw))
+    if not triad and not scope:
+        setattr(usage_ctx, "_review_custody_lost", True)
+
+
+def _frozen_actor(row: Dict[str, Any], slot: Any) -> Any:
+    from ouroboros.review_substrate import ReviewActorRecord
+
+    status = str(row.get("status") or "")
+    raw_text = str(row.get("raw_text") or "")
+    actor_status = (
+        "not_dispatched" if status == "not_dispatched"
+        else "ok" if raw_text or status in {"responded", "ok", "empty", "parse_failure", "partial"}
+        else "error"
+    )
+    usage = {
+        "pending_invocation_id": str(row.get("pending_invocation_id") or ""),
+        "delegated_run_id": str(row.get("delegated_run_id") or ""),
+    }
+    return ReviewActorRecord(
+        slot_id=str(getattr(slot, "slot_id", "") or ""),
+        model=str(row.get("model_id") or row.get("model") or getattr(slot, "model", "")),
+        status=actor_status,
+        raw_text=raw_text,
+        error=str(row.get("error") or ""),
+        usage=usage,
+        prompt_ref=dict(row.get("prompt_ref") or {}),
+        response_ref=dict(row.get("response_ref") or {}),
+        operation_id=str(row.get("operation_id") or ""),
+        operation_state=str(row.get("operation_state") or "settled"),
+        late_result_pending=False,
+    )
+
+
+def merge_frozen_review_reconciliation(usage_ctx: Any) -> None:
+    """Keep the original roster; only its exact pending operation may change."""
+    frozen = getattr(usage_ctx, "_review_frozen_rows", None)
+    if not isinstance(frozen, dict):
+        return
+
+    def _merge(surface: str, current: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        originals = frozen.get(surface) if isinstance(frozen.get(surface), dict) else {}
+        current_by_slot = {
+            str(row.get("slot_id") or row.get("slot") or ""): row
+            for row in current if isinstance(row, dict)
+        }
+        merged: List[Dict[str, Any]] = []
+        for slot_id, original in originals.items():
+            if not _row_is_pending(original):
+                merged.append(copy.deepcopy(original))
+                continue
+            candidate = current_by_slot.get(slot_id)
+            operation_id = str(original.get("operation_id") or "")
+            if candidate is not None and operation_id and str(
+                candidate.get("operation_id") or ""
+            ) == operation_id:
+                merged.append(copy.deepcopy(candidate))
+                continue
+            lost = copy.deepcopy(original)
+            lost["operation_state"] = "custody_lost"
+            lost["late_result_pending"] = True
+            merged.append(lost)
+            setattr(usage_ctx, "_review_custody_lost", True)
+        for slot_id, row in current_by_slot.items():
+            if slot_id not in originals:
+                extra = copy.deepcopy(row)
+                extra["operation_state"] = "custody_lost"
+                extra["late_result_pending"] = True
+                merged.append(extra)
+                setattr(usage_ctx, "_review_custody_lost", True)
+        return merged
+
+    triad = _merge(
+        "multi_model_review",
+        list(getattr(usage_ctx, "_last_triad_raw_results", None) or []),
+    )
+    scope_now = getattr(usage_ctx, "_last_scope_raw_result", None) or {}
+    scope_rows = list(scope_now.get("raw_results") or []) if isinstance(scope_now, dict) else []
+    if not scope_rows and isinstance(scope_now, dict) and scope_now:
+        scope_rows = [scope_now]
+    merged_scope = _merge("scope_review", scope_rows)
+    scope_wrapper = copy.deepcopy(
+        scope_now or getattr(usage_ctx, "_review_frozen_scope_raw", None) or {}
+    )
+    if merged_scope:
+        scope_wrapper["raw_results"] = merged_scope
+    usage_ctx._last_triad_raw_results = triad
+    usage_ctx._last_scope_raw_result = scope_wrapper
+
+
+def retryable_review_exception(exc: Exception, usage_ctx: Any) -> bool:
+    """Whether a second byte-identical review send has a terminal basis."""
+    from ouroboros.loop_llm_call import classify_llm_exception
+
+    classification = classify_llm_exception(exc)
+    if classification.kind == "provider_outcome_unknown":
+        if usage_ctx is not None:
+            setattr(usage_ctx, "_review_custody_lost", True)
+        if not str(getattr(exc, "code", "") or ""):
+            setattr(exc, "code", "provider_outcome_unknown")
+    return classification.retry_same_request
 
 
 def _attempt_key(request: Any, slot: Any) -> str:
@@ -88,13 +219,13 @@ def _logical_timeout(slot: Any, request: Any, usage_meta: Dict[str, Any]) -> flo
     deadline = str(getattr(request, "deadline_at", "") or "").strip()
     if not deadline and isinstance(usage_meta, dict):
         deadline = str(usage_meta.get("deadline_at") or "").strip()
-    transport = llm_transport_timeout_sec(getattr(slot, "transport_timeout_sec", None))
     from ouroboros.config import get_finalization_grace_sec
 
-    return logical_operation_timeout_sec(
+    return review_operation_timeout_sec(
         getattr(slot, "timeout_sec", None),
+        route=getattr(slot, "route", None),
         deadline_at=deadline,
-        fallback=transport,
+        transport_timeout_sec=getattr(slot, "transport_timeout_sec", None),
         reserve_sec=get_finalization_grace_sec(),
     )
 
@@ -136,6 +267,34 @@ def _emit_operation(
         log.debug("review operation event failed", exc_info=True)
 
 
+def _late_or_timeout_actor(
+    slot: Any, entry: Any, timeout: float, error_actor: Callable[..., Any],
+) -> Any:
+    if entry is not None:
+        with _ACTIVE_LOCK:
+            if entry.event.is_set() and entry.actor is not None:
+                try:
+                    return copy.deepcopy(entry.actor)
+                except Exception:
+                    return entry.actor
+            entry.timed_out = True
+    actor = error_actor(
+        slot,
+        f"Timeout after {timeout:g}s; physical review operation remains in flight",
+        entry.operation_id if entry is not None else "",
+        "in_flight" if entry is not None else "settled",
+    )
+    if entry is not None and entry.retry_state:
+        usage = dict(getattr(actor, "usage", None) or {})
+        usage.update({
+            key: str(entry.retry_state.get(key) or "")
+            for key in ("pending_invocation_id", "delegated_run_id")
+            if entry.retry_state.get(key)
+        })
+        actor.usage = usage
+    return actor
+
+
 def run_custodied_review_slots(
     *,
     request: Any,
@@ -162,9 +321,13 @@ def run_custodied_review_slots(
             late = bool(entry.timed_out)
             failure_custody = getattr(actor, "usage", None) or {}
             pending_invocation = str(failure_custody.get("pending_invocation_id") or "")
+            custody_lost = str(getattr(actor, "failure_code", "") or "") == "provider_outcome_unknown"
             actor.operation_id = entry.operation_id
-            actor.operation_state = "late_settled" if late else "settled"
-            actor.late_result_pending = False
+            actor.operation_state = (
+                "custody_lost" if custody_lost else
+                "in_flight" if pending_invocation else "late_settled" if late else "settled"
+            )
+            actor.late_result_pending = bool(pending_invocation or custody_lost)
             entry.actor = actor
             entry.event.set()
             if _ACTIVE.get(entry.key) is entry:
@@ -177,7 +340,16 @@ def run_custodied_review_slots(
                 if not isinstance(pending, dict):
                     pending = {}
                     setattr(usage_ctx, "_review_pending_invocations", pending)
-                pending[entry.key] = {"pending_invocation_id": pending_invocation}
+                pending[entry.key] = {
+                    "pending_invocation_id": pending_invocation,
+                    "operation_id": entry.operation_id,
+                }
+            if (
+                bool(getattr(request, "reconcile_only", False))
+                and str(getattr(actor, "failure_code", "") or "") == "review_custody_lost"
+                and usage_ctx is not None
+            ):
+                setattr(usage_ctx, "_review_custody_lost", True)
             explicit_retry = bool(str(getattr(request, "retry_key", "") or "").strip())
             route = getattr(slot, "route", "")
             route_value = str(getattr(route, "value", route) or "")
@@ -195,7 +367,14 @@ def run_custodied_review_slots(
                 and route_value != "agent_session"
                 and not pending_invocation
             )
-            replayable = actor.status in {"ok", "empty"} or late_plan_api_error or bool(
+            late_commit_api_error = bool(
+                late
+                and explicit_retry
+                and str(getattr(request, "retry_key", "") or "").startswith("commit_review:")
+                and route_value != "agent_session"
+                and not pending_invocation
+            )
+            replayable = actor.status in {"ok", "empty"} or late_plan_api_error or late_commit_api_error or bool(
                 failure_custody.get("delegated_run_started") and not pending_invocation
             )
             if replayable and usage_ctx is not None and (late or explicit_retry):
@@ -207,11 +386,12 @@ def run_custodied_review_slots(
                     settled[entry.key] = copy.deepcopy(actor)
                 except Exception:
                     log.debug("late review actor copy failed", exc_info=True)
-        _emit_operation(
-            usage_ctx, task_id=task_id, request=request, entry=entry, slot=slot,
-            phase="failed" if actor.status == "error" else "finished",
-        )
-        if late and usage_ctx is not None:
+        if not pending_invocation and not custody_lost:
+            _emit_operation(
+                usage_ctx, task_id=task_id, request=request, entry=entry, slot=slot,
+                phase="failed" if actor.status == "error" else "finished",
+            )
+        if late and not pending_invocation and not custody_lost and usage_ctx is not None:
             try:
                 from ouroboros.tools.review_helpers import emit_review_event
 
@@ -236,11 +416,32 @@ def run_custodied_review_slots(
         window = _logical_timeout(slot, request, usage_meta)
         slot_windows[slot_id] = window
         slot_deadlines[slot_id] = time.monotonic() + window
+        custody_lost = False
         with _ACTIVE_LOCK:
+            frozen_surfaces = getattr(usage_ctx, "_review_frozen_rows", None)
+            frozen_surface = (
+                frozen_surfaces.get(str(getattr(request, "surface", "") or ""), {})
+                if isinstance(frozen_surfaces, dict) else {}
+            )
+            frozen_row = frozen_surface.get(slot_id) if isinstance(frozen_surface, dict) else None
             pending_attempts = getattr(usage_ctx, "_review_pending_invocations", None)
-            retry_state = pending_attempts.get(key, {}) if isinstance(pending_attempts, dict) else {}
+            retry_state = dict(
+                pending_attempts.get(key, {}) if isinstance(pending_attempts, dict) else {}
+            )
             settled = getattr(usage_ctx, "_review_settled_attempts", None)
             cached_actor = settled.get(key) if isinstance(settled, dict) else None
+            if bool(getattr(request, "reconcile_only", False)) and isinstance(frozen_row, dict):
+                if _row_is_pending(frozen_row):
+                    token = str(frozen_row.get("pending_invocation_id") or "")
+                    if not retry_state and token:
+                        retry_state = {
+                            "pending_invocation_id": token,
+                            "operation_id": str(frozen_row.get("operation_id") or ""),
+                        }
+                else:
+                    cached_actor = _frozen_actor(frozen_row, slot)
+            retry_payload = dict(retry_state)
+            retry_payload.pop("operation_id", None)
             if cached_actor is not None:
                 try:
                     cached_actor = copy.deepcopy(cached_actor)
@@ -255,16 +456,33 @@ def run_custodied_review_slots(
                     actor=cached_actor,
                 )
                 entry.event.set()
+            elif (
+                entry is None
+                and bool(getattr(request, "reconcile_only", False))
+                and not retry_state
+            ):
+                custody_lost = True
+                owner = False
             elif entry is None and window > 0:
                 entry = ActiveReviewAttempt(
                     key=key,
-                    operation_id=new_call_id(
-                        f"review_{getattr(request, 'surface', 'review')}_{getattr(slot, 'slot_id', 'slot')}"
-                    ),
+                    operation_id=str(retry_state.get("operation_id") or "") or new_call_id(
+                        f"review_{getattr(request, 'surface', 'review')}_{getattr(slot, 'slot_id', 'slot')}"),
+                    retry_state=retry_payload,
                 )
                 _ACTIVE[key] = entry
                 if isinstance(pending_attempts, dict):
                     pending_attempts.pop(key, None)
+        if custody_lost:
+            if usage_ctx is not None:
+                setattr(usage_ctx, "_review_custody_lost", True)
+            immediate_actors[slot_id] = error_actor(
+                slot,
+                "Exact review custody is unavailable; refusing a second paid dispatch",
+                "",
+                "custody_lost",
+            )
+            return
         if entry is None:
             immediate_actors[slot_id] = error_actor(
                 slot, "Owner deadline exhausted before physical review dispatch",
@@ -284,7 +502,14 @@ def run_custodied_review_slots(
             if not paid_stamped and not retry_state:
                 from ouroboros.review_dispatch import stamp_review_paid_on_dispatch
 
-                stamp_review_paid_on_dispatch(usage_ctx)
+                try:
+                    stamp_review_paid_on_dispatch(usage_ctx)
+                except Exception:
+                    with _ACTIVE_LOCK:
+                        if _ACTIVE.get(entry.key) is entry:
+                            _ACTIVE.pop(entry.key, None)
+                    slot_entries.pop(slot_id, None)
+                    raise
                 paid_stamped = True
             def worker() -> None:
                 _emit_operation(
@@ -294,7 +519,7 @@ def run_custodied_review_slots(
                 try:
                     with usage_scope(review_usage_scope):
                         actor = run_slot(
-                            slot, entry.operation_id, retry_state,
+                            slot, entry.operation_id, entry.retry_state,
                             slot_deadlines[slot_id],
                         )
                 except Exception as exc:
@@ -355,26 +580,10 @@ def run_custodied_review_slots(
         if slot_id in returned_ids:
             continue
         entry = slot_entries.get(slot_id)
-        if entry is not None:
-            with _ACTIVE_LOCK:
-                if entry.event.is_set() and entry.actor is not None:
-                    try:
-                        actor = copy.deepcopy(entry.actor)
-                    except Exception:
-                        actor = entry.actor
-                    actors.append(actor)
-                    returned_ids.add(slot_id)
-                    continue
-                entry.timed_out = True
         timeout = slot_windows.get(slot_id)
         if timeout is None:
             timeout = _logical_timeout(slot, request, usage_meta)
-        actors.append(error_actor(
-            slot,
-            f"Timeout after {timeout:g}s; physical review operation remains in flight",
-            entry.operation_id if entry is not None else "",
-            "in_flight" if entry is not None else "settled",
-        ))
+        actors.append(_late_or_timeout_actor(slot, entry, timeout, error_actor))
     return actors
 
 

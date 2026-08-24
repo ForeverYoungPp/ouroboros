@@ -56,12 +56,6 @@ err on the side of NOT recommending it and explain the tension.
 """
 
 
-def _review_model_timeout_sec() -> float:
-    from ouroboros.deadline_utils import review_logical_fallback_timeout_sec
-
-    return review_logical_fallback_timeout_sec()
-
-
 # The window/limit names below stay importable and MONKEYPATCHABLE on this
 # module: ``review_admission.fit_triad_prompt`` resolves them through this
 # namespace at call time (tests pin that seam).
@@ -379,7 +373,14 @@ def _review_output_budget() -> int:
 
 
 def _review_operation_fields(actor: dict) -> dict:
-    return {"operation_id": actor.get("operation_id") or "", "operation_state": actor.get("operation_state") or "settled", "late_result_pending": bool(actor.get("late_result_pending"))}
+    usage = actor.get("usage") if isinstance(actor.get("usage"), dict) else {}
+    return {
+        "operation_id": actor.get("operation_id") or "",
+        "operation_state": actor.get("operation_state") or "settled",
+        "late_result_pending": bool(actor.get("late_result_pending")),
+        "pending_invocation_id": str(usage.get("pending_invocation_id") or ""),
+        "delegated_run_id": str(usage.get("delegated_run_id") or ""),
+    }
 
 async def _query_model(
     llm_client: LLMClient,
@@ -397,7 +398,6 @@ async def _query_model(
     retry_key: str = "",
 ):
     async with semaphore:
-        timeout_sec = _review_model_timeout_sec()
         slot = None
         try:
             from ouroboros.review_execution import ReviewRouteKind
@@ -421,12 +421,12 @@ async def _query_model(
                 policy={"output_contract": REVIEW_JSON_ARRAY_CONTRACT} if delegated else {},
                 task_attempt=getattr(ctx, "task_attempt", None) if ctx is not None else None,
                 retry_key=str(retry_key or ""),
+                reconcile_only=bool(getattr(ctx, "_review_reconcile_only", False)),
             )
             slot = ReviewSlot(
                 slot_id=slot_id,
                 model=model,
                 effort=effort or _cfg.resolve_effort("review"),
-                timeout_sec=timeout_sec,
                 max_tokens=_out_budget,
                 temperature=0.2,
                 role_hint="multi-model review",

@@ -32,6 +32,8 @@ class ReviewActorRecord:
     operation_id: str = ""
     operation_state: str = "settled"
     late_result_pending: bool = False
+    pending_invocation_id: str = ""
+    delegated_run_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         # The durable id is the one the review substrate actually ran this row
@@ -60,6 +62,8 @@ class ReviewActorRecord:
             "operation_id": self.operation_id,
             "operation_state": self.operation_state,
             "late_result_pending": self.late_result_pending,
+            "pending_invocation_id": self.pending_invocation_id,
+            "delegated_run_id": self.delegated_run_id,
         }
 
 
@@ -111,6 +115,8 @@ def _actor_record(
         operation_id=str(actor.get("operation_id") or ""),
         operation_state=str(actor.get("operation_state") or "settled"),
         late_result_pending=bool(actor.get("late_result_pending")),
+        pending_invocation_id=str(actor.get("pending_invocation_id") or ""),
+        delegated_run_id=str(actor.get("delegated_run_id") or ""),
     )
 
 

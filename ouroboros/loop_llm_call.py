@@ -509,6 +509,10 @@ def _exception_status_code(exc: Exception) -> Optional[int]:
                 pass
     response = getattr(exc, "response", None)
     value = getattr(response, "status_code", None)
+    if isinstance(value, int):
+        return value
+    capture = getattr(exc, "physical_attempt_capture", None)
+    value = getattr(capture, "provider_status_code", None)
     return value if isinstance(value, int) else None
 
 
@@ -623,8 +627,18 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
             422: "bad_request",
         }[status_code]
         return LlmErrorClassification(kind, False, status_code, provider_code)
-    if status_code in {408, 500, 502, 503, 504}:
+    if status_code == 408 or (status_code is not None and 500 <= status_code <= 599):
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
+    if status_code is not None and 400 <= status_code <= 499:
+        return LlmErrorClassification("provider_error", False, status_code, provider_code)
+    capture = getattr(exc, "physical_attempt_capture", None)
+    if str(getattr(capture, "state", "") or "") in {"dispatched", "unresolved"}:
+        # The provider may still finish a request whose socket outcome is
+        # unknown. Neither a same-model retry nor a different paid fallback is
+        # safe until a typed terminal provider fact exists.
+        return LlmErrorClassification(
+            "provider_outcome_unknown", False, status_code, provider_code,
+        )
     if any(marker in low for marker in _RETRYABLE_PROVIDER_MARKERS):
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
     return LlmErrorClassification("provider_error", True, status_code, provider_code)

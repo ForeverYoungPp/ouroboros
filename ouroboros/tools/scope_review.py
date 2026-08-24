@@ -74,7 +74,6 @@ from ouroboros.utils import (
 
 log = logging.getLogger(__name__)
 _SCOPE_REQUIRED_ITEMS = SCOPE_REQUIRED_ITEMS  # compatibility export used by tests/review tooling
-
 # Shipped designated scope reviewer (v6.82.0). Window evidence checked 2026-07-29:
 # provider docs AND OpenRouter /models both state gpt-5.6-terra context_length
 # 1,050,000 — a documented MODEL property, so the >=1M BIBLE P3 floor holds on both
@@ -83,7 +82,6 @@ from ouroboros.tools.scope_window import SCOPE_MODEL_DEFAULT as _SCOPE_MODEL_DEF
 _SCOPE_MAX_TOKENS = 100_000  # 100K output tokens
 _SCOPE_REVIEW_SLOT_TIMEOUT_SEC = None
 from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET as _SCOPE_BUDGET_TOKEN_LIMIT
-
 # The shared prompt-size SSOT (920K) governs INPUT only; the reviewer also reserves
 # _SCOPE_MAX_TOKENS of OUTPUT inside the same 1M window, and provider tokenizers can
 # exceed estimate_tokens on atlas-heavy prompts — so gate assembled INPUT on a
@@ -99,7 +97,6 @@ _SCOPE_INPUT_TOKEN_LIMIT = min(
     _SCOPE_BUDGET_TOKEN_LIMIT,
     _SCOPE_MODEL_CONTEXT_WINDOW - _SCOPE_MAX_TOKENS - _SCOPE_OUTPUT_MARGIN_TOKENS,
 )
-
 # Tokenizer-density calibration (SSOT: review_helpers.calibrated_input_token_limit +
 # capability_evidence ``token_density``). Density is MEASURED per model, so the limit
 # is computed PER CALL (an import-time constant froze the pre-measurement value). The
@@ -288,7 +285,8 @@ class ScopeReviewResult:
     operation_id: str = ""
     operation_state: str = "settled"
     late_result_pending: bool = False
-
+    pending_invocation_id: str = ""
+    delegated_run_id: str = ""
 
 def _get_scope_model() -> str:
     """Return the configured scope review model (env → settings default)."""
@@ -1048,6 +1046,7 @@ def _call_scope_llm(
             no_proxy=True,
             session_task=session_task if delegated else "",
             session_root=session_root if delegated else "",
+            reconcile_only=bool(getattr(ctx, "_review_reconcile_only", False)),
             # The extraction fallback canonicalizes to the SCOPE contract: required-
             # matrix shape, eight verbatim item ids (D19 — never a looser contract).
             policy=(
@@ -1062,7 +1061,6 @@ def _call_scope_llm(
                 else {}
             ),
         )
-        # Identity comes from the configured row, never from the row's model.
         row = scope_reviewer_slots([scope_model], effort=scope_effort)[0]
         slot = replace(
             row,
@@ -1432,6 +1430,8 @@ def run_scope_review(
         "operation_id": str(_usage.get("operation_id") or ""),
         "operation_state": str(_usage.get("operation_state") or "settled"),
         "late_result_pending": bool(_usage.get("late_result_pending")),
+        "pending_invocation_id": str(_usage.get("pending_invocation_id") or ""),
+        "delegated_run_id": str(_usage.get("delegated_run_id") or ""),
     }
     if llm_error:
         if _is_provider_oversize_error(llm_error):

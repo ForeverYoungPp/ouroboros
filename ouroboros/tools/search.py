@@ -389,10 +389,48 @@ def _web_search_ddgs(query: str, *, _max_attempts: int = 3) -> str:
 
 
 def _is_timeout_error(exc: Exception) -> bool:
-    """Heuristic-free timeout classifier: real timeout exception types only."""
+    """Typed timeout classifier across the installed HTTP/SDK transports."""
     if isinstance(exc, TimeoutError):
         return True
-    return "timeout" in type(exc).__name__.casefold()
+    try:
+        import httpx
+
+        if isinstance(exc, httpx.TimeoutException):
+            return True
+    except Exception:
+        pass
+    try:
+        from openai import APITimeoutError
+
+        return isinstance(exc, APITimeoutError)
+    except Exception:
+        return False
+
+
+def _provider_status_code(exc: Exception) -> int | None:
+    value = getattr(exc, "status_code", None)
+    if not isinstance(value, int):
+        value = getattr(getattr(exc, "response", None), "status_code", None)
+    return value if isinstance(value, int) else None
+
+
+def _stream_failure_error(event_type: str, error: Any, response: Any) -> RuntimeError:
+    """Preserve a terminal Responses-event status for the safe retry policy."""
+    detail = sanitize_tool_result_for_log(
+        str(getattr(error, "message", None) or error or "no detail")
+    )[:300]
+    exc = RuntimeError(f"OpenAI web search {event_type}: {detail}")
+    for obj in (error, getattr(response, "error", None), response):
+        for field in ("status_code", "http_status", "status", "code"):
+            value = obj.get(field) if isinstance(obj, dict) else getattr(obj, field, None)
+            try:
+                status = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 100 <= status <= 599:
+                setattr(exc, "status_code", status)
+                return exc
+    return exc
 
 
 def _web_search(
@@ -466,6 +504,7 @@ def _web_search(
     active_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
     reservation = None
     dispatched = False
+    explicit_provider_failure = False
 
     try:
         from openai import OpenAI
@@ -522,12 +561,10 @@ def _web_search(
             # answer)" success return below, so the OpenAI leg "succeeds" empty
             # and the OpenRouter/Anthropic/ddgs cascade never engages.
             if etype in ("response.failed", "error", "response.incomplete"):
+                explicit_provider_failure = True
                 resp_obj = getattr(event, "response", None)
-                detail = ""
                 err = getattr(event, "error", None) or (getattr(resp_obj, "error", None) if resp_obj else None)
-                if err is not None:
-                    detail = sanitize_tool_result_for_log(str(getattr(err, "message", None) or err))[:300]
-                raise RuntimeError(f"OpenAI web search {etype}: {detail or 'no detail'}")
+                raise _stream_failure_error(etype, err, resp_obj)
 
             # Web search lifecycle — emit progress so the user sees activity
             if etype in (
@@ -585,6 +622,16 @@ def _web_search(
             except Exception:
                 log.exception("Failed to mark Responses settlement unresolved")
 
+        if not response_completed:
+            return json.dumps({
+                "error": (
+                    "OpenAI web search ended without a terminal provider outcome; "
+                    "no retry or paid fallback was sent."
+                ),
+                "backend": "openai_responses",
+                "reason_code": "provider_outcome_unknown",
+            }, ensure_ascii=False, indent=2)
+
         # An empty result (no answer text AND no sources) is a soft failure, not
         # a successful "(no answer)": fall through to the provider cascade so a
         # degenerate OpenAI response does not shadow a working OpenRouter/
@@ -624,6 +671,7 @@ def _web_search(
 
         return json.dumps({"answer": text or "(no answer)", "answer_type": "summary", "sources": sources, "backend": "openai_responses"}, ensure_ascii=False, indent=2)
     except Exception as e:
+        was_dispatched = reservation is not None and dispatched
         if reservation is not None and dispatched:
             try:
                 mark_unresolved(reservation, f"{type(e).__name__}: {e}")
@@ -632,16 +680,32 @@ def _web_search(
         if isinstance(e, UsageAccountingError):
             raise
         detail = sanitize_tool_result_for_log(str(e))[:500]
-        # One retry on a genuine timeout before cascading: web search timeouts are
-        # frequently transient, and the provider cascade is slower/less precise.
-        if _attempt == 0 and _is_timeout_error(e):
+        status = _provider_status_code(e)
+        terminal_provider_failure = explicit_provider_failure or status is not None
+        if was_dispatched and not terminal_provider_failure:
+            return json.dumps({
+                "error": (
+                    "OpenAI web search was dispatched but its provider outcome is "
+                    "unknown; no retry or paid fallback was sent."
+                ),
+                "backend": "openai_responses",
+                "reason_code": "provider_outcome_unknown",
+            }, ensure_ascii=False, indent=2)
+        retryable_terminal = status == 408 or status == 429 or (
+            status is not None and 500 <= status <= 599
+        )
+        # One retry is safe only before dispatch or after an explicit terminal
+        # provider response. An ambiguous dispatched outcome stops the cascade.
+        if _attempt == 0 and (
+            (_is_timeout_error(e) and not was_dispatched) or retryable_terminal
+        ):
             from ouroboros.deadline_utils import deadline_remaining_sec, has_deadline
 
             if has_deadline(ctx) and deadline_remaining_sec(ctx) <= max(
                 1.0, float(get_finalization_grace_sec())
             ):
                 return _fallbacks([f"OpenAI web search timed out before a safe retry: {detail}"])
-            log.debug("web_search OpenAI timeout; retrying once")
+            log.debug("web_search OpenAI safe terminal/pre-dispatch retry")
             return _web_search(
                 ctx, query, model=model, search_context_size=search_context_size,
                 reasoning_effort=reasoning_effort, _attempt=1,

@@ -46,6 +46,7 @@ from ouroboros.usage_accounting import (
     execute_physical_attempt,
     execute_physical_attempt_async,
     last_physical_attempt_capture,
+    physical_attempt_capture_from_exception,
     usage_scope,
 )
 from ouroboros.utils import in_worker_process, sanitize_tool_result_for_log
@@ -2515,6 +2516,9 @@ class LLMClient:
                 if (_is_structured_context_overflow_exception(exc)
                         or context_overflow_message(err)):
                     raise LocalContextTooLargeError(err) from exc
+                capture = physical_attempt_capture_from_exception(exc)
+                if capture is not None and capture.state in {"dispatched", "unresolved"}:
+                    raise  # Outer custody owns an unknown physical outcome.
                 if attempt == 2:
                     log.warning("Local model request failed: %s", exc)
                     raise

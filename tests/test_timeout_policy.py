@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
+
 
 def test_logical_review_window_is_narrowed_by_owner_deadline():
     from ouroboros.deadline_utils import logical_operation_timeout_sec
@@ -86,15 +88,583 @@ def test_review_timeout_override_rejects_non_finite_and_invalid_values(monkeypat
     import ouroboros.deadline_utils as deadlines
     from ouroboros.tools import git as git_tools
 
-    monkeypatch.setattr(deadlines, "llm_transport_timeout_sec", lambda *_args: 2700.0)
     for raw in ("inf", "nan", "-1", "garbage"):
         monkeypatch.setenv("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", raw)
-        assert deadlines.review_logical_fallback_timeout_sec() == 2700.0
+        assert deadlines.review_logical_fallback_timeout_sec() is None
         assert any(raw in record.message for record in caplog.records)
         # Tool registration must remain available under a malformed operator override.
         assert {entry.name for entry in git_tools.get_tools()} >= {
             "commit_reviewed", "vcs_commit_reviewed",
         }
+
+
+def test_review_route_owns_unset_logical_fallback(monkeypatch):
+    import ouroboros.config as config
+    import ouroboros.deadline_utils as deadlines
+
+    monkeypatch.delenv("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", raising=False)
+    monkeypatch.setattr(config, "get_task_abs_ceiling_sec", lambda: 21_600)
+    monkeypatch.setattr(deadlines, "llm_transport_timeout_sec", lambda *_args: 2_700.0)
+
+    assert deadlines.review_operation_timeout_sec(route="api_chat") == 2_700.0
+    assert deadlines.review_operation_timeout_sec(route="agent_session") == 21_600.0
+    assert deadlines.review_operation_timeout_sec(600, route="agent_session") == 600.0
+    monkeypatch.setenv("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", "900")
+    assert deadlines.review_operation_timeout_sec(route="api_chat") == 900.0
+    assert deadlines.review_operation_timeout_sec(route="agent_session") == 900.0
+
+
+def test_reconcile_only_missing_custody_never_dispatches(tmp_path):
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import run_custodied_review_slots
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    request = ReviewRequest(
+        surface="multi_model_review",
+        goal="review",
+        task_id="task-1",
+        call_type="multi_model_review",
+        retry_key="commit_review:exact",
+        reconcile_only=True,
+    )
+    slot = ReviewSlot(slot_id="slot-1", model="openai/test", route=ReviewRouteKind.API_CHAT)
+    ctx = SimpleNamespace()
+    calls = []
+
+    def error_actor(_slot, error, operation_id="", operation_state="settled"):
+        return SimpleNamespace(
+            slot_id="slot-1", status="error", error=error, usage={},
+            response_ref={}, operation_id=operation_id,
+            operation_state=operation_state,
+            late_result_pending=operation_state == "in_flight",
+        )
+
+    actors = run_custodied_review_slots(
+        request=request,
+        slots=[slot],
+        usage_ctx=ctx,
+        task_id="task-1",
+        usage_meta={},
+        review_usage_scope=UsageScope(drive_root=tmp_path, task_id="task-1"),
+        run_slot=lambda *_args: calls.append("dispatched"),
+        error_actor=error_actor,
+    )
+
+    assert calls == []
+    assert actors[0].operation_state == "custody_lost"
+    assert ctx._review_custody_lost is True
+
+
+def test_strict_paid_stamp_failure_starts_no_worker_and_leaks_no_active_row(tmp_path):
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import _ACTIVE, _attempt_key, run_custodied_review_slots
+    from ouroboros.review_dispatch import ReviewPaidStamp
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    request = ReviewRequest(
+        surface="multi_model_review", goal="review", task_id="task-stamp",
+        retry_key="commit_review:stamp",
+    )
+    slot = ReviewSlot(slot_id="slot-1", model="openai/test")
+    calls = []
+
+    def fail_write():
+        raise OSError("state write failed")
+
+    stamp = ReviewPaidStamp(fail_write, fail_closed=True)
+    ctx = SimpleNamespace(_review_paid_stamp=stamp)
+    with pytest.raises(OSError, match="state write failed"):
+        run_custodied_review_slots(
+            request=request,
+            slots=[slot],
+            usage_ctx=ctx,
+            task_id="task-stamp",
+            usage_meta={},
+            review_usage_scope=UsageScope(drive_root=tmp_path, task_id="task-stamp"),
+            run_slot=lambda *_args: calls.append("sent"),
+            error_actor=lambda *_args, **_kwargs: None,
+        )
+
+    assert calls == []
+    assert stamp.fired is False
+    assert _attempt_key(request, slot) not in _ACTIVE
+
+
+def test_default_paid_stamp_remains_fail_open_for_skill_marker():
+    from types import SimpleNamespace
+
+    from ouroboros.review_dispatch import ReviewPaidStamp, stamp_review_paid_on_dispatch
+
+    def fail_write():
+        raise OSError("marker unavailable")
+
+    stamp = ReviewPaidStamp(fail_write)
+    stamp_review_paid_on_dispatch(SimpleNamespace(_review_paid_stamp=stamp))
+    assert stamp.fired is True
+
+
+def test_paid_reviewing_row_without_late_flag_is_exact_resume_candidate(tmp_path):
+    from types import SimpleNamespace
+
+    from ouroboros.review_state import (
+        AdvisoryReviewState, CommitAttemptRecord, make_repo_key, save_state,
+    )
+    from ouroboros.tools.commit_gate import _check_overlapping_review_attempt
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_root = tmp_path / "data"
+    row = CommitAttemptRecord(
+        ts="2026-01-01T00:00:00+00:00",
+        commit_message="pending paid wave",
+        status="reviewing",
+        repo_key=make_repo_key(repo),
+        tool_name="commit_reviewed",
+        task_id="task-paid",
+        attempt=4,
+        paid=True,
+        late_result_pending=False,
+        review_retry_key="commit_review:exact",
+    )
+    save_state(state_root, AdvisoryReviewState(attempts=[row]))
+    ctx = SimpleNamespace(
+        repo_dir=repo, drive_root=state_root, task_id="task-paid",
+        _current_review_tool_name="commit_reviewed",
+    )
+
+    assert _check_overlapping_review_attempt(ctx) is None
+    assert ctx._review_resume_pending is True
+    assert ctx._pending_review_attempt.review_retry_key == "commit_review:exact"
+    assert ctx._current_review_attempt_number == 4
+
+
+def test_unreadable_review_state_blocks_before_paid_dispatch(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import ouroboros.review_state as review_state
+    from ouroboros.tools.commit_gate import _check_overlapping_review_attempt
+
+    monkeypatch.setattr(
+        review_state, "update_state",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("ledger unavailable")),
+    )
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path, drive_root=tmp_path, task_id="task-state-failure",
+        _current_review_tool_name="commit_reviewed",
+    )
+
+    message = _check_overlapping_review_attempt(ctx)
+    assert message and "REVIEW_STATE_UNAVAILABLE" in message
+    assert ctx._review_resume_pending is False
+
+
+def test_frozen_roster_survives_reassembly_exit_and_stays_pending():
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import (
+        merge_frozen_review_reconciliation, prepare_frozen_review_reconciliation,
+    )
+    from ouroboros.tools.git import _review_custody_pending
+
+    terminal = {
+        "slot_id": "slot_1", "model_id": "m1", "status": "responded",
+        "raw_text": "[]", "operation_id": "op-1", "operation_state": "settled",
+        "late_result_pending": False,
+    }
+    pending = {
+        "slot_id": "slot_2", "model_id": "m2", "status": "error",
+        "raw_text": "", "operation_id": "op-2", "operation_state": "in_flight",
+        "late_result_pending": True, "pending_invocation_id": "inv-2",
+    }
+    ctx = SimpleNamespace(_last_triad_raw_results=[], _last_scope_raw_result={})
+    attempt = SimpleNamespace(
+        triad_raw_results=[terminal, pending], scope_raw_result={},
+    )
+    prepare_frozen_review_reconciliation(ctx, attempt)
+
+    # Simulate a fresh assembly/admission exit that produced no actor rows.
+    merge_frozen_review_reconciliation(ctx)
+
+    assert ctx._last_triad_raw_results[0] == terminal
+    assert ctx._last_triad_raw_results[1]["operation_id"] == "op-2"
+    assert ctx._last_triad_raw_results[1]["operation_state"] == "custody_lost"
+    assert _review_custody_pending(ctx) is True
+
+
+def test_reconcile_current_roster_cannot_dispatch_unmatched_slot(tmp_path):
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import (
+        prepare_frozen_review_reconciliation, run_custodied_review_slots,
+    )
+    from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    attempt = SimpleNamespace(triad_raw_results=[{
+        "slot_id": "slot-1", "model_id": "m1", "status": "responded",
+        "raw_text": "[]", "operation_id": "op-1", "operation_state": "settled",
+    }], scope_raw_result={})
+    ctx = SimpleNamespace()
+    prepare_frozen_review_reconciliation(ctx, attempt)
+    calls = []
+
+    def error_actor(slot, error, operation_id="", operation_state="settled"):
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error", error=error,
+            operation_id=operation_id, operation_state=operation_state,
+            late_result_pending=operation_state in {"in_flight", "custody_lost"},
+        )
+
+    actors = run_custodied_review_slots(
+        request=ReviewRequest(
+            surface="multi_model_review", goal="review", task_id="task-roster",
+            retry_key="commit_review:roster", reconcile_only=True,
+        ),
+        slots=[
+            ReviewSlot(slot_id="slot-1", model="m1"),
+            ReviewSlot(slot_id="slot-new", model="m-new"),
+        ],
+        usage_ctx=ctx,
+        task_id="task-roster",
+        usage_meta={},
+        review_usage_scope=UsageScope(drive_root=tmp_path, task_id="task-roster"),
+        run_slot=lambda *_args: calls.append("sent"),
+        error_actor=error_actor,
+    )
+
+    assert calls == []
+    assert {actor.slot_id: actor.operation_state for actor in actors} == {
+        "slot-1": "settled", "slot-new": "custody_lost",
+    }
+
+
+def test_restart_reconciliation_hydrates_delegated_invocation_without_paid_stamp(tmp_path):
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import (
+        prepare_frozen_review_reconciliation, run_custodied_review_slots,
+    )
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    attempt = SimpleNamespace(triad_raw_results=[{
+        "slot_id": "slot-1", "model_id": "cursor/test", "status": "error",
+        "operation_id": "op-existing", "operation_state": "in_flight",
+        "late_result_pending": True, "pending_invocation_id": "inv-existing",
+    }], scope_raw_result={})
+    paid = []
+    ctx = SimpleNamespace(_review_paid_stamp=lambda: paid.append("paid"))
+    prepare_frozen_review_reconciliation(ctx, attempt)
+    request = ReviewRequest(
+        surface="multi_model_review", goal="review", task_id="task-restart",
+        retry_key="commit_review:exact", reconcile_only=True,
+    )
+    slot = ReviewSlot(
+        slot_id="slot-1", model="cursor/test", route=ReviewRouteKind.AGENT_SESSION,
+    )
+    calls = []
+
+    def recover(_slot, operation_id, retry_state, _deadline):
+        calls.append((operation_id, dict(retry_state)))
+        return ReviewActorRecord(slot_id="slot-1", model="cursor/test", status="ok")
+
+    [actor] = run_custodied_review_slots(
+        request=request,
+        slots=[slot],
+        usage_ctx=ctx,
+        task_id="task-restart",
+        usage_meta={},
+        review_usage_scope=UsageScope(drive_root=tmp_path, task_id="task-restart"),
+        run_slot=recover,
+        error_actor=lambda *_args, **_kwargs: None,
+    )
+
+    assert calls == [("op-existing", {"pending_invocation_id": "inv-existing"})]
+    assert paid == []
+    assert actor.operation_id == "op-existing"
+    assert actor.operation_state == "settled"
+
+
+def test_logical_timeout_actor_carries_live_delegated_restart_token(tmp_path):
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import run_custodied_review_slots
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    release = threading.Event()
+    request = ReviewRequest(
+        surface="multi_model_review", goal="review", task_id="task-timeout-token",
+        retry_key="commit_review:token",
+    )
+    slot = ReviewSlot(
+        slot_id="slot-1", model="cursor/test", route=ReviewRouteKind.AGENT_SESSION,
+        timeout_sec=0.1,
+    )
+
+    def still_running(_slot, _operation_id, retry_state, _deadline):
+        retry_state["pending_invocation_id"] = "inv-live"
+        retry_state["delegated_run_id"] = "run-live"
+        release.wait(0.4)
+        return ReviewActorRecord(slot_id="slot-1", model="cursor/test", status="ok")
+
+    def error_actor(_slot, error, operation_id="", operation_state="settled"):
+        return ReviewActorRecord(
+            slot_id="slot-1", model="cursor/test", status="error", error=error,
+            operation_id=operation_id, operation_state=operation_state,
+            late_result_pending=operation_state == "in_flight",
+        )
+
+    started = time.monotonic()
+    [actor] = run_custodied_review_slots(
+        request=request,
+        slots=[slot],
+        usage_ctx=SimpleNamespace(),
+        task_id="task-timeout-token",
+        usage_meta={},
+        review_usage_scope=UsageScope(drive_root=tmp_path, task_id="task-timeout-token"),
+        run_slot=still_running,
+        error_actor=error_actor,
+    )
+    release.set()
+
+    assert time.monotonic() - started < 0.3
+    assert actor.operation_state == "in_flight"
+    assert actor.usage["pending_invocation_id"] == "inv-live"
+    assert actor.usage["delegated_run_id"] == "run-live"
+
+
+def test_durable_triad_and_scope_rows_carry_delegated_restart_identity():
+    from ouroboros.tools.review import _parse_model_response
+    from ouroboros.tools.review_helpers import build_scope_actor_record
+    from ouroboros.tools.scope_review import ScopeReviewResult
+    from ouroboros.triad_review import parse_model_review_results
+
+    envelope = _parse_model_response("cursor/test", {
+        "choices": [{"message": {"content": "[]"}}], "slot_id": "slot_1",
+        "operation_id": "op-1", "operation_state": "in_flight",
+        "late_result_pending": True,
+        "usage": {
+            "pending_invocation_id": "inv-1", "delegated_run_id": "run-1",
+        },
+    }, None)
+    triad = parse_model_review_results({"results": [envelope]})
+    triad_row = triad.actor_records[0].to_dict()
+    assert triad_row["pending_invocation_id"] == "inv-1"
+    assert triad_row["delegated_run_id"] == "run-1"
+
+    scope_row = build_scope_actor_record(ScopeReviewResult(
+        model_id="cursor/test", operation_id="op-2", operation_state="in_flight",
+        late_result_pending=True, pending_invocation_id="inv-2",
+        delegated_run_id="run-2",
+    ), slot_id="scope_slot_1")
+    assert scope_row["pending_invocation_id"] == "inv-2"
+    assert scope_row["delegated_run_id"] == "run-2"
+
+
+def test_review_does_not_retry_an_unknown_dispatched_api_attempt(tmp_path):
+    from types import SimpleNamespace
+
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+
+    class _AmbiguousReviewLLM:
+        calls = 0
+
+        def chat(self, **_kwargs):
+            self.calls += 1
+            exc = TimeoutError("review provider outcome unknown")
+            exc.physical_attempt_capture = SimpleNamespace(
+                state="unresolved", provider_status_code=None,
+                provider_code="", provider_error_type="TimeoutError",
+            )
+            raise exc
+
+    llm = _AmbiguousReviewLLM()
+    ctx = SimpleNamespace(task_id="task-review", event_queue=None, pending_events=[])
+    result = run_review_request(
+        ReviewRequest(
+            surface="multi_model_review", goal="review", task_id="task-review",
+            call_type="multi_model_review", retry_key="commit_review:unknown",
+        ),
+        slots=[ReviewSlot(slot_id="slot-1", model="openai/test")],
+        drive_root=tmp_path,
+        llm=llm,
+        usage_ctx=ctx,
+    )
+
+    assert llm.calls == 1
+    assert result.actors[0]["status"] == "error"
+    assert result.actors[0]["operation_state"] == "custody_lost"
+    assert result.actors[0]["late_result_pending"] is True
+    assert ctx._review_custody_lost is True
+
+
+def test_paid_or_pending_review_attempt_never_ttl_authorizes_a_resend():
+    from ouroboros.review_state import AdvisoryReviewState, CommitAttemptRecord
+
+    old = "2020-01-01T00:00:00+00:00"
+    state = AdvisoryReviewState(attempts=[
+        CommitAttemptRecord(ts=old, commit_message="unpaid", status="reviewing", attempt=1),
+        CommitAttemptRecord(
+            ts=old, commit_message="paid", status="reviewing", attempt=2,
+            paid=True, review_retry_key="commit_review:paid",
+        ),
+        CommitAttemptRecord(
+            ts=old, commit_message="late", status="reviewing", attempt=3,
+            late_result_pending=True, review_retry_key="commit_review:late",
+        ),
+    ])
+
+    expired = state.expire_stale_attempts(now_ts="2026-01-01T00:00:00+00:00")
+
+    assert [item.commit_message for item in expired] == ["unpaid"]
+    assert state.attempts[1].status == "reviewing"
+    assert state.attempts[2].late_result_pending is True
+
+
+def test_commit_retry_key_round_trips_in_review_state(tmp_path):
+    from ouroboros.review_state import (
+        AdvisoryReviewState, CommitAttemptRecord, load_state, save_state,
+    )
+
+    save_state(tmp_path, AdvisoryReviewState(attempts=[CommitAttemptRecord(
+        ts="2026-01-01T00:00:00+00:00",
+        commit_message="pending",
+        status="reviewing",
+        review_retry_key="commit_review:roundtrip",
+    )]))
+
+    assert load_state(tmp_path).attempts[0].review_retry_key == "commit_review:roundtrip"
+
+
+def test_exact_pending_commit_retry_reconciles_before_cycle_cap(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ouroboros.tools import git as git_tools
+
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path,
+        task_id="task-1",
+        task_metadata={},
+        _review_resume_pending=True,
+        _pending_review_attempt=SimpleNamespace(review_retry_key="commit_review:exact"),
+    )
+    monkeypatch.setattr(git_tools, "_commit_review_retry_key", lambda *_a, **_k: "commit_review:exact")
+    monkeypatch.setattr(git_tools, "commit_review_contract_fingerprint", lambda: "contract")
+    monkeypatch.setattr(
+        git_tools, "check_review_cycles_ceiling",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("cap must not gate reconciliation")),
+    )
+    monkeypatch.setattr(
+        git_tools, "check_identical_verdict_refusal",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("replay gate must not run")),
+    )
+
+    outcome = git_tools._free_cycle_gate(
+        ctx,
+        "message",
+        0.0,
+        pre_fingerprint={"fingerprint": "binding"},
+        review_rebuttal="",
+        goal="goal",
+        scope="scope",
+    )
+
+    assert outcome is None
+    assert ctx._review_reconcile_only is True
+    assert ctx._current_review_retry_key == "commit_review:exact"
+
+
+def test_commit_pending_retry_reconciles_same_paid_attempt(tmp_path, monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import prepare_frozen_review_reconciliation
+    from ouroboros.review_dispatch import stamp_review_paid_on_dispatch
+    from ouroboros.review_state import load_state, make_repo_key
+    from ouroboros.tools import git as git_tools
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for cmd in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "test@example.com"],
+        ["git", "config", "user.name", "Test"],
+    ):
+        subprocess.run(cmd, cwd=repo, check=True)
+    path = repo / "value.txt"
+    path.write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "add", "value.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    path.write_text("two\n", encoding="utf-8")
+
+    drive = tmp_path / "data"
+    (drive / "logs").mkdir(parents=True)
+    ctx = SimpleNamespace(
+        repo_dir=repo, drive_root=drive, drive_path=lambda name: drive / name,
+        task_id="task-commit-custody",
+        task_metadata={}, event_queue=None, current_task_type="", parent_task_id="",
+        emit_progress_fn=lambda *_args: None, drive_logs=lambda: drive / "logs",
+    )
+    monkeypatch.setattr(git_tools, "_advisory_and_tests_gate", lambda *_a, **_k: None)
+    monkeypatch.setattr(git_tools, "_review_binding_precondition_error", lambda *_a, **_k: "")
+    monkeypatch.setattr(git_tools, "commit_review_contract_fingerprint", lambda: "contract")
+    monkeypatch.setattr(
+        git_tools, "_aggregate_review_verdict",
+        lambda *_a, **_k: (False, "", "", [], []),
+    )
+    waves = 0
+
+    def wave(run_ctx, *_args, **_kwargs):
+        nonlocal waves
+        waves += 1
+        if waves == 1:
+            stamp_review_paid_on_dispatch(run_ctx)
+            run_ctx._last_triad_raw_results = [{
+                "slot_id": "slot_1", "model_id": "m1", "status": "error",
+                "operation_id": "op-1", "operation_state": "in_flight",
+                "late_result_pending": True,
+            }]
+        else:
+            assert run_ctx._review_reconcile_only is True
+            prepare_frozen_review_reconciliation(run_ctx, run_ctx._pending_review_attempt)
+            run_ctx._last_triad_raw_results = [{
+                "slot_id": "slot_1", "model_id": "m1", "status": "responded",
+                "raw_text": "[]", "operation_id": "op-1",
+                "operation_state": "settled", "late_result_pending": False,
+            }]
+        run_ctx._last_scope_raw_result = {}
+        return None, None, "critical_findings", []
+
+    monkeypatch.setattr(git_tools, "_run_parallel_review", wave)
+    first = git_tools._run_non_committing_review_cycle(ctx, "same message")
+    assert first["status"] == "blocked", first
+    assert first["block_reason"] == "review_late_result_pending"
+
+    monkeypatch.setattr(
+        git_tools, "check_review_cycles_ceiling",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("cap must not gate exact custody")),
+    )
+    second = git_tools._run_non_committing_review_cycle(ctx, "same message")
+    assert second["status"] == "passed"
+    assert waves == 2
+
+    rows = load_state(drive).filter_attempts(
+        repo_key=make_repo_key(repo), tool_name="commit_reviewed",
+        task_id="task-commit-custody",
+    )
+    assert len(rows) == 1
+    assert rows[0].attempt == 1 and rows[0].paid is True
+    assert rows[0].late_result_pending is False
+    assert rows[0].triad_raw_results[0]["operation_id"] == "op-1"
 
 
 def test_preflight_timeout_override_rejects_infinity(monkeypatch):

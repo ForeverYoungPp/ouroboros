@@ -10,12 +10,19 @@ def test_query_model_timeout_becomes_error_actor(monkeypatch):
     from ouroboros.observability import read_blob_ref
     from ouroboros.tools.review_helpers import review_drive_root
 
+    captured = {}
+
     class HangingClient:
-        async def chat_async(self, **_kwargs):
+        async def chat_async(self, **kwargs):
+            captured.update(kwargs)
             await asyncio.sleep(1)
             return {"content": "late"}, {}
 
     monkeypatch.setenv("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", "0.01")
+    monkeypatch.setattr(
+        "ouroboros.review_execution.review_transport_timeout",
+        lambda *_args, **_kwargs: 2700.0,
+    )
 
     model, result, headers = asyncio.run(
         _query_model(
@@ -30,6 +37,7 @@ def test_query_model_timeout_becomes_error_actor(monkeypatch):
     assert "physical review operation remains in flight" in result["error"]
     assert result["operation_state"] == "in_flight"
     assert result["late_result_pending"] is True
+    assert captured["timeout"] == 2700.0
     assert result["prompt_ref"]["manifest_ref"]["path"]
     assert result["response_ref"]["manifest_ref"]["path"]
     prompt = read_blob_ref(

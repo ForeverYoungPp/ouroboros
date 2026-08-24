@@ -106,8 +106,8 @@ def _commit_readiness_debts_view(state: Any) -> List["CommitReadinessDebtItem"]:
 _OBLIGATION_STR_DEFAULTS = {"obligation_id": "", "item": "", "severity": "critical", "reason": "", "source_attempt_ts": "", "source_attempt_msg": "", "status": "still_open", "resolved_by": "", "repo_key": _LEGACY_CURRENT_REPO_KEY}
 _DEBT_STR_DEFAULTS = {"debt_id": "", "category": "", "summary": "", "severity": "warning", "status": "detected", "repo_key": _LEGACY_CURRENT_REPO_KEY, "fingerprint": "", "title": "Commit readiness debt", "source": "review_state", "first_seen_at": "", "last_seen_at": "", "updated_at": "", "verified_at": ""}
 _RUN_STR_DEFAULTS = {"snapshot_hash": "", "commit_message": "", "status": "stale", "snapshot_summary": "", "raw_result": "", "bypass_reason": "", "bypassed_by_task": "", "repo_key": _LEGACY_CURRENT_REPO_KEY, "tool_name": _DEFAULT_ADVISORY_TOOL_NAME, "phase": "advisory", "model_used": "", "session_id": ""}
-_ATTEMPT_STR_DEFAULTS = {"commit_message": "", "snapshot_hash": "", "block_reason": "", "block_details": "", "task_id": "", "repo_key": _LEGACY_CURRENT_REPO_KEY, "tool_name": _DEFAULT_TOOL_NAME, "pre_review_fingerprint": "", "post_review_fingerprint": "", "fingerprint_status": "", "scope_model": "", "block_class": "", "rebuttal_sha256": "", "review_contract_fingerprint": "", "root_task_id": ""}
-_ATTEMPT_MERGE_INCOMING_FIRST = ("ts", "commit_message", "status", "snapshot_hash", "block_reason", "block_details", "duration_sec", "task_id", "repo_key", "tool_name", "phase", "pre_review_fingerprint", "post_review_fingerprint", "fingerprint_status", "scope_model", "block_class", "rebuttal_sha256", "review_contract_fingerprint", "root_task_id")
+_ATTEMPT_STR_DEFAULTS = {"commit_message": "", "snapshot_hash": "", "block_reason": "", "block_details": "", "task_id": "", "repo_key": _LEGACY_CURRENT_REPO_KEY, "tool_name": _DEFAULT_TOOL_NAME, "pre_review_fingerprint": "", "post_review_fingerprint": "", "fingerprint_status": "", "scope_model": "", "block_class": "", "rebuttal_sha256": "", "review_contract_fingerprint": "", "review_retry_key": "", "root_task_id": ""}
+_ATTEMPT_MERGE_INCOMING_FIRST = ("ts", "commit_message", "status", "snapshot_hash", "block_reason", "block_details", "duration_sec", "task_id", "repo_key", "tool_name", "phase", "pre_review_fingerprint", "post_review_fingerprint", "fingerprint_status", "scope_model", "block_class", "rebuttal_sha256", "review_contract_fingerprint", "review_retry_key", "root_task_id")
 _ATTEMPT_MERGE_INCOMING_LISTS = ("critical_findings", "advisory_findings", "obligation_ids", "readiness_warnings")
 _RUN_STATUS_ICONS = {"fresh": "✅", "stale": "⚠️", "bypassed": "⏭️", "skipped": "⏭️", "parse_failure": "🔴"}
 
@@ -269,6 +269,7 @@ class CommitAttemptRecord:
     rebuttal_sha256: str = ""
     paid: bool = False
     review_contract_fingerprint: str = ""
+    review_retry_key: str = ""
     root_task_id: str = ""
     # True once the row's heavy forensic payloads (raw reviewer results, full
     # free text) were compacted because the preserved accounting row fell
@@ -1028,6 +1029,10 @@ class AdvisoryReviewState:
         expired: List[CommitAttemptRecord] = []
         for item in self.attempts:
             if item.status != "reviewing" and not item.late_result_pending:
+                continue
+            # TTL cleans up unpaid legacy UI rows. It must never become
+            # permission to buy over paid work whose outcome remains unknown.
+            if item.late_result_pending or (item.status == "reviewing" and item.paid):
                 continue
             started_epoch = _parse_iso_ts(item.started_ts or item.ts)
             if started_epoch is None:

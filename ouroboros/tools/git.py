@@ -43,6 +43,7 @@ from ouroboros.tools.commit_gate import (
     IDENTICAL_DIFF_BLOCK_REASON,
     _check_advisory_freshness,
     _check_overlapping_review_attempt,
+    _current_review_tool_name,
     _invalidate_advisory,
     _record_commit_attempt,
     check_identical_verdict_refusal,
@@ -58,7 +59,11 @@ from ouroboros.review_cycles import (
 )
 from ouroboros.tools.review_revalidation import handle_revalidation_failure
 from ouroboros.utils import utc_now_iso, write_text, safe_relpath, run_cmd
-from ouroboros.tools.parallel_review import run_parallel_review as _run_parallel_review, aggregate_review_verdict as _aggregate_review_verdict
+from ouroboros.tools.parallel_review import (
+    _commit_review_retry_key,
+    aggregate_review_verdict as _aggregate_review_verdict,
+    run_parallel_review as _run_parallel_review,
+)
 from ouroboros.tools.review_helpers import (
     _run_review_preflight_tests,
     format_review_history_entry,
@@ -309,6 +314,73 @@ def _finalize_blocked_review(
     return combined_msg
 
 
+def _review_custody_pending(ctx: ToolContext) -> bool:
+    """Whether this gate still owns paid work that is not terminal."""
+    if bool(getattr(ctx, "_review_custody_lost", False)):
+        return True
+    triad = list(getattr(ctx, "_last_triad_raw_results", []) or [])
+    scope_raw = getattr(ctx, "_last_scope_raw_result", {}) or {}
+    scope_rows = list(scope_raw.get("raw_results") or []) if isinstance(scope_raw, dict) else []
+    if not scope_rows and isinstance(scope_raw, dict) and scope_raw:
+        scope_rows = [scope_raw]
+    return any(
+        bool(row.get("late_result_pending"))
+        or str(row.get("operation_state") or "") in {"in_flight", "custody_lost"}
+        for row in [*triad, *scope_rows]
+        if isinstance(row, dict)
+    )
+
+
+def _finalize_pending_review(
+    ctx: ToolContext,
+    commit_message: str,
+    commit_start: float,
+    *,
+    pre_fingerprint: Dict[str, Any],
+    post_fingerprint: Dict[str, Any],
+) -> str:
+    """Persist the non-terminal wave and leave its exact retry fail-closed."""
+    custody_lost = bool(getattr(ctx, "_review_custody_lost", False))
+    message = (
+        "⚠️ REVIEW_CUSTODY_LOST: the paid review wave is still unresolved, but "
+        "its exact process-local custody is unavailable. A second dispatch was "
+        "not started; operator reconciliation is required."
+        if custody_lost else
+        "⚠️ REVIEW_PENDING: physical reviewer work remains in flight. Retry the "
+        "same commit to reconcile that exact paid wave; no second dispatch is allowed."
+    )
+    post_value = str(post_fingerprint.get("fingerprint") or "")
+    pre_value = str(pre_fingerprint.get("fingerprint") or "")
+    fingerprint_status = (
+        "matched" if post_value and post_value == pre_value
+        else "mismatch" if post_value else "unavailable"
+    )
+    _record_commit_attempt(
+        ctx,
+        commit_message,
+        "reviewing",
+        block_reason="review_custody_lost" if custody_lost else "review_late_result_pending",
+        block_details=message,
+        duration_sec=time.time() - commit_start,
+        phase="late_wait",
+        late_result_pending=True,
+        pre_review_fingerprint=pre_value,
+        post_review_fingerprint=post_value,
+        fingerprint_status=fingerprint_status,
+        triad_models=getattr(ctx, "_last_triad_models", []),
+        scope_model=getattr(ctx, "_last_scope_model", ""),
+        triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+        scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
+        degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
+        review_retry_key=str(getattr(ctx, "_current_review_retry_key", "") or ""),
+    )
+    try:
+        run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
+    except Exception:
+        pass
+    return message
+
+
 _DOC_ONLY_EXTENSIONS = (".md", ".txt", ".rst")
 
 
@@ -384,6 +456,8 @@ def _free_cycle_gate(
     *,
     pre_fingerprint: Dict[str, Any],
     review_rebuttal: str,
+    goal: str = "",
+    scope: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Max-Review-Cycles gate, run BEFORE advisory freshness and any paid
     dispatch. ``None`` allows a paid attempt. Two free typed outcomes:
@@ -400,6 +474,38 @@ def _free_cycle_gate(
     ctx._current_review_rebuttal_sha256 = rebuttal_sha
     ctx._current_review_contract_fingerprint = contract_fp
     root_task_id = resolve_root_task_id(ctx)
+    retry_key = _commit_review_retry_key(
+        ctx,
+        commit_message,
+        goal=goal,
+        scope=scope,
+        review_rebuttal=review_rebuttal,
+        binding_fingerprint=fp,
+    )
+    ctx._current_review_retry_key = retry_key
+    pending = getattr(ctx, "_pending_review_attempt", None)
+    if bool(getattr(ctx, "_review_resume_pending", False)):
+        if (
+            pending is not None
+            and contract_fp
+            and str(getattr(pending, "review_retry_key", "") or "") == retry_key
+        ):
+            ctx._review_reconcile_only = True
+            return None
+        try:
+            run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
+        except Exception:
+            pass
+        return {
+            "status": "blocked",
+            "message": (
+                "⚠️ REVIEWED_ATTEMPT_IN_PROGRESS: paid review work is still "
+                "unresolved for different bytes or intent. The new candidate was "
+                "not dispatched; reconcile the original exact attempt first."
+            ),
+            "block_reason": "overlap_guard",
+        }
+    ctx._review_reconcile_only = False
     identical_msg = check_identical_verdict_refusal(
         ctx, fp, rebuttal_sha256=rebuttal_sha, contract_fingerprint=contract_fp
     )
@@ -485,6 +591,9 @@ def _install_paid_dispatch_stamp(
     from ouroboros.review_dispatch import ReviewPaidStamp
 
     def _write() -> None:
+        retry_key = str(getattr(ctx, "_current_review_retry_key", "") or "")
+        if not retry_key:
+            raise RuntimeError("commit review paid write-ahead has no retry identity")
         _record_commit_attempt(
             ctx,
             commit_message,
@@ -498,9 +607,22 @@ def _install_paid_dispatch_stamp(
             review_contract_fingerprint=str(
                 getattr(ctx, "_current_review_contract_fingerprint", "") or ""
             ),
+            review_retry_key=retry_key,
+            late_result_pending=bool(getattr(ctx, "_review_reconcile_only", False)),
+            _strict=True,
         )
+        from ouroboros.review_state import load_state, make_repo_key
 
-    ctx._review_paid_stamp = ReviewPaidStamp(_write)
+        recorded = load_state(pathlib.Path(ctx.drive_root)).latest_attempt_for(
+            repo_key=make_repo_key(pathlib.Path(ctx.repo_dir)),
+            tool_name=_current_review_tool_name(ctx),
+            task_id=str(getattr(ctx, "task_id", "") or ""),
+            attempt=int(getattr(ctx, "_current_review_attempt_number", 0) or 0),
+        )
+        if recorded is None or not recorded.paid or recorded.review_retry_key != retry_key:
+            raise RuntimeError("commit review paid write-ahead could not be verified")
+
+    ctx._review_paid_stamp = ReviewPaidStamp(_write, fail_closed=True)
 
 
 def _review_cycle_infra_failure(
@@ -510,14 +632,15 @@ def _review_cycle_infra_failure(
     message: str,
 ) -> Dict[str, Any]:
     """Record and return one fail-closed stage-cycle infrastructure result."""
-    _record_commit_attempt(
-        ctx,
-        commit_message,
-        "failed",
-        block_reason="infra_failure",
-        block_details=message,
-        duration_sec=time.time() - commit_start,
-    )
+    if not bool(getattr(ctx, "_review_resume_pending", False)):
+        _record_commit_attempt(
+            ctx,
+            commit_message,
+            "failed",
+            block_reason="infra_failure",
+            block_details=message,
+            duration_sec=time.time() - commit_start,
+        )
     return {"status": "failed", "message": message}
 
 
@@ -867,16 +990,8 @@ def _run_reviewed_stage_cycle(
     require_release_tag: bool = True,
 ) -> Dict[str, Any]:
     skip_advisory_pre_review = bool(skip_advisory_review or skip_advisory_pre_review)
-    # In-attempt semantics for the managed subject↔binding assertion: the set
-    # must only ever hold subject trees built during THIS attempt. The paid
-    # path resets it again inside run_parallel_review (harmless double reset),
-    # but the advisory free-replay branch skips that dispatch entirely — a
-    # stale set left by a previous paid attempt would then be compared against
-    # the CURRENT binding tree and permanently block the free-replay commit
-    # (typed review_subject_binding_mismatch on every retry).
+    # Subject evidence and memo are scoped to this exact attempt.
     ctx._last_review_subject_trees = set()
-    # The per-attempt subject memo shares the attempt boundary (C5): a new
-    # attempt must rebuild against the fresh candidate.
     ctx._managed_review_subject_memo = {}
     classification_paths, advisory_paths, stage_error = _stage_candidate_for_review(
         ctx,
@@ -903,16 +1018,17 @@ def _run_reviewed_stage_cycle(
             run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
         except Exception:
             pass
-        _record_commit_attempt(
-            ctx,
-            commit_message,
-            "blocked",
-            block_reason="core_protection_blocked",
-            block_details=msg,
-            duration_sec=time.time() - commit_start,
-            critical_findings=[],
-            phase="preflight",
-        )
+        if not bool(getattr(ctx, "_review_resume_pending", False)):
+            _record_commit_attempt(
+                ctx,
+                commit_message,
+                "blocked",
+                block_reason="core_protection_blocked",
+                block_details=msg,
+                duration_sec=time.time() - commit_start,
+                critical_findings=[],
+                phase="preflight",
+            )
         return {
             "status": "blocked",
             "message": msg,
@@ -920,6 +1036,14 @@ def _run_reviewed_stage_cycle(
         }
     pre_fingerprint = _fingerprint_staged_diff(pathlib.Path(ctx.repo_dir))
     if not pre_fingerprint.get("ok"):
+        if bool(getattr(ctx, "_review_resume_pending", False)):
+            return {
+                "status": "blocked",
+                "message": "⚠️ REVIEW_BINDING_UNAVAILABLE: cannot verify the exact pending review identity; no new dispatch was started.",
+                "block_reason": "fingerprint_unavailable",
+                "pre_fingerprint": pre_fingerprint,
+                "post_fingerprint": {},
+            }
         return {
             "status": "blocked",
             "message": _handle_revalidation_failure(
@@ -933,15 +1057,11 @@ def _run_reviewed_stage_cycle(
             "pre_fingerprint": pre_fingerprint,
             "post_fingerprint": {},
         }
-    # Max-Review-Cycles free gate: BEFORE the advisory-freshness gate (an
-    # identical resubmission must not be told to buy a fresh SDK advisory) and
-    # before any paid dispatch. A refusal is free; under advisory it becomes a
-    # free replay marker instead of a block. The fingerprint is computed early
-    # because this gate needs it; the binding-precondition check keeps its
-    # original place AFTER the advisory/tests gate (wording-4, I1).
+    # Free-cycle identity runs before advisory freshness and any paid dispatch.
     gate_outcome = _free_cycle_gate(
         ctx, commit_message, commit_start,
         pre_fingerprint=pre_fingerprint, review_rebuttal=review_rebuttal,
+        goal=goal, scope=scope,
     )
     advisory_replay: Optional[Dict[str, Any]] = None
     if gate_outcome is not None:
@@ -949,30 +1069,33 @@ def _run_reviewed_stage_cycle(
             advisory_replay = gate_outcome
         else:
             return gate_outcome
-    advisory_gate_outcome = _advisory_and_tests_gate(
-        ctx, commit_message, commit_start,
-        classification_paths=classification_paths,
-        advisory_paths=advisory_paths,
-        skip_advisory_pre_review=skip_advisory_pre_review,
-        skip_tests=skip_tests,
-    )
+    advisory_gate_outcome = None
+    if not bool(getattr(ctx, "_review_reconcile_only", False)):
+        advisory_gate_outcome = _advisory_and_tests_gate(
+            ctx, commit_message, commit_start,
+            classification_paths=classification_paths,
+            advisory_paths=advisory_paths,
+            skip_advisory_pre_review=skip_advisory_pre_review,
+            skip_tests=skip_tests,
+        )
     if advisory_gate_outcome is not None:
         return advisory_gate_outcome
     binding_error = _review_binding_precondition_error(
         pre_fingerprint, require_release_tag=require_release_tag
     )
     if binding_error:
-        _record_commit_attempt(
-            ctx,
-            commit_message,
-            "blocked",
-            block_reason="review_binding_invalid",
-            block_details=binding_error,
-            duration_sec=time.time() - commit_start,
-            phase="preflight",
-            pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
-            fingerprint_status="invalid",
-        )
+        if not bool(getattr(ctx, "_review_reconcile_only", False)):
+            _record_commit_attempt(
+                ctx,
+                commit_message,
+                "blocked",
+                block_reason="review_binding_invalid",
+                block_details=binding_error,
+                duration_sec=time.time() - commit_start,
+                phase="preflight",
+                pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
+                fingerprint_status="invalid",
+            )
         return {
             "status": "blocked",
             "message": binding_error,
@@ -988,16 +1111,14 @@ def _run_reviewed_stage_cycle(
         phase="review",
         pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
         fingerprint_status="pending",
-        # The PAID fact is deliberately NOT recorded here: it lands write-ahead
-        # at the first PHYSICAL reviewer dispatch (_install_paid_dispatch_stamp
-        # below, plan-review precedent), so an attempt where BOTH packs refuse
-        # at assembly — and a free advisory replay, which dispatches nothing —
-        # stays unpaid. The per-root-task cycle count is derived from these
-        # rows, never from a separate counter file (P7).
+        # PAID lands write-ahead only at the first physical dispatch; assembly
+        # refusals and advisory free replays remain unpaid.
         rebuttal_sha256=str(getattr(ctx, "_current_review_rebuttal_sha256", "") or ""),
         review_contract_fingerprint=str(
             getattr(ctx, "_current_review_contract_fingerprint", "") or ""
         ),
+        review_retry_key=str(getattr(ctx, "_current_review_retry_key", "") or ""),
+        late_result_pending=bool(getattr(ctx, "_review_reconcile_only", False)),
     )
 
     if advisory_replay is not None:
@@ -1044,6 +1165,10 @@ def _run_reviewed_stage_cycle(
             )
         finally:
             ctx._review_paid_stamp = None
+            if bool(getattr(ctx, "_review_reconcile_only", False)):
+                from ouroboros.review_custody import merge_frozen_review_reconciliation
+
+                merge_frozen_review_reconciliation(ctx)
     blocked, combined_msg, block_reason, combined_findings, scope_advisory = _aggregate_review_verdict(
         review_err,
         scope_result,
@@ -1059,6 +1184,24 @@ def _run_reviewed_stage_cycle(
         if isinstance(advisory_list, list):
             advisory_list.extend(scope_advisory)
     post_fingerprint = _fingerprint_staged_diff(pathlib.Path(ctx.repo_dir))
+    if _review_custody_pending(ctx):
+        return {
+            "status": "blocked",
+            "message": _finalize_pending_review(
+                ctx,
+                commit_message,
+                commit_start,
+                pre_fingerprint=pre_fingerprint,
+                post_fingerprint=post_fingerprint,
+            ),
+            "block_reason": (
+                "review_custody_lost"
+                if bool(getattr(ctx, "_review_custody_lost", False))
+                else "review_late_result_pending"
+            ),
+            "pre_fingerprint": pre_fingerprint,
+            "post_fingerprint": post_fingerprint,
+        }
     if not post_fingerprint.get("ok"):
         return {
             "status": "blocked",
@@ -1154,6 +1297,11 @@ def _run_non_committing_review_cycle(
     ctx._last_scope_raw_result = {}
     ctx._review_degraded_reasons = []
     ctx._current_review_tool_name = "commit_reviewed"
+    ctx._current_review_retry_key = ""
+    ctx._review_reconcile_only = False
+    ctx._review_frozen_rows = {}
+    ctx._review_custody_lost = False
+    ctx._current_review_attempt_number = None
     commit_start = time.time()
     if not commit_message.strip():
         return {"status": "failed", "message": "⚠️ ERROR: commit_message must be non-empty."}
@@ -1177,14 +1325,15 @@ def _run_non_committing_review_cycle(
     try:
         lock = _acquire_git_lock(ctx)
     except (TimeoutError, Exception) as exc:
-        _record_commit_attempt(
-            ctx,
-            commit_message,
-            "failed",
-            block_reason="infra_failure",
-            block_details=f"Git lock: {exc}",
-            duration_sec=time.time() - commit_start,
-        )
+        if not bool(getattr(ctx, "_review_resume_pending", False)):
+            _record_commit_attempt(
+                ctx,
+                commit_message,
+                "failed",
+                block_reason="infra_failure",
+                block_details=f"Git lock: {exc}",
+                duration_sec=time.time() - commit_start,
+            )
         return {"status": "failed", "message": f"⚠️ GIT_ERROR (lock): {exc}"}
 
     unstage_warning = ""
@@ -2541,14 +2690,16 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
     ctx._last_scope_raw_result = {}
     ctx._review_degraded_reasons = []
     ctx._current_review_tool_name = "commit_reviewed"
+    ctx._current_review_retry_key = ""
+    ctx._review_reconcile_only = False
+    ctx._review_frozen_rows = {}
+    ctx._review_custody_lost = False
+    ctx._current_review_attempt_number = None
     _commit_start = time.time()
     if not commit_message.strip():
         return "⚠️ ERROR: commit_message must be non-empty."
     ctx._current_review_commit_message = commit_message
-    # Managed-update merge (P2/SC2): the tx marker authorizes exactly ONE resolution task to
-    # commit while a managed merge is staged in the live tree. The resolved tree commits as a
-    # reviewed 2-parent merge (native MERGE_HEAD), with push/tag suppressed + an inline
-    # pre-restart smoke. Any OTHER task is blocked from committing while the tx is active.
+    # A managed marker authorizes exactly one reviewed two-parent resolution.
     from supervisor.update_merge import managed_assisted_tx_for
     _managed_tx, _managed_block = managed_assisted_tx_for(getattr(ctx, "task_id", ""), getattr(ctx, "task_metadata", None))
     if _managed_block:
@@ -2584,19 +2735,22 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             phase="preflight",
         )
         return overlap_err
-    _record_commit_attempt(ctx, commit_message, "reviewing")
+    if not bool(getattr(ctx, "_review_resume_pending", False)):
+        _record_commit_attempt(ctx, commit_message, "reviewing")
     try:
         lock = _acquire_git_lock(ctx)
     except (TimeoutError, Exception) as e:
-        _record_commit_attempt(ctx, commit_message, "failed",
-                               block_reason="infra_failure",
-                               block_details=f"Git lock: {e}",
-                               duration_sec=time.time() - _commit_start)
+        if not bool(getattr(ctx, "_review_resume_pending", False)):
+            _record_commit_attempt(ctx, commit_message, "failed",
+                                   block_reason="infra_failure",
+                                   block_details=f"Git lock: {e}",
+                                   duration_sec=time.time() - _commit_start)
         return f"⚠️ GIT_ERROR (lock): {e}"
     test_warning_ref = [""]
-    _fail = lambda msg: (_record_commit_attempt(ctx, commit_message, "failed",
-        block_reason="infra_failure", block_details=msg,
-        duration_sec=time.time() - _commit_start), msg)[1]
+    _fail = lambda msg: msg if bool(getattr(ctx, "_review_resume_pending", False)) else (
+        _record_commit_attempt(ctx, commit_message, "failed",
+            block_reason="infra_failure", block_details=msg,
+            duration_sec=time.time() - _commit_start), msg)[1]
     try:
         came_from_detached_checkout, preparation_error = _prepare_review_commit_worktree(
             ctx, _managed_tx

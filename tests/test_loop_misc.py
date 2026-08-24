@@ -1099,6 +1099,48 @@ def test_budget_rail_after_dispatch_is_terminal_without_provider_fallback(tmp_pa
     assert root_fence["root_task_id"] == "budget-root"
 
 
+def test_unknown_dispatched_outcome_skips_cross_model_fallback(tmp_path, monkeypatch):
+    from ouroboros.tools.registry import ToolRegistry
+
+    class FakeLLM:
+        def default_model(self):
+            return "test-model"
+
+    calls = {"primary": 0, "fallback": 0}
+
+    def ambiguous(*args, **_kwargs):
+        calls["primary"] += 1
+        usage = args[10]
+        usage["_last_llm_error"] = "provider outcome unknown"
+        usage["_last_llm_error_kind"] = "provider_outcome_unknown"
+        usage["_last_llm_retry_same_request"] = False
+        return None, 0.0
+
+    def forbidden_fallback(**_kwargs):
+        calls["fallback"] += 1
+        raise AssertionError("unknown physical work must stop the paid chain")
+
+    monkeypatch.setattr(loop_mod, "call_llm_with_retry", ambiguous)
+    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", forbidden_fallback)
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+
+    result, usage, _trace = run_llm_loop(
+        messages=[{"role": "user", "content": "go"}],
+        tools=registry,
+        llm=FakeLLM(),
+        drive_logs=tmp_path,
+        emit_progress=lambda _text: None,
+        incoming_messages=queue.Queue(),
+        task_id="unknown-provider-task",
+        drive_root=tmp_path,
+    )
+
+    assert calls == {"primary": 1, "fallback": 0}
+    assert usage["_last_llm_error_kind"] == "provider_outcome_unknown"
+    assert "no retry or paid fallback" in result
+
+
 def test_run_llm_loop_narrates_reasoning_to_bubble_not_trace(tmp_path, monkeypatch):
     """Display-only contract: a pure tool-call round with no visible content narrates the
     provider's readable reasoning to the progress BUBBLE, but never records it in the durable

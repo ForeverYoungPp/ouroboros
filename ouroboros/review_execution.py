@@ -36,13 +36,12 @@ from ouroboros.triad_review import (
     empty_array_is_verified_clean,
     extract_json_array,
 )
-from ouroboros.deadline_utils import bounded_seconds, llm_transport_timeout_sec, review_transport_timeout
+from ouroboros.deadline_utils import bounded_seconds, review_transport_timeout
 
 if TYPE_CHECKING:  # annotations only — importing the substrate here would cycle
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot
 
 log = logging.getLogger("review_execution")
-
 
 class ReviewRouteKind(str, Enum):
     """Closed set of review delivery routes.
@@ -775,9 +774,9 @@ class SessionInvocation:
     session_route: Any = None
     instructions: str = _REVIEW_SESSION_INSTRUCTIONS
     retry_state: Optional[Dict[str, Any]] = None
+    reconcile_only: bool = False
     use_thread: bool = False
     thread_id: str = ""
-
 
 def _owned_started_review_custody(
     custody: Any, custody_drive: Any, record: Dict[str, Any], claimant_task_id: str,
@@ -843,39 +842,15 @@ def run_delegated_review_session(
     custody_drive: Any,
     invocation: SessionInvocation,
 ) -> Dict[str, Any]:
-    """Start, watch, settle and collect ONE delegated read-only review session.
+    """Start, watch, settle and collect one delegated read-only review.
 
-    The single delegated-session transport for every review surface — the
-    substrate's agent_session slots and the delegated advisory both run through
-    here, so there is one nanny loop, not two. The caller owns semantics; this
-    function owns delivery:
-
-    - readonly shape, ``authPreference: subscription``, typed refusals for an
-      unconfigured/unhealthy route — never a fallback to another route (§8);
-    - the requested route is PINNED as the run's explicit one-element
-      ``harnesses`` pool: ``primaryHarness`` alone only reorders the engine's
-      auto-pool, so a "preferred" route can silently land on whatever other
-      harness the pool holds. A pinned pool runs THIS route or refuses typed;
-    - ``output_schema`` is ASKED only when the pinned route's EFFECTIVE
-      transport can carry it (live manifest, not the static adapter flag —
-      D19); the returned ``conformance`` is the only thing a caller may gate
-      trust on;
-    - invocation identity follows the explicit-retry contract: an ordinary call
-      ALWAYS mints a fresh invocation id and records the CANONICAL body on the
-      durable request row; an unknown-outcome failure leaves its token in
-      ``retry_state`` (caller-owned, surviving across the slot's permitted
-      physical attempts), and only that token replays — the STORED bytes under
-      the SAME wire key. A token whose invocation already bound a run is waited
-      on instead of re-posted; a definitively refused token is dead and the
-      call mints fresh. Nothing is ever reused by content-matching;
-    - the nanny owns the time cap: a run that outlives ``timeout_sec`` is
-      cancelled through the verified-cancel path and reported as a timeout;
-    - the transcript is read from the verified FULL primary output (D7), never
-      a bounded preview; the run is settled through delegate_custody either way.
-
-    Returns ``{run_id, text, conformance, schema_asked, settlement, route_id,
-    model, spend, spend_estimated}``. Raises ``ReviewRouteUnavailable``,
-    ``TimeoutError`` or ``RuntimeError``.
+    This is every review surface's single session transport. It pins one
+    subscription harness, asks for schema only when the effective adapter can
+    carry it, stores the canonical start request before POST, and replays only
+    an explicit pending invocation token. A bound token joins its existing run;
+    reconcile-only mode never mints a replacement. The nanny owns verified
+    cancellation at ``timeout_sec`` and reads the full primary output before
+    settling through ``delegate_custody``.
     """
     from ouroboros import delegate_custody as custody
     from ouroboros.claudexor_daemon import ensure_owned_gateway
@@ -927,6 +902,12 @@ def run_delegated_review_session(
                 f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)",
                 code="session_route_unconfigured")
         project_id, existing_project, key, schema_asked = "", "", "", False
+    if invocation.reconcile_only and not recovering:
+        raise ReviewRouteUnavailable(
+            "the exact delegated review invocation is no longer available for "
+            "reconciliation; refusing to start a second paid run",
+            code="review_custody_lost",
+        )
     gateway = ensure_owned_gateway()
     try:
         if not run_id and not (use_thread and thread_id):
@@ -1014,6 +995,10 @@ def run_delegated_review_session(
                 raise ReviewRouteUnavailable(
                     "the durable start-request row could not be written; the "
                     "delegated review session was NOT started", code="start_request_row_unwritable")
+            # Share the durable token with the logical caller before POST/poll.
+            # If its wait window closes while this worker is still alive, the
+            # synthetic in-flight actor can persist an exact restart handle.
+            state["pending_invocation_id"] = invocation_id
             try:
                 if use_thread:
                     from ouroboros.review_thread_continuity import start_review_thread_turn
@@ -1050,7 +1035,8 @@ def run_delegated_review_session(
                 state["pending_invocation_id"] = invocation_id
                 raise ReviewRouteUnavailable(
                     f"Claudexor returned a queued handle without a run id: {handle!r}", code="queued_without_run_id")
-        state.pop("pending_invocation_id", None)
+        state["pending_invocation_id"] = invocation_id or retry_token
+        state["delegated_run_id"] = run_id
         if started_custody is not None:
             entry = started_custody
             custody_durable = True
@@ -1090,6 +1076,8 @@ def run_delegated_review_session(
             message = (f"delegated review session {run_id} ended {run_state or 'unknown'}"
                        + (f": {json.dumps(failure, ensure_ascii=False)}" if failure else ""))
             code = str(failure.get("code") or "")
+            state.pop("pending_invocation_id", None)
+            state.pop("delegated_run_id", None)
             if code in WINDOW_EXHAUSTED_CODES:
                 raise ClaudexorSubscriptionWindowExhausted(
                     message, reset_at=str(failure.get("resetsAt") or ""), code=code)
@@ -1103,6 +1091,8 @@ def run_delegated_review_session(
                 expected_profile=str(getattr(route, "profile_id", "") or ""),
                 applied_profile=str((summary.get("authRoute") or {}).get("profileId") or ""))
             turn_id = str(thread_receipt.get("turn_id") or turn_id)
+        state.pop("pending_invocation_id", None)
+        state.pop("delegated_run_id", None)
         return {
             "run_id": run_id,
             "thread_id": thread_id,
@@ -1315,6 +1305,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         try:
             self._run_session()
         except BaseException as exc:
+            self._run_id = self._run_id or str(getattr(exc, "delegated_run_id", "") or "")
             if not self._retry_state.get("pending_invocation_id"):
                 self._settled_failure = exc
             raise
@@ -1328,7 +1319,9 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 "pending_invocation_id": pending}
 
     def restore_custody(self, state: Dict[str, Any]) -> None:
-        self._retry_state.update(state)
+        # The logical waiter and the physical worker share this small mutable
+        # custody cell so a timeout actor can durably carry a just-started run.
+        self._retry_state = state
     def _session_route(self) -> Any:
         # 6.1: a structured row carries ITS OWN opaque target; the shared
         # session-route key stays as the legacy fallback for rows without one.
@@ -1375,11 +1368,17 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 "agent_session slot has no session root: the surface must name the "
                 "repository root the reviewer session runs in", code="session_root_missing")
         from ouroboros.config import get_finalization_grace_sec
-        from ouroboros.deadline_utils import logical_operation_timeout_sec
-        logical_timeout = logical_operation_timeout_sec(getattr(slot, "timeout_sec", None),
-            deadline_at=getattr(request, "deadline_at", "") or "",
-            fallback=llm_transport_timeout_sec(getattr(slot, "transport_timeout_sec", None)),
-            reserve_sec=get_finalization_grace_sec())
+        from ouroboros.deadline_utils import review_operation_timeout_sec
+        logical_deadline = getattr(self, "_logical_deadline_monotonic", None)
+        logical_timeout = (
+            max(0.001, float(logical_deadline) - time.monotonic())
+            if logical_deadline is not None else
+            review_operation_timeout_sec(getattr(slot, "timeout_sec", None),
+                route=getattr(slot, "route", None),
+                deadline_at=getattr(request, "deadline_at", "") or "",
+                transport_timeout_sec=getattr(slot, "transport_timeout_sec", None),
+                reserve_sec=get_finalization_grace_sec())
+        )
         facts = run_delegated_review_session(
             prompt=self.session_prompt,
             root=root,
@@ -1393,6 +1392,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 output_schema=review_session_output_schema(request.surface),
                 session_route=self._session_route(),
                 retry_state=self._retry_state,
+                reconcile_only=bool(getattr(request, "reconcile_only", False)),
                 use_thread=request.surface == "plan_review",
                 thread_id=str((request.session_threads or {}).get(slot.slot_id) or ""),
             ),

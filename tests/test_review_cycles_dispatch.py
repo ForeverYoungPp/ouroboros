@@ -301,6 +301,14 @@ def test_one_side_dispatched_attempt_counts_as_paid(tmp_path, monkeypatch):
     assert outcome["status"] == "blocked"
     assert count_paid_review_cycles(ctx, root_task_id="root-1") == 1
     assert ctx._review_paid_stamp is None  # the seam never leaks past the wave
+    from ouroboros.review_state import load_state, make_repo_key
+
+    rows = load_state(ctx.drive_root).filter_attempts(
+        repo_key=make_repo_key(pathlib.Path(ctx.repo_dir)), task_id="root-1",
+    )
+    assert len(rows) == 1
+    assert rows[0].attempt == 1 and rows[0].paid is True
+    assert rows[0].review_retry_key
 
 
 @pytest.mark.parametrize(

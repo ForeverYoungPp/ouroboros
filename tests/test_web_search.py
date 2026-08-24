@@ -255,7 +255,7 @@ def test_web_search_outer_envelope_covers_configured_paid_cascade(monkeypatch):
     monkeypatch.setitem(sys.modules, "ddgs", None)
 
     [entry] = [tool for tool in search_module.get_tools() if tool.name == "web_search"]
-    assert entry.timeout_sec == 810  # OpenAI twice + OpenRouter + Anthropic + grace.
+    assert entry.timeout_sec == 810  # Safe terminal retry + OpenRouter + Anthropic + grace.
 
 
 def test_pinned_web_search_preserves_the_legacy_outer_floor(monkeypatch):
@@ -485,11 +485,95 @@ def test_web_search_sanitizes_provider_errors(ctx, patch_env, monkeypatch):
 
     result = json.loads(_web_search(ctx, "error query"))
 
-    assert result["error"].startswith("web_search unavailable")
+    assert result["reason_code"] == "provider_outcome_unknown"
     serialized = json.dumps(result)
     assert leaked_secret not in serialized
-    assert "***REDACTED***" in serialized
-    assert any("OpenAI web search failed" in item for item in result["backend_errors"])
+    assert result["backend"] == "openai_responses"
+
+
+def test_dispatched_web_timeout_never_retries_or_cascades(ctx, patch_env, monkeypatch):
+    calls = {"openai": 0, "fallback": 0}
+
+    class _Responses:
+        def create(self, **_kwargs):
+            calls["openai"] += 1
+            raise TimeoutError("read timed out after dispatch")
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.responses = _Responses()
+
+    def forbidden(*_args, **_kwargs):
+        calls["fallback"] += 1
+        raise AssertionError("ambiguous work must not start another backend")
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+    monkeypatch.setattr(search_module, "_web_search_openrouter", forbidden)
+    monkeypatch.setattr(search_module, "_web_search_anthropic", forbidden)
+    monkeypatch.setattr(search_module, "_web_search_ddgs", forbidden)
+
+    result = json.loads(_web_search(ctx, "error query"))
+
+    assert result["reason_code"] == "provider_outcome_unknown"
+    assert calls == {"openai": 1, "fallback": 0}
+
+
+def test_explicit_web_503_allows_one_safe_retry(ctx, patch_env, monkeypatch):
+    calls = 0
+
+    class _Terminal503(Exception):
+        status_code = 503
+
+    class _Responses:
+        def create(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise _Terminal503("service unavailable")
+            return _FakeStream([
+                _make_event("response.output_text.delta", delta="recovered"),
+                _make_completed_event(),
+            ])
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.responses = _Responses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+    result = json.loads(_web_search(ctx, "retry query"))
+
+    assert calls == 2
+    assert result["answer"] == "recovered"
+
+
+def test_streamed_web_503_preserves_status_for_one_safe_retry(ctx, patch_env, monkeypatch):
+    calls = 0
+
+    class _Responses:
+        def create(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return _FakeStream([
+                    _make_event(
+                        "response.failed",
+                        error=types.SimpleNamespace(message="service unavailable", status_code=503),
+                    )
+                ])
+            return _FakeStream([
+                _make_event("response.output_text.delta", delta="recovered from event"),
+                _make_completed_event(),
+            ])
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.responses = _Responses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+    result = json.loads(_web_search(ctx, "retry streamed failure"))
+
+    assert calls == 2
+    assert result["answer"] == "recovered from event"
 
 
 def test_streaming_no_progress_without_search_events(ctx, patch_env, mock_openai):

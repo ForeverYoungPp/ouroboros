@@ -884,6 +884,8 @@ def build_scope_actor_record(scope_result: object, *, fallback_model_id: str = "
         "operation_id": str(getattr(scope_result, "operation_id", "") or ""),
         "operation_state": str(getattr(scope_result, "operation_state", "settled") or "settled"),
         "late_result_pending": bool(getattr(scope_result, "late_result_pending", False)),
+        "pending_invocation_id": str(getattr(scope_result, "pending_invocation_id", "") or ""),
+        "delegated_run_id": str(getattr(scope_result, "delegated_run_id", "") or ""),
         "parsed_items": parsed_items,
         "critical_findings": critical_findings,
         "advisory_findings": advisory_findings,

@@ -252,6 +252,37 @@ def test_schema_conformant_clean_verdict_survives(tmp_path, fake_route):
     assert gateway.start_keys[0]  # the invocation id rode the wire
 
 
+def test_unset_session_window_uses_task_absolute_ceiling(tmp_path, fake_route, monkeypatch):
+    monkeypatch.setattr("ouroboros.config.get_task_abs_ceiling_sec", lambda: 21_600)
+
+    run_review_request(
+        _agent_request(), slots=[_agent_slot(timeout_sec=None)],
+        drive_root=tmp_path, llm=FakeLLM(),
+    )
+
+    assert fake_route.instances[0].start_requests[0]["maxSeconds"] == 21_600
+
+
+def test_task_metadata_deadline_narrows_session_engine_horizon(
+    tmp_path, fake_route, monkeypatch,
+):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr("ouroboros.config.get_finalization_grace_sec", lambda: 0)
+    ctx = SimpleNamespace(
+        task_id="t-agent", event_queue=None, pending_events=[],
+        task_metadata={
+            "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat(),
+        },
+    )
+    run_review_request(
+        _agent_request(), slots=[_agent_slot(timeout_sec=None)],
+        drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
+    )
+
+    assert 1 <= fake_route.instances[0].start_requests[0]["maxSeconds"] <= 300
+
+
 def test_structured_session_compares_the_parsed_model_not_the_harness_spec(
     tmp_path, fake_route,
 ):
@@ -2644,6 +2675,8 @@ def test_an_unreadable_settled_success_raises_typed_never_may_still_be_live(
     assert "may still be live" not in text
     assert "host-cancelled" not in text
     assert gateway.reads_after_cancel == 2, "one bounded retry, never a loop"
+    assert excinfo.value.delegated_run_started is True
+    assert excinfo.value.delegated_run_id == "run-u"
 
 
 @pytest.mark.parametrize("state,must,must_not", [

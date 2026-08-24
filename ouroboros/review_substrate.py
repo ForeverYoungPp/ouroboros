@@ -113,18 +113,15 @@ class ReviewRequest:
     max_tokens: int | None = None
     temperature: float | None = None
     no_proxy: bool = False
-    # Session delivery (agent_session route only; the api_chat route never reads
-    # either). ``session_root`` is the repository root the reviewer session runs
-    # in; ``session_task`` is the surface's compact route-owned task text — the
-    # SAME task/criteria the api pack carries, minus the assembled evidence,
-    # because a delegated reviewer retrieves context with its own tools (D12).
+    # Session route owns a compact task and repository root; API ignores both.
+    # It is the same criteria without the pack because the agent retrieves it.
     session_root: str = ""
     session_task: str = ""
     session_threads: Dict[str, str] = field(default_factory=dict)
     deadline_at: str = ""
     retry_key: str = ""
+    reconcile_only: bool = False
     task_attempt: Any = None
-
 
 @dataclass
 class ReviewActorRecord:
@@ -1366,8 +1363,8 @@ class ReviewCoordinator:
             request=request, slot=slot, call_id=call_id, call_type=base_call_type,
             custody_root=self._custody_drive_root(),
         )
-        # The route lazily renders only the prompt it actually sends.
         executor = _review_route_executor(assignment, llm=self.llm)
+        executor._logical_deadline_monotonic = logical_deadline_monotonic
         executor.restore_custody(retry_state or {})
         prompt_projection = executor.prompt_payload()
         prompt_ref: Dict[str, Any] = {}
@@ -1451,7 +1448,10 @@ class ReviewCoordinator:
                             msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
                             break
                         raise
-                    except Exception:
+                    except Exception as exc:
+                        from ouroboros.review_custody import retryable_review_exception
+                        if not retryable_review_exception(exc, self.usage_ctx):
+                            raise
                         if actor_attempt + 1 < actor_attempts:
                             if (
                                 logical_deadline_monotonic is not None

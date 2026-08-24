@@ -419,6 +419,12 @@ def run_parallel_review(
     paid dispatches still run concurrently, and every verdict is computed by
     the same code as before — only the ordering moved."""
     from ouroboros.tools.review import _dispatch_unified_review, _prepare_unified_review
+    if bool(getattr(ctx, "_review_reconcile_only", False)):
+        from ouroboros.review_custody import prepare_frozen_review_reconciliation
+
+        prepare_frozen_review_reconciliation(
+            ctx, getattr(ctx, "_pending_review_attempt", None),
+        )
 
     # Reset forensic fields so prior attempts cannot bleed into early exits.
     ctx._last_scope_model = ""
@@ -440,10 +446,12 @@ def run_parallel_review(
         diff_bytes = b""
     snapshot_digest = hashlib.sha256(diff_bytes).hexdigest()
     snapshot_key = snapshot_digest[:16]
-    retry_key = _commit_review_retry_key(
-        ctx, commit_message, goal=goal, scope=scope,
-        review_rebuttal=review_rebuttal,
-        binding_fingerprint=review_binding_fingerprint,
+    retry_key = str(getattr(ctx, "_current_review_retry_key", "") or "") or (
+        _commit_review_retry_key(
+            ctx, commit_message, goal=goal, scope=scope,
+            review_rebuttal=review_rebuttal,
+            binding_fingerprint=review_binding_fingerprint,
+        )
     )
     _stored = getattr(ctx, '_scope_review_history', None) or {}
     _scope_history = _stored.get(snapshot_key, []) if isinstance(_stored, dict) else []

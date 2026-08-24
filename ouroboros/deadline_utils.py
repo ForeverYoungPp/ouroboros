@@ -194,23 +194,63 @@ def logical_operation_timeout_sec(
     return max(0.001, value)
 
 
-def review_logical_fallback_timeout_sec() -> float:
-    """Return the review-specific logical fallback, distinct from transport."""
+def review_logical_fallback_timeout_sec() -> Optional[float]:
+    """Return an explicit review-window override, else leave routing in charge."""
     raw = os.environ.get("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", "")
+    if not raw.strip():
+        return None
     try:
         value = float(raw)
     except (TypeError, ValueError):
         value = 0.0
     if math.isfinite(value) and value > 0:
         return value
-    fallback = llm_transport_timeout_sec()
-    if raw:
-        log.warning(
-            "Invalid or non-positive OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC=%r; using %.0fs",
-            raw,
-            fallback,
+    log.warning(
+        "Invalid or non-positive OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC=%r; "
+        "using the route-owned logical fallback",
+        raw,
+    )
+    return None
+
+
+def review_operation_timeout_sec(
+    explicit: Any = None,
+    *,
+    route: Any = None,
+    deadline_at: Any = None,
+    transport_timeout_sec: Any = None,
+    reserve_sec: Any = 0.0,
+) -> float:
+    """Resolve a review wait without turning transport into cognition policy.
+
+    API calls may use their dead-socket bound as the settlement fallback because
+    the physical request itself ends there.  Agent sessions are independent paid
+    processes, so an unset logical window inherits the existing task absolute
+    ceiling instead.  Explicit review windows and owner deadlines only narrow it.
+    """
+    route_value = str(getattr(route, "value", route) or "")
+    requested = explicit
+    if explicit is None or (isinstance(explicit, str) and not explicit.strip()):
+        requested = review_logical_fallback_timeout_sec()
+    if route_value == "agent_session":
+        from ouroboros.config import get_task_abs_ceiling_sec
+
+        ceiling = float(get_task_abs_ceiling_sec())
+        return min(
+            ceiling,
+            logical_operation_timeout_sec(
+                requested,
+                deadline_at=deadline_at,
+                fallback=ceiling,
+                reserve_sec=reserve_sec,
+            ),
         )
-    return fallback
+    return logical_operation_timeout_sec(
+        requested,
+        deadline_at=deadline_at,
+        fallback=llm_transport_timeout_sec(transport_timeout_sec),
+        reserve_sec=reserve_sec,
+    )
 
 
 def review_transport_timeout(model: Any, explicit: Any = None, deadline_at: Any = None) -> Optional[float]:
