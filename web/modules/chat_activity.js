@@ -290,7 +290,7 @@ export function mainThreadAccepts(msg, projectChatIds) {
  * > background live card (Working...) > admitted managed work (Working...) >
  * server-confirmed direct/ephemeral turns (Thinking...) > local pending
  * submissions (Sending...) > queue-admitted but unstarted managed work
- * (Queued...) > terminal attention > idle. A queued task ranks below
+ * (Queued...) > idle. A queued task ranks below
  * Sending... because an unacknowledged local submission is the more actionable
  * state. Pure over its inputs for dependency-free node tests.
  */
@@ -301,7 +301,6 @@ export function computeDerivedChatStatus({
     activeManagedCount = 0,
     queuedManagedCount = 0,
     pendingSubmissionsCount = 0,
-    lastTerminalAttention = false,
 } = {}) {
     if (!isConnected) {
         return { kind: 'offline', text: 'Reconnecting...', showDots: false };
@@ -320,9 +319,6 @@ export function computeDerivedChatStatus({
     }
     if (queuedManagedCount > 0) {
         return { kind: 'thinking', text: 'Queued...', showDots: true };
-    }
-    if (lastTerminalAttention) {
-        return { kind: 'error', text: 'Attention', showDots: false };
     }
     return { kind: 'online', text: 'Online', showDots: false };
 }

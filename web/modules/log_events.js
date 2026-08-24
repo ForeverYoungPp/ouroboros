@@ -169,14 +169,9 @@ function subagentHeadline(sid = '', role = '', label = '', model = '') {
 }
 
 const SUBAGENT_CARD_LABEL = {
-    scheduled: 'scheduled',
-    running: 'running',
-    completed: 'done',
-    completed_warn: 'done with warnings',
-    failed: 'failed',
-    rejected: 'rejected',
-    cancelled: 'cancelled',
-    interrupted: 'interrupted',
+    scheduled: 'Working',
+    running: 'Working',
+    interrupted: 'Working',
 };
 
 export function formatLogMoney(value) {
@@ -253,10 +248,8 @@ export function taskSoftStopPending(record) {
 
 // S3 (owner decision №8/Q3): an owner-requested finalization is a SUCCESSFUL
 // soft stop, not a warning — the owner asked for the summary and received the
-// best available result. The shared terminal seam renders the card headline
-// "Stopped with summary" WITHOUT warn styling, and the task details carry the
-// owner-request marker (spec §17).
-export const OWNER_STOP_DONE_HEADLINE = 'Stopped with summary';
+// best available result. The factual task headline remains "Done" while the
+// task details carry this owner-stop marker (spec §17).
 export const OWNER_STOP_DETAIL_MARKER = "summary at the owner's request — best available result";
 
 export function taskStoppedWithSummary(evt) {
@@ -323,10 +316,6 @@ export function taskOutcomeSeverity(evt) {
     return 'done';
 }
 
-function taskDoneFailure(evt) {
-    return taskOutcomeSeverity(evt) === 'error';
-}
-
 // v6.82 (P5): one shared severity→card-phase mapping for terminal task frames,
 // so live task_done, history task_summary rows, and the terminal-status replay
 // fallback all resolve a cancelled root to the same honest 'cancelled' phase.
@@ -338,6 +327,26 @@ export function taskTerminalPhase(evt) {
     return 'done';
 }
 
+// One factual task-presentation vocabulary for task chips and terminal
+// headlines. Technical outcome truth stays in taskOutcomeSeverity() and
+// taskTerminalPhase(); this builder only translates that truth into compact
+// owner-facing words. A phase override lets terminal replay/fallback paths use
+// the same projection when only the already-derived phase is available.
+export function taskPresentation(evt = {}, phaseOverride = '') {
+    const type = String(evt?.type || evt?.event || '');
+    const status = String(evt?.outcome_axes?.lifecycle?.status || evt?.status || '').toLowerCase();
+    const hasTerminalTruth = type === 'task_done'
+        || ['done', 'completed', 'failed', 'cancelled', 'cancel_requested', 'rejected_duplicate'].includes(status)
+        || Boolean(evt?.outcome_axes || evt?.review_status || evt?.artifact_bundle || evt?.artifact_status);
+    const phase = String(phaseOverride || (hasTerminalTruth ? taskTerminalPhase(evt) : 'working'));
+    const headline = phase === 'done' ? 'Done'
+        : phase === 'warn' ? 'Done with warnings'
+            : phase === 'cancelled' ? 'Cancelled'
+                : ['error', 'timeout', 'lifecycle_error'].includes(phase) ? 'Failed'
+                    : 'Working';
+    return { phase, headline };
+}
+
 function taskOutcomeMeta(evt) {
     const axes = evt.outcome_axes || {};
     return [
@@ -345,23 +354,6 @@ function taskOutcomeMeta(evt) {
         axes.execution?.status ? `execution ${axes.execution.status}` : '',
         axes.objective?.status ? `objective ${axes.objective.status}` : '',
     ].filter(Boolean);
-}
-
-function taskDoneLabel(evt) {
-    const reasonCode = evt.reason_code ? String(evt.reason_code) : '';
-    if (taskOutcomeSeverity(evt) === 'cancelled') {
-        return 'Cancelled';
-    }
-    if (taskDoneFailure(evt)) {
-        return reasonCode ? `Failed: ${reasonCode}` : `Failed ${evt.task_type || 'task'}`;
-    }
-    if (taskStoppedWithSummary(evt)) {
-        return OWNER_STOP_DONE_HEADLINE;
-    }
-    if (taskOutcomeSeverity(evt) === 'warn') {
-        return reasonCode ? `Finished with warnings: ${reasonCode}` : `Finished with warnings`;
-    }
-    return `Finished ${evt.task_type || 'task'}`;
 }
 
 function compactCoverage(coverage) {
@@ -579,6 +571,7 @@ export function summarizeLogEvent(evt) {
     }
 
     if (t === 'task_done') {
+        const presentation = taskPresentation(evt);
         const reasonCode = evt.reason_code ? String(evt.reason_code) : '';
         const artifactStatus = evt.artifact_bundle?.status || evt.artifact_status || '';
         const reviewDetails = formatReviewProjection(evt.review_projection);
@@ -589,7 +582,7 @@ export function summarizeLogEvent(evt) {
         const ownCost = unavailable
             ? 'cost unavailable'
             : (ownValue != null ? `${formatLogMoney(ownValue)}${evt.cost_final === false ? ' (pending)' : ''}` : '');
-        return view(taskTerminalPhase(evt), taskDoneLabel(evt), {
+        return view(presentation.phase, presentation.headline, {
             body: reviewDetails,
             meta: taskMeta(
                 ...taskOutcomeMeta(evt),
@@ -835,7 +828,9 @@ export function summarizeChatLiveEvent(evt) {
                             : event === 'scheduled' ? 'start'
                                 : 'working';
         const terminal = ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(event);
-        const label = SUBAGENT_CARD_LABEL[event] || event || 'update';
+        const label = terminal
+            ? taskPresentation(evt, phase).headline
+            : (SUBAGENT_CARD_LABEL[event] || 'Working');
         // The compact activity line describes the child's work/result, never the
         // reviewer rationale. Review remains complete and auto-expanded below.
         const activity = terminal
@@ -937,7 +932,6 @@ export function summarizeChatLiveEvent(evt) {
                 phase: 'warn',
                 headline: 'Context rebuilt in Low mode — retrying the same model once',
                 visible: true,
-                promote: true,
                 dedupeKey: key(evt.checkpoint_kind, evt.round || ''),
             });
         }
@@ -956,11 +950,10 @@ export function summarizeChatLiveEvent(evt) {
         const errorText = describeText(evt.error, 220);
         return chatView({
             phase: 'error',
-            headline: 'Ran into an issue while thinking',
+            headline: 'Thinking step failed',
             body: errorText.preview,
             fullBody: errorText.full,
             visible: true,
-            promote: true,
             dedupeKey: key(evt.round || ''),
         });
     }
@@ -970,7 +963,6 @@ export function summarizeChatLiveEvent(evt) {
             phase: 'error',
             headline: 'One of the steps took too long',
             visible: true,
-            promote: true,
             dedupeKey: key(evt.tool || ''),
         });
     }
@@ -1001,14 +993,12 @@ export function summarizeChatLiveEvent(evt) {
             body: shortText(bodyParts.join(' '), 220),
             fullBody: fullBodyParts.join('\n\n'),
             visible: true,
-            promote: true,
             dedupeKey: key(evt.tool || '', evt.status || '', evt.exit_code || '', commandText.full || errorResult.full),
         });
     }
 
     if (t === 'task_done') {
-        const severity = taskOutcomeSeverity(evt);
-        const phase = taskTerminalPhase(evt);
+        const presentation = taskPresentation(evt);
         const reviewDetails = formatReviewProjection(evt.review_projection);
         const unavailable = evt.cost_accounting_status === 'unavailable';
         // C13: the SHARED accessor and its null policy — same alias precedence as
@@ -1023,10 +1013,12 @@ export function summarizeChatLiveEvent(evt) {
         // №8/Q3: an owner-requested soft stop keeps 'done' severity but carries
         // its own headline and the owner-request marker in the details meta.
         const softStopped = taskStoppedWithSummary(evt);
+        const reasonDetail = !softStopped && evt.reason_code
+            ? `Reason: ${String(evt.reason_code)}` : '';
         return chatView({
-            phase,
-            headline: severity === 'done' && !softStopped ? 'Done' : taskDoneLabel(evt),
-            body: reviewDetails,
+            phase: presentation.phase,
+            headline: presentation.headline,
+            body: [reasonDetail, reviewDetails].filter(Boolean).join('\n'),
             visible: true,
             promote: true,
             terminal: true,
@@ -1057,19 +1049,6 @@ export function summarizeChatLiveEvent(evt) {
             terminal: false,
             meta: [ownCost, subtreeCost ? `subtree=${subtreeCost}` : ''].filter(Boolean),
             dedupeKey: key('task-cost-finalized', evt.post_task_status || ''),
-        });
-    }
-
-    if (t.includes('error') || t.includes('crash') || t.includes('fail')) {
-        const genericError = describeText(evt.error || evt.result_preview || evt.text || '', 220);
-        return chatView({
-            phase: 'error',
-            headline: 'Ran into an issue',
-            body: genericError.preview,
-            fullBody: genericError.full,
-            visible: true,
-            promote: true,
-            dedupeKey: key(),
         });
     }
 

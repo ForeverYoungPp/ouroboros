@@ -593,7 +593,9 @@ def test_ephemeral_decision_web_frames_never_create_task_card_or_second_receipt(
     ]
     assert "if (registerEphemeralDecisionFrame(msg)) return;" in progress
     assert "if (registerEphemeralDecisionFrame(evt)) return;" in logs
-    assert logs.index("showContextFitToast(evt);") < logs.index("registerEphemeralDecisionFrame(evt)")
+    assert logs.index("registerEphemeralDecisionFrame(evt)") < logs.index(
+        "const taskId = getLogTaskGroupId(evt)"
+    )
 
     fanout = chat[
         chat.index("onWs('chat'"):

@@ -11,7 +11,6 @@ import { clientSurfaceField } from './client_surface.js';
 import { apiClient, apiFetch, fetchTaskDetail } from './api_client.js';
 import {
     OWNER_STOP_DETAIL_MARKER,
-    OWNER_STOP_DONE_HEADLINE,
     formatReviewProjection,
     getLogTaskGroupId,
     isGroupedTaskEvent,
@@ -20,6 +19,7 @@ import {
     summarizeChatLiveEvent,
     taskCancelPending,
     taskOutcomeSeverity,
+    taskPresentation,
     taskSoftStopPending,
     taskStoppedWithSummary,
     taskTerminalPhase,
@@ -176,18 +176,6 @@ function showTaskIncidentToast(msg) {
         shownIncidentToastKeys.delete(oldest);
     }
     showToast(String(msg?.content || msg?.text || incident), 'error');
-}
-
-function showContextFitToast(evt) {
-    if (evt?.checkpoint_kind !== 'context_fit_low_retry') return;
-    const key = `context-fit:${String(evt?.toast_once || `${evt?.task_id || ''}:${evt?.round || ''}`)}`;
-    if (shownIncidentToastKeys.has(key)) return;
-    shownIncidentToastKeys.add(key);
-    if (shownIncidentToastKeys.size > 500) {
-        const oldest = shownIncidentToastKeys.values().next().value;
-        shownIncidentToastKeys.delete(oldest);
-    }
-    showToast('Context exceeded this route. Retrying the same model once with the task-local Low view.', 'warn');
 }
 
 function getOrCreateChatSessionId() {
@@ -634,7 +622,6 @@ export function createChatInstance({
         if (REUSABLE_TASK_IDS.has(id)) concludedDirectActivities.delete(id);
         else recordConcludedActivity(id);
     }
-    let lastTerminalAttention = false;
     // Finished task ids hidden from routine syncs until reload/reconnect rebuilds history.
     const retiredTaskIds = new Set();
     // The owner's last main-chat request, handed to the next live card it spawns so a
@@ -1825,17 +1812,6 @@ export function createChatInstance({
         }
     }
 
-    function formatLiveCardPhaseLabel(phase) {
-        if (phase === 'thinking') return 'Thinking';
-        if (phase === 'working') return 'Working';
-        if (phase === 'done') return 'Done';
-        if (phase === 'cancelled') return 'Cancelled';
-        if (phase === 'warn') return 'Notice';
-        if (phase === 'error' || phase === 'timeout' || phase === 'lifecycle_error') return 'Issue';
-        if (!phase) return 'Working';
-        return phase.charAt(0).toUpperCase() + phase.slice(1);
-    }
-
     function setLiveCardExpanded(record, expanded) {
         const mutate = () => {
             if (!record?.root) return;
@@ -2175,19 +2151,19 @@ export function createChatInstance({
             record.lastHumanHeadline = headline;
         }
 
-        const shouldPromote =
-            Boolean(summary.promote)
-            || !record.lastHumanHeadline
-            || record.finished;
+        const shouldPromote = Boolean(summary.promote) || record.finished;
         const activeHeadline = shouldPromote
             ? headline
-            : (record.lastHumanHeadline || headline);
+            : (record.lastHumanHeadline
+                || (record.updates > 1 ? record.titleEl.textContent : '')
+                || 'Working...');
         const activePhase = record.finished
             ? (summary.phase || 'done')
             : (shouldPromote ? (summary.phase || 'working') : (record.phaseEl.dataset.phase || 'working'));
 
         record.phaseEl.dataset.phase = activePhase;
-        record.phaseEl.textContent = formatLiveCardPhaseLabel(activePhase);
+        const chipPhase = record.finished ? activePhase : 'working';
+        record.phaseEl.textContent = taskPresentation({}, chipPhase).headline;
         record.phaseEl.className = `chat-live-phase ${activePhase}`;
         // Sticky hold: post-task frames must not repaint "Working".
         if (record.finalizingHold && !record.finished && !record.cancelPendingPolicy) {
@@ -2329,16 +2305,10 @@ export function createChatInstance({
                 scheduleHistorySync();
             }
             syncLiveCardToggle(record);
-            if (drivesComposerStatus) {
-                lastTerminalAttention = (summary.phase === 'error' || summary.phase === 'timeout');
-                syncChatStatus();
-            }
+            if (drivesComposerStatus) syncChatStatus();
         } else {
             setLiveCardTypingVisible(record, true);
-            if (drivesComposerStatus) {
-                lastTerminalAttention = false;
-                syncChatStatus();
-            } else if (!hasActiveLiveCard()) {
+            if (drivesComposerStatus || !hasActiveLiveCard()) {
                 syncChatStatus();
             }
         }
@@ -2367,10 +2337,14 @@ export function createChatInstance({
         // keeps the set from accumulating every task id of a long session (P3).
         cancelableTaskIds.delete(record.groupId);
         syncCancelRunButton(record);
-        const activePhase = ['error', 'timeout', 'warn', 'cancelled'].includes(phase) ? phase : 'done';
+        const presentation = taskPresentation({}, phase || 'done');
+        const activePhase = presentation.phase;
         record.phaseEl.dataset.phase = activePhase;
-        record.phaseEl.textContent = formatLiveCardPhaseLabel(activePhase);
+        record.phaseEl.textContent = presentation.headline;
         record.phaseEl.className = `chat-live-phase ${activePhase}`;
+        if (!record.suggestedName && !record.lastHumanHeadline) {
+            record.titleEl.textContent = presentation.headline;
+        }
         setLiveCardTypingVisible(record, false);
         markTaskComplete(record.groupId, activePhase);
         if (!wasFinished) {
@@ -2381,7 +2355,6 @@ export function createChatInstance({
         }
         syncLiveCardToggle(record);
         if (activeLiveGroupId === record.groupId) activeLiveGroupId = '';
-        lastTerminalAttention = (activePhase === 'error' || activePhase === 'timeout');
         syncChatStatus();
     }
 
@@ -2409,31 +2382,20 @@ export function createChatInstance({
             markAssistantReply(taskId);
             return;
         }
-        const record = liveCardRecords.get(taskId);
-        const reasonCode = msg?.reason_code ? String(msg.reason_code) : '';
-        const severity = taskOutcomeSeverity(msg || {});
-        const terminalPhase = taskTerminalPhase(msg || {});
-        const failedResult = severity === 'error';
+        const presentation = taskPresentation(msg || {});
         // P5: a cancelled root says "Cancelled", never a generic "Done" headline.
         // №8/Q3: an owner-requested soft stop is a SUCCESS — its own headline,
         // never warn-styled, with the owner-request marker in the details.
         const softStopped = taskStoppedWithSummary(msg || {});
-        const doneHeadline = severity === 'cancelled'
-            ? 'Cancelled'
-            : (failedResult && reasonCode
-                ? `Done: ${reasonCode}`
-                : (softStopped
-                    ? OWNER_STOP_DONE_HEADLINE
-                    : (severity === 'warn'
-                        ? (reasonCode ? `Finished with warnings: ${reasonCode}` : 'Finished with warnings')
-                        : ((record && record.lastHumanHeadline) || 'Done'))));
         const softStopDetail = softStopped ? OWNER_STOP_DETAIL_MARKER : '';
+        const reasonDetail = !softStopped && msg?.reason_code
+            ? `Reason: ${String(msg.reason_code)}` : '';
         applyLiveCardState(
             {
-                phase: terminalPhase,
-                headline: doneHeadline,
-                body: [softStopDetail, reviewDetails].filter(Boolean).join('\n'),
-                visible: Boolean(softStopDetail || reviewDetails),
+                phase: presentation.phase,
+                headline: presentation.headline,
+                body: [softStopDetail, reasonDetail, reviewDetails].filter(Boolean).join('\n'),
+                visible: Boolean(softStopDetail || reasonDetail || reviewDetails),
                 human: false,
                 promote: true,
                 terminal: true,
@@ -2445,7 +2407,7 @@ export function createChatInstance({
             `task_done|${taskId}`,
             { suppressDomInsert, rawTs },
         );
-        finishLiveCard(taskId, terminalPhase);
+        finishLiveCard(taskId, presentation.phase);
         scheduleTaskUiCleanup(taskState);
     }
 
@@ -2730,7 +2692,6 @@ export function createChatInstance({
 
     function updateLiveCardFromLogEvent(evt) {
         if (!evt || !isGroupedTaskEvent(evt)) return;
-        showContextFitToast(evt);
         if (registerEphemeralDecisionFrame(evt)) return;
         const taskId = getLogTaskGroupId(evt) || activeLiveGroupId || '';
         if (!taskId) return;
@@ -4039,7 +4000,6 @@ export function createChatInstance({
             activeManagedCount: managedActive,
             queuedManagedCount: managedQueued,
             pendingSubmissionsCount: pendingSubmissions.size,
-            lastTerminalAttention,
         });
     }
 
@@ -4080,7 +4040,6 @@ export function createChatInstance({
         if (meta.clientMessageId) {
             pendingSubmissions.delete(meta.clientMessageId);
         }
-        lastTerminalAttention = false;
         syncChatStatus();
     }
 
