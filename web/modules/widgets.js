@@ -630,7 +630,7 @@ const widgetSessionState = new Map();
 let widgetsWsBridgeBound = false;
 export const WIDGET_FRAME_DEFAULT_HEIGHT = 320;
 export const WIDGET_FRAME_MAX_HEIGHT = 8192;
-const WIDGET_FRAME_BORDER_RESERVE = 2;
+export const WIDGET_FRAME_BORDER_RESERVE = 2;
 function boundedNumber(value, fallback, min, max) {
     const parsed = Number(value);
     const safe = Number.isFinite(parsed) ? parsed : fallback;
@@ -1274,7 +1274,11 @@ async function mountTab(card, tab, mountSignal = null) {
         const autoHeight = render.height === undefined || render.height === null;
         const maxHeight = frameMaxHeight(render);
         const bridge = moduleBridgeScript(nonce);
-        const resizeBridge = autoHeight ? moduleResizeScript(nonce) : '';
+        const resizeBridge = autoHeight
+            ? moduleResizeScript(
+                nonce, WIDGET_FRAME_DEFAULT_HEIGHT, maxHeight, WIDGET_FRAME_BORDER_RESERVE,
+            )
+            : '';
         const srcdoc = `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body><div id="root"></div><script>${bridge}</script><script>${resizeBridge}</script><script>${escapeScript(moduleSource)}</script></body></html>`;
         mount.innerHTML = `<iframe class="widgets-frame" sandbox="allow-scripts" srcdoc="${escapeHtml(srcdoc)}"></iframe>`;
         const iframe = mount.querySelector('iframe');
