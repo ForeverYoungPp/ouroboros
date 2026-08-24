@@ -1099,8 +1099,11 @@ def _record_from_dict(d: Dict[str, Any]) -> AdvisoryRunRecord:
 
 
 def _malformed_roster_row(surface: str) -> Dict[str, Any]:
+    from ouroboros.review_dispatch import slot_id_for_row
+
+    prefix = "custody_lost_scope_slot" if surface == "scope_review" else "custody_lost_slot"
     return {
-        "slot_id": f"__custody_lost_{surface}_container",
+        "slot_id": slot_id_for_row(0, prefix=prefix),
         "status": "error",
         "error": "durable review roster container is malformed",
         "operation_state": "custody_lost",

@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List
 
 from ouroboros.deadline_utils import review_operation_timeout_sec
 from ouroboros.observability import new_call_id
+from ouroboros.review_dispatch import slot_id_for_row
 from ouroboros.utils import emit_cognitive_operation_event
 
 log = logging.getLogger("review_custody")
@@ -52,7 +53,16 @@ def _custody_lost_row(
 ) -> Dict[str, Any]:
     lost = copy.deepcopy(row) if isinstance(row, dict) else {}
     if not str(lost.get("slot_id") or lost.get("slot") or ""):
-        lost["slot_id"] = f"__custody_lost_{surface}_{index}"
+        try:
+            position = int(index) + 1
+        except (TypeError, ValueError):
+            position = 0
+        prefix = (
+            "custody_lost_scope_slot"
+            if surface == "scope_review"
+            else "custody_lost_slot"
+        )
+        lost["slot_id"] = slot_id_for_row(position, prefix=prefix)
     lost.setdefault("status", "error")
     lost.setdefault("error", reason)
     lost["operation_state"] = "custody_lost"
@@ -110,9 +120,10 @@ def prepare_frozen_review_reconciliation(usage_ctx: Any, attempt: Any) -> None:
     scope = _freeze_roster_rows(usage_ctx, "scope_review", scope_input)
     frozen = {"multi_model_review": triad, "scope_review": scope}
     if not triad and not scope:
-        triad["__custody_lost_multi_model_review_empty"] = _custody_lost_row(
+        empty_row = _custody_lost_row(
             "multi_model_review", "empty", "review roster is empty",
         )
+        triad[str(empty_row["slot_id"])] = empty_row
         setattr(usage_ctx, "_review_custody_lost", True)
     setattr(usage_ctx, "_review_frozen_rows", frozen)
     setattr(usage_ctx, "_review_frozen_scope_raw", scope_wrapper)
