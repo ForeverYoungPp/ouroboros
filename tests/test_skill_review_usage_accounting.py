@@ -225,6 +225,12 @@ def test_api_token_normalization_preserves_missing_zero_and_body_error_contracts
     assert cache_only["prompt_tokens"] is None and cache_only["cached_tokens"] == 7
     assert cost is None and final is False
 
+    generic_mixed, cost, final = ua.usage_from_response({
+        "usage": {"input_tokens": 100, "cached_tokens": 40},
+    })
+    assert generic_mixed["prompt_tokens"] == 100 and generic_mixed["cached_tokens"] == 40
+    assert cost is None and final is False
+
     anthropic, cost, final = ua.usage_from_response({
         "usage": {"input_tokens": 3, "cache_read_input_tokens": 7},
     })
@@ -247,6 +253,15 @@ def test_api_token_normalization_preserves_missing_zero_and_body_error_contracts
         "error": {"code": 429, "message": "rate limited"}, "usage": None,
     })
     assert (rejected["prompt_tokens"], rejected["completion_tokens"]) == (0, 0)
+    assert cost == 0.0 and final is True
+
+    rejected_cache, cost, final = ua.usage_from_response({
+        "error": {"code": 429}, "usage": {"cached_tokens": 7},
+    })
+    assert (
+        rejected_cache["prompt_tokens"], rejected_cache["completion_tokens"],
+        rejected_cache["cached_tokens"],
+    ) == (0, 0, 0)
     assert cost == 0.0 and final is True
 
 
