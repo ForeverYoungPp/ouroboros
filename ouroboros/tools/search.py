@@ -177,6 +177,32 @@ def _available_web_search_backends() -> list[str]:
     return backends
 
 
+def _web_search_backend_pin() -> str:
+    return (os.environ.get("OUROBOROS_WEBSEARCH_BACKEND") or "").strip().lower()
+
+
+def _web_search_outer_timeout_sec() -> int:
+    """Cover every configured paid leg while preserving the legacy floor."""
+    from ouroboros.config import get_finalization_grace_sec, get_websearch_timeout_sec
+
+    pinned = _web_search_backend_pin()
+    if pinned == "openai":
+        attempts = 2
+    elif pinned in {"openrouter", "anthropic"}:
+        attempts = 1
+    elif pinned == "ddgs":
+        attempts = 0
+    else:
+        backends = set(_available_web_search_backends())
+        attempts = 2 * ("openai_responses" in backends)
+        attempts += "openrouter_server_tool" in backends
+        attempts += "anthropic_server_tool" in backends
+    return max(
+        600,
+        int(max(2, attempts) * get_websearch_timeout_sec() + get_finalization_grace_sec()),
+    )
+
+
 def _emit_simple_usage(
     ctx: ToolContext,
     *,
@@ -382,7 +408,7 @@ def _web_search(
     # contaminating the "single fixed model" claim). 'openai' pins the OpenAI leg only
     # (no cascade — see _fallbacks). 'auto'/'' keep the default OpenAI-first cascade
     # below. This is a config gate on TRANSPORT, not on agent behaviour (P5-safe).
-    pinned = (os.environ.get("OUROBOROS_WEBSEARCH_BACKEND") or "").strip().lower()
+    pinned = _web_search_backend_pin()
     if pinned in ("ddgs", "openrouter", "anthropic"):
         try:
             if pinned == "ddgs":
@@ -445,9 +471,8 @@ def _web_search(
         from openai import OpenAI
         from ouroboros.config import get_finalization_grace_sec
         transport_timeout = _web_search_transport_timeout(ctx)
-        # Explicit transport timeout (v6.54.3, D): without it the streaming SDK
-        # call had NO client bound, so the ToolEntry 540s outer thread-kill was
-        # the only stop for a wedged stream.
+        # Explicit per-attempt transport bound; the outer ToolEntry covers the
+        # configured paid cascade rather than acting as the socket timeout.
         client = OpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -625,8 +650,6 @@ def _web_search(
 
 
 def get_tools() -> List[ToolEntry]:
-    from ouroboros.config import get_finalization_grace_sec, get_websearch_timeout_sec
-
     backends = _available_web_search_backends()
     backend_note = ", ".join(backends) if backends else "unavailable (no key/backend configured)"
     return [
@@ -654,8 +677,5 @@ def get_tools() -> List[ToolEntry]:
                 "reasoning_effort": {"type": "string", "enum": ["low", "medium", "high"],
                                      "description": f"Reasoning effort (default: {DEFAULT_REASONING_EFFORT})"},
             }, "required": ["query"]},
-        }, _web_search, timeout_sec=max(
-            600,
-            int(2.0 * get_websearch_timeout_sec() + get_finalization_grace_sec()),
-        )),
+        }, _web_search, timeout_sec=_web_search_outer_timeout_sec()),
     ]

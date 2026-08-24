@@ -3428,15 +3428,6 @@ def _handle_forced_finalization(ctx: _RoundLimitContext, reason: str) -> Tuple[s
     if reason_lines and reason_lines[0].strip() == REASON_OWNER_REQUESTED_FINALIZATION:
         return _handle_owner_stop_finalization(ctx, str(reason))
     fallback = f"⚠️ Task reached {reason or 'deadline'}; finalization grace produced no answer."
-    if ctx.deadline_ts is not None and time.time() >= float(ctx.deadline_ts):
-        llm_trace = ctx.llm_trace if isinstance(ctx.llm_trace, dict) else {}
-        _finalize_forced_services(ctx, llm_trace)
-        ctx.accumulated_usage.update(
-            execution_status="failed", reason_code="finalization_grace")
-        return _forced_fallback_result(
-            ctx, llm_trace, fallback, "finalization_grace",
-            source="finalization_grace_window_elapsed",
-        )
     prompt = (
         f"[FINALIZE_NOW] The supervisor opened a finalization grace window (reason: {reason or 'deadline'}). "
         "The task will be stopped shortly. Produce your best final answer NOW from the verified "
@@ -3567,6 +3558,7 @@ def _maybe_deadline_local_finalize(
     deadline = parse_deadline_ts(meta.get("deadline_at"))
     if deadline is None:
         return None
+    ctx.deadline_ts = deadline.timestamp()
     remaining = (deadline - utc_now()).total_seconds()
     # v6.55.0: the plain finalization GRACE emit-window (task_pacing SSOT), NOT
     # the pct reserve — this path fires just before the kill to emit one answer,
@@ -5481,6 +5473,12 @@ def _forced_final_answer(
     live_trace = getattr(ctx, "llm_trace", None)
     llm_trace = live_trace if isinstance(live_trace, dict) else {}
     _finalize_forced_services(ctx, llm_trace)
+    if ctx.deadline_ts is not None and time.time() >= float(ctx.deadline_ts):
+        ctx.accumulated_usage.update(execution_status="failed", reason_code=reason_code)
+        return _forced_fallback_result(
+            ctx, llm_trace, fallback_text, reason_code,
+            source=f"{reason_code}_window_elapsed",
+        )
     router_result = _forced_swarm_router_result(ctx, llm_trace, reason_code)
     if router_result is not None:
         return router_result

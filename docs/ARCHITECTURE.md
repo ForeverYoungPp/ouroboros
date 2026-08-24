@@ -1976,7 +1976,10 @@ answer before the same retry identity can dispatch again. Send-time VLM
 captioning keeps its separate 90-second provider cap (narrowed further by the
 owner deadline and finalization reserve), Anthropic's direct route keeps its
 120-second provider default, and neither value is used as a generic
-review-reasoning cutoff. A delegated poll that loses transport after a run id
+review-reasoning cutoff. A spent owner window yields a typed `$0
+not_dispatched` row before fan-out; under blocking enforcement an in-flight
+triad row remains pending instead of becoming a final quorum verdict. A
+delegated poll that loses transport after a run id
 exists preserves the exact durable invocation for retry custody; it does not
 cancel an otherwise healthy unknown run or create a second one.
 
@@ -2432,7 +2435,7 @@ Runtime floors:
 | OUROBOROS_MODEL_LIGHT | openai/gpt-5.6-luna | Fast/cheap model for safety, compact routing and lightweight helper calls; it may seed the default Fast scout API actor. Empty means use `OUROBOROS_MODEL`. It never forces a session nanny's cognitive route. |
 | OUROBOROS_MODEL_VISION | "" | Vision/caption model slot for send-time image captioning and VLM helpers. Empty means use `OUROBOROS_MODEL` for normal remote routes; local/blind routes require an explicit reachable vision slot for caption fallback. Legacy `OUROBOROS_VISION_MODEL` settings migrate here. |
 | OUROBOROS_IMAGE_INPUT_MODE | auto | Image routing mode for model calls: `auto` keeps inline images for vision-capable active models and captions for blind models; `caption` always replaces image blocks with text captions; `inline` sends pixels only when supported; `off` replaces images with placeholders. |
-| OUROBOROS_VISION_CAPTION_TIMEOUT_SEC | 90 | Provider timeout for send-time image caption sub-calls (`vision_routing.py`); keeps caption fallback from occupying the main loop indefinitely. |
+| OUROBOROS_VISION_CAPTION_TIMEOUT_SEC | 90 | Provider and killable-child ceiling for send-time captions and explicit VLM helper calls. Their ToolEntry outer envelope is built from the same setting, then all nested waits narrow to the owner deadline/finalization reserve. |
 | OUROBOROS_MODEL_CONSCIOUSNESS | "" | Background Consciousness model slot. Empty means use `OUROBOROS_MODEL`; do not silently downgrade this lane to the light model or a smaller context as a cost optimization |
 | OUROBOROS_MODEL_FALLBACKS | openai/gpt-5.6-luna | Comma-separated cross-model fallback chain tried when the primary returns no usable response (429-aware cooldown, deduped, active model dropped; a run pinning all slots to one model dedupes to a no-op). (Renamed from `OUROBOROS_MODEL_FALLBACK`; stored/legacy values migrate.) |
 | OUROBOROS_MODEL_MAX_CONCURRENCY | 3 | (v6.40) Max CONCURRENT provider calls per (model, use_local) route; excess worker threads wait (deadline-bounded) instead of storming one model's rate limit (self-DoS guard, `ouroboros/model_concurrency.py`). <=0 disables. Default-on, fail-soft |

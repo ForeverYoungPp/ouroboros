@@ -29,6 +29,9 @@ class ReviewActorRecord:
     slot_id: str = ""  # the id the row physically ran under, carried not re-derived
     prompt_ref: Dict[str, Any] = field(default_factory=dict)
     response_ref: Dict[str, Any] = field(default_factory=dict)
+    operation_id: str = ""
+    operation_state: str = "settled"
+    late_result_pending: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         # The durable id is the one the review substrate actually ran this row
@@ -54,6 +57,9 @@ class ReviewActorRecord:
             "slot_id": self.slot_id or (slot_id_for_row(self.slot) if self.slot else ""),
             "prompt_ref": dict(self.prompt_ref),
             "response_ref": dict(self.response_ref),
+            "operation_id": self.operation_id,
+            "operation_state": self.operation_state,
+            "late_result_pending": self.late_result_pending,
         }
 
 
@@ -102,6 +108,9 @@ def _actor_record(
         slot_id=str(actor.get("slot_id") or ""),
         prompt_ref=dict(actor.get("prompt_ref") or {}),
         response_ref=dict(actor.get("response_ref") or {}),
+        operation_id=str(actor.get("operation_id") or ""),
+        operation_state=str(actor.get("operation_state") or "settled"),
+        late_result_pending=bool(actor.get("late_result_pending")),
     )
 
 
@@ -332,6 +341,12 @@ def parse_model_review_results(
         model = str(actor.get("model") or actor.get("request_model") or "").strip()
         raw_text = str(actor.get("text") or "")
         model_label = model or "reviewer"
+        if str(actor.get("operation_state") or "") == "not_dispatched":
+            records.append(_actor_record(
+                actor, idx=idx, model_label=model_label,
+                status="not_dispatched", raw_text=raw_text,
+            ))
+            continue
         if str(actor.get("verdict") or "").upper() == "ERROR":
             records.append(_actor_record(actor, idx=idx, model_label=model_label, status="error", raw_text=raw_text))
             continue

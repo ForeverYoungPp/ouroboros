@@ -265,9 +265,9 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # then fail-closed blocks a benign command. Registered numeric SSOT (no inline literals).
     "OUROBOROS_SAFETY_MAX_TOKENS": 2000,
     "OUROBOROS_SAFETY_CALL_TIMEOUT_SEC": 60,
-    # v6.54.3 transport-timeout SSOT (deadline package D). web_search: 480 keeps the
-    # transport failure messaged below the ToolEntry 540s outer thread-kill cap. LLM
-    # no_proxy read/write floor: 2700 leaves headroom for long silent reasoning without
+    # v6.54.3 transport-timeout SSOT (deadline package D). web_search: 480 is one
+    # provider-attempt bound; the ToolEntry envelope derives the configured paid
+    # cascade. LLM no_proxy: 2700 leaves room for long silent reasoning without
     # pinning a worker on a dead socket.
     "OUROBOROS_WEBSEARCH_TIMEOUT_SEC": 480,
     "OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC": 2700,

@@ -133,7 +133,7 @@ def run_custodied_review_slots(
     task_id: str,
     usage_meta: Dict[str, Any],
     review_usage_scope: Any,
-    run_slot: Callable[[Any, str, Dict[str, Any]], Any],
+    run_slot: Callable[[Any, str, Dict[str, Any], float], Any],
     error_actor: Callable[..., Any],
 ) -> List[Any]:
     """Run slots with independent logical windows and late-result custody."""
@@ -143,6 +143,7 @@ def run_custodied_review_slots(
     slot_entries: Dict[str, ActiveReviewAttempt] = {}
     slot_deadlines: Dict[str, float] = {}
     slot_windows: Dict[str, float] = {}
+    immediate_actors: Dict[str, Any] = {}
     paid_stamped = False
 
     def settle(entry: ActiveReviewAttempt, slot: Any, actor: Any) -> None:
@@ -203,9 +204,13 @@ def run_custodied_review_slots(
     def start(slot: Any) -> None:
         nonlocal paid_stamped
         key = _attempt_key(request, slot)
+        slot_id = str(getattr(slot, "slot_id", "") or "")
+        window = _logical_timeout(slot, request, usage_meta)
+        slot_windows[slot_id] = window
+        slot_deadlines[slot_id] = time.monotonic() + window
         with _ACTIVE_LOCK:
             pending_attempts = getattr(usage_ctx, "_review_pending_invocations", None)
-            retry_state = pending_attempts.pop(key, {}) if isinstance(pending_attempts, dict) else {}
+            retry_state = pending_attempts.get(key, {}) if isinstance(pending_attempts, dict) else {}
             settled = getattr(usage_ctx, "_review_settled_attempts", None)
             cached_actor = settled.get(key) if isinstance(settled, dict) else None
             if cached_actor is not None:
@@ -222,7 +227,7 @@ def run_custodied_review_slots(
                     actor=cached_actor,
                 )
                 entry.event.set()
-            elif entry is None:
+            elif entry is None and window > 0:
                 entry = ActiveReviewAttempt(
                     key=key,
                     operation_id=new_call_id(
@@ -230,10 +235,23 @@ def run_custodied_review_slots(
                     ),
                 )
                 _ACTIVE[key] = entry
-        slot_id = str(getattr(slot, "slot_id", "") or "")
+                if isinstance(pending_attempts, dict):
+                    pending_attempts.pop(key, None)
+        if entry is None:
+            immediate_actors[slot_id] = error_actor(
+                slot, "Owner deadline exhausted before physical review dispatch",
+                "", "not_dispatched",
+            )
+            return
         slot_entries[slot_id] = entry
-        slot_windows[slot_id] = _logical_timeout(slot, request, usage_meta)
-        slot_deadlines[slot_id] = time.monotonic() + slot_windows[slot_id]
+        if window <= 0 and cached_actor is None:
+            with _ACTIVE_LOCK:
+                entry.timed_out = True
+            immediate_actors[slot_id] = error_actor(
+                slot, "Owner deadline exhausted while the physical review remains in flight",
+                entry.operation_id, "in_flight",
+            )
+            return
         if owner:
             if not paid_stamped and not retry_state:
                 from ouroboros.review_dispatch import stamp_review_paid_on_dispatch
@@ -247,7 +265,10 @@ def run_custodied_review_slots(
                 )
                 try:
                     with usage_scope(review_usage_scope):
-                        actor = run_slot(slot, entry.operation_id, retry_state)
+                        actor = run_slot(
+                            slot, entry.operation_id, retry_state,
+                            slot_deadlines[slot_id],
+                        )
                 except Exception as exc:
                     actor = error_actor(
                         slot, f"{type(exc).__name__}: {exc}", entry.operation_id,
@@ -279,8 +300,11 @@ def run_custodied_review_slots(
     for slot in slots:
         start(slot)
 
-    actors: List[Any] = []
-    pending = {str(getattr(slot, "slot_id", "") or "") for slot in slots}
+    actors: List[Any] = list(immediate_actors.values())
+    pending = {
+        str(getattr(slot, "slot_id", "") or "") for slot in slots
+        if str(getattr(slot, "slot_id", "") or "") not in immediate_actors
+    }
     while pending:
         now = time.monotonic()
         expired = {slot_id for slot_id in pending if slot_deadlines[slot_id] <= now}

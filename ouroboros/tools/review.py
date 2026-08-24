@@ -379,12 +379,7 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
 
 
 def _review_output_budget() -> int:
-    """Reviewer response reservation (default 65536). `OUROBOROS_REVIEW_MAX_TOKENS`
-    lets an operator LOWER it when a mega-diff's input pack plus the default
-    output reservation exceeds a reviewer endpoint's context cap (input + output
-    must fit; a verdict needs ~10K tokens, so shrinking the reservation preserves
-    FULL review input context instead of trimming evidence). Floor 8192 so the
-    knob can never squeeze a verdict into uselessness; never raises the default."""
+    """Bound reviewer output to 8192..65536 while preserving full input."""
     try:
         raw = int(os.environ.get("OUROBOROS_REVIEW_MAX_TOKENS", "") or 65536)
     except (TypeError, ValueError):
@@ -592,9 +587,8 @@ def _parse_model_response(model: str, result, headers_dict) -> dict:
     usage = result.get("usage", {}) if isinstance(result, dict) else {}
     resolved_model = str(usage.get("resolved_model") or model)
     provider = str(usage.get("provider") or "openrouter")
-    # Row identity travels with the envelope on EVERY branch — success, transport
-    # error, malformed body — so no consumer has to guess it back from position.
     slot_id = str(result.get("slot_id") or "") if isinstance(result, dict) else ""
+    operation_fields = _review_operation_fields(result if isinstance(result, dict) else {})
     if isinstance(result, str) or (isinstance(result, dict) and result.get("error")):
         return {
             "model": resolved_model, "request_model": model,
@@ -602,6 +596,7 @@ def _parse_model_response(model: str, result, headers_dict) -> dict:
             "text": result if isinstance(result, str) else str(result.get("error") or ""),
             "tokens_in": 0, "tokens_out": 0, "cost_estimate": None,
             "slot_id": slot_id,
+            **operation_fields,
             "prompt_ref": result.get("prompt_ref", {}) if isinstance(result, dict) else {},
             "response_ref": result.get("response_ref", {}) if isinstance(result, dict) else {},
         }
@@ -663,6 +658,7 @@ def _parse_model_response(model: str, result, headers_dict) -> dict:
         "prompt_cache_ttl": prompt_cache_ttl,
         "cost_estimate": cost,
         "slot_id": slot_id,
+        **operation_fields,
         "prompt_ref": result.get("prompt_ref", {}) if isinstance(result, dict) else {},
         "response_ref": result.get("response_ref", {}) if isinstance(result, dict) else {},
     }
@@ -1486,8 +1482,6 @@ def _dispatch_unified_review(ctx: ToolContext, commit_message: str, prepared: di
     model_results = result.get("results", [])
     if not model_results:
         ctx._last_review_block_reason = "infra_failure"
-        # Withheld Q28-A not_dispatched seat records survive an empty panel —
-        # their merge point (_collect_review_findings) is never reached here.
         if getattr(ctx, "_triad_withheld_seat_records", None):
             ctx._last_triad_raw_results = list(ctx._triad_withheld_seat_records)
         blocked_msg = ("⚠️ REVIEW_BLOCKED: Review returned no results from any "
@@ -1499,11 +1493,19 @@ def _dispatch_unified_review(ctx: ToolContext, commit_message: str, prepared: di
     critical_fails, advisory_warns, errored_models, _triad_raw = _collect_review_findings(ctx, model_results)
     models_total = len(model_results)
 
-    # Quorum counts only parseable responded actors, not errors/parse failures.
     triad_raw = getattr(ctx, "_last_triad_raw_results", []) or []
+    pending_models = [r.get("model_id", "reviewer") for r in triad_raw if r.get("late_result_pending")]
+    if pending_models:
+        ctx._last_review_block_reason = "review_late_result_pending"
+        blocked_msg = ("⚠️ REVIEW_PENDING: Physical review operation(s) remain in flight: "
+                       f"{', '.join(pending_models)}. Retry the same commit to reconcile them without a blind paid resend.")
+        pending_block = _handle_review_block_or_warning(
+            ctx, blocking_review, blocked_msg,
+            "Review enforcement=Advisory: pending review work did not block commit. ",
+        )
+        if pending_block is not None:
+            return pending_block
     successful_reviewers = sum(1 for r in triad_raw if r.get("status") == "responded")
-    # Non-successful actors are shown for transport/parse diagnostics; a
-    # not_dispatched seat (Q28-A drop) never ran, so it is not a FAILED actor.
     failed_actors = [
         r["model_id"] for r in triad_raw
         if r.get("status") not in ("responded", "not_dispatched")]

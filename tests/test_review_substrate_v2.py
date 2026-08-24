@@ -1678,6 +1678,79 @@ def test_review_substrate_persists_timeout_actor_refs(tmp_path):
     assert actor["response_ref"]["manifest_ref"]["path"]
 
 
+def test_spent_owner_deadline_does_not_dispatch_a_review_worker(tmp_path):
+    calls = []
+    paid = []
+
+    class NeverCalledLLM:
+        def chat(self, **_kwargs):
+            calls.append(1)
+            raise AssertionError("review transport dispatched after owner deadline")
+
+    ctx = SimpleNamespace(
+        task_id="spent-review", task_attempt=1, task_metadata={},
+        event_queue=None, pending_events=[],
+        _review_paid_stamp=lambda: paid.append(1),
+    )
+    result = run_review_request(
+        ReviewRequest(
+            surface="scope", goal="review", task_id="spent-review",
+            deadline_at="2000-01-01T00:00:00Z",
+        ),
+        slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=300)],
+        drive_root=tmp_path, llm=NeverCalledLLM(), usage_ctx=ctx,
+    )
+
+    actor = result.actors[0]
+    assert calls == [] and paid == []
+    assert actor["status"] == "not_dispatched"
+    assert actor["operation_state"] == "not_dispatched"
+    assert actor["operation_id"] == ""
+    assert actor["late_result_pending"] is False
+
+
+def test_review_worker_does_not_retry_after_its_logical_deadline(tmp_path):
+    import threading
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
+
+    calls = []
+    first_finished = threading.Event()
+
+    class LateTransportFailure:
+        def chat(self, **_kwargs):
+            calls.append(1)
+            time.sleep(0.05)
+            first_finished.set()
+            raise TimeoutError("late transport failure")
+
+    ctx = SimpleNamespace(
+        task_id="late-failure", task_attempt=1, task_metadata={},
+        event_queue=None, pending_events=[],
+    )
+    request = ReviewRequest(
+        surface="multi_model_review", goal="review", task_id="late-failure",
+        task_attempt=1,
+    )
+    slot = ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.01)
+    result = run_review_request(
+        request, slots=[slot], drive_root=tmp_path,
+        llm=LateTransportFailure(), usage_ctx=ctx,
+    )
+    assert result.actors[0]["operation_state"] == "in_flight"
+    assert first_finished.wait(1.0)
+
+    key = _attempt_key(request, slot)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        with _ACTIVE_LOCK:
+            active = key in _ACTIVE
+        if not active:
+            break
+        time.sleep(0.01)
+    assert not active
+    assert calls == [1]
+
+
 def test_late_review_result_is_replayed_without_a_second_paid_dispatch(tmp_path):
     import threading
     from types import SimpleNamespace
@@ -1817,7 +1890,7 @@ def test_review_slot_timeout_is_not_used_as_transport_timeout(tmp_path):
     assert captured and captured[0]["timeout"] == 17
 
 
-def test_review_transport_timeout_is_narrowed_by_request_deadline(tmp_path):
+def test_review_transport_timeout_is_narrowed_by_request_deadline(tmp_path, monkeypatch):
     from datetime import datetime, timedelta, timezone
 
     captured = []
@@ -1827,6 +1900,7 @@ def test_review_transport_timeout_is_narrowed_by_request_deadline(tmp_path):
             captured.append(kwargs)
             return {"content": '{"verdict":"PASS","findings":[],"summary":"ok"}'}, {}
 
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "0")
     deadline = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
     run_review_request(
         ReviewRequest(
@@ -1902,7 +1976,10 @@ def test_late_agent_session_failure_is_replayed_without_a_second_run(tmp_path, m
 
     calls = []
 
-    def slow_terminal_failure(self, request, slot, *, operation_id="", retry_state=None):
+    def slow_terminal_failure(
+        self, request, slot, *, operation_id="", retry_state=None,
+        logical_deadline_monotonic=None,
+    ):
         calls.append(operation_id)
         time.sleep(0.03)
         actor = self._error_actor(
@@ -1943,7 +2020,10 @@ def test_late_agent_session_preflight_failure_can_retry(tmp_path, monkeypatch):
 
     calls = []
 
-    def preflight_then_success(self, request, slot, *, operation_id="", retry_state=None):
+    def preflight_then_success(
+        self, request, slot, *, operation_id="", retry_state=None,
+        logical_deadline_monotonic=None,
+    ):
         calls.append(operation_id)
         time.sleep(0.02)
         if len(calls) == 1:
@@ -1986,7 +2066,10 @@ def test_late_unknown_session_start_restores_exact_pending_invocation(tmp_path, 
 
     calls, paid = [], []
 
-    def pending_then_success(self, request, slot, *, operation_id="", retry_state=None):
+    def pending_then_success(
+        self, request, slot, *, operation_id="", retry_state=None,
+        logical_deadline_monotonic=None,
+    ):
         calls.append(dict(retry_state or {}))
         if len(calls) == 1:
             time.sleep(0.02)

@@ -1687,7 +1687,11 @@ Before every commit, verify the following:
   task deadline, budget, cancellation and absolute ceiling still cut through.
   A logical timeout with a live worker is custody/reconciliation-pending, never
   permission for a blind paid retry. Late review results settle the original
-  attempt and remain bound to its retry identity.
+  attempt and remain bound to its retry identity. Once the owner deadline minus
+  finalization reserve is spent, an unstarted review row is a typed `$0
+  not_dispatched` actor: no worker, paid stamp, or active lease is created.
+  A blocking commit attempt cannot treat an in-flight reviewer as a final
+  quorum verdict; advisory enforcement may proceed only with the durable warning.
 - [ ] Cooperative cancellation is used where the existing route supports it
   (delegated sessions); API/thread routes disclose an in-flight custody state
   until their physical result settles. Do not replace this with a keyword or

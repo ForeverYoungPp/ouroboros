@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 
@@ -37,6 +38,56 @@ def test_query_model_timeout_becomes_error_actor(monkeypatch):
     assert prompt["slot"]["slot_id"] == "slot_1"
     assert prompt["slot"]["model"] == "fake/reviewer"
     assert prompt["slot"]["route"] == "api_chat"
+
+    from ouroboros.tools.review import _parse_model_response
+    from ouroboros.triad_review import parse_model_review_results
+
+    flattened = _parse_model_response(model, result, headers)
+    assert flattened["operation_id"] == result["operation_id"]
+    assert flattened["operation_state"] == "in_flight"
+    assert flattened["late_result_pending"] is True
+    [record] = parse_model_review_results({"results": [flattened]}).actor_records
+    assert record.to_dict()["operation_id"] == result["operation_id"]
+    assert record.to_dict()["operation_state"] == "in_flight"
+    assert record.to_dict()["late_result_pending"] is True
+
+
+def test_blocking_triad_does_not_finalize_quorum_with_a_pending_reviewer(monkeypatch, tmp_path):
+    from ouroboros.tools import review
+
+    clean = lambda model: {
+        "model": model, "verdict": "PASS", "text": "[]", "slot_id": model,
+        "operation_id": f"op-{model}", "operation_state": "settled",
+        "late_result_pending": False,
+    }
+    pending = {
+        "model": "m3", "verdict": "ERROR", "text": "Timeout",
+        "slot_id": "m3", "operation_id": "op-m3",
+        "operation_state": "in_flight", "late_result_pending": True,
+    }
+    monkeypatch.setattr(
+        review, "_handle_multi_model_review",
+        lambda *_args, **_kwargs: json.dumps({"results": [clean("m1"), clean("m2"), pending]}),
+    )
+    ctx = SimpleNamespace(
+        _last_triad_raw_results=[], _triad_withheld_seat_records=[],
+        _review_degraded_reasons=[], _review_advisory=[],
+        drive_logs=lambda: tmp_path, task_id="pending-triad",
+    )
+    prepared = {
+        "prompt": "p", "stable_prefix_len": 0,
+        "models": ["m1", "m2", "m3"], "routes": [], "row_plan": {},
+        "session_task": "", "target_repo": tmp_path, "blocking_review": True,
+    }
+
+    blocked = review._dispatch_unified_review(ctx, "message", prepared)
+
+    assert blocked and "REVIEW_PENDING" in blocked
+    assert ctx._last_review_block_reason == "review_late_result_pending"
+    [raw] = [row for row in ctx._last_triad_raw_results if row["model_id"] == "m3"]
+    assert raw["operation_id"] == "op-m3"
+    assert raw["operation_state"] == "in_flight"
+    assert raw["late_result_pending"] is True
 
 
 def test_query_model_uses_configured_review_effort(monkeypatch):

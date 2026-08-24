@@ -1085,8 +1085,9 @@ class ReviewCoordinator:
             task_id=task_id,
             usage_meta=usage_meta,
             review_usage_scope=review_usage_scope,
-            run_slot=lambda slot, operation_id, retry_state: self._run_slot(
+            run_slot=lambda slot, operation_id, retry_state, deadline: self._run_slot(
                 request, slot, operation_id=operation_id, retry_state=retry_state,
+                logical_deadline_monotonic=deadline,
             ),
             error_actor=lambda slot, error, operation_id="", operation_state="settled": self._error_actor(
                 request,
@@ -1281,9 +1282,7 @@ class ReviewCoordinator:
         )
 
     def _custody_drive_root(self) -> pathlib.Path:
-        """Where a DELEGATED slot's custody rows live: the canonical (budget)
-        drive when the usage context names one, else this coordinator's drive.
-        Data handed to the seam once, so the api_chat route never pays for it."""
+        """Return the delegated slot's canonical custody root."""
         ctx = self.usage_ctx
         if ctx is not None and getattr(ctx, "drive_root", None):
             try:
@@ -1303,17 +1302,15 @@ class ReviewCoordinator:
         operation_id: str = "",
         operation_state: str = "settled",
     ) -> ReviewActorRecord:
+        actor_status = "not_dispatched" if operation_state == "not_dispatched" else "error"
         call_id = new_call_id(f"review_{request.surface}_{slot.slot_id}_error")
         base_call_type = request.call_type or f"{request.surface}_review"
         assignment = ReviewAssignment(
             request=request, slot=slot, call_id=call_id, call_type=base_call_type,
             custody_root=self._custody_drive_root(),
         )
-        # The synthetic prompt record is the route's own projection too: a slot
-        # that never started must not build a pack its route would never send.
-        # Best-effort by construction — this is the last-resort record for a slot
-        # that already failed, so a route refusal (or an unrenderable prompt)
-        # must degrade the record, never re-raise inside the failure path.
+        # Best-effort failure evidence uses the route's own projection; a
+        # refusal here must degrade the record, never re-raise.
         try:
             prompt_projection = _review_route_executor(assignment, llm=self.llm).prompt_payload()
         except Exception:
@@ -1338,14 +1335,14 @@ class ReviewCoordinator:
                 call_id=f"{call_id}_error",
                 call_type=f"{base_call_type}_error",
                 payload={"error": sanitize_tool_result_for_log(error)},
-                manifest={"surface": request.surface, "slot_id": slot.slot_id, "model": slot.model, "status": "error", "synthetic": True},
+                manifest={"surface": request.surface, "slot_id": slot.slot_id, "model": slot.model, "status": actor_status, "synthetic": True},
             )
         except Exception:
             response_ref = {}
         return ReviewActorRecord(
             slot_id=slot.slot_id,
             model=slot.model,
-            status="error",
+            status=actor_status,
             error=sanitize_tool_result_for_log(error),
             prompt_ref=prompt_ref,
             response_ref=response_ref,
@@ -1361,6 +1358,7 @@ class ReviewCoordinator:
         *,
         operation_id: str = "",
         retry_state: Optional[Dict[str, Any]] = None,
+        logical_deadline_monotonic: Optional[float] = None,
     ) -> ReviewActorRecord:
         call_id = str(operation_id or new_call_id(f"review_{request.surface}_{slot.slot_id}"))
         base_call_type = request.call_type or f"{request.surface}_review"
@@ -1421,42 +1419,44 @@ class ReviewCoordinator:
             p3_actor = request.surface in {"multi_model_review", "scope_review"}
             acceptance_actor = request.surface == "task_acceptance"
             actor_attempts = 2 if (p3_actor or acceptance_actor) else 1
-            # Acceptance and P3 share the same two-physical-send rail. The
-            # documented contract ("one substantive call and at most two
-            # physical attempts total — same-route transport retry or
-            # extraction/format repair") historically retried only empty/errored
-            # responses; a MALFORMED non-empty acceptance response burned the
-            # actor as DEGRADED without using its second permitted send. The
-            # prompt, slot, and model never change on the repair resend.
+            # Acceptance and P3 share one two-send rail: transport/empty retry
+            # or same-route format repair. The prompt, slot and model stay fixed.
             attempt_rail = (
                 physical_attempt_limit(2)
                 if acceptance_actor or p3_actor
                 else contextlib.nullcontext()
             )
             with attempt_rail:
-                _prior_msg, _prior_usage, _prior_text = None, None, ""
+                _prior_msg, _prior_usage, _prior_text, _has_prior = None, None, "", False
                 for actor_attempt in range(actor_attempts):
+                    if (
+                        actor_attempt and logical_deadline_monotonic is not None
+                        and time.monotonic() >= logical_deadline_monotonic
+                    ):
+                        if _has_prior:
+                            msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
+                            break
+                        raise TimeoutError("Review logical deadline expired before retry dispatch")
                     try:
-                        # The one seam. A null/non-object provider message comes
-                        # back as empty raw_text: retry once on P3, then preserve
-                        # the fail-closed empty actor.
+                        # One seam; a null provider message is an empty actor.
                         attempt = _execute_slot_attempt(
                             assignment, llm=self.llm, executor=executor,
                         )
                         msg, usage, raw_text = attempt.message, attempt.usage, attempt.raw_text
                     except UsageAccountingError:
-                        # Budget/ledger/physical-rail failures are not transport
-                        # transients and must remain fail-closed without another
-                        # send — but when the RAIL blocks the format-repair resend
-                        # (the first send burned both physical attempts on an
-                        # internal transport retry), keep the malformed first
-                        # answer as forensics instead of degrading to a bare error.
+                        # Budget/ledger/rail failures never trigger another send;
+                        # retain a prior malformed answer as forensic evidence.
                         if _prior_text:
                             msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
                             break
                         raise
                     except Exception:
                         if actor_attempt + 1 < actor_attempts:
+                            if (
+                                logical_deadline_monotonic is not None
+                                and time.monotonic() >= logical_deadline_monotonic
+                            ):
+                                raise
                             continue
                         if _prior_text:
                             # The repair RESEND failed (transport, timeout): keep the
@@ -1464,6 +1464,7 @@ class ReviewCoordinator:
                             msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
                             break
                         raise
+                    _prior_msg, _prior_usage, _prior_text, _has_prior = msg, usage, raw_text, True
                     if raw_text.strip():
                         if (
                             acceptance_actor

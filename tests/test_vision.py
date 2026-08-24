@@ -22,6 +22,16 @@ def test_vision_query_with_timeout_returns_without_waiting_for_hung_worker():
     assert time.monotonic() - started < 0.5
 
 
+def test_vlm_tool_envelopes_follow_the_supported_timeout_setting(monkeypatch):
+    from ouroboros.tools.vision import get_tools
+
+    monkeypatch.setenv("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", "1000")
+    by_name = {tool.name: tool for tool in get_tools()}
+    assert by_name["analyze_screenshot"].timeout_sec == 1000
+    assert by_name["vlm_query"].timeout_sec == 1000
+    assert by_name["view_image"].timeout_sec == 30
+
+
 class TestLLMVisionQuery(unittest.TestCase):
     """Test LLMClient.vision_query() message format."""
 

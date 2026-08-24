@@ -74,6 +74,14 @@ def test_nested_logical_window_reserves_finalization_grace():
     assert 0 < value <= 7
 
 
+def test_spent_owner_deadline_has_no_logical_review_window():
+    from ouroboros.deadline_utils import logical_operation_timeout_sec
+
+    assert logical_operation_timeout_sec(
+        300, deadline_at="2000-01-01T00:00:00Z", fallback=2700, reserve_sec=3,
+    ) == 0.0
+
+
 def test_bounded_delegate_poll_passes_remaining_transport_window():
     from ouroboros.delegate_progress import bounded_poll
 
@@ -302,8 +310,7 @@ def test_expired_supervisor_grace_does_not_dispatch_a_paid_final_call(monkeypatc
     )
     monkeypatch.setattr(loop_mod, "_finalize_forced_services", lambda *_args: None)
     monkeypatch.setattr(
-        loop_mod,
-        "_forced_final_answer",
+        loop_mod, "_call_forced_model_once",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("paid final call")),
     )
 
@@ -318,4 +325,34 @@ def test_expired_supervisor_grace_does_not_dispatch_a_paid_final_call(monkeypatc
     assert ctx.accumulated_usage == {
         "execution_status": "failed",
         "reason_code": "finalization_grace",
+    }
+
+
+def test_expired_local_deadline_does_not_dispatch_a_paid_final_call(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    import ouroboros.loop as loop_mod
+
+    ctx = loop_mod._RoundLimitContext(
+        messages=[], llm=object(), active_model="model", active_effort="high",
+        max_retries=1, drive_logs=tmp_path / "logs", task_id="task", round_idx=1,
+        event_queue=None, accumulated_usage={}, task_type="task",
+        active_use_local=False, max_rounds=1, llm_trace={},
+    )
+    tools = SimpleNamespace(_ctx=SimpleNamespace(
+        task_metadata={"deadline_at": "2000-01-01T00:00:00Z"},
+    ))
+    ctx.tools = tools
+    monkeypatch.setattr(loop_mod, "_finalize_forced_services", lambda *_args: None)
+    monkeypatch.setattr(
+        loop_mod, "_call_forced_model_once",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("paid final call")),
+    )
+
+    result = loop_mod._maybe_deadline_local_finalize(ctx, tools)
+
+    assert result is not None
+    assert result[0].startswith("⚠️ Task reached its deadline")
+    assert ctx.accumulated_usage == {
+        "execution_status": "failed",
+        "reason_code": "deadline_local",
     }

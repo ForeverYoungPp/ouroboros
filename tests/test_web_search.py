@@ -244,6 +244,30 @@ def test_provider_owned_search_without_deadline_uses_the_configured_transport_ca
     assert search_module._web_search_transport_timeout(ctx) == 321
 
 
+def test_web_search_outer_envelope_covers_configured_paid_cascade(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "200")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "10")
+    monkeypatch.delenv("OUROBOROS_WEBSEARCH_BACKEND", raising=False)
+    monkeypatch.setitem(sys.modules, "ddgs", None)
+
+    [entry] = [tool for tool in search_module.get_tools() if tool.name == "web_search"]
+    assert entry.timeout_sec == 810  # OpenAI twice + OpenRouter + Anthropic + grace.
+
+
+def test_pinned_web_search_preserves_the_legacy_outer_floor(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_BACKEND", "openrouter")
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "200")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "10")
+
+    [entry] = [tool for tool in search_module.get_tools() if tool.name == "web_search"]
+    assert entry.timeout_sec == 600
+
+
 def test_web_search_falls_back_to_ddgs(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)

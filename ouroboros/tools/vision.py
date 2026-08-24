@@ -784,7 +784,7 @@ def get_tools() -> List[ToolEntry]:
                 },
             },
             handler=_analyze_screenshot,
-            timeout_sec=90,
+            timeout_sec=get_vision_caption_timeout_sec(),
         ),
         ToolEntry(
             name="vlm_query",
@@ -832,7 +832,7 @@ def get_tools() -> List[ToolEntry]:
                 },
             },
             handler=_vlm_query,
-            timeout_sec=90,
+            timeout_sec=get_vision_caption_timeout_sec(),
         ),
         ToolEntry(
             name="view_image",

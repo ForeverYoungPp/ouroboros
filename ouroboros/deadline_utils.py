@@ -175,10 +175,12 @@ def logical_operation_timeout_sec(
         except (TypeError, ValueError):
             reserve = 0.0
         remaining = max(0.0, remaining - reserve)
+        if remaining <= 0:
+            return 0.0
         if explicit_set:
             requested = 1.0 if requested <= 0 else requested
-            return max(0.001, min(requested, remaining))
-        return max(0.001, remaining)
+            return min(requested, remaining)
+        return remaining
     if explicit_set:
         return 1.0 if requested <= 0 else requested
     try:
