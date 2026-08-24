@@ -29,6 +29,34 @@ _SESSION_RETRIEVAL = (
 )
 
 
+def skill_review_session_contract_hash() -> str:
+    """Identity of the route-specific Skill Review session serialization.
+
+    Free replay must lapse when either the retrieval-sized assignment or the
+    generic agent-session prompt wrapper changes.  Keep this separate from the
+    historical API prompt hash so API-only panels retain their exact identity.
+    """
+    try:
+        import hashlib
+        import inspect
+
+        from ouroboros.review_execution import AgentSessionReviewExecutor
+
+        getter = AgentSessionReviewExecutor.session_prompt.fget
+        if getter is None:
+            return ""
+        parts = (
+            _SINGLE_CONTENT,
+            _SESSION_RETRIEVAL,
+            inspect.getsource(run_skill_review_passes),
+            inspect.getsource(AgentSessionReviewExecutor._output_contract),
+            inspect.getsource(getter),
+        )
+        return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+    except Exception:
+        return ""  # unknown contract never matches (fail-open toward paying)
+
+
 def run_skill_review_passes(
     ctx: Any,
     drive_root: Any,

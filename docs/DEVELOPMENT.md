@@ -931,6 +931,8 @@ from the exhaustion free replay, not from the refusal streak.
 
 Scope of the review-contract fingerprint (deliberate): it covers the reviewer
 roster, routes, enforcement, resolved efforts, and the prompt constants —
+including the retrieval/task/prompt-wrapper serialization when Skill Review
+actually contains an agent-session row, without repricing API-only panels —
 governance-document CONTENTS (BIBLE.md, CHECKLISTS.md, ARCHITECTURE.md) are
 deliberately outside it, so editing those documents neither lapses recorded
 verdicts nor frees replays. The accepted trade-off is that an old verdict can

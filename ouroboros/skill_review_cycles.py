@@ -137,6 +137,13 @@ def skill_review_contract_fingerprint(
             )
         ]
         identity = {"reviewer_rows": sorted(rows, key=lambda row: row["slot_id"])}
+        if any(row["route"] == "agent_session" for row in rows):
+            from ouroboros.skill_review_passes import skill_review_session_contract_hash
+
+            session_contract = skill_review_session_contract_hash()
+            if not session_contract:
+                return ""  # unknown contract never matches (fail-open toward paying)
+            identity["session_prompt_contract"] = session_contract
     identity.update({
         "required_items": [str(item) for item in (required_items or ())],
         "prompt_contract": prompt_contract,

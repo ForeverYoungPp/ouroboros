@@ -26,6 +26,29 @@ def _actor(reason, verdict="PASS"):
     return {"model": "m", "text": json.dumps([{"item": "x", "verdict": verdict, "reason": reason}])}
 
 
+def test_session_contract_hash_tracks_retrieval_assignment(monkeypatch):
+    import ouroboros.skill_review_passes as passes
+    from ouroboros.review_execution import AgentSessionReviewExecutor
+
+    before = passes.skill_review_session_contract_hash()
+    assert before and len(before) == 64
+    with monkeypatch.context() as changed:
+        changed.setattr(passes, "_SESSION_RETRIEVAL", passes._SESSION_RETRIEVAL + "changed\n")
+        assert before != passes.skill_review_session_contract_hash()
+    with monkeypatch.context() as changed:
+        changed.setattr(passes, "_SINGLE_CONTENT", passes._SINGLE_CONTENT + " changed")
+        assert before != passes.skill_review_session_contract_hash()
+
+    original = AgentSessionReviewExecutor.session_prompt
+
+    def changed_prompt(self):
+        return original.fget(self) + "changed"
+
+    with monkeypatch.context() as changed:
+        changed.setattr(AgentSessionReviewExecutor, "session_prompt", property(changed_prompt))
+        assert before != passes.skill_review_session_contract_hash()
+
+
 def test_single_pass_returns_review_object_verbatim():
     def fake_run_review(ctx, *, content, prompt, models, stable_prefix_len=0):
         return json.dumps({"model_count": 1, "results": [_actor("ok")]})

@@ -401,6 +401,7 @@ def test_skill_review_contract_fingerprint_tracks_roster_items_and_profile(monke
 
 
 def test_skill_review_contract_fingerprint_preserves_legacy_and_tracks_rows(monkeypatch):
+    import ouroboros.skill_review_cycles as cycles
     from ouroboros.skill_review_cycles import skill_review_contract_fingerprint
 
     monkeypatch.setenv("OUROBOROS_EFFORT_REVIEW", "high")
@@ -421,6 +422,33 @@ def test_skill_review_contract_fingerprint_preserves_legacy_and_tracks_rows(monk
         ["m1", "m2"], required_items=("a",), delivery=structured,
     )
     assert structured_fp != legacy
+    with monkeypatch.context() as contract_patch:
+        contract_patch.setattr(cycles, "_skill_prompt_contract_hash", lambda: "api-contract")
+        contract_patch.setattr(
+            "ouroboros.skill_review_passes.skill_review_session_contract_hash",
+            lambda: "session-contract-a",
+        )
+        api_only_fp = skill_review_contract_fingerprint(
+            ["m1", "m2"], required_items=("a",), delivery=structured,
+        )
+        contract_patch.setattr(
+            "ouroboros.skill_review_passes.skill_review_session_contract_hash",
+            lambda: "session-contract-b",
+        )
+        assert api_only_fp == skill_review_contract_fingerprint(
+            ["m1", "m2"], required_items=("a",), delivery=structured,
+        )
+        session_delivery = dict(structured, routes=["agent_session", "api_chat"])
+        session_b = skill_review_contract_fingerprint(
+            ["m1", "m2"], required_items=("a",), delivery=session_delivery,
+        )
+        contract_patch.setattr(
+            "ouroboros.skill_review_passes.skill_review_session_contract_hash",
+            lambda: "session-contract-c",
+        )
+        assert session_b != skill_review_contract_fingerprint(
+            ["m1", "m2"], required_items=("a",), delivery=session_delivery,
+        )
     reordered = {
         key: ([value[1], value[0]] if isinstance(value, list) else value)
         for key, value in structured.items()
