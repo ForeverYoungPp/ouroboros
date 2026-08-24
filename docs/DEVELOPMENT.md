@@ -1683,6 +1683,15 @@ Before every commit, verify the following:
   an opt-in strict poll bound for the remaining logical window; the general
   delegate-wait floor remains unchanged for its existing transport contract.
   Default reviewer slots intentionally have no short cognition cap.
+- [ ] Nested process wrappers are ordered, never tied: the provider bound must
+  settle before its killable child, and the child must settle before the generic
+  ToolEntry envelope. Explicit VLM helpers reuse the fixed structural settlement
+  margin from `config.py` (`provider`, `provider + margin`, and a ToolEntry
+  minimum of `provider + 2 × margin`) and subtract the whole hierarchy from the
+  owner window before dispatch. The global owner tool-timeout setting may widen
+  that outer envelope; the margin is not a user-facing cognition timeout.
+  Send-time captions have no child wrapper and keep the direct 90-second provider
+  contract.
 - [ ] Every physical LLM/review/VLM/tool operation that can outlive a logical
   wait emits a typed `cognitive_operation` start and terminal fact. The
   supervisor uses the active-operation map only to spare the idle rail; the

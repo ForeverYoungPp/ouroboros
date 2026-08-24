@@ -14,7 +14,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 import logging
 
-from ouroboros.config import get_finalization_grace_sec, load_settings
+from ouroboros.config import (
+    NESTED_SETTLEMENT_MARGIN_SEC,
+    get_finalization_grace_sec,
+    load_settings,
+)
 from ouroboros.deadline_utils import deadline_remaining_sec
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.tool_capabilities import (
@@ -247,7 +251,7 @@ _PER_CALL_TIMEOUT_TOOLS = ("run_command", "run_script")
 # Structural ordering margin: the outer cap sits this far above the requested
 # per-call timeout so the handler's own (cleanly-messaged) subprocess timeout
 # fires first, before the outer thread-kill. Not a wait duration — a race margin.
-_PER_CALL_TIMEOUT_OUTER_MARGIN_SEC = 30
+_PER_CALL_TIMEOUT_OUTER_MARGIN_SEC = NESTED_SETTLEMENT_MARGIN_SEC
 
 
 def _tc_args(tc: Dict[str, Any]) -> Dict[str, Any]:
@@ -314,6 +318,7 @@ def _get_tool_timeout(
 _DEADLINE_CLAMPED_TOOLS = frozenset({
     "web_search", "browse_page", "browser_action", "youtube_transcript",
     "wait_task", "wait_tasks", "plan_task", "task_acceptance_review",
+    "analyze_screenshot", "vlm_query",
 })
 
 

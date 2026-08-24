@@ -47,29 +47,75 @@ def _row_is_pending(row: Dict[str, Any]) -> bool:
     ) in _PENDING_STATES
 
 
+def _custody_lost_row(
+    surface: str, index: Any, reason: str, row: Any = None,
+) -> Dict[str, Any]:
+    lost = copy.deepcopy(row) if isinstance(row, dict) else {}
+    if not str(lost.get("slot_id") or lost.get("slot") or ""):
+        lost["slot_id"] = f"__custody_lost_{surface}_{index}"
+    lost.setdefault("status", "error")
+    lost.setdefault("error", reason)
+    lost["operation_state"] = "custody_lost"
+    lost["late_result_pending"] = True
+    return lost
+
+
+def _freeze_roster_rows(usage_ctx: Any, surface: str, raw: Any) -> Dict[str, Dict[str, Any]]:
+    if raw is None:
+        rows: List[Any] = []
+    elif isinstance(raw, (list, tuple)):
+        rows = list(raw)
+    else:
+        rows = [_custody_lost_row(surface, "container", "review roster is not a list")]
+        setattr(usage_ctx, "_review_custody_lost", True)
+    by_slot: Dict[str, Dict[str, Any]] = {}
+    for index, value in enumerate(rows):
+        row = copy.deepcopy(value) if isinstance(value, dict) else _custody_lost_row(
+            surface, index, "review roster row is not an object",
+        )
+        slot_id = str(row.get("slot_id") or row.get("slot") or "")
+        if not slot_id:
+            row = _custody_lost_row(surface, index, "review roster row has no slot id", row)
+            slot_id = str(row["slot_id"])
+        if (
+            not isinstance(value, dict)
+            or slot_id in by_slot
+            or str(row.get("operation_state") or "") == "custody_lost"
+        ):
+            setattr(usage_ctx, "_review_custody_lost", True)
+        if slot_id in by_slot:
+            by_slot[slot_id] = _custody_lost_row(
+                surface, index, "review roster contains duplicate slot ids", by_slot[slot_id],
+            )
+            continue
+        by_slot[slot_id] = row
+    return by_slot
+
+
 def prepare_frozen_review_reconciliation(usage_ctx: Any, attempt: Any) -> None:
     """Expose one durable commit attempt as the exact reconciliation roster."""
-    triad = [copy.deepcopy(row) for row in list(
-        getattr(attempt, "triad_raw_results", None) or []
-    ) if isinstance(row, dict)]
-    scope_raw = getattr(attempt, "scope_raw_result", None) or {}
-    scope = list(scope_raw.get("raw_results") or []) if isinstance(scope_raw, dict) else []
-    if not scope and isinstance(scope_raw, dict) and scope_raw:
-        scope = [scope_raw]
-    frozen: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    for surface, rows in (("multi_model_review", triad), ("scope_review", scope)):
-        by_slot: Dict[str, Dict[str, Any]] = {}
-        for row in rows:
-            slot_id = str(row.get("slot_id") or row.get("slot") or "")
-            if not slot_id or slot_id in by_slot:
-                setattr(usage_ctx, "_review_custody_lost", True)
-                continue
-            by_slot[slot_id] = copy.deepcopy(row)
-        frozen[surface] = by_slot
-    setattr(usage_ctx, "_review_frozen_rows", frozen)
-    setattr(usage_ctx, "_review_frozen_scope_raw", copy.deepcopy(scope_raw))
+    triad = _freeze_roster_rows(
+        usage_ctx, "multi_model_review", getattr(attempt, "triad_raw_results", None),
+    )
+    raw_scope = getattr(attempt, "scope_raw_result", None)
+    scope_wrapper = copy.deepcopy(raw_scope) if isinstance(raw_scope, dict) else {}
+    if isinstance(raw_scope, dict):
+        scope_input = (
+            raw_scope.get("raw_results")
+            if "raw_results" in raw_scope
+            else [raw_scope] if raw_scope else []
+        )
+    else:
+        scope_input = raw_scope
+    scope = _freeze_roster_rows(usage_ctx, "scope_review", scope_input)
+    frozen = {"multi_model_review": triad, "scope_review": scope}
     if not triad and not scope:
+        triad["__custody_lost_multi_model_review_empty"] = _custody_lost_row(
+            "multi_model_review", "empty", "review roster is empty",
+        )
         setattr(usage_ctx, "_review_custody_lost", True)
+    setattr(usage_ctx, "_review_frozen_rows", frozen)
+    setattr(usage_ctx, "_review_frozen_scope_raw", scope_wrapper)
 
 
 def _frozen_actor(row: Dict[str, Any], slot: Any) -> Any:
@@ -107,14 +153,47 @@ def merge_frozen_review_reconciliation(usage_ctx: Any) -> None:
     if not isinstance(frozen, dict):
         return
 
-    def _merge(surface: str, current: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _merge(surface: str, current: List[Any]) -> List[Dict[str, Any]]:
         originals = frozen.get(surface) if isinstance(frozen.get(surface), dict) else {}
+        current_groups: Dict[str, List[Dict[str, Any]]] = {}
+        invalid_rows: List[Dict[str, Any]] = []
+        for index, row in enumerate(current):
+            if not isinstance(row, dict):
+                invalid_rows.append(_custody_lost_row(
+                    surface, index, "current review roster row is not an object",
+                ))
+                setattr(usage_ctx, "_review_custody_lost", True)
+                continue
+            slot_id = str(row.get("slot_id") or row.get("slot") or "")
+            if not slot_id:
+                invalid_rows.append(_custody_lost_row(
+                    surface, index, "current review roster row has no slot id", row,
+                ))
+                setattr(usage_ctx, "_review_custody_lost", True)
+                continue
+            current_groups.setdefault(slot_id, []).append(row)
+        ambiguous_slots = {
+            slot_id for slot_id, rows in current_groups.items() if len(rows) != 1
+        }
+        if ambiguous_slots:
+            setattr(usage_ctx, "_review_custody_lost", True)
         current_by_slot = {
-            str(row.get("slot_id") or row.get("slot") or ""): row
-            for row in current if isinstance(row, dict)
+            slot_id: rows[0]
+            for slot_id, rows in current_groups.items()
+            if slot_id not in ambiguous_slots
         }
         merged: List[Dict[str, Any]] = []
         for slot_id, original in originals.items():
+            if str(original.get("operation_state") or "") == "custody_lost":
+                merged.append(copy.deepcopy(original))
+                setattr(usage_ctx, "_review_custody_lost", True)
+                continue
+            if slot_id in ambiguous_slots:
+                merged.append(_custody_lost_row(
+                    surface, slot_id, "current review roster contains duplicate slot ids", original,
+                ))
+                setattr(usage_ctx, "_review_custody_lost", True)
+                continue
             if not _row_is_pending(original):
                 merged.append(copy.deepcopy(original))
                 continue
@@ -130,27 +209,56 @@ def merge_frozen_review_reconciliation(usage_ctx: Any) -> None:
             lost["late_result_pending"] = True
             merged.append(lost)
             setattr(usage_ctx, "_review_custody_lost", True)
-        for slot_id, row in current_by_slot.items():
+        for slot_id in sorted(current_by_slot):
+            row = current_by_slot[slot_id]
             if slot_id not in originals:
                 extra = copy.deepcopy(row)
                 extra["operation_state"] = "custody_lost"
                 extra["late_result_pending"] = True
                 merged.append(extra)
                 setattr(usage_ctx, "_review_custody_lost", True)
+        for slot_id in sorted(ambiguous_slots - set(originals)):
+            rows = current_groups[slot_id]
+            row = min(
+                rows,
+                key=lambda item: json.dumps(
+                    item, sort_keys=True, ensure_ascii=True, default=str,
+                ),
+            )
+            merged.append(_custody_lost_row(
+                surface, slot_id, "current review roster contains duplicate slot ids", row,
+            ))
+        for row in sorted(
+            invalid_rows,
+            key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=True, default=str),
+        ):
+            merged.append(copy.deepcopy(row))
         return merged
 
+    triad_now = getattr(usage_ctx, "_last_triad_raw_results", None)
+    triad_rows = (
+        list(triad_now) if isinstance(triad_now, (list, tuple))
+        else [] if triad_now is None else [triad_now]
+    )
     triad = _merge(
         "multi_model_review",
-        list(getattr(usage_ctx, "_last_triad_raw_results", None) or []),
+        triad_rows,
     )
-    scope_now = getattr(usage_ctx, "_last_scope_raw_result", None) or {}
-    scope_rows = list(scope_now.get("raw_results") or []) if isinstance(scope_now, dict) else []
-    if not scope_rows and isinstance(scope_now, dict) and scope_now:
-        scope_rows = [scope_now]
+    scope_now = getattr(usage_ctx, "_last_scope_raw_result", None)
+    scope_wrapper = copy.deepcopy(scope_now) if isinstance(scope_now, dict) else {}
+    if isinstance(scope_now, dict):
+        raw_rows = scope_now.get("raw_results") if "raw_results" in scope_now else None
+        scope_rows = (
+            list(raw_rows) if isinstance(raw_rows, (list, tuple))
+            else [raw_rows] if raw_rows is not None
+            else [scope_now] if scope_now else []
+        )
+    else:
+        scope_rows = [] if scope_now is None else [scope_now]
     merged_scope = _merge("scope_review", scope_rows)
-    scope_wrapper = copy.deepcopy(
-        scope_now or getattr(usage_ctx, "_review_frozen_scope_raw", None) or {}
-    )
+    if not scope_wrapper:
+        frozen_wrapper = getattr(usage_ctx, "_review_frozen_scope_raw", None)
+        scope_wrapper = copy.deepcopy(frozen_wrapper) if isinstance(frozen_wrapper, dict) else {}
     if merged_scope:
         scope_wrapper["raw_results"] = merged_scope
     usage_ctx._last_triad_raw_results = triad

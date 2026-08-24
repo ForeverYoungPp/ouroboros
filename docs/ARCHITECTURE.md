@@ -1973,10 +1973,14 @@ physical call from being mistaken for idle; a deadline, budget, cancellation,
 or ceiling still wins. Delegated-session expiry uses its existing verified
 cancel path, while API/thread calls disclose `in_flight` and reconcile a late
 answer before the same retry identity can dispatch again. Send-time VLM
-captioning keeps its separate 90-second provider cap (narrowed further by the
-owner deadline and finalization reserve), Anthropic's direct route keeps its
-120-second provider default, and neither value is used as a generic
-review-reasoning cutoff. A returned provider response or typed terminal error
+captioning keeps its direct 90-second provider cap. Explicit VLM helpers order
+their nested bounds as provider, killable child, then a ToolEntry minimum by
+reusing one fixed structural settlement margin; the global owner tool-timeout
+setting may widen the outer envelope, while the complete hierarchy is narrowed
+inside the owner deadline and finalization reserve before dispatch. Anthropic's direct
+route keeps its 120-second provider default, and neither provider value is used
+as a generic review-reasoning cutoff. A returned provider response or typed
+terminal error
 is settled even when its body is empty/incomplete, so bounded repair/retry may
 apply. A dead socket or unterminated stream after dispatch is instead
 `provider_outcome_unknown` and cannot trigger another paid route. A spent owner
@@ -2455,7 +2459,7 @@ Runtime floors:
 | OUROBOROS_MODEL_LIGHT | openai/gpt-5.6-luna | Fast/cheap model for safety, compact routing and lightweight helper calls; it may seed the default Fast scout API actor. Empty means use `OUROBOROS_MODEL`. It never forces a session nanny's cognitive route. |
 | OUROBOROS_MODEL_VISION | "" | Vision/caption model slot for send-time image captioning and VLM helpers. Empty means use `OUROBOROS_MODEL` for normal remote routes; local/blind routes require an explicit reachable vision slot for caption fallback. Legacy `OUROBOROS_VISION_MODEL` settings migrate here. |
 | OUROBOROS_IMAGE_INPUT_MODE | auto | Image routing mode for model calls: `auto` keeps inline images for vision-capable active models and captions for blind models; `caption` always replaces image blocks with text captions; `inline` sends pixels only when supported; `off` replaces images with placeholders. |
-| OUROBOROS_VISION_CAPTION_TIMEOUT_SEC | 90 | Provider and killable-child ceiling for send-time captions and explicit VLM helper calls. Their ToolEntry outer envelope is built from the same setting, then all nested waits narrow to the owner deadline/finalization reserve. |
+| OUROBOROS_VISION_CAPTION_TIMEOUT_SEC | 90 | Provider dead-socket ceiling for send-time captions and explicit VLM helper calls. A direct send-time caption has no child wrapper. Explicit helpers give the killable child one fixed structural settlement margin and set the ToolEntry minimum two margins above the provider; the global owner tool timeout may widen that outer envelope. The provider window is shortened before dispatch so all three remain inside the owner deadline/finalization reserve. |
 | OUROBOROS_MODEL_CONSCIOUSNESS | "" | Background Consciousness model slot. Empty means use `OUROBOROS_MODEL`; do not silently downgrade this lane to the light model or a smaller context as a cost optimization |
 | OUROBOROS_MODEL_FALLBACKS | openai/gpt-5.6-luna | Comma-separated cross-model fallback chain tried when the primary returns no usable response (429-aware cooldown, deduped, active model dropped; a run pinning all slots to one model dedupes to a no-op). (Renamed from `OUROBOROS_MODEL_FALLBACK`; stored/legacy values migrate.) |
 | OUROBOROS_MODEL_MAX_CONCURRENCY | 3 | (v6.40) Max CONCURRENT provider calls per (model, use_local) route; excess worker threads wait (deadline-bounded) instead of storming one model's rate limit (self-DoS guard, `ouroboros/model_concurrency.py`). <=0 disables. Default-on, fail-soft |

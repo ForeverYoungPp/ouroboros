@@ -11,7 +11,11 @@ import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
-from ouroboros.config import get_vision_caption_timeout_sec, resolve_effort
+from ouroboros.config import (
+    NESTED_SETTLEMENT_MARGIN_SEC,
+    get_vision_caption_timeout_sec,
+    resolve_effort,
+)
 from ouroboros.deadline_utils import transport_timeout_with_deadline
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.usage_accounting import current_usage_scope
@@ -26,17 +30,22 @@ def _vision_timeout_for_context(ctx: Any) -> float:
     deadline_at = metadata.get("deadline_at") if isinstance(metadata, dict) else None
     deadline_ts = getattr(ctx, "deadline_ts", None)
     try:
-        from ouroboros.config import get_finalization_grace_sec
+        from ouroboros.task_pacing import effective_finalization_reserve_sec
 
-        reserve = get_finalization_grace_sec()
+        reserve = effective_finalization_reserve_sec(ctx)
     except Exception:
         reserve = 0
-    return transport_timeout_with_deadline(
+    timeout = transport_timeout_with_deadline(
         get_vision_caption_timeout_sec(),
         deadline_at=deadline_at,
         deadline_ts=deadline_ts,
-        reserve_sec=reserve,
+        reserve_sec=reserve + (2 * NESTED_SETTLEMENT_MARGIN_SEC),
     )
+    if timeout <= 0.001 and (deadline_at or deadline_ts is not None):
+        raise TimeoutError(
+            "insufficient owner-deadline window for VLM provider and settlement custody"
+        )
+    return timeout
 
 
 def _get_llm_client():
@@ -115,7 +124,8 @@ _VLM_MAX_IMAGE_SIDE = 1600
 def _vision_query_with_timeout(client: Any, **kwargs: Any) -> tuple[str, dict]:
     """Run a VLM query behind a tracked, killable child process."""
     del client  # production path constructs the client in the tracked child.
-    timeout = float(kwargs.get("timeout") or get_vision_caption_timeout_sec())
+    provider_timeout = float(kwargs.get("timeout") or get_vision_caption_timeout_sec())
+    child_timeout = provider_timeout + NESTED_SETTLEMENT_MARGIN_SEC
     payload = dict(kwargs)
     active_scope = current_usage_scope()
     if active_scope is not None:
@@ -159,10 +169,13 @@ print(json.dumps({"ok": True, "text": text, "usage": usage}))
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
+            timeout=child_timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        raise TimeoutError(f"VLM query exceeded {timeout:g}s wall-clock timeout") from exc
+        raise TimeoutError(
+            f"VLM query child did not settle within {child_timeout:g}s "
+            f"after its {provider_timeout:g}s provider bound"
+        ) from exc
     finally:
         try:
             os.unlink(payload_path)
@@ -784,7 +797,9 @@ def get_tools() -> List[ToolEntry]:
                 },
             },
             handler=_analyze_screenshot,
-            timeout_sec=get_vision_caption_timeout_sec(),
+            timeout_sec=(
+                get_vision_caption_timeout_sec() + (2 * NESTED_SETTLEMENT_MARGIN_SEC)
+            ),
         ),
         ToolEntry(
             name="vlm_query",
@@ -832,7 +847,9 @@ def get_tools() -> List[ToolEntry]:
                 },
             },
             handler=_vlm_query,
-            timeout_sec=get_vision_caption_timeout_sec(),
+            timeout_sec=(
+                get_vision_caption_timeout_sec() + (2 * NESTED_SETTLEMENT_MARGIN_SEC)
+            ),
         ),
         ToolEntry(
             name="view_image",

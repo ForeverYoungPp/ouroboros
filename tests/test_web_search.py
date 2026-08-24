@@ -518,6 +518,106 @@ def test_dispatched_web_timeout_never_retries_or_cascades(ctx, patch_env, monkey
     assert calls == {"openai": 1, "fallback": 0}
 
 
+def _captured_provider_error(*, provider="openrouter", status=None):
+    from ouroboros.usage_accounting import PhysicalAttemptCapture
+
+    exc = RuntimeError("provider transport ended")
+    exc.physical_attempt_capture = PhysicalAttemptCapture(
+        attempt_id="attempt-1",
+        model="model-1",
+        provider=provider,
+        state="unresolved",
+        candidate_measurement_kind="opaque",
+        provider_status_code=status,
+    )
+    return exc
+
+
+def test_openrouter_ambiguous_outcome_stops_cross_provider_cascade(ctx, monkeypatch):
+    from ouroboros import llm
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.delenv("OUROBOROS_WEBSEARCH_BACKEND", raising=False)
+    monkeypatch.setattr(
+        llm, "openrouter_web_search_server_tool",
+        lambda **_kwargs: (_ for _ in ()).throw(_captured_provider_error()),
+    )
+    monkeypatch.setattr(
+        search_module, "_web_search_anthropic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambiguous OpenRouter work must stop the cascade")
+        ),
+    )
+    monkeypatch.setattr(
+        search_module, "_web_search_ddgs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambiguous OpenRouter work must stop the cascade")
+        ),
+    )
+
+    result = json.loads(_web_search(ctx, "ambiguous OpenRouter query"))
+
+    assert result["backend"] == "openrouter_server_tool"
+    assert result["reason_code"] == "provider_outcome_unknown"
+
+
+def test_anthropic_ambiguous_outcome_stops_ddgs_cascade(ctx, monkeypatch):
+    from ouroboros import llm
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.delenv("OUROBOROS_WEBSEARCH_BACKEND", raising=False)
+    monkeypatch.setattr(
+        search_module, "_web_search_openrouter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pre-dispatch")),
+    )
+    monkeypatch.setattr(
+        llm, "anthropic_web_search_server_tool",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            _captured_provider_error(provider="anthropic")
+        ),
+    )
+    monkeypatch.setattr(
+        search_module, "_web_search_ddgs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambiguous Anthropic work must stop the cascade")
+        ),
+    )
+
+    result = json.loads(_web_search(ctx, "ambiguous Anthropic query"))
+
+    assert result["backend"] == "anthropic_server_tool"
+    assert result["reason_code"] == "provider_outcome_unknown"
+
+
+def test_terminal_openrouter_status_allows_next_backend(ctx, monkeypatch):
+    from ouroboros import llm
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.delenv("OUROBOROS_WEBSEARCH_BACKEND", raising=False)
+    monkeypatch.setattr(
+        llm, "openrouter_web_search_server_tool",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            _captured_provider_error(status=503)
+        ),
+    )
+    monkeypatch.setattr(
+        search_module, "_web_search_anthropic",
+        lambda *_args, **_kwargs: json.dumps({
+            "answer": "recovered", "backend": "anthropic_server_tool",
+        }),
+    )
+
+    result = json.loads(_web_search(ctx, "terminal OpenRouter query"))
+
+    assert result == {"answer": "recovered", "backend": "anthropic_server_tool"}
+
+
 def test_explicit_web_503_allows_one_safe_retry(ctx, patch_env, monkeypatch):
     calls = 0
 

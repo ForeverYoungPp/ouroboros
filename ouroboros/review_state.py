@@ -1098,9 +1098,21 @@ def _record_from_dict(d: Dict[str, Any]) -> AdvisoryRunRecord:
     )
 
 
+def _malformed_roster_row(surface: str) -> Dict[str, Any]:
+    return {
+        "slot_id": f"__custody_lost_{surface}_container",
+        "status": "error",
+        "error": "durable review roster container is malformed",
+        "operation_state": "custody_lost",
+        "late_result_pending": True,
+    }
+
+
 def _commit_attempt_from_dict(d: Dict[str, Any]) -> CommitAttemptRecord:
     ts = str(d.get("ts", ""))
     status = str(d.get("status", "failed"))
+    raw_triad = d.get("triad_raw_results")
+    raw_scope = d.get("scope_raw_result")
     return CommitAttemptRecord(
         **{key: str(d.get(key, default)) for key, default in _ATTEMPT_STR_DEFAULTS.items()},
         ts=ts,
@@ -1119,8 +1131,16 @@ def _commit_attempt_from_dict(d: Dict[str, Any]) -> CommitAttemptRecord:
         updated_ts=str(d.get("updated_ts", ts)),
         finished_ts=str(d.get("finished_ts", ts if status in ("blocked", "failed", "succeeded") else "")),
         triad_models=[str(x) for x in (d.get("triad_models") or [])],
-        triad_raw_results=list(d.get("triad_raw_results") or []),
-        scope_raw_result=dict(d.get("scope_raw_result") or {}),
+        triad_raw_results=(
+            list(raw_triad) if isinstance(raw_triad, list)
+            else [] if raw_triad is None
+            else [_malformed_roster_row("multi_model_review")]
+        ),
+        scope_raw_result=(
+            dict(raw_scope) if isinstance(raw_scope, dict)
+            else {} if raw_scope is None
+            else {"raw_results": [_malformed_roster_row("scope_review")]}
+        ),
         paid=bool(d.get("paid", False)),
         raw_stripped=bool(d.get("raw_stripped", False)),
     )

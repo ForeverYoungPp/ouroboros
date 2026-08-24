@@ -14,6 +14,7 @@ from ouroboros.pricing import estimate_cost_optional
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.usage_accounting import (
     AttemptRequest,
+    PhysicalAttemptCapture,
     UsageAccountingError,
     UsageScope,
     capture_attempt_ids,
@@ -30,6 +31,37 @@ log = logging.getLogger(__name__)
 DEFAULT_SEARCH_MODEL = "gpt-5.2"
 DEFAULT_SEARCH_CONTEXT_SIZE = "medium"
 DEFAULT_REASONING_EFFORT = "high"
+
+
+def _wrapped_provider_error(provider: str, exc: Exception) -> RuntimeError:
+    """Sanitize a provider error without dropping its physical-attempt fact."""
+    detail = sanitize_tool_result_for_log(str(exc))[:500]
+    wrapped = RuntimeError(f"{provider} web search failed ({type(exc).__name__}): {detail}")
+    capture = getattr(exc, "physical_attempt_capture", None)
+    if isinstance(capture, PhysicalAttemptCapture):
+        setattr(wrapped, "physical_attempt_capture", capture)
+    return wrapped
+
+
+def _provider_outcome_is_unknown(exc: Exception) -> bool:
+    """Whether paid work started without a typed terminal provider outcome."""
+    capture = getattr(exc, "physical_attempt_capture", None)
+    return bool(
+        isinstance(capture, PhysicalAttemptCapture)
+        and capture.state in {"dispatched", "unresolved"}
+        and capture.provider_status_code is None
+    )
+
+
+def _unknown_provider_outcome(backend: str) -> str:
+    return json.dumps({
+        "error": (
+            f"{backend} web search was dispatched but its provider outcome is unknown; "
+            "no retry or paid fallback was sent."
+        ),
+        "backend": backend,
+        "reason_code": "provider_outcome_unknown",
+    }, ensure_ascii=False, indent=2)
 
 
 def _web_search_transport_timeout(ctx: Any) -> float:
@@ -294,8 +326,7 @@ def _web_search_openrouter(ctx: ToolContext, query: str, model: str = "", search
     except UsageAccountingError:
         raise
     except Exception as exc:
-        detail = sanitize_tool_result_for_log(str(exc))[:500]
-        raise RuntimeError(f"OpenRouter web search failed ({type(exc).__name__}): {detail}") from exc
+        raise _wrapped_provider_error("OpenRouter", exc) from exc
 
 
 def _web_search_anthropic(ctx: ToolContext, query: str, model: str = "") -> str:
@@ -343,8 +374,7 @@ def _web_search_anthropic(ctx: ToolContext, query: str, model: str = "") -> str:
     except UsageAccountingError:
         raise
     except Exception as exc:
-        detail = sanitize_tool_result_for_log(str(exc))[:500]
-        raise RuntimeError(f"Anthropic web search failed ({type(exc).__name__}): {detail}") from exc
+        raise _wrapped_provider_error("Anthropic", exc) from exc
 
 
 def _web_search_ddgs(query: str, *, _max_attempts: int = 3) -> str:
@@ -462,6 +492,12 @@ def _web_search(
         except UsageAccountingError:
             raise
         except Exception as exc:
+            backend = {
+                "openrouter": "openrouter_server_tool",
+                "anthropic": "anthropic_server_tool",
+            }.get(pinned, pinned)
+            if _provider_outcome_is_unknown(exc):
+                return _unknown_provider_outcome(backend)
             detail = sanitize_tool_result_for_log(str(exc))[:500]
             return json.dumps(
                 {"error": f"pinned web_search backend '{pinned}' failed: {detail}", "backend": pinned},
@@ -480,10 +516,18 @@ def _web_search(
                 {"error": f"pinned web_search backend 'openai' unavailable: {detail}", "backend": "openai"},
                 ensure_ascii=False, indent=2,
             )
-        for backend in (
-            lambda: _web_search_openrouter(ctx, query, model=model, search_context_size=search_context_size),
-            lambda: _web_search_anthropic(ctx, query, model=model),
-            lambda: _web_search_ddgs(query),
+        for backend_name, backend in (
+            (
+                "openrouter_server_tool",
+                lambda: _web_search_openrouter(
+                    ctx, query, model=model, search_context_size=search_context_size,
+                ),
+            ),
+            (
+                "anthropic_server_tool",
+                lambda: _web_search_anthropic(ctx, query, model=model),
+            ),
+            ("ddgs", lambda: _web_search_ddgs(query)),
         ):
             try:
                 return backend()
@@ -491,6 +535,8 @@ def _web_search(
                 raise
             except Exception as exc:
                 errors.append(sanitize_tool_result_for_log(str(exc))[:500])
+                if _provider_outcome_is_unknown(exc):
+                    return _unknown_provider_outcome(backend_name)
         return json.dumps({
             "error": (
                 "web_search unavailable: no configured search backend succeeded. "
