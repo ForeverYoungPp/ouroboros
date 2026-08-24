@@ -17,9 +17,8 @@
 //     breath as the benefit, because a wizard that implies otherwise sends the
 //     owner to a first run that refuses to start.
 //   * "Rides a plan" is not "free", and NOT every reviewer moves. Commit triad,
-//     scope, the advisory pre-reviewer and plan review (each triad row's own
-//     delivery) move; task acceptance and skill review stay API-only today
-//     (D15). The footnote carries both.
+//     scope, advisory, plan, and skill review follow their configured delivery;
+//     task acceptance stays API-only (D15). The footnote carries both.
 //
 // The rotation artwork is a STATIC SVG — inline, no library, no animation
 // (no comparable product animates this, and motion here would be noise). It is
@@ -80,7 +79,8 @@ export const VALUE_LADDER = [
         tone: 'Better',
         title: 'Add one agent plan',
         body: 'Delegated subagents run inside that plan instead of billing your API key '
-            + 'per call. Claude Code, Codex, and Cursor plans can also move commit review; '
+            + 'per call. Claude Code, Codex, and Cursor plans can also move commit, plan, '
+            + 'and skill review; '
             + 'task-only plans such as Antigravity do not change reviewer routes. The main '
             + 'agent keeps using the API key or local model you configured above: a '
             + 'plan cannot run it.',
@@ -96,8 +96,8 @@ export const VALUE_LADDER = [
 
 export const LADDER_FOOTNOTE =
     'Riding a plan is not free — it moves that work onto a subscription you already '
-    + 'pay for instead of adding per-call API charges. Task acceptance and skill review '
-    + 'stay on the API key for now; plan review follows each triad row.';
+    + 'pay for instead of adding per-call API charges. Task acceptance stays on the API '
+    + 'key; plan and skill review follow each configured triad row.';
 
 // ---------------------------------------------------------------------------
 // Pure helpers.
@@ -318,8 +318,7 @@ export function agentsOutcomeText(connected = [],
     if (reviewerHarnesses.length) {
         const reviewerLabels = familyLabels(reviewerHarnesses, snapshot);
         clauses.push(`${joinLabels(reviewerLabels)} can `
-            + 'also move commit review, the scope pass, the advisory pre-review and '
-            + 'their plan-review rows.');
+            + 'also move commit, scope, advisory, plan, and skill review.');
     }
     if (taskOnlyHarnesses.length) {
         const taskOnlyLabels = familyLabels(taskOnlyHarnesses, snapshot);

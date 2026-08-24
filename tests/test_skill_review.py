@@ -508,6 +508,31 @@ def test_extract_actor_findings_counts_duplicate_models_by_slot():
     ]
 
 
+def test_duplicate_model_slots_keep_stable_identity_across_chunks_and_render_separately():
+    actors = []
+    for _chunk in range(2):
+        for slot_id in ("skill-slot-a", "skill-slot-b"):
+            actor = _make_actor("anthropic/claude-fable-5", _pass_array_for_script_skill())
+            actor["slot_id"] = slot_id
+            actors.append(actor)
+
+    findings, responded = _extract_actor_findings({"results": actors})
+
+    assert responded == [
+        "anthropic/claude-fable-5 [skill-slot-a]",
+        "anthropic/claude-fable-5 [skill-slot-b]",
+    ]
+    assert {finding["slot_id"] for finding in findings} == {
+        "skill-slot-a", "skill-slot-b",
+    }
+    rendered = render_skill_review_block(SkillReviewOutcome(
+        skill_name="demo", status="clean", findings=findings,
+        reviewer_models=responded,
+    ))
+    assert rendered.count("Reviewer: anthropic/claude-fable-5 [skill-slot-a]") == 1
+    assert rendered.count("Reviewer: anthropic/claude-fable-5 [skill-slot-b]") == 1
+
+
 # ---------------------------------------------------------------------------
 # _aggregate_status
 # ---------------------------------------------------------------------------
@@ -678,6 +703,10 @@ def test_review_skill_persists_clean_verdict(tmp_path, monkeypatch):
     # stale-review gate stays honest.
     expected_hash = compute_content_hash(skills_root / "weather")
     assert persisted.content_hash == expected_hash
+    history_path = ctx.drive_root / "state" / "skills" / "weather" / "review_history.jsonl"
+    terminal = json.loads(history_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert terminal["raw_actor_records"]
+    assert all(record.get("slot_id") for record in terminal["raw_actor_records"])
 
 
 def test_review_skill_auto_grants_after_clean_when_enabled(tmp_path, monkeypatch):
@@ -1248,6 +1277,100 @@ def test_skill_packs_single_file_over_budget_refused(tmp_path, monkeypatch):
         _build_skill_file_packs(skill_dir)
 
 
+def test_review_skill_refuses_payload_mutation_between_hash_and_frozen_pack(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.skill_review as sr
+
+    skills_root = _build_skill(tmp_path)
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    script = skills_root / "weather" / "scripts" / "fetch.py"
+    real_compute = sr.compute_content_hash
+
+    def mutate_after_hash(*args, **kwargs):
+        digest = real_compute(*args, **kwargs)
+        script.write_text("print('mutated after hash')\n", encoding="utf-8")
+        return digest
+
+    monkeypatch.setattr(sr, "compute_content_hash", mutate_after_hash)
+    ctx = _make_ctx(tmp_path)
+    with patch(
+        "ouroboros.tools.review._handle_multi_model_review",
+        side_effect=AssertionError("a mismatched frozen payload must not dispatch"),
+    ):
+        outcome = review_skill(ctx, "weather")
+
+    assert outcome.status == "pending"
+    assert "payload changed after hashing" in outcome.error
+    assert outcome.paid is False and outcome.wave_id == ""
+
+
+def test_review_skill_rebinds_manifest_to_the_frozen_payload(tmp_path, monkeypatch):
+    import ouroboros.skill_review as sr
+
+    skills_root = _build_skill(tmp_path)
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    manifest = skills_root / "weather" / "SKILL.md"
+    real_load = sr.load_bound_skill
+    loads = 0
+
+    def load_then_replace(binding):
+        nonlocal loads
+        loaded = real_load(binding)
+        loads += 1
+        if loads == 1:
+            manifest.write_text(
+                manifest.read_text(encoding="utf-8").replace(
+                    "description: Check the weather.",
+                    "description: Rebound frozen description."),
+                encoding="utf-8",
+            )
+        return loaded
+
+    monkeypatch.setattr(sr, "load_bound_skill", load_then_replace)
+    captured = {}
+
+    def fake_review(_ctx, *, prompt, **_kwargs):
+        captured["prompt"] = prompt
+        return json.dumps({"results": [
+            _make_actor("reviewer-a", _pass_array_for_script_skill()),
+            _make_actor("reviewer-b", _pass_array_for_script_skill()),
+        ]})
+
+    with patch("ouroboros.tools.review._handle_multi_model_review", side_effect=fake_review):
+        outcome = review_skill(_make_ctx(tmp_path), "weather")
+
+    assert outcome.status == "clean"
+    assert loads >= 2
+    assert "Rebound frozen description." in captured["prompt"]
+    assert "Check the weather." not in captured["prompt"]
+
+
+def test_review_skill_refuses_mutation_during_deterministic_preflight(tmp_path, monkeypatch):
+    import ouroboros.skill_review as sr
+
+    skills_root = _build_skill(tmp_path)
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    script = skills_root / "weather" / "scripts" / "fetch.py"
+    real_preflight = sr._run_deterministic_preflight
+
+    def mutate_during_preflight(*args, **kwargs):
+        result = real_preflight(*args, **kwargs)
+        script.write_text("print('changed during preflight')\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(sr, "_run_deterministic_preflight", mutate_during_preflight)
+    with patch(
+        "ouroboros.tools.review._handle_multi_model_review",
+        side_effect=AssertionError("a changed preflight payload must not dispatch"),
+    ):
+        outcome = review_skill(_make_ctx(tmp_path), "weather")
+
+    assert outcome.status == "pending"
+    assert "changed during deterministic preflight" in outcome.error
+    assert outcome.paid is False and outcome.wave_id == ""
+
+
 def test_review_skill_prompt_loads_core_governance_artifacts(tmp_path, monkeypatch):
     """DEVELOPMENT.md 'When adding a new reasoning flow' rule requires
     ARCHITECTURE.md and DEVELOPMENT.md to appear in the assembled skill
@@ -1258,9 +1381,10 @@ def test_review_skill_prompt_loads_core_governance_artifacts(tmp_path, monkeypat
 
     captured = {}
 
-    def fake_review(ctx_, *, content, prompt, models, stable_prefix_len=0):
+    def fake_review(ctx_, *, content, prompt, models, stable_prefix_len=0, **delivery):
         captured["prompt"] = prompt
         captured["stable_prefix_len"] = stable_prefix_len
+        captured["delivery"] = delivery
         return json.dumps(
             {
                 "results": [

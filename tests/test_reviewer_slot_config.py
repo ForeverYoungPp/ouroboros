@@ -14,6 +14,7 @@ from ouroboros.reviewer_slot_config import (
     SCOPE_SLOT_LIMIT,
     TRIAD_SLOT_LIMIT,
     advisory_slot_config,
+    commit_triad_delivery,
     commit_triad_rows,
     load_reviewer_slot_config,
     parse_reviewer_slots,
@@ -64,6 +65,9 @@ def test_structured_config_round_trips(monkeypatch):
     assert config.advisory.enabled is False
     assert config.advisory.kind == "agent_session"
     assert config.advisory.target_id == "codex"
+    delivery = commit_triad_delivery()
+    assert delivery["slot_ids"] == ["t_api", "t_sess"]
+    assert delivery["legacy_skill_fingerprint"] is False
 
 
 @pytest.mark.parametrize("mutate,fragment", [
@@ -206,6 +210,7 @@ def test_legacy_comma_lists_read_as_api_slots(monkeypatch):
     ]
     assert [(r.slot_id, r.effort) for r in config.scope] == [("scope_slot_1", "xhigh")]
     assert config.advisory.enabled is True and config.advisory.kind == "api"
+    assert commit_triad_delivery()["legacy_skill_fingerprint"] is True
 
 
 def test_legacy_phase5_route_envs_are_honored(monkeypatch):
@@ -214,13 +219,35 @@ def test_legacy_phase5_route_envs_are_honored(monkeypatch):
     monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "m/one,m/two")
     monkeypatch.setenv("OUROBOROS_REVIEW_ROUTES", "api_chat,agent_session")
     monkeypatch.setenv("OUROBOROS_ADVISORY_REVIEW_ROUTE", "agent_session")
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claude=claude-fable-5:high")
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROFILE", "legacy-profile")
     config = load_reviewer_slot_config()
     session_row = config.triad[1]
     assert session_row.kind == "agent_session"
-    # A legacy session row has no per-row target: delivery stays on the shared
-    # session-route key, which is exactly the phase-5 behavior.
-    assert session_row.session_target == ""
+    # A legacy session row inherits the shared phase-5 route and account pin.
+    assert session_row.session_target == "claude=claude-fable-5"
+    assert session_row.profile_id == "legacy-profile"
     assert config.advisory.kind == "agent_session"
+    delivery = commit_triad_delivery()
+    assert delivery["legacy_skill_fingerprint"] is False
+    assert delivery["session_targets"][1] == "claude=claude-fable-5"
+    assert delivery["session_profiles"][1] == "legacy-profile"
+    assert delivery["efforts"][1] == "high"
+
+
+@pytest.mark.parametrize("review_route", ["off", "=malformed"])
+def test_legacy_explicitly_unavailable_session_route_never_drifts(monkeypatch, review_route):
+    monkeypatch.delenv(REVIEWER_SLOTS_ENV, raising=False)
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "m/one")
+    monkeypatch.setenv("OUROBOROS_REVIEW_ROUTES", "agent_session")
+    monkeypatch.setenv("OUROBOROS_REVIEW_SESSION_ROUTE", review_route)
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "codex=gpt-5.6-sol")
+
+    delivery = commit_triad_delivery()
+    assert delivery["routes"][0].value == "agent_session"
+    assert delivery["session_targets"] == [""]
+    assert delivery["legacy_skill_fingerprint"] is False
 
 
 def test_legacy_bad_route_token_still_refuses(monkeypatch):
@@ -257,8 +284,8 @@ def test_projection_all_delegated_triad_floors_to_defaults(monkeypatch):
 
     from ouroboros.config import SETTINGS_DEFAULTS
 
-    # The API surfaces (task acceptance, skill review — D15) fall
-    # back to the shipped defaults, never to zero reviewers or a stale comma key.
+    # The API-only task-acceptance surface falls back to shipped defaults,
+    # never to zero reviewers or a stale comma key.
     assert os.environ["OUROBOROS_REVIEW_MODELS"] == str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"])
 
 
@@ -555,9 +582,9 @@ def test_legacy_session_row_with_no_shared_route_is_empty_not_a_model(monkeypatc
 
 
 def test_all_delegated_commit_surface_discloses_the_api_fallback(monkeypatch):
-    """Claim 1: when every commit/scope row is delegated the API-pinned surfaces
-    fall back to default models and spend budget — disclosed, never silent, and
-    the save is NOT blocked (recommendation A, reversible default).
+    """When every triad row is delegated, API-only task acceptance falls back
+    to default models and spends budget — disclosed, never silent, while all
+    configured review gates keep their session rows.
 
     The disclosure is NEUTRAL routing information, not advice: an
     all-subscription triad IS the ratified default (D-3), so the sentence must
@@ -577,16 +604,15 @@ def test_all_delegated_commit_surface_discloses_the_api_fallback(monkeypatch):
     }
     disclosure = api_fallback_disclosure(parse_reviewer_slots(json.dumps(payload)))
     assert disclosure["triad"] == str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"]).split(",")
-    assert disclosure["scope"] == str(SETTINGS_DEFAULTS["OUROBOROS_SCOPE_REVIEW_MODELS"]).split(",")
+    assert set(disclosure) == {"triad"}
 
     _set_structured(monkeypatch, payload)
     warning = reviewer_slot_api_fallback_warning()
-    assert warning and "commit review" in warning and "scope review" in warning
+    assert warning and "commit, plan, and skill-review" in warning
     # It names both halves of the routing fact: what moved to subscriptions,
     # and which surfaces the API still serves with which models.
     assert "agent subscription" in warning
-    assert "Task acceptance and skill review" in warning
-    assert "plan review follows each triad row" in warning  # not API-pinned (spec-gate redesign)
+    assert "Task acceptance remains API-only" in warning
     assert str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"]).split(",")[0] in warning
     # The retired advice: telling the owner to keep an API reviewer row
     # contradicts the ratified all-subscription default.

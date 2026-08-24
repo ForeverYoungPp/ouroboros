@@ -50,13 +50,14 @@ from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
 )
 from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso
 from ouroboros._usage_rows import (  # noqa: F401  (re-exported substrate vocabulary)
+    REVIEW_ATTRIBUTION_KEYS,
     _breakdown_bucket,
     _physical_call_count,
     _summary,
     _with_integrity,
     _with_limit,
 )
-
+from ouroboros.skill_review_usage import skill_review_usage
 log = logging.getLogger(__name__)
 IMPORT_REL = pathlib.Path("state/usage_import_watermark.json")
 __all__ = (
@@ -72,7 +73,7 @@ __all__ = (
     "record_subscription_session",
     "record_unmetered_external_dispatch", "refresh_root_accounting",
     "release_attempt", "reserve_attempt", "settle_attempt",
-    "usage_breakdown", "usage_from_response", "usage_projection", "usage_scope",
+    "skill_review_usage", "usage_breakdown", "usage_from_response", "usage_projection", "usage_scope",
     "review_wave_admission",
 )
 _CURRENT_SCOPE: contextvars.ContextVar[Optional["UsageScope"]] = contextvars.ContextVar(
@@ -189,8 +190,6 @@ class _AttemptLimit:
     maximum: int
     used: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
-
-
 @dataclass(frozen=True)
 class UsageScope:
     drive_root: pathlib.Path | str | None = None
@@ -199,10 +198,11 @@ class UsageScope:
     parent_task_id: str = ""
     category: str = "task"
     source: str = "llm"
+    review_skill: str = ""
+    review_wave_id: str = ""
+    review_slot_id: str = ""
     global_limit_usd: Optional[float] = None
     root_limit_usd: Optional[float] = None
-
-
 @dataclass(frozen=True)
 class PhysicalAttemptContext:
     profile: Literal["owner_max", "owner_low", "task_local_low"]
@@ -341,8 +341,6 @@ def physical_attempt_limit(maximum: int) -> Iterator[None]:
         yield
     finally:
         _PHYSICAL_LIMIT.reset(token)
-
-
 def _claim_physical_dispatch() -> None:
     state = _PHYSICAL_LIMIT.get()
     if state is None:
@@ -351,8 +349,6 @@ def _claim_physical_dispatch() -> None:
         if state.used >= state.maximum:
             raise PhysicalAttemptLimitExceeded(f"physical attempt limit exhausted ({state.used}/{state.maximum})")
         state.used += 1
-
-
 def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
     bound = _CURRENT_SCOPE.get() or UsageScope()
     scope = UsageScope(
@@ -362,6 +358,7 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
         parent_task_id=str(request.parent_task_id or bound.parent_task_id or ""),
         category=str(request.category or bound.category or "task"),
         source=str(request.source or bound.source or "llm"),
+        **{key: str(getattr(bound, key, "") or "") for key in REVIEW_ATTRIBUTION_KEYS},
         global_limit_usd=(
             request.global_limit_usd if request.global_limit_usd is not None else bound.global_limit_usd
         ),
@@ -372,8 +369,6 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
     if request.global_limit_usd is None and scope.global_limit_usd is not None:
         request = replace(request, global_limit_usd=scope.global_limit_usd)
     return request, scope
-
-
 from ouroboros._usage_rows_memo import (  # noqa: F401,E402  (re-exported seam)
     _LedgerRowsMemo,
     _ROWS_MEMO,
@@ -685,8 +680,6 @@ def _candidate_request_fields(request: AttemptRequest) -> Dict[str, Any]:
         "candidate_measurement_kind": request.candidate_measurement_kind,
         "physical_context": asdict(request.physical_context) if request.physical_context else None,
     }
-
-
 def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
     """Atomically check global/root limits and append a ``reserved`` record."""
     request, scope = _merge_scope(request)
@@ -760,6 +753,7 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                     "parent_task_id": scope.parent_task_id,
                     "category": scope.category,
                     "source": scope.source,
+                    **{key: str(getattr(scope, key, "") or "") for key in REVIEW_ATTRIBUTION_KEYS},
                     "global_limit_usd": request.global_limit_usd,
                     "root_limit_usd": scope.root_limit_usd,
                     **_candidate_request_fields(request),
@@ -836,13 +830,17 @@ def _append_single_settled_row(
         records = _read_records_locked(root)
         existing = _final_rows(records).get(attempt_id)
         if existing is not None:
-            if any(existing.get(key) != row.get(key) for key in comparable):
+            def identity_value(source: Dict[str, Any], key: str) -> Any:
+                # Rows written before physical_attempt_v1 omitted these optional
+                # keys. Missing and explicit empty are the same legacy identity;
+                # a non-empty wave/slot still conflicts with either one.
+                return str(source.get(key) or "") if key in REVIEW_ATTRIBUTION_KEYS else source.get(key)
+
+            if any(identity_value(existing, key) != identity_value(row, key) for key in comparable):
                 raise UsageAccountingError(f"conflicting settled-row identity: {attempt_id}")
             return attempt_id
         _append_rows_locked(root, records, [row])
     return attempt_id
-
-
 def record_subscription_session(
     session_id: str,
     *,
@@ -862,6 +860,7 @@ def record_subscription_session(
     spend_estimated: bool = False,
     credential_profile_id: str = "",
     access_profile: str = "",
+    review_skill: str = "", review_wave_id: str = "", review_slot_id: str = "",
 ) -> str:
     """Record one idempotent subscription session; None remains undisclosed."""
     stable_id, route_id = str(session_id or "").strip(), str(route or "").strip()
@@ -872,6 +871,7 @@ def record_subscription_session(
     ensure_legacy_imported(root)
     identity = hashlib.sha256(stable_id.encode("utf-8")).hexdigest()
     attempt_id = f"session-{identity[:24]}"
+    attribution = {"review_skill": review_skill, "review_wave_id": review_wave_id, "review_slot_id": review_slot_id}
     row = {
         "kind": "subscription_session",
         "attempt_id": attempt_id,
@@ -892,6 +892,7 @@ def record_subscription_session(
         "parent_task_id": str(parent_task_id or bound.parent_task_id or ""),
         "category": str(category or bound.category or "subagent"),
         "source": str(source or bound.source or "delegated_subagent"),
+        **{key: str(attribution[key] or getattr(bound, key, "") or "") for key in REVIEW_ATTRIBUTION_KEYS},
         "subscription_route": route_id,
         "subscription_reset_at": str(reset_at or ""),
         # Empty profile/access means the engine reported none.
@@ -901,10 +902,8 @@ def record_subscription_session(
     }
     return _append_single_settled_row(root, row, comparable=(
         "kind", "model", "provider", "task_id", "root_task_id", "parent_task_id",
-        "category", "source", "subscription_route", "session_id_sha256",
+        "category", "source", *REVIEW_ATTRIBUTION_KEYS, "subscription_route", "session_id_sha256",
     ))
-
-
 def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> Dict[str, Any]:
     with _locked(reservation.drive_root):
         records = _read_records_locked(reservation.drive_root)
@@ -925,6 +924,7 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
             "parent_task_id": str(current.get("parent_task_id") or ""),
             "category": str(current.get("category") or "task"),
             "source": str(current.get("source") or "llm"),
+            **{key: str(current.get(key) or "") for key in REVIEW_ATTRIBUTION_KEYS},
             "global_limit_usd": current.get("global_limit_usd"),
             "root_limit_usd": current.get("root_limit_usd"),
             **{key: current.get(key) for key in _CANDIDATE_ROW_FIELDS if key in current},

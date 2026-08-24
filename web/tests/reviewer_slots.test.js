@@ -51,8 +51,8 @@ test('the standing note states the POLICY, never the current routing', () => {
     // The unconditional claim, in the shapes it could come back as.
     assert.doesNotMatch(markup, /review runs? on subscriptions/i);
     assert.doesNotMatch(markup, /reviews? run on your subscription/i);
-    // The API-only surfaces sentence is unconditional AND true, so it stays.
-    assert.match(markup, /API-only surfaces today/);
+    assert.match(markup, /skill\s+review follow their configured rows/i);
+    assert.match(markup, /Task acceptance remains API-only/i);
 });
 
 

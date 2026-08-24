@@ -95,7 +95,8 @@ def _skill_prompt_contract_hash() -> str:
 
 
 def skill_review_contract_fingerprint(
-    models: List[str], *, required_items: Any = (), review_profile: str = ""
+    models: List[str], *, required_items: Any = (), review_profile: str = "",
+    delivery: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Identity of the skill-review panel contract (Q17/Q22 pattern:
     plan_review's ``reviewer_config_fingerprint``): the configured roster, the
@@ -107,23 +108,41 @@ def skill_review_contract_fingerprint(
     prompt_contract = _skill_prompt_contract_hash()
     if not prompt_contract:
         return ""  # unknown contract never matches (fail-open toward paying)
-    # The RESOLVED review effort is contract identity too (synthesis F4): the
-    # skill panel dispatches every slot at resolve_effort("review") (see
-    # tools/review.py::_query_model), and a reviewer at a different effort is
-    # a different contract — changing the effort lapses free replay.
+    # Preserve the exact historical bytes for a genuinely unchanged legacy
+    # API/global-effort panel. Structured identity and explicit session routes
+    # use the canonical per-row contract, sorted by stable owner slot id so a
+    # reorder alone does not lapse replay.
     from ouroboros.config import resolve_effort
 
-    payload = json.dumps(
-        {
+    identity: Dict[str, Any]
+    if not delivery or delivery.get("legacy_skill_fingerprint"):
+        identity = {
             "models": [str(model) for model in (models or [])],
-            "required_items": [str(item) for item in (required_items or ())],
-            "prompt_contract": prompt_contract,
-            "review_profile": str(review_profile or ""),
             "effort": str(resolve_effort("review") or ""),
-        },
-        sort_keys=True,
-        ensure_ascii=False,
-    )
+        }
+    else:
+        rows = [
+            {
+                "slot_id": str(slot_id or ""),
+                "route": str(getattr(route, "value", route) or ""),
+                "target": str(model or ""),
+                "session_target": str(session_target or ""),
+                "profile": str(profile or ""),
+                "effort": str(effort or ""),
+            }
+            for model, route, effort, session_target, profile, slot_id in zip(
+                delivery.get("models") or [], delivery.get("routes") or [],
+                delivery.get("efforts") or [], delivery.get("session_targets") or [],
+                delivery.get("session_profiles") or [], delivery.get("slot_ids") or [],
+            )
+        ]
+        identity = {"reviewer_rows": sorted(rows, key=lambda row: row["slot_id"])}
+    identity.update({
+        "required_items": [str(item) for item in (required_items or ())],
+        "prompt_contract": prompt_contract,
+        "review_profile": str(review_profile or ""),
+    })
+    payload = json.dumps(identity, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

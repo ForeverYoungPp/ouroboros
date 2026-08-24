@@ -616,6 +616,7 @@ def test_lifecycle_timeout_terminal_merges_the_dispatch_marker(tmp_path, monkeyp
     rows = _history_rows(tmp_path)
     assert rows and rows[-1]["status"] == "timeout"
     assert rows[-1]["paid"] is True  # merged from the marker, result was None
+    assert rows[-1]["usage_attribution_schema"] == "physical_attempt_v1"
     assert rows[-1]["review_contract_fingerprint"] == "cf-9"
     assert rows[-1]["rebuttal_sha256"] == "reb-9"
     assert load_dispatch_markers(drive, "demo") == []  # merge cleared it
@@ -714,6 +715,7 @@ def test_concurrent_wave_markers_are_append_only_and_each_merge_clears_its_own(t
     # wave A into the history as a fake infra terminal.
     markers = load_dispatch_markers(drive, "demo")
     assert {m["wave_id"] for m in markers} == {"wave-A", "wave-B"}
+    assert {m["usage_attribution_schema"] for m in markers} == {"physical_attempt_v1"}
     assert _history_rows(tmp_path) == []
     assert count_paid_skill_review_cycles(
         drive, "demo", "manual:demo", content_hash="h-1",
@@ -728,6 +730,7 @@ def test_concurrent_wave_markers_are_append_only_and_each_merge_clears_its_own(t
     })
     rows = _history_rows(tmp_path)
     assert [row["status"] for row in rows] == ["clean"]  # the verdict, not "interrupted"
+    assert rows[0]["usage_attribution_schema"] == "physical_attempt_v1"
     assert rows[-1]["paid"] is True
     assert {m["wave_id"] for m in load_dispatch_markers(drive, "demo")} == {"wave-B"}
     assert count_paid_skill_review_cycles(

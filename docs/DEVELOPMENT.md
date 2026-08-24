@@ -1641,6 +1641,14 @@ Before every commit, verify the following:
   invented — so "which account paid, under which access" is answerable from the ledger
   row, the settled event, and (for reviewer slots) the last-execution file. Those are
   three separate stores, deliberately not joined into one applied receipt.
+- [ ] New Skill Review waves attribute every canonical usage row with the exact
+  `review_skill`, `review_wave_id`, and stable `review_slot_id`. API attempts inherit
+  these fields through `UsageScope`; agent sessions persist them, plus review
+  category/source, in the existing `RunCustody` start/replay facts so restart and late
+  settlement pass them explicitly to `record_subscription_session`. The history row's
+  `physical_attempt_v1` marker only declares that this join key exists; lazy detail
+  projects the same `usage_attempts.jsonl` rows and persists no totals. Pre-marker waves
+  stay “exact attribution unavailable” and must never be reconstructed by time/model.
 - [ ] `cost_final` on a projection is a COUNT of open rows (`non_final_rows`), never a
   truthiness test on a dollar sum: a reserved/dispatched/unresolved row, a settled row
   with an unknown price, and a settled row its writer marked non-final are each open

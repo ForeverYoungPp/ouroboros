@@ -23,11 +23,9 @@ absent, the legacy comma-lists (``OUROBOROS_REVIEW_MODELS`` /
 read into rows, and the global Review / Scope Review efforts are copied into
 each row. There is NO permanent double-write: once the structured key is
 saved, the comma keys become a derived runtime projection
-(``project_reviewer_slots_into_env``) that only exists for the surfaces that
-stay on the API by owner decision (D15 — task acceptance and skill review
-consume API rows only; harness delivery is commit-triad/scope/advisory territory,
-and plan review follows each configured triad row's own delivery kind, spec-gate
-redesign 2026-08-15).
+(``project_reviewer_slots_into_env``) for legacy consumers. Task acceptance
+stays API-only by owner decision (D15); commit, scope, plan, advisory, and skill
+review follow their configured delivery rows.
 
 Malformed configuration RAISES: mapping a typo to ``api_chat`` would silently
 spend the API money the owner configured the row to move off of, and mapping
@@ -76,9 +74,8 @@ class ConfiguredReviewerSlot:
     target_id: str  # API model id, or opaque ``harness[=model]`` session spec
     effort: str = ""  # "" = the surface's global default
     # The opaque per-row session spec. Structured agent_session rows carry
-    # their target here; api rows and LEGACY session rows carry '' — a legacy
-    # row's delivery stayed on the shared session-route key (phase-5 shape),
-    # and the empty value is what keeps that fallback alive downstream.
+    # their target here; api rows carry ''. Legacy session rows resolve the
+    # same shared route once into this row so delivery/fingerprint see one fact.
     session_target: str = ""
     # Optional manual credential pin (Q2-в): '' = the daemon's rotation policy
     # (D28 default). Meaningful on agent_session rows only.
@@ -269,8 +266,8 @@ def parse_reviewer_slots(raw: str) -> ReviewerSlotConfig:
 # ---------------------------------------------------------------------------
 
 
-def _shared_session_route_spec() -> tuple[str, str]:
-    """The legacy shared session route as ``(identity, effort)``.
+def _shared_session_route_spec() -> tuple[str, str, str]:
+    """The legacy shared session route as ``(identity, effort, profile)``.
 
     Identity is ``harness[=model]`` — route identity ONLY, effort split off so
     the per-slot effort field stays the single SSOT (D1/6.3). '' when no shared
@@ -281,9 +278,9 @@ def _shared_session_route_spec() -> tuple[str, str]:
 
     route = review_session_route()
     if route is None:
-        return "", ""
+        return "", "", ""
     identity = route.route_id + (f"={route.model}" if route.model else "")
-    return identity, str(route.effort or "")
+    return identity, str(route.effort or ""), str(route.profile_id or "")
 
 
 def _legacy_rows(models: List[str], route_env_key: str, effort: str,
@@ -292,7 +289,7 @@ def _legacy_rows(models: List[str], route_env_key: str, effort: str,
     from ouroboros.review_substrate import configured_review_routes, slot_id_for_row
 
     routes = configured_review_routes(route_env_key, len(models))
-    session_target, session_effort = _shared_session_route_spec()
+    session_target, session_effort, session_profile = _shared_session_route_spec()
     rows: List[ConfiguredReviewerSlot] = []
     for idx, model in enumerate(models):
         session = routes[idx] is ReviewRouteKind.AGENT_SESSION
@@ -309,6 +306,7 @@ def _legacy_rows(models: List[str], route_env_key: str, effort: str,
                 target_id=session_target,
                 session_target=session_target,
                 effort=session_effort or effort,
+                profile_id=session_profile,
             ))
         else:
             # An api row keeps its provider-tagged model as the route identity.
@@ -390,8 +388,7 @@ def reviewer_slot_config_error() -> str:
 
 
 def commit_triad_rows() -> List[ConfiguredReviewerSlot]:
-    """The commit-triad rows (the ONE surface whose rows may be delegated,
-    beside scope and advisory — D15)."""
+    """Configured triad rows shared by commit, plan, and skill review."""
     return list(load_reviewer_slot_config().triad)
 
 
@@ -431,7 +428,7 @@ def structured_scope_review_slots() -> Optional[list]:
     ]
 
 
-def commit_triad_delivery() -> Dict[str, list]:
+def commit_triad_delivery() -> Dict[str, Any]:
     """Aligned per-row delivery vectors for the commit triad, one call.
 
     The commit surface consumes rows as parallel lists (models for display and
@@ -442,7 +439,8 @@ def commit_triad_delivery() -> Dict[str, list]:
     """
     from ouroboros.review_execution import ReviewRouteKind
 
-    rows = commit_triad_rows()
+    config = load_reviewer_slot_config()
+    rows = list(config.triad)
     return {
         "models": [row.target_id for row in rows],
         "routes": [
@@ -453,6 +451,9 @@ def commit_triad_delivery() -> Dict[str, list]:
         "session_targets": [row.session_target for row in rows],
         "session_profiles": [row.profile_id for row in rows],
         "slot_ids": [row.slot_id for row in rows],
+        "legacy_skill_fingerprint": (
+            config.source == "legacy" and all(not row.is_session for row in rows)
+        ),
     }
 
 
@@ -472,23 +473,17 @@ def row_effort(row: ConfiguredReviewerSlot, surface: str) -> str:
 
 
 def api_fallback_disclosure(config: "ReviewerSlotConfig") -> Dict[str, Any]:
-    """What the API-pinned surfaces (task acceptance, skill review) will REALLY
-    run when a group has no api_chat row left (D4/D15). Plan review is not one of
-    them: it rides each configured triad row's own delivery kind.
+    """What API-pinned task acceptance runs with no triad api_chat row (D4/D15).
 
-    When every commit-triad (or scope) row is delegated, those surfaces cannot
-    run on a delegated route — they stay on the API by owner decision — so they
-    fall back to the shipped DEFAULT models and spend API money. That is a real
-    substitution the UI must not paper over: this returns the substituted model
-    list per affected group, or an empty dict when every group keeps an api row.
+    The review gates follow configured delivery rows. Task acceptance remains
+    API-only, so an all-session triad makes its legacy projection fall back to
+    shipped defaults. That real paid substitution stays owner-visible.
     """
     from ouroboros.config import SETTINGS_DEFAULTS
 
     out: Dict[str, Any] = {}
     if config.triad and not any(not r.is_session for r in config.triad):
         out["triad"] = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"]).split(",")
-    if config.scope and not any(not r.is_session for r in config.scope):
-        out["scope"] = str(SETTINGS_DEFAULTS["OUROBOROS_SCOPE_REVIEW_MODELS"]).split(",")
     return out
 
 
@@ -520,15 +515,12 @@ def _fallback_warning_text(disclosure: Dict[str, Any]) -> str:
     models they will use when they run."""
     if not disclosure:
         return ""
-    surfaces = " and ".join(
-        {"triad": "commit review", "scope": "scope review"}[g] for g in disclosure)
     models = sorted({m for row in disclosure.values() for m in row})
     return (
-        f"Every {surfaces} row runs on an agent subscription, so those reviews "
-        f"spend subscription windows instead of API budget and never fall back "
-        f"to API spend. Task acceptance and skill review are API-only surfaces "
-        f"today: they keep running on the shipped default models "
-        f"({', '.join(models)}); plan review follows each triad row's own delivery."
+        "Every commit, plan, and skill-review triad row runs on an agent "
+        "subscription, so those reviews spend subscription windows instead of "
+        "API budget and never fall back to API spend. Task acceptance remains "
+        f"API-only and uses the shipped default models ({', '.join(models)})."
     )
 
 
@@ -562,10 +554,10 @@ def _record_api_fallback_substitution(disclosure: Dict[str, Any]) -> None:
 def project_reviewer_slots_into_env() -> None:
     """Project the structured config into the legacy env keys, at env-apply time.
 
-    Task acceptance and skill review stay on the API by owner decision (D15) and
-    keep reading ``get_review_models()``; when the owner's triad mixes in
-    delegated rows, those surfaces must see ONLY the API rows (plan review reads
-    the structured rows directly, both delivery kinds).
+    Task acceptance stays on the API by owner decision (D15) and keeps reading
+    ``get_review_models()``; when the owner's triad mixes in delegated rows it
+    must see ONLY the API rows. Commit, plan, and skill review read structured
+    rows directly, including both delivery kinds.
     This is a runtime DERIVATION, not a second write: settings.json holds the
     structured key alone, and a stale comma value there is overwritten here
     rather than winning silently.
@@ -598,8 +590,8 @@ def project_reviewer_slots_into_env() -> None:
             if api_triad:
                 os.environ["OUROBOROS_REVIEW_MODELS"] = ",".join(api_triad)
             else:
-                # An all-delegated triad leaves the API surfaces (D15) on the
-                # shipped defaults rather than on zero reviewers.
+                # An all-delegated triad leaves API-only task acceptance (D15)
+                # on shipped defaults rather than on zero reviewers.
                 os.environ.pop("OUROBOROS_REVIEW_MODELS", None)
             if api_scope:
                 os.environ["OUROBOROS_SCOPE_REVIEW_MODELS"] = ",".join(api_scope)
@@ -615,9 +607,9 @@ def project_reviewer_slots_into_env() -> None:
                 import logging
 
                 logging.getLogger(__name__).warning(
-                    "reviewer slots: every %s row is delegated; the API-pinned "
-                    "review surfaces fall back to shipped default models %s and "
-                    "spend API budget",
+                    "reviewer slots: every %s row is delegated; API-only task "
+                    "acceptance falls back to shipped default models %s and "
+                    "spends API budget",
                     " and ".join(disclosure), disclosure,
                 )
                 _record_api_fallback_substitution(disclosure)

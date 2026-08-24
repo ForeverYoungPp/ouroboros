@@ -9,12 +9,13 @@ def _fake_build_prompt(ctx, drive_root, skill, *, manifest_dump, content_hash, f
     return f"PROMPT[{file_pack}]", 7, {"adv": file_pack}
 
 
-def _run(file_packs, run_review, required_items=()):
+def _run(file_packs, run_review, required_items=(), *, models=None, row_plan=None):
     return run_skill_review_passes(
         None, None, None,
         evidence={"manifest_dump": "", "content_hash": "h", "history": [],
                   "review_rebuttal": "", "required_items": required_items},
-        file_packs=file_packs, models=["m"],
+        file_packs=file_packs, models=models or ["m"], row_plan=row_plan,
+        session_root="/repo",
         build_prompt=_fake_build_prompt, run_review=run_review,
     )
 
@@ -48,6 +49,43 @@ def test_chunked_merges_results_into_one_object():
     parsed = json.loads(text)
     assert isinstance(parsed, dict) and "results" in parsed  # not a bare list
     assert len(parsed["results"]) == 3  # every chunk's record merged
+
+
+def test_chunked_passes_keep_the_full_row_plan_and_exact_session_evidence():
+    from ouroboros.review_execution import ReviewRouteKind
+
+    row_plan = {
+        "routes": [ReviewRouteKind.AGENT_SESSION, ReviewRouteKind.API_CHAT],
+        "efforts": ["high", "medium"],
+        "session_targets": ["codex=gpt-5.6-sol", ""],
+        "session_profiles": ["profile-a", ""],
+        "slot_ids": ["session-slot", "api-slot"],
+    }
+    calls = []
+
+    def fake_run_review(ctx, **kwargs):
+        calls.append(kwargs)
+        return json.dumps({"results": [
+            {"model": model, "text": json.dumps([
+                {"item": "x", "verdict": "PASS", "reason": "ok"},
+            ])}
+            for model in kwargs["models"]
+        ]})
+
+    _prompt, _adv, _text, err = _run(
+        ["p1", "p2"], fake_run_review, models=["session-model", "api-model"],
+        row_plan=row_plan,
+    )
+
+    assert err == ""
+    assert len(calls) == 2
+    for idx, call in enumerate(calls, 1):
+        assert call["routes"] == row_plan["routes"]
+        assert call["row_plan"] is row_plan
+        assert call["session_root"] == "/repo"
+        assert "exact frozen skill evidence" in call["session_task"]
+        assert f"PROMPT[p{idx}]" in call["session_task"]
+        assert f"PART {idx} of 2" in call["session_task"]
 
 
 def test_chunk_service_error_propagates_as_infra_error():

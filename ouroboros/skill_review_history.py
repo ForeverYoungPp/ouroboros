@@ -13,6 +13,7 @@ from ouroboros.tools.review_helpers import format_obligation_excerpt
 from ouroboros.utils import append_jsonl, iter_jsonl_objects, jsonl_append_lock_path, utc_now_iso
 
 log = logging.getLogger(__name__)
+USAGE_ATTRIBUTION_SCHEMA = "physical_attempt_v1"
 
 
 def _redact_history_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -165,6 +166,7 @@ def write_dispatch_marker(
         "content_hash": str(content_hash or ""),
         "root_task_id": str(root_task_id or ""),
         "paid": True,
+        "usage_attribution_schema": USAGE_ATTRIBUTION_SCHEMA,
         "review_contract_fingerprint": str(review_contract_fingerprint or ""),
         "rebuttal_sha256": str(rebuttal_sha256 or ""),
     }
@@ -198,6 +200,7 @@ def _flush_orphan_dispatch_marker(
         "group_id": str(marker.get("group_id") or ""),
         "root_task_id": str(marker.get("root_task_id") or ""),
         "paid": True,
+        "usage_attribution_schema": str(marker.get("usage_attribution_schema") or ""),
         "review_contract_fingerprint": str(marker.get("review_contract_fingerprint") or ""),
         "rebuttal_sha256": str(marker.get("rebuttal_sha256") or ""),
         "job_id": str(marker.get("wave_id") or ""),
@@ -226,7 +229,7 @@ def _merge_dispatch_marker_facts(
     merged = dict(payload)
     if marker.get("paid") and not merged.get("paid"):
         merged["paid"] = True
-    for key in ("review_contract_fingerprint", "rebuttal_sha256",
+    for key in ("review_contract_fingerprint", "rebuttal_sha256", "usage_attribution_schema",
                 "group_id", "content_hash", "root_task_id"):
         if marker.get(key) and not merged.get(key):
             merged[key] = marker[key]

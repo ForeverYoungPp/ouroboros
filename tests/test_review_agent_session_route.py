@@ -615,6 +615,31 @@ def test_a_typed_refusal_is_not_relaunched_into_a_second_billed_session(tmp_path
     assert actor["transport_status"] == "provider_transport_error"
 
 
+def test_multi_model_wrapper_preserves_typed_refusal_into_skill_actor_record():
+    from ouroboros.tools.review import _parse_model_response
+    from ouroboros.triad_review import parse_model_review_results
+
+    envelope = _parse_model_response("claude-fable-5", {
+        "error": "Error: route unavailable",
+        "slot_id": "skill-slot-1",
+        "failure_code": "agent_session_route_unavailable",
+        "reset_at": "2030-01-01T00:00:00Z",
+        "http_status": 429,
+        "transport_status": "unavailable",
+    }, None)
+    parsed = parse_model_review_results(
+        {"results": [envelope]}, required_items=("manifest_schema",),
+    )
+
+    assert envelope["failure_code"] == "agent_session_route_unavailable"
+    actor = parsed.actor_records[0].to_dict()
+    assert actor["slot_id"] == "skill-slot-1"
+    assert actor["failure_code"] == "agent_session_route_unavailable"
+    assert actor["reset_at"] == "2030-01-01T00:00:00Z"
+    assert actor["http_status"] == 429
+    assert actor["transport_status"] == "unavailable"
+
+
 def test_a_pool_exhausted_terminal_is_typed_like_a_spent_window(tmp_path, fake_route):
     """Cross-repo forward-compat (B1): a newer engine reports a spent credential POOL
     with its own RunFailureCode. Same timer-healing semantics, same exception class —
@@ -845,10 +870,17 @@ def _run_session_directly(tmp_path, **overrides):
     return run_delegated_review_session(invocation=SessionInvocation(**invocation), **kwargs)
 
 
-def _lineage_scope():
+def _lineage_scope(*, skill_review=False):
     from ouroboros.usage_accounting import UsageScope
 
-    return UsageScope(task_id="t-agent", root_task_id="t-root", parent_task_id="t-parent")
+    review = ({
+        "category": "skill_review_review", "source": "review_substrate",
+        "review_skill": "happy_farm", "review_wave_id": "wave-restart",
+        "review_slot_id": "skill-triad-2",
+    } if skill_review else {})
+    return UsageScope(
+        task_id="t-agent", root_task_id="t-root", parent_task_id="t-parent", **review,
+    )
 
 
 def _custody_rows(drive_root):
@@ -1050,7 +1082,7 @@ def test_restart_reconciliation_settles_review_spend_to_the_recorded_root(
     with monkeypatch.context() as m:
         m.setattr(ua, "record_subscription_session",
                   lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ledger down")))
-        with usage_scope(_lineage_scope()):
+        with usage_scope(_lineage_scope(skill_review=True)):
             facts = _run_session_directly(tmp_path, task_id="t-agent")
     assert facts["settlement"]["settled"] is False
 
@@ -1069,6 +1101,13 @@ def test_restart_reconciliation_settles_review_spend_to_the_recorded_root(
     assert sessions[-1]["task_id"] == "t-agent"
     assert sessions[-1]["root_task_id"] == "t-root", sessions[-1]
     assert sessions[-1]["parent_task_id"] == "t-parent"
+    assert (sessions[-1]["category"], sessions[-1]["source"]) == (
+        "skill_review_review", "review_substrate",
+    )
+    assert (
+        sessions[-1]["review_skill"], sessions[-1]["review_wave_id"],
+        sessions[-1]["review_slot_id"],
+    ) == ("happy_farm", "wave-restart", "skill-triad-2")
 
 
 def test_pending_invocation_recovery_replays_the_recorded_lineage(tmp_path, fake_route):
@@ -1081,7 +1120,7 @@ def test_pending_invocation_recovery_replays_the_recorded_lineage(tmp_path, fake
 
     fake_route.start_error = ClaudexorUnavailable("daemon_unreachable", "boom", status_code=0)
     state: dict = {}
-    with usage_scope(_lineage_scope()):
+    with usage_scope(_lineage_scope(skill_review=True)):
         with pytest.raises(ClaudexorUnavailable):
             _run_session_directly(tmp_path, task_id="t-agent", retry_state=state)
     assert state["pending_invocation_id"]
@@ -1091,6 +1130,12 @@ def test_pending_invocation_recovery_replays_the_recorded_lineage(tmp_path, fake
     record = pending[0]
     assert record["root_task_id"] == "t-root"
     assert record["parent_task_id"] == "t-parent"
+    assert (record["category"], record["source"]) == (
+        "skill_review_review", "review_substrate",
+    )
+    assert (record["review_skill"], record["review_wave_id"], record["review_slot_id"]) == (
+        "happy_farm", "wave-restart", "skill-triad-2",
+    )
 
     # The sweep recovers the invocation with NO ambient scope: the stored
     # record is the single source of the replay's facts, lineage included.
@@ -1106,6 +1151,10 @@ def test_pending_invocation_recovery_replays_the_recorded_lineage(tmp_path, fake
               if line.strip()]
     sessions = [r for r in ledger if r.get("kind") == "subscription_session"]
     assert sessions and sessions[-1]["root_task_id"] == "t-root"
+    assert (sessions[-1]["review_skill"], sessions[-1]["review_wave_id"],
+            sessions[-1]["review_slot_id"]) == (
+        "happy_farm", "wave-restart", "skill-triad-2",
+    )
 
 
 def test_retry_replays_the_stored_route_and_registers_nothing_new(tmp_path, fake_route,
@@ -1643,6 +1692,127 @@ def _scope_ctx(tmp_path):
     return ToolContext(repo_dir=gov, drive_root=drive)
 
 
+def test_skill_review_all_session_composition_uses_strict_schema_and_no_api_fallback(
+    tmp_path, fake_route, monkeypatch,
+):
+    """Skill Review → pass runner → shared substrate stays agentic end to end."""
+    import ouroboros.tools.review as review_tool
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.skill_review_passes import run_skill_review_passes
+
+    required = ("manifest_schema", "secrets_hygiene")
+    fake_route.detail = _terminal_detail(json.dumps({"findings": [
+        {"item": item, "verdict": "PASS", "severity": "advisory", "reason": "checked"}
+        for item in required
+    ]}), conformance="passed", model="fake-small")
+    sequence = {"value": 0}
+
+    def unique_start(self, request, *, idempotency_key=""):
+        self.start_requests.append(dict(request))
+        self.start_keys.append(str(idempotency_key))
+        sequence["value"] += 1
+        return {"runId": f"run-skill-{sequence['value']}", "runDir": "/tmp/fake-run"}
+
+    monkeypatch.setattr(FakeGateway, "start_run", unique_start)
+    no_api = FakeLLM()
+    monkeypatch.setattr(review_tool, "LLMClient", lambda: no_api)
+    ctx = _scope_ctx(tmp_path)
+    ctx.task_id = "skill-review-task"
+    root = tmp_path / "source-repo"
+    root.mkdir()
+    models = ["fake-review=fake-small", "fake-review=fake-small"]
+    row_plan = {
+        "routes": [ReviewRouteKind.AGENT_SESSION, ReviewRouteKind.AGENT_SESSION],
+        "efforts": ["high", "high"],
+        "session_targets": models,
+        "session_profiles": ["profile-a", "profile-b"],
+        "slot_ids": ["skill-slot-a", "skill-slot-b"],
+    }
+
+    _prompt, _evidence, result_text, error = run_skill_review_passes(
+        ctx, ctx.drive_root, SimpleNamespace(name="happy_farm"),
+        evidence={
+            "manifest_dump": "{}", "content_hash": "hash", "history": [],
+            "review_rebuttal": "", "required_items": required,
+        },
+        file_packs=["frozen payload bytes"], models=models, row_plan=row_plan,
+        session_root=str(root),
+        usage_attribution={"review_skill": "happy_farm", "review_wave_id": "wave-agentic"},
+        build_prompt=lambda *_a, **_k: ("STRICT SKILL PROMPT", 0, {}),
+        run_review=review_tool._handle_multi_model_review,
+    )
+
+    assert error == ""
+    result = json.loads(result_text)
+    assert result["model_count"] == 2
+    assert [row["slot_id"] for row in result["results"]] == [
+        "skill-slot-a", "skill-slot-b",
+    ]
+    starts = [request for instance in fake_route.instances for request in instance.start_requests]
+    assert len(starts) == 2
+    assert no_api.calls == []
+    assert {request["credentialProfileId"] for request in starts} == {"profile-a", "profile-b"}
+    assert all(request["scope"]["root"] == str(root) for request in starts)
+    assert all(request["outputSchema"]["properties"]["findings"]["minItems"] == 1
+               for request in starts)
+    assert all("exact frozen skill evidence" in request["prompt"] for request in starts)
+    assert all("Empty arrays and NO_FINDINGS are invalid" in request["prompt"]
+               and "manifest_schema" in request["prompt"] for request in starts)
+    ledger = [json.loads(line) for line in
+              (ctx.drive_root / "state" / "usage_attempts.jsonl").read_text().splitlines()
+              if line.strip()]
+    sessions = [row for row in ledger if row.get("kind") == "subscription_session"]
+    assert len(sessions) == 2
+    assert {row["review_slot_id"] for row in sessions} == {"skill-slot-a", "skill-slot-b"}
+    assert all(row["review_skill"] == "happy_farm" and
+               row["review_wave_id"] == "wave-agentic" for row in sessions)
+
+
+def test_skill_review_legacy_session_dispatch_keeps_shared_profile_pin(
+    tmp_path, fake_route, monkeypatch,
+):
+    import ouroboros.tools.review as review_tool
+    from ouroboros.reviewer_slot_config import commit_triad_delivery
+    from ouroboros.skill_review_passes import run_skill_review_passes
+
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.delenv(REVIEW_SESSION_ROUTE_ENV, raising=False)
+    monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "legacy/display-model")
+    monkeypatch.setenv(TRIAD_REVIEW_ROUTES_ENV, "agent_session")
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "fake-review=fake-small:high")
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROFILE", "legacy-profile")
+    delivery = commit_triad_delivery()
+    assert delivery["session_profiles"] == ["legacy-profile"]
+    fake_route.detail = _terminal_detail(json.dumps({"findings": [
+        {"item": "manifest_schema", "verdict": "PASS", "severity": "advisory",
+         "reason": "checked"},
+    ]}), conformance="passed")
+    no_api = FakeLLM()
+    monkeypatch.setattr(review_tool, "LLMClient", lambda: no_api)
+    ctx = _scope_ctx(tmp_path)
+
+    _prompt, _evidence, _result, error = run_skill_review_passes(
+        ctx, ctx.drive_root, SimpleNamespace(name="happy_farm"),
+        evidence={
+            "manifest_dump": "{}", "content_hash": "hash", "history": [],
+            "review_rebuttal": "", "required_items": ("manifest_schema",),
+        },
+        file_packs=["frozen"], models=delivery["models"], row_plan=delivery,
+        session_root=str(tmp_path),
+        usage_attribution={"review_skill": "happy_farm", "review_wave_id": "wave-legacy"},
+        build_prompt=lambda *_a, **_k: ("STRICT LEGACY PROMPT", 0, {}),
+        run_review=review_tool._handle_multi_model_review,
+    )
+
+    assert error == "" and no_api.calls == []
+    starts = [request for instance in fake_route.instances for request in instance.start_requests]
+    assert len(starts) == 1
+    assert starts[0]["harnesses"] == ["fake-review"]
+    assert starts[0]["credentialProfileId"] == "legacy-profile"
+    assert starts[0]["model"] == "fake-small"
+    assert starts[0]["effort"] == "high"
+
+
 def test_scope_session_delivery_never_builds_the_pack(tmp_path, fake_route, monkeypatch):
     """5.2 on scope: a delegated scope row goes out as a compact session task —
     checklist, contract and intent context intact (5.3), retrieval pointers and
@@ -2122,10 +2292,8 @@ def test_a_retrieving_row_can_actually_reach_sourced_evidence(tmp_path, monkeypa
 
 def test_session_schema_floor_matches_each_surfaces_clean_contract():
     """`{"findings": []}` is the honest clean verdict for a TRIAD session, but on
-    scope (eight mandatory rows) and advisory (empty checklist rejected by design)
-    it is a schema-conformant answer that can only land as parse_failure and block
-    the commit. The floor rides the schema so a conforming engine refuses the empty
-    answer up front while the session can still regenerate."""
+    scope and Skill Review (mandatory matrix rows) it is schema-conformant but
+    downstream-invalid. The floor lets a conforming engine regenerate instead."""
     from ouroboros.review_execution import (
         REVIEW_SESSION_OUTPUT_SCHEMA,
         review_session_output_schema,
@@ -2139,6 +2307,7 @@ def test_session_schema_floor_matches_each_surfaces_clean_contract():
     assert "minItems" not in REVIEW_SESSION_OUTPUT_SCHEMA["properties"]["findings"]
     shaped = review_session_output_schema("scope_review")
     assert shaped["properties"]["findings"]["minItems"] == 1
+    assert review_session_output_schema("skill_review")["properties"]["findings"]["minItems"] == 1
     # A shaped copy, never a mutation of the shared schema.
     assert "minItems" not in REVIEW_SESSION_OUTPUT_SCHEMA["properties"]["findings"]
 

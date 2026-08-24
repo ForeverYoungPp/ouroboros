@@ -13,6 +13,8 @@ from typing import Any, Dict, Optional, Sequence
 
 from ouroboros.usage_ledger import _number
 
+REVIEW_ATTRIBUTION_KEYS = ("review_skill", "review_wave_id", "review_slot_id")
+
 def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     settled = confirmed = estimated = reserved = unresolved = 0.0
     unknown = 0
@@ -168,3 +170,48 @@ def _breakdown_bucket(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "prompt_cache_ttls": prompt_cache_ttls,
     })
     return bucket
+
+
+_SKILL_ATTEMPT_FIELDS = (
+    "attempt_id", "review_slot_id", "kind", "state", "model", "provider", "source",
+    "cost_usd", "cost_final", "reservation_upper_bound_usd", "pricing_known",
+    "prompt_tokens", "completion_tokens", "cached_tokens", "subscription_route",
+    "subscription_reset_at", "credential_profile_id", "access_profile",
+)
+
+
+def _skill_review_usage_bucket(
+    rows: Sequence[Dict[str, Any]], *, review_skill: str, review_wave_id: str,
+    integrity_degraded: bool,
+) -> Dict[str, Any]:
+    """Project one exact Skill Review wave from canonical final attempt rows."""
+    selected = sorted(
+        (
+            row for row in rows
+            if str(row.get("review_skill") or "") == review_skill
+            and str(row.get("review_wave_id") or "") == review_wave_id
+        ),
+        key=lambda row: str(row.get("attempt_id") or ""),
+    )
+    grouped: Dict[str, list[Dict[str, Any]]] = {}
+    for row in selected:
+        grouped.setdefault(str(row.get("review_slot_id") or "(unattributed)"), []).append(row)
+    by_slot = {
+        slot: _with_integrity(_breakdown_bucket(grouped[slot]), integrity_degraded)
+        for slot in sorted(grouped)
+    }
+    result = _with_integrity(_breakdown_bucket(selected), integrity_degraded)
+    result.update({
+        "review_skill": review_skill,
+        "review_wave_id": review_wave_id,
+        "attempt_ids": [str(row.get("attempt_id") or "") for row in selected],
+        "attempts": [
+            {key: row.get(key) for key in _SKILL_ATTEMPT_FIELDS if key in row}
+            for row in selected
+        ],
+        "by_slot": by_slot,
+        "attribution_complete": bool(selected) and all(
+            str(row.get("review_slot_id") or "") for row in selected
+        ),
+    })
+    return result

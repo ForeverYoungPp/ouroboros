@@ -16,7 +16,7 @@ from ouroboros.utils import (
     utc_now_iso,
 )
 from ouroboros import config as _cfg
-from ouroboros.review_substrate import SLOT_ID_PREFIX, slot_id_for_row
+from ouroboros.review_substrate import SLOT_ID_PREFIX, TYPED_FAILURE_FACT_KEYS, slot_id_for_row
 from ouroboros.tools.registry import ToolEntry, ToolContext
 from ouroboros.triad_review import (
     REVIEW_JSON_ARRAY_CONTRACT,
@@ -331,8 +331,8 @@ def _handle_task_acceptance_review(
         },
         task_id=str(getattr(ctx, "task_id", "") or ""),
     )
-    # Task acceptance stays on the API by owner decision (D15: harness slots
-    # only for commit triad, scope, advisory). No route_env_key = api_chat pin.
+    # Task acceptance alone stays API-only by owner decision (D15); configured
+    # rows now also route commit, scope, advisory, plan, and Skill Review.
     slots = reviewer_slots(effort=resolve_effort("review"), role_hint="task acceptance")
     request.policy["min_successful_slots"] = _cfg.adaptive_quorum(len(slots))
     result = run_review_request(request, slots=slots, drive_root=pathlib.Path(ctx.drive_root), usage_ctx=ctx)
@@ -356,7 +356,7 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
                                 routes: list = None,
                                 session_task: str = "",
                                 session_root: str = "",
-                                row_plan: dict = None) -> str:
+                                row_plan: dict = None, surface: str = "multi_model_review", session_policy: dict = None, usage_attribution: dict = None) -> str:
     if models is None:
         models = []
     try:
@@ -366,12 +366,12 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 result = pool.submit(
                     asyncio.run,
-                    _multi_model_review_async(content, prompt, models, ctx, stable_prefix_len,
-                                              routes, session_task, session_root, row_plan),
+                    _multi_model_review_async(content, prompt, models, ctx, stable_prefix_len, routes,
+                                              session_task, session_root, row_plan, surface, session_policy, usage_attribution),
                 ).result()
         except RuntimeError:
-            result = asyncio.run(_multi_model_review_async(content, prompt, models, ctx, stable_prefix_len,
-                                                           routes, session_task, session_root, row_plan))
+            result = asyncio.run(_multi_model_review_async(content, prompt, models, ctx, stable_prefix_len, routes,
+                                                           session_task, session_root, row_plan, surface, session_policy, usage_attribution))
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         log.error("Multi-model review failed: %s", e, exc_info=True)
@@ -379,12 +379,9 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
 
 
 def _review_output_budget() -> int:
-    """Reviewer response reservation (default 65536). `OUROBOROS_REVIEW_MAX_TOKENS`
-    lets an operator LOWER it when a mega-diff's input pack plus the default
-    output reservation exceeds a reviewer endpoint's context cap (input + output
-    must fit; a verdict needs ~10K tokens, so shrinking the reservation preserves
-    FULL review input context instead of trimming evidence). Floor 8192 so the
-    knob can never squeeze a verdict into uselessness; never raises the default."""
+    """Reviewer response reservation. The operator may lower it to fit a full
+    input pack plus output in context; floor 8192 preserves a useful verdict and
+    the knob can never raise the 65536 default."""
     try:
         raw = int(os.environ.get("OUROBOROS_REVIEW_MAX_TOKENS", "") or 65536)
     except (TypeError, ValueError):
@@ -405,6 +402,7 @@ async def _query_model(
     effort: str = "",
     session_target: str = "",
     session_profile: str = "",
+    surface: str = "multi_model_review", session_policy: dict = None, usage_attribution: dict = None,
 ):
     async with semaphore:
         timeout_sec = _review_model_timeout_sec()
@@ -412,12 +410,11 @@ async def _query_model(
         try:
             from ouroboros.review_execution import ReviewRouteKind
             from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
-
             slot_route = route if route is not None else ReviewRouteKind.API_CHAT
             delegated = slot_route is ReviewRouteKind.AGENT_SESSION
             _out_budget = _review_output_budget()
             request = ReviewRequest(
-                surface="multi_model_review",
+                surface=surface,
                 goal="Run independent multi-model review over the supplied evidence.",
                 # 5.2: a session slot never receives the assembled api pack.
                 messages=[] if delegated else messages,
@@ -428,7 +425,8 @@ async def _query_model(
                 no_proxy=True,
                 session_task=session_task if delegated else "",
                 session_root=session_root if delegated else "",
-                policy={"output_contract": REVIEW_JSON_ARRAY_CONTRACT} if delegated else {},
+                policy=(session_policy or {"output_contract": REVIEW_JSON_ARRAY_CONTRACT}) if delegated else {},
+                usage_attribution=usage_attribution or {},
             )
             slot = ReviewSlot(
                 slot_id=slot_id,
@@ -458,9 +456,9 @@ async def _query_model(
                 timeout=timeout_sec,
             )
             actor = (run_result.actors or [{}])[0]
-            # The id the substrate REALLY ran under, so the durable actor record
-            # downstream carries it instead of re-deriving one from position.
+            # Carry the substrate's real row id instead of re-deriving position.
             ran_as = str(actor.get("slot_id") or slot_id)
+            typed = {key: actor.get(key) for key in TYPED_FAILURE_FACT_KEYS if actor.get(key) not in (None, "")}
             if actor.get("status") not in {"ok", "empty"}:
                 return model, {
                     "error": f"Error: {actor.get('error') or actor.get('status') or 'review failed'}",
@@ -468,6 +466,7 @@ async def _query_model(
                     "slot_id": ran_as,
                     "prompt_ref": actor.get("prompt_ref") or {},
                     "response_ref": actor.get("response_ref") or {},
+                    **typed,
                 }, None
             payload = {
                 "choices": [{"message": {"content": actor.get("raw_text") or ""}}],
@@ -493,7 +492,7 @@ async def _multi_model_review_async(content: str, prompt: str,
                                      routes: list = None,
                                      session_task: str = "",
                                      session_root: str = "",
-                                     row_plan: dict = None):
+                                     row_plan: dict = None, surface: str = "multi_model_review", session_policy: dict = None, usage_attribution: dict = None):
     from ouroboros.review_execution import ReviewRouteKind
 
     row_routes = list(routes or []) + [ReviewRouteKind.API_CHAT] * max(0, len(models) - len(routes or []))
@@ -559,7 +558,7 @@ async def _multi_model_review_async(content: str, prompt: str,
         _query_model(llm_client, m, messages, semaphore, ctx, slot_id=row_ids[idx],
                      route=row_routes[idx], session_task=session_task, session_root=session_root,
                      effort=row_efforts[idx], session_target=row_targets[idx],
-                     session_profile=row_profiles[idx])
+                     session_profile=row_profiles[idx], surface=surface, session_policy=session_policy, usage_attribution=usage_attribution)
         for idx, m in enumerate(models)
     ]
     results = await asyncio.gather(*tasks)
@@ -606,6 +605,7 @@ def _parse_model_response(model: str, result, headers_dict) -> dict:
             "slot_id": slot_id,
             "prompt_ref": result.get("prompt_ref", {}) if isinstance(result, dict) else {},
             "response_ref": result.get("response_ref", {}) if isinstance(result, dict) else {},
+            **{key: result.get(key) for key in TYPED_FAILURE_FACT_KEYS if isinstance(result, dict) and result.get(key) not in (None, "")},
         }
     try:
         choices = result.get("choices", [])

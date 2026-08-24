@@ -400,6 +400,49 @@ def test_skill_review_contract_fingerprint_tracks_roster_items_and_profile(monke
     assert base != skill_review_contract_fingerprint(["m1", "m2"], required_items=("a", "b"))
 
 
+def test_skill_review_contract_fingerprint_preserves_legacy_and_tracks_rows(monkeypatch):
+    from ouroboros.skill_review_cycles import skill_review_contract_fingerprint
+
+    monkeypatch.setenv("OUROBOROS_EFFORT_REVIEW", "high")
+    legacy = skill_review_contract_fingerprint(["m1", "m2"], required_items=("a",))
+    assert legacy == "e77552ac144b9d24324d1b73ddc83471fa78666357125d5c872d684d818487fc"
+    legacy_delivery = {
+        "legacy_skill_fingerprint": True,
+        "models": ["m1", "m2"], "routes": ["api_chat", "api_chat"],
+        "efforts": ["high", "high"], "session_targets": ["", ""],
+        "session_profiles": ["", ""], "slot_ids": ["slot_1", "slot_2"],
+    }
+    assert legacy == skill_review_contract_fingerprint(
+        ["m1", "m2"], required_items=("a",), delivery=legacy_delivery,
+    )
+
+    structured = dict(legacy_delivery, legacy_skill_fingerprint=False)
+    structured_fp = skill_review_contract_fingerprint(
+        ["m1", "m2"], required_items=("a",), delivery=structured,
+    )
+    assert structured_fp != legacy
+    reordered = {
+        key: ([value[1], value[0]] if isinstance(value, list) else value)
+        for key, value in structured.items()
+    }
+    assert structured_fp == skill_review_contract_fingerprint(
+        ["m2", "m1"], required_items=("a",), delivery=reordered,
+    )
+    changes = (
+        {"models": ["different-model", "m2"]},
+        {"routes": ["agent_session", "api_chat"]},
+        {"efforts": ["xhigh", "high"]},
+        {"session_targets": ["codex=different-model", ""]},
+        {"session_profiles": ["profile-a", ""]},
+        {"slot_ids": ["renamed-slot", "slot_2"]},
+    )
+    for delta in changes:
+        changed = dict(structured, **delta)
+        assert structured_fp != skill_review_contract_fingerprint(
+            ["m1", "m2"], required_items=("a",), delivery=changed,
+        ), delta
+
+
 def test_commit_contract_fingerprint_tracks_resolved_review_efforts(monkeypatch):
     """Synthesis F4 (commit side): the commit fingerprint's triad/scope rows
     carry RESOLVED efforts (surface defaults fill empty per-row efforts), so a
@@ -646,12 +689,14 @@ def _fake_manifest():
     )
 
 
-def _wire_review_skill(monkeypatch, tmp_path, *, content_hash, review_state, passes):
+def _wire_review_skill(
+    monkeypatch, tmp_path, *, content_hash, review_state, passes, delivery=None,
+):
     """Wire review_skill's heavy collaborators to a temp drive so the REAL
     pipeline (cycles gate → budget → panel seam) executes end to end."""
     import ouroboros.skill_review_passes as passes_mod
-    from ouroboros import config as cfg
     from ouroboros import skill_review
+    from ouroboros.review_execution import ReviewRouteKind
 
     drive = pathlib.Path(tmp_path)
     skill = types.SimpleNamespace(
@@ -670,7 +715,16 @@ def _wire_review_skill(monkeypatch, tmp_path, *, content_hash, review_state, pas
     monkeypatch.setattr(skill_review, "_official_hub_review_profile", lambda s: "")
     monkeypatch.setattr(skill_review, "_review_wave_budget_block",
                         lambda *a, **k: None)
-    monkeypatch.setattr(cfg, "get_review_models", lambda: ["m1", "m2"])
+    default_delivery = {
+        "models": ["m1", "m2"],
+        "routes": [ReviewRouteKind.API_CHAT, ReviewRouteKind.API_CHAT],
+        "efforts": ["", ""], "session_targets": ["", ""],
+        "session_profiles": ["", ""], "slot_ids": ["slot_1", "slot_2"],
+        "legacy_skill_fingerprint": True,
+    }
+    monkeypatch.setattr(
+        skill_review, "commit_triad_delivery", lambda: delivery or default_delivery,
+    )
     monkeypatch.setattr(passes_mod, "run_skill_review_passes", passes)
     return skill
 
@@ -749,6 +803,47 @@ def test_review_skill_replays_refuses_and_pays_functionally(tmp_path, monkeypatc
     unpaid_outcome = skill_review.review_skill(ctx, "demo", persist=False)
     assert unpaid_outcome.status == "pending" and unpaid_outcome.paid is False
     assert unpaid_outcome.wave_id == ""
+
+
+def test_review_skill_uses_configured_rows_and_prices_only_api(tmp_path, monkeypatch):
+    from ouroboros import skill_review
+    from ouroboros.review_execution import ReviewRouteKind
+
+    delivery = {
+        "models": ["codex=gpt-5.6-sol", "openai/gpt-5.6-terra"],
+        "routes": [ReviewRouteKind.AGENT_SESSION, ReviewRouteKind.API_CHAT],
+        "efforts": ["high", "high"],
+        "session_targets": ["codex=gpt-5.6-sol", ""],
+        "session_profiles": ["profile-a", ""],
+        "slot_ids": ["session-slot", "api-slot"],
+        "legacy_skill_fingerprint": False,
+    }
+    captured = {}
+
+    def passes(*args, **kwargs):
+        captured["passes"] = kwargs
+        return "prompt", {}, "", "stop after delivery capture"
+
+    _wire_review_skill(
+        monkeypatch, tmp_path, content_hash="h-route", review_state=None,
+        passes=passes, delivery=delivery,
+    )
+
+    def budget(_ctx, _skill, _packs, models):
+        captured["budget_models"] = list(models)
+        return None
+
+    monkeypatch.setattr(skill_review, "_review_wave_budget_block", budget)
+    outcome = skill_review.review_skill(
+        types.SimpleNamespace(task_id="", task_metadata={}, event_queue=None),
+        "demo", persist=False,
+    )
+
+    assert outcome.status == "pending"
+    assert captured["budget_models"] == ["openai/gpt-5.6-terra"]
+    assert captured["passes"]["models"] == delivery["models"]
+    assert captured["passes"]["row_plan"] is delivery
+    assert captured["passes"]["session_root"] == str(skill_review._REPO_ROOT)
 
 
 def test_review_skill_pipeline_order_pin():

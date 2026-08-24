@@ -26,17 +26,15 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
+from ouroboros._usage_rows import REVIEW_ATTRIBUTION_KEYS
 from ouroboros.utils import append_jsonl, utc_now_iso
-
 log = logging.getLogger(__name__)
-
 # The harness's own terminal vocabulary — one definition for the tool, the settler and
 # the reconciler (a second copy is how a "cancelled" run stayed live on one branch).
 TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "interrupted"})
 # The terminal states in which the run DID reach its contract write and DID act, so
 # absent containment evidence is a missing proof rather than "too early to tell".
 SUCCEEDED_STATES = frozenset({"succeeded"})
-
 # Durable row kinds. Every one of them is written to the event log the agent, the
 # supervisor and the forensic tooling already read.
 START_REQUESTED = "delegate_run_start_requested"
@@ -107,7 +105,6 @@ CANCEL_CONFIRMED = "confirmed"
 CANCEL_FAILED = "failed"
 CANCEL_CONTAINMENT_FAULT = "containment_fault_run_may_still_be_live"
 
-
 @dataclass
 class RunCustody:
     """One delegated run's lifecycle facts, replayed from the durable rows."""
@@ -122,12 +119,16 @@ class RunCustody:
     project_owned: bool = False
     root_task_id: str = ""
     parent_task_id: str = ""
+    category: str = "subagent"
+    source: str = "delegated_subagent"
+    review_skill: str = ""
+    review_wave_id: str = ""
+    review_slot_id: str = ""
     ledger_root: str = ""
     idempotency_key: str = ""
-    # The LOGICAL INVOCATION ID: minted once per intended invocation, reused verbatim as the wire Idempotency-Key
-    # on a transport retry of the SAME invocation (so the engine returns the run it already accepted), and fresh
-    # for every deliberately new ``delegate_start``. ``idempotency_key`` above is the content-derived identity
-    # used to FIND a pending invocation; this id is what actually rides the wire.
+    # Minted once per logical invocation and reused verbatim as the wire
+    # Idempotency-Key only for an exact transport retry; deliberately new work
+    # gets a fresh id. ``idempotency_key`` above only finds pending work.
     invocation_id: str = ""
     # Configured-actor binding. Empty on historical/root-legacy delegate starts.
     selected_subagent_id: str = ""
@@ -196,8 +197,6 @@ class RunCustody:
 # Process-local MEMOIZATION of the rows above — never the authority. A miss falls
 # through to the durable scan, which is why a restart no longer loses custody.
 _CUSTODY: Dict[str, RunCustody] = {}
-
-
 # -- durable record ------------------------------------------------------------
 
 def event_log_path(drive_root: Any) -> pathlib.Path:
@@ -290,7 +289,8 @@ def _iter_rows(path: pathlib.Path, tail_bytes: Optional[int] = None) -> Iterator
 _STARTED_STR_FIELDS: Tuple[Tuple[str, str], ...] = tuple(
     (attr, "route" if attr == "route_id" else attr) for attr in (
         "task_id", "route_id", "model", "profile_id", "project_id", "root_task_id",
-        "parent_task_id", "ledger_root", "idempotency_key", "invocation_id",
+        "parent_task_id", "category", "source", *REVIEW_ATTRIBUTION_KEYS,
+        "ledger_root", "idempotency_key", "invocation_id",
         "snapshot_id", "execution_root", "baseline_sha", "target_root",
         "authority_source", "access", "mode", "isolation",
         "selected_subagent_id", "config_fingerprint", "work_order_fingerprint",
@@ -311,7 +311,8 @@ _STARTED_FIRST_WINS_FACTS: Tuple[str, ...] = (
     "snapshot_id", "execution_root", "baseline_sha", "target_root",
     "authority_source", "resource_ref", "selected_subagent_id",
     "config_fingerprint", "work_order_fingerprint", "work_order_coverage",
-    "authority_fingerprint", "work_order_source_request")
+    "authority_fingerprint", "work_order_source_request", "category", "source",
+    *REVIEW_ATTRIBUTION_KEYS)
 
 from ouroboros.delegate_source_coverage import (
     apply_source_delivery_confirmation,
@@ -368,6 +369,8 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
             ),
             **{attr: str(row.get(key) or "") for attr, key in _STARTED_STR_FIELDS},
         )
+        entry.category = entry.category or "subagent"
+        entry.source = entry.source or "delegated_subagent"
         previous = state.get(run_id)
         setattr(entry, "_source_delivery_confirmations", [])
         if previous is not None:
@@ -625,25 +628,11 @@ def new_invocation_id() -> str:
 
 
 def invocation_record(drive_root: Any, invocation_id: str) -> Optional[Dict[str, Any]]:
-    """One invocation's durable fate: who requested it, the EXACT body it sent, the
-    resources that attempt bound, and how it resolved.
+    """Return the first request's exact body/binding and its durable fate.
 
-    ``state`` is ``pending`` (requested, never bound, never definitely refused —
-    the only state an explicit retry may replay), ``started`` (a run bound to it;
-    carried with its ``run_id`` so the caller can wait instead of re-posting), or
-    ``failed_definite`` (the daemon definitively refused; the id is dead — replaying
-    it against a since-reconfigured route is how a key wedges into a permanent 409).
-
-    ``request`` is the canonical POST body recorded before the wire attempt: a retry
-    replays THESE bytes, never a re-derivation, because the engine's replay match
-    digests the request and answers a same-key-different-digest POST with 409
-    ``idempotency_conflict``.
-
-    ``route``, ``project_id``, ``project_owned`` and ``idempotency_key`` are the
-    attempt facts that never ride the wire, read from the FIRST request row — the
-    minting — because the invocation stores its facts ONCE and a retry replays them.
-    A retry that re-derived any of these from the current route/model/workspace
-    context wrote a durable record contradicting the body it actually POSTed.
+    Only ``pending`` may replay the stored bytes; ``started`` waits on its bound
+    run and ``failed_definite`` is dead. First-request route, project, lineage,
+    usage attribution and isolation facts are never re-derived on retry.
     """
     target = str(invocation_id or "").strip()
     if not target:
@@ -662,6 +651,11 @@ def invocation_record(drive_root: Any, invocation_id: str) -> Optional[Dict[str,
                 "project_id": str(row.get("project_id") or ""),
                 "project_owned": bool(row.get("project_owned")),
                 "idempotency_key": str(row.get("idempotency_key") or ""),
+                "root_task_id": str(row.get("root_task_id") or ""),
+                "parent_task_id": str(row.get("parent_task_id") or ""),
+                "category": str(row.get("category") or "subagent"),
+                "source": str(row.get("source") or "delegated_subagent"),
+                **{key: str(row.get(key) or "") for key in REVIEW_ATTRIBUTION_KEYS},
                 # The C1 isolation binding: a retry reproduces EXACTLY these — the
                 # snapshot, the execution root, the baseline and the authority
                 # target the original attempt bound — never a re-derivation.
@@ -926,6 +920,8 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
                 task_id=custody.task_id,
                 root_task_id=custody.root_task_id,
                 parent_task_id=custody.parent_task_id,
+                category=custody.category,
+                source=custody.source,
                 prompt_tokens=disclosed_tokens(summary.get("inputTokens")),
                 completion_tokens=disclosed_tokens(summary.get("outputTokens")),
                 cached_tokens=disclosed_tokens(summary.get("cachedInputTokens")),
@@ -933,6 +929,7 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
                 spend_estimated=estimated,
                 credential_profile_id=applied_profile,
                 access_profile=applied_access,
+                **{key: getattr(custody, key) for key in REVIEW_ATTRIBUTION_KEYS},
             )
         except Exception:
             log.exception("Failed to record delegated subscription session %s", custody.run_id)
@@ -1405,6 +1402,9 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         project_id=record["project_id"], project_owned=bool(record["project_owned"]),
         root_task_id=str(record.get("root_task_id") or ""),
         parent_task_id=str(record.get("parent_task_id") or ""),
+        category=str(record.get("category") or "subagent"),
+        source=str(record.get("source") or "delegated_subagent"),
+        **{key: str(record.get(key) or "") for key in REVIEW_ATTRIBUTION_KEYS},
         # The sweep runs against the canonical root; a recovered run's ledger row
         # belongs there like every other (P34R.1).
         ledger_root=str(drive_root),

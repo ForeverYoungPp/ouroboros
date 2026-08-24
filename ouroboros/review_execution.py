@@ -1,13 +1,11 @@
 """Review execution: how a reviewer slot is delivered.
 
-This module is everything BELOW the review seam — the closed set of delivery
-routes, the immutable assignment handed to a route, the typed result handed
+This module is everything BELOW the review seam — delivery routes and the typed result handed
 back, and each route's own prompt rendering. ``review_substrate`` keeps the
 policy above the seam (attempt rails, persistence, parsing, actor projection,
 quorum) and knows only that a route exists.
 
-The dependency runs one way on purpose: this module never imports the
-coordinator, so a new route can be added here without touching review policy.
+The dependency runs one way: this module never imports the coordinator.
 """
 
 from __future__ import annotations
@@ -36,13 +34,10 @@ from ouroboros.triad_review import (
     empty_array_is_verified_clean,
     extract_json_array,
 )
-
 if TYPE_CHECKING:  # annotations only — importing the substrate here would cycle
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot
 
 log = logging.getLogger("review_execution")
-
-
 class ReviewRouteKind(str, Enum):
     """Closed set of review delivery routes.
 
@@ -429,16 +424,16 @@ def review_session_route() -> Any:
 
     raw = str(os.environ.get(REVIEW_SESSION_ROUTE_ENV, "")).strip()
     route = parse_subagent_harness(raw)
-    if route is None and raw and raw.lower() != "off":
+    if route is not None: return route
+    if raw and raw.lower() != "off":
         # Same silent-typo class as the subagent key's reader: a non-empty value
         # that parses to nothing would quietly re-route review sessions onto the
         # subagent route as if the review key were never set.
         log.warning(
-            "%s is set but unparseable (%r) — review sessions fall back to the "
-            "subagent route until it reads harness[=model][:effort]",
-            REVIEW_SESSION_ROUTE_ENV, raw,
-        )
-    return route or get_subagent_harness()
+            "%s is set but unparseable (%r) — review sessions are OFF until it "
+            "reads harness[=model][:effort]",
+            REVIEW_SESSION_ROUTE_ENV, raw)
+    return None if raw else get_subagent_harness()
 
 
 # ---------------------------------------------------------------------------
@@ -479,10 +474,9 @@ def review_session_output_schema(surface: str) -> Dict[str, Any]:
 
     The shared schema admits ``{"findings": []}`` — the honest clean verdict for a
     triad or ordinary advisory reviewer. Scope's coverage contract requires all
-    eight checklist rows (PASS included), so its schema demands ``minItems: 1`` —
-    a conforming engine refuses the empty answer up front instead of the gate
-    discovering a ``parse_failure`` after the run. Advisory keeps the clean-capable
-    shared schema (coverage is checked downstream by ``_check_expected_items``).
+    checklist rows (PASS included); Skill Review has the same matrix shape. Their
+    schemas demand ``minItems: 1`` so an engine cannot conform with an empty answer;
+    each surface's downstream parser still verifies exact item coverage.
     """
     if surface == "plan_review":
         # plan review's own element contract (4e133c8a): the generic item/verdict shape
@@ -490,7 +484,7 @@ def review_session_output_schema(surface: str) -> Dict[str, Any]:
         from ouroboros.tools.plan_spec import PLAN_REVIEW_SESSION_OUTPUT_SCHEMA
 
         return PLAN_REVIEW_SESSION_OUTPUT_SCHEMA
-    if surface != "scope_review":
+    if surface not in {"scope_review", "skill_review"}:
         return REVIEW_SESSION_OUTPUT_SCHEMA
     shaped = json.loads(json.dumps(REVIEW_SESSION_OUTPUT_SCHEMA))
     shaped["properties"]["findings"]["minItems"] = 1
@@ -874,7 +868,7 @@ def run_delegated_review_session(
         WINDOW_EXHAUSTED_CODES, ClaudexorSubscriptionWindowExhausted, ClaudexorUnavailable,
     )
     from ouroboros.subagents import delegated_run_shape, route_health
-    from ouroboros.usage_accounting import current_usage_scope
+    from ouroboros.usage_accounting import REVIEW_ATTRIBUTION_KEYS, current_usage_scope
 
     task_id, surface, slot_id = invocation.task_id, invocation.surface, invocation.slot_id
     timeout_sec, logical_key_extra = invocation.timeout_sec, invocation.logical_key_extra
@@ -887,6 +881,10 @@ def run_delegated_review_session(
     _scope = current_usage_scope()
     root_task_id = str(getattr(_scope, "root_task_id", "") or "")
     parent_task_id = str(getattr(_scope, "parent_task_id", "") or "")
+    usage_custody = {"category": str(getattr(_scope, "category", "") or "subagent"),
+        "source": str(getattr(_scope, "source", "") or "delegated_subagent"),
+        **{key: str(getattr(_scope, key, "") or "") for key in REVIEW_ATTRIBUTION_KEYS},
+    }
     shape = delegated_run_shape(False)  # a reviewer reads and answers
     state = retry_state if retry_state is not None else {}
     run_id, run_request, invocation_id = "", None, ""
@@ -987,6 +985,7 @@ def run_delegated_review_session(
                 surface=surface, slot_id=slot_id,
                 # #112: pending recovery replays the request row's lineage.
                 root_task_id=root_task_id, parent_task_id=parent_task_id,
+                **usage_custody,
             )
             if not requested:
                 # No durable request means no POST; only a fresh registration is retirable.
@@ -1046,6 +1045,7 @@ def run_delegated_review_session(
                 profile_id=str(getattr(route, "profile_id", "") or ""),
                 project_id=project_id, project_owned=not existing_project,
                 root_task_id=root_task_id, parent_task_id=parent_task_id,
+                **usage_custody,
                 ledger_root=str(custody_drive), idempotency_key=key,
                 invocation_id=invocation_id or retry_token,
             )
