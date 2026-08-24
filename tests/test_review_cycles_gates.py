@@ -824,13 +824,14 @@ def test_review_skill_replays_refuses_and_pays_functionally(tmp_path, monkeypatc
     assert paid_outcome.review_contract_fingerprint == contract_fp
     assert paid_outcome.wave_id  # the write-ahead dispatch marker names the wave
     assert "infrastructure failure" in paid_outcome.error
-    # (c2) an ASSEMBLY-refused wave (the seam never invoked) stays unpaid.
+    # (c2) a post-install wave whose seam never fires stays unpaid, while its
+    # identity remains available to join a worker that dispatches after return.
     _wire_review_skill(monkeypatch, tmp_path, content_hash="h3",
                        review_state=None,
                        passes=lambda *a, **k: ("prompt", {}, "", "packs never assembled"))
     unpaid_outcome = skill_review.review_skill(ctx, "demo", persist=False)
     assert unpaid_outcome.status == "pending" and unpaid_outcome.paid is False
-    assert unpaid_outcome.wave_id == ""
+    assert unpaid_outcome.wave_id
 
 
 def test_review_skill_uses_configured_rows_and_prices_only_api(tmp_path, monkeypatch):
