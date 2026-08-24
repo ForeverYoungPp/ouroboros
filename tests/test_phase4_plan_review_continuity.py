@@ -47,8 +47,6 @@ def test_exact_evidence_selectors_return_the_requested_slice(tmp_path) -> None:
     from ouroboros.tools.plan_evidence import resolve_evidence
 
     source = tmp_path / "evidence.txt"
-    # The resolver's exact-byte contract must not depend on the host newline
-    # translation performed by Path.write_text on Windows.
     source.write_bytes(b"one\ntwo\nthree\nfour\nfive\n")
     manifest = resolve_evidence(
         ["evidence.txt::lines=3-4", "evidence.txt::tail=5"],
