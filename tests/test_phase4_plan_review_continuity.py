@@ -47,7 +47,7 @@ def test_exact_evidence_selectors_return_the_requested_slice(tmp_path) -> None:
     from ouroboros.tools.plan_evidence import resolve_evidence
 
     source = tmp_path / "evidence.txt"
-    source.write_text("one\ntwo\nthree\nfour\nfive\n", encoding="utf-8")
+    source.write_bytes(b"one\ntwo\nthree\nfour\nfive\n")
     manifest = resolve_evidence(
         ["evidence.txt::lines=3-4", "evidence.txt::tail=5"],
         active_root=tmp_path,

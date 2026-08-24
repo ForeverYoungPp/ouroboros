@@ -351,6 +351,13 @@ def _write_schedules(tmp_path, count):
 def test_bgc_direct_identity_update_requires_complete_named_omission(tmp_path):
     bc = _bg_fixture(tmp_path)
     try:
+        # ``knowledge_read`` returns universal-newline text, while the
+        # completeness guard binds the source's raw bytes.  Keep the fixture
+        # platform-independent and prove the guard accepts a CRLF source.
+        backlog = tmp_path / "memory" / "knowledge" / "improvement-backlog.md"
+        backlog.write_bytes(
+            backlog.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        )
         context = bc._build_context()
         assert "knowledge_read" in context and "improvement-backlog" in context
         content = "I remain directly self-authoring after complete source materialization."
@@ -362,6 +369,74 @@ def test_bgc_direct_identity_update_requires_complete_named_omission(tmp_path):
         assert updated.startswith("OK: identity updated")
         journal = tmp_path / "memory" / "identity_journal.jsonl"
         assert journal.exists() and content in journal.read_text(encoding="utf-8")
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_source_mutation_after_read_cannot_authorize_identity_rewrite(tmp_path, monkeypatch):
+    bc = _bg_fixture(tmp_path)
+    try:
+        bc._build_context()
+        backlog = tmp_path / "memory" / "knowledge" / "improvement-backlog.md"
+        changed = backlog.read_bytes() + (
+            b"\n### ibl-concurrent\n- summary: changed after materialization\n"
+        )
+        real_read_bytes = pathlib.Path.read_bytes
+        target_reads = 0
+
+        def mutate_before_snapshot(self, *args, **kwargs):
+            nonlocal target_reads
+            if self == backlog:
+                target_reads += 1
+                if target_reads == 1:
+                    self.write_bytes(changed)
+            return real_read_bytes(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "read_bytes", mutate_before_snapshot)
+        bc._execute_tool(_tool_call("knowledge_read", {"topic": "improvement-backlog"}, "r1"), [])
+        result = bc._execute_tool(
+            _tool_call("update_identity", {"content": "must remain blocked"}, "u1"), [],
+        )
+        assert target_reads == 2
+        assert "IDENTITY_UPDATE_ABSTAINED" in result
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_source_snapshot_cannot_mix_text_and_digest(tmp_path, monkeypatch):
+    bc = _bg_fixture(tmp_path)
+    try:
+        backlog = tmp_path / "memory" / "knowledge" / "improvement-backlog.md"
+        backlog.write_bytes(
+            backlog.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        )
+        bc._build_context()
+        original = backlog.read_bytes()
+        changed = original + b"\r\n### ibl-concurrent\r\n- summary: changed bytes\r\n"
+        real_read_bytes = pathlib.Path.read_bytes
+        target_reads = 0
+
+        def oscillate_during_validation(self, *args, **kwargs):
+            nonlocal target_reads
+            if self == backlog:
+                target_reads += 1
+                if target_reads == 1:
+                    self.write_bytes(changed)
+                    raw = real_read_bytes(self, *args, **kwargs)
+                    self.write_bytes(original)
+                    return raw
+            return real_read_bytes(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "read_bytes", oscillate_during_validation)
+        materialized = bc._execute_tool(
+            _tool_call("knowledge_read", {"topic": "improvement-backlog"}, "r1"), [],
+        )
+        assert materialized == original.decode("utf-8").replace("\r\n", "\n")
+        backlog.write_bytes(changed)
+        result = bc._execute_tool(
+            _tool_call("update_identity", {"content": "must remain blocked"}, "u1"), [],
+        )
+        assert "IDENTITY_UPDATE_ABSTAINED" in result
     finally:
         bc._tool_executor.shutdown(wait=False, cancel_futures=True)
 
