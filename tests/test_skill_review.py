@@ -1410,6 +1410,10 @@ def test_review_skill_prompt_loads_core_governance_artifacts(tmp_path, monkeypat
     assert "BIBLE.md" in prompt, (
         "skill review prompt must cite BIBLE.md for constitutional context"
     )
+    session_task = captured["delivery"]["session_task"]
+    assert prompt[captured["stable_prefix_len"]:] in session_task
+    assert "## Governance context — docs/ARCHITECTURE.md" not in session_task
+    assert "docs/CHECKLISTS.md" in session_task and "docs/CREATING_SKILLS.md" in session_task
     # Minimal content-presence check: Section 10 key-invariants header is
     # referenced by label, and the actual body should appear (shipping
     # repo has the canonical text there).

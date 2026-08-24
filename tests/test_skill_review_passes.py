@@ -6,7 +6,7 @@ from ouroboros.skill_review_passes import run_skill_review_passes
 
 
 def _fake_build_prompt(ctx, drive_root, skill, *, manifest_dump, content_hash, file_pack, history, review_rebuttal):
-    return f"PROMPT[{file_pack}]", 7, {"adv": file_pack}
+    return f"STABLE::DYNAMIC[{file_pack}]", len("STABLE::"), {"adv": file_pack}
 
 
 def _run(file_packs, run_review, required_items=(), *, models=None, row_plan=None):
@@ -41,7 +41,7 @@ def test_chunked_merges_results_into_one_object():
     # array). The merged result must also be such an object, or the downstream
     # parse_model_review_results crashes on a list (the bug this guards).
     def fake_run_review(ctx, *, content, prompt, models, stable_prefix_len=0):
-        pack = prompt[len("PROMPT["):-1]
+        pack = prompt[len("STABLE::DYNAMIC["):-1]
         return json.dumps({"model_count": 1, "results": [_actor(pack)]})
 
     _prompt, _adv, text, err = _run(["p1", "p2", "p3"], fake_run_review)
@@ -84,7 +84,10 @@ def test_chunked_passes_keep_the_full_row_plan_and_exact_session_evidence():
         assert call["row_plan"] is row_plan
         assert call["session_root"] == "/repo"
         assert "exact frozen skill evidence" in call["session_task"]
-        assert f"PROMPT[p{idx}]" in call["session_task"]
+        assert f"DYNAMIC[p{idx}]" in call["session_task"]
+        assert "STABLE::" not in call["session_task"]
+        assert all(path in call["session_task"] for path in (
+            "BIBLE.md", "docs/CHECKLISTS.md", "ouroboros/contracts/plugin_api.py"))
         assert f"PART {idx} of 2" in call["session_task"]
 
 
@@ -102,7 +105,7 @@ def test_chunk_without_parseable_quorum_fails_closed():
     # parseable verdict) must fail the WHOLE review closed, not let the oversized skill
     # pass with that chunk effectively under-reviewed.
     def fake_run_review(ctx, *, content, prompt, models, stable_prefix_len=0):
-        pack = prompt[len("PROMPT["):-1]
+        pack = prompt[len("STABLE::DYNAMIC["):-1]
         if pack == "p2":
             return json.dumps({"results": [{"model": "m", "verdict": "ERROR", "text": ""}]})
         return json.dumps({"results": [_actor(pack)]})

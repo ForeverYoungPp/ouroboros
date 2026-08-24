@@ -1739,7 +1739,8 @@ def test_skill_review_all_session_composition_uses_strict_schema_and_no_api_fall
         file_packs=["frozen payload bytes"], models=models, row_plan=row_plan,
         session_root=str(root),
         usage_attribution={"review_skill": "happy_farm", "review_wave_id": "wave-agentic"},
-        build_prompt=lambda *_a, **_k: ("STRICT SKILL PROMPT", 0, {}),
+        build_prompt=lambda *_a, **_k: (
+            "STABLE ONLY\nDYNAMIC SKILL", len("STABLE ONLY\n"), {}),
         run_review=review_tool._handle_multi_model_review,
     )
 
@@ -1757,6 +1758,10 @@ def test_skill_review_all_session_composition_uses_strict_schema_and_no_api_fall
     assert all(request["outputSchema"]["properties"]["findings"]["minItems"] == 1
                for request in starts)
     assert all("exact frozen skill evidence" in request["prompt"] for request in starts)
+    assert all("DYNAMIC SKILL" in request["prompt"] and "STABLE ONLY" not in request["prompt"]
+               for request in starts)
+    assert all("docs/ARCHITECTURE.md" in request["prompt"] and
+               "docs/CREATING_SKILLS.md" in request["prompt"] for request in starts)
     assert all("Empty arrays and NO_FINDINGS are invalid" in request["prompt"]
                and "manifest_schema" in request["prompt"] for request in starts)
     ledger = [json.loads(line) for line in

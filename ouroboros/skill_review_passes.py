@@ -19,6 +19,15 @@ _SINGLE_CONTENT = (
     "Skill Review Checklist. Return ONLY the JSON array described in the output contract."
 )
 
+_SESSION_RETRIEVAL = (
+    "Use native read/search tools inside the source-repository session root. Read "
+    "`BIBLE.md`, `docs/ARCHITECTURE.md`, and `docs/DEVELOPMENT.md` in full; read "
+    "the `Skill Review Checklist` section of `docs/CHECKLISTS.md`; then read "
+    "`docs/CREATING_SKILLS.md`, `ouroboros/contracts/plugin_api.py`, and "
+    "`ouroboros/extension_ui_validation.py` in full. Treat those source reads as "
+    "the governance and host-contract context for this review.\n\n"
+)
+
 
 def run_skill_review_passes(
     ctx: Any,
@@ -53,13 +62,15 @@ def run_skill_review_passes(
     def _run(content: str, prompt: str, stable_prefix_len: int) -> str:
         delivery = {}
         if row_plan:
+            boundary = max(0, min(int(stable_prefix_len or 0), len(prompt)))
             delivery = {
                 "routes": row_plan.get("routes") or [],
                 "row_plan": row_plan,
                 "session_task": (
-                    "Use the exact frozen skill evidence in this assignment as the payload "
+                    _SESSION_RETRIEVAL
+                    + "Use the exact frozen skill evidence in this assignment as the payload "
                     "authority; do not replace it by rereading the mutable skill_dir path.\n\n"
-                    f"{prompt}\n\n## Review assignment\n\n{content}"
+                    f"{prompt[boundary:]}\n\n## Review assignment\n\n{content}"
                 ),
                 "session_root": session_root,
                 "session_policy": {"output_contract": matrix_contract},

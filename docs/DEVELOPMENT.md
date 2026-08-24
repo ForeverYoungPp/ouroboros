@@ -616,8 +616,15 @@ Concrete requirements:
 | Background consciousness (`consciousness.py`) | ✅ full | ✅ full (max) / navigation map (low) | — (not yet required) |
 | Advisory pre-review (`tools/claude_advisory_review.py`) | Two delivery forms: an `api` row receives the full doc inline via `load_governance_doc`; an `agent_session` row receives a resolvable pointer marked MANDATORY FULL READ and the session reads the full doc itself — retrieval is disclosed and non-certifying (the mirror of plan review's `agent_session` delivery form) | same two delivery forms (`api` inline / `agent_session` pointer) | same two delivery forms (`api` inline / `agent_session` pointer) |
 | Scope review (`tools/scope_review.py`) | full canonical doc + Atlas accounting | full canonical doc + Atlas accounting | full canonical doc + Atlas accounting |
+| Skill review (`skill_review.py`) | full inline (`api_chat`) / mandatory full source-root read (`agent_session`) | full inline (`api_chat`) / mandatory full source-root read (`agent_session`) | full inline (`api_chat`) / mandatory full source-root read (`agent_session`) |
 | Plan review (`tools/plan_review.py`) | full for a SELF-MODIFICATION plan (structural path fact: a declared target resolves under the system repo); otherwise a heading-derived navigation map of BIBLE.md generated at runtime (never a copy) | inline, in full, for a self-modification plan; otherwise the lossless navigation map + a resolvable pointer (W3) | named on-demand pointer; a reviewer that needs it returns `need_evidence` and the host attaches it on the next cycle |
 | Deep self-review (`deep_self_review.py`) | full canonical doc + Atlas accounting | full (max) / navigation map (low) + Atlas accounting | full canonical doc + Atlas accounting |
+
+Skill Review keeps the full stable governance/host prefix for cache-friendly API rows. A
+retrieving session reads those same canonical files from its source-repository root and receives
+the byte-exact dynamic tail inline: manifest, frozen skill chunk, history and output contract.
+The payload snapshot and per-chunk quorum therefore stay identical without rebilling or crowding
+the session window with source text it can inspect sequentially.
 
 Plan review keeps the reviewed SPEC, the task objective, the agent-declared evidence, and
 reviewer-slot framing as first-class context. Governance packs are tiered by ONE structural
