@@ -392,6 +392,11 @@ def _is_timeout_error(exc: Exception) -> bool:
     """Typed timeout classifier across the installed HTTP/SDK transports."""
     if isinstance(exc, TimeoutError):
         return True
+    # Keep the OpenAI timeout contract available when the optional SDK class
+    # cannot be imported in the caller's environment (and for compatible SDK
+    # wrappers that preserve the public exception type in their MRO).
+    if any(cls.__name__ == "APITimeoutError" for cls in type(exc).__mro__):
+        return True
     try:
         import httpx
 
