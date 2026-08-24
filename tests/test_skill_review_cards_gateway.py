@@ -206,6 +206,52 @@ def test_review_history_detail_empty_exact_wave_never_invents_zero_cash(tmp_path
     assert "### Review accounting" not in markdown
 
 
+def test_review_history_detail_projects_a_late_dispatch_marker_without_rewriting_history(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import usage_accounting as ua
+    from ouroboros.skill_review_history import load_dispatch_markers, write_dispatch_marker
+
+    client, drive_root = _detail_client(tmp_path)
+    monkeypatch.setenv("TOTAL_BUDGET", "100")
+    history = _history_path(drive_root, "alpha")
+    append_jsonl(history, _terminal_record(
+        paid=False, wave_id=None, usage_attribution_schema=None,
+    ))
+    raw_before = history.read_bytes()
+    write_dispatch_marker(
+        drive_root, "alpha", wave_id="skill-job-1", group_id="manual:alpha",
+        content_hash="abc123def4567890", review_contract_fingerprint="cf-late",
+    )
+    with ua.usage_scope(ua.UsageScope(
+        drive_root=drive_root, task_id="review-alpha", root_task_id="root-alpha",
+        category="skill_review_review", source="review_substrate",
+        review_skill="alpha", review_wave_id="skill-job-1",
+        review_slot_id="skill-triad-1",
+    )):
+        attempt = ua.reserve_attempt(ua.AttemptRequest(
+            model="openai/gpt-x", provider="openai", reservation_usd=0.25,
+            drive_root=drive_root, global_limit_usd=100,
+        ))
+        ua.mark_dispatched(attempt)
+        ua.settle_attempt(
+            attempt, {"prompt_tokens": 12, "completion_tokens": 4},
+            cost_usd=0.125, cost_final=True,
+        )
+
+    markdown = client.get(
+        "/api/skills/alpha/review-history/skill-job-1",
+    ).json()["markdown"]
+    assert "paid panel dispatch (counts toward Max Review Cycles)" in markdown
+    assert "### Review accounting" in markdown and attempt.attempt_id in markdown
+    assert "Recorded-row cash: settled $0.125000; confirmed $0.125000" in markdown
+    assert "Wave attempt coverage: incomplete (1/2 recorded)" in markdown
+    assert history.read_bytes() == raw_before
+    assert [row["wave_id"] for row in load_dispatch_markers(drive_root, "alpha")] == [
+        "skill-job-1",
+    ]
+
+
 def test_review_history_detail_stays_incomplete_until_late_session_settles(
     tmp_path, monkeypatch,
 ):

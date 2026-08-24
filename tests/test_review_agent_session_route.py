@@ -183,6 +183,23 @@ class FakeLLM:
         return {"content": self.reply}, {"prompt_tokens": 5, "completion_tokens": 2, "cost": 0.0001}
 
 
+class AccountedFakeLLM(FakeLLM):
+    """API-review fake that crosses the real durable physical-attempt seam."""
+
+    def __init__(self, drive_root, reply="[]"):
+        super().__init__(reply=reply)
+        self.drive_root = drive_root
+
+    def chat(self, **kwargs):
+        from ouroboros import usage_accounting as ua
+
+        request = ua.AttemptRequest(
+            model="local-review-test", provider="local", reservation_usd=0.0,
+            drive_root=self.drive_root, task_id="review", root_task_id="review",
+        )
+        return ua.execute_physical_attempt(request, lambda: FakeLLM.chat(self, **kwargs))
+
+
 @pytest.fixture()
 def fake_route(monkeypatch):
     FakeGateway.reset()
@@ -1427,7 +1444,7 @@ def test_real_api_and_session_dispatch_each_fire_the_captured_stamp_once(
 
     api_stamps = []
     api_ctx = SimpleNamespace(_review_paid_stamp=lambda: api_stamps.append("api"))
-    llm = FakeLLM()
+    llm = AccountedFakeLLM(tmp_path / "api")
     run_review_request(_agent_request(), slots=[_agent_slot(route=ReviewRouteKind.API_CHAT)],
                        drive_root=tmp_path / "api", llm=llm, usage_ctx=api_ctx)
     assert api_stamps == ["api"] and len(llm.calls) == 1
@@ -1438,7 +1455,7 @@ def test_mixed_panel_shares_one_idempotent_wave_stamp(tmp_path, fake_route):
 
     writes = []
     ctx = SimpleNamespace(_review_paid_stamp=ReviewPaidStamp(lambda: writes.append("paid")))
-    llm = FakeLLM()
+    llm = AccountedFakeLLM(tmp_path)
     run_review_request(
         _agent_request(),
         slots=[
@@ -1461,6 +1478,54 @@ def test_missing_api_transport_refuses_before_paid_stamp(tmp_path, fake_route):
     assert result.actors[0]["status"] == "error"
     assert "api_chat client exposes no callable transport" in result.actors[0]["error"]
     assert stamps == []
+
+
+def test_callable_api_refusal_before_physical_attempt_stays_unpaid(tmp_path, fake_route):
+    stamps = []
+
+    class RefusingLLM:
+        def chat(self, **_kwargs):
+            raise RuntimeError("route resolution failed before provider send")
+
+    ctx = SimpleNamespace(_review_paid_stamp=lambda: stamps.append("paid"))
+    result = run_review_request(
+        _agent_request(), slots=[_agent_slot(route=ReviewRouteKind.API_CHAT)],
+        drive_root=tmp_path, llm=RefusingLLM(), usage_ctx=ctx,
+    )
+    assert result.actors[0]["status"] == "error"
+    assert "route resolution failed" in result.actors[0]["error"]
+    assert stamps == []
+
+
+def test_async_only_api_transport_fires_at_the_same_physical_boundary(tmp_path, fake_route):
+    from ouroboros import usage_accounting as ua
+
+    stamps = []
+
+    class AsyncLLM:
+        def __init__(self):
+            self.calls = []
+
+        async def chat_async(self, **kwargs):
+            self.calls.append(kwargs)
+            request = ua.AttemptRequest(
+                model="local-review-test", provider="local", reservation_usd=0.0,
+                drive_root=tmp_path, task_id="review", root_task_id="review",
+            )
+
+            async def send():
+                return {"content": "[]"}, {"prompt_tokens": 0, "completion_tokens": 0}
+
+            return await ua.execute_physical_attempt_async(request, send)
+
+    llm = AsyncLLM()
+    ctx = SimpleNamespace(_review_paid_stamp=lambda: stamps.append("paid"))
+    result = run_review_request(
+        _agent_request(), slots=[_agent_slot(route=ReviewRouteKind.API_CHAT)],
+        drive_root=tmp_path, llm=llm, usage_ctx=ctx,
+    )
+    assert result.actors[0]["status"] == "ok"
+    assert stamps == ["paid"] and len(llm.calls) == 1
 
 
 def test_session_stamp_precedes_durable_start_request(

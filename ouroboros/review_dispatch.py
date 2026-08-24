@@ -6,8 +6,9 @@ Q16/Q17; Max-Review-Cycles fix round).
 The ``paid`` fact of Max-Review-Cycles accounting is recorded at PHYSICAL
 dispatch: a gate that must durably record "this wave spent reviewer money"
 installs a :class:`ReviewPaidStamp` on ``ctx._review_paid_stamp`` for the
-duration of its wave. The coordinator captures that exact once-only object,
-and each route executor invokes it at its physical point of no return.
+duration of its wave. The coordinator captures that exact once-only object;
+session routes invoke it at their physical point of no return, while API routes
+bind it for the canonical physical-attempt boundary to invoke.
 Assembly-only refusals (triad fit ladder, scope pack
 signals, skill prompt building) exit before the seam, so a $0 attempt stays
 outside every ceiling; a crash after dispatch keeps the durable paid fact
@@ -17,11 +18,16 @@ admission slots in at synthesis.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 log = logging.getLogger(__name__)
+_BOUND_API_PAID_STAMP: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "ouroboros_review_api_paid_stamp", default=None,
+)
 
 # Identity prefixes for the configured reviewer surfaces. A surface that fans
 # rows out registers its prefix here rather than spelling one inline, so
@@ -82,6 +88,21 @@ def invoke_review_paid_stamp(stamp: Any) -> None:
         stamp()
     except Exception:
         log.debug("review paid dispatch stamp failed (fail-open)", exc_info=True)
+
+
+@contextlib.contextmanager
+def bind_api_review_paid_stamp(stamp: Any) -> Iterator[None]:
+    """Bind one API review stamp until a canonical physical dispatch occurs."""
+    token = _BOUND_API_PAID_STAMP.set(stamp)
+    try:
+        yield
+    finally:
+        _BOUND_API_PAID_STAMP.reset(token)
+
+
+def invoke_bound_api_review_paid_stamp() -> None:
+    """Mark the bound API review paid, if any; always fail-open."""
+    invoke_review_paid_stamp(_BOUND_API_PAID_STAMP.get())
 
 
 def stamp_review_paid_on_dispatch(ctx: Any) -> None:

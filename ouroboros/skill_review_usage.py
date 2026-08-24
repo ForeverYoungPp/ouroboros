@@ -19,6 +19,10 @@ def skill_review_usage_markdown(
         return "unknown" if item is None else str(item)
 
     attempts = [item for item in (usage.get("attempts") or []) if isinstance(item, dict)]
+    token_attempts = [
+        item for item in attempts
+        if str(item.get("state") or "") in {"dispatched", "settled", "unresolved"}
+    ]
     attempt_ids = [str(item) for item in (usage.get("attempt_ids") or []) if str(item)]
     integrity_degraded = bool(usage.get("integrity_degraded"))
     coverage_complete = coverage_known and recorded >= expected
@@ -41,9 +45,9 @@ def skill_review_usage_markdown(
          f"slot attribution={'complete' if usage.get('attribution_complete') else 'incomplete'}."),
     ]
     token_gaps = [
-        f"{field.removesuffix('_tokens')}={sum(item.get(field) is None for item in attempts)}/{len(attempts)} unreported"
+        f"{field.removesuffix('_tokens')}={sum(item.get(field) is None for item in token_attempts)}/{len(token_attempts)} unreported"
         for field in ("prompt_tokens", "completion_tokens", "cached_tokens")
-        if attempts and any(item.get(field) is None for item in attempts)
+        if token_attempts and any(item.get(field) is None for item in token_attempts)
     ]
     if token_gaps:
         lines.append("- Token coverage: " + "; ".join(token_gaps) + ".")

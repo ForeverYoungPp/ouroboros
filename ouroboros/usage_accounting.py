@@ -26,7 +26,8 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Dict, Iterator, Literal, Optional, Sequence, Tuple
 
 from ouroboros.pricing import estimate_cost_optional
-from ouroboros._usage_response import usage_from_response
+from ouroboros._usage_response import _reported_token_count, usage_from_response
+from ouroboros.review_dispatch import invoke_bound_api_review_paid_stamp
 # One-way seam: usage_ledger owns bytes/validation; this module owns policy.
 from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
     LEDGER_REL,
@@ -94,11 +95,9 @@ _PHYSICAL_PREDICATE: contextvars.ContextVar[Optional[Callable[["AttemptRequest"]
 _LAST_PHYSICAL_ATTEMPT: contextvars.ContextVar[Optional["PhysicalAttemptCapture"]] = contextvars.ContextVar(
     "ouroboros_last_physical_attempt", default=None
 )
-
 _ROOT_ACCOUNTING_TELEMETRY: Dict[str, Dict[str, Any]] = {}
 _ROOT_ACCOUNTING_TELEMETRY_LOCK = threading.Lock()
 _ROOT_ACCOUNTING_TELEMETRY_CAP = 64
-
 
 def _stash_root_accounting(
     root_task_id: str,
@@ -214,7 +213,6 @@ class PhysicalAttemptContext:
     capacity_total_tokens: Optional[int]
     context_target_miss: bool
     automatic_pass_used: bool
-
 
 @dataclass(frozen=True)
 class AttemptRequest:
@@ -852,8 +850,8 @@ def record_subscription_session(
     parent_task_id: str = "",
     category: str = "subagent",
     source: str = "delegated_subagent",
-    prompt_tokens: int | None = 0,
-    completion_tokens: int | None = 0,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
     cached_tokens: int | None = None,
     reset_at: str = "",
     spend_usd: float | None = None,
@@ -961,6 +959,7 @@ def mark_dispatched(
         raise
     fields = {"candidate_manifest_ref": candidate_manifest_ref} if candidate_manifest_ref else {}
     _transition(reservation, "dispatched", **fields)
+    invoke_bound_api_review_paid_stamp()
 
 
 def release_attempt(
@@ -1022,20 +1021,21 @@ def settle_attempt(
     cost_final: bool = False,
 ) -> None:
     normalized = dict(usage or {})
+    prompt_tokens = _reported_token_count(normalized, "prompt_tokens", "input_tokens")
+    completion_tokens = _reported_token_count(normalized, "completion_tokens", "output_tokens")
+    cached_tokens = _reported_token_count(normalized, "cached_tokens")
+    cache_write_tokens = _reported_token_count(normalized, "cache_write_tokens")
     cost = _number(cost_usd)
-    has_usage = bool(
-        int(normalized.get("prompt_tokens") or normalized.get("input_tokens") or 0)
-        or int(normalized.get("completion_tokens") or normalized.get("output_tokens") or 0)
-    )
+    has_usage = bool((prompt_tokens or 0) or (completion_tokens or 0))
     if cost is None and str(reservation.provider or "").lower() == "local":
         cost, cost_final = 0.0, True
     elif cost is None and has_usage:
         cost = estimate_cost_optional(
             reservation.model,
-            int(normalized.get("prompt_tokens") or normalized.get("input_tokens") or 0),
-            int(normalized.get("completion_tokens") or normalized.get("output_tokens") or 0),
-            cache_usage={"cached_tokens": int(normalized.get("cached_tokens") or 0),
-                         "cache_write_tokens": int(normalized.get("cache_write_tokens") or 0),
+            int(prompt_tokens or 0),
+            int(completion_tokens or 0),
+            cache_usage={"cached_tokens": int(cached_tokens or 0),
+                         "cache_write_tokens": int(cache_write_tokens or 0),
                          "cache_write_tokens_by_ttl": normalized.get("cache_write_tokens_by_ttl"),
                          "prompt_cache_ttl": str(normalized.get("prompt_cache_ttl") or "")},
             allow_live_fetch=False,
@@ -1047,10 +1047,10 @@ def settle_attempt(
         "settled",
         cost_usd=cost,
         cost_final=bool(cost_final and cost is not None),
-        prompt_tokens=int(normalized.get("prompt_tokens") or normalized.get("input_tokens") or 0),
-        completion_tokens=int(normalized.get("completion_tokens") or normalized.get("output_tokens") or 0),
-        cached_tokens=int(normalized.get("cached_tokens") or 0),
-        cache_write_tokens=int(normalized.get("cache_write_tokens") or 0),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cached_tokens=cached_tokens,
+        cache_write_tokens=cache_write_tokens,
         prompt_cache_ttl=str(normalized.get("prompt_cache_ttl") or ""),
     )
 

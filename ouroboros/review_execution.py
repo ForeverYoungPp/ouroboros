@@ -27,7 +27,7 @@ from ouroboros.review_slot_cancel import (  # noqa: F401 — re-exported seam su
     _natural_success_terminal,
     _slot_cancel_outcome,
 )
-from ouroboros.review_dispatch import invoke_review_paid_stamp
+from ouroboros.review_dispatch import bind_api_review_paid_stamp, invoke_review_paid_stamp
 from ouroboros.triad_review import (
     ACCEPTANCE_SURFACE_RULES,
     REVIEW_JSON_ARRAY_CONTRACT,
@@ -354,11 +354,11 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
         async_chat = getattr(self.llm, "chat_async", None)
         if not callable(chat) and not callable(async_chat):
             raise ReviewRouteUnavailable("api_chat client exposes no callable transport", code="api_chat_unavailable")
-        invoke_review_paid_stamp(self.assignment.dispatch_stamp)
-        if callable(chat):
-            msg, usage = chat(**chat_kwargs)
-        else:
-            msg, usage = asyncio.run(async_chat(**chat_kwargs))
+        with bind_api_review_paid_stamp(self.assignment.dispatch_stamp):
+            if callable(chat):
+                msg, usage = chat(**chat_kwargs)
+            else:
+                msg, usage = asyncio.run(async_chat(**chat_kwargs))
         # Null/non-object provider messages follow the caller's empty-response rail.
         raw_text = str(msg.get("content") or "") if isinstance(msg, dict) else ""
         return ReviewAttemptResult(message=msg, usage=usage, raw_text=raw_text)

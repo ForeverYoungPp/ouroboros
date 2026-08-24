@@ -14,6 +14,10 @@ from ouroboros.utils import append_jsonl, iter_jsonl_objects, jsonl_append_lock_
 
 log = logging.getLogger(__name__)
 USAGE_ATTRIBUTION_SCHEMA = "physical_attempt_v1"
+_MARKER_FACT_KEYS = (
+    "review_contract_fingerprint", "rebuttal_sha256", "usage_attribution_schema",
+    "group_id", "content_hash", "root_task_id",
+)
 
 
 def _redact_history_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -210,31 +214,39 @@ def _flush_orphan_dispatch_marker(
     })
 
 
-def _merge_dispatch_marker_facts(
-    drive_root: pathlib.Path, skill_name: str, payload: Dict[str, Any]
-) -> Dict[str, Any]:
+def _merge_marker_facts(payload: Dict[str, Any], marker: Dict[str, Any]) -> Dict[str, Any]:
     """Merge the write-ahead marker's paid facts into ITS wave's terminal row.
 
     The producer can lose the facts legitimately — a lifecycle timeout
     finalizes with no result object — but the marker recorded the dispatch
     before the first transport call, so the terminal row still carries
-    ``paid``/contract/rebuttal. Rows of other waves pass through untouched:
-    the merge reads exactly ITS wave's per-wave marker (or a legacy
-    single-file marker recording that wave)."""
+    ``paid``/contract/rebuttal. Rows of other waves pass through untouched;
+    callers supply the exact per-wave or matching legacy marker."""
     row_wave = str(payload.get("wave_id") or payload.get("job_id") or "")
-    marker = load_dispatch_marker_for_wave(drive_root, skill_name, row_wave)
     wave = str(marker.get("wave_id") or "")
     if not wave or wave != row_wave:
         return payload
     merged = dict(payload)
     if marker.get("paid") and not merged.get("paid"):
         merged["paid"] = True
-    for key in ("review_contract_fingerprint", "rebuttal_sha256", "usage_attribution_schema",
-                "group_id", "content_hash", "root_task_id"):
+    for key in _MARKER_FACT_KEYS:
         if marker.get(key) and not merged.get(key):
             merged[key] = marker[key]
     merged.setdefault("wave_id", wave)
     return merged
+
+
+def _marker_facts_landed(payload: Dict[str, Any], marker: Dict[str, Any]) -> bool:
+    """Whether clearing this captured marker would lose no effective facts."""
+    wave = str(marker.get("wave_id") or "")
+    if not wave or str(payload.get("wave_id") or payload.get("job_id") or "") != wave:
+        return False
+    if marker.get("paid") and not payload.get("paid"):
+        return False
+    return all(
+        not marker.get(key) or payload.get(key) == marker.get(key)
+        for key in _MARKER_FACT_KEYS
+    )
 
 
 def finding_signature(findings: List[Dict[str, Any]]) -> List[str]:
@@ -310,8 +322,18 @@ def load_history(
     group_id: str = "",
 ) -> List[Dict[str, Any]]:
     try:
+        raw_entries = list(iter_jsonl_objects(review_history_path(drive_root, skill_name)))
+        markers = {
+            str(marker.get("wave_id") or ""): marker
+            for marker in load_dispatch_markers(drive_root, skill_name)
+        }
         entries = normalize_history(
-            list(iter_jsonl_objects(review_history_path(drive_root, skill_name))),
+            [
+                _merge_marker_facts(
+                    row, markers.get(str(row.get("wave_id") or row.get("job_id") or ""), {}),
+                )
+                for row in raw_entries
+            ],
             skill_name,
         )
     except OSError:
@@ -394,13 +416,14 @@ def append_history(
             payload["replayed_from_ts"] = str(replayed_from_ts)
         if wave_id:
             payload["wave_id"] = str(wave_id)
-        payload = _merge_dispatch_marker_facts(drive_root, skill_name, payload)
+        marker = load_dispatch_marker_for_wave(drive_root, skill_name, str(wave_id or ""))
+        payload = _merge_marker_facts(payload, marker)
         if not append_jsonl(
             review_history_path(drive_root, skill_name),
             _redact_history_payload(payload),
         ):
             raise OSError("append_jsonl reported failure")
-        if wave_id:
+        if _marker_facts_landed(payload, marker):
             clear_dispatch_marker(drive_root, skill_name, wave_id=wave_id)
     except Exception:
         # LOUD failure (F3): a lost terminal row silently un-counts spent
@@ -433,12 +456,18 @@ def append_history_once(
         return False
     try:
         try:
-            if any(str(row.get("job_id") or "") == job_id for row in iter_jsonl_objects(path)):
+            existing = next(
+                (row for row in iter_jsonl_objects(path) if str(row.get("job_id") or "") == job_id),
+                None,
+            )
+            marker = load_dispatch_marker_for_wave(drive_root, skill_name, job_id)
+            if existing is not None:
                 # Already landed (idempotent retry): finish the merge by
-                # clearing this wave's dispatch marker if it is still present.
-                clear_dispatch_marker(drive_root, skill_name, wave_id=job_id)
+                # clearing only a marker whose facts are already in the row.
+                if _marker_facts_landed(existing, marker):
+                    clear_dispatch_marker(drive_root, skill_name, wave_id=job_id)
                 return True
-            payload = _merge_dispatch_marker_facts(drive_root, skill_name, payload)
+            payload = _merge_marker_facts(payload, marker)
             safe_payload = _redact_history_payload(payload)
             data = (json.dumps(safe_payload, ensure_ascii=False) + "\n").encode("utf-8")
             fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -449,10 +478,11 @@ def append_history_once(
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            clear_dispatch_marker(
-                drive_root, skill_name,
-                wave_id=str(payload.get("wave_id") or job_id),
-            )
+            if _marker_facts_landed(payload, marker):
+                clear_dispatch_marker(
+                    drive_root, skill_name,
+                    wave_id=str(payload.get("wave_id") or job_id),
+                )
             return True
         except OSError:
             log.warning("skill review terminal history append failed for %s", skill_name, exc_info=True)

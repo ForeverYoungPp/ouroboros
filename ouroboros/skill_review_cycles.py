@@ -186,7 +186,8 @@ def _unmerged_markers_paid(
     from ouroboros.skill_review_history import load_dispatch_markers
 
     landed_waves = {
-        str(row.get("wave_id") or row.get("job_id") or "") for row in rows
+        str(row.get("wave_id") or row.get("job_id") or "")
+        for row in rows if _paid_row(row)
     }
     count = 0
     for marker in load_dispatch_markers(pathlib.Path(drive_root), skill_name):

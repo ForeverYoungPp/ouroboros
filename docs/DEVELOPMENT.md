@@ -1658,6 +1658,9 @@ Before every commit, verify the following:
   `physical_attempt_v1` marker only declares that this join key exists; lazy detail
   projects the same `usage_attempts.jsonl` rows and persists no totals. Pre-marker waves
   stay “exact attribution unavailable” and must never be reconstructed by time/model.
+  If a terminal row lands before a late worker dispatches, readers overlay only the exact
+  same-wave write-ahead marker; an idempotent retry must not clear that marker until its
+  facts are already durable in the raw append-only row.
 - [ ] `cost_final` on a projection is a COUNT of open rows (`non_final_rows`), never a
   truthiness test on a dollar sum: a reserved/dispatched/unresolved row, a settled row
   with an unknown price, and a settled row its writer marked non-final are each open

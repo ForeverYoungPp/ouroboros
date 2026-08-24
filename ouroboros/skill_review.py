@@ -1166,15 +1166,15 @@ def _stamp_paid_facts(
     stamp: Any = None,
 ) -> "SkillReviewOutcome":
     """Max-Review-Cycles facts for a post-panel outcome: the contract and
-    rebuttal identities always ride it; ``paid`` (and the wave id) only when
-    the wave PHYSICALLY dispatched — ``stamp.fired`` mirrors the durable
+    rebuttal and wave identities always ride it; ``paid`` only when the wave
+    PHYSICALLY dispatched — ``stamp.fired`` mirrors the durable
     write-ahead dispatch marker recorded before the first transport call
     (plan-review precedent), so a crash cannot launder the spend and an
     assembly-refused $0 wave never counts."""
     outcome.paid = bool(stamp is not None and getattr(stamp, "fired", False))
     outcome.review_contract_fingerprint = contract_fp
     outcome.rebuttal_sha256 = rebuttal_sha
-    if outcome.paid:
+    if stamp is not None:
         outcome.wave_id = str(getattr(stamp, "wave_id", "") or "")
     return outcome
 
@@ -1494,7 +1494,7 @@ def review_skill(
             paid=bool(getattr(stamp, "fired", False)),
             review_contract_fingerprint=contract_fp,
             rebuttal_sha256=rebuttal_sha,
-            wave_id=str(getattr(stamp, "wave_id", "") or "") if getattr(stamp, "fired", False) else "",
+            wave_id=str(getattr(stamp, "wave_id", "") or ""),
         ))
 
     # review_profile was resolved ONCE in _skill_cycles_gate (it is part of

@@ -213,3 +213,100 @@ def test_usage_markdown_never_claims_final_cash_from_degraded_or_open_rows():
     )
     assert "Wave attempt coverage: complete (1/1 recorded)" in open_row
     assert "Recorded-row cash" in open_row and "whole-wave cash and finality are unavailable" in open_row
+
+
+def test_api_token_normalization_preserves_missing_zero_and_body_error_contracts():
+    missing, cost, final = ua.usage_from_response({"choices": [{"message": {"content": "ok"}}]})
+    assert (missing["prompt_tokens"], missing["completion_tokens"]) == (None, None)
+    assert (missing["cached_tokens"], missing["cache_write_tokens"]) == (None, None)
+    assert cost is None and final is False
+
+    zeros, cost, final = ua.usage_from_response({
+        "usage": {
+            "prompt_tokens": 0, "completion_tokens": 0,
+            "cached_tokens": 0, "cache_write_tokens": 0,
+        },
+    })
+    assert (
+        zeros["prompt_tokens"], zeros["completion_tokens"],
+        zeros["cached_tokens"], zeros["cache_write_tokens"],
+    ) == (0, 0, 0, 0)
+    assert cost is None and final is False
+
+    rejected, cost, final = ua.usage_from_response({
+        "error": {"code": 429, "message": "rate limited"}, "usage": None,
+    })
+    assert (rejected["prompt_tokens"], rejected["completion_tokens"]) == (0, 0)
+    assert cost == 0.0 and final is True
+
+
+def test_skill_wave_token_gaps_exclude_nonphysical_rows_and_keep_explicit_zero(data_root):
+    from ouroboros.skill_review_usage import skill_review_usage_markdown
+
+    scope = ua.UsageScope(
+        drive_root=data_root, task_id="review", root_task_id="root",
+        category="skill_review_review", source="review_substrate",
+        review_skill="happy_farm", review_wave_id="wave-null",
+    )
+    with ua.usage_scope(scope):
+        missing = ua.reserve_attempt(_request(data_root, reservation_usd=0.0))
+        ua.mark_dispatched(missing)
+        ua.settle_attempt(missing, {}, cost_usd=0.0, cost_final=True)
+
+        zero = ua.reserve_attempt(_request(data_root, reservation_usd=0.0))
+        ua.mark_dispatched(zero)
+        ua.settle_attempt(
+            zero,
+            {
+                "prompt_tokens": 0, "completion_tokens": 0,
+                "cached_tokens": 0, "cache_write_tokens": 0,
+            },
+            cost_usd=0.0, cost_final=True,
+        )
+
+        released = ua.reserve_attempt(_request(data_root, reservation_usd=0.0))
+        ua.release_attempt(released, "never dispatched")
+
+    rows = _ledger(data_root)
+    final_by_id = {row["attempt_id"]: row for row in rows}
+    assert (
+        final_by_id[missing.attempt_id]["prompt_tokens"],
+        final_by_id[missing.attempt_id]["completion_tokens"],
+        final_by_id[missing.attempt_id]["cached_tokens"],
+        final_by_id[missing.attempt_id]["cache_write_tokens"],
+    ) == (None, None, None, None)
+    assert (
+        final_by_id[zero.attempt_id]["prompt_tokens"],
+        final_by_id[zero.attempt_id]["completion_tokens"],
+        final_by_id[zero.attempt_id]["cached_tokens"],
+        final_by_id[zero.attempt_id]["cache_write_tokens"],
+    ) == (0, 0, 0, 0)
+
+    projection = ua.skill_review_usage(
+        data_root, review_skill="happy_farm", review_wave_id="wave-null",
+    )
+    assert projection["prompt_tokens"] == 0
+    markdown = skill_review_usage_markdown(
+        projection, coverage_known=True, expected=2, recorded=2,
+    )
+    assert "Reported tokens: prompt=0; completion=0; cached=0" in markdown
+    assert "prompt=1/2 unreported; completion=1/2 unreported; cached=1/2 unreported" in markdown
+
+
+def test_subscription_token_defaults_are_unknown_but_explicit_zero_survives(data_root):
+    silent = ua.record_subscription_session(
+        "silent-session", drive_root=data_root, route="codex",
+    )
+    zero = ua.record_subscription_session(
+        "zero-session", drive_root=data_root, route="codex",
+        prompt_tokens=0, completion_tokens=0, cached_tokens=0,
+    )
+    rows = {row["attempt_id"]: row for row in _ledger(data_root)}
+    assert (
+        rows[silent]["prompt_tokens"], rows[silent]["completion_tokens"],
+        rows[silent]["cached_tokens"],
+    ) == (None, None, None)
+    assert (
+        rows[zero]["prompt_tokens"], rows[zero]["completion_tokens"],
+        rows[zero]["cached_tokens"],
+    ) == (0, 0, 0)
