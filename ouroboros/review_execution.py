@@ -27,6 +27,7 @@ from ouroboros.review_slot_cancel import (  # noqa: F401 — re-exported seam su
     _natural_success_terminal,
     _slot_cancel_outcome,
 )
+from ouroboros.review_dispatch import invoke_review_paid_stamp
 from ouroboros.triad_review import (
     ACCEPTANCE_SURFACE_RULES,
     REVIEW_JSON_ARRAY_CONTRACT,
@@ -247,21 +248,15 @@ def _messages_char_count(messages: List[Dict[str, Any]]) -> int:
 
 @dataclass(frozen=True)
 class ReviewAssignment:
-    """Immutable description of one reviewer slot's job.
-
-    Built by ``_run_slot`` before any transport exists and handed to the
-    execution seam unchanged, so every route receives the SAME task, subject,
-    evidence and output contract — only the delivery differs.
-    """
+    """Immutable slot job: same task and evidence, route-specific delivery."""
 
     request: ReviewRequest
     slot: ReviewSlot
     call_id: str = ""
     call_type: str = ""
-    # Where a DELEGATED route's custody rows live (the canonical/budget drive).
-    # Data, not policy: the coordinator computes it once; the api_chat route
-    # never reads it.
+    # Canonical/budget drive for delegated custody; the API route never reads it.
     custody_root: Any = None
+    dispatch_stamp: Any = None
 
     @property
     def route(self) -> ReviewRouteKind:
@@ -356,13 +351,15 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
     def execute(self) -> ReviewAttemptResult:
         chat_kwargs = self._kwargs()
         chat = getattr(self.llm, "chat", None)
+        async_chat = getattr(self.llm, "chat_async", None)
+        if not callable(chat) and not callable(async_chat):
+            raise ReviewRouteUnavailable("api_chat client exposes no callable transport", code="api_chat_unavailable")
+        invoke_review_paid_stamp(self.assignment.dispatch_stamp)
         if callable(chat):
             msg, usage = chat(**chat_kwargs)
         else:
-            msg, usage = asyncio.run(self.llm.chat_async(**chat_kwargs))
-        # A provider can yield a null/non-object message on a zero-body
-        # response. Treat it exactly like empty content: the caller's attempt
-        # rail decides whether another send is permitted.
+            msg, usage = asyncio.run(async_chat(**chat_kwargs))
+        # Null/non-object provider messages follow the caller's empty-response rail.
         raw_text = str(msg.get("content") or "") if isinstance(msg, dict) else ""
         return ReviewAttemptResult(message=msg, usage=usage, raw_text=raw_text)
 
@@ -762,6 +759,7 @@ class SessionInvocation:
     retry_state: Optional[Dict[str, Any]] = None
     use_thread: bool = False
     thread_id: str = ""
+    dispatch_stamp: Any = None
 
 
 def _owned_started_review_custody(
@@ -977,6 +975,7 @@ def run_delegated_review_session(
                 run_request["outputSchema"] = output_schema
         if not run_id:
             seconds = int(run_request.get("maxSeconds") or timeout_sec or 300)
+            invoke_review_paid_stamp(invocation.dispatch_stamp)
             requested = custody.record_start_requested(
                 custody_drive, run_id="", task_id=task_id,
                 idempotency_key=key, invocation_id=invocation_id,
@@ -1394,6 +1393,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 retry_state=self._retry_state,
                 use_thread=request.surface == "plan_review",
                 thread_id=str((request.session_threads or {}).get(slot.slot_id) or ""),
+                dispatch_stamp=self.assignment.dispatch_stamp,
             ),
         )
         self._run_id = facts["run_id"]

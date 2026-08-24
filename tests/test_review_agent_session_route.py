@@ -8,6 +8,7 @@ light-model extraction call. No network, no daemon, no subscription.
 """
 
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -1404,12 +1405,110 @@ def test_unconfigured_session_route_is_a_typed_refusal(tmp_path, fake_route, mon
     monkeypatch.delenv(REVIEW_SESSION_ROUTE_ENV, raising=False)
     monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
     llm = FakeLLM()
+    stamps = []
+    usage_ctx = SimpleNamespace(_review_paid_stamp=lambda: stamps.append("paid"))
     result = run_review_request(_agent_request(), slots=[_agent_slot()],
-                                drive_root=tmp_path, llm=llm)
+                                drive_root=tmp_path, llm=llm, usage_ctx=usage_ctx)
     actor = result.actors[0]
     assert actor["status"] == "error"
     assert "no configured session route" in actor["error"]
     assert llm.calls == []  # never a silent fallback onto the api route
+    assert stamps == []  # a typed pre-start refusal is a $0 unpaid wave
+
+
+def test_real_api_and_session_dispatch_each_fire_the_captured_stamp_once(
+    tmp_path, fake_route,
+):
+    session_stamps = []
+    session_ctx = SimpleNamespace(_review_paid_stamp=lambda: session_stamps.append("session"))
+    run_review_request(_agent_request(), slots=[_agent_slot()], drive_root=tmp_path,
+                       llm=FakeLLM(), usage_ctx=session_ctx)
+    assert session_stamps == ["session"]
+
+    api_stamps = []
+    api_ctx = SimpleNamespace(_review_paid_stamp=lambda: api_stamps.append("api"))
+    llm = FakeLLM()
+    run_review_request(_agent_request(), slots=[_agent_slot(route=ReviewRouteKind.API_CHAT)],
+                       drive_root=tmp_path / "api", llm=llm, usage_ctx=api_ctx)
+    assert api_stamps == ["api"] and len(llm.calls) == 1
+
+
+def test_mixed_panel_shares_one_idempotent_wave_stamp(tmp_path, fake_route):
+    from ouroboros.review_dispatch import ReviewPaidStamp
+
+    writes = []
+    ctx = SimpleNamespace(_review_paid_stamp=ReviewPaidStamp(lambda: writes.append("paid")))
+    llm = FakeLLM()
+    run_review_request(
+        _agent_request(),
+        slots=[
+            _agent_slot(slot_id="session-slot"),
+            _agent_slot(slot_id="api-slot", route=ReviewRouteKind.API_CHAT),
+        ],
+        drive_root=tmp_path, llm=llm, usage_ctx=ctx,
+    )
+    assert writes == ["paid"]
+    assert len(llm.calls) == 1 and len(fake_route.instances[0].start_requests) == 1
+
+
+def test_missing_api_transport_refuses_before_paid_stamp(tmp_path, fake_route):
+    stamps = []
+    ctx = SimpleNamespace(_review_paid_stamp=lambda: stamps.append("paid"))
+    result = run_review_request(
+        _agent_request(), slots=[_agent_slot(route=ReviewRouteKind.API_CHAT)],
+        drive_root=tmp_path, llm=SimpleNamespace(), usage_ctx=ctx,
+    )
+    assert result.actors[0]["status"] == "error"
+    assert "api_chat client exposes no callable transport" in result.actors[0]["error"]
+    assert stamps == []
+
+
+def test_session_stamp_precedes_durable_start_request(
+    tmp_path, fake_route, monkeypatch,
+):
+    stamped = threading.Event()
+    original = custody.record_start_requested
+
+    def checked_record(*args, **kwargs):
+        assert stamped.is_set(), "orphan recovery may POST as soon as this row exists"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(custody, "record_start_requested", checked_record)
+    ctx = SimpleNamespace(_review_paid_stamp=stamped.set)
+    run_review_request(_agent_request(), slots=[_agent_slot()], drive_root=tmp_path,
+                       llm=FakeLLM(), usage_ctx=ctx)
+    assert stamped.is_set()
+
+
+def test_late_worker_uses_its_captured_stamp_after_caller_restores_context(
+    tmp_path, fake_route, monkeypatch,
+):
+    entered, release = threading.Event(), threading.Event()
+    stamped, finished = threading.Event(), threading.Event()
+    original = FakeGateway.find_project_id
+    original_close = FakeGateway.close
+
+    def delayed_find(self, root):
+        entered.set()
+        assert release.wait(2)
+        return original(self, root)
+
+    def observed_close(self):
+        original_close(self)
+        finished.set()
+
+    monkeypatch.setattr(FakeGateway, "find_project_id", delayed_find)
+    monkeypatch.setattr(FakeGateway, "close", observed_close)
+    ctx = SimpleNamespace(_review_paid_stamp=stamped.set)
+    result = run_review_request(
+        _agent_request(), slots=[_agent_slot(timeout_sec=0.02)],
+        drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
+    )
+    assert entered.is_set() and result.actors[0]["status"] == "error"
+    ctx._review_paid_stamp = None  # mirrors review_skill's finally restoration
+    release.set()
+    assert stamped.wait(2), "the late physical start must retain its original wave stamp"
+    assert finished.wait(2), "the delayed worker must not leak into the next test"
 
 
 def test_unhealthy_route_refuses_typed_never_falls_back(tmp_path, fake_route):

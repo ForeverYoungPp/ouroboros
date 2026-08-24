@@ -336,6 +336,7 @@ def parse_model_review_results(
     """
     findings: List[Dict[str, Any]] = []
     responsive: List[str] = []
+    responsive_ids: set[str] = set()
     records: List[ReviewActorRecord] = []
     required = set(required_items or [])
     for idx, actor in enumerate(result_json.get("results") or []):
@@ -384,8 +385,10 @@ def parse_model_review_results(
             continue
         findings.extend(actor_findings)
         responsive_id = f"{model_label} [{actor_slot_id}]" if actor_slot_id else f"{model_label}#{idx + 1}"
-        if responsive_id not in responsive:
+        response_identity = f"slot:{actor_slot_id}" if actor_slot_id else f"actor:{idx}"
+        if response_identity not in responsive_ids:
             responsive.append(responsive_id)
+            responsive_ids.add(response_identity)
         records.append(_actor_record(actor, idx=idx, model_label=model_label, status="responded", raw_text=raw_text, parsed_items=actor_findings))
     return ParsedTriadReview(findings=findings, responsive_models=responsive, actor_records=records)
 

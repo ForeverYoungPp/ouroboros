@@ -167,10 +167,11 @@ def test_review_history_detail_renders_exact_canonical_wave_usage(tmp_path, monk
     assert api.attempt_id in markdown and session in markdown
     assert "Cash: settled $0.125000; confirmed $0.125000" in markdown
     assert "Calls: API physical=1; subscription sessions=1" in markdown
-    assert "Tokens: prompt=42; completion=12; cached=2" in markdown
+    assert "Reported tokens: prompt=42; completion=12; cached=2" in markdown
+    assert "Token coverage: cached=1/2 unreported" in markdown
     assert "Slot skill-triad-1" in markdown and "Slot skill-triad-2" in markdown
     assert "claude resets 2026-08-25T00:00:00Z" in markdown
-    assert "model=claude-fable-5, route=claude, profile=fable-profile" in markdown
+    assert "model=claude-fable-5, requested route=claude, profile=fable-profile" in markdown
     assert "ledger integrity=verified; slot attribution=complete" in markdown
 
 
@@ -258,7 +259,7 @@ def test_review_history_detail_stays_incomplete_until_late_session_settles(
     assert "whole-wave cash and finality are unavailable" not in settled
 
 
-def test_review_history_coverage_does_not_let_extraction_mask_chunked_session(tmp_path):
+def test_chunked_coverage_stays_unknown_without_per_occurrence_attempt_identity(tmp_path):
     from ouroboros.skill_review_usage import skill_review_attempt_coverage
 
     record = {"raw_actor_records": [
@@ -266,13 +267,25 @@ def test_review_history_coverage_does_not_let_extraction_mask_chunked_session(tm
         {"slot_id": "slot-a"}, {"slot_id": "slot-b"},
     ]}
     usage = {"attempts": [
-        {"review_slot_id": "slot-a", "kind": "subscription_session", "source": "review_substrate"},
-        {"review_slot_id": "slot-a", "kind": "attempt", "source": "review_substrate.extraction"},
-        {"review_slot_id": "slot-b", "kind": "subscription_session", "source": "review_substrate"},
-        {"review_slot_id": "slot-b", "kind": "subscription_session", "source": "review_substrate"},
+        {"review_slot_id": "slot-a", "kind": "subscription_session", "state": "settled", "source": "review_substrate"},
+        {"review_slot_id": "slot-a", "kind": "attempt", "state": "settled", "source": "review_substrate.extraction"},
+        {"review_slot_id": "slot-b", "kind": "subscription_session", "state": "settled", "source": "review_substrate"},
+        {"review_slot_id": "slot-b", "kind": "subscription_session", "state": "settled", "source": "review_substrate"},
     ]}
 
-    assert skill_review_attempt_coverage(record, usage) == (True, 4, 3)
+    assert skill_review_attempt_coverage(record, usage) == (False, 4, 3)
+
+
+def test_reserved_row_does_not_count_as_a_physical_review_attempt():
+    from ouroboros.skill_review_usage import skill_review_attempt_coverage
+
+    record = {"raw_actor_records": [{"slot_id": "slot-a"}]}
+    usage = {"attempts": [{
+        "review_slot_id": "slot-a", "kind": "attempt", "state": "reserved",
+        "source": "review_substrate",
+    }]}
+
+    assert skill_review_attempt_coverage(record, usage) == (True, 1, 0)
 
 
 def test_review_history_detail_keeps_verdict_when_usage_projection_is_unavailable(

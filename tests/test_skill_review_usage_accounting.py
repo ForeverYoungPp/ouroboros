@@ -179,3 +179,37 @@ def test_skill_review_usage_projects_only_exact_wave_and_keeps_slots_and_unknown
         data_root, review_skill="happy_farm", review_wave_id="wave-with-no-attempts",
     )
     assert empty["attempt_ids"] == [] and empty["attribution_complete"] is False
+
+
+def test_usage_markdown_never_claims_final_cash_from_degraded_or_open_rows():
+    from ouroboros.skill_review_usage import skill_review_usage_markdown
+
+    base = {
+        "attempt_ids": ["a1"],
+        "attempts": [{
+            "attempt_id": "a1", "review_slot_id": "slot-1", "kind": "attempt",
+            "state": "settled", "prompt_tokens": 10, "completion_tokens": None,
+            "cached_tokens": None,
+        }],
+        "settled_usd": 0.25, "confirmed_usd": 0.25, "estimated_usd": 0.0,
+        "unresolved_upper_bound_usd": 0.0, "physical_calls": 1,
+        "subscription_sessions": 0, "prompt_tokens": 10, "completion_tokens": None,
+        "cached_tokens": None, "unknown_unmetered": 0, "non_final_rows": 0,
+        "attribution_complete": True, "by_slot": {},
+    }
+    degraded = skill_review_usage_markdown(
+        {**base, "cost_final": False, "integrity_degraded": True},
+        coverage_known=True, expected=1, recorded=1,
+    )
+    assert "Recorded-row cash: settled $0.250000" in degraded
+    assert "Wave attempt coverage: unverified (ledger integrity degraded; 1/1 visible)" in degraded
+    assert "whole-wave cash and finality are unavailable" in degraded
+    assert "Reported tokens: prompt=10; completion=unknown; cached=unknown" in degraded
+    assert "completion=1/1 unreported; cached=1/1 unreported" in degraded
+
+    open_row = skill_review_usage_markdown(
+        {**base, "cost_final": False, "integrity_degraded": False, "non_final_rows": 1},
+        coverage_known=True, expected=1, recorded=1,
+    )
+    assert "Wave attempt coverage: complete (1/1 recorded)" in open_row
+    assert "Recorded-row cash" in open_row and "whole-wave cash and finality are unavailable" in open_row

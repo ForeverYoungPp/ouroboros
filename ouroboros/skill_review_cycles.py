@@ -482,9 +482,9 @@ def install_skill_dispatch_stamp(
     rebuttal_sha: str,
 ) -> tuple[Any, Any]:
     """Install the write-ahead paid stamp for ONE skill-review wave (F3, the
-    same seam as the commit gate's F2 stamp): the shared reviewer transport
-    entry invokes it via ``ctx._review_paid_stamp`` immediately before the
-    first physical panel call, durably writing the ONE dispatch marker shared
+    same seam as the commit gate's F2 stamp): each route executor invokes the
+    captured ``ctx._review_paid_stamp`` at its physical point of no return,
+    durably writing the ONE dispatch marker shared
     by lifecycle and direct callers (the lifecycle job id names the wave when
     present, so a timeout terminal can merge the marker back). Returns
     ``(stamp, previous_attr_value)`` — the caller restores the previous value

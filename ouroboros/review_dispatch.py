@@ -6,9 +6,9 @@ Q16/Q17; Max-Review-Cycles fix round).
 The ``paid`` fact of Max-Review-Cycles accounting is recorded at PHYSICAL
 dispatch: a gate that must durably record "this wave spent reviewer money"
 installs a :class:`ReviewPaidStamp` on ``ctx._review_paid_stamp`` for the
-duration of its wave, and the shared reviewer transport entry
-(``review_substrate.run_review_request``) invokes it immediately before the
-first transport call. Assembly-only refusals (triad fit ladder, scope pack
+duration of its wave. The coordinator captures that exact once-only object,
+and each route executor invokes it at its physical point of no return.
+Assembly-only refusals (triad fit ladder, scope pack
 signals, skill prompt building) exit before the seam, so a $0 attempt stays
 outside every ceiling; a crash after dispatch keeps the durable paid fact
 (write-ahead). This seam is also where the L-review lane's two-phase
@@ -74,17 +74,18 @@ class ReviewPaidStamp:
                 self.fired = True
 
 
-def stamp_review_paid_on_dispatch(ctx: Any) -> None:
-    """Invoke the caller-installed write-ahead paid stamp; no-op without one.
-
-    Called by the shared reviewer transport entry immediately before the first
-    physical reviewer call. Surfaces that do not meter paid cycles simply
-    never install ``ctx._review_paid_stamp``. Fail-open by design.
-    """
-    stamp = getattr(ctx, "_review_paid_stamp", None) if ctx is not None else None
+def invoke_review_paid_stamp(stamp: Any) -> None:
+    """Invoke one captured write-ahead stamp, fail-open."""
     if not callable(stamp):
         return
     try:
         stamp()
     except Exception:
         log.debug("review paid dispatch stamp failed (fail-open)", exc_info=True)
+
+
+def stamp_review_paid_on_dispatch(ctx: Any) -> None:
+    """Invoke the caller-installed stamp; retained for legacy/test callers."""
+    invoke_review_paid_stamp(
+        getattr(ctx, "_review_paid_stamp", None) if ctx is not None else None
+    )

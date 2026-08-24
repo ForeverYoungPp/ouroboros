@@ -479,9 +479,9 @@ def _install_paid_dispatch_stamp(
     any side dispatching makes the cycle paid. Assembly-only exits (triad fit
     ladder, scope pack signals) never invoke the stamp, so a $0 attempt stays
     outside the ceiling; a crash after dispatch keeps the paid fact
-    (write-ahead). The shared transport entry (``run_review_request``)
-    invokes the stamp via ``ctx._review_paid_stamp`` — the seam where the
-    L-review lane's two-phase admission slots in at synthesis."""
+    (write-ahead). The coordinator captures ``ctx._review_paid_stamp`` and
+    each route executor invokes that exact object at its point of no return —
+    the seam where the L-review lane's two-phase admission slots in."""
     from ouroboros.review_dispatch import ReviewPaidStamp
 
     def _write() -> None:

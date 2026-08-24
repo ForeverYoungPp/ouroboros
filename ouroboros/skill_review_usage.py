@@ -18,9 +18,12 @@ def skill_review_usage_markdown(
         item = usage.get(name)
         return "unknown" if item is None else str(item)
 
+    attempts = [item for item in (usage.get("attempts") or []) if isinstance(item, dict)]
     attempt_ids = [str(item) for item in (usage.get("attempt_ids") or []) if str(item)]
+    integrity_degraded = bool(usage.get("integrity_degraded"))
     coverage_complete = coverage_known and recorded >= expected
-    cash_label = "Cash" if coverage_complete else "Recorded-row cash"
+    whole_wave_final = coverage_complete and not integrity_degraded and usage.get("cost_final") is True
+    cash_label = "Cash" if whole_wave_final else "Recorded-row cash"
     lines = [
         "### Review accounting",
         "",
@@ -30,20 +33,31 @@ def skill_review_usage_markdown(
          "${unresolved_upper_bound_usd:.6f}.").format(**usage),
         (f"- Calls: API physical={int(usage.get('physical_calls') or 0)}; "
          f"subscription sessions={int(usage.get('subscription_sessions') or 0)}."),
-        (f"- Tokens: prompt={value('prompt_tokens')}; completion={value('completion_tokens')}; "
+        (f"- Reported tokens: prompt={value('prompt_tokens')}; completion={value('completion_tokens')}; "
          f"cached={value('cached_tokens')}."),
         (f"- Finality: unknown/unmetered={int(usage.get('unknown_unmetered') or 0)}; "
          f"non-final rows={int(usage.get('non_final_rows') or 0)}; "
-         f"ledger integrity={'degraded' if usage.get('integrity_degraded') else 'verified'}; "
+         f"ledger integrity={'degraded' if integrity_degraded else 'verified'}; "
          f"slot attribution={'complete' if usage.get('attribution_complete') else 'incomplete'}."),
     ]
-    if coverage_complete:
-        lines.append(f"- Wave attempt coverage: complete ({recorded}/{expected} recorded).")
+    token_gaps = [
+        f"{field.removesuffix('_tokens')}={sum(item.get(field) is None for item in attempts)}/{len(attempts)} unreported"
+        for field in ("prompt_tokens", "completion_tokens", "cached_tokens")
+        if attempts and any(item.get(field) is None for item in attempts)
+    ]
+    if token_gaps:
+        lines.append("- Token coverage: " + "; ".join(token_gaps) + ".")
+    if integrity_degraded:
+        coverage = f"unverified (ledger integrity degraded; {recorded}/{expected} visible)"
+    elif coverage_complete:
+        coverage = f"complete ({recorded}/{expected} recorded)"
     else:
-        coverage = f"incomplete ({recorded}/{expected} recorded)" if coverage_known else "unknown"
-        lines.append(
-            f"- Wave attempt coverage: {coverage}; whole-wave cash and finality are unavailable."
+        coverage = (
+            f"incomplete ({recorded}/{expected} recorded)" if coverage_known else
+            f"unknown ({recorded} physical rows / {expected} actor occurrences visible)"
         )
+    finality = "" if whole_wave_final else "; whole-wave cash and finality are unavailable"
+    lines.append(f"- Wave attempt coverage: {coverage}{finality}.")
     for slot_id, bucket in (usage.get("by_slot") or {}).items():
         lines.append(
             f"- Slot {slot_id}: API physical={int(bucket.get('physical_calls') or 0)}, "
@@ -59,10 +73,11 @@ def skill_review_usage_markdown(
         cost = attempt.get("cost_usd")
         cost_text = "unknown" if cost is None else f"${float(cost):.6f}"
         route = attempt.get("subscription_route") or attempt.get("provider") or "unknown"
+        route_label = "requested route" if attempt.get("kind") == "subscription_session" else "provider"
         lines.append(
             f"- `{attempt.get('attempt_id')}`: slot={attempt.get('review_slot_id') or 'unattributed'}, "
             f"kind={attempt.get('kind') or 'attempt'}, state={attempt.get('state') or 'unknown'}, "
-            f"model={attempt.get('model') or 'unknown'}, route={route}, "
+            f"model={attempt.get('model') or 'unknown'}, {route_label}={route}, "
             f"profile={attempt.get('credential_profile_id') or 'automatic/undisclosed'}, "
             f"access={attempt.get('access_profile') or 'undisclosed'}, cash={cost_text}."
         )
@@ -89,9 +104,15 @@ def skill_review_attempt_coverage(
         # not the reviewer transport whose late settlement this coverage proves.
         if str(attempt.get("source") or "") == "review_substrate.extraction":
             continue
+        if str(attempt.get("state") or "") not in {"dispatched", "settled", "unresolved"}:
+            continue
         slot_id = str(attempt.get("review_slot_id") or "")
         if slot_id:
             observed[slot_id] = observed.get(slot_id, 0) + 1
+    if any(count > 1 for count in expected.values()):
+        # Chunked waves repeat one stable slot id. With only the owner-approved
+        # wave/slot attribution, retries cannot be joined to a particular chunk.
+        return False, sum(expected.values()), sum(observed.values())
     return True, sum(expected.values()), sum(
         min(count, observed.get(slot_id, 0)) for slot_id, count in expected.items()
     )

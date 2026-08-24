@@ -1005,6 +1005,7 @@ class ReviewCoordinator:
 
             self.drive_root = pathlib.Path(config.DATA_DIR)
         self.usage_ctx = usage_ctx
+        self._review_paid_stamp = getattr(usage_ctx, "_review_paid_stamp", None)
 
     def run(self, request: ReviewRequest, slots: List[ReviewSlot]) -> ReviewRunResult:
         if not slots:
@@ -1363,6 +1364,7 @@ class ReviewCoordinator:
         assignment = ReviewAssignment(
             request=request, slot=slot, call_id=call_id, call_type=base_call_type,
             custody_root=self._custody_drive_root(),
+            dispatch_stamp=self._review_paid_stamp,
         )
         # Transport is chosen once, here, through the seam; the prompt itself is
         # rendered by the route (lazily) rather than by this method, so a route
@@ -1579,11 +1581,6 @@ def run_review_request(
     llm: LLMClient | None = None,
     usage_ctx: Any = None,
 ) -> ReviewRunResult:
-    # Write-ahead paid stamp (Q16 dispatch seam): a gate that meters paid
-    # cycles installed a callback on ctx; it durably lands the paid fact
-    # BEFORE the first reviewer transport call. Assembly-only refusals never
-    # reach this line, so undispatched attempts stay outside every ceiling.
-    stamp_review_paid_on_dispatch(usage_ctx)
     coordinator = ReviewCoordinator(llm=llm, drive_root=drive_root, usage_ctx=usage_ctx)
     result = coordinator.run(request, reviewer_slots(role_hint=request.surface) if slots is None else slots)
     if request.surface == "task_acceptance":

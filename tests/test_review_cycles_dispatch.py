@@ -260,7 +260,7 @@ def _overflow_wave(dispatch):
 
     def _wave(ctx, commit_message, **kwargs):
         if dispatch:
-            stamp_review_paid_on_dispatch(ctx)  # exactly what run_review_request does
+            stamp_review_paid_on_dispatch(ctx)  # simulate the route-executor seam
         ctx._last_review_block_reason = "fixed_overflow"
         ctx._last_review_critical_findings = []
         scope = ScopeReviewResult(

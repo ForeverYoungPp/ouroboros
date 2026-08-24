@@ -53,6 +53,7 @@ test('the standing note states the POLICY, never the current routing', () => {
     assert.doesNotMatch(markup, /reviews? run on your subscription/i);
     assert.match(markup, /skill\s+review follow their configured rows/i);
     assert.match(markup, /Task acceptance remains API-only/i);
+    assert.match(markup, /uses\s+configured API rows, or the shipped defaults when none remain/i);
 });
 
 
