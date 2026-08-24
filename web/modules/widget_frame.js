@@ -75,15 +75,23 @@ export function moduleResizeScript(nonce, frameFloor, maxHeight, borderReserve) 
     return `
         (() => {
             const root = document.getElementById('root');
-            const verticalOverflowStyle = document.createElement('style');
-            verticalOverflowStyle.textContent = 'html, body { overflow-y: hidden !important; }';
+            const verticalOverflowState = [document.documentElement, document.body]
+                .filter(Boolean)
+                .map((element) => ({
+                    element,
+                    value: element.style.getPropertyValue('overflow-y'),
+                    priority: element.style.getPropertyPriority('overflow-y'),
+                }));
             let suppressingVerticalOverflow = false;
             let lastHeight = 0;
             const setVerticalOverflowSuppressed = (suppressed) => {
                 if (suppressed === suppressingVerticalOverflow) return;
                 suppressingVerticalOverflow = suppressed;
-                if (suppressed) document.head.appendChild(verticalOverflowStyle);
-                else verticalOverflowStyle.remove();
+                verticalOverflowState.forEach(({ element, value, priority }) => {
+                    if (suppressed) element.style.setProperty('overflow-y', 'hidden', 'important');
+                    else if (value) element.style.setProperty('overflow-y', value, priority);
+                    else element.style.removeProperty('overflow-y');
+                });
             };
             setVerticalOverflowSuppressed(true);
             const report = () => {

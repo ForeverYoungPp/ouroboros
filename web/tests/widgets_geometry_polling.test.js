@@ -30,45 +30,51 @@ function resizeHarness({
     const sequence = [];
     const disposeCallbacks = [];
     const listeners = new Map();
-    const styleWrites = { append: 0, remove: 0 };
+    const styleWrites = { set: 0, remove: 0 };
     let observerCallback = null;
     let observerDisconnects = 0;
-    const style = {
-        textContent: '',
-        parentNode: null,
-        remove() {
-            if (!this.parentNode) return;
-            this.parentNode = null;
-            styleWrites.remove += 1;
-            sequence.push('style:remove');
-        },
+    const createStyle = (label, initial = {}) => {
+        const declarations = new Map();
+        if (initial.value) declarations.set('overflow-y', initial);
+        return {
+            getPropertyValue(name) { return declarations.get(name)?.value || ''; },
+            getPropertyPriority(name) { return declarations.get(name)?.priority || ''; },
+            setProperty(name, value, priority = '') {
+                assert.equal(name, 'overflow-y');
+                declarations.set(name, { value, priority });
+                styleWrites.set += 1;
+                sequence.push(`${label}:set:${value}:${priority}`);
+            },
+            removeProperty(name) {
+                assert.equal(name, 'overflow-y');
+                declarations.delete(name);
+                styleWrites.remove += 1;
+                sequence.push(`${label}:remove`);
+            },
+        };
     };
-    const head = {
-        appendChild(node) {
-            assert.equal(node, style);
-            node.parentNode = head;
-            styleWrites.append += 1;
-            sequence.push('style:append');
-        },
-    };
+    const documentElement = { style: createStyle('html') };
     const root = {
         get scrollHeight() { return state.height; },
         getBoundingClientRect: () => ({ height: state.height, bottom: state.height }),
     };
     const body = {
+        style: createStyle('body'),
         scrollHeight: 0,
         clientHeight: 0,
         getBoundingClientRect: () => ({ top: 0 }),
     };
     const document = {
         body,
-        head,
-        createElement(tag) {
-            assert.equal(tag, 'style');
-            return style;
-        },
+        documentElement,
         getElementById: (id) => (id === 'root' ? root : null),
     };
+    const overflowState = () => Object.fromEntries(
+        [['html', documentElement], ['body', body]].map(([label, element]) => [label, {
+            value: element.style.getPropertyValue('overflow-y'),
+            priority: element.style.getPropertyPriority('overflow-y'),
+        }]),
+    );
     const window = {
         innerHeight: 768,
         parent: {
@@ -106,7 +112,7 @@ function resizeHarness({
     return {
         messages,
         sequence,
-        style,
+        overflowState,
         styleWrites,
         listeners,
         observerDisconnects: () => observerDisconnects,
@@ -126,41 +132,53 @@ test('widget frame contract keeps the bounded host geometry', () => {
 
 test('module auto-height owns only vertical overflow across cap transitions', () => {
     const harness = resizeHarness();
-    assert.equal(harness.style.textContent, 'html, body { overflow-y: hidden !important; }');
-    assert.doesNotMatch(harness.style.textContent, /overflow-x/);
-    assert.equal(harness.style.parentNode !== null, true);
-    assert.deepEqual(harness.styleWrites, { append: 1, remove: 0 });
+    assert.deepEqual(harness.overflowState(), {
+        html: { value: 'hidden', priority: 'important' },
+        body: { value: 'hidden', priority: 'important' },
+    });
+    assert.deepEqual(harness.styleWrites, { set: 2, remove: 0 });
     assert.deepEqual(harness.messages.map((item) => item.height), [616]);
-    assert.deepEqual(harness.sequence.slice(0, 2), ['style:append', 'message']);
+    assert.deepEqual(harness.sequence.slice(0, 3), [
+        'html:set:hidden:important', 'body:set:hidden:important', 'message',
+    ]);
 
     harness.resize(600);
-    assert.deepEqual(harness.styleWrites, { append: 1, remove: 0 });
+    assert.deepEqual(harness.styleWrites, { set: 2, remove: 0 });
     assert.equal(harness.messages.length, 1);
 
     harness.resize(1200);
-    assert.equal(harness.style.parentNode, null);
-    assert.deepEqual(harness.styleWrites, { append: 1, remove: 1 });
+    assert.deepEqual(harness.overflowState(), {
+        html: { value: '', priority: '' }, body: { value: '', priority: '' },
+    });
+    assert.deepEqual(harness.styleWrites, { set: 2, remove: 2 });
     assert.deepEqual(harness.messages.map((item) => item.height), [616, 1216]);
 
     harness.resize(1200);
-    assert.deepEqual(harness.styleWrites, { append: 1, remove: 1 });
+    assert.deepEqual(harness.styleWrites, { set: 2, remove: 2 });
     assert.equal(harness.messages.length, 2);
 
     harness.resize(500);
-    assert.equal(harness.style.parentNode !== null, true);
-    assert.deepEqual(harness.styleWrites, { append: 2, remove: 1 });
+    assert.deepEqual(harness.overflowState(), {
+        html: { value: 'hidden', priority: 'important' },
+        body: { value: 'hidden', priority: 'important' },
+    });
+    assert.deepEqual(harness.styleWrites, { set: 4, remove: 2 });
     assert.deepEqual(harness.messages.map((item) => item.height), [616, 1216, 516]);
 });
 
 test('module overflow ownership covers floor equality, fixed-height no-op, and cleanup', () => {
     const floorCap = resizeHarness({ maxHeight: WIDGET_FRAME_DEFAULT_HEIGHT, initialHeight: 100 });
-    assert.equal(floorCap.style.parentNode, null);
-    assert.deepEqual(floorCap.styleWrites, { append: 1, remove: 1 });
+    assert.deepEqual(floorCap.overflowState(), {
+        html: { value: '', priority: '' }, body: { value: '', priority: '' },
+    });
+    assert.deepEqual(floorCap.styleWrites, { set: 2, remove: 2 });
 
     const harness = resizeHarness();
     harness.dispose();
-    assert.equal(harness.style.parentNode, null);
-    assert.deepEqual(harness.styleWrites, { append: 1, remove: 1 });
+    assert.deepEqual(harness.overflowState(), {
+        html: { value: '', priority: '' }, body: { value: '', priority: '' },
+    });
+    assert.deepEqual(harness.styleWrites, { set: 2, remove: 2 });
     assert.equal(harness.observerDisconnects(), 1);
     assert.equal(harness.listeners.has('load'), false);
 

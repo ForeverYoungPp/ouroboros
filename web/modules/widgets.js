@@ -1276,10 +1276,7 @@ async function mountTab(card, tab, mountSignal = null) {
         const bridge = moduleBridgeScript(nonce);
         const resizeBridge = autoHeight
             ? moduleResizeScript(
-                nonce,
-                WIDGET_FRAME_DEFAULT_HEIGHT,
-                maxHeight,
-                WIDGET_FRAME_BORDER_RESERVE,
+                nonce, WIDGET_FRAME_DEFAULT_HEIGHT, maxHeight, WIDGET_FRAME_BORDER_RESERVE,
             )
             : '';
         const srcdoc = `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body><div id="root"></div><script>${bridge}</script><script>${resizeBridge}</script><script>${escapeScript(moduleSource)}</script></body></html>`;

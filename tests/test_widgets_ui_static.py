@@ -141,13 +141,14 @@ def test_widgets_frame_geometry_and_teardown_contract():
     assert "fixedViewportBody" in source
     assert 'scrolling="no"' not in source
     assert "syncModuleFrameScrolling" not in source
-    overflow_rule = source.split("verticalOverflowStyle.textContent = ", 1)[1].split("';", 1)[0]
-    assert "overflow-y: hidden !important" in overflow_rule
-    assert "overflow-x" not in overflow_rule
+    assert "getPropertyValue('overflow-y')" in source
+    assert "getPropertyPriority('overflow-y')" in source
+    assert "style.setProperty('overflow-y', 'hidden', 'important')" in source
+    assert "style.setProperty('overflow-x'" not in source
     assert source.index("setVerticalOverflowSuppressed(true);") < source.index("const report = () =>")
     assert "setVerticalOverflowSuppressed(outerHeight <" in source
     assert "setVerticalOverflowSuppressed(false);" in source
-    assert "WIDGET_FRAME_DEFAULT_HEIGHT,\n                maxHeight,\n                WIDGET_FRAME_BORDER_RESERVE," in source
+    assert "nonce, WIDGET_FRAME_DEFAULT_HEIGHT, maxHeight, WIDGET_FRAME_BORDER_RESERVE," in source
     assert source.index("<script>${resizeBridge}</script>") < source.index("<script>${escapeScript(moduleSource)}</script>")
     assert "ouro-widget-dispose" in source
     assert "if (iframe?.parentNode === mount) iframe.remove();" in source

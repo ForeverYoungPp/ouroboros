@@ -139,8 +139,9 @@ def _write_temporal_module_widget_extension(data_dir: pathlib.Path) -> str:
                 const style = document.createElement('style');
                 style.textContent = `
                     *{box-sizing:border-box;margin:0;padding:0}
+                    html{overflow-y:auto!important}
                     body,#root{width:100%;min-height:100%;overflow-x:hidden;padding:16px 18px}
-                    body{overflow-y:auto;padding-bottom:14px;border-bottom:0 solid #e85d6f;font:14px sans-serif;color:#edf2f7;background:#111016}
+                    body{overflow-y:auto!important;padding-bottom:14px;border-bottom:0 solid #e85d6f;font:14px sans-serif;color:#edf2f7;background:#111016}
                     body.bottom-accounting{border-bottom-width:2px}
                     main{display:flex;flex-direction:column;gap:10px;width:100%}
                     .controls{display:flex;gap:8px;flex-wrap:wrap}.controls button{padding:5px 9px}
