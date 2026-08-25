@@ -149,10 +149,17 @@ def test_structured_rows_never_coerce_or_ignore_malformed_fields(mutate, fragmen
     ({"enabled": True, "route": {"kind": "api", "target_id": "",
                                    "profile_id": "api-profile"}},
      "meaningful only for agent_session"),
+    ({"enabled": True, "kind": "agent_session", "target_id": "codex",
+      "route": {"kind": "api", "target_id": "sonnet"}},
+     "either route or legacy kind/target_id, not both"),
+    ({"enabled": True, "kind": "api", "target_id": "sonnet",
+      "route": {"kind": "api", "target_id": "sonnet"}},
+     "either route or legacy kind/target_id, not both"),
 ], ids=[
     "enabled-type", "unknown-advisory-key", "effort-type", "legacy-kind-type",
     "legacy-target-type", "unknown-route-key", "route-kind-type", "route-target-type",
-    "route-profile-type", "api-profile-pin",
+    "route-profile-type", "api-profile-pin", "conflicting-route-authorities",
+    "duplicate-route-authorities",
 ])
 def test_advisory_never_coerces_or_ignores_malformed_fields(advisory, fragment):
     payload = json.loads(json.dumps(_STRUCTURED))

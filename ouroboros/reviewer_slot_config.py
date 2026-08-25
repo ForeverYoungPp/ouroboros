@@ -217,6 +217,11 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
         # reviewer_slot_config_error's callers.
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory route must be an object "
                          "{kind, target_id}")
+    if route is not None and ({"kind", "target_id"} & set(raw)):
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: advisory must use either route or legacy "
+            "kind/target_id, not both"
+        )
     route_payload = dict(route or {})
     if "kind" not in route_payload:
         route_payload["kind"] = raw.get("kind") or "api"
