@@ -151,6 +151,7 @@ BAND_PATHS = {
     "ouroboros/skill_review_runner.py": None,
     "ouroboros/task_status.py": None,
     "ouroboros/tools/browser.py": None,
+    "ouroboros/tools/plan_review_runtime.py": "Entered the band from 986 lines: timeout custody synthesis joined the existing plan-review runtime owner while preserving profile-continuity disclosures and typed health facts during target integration.",
     "ouroboros/tools/shell_guards.py": None,
     "ouroboros/tools/skill_exec.py": None,
     "ouroboros/tools/skill_publish.py": "Entered the band from 952 lines: publish now writes the OuroborosHub publication receipt at pr_opened through the shared locked-update seam and maps the receipt from the validated serialized form (hubflow sprint, receipt-as-only-stored-fact design).",
@@ -177,7 +178,6 @@ BAND_PATHS = {
     "tests/test_onboarding_complete_endpoint.py": None,
     "tests/test_onboarding_wizard.py": None,
     "tests/test_packaged_runtime_and_lifecycle.py": None,
-    "tests/test_plan_review_engine.py": "Contract tests for the redesigned plan-review engine (waves, cycles, dispositions, evidence, gate findings) grew past 1000 across the campaign's reviewed fix batches; one engine, one suite.",
     "tests/test_repo_health_smoke.py": "size-ratchet redesign: merge-aware previous, pairwise base-vs-tip, candidate-mode generator contract tests",
     "tests/test_review_fidelity.py": None,
     "tests/test_review_verification_v6544.py": None,
@@ -209,7 +209,7 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/loop.py": 316873,
+    "ouroboros/loop.py": 316323,
     "tests/test_delegated_subagent_transport.py": 320571,
     "tests/test_devtools_benchmarks.py": 328282,
     "web/modules/chat.js": 225761,

@@ -9,8 +9,10 @@ import pathlib
 from typing import Any, Dict, List
 
 from ouroboros.config import get_image_input_mode, get_vision_caption_timeout_sec, get_vision_model, resolve_effort
+from ouroboros.deadline_utils import dispatch_window_remaining_sec, transport_timeout_with_deadline
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.provider_models import supports_vision
+from ouroboros.utils import emit_cognitive_operation_event
 
 
 _CAPTION_PROMPT = (
@@ -18,6 +20,14 @@ _CAPTION_PROMPT = (
     "Be objective and include visible text, UI state, diagrams, layout, and salient details. "
     "Do not infer hidden facts."
 )
+
+
+def _vision_finalization_reserve() -> float:
+    try:
+        from ouroboros.config import get_finalization_grace_sec
+        return float(get_finalization_grace_sec())
+    except Exception:
+        return 0.0
 
 
 @dataclass
@@ -29,6 +39,8 @@ class VisionRoutingContext:
     task_id: str = ""
     event_queue: Any = None
     use_local: bool = False
+    task_attempt: Any = None
+    deadline_ts: Any = None
 
 
 def resolve_vision_caption_model(ctx: Any, llm: Any, *, use_local: bool = False) -> str:
@@ -89,6 +101,14 @@ def _caption_for_block(
         return ""
     call_id = new_call_id("vision_caption")
     prompt_ref = {}
+    emit_cognitive_operation_event(
+        event_queue,
+        task_id=task_id,
+        operation_id=call_id,
+        phase="started",
+        kind="vlm",
+        task_attempt=getattr(ctx, "task_attempt", None),
+    )
     try:
         if drive_root is not None:
             prompt_ref = persist_call(
@@ -99,12 +119,21 @@ def _caption_for_block(
                 payload={"prompt": _CAPTION_PROMPT, "image_url": url, "model": model},
                 manifest={"model": model},
             )
+        dispatch_window = dispatch_window_remaining_sec(
+            deadline_ts=getattr(ctx, "deadline_ts", None),
+        )
+        if dispatch_window is not None and dispatch_window <= 0:
+            raise TimeoutError("owner deadline leaves no window for a vision caption")
         text, usage = llm.vision_query(
             _CAPTION_PROMPT,
             [{"url": url}],
             model=model,
             reasoning_effort=resolve_effort("task"),
-            timeout=get_vision_caption_timeout_sec(),
+            timeout=transport_timeout_with_deadline(
+                get_vision_caption_timeout_sec(),
+                deadline_ts=getattr(ctx, "deadline_ts", None),
+                reserve_sec=_vision_finalization_reserve(),
+            ),
         )
         try:
             from ouroboros.llm import add_usage
@@ -140,7 +169,23 @@ def _caption_for_block(
                 payload={"caption": caption, "usage": usage, "prompt_ref": prompt_ref},
                 manifest={"model": model},
             )
+        emit_cognitive_operation_event(
+            event_queue,
+            task_id=task_id,
+            operation_id=call_id,
+            phase="finished",
+            kind="vlm",
+            task_attempt=getattr(ctx, "task_attempt", None),
+        )
     except Exception as exc:
+        emit_cognitive_operation_event(
+            event_queue,
+            task_id=task_id,
+            operation_id=call_id,
+            phase="failed",
+            kind="vlm",
+            task_attempt=getattr(ctx, "task_attempt", None),
+        )
         caption = f"[image caption unavailable: {type(exc).__name__}: {exc}]"
     memo[key] = caption
     return caption

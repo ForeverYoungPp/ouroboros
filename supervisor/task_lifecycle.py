@@ -14,6 +14,7 @@ import pathlib
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from ouroboros.review_owner_custody import reconcile_confirmed_dead_review_owner as _reconcile_dead_review_owner
 from ouroboros.utils import utc_now_iso
 
 # Cancellation settlement PUBLICATION (typed outcome vocabulary, cancelled
@@ -811,6 +812,7 @@ def _recover_stranded_reaping_slot(q: Any, task_id: str, intent: Dict[str, Any])
         "Recovering worker slot %s stranded at reaping by an abandoned cancellation custody (task %s)",
         getattr(target, "wid", "?"), task_id,
     )
+    _reconcile_dead_review_owner(q.DRIVE_ROOT, int(getattr(target.proc, "pid", 0) or 0))
     try:
         workers.respawn_worker(target.wid)
     except Exception:
@@ -1028,6 +1030,8 @@ def _finish_captured_running(
         _restore_custody(task_id, worker=worker)
         _release_intent_claim(q, task_id, error="worker survived kill escalation", intent=intent)
         return CANCEL_FAILED
+
+    _reconcile_dead_review_owner(q.DRIVE_ROOT, int(getattr(worker.proc, "pid", 0) or 0))
 
     unreconciled = _reconcile_delegated_runs_on_kill(q, task_id)
 

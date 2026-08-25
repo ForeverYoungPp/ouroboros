@@ -30,6 +30,11 @@ class ReviewSessionSucceededResultUnavailable(RuntimeError):
     capture surfaces — only this moment's fetch failed.
     """
 
+    def __init__(self, message: str, *, run_id: str):
+        super().__init__(message)
+        self.delegated_run_started = True
+        self.delegated_run_id = str(run_id or "")
+
 
 def _interaction_outlives_slot(timeout_at: Any, deadline_monotonic: float) -> bool:
     """Does the parked question have NO engine expiry inside this slot's budget?
@@ -137,5 +142,6 @@ def _natural_success_terminal(gateway: Any, custody: Any, run_id: str, state: st
         "settled result detail could not be retrieved at this moment. The result "
         "is NOT lost: custody holds the settled row with the terminal receipt, "
         "and the run's output stays readable via delegate_wait / the run's own "
-        "capture surfaces."
+        "capture surfaces.",
+        run_id=run_id,
     )

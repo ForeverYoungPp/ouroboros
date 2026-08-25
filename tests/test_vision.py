@@ -13,13 +13,81 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 
 @pytest.mark.serial
-def test_vision_query_with_timeout_returns_without_waiting_for_hung_worker():
-    from ouroboros.tools.vision import _vision_query_with_timeout
+def test_vision_query_with_timeout_returns_without_waiting_for_hung_worker(monkeypatch):
+    import ouroboros.tools.vision as vision
 
+    monkeypatch.setattr(vision, "NESTED_SETTLEMENT_MARGIN_SEC", 0.05)
     started = time.monotonic()
     with unittest.TestCase().assertRaises(TimeoutError):
-        _vision_query_with_timeout(None, prompt="x", images=[], model="m", timeout=0.01, _test_sleep_sec=2)
+        vision._vision_query_with_timeout(
+            None, prompt="x", images=[], model="m", timeout=0.01, _test_sleep_sec=2,
+        )
     assert time.monotonic() - started < 0.5
+
+
+def test_vlm_tool_envelopes_follow_the_supported_timeout_setting(monkeypatch):
+    from ouroboros.config import NESTED_SETTLEMENT_MARGIN_SEC
+    from ouroboros.tools.vision import get_tools
+
+    monkeypatch.setenv("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", "1000")
+    by_name = {tool.name: tool for tool in get_tools()}
+    assert by_name["analyze_screenshot"].timeout_sec == 1000 + (2 * NESTED_SETTLEMENT_MARGIN_SEC)
+    assert by_name["vlm_query"].timeout_sec == 1000 + (2 * NESTED_SETTLEMENT_MARGIN_SEC)
+    assert by_name["view_image"].timeout_sec == 30
+
+
+def test_vlm_child_settlement_window_is_above_provider_bound(monkeypatch):
+    import json
+    import types
+
+    from ouroboros.config import NESTED_SETTLEMENT_MARGIN_SEC
+    from ouroboros.tools import shell
+    from ouroboros.tools.vision import _vision_query_with_timeout
+
+    captured = {}
+
+    def fake_run(_argv, **kwargs):
+        payload_path = _argv[-1]
+        with open(payload_path, encoding="utf-8") as fh:
+            captured["payload"] = json.load(fh)
+        captured["child_timeout"] = kwargs["timeout"]
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout='{"ok": true, "text": "done", "usage": {}}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr(shell, "_tracked_subprocess_run", fake_run)
+    text, _usage = _vision_query_with_timeout(
+        None, prompt="x", images=[], model="m", timeout=7,
+    )
+
+    assert text == "done"
+    assert captured["payload"]["timeout"] == 7
+    assert captured["child_timeout"] == 7 + NESTED_SETTLEMENT_MARGIN_SEC
+
+
+def test_vlm_nested_windows_fit_inside_owner_deadline(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    import ouroboros.loop_tool_execution as loop_tools
+    from ouroboros.config import NESTED_SETTLEMENT_MARGIN_SEC
+    from ouroboros.tools.vision import _vision_timeout_for_context
+
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "0")
+    monkeypatch.setenv("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", "90")
+    monkeypatch.delenv("OUROBOROS_TOOL_TIMEOUT_SEC", raising=False)
+    monkeypatch.setattr(loop_tools, "load_settings", lambda: {})
+    ctx = SimpleNamespace(task_metadata={
+        "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=100)).isoformat(),
+    })
+    provider_timeout = _vision_timeout_for_context(ctx)
+    tools = SimpleNamespace(_ctx=ctx, get_timeout=lambda _name: 150)
+    outer_timeout = loop_tools._get_tool_timeout(tools, "vlm_query")
+
+    assert 0 < provider_timeout <= 40
+    assert provider_timeout + NESTED_SETTLEMENT_MARGIN_SEC < outer_timeout <= 100
 
 
 class TestLLMVisionQuery(unittest.TestCase):

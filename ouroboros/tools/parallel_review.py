@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import concurrent.futures as _cf
+import copy
 import hashlib
+import json
 import logging
 
 from ouroboros.utils import run_cmd
@@ -15,6 +17,86 @@ from ouroboros.tools.scope_review import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _route_value(route) -> str:
+    return str(getattr(route, "value", route) or "")
+
+
+def _reserved_actor_row(slot, operation_id: str) -> dict:
+    return {
+        "slot_id": str(slot.slot_id or ""),
+        "model_id": str(slot.model or ""),
+        "route": _route_value(slot.route),
+        "effort": str(getattr(slot, "effort", "") or ""),
+        "status": "in_flight",
+        "operation_id": str(operation_id or ""),
+        "operation_state": "in_flight",
+        "late_result_pending": True,
+    }
+
+
+def _reserve_parallel_review_roster(ctx, triad_prepared, scope_rows) -> None:
+    """Reserve both commit-review surfaces before either executor pool starts.
+
+    The immutable operation-id map is process-local execution state.  The full
+    roster is attached to the caller, then the existing paid write-ahead stamp
+    records both surfaces atomically in the existing CommitAttemptRecord.  A
+    stamp failure propagates before any worker or provider POST can start.
+    """
+    from types import SimpleNamespace
+
+    from ouroboros.observability import new_call_id
+    from ouroboros.review_dispatch import slot_id_for_row, stamp_review_paid_on_dispatch
+
+    triad_rows = [
+        copy.deepcopy(row)
+        for row in list(getattr(ctx, "_triad_withheld_seat_records", []) or [])
+        if isinstance(row, dict)
+    ]
+    operations = {"multi_model_review": {}, "scope_review": {}}
+    row_plan = (triad_prepared or {}).get("row_plan") or {}
+    models = list(row_plan.get("models") or [])
+    routes = list(row_plan.get("routes") or [])
+    efforts = list(row_plan.get("efforts") or [])
+    slot_ids = list(row_plan.get("slot_ids") or [])
+    for index, model in enumerate(models):
+        slot_id = str(slot_ids[index] if index < len(slot_ids) else "") or slot_id_for_row(
+            index + 1,
+        )
+        operation_id = new_call_id(f"commit_review_multi_model_review_{slot_id}")
+        slot = SimpleNamespace(
+            slot_id=slot_id,
+            model=model,
+            route=routes[index] if index < len(routes) else "api_chat",
+            effort=efforts[index] if index < len(efforts) else "",
+        )
+        triad_rows.append(_reserved_actor_row(slot, operation_id))
+        operations["multi_model_review"][slot_id] = operation_id
+
+    scope_actor_rows = []
+    for row in scope_rows:
+        slot = row["slot"]
+        final = row.get("final")
+        if final is not None:
+            scope_actor_rows.append(build_scope_actor_record(
+                final,
+                fallback_model_id=getattr(final, "model_id", "") or slot.model,
+                slot_id=slot.slot_id,
+            ))
+            continue
+        operation_id = new_call_id(f"commit_review_scope_review_{slot.slot_id}")
+        scope_actor_rows.append(_reserved_actor_row(slot, operation_id))
+        operations["scope_review"][str(slot.slot_id or "")] = operation_id
+
+    if not any(operations[surface] for surface in operations):
+        return
+    ctx._review_reserved_operations = operations
+    ctx._review_reserved_roster = {
+        "multi_model_review": triad_rows,
+        "scope_review": scope_actor_rows,
+    }
+    stamp_review_paid_on_dispatch(ctx)
 
 
 def _scope_history_entry(scope_result) -> dict:
@@ -172,7 +254,7 @@ def _prepare_scope_rows(ctx, commit_message, *, goal, scope, review_rebuttal,
 
 
 def _run_scope(ctx, commit_message, scope_rows, dispatch, *, goal, scope,
-               review_rebuttal, history_snapshot, scope_history):
+               review_rebuttal, history_snapshot, scope_history, retry_key=""):
     """Dispatch (or, on an admission block, typed-placeholder) every scope row
     and aggregate the panel verdict — the dispatch half of the Q25-A split.
     ``dispatch=False`` renders prepared rows as $0 not_dispatched placeholders
@@ -202,6 +284,7 @@ def _run_scope(ctx, commit_message, scope_rows, dispatch, *, goal, scope,
                 session_target=slot.session_target,
                 session_profile=getattr(slot, "session_profile", ""),
                 prepared=row["prepared"],
+                retry_key=retry_key,
             )
 
         scope_slots = [row["slot"] for row in scope_rows]
@@ -382,7 +465,33 @@ def _run_scope(ctx, commit_message, scope_rows, dispatch, *, goal, scope,
         return result
 
 
-def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebuttal=""):
+def _commit_review_retry_key(
+    ctx, commit_message, *, goal, scope, review_rebuttal, binding_fingerprint="",
+):
+    """Bind one logical review cycle to canonical staged material and intent."""
+    material = str(binding_fingerprint or "").strip()
+    if not material:
+        try:
+            diff_bytes = run_cmd(
+                ["git", "diff", "--cached", "--binary", "--no-ext-diff"],
+                cwd=ctx.repo_dir,
+            ).encode()
+            tree_sha = run_cmd(["git", "write-tree"], cwd=ctx.repo_dir).strip()
+        except Exception:
+            diff_bytes, tree_sha = b"", ""
+        material = hashlib.sha256(tree_sha.encode() + b"\0" + diff_bytes).hexdigest()
+    return "commit_review:" + hashlib.sha256(json.dumps({
+        "binding": material, "commit_message": commit_message,
+        "goal": goal, "scope": scope,
+        "rebuttal": hashlib.sha256(str(review_rebuttal or "").encode()).hexdigest(),
+        "contract": str(getattr(ctx, "_current_review_contract_fingerprint", "") or ""),
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def run_parallel_review(
+    ctx, commit_message, *, goal="", scope="", review_rebuttal="",
+    review_binding_fingerprint="",
+):
     """Run the commit gate's triad and scope reviews against the staged diff.
 
     Q25-A ordering: BOTH gate packets (the triad api pack and every scope row's
@@ -391,6 +500,12 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
     paid dispatches still run concurrently, and every verdict is computed by
     the same code as before — only the ordering moved."""
     from ouroboros.tools.review import _dispatch_unified_review, _prepare_unified_review
+    if bool(getattr(ctx, "_review_reconcile_only", False)):
+        from ouroboros.review_custody import prepare_frozen_review_reconciliation
+
+        prepare_frozen_review_reconciliation(
+            ctx, getattr(ctx, "_pending_review_attempt", None),
+        )
 
     # Reset forensic fields so prior attempts cannot bleed into early exits.
     ctx._last_scope_model = ""
@@ -405,10 +520,20 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
     ctx._managed_review_subject_memo = {}
 
     try:
-        diff_bytes = run_cmd(["git", "diff", "--cached"], cwd=ctx.repo_dir).encode()
+        diff_bytes = run_cmd(
+            ["git", "diff", "--cached", "--binary", "--no-ext-diff"], cwd=ctx.repo_dir,
+        ).encode()
     except Exception:
         diff_bytes = b""
-    snapshot_key = hashlib.sha256(diff_bytes).hexdigest()[:16]
+    snapshot_digest = hashlib.sha256(diff_bytes).hexdigest()
+    snapshot_key = snapshot_digest[:16]
+    retry_key = str(getattr(ctx, "_current_review_retry_key", "") or "") or (
+        _commit_review_retry_key(
+            ctx, commit_message, goal=goal, scope=scope,
+            review_rebuttal=review_rebuttal,
+            binding_fingerprint=review_binding_fingerprint,
+        )
+    )
     _stored = getattr(ctx, '_scope_review_history', None) or {}
     _scope_history = _stored.get(snapshot_key, []) if isinstance(_stored, dict) else []
     _history_snapshot = list(getattr(ctx, '_review_history', []))
@@ -421,6 +546,8 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
     try:
         triad_prepared, triad_early, triad_exited = _prepare_unified_review(
             ctx, commit_message, review_rebuttal=review_rebuttal, goal=goal, scope=scope)
+        if triad_prepared is not None:
+            triad_prepared["retry_key"] = retry_key
     except Exception as e:
         log.warning("Triad review raised unexpected exception: %s", e)
         triad_early = (
@@ -480,51 +607,72 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
             scope_result = _run_scope(
                 ctx, commit_message, scope_rows, False, goal=goal, scope=scope,
                 review_rebuttal=review_rebuttal, history_snapshot=_history_snapshot,
-                scope_history=_scope_history)
+                scope_history=_scope_history, retry_key=retry_key)
     else:
         # ---- Phase 2: submit the assembled packets to the executor pool. ----
-        with _cf.ThreadPoolExecutor(max_workers=2) as pool:
-            triad_fut = (
-                None if triad_exited
-                else pool.submit(_dispatch_unified_review, ctx, commit_message, triad_prepared)
+        try:
+            if not bool(getattr(ctx, "_review_reconcile_only", False)):
+                _reserve_parallel_review_roster(ctx, triad_prepared, scope_rows)
+        except Exception as e:
+            log.warning("Commit review custody reservation failed: %s", e)
+            ctx._last_review_block_reason = "infra_failure"
+            ctx._last_review_critical_findings = []
+            review_err = (
+                "⚠️ REVIEW_BLOCKED: durable review custody could not be reserved "
+                f"before dispatch — {e}\nNo reviewer was started; fix the state write and retry."
             )
-            scope_fut = (
-                pool.submit(_run_scope, ctx, commit_message, scope_rows, True,
-                            goal=goal, scope=scope, review_rebuttal=review_rebuttal,
-                            history_snapshot=_history_snapshot,
-                            scope_history=_scope_history)
-                if scope_rows else None
+            scope_result = ScopeReviewResult(
+                blocked=True,
+                block_message=(
+                    "⚠️ SCOPE_REVIEW_BLOCKED: durable review custody could not be "
+                    "reserved before dispatch; no scope reviewer was started."
+                ),
+                model_id=getattr(ctx, "_last_scope_model", "") or _get_scope_model(),
+                status="not_dispatched",
             )
-            if triad_fut is None:
-                review_err = triad_early
-            else:
-                try:
-                    review_err = triad_fut.result()
-                except Exception as e:
-                    log.warning("Triad review raised unexpected exception: %s", e)
-                    review_err = (
-                        f"⚠️ REVIEW_BLOCKED: Triad review crashed — {e}\nFix the issue and retry."
-                    )
-                    ctx._last_review_block_reason = 'infra_failure'
-                    ctx._last_review_critical_findings = []
-            if scope_fut is not None:
-                try:
-                    scope_result = scope_fut.result()
-                except Exception as e:
-                    log.warning("Scope future raised unexpected exception: %s", e)
-                    scope_result = ScopeReviewResult(
-                        blocked=True,
-                        block_message=f"⚠️ SCOPE_REVIEW_BLOCKED: Scope review future crashed — {e}\nFix the issue and retry.",
-                        model_id=getattr(ctx, "_last_scope_model", "") or _get_scope_model(),
-                        status="error",
-                    )
-                    ctx._last_scope_raw_results = [
-                        build_scope_actor_record(
-                            scope_result,
-                            fallback_model_id=getattr(ctx, "_last_scope_model", ""),
-                            slot_id="scope_slot_error",
+        else:
+            with _cf.ThreadPoolExecutor(max_workers=2) as pool:
+                triad_fut = (
+                    None if triad_exited
+                    else pool.submit(_dispatch_unified_review, ctx, commit_message, triad_prepared)
+                )
+                scope_fut = (
+                    pool.submit(_run_scope, ctx, commit_message, scope_rows, True,
+                                goal=goal, scope=scope, review_rebuttal=review_rebuttal,
+                                history_snapshot=_history_snapshot,
+                                scope_history=_scope_history, retry_key=retry_key)
+                    if scope_rows else None
+                )
+                if triad_fut is None:
+                    review_err = triad_early
+                else:
+                    try:
+                        review_err = triad_fut.result()
+                    except Exception as e:
+                        log.warning("Triad review raised unexpected exception: %s", e)
+                        review_err = (
+                            f"⚠️ REVIEW_BLOCKED: Triad review crashed — {e}\nFix the issue and retry."
                         )
-                    ]
+                        ctx._last_review_block_reason = 'infra_failure'
+                        ctx._last_review_critical_findings = []
+                if scope_fut is not None:
+                    try:
+                        scope_result = scope_fut.result()
+                    except Exception as e:
+                        log.warning("Scope future raised unexpected exception: %s", e)
+                        scope_result = ScopeReviewResult(
+                            blocked=True,
+                            block_message=f"⚠️ SCOPE_REVIEW_BLOCKED: Scope review future crashed — {e}\nFix the issue and retry.",
+                            model_id=getattr(ctx, "_last_scope_model", "") or _get_scope_model(),
+                            status="error",
+                        )
+                        ctx._last_scope_raw_results = [
+                            build_scope_actor_record(
+                                scope_result,
+                                fallback_model_id=getattr(ctx, "_last_scope_model", ""),
+                                slot_id="scope_slot_error",
+                            )
+                        ]
     triad_block_reason = getattr(ctx, '_last_review_block_reason', 'critical_findings')
     triad_advisory_post = list(getattr(ctx, '_review_advisory', []))
     triad_advisory = [a for a in triad_advisory_post if a not in _advisory_snapshot_before]

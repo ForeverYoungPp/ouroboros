@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from ouroboros.loop import _provider_failure_hint
@@ -459,6 +460,46 @@ def test_classify_llm_exception_keeps_text_only_token_rate_retryable():
     assert rate.retry_same_request is True
     assert plain_429.kind == "provider_transient"
     assert plain_429.retry_same_request is True
+
+
+def test_dispatched_unknown_outcome_is_not_retried(tmp_path):
+    usage = {}
+
+    class _AmbiguousLLM:
+        calls = 0
+
+        def chat(self, **_kwargs):
+            self.calls += 1
+            exc = TimeoutError("socket ended without a terminal response")
+            exc.physical_attempt_capture = SimpleNamespace(
+                state="unresolved", provider_status_code=None,
+                provider_code="", provider_error_type="TimeoutError",
+            )
+            raise exc
+
+    llm = _AmbiguousLLM()
+    msg, _cost = call_llm_with_retry(
+        llm, [{"role": "user", "content": "hi"}], "openai/gpt-5.5",
+        None, "medium", 3, tmp_path, "task-unknown", 1, None, usage,
+        "task", False,
+    )
+
+    assert msg is None
+    assert llm.calls == 1
+    assert usage["_last_llm_error_kind"] == "provider_outcome_unknown"
+    assert usage["_last_llm_retry_same_request"] is False
+
+
+def test_explicit_terminal_5xx_remains_retryable():
+    for status in (500, 502, 503, 504, 599):
+        exc = _ProviderError("typed provider failure", status_code=status)
+        exc.physical_attempt_capture = SimpleNamespace(
+            state="unresolved", provider_status_code=status,
+            provider_code="", provider_error_type="APIStatusError",
+        )
+        result = classify_llm_exception(exc)
+        assert result.kind == "provider_transient"
+        assert result.retry_same_request is True
 
 
 def test_provider_failure_hint_formats_detail():

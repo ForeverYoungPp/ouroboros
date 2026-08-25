@@ -14,6 +14,7 @@ from ouroboros.pricing import estimate_cost_optional
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.usage_accounting import (
     AttemptRequest,
+    PhysicalAttemptCapture,
     UsageAccountingError,
     UsageScope,
     capture_attempt_ids,
@@ -30,6 +31,71 @@ log = logging.getLogger(__name__)
 DEFAULT_SEARCH_MODEL = "gpt-5.2"
 DEFAULT_SEARCH_CONTEXT_SIZE = "medium"
 DEFAULT_REASONING_EFFORT = "high"
+
+
+def _wrapped_provider_error(provider: str, exc: Exception) -> RuntimeError:
+    """Sanitize a provider error without dropping its physical-attempt fact."""
+    detail = sanitize_tool_result_for_log(str(exc))[:500]
+    wrapped = RuntimeError(f"{provider} web search failed ({type(exc).__name__}): {detail}")
+    capture = getattr(exc, "physical_attempt_capture", None)
+    if isinstance(capture, PhysicalAttemptCapture):
+        setattr(wrapped, "physical_attempt_capture", capture)
+    return wrapped
+
+
+def _provider_outcome_is_unknown(exc: Exception) -> bool:
+    """Whether paid work started without a typed terminal provider outcome."""
+    capture = getattr(exc, "physical_attempt_capture", None)
+    return bool(
+        isinstance(capture, PhysicalAttemptCapture)
+        and capture.state in {"dispatched", "unresolved"}
+        and capture.provider_status_code is None
+    )
+
+
+def _unknown_provider_outcome(backend: str) -> str:
+    return json.dumps({
+        "error": (
+            f"{backend} web search was dispatched but its provider outcome is unknown; "
+            "no retry or paid fallback was sent."
+        ),
+        "backend": backend,
+        "reason_code": "provider_outcome_unknown",
+    }, ensure_ascii=False, indent=2)
+
+
+def _web_search_transport_timeout(ctx: Any) -> float:
+    """One per-attempt dead-socket bound, narrowed by the owner deadline."""
+    from ouroboros.config import get_websearch_timeout_sec
+    from ouroboros.deadline_utils import transport_timeout_with_deadline
+    from ouroboros.task_pacing import effective_finalization_reserve_sec
+
+    metadata = getattr(ctx, "task_metadata", {})
+    deadline_at = metadata.get("deadline_at") if isinstance(metadata, dict) else None
+    return transport_timeout_with_deadline(
+        get_websearch_timeout_sec(),
+        deadline_at=deadline_at,
+        reserve_sec=effective_finalization_reserve_sec(ctx),
+    )
+
+
+def _web_search_deadline_exhausted(ctx: Any) -> bool:
+    from ouroboros.deadline_utils import dispatch_window_remaining_sec
+
+    metadata = getattr(ctx, "task_metadata", {})
+    deadline_at = metadata.get("deadline_at") if isinstance(metadata, dict) else None
+    window = dispatch_window_remaining_sec(
+        deadline_at=deadline_at, deadline_ts=getattr(ctx, "deadline_ts", None),
+    )
+    return window is not None and window <= 0
+
+
+def _web_search_deadline_result() -> str:
+    return json.dumps({
+        "error": "web_search skipped: owner deadline leaves no dispatch window",
+        "reason_code": "deadline_exhausted",
+        "backend": "web_search",
+    }, ensure_ascii=False, indent=2)
 
 
 def _accounting_scope(ctx: ToolContext, source: str) -> UsageScope:
@@ -162,6 +228,32 @@ def _available_web_search_backends() -> list[str]:
     return backends
 
 
+def _web_search_backend_pin() -> str:
+    return (os.environ.get("OUROBOROS_WEBSEARCH_BACKEND") or "").strip().lower()
+
+
+def _web_search_outer_timeout_sec() -> int:
+    """Cover every configured paid leg absent a tighter owner deadline."""
+    from ouroboros.config import get_finalization_grace_sec, get_websearch_timeout_sec
+
+    pinned = _web_search_backend_pin()
+    if pinned == "openai":
+        attempts = 2
+    elif pinned in {"openrouter", "anthropic"}:
+        attempts = 1
+    elif pinned == "ddgs":
+        attempts = 0
+    else:
+        backends = set(_available_web_search_backends())
+        attempts = 2 * ("openai_responses" in backends)
+        attempts += "openrouter_server_tool" in backends
+        attempts += "anthropic_server_tool" in backends
+    return max(
+        600,
+        int(max(2, attempts) * get_websearch_timeout_sec() + get_finalization_grace_sec()),
+    )
+
+
 def _emit_simple_usage(
     ctx: ToolContext,
     *,
@@ -224,6 +316,7 @@ def _web_search_openrouter(ctx: ToolContext, query: str, model: str = "", search
                 query=query,
                 search_context_size=search_context_size or DEFAULT_SEARCH_CONTEXT_SIZE,
                 accounting_scope=_accounting_scope(ctx, "web_search.openrouter"),
+                timeout=_web_search_transport_timeout(ctx),
             )
         message = response.choices[0].message if getattr(response, "choices", None) else None
         text = str(getattr(message, "content", "") or "").strip()
@@ -252,8 +345,7 @@ def _web_search_openrouter(ctx: ToolContext, query: str, model: str = "", search
     except UsageAccountingError:
         raise
     except Exception as exc:
-        detail = sanitize_tool_result_for_log(str(exc))[:500]
-        raise RuntimeError(f"OpenRouter web search failed ({type(exc).__name__}): {detail}") from exc
+        raise _wrapped_provider_error("OpenRouter", exc) from exc
 
 
 def _web_search_anthropic(ctx: ToolContext, query: str, model: str = "") -> str:
@@ -272,6 +364,7 @@ def _web_search_anthropic(ctx: ToolContext, query: str, model: str = "") -> str:
                 model=active_model,
                 query=query,
                 accounting_scope=_accounting_scope(ctx, "web_search.anthropic"),
+                timeout=_web_search_transport_timeout(ctx),
             )
         blocks = _obj_to_plain(getattr(response, "content", []) or [])
         text_parts: list[str] = []
@@ -300,8 +393,7 @@ def _web_search_anthropic(ctx: ToolContext, query: str, model: str = "") -> str:
     except UsageAccountingError:
         raise
     except Exception as exc:
-        detail = sanitize_tool_result_for_log(str(exc))[:500]
-        raise RuntimeError(f"Anthropic web search failed ({type(exc).__name__}): {detail}") from exc
+        raise _wrapped_provider_error("Anthropic", exc) from exc
 
 
 def _web_search_ddgs(query: str, *, _max_attempts: int = 3) -> str:
@@ -346,10 +438,53 @@ def _web_search_ddgs(query: str, *, _max_attempts: int = 3) -> str:
 
 
 def _is_timeout_error(exc: Exception) -> bool:
-    """Heuristic-free timeout classifier: real timeout exception types only."""
+    """Typed timeout classifier across the installed HTTP/SDK transports."""
     if isinstance(exc, TimeoutError):
         return True
-    return "timeout" in type(exc).__name__.casefold()
+    # Keep the OpenAI timeout contract available when the optional SDK class
+    # cannot be imported in the caller's environment (and for compatible SDK
+    # wrappers that preserve the public exception type in their MRO).
+    if any(cls.__name__ == "APITimeoutError" for cls in type(exc).__mro__):
+        return True
+    try:
+        import httpx
+
+        if isinstance(exc, httpx.TimeoutException):
+            return True
+    except Exception:
+        pass
+    try:
+        from openai import APITimeoutError
+
+        return isinstance(exc, APITimeoutError)
+    except Exception:
+        return False
+
+
+def _provider_status_code(exc: Exception) -> int | None:
+    value = getattr(exc, "status_code", None)
+    if not isinstance(value, int):
+        value = getattr(getattr(exc, "response", None), "status_code", None)
+    return value if isinstance(value, int) else None
+
+
+def _stream_failure_error(event_type: str, error: Any, response: Any) -> RuntimeError:
+    """Preserve a terminal Responses-event status for the safe retry policy."""
+    detail = sanitize_tool_result_for_log(
+        str(getattr(error, "message", None) or error or "no detail")
+    )[:300]
+    exc = RuntimeError(f"OpenAI web search {event_type}: {detail}")
+    for obj in (error, getattr(response, "error", None), response):
+        for field in ("status_code", "http_status", "status", "code"):
+            value = obj.get(field) if isinstance(obj, dict) else getattr(obj, field, None)
+            try:
+                status = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 100 <= status <= 599:
+                setattr(exc, "status_code", status)
+                return exc
+    return exc
 
 
 def _web_search(
@@ -360,12 +495,14 @@ def _web_search(
     reasoning_effort: str = "",
     _attempt: int = 0,
 ) -> str:
+    if _web_search_deadline_exhausted(ctx):
+        return _web_search_deadline_result()
     # Backend pin: force ONE backend regardless of which provider keys are present.
     # A fixed-model run pins 'ddgs' so web_search is pure-retrieval (no second LLM
     # contaminating the "single fixed model" claim). 'openai' pins the OpenAI leg only
     # (no cascade — see _fallbacks). 'auto'/'' keep the default OpenAI-first cascade
     # below. This is a config gate on TRANSPORT, not on agent behaviour (P5-safe).
-    pinned = (os.environ.get("OUROBOROS_WEBSEARCH_BACKEND") or "").strip().lower()
+    pinned = _web_search_backend_pin()
     if pinned in ("ddgs", "openrouter", "anthropic"):
         try:
             if pinned == "ddgs":
@@ -376,6 +513,12 @@ def _web_search(
         except UsageAccountingError:
             raise
         except Exception as exc:
+            backend = {
+                "openrouter": "openrouter_server_tool",
+                "anthropic": "anthropic_server_tool",
+            }.get(pinned, pinned)
+            if _provider_outcome_is_unknown(exc):
+                return _unknown_provider_outcome(backend)
             detail = sanitize_tool_result_for_log(str(exc))[:500]
             return json.dumps(
                 {"error": f"pinned web_search backend '{pinned}' failed: {detail}", "backend": pinned},
@@ -394,10 +537,18 @@ def _web_search(
                 {"error": f"pinned web_search backend 'openai' unavailable: {detail}", "backend": "openai"},
                 ensure_ascii=False, indent=2,
             )
-        for backend in (
-            lambda: _web_search_openrouter(ctx, query, model=model, search_context_size=search_context_size),
-            lambda: _web_search_anthropic(ctx, query, model=model),
-            lambda: _web_search_ddgs(query),
+        for backend_name, backend in (
+            (
+                "openrouter_server_tool",
+                lambda: _web_search_openrouter(
+                    ctx, query, model=model, search_context_size=search_context_size,
+                ),
+            ),
+            (
+                "anthropic_server_tool",
+                lambda: _web_search_anthropic(ctx, query, model=model),
+            ),
+            ("ddgs", lambda: _web_search_ddgs(query)),
         ):
             try:
                 return backend()
@@ -405,6 +556,8 @@ def _web_search(
                 raise
             except Exception as exc:
                 errors.append(sanitize_tool_result_for_log(str(exc))[:500])
+                if _provider_outcome_is_unknown(exc):
+                    return _unknown_provider_outcome(backend_name)
         return json.dumps({
             "error": (
                 "web_search unavailable: no configured search backend succeeded. "
@@ -423,17 +576,18 @@ def _web_search(
     active_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
     reservation = None
     dispatched = False
+    explicit_provider_failure = False
 
     try:
         from openai import OpenAI
-        from ouroboros.config import get_websearch_timeout_sec
-        # Explicit transport timeout (v6.54.3, D): without it the streaming SDK
-        # call had NO client bound, so the ToolEntry 540s outer thread-kill was
-        # the only stop for a wedged stream.
+        from ouroboros.config import get_finalization_grace_sec
+        transport_timeout = _web_search_transport_timeout(ctx)
+        # Explicit per-attempt transport bound; the outer ToolEntry covers the
+        # configured paid cascade rather than acting as the socket timeout.
         client = OpenAI(
             api_key=api_key,
             base_url=base_url,
-            timeout=get_websearch_timeout_sec(),
+            timeout=transport_timeout,
             max_retries=0,
         )
 
@@ -479,12 +633,10 @@ def _web_search(
             # answer)" success return below, so the OpenAI leg "succeeds" empty
             # and the OpenRouter/Anthropic/ddgs cascade never engages.
             if etype in ("response.failed", "error", "response.incomplete"):
+                explicit_provider_failure = True
                 resp_obj = getattr(event, "response", None)
-                detail = ""
                 err = getattr(event, "error", None) or (getattr(resp_obj, "error", None) if resp_obj else None)
-                if err is not None:
-                    detail = sanitize_tool_result_for_log(str(getattr(err, "message", None) or err))[:300]
-                raise RuntimeError(f"OpenAI web search {etype}: {detail or 'no detail'}")
+                raise _stream_failure_error(etype, err, resp_obj)
 
             # Web search lifecycle — emit progress so the user sees activity
             if etype in (
@@ -542,6 +694,16 @@ def _web_search(
             except Exception:
                 log.exception("Failed to mark Responses settlement unresolved")
 
+        if not response_completed:
+            return json.dumps({
+                "error": (
+                    "OpenAI web search ended without a terminal provider outcome; "
+                    "no retry or paid fallback was sent."
+                ),
+                "backend": "openai_responses",
+                "reason_code": "provider_outcome_unknown",
+            }, ensure_ascii=False, indent=2)
+
         # An empty result (no answer text AND no sources) is a soft failure, not
         # a successful "(no answer)": fall through to the provider cascade so a
         # degenerate OpenAI response does not shadow a working OpenRouter/
@@ -581,6 +743,11 @@ def _web_search(
 
         return json.dumps({"answer": text or "(no answer)", "answer_type": "summary", "sources": sources, "backend": "openai_responses"}, ensure_ascii=False, indent=2)
     except Exception as e:
+        if dispatched:
+            from ouroboros.transport_custody import release_pre_dispatch_attempt
+
+            dispatched = not release_pre_dispatch_attempt(reservation, e)
+        was_dispatched = reservation is not None and dispatched
         if reservation is not None and dispatched:
             try:
                 mark_unresolved(reservation, f"{type(e).__name__}: {e}")
@@ -589,10 +756,32 @@ def _web_search(
         if isinstance(e, UsageAccountingError):
             raise
         detail = sanitize_tool_result_for_log(str(e))[:500]
-        # One retry on a genuine timeout before cascading: web search timeouts are
-        # frequently transient, and the provider cascade is slower/less precise.
-        if _attempt == 0 and _is_timeout_error(e):
-            log.debug("web_search OpenAI timeout; retrying once")
+        status = _provider_status_code(e)
+        terminal_provider_failure = explicit_provider_failure or status is not None
+        if was_dispatched and not terminal_provider_failure:
+            return json.dumps({
+                "error": (
+                    "OpenAI web search was dispatched but its provider outcome is "
+                    "unknown; no retry or paid fallback was sent."
+                ),
+                "backend": "openai_responses",
+                "reason_code": "provider_outcome_unknown",
+            }, ensure_ascii=False, indent=2)
+        retryable_terminal = status == 408 or status == 429 or (
+            status is not None and 500 <= status <= 599
+        )
+        # One retry is safe only before dispatch or after an explicit terminal
+        # provider response. An ambiguous dispatched outcome stops the cascade.
+        if _attempt == 0 and (
+            (_is_timeout_error(e) and not was_dispatched) or retryable_terminal
+        ):
+            from ouroboros.deadline_utils import deadline_remaining_sec, has_deadline
+
+            if has_deadline(ctx) and deadline_remaining_sec(ctx) <= max(
+                1.0, float(get_finalization_grace_sec())
+            ):
+                return _fallbacks([f"OpenAI web search timed out before a safe retry: {detail}"])
+            log.debug("web_search OpenAI safe terminal/pre-dispatch retry")
             return _web_search(
                 ctx, query, model=model, search_context_size=search_context_size,
                 reasoning_effort=reasoning_effort, _attempt=1,
@@ -628,5 +817,5 @@ def get_tools() -> List[ToolEntry]:
                 "reasoning_effort": {"type": "string", "enum": ["low", "medium", "high"],
                                      "description": f"Reasoning effort (default: {DEFAULT_REASONING_EFFORT})"},
             }, "required": ["query"]},
-        }, _web_search, timeout_sec=540),
+        }, _web_search, timeout_sec=_web_search_outer_timeout_sec()),
     ]

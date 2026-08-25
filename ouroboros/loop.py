@@ -85,6 +85,11 @@ def _provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
 def _provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
     """Explain whether retrying later is likely to help."""
     kind = str(accumulated_usage.get("_last_llm_error_kind") or "").strip()
+    if kind == "provider_outcome_unknown":
+        return (
+            " The dispatched request has no terminal provider outcome, so no "
+            "retry or paid fallback was sent; either could duplicate live work."
+        )
     if kind == "subscription_window_exhausted":
         reset_at = str(accumulated_usage.get("_last_llm_reset_at") or "").strip()
         when = f" It resets at {reset_at}." if reset_at else ""
@@ -1561,6 +1566,7 @@ def _build_host_acceptance_evidence(ctx: _TaskAcceptanceContext) -> Dict[str, An
 
 def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
     """Perform the one substantive host panel over the pre-bound evidence."""
+    from ouroboros.review_evidence import task_acceptance_evidence_revision
     from ouroboros.review_substrate import (
         HARDNESS_ADVISORY_VISIBLE,
         ReviewRequest,
@@ -1588,14 +1594,10 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
             "classify_outcome_tier": True,
             "max_physical_attempts_per_actor": 2,
         },
-        task_id=ctx.task_id,
+        task_id=ctx.task_id, retry_key=f"task_acceptance:{task_acceptance_evidence_revision(evidence)}",
     )
-    # Budget admission for the whole acceptance wave (v6.69.0): a wave that
-    # cannot fit the remaining root budget is declined up front as a terminal
-    # DEGRADED (no-quorum semantics) instead of dying mid-wave. The estimate
-    # renders the REAL per-slot message pair; the rare second physical attempt
-    # is deliberately not multiplied in — a fail-open coarse filter, not a
-    # hard reservation.
+    # Budget-admit the whole panel from its real per-slot prompts. This coarse
+    # fail-open estimate excludes the rare repair resend; it is not a reservation.
     from ouroboros.tools.review_helpers import review_wave_budget_gate
 
     try:
@@ -2401,15 +2403,7 @@ def _run_cross_model_fallback_chain(
     accumulated_usage, task_type, emit_progress, context_fit_plan,
     active_context_mode,
 ) -> tuple:
-    """F1 (v6.39): 429-aware cross-model fallback CHAIN. Mark the failed primary on
-    cooldown if its last failure was transient (a swarm stops stampeding it), then
-    walk the configured chain, skipping cooled-down models, until one responds; a
-    small per-candidate attempt cap keeps a multi-model chain from a retry storm,
-    and every call stays deadline-aware. The bench (FALLBACKS==main) dedupes to an
-    empty chain -> no cross-model fallback, by design. Returns the new ``(msg,
-    active_model, active_use_local, context_fit_plan, context_mode)``; ``msg`` is
-    None when the whole (cooled-down / empty) chain is exhausted, leaving the
-    caller to join the provider-unavailable shelf."""
+    """Try fallbacks; unknown dispatch stops the chain."""
     from ouroboros import fallback_cooldown as _fcd
     from ouroboros.config import get_fallback_models
     from ouroboros.loop_llm_call import _COOLDOWN_ERROR_KINDS as _cooldown_kinds
@@ -2492,12 +2486,13 @@ def _run_cross_model_fallback_chain(
                 accumulated_usage,
             )
             break
-        # Candidate evidence was real for its dispatched attempts, but an
-        # unaccepted route must not become the task's canonical plan/transcript.
+        # Unaccepted fallback evidence must not become canonical.
         tools._ctx.context_fit_plan = context_fit_plan
         tools._ctx.messages = messages
         tools._ctx.active_context_mode = active_context_mode
         _restore_context_fit_usage(accumulated_usage, primary_context_usage)
+        if str(accumulated_usage.get("_last_llm_error_kind") or "") in ("provider_outcome_unknown", "deadline_exhausted"):
+            break
         _cooled(fallback_model, fallback_use_local)
     return (
         msg,
@@ -3180,11 +3175,7 @@ def _mark_owner_stop_control_drained(
 
 
 def _owner_stop_window_elapsed(ctx: "_RoundLimitContext") -> bool:
-    """Whether the durable owner-stop deadline already passed at consume.
-
-    Reads the SAME durable intent the custody sweep budgets from (no drain
-    stamp -> the conservative request+outer-cap anchor). Fail-soft: an
-    unreadable intent keeps the bounded summary running."""
+    """Bind the durable owner-stop deadline and report whether it passed."""
     try:
         from ouroboros.cancel_intents import STOP_POLICY_FINALIZE, active_intent, stop_policy
         from ouroboros.config import get_finalization_grace_sec
@@ -3197,6 +3188,8 @@ def _owner_stop_window_elapsed(ctx: "_RoundLimitContext") -> bool:
         if not isinstance(intent, dict) or stop_policy(intent) != STOP_POLICY_FINALIZE:
             return False
         deadline = owner_stop_deadline_ts(intent, float(get_finalization_grace_sec()))
+        if deadline:
+            ctx.deadline_ts = deadline
         return time.time() >= deadline if deadline else True
     except Exception:
         log.debug("owner-stop window check failed for %s", ctx.task_id, exc_info=True)
@@ -3249,6 +3242,11 @@ def _drain_incoming_messages(
             if kind == KIND_FINALIZE_NOW:
                 text = str(entry.get("text") or "deadline")
                 controls["finalize_now"] = text
+                opened = parse_deadline_ts(entry.get("ts"))
+                if opened is not None:
+                    controls["finalize_deadline_ts"] = (
+                        opened.timestamp() + task_pacing.effective_finalization_reserve_sec(owner_ctx)
+                    )
                 first_line = text.splitlines()[0].strip() if text else ""
                 if first_line == REASON_OWNER_REQUESTED_FINALIZATION:
                     # Owner-stop budget starts at delivery; first drain wins.
@@ -3420,16 +3418,7 @@ def _handle_round_limit(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], D
 
 
 def _handle_forced_finalization(ctx: _RoundLimitContext, reason: str) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Cooperative finalize-and-exit when the supervisor opens a grace window.
-
-    The supervisor sends a typed finalize_now control through the owner
-    mailbox when the task deadline/hard-timeout is reached; this extracts one
-    tool-less best final answer inside the grace window so a deadline NEVER
-    returns emptiness. An OWNER-STOP control (its payload's first line is the
-    typed ``owner_requested_finalization`` literal, optionally followed by the
-    bounded child projection) routes to its own rail: the owner's stop must
-    never persist the deadline's false reason (CF-02).
-    """
+    """Cooperatively finalize; an expired grace never buys a paid call."""
     reason_lines = str(reason or "").splitlines()
     if reason_lines and reason_lines[0].strip() == REASON_OWNER_REQUESTED_FINALIZATION:
         return _handle_owner_stop_finalization(ctx, str(reason))
@@ -3496,14 +3485,7 @@ def _handle_owner_stop_finalization(
 
 
 def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Provider-death terminalization: the model returned no usable response
-    after the transport same-model reroute + retries (+ any configured
-    cross-model fallback). SALVAGE like the other forced rails — one tool-less
-    final answer (which itself benefits from the same-model reroute) and,
-    failing that, the last assistant text already produced — but terminalize as
-    an INFRA FAILURE, never as a completion: an outage interrupts the task with
-    the objective unmet, and calling that "completed (best effort)" was a lie
-    that hid a real outage from the owner (95 minutes of silence)."""
+    """Salvage provider failure as infra, without retrying an unknown send."""
     # A stale DeliveryCandidate is still the best complete text available when
     # the provider is dead. _forced_fallback_result preserves its original
     # evidence provenance and adds a host-owned resume disclosure rather than
@@ -3527,6 +3509,16 @@ def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str
             f"{_provider_failure_hint(ctx.accumulated_usage)}{_provider_recovery_hint(ctx.accumulated_usage)} "
             "Any files written so far are preserved in the workspace."
         )
+    if str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown":
+        live_trace = getattr(ctx, "llm_trace", None)
+        llm_trace = live_trace if isinstance(live_trace, dict) else {}
+        text, usage, llm_trace = _forced_fallback_result(
+            ctx, llm_trace, fallback, "provider_unavailable",
+            source="provider_outcome_unknown_no_resend",
+        )
+        if str(usage.get("reason_code") or "") == "provider_unavailable":
+            usage["execution_status"] = RESULT_INFRA_FAILED
+        return text, usage, llm_trace
     prompt = (
         "[PROVIDER_UNAVAILABLE] The model provider failed to return a usable response. "
         "The task is being INTERRUPTED by this outage, not completed. Summarize the "
@@ -3564,6 +3556,7 @@ def _maybe_deadline_local_finalize(
     deadline = parse_deadline_ts(meta.get("deadline_at"))
     if deadline is None:
         return None
+    ctx.deadline_ts = deadline.timestamp()
     remaining = (deadline - utc_now()).total_seconds()
     # v6.55.0: the plain finalization GRACE emit-window (task_pacing SSOT), NOT
     # the pct reserve — this path fires just before the kill to emit one answer,
@@ -3585,9 +3578,10 @@ def _maybe_deadline_local_finalize(
 def _maybe_early_finalize(
     limit_ctx: _RoundLimitContext, tools: ToolRegistry, controls: Dict[str, Any]
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
-    """One early-exit gate per round: supervisor finalize_now first, then a
-    loop-local real-deadline finalize. Returns the forced answer or None."""
+    """Consume supervisor grace first, then a local deadline."""
     if controls.get("finalize_now"):
+        if controls.get("finalize_deadline_ts") is not None:
+            limit_ctx.deadline_ts = float(controls["finalize_deadline_ts"])
         return _handle_forced_finalization(limit_ctx, str(controls["finalize_now"]))
     return _maybe_deadline_local_finalize(limit_ctx, tools)
 
@@ -5087,7 +5081,7 @@ def _drain_forced_owner_directives(
 
 
 def _call_forced_model_once(ctx: _RoundLimitContext) -> str:
-    final_msg, _final_cost = call_llm_with_retry(
+    final_msg, _ = call_llm_with_retry(
         ctx.llm,
         ctx.messages,
         ctx.active_model,
@@ -5102,6 +5096,7 @@ def _call_forced_model_once(ctx: _RoundLimitContext) -> str:
         ctx.task_type,
         use_local=ctx.active_use_local,
         deadline_ts=ctx.deadline_ts,
+        transport_reserve_sec=0.0,
     )
     return str((final_msg or {}).get("content") or "").strip()
 
@@ -5472,14 +5467,16 @@ def _forced_final_answer(
     reason_code: str,
     single_semantic_turn: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Force one tool-less final answer; stamp the typed forced-finalization
-    reason code (the best_effort outcome gate reads it downstream).
-    ``single_semantic_turn`` (owner-stop rail, CF-03): exactly ONE logical
-    model call — the late-owner-directive semantic refresh is disabled because
-    steering is fenced while the stop intent is pending."""
+    """Return a forced answer or retained fallback."""
     live_trace = getattr(ctx, "llm_trace", None)
     llm_trace = live_trace if isinstance(live_trace, dict) else {}
     _finalize_forced_services(ctx, llm_trace)
+    if ctx.deadline_ts is not None and time.time() >= float(ctx.deadline_ts):
+        ctx.accumulated_usage.update(execution_status="failed", reason_code=reason_code)
+        return _forced_fallback_result(
+            ctx, llm_trace, fallback_text, reason_code,
+            source=f"{reason_code}_window_elapsed",
+        )
     router_result = _forced_swarm_router_result(ctx, llm_trace, reason_code)
     if router_result is not None:
         return router_result
@@ -5500,32 +5497,31 @@ def _forced_final_answer(
         ctx.accumulated_usage["reason_code"] = reason_code
         if not _drain_forced_owner_directives(ctx, llm_trace):
             break
+        if str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown":
+            return _forced_fallback_result(
+                ctx, llm_trace,
+                "⚠️ Provider outcome unknown; directive retained. Resume the task without a blind resend.",
+                reason_code,
+                source="provider_outcome_unknown_no_resend",
+            )
         if attempt == 1:
             return _forced_fallback_result(
                 ctx,
                 llm_trace,
-                (
-                    "⚠️ A new owner directive arrived during the forced refresh and could "
-                    "not be incorporated safely before the hard stop. Resume the task to "
-                    "produce an answer bound to the latest directive."
-                ),
+                "⚠️ Another directive arrived. Resume the task for a current answer.",
                 reason_code,
                 source="late_owner_directive_requires_resume",
             )
         _finalize_forced_services(ctx, llm_trace)
         _append_or_merge_user_message(
             ctx.messages,
-            "[FORCED_OWNER_REFRESH] A new typed owner directive arrived while the prior "
-            "forced answer was being generated. Discard that stale draft and produce one "
-            "new complete answer bound to every owner directive now present.",
+            "[FORCED_OWNER_REFRESH] Answer all current directives; ignore the stale draft.",
         )
 
     extracted, control_degraded = _resolve_forced_delivery_control(
         getattr(getattr(ctx, "tools", None), "_ctx", None), extracted,
     )
     if extracted:
-        # Typed fact for the best_effort outcome gate: a REAL model answer
-        # was extracted (host fallback strings never set this).
         ctx.accumulated_usage["_best_effort_extracted"] = True
         tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
         plan_suffix = (
@@ -6794,7 +6790,7 @@ def run_llm_loop(
     else:
         active_context_mode = _preferred_context_mode
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
-    accumulated_usage: Dict[str, Any] = {}
+    accumulated_usage: Dict[str, Any] = {"_task_attempt": getattr(ctx, "task_attempt", None)}
     tools._ctx._accumulated_usage = accumulated_usage
     max_retries = 3
     cost_ceiling = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)
@@ -6938,7 +6934,11 @@ def run_llm_loop(
             )
             tools._ctx._current_llm_call_meta = dict(accumulated_usage.get("_last_llm_call_meta") or {})
 
-            if msg is None and not bool(getattr(ctx, "exact_model_route", False)):
+            if (
+                msg is None
+                and not bool(getattr(ctx, "exact_model_route", False))
+                and str(accumulated_usage.get("_last_llm_error_kind") or "") not in ("provider_outcome_unknown", "deadline_exhausted")
+            ):
                 (
                     msg,
                     active_model,

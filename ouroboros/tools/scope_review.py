@@ -74,16 +74,14 @@ from ouroboros.utils import (
 
 log = logging.getLogger(__name__)
 _SCOPE_REQUIRED_ITEMS = SCOPE_REQUIRED_ITEMS  # compatibility export used by tests/review tooling
-
 # Shipped designated scope reviewer (v6.82.0). Window evidence checked 2026-07-29:
 # provider docs AND OpenRouter /models both state gpt-5.6-terra context_length
 # 1,050,000 — a documented MODEL property, so the >=1M BIBLE P3 floor holds on both
 # spellings; the sentinel grants only 1M, a real probe/owner-ack supersedes.
 from ouroboros.tools.scope_window import SCOPE_MODEL_DEFAULT as _SCOPE_MODEL_DEFAULT  # noqa: E402
 _SCOPE_MAX_TOKENS = 100_000  # 100K output tokens
-_SCOPE_REVIEW_SLOT_TIMEOUT_SEC = 900
+_SCOPE_REVIEW_SLOT_TIMEOUT_SEC = None
 from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET as _SCOPE_BUDGET_TOKEN_LIMIT
-
 # The shared prompt-size SSOT (920K) governs INPUT only; the reviewer also reserves
 # _SCOPE_MAX_TOKENS of OUTPUT inside the same 1M window, and provider tokenizers can
 # exceed estimate_tokens on atlas-heavy prompts — so gate assembled INPUT on a
@@ -99,7 +97,6 @@ _SCOPE_INPUT_TOKEN_LIMIT = min(
     _SCOPE_BUDGET_TOKEN_LIMIT,
     _SCOPE_MODEL_CONTEXT_WINDOW - _SCOPE_MAX_TOKENS - _SCOPE_OUTPUT_MARGIN_TOKENS,
 )
-
 # Tokenizer-density calibration (SSOT: review_helpers.calibrated_input_token_limit +
 # capability_evidence ``token_density``). Density is MEASURED per model, so the limit
 # is computed PER CALL (an import-time constant froze the pre-measurement value). The
@@ -285,7 +282,11 @@ class ScopeReviewResult:
     context_manifest: dict = field(default_factory=dict)
     prompt_ref: dict = field(default_factory=dict)
     response_ref: dict = field(default_factory=dict)
-
+    operation_id: str = ""
+    operation_state: str = "settled"
+    late_result_pending: bool = False
+    pending_invocation_id: str = ""
+    delegated_run_id: str = ""
 
 def _get_scope_model() -> str:
     """Return the configured scope review model (env → settings default)."""
@@ -982,7 +983,7 @@ def _call_scope_llm(
     session_root: str = "",
     slot_effort: str = "",
     session_target: str = "",
-    session_profile: str = "",
+    session_profile: str = "", retry_key: str = "",
 ) -> tuple:
     """Execute the scope review call synchronously — api pack or agent session.
 
@@ -1038,13 +1039,14 @@ def _call_scope_llm(
             surface="scope_review",
             goal="Review the staged change and context above. Output ONLY a JSON array.",
             messages=messages,
-            task_id=str(getattr(ctx, "task_id", "") or "scope_review") if ctx is not None else "scope_review",
+            task_id=str(getattr(ctx, "task_id", "") or "scope_review") if ctx is not None else "scope_review", retry_key=str(retry_key or ""),
             call_type="scope_review",
             max_tokens=_scope_output_tokens,
             temperature=0.2,
             no_proxy=True,
             session_task=session_task if delegated else "",
             session_root=session_root if delegated else "",
+            reconcile_only=bool(getattr(ctx, "_review_reconcile_only", False)),
             # The extraction fallback canonicalizes to the SCOPE contract: required-
             # matrix shape, eight verbatim item ids (D19 — never a looser contract).
             policy=(
@@ -1059,7 +1061,6 @@ def _call_scope_llm(
                 else {}
             ),
         )
-        # Identity comes from the configured row, never from the row's model.
         row = scope_reviewer_slots([scope_model], effort=scope_effort)[0]
         slot = replace(
             row,
@@ -1067,12 +1068,9 @@ def _call_scope_llm(
             timeout_sec=_SCOPE_REVIEW_SLOT_TIMEOUT_SEC,
             max_tokens=_scope_output_tokens,
             temperature=0.2,
-            # ROUTE is CARRIED, never re-derived: the one-element slot list above
-            # re-reads ROUTES row 1, which sent a mixed config's api row as
-            # agent_session — the caller's fanned-out route is the authority (p5x XG).
+            # The caller's fanned-out route is authoritative; never re-derive it.
             route=ReviewRouteKind.AGENT_SESSION if delegated else ReviewRouteKind.API_CHAT,
-            # The fanned-out row's own session target (6.1); '' keeps the
-            # shared session-route fallback.
+            # Empty keeps the shared session-route fallback.
             session_target=session_target if delegated else "",
             session_profile=session_profile if delegated else "",
         )
@@ -1089,6 +1087,11 @@ def _call_scope_llm(
             "prompt_ref": actor.get("prompt_ref") or {},
             "response_ref": actor.get("response_ref") or {},
         }
+        usage.update({
+            "operation_id": str(actor.get("operation_id") or ""),
+            "operation_state": str(actor.get("operation_state") or "settled"),
+            "late_result_pending": bool(actor.get("late_result_pending")),
+        })
         if actor.get("status") not in {"ok", "empty"}:
             error_msg = (
                 f"⚠️ SCOPE_REVIEW_BLOCKED: Scope reviewer ({scope_model}) failed — commit blocked.\n"
@@ -1145,8 +1148,8 @@ def _scope_oversize_result(
     tokens_in: int = 0,
     tokens_out: int = 0,
     cost_usd: float = 0.0,
+    operation: Optional[dict] = None,
 ) -> "ScopeReviewResult":
-    """Return a visible, fail-closed oversize result."""
     authority_note = "The blocking scope gate has no authoritative verdict. "
     advisory = {
         "verdict": "FAIL",
@@ -1179,6 +1182,7 @@ def _scope_oversize_result(
         prompt_ref=prompt_ref,
         response_ref=response_ref,
         advisory_findings=[advisory],
+        **(operation or {}),
     )
 
 
@@ -1382,14 +1386,9 @@ def run_scope_review(
     slot_effort: str = "",  # the row's own effort (6.1); "" = global scope_review effort
     session_target: str = "",  # the row's own harness[=model] target; "" = shared route
     session_profile: str = "",  # optional credential pin (Q2-в); "" = rotation
-    prepared: Optional[dict] = None,  # pre-assembled packet (review_admission.prepare_scope_review)
+    prepared: Optional[dict] = None, retry_key: str = "",  # assembled packet + immutable cycle identity
 ) -> ScopeReviewResult:
-    """Run the blocking scope review, or record the owner-declared low-mode skip.
-
-    Assembly and dispatch are two phases (Q25=A): ``run_parallel_review``
-    assembles every packet through ``review_admission.prepare_scope_review``
-    BEFORE dispatching anything and hands the packet back here as ``prepared``;
-    a direct call without ``prepared`` keeps the single-call contract."""
+    """Run blocking scope review from a prepared packet or a direct call."""
     if prepared is None:
         from ouroboros.tools.review_admission import prepare_scope_review
 
@@ -1402,7 +1401,6 @@ def run_scope_review(
         )
         if final is not None:
             return final
-    # ContextVars never cross threads: re-seed this thread from the packet.
     _SCOPE_CONTEXT_MANIFEST.set(dict(prepared["context_manifest"] or {}))
     _SCOPE_STABLE_PREFIX_LEN.set(int(prepared["stable_prefix_len"] or 0))
     prompt, session_task = prepared["prompt"], prepared["session_task"]
@@ -1419,7 +1417,7 @@ def run_scope_review(
         prompt, scope_model=scope_model_id, ctx=ctx, slot_id=slot_id,
         route=route, session_task=session_task, session_root=str(repo_dir),
         slot_effort=slot_effort, session_target=session_target,
-        session_profile=session_profile,
+        session_profile=session_profile, retry_key=retry_key,
     )  # type: ignore[arg-type]
     _usage = dict(usage or {})
     _review_refs = dict(_usage.pop("_review_refs", {}) or {})
@@ -1428,11 +1426,16 @@ def run_scope_review(
     _tokens_in = int(_usage.get("prompt_tokens", 0) or 0)
     _tokens_out = int(_usage.get("completion_tokens", 0) or 0)
     _cost_usd = float(_usage.get("cost", 0.0) or 0.0)
+    _operation = {
+        "operation_id": str(_usage.get("operation_id") or ""),
+        "operation_state": str(_usage.get("operation_state") or "settled"),
+        "late_result_pending": bool(_usage.get("late_result_pending")),
+        "pending_invocation_id": str(_usage.get("pending_invocation_id") or ""),
+        "delegated_run_id": str(_usage.get("delegated_run_id") or ""),
+    }
     if llm_error:
         if _is_provider_oversize_error(llm_error):
-            # The estimate-based gate passed but the provider's REAL tokenizer called
-            # the prompt oversize: no authoritative verdict, so the >=1M gate fails
-            # CLOSED (v6.80.0: not configurable; owner controls only context mode).
+            # The real tokenizer rejected the prompt; the >=1M gate fails closed.
             log.warning(
                 "Scope reviewer rejected the prompt as oversize "
                 "(estimate-gate passed; real tokenizer denser). Failing the "
@@ -1448,6 +1451,7 @@ def run_scope_review(
                 tokens_in=_tokens_in,
                 tokens_out=_tokens_out,
                 cost_usd=_cost_usd,
+                operation=_operation,
             )
         return ScopeReviewResult(
             blocked=True,
@@ -1458,18 +1462,12 @@ def run_scope_review(
             context_manifest=_current_scope_context_manifest(),
             prompt_ref=_prompt_ref,
             response_ref=_response_ref,
+            **_operation,
         )
-    # Usage emission happens ONCE, inside the shared review substrate
-    # (source="review_substrate:scope_review", carrying ledger_attempt_ids). The old
-    # job-level re-emit duplicated every scope call without attempt ids, so the pair
-    # could not be deduplicated against the monetary ledger (v6.69.0).
-
+    # Usage emission happens once inside the shared review substrate.
     if _provider_error_is_oversize(_usage, _prompt_tokens_est, scope_model_id):
-        # Gateway route (openai-compatible/OpenRouter): a real oversize 400 arrives as
-        # an EMPTY body + usage['provider_error']{code:400}, not a raised "prompt is
-        # too long" error — the llm_error branch above never fires and the empty body
-        # would hard-block as empty_response. With INDEPENDENT size evidence, route
-        # through the same fail-closed oversize result; non-size 400 stays blocking.
+        # Some gateways report oversize as an empty body plus provider_error 400;
+        # route independently-proven size errors through the same closed gate.
         _pe_msg = str((_usage.get("provider_error") or {}).get("message") or "")
         log.warning(
             "Scope reviewer hit provider_error code=400 oversize (empty body; "
@@ -1486,8 +1484,8 @@ def run_scope_review(
             tokens_in=_tokens_in,
             tokens_out=_tokens_out,
             cost_usd=_cost_usd,
+            operation=_operation,
         )
-
     if not raw_text.strip():
         # Empty model response is distinct from transport/API error.
         return ScopeReviewResult(
@@ -1505,8 +1503,8 @@ def run_scope_review(
             context_manifest=_current_scope_context_manifest(),
             prompt_ref=_prompt_ref,
             response_ref=_response_ref,
+            **_operation,
         )
-
     items = extract_json_array(raw_text, normalize=True)
     if items is None:
         return ScopeReviewResult(
@@ -1525,8 +1523,8 @@ def run_scope_review(
             context_manifest=_current_scope_context_manifest(),
             prompt_ref=_prompt_ref,
             response_ref=_response_ref,
+            **_operation,
         )
-
     parsed_items, contract_error = _normalize_scope_items(items)
     if contract_error:
         return ScopeReviewResult(
@@ -1548,6 +1546,7 @@ def run_scope_review(
             context_manifest=_current_scope_context_manifest(),
             prompt_ref=_prompt_ref,
             response_ref=_response_ref,
+            **_operation,
         )
 
     critical_findings, advisory_findings = _classify_scope_findings(parsed_items)
@@ -1562,6 +1561,7 @@ def run_scope_review(
         "context_manifest": _current_scope_context_manifest(),
         "prompt_ref": _prompt_ref,
         "response_ref": _response_ref,
+        **_operation,
     }
     critical_findings, advisory_findings, authority_block = _apply_scope_authority(
         critical_findings, advisory_findings, scope_model_id=scope_model_id,

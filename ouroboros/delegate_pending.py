@@ -24,6 +24,9 @@ def pending_invocations(
             found[invocation_id] = {
                 "invocation_id": invocation_id,
                 "task_id": str(row.get("task_id") or ""),
+                "surface": str(row.get("surface") or ""),
+                "slot_id": str(row.get("slot_id") or ""),
+                "operation_id": str(row.get("operation_id") or ""),
                 "request": row.get("request") if isinstance(row.get("request"), dict) else None,
                 "route": str(row.get("route") or ""),
                 "project_id": str(row.get("project_id") or ""),

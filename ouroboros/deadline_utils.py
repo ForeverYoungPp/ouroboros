@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
+import math
+import os
+import time
 from typing import Any, Optional
+
+log = logging.getLogger(__name__)
 
 
 def parse_deadline_ts(value: Any) -> Optional[datetime]:
@@ -72,3 +78,217 @@ def window_within_deadline(ctx: Any, requested: int) -> int:
     remaining = float(deadline_remaining_sec(ctx) or 0.0)
     return max(1, int(min(requested, remaining - float(effective_finalization_reserve_sec(ctx)))))
 
+
+def llm_transport_timeout_sec(explicit: Any = None) -> float:
+    """Return the transport/dead-socket timeout for one LLM request.
+
+    A caller may narrow this value explicitly.  The shared default is deliberately
+    read from ``config.py`` and is never used as a logical cognition deadline.
+    """
+    try:
+        requested = float(explicit)
+    except (TypeError, ValueError):
+        requested = 0.0
+    if requested > 0:
+        return requested
+    from ouroboros.config import get_llm_transport_read_timeout_sec
+
+    return float(get_llm_transport_read_timeout_sec())
+
+
+def dispatch_window_remaining_sec(
+    *,
+    deadline_at: Any = None,
+    deadline_ts: Any = None,
+    reserve_sec: Any = 0.0,
+) -> Optional[float]:
+    """Return owner time available for a *new* physical dispatch.
+
+    ``None`` means that no owner deadline is present.  ``0.0`` means the
+    deadline or its finalization reserve is spent.  This is deliberately
+    separate from :func:`transport_timeout_with_deadline`, whose positive
+    floor keeps an already-admitted transport call bounded without pretending
+    that a new call is still admissible.
+    """
+    remaining: Optional[float] = None
+    try:
+        if isinstance(deadline_ts, (int, float, str)) and not isinstance(deadline_ts, bool):
+            candidate = float(deadline_ts) - time.time()
+            if math.isfinite(candidate):
+                remaining = candidate
+    except (TypeError, ValueError, OverflowError):
+        remaining = None
+    if remaining is None:
+        remaining = seconds_until(deadline_at)
+    if remaining is None:
+        return None
+    try:
+        reserve = max(0.0, float(reserve_sec or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        reserve = 0.0
+    return max(0.0, remaining - reserve)
+
+
+def transport_timeout_with_deadline(
+    explicit: Any = None,
+    *,
+    deadline_at: Any = None,
+    deadline_ts: Any = None,
+    reserve_sec: Any = 0.0,
+) -> float:
+    """Narrow a transport read/process timeout to the owner's remaining time.
+
+    This is deliberately a transport bound, not a logical-operation deadline:
+    absent an owner deadline it returns the configured dead-socket timeout, while
+    an existing deadline can only shorten it. Numeric epoch deadlines are useful
+    for in-process loop contexts; ISO deadlines remain the public task contract.
+    """
+    base = llm_transport_timeout_sec(explicit)
+    remaining = dispatch_window_remaining_sec(
+        deadline_at=deadline_at, deadline_ts=deadline_ts, reserve_sec=reserve_sec,
+    )
+    if remaining is None:
+        return base
+    return max(0.001, min(base, remaining))
+
+
+def bounded_seconds(value: Any, *, default: float, maximum: float) -> int:
+    """Encode a positive engine horizon without widening an exhausted one."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raw = float(default)
+    else:
+        try:
+            raw = float(value)
+        except (TypeError, ValueError):
+            raw = float(default)
+    if not math.isfinite(raw):
+        raw = float(default)
+    if raw <= 0:
+        return 1
+    return max(1, min(math.ceil(raw), int(maximum)))
+
+
+def logical_operation_timeout_sec(
+    explicit: Any = None,
+    *,
+    deadline_at: Any = None,
+    fallback: Any = None,
+    reserve_sec: Any = 0.0,
+) -> float:
+    """Choose a logical operation wait without borrowing a socket timeout.
+
+    An explicit slot/task value is the operation's requested window, but an
+    existing owner deadline always narrows it.  Absent both, ``fallback`` is
+    used (normally the transport bound only as a settlement wait, not as a
+    cognition target).
+    """
+    # ``None``/blank means "use the route fallback"; an explicit zero is a
+    # caller-owned one-second horizon, matching ``bounded_seconds``. Treating
+    # both shapes as the same sentinel silently widened a zero slot to the
+    # 2700-second transport fallback.
+    explicit_set = not (
+        explicit is None or (isinstance(explicit, str) and not explicit.strip())
+    )
+    try:
+        requested = float(explicit) if explicit_set else 0.0
+    except (TypeError, ValueError):
+        explicit_set = False
+        requested = 0.0
+    if explicit_set and not math.isfinite(requested):
+        explicit_set = False
+    remaining = seconds_until(deadline_at)
+    if remaining is not None:
+        try:
+            reserve = max(0.0, float(reserve_sec or 0.0))
+        except (TypeError, ValueError):
+            reserve = 0.0
+        remaining = max(0.0, remaining - reserve)
+        if remaining <= 0:
+            return 0.0
+        if explicit_set:
+            requested = 1.0 if requested <= 0 else requested
+            return min(requested, remaining)
+        return remaining
+    if explicit_set:
+        return 1.0 if requested <= 0 else requested
+    try:
+        value = float(fallback)
+    except (TypeError, ValueError):
+        value = llm_transport_timeout_sec()
+    return max(0.001, value)
+
+
+def review_logical_fallback_timeout_sec() -> Optional[float]:
+    """Return an explicit review-window override, else leave routing in charge."""
+    raw = os.environ.get("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", "")
+    if not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 0.0
+    if math.isfinite(value) and value > 0:
+        return value
+    log.warning(
+        "Invalid or non-positive OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC=%r; "
+        "using the route-owned logical fallback",
+        raw,
+    )
+    return None
+
+
+def review_operation_timeout_sec(
+    explicit: Any = None,
+    *,
+    route: Any = None,
+    deadline_at: Any = None,
+    transport_timeout_sec: Any = None,
+    reserve_sec: Any = 0.0,
+) -> float:
+    """Resolve a review wait without turning transport into cognition policy.
+
+    API calls may use their dead-socket bound as the settlement fallback because
+    the physical request itself ends there.  Agent sessions are independent paid
+    processes, so an unset logical window inherits the existing task absolute
+    ceiling instead.  Explicit review windows and owner deadlines only narrow it.
+    """
+    route_value = str(getattr(route, "value", route) or "")
+    requested = explicit
+    if explicit is None or (isinstance(explicit, str) and not explicit.strip()):
+        requested = review_logical_fallback_timeout_sec()
+    if route_value == "agent_session":
+        from ouroboros.config import get_task_abs_ceiling_sec
+
+        ceiling = float(get_task_abs_ceiling_sec())
+        return min(
+            ceiling,
+            logical_operation_timeout_sec(
+                requested,
+                deadline_at=deadline_at,
+                fallback=ceiling,
+                reserve_sec=reserve_sec,
+            ),
+        )
+    return logical_operation_timeout_sec(
+        requested,
+        deadline_at=deadline_at,
+        fallback=llm_transport_timeout_sec(transport_timeout_sec),
+        reserve_sec=reserve_sec,
+    )
+
+
+def review_transport_timeout(model: Any, explicit: Any = None, deadline_at: Any = None) -> Optional[float]:
+    """Resolve one review route's physical timeout without hiding an owner deadline."""
+    from ouroboros.config import get_finalization_grace_sec
+    from ouroboros.provider_models import provider_for_model
+
+    provider = provider_for_model(model)
+    deadline = str(deadline_at or "").strip()
+    if explicit is None and provider == "anthropic" and not deadline:
+        return None
+    native = 120 if provider == "anthropic" else None
+    return transport_timeout_with_deadline(
+        explicit if explicit is not None else native,
+        deadline_at=deadline or None,
+        reserve_sec=get_finalization_grace_sec(),
+    )

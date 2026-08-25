@@ -749,7 +749,7 @@ _PLAN_REVIEW_IDENTITY_KEYS = frozenset({
     "id", "finding_id", "slot", "slot_id", "class", "breaks", "aggregate", "request_fingerprint",
     "previous_fingerprint", "spec_hash", "evidence_manifest_hash", "plan_prose_hash", "sha256",
     "model", "request_model", "route", "host_file_read_attestation", "reason", "decision", "kind",
-    "goal", "acceptance_claims", "cycle_index", "series_id", "schema_version",
+    "goal", "acceptance_claims", "cycle_index", "series_id", "schema_version", "retry_key",
 })
 
 

@@ -987,6 +987,34 @@ def test_second_forced_owner_arrival_returns_exact_resume_fallback(tmp_path, mon
     )
 
 
+def test_forced_owner_refresh_does_not_resend_unknown_provider_outcome(tmp_path, monkeypatch):
+    incoming = queue.Queue()
+    loop, registry, ctx, _trace = _forced_test_context(tmp_path, incoming=incoming)
+    calls = 0
+
+    def forced_model(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        ctx.accumulated_usage["_last_llm_error_kind"] = "provider_outcome_unknown"
+        incoming.put("retain this owner directive for resume")
+        return {"role": "assistant", "content": ""}, 0.0
+
+    monkeypatch.setattr(loop, "call_llm_with_retry", forced_model)
+    text, _usage, returned_trace = loop._forced_final_answer(
+        ctx,
+        prompt="finalize",
+        fallback_text="fallback",
+        reason_code="round_limit",
+    )
+
+    assert calls == 1
+    assert "Resume the task" in text
+    assert len(registry._ctx._owner_directives) == 1
+    assert returned_trace["forced_finalization"]["source"] == (
+        "provider_outcome_unknown_no_resend"
+    )
+
+
 def test_child_result_change_during_host_panel_supersedes_pass(tmp_path, monkeypatch):
     import hashlib
 
