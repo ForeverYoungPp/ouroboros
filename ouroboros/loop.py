@@ -1572,7 +1572,8 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
         run_review_request,
     )
     from ouroboros.review_dispatch import (
-        claim_task_acceptance_dispatch as _claim_dispatch,
+        TaskAcceptanceDispatchUnavailable,
+        bind_task_acceptance_paid_dispatch,
         run_zero_physical_task_acceptance as _free_dispatch,
         task_acceptance_preclaim_refusal,
     )
@@ -1647,50 +1648,23 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
     refusal = task_acceptance_preclaim_refusal(ctx)
     if refusal is not None:
         return refusal
-    # Q6: claim the exact tree wallet after free refusals and before transport.
+    # Q6: bind the exact tree wallet to the target's physical-dispatch stamp.
+    # Route/candidate refusals remain free; one strict stamp gates every slot.
+    started = time.monotonic()
     try:
-        from ouroboros.task_results import resolve_task_lineage
-
-        tools_ctx = ctx.tools._ctx
-        metadata = getattr(tools_ctx, "task_metadata", {})
-        metadata = metadata if isinstance(metadata, dict) else {}
-        lineage = resolve_task_lineage(ctx.task_id, metadata=metadata)
-        root_task_id = str(lineage.get("root_task_id") or ctx.task_id)
-        accounting_root = pathlib.Path(str(
-            metadata.get("budget_drive_root")
-            or getattr(tools_ctx, "budget_drive_root", "")
-            or ctx.drive_root
-            or getattr(tools_ctx, "drive_root", ".")
-        ))
-        claim = _claim_dispatch(
-            accounting_root, root_task_id, ctx.task_id, ctx.review_binding,
-        )
-    except Exception as exc:
-        claim = {
-            "status": "unknown",
-            "reason": f"review_capacity_claim_unknown:{type(exc).__name__}",
-        }
-    if claim.get("status") != "claimed":
-        reason = str(claim.get("reason") or "review_capacity_unknown")
+        with bind_task_acceptance_paid_dispatch(ctx) as usage_ctx:
+            result = run_review_request(
+                request, slots=slots,
+                drive_root=(pathlib.Path(ctx.drive_root) if ctx.drive_root is not None
+                            else pathlib.Path(ctx.tools._ctx.drive_root)),
+                usage_ctx=usage_ctx,
+            )
+    except TaskAcceptanceDispatchUnavailable as exc:
         return ReviewRunResult(
             request={"surface": "task_acceptance", "task_id": str(ctx.task_id)},
-            actors=[],
-            parsed_findings=[],
-            aggregate_signal="DEGRADED",
-            degraded=True,
-            degraded_reasons=[f"{reason} (no reviewer was called)"],
+            actors=[], parsed_findings=[], aggregate_signal="DEGRADED", degraded=True,
+            degraded_reasons=[f"{exc} (no reviewer was called)"],
         )
-    started = time.monotonic()
-    result = run_review_request(
-        request,
-        slots=slots,
-        drive_root=(
-            pathlib.Path(ctx.drive_root)
-            if ctx.drive_root is not None
-            else pathlib.Path(ctx.tools._ctx.drive_root)
-        ),
-        usage_ctx=ctx.tools._ctx,
-    )
     duration_sec = round(time.monotonic() - started, 3)
     try:
         from ouroboros.utils import append_jsonl, utc_now_iso

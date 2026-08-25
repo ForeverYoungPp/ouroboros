@@ -333,7 +333,7 @@ def test_acceptance_corrupt_cancellation_projection_is_unknown_without_claim(
 
     assert result.degraded is True
     assert result.degraded_reasons[0].startswith(
-        "review_capacity_claim_unknown:CancelIntentProjectionCorrupt"
+        "cancellation_state_unknown:CancelIntentProjectionCorrupt"
     )
     state = load_task_acceptance_review_state(tmp_path, ctx.task_id)
     assert state["claims_by_binding"] == {}
@@ -418,13 +418,18 @@ def test_acceptance_zero_physical_refusal_does_not_claim_wallet(
     # Repairing the evidence can still spend the root's sole physical cycle;
     # the synthetic refusal above did not strand the tree at cap=1.
     physical_calls = []
+
+    def physical_panel(request, **kwargs):
+        from ouroboros.review_dispatch import stamp_review_paid_on_dispatch
+
+        stamp_review_paid_on_dispatch(kwargs["usage_ctx"])
+        physical_calls.append(request)
+        return SimpleNamespace(aggregate_signal="PASS")
+
     monkeypatch.setattr(
         substrate,
         "run_review_request",
-        lambda request, **_kwargs: (
-            physical_calls.append(request)
-            or SimpleNamespace(aggregate_signal="PASS")
-        ),
+        physical_panel,
     )
     repaired = loop._execute_task_acceptance_panel(
         _root_acceptance_context(tmp_path, {"evidence": "complete"}),
@@ -434,6 +439,97 @@ def test_acceptance_zero_physical_refusal_does_not_claim_wallet(
     state = load_task_acceptance_review_state(tmp_path, ctx.task_id)
     assert len(state["claims_by_binding"]) == 1
 
+
+def test_acceptance_route_refusal_before_physical_send_keeps_wallet_retryable(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.loop as loop
+    import ouroboros.review_substrate as substrate
+    from ouroboros import usage_accounting as usage
+    from ouroboros.task_results import load_task_acceptance_review_state
+
+    class RefusingLLM:
+        def chat(self, **_kwargs):
+            raise RuntimeError("route resolution failed before provider send")
+
+    class AccountedLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, **_kwargs):
+            request = usage.AttemptRequest(
+                model="local-review-test", provider="local", reservation_usd=0.0,
+                drive_root=tmp_path, task_id="root-wallet-gate",
+                root_task_id="root-wallet-gate",
+            )
+
+            def send():
+                self.calls += 1
+                return {"content": "[]"}, {
+                    "prompt_tokens": 0, "completion_tokens": 0,
+                }
+
+            return usage.execute_physical_attempt(request, send)
+
+    _allow_acceptance_wave(monkeypatch)
+    original_run = substrate.run_review_request
+
+    def run_with(llm):
+        def _run(request, **kwargs):
+            return original_run(request, llm=llm, **kwargs)
+
+        monkeypatch.setattr(substrate, "run_review_request", _run)
+        return loop._execute_task_acceptance_panel(
+            _root_acceptance_context(tmp_path, {"evidence": "complete"}),
+        )
+
+    refused = run_with(RefusingLLM())
+    assert refused.actors[0]["status"] == "error"
+    assert refused.actors[0].get("physical_attempts", 0) == 0
+    state = load_task_acceptance_review_state(tmp_path, "root-wallet-gate")
+    assert state["claims_by_binding"] == {}
+
+    accounted = AccountedLLM()
+    run_with(accounted)
+    state = load_task_acceptance_review_state(tmp_path, "root-wallet-gate")
+    assert accounted.calls == 1
+    assert len(state["claims_by_binding"]) == 1
+
+
+def test_acceptance_dispatch_rechecks_cancel_before_provider_send(tmp_path, monkeypatch):
+    import ouroboros.loop as loop
+    import ouroboros.review_substrate as substrate
+    from ouroboros import usage_accounting as usage
+    from ouroboros.cancel_intents import request_cancel
+    from ouroboros.task_results import load_task_acceptance_review_state
+    class CancellingLLM:
+        calls = 0
+
+        def chat(self, **_kwargs):
+            request_cancel(tmp_path, "root-wallet-gate", source="dispatch-race")
+            request = usage.AttemptRequest(
+                model="local-review-test", provider="local", reservation_usd=0.0,
+                drive_root=tmp_path, task_id="root-wallet-gate",
+                root_task_id="root-wallet-gate",
+            )
+            return usage.execute_physical_attempt(request, self.send)
+        def send(self):
+            self.calls += 1
+            return {"content": "[]"}, {"prompt_tokens": 0, "completion_tokens": 0}
+
+    _allow_acceptance_wave(monkeypatch)
+    original_run, llm = substrate.run_review_request, CancellingLLM()
+    monkeypatch.setattr(substrate, "run_review_request", lambda request, **kwargs:
+                        original_run(request, llm=llm, **kwargs))
+    result = loop._execute_task_acceptance_panel(
+        _root_acceptance_context(tmp_path, {"evidence": "complete"}),
+    )
+    assert result.actors[0]["status"] == "error" and llm.calls == 0
+    state = load_task_acceptance_review_state(tmp_path, "root-wallet-gate")
+    assert state["claims_by_binding"] == {}
+    projection = usage.usage_projection(tmp_path, root_task_id="root-wallet-gate")
+    assert projection["attempt_counts"] == {"released": 1} and projection["non_final_rows"] == 0
+    assert projection["cost_final"] is True
 
 def test_normalized_stall_default_does_not_emit_deprecation_noise(tmp_path):
     quiet = SimpleNamespace(

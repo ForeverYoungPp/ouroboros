@@ -946,3 +946,53 @@ def test_bound_api_paid_stamp_waits_for_durable_sync_and_async_dispatch(tmp_path
 
     assert asyncio.run(_run())["usage"]["prompt_tokens"] == 0
     assert writes == ["paid", "async"]
+
+
+def test_fail_closed_paid_stamp_replays_one_failure_to_every_dispatcher():
+    from ouroboros.review_dispatch import ReviewPaidStamp, invoke_review_paid_stamp
+
+    writes = []
+
+    def refuse():
+        writes.append("attempted")
+        raise RuntimeError("wallet unavailable")
+
+    stamp = ReviewPaidStamp(refuse, fail_closed=True)
+    with pytest.raises(RuntimeError, match="wallet unavailable"):
+        invoke_review_paid_stamp(stamp)
+    with pytest.raises(RuntimeError, match="wallet unavailable"):
+        invoke_review_paid_stamp(stamp)
+
+    assert writes == ["attempted"]
+    assert stamp.fired is True
+
+
+def test_strict_api_stamp_veto_releases_sync_and_async_attempts(tmp_path):
+    import asyncio
+    from ouroboros import usage_accounting as ua
+    from ouroboros.review_dispatch import ReviewPaidStamp, bind_api_review_paid_stamp
+
+    def request(root):
+        return ua.AttemptRequest(model="local", provider="local", reservation_usd=1.0,
+                                 drive_root=root, task_id="t", root_task_id="t")
+
+    def refuse(root):
+        rows = (root / ua.LEDGER_REL).read_text().splitlines()
+        assert json.loads(rows[-1])["state"] == "reserved"
+        raise RuntimeError("wallet unavailable")
+
+    sync_root, sent = tmp_path / "sync", []
+    with bind_api_review_paid_stamp(ReviewPaidStamp(lambda: refuse(sync_root), fail_closed=True)):
+        with pytest.raises(ua.PhysicalAttemptPreparationFailed):
+            ua.execute_physical_attempt(request(sync_root), lambda: sent.append("sync"))
+    assert sent == []
+    assert ua.usage_projection(sync_root)["attempt_counts"] == {"released": 1}
+
+    async_root = tmp_path / "async"
+    async def run():
+        with bind_api_review_paid_stamp(ReviewPaidStamp(lambda: refuse(async_root), fail_closed=True)):
+            return await ua.execute_physical_attempt_async(
+                request(async_root), lambda: (_ for _ in ()).throw(AssertionError("sent")))
+    with pytest.raises(ua.PhysicalAttemptPreparationFailed):
+        asyncio.run(run())
+    assert ua.usage_projection(async_root)["attempt_counts"] == {"released": 1}

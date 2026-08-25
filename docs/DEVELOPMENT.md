@@ -900,6 +900,16 @@ one chunked wave = ONE cycle). `unlimited` removes the local count
 everywhere; deadline, budget and lifecycle rails still bind. A malformed
 value fails closed to the bounded default and is logged once.
 
+For task acceptance, the exact-binding tree-wallet claim is a strict write-ahead
+stamp immediately before the API usage ledger crosses into physical dispatch.
+Panel assembly, an unavailable route, or another pre-transport refusal consumes
+no claim and leaves the binding retryable. Deadline and cancellation are
+rechecked by that stamp; an unavailable claim releases the usage reservation and
+blocks every parallel panel slot before reviewer transport rather than degrading
+hard authority into fail-open cost telemetry. Task acceptance remains API-only;
+the session-route stamp ordering continues to serve its separate replayable
+custody contract.
+
 Anti-pattern: paying for byte-identical review material. Never dispatch a paid
 reviewer wave for material a gate has already reviewed under the same review
 contract — the commit gate refuses a byte-identical staged diff for free from

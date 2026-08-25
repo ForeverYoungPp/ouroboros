@@ -88,21 +88,21 @@ def claim_task_acceptance_dispatch(
 
 
 def task_acceptance_preclaim_refusal(ctx: Any) -> Any:
-    """Recheck the deadline rail after assembly and before a paid wallet claim."""
-    from ouroboros import task_pacing
+    """Project every free refusal before assembly and again at dispatch."""
     from ouroboros.review_substrate import ReviewRunResult
+    from ouroboros.task_results import project_task_acceptance_review_capacity
 
-    budget = task_pacing.build_budget_snapshot(
-        ctx.tools._ctx, profile=ctx.budget_profile,
+    projection = project_task_acceptance_review_capacity(
+        ctx.tools._ctx,
+        binding_hash=str((ctx.review_binding or {}).get("binding_hash") or ""),
     )
-    allowed, reason = task_pacing.review_launch_allowed(
-        budget,
-        estimated_sec=task_pacing.acceptance_review_estimate_sec(
-            ctx.tools._ctx, passes_done=ctx.passes_done,
-        ),
-    )
-    if allowed:
+    if projection.get("state") == "available" and not projection.get("binding_seen"):
         return None
+    reason = (
+        "binding_dispatch_already_claimed"
+        if projection.get("binding_seen")
+        else str(projection.get("reason") or "review_capacity_unknown")
+    )
     return ReviewRunResult(
         request={"surface": "task_acceptance", "task_id": str(ctx.task_id)},
         actors=[], parsed_findings=[], aggregate_signal="DEGRADED", degraded=True,
@@ -125,6 +125,10 @@ def slot_id_for_row(index: int, *, prefix: str = SLOT_ID_PREFIX) -> str:
     return f"{prefix}_{int(index)}"
 
 
+class TaskAcceptanceDispatchUnavailable(RuntimeError):
+    """A task-acceptance panel was refused before reviewer transport."""
+
+
 class ReviewPaidStamp:
     """Idempotent, thread-safe once-only wrapper around one durable write.
 
@@ -132,34 +136,104 @@ class ReviewPaidStamp:
     call" (the commit gate dispatches triad and scope concurrently): the first
     caller performs the durable write-ahead, later callers block on the lock
     until it lands and then no-op — so EVERY side is guaranteed the paid fact
-    is durable before its own transport begins. A failing write is not
-    retried and still marks the stamp fired: the terminal record is the
-    primary ledger, and this writer is fail-open cost accounting, never a
-    safety gate.
+    is durable before its own transport begins. A failing default write is not
+    retried and still marks the stamp fired: the terminal record is the primary
+    ledger, and ordinary cost accounting remains fail-open. Task acceptance
+    uses ``fail_closed=True`` for its already-hard shared wallet authority;
+    every parallel caller then observes the same failure and no reviewer
+    transport proceeds.
     """
 
-    def __init__(self, write: Callable[[], None]) -> None:
+    def __init__(
+        self, write: Callable[[], None], *, fail_closed: bool = False,
+    ) -> None:
         self._write = write
         self._lock = threading.Lock()
+        self.fail_closed = bool(fail_closed)
+        self._failure: Exception | None = None
         self.fired = False
 
     def __call__(self) -> None:
         with self._lock:
             if self.fired:
+                if self.fail_closed and self._failure is not None:
+                    raise TaskAcceptanceDispatchUnavailable(
+                        str(self._failure)
+                    ) from self._failure
                 return
             try:
                 self._write()
+            except Exception as exc:
+                self._failure = exc
+                raise
             finally:
                 self.fired = True
 
 
+def task_acceptance_paid_dispatch_stamp(
+    ctx: Any,
+    drive_root: Any,
+    root_task_id: str,
+    task_id: str,
+    binding: dict[str, Any],
+) -> ReviewPaidStamp:
+    """Build the strict once-only wallet claim for a physical panel dispatch."""
+
+    def _claim() -> None:
+        refusal = task_acceptance_preclaim_refusal(ctx)
+        if refusal is not None:
+            reasons = list(getattr(refusal, "degraded_reasons", None) or [])
+            raise TaskAcceptanceDispatchUnavailable(
+                reasons[0] if reasons else "review_dispatch_refused"
+            )
+        claim = claim_task_acceptance_dispatch(
+            drive_root, root_task_id, task_id, binding,
+        )
+        if claim.get("status") != "claimed":
+            raise TaskAcceptanceDispatchUnavailable(
+                str(claim.get("reason") or "review_capacity_unknown")
+            )
+
+    return ReviewPaidStamp(_claim, fail_closed=True)
+
+
+@contextlib.contextmanager
+def bind_task_acceptance_paid_dispatch(ctx: Any) -> Iterator[Any]:
+    """Bind the canonical tree-wallet claim for this panel's physical seam."""
+    from ouroboros.task_results import resolve_task_lineage
+
+    tools_ctx = ctx.tools._ctx
+    metadata = getattr(tools_ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    lineage = resolve_task_lineage(ctx.task_id, metadata=metadata)
+    root_task_id = str(lineage.get("root_task_id") or ctx.task_id)
+    accounting_root = pathlib.Path(str(
+        metadata.get("budget_drive_root")
+        or getattr(tools_ctx, "budget_drive_root", "")
+        or ctx.drive_root
+        or getattr(tools_ctx, "drive_root", ".")
+    ))
+    prior = getattr(tools_ctx, "_review_paid_stamp", None)
+    if prior is not None:
+        raise TaskAcceptanceDispatchUnavailable("review_dispatch_stamp_already_bound")
+    tools_ctx._review_paid_stamp = task_acceptance_paid_dispatch_stamp(
+        ctx, accounting_root, root_task_id, ctx.task_id, ctx.review_binding,
+    )
+    try:
+        yield tools_ctx
+    finally:
+        tools_ctx._review_paid_stamp = prior
+
+
 def invoke_review_paid_stamp(stamp: Any) -> None:
-    """Invoke one captured write-ahead stamp, fail-open."""
+    """Invoke one captured write-ahead stamp; strict wallet claims propagate."""
     if not callable(stamp):
         return
     try:
         stamp()
     except Exception:
+        if bool(getattr(stamp, "fail_closed", False)):
+            raise
         log.debug("review paid dispatch stamp failed (fail-open)", exc_info=True)
 
 
@@ -173,9 +247,21 @@ def bind_api_review_paid_stamp(stamp: Any) -> Iterator[None]:
         _BOUND_API_PAID_STAMP.reset(token)
 
 
-def invoke_bound_api_review_paid_stamp() -> None:
-    """Mark the bound API review paid, if any; always fail-open."""
-    invoke_review_paid_stamp(_BOUND_API_PAID_STAMP.get())
+def invoke_bound_api_review_paid_stamp(
+    *, fail_closed: bool | None = None,
+) -> None:
+    """Invoke the bound API stamp at its matching dispatch phase.
+
+    Strict task-acceptance authority runs immediately before the usage ledger
+    crosses into ``dispatched`` so a veto remains an honest released attempt.
+    Ordinary commit/skill accounting keeps its existing post-transition
+    write-ahead point.  ``None`` retains the historical unconditional helper
+    behavior for direct callers.
+    """
+    stamp = _BOUND_API_PAID_STAMP.get()
+    if fail_closed is not None and bool(getattr(stamp, "fail_closed", False)) != fail_closed:
+        return
+    invoke_review_paid_stamp(stamp)
 
 
 def stamp_review_paid_on_dispatch(ctx: Any) -> None:
