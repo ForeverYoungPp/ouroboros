@@ -2127,8 +2127,8 @@ export function createChatInstance({
         ensureLiveCardVisible(record, { suppressDomInsert });
         record.updates += 1;
         const wasFinished = record.finished;
-        // Prefer the last meaningful headline when an update carries none (e.g. a
-        // structured terminal marker), so finishing a card doesn't blank its title.
+        // Keep the last meaningful headline when a terminal marker has none.
+        // Terminal markers preserve this title.
         const headline = summary.headline || record.lastHumanHeadline || 'Working...';
         const syntheticKey = summary.dedupeKey || dedupeKey || `${summary.phase || 'working'}|${headline}|${summary.body || ''}`;
         const isLegacyParentSubagentKey = syntheticKey.startsWith('parent-subagent:');
@@ -2140,7 +2140,7 @@ export function createChatInstance({
         if (!isLegacyParentSubagentKey) {
             record.finished = isTerminalTaskPhase(nextPhase, summary.terminal);
         }
-        record.root.dataset.finished = record.finished ? '1' : '0';
+        if (record.finished !== wasFinished) record.root.dataset.finished = record.finished ? '1' : '0';
         if (summary.human && headline) {
             record.lastHumanHeadline = headline;
         }
@@ -2318,7 +2318,6 @@ export function createChatInstance({
         const wasFinished = record.finished;
         record.finished = true;
         record.finalizingHold = false;
-        record.root.dataset.finished = '1';
         // A finished task can never be cancelled again; dropping the marker here
         // keeps the set from accumulating every task id of a long session (P3).
         cancelableTaskIds.delete(record.groupId);
@@ -2332,6 +2331,7 @@ export function createChatInstance({
         setLiveCardTypingVisible(record, false);
         markTaskComplete(record.groupId, activePhase);
         if (!wasFinished) {
+            record.root.dataset.finished = '1';
             if (!stickyExpandedSlots.has(record.groupId)) {
                 setLiveCardExpanded(record, record.isSubagent && nestedSubagentsExpanded);
             }
