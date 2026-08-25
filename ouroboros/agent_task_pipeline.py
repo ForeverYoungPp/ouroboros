@@ -50,8 +50,7 @@ from ouroboros.skill_publish_result import apply_skill_publish_receipt_veto
 from ouroboros.task_finalization import (
     build_sealed_final_package,
     build_swarm_efficiency as _build_swarm_efficiency,  # moved (module ceiling); tests import it here
-    deliver_final_message_live,
-    prepare_terminal_send_event, register_final_answer_owed,
+    deliver_final_message_live, prepare_terminal_send_event, register_final_answer_owed,
     sealed_final_prompt_section, terminal_result_fields,
 )
 from ouroboros.dialogue_provenance import is_presence_task, presence_provenance_fields
