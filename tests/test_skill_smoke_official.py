@@ -653,9 +653,8 @@ def _review_diag(name: str, status: str, error: str, payload: Dict[str, Any]) ->
     return "\n".join(parts)
 
 
-def _actor_cost_usd(review: Dict[str, Any]) -> float:
-    # SkillReviewOutcome.cost_usd is never populated from actor usage; the
-    # authoritative per-call costs live in raw_actor_records.
+def _actor_reported_valuation_usd(review: Dict[str, Any]) -> float:
+    """Non-authoritative reviewer telemetry, kept only for live-smoke diagnostics."""
     return sum(float(rec.get("cost_usd") or 0.0) for rec in review.get("raw_actor_records") or [])
 
 
@@ -745,5 +744,6 @@ def test_review_grants_and_enable(slug, review_secret, install_skill, review_env
 
     print(
         f"{slug}: review={status} slots={models} "
-        f"cost=${_actor_cost_usd(review):.4f} elapsed={time.time() - started:.1f}s"
+        f"actor_reported_valuation=${_actor_reported_valuation_usd(review):.4f} "
+        f"elapsed={time.time() - started:.1f}s"
     )

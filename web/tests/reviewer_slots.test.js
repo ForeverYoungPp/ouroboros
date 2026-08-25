@@ -51,8 +51,9 @@ test('the standing note states the POLICY, never the current routing', () => {
     // The unconditional claim, in the shapes it could come back as.
     assert.doesNotMatch(markup, /review runs? on subscriptions/i);
     assert.doesNotMatch(markup, /reviews? run on your subscription/i);
-    // The API-only surfaces sentence is unconditional AND true, so it stays.
-    assert.match(markup, /API-only surfaces today/);
+    assert.match(markup, /skill\s+review follow their configured rows/i);
+    assert.match(markup, /Task acceptance remains API-only/i);
+    assert.match(markup, /uses\s+configured API rows, or the shipped defaults when none remain/i);
 });
 
 
@@ -190,6 +191,26 @@ test('the composed setting carries stable ids, per-row routes/efforts and the op
     assert.equal('profile_id' in setting.scope[0].route, false);
     assert.equal(setting.advisory.enabled, false);
     assert.equal(setting.advisory.effort, 'low');
+});
+
+test('an advisory session preserves route-default effort instead of inventing low', () => {
+    const setting = JSON.parse(buildReviewerSlotsSetting({
+        triad: [{ slot_id: 't1', route: { kind: ROUTE_KIND_API, target_id: 'm/t' } }],
+        scope: [{ slot_id: 's1', route: { kind: ROUTE_KIND_API, target_id: 'm/s' } }],
+        advisory: {
+            enabled: true,
+            route: { kind: ROUTE_KIND_SESSION, target_id: 'claude=claude-fable-5' },
+            effort: '',
+        },
+    }));
+    assert.equal(setting.advisory.effort, '');
+
+    const api = JSON.parse(buildReviewerSlotsSetting({
+        triad: setting.triad,
+        scope: setting.scope,
+        advisory: { enabled: true, route: { kind: 'api', target_id: '' }, effort: '' },
+    }));
+    assert.equal(api.advisory.effort, 'low');
 });
 
 test('minted slot ids are prefixed, unique, and never an array index', () => {

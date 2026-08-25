@@ -42,6 +42,10 @@ from ouroboros.skill_loader import (
     skill_review_gate,
     _sanitize_skill_name,
 )
+from ouroboros.skill_review_usage import (
+    skill_review_attempt_coverage,
+    skill_review_usage_markdown,
+)
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -1095,10 +1099,39 @@ def _skill_review_history_detail_sync(
     # detail string is the additive channel. Legacy rows without the facts
     # render nothing.
     accounting = []
-    if record.get("paid"):
-        accounting.append("paid panel dispatch (counts toward Max Review Cycles)")
+    usage_detail = ""
     if record.get("replayed_from_ts"):
-        accounting.append(f"free replay of the {record.get('replayed_from_ts')} verdict")
+        accounting.append(
+            f"free replay of the {record.get('replayed_from_ts')} verdict; "
+            "no physical reviewer dispatch for this replay"
+        )
+    elif record.get("paid"):
+        accounting.append("paid panel dispatch (counts toward Max Review Cycles)")
+        if record.get("usage_attribution_schema") == "physical_attempt_v1":
+            from ouroboros.usage_accounting import skill_review_usage
+
+            try:
+                usage = skill_review_usage(
+                    drive_root, review_skill=skill_name,
+                    review_wave_id=str(record.get("wave_id") or job_id),
+                )
+                if usage.get("attempt_ids"):
+                    known, expected, recorded = skill_review_attempt_coverage(record, usage)
+                    usage_detail = skill_review_usage_markdown(
+                        usage, coverage_known=known, expected=expected, recorded=recorded,
+                    )
+                else:
+                    accounting.append(
+                        "no canonical physical-attempt rows are recorded yet; "
+                        "cash and finality are unavailable"
+                    )
+            except Exception:
+                log.debug("skill review physical-attempt detail unavailable", exc_info=True)
+                accounting.append("exact physical-attempt accounting is currently unavailable")
+        else:
+            accounting.append(
+                "exact per-wave physical-attempt attribution was unavailable in this version"
+            )
     if record.get("review_contract_fingerprint"):
         accounting.append(
             f"panel contract {str(record.get('review_contract_fingerprint'))[:12]}…"
@@ -1107,6 +1140,8 @@ def _skill_review_history_detail_sync(
         accounting.append(f"rebuttal sha256 {str(record.get('rebuttal_sha256'))[:12]}…")
     if accounting:
         markdown += "\n\n_Review accounting: " + "; ".join(accounting) + "._"
+    if usage_detail:
+        markdown += "\n\n" + usage_detail
     return {
         "markdown": markdown,
         "status": status,

@@ -17,7 +17,7 @@ import pathlib
 import queue
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("review_substrate")
@@ -123,6 +123,7 @@ class ReviewRequest:
     session_root: str = ""
     session_task: str = ""
     session_threads: Dict[str, str] = field(default_factory=dict)
+    usage_attribution: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -920,7 +921,7 @@ def reviewer_slots(
     ``route_env_key`` names the surface's per-row route list (plan 5.1): the
     commit triad and scope pass theirs, so a row can be an api_chat call or a
     delegated agent session. Surfaces that stay on the API by owner decision
-    (task acceptance, plan review — D15) pass NOTHING, which pins every row to
+    (task acceptance — D15) pass NOTHING, which pins every row to
     ``api_chat`` explicitly rather than by accident.
     """
     raw_models = models if models is not None else get_review_models()
@@ -1004,6 +1005,7 @@ class ReviewCoordinator:
 
             self.drive_root = pathlib.Path(config.DATA_DIR)
         self.usage_ctx = usage_ctx
+        self._review_paid_stamp = getattr(usage_ctx, "_review_paid_stamp", None)
 
     def run(self, request: ReviewRequest, slots: List[ReviewSlot]) -> ReviewRunResult:
         if not slots:
@@ -1028,6 +1030,7 @@ class ReviewCoordinator:
         if not isinstance(usage_meta, dict):
             usage_meta = {}
         task_id = str(request.task_id or base_scope.task_id or "")
+        review_meta = request.usage_attribution if isinstance(request.usage_attribution, dict) else {}
         root_task_id = str(
             usage_meta.get("root_task_id") or base_scope.root_task_id or task_id
         )
@@ -1062,6 +1065,8 @@ class ReviewCoordinator:
             parent_task_id=str(usage_meta.get("parent_task_id") or base_scope.parent_task_id or ""),
             category=f"{request.surface}_review",
             source="review_substrate",
+            review_skill=str(review_meta.get("review_skill") or base_scope.review_skill or ""),
+            review_wave_id=str(review_meta.get("review_wave_id") or base_scope.review_wave_id or ""),
             global_limit_usd=global_limit,
             root_limit_usd=root_limit,
         )
@@ -1071,7 +1076,7 @@ class ReviewCoordinator:
 
             def _worker() -> None:
                 try:
-                    with usage_scope(review_usage_scope):
+                    with usage_scope(replace(review_usage_scope, review_slot_id=slot.slot_id)):
                         result_queue.put(self._run_slot(request, slot))
                 except Exception as exc:
                     result_queue.put(self._error_actor(request, slot, f"{type(exc).__name__}: {exc}"))
@@ -1359,6 +1364,7 @@ class ReviewCoordinator:
         assignment = ReviewAssignment(
             request=request, slot=slot, call_id=call_id, call_type=base_call_type,
             custody_root=self._custody_drive_root(),
+            dispatch_stamp=self._review_paid_stamp,
         )
         # Transport is chosen once, here, through the seam; the prompt itself is
         # rendered by the route (lazily) rather than by this method, so a route
@@ -1575,11 +1581,6 @@ def run_review_request(
     llm: LLMClient | None = None,
     usage_ctx: Any = None,
 ) -> ReviewRunResult:
-    # Write-ahead paid stamp (Q16 dispatch seam): a gate that meters paid
-    # cycles installed a callback on ctx; it durably lands the paid fact
-    # BEFORE the first reviewer transport call. Assembly-only refusals never
-    # reach this line, so undispatched attempts stay outside every ceiling.
-    stamp_review_paid_on_dispatch(usage_ctx)
     coordinator = ReviewCoordinator(llm=llm, drive_root=drive_root, usage_ctx=usage_ctx)
     result = coordinator.run(request, reviewer_slots(role_hint=request.surface) if slots is None else slots)
     if request.surface == "task_acceptance":

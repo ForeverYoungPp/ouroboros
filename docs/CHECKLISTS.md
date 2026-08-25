@@ -315,8 +315,9 @@ A state-machine change that only passes the success-path test is incomplete.
 
 Used by `skill_review` to vet a single
 external skill before it is allowed to execute via `skill_exec`. This uses the
-shared reviewer-slot configuration (`OUROBOROS_REVIEW_MODELS`) but preserves the
-existing skill-review gate semantics against a skill package in the local
+shared triad reviewer-slot configuration (`OUROBOROS_REVIEWER_SLOTS`, with the
+legacy model/route settings read when absent) and follows every row's configured
+delivery, while preserving the existing gate semantics against a skill package in the local
 checkout of `OUROBOROS_SKILLS_REPO_PATH`, not against a staged git diff.
 
 ### Transport and control skills are first-class (binding for ALL reviewers)

@@ -616,8 +616,15 @@ Concrete requirements:
 | Background consciousness (`consciousness.py`) | ✅ full | ✅ full (max) / navigation map (low) | — (not yet required) |
 | Advisory pre-review (`tools/claude_advisory_review.py`) | Two delivery forms: an `api` row receives the full doc inline via `load_governance_doc`; an `agent_session` row receives a resolvable pointer marked MANDATORY FULL READ and the session reads the full doc itself — retrieval is disclosed and non-certifying (the mirror of plan review's `agent_session` delivery form) | same two delivery forms (`api` inline / `agent_session` pointer) | same two delivery forms (`api` inline / `agent_session` pointer) |
 | Scope review (`tools/scope_review.py`) | full canonical doc + Atlas accounting | full canonical doc + Atlas accounting | full canonical doc + Atlas accounting |
+| Skill review (`skill_review.py`) | full inline (`api_chat`) / mandatory full source-root read (`agent_session`) | full inline (`api_chat`) / mandatory full source-root read (`agent_session`) | full inline (`api_chat`) / mandatory full source-root read (`agent_session`) |
 | Plan review (`tools/plan_review.py`) | full for a SELF-MODIFICATION plan (structural path fact: a declared target resolves under the system repo); otherwise a heading-derived navigation map of BIBLE.md generated at runtime (never a copy) | inline, in full, for a self-modification plan; otherwise the lossless navigation map + a resolvable pointer (W3) | named on-demand pointer; a reviewer that needs it returns `need_evidence` and the host attaches it on the next cycle |
 | Deep self-review (`deep_self_review.py`) | full canonical doc + Atlas accounting | full (max) / navigation map (low) + Atlas accounting | full canonical doc + Atlas accounting |
+
+Skill Review keeps the full stable governance/host prefix for cache-friendly API rows. A
+retrieving session reads those same canonical files from its source-repository root and receives
+the byte-exact dynamic tail inline: manifest, frozen skill chunk, history and output contract.
+The payload snapshot and per-chunk quorum therefore stay identical without rebilling or crowding
+the session window with source text it can inspect sequentially.
 
 Plan review keeps the reviewed SPEC, the task objective, the agent-declared evidence, and
 reviewer-slot framing as first-class context. Governance packs are tiered by ONE structural
@@ -924,6 +931,8 @@ from the exhaustion free replay, not from the refusal streak.
 
 Scope of the review-contract fingerprint (deliberate): it covers the reviewer
 roster, routes, enforcement, resolved efforts, and the prompt constants —
+including the retrieval/task/prompt-wrapper serialization when Skill Review
+actually contains an agent-session row, without repricing API-only panels —
 governance-document CONTENTS (BIBLE.md, CHECKLISTS.md, ARCHITECTURE.md) are
 deliberately outside it, so editing those documents neither lapses recorded
 verdicts nor frees replays. The accepted trade-off is that an old verdict can
@@ -1641,6 +1650,17 @@ Before every commit, verify the following:
   invented — so "which account paid, under which access" is answerable from the ledger
   row, the settled event, and (for reviewer slots) the last-execution file. Those are
   three separate stores, deliberately not joined into one applied receipt.
+- [ ] New Skill Review waves attribute every canonical usage row with the exact
+  `review_skill`, `review_wave_id`, and stable `review_slot_id`. API attempts inherit
+  these fields through `UsageScope`; agent sessions persist them, plus review
+  category/source, in the existing `RunCustody` start/replay facts so restart and late
+  settlement pass them explicitly to `record_subscription_session`. The history row's
+  `physical_attempt_v1` marker only declares that this join key exists; lazy detail
+  projects the same `usage_attempts.jsonl` rows and persists no totals. Pre-marker waves
+  stay “exact attribution unavailable” and must never be reconstructed by time/model.
+  If a terminal row lands before a late worker dispatches, readers overlay only the exact
+  same-wave write-ahead marker; an idempotent retry must not clear that marker until its
+  facts are already durable in the raw append-only row.
 - [ ] `cost_final` on a projection is a COUNT of open rows (`non_final_rows`), never a
   truthiness test on a dollar sum: a reserved/dispatched/unresolved row, a settled row
   with an unknown price, and a settled row its writer marked non-final are each open

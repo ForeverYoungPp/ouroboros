@@ -5,8 +5,8 @@ silent truncation and the existing quorum/aggregation produces one verdict.
 
 Lives outside ``skill_review`` (module-size discipline). The prompt builder and the
 multi-model review callable are INJECTED so this module never imports ``skill_review``
-(no circular dependency); the agentic alternative is deliberately avoided — each chunk
-reuses the SAME hardened review prompt, where skill content stays untrusted DATA.
+(no circular dependency). Every configured delivery row receives the SAME hardened,
+host-built frozen chunk and output contract.
 """
 
 from __future__ import annotations
@@ -19,6 +19,43 @@ _SINGLE_CONTENT = (
     "Skill Review Checklist. Return ONLY the JSON array described in the output contract."
 )
 
+_SESSION_RETRIEVAL = (
+    "Use native read/search tools inside the source-repository session root. Read "
+    "`BIBLE.md`, `docs/ARCHITECTURE.md`, and `docs/DEVELOPMENT.md` in full; read "
+    "the `Skill Review Checklist` section of `docs/CHECKLISTS.md`; then read "
+    "`docs/CREATING_SKILLS.md`, `ouroboros/contracts/plugin_api.py`, and "
+    "`ouroboros/extension_ui_validation.py` in full. Treat those source reads as "
+    "the governance and host-contract context for this review.\n\n"
+)
+
+
+def skill_review_session_contract_hash() -> str:
+    """Identity of the route-specific Skill Review session serialization.
+
+    Free replay must lapse when either the retrieval-sized assignment or the
+    generic agent-session prompt wrapper changes.  Keep this separate from the
+    historical API prompt hash so API-only panels retain their exact identity.
+    """
+    try:
+        import hashlib
+        import inspect
+
+        from ouroboros.review_execution import AgentSessionReviewExecutor
+
+        getter = AgentSessionReviewExecutor.session_prompt.fget
+        if getter is None:
+            return ""
+        parts = (
+            _SINGLE_CONTENT,
+            _SESSION_RETRIEVAL,
+            inspect.getsource(run_skill_review_passes),
+            inspect.getsource(AgentSessionReviewExecutor._output_contract),
+            inspect.getsource(getter),
+        )
+        return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+    except Exception:
+        return ""  # unknown contract never matches (fail-open toward paying)
+
 
 def run_skill_review_passes(
     ctx: Any,
@@ -28,6 +65,9 @@ def run_skill_review_passes(
     evidence: Dict[str, Any],
     file_packs: List[str],
     models: List[str],
+    row_plan: Dict[str, Any] | None = None,
+    session_root: str = "",
+    usage_attribution: Dict[str, str] | None = None,
     build_prompt: Callable[..., Tuple[str, int, Dict[str, Any]]],
     run_review: Callable[..., str],
 ) -> Tuple[str, Dict[str, Any], str, str]:
@@ -40,6 +80,36 @@ def run_skill_review_passes(
     history = evidence["history"]
     review_rebuttal = evidence["review_rebuttal"]
     required_items = evidence["required_items"]
+    matrix_contract = (
+        "Return ONLY a JSON array with at least one PASS or FAIL object for EVERY "
+        "expected item. Empty arrays and NO_FINDINGS are invalid. Expected items: "
+        f"{json.dumps(list(required_items))}. Each object needs item, verdict, severity, "
+        "and a concrete reason; emit no prose outside the array."
+    )
+
+    def _run(content: str, prompt: str, stable_prefix_len: int) -> str:
+        delivery = {}
+        if row_plan:
+            boundary = max(0, min(int(stable_prefix_len or 0), len(prompt)))
+            delivery = {
+                "routes": row_plan.get("routes") or [],
+                "row_plan": row_plan,
+                "session_task": (
+                    _SESSION_RETRIEVAL
+                    + "Use the exact frozen skill evidence in this assignment as the payload "
+                    "authority; do not replace it by rereading the mutable skill_dir path.\n\n"
+                    f"{prompt[boundary:]}\n\n## Review assignment\n\n{content}"
+                ),
+                "session_root": session_root,
+                "session_policy": {"output_contract": matrix_contract},
+                "surface": "skill_review",
+                "usage_attribution": usage_attribution or {},
+            }
+        return run_review(
+            ctx, content=content, prompt=prompt, models=models,
+            stable_prefix_len=stable_prefix_len, **delivery,
+        )
+
     if len(file_packs) == 1:
         prompt, stable_prefix_len, advisory_evidence = build_prompt(
             ctx, drive_root, skill,
@@ -47,10 +117,7 @@ def run_skill_review_passes(
             file_pack=file_packs[0], history=history, review_rebuttal=review_rebuttal,
         )
         try:
-            result_json_text = run_review(
-                ctx, content=_SINGLE_CONTENT, prompt=prompt, models=models,
-                stable_prefix_len=stable_prefix_len,
-            )
+            result_json_text = _run(_SINGLE_CONTENT, prompt, stable_prefix_len)
         except Exception as exc:  # pragma: no cover — transport failure path
             return prompt, advisory_evidence, "", f"{type(exc).__name__}: {exc}"
         return prompt, advisory_evidence, result_json_text, ""
@@ -80,10 +147,7 @@ def run_skill_review_passes(
             "ONLY the JSON array described in the output contract."
         )
         try:
-            chunk_text = run_review(
-                ctx, content=content, prompt=chunk_prompt, models=models,
-                stable_prefix_len=chunk_stable_len,
-            )
+            chunk_text = _run(content, chunk_prompt, chunk_stable_len)
             chunk_json = json.loads(chunk_text)
         except Exception as exc:  # pragma: no cover — transport failure path
             return prompt, advisory_evidence, "", f"chunk {idx + 1}/{total}: {type(exc).__name__}: {exc}"

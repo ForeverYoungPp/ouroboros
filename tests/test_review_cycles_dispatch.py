@@ -260,7 +260,7 @@ def _overflow_wave(dispatch):
 
     def _wave(ctx, commit_message, **kwargs):
         if dispatch:
-            stamp_review_paid_on_dispatch(ctx)  # exactly what run_review_request does
+            stamp_review_paid_on_dispatch(ctx)  # simulate the route-executor seam
         ctx._last_review_block_reason = "fixed_overflow"
         ctx._last_review_critical_findings = []
         scope = ScopeReviewResult(
@@ -616,6 +616,7 @@ def test_lifecycle_timeout_terminal_merges_the_dispatch_marker(tmp_path, monkeyp
     rows = _history_rows(tmp_path)
     assert rows and rows[-1]["status"] == "timeout"
     assert rows[-1]["paid"] is True  # merged from the marker, result was None
+    assert rows[-1]["usage_attribution_schema"] == "physical_attempt_v1"
     assert rows[-1]["review_contract_fingerprint"] == "cf-9"
     assert rows[-1]["rebuttal_sha256"] == "reb-9"
     assert load_dispatch_markers(drive, "demo") == []  # merge cleared it
@@ -714,6 +715,7 @@ def test_concurrent_wave_markers_are_append_only_and_each_merge_clears_its_own(t
     # wave A into the history as a fake infra terminal.
     markers = load_dispatch_markers(drive, "demo")
     assert {m["wave_id"] for m in markers} == {"wave-A", "wave-B"}
+    assert {m["usage_attribution_schema"] for m in markers} == {"physical_attempt_v1"}
     assert _history_rows(tmp_path) == []
     assert count_paid_skill_review_cycles(
         drive, "demo", "manual:demo", content_hash="h-1",
@@ -728,6 +730,7 @@ def test_concurrent_wave_markers_are_append_only_and_each_merge_clears_its_own(t
     })
     rows = _history_rows(tmp_path)
     assert [row["status"] for row in rows] == ["clean"]  # the verdict, not "interrupted"
+    assert rows[0]["usage_attribution_schema"] == "physical_attempt_v1"
     assert rows[-1]["paid"] is True
     assert {m["wave_id"] for m in load_dispatch_markers(drive, "demo")} == {"wave-B"}
     assert count_paid_skill_review_cycles(
@@ -791,3 +794,155 @@ def test_legacy_single_file_marker_is_read_and_flushed_on_the_next_write(tmp_pat
     assert count_paid_skill_review_cycles(
         drive, "demo", "manual:demo", content_hash="h-1",
     ) == 2  # the flushed legacy row + the new unmerged marker
+
+
+def test_late_marker_overlays_unpaid_terminal_without_rewriting_or_double_counting(tmp_path):
+    from ouroboros.skill_review_cycles import count_paid_skill_review_cycles
+    from ouroboros.skill_review_history import (
+        append_history_once,
+        load_dispatch_markers,
+        load_history,
+        review_history_path,
+        write_dispatch_marker,
+    )
+
+    drive = pathlib.Path(tmp_path)
+    (drive / "logs").mkdir(parents=True, exist_ok=True)
+    terminal = {
+        "ts": "t1", "status": "timeout", "terminal_reason": "slot timeout",
+        "content_hash": "h-late", "group_id": "task:root-late:demo",
+        "root_task_id": "root-late", "job_id": "wave-late",
+        "failure_signature": [], "fail_findings": [],
+    }
+    assert append_history_once(drive, "demo", terminal)
+    path = review_history_path(drive, "demo")
+    raw_before = path.read_bytes()
+
+    write_dispatch_marker(
+        drive, "demo", wave_id="wave-late", group_id="task:root-late:demo",
+        content_hash="h-late", root_task_id="root-late",
+        review_contract_fingerprint="cf-late", rebuttal_sha256="reb-late",
+    )
+    effective = load_history(drive, "demo", limit=0)[0]
+    assert effective["paid"] is True
+    assert effective["wave_id"] == "wave-late"
+    assert effective["usage_attribution_schema"] == "physical_attempt_v1"
+    assert effective["review_contract_fingerprint"] == "cf-late"
+    assert path.read_bytes() == raw_before  # overlay is read-only
+    assert count_paid_skill_review_cycles(drive, "demo", "task:root-late:demo") == 1
+
+    # An idempotent terminal retry must not erase the only late-dispatch fact.
+    assert append_history_once(drive, "demo", terminal)
+    assert path.read_bytes() == raw_before
+    assert [row["wave_id"] for row in load_dispatch_markers(drive, "demo")] == ["wave-late"]
+    assert count_paid_skill_review_cycles(drive, "demo", "task:root-late:demo") == 1
+
+
+def test_duplicate_terminal_clears_only_a_marker_already_present_in_raw_row(tmp_path):
+    from ouroboros.skill_review_cycles import count_paid_skill_review_cycles
+    from ouroboros.skill_review_history import (
+        append_history_once,
+        load_dispatch_markers,
+        write_dispatch_marker,
+    )
+
+    drive = pathlib.Path(tmp_path)
+    (drive / "logs").mkdir(parents=True, exist_ok=True)
+    terminal = {
+        "ts": "t1", "status": "clean", "content_hash": "h-stale",
+        "group_id": "manual:demo", "root_task_id": "", "job_id": "wave-stale",
+        "wave_id": "wave-stale", "paid": True,
+        "usage_attribution_schema": "physical_attempt_v1",
+        "review_contract_fingerprint": "cf-stale", "rebuttal_sha256": "reb-stale",
+        "failure_signature": [], "fail_findings": [],
+    }
+    assert append_history_once(drive, "demo", terminal)
+    write_dispatch_marker(
+        drive, "demo", wave_id="wave-stale", group_id="manual:demo",
+        content_hash="h-stale", review_contract_fingerprint="cf-stale",
+        rebuttal_sha256="reb-stale",
+    )
+    assert len(load_dispatch_markers(drive, "demo")) == 1
+    assert append_history_once(drive, "demo", terminal)
+    assert load_dispatch_markers(drive, "demo") == []
+    assert count_paid_skill_review_cycles(
+        drive, "demo", "manual:demo", content_hash="h-stale",
+    ) == 1
+
+
+def test_direct_quorum_terminal_keeps_wave_identity_for_a_late_dispatch(tmp_path, monkeypatch):
+    from ouroboros import skill_review
+    from ouroboros.skill_review_history import load_history
+
+    captured = {}
+
+    def _terminal_before_worker_dispatch(ctx, *_args, **_kwargs):
+        captured["stamp"] = ctx._review_paid_stamp
+        return "prompt", {}, _panel_result(["m1"]), ""
+
+    _wire_skill_wave(
+        monkeypatch, tmp_path, content_hash="h-direct-late",
+        passes=_terminal_before_worker_dispatch,
+    )
+    ctx = types.SimpleNamespace(task_id="", task_metadata={}, event_queue=None)
+    outcome = skill_review.review_skill(ctx, "demo", persist=True)
+    assert outcome.status == "pending" and outcome.paid is False and outcome.wave_id
+    raw = _history_rows(tmp_path)[-1]
+    assert raw.get("paid") is not True and raw["wave_id"] == outcome.wave_id
+
+    captured["stamp"]()
+    effective = load_history(pathlib.Path(tmp_path), "demo", limit=0)[-1]
+    assert effective["paid"] is True and effective["wave_id"] == outcome.wave_id
+    assert effective["usage_attribution_schema"] == "physical_attempt_v1"
+    assert _paid_units(tmp_path, "h-direct-late") == 1
+
+
+def test_bound_api_paid_stamp_waits_for_durable_sync_and_async_dispatch(tmp_path):
+    import asyncio
+
+    from ouroboros import usage_accounting as ua
+    from ouroboros.review_dispatch import ReviewPaidStamp, bind_api_review_paid_stamp
+
+    drive = pathlib.Path(tmp_path)
+    request = ua.AttemptRequest(
+        model="local-test", provider="local", reservation_usd=0.0,
+        drive_root=drive, task_id="review", root_task_id="review",
+    )
+    writes = []
+
+    def _write_paid():
+        assert _ledger_state(drive) == "dispatched"
+        writes.append("paid")
+
+    def _ledger_state(root):
+        rows = [json.loads(line) for line in (root / ua.LEDGER_REL).read_text().splitlines()]
+        return rows[-1]["state"]
+
+    stamp = ReviewPaidStamp(_write_paid)
+    with bind_api_review_paid_stamp(stamp):
+        with pytest.raises(RuntimeError, match="candidate refused"):
+            ua.execute_physical_attempt(
+                request, lambda: None,
+                before_dispatch=lambda _reservation: (_ for _ in ()).throw(RuntimeError("candidate refused")),
+            )
+    assert writes == [] and stamp.fired is False
+
+    with bind_api_review_paid_stamp(stamp):
+        with pytest.raises(RuntimeError, match="wire failed"):
+            ua.execute_physical_attempt(
+                request, lambda: (_ for _ in ()).throw(RuntimeError("wire failed")),
+            )
+    assert writes == ["paid"] and stamp.fired is True
+
+    async_stamp = ReviewPaidStamp(lambda: writes.append("async"))
+
+    async def _send():
+        assert async_stamp.fired is True
+        return {"usage": {"prompt_tokens": 0, "completion_tokens": 0}}
+
+    async def _run():
+        with bind_api_review_paid_stamp(async_stamp):
+            return await ua.execute_physical_attempt_async(request, _send)
+
+    assert asyncio.run(_run())["usage"]["prompt_tokens"] == 0
+    assert writes == ["paid", "async"]

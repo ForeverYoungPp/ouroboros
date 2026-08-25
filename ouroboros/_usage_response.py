@@ -27,6 +27,14 @@ def _number(value: Any) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
+def _reported_token_count(usage: Dict[str, Any], *keys: str) -> Optional[int]:
+    """Return the first reported count; absence stays distinct from explicit zero."""
+    for key in keys:
+        if key in usage and usage.get(key) is not None:
+            return max(0, int(usage[key]))
+    return None
+
+
 def usage_from_response(response: Any) -> Tuple[Dict[str, Any], Optional[float], bool]:
     """Extract common usage/cost facts without retaining response text."""
     payload: Any = _plain(response)
@@ -39,32 +47,33 @@ def usage_from_response(response: Any) -> Tuple[Dict[str, Any], Optional[float],
     usage = _plain(usage)
     if not isinstance(usage, dict):
         usage = {}
-    cache_read = int(usage.get("cache_read_input_tokens") or usage.get("cached_tokens")
-                     or usage.get("precached_prompt_tokens") or 0)
-    cache_write = int(usage.get("cache_creation_input_tokens")
-                      or usage.get("cache_write_tokens") or 0)
-    prompt_value = usage.get("prompt_tokens")
-    if prompt_value is None and any(
-        key in usage for key in ("cache_read_input_tokens", "cache_creation_input_tokens")
+    native_cache_read = _reported_token_count(usage, "cache_read_input_tokens")
+    native_cache_write = _reported_token_count(usage, "cache_creation_input_tokens")
+    cache_read = _reported_token_count(
+        usage, "cache_read_input_tokens", "cached_tokens", "precached_prompt_tokens",
+    )
+    cache_write = _reported_token_count(
+        usage, "cache_creation_input_tokens", "cache_write_tokens",
+    )
+    input_tokens = _reported_token_count(usage, "input_tokens")
+    prompt = _reported_token_count(usage, "prompt_tokens")
+    if prompt is None and any(
+        value is not None for value in (input_tokens, native_cache_read, native_cache_write)
     ):
         # Anthropic native input_tokens excludes cache reads and writes.
-        prompt = int(usage.get("input_tokens") or 0) + cache_read + cache_write
-    else:
-        prompt = int(prompt_value or usage.get("input_tokens") or 0)
+        prompt = int(input_tokens or 0) + int(native_cache_read or 0) + int(native_cache_write or 0)
     details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
     if isinstance(details, dict):
-        cache_read = int(details.get("cached_tokens") or cache_read)
-        cache_write = int(
-            cache_write
-            or details.get("cache_write_tokens")
-            or details.get("cache_creation_tokens")
-            or details.get("cache_creation_input_tokens")
-            or 0
+        detail_read = _reported_token_count(details, "cached_tokens")
+        cache_read = detail_read if detail_read is not None else cache_read
+        detail_write = _reported_token_count(
+            details, "cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens",
         )
+        cache_write = detail_write if detail_write is not None else cache_write
     normalized = {
         **usage,
         "prompt_tokens": prompt,
-        "completion_tokens": int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),
+        "completion_tokens": _reported_token_count(usage, "completion_tokens", "output_tokens"),
         "cached_tokens": cache_read,
         "cache_write_tokens": cache_write,
     }
@@ -78,9 +87,20 @@ def usage_from_response(response: Any) -> Tuple[Dict[str, Any], Optional[float],
         }
         if split:
             normalized["cache_write_tokens_by_ttl"] = split
-    completion = int(normalized["completion_tokens"])
-    if (isinstance(payload, dict) and isinstance(payload.get("error"), dict)
-            and prompt == 0 and completion == 0):
+    completion = normalized["completion_tokens"]
+    cache_usage_reported = bool(
+        (cache_read or 0)
+        or (cache_write or 0)
+        or any((normalized.get("cache_write_tokens_by_ttl") or {}).values())
+    )
+    if (
+        isinstance(payload, dict)
+        and isinstance(payload.get("error"), dict)
+        and not (prompt or 0)
+        and not (completion or 0)
+        and not cache_usage_reported
+    ):
+        normalized.update(prompt_tokens=0, completion_tokens=0, cached_tokens=0, cache_write_tokens=0)
         return normalized, 0.0, True
     candidates = (
         usage.get("cost"), usage.get("total_cost"),

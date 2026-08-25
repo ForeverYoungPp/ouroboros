@@ -86,6 +86,20 @@ def route_spec_dict(route: RouteSpec, *, api_kind: str, pin_key: str) -> dict[st
     return payload
 
 
+def compound_session_effort(route: RouteSpec) -> str:
+    """Effort already encoded in a Cursor/Agy compound model slug, if any."""
+    if not route.is_session:
+        return ""
+    harness, separator, model = route.target_id.partition("=")
+    if not separator or harness not in {"cursor", "agy"}:
+        return ""
+    from ouroboros.config import EFFORT_SCALE
+
+    compound_model = model[:-5] if model.lower().endswith("-fast") else model
+    encoded = compound_model.rsplit("-", 1)[-1].lower()
+    return encoded if encoded in EFFORT_SCALE else ""
+
+
 def validate_compound_session_effort(
     route: RouteSpec,
     effort: str,
@@ -94,22 +108,17 @@ def validate_compound_session_effort(
     where: str,
 ) -> None:
     """Reject two contradictory effort authorities on Cursor/Agy routes."""
-    if not route.is_session or not effort:
+    if not effort:
         return
-    harness, separator, model = route.target_id.partition("=")
-    if not separator or harness not in {"cursor", "agy"}:
-        return
-    from ouroboros.config import EFFORT_SCALE
-
-    compound_model = model[:-5] if model.lower().endswith("-fast") else model
-    encoded = compound_model.rsplit("-", 1)[-1].lower()
-    if encoded in EFFORT_SCALE and encoded != effort:
+    encoded = compound_session_effort(route)
+    if encoded and encoded != effort:
         raise ValueError(
             f"{setting}: {where} effort {effort!r} conflicts with compound route effort {encoded!r}"
         )
 
 
 __all__ = [
+    "compound_session_effort",
     "ROUTE_KIND_AGENT_SESSION",
     "ROUTE_KIND_API_MODEL",
     "RouteSpec",

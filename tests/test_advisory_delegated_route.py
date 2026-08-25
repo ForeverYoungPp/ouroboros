@@ -95,6 +95,30 @@ def test_delegated_route_runs_without_the_key(tmp_path, monkeypatch, fake_route)
     assert start["access"] == "readonly"
 
 
+def test_structured_session_without_effort_preserves_the_route_default(
+    tmp_path, monkeypatch, fake_route,
+):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", json.dumps({
+        "triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "openai/x"}}],
+        "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "openai/y"}}],
+        "advisory": {
+            "enabled": True,
+            "route": {"kind": "agent_session", "target_id": "fake-review=fake-small"},
+        },
+    }))
+    fake_route.detail = _terminal_detail(_ADVISORY_ITEMS)
+    ctx = _ctx(tmp_path)
+
+    items, raw, _model, _chars = advisory._run_claude_advisory(
+        ctx.repo_dir, "msg", ctx,
+        options={"include_repo_diff": False},
+    )
+    assert not raw.startswith("⚠️ ADVISORY_ERROR")
+    assert [item["item"] for item in items] == ["correctness"]
+    assert "effort" not in fake_route.instances[0].start_requests[0]
+
+
 def test_unknown_route_token_is_a_loud_error_not_a_transport_pick(tmp_path, monkeypatch):
     monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "codex")
     ctx = _ctx(tmp_path)
@@ -262,6 +286,26 @@ def test_session_slot_with_shared_route_reports_the_gate_available(monkeypatch):
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claude")
     assert advisory.advisory_gate_unavailability_reason() is None
     assert advisory.advisory_gate_unavailable() is False
+
+
+def test_structured_empty_session_slot_never_uses_the_shared_route(monkeypatch):
+    """A saved structured row names its own exact session route or refuses.
+
+    The shared route remains the legacy environment fallback covered above;
+    it must not silently replace an incomplete structured owner setting.
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, raising=False)
+    _clear_session_route_envs(monkeypatch)
+    monkeypatch.setenv("OUROBOROS_REVIEW_SESSION_ROUTE", "codex=gpt-5.6-sol:high")
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", json.dumps({
+        "triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "openai/x"}}],
+        "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "openai/y"}}],
+        "advisory": {"enabled": True,
+                     "route": {"kind": "agent_session", "target_id": ""}},
+    }))
+    with pytest.raises(ValueError, match="needs a non-empty target_id"):
+        advisory.advisory_gate_unavailability_reason()
 
 
 def test_session_slot_with_its_own_target_reports_the_gate_available(monkeypatch):

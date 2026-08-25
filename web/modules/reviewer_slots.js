@@ -105,7 +105,8 @@ export function buildReviewerSlotsSetting(state) {
         enabled: advisory.enabled !== false,
         route: { kind: advisory.route?.kind === ROUTE_KIND_SESSION ? ROUTE_KIND_SESSION : 'api',
                  target_id: String(advisory.route?.target_id || '') },
-        effort: advisory.effort || 'low',
+        effort: advisory.route?.kind === ROUTE_KIND_SESSION
+            ? String(advisory.effort || '') : (advisory.effort || 'low'),
     };
     if (advisoryOut.route.kind === ROUTE_KIND_SESSION && advisory.route?.profile_id) {
         advisoryOut.route.profile_id = String(advisory.route.profile_id);
@@ -315,9 +316,9 @@ export function renderReviewerSlotsSection() {
             </div>
             <div class="settings-inline-note">
                 Rows routed to a subscription never fall back to API spend: if every eligible window
-                is exhausted, the review waits for capacity. Task acceptance and skill review are
-                API-only surfaces today and keep running on the shipped default models; plan review
-                follows each triad row's own delivery.
+                is exhausted, the review waits for capacity. Commit, plan, scope, advisory, and skill
+                review follow their configured rows. Task acceptance remains API-only: it uses
+                configured API rows, or the shipped defaults when none remain.
             </div>
             <div id="reviewer-slots-error" class="ui-status" data-tone="error" hidden></div>
             <div id="reviewer-slots-pins" class="settings-inline-status" data-tone="warn" hidden></div>
@@ -440,7 +441,11 @@ function advisoryHtml() {
                     ? selectHtml('data-advisory-model aria-label="Advisory harness model"', [{ label: '', options: modelOptions }], split.model)
                     : `<input data-advisory-api-model placeholder="Claude model — empty = default" value="${escapeHtml(advisory.route?.target_id || '')}" spellcheck="false" aria-label="Advisory Claude model">`}
                 ${session && profileOptions.length > 1 ? selectHtml('data-advisory-profile aria-label="Advisory credential account"', [{ label: '', options: profileOptions }], advisory.route?.profile_id || '') : ''}
-                ${effortSelectHtml('data-advisory-effort aria-label="Advisory effort"', advisory.effort === 'low' ? '' : advisory.effort, 'low')}
+                ${effortSelectHtml(
+                    'data-advisory-effort aria-label="Advisory effort"',
+                    session ? advisory.effort : (advisory.effort === 'low' ? '' : advisory.effort),
+                    session ? 'route default' : 'low',
+                )}
             </div>
             <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
         </div>
@@ -579,7 +584,9 @@ function bindRowEvents() {
             state.onChange();
         });
         advisoryEl.querySelector('[data-advisory-effort]')?.addEventListener('change', (event) => {
-            state.advisory.effort = String(event.target.value || '') || 'low';
+            const selected = String(event.target.value || '');
+            state.advisory.effort = selected
+                || (state.advisory.route?.kind === ROUTE_KIND_SESSION ? '' : 'low');
             state.onChange();
         });
     }

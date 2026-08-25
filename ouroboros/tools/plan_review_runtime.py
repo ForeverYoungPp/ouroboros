@@ -201,18 +201,19 @@ def plan_review_slots() -> list:
     Both kinds ride: an ``api_chat`` row is one in-process call over the lean
     packet; an ``agent_session`` row is a delegated retrieving reviewer
     (``session_target``/``session_profile`` carried per row). Effort is the row's
-    own when configured, else ``PLAN_REVIEW_EFFORT``. Slot ids are the rows' own
-    (structured: owner-assigned; legacy: ``slot_N`` from the one mint).
+    explicit value, else a compound Cursor/Agy route's encoded value, else
+    ``PLAN_REVIEW_EFFORT``. Slot ids are the rows' own (structured:
+    owner-assigned; legacy: ``slot_N`` from the one mint).
     """
     from ouroboros.review_execution import ReviewRouteKind
     from ouroboros.review_substrate import ReviewSlot
-    from ouroboros.reviewer_slot_config import load_reviewer_slot_config
+    from ouroboros.reviewer_slot_config import load_reviewer_slot_config, row_effort
 
     return [
         ReviewSlot(
             slot_id=row.slot_id,
             model=row.target_id,
-            effort=row.effort or PLAN_REVIEW_EFFORT,
+            effort=row_effort(row, "review", default=PLAN_REVIEW_EFFORT),
             timeout_sec=PLAN_REVIEW_SLOT_TIMEOUT_SEC,
             max_tokens=PLAN_REVIEW_MAX_TOKENS,
             temperature=0.2,
