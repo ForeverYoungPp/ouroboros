@@ -1292,7 +1292,13 @@ class ReviewCoordinator:
         )
         executor = _review_route_executor(assignment, llm=self.llm)
         executor._logical_deadline_monotonic = logical_deadline_monotonic
-        executor.restore_custody(retry_state or {})
+        # The physical session and the logical waiter must share this exact
+        # mutable cell.  A fresh cell is normally empty, so ``state or {}``
+        # would silently replace it and hide a just-started invocation from a
+        # timeout actor.
+        executor.restore_custody(
+            retry_state if retry_state is not None else {}
+        )
         executor.set_pending_invocation_checkpoint(pending_invocation_checkpoint)
         prompt_projection = executor.prompt_payload()
         prompt_ref: Dict[str, Any] = {}

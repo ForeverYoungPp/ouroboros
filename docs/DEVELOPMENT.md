@@ -1771,6 +1771,10 @@ Before every commit, verify the following:
   reconciliation freezes its originally dispatched rows and `$0` skip rows instead
   of re-running live health/fit admission; reviewer-requested evidence advances
   the next envelope only after every actor in the current cycle is terminal.
+  Skill Review keys additionally bind the exact skill, lifecycle wave, content,
+  panel/rebuttal contract, and frozen chunk digest/index so concurrent waves or
+  oversized chunks cannot join one another; they remain process-local custody,
+  not a promise of restart recovery without a durable invocation token.
 - [ ] Commit review writes and rereads `paid=True`, the exact nonempty retry
   key, and both complete slot rosters with reserved operation ids in one locked
   write before either parallel surface starts. A delegated row must add its

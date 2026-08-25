@@ -195,6 +195,101 @@ def test_logical_timeout_actor_carries_live_delegated_restart_token(tmp_path):
     assert joined.usage["delegated_run_id"] == "run-live"
 
 
+def test_coordinator_keeps_fresh_empty_session_custody_cell_shared(
+    tmp_path, monkeypatch,
+):
+    """The public coordinator adapter must not replace an empty custody dict."""
+    import threading
+    from types import SimpleNamespace
+
+    from ouroboros.review_execution import ReviewAttemptResult, ReviewRouteKind
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+
+    release = threading.Event()
+    settled = threading.Event()
+    checkpoints = []
+
+    class BlockingSessionExecutor:
+        def __init__(self):
+            self.state = None
+            self.checkpoint = None
+            self.execute_calls = 0
+
+        def restore_custody(self, state):
+            self.state = state
+
+        def set_pending_invocation_checkpoint(self, checkpoint):
+            self.checkpoint = checkpoint
+
+        def prompt_payload(self):
+            return {"session_prompt": "review"}
+
+        def prompt_chars(self):
+            return 6
+
+        def execute(self):
+            self.execute_calls += 1
+            self.state["pending_invocation_id"] = "inv-shared"
+            self.state["delegated_run_id"] = "run-shared"
+            if self.checkpoint is not None:
+                self.checkpoint("inv-shared")
+            release.wait(1.0)
+            settled.set()
+            return ReviewAttemptResult(
+                message={"content": "[]"}, usage={}, raw_text="[]",
+            )
+
+        def failure_custody(self):
+            return dict(self.state or {})
+
+    executor = BlockingSessionExecutor()
+    monkeypatch.setattr(
+        "ouroboros.review_substrate._review_route_executor",
+        lambda *_args, **_kwargs: executor,
+    )
+    ctx = SimpleNamespace(
+        _review_pending_invocation_checkpoint=lambda **facts: checkpoints.append(facts),
+    )
+    request = ReviewRequest(
+        surface="multi_model_review",
+        goal="review",
+        task_id="shared-empty-cell",
+        retry_key="commit_review:shared-empty-cell",
+        session_root=str(tmp_path),
+        session_task="review this tree",
+    )
+    slot = ReviewSlot(
+        slot_id="session-slot",
+        model="cursor/test",
+        route=ReviewRouteKind.AGENT_SESSION,
+        timeout_sec=0.2,
+    )
+
+    try:
+        actor = run_review_request(
+            request, slots=[slot], drive_root=tmp_path, usage_ctx=ctx,
+        ).actors[0]
+        assert actor["operation_state"] == "in_flight"
+        assert actor["usage"]["pending_invocation_id"] == "inv-shared"
+        assert actor["usage"]["delegated_run_id"] == "run-shared"
+        assert checkpoints == [{
+            "surface": "multi_model_review",
+            "slot_id": "session-slot",
+            "operation_id": actor["operation_id"],
+            "invocation_id": "inv-shared",
+        }]
+        joined = run_review_request(
+            request, slots=[slot], drive_root=tmp_path, usage_ctx=ctx,
+        ).actors[0]
+        assert executor.execute_calls == 1
+        assert joined["operation_id"] == actor["operation_id"]
+        assert joined["usage"]["pending_invocation_id"] == "inv-shared"
+        assert joined["usage"]["delegated_run_id"] == "run-shared"
+    finally:
+        release.set()
+        assert settled.wait(1.0)
+
+
 def test_durable_triad_and_scope_rows_carry_delegated_restart_identity():
     from ouroboros.tools.review import _parse_model_response
     from ouroboros.tools.review_helpers import build_scope_actor_record
