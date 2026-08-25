@@ -11,6 +11,7 @@ import subprocess
 import time
 from typing import Any, Dict, Tuple
 
+from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_SALVAGE
 from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
 from ouroboros.utils import (
     append_jsonl,
@@ -134,7 +135,7 @@ def _automatic_predecessor_authority_projection(
     """Bound only unreviewed host salvage injected automatically at startup."""
 
     authority = task_result_authority_projection(row, drive_root=drive_root)
-    if str(row.get("terminal_origin") or "") != "host_salvage":
+    if str(row.get("terminal_origin") or "") != TERMINAL_ORIGIN_HOST_SALVAGE:
         return authority
     full_result = authority.get("result")
     if not isinstance(full_result, str):

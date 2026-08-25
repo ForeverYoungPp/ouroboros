@@ -41,6 +41,10 @@ _SEALED_FINAL_TEXT_PROMPT_CHARS = 4000
 # never be inferred from result text or lifecycle status.
 TERMINAL_ORIGIN_MODEL_FINAL = "model_final"
 TERMINAL_ORIGIN_HOST_SALVAGE = "host_salvage"
+TERMINAL_PLAN_REVIEW_NOTE = (
+    "Plan review was still open when the outage forced finalization; "
+    "its details remain in the task."
+)
 
 
 def send_provider_death_notice(
@@ -49,11 +53,15 @@ def send_provider_death_notice(
     """Send the secondary incident, unless the primary is already the receipt."""
     if str(final_result.get("terminal_origin") or "") == TERMINAL_ORIGIN_HOST_SALVAGE:
         return False
+    plan_note = (
+        f"\n\n{TERMINAL_PLAN_REVIEW_NOTE}"
+        if final_result.get("terminal_plan_review_open") is True else ""
+    )
     ctx.send_with_budget(
         chat_id,
         f"🔌 Task {task_id} was stopped by a model-provider outage and was "
         "NOT completed. Partial work and workspace files are preserved; "
-        "re-run the task once the provider recovers.",
+        f"re-run the task once the provider recovers.{plan_note}",
         role="system",
         system_type="terminal_incident",
     )
@@ -91,15 +99,17 @@ def prepare_terminal_send_event(
     )
 
 
-def terminal_result_fields(usage: Dict[str, Any]) -> Dict[str, str]:
+def terminal_result_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
     """Additive durable origin/full-copy fields; unknown producers stay legacy."""
-    fields: Dict[str, str] = {}
+    fields: Dict[str, Any] = {}
     origin = str(usage.get("terminal_origin") or "")
     if origin in {TERMINAL_ORIGIN_MODEL_FINAL, TERMINAL_ORIGIN_HOST_SALVAGE}:
         fields["terminal_origin"] = origin
     path = str(usage.get("terminal_salvage_path") or "")
     if path:
         fields["terminal_salvage_path"] = path
+    if usage.get("terminal_plan_review_open") is True:
+        fields["terminal_plan_review_open"] = True
     return fields
 
 

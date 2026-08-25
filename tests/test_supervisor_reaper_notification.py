@@ -222,14 +222,19 @@ def test_provider_incident_is_system_unkeyed_and_host_salvage_suppresses_duplica
 
     events_mod._maybe_notify_provider_death(
         ctx, "root-origin", {"chat_id": 7},
-        {"terminal_origin": "model_final"}, event,
+        {
+            "terminal_origin": "model_final",
+            "terminal_plan_review_open": True,
+        }, event,
     )
     assert len(sent) == 1
     _chat, text, kwargs = sent[0]
     assert text == (
         "🔌 Task root-origin was stopped by a model-provider outage and was "
         "NOT completed. Partial work and workspace files are preserved; "
-        "re-run the task once the provider recovers."
+        "re-run the task once the provider recovers.\n\n"
+        "Plan review was still open when the outage forced finalization; "
+        "its details remain in the task."
     )
     assert kwargs == {"role": "system", "system_type": "terminal_incident"}
     assert "task_id" not in kwargs

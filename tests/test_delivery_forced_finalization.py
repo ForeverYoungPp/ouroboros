@@ -558,6 +558,7 @@ def test_provider_unavailable_keeps_current_model_candidate_byte_exact(
 
     assert text == answer
     assert usage["terminal_origin"] == "model_final"
+    assert usage["terminal_plan_review_open"] is True
     assert "HOST FACT" not in text
     assert returned_trace["forced_finalization"]["source"] == "retained_candidate"
 
@@ -597,7 +598,81 @@ def test_provider_unavailable_forced_model_answer_excludes_host_suffix(
 
     assert text == "Fresh forced model answer."
     assert usage["terminal_origin"] == "model_final"
+    assert usage["terminal_plan_review_open"] is True
     assert returned_trace["forced_finalization"]["source"] == "model"
+
+
+def test_provider_unavailable_classifies_forced_response_shape(tmp_path):
+    missing = object()
+    cases = (
+        ("stop", "stop", [], "model_final"),
+        ("end-turn", "end_turn", [], "model_final"),
+        ("refusal", "refusal", [], "model_final"),
+        ("absent", missing, [], "model_final"),
+        ("null", None, [], "host_salvage"),
+        ("length", "length", [], "host_salvage"),
+        ("max-tokens", "max_tokens", [], "host_salvage"),
+        ("context", "context_length_exceeded", [], "host_salvage"),
+        ("function-call", "function_call", [], "host_salvage"),
+        (
+            "tool-call",
+            "stop",
+            [{"id": "call-1", "type": "function", "function": {"name": "noop", "arguments": "{}"}}],
+            "host_salvage",
+        ),
+    )
+
+    for label, finish_reason, tool_calls, expected_origin in cases:
+        root = tmp_path / label
+        (root / "logs").mkdir(parents=True)
+        loop, _registry, limit_ctx, _trace = _forced_test_context(root)
+        expected_text = f"forced response {label}"
+
+        class ForcedResponseLLM:
+            def chat(self, **_kwargs):
+                response_usage = {"provider": "fake", "resolved_model": "fake/model"}
+                if finish_reason is not missing:
+                    response_usage["response_finish_reason"] = finish_reason
+                return {
+                    "content": expected_text,
+                    "tool_calls": tool_calls,
+                }, response_usage
+
+        limit_ctx.llm = ForcedResponseLLM()
+        text, usage, returned_trace = loop._handle_provider_unavailable(limit_ctx)
+
+        assert text == expected_text, label
+        assert usage["terminal_origin"] == expected_origin, label
+        expected_source = (
+            "model" if expected_origin == "model_final" else "forced_model_incomplete"
+        )
+        assert returned_trace["forced_finalization"]["source"] == expected_source, label
+
+
+def test_provider_unavailable_prefers_current_candidate_over_incomplete_forced_response(
+    tmp_path,
+):
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    answer = "Complete current model answer."
+    loop._replace_delivery_candidate(registry, limit_ctx, trace, answer, control="replace")
+
+    class LengthStoppedLLM:
+        def chat(self, **_kwargs):
+            return (
+                {"content": "partial replacement"},
+                {
+                    "provider": "fake",
+                    "resolved_model": "fake/model",
+                    "response_finish_reason": "length",
+                },
+            )
+
+    limit_ctx.llm = LengthStoppedLLM()
+    text, usage, returned_trace = loop._handle_provider_unavailable(limit_ctx)
+
+    assert text == answer
+    assert usage["terminal_origin"] == "model_final"
+    assert returned_trace["forced_finalization"]["source"] == "retained_candidate"
 
 
 def test_provider_unavailable_without_model_answer_stamps_host_salvage(

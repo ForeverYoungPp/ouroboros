@@ -934,6 +934,32 @@ def _clear_custom_receipts(accumulated_usage: Dict[str, Any]) -> None:
     accumulated_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, None)
 
 
+def _replace_response_meta(
+    target: Optional[Dict[str, Any]],
+    usage: Optional[Dict[str, Any]] = None,
+    msg: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Replace one caller-owned, attempt-local response fact projection."""
+    if target is None:
+        return
+    target.clear()
+    if usage is None or msg is None:
+        return
+    if "response_finish_reason" in usage:
+        finish_present, finish_reason = True, usage.get("response_finish_reason")
+    elif "finish_reason" in msg:
+        finish_present, finish_reason = True, msg.get("finish_reason")
+    elif "stop_reason" in msg:
+        finish_present, finish_reason = True, msg.get("stop_reason")
+    else:
+        finish_present, finish_reason = False, None
+    target.update({
+        "finish_reason_present": finish_present,
+        "finish_reason": finish_reason,
+        "tool_call_count": len(msg.get("tool_calls") or []),
+    })
+
+
 def call_llm_with_retry(
     llm: LLMClient,
     messages: List[Dict[str, Any]],
@@ -953,13 +979,11 @@ def call_llm_with_retry(
     allow_server_web_search: bool = False,
     physical_context: Optional[PhysicalAttemptContext] = None,
     candidate_predicate: Optional[Callable[[Any], Any]] = None,
+    response_meta_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
-    """Call one model with failure-class retry budgets and usage events.
-
-    ``deadline_ts`` bounds backoff, ``attempt_cap`` caps fallback candidates,
-    and cross-model fallback remains the caller's responsibility.
-    """
+    """Call one model with bounded retries; cross-model fallback stays caller-owned."""
     msg = None
+    _replace_response_meta(response_meta_out)
     drive_root = pathlib.Path(drive_logs).parent
     execution_id = str(accumulated_usage.setdefault("execution_id", new_execution_id()))
     round_id = f"{execution_id}:round:{round_idx}"
@@ -1108,6 +1132,7 @@ def call_llm_with_retry(
 
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
+            _replace_response_meta(response_meta_out, usage, msg)
             if not tool_calls and (not content or not content.strip()):
                 event_type, is_provider_glitch, permanent_body_error = _record_and_emit_empty_response(
                     usage=usage, msg=msg, accumulated_usage=accumulated_usage, event_queue=event_queue,

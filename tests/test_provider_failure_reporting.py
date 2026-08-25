@@ -23,6 +23,35 @@ class _SuccessfulLLM:
         return {"content": "ok"}, {"provider": "anthropic", "resolved_model": "anthropic/claude-sonnet-4-6"}
 
 
+class _LengthStoppedLLM:
+    def chat(self, **kwargs):
+        return (
+            {"content": "partial response", "tool_calls": []},
+            {
+                "provider": "fake",
+                "resolved_model": "fake/model",
+                "response_finish_reason": "length",
+            },
+        )
+
+
+class _RetryThenStopLLM:
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return (
+                {"content": "", "tool_calls": []},
+                {"response_finish_reason": None},
+            )
+        return (
+            {"content": "complete", "tool_calls": []},
+            {"response_finish_reason": "stop"},
+        )
+
+
 class _ProviderError(Exception):
     def __init__(self, message, *, status_code=None, code=None):
         super().__init__(message)
@@ -55,6 +84,55 @@ def test_call_llm_with_retry_records_last_error(tmp_path):
     assert "invalid_api_key" in usage["_last_llm_error"]
     assert usage["_last_llm_error_kind"] == "auth_error"
     assert usage["_last_llm_retry_same_request"] is False
+
+
+def test_call_llm_with_retry_exposes_attempt_local_response_metadata(tmp_path):
+    usage = {}
+    response_meta = {"stale": True}
+
+    msg, _cost = call_llm_with_retry(
+        _LengthStoppedLLM(),
+        [{"role": "user", "content": "hi"}],
+        "fake/model",
+        None,
+        "medium",
+        1,
+        tmp_path,
+        "task-response-meta",
+        1,
+        None,
+        usage,
+        "task",
+        False,
+        response_meta_out=response_meta,
+    )
+
+    assert msg == {"content": "partial response", "tool_calls": []}
+    assert response_meta == {
+        "finish_reason_present": True,
+        "finish_reason": "length",
+        "tool_call_count": 0,
+    }
+
+
+def test_response_metadata_tracks_the_returned_retry_attempt(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.loop_llm_call.time.sleep", lambda _seconds: None)
+    response_meta = {}
+    llm = _RetryThenStopLLM()
+
+    msg, _cost = call_llm_with_retry(
+        llm, [{"role": "user", "content": "hi"}], "fake/model", None,
+        "medium", 2, tmp_path, "task-response-retry", 1, None, {},
+        "task", False, response_meta_out=response_meta,
+    )
+
+    assert llm.calls == 2
+    assert msg == {"content": "complete", "tool_calls": []}
+    assert response_meta == {
+        "finish_reason_present": True,
+        "finish_reason": "stop",
+        "tool_call_count": 0,
+    }
 
 
 class _OverflowStoppedLLM:

@@ -1,7 +1,32 @@
 from __future__ import annotations
 
 import pathlib
+import queue
 from types import SimpleNamespace
+
+
+def test_progress_thought_keeps_full_content_and_existing_authorship():
+    from ouroboros.agent import OuroborosAgent
+
+    events = queue.Queue()
+    agent = SimpleNamespace(
+        _last_progress_ts=None,
+        _event_queue=events,
+        _current_chat_id=7,
+        _current_task_id="thought-task",
+        tools=SimpleNamespace(_ctx=SimpleNamespace(is_ephemeral_turn=False)),
+        _subagent_progress_meta=lambda _event: {},
+    )
+    thought = "long visible reasoning\n" + ("x" * 20_000)
+
+    OuroborosAgent._emit_progress(agent, thought)
+
+    event = events.get_nowait()
+    assert event["text"] == f"💬 {thought}"
+    assert event["is_progress"] is True
+    assert event["task_id"] == "thought-task"
+    assert "role" not in event
+    assert "system_type" not in event
 
 
 def test_normal_model_response_stamps_model_final_origin():
@@ -13,6 +38,18 @@ def test_normal_model_response_stamps_model_final_origin():
     )
     assert text == "A complete answer"
     assert returned_usage["terminal_origin"] == "model_final"
+
+
+def test_terminal_result_fields_carry_open_plan_review_for_model_final():
+    from ouroboros.task_finalization import terminal_result_fields
+
+    assert terminal_result_fields({
+        "terminal_origin": "model_final",
+        "terminal_plan_review_open": True,
+    }) == {
+        "terminal_origin": "model_final",
+        "terminal_plan_review_open": True,
+    }
 
 
 def test_terminal_projection_preserves_model_and_legacy_but_receipts_host_salvage(tmp_path):
