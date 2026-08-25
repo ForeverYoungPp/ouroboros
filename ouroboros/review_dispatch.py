@@ -95,6 +95,7 @@ def task_acceptance_preclaim_refusal(ctx: Any) -> Any:
     projection = project_task_acceptance_review_capacity(
         ctx.tools._ctx,
         binding_hash=str((ctx.review_binding or {}).get("binding_hash") or ""),
+        task_id=str(ctx.task_id or ""),
     )
     if projection.get("state") == "available" and not projection.get("binding_seen"):
         return None

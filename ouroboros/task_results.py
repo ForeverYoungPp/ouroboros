@@ -114,7 +114,7 @@ def _root_task_acceptance_review_cap(
 
 
 def project_task_acceptance_review_capacity(
-    ctx: Any, *, binding_hash: str = "",
+    ctx: Any, *, binding_hash: str = "", task_id: str = "",
 ) -> Dict[str, Any]:
     """Read the canonical root's paid acceptance-wallet projection.
 
@@ -127,7 +127,7 @@ def project_task_acceptance_review_capacity(
 
     metadata = getattr(ctx, "task_metadata", {})
     metadata = metadata if isinstance(metadata, dict) else {}
-    task_id = str(getattr(ctx, "task_id", "") or "")
+    task_id = str(task_id or getattr(ctx, "task_id", "") or "")
     lineage = resolve_task_lineage(
         task_id,
         metadata=metadata,
