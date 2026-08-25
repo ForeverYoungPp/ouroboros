@@ -146,6 +146,28 @@ def test_caption_call_records_observability(monkeypatch, tmp_path):
     assert [event.get("phase") for event in operation_rows] == ["started", "finished"]
 
 
+def test_expired_caption_window_does_not_dispatch_model(monkeypatch):
+    import time
+    from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
+
+    class FakeLLM:
+        def vision_query(self, *args, **kwargs):
+            raise AssertionError("expired owner window must not dispatch a caption")
+
+    monkeypatch.setenv("OUROBOROS_IMAGE_INPUT_MODE", "caption")
+    monkeypatch.setenv("OUROBOROS_MODEL_VISION", "google/gemini-3.5-flash")
+    messages = _image_message()
+    messages[0]["content"][1].pop("_caption")
+    out = prepare_messages_for_send(
+        messages,
+        routing=VisionRoutingContext(
+            "not/vision", FakeLLM(), {}, deadline_ts=time.time() - 10,
+        ),
+    )
+
+    assert "caption unavailable" in out[0]["content"][1]["text"]
+
+
 def test_caption_persistence_failure_emits_one_failed_terminal(monkeypatch, tmp_path):
     import queue
     from ouroboros import vision_routing

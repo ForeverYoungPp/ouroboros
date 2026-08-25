@@ -599,6 +599,22 @@ def test_oversized_transcript_is_typed_extraction_incomplete_never_clean(tmp_pat
     assert llm.calls == []
 
 
+def test_spent_owner_deadline_skips_light_model_extraction():
+    from ouroboros.review_execution import _extract_verdict_via_light_model
+
+    class NeverCalled:
+        def chat(self, **_kwargs):
+            raise AssertionError("spent deadline must not dispatch extraction")
+
+    canonical, usage = _extract_verdict_via_light_model(
+        "narrative", llm=NeverCalled(), deadline_at="2000-01-01T00:00:00Z",
+    )
+
+    assert canonical is None
+    assert usage["reason_code"] == "deadline_exhausted"
+    assert usage["dispatch"] == "not_dispatched"
+
+
 # ---------------------------------------------------------------------------
 # Delivery mechanics
 # ---------------------------------------------------------------------------

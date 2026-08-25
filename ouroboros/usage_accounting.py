@@ -98,7 +98,6 @@ _LAST_PHYSICAL_ATTEMPT: contextvars.ContextVar[Optional["PhysicalAttemptCapture"
 _ROOT_ACCOUNTING_TELEMETRY: Dict[str, Dict[str, Any]] = {}
 _ROOT_ACCOUNTING_TELEMETRY_LOCK = threading.Lock()
 _ROOT_ACCOUNTING_TELEMETRY_CAP = 64
-
 def _stash_root_accounting(
     root_task_id: str,
     accounted_usd: Optional[float],
@@ -160,7 +159,6 @@ def refresh_root_accounting(
         log.debug("root accounting refresh failed for %s", root_task_id, exc_info=True)
         return cached
 
-
 class BudgetExceeded(UsageAccountingError):
     """Raised before dispatch when a known budget would be exceeded."""
 
@@ -213,7 +211,6 @@ class PhysicalAttemptContext:
     capacity_total_tokens: Optional[int]
     context_target_miss: bool
     automatic_pass_used: bool
-
 @dataclass(frozen=True)
 class AttemptRequest:
     model: str
@@ -908,6 +905,9 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
         current = _final_rows(records).get(reservation.attempt_id)
         if current is None:
             raise UsageAccountingError(f"unknown usage attempt {reservation.attempt_id}")
+        allow_release = bool(fields.pop("_allow_dispatched_release", False))
+        if state == "released" and current.get("state") == "dispatched" and not allow_release:
+            raise UsageAccountingError("dispatched attempts require a typed pre-dispatch release")
         row = {
             "kind": "attempt",
             "attempt_id": reservation.attempt_id,

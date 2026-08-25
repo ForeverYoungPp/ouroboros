@@ -721,6 +721,10 @@ def _reconcile_and_clear_review_roster(ctx: ToolContext) -> None:
         ctx._review_pending_invocation_checkpoint = None
         ctx._review_reserved_roster = None
         ctx._review_reserved_operations = {}
+        # This mode belongs only to the exact commit-review reconciliation.
+        # A reused ToolContext may subsequently dispatch another review surface
+        # (notably Skill Review); do not leak the commit-only no-dispatch flag.
+        ctx._review_reconcile_only = False
 
 
 def _review_cycle_infra_failure(

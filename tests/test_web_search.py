@@ -518,6 +518,52 @@ def test_dispatched_web_timeout_never_retries_or_cascades(ctx, patch_env, monkey
     assert calls == {"openai": 1, "fallback": 0}
 
 
+def test_connect_phase_failure_releases_attempt_and_uses_fallback(ctx, patch_env, monkeypatch):
+    import httpx
+
+    calls = {"openai": 0, "fallback": 0}
+
+    class _Responses:
+        def create(self, **_kwargs):
+            calls["openai"] += 1
+            raise httpx.ConnectError("connection refused")
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.responses = _Responses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setattr(
+        search_module,
+        "_web_search_openrouter",
+        lambda *_args, **_kwargs: calls.__setitem__("fallback", calls["fallback"] + 1)
+        or json.dumps({"answer": "fallback", "backend": "openrouter_server_tool"}),
+    )
+
+    result = json.loads(_web_search(ctx, "connect failure"))
+
+    assert result["answer"] == "fallback"
+    assert calls == {"openai": 1, "fallback": 1}
+
+
+def test_spent_owner_deadline_does_not_start_web_search(ctx, patch_env, monkeypatch):
+    calls = []
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            calls.append(_kwargs)
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    ctx.task_metadata = {"deadline_at": "2000-01-01T00:00:00Z"}
+
+    result = json.loads(_web_search(ctx, "expired query"))
+
+    assert result["reason_code"] == "deadline_exhausted"
+    assert calls == []
+
+
 def _captured_provider_error(*, provider="openrouter", status=None):
     from ouroboros.usage_accounting import PhysicalAttemptCapture
 

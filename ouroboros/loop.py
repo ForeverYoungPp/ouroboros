@@ -2403,7 +2403,7 @@ def _run_cross_model_fallback_chain(
     accumulated_usage, task_type, emit_progress, context_fit_plan,
     active_context_mode,
 ) -> tuple:
-    """Try bounded fallbacks; an unknown dispatched outcome stops the chain."""
+    """Try fallbacks; unknown dispatch stops the chain."""
     from ouroboros import fallback_cooldown as _fcd
     from ouroboros.config import get_fallback_models
     from ouroboros.loop_llm_call import _COOLDOWN_ERROR_KINDS as _cooldown_kinds
@@ -2486,13 +2486,12 @@ def _run_cross_model_fallback_chain(
                 accumulated_usage,
             )
             break
-        # Candidate evidence was real for its dispatched attempts, but an
-        # unaccepted route must not become the task's canonical plan/transcript.
+        # Unaccepted fallback evidence must not become canonical.
         tools._ctx.context_fit_plan = context_fit_plan
         tools._ctx.messages = messages
         tools._ctx.active_context_mode = active_context_mode
         _restore_context_fit_usage(accumulated_usage, primary_context_usage)
-        if str(accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown":
+        if str(accumulated_usage.get("_last_llm_error_kind") or "") in ("provider_outcome_unknown", "deadline_exhausted"):
             break
         _cooled(fallback_model, fallback_use_local)
     return (
@@ -6938,8 +6937,7 @@ def run_llm_loop(
             if (
                 msg is None
                 and not bool(getattr(ctx, "exact_model_route", False))
-                and str(accumulated_usage.get("_last_llm_error_kind") or "")
-                != "provider_outcome_unknown"
+                and str(accumulated_usage.get("_last_llm_error_kind") or "") not in ("provider_outcome_unknown", "deadline_exhausted")
             ):
                 (
                     msg,

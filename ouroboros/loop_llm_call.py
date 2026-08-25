@@ -21,7 +21,11 @@ import logging
 from ouroboros import model_concurrency
 from ouroboros.anthropic_native_custody import public_custody_projection
 from ouroboros.config import get_finalization_grace_sec
-from ouroboros.deadline_utils import seconds_until, transport_timeout_with_deadline
+from ouroboros.deadline_utils import (
+    dispatch_window_remaining_sec,
+    seconds_until,
+    transport_timeout_with_deadline,
+)
 from ouroboros.llm import LLMClient, LocalContextTooLargeError, add_usage
 from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
@@ -355,6 +359,32 @@ def _emit_retry_deadline_exhausted(
         "round": round_idx, "attempt": attempt + 1,
         "model": model,
         "error_kind": error_kind,
+    })
+
+
+def _mark_deadline_not_dispatched(
+    accumulated_usage: Dict[str, Any],
+    drive_logs: pathlib.Path,
+    *,
+    task_id: str,
+    model: str,
+    round_idx: int,
+) -> None:
+    """Record a deadline refusal without minting an LLM operation or attempt."""
+    accumulated_usage.update(
+        _last_llm_error_kind="deadline_exhausted",
+        _last_llm_error="owner deadline exhausted before dispatch",
+        _last_llm_retry_same_request=False,
+        execution_status="infra_failed",
+        reason_code="deadline_exhausted",
+    )
+    append_jsonl(drive_logs / "events.jsonl", {
+        "ts": utc_now_iso(),
+        "type": "llm_not_dispatched",
+        "task_id": task_id,
+        "round": round_idx,
+        "model": model,
+        "reason_code": "deadline_exhausted",
     })
 
 
@@ -1019,6 +1049,15 @@ def call_llm_with_retry(
     """Call one model with failure-class retry budgets and usage events."""
     msg = None
     drive_root = pathlib.Path(drive_logs).parent
+    if (
+        deadline_ts is not None
+        and dispatch_window_remaining_sec(deadline_ts=deadline_ts) == 0.0
+    ):
+        _mark_deadline_not_dispatched(
+            accumulated_usage, drive_logs, task_id=task_id, model=model,
+            round_idx=round_idx,
+        )
+        return None, None
     execution_id = str(accumulated_usage.setdefault("execution_id", new_execution_id()))
     round_id = f"{execution_id}:round:{round_idx}"
     context_fit_event_fields = (

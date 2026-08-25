@@ -795,3 +795,22 @@ def test_startup_recovers_start_requested_token_by_reserved_operation(tmp_path, 
         attempt.triad_raw_results[0]["pending_invocation_id"]
         == "inv-start-window"
     )
+
+
+def test_commit_reconciliation_does_not_leak_reconcile_only_to_next_surface():
+    from ouroboros.tools.git import _reconcile_and_clear_review_roster
+
+    ctx = SimpleNamespace(
+        _review_reconcile_only=True,
+        _review_reserved_roster=None,
+        _review_paid_stamp=object(),
+        _review_pending_invocation_checkpoint=object(),
+        _review_reserved_operations={"commit": "op-1"},
+    )
+
+    _reconcile_and_clear_review_roster(ctx)
+
+    assert ctx._review_reconcile_only is False
+    assert ctx._review_paid_stamp is None
+    assert ctx._review_pending_invocation_checkpoint is None
+    assert ctx._review_reserved_operations == {}

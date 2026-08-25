@@ -702,6 +702,22 @@ def test_unknown_pricing_is_not_reported_as_zero(data_root, monkeypatch):
     assert _ledger(data_root)[-1]["cost_final"] is False
 
 
+def test_typed_pre_dispatch_release_closes_dispatched_attempt(data_root, monkeypatch):
+    from ouroboros.transport_custody import release_pre_dispatch_attempt
+
+    monkeypatch.setenv("TOTAL_BUDGET", "10")
+    reservation = ua.reserve_attempt(_request(data_root, reservation_usd=1.0))
+    ua.mark_dispatched(reservation)
+    assert release_pre_dispatch_attempt(reservation, ConnectionError("refused")) is False
+    import httpx
+    assert release_pre_dispatch_attempt(reservation, httpx.ConnectError("refused")) is True
+
+    row = _ledger(data_root)[-1]
+    assert row["state"] == "released"
+    assert row["reason"] == "before_dispatch_failed:ConnectError"
+    assert ua.usage_projection(data_root)["non_final_rows"] == 0
+
+
 def test_legacy_metadata_gap_is_count_only_not_monetary_unknown():
     summary = ua._summary([{
         "kind": "legacy_metadata",

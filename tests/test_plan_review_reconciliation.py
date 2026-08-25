@@ -10,11 +10,15 @@ from tests.test_plan_review_engine import (
     _call,
     _control,
     _finding,
+    harness as _engine_harness,
     _patch_health,
     _state,
 )
 
-pytest_plugins = ("tests.test_plan_review_engine",)
+# Explicitly re-export the fixture. pytest 8.x does not reliably discover a
+# fixture from a test module via ``pytest_plugins`` when the provider is also
+# collected, while pytest 9.x happens to do so.
+harness = _engine_harness  # noqa: F811 - pytest fixture re-export
 
 
 def _install_two_turn_substrate(monkeypatch, calls, *, pending_ids=None, texts=None):

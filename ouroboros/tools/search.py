@@ -79,6 +79,25 @@ def _web_search_transport_timeout(ctx: Any) -> float:
     )
 
 
+def _web_search_deadline_exhausted(ctx: Any) -> bool:
+    from ouroboros.deadline_utils import dispatch_window_remaining_sec
+
+    metadata = getattr(ctx, "task_metadata", {})
+    deadline_at = metadata.get("deadline_at") if isinstance(metadata, dict) else None
+    window = dispatch_window_remaining_sec(
+        deadline_at=deadline_at, deadline_ts=getattr(ctx, "deadline_ts", None),
+    )
+    return window is not None and window <= 0
+
+
+def _web_search_deadline_result() -> str:
+    return json.dumps({
+        "error": "web_search skipped: owner deadline leaves no dispatch window",
+        "reason_code": "deadline_exhausted",
+        "backend": "web_search",
+    }, ensure_ascii=False, indent=2)
+
+
 def _accounting_scope(ctx: ToolContext, source: str) -> UsageScope:
     bound_scope = current_usage_scope()
     if bound_scope is not None:
@@ -476,6 +495,8 @@ def _web_search(
     reasoning_effort: str = "",
     _attempt: int = 0,
 ) -> str:
+    if _web_search_deadline_exhausted(ctx):
+        return _web_search_deadline_result()
     # Backend pin: force ONE backend regardless of which provider keys are present.
     # A fixed-model run pins 'ddgs' so web_search is pure-retrieval (no second LLM
     # contaminating the "single fixed model" claim). 'openai' pins the OpenAI leg only
@@ -722,6 +743,10 @@ def _web_search(
 
         return json.dumps({"answer": text or "(no answer)", "answer_type": "summary", "sources": sources, "backend": "openai_responses"}, ensure_ascii=False, indent=2)
     except Exception as e:
+        if dispatched:
+            from ouroboros.transport_custody import release_pre_dispatch_attempt
+
+            dispatched = not release_pre_dispatch_attempt(reservation, e)
         was_dispatched = reservation is not None and dispatched
         if reservation is not None and dispatched:
             try:

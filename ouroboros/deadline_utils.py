@@ -96,6 +96,39 @@ def llm_transport_timeout_sec(explicit: Any = None) -> float:
     return float(get_llm_transport_read_timeout_sec())
 
 
+def dispatch_window_remaining_sec(
+    *,
+    deadline_at: Any = None,
+    deadline_ts: Any = None,
+    reserve_sec: Any = 0.0,
+) -> Optional[float]:
+    """Return owner time available for a *new* physical dispatch.
+
+    ``None`` means that no owner deadline is present.  ``0.0`` means the
+    deadline or its finalization reserve is spent.  This is deliberately
+    separate from :func:`transport_timeout_with_deadline`, whose positive
+    floor keeps an already-admitted transport call bounded without pretending
+    that a new call is still admissible.
+    """
+    remaining: Optional[float] = None
+    try:
+        if isinstance(deadline_ts, (int, float, str)) and not isinstance(deadline_ts, bool):
+            candidate = float(deadline_ts) - time.time()
+            if math.isfinite(candidate):
+                remaining = candidate
+    except (TypeError, ValueError, OverflowError):
+        remaining = None
+    if remaining is None:
+        remaining = seconds_until(deadline_at)
+    if remaining is None:
+        return None
+    try:
+        reserve = max(0.0, float(reserve_sec or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        reserve = 0.0
+    return max(0.0, remaining - reserve)
+
+
 def transport_timeout_with_deadline(
     explicit: Any = None,
     *,
@@ -111,21 +144,12 @@ def transport_timeout_with_deadline(
     for in-process loop contexts; ISO deadlines remain the public task contract.
     """
     base = llm_transport_timeout_sec(explicit)
-    remaining: Optional[float] = None
-    try:
-        if deadline_ts is not None:
-            remaining = max(0.0, float(deadline_ts) - time.time())
-    except (TypeError, ValueError):
-        remaining = None
-    if remaining is None:
-        remaining = seconds_until(deadline_at)
+    remaining = dispatch_window_remaining_sec(
+        deadline_at=deadline_at, deadline_ts=deadline_ts, reserve_sec=reserve_sec,
+    )
     if remaining is None:
         return base
-    try:
-        reserve = max(0.0, float(reserve_sec or 0.0))
-    except (TypeError, ValueError):
-        reserve = 0.0
-    return max(0.001, min(base, remaining - reserve))
+    return max(0.001, min(base, remaining))
 
 
 def bounded_seconds(value: Any, *, default: float, maximum: float) -> int:

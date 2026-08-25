@@ -649,11 +649,17 @@ def _extract_verdict_via_light_model(
     transport_timeout_sec: Any = None) -> tuple[Optional[str], Dict[str, Any]]:
     """One bounded light-model call canonicalizing narrative to the contract."""
     from ouroboros.config import get_light_model
+    from ouroboros.deadline_utils import dispatch_window_remaining_sec
     from ouroboros.usage_accounting import physical_attempt_limit
 
     if not str(raw_text or "").strip():
         return None, {}
     model = get_light_model()
+    dispatch_window = dispatch_window_remaining_sec(
+        deadline_at=deadline_at,
+    )
+    if dispatch_window is not None and dispatch_window <= 0:
+        return None, {"model": model, "reason_code": "deadline_exhausted", "dispatch": "not_dispatched"}
     prompt = _SESSION_EXTRACT_PROMPT.format(
         contract=contract or REVIEW_JSON_ARRAY_CONTRACT,
         raw_text=raw_text,  # WHOLE — the caller already bounded the one send
