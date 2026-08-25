@@ -46,8 +46,7 @@ from ouroboros.config import (
 from ouroboros.review_cycles import emit_review_cycles_exhausted, review_max_cycles
 from ouroboros.task_results import (
     load_plan_review_state, load_task_result, mark_current_plan_review_unavailable,
-    mark_plan_review_cycles_exhausted, plan_review_wave, current_plan_review_wave,
-    record_plan_review_attempt, record_plan_review_dispositions,
+    plan_review_wave, current_plan_review_wave, record_plan_review_dispositions,
 )
 from ouroboros.tools import plan_evidence, plan_spec
 from ouroboros.tools.plan_render import _next_step, _quote_control_lines, _render_wave  # noqa: F401 — engine renderers
@@ -80,6 +79,12 @@ from ouroboros.tools.plan_review_artifacts import (
     record_cannot_verify_attempt as _record_cannot_verify_attempt,
     record_exact_wave as _record_exact_wave,
     read_wave as _read_plan_review_wave_artifact,
+)
+from ouroboros.tools.plan_review_references import (
+    _emit_plan_review_reference,
+    _record_cycles_exhausted_with_references,
+    _record_plan_review_attempt_with_reference,
+    _record_raw_plan_request_with_reference,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.tools.review_helpers import review_wave_budget_gate
@@ -312,7 +317,8 @@ def _plan_unavailable(ctx: ToolContext, message: str, reason: str) -> str:
     """Persist a retryable availability outcome (the current fingerprint stays open-unavailable)."""
     try:
         root, task_id = _planning_state_location(ctx)
-        mark_current_plan_review_unavailable(root, task_id, reason=reason)
+        state = mark_current_plan_review_unavailable(root, task_id, reason=reason)
+        _emit_plan_review_reference(ctx, task_id, state)
     except (OSError, TimeoutError, ValueError) as exc:
         return f"{message}\nERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
     return message
@@ -483,10 +489,9 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
     if prepared.get("error"):
         if "PLAN_SPEC_INVALID" in prepared["error"]:
             try:
-                _record_raw_plan_request_attempt(
-                    {"goal": request.goal, "plan": request.plan, "spec": request.spec},
-                    state_root, task_id, reason="plan_input_invalid",
-                )
+                _record_raw_plan_request_with_reference(
+                    ctx, state_root, task_id, {"goal": request.goal, "plan": request.plan, "spec": request.spec},
+                    reason="plan_input_invalid")
             except (OSError, TimeoutError, ValueError) as exc:
                 return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
         return prepared["error"]
@@ -506,7 +511,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
     cycles_paid = int(state.get("cycles_paid") or 0)
     # C-01: every envelope supersedes prior authority BEFORE any cap/rail exit.
     try:
-        record_plan_review_attempt(state_root, task_id, fingerprint=fingerprint)
+        _record_plan_review_attempt_with_reference(ctx, state_root, task_id, fingerprint=fingerprint)
     except (OSError, TimeoutError, ValueError) as exc:
         return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
     previous_override: Optional[dict] = None
@@ -555,8 +560,9 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
     deadline_skip = _plan_deadline_skip(ctx)
     if deadline_skip:
         try:
-            record_plan_review_attempt(state_root, task_id, fingerprint=fingerprint,
-                                       status="rail_degraded", reason="plan_task_deadline")
+            _record_plan_review_attempt_with_reference(
+                ctx, state_root, task_id, fingerprint=fingerprint, status="rail_degraded",
+                reason="plan_task_deadline")
         except (OSError, TimeoutError, ValueError) as exc:
             return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
         return _plan_deadline_skip(ctx, emit=True) or deadline_skip
@@ -624,6 +630,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             )
         except (OSError, ValueError) as exc:
             return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
+        _emit_plan_review_reference(ctx, task_id, state_root=state_root)
         return _render_wave(
             stored, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
             reminder=reminder,
@@ -712,6 +719,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         paid_now = int(load_plan_review_state(state_root, task_id).get("cycles_paid") or 0)
     except (OSError, TimeoutError, ValueError) as exc:
         return f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}"
+    _emit_plan_review_reference(ctx, task_id, state_root=state_root)
     if enforcement == "advisory" and not stored.get("closed"):
         # B2: loud at the moment — ONE typed owner-visible event per recorded open wave.
         _emit_plan_review_advisory_open(ctx, state_root, task_id=task_id, wave=stored,
@@ -724,11 +732,10 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         # cap state must land NOW — not wait for a second envelope the agent may never send —
         # or the blocking gate holds a task that can never buy another panel (D27).
         try:
-            stored = mark_plan_review_cycles_exhausted(
-                state_root, task_id, fingerprint=fingerprint) or stored
-            record_plan_review_attempt(
-                state_root, task_id, fingerprint=fingerprint, status="cycles_exhausted",
-                reason=f"{paid_now}/{cap} paid plan-review cycles spent")
+            stored = _record_cycles_exhausted_with_references(
+                ctx, state_root, task_id, wave_fingerprint=fingerprint,
+                attempt_fingerprint=fingerprint, cycles_paid=paid_now, cap=cap,
+            ) or stored
         except (OSError, TimeoutError, ValueError) as exc:
             return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
         emit_review_cycles_exhausted(
@@ -800,16 +807,14 @@ def _cycles_exhausted(
             None,
         )
     fingerprint = str((current or {}).get("request_fingerprint") or "")
-    if fingerprint and not (current or {}).get("closed"):
-        try:
-            current = mark_plan_review_cycles_exhausted(state_root, task_id, fingerprint=fingerprint) or current
-        except (OSError, TimeoutError, ValueError) as exc:
-            return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
     if request_fingerprint:
         try:
-            record_plan_review_attempt(
-                state_root, task_id, fingerprint=request_fingerprint, status="cycles_exhausted",
-                reason=f"{cycles_paid}/{cap} paid plan-review cycles spent")
+            current = _record_cycles_exhausted_with_references(
+                ctx, state_root, task_id,
+                wave_fingerprint=fingerprint or request_fingerprint,
+                attempt_fingerprint=request_fingerprint,
+                cycles_paid=cycles_paid, cap=cap,
+            ) or current
         except (OSError, TimeoutError, ValueError) as exc:
             return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
     emit_review_cycles_exhausted(
@@ -932,6 +937,7 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
         )
     except (OSError, TimeoutError, ValueError) as exc:
         return "ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: " + str(exc)
+    _emit_plan_review_reference(ctx, task_id, state_root=root)
     ctx.emit_progress_fn(
         f"📐 plan_task: disposition recorded — {'closed' if closure['closed'] else 'still open'} "
         f"({len(closure['open_ids'])} open finding id(s); no reviewer call, no cycle)."

@@ -65,7 +65,8 @@ def review_job_state_path(drive_root: pathlib.Path, skill_name: str) -> pathlib.
 _UI_REVIEW_FIELDS = (
     "ts", "status", "review_status", "job_status", "lifecycle_status",
     "content_hash", "job_id", "group_id", "review_round", "snapshot_attempt",
-    "snapshot_revised", "task_id", "root_task_id", "chat_id", "source",
+    "snapshot_revised", "task_id", "root_task_id", "origin_task_id",
+    "origin_root_task_id", "presentation_owner_task_id", "chat_id", "source",
     "terminal_reason", "started_at", "finished_at",
 )
 
@@ -149,6 +150,7 @@ def _review_provenance(ctx: Any, source: str, skill_name: str) -> Dict[str, Any]
     if manual:
         group_id = f"manual:{skill_name}"
         root_task_id = ""
+        presentation_owner_task_id = ""
     else:
         # Ceiling/group root = the CURRENT task tree's root. The follow-up
         # chain marker origin_root_task_id is deliberately NOT honored here
@@ -162,6 +164,7 @@ def _review_provenance(ctx: Any, source: str, skill_name: str) -> Dict[str, Any]
             or task_id
         )
         group_id = f"task:{root_task_id}:{skill_name}"
+        presentation_owner_task_id = root_task_id
     try:
         chat_id = int(getattr(ctx, "current_chat_id", 0) or 0)
     except (TypeError, ValueError):
@@ -172,6 +175,7 @@ def _review_provenance(ctx: Any, source: str, skill_name: str) -> Dict[str, Any]
         "root_task_id": root_task_id,
         "origin_task_id": origin_task_id if not manual else "",
         "origin_root_task_id": origin_root_task_id if not manual else "",
+        "presentation_owner_task_id": presentation_owner_task_id,
         "chat_id": chat_id,
         "source": str(source or ""),
     }
@@ -209,7 +213,7 @@ def _terminal_history_payload(
     for key in (
         "group_id", "review_round", "snapshot_attempt", "snapshot_revised",
         "task_id", "root_task_id", "origin_task_id", "origin_root_task_id",
-        "chat_id", "source",
+        "presentation_owner_task_id", "chat_id", "source",
     ):
         if key in job_data:
             payload[key] = job_data[key]
@@ -295,6 +299,12 @@ def _append_review_chat_summary(
             "type": "skill_review",
             "task_id": task_id,
             "root_task_id": str(payload.get("root_task_id") or ""),
+            "origin_task_id": str(payload.get("origin_task_id") or ""),
+            "origin_root_task_id": str(payload.get("origin_root_task_id") or ""),
+            "presentation_owner_task_id": str(
+                payload.get("presentation_owner_task_id") or ""
+            ),
+            "group_id": str(payload.get("group_id") or ""),
             "chat_id": int(payload.get("chat_id") or 0),
             "skill": skill_name,
             "status": status,
@@ -302,6 +312,12 @@ def _append_review_chat_summary(
             "job_id": str(payload.get("job_id") or ""),
             "review_round": int(payload.get("review_round") or 1),
             "snapshot_attempt": int(payload.get("snapshot_attempt") or 1),
+            "snapshot_revised": bool(payload.get("snapshot_revised")),
+            "job_status": str(
+                payload.get("lifecycle_status") or payload.get("job_status") or ""
+            ),
+            "terminal_reason": str(payload.get("terminal_reason") or status),
+            "replayed_from_ts": str(payload.get("replayed_from_ts") or ""),
             "source": str(payload.get("source") or ""),
             "format": "markdown",
             "text": text,
@@ -361,6 +377,12 @@ def _append_interrupted_review_progress(
         "stale_reason": reason,
         "recovery_hint": "Start a fresh review for this skill before enabling or granting access.",
     }
+    for key in (
+        "group_id", "task_id", "root_task_id", "origin_task_id",
+        "origin_root_task_id", "presentation_owner_task_id", "chat_id", "source",
+    ):
+        if key in payload:
+            lifecycle[key] = payload[key]
     text = f"Skill review: `{skill_name}` — interrupted — {reason}"
     append_jsonl(
         _progress_jsonl_path(drive_root),
@@ -788,7 +810,8 @@ def _outcome_payload(
         payload["job_status"] = job.status
     for key in (
         "job_id", "group_id", "review_round", "snapshot_attempt", "snapshot_revised",
-        "task_id", "root_task_id", "chat_id", "source", "terminal_reason",
+        "task_id", "root_task_id", "origin_task_id", "origin_root_task_id",
+        "presentation_owner_task_id", "chat_id", "source", "terminal_reason",
     ):
         if job_data and key in job_data:
             payload[key] = job_data[key]
@@ -977,6 +1000,9 @@ def _on_finished(
             "deps_error": deps_error,
             "terminal_reason": terminal_reason,
         }
+        replayed_from_ts = str(getattr(result, "replayed_from_ts", "") or "")
+        if replayed_from_ts:
+            payload["replayed_from_ts"] = replayed_from_ts
         atomic_write_json(review_job_state_path(drive_root, skill_name), payload, trailing_newline=True)
         history_status = review_status if result is not None else state_status
         _append_terminal_history(
@@ -1224,6 +1250,7 @@ def run_skill_review_lifecycle_blocking(
             runner=_run_review,
             options=LifecycleJobOptions(
                 drive_root=drive_root,
+                presentation=provenance,
                 progress_target=progress,
                 result_message=_review_result_message,
                 result_error=lambda item: getattr(item, "error", "") or getattr(item, "deps_error", "") or "",

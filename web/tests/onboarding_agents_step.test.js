@@ -95,6 +95,7 @@ test('the step renders the ladder, one row per family, and the editable actor ho
     for (const family of AGENT_FAMILIES) {
         assert.ok(rows.includes(family.label), family.label);
         assert.ok(rows.includes(`data-agent-connect="${family.harness}"`), family.harness);
+        assert.ok(rows.includes(`data-harness-identity="${family.harness}"`), family.harness);
     }
     assert.ok(html.includes('id="agents-login-host"'));
     assert.ok(html.includes('id="agents-outcome"'));
@@ -246,15 +247,20 @@ test('a family the engine renames is spoken in the engine words, never as a raw 
     const renamed = snapshotWith(['claude']);
     renamed.harnesses = [{ id: 'claude', display_name: 'Claude Code Max' },
                          { id: 'codex' }, { id: 'cursor' }];
-    const text = agentsOutcomeText(['claude'], { snapshot: renamed });
+    const text = agentsOutcomeText(['claude'], { snapshot: renamed, catalogKnown: true });
     assert.match(text, /Claude Code Max is connected/);
     assert.doesNotMatch(text, /\bclaude\b/);
 
     // A family with no product name of its own is still never printed raw...
     const fourth = snapshotWith([]);
     fourth.harnesses = [{ id: 'gemini_cli', display_name: 'Gemini CLI' }];
-    assert.match(agentsOutcomeText(['gemini_cli'], { snapshot: fourth }),
+    assert.match(agentsOutcomeText(['gemini_cli'], { snapshot: fourth, catalogKnown: true }),
                  /Gemini CLI is connected/);
+
+    // A retained snapshot after a failed catalog read is useful for controls,
+    // but its daemon label is no longer fresh evidence.
+    assert.match(agentsOutcomeText(['claude'], { snapshot: renamed }), /Claude Code is connected/);
+    assert.doesNotMatch(agentsOutcomeText(['claude'], { snapshot: renamed }), /Claude Code Max/);
 
     // ...and with no payload at all the bootstrap product names still apply,
     // which is exactly what every surface printed before the two merged.

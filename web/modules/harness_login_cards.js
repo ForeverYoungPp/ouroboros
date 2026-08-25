@@ -37,6 +37,7 @@
 // Pure helpers up top are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
+import { harnessIdentityMarkup } from './harness_presentation.js';
 import {
     accountLoginConfirmed,
     claudexorPreparationLine,
@@ -485,7 +486,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
     // NOT .panel-card: that class lives in onboarding.css, which the settings
     // pages never load — the card rendered with no frame at all (finding #4).
     const bits = [`<div class="harness-login-card" data-login-card data-login-mode="${escapeHtml(compact ? LOGIN_CARD_COMPACT : LOGIN_CARD_FULL)}">`,
-        `<h4>Connect ${escapeHtml(active.harness)}${active.profile ? ` (${escapeHtml(active.profile)})` : ''}</h4>`];
+        `<h4>Connect ${harnessIdentityMarkup(active.harness, { label: active.familyLabel || '' })}${active.profile ? ` (${escapeHtml(active.profile)})` : ''}</h4>`];
     if (face === 'error') {
         bits.push(`<div class="settings-inline-note" data-tone="error">${escapeHtml(active.error)}</div>`);
         if (loginRetryAvailable(active)) {
@@ -789,11 +790,26 @@ export function createLoginCardController({
         ? store.subscribe(() => { if (ctl.active?.preparingRuntime) render(); })
         : () => {};
 
+    function currentFamilyLabel(harness) {
+        // The store deliberately retains its last snapshot across a failed
+        // read. That snapshot keeps controls usable, but its display_name is
+        // not current catalog evidence. Use it only after a proven catalog
+        // read; otherwise the shared presentation catalog is the safe label.
+        return familyLabel(harness, store?.snapshot || null, {
+            catalogKnown: Boolean(store?.catalogKnown),
+        }) || String(harness || '');
+    }
+
     function render() {
         const hostEl = getHost();
         if (!hostEl) return;
         const active = ctl.active;
         if (!active) { hostEl.innerHTML = ''; return; }
+        // A login can outlive several status reads. Resolve at paint time so a
+        // newly proven daemon label replaces the fallback, while a later read
+        // gap cannot dress a stale snapshot up as fresh evidence.
+        active.familyLabel = currentFamilyLabel(active.harness);
+        if (active.needsProfile) active.needsProfile.familyLabel = active.familyLabel;
         preserveCardFocus(hostEl, () => {
             // A failed refresh RETAINS the prior snapshot and records the
             // error; a retained snapshot is not phase evidence, and rendering
@@ -1271,7 +1287,9 @@ export function createLoginCardController({
         if (profile) body.profile_id = profile;
         if (transport === 'client_pty') body.transport = transport;
         ctl.active = {
-            harness, profile, transport, jobId: '', envelope: null, absent: false, custodyStatus: '',
+            harness, profile, transport,
+            familyLabel: currentFamilyLabel(harness),
+            jobId: '', envelope: null, absent: false, custodyStatus: '',
             attachCommand: '', attachShell: '', setupLoginSource: '', error: '',
             problemCode: '', requiredActions: [],
             startedAtMs: now(), engineDegraded: false,
@@ -1320,7 +1338,7 @@ export function createLoginCardController({
                         // at detection where the store is at hand — the pure
                         // renderer must not reach for a global (raw id is the
                         // no-payload fallback).
-                        familyLabel: familyLabel(harness, store?.snapshot || null) || String(harness || ''),
+                        familyLabel: currentFamilyLabel(harness),
                     };
                     releaseStatusPolling();
                     render();

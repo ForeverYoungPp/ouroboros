@@ -168,6 +168,31 @@ not compact headlines.
 - Spacing comes from the 8pt tokens (`--space-*`); a new visual dimension
   becomes a CSS variable before it becomes a page-local literal.
 
+### Reviews inside task cards
+
+Real tasks and real subagents are cards. Reviews are a subsection of the
+exact real task that owns their presentation. Harness and neutral API marks
+identify the delivery channel alongside explicit execution evidence; they are
+not child-task cards and never prove execution by themselves.
+
+- A collapsed task card shows only a quiet `Reviews N` line, optionally with an
+  active count. It has no aggregate pass/fail alert, no synthesized verdict, and
+  no review dollars.
+- Expanding `Reviews` reveals one row per currently admitted review group
+  (`Skill review`, `Plan review`, or `Task acceptance`). Expanding a group
+  reveals its ordered attempt rows. Group state and verdict remain
+  domain-specific; one blocker never recolours the whole task card.
+- Disclosure is user-owned. Review results, retries, failures, terminal task
+  state, reconnect, and lazy-detail loading update content in place but never
+  open or close the task, Reviews section, or group.
+- Harness marks are monochrome `currentColor` vectors with adjacent visible
+  text. They carry identity only, remain neutral across status states, and use a
+  generic text-preserving fallback for unknown harnesses; direct API is shown
+  neutrally as `API`.
+- Vector provenance: Claude, Cursor, and OpenCode paths come from Simple Icons;
+  Codex/OpenAI comes from SVGL. Product names and marks remain the property of
+  their owners.
+
 ## 6. Account group / row anatomy
 
 For a repeated identity row (a connected agent account, a reviewer slot,

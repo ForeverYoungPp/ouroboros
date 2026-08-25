@@ -533,6 +533,38 @@ distrust — profile, route, parser, window — is metadata on that evidence: it
 may lower authority to DEGRADED/SKIPPED/NOT_RUN, but it must not blank,
 rewrite, or relabel the artifact or its original cause.
 
+#### Review presentation adapters
+
+`web/modules/review_presentation.js` is the frontend SSOT for adapting bounded
+domain projections into review groups and attempts. It owns validation, stable
+identity, ordering, labels, summary fallback, grouping, and typed presentation
+state/tone. It does not author, mutate, or feed back canonical domain verdict,
+lifecycle, routing, attention, or enforcement authority. Admission is
+source-complete: require a stable group/attempt identity, an exact real
+presentation-owner task, typed state/verdict (or explicit unavailable), an
+exact detail reference when detail is offered, and exact task/candidate binding
+for repository review. Omit an incomplete row; never guess from current chat,
+repository, timestamps, model, tool name, or activity.
+
+`web/modules/harness_presentation.js` is the vector-and-label SSOT for harness
+identity. It owns the known labels, monochrome SVG geometry, generic unknown and
+neutral direct-API fallbacks, escaping, and compact mark-plus-text helpers.
+Marks use `currentColor`, visible text is always retained, and the surrounding
+component owns status tone and execution wording. The helper must never infer
+that a requested route executed or turn native selects into custom controls.
+
+Both modules are pure read-side presentation. Reuse the existing Chat-history,
+task-detail, exact domain-detail, and canonical physical-attempt readers; do not
+add a review ledger, endpoint, persisted UI state, cost copy, or enforcement
+layer. Compact review rows carry no dollars. Exact Skill attempt money appears
+only inside the existing lazy detail when the history row declares
+`physical_attempt_v1`; that detail joins the canonical ledger by exact wave and
+slot, persists no totals, and leaves legacy attribution unavailable.
+Pin these contracts in `web/tests/review_presentation.test.js` and
+`web/tests/harness_presentation.test.js`; keep grouping/reconnect/disclosure and
+requested/effective/executed truth covered by the existing Skill Review,
+render-batch, and review-truth suites.
+
 #### Context and growth matrix
 
 | Store / surface | Complete producer and source | Interactive projection / consumer | Growth and retention proof |

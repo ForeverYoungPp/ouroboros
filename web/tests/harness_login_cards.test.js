@@ -100,7 +100,8 @@ test('the controller drives create → poll → Connected, and holds the status 
     });
 
     await ctl.start('codex', '');
-    assert.ok(host.innerHTML.includes('Connect codex'), 'the card rendered');
+    assert.ok(host.innerHTML.includes('data-harness-identity="codex"'), 'the card rendered');
+    assert.ok(host.innerHTML.includes('>Codex</span>'), 'the readable product name rendered');
     assert.ok(host.innerHTML.includes('data-login-state'), 'a live job shows the progress line');
     assert.equal(store.polling, true, 'a live login holds the shared status poll open');
 
@@ -119,6 +120,44 @@ test('the controller drives create → poll → Connected, and holds the status 
     ctl.dispose();
     store.dispose();
     t.mock.timers.reset();
+});
+
+test('an active card adopts only currently proven catalog labels and falls back across gaps', async () => {
+    let catalogKnown = false;
+    let snapshot = {
+        harnesses: [{ id: 'codex', display_name: 'Stale daemon label' }],
+    };
+    const store = {
+        get catalogKnown() { return catalogKnown; },
+        get snapshot() { return snapshot; },
+        holdPolling: () => () => {},
+        refresh: async () => {
+            snapshot = { harnesses: [{ id: 'codex', display_name: 'Codex Live' }] };
+            catalogKnown = true;
+        },
+    };
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host,
+        store,
+        fetchImpl: async () => json(503, { error: 'offline' }),
+    });
+
+    await ctl.start('codex', '');
+    assert.match(host.innerHTML, />Codex<\/span>/);
+    assert.doesNotMatch(host.innerHTML, /Stale daemon label/);
+
+    await store.refresh();
+    ctl.render();
+    assert.match(host.innerHTML, />Codex Live<\/span>/,
+        'a newly proven catalog label replaces the fallback on the active card');
+
+    catalogKnown = false;
+    ctl.render();
+    assert.match(host.innerHTML, />Codex<\/span>/);
+    assert.doesNotMatch(host.innerHTML, /Codex Live/,
+        'a read gap cannot present the retained snapshot as fresh evidence');
+    ctl.detach();
 });
 
 test('poll replaces the whole canonical envelope, preserving envelope-level device disclosure', async (t) => {
@@ -266,7 +305,8 @@ test('dispose CANCELS the live job before releasing custody, and clears the card
     });
     await ctl.start('codex', '');
     assert.equal(store.polling, true);
-    assert.ok(host.innerHTML.includes('Connect codex'), 'the card is on screen before the disposer');
+    assert.ok(host.innerHTML.includes('data-harness-identity="codex"'),
+        'the card is on screen before the disposer');
 
     const released = await ctl.dispose();
     assert.ok(calls.includes('DELETE /api/claudexor/login/job-4'),

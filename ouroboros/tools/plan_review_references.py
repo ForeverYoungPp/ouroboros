@@ -1,0 +1,103 @@
+"""Small owner-visible invalidations for canonical Plan Review state writes."""
+
+from __future__ import annotations
+
+import json
+import logging
+import pathlib
+from hashlib import sha256
+from typing import Any, Optional
+
+from ouroboros.task_results import (
+    load_plan_review_state,
+    mark_plan_review_cycles_exhausted,
+    record_plan_review_attempt,
+)
+from ouroboros.tools.plan_review_runtime import record_raw_plan_request_attempt
+from ouroboros.utils import emit_log_event, utc_now_iso
+
+log = logging.getLogger(__name__)
+
+
+def _emit_plan_review_reference(
+    ctx: Any,
+    task_id: str,
+    state: Optional[dict] = None,
+    *,
+    state_root: Optional[pathlib.Path] = None,
+) -> None:
+    """Publish a small invalidation; the task result remains authority."""
+    event_queue = getattr(ctx, "event_queue", None)
+    if event_queue is None:
+        return
+    if state is None:
+        try:
+            state = load_plan_review_state(state_root, task_id)
+        except (OSError, TimeoutError, ValueError):
+            log.debug("Failed to reload plan-review state reference", exc_info=True)
+            return
+    attempt = state.get("current_attempt") if isinstance(state, dict) else {}
+    serialized = json.dumps(state, ensure_ascii=False, sort_keys=True, default=str)
+    revision = sha256(serialized.encode("utf-8")).hexdigest()
+    try:
+        chat_id = int(getattr(ctx, "current_chat_id", 0))
+    except (TypeError, ValueError):
+        chat_id = 0
+    emit_log_event(event_queue, {
+        "type": "review_reference", "surface": "plan_review",
+        "task_id": str(task_id or ""), "chat_id": chat_id,
+        "review_fingerprint": str((attempt or {}).get("fingerprint") or ""),
+        "state_revision": revision, "ts": utc_now_iso(),
+    }, log_label="plan-review state reference")
+
+
+def _record_plan_review_attempt_with_reference(
+    ctx: Any,
+    state_root: pathlib.Path,
+    task_id: str,
+    **attempt: Any,
+) -> dict:
+    """Persist an attempt and publish its durable revision immediately."""
+    state = record_plan_review_attempt(state_root, task_id, **attempt)
+    _emit_plan_review_reference(ctx, task_id, state)
+    return state
+
+
+def _record_raw_plan_request_with_reference(
+    ctx: Any,
+    state_root: pathlib.Path,
+    task_id: str,
+    envelope: dict,
+    *,
+    reason: str,
+) -> str:
+    """Persist an undecodable request and immediately invalidate Plan detail."""
+    fingerprint = record_raw_plan_request_attempt(
+        envelope, state_root, task_id, reason=reason,
+    )
+    _emit_plan_review_reference(ctx, task_id, state_root=state_root)
+    return fingerprint
+
+
+def _record_cycles_exhausted_with_references(
+    ctx: Any,
+    state_root: pathlib.Path,
+    task_id: str,
+    *,
+    wave_fingerprint: str,
+    attempt_fingerprint: str,
+    cycles_paid: int,
+    cap: int,
+) -> dict:
+    """Persist both cap writes and publish each durable revision immediately."""
+    marked_wave = mark_plan_review_cycles_exhausted(
+        state_root, task_id, fingerprint=wave_fingerprint,
+    )
+    _emit_plan_review_reference(ctx, task_id, state_root=state_root)
+    attempt_state = record_plan_review_attempt(
+        state_root, task_id, fingerprint=attempt_fingerprint,
+        status="cycles_exhausted",
+        reason=f"{cycles_paid}/{cap} paid plan-review cycles spent",
+    )
+    _emit_plan_review_reference(ctx, task_id, attempt_state)
+    return marked_wave

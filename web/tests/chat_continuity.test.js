@@ -8,6 +8,7 @@ import {
     computeDerivedChatStatus,
     computeHydratedDirectActivities,
     partitionLocalEchoJournal,
+    positiveTaskTerminalFact,
     reconcileHydratedDirectActivities,
 } from '../modules/chat_activity.js';
 import {
@@ -238,4 +239,25 @@ test('task_done stays the terminal card projection', () => {
         outcome_axes: { lifecycle: { status: 'completed' } },
     });
     assert.equal(summary.terminal, true);
+});
+
+test('history terminal truth requires a positive typed fact', () => {
+    assert.equal(positiveTaskTerminalFact({
+        role: 'system', task_id: 'root', system_type: 'skill_review',
+    }), false);
+    assert.equal(positiveTaskTerminalFact({
+        role: 'assistant', task_id: 'root', system_type: 'photo',
+    }), false);
+    assert.equal(positiveTaskTerminalFact({
+        role: 'system', task_id: 'root', system_type: 'task_summary',
+    }), true);
+    assert.equal(positiveTaskTerminalFact({
+        role: 'assistant', task_id: 'root', task_terminal_status: 'failed',
+    }), true);
+    assert.equal(positiveTaskTerminalFact({
+        delegation_role: 'subagent', task_id: 'child', subagent_event: 'completed',
+    }), true);
+    assert.equal(positiveTaskTerminalFact({
+        delegation_role: 'subagent', task_id: 'child', subagent_event: 'interrupted',
+    }), false);
 });

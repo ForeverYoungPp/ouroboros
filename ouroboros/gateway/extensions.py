@@ -1039,36 +1039,54 @@ def _skill_review_history_detail_sync(
         STATUS_WARNINGS,
     )
 
-    records = skill_review_history.load_history(drive_root, skill_name, limit=0)
-    if not records:
-        return {"error": "no review history for skill", "status_code": 404}
-    record = next(
-        (row for row in records if str(row.get("job_id") or "") == job_id), None,
+    record, lookup_status = skill_review_history.find_history_job_bounded(
+        drive_root, skill_name, job_id,
     )
+    if lookup_status == "absent":
+        return {"error": "no review history for skill", "status_code": 404}
     if record is None:
-        return {"error": "review record not found", "status_code": 404}
+        error = (
+            "review record unavailable outside the bounded history window"
+            if lookup_status == "unavailable"
+            else "review record not found"
+        )
+        return {"error": error, "status_code": 404}
     raw_actors = [
         actor for actor in (record.get("raw_actor_records") or [])
         if isinstance(actor, dict)
     ]
-    findings = [
-        item
+    actor_models = [
+        str(actor.get("model_id") or actor.get("model") or "reviewer")
         for actor in raw_actors
+    ]
+    duplicate_models = {
+        model for model in actor_models if actor_models.count(model) > 1
+    }
+    duplicate_occurrences: Dict[str, int] = {}
+    labeled_actors = []
+    for actor in raw_actors:
+        model = str(actor.get("model_id") or actor.get("model") or "reviewer")
+        slot_id = str(actor.get("slot_id") or "")
+        duplicate_occurrences[model] = duplicate_occurrences.get(model, 0) + 1
+        qualifier = slot_id or f"legacy-actor-{duplicate_occurrences[model]}"
+        label = f"{model} [{qualifier}]" if model in duplicate_models else model
+        labeled_actors.append((actor, label))
+    findings = [
+        {**item, "model": label}
+        for actor, label in labeled_actors
         for item in (actor.get("parsed_items") or [])
         if isinstance(item, dict)
     ]
     reviewer_models = [
-        model for model in (
-            str(actor.get("model_id") or actor.get("model") or "") for actor in raw_actors
-        ) if model
+        label for _actor, label in labeled_actors
     ]
     degraded_actors = [
         {
-            "model_id": str(actor.get("model_id") or actor.get("model") or "reviewer"),
+            "model_id": label,
             "status": str(actor.get("status") or "unknown"),
             "raw_text": "(raw reviewer output withheld from chat; stored in review_history.jsonl)",
         }
-        for actor in raw_actors
+        for actor, label in labeled_actors
         if str(actor.get("status") or "") != "responded"
     ]
     status = str(record.get("status") or "pending")
@@ -1092,6 +1110,11 @@ def _skill_review_history_detail_sync(
         "error": error_note,
     }
     markdown = render_skill_review_block(outcome, attempt_idx=attempt)
+    if degraded_actors:
+        markdown += (
+            "\n\n_A terminal reviewer slot that never started or refused has no "
+            "physical-attempt ledger row; incomplete attempt coverage can therefore be final._"
+        )
     # Max-Review-Cycles accounting facts (Q16/Q17 auditability) ride the
     # free-form markdown detail: the response contract
     # (SkillReviewHistoryDetailResponse) is typed to exactly four fields, so

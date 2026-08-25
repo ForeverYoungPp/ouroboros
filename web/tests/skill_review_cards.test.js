@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import {
     loadSkillReviewDetail,
+    nestedSkillReviewRef,
     renderSkillReviewDisclosure,
     summarizeSkillReviewMessage,
     wireSkillReviewDisclosure,
@@ -12,7 +13,10 @@ import {
 const REFERENCE_TEXT = 'Skill review round 2 — snapshot abc123def456 (attempt 1): `alpha` — status=clean, source=skills';
 
 function makeFull() {
-    return { dataset: {}, innerHTML: '' };
+    return {
+        dataset: {}, innerHTML: '', attrs: {},
+        setAttribute(key, value) { this.attrs[key] = value; },
+    };
 }
 
 function okResponse(markdown) {
@@ -120,6 +124,71 @@ test('loaded and in-flight containers are never refetched', async () => {
     full.dataset.state = 'loading';
     assert.equal(await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'j1' }, deps), 'loading');
     assert.equal(attempts, 1);
+});
+
+test('nested attempts reuse the instance exact-job store after DOM rebuild', async () => {
+    const store = new Map();
+    let fetches = 0;
+    const deps = {
+        store,
+        fetchImpl: async () => { fetches += 1; return okResponse('cached exact detail'); },
+        render: (markdown) => markdown,
+    };
+    await loadSkillReviewDetail(makeFull(), { skill: 'alpha', jobId: 'nested-job' }, deps);
+    const rebuilt = makeFull();
+    await loadSkillReviewDetail(rebuilt, { skill: 'alpha', jobId: 'nested-job' }, deps);
+    assert.equal(fetches, 1);
+    assert.match(rebuilt.innerHTML, /cached exact detail/);
+    assert.deepEqual(nestedSkillReviewRef({ dataset: {
+        skillReviewSkill: 'alpha', skillReviewJob: 'nested-job',
+    } }), { skill: 'alpha', jobId: 'nested-job' });
+});
+
+test('same exact detail shares one in-flight read across a DOM rebuild', async () => {
+    const store = new Map();
+    let resolve;
+    let fetches = 0;
+    const gate = new Promise((done) => { resolve = done; });
+    const deps = {
+        store,
+        fetchImpl: async () => { fetches += 1; await gate; return okResponse('settled detail'); },
+        render: (markdown) => markdown,
+    };
+    const first = makeFull();
+    const second = makeFull();
+    const one = loadSkillReviewDetail(first, { skill: 'alpha', jobId: 'shared-job' }, deps);
+    await Promise.resolve();
+    const two = loadSkillReviewDetail(second, { skill: 'alpha', jobId: 'shared-job' }, deps);
+    assert.equal(fetches, 1);
+    assert.equal(second.dataset.state, 'loading');
+    assert.equal(second.attrs['aria-busy'], 'true');
+    assert.match(second.innerHTML, /role="status" aria-live="polite"/);
+    resolve();
+    await Promise.all([one, two]);
+    assert.equal(second.dataset.state, 'loaded');
+    assert.equal(second.attrs['aria-busy'], 'false');
+    assert.match(second.innerHTML, /settled detail/);
+});
+
+test('retry resets the shared error and exposes accessible busy state', async () => {
+    const store = new Map();
+    const full = makeFull();
+    let attempts = 0;
+    const deps = {
+        store,
+        fetchImpl: async () => {
+            attempts += 1;
+            if (attempts === 1) throw new Error('offline');
+            return okResponse('recovered');
+        },
+        render: (markdown) => markdown,
+    };
+    await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'retry-job' }, deps);
+    assert.match(full.innerHTML, /role="status" aria-live="polite"/);
+    await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'retry-job' }, { ...deps, retry: true });
+    assert.equal(attempts, 2);
+    assert.equal(full.attrs['aria-busy'], 'false');
+    assert.match(full.innerHTML, /recovered/);
 });
 
 test('empty markdown from the route is treated as an error, not a blank card', async () => {

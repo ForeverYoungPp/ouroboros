@@ -56,34 +56,79 @@ export function renderSkillReviewDisclosure(text, ref = null, deps = {}) {
 /**
  * Fill a reference row's detail container from
  * GET /api/skills/{skill}/review-history/{job_id}. States ride
- * `full.dataset.state`: '' (idle) → 'loading' → 'loaded' | 'error'; an
- * in-flight or already-loaded container is never refetched (Retry clears the
- * state first). Errors degrade honestly inline and keep the card usable.
+ * `full.dataset.state`: '' (idle) → 'loading' → 'loaded' | 'error'. Nested
+ * Reviews may provide a keyed per-instance store so an immutable exact-job
+ * read, including its in-flight promise, survives DOM replacement. Retry
+ * explicitly replaces an error entry. Errors stay honest and inline.
  */
+function detailStoreKey(ref) {
+    return `${ref.skill}\u0000${ref.jobId}`;
+}
+
+function renderDetailState(full, entry, render) {
+    if (!full || !entry) return;
+    full.dataset.state = entry.state;
+    full.setAttribute?.('aria-busy', entry.state === 'loading' ? 'true' : 'false');
+    if (entry.state === 'loading') {
+        full.innerHTML = '<div class="skill-review-loading" role="status" aria-live="polite">Loading review details…</div>';
+    } else if (entry.state === 'loaded') {
+        full.innerHTML = render(entry.markdown);
+    } else if (entry.state === 'error') {
+        full.innerHTML = `<div class="skill-review-error" role="status" aria-live="polite">Review details unavailable (${escapeHtmlAttr(entry.error)}). `
+            + '<button type="button" class="skill-review-retry" data-skill-review-retry>Retry</button></div>';
+    }
+}
+
 export async function loadSkillReviewDetail(full, ref, deps = {}) {
     const fetchImpl = deps.fetchImpl || apiFetch;
     const render = deps.render || renderMarkdown;
+    const store = deps.store instanceof Map ? deps.store : null;
     if (!full || !ref || !ref.skill || !ref.jobId) return '';
+    const cacheKey = detailStoreKey(ref);
+    let entry = store?.get(cacheKey) || null;
+    if (deps.retry === true && entry?.state === 'error') {
+        entry = null;
+        store?.delete(cacheKey);
+    }
+    if (entry) {
+        renderDetailState(full, entry, render);
+        if (entry.state === 'loading' && entry.promise) {
+            await entry.promise;
+            renderDetailState(full, entry, render);
+        }
+        return entry.state;
+    }
     if (full.dataset.state === 'loading' || full.dataset.state === 'loaded') {
         return full.dataset.state;
     }
-    full.dataset.state = 'loading';
-    full.innerHTML = '<div class="skill-review-loading">Loading review details…</div>';
-    try {
-        const url = `/api/skills/${encodeURIComponent(ref.skill)}/review-history/${encodeURIComponent(ref.jobId)}`;
-        const resp = await fetchImpl(url, { cache: 'no-store' });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const data = await resp.json();
-        const markdown = String(data?.markdown || '');
-        if (!markdown) throw new Error('empty review detail');
-        full.innerHTML = render(markdown);
-        full.dataset.state = 'loaded';
-    } catch (err) {
-        full.dataset.state = 'error';
-        full.innerHTML = `<div class="skill-review-error">Review details unavailable (${escapeHtmlAttr(String(err?.message || err))}). `
-            + '<button type="button" class="skill-review-retry" data-skill-review-retry>Retry</button></div>';
-    }
-    return full.dataset.state;
+    entry = { state: 'loading', markdown: '', error: '', promise: null };
+    store?.set(cacheKey, entry);
+    renderDetailState(full, entry, render);
+    entry.promise = (async () => {
+        try {
+            const url = `/api/skills/${encodeURIComponent(ref.skill)}/review-history/${encodeURIComponent(ref.jobId)}`;
+            const resp = await fetchImpl(url, { cache: 'no-store' });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const data = await resp.json();
+            const markdown = String(data?.markdown || '');
+            if (!markdown) throw new Error('empty review detail');
+            entry.markdown = markdown;
+            entry.state = 'loaded';
+        } catch (err) {
+            entry.error = String(err?.message || err);
+            entry.state = 'error';
+        }
+    })();
+    await entry.promise;
+    renderDetailState(full, entry, render);
+    return entry.state;
+}
+
+/** Exact immutable job reference carried by a nested Reviews attempt. */
+export function nestedSkillReviewRef(detail) {
+    const skill = detail?.dataset?.skillReviewSkill || '';
+    const jobId = detail?.dataset?.skillReviewJob || '';
+    return skill && jobId ? { skill, jobId } : null;
 }
 
 /**
@@ -119,7 +164,7 @@ export function wireSkillReviewDisclosure(bubble, onLayoutChange, deps = {}) {
         full.addEventListener('click', (ev) => {
             if (!ev.target?.closest?.('[data-skill-review-retry]')) return;
             full.dataset.state = '';
-            loadSkillReviewDetail(full, reviewRef, deps).then(onLayoutChange);
+            loadSkillReviewDetail(full, reviewRef, { ...deps, retry: true }).then(onLayoutChange);
         });
     }
     return true;

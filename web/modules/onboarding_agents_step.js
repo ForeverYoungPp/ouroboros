@@ -38,6 +38,7 @@
 import { apiClient } from './api_client.js';
 import { claudexorStatus, accountRows, familyLabel } from './claudexor_status_store.js';
 import { LOGIN_CARD_FULL, createLoginCardController } from './harness_login_cards.js';
+import { harnessIdentityMarkup } from './harness_presentation.js';
 import {
     availableSubagentsEditorHost,
     createAvailableSubagentsEditor,
@@ -129,13 +130,15 @@ export function harnessAccountCount(snapshot, harness) {
     ).length;
 }
 
-export function familyLabels(harnesses, snapshot) {
+export function familyLabels(harnesses, snapshot, { catalogKnown = false } = {}) {
     // ONE authority, shared with the Agents tab: prefer the engine's own
     // display_name, fall back to the bootstrap product names. Passing the
     // snapshot keeps this pure and node-testable like the helpers around it;
     // without it the wizard would print a raw `claude` the day the engine
     // renames a family or adds a fourth.
-    return (harnesses || []).map((harness) => familyLabel(harness, snapshot));
+    return (harnesses || []).map(
+        (harness) => familyLabel(harness, snapshot, { catalogKnown }),
+    );
 }
 
 function joinLabels(labels) {
@@ -285,8 +288,12 @@ export function completionFailureNotice(error) {
     };
 }
 
-export function agentsOutcomeText(connected = [],
-                                  { accountsKnown = true, skipPresets = false, snapshot } = {}) {
+export function agentsOutcomeText(connected = [], {
+    accountsKnown = true,
+    catalogKnown = false,
+    skipPresets = false,
+    snapshot,
+} = {}) {
     // What the owner is told BEFORE finishing. Every verb is conditional,
     // because the compiler can still refuse a seat no live model id satisfies.
     if (!accountsKnown) {
@@ -298,7 +305,7 @@ export function agentsOutcomeText(connected = [],
             + 'access you configured — you can connect an account any time in '
             + 'Settings → Agents.';
     }
-    const labels = joinLabels(familyLabels(connected, snapshot));
+    const labels = joinLabels(familyLabels(connected, snapshot, { catalogKnown }));
     if (skipPresets) {
         return `${labels} ${connected.length === 1 ? 'is' : 'are'} connected, but you chose to `
             + 'skip the automatic subscription preset. The Available subagents draft below '
@@ -316,12 +323,12 @@ export function agentsOutcomeText(connected = [],
             + `through ${connected.length === 1 ? 'it' : 'them'}.`,
     ];
     if (reviewerHarnesses.length) {
-        const reviewerLabels = familyLabels(reviewerHarnesses, snapshot);
+        const reviewerLabels = familyLabels(reviewerHarnesses, snapshot, { catalogKnown });
         clauses.push(`${joinLabels(reviewerLabels)} can `
             + 'also move commit, scope, advisory, plan, and skill review.');
     }
     if (taskOnlyHarnesses.length) {
-        const taskOnlyLabels = familyLabels(taskOnlyHarnesses, snapshot);
+        const taskOnlyLabels = familyLabels(taskOnlyHarnesses, snapshot, { catalogKnown });
         clauses.push(`${joinLabels(taskOnlyLabels)} `
             + `${taskOnlyHarnesses.length === 1 ? 'is task-only and does' : 'are task-only and do'} `
             + 'not change reviewer routes.');
@@ -451,7 +458,10 @@ export function familyRowHtml(family, { status, connected = false }) {
     return `
         <div class="agent-family-row" data-agent-family="${escapeHtml(family.harness)}">
             <span class="agent-family-identity">
-                <span class="agent-family-name">${escapeHtml(family.label)}</span>
+                ${harnessIdentityMarkup(family.harness, {
+                    label: family.label,
+                    className: 'agent-family-name',
+                })}
                 <span class="agent-family-status" data-tone="${escapeHtml(status.tone)}">${escapeHtml(status.text)}</span>
             </span>
             <button type="button" class="btn btn-secondary" data-agent-connect="${escapeHtml(family.harness)}">
@@ -461,9 +471,15 @@ export function familyRowHtml(family, { status, connected = false }) {
     `;
 }
 
-export function familyListHtml(snapshot, { accountsKnown = true } = {}) {
+export function familyListHtml(snapshot, {
+    accountsKnown = true,
+    catalogKnown = false,
+} = {}) {
     const connected = new Set(accountsKnown ? connectedHarnesses(snapshot) : []);
-    return AGENT_FAMILIES.map((family) => familyRowHtml(family, {
+    return AGENT_FAMILIES.map((family) => familyRowHtml({
+        ...family,
+        label: familyLabel(family.harness, snapshot, { catalogKnown }),
+    }, {
         status: familyStatusText(snapshot, family.harness, { accountsKnown }),
         connected: connected.has(family.harness),
     })).join('');
@@ -639,7 +655,10 @@ export function createAgentsStep({
             // seconds; replacing three unchanged rows on every tick is pointless
             // churn, and it opens a window where a click lands on a button that
             // is being replaced.
-            const html = familyListHtml(snapshot, { accountsKnown: known });
+            const html = familyListHtml(snapshot, {
+                accountsKnown: known,
+                catalogKnown: Boolean(store.catalogKnown),
+            });
             if (html !== state.listHtml) {
                 state.listHtml = html;
                 list.innerHTML = html;
@@ -657,6 +676,7 @@ export function createAgentsStep({
         if (outcome) {
             outcome.textContent = agentsOutcomeText(state.connected, {
                 accountsKnown: known,
+                catalogKnown: Boolean(store.catalogKnown),
                 skipPresets: state.skipPresets,
                 snapshot,
             });

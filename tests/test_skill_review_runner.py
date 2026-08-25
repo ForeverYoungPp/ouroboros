@@ -515,6 +515,10 @@ def test_lifecycle_finish_writes_compact_provenance_to_chat_jsonl(tmp_path, monk
     assert row["snapshot_attempt"] == 1
     assert row["task_id"] == "child-task"
     assert row["root_task_id"] == "root-task"
+    assert row["origin_task_id"] == "child-task"
+    assert row["origin_root_task_id"] == "root-task"
+    assert row["presentation_owner_task_id"] == "root-task"
+    assert row["group_id"] == "task:root-task:alpha"
     assert row["chat_id"] == 17
     assert row["source"] == "test"
     assert "Skill review round 1" in row["text"]
@@ -528,6 +532,7 @@ def test_lifecycle_finish_writes_compact_provenance_to_chat_jsonl(tmp_path, monk
     ]
     assert len(history) == 1
     assert history[0]["job_id"] == row["job_id"]
+    assert history[0]["presentation_owner_task_id"] == "root-task"
     assert history[0]["raw_actor_records"][0]["raw_text"] == raw_failure
 
 

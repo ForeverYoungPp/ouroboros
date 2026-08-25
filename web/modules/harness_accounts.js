@@ -61,6 +61,7 @@ import {
     unifiedAccounts,
 } from './claudexor_status_store.js';
 import { openConfirmDialog } from './confirm_dialog.js';
+import { harnessIdentityMarkup } from './harness_presentation.js';
 import { createLoginCardController, normalizeProfileName } from './harness_login_cards.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
@@ -612,7 +613,10 @@ export function accountMetaLine(row, payload, { quotaRead = READ_OK, nowMs = Dat
     return parts.filter(Boolean).join(' · ');
 }
 
-export function accountGroups(payload, { accountsRead = READ_OK } = {}) {
+export function accountGroups(payload, {
+    accountsRead = READ_OK,
+    catalogKnown = false,
+} = {}) {
     // One group per family, in a stable order: discovered families first (the
     // engine's own order), then any bootstrap family still missing, so a fresh
     // install shows all three cards and every one of them can be connected.
@@ -628,7 +632,7 @@ export function accountGroups(payload, { accountsRead = READ_OK } = {}) {
         const own = rows.filter((row) => row.harness === id);
         return {
             harness: id,
-            label: familyLabel(id, payload),
+            label: familyLabel(id, payload, { catalogKnown }),
             rows: own,
             status: familyStatus(own, { accountsRead }),
         };
@@ -974,7 +978,7 @@ function rowHtml(row, payload, facets = {}) {
     `;
 }
 
-function groupHtml(group, payload, facets) {
+export function harnessFamilyMarkup(group, payload, facets) {
     // An empty family is a ONE-LINE card: the header already carries the verdict
     // (familyStatus falls through to it), and printing the same sentence again
     // in the body just made the card twice as tall to say nothing new.
@@ -985,7 +989,7 @@ function groupHtml(group, payload, facets) {
         <section class="agent-family-card" data-family="${escapeHtml(group.harness)}">
             <div class="agent-family-head">
                 <div class="agent-family-id">
-                    <h4>${escapeHtml(group.label)}</h4>
+                    <h4>${harnessIdentityMarkup(group.harness, { label: group.label })}</h4>
                     <span class="ui-status" data-tone="${group.status.tone}">${escapeHtml(group.status.label)}</span>
                     ${nextUp ? `<span class="ui-status" data-tone="muted" data-next-up>${escapeHtml(nextUp)}</span>` : ''}
                 </div>
@@ -1036,8 +1040,11 @@ function renderRows() {
     const payload = state.store.snapshot || {};
     const accountsRead = state.store.facet(FACET_ACCOUNTS);
     const quotaRead = state.store.facet(FACET_QUOTA);
-    host.innerHTML = accountGroups(payload, { accountsRead })
-        .map((group) => groupHtml(group, payload, { accountsRead, quotaRead })).join('');
+    host.innerHTML = accountGroups(payload, {
+        accountsRead,
+        catalogKnown: state.store.catalogKnown,
+    })
+        .map((group) => harnessFamilyMarkup(group, payload, { accountsRead, quotaRead })).join('');
     host.querySelectorAll('[data-harness-login]').forEach((button) => {
         button.addEventListener('click', () => {
             if (!state.initialized) return;
@@ -1080,7 +1087,11 @@ function renderRows() {
             const harness = card?.dataset.family;
             const hasRows = Boolean(card?.querySelector('[data-harness]'));
             if (!hasRows) { startLogin(harness, ''); return; }
-            const profile = await promptProfileName({ family: familyLabel(harness, state.store.snapshot || {}) });
+            const profile = await promptProfileName({
+                family: familyLabel(harness, state.store.snapshot || {}, {
+                    catalogKnown: state.store.catalogKnown,
+                }),
+            });
             if (profile) startLogin(harness, profile);
         });
     });
@@ -1116,7 +1127,9 @@ export async function confirmRemoveAccount(harness, profileId, {
     renderImpl = renderRows,
 } = {}) {
     if (!harness || !profileId) return;
-    const family = familyLabel(harness, store.snapshot || {});
+    const family = familyLabel(harness, store.snapshot || {}, {
+        catalogKnown: store.catalogKnown,
+    });
     const answer = await dialogImpl({
         title: 'Remove account',
         body: removeAccountConfirmBody(profileId, family),

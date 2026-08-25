@@ -15,6 +15,7 @@ import {
     taskStoppedWithSummary,
     taskTerminalPhase,
 } from '../modules/log_events.js';
+import { senderLabel } from '../modules/chat_activity.js';
 
 const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
 
@@ -74,23 +75,18 @@ test('the chat.js terminal seam keeps soft-stop truth in the details', () => {
         /taskPresentation\(finalizing \? 'working' : taskTerminalPhase\(msg \|\| \{\}\)\)/,
     );
     assert.match(chat, /softStopped \? OWNER_STOP_DETAIL_MARKER : ''/);
-    assert.match(chat, /\[softStopDetail, reasonDetail, reviewDetails\]\.filter\(Boolean\)\.join\('\\n'\)/);
-    assert.match(chat, /visible: Boolean\(softStopDetail \|\| reasonDetail \|\| reviewDetails\)/);
+    assert.match(chat, /\[softStopDetail, reasonDetail\]\.filter\(Boolean\)\.join\('\\n'\)/);
+    assert.match(chat, /visible: Boolean\(softStopDetail \|\| reasonDetail\)/);
+    assert.doesNotMatch(chat, /reviewDetails/);
 });
 
 // --- MINOR 7 (Q4): cancel_receipt rendered as 📋 System, not assistant ---
 
 test('a system cancel_receipt row renders the 📋 System sender label', () => {
     // The receipt is transported role="system", system_type="cancel_receipt"
-    // (supervisor/terminal_delivery.py). getSenderLabel has no special case for
-    // it, so it must fall through to the generic system label — pin the branch
-    // so a future mapping cannot silently restyle receipts as assistant text.
-    const senderFn = chat.slice(chat.indexOf('function getSenderLabel'));
-    const systemBranch = senderFn.slice(0, senderFn.indexOf("if (isProgress)"));
-    assert.match(systemBranch, /if \(role === 'system'\) \{/);
-    assert.match(systemBranch, /return '📋 System';/);
-    // No cancel_receipt→assistant diversion anywhere in the sender mapping.
-    assert.doesNotMatch(senderFn.slice(0, 600), /cancel_receipt/);
+    // (supervisor/terminal_delivery.py). The extracted shared mapping has no
+    // receipt special case, so it must fall through to the generic system label.
+    assert.equal(senderLabel('system', false, 'cancel_receipt'), '📋 System');
 });
 
 test('the bubble keeps the system style class and the system_type marker', () => {

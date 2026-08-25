@@ -64,6 +64,7 @@
 // Pure helpers up top are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
+import { harnessPresentation } from './harness_presentation.js';
 
 export const STATUS_ENDPOINT = '/api/claudexor/status';
 export const WAKE_ENDPOINT = '/api/claudexor/wake';
@@ -166,27 +167,26 @@ export const FACET_SUBJECT = {
     [FACET_QUOTA]: 'subscription limits',
 };
 
-// Product names for the families a first run can bootstrap. They are used ONLY
-// until discovery answers with the engine's own `display_name`, and they are
-// trademarks rather than the generic label the Agents tab renamed away from.
-export const BOOTSTRAP_LABELS = {
-    codex: 'Codex', claude: 'Claude Code', cursor: 'Cursor', agy: 'Antigravity',
-};
-
 // THE family display name, for every surface that shows one. It lives with the
 // store because the store owns the payload this reads, and because two
 // authorities is how a surface ends up printing a raw harness id: the settings
 // tab preferred the engine's `display_name` while the onboarding wizard kept a
 // private map of three and fell through to the id, so a renamed or fourth
 // family would have reached the owner spelled `claude`.
-export function familyLabel(harnessId, payload) {
+// A daemon-provided display name is licensed only by an explicitly proven
+// catalog read. The fail-closed default matters because the store deliberately
+// retains its last snapshot across a failed request; an omitted provenance
+// argument must never turn that retained label back into a fresh daemon fact.
+export function familyLabel(harnessId, payload, { catalogKnown = false } = {}) {
     const id = String(harnessId || '');
-    for (const harness of payload?.harnesses || []) {
-        if (String(harness?.id || '') === id) {
-            return String(harness.display_name || '') || BOOTSTRAP_LABELS[id] || id;
+    if (catalogKnown) {
+        for (const harness of payload?.harnesses || []) {
+            if (String(harness?.id || '') === id) {
+                return harnessPresentation(id, { label: harness.display_name }).label;
+            }
         }
     }
-    return BOOTSTRAP_LABELS[id] || id;
+    return harnessPresentation(id).label;
 }
 
 export function facetGapClause(reads, facets = []) {

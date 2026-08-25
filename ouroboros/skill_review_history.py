@@ -14,6 +14,8 @@ from ouroboros.utils import append_jsonl, iter_jsonl_objects, jsonl_append_lock_
 
 log = logging.getLogger(__name__)
 USAGE_ATTRIBUTION_SCHEMA = "physical_attempt_v1"
+_DETAIL_LOOKUP_MAX_BYTES = 4 * 1024 * 1024
+_DETAIL_LOOKUP_MAX_RECORDS = 128
 _MARKER_FACT_KEYS = (
     "review_contract_fingerprint", "rebuttal_sha256", "usage_attribution_schema",
     "group_id", "content_hash", "root_task_id",
@@ -341,6 +343,83 @@ def load_history(
     if group_id:
         entries = [entry for entry in entries if entry.get("group_id") == group_id]
     return entries[-limit:] if limit > 0 else entries
+
+
+def find_history_job_bounded(
+    drive_root: pathlib.Path,
+    skill_name: str,
+    job_id: str,
+) -> tuple[Optional[Dict[str, Any]], str]:
+    """Find one immutable terminal row inside a fixed tail window.
+
+    Full-history authority readers remain unchanged. This helper exists only
+    for lazy presentation: an old job outside the bounded tail is unavailable
+    rather than making every detail expansion scan the growing domain log.
+    """
+    path = review_history_path(drive_root, skill_name)
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return None, "absent"
+    except OSError:
+        return None, "unavailable"
+    if size <= 0:
+        return None, "absent"
+    byte_window_truncated = size > _DETAIL_LOOKUP_MAX_BYTES
+    gaps: set[str] = set()
+    try:
+        parsed = list(iter_jsonl_objects(
+            path,
+            max_entries=_DETAIL_LOOKUP_MAX_RECORDS + 1,
+            tail_bytes=_DETAIL_LOOKUP_MAX_BYTES,
+            gap_reasons=gaps,
+        ))
+    except FileNotFoundError:
+        return None, "absent"
+    except OSError:
+        return None, "unavailable"
+    records_truncated = len(parsed) > _DETAIL_LOOKUP_MAX_RECORDS
+    if records_truncated:
+        parsed = parsed[-_DETAIL_LOOKUP_MAX_RECORDS:]
+    source_record = next(
+        (row for row in reversed(parsed) if str(row.get("job_id") or "") == job_id),
+        None,
+    )
+    # max_entries counts raw tail lines while parsed contains valid objects.
+    # Any malformed/partial raw row can hide ordinal-bearing authority just as
+    # surely as byte or record truncation.
+    projection_incomplete = byte_window_truncated or records_truncated or bool(gaps)
+    if source_record is not None:
+        marker = load_dispatch_marker_for_wave(
+            drive_root,
+            skill_name,
+            str(source_record.get("wave_id") or source_record.get("job_id") or ""),
+        )
+        source_record = _merge_marker_facts(source_record, marker)
+        ordinal_fields = ("review_round", "snapshot_attempt", "snapshot_revised")
+        if projection_incomplete and any(key not in source_record for key in ordinal_fields):
+            return None, "unavailable"
+        if projection_incomplete:
+            return dict(source_record), "found"
+        normalized = normalize_history([
+            _merge_marker_facts(
+                row,
+                load_dispatch_marker_for_wave(
+                    drive_root,
+                    skill_name,
+                    str(row.get("wave_id") or row.get("job_id") or ""),
+                ),
+            )
+            for row in parsed
+        ], skill_name)
+        record = next(
+            (row for row in reversed(normalized) if str(row.get("job_id") or "") == job_id),
+            None,
+        )
+        return record, "found"
+    if projection_incomplete:
+        return None, "unavailable"
+    return None, "not_found" if parsed else "absent"
 
 
 def allocate_ordinals(
