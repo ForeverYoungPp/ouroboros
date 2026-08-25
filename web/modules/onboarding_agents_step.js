@@ -799,6 +799,7 @@ export function createAgentsStep({
         // up on the Agents step and then silently un-renamed itself in the
         // summary. Same store, same snapshot, one spelling.
         get snapshot() { return store?.snapshot || null; },
+        get catalogKnown() { return Boolean(store?.catalogKnown); },
         get accountsKnown() { return accountsKnown(); },
         get availableSubagents() { return subagents.setting; },
         get generatedPreviewReady() {

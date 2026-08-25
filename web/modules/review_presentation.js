@@ -530,10 +530,17 @@ export function mergeReviewGroup(store, incoming) {
             }
         }
     }
-    const order = [
-        ...prior.attempts.filter((attempt) => !incomingIds.has(attempt.id)).map((attempt) => attempt.id),
-        ...incoming.attempts.map((attempt) => attempt.id),
-    ];
+    const priorIds = prior.attempts.map((attempt) => attempt.id);
+    const priorOnly = priorIds.filter((id) => !incomingIds.has(id));
+    // A projection that contains every known attempt owns their order (for
+    // example, terminal Skill history arriving after one live row). A bounded
+    // projection that omits a known attempt cannot move it to the front: keep
+    // the established order and append only genuinely new identities.
+    const order = priorOnly.length === 0
+        ? incoming.attempts.map((attempt) => attempt.id)
+        : [...priorIds, ...incoming.attempts
+            .filter((attempt) => !priorById.has(attempt.id))
+            .map((attempt) => attempt.id)];
     const staleActiveRegression = (
         (prior.state === 'terminal' || prior.state === 'superseded')
         && (incoming.state === 'queued' || incoming.state === 'running')

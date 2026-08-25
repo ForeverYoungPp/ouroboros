@@ -220,6 +220,7 @@ test('a stale partial projection cannot hide a newer active attempt it omits', (
     const merged = store.get('task:root:alpha');
     assert.equal(merged.state, 'running');
     assert.equal(merged.activeCount, 1);
+    assert.deepEqual(merged.attempts.map((attempt) => attempt.id), ['job-1', 'job-2', 'job-3']);
     assert.equal(merged.attempts.find((attempt) => attempt.id === 'job-3')?.state, 'running');
 });
 
@@ -290,6 +291,9 @@ test('a newer canonical Plan attempt retires prior unmatched liveness', () => {
     const running = store.get('plan:root');
     assert.equal(running.state, 'running');
     assert.equal(running.activeCount, 1);
+    assert.deepEqual(running.attempts.map((attempt) => attempt.id), [
+        settledFingerprint, firstOpen, secondOpen,
+    ]);
     assert.equal(running.attempts.find((attempt) => attempt.id === firstOpen)?.state, 'superseded');
     assert.equal(running.attempts.find((attempt) => attempt.id === secondOpen)?.state, 'running');
 
@@ -311,6 +315,9 @@ test('a newer canonical Plan attempt retires prior unmatched liveness', () => {
     assert.equal(terminal.state, 'terminal');
     assert.equal(terminal.activeCount, 0);
     assert.equal(terminal.verdict, 'GREEN');
+    assert.deepEqual(terminal.attempts.map((attempt) => attempt.id), [
+        settledFingerprint, firstOpen, secondOpen,
+    ]);
     assert.equal(terminal.attempts.find((attempt) => attempt.id === firstOpen)?.state, 'superseded');
     assert.equal(terminal.attempts.find((attempt) => attempt.id === secondOpen)?.state, 'terminal');
 });

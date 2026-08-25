@@ -79,7 +79,9 @@ def test_preview_contract_and_task_only_agy_copy_are_explicit() -> None:
     assert "@property {boolean} ok" in types
     assert "@property {AvailableSubagentsSetting} available_subagents" in types
     assert "@property {Object[]} diagnostics" in types
-    assert "{ harness: 'agy', label: 'Antigravity' }" in step
+    assert "{ harness: 'agy' }" in step
+    assert "familyLabel(family.harness" in step
+    assert "{ harness: 'agy', label:" not in step
     assert "task-only and does" in step
     assert "@typedef {Object} SubagentLastDelegation" in types
     assert "@property {SubagentLastDelegation=} subagent_last_delegation" in types
