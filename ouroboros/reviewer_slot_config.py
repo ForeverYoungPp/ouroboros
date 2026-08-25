@@ -74,7 +74,9 @@ class ConfiguredReviewerSlot:
     slot_id: str
     kind: str  # api_chat | agent_session
     target_id: str  # API model id, or opaque ``harness[=model]`` session spec
-    effort: str = ""  # "" = the surface's global default
+    # Empty means a compound Cursor/Agy route's encoded effort when present,
+    # otherwise the surface's established default.
+    effort: str = ""
     # The opaque per-row session spec. Structured agent_session rows carry
     # their target here; api rows carry ''. Legacy session rows resolve the
     # same shared route once into this row so delivery/fingerprint see one fact.
@@ -146,6 +148,26 @@ def _valid_effort(value: Any, where: str) -> str:
     return effort
 
 
+def _validate_concrete_session_target(route: RouteSpec, where: str) -> None:
+    """A structured session row names one concrete delegated route.
+
+    ``parse_route_spec`` owns the shared JSON shape and deliberately accepts an
+    opaque target.  Reviewer rows additionally promise exact delivery, so a
+    non-empty sentinel/malformed target that the canonical delegated-route
+    parser resolves to ``None`` must be refused here instead of reaching a
+    consumer that may interpret ``None`` as permission to use a shared route.
+    """
+    if not route.is_session or not route.target_id:
+        return
+    from ouroboros.subagents import parse_subagent_harness
+
+    if parse_subagent_harness(route.target_id) is None:
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} session target "
+            f"{route.target_id!r} does not name a concrete harness route"
+        )
+
+
 def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
     if not isinstance(row, dict):
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: {where} is not an object")
@@ -183,6 +205,7 @@ def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
         reject_api_pin=True,
     )
     kind = ROUTE_KIND_SESSION if route.is_session else ROUTE_KIND_API
+    _validate_concrete_session_target(route, where)
     effort = _valid_effort(row.get("effort"), where)
     validate_compound_session_effort(
         route, effort, setting=REVIEWER_SLOTS_ENV, where=where,
@@ -252,6 +275,7 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
             f"{REVIEWER_SLOTS_ENV}: enabled advisory agent_session route needs "
             "a non-empty target_id; shared-session fallback is legacy-only"
         )
+    _validate_concrete_session_target(shared_route, "advisory")
     effort = _valid_effort(raw.get("effort"), "advisory")
     if not effort and not shared_route.is_session:
         effort = "low"
@@ -477,7 +501,7 @@ def structured_scope_review_slots() -> Optional[list]:
         ReviewSlot(
             slot_id=row.slot_id,
             model=row.target_id,
-            effort=row.effort or row_effort(row, "scope_review"),
+            effort=row_effort(row, "scope_review"),
             role_hint="scope reviewer",
             use_local=review_model_uses_local(row.target_id),
             route=(ReviewRouteKind.AGENT_SESSION if row.is_session
@@ -518,11 +542,31 @@ def commit_triad_delivery() -> Dict[str, Any]:
     }
 
 
-def row_effort(row: ConfiguredReviewerSlot, surface: str) -> str:
-    """A row's effective effort: its own, else the surface's global default
-    (the existing effort mechanism, reused per the owner's directive)."""
+def row_effort(
+    row: ConfiguredReviewerSlot,
+    surface: str,
+    *,
+    default: str = "",
+) -> str:
+    """Resolve one effort authority without contradicting a compound route.
+
+    An explicit row field wins.  When it is absent, a Cursor/Agy compound model
+    slug already carries the requested effort and therefore wins over the
+    surface default.  Ordinary rows retain the existing surface default (or a
+    caller's established local default, as Plan Review does).
+    """
     if row.effort:
         return row.effort
+    if row.is_session:
+        encoded = compound_session_effort(RouteSpec(
+            kind=SHARED_ROUTE_KIND_SESSION,
+            target_id=row.session_target or row.target_id,
+            credential_profile_id=row.profile_id,
+        ))
+        if encoded:
+            return encoded
+    if default:
+        return default
     from ouroboros.config import resolve_effort
 
     return resolve_effort(surface)
