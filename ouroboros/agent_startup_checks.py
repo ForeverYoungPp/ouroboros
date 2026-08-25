@@ -820,17 +820,23 @@ def verify_system_state(env: Any, git_sha: str) -> None:
     )
     issues += 1 if growth_notes else 0
 
-    # Reconcile stale hung reviewed attempts left by abrupt process death
+    # The startup boundary proves that process-local reviewer threads from the
+    # prior worker are gone. Delegated rows with a durable invocation token keep
+    # their existing recovery path; TTL never authorizes a paid resend.
     try:
-        import pathlib
-        from ouroboros.review_state import _utc_now, update_state
-        drive_root = pathlib.Path(env.drive_root) if hasattr(env, "drive_root") else env.drive_path("").parent
-        expired = update_state(
-            drive_root,
-            lambda st: st.expire_stale_attempts(now_ts=_utc_now()),
-        )
+        review_reconciliation = _reconcile_review_attempts_on_startup(env)
+        reconciled = review_reconciliation["reconciled"]
+        expired = review_reconciliation["expired"]
+        if reconciled:
+            log.warning(
+                "Reconciled custody for %d reviewed attempt(s) on startup",
+                len(reconciled),
+            )
         if expired:
-            log.warning("Auto-expired %d stale reviewed attempt(s) on startup", len(expired))
+            log.warning(
+                "Auto-expired %d stale unpaid reviewed attempt(s) on startup",
+                len(expired),
+            )
     except Exception:
         log.debug("Failed to reconcile commit attempt state", exc_info=True)
 
@@ -848,6 +854,54 @@ def verify_system_state(env: Any, git_sha: str) -> None:
 
     if issues > 0:
         log.warning(f"Startup verification found {issues} issue(s): {checks}")
+
+
+def _reconcile_review_attempts_on_startup(env: Any) -> Dict[str, Any]:
+    """Reconcile review custody once at the worker-start boundary."""
+    from ouroboros import delegate_custody
+    from ouroboros.review_state import _utc_now, update_state
+
+    drive_root = (
+        pathlib.Path(env.drive_root)
+        if hasattr(env, "drive_root")
+        else env.drive_path("").parent
+    )
+    stamp = _utc_now()
+    candidates: Dict[str, set[str]] = {}
+    pending = list(delegate_custody.pending_invocations(drive_root))
+    records = [
+        (record, str(record.get("invocation_id") or ""))
+        for record in pending
+    ]
+    for run in delegate_custody.open_runs(drive_root):
+        token = str(getattr(run, "invocation_id", "") or "")
+        record = delegate_custody.invocation_record(drive_root, token)
+        if record is not None:
+            records.append((record, token))
+    for record, token in records:
+        operation_id = str(record.get("operation_id") or "")
+        if (
+            operation_id
+            and token
+            and str(record.get("surface") or "")
+            in {"multi_model_review", "scope_review"}
+        ):
+            candidates.setdefault(operation_id, set()).add(token)
+    recoverable = {
+        operation_id: next(iter(tokens))
+        for operation_id, tokens in candidates.items()
+        if len(tokens) == 1
+    }
+
+    def _mutate(state: Any) -> Dict[str, Any]:
+        reconciled = state.reconcile_process_local_review_custody_on_startup(
+            now_ts=stamp,
+            recoverable_invocations=recoverable,
+        )
+        expired = state.expire_stale_attempts(now_ts=stamp)
+        return {"reconciled": reconciled, "expired": expired}
+
+    return update_state(drive_root, _mutate)
 
 
 def inject_crash_report(env: Any) -> None:

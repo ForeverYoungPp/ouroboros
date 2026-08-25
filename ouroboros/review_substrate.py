@@ -14,8 +14,6 @@ import json
 import logging
 import os
 import pathlib
-import queue
-import threading
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
@@ -55,7 +53,6 @@ from ouroboros.usage_accounting import (
     UsageScope,
     current_usage_scope,
     physical_attempt_limit,
-    usage_scope,
 )
 from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact
 
@@ -82,7 +79,7 @@ class ReviewSlot:
     slot_id: str
     model: str
     effort: str = "medium"
-    timeout_sec: float = 300
+    timeout_sec: Optional[float] = None
     max_tokens: int = 16_384
     temperature: float | None = None
     role_hint: str = ""
@@ -96,6 +93,7 @@ class ReviewSlot:
     session_target: str = ""
     # Optional manual credential pin (Q2-в); '' = the daemon's rotation (D28).
     session_profile: str = ""
+    transport_timeout_sec: Optional[float] = None
 
 
 @dataclass
@@ -115,15 +113,15 @@ class ReviewRequest:
     max_tokens: int | None = None
     temperature: float | None = None
     no_proxy: bool = False
-    # Session delivery (agent_session route only; the api_chat route never reads
-    # either). ``session_root`` is the repository root the reviewer session runs
-    # in; ``session_task`` is the surface's compact route-owned task text — the
-    # SAME task/criteria the api pack carries, minus the assembled evidence,
-    # because a delegated reviewer retrieves context with its own tools (D12).
+    # Session route owns a compact task and repository root; API ignores both.
+    # It is the same criteria without the pack because the agent retrieves it.
     session_root: str = ""
     session_task: str = ""
     session_threads: Dict[str, str] = field(default_factory=dict)
-
+    deadline_at: str = ""
+    retry_key: str = ""
+    reconcile_only: bool = False
+    task_attempt: Any = None
 
 @dataclass
 class ReviewActorRecord:
@@ -164,6 +162,11 @@ class ReviewActorRecord:
     quorum_contribution: bool = False
     reason: str = ""
     enforcement_impact: str = ""
+    # Physical operation identity survives a logical timeout.  A pending actor
+    # is custody/reconciliation state, not permission for a blind resend.
+    operation_id: str = ""
+    operation_state: str = "settled"
+    late_result_pending: bool = False
 
 
 # B1 typed failure facts, ONE shared key tuple (row/wave/last-execution projections).
@@ -316,11 +319,11 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
         "quorum_contribution": bool(row.get("quorum_contribution")),
         "reason": _public_review_reason(reason),
         "enforcement_impact": str(row.get("enforcement_impact") or "abstains"),
-        # Forensic pointer to the full raw reviewer response in the private
-        # observability store (durable-copy reachability; never the raw text,
-        # never absolute host paths — exported task records must not leak the
-        # install layout). persist_call() nests the content hashes inside
-        # redacted_projection_ref/manifest_ref; project them flat.
+        # Preserve the physical identity when the logical actor times out.
+        "operation_id": str(row.get("operation_id") or ""),
+        "operation_state": str(row.get("operation_state") or "settled"),
+        "late_result_pending": bool(row.get("late_result_pending")),
+        # Flat, redacted pointer to the private full response artifact.
         "response_ref": _response_ref_projection(row.get("response_ref")),
     }
 
@@ -1017,8 +1020,6 @@ class ReviewCoordinator:
                 panel_id=_review_panel_id(request, []),
             )
 
-        result_queue: "queue.Queue[ReviewActorRecord]" = queue.Queue()
-        started_slots: List[ReviewSlot] = []
         base_scope = current_usage_scope() or UsageScope()
         usage_meta = (
             getattr(self.usage_ctx, "task_metadata", {})
@@ -1027,6 +1028,12 @@ class ReviewCoordinator:
         )
         if not isinstance(usage_meta, dict):
             usage_meta = {}
+        if not str(getattr(request, "deadline_at", "") or "").strip():
+            inherited_deadline = str(usage_meta.get("deadline_at") or "").strip()
+            if inherited_deadline:
+                request.deadline_at = inherited_deadline
+        if getattr(request, "task_attempt", None) in (None, ""):
+            request.task_attempt = getattr(self.usage_ctx, "task_attempt", None)
         task_id = str(request.task_id or base_scope.task_id or "")
         root_task_id = str(
             usage_meta.get("root_task_id") or base_scope.root_task_id or task_id
@@ -1066,46 +1073,25 @@ class ReviewCoordinator:
             root_limit_usd=root_limit,
         )
 
-        def _start_slot(slot: ReviewSlot) -> None:
-            started_slots.append(slot)
+        from ouroboros.review_custody import run_custodied_review_slots
 
-            def _worker() -> None:
-                try:
-                    with usage_scope(review_usage_scope):
-                        result_queue.put(self._run_slot(request, slot))
-                except Exception as exc:
-                    result_queue.put(self._error_actor(request, slot, f"{type(exc).__name__}: {exc}"))
-
-            thread = threading.Thread(
-                target=_worker,
-                name=f"ouroboros-review-{request.surface}-{slot.slot_id}",
-                daemon=True,
-            )
-            thread.start()
-
-        for slot in slots:
-            _start_slot(slot)
-
-        actors: List[ReviewActorRecord] = []
-        slot_timeout = max(0.001, max(float(slot.timeout_sec or 1) for slot in slots))
-        deadline = time.monotonic() + slot_timeout
-        while len(actors) < len(slots):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            try:
-                actors.append(result_queue.get(timeout=remaining))
-            except queue.Empty:
-                break
-
-        seen = {actor.slot_id for actor in actors}
-        started_ids = {slot.slot_id for slot in started_slots}
-        for slot in slots:
-            if slot.slot_id not in seen:
-                if slot.slot_id in started_ids:
-                    actors.append(self._error_actor(request, slot, f"Timeout after {slot.timeout_sec:g}s"))
-                else:
-                    actors.append(self._error_actor(request, slot, "Not started before reviewer timeout budget expired"))
+        actors = run_custodied_review_slots(
+            request=request, slots=slots,
+            usage_ctx=self.usage_ctx,
+            task_id=task_id,
+            usage_meta=usage_meta,
+            review_usage_scope=review_usage_scope,
+            run_slot=lambda slot, operation_id, retry_state, deadline, checkpoint: self._run_slot(
+                request, slot, operation_id=operation_id, retry_state=retry_state,
+                logical_deadline_monotonic=deadline,
+                **({"pending_invocation_checkpoint": checkpoint}
+                   if checkpoint is not None else {}),
+            ),
+            error_actor=lambda slot, error, operation_id="", operation_state="settled": self._error_actor(
+                request, slot, error, operation_id=operation_id,
+                operation_state=operation_state,
+            ),
+        )
         slot_order = {slot.slot_id: idx for idx, slot in enumerate(slots)}
         slots_by_id = {slot.slot_id: slot for slot in slots}
         actors.sort(key=lambda actor: slot_order.get(actor.slot_id, len(slot_order)))
@@ -1291,9 +1277,7 @@ class ReviewCoordinator:
         )
 
     def _custody_drive_root(self) -> pathlib.Path:
-        """Where a DELEGATED slot's custody rows live: the canonical (budget)
-        drive when the usage context names one, else this coordinator's drive.
-        Data handed to the seam once, so the api_chat route never pays for it."""
+        """Return the delegated slot's canonical custody root."""
         ctx = self.usage_ctx
         if ctx is not None and getattr(ctx, "drive_root", None):
             try:
@@ -1304,18 +1288,24 @@ class ReviewCoordinator:
                 log.debug("custody root resolution failed; using coordinator drive", exc_info=True)
         return self.drive_root
 
-    def _error_actor(self, request: ReviewRequest, slot: ReviewSlot, error: str) -> ReviewActorRecord:
+    def _error_actor(
+        self,
+        request: ReviewRequest,
+        slot: ReviewSlot,
+        error: str,
+        *,
+        operation_id: str = "",
+        operation_state: str = "settled",
+    ) -> ReviewActorRecord:
+        actor_status = "not_dispatched" if operation_state == "not_dispatched" else "error"
         call_id = new_call_id(f"review_{request.surface}_{slot.slot_id}_error")
         base_call_type = request.call_type or f"{request.surface}_review"
         assignment = ReviewAssignment(
             request=request, slot=slot, call_id=call_id, call_type=base_call_type,
             custody_root=self._custody_drive_root(),
         )
-        # The synthetic prompt record is the route's own projection too: a slot
-        # that never started must not build a pack its route would never send.
-        # Best-effort by construction — this is the last-resort record for a slot
-        # that already failed, so a route refusal (or an unrenderable prompt)
-        # must degrade the record, never re-raise inside the failure path.
+        # Best-effort failure evidence uses the route's own projection; a
+        # refusal here must degrade the record, never re-raise.
         try:
             prompt_projection = _review_route_executor(assignment, llm=self.llm).prompt_payload()
         except Exception:
@@ -1340,30 +1330,42 @@ class ReviewCoordinator:
                 call_id=f"{call_id}_error",
                 call_type=f"{base_call_type}_error",
                 payload={"error": sanitize_tool_result_for_log(error)},
-                manifest={"surface": request.surface, "slot_id": slot.slot_id, "model": slot.model, "status": "error", "synthetic": True},
+                manifest={"surface": request.surface, "slot_id": slot.slot_id, "model": slot.model, "status": actor_status, "synthetic": True},
             )
         except Exception:
             response_ref = {}
         return ReviewActorRecord(
             slot_id=slot.slot_id,
             model=slot.model,
-            status="error",
+            status=actor_status,
             error=sanitize_tool_result_for_log(error),
             prompt_ref=prompt_ref,
             response_ref=response_ref,
+            operation_id=str(operation_id or ""),
+            operation_state=str(operation_state or "settled"),
+            late_result_pending=str(operation_state or "") == "in_flight",
         )
 
-    def _run_slot(self, request: ReviewRequest, slot: ReviewSlot) -> ReviewActorRecord:
-        call_id = new_call_id(f"review_{request.surface}_{slot.slot_id}")
+    def _run_slot(
+        self,
+        request: ReviewRequest,
+        slot: ReviewSlot,
+        *,
+        operation_id: str = "",
+        retry_state: Optional[Dict[str, Any]] = None,
+        logical_deadline_monotonic: Optional[float] = None,
+        pending_invocation_checkpoint: Any = None,
+    ) -> ReviewActorRecord:
+        call_id = str(operation_id or new_call_id(f"review_{request.surface}_{slot.slot_id}"))
         base_call_type = request.call_type or f"{request.surface}_review"
         assignment = ReviewAssignment(
             request=request, slot=slot, call_id=call_id, call_type=base_call_type,
             custody_root=self._custody_drive_root(),
         )
-        # Transport is chosen once, here, through the seam; the prompt itself is
-        # rendered by the route (lazily) rather than by this method, so a route
-        # that does not send an API pack never assembles one.
         executor = _review_route_executor(assignment, llm=self.llm)
+        executor._logical_deadline_monotonic = logical_deadline_monotonic
+        executor.restore_custody(retry_state or {})
+        executor.set_pending_invocation_checkpoint(pending_invocation_checkpoint)
         prompt_projection = executor.prompt_payload()
         prompt_ref: Dict[str, Any] = {}
         response_ref: Dict[str, Any] = {}
@@ -1414,13 +1416,8 @@ class ReviewCoordinator:
             p3_actor = request.surface in {"multi_model_review", "scope_review"}
             acceptance_actor = request.surface == "task_acceptance"
             actor_attempts = 2 if (p3_actor or acceptance_actor) else 1
-            # Acceptance and P3 share the same two-physical-send rail. The
-            # documented contract ("one substantive call and at most two
-            # physical attempts total — same-route transport retry or
-            # extraction/format repair") historically retried only empty/errored
-            # responses; a MALFORMED non-empty acceptance response burned the
-            # actor as DEGRADED without using its second permitted send. The
-            # prompt, slot, and model never change on the repair resend.
+            # Acceptance and P3 share one two-send rail: transport/empty retry
+            # or same-route format repair. The prompt, slot and model stay fixed.
             attempt_rail = (
                 physical_attempt_limit(2)
                 if acceptance_actor or p3_actor
@@ -1428,28 +1425,39 @@ class ReviewCoordinator:
             )
             with attempt_rail:
                 _prior_msg, _prior_usage, _prior_text = None, None, ""
+                _last_msg, _last_usage, _last_text, _has_prior = None, None, "", False
                 for actor_attempt in range(actor_attempts):
+                    if (
+                        actor_attempt and logical_deadline_monotonic is not None
+                        and time.monotonic() >= logical_deadline_monotonic
+                    ):
+                        if _has_prior:
+                            msg, usage, raw_text = _last_msg, _last_usage, _last_text
+                            break
+                        raise TimeoutError("Review logical deadline expired before retry dispatch")
                     try:
-                        # The one seam. A null/non-object provider message comes
-                        # back as empty raw_text: retry once on P3, then preserve
-                        # the fail-closed empty actor.
+                        # One seam; a null provider message is an empty actor.
                         attempt = _execute_slot_attempt(
                             assignment, llm=self.llm, executor=executor,
                         )
                         msg, usage, raw_text = attempt.message, attempt.usage, attempt.raw_text
                     except UsageAccountingError:
-                        # Budget/ledger/physical-rail failures are not transport
-                        # transients and must remain fail-closed without another
-                        # send — but when the RAIL blocks the format-repair resend
-                        # (the first send burned both physical attempts on an
-                        # internal transport retry), keep the malformed first
-                        # answer as forensics instead of degrading to a bare error.
+                        # Budget/ledger/rail failures never trigger another send;
+                        # retain a prior malformed answer as forensic evidence.
                         if _prior_text:
                             msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
                             break
                         raise
-                    except Exception:
+                    except Exception as exc:
+                        from ouroboros.review_custody import retryable_review_exception
+                        if not retryable_review_exception(exc, self.usage_ctx):
+                            raise
                         if actor_attempt + 1 < actor_attempts:
+                            if (
+                                logical_deadline_monotonic is not None
+                                and time.monotonic() >= logical_deadline_monotonic
+                            ):
+                                raise
                             continue
                         if _prior_text:
                             # The repair RESEND failed (transport, timeout): keep the
@@ -1457,6 +1465,7 @@ class ReviewCoordinator:
                             msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
                             break
                         raise
+                    _last_msg, _last_usage, _last_text, _has_prior = msg, usage, raw_text, True
                     if raw_text.strip():
                         if (
                             acceptance_actor
@@ -1537,6 +1546,7 @@ class ReviewCoordinator:
                 failure_code=str(getattr(exc, "code", "") or ""),
                 reset_at=str(getattr(exc, "reset_at", "") or ""),
                 http_status=http_status if isinstance(http_status, int) and http_status else None,
+                usage=executor.failure_custody(),
                 prompt_ref=prompt_ref,
                 response_ref=response_ref,
                 duration_sec=round(time.time() - start, 3),
@@ -1575,13 +1585,9 @@ def run_review_request(
     llm: LLMClient | None = None,
     usage_ctx: Any = None,
 ) -> ReviewRunResult:
-    # Write-ahead paid stamp (Q16 dispatch seam): a gate that meters paid
-    # cycles installed a callback on ctx; it durably lands the paid fact
-    # BEFORE the first reviewer transport call. Assembly-only refusals never
-    # reach this line, so undispatched attempts stay outside every ceiling.
-    stamp_review_paid_on_dispatch(usage_ctx)
+    resolved_slots = reviewer_slots(role_hint=request.surface) if slots is None else slots
     coordinator = ReviewCoordinator(llm=llm, drive_root=drive_root, usage_ctx=usage_ctx)
-    result = coordinator.run(request, reviewer_slots(role_hint=request.surface) if slots is None else slots)
+    result = coordinator.run(request, resolved_slots)
     if request.surface == "task_acceptance":
         # D-Q5 annotation-only pass: feeds the clean bit + disclosure, never parse
         # validity/quorum/verdicts. Called UNGUARDED on purpose — the annotator is

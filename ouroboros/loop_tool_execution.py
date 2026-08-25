@@ -14,7 +14,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 import logging
 
-from ouroboros.config import get_finalization_grace_sec, load_settings
+from ouroboros.config import (
+    NESTED_SETTLEMENT_MARGIN_SEC,
+    get_finalization_grace_sec,
+    load_settings,
+)
 from ouroboros.deadline_utils import deadline_remaining_sec
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.tool_capabilities import (
@@ -32,6 +36,7 @@ from ouroboros.tools.review_synthesis import PLAN_REVIEW_CONTROL_PREFIX
 from ouroboros.usage_accounting import UsageAccountingError
 from ouroboros.utils import (
     append_jsonl,
+    emit_cognitive_operation_event,
     emit_log_event,
     sanitize_tool_args_for_log,
     sanitize_tool_result_for_log,
@@ -120,10 +125,6 @@ _FAILURE_MARKERS = (
 _EXIT_CODE_RE = re.compile(r"exit_code=(-?\d+)")
 _SIGNAL_RE = re.compile(r"signal=([A-Z0-9_]+)")
 
-# Reviewed mutative tools get a hard ceiling after their soft timeout.
-_REVIEWED_MUTATIVE_HARD_CEILING = 1800
-
-
 def _emit_live_log(tools: ToolRegistry, payload: Dict[str, Any]) -> None:
     """Emit a live log through the registry context queue. Lineage (parent/root task
     ids) is merged in so a SUBAGENT's live log routes to its root project thread
@@ -139,11 +140,60 @@ def _emit_live_log(tools: ToolRegistry, payload: Dict[str, Any]) -> None:
     for key in ("parent_task_id", "root_task_id"):
         if meta.get(key) and not enriched.get(key):
             enriched[key] = meta.get(key)
+    # Tool execution is another physical wait surface.  Keep the idle rail
+    # aware of it through the same typed operation seam as LLM/review calls;
+    # a timeout/late notice deliberately does NOT close the lease because the
+    # worker thread may still be running after the logical caller returned.
+    operation_id = str(enriched.get("tool_call_id") or "")
+    event_type = str(enriched.get("type") or "")
+    if operation_id and event_type in {"tool_call_started", "tool_call_finished"}:
+        emit_cognitive_operation_event(
+            event_queue,
+            task_id=str(enriched.get("task_id") or getattr(tool_ctx, "task_id", "") or ""),
+            operation_id=operation_id,
+            phase="started" if event_type == "tool_call_started" else "finished",
+            kind="tool",
+            task_attempt=getattr(tool_ctx, "task_attempt", None),
+            execution_id=str(enriched.get("execution_id") or ""),
+            round_id=str(enriched.get("round_id") or ""),
+            tool=str(enriched.get("tool") or ""),
+        )
     emit_log_event(
         event_queue,
         {"ts": utc_now_iso(), **enriched},
         log_label="tool live",
     )
+
+
+def _attach_late_tool_settlement(
+    tools: ToolRegistry,
+    future: Any,
+    *,
+    task_id: str,
+    tool_call_id: str,
+    correlation: Dict[str, Any],
+) -> None:
+    """Close the cognitive lease when a timed-out worker finally settles."""
+    tool_ctx = getattr(tools, "_ctx", None)
+    event_queue = getattr(tool_ctx, "event_queue", None)
+
+    def _settled(_future: Any) -> None:
+        emit_cognitive_operation_event(
+            event_queue,
+            task_id=task_id,
+            operation_id=tool_call_id,
+            phase="finished",
+            kind="tool",
+            task_attempt=getattr(tool_ctx, "task_attempt", None),
+            execution_id=str(correlation.get("execution_id") or ""),
+            round_id=str(correlation.get("round_id") or ""),
+            tool=str(correlation.get("tool") or ""),
+        )
+
+    try:
+        future.add_done_callback(_settled)
+    except Exception:
+        log.debug("Failed to attach late tool settlement callback", exc_info=True)
 
 
 def _tool_correlation(tools: ToolRegistry) -> Dict[str, Any]:
@@ -201,7 +251,7 @@ _PER_CALL_TIMEOUT_TOOLS = ("run_command", "run_script")
 # Structural ordering margin: the outer cap sits this far above the requested
 # per-call timeout so the handler's own (cleanly-messaged) subprocess timeout
 # fires first, before the outer thread-kill. Not a wait duration — a race margin.
-_PER_CALL_TIMEOUT_OUTER_MARGIN_SEC = 30
+_PER_CALL_TIMEOUT_OUTER_MARGIN_SEC = NESTED_SETTLEMENT_MARGIN_SEC
 
 
 def _tc_args(tc: Dict[str, Any]) -> Dict[str, Any]:
@@ -267,7 +317,8 @@ def _get_tool_timeout(
 # per-call/run_command machinery and the deadline milestones own those.
 _DEADLINE_CLAMPED_TOOLS = frozenset({
     "web_search", "browse_page", "browser_action", "youtube_transcript",
-    "wait_task", "wait_tasks",
+    "wait_task", "wait_tasks", "plan_task", "task_acceptance_review",
+    "analyze_screenshot", "vlm_query",
 })
 
 
@@ -829,6 +880,7 @@ def _execute_with_timeout(
     fn_name = str(requested_fn_name or "").strip()
     tool_call_id = tc["id"]
     is_code_tool = fn_name in tools.CODE_TOOLS
+    is_reviewed_mutative = fn_name in REVIEWED_MUTATIVE_TOOLS
     use_stateful = stateful_executor and fn_name in STATEFUL_BROWSER_TOOLS
     started_at = time.perf_counter()
     correlation = _tool_correlation(tools)
@@ -843,7 +895,8 @@ def _execute_with_timeout(
         "type": "tool_call_started",
         "task_id": task_id,
         "tool": fn_name,
-        "timeout_sec": timeout_sec,
+        "timeout_sec": None if is_reviewed_mutative else timeout_sec,
+        "terminal_wait": is_reviewed_mutative,
         "args": args_for_log,
     }, correlation, tool_call_id=tool_call_id))
 
@@ -868,6 +921,10 @@ def _execute_with_timeout(
             }, correlation, tool_call_id=tool_call_id))
             return result
         except (TimeoutError, concurrent.futures.TimeoutError):
+            _attach_late_tool_settlement(
+                tools, future, task_id=task_id, tool_call_id=tool_call_id,
+                correlation={**correlation, "tool": fn_name},
+            )
             stateful_executor.reset()
             reset_msg = "Browser state has been reset. "
             timeout_result = _make_timeout_result(
@@ -891,7 +948,7 @@ def _execute_with_timeout(
                 context.run, _execute_single_tool, tools, tc, drive_logs, task_id,
             )
             try:
-                result = future.result(timeout=timeout_sec)
+                result = future.result() if is_reviewed_mutative else future.result(timeout=timeout_sec)
                 result_meta = result.get("result_meta") or {}
                 _emit_live_log(tools, _with_correlation({
                     "type": "tool_call_finished",
@@ -909,22 +966,10 @@ def _execute_with_timeout(
                 }, correlation, tool_call_id=tool_call_id))
                 return result
             except (TimeoutError, concurrent.futures.TimeoutError):
-                is_reviewed_mutative = fn_name in REVIEWED_MUTATIVE_TOOLS
                 is_foreground_mutative = fn_name in FOREGROUND_MUTATIVE_TOOLS
 
-                if is_reviewed_mutative or is_foreground_mutative:
-                    # Review/code mutation tools must not end with ambiguous timeout.
-                    try:
-                        from ouroboros.tools.commit_gate import _mark_review_attempt_late
-                        ctx = getattr(tools, "_ctx", None)
-                        if ctx is not None and is_reviewed_mutative:
-                            _mark_review_attempt_late(
-                                ctx,
-                                soft_timeout_sec=timeout_sec,
-                                duration_sec=round(time.perf_counter() - started_at, 1),
-                            )
-                    except Exception:
-                        log.debug("Failed to mark reviewed attempt as late_result_pending", exc_info=True)
+                if is_foreground_mutative:
+                    # Publication-like mutation must not end with an ambiguous timeout.
                     _emit_live_log(tools, _with_correlation({
                         "type": "tool_call_late",
                         "task_id": task_id,
@@ -934,91 +979,30 @@ def _execute_with_timeout(
                         "message": (
                             f"Foreground mutative tool '{fn_name}' exceeded "
                             f"{timeout_sec}s — still waiting for result "
-                            + (
-                                f"(hard ceiling: {_REVIEWED_MUTATIVE_HARD_CEILING}s)"
-                                if is_reviewed_mutative else "(terminal wait: no background edits)"
-                            )
+                            + "(terminal wait: no background edits)"
                         ),
                     }, correlation, tool_call_id=tool_call_id))
-                    if is_foreground_mutative:
-                        result = future.result()
-                        result_meta = result.get("result_meta") or {}
-                        _emit_live_log(tools, _with_correlation({
-                            "type": "tool_call_finished",
-                            "task_id": task_id,
-                            "tool": fn_name,
-                            "args": result.get("args_for_log", args_for_log),
-                            "duration_sec": round(time.perf_counter() - started_at, 3),
-                            "is_error": bool(result.get("is_error")),
-                            "status": result_meta.get("status"),
-                            "late": True,
-                            "terminal_wait": True,
-                        }, correlation, tool_call_id=tool_call_id))
-                        return result
-                    try:
-                        ceiling = max(_REVIEWED_MUTATIVE_HARD_CEILING, timeout_sec + 60)
-                        remaining = max(1, ceiling - timeout_sec)
-                        result = future.result(timeout=remaining)
-                        result_meta = result.get("result_meta") or {}
-                        _emit_live_log(tools, _with_correlation({
-                            "type": "tool_call_finished",
-                            "task_id": task_id,
-                            "tool": fn_name,
-                            "args": result.get("args_for_log", args_for_log),
-                            "duration_sec": round(time.perf_counter() - started_at, 3),
-                            "is_error": bool(result.get("is_error")),
-                            "status": result_meta.get("status"),
-                            "late": True,
-                        }, correlation, tool_call_id=tool_call_id))
-                        return result
-                    except (TimeoutError, concurrent.futures.TimeoutError):
-                        # Hard ceiling records terminal state; late real result may overwrite.
-                        try:
-                            from ouroboros.tools.commit_gate import _record_commit_attempt
-                            ctx = getattr(tools, "_ctx", None)
-                            if ctx is not None:
-                                _record_commit_attempt(
-                                    ctx,
-                                    commit_message=str(getattr(ctx, "_current_review_commit_message", "") or ""),
-                                    status="failed",
-                                    block_reason="infra_failure",
-                                    block_details=(
-                                        f"Hard ceiling timeout ({_REVIEWED_MUTATIVE_HARD_CEILING}s). "
-                                        "The underlying operation may still complete later."
-                                    ),
-                                    duration_sec=round(time.perf_counter() - started_at, 1),
-                                    late_result_pending=True,
-                                    phase="late_hard_ceiling",
-                                    readiness_warnings=[
-                                        "Reviewed mutative tool exceeded the hard ceiling; late result may still arrive."
-                                    ],
-                                    degraded_reasons=[
-                                        f"hard_ceiling_timeout:{_REVIEWED_MUTATIVE_HARD_CEILING}"
-                                    ],
-                                )
-                        except Exception:
-                            pass
-                        timeout_result = _make_timeout_result(
-                            fn_name, tool_call_id, is_code_tool, tc, drive_logs,
-                            _REVIEWED_MUTATIVE_HARD_CEILING, task_id,
-                            reset_msg=(
-                                f"CRITICAL: Reviewed mutative tool hit hard ceiling "
-                                f"({_REVIEWED_MUTATIVE_HARD_CEILING}s). "
-                                "Check git state manually. "
-                            ),
-                            correlation=correlation,
-                        )
-                        _emit_live_log(tools, _with_correlation({
-                            "type": "tool_call_timeout",
-                            "task_id": task_id,
-                            "tool": fn_name,
-                            "args": args_for_log,
-                            "duration_sec": round(time.perf_counter() - started_at, 3),
-                            "timeout_sec": _REVIEWED_MUTATIVE_HARD_CEILING,
-                            "hard_ceiling": True,
-                        }, correlation, tool_call_id=tool_call_id))
-                        return timeout_result
+                    # Foreground mutators own effects that cannot safely be
+                    # abandoned in a background thread.
+                    result = future.result()
+                    result_meta = result.get("result_meta") or {}
+                    _emit_live_log(tools, _with_correlation({
+                        "type": "tool_call_finished",
+                        "task_id": task_id,
+                        "tool": fn_name,
+                        "args": result.get("args_for_log", args_for_log),
+                        "duration_sec": round(time.perf_counter() - started_at, 3),
+                        "is_error": bool(result.get("is_error")),
+                        "status": result_meta.get("status"),
+                        "late": True,
+                        "terminal_wait": True,
+                    }, correlation, tool_call_id=tool_call_id))
+                    return result
                 else:
+                    _attach_late_tool_settlement(
+                        tools, future, task_id=task_id, tool_call_id=tool_call_id,
+                        correlation={**correlation, "tool": fn_name},
+                    )
                     timeout_result = _make_timeout_result(
                         fn_name, tool_call_id, is_code_tool, tc, drive_logs,
                         timeout_sec, task_id, reset_msg="", correlation=correlation

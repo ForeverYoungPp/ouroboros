@@ -275,6 +275,44 @@ def test_local_candidate_is_measured_after_existing_local_transform(data_root, m
     assert final["candidate_raw_size_bytes"] == len(raw)
 
 
+def test_local_read_timeout_after_dispatch_is_not_retried(data_root, monkeypatch):
+    import httpx
+    import ouroboros.local_model as local_model
+
+    client = LLMClient(api_key="unused")
+    calls = 0
+
+    class _Completions:
+        @staticmethod
+        def create(**_candidate):
+            nonlocal calls
+            calls += 1
+            raise httpx.ReadTimeout("local server stopped answering")
+
+    monkeypatch.setattr(
+        client,
+        "_get_local_client",
+        lambda: SimpleNamespace(chat=SimpleNamespace(completions=_Completions())),
+    )
+    monkeypatch.setattr(
+        local_model,
+        "get_manager",
+        lambda: SimpleNamespace(get_context_length=lambda: 8192),
+    )
+    with ua.usage_scope(_scope(data_root, "task-local-timeout")), ua.bind_physical_attempt_context(
+        _physical_context("route-local-timeout")
+    ), pytest.raises(httpx.ReadTimeout):
+        client._chat_local(
+            [{"role": "user", "content": "do this once"}],
+            None,
+            max_tokens=1024,
+            tool_choice="auto",
+        )
+
+    assert calls == 1
+    assert _rows(data_root)[-1]["state"] == "unresolved"
+
+
 def test_internal_retry_gets_distinct_attempt_but_stable_context_identity(data_root, monkeypatch):
     client = LLMClient(api_key="unused")
     sends = []

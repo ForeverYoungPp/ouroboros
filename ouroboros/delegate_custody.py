@@ -625,20 +625,17 @@ def new_invocation_id() -> str:
 
 
 def invocation_record(drive_root: Any, invocation_id: str) -> Optional[Dict[str, Any]]:
-    """One invocation's durable fate: who requested it, the EXACT body it sent, the
-    resources that attempt bound, and how it resolved.
-
+    """One invocation's durable fate: who requested it, the EXACT body it sent,
+    the resources that attempt bound, and how it resolved.
     ``state`` is ``pending`` (requested, never bound, never definitely refused —
     the only state an explicit retry may replay), ``started`` (a run bound to it;
     carried with its ``run_id`` so the caller can wait instead of re-posting), or
     ``failed_definite`` (the daemon definitively refused; the id is dead — replaying
     it against a since-reconfigured route is how a key wedges into a permanent 409).
-
     ``request`` is the canonical POST body recorded before the wire attempt: a retry
     replays THESE bytes, never a re-derivation, because the engine's replay match
     digests the request and answers a same-key-different-digest POST with 409
     ``idempotency_conflict``.
-
     ``route``, ``project_id``, ``project_owned`` and ``idempotency_key`` are the
     attempt facts that never ride the wire, read from the FIRST request row — the
     minting — because the invocation stores its facts ONCE and a retry replays them.
@@ -657,6 +654,9 @@ def invocation_record(drive_root: Any, invocation_id: str) -> Optional[Dict[str,
         if kind == START_REQUESTED and found is None:
             found = {
                 "task_id": str(row.get("task_id") or ""),
+                "surface": str(row.get("surface") or ""),
+                "slot_id": str(row.get("slot_id") or ""),
+                "operation_id": str(row.get("operation_id") or ""),
                 "request": row.get("request") if isinstance(row.get("request"), dict) else None,
                 "route": str(row.get("route") or ""),
                 "project_id": str(row.get("project_id") or ""),

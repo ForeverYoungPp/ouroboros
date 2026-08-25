@@ -7,12 +7,13 @@ The ``paid`` fact of Max-Review-Cycles accounting is recorded at PHYSICAL
 dispatch: a gate that must durably record "this wave spent reviewer money"
 installs a :class:`ReviewPaidStamp` on ``ctx._review_paid_stamp`` for the
 duration of its wave, and the shared reviewer transport entry
-(``review_substrate.run_review_request``) invokes it immediately before the
-first transport call. Assembly-only refusals (triad fit ladder, scope pack
-signals, skill prompt building) exit before the seam, so a $0 attempt stays
-outside every ceiling; a crash after dispatch keeps the durable paid fact
-(write-ahead). This seam is also where the L-review lane's two-phase
-admission slots in at synthesis.
+(``review_custody.run_custodied_review_slots``) invokes it after slot resolution and
+immediately before worker fan-out. Assembly-only refusals (triad fit ladder,
+scope pack signals, skill prompt building) exit before the seam, so a $0
+attempt stays outside every ceiling; a worker that outlives its logical caller
+cannot race the write-ahead fact, and a crash after dispatch keeps the durable paid fact.
+Commit review verifies this write fail-closed; other callers retain historical
+fail-open accounting. This seam also hosts the L-review lane's two-phase admission.
 """
 
 from __future__ import annotations
@@ -52,16 +53,16 @@ class ReviewPaidStamp:
     Parallel dispatch means two sides can race to be "the first transport
     call" (the commit gate dispatches triad and scope concurrently): the first
     caller performs the durable write-ahead, later callers block on the lock
-    until it lands and then no-op — so EVERY side is guaranteed the paid fact
-    is durable before its own transport begins. A failing write is not
-    retried and still marks the stamp fired: the terminal record is the
-    primary ledger, and this writer is fail-open cost accounting, never a
-    safety gate.
+    until it lands and then no-op. The default consumes a failed write and
+    remains fail-open for existing accounting callers. ``fail_closed=True``
+    propagates the error and leaves the stamp unfired, so a paid transport may
+    start only after a later idempotent write succeeds.
     """
 
-    def __init__(self, write: Callable[[], None]) -> None:
+    def __init__(self, write: Callable[[], None], *, fail_closed: bool = False) -> None:
         self._write = write
         self._lock = threading.Lock()
+        self.fail_closed = bool(fail_closed)
         self.fired = False
 
     def __call__(self) -> None:
@@ -70,8 +71,12 @@ class ReviewPaidStamp:
                 return
             try:
                 self._write()
-            finally:
+            except Exception:
+                if self.fail_closed:
+                    raise
                 self.fired = True
+                raise
+            self.fired = True
 
 
 def stamp_review_paid_on_dispatch(ctx: Any) -> None:
@@ -79,7 +84,8 @@ def stamp_review_paid_on_dispatch(ctx: Any) -> None:
 
     Called by the shared reviewer transport entry immediately before the first
     physical reviewer call. Surfaces that do not meter paid cycles simply
-    never install ``ctx._review_paid_stamp``. Fail-open by design.
+    never install ``ctx._review_paid_stamp``. The installed stamp selects the
+    default fail-open or explicit fail-closed contract.
     """
     stamp = getattr(ctx, "_review_paid_stamp", None) if ctx is not None else None
     if not callable(stamp):
@@ -87,4 +93,6 @@ def stamp_review_paid_on_dispatch(ctx: Any) -> None:
     try:
         stamp()
     except Exception:
+        if bool(getattr(stamp, "fail_closed", False)):
+            raise
         log.debug("review paid dispatch stamp failed (fail-open)", exc_info=True)

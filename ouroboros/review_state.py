@@ -106,8 +106,8 @@ def _commit_readiness_debts_view(state: Any) -> List["CommitReadinessDebtItem"]:
 _OBLIGATION_STR_DEFAULTS = {"obligation_id": "", "item": "", "severity": "critical", "reason": "", "source_attempt_ts": "", "source_attempt_msg": "", "status": "still_open", "resolved_by": "", "repo_key": _LEGACY_CURRENT_REPO_KEY}
 _DEBT_STR_DEFAULTS = {"debt_id": "", "category": "", "summary": "", "severity": "warning", "status": "detected", "repo_key": _LEGACY_CURRENT_REPO_KEY, "fingerprint": "", "title": "Commit readiness debt", "source": "review_state", "first_seen_at": "", "last_seen_at": "", "updated_at": "", "verified_at": ""}
 _RUN_STR_DEFAULTS = {"snapshot_hash": "", "commit_message": "", "status": "stale", "snapshot_summary": "", "raw_result": "", "bypass_reason": "", "bypassed_by_task": "", "repo_key": _LEGACY_CURRENT_REPO_KEY, "tool_name": _DEFAULT_ADVISORY_TOOL_NAME, "phase": "advisory", "model_used": "", "session_id": ""}
-_ATTEMPT_STR_DEFAULTS = {"commit_message": "", "snapshot_hash": "", "block_reason": "", "block_details": "", "task_id": "", "repo_key": _LEGACY_CURRENT_REPO_KEY, "tool_name": _DEFAULT_TOOL_NAME, "pre_review_fingerprint": "", "post_review_fingerprint": "", "fingerprint_status": "", "scope_model": "", "block_class": "", "rebuttal_sha256": "", "review_contract_fingerprint": "", "root_task_id": ""}
-_ATTEMPT_MERGE_INCOMING_FIRST = ("ts", "commit_message", "status", "snapshot_hash", "block_reason", "block_details", "duration_sec", "task_id", "repo_key", "tool_name", "phase", "pre_review_fingerprint", "post_review_fingerprint", "fingerprint_status", "scope_model", "block_class", "rebuttal_sha256", "review_contract_fingerprint", "root_task_id")
+_ATTEMPT_STR_DEFAULTS = {"commit_message": "", "snapshot_hash": "", "block_reason": "", "block_details": "", "task_id": "", "repo_key": _LEGACY_CURRENT_REPO_KEY, "tool_name": _DEFAULT_TOOL_NAME, "pre_review_fingerprint": "", "post_review_fingerprint": "", "fingerprint_status": "", "scope_model": "", "block_class": "", "rebuttal_sha256": "", "review_contract_fingerprint": "", "review_retry_key": "", "root_task_id": ""}
+_ATTEMPT_MERGE_INCOMING_FIRST = ("ts", "commit_message", "status", "snapshot_hash", "block_reason", "block_details", "duration_sec", "task_id", "repo_key", "tool_name", "phase", "pre_review_fingerprint", "post_review_fingerprint", "fingerprint_status", "scope_model", "block_class", "rebuttal_sha256", "review_contract_fingerprint", "review_retry_key", "root_task_id")
 _ATTEMPT_MERGE_INCOMING_LISTS = ("critical_findings", "advisory_findings", "obligation_ids", "readiness_warnings")
 _RUN_STATUS_ICONS = {"fresh": "✅", "stale": "⚠️", "bypassed": "⏭️", "skipped": "⏭️", "parse_failure": "🔴"}
 
@@ -269,6 +269,7 @@ class CommitAttemptRecord:
     rebuttal_sha256: str = ""
     paid: bool = False
     review_contract_fingerprint: str = ""
+    review_retry_key: str = ""
     root_task_id: str = ""
     # True once the row's heavy forensic payloads (raw reviewer results, full
     # free text) were compacted because the preserved accounting row fell
@@ -316,7 +317,7 @@ class AdvisoryReviewState:
     def get_active_attempts(self, *, repo_key: str | None = None) -> List[CommitAttemptRecord]:
         active = [
             item for item in self.attempts
-            if item.status == "reviewing" or item.late_result_pending
+            if _attempt_has_active_review_custody(item)
         ]
         return _filter_repo_scope(active, repo_key)
 
@@ -530,6 +531,8 @@ class AdvisoryReviewState:
             kept.append(item)
         self.attempts = kept
         for item in self.attempts[:-_MAX_ATTEMPT_HISTORY]:
+            if _attempt_has_active_review_custody(item):
+                continue
             _strip_attempt_heavy_payload(item)
 
     def _allocate_obligation_id(self) -> str:
@@ -1029,6 +1032,10 @@ class AdvisoryReviewState:
         for item in self.attempts:
             if item.status != "reviewing" and not item.late_result_pending:
                 continue
+            # TTL cleans up unpaid legacy UI rows. It must never become
+            # permission to buy over paid work whose outcome remains unknown.
+            if item.late_result_pending or (item.status == "reviewing" and item.paid):
+                continue
             started_epoch = _parse_iso_ts(item.started_ts or item.ts)
             if started_epoch is None:
                 continue
@@ -1054,6 +1061,89 @@ class AdvisoryReviewState:
             expired.append(item)
 
         return expired
+
+    def reconcile_process_local_review_custody_on_startup(
+        self,
+        *,
+        now_ts: str | None = None,
+        recoverable_invocations: Optional[Dict[str, str]] = None,
+    ) -> List[CommitAttemptRecord]:
+        """Settle process-local review rows whose worker died at restart.
+
+        The startup boundary is the causal proof: process-local API workers from
+        the prior worker process cannot survive it.  A delegated row carrying a
+        durable ``pending_invocation_id`` is different — its Claudexor run may
+        still be live and remains recoverable, so startup leaves it active.
+
+        This is intentionally not TTL policy.  Startup itself proves the old
+        in-process waiter is gone, so tokenless rows settle as typed failures.
+        If no delegated token remains, the attempt becomes terminal and a new
+        explicit commit attempt may start; elapsed time alone never grants that
+        authority.
+        """
+        stamp = now_ts or _utc_now()
+        recoverable = dict(recoverable_invocations or {})
+        changed: List[CommitAttemptRecord] = []
+        for item in self.attempts:
+            if not _attempt_has_active_review_custody(item):
+                continue
+            item_changed = False
+            roster_rows = _attempt_review_roster_rows(item)
+            for row in roster_rows:
+                if not _review_roster_row_is_pending(row):
+                    continue
+                if str(row.get("pending_invocation_id") or "").strip():
+                    continue
+                operation_id = str(row.get("operation_id") or "").strip()
+                recovered_token = str(recoverable.get(operation_id) or "")
+                if recovered_token:
+                    # A START_REQUESTED/STARTED row may land immediately before
+                    # the exact-slot checkpoint. Its operation id joins the two
+                    # existing ledgers without guessing by task or slot.
+                    row["pending_invocation_id"] = recovered_token
+                    row["late_result_pending"] = True
+                    item_changed = True
+                    continue
+                row["operation_state"] = "settled"
+                row["late_result_pending"] = False
+                row["status"] = "error"
+                row["failure_code"] = "process_local_review_worker_lost"
+                row["error"] = "process-local review worker was lost across startup"
+                item_changed = True
+            still_pending = any(
+                _review_roster_row_is_pending(row)
+                for row in roster_rows
+            )
+            # Legacy paid stamps predate durable roster reservation. A process
+            # can therefore restart with an active top-level row but no slot
+            # rows at all, or with only already-terminal rows whose aggregate
+            # was never written. The orchestration process is gone; preserve
+            # the evidence and close the attempt as infra failure rather than
+            # blocking every future commit forever.
+            if not item_changed and still_pending:
+                continue
+            if not item_changed and not (
+                item.status == "reviewing" or item.late_result_pending
+            ):
+                continue
+            item.status = "reviewing" if still_pending else "failed"
+            item.phase = "late_wait" if still_pending else "review"
+            item.block_reason = (
+                "review_late_result_pending" if still_pending else "infra_failure"
+            )
+            item.block_details = (
+                "A process-local review worker was lost across startup; "
+                "delegated rows remain available for exact reconciliation."
+                if still_pending
+                else "Process restart proved every tokenless review worker was lost; "
+                "the paid attempt failed without a review verdict."
+            )
+            item.late_result_pending = still_pending
+            if not still_pending:
+                item.finished_ts = stamp
+            item.updated_ts = stamp
+            changed.append(item)
+        return changed
 
 
 def _obligation_from_dict(d: Dict[str, Any]) -> ObligationItem:
@@ -1093,9 +1183,24 @@ def _record_from_dict(d: Dict[str, Any]) -> AdvisoryRunRecord:
     )
 
 
+def _malformed_roster_row(surface: str) -> Dict[str, Any]:
+    from ouroboros.review_dispatch import slot_id_for_row
+
+    prefix = "custody_lost_scope_slot" if surface == "scope_review" else "custody_lost_slot"
+    return {
+        "slot_id": slot_id_for_row(0, prefix=prefix),
+        "status": "error",
+        "error": "durable review roster container is malformed",
+        "operation_state": "custody_lost",
+        "late_result_pending": True,
+    }
+
+
 def _commit_attempt_from_dict(d: Dict[str, Any]) -> CommitAttemptRecord:
     ts = str(d.get("ts", ""))
     status = str(d.get("status", "failed"))
+    raw_triad = d.get("triad_raw_results")
+    raw_scope = d.get("scope_raw_result")
     return CommitAttemptRecord(
         **{key: str(d.get(key, default)) for key, default in _ATTEMPT_STR_DEFAULTS.items()},
         ts=ts,
@@ -1114,14 +1219,75 @@ def _commit_attempt_from_dict(d: Dict[str, Any]) -> CommitAttemptRecord:
         updated_ts=str(d.get("updated_ts", ts)),
         finished_ts=str(d.get("finished_ts", ts if status in ("blocked", "failed", "succeeded") else "")),
         triad_models=[str(x) for x in (d.get("triad_models") or [])],
-        triad_raw_results=list(d.get("triad_raw_results") or []),
-        scope_raw_result=dict(d.get("scope_raw_result") or {}),
+        triad_raw_results=(
+            list(raw_triad) if isinstance(raw_triad, list)
+            else [] if raw_triad is None
+            else [_malformed_roster_row("multi_model_review")]
+        ),
+        scope_raw_result=(
+            dict(raw_scope) if isinstance(raw_scope, dict)
+            else {} if raw_scope is None
+            else {"raw_results": [_malformed_roster_row("scope_review")]}
+        ),
         paid=bool(d.get("paid", False)),
         raw_stripped=bool(d.get("raw_stripped", False)),
     )
 
 
-def _load_state_unlocked(drive_root: pathlib.Path) -> AdvisoryReviewState:
+_ATTEMPT_AUTHORITY_STRING_FIELDS = frozenset({
+    "ts", "status", "phase", "started_ts", "updated_ts", "finished_ts",
+    "task_id", "repo_key", "tool_name", "review_retry_key",
+    "review_contract_fingerprint", "block_reason",
+})
+_ATTEMPT_AUTHORITY_BOOL_FIELDS = frozenset({
+    "blocked", "paid", "late_result_pending", "raw_stripped",
+})
+
+
+def _validate_attempt_authority_shape(data: Dict[str, Any]) -> List[Any]:
+    """Validate only mutation-authoritative attempt structure.
+
+    Ordinary ``load_state`` remains fail-soft.  A locked read-modify-write must
+    instead refuse malformed lifecycle authority before normalization can turn
+    it into a different, writable value.  Nested reviewer rosters deliberately
+    stay out of this validator: their existing fail-soft ``custody_lost``
+    hardening is the recovery contract.
+    """
+    raw_attempts = data.get("attempts", [])
+    if not isinstance(raw_attempts, list):
+        raise ValueError("advisory review attempts must be a list")
+    for index, item in enumerate(raw_attempts):
+        if not isinstance(item, dict):
+            raise ValueError(f"advisory review attempt {index} must be an object")
+        for key in _ATTEMPT_AUTHORITY_STRING_FIELDS:
+            if key in item and not isinstance(item[key], str):
+                raise ValueError(
+                    f"advisory review attempt {index} has invalid {key}"
+                )
+        for key in _ATTEMPT_AUTHORITY_BOOL_FIELDS:
+            if key in item and not isinstance(item[key], bool):
+                raise ValueError(
+                    f"advisory review attempt {index} has invalid {key}"
+                )
+        if "attempt" in item and (
+            not isinstance(item["attempt"], int) or isinstance(item["attempt"], bool)
+        ):
+            raise ValueError(
+                f"advisory review attempt {index} has invalid attempt"
+            )
+        if "duration_sec" in item and (
+            not isinstance(item["duration_sec"], (int, float))
+            or isinstance(item["duration_sec"], bool)
+        ):
+            raise ValueError(
+                f"advisory review attempt {index} has invalid duration_sec"
+            )
+    return raw_attempts
+
+
+def _load_state_unlocked(
+    drive_root: pathlib.Path, *, strict_attempt_authority: bool = False,
+) -> AdvisoryReviewState:
     path = drive_root / _STATE_RELPATH
     if not path.exists():
         return AdvisoryReviewState()
@@ -1129,10 +1295,17 @@ def _load_state_unlocked(drive_root: pathlib.Path) -> AdvisoryReviewState:
     raw = path.read_text(encoding="utf-8")
     data = json.loads(raw)
     if not isinstance(data, dict):
+        if strict_attempt_authority:
+            raise ValueError("advisory review state root must be an object")
         return AdvisoryReviewState()
 
+    raw_attempts = (
+        _validate_attempt_authority_shape(data)
+        if strict_attempt_authority else data.get("attempts", [])
+    )
+
     advisory_runs = [_record_from_dict(item) for item in (item for item in data.get("advisory_runs", []) if isinstance(item, dict))]
-    attempts = [_commit_attempt_from_dict(item) for item in (item for item in data.get("attempts", []) if isinstance(item, dict))]
+    attempts = [_commit_attempt_from_dict(item) for item in (item for item in raw_attempts if isinstance(item, dict))]
     open_obligations = [_obligation_from_dict(item) for item in (item for item in data.get("open_obligations", []) if isinstance(item, dict))]
     commit_readiness_debts = [
         _commit_readiness_debt_from_dict(item)
@@ -1295,7 +1468,7 @@ def update_state(
     if lock_fd is None:
         raise TimeoutError(f"Could not acquire review state lock for {drive_root / _LOCK_RELPATH}")
     try:
-        state = _load_state_unlocked(drive_root)
+        state = _load_state_unlocked(drive_root, strict_attempt_authority=True)
         result = mutator(state)
         _save_state_unlocked(drive_root, state)
         return state if result is None else result
@@ -1641,6 +1814,125 @@ def _normalize_findings(items: List[Any]) -> List[Dict[str, Any]]:
     return normalized
 
 
+_ACTIVE_REVIEW_OPERATION_STATES = frozenset({"in_flight", "custody_lost"})
+
+
+def _attempt_review_roster_rows(item: "CommitAttemptRecord") -> List[Dict[str, Any]]:
+    """Return mutable row objects from both existing commit-review surfaces."""
+    rows = [row for row in (item.triad_raw_results or []) if isinstance(row, dict)]
+    scope = item.scope_raw_result
+    if not isinstance(scope, dict) or not scope:
+        return rows
+    raw_results = scope.get("raw_results")
+    if isinstance(raw_results, list):
+        rows.extend(row for row in raw_results if isinstance(row, dict))
+    elif "raw_results" not in scope:
+        # Historical single-scope rows used the wrapper itself as the actor.
+        rows.append(scope)
+    return rows
+
+
+def _review_roster_row_is_pending(row: Dict[str, Any]) -> bool:
+    return bool(
+        str(row.get("pending_invocation_id") or "").strip()
+        or row.get("late_result_pending")
+        or str(row.get("operation_state") or "") in _ACTIVE_REVIEW_OPERATION_STATES
+    )
+
+
+def _attempt_has_active_review_custody(item: "CommitAttemptRecord") -> bool:
+    """One SSOT for overlap, startup, eviction, and payload compaction."""
+    if str(getattr(item, "status", "") or "") == "reviewing" or bool(
+        getattr(item, "late_result_pending", False)
+    ):
+        return True
+    # A terminal lifecycle projection can still race a live delegated/API row;
+    # preserve that exact roster. A synthetic malformed-container
+    # ``custody_lost`` row on a historical terminal attempt is forensic damage,
+    # not reopened physical work, so it does not make the old attempt active.
+    return any(
+        str(row.get("pending_invocation_id") or "").strip()
+        or str(row.get("operation_state") or "") == "in_flight"
+        for row in _attempt_review_roster_rows(item)
+    )
+
+
+def checkpoint_pending_review_invocation(
+    drive_root: pathlib.Path,
+    *,
+    repo_key: str,
+    tool_name: str,
+    task_id: str,
+    attempt: int,
+    review_retry_key: str,
+    surface: str,
+    slot_id: str,
+    operation_id: str,
+    invocation_id: str,
+) -> None:
+    """Bind one delegated start token to its pre-reserved commit-review row.
+
+    The existing advisory-review state remains the only ledger.  This narrow
+    locked patch is deliberately stricter than a whole-attempt merge: triad and
+    scope start concurrently, so each may update only its exact reserved row
+    and may never overwrite the other surface's token.
+    """
+    expected = {
+        "review_retry_key": str(review_retry_key or ""),
+        "surface": str(surface or ""),
+        "slot_id": str(slot_id or ""),
+        "operation_id": str(operation_id or ""),
+        "invocation_id": str(invocation_id or ""),
+    }
+    if not all(expected.values()):
+        raise ValueError("pending review invocation checkpoint is incomplete")
+    if expected["surface"] not in {"multi_model_review", "scope_review"}:
+        raise ValueError(f"unsupported commit-review surface {surface!r}")
+
+    def _mutate(state: AdvisoryReviewState) -> None:
+        current = state.latest_attempt_for(
+            repo_key=repo_key,
+            tool_name=tool_name,
+            task_id=task_id,
+            attempt=int(attempt or 0),
+        )
+        if (
+            current is None
+            or current.status != "reviewing"
+            or not current.paid
+            or current.review_retry_key != expected["review_retry_key"]
+        ):
+            raise ValueError("reserved commit-review attempt is unavailable")
+        if expected["surface"] == "multi_model_review":
+            rows = current.triad_raw_results
+        else:
+            wrapper = current.scope_raw_result
+            rows = wrapper.get("raw_results") if isinstance(wrapper, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError("reserved commit-review roster is unavailable")
+        matches = [
+            row for row in rows
+            if isinstance(row, dict)
+            and str(row.get("slot_id") or row.get("slot") or "") == expected["slot_id"]
+        ]
+        if len(matches) != 1:
+            raise ValueError("reserved commit-review slot identity is ambiguous")
+        row = matches[0]
+        if str(row.get("operation_id") or "") != expected["operation_id"]:
+            raise ValueError("reserved commit-review operation identity changed")
+        if str(row.get("operation_state") or "") != "in_flight":
+            raise ValueError("reserved commit-review operation is not in flight")
+        prior = str(row.get("pending_invocation_id") or "")
+        if prior and prior != expected["invocation_id"]:
+            raise ValueError("reserved commit-review invocation identity changed")
+        row["pending_invocation_id"] = expected["invocation_id"]
+        row["late_result_pending"] = True
+        current.late_result_pending = True
+        current.updated_ts = _utc_now()
+
+    update_state(pathlib.Path(drive_root), _mutate)
+
+
 def _attempt_history_evictable(item: "CommitAttemptRecord") -> bool:
     """True only for rows the Max-Review-Cycles machinery derives NO authority
     from. Never evictable: paid rows (the per-root-task money count), rows of
@@ -1649,11 +1941,9 @@ def _attempt_history_evictable(item: "CommitAttemptRecord") -> bool:
     quotes; legacy rows classify by recorded reason via the commit gate's
     ``attempt_block_class``). Unclassifiable rows are kept — fail toward
     remembering."""
-    if bool(getattr(item, "paid", False)):
+    if _attempt_has_active_review_custody(item):
         return False
-    if str(getattr(item, "status", "") or "") == "reviewing" or bool(
-        getattr(item, "late_result_pending", False)
-    ):
+    if bool(getattr(item, "paid", False)):
         return False
     try:
         from ouroboros.tools.commit_gate import BLOCK_CLASS_VERDICT, attempt_block_class
@@ -1690,6 +1980,8 @@ def _strip_attempt_heavy_payload(item: CommitAttemptRecord, *, force: bool = Fal
     only in the newest-50 window. ``force=True`` re-compacts a row ALREADY
     marked stripped — the terminal-merge path uses it when a merge onto a
     stripped row would otherwise resurrect the heavy payloads it carries in."""
+    if _attempt_has_active_review_custody(item):
+        return
     if bool(getattr(item, "raw_stripped", False)) and not force:
         return
     if not item.block_class:

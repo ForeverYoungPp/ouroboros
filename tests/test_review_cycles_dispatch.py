@@ -205,6 +205,56 @@ def test_ledger_growth_stays_bounded_while_accounting_authority_survives(tmp_pat
         assert len(json.dumps(dataclasses.asdict(row))) < 4_000
 
 
+def test_history_compaction_never_strips_active_roster_or_invocation_tokens(tmp_path):
+    from ouroboros.review_state import (
+        CommitAttemptRecord,
+        load_state,
+        make_repo_key,
+        update_state,
+        _utc_now,
+    )
+
+    repo_key = make_repo_key(pathlib.Path(tmp_path))
+    triad = [{
+        "slot_id": "slot_api", "operation_id": "op-api",
+        "operation_state": "in_flight", "late_result_pending": True,
+        "raw_text": "ACTIVE_TRIAD_ROSTER",
+    }]
+    scope = {"raw_results": [{
+        "slot_id": "scope_session", "operation_id": "op-session",
+        "operation_state": "in_flight", "late_result_pending": True,
+        "pending_invocation_id": "invocation-preserved",
+        "raw_text": "ACTIVE_SCOPE_ROSTER",
+    }]}
+
+    def _seed(state):
+        # Deliberately inconsistent top-level terminal status exercises the
+        # row-level custody authority: compaction must follow the live roster,
+        # not only the lifecycle projection.
+        state.record_attempt(CommitAttemptRecord(
+            ts=_utc_now(), commit_message="active", status="failed",
+            repo_key=repo_key, tool_name="commit_reviewed", task_id="active-task",
+            attempt=1, paid=True, raw_stripped=False,
+            triad_raw_results=triad, scope_raw_result=scope,
+        ))
+        for index in range(2, 64):
+            state.record_attempt(CommitAttemptRecord(
+                ts=_utc_now(), commit_message=f"terminal-{index}", status="succeeded",
+                repo_key=repo_key, tool_name="commit_reviewed",
+                task_id=f"terminal-{index}", attempt=index, paid=True,
+                triad_raw_results=[{"raw_text": "HEAVY" * 100}],
+            ))
+
+    update_state(pathlib.Path(tmp_path), _seed)
+
+    state = load_state(pathlib.Path(tmp_path))
+    active = next(row for row in state.attempts if row.task_id == "active-task")
+    assert active.raw_stripped is False
+    assert active.triad_raw_results == triad
+    assert active.scope_raw_result == scope
+    assert active in state.get_active_attempts(repo_key=repo_key)
+
+
 # ---------------------------------------------------------------------------
 # F2 / P3-3 — the write-ahead paid stamp on the real stage cycle
 
@@ -301,6 +351,14 @@ def test_one_side_dispatched_attempt_counts_as_paid(tmp_path, monkeypatch):
     assert outcome["status"] == "blocked"
     assert count_paid_review_cycles(ctx, root_task_id="root-1") == 1
     assert ctx._review_paid_stamp is None  # the seam never leaks past the wave
+    from ouroboros.review_state import load_state, make_repo_key
+
+    rows = load_state(ctx.drive_root).filter_attempts(
+        repo_key=make_repo_key(pathlib.Path(ctx.repo_dir)), task_id="root-1",
+    )
+    assert len(rows) == 1
+    assert rows[0].attempt == 1 and rows[0].paid is True
+    assert rows[0].review_retry_key
 
 
 @pytest.mark.parametrize(
