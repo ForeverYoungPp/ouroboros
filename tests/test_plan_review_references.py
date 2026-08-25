@@ -196,10 +196,54 @@ def test_plan_reference_append_failure_is_not_misreported_as_durable(tmp_path, m
     ctx = SimpleNamespace(event_queue=queue.Queue(), drive_root=tmp_path)
     monkeypatch.setattr(plan_review_references, "append_jsonl", lambda *_a, **_k: False)
 
-    with pytest.raises(OSError, match="progress reference append failed"):
-        plan_review_references._record_plan_review_attempt_with_reference(
-            ctx, tmp_path, "task-1", fingerprint="d" * 64, status="open",
-        )
+    plan_review_references._record_plan_review_attempt_with_reference(
+        ctx, tmp_path, "task-1", fingerprint="d" * 64, status="open",
+    )
 
     durable = task_results.load_plan_review_state(tmp_path, "task-1")
     assert durable["current_attempt"]["fingerprint"] == "d" * 64
+    assert not (tmp_path / "logs" / "progress.jsonl").exists()
+    assert _reference_rows(ctx.event_queue)[0]["review_fingerprint"] == "d" * 64
+
+
+def test_plan_reference_append_exception_keeps_live_invalidation(monkeypatch, tmp_path):
+    task_results.write_task_result(tmp_path, "task-1", "running", result="running")
+    events: queue.Queue = queue.Queue()
+    ctx = SimpleNamespace(event_queue=events, drive_root=tmp_path)
+
+    def fail_append(*_args, **_kwargs):
+        raise OSError("progress rail unavailable")
+
+    monkeypatch.setattr(plan_review_references, "append_jsonl", fail_append)
+    plan_review_references._record_plan_review_attempt_with_reference(
+        ctx, tmp_path, "task-1", fingerprint="e" * 64, status="open",
+    )
+
+    durable = task_results.load_plan_review_state(tmp_path, "task-1")
+    assert durable["current_attempt"]["fingerprint"] == "e" * 64
+    assert _reference_rows(events)[0]["review_fingerprint"] == "e" * 64
+
+
+def test_cycles_exhausted_writes_continue_when_reference_rail_fails(tmp_path, monkeypatch):
+    fingerprint = "f" * 64
+    task_results.write_task_result(tmp_path, "task-1", "running", result="running")
+    task_results.record_plan_review_wave(
+        tmp_path, "task-1", {
+            "request_fingerprint": fingerprint, "aggregate": "REVIEW_REQUIRED",
+            "closed": False, "paid": True, "cycle_index": 1,
+            "spec": {}, "findings": [], "dispositions": [],
+        },
+    )
+    events: queue.Queue = queue.Queue()
+    ctx = SimpleNamespace(event_queue=events, drive_root=tmp_path)
+    monkeypatch.setattr(plan_review_references, "append_jsonl", lambda *_a, **_k: False)
+
+    plan_review_references._record_cycles_exhausted_with_references(
+        ctx, tmp_path, "task-1", wave_fingerprint=fingerprint,
+        attempt_fingerprint=fingerprint, cycles_paid=1, cap=1,
+    )
+
+    durable = task_results.load_plan_review_state(tmp_path, "task-1")
+    assert durable["waves"][-1]["cycles_exhausted"] is True
+    assert durable["current_attempt"]["status"] == "cycles_exhausted"
+    assert len(_reference_rows(events)) == 2

@@ -26,7 +26,12 @@ def _emit_plan_review_reference(
     *,
     state_root: Optional[pathlib.Path] = None,
 ) -> None:
-    """Persist and publish a small invalidation; task result remains authority."""
+    """Best-effort persist and publish an invalidation; task result remains authority.
+
+    The progress row is only a reconnect/history hint.  A filesystem failure on
+    that presentation rail must never interrupt the canonical Plan Review write
+    that just completed or the live invalidation event below.
+    """
     event_queue = getattr(ctx, "event_queue", None)
     if state is None:
         try:
@@ -57,13 +62,17 @@ def _emit_plan_review_reference(
     if raw_root:
         # Existing progress JSONL is the reconnect/history rail. The row is an
         # opaque invalidation only; the task result remains the sole Plan state.
-        written = append_jsonl(pathlib.Path(raw_root) / "logs" / "progress.jsonl", {
-            **payload,
-            "direction": "out", "is_progress": True,
-            "user_id": 0, "text": "", "content": "", "format": "",
-        })
-        if not written:
-            raise OSError("plan-review progress reference append failed")
+        try:
+            written = append_jsonl(pathlib.Path(raw_root) / "logs" / "progress.jsonl", {
+                **payload,
+                "direction": "out", "is_progress": True,
+                "user_id": 0, "text": "", "content": "", "format": "",
+            })
+        except Exception:
+            log.warning("Failed to append plan-review progress reference", exc_info=True)
+        else:
+            if not written:
+                log.warning("Failed to append plan-review progress reference")
     emit_log_event(
         event_queue, payload, log_label="plan-review state reference",
     )
