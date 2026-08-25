@@ -83,6 +83,10 @@ class ElementStub {
     append(...nodes) { nodes.forEach((node) => this.appendChild(node)); }
     prepend(node) { return this.insertBefore(node, this.children[0] || null); }
     insertBefore(node, before) {
+        if (node?.isDocumentFragment) {
+            for (const child of [...node.children]) this.insertBefore(child, before);
+            return node;
+        }
         node.parentNode?.removeChild?.(node);
         const index = before ? this.children.indexOf(before) : -1;
         if (index >= 0) this.children.splice(index, 0, node); else this.children.push(node);
@@ -152,6 +156,11 @@ function installDom(fetchImpl = async () => ({ ok: true, json: async () => ({ ac
     const document = {
         byId: new Map(), hidden: false, activeElement: null,
         createElement(tag) { return new ElementStub(tag, document); },
+        createDocumentFragment() {
+            const fragment = new ElementStub('#document-fragment', document);
+            fragment.isDocumentFragment = true;
+            return fragment;
+        },
         getElementById(id) { return document.byId.get(id) || null; },
         addEventListener() {}, removeEventListener() {},
     };
@@ -584,12 +593,22 @@ test('duplicate lifecycle pointer never mints a task and enriches only an existi
         handlers.get('chat')({
             chat_id: 2, role: 'system', is_progress: true,
             task_id: 'skill_lifecycle_review_alpha_job-pointer',
+            content: 'Skill review alpha is already running in its original chat.',
             progress_meta: { lifecycle_pointer: pointer },
         });
         assert.equal(messages.children.some((node) => node.dataset.taskId === 'root-pointer'), false);
         assert.equal(messages.children.some(
             (node) => node.dataset.taskId === 'skill_lifecycle_review_alpha_job-pointer',
         ), false);
+        const acknowledgements = messages.children.filter(
+            (node) => node.classList.contains('chat-bubble')
+                && node.classList.contains('assistant')
+                && node.classList.contains('progress'),
+        );
+        assert.equal(acknowledgements.length, 1);
+        assert.equal(acknowledgements[0].classList.contains('system'), false);
+        assert.equal(acknowledgements[0].dataset.taskId, undefined);
+        assert.match(acknowledgements[0].innerHTML, /already running in its original chat/);
 
         handlers.get('chat')({
             chat_id: 2, role: 'system', is_progress: true,
@@ -600,6 +619,7 @@ test('duplicate lifecycle pointer never mints a task and enriches only an existi
         handlers.get('chat')({
             chat_id: 2, role: 'system', is_progress: true,
             task_id: 'skill_lifecycle_review_alpha_job-pointer',
+            content: 'Skill review alpha is already running in its original chat.',
             progress_meta: { lifecycle_pointer: pointer },
         });
         assert.equal(messages.children.find((node) => node.dataset.taskId === 'root-pointer'), owner);
@@ -607,6 +627,60 @@ test('duplicate lifecycle pointer never mints a task and enriches only an existi
         assert.equal(messages.children.some(
             (node) => node.dataset.taskId === 'skill_lifecycle_review_alpha_job-pointer',
         ), false);
+        assert.equal(messages.children.filter(
+            (node) => node.classList.contains('chat-bubble')
+                && node.classList.contains('assistant')
+                && node.classList.contains('progress'),
+        ).length, 1, 'an existing exact owner consumes the pointer without another acknowledgement');
+    } finally {
+        instance?.destroy();
+        restoreDom(prior);
+    }
+});
+
+test('history replay keeps one duplicate lifecycle acknowledgement without a task card', async () => {
+    const pointerRow = {
+        chat_id: 2, role: 'assistant', is_progress: true, task_id: '',
+        text: 'Skill review alpha is already running in its original chat.',
+        ts: '2026-08-25T00:00:00Z',
+        lifecycle_pointer: {
+            kind: 'review', job_id: 'job-pointer', status: 'running', target: 'alpha',
+            group_id: 'task:root-pointer:alpha', presentation_owner_task_id: 'root-pointer',
+        },
+    };
+    const { prior, mount } = installDom(async (url) => {
+        if (String(url).startsWith('/api/chat/history')) {
+            return { ok: true, json: async () => ({ messages: [pointerRow] }) };
+        }
+        return { ok: true, json: async () => ({ active_direct_turns: [] }) };
+    });
+    const handlers = new Map();
+    const ws = {
+        on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
+        isConnected: () => true, send() {},
+    };
+    let generation = 0;
+    const stateSnapshots = {
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        isCurrent: () => true, apply() {},
+    };
+    let instance;
+    try {
+        instance = createChatInstance({
+            ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
+            updateUnreadBadge() {}, stateSnapshots, chatId: 2, idPrefix: 'chat', mountEl: mount,
+            asPanel: true,
+        });
+        await instance.refreshHistory({ revision: 1 });
+        const messages = globalThis.document.byId.get('chat-messages');
+        const acknowledgements = messages.children.filter(
+            (node) => node.classList.contains('chat-bubble')
+                && node.classList.contains('assistant')
+                && node.classList.contains('progress'),
+        );
+        assert.equal(acknowledgements.length, 1);
+        assert.match(acknowledgements[0].innerHTML, /already running in its original chat/);
+        assert.equal(messages.children.some((node) => node.dataset.taskId === 'root-pointer'), false);
     } finally {
         instance?.destroy();
         restoreDom(prior);

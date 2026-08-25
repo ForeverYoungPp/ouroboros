@@ -573,7 +573,9 @@ state write also appends one empty typed `review_reference` to the existing
 bounded progress-history rail before publishing its live invalidation; the task
 result remains the only Plan authority and reconnect retains only the latest
 reference per owner. Duplicate Skill lifecycle acknowledgements remain typed
-`lifecycle_pointer` rows with no task id, so they can never become lineage.
+`lifecycle_pointer` rows with no task id, so they can never become lineage. They
+enrich an existing exact owner card, or render once as subdued non-task progress
+in the duplicate caller's chat when that owner card is absent.
 Pin these contracts in `web/tests/review_presentation.test.js` and
 `web/tests/harness_presentation.test.js`; keep grouping/reconnect/disclosure and
 requested/effective/executed truth covered by the existing Skill Review,

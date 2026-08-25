@@ -49,10 +49,10 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 // Reviewer policy remains a separate core-only projection: Agy is task-only and
 // must never be omitted here merely because it creates no reviewer seats.
 export const AGENT_FAMILIES = [
-    { harness: 'claude', label: 'Claude Code' },
-    { harness: 'codex', label: 'Codex' },
-    { harness: 'cursor', label: 'Cursor' },
-    { harness: 'agy', label: 'Antigravity' },
+    { harness: 'claude' },
+    { harness: 'codex' },
+    { harness: 'cursor' },
+    { harness: 'agy' },
 ];
 
 const REVIEW_CAPABLE_AGENT_HARNESSES = new Set(['claude', 'codex', 'cursor']);
@@ -62,10 +62,6 @@ const REVIEW_CAPABLE_AGENT_HARNESSES = new Set(['claude', 'codex', 'cursor']);
 // longer stops being a blip.
 const LOGIN_RELEASE_RETRIES = 2;
 const LOGIN_RELEASE_RETRY_MS = 600;
-
-// AGENT_FAMILIES still carries the label the STEP renders for a family it lists
-// before any discovery has answered; the shared `familyLabel` owns every name
-// shown once a payload exists.
 
 // The three rungs, in the owner's own logic. `tone` is the one-word verdict the
 // eye lands on first; `title` is the action; `body` is the honest consequence.

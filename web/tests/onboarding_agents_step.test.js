@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createClaudexorStatusStore } from '../modules/claudexor_status_store.js';
+import { createClaudexorStatusStore, familyLabel } from '../modules/claudexor_status_store.js';
 import {
     AGENT_FAMILIES,
     LADDER_FOOTNOTE,
@@ -93,7 +93,8 @@ test('the step renders the ladder, one row per family, and the editable actor ho
 
     for (const rung of VALUE_LADDER) assert.ok(html.includes(rung.title), rung.title);
     for (const family of AGENT_FAMILIES) {
-        assert.ok(rows.includes(family.label), family.label);
+        const label = familyLabel(family.harness, null, { catalogKnown: false });
+        assert.ok(rows.includes(label), label);
         assert.ok(rows.includes(`data-agent-connect="${family.harness}"`), family.harness);
         assert.ok(rows.includes(`data-harness-identity="${family.harness}"`), family.harness);
     }

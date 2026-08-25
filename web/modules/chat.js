@@ -1413,9 +1413,7 @@ export function createChatInstance({
     function attachReviewGroup(group, rawTs = '') {
         const ownerTaskId = String(group?.presentationOwnerTaskId || '').trim();
         if (!ownerTaskId) return false;
-        // A late review reference may outlive the card's ordinary retirement.
-        // Consume it without resurrecting stale task UI; history/reconnect owns
-        // deliberate rebuilds and clears retiredTaskIds before replay.
+        // Late refs never resurrect a retired card; deliberate replay clears the fence.
         if (retiredTaskIds.has(ownerTaskId) && !liveCardRecords.has(ownerTaskId)) return true;
         const ownerState = forceTaskCard(ownerTaskId, rawTs);
         if (!ownerState?.cardVisible) return false;
@@ -1423,7 +1421,6 @@ export function createChatInstance({
         const merged = record?.reviewController?.update(group);
         if (merged) {
             if (rawTs) reanchorVisibleTaskCard(ownerState, rawTs);
-            // One bounded owner-detail reconciliation per card generation.
             if (!record.reviewOwnerDetailObserved) {
                 record.reviewOwnerDetailObserved = true;
                 observeMissingManagedTask(ownerTaskId);
@@ -1450,12 +1447,19 @@ export function createChatInstance({
         return reviewHydrator.hydrate(id, revision);
     }
 
-    function attachReviewFromRow(row, rawTs = '') {
+    function attachReviewFromRow(row, rawTs = '', showPointerAck = false) {
         const pointer = classifyReviewLifecyclePointer(row);
         if (pointer.classification !== 'not_pointer') {
-            const owner = pointer.group?.presentationOwnerTaskId;
-            if (owner) liveCardRecords.get(owner)?.reviewController?.update(pointer.group);
-            return true; // Never mint the synthetic job or a missing owner.
+            const record = pointer.group && liveCardRecords.get(pointer.group.presentationOwnerTaskId);
+            if (record?.reviewController) record.reviewController.update(pointer.group);
+            else if (showPointerAck && pointer.classification === 'source_complete') {
+                const ack = String(row?.text || row?.content || '').trim();
+                if (ack) addMessage(
+                    ack, 'assistant', !!row?.markdown, rawTs || row?.ts || null,
+                    true, { systemType: 'lifecycle_pointer' },
+                );
+            }
+            return true;
         }
         const historyGroup = reviewGroupFromHistoryRow(row);
         if (historyGroup) {
@@ -1465,10 +1469,7 @@ export function createChatInstance({
         if (lifecycle.classification === 'source_complete') {
             return attachReviewGroup(lifecycle.group, rawTs || row?.ts || row?.timestamp || '');
         }
-        // Typed review lifecycle without a complete group/owner is manual or
-        // legacy domain progress. Consume it here so its synthetic task id can
-        // never become a generic task card; the Skills/domain surface remains
-        // its authority and chat_id=0 remains hidden.
+        // Incomplete review lifecycle stays domain-local and never mints a task.
         return lifecycle.classification === 'source_incomplete';
     }
 
@@ -3090,10 +3091,11 @@ export function createChatInstance({
                 }
                 for (const msg of messages) {
                     const taskId = msg.task_id || '';
-                    // A source-complete task-bound review row already updated
-                    // the owning card in pass 1. It is neither a standalone
-                    // yellow bubble nor terminal task evidence.
-                    if (handleReviewReference(msg) || attachReviewFromRow(msg, msg.ts || '')) continue;
+                    // Owner-bound reviews attached in pass 1 are not terminal chat bubbles.
+                    if (
+                        handleReviewReference(msg)
+                        || attachReviewFromRow(msg, msg.ts || '', true)
+                    ) continue;
                     // Reconnect: a durably recorded submission must not stay
                     // `Sending...` — history + snapshot are the authorities
                     // (a live turn re-links via hydration / next typing frame).
@@ -4180,7 +4182,7 @@ export function createChatInstance({
                 syncChatStatus();
                 return;
             }
-            if (attachReviewFromRow(msg, msg.ts || '')) {
+            if (attachReviewFromRow(msg, msg.ts || '', true)) {
                 syncChatStatus();
                 return;
             }

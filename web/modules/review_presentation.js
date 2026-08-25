@@ -288,11 +288,17 @@ function planAttempt(wave, index, isCurrent) {
     };
 }
 
-function activePlanAttempt(current, index) {
+function currentPlanAttempt(current, index) {
     const fingerprint = text(current?.fingerprint);
     const status = text(current?.status).toLowerCase();
-    if (!fingerprint || !['open', 'pending'].includes(status)) return null;
-    const state = status === 'pending' ? 'queued' : 'running';
+    if (!fingerprint || !status) return null;
+    const state = normalizedState(status);
+    const detailText = [
+        `Status: ${status}`,
+        current.reason ? `Reason: ${text(current.reason)}` : '',
+        'Review result unavailable.',
+        'Cost unavailable',
+    ].filter(Boolean).join('\n');
     return {
         id: fingerprint,
         surface: 'plan',
@@ -310,7 +316,7 @@ function activePlanAttempt(current, index) {
         executions: normalizedExecutions(current.executions, current.execution),
         execution: null,
         detailRef: null,
-        detailText: 'Review result unavailable.\nCost unavailable',
+        detailText,
     };
 }
 
@@ -355,19 +361,14 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
     let state = 'terminal';
     let activeCount = 0;
     if (!currentAttempt) {
-        if (currentStatus === 'open') {
-            state = 'running';
-            activeCount = 1;
-        } else if (currentStatus === 'pending') {
-            state = 'queued';
-            activeCount = 1;
-        } else if (currentStatus === 'unavailable') {
-            state = 'unavailable';
-        }
-        const activeAttempt = activePlanAttempt(current, attempts.length);
-        if (activeAttempt) {
-            attempts.push(activeAttempt);
-            currentAttempt = activeAttempt;
+        const unmatchedAttempt = currentPlanAttempt(current, attempts.length);
+        if (unmatchedAttempt) {
+            attempts.push(unmatchedAttempt);
+            currentAttempt = unmatchedAttempt;
+            state = unmatchedAttempt.state;
+            activeCount = state === 'queued' || state === 'running' ? 1 : 0;
+        } else if (currentStatus) {
+            state = normalizedState(currentStatus);
         }
     }
     const currentVerdict = text(currentAttempt?.verdict || currentStatus);
@@ -513,6 +514,21 @@ export function mergeReviewGroup(store, incoming) {
         mergedById.set(attempt.id, mergedAttempt);
         if (incomingActive && previousTerminal) hasStaleActiveAttempt = true;
         if (incomingActive && !previousTerminal && !previous) introducedActiveAttempt = true;
+    }
+    if (incoming.surface === 'plan') {
+        // Plan task detail owns one canonical current fingerprint. An omitted
+        // prior unmatched attempt was replaced, not merely absent from a
+        // bounded history window; retain its reason but retire its liveness.
+        for (const [id, attempt] of mergedById) {
+            if (
+                !incomingIds.has(id)
+                && (attempt.state === 'queued' || attempt.state === 'running')
+            ) {
+                mergedById.set(id, {
+                    ...attempt, state: 'superseded', tone: 'neutral', superseded: true,
+                });
+            }
+        }
     }
     const order = [
         ...prior.attempts.filter((attempt) => !incomingIds.has(attempt.id)).map((attempt) => attempt.id),
@@ -791,7 +807,10 @@ export function renderReviewsSection(groupsInput, disclosure = {}) {
                     </span>
                     <span class="chat-review-group-meta">${escapeHtmlText([group.verdict || group.state, shown].filter(Boolean).join(' · '))}</span>
                 </button>
-                <div class="chat-review-attempts"${groupExpanded ? '' : ' hidden'}>${initiator}${attempts}</div>
+                <div class="chat-review-attempts"${groupExpanded ? '' : ' hidden'}>
+                    <div class="chat-review-group-cost">Cost unavailable</div>
+                    ${initiator}${attempts}
+                </div>
             </div>`;
     }).join('');
     return `

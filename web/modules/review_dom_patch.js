@@ -9,7 +9,7 @@ function reviewNodeKey(node) {
     if (dataset.reviewAttemptDetail) return `attempt-detail:${dataset.reviewAttemptDetail}`;
     for (const className of [
         'chat-review-groups', 'chat-review-attempts', 'chat-review-attempt-main',
-        'chat-review-initiator',
+        'chat-review-group-cost', 'chat-review-initiator',
     ]) {
         if (node?.classList?.contains?.(className)) return `class:${className}`;
     }

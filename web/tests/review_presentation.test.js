@@ -259,6 +259,81 @@ test('an unmatched open Plan attempt restores liveness before its first wave lan
     assert.equal(next.attempts.at(-1).label, 'current attempt');
 });
 
+test('a newer canonical Plan attempt retires prior unmatched liveness', () => {
+    const settledFingerprint = 'a'.repeat(64);
+    const firstOpen = 'b'.repeat(64);
+    const secondOpen = 'c'.repeat(64);
+    const settledWave = {
+        request_fingerprint: settledFingerprint,
+        cycle_index: 1,
+        aggregate: 'GREEN',
+        closed: true,
+    };
+    const store = new Map();
+    mergeReviewGroup(store, planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            current_attempt: { fingerprint: settledFingerprint, status: 'closed' },
+            waves: [settledWave],
+        },
+    }));
+    for (const fingerprint of [firstOpen, secondOpen]) {
+        mergeReviewGroup(store, planReviewGroupFromTaskDetail({
+            task_id: 'root',
+            plan_review_state: {
+                current_attempt: { fingerprint, status: 'open', reason: `attempt ${fingerprint[0]}` },
+                waves: [settledWave],
+            },
+        }));
+    }
+
+    const running = store.get('plan:root');
+    assert.equal(running.state, 'running');
+    assert.equal(running.activeCount, 1);
+    assert.equal(running.attempts.find((attempt) => attempt.id === firstOpen)?.state, 'superseded');
+    assert.equal(running.attempts.find((attempt) => attempt.id === secondOpen)?.state, 'running');
+
+    const terminalWave = {
+        request_fingerprint: secondOpen,
+        cycle_index: 2,
+        aggregate: 'GREEN',
+        closed: true,
+    };
+    mergeReviewGroup(store, planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            current_attempt: { fingerprint: secondOpen, status: 'closed' },
+            waves: [settledWave, terminalWave],
+        },
+    }));
+
+    const terminal = store.get('plan:root');
+    assert.equal(terminal.state, 'terminal');
+    assert.equal(terminal.activeCount, 0);
+    assert.equal(terminal.verdict, 'GREEN');
+    assert.equal(terminal.attempts.find((attempt) => attempt.id === firstOpen)?.state, 'superseded');
+    assert.equal(terminal.attempts.find((attempt) => attempt.id === secondOpen)?.state, 'terminal');
+});
+
+test('unmatched terminal Plan states remain inspectable attempts', () => {
+    for (const status of ['unavailable', 'rail_degraded', 'cycles_exhausted']) {
+        const fingerprint = status[0].repeat(64);
+        const group = planReviewGroupFromTaskDetail({
+            task_id: 'root',
+            plan_review_state: {
+                current_attempt: { fingerprint, status, reason: `typed ${status} reason` },
+                waves: [],
+            },
+        });
+        assert.equal(group.activeCount, 0, status);
+        assert.equal(group.attempts.length, 1, status);
+        assert.equal(group.attempts[0].id, fingerprint, status);
+        assert.equal(group.attempts[0].state, status === 'unavailable' ? 'unavailable' : 'terminal', status);
+        assert.match(group.attempts[0].detailText, new RegExp(`typed ${status} reason`));
+        assert.match(group.attempts[0].detailText, /Cost unavailable/);
+    }
+});
+
 test('plan review retains current and superseded waves without inventing authority', () => {
     const detail = {
         task_id: 'root',
@@ -469,6 +544,7 @@ test('expanded non-Skill attempts disclose unavailable cost while compact rows s
         expandedGroups: new Set([plan.id]),
         expandedAttempts: new Set([attemptKey]),
     });
+    assert.match(html, /chat-review-group-cost">Cost unavailable/);
     assert.match(html, /Cost unavailable/);
     const compact = renderReviewsSection([plan], {});
     const compactRow = compact.slice(

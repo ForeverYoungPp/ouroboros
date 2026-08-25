@@ -2184,6 +2184,7 @@ button.chat-file:hover,
     overflow-y: auto;
 }
 
+.chat-review-group-cost,
 .chat-review-initiator {
     color: var(--text-meta);
     font-size: var(--type-meta);
