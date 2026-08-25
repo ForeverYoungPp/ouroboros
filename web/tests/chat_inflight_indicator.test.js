@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -9,6 +10,23 @@ import {
     createStateSnapshotSequencer,
     routingAnnotationText,
 } from '../modules/chat_activity.js';
+
+const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
+
+test('unkeyed terminal incidents do not clear unrelated live turns', () => {
+    const cleanupStart = chatSource.indexOf('if (!finalizing) {');
+    const finalCleanup = chatSource.slice(
+        cleanupStart,
+        chatSource.indexOf("if (msg.system_type === 'task_summary')", cleanupStart),
+    );
+    assert.match(
+        finalCleanup,
+        /} else if \(msg\.system_type !== 'terminal_incident'\) \{[^}]*?activeDirectActivities\.clear\(\);[^}]*?pendingSubmissions\.clear\(\);\s*}\s*}/,
+    );
+    // Ordinary unkeyed finals retain their existing global cleanup semantics.
+    assert.match(finalCleanup, /activeDirectActivities\.clear\(\);/);
+    assert.match(finalCleanup, /pendingSubmissions\.clear\(\);/);
+});
 
 test('routing receipts display the event-time label while keeping raw target metadata', () => {
     const annotation = {
