@@ -45,6 +45,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from ouroboros.route_spec import (
     ROUTE_KIND_AGENT_SESSION as SHARED_ROUTE_KIND_SESSION,
     ROUTE_KIND_API_MODEL as SHARED_ROUTE_KIND_API,
+    RouteSpec,
+    compound_session_effort,
     parse_route_spec,
     validate_compound_session_effort,
 )
@@ -101,6 +103,9 @@ class AdvisorySlotConfig:
     # Claude-SDK model spelling — sonnet, opus[1m], claude-… — NOT an
     # OpenRouter catalog id ('' = resolve_claude_code_model() default).
     target_id: str = ""
+    # API keeps the historical low default. Session ``""`` means the route's
+    # own default; an explicit/compound route effort is materialized on legacy
+    # migration so Settings round-trips one authority without lowering it.
     effort: str = "low"
     profile_id: str = ""  # optional manual credential pin (Q2-в); '' = rotation
 
@@ -242,7 +247,14 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
         strict_strings=True,
         reject_api_pin=True,
     )
-    effort = _valid_effort(raw.get("effort"), "advisory") or "low"
+    if enabled and shared_route.is_session and not shared_route.target_id:
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: enabled advisory agent_session route needs "
+            "a non-empty target_id; shared-session fallback is legacy-only"
+        )
+    effort = _valid_effort(raw.get("effort"), "advisory")
+    if not effort and not shared_route.is_session:
+        effort = "low"
     validate_compound_session_effort(
         shared_route, effort, setting=REVIEWER_SLOTS_ENV, where="advisory",
     )
@@ -313,7 +325,12 @@ def _shared_session_route_spec() -> tuple[str, str, str]:
     if route is None:
         return "", "", ""
     identity = route.route_id + (f"={route.model}" if route.model else "")
-    return identity, str(route.effort or ""), str(route.profile_id or "")
+    effort = str(route.effort or "") or compound_session_effort(RouteSpec(
+        kind=SHARED_ROUTE_KIND_SESSION,
+        target_id=identity,
+        credential_profile_id=str(route.profile_id or ""),
+    ))
+    return identity, effort, str(route.profile_id or "")
 
 
 def _legacy_rows(models: List[str], route_env_key: str, effort: str,
@@ -380,10 +397,21 @@ def _legacy_config() -> ReviewerSlotConfig:
             f"OUROBOROS_ADVISORY_REVIEW_ROUTE names an unknown advisory route "
             f"{raw_route!r}; valid: api, agent_session"
         )
+    advisory_target = ""
+    advisory_effort = "low"
+    advisory_profile = ""
+    if advisory_kind == ROUTE_KIND_SESSION:
+        advisory_target, advisory_effort, advisory_profile = _shared_session_route_spec()
     return ReviewerSlotConfig(
         triad=tuple(triad),
         scope=tuple(scope),
-        advisory=AdvisorySlotConfig(enabled=True, kind=advisory_kind),
+        advisory=AdvisorySlotConfig(
+            enabled=True,
+            kind=advisory_kind,
+            target_id=advisory_target,
+            effort=advisory_effort,
+            profile_id=advisory_profile,
+        ),
         source="legacy",
     )
 

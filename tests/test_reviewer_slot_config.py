@@ -19,6 +19,7 @@ from ouroboros.reviewer_slot_config import (
     load_reviewer_slot_config,
     parse_reviewer_slots,
     project_reviewer_slots_into_env,
+    reviewer_slot_save_check,
 )
 
 _STRUCTURED = {
@@ -149,6 +150,10 @@ def test_structured_rows_never_coerce_or_ignore_malformed_fields(mutate, fragmen
     ({"enabled": True, "route": {"kind": "api", "target_id": "",
                                    "profile_id": "api-profile"}},
      "meaningful only for agent_session"),
+    ({"enabled": True, "route": {"kind": "agent_session", "target_id": ""}},
+     "needs a non-empty target_id"),
+    ({"enabled": True, "kind": "agent_session", "target_id": ""},
+     "needs a non-empty target_id"),
     ({"enabled": True, "kind": "agent_session", "target_id": "codex",
       "route": {"kind": "api", "target_id": "sonnet"}},
      "either route or legacy kind/target_id, not both"),
@@ -158,8 +163,8 @@ def test_structured_rows_never_coerce_or_ignore_malformed_fields(mutate, fragmen
 ], ids=[
     "enabled-type", "unknown-advisory-key", "effort-type", "legacy-kind-type",
     "legacy-target-type", "unknown-route-key", "route-kind-type", "route-target-type",
-    "route-profile-type", "api-profile-pin", "conflicting-route-authorities",
-    "duplicate-route-authorities",
+    "route-profile-type", "api-profile-pin", "empty-session-route",
+    "empty-legacy-session-route", "conflicting-route-authorities", "duplicate-route-authorities",
 ])
 def test_advisory_never_coerces_or_ignores_malformed_fields(advisory, fragment):
     payload = json.loads(json.dumps(_STRUCTURED))
@@ -186,6 +191,15 @@ def test_advisory_keeps_recognized_legacy_shape_and_empty_api_target():
     advisory = parse_reviewer_slots(json.dumps(payload)).advisory
     assert (advisory.kind, advisory.target_id, advisory.effort) == ("api", "", "low")
 
+    payload["advisory"] = {
+        "enabled": False,
+        "route": {"kind": "agent_session", "target_id": ""},
+    }
+    advisory = parse_reviewer_slots(json.dumps(payload)).advisory
+    assert (advisory.enabled, advisory.kind, advisory.target_id) == (
+        False, "agent_session", "",
+    )
+
 
 def test_settings_save_refuses_a_malformed_row_before_persistence():
     from starlette.requests import Request
@@ -206,6 +220,30 @@ def test_settings_save_refuses_a_malformed_row_before_persistence():
     assert response.status_code == 400
     assert body["saved"] is False
     assert "triad[0] has unknown keys" in body["error"]
+
+
+def test_settings_save_refuses_an_enabled_empty_advisory_session_route():
+    from starlette.requests import Request
+
+    from ouroboros.gateway.settings import _api_settings_post_locked
+
+    payload = json.loads(json.dumps(_STRUCTURED))
+    payload["advisory"] = {
+        "enabled": True,
+        "route": {"kind": "agent_session", "target_id": ""},
+    }
+    request = Request({
+        "type": "http", "method": "POST", "path": "/api/settings",
+        "headers": [], "query_string": b"",
+    })
+    response = _api_settings_post_locked(
+        request,
+        {REVIEWER_SLOTS_ENV: json.dumps(payload)},
+    )
+    body = json.loads(response.body)
+    assert response.status_code == 400
+    assert body["saved"] is False
+    assert "needs a non-empty target_id" in body["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -327,11 +365,92 @@ def test_legacy_phase5_route_envs_are_honored(monkeypatch):
     assert session_row.session_target == "claude=claude-fable-5"
     assert session_row.profile_id == "legacy-profile"
     assert config.advisory.kind == "agent_session"
+    assert config.advisory.target_id == "claude=claude-fable-5"
+    assert config.advisory.effort == "high"
+    assert config.advisory.profile_id == "legacy-profile"
     delivery = commit_triad_delivery()
     assert delivery["legacy_skill_fingerprint"] is False
     assert delivery["session_targets"][1] == "claude=claude-fable-5"
     assert delivery["session_profiles"][1] == "legacy-profile"
     assert delivery["efforts"][1] == "high"
+
+
+def test_legacy_advisory_session_materializes_for_settings_round_trip(monkeypatch):
+    import asyncio
+
+    from starlette.requests import Request
+
+    from ouroboros.gateway.settings import api_reviewer_slots
+    monkeypatch.delenv(REVIEWER_SLOTS_ENV, raising=False)
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "m/one")
+    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_MODELS", "m/scope")
+    monkeypatch.setenv("OUROBOROS_ADVISORY_REVIEW_ROUTE", "agent_session")
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claude=claude-fable-5:high")
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROFILE", "legacy-profile")
+
+    request = Request({
+        "type": "http", "method": "GET", "path": "/api/reviewer-slots",
+        "headers": [], "query_string": b"",
+    })
+    body = json.loads(asyncio.run(api_reviewer_slots(request)).body)
+    assert body["source"] == "legacy"
+    assert body["advisory"]["route"] == {
+        "kind": "agent_session",
+        "target_id": "claude=claude-fable-5",
+        "profile_id": "legacy-profile",
+    }
+    assert body["advisory"]["effort"] == "high"
+
+    migrated = json.dumps({key: body[key] for key in ("triad", "scope", "advisory")})
+    assert reviewer_slot_save_check(migrated) == ""
+
+
+def test_legacy_compound_advisory_effort_round_trips_without_a_second_authority(
+    monkeypatch,
+):
+    monkeypatch.delenv(REVIEWER_SLOTS_ENV, raising=False)
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "m/one")
+    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_MODELS", "m/scope")
+    monkeypatch.setenv("OUROBOROS_ADVISORY_REVIEW_ROUTE", "agent_session")
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "cursor=gpt-5.6-sol-high")
+
+    config = load_reviewer_slot_config()
+    assert (config.advisory.target_id, config.advisory.effort) == (
+        "cursor=gpt-5.6-sol-high", "high",
+    )
+    migrated = json.dumps({
+        "triad": [
+            {"slot_id": row.slot_id,
+             "route": {"kind": row.kind, "target_id": row.target_id},
+             "effort": row.effort}
+            for row in config.triad
+        ],
+        "scope": [
+            {"slot_id": row.slot_id,
+             "route": {"kind": row.kind, "target_id": row.target_id},
+             "effort": row.effort}
+            for row in config.scope
+        ],
+        "advisory": {
+            "enabled": True,
+            "route": {"kind": config.advisory.kind,
+                      "target_id": config.advisory.target_id},
+            "effort": config.advisory.effort,
+        },
+    })
+    assert reviewer_slot_save_check(migrated) == ""
+
+
+def test_legacy_advisory_without_route_effort_preserves_engine_default(monkeypatch):
+    monkeypatch.delenv(REVIEWER_SLOTS_ENV, raising=False)
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("OUROBOROS_ADVISORY_REVIEW_ROUTE", "agent_session")
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claude=claude-fable-5")
+
+    advisory = load_reviewer_slot_config().advisory
+    assert (advisory.target_id, advisory.effort) == ("claude=claude-fable-5", "")
 
 
 @pytest.mark.parametrize("review_route", ["off", "=malformed"])

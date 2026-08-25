@@ -193,6 +193,26 @@ test('the composed setting carries stable ids, per-row routes/efforts and the op
     assert.equal(setting.advisory.effort, 'low');
 });
 
+test('an advisory session preserves route-default effort instead of inventing low', () => {
+    const setting = JSON.parse(buildReviewerSlotsSetting({
+        triad: [{ slot_id: 't1', route: { kind: ROUTE_KIND_API, target_id: 'm/t' } }],
+        scope: [{ slot_id: 's1', route: { kind: ROUTE_KIND_API, target_id: 'm/s' } }],
+        advisory: {
+            enabled: true,
+            route: { kind: ROUTE_KIND_SESSION, target_id: 'claude=claude-fable-5' },
+            effort: '',
+        },
+    }));
+    assert.equal(setting.advisory.effort, '');
+
+    const api = JSON.parse(buildReviewerSlotsSetting({
+        triad: setting.triad,
+        scope: setting.scope,
+        advisory: { enabled: true, route: { kind: 'api', target_id: '' }, effort: '' },
+    }));
+    assert.equal(api.advisory.effort, 'low');
+});
+
 test('minted slot ids are prefixed, unique, and never an array index', () => {
     const taken = ['triad_abc123'];
     const minted = mintSlotId('triad', taken);
