@@ -56,6 +56,26 @@ def verification_receipts_path(
     return artifact_dir / "verification_receipts.jsonl"
 
 
+def is_verification_receipts_path(
+    drive_root: Any, task_id: str, candidate: Any,
+) -> bool:
+    """Whether ``candidate`` is this task's receipt authority file.
+
+    Receipt replicas share the task-artifact directory for custody, but they are
+    reconciled by :func:`publish_verification_receipt_union`, never by generic
+    artifact copying.  Keep the identity test beside the path SSOT so live reads,
+    final copy-back and artifact collection cannot derive competing spellings.
+    """
+
+    try:
+        expected = verification_receipts_path(
+            drive_root, task_id, create=False,
+        ).resolve(strict=False)
+        return pathlib.Path(candidate).resolve(strict=False) == expected
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def append_verification_receipt(
     drive_root: Any, task_id: str, receipt: Dict[str, Any],
 ) -> bool:

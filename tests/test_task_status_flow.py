@@ -710,6 +710,90 @@ def test_child_receipt_republish_is_idempotent_refresh(tmp_path):
     ]
 
 
+def test_materializing_child_read_cannot_overwrite_canonical_zero_run_receipt(tmp_path):
+    """Generic artifact refresh must never own the receipt authority stream.
+
+    A running parent's ``wait_tasks`` performs materializing reads.  Before this
+    regression, the first read registered the child receipt file as an ordinary
+    artifact; a later read reused that source/destination manifest mapping and
+    copied the stale child bytes over a newer canonical-only zero-run row.
+    """
+    from ouroboros.headless import copy_child_task_result, prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
+    from ouroboros.task_results import (
+        STATUS_COMPLETED,
+        STATUS_SCHEDULED,
+        load_task_result,
+        write_task_result,
+    )
+    from ouroboros.task_status import effective_task_result
+
+    tid = "child-materialized-receipts"
+    child_drive = prepare_task_drive(tmp_path, tid, "empty")
+    assert child_drive is not None
+    write_task_result(
+        tmp_path, tid, STATUS_SCHEDULED,
+        drive_root=str(child_drive), child_drive_root=str(child_drive),
+    )
+    assert append_verification_receipt(child_drive, tid, {
+        "status": "pass", "criterion_id": "child-check",
+        "ts": "2026-01-01T00:00:01+00:00",
+    })
+    from ouroboros.outcomes import verification_receipts_path
+
+    child_receipts = verification_receipts_path(child_drive, tid)
+    write_task_result(
+        child_drive,
+        tid,
+        STATUS_COMPLETED,
+        result="done",
+        # Historical/current pre-fix task rows may already carry the authority
+        # file as an ordinary artifact even though collection now excludes it.
+        artifacts=[{
+            "kind": "task_artifact",
+            "name": child_receipts.name,
+            "path": str(child_receipts),
+        }],
+    )
+
+    from ouroboros.artifacts import collect_task_artifact_records
+
+    assert collect_task_artifact_records(child_drive, tid) == []
+
+    # The first wait/detail read observes the child while its local receipt file
+    # exists.  It must not register that authority stream as a generic artifact.
+    effective_task_result(tmp_path, load_task_result(tmp_path, tid) or {})
+    assert append_verification_receipt(tmp_path, tid, {
+        "status": "declared",
+        "contract_kind": "delegation_zero_run",
+        "zero_run": True,
+        "zero_run_decision": "complete",
+        "zero_run_basis": "completed useful direct child",
+        "physical_run_started": False,
+        "ts": "2026-01-01T00:00:02+00:00",
+    })
+
+    # Repeated polling must preserve the canonical-only row.  Final copy-back
+    # then unions the ordinary child check into that same authority file.
+    effective_task_result(tmp_path, load_task_result(tmp_path, tid) or {})
+    assert [
+        row.get("contract_kind")
+        for row in read_verification_receipts(tmp_path, tid)
+    ] == [None, "delegation_zero_run"]
+
+    copied = copy_child_task_result(
+        tmp_path, {"id": tid, "drive_root": str(child_drive)},
+    )
+    assert copied is not None
+    rows = read_verification_receipts(tmp_path, tid)
+    assert [row.get("criterion_id") for row in rows] == ["child-check", None]
+    assert rows[-1]["contract_kind"] == "delegation_zero_run"
+    assert all(
+        str(item.get("name") or "") != "verification_receipts.jsonl"
+        for item in copied.get("artifacts") or []
+    )
+
+
 def test_child_receipt_publish_preserves_corrupt_canonical_authority(tmp_path):
     from ouroboros.headless import _publish_child_verification_receipts, prepare_task_drive
     from ouroboros.outcomes import append_verification_receipt, verification_receipts_path

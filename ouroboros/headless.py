@@ -537,6 +537,8 @@ def _copy_child_artifacts_to_parent(
 ) -> List[Dict[str, Any]]:
     """Rebase child-drive artifact files into the parent task artifact store."""
 
+    from ouroboros.outcome_receipt_store import is_verification_receipts_path
+
     parent_dir = task_artifacts_dir(parent_drive_root, task_id)
     rebased: List[Dict[str, Any]] = []
     for artifact in artifacts:
@@ -548,6 +550,12 @@ def _copy_child_artifacts_to_parent(
         src = pathlib.Path(raw_path)
         if not src.is_absolute():
             src = (child_drive / raw_path).resolve(strict=False)
+        if is_verification_receipts_path(child_drive, task_id, src):
+            # ``copy_child_task_result`` publishes this stream through the
+            # locked union immediately before rebasing ordinary artifacts.
+            # A stale generic copy would create a competing replica (or, on a
+            # reused destination, erase canonical-only lifecycle rows).
+            continue
         try:
             src.resolve(strict=False).relative_to(parent_dir.resolve(strict=False))
             rebased.append(item)

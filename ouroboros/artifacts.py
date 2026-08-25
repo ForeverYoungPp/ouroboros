@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 
 from ouroboros.utils import atomic_write_json, read_json_dict, write_bytes_atomic
 from ouroboros.headless import ARTIFACT_STATUS_READY, SCRATCH_MANIFEST_NAME, task_artifacts_dir
+from ouroboros.outcome_receipt_store import is_verification_receipts_path
 from ouroboros.task_results import validate_task_id
 
 log = logging.getLogger(__name__)
@@ -1074,6 +1075,12 @@ def collect_task_artifact_records(drive_root: Union[pathlib.Path, str], task_id:
         # Internal task-metadata files (the artifact manifest and the v6.52.2 scratch manifest)
         # are NOT deliverables — never record them as produced artifacts.
         if path.name in (_ARTIFACT_MANIFEST, SCRATCH_MANIFEST_NAME):
+            continue
+        # Verification receipts live beside artifacts for durable custody, but
+        # they are an append-only authority stream, not a deliverable.  Letting
+        # generic materialization register/copy this file can replace a newer
+        # canonical-only lifecycle row with a stale child replica.
+        if is_verification_receipts_path(drive_root, task_id, path):
             continue
         try:
             rel_parts = path.resolve(strict=False).relative_to(artifact_root).parts

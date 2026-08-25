@@ -754,12 +754,25 @@ def effective_task_result(
                 [item for item in (child_result.get("artifacts") or []) if isinstance(item, dict)],
                 collect_task_artifact_records(pathlib.Path(child_text), task_id),
             )
+            from ouroboros.outcome_receipt_store import (
+                is_verification_receipts_path,
+                publish_verification_receipt_union,
+            )
+
             for child_artifact in child_artifacts:
                 source_text = str(child_artifact.get("path") or "").strip()
                 if not source_text:
                     continue
                 source = pathlib.Path(source_text).expanduser().resolve(strict=False)
                 if not source.is_file():
+                    continue
+                if is_verification_receipts_path(child_text, task_id, source):
+                    # Historical child results may already list the receipt
+                    # stream as a generic artifact.  Reconcile it through its
+                    # one locked owner and never feed it to shutil.copy2.
+                    publish_verification_receipt_union(
+                        pathlib.Path(drive_root), task_id, pathlib.Path(child_text),
+                    )
                     continue
                 copied = copy_file_to_task_artifacts(
                     parent_artifact_ctx,
