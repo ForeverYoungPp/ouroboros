@@ -6,14 +6,17 @@ Q16/Q17; Max-Review-Cycles fix round).
 The ``paid`` fact of Max-Review-Cycles accounting is recorded at PHYSICAL
 dispatch: a gate that must durably record "this wave spent reviewer money"
 installs a :class:`ReviewPaidStamp` on ``ctx._review_paid_stamp`` for the
-duration of its wave. The coordinator captures that exact once-only object;
-session routes invoke it at their physical point of no return, while API routes
-bind it for the canonical physical-attempt boundary to invoke.
-Assembly-only refusals (triad fit ladder, scope pack
-signals, skill prompt building) exit before the seam, so a $0 attempt stays
-outside every ceiling; a crash after dispatch keeps the durable paid fact
-(write-ahead). This seam is also where the L-review lane's two-phase
-admission slots in at synthesis.
+duration of its wave, and the shared reviewer transport entry
+(``review_custody.run_custodied_review_slots``) invokes it after slot resolution and
+immediately before worker fan-out. The coordinator also captures that exact
+once-only object: session routes invoke it before their replayable
+``START_REQUESTED`` row, while API routes bind it for the canonical physical-
+attempt boundary. Assembly-only refusals (triad fit ladder, scope pack signals,
+skill prompt building) exit before the seam, so a $0 attempt stays outside
+every ceiling; a worker that outlives its logical caller cannot race the
+write-ahead fact, and a crash after dispatch keeps the durable paid fact.
+Commit review verifies this write fail-closed; other callers retain historical
+fail-open accounting. This seam also hosts the L-review lane's two-phase admission.
 """
 
 from __future__ import annotations
@@ -58,16 +61,16 @@ class ReviewPaidStamp:
     Parallel dispatch means two sides can race to be "the first transport
     call" (the commit gate dispatches triad and scope concurrently): the first
     caller performs the durable write-ahead, later callers block on the lock
-    until it lands and then no-op — so EVERY side is guaranteed the paid fact
-    is durable before its own transport begins. A failing write is not
-    retried and still marks the stamp fired: the terminal record is the
-    primary ledger, and this writer is fail-open cost accounting, never a
-    safety gate.
+    until it lands and then no-op. The default consumes a failed write and
+    remains fail-open for existing accounting callers. ``fail_closed=True``
+    propagates the error and leaves the stamp unfired, so a paid transport may
+    start only after a later idempotent write succeeds.
     """
 
-    def __init__(self, write: Callable[[], None]) -> None:
+    def __init__(self, write: Callable[[], None], *, fail_closed: bool = False) -> None:
         self._write = write
         self._lock = threading.Lock()
+        self.fail_closed = bool(fail_closed)
         self.fired = False
 
     def __call__(self) -> None:
@@ -76,17 +79,23 @@ class ReviewPaidStamp:
                 return
             try:
                 self._write()
-            finally:
+            except Exception:
+                if self.fail_closed:
+                    raise
                 self.fired = True
+                raise
+            self.fired = True
 
 
 def invoke_review_paid_stamp(stamp: Any) -> None:
-    """Invoke one captured write-ahead stamp, fail-open."""
+    """Invoke one captured write-ahead stamp under its selected failure policy."""
     if not callable(stamp):
         return
     try:
         stamp()
     except Exception:
+        if bool(getattr(stamp, "fail_closed", False)):
+            raise
         log.debug("review paid dispatch stamp failed (fail-open)", exc_info=True)
 
 
@@ -106,7 +115,7 @@ def invoke_bound_api_review_paid_stamp() -> None:
 
 
 def stamp_review_paid_on_dispatch(ctx: Any) -> None:
-    """Invoke the caller-installed stamp; retained for legacy/test callers."""
+    """Invoke the caller-installed stamp at the shared dispatch boundary."""
     invoke_review_paid_stamp(
         getattr(ctx, "_review_paid_stamp", None) if ctx is not None else None
     )

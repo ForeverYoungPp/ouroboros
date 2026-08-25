@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -329,7 +331,7 @@ def emit_external_wait_lease(ctx: Any, run_id: str, until_ts: float,
         log.debug("external-wait lease emission failed", exc_info=True)
 
 
-def poll_bound(seconds_left: float) -> float:
+def poll_bound(seconds_left: float, *, strict: bool = False) -> float:
     """What one call inside a clamped window may ASK the transport for.
 
     NARROWING in both directions, which is the only thing a bound is for. Never more
@@ -346,7 +348,34 @@ def poll_bound(seconds_left: float) -> float:
     """
     from ouroboros.gateways.claudexor import _READ_TIMEOUT_SEC, SHORT_POLL_TIMEOUT_SEC
 
+    if strict:
+        return min(_READ_TIMEOUT_SEC, max(0.001, float(seconds_left)))
     return min(_READ_TIMEOUT_SEC, max(SHORT_POLL_TIMEOUT_SEC, float(seconds_left)))
+
+
+def _strict_poll(gateway: Any, run_id: str, timeout: float) -> Dict[str, Any]:
+    """Give each HTTP phase the full remainder, while bounding total wall time."""
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    holder: Dict[str, Any] = {}
+    done = threading.Event()
+
+    def call() -> None:
+        try:
+            holder["detail"] = gateway.get_run(run_id, timeout_sec=timeout)
+        except BaseException as exc:
+            holder["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=call, name=f"review-poll-{run_id}", daemon=True).start()
+    if not done.wait(timeout=timeout):
+        raise ClaudexorUnavailable(
+            "poll_wall_timeout", f"Claudexor poll exceeded {timeout:g}s wall-clock bound",
+        )
+    if "error" in holder:
+        raise holder["error"]
+    return holder.get("detail") or {}
 
 
 def is_transient_git_object_race(exc: Exception) -> bool:
@@ -369,14 +398,16 @@ def is_transient_git_object_race(exc: Exception) -> bool:
     )
 
 
-def bounded_poll(gateway: Any, run_id: str, seconds_left: float) -> Dict[str, Any]:
+def bounded_poll(
+    gateway: Any, run_id: str, seconds_left: float, *, strict: bool = False,
+) -> Dict[str, Any]:
     """One poll that may not ask for longer than the window has left.
 
     The client's read default is minutes-scale, which is right for a call with all the
     time it needs and wrong for one inside a clamped window: a poll started a moment
     before expiry could answer a minute after it, so the clamp bounded the sleeping and
-    not the waiting (measured, 4.51s of wall against a 4.2s window — and that was a fast
-    daemon). Bounded here, the wait cannot outlive its window through the transport.
+    not the waiting. Strict review polls add a total wall-clock guard; ordinary
+    delegate waits retain their intentional short-poll floor and phase-local timeout.
 
     A failure PROPAGATES, as the typed refusal the gateway already raised. There is time
     left on the window here, so there is no expiry to report and nothing true to say
@@ -393,20 +424,30 @@ def bounded_poll(gateway: Any, run_id: str, seconds_left: float) -> Dict[str, An
     gets ONE immediate re-read while the window still has time — it is a lie about a
     file mid-rename, not a daemon that stopped answering.
     """
+    deadline = time.monotonic() + max(0.0, float(seconds_left))
+
+    def poll(remaining: float) -> Dict[str, Any]:
+        bound = poll_bound(remaining, strict=strict)
+        return _strict_poll(gateway, run_id, bound) if strict else gateway.get_run(run_id, timeout_sec=bound)
+
     try:
-        return gateway.get_run(run_id, timeout_sec=poll_bound(seconds_left))
+        return poll(seconds_left)
     except Exception as exc:
-        if seconds_left > 0 and is_transient_git_object_race(exc):
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining > 0 and is_transient_git_object_race(exc):
             log.debug("transient Git object race on poll of %s; one re-read", run_id)
-            return gateway.get_run(run_id, timeout_sec=poll_bound(seconds_left))
+            return poll(remaining)
         raise
 
 
-def expiring_poll(gateway: Any, run_id: str) -> Optional[Dict[str, Any]]:
+def expiring_poll(
+    gateway: Any, run_id: str, *, strict: bool = False,
+) -> Optional[Dict[str, Any]]:
     """The poll of a SPENT window. ``None`` when the daemon did not answer inside it.
 
-    A spent window still takes its poll rather than skipping it, at the floor: skipping
-    looked like the cheap trade and cost more, because terminal state and containment
+    A spent window still takes its poll rather than skipping it. The ordinary path uses
+    the short-poll floor; strict owner-deadline callers use their 1 ms total wall bound.
+    Skipping looked like the cheap trade and cost more, because terminal state and containment
     breach were then judged on data read BEFORE the last sleep — a run that finished
     during that sleep came back as ``progress``/``running`` with no settlement, and the
     model paid another full-context round for a run already done.
@@ -419,7 +460,7 @@ def expiring_poll(gateway: Any, run_id: str) -> Optional[Dict[str, Any]]:
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
     try:
-        return bounded_poll(gateway, run_id, 0.0)
+        return bounded_poll(gateway, run_id, 0.0, strict=strict)
     except ClaudexorUnavailable:
         log.debug("the last poll of a spent delegate_wait window went unanswered", exc_info=True)
         return None

@@ -758,7 +758,7 @@ def _resolve_preflight_timeout(timeout: int) -> int:
             parsed = int(float(raw))
             if parsed > 0:
                 return parsed
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             pass
     return timeout
 

@@ -218,6 +218,75 @@ def test_identical_request_replays_recorded_wave_without_panel_or_cycle(harness)
     assert _state(harness)["cycles_paid"] == 1
 
 
+def test_identical_in_flight_plan_reconciles_same_paid_cycle_at_cap(
+    harness, monkeypatch,
+):
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
+    calls = []
+
+    def substrate(request, *, slots, drive_root, llm, usage_ctx=None):
+        calls.append(request.retry_key)
+        in_flight = len(calls) == 1
+        return SimpleNamespace(actors=[{
+            "slot_id": slot.slot_id,
+            "model": slot.model,
+            "status": "error" if in_flight else "ok",
+            "raw_text": "" if in_flight else CLEAN,
+            "error": "logical wait expired" if in_flight else "",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "resolved_model": slot.model},
+            "prompt_ref": {}, "response_ref": {},
+            "operation_id": f"op-{slot.slot_id}",
+            "operation_state": "in_flight" if in_flight else "late_settled",
+            "late_result_pending": in_flight,
+        } for slot in slots])
+
+    import ouroboros.review_substrate as review_substrate
+    import ouroboros.review_custody as review_custody
+
+    monkeypatch.setattr(review_substrate, "run_review_request", substrate)
+    monkeypatch.setattr(review_custody, "review_retry_custody_available", lambda **_kwargs: True)
+    ctx = harness.make_ctx()
+    first = _call(ctx)
+    assert _control(first) == {"outcome": "DEGRADED", "closed": False}
+    first_state = _state(harness)
+    assert first_state["cycles_paid"] == 1
+    assert not first_state["waves"][-1].get("cycles_exhausted")
+
+    second = _call(ctx)
+    assert _control(second) == {"outcome": "GREEN", "closed": True}
+    assert calls == [calls[0], calls[0]]
+    state = _state(harness)
+    assert state["cycles_paid"] == 1
+    assert state["waves"][-1]["cycle_index"] == 1
+
+
+def test_in_flight_plan_without_process_custody_refuses_duplicate_dispatch(
+    harness, monkeypatch,
+):
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
+    calls = []
+
+    def substrate(request, *, slots, drive_root, llm, usage_ctx=None):
+        calls.append(request.retry_key)
+        return SimpleNamespace(actors=[{
+            "slot_id": slot.slot_id, "model": slot.model, "status": "error",
+            "raw_text": "", "error": "logical wait expired", "usage": {},
+            "prompt_ref": {}, "response_ref": {}, "operation_id": f"op-{slot.slot_id}",
+            "operation_state": "in_flight", "late_result_pending": True,
+        } for slot in slots])
+
+    import ouroboros.review_substrate as review_substrate
+
+    monkeypatch.setattr(review_substrate, "run_review_request", substrate)
+    ctx = harness.make_ctx()
+    _call(ctx)
+    second = _call(ctx)
+
+    assert len(calls) == 1
+    assert "process-local custody is unavailable" in second
+    assert _state(harness)["cycles_paid"] == 1
+
+
 def test_cap_reached_returns_typed_exhausted_result_hold_and_event(harness, monkeypatch):
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
     blocking = json.dumps([_finding("f1", "blocking", breaks="claim_1")])
@@ -1332,10 +1401,9 @@ _DEAD_PANEL = {
 
 
 def _patch_health(monkeypatch, snapshot_fn):
-    """Patch BOTH snapshot callers: the engine's fan-out seam and the replay seam."""
+    """Patch the runtime snapshot owner used by fresh fan-out and replay."""
     import ouroboros.tools.plan_review_runtime as prr
 
-    monkeypatch.setattr(pr, "_plan_panel_health_snapshot", snapshot_fn)
     monkeypatch.setattr(prr, "plan_panel_health_snapshot", snapshot_fn)
 
 

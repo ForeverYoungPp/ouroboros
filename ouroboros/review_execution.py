@@ -18,7 +18,7 @@ import os
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, List, Optional
 
 from ouroboros.review_slot_cancel import (  # noqa: F401 — re-exported seam surface
     ReviewSessionSucceededResultUnavailable,
@@ -35,10 +35,21 @@ from ouroboros.triad_review import (
     empty_array_is_verified_clean,
     extract_json_array,
 )
+from ouroboros.deadline_utils import bounded_seconds, review_transport_timeout
+from ouroboros.review_session_custody import (
+    checkpoint_pending_invocation,
+    owned_started_review_custody,
+    review_recovery_facts,
+)
+from ouroboros.review_session_usage import (
+    session_custody_attribution,
+    session_invocation_fields,
+)
 if TYPE_CHECKING:  # annotations only — importing the substrate here would cycle
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot
 
 log = logging.getLogger("review_execution")
+
 class ReviewRouteKind(str, Enum):
     """Closed set of review delivery routes.
 
@@ -82,6 +93,12 @@ class ReviewSessionWaitingOnUser(RuntimeError):
     deliberate non-goal (owner: no acceptance host-wait; see docs/ARCHITECTURE.md).
     """
 
+
+def _poll_detail(gateway: Any, run_id: str, seconds: float) -> Dict[str, Any]:
+    from ouroboros.delegate_progress import bounded_poll, expiring_poll
+    if seconds > 0:
+        return bounded_poll(gateway, run_id, seconds, strict=True)
+    return expiring_poll(gateway, run_id, strict=True) or {}
 
 def _render_prompt_parts(request: ReviewRequest, slot: ReviewSlot) -> tuple[str, str, str]:
     """Return (stable_governance, task_stable, dynamic_evidence) for one slot.
@@ -298,6 +315,17 @@ class ReviewSlotExecutor:
     def execute(self) -> ReviewAttemptResult:
         raise NotImplementedError
 
+    def failure_custody(self) -> Dict[str, Any]:
+        return {}
+
+    def restore_custody(self, _state: Dict[str, Any]) -> None:
+        return None
+
+    def set_pending_invocation_checkpoint(
+        self, _checkpoint: Optional[Callable[[str], None]],
+    ) -> None:
+        return None
+
 
 class ApiChatReviewExecutor(ReviewSlotExecutor):
     """The chat-completions route: the historical ``LLMClient.chat`` path."""
@@ -327,6 +355,7 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
     def _kwargs(self) -> Dict[str, Any]:
         if self._chat_kwargs is None:
             request, slot = self.assignment.request, self.assignment.slot
+            transport = review_transport_timeout(slot.model, getattr(slot, "transport_timeout_sec", None), getattr(request, "deadline_at", ""))
             self._chat_kwargs = {
                 "messages": self.messages,
                 "model": slot.model,
@@ -340,10 +369,7 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
                 # slot_id in the key — same-model slots keep today's
                 # provider-concentration behavior.
                 "cache_affinity": f"{request.surface}:{request.task_id or 'review'}",
-                # Bound the socket to the logical slot timeout so a stalled
-                # connection cannot leave the whole review process unable to exit.
-                # The outer queue/wait_for still governs the logical deadline.
-                "timeout": float(slot.timeout_sec) if slot.timeout_sec else None,
+                "timeout": transport,
                 "use_local": bool(slot.use_local),
             }
         return self._chat_kwargs
@@ -355,10 +381,20 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
         if not callable(chat) and not callable(async_chat):
             raise ReviewRouteUnavailable("api_chat client exposes no callable transport", code="api_chat_unavailable")
         with bind_api_review_paid_stamp(self.assignment.dispatch_stamp):
-            if callable(chat):
-                msg, usage = chat(**chat_kwargs)
-            else:
-                msg, usage = asyncio.run(async_chat(**chat_kwargs))
+            try:
+                if callable(chat):
+                    msg, usage = chat(**chat_kwargs)
+                else:
+                    msg, usage = asyncio.run(async_chat(**chat_kwargs))
+            except BaseException as exc:
+                # A provider-ambiguous exception is positive evidence that the
+                # physical boundary was crossed even when a test adapter or old
+                # transport did not enter usage_accounting's canonical marker.
+                # The coordinator wraps raw stamps once-only, so this fallback
+                # cannot double-charge a route that already marked dispatch.
+                if getattr(exc, "physical_attempt_capture", None) is not None:
+                    invoke_review_paid_stamp(self.assignment.dispatch_stamp)
+                raise
         # Null/non-object provider messages follow the caller's empty-response rail.
         raw_text = str(msg.get("content") or "") if isinstance(msg, dict) else ""
         return ReviewAttemptResult(message=msg, usage=usage, raw_text=raw_text)
@@ -563,11 +599,8 @@ def _strictly_parseable(text: str) -> bool:
 
 
 def canonicalize_session_verdict(
-    raw_text: str,
-    *,
-    conformance_passed: bool,
-    contract: str = "",
-    llm: Any = None,
+    raw_text: str, *, conformance_passed: bool, contract: str = "", llm: Any = None,
+    deadline_at: Any = None, transport_timeout_sec: Any = None,
 ) -> tuple[str, str, Dict[str, Any]]:
     """Return ``(canonical_text, method, extraction_usage)`` for a session answer.
 
@@ -598,7 +631,9 @@ def canonicalize_session_verdict(
         return text, "strict", {}
     if len(text) > _EXTRACT_MAX_CHARS:
         return text, "extraction_incomplete", {}
-    canonical, usage = _extract_verdict_via_light_model(text, contract=contract, llm=llm)
+    canonical, usage = _extract_verdict_via_light_model(
+        text, contract=contract, llm=llm, deadline_at=deadline_at,
+        transport_timeout_sec=transport_timeout_sec)
     if canonical is not None:
         return canonical, "light_model_extraction", usage
     # `unparsed` is the honest end of THIS layer's knowledge. The coordinator's
@@ -609,10 +644,9 @@ def canonicalize_session_verdict(
     # verdict that lands downstream is telemetered `unparsed` at this layer.
     return text, "unparsed", usage
 
-
 def _extract_verdict_via_light_model(
-    raw_text: str, *, contract: str = "", llm: Any = None,
-) -> tuple[Optional[str], Dict[str, Any]]:
+    raw_text: str, *, contract: str = "", llm: Any = None, deadline_at: Any = None,
+    transport_timeout_sec: Any = None) -> tuple[Optional[str], Dict[str, Any]]:
     """One bounded light-model call canonicalizing narrative to the contract."""
     from ouroboros.config import get_light_model
     from ouroboros.usage_accounting import physical_attempt_limit
@@ -639,16 +673,16 @@ def _extract_verdict_via_light_model(
         # sub-labeled `review_substrate.extraction`, so the small light-model
         # rows beside the $0.00 subscription settlements read as what they are —
         # verdict extraction, not review-slot spend.
-        _scope = _replace(current_usage_scope() or UsageScope(),
-                          source="review_substrate.extraction")
+        _scope = _replace(current_usage_scope() or UsageScope(), source="review_substrate.extraction")
+        chat_kwargs = dict(
+            messages=[{"role": "user", "content": prompt}], model=model,
+            max_tokens=8192, reasoning_effort="low", no_proxy=True,
+        )
+        transport = review_transport_timeout(model, transport_timeout_sec, deadline_at)
+        if transport is not None:
+            chat_kwargs["timeout"] = transport
         with physical_attempt_limit(1), usage_scope(_scope):
-            message, usage = llm.chat(
-                messages=[{"role": "user", "content": prompt}],
-                model=model,
-                max_tokens=8192,
-                reasoning_effort="low",
-                no_proxy=True,
-            )
+            message, usage = llm.chat(**chat_kwargs)
     except Exception as exc:
         log.warning("Review session verdict extraction failed: %s", exc)
         return None, {}
@@ -757,67 +791,12 @@ class SessionInvocation:
     session_route: Any = None
     instructions: str = _REVIEW_SESSION_INSTRUCTIONS
     retry_state: Optional[Dict[str, Any]] = None
+    reconcile_only: bool = False
     use_thread: bool = False
     thread_id: str = ""
     dispatch_stamp: Any = None
-
-
-def _owned_started_review_custody(
-    custody: Any, custody_drive: Any, record: Dict[str, Any], claimant_task_id: str,
-) -> tuple[str, Any]:
-    """Return the existing run custody only after exact owner corroboration."""
-    run_id = str(record.get("run_id") or "")
-    ownership, found = custody.lookup(custody_drive, claimant_task_id, run_id)
-    invocation_owner = str(record.get("task_id") or "")
-    custody_owner = str(getattr(found, "task_id", "") or "")
-    if (ownership != custody.OWNED or found is None
-            or invocation_owner != claimant_task_id
-            or custody_owner != claimant_task_id):
-        raise ReviewRouteUnavailable(
-            "delegated review started-run recovery could not corroborate "
-            f"ownership for run {run_id} (lookup={ownership}, "
-            f"claimant={claimant_task_id!r}, invocation_owner={invocation_owner!r}, "
-            f"custody_owner={custody_owner!r})", code="review_recovery_ownership_unverified")
-    return run_id, found
-
-
-def _review_recovery_facts(
-    record: Dict[str, Any], run_request: Any, started_custody: Any, *,
-    prompt: str, root: str,
-) -> tuple[Any, str, str, str, bool]:
-    """Validate one stored request and restore its immutable delivery facts."""
-    from ouroboros.subagents import DelegationRoute
-
-    if not isinstance(run_request, dict) or not run_request:
-        raise ReviewRouteUnavailable(
-            "delegated review recovery has no canonical stored request; "
-            "the existing invocation is not re-derived", code="review_recovery_request_missing")
-    stored_root = str((run_request.get("scope") or {}).get("root") or "")
-    if str(run_request.get("prompt") or "") != prompt or stored_root != root:
-        raise ReviewRouteUnavailable(
-            "delegated review retry replays a recorded invocation whose "
-            f"{'prompt' if stored_root == root else 'session root'} differs from "
-            "this call's; the durable retry token remains untouched and the "
-            "recorded invocation is not replayed against a different review", code="review_recovery_request_mismatch")
-    if started_custody is not None:
-        route_id = str(started_custody.route_id or "")
-        model = str(started_custody.model or "")
-        project_id = str(started_custody.project_id or "")
-        project_owned = bool(started_custody.project_owned)
-        key = str(started_custody.idempotency_key or "")
-    else:
-        route_id = str(run_request.get("primaryHarness") or record.get("route") or "")
-        model = str(run_request.get("model") or "")
-        project_id = str(record.get("project_id") or "")
-        project_owned = bool(record.get("project_owned"))
-        key = str(record.get("idempotency_key") or "")
-    route = DelegationRoute(
-        route_id=route_id, model=model, effort=str(run_request.get("effort") or ""),
-        # The stored request carries the pin: a pinned retry replays PINNED (D1).
-        profile_id=str(run_request.get("credentialProfileId") or ""))
-    existing_project = "" if project_owned else project_id
-    return route, project_id, existing_project, key, "outputSchema" in run_request
-
+    operation_id: str = ""
+    pending_invocation_checkpoint: Optional[Callable[[str], None]] = None
 
 def run_delegated_review_session(
     *,
@@ -826,39 +805,15 @@ def run_delegated_review_session(
     custody_drive: Any,
     invocation: SessionInvocation,
 ) -> Dict[str, Any]:
-    """Start, watch, settle and collect ONE delegated read-only review session.
+    """Start, watch, settle and collect one delegated read-only review.
 
-    The single delegated-session transport for every review surface — the
-    substrate's agent_session slots and the delegated advisory both run through
-    here, so there is one nanny loop, not two. The caller owns semantics; this
-    function owns delivery:
-
-    - readonly shape, ``authPreference: subscription``, typed refusals for an
-      unconfigured/unhealthy route — never a fallback to another route (§8);
-    - the requested route is PINNED as the run's explicit one-element
-      ``harnesses`` pool: ``primaryHarness`` alone only reorders the engine's
-      auto-pool, so a "preferred" route can silently land on whatever other
-      harness the pool holds. A pinned pool runs THIS route or refuses typed;
-    - ``output_schema`` is ASKED only when the pinned route's EFFECTIVE
-      transport can carry it (live manifest, not the static adapter flag —
-      D19); the returned ``conformance`` is the only thing a caller may gate
-      trust on;
-    - invocation identity follows the explicit-retry contract: an ordinary call
-      ALWAYS mints a fresh invocation id and records the CANONICAL body on the
-      durable request row; an unknown-outcome failure leaves its token in
-      ``retry_state`` (caller-owned, surviving across the slot's permitted
-      physical attempts), and only that token replays — the STORED bytes under
-      the SAME wire key. A token whose invocation already bound a run is waited
-      on instead of re-posted; a definitively refused token is dead and the
-      call mints fresh. Nothing is ever reused by content-matching;
-    - the nanny owns the time cap: a run that outlives ``timeout_sec`` is
-      cancelled through the verified-cancel path and reported as a timeout;
-    - the transcript is read from the verified FULL primary output (D7), never
-      a bounded preview; the run is settled through delegate_custody either way.
-
-    Returns ``{run_id, text, conformance, schema_asked, settlement, route_id,
-    model, spend, spend_estimated}``. Raises ``ReviewRouteUnavailable``,
-    ``TimeoutError`` or ``RuntimeError``.
+    This is every review surface's single session transport. It pins one
+    subscription harness, asks for schema only when the effective adapter can
+    carry it, stores the canonical start request before POST, and replays only
+    an explicit pending invocation token. A bound token joins its existing run;
+    reconcile-only mode never mints a replacement. The nanny owns verified
+    cancellation at ``timeout_sec`` and reads the full primary output before
+    settling through ``delegate_custody``.
     """
     from ouroboros import delegate_custody as custody
     from ouroboros.claudexor_daemon import ensure_owned_gateway
@@ -866,23 +821,16 @@ def run_delegated_review_session(
         WINDOW_EXHAUSTED_CODES, ClaudexorSubscriptionWindowExhausted, ClaudexorUnavailable,
     )
     from ouroboros.subagents import delegated_run_shape, route_health
-    from ouroboros.usage_accounting import REVIEW_ATTRIBUTION_KEYS, current_usage_scope
+    from ouroboros.usage_accounting import current_usage_scope
 
-    task_id, surface, slot_id = invocation.task_id, invocation.surface, invocation.slot_id
-    timeout_sec, logical_key_extra = invocation.timeout_sec, invocation.logical_key_extra
-    output_schema, session_route = invocation.output_schema, invocation.session_route
-    instructions, retry_state = invocation.instructions, invocation.retry_state
+    task_id, surface, slot_id, timeout_sec, logical_key_extra, output_schema, \
+        session_route, instructions, retry_state = session_invocation_fields(invocation)
     use_thread = bool(invocation.use_thread)
     thread_id = str(invocation.thread_id or "")
     turn_id = ""
     # #112: capture task-tree lineage once for both custody writers.
     _scope = current_usage_scope()
-    root_task_id = str(getattr(_scope, "root_task_id", "") or "")
-    parent_task_id = str(getattr(_scope, "parent_task_id", "") or "")
-    usage_custody = {"category": str(getattr(_scope, "category", "") or "subagent"),
-        "source": str(getattr(_scope, "source", "") or "delegated_subagent"),
-        **{key: str(getattr(_scope, key, "") or "") for key in REVIEW_ATTRIBUTION_KEYS},
-    }
+    root_task_id, parent_task_id, usage_custody = session_custody_attribution(_scope)
     shape = delegated_run_shape(False)  # a reviewer reads and answers
     state = retry_state if retry_state is not None else {}
     run_id, run_request, invocation_id = "", None, ""
@@ -891,7 +839,7 @@ def run_delegated_review_session(
     retry_token = str(state.get("pending_invocation_id") or "")
     record = custody.invocation_record(custody_drive, retry_token) if retry_token else None
     if record is not None and record["state"] == "started" and record["run_id"]:
-        run_id, started_custody = _owned_started_review_custody(
+        run_id, started_custody = owned_started_review_custody(
             custody, custody_drive, record, task_id)
         run_request, invocation_id = record.get("request"), retry_token
     elif (record is not None and record["state"] == "pending"
@@ -901,8 +849,9 @@ def run_delegated_review_session(
     recovering = bool(run_id) or run_request is not None
     if recovering:
         route, project_id, existing_project, key, schema_asked = (
-            _review_recovery_facts(
-                record, run_request, started_custody, prompt=prompt, root=root)
+            review_recovery_facts(
+                record, run_request, started_custody, prompt=prompt, root=root,
+                claimant_task_id=task_id)
         )
         thread_id = str(run_request.get("_thread_id") or thread_id)
         use_thread = bool(thread_id or run_request.get("_use_thread"))
@@ -914,9 +863,15 @@ def run_delegated_review_session(
                 f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)",
                 code="session_route_unconfigured")
         project_id, existing_project, key, schema_asked = "", "", "", False
+    if invocation.reconcile_only and not recovering:
+        raise ReviewRouteUnavailable(
+            "the exact delegated review invocation is no longer available for "
+            "reconciliation; refusing to start a second paid run",
+            code="review_custody_lost",
+        )
     gateway = ensure_owned_gateway()
     try:
-        if not run_id and not (use_thread and thread_id):
+        if not recovering and not run_id and not (use_thread and thread_id):
             # Admission applies only before POST and is checked against the exact pin (D1).
             unavailable, reset_at = route_health(
                 gateway, route.route_id, shape, route_model=route.model,
@@ -949,7 +904,9 @@ def run_delegated_review_session(
                     surface=surface, slot_id=slot_id, task_id=task_id)
                 existing_project = project_id
             invocation_id = custody.new_invocation_id()
-            seconds = max(1, min(int(timeout_sec or 300), _CLAUDEXOR_MAX_SECONDS))
+            seconds = bounded_seconds(
+                timeout_sec, default=300, maximum=_CLAUDEXOR_MAX_SECONDS,
+            )
             run_request = {
                 "prompt": prompt,
                 "instructions": instructions,
@@ -974,11 +931,16 @@ def run_delegated_review_session(
             if schema_asked:
                 run_request["outputSchema"] = output_schema
         if not run_id:
-            seconds = int(run_request.get("maxSeconds") or timeout_sec or 300)
+            seconds = bounded_seconds(
+                run_request.get("maxSeconds"),
+                default=timeout_sec if timeout_sec is not None else 300,
+                maximum=_CLAUDEXOR_MAX_SECONDS,
+            )
             invoke_review_paid_stamp(invocation.dispatch_stamp)
             requested = custody.record_start_requested(
                 custody_drive, run_id="", task_id=task_id,
                 idempotency_key=key, invocation_id=invocation_id,
+                operation_id=str(invocation.operation_id or ""),
                 max_seconds=seconds, request=run_request, project_id=project_id,
                 project_owned=not existing_project, route=route.route_id,
                 surface=surface, slot_id=slot_id,
@@ -997,6 +959,17 @@ def run_delegated_review_session(
                 raise ReviewRouteUnavailable(
                     "the durable start-request row could not be written; the "
                     "delegated review session was NOT started", code="start_request_row_unwritable")
+            # Share the durable token with the logical caller before POST/poll.
+            # If its wait window closes while this worker is still alive, the
+            # synthetic in-flight actor can persist an exact restart handle.
+            state["pending_invocation_id"] = invocation_id
+            checkpoint_pending_invocation(
+                checkpoint=invocation.pending_invocation_checkpoint, invocation_id=invocation_id,
+                state=state, on_failure=lambda: _retire_orphaned_review_registration(
+                    custody, gateway, custody_drive, project_id if not existing_project else "",
+                    definite_refusal=not recovering,
+                    reason="review_custody_checkpoint_unwritable",
+                    invocation_id=invocation_id, surface=surface, slot_id=slot_id))
             try:
                 if use_thread:
                     from ouroboros.review_thread_continuity import start_review_thread_turn
@@ -1033,7 +1006,8 @@ def run_delegated_review_session(
                 state["pending_invocation_id"] = invocation_id
                 raise ReviewRouteUnavailable(
                     f"Claudexor returned a queued handle without a run id: {handle!r}", code="queued_without_run_id")
-        state.pop("pending_invocation_id", None)
+        state["pending_invocation_id"] = invocation_id or retry_token
+        state["delegated_run_id"] = run_id
         if started_custody is not None:
             entry = started_custody
             custody_durable = True
@@ -1054,8 +1028,17 @@ def run_delegated_review_session(
                 "isolation": shape.isolation, "delegated": shape.delegated,
                 "root": root, "surface": surface, "slot_id": slot_id,
             }))
-        detail = _poll_session_terminal(gateway, custody, custody_drive, entry,
-                                        run_id, float(timeout_sec or 300))
+        try:
+            detail = _poll_session_terminal(
+                gateway, custody, custody_drive, entry, run_id,
+                float(timeout_sec) if timeout_sec is not None else 300.0,
+            )
+        except ClaudexorUnavailable:
+            # A started run with an unreadable terminal state is still paid work.
+            # Preserve the exact durable invocation for the permitted retry rather
+            # than POSTing a second review against the same slot.
+            state["pending_invocation_id"] = invocation_id or retry_token
+            raise
         settlement = custody.settle_run(custody_drive, gateway, entry, detail)
         summary = custody.summary_of(detail)
         run_state = str(summary.get("state") or "")
@@ -1065,6 +1048,8 @@ def run_delegated_review_session(
             message = (f"delegated review session {run_id} ended {run_state or 'unknown'}"
                        + (f": {json.dumps(failure, ensure_ascii=False)}" if failure else ""))
             code = str(failure.get("code") or "")
+            state.pop("pending_invocation_id", None)
+            state.pop("delegated_run_id", None)
             if code in WINDOW_EXHAUSTED_CODES:
                 raise ClaudexorSubscriptionWindowExhausted(
                     message, reset_at=str(failure.get("resetsAt") or ""), code=code)
@@ -1078,6 +1063,8 @@ def run_delegated_review_session(
                 expected_profile=str(getattr(route, "profile_id", "") or ""),
                 applied_profile=str((summary.get("authRoute") or {}).get("profileId") or ""))
             turn_id = str(thread_receipt.get("turn_id") or turn_id)
+        state.pop("pending_invocation_id", None)
+        state.pop("delegated_run_id", None)
         return {
             "run_id": run_id,
             "thread_id": thread_id,
@@ -1104,10 +1091,13 @@ def run_delegated_review_session(
             # Only effectiveAccess witnesses applied access; request echo is insufficient.
             "applied_access": str(summary.get("effectiveAccess") or ""),
         }
+    except BaseException as exc:
+        if run_id:
+            setattr(exc, "delegated_run_started", True)
+            setattr(exc, "delegated_run_id", run_id)
+        raise
     finally:
         gateway.close()
-
-
 def _effective_route_carries_schema(gateway: Any, route_id: str) -> bool:
     """Can the EFFECTIVE route actually carry ``outputSchema`` on this run (D19)?
 
@@ -1137,33 +1127,13 @@ def _effective_route_carries_schema(gateway: Any, route_id: str) -> bool:
     except Exception:
         log.debug("harness manifest read failed", exc_info=True)
     return False
-
-
 def _poll_session_terminal(gateway: Any, custody: Any, custody_drive: Any, entry: Any,
                            run_id: str, seconds: float) -> Dict[str, Any]:
-    """Wait for the run's terminal state, bounded by the SLOT's own clock.
-
-    The nanny owns the time cap: on expiry the run is cancelled through the
-    verified-cancel path (an unverified stop must not read as stopped) and the
-    slot fails as an ordinary timeout on its own row.
-
-    A session that parks on an interactive question terminates the slot EARLY
-    (F18) — but only when the question has no engine expiry inside the slot's
-    remaining budget (``_interaction_outlives_slot``): review slots are
-    non-interactive, so such a question can only burn the slot in silence. The
-    run is cancelled through the same verified path under its own typed reason
-    and the failure names the pending question. A question whose ``timeout_at``
-    provably lands first is left to the engine's benign decline and the poll
-    continues (R2-2).
-
-    Both cancel sites are HONEST about what the cancel proved (BR1-1): the
-    typed outcome rides the raise, and a verify read that discovers a natural
-    SUCCESS terminal returns it as the slot's ordinary result instead of
-    raising over it — completion wins, no host-side waiting added."""
+    """Poll a delegated review run on the slot clock; verified cancel and
+    completion-wins semantics remain owned by the existing cancel seam."""
     from ouroboros.gateways.claudexor import pending_interactions as _cx_pending
-
-    deadline = time.monotonic() + max(1.0, float(seconds))
-    detail = gateway.get_run(run_id)
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    detail = _poll_detail(gateway, run_id, max(0.0, deadline - time.monotonic()))
     while not custody.is_terminal(detail):
         pending = _cx_pending(detail)
         if (pending or bool(custody.summary_of(detail).get("waitingOnUser"))) \
@@ -1201,11 +1171,13 @@ def _poll_session_terminal(gateway: Any, custody: Any, custody_drive: Any, entry
                 f"of {seconds:g}s ("
                 + _cancel_honesty_clause(outcome, state) + ")"
             )
-        time.sleep(min(_SESSION_POLL_SEC, max(0.0, deadline - time.monotonic())))
-        detail = gateway.get_run(run_id)
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            continue
+        time.sleep(min(_SESSION_POLL_SEC, remaining))
+        remaining = max(0.0, deadline - time.monotonic())
+        detail = _poll_detail(gateway, run_id, remaining)
     return detail
-
-
 def _full_session_text(gateway: Any, run_id: str, detail: Dict[str, Any]) -> str:
     """The session's final answer from the verified FULL primary output (D7).
 
@@ -1232,20 +1204,11 @@ def _full_session_text(gateway: Any, run_id: str, detail: Dict[str, Any]) -> str
         final_summary = detail.get("finalSummary")
         text = final_summary if isinstance(final_summary, str) else ""
     return text
-
-
 class AgentSessionReviewExecutor(ReviewSlotExecutor):
-    """The hosted-session route: one delegated Claudexor run per slot.
+    """One pinned Claudexor run per reviewer slot.
 
-    The COORDINATOR stays the owner of attempt policy, persistence, parsing,
-    actor projection and quorum; this class owns only delivery — it is the
-    nanny in host form: start the run, watch it, enforce the slot's own time
-    bound, bring the transcript home, and let the host's parsers judge it. It
-    never falls back to another route, provider, model or profile (§8), and a
-    repair resend NEVER restarts the session: the second ``execute`` performs
-    local extraction over the transcript already collected (plan 5.5).
+    The coordinator owns policy; this executor never restarts for format repair.
     """
-
     route = ReviewRouteKind.AGENT_SESSION
 
     def __init__(self, assignment: ReviewAssignment, *, llm: Any = None):
@@ -1256,13 +1219,10 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         self._run_id = ""
         self._session_usage: Dict[str, Any] = {}
         self._deltas: List[Dict[str, Any]] = []
-        # Caller-owned retry state for the explicit-retry contract: an
-        # unknown-outcome start leaves its invocation token here, so the slot's
-        # permitted second physical attempt replays THAT invocation instead of
-        # minting a second live run. It never crosses slot instances.
+        # Unknown starts retain the exact invocation token for the permitted retry.
         self._retry_state: Dict[str, Any] = {}
-        # The failure of a session that already RAN, remembered so the permitted
-        # resend re-raises it instead of buying a second billed run (see execute).
+        self._pending_invocation_checkpoint: Optional[Callable[[str], None]] = None
+        # A settled run failure is replayed rather than billed twice.
         self._settled_failure: Optional[BaseException] = None
 
     # -- prompt (route-owned; never the api pack) ------------------------------
@@ -1305,7 +1265,6 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             ]
             self._session_prompt = "\n".join(parts)
         return self._session_prompt
-
     # -- delivery --------------------------------------------------------------
 
     def execute(self) -> ReviewAttemptResult:
@@ -1314,31 +1273,41 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             # collected transcript; it never launches a second session.
             return self._verdict_result(force_extraction=True)
         if self._settled_failure is not None:
-            # The same rule, one step earlier: the session ALREADY RAN. Whether it
-            # terminated on a typed refusal or succeeded and then refused to hand
-            # its transcript back, the money is spent and the second physical send
-            # would mint a NEW run — a fresh idempotency key, a fresh bill — for a
-            # cause that is deterministic and will refuse identically. The rail's
-            # second send exists for a transport transient BEFORE the run exists
-            # (the pending invocation replays the same key onto the same run), and
-            # that path is untouched: it leaves `_retry_state` pending and never
-            # reaches here.
+            # Pre-start transients retain a pending invocation and do not land here.
             raise self._settled_failure
         try:
             self._run_session()
         except BaseException as exc:
+            self._run_id = self._run_id or str(getattr(exc, "delegated_run_id", "") or "")
             if not self._retry_state.get("pending_invocation_id"):
                 self._settled_failure = exc
             raise
         return self._verdict_result()
 
+    def failure_custody(self) -> Dict[str, Any]:
+        failure = self._settled_failure
+        run_id = self._run_id or str(getattr(failure, "delegated_run_id", "") or "")
+        pending = str(self._retry_state.get("pending_invocation_id") or "")
+        return {"delegated_run_started": bool(run_id), "delegated_run_id": run_id,
+                "pending_invocation_id": pending}
+
+    def restore_custody(self, state: Dict[str, Any]) -> None:
+        # The logical waiter and the physical worker share this small mutable
+        # custody cell so a timeout actor can durably carry a just-started run.
+        self._retry_state = state
+
+    def set_pending_invocation_checkpoint(
+        self, checkpoint: Optional[Callable[[str], None]],
+    ) -> None:
+        # Captured by the physical worker before the logical caller may return.
+        # Commit review uses it to patch the exact reserved slot before POST.
+        self._pending_invocation_checkpoint = checkpoint
     def _session_route(self) -> Any:
         # 6.1: a structured row carries ITS OWN opaque target; the shared
         # session-route key stays as the legacy fallback for rows without one.
         spec = str(getattr(self.assignment.slot, "session_target", "") or "")
         if spec:
             import dataclasses
-
             from ouroboros.subagents import parse_subagent_harness
 
             route = parse_subagent_harness(spec)
@@ -1378,6 +1347,18 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             raise ReviewRouteUnavailable(
                 "agent_session slot has no session root: the surface must name the "
                 "repository root the reviewer session runs in", code="session_root_missing")
+        from ouroboros.config import get_finalization_grace_sec
+        from ouroboros.deadline_utils import review_operation_timeout_sec
+        logical_deadline = getattr(self, "_logical_deadline_monotonic", None)
+        logical_timeout = (
+            max(0.001, float(logical_deadline) - time.monotonic())
+            if logical_deadline is not None else
+            review_operation_timeout_sec(getattr(slot, "timeout_sec", None),
+                route=getattr(slot, "route", None),
+                deadline_at=getattr(request, "deadline_at", "") or "",
+                transport_timeout_sec=getattr(slot, "transport_timeout_sec", None),
+                reserve_sec=get_finalization_grace_sec())
+        )
         facts = run_delegated_review_session(
             prompt=self.session_prompt,
             root=root,
@@ -1386,14 +1367,17 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 task_id=str(request.task_id or ""),
                 surface=request.surface,
                 slot_id=slot.slot_id,
-                timeout_sec=float(slot.timeout_sec or 300),
+                timeout_sec=logical_timeout,
                 logical_key_extra=(self.assignment.call_id,),
                 output_schema=review_session_output_schema(request.surface),
                 session_route=self._session_route(),
                 retry_state=self._retry_state,
+                reconcile_only=bool(getattr(request, "reconcile_only", False)),
                 use_thread=request.surface == "plan_review",
                 thread_id=str((request.session_threads or {}).get(slot.slot_id) or ""),
                 dispatch_stamp=self.assignment.dispatch_stamp,
+                operation_id=self.assignment.call_id,
+                pending_invocation_checkpoint=self._pending_invocation_checkpoint,
             ),
         )
         self._run_id = facts["run_id"]
@@ -1491,6 +1475,8 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             conformance_passed=self._conformance_passed and not force_extraction,
             contract=self._output_contract(),
             llm=self.llm,
+            deadline_at=getattr(self.assignment.request, "deadline_at", "") or "",
+            transport_timeout_sec=getattr(self.assignment.slot, "transport_timeout_sec", None),
         )
         usage = dict(self._session_usage)
         deltas = list(self._deltas)
@@ -1541,7 +1527,6 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             "verdict_method": method,
         }
         return ReviewAttemptResult(message=message, usage=usage, raw_text=canonical)
-
     def _emit_capability_delta(self, deltas: List[Dict[str, Any]], method: str) -> None:
         """Durable half of the disclosure (D4): every landing below what was
         asked reaches the event log, not only the actor record."""
@@ -1558,14 +1543,12 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         except Exception:
             log.warning("capability_delta disclosure write failed", exc_info=True)
 
-
 # Closed route table. Adding a route means adding an executor here; it never
 # means adding a branch to the coordinator.
 _REVIEW_ROUTE_EXECUTORS: Dict[ReviewRouteKind, type[ReviewSlotExecutor]] = {
     ReviewRouteKind.API_CHAT: ApiChatReviewExecutor,
     ReviewRouteKind.AGENT_SESSION: AgentSessionReviewExecutor,
 }
-
 
 def _review_route_executor(assignment: ReviewAssignment, *, llm: Any = None) -> ReviewSlotExecutor:
     """Bind a route to its executor. The ONLY place a review transport is chosen.

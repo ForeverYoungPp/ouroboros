@@ -12,7 +12,11 @@ import pathlib
 from typing import Any, Dict, List, Optional
 
 from ouroboros.review_cycles import REASON_REVIEW_CYCLES_EXHAUSTED, review_max_cycles
-from ouroboros.review_state import infer_review_phase
+from ouroboros.review_owner_custody import stamp_paid_review_owner
+from ouroboros.review_state import (
+    _attempt_has_active_review_custody,
+    infer_review_phase,
+)
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import (
     truncate_review_artifact as _truncate_review_reason,
@@ -54,7 +58,7 @@ def _continuation_source(status: str, *, late_result_pending: bool) -> str:
 def _attempt_accepts_reviewing_update(existing: Any) -> bool:
     if existing is None:
         return False
-    return bool(existing.status == "reviewing" or existing.late_result_pending)
+    return _attempt_has_active_review_custody(existing)
 
 
 # Max Review Cycles semantics on the commit gate (owner Q12/Q16/Q22/Q23):
@@ -465,6 +469,7 @@ def _record_commit_attempt(
     **legacy_kwargs: Any,
 ) -> None:
     """Record a commit attempt; supports positional or keyword commit_message/status."""
+    strict = bool(legacy_kwargs.pop("_strict", False))
     if commit_message is not None:
         legacy_kwargs.setdefault("commit_message", commit_message)
     if status is not None:
@@ -507,6 +512,7 @@ def _record_commit_attempt(
         rebuttal_sha256 = _req("rebuttal_sha256")
         paid = _req("paid", False)
         review_contract_fingerprint = _req("review_contract_fingerprint")
+        review_retry_key = _req("review_retry_key")
         root_task_id = resolve_root_task_id(ctx)
         dr = pathlib.Path(ctx.drive_root)
         repo_key = make_repo_key(pathlib.Path(ctx.repo_dir))
@@ -640,8 +646,16 @@ def _record_commit_attempt(
                     ) if str(x).strip()
                 ],
                 scope_model=scope_model or str(getattr(existing, "scope_model", "") or ""),
-                triad_raw_results=list(triad_raw_results or []),
-                scope_raw_result=dict(scope_raw_result or {}),
+                triad_raw_results=list(
+                    triad_raw_results
+                    if triad_raw_results is not None
+                    else getattr(existing, "triad_raw_results", None) or []
+                ),
+                scope_raw_result=dict(
+                    scope_raw_result
+                    if scope_raw_result is not None
+                    else getattr(existing, "scope_raw_result", None) or {}
+                ),
                 block_class=block_class or str(getattr(existing, "block_class", "") or ""),
                 rebuttal_sha256=rebuttal_sha256 or str(getattr(existing, "rebuttal_sha256", "") or ""),
                 paid=bool(paid or getattr(existing, "paid", False)),
@@ -649,8 +663,18 @@ def _record_commit_attempt(
                     review_contract_fingerprint
                     or str(getattr(existing, "review_contract_fingerprint", "") or "")
                 ),
+                review_retry_key=(
+                    review_retry_key or str(getattr(existing, "review_retry_key", "") or "")
+                ),
                 root_task_id=root_task_id or str(getattr(existing, "root_task_id", "") or ""),
+                review_owner_session_id=str(
+                    getattr(existing, "review_owner_session_id", "") or ""
+                ),
+                review_owner_pid=int(
+                    getattr(existing, "review_owner_pid", 0) or 0
+                ),
             )
+            stamp_paid_review_owner(attempt, paid=bool(paid))
             state.record_attempt(attempt, semantic_redirects=_obligation_redirects)
 
         update_state(dr, _mutate)
@@ -694,6 +718,8 @@ def _record_commit_attempt(
             ctx._current_review_attempt_number = None
     except Exception as e:
         log.warning("Failed to record commit attempt: %s", e)
+        if strict:
+            raise
 
 
 def _invalidate_advisory(
@@ -747,6 +773,8 @@ def _check_overlapping_review_attempt(ctx: ToolContext) -> Optional[str]:
 
     repo_key = make_repo_key(pathlib.Path(ctx.repo_dir))
     expiration_window = _REVIEW_ATTEMPT_TTL_SEC + _REVIEW_ATTEMPT_GRACE_SEC
+    ctx._review_resume_pending = False
+    ctx._pending_review_attempt = None
 
     def _mutate(state):
         state.expire_stale_attempts(now_ts=_utc_now())
@@ -759,9 +787,28 @@ def _check_overlapping_review_attempt(ctx: ToolContext) -> Optional[str]:
         active_attempts = update_state(pathlib.Path(ctx.drive_root), _mutate)
     except Exception as e:
         log.warning("Failed to check overlapping review attempts: %s", e)
-        return None
+        return (
+            "⚠️ REVIEW_STATE_UNAVAILABLE: active paid-review custody could not "
+            "be verified, so no reviewer dispatch was started. Retry after the "
+            "review state store is readable."
+        )
     if not active_attempts:
         return None
+
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    tool_name = _current_review_tool_name(ctx)
+    if len(active_attempts) == 1:
+        candidate = active_attempts[0]
+        if (
+            (candidate.late_result_pending or candidate.paid)
+            and candidate.task_id == task_id
+            and candidate.tool_name == tool_name
+            and candidate.review_retry_key
+        ):
+            ctx._review_resume_pending = True
+            ctx._pending_review_attempt = candidate
+            ctx._current_review_attempt_number = int(candidate.attempt or 0)
+            return None
 
     active = active_attempts[-1]
     attempt_label = (
@@ -773,8 +820,9 @@ def _check_overlapping_review_attempt(ctx: ToolContext) -> Optional[str]:
         f"⚠️ REVIEWED_ATTEMPT_IN_PROGRESS: {attempt_label} is still active "
         f"(status={active.status}, late_result_pending={bool(active.late_result_pending)}, "
         f"started={active.started_ts or active.ts}). "  # full ts — no [:19] truncation
-        f"Do not start another reviewed attempt for this repo until it finishes or auto-expires "
-        f"after {expiration_window}s TTL+grace. Check review_status for current state."
+        "Do not start another reviewed attempt for this repo. An exact retry may "
+        "reconcile retained custody; otherwise operator recovery is required. "
+        f"Only an unpaid legacy row auto-expires after {expiration_window}s."
     )
 
 
