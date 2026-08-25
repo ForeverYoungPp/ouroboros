@@ -355,9 +355,22 @@ def test_project_activity_stays_out_of_main_static_contract():
         chat.index("onWs('message_annotation'")
     ]
     assert "mirrorProject" not in fanout
-    # Main's gate is the pure mainThreadAccepts predicate (server project_thread
-    # stamp + known-project set) — behavior pinned in chat_thread_routing.test.js.
-    assert "return mainThreadAccepts(msg, state.projectChatIds);" in fanout
+    # Every Chat instance enters through the shared thread gate. Its Main arm
+    # still excludes both server-stamped and already-known Project frames.
+    assert "return chatThreadAccepts(msg, isMain, chatId, state.projectChatIds);" in fanout
+    activity = (root / "web" / "modules" / "chat_activity.js").read_text(encoding="utf-8")
+    main_gate = activity[
+        activity.index("export function mainThreadAccepts"):
+        activity.index("/** Main routing for the legacy LocalChatBridge")
+    ]
+    shared_gate = activity[
+        activity.index("export function chatThreadAccepts"):
+        activity.index("/**\n * Route one LocalChatBridge log envelope")
+    ]
+    assert "if (msg && msg.project_thread) return false;" in main_gate
+    assert "projectChatIds.has(cid)" in main_gate
+    assert "if (isMain) return mainThreadAccepts(msg, projectChatIds);" in shared_gate
+    assert "return Number(msg?.chat_id ?? 1) === chatId;" in shared_gate
     assert "PROJECT_ROW_TYPES.has(msg.system_type)" in fanout
     assert "appendTaskSummaryToLiveCard(msg);" in fanout
     assert "updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true });" in fanout

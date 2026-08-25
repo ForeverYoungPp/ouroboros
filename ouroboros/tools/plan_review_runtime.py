@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from ouroboros.config import review_model_uses_local
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.llm import LLMClient
+from ouroboros.review_execution_projection import review_executions_from_actor_usage
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for
 from ouroboros.utils import utc_now_iso
 
@@ -333,6 +334,9 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         "tokens_in": usage.get("prompt_tokens", 0),
         "tokens_out": usage.get("completion_tokens", 0),
         "cost": float(usage["cost"]) if usage.get("cost") is not None else None,
+        # Presentation-only receipt from the actor's RETURNED usage. Requested
+        # slot route/model, money, profile and raw telemetry never enter it.
+        "executions": review_executions_from_actor_usage([actor]),
         # B1 typed failure facts, forwarded VERBATIM from the actor record (empty on
         # success and on pre-typed engines) so downstream never regresses to matching
         # the error prose for the code or the reset instant.
@@ -391,7 +395,6 @@ def synthesize_plan_review_wave(
 ) -> tuple[dict, set[str], dict]:
     """Validate raw actor rows and build one durable plan-review wave."""
     from ouroboros.tools import plan_spec
-    from ouroboros.utils import truncate_review_artifact
 
     ids = plan_spec.spec_ids(spec)
     seen_before = {str(s) for s in state.get("need_evidence_seen") or []}
@@ -414,24 +417,10 @@ def synthesize_plan_review_wave(
                 seen_after |= set(slot_seen)
         slot_results.append({"slot": row.get("slot_id"), "model": row.get("model"),
                              "ok": ok, "findings": findings, "error": error or None})
-        slot_records.append({
-            "slot_id": row.get("slot_id"), "model": row.get("model"), "route": row.get("route"),
-            "host_file_read_attestation": row.get("host_file_read_attestation"),
-            "ok": ok, "error": error or None, "disclosures": disclosures,
-            **plan_row_typed_facts(row),
-            "prompt_ref": row.get("prompt_ref") or {}, "response_ref": row.get("response_ref") or {},
-            "tokens_in": row.get("tokens_in"), "tokens_out": row.get("tokens_out"),
-            "cost": row.get("cost"),
-            "raw_text_preview": truncate_review_artifact(
-                str(row.get("text") or ""), limit=PLAN_RAW_TEXT_PREVIEW_CHARS,
-            ) if not ok else "",
-            "review_thread_id": str(row.get("review_thread_id") or ""),
-            "review_turn_id": str(row.get("review_turn_id") or ""),
-            "review_thread_receipt": row.get("review_thread_receipt") or {},
-            "auth_route_receipt": row.get("auth_route_receipt") or {},
-            "profile_continuity_receipt": row.get("profile_continuity_receipt") or {},
-            "applied_profile": str(row.get("applied_profile") or ""),
-        })
+        slot_records.append(plan_wave_actor_record(
+            row, ok=ok, error=error, disclosures=disclosures,
+            raw_text_preview_chars=PLAN_RAW_TEXT_PREVIEW_CHARS,
+        ))
     agg = plan_spec.aggregate(slot_results, quorum=quorum)
     aggregate = str(agg["aggregate"])
     wave = {
@@ -478,6 +467,37 @@ def synthesize_plan_review_wave(
         wave["reasons"].append("review_late_result_pending")
         seen_after = seen_before
     return wave, seen_after, agg
+
+
+def plan_wave_actor_record(
+    row: Dict[str, Any], *, ok: bool, error: str,
+    disclosures: List[str], raw_text_preview_chars: int,
+) -> Dict[str, Any]:
+    """Build the durable Plan actor projection outside the orchestration loop."""
+    from ouroboros.utils import truncate_review_artifact
+
+    return {
+        "slot_id": row.get("slot_id"), "model": row.get("model"),
+        "route": row.get("route"), "executions": list(row.get("executions") or []),
+        "host_file_read_attestation": row.get("host_file_read_attestation"),
+        "ok": ok, "error": error or None, "disclosures": disclosures,
+        **plan_row_typed_facts(row),
+        "prompt_ref": row.get("prompt_ref") or {},
+        "response_ref": row.get("response_ref") or {},
+        "tokens_in": row.get("tokens_in"), "tokens_out": row.get("tokens_out"),
+        "cost": row.get("cost"),
+        "raw_text_preview": (
+            truncate_review_artifact(
+                str(row.get("text") or ""), limit=raw_text_preview_chars,
+            ) if not ok else ""
+        ),
+        "review_thread_id": str(row.get("review_thread_id") or ""),
+        "review_turn_id": str(row.get("review_turn_id") or ""),
+        "review_thread_receipt": row.get("review_thread_receipt") or {},
+        "auth_route_receipt": row.get("auth_route_receipt") or {},
+        "profile_continuity_receipt": row.get("profile_continuity_receipt") or {},
+        "applied_profile": str(row.get("applied_profile") or ""),
+    }
 
 
 def plan_row_disclosures(row: Dict[str, Any]) -> List[str]:

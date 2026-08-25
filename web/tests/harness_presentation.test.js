@@ -5,10 +5,11 @@ import test from 'node:test';
 
 import { familyLabel } from '../modules/claudexor_status_store.js';
 import { harnessFamilyMarkup } from '../modules/harness_accounts.js';
-import { loginCardHtml } from '../modules/harness_login_cards.js';
+import { createLoginCardController, loginCardHtml } from '../modules/harness_login_cards.js';
 import {
     GENERIC_HARNESS_MARK,
     HARNESS_MARKS,
+    harnessAccountIdentityMarkup,
     harnessIdentityMarkup,
     harnessPresentation,
 } from '../modules/harness_presentation.js';
@@ -44,6 +45,14 @@ test('identity markup is local, monochrome, decorative, and text-always', () => 
     assert.match(html, /focusable="false"/);
     assert.match(html, /<span class="harness-identity-label">Claude Code<\/span>/);
     assert.doesNotMatch(html, /(?:https?:|data:|url\()/i);
+});
+
+test('named account identity reuses the mark and escapes its visible profile', () => {
+    const html = harnessAccountIdentityMarkup('codex', {
+        label: 'Codex Live', profile: 'work<&"',
+    });
+    assert.match(html, /data-harness-identity="codex"/);
+    assert.match(html, />Codex Live<\/span><\/span> \(work&lt;&amp;&quot;\)$/);
 });
 
 test('app and standalone onboarding sheets share the mark and long-label contract', () => {
@@ -119,6 +128,38 @@ test('Agents and login surfaces use the shared identity markup with visible labe
     });
     assert.match(loginHtml, /data-harness-identity="cursor"/);
     assert.match(loginHtml, />Cursor Live<\/span>/);
+});
+
+test('an active login identity trusts only a currently proven catalog label', async () => {
+    let catalogKnown = false;
+    let snapshot = { harnesses: [{ id: 'codex', display_name: 'Stale daemon label' }] };
+    const store = {
+        get catalogKnown() { return catalogKnown; },
+        get snapshot() { return snapshot; },
+        holdPolling: () => () => {},
+    };
+    const host = {
+        innerHTML: '', contains: () => false, querySelector: () => null,
+        querySelectorAll: () => [],
+    };
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async () => ({ ok: false, status: 503, json: async () => ({ error: 'offline' }) }),
+    });
+    await ctl.start('codex', '');
+    assert.match(host.innerHTML, />Codex<\/span>/);
+    assert.doesNotMatch(host.innerHTML, /Stale daemon label/);
+
+    snapshot = { harnesses: [{ id: 'codex', display_name: 'Codex Live' }] };
+    catalogKnown = true;
+    ctl.render();
+    assert.match(host.innerHTML, />Codex Live<\/span>/);
+
+    catalogKnown = false;
+    ctl.render();
+    assert.match(host.innerHTML, />Codex<\/span>/);
+    assert.doesNotMatch(host.innerHTML, /Codex Live/);
+    ctl.detach();
 });
 
 test('configured subagent marks surround native text controls without changing saved bytes', () => {

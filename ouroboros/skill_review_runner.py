@@ -67,12 +67,17 @@ _UI_REVIEW_FIELDS = (
     "content_hash", "job_id", "group_id", "review_round", "snapshot_attempt",
     "snapshot_revised", "task_id", "root_task_id", "origin_task_id",
     "origin_root_task_id", "presentation_owner_task_id", "chat_id", "source",
-    "terminal_reason", "started_at", "finished_at",
+    "terminal_reason", "started_at", "finished_at", "executions",
 )
 
 
 def _review_ui_row(value: Dict[str, Any]) -> Dict[str, Any]:
-    return {key: value[key] for key in _UI_REVIEW_FIELDS if key in value}
+    from ouroboros.review_execution_projection import normalize_review_executions
+
+    row = {key: value[key] for key in _UI_REVIEW_FIELDS if key in value}
+    if "executions" in row:
+        row["executions"] = normalize_review_executions(row["executions"])
+    return row
 
 
 # The extensions index calls the projection for EVERY skill on EVERY request;
@@ -191,6 +196,60 @@ def _review_title(payload: Dict[str, Any]) -> str:
     )
 
 
+def _skill_review_executions(
+    drive_root: pathlib.Path,
+    skill_name: str,
+    result: Any,
+) -> list[Dict[str, str]]:
+    """Return compact execution receipts proved by actor usage/physical rows."""
+    from ouroboros.review_execution_projection import (
+        normalize_review_executions,
+        review_executions_from_actor_usage,
+    )
+
+    replayed_from_ts = str(getattr(result, "replayed_from_ts", "") or "")
+    # A replay reuses an earlier verdict without a new physical dispatch. Even
+    # if a future replay payload copies the original actors for forensics, it
+    # must not present those old receipts as executions of this attempt.
+    if replayed_from_ts:
+        return []
+    actors = list(getattr(result, "raw_actor_records", None) or []) if result is not None else []
+    executions = review_executions_from_actor_usage(actors)
+    wave_id = str(getattr(result, "wave_id", "") or "")
+    if not bool(getattr(result, "paid", False)) or not wave_id:
+        return executions
+    try:
+        from ouroboros.usage_accounting import skill_review_usage
+
+        usage = skill_review_usage(
+            drive_root, review_skill=skill_name, review_wave_id=wave_id,
+        )
+        physical_actors = []
+        for attempt in usage.get("attempts") or []:
+            if not isinstance(attempt, dict):
+                continue
+            if str(attempt.get("state") or "") not in {"dispatched", "settled", "unresolved"}:
+                continue
+            if str(attempt.get("source") or "") == "review_substrate.extraction":
+                continue
+            model = str(attempt.get("model") or "")
+            if str(attempt.get("kind") or "") == "subscription_session":
+                route = str(attempt.get("subscription_route") or "")
+                if route:
+                    physical_actors.append({"usage": {
+                        "delegated_route": route, "resolved_model": model,
+                    }})
+            elif str(attempt.get("kind") or "") not in {"legacy_metadata", "legacy_delta"}:
+                physical_actors.append({"usage": {
+                    "ledger_attempt_ids": [str(attempt.get("attempt_id") or "")],
+                    "resolved_model": model,
+                }})
+        executions.extend(review_executions_from_actor_usage(physical_actors))
+    except Exception:
+        log.debug("skill review execution projection unavailable", exc_info=True)
+    return normalize_review_executions(executions)
+
+
 def _terminal_history_payload(
     job_data: Dict[str, Any],
     *,
@@ -213,7 +272,7 @@ def _terminal_history_payload(
     for key in (
         "group_id", "review_round", "snapshot_attempt", "snapshot_revised",
         "task_id", "root_task_id", "origin_task_id", "origin_root_task_id",
-        "presentation_owner_task_id", "chat_id", "source",
+        "presentation_owner_task_id", "chat_id", "source", "executions",
     ):
         if key in job_data:
             payload[key] = job_data[key]
@@ -286,6 +345,8 @@ def _append_review_chat_summary(
     status: str,
     ts: str,
 ) -> None:
+    from ouroboros.review_execution_projection import normalize_review_executions
+
     title = _review_title(payload)
     provenance = str(payload.get("source") or "unknown")
     task_id = str(payload.get("task_id") or "")
@@ -318,6 +379,7 @@ def _append_review_chat_summary(
             ),
             "terminal_reason": str(payload.get("terminal_reason") or status),
             "replayed_from_ts": str(payload.get("replayed_from_ts") or ""),
+            "executions": normalize_review_executions(payload.get("executions")),
             "source": str(payload.get("source") or ""),
             "format": "markdown",
             "text": text,
@@ -812,6 +874,7 @@ def _outcome_payload(
         "job_id", "group_id", "review_round", "snapshot_attempt", "snapshot_revised",
         "task_id", "root_task_id", "origin_task_id", "origin_root_task_id",
         "presentation_owner_task_id", "chat_id", "source", "terminal_reason",
+        "executions",
     ):
         if job_data and key in job_data:
             payload[key] = job_data[key]
@@ -1000,6 +1063,9 @@ def _on_finished(
             "deps_error": deps_error,
             "terminal_reason": terminal_reason,
         }
+        payload["executions"] = _skill_review_executions(
+            drive_root, skill_name, result,
+        )
         replayed_from_ts = str(getattr(result, "replayed_from_ts", "") or "")
         if replayed_from_ts:
             payload["replayed_from_ts"] = replayed_from_ts

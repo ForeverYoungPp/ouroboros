@@ -185,6 +185,10 @@ not child-task cards and never prove execution by themselves.
 - Disclosure is user-owned. Review results, retries, failures, terminal task
   state, reconnect, and lazy-detail loading update content in place but never
   open or close the task, Reviews section, or group.
+- Stable keyed rows are reconciled in place. A routine update preserves the
+  exact lazy-detail node, focused descendant, and its reading position. Expanded
+  attempt detail states exact accounting when the domain can prove it and
+  otherwise says `Cost unavailable`; collapsed rows never show dollars.
 - Harness marks are monochrome `currentColor` vectors with adjacent visible
   text. They carry identity only, remain neutral across status states, and use a
   generic text-preserving fallback for unknown harnesses; direct API is shown

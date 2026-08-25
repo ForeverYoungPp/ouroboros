@@ -65,6 +65,14 @@ function detailStoreKey(ref) {
     return `${ref.skill}\u0000${ref.jobId}`;
 }
 
+async function responseJson(resp) {
+    try {
+        return await resp.json();
+    } catch {
+        return null;
+    }
+}
+
 function renderDetailState(full, entry, render) {
     if (!full || !entry) return;
     full.dataset.state = entry.state;
@@ -75,7 +83,10 @@ function renderDetailState(full, entry, render) {
         full.innerHTML = render(entry.markdown);
     } else if (entry.state === 'error') {
         full.innerHTML = `<div class="skill-review-error" role="status" aria-live="polite">Review details unavailable (${escapeHtmlAttr(entry.error)}). `
-            + '<button type="button" class="skill-review-retry" data-skill-review-retry>Retry</button></div>';
+            + (entry.retryable
+                ? '<button type="button" class="skill-review-retry" data-skill-review-retry>Retry</button>'
+                : '')
+            + '</div><div class="skill-review-cost-unavailable">Cost unavailable</div>';
     }
 }
 
@@ -86,7 +97,7 @@ export async function loadSkillReviewDetail(full, ref, deps = {}) {
     if (!full || !ref || !ref.skill || !ref.jobId) return '';
     const cacheKey = detailStoreKey(ref);
     let entry = store?.get(cacheKey) || null;
-    if (deps.retry === true && entry?.state === 'error') {
+    if (deps.retry === true && entry?.state === 'error' && entry.retryable !== false) {
         entry = null;
         store?.delete(cacheKey);
     }
@@ -101,21 +112,30 @@ export async function loadSkillReviewDetail(full, ref, deps = {}) {
     if (full.dataset.state === 'loading' || full.dataset.state === 'loaded') {
         return full.dataset.state;
     }
-    entry = { state: 'loading', markdown: '', error: '', promise: null };
+    entry = {
+        state: 'loading', markdown: '', error: '', promise: null,
+        retryable: true,
+    };
     store?.set(cacheKey, entry);
     renderDetailState(full, entry, render);
     entry.promise = (async () => {
         try {
             const url = `/api/skills/${encodeURIComponent(ref.skill)}/review-history/${encodeURIComponent(ref.jobId)}`;
             const resp = await fetchImpl(url, { cache: 'no-store' });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            const data = await resp.json();
+            const data = await responseJson(resp);
+            if (!resp.ok) {
+                const detail = String(data?.error || data?.detail || '').trim();
+                const error = new Error(`HTTP ${resp.status}${detail ? `: ${detail}` : ''}`);
+                error.retryable = Number(resp.status) !== 404;
+                throw error;
+            }
             const markdown = String(data?.markdown || '');
             if (!markdown) throw new Error('empty review detail');
             entry.markdown = markdown;
             entry.state = 'loaded';
         } catch (err) {
             entry.error = String(err?.message || err);
+            entry.retryable = err?.retryable !== false;
             entry.state = 'error';
         }
     })();

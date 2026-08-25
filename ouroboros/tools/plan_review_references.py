@@ -14,7 +14,7 @@ from ouroboros.task_results import (
     record_plan_review_attempt,
 )
 from ouroboros.tools.plan_review_runtime import record_raw_plan_request_attempt
-from ouroboros.utils import emit_log_event, utc_now_iso
+from ouroboros.utils import append_jsonl, emit_log_event, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -26,10 +26,8 @@ def _emit_plan_review_reference(
     *,
     state_root: Optional[pathlib.Path] = None,
 ) -> None:
-    """Publish a small invalidation; the task result remains authority."""
+    """Persist and publish a small invalidation; task result remains authority."""
     event_queue = getattr(ctx, "event_queue", None)
-    if event_queue is None:
-        return
     if state is None:
         try:
             state = load_plan_review_state(state_root, task_id)
@@ -43,12 +41,32 @@ def _emit_plan_review_reference(
         chat_id = int(getattr(ctx, "current_chat_id", 0))
     except (TypeError, ValueError):
         chat_id = 0
-    emit_log_event(event_queue, {
+    ts = utc_now_iso()
+    payload = {
         "type": "review_reference", "surface": "plan_review",
         "task_id": str(task_id or ""), "chat_id": chat_id,
+        "presentation_owner_task_id": str(task_id or ""),
         "review_fingerprint": str((attempt or {}).get("fingerprint") or ""),
-        "state_revision": revision, "ts": utc_now_iso(),
-    }, log_label="plan-review state reference")
+        "state_revision": revision, "ts": ts,
+    }
+    raw_root = (
+        state_root
+        or getattr(ctx, "budget_drive_root", "")
+        or getattr(ctx, "drive_root", "")
+    )
+    if raw_root:
+        # Existing progress JSONL is the reconnect/history rail. The row is an
+        # opaque invalidation only; the task result remains the sole Plan state.
+        written = append_jsonl(pathlib.Path(raw_root) / "logs" / "progress.jsonl", {
+            **payload,
+            "direction": "out", "is_progress": True,
+            "user_id": 0, "text": "", "content": "", "format": "",
+        })
+        if not written:
+            raise OSError("plan-review progress reference append failed")
+    emit_log_event(
+        event_queue, payload, log_label="plan-review state reference",
+    )
 
 
 def _record_plan_review_attempt_with_reference(
@@ -59,7 +77,7 @@ def _record_plan_review_attempt_with_reference(
 ) -> dict:
     """Persist an attempt and publish its durable revision immediately."""
     state = record_plan_review_attempt(state_root, task_id, **attempt)
-    _emit_plan_review_reference(ctx, task_id, state)
+    _emit_plan_review_reference(ctx, task_id, state, state_root=state_root)
     return state
 
 
@@ -99,5 +117,5 @@ def _record_cycles_exhausted_with_references(
         status="cycles_exhausted",
         reason=f"{cycles_paid}/{cap} paid plan-review cycles spent",
     )
-    _emit_plan_review_reference(ctx, task_id, attempt_state)
+    _emit_plan_review_reference(ctx, task_id, attempt_state, state_root=state_root)
     return marked_wave

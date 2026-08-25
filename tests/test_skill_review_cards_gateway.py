@@ -211,6 +211,7 @@ def test_review_history_detail_renders_exact_canonical_wave_usage(tmp_path, monk
     assert "claude resets 2026-08-25T00:00:00Z" in markdown
     assert "model=claude-fable-5, requested route=claude, profile=fable-profile" in markdown
     assert "ledger integrity=verified; slot attribution=complete" in markdown
+    assert "Cost unavailable" not in markdown
 
 
 def test_review_history_detail_discloses_legacy_paid_wave_as_unattributable(tmp_path):
@@ -224,6 +225,7 @@ def test_review_history_detail_discloses_legacy_paid_wave_as_unattributable(tmp_
     assert "paid panel dispatch" in markdown
     assert "exact per-wave physical-attempt attribution was unavailable in this version" in markdown
     assert "### Review accounting" not in markdown
+    assert "Cost unavailable" in markdown
 
 
 def test_review_history_detail_empty_exact_wave_never_invents_zero_cash(tmp_path):
@@ -242,6 +244,7 @@ def test_review_history_detail_empty_exact_wave_never_invents_zero_cash(tmp_path
     assert "$0.000000" not in markdown
     assert "ledger integrity=verified" not in markdown
     assert "### Review accounting" not in markdown
+    assert "Cost unavailable" in markdown
 
 
 def test_review_history_detail_projects_a_late_dispatch_marker_without_rewriting_history(
@@ -408,6 +411,7 @@ def test_review_history_detail_free_replay_names_zero_physical_dispatch(tmp_path
     assert "free replay of the 2026-08-14T12:00:00Z verdict" in markdown
     assert "no physical reviewer dispatch for this replay" in markdown
     assert "### Review accounting" not in markdown
+    assert "Cost: $0 (free replay)" in markdown
 
 
 def test_review_history_detail_missing_skill_is_typed_404(tmp_path):

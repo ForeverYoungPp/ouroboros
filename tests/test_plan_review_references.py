@@ -48,6 +48,7 @@ def test_plan_reference_uses_shared_best_effort_log_event_seam(monkeypatch):
         "surface": "plan_review",
         "task_id": "task-1",
         "chat_id": 23,
+        "presentation_owner_task_id": "task-1",
         "review_fingerprint": "review-fingerprint",
         "state_revision": _revision(state),
         "ts": payload["ts"],
@@ -152,3 +153,53 @@ def test_first_cycles_exhausted_revision_is_published_if_second_write_fails(
     assert len(refs) == 1
     assert refs[0]["review_fingerprint"] == fingerprint
     assert refs[0]["state_revision"] == _revision(durable)
+
+
+def test_plan_reference_is_durable_on_progress_rail_and_state_stays_authority(tmp_path):
+    task_results.write_task_result(tmp_path, "task-1", "running", result="running")
+    events: queue.Queue = queue.Queue()
+    ctx = SimpleNamespace(
+        event_queue=events, current_chat_id=23, drive_root=tmp_path,
+    )
+
+    state = plan_review_references._record_plan_review_attempt_with_reference(
+        ctx, tmp_path, "task-1", fingerprint="c" * 64, status="open",
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "progress.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 1
+    assert rows[0] == {
+        "type": "review_reference",
+        "surface": "plan_review",
+        "task_id": "task-1",
+        "chat_id": 23,
+        "presentation_owner_task_id": "task-1",
+        "review_fingerprint": "c" * 64,
+        "state_revision": _revision(state),
+        "ts": rows[0]["ts"],
+        "direction": "out",
+        "is_progress": True,
+        "user_id": 0,
+        "text": "",
+        "content": "",
+        "format": "",
+    }
+    assert task_results.load_plan_review_state(tmp_path, "task-1") == state
+
+
+def test_plan_reference_append_failure_is_not_misreported_as_durable(tmp_path, monkeypatch):
+    task_results.write_task_result(tmp_path, "task-1", "running", result="running")
+    ctx = SimpleNamespace(event_queue=queue.Queue(), drive_root=tmp_path)
+    monkeypatch.setattr(plan_review_references, "append_jsonl", lambda *_a, **_k: False)
+
+    with pytest.raises(OSError, match="progress reference append failed"):
+        plan_review_references._record_plan_review_attempt_with_reference(
+            ctx, tmp_path, "task-1", fingerprint="d" * 64, status="open",
+        )
+
+    durable = task_results.load_plan_review_state(tmp_path, "task-1")
+    assert durable["current_attempt"]["fingerprint"] == "d" * 64

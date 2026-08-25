@@ -1,6 +1,10 @@
 import { accountedUpperBound, accountedUpperBoundWithChildren, formatUsd4 } from './utils.js';
 import { harnessPresentation } from './harness_presentation.js';
-import { classifyReviewLifecycle, formatReviewProjection } from './review_presentation.js';
+import {
+    classifyReviewLifecycle,
+    classifyReviewLifecyclePointer,
+    formatReviewProjection,
+} from './review_presentation.js';
 
 export { formatReviewProjection } from './review_presentation.js';
 
@@ -1033,6 +1037,11 @@ export function prettyLogEvent(evt) {
 }
 
 export function getLogTaskGroupId(evt) {
+    const pointer = classifyReviewLifecyclePointer(evt);
+    // A duplicate lifecycle pointer is an acknowledgement for an existing
+    // owner card, never task lineage. Logs may show it as a compact standalone
+    // row, but must not create a synthetic task group from its outer task_id.
+    if (pointer.classification !== 'not_pointer') return '';
     const review = classifyReviewLifecycle(evt);
     if (review.classification === 'source_complete') {
         return String(review.group.presentationOwnerTaskId || '');

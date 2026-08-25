@@ -59,6 +59,7 @@ from ouroboros.tools.plan_review_runtime import (
     plan_deadline_skip as _plan_deadline_skip,
     plan_payload_roots as _plan_payload_roots,
     plan_review_slots as _plan_review_slots,
+    plan_quorum_unreachable_facts as _plan_quorum_unreachable_facts,
     plan_reviewer_config_fingerprint as _plan_reviewer_config_fingerprint,
     plan_wave_replay_decision as _plan_wave_replay_decision,
     plan_wave_has_in_flight as _plan_wave_has_in_flight,
@@ -318,7 +319,7 @@ def _plan_unavailable(ctx: ToolContext, message: str, reason: str) -> str:
     try:
         root, task_id = _planning_state_location(ctx)
         state = mark_current_plan_review_unavailable(root, task_id, reason=reason)
-        _emit_plan_review_reference(ctx, task_id, state)
+        _emit_plan_review_reference(ctx, task_id, state, state_root=root)
     except (OSError, TimeoutError, ValueError) as exc:
         return f"{message}\nERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
     return message

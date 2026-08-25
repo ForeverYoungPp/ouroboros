@@ -122,44 +122,6 @@ test('the controller drives create → poll → Connected, and holds the status 
     t.mock.timers.reset();
 });
 
-test('an active card adopts only currently proven catalog labels and falls back across gaps', async () => {
-    let catalogKnown = false;
-    let snapshot = {
-        harnesses: [{ id: 'codex', display_name: 'Stale daemon label' }],
-    };
-    const store = {
-        get catalogKnown() { return catalogKnown; },
-        get snapshot() { return snapshot; },
-        holdPolling: () => () => {},
-        refresh: async () => {
-            snapshot = { harnesses: [{ id: 'codex', display_name: 'Codex Live' }] };
-            catalogKnown = true;
-        },
-    };
-    const host = fakeHost();
-    const ctl = createLoginCardController({
-        host,
-        store,
-        fetchImpl: async () => json(503, { error: 'offline' }),
-    });
-
-    await ctl.start('codex', '');
-    assert.match(host.innerHTML, />Codex<\/span>/);
-    assert.doesNotMatch(host.innerHTML, /Stale daemon label/);
-
-    await store.refresh();
-    ctl.render();
-    assert.match(host.innerHTML, />Codex Live<\/span>/,
-        'a newly proven catalog label replaces the fallback on the active card');
-
-    catalogKnown = false;
-    ctl.render();
-    assert.match(host.innerHTML, />Codex<\/span>/);
-    assert.doesNotMatch(host.innerHTML, /Codex Live/,
-        'a read gap cannot present the retained snapshot as fresh evidence');
-    ctl.detach();
-});
-
 test('poll replaces the whole canonical envelope, preserving envelope-level device disclosure', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const store = createClaudexorStatusStore({

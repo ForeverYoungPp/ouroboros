@@ -546,6 +546,15 @@ exact detail reference when detail is offered, and exact task/candidate binding
 for repository review. Omit an incomplete row; never guess from current chat,
 repository, timestamps, model, tool name, or activity.
 
+`ouroboros/review_execution_projection.py` owns the tiny cross-domain
+`executions[]` wire. It admits only returned API usage or an actually resolved
+delegated harness route plus model, and strips money, profile, raw output, and
+requested-only intent. Skill history, Plan waves, and task-acceptance actors
+reuse that projection. `web/modules/review_dom_patch.js` is the keyed DOM leaf:
+routine review updates reconcile stable group/attempt/detail nodes in place so
+lazy state, focused descendants, and detail scroll survive without adding a UI
+state authority.
+
 `web/modules/harness_presentation.js` is the vector-and-label SSOT for harness
 identity. It owns the known labels, monochrome SVG geometry, generic unknown and
 neutral direct-API fallbacks, escaping, and compact mark-plus-text helpers.
@@ -559,7 +568,12 @@ add a review ledger, endpoint, persisted UI state, cost copy, or enforcement
 layer. Compact review rows carry no dollars. Exact Skill attempt money appears
 only inside the existing lazy detail when the history row declares
 `physical_attempt_v1`; that detail joins the canonical ledger by exact wave and
-slot, persists no totals, and leaves legacy attribution unavailable.
+slot, persists no totals, and leaves legacy attribution unavailable. A Plan
+state write also appends one empty typed `review_reference` to the existing
+bounded progress-history rail before publishing its live invalidation; the task
+result remains the only Plan authority and reconnect retains only the latest
+reference per owner. Duplicate Skill lifecycle acknowledgements remain typed
+`lifecycle_pointer` rows with no task id, so they can never become lineage.
 Pin these contracts in `web/tests/review_presentation.test.js` and
 `web/tests/harness_presentation.test.js`; keep grouping/reconnect/disclosure and
 requested/effective/executed truth covered by the existing Skill Review,

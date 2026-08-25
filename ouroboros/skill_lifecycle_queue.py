@@ -193,7 +193,10 @@ def _notify_duplicate_pointer(requested: LifecycleJob, existing: LifecycleJob) -
             f"Skill {existing.kind}: `{existing.target}` — already {existing.status} "
             f"(job {existing.id}); progress reports in its original chat.",
             is_progress=True,
-            task_id=_chat_task_id(existing),
+            # A pointer is an acknowledgement to the duplicate caller, not a
+            # scheduled task.  Giving it the synthetic lifecycle id promoted
+            # this harmless line into a second task card on replay.
+            task_id="",
             progress_meta={"lifecycle_pointer": {
                 "job_id": existing.id,
                 "kind": existing.kind,
@@ -201,7 +204,12 @@ def _notify_duplicate_pointer(requested: LifecycleJob, existing: LifecycleJob) -
                 "status": existing.status,
                 "chat_id": _effective_chat_id(existing),
                 "group_id": existing.group_id,
+                "task_id": existing.task_id,
+                "root_task_id": existing.root_task_id,
+                "origin_task_id": existing.origin_task_id,
+                "origin_root_task_id": existing.origin_root_task_id,
                 "presentation_owner_task_id": existing.presentation_owner_task_id,
+                "source": existing.source,
             }},
         )
     except Exception:

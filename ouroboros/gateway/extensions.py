@@ -1123,7 +1123,8 @@ def _skill_review_history_detail_sync(
     # render nothing.
     accounting = []
     usage_detail = ""
-    if record.get("replayed_from_ts"):
+    replayed = bool(record.get("replayed_from_ts"))
+    if replayed:
         accounting.append(
             f"free replay of the {record.get('replayed_from_ts')} verdict; "
             "no physical reviewer dispatch for this replay"
@@ -1165,6 +1166,10 @@ def _skill_review_history_detail_sync(
         markdown += "\n\n_Review accounting: " + "; ".join(accounting) + "._"
     if usage_detail:
         markdown += "\n\n" + usage_detail
+    elif replayed:
+        markdown += "\n\n_Cost: $0 (free replay)._"
+    else:
+        markdown += "\n\n_Cost unavailable._"
     return {
         "markdown": markdown,
         "status": status,

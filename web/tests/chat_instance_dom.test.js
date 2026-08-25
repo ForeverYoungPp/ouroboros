@@ -486,8 +486,11 @@ test('Plan invalidation applies terminal task detail to its review-created owner
         assert.equal(detailCalls.length, 1);
 
         historyRows = [{
-            chat_id: 2, role: 'system', system_type: 'review_reference',
-            surface: 'plan_review', task_id: 'root-terminal', state_revision: revision,
+            chat_id: 2, role: 'system', is_progress: true, task_id: 'plan-review-rail',
+            progress_meta: { review_reference: {
+                surface: 'plan_review', presentation_owner_task_id: 'root-terminal',
+                state_revision: revision,
+            } },
         }];
         handlers.get('open')({ previouslyConnected: true });
         await new Promise((resolve) => setTimeout(resolve, 0));
@@ -547,6 +550,63 @@ test('source-incomplete typed review lifecycle is consumed in history, live chat
         }
         assert.equal(messages.children.some((node) => node.classList.contains('system')), false,
             'manual/legacy review lifecycle did not fall through to a chat bubble');
+    } finally {
+        instance?.destroy();
+        restoreDom(prior);
+    }
+});
+
+test('duplicate lifecycle pointer never mints a task and enriches only an existing exact owner', async () => {
+    const { prior, mount } = installDom();
+    const handlers = new Map();
+    const ws = {
+        on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
+        isConnected: () => true, send() {},
+    };
+    let generation = 0;
+    const stateSnapshots = {
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        isCurrent: () => true, apply() {},
+    };
+    const pointer = {
+        kind: 'review', job_id: 'job-pointer', status: 'running', target: 'alpha',
+        group_id: 'task:root-pointer:alpha', presentation_owner_task_id: 'root-pointer',
+    };
+    let instance;
+    try {
+        instance = createChatInstance({
+            ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
+            updateUnreadBadge() {}, stateSnapshots, chatId: 2, idPrefix: 'chat', mountEl: mount,
+            asPanel: true,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const messages = globalThis.document.byId.get('chat-messages');
+        handlers.get('chat')({
+            chat_id: 2, role: 'system', is_progress: true,
+            task_id: 'skill_lifecycle_review_alpha_job-pointer',
+            progress_meta: { lifecycle_pointer: pointer },
+        });
+        assert.equal(messages.children.some((node) => node.dataset.taskId === 'root-pointer'), false);
+        assert.equal(messages.children.some(
+            (node) => node.dataset.taskId === 'skill_lifecycle_review_alpha_job-pointer',
+        ), false);
+
+        handlers.get('chat')({
+            chat_id: 2, role: 'system', is_progress: true,
+            task_id: 'root-pointer', content: 'Owner task is already visible',
+        });
+        const owner = messages.children.find((node) => node.dataset.taskId === 'root-pointer');
+        assert.ok(owner);
+        handlers.get('chat')({
+            chat_id: 2, role: 'system', is_progress: true,
+            task_id: 'skill_lifecycle_review_alpha_job-pointer',
+            progress_meta: { lifecycle_pointer: pointer },
+        });
+        assert.equal(messages.children.find((node) => node.dataset.taskId === 'root-pointer'), owner);
+        assert.equal(owner.querySelector('[data-live-review-summary]')?.textContent, 'Reviews 1 · 1 active');
+        assert.equal(messages.children.some(
+            (node) => node.dataset.taskId === 'skill_lifecycle_review_alpha_job-pointer',
+        ), false);
     } finally {
         instance?.destroy();
         restoreDom(prior);

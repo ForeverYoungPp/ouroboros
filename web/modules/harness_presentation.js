@@ -82,3 +82,11 @@ export function harnessIdentityMarkup(harnessId, {
         + `<svg class="harness-identity-mark" viewBox="${presentation.viewBox}" width="1em" height="1em" fill="currentColor" aria-hidden="true" focusable="false"><path d="${presentation.path}"></path></svg>`
         + `<span class="harness-identity-label">${escapeHtml(presentation.label)}</span></span>`;
 }
+
+/** Shared visible identity for one optional named harness account. */
+export function harnessAccountIdentityMarkup(harnessId, {
+    label = '', profile = '', className = '',
+} = {}) {
+    const identity = harnessIdentityMarkup(harnessId, { label, className });
+    return identity + (profile ? ` (${escapeHtml(profile)})` : '');
+}

@@ -175,6 +175,9 @@ def test_domain_independent_plan_reviewed_end_to_end_green(harness):
     assert wave["constitutional"] is False
     assert [c["id"] for c in wave["spec"]["acceptance_claims"]] == ["claim_1", "claim_2"]
     assert wave["spec"]["evidence"] == [] and wave["evidence_manifest"]["declared"] == []
+    assert [actor["executions"] for actor in wave["actors"]] == [
+        [{"kind": "api", "model": model}] for model in ("m/a", "m/b", "m/c")
+    ]
     # The packet is domain-free: objective, spec, prose — no repository archaeology.
     request = sub.calls[0]["request"]
     user = _user_text(request.messages[1]["content"])

@@ -4,17 +4,21 @@ import test from 'node:test';
 
 import {
     classifyReviewLifecycle,
+    classifyReviewLifecyclePointer,
     createReviewHydrator,
     createReviewPresentationController,
     mergeReviewGroup,
     planReviewGroupFromTaskDetail,
     renderReviewsSection,
     reviewExecutionEvidence,
+    reviewExecutionEvidenceList,
     reviewGroupFromHistoryRow,
     reviewGroupFromLifecycle,
     reviewGroupsFromTaskDetail,
+    reviewReferenceFromRow,
     taskAcceptanceGroupFromTaskDetail,
 } from '../modules/review_presentation.js';
+import { reconcileReviewElementTree } from '../modules/review_dom_patch.js';
 import { getLogTaskGroupId, isGroupedTaskEvent } from '../modules/log_events.js';
 import { loadSkillReviewDetail } from '../modules/skill_review_card.js';
 
@@ -72,6 +76,42 @@ test('typed review lifecycle distinguishes source-incomplete rows from unrelated
         kind: 'review', status: 'running', target: 'alpha', job_id: 'job-1',
         group_id: 'task:root:alpha', presentation_owner_task_id: 'root',
     } }).classification, 'source_complete');
+});
+
+test('lifecycle pointers are typed acknowledgements, never generic task lineage', () => {
+    const incomplete = { progress_meta: { lifecycle_pointer: {
+        kind: 'review', job_id: 'job-1', status: 'running', target: 'alpha',
+    } } };
+    assert.equal(classifyReviewLifecyclePointer(incomplete).classification, 'source_incomplete');
+    assert.equal(getLogTaskGroupId({ ...incomplete, task_id: 'skill_lifecycle_review_alpha_job-1' }), '');
+
+    const complete = { progress_meta: { lifecycle_pointer: {
+        kind: 'review', job_id: 'job-1', status: 'running', target: 'alpha',
+        group_id: 'task:root:alpha', presentation_owner_task_id: 'root',
+    } } };
+    const classified = classifyReviewLifecyclePointer(complete);
+    assert.equal(classified.classification, 'source_complete');
+    assert.equal(classified.group.presentationOwnerTaskId, 'root');
+    assert.equal(getLogTaskGroupId({ ...complete, task_id: 'skill_lifecycle_review_alpha_job-1' }), '');
+});
+
+test('Plan review references normalize from both live and nested durable envelopes', () => {
+    const revision = 'a'.repeat(64);
+    assert.deepEqual(reviewReferenceFromRow({
+        type: 'review_reference', surface: 'plan_review', task_id: 'root', state_revision: revision,
+    }), {
+        surface: 'plan_review', presentationOwnerTaskId: 'root',
+        stateRevision: revision, reviewFingerprint: '',
+    });
+    assert.deepEqual(reviewReferenceFromRow({
+        task_id: 'outer', progress_meta: { review_reference: {
+            surface: 'plan_review', presentation_owner_task_id: 'root', state_revision: revision,
+            review_fingerprint: 'fingerprint',
+        } },
+    }), {
+        surface: 'plan_review', presentationOwnerTaskId: 'root',
+        stateRevision: revision, reviewFingerprint: 'fingerprint',
+    });
 });
 
 test('live lifecycle ignores its synthetic outer task id and updates the same group', () => {
@@ -166,6 +206,23 @@ test('terminal attempt state is monotonic while a genuinely new attempt restores
     assert.equal(next.attempts.find((attempt) => attempt.id === 'job-3')?.state, 'running');
 });
 
+test('a stale partial projection cannot hide a newer active attempt it omits', () => {
+    const store = new Map();
+    mergeReviewGroup(store, reviewGroupFromHistoryRow(groupedSkillRow()));
+    mergeReviewGroup(store, reviewGroupFromLifecycle({ lifecycle: {
+        kind: 'review', status: 'running', target: 'alpha', job_id: 'job-3',
+        group_id: 'task:root:alpha', presentation_owner_task_id: 'root',
+    } }));
+    mergeReviewGroup(store, reviewGroupFromHistoryRow(groupedSkillRow({
+        status: 'clean',
+        attempts: [{ job_id: 'job-1', skill: 'alpha', status: 'blockers' }],
+    })));
+    const merged = store.get('task:root:alpha');
+    assert.equal(merged.state, 'running');
+    assert.equal(merged.activeCount, 1);
+    assert.equal(merged.attempts.find((attempt) => attempt.id === 'job-3')?.state, 'running');
+});
+
 test('an unmatched open Plan attempt restores liveness before its first wave lands', () => {
     const settledFingerprint = 'a'.repeat(64);
     const nextFingerprint = 'b'.repeat(64);
@@ -197,6 +254,9 @@ test('an unmatched open Plan attempt restores liveness before its first wave lan
     assert.equal(next.activeCount, 1);
     assert.equal(next.verdict, 'open');
     assert.equal(next.tone, 'working');
+    assert.equal(next.attempts.at(-1).id, nextFingerprint);
+    assert.equal(next.attempts.at(-1).state, 'running');
+    assert.equal(next.attempts.at(-1).label, 'current attempt');
 });
 
 test('plan review retains current and superseded waves without inventing authority', () => {
@@ -207,7 +267,13 @@ test('plan review retains current and superseded waves without inventing authori
             waves_omitted: 0,
             waves: [
                 { request_fingerprint: 'old', cycle_index: 1, aggregate: 'GREEN', closed: true },
-                { request_fingerprint: 'new', cycle_index: 2, aggregate: 'REVIEW_REQUIRED', closed: false },
+                {
+                    request_fingerprint: 'new', cycle_index: 2,
+                    aggregate: 'REVIEW_REQUIRED', closed: false,
+                    actors: [{ executions: [
+                        { kind: 'harness', harness_id: 'cursor', model: 'cursor-grok-4.6-high' },
+                    ] }],
+                },
                 { request_fingerprint: 'cached', cycle_index: 3, aggregate: 'GREEN', closed: true },
             ],
         },
@@ -219,6 +285,9 @@ test('plan review retains current and superseded waves without inventing authori
     assert.equal(group.attempts[0].superseded, true);
     assert.equal(group.attempts[1].superseded, false);
     assert.equal(group.attempts[1].verdict, 'REVIEW_REQUIRED');
+    assert.deepEqual(group.attempts[1].executions, [
+        { kind: 'harness', harness_id: 'cursor', model: 'cursor-grok-4.6-high' },
+    ]);
     assert.equal(group.attempts[2].superseded, true);
     assert.equal(group.verdict, 'REVIEW_REQUIRED');
     assert.equal(group.countIsAuthoritative, true);
@@ -280,13 +349,18 @@ test('task acceptance adapts only task_acceptance panels; advisory and commit st
     const detail = {
         task_id: 'root',
         review_projection: { panels: [
-            { panel_id: 'accept', surface: 'task_acceptance', aggregate_signal: 'PASS', actors: [] },
+            { panel_id: 'accept', surface: 'task_acceptance', aggregate_signal: 'PASS', actors: [{
+                executions: [{ kind: 'harness', harness_id: 'claude', model: 'claude-fable-5' }],
+            }] },
             { panel_id: 'commit', surface: 'commit', aggregate_signal: 'PASS', actors: [] },
             { panel_id: 'advisory', surface: 'advisory', aggregate_signal: 'PASS', actors: [] },
         ] },
     };
     const group = taskAcceptanceGroupFromTaskDetail(detail);
     assert.deepEqual(group.attempts.map((attempt) => attempt.id), ['accept']);
+    assert.deepEqual(group.attempts[0].executions, [
+        { kind: 'harness', harness_id: 'claude', model: 'claude-fable-5' },
+    ]);
     assert.deepEqual(reviewGroupsFromTaskDetail(detail).map((item) => item.surface), ['task_acceptance']);
 });
 
@@ -307,7 +381,7 @@ test('renderer is quiet, accessible and never invents review dollars', () => {
     assert.doesNotMatch(html, /\$\d|cost=/i);
 });
 
-test('attempt marks require an explicit executed receipt and keep intent separate', () => {
+test('attempt marks require explicit executed receipts, render every production execution, and keep intent separate', () => {
     const executed = {
         executed: { kind: 'agent_session', harness: 'claude', model: 'claude-fable-5' },
         requested: { kind: 'agent_session', harness: 'cursor' },
@@ -316,10 +390,23 @@ test('attempt marks require an explicit executed receipt and keep intent separat
         harness: 'claude', channel: '', label: '', model: 'claude-fable-5',
     });
     assert.equal(reviewExecutionEvidence({ requested: { harness: 'claude' } }), null);
+    assert.deepEqual(reviewExecutionEvidenceList([
+        { kind: 'harness', harness_id: 'claude', model: 'claude-fable-5' },
+        { kind: 'harness', harness_id: 'cursor', model: 'cursor-grok-4.6-high' },
+        { kind: 'api', model: 'openai/gpt-5.6-sol' },
+    ]).map((item) => [item.harness, item.model]), [
+        ['claude', 'claude-fable-5'],
+        ['cursor', 'cursor-grok-4.6-high'],
+        ['api', 'openai/gpt-5.6-sol'],
+    ]);
 
     const group = reviewGroupFromHistoryRow(groupedSkillRow({
         attempts: [{
-            job_id: 'job-executed', skill: 'alpha', status: 'clean', execution: executed,
+            job_id: 'job-executed', skill: 'alpha', status: 'clean', executions: [
+                { kind: 'harness', harness_id: 'claude', model: 'claude-fable-5' },
+                { kind: 'harness', harness_id: 'cursor', model: 'cursor-grok-4.6-high' },
+                { kind: 'api', model: 'openai/gpt-5.6-sol' },
+            ],
         }, {
             job_id: 'job-requested', skill: 'alpha', status: 'clean',
             execution: { requested: { kind: 'agent_session', harness: 'cursor' } },
@@ -332,10 +419,63 @@ test('attempt marks require an explicit executed receipt and keep intent separat
     assert.match(html, /data-harness-identity="claude"/);
     assert.match(html, /Claude Code/);
     assert.match(html, /claude-fable-5/);
-    assert.doesNotMatch(html, /data-harness-identity="cursor"/);
+    assert.match(html, /data-harness-identity="cursor"/);
+    assert.match(html, /cursor-grok-4\.6-high/);
+    assert.match(html, /data-harness-identity="api"/);
+    const requestedAttempt = html.slice(html.indexOf('data-review-attempt="task:root:alpha:job-requested"'));
+    assert.doesNotMatch(requestedAttempt, /data-harness-identity="cursor"/);
 
     const api = reviewExecutionEvidence({ executed: { kind: 'api_chat', model: 'openai\/gpt' } });
     assert.deepEqual(api, { harness: 'api', channel: 'api', label: '', model: 'openai\/gpt' });
+});
+
+test('attempt provenance stays per attempt and is promoted to group only when uniform', () => {
+    const mixed = reviewGroupFromHistoryRow(groupedSkillRow({ attempts: [
+        { job_id: 'job-1', skill: 'alpha', status: 'blockers', initiator_task_id: 'child-a' },
+        { job_id: 'job-2', skill: 'alpha', status: 'clean', initiator_task_id: 'child-b' },
+    ] }));
+    assert.equal(mixed.initiatorTaskId, '');
+    const mixedHtml = renderReviewsSection([mixed], {
+        sectionExpanded: true,
+        expandedGroups: new Set([mixed.id]),
+    });
+    assert.match(mixedHtml, /Initiated by task child-a/);
+    assert.match(mixedHtml, /Initiated by task child-b/);
+
+    const uniform = reviewGroupFromHistoryRow(groupedSkillRow({ attempts: [
+        { job_id: 'job-1', skill: 'alpha', status: 'blockers', initiator_task_id: 'child-a' },
+        { job_id: 'job-2', skill: 'alpha', status: 'clean', initiator_task_id: 'child-a' },
+    ] }));
+    assert.equal(uniform.initiatorTaskId, 'child-a');
+    const uniformHtml = renderReviewsSection([uniform], {
+        sectionExpanded: true,
+        expandedGroups: new Set([uniform.id]),
+    });
+    assert.equal((uniformHtml.match(/Initiated by task child-a/g) || []).length, 1);
+});
+
+test('expanded non-Skill attempts disclose unavailable cost while compact rows stay dollar-free', () => {
+    const fingerprint = 'c'.repeat(64);
+    const plan = planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            current_attempt: { fingerprint, status: 'closed' },
+            waves: [{ request_fingerprint: fingerprint, aggregate: 'GREEN', closed: true }],
+        },
+    });
+    const attemptKey = `${plan.id}:${plan.attempts[0].id}`;
+    const html = renderReviewsSection([plan], {
+        sectionExpanded: true,
+        expandedGroups: new Set([plan.id]),
+        expandedAttempts: new Set([attemptKey]),
+    });
+    assert.match(html, /Cost unavailable/);
+    const compact = renderReviewsSection([plan], {});
+    const compactRow = compact.slice(
+        compact.indexOf('data-review-group-toggle'),
+        compact.indexOf('<div class="chat-review-attempts"'),
+    );
+    assert.doesNotMatch(compactRow, /Cost unavailable|\$\d/);
 });
 
 test('initiator detail is omitted when it is the owner', () => {
@@ -543,6 +683,99 @@ test('review re-render restores keyboard focus to the equivalent disclosure cont
     assert.equal(disclosure.expandedGroups.has('task:root:alpha'), true);
     assert.equal(doc.activeElement, buttons.get('group'));
     assert.notEqual(doc.activeElement, oldGroupButton);
+});
+
+test('keyed reconciliation preserves exact detail node, focused descendant and scrollTop', () => {
+    class ReviewElement {
+        constructor({ tag = 'div', dataset = {}, classes = [], attrs = {}, html = '', children = [] } = {}) {
+            this.tagName = tag.toUpperCase();
+            this.dataset = { ...dataset };
+            this._attrs = new Map(Object.entries(attrs));
+            for (const [key, value] of Object.entries(dataset)) {
+                const attr = `data-${key.replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)}`;
+                this._attrs.set(attr, String(value));
+            }
+            this._classes = new Set(classes);
+            if (classes.length) this._attrs.set('class', classes.join(' '));
+            this.classList = { contains: (name) => this._classes.has(name) };
+            this._innerHTML = html;
+            this.children = [];
+            this.scrollTop = 0;
+            children.forEach((child) => this.insertBefore(child, null));
+        }
+        get attributes() { return [...this._attrs].map(([name, value]) => ({ name, value })); }
+        get innerHTML() { return this._innerHTML; }
+        set innerHTML(value) { this._innerHTML = String(value); this.children = []; }
+        hasAttribute(name) { return this._attrs.has(name); }
+        setAttribute(name, value) {
+            const normalized = String(value);
+            this._attrs.set(name, normalized);
+            if (name.startsWith('data-')) {
+                const key = name.slice(5).replace(/-([a-z])/g, (_all, char) => char.toUpperCase());
+                this.dataset[key] = normalized;
+            }
+        }
+        removeAttribute(name) { this._attrs.delete(name); }
+        insertBefore(child, before) {
+            child.remove();
+            const index = before ? this.children.indexOf(before) : -1;
+            if (index >= 0) this.children.splice(index, 0, child); else this.children.push(child);
+            child.parentElement = this;
+            return child;
+        }
+        remove() {
+            if (!this.parentElement) return;
+            const index = this.parentElement.children.indexOf(this);
+            if (index >= 0) this.parentElement.children.splice(index, 1);
+            this.parentElement = null;
+        }
+        cloneNode(deep) {
+            return new ReviewElement({
+                tag: this.tagName,
+                dataset: this.dataset,
+                classes: [...this._classes],
+                attrs: Object.fromEntries(this._attrs),
+                html: this._innerHTML,
+                children: deep ? this.children.map((child) => child.cloneNode(true)) : [],
+            });
+        }
+    }
+    const node = (dataset, children = [], classes = []) => new ReviewElement({ dataset, children, classes });
+    const focused = new ReviewElement({ tag: 'button', html: 'Retry' });
+    const detail = node({
+        reviewAttemptDetail: 'task:root:alpha:job-1',
+        skillReviewSkill: 'alpha', skillReviewJob: 'job-1', state: 'loaded',
+    }, [focused]);
+    detail.setAttribute('aria-busy', 'false');
+    detail.scrollTop = 37;
+    const attempt = node({ reviewAttempt: 'task:root:alpha:job-1' }, [detail]);
+    const attempts = node({}, [attempt], ['chat-review-attempts']);
+    const group = node({ reviewGroup: 'task:root:alpha' }, [attempts]);
+    const current = node({ reviewSection: '' }, [group]);
+
+    const desiredDetail = node({
+        reviewAttemptDetail: 'task:root:alpha:job-1',
+        skillReviewSkill: 'alpha', skillReviewJob: 'job-1',
+    });
+    const desiredAttempt = node({ reviewAttempt: 'task:root:alpha:job-1' }, [desiredDetail]);
+    const desiredNewAttempt = node({ reviewAttempt: 'task:root:alpha:job-2' }, [
+        node({ reviewAttemptDetail: 'task:root:alpha:job-2', skillReviewSkill: 'alpha', skillReviewJob: 'job-2' }),
+    ]);
+    const desired = node({ reviewSection: '' }, [
+        node({ reviewGroup: 'task:root:alpha' }, [
+            node({}, [desiredAttempt, desiredNewAttempt], ['chat-review-attempts']),
+        ]),
+    ]);
+
+    assert.equal(reconcileReviewElementTree(current, desired), true);
+    assert.equal(current.children[0], group);
+    assert.equal(group.children[0], attempts);
+    assert.equal(attempts.children[0], attempt);
+    assert.equal(attempt.children[0], detail);
+    assert.equal(detail.children[0], focused);
+    assert.equal(detail.scrollTop, 37);
+    assert.equal(detail.dataset.state, 'loaded');
+    assert.equal(attempts.children.length, 2);
 });
 
 test('Retry keeps keyboard focus on the live detail status while refetching', () => {

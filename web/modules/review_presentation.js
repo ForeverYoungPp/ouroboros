@@ -1,5 +1,6 @@
 import { escapeHtmlAttr } from './utils.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
+import { reconcileReviewMarkup } from './review_dom_patch.js';
 
 const escapeHtmlText = escapeHtmlAttr;
 
@@ -58,6 +59,31 @@ function attemptIdentity(attempt, fallback = '') {
     );
 }
 
+function normalizedExecutions(value, legacyExecution = null) {
+    const rows = Array.isArray(value) ? value : [];
+    if (rows.length) return rows.filter((item) => item && typeof item === 'object');
+    const executed = legacyExecution?.executed;
+    return executed && typeof executed === 'object' ? [executed] : [];
+}
+
+function executionsFromReviewRecord(record) {
+    if (!record || typeof record !== 'object') return [];
+    const direct = normalizedExecutions(record.executions, record.execution);
+    const actorExecutions = (Array.isArray(record.actors) ? record.actors : [])
+        .flatMap((actor) => normalizedExecutions(actor?.executions, actor?.execution));
+    return [...direct, ...actorExecutions];
+}
+
+function uniformAttemptInitiator(attempts, fallback = '') {
+    if (!attempts.length) return text(fallback);
+    const initiators = attempts.map((attempt) => text(attempt.initiatorTaskId));
+    const known = initiators.filter(Boolean);
+    if (!known.length) return text(fallback);
+    if (known.length !== initiators.length) return '';
+    const unique = new Set(initiators);
+    return unique.size === 1 ? initiators[0] : '';
+}
+
 function normalizeSkillAttempt(attempt, defaults = {}, ordinal = 0) {
     if (!attempt || typeof attempt !== 'object') return null;
     const skill = text(attempt.skill || defaults.skill);
@@ -85,6 +111,10 @@ function normalizeSkillAttempt(attempt, defaults = {}, ordinal = 0) {
         superseded: Boolean(attempt.superseded),
         replayed: Boolean(attempt.replayed || attempt.replay || attempt.replay_of || attempt.replayed_from_ts),
         revised: Boolean(attempt.snapshot_revised || attempt.revised_snapshot || attempt.revised),
+        initiatorTaskId: text(
+            attempt.initiator_task_id || attempt.origin_task_id || attempt.task_id,
+        ),
+        executions: normalizedExecutions(attempt.executions, attempt.execution),
         execution: attempt.execution && typeof attempt.execution === 'object' ? attempt.execution : null,
         detailRef: skill && jobId ? { surface: 'skill', skill, jobId } : null,
         detailText: '',
@@ -100,6 +130,10 @@ function normalizeSkillGroup(group, row = {}, { allowRowTaskIdFallback = true } 
         skill: text(group.skill || row.skill),
         status: text(group.status || row.status),
         state: normalizedState(group.state || group.status || row.status),
+        initiatorTaskId: text(
+            group.initiator_task_id || group.origin_task_id || row.origin_task_id
+            || (allowRowTaskIdFallback ? row.task_id : ''),
+        ),
     };
     const rawAttempts = Array.isArray(group.attempts) ? group.attempts : [];
     const attempts = rawAttempts
@@ -124,10 +158,7 @@ function normalizeSkillGroup(group, row = {}, { allowRowTaskIdFallback = true } 
         subject: defaults.skill,
         presentationOwnerTaskId: ownerTaskId,
         subjectTaskId: text(group.subject_task_id),
-        initiatorTaskId: text(
-            group.initiator_task_id || group.origin_task_id || row.origin_task_id
-            || (allowRowTaskIdFallback ? row.task_id : ''),
-        ),
+        initiatorTaskId: uniformAttemptInitiator(attempts, defaults.initiatorTaskId),
         state,
         tone: statusTone(state, group.verdict || group.status || latest?.verdict),
         verdict: text(group.verdict || group.status || latest?.verdict),
@@ -182,6 +213,49 @@ export function reviewGroupFromLifecycle(row) {
     return classifyReviewLifecycle(row).group;
 }
 
+function lifecyclePointerPayload(row) {
+    const direct = row?.lifecycle_pointer;
+    if (direct && typeof direct === 'object') return direct;
+    const nested = row?.progress_meta?.lifecycle_pointer;
+    return nested && typeof nested === 'object' ? nested : null;
+}
+
+export function classifyReviewLifecyclePointer(row) {
+    const pointer = lifecyclePointerPayload(row);
+    if (!pointer || text(pointer.kind) !== 'review') {
+        return { classification: 'not_pointer', group: null };
+    }
+    const groupId = text(pointer.group_id || pointer.review_group_id);
+    const ownerTaskId = text(pointer.presentation_owner_task_id);
+    if (!groupId || !ownerTaskId) {
+        return { classification: 'source_incomplete', group: null };
+    }
+    const status = text(pointer.status || 'queued');
+    const initiatorTaskId = text(pointer.initiator_task_id || pointer.origin_task_id);
+    const group = normalizeSkillGroup({
+        surface: 'skill',
+        id: groupId,
+        presentation_owner_task_id: ownerTaskId,
+        subject_task_id: pointer.subject_task_id,
+        initiator_task_id: initiatorTaskId,
+        skill: pointer.target || pointer.skill,
+        state: status,
+        status,
+        active_count: ['pending', 'queued', 'running'].includes(status.toLowerCase()) ? 1 : 0,
+        projected_attempt_count: pointer.projected_attempt_count ?? (pointer.job_id ? 1 : 0),
+        count_is_authoritative: pointer.count_is_authoritative === true,
+        attempts: pointer.job_id ? [{
+            ...pointer,
+            initiator_task_id: initiatorTaskId,
+            status,
+        }] : [],
+    }, row, { allowRowTaskIdFallback: false });
+    return {
+        classification: group ? 'source_complete' : 'source_incomplete',
+        group,
+    };
+}
+
 function planAttempt(wave, index, isCurrent) {
     if (!wave || typeof wave !== 'object') return null;
     const fingerprint = text(wave.request_fingerprint);
@@ -206,9 +280,37 @@ function planAttempt(wave, index, isCurrent) {
         superseded,
         replayed: Boolean(wave.replayed || wave.cached),
         revised: Boolean(wave.revised),
+        initiatorTaskId: '',
+        executions: executionsFromReviewRecord(wave),
         execution: null,
         detailRef: null,
-        detailText: planWaveDetail(wave),
+        detailText: `${planWaveDetail(wave)}\nCost unavailable`.trim(),
+    };
+}
+
+function activePlanAttempt(current, index) {
+    const fingerprint = text(current?.fingerprint);
+    const status = text(current?.status).toLowerCase();
+    if (!fingerprint || !['open', 'pending'].includes(status)) return null;
+    const state = status === 'pending' ? 'queued' : 'running';
+    return {
+        id: fingerprint,
+        surface: 'plan',
+        state,
+        tone: statusTone(state, status),
+        verdict: status,
+        timestamp: text(current.ts || current.timestamp),
+        ordinal: index,
+        label: 'current attempt',
+        summary: text(current.reason),
+        superseded: false,
+        replayed: false,
+        revised: false,
+        initiatorTaskId: '',
+        executions: normalizedExecutions(current.executions, current.execution),
+        execution: null,
+        detailRef: null,
+        detailText: 'Review result unavailable.\nCost unavailable',
     };
 }
 
@@ -243,7 +345,12 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
             index === currentWaveIndex,
         ))
         .filter(Boolean);
-    const currentAttempt = currentWaveIndex >= 0 ? attempts[currentWaveIndex] : null;
+    let currentAttempt = currentWaveIndex >= 0
+        ? attempts.find((attempt) => attempt.id === attemptIdentity(
+            waves[currentWaveIndex],
+            `${currentFingerprint || 'wave'}:${waves[currentWaveIndex]?.cycle_index ?? currentWaveIndex + 1}`,
+        )) || null
+        : null;
     const currentStatus = text(current.status || (currentAttempt ? 'closed' : 'open')).toLowerCase();
     let state = 'terminal';
     let activeCount = 0;
@@ -256,6 +363,11 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
             activeCount = 1;
         } else if (currentStatus === 'unavailable') {
             state = 'unavailable';
+        }
+        const activeAttempt = activePlanAttempt(current, attempts.length);
+        if (activeAttempt) {
+            attempts.push(activeAttempt);
+            currentAttempt = activeAttempt;
         }
     }
     const currentVerdict = text(currentAttempt?.verdict || currentStatus);
@@ -341,9 +453,11 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
             superseded: Boolean(panel?.superseded),
             replayed: false,
             revised: false,
+            initiatorTaskId: owner,
+            executions: executionsFromReviewRecord(panel),
             execution: null,
             detailRef: null,
-            detailText: formatReviewProjection({ panels: [panel] }),
+            detailText: `${formatReviewProjection({ panels: [panel] })}\nCost unavailable`.trim(),
         };
     });
     const latest = attempts.at(-1);
@@ -423,6 +537,24 @@ export function mergeReviewGroup(store, incoming) {
         merged.summary = prior.summary;
         merged.activeCount = prior.activeCount;
     }
+    const activeAttempts = merged.attempts.filter(
+        (attempt) => attempt.state === 'queued' || attempt.state === 'running',
+    );
+    // A bounded/history projection can omit the newest live attempt. Preserve
+    // that attempt's liveness until a source explicitly updates the same
+    // immutable attempt id to a terminal state.
+    if (activeAttempts.length) {
+        const active = activeAttempts.at(-1);
+        merged.state = activeAttempts.some((attempt) => attempt.state === 'running') ? 'running' : 'queued';
+        merged.tone = 'working';
+        merged.verdict = active.verdict || merged.state;
+        merged.summary = active.summary || merged.summary;
+        merged.activeCount = activeAttempts.length;
+    }
+    merged.initiatorTaskId = uniformAttemptInitiator(
+        merged.attempts,
+        incoming.initiatorTaskId || prior.initiatorTaskId,
+    );
     store.set(merged.id, merged);
     return merged;
 }
@@ -543,17 +675,59 @@ function attemptMeta(attempt) {
  * is deliberately ignored: identity markup must not manufacture execution.
  */
 export function reviewExecutionEvidence(execution) {
-    const executed = execution?.executed;
+    const wrapped = execution?.executed && typeof execution.executed === 'object';
+    const executed = wrapped
+        ? execution.executed
+        : execution;
     if (!executed || typeof executed !== 'object') return null;
     const kind = text(executed.kind || executed.route_kind || executed.channel).toLowerCase();
     const harness = text(executed.harness_id || executed.harness);
     const api = ['api', 'api_chat', 'api_model'].includes(kind);
-    if (!harness && !api) return null;
+    const harnessReceipt = kind === 'harness' || kind === 'agent_session' || (wrapped && Boolean(harness));
+    if (!api && (!harnessReceipt || !harness)) return null;
     return {
         harness: api ? 'api' : harness,
         channel: api ? 'api' : '',
         label: text(executed.label),
         model: text(executed.model || executed.model_id),
+    };
+}
+
+export function reviewExecutionEvidenceList(executions, legacyExecution = null) {
+    const rows = normalizedExecutions(executions, legacyExecution);
+    const seen = new Set();
+    const evidence = [];
+    for (const row of rows) {
+        const normalized = reviewExecutionEvidence(row);
+        if (!normalized) continue;
+        const key = [normalized.harness, normalized.channel, normalized.label, normalized.model].join('\u0000');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        evidence.push(normalized);
+    }
+    return evidence;
+}
+
+export function reviewReferenceFromRow(row) {
+    const directType = text(row?.system_type || row?.type || row?.event);
+    const direct = directType === 'review_reference' ? row : null;
+    const nested = row?.review_reference && typeof row.review_reference === 'object'
+        ? row.review_reference
+        : (row?.progress_meta?.review_reference && typeof row.progress_meta.review_reference === 'object'
+            ? row.progress_meta.review_reference
+            : null);
+    const reference = direct || nested;
+    if (!reference || text(reference.surface) !== 'plan_review') return null;
+    const presentationOwnerTaskId = text(
+        reference.presentation_owner_task_id || reference.task_id
+        || row?.presentation_owner_task_id || row?.task_id,
+    );
+    if (!presentationOwnerTaskId) return null;
+    return {
+        surface: 'plan_review',
+        presentationOwnerTaskId,
+        stateRevision: text(reference.state_revision),
+        reviewFingerprint: text(reference.review_fingerprint),
     };
 }
 
@@ -576,15 +750,22 @@ export function renderReviewsSection(groupsInput, disclosure = {}) {
                 ? ` data-skill-review-skill="${escapeHtmlAttr(skillRef.skill)}" data-skill-review-job="${escapeHtmlAttr(skillRef.jobId)}"`
                 : '';
             const detail = skillRef ? '' : escapeHtmlText(attempt.detailText || attempt.summary || 'No additional detail projected.');
-            const execution = reviewExecutionEvidence(attempt.execution);
-            const executionMarkup = execution
-                ? harnessIdentityMarkup(execution.harness, {
+            const executions = reviewExecutionEvidenceList(attempt.executions, attempt.execution);
+            const executionMarkup = executions.map((execution) => (
+                harnessIdentityMarkup(execution.harness, {
                     channel: execution.channel,
                     label: execution.label,
                     className: 'chat-review-execution-identity',
                 }) + (execution.model
                     ? `<span class="chat-review-execution-model">${escapeHtmlText(execution.model)}</span>`
                     : '')
+            )).join('');
+            const attemptInitiator = (
+                attempt.initiatorTaskId
+                && attempt.initiatorTaskId !== group.presentationOwnerTaskId
+                && attempt.initiatorTaskId !== group.initiatorTaskId
+            )
+                ? `<div class="chat-review-initiator">Initiated by task ${escapeHtmlText(attempt.initiatorTaskId)}</div>`
                 : '';
             return `
                 <div class="chat-review-attempt ${escapeHtmlAttr(attempt.tone)}${attempt.superseded ? ' superseded' : ''}" data-review-attempt="${escapeHtmlAttr(attemptKey)}">
@@ -593,6 +774,7 @@ export function renderReviewsSection(groupsInput, disclosure = {}) {
                         <span class="chat-review-attempt-meta">${escapeHtmlText(attemptMeta(attempt))}</span>
                         ${executionMarkup ? `<span class="chat-review-execution">${executionMarkup}</span>` : ''}
                     </div>
+                    ${attemptInitiator}
                     <button type="button" class="chat-review-detail-toggle" data-review-attempt-toggle="${escapeHtmlAttr(attemptKey)}" aria-expanded="${attemptExpanded ? 'true' : 'false'}">${attemptExpanded ? 'Hide details' : 'Show details'}</button>
                     <div class="chat-review-attempt-detail" data-review-attempt-detail="${escapeHtmlAttr(attemptKey)}"${detailAttrs} aria-busy="false"${attemptExpanded ? '' : ' hidden'}>${detail}</div>
                 </div>`;
@@ -675,8 +857,9 @@ export function createReviewPresentationController({
         summary.textContent = groupCount
             ? `Reviews ${groupCount}${activeCount ? ` · ${activeCount} active` : ''}`
             : '';
-        host.innerHTML = renderReviewsSection(groups, state);
-        restoreFocus(focused);
+        const reconciled = reconcileReviewMarkup(host, renderReviewsSection(groups, state));
+        const active = host?.ownerDocument?.activeElement;
+        if (!reconciled || !active || !host.contains?.(active)) restoreFocus(focused);
         for (const detail of host.querySelectorAll?.('[data-review-attempt-detail]') || []) {
             if (
                 !detail.hidden

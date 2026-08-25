@@ -52,8 +52,10 @@ import {
 } from './skill_review_card.js';
 import {
     classifyReviewLifecycle,
+    classifyReviewLifecyclePointer,
     createReviewPresentationController,
     createReviewHydrator,
+    reviewReferenceFromRow,
     reviewGroupFromHistoryRow,
     reviewGroupsFromTaskDetail,
 } from './review_presentation.js';
@@ -1421,10 +1423,7 @@ export function createChatInstance({
         const merged = record?.reviewController?.update(group);
         if (merged) {
             if (rawTs) reanchorVisibleTaskCard(ownerState, rawTs);
-            // The first source-complete review observed by this card generation
-            // enters the existing bounded durable-detail reconciliation. This
-            // also covers an owner card created by progress before the review;
-            // later attempts update the row without adding more GETs.
+            // One bounded owner-detail reconciliation per card generation.
             if (!record.reviewOwnerDetailObserved) {
                 record.reviewOwnerDetailObserved = true;
                 observeMissingManagedTask(ownerTaskId);
@@ -1452,6 +1451,12 @@ export function createChatInstance({
     }
 
     function attachReviewFromRow(row, rawTs = '') {
+        const pointer = classifyReviewLifecyclePointer(row);
+        if (pointer.classification !== 'not_pointer') {
+            const owner = pointer.group?.presentationOwnerTaskId;
+            if (owner) liveCardRecords.get(owner)?.reviewController?.update(pointer.group);
+            return true; // Never mint the synthetic job or a missing owner.
+        }
         const historyGroup = reviewGroupFromHistoryRow(row);
         if (historyGroup) {
             return attachReviewGroup(historyGroup, rawTs || row?.ts || row?.timestamp || '');
@@ -1468,11 +1473,9 @@ export function createChatInstance({
     }
 
     function handleReviewReference(row) {
-        const type = String(row?.system_type || row?.type || row?.event || '');
-        if (type !== 'review_reference' || String(row?.surface || '') !== 'plan_review') return false;
-        const ownerTaskId = String(row?.presentation_owner_task_id || row?.task_id || '').trim();
-        if (!ownerTaskId) return false;
-        hydrateCardReviews(ownerTaskId, row?.state_revision);
+        const reference = reviewReferenceFromRow(row);
+        if (!reference) return false;
+        hydrateCardReviews(reference.presentationOwnerTaskId, reference.stateRevision);
         return true;
     }
 

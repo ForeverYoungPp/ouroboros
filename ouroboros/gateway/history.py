@@ -101,6 +101,9 @@ _PROGRESS_META_FIELDS = (
     # (harness_used/harness_attempted/native_only).
     "actual_substrate",
     "task_group_id",
+    # A duplicate lifecycle call is a typed pointer/ack, not a task. Preserve
+    # the pointer on reload while its outer task_id stays empty.
+    "lifecycle_pointer",
 )
 
 _SKILL_REVIEW_STRING_FIELDS = (
@@ -111,6 +114,12 @@ _SKILL_REVIEW_STRING_FIELDS = (
 )
 _SKILL_REVIEW_INT_FIELDS = ("review_round", "snapshot_attempt")
 _SKILL_REVIEW_BOOL_FIELDS = ("snapshot_revised",)
+
+
+def _review_executions(value: Any) -> list[Dict[str, str]]:
+    from ouroboros.review_execution_projection import normalize_review_executions
+
+    return normalize_review_executions(value)
 
 
 def _stored_chat_id(value: Any, default: int = 1) -> int:
@@ -856,6 +865,7 @@ def _collect_chat_rows(
                         rec[key] = 0
                 for key in _SKILL_REVIEW_BOOL_FIELDS:
                     rec[key] = bool(entry.get(key))
+                rec["executions"] = _review_executions(entry.get("executions"))
             # Delivered document rows carry lightweight media metadata (no
             # base64); surface a msg_type + download_url so the frontend
             # rebuilds the file bubble on reload instead of a bare text line.
@@ -900,6 +910,8 @@ def _collect_progress_rows(
         # the window holds n_progress ordinary telemetry rows.
         if not isinstance(entry, dict):
             return False
+        if str(entry.get("type") or "") == "review_reference":
+            return False
         if is_a2a_chat_id(entry.get("chat_id", 1)):
             return False
         entry_chat = _stored_chat_id(entry.get("chat_id"), 1)
@@ -942,7 +954,8 @@ def _collect_progress_rows(
             if not row_matches_thread(entry_chat, {"is_progress": True, **entry}):
                 continue
             text = str(entry.get("content", entry.get("text", "")))
-            if not text:
+            is_review_reference = str(entry.get("type") or "") == "review_reference"
+            if not text and not is_review_reference:
                 continue
             rec = {
                 "text": text,
@@ -952,6 +965,14 @@ def _collect_progress_rows(
                 "markdown": str(entry.get("format", "")).lower() == "markdown",
                 "task_id": str(entry.get("task_id", "")),
             }
+            if is_review_reference:
+                rec["system_type"] = "review_reference"
+                for field in (
+                    "surface", "presentation_owner_task_id",
+                    "review_fingerprint", "state_revision",
+                ):
+                    if field in entry:
+                        rec[field] = str(entry.get(field) or "")
             if isinstance(entry.get("lifecycle"), dict):
                 rec["lifecycle"] = dict(entry.get("lifecycle") or {})
             for field in _PROGRESS_META_FIELDS:
@@ -1010,10 +1031,15 @@ def _fold_task_bound_skill_reviews(combined: list[Dict[str, Any]]) -> list[Dict[
             or latest_job_position[str(item[1].get("job_id") or "")] == position
         ]
         attempts: list[Dict[str, Any]] = []
-        for _index, row in surviving_rows:
+        for position, (_index, row) in enumerate(surviving_rows):
             attempt = {
                 "ts": str(row.get("ts") or ""),
                 "task_id": str(row.get("task_id") or ""),
+                # Legacy jobless rows have no exact-detail ref. Their compact
+                # terminal text is therefore the only useful attempt body.
+                "text": str(row.get("text") or ""),
+                "superseded": position < len(surviving_rows) - 1,
+                "executions": _review_executions(row.get("executions")),
             }
             for key in _SKILL_REVIEW_STRING_FIELDS:
                 if key in row:
@@ -1163,7 +1189,25 @@ def _apply_window_quotas(
                 )
         except Exception:
             log.debug("Project origin fallback synthesis failed", exc_info=True)
-    other = [m for m in progress if not _is_subagent_lineage(m)]
+    # Plan references are durable invalidations on the existing progress rail.
+    # They neither consume visible telemetry quota nor need every historical
+    # revision: task detail remains authority, so the latest ref per owner is
+    # sufficient to rehydrate after reload.
+    review_references_by_owner: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for message in progress:
+        if str(message.get("system_type") or "") != "review_reference":
+            continue
+        key = (
+            str(message.get("surface") or ""),
+            str(message.get("presentation_owner_task_id") or message.get("task_id") or ""),
+        )
+        review_references_by_owner[key] = message
+    review_references = list(review_references_by_owner.values())
+    other = [
+        m for m in progress
+        if not _is_subagent_lineage(m)
+        and str(m.get("system_type") or "") != "review_reference"
+    ]
     other_tail = other[-n_progress:] if n_progress > 0 else []
     # Recency floor = oldest retained telemetry row. Drop lineage older than it so
     # long-finished swarms don't re-materialise as stuck "Working" parent cards.
@@ -1203,7 +1247,7 @@ def _apply_window_quotas(
     lineage_truncated = len(lineage) > _LINEAGE_CAP
     if lineage_truncated:
         lineage = lineage[-_LINEAGE_CAP:]  # keep the most recent lineage events
-    progress_tail = lineage + other_tail
+    progress_tail = lineage + other_tail + review_references
     messages = sorted(
         human_tail + folded_reviews + progress_tail,
         key=lambda m: m.get("ts", ""),

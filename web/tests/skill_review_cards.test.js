@@ -79,16 +79,34 @@ test('loadSkillReviewDetail encodes skill and job id in the route', async () => 
     assert.deepEqual(calls, ['/api/skills/a%20b/review-history/j%2F1']);
 });
 
-test('loadSkillReviewDetail failure degrades honestly with a Retry control', async () => {
+test('permanent bounded 404 parses the server error and offers no fake Retry', async () => {
     const full = makeFull();
     const state = await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'skill-job-1' }, {
-        fetchImpl: async () => ({ ok: false, status: 404, json: async () => ({ error: 'review record not found' }) }),
+        fetchImpl: async () => ({
+            ok: false, status: 404,
+            json: async () => ({ error: 'review record unavailable outside the bounded history window' }),
+        }),
         render: () => { throw new Error('must not render on failure'); },
     });
     assert.equal(state, 'error');
     assert.equal(full.dataset.state, 'error');
     assert.match(full.innerHTML, /Review details unavailable/);
     assert.match(full.innerHTML, /HTTP 404/);
+    assert.match(full.innerHTML, /unavailable outside the bounded history window/);
+    assert.match(full.innerHTML, /Cost unavailable/);
+    assert.doesNotMatch(full.innerHTML, /data-skill-review-retry/);
+});
+
+test('transient non-OK detail parses JSON and retains Retry', async () => {
+    const full = makeFull();
+    const state = await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'skill-job-1' }, {
+        fetchImpl: async () => ({
+            ok: false, status: 503,
+            json: async () => ({ error: 'temporary ledger read failure' }),
+        }),
+    });
+    assert.equal(state, 'error');
+    assert.match(full.innerHTML, /HTTP 503: temporary ledger read failure/);
     assert.match(full.innerHTML, /data-skill-review-retry/);
 });
 
@@ -199,6 +217,16 @@ test('empty markdown from the route is treated as an error, not a blank card', a
     });
     assert.equal(state, 'error');
     assert.match(full.innerHTML, /Review details unavailable/);
+});
+
+test('exact server accounting renders without a client-authored cost fallback', async () => {
+    const full = makeFull();
+    await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'j1' }, {
+        fetchImpl: async () => okResponse('## Findings\n\n### Review accounting\n\n- Cash: settled $0.10.'),
+        render: (markdown) => `<rendered>${markdown}</rendered>`,
+    });
+    assert.match(full.innerHTML, /Review accounting/);
+    assert.doesNotMatch(full.innerHTML, /skill-review-cost-unavailable/);
 });
 
 test('a missing reference is a no-op (defensive)', async () => {
