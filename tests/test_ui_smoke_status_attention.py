@@ -379,7 +379,12 @@ def test_task_status_stays_factual_in_main_and_project_chat(
                     page.locator("#page-chat [data-mobile-nav-toggle]").click()
                     project_row.wait_for(state="visible", timeout=5_000)
                 project_row.scroll_into_view_if_needed()
-                project_row.click()
+                with page.expect_response(
+                    lambda response: response.url.endswith("/api/ui/preferences")
+                    and response.request.method == "POST",
+                    timeout=30_000,
+                ):
+                    project_row.click()
                 page.wait_for_selector("#project-panel:not([hidden])", timeout=30_000)
                 project_scope = page.locator("#project-panel .chat-instance-panel")
                 project_scope.wait_for(state="visible", timeout=30_000)
