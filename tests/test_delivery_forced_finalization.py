@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import queue
 from types import SimpleNamespace
@@ -540,7 +541,75 @@ def test_provider_unavailable_preserves_stale_candidate_with_resume_disclosure(
     assert forced["evidence_revision"] == old.evidence_revision
     assert forced["current_evidence_revision"] > old.evidence_revision
     assert usage["_best_effort_extracted"] is True
+    assert usage["terminal_origin"] == "host_salvage"
     assert trace["tool_calls"] == []
+
+
+def test_provider_unavailable_keeps_current_model_candidate_byte_exact(
+    tmp_path, monkeypatch,
+):
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    answer = "Complete current model answer."
+    loop._replace_delivery_candidate(registry, limit_ctx, trace, answer, control="replace")
+    monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (None, 0.0))
+    monkeypatch.setattr(loop, "_force_plan_disclosure", lambda *_a, **_k: "\nHOST FACT")
+
+    text, usage, returned_trace = loop._handle_provider_unavailable(limit_ctx)
+
+    assert text == answer
+    assert usage["terminal_origin"] == "model_final"
+    assert "HOST FACT" not in text
+    assert returned_trace["forced_finalization"]["source"] == "retained_candidate"
+
+
+def test_provider_unavailable_strips_host_suffix_already_on_retained_candidate(
+    tmp_path, monkeypatch,
+):
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    loop._replace_delivery_candidate(
+        registry, limit_ctx, trace, "Model answer.\nHOST FACT",
+        control="host_suffix", model_text="Model answer.",
+    )
+    monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (None, 0.0))
+
+    text, usage, returned_trace = loop._handle_provider_unavailable(limit_ctx)
+
+    assert text == "Model answer."
+    assert usage["terminal_origin"] == "model_final"
+    assert registry._ctx._delivery_candidate.full_text == text
+    assert returned_trace["forced_finalization"]["candidate_sha256"] == hashlib.sha256(
+        text.encode("utf-8")
+    ).hexdigest()
+
+
+def test_provider_unavailable_forced_model_answer_excludes_host_suffix(
+    tmp_path, monkeypatch,
+):
+    loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
+    monkeypatch.setattr(
+        loop,
+        "call_llm_with_retry",
+        lambda *_a, **_k: ({"content": "Fresh forced model answer."}, 0.0),
+    )
+    monkeypatch.setattr(loop, "_force_plan_disclosure", lambda *_a, **_k: "\nHOST FACT")
+
+    text, usage, returned_trace = loop._handle_provider_unavailable(limit_ctx)
+
+    assert text == "Fresh forced model answer."
+    assert usage["terminal_origin"] == "model_final"
+    assert returned_trace["forced_finalization"]["source"] == "model"
+
+
+def test_provider_unavailable_without_model_answer_stamps_host_salvage(
+    tmp_path, monkeypatch,
+):
+    loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
+    monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (None, 0.0))
+
+    text, usage, _returned_trace = loop._handle_provider_unavailable(limit_ctx)
+
+    assert "provider returned no usable response" in text
+    assert usage["terminal_origin"] == "host_salvage"
 
 
 def test_normal_host_suffix_is_inside_candidate_and_panel_subject(tmp_path, monkeypatch):
@@ -581,6 +650,7 @@ def test_normal_host_suffix_is_inside_candidate_and_panel_subject(tmp_path, monk
         text.encode("utf-8")
     ).hexdigest()
     assert registry._ctx._delivery_candidate.full_text == text
+    assert registry._ctx._delivery_candidate.model_text == "Base complete answer."
 
 
 def test_forced_retained_candidate_suffix_creates_new_unaccepted_revision(

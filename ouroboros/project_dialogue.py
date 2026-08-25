@@ -546,6 +546,8 @@ def append_terminal_task_projection(
 
 
 def _completion_excerpt(result: Dict[str, Any]) -> str:
+    if str(result.get("terminal_origin") or "") == "host_salvage":
+        return ""
     for key in ("summary", "result", "error"):
         text = " ".join(str(result.get(key) or "").split())
         if text:

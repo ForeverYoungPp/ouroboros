@@ -8,6 +8,18 @@ the reflection — written from the error trace — declared the delivered PDF
 missing. The two seams below fix both halves: the answer leaves early over
 the live queue, and synthesis receives the delivered outcome as ground truth
 (a prompt input, not a validator — durable writes are never blocked on it).
+
+Terminal provenance extends the same custody rule. A provider outage is an
+infrastructure failure even when useful text survived. A complete current
+model candidate remains Ouroboros's byte-exact answer and host outage facts
+become a separate System incident; stale/last-response/deterministic fallback
+bytes are host salvage, preserved durably but never promoted to speech. The
+provider rail may recover a compacted transcript from persisted LLM output,
+and forced finalization still retains its original semantics: owner-stop gets
+one logical model call because steering is fenced, while the generic rail may
+refresh once for a late owner directive. These invariants belong here because
+this module joins producer provenance, durable result, delivered projection,
+and sealed post-task ground truth.
 """
 
 from __future__ import annotations
@@ -24,6 +36,71 @@ log = logging.getLogger(__name__)
 # Prompt bounds: the overflow count is disclosed instead of silently dropped.
 _SEALED_MANIFEST_MAX_FILES = 200
 _SEALED_FINAL_TEXT_PROMPT_CHARS = 4000
+
+# Closed producer vocabulary. Missing remains a valid legacy state and must
+# never be inferred from result text or lifecycle status.
+TERMINAL_ORIGIN_MODEL_FINAL = "model_final"
+TERMINAL_ORIGIN_HOST_SALVAGE = "host_salvage"
+
+
+def send_provider_death_notice(
+    ctx: Any, chat_id: int, task_id: Any, final_result: Dict[str, Any],
+) -> bool:
+    """Send the secondary incident, unless the primary is already the receipt."""
+    if str(final_result.get("terminal_origin") or "") == TERMINAL_ORIGIN_HOST_SALVAGE:
+        return False
+    ctx.send_with_budget(
+        chat_id,
+        f"🔌 Task {task_id} was stopped by a model-provider outage and was "
+        "NOT completed. Partial work and workspace files are preserved; "
+        "re-run the task once the provider recovers.",
+        role="system",
+        system_type="terminal_incident",
+    )
+    return True
+
+
+def prepare_terminal_send_event(
+    env_drive_root: Any, task: Dict[str, Any], text: str,
+    usage: Dict[str, Any], send_event: Dict[str, Any],
+    *, ephemeral: bool, presence: bool,
+) -> Dict[str, Any]:
+    """Preserve raw host salvage, then build the one live/replay projection."""
+    origin = str(usage.get("terminal_origin") or "")
+    if ephemeral or presence or origin not in {
+        TERMINAL_ORIGIN_MODEL_FINAL, TERMINAL_ORIGIN_HOST_SALVAGE,
+    }:
+        return send_event
+    canonical_root = pathlib.Path(task.get("budget_drive_root") or env_drive_root)
+    preserved_path = ""
+    if origin == TERMINAL_ORIGIN_HOST_SALVAGE and text:
+        try:
+            from ouroboros.observability import preserve_salvaged_output
+
+            preserved_path = preserve_salvaged_output(
+                canonical_root, str(task.get("id") or ""), text,
+            )
+        except Exception:
+            log.warning("Failed to pre-preserve terminal host salvage", exc_info=True)
+        usage["terminal_salvage_path"] = preserved_path
+    from supervisor.terminal_delivery import project_terminal_result_event
+
+    return project_terminal_result_event(
+        canonical_root, task, str(task.get("id") or ""),
+        result_text=text, terminal_origin=origin, base_event=send_event,
+    )
+
+
+def terminal_result_fields(usage: Dict[str, Any]) -> Dict[str, str]:
+    """Additive durable origin/full-copy fields; unknown producers stay legacy."""
+    fields: Dict[str, str] = {}
+    origin = str(usage.get("terminal_origin") or "")
+    if origin in {TERMINAL_ORIGIN_MODEL_FINAL, TERMINAL_ORIGIN_HOST_SALVAGE}:
+        fields["terminal_origin"] = origin
+    path = str(usage.get("terminal_salvage_path") or "")
+    if path:
+        fields["terminal_salvage_path"] = path
+    return fields
 
 
 def deliver_final_message_live(
@@ -64,8 +141,9 @@ def deliver_final_message_live(
     final = final if final is not None else fallback
     if final is None:
         return False
-    digest = hashlib.sha256(str(final.get("text") or "").encode("utf-8")).hexdigest()[:16]
-    final["delivery_id"] = f"final:{tid}:{digest}"
+    if not str(final.get("delivery_id") or "").strip():
+        digest = hashlib.sha256(str(final.get("text") or "").encode("utf-8")).hexdigest()[:16]
+        final["delivery_id"] = f"final:{tid}:{digest}"
     if drive_root is not None and str(drive_root).strip() and final.get("chat_id"):
         # OWED before ENQUEUED. Rows without a chat id are not registered (the
         # replay could never send them, so they would only age into a false
@@ -118,8 +196,9 @@ def register_final_answer_owed(
         from supervisor.terminal_delivery import register_pending_delivery
 
         tid = str(task.get("id") or "")
-        digest = hashlib.sha256(str(send_event.get("text") or "").encode("utf-8")).hexdigest()[:16]
-        send_event["delivery_id"] = f"final:{tid}:{digest}"
+        if not str(send_event.get("delivery_id") or "").strip():
+            digest = hashlib.sha256(str(send_event.get("text") or "").encode("utf-8")).hexdigest()[:16]
+            send_event["delivery_id"] = f"final:{tid}:{digest}"
         register_pending_delivery(pathlib.Path(outbox_root), dict(send_event))
     except Exception:
         log.debug("final-answer owed registration failed for %s", task.get("id"), exc_info=True)

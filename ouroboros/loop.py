@@ -32,6 +32,10 @@ from ouroboros.usage_accounting import (
     PhysicalAttemptPreconditionFailed,
     last_physical_attempt_capture,
 )
+from ouroboros.task_finalization import (
+    TERMINAL_ORIGIN_HOST_SALVAGE,
+    TERMINAL_ORIGIN_MODEL_FINAL,
+)
 
 from ouroboros.loop_tool_execution import (
     StatefulToolExecutor,
@@ -63,6 +67,7 @@ class DeliveryCandidate:
     repair_attempted: bool = False
     degraded: bool = False
     degraded_reason: str = ""
+    model_text: str = ""
 
 @dataclass
 class _CompactionRoundContext:
@@ -125,6 +130,7 @@ def _handle_text_response(
     safe_content = sanitize_tool_result_for_log(content or "")
     if safe_content.strip():
         llm_trace["reasoning_notes"].append(safe_content.strip())
+        accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL
     return safe_content, accumulated_usage, llm_trace
 
 
@@ -3496,24 +3502,11 @@ def _handle_owner_stop_finalization(
 
 
 def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Provider-death terminalization: the model returned no usable response
-    after the transport same-model reroute + retries (+ any configured
-    cross-model fallback). SALVAGE like the other forced rails — one tool-less
-    final answer (which itself benefits from the same-model reroute) and,
-    failing that, the last assistant text already produced — but terminalize as
-    an INFRA FAILURE, never as a completion: an outage interrupts the task with
-    the objective unmet, and calling that "completed (best effort)" was a lie
-    that hid a real outage from the owner (95 minutes of silence)."""
-    # A stale DeliveryCandidate is still the best complete text available when
-    # the provider is dead. _forced_fallback_result preserves its original
-    # evidence provenance and adds a host-owned resume disclosure rather than
-    # laundering unchanged text onto the newer evidence fingerprint.
+    """Provider-death terminalization; rationale lives in task_finalization."""
     candidate = _live_delivery_candidate(ctx)
     salvaged = candidate.full_text if candidate is not None else _last_assistant_text(ctx.messages)
     if candidate is None and not salvaged and ctx.drive_root is not None:
-        # B2: the current (possibly compacted) transcript may no longer hold the
-        # last useful assistant text, but every LLM round was persisted — fall back
-        # to the durable salvage source named by the plan (latest_llm_response_text).
+        # Compaction may hide the last text; persisted LLM output remains custody.
         try:
             from ouroboros.observability import latest_llm_response_text
             salvaged = latest_llm_response_text(pathlib.Path(ctx.drive_root), ctx.task_id) or ""
@@ -3534,16 +3527,12 @@ def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str
     )
     text, usage, llm_trace = _forced_final_answer(
         ctx, prompt=prompt, fallback_text=fallback, reason_code="provider_unavailable",
+        provider_terminal=True,
     )
-    # Honesty (P1): a provider outage interrupts the task — it never "completes"
-    # it. Stamp the infra-failure execution status so the outcome reducer lands
-    # on infra_failed/provider (terminal: failed) instead of the old best-effort
-    # promotion to "completed"; the salvage text still rides the result body.
-    # Skipped when a swarm routing handoff already cleared the rail (the admitted
-    # task owns its lifecycle). NOTE: "interrupted" is deliberately NOT used —
-    # STATUS_INTERRUPTED is a pre-requeue, non-terminal state in this codebase.
+    # `interrupted` is pre-requeue here; provider death is a failed terminal.
     if str(usage.get("reason_code") or "") == "provider_unavailable":
         usage["execution_status"] = RESULT_INFRA_FAILED
+        usage.setdefault("terminal_origin", TERMINAL_ORIGIN_HOST_SALVAGE)
     return text, usage, llm_trace
 
 
@@ -3899,8 +3888,12 @@ def _replace_delivery_candidate(
     full_text: str,
     *,
     control: str,
+    model_text: Optional[str] = None,
 ) -> DeliveryCandidate:
     full_text = sanitize_tool_result_for_log(full_text)
+    model_text = sanitize_tool_result_for_log(
+        full_text if model_text is None else model_text
+    )
     previous_candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if isinstance(previous_candidate, DeliveryCandidate):
         _supersede_delivery_acceptance_binding(
@@ -3921,6 +3914,7 @@ def _replace_delivery_candidate(
         evidence_fingerprint=evidence_fingerprint,
         acceptance_binding=_unaccepted_delivery_binding(tools, content_hash),
         finalization_control=control,
+        model_text=model_text,
     )
     tools._ctx._delivery_candidate = candidate
     tools._ctx._delivery_control_required = False
@@ -4829,6 +4823,7 @@ def _no_tool_final_answer(
             llm_trace,
             composed_content,
             control="host_suffix" if normal_suffix else "candidate",
+            model_text=str(content or ""),
         )
     if isinstance(candidate, DeliveryCandidate):
         if orphan_suffix:
@@ -5197,6 +5192,7 @@ def _forced_fallback_result(
     source: str = "host_fallback",
     retained_source: str = "",
     retained_control: str = "",
+    provider_terminal: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Return one exact candidate; reuse only current unchanged full text."""
 
@@ -5216,9 +5212,18 @@ def _forced_fallback_result(
     )
     candidate = _current_delivery_candidate(ctx, llm_trace)
     if candidate is not None:
-        composed = sanitize_tool_result_for_log(
-            _compose_delivery_suffix(candidate.full_text, suffix)
-        )
+        if provider_terminal:
+            core = candidate.model_text or candidate.full_text
+            if core != candidate.full_text:
+                candidate = _publish_model_forced_candidate(
+                    ctx, llm_trace, core, reason_code,
+                ) or candidate
+            composed = candidate.full_text
+            ctx.accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL
+        else:
+            composed = sanitize_tool_result_for_log(
+                _compose_delivery_suffix(candidate.full_text, suffix)
+            )
         if composed != candidate.full_text:
             candidate = _publish_model_forced_candidate(
                 ctx, llm_trace, composed, reason_code,
@@ -5262,6 +5267,8 @@ def _forced_fallback_result(
             suffix,
         )
         if candidate is not None:
+            if provider_terminal:
+                ctx.accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_HOST_SALVAGE
             ctx.accumulated_usage["_best_effort_extracted"] = True
             _record_forced_finalization(
                 ctx,
@@ -5278,6 +5285,8 @@ def _forced_fallback_result(
     )
     if fallback_is_retained_model_text:
         ctx.accumulated_usage["_best_effort_extracted"] = True
+    if provider_terminal:
+        ctx.accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_HOST_SALVAGE
     _record_forced_finalization(
         ctx,
         llm_trace,
@@ -5471,12 +5480,9 @@ def _forced_final_answer(
     fallback_text: str,
     reason_code: str,
     single_semantic_turn: bool = False,
+    provider_terminal: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Force one tool-less final answer; stamp the typed forced-finalization
-    reason code (the best_effort outcome gate reads it downstream).
-    ``single_semantic_turn`` (owner-stop rail, CF-03): exactly ONE logical
-    model call — the late-owner-directive semantic refresh is disabled because
-    steering is fenced while the stop intent is pending."""
+    """Force a tool-less answer; rail rationale lives in task_finalization."""
     live_trace = getattr(ctx, "llm_trace", None)
     llm_trace = live_trace if isinstance(live_trace, dict) else {}
     _finalize_forced_services(ctx, llm_trace)
@@ -5511,6 +5517,7 @@ def _forced_final_answer(
                 ),
                 reason_code,
                 source="late_owner_directive_requires_resume",
+                provider_terminal=provider_terminal,
             )
         _finalize_forced_services(ctx, llm_trace)
         _append_or_merge_user_message(
@@ -5532,9 +5539,14 @@ def _forced_final_answer(
             _force_plan_disclosure(tool_ctx, llm_trace, forced_reason=reason_code)
             if tool_ctx is not None else ""
         )
-        full_text = _compose_delivery_suffix(
-            extracted, plan_suffix + _forced_orphan_note(ctx),
+        host_suffix = plan_suffix + _forced_orphan_note(ctx)
+        full_text = (
+            extracted
+            if provider_terminal
+            else _compose_delivery_suffix(extracted, host_suffix)
         )
+        if provider_terminal:
+            ctx.accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL
         candidate = _publish_model_forced_candidate(
             ctx, llm_trace, full_text, reason_code,
         )
@@ -5563,6 +5575,7 @@ def _forced_final_answer(
         llm_trace,
         fallback_text,
         reason_code,
+        provider_terminal=provider_terminal,
     )
 
 

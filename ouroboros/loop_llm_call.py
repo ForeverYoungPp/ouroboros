@@ -509,6 +509,20 @@ def _exception_provider_code(exc: Exception, safe_error: str) -> str:
     for value in values:
         if value.lower() in _STRUCTURED_CONTEXT_OVERFLOW_CODES:
             return value
+    generic_bad_request_wrappers = {
+        "badrequest",
+        "badrequesterror",
+        "invalidrequest",
+        "invalidrequesterror",
+    }
+    for value in values:
+        normalized = value.lower().replace("_", "").replace("-", "").replace(" ", "")
+        if (
+            not value.isdigit()
+            and normalized not in generic_bad_request_wrappers
+            and _provider_code_kind(value)
+        ):
+            return value
     return values[0] if values else ""
 
 
@@ -537,8 +551,12 @@ def _provider_code_kind(provider_code: str) -> str:
     if not code:
         return ""
     for kind, markers in _NON_RETRYABLE_PROVIDER_MARKERS.items():
-        if code == kind or any(code == str(marker).lower() or str(marker).lower() in code for marker in markers):
+        if code == kind:
             return kind
+        for marker in markers:
+            normalized = str(marker).lower()
+            if code == normalized or (not normalized.isdigit() and normalized in code):
+                return kind
     return ""
 
 
@@ -566,7 +584,13 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
     if provider_code.lower() in _STRUCTURED_CONTEXT_OVERFLOW_CODES:
         return LlmErrorClassification("context_overflow", False, status_code, provider_code)
     provider_kind = _provider_code_kind(provider_code)
-    if provider_kind:
+    # Named codes and numeric auth/quota codes are typed authority. Only a
+    # numeric code that maps to generic bad_request defers to the semantic body
+    # classifiers below, which can distinguish output/context failures.
+    generic_numeric_bad_request = (
+        provider_kind == "bad_request" and provider_code == "400"
+    )
+    if provider_kind and not generic_numeric_bad_request:
         return LlmErrorClassification(provider_kind, False, status_code, provider_code)
     if status_code == 429:
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
@@ -576,6 +600,8 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
         return LlmErrorClassification("request_too_large", False, status_code, provider_code)
     if _is_context_overflow_error(exc, safe):
         return LlmErrorClassification("context_overflow", False, status_code, provider_code)
+    if provider_kind:
+        return LlmErrorClassification(provider_kind, False, status_code, provider_code)
     for kind, markers in _NON_RETRYABLE_PROVIDER_MARKERS.items():
         if any(marker in low for marker in markers):
             return LlmErrorClassification(kind, False, status_code, provider_code)

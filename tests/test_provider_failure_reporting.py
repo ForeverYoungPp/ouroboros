@@ -442,6 +442,135 @@ def test_classify_llm_exception_uses_provider_code_before_429_status():
     assert quota.provider_code == "insufficient_quota"
 
 
+def test_numeric_400_defers_to_size_and_context_semantics():
+    ordinary = classify_llm_exception(
+        _ProviderError("400 bad request", status_code=400, code="400")
+    )
+    output_size = classify_llm_exception(_ProviderError(
+        "max_tokens 65536 exceeds maximum context length 32768",
+        status_code=400,
+        code="400",
+    ))
+    context = classify_llm_exception(_ProviderError(
+        "Prompt is too long for this model context window",
+        status_code=400,
+        code="400",
+    ))
+
+    assert ordinary.kind == "bad_request"
+    assert output_size.kind == "request_too_large"
+    assert context.kind == "context_overflow"
+
+
+def test_meaningful_named_provider_code_keeps_precedence_over_error_text():
+    quota = classify_llm_exception(_ProviderError(
+        "Prompt is too long for this model context window",
+        status_code=400,
+        code="insufficient_quota",
+    ))
+
+    assert quota.kind == "quota_exhausted"
+    assert quota.provider_code == "insufficient_quota"
+
+
+def test_numeric_auth_and_quota_codes_keep_precedence_over_error_text():
+    for code, expected in (
+        ("401", "auth_error"),
+        ("402", "quota_exhausted"),
+        ("403", "auth_error"),
+    ):
+        classified = classify_llm_exception(_ProviderError(
+            "Prompt is too long for this model context window",
+            status_code=int(code),
+            code=code,
+        ))
+
+        assert classified.kind == expected
+        assert classified.provider_code == code
+
+
+def test_later_meaningful_provider_type_wins_over_generic_numeric_code():
+    for provider_type, expected in (
+        ("insufficient_quota", "quota_exhausted"),
+        ("unauthorized", "auth_error"),
+    ):
+        error = _ProviderError(
+            "Prompt is too long for this model context window",
+            status_code=400,
+            code="400",
+        )
+        error.type = provider_type
+
+        classified = classify_llm_exception(error)
+
+        assert classified.kind == expected
+        assert classified.provider_code == provider_type
+
+
+def test_generic_bad_request_wrappers_do_not_hide_400_size_or_context_semantics():
+    for provider_type in ("BadRequestError", "invalid_request_error"):
+        for message, expected in (
+            ("Prompt is too long for this model context window", "context_overflow"),
+            ("request body too large", "request_too_large"),
+        ):
+            error = _ProviderError(message, status_code=400, code="400")
+            error.type = provider_type
+
+            classified = classify_llm_exception(error)
+
+            assert classified.kind == expected
+            assert classified.provider_code == "400"
+
+
+def test_structured_context_code_stays_ahead_of_later_named_type():
+    error = _ProviderError(
+        "quota-looking transport detail",
+        status_code=400,
+        code="context_length_exceeded",
+    )
+    error.type = "insufficient_quota"
+
+    classified = classify_llm_exception(error)
+
+    assert classified.kind == "context_overflow"
+    assert classified.provider_code == "context_length_exceeded"
+
+
+def test_specific_named_bad_request_code_keeps_typed_precedence():
+    error = _ProviderError(
+        "Prompt is too long for this model context window",
+        status_code=400,
+        code="400",
+    )
+    error.type = "unsupported_parameter"
+
+    classified = classify_llm_exception(error)
+
+    assert classified.kind == "bad_request"
+    assert classified.provider_code == "unsupported_parameter"
+
+
+def test_non_http_numeric_provider_codes_do_not_inherit_the_400_marker():
+    for code in ("4001", "1400"):
+        context = classify_llm_exception(_ProviderError(
+            "Prompt is too long for this model context window",
+            status_code=400,
+            code=code,
+        ))
+        ordinary = classify_llm_exception(_ProviderError(
+            "ordinary bad request",
+            status_code=400,
+            code=code,
+        ))
+
+        assert context.kind == "context_overflow"
+        assert context.retry_same_request is False
+        assert context.provider_code == code
+        assert ordinary.kind == "bad_request"
+        assert ordinary.retry_same_request is False
+        assert ordinary.provider_code == code
+
+
 def test_classify_llm_exception_keeps_429_token_rate_retryable():
     rate = classify_llm_exception(
         _ProviderError("429 too many tokens per minute", status_code=429)

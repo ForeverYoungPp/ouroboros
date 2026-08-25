@@ -51,8 +51,8 @@ from ouroboros.task_finalization import (
     build_sealed_final_package,
     build_swarm_efficiency as _build_swarm_efficiency,  # moved (module ceiling); tests import it here
     deliver_final_message_live,
-    register_final_answer_owed,
-    sealed_final_prompt_section,
+    prepare_terminal_send_event, register_final_answer_owed,
+    sealed_final_prompt_section, terminal_result_fields,
 )
 from ouroboros.dialogue_provenance import is_presence_task, presence_provenance_fields
 from ouroboros.presence_runner import build_presence_result_event
@@ -673,6 +673,7 @@ def emit_task_results(
         # Final frames carry their own durable identity; replay must not depend
         # on a nearby progress row that may age out independently.
         send_event["progress_meta"] = dict(_message_meta)
+    send_event = prepare_terminal_send_event(env.drive_root, task, text, usage, send_event, ephemeral=_ephemeral, presence=_presence)
     pending_events.append(build_presence_result_event(task, text, ctx) if _presence else send_event)
     duration_sec = round(time.time() - start_time, 3)
     n_tool_calls = len(llm_trace.get("tool_calls", []))
@@ -915,7 +916,7 @@ def emit_task_results(
 
         if not _ephemeral and not _root_post_task_already_completed(env, task):
             _dispatch_root_post_task(
-                env, task, text, event_queue, pending_events,
+                env, task, str(send_event.get("text") or ""), event_queue, pending_events,
                 post_usage, llm_trace, review_evidence, drive_logs,
                 budget_drive_root=budget_drive_root, split_drive=split_drive,
                 project_scoped=_project_scoped, project_task=_project_task,
@@ -1161,7 +1162,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             parent_cognitive_route=task.get("parent_cognitive_route"),
             subagent_availability=task.get("subagent_availability"),
             metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
-            result=text or "",
+            result=text or "", **terminal_result_fields(usage),
             final_answer=str(loop_outcome.get("final_answer") or ""),
             trace_summary=trace_summary,
             trace_refs=loop_outcome.get("trace_refs") or {},
