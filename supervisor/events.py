@@ -4318,9 +4318,60 @@ def _handle_external_wait_lease(evt: Dict[str, Any], ctx: Any) -> None:
         meta.pop("external_wait_lease_id", None)
 
 
+def _handle_main_llm_call_state(evt: Dict[str, Any], ctx: Any) -> None:
+    task_id = str(evt.get("task_id") or "")
+    phase = str(evt.get("phase") or "").strip().lower()
+    llm_call_id = str(evt.get("llm_call_id") or "")
+    execution_id = str(evt.get("execution_id") or "")
+    round_id = str(evt.get("round_id") or "")
+    if (
+        not task_id
+        or phase not in {"started", "finished", "failed"}
+        or not llm_call_id
+        or not execution_id
+        or not round_id
+    ):
+        return
+    try:
+        task_attempt = int(evt["task_attempt"])
+        call_attempt = int(evt["call_attempt"])
+    except (KeyError, TypeError, ValueError):
+        return
+    if task_attempt < 1 or call_attempt < 1:
+        return
+    running = getattr(ctx, "RUNNING", None)
+    meta = running.get(task_id) if isinstance(running, dict) else None
+    if not isinstance(meta, dict):
+        return
+    expected_attempt = meta.get("attempt")
+    if expected_attempt is None:
+        task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
+        expected_attempt = task.get("_attempt")
+    try:
+        if int(expected_attempt) != task_attempt:
+            return
+    except (TypeError, ValueError):
+        return
+    identity = {
+        "task_attempt": task_attempt,
+        "llm_call_id": llm_call_id,
+        "execution_id": execution_id,
+        "round_id": round_id,
+        "call_attempt": call_attempt,
+    }
+    if phase == "started":
+        meta["active_llm_call"] = {**identity, "started_at": time.time()}
+        return
+    active = meta.get("active_llm_call")
+    if not isinstance(active, dict) or any(active.get(key) != value for key, value in identity.items()):
+        return
+    meta.pop("active_llm_call", None)
+
+
 EVENT_HANDLERS = {
     "llm_usage": _handle_llm_usage,
     "external_wait_lease": _handle_external_wait_lease,
+    "main_llm_call_state": _handle_main_llm_call_state,
     "budget_pause": _handle_budget_pause,
     "budget_root_fence": _handle_budget_root_fence,
     "task_heartbeat": _handle_task_heartbeat,

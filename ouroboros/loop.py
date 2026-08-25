@@ -6795,13 +6795,13 @@ def run_llm_loop(
     else:
         active_context_mode = _preferred_context_mode
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
-    accumulated_usage: Dict[str, Any] = {}
-    tools._ctx._accumulated_usage = accumulated_usage
+    accumulated_usage = {"_task_attempt": getattr(ctx, "task_attempt", None)}
+    ctx._accumulated_usage = accumulated_usage
     max_retries = 3
     cost_ceiling = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)
     if cost_ceiling.root_cap_usd is not None:
-        # Loop-start seed (one rare ledger read): a resumed/late-started member
-        # of a spending tree must see the real tree number before its first
+        # One ledger read seeds a resumed/late-started member
+        # of a spending tree must see tree spend before its first
         # pacing surface, not a process-local empty stash.
         _loop_tree_accounting(refresh=True, max_age_sec=0.0)
     from ouroboros.tools import tool_discovery as _td

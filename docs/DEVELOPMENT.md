@@ -1780,6 +1780,14 @@ Before every commit, verify the following:
 - [ ] Fixed **kill**-timeouts (hard task/tool ceilings, watchdog) still exist as
   the outer safety bound and get sensible ceilings under high-reasoning models;
   progress-aware waiting tunes the *passive* wait, it does not remove the watchdog.
+- [ ] Keep transport dead-socket bounds, task deadlines, and cognitive in-flight
+  state separate. Each main-loop LLM call emits exact-attempt `started` and
+  `finished | failed` facts; while that row is active it spares only the task idle
+  rail. Silent elapsed reasoning is not semantic stall evidence. Explicit deadline,
+  budget, cancellation, and the absolute task ceiling still cut through, and a
+  terminal fact must match task-attempt plus execution/round/call identity before
+  it clears the row. Do not reuse `external_wait_lease`, a transport timeout, or a
+  heartbeat as this authority, and do not add an elapsed-time stall detector.
 - [ ] New numeric timeout constants are an SSOT in `config.py` `SETTINGS_DEFAULTS`
   with a getter and env registration; do not scatter magic wait numbers across
   call sites.

@@ -67,6 +67,41 @@ def emit_log_event(
     except Exception:
         log.debug("Failed to emit %s event", log_label, exc_info=True)
 
+
+def emit_main_llm_call_state_event(
+    event_queue: Any,
+    *,
+    task_id: str,
+    task_attempt: Any,
+    llm_call_id: str,
+    execution_id: str,
+    round_id: str,
+    call_attempt: int,
+    phase: str,
+) -> None:
+    """Publish one typed main-LLM in-flight fact to the supervisor.
+
+    This is a direct control-plane event, not a UI ``log_event``.  It has no
+    elapsed-time expiry: the supervisor uses it only to spare the idle rail
+    while the exact call is active; deadline, budget, cancellation, and the
+    absolute task ceiling remain independent hard axes.
+    """
+    if event_queue is None:
+        return
+    try:
+        event_queue.put({
+            "type": "main_llm_call_state",
+            "task_id": str(task_id or ""),
+            "task_attempt": task_attempt,
+            "llm_call_id": str(llm_call_id or ""),
+            "execution_id": str(execution_id or ""),
+            "round_id": str(round_id or ""),
+            "call_attempt": int(call_attempt),
+            "phase": str(phase or ""),
+        })
+    except Exception:
+        log.debug("Failed to emit main LLM call state event", exc_info=True)
+
 def sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 

@@ -280,3 +280,122 @@ def test_the_lease_never_spares_deadline_or_ceiling(monkeypatch, tmp_path):
     _enforcer(monkeypatch, tmp_path, {"t2": meta2})(2500.0)
     assert meta2.get("finalization_requested_at") == 2500.0
     assert meta2.get("finalization_reason") == "deadline"
+
+
+def _llm_call_event(phase, **overrides):
+    return {
+        "type": "main_llm_call_state",
+        "task_id": "t3",
+        "task_attempt": 2,
+        "llm_call_id": "call-1",
+        "execution_id": "exec-1",
+        "round_id": "exec-1:round:4",
+        "call_attempt": 1,
+        "phase": phase,
+        **overrides,
+    }
+
+
+def test_main_llm_call_state_is_attempt_and_call_identity_bound():
+    from supervisor import events as events_mod
+
+    meta = {
+        "task": {"id": "t3", "_attempt": 2},
+        "attempt": 2,
+        "started_at": 1000.0,
+    }
+    ctx = types.SimpleNamespace(RUNNING={"t3": meta})
+
+    events_mod.dispatch_event(_llm_call_event("started", task_attempt=None), ctx)
+    events_mod.dispatch_event(_llm_call_event("started", task_attempt=1), ctx)
+    assert "active_llm_call" not in meta
+
+    events_mod.dispatch_event(_llm_call_event("started"), ctx)
+    assert meta["active_llm_call"]["llm_call_id"] == "call-1"
+
+    # The next retry supersedes the settled call identity. A late terminal from
+    # the prior call, or a partial terminal, cannot clear the newer in-flight row.
+    events_mod.dispatch_event(_llm_call_event(
+        "started", llm_call_id="call-2", call_attempt=2,
+    ), ctx)
+    events_mod.dispatch_event(_llm_call_event("failed"), ctx)
+    events_mod.dispatch_event(_llm_call_event(
+        "finished", llm_call_id="call-2", call_attempt=2, round_id="",
+    ), ctx)
+    assert meta["active_llm_call"]["llm_call_id"] == "call-2"
+
+    events_mod.dispatch_event(_llm_call_event(
+        "finished", llm_call_id="call-2", call_attempt=2,
+    ), ctx)
+    assert "active_llm_call" not in meta
+
+
+def test_active_llm_call_spares_idle_without_elapsed_expiry(monkeypatch, tmp_path):
+    meta = {
+        "task": {"id": "t4", "chat_id": 7, "_attempt": 2},
+        "attempt": 2,
+        "started_at": 1000.0,
+        "last_progress_at": 1000.0,
+        "worker_id": 0,
+        "active_llm_call": {
+            "task_attempt": 2,
+            "llm_call_id": "call-live",
+            "execution_id": "exec-live",
+            "round_id": "exec-live:round:1",
+            "call_attempt": 1,
+            "started_at": 1100.0,
+        },
+    }
+    # The call has been silent longer than the current 2700s transport default.
+    # Elapsed time is not semantic stall evidence; only hard task axes cut through.
+    _enforcer(monkeypatch, tmp_path, {"t4": meta}, abs_ceiling=10_000)(5000.0)
+    assert "finalization_requested_at" not in meta
+
+    meta.pop("active_llm_call")
+    _enforcer(monkeypatch, tmp_path, {"t4": meta}, abs_ceiling=10_000)(5000.0)
+    assert meta["finalization_requested_at"] == 5000.0
+    assert meta["finalization_reason"] == "idle_timeout"
+
+
+def test_stale_attempt_llm_call_does_not_spare_idle(monkeypatch, tmp_path):
+    meta = {
+        "task": {"id": "t5", "chat_id": 7, "_attempt": 2},
+        "attempt": 2,
+        "started_at": 1000.0,
+        "last_progress_at": 1000.0,
+        "worker_id": 0,
+        "active_llm_call": {"task_attempt": 1, "llm_call_id": "stale"},
+    }
+    _enforcer(monkeypatch, tmp_path, {"t5": meta})(2500.0)
+    assert meta["finalization_reason"] == "idle_timeout"
+
+
+@pytest.mark.parametrize("hard_axis", ["deadline", "absolute_ceiling"])
+def test_active_llm_call_never_spares_hard_task_axes(
+    hard_axis, monkeypatch, tmp_path,
+):
+    task = {"id": "t6", "chat_id": 7, "_attempt": 1}
+    abs_ceiling = 10_000
+    if hard_axis == "deadline":
+        task["deadline_at"] = dt.datetime.fromtimestamp(
+            2000.0, tz=dt.timezone.utc,
+        ).isoformat()
+    else:
+        abs_ceiling = 1000
+    meta = {
+        "task": task,
+        "attempt": 1,
+        "started_at": 1000.0,
+        "last_progress_at": 1000.0,
+        "worker_id": 0,
+        "active_llm_call": {
+            "task_attempt": 1,
+            "llm_call_id": "call-hard-axis",
+            "execution_id": "exec-hard-axis",
+            "round_id": "exec-hard-axis:round:1",
+            "call_attempt": 1,
+        },
+    }
+    _enforcer(monkeypatch, tmp_path, {"t6": meta}, abs_ceiling=abs_ceiling)(2500.0)
+    assert meta["finalization_requested_at"] == 2500.0
+    assert meta["finalization_reason"] == hard_axis
