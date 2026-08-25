@@ -245,7 +245,7 @@ def test_live_event_summaries_preserve_full_text_for_expansion():
 def test_task_done_live_summary_distinguishes_typed_failure():
     source = _read("web/modules/log_events.js")
     assert "export function taskOutcomeSeverity" in source
-    assert "function taskDoneFailure" in source
+    assert "export function taskPresentation" in source
     assert "outcome_axes?.execution?.status" in source
     assert "['degraded', 'best_effort'].includes(execution)" in source
     assert "['degraded', 'best_effort'].includes(objective)" in source
@@ -258,6 +258,9 @@ def test_task_done_live_summary_distinguishes_typed_failure():
     assert "if (severity === 'error') return 'error';" in source
     assert "if (severity === 'warn') return 'warn';" in source
     assert source.count("taskTerminalPhase(evt)") >= 2
+    assert "const terminal = taskDoneIsTerminal(evt);" in source
+    assert "const presentation = taskPresentation(terminal ? taskTerminalPhase(evt) : 'working');" in source
+    assert "headline: presentation.headline" in source
 
 
 def test_chat_warning_task_summaries_force_visible_cards():

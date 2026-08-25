@@ -134,7 +134,7 @@ test('subagent projection keeps identity, compact facts and complete disclosure'
         write_surface: 'workspace',
         status: 'running',
     });
-    assert.match(summary.headline, /researcher · claude-fable-5 \(child123\) — running/);
+    assert.match(summary.headline, /researcher · claude-fable-5 \(child123\) — Working/);
     assert.ok(summary.activityPreview.length <= COLLAPSED_ACTIVITY_MAX);
     assert.match(summary.fullBody, /UNIQUE_CHILD_TAIL$/);
     assert.deepEqual(summary.meta, ['write=workspace', 'status=running']);

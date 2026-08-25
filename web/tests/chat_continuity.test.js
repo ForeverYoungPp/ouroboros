@@ -7,11 +7,14 @@ import test from 'node:test';
 import {
     computeDerivedChatStatus,
     computeHydratedDirectActivities,
-    isTerminalTaskDetail,
     partitionLocalEchoJournal,
     reconcileHydratedDirectActivities,
 } from '../modules/chat_activity.js';
-import { summarizeChatLiveEvent, taskTerminalPhase } from '../modules/log_events.js';
+import {
+    isTerminalTaskDetail,
+    summarizeChatLiveEvent,
+    taskTerminalPhase,
+} from '../modules/log_events.js';
 
 // ---------------------------------------------------------------------------
 // Local-echo journal: a stale history snapshot must not erase the owner's row.
@@ -186,7 +189,7 @@ test('admitted managed work shows Working... without a live card', () => {
     assert.deepEqual(status, { kind: 'thinking', text: 'Working...', showDots: true });
 });
 
-test('managed status priority: working > thinking > sending > queued > attention', () => {
+test('managed status priority: working > thinking > sending > queued > online', () => {
     assert.equal(computeDerivedChatStatus({
         activeManagedCount: 1, activeDirectCount: 1, pendingSubmissionsCount: 1, queuedManagedCount: 1,
     }).text, 'Working...');
@@ -197,9 +200,8 @@ test('managed status priority: working > thinking > sending > queued > attention
         pendingSubmissionsCount: 1, queuedManagedCount: 1,
     }).text, 'Sending...');
     assert.equal(computeDerivedChatStatus({
-        queuedManagedCount: 1, lastTerminalAttention: true,
+        queuedManagedCount: 1,
     }).text, 'Queued...');
-    assert.equal(computeDerivedChatStatus({ lastTerminalAttention: true }).text, 'Attention');
     assert.equal(computeDerivedChatStatus({}).text, 'Online');
 });
 

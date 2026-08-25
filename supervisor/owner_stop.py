@@ -324,8 +324,9 @@ def graceful_summary_suppressed(q: Any, task_id: str) -> bool:
     True only when the root's open cascade intent carries the finalize policy
     AND the root's durable result is COMPLETED — the owner already received the
     model's own final answer through normal delivery, and the card state says
-    "Stopped with summary"; a second summary message would be the duplicate Q4
-    forbids. Every other outcome (expiry -> cancelled, failed, replayed crash)
+    factual "Done" with the owner-stop marker in its details; a second summary
+    message would be the duplicate Q4 forbids. Every other outcome (expiry ->
+    cancelled, failed, replayed crash)
     keeps the tree's ONE receipt. The suppression is recorded as a typed
     forensic row so the crash-order evidence shows a conscious decision.
     """

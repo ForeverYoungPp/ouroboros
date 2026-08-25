@@ -222,7 +222,7 @@ test('a failed cancel reconciles through the shared helper before touching the b
     // a genuinely-live, non-pending task gets its prior phase restored and
     // the button re-enabled.
     const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    assert.match(chat, /const priorPhase = captureLiveCardPhase\(record\);\n\s*markLiveCardCancelPending\(taskId, soft\);/);
+    assert.match(chat, /const priorPhase = captureLiveCardPhaseState\(record\);\n\s*markLiveCardCancelPending\(taskId, soft\);/);
     const failure = chat.slice(chat.indexOf('showToast(`Cancel failed:'));
     const branch = failure.slice(0, 2200);
     // The shared seam runs BEFORE any button re-enable.
@@ -233,5 +233,5 @@ test('a failed cancel reconciles through the shared helper before touching the b
     // Pending or terminal ⇒ return WITHOUT re-enabling or restoring the phase.
     assert.match(branch, /if \(record\.finished \|\| stillPending\) return;/);
     assert.match(branch, /taskCancelPending\(stored\)/);
-    assert.match(branch, /restoreLiveCardPhase\(record, priorPhase\)/);
+    assert.match(branch, /restoreLiveCardPhaseState\(record, priorPhase\)/);
 });

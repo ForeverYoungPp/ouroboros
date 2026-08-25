@@ -1,6 +1,6 @@
 // S3 stream-gate fixes: MAJOR-A (owner decision №8/Q3) — an owner-requested
-// finalization renders as the SUCCESS "Stopped with summary", never as
-// "Finished with warnings" — and MINOR 7 (Q4) — the cancel_receipt system row
+// finalization renders as factual SUCCESS "Done", never as a warning — while
+// the owner-request marker stays in details. MINOR 7 (Q4): cancel_receipt
 // keeps the 📋 System render style, never assistant-styled.
 
 import assert from 'node:assert/strict';
@@ -9,7 +9,6 @@ import { readFileSync } from 'node:fs';
 
 import {
     OWNER_STOP_DETAIL_MARKER,
-    OWNER_STOP_DONE_HEADLINE,
     summarizeChatLiveEvent,
     summarizeLogEvent,
     taskOutcomeSeverity,
@@ -39,10 +38,9 @@ test('owner-requested finalization classifies as done, not warn', () => {
     assert.equal(taskOutcomeSeverity({ ...softStop, reason_code: 'deadline' }), 'warn');
 });
 
-test('chat live card headline reads "Stopped with summary" with the owner marker', () => {
+test('chat live card headline reads factual "Done" with the owner marker', () => {
     const view = summarizeChatLiveEvent(softStop);
-    assert.equal(view.headline, OWNER_STOP_DONE_HEADLINE);
-    assert.equal(view.headline, 'Stopped with summary');
+    assert.equal(view.headline, 'Done');
     assert.equal(view.phase, 'done');                     // NOT warn-styled
     assert.equal(view.terminal, true);
     assert.ok(view.meta.includes(OWNER_STOP_DETAIL_MARKER));
@@ -51,9 +49,9 @@ test('chat live card headline reads "Stopped with summary" with the owner marker
     assert.doesNotMatch(view.headline, /Finished with warnings/);
 });
 
-test('logs surface shows the same headline and marker instead of the raw code', () => {
+test('logs surface shows the same factual headline and marker instead of the raw code', () => {
     const view = summarizeLogEvent(softStop);
-    assert.equal(view.headline, OWNER_STOP_DONE_HEADLINE);
+    assert.equal(view.headline, 'Done');
     assert.equal(view.phase, 'done');                     // NOT warn-styled
     assert.ok(view.meta.includes(OWNER_STOP_DETAIL_MARKER));
     assert.ok(!view.meta.includes('owner_requested_finalization'));
@@ -67,15 +65,17 @@ test('an expiry kill still reads Cancelled — honesty outranks the soft-stop la
     assert.equal(summarizeChatLiveEvent(expired).headline, 'Cancelled');
 });
 
-test('the chat.js terminal seam consumes the shared soft-stop branch', () => {
-    // Pinned at source: the live-card done headline branches through the SAME
-    // shared predicate/constants (no divergent inline string), and the details
-    // panel body carries the owner-request marker.
+test('the chat.js terminal seam keeps soft-stop truth in the details', () => {
+    // Pinned at source: the shared task presentation owns the factual headline,
+    // and the details panel body carries the owner-request marker.
     assert.match(chat, /taskStoppedWithSummary\(msg \|\| \{\}\)/);
-    assert.match(chat, /\? OWNER_STOP_DONE_HEADLINE/);
+    assert.match(
+        chat,
+        /taskPresentation\(finalizing \? 'working' : taskTerminalPhase\(msg \|\| \{\}\)\)/,
+    );
     assert.match(chat, /softStopped \? OWNER_STOP_DETAIL_MARKER : ''/);
-    assert.match(chat, /\[softStopDetail, reviewDetails\]\.filter\(Boolean\)\.join\('\\n'\)/);
-    assert.match(chat, /visible: Boolean\(softStopDetail \|\| reviewDetails\)/);
+    assert.match(chat, /\[softStopDetail, reasonDetail, reviewDetails\]\.filter\(Boolean\)\.join\('\\n'\)/);
+    assert.match(chat, /visible: Boolean\(softStopDetail \|\| reasonDetail \|\| reviewDetails\)/);
 });
 
 // --- MINOR 7 (Q4): cancel_receipt rendered as 📋 System, not assistant ---

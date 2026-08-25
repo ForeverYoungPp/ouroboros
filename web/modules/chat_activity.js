@@ -212,22 +212,6 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
     return Boolean(terminal) || ['done', 'lifecycle_error', 'cancelled'].includes(phase);
 }
 
-// Durable task detail is allowed to finish a card only at one of the task
-// result store's genuinely-settled statuses. In particular, interrupted and
-// the legacy cancel_requested latch remain retryable rather than becoming a
-// fabricated Done/Cancelled projection.
-const TERMINAL_TASK_DETAIL_STATUSES = new Set([
-    'completed', 'failed', 'cancelled', 'rejected_duplicate',
-]);
-const OPEN_POST_TASK_SYNTHESIS_STATUSES = new Set(['pending_once', 'running']);
-
-export function isTerminalTaskDetail(record) {
-    const status = String(record?.status || '').toLowerCase();
-    const synthesis = String(record?.root_phase_checkpoint?.post_task_synthesis || '').toLowerCase();
-    return TERMINAL_TASK_DETAIL_STATUSES.has(status)
-        && !(status === 'completed' && OPEN_POST_TASK_SYNTHESIS_STATUSES.has(synthesis));
-}
-
 // ---------------------------------------------------------------------------
 // In-flight chat activity status (owner decisions 1A-5A; managed continuity).
 // ---------------------------------------------------------------------------
@@ -290,7 +274,7 @@ export function mainThreadAccepts(msg, projectChatIds) {
  * > background live card (Working...) > admitted managed work (Working...) >
  * server-confirmed direct/ephemeral turns (Thinking...) > local pending
  * submissions (Sending...) > queue-admitted but unstarted managed work
- * (Queued...) > terminal attention > idle. A queued task ranks below
+ * (Queued...) > idle. A queued task ranks below
  * Sending... because an unacknowledged local submission is the more actionable
  * state. Pure over its inputs for dependency-free node tests.
  */
@@ -301,7 +285,6 @@ export function computeDerivedChatStatus({
     activeManagedCount = 0,
     queuedManagedCount = 0,
     pendingSubmissionsCount = 0,
-    lastTerminalAttention = false,
 } = {}) {
     if (!isConnected) {
         return { kind: 'offline', text: 'Reconnecting...', showDots: false };
@@ -320,9 +303,6 @@ export function computeDerivedChatStatus({
     }
     if (queuedManagedCount > 0) {
         return { kind: 'thinking', text: 'Queued...', showDots: true };
-    }
-    if (lastTerminalAttention) {
-        return { kind: 'error', text: 'Attention', showDots: false };
     }
     return { kind: 'online', text: 'Online', showDots: false };
 }
@@ -576,7 +556,7 @@ export function reconcileHydratedDirectActivities(
  * of ids the GLOBAL /api/state snapshot confirms live, it returns the mounted
  * unfinished foreground card ids the snapshot does NOT vouch for. Each one is
  * handed to observeMissingManagedTask, whose durable task-detail read finishes
- * the card ONLY on a proven terminal status (isTerminalTaskDetail); a 404 or
+ * the card ONLY on a proven terminal status (`log_events.js::isTerminalTaskDetail`); a 404 or
  * nonterminal detail keeps the id and retries on the next snapshot (owner
  * Q3=A: no timers, no id-shape heuristics, no fabricated terminal).
  *

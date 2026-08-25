@@ -115,6 +115,25 @@ exempts; it must never carry meaning a reader has to obtain.
 A status has **an explicit foreground/background pair**, never a foreground
 derived from whatever generic opacity happens to sit on the element.
 
+Status, owner action, and urgent notification are separate product concepts:
+
+- **Status** states a fact about the affected object. It does not imply that the
+  owner can or must act. Task status uses one factual word family: `Working`,
+  `Done`, `Done with warnings`, `Failed`, `Cancelled`.
+- **Owner action** exists only when the responsible domain exposes a current
+  concrete continuation, such as Resume, Retry, Connect, Repair, Grant access,
+  or Restart. The action is a real adjacent control; severity alone never
+  manufactures one.
+- **Urgent notification** is a rare, time-sensitive interruption. It uses the
+  product's explicit incident/notification seam, not a red status or a failed
+  task as a proxy.
+
+Local diagnostic failures remain inspectable in details and Logs, but do not
+relabel the whole still-working task. A failed child keeps a compact factual
+`Failed` marker inside its parent while the root continues under its own
+authoritative status. Internal reason codes belong in details and diagnostics,
+not compact headlines.
+
 | Role | Foreground | Background |
 | --- | --- | --- |
 | Success / connected | `--status-ok-fg` | `--status-ok-bg` |
@@ -209,7 +228,8 @@ The scale is applied surface by surface. Migrated today:
 Not yet migrated: chat, skills, marketplace, widgets, logs, evolution. They are
 historical and keep their literals until their own pass. Do not part-migrate a
 surface: a half-tokenised stylesheet is harder to reason about than an untouched
-one.
+one. The semantic status/action/notification contract above already applies to
+these surfaces; it does not by itself authorize a visual token migration.
 
 `tests/test_web_typography_static.py` guards the migrated set only. Extending
 the guard to a new surface and migrating that surface are the same commit.

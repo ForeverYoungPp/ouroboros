@@ -1918,6 +1918,17 @@ commit.
   shared toast host unless status belongs to a permanently reserved control
   row. Working, warning, error, and destructive states keep consistent meaning
   across Chat, Logs, Settings, and Skills.
+- Task outcome truth stays in `log_events.js::taskOutcomeSeverity` and
+  `taskTerminalPhase`; `taskPresentation` is the one compact factual projection
+  consumed by task chips, live completion, history replay, and child terminal
+  presentation. Keep raw reason codes in details/Logs. A non-terminal
+  LLM/tool/checkpoint diagnostic may add a timeline fact, but must not promote
+  the whole task, including when no earlier human headline exists. Unknown
+  event names never acquire Chat severity from `error`/`crash`/`fail` keyword
+  matching; Logs retains its independent diagnostic categorization.
+- The Chat header reports connection and server-authoritative activity only.
+  Failed task status does not synthesize header attention, a toast, unread
+  state, or an owner action; those remain explicit domain/incident contracts.
 - Floating chrome combines gradient and masked backdrop blur so the blur edge
   does not become a visible seam. The chat composer intentionally keeps blur on
   the input surface and reserves measured message padding around the dock.
