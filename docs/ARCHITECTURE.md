@@ -345,6 +345,26 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       the reaper (server startup + 10-min supervisor tick) kills entries whose
       generation/task owner is gone, matching by STRICT fingerprint only —
       never by command-line class, so dev and packaged instances can coexist.
+      On Linux `start_time` is read from `/proc` and boot-qualified
+      (`"<ticks>.<boot8>"`, since boot-relative ticks recur across reboots and a
+      bare tick plus a recycled pid is a real collision). The mint order is
+      boot-qualified first; then, when the boot id is unreadable, the `ps`
+      wall-clock token, which cannot collide across boots; and only once `ps` has
+      ALSO failed, `"<ticks>."` as a disclosed last resort (two of THOSE from
+      different boots do string-match, which is why they are last, not first). A
+      post-change token is therefore never string-equal to a pre-change bare
+      tick: it is boot-qualified, a `ps` string, or separator-carrying. The
+      minted form changes if the boot id starts or stops being readable
+      mid-generation, so a row recorded across that transition mismatches its own
+      live process — safe, since a mismatch prunes and never kills. The match
+      accepts both Linux representations for pre-existing rows — current first,
+      and the pre-upgrade `ps -o lstart=` spelling (or its rare bare-tick
+      fallback) only once that mismatched; the `ps` spelling is re-derived only
+      when the current token is `/proc`-minted (elsewhere it would be the same
+      bytes again), while a bare-tick row resolves against `/proc` directly in
+      every mint order, so no legacy row shape is orphaned on a `/proc` host.
+      An upgrade therefore orphans no ledger row and the reaper's hot path never
+      pays for a second subprocess.
       Genuine `daemon` entries are kept; skill companions (daemon scope,
       `purpose companion:<skill>:<name>`) are the exception (v6.36.2) — reaped on
       owner-uninstall or a foreign generation, **log-only by default**

@@ -41,9 +41,8 @@ def executable_name_candidates(name: str) -> List[str]:
 def local_zoneinfo():
     """Best-effort DST-aware local timezone.
 
-    ``astimezone().tzinfo`` is a *fixed* offset that drifts across DST; resolve the IANA
-    zone (``TZ`` or ``/etc/localtime``), falling back to the fixed offset.
-    """
+    ``astimezone().tzinfo`` is a *fixed* offset that drifts across DST; resolve the IANA zone (``TZ`` or
+    ``/etc/localtime``), falling back to the fixed offset."""
     import datetime
     from zoneinfo import ZoneInfo
 
@@ -136,12 +135,11 @@ def bootstrap_process_path() -> list[str]:
 
 
 def scrub_repo_from_pythonpath(env: dict[str, str], repo_dir: "str | pathlib.Path | None") -> dict[str, str]:
-    """Return a copy of *env* with any ``PYTHONPATH`` entry resolving to the Ouroboros
-    system repo dir removed.
+    """Return a copy of *env* with any ``PYTHONPATH`` entry resolving to the Ouroboros system repo dir removed.
 
-    An EXTERNAL-workspace command inherits the worker's ``PYTHONPATH`` repo entry, which
-    makes the target's ``import web``/``server``/``ouroboros`` resolve to OUROBOROS's modules.
-    Dropping ONLY the repo entry isolates the target; no-op without one."""
+    An EXTERNAL-workspace command inherits the worker's ``PYTHONPATH`` repo entry, which makes the target's
+    ``import web``/``server``/``ouroboros`` resolve to OUROBOROS's modules. Dropping ONLY the repo entry isolates
+    the target; no-op without one."""
     out = dict(env)
     raw = out.get("PYTHONPATH", "")
     if not raw or not repo_dir:
@@ -460,9 +458,8 @@ def pid_is_alive(pid: int) -> bool:
 def pid_provably_gone(pid: int) -> bool:
     """True only when the OS positively answers that ``pid`` does not exist.
 
-    Stricter than ``not pid_is_alive``: the POSIX branch there folds EVERY
-    OSError into 'dead', but EPERM means the process EXISTS and merely refuses
-    our signal — a caller deciding whether a killed process is really gone
+    Stricter than ``not pid_is_alive``: the POSIX branch there folds EVERY OSError into 'dead', but EPERM means
+    the process EXISTS and merely refuses our signal — a caller deciding whether a killed process is really gone
     must treat that (and anything else undeterminable) as still present."""
     if pid <= 0:
         return True
@@ -573,12 +570,10 @@ def _win32_unlock(fd: int) -> None:
 def kill_process_tree(proc: subprocess.Popen) -> None:
     """Force-kill a subprocess and its entire process tree.
 
-    On POSIX the immediate process group is SIGKILLed first, then descendants that
-    escaped into their own session/group are swept by PID — without that sweep a
-    cancelled child which spawned grandchildren in new groups leaks orphans.
-    Descendants are collected BEFORE the kill: once the parent dies its children are
-    reparented and the ppid links disappear.
-    """
+    On POSIX the immediate process group is SIGKILLed first, then descendants that escaped into their own
+    session/group are swept by PID — without that sweep a cancelled child which spawned grandchildren in new
+    groups leaks orphans. Descendants are collected BEFORE the kill: once the parent dies its children are
+    reparented and the ppid links disappear."""
     pid = proc.pid
     if IS_WINDOWS:
         try:
@@ -675,21 +670,44 @@ def current_process_group_id() -> int:
         return 0
 
 
+_BOOT_ID = ""  # first 8 hex of the /proc boot id; empty until a successful read, then latched
+
+
 def process_start_time(pid: int) -> str:
     """Best-effort stable start-time token for (pid, start_time) fingerprints.
 
-    A bare pid is not an identity — the kernel reuses it. ``(pid, start_time)`` is, which is what
-    lets a caller refuse to signal a pid it merely used to own. POSIX uses ``ps -o lstart=``,
-    falling back to the same /proc field the containment scan dates candidates by, so the
-    fingerprint stays real on an image with no usable ``ps``. Windows returns "" (callers degrade
-    to pid liveness), as does a pid that is already gone."""
-    if pid <= 0:
+    A bare pid is not an identity (kernels reuse pids) and boot-relative ticks RECUR across reboots, so a bare
+    tick + a recycled pid + the same command line is a real collision; refusing that kill is the job. Linux mints
+    IN THIS ORDER: ``"<ticks>.<boot8>"`` when the boot id is readable (no subprocess); else the ``ps`` wall-clock
+    token, which cannot collide across boots; and only once ``ps`` has ALSO failed, ``"<ticks>."`` as a disclosed
+    last resort — two of THOSE from different boots do string-match, hence last, not first. No ``/proc``: legacy
+    throughout; Windows and a dead pid return "". A post-change token is never string-equal to a bare pre-change
+    tick: it is boot-qualified, a ``ps`` string, or separator-carrying. Disclosed: the FORM changes if the boot id
+    starts or stops being readable mid-generation, so a row recorded across it mismatches its own live process —
+    safe: it prunes, never kills, and the cheap reap path skips live rows."""
+    global _BOOT_ID
+    if pid <= 0 or os.name == "nt":
         return ""
-    if os.name == "nt":
+    if not (ticks := _proc_start_ticks(pid)):
+        return process_start_time_legacy(pid)  # no /proc here (macOS, BSD): ps is the only source
+    if not _BOOT_ID:  # a failed read is transient: retry next call, never downgrade the generation
+        try:
+            _BOOT_ID = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip().replace("-", "")[:8]
+        except (OSError, ValueError):  # matches _proc_start_ticks; an escapee would abort a custody sweep
+            pass
+    if _BOOT_ID:
+        return f"{ticks}.{_BOOT_ID}"
+    # legacy degrades to str(ticks) when ps ALSO failed; only then is the separator form the best we have.
+    return legacy if (legacy := process_start_time_legacy(pid)) and legacy != str(ticks) else f"{ticks}."
+
+
+def process_start_time_legacy(pid: int) -> str:
+    """The historical ``ps -o lstart=`` token (bare ``/proc`` ticks when ``ps`` fails); the compatibility half of the
+    dual-format fingerprint match, consulted only after a boot-qualified current token failed to match."""
+    if pid <= 0 or os.name == "nt":
         return ""
     try:
-        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
-                             capture_output=True, text=True, timeout=5)
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
         text = (out.stdout or "").strip()
         if out.returncode == 0 and text:
             return text
@@ -742,10 +760,9 @@ def force_kill_pid(pid: int) -> None:
 def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None) -> None:
     """Force-kill a PID tree recursively.
 
-    ``exclude_pids`` are spared along with their own descendants, keeping
-    ``service_teardown=keep`` services reachable for a verifier when a worker is
-    force-killed; spared children reparent to init and fall to the custody reaper.
-    """
+    ``exclude_pids`` are spared along with their own descendants, keeping ``service_teardown=keep`` services
+    reachable for a verifier when a worker is force-killed; spared children reparent to init and fall to the
+    custody reaper."""
     exclude = {int(p) for p in (exclude_pids or set())}
     if IS_WINDOWS:
         # exclude_pids is a POSIX-only nicety: descendant enumeration relies on
@@ -952,24 +969,19 @@ def interpreter_is_embedded(interpreter: str) -> bool:
 def pip_install_target_args(interpreter: str) -> List[str]:
     """Extra pip flags so an install never writes INSIDE the packaged bundle.
 
-    The embedded interpreter lives in the signed bundle, so its own
-    ``site-packages`` is the wrong install target: writing there breaks the code
-    signature and fails outright on a read-only install. ``--user`` redirects to
-    the user site under ``PYTHONUSERBASE`` (set by
-    ``launcher_bootstrap.embedded_python_env`` for every process that runs the
-    embedded interpreter). A non-embedded interpreter — a dev venv, a system
-    python — gets NO flag: ``--user`` is refused inside a virtualenv, so a blanket
-    flag would trade one broken install for another.
-    """
+    The embedded interpreter lives in the signed bundle, so its own ``site-packages`` is the wrong install target:
+    writing there breaks the code signature and fails outright on a read-only install. ``--user`` redirects to the
+    user site under ``PYTHONUSERBASE`` (set by ``launcher_bootstrap.embedded_python_env`` for every process that
+    runs the embedded interpreter). A non-embedded interpreter — a dev venv, a system python — gets NO flag:
+    ``--user`` is refused inside a virtualenv, so a blanket flag would trade one broken install for another."""
     return ["--user"] if interpreter_is_embedded(interpreter) else []
 
 
 def project_venv_python(project_root: pathlib.Path) -> str:
     """Return the executable for a valid project ``.venv`` on this platform.
 
-    Keep the lexical venv path (rather than resolving its symlink) so Python
-    discovers the adjacent ``pyvenv.cfg`` and activates the environment.
-    """
+    Keep the lexical venv path (rather than resolving its symlink) so Python discovers the adjacent ``pyvenv.cfg``
+    and activates the environment."""
     env_root = pathlib.Path(project_root) / ".venv"
     if not (env_root / "pyvenv.cfg").is_file():
         return ""
@@ -1051,13 +1063,10 @@ BUNDLE_DIR_ENV = "OUROBOROS_BUNDLE_DIR"
 def bundled_resource_ancestor_bases(executable: "str | pathlib.Path | None" = None) -> List[pathlib.Path]:
     """Bundle roots recoverable from an embedded interpreter path.
 
-    Managed updates replace the server checkout but not the frozen launcher.
-    Launchers predating ``OUROBOROS_BUNDLE_DIR`` still start the updated server
-    with ``.../Resources/python-standalone/...`` (macOS) or
-    ``.../_internal/python-standalone/...`` (portable builds).  The interpreter
-    path therefore remains a durable, cross-platform pointer to the old app's
-    resource root.
-    """
+    Managed updates replace the server checkout but not the frozen launcher. Launchers predating
+    ``OUROBOROS_BUNDLE_DIR`` still start the updated server with ``.../Resources/python-standalone/...`` (macOS)
+    or ``.../_internal/python-standalone/...`` (portable builds). The interpreter path therefore remains a
+    durable, cross-platform pointer to the old app's resource root."""
     try:
         start = pathlib.Path(executable or sys.executable).resolve()
     except (OSError, ValueError):
@@ -1080,17 +1089,13 @@ def bundled_resource_ancestor_bases(executable: "str | pathlib.Path | None" = No
 def bundled_resource_bases() -> List[pathlib.Path]:
     """Roots to search for a resource shipped INSIDE the packaged bundle.
 
-    SSOT for every bundled-payload lookup, because the process that consumes a
-    bundled payload is usually NOT the frozen launcher. In a packaged install the
-    launcher runs the server/CLI as a SEPARATE child of the embedded interpreter,
-    out of the launcher-managed repo under the data dir: that child has no
-    ``sys._MEIPASS`` and its ``__file__`` parent is the managed repo, so both
-    historical bases miss and every bundled payload silently reads as absent.
-    The launcher therefore hands the bundle root down by value in
-    ``OUROBOROS_BUNDLE_DIR`` and it is searched FIRST. The other two bases stay
-    for the frozen process itself and for the dev/source layout (payloads sit at
-    the repo root, two levels up from this module).
-    """
+    SSOT for every bundled-payload lookup, because the process that consumes a bundled payload is usually NOT the
+    frozen launcher. In a packaged install the launcher runs the server/CLI as a SEPARATE child of the embedded
+    interpreter, out of the launcher-managed repo under the data dir: that child has no ``sys._MEIPASS`` and its
+    ``__file__`` parent is the managed repo, so both historical bases miss and every bundled payload silently
+    reads as absent. The launcher therefore hands the bundle root down by value in ``OUROBOROS_BUNDLE_DIR`` and it
+    is searched FIRST. The other two bases stay for the frozen process itself and for the dev/source layout
+    (payloads sit at the repo root, two levels up from this module)."""
     bases: List[pathlib.Path] = []
     env_base = str(os.environ.get(BUNDLE_DIR_ENV) or "").strip()
     if env_base:
@@ -1129,11 +1134,9 @@ def _resolve_bundled_payload(candidates_for: Callable[[pathlib.Path], List[pathl
 def resolve_bundled_node() -> Optional[str]:
     """Return the path to the bundled, signed Node.js runtime if present.
 
-    The packaged app ships an official notarized node under ``node-standalone``
-    (re-signed under the hardened runtime by the build's signing pass). Prefer it
-    over a PATH (e.g. Homebrew) node, which macOS code-signing enforcement can
-    SIGKILL when launched from the packaged process tree.
-    """
+    The packaged app ships an official notarized node under ``node-standalone`` (re-signed under the hardened
+    runtime by the build's signing pass). Prefer it over a PATH (e.g. Homebrew) node, which macOS code-signing
+    enforcement can SIGKILL when launched from the packaged process tree."""
     return _resolve_bundled_payload(embedded_node_candidates)
 
 
@@ -1351,11 +1354,9 @@ def subprocess_new_group_kwargs() -> dict:
 
 
 def install_shutdown_signal_handlers(handler) -> None:
-    """Register ``handler`` for the signals that ask a console process to shut
-    down: SIGINT everywhere, SIGTERM on POSIX. The platform-specific signal
-    surface lives HERE, never in callers (checklist 15). The handler must only
-    set a flag/event — real teardown belongs on the caller's main thread, not
-    inside a signal frame."""
+    """Register ``handler`` for the signals that ask a console process to shut down: SIGINT everywhere, SIGTERM on
+    POSIX. The platform-specific signal surface lives HERE, never in callers (checklist 15). The handler must only
+    set a flag/event — real teardown belongs on the caller's main thread, not inside a signal frame."""
     signal.signal(signal.SIGINT, handler)
     if not IS_WINDOWS:
         signal.signal(signal.SIGTERM, handler)

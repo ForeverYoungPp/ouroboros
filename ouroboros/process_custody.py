@@ -34,13 +34,15 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from ouroboros.platform_layer import (
-    kill_process_tree,
+    _proc_start_ticks,
     kill_process_group_id,
+    kill_process_tree,
     pid_is_alive,
     process_command,
     process_group_id,
     process_group_is_alive,
     process_start_time,
+    process_start_time_legacy,
     subprocess_new_group_kwargs,
 )
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -182,12 +184,47 @@ def spawn_supervised(
     return proc
 
 
+def _legacy_start_matches(pid: int, recorded: str, current: str) -> bool:
+    """Accept a start-time token written BEFORE /proc-first, so the upgrade orphans no ledger row.
+
+    ``process_start_time`` now returns a boot-qualified ``"<ticks>.<boot8>"``. A row written
+    before that change carries the ``ps -o lstart=`` spelling instead, or — on the rare path
+    where ``ps`` itself failed — a BARE boot-relative tick count. Both are accepted, and only
+    here: this runs solely AFTER the current token already failed to match, so the extra ``ps``
+    stays off the reaper's hot path and a genuinely different process still fails every form.
+    A bare-tick row resolves against /proc directly even when the current primary token is the
+    ``ps`` spelling (boot id unreadable), so no legacy row shape is orphaned on a /proc host.
+
+    BOUNDED EXPOSURE, stated rather than hidden: the bare-tick form carries no boot id, so such a
+    row can still collide across a reboot exactly as it always could (same ticks, recycled pid,
+    same command line). No post-change token is written in that form — a /proc mint is
+    boot-qualified, a ``ps`` string, or separator-carrying — so the PRE-CHANGE window closes as the
+    ledger turns over. What does NOT close by turnover is the separator form itself, minted only
+    when the boot id AND ``ps`` both fail: two of those from different boots string-match on the
+    equality check above, before this helper is ever consulted. That is why the separator form is
+    the last resort rather than the boot-id-less default.
+    """
+    ticks, sep, _ = current.partition(".")
+    if not (sep and ticks.isdigit()):
+        # The current token IS the legacy ``ps`` form (no /proc, or the boot id was
+        # unreadable so ``ps`` won the mint order). Re-running ``ps`` would return the
+        # byte-identical value that already failed to match — but a recorded BARE-TICK
+        # row is still resolvable against /proc directly (0 on hosts without /proc,
+        # which never equals a digit row), at zero subprocess cost.
+        return recorded.isdigit() and recorded == str(_proc_start_ticks(pid))
+    if recorded.isdigit() and recorded == ticks:
+        return True  # pre-change bare-tick fallback row; the tick half of today's token
+    return bool(recorded) and process_start_time_legacy(pid) == recorded
+
+
 def _fingerprint_matches(entry: Dict[str, Any]) -> bool:
     """STRICT identity: the live process must still BE the recorded one.
 
     pid alive + same start_time (when we have one) + same command hash (when
     we have one). A recycled pid fails this and is left alone. We never match
-    by command-line class.
+    by command-line class. The start-time comparison is DUAL-FORMAT on Linux:
+    the cheap current representation first, and the pre-upgrade spelling only
+    once that mismatched (see ``_legacy_start_matches``).
     """
     pid = int(entry.get("pid") or 0)
     if pid <= 0 or not pid_is_alive(pid):
@@ -196,7 +233,9 @@ def _fingerprint_matches(entry: Dict[str, Any]) -> bool:
     recorded_start = str(fp.get("start_time") or "")
     if recorded_start:
         live_start = process_start_time(pid)
-        if live_start and live_start != recorded_start:
+        if live_start and live_start != recorded_start and not _legacy_start_matches(
+            pid, recorded_start, live_start
+        ):
             return False
     recorded_cmd = str(fp.get("cmd_sha256") or "")
     if recorded_cmd:
