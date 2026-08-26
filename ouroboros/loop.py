@@ -2981,7 +2981,7 @@ def _last_assistant_text(messages: List[Dict[str, Any]]) -> str:
 
 
 def _task_deadline_epoch(tools: ToolRegistry) -> Optional[float]:
-    """Task deadline as epoch seconds, for deadline-bounded LLM retry backoff."""
+    """Task deadline as epoch seconds for retry backoff."""
     meta = getattr(tools._ctx, "task_metadata", {})
     if not isinstance(meta, dict):
         return None
@@ -3178,7 +3178,6 @@ def _owner_stop_window_elapsed(ctx: "_RoundLimitContext") -> bool:
     """Bind the durable owner-stop deadline and report whether it passed."""
     try:
         from ouroboros.cancel_intents import STOP_POLICY_FINALIZE, active_intent, stop_policy
-        from ouroboros.config import get_finalization_grace_sec
         from supervisor.owner_stop import owner_stop_deadline_ts
 
         root = getattr(ctx, "status_drive_root", None) or ctx.drive_root
@@ -3187,7 +3186,7 @@ def _owner_stop_window_elapsed(ctx: "_RoundLimitContext") -> bool:
         intent = active_intent(pathlib.Path(root), ctx.task_id)
         if not isinstance(intent, dict) or stop_policy(intent) != STOP_POLICY_FINALIZE:
             return False
-        deadline = owner_stop_deadline_ts(intent, float(get_finalization_grace_sec()))
+        deadline = owner_stop_deadline_ts(intent, float(task_pacing.get_finalization_grace_sec()))
         if deadline:
             ctx.deadline_ts = deadline
         return time.time() >= deadline if deadline else True
@@ -6205,6 +6204,7 @@ def _dispatch_round_model(
         ctx.task_type,
         use_local=ctx.active_use_local,
         deadline_ts=_task_deadline_epoch(ctx.tools),
+        transport_reserve_sec=task_pacing.get_finalization_grace_sec(),
         attempt_cap=attempt_cap,
         allow_server_web_search=_server_web_allowed_by_task(ctx.tools._ctx),
         physical_context=(

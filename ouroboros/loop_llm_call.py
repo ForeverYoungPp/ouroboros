@@ -395,7 +395,11 @@ def _deadline_not_dispatched(
     task_attempt: Any = None, execution_id: str = "", round_id: str = "",
     reserve_sec: Optional[float] = None,
 ) -> bool:
-    admission_reserve = get_finalization_grace_sec() if reserve_sec is None else reserve_sec
+    # ``None`` preserves the low-level helper's raw-deadline contract.  The
+    # production round dispatcher supplies the finalization reserve explicitly;
+    # direct callers such as retry diagnostics can still exercise a first
+    # admitted attempt and let the retry backoff gate stop the next one.
+    admission_reserve = 0.0 if reserve_sec is None else reserve_sec
     if not owner_deadline_exhausted(
         deadline_ts=deadline_ts, reserve_sec=admission_reserve,
     ):

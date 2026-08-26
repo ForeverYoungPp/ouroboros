@@ -121,7 +121,7 @@ def test_main_call_inside_finalization_reserve_does_not_dispatch(tmp_path, monke
     message, cost = call_llm_with_retry(
         NeverCalled(), [{"role": "user", "content": "x"}], "openai/gpt-5.5",
         None, "high", 1, tmp_path / "logs", "reserve-task", 1, None, usage,
-        deadline_ts=1005,
+        deadline_ts=1005, transport_reserve_sec=120,
     )
 
     assert message is None and cost is None
@@ -835,6 +835,7 @@ def test_main_round_call_propagates_task_attempt(monkeypatch, tmp_path):
     import ouroboros.loop as loop_mod
 
     captured = {}
+    monkeypatch.setattr(loop_mod.task_pacing, "get_finalization_grace_sec", lambda: 7)
 
     def fake_call(*args, **kwargs):
         captured.update(kwargs)
@@ -854,6 +855,7 @@ def test_main_round_call_propagates_task_attempt(monkeypatch, tmp_path):
     )
     loop_mod._dispatch_round_model(ctx, None, attempt_cap=1)
     assert captured["task_attempt"] == 7
+    assert captured["transport_reserve_sec"] == 7
 
 
 def test_forced_finalization_transport_uses_full_grace_deadline(monkeypatch, tmp_path):
