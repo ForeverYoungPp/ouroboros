@@ -22,7 +22,7 @@ from ouroboros.observability import new_execution_id
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context import build_user_content
-from ouroboros.context_budget import CONTEXT_OVERFLOW_CODES, ContextReclaimRequest
+from ouroboros.context_budget import ContextReclaimRequest
 from ouroboros.context_compaction import compact_tool_history_llm, context_reclaim_transcript_sha256
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.utils import estimate_tokens, sanitize_tool_result_for_log, truncate_review_artifact
@@ -44,18 +44,13 @@ from ouroboros.loop_tool_execution import (
     reclaim_negative_memo,
     reclaim_trace_refs,
 )
-from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event
+from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event, forced_response_is_incomplete
 from ouroboros.pricing import estimate_cost_optional
 
 # Backward-compat alias for source-inspecting/monkeypatched tests.
 _call_llm_with_retry = call_llm_with_retry
 
 log = logging.getLogger(__name__)
-
-_FORCED_INCOMPLETE_FINISH_REASONS = CONTEXT_OVERFLOW_CODES | {
-    "length", "max_tokens", "tool_calls", "function_call", "tool_use",
-}
-
 
 @dataclass
 class DeliveryCandidate:
@@ -3508,7 +3503,7 @@ def _handle_owner_stop_finalization(
 def _handle_provider_unavailable(
     ctx: _RoundLimitContext, *, error_kind: str = "provider_unavailable",
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Salvage a provider interruption, or a context overflow, truthfully."""
+    """Handle provider terminalization."""
     is_context_overflow = str(error_kind or "") == "context_overflow"
     llm_trace = getattr(ctx, "llm_trace", None)
     llm_trace = llm_trace if isinstance(llm_trace, dict) else {}
@@ -3532,12 +3527,6 @@ def _handle_provider_unavailable(
             "Any files written so far are preserved in the workspace."
         )
     if is_context_overflow:
-        # A context overflow is a provider-confirmed request-shape failure.
-        # Keep this rail local: a forced semantic call would resend the same
-        # oversized payload, spend another attempt, and blur overflow with an
-        # outage. The candidate/source custody still records useful work;
-        # the usage fields below preserve the infra failure for acceptance.
-        # The typed overflow fact remains terminally visible to acceptance and review.
         text, usage, llm_trace = _forced_fallback_result(
             ctx, llm_trace, fallback, "context_overflow",
             source="context_overflow_local_salvage",
@@ -3557,7 +3546,6 @@ def _handle_provider_unavailable(
         ctx, prompt=prompt, fallback_text=fallback, reason_code="provider_unavailable",
         provider_terminal=True,
     )
-    # `interrupted` is pre-requeue here; provider death is a failed terminal.
     if str(usage.get("reason_code") or "") == "provider_unavailable":
         usage["execution_status"] = RESULT_INFRA_FAILED
         usage.setdefault("terminal_origin", TERMINAL_ORIGIN_HOST_SALVAGE)
@@ -5109,9 +5097,7 @@ def _drain_forced_owner_directives(
     return True
 
 
-def _call_forced_model_once(
-    ctx: _RoundLimitContext,
-) -> Tuple[str, Dict[str, Any]]:
+def _call_forced_model_once(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any]]:
     response_meta: Dict[str, Any] = {}
     final_msg, _final_cost = call_llm_with_retry(
         ctx.llm,
@@ -5139,7 +5125,7 @@ def _publish_model_forced_candidate(
     full_text: str,
     reason_code: str,
 ) -> Optional[DeliveryCandidate]:
-    """Replace the retained answer and invalidate any verdict for the old SHA."""
+    """Replace the retained answer and old verdict."""
 
     tools = getattr(ctx, "tools", None)
     if tools is None:
@@ -5168,7 +5154,7 @@ def _publish_stale_forced_candidate(
     reason_code: str,
     suffix: str,
 ) -> Optional[DeliveryCandidate]:
-    """Preserve useful old text without pretending it absorbed newer evidence."""
+    """Preserve old text."""
 
     tools = getattr(ctx, "tools", None)
     if tools is None:
@@ -5223,7 +5209,7 @@ def _forced_fallback_result(
     retained_control: str = "",
     provider_terminal: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Return one exact candidate; reuse only current unchanged full text."""
+    """Return a current or fallback candidate."""
 
     router_result = _forced_swarm_router_result(ctx, llm_trace, reason_code)
     if router_result is not None:
@@ -5244,12 +5230,12 @@ def _forced_fallback_result(
         if provider_terminal:
             core = candidate.model_text or candidate.full_text
             if core != candidate.full_text:
-                candidate = _publish_model_forced_candidate(
-                    ctx, llm_trace, core, reason_code,
-                ) or candidate
+                candidate = _publish_model_forced_candidate(ctx, llm_trace, core, reason_code) or candidate
             composed = candidate.full_text
-            ctx.accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL
-            ctx.accumulated_usage["terminal_plan_review_open"] = bool(plan_suffix)
+            ctx.accumulated_usage.update(
+                terminal_origin=TERMINAL_ORIGIN_MODEL_FINAL,
+                terminal_plan_review_open=bool(plan_suffix),
+            )
         else:
             composed = sanitize_tool_result_for_log(
                 _compose_delivery_suffix(candidate.full_text, suffix)
@@ -5277,7 +5263,6 @@ def _forced_fallback_result(
             control=retained_control or f"forced_preserve:{reason_code}",
             reason_code=reason_code,
         )
-        # The preserved candidate is a previously model-produced complete answer.
         ctx.accumulated_usage["_best_effort_extracted"] = True
         _record_forced_finalization(
             ctx,
@@ -5545,15 +5530,7 @@ def _forced_final_answer(
             "new complete answer bound to every owner directive now present.",
         )
 
-    finish_reason = response_meta.get("finish_reason")
-    response_incomplete = bool(response_meta.get("tool_call_count")) or (
-        response_meta.get("finish_reason_present") is True
-        and (
-            finish_reason is None
-            or str(finish_reason).strip().lower() in _FORCED_INCOMPLETE_FINISH_REASONS
-        )
-    )
-    if provider_terminal and extracted and response_incomplete:
+    if provider_terminal and extracted and forced_response_is_incomplete(response_meta):
         return _forced_fallback_result(
             ctx, llm_trace, extracted, reason_code,
             source="forced_model_incomplete", provider_terminal=True,

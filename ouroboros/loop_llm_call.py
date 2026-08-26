@@ -382,6 +382,25 @@ from ouroboros.context_budget import (  # one overflow vocabulary for every seam
     context_overflow_message as _context_overflow_message,
     output_or_body_size_message as _output_or_body_size_message,
 )
+_FORCED_INCOMPLETE_FINISH_REASONS = _STRUCTURED_CONTEXT_OVERFLOW_CODES | frozenset({
+    "length", "max_tokens", "tool_calls", "function_call", "tool_use",
+})
+
+
+def forced_response_is_incomplete(response_meta: Optional[Dict[str, Any]]) -> bool:
+    """Return whether a forced provider response is not a complete final."""
+    if not isinstance(response_meta, dict):
+        return False
+    finish_reason = response_meta.get("finish_reason")
+    return bool(response_meta.get("tool_call_count")) or (
+        response_meta.get("finish_reason_present") is True
+        and (
+            finish_reason is None
+            or str(finish_reason).strip().lower() in _FORCED_INCOMPLETE_FINISH_REASONS
+        )
+    )
+
+
 _NON_RETRYABLE_PROVIDER_MARKERS = {
     "quota_exhausted": (
         "insufficient credits",
