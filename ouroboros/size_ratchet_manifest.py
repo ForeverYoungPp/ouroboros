@@ -171,6 +171,7 @@ BAND_PATHS = {
     "tests/test_evolution_redesign.py": None,
     "tests/test_external_workspace_access.py": "Deliverables custody matrix covers nested roots, executor aliases, Presence ceilings, and direct shell target semantics.",
     "tests/test_managed_review_subject.py": "Lane L-review contract suite: the managed resolution-delta subject (gate/advisory surfaces, M0 fallback), Q25-A admission, Q28-A yield outcomes and enforcement-honest advisory texts grew past 1000 across the adversarial fix round; one subject, one suite.",
+    "tests/test_nested_rights_depth.py": "Nested delegation depth authority regression coverage",
     "tests/test_observability_outcomes_v2.py": None,
     "tests/test_onboarding_complete_endpoint.py": None,
     "tests/test_onboarding_wizard.py": None,
