@@ -4249,10 +4249,8 @@ export function createChatInstance({
                     if (finished?.clientMessageId) {
                         pendingSubmissions.delete(finished.clientMessageId);
                     }
-                } else {
-                    // A bare (unkeyed) final cannot be scoped: clear the set
-                    // but NEVER ledger — no proof any specific turn ended; a
-                    // live turn stays restorable by typing frame or snapshot.
+                } else if (msg.system_type !== 'terminal_incident') {
+                    // Unkeyed finals clear unscoped state; incidents are informational.
                     activeDirectActivities.clear();
                     pendingSubmissions.clear();
                 }

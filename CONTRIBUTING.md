@@ -27,6 +27,7 @@ editing:
   rationale for non-obvious decisions.
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — engineering, testing, and
   review conventions.
+- [`docs/DESIGN.md`](docs/DESIGN.md) — visual and interaction semantics.
 - [`docs/CHECKLISTS.md`](docs/CHECKLISTS.md) — the review checklist single
   source of truth.
 
@@ -35,8 +36,8 @@ invent a parallel mechanism when the repository already has one. A useful
 first instruction for a coding agent is:
 
 > Read CONTRIBUTING.md, BIBLE.md, docs/ARCHITECTURE.md,
-> docs/DEVELOPMENT.md, and docs/CHECKLISTS.md in full before editing. Follow
-> their current architecture and keep the requested change focused.
+> docs/DEVELOPMENT.md, docs/DESIGN.md, and docs/CHECKLISTS.md in full before
+> editing. Follow their current architecture and keep the requested change focused.
 
 These documents may themselves be improved, but constitutional changes must
 follow the semantic change process in `BIBLE.md`, and behavior, tests, and
@@ -131,7 +132,8 @@ instruction:
 Review the final pull request diff from <base SHA> to <head SHA>. Do not edit.
 
 Read CONTRIBUTING.md. For a substantive change, read BIBLE.md,
-docs/ARCHITECTURE.md, docs/DEVELOPMENT.md, and docs/CHECKLISTS.md in full.
+docs/ARCHITECTURE.md, docs/DEVELOPMENT.md, docs/DESIGN.md, and
+docs/CHECKLISTS.md in full.
 Inspect the complete diff, touched files, relevant callers, tests, and docs.
 
 Return findings first with severity and exact file/line references, then checks

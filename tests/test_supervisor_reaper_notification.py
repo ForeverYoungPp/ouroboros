@@ -204,6 +204,42 @@ def test_subagent_provider_death_never_pings_the_owner(sent_and_ctx):
     assert [text for _cid, text in sent if "Subagent kidE failed" in text]
 
 
+def test_provider_incident_is_system_unkeyed_and_host_salvage_suppresses_duplicate(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(events_mod, "_PROVIDER_DEATH_NOTIFIED", set())
+    sent = []
+    ctx = types.SimpleNamespace(
+        send_with_budget=lambda cid, text, **kwargs: sent.append((cid, text, kwargs)),
+    )
+    event = _provider_death_event("root-origin")
+
+    events_mod._maybe_notify_provider_death(
+        ctx, "root-origin", {"chat_id": 7},
+        {"terminal_origin": "host_salvage"}, event,
+    )
+    assert sent == []
+
+    events_mod._maybe_notify_provider_death(
+        ctx, "root-origin", {"chat_id": 7},
+        {
+            "terminal_origin": "model_final",
+            "terminal_plan_review_open": True,
+        }, event,
+    )
+    assert len(sent) == 1
+    _chat, text, kwargs = sent[0]
+    assert text == (
+        "🔌 Task root-origin was stopped by a model-provider outage and was "
+        "NOT completed. Partial work and workspace files are preserved; "
+        "re-run the task once the provider recovers.\n\n"
+        "Plan review was still open when the outage forced finalization; "
+        "its details remain in the task."
+    )
+    assert kwargs == {"role": "system", "system_type": "terminal_incident"}
+    assert "task_id" not in kwargs
+
+
 def test_settled_dispatch_cleans_mailbox_only_after_durable_terminal(
     sent_and_ctx, tmp_path, monkeypatch,
 ):

@@ -11,7 +11,17 @@ import subprocess
 import time
 from typing import Any, Dict, Tuple
 
-from ouroboros.utils import atomic_write_json, utc_now_iso, read_text, append_jsonl, read_json_dict, update_json_locked
+from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_SALVAGE
+from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
+from ouroboros.utils import (
+    append_jsonl,
+    atomic_write_json,
+    read_json_dict,
+    read_text,
+    truncate_within_limit,
+    update_json_locked,
+    utc_now_iso,
+)
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +50,11 @@ _TASK_RESULT_PROCESS_EVIDENCE_FIELDS = frozenset({
     "request_wire",
     "request_wire_history",
 })
+
+# Automatic continuation gets at most one ordinary tool-result-sized slice of
+# unreviewed host salvage. The full canonical result remains available through
+# the named get_task_result(include_authority=True) source below.
+_AUTOMATIC_HOST_SALVAGE_RESULT_CHARS = DEFAULT_TOOL_RESULT_LIMIT
 
 
 def _authority_verification_receipts(
@@ -103,6 +118,45 @@ def valid_task_result_authority_source(source: Any, task_id: Any) -> bool:
         and str(arguments.get("task_id") or "") == selected_id
         and arguments.get("include_authority") is True
     )
+
+
+def _automatic_predecessor_authority_projection(
+    row: Dict[str, Any], source: Dict[str, Any], *, drive_root: Any,
+) -> Dict[str, Any]:
+    """Bound only unreviewed host salvage injected automatically at startup."""
+
+    authority = task_result_authority_projection(row, drive_root=drive_root)
+    if str(row.get("terminal_origin") or "") != TERMINAL_ORIGIN_HOST_SALVAGE:
+        return authority
+    full_result = authority.get("result")
+    if not isinstance(full_result, str):
+        return authority
+
+    full_chars = len(full_result)
+    if full_chars <= _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS:
+        carried_chars = full_chars
+    else:
+        omission_note = (
+            "\n⚠️ OMISSION NOTE: truncated at "
+            f"{_AUTOMATIC_HOST_SALVAGE_RESULT_CHARS} chars; original length {full_chars}"
+        )
+        carried_chars = max(
+            0, _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS - len(omission_note),
+        )
+    authority["result"] = {
+        "kind": "unreviewed_host_salvage",
+        "preview": truncate_within_limit(
+            full_result, limit=_AUTOMATIC_HOST_SALVAGE_RESULT_CHARS,
+        ),
+        "carried_chars": carried_chars,
+        "omitted_chars": full_chars - carried_chars,
+        "full_chars": full_chars,
+        "source_ref": {
+            **copy.deepcopy(source),
+            "field": "authority.result",
+        },
+    }
+    return authority
 
 
 def validate_task_authority_sources(env: Any, task: Dict[str, Any]) -> Dict[str, Any]:
@@ -177,7 +231,9 @@ def validate_task_authority_sources(env: Any, task: Dict[str, Any]) -> Dict[str,
             return _unavailable(predecessor, "named predecessor task result is missing or unreadable")
         task["predecessor_authority"] = {
             "source": dict(predecessor),
-            **task_result_authority_projection(predecessor_row, drive_root=root),
+            **_automatic_predecessor_authority_projection(
+                predecessor_row, predecessor, drive_root=root,
+            ),
         }
     else:
         metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}

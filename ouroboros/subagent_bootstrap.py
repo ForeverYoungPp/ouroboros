@@ -365,8 +365,16 @@ def actor_first_terminal_projection(
     llm_trace: Mapping[str, Any], drive_root: Any,
 ) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any]]:
     """Attach the unresolved actor fact to the existing terminal projections."""
+    # ``emit_task_results`` and the terminal-delivery projection share these
+    # mappings with the caller.  Keep that identity for ordinary dict inputs so
+    # fields added during finalization (for example the preserved host-salvage
+    # path) remain visible to the durable-result path as well as the live event.
+    # Non-dict mappings still receive the defensive copy promised by this
+    # boundary.
+    usage_out = usage if isinstance(usage, dict) else dict(usage or {})
+    trace_out = llm_trace if isinstance(llm_trace, dict) else dict(llm_trace or {})
     if ctx is None:
-        return None, dict(usage or {}), dict(llm_trace or {})
+        return None, usage_out, trace_out
     bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
     if isinstance(bootstrap, dict) and bool(bootstrap.get("zero_run_receipt_recorded")):
         decision = str(bootstrap.get("zero_run_decision") or "unknown").strip().lower()
@@ -380,7 +388,7 @@ def actor_first_terminal_projection(
                 "route_available": bootstrap.get("route_available"),
             }
         else:
-            return None, dict(usage or {}), dict(llm_trace or {})
+            return None, usage_out, trace_out
     else:
         fact = None
     try:
@@ -390,19 +398,17 @@ def actor_first_terminal_projection(
             )
     except Exception:
         if not isinstance(bootstrap, dict):
-            return None, dict(usage or {}), dict(llm_trace or {})
+            return None, usage_out, trace_out
         fact = {
             "status": "unknown",
             "reason": "actor_terminal_projection_unavailable",
             "route_available": bootstrap.get("route_available"),
         }
     if not fact:
-        return None, dict(usage or {}), dict(llm_trace or {})
-    updated_usage = dict(usage or {})
-    updated_usage["actor_first_terminal"] = dict(fact)
-    updated_trace = dict(llm_trace or {})
-    updated_trace["actor_first_terminal"] = dict(fact)
-    return fact, updated_usage, updated_trace
+        return None, usage_out, trace_out
+    usage_out["actor_first_terminal"] = dict(fact)
+    trace_out["actor_first_terminal"] = dict(fact)
+    return fact, usage_out, trace_out
 
 
 def _prepare_actor_first_bootstrap(

@@ -1325,6 +1325,7 @@ def test_pending_outbox_gives_up_loudly_instead_of_retrying_forever(tmp_path, mo
     assert notice[0] == 9
     assert "could not be delivered" in notice[1]
     assert str(preserved) in notice[1]
+    assert notice[2] == {"role": "system", "system_type": "terminal_incident"}
 
 
 def test_pending_outbox_spaces_replays_with_backoff(tmp_path):
