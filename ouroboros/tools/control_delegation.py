@@ -178,6 +178,12 @@ def admitted_depth_cap(parent_contract: Any, live_max_depth: Any) -> int:
         else parent_contract
     )
     budget = budget if isinstance(budget, dict) else {}
+    try:
+        live_cap = max(0, int(live_max_depth))
+    except (TypeError, ValueError):
+        live_cap = 0
+    if live_cap == 0:
+        return 0
     provenance = normalize_depth_provenance(budget.get("depth_provenance"))
     permitted = provenance.get("permitted_depth")
     if permitted is not None:
@@ -188,10 +194,7 @@ def admitted_depth_cap(parent_contract: Any, live_max_depth: Any) -> int:
             # Preserve the legacy live-limit behavior until a typed contract
             # can supply a valid persisted cap.
             pass
-    try:
-        return max(0, int(live_max_depth))
-    except (TypeError, ValueError):
-        return 0
+    return live_cap
 
 
 def depth_provenance_for_schedule(

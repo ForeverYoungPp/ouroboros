@@ -179,7 +179,14 @@ def test_admitted_depth_cap_ignores_later_settings_decrease_but_not_fresh_roots(
     })
     assert admitted_depth_cap(contract, 1) == 3
     assert admitted_depth_cap(contract, 7) == 3
+    assert admitted_depth_cap(contract, 0) == 0
     assert admitted_depth_cap({}, 1) == 1
+    zero_contract = build_task_contract({
+        "delegation_budget": {
+            "depth_provenance": {"permitted_depth": 0},
+        },
+    })
+    assert admitted_depth_cap(zero_contract, 7) == 0
 
 
 def test_persisted_depth_cap_survives_live_decrease_when_narrowing_child_budget():
@@ -258,6 +265,51 @@ def test_schedule_path_preserves_admitted_cap_after_live_depth_decrease(tmp_path
     assert child_budget["depth_provenance"]["permitted_depth"] == 3
 
 
+def test_schedule_path_honors_global_zero_depth_switch_for_admitted_lineage(
+    tmp_path, monkeypatch,
+):
+    from ouroboros.tools.control import _schedule_task
+    from ouroboros.tools.registry import ToolContext
+    from tests._shared import configure_test_subagent
+
+    subagent_id = configure_test_subagent(monkeypatch)
+    monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "0")
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    contract = build_task_contract({
+        "delegation_budget": {
+            "depth_remaining": 2,
+            "depth_provenance": {
+                "requested_depth": 3,
+                "permitted_depth": 3,
+                "attempted_depth": 1,
+                "achieved_depth": 1,
+            },
+        },
+    })
+    ctx = ToolContext(
+        repo_dir=repo,
+        drive_root=data,
+        task_id="parent",
+        task_depth=1,
+        task_contract=contract,
+        task_metadata={"task_contract": contract, "budget_drive_root": str(data)},
+    )
+
+    result = _schedule_task(
+        ctx,
+        subagent_id=subagent_id,
+        objective="Attempt continuation while delegation is globally disabled",
+        expected_output="child id",
+        memory_mode="empty",
+    )
+
+    assert "depth limit (0) exceeded" in result
+    assert not ctx.pending_events
+
+
 def test_supervisor_schedule_path_preserves_admitted_cap_after_live_depth_decrease(
     tmp_path, monkeypatch,
 ):
@@ -284,6 +336,13 @@ def test_supervisor_schedule_path_preserves_admitted_cap_after_live_depth_decrea
     assert [task["id"] for task in enqueued] == ["child"]
     queued = json.loads((tmp_path / "task_results" / "child.json").read_text())
     assert queued["depth_provenance"]["permitted_depth"] == 3
+
+    monkeypatch.setattr(events, "get_max_subagent_depth", lambda: 0)
+    event["task_id"] = "child-zero"
+    events._handle_schedule_task(event, _fake_ctx(tmp_path, enqueued))
+    rejected = json.loads((tmp_path / "task_results" / "child-zero.json").read_text())
+    assert rejected["status"] == "failed"
+    assert "depth limit (0)" in rejected["result"]
 
 
 def test_assignment_preserves_admitted_depth_authority_and_only_adds_achievement():
