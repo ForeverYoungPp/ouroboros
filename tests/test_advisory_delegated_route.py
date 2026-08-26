@@ -10,6 +10,7 @@ agent-session route tests stands in for the Claudexor control plane.
 """
 
 import json
+import pathlib
 import subprocess
 
 import pytest
@@ -93,6 +94,29 @@ def test_delegated_route_runs_without_the_key(tmp_path, monkeypatch, fake_route)
     start = fake_route.instances[0].start_requests[0]
     assert start["authPreference"] == "subscription"
     assert start["access"] == "readonly"
+
+
+def test_delegated_advisory_passes_expired_owner_deadline_before_dispatch(
+    tmp_path, monkeypatch, fake_route,
+):
+    """The advisory consumer must pass its task deadline into the shared runner.
+
+    An expired deadline is a host-side admission refusal, so the paid Claudexor
+    start must never be posted.  This exercises the real advisory caller rather
+    than only testing ``SessionInvocation`` in isolation.
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "agent_session")
+    ctx = _ctx(tmp_path)
+    ctx.task_metadata = {"deadline_at": "2000-01-01T00:00:00Z"}
+
+    result, _model = advisory._run_advisory_delegated(
+        "review", pathlib.Path(ctx.repo_dir), ctx,
+    )
+
+    assert result.success is False
+    assert "owner deadline leaves no dispatch window" in result.error
+    assert not any(instance.start_requests for instance in fake_route.instances)
 
 
 def test_structured_session_without_effort_preserves_the_route_default(

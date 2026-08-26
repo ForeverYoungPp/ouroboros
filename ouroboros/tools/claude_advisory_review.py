@@ -786,6 +786,9 @@ def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContex
                 surface="advisory_review",
                 slot_id="advisory_slot_1",
                 timeout_sec=_ADVISORY_SESSION_MAX_SECONDS,
+                owner_deadline_at=str(
+                    (getattr(ctx, "task_metadata", {}) or {}).get("deadline_at") or ""
+                ),
                 # The owner's configured advisory slot route (6.1 SSOT) rides the
                 # invocation — the one identity+delivery value — not a parallel kwarg.
                 session_route=_session_route,
