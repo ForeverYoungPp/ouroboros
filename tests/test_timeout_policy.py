@@ -84,7 +84,19 @@ def test_main_llm_transport_preserves_anthropic_default_but_narrows_deadline(mon
     monkeypatch.setattr(deadlines.time, "time", lambda: 1000.0)
     monkeypatch.setattr("ouroboros.loop_llm_call.get_finalization_grace_sec", lambda: 3)
     assert _main_transport_timeout("anthropic::claude-fable-5", None) == 120
-    assert _main_transport_timeout("anthropic::claude-fable-5", 1010.0) == 7.0
+    assert _main_transport_timeout("anthropic::claude-fable-5", 1010.0) == 10.0
+    assert _main_transport_timeout(
+        "anthropic::claude-fable-5", 1010.0, reserve_sec=3,
+    ) == 7.0
+
+
+def test_low_level_main_transport_admission_and_timeout_share_raw_default(monkeypatch):
+    import ouroboros.deadline_utils as deadlines
+    from ouroboros.loop_llm_call import _main_transport_timeout
+
+    monkeypatch.setattr(deadlines.time, "time", lambda: 1000.0)
+    monkeypatch.setattr("ouroboros.loop_llm_call.get_finalization_grace_sec", lambda: 120)
+    assert _main_transport_timeout("openai/gpt-5.5", 1005.0) == 5.0
 
 
 def test_spent_main_deadline_does_not_dispatch_or_fallback(tmp_path):

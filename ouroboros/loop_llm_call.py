@@ -59,12 +59,13 @@ def _main_transport_timeout(
     # owner deadline. Other routes use the shared dead-socket bound; local models
     # receive the same explicit bound their client already supports.
     explicit = 120 if provider_for_model(model) == "anthropic" else None
+    # ``None`` is the low-level raw-deadline contract.  The production round
+    # dispatcher passes the finalization reserve explicitly; keeping this
+    # default raw prevents admission from accepting a call and then shrinking
+    # its transport to the 0.001-second floor unexpectedly.
     return transport_timeout_with_deadline(
-        explicit,
-        deadline_ts=deadline_ts,
-        reserve_sec=(
-            get_finalization_grace_sec() if reserve_sec is None else reserve_sec
-        ),
+        explicit, deadline_ts=deadline_ts,
+        reserve_sec=0.0 if reserve_sec is None else reserve_sec,
     )
 
 # Retrieval transparency (v6.78.0, owner Q20/Q22): native provider web search happens

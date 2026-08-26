@@ -1990,7 +1990,10 @@ apply. A dead socket or unterminated stream after dispatch is instead
 not infer pre-dispatch provenance from Python's implicit `__context__`, because a
 fallback raised inside a prior provider handler can inherit that earlier attempt;
 only an explicit `__cause__` or typed transport metadata can release a row. A
-spent owner window yields a typed `$0
+low-level main-call helper with no explicit reserve uses the raw owner deadline;
+the normal round dispatcher passes the finalization reserve explicitly, keeping
+dispatch admission and the transport bound on the same window. A spent owner
+window yields a typed `$0
 not_dispatched` row before fan-out; under blocking enforcement an in-flight
 triad row remains pending instead of becoming a final quorum verdict. A
 reviewed commit has no independent outer tool cutoff: the foreground caller

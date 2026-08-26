@@ -35,6 +35,7 @@ from ouroboros.request_wire_recovery import (
 )
 from ouroboros.usage_accounting import (
     AttemptRequest,
+    PhysicalAttemptCapture,
     PhysicalAttemptPreconditionFailed,
     PhysicalAttemptPreparationFailed,
     UsageAccountingError,
@@ -46,7 +47,6 @@ from ouroboros.usage_accounting import (
     execute_physical_attempt,
     execute_physical_attempt_async,
     last_physical_attempt_capture,
-    physical_attempt_capture_from_exception,
     usage_scope,
 )
 from ouroboros.utils import in_worker_process, sanitize_tool_result_for_log
@@ -2516,8 +2516,14 @@ class LLMClient:
                 if (_is_structured_context_overflow_exception(exc)
                         or context_overflow_message(err)):
                     raise LocalContextTooLargeError(err) from exc
-                capture = physical_attempt_capture_from_exception(exc)
-                if capture is not None and capture.state in {"dispatched", "unresolved"}:
+                # Only an exception-owned capture can prove that THIS local
+                # attempt reached the provider.  The process-local "last"
+                # capture may belong to an unrelated earlier operation (or a
+                # compatibility executor that never entered custody), and
+                # must not turn an ordinary retryable error into a no-resend
+                # tombstone.
+                capture = getattr(exc, "physical_attempt_capture", None)
+                if isinstance(capture, PhysicalAttemptCapture) and capture.state in {"dispatched", "unresolved"}:
                     raise  # Outer custody owns an unknown physical outcome.
                 if attempt == 2:
                     log.warning("Local model request failed: %s", exc)
