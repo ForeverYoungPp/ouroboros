@@ -4923,6 +4923,8 @@ def _no_tool_final_answer(
         if provisional_assistant is not None and messages[-1] is provisional_assistant:
             messages.pop()
         if post_controls.get("finalize_now"):
+            if post_controls.get("finalize_deadline_ts") is not None:
+                limit_ctx.deadline_ts = float(post_controls["finalize_deadline_ts"])
             text, usage, forced_trace = _handle_forced_finalization(
                 limit_ctx, str(post_controls.get("finalize_now") or "deadline"),
             )

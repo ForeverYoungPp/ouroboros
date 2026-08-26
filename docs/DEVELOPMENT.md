@@ -1745,8 +1745,7 @@ Before every commit, verify the following:
   transport bound as a settlement fallback because that request ends there;
   a delegated agent session instead inherits the existing task absolute ceiling
   because the paid engine run can outlive an HTTP read. The owner deadline always
-  narrows either route. A
-  caller/task deadline always narrows nested waits, and Anthropic (120s) plus
+  narrows either route. A caller/task deadline always narrows nested waits, and Anthropic (120s) plus
   VLM captioning (90s) retain their separate provider transport defaults as
   ceilings, not promises to run past the owner deadline. Delegated review uses
   an opt-in strict poll bound for the remaining logical window; the general

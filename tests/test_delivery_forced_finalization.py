@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import queue
+import threading
+import time
 from types import SimpleNamespace
 
 from tests._delivery_candidate_shared import (
@@ -125,6 +127,57 @@ def test_round_limit_projects_deferred_child_before_forced_return(tmp_path, monk
     _assert_forced_deferred_outcome(
         text, usage, returned_trace, "round_limit",
     )
+
+
+def test_post_round_finalize_control_binds_its_grace_deadline(tmp_path, monkeypatch):
+    """A finalize control drained after an answer uses the mailbox grace deadline.
+
+    The post-round drain reaches the same forced rail as the early-round path;
+    it must not fall back to the task's raw transport deadline.
+    """
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    registry._ctx.owner_message_admission_lock = threading.RLock()
+    registry._ctx.owner_message_admission_agent = SimpleNamespace(
+        _accepting_owner_messages=False,
+        _busy=True,
+        _current_task_id="parent1",
+    )
+    grace_deadline = time.time() + 42.0
+    monkeypatch.setattr(loop, "_resolve_delivery_control", lambda content, *_args: ("fresh", content))
+    monkeypatch.setattr(loop, "_enforce_swarm_actions", lambda *_args: False)
+    monkeypatch.setattr(loop, "_compute_subagent_handoff", lambda *_args: None)
+    monkeypatch.setattr(loop, "_maybe_enforce_child_absorption_gate", lambda *_args: None)
+    monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_args: False)
+    monkeypatch.setattr(loop, "_finalize_task_services", lambda *_args: False)
+    monkeypatch.setattr(loop, "_run_task_acceptance_review_once", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        loop,
+        "_drain_incoming_messages",
+        lambda *_args, **_kwargs: {
+            "finalize_now": "deadline",
+            "finalize_deadline_ts": grace_deadline,
+        },
+    )
+    observed = {}
+
+    def _capture_forced(ctx, reason):
+        observed["deadline_ts"] = ctx.deadline_ts
+        observed["reason"] = reason
+        return "forced", {}, {}
+
+    monkeypatch.setattr(loop, "_handle_forced_finalization", _capture_forced)
+    result = loop._no_tool_final_answer(
+        "answer",
+        limit_ctx,
+        trace,
+        registry,
+        queue.Queue(),
+        set(),
+        lambda _msg: None,
+    )
+
+    assert result[:2] == ("forced", {})
+    assert observed == {"deadline_ts": grace_deadline, "reason": "deadline"}
 
 
 def test_budget_exhaustion_projects_deferred_child_before_forced_return(
