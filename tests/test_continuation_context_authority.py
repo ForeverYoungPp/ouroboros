@@ -270,6 +270,36 @@ def test_response_body_output_limit_keeps_output_size_precedence():
     assert result.kind == "request_too_large"
 
 
+def test_symbolic_rate_code_stays_retryable_even_with_http_400():
+    from ouroboros.loop_llm_call import classify_llm_exception
+
+    class ProviderError(Exception):
+        status_code = 400
+        code = "400"
+        body = {"error": {"code": "rate_limit_exceeded", "message": "Bad Request"}}
+
+    result = classify_llm_exception(ProviderError("bad request"), "bad request")
+    assert result.kind == "provider_transient"
+    assert result.retry_same_request is True
+    assert result.provider_code == "rate_limit_exceeded"
+
+
+def test_exception_overflow_text_survives_a_generic_response_body():
+    from ouroboros.loop_llm_call import classify_llm_exception
+
+    class ProviderError(Exception):
+        status_code = 400
+        code = "400"
+        body = {"error": {"code": "400", "message": "Bad Request"}}
+
+    result = classify_llm_exception(
+        ProviderError("maximum context length exceeded"),
+        "maximum context length exceeded",
+    )
+    assert result.kind == "context_overflow"
+    assert result.retry_same_request is False
+
+
 def test_router_selector_is_explicit_and_schema_requires_it(tmp_path):
     from ouroboros.tools.control import _promote_chat_to_task, _route_to_project, get_tools
 

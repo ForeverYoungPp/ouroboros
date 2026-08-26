@@ -822,6 +822,7 @@ def _attach_predecessor_authority_from_metadata(
     from ouroboros.agent_startup_checks import valid_task_result_authority_source
 
     if valid_task_result_authority_source(source, selected_id):
+        evt["predecessor_task_id"] = selected_id
         evt["predecessor_authority_source"] = dict(source)
     else:
         return "the selected predecessor has no readable authority source"
@@ -1169,6 +1170,12 @@ def _route_to_project(
         else {}
     )
     client_message_id = str(metadata.get("client_message_id") or "").strip()
+    predecessor_event: Dict[str, Any] = {}
+    predecessor_error = _attach_predecessor_authority_from_metadata(
+        ctx, predecessor_event, predecessor_task_id,
+    )
+    if predecessor_error:
+        return "⚠️ AUTHORITY_SOURCE_UNAVAILABLE (route_to_project): " + predecessor_error
     requested_pid = str(project_id or "").strip()
     pid = sanitize_project_id(requested_pid) if requested_pid and explicit_project_id_ok(requested_pid) else ""
     proj = get_project(Path(ctx.drive_root), pid) if pid else None
@@ -1186,7 +1193,7 @@ def _route_to_project(
             else "target_not_found"
         )
         routing_token = uuid.uuid4().hex
-        mode, receipt = _emit_and_wait_for_routing(ctx, {
+        manual_event: Dict[str, Any] = {
             "type": "routing_manual_target",
             "routing_token": routing_token,
             "chat_id": current_chat_id,
@@ -1195,7 +1202,9 @@ def _route_to_project(
             "reason": str(reason or "").strip() or failure,
             "options": options,
             "ts": utc_now_iso(),
-        })
+        }
+        manual_event.update(predecessor_event)
+        mode, receipt = _emit_and_wait_for_routing(ctx, manual_event)
         if str(receipt.get("status") or "") == "needs_manual_target":
             durable_options = (
                 receipt.get("options") if isinstance(receipt.get("options"), list) else options
@@ -1228,11 +1237,7 @@ def _route_to_project(
         "ts": utc_now_iso(),
     }
     _attach_origin_from_metadata(ctx, evt)
-    predecessor_error = _attach_predecessor_authority_from_metadata(
-        ctx, evt, predecessor_task_id,
-    )
-    if predecessor_error:
-        return "⚠️ AUTHORITY_SOURCE_UNAVAILABLE (route_to_project): " + predecessor_error
+    evt.update(predecessor_event)
     _attach_swarm_intent(ctx, evt)
     _attach_client_surface(ctx, evt)
     mode, receipt = _emit_and_wait_for_routing(ctx, evt)

@@ -79,6 +79,7 @@ def test_main_route_to_existing_project_explicitly_selects_predecessor_or_stays_
     )
 
     assert out.startswith("⚠️ ROUTE_UNCONFIRMED")
+    assert events[0]["predecessor_task_id"] == "racer-old"
     assert events[0]["predecessor_authority_source"] == preview["authority_source"]
 
     fresh_events = []
@@ -154,6 +155,48 @@ def test_route_to_missing_project_emits_typed_manual_target(tmp_path):
     assert events[0]["reason"] == "target_not_found"
     assert events[0]["options"] == [{"task_id": "task-1", "title": "Fix it"}]
     assert ctx._typed_routing_action_emitted == "routing_manual_target"
+
+
+def test_manual_target_preserves_valid_predecessor_and_rejects_unreadable_one(tmp_path):
+    import server
+
+    predecessor = {
+        "task_id": "previous", "status": "completed", "project_id": "racer",
+        "title": "Previous result", "objective": "Build the previous result",
+        "task_contract": {"objective": "Build the previous result"},
+    }
+    result_dir = tmp_path / "task_results"
+    result_dir.mkdir()
+    (result_dir / "previous.json").write_text(json.dumps(predecessor), encoding="utf-8")
+    preview = server._task_result_ground_truth(predecessor)
+    events = []
+    metadata = {"main_routing_manifest": {"final_results": [preview]}}
+
+    out = _route_to_project(
+        _ctx(tmp_path, events, task_metadata=metadata),
+        "missing-project", "continue it", predecessor_task_id="previous",
+    )
+
+    assert "ROUTING_UNCONFIRMED" in out
+    assert events[0]["type"] == "routing_manual_target"
+    assert events[0]["predecessor_task_id"] == "previous"
+    assert events[0]["predecessor_authority_source"] == preview["authority_source"]
+
+    unreadable_source = {
+        "kind": "task_result", "task_id": "gone", "tool": "get_task_result",
+        "arguments": {"task_id": "gone", "include_authority": True},
+    }
+    unreadable_metadata = {"main_routing_manifest": {"final_results": [{
+        "task_id": "gone", "authority_source": unreadable_source,
+    }]}}
+    rejected_events = []
+    rejected = _route_to_project(
+        _ctx(tmp_path, rejected_events, task_metadata=unreadable_metadata),
+        "missing-project", "continue it", predecessor_task_id="gone",
+    )
+    assert "AUTHORITY_SOURCE_UNAVAILABLE" in rejected
+    assert "missing or unreadable" in rejected
+    assert rejected_events == []
 
 
 def test_route_rejects_dirty_project_id(tmp_path):

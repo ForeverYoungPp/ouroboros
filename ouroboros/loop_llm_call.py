@@ -440,6 +440,7 @@ _RATE_LIMIT_TEXT_MARKERS = (
     "tpm",
     "rpm",
 )
+_RETRYABLE_PROVIDER_CODES = frozenset({"rate_limit_exceeded"})
 
 
 def _is_rate_limit_text(text: str) -> bool:
@@ -454,10 +455,13 @@ def _is_context_overflow_error(exc: Exception, safe_error: str) -> bool:
     Main, the local transport, and the summarizer classify identically."""
     if isinstance(exc, LocalContextTooLargeError):
         return True
-    provider_text = _exception_provider_message(exc, safe_error)
-    if _is_rate_limit_text(provider_text or safe_error):
+    provider_text = _exception_provider_message(exc, "")
+    classification_text = "\n".join(
+        value for value in (safe_error, provider_text) if str(value or "").strip()
+    )
+    if _is_rate_limit_text(classification_text):
         return False
-    return _context_overflow_message(provider_text or safe_error)
+    return _context_overflow_message(classification_text)
 
 
 def _is_output_or_body_size_error(safe_error: str) -> bool:
@@ -588,13 +592,15 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
     provider_kind = _provider_code_kind(provider_code)
     if provider_kind:
         return LlmErrorClassification(provider_kind, False, status_code, provider_code)
+    if provider_code.lower() in _RETRYABLE_PROVIDER_CODES:
+        return LlmErrorClassification("provider_transient", True, status_code, provider_code)
     if status_code == 429:
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
     if _is_rate_limit_text(low):
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
     if _is_output_or_body_size_error(low):
         return LlmErrorClassification("request_too_large", False, status_code, provider_code)
-    if _is_context_overflow_error(exc, provider_message or safe):
+    if _is_context_overflow_error(exc, classification_text):
         return LlmErrorClassification("context_overflow", False, status_code, provider_code)
     for kind, markers in _NON_RETRYABLE_PROVIDER_MARKERS.items():
         if any(marker in low for marker in markers):
