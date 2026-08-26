@@ -516,6 +516,31 @@ def reap_orphaned_processes(
         pid = int(entry.get("pid") or 0)
         scope = str(entry.get("scope") or "task")
         same_session = str(entry.get("session_id") or "") == _SESSION_ID
+        # CHEAP PATH for the current generation's own session processes. The branch
+        # further down keeps every same-session session entry regardless of what the
+        # fingerprint said (``task_owner_gone`` is task-scope-only), so for a LIVE pid
+        # the cheap path only ever KEEPS: an alive-but-RECYCLED same-session pid is
+        # retained one generation (foreign next generation -> full fingerprint ->
+        # prune), never killed. The skipped fingerprint only cost a `ps` per row on
+        # every 600s tick and startup sweep. This is the hot majority of the ledger:
+        # worker-pool members, the SyncManager, the claudexor daemon, the local-model
+        # server and keep-services are all scope="session".
+        #
+        # A DEAD pid deliberately FALLS THROUGH instead of pruning here: a session
+        # service whose leader died while its process group is still alive is preserved
+        # today by ``_service_group_survives_leader``, and a prune-on-dead shortcut would
+        # throw that evidence away. Companions are excluded so the daemon-scope companion
+        # rules below stay the only authority on them even for a malformed session-scope
+        # row. This path only ever KEEPS — it can never authorize a kill.
+        if (
+            scope == "session"
+            and same_session
+            and pid > 0
+            and not str(entry.get("purpose") or "").startswith("companion:")
+            and pid_is_alive(pid)
+        ):
+            survivors.append(entry)
+            continue
         leader_matches = _fingerprint_matches(entry)
         group_survives = _service_group_survives_leader(entry)
         if not leader_matches and not group_survives:

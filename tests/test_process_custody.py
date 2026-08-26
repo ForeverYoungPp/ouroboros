@@ -782,3 +782,63 @@ def test_start_time_match_matrix(tmp_path, monkeypatch, live, recorded, expected
         assert process_custody._fingerprint_matches(entry) is expected, why
     finally:
         proc.kill(); proc.wait(timeout=5)
+
+
+# --- OB-07: cheap liveness for the current generation's own session rows ---
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("purpose", ["live-session-service", "service:web", "workspace_service:api"])
+def test_reaper_skips_the_fingerprint_for_live_same_session_rows(tmp_path, monkeypatch, purpose):
+    """A live same-session session row is kept either way, so the `ps` is pure cost.
+
+    The counter is the assertion: worker-pool members, the SyncManager, the claudexor
+    daemon, the local-model server and keep-services are ALL scope="session", so this is
+    the hot majority of the ledger on every 600s tick and startup sweep.
+    """
+    calls = []
+    real = process_custody._fingerprint_matches
+    monkeypatch.setattr(
+        process_custody, "_fingerprint_matches",
+        lambda entry: (calls.append(entry.get("pid")), real(entry))[1],
+    )
+    proc = _sleeper(tmp_path, purpose, "session")
+    try:
+        reaped = reap_orphaned_processes(tmp_path)
+        assert proc.pid not in reaped
+        assert proc.poll() is None, "a live same-session service must be kept"
+        assert calls == [], f"no fingerprint should be computed for a live session row; got {calls}"
+        # and the row is still in the ledger for the next generation to judge
+        kept = [json.loads(line) for line in ledger_path(tmp_path).read_text().splitlines() if line.strip()]
+        assert [e["pid"] for e in kept] == [proc.pid]
+    finally:
+        proc.kill(); proc.wait(timeout=5)
+
+
+def test_reaper_keeps_dead_leader_session_service_with_a_live_group(tmp_path, monkeypatch):
+    """A DEAD pid must fall through to the group evidence, never take a prune shortcut.
+
+    A session service whose leader died while its process group is still alive is
+    preserved by ``_service_group_survives_leader``; pruning on a dead pid inside the
+    cheap path would have silently dropped that row and orphaned the group.
+    """
+    entry = {
+        "pid": 123,
+        "pgid": 456,
+        "purpose": "service:background-child",
+        "scope": "session",
+        "session_id": process_custody._SESSION_ID,  # CURRENT generation
+        "fingerprint": {"start_time": "gone", "cmd_sha256": "gone"},
+    }
+    rewritten = []
+    monkeypatch.setattr(process_custody, "_read_ledger", lambda _root: [entry])
+    monkeypatch.setattr(process_custody, "pid_is_alive", lambda _pid: False)  # leader is dead
+    monkeypatch.setattr(process_custody, "process_group_is_alive", lambda pgid: pgid == 456)
+    monkeypatch.setattr(
+        process_custody, "kill_process_group_id",
+        lambda pgid: pytest.fail(f"a surviving service group must not be killed (pgid={pgid})"),
+    )
+    monkeypatch.setattr(process_custody, "_rewrite_ledger", lambda _root, entries: rewritten.extend(entries))
+
+    assert reap_orphaned_processes(tmp_path) == []
+    assert rewritten == [entry], "the dead-leader row must survive on its group evidence"

@@ -365,6 +365,12 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       every mint order, so no legacy row shape is orphaned on a `/proc` host.
       An upgrade therefore orphans no ledger row and the reaper's hot path never
       pays for a second subprocess.
+      Current-generation session processes take a cheap liveness check instead
+      (the cheap path only ever keeps: an alive-but-recycled same-session pid is
+      retained one generation and pruned by the next generation's full
+      fingerprint check, never killed); full fingerprints remain for
+      stale/foreign records, and a DEAD pid still falls through to the
+      service-group evidence rather than being pruned on the spot.
       Genuine `daemon` entries are kept; skill companions (daemon scope,
       `purpose companion:<skill>:<name>`) are the exception (v6.36.2) — reaped on
       owner-uninstall or a foreign generation, **log-only by default**
