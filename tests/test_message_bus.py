@@ -136,7 +136,9 @@ def test_terminal_incident_persists_and_replays_as_system_without_raw_salvage(
     assert live["role"] == "system"
     assert live["system_type"] == "terminal_incident"
     assert raw not in live["content"]
-    durable = json.loads((tmp_path / "logs" / "chat.jsonl").read_text().splitlines()[-1])
+    durable = json.loads(
+        (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+    )
     assert durable["direction"] == "system"
     assert durable["type"] == "terminal_incident"
     assert raw not in durable["text"]
