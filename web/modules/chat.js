@@ -2127,8 +2127,8 @@ export function createChatInstance({
         ensureLiveCardVisible(record, { suppressDomInsert });
         record.updates += 1;
         const wasFinished = record.finished;
-        // Keep the last meaningful headline when a terminal marker has none.
-        // Terminal markers preserve this title.
+        // Prefer the last meaningful headline when an update carries none (e.g. a
+        // structured terminal marker), so finishing a card doesn't blank its title.
         const headline = summary.headline || record.lastHumanHeadline || 'Working...';
         const syntheticKey = summary.dedupeKey || dedupeKey || `${summary.phase || 'working'}|${headline}|${summary.body || ''}`;
         const isLegacyParentSubagentKey = syntheticKey.startsWith('parent-subagent:');
