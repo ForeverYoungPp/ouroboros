@@ -6,6 +6,7 @@ import pytest
 
 from ouroboros.loop_transport import provider_failure_hint as _provider_failure_hint
 from ouroboros.loop_llm_call import (
+    RETRY_WALL_EXHAUSTED_KEY,
     _normalize_usage_cost,
     call_llm_with_retry,
     classify_llm_exception,
@@ -1065,3 +1066,161 @@ def test_missing_provider_cost_still_uses_the_catalog_estimate(tmp_path, include
     assert cost == 0.99
     estimate.assert_called_once()
     assert accumulated["cost"] == 0.99
+
+
+# ---------------------------------------------------------------------------
+# OB-01 — the transient retry-wall marker (`RETRY_WALL_EXHAUSTED_KEY`)
+# ---------------------------------------------------------------------------
+
+
+def _no_sleep(monkeypatch):
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda _s: None)
+
+
+def test_transient_exhaustion_marks_the_retry_wall(tmp_path, monkeypatch):
+    """The attempt budget running out on a TRANSIENT class is exactly what the
+    marker means: more attempts on this model are pointless."""
+    _no_sleep(monkeypatch)
+    accumulated = {}
+
+    msg, _cost = call_llm_with_retry(
+        _TransientFailingLLM(), [{"role": "user", "content": "hi"}],
+        "openai/gpt-5.5", None, "medium", 3, tmp_path, "task-wall", 1, None,
+        accumulated, "task", False,
+    )
+
+    assert msg is None
+    assert accumulated["_last_llm_error_kind"] == "provider_transient"
+    assert accumulated[RETRY_WALL_EXHAUSTED_KEY] is True
+
+
+def test_transient_deadline_stop_marks_the_retry_wall(tmp_path, monkeypatch):
+    """The other half of the wall: the deadline refuses the next backoff."""
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda _s: None)
+    accumulated = {}
+
+    msg, _cost = call_llm_with_retry(
+        _TransientFailingLLM(), [{"role": "user", "content": "hi"}],
+        "openai/gpt-5.5", None, "medium", 3, tmp_path, "task-wall-deadline", 1,
+        None, accumulated, "task", False, deadline_ts=_time.time() + 1.0,
+    )
+
+    assert msg is None
+    assert accumulated[RETRY_WALL_EXHAUSTED_KEY] is True
+
+
+def test_empty_response_exhaustion_marks_the_retry_wall(tmp_path, monkeypatch):
+    """The response-shaped exit marks too: a finish_reason=null glitch that never
+    recovered spent the same wall as a raised transient error."""
+    _no_sleep(monkeypatch)
+    accumulated = {}
+
+    msg, _cost = call_llm_with_retry(
+        _GlitchThenOkLLM(glitches=99), [{"role": "user", "content": "hi"}],
+        "openai/gpt-5.5", None, "medium", 3, tmp_path, "task-wall-empty", 1,
+        None, accumulated, "task", False,
+    )
+
+    assert msg is None
+    assert accumulated[RETRY_WALL_EXHAUSTED_KEY] is True
+
+
+def test_permanent_failure_leaves_the_retry_wall_unspent(tmp_path, monkeypatch):
+    """A permanent class fails FAST — the wall is never spent, so the forced
+    finalization keeps the one chance that class is entitled to."""
+    _no_sleep(monkeypatch)
+    accumulated = {}
+
+    msg, _cost = call_llm_with_retry(
+        _FailingLLM(), [{"role": "user", "content": "hi"}], "openai/gpt-5.5",
+        None, "medium", 3, tmp_path, "task-auth-wall", 1, None, accumulated,
+        "task", False,
+    )
+
+    assert msg is None
+    assert accumulated["_last_llm_error_kind"] == "auth_error"
+    assert RETRY_WALL_EXHAUSTED_KEY not in accumulated
+
+
+def test_permanent_body_error_leaves_the_retry_wall_unspent(tmp_path):
+    """Same rule on the response-shaped exit: a PERMANENT body error stopped
+    without spending the wall."""
+    accumulated = {}
+    llm = _EmptyBodyErrorLLM(
+        {"kind": "provider_error", "code": 400, "message": "bad request"},
+    )
+
+    msg, _cost = call_llm_with_retry(
+        llm, [{"role": "user", "content": "hi"}], "openai/gpt-5.5", None,
+        "medium", 3, tmp_path, "task-body-wall", 1, None, accumulated, "task",
+        False, attempt_cap=1,
+    )
+
+    assert msg is None
+    assert llm.calls == 1
+    assert RETRY_WALL_EXHAUSTED_KEY not in accumulated
+
+
+def test_retry_wall_marker_is_cleared_at_entry_of_every_invocation(tmp_path, monkeypatch):
+    """REGRESSION: the primary and every fallback candidate SHARE one
+    ``accumulated_usage``. A transient-exhausted primary followed by a
+    permanent-failed fallback must NOT leave the marker standing — otherwise the
+    permanent failure inherits "the wall is spent" and silently loses the one
+    forced call its class is entitled to."""
+    _no_sleep(monkeypatch)
+    shared = {}
+
+    call_llm_with_retry(
+        _TransientFailingLLM(), [{"role": "user", "content": "hi"}],
+        "openai/gpt-5.5", None, "medium", 3, tmp_path, "task-chain", 1, None,
+        shared, "task", False,
+    )
+    assert shared[RETRY_WALL_EXHAUSTED_KEY] is True  # the primary spent its wall
+
+    call_llm_with_retry(
+        _FailingLLM(), [{"role": "user", "content": "hi"}],
+        "anthropic/claude-opus-5", None, "medium", 3, tmp_path, "task-chain", 1,
+        None, shared, "task", False, attempt_cap=2,
+    )
+
+    assert shared["_last_llm_error_kind"] == "auth_error"
+    assert RETRY_WALL_EXHAUSTED_KEY not in shared
+
+
+class _MarkerSeedingLLM:
+    """Sets the wall marker DURING the call, i.e. AFTER `call_llm_with_retry`'s
+    entry-clear has already run.
+
+    Seeding it before the call instead would be vacuous: the entry-clear alone
+    would satisfy the assertion and the successful-round pop could be deleted
+    without any test noticing.
+    """
+
+    def __init__(self, accumulated):
+        self.accumulated = accumulated
+
+    def chat(self, **kwargs):
+        self.accumulated[RETRY_WALL_EXHAUSTED_KEY] = True
+        return (
+            {"content": "ok"},
+            {"provider": "anthropic", "resolved_model": "anthropic/claude-sonnet-4-6"},
+        )
+
+
+def test_successful_round_pops_the_retry_wall_marker(tmp_path):
+    """A round that succeeds retires the marker beside the other stale per-round
+    bookkeeping — the wall is no longer spent. Only the success-path pop can
+    clear a marker set after entry, which is what makes this test load-bearing."""
+    accumulated = {"execution_status": "infra_failed"}
+
+    msg, _cost = call_llm_with_retry(
+        _MarkerSeedingLLM(accumulated), [{"role": "user", "content": "hi"}],
+        "anthropic::claude-sonnet-4-6", None, "medium", 1, tmp_path,
+        "task-wall-ok", 1, None, accumulated, "task", False,
+    )
+
+    assert msg == {"content": "ok"}
+    assert RETRY_WALL_EXHAUSTED_KEY not in accumulated
+    assert "execution_status" not in accumulated

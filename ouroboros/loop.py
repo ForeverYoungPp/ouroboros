@@ -51,7 +51,7 @@ from ouroboros.loop_tool_execution import (
     reclaim_negative_memo,
     reclaim_trace_refs,
 )
-from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event, forced_response_is_incomplete, forced_response_parts
+from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event, forced_response_is_incomplete, forced_response_parts, provider_no_call_source
 from ouroboros.loop_transport import (
     TransportWaitEpisode,
     end_episode_budget as _end_episode_budget,
@@ -3369,15 +3369,18 @@ def _handle_provider_unavailable(
         if str(usage.get("reason_code") or "") == "provider_unavailable":
             usage["execution_status"] = RESULT_INFRA_FAILED
         return text, usage, llm_trace
-    if str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown":
-        live_trace = getattr(ctx, "llm_trace", None)
-        llm_trace = live_trace if isinstance(live_trace, dict) else {}
+    # No-call shapes; see provider_no_call_source
+    no_call, wall = provider_no_call_source(ctx.accumulated_usage, is_deadline_exhausted)
+    if no_call:
+        if wall:
+            _finalize_forced_services(ctx, llm_trace)
+            _drain_forced_owner_directives(ctx, llm_trace)
         text, usage, llm_trace = _forced_fallback_result(
             ctx, llm_trace, fallback, reason_code="provider_unavailable",
-            source="provider_outcome_unknown_no_resend",
+            source=no_call, provider_terminal=wall,
         )
-        if str(usage.get("reason_code") or "") == "provider_unavailable":
-            usage["execution_status"] = RESULT_INFRA_FAILED
+        if usage.get("execution_status") is not None:
+            usage.update(execution_status=RESULT_INFRA_FAILED, reason_code="provider_unavailable")
         return text, usage, llm_trace
     prompt = (
         "[DEADLINE] Primary model work reached the owner deadline. Produce the best final answer now from verified work and state what remains undone."
@@ -5409,15 +5412,12 @@ def _forced_final_answer(
             source="forced_model_incomplete", provider_terminal=True,
         )
 
-    extracted, control_degraded = _resolve_forced_delivery_control(
-        getattr(getattr(ctx, "tools", None), "_ctx", None), extracted,
-    )
+    extracted, control_degraded = _resolve_forced_delivery_control(tools_ctx, extracted)
     if extracted:
         ctx.accumulated_usage["_best_effort_extracted"] = True
-        tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
         plan_suffix = (
-            _force_plan_disclosure(tool_ctx, llm_trace, forced_reason=reason_code)
-            if tool_ctx is not None else ""
+            _force_plan_disclosure(tools_ctx, llm_trace, forced_reason=reason_code)
+            if tools_ctx is not None else ""
         )
         if provider_terminal:
             ctx.accumulated_usage["terminal_plan_review_open"] = bool(plan_suffix)
