@@ -2580,6 +2580,10 @@ def test_queue_snapshot_preserves_subagent_contract_fields(tmp_path, monkeypatch
             },
             "child_drive_root": str(tmp_path / "state" / "headless_tasks" / "sub1" / "data"),
             "task_constraint": {"mode": "local_readonly_subagent", "allow_enable": False},
+            "predecessor_authority_source": {
+                "kind": "task_result", "task_id": "previous", "reader": "get_task_result",
+                "arguments": {"task_id": "previous", "include_authority": True},
+            },
         }
     )
 
@@ -2595,6 +2599,7 @@ def test_queue_snapshot_preserves_subagent_contract_fields(tmp_path, monkeypatch
     assert saved["task_contract"]["resource_policy"]["protected_artifacts"][0]["id"] == "reference"
     assert pathlib.Path(saved["child_drive_root"]).parts[-4:] == ("state", "headless_tasks", "sub1", "data")
     assert saved["task_constraint"]["mode"] == "local_readonly_subagent"
+    assert saved["predecessor_authority_source"]["task_id"] == "previous"
 
     queue_module.PENDING.clear()
     assert queue_module.restore_pending_from_snapshot(max_age_sec=900) == 1
@@ -2609,6 +2614,7 @@ def test_queue_snapshot_preserves_subagent_contract_fields(tmp_path, monkeypatch
     assert restored["task_contract"]["resource_policy"]["protected_artifacts"][0]["paths"] == ["reference.bin"]
     assert pathlib.Path(restored["child_drive_root"]).parts[-4:] == ("state", "headless_tasks", "sub1", "data")
     assert restored["task_constraint"]["mode"] == "local_readonly_subagent"
+    assert restored["predecessor_authority_source"]["task_id"] == "previous"
 
 
 def test_assign_tasks_mirrors_running_subagent_status_to_parent_drive(tmp_path, monkeypatch):

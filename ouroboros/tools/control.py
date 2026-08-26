@@ -67,6 +67,17 @@ VALID_SUBTASK_MEMORY_MODES = frozenset({"forked", "empty"})
 _SCHEDULE_EMIT_LOCK = threading.Lock()
 _PROMOTE_CONFIRM_TIMEOUT_SEC = 15.0
 _PROMOTE_CONFIRM_POLL_SEC = 0.05
+_MISSING_PREDECESSOR_SELECTOR = object()
+
+
+def _predecessor_selector_error(value: Any, tool_name: str) -> str:
+    """Require the router to state fresh work or a named continuation."""
+    if value is _MISSING_PREDECESSOR_SELECTOR or value is None:
+        return (
+            f"⚠️ TOOL_ARG_ERROR ({tool_name}): predecessor_task_id is required; "
+            "pass an empty string for fresh work or the host-listed result id to continue it"
+        )
+    return ""
 
 
 def _record_scheduled_subagent(ctx: ToolContext, record: Dict[str, Any]) -> None:
@@ -881,7 +892,7 @@ def _promote_chat_to_task(
     project_name: str = "",
     workspace: str = "",
     source: str = "",
-    predecessor_task_id: str = "",
+    predecessor_task_id: Any = _MISSING_PREDECESSOR_SELECTOR,
 ) -> str:
     """Route real work out of the conversation lane into a supervised pooled task.
 
@@ -897,6 +908,9 @@ def _promote_chat_to_task(
     "create a named project and work there" call: the project is created NOW
     with that display name and the task runs inside it (v6.33.0).
     """
+    selector_error = _predecessor_selector_error(predecessor_task_id, "promote_chat_to_task")
+    if selector_error:
+        return selector_error
     goal = str(objective or "").strip()
     if not goal:
         return "⚠️ TOOL_ARG_ERROR (promote_chat_to_task): objective is required"
@@ -1116,7 +1130,7 @@ def _list_projects(ctx: ToolContext, limit: int = 50) -> str:
 
 def _route_to_project(
     ctx: ToolContext, project_id: str = "", message: str = "", reason: str = "",
-    predecessor_task_id: str = "",
+    predecessor_task_id: Any = _MISSING_PREDECESSOR_SELECTOR,
 ) -> str:
     """Route a main-chat message to an EXISTING project so the work continues in
     that project's context (its memory/journal/thread), keeping the main chat free.
@@ -1126,6 +1140,9 @@ def _route_to_project(
     receipt. The receipt is host metadata on the owner message; any non-empty
     final decision-turn explanation remains a separate conversational reply.
     """
+    selector_error = _predecessor_selector_error(predecessor_task_id, "route_to_project")
+    if selector_error:
+        return selector_error
     from ouroboros.project_facts import explicit_project_id_ok, sanitize_project_id
     from ouroboros.projects_registry import get_project
 
@@ -2847,7 +2864,7 @@ _PROMOTE_CHAT_DESCRIPTION = (
     "called, and do not just answer or spawn a project-less task). `project_id` "
     "scopes to an existing project. When this new task continues one specific "
     "completed result shown by the host (the Main manifest or Project last-result "
-    "preview), pass its internal id as `predecessor_task_id`; omit it for fresh work. "
+    "preview), pass its internal id as `predecessor_task_id`; pass an empty string for fresh work. "
     "`workspace_root` points at a working folder. A project-scoped task inherits "
     "the project's working folder as its ACTIVE WORKSPACE by default (its file/"
     "shell/git tools operate there, not on the Ouroboros repo); pass "
@@ -2891,9 +2908,9 @@ def get_tools() -> List[ToolEntry]:
                     "workspace_root": {"type": "string", "description": "Optional absolute working-folder path (validated at admission: must be a git worktree root outside the Ouroboros repo/data). When omitted for a project-scoped task, the project's registered working_dir is used by default.", "default": ""},
                     "workspace": {"type": "string", "description": "Pass 'none' to opt OUT of the project room's default working folder (a folder-less task in a folder-ful project). Leave empty otherwise.", "default": ""},
                     "source": {"type": "string", "description": "Attach or clone the project's working folder in ONE move: a git URL (https://... or git@host:path — cloned server-side into the projects root; private repos fail typed auth_required) or an existing folder path (validated attach). The folder is registered on the project (provenance + trusted_at) and becomes this task's active workspace. Use for 'help me debug this GitHub repo / this folder' asks.", "default": ""},
-                    "predecessor_task_id": {"type": "string", "description": "Internal selector for one completed result already listed by the host routing manifest. Use only when the new task continues that result; omit for fresh work.", "default": ""},
+                    "predecessor_task_id": {"type": "string", "description": "Required explicit selector: pass an empty string for fresh work, or the completed result id shown by the host routing manifest to continue it."},
                 },
-                "required": ["objective"],
+                "required": ["objective", "predecessor_task_id"],
             },
         }, _promote_chat_to_task),
         ToolEntry("ensure_project_scope", {
@@ -2939,15 +2956,15 @@ def get_tools() -> List[ToolEntry]:
                 "needs_manual_target acknowledgement with host-validated task options and New task "
                 "in Project; prose alone cannot emit that typed choice. For brand-new work that is not yet a project, "
                 "use promote_chat_to_task instead. When continuing one completed result from the "
-                "Main host manifest, pass its internal `predecessor_task_id`; omit it for fresh work. "
+                "Main host manifest, pass its internal `predecessor_task_id`; pass an empty string for fresh work. "
                 "Returns a visible routing receipt."
             ),
             "parameters": {"type": "object", "properties": {
                 "project_id": {"type": "string", "default": "", "description": "Target project id (filesystem-clean; see list_projects), or empty to emit typed needs_manual_target."},
                 "message": {"type": "string", "description": "The owner message / work to route into the project."},
                 "reason": {"type": "string", "default": "", "description": "Optional short why-this-project note (provenance)."},
-                "predecessor_task_id": {"type": "string", "default": "", "description": "Internal selector for one completed result listed by the Main host manifest. Omit for fresh work."},
-            }, "required": ["message"]},
+                "predecessor_task_id": {"type": "string", "description": "Required explicit selector: pass an empty string for fresh work, or the completed result id listed by the Main host manifest to continue it."},
+            }, "required": ["message", "predecessor_task_id"]},
         }, _route_to_project),
         ToolEntry("steer_task", {
             "name": "steer_task",

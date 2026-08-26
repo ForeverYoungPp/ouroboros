@@ -537,6 +537,35 @@ rewrite, or relabel the artifact or its original cause.
 | Plan/review evidence | Exact task-artifact/observability bodies and reviewer route/thread receipts | Bounded review hot index, obligations, and latest-wave status | Exact artifact refs and candidate SHA bind the decision; index rotation cannot certify a missing or partial wave |
 | Task/project execution | Canonical task result plus promoted child artifacts and summaries | Status cards, terminal rows, and Main/Project summary projections | Canonical promotion precedes child-drive GC; disposable task scratch follows the unified retention owner |
 
+### Invariant: Continuation authority and bounded Main projection
+
+Continuation is an explicit relation, not an inferred chat-memory feature. The
+router contract requires `predecessor_task_id`: an empty string means a fresh
+task, a non-empty value means continuation, and omission or `null` is a typed
+refusal before any lookup, enqueue, or provider spend. The existing predecessor
+source is retained by queue snapshot/restore, so a restart cannot silently turn
+the selected task into a fresh one.
+
+The authored continuation narrative is written at the result owner together
+with its exact `get_task_result(include_authority=True)` source. A Project child
+must promote its child-born narrative before child-drive collection; for a
+non-Project split the parent-born narrative owns the field when a stale child
+replica is copied back. Main's provider projection is defensive and recursive:
+it deep-copies the authority, removes only the current task's duplicate nested
+predecessor, and thresholds only the closed raw keys `result` and
+`final_answer` using `context_budget.PREDECESSOR_RESULT_INLINE_CHARS`.
+Oversized values resolve as persisted narrative, bounded exact-key legacy
+authored lookup, or an explicit source-resolvable gap. They never use a raw
+head/tail slice, invent a summary, or mutate the canonical result. Exact task
+reads and external work-order consumers retain the full source.
+
+Provider context overflow is a typed recovery fact. The existing useful reclaim
+and one strictly-smaller same-route retry retain their route order; a final
+`context_overflow` skips the provider-unavailable/forced-provider path, keeps
+`execution_status=infra_failed` and `reason_code=llm_api_error`, and records the
+typed acceptance bypass and `failure.error_kind`. Ordinary provider outages keep
+their existing recovery behavior.
+
 ### Invariant: UI resources carry a disposer
 
 Every long-lived acquisition in `web/` returns or records a disposer, and a UI
