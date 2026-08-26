@@ -184,6 +184,7 @@ BAND_PATHS = {
     "tests/test_safety_policy.py": None,
     "tests/test_swe_pro_e1v2.py": None,
     "tests/test_telegram_miniapp_lifecycle.py": None,
+    "tests/test_timeout_policy.py": "Adaptive timeout and custody regression suite covers raw-deadline admission, explicit finalization reserve, transport bounds, and late-result reconciliation.",
     "tests/test_tool_api_v2_public_surface.py": None,
     "tests/test_usage_accounting.py": None,
     "tests/test_v647_megacommit.py": None,

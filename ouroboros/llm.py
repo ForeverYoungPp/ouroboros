@@ -2516,12 +2516,7 @@ class LLMClient:
                 if (_is_structured_context_overflow_exception(exc)
                         or context_overflow_message(err)):
                     raise LocalContextTooLargeError(err) from exc
-                # Only an exception-owned capture can prove that THIS local
-                # attempt reached the provider.  The process-local "last"
-                # capture may belong to an unrelated earlier operation (or a
-                # compatibility executor that never entered custody), and
-                # must not turn an ordinary retryable error into a no-resend
-                # tombstone.
+                # Exception-owned capture proves this attempt; prior ContextVar may be unrelated.
                 capture = getattr(exc, "physical_attempt_capture", None)
                 if isinstance(capture, PhysicalAttemptCapture) and capture.state in {"dispatched", "unresolved"}:
                     raise  # Outer custody owns an unknown physical outcome.

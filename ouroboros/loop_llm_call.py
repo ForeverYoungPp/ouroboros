@@ -20,7 +20,6 @@ import logging
 
 from ouroboros import model_concurrency
 from ouroboros.anthropic_native_custody import public_custody_projection
-from ouroboros.config import get_finalization_grace_sec
 from ouroboros.deadline_utils import (
     owner_deadline_exhausted,
     seconds_until,
