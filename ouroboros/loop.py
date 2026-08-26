@@ -90,7 +90,10 @@ def _provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
     """Explain whether retrying later is likely to help."""
     kind = str(accumulated_usage.get("_last_llm_error_kind") or "").strip()
     if kind == "provider_outcome_unknown":
-        return " Dispatch unknown; retry withheld to avoid duplication."
+        return (
+            " The dispatched request has no terminal provider outcome, so no "
+            "retry or paid fallback was sent; either could duplicate live work."
+        )
     if kind == "subscription_window_exhausted":
         reset_at = str(accumulated_usage.get("_last_llm_reset_at") or "").strip()
         when = f" It resets at {reset_at}." if reset_at else ""
@@ -3451,8 +3454,6 @@ def _handle_owner_stop_finalization(
         "produced inside the grace window."
     )
     if _owner_stop_window_elapsed(ctx):
-        # An expired control never buys a paid summary: the honest fallback
-        # rides the same typed rail and custody settles it.
         _finalize_forced_services(ctx, llm_trace)
         ctx.accumulated_usage["execution_status"] = "failed"
         ctx.accumulated_usage["reason_code"] = REASON_OWNER_REQUESTED_FINALIZATION
@@ -3520,7 +3521,7 @@ def _handle_provider_unavailable(
         live_trace = getattr(ctx, "llm_trace", None)
         llm_trace = live_trace if isinstance(live_trace, dict) else {}
         text, usage, llm_trace = _forced_fallback_result(
-            ctx, llm_trace, fallback, "provider_unavailable",
+            ctx, llm_trace, fallback, reason_code="provider_unavailable",
             source="provider_outcome_unknown_no_resend",
         )
         if str(usage.get("reason_code") or "") == "provider_unavailable":
