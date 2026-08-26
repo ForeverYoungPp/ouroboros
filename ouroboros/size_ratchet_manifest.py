@@ -195,6 +195,7 @@ BAND_PATHS = {
     "web/modules/settings.js": None,
     "web/modules/widgets.js": None,
     "web/tests/harness_login_cards.test.js": "Login-card suite grew past 1000 lines with the name-the-account face cases (agy pickup, issue #232); split when the next face lands.",
+    "web/tests/review_presentation.test.js": "Review Checkpoint lifecycle and verdict reconciliation remain covered by one focused presentation suite.",
 }
 
 BYTE_BASELINE_DEBT = {

@@ -506,6 +506,103 @@ test('lifecycle completion stays neutral until a semantic review verdict arrives
     assert.equal(staleMerged.attempts.at(-1).id, 'job-3');
 });
 
+test('lifecycle timestamps fence delayed older history without inventing a verdict', () => {
+    const lifecycle = reviewGroupFromLifecycle({
+        ts: '2026-08-26T10:03:00Z',
+        lifecycle: {
+            kind: 'review', status: 'succeeded', target: 'alpha', job_id: 'job-3',
+            group_id: 'task:root:alpha', presentation_owner_task_id: 'root',
+        },
+    });
+    assert.equal(lifecycle.attempts[0].timestamp, '2026-08-26T10:03:00Z');
+
+    const store = new Map();
+    mergeReviewGroup(store, reviewGroupFromHistoryRow(groupedSkillRow({
+        attempts: [{ job_id: 'job-1', skill: 'alpha', status: 'blockers', ts: '2026-08-26T10:00:00Z' }],
+    })));
+    mergeReviewGroup(store, lifecycle);
+    const delayed = reviewGroupFromHistoryRow(groupedSkillRow({
+        attempts: [
+            { job_id: 'job-1', skill: 'alpha', status: 'blockers', ts: '2026-08-26T10:00:00Z' },
+            { job_id: 'job-2', skill: 'alpha', status: 'clean', ts: '2026-08-26T10:02:00Z' },
+        ],
+    }));
+    const merged = mergeReviewGroup(store, delayed);
+    assert.deepEqual(merged.attempts.map((attempt) => attempt.id), ['job-1', 'job-2', 'job-3']);
+    assert.equal(merged.lifecycleOnly, true);
+    assert.equal(merged.verdict, '');
+    assert.equal(merged.tone, 'neutral');
+
+    const newer = reviewGroupFromHistoryRow(groupedSkillRow({
+        attempts: [{ job_id: 'job-4', skill: 'alpha', status: 'clean', ts: '2026-08-26T10:04:00Z' }],
+    }));
+    const upgraded = mergeReviewGroup(store, newer);
+    assert.equal(upgraded.attempts.at(-1).id, 'job-4');
+    assert.equal(upgraded.verdict, 'clean');
+    assert.equal(upgraded.tone, 'done');
+
+    const mixed = reviewGroupFromHistoryRow(groupedSkillRow({
+        attempts: [
+            { job_id: 'job-2', skill: 'alpha', status: 'clean', ts: '2026-08-26T10:02:00Z' },
+            { job_id: 'job-4', skill: 'alpha', status: 'clean', ts: '2026-08-26T10:04:00Z' },
+        ],
+    }));
+    const mixedStore = new Map();
+    mergeReviewGroup(mixedStore, reviewGroupFromHistoryRow(groupedSkillRow({
+        attempts: [{ job_id: 'job-1', skill: 'alpha', status: 'blockers', ts: '2026-08-26T10:00:00Z' }],
+    })));
+    mergeReviewGroup(mixedStore, lifecycle);
+    const mixedMerged = mergeReviewGroup(mixedStore, mixed);
+    assert.deepEqual(mixedMerged.attempts.map((attempt) => attempt.id), ['job-1', 'job-2', 'job-3', 'job-4']);
+    assert.equal(mixedMerged.verdict, 'clean');
+    assert.equal(mixedMerged.tone, 'done');
+
+    const semanticHistory = reviewGroupFromHistoryRow(groupedSkillRow({
+        attempts: [
+            { job_id: 'job-1', skill: 'alpha', status: 'clean', ts: '2026-08-26T10:00:00Z' },
+            { job_id: 'job-2', skill: 'alpha', status: 'blockers', ts: '2026-08-26T10:02:00Z' },
+        ],
+    }));
+    const lateLifecycle = reviewGroupFromLifecycle({
+        lifecycle: {
+            kind: 'review', status: 'succeeded', target: 'alpha', job_id: 'job-2',
+            finished_at: '2026-08-26T10:05:00Z',
+            group_id: 'task:root:alpha', presentation_owner_task_id: 'root',
+        },
+    });
+    const sameAttemptStore = new Map();
+    mergeReviewGroup(sameAttemptStore, semanticHistory);
+    mergeReviewGroup(sameAttemptStore, lateLifecycle);
+    const afterLateLifecycle = sameAttemptStore.get('task:root:alpha');
+    assert.equal(afterLateLifecycle.attempts.find((attempt) => attempt.id === 'job-2').timestamp, '2026-08-26T10:02:00Z');
+    const newerHistory = reviewGroupFromHistoryRow(groupedSkillRow({
+        attempts: [{ job_id: 'job-3', skill: 'alpha', status: 'clean', ts: '2026-08-26T10:04:00Z' }],
+    }));
+    const afterNewerHistory = mergeReviewGroup(sameAttemptStore, newerHistory);
+    assert.deepEqual(afterNewerHistory.attempts.map((attempt) => attempt.id), ['job-1', 'job-2', 'job-3']);
+
+    const semanticStaleStore = new Map();
+    mergeReviewGroup(semanticStaleStore, reviewGroupFromHistoryRow(groupedSkillRow({
+        attempts: [{ job_id: 'job-3', skill: 'alpha', status: 'blockers', ts: '2026-08-26T10:03:00Z' }],
+    })));
+    const semanticStale = mergeReviewGroup(semanticStaleStore, reviewGroupFromHistoryRow(groupedSkillRow({
+        status: 'clean',
+        attempts: [{ job_id: 'job-2', skill: 'alpha', status: 'clean', ts: '2026-08-26T10:02:00Z' }],
+    })));
+    assert.deepEqual(semanticStale.attempts.map((attempt) => attempt.id), ['job-2', 'job-3']);
+    assert.equal(semanticStale.verdict, 'blockers');
+    assert.equal(semanticStale.tone, 'error');
+
+    const pointer = classifyReviewLifecyclePointer({
+        ts: '2026-08-26T11:00:00Z',
+        lifecycle_pointer: {
+            kind: 'review', status: 'running', target: 'alpha', job_id: 'pointer-1',
+            group_id: 'task:root:alpha', presentation_owner_task_id: 'root',
+        },
+    });
+    assert.equal(pointer.group.attempts[0].timestamp, '2026-08-26T11:00:00Z');
+});
+
 test('task acceptance adapts only task_acceptance panels; advisory and commit stay omitted', () => {
     const detail = {
         task_id: 'root',

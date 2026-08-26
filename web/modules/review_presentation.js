@@ -135,7 +135,10 @@ function normalizeSkillAttempt(attempt, defaults = {}, ordinal = 0) {
             : statusTone(state, rawStatus),
         verdict: rawStatus,
         lifecycleStatus,
-        timestamp: text(attempt.ts || attempt.timestamp),
+        timestamp: text(
+            attempt.ts || attempt.timestamp || attempt.finished_at
+            || attempt.started_at || attempt.queued_at,
+        ),
         ordinal,
         label: [
             attempt.review_round != null ? `round ${attempt.review_round}` : '',
@@ -251,6 +254,10 @@ export function classifyReviewLifecycle(row) {
     const status = text(lifecycle.status || lifecycle.phase || 'queued');
     const reviewStatus = text(lifecycle.review_status || lifecycle.review_verdict);
     const lifecycleOnly = !reviewStatus;
+    const timestamp = text(
+        lifecycle.finished_at || lifecycle.started_at || lifecycle.queued_at
+        || lifecycle.ts || row?.ts || row?.timestamp,
+    );
     const group = normalizeSkillGroup({
         surface: 'skill',
         id: groupId,
@@ -268,6 +275,7 @@ export function classifyReviewLifecycle(row) {
         count_is_authoritative: lifecycle.count_is_authoritative === true,
         attempts: lifecycle.job_id || lifecycle.id ? [{
             ...lifecycle,
+            ts: timestamp,
             job_id: lifecycle.job_id || lifecycle.id,
             status: reviewStatus,
             review_status: reviewStatus,
@@ -306,6 +314,10 @@ export function classifyReviewLifecyclePointer(row) {
     const reviewStatus = text(pointer.review_status || pointer.review_verdict);
     const lifecycleOnly = !reviewStatus;
     const initiatorTaskId = text(pointer.initiator_task_id || pointer.origin_task_id);
+    const timestamp = text(
+        pointer.finished_at || pointer.started_at || pointer.queued_at
+        || pointer.ts || row?.ts || row?.timestamp,
+    );
     const group = normalizeSkillGroup({
         surface: 'skill',
         id: groupId,
@@ -323,6 +335,7 @@ export function classifyReviewLifecyclePointer(row) {
         count_is_authoritative: pointer.count_is_authoritative === true,
         attempts: pointer.job_id ? [{
             ...pointer,
+            ts: timestamp,
             initiator_task_id: initiatorTaskId,
             status: reviewStatus,
             review_status: reviewStatus,
@@ -609,6 +622,13 @@ export function mergeReviewGroup(store, incoming) {
                 lifecycleOnly: false,
             };
         }
+        // A lifecycle frame for an already-semantic attempt carries a transport
+        // timestamp, not a new attempt timestamp. Keep the domain row's time as
+        // the ordering key so a late frame cannot move that attempt past newer
+        // semantic history.
+        if (attempt.lifecycleOnly && previous && !previous.lifecycleOnly) {
+            mergedAttempt.timestamp = previous.timestamp || mergedAttempt.timestamp;
+        }
         mergedById.set(attempt.id, mergedAttempt);
         if (incomingActive && previousTerminal) hasStaleActiveAttempt = true;
         if (incomingActive && !previousTerminal && !previous) introducedActiveAttempt = true;
@@ -632,13 +652,26 @@ export function mergeReviewGroup(store, incoming) {
     const priorOnly = priorIds.filter((id) => !incomingIds.has(id));
     // A projection that contains every known attempt owns their order (for
     // example, terminal Skill history arriving after one live row). A bounded
-    // projection that omits a known attempt cannot move it to the front: keep
-    // the established order and append only genuinely new identities.
-    const order = priorOnly.length === 0
-        ? incoming.attempts.map((attempt) => attempt.id)
-        : [...priorIds, ...incoming.attempts
-            .filter((attempt) => !priorById.has(attempt.id))
-            .map((attempt) => attempt.id)];
+    // projection that omits a known attempt keeps established order; a new
+    // timestamped identity is inserted before a later known timestamp.
+    let order;
+    if (priorOnly.length === 0) {
+        order = incoming.attempts.map((attempt) => attempt.id);
+    } else {
+        order = [...priorIds];
+        for (const attempt of incoming.attempts) {
+            if (priorById.has(attempt.id) || order.includes(attempt.id)) continue;
+            const timestamp = text(attempt.timestamp);
+            const insertBefore = timestamp
+                ? order.findIndex((id) => {
+                    const existing = text(mergedById.get(id)?.timestamp);
+                    return existing && existing > timestamp;
+                })
+                : -1;
+            if (insertBefore >= 0) order.splice(insertBefore, 0, attempt.id);
+            else order.push(attempt.id);
+        }
+    }
     const staleActiveRegression = (
         (prior.state === 'terminal' || prior.state === 'superseded')
         && (incoming.state === 'queued' || incoming.state === 'running')
@@ -688,11 +721,19 @@ export function mergeReviewGroup(store, incoming) {
     }
     const priorLatestAttempt = prior.attempts.at(-1);
     const mergedLatestAttempt = merged.attempts.at(-1);
+    const newAttemptHasProvenablyNewerTimestamp = (
+        priorLatestAttempt?.timestamp
+        && mergedLatestAttempt
+        && !priorById.has(mergedLatestAttempt.id)
+        && !mergedLatestAttempt.lifecycleOnly
+        && hasSemanticVerdict(mergedLatestAttempt.verdict)
+        && text(mergedLatestAttempt.timestamp) > text(priorLatestAttempt.timestamp)
+    );
     if (
         !activeAttempts.length
         && priorLatestAttempt?.lifecycleOnly
-        && mergedLatestAttempt?.id === priorLatestAttempt.id
         && !incomingIds.has(priorLatestAttempt.id)
+        && !newAttemptHasProvenablyNewerTimestamp
     ) {
         // A stale history refresh may omit a newer terminal lifecycle row.  It
         // must not resurrect the older typed verdict at group level while the
@@ -702,6 +743,35 @@ export function mergeReviewGroup(store, incoming) {
         merged.verdict = priorLatestAttempt.verdict || '';
         merged.summary = priorLatestAttempt.summary || merged.summary;
         merged.lifecycleOnly = true;
+        merged.lifecycleStatus = priorLatestAttempt.lifecycleStatus || merged.lifecycleStatus;
+    }
+    const delayedSemanticProjection = (
+        incoming.surface === 'skill'
+        && priorOnly.length > 0
+        && !activeAttempts.length
+        && priorLatestAttempt
+        && !priorLatestAttempt.lifecycleOnly
+        && hasSemanticVerdict(priorLatestAttempt.verdict)
+        && !incomingIds.has(priorLatestAttempt.id)
+        && mergedLatestAttempt
+        && !mergedLatestAttempt.lifecycleOnly
+        && hasSemanticVerdict(mergedLatestAttempt.verdict)
+        && (
+            !text(priorLatestAttempt.timestamp)
+            || !text(mergedLatestAttempt.timestamp)
+            || text(mergedLatestAttempt.timestamp) <= text(priorLatestAttempt.timestamp)
+        )
+    );
+    if (delayedSemanticProjection) {
+        // A bounded history response may contain an older semantic row that was
+        // not known when the newer row arrived live. Keep the group header tied
+        // to the newer proved attempt; the older row remains inspectable below.
+        merged.state = priorLatestAttempt.state;
+        merged.tone = priorLatestAttempt.tone;
+        merged.verdict = priorLatestAttempt.verdict;
+        merged.summary = priorLatestAttempt.summary || merged.summary;
+        merged.lifecycleOnly = false;
+        merged.lifecycleStatus = priorLatestAttempt.lifecycleStatus || merged.lifecycleStatus;
     }
     merged.initiatorTaskId = uniformAttemptInitiator(
         merged.attempts,
