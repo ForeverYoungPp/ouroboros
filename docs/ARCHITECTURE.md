@@ -1207,10 +1207,12 @@ budget remains usable. The same budget carries additive depth provenance for
 `achieved_depth`; absent explicit root provenance stays unknown, and vendor-internal
 children do not advance achieved depth without a Claudexor boundary receipt. Root
 acceptance carries the per-child facts and a host-attested depth summary; persisted
-admission facts are monotonic authority and outrank later Settings changes. A normal
-over-cap `schedule_subagent` attempt writes a typed rejected child result carrying the
-same provenance, and a lower permitted depth is reported as `capability_reduced`
-rather than a silent flat tree.
+admission facts are monotonic authority and outrank later Settings changes, except
+that the explicit global depth setting `0` disables every new descendant and the
+immutable hard ceiling remains authoritative over malformed persisted projections.
+A normal over-cap `schedule_subagent` attempt writes a typed rejected child result
+carrying the same provenance, and a lower permitted depth is reported as
+`capability_reduced` rather than a silent flat tree.
 
 `wait_task` and `get_task_result` return the full single-child handoff. They include a disclosed, ten-row verification-receipt projection ordered with every still-outstanding red or masked pass first and the newest remaining receipts after it; the exact omitted count is carried. Readers union the recorded child-drive and canonical replicas with exact-row de-duplication and stable receipt chronology (undated legacy rows before dated evidence), so source iteration order cannot let an older PASS hide a newer FAIL during the pre-copy-back window. `wait_tasks` deliberately remains batch-compact: `task_id, status, cost_usd, child_result_sha256, outcome_axes, result, trace_summary, capability_delta when the child has something to disclose, duplicate_of`.
 

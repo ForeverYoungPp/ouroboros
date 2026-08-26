@@ -782,6 +782,10 @@ def _bounded_positive_int_setting(key: str, *, default: int, hard_max: int, min_
 # ONE per-root subagent ceiling (v6.82: 50->500): clamp below, supervisor/events.py, wait_tasks; ARCHITECTURE §7.
 MAX_ACTIVE_SUBAGENTS_HARD_CAP = 500
 
+# Absolute host-visible nesting ceiling. Both live settings and persisted
+# admission facts are bounded by this value.
+MAX_SUBAGENT_DEPTH_HARD_CAP = 10
+
 
 def get_max_active_subagents_per_root() -> int:
     return _bounded_positive_int_setting(
@@ -797,7 +801,7 @@ def get_max_subagent_depth() -> int:
     return _bounded_positive_int_setting(
         "OUROBOROS_MAX_SUBAGENT_DEPTH",
         default=int(SETTINGS_DEFAULTS["OUROBOROS_MAX_SUBAGENT_DEPTH"]),
-        hard_max=10,
+        hard_max=MAX_SUBAGENT_DEPTH_HARD_CAP,
         min_value=0,
     )
 

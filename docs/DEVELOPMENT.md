@@ -1181,7 +1181,10 @@ Before every commit, verify the following:
   `depth_provenance` facts (`requested_depth`,
   `permitted_depth`, `attempted_depth`, and host-visible `achieved_depth`), where
   an absent explicit root request remains unknown rather than being inferred from
-  prose or a vendor's internal children.
+  prose or a vendor's internal children. Persisted permission remains monotonic
+  across ordinary Settings changes, while the explicit global depth value `0`
+  still refuses every new descendant and the immutable hard ceiling bounds any
+  malformed persisted projection.
 - `subagent_id` selects one complete row from the canonical enabled
   `OUROBOROS_SUBAGENTS` list. At schedule time, freeze the normalized row and list
   fingerprint into the task; dispatch/restart must use that snapshot rather than

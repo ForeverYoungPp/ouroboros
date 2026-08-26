@@ -17,6 +17,32 @@ from ouroboros.tools.control_delegation import (
 )
 
 
+def test_persisted_depth_provenance_cannot_exceed_immutable_host_ceiling():
+    contract = build_task_contract({
+        "delegation_budget": {
+            "depth_provenance": {
+                "requested_depth": 99,
+                "permitted_depth": 99,
+                "attempted_depth": 1,
+            },
+        },
+    })
+
+    assert admitted_depth_cap(contract, 7) == 10
+    assert admitted_depth_cap(contract, 99) == 10
+    child = child_budget_for_schedule(
+        contract,
+        current_depth=1,
+        new_depth=2,
+        max_depth=99,
+        may_mutate=False,
+        may_fan_out=True,
+        max_children=0,
+        intent_note="",
+    )
+    assert child["depth_provenance"]["permitted_depth"] == 10
+
+
 def test_explicit_rights_are_typed_and_legacy_omission_stays_permissive():
     assert check_delegation_admission({"may_delegate": False}).reason_code == "delegation_rights_may_delegate"
     assert check_delegation_admission({"may_delegate": "false"}).reason_code == "delegation_rights_may_delegate"
@@ -320,6 +346,15 @@ def test_supervisor_schedule_path_preserves_admitted_cap_after_live_depth_decrea
     contract = build_task_contract({
         "delegation_budget": {
             "depth_remaining": 1,
+            "depth_provenance": {
+                "requested_depth": 3,
+                "permitted_depth": 3,
+                "attempted_depth": 2,
+                "achieved_depth": None,
+            },
+        },
+    })
+    event = _schedule_event("child", "parent", depth=2, drive_root=tmp_path)
             "depth_provenance": {
                 "requested_depth": 3,
                 "permitted_depth": 3,
