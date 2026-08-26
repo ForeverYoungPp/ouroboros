@@ -121,6 +121,7 @@ def test_caption_call_records_observability(monkeypatch, tmp_path):
 
     monkeypatch.setenv("OUROBOROS_IMAGE_INPUT_MODE", "caption")
     monkeypatch.setenv("OUROBOROS_MODEL_VISION", "google/gemini-3.5-flash")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "0")
     messages = _image_message()
     messages[0]["content"][1].pop("_caption")
 
@@ -162,6 +163,29 @@ def test_expired_caption_window_does_not_dispatch_model(monkeypatch):
         messages,
         routing=VisionRoutingContext(
             "not/vision", FakeLLM(), {}, deadline_ts=time.time() - 10,
+        ),
+    )
+
+    assert "caption unavailable" in out[0]["content"][1]["text"]
+
+
+def test_caption_does_not_start_inside_finalization_reserve(monkeypatch):
+    import time
+    from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
+
+    class FakeLLM:
+        def vision_query(self, *args, **kwargs):
+            raise AssertionError("reserve-only owner window must not dispatch a caption")
+
+    monkeypatch.setenv("OUROBOROS_IMAGE_INPUT_MODE", "caption")
+    monkeypatch.setenv("OUROBOROS_MODEL_VISION", "google/gemini-3.5-flash")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+    messages = _image_message()
+    messages[0]["content"][1].pop("_caption")
+    out = prepare_messages_for_send(
+        messages,
+        routing=VisionRoutingContext(
+            "not/vision", FakeLLM(), {}, deadline_ts=time.time() + 5,
         ),
     )
 

@@ -90,6 +90,22 @@ def test_vlm_nested_windows_fit_inside_owner_deadline(monkeypatch):
     assert provider_timeout + NESTED_SETTLEMENT_MARGIN_SEC < outer_timeout <= 100
 
 
+def test_vlm_does_not_start_inside_nested_settlement_reserve(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from ouroboros.tools.vision import _vision_timeout_for_context
+
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+    monkeypatch.setenv("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", "90")
+    ctx = SimpleNamespace(task_metadata={
+        "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat(),
+    })
+
+    with pytest.raises(TimeoutError, match="insufficient owner-deadline window"):
+        _vision_timeout_for_context(ctx)
+
+
 class TestLLMVisionQuery(unittest.TestCase):
     """Test LLMClient.vision_query() message format."""
 

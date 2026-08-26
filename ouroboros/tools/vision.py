@@ -35,10 +35,12 @@ def _vision_timeout_for_context(ctx: Any) -> float:
         reserve = effective_finalization_reserve_sec(ctx)
     except Exception:
         reserve = 0
-    # Admission uses the raw owner deadline. The provider/child/finalization
-    # reserve remains a transport-and-settlement bound after admission.
+    # Admission consumes the whole provider/child/finalization reserve. The
+    # transport helper repeats the same bound for an already-admitted call.
     transport_reserve = reserve + (2 * NESTED_SETTLEMENT_MARGIN_SEC)
-    if owner_deadline_exhausted(deadline_at=deadline_at, deadline_ts=deadline_ts):
+    if owner_deadline_exhausted(
+        deadline_at=deadline_at, deadline_ts=deadline_ts, reserve_sec=transport_reserve,
+    ):
         raise TimeoutError(
             "insufficient owner-deadline window for VLM provider and settlement custody"
         )

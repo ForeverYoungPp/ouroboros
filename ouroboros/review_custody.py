@@ -575,6 +575,12 @@ def run_custodied_review_slots(
         nonlocal paid_stamped
         key = _attempt_key(request, slot)
         slot_id = str(getattr(slot, "slot_id", "") or "")
+        reserved_surface = (getattr(usage_ctx, "_review_reserved_operations", {}) or {}).get(
+            str(getattr(request, "surface", "") or ""), {}
+        )
+        reserved_operation_id = str(reserved_surface.get(slot_id) or "") if isinstance(
+            reserved_surface, dict
+        ) else ""
         window = _logical_timeout(slot, request, usage_meta)
         slot_windows[slot_id] = window
         slot_deadlines[slot_id] = time.monotonic() + window
@@ -653,19 +659,6 @@ def run_custodied_review_slots(
                     slot_windows[slot_id] = window
                     slot_deadlines[slot_id] = time.monotonic() + window
                 if window > 0:
-                    reserved_surfaces = getattr(
-                        usage_ctx, "_review_reserved_operations", None,
-                    )
-                    reserved_surface = (
-                        reserved_surfaces.get(
-                            str(getattr(request, "surface", "") or ""), {},
-                        )
-                        if isinstance(reserved_surfaces, dict)
-                        else {}
-                    )
-                    reserved_operation_id = str(
-                        reserved_surface.get(slot_id) or ""
-                    )
                     entry = ActiveReviewAttempt(
                         key=key,
                         operation_id=retry_operation_id or reserved_operation_id or new_call_id(
@@ -725,7 +718,7 @@ def run_custodied_review_slots(
         if entry is None:
             immediate_actors[slot_id] = error_actor(
                 slot, "Owner deadline exhausted before physical review dispatch",
-                "", "not_dispatched",
+                reserved_operation_id, "not_dispatched",
             )
             return
         slot_entries[slot_id] = entry

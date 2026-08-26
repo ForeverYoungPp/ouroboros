@@ -22,7 +22,11 @@ def is_pre_dispatch_transport_failure(exc: BaseException) -> bool:
         seen.add(id(current))
         if isinstance(current, safe_types):
             return True
-        current = current.__cause__ or current.__context__
+        # Only an explicit ``raise ... from ...`` chain carries transport
+        # provenance.  Implicit ``__context__`` also links a later fallback
+        # exception to the previous provider leg, which would misclassify a
+        # dispatched read timeout as a pre-dispatch connect failure.
+        current = current.__cause__
     return False
 
 

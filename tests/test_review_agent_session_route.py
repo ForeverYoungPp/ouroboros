@@ -615,6 +615,26 @@ def test_spent_owner_deadline_skips_light_model_extraction():
     assert usage["dispatch"] == "not_dispatched"
 
 
+def test_reserve_only_owner_window_skips_light_model_extraction(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from ouroboros.review_execution import _extract_verdict_via_light_model
+
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+
+    class NeverCalled:
+        def chat(self, **_kwargs):
+            raise AssertionError("reserve-only owner window must not dispatch extraction")
+
+    deadline = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    canonical, usage = _extract_verdict_via_light_model(
+        "narrative", llm=NeverCalled(), deadline_at=deadline,
+    )
+
+    assert canonical is None
+    assert usage["reason_code"] == "deadline_exhausted"
+    assert usage["dispatch"] == "not_dispatched"
+
+
 # ---------------------------------------------------------------------------
 # Delivery mechanics
 # ---------------------------------------------------------------------------
@@ -1601,13 +1621,14 @@ def test_started_run_reports_whether_its_custody_row_landed(tmp_path, fake_route
     assert _run_session_directly(tmp_path)["custody_durable"] is False
 
 
-def test_session_is_never_restarted_for_format_repair(tmp_path, fake_route):
+def test_session_is_never_restarted_for_format_repair(tmp_path, fake_route, monkeypatch):
     """5.5: a resend over bad output performs local extraction over the already
     collected transcript — the session is not relaunched."""
     from ouroboros.review_execution import AgentSessionReviewExecutor, ReviewAssignment
 
     fake_route.manifest_capabilities = {}
     fake_route.detail = _terminal_detail("prose without a verdict")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "0")
     llm = FakeLLM(reply="UNEXTRACTABLE")
     from datetime import datetime, timedelta, timezone
 
@@ -1729,6 +1750,33 @@ def test_api_review_rechecks_owner_deadline_at_physical_boundary(tmp_path, fake_
     )
     # Stand in for a long prompt/render/persistence phase. The final check is
     # deliberately after `_kwargs()` and immediately before `chat`.
+    monkeypatch.setattr(executor, "_kwargs", lambda: {"messages": [], "model": "fake"})
+
+    with pytest.raises(ReviewRouteUnavailable) as caught:
+        executor.execute()
+    assert caught.value.code == "deadline_exhausted"
+    assert llm.calls == []
+
+
+def test_api_review_does_not_dispatch_inside_finalization_reserve(
+    tmp_path, fake_route, monkeypatch,
+):
+    from datetime import datetime, timedelta, timezone
+    from ouroboros.review_execution import (
+        ApiChatReviewExecutor, ReviewAssignment, ReviewRouteUnavailable,
+    )
+
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+    deadline = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    llm = FakeLLM()
+    executor = ApiChatReviewExecutor(
+        ReviewAssignment(
+            request=_agent_request(deadline_at=deadline),
+            slot=_agent_slot(route=ReviewRouteKind.API_CHAT),
+            custody_root=tmp_path,
+        ),
+        llm=llm,
+    )
     monkeypatch.setattr(executor, "_kwargs", lambda: {"messages": [], "model": "fake"})
 
     with pytest.raises(ReviewRouteUnavailable) as caught:

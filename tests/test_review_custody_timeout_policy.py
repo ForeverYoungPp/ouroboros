@@ -65,6 +65,184 @@ def test_spent_deadline_restart_reconciliation_gets_only_a_settlement_window(
     assert actor.operation_state == "settled"
 
 
+def test_reserved_operation_keeps_not_dispatched_identity_inside_reserve(
+    tmp_path, monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import (
+        reconcile_reserved_review_roster, run_custodied_review_slots,
+    )
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+    reserved = {
+        "multi_model_review": [{
+            "slot_id": "slot-1", "model_id": "cursor/test", "route": "api_chat",
+            "status": "in_flight", "operation_id": "op-reserved",
+            "operation_state": "in_flight", "late_result_pending": True,
+        }],
+        "scope_review": [],
+    }
+    ctx = SimpleNamespace(
+        _review_reserved_operations={"multi_model_review": {"slot-1": "op-reserved"}},
+        _review_reserved_roster=reserved,
+    )
+
+    def error_actor(slot, error, operation_id="", operation_state="settled"):
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="not_dispatched",
+            error=error, operation_id=operation_id, operation_state=operation_state,
+        )
+
+    [actor] = run_custodied_review_slots(
+        request=ReviewRequest(
+            surface="multi_model_review", goal="review", task_id="reserve-only",
+            retry_key="commit_review:reserve-only", deadline_at="2000-01-01T00:00:00Z",
+        ),
+        slots=[ReviewSlot(
+            slot_id="slot-1", model="cursor/test", route=ReviewRouteKind.API_CHAT,
+        )],
+        usage_ctx=ctx, task_id="reserve-only",
+        usage_meta={"deadline_at": "2000-01-01T00:00:00Z"},
+        review_usage_scope=UsageScope(drive_root=tmp_path, task_id="reserve-only"),
+        run_slot=lambda *_args: pytest.fail("reserve-only row dispatched"),
+        error_actor=error_actor,
+    )
+
+    assert actor.operation_id == "op-reserved"
+    assert actor.operation_state == "not_dispatched"
+    ctx._last_triad_raw_results = [{
+        "slot_id": actor.slot_id, "status": actor.status,
+        "operation_id": actor.operation_id, "operation_state": actor.operation_state,
+        "late_result_pending": False,
+    }]
+    ctx._last_scope_raw_results = []
+    reconcile_reserved_review_roster(ctx, reserved)
+    assert ctx._last_triad_raw_results[0]["operation_state"] == "not_dispatched"
+    assert getattr(ctx, "_review_custody_lost", False) is False
+
+
+def test_custody_lost_error_actor_remains_pending_for_plan_review(tmp_path):
+    from ouroboros.review_substrate import (
+        ReviewCoordinator, ReviewRequest, ReviewSlot,
+    )
+
+    coordinator = ReviewCoordinator(drive_root=tmp_path, usage_ctx=None)
+    actor = coordinator._error_actor(
+        ReviewRequest(surface="plan_review", goal="review", task_id="pending"),
+        ReviewSlot(slot_id="slot-1", model="test/model"),
+        "provider outcome is unknown",
+        operation_id="op-1",
+        operation_state="custody_lost",
+    )
+
+    assert actor.operation_state == "custody_lost"
+    assert actor.late_result_pending is True
+
+
+def test_failed_commit_roster_stamp_drops_unsent_process_local_reservation(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from ouroboros.tools.parallel_review import _reserve_parallel_review_roster
+
+    ctx = SimpleNamespace(_triad_withheld_seat_records=[])
+
+    def fail_stamp(_ctx):
+        raise RuntimeError("write-ahead unavailable")
+
+    monkeypatch.setattr(
+        "ouroboros.review_dispatch.stamp_review_paid_on_dispatch", fail_stamp,
+    )
+    with pytest.raises(RuntimeError, match="write-ahead unavailable"):
+        _reserve_parallel_review_roster(
+            ctx,
+            {"row_plan": {
+                "models": ["test/model"], "routes": ["api_chat"],
+                "efforts": ["high"], "slot_ids": ["slot-1"],
+            }},
+            [],
+        )
+
+    assert getattr(ctx, "_review_reserved_roster", None) is None
+    assert getattr(ctx, "_review_reserved_operations", {}) == {}
+
+
+def test_spent_owner_window_does_not_stamp_zero_dispatch_commit_roster(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from ouroboros.tools.parallel_review import _reserve_parallel_review_roster
+
+    stamp_calls = []
+    ctx = SimpleNamespace(
+        _triad_withheld_seat_records=[],
+        task_metadata={"deadline_at": "2000-01-01T00:00:00Z"},
+    )
+    monkeypatch.setattr(
+        "ouroboros.review_dispatch.stamp_review_paid_on_dispatch",
+        lambda _ctx: stamp_calls.append("paid"),
+    )
+
+    _reserve_parallel_review_roster(
+        ctx,
+        {"row_plan": {
+            "models": ["test/model"], "routes": ["api_chat"],
+            "efforts": ["high"], "slot_ids": ["slot-1"],
+        }},
+        [],
+    )
+
+    assert stamp_calls == []
+    assert ctx._review_reserved_roster["multi_model_review"][0]["operation_id"]
+    assert ctx._review_reserved_operations["multi_model_review"]["slot-1"]
+
+
+def test_binding_refusal_clears_commit_reconcile_mode_before_return(
+    tmp_path, monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from ouroboros.tools import git as git_tools
+
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path,
+        task_id="binding-refusal",
+        task_metadata={},
+        _review_resume_pending=True,
+        _pending_review_attempt=SimpleNamespace(review_retry_key="exact"),
+    )
+    monkeypatch.setattr(
+        git_tools, "_stage_candidate_for_review",
+        lambda *_args, **_kwargs: ([], [], None),
+    )
+    monkeypatch.setattr(
+        git_tools, "_fingerprint_staged_diff",
+        lambda *_args, **_kwargs: {"ok": True, "fingerprint": "fp"},
+    )
+    monkeypatch.setattr(
+        git_tools, "_free_cycle_gate",
+        lambda run_ctx, *_args, **_kwargs: (
+            setattr(run_ctx, "_review_reconcile_only", True) or None
+        ),
+    )
+    monkeypatch.setattr(
+        git_tools, "_review_binding_precondition_error",
+        lambda *_args, **_kwargs: "binding is invalid",
+    )
+    monkeypatch.setattr(git_tools, "_record_commit_attempt", lambda *_a, **_k: None)
+
+    outcome = git_tools._run_reviewed_stage_cycle(ctx, "message", 0.0)
+
+    assert outcome["block_reason"] == "review_binding_invalid"
+    assert ctx._review_reconcile_only is False
+
+
 @pytest.mark.parametrize(
     "pending_invocation_id,operation_id",
     [("inv-existing", ""), ("", "op-existing")],

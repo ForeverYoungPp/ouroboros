@@ -39,6 +39,7 @@ from ouroboros.deadline_utils import (
     bounded_seconds, owner_deadline_exhausted,
     review_transport_timeout,
 )
+from ouroboros.config import get_finalization_grace_sec
 from ouroboros.review_session_custody import (
     checkpoint_pending_invocation,
     owned_started_review_custody,
@@ -386,7 +387,7 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
         if not callable(chat) and not callable(async_chat):
             raise ReviewRouteUnavailable("api_chat client exposes no callable transport", code="api_chat_unavailable")
         deadline_at = str(getattr(self.assignment.request, "deadline_at", "") or "")
-        if owner_deadline_exhausted(deadline_at=deadline_at):
+        if owner_deadline_exhausted(deadline_at=deadline_at, reserve_sec=get_finalization_grace_sec()):
             raise _deadline_exhausted_error()
         with bind_api_review_paid_stamp(self.assignment.dispatch_stamp):
             try:
@@ -662,7 +663,8 @@ def _extract_verdict_via_light_model(
     if not str(raw_text or "").strip():
         return None, {}
     model = get_light_model()
-    if owner_deadline_exhausted(deadline_at=deadline_at):
+    from ouroboros.config import get_finalization_grace_sec
+    if owner_deadline_exhausted(deadline_at=deadline_at, reserve_sec=get_finalization_grace_sec()):
         return None, {"model": model, "reason_code": "deadline_exhausted", "dispatch": "not_dispatched"}
     prompt = _SESSION_EXTRACT_PROMPT.format(
         contract=contract or REVIEW_JSON_ARRAY_CONTRACT,
@@ -671,7 +673,7 @@ def _extract_verdict_via_light_model(
     # Formatting the extraction prompt can itself be expensive. Re-check at
     # the physical light-model boundary rather than letting an expired owner
     # window reach the transport helper's positive floor.
-    if owner_deadline_exhausted(deadline_at=deadline_at):
+    if owner_deadline_exhausted(deadline_at=deadline_at, reserve_sec=get_finalization_grace_sec()):
         return None, {"model": model, "reason_code": "deadline_exhausted", "dispatch": "not_dispatched"}
     try:
         if llm is None:
@@ -942,11 +944,8 @@ def run_delegated_review_session(
             if schema_asked:
                 run_request["outputSchema"] = output_schema
         if not run_id:
-            if (
-                not recovering
-                and owner_deadline_at
-                and owner_deadline_exhausted(deadline_at=owner_deadline_at)
-            ):
+            if (not recovering and owner_deadline_at and owner_deadline_exhausted(
+                deadline_at=owner_deadline_at, reserve_sec=get_finalization_grace_sec())):
                 raise _deadline_exhausted_error()
             seconds = bounded_seconds(
                 run_request.get("maxSeconds"),

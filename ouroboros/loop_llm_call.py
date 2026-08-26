@@ -393,8 +393,12 @@ def _deadline_not_dispatched(
     drive_logs: pathlib.Path, *, task_id: str, model: str, round_idx: int,
     event_queue: Optional[queue.Queue] = None, llm_call_id: str = "",
     task_attempt: Any = None, execution_id: str = "", round_id: str = "",
+    reserve_sec: Optional[float] = None,
 ) -> bool:
-    if not owner_deadline_exhausted(deadline_ts=deadline_ts):
+    admission_reserve = get_finalization_grace_sec() if reserve_sec is None else reserve_sec
+    if not owner_deadline_exhausted(
+        deadline_ts=deadline_ts, reserve_sec=admission_reserve,
+    ):
         return False
     if llm_call_id:
         _emit_llm_operation(
@@ -1085,7 +1089,7 @@ def call_llm_with_retry(
     for attempt in range(transient_budget):
         if _deadline_not_dispatched(
             deadline_ts, accumulated_usage, drive_logs,
-            task_id=task_id, model=model, round_idx=round_idx,
+            task_id=task_id, model=model, round_idx=round_idx, reserve_sec=transport_reserve_sec,
         ):
             return None, None
         accumulated_usage["_llm_attempts_used"] = attempt + 1
@@ -1162,7 +1166,7 @@ def call_llm_with_retry(
                 task_id=task_id, model=model, round_idx=round_idx,
                 event_queue=event_queue, llm_call_id=llm_call_id,
                 task_attempt=task_attempt, execution_id=execution_id,
-                round_id=round_id,
+                round_id=round_id, reserve_sec=transport_reserve_sec,
             ):
                 return None, None
             resp_msg, usage = _send_main_candidate(

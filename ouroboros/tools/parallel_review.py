@@ -40,9 +40,11 @@ def _reserve_parallel_review_roster(ctx, triad_prepared, scope_rows) -> None:
     """Reserve both commit-review surfaces before either executor pool starts.
 
     The immutable operation-id map is process-local execution state.  The full
-    roster is attached to the caller, then the existing paid write-ahead stamp
-    records both surfaces atomically in the existing CommitAttemptRecord.  A
-    stamp failure propagates before any worker or provider POST can start.
+    roster is attached to the caller.  When the owner deadline has no
+    dispatch window left, the roster remains an unpaid typed $0 wave; otherwise
+    the existing paid write-ahead stamp records both surfaces atomically in the
+    existing CommitAttemptRecord.  A stamp failure propagates before any
+    worker or provider POST can start.
     """
     from types import SimpleNamespace
 
@@ -96,7 +98,22 @@ def _reserve_parallel_review_roster(ctx, triad_prepared, scope_rows) -> None:
         "multi_model_review": triad_rows,
         "scope_review": scope_actor_rows,
     }
-    stamp_review_paid_on_dispatch(ctx)
+    from ouroboros.config import get_finalization_grace_sec
+    from ouroboros.deadline_utils import owner_deadline_exhausted_for_context
+
+    if owner_deadline_exhausted_for_context(
+        ctx, reserve_sec=get_finalization_grace_sec(),
+    ):
+        return
+    try:
+        stamp_review_paid_on_dispatch(ctx)
+    except Exception:
+        # No worker can have started before the write-ahead stamp.  Do not let
+        # the outer reconciliation turn this unsent process-local reservation
+        # into durable custody_lost when the stamp itself failed.
+        ctx._review_reserved_roster = None
+        ctx._review_reserved_operations = {}
+        raise
 
 
 def _scope_history_entry(scope_result) -> dict:

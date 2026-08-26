@@ -1270,7 +1270,7 @@ class ReviewCoordinator:
             response_ref=response_ref,
             operation_id=str(operation_id or ""),
             operation_state=str(operation_state or "settled"),
-            late_result_pending=str(operation_state or "") == "in_flight",
+            late_result_pending=str(operation_state or "") in {"in_flight", "custody_lost"},
         )
 
     def _run_slot(
@@ -1347,8 +1347,11 @@ class ReviewCoordinator:
                 duration_sec=round(time.time() - start, 3),
             )
         owner_deadline = str(getattr(request, "deadline_at", "") or "")
+        from ouroboros.config import get_finalization_grace_sec
         from ouroboros.deadline_utils import owner_deadline_exhausted
-        if owner_deadline_exhausted(deadline_at=owner_deadline):
+        if owner_deadline_exhausted(
+            deadline_at=owner_deadline, reserve_sec=get_finalization_grace_sec(),
+        ):
             return self._error_actor(
                 request,
                 slot,

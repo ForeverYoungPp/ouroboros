@@ -1198,6 +1198,9 @@ def _run_reviewed_stage_cycle(
                 pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
                 fingerprint_status="invalid",
             )
+        # Reconciliation is owned only by the exact commit-review dispatch
+        # below.  This pre-dispatch refusal has no finally block to clear it.
+        ctx._review_reconcile_only = False
         return {
             "status": "blocked",
             "message": binding_error,

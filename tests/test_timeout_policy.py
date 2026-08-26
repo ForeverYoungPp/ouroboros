@@ -48,6 +48,16 @@ def test_dispatch_window_distinguishes_no_deadline_from_spent_deadline(monkeypat
     assert deadlines.dispatch_window_remaining_sec(deadline_ts=999.0) == 0.0
 
 
+def test_owner_deadline_admission_can_reserve_settlement_window(monkeypatch):
+    import ouroboros.deadline_utils as deadlines
+
+    monkeypatch.setattr(deadlines.time, "time", lambda: 1000.0)
+    assert deadlines.owner_deadline_exhausted(deadline_ts=1005.0) is False
+    assert deadlines.owner_deadline_exhausted(
+        deadline_ts=1005.0, reserve_sec=5,
+    ) is True
+
+
 def test_spent_web_search_deadline_never_reverts_to_the_provider_default(monkeypatch):
     from types import SimpleNamespace
     from ouroboros.tools.search import _web_search_transport_timeout
@@ -93,6 +103,28 @@ def test_spent_main_deadline_does_not_dispatch_or_fallback(tmp_path):
 
     assert message is None and cost is None
     assert usage["_last_llm_error_kind"] == "deadline_exhausted"
+    assert usage["reason_code"] == "deadline_exhausted"
+
+
+def test_main_call_inside_finalization_reserve_does_not_dispatch(tmp_path, monkeypatch):
+    import ouroboros.deadline_utils as deadlines
+    from ouroboros.loop_llm_call import call_llm_with_retry
+
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+    monkeypatch.setattr(deadlines.time, "time", lambda: 1000.0)
+
+    class NeverCalled:
+        def chat(self, **_kwargs):
+            raise AssertionError("reserve-only owner window must not call provider")
+
+    usage = {}
+    message, cost = call_llm_with_retry(
+        NeverCalled(), [{"role": "user", "content": "x"}], "openai/gpt-5.5",
+        None, "high", 1, tmp_path / "logs", "reserve-task", 1, None, usage,
+        deadline_ts=1005,
+    )
+
+    assert message is None and cost is None
     assert usage["reason_code"] == "deadline_exhausted"
 
 

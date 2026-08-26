@@ -35,6 +35,8 @@ from ouroboros.review_state import (
     _utc_now,
 )
 from ouroboros.config import get_review_enforcement as _get_review_enforcement
+from ouroboros.config import get_finalization_grace_sec
+from ouroboros.deadline_utils import owner_deadline_exhausted_for_context
 from ouroboros.tools.review_helpers import (
     build_advisory_changed_context,
     build_skill_host_context,
@@ -1201,7 +1203,6 @@ def _run_claude_advisory(
     # as before; the delegated route runs on the subscription and needs none.
     if not api_key and not delegated_route:
         return [], "⚠️ ADVISORY_ERROR: ANTHROPIC_API_KEY not set (advisory route=api).", "", 0
-
     if delegated_route:
         model = ""  # the session route resolves its own model; reported after the run
         _slot = None
@@ -1314,6 +1315,8 @@ def _run_claude_advisory(
             max_budget_usd = options.get("max_budget_usd")
             if max_budget_usd is None:
                 max_budget_usd = _advisory_sdk_budget(ctx, active_scope, drive_root, repo_dir)
+            if owner_deadline_exhausted_for_context(ctx, reserve_sec=get_finalization_grace_sec()):
+                raise TimeoutError("owner deadline leaves no dispatch window for advisory review")
             if active_scope is not None:
                 from dataclasses import replace
                 from ouroboros.usage_accounting import usage_scope

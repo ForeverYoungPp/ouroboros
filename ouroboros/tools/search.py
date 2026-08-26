@@ -81,13 +81,9 @@ def _web_search_transport_timeout(ctx: Any) -> float:
 
 
 def _web_search_deadline_exhausted(ctx: Any) -> bool:
-    from ouroboros.deadline_utils import owner_deadline_exhausted
-
-    metadata = getattr(ctx, "task_metadata", {})
-    deadline_at = metadata.get("deadline_at") if isinstance(metadata, dict) else None
-    return owner_deadline_exhausted(
-        deadline_at=deadline_at, deadline_ts=getattr(ctx, "deadline_ts", None),
-    )
+    from ouroboros.deadline_utils import owner_deadline_exhausted_for_context
+    from ouroboros.task_pacing import effective_finalization_reserve_sec
+    return owner_deadline_exhausted_for_context(ctx, reserve_sec=effective_finalization_reserve_sec(ctx))
 
 
 def _web_search_deadline_result() -> str:
@@ -300,6 +296,8 @@ def _emit_simple_usage(
 
 
 def _web_search_openrouter(ctx: ToolContext, query: str, model: str = "", search_context_size: str = "") -> str:
+    if _web_search_deadline_exhausted(ctx):
+        return _web_search_deadline_result()
     api_key = str(os.environ.get("OPENROUTER_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not configured")
@@ -349,6 +347,8 @@ def _web_search_openrouter(ctx: ToolContext, query: str, model: str = "", search
 
 
 def _web_search_anthropic(ctx: ToolContext, query: str, model: str = "") -> str:
+    if _web_search_deadline_exhausted(ctx):
+        return _web_search_deadline_result()
     api_key = str(os.environ.get("ANTHROPIC_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not configured")
@@ -497,11 +497,9 @@ def _web_search(
 ) -> str:
     if _web_search_deadline_exhausted(ctx):
         return _web_search_deadline_result()
-    # Backend pin: force ONE backend regardless of which provider keys are present.
-    # A fixed-model run pins 'ddgs' so web_search is pure-retrieval (no second LLM
-    # contaminating the "single fixed model" claim). 'openai' pins the OpenAI leg only
-    # (no cascade — see _fallbacks). 'auto'/'' keep the default OpenAI-first cascade
-    # below. This is a config gate on TRANSPORT, not on agent behaviour (P5-safe).
+    # Backend pin forces ONE backend. Fixed-model runs pin pure-retrieval 'ddgs',
+    # 'openai' pins its leg, and 'auto'/'' keep the cascade below. This is a
+    # transport config gate, not an agent-behaviour gate (P5-safe).
     pinned = _web_search_backend_pin()
     if pinned in ("ddgs", "openrouter", "anthropic"):
         try:
@@ -550,6 +548,8 @@ def _web_search(
             ("ddgs", lambda: _web_search_ddgs(query)),
         ):
             try:
+                if _web_search_deadline_exhausted(ctx):
+                    return _web_search_deadline_result()
                 return backend()
             except UsageAccountingError:
                 raise
@@ -586,7 +586,6 @@ def _web_search(
             timeout=transport_timeout,
             max_retries=0,
         )
-
         # Reserve before dispatch; settle only after the terminal stream event.
         scope = _accounting_scope(ctx, "web_search.openai_responses")
         reservation = reserve_attempt(AttemptRequest(
@@ -618,7 +617,6 @@ def _web_search(
             input=query,
             stream=True,
         )
-
         text_parts: list[str] = []
         usage: dict = {}
         sources: List[Dict[str, str]] = []

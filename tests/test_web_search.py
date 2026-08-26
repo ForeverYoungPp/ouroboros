@@ -238,6 +238,32 @@ def test_provider_owned_search_recomputes_the_owner_bounded_timeout(monkeypatch)
     assert 0 < captured["anthropic"] <= captured["openrouter"] <= 31
 
 
+def test_provider_owned_search_refuses_inside_finalization_reserve(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from ouroboros import llm
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+    calls = []
+
+    def fake_openrouter(**_kwargs):
+        calls.append(1)
+        raise AssertionError("reserve-only owner window must not dispatch search")
+
+    monkeypatch.setattr(llm, "openrouter_web_search_server_tool", fake_openrouter)
+    ctx = types.SimpleNamespace(
+        pending_events=[], emit_progress_fn=MagicMock(),
+        task_metadata={
+            "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat(),
+        },
+    )
+
+    result = json.loads(search_module._web_search_openrouter(ctx, "q"))
+
+    assert result["reason_code"] == "deadline_exhausted"
+    assert calls == []
+
+
 def test_provider_owned_search_without_deadline_uses_the_configured_transport_cap(monkeypatch):
     monkeypatch.setenv("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "321")
     ctx = types.SimpleNamespace(task_metadata={})
@@ -545,6 +571,54 @@ def test_connect_phase_failure_releases_attempt_and_uses_fallback(ctx, patch_env
 
     assert result["answer"] == "fallback"
     assert calls == {"openai": 1, "fallback": 1}
+
+
+def test_fallback_read_timeout_keeps_its_dispatched_attempt_unresolved(
+    ctx, patch_env, monkeypatch, tmp_path,
+):
+    """An exception raised in a prior-leg handler inherits that leg as context."""
+    import httpx
+    from ouroboros import usage_accounting as ua
+
+    class _Responses:
+        def create(self, **_kwargs):
+            raise httpx.ConnectError("first leg refused")
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.responses = _Responses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setitem(sys.modules, "ddgs", None)
+
+    def fallback(_ctx, *_args, **_kwargs):
+        request = ua.AttemptRequest(
+            model="openai/fallback", provider="openrouter", reservation_usd=1.0,
+            drive_root=tmp_path, task_id="fallback", root_task_id="fallback",
+            source="test.web_search",
+        )
+
+        def send():
+            raise httpx.ReadTimeout("second leg timed out after dispatch")
+
+        return ua.execute_physical_attempt(request, send)
+
+    monkeypatch.setattr(search_module, "_web_search_openrouter", fallback)
+    ctx.task_metadata["budget_drive_root"] = str(tmp_path)
+    result = json.loads(_web_search(ctx, "fallback timeout"))
+
+    assert result["reason_code"] == "provider_outcome_unknown"
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / ua.LEDGER_REL).read_text().splitlines()
+        if line.strip()
+    ]
+    final_states = {}
+    for row in rows:
+        final_states[row["attempt_id"]] = row["state"]
+    assert list(final_states.values()) == ["released", "unresolved"]
 
 
 def test_spent_owner_deadline_does_not_start_web_search(ctx, patch_env, monkeypatch):

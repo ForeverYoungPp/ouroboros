@@ -129,12 +129,23 @@ def dispatch_window_remaining_sec(
     return max(0.0, remaining - reserve)
 
 
-def owner_deadline_exhausted(*, deadline_at: Any = None, deadline_ts: Any = None) -> bool:
-    """Whether a raw owner deadline forbids a new physical dispatch."""
+def owner_deadline_exhausted(
+    *, deadline_at: Any = None, deadline_ts: Any = None, reserve_sec: Any = 0.0,
+) -> bool:
+    """Whether the owner window, optionally minus a settlement reserve, is spent."""
     remaining = dispatch_window_remaining_sec(
-        deadline_at=deadline_at, deadline_ts=deadline_ts, reserve_sec=0,
+        deadline_at=deadline_at, deadline_ts=deadline_ts, reserve_sec=reserve_sec,
     )
     return remaining is not None and remaining <= 0
+
+
+def owner_deadline_exhausted_for_context(ctx: Any, *, reserve_sec: Any = 0.0) -> bool:
+    """Apply the same admission rule to a task context's ISO or epoch deadline."""
+    metadata = getattr(ctx, "task_metadata", {})
+    deadline_at = metadata.get("deadline_at") if isinstance(metadata, dict) else None
+    return owner_deadline_exhausted(
+        deadline_at=deadline_at, deadline_ts=getattr(ctx, "deadline_ts", None), reserve_sec=reserve_sec,
+    )
 
 
 def transport_timeout_with_deadline(

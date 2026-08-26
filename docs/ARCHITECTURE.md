@@ -1986,8 +1986,11 @@ as a generic review-reasoning cutoff. A returned provider response or typed
 terminal error
 is settled even when its body is empty/incomplete, so bounded repair/retry may
 apply. A dead socket or unterminated stream after dispatch is instead
-`provider_outcome_unknown` and cannot trigger another paid route. A spent owner
-window yields a typed `$0
+`provider_outcome_unknown` and cannot trigger another paid route. Custody does
+not infer pre-dispatch provenance from Python's implicit `__context__`, because a
+fallback raised inside a prior provider handler can inherit that earlier attempt;
+only an explicit `__cause__` or typed transport metadata can release a row. A
+spent owner window yields a typed `$0
 not_dispatched` row before fan-out; under blocking enforcement an in-flight
 triad row remains pending instead of becoming a final quorum verdict. A
 reviewed commit has no independent outer tool cutoff: the foreground caller
@@ -1999,7 +2002,9 @@ part of that identity, while a changed snapshot, owner intent, reviewer route, o
 admitted cycle mints a new one. Commit review takes that material identity from
 the canonical staged tree/parent binding. Before either parallel surface starts,
 one locked write records `paid=True` plus both complete slot rosters and their
-operation ids in the existing commit-attempt row. A delegated slot patches only
+operation ids in the existing commit-attempt row, unless the owner window has
+already spent its finalization reserve; that prepared roster stays a typed
+unpaid `$0` wave and no paid stamp is fired. A delegated slot patches only
 its exact reserved row with `pending_invocation_id` after `START_REQUESTED` and
 before the provider POST. Exact resume preserves those rows and tokens, while a
 missing or mismatched operation remains `custody_lost` under every enforcement

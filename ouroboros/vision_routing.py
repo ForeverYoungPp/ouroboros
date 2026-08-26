@@ -119,7 +119,10 @@ def _caption_for_block(
                 payload={"prompt": _CAPTION_PROMPT, "image_url": url, "model": model},
                 manifest={"model": model},
             )
-        if owner_deadline_exhausted(deadline_ts=getattr(ctx, "deadline_ts", None)):
+        reserve = _vision_finalization_reserve()
+        if owner_deadline_exhausted(
+            deadline_ts=getattr(ctx, "deadline_ts", None), reserve_sec=reserve,
+        ):
             raise TimeoutError("owner deadline leaves no window for a vision caption")
         text, usage = llm.vision_query(
             _CAPTION_PROMPT,
@@ -129,7 +132,7 @@ def _caption_for_block(
             timeout=transport_timeout_with_deadline(
                 get_vision_caption_timeout_sec(),
                 deadline_ts=getattr(ctx, "deadline_ts", None),
-                reserve_sec=_vision_finalization_reserve(),
+                reserve_sec=reserve,
             ),
         )
         try:

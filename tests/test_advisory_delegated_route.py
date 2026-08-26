@@ -155,6 +155,28 @@ def test_delegated_advisory_narrows_poll_window_to_owner_deadline(
     assert 0 < invocation.timeout_sec <= 45
 
 
+def test_delegated_advisory_does_not_start_inside_finalization_reserve(
+    tmp_path, monkeypatch, fake_route,
+):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "agent_session")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+    ctx = _ctx(tmp_path)
+    ctx.task_metadata = {
+        "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat(),
+    }
+
+    result, _model = advisory._run_advisory_delegated(
+        "review", pathlib.Path(ctx.repo_dir), ctx,
+    )
+
+    assert result.success is False
+    assert "owner deadline leaves no dispatch window" in result.error
+    assert not any(instance.start_requests for instance in fake_route.instances)
+
+
 def test_structured_session_without_effort_preserves_the_route_default(
     tmp_path, monkeypatch, fake_route,
 ):
@@ -433,6 +455,31 @@ def test_api_route_applies_the_advisory_rows_model_and_effort(tmp_path, monkeypa
     assert [i["item"] for i in items] == ["correctness"]
     assert captured["model"] == "sonnet" and model == "sonnet"
     assert captured["effort"] == "high"
+
+
+def test_api_advisory_does_not_start_inside_finalization_reserve(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from ouroboros.gateways import claude_code
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", _SLOTS_API_ADVISORY)
+    calls = []
+    monkeypatch.setattr(
+        claude_code, "run_readonly",
+        lambda **_kwargs: calls.append(1),
+    )
+    ctx = _ctx(tmp_path)
+    ctx.task_metadata = {
+        "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat(),
+    }
+
+    _items, raw, _model, _chars = advisory._run_claude_advisory(
+        ctx.repo_dir, "msg", ctx, options={"include_repo_diff": False},
+    )
+
+    assert calls == []
+    assert "owner deadline leaves no dispatch window" in raw
 
 
 def test_api_route_empty_target_falls_back_to_the_environment_default(tmp_path, monkeypatch):
