@@ -767,9 +767,15 @@ def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContex
 
         from ouroboros.reviewer_slot_config import advisory_slot_config
         from ouroboros.subagents import parse_subagent_harness
+        from ouroboros.config import get_finalization_grace_sec
+        from ouroboros.deadline_utils import review_operation_timeout_sec
 
         _slot = advisory_slot_config()
         _session_route = parse_subagent_harness(_slot.target_id) if _slot.target_id else None
+        _task_metadata = getattr(ctx, "task_metadata", {}) or {}
+        _owner_deadline_at = str(_task_metadata.get("deadline_at") or "") if isinstance(
+            _task_metadata, dict
+        ) else ""
         # D1/6.3: the effort field is the ONE source; any effort embedded in the
         # target identity is dropped so it can never override the field.
         if _session_route is not None:
@@ -785,10 +791,13 @@ def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContex
                 task_id=str(getattr(ctx, "task_id", "") or ""),
                 surface="advisory_review",
                 slot_id="advisory_slot_1",
-                timeout_sec=_ADVISORY_SESSION_MAX_SECONDS,
-                owner_deadline_at=str(
-                    (getattr(ctx, "task_metadata", {}) or {}).get("deadline_at") or ""
+                timeout_sec=review_operation_timeout_sec(
+                    _ADVISORY_SESSION_MAX_SECONDS,
+                    route="agent_session",
+                    deadline_at=_owner_deadline_at,
+                    reserve_sec=get_finalization_grace_sec(),
                 ),
+                owner_deadline_at=_owner_deadline_at,
                 # The owner's configured advisory slot route (6.1 SSOT) rides the
                 # invocation — the one identity+delivery value — not a parallel kwarg.
                 session_route=_session_route,

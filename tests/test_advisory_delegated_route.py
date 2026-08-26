@@ -119,6 +119,42 @@ def test_delegated_advisory_passes_expired_owner_deadline_before_dispatch(
     assert not any(instance.start_requests for instance in fake_route.instances)
 
 
+def test_delegated_advisory_narrows_poll_window_to_owner_deadline(
+    tmp_path, monkeypatch, fake_route,
+):
+    """A live advisory poll cannot outlive the task's remaining window."""
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "agent_session")
+    monkeypatch.setattr("ouroboros.config.get_finalization_grace_sec", lambda: 0)
+    captured = {}
+
+    def _fake_runner(**kwargs):
+        captured["invocation"] = kwargs["invocation"]
+        return {
+            "text": "[]", "run_id": "run-1", "route_id": "fake-review",
+            "model": "fake-small", "spend": None, "spend_estimated": False,
+            "settlement": {}, "schema_asked": False, "conformance": "failed",
+            "effective_route_ids": ["fake-review"],
+        }
+
+    import ouroboros.review_execution as review_execution
+    monkeypatch.setattr(review_execution, "run_delegated_review_session", _fake_runner)
+    deadline = (datetime.now(timezone.utc) + timedelta(seconds=45)).isoformat()
+    ctx = _ctx(tmp_path)
+    ctx.task_metadata = {"deadline_at": deadline}
+
+    result, _model = advisory._run_advisory_delegated(
+        "review", pathlib.Path(ctx.repo_dir), ctx,
+    )
+
+    assert result.success is True
+    invocation = captured["invocation"]
+    assert invocation.owner_deadline_at == deadline
+    assert 0 < invocation.timeout_sec <= 45
+
+
 def test_structured_session_without_effort_preserves_the_route_default(
     tmp_path, monkeypatch, fake_route,
 ):
