@@ -707,7 +707,11 @@ def test_review_grants_and_enable(slug, review_secret, install_skill, review_env
     review = json.loads((_skill_state_dir(name) / "review.json").read_text(encoding="utf-8"))
     assert review.get("content_hash") == loaded.content_hash
     models = list(review.get("reviewer_models") or [])
-    assert len(models) == 1 and models[0].rsplit("#", 1)[0] == _REVIEW_MODEL, models
+    assert len(models) == 1, models
+    # Reviewer identity may carry the stable slot attribution suffix introduced
+    # by the shared review substrate, while the model id remains the contract.
+    model_id = models[0].split(" [", 1)[0].rsplit("#", 1)[0]
+    assert model_id == _REVIEW_MODEL, models
     # Hash-verified official payloads get the official_hub profile (the
     # severity-downgrade that stabilizes verdicts); losing it silently would
     # change what this lane proves.
