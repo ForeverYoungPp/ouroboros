@@ -622,14 +622,6 @@ export function mergeReviewGroup(store, incoming) {
         attempts: order.map((id) => mergedById.get(id)).filter(Boolean),
         attemptCount: Math.max(prior.attemptCount || 0, incoming.attemptCount || 0, mergedById.size),
     };
-    if (incoming.lifecycleOnly && prior.verdict) {
-        // Keep the domain result while accepting the lifecycle frame's
-        // terminal state and any newly observed execution metadata.
-        merged.verdict = prior.verdict;
-        merged.tone = prior.tone;
-        merged.summary = prior.summary || incoming.summary;
-        merged.lifecycleOnly = false;
-    }
     if (staleActiveRegression) {
         merged.state = prior.state;
         merged.tone = prior.tone;
@@ -650,6 +642,20 @@ export function mergeReviewGroup(store, incoming) {
         merged.verdict = active.verdict || merged.state;
         merged.summary = active.summary || merged.summary;
         merged.activeCount = activeAttempts.length;
+    }
+    if (incoming.lifecycleOnly && incoming.attempts.length && !activeAttempts.length) {
+        // Project a lifecycle-only group from the latest merged attempt.  A
+        // late frame for an existing attempt inherits that attempt's typed
+        // verdict; a genuinely new attempt stays neutral instead of borrowing
+        // the previous attempt's group-level PASS.
+        const latestAttempt = merged.attempts.at(-1);
+        if (latestAttempt) {
+            merged.state = latestAttempt.state;
+            merged.tone = latestAttempt.tone;
+            merged.verdict = latestAttempt.verdict || '';
+            merged.summary = latestAttempt.summary || merged.summary;
+            merged.lifecycleOnly = Boolean(latestAttempt.lifecycleOnly);
+        }
     }
     merged.initiatorTaskId = uniformAttemptInitiator(
         merged.attempts,

@@ -450,6 +450,17 @@ test('lifecycle completion stays neutral until a semantic review verdict arrives
     assert.equal(merged.tone, 'done');
     assert.equal(merged.attempts.at(-1).verdict, 'clean');
     assert.equal(merged.attempts.at(-1).tone, 'done');
+
+    const newAttempt = reviewGroupFromLifecycle({ lifecycle: {
+        kind: 'review', status: 'succeeded', target: 'alpha', job_id: 'job-3',
+        group_id: 'task:root:alpha', presentation_owner_task_id: 'root',
+    } });
+    const newAttemptMerged = mergeReviewGroup(store, newAttempt);
+    assert.equal(newAttemptMerged.verdict, '');
+    assert.equal(newAttemptMerged.tone, 'neutral');
+    assert.equal(newAttemptMerged.lifecycleOnly, true);
+    assert.equal(newAttemptMerged.attempts.at(-1).id, 'job-3');
+    assert.equal(newAttemptMerged.attempts.at(-1).verdict, '');
 });
 
 test('task acceptance adapts only task_acceptance panels; advisory and commit stay omitted', () => {
