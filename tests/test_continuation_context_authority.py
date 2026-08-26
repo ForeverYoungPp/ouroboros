@@ -284,6 +284,27 @@ def test_symbolic_rate_code_stays_retryable_even_with_http_400():
     assert result.provider_code == "rate_limit_exceeded"
 
 
+@pytest.mark.parametrize("generic_type", ["error", "invalid_request_error"])
+def test_symbolic_rate_code_wins_over_generic_provider_type(generic_type):
+    from ouroboros.loop_llm_call import classify_llm_exception
+
+    class ProviderError(Exception):
+        status_code = 400
+        code = "400"
+
+    error = ProviderError("bad request")
+    error.type = generic_type
+    error.body = {
+        "type": generic_type,
+        "error": {"code": "rate_limit_exceeded", "message": "Bad Request"},
+    }
+
+    result = classify_llm_exception(error, "bad request")
+    assert result.kind == "provider_transient"
+    assert result.retry_same_request is True
+    assert result.provider_code == "rate_limit_exceeded"
+
+
 def test_exception_overflow_text_survives_a_generic_response_body():
     from ouroboros.loop_llm_call import classify_llm_exception
 

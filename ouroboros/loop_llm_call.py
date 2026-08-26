@@ -529,6 +529,9 @@ def _exception_provider_code(exc: Exception, safe_error: str) -> str:
     for value in values:
         if value.lower() in _STRUCTURED_CONTEXT_OVERFLOW_CODES:
             return value
+    for value in values:
+        if value.lower() in _RETRYABLE_PROVIDER_CODES:
+            return value
     return next((value for value in values if not value.isdigit()), "")
 
 
