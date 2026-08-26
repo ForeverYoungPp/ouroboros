@@ -170,6 +170,7 @@ def test_promote_tool_passes_origin_by_value_despite_rewritten_objective(tmp_pat
         ctx,
         objective="Create a standalone 3D browser game about a robot (LLM-rewritten)",
         project_name="Robot City Adventure",
+        predecessor_task_id="",
     )
     assert out.startswith("OK: task")
     evt = events[0]

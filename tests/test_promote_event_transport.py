@@ -260,6 +260,7 @@ def test_tool_snapshot_precheck_skips_source_side_effects(monkeypatch, tmp_path)
         "Build",
         project_name="Must Not Exist",
         source="/tmp/must-not-attach",
+        predecessor_task_id="",
     )
     assert out.startswith("PROMOTE_REJECTED:")
     assert "worker_crash_storm" in out
@@ -321,7 +322,7 @@ def test_real_event_queue_reaches_dispatch_and_confirms_durable_admission(
     )
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(control._promote_chat_to_task, tool_ctx, "Build the racer")
+            future = executor.submit(control._promote_chat_to_task, tool_ctx, "Build the racer", predecessor_task_id="")
             event = queue.get(timeout=2)
             assert event["type"] == "promote_chat_to_task"
             outcome = _handle_promote_chat_to_task(event, handler_ctx)
@@ -403,6 +404,7 @@ def test_route_to_project_waits_for_same_durable_admission(monkeypatch, tmp_path
                 "racer",
                 "Continue the racer",
                 "belongs there",
+                predecessor_task_id="",
             )
             event = queue.get(timeout=2)
             outcome = _handle_promote_chat_to_task(event, handler_ctx)
@@ -472,6 +474,7 @@ def test_manual_target_tool_waits_for_durable_handler_receipt(monkeypatch, tmp_p
                 "missing-project",
                 "Continue",
                 "uncertain target",
+                predecessor_task_id="",
             )
             event = queue.get(timeout=2)
             _handle_routing_manual_target(event, handler_ctx)
@@ -539,7 +542,7 @@ def test_stale_live_transport_returns_unconfirmed_not_ok(monkeypatch, tmp_path):
         task_metadata={},
     )
     try:
-        out = control._promote_chat_to_task(ctx, "Never drained")
+        out = control._promote_chat_to_task(ctx, "Never drained", predecessor_task_id="")
         event = stale_queue.get(timeout=2)
         assert event["type"] == "promote_chat_to_task"
         assert out.startswith("PROMOTE_UNCONFIRMED:")

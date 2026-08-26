@@ -87,6 +87,12 @@ def project_replica_task_result_fields(
         for field in _TERMINAL_ACCOUNTING_FIELDS:
             overlay.pop(field, None)
 
+    # Non-Project split synthesis writes this field in the canonical parent
+    # root.  A later child replica must not replace it with stale child text.
+    if isinstance(canonical_fields.get("continuation_narrative"), dict):
+        if str(canonical_fields["continuation_narrative"].get("text") or "").strip():
+            overlay.pop("continuation_narrative", None)
+
     canonical_updated_at = _parse_updated_at(canonical_fields.get("updated_at"))
     replica_updated_at = _parse_updated_at(overlay.get("updated_at"))
     if canonical_updated_at is not None and (

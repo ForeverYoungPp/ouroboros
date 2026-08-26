@@ -447,6 +447,7 @@ _RATE_LIMIT_TEXT_MARKERS = (
     "tpm",
     "rpm",
 )
+_RETRYABLE_PROVIDER_CODES = frozenset({"rate_limit_exceeded"})
 
 
 def _is_rate_limit_text(text: str) -> bool:
@@ -461,9 +462,13 @@ def _is_context_overflow_error(exc: Exception, safe_error: str) -> bool:
     Main, the local transport, and the summarizer classify identically."""
     if isinstance(exc, LocalContextTooLargeError):
         return True
-    if _is_rate_limit_text(safe_error):
+    provider_text = _exception_provider_message(exc, "")
+    classification_text = "\n".join(
+        value for value in (safe_error, provider_text) if str(value or "").strip()
+    )
+    if _is_rate_limit_text(classification_text):
         return False
-    return _context_overflow_message(safe_error)
+    return _context_overflow_message(classification_text)
 
 
 def _is_output_or_body_size_error(safe_error: str) -> bool:
@@ -485,6 +490,22 @@ def _exception_status_code(exc: Exception) -> Optional[int]:
     return value if isinstance(value, int) else None
 
 
+def _exception_body(exc: Exception) -> Dict[str, Any]:
+    """Read a structured provider body without turning a diagnostic into a failure."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        return body
+    response = getattr(exc, "response", None)
+    parser = getattr(response, "json", None)
+    if callable(parser):
+        try:
+            value = parser()
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
 def _exception_provider_values(exc: Exception) -> List[str]:
     values: List[str] = []
 
@@ -495,14 +516,13 @@ def _exception_provider_values(exc: Exception) -> List[str]:
 
     for attr in ("code", "type"):
         add(getattr(exc, attr, None))
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
+    body = _exception_body(exc)
+    for key in ("code", "type"):
+        add(body.get(key))
+    nested = body.get("error")
+    if isinstance(nested, dict):
         for key in ("code", "type"):
-            add(body.get(key))
-        nested = body.get("error")
-        if isinstance(nested, dict):
-            for key in ("code", "type"):
-                add(nested.get(key))
+            add(nested.get(key))
     capture = getattr(exc, "physical_attempt_capture", None)
     if capture is not None:
         add(getattr(capture, "provider_code", None))
@@ -516,7 +536,10 @@ def _exception_provider_code(exc: Exception, safe_error: str) -> str:
     for value in values:
         if value.lower() in _STRUCTURED_CONTEXT_OVERFLOW_CODES:
             return value
-    return values[0] if values else ""
+    for value in values:
+        if value.lower() in _RETRYABLE_PROVIDER_CODES:
+            return value
+    return next((value for value in values if not value.isdigit()), "")
 
 
 def _exception_provider_message(exc: Exception, safe_error: str = "") -> str:
@@ -528,7 +551,7 @@ def _exception_provider_message(exc: Exception, safe_error: str = "") -> str:
     permitted`` reasoning_content echo. ``provider_code`` alone cannot tell them
     apart, so surface the body message (sanitized + truncated) into the durable
     event for the owner. Pure read of ``exc.body``/repr; never changes routing."""
-    body = getattr(exc, "body", None)
+    body = _exception_body(exc)
     if isinstance(body, dict):
         nested = body.get("error")
         if isinstance(nested, dict) and str(nested.get("message") or "").strip():
@@ -569,19 +592,25 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
         )
     status_code = _exception_status_code(exc)
     provider_code = _exception_provider_code(exc, safe)
-    low = str(safe or "").lower()
+    provider_message = _exception_provider_message(exc, safe)
+    classification_text = "\n".join(
+        value for value in (safe, provider_message) if str(value or "").strip()
+    )
+    low = classification_text.lower()
     if provider_code.lower() in _STRUCTURED_CONTEXT_OVERFLOW_CODES:
         return LlmErrorClassification("context_overflow", False, status_code, provider_code)
     provider_kind = _provider_code_kind(provider_code)
     if provider_kind:
         return LlmErrorClassification(provider_kind, False, status_code, provider_code)
+    if provider_code.lower() in _RETRYABLE_PROVIDER_CODES:
+        return LlmErrorClassification("provider_transient", True, status_code, provider_code)
     if status_code == 429:
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
     if _is_rate_limit_text(low):
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
     if _is_output_or_body_size_error(low):
         return LlmErrorClassification("request_too_large", False, status_code, provider_code)
-    if _is_context_overflow_error(exc, safe):
+    if _is_context_overflow_error(exc, classification_text):
         return LlmErrorClassification("context_overflow", False, status_code, provider_code)
     for kind, markers in _NON_RETRYABLE_PROVIDER_MARKERS.items():
         if any(marker in low for marker in markers):

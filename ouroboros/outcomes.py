@@ -179,6 +179,7 @@ ACCEPTANCE_BYPASS_REASON_BY_RAIL = {
     "finalization_grace": "acceptance_bypassed_deadline",
     "deadline_local": "acceptance_bypassed_deadline",
     "provider_unavailable": "acceptance_bypassed_provider_unavailable",
+    "context_overflow": "acceptance_bypassed_context_overflow",
     "children_unabsorbed": "acceptance_bypassed_children_unabsorbed",
     # The owner-stop rail bypasses an owed panel because the OWNER asked the
     # task to wrap up now — its own typed reason, never the deadline's (CF-02).
@@ -996,6 +997,8 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         execution_status = EXECUTION_INFRA_FAILED
         reason_code = usage_reason or REASON_PROVIDER_FAILURE
         failure = {"kind": "provider", "reason_code": reason_code}
+        if str(usage.get("_last_llm_error_kind") or "") == "context_overflow":
+            failure["error_kind"] = "context_overflow"
     elif (
         usage_status == RESULT_FAILED
         and usage_reason in BEST_EFFORT_REASON_CODES
