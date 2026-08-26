@@ -246,7 +246,7 @@ def enqueue_task(
             try:
                 from ouroboros.task_results import load_task_result
 
-                if load_task_result(DRIVE_ROOT, task_id):
+                if load_task_result(DRIVE_ROOT, task_id, strict=True):
                     if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
                         ADMISSION_RESERVATIONS.pop(task_id, None)
                     t["_admission_blocked"] = "duplicate_task_id"
@@ -1229,11 +1229,11 @@ def _enforce_task_timeouts_locked(
         # is legitimate silence (hard-bounded by events._handle_external_wait_lease);
         # it spares ONLY this idle rail — ceiling/deadline/budget/cancel never consult it.
         lease_ts = meta.get("external_wait_lease_until")
-        # Keep an orchestrator alive on own progress, a freshly progressing RUNNING descendant,
-        # a QUEUED descendant (a kill would orphan the queued subtree), or a live external-wait
-        # lease; only abs ceiling / explicit deadline / budget are unconditional.
+        active_llm_call = meta.get("active_llm_call")
+        llm_call_in_flight = isinstance(active_llm_call, dict) and active_llm_call.get("task_attempt") == attempt
         progressing = (own_progress or subtree_progressing or _has_pending_descendant(task_id)
-                       or (isinstance(lease_ts, (int, float)) and float(lease_ts) > now))
+                       or (isinstance(lease_ts, (int, float)) and float(lease_ts) > now)
+                       or llm_call_in_flight)
         ceiling_reached = runtime_sec >= abs_ceiling
 
         # Hard axes (deadline_at, abs ceiling) stop the task regardless of activity; the

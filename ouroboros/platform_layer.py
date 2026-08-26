@@ -174,8 +174,14 @@ def acquire_exclusive_file_lock(
     stale_sec: float = 90.0,
     metadata: str = "",
     poll_sec: float = 0.05,
+    owner_aware_stale: bool = False,
 ) -> Optional[int]:
-    """Acquire a portable lockfile using O_EXCL and return its file descriptor."""
+    """Acquire a portable lockfile using O_EXCL and return its file descriptor.
+
+    Authority streams opt into ``owner_aware_stale`` so elapsed time alone can
+    never steal a lock from a live writer.  A dead/malformed legacy owner still
+    recovers through the existing stale-age path.
+    """
     lock_path = pathlib.Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.time()
@@ -192,6 +198,20 @@ def acquire_exclusive_file_lock(
             try:
                 age = time.time() - lock_path.stat().st_mtime
                 if age > stale_sec:
+                    if owner_aware_stale:
+                        owner_pid = 0
+                        try:
+                            for field in lock_path.read_text(
+                                encoding="utf-8", errors="replace",
+                            ).split():
+                                if field.startswith("pid="):
+                                    owner_pid = int(field[4:])
+                                    break
+                        except (OSError, ValueError):
+                            owner_pid = 0
+                        if owner_pid > 0 and pid_is_alive(owner_pid):
+                            time.sleep(poll_sec)
+                            continue
                     lock_path.unlink()
                     continue
             except Exception:

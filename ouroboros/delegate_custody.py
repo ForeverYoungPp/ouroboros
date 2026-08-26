@@ -23,6 +23,7 @@ import json
 import logging
 import pathlib
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -263,6 +264,36 @@ def custody_log_unreadable(drive_root: Any) -> bool:
     except OSError:
         return True
     return False
+
+
+@contextmanager
+def actor_decision_lock(drive_root: Any, task_id: str) -> Iterator[None]:
+    """Serialize one actor's mutually exclusive zero-run/start decisions.
+
+    The custody log and the verification-receipt store are separate append-only
+    authorities.  This short critical section joins only their decision edge:
+    re-read current authority, then append either a zero-run receipt or a fresh
+    START_REQUESTED row.  Transport, waiting and settlement stay outside it.
+    """
+
+    from ouroboros.platform_layer import (
+        acquire_exclusive_file_lock,
+        release_exclusive_file_lock,
+    )
+
+    identity = str(task_id or "").strip()
+    if not identity:
+        raise ValueError("actor decision lock requires a task id")
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    lock_path = pathlib.Path(drive_root) / "state" / "delegate_actor_claims" / f"{digest}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = acquire_exclusive_file_lock(lock_path, timeout_sec=20.0, stale_sec=120.0)
+    if fd is None:
+        raise TimeoutError("actor decision lock is unavailable")
+    try:
+        yield
+    finally:
+        release_exclusive_file_lock(lock_path, fd)
 
 def _iter_rows(path: pathlib.Path, tail_bytes: Optional[int] = None) -> Iterator[Dict[str, Any]]:
     try:
@@ -1462,41 +1493,9 @@ def _retire_recovered_registration(gateway: Any, record: Dict[str, Any]) -> bool
         return False
 
 
-def _capture_stranded_patch(drive_root: Any, run: RunCustody) -> Dict[str, Any]:
-    """Capture a reconciled mutating run's diff into the ordinary patch artifact.
-
-    The reconcile path is the ONLY terminal observer a dead-owner run gets, so
-    without this the child's work stayed in the snapshot with no captured patch
-    and no apply/reject material — stranded, invisible, and one binding loss away
-    from GC. Called ONLY where a terminal receipt PROVES the run is over (C1-R2):
-    a run closed absent/unreadable has unknowable state, and freezing a patch
-    there would put a "captured" receipt over work the child might still be
-    writing — those runs are captured lazily at disposition instead. Reuses the
-    one existing capture primitive (idempotent, durable ``PATCH_CAPTURED`` row);
-    capture ONLY — the apply/reject decision belongs to a live owner and is NEVER
-    taken by a sweep. Fail-soft: a capture error is disclosed in the reconcile
-    row, and the snapshot persists either way because the run has no recorded
-    disposition.
-    """
-    if not (run.execution_root and run.settled and not run.patch_disposed):
-        return {}
-    try:
-        from ouroboros.tools.delegate_integration import capture_terminal_patch_for_drive
-
-        block = capture_terminal_patch_for_drive(drive_root, run) or {}
-    except Exception:
-        log.warning("Reconcile patch capture failed for %s", run.run_id, exc_info=True)
-        return {"patch_capture": "failed", "patch_disposition": "pending"}
-    return {"patch_capture": str(block.get("status") or ""),
-            "patch_artifact": block.get("patch_artifact"),
-            # The typed disposition-pending disclosure: this rides the durable
-            # RECONCILED row, and the health surface (``undisposed_patches``)
-            # keeps the fact visible until an explicit apply/reject lands.
-            "patch_disposition": "pending"}
-
-
 def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[str, Any]:
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    from ouroboros.tools.delegate_integration import capture_stranded_patch
 
     try:
         detail = gateway.get_run(custody.run_id)
@@ -1530,7 +1529,7 @@ def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[s
                   "settled": settled["settled"], **output_disposition(custody)}
         # The C1 half: a TERMINAL DETAIL proves the run is over, so the sweep — its
         # last terminal observer — captures the diff eagerly here.
-        result.update(_capture_stranded_patch(drive_root, custody))
+        result.update(capture_stranded_patch(drive_root, custody))
     else:
         cancelled = cancel_and_verify(drive_root, gateway, custody, "owner_task_gone")
         result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "cancelled",
@@ -1541,7 +1540,7 @@ def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[s
         # the run (same unknowable-state doctrine as above) — both leave the
         # capture to disposition.
         if cancelled["state"] in TERMINAL_STATES:
-            result.update(_capture_stranded_patch(drive_root, custody))
+            result.update(capture_stranded_patch(drive_root, custody))
     emit(drive_root, RECONCILED, result)
     return result
 
@@ -1557,6 +1556,7 @@ __all__ = [
     "SOURCE_RANGE_DELIVERY_CONFIRMED",
     "TERMINAL_STATES",
     "UNKNOWN",
+    "actor_decision_lock",
     "cancel_and_verify",
     "close_absent_run",
     "custody_log_unreadable",

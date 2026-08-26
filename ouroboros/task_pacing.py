@@ -305,6 +305,12 @@ def effective_max_improvement_passes(
     return None if cap is None else max(0, int(cap))
 
 
+from ouroboros.task_results import (  # noqa: E402,F401 - compatibility re-export
+    effective_task_acceptance_review_cycles,
+    project_task_acceptance_review_capacity,
+)
+
+
 def improvement_pass_allowed(
     snapshot: BudgetSnapshot,
     passes_done: int,

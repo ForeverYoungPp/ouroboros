@@ -95,8 +95,9 @@ def get_tools() -> List[ToolEntry]:
                 "siblings/descendants of THIS task tree). Use it to publish the shared "
                 "frame BEFORE fanning out interdependent children and to coordinate while "
                 "they run. kind: contract|decision|fact|note (coordination) or "
-                "milestone|partial_finding|blocker|question|interface_contract|delegation_constraint "
-                "(child->parent beacon). blocker/question/interface_contract/delegation_constraint (or "
+                "milestone|partial_finding|blocker|question|interface_contract|review_requested|"
+                "delegation_constraint (child->parent beacon). blocker/question/interface_contract/"
+                "review_requested/delegation_constraint (or "
                 "needs_parent_attention=true) surface an early return "
                 "in the parent's wait. Domain-agnostic: 'contract' = code APIs OR "
                 "presentation section-ownership OR a research claim schema — the seam for "
@@ -105,11 +106,15 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "required": ["kind", "text"], "properties": {
                 "kind": {"type": "string", "enum": list(LEDGER_KINDS)},
                 "text": {"type": "string", "description": "Short coordination text (<=4000 chars)."},
-                "needs_parent_attention": {"type": "boolean", "default": False, "description": "Force a parent early-wait return (implied by blocker/question/interface_contract)."},
+                "needs_parent_attention": {"type": "boolean", "default": False, "description": "Force a parent early-wait return (implied by blocker/question/interface_contract/review_requested)."},
                 "payload": {
                     "type": "object",
                     "description": (
-                        "Structured payload. Required for delegation_constraint. For a parent "
+                        "Structured payload. For review_requested, provide exactly evidence_ref "
+                        "and evidence_sha256; this records a non-blocking exact-evidence request "
+                        "and never starts a reviewer. If the parent launches a check, it carries "
+                        "that hash into the existing accounting/dedup path. Required for "
+                        "delegation_constraint. For a parent "
                         "decision about a direct child result, set type=child_result_disposition, "
                         "child_task_id, disposition, and the exact SHA-256 shown by child evidence; "
                         "tree_note text is the rationale. To disposition MANY children in one call, "
@@ -147,6 +152,8 @@ def get_tools() -> List[ToolEntry]:
                             },
                         },
                         "constraint_id": {"type": "string"},
+                        "evidence_ref": {"type": "string"},
+                        "evidence_sha256": {"type": "string"},
                         "directive": {"type": "string", "enum": list(DELEGATION_CONSTRAINT_DIRECTIVES)},
                         "scope": {},
                         "rationale": {"type": "string"},

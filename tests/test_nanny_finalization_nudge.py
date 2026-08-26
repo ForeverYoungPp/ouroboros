@@ -87,6 +87,28 @@ def test_no_nudge_when_delegate_verbs_are_policy_hidden(tmp_path):
     assert not any("NANNY" in m.get("content", "") for m in msgs)
 
 
+def test_durable_zero_run_counts_as_host_coordination_after_resume(tmp_path):
+    from ouroboros.loop import _nanny_finalization_message
+
+    ctx = SimpleNamespace(
+        task_id="zero-run-child",
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        task_metadata={},
+        _configured_actor_bootstrap={
+            "zero_run_receipt_recorded": True,
+            "zero_run_decision": "complete",
+            "physical_started": False,
+            "exact_start_pending": False,
+        },
+    )
+    assert _nanny_finalization_message(
+        _tools(ctx, ["delegate_start", "delegate_wait"]),
+        _custody_drive(tmp_path),
+        "zero-run-child",
+    ) == ""
+
+
 def test_failed_delegated_run_gets_the_truthful_reminder(tmp_path):
     # F4b: a delegated run that STARTED but FAILED is an attempted route. The
     # durable custody evidence (not the per-execution trace) proves it, and the
@@ -309,8 +331,49 @@ def test_a_delegating_nanny_and_a_native_child_are_not_nudged():
                              _nanny_finalization_injected=False)
     assert _run(native, [], []) is False
 
+
+def test_actor_first_host_coordination_suppresses_zero_leaf_accusation(tmp_path):
+    # Scheduling or inspecting a host child is a valid actor-first outcome. It
+    # must not be reported as if the nanny silently chose metered inline work.
+    from ouroboros.loop import _nanny_finalization_message
+
+    drive = _custody_drive(tmp_path)
+    ctx = SimpleNamespace(
+        _nanny_route_dispatched=True,
+        _nanny_finalization_injected=False,
+        _nanny_coordination_activity=True,
+        task_metadata={"budget_drive_root": str(drive)},
+    )
+    tools = _tools(ctx, ["delegate_start", "delegate_wait", "schedule_subagent"])
+    assert _nanny_finalization_message(tools, drive, "child-1") == ""
+
     undispatched = SimpleNamespace()  # a ctx that never saw a dispatch at all
     assert _run(undispatched, [], []) is False
+
+
+def test_actor_first_plain_finalization_requires_typed_zero_run_or_leaf(tmp_path):
+    from ouroboros.loop import _nanny_finalization_message
+
+    drive = _custody_drive(tmp_path)
+    ctx = SimpleNamespace(
+        _nanny_route_dispatched=True,
+        _nanny_finalization_injected=False,
+        _nanny_coordination_activity=True,
+        task_id="actor-1",
+        task_metadata={"budget_drive_root": str(drive)},
+        _configured_actor_bootstrap={
+            "route_available": True,
+            "exact_start_pending": True,
+            "physical_started": False,
+            "zero_run_receipt_recorded": False,
+            "selected_subagent_id": "session-a",
+        },
+    )
+    message = _nanny_finalization_message(
+        _tools(ctx, ["delegate_start", "verify_and_record"]), drive, "actor-1",
+    )
+    assert "CONFIGURED_ACTOR_INCOMPLETE" in message
+    assert "delegation_zero_run" in message
 
 
 def _forced_run(tmp_path, nanny, tool_calls):

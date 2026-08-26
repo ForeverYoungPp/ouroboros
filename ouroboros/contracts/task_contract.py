@@ -138,6 +138,25 @@ def _normalized_intent_note(value: Any) -> str:
     return str(value or "").strip()
 
 
+_DEPTH_PROVENANCE_KEYS = (
+    "requested_depth",
+    "permitted_depth",
+    "attempted_depth",
+    "achieved_depth",
+)
+
+
+def normalize_depth_provenance(value: Any) -> Dict[str, Any]:
+    """Normalize additive depth facts without inventing a requested depth."""
+    if not isinstance(value, Mapping):
+        return {}
+    out: Dict[str, Any] = {}
+    for key in _DEPTH_PROVENANCE_KEYS:
+        if key in value:
+            out[key] = _opt_nonneg_int(value.get(key))
+    return out
+
+
 def normalize_delegation_budget(value: Any) -> Dict[str, Any]:
     """The typed delegation-budget block — the SSOT for what delegation a task is
     licensed to do, so a parent's 'you may delegate / mutate / fan out further'
@@ -149,14 +168,21 @@ def normalize_delegation_budget(value: Any) -> Dict[str, Any]:
     explicitly granted, and ``depth_remaining``/``max_children`` default to None
     (the configured caps apply)."""
     v = value if isinstance(value, Mapping) else {}
-    return {
+    depth_remaining = _opt_nonneg_int(v.get("depth_remaining"))
+    budget = {
         "may_delegate": normalize_bool(v.get("may_delegate", True)),
         "may_mutate": normalize_bool(v.get("may_mutate", False)),
         "may_fan_out": normalize_bool(v.get("may_fan_out", True)),
-        "depth_remaining": _opt_nonneg_int(v.get("depth_remaining")),
+        "depth_remaining": depth_remaining,
         "max_children": _opt_nonneg_int(v.get("max_children")),
         "intent_note": _normalized_intent_note(v.get("intent_note")),
     }
+    if "depth_provenance" in v:
+        # Only an explicitly authored projection enters the frozen contract.
+        # Inferring one from a legacy depth_remaining field would rewrite old
+        # work-order hashes during restart/recovery.
+        budget["depth_provenance"] = normalize_depth_provenance(v.get("depth_provenance"))
+    return budget
 
 
 VALID_IMPROVEMENT_POLICIES = ("fixed", "adaptive", "until_deadline")
@@ -580,4 +606,4 @@ def attach_task_contract(task: Dict[str, Any]) -> Dict[str, Any]:
     return task
 
 
-__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "effective_acceptance_claims", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_answer_protocol", "normalize_attachment_manifest", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_disabled_tools", "normalize_resource_policy"]
+__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "effective_acceptance_claims", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_answer_protocol", "normalize_attachment_manifest", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_depth_provenance", "normalize_disabled_tools", "normalize_resource_policy"]

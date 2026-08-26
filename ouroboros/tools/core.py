@@ -1396,7 +1396,9 @@ def _write_file(
                     continue
                 target = item_binding.target_path
                 if normalized == "artifact_store":
-                    block_reason = artifact_store_path_block_reason(target)
+                    block_reason = artifact_store_path_block_reason(
+                        target, base_path=item_binding.base_path,
+                    )
                     if block_reason:
                         results.append(f"⚠️ WRITE_FILE_BLOCKED: artifact_store path blocked: {block_reason}")
                         continue
@@ -1416,7 +1418,9 @@ def _write_file(
             return _join_write_results(results)
         target = binding_items[0].target_path
         if normalized == "artifact_store":
-            block_reason = artifact_store_path_block_reason(target)
+            block_reason = artifact_store_path_block_reason(
+                target, base_path=binding_items[0].base_path,
+            )
             if block_reason:
                 return f"⚠️ WRITE_FILE_BLOCKED: artifact_store path blocked: {block_reason}"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1563,7 +1567,9 @@ def _edit_text(
                     "tools instead of editing state/workspace_executor_processes directly."
                 )
         if normalized == "artifact_store":
-            block_reason = artifact_store_path_block_reason(target)
+            block_reason = artifact_store_path_block_reason(
+                target, base_path=binding.base_path,
+            )
             if block_reason:
                 return f"⚠️ EDIT_TEXT_BLOCKED: artifact_store path blocked: {block_reason}"
         text = target.read_text(encoding="utf-8")

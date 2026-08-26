@@ -105,7 +105,7 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "CLAUDE_CODE_MODEL": OPENROUTER_REVIEW_DEFAULTS["advisory"],
     "OUROBOROS_MAX_WORKERS": 10, "OUROBOROS_PRESENCE_MAX_ACTIVE": 2,
     "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT": 6,
-    "OUROBOROS_MAX_SUBAGENT_DEPTH": 2,
+    "OUROBOROS_MAX_SUBAGENT_DEPTH": 3,
     # Mutative ("acting") subagents master toggle. Empty = follow runtime mode
     # (ON in advanced/pro, OFF in light); explicit true/false overrides. Owner-
     # controlled; light-mode self-repo writes stay blocked by the sandbox.

@@ -11,7 +11,6 @@ from typing import Any, Dict, List
 
 from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
 from ouroboros.utils import truncate_review_artifact, truncate_within_limit
-
 log = logging.getLogger(__name__)
 
 
@@ -861,7 +860,7 @@ def build_task_acceptance_evidence(
     (review_substrate) is the authority that applies the anti-cheat boundary — it must never
     credit success to `hidden_or_restricted` evidence."""
     from ouroboros.observability import redact_projection
-    from ouroboros.outcomes import read_verification_receipts
+    from ouroboros.outcomes import read_context_verification_receipts
 
     ev: Dict[str, Any] = {}
     prov: Dict[str, str] = {}
@@ -897,7 +896,7 @@ def build_task_acceptance_evidence(
     claims, claims_source = _accept_effective_claims(ctx, contract, drive_root, task_id)
     if claims_source == "plan_review":
         contract = {**contract, "acceptance_claims": claims}
-    receipts = read_verification_receipts(drive_root, task_id) if (drive_root is not None and task_id) else []
+    receipts = read_context_verification_receipts(ctx, task_id, fallback_root=drive_root) if task_id else []
     owner_directives = _accept_owner_directives(ctx, drive_root, task_id)
     if owner_directives:
         # This is an immutable verbatim corpus, not a parsed decision ledger:
@@ -953,7 +952,9 @@ def build_task_acceptance_evidence(
     partial_sources: List[Dict[str, Any]] = [dict(diff_meta["issue"])] if diff_meta.get("issue") else []
     if subtree_statuses is not None:
         ev["terminal_subtree_statuses"] = [dict(row) for row in subtree_statuses if isinstance(row, dict)]
-        prov["terminal_subtree_statuses"] = "host_attested"
+        from ouroboros.depth_evidence import build_depth_summary
+        ev["depth_summary"] = build_depth_summary(contract, ev["terminal_subtree_statuses"])
+        prov["terminal_subtree_statuses"] = prov["depth_summary"] = "host_attested"
     if isinstance(llm_trace, dict):
         traj, omitted, unresolved = _accept_trajectory(
             llm_trace.get("tool_calls") or [], drive_root=drive_root, task_id=task_id,

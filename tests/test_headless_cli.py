@@ -326,6 +326,23 @@ def test_task_api_refuses_when_durable_queue_snapshot_fails(tmp_path, monkeypatc
     assert not (data / "state" / "headless_tasks" / "snapshot-fail").exists()
 
 
+def test_late_api_identity_lookup_failure_preserves_exact_result(tmp_path):
+    from ouroboros.gateway.tasks import _admission_rejection_response
+
+    result_path = tmp_path / "task_results" / "api-corrupt.json"
+    result_path.parent.mkdir()
+    original = b"{api-corrupt"
+    result_path.write_bytes(original)
+    response = _admission_rejection_response(
+        {"_admission_blocked": "task_id_lookup_failed"},
+        drive_root=tmp_path, task_id="api-corrupt", project_id="",
+        workspace_root=None, child_drive=None,
+    )
+    assert response is not None and response.status_code == 409
+    assert json.loads(response.body)["admission"]["reason_code"] == "task_id_lookup_failed"
+    assert result_path.read_bytes() == original
+
+
 def test_task_api_releases_reservation_when_payload_composition_fails(
     tmp_path, monkeypatch,
 ):

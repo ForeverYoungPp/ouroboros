@@ -1,5 +1,6 @@
 import json
 import pathlib
+import threading
 import time
 from types import SimpleNamespace
 
@@ -604,6 +605,26 @@ def _receipt_rows_of(output):
     return summary.get("verification_receipts")
 
 
+def test_default_receipt_read_stays_all_or_nothing_on_invalid_utf8(tmp_path):
+    from ouroboros.outcomes import (
+        read_verification_receipts,
+        verification_receipts_path,
+    )
+
+    path = verification_receipts_path(tmp_path, "invalid-utf8", create=True)
+    path.write_bytes(b'\xff\n{"status":"pass","criterion_id":"partial-green"}\n')
+
+    # Existing observational consumers must not receive a partial green view.
+    assert read_verification_receipts(tmp_path, "invalid-utf8") == []
+
+    gaps: set[str] = set()
+    rows = read_verification_receipts(
+        tmp_path, "invalid-utf8", gap_reasons=gaps,
+    )
+    assert [row["criterion_id"] for row in rows] == ["partial-green"]
+    assert "unreadable_bytes" in gaps
+
+
 def test_child_finalization_publishes_receipts_to_canonical_root(tmp_path):
     """S3 seam (a): every real schedule_subagent child runs memory_mode forked|empty
     on an ISOLATED drive, so verify_and_record writes its receipts under the CHILD
@@ -635,14 +656,20 @@ def test_child_finalization_publishes_receipts_to_canonical_root(tmp_path):
     append_verification_receipt(child_drive, tid, {
         "status": "pass", "check": "pytest tests/green.py", "criterion_id": "claim_green",
     })
-    assert read_verification_receipts(tmp_path, tid) == []
+    append_verification_receipt(tmp_path, tid, {
+        "status": "declared", "contract_kind": "delegation_zero_run",
+        "zero_run": True, "zero_run_decision": "complete",
+    })
 
     # Finalization copy-back publishes the receipts file to the canonical root
     # (no parent-side read has happened yet — the publish alone must carry them).
     copied = copy_child_task_result(tmp_path, {"id": tid, "drive_root": str(child_drive)})
     assert copied is not None
     canonical = read_verification_receipts(tmp_path, tid)
-    assert [r["criterion_id"] for r in canonical] == ["claim_red", "claim_green"]
+    assert [r.get("criterion_id") for r in canonical] == [
+        "claim_red", "claim_green", None,
+    ]
+    assert canonical[-1]["contract_kind"] == "delegation_zero_run"
 
     # Durability: the receipts survive child-drive pruning (retention GC / the
     # cancel path delete the drive; the canonical copy is the durable record).
@@ -650,15 +677,15 @@ def test_child_finalization_publishes_receipts_to_canonical_root(tmp_path):
 
     _shutil.rmtree(child_drive)
     rows = _receipt_rows_of(_get_task_result(SimpleNamespace(drive_root=tmp_path), tid))
-    assert rows is not None and len(rows) == 2
+    assert rows is not None and len(rows) == 3
     assert rows[0]["criterion_id"] == "claim_red"
     assert rows[0]["outstanding"] == "unreconciled_failed"
 
 
 def test_child_receipt_republish_is_idempotent_refresh(tmp_path):
     """S3 seam (a) re-entry: copy_child_task_result runs more than once per child
-    (task_done + reaper/cancel re-checks). The publish is a whole-file refresh of
-    the append-only child store — newer child receipts land, nothing duplicates."""
+    (task_done + reaper/cancel re-checks). The publish refreshes the union of the
+    append-only child and canonical stores — newer rows land, nothing duplicates."""
     from ouroboros.headless import copy_child_task_result, prepare_task_drive
     from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
@@ -683,15 +710,238 @@ def test_child_receipt_republish_is_idempotent_refresh(tmp_path):
     ]
 
 
-def test_get_task_result_falls_back_to_child_drive_receipts(tmp_path):
-    """S3 seam (b): before ANY canonical copy exists (child still running, or
-    self-finalized but the supervisor copy-back / effective-read sync has not
-    landed), _get_task_result falls back to the child drive recorded on the
-    result, so the W2 rows are never silently absent in the window the parent
-    most often absorbs the child in."""
-    from ouroboros.headless import prepare_task_drive
+def test_materializing_child_read_cannot_overwrite_canonical_zero_run_receipt(tmp_path):
+    """Generic artifact refresh must never own the receipt authority stream.
+
+    A running parent's ``wait_tasks`` performs materializing reads.  Before this
+    regression, the first read registered the child receipt file as an ordinary
+    artifact; a later read reused that source/destination manifest mapping and
+    copied the stale child bytes over a newer canonical-only zero-run row.
+    """
+    from ouroboros.headless import copy_child_task_result, prepare_task_drive
     from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
-    from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
+    from ouroboros.task_results import (
+        STATUS_COMPLETED,
+        STATUS_SCHEDULED,
+        load_task_result,
+        write_task_result,
+    )
+    from ouroboros.task_status import effective_task_result
+
+    tid = "child-materialized-receipts"
+    child_drive = prepare_task_drive(tmp_path, tid, "empty")
+    assert child_drive is not None
+    write_task_result(
+        tmp_path, tid, STATUS_SCHEDULED,
+        drive_root=str(child_drive), child_drive_root=str(child_drive),
+    )
+    assert append_verification_receipt(child_drive, tid, {
+        "status": "pass", "criterion_id": "child-check",
+        "ts": "2026-01-01T00:00:01+00:00",
+    })
+    from ouroboros.outcomes import verification_receipts_path
+
+    child_receipts = verification_receipts_path(child_drive, tid)
+    write_task_result(
+        child_drive,
+        tid,
+        STATUS_COMPLETED,
+        result="done",
+        # Historical/current pre-fix task rows may already carry the authority
+        # file as an ordinary artifact even though collection now excludes it.
+        artifacts=[{
+            "kind": "task_artifact",
+            "name": child_receipts.name,
+            "path": str(child_receipts),
+        }],
+    )
+
+    from ouroboros.artifacts import collect_task_artifact_records
+
+    assert collect_task_artifact_records(child_drive, tid) == []
+
+    # The first wait/detail read observes the child while its local receipt file
+    # exists.  It must not register that authority stream as a generic artifact.
+    effective_task_result(tmp_path, load_task_result(tmp_path, tid) or {})
+    assert append_verification_receipt(tmp_path, tid, {
+        "status": "declared",
+        "contract_kind": "delegation_zero_run",
+        "zero_run": True,
+        "zero_run_decision": "complete",
+        "zero_run_basis": "completed useful direct child",
+        "physical_run_started": False,
+        "ts": "2026-01-01T00:00:02+00:00",
+    })
+
+    # Repeated polling must preserve the canonical-only row.  Final copy-back
+    # then unions the ordinary child check into that same authority file.
+    effective_task_result(tmp_path, load_task_result(tmp_path, tid) or {})
+    assert [
+        row.get("contract_kind")
+        for row in read_verification_receipts(tmp_path, tid)
+    ] == [None, "delegation_zero_run"]
+
+    copied = copy_child_task_result(
+        tmp_path, {"id": tid, "drive_root": str(child_drive)},
+    )
+    assert copied is not None
+    rows = read_verification_receipts(tmp_path, tid)
+    assert [row.get("criterion_id") for row in rows] == ["child-check", None]
+    assert rows[-1]["contract_kind"] == "delegation_zero_run"
+    assert all(
+        str(item.get("name") or "") != "verification_receipts.jsonl"
+        for item in copied.get("artifacts") or []
+    )
+
+
+def test_child_receipt_publish_preserves_corrupt_canonical_authority(tmp_path):
+    from ouroboros.headless import _publish_child_verification_receipts, prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt, verification_receipts_path
+
+    tid = "child-corrupt-authority"
+    child_drive = prepare_task_drive(tmp_path, tid, "forked")
+    assert append_verification_receipt(child_drive, tid, {
+        "status": "pass",
+        "check": "pytest tests/ordinary.py",
+        "criterion_id": "ordinary",
+    })
+    canonical = verification_receipts_path(tmp_path, tid, create=True)
+    corrupt = b'{"contract_kind":"delegation_zero_run","zero_run":true\n'
+    canonical.write_bytes(corrupt)
+
+    _publish_child_verification_receipts(tmp_path, tid, child_drive)
+
+    assert canonical.read_bytes() == corrupt
+
+
+def test_child_receipt_publish_serializes_late_canonical_append(tmp_path, monkeypatch):
+    """An append arriving after union-read must survive the atomic refresh."""
+    import ouroboros.outcome_receipt_store as receipt_store
+    import ouroboros.utils as utils
+    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
+
+    tid = "child-late-canonical-append"
+    child_drive = tmp_path / "child"
+    assert append_verification_receipt(child_drive, tid, {
+        "status": "pass", "criterion_id": "child-check",
+    })
+    assert append_verification_receipt(tmp_path, tid, {
+        "status": "declared", "criterion_id": "canonical-before",
+    })
+
+    publisher_at_replace = threading.Event()
+    allow_replace = threading.Event()
+    real_write = receipt_store.write_text_atomic
+
+    def paused_write(path, content, **kwargs):
+        publisher_at_replace.set()
+        assert allow_replace.wait(timeout=2.0)
+        return real_write(path, content, **kwargs)
+
+    monkeypatch.setattr(receipt_store, "write_text_atomic", paused_write)
+    append_blocked_on_union = threading.Event()
+    real_sleep = utils.time.sleep
+
+    def observed_sleep(seconds):
+        if (
+            threading.current_thread().name == "late-receipt-append"
+            and seconds == 0.01
+        ):
+            append_blocked_on_union.set()
+        return real_sleep(seconds)
+
+    monkeypatch.setattr(utils.time, "sleep", observed_sleep)
+    publish_result = []
+    publish_thread = threading.Thread(
+        target=lambda: publish_result.append(
+            receipt_store.publish_verification_receipt_union(
+                tmp_path, tid, child_drive,
+            )
+        )
+    )
+    publish_thread.start()
+    assert publisher_at_replace.wait(timeout=2.0)
+
+    append_result = []
+    append_thread = threading.Thread(
+        name="late-receipt-append",
+        target=lambda: append_result.append(
+            append_verification_receipt(tmp_path, tid, {
+                "status": "declared", "criterion_id": "canonical-late",
+            })
+        )
+    )
+    append_thread.start()
+    assert append_blocked_on_union.wait(timeout=2.0)
+    assert append_result == [], "late append must wait on the union writer's sidecar"
+
+    allow_replace.set()
+    publish_thread.join(timeout=2.0)
+    append_thread.join(timeout=2.0)
+    assert not publish_thread.is_alive()
+    assert not append_thread.is_alive()
+    assert publish_result == [True]
+    assert append_result == [True]
+    assert [
+        row.get("criterion_id")
+        for row in read_verification_receipts(tmp_path, tid)
+    ] == ["child-check", "canonical-before", "canonical-late"]
+
+
+def test_verification_receipt_append_refuses_unlocked_timeout(tmp_path, monkeypatch):
+    import ouroboros.platform_layer as platform
+    from ouroboros.outcome_receipt_store import (
+        append_verification_receipt,
+        verification_receipts_path,
+    )
+
+    monkeypatch.setattr(
+        platform, "acquire_exclusive_file_lock", lambda *_args, **_kwargs: None,
+    )
+
+    assert append_verification_receipt(
+        tmp_path, "locked-receipt", {"status": "pass"},
+    ) is False
+    assert not verification_receipts_path(
+        tmp_path, "locked-receipt", create=False,
+    ).exists()
+
+
+def test_authority_lock_never_steals_from_live_owner_by_age(tmp_path):
+    import os
+
+    from ouroboros.platform_layer import (
+        acquire_exclusive_file_lock,
+        release_exclusive_file_lock,
+    )
+    from ouroboros.utils import jsonl_append_lock_path
+
+    receipt_path = tmp_path / "verification_receipts.jsonl"
+    lock_path = jsonl_append_lock_path(receipt_path)
+    owner_fd = acquire_exclusive_file_lock(lock_path)
+    assert owner_fd is not None
+    old = time.time() - 60.0
+    os.utime(lock_path, (old, old))
+    contender_fd = acquire_exclusive_file_lock(
+        lock_path, timeout_sec=0.05, stale_sec=0.01,
+        poll_sec=0.005, owner_aware_stale=True,
+    )
+    try:
+        assert contender_fd is None
+        assert lock_path.exists()
+    finally:
+        release_exclusive_file_lock(lock_path, contender_fd)
+        release_exclusive_file_lock(lock_path, owner_fd)
+
+
+def test_get_task_result_merges_child_and_canonical_receipts(tmp_path):
+    """S3 seam (b): before copy-back, a canonical actor lifecycle receipt and
+    child-local ordinary checks are one effective evidence view rather than
+    competing fallback stores."""
+    from ouroboros.agent_startup_checks import task_result_authority_projection
+    from ouroboros.headless import prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt
+    from ouroboros.task_results import STATUS_SCHEDULED, load_task_result, write_task_result
     from ouroboros.tools.control import _get_task_result
 
     tid = "childlive"
@@ -705,12 +955,23 @@ def test_get_task_result_falls_back_to_child_drive_receipts(tmp_path):
     append_verification_receipt(child_drive, tid, {
         "status": "fail", "check": "pytest tests/red.py", "criterion_id": "claim_red",
     })
-    assert read_verification_receipts(tmp_path, tid) == []
+    append_verification_receipt(tmp_path, tid, {
+        "status": "declared", "contract_kind": "delegation_zero_run",
+        "zero_run": True, "zero_run_decision": "unknown",
+    })
 
     rows = _receipt_rows_of(_get_task_result(SimpleNamespace(drive_root=tmp_path), tid))
-    assert rows is not None and len(rows) == 1
+    assert rows is not None and len(rows) == 2
     assert rows[0]["criterion_id"] == "claim_red"
     assert rows[0]["outstanding"] == "unreconciled_failed"
+    assert rows[1]["status"] == "declared"
+
+    authority = task_result_authority_projection(
+        load_task_result(tmp_path, tid), drive_root=tmp_path,
+    )
+    assert [row.get("criterion_id") for row in authority["verification_receipts"]] == [
+        "claim_red", None,
+    ]
 
 
 def test_get_task_result_uses_child_terminal_over_stale_parent(tmp_path):
@@ -990,6 +1251,71 @@ def test_wait_task_does_not_claim_completion_on_cancel_requested(tmp_path):
     output = _wait_for_task(SimpleNamespace(drive_root=tmp_path), "cancelling2", timeout_sec=0)
     assert output.startswith("Task wait timed out")
     assert not output.startswith("Task wait completed")
+
+
+def test_wait_tools_surface_preentry_beacons_once_per_actor_context(tmp_path, monkeypatch):
+    from ouroboros import task_tree_ledger
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from ouroboros.tools.control import _wait_for_task, _wait_for_tasks
+
+    monkeypatch.setattr(task_tree_ledger, "DATA_DIR", str(tmp_path))
+    for task_id in ("waitingchild1", "waitingchild2"):
+        write_task_result(
+            tmp_path, task_id, STATUS_RUNNING,
+            parent_task_id="waitparent2", root_task_id="waitparent2",
+            delegation_role="subagent",
+        )
+        assert task_tree_ledger.tree_ledger_append(
+            "waitparent2", "question", f"preentry-{task_id}", task_id=task_id,
+        ).startswith("OK:")
+
+    ctx = SimpleNamespace(
+        drive_root=tmp_path,
+        task_id="waitparent2",
+        task_metadata={"root_task_id": "waitparent2"},
+    )
+    single = _wait_for_task(ctx, "waitingchild1", timeout_sec=0)
+    assert single.startswith("Task wait interrupted by a child attention beacon")
+    assert "preentry-waitingchild1" in single
+
+    batch = json.loads(_wait_for_tasks(ctx, ["waitingchild2"], timeout_sec=0))
+    assert batch["early_return"]["reason"] == "child_attention_beacon"
+    assert [row["text"] for row in batch["early_return"]["beacons"]] == [
+        "preentry-waitingchild2"
+    ]
+
+    # A later wait in this same actor context does not replay either row.
+    assert _wait_for_task(ctx, "waitingchild1", timeout_sec=0).startswith("Task wait timed out")
+    assert "early_return" not in json.loads(
+        _wait_for_tasks(ctx, ["waitingchild2"], timeout_sec=0)
+    )
+
+
+def test_wait_surfaces_preentry_beacon_before_terminal_fast_path(tmp_path, monkeypatch):
+    from ouroboros import task_tree_ledger
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _wait_for_task
+
+    monkeypatch.setattr(task_tree_ledger, "DATA_DIR", str(tmp_path))
+    write_task_result(
+        tmp_path, "terminal-beacon-child", STATUS_COMPLETED,
+        parent_task_id="terminal-beacon-parent", root_task_id="terminal-beacon-parent",
+        delegation_role="subagent",
+    )
+    assert task_tree_ledger.tree_ledger_append(
+        "terminal-beacon-parent", "question", "answer me before completion",
+        task_id="terminal-beacon-child",
+    ).startswith("OK:")
+    ctx = SimpleNamespace(
+        drive_root=tmp_path, task_id="terminal-beacon-parent",
+        task_metadata={"root_task_id": "terminal-beacon-parent"},
+    )
+    first = _wait_for_task(ctx, "terminal-beacon-child", timeout_sec=0)
+    assert first.startswith("Task wait interrupted by a child attention beacon")
+    assert "answer me before completion" in first
+    assert _wait_for_task(ctx, "terminal-beacon-child", timeout_sec=0).startswith(
+        "Task wait completed"
+    )
 
 
 # --- v6.91 wait_tasks typed unknown ids + children roster ---------------------
@@ -2131,6 +2457,19 @@ def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monk
     out = control._schedule_task(
         ctx, subagent_id="api-scout", objective="Delegate", expected_output="Something")
     assert "depth limit (0) exceeded" in out
+    assert "subtask_depth_limit" in out
+    refused_id = out.split("task_id=", 1)[1].split(";", 1)[0]
+    refused = json.loads(
+        (tmp_path / "task_results" / f"{refused_id}.json").read_text(encoding="utf-8")
+    )
+    assert refused["status"] == STATUS_FAILED
+    assert refused["delegation_admission"]["reason_code"] == "subtask_depth_limit"
+    assert refused["depth_provenance"] == {
+        "requested_depth": None,
+        "permitted_depth": 0,
+        "attempted_depth": 1,
+        "achieved_depth": None,
+    }
 
     monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     enqueued = []
@@ -2190,8 +2529,8 @@ def test_other_bounded_int_settings_keep_their_min_of_one(monkeypatch):
 
 def test_settings_ui_carries_a_configured_zero_subagent_depth():
     """The runtime honouring 0 is worthless if the Settings page silently reverts it: 0 is FALSY
-    in JS, so a stored 0 read through the plain `if (value)` branch displayed the fallback 2, and
-    the next Save (which posts every number field unconditionally) wrote 2 back — re-enabling two
+    in JS, so a stored 0 read through the plain `if (value)` branch displayed the fallback 3, and
+    the next Save (which posts every number field unconditionally) wrote 3 back — re-enabling three
     levels of delegation through the UI. All three carriers of the owner's 0 are pinned: the input
     can reach it, the depth entry is falsy-tolerant, and the load path still honours that flag
     (without which the flag is inert)."""
@@ -2203,7 +2542,7 @@ def test_settings_ui_carries_a_configured_zero_subagent_depth():
     settings_ui = (root / "web" / "modules" / "subagents_settings.js").read_text(encoding="utf-8")
     assert 'id="s-subagent-depth" type="number" min="0"' in settings_ui
     # The 4th tuple element is the falsy-tolerant flag consumed by the load path below.
-    assert "['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 2, true]" in settings_js
+    assert "['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 3, true]" in settings_js
     assert (
         "if (allowFalsy ? value !== null && value !== undefined : value) byId(id).value = value;"
         in settings_js
@@ -2763,6 +3102,92 @@ def test_assign_tasks_honors_depth_reservation_for_first_grandchild(tmp_path, mo
 
     assert delivered and delivered[0]["id"] == "grandchild1"
     assert "grandchild1" in workers_module.RUNNING
+
+
+def test_assignment_depth_fact_reaches_worker_and_survives_child_copyback(tmp_path, monkeypatch):
+    from supervisor import queue as queue_module
+    from supervisor import workers as workers_module
+    from supervisor import state as state_module
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.headless import copy_child_task_result
+    from ouroboros.task_results import (
+        STATUS_COMPLETED,
+        load_task_result,
+        write_task_result,
+    )
+
+    delivered = []
+
+    class FakeWorkerQueue:
+        def put(self, task):
+            delivered.append(task)
+
+    child_drive = tmp_path / "state" / "headless_tasks" / "child-depth" / "data"
+    child_drive.mkdir(parents=True)
+    queued_contract = build_task_contract({
+        "delegation_budget": {
+            "depth_remaining": 2,
+            "depth_provenance": {
+                "requested_depth": 3,
+                "permitted_depth": 3,
+                "attempted_depth": 1,
+                "achieved_depth": None,
+            },
+        },
+    })
+    pending = [{
+        "id": "child-depth",
+        "type": "task",
+        "chat_id": 1,
+        "description": "Assigned depth child",
+        "depth": 1,
+        "root_task_id": "root-depth",
+        "parent_task_id": "root-depth",
+        "delegation_role": "subagent",
+        "drive_root": str(child_drive),
+        "child_drive_root": str(child_drive),
+        "budget_drive_root": str(tmp_path),
+        "task_contract": queued_contract,
+        "metadata": {"task_contract": queued_contract},
+    }]
+    monkeypatch.setattr(workers_module, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers_module, "PENDING", pending)
+    monkeypatch.setattr(workers_module, "RUNNING", {})
+    monkeypatch.setattr(
+        workers_module,
+        "WORKERS",
+        {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())},
+    )
+    monkeypatch.setattr(workers_module, "load_state", lambda: {})
+    monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+
+    workers_module.assign_tasks()
+
+    assert delivered and delivered[0]["depth_provenance"]["achieved_depth"] == 1
+    worker_contract = delivered[0]["task_contract"]
+    assert worker_contract["delegation_budget"]["depth_provenance"]["achieved_depth"] == 1
+    assert delivered[0]["metadata"]["task_contract"] == worker_contract
+
+    # Reproduce the real terminal replica: the worker writes the contract it
+    # received to its child drive, then the supervisor copies that result back.
+    write_task_result(
+        child_drive,
+        "child-depth",
+        STATUS_COMPLETED,
+        parent_task_id="root-depth",
+        root_task_id="root-depth",
+        delegation_role="subagent",
+        task_contract=worker_contract,
+        depth_provenance=delivered[0]["depth_provenance"],
+        result="done",
+    )
+    copied = copy_child_task_result(tmp_path, delivered[0])
+    assert copied is not None
+    canonical = load_task_result(tmp_path, "child-depth")
+    nested = canonical["task_contract"]["delegation_budget"]["depth_provenance"]
+    assert nested == canonical["depth_provenance"]
+    assert nested["achieved_depth"] == 1
 
 
 def test_override_delegation_constraint_requires_parent_lineage(tmp_path, monkeypatch):

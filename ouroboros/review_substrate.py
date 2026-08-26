@@ -26,6 +26,7 @@ from ouroboros.config import get_review_models, review_model_uses_local
 from ouroboros.llm import LLMClient
 from ouroboros.observability import new_call_id, persist_call, redact_projection
 from ouroboros.provider_models import provider_for_model
+from ouroboros.task_results import review_binding_hash
 # Everything below the seam. Re-exported here because the substrate is the
 # historical import site for the api_chat prompt renderers; `review_execution`
 # owns them now and must never import this module back.
@@ -393,9 +394,7 @@ def build_review_binding(
         "evidence_revision": evidence_revision,
         "fence_hash": fence_hash,
     }
-    binding_hash = hashlib.sha256(
-        json.dumps(binding_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    binding_hash = review_binding_hash(**binding_payload)
     return {
         **binding_payload,
         "binding_hash": binding_hash,
@@ -896,15 +895,14 @@ def build_improvement_capsule(
     return "\n".join(lines)
 
 
-# The row-identity mint (slot_id_for_row + surface prefixes) moved whole to
-# ouroboros/review_dispatch.py at the module-size gate; the historical names
-# stay importable from here for every existing consumer.
+# Historical dispatch names remain re-exported for existing consumers.
 from ouroboros.review_dispatch import (  # noqa: E402,F401 — re-exports
     PLAN_SLOT_ID_PREFIX,
     SCOPE_SLOT_ID_PREFIX,
     SLOT_ID_PREFIX,
     slot_id_for_row,
     stamp_review_paid_on_dispatch,
+    task_acceptance_zero_physical_refusal,
 )
 
 
@@ -1385,12 +1383,16 @@ class ReviewCoordinator:
             )
         except Exception:
             prompt_ref = {}
-        incomplete_partial = request.evidence.get("__unresolved_partial_artifacts__")
-        if request.surface == "task_acceptance" and (request.evidence.get("__immutable_core_overflow__") or incomplete_partial):
+        free_refusal = (
+            task_acceptance_zero_physical_refusal(request.evidence)
+            if request.surface == "task_acceptance"
+            else {}
+        )
+        if free_refusal:
             raw_text = json.dumps({
                 "verdict": "DEGRADED",
                 "findings": [],
-                "summary": "A decision-bearing tool result remains partial or its exact source is unavailable; acceptance cannot treat that projection as complete." if incomplete_partial else "Immutable owner requirements do not fit the acceptance evidence budget; no requirement was silently truncated.",
+                "summary": free_refusal["summary"],
             })
             try:
                 response_ref = persist_call(
@@ -1401,7 +1403,7 @@ class ReviewCoordinator:
                     payload={"message": {"content": raw_text}, "usage": {}},
                     manifest={
                         "surface": request.surface, "slot_id": slot.slot_id,
-                        "model": slot.model, "status": "degraded_partial_source" if incomplete_partial else "degraded_core_overflow",
+                        "model": slot.model, "status": free_refusal["status"],
                         "physical_attempts": 0,
                     },
                 )

@@ -1,0 +1,134 @@
+"""Metered pacing state for configured-session host actors."""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Tuple
+
+
+DELEGATE_ACTIVITY_TOOLS = frozenset({
+    "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
+})
+
+HOST_COORDINATION_ACTIVITY_TOOLS = frozenset({
+    "schedule_subagent", "wait_task", "wait_tasks", "get_task_result", "peek_task",
+    "tree_note", "tree_read", "verify_and_record", "cancel_task",
+    "discard_child_result", "override_delegation_constraint", "forward_to_worker",
+})
+
+
+def note_nanny_delegate_activity(
+    ctx: Any,
+    round_idx: int,
+    accumulated_usage: Dict[str, Any],
+    tool_calls: List[Dict[str, Any]],
+) -> None:
+    """Advance metered progress and the latest physical/host coordination baseline."""
+
+    if not getattr(ctx, "_nanny_route_dispatched", False):
+        return
+    try:
+        cost = float(accumulated_usage.get("cost") or 0.0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    mark = {"round": int(round_idx), "cost": cost}
+    ctx._nanny_metered_progress = mark
+    verbs = set()
+    coordination_verbs = set()
+    for call in tool_calls or []:
+        fn = call.get("function") if isinstance(call, dict) else None
+        name = str((fn or {}).get("name") or "").strip() if isinstance(fn, dict) else ""
+        if name in DELEGATE_ACTIVITY_TOOLS:
+            verbs.add(name)
+        if name in HOST_COORDINATION_ACTIVITY_TOOLS:
+            coordination_verbs.add(name)
+    if coordination_verbs:
+        ctx._nanny_coordination_activity = True
+        ctx._nanny_coordination_tools = tuple(sorted(coordination_verbs))
+        ctx._nanny_delegate_baseline = dict(mark)
+        ctx._nanny_reminder_mark = None
+        return
+    if not verbs:
+        return
+    if verbs == {"delegate_wait"}:
+        # Waiting advances the round baseline but preserves cumulative dollar burn.
+        prior = getattr(ctx, "_nanny_delegate_baseline", None)
+        prior_cost = float(prior.get("cost") or 0.0) if isinstance(prior, dict) else 0.0
+        ctx._nanny_delegate_baseline = {"round": mark["round"], "cost": prior_cost}
+    else:
+        ctx._nanny_delegate_baseline = dict(mark)
+    ctx._nanny_reminder_mark = None
+
+
+def nanny_metered_since_delegate_activity(ctx: Any) -> Tuple[int, float]:
+    """Return own metered rounds/dollars since the latest coordination baseline."""
+
+    progress = getattr(ctx, "_nanny_metered_progress", None)
+    progress = progress if isinstance(progress, dict) else {}
+    baseline = getattr(ctx, "_nanny_delegate_baseline", None)
+    baseline = baseline if isinstance(baseline, dict) else {}
+    try:
+        rounds = max(
+            0, int(progress.get("round") or 0) - int(baseline.get("round") or 0),
+        )
+    except (TypeError, ValueError):
+        rounds = 0
+    try:
+        cost = max(
+            0.0, float(progress.get("cost") or 0.0) - float(baseline.get("cost") or 0.0),
+        )
+    except (TypeError, ValueError):
+        cost = 0.0
+    return rounds, cost
+
+
+def nanny_reminder_due(ctx: Any, round_idx: int) -> Tuple[int, float, bool]:
+    """Return measured burn and whether either proportional reminder axis is due."""
+
+    from ouroboros.task_pacing import (
+        NANNY_FIRST_REMINDER_ROUNDS,
+        NANNY_REMINDER_ROUNDS,
+        NANNY_REMINDER_USD,
+    )
+
+    rounds, cost = nanny_metered_since_delegate_activity(ctx)
+    round_threshold = NANNY_REMINDER_ROUNDS
+    if (
+        not isinstance(getattr(ctx, "_nanny_delegate_baseline", None), dict)
+        and not isinstance(getattr(ctx, "_nanny_reminder_mark", None), dict)
+    ):
+        round_threshold = NANNY_FIRST_REMINDER_ROUNDS
+    if rounds < round_threshold and cost < NANNY_REMINDER_USD:
+        return rounds, cost, False
+    mark = getattr(ctx, "_nanny_reminder_mark", None)
+    if not isinstance(mark, dict):
+        return rounds, cost, True
+    progress = getattr(ctx, "_nanny_metered_progress", None)
+    progress = progress if isinstance(progress, dict) else {}
+    try:
+        rounds_since_fire = int(progress.get("round") or 0) - int(mark.get("round") or 0)
+    except (TypeError, ValueError):
+        rounds_since_fire = 0
+    try:
+        cost_since_fire = float(progress.get("cost") or 0.0) - float(mark.get("cost") or 0.0)
+    except (TypeError, ValueError):
+        cost_since_fire = 0.0
+    due = (
+        rounds_since_fire >= NANNY_REMINDER_ROUNDS
+        or cost_since_fire >= NANNY_REMINDER_USD
+    )
+    return rounds, cost, due
+
+
+def nanny_burn_phrase(rounds: int, cost: float) -> str:
+    if cost > 0:
+        return f"{rounds} of your own metered LLM rounds (~${cost:.2f})"
+    return f"{rounds} of your own metered LLM rounds"
+
+
+# Compatibility spellings retained on ``ouroboros.loop`` through imports.
+_DELEGATE_ACTIVITY_TOOLS = DELEGATE_ACTIVITY_TOOLS
+_HOST_COORDINATION_ACTIVITY_TOOLS = HOST_COORDINATION_ACTIVITY_TOOLS
+_note_nanny_delegate_activity = note_nanny_delegate_activity
+_nanny_metered_since_delegate_activity = nanny_metered_since_delegate_activity
+_nanny_reminder_due = nanny_reminder_due
+_nanny_burn_phrase = nanny_burn_phrase

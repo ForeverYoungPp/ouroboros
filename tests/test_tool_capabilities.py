@@ -558,6 +558,7 @@ def test_schedule_subagent_in_initial_schemas():
     registry = ToolRegistry(repo_dir=tmp, drive_root=tmp)
     names = {s["function"]["name"] for s in initial_tool_schemas(registry)}
     assert "schedule_subagent" in names
+    assert {"peek_task", "cancel_task", "discard_child_result"} <= names
     schedule_schema = next(s for s in initial_tool_schemas(registry) if s["function"]["name"] == "schedule_subagent")
     props = schedule_schema["function"]["parameters"]["properties"]
     assert "required_capabilities" in props
@@ -655,6 +656,7 @@ def test_local_readonly_subagent_initial_schemas_are_allowlisted(tmp_path):
     assert LOCAL_READONLY_SUBAGENT_TOOL_NAMES <= names
     assert "enable_tools" not in names
     assert "schedule_subagent" in names
+    assert "verify_and_record" not in names
     assert "write_file" not in names
     assert "run_command" not in names
     assert "browse_page" in names
@@ -671,6 +673,182 @@ def test_local_readonly_subagent_initial_schemas_are_allowlisted(tmp_path):
     assert schemas["browse_page"]["parameters"]["properties"]["engine"]["enum"] == ["chromium", "webkit"]
     assert "device" in schemas["browse_page"]["parameters"]["properties"]
     assert list_non_core_tools(registry) == []
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        pytest.param(
+            "readonly", id="local-readonly",
+        ),
+        pytest.param(
+            "acting", id="acting",
+        ),
+    ],
+)
+def test_child_profiles_expose_existing_descendant_controls(tmp_path, constraint):
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.tool_policy import initial_tool_schemas
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task_constraint = (
+        TaskConstraint(mode="local_readonly_subagent", allow_enable=False)
+        if constraint == "readonly"
+        else TaskConstraint(
+            mode="acting_subagent",
+            surface="external_workspace",
+            write_root=str(workspace),
+            allow_enable=False,
+        )
+    )
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path / "data")
+    registry.set_context(ToolContext(
+        repo_dir=tmp_path,
+        drive_root=tmp_path / "data",
+        workspace_root=workspace if constraint == "acting" else None,
+        workspace_mode="external" if constraint == "acting" else "",
+        task_constraint=task_constraint,
+    ))
+
+    names = {item["function"]["name"] for item in initial_tool_schemas(registry)}
+    assert {"peek_task", "cancel_task", "discard_child_result"} <= names
+
+
+def test_local_readonly_verify_is_typed_zero_run_only(tmp_path):
+    """Readonly actor-first sessions may disclose no-leaf state, never run generic checks."""
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.outcomes import (
+        read_verification_receipts,
+        verification_receipts_path,
+    )
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    data = tmp_path / "data"
+    data.mkdir()
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        drive_root=data,
+        task_id="readonly-actor",
+        task_constraint=TaskConstraint(mode="local_readonly_subagent", allow_enable=False),
+    )
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+        "exact_start_pending": False,
+        "zero_run_evidence_status": "unknown",
+        "zero_run_evidence_gaps": ["malformed_jsonl"],
+    }
+    verification_receipts_path(data, "readonly-actor", create=True).write_text(
+        '{"contract_kind":"delegation_zero_run","zero_run":true',
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=data)
+    registry.set_context(ctx)
+
+    from ouroboros.tool_policy import initial_tool_schemas
+    initial_names = {item["function"]["name"] for item in initial_tool_schemas(registry)}
+    assert "verify_and_record" in initial_names
+    verify_schema = registry.get_schema_by_name("verify_and_record")
+    assert verify_schema is not None
+    assert verify_schema["function"]["parameters"]["properties"]["contract_kind"]["enum"] == ["delegation_zero_run"]
+    assert "check" not in verify_schema["function"]["parameters"]["properties"]
+
+    blocked = registry.execute(
+        "verify_and_record",
+        {"contract_kind": "explicit_command", "check": [sys.executable, "-c", "print('must not run')"]},
+    )
+    assert "local_readonly_subagent" in blocked
+    assert read_verification_receipts(data, "readonly-actor") == []
+
+    allowed = registry.execute(
+        "verify_and_record",
+        {
+            "contract_kind": "delegation_zero_run",
+            "zero_run_decision": "unknown",
+            "zero_run_basis": "The configured route has not started a physical leaf.",
+        },
+    )
+    assert "UNKNOWN" in allowed
+    receipts = read_verification_receipts(data, "readonly-actor")
+    assert receipts[-1]["contract_kind"] == "delegation_zero_run"
+    assert receipts[-1]["regrounds_zero_run_authority"] is True
+    assert receipts[-1]["prior_zero_run_evidence_gaps"] == ["malformed_jsonl"]
+    assert ctx._configured_actor_bootstrap["exact_start_pending"] is False
+    assert "zero_run_evidence_status" not in ctx._configured_actor_bootstrap
+    assert "zero_run_evidence_gaps" not in ctx._configured_actor_bootstrap
+    assert registry.get_schema_by_name("verify_and_record") is None
+
+    # A forced direct handler call must also fail closed after the physical leaf
+    # starts, even if a caller bypasses registry schema/dispatch discovery.
+    ctx._configured_actor_bootstrap["physical_started"] = True
+    assert registry.get_schema_by_name("verify_and_record") is None
+    from ouroboros.tools.verify import _verify_and_record
+    late = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="complete",
+        zero_run_basis="too late",
+    )
+    assert "LOCAL_READONLY_SUBAGENT_BLOCKED" in late
+
+
+def test_ordinary_fresh_start_ignores_actor_first_zero_run_receipt_surface(tmp_path):
+    from ouroboros.outcomes import verification_receipts_path
+    from ouroboros.tools.delegate_integration import claimed_start_request
+    from ouroboros.tools.registry import ToolContext
+
+    data = tmp_path / "data"
+    data.mkdir()
+    ctx = ToolContext(
+        repo_dir=tmp_path,
+        drive_root=data,
+        task_id="ordinary-root",
+    )
+    verification_receipts_path(data, ctx.task_id, create=True).write_text(
+        '{"contract_kind":"delegation_zero_run"', encoding="utf-8",
+    )
+
+    claimed, refusal = claimed_start_request(
+        data,
+        claim_target="",
+        actor_ctx=ctx,
+        enforce_actor_idle=True,
+        run_id="",
+        task_id=ctx.task_id,
+        idempotency_key="ordinary-root-invocation",
+        invocation_id="ordinary-root-invocation",
+        max_seconds=30,
+        request={"prompt": "ordinary root delegation"},
+        project_id="",
+        project_owned=False,
+        route="codex",
+    )
+
+    assert claimed is True
+    assert refusal == {}
+
+
+def test_verify_never_claims_recorded_when_receipt_custody_fails(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.tools.verify as verify
+    from ouroboros.tools.registry import ToolContext
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="receipt-fail")
+    monkeypatch.setattr(verify, "append_verification_receipt", lambda *_a, **_k: False)
+
+    output = verify._verify_and_record(
+        ctx,
+        contract_kind="no_visible_machine_contract",
+        check="manual visual check with disclosed residual risk",
+    )
+
+    assert "receipt_custody_failed" in output
+    assert "no durable receipt was recorded" in output
+    assert "recorded as a receipt" not in output
 
 
 def test_local_readonly_subagent_execute_blocks_forbidden_tools(tmp_path, monkeypatch):

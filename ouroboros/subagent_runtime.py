@@ -547,14 +547,22 @@ def prepare_delegate_start_actor(
     snapshot, route = exact_session_binding(selected_snapshot)
     selected_id = str(snapshot.get("selected_subagent_id") or "")
     config_fingerprint = str(snapshot.get("config_fingerprint") or "")
+    if custody.custody_log_unreadable(drive_root):
+        return {}, _fail(
+            "delegate_start", "replacement_custody_unknown",
+            "The custody event log exists but cannot be read, so the host cannot "
+            "prove that no physical start/run remains. Repair or reconcile the "
+            "canonical custody record before starting a replacement.",
+        )
     blockers = unsettled_start_ids(
         drive_root, str(getattr(ctx, "task_id", "") or "")
     )
     if any(blockers.values()):
         return {}, _fail(
             "delegate_start", "replacement_requires_settlement",
-            "This task already owns an unsettled run or start invocation. Wait/cancel and "
-            "verify terminal settlement before starting a replacement.",
+            "This task still owns an unsettled run/start invocation or an undisposed "
+            "captured patch. Prove the predecessor absent or terminal and explicitly "
+            "dispose any captured patch before starting a replacement.",
             **blockers,
         )
     return {
@@ -568,15 +576,78 @@ def prepare_delegate_start_actor(
 
 
 def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) -> str:
-    """Shared exact-start primitive for atomic bootstrap and root-direct calls."""
+    """Shared exact-start primitive for actor-first sessions and root-direct calls."""
 
     options = dict(spec or {})
+    retry_token = str(options.get("retry_of") or "").strip()
+    bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+    recovering = False
+    if retry_token and isinstance(bootstrap, dict):
+        from ouroboros import delegate_custody as custody
+
+        invocation = custody.invocation_record(custody.custody_root(ctx), retry_token) or {}
+        recovering = (
+            str(invocation.get("state") or "") == "pending"
+            and str(invocation.get("task_id") or "")
+            == str(getattr(ctx, "task_id", "") or "")
+        )
+    if isinstance(bootstrap, dict) and not bool(bootstrap.get("zero_run_receipt_recorded")):
+        from ouroboros.subagent_bootstrap import _durable_zero_run_receipt
+
+        zero_run_evidence_gaps: set[str] = set()
+        durable_zero_run = _durable_zero_run_receipt(
+            ctx, gap_reasons=zero_run_evidence_gaps,
+        )
+        if durable_zero_run:
+            bootstrap.update({
+                "zero_run_receipt_recorded": True,
+                "zero_run_decision": str(durable_zero_run.get("zero_run_decision") or ""),
+                "zero_run_basis": str(durable_zero_run.get("zero_run_basis") or ""),
+                "exact_start_pending": False,
+            })
+            bootstrap.pop("zero_run_evidence_status", None)
+            bootstrap.pop("zero_run_evidence_gaps", None)
+        elif zero_run_evidence_gaps and not recovering:
+            bootstrap.update({
+                "zero_run_evidence_status": "unknown",
+                "zero_run_evidence_gaps": sorted(zero_run_evidence_gaps),
+                "exact_start_pending": False,
+            })
+    if isinstance(bootstrap, dict) and bool(bootstrap.get("zero_run_receipt_recorded")):
+        from ouroboros.delegate_shared import _fail
+
+        return _fail(
+            "delegate_start", "zero_run_already_recorded",
+            "This actor already recorded a terminal delegation_zero_run decision; "
+            "starting a physical leaf now would contradict that durable receipt. "
+            "Create a new explicitly bound task/retry after the parent disposes the result.",
+            zero_run_decision=str(bootstrap.get("zero_run_decision") or ""),
+        )
+    if (
+        not recovering
+        and isinstance(bootstrap, dict)
+        and str(bootstrap.get("zero_run_evidence_status") or "") == "unknown"
+    ):
+        from ouroboros.delegate_shared import _fail
+
+        return _fail(
+            "delegate_start", "zero_run_evidence_unavailable",
+            "The host cannot prove whether this actor already recorded a terminal "
+            "delegation_zero_run decision. Starting another physical leaf would "
+            "risk duplicating the same logical invocation. Reconcile the durable "
+            "receipt evidence or record a new typed zero-run decision.",
+            zero_run_evidence_status="unknown",
+            zero_run_evidence_gaps=list(
+                bootstrap.get("zero_run_evidence_gaps") or []
+            ),
+        )
     selected_id = str(options.pop("subagent_id", "") or "").strip()
     selected_snapshot = options.pop("snapshot", None)
     compiled_work_order = bool(options.pop("compiled_work_order", False))
     canonical_work_order_fingerprint = str(
         options.pop("work_order_fingerprint", "") or ""
     ).strip()
+    coordination_context = str(options.pop("_coordination_context", "") or "").strip()
     work_order_source_request = options.pop("work_order_source_request", None)
     try:
         if str(options.get("retry_of") or "").strip() and (
@@ -624,7 +695,15 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
             _resolved_binding=options.pop("_resolved_binding", None),
             _canonical_work_order_fingerprint=canonical_work_order_fingerprint,
             _work_order_source_request=work_order_source_request,
+            _coordination_context=coordination_context,
         )
+        # Actor-first configured sessions keep the physical leaf pending until the
+        # ordinary host episode chooses ``delegate_start``.  Mark that choice from
+        # the host-owned typed result, including the uncustodied branch: a run may
+        # already be live even when its durable custody row could not be written.
+        # Without this marker the same episode could mint a false zero-run receipt
+        # after a successful start and nanny economics would miss real activity.
+        _mark_actor_physical_start(ctx, result)
         try:
             payload = json.loads(result)
         except (TypeError, ValueError):
@@ -647,7 +726,238 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
         _EXACT_START_SELECTION.reset(token)
 
 
+def _mark_actor_physical_start(ctx: Any, result: Any) -> None:
+    """Record a successful actor-first physical start on the private bootstrap fact.
+
+    This is deliberately an internal projection, not a new lifecycle ABI.  The
+    durable custody/evidence rows remain authoritative; the projection only keeps
+    the current host episode from treating a started (possibly uncustodied) run as
+    a zero-run and seeds the existing nanny-activity accounting.
+    """
+    bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+    if not isinstance(bootstrap, dict):
+        return
+    try:
+        payload = json.loads(result) if isinstance(result, str) else result
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict) or str(payload.get("status") or "") not in {
+        "started", "started_uncustodied",
+    }:
+        return
+    bootstrap["physical_started"] = True
+    bootstrap["exact_start_pending"] = False
+    bootstrap["physical_start_status"] = str(payload.get("status") or "")
+    ctx._nanny_physical_activity_seed = True
+
+
+def _record_actor_work_order_source(
+    ctx: Any, bootstrap: dict[str, Any], *, refusal_reason: str = "",
+) -> None:
+    """Persist the oversized-work-order decision when a physical start is attempted."""
+    source_request = bootstrap.get("source_request")
+    if not isinstance(source_request, dict) or not source_request:
+        return
+    from ouroboros import delegate_custody as custody
+
+    source_channel = (
+        bootstrap.get("source_channel")
+        if isinstance(bootstrap.get("source_channel"), dict)
+        else {}
+    )
+    payload = {
+        "task_id": str(getattr(ctx, "task_id", "") or ""),
+        "route": str(source_channel.get("route") or bootstrap.get("route_id") or ""),
+        # This evidence is written before the POST so a crash cannot turn an
+        # attempted partial-lens start into clean absence.  ``exact_start`` may
+        # still refuse before delivery, so do not label the request as sent.
+        "status": "attempted",
+        "source_channel": source_channel,
+        **source_request,
+    }
+    event_type = "configured_subagent_work_order_source_request"
+    if refusal_reason:
+        event_type = "configured_subagent_work_order_refused"
+        payload.update({
+            "status": "refused",
+            "reason": refusal_reason,
+            "source_request": source_request,
+            "source_channel": source_channel,
+            "detail": (
+                "The complete brief was not truncated or sent. A live interactive "
+                "question channel is required to resolve its named source ranges."
+            ),
+        })
+    custody.emit(custody.custody_root(ctx), event_type, payload)
+
+
+def _actor_work_order_for_start(
+    ctx: Any, bootstrap: dict[str, Any], *, retry: bool = False,
+) -> tuple[str, str]:
+    """Resolve the immutable work order for one physical start attempt.
+
+    A bootstrap capability observation is useful context for the actor, but it
+    cannot authorize a later partial-lens start: manifests may change in either
+    direction while the actor reasons.  Every over-budget attempt therefore
+    probes the exact frozen route again and records the live observation.
+    """
+
+    canonical = str(bootstrap.get("canonical_work_order") or "")
+    source_request = bootstrap.get("source_request")
+    if canonical or not isinstance(source_request, dict) or not source_request:
+        return canonical, ""
+
+    try:
+        _snapshot, exact_route = exact_session_binding(bootstrap.get("snapshot"))
+        channel_route_id = str(exact_route.route_id or "")
+        route_error = ""
+    except Exception as exc:  # noqa: BLE001 - invalid frozen authority is UNKNOWN
+        channel_route_id = ""
+        route_error = str(getattr(exc, "code", "") or type(exc).__name__)
+    gateway = None
+    try:
+        from ouroboros.claudexor_daemon import ensure_owned_gateway
+        from ouroboros.subagent_work_order import route_source_request_channel
+
+        if route_error:
+            source_channel = {
+                "status": "unverified",
+                "reason": "frozen_route_invalid",
+                "detail": route_error,
+                "route": channel_route_id,
+            }
+        else:
+            gateway = ensure_owned_gateway()
+            source_channel = route_source_request_channel(gateway, channel_route_id)
+    except Exception as exc:  # noqa: BLE001 - unknown is a typed authority fact
+        source_channel = {
+            "status": "unverified",
+            "reason": "capability_probe_failed",
+            "detail": type(exc).__name__,
+            "route": channel_route_id,
+        }
+    finally:
+        if gateway is not None:
+            try:
+                gateway.close()
+            except Exception:
+                pass
+    bootstrap["source_channel"] = source_channel
+
+    status = str(source_channel.get("status") or "unverified")
+    if status != "available":
+        reason = (
+            "work_order_source_channel_unavailable"
+            if status == "unavailable"
+            else "work_order_source_channel_unverified"
+        )
+        _record_actor_work_order_source(ctx, bootstrap, refusal_reason=reason)
+        from ouroboros.delegate_shared import _fail
+
+        detail = (
+            "The selected route reports no interactive source channel."
+            if status == "unavailable"
+            else "The host could not verify an interactive source channel for the selected route."
+        )
+        return "", _fail(
+            "delegate_start", reason,
+            f"{detail} The complete canonical work order exceeds the host wire budget, "
+            "so the physical leaf was not started from a prefix.",
+            work_order_fingerprint=str(bootstrap.get("work_order_fingerprint") or ""),
+            work_order_chars=int(bootstrap.get("work_order_chars") or 0),
+            source_channel=source_channel,
+            retry=bool(retry),
+            host_fallback=False,
+        )
+
+    source_prompt = str(bootstrap.get("source_prompt") or "")
+    if source_prompt:
+        return source_prompt, ""
+    return "", ""
+
+
 def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, **params: Any) -> str:
+    # Actor-first configured sessions bind every fresh start to the immutable
+    # snapshot captured before the episode. The model supplies only an advisory
+    # coordination appendix; the canonical work order remains host-owned.
+    bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+    retry_of = str(params.get("retry_of") or "").strip()
+    from ouroboros.delegate_shared import _fail
+    if isinstance(bootstrap, dict) and not retry_of:
+        expected_id = str(bootstrap.get("selected_subagent_id") or "")
+        requested_id = str(params.get("subagent_id") or "").strip()
+        if requested_id and requested_id != expected_id:
+            return _fail(
+                "delegate_start", "configured_actor_route_mismatch",
+                "This actor-first turn is bound to its scheduled configured session; "
+                "select another actor with schedule_subagent instead.",
+                selected_subagent_id=expected_id,
+                requested_subagent_id=requested_id,
+                host_fallback=False,
+            )
+        if any(str(params.get(key) or "").strip() for key in ("root", "bucket", "skill_name")):
+            return _fail(
+                "delegate_start", "configured_actor_resource_mismatch",
+                "An actor-first configured session may start only its assigned route, "
+                "not a skill-payload resource.",
+                selected_subagent_id=expected_id,
+                host_fallback=False,
+            )
+        canonical_work_order, source_refusal = _actor_work_order_for_start(
+            ctx, bootstrap,
+        )
+        if source_refusal:
+            return source_refusal
+        source_request = bootstrap.get("source_request")
+        if not canonical_work_order:
+            return _fail(
+                "delegate_start", "configured_work_order_unavailable",
+                "The canonical work order is unavailable; do not start a physical leaf "
+                "from a prefix. Resolve the existing source-range interaction first.",
+                work_order_fingerprint=str(bootstrap.get("work_order_fingerprint") or ""),
+                work_order_chars=int(bootstrap.get("work_order_chars") or 0),
+                host_fallback=False,
+            )
+        bound = dict(params)
+        bound.pop("subagent_id", None)
+        bound.update({
+            "snapshot": dict(bootstrap.get("snapshot") or {}),
+            "compiled_work_order": True,
+            "work_order_fingerprint": str(bootstrap.get("work_order_fingerprint") or ""),
+            "_coordination_context": str(prompt or "").strip(),
+        })
+        if _resolved_binding is not None:
+            bound["_resolved_binding"] = _resolved_binding
+        if isinstance(source_request, dict) and source_request:
+            bound["work_order_source_request"] = dict(source_request)
+            _record_actor_work_order_source(ctx, bootstrap)
+        return exact_start(ctx, canonical_work_order, bound)
+    if retry_of and isinstance(bootstrap, dict):
+        # Retry replays the stored canonical request byte-for-byte; do not let a
+        # new coordination sentence become a prefix when the original order was
+        # over the host wire budget.
+        canonical_work_order, source_refusal = _actor_work_order_for_start(
+            ctx, bootstrap, retry=True,
+        )
+        if source_refusal:
+            return source_refusal
+        if not canonical_work_order:
+            return _fail(
+                "delegate_start", "configured_work_order_unavailable",
+                "The retry has no complete canonical work order or verified source "
+                "lens; the coordination prompt cannot replace the original assignment.",
+                work_order_fingerprint=str(bootstrap.get("work_order_fingerprint") or ""),
+                work_order_chars=int(bootstrap.get("work_order_chars") or 0),
+                host_fallback=False,
+            )
+        retry_spec = {
+            "retry_of": retry_of,
+            "_resolved_binding": _resolved_binding,
+        }
+        if isinstance(bootstrap.get("source_request"), dict) and bootstrap.get("source_request"):
+            retry_spec["work_order_source_request"] = dict(bootstrap["source_request"])
+            _record_actor_work_order_source(ctx, bootstrap)
+        return exact_start(ctx, canonical_work_order, retry_spec)
     return exact_start(ctx, prompt, {**params, "_resolved_binding": _resolved_binding})
 
 

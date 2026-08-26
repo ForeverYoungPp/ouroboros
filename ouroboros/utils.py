@@ -67,6 +67,41 @@ def emit_log_event(
     except Exception:
         log.debug("Failed to emit %s event", log_label, exc_info=True)
 
+
+def emit_main_llm_call_state_event(
+    event_queue: Any,
+    *,
+    task_id: str,
+    task_attempt: Any,
+    llm_call_id: str,
+    execution_id: str,
+    round_id: str,
+    call_attempt: int,
+    phase: str,
+) -> None:
+    """Publish one typed main-LLM in-flight fact to the supervisor.
+
+    This is a direct control-plane event, not a UI ``log_event``.  It has no
+    elapsed-time expiry: the supervisor uses it only to spare the idle rail
+    while the exact call is active; deadline, budget, cancellation, and the
+    absolute task ceiling remain independent hard axes.
+    """
+    if event_queue is None:
+        return
+    try:
+        event_queue.put({
+            "type": "main_llm_call_state",
+            "task_id": str(task_id or ""),
+            "task_attempt": task_attempt,
+            "llm_call_id": str(llm_call_id or ""),
+            "execution_id": str(execution_id or ""),
+            "round_id": str(round_id or ""),
+            "call_attempt": int(call_attempt),
+            "phase": str(phase or ""),
+        })
+    except Exception:
+        log.debug("Failed to emit main LLM call state event", exc_info=True)
+
 def sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
@@ -383,9 +418,17 @@ def jsonl_append_lock_path(path: pathlib.Path) -> pathlib.Path:
     return path.parent / f".append_jsonl_{path_hash}.lock"
 
 
-def append_jsonl(path: pathlib.Path, obj: Dict[str, Any]) -> bool:
+def append_jsonl(
+    path: pathlib.Path, obj: Dict[str, Any], *, ensure_record_boundary: bool = False,
+    require_lock: bool = False,
+) -> bool:
     """Append a JSON object as a line to a JSONL file (concurrent-safe).
 
+    ``ensure_record_boundary`` repairs a missing final newline before this
+    append; it is opt-in so high-volume event logs keep their established path.
+    ``require_lock`` is reserved for authority streams that also have atomic
+    whole-file reconciliation: unlike high-volume observational logs, they may
+    not fall back to an unlocked append after lock timeout.
     Returns ``True`` on successful write, ``False`` when all retries
     failed (which is also logged at WARNING). Important events
     (``task_done``, ``llm_round``, escalation messages) need that signal
@@ -410,31 +453,68 @@ def append_jsonl(path: pathlib.Path, obj: Dict[str, Any]) -> bool:
     _written = False
 
     try:
-        start = time.time()
-        while time.time() - start < lock_timeout_sec:
-            try:
-                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-                lock_acquired = True
-                break
-            except FileExistsError:
+        if require_lock:
+            from ouroboros.platform_layer import acquire_exclusive_file_lock
+
+            lock_fd = acquire_exclusive_file_lock(
+                lock_path,
+                timeout_sec=lock_timeout_sec,
+                stale_sec=lock_stale_sec,
+                poll_sec=lock_sleep_sec,
+                owner_aware_stale=True,
+            )
+            lock_acquired = lock_fd is not None
+        else:
+            start = time.time()
+            while time.time() - start < lock_timeout_sec:
                 try:
-                    stat = lock_path.stat()
-                    if time.time() - stat.st_mtime > lock_stale_sec:
-                        lock_path.unlink()
-                        continue
+                    lock_fd = os.open(
+                        str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644,
+                    )
+                    lock_acquired = True
+                    break
+                except FileExistsError:
+                    try:
+                        stat = lock_path.stat()
+                        if time.time() - stat.st_mtime > lock_stale_sec:
+                            lock_path.unlink()
+                            continue
+                    except Exception:
+                        log.debug(
+                            "Failed to read lock stat during lock acquisition retry",
+                            exc_info=True,
+                        )
+                    time.sleep(lock_sleep_sec)
                 except Exception:
-                    log.debug("Failed to read lock stat during lock acquisition retry", exc_info=True)
-                    pass
-                time.sleep(lock_sleep_sec)
-            except Exception:
-                log.debug("Failed to acquire file lock for jsonl append", exc_info=True)
-                break
+                    log.debug("Failed to acquire file lock for jsonl append", exc_info=True)
+                    break
+
+        if require_lock and not lock_acquired:
+            log.warning("append_jsonl: required lock unavailable for %s", path)
+            return False
+
+        append_data = data
+        if ensure_record_boundary:
+            # A crashed receipt writer may leave its final object without a
+            # separator. Preserve those bytes while keeping this append a new
+            # record. Ordinary high-volume logs retain their existing fast path.
+            try:
+                if path.stat().st_size > 0:
+                    with path.open("rb") as existing:
+                        existing.seek(-1, os.SEEK_END)
+                        if existing.read(1) != b"\n":
+                            append_data = b"\n" + data
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Preserve historical behavior for unusual write-only files.
+                append_data = data
 
         for attempt in range(write_retries):
             try:
                 fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
                 try:
-                    os.write(fd, data)
+                    os.write(fd, append_data)
                 finally:
                     os.close(fd)
                 _written = True
@@ -446,7 +526,7 @@ def append_jsonl(path: pathlib.Path, obj: Dict[str, Any]) -> bool:
         for attempt in range(write_retries):
             try:
                 with path.open("a", encoding="utf-8") as f:
-                    f.write(line + "\n")
+                    f.write(append_data.decode("utf-8"))
                 _written = True
                 return True
             except Exception:

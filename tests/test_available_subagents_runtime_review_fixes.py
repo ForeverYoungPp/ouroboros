@@ -409,7 +409,11 @@ def test_delegate_start_recipes_match_the_fresh_start_schema():
         for recipe in recipes:
             assert re.search(r"\bprompt\s*=", recipe), (relative, recipe)
             if not re.search(r"\bretry_of\s*=", recipe):
-                assert re.search(r"\bsubagent_id\s*=", recipe), (relative, recipe)
+                direct_selector = re.search(r"\bsubagent_id\s*=", recipe)
+                actor_first_snapshot = re.fullmatch(
+                    r"\s*prompt\s*=\s*(['\"])\1\s*", recipe,
+                )
+                assert direct_selector or actor_first_snapshot, (relative, recipe)
 
 
 def test_delegate_recovery_uses_platform_pid_probe(monkeypatch):

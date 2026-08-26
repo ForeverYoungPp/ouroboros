@@ -394,6 +394,33 @@ def _is_own_child(ctx: ToolContext, status_drive_root: Path, tid: str) -> bool:
         return False
 
 
+def _is_delegated_task(ctx: ToolContext) -> bool:
+    """Whether the current caller has a delegated-child tool profile."""
+
+    try:
+        from ouroboros.tool_access import active_tool_profile
+
+        return active_tool_profile(ctx) in {
+            "acting_subagent", "local_readonly_subagent",
+        }
+    except Exception:
+        # Preserve the descendant-only authority even if profile projection
+        # itself fails: a delegated lineage marker may narrow this caller but
+        # must never widen it to arbitrary task inspection/control.
+        metadata = (
+            getattr(ctx, "task_metadata", {})
+            if isinstance(getattr(ctx, "task_metadata", {}), dict)
+            else {}
+        )
+        constraint = getattr(ctx, "task_constraint", None)
+        return (
+            str(getattr(constraint, "mode", "") or "") in {
+                "acting_subagent", "local_readonly_subagent",
+            }
+            or str(metadata.get("delegation_role") or "") == "subagent"
+        )
+
+
 def _clip(text: object, limit: int, *, tail: bool = False) -> str:
     """Truncate to ``limit`` chars with an EXPLICIT omission marker so a peek never
     silently drops cognitive content (P1 — no silent horizon cut; the agent can then
@@ -420,6 +447,11 @@ def _peek_task(ctx: ToolContext, task_id: str, view: str = "summary") -> str:
         return f"⚠️ TOOL_ARG_ERROR (peek_task): {exc}"
     v = str(view or "summary").strip().lower()
     status_drive_root = _status_drive_root(ctx)
+    if _is_delegated_task(ctx) and not _is_own_child(ctx, status_drive_root, tid):
+        return (
+            f"⚠️ peek_task: {tid} is not a child of this task — a delegated task "
+            "may inspect only its own children."
+        )
     data = load_effective_task_result(status_drive_root, tid) or {}
     status = str(data.get("status") or "unknown")
     # SSOT cost projection (C2): a missing/unknown cost says "unknown", never a
@@ -440,11 +472,26 @@ def _peek_task(ctx: ToolContext, task_id: str, view: str = "summary") -> str:
         if rid:
             rows = [r for r in tree_ledger_rows(rid) if str(r.get("task_id") or "") == tid]
             if v in ("partials", "summary"):
-                beacons = [r for r in rows if str(r.get("kind")) in ("partial_finding", "blocker", "question", "milestone", "interface_contract")]
+                beacons = [
+                    r for r in rows
+                    if str(r.get("kind")) in (
+                        "partial_finding", "blocker", "question", "milestone",
+                        "interface_contract", "review_requested",
+                    )
+                ]
                 if len(beacons) > 8:
                     parts.append(f"  …(+{len(beacons) - 8} older beacon(s) omitted; showing newest 8)")
                 for r in beacons[-8:]:
-                    parts.append(f"  • [{r.get('kind')}] {_clip(r.get('text'), 400)}")
+                    detail = ""
+                    if str(r.get("kind") or "") == "review_requested":
+                        payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+                        detail = (
+                            f" evidence_ref={_clip(payload.get('evidence_ref'), 1000)}"
+                            f" evidence_sha256={str(payload.get('evidence_sha256') or '')}"
+                        )
+                    parts.append(
+                        f"  • [{r.get('kind')}] {_clip(r.get('text'), 400)}{detail}"
+                    )
     except Exception:
         log.debug("peek_task ledger read failed for %s", tid, exc_info=True)
     if v in ("tail", "summary"):
@@ -552,16 +599,8 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     # Subagent isolation: a delegated child may cancel only its own children.
     # Project focus does not narrow an ordinary top-level principal; workspace
     # parents keep the same task-control authority as other top-level tasks.
-    if not own:
-        try:
-            from ouroboros.tool_access import active_tool_profile
-
-            if active_tool_profile(ctx) in (
-                "acting_subagent", "local_readonly_subagent",
-            ):
-                return f"⚠️ cancel_task: {tid} is not a child of this task — a delegated task may only cancel its own children."
-        except Exception:
-            log.debug("cancel_task lineage profile check failed for %s", tid, exc_info=True)
+    if not own and _is_delegated_task(ctx):
+        return f"⚠️ cancel_task: {tid} is not a child of this task — a delegated task may only cancel its own children."
     # Durable cancel intent — the ONE ingress (phase A, owner batch-4 1=A). The
     # canonical status never carries intent: the supervisor's cancellation
     # custody claims this intent, tears the task down, and settles the terminal

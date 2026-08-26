@@ -820,6 +820,36 @@ def test_v651_build_task_acceptance_evidence_process_aware():
     assert "hello world" in arts["out.txt"]["preview"]
 
 
+def test_acceptance_evidence_unions_split_root_actor_receipts(tmp_path):
+    from ouroboros.outcomes import append_verification_receipt
+    from ouroboros.review_evidence import build_task_acceptance_evidence
+
+    local = tmp_path / "child"
+    canonical = tmp_path / "canonical"
+    local.mkdir()
+    canonical.mkdir()
+    ctx = _verify_ctx(local, task_id="split-acceptance")
+    ctx.drive_root = local
+    ctx.budget_drive_root = str(canonical)
+    append_verification_receipt(canonical, ctx.task_id, {
+        "status": "declared", "contract_kind": "delegation_zero_run",
+        "zero_run": True, "zero_run_decision": "complete",
+    })
+    append_verification_receipt(local, ctx.task_id, {
+        "status": "pass", "check": "pytest tests/split.py",
+        "criterion_id": "split-check",
+    })
+
+    packet = build_task_acceptance_evidence(
+        ctx, drive_root=local, task_id=ctx.task_id,
+    )
+
+    assert packet["verification_summary"]["count"] == 2
+    assert [row.get("contract_kind") for row in packet["verification_receipts"]] == [
+        "", "delegation_zero_run",
+    ]
+
+
 def test_v651_acceptance_evidence_budget_disclosed():
     """Verbose evidence is reduced, but immutable owner intent is never truncated."""
     import types as _t
@@ -956,6 +986,448 @@ def test_verify_and_record_handler_artifact_and_declared(tmp_path):
     # no_visible_machine_contract -> honest declared receipt (grounding)
     assert "DECLARED" in _verify_and_record(ctx, contract_kind="no_visible_machine_contract", check="manual UI review")
     assert read_verification_receipts(ctx.drive_root, "vhandler")[-1]["status"] == "declared"
+
+
+def test_configured_actor_can_record_typed_zero_run_only_before_leaf(tmp_path):
+    from ouroboros.outcomes import (
+        apply_receipt_absent_flag,
+        read_verification_receipts,
+        should_nudge_verification,
+        verification_grounding_present,
+    )
+    from ouroboros.tools.verify import _verify_and_record
+
+    ctx = _verify_ctx(tmp_path)
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+    }
+    result = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="incomplete",
+        zero_run_basis="The selected route was unavailable and no host child produced the requested artifact.",
+    )
+    assert "INCOMPLETE" in result
+    receipt = read_verification_receipts(ctx.drive_root, ctx.task_id)[-1]
+    assert receipt["contract_kind"] == "delegation_zero_run"
+    assert receipt["status"] == "declared"
+    assert receipt["zero_run_decision"] == "incomplete"
+    assert receipt["physical_run_started"] is False
+    assert ctx._configured_actor_bootstrap["zero_run_receipt_recorded"] is True
+
+    # A no-leaf lifecycle decision is not proof that the requested deliverable
+    # is correct.  It remains visible in the receipt packet without suppressing
+    # receipt_absent or masquerading as host-attested grounding.  The actor also
+    # must not become grounding. The pure receipt helper has no tool-profile
+    # context, so it still reports that a reviewable effect needs verification;
+    # the loop suppresses that impossible reminder only for the readonly actor
+    # profile whose generic verify surface disappears after zero-run.
+    trace = {"tool_calls": [{"tool": "integrate_subagent_patch", "status": "ok", "args": {}}]}
+    assert verification_grounding_present(trace, ctx.drive_root, ctx.task_id) is False
+    assert should_nudge_verification(trace, ctx.drive_root, ctx.task_id) is True
+    loop_outcome = {
+        "outcome_axes": {
+            "execution": {"status": "ok"},
+            "objective": {"status": "satisfied"},
+        },
+        "final_answer": "host-side result",
+    }
+    apply_receipt_absent_flag(
+        loop_outcome, trace, ctx.drive_root, ctx.task_id,
+        expected_output="verified result",
+    )
+    assert "receipt_absent" in loop_outcome["outcome_axes"]["objective"]["warnings"]
+
+    ctx._configured_actor_bootstrap["physical_started"] = True
+    refused = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="unknown",
+        zero_run_basis="late decision",
+    )
+    assert "TOOL_ARG_ERROR" in refused
+
+    duplicate = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="incomplete",
+        zero_run_basis="second terminal decision",
+    )
+    assert "TOOL_ARG_ERROR" in duplicate
+
+
+def test_zero_run_refuses_ambiguous_physical_start_custody(tmp_path):
+    from ouroboros import delegate_custody as custody
+    from ouroboros.outcomes import read_verification_receipts
+    from ouroboros.tools.verify import _verify_and_record
+
+    ctx = _verify_ctx(tmp_path)
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+    }
+    custody_drive = custody.custody_root(ctx)
+    assert custody.record_start_requested(
+        custody_drive,
+        task_id=ctx.task_id,
+        invocation_id="inv-unknown",
+        idempotency_key="inv-unknown",
+        run_id="",
+        request={"prompt": "canonical"},
+        route="codex",
+    )
+    refused = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="complete",
+        zero_run_basis="the POST answer was lost",
+    )
+    assert "zero_run_requires_settlement" in refused
+    assert "inv-unknown" in refused
+    assert read_verification_receipts(custody_drive, ctx.task_id) == []
+    assert ctx._configured_actor_bootstrap.get("zero_run_receipt_recorded") is not True
+
+
+def test_zero_run_refuses_unreadable_custody_without_fail_soft_scan(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import delegate_custody as custody
+    from ouroboros import delegate_recovery
+    from ouroboros.outcomes import read_verification_receipts
+    from ouroboros.tools.verify import _verify_and_record
+
+    ctx = _verify_ctx(tmp_path)
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+    }
+    monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: True)
+    monkeypatch.setattr(
+        delegate_recovery,
+        "unsettled_start_ids",
+        lambda *_a, **_k: pytest.fail("an unreadable authority must stop before scan"),
+    )
+    refused = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="complete",
+        zero_run_basis="no visible run",
+    )
+    assert "zero_run_custody_unknown" in refused
+    assert "custody_log_unreadable" in refused
+    assert read_verification_receipts(tmp_path, ctx.task_id) == []
+    assert ctx._configured_actor_bootstrap.get("zero_run_receipt_recorded") is not True
+
+
+def test_zero_run_and_fresh_start_share_one_atomic_actor_decision(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    from ouroboros import delegate_custody as custody
+    from ouroboros.outcomes import read_verification_receipts
+    from ouroboros.tools.delegate_integration import claimed_start_request
+    from ouroboros.tools.verify import _verify_and_record
+
+    ctx = _verify_ctx(tmp_path, task_id="actor-claim")
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+    }
+    drive = custody.custody_root(ctx)
+    barrier = threading.Barrier(2)
+
+    def claim_start():
+        barrier.wait()
+        return claimed_start_request(
+            drive,
+            claim_target="",
+            actor_ctx=ctx,
+            enforce_actor_idle=True,
+            run_id="",
+            task_id=ctx.task_id,
+            idempotency_key="actor-claim-invocation",
+            invocation_id="actor-claim-invocation",
+            max_seconds=30,
+            request={"prompt": "exact physical assignment"},
+            project_id="project-1",
+            project_owned=False,
+            route="codex",
+        )
+
+    def claim_zero_run():
+        barrier.wait()
+        return _verify_and_record(
+            ctx,
+            contract_kind="delegation_zero_run",
+            zero_run_decision="complete",
+            zero_run_basis="host-visible work completed without a physical leaf",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        start_future = pool.submit(claim_start)
+        zero_future = pool.submit(claim_zero_run)
+        start = start_future.result()
+        zero = zero_future.result()
+
+    start_won = start[0] is True
+    zero_won = "typed host receipt recorded" in zero
+    assert start_won is not zero_won
+    receipts = read_verification_receipts(drive, ctx.task_id)
+    pending = custody.pending_invocations(drive)
+    if start_won:
+        assert "zero_run_requires_settlement" in zero
+        assert receipts == []
+        assert [row["invocation_id"] for row in pending] == ["actor-claim-invocation"]
+    else:
+        assert start[1]["reason"] == "zero_run_already_recorded"
+        assert len(receipts) == 1 and receipts[0]["zero_run"] is True
+        assert pending == []
+
+
+def test_failed_direct_child_does_not_make_actor_first_terminal_clean(tmp_path):
+    from ouroboros.subagent_bootstrap import actor_first_unresolved_fact
+    from ouroboros.task_results import STATUS_FAILED, write_task_result
+
+    ctx = types.SimpleNamespace(
+        task_id="actor-with-failed-child",
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        _configured_actor_bootstrap={
+            "physical_started": False,
+            "exact_start_pending": True,
+            "route_available": True,
+            "selected_subagent_id": "session-a",
+            "work_order_fingerprint": "a" * 64,
+        },
+    )
+    write_task_result(
+        tmp_path,
+        "failed-child",
+        STATUS_FAILED,
+        parent_task_id=ctx.task_id,
+        root_task_id=ctx.task_id,
+        delegation_role="subagent",
+        result="provider failed before producing a result",
+    )
+    fact = actor_first_unresolved_fact(ctx, drive_root=tmp_path)
+    assert fact["status"] == "incomplete"
+    assert fact["reason"] == "direct_children_without_completed_result"
+    assert fact["direct_child_statuses"] == [STATUS_FAILED]
+
+
+def test_discarded_completed_child_does_not_make_actor_first_terminal_clean(tmp_path):
+    from ouroboros.subagent_bootstrap import actor_first_unresolved_fact
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.join_ledger import _discard_child_result
+
+    ctx = types.SimpleNamespace(
+        task_id="actor-with-discarded-child",
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        task_metadata={},
+        role="orchestrator",
+        _configured_actor_bootstrap={
+            "physical_started": False,
+            "exact_start_pending": True,
+            "route_available": True,
+            "selected_subagent_id": "session-a",
+            "work_order_fingerprint": "a" * 64,
+        },
+    )
+    write_task_result(
+        tmp_path,
+        "discarded-child",
+        STATUS_COMPLETED,
+        parent_task_id=ctx.task_id,
+        root_task_id=ctx.task_id,
+        delegation_role="subagent",
+        result="superseded result",
+    )
+    assert "Discarded" in _discard_child_result(
+        ctx, "discarded-child", "a better branch already produced the result",
+    )
+
+    fact = actor_first_unresolved_fact(ctx, drive_root=tmp_path)
+    assert fact["status"] == "incomplete"
+    assert fact["reason"] == "direct_children_without_completed_result"
+
+
+def test_zero_run_receipt_write_failure_does_not_claim_terminal_truth(tmp_path, monkeypatch):
+    from ouroboros.tools import verify as verify_module
+    from ouroboros.tools.verify import _verify_and_record
+
+    ctx = _verify_ctx(tmp_path)
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+    }
+    monkeypatch.setattr(verify_module, "append_verification_receipt", lambda *_a, **_k: False)
+    result = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="unknown",
+        zero_run_basis="receipt sink unavailable",
+    )
+    assert "could not be durably written" in result
+    assert ctx._configured_actor_bootstrap.get("zero_run_receipt_recorded") is not True
+
+
+def test_zero_run_receipt_uses_canonical_budget_root_for_split_drive(tmp_path, monkeypatch):
+    from ouroboros import loop as loop_module
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.outcomes import read_verification_receipts
+    from ouroboros.tools.verify import _verify_and_record
+
+    local = tmp_path / "child-drive"
+    canonical = tmp_path / "budget-root"
+    local.mkdir()
+    canonical.mkdir()
+    ctx = _verify_ctx(tmp_path, task_id="split-zero")
+    ctx.drive_root = local
+    ctx.budget_drive_root = str(canonical)
+    ctx.task_constraint = TaskConstraint(
+        mode="local_readonly_subagent", allow_enable=False,
+    )
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+    }
+    result = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="unknown",
+        zero_run_basis="canonical root receipt test",
+    )
+    assert "UNKNOWN" in result
+    assert read_verification_receipts(canonical, "split-zero")
+    assert read_verification_receipts(local, "split-zero") == []
+
+    # Every active finalization reader follows the same canonical root as the
+    # writer. A forked actor must not receive an impossible generic verification
+    # reminder after recording its terminal no-leaf decision.
+    monkeypatch.setattr(loop_module, "_skill_finalization_message", lambda *_a, **_k: "")
+    messages = []
+    trace = {
+        "reasoning_notes": [],
+        "tool_calls": [{"tool": "integrate_subagent_patch", "status": "ok", "args": {}}],
+    }
+    fired = loop_module._maybe_inject_finalization_nudges(
+        types.SimpleNamespace(_ctx=ctx), local, "split-zero",
+        trace, "typed zero-run result", messages, lambda *_: None,
+    )
+    assert fired is False
+    assert not any("verify_and_record" in item.get("content", "") for item in messages)
+
+
+def test_acting_zero_run_keeps_generic_verification_nudge(tmp_path, monkeypatch):
+    from ouroboros import loop as loop_module
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.tools.verify import _verify_and_record
+
+    local = tmp_path / "acting-child"
+    canonical = tmp_path / "budget-root"
+    workspace = tmp_path / "workspace"
+    local.mkdir()
+    canonical.mkdir()
+    workspace.mkdir()
+    ctx = _verify_ctx(tmp_path / "acting-ctx", task_id="acting-zero")
+    ctx.drive_root = local
+    ctx.budget_drive_root = str(canonical)
+    ctx.task_constraint = TaskConstraint(
+        mode="acting_subagent", surface="external_workspace",
+        write_root=str(workspace), allow_enable=False,
+    )
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+    }
+    assert "COMPLETE" in _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="complete",
+        zero_run_basis="host-side integration completed without a physical leaf",
+    )
+    monkeypatch.setattr(loop_module, "_skill_finalization_message", lambda *_a, **_k: "")
+    messages = []
+    fired = loop_module._maybe_inject_finalization_nudges(
+        types.SimpleNamespace(_ctx=ctx), local, "acting-zero",
+        {
+            "reasoning_notes": [],
+            "tool_calls": [{
+                "tool": "integrate_subagent_patch", "status": "ok", "args": {},
+            }],
+        },
+        "integrated host result", messages, lambda *_: None,
+    )
+    assert fired is True
+    assert any("verify_and_record" in item.get("content", "") for item in messages)
+
+
+def test_actor_first_unresolved_terminal_is_typed_degraded_not_clean():
+    from ouroboros.outcomes import derive_loop_outcome
+
+    outcome = derive_loop_outcome(
+        "A plain answer without a physical start.",
+        {
+            "actor_first_terminal": {
+                "status": "incomplete",
+                "reason": "physical_leaf_not_started_and_no_direct_child",
+            },
+        },
+        {"tool_calls": []},
+    )
+    assert outcome["reason_code"] == "configured_actor_incomplete"
+    assert outcome["outcome_axes"]["execution"]["status"] == "degraded"
+    assert outcome["outcome_axes"]["objective"]["status"] == "degraded"
+    assert outcome["actor_first_terminal"]["status"] == "incomplete"
+
+
+def test_recorded_zero_run_incomplete_or_unknown_stays_degraded():
+    from ouroboros.outcomes import derive_loop_outcome
+    from ouroboros.subagent_bootstrap import actor_first_terminal_projection
+
+    for decision in ("incomplete", "unknown"):
+        ctx = types.SimpleNamespace(
+            task_id=f"zero-{decision}",
+            _configured_actor_bootstrap={
+                "zero_run_receipt_recorded": True,
+                "zero_run_decision": decision,
+                "zero_run_basis": "typed route evidence",
+            },
+        )
+        fact, usage, trace = actor_first_terminal_projection(
+            ctx, {"id": ctx.task_id}, {}, {}, None,
+        )
+        assert fact["status"] == decision
+        outcome = derive_loop_outcome("typed zero-run", usage, trace)
+        assert outcome["reason_code"] == f"configured_actor_{decision}"
+        assert outcome["outcome_axes"]["execution"]["status"] == "degraded"
+
+
+def test_zero_run_requires_actor_marker_and_basis(tmp_path):
+    from ouroboros.tools.verify import _verify_and_record
+
+    ctx = _verify_ctx(tmp_path)
+    assert "TOOL_ARG_ERROR" in _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="unknown",
+        zero_run_basis="not an actor",
+    )
+    ctx._configured_actor_bootstrap = {"physical_started": False}
+    assert "TOOL_ARG_ERROR" in _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="unknown",
+    )
 
 
 def test_verify_and_record_receipt_truncation_is_disclosed(tmp_path, monkeypatch):

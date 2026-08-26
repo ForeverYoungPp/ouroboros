@@ -257,10 +257,9 @@ def test_malformed_named_authority_shapes_refuse_before_model_or_tool_work(monke
     assert tool_context_calls == []
 
 
-def test_context_build_exception_propagates_after_exact_leaf_bootstrap(monkeypatch, tmp_path):
+def test_context_build_exception_propagates_before_actor_first_leaf_start(monkeypatch, tmp_path):
     from ouroboros import agent as agent_module
     import ouroboros.claudexor_daemon as daemon
-    import ouroboros.subagent_bootstrap as bootstrap
     import ouroboros.subagents as subagents
     from ouroboros.agent import Env, OuroborosAgent
 
@@ -271,23 +270,15 @@ def test_context_build_exception_propagates_after_exact_leaf_bootstrap(monkeypat
     monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(subagents, "route_health", lambda *_a, **_k: ("", ""))
     monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
-    monkeypatch.setattr(
-        bootstrap,
-        "bootstrap_session_leaf",
-        lambda *_a, **_k: order.append("exact_leaf_started") or json.dumps({
-            "status": "configured_session_wake", "wake": {"status": "completed"},
-        }),
-    )
-
     def fail_context(**_kwargs):
         order.append("context_build_failed")
-        raise RuntimeError("context assembly failed after exact leaf start")
+        raise RuntimeError("context assembly failed before exact leaf start")
 
     monkeypatch.setattr(agent_module, "build_llm_messages", fail_context)
     snapshot = _snapshot(_settings(_session_row()), "session-builder")
     agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
     agent.tools.available_tools = lambda: ["delegate_start", "delegate_wait", "delegate_cancel"]
-    with pytest.raises(RuntimeError, match="after exact leaf start"):
+    with pytest.raises(RuntimeError, match="before exact leaf start"):
         agent._prepare_task_context({
             "id": "child1", "type": "task", "chat_id": 1, "text": "Build",
             "delegation_role": "subagent", "configured_subagent": snapshot,
@@ -298,7 +289,7 @@ def test_context_build_exception_propagates_after_exact_leaf_bootstrap(monkeypat
             "task_contract": {"objective": "Build", "expected_output": "Patch"},
             "drive_root": str(drive), "budget_drive_root": str(drive),
         })
-    assert order == ["exact_leaf_started", "context_build_failed"]
+    assert order == ["context_build_failed"]
 
 
 @pytest.mark.parametrize("message_kind", ["owner", "task"])
@@ -378,7 +369,8 @@ def test_unacknowledged_delegate_wake_replays_before_successor_poll(tmp_path):
         }),
     ))
     successor = SimpleNamespace(**{**first_ctx.__dict__, "task_attempt": 2})
-    assert supervision.acknowledge_pending_wake(successor)
+    assert supervision.acknowledge_pending_wake(successor) is False
+    assert supervision.supervision_checkpoint(successor)["pending_wake"]
     replay = json.loads(supervision.supervised_wait(
         successor, "run-1",
         wait_once=lambda *_a, **_k: (_ for _ in ()).throw(
@@ -446,9 +438,9 @@ def test_refused_bootstrap_receipt_never_claims_a_live_leaf(monkeypatch):
         }),
     )
     receipt = messages[0]["content"]
-    assert "does not imply a live leaf" in receipt
+    assert "physical leaf may still be pending" in receipt
     assert "external start already happened" not in receipt
-    assert "typed receipt alone" in receipt
+    assert "canonical work-order authority" in receipt
 
 
 def test_crash_handoff_does_not_replay_attempt_local_loop_controls(tmp_path):
