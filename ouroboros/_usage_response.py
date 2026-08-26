@@ -20,11 +20,24 @@ def _plain(value: Any) -> Any:
 
 
 def _number(value: Any) -> Optional[float]:
+    """Parse a provider-reported cost; ``None`` means the value cannot be trusted.
+
+    This is the AUTHORITATIVE boundary — what survives here is what the durable
+    attempt ledger settles as final money — so it applies the same predicate as
+    the loop-side projection in ``loop_llm_call._provider_cost_value``: ``bool``
+    is rejected FIRST (``float(True)`` is a plausible-looking 1.0 that would
+    settle as a FINAL $1.00 and eat real budget admission), then anything
+    unparseable, non-finite, or negative. A reported ``0.0`` stays a legitimate
+    zero. Rejecting here settles the attempt as unknown rather than as a
+    fabricated amount (BIBLE P1).
+    """
+    if isinstance(value, bool):
+        return None
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
-    return number if math.isfinite(number) else None
+    return number if math.isfinite(number) and number >= 0 else None
 
 
 def _reported_token_count(usage: Dict[str, Any], *keys: str) -> Optional[int]:

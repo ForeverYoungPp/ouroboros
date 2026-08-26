@@ -1,10 +1,15 @@
+import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from ouroboros.loop_transport import provider_failure_hint as _provider_failure_hint
-from ouroboros.loop_llm_call import call_llm_with_retry, classify_llm_exception
+from ouroboros.loop_llm_call import (
+    _normalize_usage_cost,
+    call_llm_with_retry,
+    classify_llm_exception,
+)
 from ouroboros.usage_accounting import PhysicalAttemptContext, UsageAccountingError
 
 
@@ -910,3 +915,153 @@ def test_main_llm_call_state_reads_the_loop_attempt_carrier(tmp_path):
     )
     state_events = _main_llm_state_events(events)
     assert [event["task_attempt"] for event in state_events] == [7, 7]
+# ---------------------------------------------------------------------------
+# OB-10 — provider-reported cost validation (`_normalize_usage_cost`)
+# ---------------------------------------------------------------------------
+
+
+class _ReportedCostLLM:
+    """One successful round carrying whatever ``usage["cost"]`` the test supplies.
+
+    ``sent_usage`` retains the exact per-call dict the loop normalizes IN PLACE, so
+    a test can assert what was recorded for that round rather than only what the
+    accumulator folded afterwards.
+    """
+
+    def __init__(self, cost=None, *, include_cost: bool = True, cost_final=None):
+        self.cost = cost
+        self.include_cost = include_cost
+        self.cost_final = cost_final
+        self.sent_usage = None
+
+    def chat(self, **kwargs):
+        usage = {
+            "provider": "openrouter",
+            "resolved_model": "openai/gpt-5.5",
+            "prompt_tokens": 1000,
+            "completion_tokens": 100,
+        }
+        if self.include_cost:
+            usage["cost"] = self.cost
+        if self.cost_final is not None:
+            usage["cost_final"] = self.cost_final
+        self.sent_usage = usage
+        return {"content": "ok"}, usage
+
+
+def _run_cost_round(llm, tmp_path, accumulated):
+    return call_llm_with_retry(
+        llm, [{"role": "user", "content": "hi"}], "openai/gpt-5.5", None,
+        "medium", 1, tmp_path, "task-cost", 1, None, accumulated, "task", False,
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_cost",
+    [True, float("nan"), float("inf"), float("-inf"), -5, "abc", object()],
+    ids=["bool", "nan", "inf", "neg_inf", "negative", "unparseable", "foreign_type"],
+)
+def test_invalid_provider_cost_is_unknown_and_never_estimated(tmp_path, caplog, bad_cost):
+    """A cost the provider DID send but that cannot be trusted is honestly unknown.
+
+    Never a fabricated tariff (``float(True)`` is a plausible-looking ``1.0``),
+    never ``0.0``, never a raise that kills the whole round, and never a catalog
+    estimate standing in for a figure the provider actually reported.
+    ``estimate_cost_optional`` is patched to a NONZERO value precisely so that a
+    silent fall-through to estimation could not hide behind a ``None`` estimate.
+    """
+    accumulated = {}
+    llm = _ReportedCostLLM(bad_cost)
+    with caplog.at_level(logging.WARNING, logger="ouroboros.loop_llm_call"), patch(
+        "ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99,
+    ) as estimate:
+        msg, cost = _run_cost_round(llm, tmp_path, accumulated)
+
+    assert msg == {"content": "ok"}            # the round SURVIVES an invalid cost
+    assert cost is None                        # unknown — neither 0.0 nor 0.99
+    assert llm.sent_usage["cost"] is None      # recorded honestly for the round
+    assert llm.sent_usage["cost_final"] is False   # unknown cost is never a closed book
+    estimate.assert_not_called()               # estimation is SKIPPED, not consulted
+    assert accumulated.get("cost") is None     # nothing folded into the total
+    assert accumulated["cost_final"] is False  # the total is openly non-final
+    assert "cost_estimated" not in accumulated
+    warnings = [r for r in caplog.records if "invalid cost" in r.getMessage()]
+    assert len(warnings) == 1
+    assert f"type={type(bad_cost).__name__}" in warnings[0].getMessage()
+
+
+def test_invalid_cost_clears_a_stale_cost_final_from_the_wire(tmp_path):
+    """A provider that sends an invalid amount AND `cost_final: true` would leave an
+    internally contradictory record: no trusted cost, yet the book declared closed.
+    The pair must move together."""
+    accumulated = {}
+    llm = _ReportedCostLLM(True, cost_final=True)
+    with patch("ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99):
+        _msg, cost = _run_cost_round(llm, tmp_path, accumulated)
+
+    assert cost is None
+    assert llm.sent_usage["cost"] is None
+    assert llm.sent_usage["cost_final"] is False
+    assert accumulated["cost_final"] is False
+
+
+def test_normalize_usage_cost_invalid_does_not_claim_an_estimate():
+    """The tuple's 4th element is ``cost_estimated``: an UNKNOWN cost is not an
+    ESTIMATED one, so the invalid path must leave that flag untouched."""
+    usage = {"cost": "abc", "resolved_model": "openai/gpt-5.5", "provider": "openrouter"}
+    with patch("ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99):
+        cost, display_model, provider, cost_estimated = _normalize_usage_cost(
+            usage, model="openai/gpt-5.5", use_local=False,
+        )
+    assert cost is None
+    assert cost_estimated is False
+    assert usage["cost"] is None
+    assert display_model == "openai/gpt-5.5"
+    assert provider == "openrouter"
+
+
+def test_reported_zero_cost_is_a_legitimate_provider_zero(tmp_path):
+    """A reported ``0.0`` (free tier, fully cached round) is DATA, not absence: it
+    is neither re-estimated nor rejected as invalid."""
+    accumulated = {}
+    llm = _ReportedCostLLM(0.0)
+    with patch(
+        "ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99,
+    ) as estimate:
+        _msg, cost = _run_cost_round(llm, tmp_path, accumulated)
+
+    assert cost == 0.0
+    assert llm.sent_usage["cost"] == 0.0
+    estimate.assert_not_called()
+    assert accumulated["cost"] == 0.0
+
+
+def test_valid_provider_cost_passes_through(tmp_path):
+    """An ordinary reported amount reaches the accumulator unchanged."""
+    accumulated = {}
+    llm = _ReportedCostLLM(1.23)
+    with patch(
+        "ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99,
+    ) as estimate:
+        _msg, cost = _run_cost_round(llm, tmp_path, accumulated)
+
+    assert cost == 1.23
+    assert llm.sent_usage["cost"] == 1.23
+    estimate.assert_not_called()
+    assert accumulated["cost"] == 1.23
+
+
+@pytest.mark.parametrize("include_cost", [False, True], ids=["absent", "explicit_none"])
+def test_missing_provider_cost_still_uses_the_catalog_estimate(tmp_path, include_cost):
+    """MISSING is not INVALID: with no provider cost the catalog-estimate path is
+    unchanged — this is the case validation must NOT capture."""
+    accumulated = {}
+    llm = _ReportedCostLLM(None, include_cost=include_cost)
+    with patch(
+        "ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99,
+    ) as estimate:
+        _msg, cost = _run_cost_round(llm, tmp_path, accumulated)
+
+    assert cost == 0.99
+    estimate.assert_called_once()
+    assert accumulated["cost"] == 0.99

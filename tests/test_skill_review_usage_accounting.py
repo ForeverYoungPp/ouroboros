@@ -270,6 +270,37 @@ def test_api_token_normalization_preserves_missing_zero_and_body_error_contracts
         assert cost is None and final is False
 
 
+def test_api_cost_extraction_rejects_untrustworthy_provider_amounts():
+    """The AUTHORITATIVE cost boundary: whatever survives `usage_from_response` is
+    what the durable attempt ledger settles as money.
+
+    `_number` previously rejected only non-finite values, so a JSON `true` passed
+    `float()` and `math.isfinite()` and settled as a FINAL $1.00 — real budget
+    admission spent on an amount no provider ever reported — and a negative amount
+    settled as a final credit. Both are unknown now, applying the same predicate
+    `loop_llm_call._provider_cost_value` applies to the projection lane. Both lanes
+    must reject, or an invalid cost still reaches the ledger.
+    """
+    for bad in (
+        True, False, -5, -0.01, float("nan"), float("inf"), float("-inf"),
+        "abc", object(), [1.0], {"usd": 1.0},
+    ):
+        _normalized, cost, final = ua.usage_from_response({"usage": {"cost": bad}})
+        assert cost is None, f"{bad!r} must never settle as money"
+        assert final is False
+
+    for good, expected in ((0.0, 0.0), (0, 0.0), (1.23, 1.23), ("2.5", 2.5)):
+        _normalized, cost, final = ua.usage_from_response({"usage": {"cost": good}})
+        assert cost == expected and final is True
+
+    # Rejecting one field does not abandon the candidate chain: the next reported
+    # amount is still consulted, exactly as it is when `cost` is simply absent.
+    _normalized, cost, final = ua.usage_from_response(
+        {"usage": {"cost": True, "total_cost": 2.0}},
+    )
+    assert cost == 2.0 and final is True
+
+
 def test_skill_wave_token_gaps_exclude_nonphysical_rows_and_keep_explicit_zero(data_root):
     from ouroboros.skill_review_usage import skill_review_usage_markdown
 

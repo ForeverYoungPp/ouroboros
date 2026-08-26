@@ -9,6 +9,7 @@ Extracted from loop.py to keep the main loop orchestrator focused.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import pathlib
 import queue
@@ -850,19 +851,66 @@ def _remember_llm_call(
     usage.setdefault("llm_call_refs", []).append(call_meta)
 
 
+def _provider_cost_value(raw: Any) -> Optional[float]:
+    """Parse a provider-reported ``usage["cost"]``; ``None`` means INVALID.
+
+    Provider cost is data from outside the process, so it is validated before it
+    is trusted (OB-10). ``bool`` is rejected FIRST because ``float(True)`` is a
+    perfectly plausible ``1.0`` — a fabricated tariff, not a reported one — and
+    then anything unparseable, non-finite (NaN/inf), or negative. A legitimate
+    reported ``0.0`` (free tier, cached round) is valid and returned as itself.
+
+    The same predicate guards the AUTHORITATIVE boundary in
+    ``_usage_response._number``, where the durable attempt ledger settles cost.
+    Both are needed: this one keeps the projection honest, that one keeps an
+    invalid amount from becoming final money.
+    """
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+
 def _normalize_usage_cost(
     usage: Dict[str, Any],
     *,
     model: str,
     use_local: bool,
 ) -> tuple[Optional[float], str, str, bool]:
-    provider_reported_cost = usage.get("cost") is not None
-    cost = float(usage["cost"]) if provider_reported_cost else None
+    raw_cost = usage.get("cost")
+    provider_reported_cost = raw_cost is not None
+    cost = _provider_cost_value(raw_cost) if provider_reported_cost else None
     display_model = str(usage.get("resolved_model") or model)
     provider = "local" if use_local else str(usage.get("provider") or "openrouter")
     if use_local:
         cost = 0.0
         display_model = f"{model} (local)"
+    elif provider_reported_cost and cost is None:
+        # MISSING and INVALID are different facts. A missing cost falls through to
+        # the catalog estimate below; a cost the provider DID send but that cannot
+        # be trusted is honestly unknown RIGHT HERE — estimation is skipped, because
+        # substituting a catalog price for a number the provider actually reported
+        # would misrepresent whose figure it is. Never raise (an unparseable value
+        # used to kill the whole round), never 0.0, never a fabricated tariff.
+        # This is the PROJECTION lane only. The durable attempt ledger settles from
+        # the provider response through `_usage_response.usage_from_response`, which
+        # applies the SAME predicate at that authoritative boundary — both lanes must
+        # reject, or an invalid cost still becomes final money (BIBLE P1, Invariant 4).
+        log.warning(
+            "Provider reported an invalid cost (type=%s, value=%s) for %s; recording "
+            "cost as unknown and skipping estimation",
+            type(raw_cost).__name__,
+            truncate_review_artifact(repr(raw_cost), limit=120),
+            display_model,
+        )
+        usage["cost"] = None
+        # A `cost_final` the wire set beside a cost we just rejected would make the
+        # record contradict itself: unknown cost is never a closed book.
+        usage["cost_final"] = False
+        return None, display_model, provider, bool(usage.get("cost_estimated"))
     elif cost is None:
         cost = estimate_cost_optional(
             display_model,
