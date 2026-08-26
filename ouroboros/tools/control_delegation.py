@@ -164,6 +164,36 @@ def durable_direct_child_count(
     )
 
 
+def admitted_depth_cap(parent_contract: Any, live_max_depth: Any) -> int:
+    """Return the cap that was admitted for this lineage, when it is known.
+
+    A task's persisted ``permitted_depth`` is an admission fact.  Once present,
+    a later Settings edit may not silently revoke or widen that task's already
+    admitted continuation.  Fresh and legacy contracts without a valid
+    persisted cap continue to use the current configured limit.
+    """
+    budget = (
+        parent_contract.get("delegation_budget", parent_contract)
+        if isinstance(parent_contract, dict)
+        else parent_contract
+    )
+    budget = budget if isinstance(budget, dict) else {}
+    provenance = normalize_depth_provenance(budget.get("depth_provenance"))
+    permitted = provenance.get("permitted_depth")
+    if permitted is not None:
+        try:
+            return max(0, int(permitted))
+        except (TypeError, ValueError):
+            # An incomplete/malformed projection is not an admission fact.
+            # Preserve the legacy live-limit behavior until a typed contract
+            # can supply a valid persisted cap.
+            pass
+    try:
+        return max(0, int(live_max_depth))
+    except (TypeError, ValueError):
+        return 0
+
+
 def depth_provenance_for_schedule(
     parent_budget: Dict[str, Any], *, new_depth: int, max_depth: int,
     achieved_depth: Any = None, use_remaining_envelope: bool = False,
@@ -205,11 +235,17 @@ def depth_provenance_for_schedule(
             max(0, int(new_depth) - 1) + max(0, remaining),
         )
     inherited_permitted = inherited.get("permitted_depth")
-    permitted = (
-        current_permitted
-        if inherited_permitted is None
-        else min(current_permitted, max(0, int(inherited_permitted)))
-    )
+    if inherited_permitted is None:
+        permitted = current_permitted
+    else:
+        # ``permitted_depth`` is a persisted admission fact, not a fresh
+        # Settings-derived suggestion.  Do not intersect it with a later live
+        # max: a decrease must not revoke an already admitted lineage, and an
+        # increase must not widen it.
+        try:
+            permitted = max(0, int(inherited_permitted))
+        except (TypeError, ValueError):
+            permitted = current_permitted
     try:
         attempted = max(0, int(new_depth))
     except (TypeError, ValueError):

@@ -38,6 +38,7 @@ from ouroboros.subagent_messages import subagent_message_meta
 from ouroboros.task_finalization import send_provider_death_notice
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
 from ouroboros.tools.control_delegation import (
+    admitted_depth_cap,
     check_delegation_admission,
     durable_direct_child_count,
     stamp_depth_provenance,
@@ -3396,10 +3397,12 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         "session_id": session_id,
         "delegation_role": delegation_role,
     })
+    live_max_depth = get_max_subagent_depth()
+    max_depth = admitted_depth_cap(task_contract, live_max_depth)
     task_contract, depth_provenance = stamp_depth_provenance(
         task_contract,
         attempted_depth=depth,
-        max_depth=get_max_subagent_depth(),
+        max_depth=max_depth,
     )
     result_fields = {
         "parent_task_id": parent_id,
@@ -3564,7 +3567,6 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         except Exception:
             log.debug("Delegation reconciliation failed open for %s", tid, exc_info=True)
 
-    max_depth = get_max_subagent_depth()
     if depth > max_depth:
         detail = f"Subagent rejected: subtask depth limit ({max_depth}) exceeded."
         log.warning("Rejected task due to depth limit: depth=%d, desc=%s", depth, desc[:100])

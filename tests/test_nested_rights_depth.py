@@ -7,6 +7,7 @@ from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.depth_evidence import build_depth_summary
 from ouroboros.task_results import STATUS_FAILED, STATUS_RUNNING, write_task_result
 from ouroboros.tools.control_delegation import (
+    admitted_depth_cap,
     check_delegation_admission,
     child_budget_for_schedule,
     durable_direct_child_count,
@@ -162,6 +163,127 @@ def test_depth_permission_and_remaining_never_widen_after_settings_raise():
         "requested_depth": 3, "permitted_depth": 2,
         "attempted_depth": 2, "achieved_depth": None,
     }
+
+
+def test_admitted_depth_cap_ignores_later_settings_decrease_but_not_fresh_roots():
+    contract = build_task_contract({
+        "delegation_budget": {
+            "depth_remaining": 2,
+            "depth_provenance": {
+                "requested_depth": 3,
+                "permitted_depth": 3,
+                "attempted_depth": 1,
+                "achieved_depth": None,
+            },
+        },
+    })
+    assert admitted_depth_cap(contract, 1) == 3
+    assert admitted_depth_cap(contract, 7) == 3
+    assert admitted_depth_cap({}, 1) == 1
+
+
+def test_persisted_depth_cap_survives_live_decrease_when_narrowing_child_budget():
+    parent = build_task_contract({
+        "delegation_budget": {
+            "depth_remaining": 2,
+            "depth_provenance": {
+                "requested_depth": 3,
+                "permitted_depth": 3,
+                "attempted_depth": 1,
+                "achieved_depth": None,
+            },
+        },
+    })
+    child = child_budget_for_schedule(
+        parent,
+        current_depth=1,
+        new_depth=2,
+        max_depth=1,
+        may_mutate=False,
+        may_fan_out=True,
+        max_children=0,
+        intent_note="",
+    )
+    assert child["depth_provenance"]["permitted_depth"] == 3
+    assert child["depth_remaining"] == 1
+
+
+def test_schedule_path_preserves_admitted_cap_after_live_depth_decrease(tmp_path, monkeypatch):
+    from ouroboros.tools.control import _schedule_task
+    from ouroboros.tools.registry import ToolContext
+    from tests._shared import configure_test_subagent
+
+    subagent_id = configure_test_subagent(monkeypatch)
+    monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "1")
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    parent_contract = build_task_contract({
+        "delegation_budget": {
+            "depth_remaining": 2,
+            "depth_provenance": {
+                "requested_depth": 3,
+                "permitted_depth": 3,
+                "attempted_depth": 1,
+                "achieved_depth": 1,
+            },
+        },
+    })
+    ctx = ToolContext(
+        repo_dir=repo,
+        drive_root=data,
+        task_id="parent",
+        task_depth=1,
+        task_contract=parent_contract,
+        task_metadata={
+            "task_contract": parent_contract,
+            "root_task_id": "root",
+            "parent_task_id": "parent",
+            "budget_drive_root": str(data),
+        },
+    )
+
+    result = _schedule_task(
+        ctx,
+        subagent_id=subagent_id,
+        objective="Continue the admitted nested line",
+        expected_output="child id",
+        memory_mode="empty",
+    )
+
+    assert "subtask_depth_limit" not in result
+    assert ctx.pending_events
+    child_budget = ctx.pending_events[0]["task_contract"]["delegation_budget"]
+    assert child_budget["depth_provenance"]["permitted_depth"] == 3
+
+
+def test_supervisor_schedule_path_preserves_admitted_cap_after_live_depth_decrease(
+    tmp_path, monkeypatch,
+):
+    from supervisor import events
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    monkeypatch.setattr(events, "get_max_subagent_depth", lambda: 1)
+    contract = build_task_contract({
+        "delegation_budget": {
+            "depth_remaining": 1,
+            "depth_provenance": {
+                "requested_depth": 3,
+                "permitted_depth": 3,
+                "attempted_depth": 2,
+                "achieved_depth": None,
+            },
+        },
+    })
+    event = _schedule_event("child", "parent", depth=2, drive_root=tmp_path)
+    event["task_contract"] = contract
+    enqueued = []
+    events._handle_schedule_task(event, _fake_ctx(tmp_path, enqueued))
+
+    assert [task["id"] for task in enqueued] == ["child"]
+    queued = json.loads((tmp_path / "task_results" / "child.json").read_text())
+    assert queued["depth_provenance"]["permitted_depth"] == 3
 
 
 def test_assignment_preserves_admitted_depth_authority_and_only_adds_achievement():

@@ -28,6 +28,7 @@ from ouroboros.contracts.task_contract import (
 )
 from ouroboros.tools.control_delegation import (
     _ensure_project_scope,
+    admitted_depth_cap,
     child_budget_for_schedule,
     normalize_required_capabilities,
     profile_from_task_constraint,
@@ -1838,7 +1839,11 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     except (TypeError, ValueError):
         current_depth = 0
     new_depth = current_depth + 1
-    max_depth = get_max_subagent_depth()
+    metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
+    parent_contract = metadata.get("task_contract") if isinstance(metadata.get("task_contract"), dict) else {}
+    if not parent_contract and isinstance(getattr(ctx, "task_contract", None), dict):
+        parent_contract = getattr(ctx, "task_contract")
+    max_depth = admitted_depth_cap(parent_contract, get_max_subagent_depth())
     if new_depth > max_depth:
         return record_depth_limit_refusal(
             ctx, fields, params, configured_subagent,
@@ -1857,14 +1862,10 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         except Exception:
             pass
 
-    metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     # EMPTINESS decides, not type. `ToolContext.task_contract` defaults to `{}`, so testing
     # only `isinstance(..., dict)` let that empty default win over a contract that really is
     # in `task_metadata` — and the parent's `deadline_at` lives in the contract, so the miss
     # silently un-narrowed every child deadline. Same precedence the registry already uses.
-    parent_contract = metadata.get("task_contract") if isinstance(metadata.get("task_contract"), dict) else {}
-    if not parent_contract and isinstance(getattr(ctx, "task_contract", None), dict):
-        parent_contract = getattr(ctx, "task_contract")
     current_task_id = str(getattr(ctx, "task_id", "") or "")
     parent_task_id = str(current_task_id or metadata.get("parent_task_id") or "").strip()
     root_task_id_seed = str(metadata.get("root_task_id") or current_task_id or "").strip()
