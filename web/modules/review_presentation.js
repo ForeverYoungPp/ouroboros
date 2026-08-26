@@ -57,6 +57,23 @@ function statusTone(state, verdict = '') {
     return 'neutral';
 }
 
+function lifecycleOnlyTone(lifecycleStatus, state) {
+    const token = text(lifecycleStatus).toLowerCase();
+    // Successful job completion is deliberately not a semantic PASS.  Other
+    // lifecycle failures still carry a useful severity fact even though their
+    // review verdict is unavailable.
+    if (LIFECYCLE_TERMINAL_STATES.has(token)) return 'neutral';
+    return statusTone(state, token);
+}
+
+function hasSemanticVerdict(verdict) {
+    const token = text(verdict).toLowerCase();
+    return Boolean(token)
+        && !ACTIVE_STATES.has(token)
+        && !LIFECYCLE_TERMINAL_STATES.has(token)
+        && !['terminal', 'unavailable', 'absent'].includes(token);
+}
+
 function attemptIdentity(attempt, fallback = '') {
     return text(
         attempt?.id || attempt?.job_id || attempt?.wave_id || attempt?.panel_id
@@ -113,8 +130,11 @@ function normalizeSkillAttempt(attempt, defaults = {}, ordinal = 0) {
         id,
         surface: 'skill',
         state,
-        tone: statusTone(state, rawStatus),
+        tone: lifecycleOnly
+            ? lifecycleOnlyTone(lifecycleStatus || explicitStatus, state)
+            : statusTone(state, rawStatus),
         verdict: rawStatus,
+        lifecycleStatus,
         timestamp: text(attempt.ts || attempt.timestamp),
         ordinal,
         label: [
@@ -191,17 +211,22 @@ function normalizeSkillGroup(group, row = {}, { allowRowTaskIdFallback = true } 
         subjectTaskId: text(group.subject_task_id),
         initiatorTaskId: uniformAttemptInitiator(attempts, defaults.initiatorTaskId),
         state,
-        tone: statusTone(
-            state,
-            lifecycleOnly ? text(group.review_status || group.review_verdict || latest?.verdict)
-                : text(group.verdict || group.review_status || group.status || latest?.verdict),
-        ),
+        tone: lifecycleOnly
+            ? lifecycleOnlyTone(
+                lifecycleStatus || latest?.lifecycleStatus || group.review_status || group.review_verdict,
+                state,
+            )
+            : statusTone(
+                state,
+                text(group.verdict || group.review_status || group.status || latest?.verdict),
+            ),
         verdict: lifecycleOnly
             ? text(group.review_status || group.review_verdict || latest?.verdict)
             : text(group.verdict || group.review_status || group.status || latest?.verdict),
         summary: text(group.summary || latest?.summary)
             || (lifecycleOnly ? 'Review verdict unavailable.' : ''),
         lifecycleOnly,
+        lifecycleStatus,
         activeCount: finiteCount(group.active_count) ?? (state === 'queued' || state === 'running' ? 1 : 0),
         attemptCount: Math.max(count, attempts.length),
         countIsAuthoritative: group.count_is_authoritative === true,
@@ -570,7 +595,11 @@ export function mergeReviewGroup(store, incoming) {
         // for the same attempt.  It contributes timing/execution facts, but
         // its `succeeded`/`completed` word is not a review verdict and must
         // not erase an already-proved semantic result.
-        if (attempt.lifecycleOnly && previous?.verdict) {
+        if (
+            attempt.lifecycleOnly
+            && previousTerminal
+            && hasSemanticVerdict(previous?.verdict)
+        ) {
             mergedAttempt = {
                 ...mergedAttempt,
                 state: previous.state,
@@ -656,6 +685,23 @@ export function mergeReviewGroup(store, incoming) {
             merged.summary = latestAttempt.summary || merged.summary;
             merged.lifecycleOnly = Boolean(latestAttempt.lifecycleOnly);
         }
+    }
+    const priorLatestAttempt = prior.attempts.at(-1);
+    const mergedLatestAttempt = merged.attempts.at(-1);
+    if (
+        !activeAttempts.length
+        && priorLatestAttempt?.lifecycleOnly
+        && mergedLatestAttempt?.id === priorLatestAttempt.id
+        && !incomingIds.has(priorLatestAttempt.id)
+    ) {
+        // A stale history refresh may omit a newer terminal lifecycle row.  It
+        // must not resurrect the older typed verdict at group level while the
+        // newer attempt remains unresolved.
+        merged.state = priorLatestAttempt.state;
+        merged.tone = priorLatestAttempt.tone;
+        merged.verdict = priorLatestAttempt.verdict || '';
+        merged.summary = priorLatestAttempt.summary || merged.summary;
+        merged.lifecycleOnly = true;
     }
     merged.initiatorTaskId = uniformAttemptInitiator(
         merged.attempts,

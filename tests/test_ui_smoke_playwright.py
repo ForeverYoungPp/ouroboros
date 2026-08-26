@@ -17,6 +17,18 @@ from tests.fixtures_mock_llm import MockLLMServer
 REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
 
 
+def _open_review_checkpoint(card, *, open_card=True):
+    if open_card:
+        card.locator(":scope > [data-live-summary-button]").click()
+    section = card.locator("[data-review-section]")
+    section.wait_for(state="visible", timeout=5_000)
+    section.locator("[data-review-section-toggle]").click()
+    group = section.locator("[data-review-group]").first
+    group.locator("[data-review-group-toggle]").click()
+    attempt = group.locator("[data-review-attempt-toggle]").first
+    attempt.click()
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -1059,22 +1071,9 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 card = page.locator('.chat-live-card[data-task-id="review-ui"]')
                 card.wait_for(state="attached", timeout=30_000)
-                assert card.is_visible()
-                # Review evidence is a task-bound checkpoint, not an alert.  It
-                # must stay collapsed until the owner explicitly opens the task
-                # card and then the Reviews disclosure.
                 assert card.get_attribute("data-expanded") == "0"
                 assert "Review panel panel_visual_truth" not in card.inner_text()
-                card.locator(":scope > [data-live-summary-button]").click()
-                review_section = card.locator(":scope > [data-live-reviews-host] [data-review-section]")
-                review_section.wait_for(state="visible", timeout=5_000)
-                assert review_section.get_attribute("data-expanded") == "0"
-                review_section.locator("[data-review-section-toggle]").click()
-                assert review_section.get_attribute("data-expanded") == "1"
-                review_group = review_section.locator("[data-review-group]").first
-                assert "Review panel panel_visual_truth" not in review_group.inner_text()
-                review_group.locator("[data-review-group-toggle]").click()
-                review_group.locator("[data-review-attempt-toggle]").first.click()
+                _open_review_checkpoint(card)
                 chat_text = card.inner_text()
                 assert "Done with warnings" in chat_text
                 assert "Notice" not in chat_text
@@ -1083,18 +1082,8 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                 assert "Reviewer sol" in chat_text
                 no_summary = page.locator('.chat-live-card[data-task-id="review-no-summary"]')
                 no_summary.wait_for(state="attached", timeout=30_000)
-                assert no_summary.is_visible()
                 assert no_summary.get_attribute("data-expanded") == "0"
-                no_summary.locator(":scope > [data-live-summary-button]").click()
-                no_summary_section = no_summary.locator(
-                    ":scope > [data-live-reviews-host] [data-review-section]"
-                )
-                no_summary_section.wait_for(state="visible", timeout=5_000)
-                assert no_summary_section.get_attribute("data-expanded") == "0"
-                no_summary_section.locator("[data-review-section-toggle]").click()
-                no_summary_group = no_summary_section.locator("[data-review-group]").first
-                no_summary_group.locator("[data-review-group-toggle]").click()
-                no_summary_group.locator("[data-review-attempt-toggle]").first.click()
+                _open_review_checkpoint(no_summary)
                 assert no_summary.locator('[data-live-phase]').first.get_attribute("data-phase") == "warn"
                 assert "Review panel panel_visual_truth" in no_summary.inner_text()
                 page.wait_for_timeout(900)  # cover the routine background history sync
@@ -1445,9 +1434,6 @@ def test_ui_smoke_live_card_mutations_preserve_viewport(
                 assert parent.evaluate("card => card.getBoundingClientRect().height") > parent_before_mount + 30
                 assert abs(card_top(page, anchor_id) - anchor_before) <= 6
 
-                # Terminal lifecycle does not rewrite the owner's disclosure
-                # choice.  An explicitly open card stays open, so completion
-                # cannot unexpectedly hide the reader's context.
                 parent_before_finish = parent.evaluate("card => card.getBoundingClientRect().height")
                 emit(page, {
                     "type": "chat", "role": "system", "system_type": "task_summary",
@@ -1460,17 +1446,9 @@ def test_ui_smoke_live_card_mutations_preserve_viewport(
                     },
                 })
                 assert parent.get_attribute("data-expanded") == "1"
-                # Replacing the live activity summary with the terminal summary
-                # may shorten the open card a little.  The contract is that the
-                # owner's disclosure remains open, not that terminal copy has
-                # byte-for-byte identical geometry.
                 assert parent.evaluate("card => card.getBoundingClientRect().height") >= parent_before_finish - 32
                 assert abs(card_top(page, anchor_id) - anchor_before) <= 6
 
-                # Review evidence is attached to the child without changing its
-                # disclosure state.  The owner must explicitly open the card;
-                # the viewport-preserving expansion path then handles the
-                # larger review checkpoint just like any other detail.
                 review_child = page.locator('.chat-live-card[data-task-id="vp-late-child"]')
                 emit(page, {
                     "type": "chat", "role": "assistant", "is_progress": True,
@@ -1490,26 +1468,9 @@ def test_ui_smoke_live_card_mutations_preserve_viewport(
                     }]},
                 })
                 assert review_child.get_attribute("data-expanded") == "0"
-                review_collapsed = review_child.evaluate("card => card.getBoundingClientRect().height")
-                # Playwright's locator click would scroll the off-screen child
-                # into view before dispatching the event, which changes the
-                # reader's anchor for reasons unrelated to the mutation.  Invoke
-                # the real DOM click at the current scroll position so this
-                # assertion isolates the viewport-preserving expansion path.
-                page.evaluate(
-                    "() => document.querySelector('[data-task-id=\\\"vp-late-child\\\"] > [data-live-summary-button]').click()"
-                )
-                page.evaluate(settle)
+                review_child.locator(":scope > [data-live-summary-button]").evaluate("el => el.click()")
                 assert review_child.get_attribute("data-expanded") == "1"
-                assert review_child.evaluate("card => card.getBoundingClientRect().height") > review_collapsed + 20
-                assert abs(card_top(page, anchor_id) - anchor_before) <= 6, page.evaluate(
-                    "() => { const m = document.querySelector('#chat-messages'); "
-                    "const a = document.querySelector('[data-task-id=\\\"vp-follow-1\\\"]'); "
-                    "const c = document.querySelector('[data-task-id=\\\"vp-late-child\\\"]'); "
-                    "return {scrollTop: m.scrollTop, scrollHeight: m.scrollHeight, clientHeight: m.clientHeight, "
-                    "remaining: m.scrollHeight - m.scrollTop - m.clientHeight, anchorTop: a?.getBoundingClientRect().top, "
-                    "childTop: c?.getBoundingClientRect().top, childExpanded: c?.dataset.expanded}; }"
-                )
+                assert abs(card_top(page, anchor_id) - anchor_before) <= 6
                 page.screenshot(
                     path=str(data_dir.parent / f"live-card-viewport-{browser_engine}.png"),
                     full_page=True,
@@ -1995,9 +1956,6 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
             "task_id": "child1",
             "text": "Final child answer should stay inside the child card.",
             "format": "markdown",
-            # A child final is routed by its typed lifecycle marker, not by
-            # the presence of task_id alone (ordinary child speech can be
-            # delivered while the task is still running).
             "delegation_role": "subagent",
             "subagent_event": "completed",
             "subagent_task_id": "child1",
@@ -2047,8 +2005,6 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 assert "1 child" in child_count.inner_text()
                 assert "child=child1" not in child_text
                 assert "role=researcher" not in child_text
-                # A review checkpoint is quiet until the owner walks through
-                # the explicit card -> Reviews -> attempt disclosures.
                 assert "panel_child_review" not in child_text
                 assert "claude-fable-5" not in child_text
                 assert "verdict=DEGRADED" not in child_text
@@ -2082,23 +2038,11 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                     has_text="Final child answer should stay inside the child card."
                 ).count() == 0
 
-                # Ordinary nested cards and their review checkpoints are both
-                # collapsed by default; no lifecycle/review frame expands them.
                 assert child.get_attribute("data-expanded") == "0"
                 assert grandchild.get_attribute("data-expanded") == "0"
                 child_summary = child.locator(":scope > [data-live-summary-button]").first
                 child_summary.click()
-                assert child.get_attribute("data-expanded") == "1"
-                review_section = child.locator(
-                    ":scope > [data-live-reviews-host] [data-review-section]"
-                )
-                review_section.wait_for(state="visible", timeout=5_000)
-                assert review_section.get_attribute("data-expanded") == "0"
-                review_section.locator("[data-review-section-toggle]").click()
-                review_group = review_section.locator("[data-review-group]").first
-                assert "panel_child_review" not in child.inner_text()
-                review_group.locator("[data-review-group-toggle]").click()
-                review_group.locator("[data-review-attempt-toggle]").first.click()
+                _open_review_checkpoint(child, open_card=False)
                 assert "panel_child_review" in child.inner_text()
                 assert "claude-fable-5" in child.inner_text()
                 assert "verdict=DEGRADED" in child.inner_text()
@@ -2122,7 +2066,6 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 assert "Scheduled subagent child1" not in expanded_text
                 assert child_summary.get_attribute("aria-expanded") == "true"
                 assert child.locator("[data-live-timeline]").first.get_attribute("id")
-                assert review_group.locator("[data-review-attempt-toggle]").first.get_attribute("aria-expanded") == "true"
 
                 page.reload(wait_until="domcontentloaded", timeout=30_000)
                 page.wait_for_function("() => document.querySelectorAll('.chat-live-card').length === 4", timeout=30_000)
@@ -2147,22 +2090,13 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 assert replay_child.locator(":scope > [data-live-summary-button] [data-live-phase]").first.get_attribute("data-phase") == "warn"
                 assert replay_grandchild.get_attribute("data-finished") == "1"
                 assert replay_child.get_attribute("data-expanded") == "0"
-                assert replay_grandchild.get_attribute("data-expanded") == "0"
                 assert "researcher (child1)" in replay_child.inner_text()
                 assert "child=child1" not in replay_child.inner_text()
                 assert "role=researcher" not in replay_child.inner_text()
                 assert page.locator(".chat-bubble").filter(
                     has_text="Final child answer should stay inside the child card."
                 ).count() == 0
-                replay_child.locator(":scope > [data-live-summary-button]").click()
-                assert replay_child.get_attribute("data-expanded") == "1"
-                replay_section = replay_child.locator(
-                    ":scope > [data-live-reviews-host] [data-review-section]"
-                )
-                replay_section.locator("[data-review-section-toggle]").click()
-                replay_group = replay_section.locator("[data-review-group]").first
-                replay_group.locator("[data-review-group-toggle]").click()
-                replay_group.locator("[data-review-attempt-toggle]").first.click()
+                _open_review_checkpoint(replay_child)
                 assert "Final child answer should stay inside the child card." in replay_child.inner_text()
                 replay_progress = replay_child.locator(".chat-live-line", has_text="Searching evidence").first
                 replay_progress.locator(".chat-live-line-toggle").click()

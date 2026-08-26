@@ -437,6 +437,36 @@ test('lifecycle completion stays neutral until a semantic review verdict arrives
     assert.equal(lifecycle.verdict, '');
     assert.equal(lifecycle.attempts[0].lifecycleOnly, true);
     assert.match(lifecycle.attempts[0].summary, /verdict unavailable/i);
+    for (const [status, tone] of [
+        ['failed', 'error'], ['cancelled', 'warn'], ['interrupted', 'warn'], ['timeout', 'error'],
+    ]) {
+        const terminal = reviewGroupFromLifecycle({ lifecycle: {
+            kind: 'review', status, target: 'alpha', job_id: `job-${status}`,
+            group_id: 'task:root:alpha', presentation_owner_task_id: 'root',
+        } });
+        assert.equal(terminal.verdict, '');
+        assert.equal(terminal.tone, tone, status);
+        assert.equal(terminal.attempts[0].tone, tone, status);
+    }
+
+    for (const status of ['failed', 'timeout']) {
+        const pendingStore = new Map();
+        mergeReviewGroup(pendingStore, reviewGroupFromHistoryRow({
+            ...groupedSkillRow({
+                status: 'pending',
+                attempts: [{ job_id: 'pending-job', skill: 'alpha', status: 'pending' }],
+            }),
+            job_id: 'pending-job',
+        }));
+        const failed = mergeReviewGroup(pendingStore, reviewGroupFromLifecycle({ lifecycle: {
+            kind: 'review', status, target: 'alpha', job_id: 'pending-job',
+            group_id: 'task:root:alpha', presentation_owner_task_id: 'root',
+        } }));
+        assert.equal(failed.verdict, '');
+        assert.equal(failed.tone, 'error', status);
+        assert.equal(failed.attempts[0].state, 'terminal');
+        assert.equal(failed.attempts[0].tone, 'error');
+    }
 
     const store = new Map();
     const history = reviewGroupFromHistoryRow(groupedSkillRow());
@@ -461,6 +491,19 @@ test('lifecycle completion stays neutral until a semantic review verdict arrives
     assert.equal(newAttemptMerged.lifecycleOnly, true);
     assert.equal(newAttemptMerged.attempts.at(-1).id, 'job-3');
     assert.equal(newAttemptMerged.attempts.at(-1).verdict, '');
+
+    const staleStore = new Map();
+    mergeReviewGroup(staleStore, history);
+    mergeReviewGroup(staleStore, newAttempt);
+    const staleHistory = reviewGroupFromHistoryRow(groupedSkillRow({
+        status: 'clean',
+        attempts: [{ job_id: 'job-2', skill: 'alpha', status: 'clean' }],
+    }));
+    const staleMerged = mergeReviewGroup(staleStore, staleHistory);
+    assert.equal(staleMerged.verdict, '');
+    assert.equal(staleMerged.tone, 'neutral');
+    assert.equal(staleMerged.lifecycleOnly, true);
+    assert.equal(staleMerged.attempts.at(-1).id, 'job-3');
 });
 
 test('task acceptance adapts only task_acceptance panels; advisory and commit stay omitted', () => {
