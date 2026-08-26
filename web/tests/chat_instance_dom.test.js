@@ -686,3 +686,51 @@ test('history replay keeps one duplicate lifecycle acknowledgement without a tas
         restoreDom(prior);
     }
 });
+
+test('history replay keeps an ownerless duplicate acknowledgement without a task card', async () => {
+    const pointerRow = {
+        chat_id: 2, role: 'assistant', is_progress: true, task_id: '',
+        text: 'Skill review alpha is already running in its original chat.',
+        ts: '2026-08-25T00:00:00Z',
+        lifecycle_pointer: {
+            kind: 'review', job_id: 'manual-job', status: 'running', target: 'alpha',
+        },
+    };
+    const { prior, mount } = installDom(async (url) => {
+        if (String(url).startsWith('/api/chat/history')) {
+            return { ok: true, json: async () => ({ messages: [pointerRow] }) };
+        }
+        return { ok: true, json: async () => ({ active_direct_turns: [] }) };
+    });
+    const handlers = new Map();
+    const ws = {
+        on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
+        isConnected: () => true, send() {},
+    };
+    let generation = 0;
+    const stateSnapshots = {
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        isCurrent: () => true, apply() {},
+    };
+    let instance;
+    try {
+        instance = createChatInstance({
+            ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
+            updateUnreadBadge() {}, stateSnapshots, chatId: 2, idPrefix: 'chat', mountEl: mount,
+            asPanel: true,
+        });
+        await instance.refreshHistory({ revision: 1 });
+        const messages = globalThis.document.byId.get('chat-messages');
+        const acknowledgements = messages.children.filter(
+            (node) => node.classList.contains('chat-bubble')
+                && node.classList.contains('assistant')
+                && node.classList.contains('progress'),
+        );
+        assert.equal(acknowledgements.length, 1);
+        assert.match(acknowledgements[0].innerHTML, /already running in its original chat/);
+        assert.equal(messages.children.some((node) => node.dataset.taskId), false);
+    } finally {
+        instance?.destroy();
+        restoreDom(prior);
+    }
+});

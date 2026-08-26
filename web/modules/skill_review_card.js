@@ -90,6 +90,11 @@ function renderDetailState(full, entry, render) {
     }
 }
 
+function renderDetailStateIfChanged(full, entry, render) {
+    if (!full || !entry || full.dataset.state === entry.state) return;
+    renderDetailState(full, entry, render);
+}
+
 export async function loadSkillReviewDetail(full, ref, deps = {}) {
     const fetchImpl = deps.fetchImpl || apiFetch;
     const render = deps.render || renderMarkdown;
@@ -102,10 +107,16 @@ export async function loadSkillReviewDetail(full, ref, deps = {}) {
         store?.delete(cacheKey);
     }
     if (entry) {
-        renderDetailState(full, entry, render);
+        // A keyed Reviews reconcile deliberately keeps a live detail node,
+        // including its markdown descendants, selection and scroll position.
+        // Repainting a cache hit would replace that user-owned DOM on every
+        // unrelated review update. Paint only when this node has not reached
+        // the cached state yet; an explicit retry remains the only forced
+        // rewrite path.
+        renderDetailStateIfChanged(full, entry, render);
         if (entry.state === 'loading' && entry.promise) {
             await entry.promise;
-            renderDetailState(full, entry, render);
+            renderDetailStateIfChanged(full, entry, render);
         }
         return entry.state;
     }
@@ -140,7 +151,7 @@ export async function loadSkillReviewDetail(full, ref, deps = {}) {
         }
     })();
     await entry.promise;
-    renderDetailState(full, entry, render);
+    renderDetailStateIfChanged(full, entry, render);
     return entry.state;
 }
 

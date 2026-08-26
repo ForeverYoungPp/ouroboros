@@ -162,6 +162,31 @@ test('nested attempts reuse the instance exact-job store after DOM rebuild', asy
     } }), { skill: 'alpha', jobId: 'nested-job' });
 });
 
+test('cached loaded detail does not repaint an already-loaded live node', async () => {
+    const store = new Map();
+    const full = makeFull();
+    let fetches = 0;
+    let renders = 0;
+    const deps = {
+        store,
+        fetchImpl: async () => {
+            fetches += 1;
+            return okResponse('cached body');
+        },
+        render: (markdown) => {
+            renders += 1;
+            return '<p>' + markdown + '</p>';
+        },
+    };
+    await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'reader-job' }, deps);
+    const readerOwnedMarkup = '<p>cached body</p><span data-selection-anchor>keep</span>';
+    full.innerHTML = readerOwnedMarkup;
+    await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'reader-job' }, deps);
+    assert.equal(fetches, 1);
+    assert.equal(renders, 1);
+    assert.equal(full.innerHTML, readerOwnedMarkup);
+});
+
 test('same exact detail shares one in-flight read across a DOM rebuild', async () => {
     const store = new Map();
     let resolve;
