@@ -113,6 +113,151 @@ def test_registry_reconcile_registers_existing_stores_never_prunes(tmp_path):
     assert {p["id"] for p in list_projects(tmp_path)} == ids
 
 
+_GHOST_ID = "proj_deadbeef1234"
+_TOMB_ID = "proj_deadtomb0001"
+
+
+def _store(drive_root, project_id):
+    """Materialize the on-disk shape project_facts creates for a project store."""
+    (drive_root / "projects" / project_id / "knowledge").mkdir(parents=True)
+
+
+def _write_bindings(drive_root, rows):
+    """Write the durable task->project bindings file directly.
+
+    bind_task_to_project would CREATE the registry row it binds to, which is
+    exactly the state these tests must not have: the guard only matters for a
+    store whose registry row is missing.
+    """
+    import json
+
+    state = drive_root / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "project_task_bindings.json").write_text(
+        json.dumps({"bindings": rows}), encoding="utf-8"
+    )
+
+
+def _read_bindings(drive_root):
+    import json
+
+    return json.loads(
+        (drive_root / "state" / "project_task_bindings.json").read_text(encoding="utf-8")
+    )["bindings"]
+
+
+def _binding(project_id, task_id="t-1"):
+    return {
+        "task_id": task_id,
+        "project_id": project_id,
+        "project_chat_id": project_chat_id(project_id),
+        "bound_at": "2026-08-26T00:00:00Z",
+        "origin_absent": "post_hoc_unresolved",
+    }
+
+
+def test_reconcile_skips_workspace_derived_store_without_a_binding(tmp_path):
+    """A proj_<hash> store minted by project_facts for a workspace path is not a
+    project room: with no durable binding it must never become a sidebar row."""
+    from ouroboros.projects_registry import list_projects, reconcile_projects
+
+    _store(tmp_path, _GHOST_ID)
+
+    assert reconcile_projects(tmp_path) == 0
+    assert list_projects(tmp_path) == []
+    # Idempotent: the ghost is skipped again on the next 300s tick, never pruned.
+    assert reconcile_projects(tmp_path) == 0
+    assert (tmp_path / "projects" / _GHOST_ID / "knowledge").is_dir()
+
+
+def test_reconcile_registers_workspace_derived_store_with_a_binding(tmp_path):
+    """A durable task binding is the proof of user ownership that admits the
+    store — the registry-row-lost recovery case."""
+    from ouroboros.projects_registry import list_projects, reconcile_projects
+
+    _store(tmp_path, _GHOST_ID)
+    _write_bindings(tmp_path, {"t-1": _binding(_GHOST_ID)})
+
+    assert reconcile_projects(tmp_path) == 1
+    assert {p["id"] for p in list_projects(tmp_path)} == {_GHOST_ID}
+
+
+def test_reconcile_still_registers_named_store_beside_a_skipped_ghost(tmp_path):
+    """The guard is prefix-scoped: an ordinary named store registers exactly as
+    before, even while an unbound proj_ store in the same scan is skipped."""
+    from ouroboros.projects_registry import list_projects, reconcile_projects
+
+    _store(tmp_path, "legacy-store")
+    _store(tmp_path, _GHOST_ID)
+
+    assert reconcile_projects(tmp_path) == 1
+    assert {p["id"] for p in list_projects(tmp_path)} == {"legacy-store"}
+
+
+def test_reconcile_never_prunes_existing_rows_while_skipping_a_ghost(tmp_path):
+    """Function contract: reconcile only ever ADDS. A pass that skips a ghost
+    must leave every pre-existing row untouched."""
+    from ouroboros.projects_registry import create_project, list_projects, reconcile_projects
+
+    create_project(tmp_path, "kept", name="Kept Project")
+    _store(tmp_path, _GHOST_ID)
+
+    assert reconcile_projects(tmp_path) == 0
+    rows = list_projects(tmp_path)
+    assert [p["id"] for p in rows] == ["kept"]
+    assert rows[0]["name"] == "Kept Project"
+
+
+def test_reconcile_survives_malformed_binding_rows(tmp_path):
+    """A malformed legacy binding row must fail closed for ITSELF only: the
+    reconcile completes, named stores still register, unbound ghosts stay out."""
+    from ouroboros.projects_registry import list_projects, reconcile_projects
+
+    _store(tmp_path, "legacy-store")
+    _store(tmp_path, _GHOST_ID)
+    _store(tmp_path, "proj_00000000cafe")
+    _write_bindings(tmp_path, {
+        "t-str": "not-a-dict",
+        "t-noid": {"task_id": "t-noid", "bound_at": "2026-08-26T00:00:00Z"},
+        "t-null": {"task_id": "t-null", "project_id": None},
+        "t-ok": _binding(_GHOST_ID, task_id="t-ok"),
+    })
+
+    # legacy-store (named) + the ONE ghost a valid row vouches for.
+    assert reconcile_projects(tmp_path) == 2
+    assert {p["id"] for p in list_projects(tmp_path)} == {"legacy-store", _GHOST_ID}
+
+
+def test_reconcile_leaves_a_tombstoned_workspace_store_tombstoned(tmp_path):
+    """Deletion PRESERVES bindings, so a tombstoned proj_ store still carries
+    the very binding this guard accepts as ownership proof — the guard alone
+    would re-admit it. The pre-existing `known` check runs FIRST and is what
+    keeps it dead: a tombstoned id is never resurrected as active."""
+    from ouroboros.projects_registry import (
+        PROJECT_TOMBSTONED,
+        begin_project_deletion,
+        complete_project_deletion,
+        create_project,
+        list_projects,
+        list_reserved_projects,
+        reconcile_projects,
+    )
+
+    create_project(tmp_path, _TOMB_ID)
+    _store(tmp_path, _TOMB_ID)
+    _write_bindings(tmp_path, {"t-tomb": _binding(_TOMB_ID, task_id="t-tomb")})
+    begin_project_deletion(tmp_path, _TOMB_ID)
+    complete_project_deletion(tmp_path, _TOMB_ID)
+
+    # The binding survived the deletion (nothing removed it).
+    assert _read_bindings(tmp_path)["t-tomb"]["project_id"] == _TOMB_ID
+
+    assert reconcile_projects(tmp_path) == 0
+    assert list_projects(tmp_path) == []
+    reserved = {p["id"]: p["lifecycle"] for p in list_reserved_projects(tmp_path)}
+    assert reserved == {_TOMB_ID: PROJECT_TOMBSTONED}
+
+
 def test_journal_and_workpad_roundtrip(tmp_path, monkeypatch):
     import types
 

@@ -805,10 +805,11 @@ def touch_project(drive_root: Any, project_id: str) -> None:
 
 
 def reconcile_projects(drive_root: Any) -> int:
-    """Boot reconcile: register projects whose memory store exists but whose
-    registry row is missing (e.g. created before the registry shipped, or a
-    workspace-derived ``proj_<hash>`` store). NEVER prunes — durable project
-    dirs outlive any registry accident.
+    """Register projects whose memory store exists but whose registry row is
+    missing (e.g. created before the registry shipped). Runs at boot AND on the
+    periodic supervisor reconcile tick. A workspace-derived ``proj_<hash>``
+    store registers only when a durable task binding names it. NEVER prunes —
+    durable project dirs outlive any registry accident.
     """
     added = 0
     try:
@@ -817,11 +818,32 @@ def reconcile_projects(drive_root: Any) -> int:
             with _file_write_lock(_registry_path(drive_root)):
                 data = _load(drive_root)
                 known = {p.get("id") for p in data["projects"]}
+                # A workspace-derived ``proj_<hash>`` store is minted by
+                # project_facts for ANY task carrying a workspace path; the
+                # directory alone is not evidence that the owner ever created a
+                # project room. Only a durable task binding proves that, so read
+                # the bindings ONCE here — this function also runs on the 300s
+                # supervisor reconcile tick, not just at boot — and let an unbound
+                # proj_ store stay unregistered. An unreadable bindings file
+                # fail-closes to an empty set (every unbound proj_ dir is skipped
+                # this pass, idempotently retried on the next tick), and a
+                # malformed legacy row is skipped per row rather than aborting the
+                # whole reconcile.
+                bound = {
+                    sanitize_project_id(str(row.get("project_id") or ""))
+                    for row in _load_bindings(drive_root)["bindings"].values()
+                    if isinstance(row, dict)
+                }
                 for entry in sorted(projects_root.iterdir()):
                     if not entry.is_dir() or entry.name.startswith("."):
                         continue
                     pid = sanitize_project_id(entry.name)
                     if not pid or pid in known:
+                        continue
+                    # Named stores register as before. A legitimately created
+                    # proj_*-named project passed through create_project and is
+                    # already in ``known``, so it never reaches this guard.
+                    if pid.startswith("proj_") and pid not in bound:
                         continue
                     data["projects"].append({
                         "id": pid,
