@@ -1210,13 +1210,9 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
                       sealed_final=None):
     """Generate a detailed task summary and inject it into chat.jsonl."""
     try:
-        from ouroboros.project_dialogue import append_canonical_task_summary, completion_status_label
+        from ouroboros.project_dialogue import append_authored_task_summary, completion_status_label
         from ouroboros.projects_registry import project_thread_note_for_task
-
-        from ouroboros.consolidator import (
-            CONSOLIDATION_REASONING_EFFORT,
-            _consolidation_route,
-        )
+        from ouroboros.consolidator import CONSOLIDATION_REASONING_EFFORT, _consolidation_route
         task_id = str(task.get("id") or "unknown")
         canonical_root = pathlib.Path(task.get("budget_drive_root") or drive_logs.parent)
         summary_id = f"task-narrative:{task_id}"
@@ -1230,8 +1226,9 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
         result_root = pathlib.Path(getattr(env, "drive_root", canonical_root))
         stored_result = load_task_result(result_root, task_id) or {}
         result_ref = {"kind": "task_result", "task_id": task_id, "reader": "get_task_result"}
+
         def _append_summary(value: str) -> None:
-            append_canonical_task_summary(canonical_root, {
+            row = {
                 "ts": utc_now_iso(), "direction": "system", "type": "task_summary",
                 "summary_kind": "authored_root_summary", "summary_id": summary_id,
                 "task_id": task_id, "parent_task_id": str(task.get("parent_task_id") or ""), "root_task_id": str(task.get("root_task_id") or task_id),
@@ -1241,7 +1238,10 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
                 "text": value, "tool_calls": n_tool_calls, "rounds": rounds, "outcome_axes": outcome_axes, "reason_code": reason_code,
                 "result_ref": result_ref, "source_coverage": {"task_result": result_ref}, **_summary_row_cost_fields(usage), **presence_fields,
                 **({"review_projection": review_projection} if review_projection.get("panels") else {}),
-            })
+            }
+            append_authored_task_summary(
+                canonical_root, result_root, row, status=str(stored_result.get("status") or ""),
+            )
         # Skip LLM summary for trivial tasks.
         if n_tool_calls == 0 and rounds <= 1:
             goal = _truncate_with_notice(task.get("text", ""), 200)

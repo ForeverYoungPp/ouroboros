@@ -38,7 +38,7 @@ def test_route_to_existing_project_emits_event_and_receipt(tmp_path):
         "origin_message_ref": origin_ref,
         "origin_message_text": "continue the engine tuning",
     })
-    out = _route_to_project(ctx, "racer", "paraphrased: keep tuning the engine", reason="follow-up")
+    out = _route_to_project(ctx, "racer", "paraphrased: keep tuning the engine", reason="follow-up", predecessor_task_id="")
     assert out.startswith("⚠️ ROUTE_UNCONFIRMED:")
     assert "do not retry automatically" in out.lower()
     assert len(events) == 1
@@ -79,12 +79,13 @@ def test_main_route_to_existing_project_explicitly_selects_predecessor_or_stays_
     )
 
     assert out.startswith("⚠️ ROUTE_UNCONFIRMED")
+    assert events[0]["predecessor_task_id"] == "racer-old"
     assert events[0]["predecessor_authority_source"] == preview["authority_source"]
 
     fresh_events = []
     route_tool.handler(
         _ctx(tmp_path, fresh_events, task_metadata=metadata),
-        "racer", "Start a separate racer experiment",
+        "racer", "Start a separate racer experiment", predecessor_task_id="",
     )
     assert "predecessor_authority_source" not in fresh_events[0]
     assert "predecessor_task_id" in route_tool.schema["parameters"]["properties"]
@@ -109,8 +110,8 @@ def test_main_swarm_route_carries_intent_and_emits_only_once(tmp_path, monkeypat
         project_id="",
     )
 
-    first = _route_to_project(ctx, "racer", "Audit and fix this in Racer")
-    second = _route_to_project(ctx, "racer", "Audit and fix this in Racer")
+    first = _route_to_project(ctx, "racer", "Audit and fix this in Racer", predecessor_task_id="")
+    second = _route_to_project(ctx, "racer", "Audit and fix this in Racer", predecessor_task_id="")
 
     assert first == second
     assert len(events) == 1
@@ -130,7 +131,7 @@ def test_project_swarm_route_to_other_project_is_rejected_without_event(tmp_path
         project_id="alpha",
     )
 
-    out = _route_to_project(ctx, "beta", "Audit and fix this in Beta")
+    out = _route_to_project(ctx, "beta", "Audit and fix this in Beta", predecessor_task_id="")
 
     assert "SWARM_PROJECT_SCOPE_OWNED" in out
     assert events == []
@@ -143,7 +144,7 @@ def test_route_to_missing_project_emits_typed_manual_target(tmp_path):
         "routing_contract": {"manual_options": [{"task_id": "task-1", "title": "Fix it"}]},
     }
     ctx = _ctx(tmp_path, events, task_metadata=metadata)
-    out = _route_to_project(ctx, "ghost", "do the thing")
+    out = _route_to_project(ctx, "ghost", "do the thing", predecessor_task_id="")
     assert "ROUTING_UNCONFIRMED" in out
     assert len(events) == 1
     assert events[0]["type"] == "routing_manual_target"
@@ -156,9 +157,51 @@ def test_route_to_missing_project_emits_typed_manual_target(tmp_path):
     assert ctx._typed_routing_action_emitted == "routing_manual_target"
 
 
+def test_manual_target_preserves_valid_predecessor_and_rejects_unreadable_one(tmp_path):
+    import server
+
+    predecessor = {
+        "task_id": "previous", "status": "completed", "project_id": "racer",
+        "title": "Previous result", "objective": "Build the previous result",
+        "task_contract": {"objective": "Build the previous result"},
+    }
+    result_dir = tmp_path / "task_results"
+    result_dir.mkdir()
+    (result_dir / "previous.json").write_text(json.dumps(predecessor), encoding="utf-8")
+    preview = server._task_result_ground_truth(predecessor)
+    events = []
+    metadata = {"main_routing_manifest": {"final_results": [preview]}}
+
+    out = _route_to_project(
+        _ctx(tmp_path, events, task_metadata=metadata),
+        "missing-project", "continue it", predecessor_task_id="previous",
+    )
+
+    assert "ROUTING_UNCONFIRMED" in out
+    assert events[0]["type"] == "routing_manual_target"
+    assert events[0]["predecessor_task_id"] == "previous"
+    assert events[0]["predecessor_authority_source"] == preview["authority_source"]
+
+    unreadable_source = {
+        "kind": "task_result", "task_id": "gone", "tool": "get_task_result",
+        "arguments": {"task_id": "gone", "include_authority": True},
+    }
+    unreadable_metadata = {"main_routing_manifest": {"final_results": [{
+        "task_id": "gone", "authority_source": unreadable_source,
+    }]}}
+    rejected_events = []
+    rejected = _route_to_project(
+        _ctx(tmp_path, rejected_events, task_metadata=unreadable_metadata),
+        "missing-project", "continue it", predecessor_task_id="gone",
+    )
+    assert "AUTHORITY_SOURCE_UNAVAILABLE" in rejected
+    assert "missing or unreadable" in rejected
+    assert rejected_events == []
+
+
 def test_route_rejects_dirty_project_id(tmp_path):
     events = []
-    out = _route_to_project(_ctx(tmp_path, events), "Bad Name!", "msg")
+    out = _route_to_project(_ctx(tmp_path, events), "Bad Name!", "msg", predecessor_task_id="")
     assert "ROUTING_UNCONFIRMED" in out
     assert events[0]["routing_token"]
     assert events[0]["reason"] == "invalid_project_id"
@@ -172,7 +215,7 @@ def test_route_empty_target_is_the_typed_abstention_path(tmp_path):
             "manual_options": [{"action": "new_task_in_project", "label": "New task in Project"}],
         },
     }
-    out = _route_to_project(_ctx(tmp_path, events, task_metadata=metadata), "", "ambiguous follow-up")
+    out = _route_to_project(_ctx(tmp_path, events, task_metadata=metadata), "", "ambiguous follow-up", predecessor_task_id="")
     assert "ROUTING_UNCONFIRMED" in out
     assert events[0]["routing_token"]
     assert events[0]["reason"] == "target_unspecified"
@@ -183,7 +226,7 @@ def test_route_requires_message(tmp_path):
     create_project(tmp_path, "racer", name="Racer")
     events = []
     ctx = _ctx(tmp_path, events)
-    out = _route_to_project(ctx, "racer", "   ")
+    out = _route_to_project(ctx, "racer", "   ", predecessor_task_id="")
     assert "TOOL_ARG_ERROR" in out
     assert events == []
     assert not hasattr(ctx, "_typed_routing_action_emitted")
