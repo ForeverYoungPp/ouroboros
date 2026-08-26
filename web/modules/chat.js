@@ -1453,11 +1453,6 @@ export function createChatInstance({
             const record = pointer.group && liveCardRecords.get(pointer.group.presentationOwnerTaskId);
             if (record?.reviewController) record.reviewController.update(pointer.group);
             else if (showPointerAck) {
-                // An ownerless/legacy pointer is still a real duplicate
-                // acknowledgement. Keep it as one subdued progress row rather
-                // than silently consuming the producer text; it must never
-                // mint a task card or imply an owner that the source did not
-                // provide.
                 const ack = String(row?.text || row?.content || '').trim();
                 if (ack) addMessage(
                     ack, 'assistant', !!row?.markdown, rawTs || row?.ts || null,
