@@ -51,6 +51,26 @@ def _install_two_turn_substrate(monkeypatch, calls, *, pending_ids=None, texts=N
     monkeypatch.setattr(review_custody, "review_retry_custody_available", lambda **_kwargs: True)
 
 
+def test_partial_quorum_stays_open_while_one_paid_slot_is_in_flight(harness, monkeypatch):
+    """A 2/3 parseable quorum cannot close over a live paid reviewer worker."""
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
+    calls = []
+    _install_two_turn_substrate(monkeypatch, calls, pending_ids={"s3"})
+    ctx = harness.make_ctx()
+
+    first = _call(ctx)
+    state = _state(harness)
+    wave = state["waves"][-1]
+    assert _control(first) == {"outcome": "DEGRADED", "closed": False}
+    assert wave["aggregate"] == "DEGRADED"
+    assert wave["closed"] is False and wave["custody_pending"] is True
+    assert "review_late_result_pending" in wave["reasons"]
+    assert "Closed: proceed" not in first
+
+    second = _call(ctx)
+    assert _control(second) == {"outcome": "GREEN", "closed": True}
+
+
 def test_resume_keeps_original_dispatched_set_when_skipped_lane_heals(harness, monkeypatch):
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
     health_calls = []

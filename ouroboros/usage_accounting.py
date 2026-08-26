@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, Iterator, Literal, Optional, Sequence, T
 from ouroboros.pricing import estimate_cost_optional
 from ouroboros._usage_response import _reported_token_count, usage_from_response
 from ouroboros.review_dispatch import invoke_bound_api_review_paid_stamp
-# One-way seam: usage_ledger owns bytes/validation; this module owns policy.
+from ouroboros.transport_custody import release_pre_dispatch_attempt
 from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
     LEDGER_REL,
     QUARANTINE_REL,
@@ -122,7 +122,6 @@ def _stash_root_accounting(
             "updated_monotonic": time.monotonic(),
         }
 
-
 def last_root_accounting(root_task_id: str) -> Optional[Dict[str, Any]]:
     """Newest process-local root snapshot, including in-flight holds."""
     with _ROOT_ACCOUNTING_TELEMETRY_LOCK:
@@ -132,7 +131,6 @@ def last_root_accounting(root_task_id: str) -> Optional[Dict[str, Any]]:
         entry = dict(entry)
     entry["age_sec"] = max(0.0, time.monotonic() - entry.pop("updated_monotonic"))
     return entry
-
 
 def refresh_root_accounting(
     drive_root: pathlib.Path | str | None,
@@ -1119,6 +1117,8 @@ def _is_tos_rejection(exc: BaseException) -> bool:
 
 def _terminalize_failed_attempt(reservation: AttemptReservation, exc: BaseException) -> str:
     """Route a raised provider send to its honest terminal ledger state."""
+    if release_pre_dispatch_attempt(reservation, exc):
+        return "released"
     provider = str(reservation.provider or "").strip().lower()
     if provider == "openrouter" and _is_pre_routing_rejection(exc):
         _transition(

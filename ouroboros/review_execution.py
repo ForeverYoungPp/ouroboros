@@ -35,7 +35,10 @@ from ouroboros.triad_review import (
     empty_array_is_verified_clean,
     extract_json_array,
 )
-from ouroboros.deadline_utils import bounded_seconds, review_transport_timeout
+from ouroboros.deadline_utils import (
+    bounded_seconds, owner_deadline_exhausted,
+    review_transport_timeout,
+)
 from ouroboros.review_session_custody import (
     checkpoint_pending_invocation,
     owned_started_review_custody,
@@ -62,7 +65,6 @@ class ReviewRouteKind(str, Enum):
     API_CHAT = "api_chat"
     AGENT_SESSION = "agent_session"
 
-
 class ReviewRouteUnavailable(RuntimeError):
     """Typed refusal for a route with no executor in this build.
 
@@ -75,6 +77,10 @@ class ReviewRouteUnavailable(RuntimeError):
         super().__init__(message)
         self.code = str(code or "")
 
+def _deadline_exhausted_error(
+    message: str = "owner deadline leaves no dispatch window",
+) -> ReviewRouteUnavailable:
+    return ReviewRouteUnavailable(message, code="deadline_exhausted")
 
 class ReviewSessionWaitingOnUser(RuntimeError):
     """A delegated review session parked on an interactive question (F18).
@@ -92,7 +98,6 @@ class ReviewSessionWaitingOnUser(RuntimeError):
     (completion wins). Answering support for hosted review lanes is a
     deliberate non-goal (owner: no acceptance host-wait; see docs/ARCHITECTURE.md).
     """
-
 
 def _poll_detail(gateway: Any, run_id: str, seconds: float) -> Dict[str, Any]:
     from ouroboros.delegate_progress import bounded_poll, expiring_poll
@@ -380,6 +385,9 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
         async_chat = getattr(self.llm, "chat_async", None)
         if not callable(chat) and not callable(async_chat):
             raise ReviewRouteUnavailable("api_chat client exposes no callable transport", code="api_chat_unavailable")
+        deadline_at = str(getattr(self.assignment.request, "deadline_at", "") or "")
+        if owner_deadline_exhausted(deadline_at=deadline_at):
+            raise _deadline_exhausted_error()
         with bind_api_review_paid_stamp(self.assignment.dispatch_stamp):
             try:
                 if callable(chat):
@@ -649,21 +657,22 @@ def _extract_verdict_via_light_model(
     transport_timeout_sec: Any = None) -> tuple[Optional[str], Dict[str, Any]]:
     """One bounded light-model call canonicalizing narrative to the contract."""
     from ouroboros.config import get_light_model
-    from ouroboros.deadline_utils import dispatch_window_remaining_sec
     from ouroboros.usage_accounting import physical_attempt_limit
 
     if not str(raw_text or "").strip():
         return None, {}
     model = get_light_model()
-    dispatch_window = dispatch_window_remaining_sec(
-        deadline_at=deadline_at,
-    )
-    if dispatch_window is not None and dispatch_window <= 0:
+    if owner_deadline_exhausted(deadline_at=deadline_at):
         return None, {"model": model, "reason_code": "deadline_exhausted", "dispatch": "not_dispatched"}
     prompt = _SESSION_EXTRACT_PROMPT.format(
         contract=contract or REVIEW_JSON_ARRAY_CONTRACT,
         raw_text=raw_text,  # WHOLE — the caller already bounded the one send
     )
+    # Formatting the extraction prompt can itself be expensive. Re-check at
+    # the physical light-model boundary rather than letting an expired owner
+    # window reach the transport helper's positive floor.
+    if owner_deadline_exhausted(deadline_at=deadline_at):
+        return None, {"model": model, "reason_code": "deadline_exhausted", "dispatch": "not_dispatched"}
     try:
         if llm is None:
             from ouroboros.llm import LLMClient
@@ -803,6 +812,7 @@ class SessionInvocation:
     dispatch_stamp: Any = None
     operation_id: str = ""
     pending_invocation_checkpoint: Optional[Callable[[str], None]] = None
+    owner_deadline_at: str = ""
 
 def run_delegated_review_session(
     *,
@@ -812,7 +822,6 @@ def run_delegated_review_session(
     invocation: SessionInvocation,
 ) -> Dict[str, Any]:
     """Start, watch, settle and collect one delegated read-only review.
-
     This is every review surface's single session transport. It pins one
     subscription harness, asks for schema only when the effective adapter can
     carry it, stores the canonical start request before POST, and replays only
@@ -828,13 +837,12 @@ def run_delegated_review_session(
     )
     from ouroboros.subagents import delegated_run_shape, route_health
     from ouroboros.usage_accounting import current_usage_scope
-
     task_id, surface, slot_id, timeout_sec, logical_key_extra, output_schema, \
         session_route, instructions, retry_state = session_invocation_fields(invocation)
+    owner_deadline_at = invocation.owner_deadline_at
     use_thread = bool(invocation.use_thread)
     thread_id = str(invocation.thread_id or "")
     turn_id = ""
-    # #112: capture task-tree lineage once for both custody writers.
     _scope = current_usage_scope()
     root_task_id, parent_task_id, usage_custody = session_custody_attribution(_scope)
     shape = delegated_run_shape(False)  # a reviewer reads and answers
@@ -851,7 +859,6 @@ def run_delegated_review_session(
     elif (record is not None and record["state"] == "pending"
           and isinstance(record.get("request"), dict) and record["request"]):
         run_request, invocation_id = record["request"], retry_token
-    # A dead (definitely refused) or unrecorded token falls through and mints fresh; its id never rides the wire again.
     recovering = bool(run_id) or run_request is not None
     if recovering:
         route, project_id, existing_project, key, schema_asked = (
@@ -878,7 +885,6 @@ def run_delegated_review_session(
     gateway = ensure_owned_gateway()
     try:
         if not recovering and not run_id and not (use_thread and thread_id):
-            # Admission applies only before POST and is checked against the exact pin (D1).
             unavailable, reset_at = route_health(
                 gateway, route.route_id, shape, route_model=route.model,
                 pinned_profile=str(getattr(route, "profile_id", "") or ""),
@@ -904,7 +910,6 @@ def run_delegated_review_session(
             )
             if use_thread and not thread_id:
                 from ouroboros.review_thread_continuity import ensure_review_thread
-
                 thread_id = ensure_review_thread(
                     gateway, custody, thread_id, route=route, root=root,
                     surface=surface, slot_id=slot_id, task_id=task_id)
@@ -937,6 +942,12 @@ def run_delegated_review_session(
             if schema_asked:
                 run_request["outputSchema"] = output_schema
         if not run_id:
+            if (
+                not recovering
+                and owner_deadline_at
+                and owner_deadline_exhausted(deadline_at=owner_deadline_at)
+            ):
+                raise _deadline_exhausted_error()
             seconds = bounded_seconds(
                 run_request.get("maxSeconds"),
                 default=timeout_sec if timeout_sec is not None else 300,
@@ -979,7 +990,6 @@ def run_delegated_review_session(
             try:
                 if use_thread:
                     from ouroboros.review_thread_continuity import start_review_thread_turn
-
                     handle = start_review_thread_turn(
                         gateway, thread_id, run_request, idempotency_key=invocation_id)
                 else:
@@ -1384,6 +1394,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 dispatch_stamp=self.assignment.dispatch_stamp,
                 operation_id=self.assignment.call_id,
                 pending_invocation_checkpoint=self._pending_invocation_checkpoint,
+                owner_deadline_at=str(getattr(request, "deadline_at", "") or ""),
             ),
         )
         self._run_id = facts["run_id"]

@@ -461,9 +461,13 @@ def _settle_review_attempt(
             str(getattr(actor, "failure_code", "") or "")
             == "provider_outcome_unknown"
         )
+        not_dispatched = str(
+            getattr(actor, "operation_state", "") or ""
+        ) == "not_dispatched"
         actor.operation_id = entry.operation_id
         actor.operation_state = (
             "custody_lost" if custody_lost else
+            "not_dispatched" if not_dispatched else
             "in_flight" if pending_invocation else "late_settled" if late else "settled"
         )
         actor.late_result_pending = bool(pending_invocation or custody_lost)
@@ -756,8 +760,14 @@ def run_custodied_review_slots(
                             entry.pending_invocation_checkpoint,
                         )
                 except Exception as exc:
+                    operation_state = (
+                        "not_dispatched"
+                        if str(getattr(exc, "code", "") or "") == "deadline_exhausted"
+                        else "settled"
+                    )
                     actor = error_actor(
                         slot, f"{type(exc).__name__}: {exc}", entry.operation_id,
+                        operation_state,
                     )
                 _settle_review_attempt(
                     entry, slot, actor, usage_ctx=usage_ctx, request=request,

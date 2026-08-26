@@ -1713,6 +1713,30 @@ def test_callable_api_refusal_before_physical_attempt_stays_unpaid(tmp_path, fak
     assert stamps == []
 
 
+def test_api_review_rechecks_owner_deadline_at_physical_boundary(tmp_path, fake_route, monkeypatch):
+    from ouroboros.review_execution import (
+        ApiChatReviewExecutor, ReviewAssignment, ReviewRouteUnavailable,
+    )
+
+    llm = FakeLLM()
+    executor = ApiChatReviewExecutor(
+        ReviewAssignment(
+            request=_agent_request(deadline_at="2000-01-01T00:00:00Z"),
+            slot=_agent_slot(route=ReviewRouteKind.API_CHAT),
+            custody_root=tmp_path,
+        ),
+        llm=llm,
+    )
+    # Stand in for a long prompt/render/persistence phase. The final check is
+    # deliberately after `_kwargs()` and immediately before `chat`.
+    monkeypatch.setattr(executor, "_kwargs", lambda: {"messages": [], "model": "fake"})
+
+    with pytest.raises(ReviewRouteUnavailable) as caught:
+        executor.execute()
+    assert caught.value.code == "deadline_exhausted"
+    assert llm.calls == []
+
+
 def test_async_only_api_transport_fires_at_the_same_physical_boundary(tmp_path, fake_route):
     from ouroboros import usage_accounting as ua
 

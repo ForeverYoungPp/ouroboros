@@ -347,6 +347,12 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         "operation_id": str(actor.get("operation_id") or ""),
         "operation_state": str(actor.get("operation_state") or "settled"),
         "late_result_pending": bool(actor.get("late_result_pending")),
+        "pending_invocation_id": str(
+            usage.get("pending_invocation_id") or actor.get("pending_invocation_id") or ""
+        ),
+        "delegated_run_id": str(
+            usage.get("delegated_run_id") or actor.get("delegated_run_id") or ""
+        ),
     }
 
 
@@ -361,12 +367,17 @@ def plan_row_typed_facts(row: Dict[str, Any]) -> Dict[str, Any]:
         **_typed_facts_from(row, lambda source, key: source.get(key)),
         "capability_delta": row.get("capability_delta") or [],
     }
+    pending_invocation_id = str(row.get("pending_invocation_id") or "")
+    delegated_run_id = str(row.get("delegated_run_id") or "")
     if row.get("operation_id") or row.get("late_result_pending") \
-            or str(row.get("operation_state") or "settled") != "settled":
+            or str(row.get("operation_state") or "settled") != "settled" \
+            or pending_invocation_id or delegated_run_id:
         facts.update({
             "operation_id": str(row.get("operation_id") or ""),
             "operation_state": str(row.get("operation_state") or "settled"),
             "late_result_pending": bool(row.get("late_result_pending")),
+            "pending_invocation_id": pending_invocation_id,
+            "delegated_run_id": delegated_run_id,
         })
     return facts
 
@@ -443,6 +454,7 @@ def synthesize_plan_review_wave(
         "constitutional_note": constitutional_note, "findings": list(agg["findings"]),
         "aggregate": aggregate, "reasons": list(agg["reasons"]), "counts": dict(agg["counts"]),
         "closed": aggregate == "GREEN", "dispositions": [], "actors": slot_records,
+        "custody_pending": False,
         "actors_degraded": [str(r["slot_id"]) for r in slot_records if not r["ok"]],
         "enforcement": enforcement, "cycle_cap": cap, "paid": bool(callable_slots),
         "health_epoch": plan_health_epoch(health_evidence),
@@ -456,6 +468,14 @@ def synthesize_plan_review_wave(
     # in the exact wave; reconciliation replays them and advances the durable
     # task-level evidence set only once the whole cycle is terminal.
     if plan_wave_has_in_flight(wave):
+        # A parseable quorum is not final authority while any paid physical
+        # reviewer can still settle. Keep the arithmetic counts, but expose
+        # the wave as the existing open DEGRADED state so both live and
+        # process-loss paths remain fail-closed without a new state/ledger.
+        wave["aggregate"] = "DEGRADED"
+        wave["closed"] = False
+        wave["custody_pending"] = True
+        wave["reasons"].append("review_late_result_pending")
         seen_after = seen_before
     return wave, seen_after, agg
 

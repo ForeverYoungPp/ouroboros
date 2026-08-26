@@ -9,7 +9,7 @@ import pathlib
 from typing import Any, Dict, List
 
 from ouroboros.config import get_image_input_mode, get_vision_caption_timeout_sec, get_vision_model, resolve_effort
-from ouroboros.deadline_utils import dispatch_window_remaining_sec, transport_timeout_with_deadline
+from ouroboros.deadline_utils import owner_deadline_exhausted, transport_timeout_with_deadline
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.provider_models import supports_vision
 from ouroboros.utils import emit_cognitive_operation_event
@@ -119,10 +119,7 @@ def _caption_for_block(
                 payload={"prompt": _CAPTION_PROMPT, "image_url": url, "model": model},
                 manifest={"model": model},
             )
-        dispatch_window = dispatch_window_remaining_sec(
-            deadline_ts=getattr(ctx, "deadline_ts", None),
-        )
-        if dispatch_window is not None and dispatch_window <= 0:
+        if owner_deadline_exhausted(deadline_ts=getattr(ctx, "deadline_ts", None)):
             raise TimeoutError("owner deadline leaves no window for a vision caption")
         text, usage = llm.vision_query(
             _CAPTION_PROMPT,

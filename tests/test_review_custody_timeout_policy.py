@@ -290,6 +290,57 @@ def test_coordinator_keeps_fresh_empty_session_custody_cell_shared(
         assert settled.wait(1.0)
 
 
+def test_review_owner_deadline_rechecked_after_prompt_persistence(
+    tmp_path, monkeypatch,
+):
+    """A slow prompt/custody phase must not create a late paid API send."""
+    import datetime as dt
+    from types import SimpleNamespace
+
+    import ouroboros.deadline_utils as deadlines
+    import ouroboros.review_substrate as substrate
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+
+    clock = [dt.datetime(2030, 1, 1, tzinfo=dt.timezone.utc)]
+    monkeypatch.setattr(deadlines, "utc_now", lambda: clock[0])
+    original_persist = substrate.persist_call
+
+    def slow_prompt_persist(drive_root, *, call_type="", **kwargs):
+        if str(call_type).endswith("_prompt"):
+            clock[0] += dt.timedelta(seconds=400)
+        return original_persist(drive_root, call_type=call_type, **kwargs)
+
+    monkeypatch.setattr(substrate, "persist_call", slow_prompt_persist)
+
+    class NeverCalled:
+        calls = 0
+
+        def chat(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("expired review owner deadline must not dispatch")
+
+    llm = NeverCalled()
+    request = ReviewRequest(
+        surface="multi_model_review", goal="review", task_id="late-review",
+        call_type="multi_model_review",
+        deadline_at=(clock[0] + dt.timedelta(seconds=300)).isoformat(),
+    )
+    slot = ReviewSlot(
+        slot_id="slot-1", model="openai/test", route=ReviewRouteKind.API_CHAT,
+        timeout_sec=30,
+    )
+    result = run_review_request(
+        request, slots=[slot], drive_root=tmp_path, llm=llm,
+        usage_ctx=SimpleNamespace(),
+    )
+
+    actor = result.actors[0]
+    assert llm.calls == 0
+    assert actor["operation_state"] == "not_dispatched"
+    assert actor["status"] == "not_dispatched"
+
+
 def test_durable_triad_and_scope_rows_carry_delegated_restart_identity():
     from ouroboros.tools.review import _parse_model_response
     from ouroboros.tools.review_helpers import build_scope_actor_record

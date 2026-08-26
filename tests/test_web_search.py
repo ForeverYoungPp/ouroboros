@@ -564,6 +564,40 @@ def test_spent_owner_deadline_does_not_start_web_search(ctx, patch_env, monkeypa
     assert calls == []
 
 
+def test_web_search_rechecks_owner_deadline_after_client_preparation(
+    ctx, patch_env, monkeypatch, tmp_path,
+):
+    import ouroboros.deadline_utils as deadlines
+
+    clock = [100.0]
+    monkeypatch.setattr(deadlines.time, "time", lambda: clock[0])
+    ctx.deadline_ts = 100.5
+    ctx.task_metadata = {
+        "budget_drive_root": str(tmp_path),
+        "root_task_id": "root-web-prep",
+        "parent_task_id": "parent-web-prep",
+    }
+    calls = []
+
+    class _Responses:
+        def create(self, **_kwargs):
+            calls.append("provider")
+            raise AssertionError("expired preparation must not dispatch search")
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            # Client construction stands in for a slow setup phase.
+            clock[0] = 101.0
+            self.responses = _Responses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+
+    result = json.loads(_web_search(ctx, "expired after setup"))
+
+    assert result["reason_code"] == "deadline_exhausted"
+    assert calls == []
+
+
 def _captured_provider_error(*, provider="openrouter", status=None):
     from ouroboros.usage_accounting import PhysicalAttemptCapture
 

@@ -1346,6 +1346,16 @@ class ReviewCoordinator:
                 response_ref=response_ref,
                 duration_sec=round(time.time() - start, 3),
             )
+        owner_deadline = str(getattr(request, "deadline_at", "") or "")
+        from ouroboros.deadline_utils import owner_deadline_exhausted
+        if owner_deadline_exhausted(deadline_at=owner_deadline):
+            return self._error_actor(
+                request,
+                slot,
+                "Owner deadline exhausted before physical review dispatch",
+                operation_id=call_id,
+                operation_state="not_dispatched",
+            )
         try:
             p3_actor = request.surface in {"multi_model_review", "scope_review"}
             acceptance_actor = request.surface == "task_acceptance"

@@ -21,6 +21,7 @@ from ouroboros.usage_accounting import (
     current_usage_scope,
     mark_dispatched,
     mark_unresolved,
+    release_attempt,
     reserve_attempt,
     settle_attempt,
 )
@@ -80,14 +81,13 @@ def _web_search_transport_timeout(ctx: Any) -> float:
 
 
 def _web_search_deadline_exhausted(ctx: Any) -> bool:
-    from ouroboros.deadline_utils import dispatch_window_remaining_sec
+    from ouroboros.deadline_utils import owner_deadline_exhausted
 
     metadata = getattr(ctx, "task_metadata", {})
     deadline_at = metadata.get("deadline_at") if isinstance(metadata, dict) else None
-    window = dispatch_window_remaining_sec(
+    return owner_deadline_exhausted(
         deadline_at=deadline_at, deadline_ts=getattr(ctx, "deadline_ts", None),
     )
-    return window is not None and window <= 0
 
 
 def _web_search_deadline_result() -> str:
@@ -524,7 +524,6 @@ def _web_search(
                 {"error": f"pinned web_search backend '{pinned}' failed: {detail}", "backend": pinned},
                 ensure_ascii=False, indent=2,
             )
-
     def _fallbacks(previous_errors: list[str] | None = None) -> str:
         errors = list(previous_errors or [])
         if pinned == "openai":
@@ -566,18 +565,15 @@ def _web_search(
             ),
             "backend_errors": errors,
         }, ensure_ascii=False, indent=2)
-
     api_key, base_url, provider, api_key_type = _resolve_openai_client_settings()
     if not api_key:
         return _fallbacks()
-
     active_model = model or os.environ.get("OUROBOROS_WEBSEARCH_MODEL", DEFAULT_SEARCH_MODEL)
     active_context = search_context_size or DEFAULT_SEARCH_CONTEXT_SIZE
     active_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
     reservation = None
     dispatched = False
     explicit_provider_failure = False
-
     try:
         from openai import OpenAI
         from ouroboros.config import get_finalization_grace_sec
@@ -605,6 +601,10 @@ def _web_search(
             category=scope.category,
             source=scope.source,
         ))
+        if _web_search_deadline_exhausted(ctx):
+            release_attempt(reservation, "deadline_exhausted_before_dispatch")
+            reservation = None
+            return _web_search_deadline_result()
         mark_dispatched(reservation)
         dispatched = True
         stream = client.responses.create(

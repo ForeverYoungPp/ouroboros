@@ -22,7 +22,7 @@ from ouroboros import model_concurrency
 from ouroboros.anthropic_native_custody import public_custody_projection
 from ouroboros.config import get_finalization_grace_sec
 from ouroboros.deadline_utils import (
-    dispatch_window_remaining_sec,
+    owner_deadline_exhausted,
     seconds_until,
     transport_timeout_with_deadline,
 )
@@ -386,6 +386,26 @@ def _mark_deadline_not_dispatched(
         "model": model,
         "reason_code": "deadline_exhausted",
     })
+
+
+def _deadline_not_dispatched(
+    deadline_ts: Optional[float], accumulated_usage: Dict[str, Any],
+    drive_logs: pathlib.Path, *, task_id: str, model: str, round_idx: int,
+    event_queue: Optional[queue.Queue] = None, llm_call_id: str = "",
+    task_attempt: Any = None, execution_id: str = "", round_id: str = "",
+) -> bool:
+    if not owner_deadline_exhausted(deadline_ts=deadline_ts):
+        return False
+    if llm_call_id:
+        _emit_llm_operation(
+            event_queue, task_id, llm_call_id, "failed", task_attempt,
+            execution_id, round_id,
+        )
+    _mark_deadline_not_dispatched(
+        accumulated_usage, drive_logs, task_id=task_id, model=model,
+        round_idx=round_idx,
+    )
+    return True
 
 
 @dataclass
@@ -1049,15 +1069,6 @@ def call_llm_with_retry(
     """Call one model with failure-class retry budgets and usage events."""
     msg = None
     drive_root = pathlib.Path(drive_logs).parent
-    if (
-        deadline_ts is not None
-        and dispatch_window_remaining_sec(deadline_ts=deadline_ts) == 0.0
-    ):
-        _mark_deadline_not_dispatched(
-            accumulated_usage, drive_logs, task_id=task_id, model=model,
-            round_idx=round_idx,
-        )
-        return None, None
     execution_id = str(accumulated_usage.setdefault("execution_id", new_execution_id()))
     round_id = f"{execution_id}:round:{round_idx}"
     context_fit_event_fields = (
@@ -1072,6 +1083,11 @@ def call_llm_with_retry(
         accumulated_usage["_task_attempt"] = task_attempt
     response_cache_bypass_requested = False
     for attempt in range(transient_budget):
+        if _deadline_not_dispatched(
+            deadline_ts, accumulated_usage, drive_logs,
+            task_id=task_id, model=model, round_idx=round_idx,
+        ):
+            return None, None
         accumulated_usage["_llm_attempts_used"] = attempt + 1
         llm_call_id = new_call_id("llm")
         request_ref: Dict[str, Any] = {}
@@ -1141,7 +1157,14 @@ def call_llm_with_retry(
                 )
             except Exception:
                 log.debug("Failed to persist LLM request observability payload", exc_info=True)
-            # Vision preparation is outside the Main-only physical binding.
+            if _deadline_not_dispatched(
+                deadline_ts, accumulated_usage, drive_logs,
+                task_id=task_id, model=model, round_idx=round_idx,
+                event_queue=event_queue, llm_call_id=llm_call_id,
+                task_attempt=task_attempt, execution_id=execution_id,
+                round_id=round_id,
+            ):
+                return None, None
             resp_msg, usage = _send_main_candidate(
                 llm, kwargs, model=model, use_local=use_local, deadline_ts=deadline_ts,
                 physical_context=physical_context, candidate_predicate=candidate_predicate,

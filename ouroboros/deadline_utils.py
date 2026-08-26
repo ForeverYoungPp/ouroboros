@@ -129,6 +129,14 @@ def dispatch_window_remaining_sec(
     return max(0.0, remaining - reserve)
 
 
+def owner_deadline_exhausted(*, deadline_at: Any = None, deadline_ts: Any = None) -> bool:
+    """Whether a raw owner deadline forbids a new physical dispatch."""
+    remaining = dispatch_window_remaining_sec(
+        deadline_at=deadline_at, deadline_ts=deadline_ts, reserve_sec=0,
+    )
+    return remaining is not None and remaining <= 0
+
+
 def transport_timeout_with_deadline(
     explicit: Any = None,
     *,

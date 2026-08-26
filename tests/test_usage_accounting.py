@@ -9,6 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import httpx
 
 from ouroboros import usage_accounting as ua
 
@@ -218,6 +219,25 @@ def test_provider_failure_remains_unresolved(data_root):
     projection = ua.usage_projection(data_root)
     assert projection["unresolved_upper_bound_usd"] == 1.0
     assert _ledger(data_root)[-1]["state"] == "unresolved"
+
+
+def test_generic_physical_attempt_releases_typed_connect_failure(data_root):
+    with pytest.raises(httpx.ConnectError):
+        ua.execute_physical_attempt(
+            _request(data_root),
+            lambda: (_ for _ in ()).throw(httpx.ConnectError("connection refused")),
+        )
+    assert (_ledger(data_root)[-1]["state"], _ledger(data_root)[-1]["reason"]) == ("released", "before_dispatch_failed:ConnectError")
+    assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 0.0
+
+
+def test_generic_async_physical_attempt_releases_typed_connect_timeout(data_root):
+    async def send():
+        raise httpx.ConnectTimeout("connection timed out")
+    with pytest.raises(httpx.ConnectTimeout):
+        asyncio.run(ua.execute_physical_attempt_async(_request(data_root), send))
+    assert (_ledger(data_root)[-1]["state"], _ledger(data_root)[-1]["reason"]) == ("released", "before_dispatch_failed:ConnectTimeout")
+    assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 0.0
 
 
 def test_abandoned_attempt_settles_with_the_usage_the_dead_child_reported(data_root, monkeypatch):

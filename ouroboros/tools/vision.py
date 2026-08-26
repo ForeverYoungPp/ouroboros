@@ -16,7 +16,7 @@ from ouroboros.config import (
     get_vision_caption_timeout_sec,
     resolve_effort,
 )
-from ouroboros.deadline_utils import dispatch_window_remaining_sec, transport_timeout_with_deadline
+from ouroboros.deadline_utils import owner_deadline_exhausted, transport_timeout_with_deadline
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.usage_accounting import current_usage_scope
 from ouroboros.utils import emit_cognitive_operation_event
@@ -35,12 +35,10 @@ def _vision_timeout_for_context(ctx: Any) -> float:
         reserve = effective_finalization_reserve_sec(ctx)
     except Exception:
         reserve = 0
-    dispatch_window = dispatch_window_remaining_sec(
-        deadline_at=deadline_at,
-        deadline_ts=deadline_ts,
-        reserve_sec=0,
-    )
-    if dispatch_window is not None and dispatch_window <= 0:
+    # Admission uses the raw owner deadline. The provider/child/finalization
+    # reserve remains a transport-and-settlement bound after admission.
+    transport_reserve = reserve + (2 * NESTED_SETTLEMENT_MARGIN_SEC)
+    if owner_deadline_exhausted(deadline_at=deadline_at, deadline_ts=deadline_ts):
         raise TimeoutError(
             "insufficient owner-deadline window for VLM provider and settlement custody"
         )
@@ -48,7 +46,7 @@ def _vision_timeout_for_context(ctx: Any) -> float:
         get_vision_caption_timeout_sec(),
         deadline_at=deadline_at,
         deadline_ts=deadline_ts,
-        reserve_sec=reserve + (2 * NESTED_SETTLEMENT_MARGIN_SEC),
+        reserve_sec=transport_reserve,
     )
     return timeout
 

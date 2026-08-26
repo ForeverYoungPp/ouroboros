@@ -96,6 +96,34 @@ def test_spent_main_deadline_does_not_dispatch_or_fallback(tmp_path):
     assert usage["reason_code"] == "deadline_exhausted"
 
 
+def test_main_deadline_is_rechecked_after_slow_message_preparation(tmp_path, monkeypatch):
+    import ouroboros.deadline_utils as deadlines
+    import ouroboros.loop_llm_call as loop_call
+
+    clock = [100.0]
+    monkeypatch.setattr(deadlines.time, "time", lambda: clock[0])
+
+    def slow_prepare(messages, **_kwargs):
+        clock[0] = 101.0
+        return messages
+
+    monkeypatch.setattr(loop_call, "_prepare_main_messages", slow_prepare)
+
+    class NeverCalled:
+        def chat(self, **_kwargs):
+            raise AssertionError("preparation-expired owner deadline must not dispatch")
+
+    usage = {}
+    message, cost = loop_call.call_llm_with_retry(
+        NeverCalled(), [{"role": "user", "content": "x"}], "openai/gpt-5.5",
+        None, "high", 1, tmp_path / "logs", "deadline-prep", 1, None, usage,
+        deadline_ts=100.5,
+    )
+
+    assert message is None and cost is None
+    assert usage["reason_code"] == "deadline_exhausted"
+
+
 def test_nested_logical_window_reserves_finalization_grace():
     from ouroboros.deadline_utils import logical_operation_timeout_sec
 

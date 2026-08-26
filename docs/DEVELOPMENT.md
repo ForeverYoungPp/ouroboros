@@ -1751,7 +1751,11 @@ Before every commit, verify the following:
   finalization reserve is spent, an unstarted review row is a typed `$0
   not_dispatched` actor: no worker, paid stamp, or active lease is created.
   A commit attempt cannot treat an in-flight reviewer as a final quorum verdict,
-  including under advisory enforcement.
+  including under advisory enforcement. Plan review applies the same rule: if a
+  paid actor remains in flight, the wave is projected as the existing open
+  `DEGRADED` state with `review_late_result_pending`, even when the settled
+  responses already meet the arithmetic quorum; the counts remain factual, but
+  the wave cannot close until custody settles.
 - [ ] A returned provider response (including an empty/incomplete body) or typed
   terminal 408/429/5xx is settled and may use the surface's bounded retry/repair
   rail. A dispatched request whose socket or stream ends without terminal
