@@ -1070,7 +1070,15 @@ def _on_finished(
         if replayed_from_ts:
             payload["replayed_from_ts"] = replayed_from_ts
         atomic_write_json(review_job_state_path(drive_root, skill_name), payload, trailing_newline=True)
-        history_status = review_status if result is not None else state_status
+        # Lifecycle completion is not a semantic review verdict.  A runner can
+        # finish without returning a result (for example after an in-process
+        # handoff), so never let the lifecycle word ``completed`` paint a
+        # review green before a typed verdict exists.  Failure/cancellation
+        # states remain useful terminal facts when there is no result to carry
+        # the review status.
+        history_status = review_status
+        if result is None and state_status not in {"completed", "succeeded"}:
+            history_status = state_status
         _append_terminal_history(
             drive_root,
             skill_name,

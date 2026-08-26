@@ -427,6 +427,31 @@ test('review tones use an explicit success allowlist', () => {
     assert.equal(pending.activeCount, 1);
 });
 
+test('lifecycle completion stays neutral until a semantic review verdict arrives', () => {
+    const lifecycle = reviewGroupFromLifecycle({ lifecycle: {
+        kind: 'review', status: 'succeeded', target: 'alpha', job_id: 'job-live',
+        group_id: 'task:root:alpha', presentation_owner_task_id: 'root',
+    } });
+    assert.equal(lifecycle.state, 'terminal');
+    assert.equal(lifecycle.tone, 'neutral');
+    assert.equal(lifecycle.verdict, '');
+    assert.equal(lifecycle.attempts[0].lifecycleOnly, true);
+    assert.match(lifecycle.attempts[0].summary, /verdict unavailable/i);
+
+    const store = new Map();
+    const history = reviewGroupFromHistoryRow(groupedSkillRow());
+    mergeReviewGroup(store, history);
+    const late = reviewGroupFromLifecycle({ lifecycle: {
+        kind: 'review', status: 'succeeded', target: 'alpha', job_id: 'job-2',
+        group_id: 'task:root:alpha', presentation_owner_task_id: 'root',
+    } });
+    const merged = mergeReviewGroup(store, late);
+    assert.equal(merged.verdict, 'clean');
+    assert.equal(merged.tone, 'done');
+    assert.equal(merged.attempts.at(-1).verdict, 'clean');
+    assert.equal(merged.attempts.at(-1).tone, 'done');
+});
+
 test('task acceptance adapts only task_acceptance panels; advisory and commit stay omitted', () => {
     const detail = {
         task_id: 'root',

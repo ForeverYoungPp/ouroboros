@@ -983,3 +983,38 @@ def test_cancel_and_timeout_each_write_one_idempotent_terminal_row(tmp_path):
         assert len(rows) == 1
         assert rows[0]["status"] == expected_status
         assert rows[0]["job_id"] == expected_job
+
+
+def test_success_without_typed_verdict_stays_pending_in_history(tmp_path):
+    """Lifecycle success is not a review verdict when the result omits one."""
+    import json
+
+    from ouroboros.skill_lifecycle_queue import LifecycleJob
+    from ouroboros.skill_review_runner import (
+        _on_finished,
+        _on_started,
+        review_job_state_path,
+    )
+
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir()
+    started = {}
+    provenance = {
+        "group_id": "manual:alpha", "source": "skills", "task_id": "",
+        "root_task_id": "", "chat_id": 0,
+    }
+    job = LifecycleJob(id="success-job", kind="review", target="alpha")
+    job.status = "running"
+    _on_started(drive_root, "alpha", "hash-a", started, provenance)(job)
+    job.status = "succeeded"
+    _on_finished(drive_root, "alpha", "hash-a", started)(job, None, None)
+
+    state = json.loads(review_job_state_path(drive_root, "alpha").read_text())
+    assert state["status"] == "completed"
+    assert state["review_status"] == "pending"
+    history = [
+        json.loads(line)
+        for line in (drive_root / "state/skills/alpha/review_history.jsonl").read_text().splitlines()
+    ]
+    assert history[0]["status"] == "pending"
+    assert history[0]["job_status"] == "succeeded"

@@ -23,6 +23,10 @@ const TERMINAL_STATES = new Set([
     ...SUCCESS_STATES, 'terminal',
     ...ERROR_STATES, ...WARNING_STATES,
 ]);
+// These values belong to the lifecycle of the review job, not to the
+// review's semantic verdict.  Keep them terminal for activity purposes while
+// preventing a live lifecycle frame from looking like a verified PASS.
+const LIFECYCLE_TERMINAL_STATES = new Set(['succeeded', 'success', 'completed']);
 
 const text = (value) => String(value ?? '').trim();
 const finiteCount = (value) => {
@@ -37,6 +41,7 @@ function normalizedState(value, fallback = 'unavailable') {
         if (state === 'pending') return 'queued';
         return state === 'open' || state === 'working' ? 'running' : state;
     }
+    if (LIFECYCLE_TERMINAL_STATES.has(state)) return 'terminal';
     if (TERMINAL_STATES.has(state)) return 'terminal';
     if (state === 'unavailable' || state === 'absent') return 'unavailable';
     if (state === 'superseded') return 'superseded';
@@ -93,8 +98,17 @@ function normalizeSkillAttempt(attempt, defaults = {}, ordinal = 0) {
         text(attempt.snapshot_attempt), String(ordinal + 1),
     ].join(':'));
     if (!id) return null;
-    const rawStatus = text(attempt.status || attempt.job_status || defaults.status);
-    const state = normalizedState(rawStatus, defaults.state || 'unavailable');
+    const lifecycleStatus = text(attempt.lifecycle_status || attempt.job_status);
+    const explicitStatus = text(
+        attempt.review_status || attempt.review_verdict || attempt.status || defaults.status,
+    );
+    const lifecycleOnly = attempt.lifecycle_only === true
+        || (!attempt.review_status && !attempt.review_verdict
+            && LIFECYCLE_TERMINAL_STATES.has(explicitStatus.toLowerCase()));
+    const rawStatus = lifecycleOnly ? '' : explicitStatus;
+    const state = lifecycleOnly
+        ? normalizedState(lifecycleStatus || explicitStatus, defaults.state || 'unavailable')
+        : normalizedState(rawStatus, defaults.state || 'unavailable');
     return {
         id,
         surface: 'skill',
@@ -107,7 +121,8 @@ function normalizeSkillAttempt(attempt, defaults = {}, ordinal = 0) {
             attempt.review_round != null ? `round ${attempt.review_round}` : '',
             attempt.snapshot_attempt != null ? `attempt ${attempt.snapshot_attempt}` : '',
         ].filter(Boolean).join(' · ') || `attempt ${ordinal + 1}`,
-        summary: text(attempt.summary || attempt.text || attempt.terminal_reason || attempt.error),
+        summary: text(attempt.summary || attempt.text || attempt.terminal_reason || attempt.error)
+            || (lifecycleOnly ? 'Review verdict unavailable.' : ''),
         superseded: Boolean(attempt.superseded),
         replayed: Boolean(attempt.replayed || attempt.replay || attempt.replay_of || attempt.replayed_from_ts),
         revised: Boolean(attempt.snapshot_revised || attempt.revised_snapshot || attempt.revised),
@@ -116,6 +131,7 @@ function normalizeSkillAttempt(attempt, defaults = {}, ordinal = 0) {
         ),
         executions: normalizedExecutions(attempt.executions, attempt.execution),
         execution: attempt.execution && typeof attempt.execution === 'object' ? attempt.execution : null,
+        lifecycleOnly,
         detailRef: skill && jobId ? { surface: 'skill', skill, jobId } : null,
         detailText: '',
     };
@@ -126,9 +142,20 @@ function normalizeSkillGroup(group, row = {}, { allowRowTaskIdFallback = true } 
     const id = text(group.id || group.group_id);
     const ownerTaskId = text(group.presentation_owner_task_id);
     if (!id || !ownerTaskId) return null;
+    const groupStatus = text(group.status);
+    const lifecycleStatus = text(group.lifecycle_status || groupStatus || row.status);
+    const groupVerdict = text(group.verdict);
+    const lifecycleOnly = group.lifecycle_only === true
+        || (!group.review_status && !group.verdict
+            && LIFECYCLE_TERMINAL_STATES.has(lifecycleStatus.toLowerCase()))
+        || (!group.review_status && !group.review_verdict
+            && groupVerdict.toLowerCase() === lifecycleStatus.toLowerCase()
+            && LIFECYCLE_TERMINAL_STATES.has(lifecycleStatus.toLowerCase()));
     const defaults = {
         skill: text(group.skill || row.skill),
-        status: text(group.status || row.status),
+        status: lifecycleOnly
+            ? text(group.review_status || group.review_verdict)
+            : text(group.review_status || group.verdict || group.status || row.status),
         state: normalizedState(group.state || group.status || row.status),
         initiatorTaskId: text(
             group.initiator_task_id || group.origin_task_id || row.origin_task_id
@@ -144,11 +171,15 @@ function normalizeSkillGroup(group, row = {}, { allowRowTaskIdFallback = true } 
             ...row,
             ...group,
             job_id: group.job_id || row.job_id || group.lifecycle_id,
+            lifecycle_only: lifecycleOnly,
         }, defaults, 0);
         if (fallback) attempts.push(fallback);
     }
     const latest = attempts[attempts.length - 1] || null;
-    const state = normalizedState(group.state || group.status || latest?.state, latest?.state || 'unavailable');
+    const state = normalizedState(
+        group.state || group.lifecycle_status || group.status || latest?.state,
+        latest?.state || 'unavailable',
+    );
     const projectedCount = finiteCount(group.projected_attempt_count);
     const count = projectedCount ?? attempts.length;
     return {
@@ -160,9 +191,17 @@ function normalizeSkillGroup(group, row = {}, { allowRowTaskIdFallback = true } 
         subjectTaskId: text(group.subject_task_id),
         initiatorTaskId: uniformAttemptInitiator(attempts, defaults.initiatorTaskId),
         state,
-        tone: statusTone(state, group.verdict || group.status || latest?.verdict),
-        verdict: text(group.verdict || group.status || latest?.verdict),
-        summary: text(group.summary || latest?.summary),
+        tone: statusTone(
+            state,
+            lifecycleOnly ? text(group.review_status || group.review_verdict || latest?.verdict)
+                : text(group.verdict || group.review_status || group.status || latest?.verdict),
+        ),
+        verdict: lifecycleOnly
+            ? text(group.review_status || group.review_verdict || latest?.verdict)
+            : text(group.verdict || group.review_status || group.status || latest?.verdict),
+        summary: text(group.summary || latest?.summary)
+            || (lifecycleOnly ? 'Review verdict unavailable.' : ''),
+        lifecycleOnly,
         activeCount: finiteCount(group.active_count) ?? (state === 'queued' || state === 'running' ? 1 : 0),
         attemptCount: Math.max(count, attempts.length),
         countIsAuthoritative: group.count_is_authoritative === true,
@@ -185,6 +224,8 @@ export function classifyReviewLifecycle(row) {
         return { classification: 'source_incomplete', group: null };
     }
     const status = text(lifecycle.status || lifecycle.phase || 'queued');
+    const reviewStatus = text(lifecycle.review_status || lifecycle.review_verdict);
+    const lifecycleOnly = !reviewStatus;
     const group = normalizeSkillGroup({
         surface: 'skill',
         id: groupId,
@@ -193,14 +234,20 @@ export function classifyReviewLifecycle(row) {
         initiator_task_id: lifecycle.initiator_task_id || lifecycle.origin_task_id,
         skill: lifecycle.target || lifecycle.skill,
         state: status,
-        status,
+        status: reviewStatus,
+        review_status: reviewStatus,
+        lifecycle_status: status,
+        lifecycle_only: lifecycleOnly,
         active_count: ['pending', 'queued', 'running'].includes(status.toLowerCase()) ? 1 : 0,
         projected_attempt_count: lifecycle.projected_attempt_count ?? (lifecycle.job_id || lifecycle.id ? 1 : 0),
         count_is_authoritative: lifecycle.count_is_authoritative === true,
         attempts: lifecycle.job_id || lifecycle.id ? [{
             ...lifecycle,
             job_id: lifecycle.job_id || lifecycle.id,
-            status,
+            status: reviewStatus,
+            review_status: reviewStatus,
+            lifecycle_status: status,
+            lifecycle_only: lifecycleOnly,
         }] : [],
     }, row, { allowRowTaskIdFallback: false });
     return {
@@ -231,6 +278,8 @@ export function classifyReviewLifecyclePointer(row) {
         return { classification: 'source_incomplete', group: null };
     }
     const status = text(pointer.status || 'queued');
+    const reviewStatus = text(pointer.review_status || pointer.review_verdict);
+    const lifecycleOnly = !reviewStatus;
     const initiatorTaskId = text(pointer.initiator_task_id || pointer.origin_task_id);
     const group = normalizeSkillGroup({
         surface: 'skill',
@@ -240,14 +289,20 @@ export function classifyReviewLifecyclePointer(row) {
         initiator_task_id: initiatorTaskId,
         skill: pointer.target || pointer.skill,
         state: status,
-        status,
+        status: reviewStatus,
+        review_status: reviewStatus,
+        lifecycle_status: status,
+        lifecycle_only: lifecycleOnly,
         active_count: ['pending', 'queued', 'running'].includes(status.toLowerCase()) ? 1 : 0,
         projected_attempt_count: pointer.projected_attempt_count ?? (pointer.job_id ? 1 : 0),
         count_is_authoritative: pointer.count_is_authoritative === true,
         attempts: pointer.job_id ? [{
             ...pointer,
             initiator_task_id: initiatorTaskId,
-            status,
+            status: reviewStatus,
+            review_status: reviewStatus,
+            lifecycle_status: status,
+            lifecycle_only: lifecycleOnly,
         }] : [],
     }, row, { allowRowTaskIdFallback: false });
     return {
@@ -508,9 +563,23 @@ export function mergeReviewGroup(store, incoming) {
         // Attempt ids are immutable domain references. A delayed lifecycle row
         // for the same attempt may arrive after its terminal history row, but
         // it cannot make that physical attempt non-terminal again.
-        const mergedAttempt = previousTerminal && incomingActive
+        let mergedAttempt = previousTerminal && incomingActive
             ? { ...attempt, ...previous }
             : { ...(previous || {}), ...attempt };
+        // A lifecycle terminal frame can arrive after the domain history row
+        // for the same attempt.  It contributes timing/execution facts, but
+        // its `succeeded`/`completed` word is not a review verdict and must
+        // not erase an already-proved semantic result.
+        if (attempt.lifecycleOnly && previous?.verdict) {
+            mergedAttempt = {
+                ...mergedAttempt,
+                state: previous.state,
+                tone: previous.tone,
+                verdict: previous.verdict,
+                summary: previous.summary || attempt.summary,
+                lifecycleOnly: false,
+            };
+        }
         mergedById.set(attempt.id, mergedAttempt);
         if (incomingActive && previousTerminal) hasStaleActiveAttempt = true;
         if (incomingActive && !previousTerminal && !previous) introducedActiveAttempt = true;
@@ -553,6 +622,14 @@ export function mergeReviewGroup(store, incoming) {
         attempts: order.map((id) => mergedById.get(id)).filter(Boolean),
         attemptCount: Math.max(prior.attemptCount || 0, incoming.attemptCount || 0, mergedById.size),
     };
+    if (incoming.lifecycleOnly && prior.verdict) {
+        // Keep the domain result while accepting the lifecycle frame's
+        // terminal state and any newly observed execution metadata.
+        merged.verdict = prior.verdict;
+        merged.tone = prior.tone;
+        merged.summary = prior.summary || incoming.summary;
+        merged.lifecycleOnly = false;
+    }
     if (staleActiveRegression) {
         merged.state = prior.state;
         merged.tone = prior.tone;
@@ -686,7 +763,9 @@ export function createReviewHydrator({ fetchDetail, applyDetail } = {}) {
 function attemptMeta(attempt) {
     return [
         attempt.timestamp,
-        attempt.verdict,
+        attempt.verdict || (attempt.lifecycleOnly
+            ? (['queued', 'running'].includes(attempt.state) ? attempt.state : 'review verdict unavailable')
+            : ''),
         attempt.superseded ? 'superseded' : '',
         attempt.replayed ? 'replay' : '',
         attempt.revised ? 'revised snapshot' : '',
@@ -812,7 +891,9 @@ export function renderReviewsSection(groupsInput, disclosure = {}) {
                         <span class="chat-review-group-label">${escapeHtmlText(group.label)}</span>
                         ${group.subject ? `<span class="chat-review-subject">${escapeHtmlText(group.subject)}</span>` : ''}
                     </span>
-                    <span class="chat-review-group-meta">${escapeHtmlText([group.verdict || group.state, shown].filter(Boolean).join(' · '))}</span>
+                    <span class="chat-review-group-meta">${escapeHtmlText([group.verdict || (group.lifecycleOnly
+                        ? (['queued', 'running'].includes(group.state) ? group.state : 'review verdict unavailable')
+                        : group.state), shown].filter(Boolean).join(' · '))}</span>
                 </button>
                 <div class="chat-review-attempts"${groupExpanded ? '' : ' hidden'}>
                     <div class="chat-review-group-cost">Cost unavailable</div>
