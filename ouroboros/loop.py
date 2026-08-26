@@ -3505,12 +3505,16 @@ def _handle_owner_stop_finalization(
     )
 
 
-def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Provider-death terminalization; rationale lives in task_finalization."""
+def _handle_provider_unavailable(
+    ctx: _RoundLimitContext, *, error_kind: str = "provider_unavailable",
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Salvage a provider interruption, or a context overflow, truthfully."""
+    is_context_overflow = str(error_kind or "") == "context_overflow"
+    llm_trace = getattr(ctx, "llm_trace", None)
+    llm_trace = llm_trace if isinstance(llm_trace, dict) else {}
     candidate = _live_delivery_candidate(ctx)
     salvaged = candidate.full_text if candidate is not None else _last_assistant_text(ctx.messages)
     if candidate is None and not salvaged and ctx.drive_root is not None:
-        # Compaction may hide the last text; persisted LLM output remains custody.
         try:
             from ouroboros.observability import latest_llm_response_text
             salvaged = latest_llm_response_text(pathlib.Path(ctx.drive_root), ctx.task_id) or ""
@@ -3520,10 +3524,30 @@ def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str
         fallback = salvaged
     else:
         fallback = (
+            "⚠️ The context exceeded the selected model window; no further provider call was made. "
+            "Any files written so far are preserved in the workspace."
+            if is_context_overflow else
             "⚠️ The model provider returned no usable response after retries and same-model reroute."
             f"{_provider_failure_hint(ctx.accumulated_usage)}{_provider_recovery_hint(ctx.accumulated_usage)} "
             "Any files written so far are preserved in the workspace."
         )
+    if is_context_overflow:
+        # A context overflow is a provider-confirmed request-shape failure.
+        # Keep this rail local: a forced semantic call would resend the same
+        # oversized payload, spend another attempt, and blur overflow with an
+        # outage. The candidate/source custody still records useful work;
+        # the usage fields below preserve the infra failure for acceptance.
+        # The typed overflow fact remains terminally visible to acceptance and review.
+        text, usage, llm_trace = _forced_fallback_result(
+            ctx, llm_trace, fallback, "context_overflow",
+            source="context_overflow_local_salvage",
+        )
+        usage.update(
+            execution_status=RESULT_INFRA_FAILED,
+            reason_code="llm_api_error",
+            _last_llm_error_kind="context_overflow",
+        )
+        return text, usage, llm_trace
     prompt = (
         "[PROVIDER_UNAVAILABLE] The model provider failed to return a usable response. "
         "The task is being INTERRUPTED by this outage, not completed. Summarize the "
@@ -6878,6 +6902,7 @@ def run_llm_loop(
                 task_id, round_idx, event_queue, accumulated_usage, task_type,
                 active_use_local, MAX_ROUNDS, drive_root=drive_root,
                 incoming_messages=incoming_messages, owner_msg_seen=_owner_msg_seen,
+                llm_trace=llm_trace,
             )
             _finalize_limit_ctx(limit_ctx, tools, llm_trace)
             if round_idx > MAX_ROUNDS:
@@ -6959,7 +6984,8 @@ def run_llm_loop(
             )
             tools._ctx._current_llm_call_meta = dict(accumulated_usage.get("_last_llm_call_meta") or {})
 
-            if msg is None and not bool(getattr(ctx, "exact_model_route", False)):
+            last_error_kind = str(accumulated_usage.get("_last_llm_error_kind") or "")
+            if msg is None and last_error_kind != "context_overflow" and not bool(getattr(ctx, "exact_model_route", False)):
                 (
                     msg,
                     active_model,
@@ -6975,7 +7001,10 @@ def run_llm_loop(
                     active_context_mode=active_context_mode)
             if msg is None:
                 # Exact actor routes skip generic substitution and fail as infrastructure.
-                text, accumulated_usage, forced_trace = _handle_provider_unavailable(limit_ctx)
+                text, accumulated_usage, forced_trace = _handle_provider_unavailable(
+                    limit_ctx,
+                    error_kind=str(accumulated_usage.get("_last_llm_error_kind") or "provider_unavailable"),
+                )
                 _merge_finalization_trace(llm_trace, forced_trace)
                 return text, accumulated_usage, llm_trace
 

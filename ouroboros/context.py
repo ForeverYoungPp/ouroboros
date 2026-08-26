@@ -546,25 +546,15 @@ def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
 
 def _task_authority_projection(env: Any, task: Dict[str, Any]) -> Dict[str, Any]:
     """Exact active task/origin/plan authority, before route-specific fitting."""
-    projection: Dict[str, Any] = {}
-    if isinstance(task.get("task_contract"), dict):
-        projection["task_contract"] = task.get("task_contract")
-    origin_ref, origin_text = task.get("origin_message_ref"), task.get("origin_message_text")
-    if isinstance(origin_ref, dict) and origin_ref:
-        projection["task_authority_origin"] = {
-            "ref": dict(origin_ref),
-            **({"text": origin_text} if isinstance(origin_text, str) and origin_text else {}),
-        }
-    if isinstance(task.get("predecessor_authority"), dict):
-        projection["predecessor_authority"] = task.get("predecessor_authority")
-    if isinstance(task.get("authority_historical_gaps"), list):
-        projection["authority_historical_gaps"] = task.get("authority_historical_gaps")
-    task_id = str(task.get("id") or "").strip()
-    if not task_id:
-        return projection
     canonical_root = pathlib.Path(
         task.get("budget_drive_root") or getattr(env, "budget_drive_root", None) or env.drive_root
     )
+    from ouroboros.main_context_authority import project_main_task_authority
+
+    projection = project_main_task_authority(task, drive_root=canonical_root)
+    task_id = str(task.get("id") or "").strip()
+    if not task_id:
+        return projection
     source = {
         "tool": "get_task_result",
         "arguments": {"task_id": task_id, "include_authority": True},
