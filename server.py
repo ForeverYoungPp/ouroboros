@@ -990,7 +990,16 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
         wedged_task = None
         while not _restart_requested.is_set() and not (stop_event is not None and stop_event.is_set()):
             time.sleep(interval)
-            now = time.time()
+            # TWO clocks, deliberately: each half must read the SAME clock its own
+            # stamps were taken on. The liveness tick is monotonic (it measures an
+            # elapsed gap, and a wall-clock jump — NTP step, DST/timezone change,
+            # manual set, VM resume — must neither fabricate a stall nor mask one),
+            # while the chat-turn wedge compares against ``agent._last_activity_ts``,
+            # a WALL stamp (agent.py). Feeding a monotonic ``now`` into that half
+            # would make ``now - turn_ts`` hugely negative and silently disable wedge
+            # detection forever. Do not collapse these back into one variable.
+            now = time.monotonic()
+            now_wall = time.time()
             # (1) Supervisor loop stall — new-message intake starvation.
             if _supervisor_loop_stalled(liveness[0], now, deadline):
                 if not loop_alerted:
@@ -1030,9 +1039,9 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
                 busy, turn_task, turn_ts = chat_turn_liveness()
             except Exception:
                 busy, turn_task, turn_ts = (False, None, None)
-            if _chat_turn_wedged(busy, turn_ts, now, deadline):
+            if _chat_turn_wedged(busy, turn_ts, now_wall, deadline):
                 if wedged_task != turn_task:  # alert once per wedged turn
-                    _alert_chat_turn_wedge(turn_task, now - (turn_ts or now))
+                    _alert_chat_turn_wedge(turn_task, now_wall - (turn_ts or now_wall))
                     wedged_task = turn_task
             elif not busy:
                 wedged_task = None
@@ -2187,13 +2196,15 @@ def _run_supervisor(settings: dict) -> None:
     _last_review_job_reconcile = [time.time()]
     # WS3: a dedicated watchdog thread (outside this loop, so it fires even if the
     # loop stalls) surfaces a wedge as an observable signal + owner alert instead
-    # of silent hours; the loop publishes a liveness tick each iteration.
-    _loop_liveness = [time.time()]
+    # of silent hours; the loop publishes a liveness tick each iteration. The tick
+    # is MONOTONIC: it is only ever read as an elapsed gap, so a wall-clock jump
+    # must not turn a healthy loop into a phantom stall (nor hide a real one).
+    _loop_liveness = [time.monotonic()]
     _watchdog_stop = threading.Event()  # per-generation: stops the watchdog when THIS loop exits
     _start_supervisor_liveness_watchdog(_loop_liveness, _watchdog_stop)
     while not _restart_requested.is_set():
         try:
-            _loop_liveness[0] = time.time()
+            _loop_liveness[0] = time.monotonic()
             rotate_chat_log_if_needed(DATA_DIR)
             # progress.jsonl rotates on the same supervisor tick (v6.90.x P2); its
             # readers (history backfill, SSE replay, api_logs_tail, TB ATIF) are
