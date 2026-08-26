@@ -382,6 +382,25 @@ from ouroboros.context_budget import (  # one overflow vocabulary for every seam
     context_overflow_message as _context_overflow_message,
     output_or_body_size_message as _output_or_body_size_message,
 )
+_FORCED_INCOMPLETE_FINISH_REASONS = _STRUCTURED_CONTEXT_OVERFLOW_CODES | frozenset({
+    "length", "max_tokens", "tool_calls", "function_call", "tool_use",
+})
+
+
+def forced_response_is_incomplete(response_meta: Optional[Dict[str, Any]]) -> bool:
+    """Return whether a forced provider response is not a complete final."""
+    if not isinstance(response_meta, dict):
+        return False
+    finish_reason = response_meta.get("finish_reason")
+    return bool(response_meta.get("tool_call_count")) or (
+        response_meta.get("finish_reason_present") is True
+        and (
+            finish_reason is None
+            or str(finish_reason).strip().lower() in _FORCED_INCOMPLETE_FINISH_REASONS
+        )
+    )
+
+
 _NON_RETRYABLE_PROVIDER_MARKERS = {
     "quota_exhausted": (
         "insufficient credits",
@@ -532,7 +551,45 @@ def _exception_provider_code(exc: Exception, safe_error: str) -> str:
     for value in values:
         if value.lower() in _RETRYABLE_PROVIDER_CODES:
             return value
-    return next((value for value in values if not value.isdigit()), "")
+    generic_bad_request_wrappers = {
+        "badrequest",
+        "badrequesterror",
+        "invalidrequest",
+        "invalidrequesterror",
+        "error",
+    }
+    for value in values:
+        normalized = value.lower().replace("_", "").replace("-", "").replace(" ", "")
+        if (
+            not value.isdigit()
+            and normalized not in generic_bad_request_wrappers
+            and _provider_code_kind(value)
+        ):
+            return value
+    # A response body that repeats only the generic numeric 400 is not a
+    # provider-specific code. Leave it empty so its message can classify the
+    # actual context/output failure; attr-only numeric codes stay available.
+    body = _exception_body(exc)
+    body_values: List[str] = []
+    if isinstance(body, dict):
+        for key in ("code", "type"):
+            value = str(body.get(key) or "").strip()
+            if value:
+                body_values.append(value)
+        nested = body.get("error")
+        if isinstance(nested, dict):
+            for key in ("code", "type"):
+                value = str(nested.get(key) or "").strip()
+                if value:
+                    body_values.append(value)
+    if body_values and all(
+        value == "400"
+        or value.lower().replace("_", "").replace("-", "").replace(" ", "")
+        in generic_bad_request_wrappers
+        for value in body_values
+    ):
+        return ""
+    return values[0] if values else ""
 
 
 def _exception_provider_message(exc: Exception, safe_error: str = "") -> str:
@@ -560,8 +617,12 @@ def _provider_code_kind(provider_code: str) -> str:
     if not code:
         return ""
     for kind, markers in _NON_RETRYABLE_PROVIDER_MARKERS.items():
-        if code == kind or any(code == str(marker).lower() or str(marker).lower() in code for marker in markers):
+        if code == kind:
             return kind
+        for marker in markers:
+            normalized = str(marker).lower()
+            if code == normalized or (not normalized.isdigit() and normalized in code):
+                return kind
     return ""
 
 
@@ -593,7 +654,13 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
     if provider_code.lower() in _STRUCTURED_CONTEXT_OVERFLOW_CODES:
         return LlmErrorClassification("context_overflow", False, status_code, provider_code)
     provider_kind = _provider_code_kind(provider_code)
-    if provider_kind:
+    # Named codes and numeric auth/quota codes are typed authority. Only a
+    # numeric code that maps to generic bad_request defers to the semantic body
+    # classifiers below, which can distinguish output/context failures.
+    generic_numeric_bad_request = (
+        provider_kind == "bad_request" and provider_code == "400"
+    )
+    if provider_kind and not generic_numeric_bad_request:
         return LlmErrorClassification(provider_kind, False, status_code, provider_code)
     if provider_code.lower() in _RETRYABLE_PROVIDER_CODES:
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
@@ -605,6 +672,8 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
         return LlmErrorClassification("request_too_large", False, status_code, provider_code)
     if _is_context_overflow_error(exc, classification_text):
         return LlmErrorClassification("context_overflow", False, status_code, provider_code)
+    if provider_kind:
+        return LlmErrorClassification(provider_kind, False, status_code, provider_code)
     for kind, markers in _NON_RETRYABLE_PROVIDER_MARKERS.items():
         if any(marker in low for marker in markers):
             return LlmErrorClassification(kind, False, status_code, provider_code)
@@ -937,6 +1006,32 @@ def _clear_custom_receipts(accumulated_usage: Dict[str, Any]) -> None:
     accumulated_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, None)
 
 
+def _replace_response_meta(
+    target: Optional[Dict[str, Any]],
+    usage: Optional[Dict[str, Any]] = None,
+    msg: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Replace one caller-owned, attempt-local response fact projection."""
+    if target is None:
+        return
+    target.clear()
+    if usage is None or msg is None:
+        return
+    if "response_finish_reason" in usage:
+        finish_present, finish_reason = True, usage.get("response_finish_reason")
+    elif "finish_reason" in msg:
+        finish_present, finish_reason = True, msg.get("finish_reason")
+    elif "stop_reason" in msg:
+        finish_present, finish_reason = True, msg.get("stop_reason")
+    else:
+        finish_present, finish_reason = False, None
+    target.update({
+        "finish_reason_present": finish_present,
+        "finish_reason": finish_reason,
+        "tool_call_count": len(msg.get("tool_calls") or []),
+    })
+
+
 def call_llm_with_retry(
     llm: LLMClient,
     messages: List[Dict[str, Any]],
@@ -956,13 +1051,11 @@ def call_llm_with_retry(
     allow_server_web_search: bool = False,
     physical_context: Optional[PhysicalAttemptContext] = None,
     candidate_predicate: Optional[Callable[[Any], Any]] = None,
+    response_meta_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
-    """Call one model with failure-class retry budgets and usage events.
-
-    ``deadline_ts`` bounds backoff, ``attempt_cap`` caps fallback candidates,
-    and cross-model fallback remains the caller's responsibility.
-    """
+    """Call one model with bounded retries; cross-model fallback stays caller-owned."""
     msg = None
+    _replace_response_meta(response_meta_out)
     drive_root = pathlib.Path(drive_logs).parent
     execution_id = str(accumulated_usage.setdefault("execution_id", new_execution_id()))
     round_id = f"{execution_id}:round:{round_idx}"
@@ -1111,6 +1204,7 @@ def call_llm_with_retry(
 
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
+            _replace_response_meta(response_meta_out, usage, msg)
             if not tool_calls and (not content or not content.strip()):
                 event_type, is_provider_glitch, permanent_body_error = _record_and_emit_empty_response(
                     usage=usage, msg=msg, accumulated_usage=accumulated_usage, event_queue=event_queue,

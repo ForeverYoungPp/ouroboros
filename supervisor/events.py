@@ -35,6 +35,7 @@ from ouroboros.outcomes import infra_failed_axes, normalize_outcome_axes
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.subagents import intended_lane as intended_subagent_lane
 from ouroboros.subagent_messages import subagent_message_meta
+from ouroboros.task_finalization import send_provider_death_notice
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
 
 log = logging.getLogger(__name__)
@@ -1655,12 +1656,10 @@ def _maybe_notify_provider_death(
         # Promise only what works: the resume endpoint serves budget-paused
         # PENDING tasks (task_lifecycle.resume_budget_paused_task), never a
         # failed terminal — "resume" here was a false owner promise.
-        ctx.send_with_budget(
-            notify_chat,
-            f"🔌 Task {task_id} was stopped by a model-provider outage and was "
-            "NOT completed. Partial work and workspace files are preserved; "
-            "re-run the task once the provider recovers.",
-        )
+        if not send_provider_death_notice(
+            ctx, notify_chat, task_id, final_task_result,
+        ):
+            return
     except Exception:
         log.warning(
             "Provider-death owner notification failed for %s", task_id, exc_info=True,

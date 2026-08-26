@@ -33,6 +33,10 @@ import pathlib
 from typing import Any, Dict, List, Optional
 
 from ouroboros.utils import update_json_locked, utc_now_iso
+from ouroboros.task_finalization import (
+    TERMINAL_ORIGIN_HOST_SALVAGE,
+    TERMINAL_ORIGIN_MODEL_FINAL,
+)
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +59,12 @@ _PENDING_MAX_REPLAYS = 5
 # GR3-7: marker prefix for "the teardown audit itself failed" rows riding the
 # delegated_runs_unreconciled surface — run state is UNKNOWN, never clean.
 RUN_STATE_UNKNOWN_PREFIX = "delegated_run_state_unknown"
+
+_HOST_SALVAGE_RECEIPT = (
+    "⚠️ A model-provider outage stopped this task before Ouroboros produced "
+    "a complete answer. The full intermediate output and technical details are preserved in the "
+    "task details."
+)
 
 
 def cleanup_settled_owner_mailbox(
@@ -518,7 +528,8 @@ def _disclose_exhausted_delivery(
         send_with_budget(
             chat_id,
             f"⚠️ A terminal answer for task {tid} could not be delivered: {cause}. {copy_note}",
-            task_id=tid,
+            role="system",
+            system_type="terminal_incident",
         )
     except Exception:
         log.debug("exhausted-delivery chat notice failed for %s", did, exc_info=True)
@@ -678,7 +689,7 @@ def build_completed_result_event(
     chat_id = lineage_chat_id(pathlib.Path(drive_root), task_row, tid)
     if not tid or not core_text or not chat_id:
         return None
-    return {
+    event = {
         "type": "send_message",
         "chat_id": chat_id,
         "task_id": tid,
@@ -689,6 +700,52 @@ def build_completed_result_event(
         "format": "markdown",
         "delivery_id": delivery_id_for(tid, core_text),
     }
+    return project_terminal_result_event(
+        pathlib.Path(drive_root), task_row, tid,
+        result_text=core_text,
+        terminal_origin=(stored or {}).get("terminal_origin"),
+        base_event=event,
+    )
+
+
+def project_terminal_result_event(
+    drive_root: Any,
+    task: Optional[Dict[str, Any]],
+    task_id: str,
+    *,
+    result_text: str,
+    terminal_origin: Any,
+    base_event: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Project one terminal event from producer-stamped origin.
+
+    ``host_salvage`` becomes one short keyed System receipt while the full
+    bytes stay in task details. ``model_final`` and a missing legacy origin
+    keep the assistant projection. No text/status/length inference occurs.
+    The delivery id always digests the stable core result rather than a
+    mutable disclosure suffix.
+    """
+    tid = str(task_id or "")
+    core_text = str(result_text or "")
+    event = dict(base_event or {})
+    event.setdefault("type", "send_message")
+    event.setdefault("task_id", tid)
+    event.setdefault("chat_id", lineage_chat_id(drive_root, task or {}, tid))
+    event["delivery_id"] = delivery_id_for(tid, core_text)
+    origin = str(terminal_origin or "")
+    if origin == TERMINAL_ORIGIN_HOST_SALVAGE:
+        event.update({
+            "text": _HOST_SALVAGE_RECEIPT,
+            "role": "system",
+            "system_type": "terminal_incident",
+            "terminal_origin": TERMINAL_ORIGIN_HOST_SALVAGE,
+        })
+        event.pop("log_text", None)
+        return event
+    if origin == TERMINAL_ORIGIN_MODEL_FINAL:
+        event["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL
+    # Missing origin remains absent so legacy rows replay byte-compatibly.
+    return event
 
 
 def enqueue_terminal_delivery(

@@ -102,6 +102,54 @@ def test_project_completion_summary_keeps_event_time_label_live_and_on_reload(
     assert replayed["status"] == live["status"]
 
 
+def test_terminal_incident_persists_and_replays_as_system_without_raw_salvage(
+    monkeypatch, tmp_path,
+):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    from ouroboros.gateway.history import make_chat_history_endpoint
+    from supervisor.terminal_delivery import project_terminal_result_event
+
+    raw = "RAW SALVAGE " * 1000
+    projected = project_terminal_result_event(
+        tmp_path, {"chat_id": 1}, "terminal-task",
+        result_text=raw, terminal_origin="host_salvage",
+        base_event={"chat_id": 1, "task_id": "terminal-task", "text": raw},
+    )
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
+    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat_id: None)
+    monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
+
+    message_bus.send_with_budget(
+        1, projected["text"], task_id=projected["task_id"],
+        role=projected["role"], system_type=projected["system_type"],
+    )
+
+    live = next(frame for frame in frames if frame.get("type") == "chat")
+    assert live["role"] == "system"
+    assert live["system_type"] == "terminal_incident"
+    assert raw not in live["content"]
+    durable = json.loads((tmp_path / "logs" / "chat.jsonl").read_text().splitlines()[-1])
+    assert durable["direction"] == "system"
+    assert durable["type"] == "terminal_incident"
+    assert raw not in durable["text"]
+
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(
+        query_params={"chat_id": "1", "limit": "20"},
+    )))
+    replayed = json.loads(response.body.decode("utf-8"))["messages"][-1]
+    assert replayed["role"] == "system"
+    assert replayed["system_type"] == "terminal_incident"
+    assert raw not in replayed["text"]
+
+
 def test_send_photo_publishes_transport_event_with_payload(monkeypatch):
     bridge = _make_bridge(monkeypatch)
     events = []

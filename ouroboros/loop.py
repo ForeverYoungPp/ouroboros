@@ -32,6 +32,10 @@ from ouroboros.usage_accounting import (
     PhysicalAttemptPreconditionFailed,
     last_physical_attempt_capture,
 )
+from ouroboros.task_finalization import (
+    TERMINAL_ORIGIN_HOST_SALVAGE,
+    TERMINAL_ORIGIN_MODEL_FINAL,
+)
 
 from ouroboros.loop_tool_execution import (
     StatefulToolExecutor,
@@ -40,14 +44,13 @@ from ouroboros.loop_tool_execution import (
     reclaim_negative_memo,
     reclaim_trace_refs,
 )
-from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event
+from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event, forced_response_is_incomplete
 from ouroboros.pricing import estimate_cost_optional
 
 # Backward-compat alias for source-inspecting/monkeypatched tests.
 _call_llm_with_retry = call_llm_with_retry
 
 log = logging.getLogger(__name__)
-
 
 @dataclass
 class DeliveryCandidate:
@@ -63,6 +66,7 @@ class DeliveryCandidate:
     repair_attempted: bool = False
     degraded: bool = False
     degraded_reason: str = ""
+    model_text: str = ""
 
 @dataclass
 class _CompactionRoundContext:
@@ -125,6 +129,7 @@ def _handle_text_response(
     safe_content = sanitize_tool_result_for_log(content or "")
     if safe_content.strip():
         llm_trace["reasoning_notes"].append(safe_content.strip())
+        accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL
     return safe_content, accumulated_usage, llm_trace
 
 
@@ -3498,7 +3503,7 @@ def _handle_owner_stop_finalization(
 def _handle_provider_unavailable(
     ctx: _RoundLimitContext, *, error_kind: str = "provider_unavailable",
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Salvage a provider interruption, or a context overflow, truthfully."""
+    """Handle provider terminalization."""
     is_context_overflow = str(error_kind or "") == "context_overflow"
     llm_trace = getattr(ctx, "llm_trace", None)
     llm_trace = llm_trace if isinstance(llm_trace, dict) else {}
@@ -3522,12 +3527,6 @@ def _handle_provider_unavailable(
             "Any files written so far are preserved in the workspace."
         )
     if is_context_overflow:
-        # A context overflow is a provider-confirmed request-shape failure.
-        # Keep this rail local: a forced semantic call would resend the same
-        # oversized payload, spend another attempt, and blur overflow with an
-        # outage. The candidate/source custody still records useful work;
-        # the usage fields below preserve the infra failure for acceptance.
-        # The typed overflow fact remains terminally visible to acceptance and review.
         text, usage, llm_trace = _forced_fallback_result(
             ctx, llm_trace, fallback, "context_overflow",
             source="context_overflow_local_salvage",
@@ -3545,9 +3544,11 @@ def _handle_provider_unavailable(
     )
     text, usage, llm_trace = _forced_final_answer(
         ctx, prompt=prompt, fallback_text=fallback, reason_code="provider_unavailable",
+        provider_terminal=True,
     )
     if str(usage.get("reason_code") or "") == "provider_unavailable":
         usage["execution_status"] = RESULT_INFRA_FAILED
+        usage.setdefault("terminal_origin", TERMINAL_ORIGIN_HOST_SALVAGE)
     return text, usage, llm_trace
 
 
@@ -3903,8 +3904,12 @@ def _replace_delivery_candidate(
     full_text: str,
     *,
     control: str,
+    model_text: Optional[str] = None,
 ) -> DeliveryCandidate:
     full_text = sanitize_tool_result_for_log(full_text)
+    model_text = sanitize_tool_result_for_log(
+        full_text if model_text is None else model_text
+    )
     previous_candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if isinstance(previous_candidate, DeliveryCandidate):
         _supersede_delivery_acceptance_binding(
@@ -3925,6 +3930,7 @@ def _replace_delivery_candidate(
         evidence_fingerprint=evidence_fingerprint,
         acceptance_binding=_unaccepted_delivery_binding(tools, content_hash),
         finalization_control=control,
+        model_text=model_text,
     )
     tools._ctx._delivery_candidate = candidate
     tools._ctx._delivery_control_required = False
@@ -4833,6 +4839,7 @@ def _no_tool_final_answer(
             llm_trace,
             composed_content,
             control="host_suffix" if normal_suffix else "candidate",
+            model_text=str(content or ""),
         )
     if isinstance(candidate, DeliveryCandidate):
         if orphan_suffix:
@@ -5090,7 +5097,8 @@ def _drain_forced_owner_directives(
     return True
 
 
-def _call_forced_model_once(ctx: _RoundLimitContext) -> str:
+def _call_forced_model_once(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any]]:
+    response_meta: Dict[str, Any] = {}
     final_msg, _final_cost = call_llm_with_retry(
         ctx.llm,
         ctx.messages,
@@ -5106,8 +5114,9 @@ def _call_forced_model_once(ctx: _RoundLimitContext) -> str:
         ctx.task_type,
         use_local=ctx.active_use_local,
         deadline_ts=ctx.deadline_ts,
+        response_meta_out=response_meta,
     )
-    return str((final_msg or {}).get("content") or "").strip()
+    return str((final_msg or {}).get("content") or "").strip(), response_meta
 
 
 def _publish_model_forced_candidate(
@@ -5116,7 +5125,7 @@ def _publish_model_forced_candidate(
     full_text: str,
     reason_code: str,
 ) -> Optional[DeliveryCandidate]:
-    """Replace the retained answer and invalidate any verdict for the old SHA."""
+    """Replace the retained answer and old verdict."""
 
     tools = getattr(ctx, "tools", None)
     if tools is None:
@@ -5145,7 +5154,7 @@ def _publish_stale_forced_candidate(
     reason_code: str,
     suffix: str,
 ) -> Optional[DeliveryCandidate]:
-    """Preserve useful old text without pretending it absorbed newer evidence."""
+    """Preserve old text."""
 
     tools = getattr(ctx, "tools", None)
     if tools is None:
@@ -5171,10 +5180,7 @@ def _publish_stale_forced_candidate(
         full_text,
         control=f"forced_stale_preserve:{reason_code}",
     )
-    # The host-added disclosure is current, but the substantive answer it
-    # qualifies is not. Preserve the answer's original evidence provenance so
-    # every projection remains conservative instead of laundering unchanged
-    # text onto the newer fingerprint.
+    # A host disclosure cannot make the preserved model text current.
     candidate.evidence_revision = stale_candidate.evidence_revision
     candidate.evidence_fingerprint = stale_candidate.evidence_fingerprint
     candidate.acceptance_binding = _forced_unaccepted_binding(
@@ -5201,8 +5207,9 @@ def _forced_fallback_result(
     source: str = "host_fallback",
     retained_source: str = "",
     retained_control: str = "",
+    provider_terminal: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Return one exact candidate; reuse only current unchanged full text."""
+    """Return a current or fallback candidate."""
 
     router_result = _forced_swarm_router_result(ctx, llm_trace, reason_code)
     if router_result is not None:
@@ -5220,9 +5227,19 @@ def _forced_fallback_result(
     )
     candidate = _current_delivery_candidate(ctx, llm_trace)
     if candidate is not None:
-        composed = sanitize_tool_result_for_log(
-            _compose_delivery_suffix(candidate.full_text, suffix)
-        )
+        if provider_terminal:
+            core = candidate.model_text or candidate.full_text
+            if core != candidate.full_text:
+                candidate = _publish_model_forced_candidate(ctx, llm_trace, core, reason_code) or candidate
+            composed = candidate.full_text
+            ctx.accumulated_usage.update(
+                terminal_origin=TERMINAL_ORIGIN_MODEL_FINAL,
+                terminal_plan_review_open=bool(plan_suffix),
+            )
+        else:
+            composed = sanitize_tool_result_for_log(
+                _compose_delivery_suffix(candidate.full_text, suffix)
+            )
         if composed != candidate.full_text:
             candidate = _publish_model_forced_candidate(
                 ctx, llm_trace, composed, reason_code,
@@ -5246,7 +5263,6 @@ def _forced_fallback_result(
             control=retained_control or f"forced_preserve:{reason_code}",
             reason_code=reason_code,
         )
-        # The preserved candidate is a previously model-produced complete answer.
         ctx.accumulated_usage["_best_effort_extracted"] = True
         _record_forced_finalization(
             ctx,
@@ -5266,6 +5282,8 @@ def _forced_fallback_result(
             suffix,
         )
         if candidate is not None:
+            if provider_terminal:
+                ctx.accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_HOST_SALVAGE
             ctx.accumulated_usage["_best_effort_extracted"] = True
             _record_forced_finalization(
                 ctx,
@@ -5282,6 +5300,8 @@ def _forced_fallback_result(
     )
     if fallback_is_retained_model_text:
         ctx.accumulated_usage["_best_effort_extracted"] = True
+    if provider_terminal:
+        ctx.accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_HOST_SALVAGE
     _record_forced_finalization(
         ctx,
         llm_trace,
@@ -5349,21 +5369,7 @@ def _resolve_forced_delivery_control(
     tools_ctx: Any,
     extracted: str,
 ) -> Tuple[str, str]:
-    """PURE, no-retry delivery-control resolution for the forced rail.
-
-    While the latch is armed, the one forced answer may legitimately be the
-    protocol object ``{"delivery_control": ...}`` — shipped raw it leaked
-    protocol JSON into the owner's chat and the durable result. Resolve it
-    before suffix composition, never re-looping (``_resolve_delivery_control``
-    can inject a repair round, which a hard forced stop must never do): valid
-    ``keep`` = the retained candidate's full text, valid ``replace`` =
-    ``full_answer``, malformed/duplicate/invalid = the retained candidate with
-    the typed degraded reason. Armed protocol intent is ANY parsed object with
-    the ``delivery_control`` key AND any JSON-looking text that fails to parse
-    (the model was told to answer with the object, so that is a mangled
-    control, never the answer). JSON while NOT armed passes through untouched.
-    Disclosed residual: armed PROSE stands as-is. Clears the latch. Returns
-    ``(resolved_text, degraded_reason)``."""
+    """Resolve an armed delivery-control object without another model round."""
     if tools_ctx is None or not extracted:
         return extracted, ""
     candidate = getattr(tools_ctx, "_delivery_candidate", None)
@@ -5475,12 +5481,9 @@ def _forced_final_answer(
     fallback_text: str,
     reason_code: str,
     single_semantic_turn: bool = False,
+    provider_terminal: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Force one tool-less final answer; stamp the typed forced-finalization
-    reason code (the best_effort outcome gate reads it downstream).
-    ``single_semantic_turn`` (owner-stop rail, CF-03): exactly ONE logical
-    model call — the late-owner-directive semantic refresh is disabled because
-    steering is fenced while the stop intent is pending."""
+    """Force a tool-less answer; rail rationale lives in task_finalization."""
     live_trace = getattr(ctx, "llm_trace", None)
     llm_trace = live_trace if isinstance(live_trace, dict) else {}
     _finalize_forced_services(ctx, llm_trace)
@@ -5491,15 +5494,17 @@ def _forced_final_answer(
     prompt += _forced_delegation_note(tools_ctx, llm_trace)
     _append_or_merge_user_message(ctx.messages, prompt)
     extracted = ""
+    response_meta: Dict[str, Any] = {}
     for attempt in range(1 if single_semantic_turn else 2):
         try:
-            extracted = _call_forced_model_once(ctx)
+            extracted, response_meta = _call_forced_model_once(ctx)
         except BudgetExceeded:
             _drain_forced_owner_directives(ctx, llm_trace)
             raise
         except Exception:
             log.warning("Failed to get final response after %s", reason_code, exc_info=True)
             extracted = ""
+            response_meta = {}
         ctx.accumulated_usage["execution_status"] = "failed"
         ctx.accumulated_usage["reason_code"] = reason_code
         if not _drain_forced_owner_directives(ctx, llm_trace):
@@ -5515,6 +5520,7 @@ def _forced_final_answer(
                 ),
                 reason_code,
                 source="late_owner_directive_requires_resume",
+                provider_terminal=provider_terminal,
             )
         _finalize_forced_services(ctx, llm_trace)
         _append_or_merge_user_message(
@@ -5524,21 +5530,32 @@ def _forced_final_answer(
             "new complete answer bound to every owner directive now present.",
         )
 
+    if provider_terminal and extracted and forced_response_is_incomplete(response_meta):
+        return _forced_fallback_result(
+            ctx, llm_trace, extracted, reason_code,
+            source="forced_model_incomplete", provider_terminal=True,
+        )
+
     extracted, control_degraded = _resolve_forced_delivery_control(
         getattr(getattr(ctx, "tools", None), "_ctx", None), extracted,
     )
     if extracted:
-        # Typed fact for the best_effort outcome gate: a REAL model answer
-        # was extracted (host fallback strings never set this).
         ctx.accumulated_usage["_best_effort_extracted"] = True
         tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
         plan_suffix = (
             _force_plan_disclosure(tool_ctx, llm_trace, forced_reason=reason_code)
             if tool_ctx is not None else ""
         )
-        full_text = _compose_delivery_suffix(
-            extracted, plan_suffix + _forced_orphan_note(ctx),
+        if provider_terminal:
+            ctx.accumulated_usage["terminal_plan_review_open"] = bool(plan_suffix)
+        host_suffix = plan_suffix + _forced_orphan_note(ctx)
+        full_text = (
+            extracted
+            if provider_terminal
+            else _compose_delivery_suffix(extracted, host_suffix)
         )
+        if provider_terminal:
+            ctx.accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL
         candidate = _publish_model_forced_candidate(
             ctx, llm_trace, full_text, reason_code,
         )
@@ -5567,6 +5584,7 @@ def _forced_final_answer(
         llm_trace,
         fallback_text,
         reason_code,
+        provider_terminal=provider_terminal,
     )
 
 

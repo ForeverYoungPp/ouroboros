@@ -5,6 +5,7 @@
 This is Ouroboros's engineering handbook: how to name, design, implement, and
 verify changes. `BIBLE.md` owns constitutional principles;
 `docs/ARCHITECTURE.md` owns the current structure, data flow, and rationale map;
+`docs/DESIGN.md` owns visual and interaction semantics;
 `docs/CHECKLISTS.md` owns reviewer items, severity, and output contracts. This
 file does not duplicate their inventories or serve as a changelog.
 
@@ -42,6 +43,10 @@ layer is required.
 Dependency direction is the test: UI/CLI → inbound gateway → domain owner;
 runtime policy → small host-owned contract → outbound adapter. Provider- or
 transport-specific decisions do not flow back into core policy.
+
+Preserve user-visible progress and reasoning. Chat authorship is stamped by the
+producer and preserved through persistence and replay; never infer it from text
+or promote host-selected intermediate output to a model final.
 
 ### CLI and headless work
 
