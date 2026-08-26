@@ -796,7 +796,10 @@ class TestRunScopeReviewFailClosed:
         monkeypatch.setattr(
             mod,
             "_call_scope_llm",
-            lambda *a, **k: (raw, {"prompt_tokens": 10, "completion_tokens": 5}, None),
+            lambda *a, **k: (raw, {
+                "prompt_tokens": 10, "completion_tokens": 5,
+                "operation_id": "review-op", "operation_state": "late_settled",
+            }, None),
         )
 
         result = mod.run_scope_review(MockCtx(), "test commit", scope_model="test-scope")
@@ -805,6 +808,8 @@ class TestRunScopeReviewFailClosed:
         assert result.status == "parse_failure"
         assert "missing required items" in result.block_message
         assert result.parsed_items[0]["item"] == "intent_alignment"
+        assert result.operation_id == "review-op"
+        assert result.operation_state == "late_settled"
 
     def test_run_scope_review_blocks_bare_pass_and_invalid_severity(self, tmp_path, monkeypatch):
         """Scope output contract rejects weak PASS reasons and bad severities."""
@@ -928,7 +933,9 @@ class TestRunScopeReviewFailClosed:
             "Retry the commit, or check API key and network connectivity."
         )
         monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
-        monkeypatch.setattr(mod, "_call_scope_llm", lambda *a, **k: ("", None, oversize_error))
+        monkeypatch.setattr(mod, "_call_scope_llm", lambda *a, **k: (
+            "", {"operation_id": "oversize-op", "late_result_pending": True}, oversize_error,
+        ))
         monkeypatch.setattr(mod, "_scope_window",
                             lambda _m, **_k: mod.ReviewerWindow(1_000_000, "confirmed"))
 
@@ -936,6 +943,8 @@ class TestRunScopeReviewFailClosed:
 
         assert result.blocked is True
         assert result.status == "fixed_overflow"
+        assert result.operation_id == "oversize-op"
+        assert result.late_result_pending is True
         assert result.advisory_findings[0]["item"] == "scope_review_skipped"
         assert "prompt is too long" in result.advisory_findings[0]["reason"]
 

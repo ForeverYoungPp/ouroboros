@@ -35,6 +35,7 @@ from ouroboros.request_wire_recovery import (
 )
 from ouroboros.usage_accounting import (
     AttemptRequest,
+    PhysicalAttemptCapture,
     PhysicalAttemptPreconditionFailed,
     PhysicalAttemptPreparationFailed,
     UsageAccountingError,
@@ -2515,6 +2516,10 @@ class LLMClient:
                 if (_is_structured_context_overflow_exception(exc)
                         or context_overflow_message(err)):
                     raise LocalContextTooLargeError(err) from exc
+                # Exception-owned capture proves this attempt; prior ContextVar may be unrelated.
+                capture = getattr(exc, "physical_attempt_capture", None)
+                if isinstance(capture, PhysicalAttemptCapture) and capture.state in {"dispatched", "unresolved"}:
+                    raise  # Outer custody owns an unknown physical outcome.
                 if attempt == 2:
                     log.warning("Local model request failed: %s", exc)
                     raise
@@ -4344,16 +4349,20 @@ def openrouter_web_search_server_tool(
     query: str,
     search_context_size: str,
     accounting_scope: Optional[UsageScope] = None,
+    timeout: Optional[float] = None,
 ) -> Any:
     """Run OpenRouter's provider-owned web_search server tool."""
 
     from openai import OpenAI
 
-    client = OpenAI(
+    client_kwargs: Dict[str, Any] = dict(
         api_key=api_key,
         base_url="https://openrouter.ai/api/v1",
         max_retries=0,
     )
+    if timeout is not None:
+        client_kwargs["timeout"] = float(timeout)
+    client = OpenAI(**client_kwargs)
     payload = dict(
         model=model,
         messages=[{"role": "user", "content": query}],
@@ -4388,12 +4397,16 @@ def anthropic_web_search_server_tool(
     model: str,
     query: str,
     accounting_scope: Optional[UsageScope] = None,
+    timeout: Optional[float] = None,
 ) -> Any:
     """Run Anthropic's provider-owned web_search server tool."""
 
     import anthropic
 
-    client = anthropic.Anthropic(api_key=api_key, max_retries=0)
+    client_kwargs: Dict[str, Any] = {"api_key": api_key, "max_retries": 0}
+    if timeout is not None:
+        client_kwargs["timeout"] = float(timeout)
+    client = anthropic.Anthropic(**client_kwargs)
     payload = dict(
         model=model,
         max_tokens=2048,

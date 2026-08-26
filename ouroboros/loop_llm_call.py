@@ -20,20 +20,53 @@ import logging
 
 from ouroboros import model_concurrency
 from ouroboros.anthropic_native_custody import public_custody_projection
-from ouroboros.deadline_utils import seconds_until
+from ouroboros.config import get_finalization_grace_sec  # noqa: F401 - legacy monkeypatch seam
+from ouroboros.deadline_utils import (
+    owner_deadline_exhausted,
+    seconds_until,
+    transport_timeout_with_deadline,
+)
 from ouroboros.llm import LLMClient, LocalContextTooLargeError, add_usage
 from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
+from ouroboros.provider_models import provider_for_model
 from ouroboros.usage_accounting import (
     PhysicalAttemptContext,
     UsageAccountingError,
     bind_physical_attempt_context,
 )
-from ouroboros.utils import append_jsonl, emit_log_event, sanitize_tool_result_for_log, truncate_review_artifact, utc_now_iso
+from ouroboros.utils import (
+    append_jsonl,
+    emit_cognitive_operation_event,
+    emit_log_event,
+    sanitize_tool_result_for_log,
+    truncate_review_artifact,
+    utc_now_iso,
+)
 
 log = logging.getLogger(__name__)
 
 MAIN_LOOP_MAX_TOKENS = 65_536
+
+
+def _main_transport_timeout(
+    model: str,
+    deadline_ts: Optional[float],
+    *,
+    reserve_sec: Optional[float] = None,
+) -> float:
+    # Preserve the native Anthropic default while narrowing every route to an
+    # owner deadline. Other routes use the shared dead-socket bound; local models
+    # receive the same explicit bound their client already supports.
+    explicit = 120 if provider_for_model(model) == "anthropic" else None
+    # ``None`` is the low-level raw-deadline contract.  The production round
+    # dispatcher passes the finalization reserve explicitly; keeping this
+    # default raw prevents admission from accepting a call and then shrinking
+    # its transport to the 0.001-second floor unexpectedly.
+    return transport_timeout_with_deadline(
+        explicit, deadline_ts=deadline_ts,
+        reserve_sec=0.0 if reserve_sec is None else reserve_sec,
+    )
 
 # Retrieval transparency (v6.78.0, owner Q20/Q22): native provider web search happens
 # INSIDE the solve model's own request, so `usage["web_search_sources"]` /
@@ -221,6 +254,7 @@ def _record_and_emit_empty_response(
     *, usage, msg, accumulated_usage, event_queue, drive_logs, task_id, execution_id,
     round_id, llm_call_id, round_idx, attempt, model, task_type, content, tool_calls,
     request_ref, response_ref, transient_budget, context_fit_event_fields,
+    task_attempt=None,
 ) -> tuple:
     """Classify an empty / no-tool-call response, log + emit its events, and stamp
     accumulated_usage (last error / execution_status / reason_code / F1 cooldown kind).
@@ -235,6 +269,7 @@ def _record_and_emit_empty_response(
         base={"task_id": task_id, "execution_id": execution_id, "round_id": round_id,
               "llm_call_id": llm_call_id, "round": round_idx, "attempt": attempt + 1,
               "model": model, "finish_reason": finish_reason,
+              "task_attempt": task_attempt,
               **context_fit_event_fields},
         task_type=task_type,
         details={"content": content, "tool_calls": tool_calls,
@@ -328,6 +363,60 @@ def _emit_retry_deadline_exhausted(
     })
 
 
+def _mark_deadline_not_dispatched(
+    accumulated_usage: Dict[str, Any],
+    drive_logs: pathlib.Path,
+    *,
+    task_id: str,
+    model: str,
+    round_idx: int,
+) -> None:
+    """Record a deadline refusal without minting an LLM operation or attempt."""
+    accumulated_usage.update(
+        _last_llm_error_kind="deadline_exhausted",
+        _last_llm_error="owner deadline exhausted before dispatch",
+        _last_llm_retry_same_request=False,
+        execution_status="infra_failed",
+        reason_code="deadline_exhausted",
+    )
+    append_jsonl(drive_logs / "events.jsonl", {
+        "ts": utc_now_iso(),
+        "type": "llm_not_dispatched",
+        "task_id": task_id,
+        "round": round_idx,
+        "model": model,
+        "reason_code": "deadline_exhausted",
+    })
+
+
+def _deadline_not_dispatched(
+    deadline_ts: Optional[float], accumulated_usage: Dict[str, Any],
+    drive_logs: pathlib.Path, *, task_id: str, model: str, round_idx: int,
+    event_queue: Optional[queue.Queue] = None, llm_call_id: str = "",
+    task_attempt: Any = None, execution_id: str = "", round_id: str = "",
+    reserve_sec: Optional[float] = None,
+) -> bool:
+    # ``None`` preserves the low-level helper's raw-deadline contract.  The
+    # production round dispatcher supplies the finalization reserve explicitly;
+    # direct callers such as retry diagnostics can still exercise a first
+    # admitted attempt and let the retry backoff gate stop the next one.
+    admission_reserve = 0.0 if reserve_sec is None else reserve_sec
+    if not owner_deadline_exhausted(
+        deadline_ts=deadline_ts, reserve_sec=admission_reserve,
+    ):
+        return False
+    if llm_call_id:
+        _emit_llm_operation(
+            event_queue, task_id, llm_call_id, "failed", task_attempt,
+            execution_id, round_id,
+        )
+    _mark_deadline_not_dispatched(
+        accumulated_usage, drive_logs, task_id=task_id, model=model,
+        round_idx=round_idx,
+    )
+    return True
+
+
 @dataclass
 class _LlmErrorContext:
     task_id: str
@@ -343,6 +432,10 @@ class _LlmErrorContext:
     event_queue: Optional[queue.Queue]
     accumulated_usage: Dict[str, Any]
     context_fit_event_fields: Optional[Dict[str, Any]] = None
+    task_attempt: Any = None
+    deadline_ts: Optional[float] = None
+    max_retries: int = 0
+    transient_budget: int = 0
 
 
 @dataclass(frozen=True)
@@ -499,6 +592,10 @@ def _exception_status_code(exc: Exception) -> Optional[int]:
                 pass
     response = getattr(exc, "response", None)
     value = getattr(response, "status_code", None)
+    if isinstance(value, int):
+        return value
+    capture = getattr(exc, "physical_attempt_capture", None)
+    value = getattr(capture, "provider_status_code", None)
     return value if isinstance(value, int) else None
 
 
@@ -687,8 +784,18 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
             422: "bad_request",
         }[status_code]
         return LlmErrorClassification(kind, False, status_code, provider_code)
-    if status_code in {408, 500, 502, 503, 504}:
+    if status_code == 408 or (status_code is not None and 500 <= status_code <= 599):
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
+    if status_code is not None and 400 <= status_code <= 499:
+        return LlmErrorClassification("provider_error", False, status_code, provider_code)
+    capture = getattr(exc, "physical_attempt_capture", None)
+    if str(getattr(capture, "state", "") or "") in {"dispatched", "unresolved"}:
+        # The provider may still finish a request whose socket outcome is
+        # unknown. Neither a same-model retry nor a different paid fallback is
+        # safe until a typed terminal provider fact exists.
+        return LlmErrorClassification(
+            "provider_outcome_unknown", False, status_code, provider_code,
+        )
     if any(marker in low for marker in _RETRYABLE_PROVIDER_MARKERS):
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
     return LlmErrorClassification("provider_error", True, status_code, provider_code)
@@ -778,6 +885,7 @@ def _record_llm_call_error(
         "execution_id": ctx.execution_id,
         "round_id": ctx.round_id,
         "llm_call_id": ctx.llm_call_id,
+        "task_attempt": ctx.task_attempt,
         "round": ctx.round_idx,
         "attempt": ctx.attempt + 1,
         "model": ctx.model,
@@ -950,6 +1058,8 @@ def _prepare_main_messages(
     task_id: str,
     event_queue: Optional[queue.Queue],
     use_local: bool,
+    task_attempt: Any = None,
+    deadline_ts: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     try:
         from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
@@ -959,7 +1069,7 @@ def _prepare_main_messages(
             routing=VisionRoutingContext(
                 model=model, llm=llm, accumulated_usage=accumulated_usage,
                 drive_root=drive_root, task_id=task_id, event_queue=event_queue,
-                use_local=use_local,
+                use_local=use_local, task_attempt=task_attempt, deadline_ts=deadline_ts,
             ),
         )
     except Exception:
@@ -1032,6 +1142,54 @@ def _replace_response_meta(
     })
 
 
+def forced_response_parts(
+    result: Any, accumulated_usage: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    """Normalize the forced-call seam while preserving legacy tuple patches."""
+    if isinstance(result, tuple):
+        return (
+            str(result[0] or "").strip(),
+            dict(result[1]) if len(result) > 1 and isinstance(result[1], dict) else {},
+        )
+    meta = accumulated_usage.pop("_forced_response_meta", {})
+    return str(result or "").strip(), dict(meta) if isinstance(meta, dict) else {}
+
+
+def _emit_llm_operation(
+    event_queue: Optional[queue.Queue], task_id: str, operation_id: str,
+    phase: str, task_attempt: Any, execution_id: str, round_id: str,
+) -> None:
+    emit_cognitive_operation_event(
+        event_queue, task_id=task_id, operation_id=operation_id, phase=phase,
+        kind="llm", task_attempt=task_attempt, execution_id=execution_id,
+        round_id=round_id,
+    )
+
+
+def _handle_llm_call_exception(error: Exception, ctx: _LlmErrorContext) -> bool:
+    _clear_custom_receipts(ctx.accumulated_usage)
+    _emit_llm_operation(
+        ctx.event_queue, ctx.task_id, ctx.llm_call_id, "failed", ctx.task_attempt,
+        ctx.execution_id, ctx.round_id,
+    )
+    if _record_llm_call_error(error, ctx):
+        return True
+    kind = str(ctx.accumulated_usage.get("_last_llm_error_kind") or "")
+    transient = kind in _TRANSIENT_RETRY_KINDS
+    budget = ctx.transient_budget if transient else min(ctx.max_retries, ctx.transient_budget)
+    if ctx.attempt >= budget - 1:
+        return True
+    backoff = _retry_backoff_sec(ctx.accumulated_usage, kind, ctx.attempt, transient)
+    if _sleep_within_deadline(backoff, ctx.deadline_ts):
+        return False
+    _emit_retry_deadline_exhausted(
+        ctx.drive_logs, task_id=ctx.task_id, execution_id=ctx.execution_id,
+        round_id=ctx.round_id, round_idx=ctx.round_idx, attempt=ctx.attempt,
+        model=ctx.model, error_kind=kind,
+    )
+    return True
+
+
 def call_llm_with_retry(
     llm: LLMClient,
     messages: List[Dict[str, Any]],
@@ -1052,8 +1210,10 @@ def call_llm_with_retry(
     physical_context: Optional[PhysicalAttemptContext] = None,
     candidate_predicate: Optional[Callable[[Any], Any]] = None,
     response_meta_out: Optional[Dict[str, Any]] = None,
+    task_attempt: Any = None,
+    transport_reserve_sec: Optional[float] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
-    """Call one model with bounded retries; cross-model fallback stays caller-owned."""
+    """Call one model with bounded retries, typed operation events, and deadline-aware transport."""
     msg = None
     _replace_response_meta(response_meta_out)
     drive_root = pathlib.Path(drive_logs).parent
@@ -1065,16 +1225,26 @@ def call_llm_with_retry(
         else {}
     )
     transient_budget = _attempt_loop_budget(max_retries, attempt_cap)
+    if task_attempt is None:
+        task_attempt = accumulated_usage.get("_task_attempt")
+    else:
+        accumulated_usage["_task_attempt"] = task_attempt
     response_cache_bypass_requested = False
     for attempt in range(transient_budget):
+        if _deadline_not_dispatched(
+            deadline_ts, accumulated_usage, drive_logs,
+            task_id=task_id, model=model, round_idx=round_idx, reserve_sec=transport_reserve_sec,
+        ):
+            return None, None
         accumulated_usage["_llm_attempts_used"] = attempt + 1
         llm_call_id = new_call_id("llm")
         request_ref: Dict[str, Any] = {}
         try:
+            _emit_llm_operation(event_queue, task_id, llm_call_id, "started", task_attempt, execution_id, round_id)
             send_messages = _prepare_main_messages(
                 messages, model=model, llm=llm, accumulated_usage=accumulated_usage,
                 drive_root=drive_root, task_id=task_id, event_queue=event_queue,
-                use_local=use_local,
+                use_local=use_local, task_attempt=task_attempt, deadline_ts=deadline_ts,
             )
             _emit_live_log(event_queue, {
                 "type": "llm_round_started",
@@ -1084,6 +1254,7 @@ def call_llm_with_retry(
                 "round_id": round_id,
                 "llm_call_id": llm_call_id,
                 "round": round_idx,
+                "task_attempt": task_attempt,
                 "attempt": attempt + 1,
                 "model": model,
                 "reasoning_effort": effort,
@@ -1097,6 +1268,9 @@ def call_llm_with_retry(
                 "use_local": use_local,
                 "allow_server_web_search": bool(allow_server_web_search),
                 "bypass_response_cache": response_cache_bypass_requested,
+                "timeout": _main_transport_timeout(
+                    model, deadline_ts, reserve_sec=transport_reserve_sec,
+                ),
             }
             if tools:
                 kwargs["tools"] = tools
@@ -1131,7 +1305,14 @@ def call_llm_with_retry(
                 )
             except Exception:
                 log.debug("Failed to persist LLM request observability payload", exc_info=True)
-            # Vision preparation is outside the Main-only physical binding.
+            if _deadline_not_dispatched(
+                deadline_ts, accumulated_usage, drive_logs,
+                task_id=task_id, model=model, round_idx=round_idx,
+                event_queue=event_queue, llm_call_id=llm_call_id,
+                task_attempt=task_attempt, execution_id=execution_id,
+                round_id=round_id, reserve_sec=transport_reserve_sec,
+            ):
+                return None, None
             resp_msg, usage = _send_main_candidate(
                 llm, kwargs, model=model, use_local=use_local, deadline_ts=deadline_ts,
                 physical_context=physical_context, candidate_predicate=candidate_predicate,
@@ -1143,7 +1324,6 @@ def call_llm_with_retry(
             accumulated_usage.pop("_last_llm_retry_same_request", None)
             accumulated_usage.pop("_last_llm_status_code", None)
             accumulated_usage.pop("_last_llm_provider_code", None)
-
             cost, display_model, provider, cost_estimated = _normalize_usage_cost(
                 usage,
                 model=model,
@@ -1188,7 +1368,6 @@ def call_llm_with_retry(
                 request_ref=request_ref,
                 response_ref=response_ref,
             )
-
             category = task_type if task_type in ("evolution", "consciousness", "review", "summarize") else "task"
             emit_llm_usage_event(
                 event_queue,
@@ -1201,7 +1380,6 @@ def call_llm_with_retry(
                 source="loop",
                 cost_estimated=cost_estimated,
             )
-
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
             _replace_response_meta(response_meta_out, usage, msg)
@@ -1213,7 +1391,9 @@ def call_llm_with_retry(
                     task_type=task_type, content=content, tool_calls=tool_calls,
                     request_ref=request_ref, response_ref=response_ref, transient_budget=transient_budget,
                     context_fit_event_fields=context_fit_event_fields,
+                    task_attempt=task_attempt,
                 )
+                _emit_llm_operation(event_queue, task_id, llm_call_id, "failed", task_attempt, execution_id, round_id)
                 if event_type == "provider_incomplete_response" and not usage.get("provider_error"):
                     response_cache_bypass_requested = True
                 # Transient response glitches retry the same model; permanent body errors fail fast.
@@ -1272,6 +1452,7 @@ def call_llm_with_retry(
                 "round_id": round_id,
                 "llm_call_id": llm_call_id,
                 "round": round_idx,
+                "task_attempt": task_attempt,
                 "attempt": attempt + 1,
                 "model": display_model,
                 "reasoning_effort": effort,
@@ -1286,47 +1467,26 @@ def call_llm_with_retry(
                 "has_text": bool(content and str(content).strip()),
             })
             append_jsonl(drive_logs / "events.jsonl", _round_event)
+            _emit_llm_operation(event_queue, task_id, llm_call_id, "finished", task_attempt, execution_id, round_id)
             return msg, cost
 
         except UsageAccountingError:
+            _emit_llm_operation(event_queue, task_id, llm_call_id, "failed", task_attempt, execution_id, round_id)
             raise  # Monetary/ledger rails are not provider failures.
         except Exception as e:
-            _clear_custom_receipts(accumulated_usage)
-            if _record_llm_call_error(
+            if _handle_llm_call_exception(
                 e,
                 _LlmErrorContext(
-                    task_id=task_id,
-                    task_type=task_type,
-                    execution_id=execution_id,
-                    round_id=round_id,
-                    llm_call_id=llm_call_id,
-                    round_idx=round_idx,
-                    attempt=attempt,
-                    model=model,
-                    request_ref=request_ref,
-                    drive_logs=drive_logs,
-                    event_queue=event_queue,
+                    task_id=task_id, task_type=task_type, execution_id=execution_id,
+                    round_id=round_id, llm_call_id=llm_call_id, round_idx=round_idx,
+                    attempt=attempt, model=model, request_ref=request_ref,
+                    drive_logs=drive_logs, event_queue=event_queue,
                     accumulated_usage=accumulated_usage,
                     context_fit_event_fields=context_fit_event_fields,
+                    task_attempt=task_attempt, deadline_ts=deadline_ts,
+                    max_retries=max_retries, transient_budget=transient_budget,
                 ),
             ):
-                break
-            error_kind = str(accumulated_usage.get("_last_llm_error_kind") or "")
-            is_transient = error_kind in _TRANSIENT_RETRY_KINDS
-            # Non-transient retryable classes keep the caller's max_retries, but never
-            # exceed the loop ceiling (transient_budget) — so an attempt_cap'd fallback
-            # candidate does not waste a backoff sleep on an iteration the loop won't run.
-            # For the primary, transient_budget >= max_retries, so this is a no-op there.
-            attempt_budget = transient_budget if is_transient else min(max_retries, transient_budget)
-            if attempt >= attempt_budget - 1:
-                break
-            backoff = _retry_backoff_sec(accumulated_usage, error_kind, attempt, is_transient)
-            if not _sleep_within_deadline(backoff, deadline_ts):
-                _emit_retry_deadline_exhausted(
-                    drive_logs, task_id=task_id, execution_id=execution_id,
-                    round_id=round_id, round_idx=round_idx, attempt=attempt,
-                    model=model, error_kind=error_kind,
-                )
                 break
 
     return None, 0.0

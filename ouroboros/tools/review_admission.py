@@ -181,6 +181,9 @@ def triad_not_dispatched_records(
             "slot_id": str(slot_ids[index]) if index < len(slot_ids) else "",
             "prompt_ref": {},
             "response_ref": {},
+            "operation_id": "",
+            "operation_state": "not_dispatched",
+            "late_result_pending": False,
         })
     return records
 

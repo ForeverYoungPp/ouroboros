@@ -341,15 +341,19 @@ def test_provider_owned_web_search_disables_sdk_retries(monkeypatch):
         model="openai/gpt-5.2",
         query="query",
         search_context_size="medium",
+        timeout=17,
     )
     llm.anthropic_web_search_server_tool(
         api_key="test",
         model="claude-sonnet-4-6",
         query="query",
+        timeout=17,
     )
 
     assert captured["openai"]["max_retries"] == 0
     assert captured["anthropic"]["max_retries"] == 0
+    assert captured["openai"]["timeout"] == 17
+    assert captured["anthropic"]["timeout"] == 17
 
 
 def test_openai_responses_web_search_disables_sdk_retries(tmp_path, monkeypatch):

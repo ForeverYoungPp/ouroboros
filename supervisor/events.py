@@ -37,6 +37,7 @@ from ouroboros.subagents import intended_lane as intended_subagent_lane
 from ouroboros.subagent_messages import subagent_message_meta
 from ouroboros.task_finalization import send_provider_death_notice
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
+from supervisor.cognitive_operations import EVENT_HANDLERS as _CEH, _handle_cognitive_operation  # noqa: F401
 
 log = logging.getLogger(__name__)
 
@@ -1140,7 +1141,7 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             meta.get("root_task_id") or evt.get("root_task_id"),
         )
         system_type = str(evt.get("system_type") or "")
-        # Project lifecycle rows (started/completion) pin Main; others keep lineage routing.
+        # Project lifecycle rows pin Main; others keep lineage routing.
         chat_id = int(evt["chat_id"]) if system_type in ("project_started", "project_completion_summary") else bound_chat or int(evt["chat_id"])
         ctx.send_with_budget(
             chat_id,
@@ -3034,7 +3035,6 @@ def _prepare_promote_source_off_loop(evt: Dict[str, Any], ctx: Any) -> None:
         continuation["project_id"] = project_id
         continuation["_source_note"] = note
         continuation["_source_error"] = error
-        # Off-loop creation fact for the one workers-side announce gate.
         continuation["_source_created"] = bool(source_created)
         if folder and not str(continuation.get("workspace_root") or "").strip():
             continuation["workspace_root"] = folder
@@ -4325,6 +4325,7 @@ def _handle_external_wait_lease(evt: Dict[str, Any], ctx: Any) -> None:
 EVENT_HANDLERS = {
     "llm_usage": _handle_llm_usage,
     "external_wait_lease": _handle_external_wait_lease,
+    **_CEH,
     "budget_pause": _handle_budget_pause,
     "budget_root_fence": _handle_budget_root_fence,
     "task_heartbeat": _handle_task_heartbeat,

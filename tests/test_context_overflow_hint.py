@@ -161,3 +161,49 @@ def test_local_output_limit_error_takes_normal_retry_path_not_overflow(monkeypat
     assert excinfo.value is output_limit_exc
     assert not isinstance(excinfo.value, llm_mod.LocalContextTooLargeError)
     assert calls["n"] == 3
+
+
+def test_local_retry_does_not_inherit_unrelated_physical_capture(monkeypatch, tmp_path):
+    """A missing exception-owned capture must not borrow a prior operation's custody."""
+    from ouroboros import llm as llm_mod
+    from ouroboros import usage_accounting as ua
+
+    # Leave an unresolved capture in the current ContextVar, as a previous
+    # provider call would.  The compatibility executor below then raises an
+    # ordinary local error without entering the physical-attempt seam.
+    with pytest.raises(RuntimeError):
+        ua.execute_physical_attempt(
+            ua.AttemptRequest(
+                model="seed-model", provider="local", reservation_usd=0.0,
+                drive_root=tmp_path, task_id="seed-task",
+            ),
+            lambda: (_ for _ in ()).throw(RuntimeError("seed transport failure")),
+        )
+    assert ua.last_physical_attempt_capture().state == "unresolved"
+
+    output_limit_exc = RuntimeError(
+        "max_tokens 65536 exceeds maximum context length 32768"
+    )
+    calls = {"n": 0}
+
+    def _fake_execute(request, send, before):
+        calls["n"] += 1
+        raise output_limit_exc
+
+    monkeypatch.setattr(llm_mod, "_execute_candidate", _fake_execute)
+    monkeypatch.setattr(llm_mod, "_attempt_request", lambda *a, **k: None)
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda _s: None)
+    client = llm_mod.LLMClient.__new__(llm_mod.LLMClient)
+    monkeypatch.setattr(client, "_get_local_client", lambda: object(), raising=False)
+    monkeypatch.setattr(
+        client, "_normalize_system_message_placement", lambda m: list(m), raising=False)
+    monkeypatch.setattr(
+        client, "_strip_openrouter_roundtrip_metadata", lambda m: list(m), raising=False)
+    monkeypatch.setattr(
+        client, "_copy_messages_with_cache_policy",
+        lambda m, **k: [dict(x) for x in m], raising=False)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        client._chat_local([{"role": "user", "content": "hi"}], None, 512, "auto")
+    assert excinfo.value is output_limit_exc
+    assert calls["n"] == 3

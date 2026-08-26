@@ -19,6 +19,9 @@ from supervisor.state import load_state, append_jsonl, reconstruct_task_cost
 from supervisor.message_bus import coerce_chat_identity, send_with_budget
 from ouroboros.config import DATA_DIR, REPO_DIR as CONFIG_REPO_DIR
 from ouroboros.outcomes import EXECUTION_FAILED, EXECUTION_INFRA_FAILED, terminal_outcome_axes
+from ouroboros.review_owner_custody import (
+    reconcile_confirmed_dead_review_owner as _reconcile_confirmed_dead_review_owner_for_root,
+)
 from ouroboros.utils import utc_now_iso
 
 
@@ -2070,6 +2073,10 @@ def _record_worker_pids() -> None:
         log.debug("Failed to ledger worker pids", exc_info=True)
 
 
+def _reconcile_confirmed_dead_review_owner(owner_pid: int) -> None:
+    _reconcile_confirmed_dead_review_owner_for_root(DRIVE_ROOT, owner_pid)
+
+
 def reap_orphaned_workers() -> int:
     """Kill leftover worker process groups left by a PRIOR server instance.
 
@@ -2224,6 +2231,16 @@ def kill_workers(
         for w in WORKERS.values():
             w.proc.join(timeout=3)
         _kill_survivors()
+        for w in WORKERS.values():
+            try:
+                if w.proc.pid and not w.proc.is_alive():
+                    _reconcile_confirmed_dead_review_owner(int(w.proc.pid))
+            except Exception:
+                log.debug(
+                    "Could not prove worker %s dead for review reconciliation",
+                    w.wid,
+                    exc_info=True,
+                )
         WORKERS.clear()
         orphaned_ids = []
         drained_ids = []
@@ -2378,6 +2395,10 @@ def kill_workers_for_update(*, result_reason: str, terminal_status: str = "inter
                 worker.proc.join(timeout=3)
             if worker.proc.is_alive():
                 survivors.append(f"worker:{worker.proc.pid or worker.wid}")
+            else:
+                _reconcile_confirmed_dead_review_owner(
+                    int(getattr(worker.proc, "pid", 0) or 0)
+                )
         except Exception as exc:
             survivors.append(f"worker:{worker.wid}:{type(exc).__name__}")
     if teardown_error:
@@ -2958,6 +2979,48 @@ def ensure_workers_healthy() -> None:
         queue.persist_queue_snapshot(reason="worker_respawn_after_crash")
 
 
+def _worker_crash_storm_detected(
+    *, busy_crashes: int, dead_detections: int, crashed_tasks: List[Dict[str, Any]]
+) -> bool:
+    now = time.time()
+    alive_now = sum(1 for worker in WORKERS.values() if worker.proc.is_alive())
+    if dead_detections:
+        # Only count busy crashes or all-workers-dead as storm signals.
+        if busy_crashes > 0 or alive_now == 0:
+            CRASH_TS.extend([now] * max(1, dead_detections))
+        else:
+            CRASH_TS.clear()
+
+    CRASH_TS[:] = [stamp for stamp in CRASH_TS if (now - stamp) < 60.0]
+    if len(CRASH_TS) < 3:
+        return False
+
+    # Do not execv on crash storms; keep direct-chat mode alive.
+    st = load_state()
+    append_jsonl(
+        DRIVE_ROOT / "logs" / "supervisor.jsonl",
+        {
+            "ts": utc_now_iso(),
+            "type": "crash_storm_detected",
+            "crash_count": len(CRASH_TS),
+            "worker_count": len(WORKERS),
+            "crashed_tasks": crashed_tasks,
+        },
+    )
+    if st.get("owner_chat_id"):
+        send_with_budget(
+            int(st["owner_chat_id"]),
+            "⚠️ Frequent worker crashes. Multiprocessing workers disabled, "
+            "continuing in direct-chat mode (threading).",
+            is_progress=True,
+            progress_meta={
+                "task_incident": "worker_crash_storm",
+                "toast_once": f"worker-crash-storm:{int(min(CRASH_TS) if CRASH_TS else now)}",
+            },
+        )
+    return True
+
+
 def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
     busy_crashes = 0
     dead_detections = 0
@@ -2970,6 +3033,9 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
         if not w.proc.is_alive():
             # Reserve the dead slot before the queue lock is released.
             w.reaping = True
+            _reconcile_confirmed_dead_review_owner(
+                int(getattr(w.proc, "pid", 0) or 0)
+            )
             dead_detections += 1
             if w.busy_task_id is not None:
                 busy_crashes += 1
@@ -3221,39 +3287,9 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                             )
             respawn_ids.append(wid)
 
-    now = time.time()
-    alive_now = sum(1 for w in WORKERS.values() if w.proc.is_alive())
-    if dead_detections:
-        # Only count busy crashes or all-workers-dead as storm signals.
-        if busy_crashes > 0 or alive_now == 0:
-            CRASH_TS.extend([now] * max(1, dead_detections))
-        else:
-            CRASH_TS.clear()
-
-    CRASH_TS[:] = [t for t in CRASH_TS if (now - t) < 60.0]
-    disable_pool = len(CRASH_TS) >= 3
-    if disable_pool:
-        # Do not execv on crash storms; keep direct-chat mode alive.
-        st = load_state()
-        append_jsonl(
-            DRIVE_ROOT / "logs" / "supervisor.jsonl",
-            {
-                "ts": utc_now_iso(),
-                "type": "crash_storm_detected",
-                "crash_count": len(CRASH_TS),
-                "worker_count": len(WORKERS),
-                "crashed_tasks": crashed_tasks,
-            },
-        )
-        if st.get("owner_chat_id"):
-            send_with_budget(
-                int(st["owner_chat_id"]),
-                "⚠️ Frequent worker crashes. Multiprocessing workers disabled, "
-                "continuing in direct-chat mode (threading).",
-                is_progress=True,
-                progress_meta={
-                    "task_incident": "worker_crash_storm",
-                    "toast_once": f"worker-crash-storm:{int(min(CRASH_TS) if CRASH_TS else now)}",
-                },
-            )
+    disable_pool = _worker_crash_storm_detected(
+        busy_crashes=busy_crashes,
+        dead_detections=dead_detections,
+        crashed_tasks=crashed_tasks,
+    )
     return respawn_ids, disable_pool

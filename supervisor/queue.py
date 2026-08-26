@@ -49,7 +49,7 @@ from supervisor.task_lifecycle import (  # noqa: F401 -- public queue API re-exp
     clear_acceptance_fence_for_root, record_scheduled_admission,
     resume_budget_paused_task, restore_queue_fences, transition_acceptance_fence,
 )
-
+from supervisor.cognitive_operations import _active_operation_progressing
 log = logging.getLogger(__name__)
 
 
@@ -1171,7 +1171,6 @@ def _has_pending_descendant(task_id: str) -> bool:
             return True
     return False
 
-
 def _enforce_task_timeouts_locked(
     workers: Any, now: float, owner_chat_id: int, st: Dict[str, Any]
 ) -> None:
@@ -1233,7 +1232,8 @@ def _enforce_task_timeouts_locked(
         # a QUEUED descendant (a kill would orphan the queued subtree), or a live external-wait
         # lease; only abs ceiling / explicit deadline / budget are unconditional.
         progressing = (own_progress or subtree_progressing or _has_pending_descendant(task_id)
-                       or (isinstance(lease_ts, (int, float)) and float(lease_ts) > now))
+                       or (isinstance(lease_ts, (int, float)) and float(lease_ts) > now)
+                       or _active_operation_progressing(meta, now))
         ceiling_reached = runtime_sec >= abs_ceiling
 
         # Hard axes (deadline_at, abs ceiling) stop the task regardless of activity; the

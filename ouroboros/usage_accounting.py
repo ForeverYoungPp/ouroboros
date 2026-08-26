@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, Iterator, Literal, Optional, Sequence, T
 from ouroboros.pricing import estimate_cost_optional
 from ouroboros._usage_response import _reported_token_count, usage_from_response
 from ouroboros.review_dispatch import invoke_bound_api_review_paid_stamp
-# One-way seam: usage_ledger owns bytes/validation; this module owns policy.
+from ouroboros.transport_custody import release_pre_dispatch_attempt
 from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
     LEDGER_REL,
     QUARANTINE_REL,
@@ -98,7 +98,6 @@ _LAST_PHYSICAL_ATTEMPT: contextvars.ContextVar[Optional["PhysicalAttemptCapture"
 _ROOT_ACCOUNTING_TELEMETRY: Dict[str, Dict[str, Any]] = {}
 _ROOT_ACCOUNTING_TELEMETRY_LOCK = threading.Lock()
 _ROOT_ACCOUNTING_TELEMETRY_CAP = 64
-
 def _stash_root_accounting(
     root_task_id: str,
     accounted_usd: Optional[float],
@@ -123,7 +122,6 @@ def _stash_root_accounting(
             "updated_monotonic": time.monotonic(),
         }
 
-
 def last_root_accounting(root_task_id: str) -> Optional[Dict[str, Any]]:
     """Newest process-local root snapshot, including in-flight holds."""
     with _ROOT_ACCOUNTING_TELEMETRY_LOCK:
@@ -133,7 +131,6 @@ def last_root_accounting(root_task_id: str) -> Optional[Dict[str, Any]]:
         entry = dict(entry)
     entry["age_sec"] = max(0.0, time.monotonic() - entry.pop("updated_monotonic"))
     return entry
-
 
 def refresh_root_accounting(
     drive_root: pathlib.Path | str | None,
@@ -159,7 +156,6 @@ def refresh_root_accounting(
     except Exception:
         log.debug("root accounting refresh failed for %s", root_task_id, exc_info=True)
         return cached
-
 
 class BudgetExceeded(UsageAccountingError):
     """Raised before dispatch when a known budget would be exceeded."""
@@ -213,7 +209,6 @@ class PhysicalAttemptContext:
     capacity_total_tokens: Optional[int]
     context_target_miss: bool
     automatic_pass_used: bool
-
 @dataclass(frozen=True)
 class AttemptRequest:
     model: str
@@ -908,6 +903,9 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
         current = _final_rows(records).get(reservation.attempt_id)
         if current is None:
             raise UsageAccountingError(f"unknown usage attempt {reservation.attempt_id}")
+        allow_release = bool(fields.pop("_allow_dispatched_release", False))
+        if state == "released" and current.get("state") == "dispatched" and not allow_release:
+            raise UsageAccountingError("dispatched attempts require a typed pre-dispatch release")
         row = {
             "kind": "attempt",
             "attempt_id": reservation.attempt_id,
@@ -1119,6 +1117,8 @@ def _is_tos_rejection(exc: BaseException) -> bool:
 
 def _terminalize_failed_attempt(reservation: AttemptReservation, exc: BaseException) -> str:
     """Route a raised provider send to its honest terminal ledger state."""
+    if release_pre_dispatch_attempt(reservation, exc):
+        return "released"
     provider = str(reservation.provider or "").strip().lower()
     if provider == "openrouter" and _is_pre_routing_rejection(exc):
         _transition(

@@ -85,16 +85,35 @@ class TestOwnerInjectPerTask(unittest.TestCase):
         """The loop drain returns the typed control instead of injecting it
         as owner prose."""
         import queue as _q
+        from ouroboros import task_pacing
+        from ouroboros.deadline_utils import parse_deadline_ts
         from ouroboros.loop import _drain_incoming_messages
-        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
+        from ouroboros.owner_mailbox import (
+            KIND_FINALIZE_NOW,
+            drain_owner_entries,
+            write_owner_message,
+        )
 
-        write_owner_message(self.drive_root, "hard_timeout", task_id="t10", kind=KIND_FINALIZE_NOW)
+        write_owner_message(
+            self.drive_root, "hard_timeout", task_id="t10",
+            msg_id="finalize-1", kind=KIND_FINALIZE_NOW,
+        )
         write_owner_message(self.drive_root, "keep going please", task_id="t10")
+        control_entry = next(
+            row for row in drain_owner_entries(self.drive_root, "t10")
+            if row["msg_id"] == "finalize-1"
+        )
+        expected_deadline = (
+            parse_deadline_ts(control_entry["ts"]).timestamp()
+            + task_pacing.effective_finalization_reserve_sec(None)
+        )
         messages = []
         controls = _drain_incoming_messages(
             messages, _q.Queue(), self.drive_root, "t10", None, set()
         )
-        self.assertEqual(controls, {"finalize_now": "hard_timeout"})
+        self.assertEqual(set(controls), {"finalize_now", "finalize_deadline_ts"})
+        self.assertEqual(controls["finalize_now"], "hard_timeout")
+        self.assertEqual(controls["finalize_deadline_ts"], expected_deadline)
         joined = json.dumps(messages, ensure_ascii=False)
         self.assertIn("keep going please", joined)
         self.assertNotIn("hard_timeout", joined)

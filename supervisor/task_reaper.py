@@ -670,6 +670,10 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                             _incident_chat_id(task, owner_chat_id))
         return
 
+    workers_mod._reconcile_confirmed_dead_review_owner(
+        int(getattr(proc, "pid", 0) or 0)
+    )
+
     try:
         from ouroboros.tools.services import archive_task_service_logs
 

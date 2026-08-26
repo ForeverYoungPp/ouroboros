@@ -2,20 +2,30 @@
 
 import json
 
-from ouroboros.skill_review_passes import run_skill_review_passes
+from ouroboros.skill_review_passes import (
+    _skill_review_retry_key,
+    run_skill_review_passes,
+)
 
 
 def _fake_build_prompt(ctx, drive_root, skill, *, manifest_dump, content_hash, file_pack, history, review_rebuttal):
     return f"STABLE::DYNAMIC[{file_pack}]", len("STABLE::"), {"adv": file_pack}
 
 
-def _run(file_packs, run_review, required_items=(), *, models=None, row_plan=None):
+def _run(
+    file_packs, run_review, required_items=(), *, models=None, row_plan=None,
+    usage_attribution=None, review_contract_fingerprint="",
+    rebuttal_sha256="",
+):
     return run_skill_review_passes(
         None, None, None,
         evidence={"manifest_dump": "", "content_hash": "h", "history": [],
                   "review_rebuttal": "", "required_items": required_items},
         file_packs=file_packs, models=models or ["m"], row_plan=row_plan,
         session_root="/repo",
+        usage_attribution=usage_attribution,
+        review_contract_fingerprint=review_contract_fingerprint,
+        rebuttal_sha256=rebuttal_sha256,
         build_prompt=_fake_build_prompt, run_review=run_review,
     )
 
@@ -112,6 +122,66 @@ def test_chunked_passes_keep_the_full_row_plan_and_exact_session_evidence():
         assert all(path in call["session_task"] for path in (
             "BIBLE.md", "docs/CHECKLISTS.md", "ouroboros/contracts/plugin_api.py"))
         assert f"PART {idx} of 2" in call["session_task"]
+
+
+def test_retry_identity_separates_skill_waves_and_exact_chunks():
+    row_plan = {"routes": []}
+
+    def collect(wave_id, packs):
+        keys = []
+
+        def fake_run_review(ctx, **kwargs):
+            keys.append(kwargs["retry_key"])
+            return json.dumps({"results": [_actor("ok")]})
+
+        _prompt, _adv, _text, error = _run(
+            packs,
+            fake_run_review,
+            row_plan=row_plan,
+            usage_attribution={
+                "review_skill": "demo",
+                "review_wave_id": wave_id,
+            },
+            review_contract_fingerprint="contract-1",
+            rebuttal_sha256="rebuttal-1",
+        )
+        assert error == ""
+        return keys
+
+    first = collect("wave-a", ["same-pack", "same-pack"])
+    replay = collect("wave-a", ["same-pack", "same-pack"])
+    other_wave = collect("wave-b", ["same-pack", "same-pack"])
+
+    assert first == replay
+    assert all(key.startswith("skill_review:") for key in first)
+    assert len(set(first)) == 2  # identical bytes remain distinct chunk positions
+    assert set(first).isdisjoint(other_wave)
+
+
+def test_retry_identity_binds_every_material_contract_field():
+    base = {
+        "skill_name": "demo",
+        "wave_id": "wave-a",
+        "content_hash": "content-a",
+        "contract_fingerprint": "contract-a",
+        "rebuttal_sha256": "rebuttal-a",
+        "pack": "pack-a",
+        "chunk_index": 0,
+        "chunk_count": 2,
+    }
+    expected = _skill_review_retry_key(**base)
+    mutations = {
+        "skill_name": "other",
+        "wave_id": "wave-b",
+        "content_hash": "content-b",
+        "contract_fingerprint": "contract-b",
+        "rebuttal_sha256": "rebuttal-b",
+        "pack": "pack-b",
+        "chunk_index": 1,
+        "chunk_count": 3,
+    }
+    for field, value in mutations.items():
+        assert _skill_review_retry_key(**{**base, field: value}) != expected
 
 
 def test_chunk_service_error_propagates_as_infra_error():

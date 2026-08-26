@@ -288,8 +288,14 @@ def _validate_records(
             if state not in {"dispatched", "released"}:
                 raise UsageLedgerCorrupt(f"invalid transition {previous}->{state}")
         elif previous == "dispatched":
-            if state not in {"settled", "unresolved"}:
+            if state not in {"settled", "unresolved", "released"}:
                 raise UsageLedgerCorrupt(f"invalid transition {previous}->{state}")
+            if state == "released" and not str(row.get("reason") or "").startswith(
+                "before_dispatch_failed:"
+            ):
+                raise UsageLedgerCorrupt(
+                    f"dispatched->released requires a typed pre-dispatch reason at seq={row.get('seq')}"
+                )
         else:
             raise UsageLedgerCorrupt(f"attempt {attempt_id} changed after terminal state")
         states[attempt_id] = state

@@ -687,6 +687,37 @@ def test_provider_unavailable_without_model_answer_stamps_host_salvage(
     assert usage["terminal_origin"] == "host_salvage"
 
 
+def test_deadline_exhausted_forced_finalization_keeps_local_reason(tmp_path, monkeypatch):
+    import time
+    from ouroboros.outcomes import derive_loop_outcome
+
+    loop, _registry, limit_ctx, _trace = _forced_test_context(
+        tmp_path, usage={"_last_llm_error_kind": "deadline_exhausted"},
+    )
+    limit_ctx.deadline_ts = time.time() + 30
+    monkeypatch.setattr(
+        loop,
+        "call_llm_with_retry",
+        lambda *_args, **_kwargs: (
+            {"role": "assistant", "content": "Best answer before deadline."},
+            0.0,
+        ),
+    )
+
+    text, usage, returned_trace = loop._handle_provider_unavailable(
+        limit_ctx, error_kind="deadline_exhausted",
+    )
+
+    assert text == "Best answer before deadline."
+    assert usage["reason_code"] == "deadline_local"
+    assert usage["execution_status"] == "failed"
+    assert usage["_best_effort_extracted"] is True
+    assert returned_trace["forced_finalization"]["reason_code"] == "deadline_local"
+    outcome = derive_loop_outcome(text, usage, returned_trace)
+    assert outcome["outcome_axes"]["execution"]["status"] == "best_effort"
+    assert outcome["outcome_axes"]["execution"]["reason_code"] == "deadline_local"
+
+
 def test_normal_host_suffix_is_inside_candidate_and_panel_subject(tmp_path, monkeypatch):
     import hashlib
 
@@ -1129,6 +1160,34 @@ def test_second_forced_owner_arrival_returns_exact_resume_fallback(tmp_path, mon
     ).hexdigest()
     assert returned_trace["forced_finalization"]["source"] == (
         "late_owner_directive_requires_resume"
+    )
+
+
+def test_forced_owner_refresh_does_not_resend_unknown_provider_outcome(tmp_path, monkeypatch):
+    incoming = queue.Queue()
+    loop, registry, ctx, _trace = _forced_test_context(tmp_path, incoming=incoming)
+    calls = 0
+
+    def forced_model(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        ctx.accumulated_usage["_last_llm_error_kind"] = "provider_outcome_unknown"
+        incoming.put("retain this owner directive for resume")
+        return {"role": "assistant", "content": ""}, 0.0
+
+    monkeypatch.setattr(loop, "call_llm_with_retry", forced_model)
+    text, _usage, returned_trace = loop._forced_final_answer(
+        ctx,
+        prompt="finalize",
+        fallback_text="fallback",
+        reason_code="round_limit",
+    )
+
+    assert calls == 1
+    assert "Resume the task" in text
+    assert len(registry._ctx._owner_directives) == 1
+    assert returned_trace["forced_finalization"]["source"] == (
+        "provider_outcome_unknown_no_resend"
     )
 
 

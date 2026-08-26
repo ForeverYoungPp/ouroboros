@@ -876,17 +876,23 @@ def verify_system_state(env: Any, git_sha: str) -> None:
     )
     issues += 1 if growth_notes else 0
 
-    # Reconcile stale hung reviewed attempts left by abrupt process death
+    # The startup boundary proves that process-local reviewer threads from the
+    # prior worker are gone. Delegated rows with a durable invocation token keep
+    # their existing recovery path; TTL never authorizes a paid resend.
     try:
-        import pathlib
-        from ouroboros.review_state import _utc_now, update_state
-        drive_root = pathlib.Path(env.drive_root) if hasattr(env, "drive_root") else env.drive_path("").parent
-        expired = update_state(
-            drive_root,
-            lambda st: st.expire_stale_attempts(now_ts=_utc_now()),
-        )
+        review_reconciliation = _reconcile_review_attempts_on_startup(env)
+        reconciled = review_reconciliation["reconciled"]
+        expired = review_reconciliation["expired"]
+        if reconciled:
+            log.warning(
+                "Reconciled custody for %d reviewed attempt(s) on startup",
+                len(reconciled),
+            )
         if expired:
-            log.warning("Auto-expired %d stale reviewed attempt(s) on startup", len(expired))
+            log.warning(
+                "Auto-expired %d stale unpaid reviewed attempt(s) on startup",
+                len(expired),
+            )
     except Exception:
         log.debug("Failed to reconcile commit attempt state", exc_info=True)
 
@@ -904,6 +910,20 @@ def verify_system_state(env: Any, git_sha: str) -> None:
 
     if issues > 0:
         log.warning(f"Startup verification found {issues} issue(s): {checks}")
+
+
+def _reconcile_review_attempts_on_startup(env: Any) -> Dict[str, Any]:
+    """Reconcile only owners proven dead from an older server generation."""
+    from ouroboros.review_owner_custody import (
+        reconcile_review_custody_on_process_start,
+    )
+
+    drive_root = (
+        pathlib.Path(env.drive_root)
+        if hasattr(env, "drive_root")
+        else env.drive_path("").parent
+    )
+    return reconcile_review_custody_on_process_start(drive_root)
 
 
 def inject_crash_report(env: Any) -> None:
