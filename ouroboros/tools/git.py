@@ -943,6 +943,8 @@ def _subject_binding_mismatch_outcome(
         block_class=BLOCK_CLASS_INFRA,
         pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
         fingerprint_status="invalid",
+        triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+        scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
     )
     return {
         "status": "blocked",
@@ -2497,10 +2499,10 @@ def _check_evolution_commit_stage(
         block_details=message,
         duration_sec=time.time() - started_at,
         phase=phase,
-        **({
-            "triad_models": getattr(ctx, "_last_triad_models", []),
-            "scope_model": getattr(ctx, "_last_scope_model", ""),
-        } if phase == "pre_tag_authority" else {}),
+        triad_models=getattr(ctx, "_last_triad_models", []),
+        scope_model=getattr(ctx, "_last_scope_model", ""),
+        triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+        scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
     )
     return claim, message
 
@@ -2692,6 +2694,8 @@ def _record_evolution_commit_receipt(
         phase="post_commit_authority",
         triad_models=getattr(ctx, "_last_triad_models", []),
         scope_model=getattr(ctx, "_last_scope_model", ""),
+        triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+        scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
     )
     return message
 
@@ -2851,7 +2855,9 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
     _fail = lambda msg: msg if bool(getattr(ctx, "_review_resume_pending", False)) else (
         _record_commit_attempt(ctx, commit_message, "failed",
             block_reason="infra_failure", block_details=msg,
-            duration_sec=time.time() - _commit_start), msg)[1]
+            duration_sec=time.time() - _commit_start,
+            triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+            scope_raw_result=getattr(ctx, "_last_scope_raw_result", {})), msg)[1]
     try:
         came_from_detached_checkout, preparation_error = _prepare_review_commit_worktree(
             ctx, _managed_tx

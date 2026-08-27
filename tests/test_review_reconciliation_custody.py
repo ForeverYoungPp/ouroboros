@@ -255,6 +255,73 @@ def test_row_level_active_custody_reuses_terminal_attempt_instead_of_forking(tmp
     assert attempts[0].triad_raw_results[0]["operation_id"] == "op-a"
 
 
+def test_terminal_authority_failure_reconciles_reserved_roster(tmp_path, monkeypatch):
+    from ouroboros.review_state import (
+        AdvisoryReviewState,
+        CommitAttemptRecord,
+        load_state,
+        make_repo_key,
+        save_state,
+    )
+    from ouroboros.tools import git as git_tools
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    drive = tmp_path / "data"
+    repo_key = make_repo_key(repo)
+    state = AdvisoryReviewState()
+    state.record_attempt(CommitAttemptRecord(
+        ts="2026-08-24T00:00:00+00:00",
+        commit_message="same",
+        status="reviewing",
+        repo_key=repo_key,
+        tool_name="commit_reviewed",
+        task_id="task-authority",
+        attempt=1,
+        paid=True,
+        triad_raw_results=[{
+            "slot_id": "slot-a", "operation_id": "op-a",
+            "operation_state": "in_flight", "late_result_pending": True,
+        }],
+    ))
+    save_state(drive, state)
+    monkeypatch.setattr(
+        "supervisor.evolution_lifecycle.check_evolution_authority",
+        lambda **_kwargs: {"ok": False, "reason": "claim_gone"},
+    )
+    ctx = SimpleNamespace(
+        repo_dir=repo,
+        drive_root=drive,
+        task_id="task-authority",
+        task_metadata={
+            "evolution_transaction": {
+                "campaign_id": "campaign",
+                "transaction_id": "transaction",
+                "task_id": "task-authority",
+            },
+        },
+        _current_review_attempt_number=1,
+        _last_triad_models=[],
+        _last_scope_model="",
+        _last_triad_raw_results=[{
+            "slot_id": "slot-a", "operation_id": "op-a",
+            "operation_state": "settled", "late_result_pending": False,
+        }],
+        _last_scope_raw_result={},
+    )
+
+    _claim, message = git_tools._check_evolution_commit_stage(
+        ctx, "same", 0.0, phase="pre_commit_authority",
+    )
+
+    assert "claim_gone" in message
+    attempt = load_state(drive).attempts[-1]
+    assert attempt.status == "blocked"
+    assert attempt.triad_raw_results[0]["operation_state"] == "settled"
+    assert attempt.late_result_pending is False
+    assert load_state(drive).get_active_attempts(repo_key=repo_key) == []
+
+
 def test_duplicate_current_slot_is_rejected_order_independently():
     original = {
         "slot_id": "slot-1", "model_id": "m1", "status": "error",

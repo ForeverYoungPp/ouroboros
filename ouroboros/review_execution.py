@@ -359,9 +359,8 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
         return _messages_char_count(self.messages)
 
     def _kwargs(self) -> Dict[str, Any]:
+        request, slot = self.assignment.request, self.assignment.slot
         if self._chat_kwargs is None:
-            request, slot = self.assignment.request, self.assignment.slot
-            transport = review_transport_timeout(slot.model, getattr(slot, "transport_timeout_sec", None), getattr(request, "deadline_at", ""))
             self._chat_kwargs = {
                 "messages": self.messages,
                 "model": slot.model,
@@ -369,15 +368,16 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
                 "max_tokens": int(request.max_tokens or slot.max_tokens),
                 "temperature": request.temperature if request.temperature is not None else slot.temperature,
                 "no_proxy": bool(request.no_proxy),
-                # Stable per-surface session affinity: changing evidence would
-                # otherwise fragment default first-user-message sticky routing
-                # (and the provider cache) on every round. Deliberately NO
-                # slot_id in the key — same-model slots keep today's
-                # provider-concentration behavior.
+                # Keep stable per-surface affinity; same-model slots intentionally share it.
                 "cache_affinity": f"{request.surface}:{request.task_id or 'review'}",
-                "timeout": transport,
                 "use_local": bool(slot.use_local),
             }
+        # Recompute this per physical send because the executor is reused for retries.
+        self._chat_kwargs["timeout"] = review_transport_timeout(
+            slot.model,
+            getattr(slot, "transport_timeout_sec", None),
+            getattr(request, "deadline_at", ""),
+        )
         return self._chat_kwargs
 
     def execute(self) -> ReviewAttemptResult:

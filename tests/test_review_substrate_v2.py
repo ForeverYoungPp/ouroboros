@@ -2025,6 +2025,35 @@ def test_review_transport_timeout_is_narrowed_by_request_deadline(tmp_path, monk
     assert captured and 0 < captured[0]["timeout"] <= 5
 
 
+def test_api_chat_retry_recomputes_transport_window(tmp_path, monkeypatch):
+    from ouroboros import review_execution
+
+    captured = []
+    transport_windows = iter((479.96, 1.0))
+
+    class RetryingLLM:
+        def chat(self, **kwargs):
+            captured.append(kwargs["timeout"])
+            if len(captured) == 1:
+                return {"content": ""}, {}
+            return {"content": '{"verdict":"PASS","findings":[],"summary":"ok"}'}, {}
+
+    monkeypatch.setattr(
+        review_execution,
+        "review_transport_timeout",
+        lambda *_args: next(transport_windows),
+    )
+    result = run_review_request(
+        ReviewRequest(surface="scope_review", goal="retry", task_id="retry-timeout"),
+        slots=[ReviewSlot(slot_id="slot_a", model="same/model")],
+        drive_root=tmp_path,
+        llm=RetryingLLM(),
+    )
+
+    assert result.aggregate_signal == "PASS"
+    assert captured == [479.96, 1.0]
+
+
 def test_direct_anthropic_route_keeps_provider_default_transport(tmp_path):
     captured = []
 
