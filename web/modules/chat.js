@@ -2140,7 +2140,6 @@ export function createChatInstance({
         if (!isLegacyParentSubagentKey) {
             record.finished = isTerminalTaskPhase(nextPhase, summary.terminal);
         }
-        if (record.finished !== wasFinished) record.root.dataset.finished = record.finished ? '1' : '0';
         if (summary.human && headline) {
             record.lastHumanHeadline = headline;
         }
@@ -2278,6 +2277,7 @@ export function createChatInstance({
         // task_done terminates the card HERE without passing finishLiveCard, so
         // the cancelable marker must be dropped on this path too (P3 growth cap).
         if (justFinished) {
+            record.root.dataset.finished = '1';
             cancelableTaskIds.delete(record.groupId);
             syncCancelRunButton(record);
         }
