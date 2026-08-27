@@ -53,7 +53,13 @@ def _observation(plan, host, *, wildcard=False, workspace_socket=False, mode=Non
         "NetworkSettings": {"Networks": {plan.network_name: workspace_network}},
         "Mounts": workspace_mounts,
     }
-    return {"docker_host": host.value, "server": server, "workspace": workspace, "executor_network": "host"}
+    return {
+        "docker_host": host.value,
+        "network": {"Name": plan.network_name, "Id": "net-123", "Internal": True, "Driver": "bridge"},
+        "server": server,
+        "workspace": workspace,
+        "executor_network": "host",
+    }
 
 
 def _connectivity():

@@ -814,18 +814,28 @@ def check_sidecar_attestation(
         if observed_host_ref is None or observed_host_ref.value != expected.docker_host.value:
             failures.append("docker_host_mismatch")
     network_observation = observation.get("network")
-    network_report: dict[str, Any] = {"name": expected.plan.network_name, "id": expected.network_id, "internal": None}
+    network_report: dict[str, Any] = {
+        "name": expected.plan.network_name,
+        "id": expected.network_id,
+        "internal": None,
+        "driver": None,
+    }
     if isinstance(network_observation, Mapping):
         observed_network_name = network_observation.get("Name") or network_observation.get("name")
         observed_network_id = network_observation.get("Id") or network_observation.get("ID") or network_observation.get("id")
         internal = network_observation.get("Internal")
-        network_report = {"name": observed_network_name, "id": observed_network_id, "internal": internal}
+        driver = network_observation.get("Driver") or network_observation.get("driver")
+        network_report = {"name": observed_network_name, "id": observed_network_id, "internal": internal, "driver": driver}
         if observed_network_name != expected.plan.network_name:
             failures.append("network.name")
         if expected.network_id is not None and observed_network_id != expected.network_id:
             failures.append("network.id")
         if internal is not True:
             failures.append("network.internal")
+        if driver != "bridge":
+            failures.append("network.driver")
+    else:
+        failures.append("network_observation_unknown")
     server_report, more = _container_report(
         server, expected, "server", expected.server_container_name, expected.server_container_id, expected.server_pid
     )
