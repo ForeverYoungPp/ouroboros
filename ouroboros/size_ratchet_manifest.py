@@ -211,5 +211,5 @@ BYTE_DEBT = {
     "ouroboros/loop.py": 314553,
     "tests/test_delegated_subagent_transport.py": 320571,
     "tests/test_devtools_benchmarks.py": 328282,
-    "web/modules/chat.js": 224759,
+    "web/modules/chat.js": 224736,
 }

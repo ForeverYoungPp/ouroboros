@@ -1413,16 +1413,12 @@ export function createChatInstance({
     function attachReviewGroup(group, rawTs = '') {
         const ownerTaskId = String(group?.presentationOwnerTaskId || '').trim();
         if (!ownerTaskId) return false;
-        // Late refs never resurrect a retired card; deliberate replay clears the fence.
         if (retiredTaskIds.has(ownerTaskId) && !liveCardRecords.has(ownerTaskId)) return true;
         const ownerState = forceTaskCard(ownerTaskId, rawTs);
         if (!ownerState?.cardVisible) return false;
         const record = liveCardRecords.get(ownerTaskId);
         const merged = record?.reviewController?.update(group);
         if (merged) {
-            // History replay builds review-only owners while pass 1 suppresses
-            // DOM insertion. The pass-2 row is intentionally consumed by this
-            // seam, so make the already-created owner visible before returning.
             if (!_syncPass1Active) ensureLiveCardVisible(record);
             if (rawTs) reanchorVisibleTaskCard(ownerState, rawTs);
             if (!record.reviewOwnerDetailObserved) {
