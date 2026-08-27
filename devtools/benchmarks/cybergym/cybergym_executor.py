@@ -16,6 +16,7 @@ The upstream server remains the source of truth for vulnerable/fixed exits;
 from __future__ import annotations
 
 import base64
+import copy
 import dataclasses
 import gzip
 import hashlib
@@ -23,11 +24,14 @@ import json
 import math
 import os
 import pathlib
+import posixpath
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
@@ -88,6 +92,7 @@ _MASKED_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,255}$")
 _OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _EXPECTED_MODEL = OFFICIAL_MODEL
+_ARCHIVE_RENAME_DIR_FD = os.rename in os.supports_dir_fd
 _SAFE_ENV_NAMES = (
     "PATH",
     "HOME",
@@ -1076,19 +1081,340 @@ def _write_json(path: pathlib.Path, value: Mapping[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def _safe_extract(archive: pathlib.Path, destination: pathlib.Path) -> None:
-    """Extract only members that remain below the task workspace."""
+_ARCHIVE_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 
-    destination.mkdir(parents=True, exist_ok=True)
-    root = destination.resolve(strict=False)
-    with tarfile.open(archive, "r:*") as tar:
-        for member in tar.getmembers():
-            target = (destination / member.name).resolve(strict=False)
-            _inside(target, root, "archive member")
-            if member.issym() or member.islnk() or member.isdev():
-                raise ExecutorFailure("task archive contains a link or device member")
-        for member in tar.getmembers():
-            tar.extract(member, destination)
+
+def _archive_relative(value: Any, *, field: str) -> str:
+    """Normalize one POSIX archive path and keep it relative."""
+    if not isinstance(value, str) or not value:
+        raise ExecutorFailure(f"task archive {field} is empty")
+    if "\x00" in value or "\\" in value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ExecutorFailure(f"task archive {field} contains unsafe characters")
+    if value.startswith("/") or _ARCHIVE_DRIVE_PREFIX.match(value):
+        raise ExecutorFailure(f"task archive {field} must be relative")
+    normalized = posixpath.normpath(value)
+    if normalized in {"", "."}:
+        return "."
+    if normalized.startswith("../") or normalized == "..":
+        raise ExecutorFailure(f"task archive {field} escapes its workspace")
+    # A colon is legal on POSIX but has drive/alternate-stream meaning on
+    # Windows; reject it in every component so the same archive contract holds
+    # on both Python 3.10 worker platforms.
+    if any(":" in component for component in normalized.split("/")):
+        raise ExecutorFailure(f"task archive {field} contains a platform path separator")
+    return normalized
+
+
+def _archive_link_target(member_name: str, linkname: Any) -> str:
+    """Resolve a symlink target lexically inside the archive."""
+    if not isinstance(linkname, str) or not linkname:
+        raise ExecutorFailure("task archive symlink target is empty")
+    return _archive_relative(
+        posixpath.join(posixpath.dirname(member_name), linkname),
+        field="symlink target",
+    )
+
+
+def _archive_path(root: pathlib.Path, relative: str) -> pathlib.Path:
+    """Join a validated POSIX path without host separator tricks."""
+    return root if relative == "." else root.joinpath(*pathlib.PurePosixPath(relative).parts)
+
+
+def _assert_archive_parent_is_directory(root: pathlib.Path, relative: str) -> None:
+    """Reject an existing symlink or non-directory in a member's parents."""
+    current = root
+    for part in pathlib.PurePosixPath(relative).parts[:-1]:
+        current /= part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ExecutorFailure("task archive destination cannot be inspected") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ExecutorFailure("task archive destination contains a symlinked parent")
+        if not stat.S_ISDIR(info.st_mode):
+            raise ExecutorFailure("task archive destination parent is not a directory")
+
+
+def _assert_archive_root_is_not_symlink(path: pathlib.Path) -> None:
+    """Reject a destination whose lexical path resolves through a link."""
+    absolute = pathlib.Path(os.path.abspath(os.fspath(path)))
+    try:
+        resolved = absolute.resolve(strict=False)
+    except OSError as exc:
+        raise ExecutorFailure("task archive destination cannot be inspected") from exc
+    if resolved != absolute:
+        raise ExecutorFailure("task archive destination must not traverse a symlink")
+
+
+def _archive_resolve(
+    relative: str,
+    member_types: Mapping[str, str],
+    link_targets: Mapping[str, str],
+    implicit_dirs: set[str],
+) -> tuple[str, str]:
+    """Resolve path components and symlink chains inside an archive graph."""
+    pending = [] if relative == "." else list(pathlib.PurePosixPath(relative).parts)
+    resolved: list[str] = []
+    seen: set[str] = set()
+    while pending:
+        component = pending.pop(0)
+        candidate = "/".join((*resolved, component))
+        kind = member_types.get(candidate)
+        if kind == "link":
+            if candidate in seen:
+                raise ExecutorFailure("task archive contains a symlink cycle")
+            seen.add(candidate)
+            target = link_targets.get(candidate)
+            if target is None:  # pragma: no cover - graph construction invariant
+                raise ExecutorFailure("task archive contains a broken symlink")
+            # Link targets are already normalized relative to the archive root;
+            # replace the resolved prefix and continue with any suffix components.
+            pending = ([] if target == "." else list(pathlib.PurePosixPath(target).parts)) + pending
+            resolved = []
+            continue
+        resolved.append(component)
+    canonical = "/".join(resolved) or "."
+    kind = member_types.get(canonical)
+    if kind is None and canonical in implicit_dirs:
+        kind = "dir"
+    if kind is None:
+        raise ExecutorFailure("task archive contains a broken symlink")
+    return canonical, kind
+
+
+def _archive_link_kind(
+    relative: str,
+    member_types: Mapping[str, str],
+    link_targets: Mapping[str, str],
+    implicit_dirs: set[str],
+) -> str:
+    """Return the terminal type of a link target, including component links."""
+    return _archive_resolve(relative, member_types, link_targets, implicit_dirs)[1]
+
+
+def _remove_archive_path(path: pathlib.Path) -> None:
+    """Remove one known staging/published path without following a symlink."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _safe_extract(archive: pathlib.Path, destination: pathlib.Path) -> None:
+    """Extract a confined tree while preserving safe CyberGym symlinks.
+
+    Python 3.10 has no dependable extraction filter.  Validate the complete
+    member/link graph, extract directories/files before links, and create only
+    canonical relative symlinks.
+    """
+
+    destination = pathlib.Path(destination).expanduser()
+    _assert_archive_root_is_not_symlink(destination)
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        destination = destination.resolve(strict=True)
+        root_info = destination.lstat()
+    except OSError as exc:
+        raise ExecutorFailure("task archive destination is unavailable") from exc
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise ExecutorFailure("task archive destination must be a regular directory")
+
+    staging: pathlib.Path | None = None
+    published: list[pathlib.Path] = []
+
+    def rollback() -> None:
+        rollback_error: Exception | None = None
+        for path in reversed(published):
+            try:
+                _remove_archive_path(path)
+            except Exception as exc:  # pragma: no cover - filesystem failure
+                rollback_error = exc
+        published.clear()
+        if rollback_error is not None:
+            raise ExecutorFailure("task archive publish rollback failed") from rollback_error
+
+    try:
+        staging = pathlib.Path(
+            tempfile.mkdtemp(prefix=f".{destination.name}.extract-", dir=destination.parent)
+        )
+        root = staging
+        with tarfile.open(archive, "r:*") as tar:
+            members: dict[str, tarfile.TarInfo] = {}
+            member_types: dict[str, str] = {}
+            implicit_dirs: set[str] = {"."}
+            link_targets: dict[str, str] = {}
+            for member in tar.getmembers():
+                relative = _archive_relative(member.name, field="member name")
+                if relative in members:
+                    raise ExecutorFailure("task archive contains duplicate member paths")
+                if member.isdir():
+                    kind = "dir"
+                elif member.isreg():
+                    kind = "file"
+                elif member.issym():
+                    kind = "link"
+                else:
+                    raise ExecutorFailure("task archive contains a special member")
+                if relative == "." and kind != "dir":
+                    raise ExecutorFailure("task archive root member must be a directory")
+                members[relative] = member
+                member_types[relative] = kind
+                for parent in pathlib.PurePosixPath(relative).parents:
+                    parent_text = parent.as_posix()
+                    if parent_text != ".":
+                        implicit_dirs.add(parent_text)
+                if kind == "link":
+                    link_targets[relative] = _archive_link_target(relative, member.linkname)
+
+            # Reject file/link parents before any filesystem write.  Archive
+            # contents are published only after the complete graph is valid.
+            for relative in member_types:
+                for parent in pathlib.PurePosixPath(relative).parents:
+                    parent_text = parent.as_posix()
+                    if parent_text != "." and member_types.get(parent_text) not in {None, "dir"}:
+                        raise ExecutorFailure("task archive member parent is not a directory")
+
+            link_resolutions: dict[str, tuple[str, str]] = {}
+            for relative, target in link_targets.items():
+                resolved_target, kind = _archive_resolve(
+                    target, member_types, link_targets, implicit_dirs
+                )
+                if kind not in {"dir", "file"}:
+                    raise ExecutorFailure("task archive symlink target is not a regular path")
+                link_resolutions[relative] = (resolved_target, kind)
+
+            top_levels = sorted(
+                {
+                    pathlib.PurePosixPath(relative).parts[0]
+                    for relative in members
+                    if relative != "."
+                }
+            )
+            for top in top_levels:
+                try:
+                    destination.joinpath(top).lstat()
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise ExecutorFailure("task archive destination cannot be inspected") from exc
+                raise ExecutorFailure("task archive member would overwrite an existing path")
+
+            # Create all parent directories while no archive symlink exists.
+            directory_names = sorted(
+                implicit_dirs | {name for name, kind in member_types.items() if kind == "dir"},
+                key=lambda name: (len(pathlib.PurePosixPath(name).parts), name),
+            )
+            for relative in directory_names:
+                if relative == ".":
+                    continue
+                path = _archive_path(root, relative)
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    info = None
+                if info is not None:
+                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                        raise ExecutorFailure("task archive directory collides with a non-directory")
+                    continue
+                path.mkdir()
+
+            # Keep tar stream order; repeated backward seeks make gzip archives
+            # unexpectedly expensive.  Only regular files/directories reach
+            # tarfile, so Python 3.10 cannot create an unvalidated link here.
+            for relative, member in members.items():
+                # Directories were created above with writable mode.  Do not
+                # let tarfile apply an archive directory mode (for example
+                # 0644) before its child files are written.
+                if member_types[relative] != "file":
+                    continue
+                _assert_archive_parent_is_directory(root, relative)
+                extracted = copy.copy(member)  # TarInfo uses slots on Python 3.10.
+                extracted.name = relative
+                tar.extract(extracted, root)
+
+            # Create links manually, after all regular members, and preserve the
+            # archive's relative target spelling.
+            for relative in sorted(link_targets):
+                path = _archive_path(root, relative)
+                target = link_targets[relative]
+                link_from = posixpath.dirname(relative) or "."
+                linkname = posixpath.relpath(target, link_from)
+                try:
+                    os.symlink(linkname, path)
+                except FileExistsError as exc:
+                    raise ExecutorFailure("task archive symlink would overwrite an existing path") from exc
+
+            for relative, (_resolved_target, expected) in link_resolutions.items():
+                path = _archive_path(root, relative)
+                try:
+                    info = path.lstat()
+                    resolved = path.resolve(strict=True)
+                    resolved.relative_to(root)
+                    resolved_info = resolved.stat()
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise ExecutorFailure("task archive produced a broken or external symlink") from exc
+                if not stat.S_ISLNK(info.st_mode):
+                    raise ExecutorFailure("task archive symlink was not preserved")
+                if (expected == "dir" and not stat.S_ISDIR(resolved_info.st_mode)) or (
+                    expected == "file" and not stat.S_ISREG(resolved_info.st_mode)
+                ):
+                    raise ExecutorFailure("task archive symlink target changed type")
+
+        # Publish only validated top-level entries.  On POSIX use directory
+        # descriptors opened with O_NOFOLLOW so a replaced destination path
+        # cannot redirect the rename outside the task directory.
+        if top_levels:
+            _assert_archive_root_is_not_symlink(destination)
+            dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            dest_fd: int | None = None
+            stage_fd: int | None = None
+            try:
+                if _ARCHIVE_RENAME_DIR_FD:
+                    dest_fd = os.open(destination, dir_flags)
+                    stage_fd = os.open(staging, dir_flags)
+                    for top in top_levels:
+                        try:
+                            os.stat(top, dir_fd=dest_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            raise ExecutorFailure("task archive destination changed before publish")
+                        os.rename(top, top, src_dir_fd=stage_fd, dst_dir_fd=dest_fd)
+                        published.append(destination / top)
+                else:  # pragma: no cover - Python platforms without dir_fd rename
+                    for top in top_levels:
+                        target = destination / top
+                        try:
+                            target.lstat()
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            raise ExecutorFailure("task archive destination changed before publish")
+                        os.replace(staging / top, target)
+                        published.append(target)
+            finally:
+                if stage_fd is not None:
+                    os.close(stage_fd)
+                if dest_fd is not None:
+                    os.close(dest_fd)
+    except ExecutorFailure:
+        rollback()
+        raise
+    except Exception as exc:
+        rollback()
+        raise ExecutorFailure("task archive extraction failed") from exc
+    finally:
+        if staging is not None:
+            try:
+                _remove_archive_path(staging)
+            except OSError as exc:  # pragma: no cover - filesystem failure
+                raise ExecutorFailure("task archive staging cleanup failed") from exc
 
 
 def _read_text(path: pathlib.Path, name: str, limit: int = 256_000) -> str:
@@ -1224,6 +1550,14 @@ class CyberGymExecutor:
         self._workspace_observations: dict[str, Mapping[str, Any]] = {}
         self._sidecar_attestation: dict[str, Any] = {}
         self._plans: dict[str, NetworkPlan] = {}
+        # Docker attaches a container to the network before ``docker run``
+        # returns its id.  The condition tracks that short pending-start window;
+        # it lets all lanes execute ``docker run`` concurrently while making an
+        # attestation wait until every started container has immutable custody.
+        self._registry_lock = threading.RLock()
+        self._registry_condition = threading.Condition(self._registry_lock)
+        self._workspace_starting: dict[str, int] = {}
+        self._unresolved_workspace_custody: dict[str, str] = {}
         # Gateway ids are registered before the admission POST and retained
         # until a settled status is observed.  This is the custody boundary:
         # a transport error after the server accepted a task must not let
@@ -1959,6 +2293,63 @@ class CyberGymExecutor:
             if init.returncode != 0 or not git_marker.exists():
                 raise ExecutorFailure("generated CyberGym workspace could not be made a git worktree")
 
+    def _recover_workspace_custody(
+        self, container_name: str, plan: NetworkPlan, reason: str
+    ) -> bool:
+        """Recover a container attached by a failed ``docker run`` by name.
+
+        Docker can create and attach the container before the runner receives
+        an id (for example, when the command times out).  Inspect the exact
+        generated name while it is still an owned handle, then publish the
+        immutable id only after the campaign/role/network/image checks pass.
+        If inspection cannot prove custody, retain a typed name entry so close
+        and attestation never silently treat the container as disposable.
+        """
+        observed: Mapping[str, Any] | None = None
+        failure_reason = str(reason or "workspace start failed")
+        try:
+            observed = self._inspect_optional("container", container_name)
+        except Exception as exc:
+            failure_reason += f"; name inspect failed: {type(exc).__name__}"
+        if observed is not None:
+            observed_id = str(observed.get("Id") or "").strip()
+            actual_name = str(observed.get("Name") or "").lstrip("/")
+            config = observed.get("Config")
+            labels = config.get("Labels", {}) if isinstance(config, Mapping) else {}
+            networks = ((observed.get("NetworkSettings") or {}).get("Networks") or {})
+            network = networks.get("cybergym-internal") if isinstance(networks, Mapping) else None
+            try:
+                bound = _bind_container_image(
+                    observed,
+                    self._workspace_image_observation,
+                    self.config.workspace_image_digest,
+                    "workspace",
+                )
+            except Exception as exc:
+                bound = None
+                failure_reason += f"; image custody failed: {type(exc).__name__}"
+            if (
+                observed_id
+                and _GATEWAY_TASK_ID.fullmatch(observed_id)
+                and actual_name == container_name
+                and isinstance(labels, Mapping)
+                and labels.get("com.ouroboros.campaign") == self.config.campaign_id
+                and labels.get("com.ouroboros.role") == "workspace"
+                and labels.get("com.ouroboros.agent_id") == plan.opaque_agent_id
+                and isinstance(network, Mapping)
+                and (not self.network_id or str(network.get("NetworkID") or "") == self.network_id)
+                and bound is not None
+            ):
+                with self._registry_condition:
+                    self._task_containers[container_name] = observed_id
+                    self._workspace_observations[container_name] = bound
+                    self._unresolved_workspace_custody.pop(container_name, None)
+                return True
+            failure_reason += "; inspected container did not prove ownership"
+        with self._registry_condition:
+            self._unresolved_workspace_custody[container_name] = failure_reason
+        return False
+
     def _workspace(self, task: TaskSpec, task_dir: pathlib.Path, plan: NetworkPlan) -> str:
         container_name = f"cybergym-workspace-{plan.opaque_agent_id}"
         spec = WorkspaceCommandSpec(
@@ -1970,37 +2361,61 @@ class CyberGymExecutor:
             command=self.config.command,
             labels={"com.ouroboros.image_digest": self.config.workspace_image_digest},
         )
-        result = self.config.command_runner(
-            build_workspace_argv(spec), cwd=self.config.run_root,
-            env=_minimal_child_env(self.host), timeout=120,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            raise ExecutorFailure("CyberGym workspace failed to start")
-        provisional_id = result.stdout.strip().splitlines()[-1].strip()
-        if not provisional_id or not _GATEWAY_TASK_ID.fullmatch(provisional_id):
-            raise ExecutorFailure("workspace start returned an unsafe container id")
-        # Record the id before the inspect call.  A successful ``docker run``
-        # followed by a daemon/transport inspect failure must still be
-        # recoverable by the campaign close path.
-        self._task_containers[container_name] = provisional_id
-        observed = self._inspect("container", container_name)
-        observed_id = str(observed.get("Id") or "").strip()
-        if not observed_id:
-            raise ExecutorFailure("workspace inspect returned no immutable container id")
-        if observed_id != provisional_id:
-            raise ExecutorFailure("workspace container id changed during startup")
-        self._task_containers[container_name] = observed_id
-        networks = ((observed.get("NetworkSettings") or {}).get("Networks") or {})
-        if "cybergym-internal" not in networks:
-            raise ExecutorFailure("workspace is not on cybergym-internal")
-        observed = _bind_container_image(
-            observed,
-            self._workspace_image_observation,
-            self.config.workspace_image_digest,
-            "workspace",
-        )
-        self._workspace_observations[container_name] = observed
-        return container_name
+        # A container is attached before ``docker run`` returns its id.  Mark
+        # the startup before invoking Docker, but do not hold the registry lock
+        # over the command: independent task lanes must retain parallel starts.
+        with self._registry_condition:
+            self._workspace_starting[container_name] = self._workspace_starting.get(container_name, 0) + 1
+            self._unresolved_workspace_custody.pop(container_name, None)
+        try:
+            try:
+                result = self.config.command_runner(
+                    build_workspace_argv(spec), cwd=self.config.run_root,
+                    env=_minimal_child_env(self.host), timeout=120,
+                )
+                if result.returncode != 0 or not result.stdout.strip():
+                    raise ExecutorFailure("CyberGym workspace failed to start")
+                provisional_id = result.stdout.strip().splitlines()[-1].strip()
+                if not provisional_id or not _GATEWAY_TASK_ID.fullmatch(provisional_id):
+                    raise ExecutorFailure("workspace start returned an unsafe container id")
+                # Publish the provisional id before inspect so a transport
+                # failure after ``run`` still leaves exact cleanup custody.
+                with self._registry_lock:
+                    self._task_containers[container_name] = provisional_id
+                observed = self._inspect("container", container_name)
+                observed_id = str(observed.get("Id") or "").strip()
+                if not observed_id:
+                    raise ExecutorFailure("workspace inspect returned no immutable container id")
+                if observed_id != provisional_id:
+                    raise ExecutorFailure("workspace container id changed during startup")
+                networks = ((observed.get("NetworkSettings") or {}).get("Networks") or {})
+                if "cybergym-internal" not in networks:
+                    raise ExecutorFailure("workspace is not on cybergym-internal")
+                observed = _bind_container_image(
+                    observed,
+                    self._workspace_image_observation,
+                    self.config.workspace_image_digest,
+                    "workspace",
+                )
+                with self._registry_lock:
+                    self._task_containers[container_name] = observed_id
+                    self._workspace_observations[container_name] = observed
+                    self._unresolved_workspace_custody.pop(container_name, None)
+                return container_name
+            except BaseException as exc:
+                with self._registry_lock:
+                    has_exact_id = bool(self._task_containers.get(container_name))
+                if not has_exact_id:
+                    self._recover_workspace_custody(container_name, plan, type(exc).__name__)
+                raise
+        finally:
+            with self._registry_condition:
+                count = self._workspace_starting.get(container_name, 0)
+                if count <= 1:
+                    self._workspace_starting.pop(container_name, None)
+                else:
+                    self._workspace_starting[container_name] = count - 1
+                self._registry_condition.notify_all()
 
     def _probe_from_workspace(self, container_id: str, script: str) -> bool | None:
         """Run one bounded, non-mutating connectivity probe in the agent container."""
@@ -2205,55 +2620,66 @@ class CyberGymExecutor:
         api_key: str,
     ) -> dict[str, Any]:
         """Run the complete sidecar custody/connectivity gate before gateway dispatch."""
-        cached_server = self._server_observation
-        cached_workspace = self._workspace_observations.get(workspace_name)
-        if not isinstance(cached_server, Mapping) or not isinstance(cached_workspace, Mapping):
-            raise ExecutorFailure("sidecar observations are incomplete")
-        # Names are only startup handles.  Re-inspect the immutable ids at the
-        # trust boundary immediately before the gateway POST so a replacement
-        # container, restart, or daemon mix-up cannot inherit an old attestation.
-        server_id = str(cached_server.get("Id") or self.server_id).strip()
-        workspace_id = str(
-            cached_workspace.get("Id") or self._task_containers.get(workspace_name) or ""
-        ).strip()
-        if not server_id or not workspace_id:
-            raise ExecutorFailure("sidecar observations omitted immutable container ids")
-        server = self._inspect("container", server_id)
-        workspace = self._inspect("container", workspace_id)
-        network = self._inspect("network", self.network_id)
-        if str(server.get("Id") or "").strip() != server_id:
-            raise ExecutorFailure("server container identity changed before attestation")
-        if str(workspace.get("Id") or "").strip() != workspace_id:
-            raise ExecutorFailure("workspace container identity changed before attestation")
-        if (
-            str(network.get("Id") or "").strip() != self.network_id
-            or network.get("Name") != "cybergym-internal"
-            or network.get("Internal") is not True
-            or network.get("Driver") != "bridge"
-        ):
-            raise ExecutorFailure("CyberGym network identity changed before attestation")
-        network_labels = network.get("Labels") if isinstance(network.get("Labels"), Mapping) else {}
-        if network_labels.get("com.ouroboros.campaign") != self.config.campaign_id:
-            raise ExecutorFailure("CyberGym network ownership changed before attestation")
-        attached = network.get("Containers")
-        if isinstance(attached, Mapping):
-            known_ids = {server_id, workspace_id, *self._task_containers.values()}
-            if any(str(item) not in known_ids for item in attached):
-                raise ExecutorFailure("CyberGym network gained an unknown container")
-        for role, container in (("server", server), ("workspace", workspace)):
-            all_networks = ((container.get("NetworkSettings") or {}).get("Networks") or {})
-            if not isinstance(all_networks, Mapping) or set(all_networks) != {"cybergym-internal"}:
-                raise ExecutorFailure(f"{role} has an unexpected network attachment")
-        cached_server_pid = _pid_from_observation(cached_server)
-        fresh_server_pid = _pid_from_observation(server)
-        cached_workspace_pid = _pid_from_observation(cached_workspace)
-        fresh_workspace_pid = _pid_from_observation(workspace)
-        if cached_server_pid and fresh_server_pid and cached_server_pid != fresh_server_pid:
-            raise ExecutorFailure("server process identity changed before attestation")
-        if cached_workspace_pid and fresh_workspace_pid and cached_workspace_pid != fresh_workspace_pid:
-            raise ExecutorFailure("workspace process identity changed before attestation")
-        self._server_observation = server
-        self._workspace_observations[workspace_name] = workspace
+        # Docker publishes a container on the network before ``docker run``
+        # returns its id.  Wait for all pending starts to publish immutable
+        # custody, then snapshot/inspect under the registry lock.  The lock is
+        # not held while those starts execute Docker, so task lanes remain
+        # concurrent.
+        with self._registry_condition:
+            while self._workspace_starting:
+                self._registry_condition.wait()
+            if self._unresolved_workspace_custody:
+                names = ", ".join(sorted(self._unresolved_workspace_custody))
+                raise ExecutorFailure(f"workspace startup custody is unresolved: {names}")
+            cached_server = self._server_observation
+            cached_workspace = self._workspace_observations.get(workspace_name)
+            if not isinstance(cached_server, Mapping) or not isinstance(cached_workspace, Mapping):
+                raise ExecutorFailure("sidecar observations are incomplete")
+            # Names are only startup handles.  Re-inspect the immutable ids at
+            # the trust boundary immediately before the gateway POST so a replacement
+            # container, restart, or daemon mix-up cannot inherit an old attestation.
+            server_id = str(cached_server.get("Id") or self.server_id).strip()
+            workspace_id = str(
+                cached_workspace.get("Id") or self._task_containers.get(workspace_name) or ""
+            ).strip()
+            if not server_id or not workspace_id:
+                raise ExecutorFailure("sidecar observations omitted immutable container ids")
+            server = self._inspect("container", server_id)
+            workspace = self._inspect("container", workspace_id)
+            network = self._inspect("network", self.network_id)
+            if str(server.get("Id") or "").strip() != server_id:
+                raise ExecutorFailure("server container identity changed before attestation")
+            if str(workspace.get("Id") or "").strip() != workspace_id:
+                raise ExecutorFailure("workspace container identity changed before attestation")
+            if (
+                str(network.get("Id") or "").strip() != self.network_id
+                or network.get("Name") != "cybergym-internal"
+                or network.get("Internal") is not True
+                or network.get("Driver") != "bridge"
+            ):
+                raise ExecutorFailure("CyberGym network identity changed before attestation")
+            network_labels = network.get("Labels") if isinstance(network.get("Labels"), Mapping) else {}
+            if network_labels.get("com.ouroboros.campaign") != self.config.campaign_id:
+                raise ExecutorFailure("CyberGym network ownership changed before attestation")
+            attached = network.get("Containers")
+            if isinstance(attached, Mapping):
+                known_ids = {server_id, workspace_id, *self._task_containers.values()}
+                if any(str(item) not in known_ids for item in attached):
+                    raise ExecutorFailure("CyberGym network gained an unknown container")
+            for role, container in (("server", server), ("workspace", workspace)):
+                all_networks = ((container.get("NetworkSettings") or {}).get("Networks") or {})
+                if not isinstance(all_networks, Mapping) or set(all_networks) != {"cybergym-internal"}:
+                    raise ExecutorFailure(f"{role} has an unexpected network attachment")
+            cached_server_pid = _pid_from_observation(cached_server)
+            fresh_server_pid = _pid_from_observation(server)
+            cached_workspace_pid = _pid_from_observation(cached_workspace)
+            fresh_workspace_pid = _pid_from_observation(workspace)
+            if cached_server_pid and fresh_server_pid and cached_server_pid != fresh_server_pid:
+                raise ExecutorFailure("server process identity changed before attestation")
+            if cached_workspace_pid and fresh_workspace_pid and cached_workspace_pid != fresh_workspace_pid:
+                raise ExecutorFailure("workspace process identity changed before attestation")
+            self._server_observation = server
+            self._workspace_observations[workspace_name] = workspace
         # Bind image-level manifest digests to the actual container image id/ref
         # before handing the redacted projections to the generic attestor.
         server_projection = dict(server)
@@ -2351,7 +2777,8 @@ class CyberGymExecutor:
         prevents the real benchmark id from entering the model-visible
         workspace contract and makes the host mapping match the live mount.
         """
-        container_id = str(self._task_containers.get(container_name) or "").strip()
+        with self._registry_lock:
+            container_id = str(self._task_containers.get(container_name) or "").strip()
         if not container_id or not _GATEWAY_TASK_ID.fullmatch(container_id):
             raise ExecutorFailure("workspace executor_ref requires the immutable container id")
         opaque = "cybergym-" + hashlib.sha256(f"{self.config.campaign_id}\0{task.task_id}\0{attempt_id}".encode()).hexdigest()[:32]
@@ -2667,7 +3094,8 @@ class CyberGymExecutor:
     ) -> tuple[dict[str, Any], str, str]:
         marker = final_poc_record(task_dir)
         declared_masked_id = _masked_id_from_submit_script(task_dir / "submit.sh")
-        container_id = str(self._task_containers.get(container_name) or "").strip()
+        with self._registry_lock:
+            container_id = str(self._task_containers.get(container_name) or "").strip()
         if not container_id or not _GATEWAY_TASK_ID.fullmatch(container_id):
             raise ExecutorFailure("final submit requires the immutable workspace container id")
         result = self.config.command_runner(
@@ -2751,7 +3179,8 @@ class CyberGymExecutor:
         unresolved gateway attempt never reaches this method and is retained
         for late-result custody.
         """
-        container_id = str(self._task_containers.get(container_name) or "").strip()
+        with self._registry_lock:
+            container_id = str(self._task_containers.get(container_name) or "").strip()
         if not container_id:
             raise ExecutorFailure("workspace cleanup has no immutable container id")
         observed = self._inspect_optional("container", container_id)
@@ -2769,8 +3198,9 @@ class CyberGymExecutor:
                 "already_absent": True,
             }
             _write_json(report_path, report)
-            self._task_containers.pop(container_name, None)
-            self._workspace_observations.pop(container_name, None)
+            with self._registry_lock:
+                self._task_containers.pop(container_name, None)
+                self._workspace_observations.pop(container_name, None)
             return report
         actual_id = str(observed.get("Id") or "").strip()
         actual_name = str(observed.get("Name") or "").lstrip("/")
@@ -2806,8 +3236,9 @@ class CyberGymExecutor:
             "already_absent": False,
         }
         _write_json(report_path, report)
-        self._task_containers.pop(container_name, None)
-        self._workspace_observations.pop(container_name, None)
+        with self._registry_lock:
+            self._task_containers.pop(container_name, None)
+            self._workspace_observations.pop(container_name, None)
         return report
 
     def run_task(self, task: TaskSpec, task_dir: pathlib.Path) -> Mapping[str, Any]:
@@ -3014,7 +3445,14 @@ class CyberGymExecutor:
 
     def _cleanup_owned_resources(self) -> dict[str, Any]:
         """Remove exact inspected ids and verify that no owned object remains."""
-        workspace_ids = tuple(self._task_containers.values())
+        with self._registry_condition:
+            if self._workspace_starting:
+                raise ExecutorFailure("cleanup custody is pending workspace startup")
+            if self._unresolved_workspace_custody:
+                names = ", ".join(sorted(self._unresolved_workspace_custody))
+                raise ExecutorFailure(f"cleanup custody is unresolved for workspace names: {names}")
+            workspace_items = tuple(self._task_containers.items())
+        workspace_ids = tuple(container_id for _name, container_id in workspace_items)
         if not self.network_id and not self.server_id and not workspace_ids:
             return {"status": "not_needed", "ok": True}
         if not self.network_id:
@@ -3049,7 +3487,7 @@ class CyberGymExecutor:
         # immutable ids to agree with our checkpoint.  A name may have been
         # replaced by an unrelated container since startup.
         owned_ids = set(workspace_ids) | {self.server_id}
-        for name, container_id in [(self.server_name, self.server_id), *self._task_containers.items()]:
+        for name, container_id in [(self.server_name, self.server_id), *workspace_items]:
             observed = self._inspect_optional("container", container_id)
             if observed is None:
                 continue
@@ -3107,8 +3545,9 @@ class CyberGymExecutor:
     @property
     def custody_blocked(self) -> bool:
         """Whether an unresolved gateway attempt requires the server to stay alive."""
-
-        return bool(self._custody_blocked or self._gateway_attempts)
+        with self._registry_condition:
+            workspace_pending = bool(self._workspace_starting or self._unresolved_workspace_custody)
+            return bool(self._custody_blocked or self._gateway_attempts or workspace_pending)
 
     def close(self) -> Mapping[str, Any] | None:
         """Remove owned ids only after every gateway attempt has settled.
@@ -3118,26 +3557,46 @@ class CyberGymExecutor:
         launcher finalize a truthful run manifest while keeping the isolated
         server alive for a later reattach/cancel operation.
         """
-        if not self.started and not self._task_containers and not self.server_id and not self.network_id:
+        with self._registry_condition:
+            no_resources = (
+                not self.started
+                and not self._task_containers
+                and not self.server_id
+                and not self.network_id
+                and not self._workspace_starting
+                and not self._unresolved_workspace_custody
+            )
+        if no_resources:
             return {"status": "not_needed", "ok": True}
-        if self._gateway_attempts:
+        with self._registry_condition:
+            gateway_pending = bool(self._gateway_attempts)
+            workspace_starting = tuple(sorted(self._workspace_starting))
+            unresolved_workspace = dict(self._unresolved_workspace_custody)
+            workspace_ids = dict(self._task_containers)
+            attempts = [dict(value) for value in self._gateway_attempts.values()]
+        if gateway_pending or workspace_starting or unresolved_workspace:
             self._custody_blocked = True
             pending = {
                 "schema": "ouroboros.benchmark.cybergym.custody_pending.v1",
                 "status": "custody_pending",
                 "ok": False,
-                "attempts": [dict(value) for value in self._gateway_attempts.values()],
+                "attempts": attempts,
                 "server_id": self.server_id,
                 "network_id": self.network_id,
-                "workspace_ids": dict(self._task_containers),
+                "workspace_ids": workspace_ids,
+                "workspace_starting": list(workspace_starting),
+                "workspace_custody_unresolved": unresolved_workspace,
             }
             _write_json(self.config.run_root / "custody_pending.json", pending)
             self._sidecar_attestation = {"cleanup": pending}
             return pending
         report = self._cleanup_owned_resources()
-        self._task_containers.clear()
-        self._workspace_observations.clear()
-        self._server_observation = None
+        with self._registry_condition:
+            self._task_containers.clear()
+            self._workspace_observations.clear()
+            self._server_observation = None
+            self._workspace_starting.clear()
+            self._unresolved_workspace_custody.clear()
         self.network_id = ""
         self.server_id = ""
         self.server_url = ""

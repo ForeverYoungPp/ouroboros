@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import io
 import json
+import os
 import pathlib
+import tarfile
+import threading
 
 import pytest
 
@@ -22,6 +26,7 @@ from devtools.benchmarks.cybergym.cybergym_executor import (
     _bind_container_image,
     _parse_json_stdout,
     _require_exact_effort,
+    _safe_extract,
     _served_telemetry,
     _validate_verify_response,
 )
@@ -54,6 +59,177 @@ def _config(tmp_path: pathlib.Path, **overrides):
     )
     values.update(overrides)
     return ExecutorConfig(**values)
+
+
+def _write_archive(path: pathlib.Path, entries: list[tuple[str, str, str]]) -> None:
+    """Build a tiny tarball with explicit member types for extraction tests."""
+    with tarfile.open(path, "w:gz") as archive:
+        for name, kind, value in entries:
+            member = tarfile.TarInfo(name)
+            if kind == "dir":
+                member.type = tarfile.DIRTYPE
+                member.mode = 0o755
+                archive.addfile(member)
+            elif kind == "file":
+                payload = value.encode("utf-8")
+                member.size = len(payload)
+                archive.addfile(member, io.BytesIO(payload))
+            elif kind == "symlink":
+                member.type = tarfile.SYMTYPE
+                member.linkname = value
+                archive.addfile(member)
+            elif kind == "hardlink":
+                member.type = tarfile.LNKTYPE
+                member.linkname = value
+                archive.addfile(member)
+            elif kind == "fifo":
+                member.type = tarfile.FIFOTYPE
+                archive.addfile(member)
+            else:  # pragma: no cover - test helper misuse
+                raise AssertionError(kind)
+
+
+def test_safe_extract_preserves_confined_relative_symlinks(tmp_path):
+    archive = tmp_path / "repo-vul.tar.gz"
+    _write_archive(
+        archive,
+        [
+            ("src-vul", "dir", ""),
+            ("src-vul/lib.la", "file", "library"),
+            ("src-vul/.libs", "dir", ""),
+            ("src-vul/.libs/lib.la", "symlink", "../lib.la"),
+            ("src-vul/README.md", "file", "readme"),
+            ("src-vul/README", "symlink", "README.md"),
+        ],
+    )
+    destination = tmp_path / "workspace"
+    _safe_extract(archive, destination)
+    assert (destination / "src-vul/.libs/lib.la").is_symlink()
+    assert (destination / "src-vul/.libs/lib.la").read_text(encoding="utf-8") == "library"
+    assert (destination / "src-vul/README").read_text(encoding="utf-8") == "readme"
+    assert all(
+        destination.resolve() in path.resolve().parents
+        for path in destination.rglob("*")
+        if path.is_symlink()
+    )
+
+
+def test_safe_extract_resolves_symlink_components(tmp_path):
+    archive = tmp_path / "component-links.tar.gz"
+    _write_archive(
+        archive,
+        [
+            ("root", "dir", ""),
+            ("root/real", "dir", ""),
+            ("root/real/file", "file", "payload"),
+            ("root/dirlink", "symlink", "real"),
+            ("root/filelink", "symlink", "dirlink/file"),
+        ],
+    )
+    destination = tmp_path / "workspace"
+    _safe_extract(archive, destination)
+    assert (destination / "root/filelink").is_symlink()
+    assert (destination / "root/filelink").read_text(encoding="utf-8") == "payload"
+
+
+def test_safe_extract_rolls_back_staging_on_extraction_error(tmp_path, monkeypatch):
+    archive = tmp_path / "partial.tar.gz"
+    _write_archive(archive, [("root", "dir", ""), ("root/file", "file", "payload")])
+    destination = tmp_path / "workspace"
+    destination.mkdir()
+    sentinel = destination / "sentinel"
+    sentinel.write_text("keep", encoding="utf-8")
+    original_extract = tarfile.TarFile.extract
+
+    def fail_after_extract(self, *args, **kwargs):
+        original_extract(self, *args, **kwargs)
+        raise OSError("injected extraction failure")
+
+    monkeypatch.setattr(tarfile.TarFile, "extract", fail_after_extract)
+    with pytest.raises(ExecutorFailure, match="extraction failed"):
+        _safe_extract(archive, destination)
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not (destination / "root").exists()
+    assert not list(tmp_path.glob(".workspace.extract-*"))
+
+
+def test_safe_extract_publish_dirfd_survives_destination_replacement(tmp_path, monkeypatch):
+    if os.rename not in os.supports_dir_fd:
+        pytest.skip("platform has no dirfd-safe rename")
+    archive = tmp_path / "race.tar.gz"
+    _write_archive(archive, [("root", "dir", ""), ("root/file", "file", "payload")])
+    destination = tmp_path / "workspace"
+    destination.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_sentinel = outside / "sentinel"
+    outside_sentinel.write_text("untouched", encoding="utf-8")
+    backup = tmp_path / "workspace-before-race"
+    original_rename = os.rename
+    replaced = False
+
+    def replace_destination_once(src, dst, *args, **kwargs):
+        nonlocal replaced
+        if not replaced and kwargs.get("dst_dir_fd") is not None:
+            original_rename(destination, backup)
+            destination.symlink_to(outside, target_is_directory=True)
+            replaced = True
+        return original_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", replace_destination_once)
+    _safe_extract(archive, destination)
+    assert replaced
+    assert outside_sentinel.read_text(encoding="utf-8") == "untouched"
+    assert (backup / "root/file").read_text(encoding="utf-8") == "payload"
+
+
+@pytest.mark.parametrize(
+    ("linkname", "message"),
+    [
+        ("/tmp/cybergym-outside", "must be relative"),
+        ("../../cybergym-outside", "escapes its workspace"),
+        ("missing", "broken symlink"),
+    ],
+)
+def test_safe_extract_rejects_absolute_escaping_and_broken_links(tmp_path, linkname, message):
+    archive = tmp_path / "bad.tar.gz"
+    _write_archive(archive, [("root", "dir", ""), ("root/link", "symlink", linkname)])
+    destination = tmp_path / "workspace"
+    outside = tmp_path / "cybergym-outside"
+    outside.write_text("untouched", encoding="utf-8")
+    with pytest.raises(ExecutorFailure, match=message):
+        _safe_extract(archive, destination)
+    assert outside.read_text(encoding="utf-8") == "untouched"
+    assert not (destination / "root/link").exists()
+
+
+@pytest.mark.parametrize("kind", ["hardlink", "fifo"])
+def test_safe_extract_rejects_special_link_members(tmp_path, kind):
+    archive = tmp_path / "special.tar.gz"
+    _write_archive(archive, [("root", "dir", ""), ("root/member", kind, "root/target")])
+    with pytest.raises(ExecutorFailure, match="special member"):
+        _safe_extract(archive, tmp_path / "workspace")
+
+
+def test_safe_extract_rejects_link_parent_conflict_and_destination_symlink(tmp_path):
+    archive = tmp_path / "conflict.tar.gz"
+    _write_archive(
+        archive,
+        [
+            ("root", "dir", ""),
+            ("root/link", "symlink", "."),
+            ("root/link/payload", "file", "must not write"),
+        ],
+    )
+    with pytest.raises(ExecutorFailure, match="parent is not a directory"):
+        _safe_extract(archive, tmp_path / "workspace")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    redirected = tmp_path / "redirected"
+    redirected.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ExecutorFailure, match="must not traverse a symlink"):
+        _safe_extract(archive, redirected / "nested")
 
 
 def test_executor_rejects_non_rootless_or_missing_digest(tmp_path):
@@ -447,6 +623,277 @@ def test_runtime_attestation_reinspects_immutable_ids_before_gateway_boundary(tm
     assert ("container", "workspace-123") in inspected
     assert ("network", "network-123") in inspected
     assert (config.run_root / "attestations" / "arvo__1" / "attempt-1" / "sidecar_attestation.json").is_file()
+
+    # Keep the foreign-container guard covered while the registry is now
+    # synchronized with concurrent workspace startup.
+    network["Containers"] = {"foreign-container-id": {}}
+    with pytest.raises(ExecutorFailure, match="unknown container"):
+        executor._attest_runtime(  # noqa: SLF001 - ownership guard assertion
+            type("Task", (), {"task_id": "arvo:1"})(),
+            "attempt-1",
+            plan,
+            workspace_name,
+            "valid-key",
+        )
+
+
+def test_workspace_registration_and_attestation_share_registry_lock(tmp_path, monkeypatch):
+    """An attached workspace is registered before another lane snapshots Docker."""
+    import devtools.benchmarks.cybergym.cybergym_executor as executor_module
+
+    config = _config(tmp_path)
+    executor = CyberGymExecutor(config)
+    executor.started = True
+    executor.network_id = "network-id"
+    executor.server_id = "server-id"
+    executor.server_name = "cybergym-server-test-campaign"
+    server = {
+        "Id": executor.server_id,
+        "Name": "/" + executor.server_name,
+        "Config": {"Image": config.server_image_digest},
+        "State": {"Running": True, "Pid": 101},
+        "NetworkSettings": {"Networks": {"cybergym-internal": {}}},
+    }
+    executor._server_observation = server
+
+    agent_a = "agent-" + "a" * 24
+    agent_b = "agent-" + "b" * 24
+    plan_a = executor._task_network_plan("task-a", agent_a)
+    plan_b = executor._task_network_plan("task-b", agent_b)
+    name_a = "cybergym-workspace-" + agent_a
+    name_b = "cybergym-workspace-" + agent_b
+    id_a = "a" * 64
+    id_b = "b" * 64
+    workspace_a = {
+        "Id": id_a,
+        "Name": "/" + name_a,
+        "Config": {"Image": config.workspace_image_digest},
+        "State": {"Running": True, "Pid": 202},
+        "NetworkSettings": {"Networks": {"cybergym-internal": {}}},
+    }
+    workspace_b = {
+        "Id": id_b,
+        "Name": "/" + name_b,
+        "Config": {"Image": config.workspace_image_digest},
+        "State": {"Running": True, "Pid": 303},
+        "NetworkSettings": {"Networks": {"cybergym-internal": {}}},
+    }
+    executor._task_containers = {name_a: id_a}
+    executor._workspace_observations = {name_a: workspace_a}
+    attached = {executor.server_id, id_a}
+    b_attached = threading.Event()
+    release_b = threading.Event()
+    a_entered = threading.Event()
+    a_done = threading.Event()
+    network_snapshots: list[bool] = []
+    errors: list[tuple[str, BaseException]] = []
+
+    def command(argv, *, cwd=None, env=None, timeout=None):
+        if "run" in argv and name_b in argv:
+            attached.add(id_b)
+            b_attached.set()
+            assert release_b.wait(5), "test barrier was not released"
+            return CommandResult(0, id_b + "\n", "")
+        raise AssertionError(argv)
+
+    def inspect(kind, target):
+        if kind == "network":
+            network_snapshots.append(name_b in executor._task_containers)
+            return {
+                "Name": "cybergym-internal",
+                "Id": executor.network_id,
+                "Internal": True,
+                "Driver": "bridge",
+                "Labels": {"com.ouroboros.campaign": config.campaign_id},
+                "Containers": {container_id: {} for container_id in attached},
+            }
+        if target == executor.server_id:
+            return server
+        if target == id_a:
+            return workspace_a
+        if target == name_b or target == id_b:
+            return workspace_b
+        raise AssertionError((kind, target))
+
+    monkeypatch.setattr(executor, "_inspect", inspect)
+    monkeypatch.setattr(
+        executor,
+        "_connectivity_observation",
+        lambda plan, workspace_id, api_key: {
+            "agent_to_server": True,
+            "verifier_to_private": {"reachable": True},
+            "agent_to_public": False,
+            "agent_to_verifier": False,
+            "agent_socket_visible": False,
+            "agent_hidden_artifacts": {"hidden": True},
+            "agent_secret_env_absent": True,
+            "agent_probe_tools": True,
+        },
+    )
+    monkeypatch.setattr(executor_module, "attest_sidecar_runtime", lambda *args, **kwargs: {"ok": True})
+    executor.config = dataclasses_replace(config, command_runner=command)
+
+    def start_workspace():
+        try:
+            executor._workspace(  # noqa: SLF001 - concurrency seam assertion
+                type("Task", (), {"task_id": "task-b"})(),
+                config.run_root / "task-b",
+                plan_b,
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports the cause
+            errors.append(("workspace", exc))
+
+    def attest_workspace():
+        a_entered.set()
+        try:
+            executor._attest_runtime(  # noqa: SLF001 - concurrency seam assertion
+                type("Task", (), {"task_id": "arvo:task-a"})(),
+                "attempt-a",
+                plan_a,
+                name_a,
+                "valid-key",
+            )
+        except BaseException as exc:
+            errors.append(("attestation", exc))
+        finally:
+            a_done.set()
+
+    workspace_thread = threading.Thread(target=start_workspace)
+    attestation_thread = threading.Thread(target=attest_workspace)
+    workspace_thread.start()
+    try:
+        assert b_attached.wait(2)
+        attestation_thread.start()
+        assert a_entered.wait(2)
+        assert not a_done.wait(0.1), "attestation crossed the attach-to-custody barrier"
+    finally:
+        # Always release the worker, including when running this regression
+        # against an intentionally broken mutant.
+        release_b.set()
+        workspace_thread.join(5)
+        attestation_thread.join(5)
+    assert not workspace_thread.is_alive()
+    assert not attestation_thread.is_alive()
+    assert errors == []
+    assert executor._task_containers[name_b] == id_b
+    assert network_snapshots and all(network_snapshots)
+
+
+def test_workspace_start_error_recovers_name_custody_by_inspect(tmp_path):
+    config = _config(tmp_path)
+    executor = CyberGymExecutor(config)
+    executor.network_id = "network-id"
+    agent_id = "agent-" + "c" * 24
+    plan = executor._task_network_plan("task-c", agent_id)
+    name = "cybergym-workspace-" + agent_id
+    container_id = "c" * 64
+    observed = {
+        "Id": container_id,
+        "Name": "/" + name,
+        "Config": {
+            "Image": config.workspace_image_digest,
+            "Labels": {
+                "com.ouroboros.campaign": config.campaign_id,
+                "com.ouroboros.role": "workspace",
+                "com.ouroboros.agent_id": plan.opaque_agent_id,
+            },
+        },
+        "NetworkSettings": {
+            "Networks": {"cybergym-internal": {"NetworkID": executor.network_id}}
+        },
+    }
+
+    def command(argv, *, cwd=None, env=None, timeout=None):
+        if "inspect" in argv and "container" in argv:
+            return CommandResult(0, json.dumps([observed]), "")
+        if "run" in argv and name in argv:
+            raise ExecutorFailure("docker run transport timeout")
+        raise AssertionError(argv)
+
+    executor.config = dataclasses_replace(config, command_runner=command)
+    with pytest.raises(ExecutorFailure, match="transport timeout"):
+        executor._workspace(  # noqa: SLF001 - startup custody assertion
+            type("Task", (), {"task_id": "task-c"})(),
+            config.run_root / "task-c",
+            plan,
+        )
+    assert executor._task_containers[name] == container_id
+    assert executor._workspace_observations[name]["Id"] == container_id
+    assert name not in executor._unresolved_workspace_custody
+    assert not executor._workspace_starting
+
+
+def test_workspace_starts_remain_concurrent_while_registry_publishes_atomically(tmp_path):
+    config = _config(tmp_path)
+    executor = CyberGymExecutor(config)
+    executor.network_id = "network-id"
+    starts_entered = []
+    both_entered = threading.Event()
+    release = threading.Event()
+    errors = []
+    observations = {}
+    plans = {}
+    names = {}
+    ids = {}
+    for suffix in ("d", "e"):
+        agent_id = "agent-" + suffix * 24
+        plans[suffix] = executor._task_network_plan("task-" + suffix, agent_id)
+        names[suffix] = "cybergym-workspace-" + agent_id
+        ids[suffix] = suffix * 64
+        observations[suffix] = {
+            "Id": ids[suffix],
+            "Name": "/" + names[suffix],
+            "Config": {"Image": config.workspace_image_digest},
+            "NetworkSettings": {
+                "Networks": {"cybergym-internal": {"NetworkID": executor.network_id}}
+            },
+        }
+
+    def command(argv, *, cwd=None, env=None, timeout=None):
+        if "run" in argv:
+            suffix = next(key for key, name in names.items() if name in argv)
+            starts_entered.append(suffix)
+            if len(starts_entered) == 2:
+                both_entered.set()
+            assert release.wait(5), "concurrent-start barrier was not released"
+            return CommandResult(0, ids[suffix] + "\n", "")
+        raise AssertionError(argv)
+
+    def inspect(kind, target):
+        if kind == "container":
+            suffix = next(key for key, name in names.items() if target == name)
+            return observations[suffix]
+        raise AssertionError((kind, target))
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(executor, "_inspect", inspect)
+    executor.config = dataclasses_replace(config, command_runner=command)
+
+    def start(suffix):
+        try:
+            executor._workspace(  # noqa: SLF001 - concurrency seam assertion
+                type("Task", (), {"task_id": "task-" + suffix})(),
+                config.run_root / ("task-" + suffix),
+                plans[suffix],
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports cause
+            errors.append(exc)
+
+    threads = [threading.Thread(target=start, args=(suffix,)) for suffix in ("d", "e")]
+    for thread in threads:
+        thread.start()
+    try:
+        assert both_entered.wait(2), "workspace starts were serialized"
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(5)
+        monkeypatch.undo()
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert set(starts_entered) == {"d", "e"}
+    assert {executor._task_containers[name] for name in names.values()} == set(ids.values())
+    assert not executor._workspace_starting
 
 
 def test_settled_workspace_cleanup_uses_exact_id_and_postcondition(tmp_path, monkeypatch):
