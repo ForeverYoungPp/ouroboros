@@ -943,9 +943,11 @@ export function createLoginCardController({
             // When it failed without a job id there is nothing a DELETE can
             // address — the same honest local detach the pre-queue check in
             // close() applies when the error is already visible at the press.
-            const result = detach();
+            // detach() answers a bare STATUS; this transition's callers unwrap
+            // `.status` from an object like every other branch here returns.
+            const status = detach();
             onSettled();
-            return result;
+            return { status };
         }
 
         let result = custodyResult(active.envelope, { absent: Boolean(active.absent) });

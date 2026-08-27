@@ -181,7 +181,9 @@ test('a close queued during a create that fails without a job detaches honestly'
     assert.ok(host.innerHTML.includes('Closing…'), 'the press acknowledged before the create settled');
     releaseCreate();
     await starting;
-    await clicked;
+    const settledStatus = await clicked;
     assert.equal(deletes, 0, 'no job id — nothing a DELETE can address');
     assert.equal(host.innerHTML, '', 'the queued close detached the failed create honestly');
+    assert.ok(typeof settledStatus === 'string' && settledStatus.length > 0,
+        `the close must keep its released|retained|unknown contract, got: ${String(settledStatus)}`);
 });
