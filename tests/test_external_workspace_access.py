@@ -8,6 +8,7 @@ guards remain independent of the shared operation matrix.
 from __future__ import annotations
 
 import pathlib
+import shlex
 
 import pytest
 
@@ -289,7 +290,13 @@ def test_external_workspace_shell_can_write_configured_deliverable_only_at_top_l
 
     wrapped_result = _run_shell(
         ctx,
-        ["sh", "-c", f"cp {source} {deliverables / 'wrapped.html'}"],
+        [
+            "sh",
+            "-c",
+            "cp "
+            f"{shlex.quote(str(source))} "
+            f"{shlex.quote(str(deliverables / 'wrapped.html'))}",
+        ],
         cwd=str(workspace),
     )
     assert "ARTIFACT_OUTPUT_UNDECLARED" in wrapped_result
