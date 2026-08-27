@@ -11,6 +11,7 @@ back to a host shell, Docker default network, or a different model.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import pathlib
@@ -56,6 +57,8 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     task_contract_metadata,
     validate_model_pin,
     validate_positive_finite,
+    verify_source_checkout,
+    source_tree_digest,
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -71,6 +74,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tasks-file", default="", help="pinned tasks.json catalog")
     parser.add_argument("--task-id", action="append", default=[], help="task id (repeatable, e.g. arvo:47101)")
     parser.add_argument("--server", default="", help="private CyberGym submit server URL")
+    parser.add_argument("--ouroboros-url", default="", help="Ouroboros gateway URL for the measured task")
+    parser.add_argument("--docker-host", default="", help="explicit rootless Docker unix socket")
+    parser.add_argument("--server-image", default="", help="pinned CyberGym server image")
+    parser.add_argument("--server-image-digest", default="", help="resolved sha256 digest for server image")
+    parser.add_argument("--workspace-image", default="", help="pinned Ouroboros workspace image")
+    parser.add_argument("--workspace-image-digest", default="", help="resolved sha256 digest for workspace image")
+    parser.add_argument("--server-root", default="", help="host root mounted at the same absolute path in the server sidecar")
+    parser.add_argument("--cybergym-api-key-env", default="CYBERGYM_API_KEY", help="host env name for the private verifier key")
     parser.add_argument("--mask-map", default="", help="task mask-map JSON")
     parser.add_argument("--difficulty", default=DEFAULT_LEVEL)
     parser.add_argument("--model", default="deepseek/deepseek-v4-flash-0731")
@@ -91,7 +102,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="record and proceed with a dirty seed (not submittable)")
     parser.add_argument("--expected-source-sha256", default="")
     parser.add_argument("--expected-tasks-sha256", default=OFFICIAL_TASKS_SHA256)
+    parser.add_argument("--expected-mask-sha256", default="")
     return parser.parse_args(argv)
+
+
+def _sha256_file(path: pathlib.Path | str) -> str:
+    return hashlib.sha256(pathlib.Path(path).expanduser().resolve(strict=False).read_bytes()).hexdigest()
 
 
 def _declared_task_ids(args: argparse.Namespace) -> list[str]:
@@ -137,6 +153,59 @@ def _load_executor(spec: str) -> Callable[[TaskSpec, pathlib.Path], Mapping[str,
         raise CyberGymIntegrationUnavailable(f"CyberGym executor could not be loaded: {text}") from exc
     if not callable(callback):
         raise CyberGymIntegrationUnavailable(f"CyberGym executor is not callable: {text}")
+    return callback
+
+
+def _build_default_executor(args: argparse.Namespace, out_root: pathlib.Path) -> Callable[[TaskSpec, pathlib.Path], Mapping[str, Any]]:
+    """Construct the concrete sidecar executor after admission.
+
+    An explicit ``--executor`` remains useful for a pre-started server or a
+    laboratory harness.  The normal paid path must provide all image/socket
+    pins, so a missing value is a typed refusal rather than a host-shell
+    fallback.
+    """
+    required = {
+        "--ouroboros-url": args.ouroboros_url,
+        "--docker-host": args.docker_host,
+        "--server-image": args.server_image,
+        "--server-image-digest": args.server_image_digest,
+        "--workspace-image": args.workspace_image,
+        "--workspace-image-digest": args.workspace_image_digest,
+        "--server-root": args.server_root,
+    }
+    missing = [name for name, value in required.items() if not str(value or "").strip()]
+    if missing:
+        raise CyberGymIntegrationUnavailable(
+            "concrete CyberGym executor requires " + ", ".join(missing)
+        )
+    from devtools.benchmarks.cybergym.cybergym_executor import ExecutorConfig, build_executor
+
+    config = ExecutorConfig(
+        campaign_id=out_root.name,
+        source_root=pathlib.Path(args.source_root),
+        data_root=pathlib.Path(args.data_root),
+        mask_map=pathlib.Path(args.mask_map),
+        run_root=out_root,
+        server_root=pathlib.Path(args.server_root),
+        server_image=str(args.server_image),
+        server_image_digest=str(args.server_image_digest),
+        workspace_image=str(args.workspace_image),
+        workspace_image_digest=str(args.workspace_image_digest),
+        ouroboros_url=str(args.ouroboros_url),
+        docker_host=str(args.docker_host),
+        difficulty=str(args.difficulty or DEFAULT_LEVEL),
+        task_timeout_sec=int(args.timeout_sec),
+        api_key_env=str(args.cybergym_api_key_env),
+    )
+    executor = build_executor(config)
+
+    def callback(task: TaskSpec, task_dir: pathlib.Path) -> Mapping[str, Any]:
+        return executor.run_task(task, task_dir)
+
+    # The launcher finalizer owns terminal bookkeeping; this closure's object
+    # is kept alive by the callback.  ``main`` invokes close in its finally
+    # path through the optional attribute below.
+    setattr(callback, "close", executor.close)
     return callback
 
 
@@ -206,7 +275,11 @@ def _prepare_applied_settings(
         ) from exc
     if not isinstance(template, dict):
         raise CyberGymIntegrationUnavailable("settings template must contain a JSON object")
-    from devtools.benchmarks.common.manifests import model_slot_snapshot, write_json
+    from devtools.benchmarks.common.manifests import (
+        model_slot_snapshot,
+        provider_credential_disclosure,
+        write_json,
+    )
     from devtools.benchmarks.common.server_runner import build_isolated_settings
 
     model = validate_model_pin(args.model, expected=OFFICIAL_MODEL)
@@ -224,9 +297,40 @@ def _prepare_applied_settings(
         "OUROBOROS_SCOPE_REVIEW_MODEL": model,
         "OUROBOROS_REVIEW_MODELS": ",".join([model] * 3),
         "OUROBOROS_MAX_SUBAGENT_DEPTH": 0,
+        "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS": "false",
+        "OUROBOROS_RUNTIME_MODE": "pro",
+        "OUROBOROS_SAFETY_MODE": "light",
+        "OUROBOROS_CONTEXT_MODE": "max",
+        "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "false",
+        "OUROBOROS_MAX_WORKERS": 10,
+        "OUROBOROS_MAX_ROUNDS": 200,
+        "OUROBOROS_TASK_IDLE_TIMEOUT_SEC": 900,
         "TOTAL_BUDGET": budget_usd,
         "OUROBOROS_TASK_ABS_CEILING_SEC": max(1, int(timeout_sec)),
+        "OUROBOROS_TASK_REVIEW_MODE": "required",
+        "OUROBOROS_REVIEW_ENFORCEMENT": "blocking",
+        "OUROBOROS_REVIEW_MAX_CYCLES": "unlimited",
+        "OUROBOROS_POST_TASK_EVOLUTION": "false",
+        "OUROBOROS_POST_TASK_EVOLUTION_CADENCE": "off",
+        "OUROBOROS_MAIN_WEB_SEARCH": "off",
+        "OUROBOROS_WEBSEARCH_BACKEND": "auto",
+        "OUROBOROS_IMAGE_INPUT_MODE": "auto",
+        "OUROBOROS_RETURN_REASONING": True,
+        "OUROBOROS_REASONING_SUMMARY": "auto",
+        "MCP_ENABLED": False,
+        "MCP_SERVERS": [],
+        "OUROBOROS_EFFORT_TASK": "high",
+        "OUROBOROS_EFFORT_EVOLUTION": "high",
+        "OUROBOROS_EFFORT_REVIEW": "high",
+        "OUROBOROS_EFFORT_SCOPE_REVIEW": "high",
+        "OUROBOROS_EFFORT_DEEP_SELF_REVIEW": "high",
+        "OUROBOROS_EFFORT_CONSCIOUSNESS": "high",
     }
+    # Structured no-swarm/reviewer declarations are explicit overrides rather
+    # than values accidentally inherited from the live settings file.
+    for key in ("OUROBOROS_SUBAGENTS", "OUROBOROS_REVIEWER_SLOTS"):
+        if key in template:
+            overrides[key] = template[key]
     # The provider pool is selected by a live probe in the sidecar lane.  Keep
     # the template's safe fallback-ready shape until that callback supplies an
     # evidence-backed ``only``/``order`` override.
@@ -263,6 +367,14 @@ def _prepare_applied_settings(
         "task_abs_ceiling_sec": max(1, int(timeout_sec)),
         "provider_policy": provider,
         "provider_probe_required": True,
+        "provider_credentials": provider_credential_disclosure(
+            output_path
+        ),
+        "effective_overrides": {
+            key: overrides[key]
+            for key in sorted(overrides)
+            if key != "OUROBOROS_OR_PROVIDER"
+        },
         "keys": sorted(str(key) for key in applied if isinstance(key, str)),
     }
 
@@ -325,6 +437,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_api_key=False,
         settings_path=settings_path,
         require_settings=True,
+        require_inputs=not bool(args.dry_run),
         network_mode="cybergym-internal",
     )
     if not report["ok"]:
@@ -375,6 +488,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             task_ids = list(declared_ids)
             catalog: dict[str, Any] | None = None
+            if not args.dry_run:
+                if not args.source_root or not args.data_root or not args.tasks_file or not args.mask_map:
+                    raise CyberGymError(
+                        "paid CyberGym execution requires source-root, data-root, tasks-file, and mask-map"
+                    )
+                source_provenance = verify_source_checkout(
+                    args.source_root,
+                    expected_commit=OFFICIAL_SOURCE_PIN,
+                    require_clean=True,
+                )
+                manifest["extra"]["cybergym_source"] = source_provenance
+                expected_source_digest = str(args.expected_source_sha256 or "").strip().lower()
+                if expected_source_digest:
+                    observed_source_digest = source_tree_digest(args.source_root)
+                    if observed_source_digest != expected_source_digest:
+                        raise CyberGymError(
+                            "source tree SHA-256 mismatch: "
+                            f"expected {expected_source_digest}, got {observed_source_digest}"
+                        )
+                    manifest["extra"]["cybergym_source"]["tree_sha256"] = observed_source_digest
+                mask_digest = _sha256_file(args.mask_map)
+                expected_mask = str(args.expected_mask_sha256 or "").strip().lower()
+                if expected_mask and mask_digest != expected_mask:
+                    raise CyberGymError(
+                        f"mask map SHA-256 mismatch: expected {expected_mask}, got {mask_digest}"
+                    )
+                mask_info = {
+                    "label": "mask_map",
+                    "path": str(pathlib.Path(args.mask_map).resolve(strict=False)),
+                    "sha256": mask_digest,
+                    "size": pathlib.Path(args.mask_map).stat().st_size,
+                }
+                manifest["extra"]["mask_map"] = mask_info
             if args.tasks_file:
                 catalog = load_task_catalog(
                     args.tasks_file,
@@ -429,14 +575,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise CyberGymIntegrationUnavailable(
                         "paid CyberGym execution requires --per-task-estimate-usd; no price is invented"
                     )
-                executor = _load_executor(args.executor)
-                rows = run_campaign(
-                    _task_specs(task_ids, contract=contract),
-                    run_root=out_root,
-                    executor=executor,
-                    estimated_cost_usd=float(args.per_task_estimate_usd),
-                    budget_cap_usd=float(args.budget_usd),
+                executor = (
+                    _load_executor(args.executor)
+                    if args.executor
+                    else _build_default_executor(args, out_root)
                 )
+                try:
+                    rows = run_campaign(
+                        _task_specs(task_ids, contract=contract),
+                        run_root=out_root,
+                        executor=executor,
+                        estimated_cost_usd=float(args.per_task_estimate_usd),
+                        budget_cap_usd=float(args.budget_usd),
+                    )
+                finally:
+                    close = getattr(executor, "close", None)
+                    if callable(close):
+                        close()
 
             projection_path = out_root / "claims.jsonl"
             try:

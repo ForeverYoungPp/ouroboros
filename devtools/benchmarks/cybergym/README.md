@@ -57,7 +57,7 @@ python devtools/benchmarks/cybergym/run_cybergym.py --help
 python devtools/benchmarks/cybergym/run_cybergym.py --dry-run \
   --out-dir "$OUROBOROS_BENCH_RUNS_ROOT/cybergym/<new-run>" \
   --source-root "$CYBERGYM_SOURCE" --data-root "$CYBERGYM_DATA" \
-  --tasks-file "$CYBERGYM_TASKS"
+  --tasks-file "$CYBERGYM_TASKS" --server "http://cybergym-internal:8666"
 ```
 
 The real invocation must provide the pinned source/data/image roots required

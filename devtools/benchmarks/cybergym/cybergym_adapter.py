@@ -322,6 +322,7 @@ def pre_admission_report(
     require_api_key: bool = False,
     settings_path: pathlib.Path | str | None = None,
     require_settings: bool = False,
+    require_inputs: bool = False,
     network_mode: str = "cybergym-internal",
 ) -> dict[str, Any]:
     """Perform only deterministic argument/path admission checks.
@@ -374,6 +375,11 @@ def pre_admission_report(
 
     if source is not None and data is not None and _paths_overlap(source, data):
         reasons.append("source_root_overlaps_data_root")
+    if require_inputs:
+        if source is None:
+            reasons.append("source_root_missing")
+        if data is None:
+            reasons.append("data_root_missing")
     if difficulty != DEFAULT_LEVEL or difficulty not in _LEVELS:
         reasons.append(f"unsupported_difficulty:{difficulty!r}; CyberGym run is Level 1")
     model_text = str(model or "").strip()
@@ -457,6 +463,65 @@ def verify_pinned_file(
     if actual != expected:
         raise CyberGymPinRefused(f"{label} SHA-256 mismatch: expected {expected}, got {actual}")
     return {"label": label, "path": str(target), "sha256": actual, "size": len(raw)}
+
+
+def verify_source_checkout(
+    path: pathlib.Path | str,
+    *,
+    expected_commit: str = "",
+    require_clean: bool = True,
+) -> dict[str, Any]:
+    """Verify the evaluator checkout after admission, separately from the seed gate."""
+    import subprocess
+
+    root = pathlib.Path(path).expanduser().resolve(strict=False)
+    if not root.is_dir():
+        raise CyberGymPinRefused(f"source checkout is unavailable: {root}")
+
+    def _git(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise CyberGymPinRefused(f"source git probe failed: {args[0]}")
+        return (proc.stdout or "").strip()
+
+    commit = _git("rev-parse", "HEAD")
+    expected = str(expected_commit or "").strip().lower()
+    if expected and commit.lower() != expected:
+        raise CyberGymPinRefused(f"source commit mismatch: expected {expected}, got {commit}")
+    status = _git("status", "--porcelain=v1", "--untracked-files=all")
+    if require_clean and status:
+        raise CyberGymPinRefused("source checkout is dirty")
+    tree = _git("rev-parse", "HEAD^{tree}")
+    return {
+        "path": str(root),
+        "commit": commit,
+        "tree": tree,
+        "clean": not bool(status),
+        "status_entries": len(status.splitlines()) if status else 0,
+        "expected_commit": expected,
+    }
+
+
+def source_tree_digest(path: pathlib.Path | str) -> str:
+    """Return a deterministic SHA-256 over ``git archive HEAD`` bytes."""
+    import subprocess
+
+    root = pathlib.Path(path).expanduser().resolve(strict=False)
+    proc = subprocess.run(
+        ["git", "-C", str(root), "archive", "--format=tar", "HEAD"],
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise CyberGymPinRefused("unable to produce source tree digest")
+    return hashlib.sha256(proc.stdout).hexdigest()
 
 
 def _normal_level(value: Any, default: str) -> str:
@@ -636,7 +701,11 @@ def _final_path(path_or_workspace: pathlib.Path | str) -> pathlib.Path:
 
 
 def final_poc_record(path_or_workspace: pathlib.Path | str) -> FinalPoc:
-    """Hash exactly one regular, non-symlink ``final.poc`` file."""
+    """Hash exactly one regular, non-symlink ``final.poc`` file.
+
+    CyberGym caps uploaded PoCs at 10 MiB; enforcing that protocol limit here
+    prevents an oversized marker from being mistaken for a valid final trial.
+    """
     import stat
 
     target = _final_path(path_or_workspace)
@@ -646,6 +715,10 @@ def final_poc_record(path_or_workspace: pathlib.Path | str) -> FinalPoc:
         raise FinalPocRefused(f"final PoC is missing: {target}") from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise FinalPocRefused(f"final.poc must be a regular non-symlink file: {target}")
+    if info.st_size <= 0:
+        raise FinalPocRefused(f"final.poc must be non-empty: {target}")
+    if info.st_size > 10 * 1024 * 1024:
+        raise FinalPocRefused(f"final.poc exceeds the CyberGym 10 MiB upload cap: {target}")
     try:
         raw = target.read_bytes()
     except OSError as exc:
@@ -1181,8 +1254,30 @@ def append_cybergym_result(run_root: pathlib.Path | str, row: Mapping[str, Any])
     root = pathlib.Path(run_root).expanduser().resolve(strict=False)
     task = safe_task_id(str(row.get("task_id", row.get("instance_id", ""))))
     value = dict(row)
-    append_result_index(root, value)
-    append_result_index(safe_task_path(root, task), value)
+    # The shared helper deliberately stays a tiny append primitive and does not
+    # own a cross-process lock.  A campaign can have several lanes, so serialize
+    # the paired parent/task writes here and fsync the lock holder before release.
+    lock_path = root / ".result_index.lock"
+    root.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        locked = False
+        try:
+            try:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                locked = True
+            except ImportError:
+                pass
+            append_result_index(root, value)
+            append_result_index(safe_task_path(root, task), value)
+            lock.flush()
+            os.fsync(lock.fileno())
+        finally:
+            if locked:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _task_spec(value: TaskSpec | Mapping[str, Any] | str) -> TaskSpec:
@@ -1234,10 +1329,10 @@ def run_campaign(
     ledger = BudgetLedger(root / "claims.jsonl", cap_usd=budget_cap_usd)
     rows: list[dict[str, Any]] = []
     for task in normalized_tasks:
-        task_dir = safe_task_path(root, task.task_id)
-        task_dir.mkdir(parents=True, exist_ok=True)
         contract = task.metadata.get("task_contract") if isinstance(task.metadata, Mapping) else None
         if executor is None:
+            task_dir = safe_task_path(root, task.task_id)
+            task_dir.mkdir(parents=True, exist_ok=True)
             row = build_task_result_row(
                 task.task_id,
                 status="blocked",
@@ -1253,9 +1348,18 @@ def run_campaign(
             continue
 
         claim: Mapping[str, Any] | None = None
+        task_dir = safe_task_path(root, task.task_id)
         try:
             claim = ledger.claim(task.task_id, estimated_cost_usd)
-            result = executor(task, task_dir)
+            # Claim first, then create the workspace.  The persisted attempt id
+            # is part of the immutable task value so sidecar agent identities,
+            # checkpoints, and late results all refer to the same claim.
+            task_dir.mkdir(parents=True, exist_ok=True)
+            attempt_id = str(claim["attempt_id"])
+            callback_metadata = dict(task.metadata)
+            callback_metadata["attempt_id"] = attempt_id
+            callback_task = dataclasses.replace(task, metadata=callback_metadata)
+            result = executor(callback_task, task_dir)
             if not isinstance(result, Mapping):
                 raise CyberGymIntegrationUnavailable("CyberGym executor must return a mapping")
             outcome = dict(result)
