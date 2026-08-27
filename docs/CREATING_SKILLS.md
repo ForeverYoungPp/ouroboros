@@ -85,7 +85,7 @@ entry: plugin.py                    # type=extension only — relative to skill 
 scripts:                            # type=script only
   - name: fetch.py                  # name resolves under scripts/ unless slashes/extensions
     description: Fetch and render
-permissions: [net, tool, route, widget, read_settings]   # see "Permissions"
+permissions: [net, tool, route, widget, read_settings, companion_process, supervised_task] # see "Permissions"
 conflicts: [legacy-weather]            # optional incompatible installed skill names
 env_from_settings: [OPENROUTER_API_KEY]                  # core keys require an owner grant
 when_to_use: User asks for the weather forecast.
@@ -284,14 +284,14 @@ metadata and the `supervised_task` permission.
 ### Declaring a companion process
 
 The descriptor lives in the manifest; `plugin.py` only names it. The key is
-`companion_processes` — **plural** — and `register_companion_process()` takes
-that name and nothing else:
+`companion_processes` — **plural** — and `register_companion_process()` accepts
+only that name (positionally or by keyword):
 
 ```yaml
-permissions: [tool, companion_process]
+permissions: [companion_process]
 companion_processes:
-  - name: demo_worker                     # alnum/underscore only, no hyphen
-    command: [python3, scripts/worker.py] # a reviewed path inside the skill
+  - name: demo_worker                     # alnum/underscore only, max 24 chars
+    command: [python3, scripts/worker.py] # relative POSIX-style path in the skill
     runtime: python3
     restart_policy: on_failure            # default; the only policy that restarts
     max_restarts: 5                       # default; the bound within a 300s window
@@ -299,7 +299,7 @@ companion_processes:
 
 ```python
 def register(api):
-    api.register_companion_process("demo_worker")   # one argument, no kwargs
+    api.register_companion_process("demo_worker")   # only the declared name
 ```
 
 Two different layers check this, and they fail at different moments. The parser
@@ -311,27 +311,34 @@ rejects a malformed descriptor when the skill is read:
 | `runtime` is declared | `each 'companion_processes' item must include runtime` |
 | A `python`/`python3` runtime names a script — a bare `[python3]` does not | `python companion command must name a reviewed script` |
 | No argument is `-c`, `-m`, `-e`, `--eval` or `eval`. `[python3, -m, mypackage, boot]` is caught here rather than by the rule above, even when the package is a declared dependency — and so is a script of your own passed a flag that happens to be named `-c` | `companion inline/eval commands are not allowed` |
-| No argument escapes the skill directory (absolute path, `..`) | `companion command arguments must stay inside the reviewed skill tree` |
+| Path arguments use relative POSIX-style paths (no leading `/` or `..` segment) | `companion command arguments must stay inside the reviewed skill tree` |
+
+The path check is lexical and does not verify that the target file exists. Keep
+the script in the skill payload and use `/` separators so the descriptor has the
+same meaning on every supported platform.
 
 The rest is checked at registration, from `plugin.py`, and a manifest that is
 wrong in these ways parses without complaint:
 
 | Rule | Error when broken |
 |---|---|
-| The manifest declares `permissions: [companion_process]` | `skill 'x' cannot 'companion_process' — manifest permissions=[...]` |
-| `name` is alnum/underscore — `demo-worker` parses in the manifest but is not a registrable name | `tool name must be alnum/underscore only: 'demo-worker'` |
+| The manifest includes the `companion_process` permission | `skill 'x' cannot 'companion_process' — manifest permissions=[...]` when it is missing |
+| `name` is non-empty, at most 24 characters, and alnum/underscore — `demo-worker` parses in the manifest but is not a registrable name | `tool name must be alnum/underscore only: 'demo-worker'` |
 | The name passed to `register_companion_process()` is declared in the manifest | `companion 'x' is not declared in manifest.companion_processes` |
 
 **If you read that last error, check the key for a missing `s` first.** An
 unrecognised frontmatter key is kept as an extra rather than refused —
 `install_specs` and the forward-compatible `presence:` block are both read that
 way — so `companion_process:` in the singular parses, declares no companions,
-and no deterministic path — parser, `validate()`, `skill_preflight` — warns about it. The error you eventually meet names the
+and currently produces no warning from the parser, `validate()`, or
+`skill_preflight`. The error you eventually meet names the
 plural key and cannot tell you that the singular one was sitting in the
 manifest all along.
 
-There is no `on_enable` trigger and no `once` flag. A companion starts when the
-skill is enabled and is supervised from there; `restart_policy: on_failure`
+There is no `on_enable` trigger and no `once` flag. After a skill is enabled, the
+host starts a companion whose name `register()` has registered; for an
+out-of-process extension, this handoff can be asynchronous. The companion is
+supervised from there; `restart_policy: on_failure`
 restarts it only on a non-zero exit, so a one-shot script that exits 0 runs
 once, and `max_restarts` (default 5, counted within a 300-second window) bounds
 the loop before `companion_restart_exhausted` is recorded. For work that must
