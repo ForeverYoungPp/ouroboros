@@ -1420,6 +1420,10 @@ export function createChatInstance({
         const record = liveCardRecords.get(ownerTaskId);
         const merged = record?.reviewController?.update(group);
         if (merged) {
+            // History replay builds review-only owners while pass 1 suppresses
+            // DOM insertion. The pass-2 row is intentionally consumed by this
+            // seam, so make the already-created owner visible before returning.
+            if (!_syncPass1Active) ensureLiveCardVisible(record);
             if (rawTs) reanchorVisibleTaskCard(ownerState, rawTs);
             if (!record.reviewOwnerDetailObserved) {
                 record.reviewOwnerDetailObserved = true;

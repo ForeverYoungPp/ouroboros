@@ -443,6 +443,59 @@ test('first task-bound review hydrates a progress-created owner once and reconci
     }
 });
 
+test('reconnect with only a task-bound review row inserts the owner checkpoint card', async () => {
+    let historyRows = [];
+    const { prior, mount } = installDom(async (url) => {
+        if (String(url).startsWith('/api/chat/history')) {
+            return { ok: true, json: async () => ({ messages: historyRows }) };
+        }
+        return { ok: true, json: async () => ({ active_direct_turns: [] }) };
+    });
+    const handlers = new Map();
+    const ws = {
+        on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
+        isConnected: () => true,
+        send() {},
+    };
+    let generation = 0;
+    const stateSnapshots = {
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        isCurrent: () => true,
+        apply() {},
+    };
+    let instance;
+    try {
+        instance = createChatInstance({
+            ws,
+            state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
+            updateUnreadBadge() {}, stateSnapshots, chatId: 2, idPrefix: 'chat', mountEl: mount,
+            asPanel: true,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        historyRows = [{
+            chat_id: 2,
+            role: 'system',
+            system_type: 'skill_review',
+            task_id: 'review-child',
+            ts: '2026-08-24T00:00:01Z',
+            review_group: {
+                surface: 'skill', id: 'task:review-root:alpha',
+                presentation_owner_task_id: 'review-root', skill: 'alpha', status: 'clean',
+                attempts: [{ job_id: 'review-job', skill: 'alpha', status: 'clean' }],
+            },
+        }];
+        handlers.get('open')({ previouslyConnected: true });
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        const messages = globalThis.document.byId.get('chat-messages');
+        const ownerCard = messages.children.find((node) => node.dataset.taskId === 'review-root');
+        assert.ok(ownerCard, 'review-only history replay must insert the explicit owner card');
+        assert.equal(ownerCard.querySelector('[data-live-review-summary]')?.textContent, 'Reviews 1');
+    } finally {
+        instance?.destroy();
+        restoreDom(prior);
+    }
+});
+
 test('Plan invalidation applies terminal task detail to its review-created owner card', async () => {
     const revision = 'a'.repeat(64);
     const detailCalls = [];
