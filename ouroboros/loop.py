@@ -1625,7 +1625,6 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
     # renders the REAL per-slot message pair; the rare second physical attempt
     # is deliberately not multiplied in — a fail-open coarse filter, not a
     # hard reservation.
-    # Budget-admit the panel from real per-slot prompts; repair resends remain unreserved.
     from ouroboros.tools.review_helpers import review_wave_budget_gate
 
     try:
@@ -3492,7 +3491,6 @@ def _maybe_deadline_local_finalize(
         return None
     ctx.deadline_ts = deadline.timestamp()
     remaining = (deadline - utc_now()).total_seconds()
-    # Use the existing finalization grace for headless runs; never synthesize a deadline.
     if remaining > task_pacing.effective_finalization_reserve_sec(tools._ctx):
         return None
     prompt = (

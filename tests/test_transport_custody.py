@@ -56,3 +56,27 @@ def test_explicit_transport_cause_still_proves_pre_dispatch(data_root):
             raise RuntimeError("provider connection wrapper") from cause
         except RuntimeError as wrapper:
             assert is_pre_dispatch_transport_failure(wrapper)
+
+
+def test_requests_new_connection_error_proves_pre_dispatch(data_root):
+    import requests
+    import urllib3
+    from ouroboros.transport_custody import is_pre_dispatch_transport_failure
+
+    reason = urllib3.exceptions.NewConnectionError(None, "connection refused")
+    wrapped = requests.exceptions.ConnectionError(
+        urllib3.exceptions.MaxRetryError(None, "/messages", reason=reason)
+    )
+    assert is_pre_dispatch_transport_failure(wrapped)
+
+
+def test_requests_read_timeout_connection_error_does_not_prove_pre_dispatch(data_root):
+    import requests
+    import urllib3
+    from ouroboros.transport_custody import is_pre_dispatch_transport_failure
+
+    reason = urllib3.exceptions.ReadTimeoutError(None, "/messages", "read timed out")
+    wrapped = requests.exceptions.ConnectionError(
+        urllib3.exceptions.MaxRetryError(None, "/messages", reason=reason)
+    )
+    assert not is_pre_dispatch_transport_failure(wrapped)

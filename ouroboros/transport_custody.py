@@ -27,6 +27,21 @@ def is_pre_dispatch_transport_failure(exc: BaseException) -> bool:
         # exception to the previous provider leg, which would misclassify a
         # dispatched read timeout as a pre-dispatch connect failure.
         current = current.__cause__
+    try:
+        import requests
+        import urllib3
+
+        if isinstance(exc, requests.exceptions.ConnectTimeout):
+            return True
+        if not isinstance(exc, requests.exceptions.ConnectionError):
+            return False
+        for value in getattr(exc, "args", ()):
+            if isinstance(value, urllib3.exceptions.MaxRetryError):
+                reason = getattr(value, "reason", None)
+                if isinstance(reason, urllib3.exceptions.ConnectTimeoutError):
+                    return True
+    except Exception:  # pragma: no cover - optional transport dependency
+        pass
     return False
 
 
