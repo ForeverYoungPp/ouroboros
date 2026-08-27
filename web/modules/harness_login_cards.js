@@ -909,7 +909,18 @@ export function createLoginCardController({
         // are non-awaitable and must make every continuation inert NOW. The
         // monotone disposed flag plus active identity checks are the fence; a
         // second generation counter would duplicate that authority.
-        if (ctl.disposed && !ctl.active && ctl.detachedStatus) return ctl.detachedStatus;
+        if (!ctl.active && ctl.detachedStatus) {
+            // Disposed or not: an empty slot with a remembered verdict answers
+            // that verdict — the same invariant _closeLocked and dispose hold.
+            // The per-card no-job close leaves {disposed:false, active:null,
+            // detachedStatus}, and fabricating absent/released here would be
+            // exactly the empty-slot release proof this seam forbids.
+            ctl.disposed = true;
+            stopJobPolling();
+            releaseStatusPolling();
+            clearHost();
+            return ctl.detachedStatus;
+        }
         const active = ctl.active;
         let result = active
             ? custodyResult(active.envelope, { absent: Boolean(active.absent) })

@@ -285,3 +285,31 @@ test('a second Connect queued behind the failed-create close is not dropped', as
     ctl.dispose();
     await flush();
 });
+
+test('detach after the unknown-custody per-card close answers the remembered verdict', async () => {
+    // The third exit of the same invariant: pagehide/destroy call detach()
+    // directly, and an empty slot with a remembered verdict must answer it —
+    // never fabricate absent/released.
+    let releaseCreate = () => {};
+    const gate = new Promise((resolve) => { releaseCreate = resolve; });
+    const host = interactiveHost();
+    const ctl = createLoginCardController({
+        host,
+        store: null,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                await gate;
+                return json(502, { error: 'engine exploded mid-create' });
+            }
+            return json(404, {});
+        },
+    });
+    const starting = ctl.start('codex', '');
+    await flush();
+    const clicked = host.click('[data-login-dismiss]');
+    releaseCreate();
+    await starting;
+    const closeStatus = await clicked;
+    assert.equal(ctl.detach(), closeStatus,
+        'the external detach answers the verdict the queued close remembered');
+});
