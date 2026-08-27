@@ -619,7 +619,7 @@ def test_bounded_detail_lookup_missing_and_empty_history_are_absent(tmp_path):
     assert empty == (None, "absent")
 
 
-def test_bounded_detail_lookup_stat_permission_error_is_unavailable(tmp_path, monkeypatch):
+def test_bounded_detail_lookup_stat_permission_error_is_retryable_io_error(tmp_path, monkeypatch):
     from ouroboros import skill_review_history
 
     _client, drive_root = _detail_client(tmp_path)
@@ -635,12 +635,12 @@ def test_bounded_detail_lookup_stat_permission_error_is_unavailable(tmp_path, mo
     monkeypatch.setattr(pathlib.Path, "stat", guarded_stat)
     assert skill_review_history.find_history_job_bounded(
         drive_root, "alpha", "missing",
-    ) == (None, "unavailable")
+    ) == (None, "io_error")
 
 
 @pytest.mark.parametrize(
     ("error", "expected"),
-    [(FileNotFoundError("gone"), "absent"), (PermissionError("denied"), "unavailable")],
+    [(FileNotFoundError("gone"), "absent"), (PermissionError("denied"), "io_error")],
 )
 def test_bounded_detail_lookup_read_errors_are_typed(tmp_path, monkeypatch, error, expected):
     from ouroboros import skill_review_history
@@ -655,6 +655,24 @@ def test_bounded_detail_lookup_read_errors_are_typed(tmp_path, monkeypatch, erro
     assert skill_review_history.find_history_job_bounded(
         drive_root, "alpha", "missing",
     ) == (None, expected)
+
+
+def test_review_history_detail_io_error_is_retryable_503(tmp_path, monkeypatch):
+    from ouroboros import skill_review_history
+
+    client, _drive_root = _detail_client(tmp_path)
+    monkeypatch.setattr(
+        skill_review_history,
+        "find_history_job_bounded",
+        lambda *_args, **_kwargs: (None, "io_error"),
+    )
+
+    resp = client.get("/api/skills/alpha/review-history/skill-job-1")
+
+    assert resp.status_code == 503
+    assert resp.json()["error"] == (
+        "review history is temporarily unavailable; retry the detail"
+    )
 
 
 def test_review_history_detail_malformed_lines_degrade_to_typed_404(tmp_path):

@@ -1044,6 +1044,11 @@ def _skill_review_history_detail_sync(
     )
     if lookup_status == "absent":
         return {"error": "no review history for skill", "status_code": 404}
+    if lookup_status == "io_error":
+        return {
+            "error": "review history is temporarily unavailable; retry the detail",
+            "status_code": 503,
+        }
     if record is None:
         error = (
             "review record unavailable outside the bounded history window"

@@ -362,7 +362,7 @@ def find_history_job_bounded(
     except FileNotFoundError:
         return None, "absent"
     except OSError:
-        return None, "unavailable"
+        return None, "io_error"
     if size <= 0:
         return None, "absent"
     byte_window_truncated = size > _DETAIL_LOOKUP_MAX_BYTES
@@ -377,7 +377,7 @@ def find_history_job_bounded(
     except FileNotFoundError:
         return None, "absent"
     except OSError:
-        return None, "unavailable"
+        return None, "io_error"
     records_truncated = len(parsed) > _DETAIL_LOOKUP_MAX_RECORDS
     if records_truncated:
         parsed = parsed[-_DETAIL_LOOKUP_MAX_RECORDS:]
