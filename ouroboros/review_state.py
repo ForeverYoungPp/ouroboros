@@ -1136,7 +1136,7 @@ class AdvisoryReviewState:
             ):
                 continue
             item.status = "reviewing" if still_pending else "failed"
-            item.phase = "late_wait" if still_pending else "review"
+            item.phase = "late_wait" if still_pending else "infra"
             item.block_reason = (
                 "review_late_result_pending" if still_pending else "infra_failure"
             )

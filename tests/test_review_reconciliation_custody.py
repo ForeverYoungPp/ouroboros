@@ -568,6 +568,60 @@ def test_confirmed_owner_death_terminalizes_custody_loss_and_is_idempotent(tmp_p
     ) == []
 
 
+def test_confirmed_owner_death_keeps_identical_verdict_streak_fail_closed(tmp_path):
+    """A lost paid worker is infra noise, not a new terminal review result.
+
+    The identical-diff refusal must survive owner-death reconciliation so a
+    later retry cannot buy a duplicate paid wave for unchanged bytes.
+    """
+    from ouroboros.review_state import (
+        AdvisoryReviewState,
+        CommitAttemptRecord,
+        load_state,
+        make_repo_key,
+        save_state,
+    )
+    from ouroboros.tools.commit_gate import check_identical_verdict_refusal
+
+    fingerprint = "fp-owner-loss"
+    contract = "contract-owner-loss"
+    repo_key = make_repo_key(tmp_path)
+    save_state(tmp_path, AdvisoryReviewState(attempts=[CommitAttemptRecord(
+        ts="2020-01-01T00:00:00+00:00",
+        commit_message="owner lost",
+        status="reviewing",
+        attempt=1,
+        paid=True,
+        repo_key=repo_key,
+        task_id="task-owner-loss",
+        review_owner_pid=42,
+        pre_review_fingerprint=fingerprint,
+        review_contract_fingerprint=contract,
+        triad_raw_results=[{
+            "slot_id": "slot-api",
+            "operation_id": "op-api",
+            "operation_state": "custody_lost",
+            "late_result_pending": True,
+        }],
+    )]))
+
+    state = load_state(tmp_path)
+    changed = state.reconcile_process_local_review_custody_after_owner_loss(
+        confirmed_dead_owner_pids={42},
+    )
+    assert len(changed) == 1
+    assert state.attempts[0].status == "failed"
+    assert state.attempts[0].phase == "infra"
+    save_state(tmp_path, state)
+
+    refusal = check_identical_verdict_refusal(
+        SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id="task-owner-loss"),
+        fingerprint,
+        contract_fingerprint=contract,
+    )
+    assert refusal == ""
+
+
 def test_confirmed_owner_death_unblocks_a_new_commit(tmp_path):
     from ouroboros.review_state import AdvisoryReviewState, CommitAttemptRecord, make_repo_key
 
