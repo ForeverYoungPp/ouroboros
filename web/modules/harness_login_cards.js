@@ -947,13 +947,23 @@ export function createLoginCardController({
             // Re-proved at EXECUTION time, not at click time: a close queued
             // during an in-flight create observes the world that create left.
             // When it failed without a job id there is nothing a DELETE can
-            // address — the same honest local detach the pre-queue check in
-            // close() applies when the error is already visible at the press.
-            // detach() answers a bare STATUS; this transition's callers unwrap
-            // `.status` from an object like every other branch here returns.
-            const status = detach();
+            // address. This is the PER-CARD half of detach() only: the full
+            // detach permanently fences the controller, which silently dropped
+            // a second Connect legitimately queued behind this close. The
+            // verdict is still remembered so a dispose queued behind this
+            // close answers it instead of fabricating release from the empty
+            // slot; a later start opens a new custody story and clears it.
+            let result = custodyResult(active.envelope, { absent: Boolean(active.absent) });
+            if (active.custodyStatus === LOGIN_CUSTODY_UNKNOWN) {
+                result = { ...result, status: LOGIN_CUSTODY_UNKNOWN };
+            }
+            stopJobPolling();
+            releaseStatusPolling();
+            ctl.active = null;
+            ctl.detachedStatus = result.status;
+            clearHost();
             onSettled();
-            return { status };
+            return result;
         }
 
         let result = custodyResult(active.envelope, { absent: Boolean(active.absent) });
@@ -1205,6 +1215,9 @@ export function createLoginCardController({
         // this start, and a disposed controller must not create a job nobody
         // will ever poll or cancel.
         if (ctl.disposed) return;
+        // A new card is a new custody story: the remembered verdict belonged
+        // to the card the queued close detached, not to this one.
+        ctl.detachedStatus = null;
         // C7 (plan roast, accepted): a NEW login may start only once release of
         // the previous job is PROVEN (loginReleaseProven): a terminal snapshot
         // whose reason is not termination_unconfirmed, a reconciliation that

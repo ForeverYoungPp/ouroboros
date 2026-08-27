@@ -250,3 +250,38 @@ test('a dispose queued behind an unknown-custody detach keeps the unknown verdic
     assert.equal(disposeStatus, closeStatus,
         'the shutdown answers the remembered detach verdict, never a fabricated release');
 });
+
+test('a second Connect queued behind the failed-create close is not dropped', async () => {
+    // The queued close tears down ITS card only: a permanent fence here
+    // silently swallowed a different-account start legitimately queued behind
+    // the close.
+    let creates = 0;
+    let releaseCreate = () => {};
+    const gate = new Promise((resolve) => { releaseCreate = resolve; });
+    const host = interactiveHost();
+    const ctl = createLoginCardController({
+        host,
+        store: null,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                creates += 1;
+                if (creates === 1) { await gate; return json(502, { error: 'engine exploded' }); }
+                return json(200, { job_id: 'job-2', job: { state: 'running', phase: 'awaiting_user' }, attach_command: '' });
+            }
+            return json(200, { job: { state: 'cancelled' } });
+        },
+    });
+    const first = ctl.start('codex', '');
+    await flush();
+    const clicked = host.click('[data-login-dismiss]');
+    const second = ctl.start('codex', 'other-account');
+    releaseCreate();
+    await first;
+    await clicked;
+    await second;
+    await flush();
+    assert.equal(creates, 2, 'the queued second Connect ran after the close settled');
+    assert.ok(host.innerHTML.includes('data-login-card'), 'the second card rendered');
+    ctl.dispose();
+    await flush();
+});

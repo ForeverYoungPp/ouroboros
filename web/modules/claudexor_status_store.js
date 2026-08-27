@@ -930,15 +930,16 @@ export function claudexorPreparationLine(payload) {
     const daemon = payload?.daemon || {};
     const runtime = daemon.runtime || {};
     const state = String(runtime.state || '');
+    if (daemon.ownership_problem) {
+        // Checked before EVERY positive phase claim: ensure_running refuses a
+        // foreign daemon home, so neither an install nor a start proceeds on
+        // this payload however the runtime projection reads — the accounts
+        // panel carries the ownership sentence itself.
+        return 'Checking Claudexor…';
+    }
     if (state === 'installing') {
         const version = runtime.target_version ? ` ${runtime.target_version}` : '';
         return `Installing Claudexor${version}…`;
-    }
-    if (daemon.ownership_problem) {
-        // The producer's own refusal: ensure_running will not spawn into a
-        // foreign daemon home, so a "Starting…" claim would promise a start
-        // that is refused — the accounts panel carries the ownership sentence.
-        return 'Checking Claudexor…';
     }
     if (state === 'ready' && String(daemon.state || '') === 'stale') {
         // POSITIVE knowledge only: 'stale' is the producer's own "installed,

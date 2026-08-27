@@ -904,6 +904,11 @@ test('claudexorPreparationLine phases by runtime state and daemon liveness', () 
         daemon: { state: 'stale', ownership_problem: 'foreign home', runtime: { state: 'ready' } },
     }), 'Checking Claudexor…',
         'ensure refuses a foreign daemon home — never promise a start that is refused');
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'unreachable', ownership_problem: 'foreign home',
+            runtime: { state: 'installing', target_version: '3.3.14' } },
+    }), 'Checking Claudexor…',
+        'an ownership refusal outranks every positive phase claim, installing included');
     assert.equal(claudexorPreparationLine(null), 'Checking Claudexor…',
         'no snapshot is no phase evidence — the honest generic');
     assert.equal(claudexorPreparationLine({
