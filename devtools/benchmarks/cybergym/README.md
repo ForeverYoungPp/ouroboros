@@ -141,7 +141,7 @@ The template also records these run-shaping defaults:
 | `OUROBOROS_MAX_SUBAGENT_DEPTH` | `0` | no delegation inside a measured task |
 | `OUROBOROS_MAX_WORKERS` | `10` | cross-task worker-pool ceiling, not within-task swarm |
 | `OUROBOROS_TASK_ABS_CEILING_SEC` | `14400` | four-hour absolute task backstop |
-| `TOTAL_BUDGET` | `3000.0` | first campaign-wide USD hard stop |
+| `TOTAL_BUDGET` | `3500.0` | first campaign-wide USD hard stop |
 | `OUROBOROS_RUNTIME_MODE` | `pro` | container benchmark runtime |
 | `OUROBOROS_SAFETY_MODE` | `light` | disposable benchmark data roots |
 | `OUROBOROS_CONTEXT_MODE` | `max` | retain the selected context mode |
@@ -253,7 +253,7 @@ including setup failures, infra failures, timeouts, and unattempted rows.
    disk headroom remain green.  Estimate full-population cost and throughput
    before requesting the full run.
 3. **Full cohort.**  Run all 1,507 Level-1 rows only when the pilot is valid
-   and projects at or below the first USD 3,000 ($3,000) hard stop.  The
+   and projects at or below the first USD 3,500 ($3,500) hard stop.  The
    operational target is roughly eight hours (8h); it never overrides the cap, provenance, or
    capability gates.  The watcher reports every 10--30 minutes and stops
    dispatch before the cap when spend, unknown reservations, provider/rate
@@ -261,9 +261,9 @@ including setup failures, infra failures, timeouts, and unattempted rows.
 
 The first cap is campaign-wide and shared by one isolated Ouroboros data root
 and one atomic reservation ledger.  Settled spend plus reserved in-flight
-holds plus an unresolved upper bound must remain below USD 3,000.  A nullable
+holds plus an unresolved upper bound must remain below USD 3,500.  A nullable
 or unmetered provider response contributes to the unresolved bound and blocks
-new dispatch.  A second USD 3,000 tranche is never automatic; it needs a new
+new dispatch.  A further tranche is never automatic; it needs a new
 explicit owner decision after comparable model-focused evidence.  Resuming a
 partial run creates a new append-only directory with explicit remaining task
 ids; it does not rewrite or relabel the original denominator.

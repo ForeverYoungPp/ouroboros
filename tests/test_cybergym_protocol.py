@@ -279,7 +279,7 @@ def test_launcher_paid_limits_and_immutable_hash_declarations_are_bounded():
     def args(**overrides):
         values = dict(
             model=OFFICIAL_MODEL,
-            budget_usd=3000.0,
+            budget_usd=3500.0,
             timeout_sec=14_400,
             workers=10,
             per_task_estimate_usd=1.0,
@@ -295,7 +295,7 @@ def test_launcher_paid_limits_and_immutable_hash_declarations_are_bounded():
         return SimpleNamespace(**values)
 
     for kwargs, message in (
-        ({"budget_usd": 3000.01}, "budget_usd"),
+        ({"budget_usd": 3500.01}, "budget_usd"),
         ({"timeout_sec": 14_401}, "timeout_sec"),
         ({"workers": 11}, "workers"),
         ({"allow_dirty_seed": True}, "allow-dirty-seed"),

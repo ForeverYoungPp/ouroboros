@@ -410,11 +410,11 @@ separate contracts and are recorded independently.  The smoke has a shorter
 explicit timeout visible in its manifest; it is not silently reused as the
 full-task cap.
 
-The campaign has one initial hard cap of USD 3,000.  One campaign-wide
+The campaign has one initial hard cap of USD 3,500.  One campaign-wide
 reservation ledger under one isolated server/data root enforces:
 
 ```text
-settled_usd + reserved_usd + unresolved_upper_bound <= 3000
+settled_usd + reserved_usd + unresolved_upper_bound <= 3500
 ```
 
 The launcher must receive an explicit measured per-task reservation through
@@ -434,9 +434,9 @@ full cohort; never resize a live cohort.  `OUROBOROS_MAX_WORKERS=10` in the
 template is a cross-task ceiling for this ramp, not permission to spawn
 within-task children.
 
-A second USD 3,000 tranche is never automatic.  It requires a new explicit
+A further tranche is never automatic.  It requires a new explicit
 owner confirmation after comparable model-focused evidence.  If the pilot's
-projection exceeds USD 3,000, stop before further paid work and report actual
+projection exceeds USD 3,500, stop before further paid work and report actual
 spend, throughput, uncertainty, and the projection; do not silently
 downsample or continue under a different population label.
 
@@ -558,7 +558,7 @@ to each item below from source and artifacts alone:
 8. Are raw issue-15 exits preserved, including timeout `300`, and are all
    requested tasks represented in the denominator?
 9. Are four-hour task ceilings, shorter smoke timeout, cross-task ramp, one
-   campaign ledger, explicit per-task reservation, and USD 3,000 stop visible?
+    campaign ledger, explicit per-task reservation, and USD 3,500 stop visible?
 10. Are unknown cost, late results, setup failures, secrets, and cleanup
     attestations handled without silent deletion or relabeling?
 

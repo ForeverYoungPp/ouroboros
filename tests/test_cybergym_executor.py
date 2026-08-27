@@ -99,6 +99,12 @@ def test_task_body_is_opaque_and_preserves_network_contract(tmp_path):
     assert body["executor_ref"]["id"] == "b" * 64
     assert body["executor_ref"]["container_name"] == "b" * 64
     assert "arvo:1" not in body["metadata"]
+    guidance = body["description"]
+    assert "structured file tools" in guidance
+    assert "do not give them '/workspace/...' paths" in guidance
+    assert "do not set cwd='/workspace'" in guidance
+    assert '["bash", "./submit.sh", "./final.poc"]' in guidance
+    assert str(task_dir) not in guidance
 
 
 def test_task_body_requires_immutable_workspace_id(tmp_path):
