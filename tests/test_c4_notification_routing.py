@@ -16,6 +16,9 @@ import pytest
 import ouroboros.skill_lifecycle_queue as q
 
 
+pytestmark = pytest.mark.serial
+
+
 @pytest.fixture(autouse=True)
 def _reset_queue_state():
     q._dedupe_jobs.clear()
