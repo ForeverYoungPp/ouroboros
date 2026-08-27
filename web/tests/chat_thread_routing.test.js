@@ -9,6 +9,7 @@ test('main adopts its own and transport-shaped frames but rejects explicit panel
     assert.equal(mainThreadAccepts({ chat_id: 1 }, known), true);
     assert.equal(mainThreadAccepts({}, known), true);               // missing chat_id -> main
     assert.equal(mainThreadAccepts({ chat_id: 0 }, known), false);
+    assert.equal(mainThreadAccepts({ chat_id: -1001 }, known), false);
     // External transport (Telegram-shaped big id) is never a registry member
     // and is never stamped: Main keeps adopting it.
     assert.equal(mainThreadAccepts({ chat_id: 197422551 }, known), true);
@@ -19,6 +20,8 @@ test('legacy absent log identity stays Main while explicit inner panel zero is r
     assert.equal(mainLogFrameAccepts({ chat_id: 0, data: { type: 'task_started' } }, known), true);
     assert.equal(mainLogFrameAccepts({ chat_id: 0, data: { type: 'review_reference', chat_id: 0 } }, known), false);
     assert.equal(mainLogFrameAccepts({ chat_id: 1, data: { type: 'review_reference', chat_id: 0 } }, known), false);
+    assert.equal(mainLogFrameAccepts({ chat_id: 1, data: { type: 'task_started', chat_id: -1001 } }, known), false);
+    assert.equal(mainLogFrameAccepts({ chat_id: -1001, data: { type: 'task_started' } }, known), false);
     assert.equal(mainLogFrameAccepts({ chat_id: 0, data: { type: 'task_started', chat_id: 1 } }, known), true);
     assert.equal(mainLogFrameAccepts({ project_thread: true, data: { chat_id: 1, project_thread: false } }, known), false);
 });

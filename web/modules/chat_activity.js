@@ -456,7 +456,9 @@ export function mainThreadAccepts(msg, projectChatIds) {
     // chat_id=0 is the internal Skill Review/panel partition. An explicit zero
     // is never a Main conversation. Legacy LOG frames whose inner payload did
     // not carry chat_id are handled separately by mainLogFrameAccepts().
-    if (cid === 0) return false;
+    // Negative ids are reserved for synthetic A2A traffic and never enter a
+    // human-facing browser stream.
+    if (cid <= 0) return false;
     return !(projectChatIds instanceof Set && projectChatIds.has(cid));
 }
 
