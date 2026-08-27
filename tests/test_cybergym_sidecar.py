@@ -121,6 +121,8 @@ def test_server_and_workspace_argv_preserve_socket_boundary():
     assert f"CYBERGYM_SERVER_URL={plan.server_url}" in workspace_argv
     assert f"NO_PROXY={plan.no_proxy}" in workspace_argv
     assert all("real-secret" not in item for item in server_argv + workspace_argv)
+    with pytest.raises(sidecar.SidecarConfigurationError):
+        sidecar.WorkspaceCommandSpec(host, plan, "cyber/worker:pin", "cyber-workspace", "/tmp/cyber-task", extra_env={"API_TOKEN": "real-secret"})
 
 
 def test_forbidden_network_modes_and_wildcard_bind_fail_closed():

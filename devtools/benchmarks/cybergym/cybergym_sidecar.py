@@ -276,7 +276,7 @@ def build_no_proxy(alias: str, port: int | None = None, *, existing: Iterable[st
 
 def build_private_route(plan: NetworkPlan, endpoint: str, *, audience: str) -> str:
     endpoint = _text(endpoint, "endpoint", max_len=512)
-    if not endpoint.startswith("/") or "//" in endpoint or ".." in endpoint:
+    if not endpoint.startswith("/") or "//" in endpoint or ".." in endpoint or "?" in endpoint or "#" in endpoint:
         raise SidecarConfigurationError("endpoint must be a relative absolute path")
     audience = _safe_id(audience, "audience").lower()
     protected = {"/query-poc", "/submit-fix", "/fix", "/protected/query", "/protected/fix"}
@@ -355,6 +355,15 @@ def _env_name(value: str) -> str:
     return value
 
 
+def _safe_env_items(values: Mapping[str, str]) -> None:
+    for key, value in values.items():
+        _env_name(key)
+        _text(value, f"environment value for {key}", max_len=4096)
+        upper = key.upper()
+        if any(marker in upper for marker in ("SECRET", "TOKEN", "PASSWORD", "CREDENTIAL")) or upper.endswith("_API_KEY"):
+            raise SidecarConfigurationError(f"secret-bearing environment must be injected by name only: {key}")
+
+
 def _mount_path(value: str, name: str) -> str:
     value = _safe_path(value, name)
     if "," in value:
@@ -427,9 +436,7 @@ class SidecarCommandSpec:
             raise SidecarConfigurationError("unsafe platform")
         for item in self.command:
             _text(item, "command argument", max_len=4096)
-        for key, value in self.extra_env.items():
-            _env_name(key)
-            _text(value, f"environment value for {key}", max_len=4096)
+        _safe_env_items(self.extra_env)
         _labels(self.plan, "server", self.labels)
 
 
@@ -459,9 +466,7 @@ class WorkspaceCommandSpec:
             raise SidecarConfigurationError("unsafe platform")
         for item in self.command:
             _text(item, "command argument", max_len=4096)
-        for key, value in self.extra_env.items():
-            _env_name(key)
-            _text(value, f"environment value for {key}", max_len=4096)
+        _safe_env_items(self.extra_env)
         _labels(self.plan, "workspace", self.labels)
 
 
