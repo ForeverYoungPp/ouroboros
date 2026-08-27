@@ -307,6 +307,7 @@ rejects a malformed descriptor when the skill is read:
 
 | Rule | Error when broken |
 |---|---|
+| `name` is present and non-empty | `each 'companion_processes' item must include name` |
 | `command` is present and non-empty | `each 'companion_processes' item must include a non-empty command list` |
 | `runtime` is declared | `each 'companion_processes' item must include runtime` |
 | A `python`/`python3` runtime names a script — a bare `[python3]` does not | `python companion command must name a reviewed script` |
@@ -317,13 +318,15 @@ The path check is lexical and does not verify that the target file exists. Keep
 the script in the skill payload and use `/` separators so the descriptor has the
 same meaning on every supported platform.
 
-The rest is checked at registration, from `plugin.py`, and a manifest that is
-wrong in these ways parses without complaint:
+Registration then checks the manifest permission, the name constraints that the
+parser does not enforce, and whether the name is declared. A manifest that has
+passed parsing but is wrong in these ways fails from `plugin.py`:
 
 | Rule | Error when broken |
 |---|---|
 | The manifest includes the `companion_process` permission | `skill 'x' cannot 'companion_process' — manifest permissions=[...]` when it is missing |
-| `name` is non-empty, at most 24 characters, and alnum/underscore — `demo-worker` parses in the manifest but is not a registrable name | `tool name must be alnum/underscore only: 'demo-worker'` |
+| `name` is at most 24 characters | `tool name must be <= 24 characters: '...'` |
+| `name` contains only alnum/underscore — `demo-worker` parses in the manifest but is not a registrable name | `tool name must be alnum/underscore only: 'demo-worker'` |
 | The name passed to `register_companion_process()` is declared in the manifest | `companion 'x' is not declared in manifest.companion_processes` |
 
 **If you read that last error, check the key for a missing `s` first.** An
