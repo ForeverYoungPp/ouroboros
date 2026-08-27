@@ -308,6 +308,24 @@ def retryable_review_exception(exc: Exception, usage_ctx: Any) -> bool:
     """Whether a second byte-identical review send has a terminal basis."""
     from ouroboros.loop_llm_call import classify_llm_exception
 
+    # A cancellation requested after the first route attempt is a terminal
+    # owner decision for this wave, even when the transport wrapper surfaced a
+    # generic retryable preparation error. Reusing the existing durable cancel
+    # intent prevents a zero-cost pre-dispatch retry from racing the stop rail.
+    if usage_ctx is not None:
+        task_id = str(getattr(usage_ctx, "task_id", "") or "")
+        drive_root = getattr(usage_ctx, "drive_root", None)
+        if task_id and drive_root:
+            try:
+                from ouroboros.cancel_intents import cancel_pending
+
+                if cancel_pending(drive_root, task_id, strict=True):
+                    return False
+            except Exception:
+                # An unreadable cancel projection must not authorize another
+                # paid/retryable physical attempt.
+                return False
+
     classification = classify_llm_exception(exc)
     if classification.kind == "provider_outcome_unknown":
         if usage_ctx is not None:

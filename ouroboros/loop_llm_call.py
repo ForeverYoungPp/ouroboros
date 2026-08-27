@@ -1518,6 +1518,7 @@ def call_llm_with_retry(
             })
             append_jsonl(drive_logs / "events.jsonl", _round_event)
             _emit_llm_operation(event_queue, task_id, llm_call_id, "finished", task_attempt, execution_id, round_id)
+            _emit_main_llm_call_state(event_queue, call_identity, "finished")
             return msg, cost
         except UsageAccountingError:
             _emit_llm_operation(event_queue, task_id, llm_call_id, "failed", task_attempt, execution_id, round_id)
