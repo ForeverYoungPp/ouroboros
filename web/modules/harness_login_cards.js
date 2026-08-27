@@ -935,6 +935,11 @@ export function createLoginCardController({
         const active = ctl.active;
         if (!active) {
             if (shuttingDown) { stopJobPolling(); releaseStatusPolling(); clearHost(); }
+            // A remembered detach verdict outranks the empty-slot default: a
+            // queued close that detached with UNKNOWN must not be overwritten
+            // by a later shutdown answering absent/released for the same card
+            // — that would fabricate release proof out of an empty slot.
+            if (ctl.detachedStatus) return { status: ctl.detachedStatus };
             return custodyResult(null, { absent: true });
         }
         if (expected !== undefined && active !== expected) return custodyResult(null);

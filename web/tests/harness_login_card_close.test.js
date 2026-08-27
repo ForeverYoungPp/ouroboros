@@ -219,4 +219,34 @@ test('a malformed 2xx create with a job id is still cancellable by a queued clos
     const status = await clicked;
     assert.equal(deletes, 1, 'the id was adopted before body validation — the job got its DELETE');
     assert.ok(typeof status === 'string' && status.length > 0);
-})
+});
+
+test('a dispose queued behind an unknown-custody detach keeps the unknown verdict', async () => {
+    // The queued close detaches with UNKNOWN (untyped create failure, no job
+    // id); the shutdown that follows must answer that remembered verdict —
+    // an empty slot is not release proof.
+    let releaseCreate = () => {};
+    const gate = new Promise((resolve) => { releaseCreate = resolve; });
+    const host = interactiveHost();
+    const ctl = createLoginCardController({
+        host,
+        store: null,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                await gate;
+                return json(502, { error: 'engine exploded mid-create' });
+            }
+            return json(404, {});
+        },
+    });
+    const starting = ctl.start('codex', '');
+    await flush();
+    const clicked = host.click('[data-login-dismiss]');
+    const disposed = ctl.dispose();
+    releaseCreate();
+    await starting;
+    const closeStatus = await clicked;
+    const disposeStatus = await disposed;
+    assert.equal(disposeStatus, closeStatus,
+        'the shutdown answers the remembered detach verdict, never a fabricated release');
+});
