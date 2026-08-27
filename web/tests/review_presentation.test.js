@@ -427,6 +427,38 @@ test('review tones use an explicit success allowlist', () => {
     assert.equal(pending.activeCount, 1);
 });
 
+test('terminal lifecycle wins over pending history after reload without inventing a verdict', () => {
+    const group = reviewGroupFromHistoryRow({
+        ...groupedSkillRow({
+            attempts: [{
+                job_id: 'pending-job',
+                skill: 'alpha',
+                status: 'pending',
+                job_status: 'succeeded',
+            }],
+        }),
+        status: 'pending',
+        job_status: 'succeeded',
+        job_id: 'pending-job',
+    });
+    assert.equal(group.state, 'terminal');
+    assert.equal(group.tone, 'neutral');
+    assert.equal(group.verdict, '');
+    assert.equal(group.activeCount, 0);
+    assert.equal(group.attempts[0].lifecycleOnly, true);
+});
+
+test('semantic history still wins when a successful lifecycle fact is present', () => {
+    const group = reviewGroupFromHistoryRow({
+        ...groupedSkillRow(),
+        status: 'clean',
+        job_status: 'succeeded',
+    });
+    assert.equal(group.state, 'terminal');
+    assert.equal(group.tone, 'done');
+    assert.equal(group.verdict, 'clean');
+});
+
 test('lifecycle completion stays neutral until a semantic review verdict arrives', () => {
     const lifecycle = reviewGroupFromLifecycle({ lifecycle: {
         kind: 'review', status: 'succeeded', target: 'alpha', job_id: 'job-live',

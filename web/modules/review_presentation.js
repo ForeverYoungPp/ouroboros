@@ -120,6 +120,8 @@ function normalizeSkillAttempt(attempt, defaults = {}, ordinal = 0) {
         attempt.review_status || attempt.review_verdict || attempt.status || defaults.status,
     );
     const lifecycleOnly = attempt.lifecycle_only === true
+        || (!hasSemanticVerdict(explicitStatus)
+            && LIFECYCLE_TERMINAL_STATES.has(lifecycleStatus.toLowerCase()))
         || (!attempt.review_status && !attempt.review_verdict
             && LIFECYCLE_TERMINAL_STATES.has(explicitStatus.toLowerCase()));
     const rawStatus = lifecycleOnly ? '' : explicitStatus;
@@ -166,10 +168,14 @@ function normalizeSkillGroup(group, row = {}, { allowRowTaskIdFallback = true } 
     const ownerTaskId = text(group.presentation_owner_task_id);
     if (!id || !ownerTaskId) return null;
     const groupStatus = text(group.status);
-    const lifecycleStatus = text(group.lifecycle_status || groupStatus || row.status);
+    const lifecycleStatus = text(
+        group.lifecycle_status || row.lifecycle_status || row.job_status
+        || groupStatus || row.status,
+    );
     const groupVerdict = text(group.verdict);
+    const rowVerdict = text(row.review_status || row.review_verdict || row.status);
     const lifecycleOnly = group.lifecycle_only === true
-        || (!group.review_status && !group.verdict
+        || (!hasSemanticVerdict(groupVerdict || rowVerdict)
             && LIFECYCLE_TERMINAL_STATES.has(lifecycleStatus.toLowerCase()))
         || (!group.review_status && !group.review_verdict
             && groupVerdict.toLowerCase() === lifecycleStatus.toLowerCase()
@@ -179,7 +185,9 @@ function normalizeSkillGroup(group, row = {}, { allowRowTaskIdFallback = true } 
         status: lifecycleOnly
             ? text(group.review_status || group.review_verdict)
             : text(group.review_status || group.verdict || group.status || row.status),
-        state: normalizedState(group.state || group.status || row.status),
+        state: normalizedState(
+            group.state || (lifecycleOnly ? lifecycleStatus : group.status || row.status),
+        ),
         initiatorTaskId: text(
             group.initiator_task_id || group.origin_task_id || row.origin_task_id
             || (allowRowTaskIdFallback ? row.task_id : ''),
