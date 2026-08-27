@@ -500,6 +500,31 @@ test('lifecycle completion stays neutral until a semantic review verdict arrives
         assert.equal(failed.attempts[0].tone, 'error');
     }
 
+    for (const [status, tone] of [
+        ['failed', 'error'], ['error', 'error'], ['cancelled', 'warn'],
+        ['interrupted', 'warn'], ['timeout', 'error'],
+    ]) {
+        const historical = reviewGroupFromHistoryRow({
+            ...groupedSkillRow({
+                attempts: [{
+                    job_id: `history-${status}`,
+                    skill: 'alpha',
+                    status,
+                    job_status: status,
+                }],
+            }),
+            status,
+            job_status: status,
+            job_id: `history-${status}`,
+        });
+        assert.equal(historical.verdict, '', status);
+        assert.equal(historical.lifecycleOnly, true, status);
+        assert.equal(historical.tone, tone, status);
+        assert.equal(historical.attempts[0].verdict, '', status);
+        assert.equal(historical.attempts[0].lifecycleOnly, true, status);
+        assert.equal(historical.attempts[0].tone, tone, status);
+    }
+
     const store = new Map();
     const history = reviewGroupFromHistoryRow(groupedSkillRow());
     mergeReviewGroup(store, history);

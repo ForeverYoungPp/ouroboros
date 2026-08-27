@@ -1156,16 +1156,18 @@ def _apply_window_quotas(
 
     # NOTE: guard 0 explicitly — Python's list[-0:] is list[0:] (the WHOLE list),
     # so a `[-quota:]` slice with quota==0 would leak everything, not nothing.
-    folded_reviews = [
-        m for m in combined
-        if not m.get("is_progress")
-        and str(m.get("system_type") or "") == "skill_review"
-        and isinstance(m.get("review_group"), dict)
-    ]
+    def _is_folded_review(m: dict) -> bool:
+        return (
+            not m.get("is_progress")
+            and str(m.get("system_type") or "") == "skill_review"
+            and isinstance(m.get("review_group"), dict)
+        )
+
+    folded_reviews = [m for m in combined if _is_folded_review(m)]
     human = sorted(
         (
             m for m in combined
-            if not m.get("is_progress") and m not in folded_reviews
+            if not m.get("is_progress") and not _is_folded_review(m)
         ),
         key=lambda m: m.get("ts", ""),
     )

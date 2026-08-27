@@ -24,9 +24,13 @@ const TERMINAL_STATES = new Set([
     ...ERROR_STATES, ...WARNING_STATES,
 ]);
 // These values belong to the lifecycle of the review job, not to the
-// review's semantic verdict.  Keep them terminal for activity purposes while
-// preventing a live lifecycle frame from looking like a verified PASS.
-const LIFECYCLE_TERMINAL_STATES = new Set(['succeeded', 'success', 'completed']);
+// review's semantic verdict. Keep them terminal for activity purposes while
+// preventing a lifecycle-only row from looking like a review verdict.
+const LIFECYCLE_SUCCESS_STATES = new Set(['succeeded', 'success', 'completed']);
+const LIFECYCLE_TERMINAL_STATES = new Set([
+    ...LIFECYCLE_SUCCESS_STATES,
+    'failed', 'error', 'timeout', 'interrupted', 'cancelled',
+]);
 
 const text = (value) => String(value ?? '').trim();
 const finiteCount = (value) => {
@@ -62,7 +66,7 @@ function lifecycleOnlyTone(lifecycleStatus, state) {
     // Successful job completion is deliberately not a semantic PASS.  Other
     // lifecycle failures still carry a useful severity fact even though their
     // review verdict is unavailable.
-    if (LIFECYCLE_TERMINAL_STATES.has(token)) return 'neutral';
+    if (LIFECYCLE_SUCCESS_STATES.has(token)) return 'neutral';
     return statusTone(state, token);
 }
 
