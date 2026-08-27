@@ -118,6 +118,13 @@ def test_network_argv_uses_internal_named_network_and_explicit_daemon():
     assert "--network" not in argv
 
 
+def test_connectivity_probe_uses_documented_server_route():
+    probes = sidecar.build_connectivity_probe_plan(_plan())
+    server_probe = next(item for item in probes if item["name"] == "agent_to_server")
+    assert server_probe["target"] == f"{_plan().server_url}/docs"
+    assert "/health" not in server_probe["target"]
+
+
 def test_server_and_workspace_argv_preserve_socket_boundary():
     plan, host = _plan(), _host()
     server = sidecar.SidecarCommandSpec(
@@ -147,6 +154,59 @@ def test_server_and_workspace_argv_preserve_socket_boundary():
         sidecar.WorkspaceCommandSpec(host, plan, "cyber/worker:pin", "cyber-workspace", "/tmp/cyber-task", extra_env={"TASK_HINT": "task-42"})
     with pytest.raises(sidecar.SidecarConfigurationError):
         sidecar.WorkspaceCommandSpec(host, plan, "cyber/worker:pin", "cyber-workspace", "/tmp/cyber-task", labels={"hint": "task-42"})
+    for key in ("DOCKER_HOST", "CYBERGYM_SERVER_URL", "NO_PROXY", "https_proxy"):
+        with pytest.raises(sidecar.SidecarConfigurationError):
+            sidecar.WorkspaceCommandSpec(
+                host, plan, "cyber/worker:pin", "cyber-workspace", "/tmp/cyber-task", extra_env={key: "override"}
+            )
+    with pytest.raises(sidecar.SidecarConfigurationError):
+        sidecar.SidecarCommandSpec(
+            host, plan, "cyber/server:pin", "cyber-server", api_key_env="DOCKER_HOST"
+        )
+    with pytest.raises(sidecar.SidecarConfigurationError):
+        sidecar.SidecarCommandSpec(
+            host, plan, "cyber/server:pin", "cyber-server", container_docker_host="tcp://127.0.0.1:2375"
+        )
+    mounted_socket_server = sidecar.SidecarCommandSpec(
+        host, plan, "cyber/server:pin", "cyber-server", container_docker_host="unix:///var/run/docker.sock"
+    )
+    assert "DOCKER_HOST=unix:///var/run/docker.sock" in sidecar.build_sidecar_argv(mounted_socket_server)
+    with pytest.raises(sidecar.SidecarConfigurationError):
+        sidecar.WorkspaceCommandSpec(
+            host, plan, "cyber/worker:pin", "cyber-workspace", "/tmp/cyber-task",
+            container_docker_host="unix:///var/run/docker.sock",
+        )
+
+
+def test_server_data_mount_keeps_one_absolute_root_for_verifier():
+    plan, host = _plan(), _host()
+    server = sidecar.SidecarCommandSpec(
+        host,
+        plan,
+        "cyber/server:pin",
+        "cyber-server",
+        data_host_path="/tmp/cyber-server-root",
+        data_container_path="/tmp/cyber-server-root",
+    )
+    argv = sidecar.build_sidecar_argv(server)
+    assert "type=bind,src=/tmp/cyber-server-root,dst=/tmp/cyber-server-root" in argv
+    with pytest.raises(sidecar.SidecarConfigurationError, match="same absolute"):
+        sidecar.SidecarCommandSpec(
+            host,
+            plan,
+            "cyber/server:pin",
+            "cyber-server",
+            data_host_path="/tmp/cyber-server-root",
+        )
+    with pytest.raises(sidecar.SidecarConfigurationError, match="same absolute"):
+        sidecar.SidecarCommandSpec(
+            host,
+            plan,
+            "cyber/server:pin",
+            "cyber-server",
+            data_host_path="/tmp/cyber-server-root",
+            data_container_path="/cybergym-data",
+        )
 
 
 def test_forbidden_network_modes_and_wildcard_bind_fail_closed():
@@ -250,6 +310,17 @@ def test_api_key_status_never_returns_secret():
     assert sidecar.is_placeholder_api_key("placeholder") is True
     with pytest.raises(sidecar.SidecarConfigurationError):
         sidecar.require_api_key("placeholder")
+
+
+def test_api_key_status_rejects_upstream_public_default_fingerprint():
+    # Only the non-reversible fingerprint is part of this test; the public
+    # example key itself must never be copied into source or test artifacts.
+    status = sidecar.api_key_attestation(
+        {"present": True, "placeholder": False, "fingerprint": "9605ed570966a4e0"}
+    )
+    assert status["placeholder"] is True
+    with pytest.raises(sidecar.SidecarConfigurationError):
+        sidecar.require_api_key(status)
 
 
 def test_production_expectation_requires_resolved_image_digest():

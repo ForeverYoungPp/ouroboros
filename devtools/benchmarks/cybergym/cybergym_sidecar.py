@@ -33,6 +33,24 @@ _SAFE_DNS = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
+# The upstream CyberGym distribution documents a public example key.  Keep
+# only its non-reversible digest prefix here; the key itself must never enter
+# source, logs, or an attestation artifact.
+_PUBLIC_DEFAULT_API_KEY_FINGERPRINT = "9605ed570966a4e0"
+_PROTECTED_ENV_NAMES = frozenset(
+    {
+        DOCKER_HOST_ENV,
+        API_KEY_ENV,
+        "CYBERGYM_SERVER_URL",
+        "CYBERGYM_TASK_ID",
+        "CYBERGYM_AGENT_ID",
+        "NO_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    }
+)
+
 
 class SidecarConfigurationError(ValueError):
     """Raised when an input would weaken the adapter-owned boundary."""
@@ -320,7 +338,9 @@ def build_private_route(plan: NetworkPlan, endpoint: str, *, audience: str) -> s
 
 def build_connectivity_probe_plan(plan: NetworkPlan) -> tuple[dict[str, Any], ...]:
     return (
-        {"name": "agent_to_server", "target": f"{plan.server_url}/health", "expected_reachable": True},
+        # FastAPI's documented route is stable across the upstream server
+        # versions used by this adapter.
+        {"name": "agent_to_server", "target": f"{plan.server_url}/docs", "expected_reachable": True},
         {
             "name": "verifier_to_private",
             "targets": (f"{plan.verifier_url}/query-poc", f"{plan.verifier_url}/submit-fix"),
@@ -401,12 +421,32 @@ def _env_name(value: str) -> str:
 
 
 def _safe_env_items(values: Mapping[str, str]) -> None:
+    if not isinstance(values, Mapping):
+        raise SidecarConfigurationError("extra_env must be a mapping")
     for key, value in values.items():
-        _env_name(key)
+        key = _env_name(key)
         _text(value, f"environment value for {key}", max_len=4096)
         upper = key.upper()
+        if upper in _PROTECTED_ENV_NAMES:
+            raise SidecarConfigurationError(f"protected control environment cannot be overridden: {key}")
         if any(marker in upper for marker in ("SECRET", "TOKEN", "PASSWORD", "CREDENTIAL")) or upper.endswith("_API_KEY"):
             raise SidecarConfigurationError(f"secret-bearing environment must be injected by name only: {key}")
+
+
+def _container_docker_host(value: str, socket_target: str) -> str:
+    """Validate the in-container Docker endpoint used by the server only.
+
+    The host-side daemon remains the explicitly selected rootless socket.  A
+    server may opt into ``DOCKER_HOST`` only when it points at the socket that
+    this command mounts into the container; arbitrary TCP/rootful endpoints
+    would let a caller bypass that custody boundary.
+    """
+
+    value = _text(value, "container_docker_host", max_len=4096)
+    expected = f"unix://{socket_target}"
+    if value != expected:
+        raise SidecarConfigurationError("container DOCKER_HOST must reference the mounted socket")
+    return value
 
 
 def _reject_task_exposure(values: Iterable[str], plan: NetworkPlan) -> None:
@@ -492,11 +532,23 @@ class SidecarCommandSpec:
         object.__setattr__(self, "docker_host", _host(self.docker_host))
         _validate_image(self.image)
         _safe_name(self.container_name, "container_name")
-        _env_name(self.api_key_env)
-        _mount_path(self.socket_target, "socket_target")
+        api_key_env = _env_name(self.api_key_env)
+        if api_key_env.upper() in _PROTECTED_ENV_NAMES and api_key_env != API_KEY_ENV:
+            raise SidecarConfigurationError("api_key_env collides with a protected control environment")
+        object.__setattr__(self, "api_key_env", api_key_env)
+        socket_target = _mount_path(self.socket_target, "socket_target")
+        object.__setattr__(self, "socket_target", socket_target)
+        data_container_path = _mount_path(self.data_container_path, "data_container_path")
+        object.__setattr__(self, "data_container_path", data_container_path)
         if self.data_host_path is not None:
-            _mount_path(self.data_host_path, "data_host_path")
-            _safe_path(self.data_container_path, "data_container_path")
+            data_host_path = _mount_path(self.data_host_path, "data_host_path")
+            object.__setattr__(self, "data_host_path", data_host_path)
+            if data_host_path != data_container_path:
+                raise SidecarConfigurationError(
+                    "server data mount must preserve the same absolute server-root path"
+                )
+        if self.container_docker_host is not None:
+            _container_docker_host(self.container_docker_host, socket_target)
         _digest(self.image_digest)
         if not re.fullmatch(r"[A-Za-z0-9_./-]+", self.platform):
             raise SidecarConfigurationError("unsafe platform")
@@ -535,12 +587,14 @@ class WorkspaceCommandSpec:
         _safe_env_items(self.extra_env)
         _reject_task_exposure(self.extra_env.values(), self.plan)
         _reject_task_exposure((*self.labels.keys(), *self.labels.values()), self.plan)
-        if self.container_docker_host:
-            _reject_task_exposure((self.container_docker_host,), self.plan)
+        if self.container_docker_host is not None:
+            raise SidecarConfigurationError("workspace must not receive DOCKER_HOST")
         _labels(self.plan, "workspace", self.labels)
 
 
 def _mount_arg(source: str, destination: str) -> str:
+    source = _mount_path(source, "mount source")
+    destination = _mount_path(destination, "mount destination")
     return f"type=bind,src={source},dst={destination}"
 
 
@@ -582,7 +636,7 @@ def build_sidecar_argv(spec: SidecarCommandSpec) -> list[str]:
         "--mount", _mount_arg(spec.docker_host.socket_path, spec.socket_target),
         "--env", spec.api_key_env,
     ))
-    if spec.container_docker_host:
+    if spec.container_docker_host is not None:
         argv.extend(("--env", f"{DOCKER_HOST_ENV}={_text(spec.container_docker_host, 'container_docker_host')}"))
     for key in sorted(spec.extra_env):
         argv.extend(("--env", f"{key}={spec.extra_env[key]}"))
@@ -609,8 +663,10 @@ def build_workspace_argv(spec: WorkspaceCommandSpec) -> list[str]:
         "--env", f"NO_PROXY={no_proxy}", "--env", f"no_proxy={no_proxy}",
         "--env", f"CYBERGYM_AGENT_ID={plan.opaque_agent_id}",
     ))
-    if spec.container_docker_host:
-        argv.extend(("--env", f"{DOCKER_HOST_ENV}={_text(spec.container_docker_host, 'container_docker_host')}"))
+    if spec.container_docker_host is not None:
+        # WorkspaceCommandSpec rejects this field; retain the branch only as
+        # a defensive guard for objects produced by untrusted deserializers.
+        raise SidecarConfigurationError("workspace must not receive DOCKER_HOST")
     for key in sorted(spec.extra_env):
         argv.extend(("--env", f"{key}={spec.extra_env[key]}"))
     argv.append(spec.image)
@@ -625,8 +681,14 @@ def api_key_attestation(value: Any) -> dict[str, Any]:
         present = value.get("present") is True
         placeholder = value.get("placeholder") is True
         fingerprint = value.get("fingerprint") if isinstance(value.get("fingerprint"), str) else None
-        if fingerprint and not re.fullmatch(r"[0-9a-f]{8,64}", fingerprint):
-            fingerprint = None
+        if fingerprint:
+            fingerprint = fingerprint.lower()
+            if not re.fullmatch(r"[0-9a-f]{8,64}", fingerprint):
+                fingerprint = None
+        # Sanitised runner observations may carry only a digest.  Do not trust
+        # a caller-provided ``placeholder=false`` when that digest identifies
+        # the public key shipped in upstream CyberGym documentation.
+        placeholder = placeholder or _is_public_default_key_fingerprint(fingerprint)
         return {"present": present, "placeholder": placeholder, "fingerprint": fingerprint}
     if not isinstance(value, str) or not value:
         return {"present": False, "placeholder": False, "fingerprint": None}
@@ -635,8 +697,24 @@ def api_key_attestation(value: Any) -> dict[str, Any]:
         "placeholder", "changeme", "change-me", "your_api_key", "your-api-key", "api_key", "test-key", "test_key",
         "none", "null", "<api-key>", "${cybergym_api_key}", "cybergym_api_key", "your-cybergym-api-key",
     }
-    placeholder = lowered in placeholders or lowered.startswith(("replace_me", "replace-me"))
-    return {"present": True, "placeholder": placeholder, "fingerprint": hashlib.sha256(value.encode()).hexdigest()[:16]}
+    digest = hashlib.sha256(value.encode()).hexdigest()
+    fingerprint = digest[:16]
+    placeholder = (
+        lowered in placeholders
+        or lowered.startswith(("replace_me", "replace-me"))
+        or _is_public_default_key_fingerprint(fingerprint)
+    )
+    return {"present": True, "placeholder": placeholder, "fingerprint": fingerprint}
+
+
+def _is_public_default_key_fingerprint(fingerprint: str | None) -> bool:
+    """Return whether a redacted key fingerprint matches the upstream public example."""
+
+    return bool(
+        isinstance(fingerprint, str)
+        and len(fingerprint) >= len(_PUBLIC_DEFAULT_API_KEY_FINGERPRINT)
+        and fingerprint.startswith(_PUBLIC_DEFAULT_API_KEY_FINGERPRINT)
+    )
 
 
 def is_placeholder_api_key(value: Any) -> bool:
