@@ -355,15 +355,6 @@ def test_supervisor_schedule_path_preserves_admitted_cap_after_live_depth_decrea
         },
     })
     event = _schedule_event("child", "parent", depth=2, drive_root=tmp_path)
-            "depth_provenance": {
-                "requested_depth": 3,
-                "permitted_depth": 3,
-                "attempted_depth": 2,
-                "achieved_depth": None,
-            },
-        },
-    })
-    event = _schedule_event("child", "parent", depth=2, drive_root=tmp_path)
     event["task_contract"] = contract
     enqueued = []
     events._handle_schedule_task(event, _fake_ctx(tmp_path, enqueued))
