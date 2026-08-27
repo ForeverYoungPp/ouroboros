@@ -128,6 +128,11 @@ not evidence of model diversity.  Task review is `required`, enforcement is
 `blocking`, and the review cycle value is `unlimited` as represented by the
 current settings schema.
 
+The template's `OUROBOROS_MAX_ROUNDS=200` is a safe launcher default.  The
+current owner-authorized pilot overrides it with `--max-rounds 1000`; the
+applied settings and run manifest are the authority for the value used by a
+particular cohort.
+
 The panel above belongs to the isolated measured server.  It must not be
 confused with the owner-selected external review of this adapter: Codex
 `gpt-5.6-sol` high, Cursor Grok `cursor-grok-4.6-high` high, and Cursor GLM
@@ -418,9 +423,15 @@ settled_usd + reserved_usd + unresolved_upper_bound <= 3500
 ```
 
 The launcher must receive an explicit measured per-task reservation through
-`--per-task-estimate-usd`.  The settings template intentionally does
-not set `OUROBOROS_PER_TASK_COST_USD`, because no owner-approved per-task
-number was chosen.  Missing, unknown, or unresolved reservation evidence
+`--per-task-estimate-usd`.  The settings template intentionally remains
+neutral and does not set `OUROBOROS_PER_TASK_COST_USD`; for the current
+owner-authorized pilot the launcher applies the explicit runtime tree cap
+`OUROBOROS_PER_TASK_COST_USD=20.0`.  The pilot passes both
+`--per-task-cost-usd 20` and `--per-task-estimate-usd 20`; the former is the
+runtime tree cap and the latter is the separate campaign-ledger reservation.
+Both values are visible without conflating their roles, and paid invocations
+must state the runtime cap explicitly.  Missing, unknown, or unresolved
+reservation evidence
 blocks the next paid dispatch.  A nullable provider cost is not interpreted as
 zero.  The watchdog stops before crossing the cap; it cannot raise the cap or
 rewrite settled rows.

@@ -72,6 +72,11 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 DEFAULT_TIMEOUT_SEC = 4 * 60 * 60
+DEFAULT_MAX_ROUNDS = 200
+# Runtime tree cap for each measured task.  This is deliberately separate from
+# ``--per-task-estimate-usd``: the latter is the campaign reservation, while
+# this value is consumed by the isolated Ouroboros server's UsageScope.
+DEFAULT_PER_TASK_COST_USD = 20.0
 
 
 def _row_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
@@ -127,6 +132,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--per-task-estimate-usd", type=float, default=None,
                         help="finite reservation required for a paid injected executor")
     parser.add_argument("--timeout-sec", type=float, default=DEFAULT_TIMEOUT_SEC)
+    parser.add_argument(
+        "--max-rounds",
+        type=float,
+        default=DEFAULT_MAX_ROUNDS,
+        help="per-task Ouroboros round ceiling (recorded in applied settings)",
+    )
+    parser.add_argument(
+        "--per-task-cost-usd",
+        type=float,
+        default=None,
+        help="runtime per-task Ouroboros tree cost cap (separate from the ledger estimate)",
+    )
     parser.add_argument("--workers", type=int, default=1,
                         help="bounded cross-task lanes; freeze only after pilot validation")
     parser.add_argument("--executor", default="", help="post-admission module:function callback")
@@ -181,6 +198,22 @@ def _validate_launcher_values(args: argparse.Namespace) -> None:
         raise ValueError(
             f"timeout_sec may not exceed the CyberGym task cap of {MAX_TASK_TIMEOUT_SEC}"
         )
+    args.max_rounds = validate_positive_integral(
+        getattr(args, "max_rounds", DEFAULT_MAX_ROUNDS), field="max_rounds"
+    )
+    dry_run = getattr(args, "dry_run", False)
+    raw_per_task_cost = getattr(args, "per_task_cost_usd", None)
+    if raw_per_task_cost is None:
+        if not dry_run:
+            raise ValueError(
+                "--per-task-cost-usd is required for paid CyberGym execution"
+            )
+        raw_per_task_cost = DEFAULT_PER_TASK_COST_USD
+    args.per_task_cost_usd = validate_positive_finite(
+        raw_per_task_cost, field="per_task_cost_usd"
+    )
+    if args.per_task_cost_usd > args.budget_usd:
+        raise ValueError("per_task_cost_usd may not exceed budget_usd")
     args.workers = validate_positive_integral(args.workers, field="workers")
     if args.workers > MAX_CROSS_TASK_WORKERS:
         raise ValueError(
@@ -193,7 +226,6 @@ def _validate_launcher_values(args: argparse.Namespace) -> None:
         if args.per_task_estimate_usd > args.budget_usd:
             raise ValueError("per_task_estimate_usd may not exceed budget_usd")
 
-    dry_run = getattr(args, "dry_run", False)
     allow_dirty = getattr(args, "allow_dirty_seed", False)
     if not isinstance(dry_run, bool) or not isinstance(allow_dirty, bool):
         raise ValueError("dry_run and allow_dirty_seed must be booleans")
@@ -691,6 +723,13 @@ def _prepare_applied_settings(
     model = validate_model_pin(args.model, expected=OFFICIAL_MODEL)
     budget_usd = validate_positive_finite(args.budget_usd, field="budget_usd")
     timeout_sec = validate_positive_integral(args.timeout_sec, field="timeout_sec")
+    max_rounds = validate_positive_integral(
+        getattr(args, "max_rounds", DEFAULT_MAX_ROUNDS), field="max_rounds"
+    )
+    per_task_cost_usd = validate_positive_finite(
+        getattr(args, "per_task_cost_usd", DEFAULT_PER_TASK_COST_USD),
+        field="per_task_cost_usd",
+    )
     overrides: dict[str, Any] = {
         "OUROBOROS_MODEL": model,
         "OUROBOROS_MODEL_LIGHT": model,
@@ -709,8 +748,9 @@ def _prepare_applied_settings(
         "OUROBOROS_CONTEXT_MODE": "max",
         "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "false",
         "OUROBOROS_MAX_WORKERS": 10,
-        "OUROBOROS_MAX_ROUNDS": 200,
+        "OUROBOROS_MAX_ROUNDS": max_rounds,
         "OUROBOROS_TASK_IDLE_TIMEOUT_SEC": 900,
+        "OUROBOROS_PER_TASK_COST_USD": per_task_cost_usd,
         "TOTAL_BUDGET": budget_usd,
         "OUROBOROS_TASK_ABS_CEILING_SEC": timeout_sec,
         "OUROBOROS_TASK_REVIEW_MODE": "required",
@@ -787,6 +827,8 @@ def _prepare_applied_settings(
         "template_path": str(template_path),
         "requested_model": model,
         "model": applied_model,
+        "max_rounds": max_rounds,
+        "per_task_cost_usd": per_task_cost_usd,
         "model_slots": model_slots,
         "budget_usd": budget_usd,
         "task_abs_ceiling_sec": timeout_sec,
@@ -909,6 +951,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "server": str(args.server),
                 "requested_server": str(args.server),
                 "timeout_sec": int(args.timeout_sec),
+                "max_rounds": int(getattr(args, "max_rounds", DEFAULT_MAX_ROUNDS)),
+                "per_task_cost_usd": float(
+                    getattr(args, "per_task_cost_usd", DEFAULT_PER_TASK_COST_USD)
+                ),
                 "executor": str(args.executor or "concrete_sidecar"),
                 "workers": int(args.workers),
                 "provider_only": list(_csv_values(getattr(args, "provider_only", ()))),
@@ -944,6 +990,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "network_contract": "cybergym-internal",
                 "final_poc_basename": "final.poc",
                 "budget_cap_usd": float(args.budget_usd),
+                "max_rounds": int(getattr(args, "max_rounds", DEFAULT_MAX_ROUNDS)),
+                "per_task_cost_usd": float(
+                    getattr(args, "per_task_cost_usd", DEFAULT_PER_TASK_COST_USD)
+                ),
             },
         )
     except BenchmarkAdmissionRefused as exc:

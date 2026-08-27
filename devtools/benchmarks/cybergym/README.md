@@ -140,6 +140,7 @@ The template also records these run-shaping defaults:
 | --- | ---: | --- |
 | `OUROBOROS_MAX_SUBAGENT_DEPTH` | `0` | no delegation inside a measured task |
 | `OUROBOROS_MAX_WORKERS` | `10` | cross-task worker-pool ceiling, not within-task swarm |
+| `OUROBOROS_MAX_ROUNDS` | `200` (launcher default) | per-task Ouroboros loop ceiling; the current owner-authorized pilot explicitly uses `--max-rounds 1000` |
 | `OUROBOROS_TASK_ABS_CEILING_SEC` | `14400` | four-hour absolute task backstop |
 | `TOTAL_BUDGET` | `3500.0` | first campaign-wide USD hard stop |
 | `OUROBOROS_RUNTIME_MODE` | `pro` | container benchmark runtime |
@@ -150,7 +151,13 @@ The template also records these run-shaping defaults:
 
 The template deliberately has no `OUROBOROS_PER_TASK_COST_USD` value.  The
 launcher must receive an explicit measured per-task reservation through its
-`--per-task-estimate-usd` interface before dispatch.  Missing,
+`--per-task-estimate-usd` interface before dispatch.  For the current
+owner-authorized pilot, it also applies the runtime tree cap
+`OUROBOROS_PER_TASK_COST_USD=20.0` to the isolated settings snapshot.  This is
+separate from the ledger reservation: the pilot passes both
+`--per-task-cost-usd 20` and `--per-task-estimate-usd 20`, so both rails are
+explicit and auditable.  The template/default remains unchanged for other
+runs; paid invocations must state the runtime cap explicitly.  Missing,
 unsettled, or unknown cost is a stop condition, never zero cost.
 
 ## No-swarm task contract

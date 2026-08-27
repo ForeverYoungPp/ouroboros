@@ -85,8 +85,9 @@ def test_profile_records_safe_runtime_and_budget_defaults():
     assert settings["OUROBOROS_POST_TASK_EVOLUTION"] == "false"
     assert settings["MCP_ENABLED"] is False
     assert settings["MCP_SERVERS"] == []
-    # No owner-approved per-task number exists; the launcher must supply a
-    # measured reservation instead of inheriting the runtime's $50 default.
+    # The template remains neutral; the launcher applies a run-specific
+    # runtime cap (covered by the protocol tests) instead of inheriting a
+    # hidden runtime default.
     assert "OUROBOROS_PER_TASK_COST_USD" not in settings
 
 

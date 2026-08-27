@@ -281,6 +281,8 @@ def test_launcher_paid_limits_and_immutable_hash_declarations_are_bounded():
             model=OFFICIAL_MODEL,
             budget_usd=3500.0,
             timeout_sec=14_400,
+            max_rounds=200,
+            per_task_cost_usd=20.0,
             workers=10,
             per_task_estimate_usd=1.0,
             dry_run=False,
@@ -297,6 +299,9 @@ def test_launcher_paid_limits_and_immutable_hash_declarations_are_bounded():
     for kwargs, message in (
         ({"budget_usd": 3500.01}, "budget_usd"),
         ({"timeout_sec": 14_401}, "timeout_sec"),
+        ({"max_rounds": 0}, "max_rounds"),
+        ({"per_task_cost_usd": 0}, "per_task_cost_usd"),
+        ({"per_task_cost_usd": 3500.01}, "per_task_cost_usd"),
         ({"workers": 11}, "workers"),
         ({"allow_dirty_seed": True}, "allow-dirty-seed"),
         ({"expected_data_sha256": ""}, "expected-data-sha256"),
@@ -305,10 +310,16 @@ def test_launcher_paid_limits_and_immutable_hash_declarations_are_bounded():
         with pytest.raises(ValueError, match=message):
             _validate_launcher_values(args(**kwargs))
 
-    normalized = args(workers="2", timeout_sec="120.0")
+    normalized = args(
+        workers="2", timeout_sec="120.0", max_rounds="1000.0", per_task_cost_usd="20.0"
+    )
     _validate_launcher_values(normalized)
     assert normalized.workers == 2
     assert normalized.timeout_sec == 120
+    assert normalized.max_rounds == 1000
+    assert normalized.per_task_cost_usd == 20.0
+    with pytest.raises(ValueError, match="per-task-cost-usd"):
+        _validate_launcher_values(args(per_task_cost_usd=None))
     with pytest.raises(ValueError, match="cybergym-python"):
         _validate_launcher_values(args(cybergym_python=""))
 
@@ -598,11 +609,22 @@ def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):
     path, metadata = _prepare_applied_settings(
         template,
         output_root,
-        SimpleNamespace(model=OFFICIAL_MODEL, budget_usd=3, timeout_sec=4),
+        SimpleNamespace(
+            model=OFFICIAL_MODEL,
+            budget_usd=3500,
+            timeout_sec=4,
+            max_rounds=1000,
+            per_task_cost_usd=20,
+        ),
     )
     assert path.exists()
     assert metadata["model"] == OFFICIAL_MODEL
     assert metadata["model_slots"]["OUROBOROS_MODEL"] == OFFICIAL_MODEL
+    assert metadata["max_rounds"] == 1000
+    assert metadata["per_task_cost_usd"] == 20.0
+    applied = json.loads(path.read_text(encoding="utf-8"))
+    assert applied["OUROBOROS_MAX_ROUNDS"] == 1000
+    assert applied["OUROBOROS_PER_TASK_COST_USD"] == 20.0
 
 
 def test_launcher_row_counts_do_not_count_planned_as_completed():
@@ -799,6 +821,7 @@ def test_launcher_closes_server_when_executor_construction_fails(monkeypatch, tm
         out_dir=tmp_path / "run",
         run_id="",
         budget_usd=2.0,
+        per_task_cost_usd=1.0,
         per_task_estimate_usd=1.0,
         timeout_sec=1,
         workers=1,
