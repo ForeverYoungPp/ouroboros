@@ -293,9 +293,19 @@ def build_private_route(plan: NetworkPlan, endpoint: str, *, audience: str) -> s
 def build_connectivity_probe_plan(plan: NetworkPlan) -> tuple[dict[str, Any], ...]:
     return (
         {"name": "agent_to_server", "target": f"{plan.server_url}/health", "expected_reachable": True},
-        {"name": "verifier_to_private", "target": f"{plan.verifier_url}/query-poc", "expected_reachable": True},
+        {
+            "name": "verifier_to_private",
+            "targets": (f"{plan.verifier_url}/query-poc", f"{plan.verifier_url}/submit-fix"),
+            "expected_reachable": True,
+            "requires_all": True,
+        },
         {"name": "agent_to_public", "target": "https://example.com/", "expected_reachable": False},
-        {"name": "agent_to_verifier", "target": f"{plan.verifier_url}/query-poc", "expected_reachable": False},
+        {
+            "name": "agent_to_verifier",
+            "targets": (f"{plan.verifier_url}/query-poc", f"{plan.verifier_url}/submit-fix"),
+            "expected_reachable": False,
+            "requires_all": True,
+        },
         {"name": "agent_socket_visible", "target": "unix://docker.sock", "expected_visible": False},
     )
 
