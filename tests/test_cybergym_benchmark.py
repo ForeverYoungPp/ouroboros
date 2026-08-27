@@ -14,7 +14,6 @@ from devtools.benchmarks.common import launcher_audit
 from ouroboros.configured_subagents import parse_configured_subagents
 from ouroboros.reviewer_slot_config import parse_reviewer_slots
 
-
 REPO = Path(__file__).resolve().parents[1]
 PROFILE = REPO / "devtools" / "benchmarks" / "cybergym" / "settings_base.json"
 MODEL = "deepseek/deepseek-v4-flash-0731"

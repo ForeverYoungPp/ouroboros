@@ -73,6 +73,27 @@ def _connectivity():
     }
 
 
+def _daemon_info(host):
+    return {
+        "ID": "daemon-123",
+        "ServerVersion": "28.3.3",
+        "SecurityOptions": ["name=rootless"],
+        "DockerHost": host.value,
+        "DockerRootDir": "/mnt/data/cybergym-docker",
+    }
+
+
+def _protected_connectivity():
+    return {
+        "agent_to_server_protected": {
+            "targets": [
+                {"reachable": True, "status_code": 401, "mutating": False},
+                {"reachable": True, "status_code": 404, "mutating": False},
+            ]
+        }
+    }
+
+
 def test_rootless_host_is_explicit_and_rootful_or_tcp_is_rejected():
     assert _host().socket_path == "/run/user/1006/docker.sock"
     with pytest.raises(sidecar.SidecarConfigurationError):
@@ -81,6 +102,9 @@ def test_rootless_host_is_explicit_and_rootful_or_tcp_is_rejected():
         with pytest.raises(sidecar.SidecarConfigurationError):
             sidecar.resolve_rootless_docker_host(value)
     assert sidecar.resolve_rootless_docker_host("unix:///tmp/owned.sock", allow_custom=True).socket_path == "/tmp/owned.sock"
+    for value in ("/var/run/docker.sock", "/run/docker.sock", "/docker.sock"):
+        with pytest.raises(sidecar.SidecarConfigurationError):
+            sidecar.DockerHostRef(f"unix://{value}", value, allow_custom=True)
 
 
 def test_network_plan_aliases_and_no_proxy_are_deterministic():
@@ -125,6 +149,18 @@ def test_connectivity_probe_uses_documented_server_route():
     assert "/health" not in server_probe["target"]
 
 
+def test_connectivity_probe_checks_unauthenticated_protected_server_routes():
+    plan = _plan()
+    probe = next(item for item in sidecar.build_connectivity_probe_plan(plan) if item["name"] == "agent_to_server_protected")
+    assert probe["targets"] == (f"{plan.server_url}/query-poc", f"{plan.server_url}/submit-fix")
+    assert probe["method"] == "POST"
+    assert probe["authentication"] == "none"
+    assert probe["expected_reachable"] is True
+    assert probe["expected_authorized"] is False
+    assert probe["expected_mutating"] is False
+    assert probe["requires_all"] is True
+
+
 def test_server_and_workspace_argv_preserve_socket_boundary():
     plan, host = _plan(), _host()
     server = sidecar.SidecarCommandSpec(
@@ -148,6 +184,15 @@ def test_server_and_workspace_argv_preserve_socket_boundary():
     assert "CYBERGYM_TASK_ID" not in " ".join(workspace_argv)
     assert plan.task_id not in " ".join(workspace_argv)
     assert all("real-secret" not in item for item in server_argv + workspace_argv)
+    exec_server = sidecar.SidecarCommandSpec(
+        host,
+        plan,
+        "cyber/server@sha256:" + "a" * 64,
+        "cyber-server-exec",
+        publish_host_port=False,
+    )
+    exec_argv = sidecar.build_sidecar_argv(exec_server)
+    assert "--publish" not in exec_argv
     with pytest.raises(sidecar.SidecarConfigurationError):
         sidecar.WorkspaceCommandSpec(host, plan, "cyber/worker:pin", "cyber-workspace", "/tmp/cyber-task", extra_env={"API_TOKEN": "real-secret"})
     with pytest.raises(sidecar.SidecarConfigurationError):
@@ -242,6 +287,22 @@ def test_connectivity_requires_all_positive_and_negative_facts():
     assert "agent_socket_visible" in sidecar.evaluate_connectivity_checks(wrong)["failed"]
 
 
+def test_protected_route_probe_requires_transport_denial_and_no_mutation():
+    result = sidecar.evaluate_connectivity_checks({**_connectivity(), **_protected_connectivity()})
+    assert result["ok"] is True
+    assert result["checks"]["agent_to_server_protected"]["observed"]["target_count"] == 2
+    mutating = {**_connectivity(), **_protected_connectivity()}
+    mutating["agent_to_server_protected"]["targets"][1]["mutating"] = True
+    failed = sidecar.evaluate_connectivity_checks(mutating)
+    assert failed["ok"] is False
+    assert "agent_to_server_protected" in failed["failed"]
+    incomplete = {**_connectivity(), "agent_to_server_protected": {"reachable": True}}
+    assert sidecar.evaluate_connectivity_checks(incomplete)["ok"] is False
+    assert sidecar.evaluate_connectivity_checks(
+        _connectivity(), require_protected_route_evidence=True
+    )["ok"] is False
+
+
 def test_attestation_rejects_socket_leak_wildcard_and_default_bridge():
     plan, host = _plan(), _host()
     expectation = sidecar.SidecarExpectation(plan, host, "cyber-server", "cyber-workspace", "server-123", "workspace-123", "net-123", host.socket_path, image_digest=IMAGE_DIGEST, server_pid=101, workspace_pid=202)
@@ -265,6 +326,117 @@ def test_attestation_requires_resolved_digest_on_each_container():
     report = sidecar.check_sidecar_attestation(observation, expectation, api_key="valid-key", connectivity=_connectivity())
     assert report["ok"] is False
     assert "workspace.image_digest" in report["failed_checks"]
+
+
+def test_attestation_accepts_distinct_server_and_workspace_digests():
+    plan, host = _plan(), _host()
+    server_digest = "sha256:" + "a" * 64
+    workspace_digest = "sha256:" + "b" * 64
+    expectation = sidecar.SidecarExpectation(
+        plan,
+        host,
+        "cyber-server",
+        "cyber-workspace",
+        "server-123",
+        "workspace-123",
+        "net-123",
+        host.socket_path,
+        server_image_digest=server_digest,
+        workspace_image_digest=workspace_digest,
+        server_pid=101,
+        workspace_pid=202,
+    )
+    observation = _observation(plan, host)
+    observation["server"]["Config"]["RepoDigests"] = [f"cyber/server@{server_digest}"]
+    observation["workspace"]["Config"]["RepoDigests"] = [f"cyber/worker@{workspace_digest}"]
+    report = sidecar.check_sidecar_attestation(
+        observation,
+        expectation,
+        api_key="valid-key",
+        connectivity=_connectivity(),
+    )
+    assert report["ok"] is True
+    assert report["server"]["expected_image_digest"] == server_digest
+    assert report["workspace"]["expected_image_digest"] == workspace_digest
+
+
+def test_attestation_supports_internal_exec_private_route_without_publish():
+    plan, host = _plan(), _host()
+    expectation = sidecar.SidecarExpectation(
+        plan,
+        host,
+        "cyber-server",
+        "cyber-workspace",
+        "server-123",
+        "workspace-123",
+        "net-123",
+        host.socket_path,
+        image_digest=IMAGE_DIGEST,
+        server_pid=101,
+        workspace_pid=202,
+        publish_host_port=False,
+    )
+    observation = _observation(plan, host)
+    observation["server"]["NetworkSettings"]["Ports"] = {"8080/tcp": None}
+    report = sidecar.check_sidecar_attestation(
+        observation,
+        expectation,
+        api_key="valid-key",
+        connectivity=_connectivity(),
+    )
+    assert report["ok"] is True
+    assert report["published_verifier"]["mode"] == "container_exec"
+
+
+def test_daemon_evidence_is_required_only_for_strict_production_entrypoint():
+    plan, host = _plan(), _host()
+    expectation = sidecar.SidecarExpectation(
+        plan,
+        host,
+        "cyber-server",
+        "cyber-workspace",
+        "server-123",
+        "workspace-123",
+        "net-123",
+        host.socket_path,
+        image_digest=IMAGE_DIGEST,
+        server_pid=101,
+        workspace_pid=202,
+    )
+    pure = sidecar.check_sidecar_attestation(
+        _observation(plan, host), expectation, api_key="valid-key", connectivity=_connectivity()
+    )
+    assert pure["ok"] is True
+    strict_missing = sidecar.check_sidecar_attestation(
+        _observation(plan, host),
+        expectation,
+        api_key="valid-key",
+        connectivity=_connectivity(),
+        require_daemon_evidence=True,
+    )
+    assert strict_missing["ok"] is False
+    assert "docker_daemon_evidence" in strict_missing["failed_checks"]
+    observation = _observation(plan, host)
+    observation["docker_info"] = _daemon_info(host)
+    strict = sidecar.check_sidecar_attestation(
+        observation,
+        expectation,
+        api_key="valid-key",
+        connectivity=_connectivity(),
+        require_daemon_evidence=True,
+    )
+    assert strict["ok"] is True
+    assert strict["docker_info"]["status"] == "verified"
+    assert strict["docker_info"]["daemon_id"] == "daemon-123"
+    with pytest.raises(sidecar.SidecarAttestationError) as exc_info:
+        sidecar.attest_sidecar_runtime(
+            _observation(plan, host),
+            expectation,
+            api_key="valid-key",
+            connectivity=_connectivity(),
+            require_daemon_evidence=True,
+        )
+    assert "docker_daemon_evidence" in exc_info.value.report["failed_checks"]
 
 
 def test_cleanup_is_exact_and_never_broad():

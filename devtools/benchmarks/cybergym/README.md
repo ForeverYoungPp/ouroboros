@@ -40,6 +40,11 @@ artifacts, or the API credentials.  The verifier may retain those objects in
 the private server sidecar because the official protocol needs them; they are
 outside the agent view.
 
+The existing Ouroboros external-workspace validator requires a Git worktree
+root.  After generation the adapter adds an empty, local `.git` metadata
+directory to its owned workspace; it has no history and is not part of the
+CyberGym task payload.
+
 The adapter uses the upstream binary-only distribution (`--binary_dir`) for
 the measured run.  The approximately 130 GB binary store is an operational
 input and is not checked into this repository.  A dynamic full image store is
@@ -60,8 +65,14 @@ python devtools/benchmarks/cybergym/run_cybergym.py --dry-run \
   --tasks-file "$CYBERGYM_TASKS" --server "http://cybergym-internal:8666"
 ```
 
+Paid runs must also pass `--cybergym-python` with an absolute Python 3.11+
+or newer interpreter where the pinned CyberGym checkout is installed.  The
+upstream package uses `enum.StrEnum`; the launcher does not silently reuse the
+Ouroboros interpreter or install benchmark dependencies during a paid run.
+
 The real invocation must provide the pinned source/data/image roots required
-by `--help`, an explicit rootless `DOCKER_HOST`, and a host-side
+by `--help`, `--cybergym-python /absolute/path/bin/python`, an explicit
+rootless `DOCKER_HOST`, and a host-side
 `CYBERGYM_API_KEY`.  The key is injected only into the verifier path; it is
 never placed in a settings template, task workspace, command line, manifest,
 or log.  Every invocation creates a new append-only run directory.  Do not
@@ -115,6 +126,13 @@ The structured reviewer panel has three triad rows and one scope row, all on
 that exact model, with advisory disabled.  `required` task review and
 `blocking` enforcement are intentional.  No local model, Claude session,
 legacy heavy slot, or hidden fallback family is inherited.
+
+This in-server panel is separate from the owner-authorized review of this
+adapter before any paid run.  That external review uses Codex
+`gpt-5.6-sol`, Cursor Grok `cursor-grok-4.6-high`, and Cursor GLM
+`glm-5.2-high` (profile-pinned); scope review uses Codex `gpt-5.6-sol`
+`xhigh`.  Those review lanes validate the adapter and do not change the
+measured CyberGym model or become benchmark score evidence.
 
 The template also records these run-shaping defaults:
 
@@ -170,10 +188,13 @@ agent workspace --(submit.sh, private DNS only)--> cybergym-server sidecar
        |                                             |
        +-- no Docker socket, DB, mask map, keys    +-- verifier socket only
                                                      (rootless daemon)
-host verifier --(loopback published port or controlled exec)--> sidecar
+host verifier --(controlled docker exec on the internal network)--> sidecar
 ```
 
-The server sidecar owns hidden binaries, fixed artifacts, the database, and
+On the selected rootless daemon an `--internal` bridge has no usable host port
+mapping.  The concrete verifier therefore uses the immutable server container
+ID and a fixed in-container HTTP helper; that transport is recorded in the
+attestation.  The server sidecar owns hidden binaries, fixed artifacts, the database, and
 the API key.  The socket mounted for its official verifier is never mounted in
 the agent workspace.  The generated URL uses the sidecar DNS name and
 `NO_PROXY` contains that name and port.  Positive tests prove that the agent's
@@ -266,9 +287,10 @@ The common manifest seams are mandatory: admission goes through
 identity, applied settings, provider probe, source/data/image hashes, task
 order, sidecar/container identities, network and `NO_PROXY` attestations,
 budget reservations, raw exits, final/any-of hashes, and the typed reason for
-every refusal.  It also records exact process/container PID custody, cwd,
-ports, and selected Docker socket so late results cannot be mistaken for a
-second attempt.
+every refusal.  Docker/container IDs, available PIDs, labels, ports, and the
+selected socket are recorded; optional PGID/cwd/start-identity fields are
+copied only when the common server seam supplies them and otherwise remain
+`NOT_RUN`.
 
 Run output belongs under an external append-only root, normally
 `bench_runs/cybergym/<tag>_<timestamp>/` (large binary/image caches belong on
@@ -278,7 +300,10 @@ the adapter reaps only containers/processes bearing its run label and verifies
 that no task workspace, API key, socket mount, or temporary file escaped the
 run root.  Cleanup is performed after terminal custody is settled; an
 in-flight late result is retained under its original attempt instead of being
-deleted or retried as a duplicate.
+deleted or retried as a duplicate.  When custody is unknown, the adapter
+writes `custody_pending.json` and intentionally leaves owned resources alive;
+the shipped launcher has no automatic cross-process reattach, so an operator
+must use that checkpoint and the gateway custody API before cleanup.
 
 ## Official-submission boundary
 

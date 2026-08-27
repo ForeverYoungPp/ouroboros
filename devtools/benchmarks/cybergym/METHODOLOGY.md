@@ -59,6 +59,11 @@ private verifier may use hidden vulnerable/fixed binaries as required by the
 official protocol; those objects remain outside the agent container and its
 filesystem mounts.
 
+Because the existing external-workspace admission requires a Git worktree
+root, the adapter adds an empty local `.git` metadata directory after
+generation.  It has no history and carries no hidden benchmark artifact; the
+upstream task files and the agent's edits remain the measured payload.
+
 The run uses the upstream binary-only server distribution (`--binary_dir`).
 The approximately 130 GB binary store is an external operational input.  It
 must be downloaded once into a durable approved cache, verified by digest, and
@@ -123,6 +128,13 @@ not evidence of model diversity.  Task review is `required`, enforcement is
 `blocking`, and the review cycle value is `unlimited` as represented by the
 current settings schema.
 
+The panel above belongs to the isolated measured server.  It must not be
+confused with the owner-selected external review of this adapter: Codex
+`gpt-5.6-sol` high, Cursor Grok `cursor-grok-4.6-high` high, and Cursor GLM
+`glm-5.2-high` high, with Codex `gpt-5.6-sol` xhigh for scope review.  Those
+profile-pinned review runs are pre-spend validation evidence only; they are not
+additional CyberGym agents and do not alter the measured model contract.
+
 The template also pins `OUROBOROS_RUNTIME_MODE=pro`,
 `OUROBOROS_SAFETY_MODE=light`, `OUROBOROS_CONTEXT_MODE=max`, disables local
 routes, turns post-task evolution off, and disables MCP.  These values are
@@ -157,6 +169,11 @@ changes.  Before paid work, the launcher must:
 6. persist the applied JSON, probe timestamp, requested/observed model and
    provider, response id, effort, supported parameters, and available usage
    and cost metadata in `run_manifest.json` before the first paid task.
+
+For the concrete gateway, the applied effort is read from the exact response
+call's run-local request-wire disclosure (the signed observability reference),
+not inferred from a requested task field.  A missing or unverifiable
+disclosure blocks the paid row.
 
 The launcher must also persist the full applied settings projection, not just
 the CLI model.  A claim based on the static template or pre-override argv is
@@ -230,7 +247,7 @@ host-local.  Therefore the adapter owns this topology:
              \______________________________________________/
                     adapter-owned cybergym-internal network
 
-  host verifier ---- loopback published port or controlled docker exec ---->
+  host verifier ---- controlled docker exec on the internal network ---->
                     server sidecar private routes
 ```
 
@@ -243,9 +260,14 @@ the official verifier, is never mounted in the agent workspace and is never
 the shared system daemon.
 
 The generated task URL uses sidecar DNS/name, not a host gateway.  `NO_PROXY`
-contains that name and port, and the manifest records the injected value.  The
-host verifier uses a loopback-only published port or a controlled
-`docker exec` path; the chosen path is tested and recorded.  Positive checks
+contains that name and port, and the manifest records the applied value.  The
+launcher keeps the CLI's admission-time URL as `requested_server` and replaces
+the manifest's `server`/official command with the campaign alias actually
+embedded in `submit.sh`.  The
+On the selected rootless daemon an `--internal` bridge intentionally has no
+usable host port mapping.  The concrete host verifier therefore uses a
+controlled `docker exec` path against the immutable server container ID; that
+transport is tested and recorded as `container_exec`.  Positive checks
 must show `submit.sh` feedback and protected query/fix success.  Negative
 checks must show that the agent cannot read the socket, database, mask map,
 fixed artifacts, API key, or unauthenticated query/fix endpoint and cannot
@@ -349,9 +371,16 @@ The manifest records the exact candidate commit, clean-seed status, command
 argv, isolated four-root environment, source/data/image digests, task order,
 applied settings, provider probe, task contract, sidecar/container IDs,
 network and `NO_PROXY` attestations, budget reservations, and final/any-of
-hashes.  Process custody records PID/PGID/start identity, cwd, socket, port,
-and run label.  A late result is attached to its original attempt; the
+hashes.  The sidecar executor records the custody fields that Docker and the
+common isolated-server seam actually expose (immutable container IDs, host
+PIDs, labels, socket, port, and run identity); optional PGID/start-identity
+fields are retained when that seam emits them and otherwise remain explicitly
+`NOT_RUN`.  A late result is kept under its original attempt and the
 launcher never starts a duplicate merely because the caller's wait expired.
+The shipped adapter writes a durable checkpoint and `custody_pending.json`,
+but it does not automatically reattach after an operator-process crash; an
+operator must use the recorded gateway id/checkpoint and the gateway's own
+custody API before resuming or cleaning that attempt.
 
 Every run is append-only under an external output root such as
 `bench_runs/cybergym/<tag>_<timestamp>/`.  Large image/binary caches use the
@@ -363,8 +392,11 @@ Ouroboros `data/`.
 
 Cleanup occurs only after terminal custody is settled.  It removes or reaps
 containers, sockets, and temporary files bearing this run's exact label, then
-checks for escaped task files or credentials.  It never removes another
-operator's container, old append-only run, or shared Docker image.  Secret
+checks for escaped task files or credentials.  If custody is unknown, cleanup
+is deliberately deferred and the owned server/workspace remain available for
+manual rescue; `custody_pending.json` is the truthful terminal artifact for
+that state.  It never removes another operator's container, old append-only
+run, or shared Docker image.  Secret
 fields in rendered settings are blank, and provider/API keys are passed only
 through a protected host-side environment or 0600 file.  No generated result,
 database, binary archive, key, or trajectory is staged for this PR.
@@ -470,7 +502,9 @@ verifier that returns a valid zero is capability evidence, not infrastructure.
 A retry is allowed only for a typed infrastructure failure and receives a new
 attempt id.  The original row and evidence remain.  A resumed run is a new
 append-only directory with explicit remaining IDs and the same pinned source
-and settings contract.  A failed provider request is retried on the same exact
+and settings contract.  Reattachment of an unresolved in-flight attempt is a
+manual operator action from its checkpoint; this adapter does not claim
+automatic cross-process resume.  A failed provider request is retried on the same exact
 model and then the next suitable key in the operator-authorized pool; no
 unapproved model substitution is made.  Provider identity and raw transport
 errors are retained for audit.

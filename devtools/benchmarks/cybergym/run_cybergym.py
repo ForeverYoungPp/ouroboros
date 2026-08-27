@@ -14,7 +14,11 @@ import argparse
 import hashlib
 import importlib
 import json
+import math
+import os
 import pathlib
+import re
+import shutil
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -37,6 +41,8 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     DEFAULT_BUDGET_CAP_USD,
     DEFAULT_FINAL_POC_PATH,
     DEFAULT_LEVEL,
+    MAX_CROSS_TASK_WORKERS,
+    MAX_TASK_TIMEOUT_SEC,
     OFFICIAL_DATA_REVISION,
     OFFICIAL_MODEL,
     OFFICIAL_SOURCE_PIN,
@@ -89,7 +95,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tasks-file", default="", help="pinned tasks.json catalog")
     parser.add_argument("--task-id", action="append", default=[], help="task id (repeatable, e.g. arvo:47101)")
     parser.add_argument("--server", default="http://cybergym-internal:8666", help="private CyberGym submit server URL")
-    parser.add_argument("--ouroboros-url", default="", help="Ouroboros gateway URL for the measured task")
+    parser.add_argument(
+        "--ouroboros-url",
+        default="",
+        help="external gateway URL for an explicitly injected --executor (concrete path owns one)",
+    )
     parser.add_argument("--docker-host", default="", help="explicit rootless Docker unix socket")
     parser.add_argument("--server-image", default="", help="pinned CyberGym server image")
     parser.add_argument("--server-image-digest", default="", help="resolved sha256 digest for server image")
@@ -97,6 +107,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workspace-image-digest", default="", help="resolved sha256 digest for workspace image")
     parser.add_argument("--server-root", default="", help="host root mounted at the same absolute path in the server sidecar")
     parser.add_argument("--binary-dir", default="", help="pinned CyberGym binary directory inside server-root")
+    parser.add_argument(
+        "--cybergym-python",
+        default="",
+        help="Python executable for the pinned CyberGym package (required for paid runs)",
+    )
     parser.add_argument("--cybergym-api-key-env", default="CYBERGYM_API_KEY", help="host env name for the private verifier key")
     parser.add_argument("--mask-map", default="", help="task mask-map JSON")
     parser.add_argument("--difficulty", default=DEFAULT_LEVEL)
@@ -119,6 +134,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--allow-dirty-seed", action="store_true",
                         help="record and proceed with a dirty seed (not submittable)")
     parser.add_argument("--expected-source-sha256", default="")
+    parser.add_argument(
+        "--expected-data-sha256", default="",
+        help="exact SHA-256 of the immutable CyberGym data tree",
+    )
+    parser.add_argument(
+        "--expected-binary-sha256", default="",
+        help="exact SHA-256 of the immutable CyberGym binary tree",
+    )
     parser.add_argument("--expected-tasks-sha256", default=OFFICIAL_TASKS_SHA256)
     parser.add_argument("--expected-mask-sha256", default="")
     parser.add_argument("--provider-only", action="append", default=[], help="OpenRouter provider id to allow (repeatable/comma-separated)")
@@ -139,6 +162,65 @@ def _sha256_file(path: pathlib.Path | str) -> str:
     return hashlib.sha256(pathlib.Path(path).expanduser().resolve(strict=False).read_bytes()).hexdigest()
 
 
+def _validate_launcher_values(args: argparse.Namespace) -> None:
+    """Normalize scalar launch values and enforce the campaign safety rails.
+
+    This function is deliberately filesystem-free.  Paid input hashes are
+    required here so an invalid or incomplete declaration cannot reach server
+    startup; the bytes themselves are attested by the concrete executor after
+    admission.
+    """
+    args.model = validate_model_pin(args.model, expected=OFFICIAL_MODEL)
+    args.budget_usd = validate_positive_finite(args.budget_usd, field="budget_usd")
+    if args.budget_usd > DEFAULT_BUDGET_CAP_USD:
+        raise ValueError(
+            f"budget_usd may not exceed the CyberGym hard cap of {DEFAULT_BUDGET_CAP_USD:.2f}"
+        )
+    args.timeout_sec = validate_positive_integral(args.timeout_sec, field="timeout_sec")
+    if args.timeout_sec > MAX_TASK_TIMEOUT_SEC:
+        raise ValueError(
+            f"timeout_sec may not exceed the CyberGym task cap of {MAX_TASK_TIMEOUT_SEC}"
+        )
+    args.workers = validate_positive_integral(args.workers, field="workers")
+    if args.workers > MAX_CROSS_TASK_WORKERS:
+        raise ValueError(
+            f"workers may not exceed the CyberGym cross-task cap of {MAX_CROSS_TASK_WORKERS}"
+        )
+    if args.per_task_estimate_usd is not None:
+        args.per_task_estimate_usd = validate_positive_finite(
+            args.per_task_estimate_usd, field="per_task_estimate_usd"
+        )
+        if args.per_task_estimate_usd > args.budget_usd:
+            raise ValueError("per_task_estimate_usd may not exceed budget_usd")
+
+    dry_run = getattr(args, "dry_run", False)
+    allow_dirty = getattr(args, "allow_dirty_seed", False)
+    if not isinstance(dry_run, bool) or not isinstance(allow_dirty, bool):
+        raise ValueError("dry_run and allow_dirty_seed must be booleans")
+    if allow_dirty and not dry_run:
+        raise ValueError("--allow-dirty-seed is not permitted for paid CyberGym execution")
+
+    if not dry_run:
+        python_executable = str(getattr(args, "cybergym_python", "") or "").strip()
+        if not python_executable:
+            raise ValueError(
+                "--cybergym-python is required for paid CyberGym execution"
+            )
+        for field, label in (
+            ("expected_data_sha256", "expected-data-sha256"),
+            ("expected_binary_sha256", "expected-binary-sha256"),
+        ):
+            value = str(getattr(args, field, "") or "").strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+                raise ValueError(
+                    f"--{label} is required for paid CyberGym execution and must be a SHA-256"
+                )
+        if str(getattr(args, "executor", "") or "").strip() and not str(
+            getattr(args, "ouroboros_url", "") or ""
+        ).strip():
+            raise ValueError("paid --executor requires an explicit --ouroboros-url")
+
+
 def _declared_task_ids(args: argparse.Namespace) -> list[str]:
     """Normalize explicit ids without touching the task catalog."""
     result: list[str] = []
@@ -152,17 +234,34 @@ def _declared_task_ids(args: argparse.Namespace) -> list[str]:
     return result
 
 
-def _generator_template(args: argparse.Namespace) -> list[str]:
+def _generator_template(
+    args: argparse.Namespace, *, server: str | None = None
+) -> list[str]:
     """A manifest-safe command shape, using a placeholder task until catalog load."""
     task = "arvo:0"
     return build_generate_task_argv(
         task,
         out_dir="<task-output>",
         data_dir=str(args.data_root or "<cybergym-data>"),
-        server=str(args.server or "<private-server>"),
+        server=str(server or args.server or "<private-server>"),
         mask_map=str(args.mask_map or "") or None,
         difficulty=str(args.difficulty or DEFAULT_LEVEL),
+        python=str(getattr(args, "cybergym_python", "") or "") or None,
     )
+
+
+def _apply_server_provenance(
+    manifest: dict[str, Any], args: argparse.Namespace, applied_url: str
+) -> None:
+    """Replace a requested server placeholder with the URL actually applied."""
+    applied = str(applied_url or "").strip()
+    if not applied:
+        return
+    harness = manifest.setdefault("harness", {})
+    harness.setdefault("requested_server", str(args.server))
+    harness["server"] = applied
+    harness["applied_server"] = applied
+    manifest["official_command"] = _generator_template(args, server=applied)
 
 
 def _load_executor(spec: str) -> Callable[[TaskSpec, pathlib.Path], Mapping[str, Any]]:
@@ -185,7 +284,12 @@ def _load_executor(spec: str) -> Callable[[TaskSpec, pathlib.Path], Mapping[str,
     return callback
 
 
-def _build_default_executor(args: argparse.Namespace, out_root: pathlib.Path) -> Callable[[TaskSpec, pathlib.Path], Mapping[str, Any]]:
+def _build_default_executor(
+    args: argparse.Namespace,
+    out_root: pathlib.Path,
+    *,
+    ouroboros_url: str | None = None,
+) -> Callable[[TaskSpec, pathlib.Path], Mapping[str, Any]]:
     """Construct the concrete sidecar executor after admission.
 
     An explicit ``--executor`` remains useful for a pre-started server or a
@@ -193,8 +297,8 @@ def _build_default_executor(args: argparse.Namespace, out_root: pathlib.Path) ->
     pins, so a missing value is a typed refusal rather than a host-shell
     fallback.
     """
+    effective_ouroboros_url = str(ouroboros_url or getattr(args, "ouroboros_url", "") or "").strip()
     required = {
-        "--ouroboros-url": args.ouroboros_url,
         "--docker-host": args.docker_host,
         "--server-image": args.server_image,
         "--server-image-digest": args.server_image_digest,
@@ -202,11 +306,21 @@ def _build_default_executor(args: argparse.Namespace, out_root: pathlib.Path) ->
         "--workspace-image-digest": args.workspace_image_digest,
         "--server-root": args.server_root,
         "--binary-dir": args.binary_dir,
+        "--cybergym-python": getattr(args, "cybergym_python", ""),
+        "--expected-data-sha256": getattr(args, "expected_data_sha256", ""),
+        "--expected-binary-sha256": getattr(args, "expected_binary_sha256", ""),
+        "managed Ouroboros URL": effective_ouroboros_url,
     }
     missing = [name for name, value in required.items() if not str(value or "").strip()]
     if missing:
         raise CyberGymIntegrationUnavailable(
             "concrete CyberGym executor requires " + ", ".join(missing)
+        )
+    python_executable = str(getattr(args, "cybergym_python", "") or "").strip()
+    resolved_python = shutil.which(python_executable)
+    if not resolved_python:
+        raise CyberGymIntegrationUnavailable(
+            "the --cybergym-python executable is not available on PATH"
         )
     if not _csv_values(getattr(args, "provider_only", ())) or not _csv_values(getattr(args, "provider_order", ())):
         raise CyberGymIntegrationUnavailable(
@@ -223,11 +337,13 @@ def _build_default_executor(args: argparse.Namespace, out_root: pathlib.Path) ->
         run_root=out_root,
         server_root=pathlib.Path(args.server_root),
         binary_dir=pathlib.Path(args.binary_dir),
+        expected_data_sha256=str(getattr(args, "expected_data_sha256", "") or ""),
+        expected_binary_sha256=str(getattr(args, "expected_binary_sha256", "") or ""),
         server_image=str(args.server_image),
         server_image_digest=str(args.server_image_digest),
         workspace_image=str(args.workspace_image),
         workspace_image_digest=str(args.workspace_image_digest),
-        ouroboros_url=str(args.ouroboros_url),
+        ouroboros_url=effective_ouroboros_url,
         docker_host=str(args.docker_host),
         model=str(args.model),
         settings_path=out_root / "settings_applied.json",
@@ -237,6 +353,7 @@ def _build_default_executor(args: argparse.Namespace, out_root: pathlib.Path) ->
         provider_only=_csv_values(getattr(args, "provider_only", ())),
         provider_order=_csv_values(getattr(args, "provider_order", ())),
         disabled_tools=disabled_tools,
+        python_executable=resolved_python,
     )
     executor = build_executor(config)
 
@@ -250,6 +367,251 @@ def _build_default_executor(args: argparse.Namespace, out_root: pathlib.Path) ->
     setattr(callback, "prepare", executor.start)
     setattr(callback, "executor", executor)
     return callback
+
+
+def _prepared_observation(
+    executor: Any,
+    prepared: Any,
+    name: str,
+) -> dict[str, Any]:
+    """Read one structured readiness observation from a paid executor.
+
+    The concrete executor stores observations on its object; an injected
+    callback may return them from ``prepare`` or expose the same attributes.
+    No fallback hash or synthetic provider charge is accepted.
+    """
+    candidates: list[Any] = []
+    if isinstance(prepared, Mapping):
+        nested = prepared.get(name)
+        if isinstance(nested, Mapping):
+            candidates.append(nested)
+        if name == "provider_observation" and "cost_usd" in prepared:
+            candidates.append(prepared)
+    elif prepared is not None:
+        value = getattr(prepared, name, None)
+        if isinstance(value, Mapping):
+            candidates.append(value)
+    nested_executor = getattr(executor, "executor", None)
+    for owner in (nested_executor, executor):
+        value = getattr(owner, name, None)
+        if isinstance(value, Mapping):
+            candidates.append(value)
+    if not candidates:
+        raise CyberGymIntegrationUnavailable(
+            f"paid executor did not expose an exact {name} observation"
+        )
+    return dict(candidates[0])
+
+
+def _validate_paid_observations(
+    executor: Any,
+    prepared: Any,
+    *,
+    model: str,
+    expected_data_sha256: str,
+    expected_binary_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], float]:
+    """Validate provider and immutable-input evidence returned by ``prepare``."""
+    provider = _prepared_observation(executor, prepared, "provider_observation")
+    if str(provider.get("status") or "").strip().lower() != "passed":
+        raise CyberGymIntegrationUnavailable("provider probe did not pass")
+    if provider.get("cost_estimated") is not False:
+        raise CyberGymIntegrationUnavailable(
+            "provider probe cost is unknown or estimated"
+        )
+    observed_model = str(
+        provider.get("observed_model") or provider.get("model") or ""
+    ).strip()
+    if observed_model != model:
+        raise CyberGymIntegrationUnavailable(
+            "provider probe served a model different from the pinned request"
+        )
+    if not str(provider.get("provider") or "").strip() or not str(
+        provider.get("response_id") or ""
+    ).strip():
+        raise CyberGymIntegrationUnavailable(
+            "provider probe omitted authoritative provider or response id"
+        )
+    raw_cost = provider.get("cost_usd")
+    if isinstance(raw_cost, bool):
+        raise CyberGymIntegrationUnavailable("provider probe cost is not numeric")
+    try:
+        cost = float(raw_cost)
+    except (TypeError, ValueError) as exc:
+        raise CyberGymIntegrationUnavailable("provider probe cost is unknown") from exc
+    if not math.isfinite(cost) or cost < 0:
+        raise CyberGymIntegrationUnavailable("provider probe cost is not finite")
+
+    data = _prepared_observation(executor, prepared, "data_observation")
+    binary = _prepared_observation(executor, prepared, "binary_observation")
+    expected_data = str(expected_data_sha256 or "").strip().lower()
+    expected_binary = str(expected_binary_sha256 or "").strip().lower()
+    if str(data.get("sha256") or "").strip().lower() != expected_data:
+        raise CyberGymIntegrationUnavailable("CyberGym data observation does not match its pin")
+    if str(binary.get("sha256") or "").strip().lower() != expected_binary:
+        raise CyberGymIntegrationUnavailable("CyberGym binary observation does not match its pin")
+    return provider, data, binary, cost
+
+
+def _redacted_observation(observation: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep only non-secret provider/input attestation fields in the manifest."""
+    allowed = {
+        "status",
+        "ts_unix",
+        "requested_model",
+        "observed_model",
+        "model",
+        "provider",
+        "provider_pool_membership",
+        "provider_policy",
+        "inventory",
+        "response_id",
+        "prompt_tokens",
+        "completion_tokens",
+        "cached_tokens",
+        "cost_usd",
+        "cost_estimated",
+        "label",
+        "path",
+        "sha256",
+        "expected_sha256",
+        "files",
+        "bytes",
+    }
+    return {str(key): value for key, value in observation.items() if str(key) in allowed}
+
+
+def _record_provider_probe_cost(
+    out_root: pathlib.Path,
+    budget_usd: float,
+    cost_usd: float,
+) -> dict[str, Any]:
+    """Charge the exact provider readiness request before task claims."""
+    ledger = BudgetLedger(out_root / "claims.jsonl", cap_usd=float(budget_usd))
+    return ledger.record_campaign_cost(cost_usd, label="provider_probe")
+
+
+def _start_isolated_ouroboros_server(
+    args: argparse.Namespace,
+    out_root: pathlib.Path,
+    applied_settings: pathlib.Path,
+    expected_commit: str,
+) -> Any:
+    """Start the campaign-owned Ouroboros gateway on the selected Docker daemon.
+
+    The wrapper is deliberately imported and started only after admission and
+    applied-settings rendering.  Its isolated clone receives the exact
+    committed seed and a copy of the settings file; the live operator server
+    and settings are never reused.
+    """
+    from devtools.benchmarks.cybergym.cybergym_server import CyberGymIsolatedServer
+    provider_key = str(os.environ.get("OPENROUTER_API_KEY", "") or "").strip()
+    if not provider_key:
+        raise CyberGymIntegrationUnavailable(
+            "OPENROUTER_API_KEY must be injected in the host environment for the isolated server"
+        )
+
+    server: Any | None = None
+    try:
+        server = CyberGymIsolatedServer(
+            pathlib.Path(args.repo_dir),
+            out_root,
+            applied_settings,
+            str(args.docker_host),
+            expected_commit=str(expected_commit or ""),
+            provider_key=provider_key,
+        )
+        return server.start(ready_timeout=180)
+    except Exception as exc:
+        # ``CyberGymIsolatedServer.start`` already cleans up its own partial
+        # state, but keep this boundary safe for injected/fake implementations
+        # and for failures in construction before the wrapper can do so.
+        if server is not None:
+            try:
+                server.close()
+            except Exception:
+                pass
+        raise CyberGymIntegrationUnavailable(
+            "isolated Ouroboros server preparation failed: "
+            + type(exc).__name__
+        ) from exc
+
+
+def _cleanup_execution_resources(
+    executor: Any | None,
+    isolated_server: Any | None,
+    manifest: dict[str, Any],
+) -> None:
+    """Close owned resources while retaining a typed custody report.
+
+    A callback may return ``{"ok": False}`` when a late gateway result still
+    owns live workers.  In that case the server is deliberately left running
+    for reattachment, and both decisions are persisted through the enclosing
+    manifest finalizer.  Cleanup errors are recorded without copying an
+    exception message that could contain endpoint or credential data.
+    """
+    extra = manifest.setdefault("extra", {})
+    executor_cleanup: dict[str, Any] = {
+        "attempted": False,
+        "status": "not_available",
+        "ok": None,
+    }
+    server_close_allowed = True
+    try:
+        if executor is not None:
+            close = getattr(executor, "close", None)
+            if callable(close):
+                executor_cleanup["attempted"] = True
+                close_report = close()
+                if isinstance(close_report, Mapping):
+                    # Keep the executor's structured fields at the top level
+                    # so the manifest remains compatible with existing cleanup
+                    # attestations while adding only launcher-owned metadata.
+                    executor_cleanup = dict(close_report)
+                    executor_cleanup["attempted"] = True
+                    executor_cleanup.setdefault("status", "reported")
+                    executor_cleanup.setdefault("ok", None)
+                    if executor_cleanup.get("ok") is False:
+                        # An unresolved gateway attempt owns live worker/server
+                        # custody.  Keep the isolated server alive for reattach.
+                        server_close_allowed = False
+                else:
+                    executor_cleanup.update({"status": "not_reported", "ok": None})
+    except BaseException as exc:
+        executor_cleanup.update(
+            {"status": "error", "ok": False, "error_type": type(exc).__name__}
+        )
+        extra["executor_cleanup"] = executor_cleanup
+        server_close_allowed = False
+        raise
+    else:
+        extra["executor_cleanup"] = executor_cleanup
+    finally:
+        server_cleanup: dict[str, Any] = {
+            "attempted": isolated_server is not None,
+            "close_skipped": isolated_server is not None and not server_close_allowed,
+            "status": (
+                "not_available"
+                if isolated_server is None
+                else "skipped_custody"
+                if not server_close_allowed
+                else "pending"
+            ),
+        }
+        if isolated_server is not None and server_close_allowed:
+            try:
+                isolated_server.close()
+            except BaseException as exc:
+                server_cleanup.update(
+                    {"status": "error", "error_type": type(exc).__name__}
+                )
+                extra["server_cleanup"] = server_cleanup
+                extra["close_skipped"] = False
+                raise
+            else:
+                server_cleanup["status"] = "closed"
+        extra["server_cleanup"] = server_cleanup
+        extra["close_skipped"] = bool(server_cleanup["close_skipped"])
 
 
 def _task_specs(
@@ -450,15 +812,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # do not read tasks.json, inspect Docker, import the optional upstream package,
     # or create a directory before the shared admission manifest exists.
     try:
-        args.model = validate_model_pin(args.model, expected=OFFICIAL_MODEL)
-        args.budget_usd = validate_positive_finite(args.budget_usd, field="budget_usd")
-        args.timeout_sec = validate_positive_integral(args.timeout_sec, field="timeout_sec")
-        if isinstance(args.workers, bool) or int(args.workers) < 1:
-            raise ValueError("workers must be a positive integer")
-        if args.per_task_estimate_usd is not None:
-            args.per_task_estimate_usd = validate_positive_finite(
-                args.per_task_estimate_usd, field="per_task_estimate_usd"
-            )
+        _validate_launcher_values(args)
     except ValueError as exc:
         print(f"[cybergym] pre-admission refusal: {exc}", file=sys.stderr)
         return 2
@@ -540,18 +894,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_root=out_root,
             repo_dir=repo_dir,
             requested_task_ids=declared_ids,
-            require_clean=not bool(args.allow_dirty_seed),
+            # Paid runs have already rejected ``--allow-dirty-seed`` above;
+            # keep the explicit dry-run escape only for diagnostic planning.
+            require_clean=(
+                True
+                if not bool(getattr(args, "dry_run", False))
+                else not bool(getattr(args, "allow_dirty_seed", False))
+            ),
             argv=list(sys.argv if argv is None else [sys.argv[0], *argv]),
             dataset="sunblaze-ucb/cybergym",
             harness={
                 "model": str(args.model),
                 "difficulty": str(args.difficulty),
                 "server": str(args.server),
+                "requested_server": str(args.server),
                 "timeout_sec": int(args.timeout_sec),
                 "executor": str(args.executor or "concrete_sidecar"),
                 "workers": int(args.workers),
                 "provider_only": list(_csv_values(getattr(args, "provider_only", ()))),
                 "provider_order": list(_csv_values(getattr(args, "provider_order", ()))),
+                "executor_mode": "injected" if args.executor else "concrete_sidecar",
+                "expected_data_sha256": str(
+                    getattr(args, "expected_data_sha256", "") or ""
+                ),
+                "expected_binary_sha256": str(
+                    getattr(args, "expected_binary_sha256", "") or ""
+                ),
             },
             official_command=_generator_template(args),
             isolated_data_root=str(args.data_root or ""),
@@ -565,6 +933,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "source_pin": OFFICIAL_SOURCE_PIN,
                 "data_revision": OFFICIAL_DATA_REVISION,
                 "tasks_sha256_expected": str(args.expected_tasks_sha256 or ""),
+                "data_sha256_expected": str(
+                    getattr(args, "expected_data_sha256", "") or ""
+                ),
+                "binary_sha256_expected": str(
+                    getattr(args, "expected_binary_sha256", "") or ""
+                ),
                 "metric_name": "final_submission",
                 "any_of_projection": "diagnostic_only",
                 "network_contract": "cybergym-internal",
@@ -647,6 +1021,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 final_poc_path=DEFAULT_FINAL_POC_PATH,
                 disabled_tools=derive_disabled_tools(),
             )
+            if not args.dry_run:
+                contract["data_sha256"] = str(
+                    getattr(args, "expected_data_sha256", "") or ""
+                ).lower()
+                contract["binary_sha256"] = str(
+                    getattr(args, "expected_binary_sha256", "") or ""
+                ).lower()
             if isinstance(manifest.get("extra", {}).get("mask_map"), Mapping):
                 contract["mask_map_sha256"] = str(
                     manifest["extra"]["mask_map"].get("sha256") or ""
@@ -671,22 +1052,103 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise CyberGymIntegrationUnavailable(
                         "paid CyberGym execution requires --per-task-estimate-usd; no price is invented"
                     )
-                executor = (
-                    _load_executor(args.executor)
-                    if args.executor
-                    else _build_default_executor(args, out_root)
-                )
+                executor: Callable[[TaskSpec, pathlib.Path], Mapping[str, Any]] | None = None
+                isolated_server: Any | None = None
+                # Keep server startup, executor construction, and execution in
+                # one ownership scope.  If construction or provider
+                # preparation fails after the server starts, the server still
+                # receives the same close path as a normally completed run.
                 try:
+                    if args.executor:
+                        # An injected callback owns its own gateway contract.
+                        # It is intentionally an explicit lab seam, never a
+                        # silent replacement for the campaign-owned server.
+                        executor = _load_executor(args.executor)
+                        manifest.setdefault("harness", {})["ouroboros_url"] = str(
+                            args.ouroboros_url
+                        )
+                    else:
+                        if str(args.ouroboros_url or "").strip():
+                            raise CyberGymIntegrationUnavailable(
+                                "--ouroboros-url is only allowed with an injected --executor; "
+                                "the concrete path starts its campaign-owned server"
+                            )
+                        seed_source = manifest.get("source")
+                        expected_seed_commit = (
+                            str(seed_source.get("head") or "").strip()
+                            if isinstance(seed_source, Mapping)
+                            else ""
+                        )
+                        if not expected_seed_commit:
+                            raise CyberGymIntegrationUnavailable(
+                                "admission did not provide a committed Ouroboros seed identity"
+                            )
+                        isolated_server = _start_isolated_ouroboros_server(
+                            args, out_root, applied_path, expected_seed_commit
+                        )
+                        manifest.setdefault("extra", {})["ouroboros_server"] = dict(
+                            getattr(isolated_server, "attestation", {}) or {}
+                        )
+                        manifest.setdefault("harness", {})["ouroboros_url"] = str(
+                            isolated_server.base_url
+                        )
+                        executor = _build_default_executor(
+                            args, out_root, ouroboros_url=isolated_server.base_url
+                        )
                     prepare = getattr(executor, "prepare", None)
-                    if callable(prepare):
-                        # Provider/network readiness is established before the
-                        # first budget claim, so a failed probe cannot consume
-                        # a task reservation or masquerade as a model result.
-                        prepare()
-                        executor_obj = getattr(executor, "executor", None)
-                        if executor_obj is not None:
-                            manifest["extra"]["provider_probe"] = dict(
-                                getattr(executor_obj, "provider_observation", {})
+                    if not callable(prepare):
+                        raise CyberGymIntegrationUnavailable(
+                            "paid executor must expose a prepare() provider probe"
+                        )
+                    # Provider/network readiness is established before the first
+                    # budget claim, so a failed probe cannot consume a task
+                    # reservation or masquerade as a model result.
+                    try:
+                        prepared = prepare()
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception as exc:
+                        raise CyberGymIntegrationUnavailable(
+                            "paid executor preparation failed: " + type(exc).__name__
+                        ) from exc
+                    provider_observation, data_observation, binary_observation, probe_cost = (
+                        _validate_paid_observations(
+                            executor,
+                            prepared,
+                            model=str(args.model),
+                            expected_data_sha256=str(
+                                getattr(args, "expected_data_sha256", "") or ""
+                            ),
+                            expected_binary_sha256=str(
+                                getattr(args, "expected_binary_sha256", "") or ""
+                            ),
+                        )
+                    )
+                    manifest["extra"]["provider_probe"] = _redacted_observation(
+                        provider_observation
+                    )
+                    manifest["extra"]["cybergym_data"] = _redacted_observation(
+                        data_observation
+                    )
+                    manifest["extra"]["cybergym_binary"] = _redacted_observation(
+                        binary_observation
+                    )
+                    overhead_event = _record_provider_probe_cost(
+                        out_root,
+                        float(args.budget_usd),
+                        probe_cost,
+                    )
+                    manifest["extra"]["provider_probe_cost"] = {
+                        "label": "provider_probe",
+                        "cost_usd": probe_cost,
+                        "ledger_event": _redacted_observation(overhead_event),
+                    }
+                    executor_obj = getattr(executor, "executor", None)
+                    if executor_obj is not None:
+                        applied_server_url = str(getattr(executor_obj, "server_url", "") or "")
+                        if applied_server_url:
+                            _apply_server_provenance(
+                                manifest, args, applied_server_url
                             )
                     rows = run_campaign(
                         _task_specs(task_ids, contract=contract),
@@ -696,13 +1158,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         budget_cap_usd=float(args.budget_usd),
                         max_workers=int(args.workers),
                     )
-                    executor_obj = getattr(executor, "executor", None)
-                    if executor_obj is not None:
-                        manifest["extra"]["provider_probe"] = dict(getattr(executor_obj, "provider_observation", {}))
                 finally:
-                    close = getattr(executor, "close", None)
-                    if callable(close):
-                        close()
+                    _cleanup_execution_resources(executor, isolated_server, manifest)
 
             projection_path = out_root / "claims.jsonl"
             try:
@@ -711,8 +1168,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             except CyberGymError as exc:
                 manifest["extra"]["budget_projection"] = {"available": False, "error": str(exc)}
             manifest["extra"].update(_row_counts(rows))
-            code = 0 if args.dry_run or all(row.get("status") == "completed" for row in rows) else 2
-            if code:
+            custody_pending = bool(manifest.get("extra", {}).get("close_skipped"))
+            code = (
+                2
+                if custody_pending
+                else 0
+                if args.dry_run or all(row.get("status") == "completed" for row in rows)
+                else 2
+            )
+            if custody_pending:
+                final.update({"outcome": "custody_pending", "exit_code": code})
+            elif code:
                 final.update({"outcome": "integration_or_task_failure", "exit_code": code})
             else:
                 final.update({"outcome": "completed", "exit_code": 0})

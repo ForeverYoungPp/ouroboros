@@ -80,6 +80,30 @@ def test_rootless_wrapper_injects_selected_socket(monkeypatch, tmp_path):
     assert isinstance(delegate._delegate, IsolatedServer)
 
 
+def test_rootless_wrapper_start_does_not_recurse_when_delegate_calls_env(monkeypatch, tmp_path):
+    seed, _commit = _seed_repo(tmp_path)
+    host = _host()
+    from devtools.benchmarks.common.server_runner import IsolatedServer
+
+    delegate = _RootlessIsolatedServer(
+        seed,
+        tmp_path / "data",
+        _settings(tmp_path),
+        docker_host=host,
+        provider_key="provider-secret",
+    )
+    observed = {}
+
+    def fake_start(*, ready_timeout):
+        observed["env"] = delegate._delegate._env()  # noqa: SLF001 - lifecycle seam
+
+    monkeypatch.setattr(delegate._delegate, "start", fake_start)
+    delegate.start(ready_timeout=1)
+    assert observed["env"]["DOCKER_HOST"] == host.value
+    assert observed["env"]["OPENROUTER_API_KEY"] == "provider-secret"
+    assert isinstance(delegate._delegate, IsolatedServer)
+
+
 class _FakeServer:
     base_url = "http://127.0.0.1:19001"
     attestation = {"repo_head": "a" * 40, "runtime_version": "test-version"}

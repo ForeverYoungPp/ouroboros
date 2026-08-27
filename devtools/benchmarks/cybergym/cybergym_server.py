@@ -13,12 +13,14 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from devtools.benchmarks.cybergym.cybergym_sidecar import (
     DockerHostRef,
+    is_placeholder_api_key,
     resolve_rootless_docker_host,
 )
 
@@ -63,15 +65,30 @@ def _run_git_output(argv: Sequence[str], cwd: pathlib.Path) -> tuple[int, str]:
 class _RootlessIsolatedServer:
     """Small subclass that adds the explicit rootless socket to IsolatedServer._env."""
 
-    def __init__(self, *args: Any, docker_host: DockerHostRef, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        docker_host: DockerHostRef,
+        provider_key: str = "",
+        provider_key_env: str = "OPENROUTER_API_KEY",
+        **kwargs: Any,
+    ) -> None:
         from devtools.benchmarks.common.server_runner import IsolatedServer
 
         self._docker_host = docker_host
+        self._provider_key = str(provider_key or "").strip()
+        self._provider_key_env = str(provider_key_env or "").strip()
         self._delegate = IsolatedServer(*args, **kwargs)
+        # Keep the original bound method before ``start`` installs our
+        # adapter-owned shim on the delegate.  Calling ``delegate._env`` from
+        # the shim after that assignment would recurse forever.
+        self._base_env = self._delegate._env  # noqa: SLF001 - lifecycle seam
 
     def _env(self) -> dict[str, str]:
-        env = self._delegate._env()  # noqa: SLF001 - existing lifecycle seam
+        env = self._base_env()
         env["DOCKER_HOST"] = self._docker_host.value
+        if self._provider_key:
+            env[self._provider_key_env] = self._provider_key
         return env
 
     def start(self, *args: Any, **kwargs: Any) -> Any:
@@ -103,6 +120,8 @@ class CyberGymIsolatedServer:
         docker_host: str | DockerHostRef,
         *,
         expected_commit: str = "",
+        provider_key: str = "",
+        provider_key_env: str = "OPENROUTER_API_KEY",
         server_factory: ServerFactory | None = None,
         git_runner: GitRunner | None = None,
     ) -> None:
@@ -111,6 +130,8 @@ class CyberGymIsolatedServer:
         self.applied_settings = pathlib.Path(applied_settings).expanduser().resolve(strict=False)
         self.docker_host = resolve_rootless_docker_host(docker_host)
         self.expected_commit = str(expected_commit or "").strip().lower()
+        self.provider_key = str(provider_key or "").strip()
+        self.provider_key_env = str(provider_key_env or "").strip()
         self._server_factory = server_factory
         self._git_runner = git_runner or _run_git
         self.clone_root = self.run_root / "ouroboros-clone"
@@ -123,8 +144,12 @@ class CyberGymIsolatedServer:
 
         if not self.seed_repo.is_dir():
             raise CyberGymServerError("seed_repo must be an existing directory")
-        if not self.expected_commit:
+        if not re.fullmatch(r"[0-9a-f]{40}", self.expected_commit):
             raise CyberGymServerError("expected_commit is required for isolated-server provenance")
+        if self.provider_key_env != "OPENROUTER_API_KEY":
+            raise CyberGymServerError("provider_key_env must be OPENROUTER_API_KEY")
+        if self.provider_key and is_placeholder_api_key(self.provider_key):
+            raise CyberGymServerError("provider_key must not be a placeholder")
         if not self.run_root.is_absolute() or self.run_root == pathlib.Path("/"):
             raise CyberGymServerError("run_root must be a non-root absolute path")
         try:
@@ -217,6 +242,8 @@ class CyberGymIsolatedServer:
             self.data_root,
             self.settings_path,
             docker_host=self.docker_host,
+            provider_key=self.provider_key,
+            provider_key_env=self.provider_key_env,
         )
         try:
             self._server.start(ready_timeout=ready_timeout)

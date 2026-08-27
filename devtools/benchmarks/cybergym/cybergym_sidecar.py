@@ -140,6 +140,8 @@ class DockerHostRef:
     def __post_init__(self) -> None:
         value = _text(self.value, "docker_host", max_len=4096)
         path = _safe_path(self.socket_path, "docker_socket")
+        if path in {"/var/run/docker.sock", "/run/docker.sock", "/docker.sock"}:
+            raise SidecarConfigurationError("the shared/rootful Docker socket is forbidden")
         if value != f"unix://{path}" or (not self.allow_custom and not _recognised_rootless_socket(path)):
             raise SidecarConfigurationError("docker_host must be a recognised rootless unix socket")
 
@@ -363,6 +365,23 @@ def build_connectivity_probe_plan(plan: NetworkPlan) -> tuple[dict[str, Any], ..
             "expected_reachable": False,
             "requires_all": True,
         },
+        {
+            # The agent shares the server alias, but must not be able to use
+            # the verifier routes without authentication.  GET is intentional:
+            # it exercises transport and the denial response without creating
+            # a PoC or changing verifier state.
+            "name": "agent_to_server_protected",
+            "targets": (f"{plan.server_url}/query-poc", f"{plan.server_url}/submit-fix"),
+            "method": "POST",
+            "authentication": "none",
+            "expected_reachable": True,
+            "expected_authorized": False,
+            "expected_denied": True,
+            "expected_statuses": [401, 403, 404],
+            "expected_mutating": False,
+            "side_effect_free": True,
+            "requires_all": True,
+        },
         {"name": "agent_socket_visible", "target": "unix://docker.sock", "expected_visible": False},
     )
 
@@ -386,17 +405,208 @@ def _probe_value(value: Any) -> bool | None:
     return None
 
 
-def evaluate_connectivity_checks(observed: Mapping[str, Any]) -> dict[str, Any]:
-    """Evaluate mandatory positive/negative facts; absent facts fail closed."""
+_PROTECTED_ROUTE_KEY = "agent_to_server_protected"
+# A wrong HTTP method (405) reaches Starlette routing before FastAPI's private
+# API-key dependency, so it is not evidence that the route is protected.  The
+# production probe uses POST with an intentionally invalid JSON body and must
+# observe an auth denial.  Keep this set narrow rather than treating every
+# client error (notably 405/422) as proof of authorization enforcement.
+_PROTECTED_DENIAL_STATUS_RANGE = {401, 403, 404}
+
+
+def _is_rootless_security_option(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    option = value.strip().lower()
+    return option in {"rootless", "name=rootless"} or option.endswith("=rootless")
+
+
+def _mapping_value(mapping: Mapping[str, Any], names: Sequence[str]) -> Any:
+    """Read a small set of Docker/runner spellings without accepting aliases blindly."""
+
+    for name in names:
+        if name in mapping:
+            return mapping[name]
+    lowered = {name.lower() for name in names}
+    for key, value in mapping.items():
+        if isinstance(key, str) and key.lower() in lowered:
+            return value
+    return None
+
+
+def _bool_mapping_value(mapping: Mapping[str, Any], names: Sequence[str]) -> bool | None:
+    value = _mapping_value(mapping, names)
+    return value if isinstance(value, bool) else None
+
+
+def _http_status(mapping: Mapping[str, Any]) -> int | None:
+    value = _mapping_value(mapping, ("status_code", "http_status", "response_status", "status"))
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 100 <= value <= 599 else None
+
+
+def _protected_route_record(value: Any) -> dict[str, Any] | None:
+    """Normalize one non-mutating protected-route probe result.
+
+    A transport response is useful evidence only when the runner also records
+    that the unauthenticated request was denied and did not mutate state.  A
+    bare boolean is deliberately rejected, because it cannot distinguish a
+    denied 401/405 from a successful mutating request.
+    """
+
+    if not isinstance(value, Mapping):
+        return None
+    status = _http_status(value)
+    reachable = _bool_mapping_value(
+        value,
+        ("reachable", "transport_reachable", "transport_ok", "transport"),
+    )
+    if reachable is None and status is not None:
+        reachable = True
+    authorized = _bool_mapping_value(value, ("authorized", "allowed", "accepted"))
+    denied = _bool_mapping_value(
+        value,
+        ("denied", "unauthorized", "protected", "expected_denial", "denied_by_auth"),
+    )
+    if denied is None and authorized is not None:
+        denied = not authorized
+    if denied is None and status is not None:
+        denied = status in _PROTECTED_DENIAL_STATUS_RANGE
+    mutating = _bool_mapping_value(
+        value,
+        ("mutating", "mutation", "mutation_succeeded", "mutation_success", "write_succeeded", "mutated"),
+    )
+    # An auth denial is an explicit non-mutating outcome for the malformed POST
+    # probe.  A 2xx/5xx response still requires an explicit mutating=false fact.
+    if mutating is None and denied is True and status in _PROTECTED_DENIAL_STATUS_RANGE:
+        mutating = False
+    return {
+        "reachable": reachable,
+        "denied": denied,
+        "mutating": mutating,
+        "status_code": status,
+    }
+
+
+def _protected_route_summary(value: Any) -> tuple[dict[str, Any], bool]:
+    """Evaluate aggregate or per-target protected-route observations."""
+
+    per_target = False
+    raw_records: list[Any]
+    aggregate_defaults: dict[str, Any] = {}
+    if isinstance(value, Mapping):
+        aggregate_defaults = {
+            key: item
+            for key, item in value.items()
+            if key in {
+                "reachable",
+                "transport_reachable",
+                "transport_ok",
+                "transport",
+                "denied",
+                "unauthorized",
+                "protected",
+                "expected_denial",
+                "denied_by_auth",
+                "authorized",
+                "allowed",
+                "accepted",
+                "mutating",
+                "mutation",
+                "mutation_succeeded",
+                "mutation_success",
+                "write_succeeded",
+                "mutated",
+                "status_code",
+                "http_status",
+                "response_status",
+                "status",
+            }
+        }
+        nested = _mapping_value(value, ("targets", "target_results", "routes"))
+        if isinstance(nested, Mapping):
+            raw_records = list(nested.values())
+            per_target = True
+        elif isinstance(nested, Sequence) and not isinstance(nested, (str, bytes)):
+            if all(isinstance(item, Mapping) for item in nested):
+                raw_records = list(nested)
+            else:
+                # Some runners report only the target names and put the
+                # aggregate facts beside them.  Preserve the requirement that
+                # both configured routes were probed while reusing those facts.
+                raw_records = [dict(aggregate_defaults) for _ in nested]
+            per_target = True
+        elif value and all(isinstance(item, Mapping) for item in value.values()):
+            # A URL-keyed mapping is a convenient runner representation.
+            raw_records = list(value.values())
+            per_target = True
+        else:
+            raw_records = [value]
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        raw_records = list(value)
+        per_target = True
+    else:
+        raw_records = []
+    records = [_protected_route_record(item) for item in raw_records]
+    if per_target and aggregate_defaults:
+        records = [
+            _protected_route_record({**aggregate_defaults, **item}) if isinstance(item, Mapping) else record
+            for item, record in zip(raw_records, records)
+        ]
+    declared_count = value.get("target_count") if isinstance(value, Mapping) else None
+    declared_count_ok = declared_count is None or (
+        isinstance(declared_count, int) and not isinstance(declared_count, bool) and declared_count == len(records)
+    )
+    target_count_ok = bool(records) and declared_count_ok and (not per_target or len(records) >= 2)
+    pass_value = bool(
+        target_count_ok
+        and all(
+            record is not None
+            and record["reachable"] is True
+            and record["denied"] is True
+            and record["mutating"] is False
+            and record["status_code"] in _PROTECTED_DENIAL_STATUS_RANGE
+            for record in records
+        )
+    )
+    summary = {
+        "reachable": all(record is not None and record["reachable"] is True for record in records) if records else None,
+        "denied": all(record is not None and record["denied"] is True for record in records) if records else None,
+        "mutating": any(record is not None and record["mutating"] is True for record in records) if records else None,
+        "target_count": len(records),
+        "per_target": per_target,
+        "pass": pass_value,
+    }
+    return summary, pass_value
+
+
+def evaluate_connectivity_checks(
+    observed: Mapping[str, Any],
+    *,
+    require_protected_route_evidence: bool = False,
+) -> dict[str, Any]:
+    """Evaluate route facts; optional production probes fail closed when present."""
 
     checks: dict[str, Any] = {}
     failed: list[str] = []
+    if not isinstance(observed, Mapping):
+        observed = {}
     for name, expected in _CONNECTIVITY_EXPECTATIONS.items():
         value = _probe_value(observed.get(name))
         passed = value is expected
         checks[name] = {"observed": value, "expected": expected, "pass": passed}
         if not passed:
             failed.append(name)
+    if _PROTECTED_ROUTE_KEY in observed or require_protected_route_evidence:
+        summary, passed = _protected_route_summary(observed.get(_PROTECTED_ROUTE_KEY))
+        checks[_PROTECTED_ROUTE_KEY] = {
+            "observed": summary,
+            "expected": {"reachable": True, "denied": True, "mutating": False},
+            "pass": passed,
+        }
+        if not passed:
+            failed.append(_PROTECTED_ROUTE_KEY)
     return {"schema": f"{SCHEMA_VERSION}.connectivity", "ok": not failed, "checks": checks, "failed": failed}
 
 
@@ -536,6 +746,10 @@ class SidecarCommandSpec:
     extra_env: Mapping[str, str] = field(default_factory=dict)
     container_docker_host: str | None = None
     platform: str = "linux/amd64"
+    # Rootless Docker does not publish ports from an ``--internal`` bridge.
+    # Production callers use the server container's immutable-id exec channel
+    # instead; the default remains True for the legacy pure argv contract.
+    publish_host_port: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "docker_host", _host(self.docker_host))
@@ -561,6 +775,8 @@ class SidecarCommandSpec:
         _digest(self.image_digest)
         if not re.fullmatch(r"[A-Za-z0-9_./-]+", self.platform):
             raise SidecarConfigurationError("unsafe platform")
+        if not isinstance(self.publish_host_port, bool):
+            raise SidecarConfigurationError("publish_host_port must be a boolean")
         for item in self.command:
             _text(item, "command argument", max_len=4096)
         _safe_env_items(self.extra_env)
@@ -640,8 +856,11 @@ def build_sidecar_argv(spec: SidecarCommandSpec) -> list[str]:
         "--platform", spec.platform, "--network", plan.network_name, "--network-alias", plan.server_alias,
     ]
     _append_labels(argv, _labels(plan, "server", spec.labels))
+    if spec.publish_host_port:
+        argv.extend((
+            "--publish", f"{plan.verifier_bind_host}:{plan.verifier_host_port}:{plan.server_container_port}/tcp",
+        ))
     argv.extend((
-        "--publish", f"{plan.verifier_bind_host}:{plan.verifier_host_port}:{plan.server_container_port}/tcp",
         "--mount", _mount_arg(spec.docker_host.socket_path, spec.socket_target),
         "--env", spec.api_key_env,
     ))
@@ -751,6 +970,14 @@ class SidecarExpectation:
     server_pid: int | None = None
     workspace_pid: int | None = None
     executor_network_declaration: str = EXECUTOR_NETWORK_DECLARATION
+    # New callers may attest distinct immutable server/workspace images.  The
+    # legacy ``image_digest`` remains a compatibility shorthand and applies to
+    # both roles when the role-specific values are omitted.
+    server_image_digest: str | None = None
+    workspace_image_digest: str | None = None
+    # When false, the server is reachable only from the internal network and
+    # host-side private calls must use ``docker exec`` against server_id.
+    publish_host_port: bool = True
 
     def __post_init__(self) -> None:
         host = _host(self.docker_host)
@@ -765,13 +992,25 @@ class SidecarExpectation:
             if path != host.socket_path:
                 raise SidecarConfigurationError("socket_path must equal selected rootless socket")
             object.__setattr__(self, "socket_path", path)
-        digest = _required_digest(self.image_digest)
-        object.__setattr__(self, "image_digest", digest)
+        legacy_digest = _digest(self.image_digest)
+        server_digest = _digest(self.server_image_digest)
+        workspace_digest = _digest(self.workspace_image_digest)
+        if server_digest is None:
+            server_digest = legacy_digest
+        if workspace_digest is None:
+            workspace_digest = legacy_digest
+        if server_digest is None or workspace_digest is None:
+            raise SidecarConfigurationError("image_digest is required for production custody")
+        object.__setattr__(self, "image_digest", legacy_digest or server_digest)
+        object.__setattr__(self, "server_image_digest", server_digest)
+        object.__setattr__(self, "workspace_image_digest", workspace_digest)
         for value, name in ((self.server_pid, "server_pid"), (self.workspace_pid, "workspace_pid")):
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
                 raise SidecarConfigurationError(f"{name} must be positive")
         if self.executor_network_declaration != EXECUTOR_NETWORK_DECLARATION:
             raise SidecarConfigurationError("executor declaration must be non-none host value")
+        if not isinstance(self.publish_host_port, bool):
+            raise SidecarConfigurationError("publish_host_port must be a boolean")
 
 
 def _nested(mapping: Mapping[str, Any], *keys: str) -> Any:
@@ -915,7 +1154,10 @@ def _container_report(
     observed_network_id = network.get("NetworkID") if network else None
     if expected.network_id is not None and observed_network_id != expected.network_id:
         failures.append(f"{role}.network_id")
-    digest_ok = expected.image_digest is None or expected.image_digest in _digests(observation)
+    expected_digest = (
+        expected.server_image_digest if role == "server" else expected.workspace_image_digest
+    ) or expected.image_digest
+    digest_ok = expected_digest in _digests(observation)
     if not digest_ok:
         failures.append(f"{role}.image_digest")
     return {
@@ -923,7 +1165,8 @@ def _container_report(
         "network_mode": mode, "network_name": plan.network_name if network else None,
         "network_id": observed_network_id,
         "aliases": list(aliases) if isinstance(aliases, Sequence) and not isinstance(aliases, (str, bytes)) else [],
-        "labels": label_report, "image_digests": sorted(_digests(observation)), "image_digest_ok": digest_ok,
+        "labels": label_report, "image_digests": sorted(_digests(observation)),
+        "expected_image_digest": expected_digest, "image_digest_ok": digest_ok,
     }, failures
 
 
@@ -940,8 +1183,24 @@ def _socket_report(server: Mapping[str, Any], workspace: Mapping[str, Any], expe
     }, failures
 
 
-def _publish_report(server: Mapping[str, Any], plan: NetworkPlan) -> tuple[dict[str, Any], list[str]]:
+def _publish_report(
+    server: Mapping[str, Any], plan: NetworkPlan, *, required: bool = True
+) -> tuple[dict[str, Any], list[str]]:
     bindings = _bindings(server, int(plan.server_container_port))
+    if not required:
+        # ``--internal`` rootless bridges intentionally have no host port
+        # mapping.  An unexpected mapping would widen the verifier boundary,
+        # so absence is the only passing observation for exec transport.
+        ok = not bindings
+        return {
+            "mode": "container_exec",
+            "host_ip": None,
+            "host_port": None,
+            "container_port": plan.server_container_port,
+            "loopback_only": False,
+            "container_exec": True,
+            "bindings": len(bindings),
+        }, ([] if ok else ["server.unexpected_publish"])
     host_ip = bindings[0].get("HostIp") if len(bindings) == 1 else None
     host_port = bindings[0].get("HostPort") if len(bindings) == 1 else None
     try:
@@ -952,6 +1211,159 @@ def _publish_report(server: Mapping[str, Any], plan: NetworkPlan) -> tuple[dict[
     return {"host_ip": host_ip, "host_port": host_port, "container_port": plan.server_container_port, "loopback_only": ok}, ([] if ok else ["server.loopback_publish"])
 
 
+def _daemon_identity_report(
+    observation: Mapping[str, Any],
+    expected_host: DockerHostRef,
+    *,
+    required: bool,
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate structured evidence returned by the selected Docker daemon.
+
+    A socket path is only a routing intent; it is not proof that the command
+    reached the selected rootless daemon.  Production callers therefore pass
+    a redacted ``docker info``/daemon-identity mapping.  Pure unit fixtures can
+    omit it by leaving ``required`` false.
+    """
+
+    raw = observation.get("docker_info")
+    source = "docker_info"
+    if raw is None:
+        raw = observation.get("daemon_identity")
+        source = "daemon_identity"
+    if raw is None:
+        report = {
+            "required": required,
+            "source": None,
+            "status": "missing" if required else "not_required",
+            "ok": not required,
+            "daemon_id": None,
+            "server_version": None,
+            "rootless": None,
+            "endpoint": None,
+            "docker_root_dir": None,
+        }
+        return report, (["docker_daemon_evidence"] if required else [])
+    if not isinstance(raw, Mapping):
+        if not required:
+            return {
+                "required": False,
+                "source": source,
+                "status": "not_required",
+                "ok": True,
+                "daemon_id": None,
+                "server_version": None,
+                "rootless": None,
+                "endpoint": None,
+                "docker_root_dir": None,
+            }, []
+        return {
+            "required": required,
+            "source": source,
+            "status": "invalid",
+            "ok": False,
+            "daemon_id": None,
+            "server_version": None,
+            "rootless": None,
+            "endpoint": None,
+            "docker_root_dir": None,
+        }, ["docker_daemon_evidence", "docker_daemon.type"]
+
+    # Some runners wrap the ``docker info`` payload in a daemon key.  Merge
+    # only this known structure; arbitrary objects are never trusted as proof.
+    nested = raw.get("daemon")
+    if isinstance(nested, Mapping):
+        info: Mapping[str, Any] = {**dict(nested), **{key: value for key, value in raw.items() if key != "daemon"}}
+    else:
+        info = raw
+
+    daemon_id: str | None = None
+    raw_id = _mapping_value(info, ("ID", "Id", "id", "daemon_id", "daemonId"))
+    if isinstance(raw_id, str):
+        try:
+            daemon_id = _safe_id(raw_id, "daemon_id")
+        except SidecarConfigurationError:
+            daemon_id = None
+    server_version: str | None = None
+    raw_version = _mapping_value(info, ("ServerVersion", "server_version", "version"))
+    if isinstance(raw_version, str):
+        try:
+            server_version = _text(raw_version, "server_version", max_len=128)
+        except SidecarConfigurationError:
+            server_version = None
+    rootless = _bool_mapping_value(info, ("Rootless", "rootless"))
+    security_options = _mapping_value(info, ("SecurityOptions", "security_options"))
+    if rootless is None and isinstance(security_options, str):
+        security_options = (security_options,)
+    if rootless is None and isinstance(security_options, Sequence) and not isinstance(security_options, (str, bytes)):
+        rootless = any(_is_rootless_security_option(item) for item in security_options)
+    raw_endpoint = _mapping_value(
+        info,
+        ("DockerHost", "docker_host", "Endpoint", "endpoint", "Socket", "socket", "socket_path"),
+    )
+    endpoint: str | None = None
+    endpoint_ok = True
+    endpoint_present = raw_endpoint is not None
+    if endpoint_present:
+        if isinstance(raw_endpoint, str):
+            try:
+                endpoint_ref = resolve_rootless_docker_host(raw_endpoint, allow_custom=True)
+                endpoint = endpoint_ref.value
+                endpoint_ok = endpoint == expected_host.value
+            except SidecarConfigurationError:
+                endpoint_ok = False
+        else:
+            endpoint_ok = False
+    elif required:
+        # In production, the selected socket must be part of the daemon
+        # response itself; the separate observation path is only intent.
+        endpoint_ok = False
+    raw_root_dir = _mapping_value(info, ("DockerRootDir", "docker_root_dir", "root_dir"))
+    docker_root_dir: str | None = None
+    root_dir_ok = True
+    root_dir_present = raw_root_dir is not None
+    if root_dir_present:
+        if isinstance(raw_root_dir, str):
+            try:
+                docker_root_dir = _safe_path(raw_root_dir, "docker_root_dir")
+            except SidecarConfigurationError:
+                root_dir_ok = False
+        else:
+            root_dir_ok = False
+
+    checks = {
+        "id": daemon_id is not None,
+        "server_version": server_version is not None,
+        "rootless": rootless is True,
+        "endpoint": endpoint_ok,
+        "docker_root_dir": root_dir_ok,
+    }
+    evidence_ok = all(checks[name] for name in ("id", "server_version", "rootless")) and endpoint_ok and root_dir_ok
+    # Optional daemon evidence is diagnostic only.  A pure/library caller may
+    # pass a partial observation (for example ``{"status": "not_checked"}`)
+    # while exercising the container contract; that must not be confused with
+    # a production attestation.  Production callers set ``required=True`` and
+    # therefore retain the fail-closed behavior for every missing/malformed
+    # field.
+    ok = evidence_ok or not required
+    failures = [] if ok else ["docker_daemon_evidence"]
+    if required:
+        failures.extend(f"docker_daemon.{name}" for name, passed in checks.items() if not passed)
+    return {
+        "required": required,
+        "source": source,
+        "status": "verified" if evidence_ok else "not_required" if not required else "invalid",
+        "ok": ok,
+        "daemon_id": daemon_id,
+        "server_version": server_version,
+        "rootless": rootless,
+        "endpoint": endpoint,
+        "docker_root_dir": docker_root_dir,
+        "checks": checks,
+        "endpoint_present": endpoint_present,
+        "docker_root_dir_present": root_dir_present,
+    }, failures
+
+
 def check_sidecar_attestation(
     observation: Mapping[str, Any],
     expected: SidecarExpectation,
@@ -959,6 +1371,8 @@ def check_sidecar_attestation(
     api_key: Any = None,
     connectivity: Mapping[str, Any] | None = None,
     require_connectivity: bool = True,
+    require_daemon_evidence: bool = False,
+    require_protected_route_evidence: bool = False,
 ) -> dict[str, Any]:
     """Return a complete secret-free report; unknown custody facts fail closed."""
 
@@ -976,6 +1390,12 @@ def check_sidecar_attestation(
             observed_host_ref = None
         if observed_host_ref is None or observed_host_ref.value != expected.docker_host.value:
             failures.append("docker_host_mismatch")
+    daemon_report, more = _daemon_identity_report(
+        observation,
+        expected.docker_host,
+        required=require_daemon_evidence,
+    )
+    failures.extend(more)
     network_observation = observation.get("network")
     network_report: dict[str, Any] = {
         "name": expected.plan.network_name,
@@ -1009,7 +1429,9 @@ def check_sidecar_attestation(
     failures.extend(more)
     socket_report, more = _socket_report(server, workspace, expected)
     failures.extend(more)
-    publish_report, more = _publish_report(server, expected.plan)
+    publish_report, more = _publish_report(
+        server, expected.plan, required=expected.publish_host_port
+    )
     failures.extend(more)
     key_report = api_key_attestation(api_key)
     if api_key is None:
@@ -1024,8 +1446,13 @@ def check_sidecar_attestation(
         connectivity_report: Mapping[str, Any] = {"schema": f"{SCHEMA_VERSION}.connectivity", "ok": False, "status": "not_provided"}
         if require_connectivity:
             failures.append("connectivity_unknown")
+        elif require_protected_route_evidence:
+            failures.append("protected_route_connectivity_unknown")
     else:
-        connectivity_report = evaluate_connectivity_checks(connectivity)
+        connectivity_report = evaluate_connectivity_checks(
+            connectivity,
+            require_protected_route_evidence=require_protected_route_evidence,
+        )
         if not connectivity_report.get("ok"):
             failures.append("connectivity")
     network_id = _nested(server, "NetworkSettings", "Networks", expected.plan.network_name, "NetworkID")
@@ -1036,6 +1463,8 @@ def check_sidecar_attestation(
     return {
         "schema": SCHEMA_VERSION, "ok": not failures, "failed_checks": sorted(set(failures)),
         "docker_host": {"value": expected.docker_host.value, "socket_path": expected.docker_host.socket_path, "rootless": True},
+        "docker_info": dict(daemon_report),
+        "docker_daemon": dict(daemon_report),
         "network": network_report,
         "server": server_report, "workspace": workspace_report, "socket": socket_report,
         "published_verifier": publish_report, "api_key": key_report,
@@ -1044,8 +1473,23 @@ def check_sidecar_attestation(
     }
 
 
-def attest_sidecar_runtime(observation: Mapping[str, Any], expected: SidecarExpectation, **kwargs: Any) -> dict[str, Any]:
-    report = check_sidecar_attestation(observation, expected, **kwargs)
+def attest_sidecar_runtime(
+    observation: Mapping[str, Any],
+    expected: SidecarExpectation,
+    *,
+    require_daemon_evidence: bool = False,
+    require_protected_route_evidence: bool = False,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Attest a sidecar; production callers pass ``require_daemon_evidence=True``."""
+
+    report = check_sidecar_attestation(
+        observation,
+        expected,
+        require_daemon_evidence=require_daemon_evidence,
+        require_protected_route_evidence=require_protected_route_evidence,
+        **kwargs,
+    )
     if not report.get("ok"):
         raise SidecarAttestationError("CyberGym sidecar attestation failed", report)
     return report
