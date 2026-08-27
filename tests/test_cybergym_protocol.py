@@ -10,10 +10,13 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     DEFAULT_FINAL_POC_PATH,
     OFFICIAL_MODEL,
     BudgetLedger,
+    BudgetOverspend,
     BudgetRefused,
     ClaimRefused,
+    CyberGymPinRefused,
     FinalPocRefused,
     LedgerError,
+    assert_fresh_output_root,
     build_generate_task_argv,
     build_task_result_row,
     classify_official_exit,
@@ -26,8 +29,10 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     safe_task_id,
     safe_task_path,
     task_contract_metadata,
+    validate_high_effort,
     validate_model_pin,
     validate_positive_finite,
+    validate_positive_integral,
     verify_mask_map,
 )
 
@@ -75,6 +80,40 @@ def test_pre_admission_is_pure_and_fail_closed(tmp_path):
     assert not denied["ok"]
     assert "output_root_overlaps_repo" in denied["reasons"]
     assert "server_url_wildcard_host" in denied["reasons"]
+
+
+def test_runtime_paths_are_confined_and_binary_is_nested(tmp_path):
+    repo = tmp_path / "repo"
+    denied = pre_admission_report(
+        task_ids=["arvo:1"],
+        output_root=tmp_path / "out",
+        repo_dir=repo,
+        source_root=tmp_path / "source",
+        data_root=tmp_path / "data",
+        mask_map=repo / "mask.json",
+        server_root=tmp_path / "server",
+        binary_dir=tmp_path / "elsewhere",
+        require_inputs=True,
+        server_url="http://cybergym-internal:8666",
+        model=OFFICIAL_MODEL,
+    )
+    assert not denied["ok"]
+    assert "mask_map_overlaps_repo" in denied["reasons"]
+    assert "binary_dir_outside_server_root" in denied["reasons"]
+    assert not (tmp_path / "out").exists()
+
+
+def test_fresh_output_root_rejects_nonempty_and_symlink(tmp_path):
+    fresh = tmp_path / "fresh"
+    assert assert_fresh_output_root(fresh) == fresh
+    fresh.mkdir()
+    (fresh / "old.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(CyberGymPinRefused, match="fresh"):
+        assert_fresh_output_root(fresh)
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "missing", target_is_directory=True)
+    with pytest.raises(CyberGymPinRefused, match="symlink"):
+        assert_fresh_output_root(link)
 
 
 def test_issue15_and_final_hash_binding(tmp_path):
@@ -149,6 +188,16 @@ def test_budget_projection_replays_terminal_states():
         project_budget([{"event": "settle", "attempt_id": "orphan", "cost_usd": 1}])
 
 
+def test_budget_settlement_overspend_is_typed_and_stops_dispatch(tmp_path):
+    ledger = BudgetLedger(tmp_path / "claims.jsonl", cap_usd=2)
+    ledger.claim("arvo:1", 1, attempt_id="a1")
+    with pytest.raises(BudgetOverspend):
+        ledger.settle("a1", 3)
+    projection = ledger.projection()
+    assert projection.reason == "budget_cap_exceeded"
+    assert projection.can_dispatch is False
+
+
 def test_exact_model_and_positive_launcher_values_are_strict():
     assert validate_model_pin(OFFICIAL_MODEL) == OFFICIAL_MODEL
     with pytest.raises(ValueError):
@@ -157,6 +206,13 @@ def test_exact_model_and_positive_launcher_values_are_strict():
     for value in (0, -1, float("nan"), float("inf"), True, ""):
         with pytest.raises(ValueError):
             validate_positive_finite(value, field="timeout")
+    assert validate_positive_integral("4.0", field="timeout") == 4
+    for value in (0, -1, 1.5, float("nan"), True, ""):
+        with pytest.raises(ValueError):
+            validate_positive_integral(value, field="timeout")
+    assert validate_high_effort("HIGH") == "high"
+    with pytest.raises(ValueError):
+        validate_high_effort("max")
 
 
 def test_strict_trial_bool_rejects_truthy_strings_and_contract_is_pinned():
@@ -196,6 +252,7 @@ def test_run_campaign_requires_regular_marker_and_binds_hash(tmp_path):
     def no_marker(_task, _task_dir):
         return {
             "status": "completed",
+            "observed_effort": "high",
             "trials": [{"trial_id": "final", "poc_hash": "a" * 64, "vul_exit_code": 1, "fix_exit_code": 0}],
             "cost_usd": 0.5,
         }
@@ -216,6 +273,7 @@ def test_run_campaign_requires_regular_marker_and_binds_hash(tmp_path):
         digest = hashlib.sha256(b"poc").hexdigest()
         return {
             "status": "completed",
+            "observed_effort": "high",
             "trials": [{"trial_id": "final", "is_final": True, "poc_hash": digest, "vul_exit_code": 1, "fix_exit_code": 0}],
             "cost_usd": 0.5,
         }
@@ -229,6 +287,102 @@ def test_run_campaign_requires_regular_marker_and_binds_hash(tmp_path):
     )
     assert rows[0]["status"] == "completed"
     assert rows[0]["final_submission_success"] is True
+    assert rows[0]["attempt_id"]
+
+
+def test_run_campaign_typed_overspend_row_and_retry_attempt_isolated(tmp_path):
+    def overspend(_task, task_dir):
+        marker = task_dir / "final.poc"
+        marker.write_bytes(b"poc")
+        digest = hashlib.sha256(b"poc").hexdigest()
+        return {
+            "status": "completed",
+            "observed_effort": "high",
+            "trials": [{"trial_id": "final", "is_final": True, "poc_hash": digest, "vul_exit_code": 1, "fix_exit_code": 0}],
+            "cost_usd": 3,
+        }
+
+    rows = run_campaign(
+        ["arvo:1"],
+        run_root=tmp_path / "overspend",
+        executor=overspend,
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+    )
+    assert rows[0]["status"] == "infra_failed"
+    assert rows[0]["infra_reason"] == "budget_overspend"
+    assert rows[0]["attempt_id"]
+
+    with pytest.raises(ClaimRefused):
+        run_campaign(
+            ["arvo:1"],
+            run_root=tmp_path / "overspend",
+            executor=overspend,
+            estimated_cost_usd=1,
+            budget_cap_usd=2,
+        )
+
+    calls: list[tuple[str, str]] = []
+
+    def retryable(task, task_dir):
+        calls.append((task.metadata["attempt_id"], str(task_dir)))
+        (task_dir / "final.poc").write_bytes(b"retry")
+        digest = hashlib.sha256(b"retry").hexdigest()
+        return {
+            "status": "completed",
+            "observed_effort": "high",
+            "trials": [{"trial_id": "final", "is_final": True, "poc_hash": digest, "vul_exit_code": 1, "fix_exit_code": 0}],
+            "cost_usd": 0.25,
+        }
+
+    retry_root = tmp_path / "retry"
+    first = run_campaign(
+        ["arvo:2"],
+        run_root=retry_root,
+        executor=retryable,
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+    )
+    second = run_campaign(
+        ["arvo:2"],
+        run_root=retry_root,
+        executor=retryable,
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+        allow_retries=True,
+    )
+    assert first[0]["status"] == second[0]["status"] == "completed"
+    assert calls[0][0] != calls[1][0]
+    assert calls[0][1] != calls[1][1]
+    assert first[0]["attempt_id"] != second[0]["attempt_id"]
+
+
+def test_run_campaign_rejects_missing_or_non_high_effort(tmp_path):
+    def callback(_task, task_dir):
+        (task_dir / "final.poc").write_bytes(b"poc")
+        return {
+            "status": "completed",
+            "trials": [
+                {
+                    "trial_id": "final",
+                    "is_final": True,
+                    "poc_hash": hashlib.sha256(b"poc").hexdigest(),
+                    "vul_exit_code": 1,
+                    "fix_exit_code": 0,
+                }
+            ],
+            "cost_usd": 0.5,
+        }
+
+    rows = run_campaign(
+        ["arvo:1"],
+        run_root=tmp_path / "effort",
+        executor=callback,
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+    )
+    assert rows[0]["status"] == "infra_failed"
+    assert rows[0]["infra_reason"] == "ValueError"
 
 
 def test_mask_map_is_private_but_checked_for_selected_rows(tmp_path):
@@ -260,3 +414,25 @@ def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):
     assert path.exists()
     assert metadata["model"] == OFFICIAL_MODEL
     assert metadata["model_slots"]["OUROBOROS_MODEL"] == OFFICIAL_MODEL
+
+
+def test_launcher_row_counts_do_not_count_planned_as_completed():
+    from devtools.benchmarks.cybergym.run_cybergym import _row_counts
+
+    counts = _row_counts(
+        [{"status": "planned"}, {"status": "completed"}, {"status": "infra_failed"}]
+    )
+    assert counts == {
+        "rows_written": 3,
+        "completed_count": 1,
+        "planned_count": 1,
+        "infra_count": 1,
+    }
+
+
+def test_launcher_rejects_fractional_timeout_before_output(tmp_path):
+    from devtools.benchmarks.cybergym.run_cybergym import main
+
+    out = tmp_path / "fractional"
+    assert main(["--timeout-sec", "1.5", "--out-dir", str(out)]) == 2
+    assert not out.exists()

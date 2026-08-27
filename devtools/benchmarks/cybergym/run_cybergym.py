@@ -51,6 +51,7 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     derive_disabled_tools,
     load_task_catalog,
     mask_task_id,
+    output_root_freshness,
     pre_admission_report,
     run_campaign,
     safe_task_id,
@@ -58,12 +59,25 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     task_contract_metadata,
     validate_model_pin,
     validate_positive_finite,
+    validate_positive_integral,
     verify_mask_map,
     verify_source_checkout,
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 DEFAULT_TIMEOUT_SEC = 4 * 60 * 60
+
+
+def _row_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """Summarize terminal rows without treating planned rows as completed."""
+    return {
+        "rows_written": len(rows),
+        "completed_count": sum(1 for row in rows if row.get("status") == "completed"),
+        "planned_count": sum(1 for row in rows if row.get("status") == "planned"),
+        "infra_count": sum(
+            1 for row in rows if row.get("status") in {"infra_failed", "blocked"}
+        ),
+    }
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -314,7 +328,7 @@ def _prepare_applied_settings(
 
     model = validate_model_pin(args.model, expected=OFFICIAL_MODEL)
     budget_usd = validate_positive_finite(args.budget_usd, field="budget_usd")
-    timeout_sec = validate_positive_finite(args.timeout_sec, field="timeout_sec")
+    timeout_sec = validate_positive_integral(args.timeout_sec, field="timeout_sec")
     overrides: dict[str, Any] = {
         "OUROBOROS_MODEL": model,
         "OUROBOROS_MODEL_LIGHT": model,
@@ -336,7 +350,7 @@ def _prepare_applied_settings(
         "OUROBOROS_MAX_ROUNDS": 200,
         "OUROBOROS_TASK_IDLE_TIMEOUT_SEC": 900,
         "TOTAL_BUDGET": budget_usd,
-        "OUROBOROS_TASK_ABS_CEILING_SEC": max(1, int(timeout_sec)),
+        "OUROBOROS_TASK_ABS_CEILING_SEC": timeout_sec,
         "OUROBOROS_TASK_REVIEW_MODE": "required",
         "OUROBOROS_REVIEW_ENFORCEMENT": "blocking",
         "OUROBOROS_REVIEW_MAX_CYCLES": "unlimited",
@@ -413,7 +427,7 @@ def _prepare_applied_settings(
         "model": applied_model,
         "model_slots": model_slots,
         "budget_usd": budget_usd,
-        "task_abs_ceiling_sec": max(1, int(timeout_sec)),
+        "task_abs_ceiling_sec": timeout_sec,
         "provider_policy": provider,
         "provider_probe_required": True,
         "provider_policy_complete": bool(provider_only or provider_order),
@@ -438,7 +452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args.model = validate_model_pin(args.model, expected=OFFICIAL_MODEL)
         args.budget_usd = validate_positive_finite(args.budget_usd, field="budget_usd")
-        args.timeout_sec = validate_positive_finite(args.timeout_sec, field="timeout_sec")
+        args.timeout_sec = validate_positive_integral(args.timeout_sec, field="timeout_sec")
         if isinstance(args.workers, bool) or int(args.workers) < 1:
             raise ValueError("workers must be a positive integer")
         if args.per_task_estimate_usd is not None:
@@ -463,6 +477,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Pure confinement is intentionally separate from ensure_* helpers: the
     # latter mkdir and are forbidden before admission by launcher_audit.
     try:
+        # An explicit run directory must be a new append-only root.  Perform
+        # this small read-only probe before the shared manifest writer so a
+        # stale directory can never be overwritten.
+        freshness = output_root_freshness(out_root)
+        if not freshness.get("ok"):
+            print(
+                "[cybergym] pre-admission path refusal: "
+                + str(freshness.get("reason") or "output root is not fresh"),
+                file=sys.stderr,
+            )
+            return 2
+        out_root = pathlib.Path(str(freshness["path"]))
+        manifest_path = out_root / "run_manifest.json"
+        ledger_path = out_root / "result_index.jsonl"
         assert_outside_repo(out_root, repo_dir)
         assert_file_output_outside_repo(manifest_path, repo_dir)
         assert_file_output_outside_repo(ledger_path, repo_dir)
@@ -472,7 +500,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             assert_outside_repo(pathlib.Path(args.source_root), repo_dir)
         if args.data_root:
             assert_outside_repo(pathlib.Path(args.data_root), repo_dir)
-    except (ValueError, OSError) as exc:
+        if args.mask_map:
+            assert_file_output_outside_repo(pathlib.Path(args.mask_map), repo_dir)
+        if args.server_root:
+            assert_outside_repo(pathlib.Path(args.server_root), repo_dir)
+        if args.binary_dir:
+            assert_outside_repo(pathlib.Path(args.binary_dir), repo_dir)
+    except (CyberGymError, ValueError, OSError) as exc:
         print(f"[cybergym] pre-admission path refusal: {exc}", file=sys.stderr)
         return 2
 
@@ -491,6 +525,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_settings=True,
         require_inputs=not bool(args.dry_run),
         network_mode="cybergym-internal",
+        mask_map=args.mask_map,
+        server_root=args.server_root,
+        binary_dir=args.binary_dir,
     )
     if not report["ok"]:
         print("[cybergym] pre-admission refusal: " + "; ".join(report["reasons"]), file=sys.stderr)
@@ -510,7 +547,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "model": str(args.model),
                 "difficulty": str(args.difficulty),
                 "server": str(args.server),
-                "timeout_sec": float(args.timeout_sec),
+                "timeout_sec": int(args.timeout_sec),
                 "executor": str(args.executor or "concrete_sidecar"),
                 "workers": int(args.workers),
                 "provider_only": list(_csv_values(getattr(args, "provider_only", ()))),
@@ -673,11 +710,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest["extra"]["budget_projection"] = budget.as_dict()
             except CyberGymError as exc:
                 manifest["extra"]["budget_projection"] = {"available": False, "error": str(exc)}
-            manifest["extra"].update({
-                "rows_written": len(rows),
-                "completed_count": sum(1 for row in rows if row.get("status") in {"completed", "planned"}),
-                "infra_count": sum(1 for row in rows if row.get("status") in {"infra_failed", "blocked"}),
-            })
+            manifest["extra"].update(_row_counts(rows))
             code = 0 if args.dry_run or all(row.get("status") == "completed" for row in rows) else 2
             if code:
                 final.update({"outcome": "integration_or_task_failure", "exit_code": code})

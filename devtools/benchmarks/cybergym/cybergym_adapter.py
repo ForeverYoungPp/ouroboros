@@ -101,6 +101,10 @@ class BudgetRefused(LedgerError):
     """A reservation would exceed known budget headroom."""
 
 
+class BudgetOverspend(BudgetRefused):
+    """A measured settlement would take the campaign beyond its hard cap."""
+
+
 @dataclasses.dataclass(frozen=True)
 class BudgetProjection:
     """Pure replay result for one campaign-global budget ledger."""
@@ -178,6 +182,31 @@ def validate_positive_finite(value: Any, *, field: str) -> float:
     return number
 
 
+def validate_positive_integral(value: Any, *, field: str) -> int:
+    """Validate a strictly positive finite integer setting.
+
+    Wall-clock ceilings are protocol values, not arbitrary floating-point
+    hints.  Rejecting ``1.5`` (and boolean truthiness) at the launcher boundary
+    prevents a callback from silently truncating a declared timeout.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a positive integer")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive integer") from exc
+    if not math.isfinite(number) or number <= 0 or not number.is_integer():
+        raise ValueError(f"{field} must be a positive integer")
+    return int(number)
+
+
+def validate_high_effort(value: Any, *, field: str = "effort") -> str:
+    """Require the owner-selected high reasoning effort exactly."""
+    if str(value or "").strip().lower() != "high":
+        raise ValueError(f"{field} must be exactly 'high'")
+    return "high"
+
+
 def parse_strict_bool(
     value: Any, *, field: str = "boolean", default: bool | None = None
 ) -> bool:
@@ -207,9 +236,11 @@ def task_contract_metadata(
     tasks_sha256: str = OFFICIAL_TASKS_SHA256,
     final_poc_path: str = DEFAULT_FINAL_POC_PATH,
     disabled_tools: Iterable[str] = DEFAULT_DISABLED_TOOLS,
+    effort: str = "high",
 ) -> dict[str, Any]:
     """Build the immutable, non-secret contract attached to each task attempt."""
     model = validate_model_pin(model)
+    effort = validate_high_effort(effort)
     if level != DEFAULT_LEVEL:
         raise ValueError("CyberGym task contract requires level1")
     normalized_task = safe_task_id(task_id) if task_id else ""
@@ -223,7 +254,7 @@ def task_contract_metadata(
         "task_id": normalized_task,
         "level": level,
         "model": model,
-        "effort": "high",
+        "effort": effort,
         "no_swarm": True,
         "disabled_tools": list(tools),
         "final_poc_path": final_path,
@@ -287,6 +318,58 @@ def _paths_overlap(left: pathlib.Path, right: pathlib.Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def output_root_freshness(path: pathlib.Path | str) -> dict[str, Any]:
+    """Inspect a prospective output root without raising or mutating anything.
+
+    The non-raising shape is deliberate: a launcher can take a step-aside
+    refusal for an already-used directory before admission, while the pure
+    argument gate remains free of state-dependent exceptions.
+    """
+    lexical = pathlib.Path(path).expanduser()
+    if not str(path).strip():
+        return {"ok": False, "path": "", "reason": "output root is required"}
+    try:
+        if lexical.is_symlink():
+            return {
+                "ok": False,
+                "path": str(lexical),
+                "reason": "output root must not be a symlink",
+            }
+        target = lexical.resolve(strict=False)
+        if target == pathlib.Path(target.anchor or "/"):
+            return {
+                "ok": False,
+                "path": str(target),
+                "reason": "output root must not be the filesystem root",
+            }
+        target.stat()
+    except FileNotFoundError:
+        return {"ok": True, "path": str(lexical.resolve(strict=False)), "reason": ""}
+    except OSError as exc:
+        return {
+            "ok": False,
+            "path": str(lexical),
+            "reason": f"cannot inspect output root: {exc}",
+        }
+    # A run root is append-only and must be created by the admission writer;
+    # even an existing empty directory is therefore treated as stale.  This
+    # avoids a directory listing before admission (which would couple the
+    # refusal to world state) while still rejecting every non-empty root.
+    return {
+        "ok": False,
+        "path": str(target),
+        "reason": "output root must be fresh and nonexistent",
+    }
+
+
+def assert_fresh_output_root(path: pathlib.Path | str) -> pathlib.Path:
+    """Return an output root only when ``output_root_freshness`` is successful."""
+    verdict = output_root_freshness(path)
+    if not verdict.get("ok"):
+        raise CyberGymPinRefused(str(verdict.get("reason") or "output root is not fresh"))
+    return pathlib.Path(str(verdict["path"]))
 
 
 def safe_task_id(value: str) -> str:
@@ -372,6 +455,9 @@ def pre_admission_report(
     require_settings: bool = False,
     require_inputs: bool = False,
     network_mode: str = "cybergym-internal",
+    mask_map: pathlib.Path | str | None = None,
+    server_root: pathlib.Path | str | None = None,
+    binary_dir: pathlib.Path | str | None = None,
 ) -> dict[str, Any]:
     """Perform only deterministic argument/path admission checks.
 
@@ -398,36 +484,104 @@ def pre_admission_report(
     repo = _path(repo_dir)
     source = _path(source_root)
     data = _path(data_root)
+    mask = _path(mask_map)
+    server = _path(server_root)
+    binary = _path(binary_dir)
     if not str(output_root).strip():
         reasons.append("output_root_missing")
     if repo is None:
         reasons.append("repo_dir_missing")
-    elif _paths_overlap(out, repo):
-        reasons.append("output_root_overlaps_repo")
-    if data is not None and _paths_overlap(out, data):
-        reasons.append("output_root_overlaps_data_root")
+
+    # Every mutable/input root is compared in both directions with the live
+    # repository/data roots and this run's output root.  ``assert_outside_repo``
+    # only catches a candidate *under* a forbidden root; the reverse case
+    # (for example an output directory containing the live data directory) is
+    # equally unsafe and must be rejected before admission.
+    try:
+        from devtools.benchmarks.common.run_roots import live_data_roots, live_repo_roots
+
+        forbidden_roots: list[tuple[str, pathlib.Path]] = []
+        if repo is not None:
+            forbidden_roots.append(("repo", repo))
+        forbidden_roots.extend(("live_repo", _path(root) or pathlib.Path()) for root in live_repo_roots())
+        forbidden_roots.extend(("live_data", _path(root) or pathlib.Path()) for root in live_data_roots())
+        candidates = {
+            "output_root": out,
+            "source_root": source,
+            "data_root": data,
+            "mask_map": mask,
+            "server_root": server,
+            "binary_dir": binary,
+        }
+        for name, candidate in candidates.items():
+            if candidate is None:
+                continue
+            for label, forbidden in forbidden_roots:
+                if _paths_overlap(candidate, forbidden):
+                    reasons.append(f"{name}_overlaps_{label}")
+    except (ValueError, OSError) as exc:
+        reasons.append(f"path_not_confined:{exc}")
+
     if source is not None and _paths_overlap(out, source):
         reasons.append("output_root_overlaps_source_root")
+    if data is not None and _paths_overlap(out, data):
+        reasons.append("output_root_overlaps_data_root")
+    for label, candidate in (
+        ("mask_map", mask),
+        ("server_root", server),
+        ("binary_dir", binary),
+    ):
+        if candidate is not None and _paths_overlap(out, candidate):
+            reasons.append(f"output_root_overlaps_{label}")
     try:
         from devtools.benchmarks.common.run_roots import assert_outside_repo
 
-        if repo is not None:
-            assert_outside_repo(out, repo)
-        for label, candidate in (("source", source), ("data", data)):
+        for label, candidate in (
+            ("source", source),
+            ("data", data),
+            ("mask", mask),
+            ("server", server),
+            ("binary", binary),
+        ):
             if candidate is not None and repo is not None:
-                assert_outside_repo(candidate, repo)
-                if _paths_overlap(candidate, repo):
+                try:
+                    assert_outside_repo(candidate, repo)
+                except (ValueError, OSError):
                     reasons.append(f"{label}_root_overlaps_repo")
     except (ValueError, OSError) as exc:
         reasons.append(f"path_not_confined:{exc}")
 
     if source is not None and data is not None and _paths_overlap(source, data):
         reasons.append("source_root_overlaps_data_root")
+    if mask is not None and source is not None and _paths_overlap(mask, source):
+        reasons.append("mask_map_overlaps_source_root")
+    if mask is not None and data is not None and _paths_overlap(mask, data):
+        reasons.append("mask_map_overlaps_data_root")
+    if server is not None and source is not None and _paths_overlap(server, source):
+        reasons.append("server_root_overlaps_source_root")
+    if server is not None and data is not None and _paths_overlap(server, data):
+        reasons.append("server_root_overlaps_data_root")
+    if binary is not None and server is None:
+        reasons.append("binary_dir_requires_server_root")
+    if server is not None and binary is not None:
+        if binary == server:
+            reasons.append("binary_dir_must_be_nested_under_server_root")
+        else:
+            try:
+                binary.relative_to(server)
+            except ValueError:
+                reasons.append("binary_dir_outside_server_root")
     if require_inputs:
         if source is None:
             reasons.append("source_root_missing")
         if data is None:
             reasons.append("data_root_missing")
+        if mask is None:
+            reasons.append("mask_map_missing")
+        if server is None:
+            reasons.append("server_root_missing")
+        if binary is None:
+            reasons.append("binary_dir_missing")
     if difficulty != DEFAULT_LEVEL or difficulty not in _LEVELS:
         reasons.append(f"unsupported_difficulty:{difficulty!r}; CyberGym run is Level 1")
     model_text = str(model or "").strip()
@@ -481,6 +635,9 @@ def pre_admission_report(
         "repo_dir": str(repo) if repo is not None else "",
         "source_root": str(source) if source is not None else "",
         "data_root": str(data) if data is not None else "",
+        "mask_map": str(mask) if mask is not None else "",
+        "server_root": str(server) if server is not None else "",
+        "binary_dir": str(binary) if binary is not None else "",
         "settings_path": str(settings) if settings is not None else "",
     }
 
@@ -952,6 +1109,15 @@ def final_submission(
 ) -> dict[str, Any]:
     """Project one final submission and a diagnostic any-of view side by side."""
     normalized = [_normalize_trial(item, index) for index, item in enumerate(trials)]
+    trial_ids = [str(item.get("trial_id") or "") for item in normalized]
+    if len(trial_ids) != len(set(trial_ids)):
+        return {
+            "final_submission_success": None,
+            "final_submission_status": "unknown",
+            "final_submission_reason": "duplicate_trial_id",
+            "final_poc_hash": str(final_poc_sha256 or "").strip().lower(),
+            **_any_of(normalized),
+        }
     try:
         selected = _choose_final(normalized, final_trial)
     except ValueError as exc:
@@ -1043,11 +1209,17 @@ def build_task_result_row(
     error: str = "",
     runtime_result: Mapping[str, Any] | None = None,
     task_contract: Mapping[str, Any] | None = None,
+    attempt_id: str = "",
 ) -> dict[str, Any]:
     """Build a denominator-preserving row through ``common.result_index``."""
     from devtools.benchmarks.common.result_index import task_result_row as common_row
 
     task = safe_task_id(task_id)
+    normalized_attempt = str(attempt_id or "").strip()
+    if normalized_attempt and not _SAFE_COMPONENT.fullmatch(normalized_attempt):
+        raise ValueError("attempt_id must be a safe path component")
+    if observed_effort:
+        observed_effort = validate_high_effort(observed_effort, field="observed_effort")
     normalized = [_normalize_trial(item, index) for index, item in enumerate(trials)]
     selected = _choose_final(normalized, final_trial)
     if final_poc is not None and not final_poc_sha256:
@@ -1085,6 +1257,8 @@ def build_task_result_row(
             "completed result requires one regular final.poc and a bound final trial hash"
         )
     contract = dict(task_contract or {})
+    if "effort" in contract:
+        validate_high_effort(contract.get("effort"), field="task_contract.effort")
     project = project or task.split(":", 1)[0]
     refs = dict(artifact_refs or {})
     row = common_row(
@@ -1103,6 +1277,7 @@ def build_task_result_row(
             "trials": [_compact_trial(item) for item in normalized],
             "leakage": leakage,
             "task_contract": contract,
+            "attempt_id": normalized_attempt,
         },
     )
     effective_masked_id = str(masked_id or "").strip()
@@ -1144,6 +1319,7 @@ def build_task_result_row(
             "any_of_status": projection.get("any_of_status", "unknown"),
             "any_of_reason": projection.get("any_of_reason", ""),
             "task_contract": contract,
+            "attempt_id": normalized_attempt,
         }
     )
     return row
@@ -1193,7 +1369,7 @@ def project_budget(
             task = safe_task_id(str(event.get("task_id") or ""))
             amount = _event_amount(event, "reserved_usd", "estimated_cost_usd", "amount_usd")
             latest[attempt] = {"state": "reserved", "task_id": task, "reserved_usd": amount or 0.0}
-        elif kind in {"settle", "settled"}:
+        elif kind in {"settle", "settled", "overspend"}:
             if previous is None or previous.get("state") not in {"reserved", "unresolved"}:
                 raise LedgerError(f"settlement has no active claim: {attempt}")
             cost = _event_amount(event, "cost_usd", "settled_usd", "amount_usd")
@@ -1203,6 +1379,7 @@ def project_budget(
                 "cost_usd": cost or 0.0,
                 "reserved_usd": 0.0,
                 "upper_bound_usd": None,
+                "overspend": kind == "overspend",
             }
         elif kind in {"unresolved", "unknown"}:
             if previous is None or previous.get("state") not in {"reserved", "unresolved"}:
@@ -1314,6 +1491,8 @@ class BudgetLedger:
         estimate = _money(estimated_cost_usd, field="estimated_cost_usd", allow_none=True)
         if estimate is None:
             raise BudgetRefused("a finite estimate is required before paid dispatch")
+        if estimate <= 0:
+            raise BudgetRefused("estimated_cost_usd must be positive")
         attempt = str(attempt_id or uuid.uuid4().hex)
         if not _SAFE_COMPONENT.fullmatch(attempt):
             raise ValueError("attempt_id must be a safe path component")
@@ -1347,9 +1526,56 @@ class BudgetLedger:
         attempt = str(attempt_id or "").strip()
         cost = _money(cost_usd, field="cost_usd")
         with self._lock():
-            if attempt not in self.projection().active_attempt_ids:
+            current = self.projection()
+            if attempt not in current.active_attempt_ids:
                 raise LedgerError(f"attempt is not active: {attempt}")
-            self._append({"schema": LEDGER_SCHEMA, "event": "settle", "attempt_id": attempt, "cost_usd": cost, "ts_unix": time.time()})
+            # Replace this attempt's reservation with its measured spend when
+            # checking the hard cap.  Unknown other attempts deliberately keep
+            # the projection unknown; they already block new claims, while a
+            # known terminal result can still be recorded for custody.
+            reserved_for_attempt = 0.0
+            for event in self.events():
+                if str(event.get("attempt_id") or "") != attempt:
+                    continue
+                kind = str(event.get("event", event.get("kind", "")) or "").lower()
+                if kind in {"claim", "reserve", "reserved"}:
+                    reserved_for_attempt = float(
+                        _event_amount(
+                            event,
+                            "reserved_usd",
+                            "estimated_cost_usd",
+                            "amount_usd",
+                        )
+                        or 0.0
+                    )
+                elif kind in {"settle", "settled", "overspend", "release", "released"}:
+                    reserved_for_attempt = 0.0
+            projected_after = None
+            if current.projected_usd is not None:
+                projected_after = current.projected_usd - reserved_for_attempt + float(cost or 0.0)
+            if self.cap_usd is not None and projected_after is not None and projected_after > self.cap_usd:
+                self._append(
+                    {
+                        "schema": LEDGER_SCHEMA,
+                        "event": "overspend",
+                        "attempt_id": attempt,
+                        "cost_usd": cost,
+                        "ts_unix": time.time(),
+                    }
+                )
+                raise BudgetOverspend(
+                    "measured settlement exceeds campaign budget cap: "
+                    f"projected={projected_after:.6f}, cap={self.cap_usd:.6f}"
+                )
+            self._append(
+                {
+                    "schema": LEDGER_SCHEMA,
+                    "event": "settle",
+                    "attempt_id": attempt,
+                    "cost_usd": cost,
+                    "ts_unix": time.time(),
+                }
+            )
 
     def mark_unresolved(self, attempt_id: str, upper_bound_usd: float | None = None) -> None:
         attempt = str(attempt_id or "").strip()
@@ -1431,6 +1657,7 @@ def run_campaign(
     estimated_cost_usd: float | None,
     budget_cap_usd: float | None = DEFAULT_BUDGET_CAP_USD,
     max_workers: int = 1,
+    allow_retries: bool = False,
 ) -> list[dict[str, Any]]:
     """Run injected task callbacks under one atomic ledger.
 
@@ -1450,6 +1677,41 @@ def run_campaign(
         seen_task_ids.add(task.task_id)
         normalized_tasks.append(task)
     ledger = BudgetLedger(root / "claims.jsonl", cap_usd=budget_cap_usd)
+    if not isinstance(allow_retries, bool):
+        raise ValueError("allow_retries must be a boolean")
+    if not allow_retries:
+        # A second invocation against the same campaign root is ambiguous: it
+        # could overwrite a completed row or attach a late result to the wrong
+        # attempt.  Callers that intentionally resume must opt in explicitly;
+        # each resumed claim receives a fresh attempt id below.
+        claimed_tasks = {
+            safe_task_id(str(event.get("task_id") or ""))
+            for event in ledger.events()
+            if str(event.get("event", event.get("kind", "")) or "").lower()
+            in {"claim", "reserve", "reserved"}
+        }
+        recorded_tasks: set[str] = set()
+        index_path = root / "result_index.jsonl"
+        if index_path.exists():
+            try:
+                for line_number, line in enumerate(index_path.read_text(encoding="utf-8").splitlines(), 1):
+                    if not line.strip():
+                        continue
+                    value = json.loads(line)
+                    if not isinstance(value, Mapping):
+                        raise LedgerError(f"result index line {line_number} is not an object")
+                    raw_task = value.get("task_id", value.get("instance_id", ""))
+                    if raw_task:
+                        recorded_tasks.add(safe_task_id(str(raw_task)))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise LedgerError(f"cannot inspect existing result index: {index_path}") from exc
+        repeated = sorted((claimed_tasks | recorded_tasks).intersection(seen_task_ids))
+        if repeated:
+            raise ClaimRefused(
+                "task already has campaign history; pass allow_retries=True: "
+                + ", ".join(repeated)
+            )
+
     def _run_one(task: TaskSpec) -> dict[str, Any]:
         contract = task.metadata.get("task_contract") if isinstance(task.metadata, Mapping) else None
         if executor is None:
@@ -1469,22 +1731,40 @@ def run_campaign(
             return row
 
         claim: Mapping[str, Any] | None = None
+        outcome: dict[str, Any] = {}
+        callback_contract: Mapping[str, Any] | None = None
         task_dir = safe_task_path(root, task.task_id)
         try:
             claim = ledger.claim(task.task_id, estimated_cost_usd)
             # Claim first, then create the workspace.  The persisted attempt id
             # is part of the immutable task value so sidecar agent identities,
             # checkpoints, and late results all refer to the same claim.
-            task_dir.mkdir(parents=True, exist_ok=True)
             attempt_id = str(claim["attempt_id"])
             callback_metadata = dict(task.metadata)
             callback_metadata["attempt_id"] = attempt_id
+            if isinstance(contract, Mapping):
+                callback_contract = dict(contract)
+                callback_contract["attempt_id"] = attempt_id
+                callback_metadata["task_contract"] = callback_contract
+            else:
+                callback_contract = None
+            # Retried attempts receive an isolated child directory, so a stale
+            # final.poc from an earlier attempt cannot satisfy the new claim.
+            if allow_retries:
+                task_dir = safe_task_path(root, task.task_id, attempt_id)
+            task_dir.mkdir(parents=True, exist_ok=True)
             callback_task = dataclasses.replace(task, metadata=callback_metadata)
             result = executor(callback_task, task_dir)
             if not isinstance(result, Mapping):
                 raise CyberGymIntegrationUnavailable("CyberGym executor must return a mapping")
             outcome = dict(result)
             requested_status = str(outcome.get("status") or "completed").strip().lower()
+            if requested_status == "completed":
+                observed_effort = validate_high_effort(
+                    outcome.get("observed_effort"), field="observed_effort"
+                )
+            else:
+                observed_effort = str(outcome.get("observed_effort") or "")
             final_poc = outcome.get("final_poc")
             marker_record: FinalPoc | None = None
             if requested_status == "completed":
@@ -1517,7 +1797,7 @@ def run_campaign(
                 masked_id_source=str(outcome.get("masked_id_source") or ""),
                 observed_provider=str(outcome.get("observed_provider") or ""),
                 observed_model=str(outcome.get("observed_model") or ""),
-                observed_effort=str(outcome.get("observed_effort") or ""),
+                observed_effort=observed_effort,
                 prompt_tokens=outcome.get("prompt_tokens"),
                 completion_tokens=outcome.get("completion_tokens"),
                 cached_tokens=outcome.get("cached_tokens"),
@@ -1527,12 +1807,46 @@ def run_campaign(
                 artifact_refs=outcome.get("artifact_refs") or {"task_dir": str(task_dir)},
                 error=str(outcome.get("error") or ""),
                 runtime_result=outcome.get("runtime_result"),
-                task_contract=contract if isinstance(contract, Mapping) else None,
+                task_contract=callback_contract
+                if callback_contract is not None
+                else (contract if isinstance(contract, Mapping) else None),
+                attempt_id=str(claim["attempt_id"]),
             )
             if outcome.get("cost_usd") is None:
                 ledger.mark_unresolved(str(claim["attempt_id"]), outcome.get("cost_upper_bound_usd"))
             else:
                 ledger.settle(str(claim["attempt_id"]), float(outcome["cost_usd"]))
+        except BudgetOverspend as exc:
+            row = build_task_result_row(
+                task.task_id,
+                trials=outcome.get("trials") or (),
+                final_trial=outcome.get("final_trial"),
+                final_poc_sha256=str(outcome.get("final_poc_sha256") or ""),
+                status="infra_failed",
+                lifecycle="budget_refused",
+                level=task.level,
+                masked_id=str(outcome.get("masked_id") or ""),
+                masked_id_source=str(outcome.get("masked_id_source") or ""),
+                observed_provider=str(outcome.get("observed_provider") or ""),
+                observed_model=str(outcome.get("observed_model") or ""),
+                observed_effort=(
+                    str(outcome.get("observed_effort") or "")
+                    if str(outcome.get("observed_effort") or "").strip().lower() == "high"
+                    else ""
+                ),
+                prompt_tokens=outcome.get("prompt_tokens"),
+                completion_tokens=outcome.get("completion_tokens"),
+                cached_tokens=outcome.get("cached_tokens"),
+                cost_usd=outcome.get("cost_usd"),
+                infra_reason="budget_overspend",
+                artifact_refs={"task_dir": str(task_dir), "claims": str(ledger.path)},
+                error=str(exc),
+                runtime_result=outcome.get("runtime_result"),
+                task_contract=callback_contract
+                if callback_contract is not None
+                else (contract if isinstance(contract, Mapping) else None),
+                attempt_id=str(claim["attempt_id"]) if claim else "",
+            )
         except Exception as exc:
             if claim is not None:
                 try:
@@ -1541,13 +1855,32 @@ def run_campaign(
                     pass
             row = build_task_result_row(
                 task.task_id,
+                trials=outcome.get("trials") or (),
+                final_trial=outcome.get("final_trial"),
+                final_poc_sha256=str(outcome.get("final_poc_sha256") or ""),
                 status="infra_failed",
                 lifecycle="executor_failed",
                 level=task.level,
+                masked_id=str(outcome.get("masked_id") or ""),
+                masked_id_source=str(outcome.get("masked_id_source") or ""),
+                observed_provider=str(outcome.get("observed_provider") or ""),
+                observed_model=str(outcome.get("observed_model") or ""),
+                observed_effort=(
+                    str(outcome.get("observed_effort") or "")
+                    if str(outcome.get("observed_effort") or "").strip().lower() == "high"
+                    else ""
+                ),
+                prompt_tokens=outcome.get("prompt_tokens"),
+                completion_tokens=outcome.get("completion_tokens"),
+                cached_tokens=outcome.get("cached_tokens"),
+                cost_usd=outcome.get("cost_usd"),
                 infra_reason=type(exc).__name__,
                 artifact_refs={"task_dir": str(task_dir), "claims": str(ledger.path)},
                 error=str(exc),
-                task_contract=contract if isinstance(contract, Mapping) else None,
+                task_contract=callback_contract
+                if callback_contract is not None
+                else (contract if isinstance(contract, Mapping) else None),
+                attempt_id=str(claim["attempt_id"]) if claim else "",
             )
         append_cybergym_result(root, row)
         return row
