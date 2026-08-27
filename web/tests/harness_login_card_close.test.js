@@ -93,3 +93,64 @@ test('detach releases the phase-follow subscription like every other resource', 
     ctl.dispose();
     assert.equal(subscribed, 0, 'a later dispose releases nothing twice');
 });
+
+test('the preparation line advances with live snapshots and retreats on a dead read', async () => {
+    // End-to-end: while the create POST holds the transition chain, the
+    // phase-follow subscription re-renders the card as store reads land — and
+    // a FAILED read (which retains the prior snapshot) must not keep a
+    // positive "Installing…" claim alive.
+    const { createClaudexorStatusStore } = await import('../modules/claudexor_status_store.js');
+    let runtime = { state: 'installing', target_version: '3.3.14' };
+    let daemonState = 'unreachable';
+    let fail = false;
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => {
+            if (fail) throw new Error('status read died');
+            return json(200, {
+                daemon: { state: daemonState, runtime },
+                config_dir: '/home/agent', harnesses: [], profiles: { harnessAccounts: [], profiles: [] }, quota: [],
+            });
+        },
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    let releaseCreate = () => {};
+    const gate = new Promise((resolve) => { releaseCreate = resolve; });
+    const host = interactiveHost();
+    const ctl = createLoginCardController({
+        host,
+        store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                await gate;
+                return json(200, { job_id: 'job-x', job: { state: 'cancelled' }, attach_command: '' });
+            }
+            return json(200, { job: { state: 'cancelled' } });
+        },
+    });
+    try {
+        const starting = ctl.start('codex', '');
+        await flush();
+        assert.ok(host.innerHTML.includes('Checking Claudexor…'), 'no snapshot yet — the generic');
+
+        await store.refresh();
+        assert.ok(host.innerHTML.includes('Installing Claudexor 3.3.14…'),
+            'a landed installing snapshot advances the line without any job poll');
+
+        runtime = { state: 'ready' };
+        daemonState = 'stale';
+        await store.refresh();
+        assert.ok(host.innerHTML.includes('Starting the Claudexor daemon…'));
+
+        fail = true;
+        await store.refresh();
+        assert.ok(host.innerHTML.includes('Checking Claudexor…'),
+            'a dead read retains the snapshot but is NOT phase evidence');
+
+        releaseCreate();
+        await starting;
+    } finally {
+        ctl.dispose();
+        await flush();
+        store.dispose();
+    }
+});

@@ -13,7 +13,6 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 
 import {
-    claudexorPreparationLine,
     DAEMON_STATES_STOPPED,
     FACET_ACCOUNTS,
     FACET_CATALOG,
@@ -27,6 +26,7 @@ import {
     accountLoginConfirmed,
     accountRows,
     bindStatusSurface,
+    claudexorPreparationLine,
     createClaudexorStatusStore,
     facetGapClause,
     facetKnown,

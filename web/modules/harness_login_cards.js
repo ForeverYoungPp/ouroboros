@@ -794,7 +794,13 @@ export function createLoginCardController({
         const active = ctl.active;
         if (!active) { hostEl.innerHTML = ''; return; }
         preserveCardFocus(hostEl, () => {
-            hostEl.innerHTML = loginCardHtml(active, now(), { mode, statusPayload: store?.snapshot || null });
+            // A failed refresh RETAINS the prior snapshot and records the
+            // error; a retained snapshot is not phase evidence, and rendering
+            // it kept a positive "Installing…" claim alive off a dead read.
+            hostEl.innerHTML = loginCardHtml(active, now(), {
+                mode,
+                statusPayload: store?.error ? null : (store?.snapshot || null),
+            });
         }, getDoc());
         wireLoginCard(hostEl, active);
     }
