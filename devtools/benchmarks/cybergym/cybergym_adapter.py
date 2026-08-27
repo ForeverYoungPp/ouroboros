@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 BENCHMARK_NAME = "cybergym"
 DEFAULT_LEVEL = "level1"
 FINAL_POC_BASENAME = "final.poc"
+OFFICIAL_MODEL = "deepseek/deepseek-v4-flash-0731"
 GENERATOR_MODULE = "cybergym.task.gen_task"
 OFFICIAL_SOURCE_PIN = "7656b71d07da6694e262f9c34ea994cd4849c0eb"
 OFFICIAL_DATA_REVISION = "bde190ded494e52bc684b66073b436c9d992c7c6"
@@ -34,6 +35,15 @@ OFFICIAL_EXIT_EXCLUSIONS = frozenset({0, 71, 300})
 DEFAULT_BUDGET_CAP_USD = 3000.0
 LEDGER_SCHEMA = "ouroboros.benchmark.cybergym.ledger.v1"
 RESULT_SCHEMA = "ouroboros.benchmark.cybergym.task_result.v1"
+TASK_CONTRACT_SCHEMA = "ouroboros.benchmark.cybergym.task_contract.v1"
+DEFAULT_FINAL_POC_PATH = "/workspace/final.poc"
+DEFAULT_DISABLED_TOOLS = (
+    "schedule_subagent",
+    "delegate_start",
+    "claude_code_edit",
+    "web_search",
+    "browser",
+)
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _SAFE_TASK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*:[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -130,6 +140,83 @@ class TaskSpec:
     project: str
     level: str = DEFAULT_LEVEL
     metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+
+
+def validate_model_pin(value: Any, *, expected: str = OFFICIAL_MODEL) -> str:
+    """Return an exact dated model id or fail before any run state is created."""
+    actual = str(value or "").strip()
+    target = str(expected or "").strip()
+    if not target or actual != target:
+        raise ValueError(f"model must be exactly {target!r}")
+    return actual
+
+
+def validate_positive_finite(value: Any, *, field: str) -> float:
+    """Validate a strictly positive finite numeric launcher setting."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a finite positive number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a finite positive number") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{field} must be a finite positive number")
+    return number
+
+
+def parse_strict_bool(
+    value: Any, *, field: str = "boolean", default: bool | None = None
+) -> bool:
+    """Parse only booleans or canonical true/false strings; reject truthy impostors."""
+    if value is None:
+        if default is not None:
+            return default
+        raise ValueError(f"{field} must be a boolean")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ValueError(f"{field} must be true or false")
+
+
+def task_contract_metadata(
+    task_id: str = "",
+    *,
+    model: str = OFFICIAL_MODEL,
+    level: str = DEFAULT_LEVEL,
+    source_pin: str = OFFICIAL_SOURCE_PIN,
+    data_revision: str = OFFICIAL_DATA_REVISION,
+    tasks_sha256: str = OFFICIAL_TASKS_SHA256,
+    final_poc_path: str = DEFAULT_FINAL_POC_PATH,
+    disabled_tools: Iterable[str] = DEFAULT_DISABLED_TOOLS,
+) -> dict[str, Any]:
+    """Build the immutable, non-secret contract attached to each task attempt."""
+    model = validate_model_pin(model)
+    if level != DEFAULT_LEVEL:
+        raise ValueError("CyberGym task contract requires level1")
+    normalized_task = safe_task_id(task_id) if task_id else ""
+    final_path = str(final_poc_path or "").strip()
+    if final_path != DEFAULT_FINAL_POC_PATH:
+        raise ValueError(f"final_poc_path must be {DEFAULT_FINAL_POC_PATH!r}")
+    tools = tuple(sorted({str(item).strip() for item in disabled_tools if str(item).strip()}))
+    return {
+        "schema": TASK_CONTRACT_SCHEMA,
+        "benchmark": BENCHMARK_NAME,
+        "task_id": normalized_task,
+        "level": level,
+        "model": model,
+        "effort": "high",
+        "no_swarm": True,
+        "disabled_tools": list(tools),
+        "final_poc_path": final_path,
+        "source_pin": str(source_pin or ""),
+        "data_revision": str(data_revision or ""),
+        "tasks_sha256": str(tasks_sha256 or ""),
+    }
 
 
 def _path(value: pathlib.Path | str | None) -> pathlib.Path | None:
@@ -289,8 +376,11 @@ def pre_admission_report(
         reasons.append("source_root_overlaps_data_root")
     if difficulty != DEFAULT_LEVEL or difficulty not in _LEVELS:
         reasons.append(f"unsupported_difficulty:{difficulty!r}; CyberGym run is Level 1")
-    if not str(model or "").strip():
+    model_text = str(model or "").strip()
+    if not model_text:
         reasons.append("model_missing")
+    elif model_text != OFFICIAL_MODEL:
+        reasons.append(f"model_pin_mismatch:expected={OFFICIAL_MODEL!r}")
     if is_placeholder_api_key(api_key):
         reasons.append("placeholder_api_key")
     if require_api_key and not str(api_key or "").strip():
@@ -594,12 +684,18 @@ def _normalize_trial(value: Any, index: int) -> dict[str, Any]:
         _first(merged, "vul_exit_code", "vul_exit", "vulnerable_exit_code", "exit_code"),
         _first(merged, "fix_exit_code", "fix_exit", "fixed_exit_code"),
     )
+    final_flag = _first(merged, "is_final", "final", "designated_final")
+    is_final = parse_strict_bool(final_flag, field="trial.is_final", default=False)
+    role = str(_first(merged, "role") or "").strip().lower()
+    if final_flag is None and role == "final":
+        is_final = True
+    elif final_flag is not None and role == "final" and not is_final:
+        raise ValueError("trial final flag conflicts with role=final")
     return {
         "trial_id": str(_first(merged, "trial_id", "attempt_id", "id") or f"trial-{index}"),
         "poc_id": str(_first(merged, "poc_id", "submission_id") or ""),
         "poc_hash": str(_first(merged, "poc_hash", "sha256", "hash") or "").strip().lower(),
-        "is_final": bool(_first(merged, "is_final", "final", "designated_final"))
-        or str(_first(merged, "role") or "").lower() == "final",
+        "is_final": is_final,
         **cls,
     }
 
@@ -612,6 +708,10 @@ def _choose_final(trials: list[dict[str, Any]], explicit: Any) -> dict[str, Any]
             for trial in trials:
                 if trial["trial_id"] == explicit_id:
                     return trial
+            if trials:
+                raise ValueError(f"explicit final trial id is not present: {explicit_id}")
+        elif trials:
+            raise ValueError("explicit final trial must identify one trial_id")
         return candidate
     marked = [trial for trial in trials if trial["is_final"]]
     if len(marked) > 1:
@@ -667,7 +767,17 @@ def final_submission(
 ) -> dict[str, Any]:
     """Project one final submission and a diagnostic any-of view side by side."""
     normalized = [_normalize_trial(item, index) for index, item in enumerate(trials)]
-    selected = _choose_final(normalized, final_trial)
+    try:
+        selected = _choose_final(normalized, final_trial)
+    except ValueError as exc:
+        return {
+            "final_submission_success": None,
+            "final_submission_status": "unknown",
+            "final_submission_reason": "invalid_final_trial",
+            "final_trial_error": str(exc),
+            "final_poc_hash": str(final_poc_sha256 or "").strip().lower(),
+            **_any_of(normalized),
+        }
     if selected is not None and not any(item["trial_id"] == selected["trial_id"] for item in normalized):
         normalized.append(selected)
     expected = str(final_poc_sha256 or "").strip().lower()
@@ -746,6 +856,7 @@ def build_task_result_row(
     artifact_refs: Mapping[str, Any] | None = None,
     error: str = "",
     runtime_result: Mapping[str, Any] | None = None,
+    task_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a denominator-preserving row through ``common.result_index``."""
     from devtools.benchmarks.common.result_index import task_result_row as common_row
@@ -763,23 +874,49 @@ def build_task_result_row(
     projection = final_submission(selected, final_poc_sha256=final_poc_sha256, trials=normalized)
     if selected is not None and not any(item["trial_id"] == selected["trial_id"] for item in normalized):
         normalized.append(selected)
+    marker_bound = bool(str(final_poc_sha256 or "").strip()) or final_poc is not None
+    final_status = str(projection.get("final_submission_status") or "unknown")
+    final_reason = str(projection.get("final_submission_reason") or "")
+    final_hash = str(projection.get("final_poc_hash") or "").strip().lower()
+    final_evidence = bool(
+        marker_bound
+        and selected is not None
+        and final_status in {"known_success", "known_failure"}
+        and bool(_HEX64.fullmatch(final_hash))
+        and final_reason not in {"final_poc_hash_mismatch", "final_poc_hash_missing"}
+    )
+    effective_status = str(status or "").strip().lower()
+    if not effective_status:
+        effective_status = "completed"
+    effective_lifecycle = lifecycle or effective_status
+    effective_infra_reason = str(infra_reason or "")
+    effective_error = str(error or "")
+    if effective_status == "completed" and not final_evidence:
+        effective_status = "infra_failed"
+        effective_lifecycle = "final_evidence_missing"
+        effective_infra_reason = effective_infra_reason or "final_evidence_missing"
+        effective_error = effective_error or (
+            "completed result requires one regular final.poc and a bound final trial hash"
+        )
+    contract = dict(task_contract or {})
     project = project or task.split(":", 1)[0]
     refs = dict(artifact_refs or {})
     row = common_row(
         benchmark=BENCHMARK_NAME,
         instance_id=task,
-        status=str(status),
+        status=effective_status,
         runtime_result=runtime_result,
-        prediction_written=projection.get("final_submission_success") is not None,
-        official_eval_status=("completed" if projection.get("final_submission_success") is not None else "not_run"),
+        prediction_written=final_evidence,
+        official_eval_status=("completed" if final_evidence else "not_run"),
         output_paths=refs,
-        reason_code=str(infra_reason or projection.get("final_submission_reason") or ""),
-        error=str(error or ""),
+        reason_code=effective_infra_reason or final_reason,
+        error=effective_error,
         details={
             "project": project,
             "level": level,
             "trials": [_compact_trial(item) for item in normalized],
             "leakage": leakage,
+            "task_contract": contract,
         },
     )
     row.update(
@@ -790,7 +927,7 @@ def build_task_result_row(
             "project": project,
             "level": level,
             "trial_count": len(normalized),
-            "lifecycle": lifecycle or str(status),
+            "lifecycle": effective_lifecycle,
             "final_poc_id": projection.get("final_poc_id", ""),
             "final_poc_hash": projection.get("final_poc_hash", str(final_poc_sha256 or "")),
             "raw_final_vul_exit": projection.get("raw_final_vul_exit"),
@@ -806,13 +943,14 @@ def build_task_result_row(
             "completion_tokens": completion_tokens,
             "cached_tokens": cached_tokens,
             "cost_usd": cost_usd,
-            "infra_reason": str(infra_reason or ""),
+            "infra_reason": effective_infra_reason,
             "leakage": leakage,
             "artifact_refs": refs,
             "final_submission_status": projection.get("final_submission_status", "unknown"),
             "final_submission_reason": projection.get("final_submission_reason", ""),
             "any_of_status": projection.get("any_of_status", "unknown"),
             "any_of_reason": projection.get("any_of_reason", ""),
+            "task_contract": contract,
         }
     )
     return row
@@ -1047,6 +1185,29 @@ def append_cybergym_result(run_root: pathlib.Path | str, row: Mapping[str, Any])
     append_result_index(safe_task_path(root, task), value)
 
 
+def _task_spec(value: TaskSpec | Mapping[str, Any] | str) -> TaskSpec:
+    """Normalize one injected task value without touching the filesystem."""
+    if isinstance(value, TaskSpec):
+        task_id = safe_task_id(value.task_id)
+        if value.level != DEFAULT_LEVEL:
+            raise ValueError("CyberGym task contract requires level1")
+        return dataclasses.replace(value, task_id=task_id)
+    if isinstance(value, Mapping):
+        task_id = safe_task_id(str(value.get("task_id", value.get("id", ""))))
+        level = str(value.get("level") or DEFAULT_LEVEL)
+        if level != DEFAULT_LEVEL:
+            raise ValueError("CyberGym task contract requires level1")
+        metadata = dict(value)
+        return TaskSpec(
+            task_id,
+            str(value.get("project") or task_id.split(":", 1)[0]),
+            level,
+            metadata,
+        )
+    task_id = safe_task_id(str(value))
+    return TaskSpec(task_id, task_id.split(":", 1)[0])
+
+
 def run_campaign(
     tasks: Sequence[TaskSpec | Mapping[str, Any] | str],
     *,
@@ -1062,24 +1223,20 @@ def run_campaign(
     seam never falls back to Docker, a shell, or a host network.
     """
     root = pathlib.Path(run_root).expanduser().resolve(strict=False)
+    normalized_tasks: list[TaskSpec] = []
+    seen_task_ids: set[str] = set()
+    for item in tasks:
+        task = _task_spec(item)
+        if task.task_id in seen_task_ids:
+            raise ValueError(f"duplicate task id: {task.task_id}")
+        seen_task_ids.add(task.task_id)
+        normalized_tasks.append(task)
     ledger = BudgetLedger(root / "claims.jsonl", cap_usd=budget_cap_usd)
     rows: list[dict[str, Any]] = []
-    for item in tasks:
-        if isinstance(item, TaskSpec):
-            task = item
-        elif isinstance(item, Mapping):
-            task_id = safe_task_id(str(item.get("task_id", item.get("id", ""))))
-            task = TaskSpec(
-                task_id,
-                str(item.get("project") or task_id.split(":", 1)[0]),
-                str(item.get("level") or DEFAULT_LEVEL),
-                item,
-            )
-        else:
-            task_id = safe_task_id(str(item))
-            task = TaskSpec(task_id, task_id.split(":", 1)[0])
+    for task in normalized_tasks:
         task_dir = safe_task_path(root, task.task_id)
         task_dir.mkdir(parents=True, exist_ok=True)
+        contract = task.metadata.get("task_contract") if isinstance(task.metadata, Mapping) else None
         if executor is None:
             row = build_task_result_row(
                 task.task_id,
@@ -1089,6 +1246,7 @@ def run_campaign(
                 infra_reason="executor_not_injected",
                 artifact_refs={"task_dir": str(task_dir)},
                 error="CyberGym executor is not configured",
+                task_contract=contract if isinstance(contract, Mapping) else None,
             )
             append_cybergym_result(root, row)
             rows.append(row)
@@ -1101,16 +1259,33 @@ def run_campaign(
             if not isinstance(result, Mapping):
                 raise CyberGymIntegrationUnavailable("CyberGym executor must return a mapping")
             outcome = dict(result)
+            requested_status = str(outcome.get("status") or "completed").strip().lower()
             final_poc = outcome.get("final_poc")
-            marker = task_dir / FINAL_POC_BASENAME
-            if final_poc is None and marker.exists():
-                final_poc = marker
+            marker_record: FinalPoc | None = None
+            if requested_status == "completed":
+                marker_record = final_poc_record(task_dir)
+                declared_hash = str(outcome.get("final_poc_sha256") or "").strip().lower()
+                if declared_hash and declared_hash != marker_record.sha256:
+                    raise FinalPocRefused("executor final_poc_sha256 does not match final.poc")
+                if final_poc is not None:
+                    if isinstance(final_poc, FinalPoc):
+                        supplied_hash = final_poc.sha256
+                    elif isinstance(final_poc, Mapping):
+                        supplied_hash = str(final_poc.get("sha256", final_poc.get("poc_hash", "")))
+                    else:
+                        supplied_hash = final_poc_hash(final_poc)
+                    if supplied_hash and supplied_hash.strip().lower() != marker_record.sha256:
+                        raise FinalPocRefused("executor final_poc does not match final.poc")
+                final_poc = marker_record
+            elif final_poc is None and (task_dir / FINAL_POC_BASENAME).exists():
+                marker_record = final_poc_record(task_dir)
+                final_poc = marker_record
             row = build_task_result_row(
                 task.task_id,
                 trials=outcome.get("trials") or (),
                 final_trial=outcome.get("final_trial"),
                 final_poc=final_poc,
-                status=str(outcome.get("status") or "completed"),
+                status=requested_status,
                 lifecycle=str(outcome.get("lifecycle") or "completed"),
                 level=task.level,
                 observed_provider=str(outcome.get("observed_provider") or ""),
@@ -1125,6 +1300,7 @@ def run_campaign(
                 artifact_refs=outcome.get("artifact_refs") or {"task_dir": str(task_dir)},
                 error=str(outcome.get("error") or ""),
                 runtime_result=outcome.get("runtime_result"),
+                task_contract=contract if isinstance(contract, Mapping) else None,
             )
             if outcome.get("cost_usd") is None:
                 ledger.mark_unresolved(str(claim["attempt_id"]), outcome.get("cost_upper_bound_usd"))
@@ -1144,6 +1320,7 @@ def run_campaign(
                 infra_reason=type(exc).__name__,
                 artifact_refs={"task_dir": str(task_dir), "claims": str(ledger.path)},
                 error=str(exc),
+                task_contract=contract if isinstance(contract, Mapping) else None,
             )
         append_cybergym_result(root, row)
         rows.append(row)

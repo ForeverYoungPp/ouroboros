@@ -7,6 +7,8 @@ import hashlib
 import pytest
 
 from devtools.benchmarks.cybergym.cybergym_adapter import (
+    DEFAULT_FINAL_POC_PATH,
+    OFFICIAL_MODEL,
     BudgetLedger,
     BudgetRefused,
     ClaimRefused,
@@ -17,10 +19,15 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     classify_official_exit,
     final_poc_record,
     final_submission,
+    parse_strict_bool,
     pre_admission_report,
     project_budget,
+    run_campaign,
     safe_task_id,
     safe_task_path,
+    task_contract_metadata,
+    validate_model_pin,
+    validate_positive_finite,
 )
 
 
@@ -91,7 +98,10 @@ def test_result_row_preserves_final_and_any_of_columns():
     digest = "a" * 64
     row = build_task_result_row(
         "arvo:1",
-        trials=[{"trial_id": "old", "poc_hash": digest, "vul_exit_code": 1, "fix_exit_code": 0}],
+        trials=[
+            {"trial_id": "old", "poc_hash": digest, "vul_exit_code": 1, "fix_exit_code": 0},
+            {"trial_id": "final", "poc_hash": "b" * 64, "vul_exit_code": 71, "fix_exit_code": 0},
+        ],
         final_trial={"trial_id": "final", "poc_hash": "b" * 64, "vul_exit_code": 71, "fix_exit_code": 0},
         final_poc_sha256="b" * 64,
         status="completed",
@@ -125,3 +135,107 @@ def test_budget_projection_replays_terminal_states():
     assert projection.can_dispatch
     with pytest.raises(LedgerError):
         project_budget([{"event": "settle", "attempt_id": "orphan", "cost_usd": 1}])
+
+
+def test_exact_model_and_positive_launcher_values_are_strict():
+    assert validate_model_pin(OFFICIAL_MODEL) == OFFICIAL_MODEL
+    with pytest.raises(ValueError):
+        validate_model_pin("deepseek/deepseek-v4-flash")
+    assert validate_positive_finite("1.5", field="budget") == 1.5
+    for value in (0, -1, float("nan"), float("inf"), True, ""):
+        with pytest.raises(ValueError):
+            validate_positive_finite(value, field="timeout")
+
+
+def test_strict_trial_bool_rejects_truthy_strings_and_contract_is_pinned():
+    assert parse_strict_bool("false") is False
+    assert parse_strict_bool("TRUE") is True
+    with pytest.raises(ValueError):
+        parse_strict_bool("yes")
+    contract = task_contract_metadata("arvo:1")
+    assert contract["model"] == OFFICIAL_MODEL
+    assert contract["final_poc_path"] == DEFAULT_FINAL_POC_PATH
+    assert contract["no_swarm"] is True
+    assert "schedule_subagent" in contract["disabled_tools"]
+
+
+def test_completed_row_requires_marker_bound_final_evidence():
+    row = build_task_result_row(
+        "arvo:1",
+        trials=[{"trial_id": "final", "poc_hash": "a" * 64, "vul_exit_code": 1, "fix_exit_code": 0}],
+        status="completed",
+    )
+    assert row["status"] == "infra_failed"
+    assert row["infra_reason"] == "final_evidence_missing"
+
+
+def test_run_campaign_rejects_duplicate_ids_before_creating_output(tmp_path):
+    with pytest.raises(ValueError, match="duplicate task id"):
+        run_campaign(
+            ["arvo:1", "arvo:1"],
+            run_root=tmp_path / "run",
+            executor=None,
+            estimated_cost_usd=1,
+        )
+    assert not (tmp_path / "run").exists()
+
+
+def test_run_campaign_requires_regular_marker_and_binds_hash(tmp_path):
+    def no_marker(_task, _task_dir):
+        return {
+            "status": "completed",
+            "trials": [{"trial_id": "final", "poc_hash": "a" * 64, "vul_exit_code": 1, "fix_exit_code": 0}],
+            "cost_usd": 0.5,
+        }
+
+    rows = run_campaign(
+        ["arvo:1"],
+        run_root=tmp_path / "missing",
+        executor=no_marker,
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+    )
+    assert rows[0]["status"] == "infra_failed"
+    assert rows[0]["infra_reason"] == "FinalPocRefused"
+
+    def good_marker(_task, task_dir):
+        marker = task_dir / "final.poc"
+        marker.write_bytes(b"poc")
+        digest = hashlib.sha256(b"poc").hexdigest()
+        return {
+            "status": "completed",
+            "trials": [{"trial_id": "final", "is_final": True, "poc_hash": digest, "vul_exit_code": 1, "fix_exit_code": 0}],
+            "cost_usd": 0.5,
+        }
+
+    rows = run_campaign(
+        ["arvo:2"],
+        run_root=tmp_path / "good",
+        executor=good_marker,
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+    )
+    assert rows[0]["status"] == "completed"
+    assert rows[0]["final_submission_success"] is True
+
+
+def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):
+    from types import SimpleNamespace
+
+    from devtools.benchmarks.cybergym.run_cybergym import _prepare_applied_settings
+
+    template = tmp_path / "settings.json"
+    template.write_text(
+        '{"OUROBOROS_MODEL": "wrong", "OUROBOROS_MODEL_LIGHT": "wrong"}',
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "run"
+    output_root.mkdir()
+    path, metadata = _prepare_applied_settings(
+        template,
+        output_root,
+        SimpleNamespace(model=OFFICIAL_MODEL, budget_usd=3, timeout_sec=4),
+    )
+    assert path.exists()
+    assert metadata["model"] == OFFICIAL_MODEL
+    assert metadata["model_slots"]["OUROBOROS_MODEL"] == OFFICIAL_MODEL

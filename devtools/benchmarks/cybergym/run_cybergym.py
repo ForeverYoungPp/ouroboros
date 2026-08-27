@@ -34,8 +34,11 @@ from devtools.benchmarks.common.run_roots import (
 from devtools.benchmarks.cybergym.cybergym_adapter import (
     BENCHMARK_NAME,
     DEFAULT_BUDGET_CAP_USD,
+    DEFAULT_DISABLED_TOOLS,
+    DEFAULT_FINAL_POC_PATH,
     DEFAULT_LEVEL,
     OFFICIAL_DATA_REVISION,
+    OFFICIAL_MODEL,
     OFFICIAL_SOURCE_PIN,
     OFFICIAL_TASKS_SHA256,
     BudgetLedger,
@@ -50,6 +53,9 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     pre_admission_report,
     run_campaign,
     safe_task_id,
+    task_contract_metadata,
+    validate_model_pin,
+    validate_positive_finite,
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -134,11 +140,36 @@ def _load_executor(spec: str) -> Callable[[TaskSpec, pathlib.Path], Mapping[str,
     return callback
 
 
-def _task_specs(task_ids: Sequence[str], *, level: str = DEFAULT_LEVEL) -> list[TaskSpec]:
-    return [TaskSpec(task_id, task_id.split(":", 1)[0], level) for task_id in task_ids]
+def _task_specs(
+    task_ids: Sequence[str],
+    *,
+    level: str = DEFAULT_LEVEL,
+    contract: Mapping[str, Any] | None = None,
+) -> list[TaskSpec]:
+    """Build task values carrying the immutable contract into the executor seam."""
+    base_contract = dict(contract or task_contract_metadata(level=level))
+    specs: list[TaskSpec] = []
+    for raw_task_id in task_ids:
+        task_id = safe_task_id(raw_task_id)
+        task_contract = {**base_contract, "task_id": task_id}
+        specs.append(
+            TaskSpec(
+                task_id,
+                task_id.split(":", 1)[0],
+                level,
+                {"task_contract": task_contract},
+            )
+        )
+    return specs
 
 
-def _write_planned_rows(out_root: pathlib.Path, task_ids: Sequence[str], *, level: str) -> list[dict[str, Any]]:
+def _write_planned_rows(
+    out_root: pathlib.Path,
+    task_ids: Sequence[str],
+    *,
+    level: str,
+    contract: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for task_id in task_ids:
         row = build_task_result_row(
@@ -149,6 +180,7 @@ def _write_planned_rows(out_root: pathlib.Path, task_ids: Sequence[str], *, leve
             masked_id=mask_task_id(task_id),
             infra_reason="dry_run",
             artifact_refs={"run_root": str(out_root)},
+            task_contract=contract,
         )
         append_cybergym_result(out_root, row)
         rows.append(row)
@@ -174,10 +206,12 @@ def _prepare_applied_settings(
         ) from exc
     if not isinstance(template, dict):
         raise CyberGymIntegrationUnavailable("settings template must contain a JSON object")
-    from devtools.benchmarks.common.manifests import write_json
+    from devtools.benchmarks.common.manifests import model_slot_snapshot, write_json
     from devtools.benchmarks.common.server_runner import build_isolated_settings
 
-    model = str(args.model or "").strip()
+    model = validate_model_pin(args.model, expected=OFFICIAL_MODEL)
+    budget_usd = validate_positive_finite(args.budget_usd, field="budget_usd")
+    timeout_sec = validate_positive_finite(args.timeout_sec, field="timeout_sec")
     overrides: dict[str, Any] = {
         "OUROBOROS_MODEL": model,
         "OUROBOROS_MODEL_LIGHT": model,
@@ -185,12 +219,13 @@ def _prepare_applied_settings(
         "OUROBOROS_MODEL_CONSCIOUSNESS": model,
         "OUROBOROS_MODEL_FALLBACKS": model,
         "OUROBOROS_MODEL_DEEP_SELF_REVIEW": model,
+        "OUROBOROS_WEBSEARCH_MODEL": model,
         "OUROBOROS_SCOPE_REVIEW_MODELS": model,
         "OUROBOROS_SCOPE_REVIEW_MODEL": model,
         "OUROBOROS_REVIEW_MODELS": ",".join([model] * 3),
         "OUROBOROS_MAX_SUBAGENT_DEPTH": 0,
-        "TOTAL_BUDGET": float(args.budget_usd),
-        "OUROBOROS_TASK_ABS_CEILING_SEC": int(float(args.timeout_sec)),
+        "TOTAL_BUDGET": budget_usd,
+        "OUROBOROS_TASK_ABS_CEILING_SEC": max(1, int(timeout_sec)),
     }
     # The provider pool is selected by a live probe in the sidecar lane.  Keep
     # the template's safe fallback-ready shape until that callback supplies an
@@ -200,12 +235,32 @@ def _prepare_applied_settings(
     applied = build_isolated_settings(template, **overrides)
     output_path = out_root / "settings_applied.json"
     write_json(output_path, applied)
+    model_slots = model_slot_snapshot(output_path, env_overrides=False)
+    applied_model = str(model_slots.get("OUROBOROS_MODEL") or "").strip()
+    if applied_model != model:
+        raise CyberGymIntegrationUnavailable(
+            "applied settings changed the pinned model: "
+            f"expected {model!r}, got {applied_model!r}"
+        )
+    model_mismatches = []
+    for key, value in model_slots.items():
+        if "MODEL" not in key or not value:
+            continue
+        configured = [item.strip() for item in str(value).split(",") if item.strip()]
+        if any(item != model for item in configured):
+            model_mismatches.append(key)
+    if model_mismatches:
+        raise CyberGymIntegrationUnavailable(
+            "applied settings contain non-pinned model slots: " + ", ".join(model_mismatches)
+        )
     return output_path, {
         "path": str(output_path),
         "template_path": str(template_path),
-        "model": model,
-        "budget_usd": float(args.budget_usd),
-        "task_abs_ceiling_sec": int(float(args.timeout_sec)),
+        "requested_model": model,
+        "model": applied_model,
+        "model_slots": model_slots,
+        "budget_usd": budget_usd,
+        "task_abs_ceiling_sec": max(1, int(timeout_sec)),
         "provider_policy": provider,
         "provider_probe_required": True,
         "keys": sorted(str(key) for key in applied if isinstance(key, str)),
@@ -218,6 +273,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Everything through this point is argument/path arithmetic.  In particular,
     # do not read tasks.json, inspect Docker, import the optional upstream package,
     # or create a directory before the shared admission manifest exists.
+    try:
+        args.model = validate_model_pin(args.model, expected=OFFICIAL_MODEL)
+        args.budget_usd = validate_positive_finite(args.budget_usd, field="budget_usd")
+        args.timeout_sec = validate_positive_finite(args.timeout_sec, field="timeout_sec")
+        if args.per_task_estimate_usd is not None:
+            args.per_task_estimate_usd = validate_positive_finite(
+                args.per_task_estimate_usd, field="per_task_estimate_usd"
+            )
+    except ValueError as exc:
+        print(f"[cybergym] pre-admission refusal: {exc}", file=sys.stderr)
+        return 2
     try:
         declared_ids = _declared_task_ids(args)
     except ValueError as exc:
@@ -335,12 +401,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             manifest["requested_task_ids"] = task_ids
             manifest["requested_count"] = len(task_ids)
 
+            contract = task_contract_metadata(
+                model=args.model,
+                level=DEFAULT_LEVEL,
+                source_pin=OFFICIAL_SOURCE_PIN,
+                data_revision=OFFICIAL_DATA_REVISION,
+                tasks_sha256=str(args.expected_tasks_sha256 or OFFICIAL_TASKS_SHA256),
+                final_poc_path=DEFAULT_FINAL_POC_PATH,
+                disabled_tools=DEFAULT_DISABLED_TOOLS,
+            )
+            manifest.setdefault("extra", {})["task_contract"] = contract
+
             applied_path, applied_metadata = _prepare_applied_settings(settings_path, out_root, args)
             manifest.setdefault("extra", {})["settings_snapshot"] = applied_metadata
             manifest.setdefault("output_paths", {})["settings_applied"] = str(applied_path)
+            manifest["model_slots"] = dict(applied_metadata.get("model_slots") or {})
+            manifest.setdefault("harness", {})["applied_model"] = str(
+                applied_metadata.get("model") or ""
+            )
 
             if args.dry_run:
-                rows = _write_planned_rows(out_root, task_ids, level=DEFAULT_LEVEL)
+                rows = _write_planned_rows(
+                    out_root, task_ids, level=DEFAULT_LEVEL, contract=contract
+                )
             else:
                 if args.per_task_estimate_usd is None:
                     raise CyberGymIntegrationUnavailable(
@@ -348,7 +431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 executor = _load_executor(args.executor)
                 rows = run_campaign(
-                    _task_specs(task_ids),
+                    _task_specs(task_ids, contract=contract),
                     run_root=out_root,
                     executor=executor,
                     estimated_cost_usd=float(args.per_task_estimate_usd),
