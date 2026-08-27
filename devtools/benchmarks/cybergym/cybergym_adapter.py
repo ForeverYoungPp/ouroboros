@@ -20,6 +20,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -40,8 +41,21 @@ DEFAULT_FINAL_POC_PATH = "/workspace/final.poc"
 DEFAULT_DISABLED_TOOLS = (
     "schedule_subagent",
     "delegate_start",
+    "delegate_wait",
+    "delegate_cancel",
+    "delegate_answer",
     "claude_code_edit",
     "web_search",
+    "browse_page",
+    "browser_action",
+    "youtube_transcript",
+    "analyze_screenshot",
+    "vlm_query",
+    "view_image",
+    "ocr_pdf",
+    "extract_video_frames",
+    "send_photo",
+    "switch_model",
     "browser",
 )
 
@@ -217,6 +231,40 @@ def task_contract_metadata(
         "data_revision": str(data_revision or ""),
         "tasks_sha256": str(tasks_sha256 or ""),
     }
+
+
+def derive_disabled_tools(extra: Iterable[str] = ()) -> tuple[str, ...]:
+    """Return the current non-shell escape/tool surfaces for a measured task.
+
+    The baseline is intentionally small and stable for CI.  After admission a
+    launcher may pass names discovered from the live tool registry; accepting
+    that explicit iterable keeps this helper independent of the runtime while
+    ensuring newly-added web, vision, delegation, or model-switch names are
+    recorded instead of silently reopening the capability.
+    """
+    names = {str(item).strip() for item in (*DEFAULT_DISABLED_TOOLS, *extra) if str(item).strip()}
+    # ``tool_capabilities`` is a runtime-owned registry, not a second policy
+    # table.  Import it lazily (after admission) and select only capability
+    # families that are intentionally absent from this benchmark; shell,
+    # file, and ordinary task tools remain available to the agent.
+    dynamic_families = {
+        "web_search", "browse_page", "browser_action", "youtube_transcript",
+        "analyze_screenshot", "vlm_query", "view_image", "ocr_pdf",
+        "extract_video_frames", "send_photo", "send_video", "switch_model",
+        "schedule_subagent", "delegate_start", "delegate_wait", "delegate_cancel",
+        "delegate_answer", "claude_code_edit", "wait_task", "wait_tasks",
+        "get_task_result", "peek_task", "cancel_task", "discard_child_result",
+        "task_acceptance_review", "request_deep_self_review",
+    }
+    try:
+        from ouroboros.tool_capabilities import CORE_TOOL_NAMES
+
+        names.update(str(item) for item in CORE_TOOL_NAMES if str(item) in dynamic_families)
+    except (ImportError, AttributeError):
+        # CI and external adapter users may not ship the Ouroboros runtime;
+        # the stable baseline above is still a valid declared contract there.
+        pass
+    return tuple(sorted(names))
 
 
 def _path(value: pathlib.Path | str | None) -> pathlib.Path | None:
@@ -463,6 +511,57 @@ def verify_pinned_file(
     if actual != expected:
         raise CyberGymPinRefused(f"{label} SHA-256 mismatch: expected {expected}, got {actual}")
     return {"label": label, "path": str(target), "sha256": actual, "size": len(raw)}
+
+
+def verify_mask_map(
+    path: pathlib.Path | str,
+    task_ids: Iterable[str],
+    *,
+    expected_sha256: str = "",
+) -> dict[str, Any]:
+    """Validate the upstream real-id -> opaque-id map for the selected rows.
+
+    The generator must receive this map; omitting it would put real CyberGym
+    identifiers in the agent-visible ``submit.sh``.  The mapping itself stays
+    private, while the digest/count and coverage are safe provenance facts.
+    """
+    target = pathlib.Path(path).expanduser().resolve(strict=False)
+    try:
+        raw = target.read_bytes()
+    except OSError as exc:
+        raise CyberGymPinRefused(f"mask map is unreadable: {target}") from exc
+    digest = hashlib.sha256(raw).hexdigest()
+    expected = str(expected_sha256 or "").strip().lower()
+    if expected and digest != expected:
+        raise CyberGymPinRefused(f"mask map SHA-256 mismatch: expected {expected}, got {digest}")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CyberGymPinRefused("mask map is not valid JSON") from exc
+    mapping = payload.get("mapping") if isinstance(payload, Mapping) and isinstance(payload.get("mapping"), Mapping) else payload
+    if not isinstance(mapping, Mapping):
+        raise CyberGymPinRefused("mask map must be a JSON object")
+    normalized_ids = [safe_task_id(str(item)) for item in task_ids]
+    missing = [item for item in normalized_ids if item not in mapping]
+    if missing:
+        raise CyberGymPinRefused("mask map is missing requested task ids: " + ", ".join(missing[:8]))
+    masked: list[str] = []
+    for task in normalized_ids:
+        value = mapping.get(task)
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", value):
+            raise CyberGymPinRefused(f"mask map contains an unsafe value for {task}")
+        masked.append(value)
+    if len(set(masked)) != len(masked):
+        raise CyberGymPinRefused("mask map contains duplicate opaque ids for the selected tasks")
+    return {
+        "label": "mask_map",
+        "path": str(target),
+        "sha256": digest,
+        "size": len(raw),
+        "entries": len(mapping),
+        "selected_entries": len(normalized_ids),
+        "coverage": "complete",
+    }
 
 
 def verify_source_checkout(
@@ -776,10 +875,23 @@ def _normalize_trial(value: Any, index: int) -> dict[str, Any]:
 def _choose_final(trials: list[dict[str, Any]], explicit: Any) -> dict[str, Any] | None:
     if explicit is not None:
         candidate = _normalize_trial(explicit, 0)
-        explicit_id = str(_first(_as_mapping(explicit), "trial_id", "attempt_id", "id") or "")
+        explicit_map = _as_mapping(explicit)
+        explicit_id = str(_first(explicit_map, "trial_id", "attempt_id", "id") or "")
+        # An explicit final designation is a binding claim, not a pointer to a
+        # stale row.  Require the identity fields needed to bind it to the
+        # bytes and verifier result that the caller actually observed.
+        if not candidate["poc_hash"] or not _HEX64.fullmatch(candidate["poc_hash"]):
+            raise ValueError("explicit final trial must include a valid poc_hash")
+        if candidate["vul_exit_code"] is None or candidate["fix_exit_code"] is None:
+            raise ValueError("explicit final trial must include both raw exit codes")
         if explicit_id:
             for trial in trials:
                 if trial["trial_id"] == explicit_id:
+                    for key in ("poc_hash", "vul_exit_code", "fix_exit_code"):
+                        if candidate.get(key) != trial.get(key):
+                            raise ValueError(f"explicit final trial conflicts with recorded {key}")
+                    if candidate.get("poc_id") and candidate.get("poc_id") != trial.get("poc_id"):
+                        raise ValueError("explicit final trial conflicts with recorded poc_id")
                     return trial
             if trials:
                 raise ValueError(f"explicit final trial id is not present: {explicit_id}")
@@ -915,6 +1027,7 @@ def build_task_result_row(
     status: str = "completed",
     lifecycle: str = "",
     masked_id: str = "",
+    masked_id_source: str = "",
     project: str = "",
     level: str = DEFAULT_LEVEL,
     observed_provider: str = "",
@@ -992,11 +1105,18 @@ def build_task_result_row(
             "task_contract": contract,
         },
     )
+    effective_masked_id = str(masked_id or "").strip()
+    effective_masked_source = str(masked_id_source or "").strip()
+    if not effective_masked_source:
+        effective_masked_source = (
+            "upstream_submit_response" if effective_masked_id else "local_digest_diagnostic"
+        )
     row.update(
         {
             "adapter_schema": RESULT_SCHEMA,
             "task_id": task,
-            "masked_id": masked_id or mask_task_id(task),
+            "masked_id": effective_masked_id or mask_task_id(task),
+            "masked_id_source": effective_masked_source,
             "project": project,
             "level": level,
             "trial_count": len(normalized),
@@ -1310,6 +1430,7 @@ def run_campaign(
     executor: Callable[[TaskSpec, pathlib.Path], Mapping[str, Any]] | None,
     estimated_cost_usd: float | None,
     budget_cap_usd: float | None = DEFAULT_BUDGET_CAP_USD,
+    max_workers: int = 1,
 ) -> list[dict[str, Any]]:
     """Run injected task callbacks under one atomic ledger.
 
@@ -1317,6 +1438,8 @@ def run_campaign(
     process custody.  A missing callback is an explicit blocked result; this
     seam never falls back to Docker, a shell, or a host network.
     """
+    if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
+        raise ValueError("max_workers must be a positive integer")
     root = pathlib.Path(run_root).expanduser().resolve(strict=False)
     normalized_tasks: list[TaskSpec] = []
     seen_task_ids: set[str] = set()
@@ -1327,8 +1450,7 @@ def run_campaign(
         seen_task_ids.add(task.task_id)
         normalized_tasks.append(task)
     ledger = BudgetLedger(root / "claims.jsonl", cap_usd=budget_cap_usd)
-    rows: list[dict[str, Any]] = []
-    for task in normalized_tasks:
+    def _run_one(task: TaskSpec) -> dict[str, Any]:
         contract = task.metadata.get("task_contract") if isinstance(task.metadata, Mapping) else None
         if executor is None:
             task_dir = safe_task_path(root, task.task_id)
@@ -1344,8 +1466,7 @@ def run_campaign(
                 task_contract=contract if isinstance(contract, Mapping) else None,
             )
             append_cybergym_result(root, row)
-            rows.append(row)
-            continue
+            return row
 
         claim: Mapping[str, Any] | None = None
         task_dir = safe_task_path(root, task.task_id)
@@ -1392,6 +1513,8 @@ def run_campaign(
                 status=requested_status,
                 lifecycle=str(outcome.get("lifecycle") or "completed"),
                 level=task.level,
+                masked_id=str(outcome.get("masked_id") or ""),
+                masked_id_source=str(outcome.get("masked_id_source") or ""),
                 observed_provider=str(outcome.get("observed_provider") or ""),
                 observed_model=str(outcome.get("observed_model") or ""),
                 observed_effort=str(outcome.get("observed_effort") or ""),
@@ -1427,5 +1550,14 @@ def run_campaign(
                 task_contract=contract if isinstance(contract, Mapping) else None,
             )
         append_cybergym_result(root, row)
-        rows.append(row)
-    return rows
+        return row
+
+    # A campaign may fan out independent tasks, but each task remains a
+    # single-agent/no-swarm attempt.  The ledger and result writer are locked;
+    # callers should choose the worker count from the measured pilot rather
+    # than treating this as an unbounded scheduler.
+    if max_workers == 1 or len(normalized_tasks) <= 1:
+        return [_run_one(task) for task in normalized_tasks]
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cybergym") as pool:
+        futures = [pool.submit(_run_one, task) for task in normalized_tasks]
+        return [future.result() for future in futures]

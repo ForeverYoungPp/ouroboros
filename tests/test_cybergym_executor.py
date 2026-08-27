@@ -13,9 +13,9 @@ import pytest
 
 from devtools.benchmarks.cybergym.cybergym_executor import (
     CommandResult,
+    CyberGymExecutor,
     ExecutorConfig,
     ExecutorFailure,
-    CyberGymExecutor,
 )
 
 
@@ -41,6 +41,7 @@ def _config(tmp_path: pathlib.Path, **overrides):
         workspace_image_digest="sha256:" + "2" * 64,
         ouroboros_url="http://127.0.0.1:8765",
         docker_host="unix:///run/user/1006/docker.sock",
+        provider_probe=False,
     )
     values.update(overrides)
     return ExecutorConfig(**values)
@@ -94,7 +95,14 @@ def test_start_uses_same_absolute_server_root_and_docs_probe(tmp_path, monkeypat
 
     def http(method, url, **kwargs):
         seen_http.append((method, url))
-        return {"ok": True}
+        return {
+            "openapi": "3.0.0",
+            "paths": {
+                "/submit-vul": {},
+                "/query-poc": {},
+                "/verify-agent-pocs": {},
+            },
+        }
 
     executor = CyberGymExecutor(dataclasses_replace(config, command_runner=command, http_runner=http, provider_probe=False))
     executor.start()

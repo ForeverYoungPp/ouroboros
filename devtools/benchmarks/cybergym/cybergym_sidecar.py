@@ -196,12 +196,21 @@ def _dns_slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "item"
 
 
-def make_opaque_agent_id(campaign_id: str, task_id: str) -> str:
-    """Derive a stable agent identifier without putting the task id in container-visible strings."""
+def make_opaque_agent_id(campaign_id: str, task_id: str, attempt_id: str = "") -> str:
+    """Derive an attempt-scoped agent id without exposing the task identity.
+
+    Reattaching the same attempt keeps the same id; a retry supplies a new
+    persisted ``attempt_id`` and therefore cannot collide with old PoC records.
+    The optional argument preserves the stable two-argument helper contract for
+    callers that only need a deterministic display id.
+    """
 
     campaign = _safe_id(campaign_id, "campaign_id")
     task = _safe_id(task_id, "task_id")
-    digest = hashlib.sha256(f"cybergym-agent\0{campaign}\0{task}".encode()).hexdigest()[:24]
+    attempt = ""
+    if attempt_id:
+        attempt = _safe_id(attempt_id, "attempt_id")
+    digest = hashlib.sha256(f"cybergym-agent\0{campaign}\0{task}\0{attempt}".encode()).hexdigest()[:24]
     return f"agent-{digest}"
 
 

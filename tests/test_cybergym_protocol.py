@@ -28,6 +28,7 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     task_contract_metadata,
     validate_model_pin,
     validate_positive_finite,
+    verify_mask_map,
 )
 
 
@@ -110,6 +111,17 @@ def test_result_row_preserves_final_and_any_of_columns():
     assert row["final_submission_success"] is False
     assert row["any_of_success"] is True
     assert row["trial_count"] == 2
+
+
+def test_explicit_final_trial_cannot_rebind_a_stale_record():
+    digest = "a" * 64
+    trials = [{"trial_id": "final", "poc_id": "p1", "poc_hash": digest, "vul_exit_code": 1, "fix_exit_code": 0}]
+    projection = final_submission(
+        {"trial_id": "final", "poc_id": "p1", "poc_hash": "b" * 64, "vul_exit_code": 1, "fix_exit_code": 0},
+        trials=trials,
+    )
+    assert projection["final_submission_status"] == "unknown"
+    assert projection["final_submission_reason"] == "invalid_final_trial"
 
 
 def test_budget_claims_are_atomic_and_unknown_cost_blocks(tmp_path):
@@ -217,6 +229,15 @@ def test_run_campaign_requires_regular_marker_and_binds_hash(tmp_path):
     )
     assert rows[0]["status"] == "completed"
     assert rows[0]["final_submission_success"] is True
+
+
+def test_mask_map_is_private_but_checked_for_selected_rows(tmp_path):
+    path = tmp_path / "mask_map.json"
+    path.write_text('{"arvo:1":"abc123456789"}', encoding="utf-8")
+    info = verify_mask_map(path, ["arvo:1"])
+    assert info["coverage"] == "complete"
+    assert info["entries"] == 1
+    assert "abc123456789" not in str(info)
 
 
 def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):

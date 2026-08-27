@@ -35,7 +35,6 @@ from devtools.benchmarks.common.run_roots import (
 from devtools.benchmarks.cybergym.cybergym_adapter import (
     BENCHMARK_NAME,
     DEFAULT_BUDGET_CAP_USD,
-    DEFAULT_DISABLED_TOOLS,
     DEFAULT_FINAL_POC_PATH,
     DEFAULT_LEVEL,
     OFFICIAL_DATA_REVISION,
@@ -49,16 +48,18 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     append_cybergym_result,
     build_generate_task_argv,
     build_task_result_row,
+    derive_disabled_tools,
     load_task_catalog,
     mask_task_id,
     pre_admission_report,
     run_campaign,
     safe_task_id,
+    source_tree_digest,
     task_contract_metadata,
     validate_model_pin,
     validate_positive_finite,
+    verify_mask_map,
     verify_source_checkout,
-    source_tree_digest,
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -73,7 +74,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-root", default="", help="CyberGym data directory")
     parser.add_argument("--tasks-file", default="", help="pinned tasks.json catalog")
     parser.add_argument("--task-id", action="append", default=[], help="task id (repeatable, e.g. arvo:47101)")
-    parser.add_argument("--server", default="", help="private CyberGym submit server URL")
+    parser.add_argument("--server", default="http://cybergym-internal:8666", help="private CyberGym submit server URL")
     parser.add_argument("--ouroboros-url", default="", help="Ouroboros gateway URL for the measured task")
     parser.add_argument("--docker-host", default="", help="explicit rootless Docker unix socket")
     parser.add_argument("--server-image", default="", help="pinned CyberGym server image")
@@ -81,6 +82,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workspace-image", default="", help="pinned Ouroboros workspace image")
     parser.add_argument("--workspace-image-digest", default="", help="resolved sha256 digest for workspace image")
     parser.add_argument("--server-root", default="", help="host root mounted at the same absolute path in the server sidecar")
+    parser.add_argument("--binary-dir", default="", help="pinned CyberGym binary directory inside server-root")
     parser.add_argument("--cybergym-api-key-env", default="CYBERGYM_API_KEY", help="host env name for the private verifier key")
     parser.add_argument("--mask-map", default="", help="task mask-map JSON")
     parser.add_argument("--difficulty", default=DEFAULT_LEVEL)
@@ -96,6 +98,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--per-task-estimate-usd", type=float, default=None,
                         help="finite reservation required for a paid injected executor")
     parser.add_argument("--timeout-sec", type=float, default=DEFAULT_TIMEOUT_SEC)
+    parser.add_argument("--workers", type=int, default=1,
+                        help="bounded cross-task lanes; freeze only after pilot validation")
     parser.add_argument("--executor", default="", help="post-admission module:function callback")
     parser.add_argument("--dry-run", action="store_true", help="write a protocol plan without invoking an executor")
     parser.add_argument("--allow-dirty-seed", action="store_true",
@@ -103,7 +107,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-source-sha256", default="")
     parser.add_argument("--expected-tasks-sha256", default=OFFICIAL_TASKS_SHA256)
     parser.add_argument("--expected-mask-sha256", default="")
+    parser.add_argument("--provider-only", action="append", default=[], help="OpenRouter provider id to allow (repeatable/comma-separated)")
+    parser.add_argument("--provider-order", action="append", default=[], help="OpenRouter provider order (repeatable/comma-separated)")
     return parser.parse_args(argv)
+
+
+def _csv_values(values: Sequence[str] | str | None) -> tuple[str, ...]:
+    """Normalize repeatable/comma-separated provider ids without I/O."""
+    raw = [values] if isinstance(values, str) else list(values or ())
+    result: list[str] = []
+    for item in raw:
+        result.extend(part.strip() for part in str(item).split(",") if part.strip())
+    return tuple(dict.fromkeys(result))
 
 
 def _sha256_file(path: pathlib.Path | str) -> str:
@@ -172,14 +187,20 @@ def _build_default_executor(args: argparse.Namespace, out_root: pathlib.Path) ->
         "--workspace-image": args.workspace_image,
         "--workspace-image-digest": args.workspace_image_digest,
         "--server-root": args.server_root,
+        "--binary-dir": args.binary_dir,
     }
     missing = [name for name, value in required.items() if not str(value or "").strip()]
     if missing:
         raise CyberGymIntegrationUnavailable(
             "concrete CyberGym executor requires " + ", ".join(missing)
         )
+    if not _csv_values(getattr(args, "provider_only", ())) or not _csv_values(getattr(args, "provider_order", ())):
+        raise CyberGymIntegrationUnavailable(
+            "concrete CyberGym executor requires both --provider-only and --provider-order"
+        )
     from devtools.benchmarks.cybergym.cybergym_executor import ExecutorConfig, build_executor
 
+    disabled_tools = derive_disabled_tools()
     config = ExecutorConfig(
         campaign_id=out_root.name,
         source_root=pathlib.Path(args.source_root),
@@ -187,15 +208,21 @@ def _build_default_executor(args: argparse.Namespace, out_root: pathlib.Path) ->
         mask_map=pathlib.Path(args.mask_map),
         run_root=out_root,
         server_root=pathlib.Path(args.server_root),
+        binary_dir=pathlib.Path(args.binary_dir),
         server_image=str(args.server_image),
         server_image_digest=str(args.server_image_digest),
         workspace_image=str(args.workspace_image),
         workspace_image_digest=str(args.workspace_image_digest),
         ouroboros_url=str(args.ouroboros_url),
         docker_host=str(args.docker_host),
+        model=str(args.model),
+        settings_path=out_root / "settings_applied.json",
         difficulty=str(args.difficulty or DEFAULT_LEVEL),
         task_timeout_sec=int(args.timeout_sec),
         api_key_env=str(args.cybergym_api_key_env),
+        provider_only=_csv_values(getattr(args, "provider_only", ())),
+        provider_order=_csv_values(getattr(args, "provider_order", ())),
+        disabled_tools=disabled_tools,
     )
     executor = build_executor(config)
 
@@ -206,6 +233,8 @@ def _build_default_executor(args: argparse.Namespace, out_root: pathlib.Path) ->
     # is kept alive by the callback.  ``main`` invokes close in its finally
     # path through the optional attribute below.
     setattr(callback, "close", executor.close)
+    setattr(callback, "prepare", executor.start)
+    setattr(callback, "executor", executor)
     return callback
 
 
@@ -251,6 +280,7 @@ def _write_planned_rows(
             artifact_refs={"run_root": str(out_root)},
             task_contract=contract,
         )
+        row["masked_id_source"] = "local_digest_diagnostic_not_upstream_mask"
         append_cybergym_result(out_root, row)
         rows.append(row)
     return rows
@@ -335,6 +365,25 @@ def _prepare_applied_settings(
     # the template's safe fallback-ready shape until that callback supplies an
     # evidence-backed ``only``/``order`` override.
     provider = {"allow_fallbacks": True, "require_parameters": True}
+    provider_only = _csv_values(getattr(args, "provider_only", ()))
+    provider_order = _csv_values(getattr(args, "provider_order", ()))
+    # ``argparse`` always supplies both flags for the production launcher.  A
+    # small library caller may omit them while rendering a settings snapshot;
+    # keep that pure helper usable, but never let the real paid CLI proceed
+    # without the explicit policy.
+    has_provider_flags = hasattr(args, "provider_only") or hasattr(args, "provider_order")
+    if not getattr(args, "dry_run", False) and has_provider_flags and (not provider_only or not provider_order):
+        raise CyberGymIntegrationUnavailable(
+            "paid CyberGym execution requires explicit provider-only and provider-order policy"
+        )
+    if provider_only and provider_order and not set(provider_only).issubset(provider_order):
+        raise CyberGymIntegrationUnavailable(
+            "provider-only entries must be included in provider-order"
+        )
+    if provider_only:
+        provider["only"] = list(provider_only)
+    if provider_order:
+        provider["order"] = list(provider_order)
     overrides["OUROBOROS_OR_PROVIDER"] = json.dumps(provider, separators=(",", ":"))
     applied = build_isolated_settings(template, **overrides)
     output_path = out_root / "settings_applied.json"
@@ -367,6 +416,7 @@ def _prepare_applied_settings(
         "task_abs_ceiling_sec": max(1, int(timeout_sec)),
         "provider_policy": provider,
         "provider_probe_required": True,
+        "provider_policy_complete": bool(provider_only or provider_order),
         "provider_credentials": provider_credential_disclosure(
             output_path
         ),
@@ -389,6 +439,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.model = validate_model_pin(args.model, expected=OFFICIAL_MODEL)
         args.budget_usd = validate_positive_finite(args.budget_usd, field="budget_usd")
         args.timeout_sec = validate_positive_finite(args.timeout_sec, field="timeout_sec")
+        if isinstance(args.workers, bool) or int(args.workers) < 1:
+            raise ValueError("workers must be a positive integer")
         if args.per_task_estimate_usd is not None:
             args.per_task_estimate_usd = validate_positive_finite(
                 args.per_task_estimate_usd, field="per_task_estimate_usd"
@@ -459,7 +511,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "difficulty": str(args.difficulty),
                 "server": str(args.server),
                 "timeout_sec": float(args.timeout_sec),
-                "executor": bool(args.executor),
+                "executor": str(args.executor or "concrete_sidecar"),
+                "workers": int(args.workers),
+                "provider_only": list(_csv_values(getattr(args, "provider_only", ()))),
+                "provider_order": list(_csv_values(getattr(args, "provider_order", ()))),
             },
             official_command=_generator_template(args),
             isolated_data_root=str(args.data_root or ""),
@@ -499,27 +554,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     require_clean=True,
                 )
                 manifest["extra"]["cybergym_source"] = source_provenance
+                observed_source_digest = source_tree_digest(args.source_root)
                 expected_source_digest = str(args.expected_source_sha256 or "").strip().lower()
-                if expected_source_digest:
-                    observed_source_digest = source_tree_digest(args.source_root)
-                    if observed_source_digest != expected_source_digest:
-                        raise CyberGymError(
-                            "source tree SHA-256 mismatch: "
-                            f"expected {expected_source_digest}, got {observed_source_digest}"
-                        )
-                    manifest["extra"]["cybergym_source"]["tree_sha256"] = observed_source_digest
-                mask_digest = _sha256_file(args.mask_map)
-                expected_mask = str(args.expected_mask_sha256 or "").strip().lower()
-                if expected_mask and mask_digest != expected_mask:
+                if expected_source_digest and observed_source_digest != expected_source_digest:
                     raise CyberGymError(
-                        f"mask map SHA-256 mismatch: expected {expected_mask}, got {mask_digest}"
+                        "source tree SHA-256 mismatch: "
+                        f"expected {expected_source_digest}, got {observed_source_digest}"
                     )
-                mask_info = {
-                    "label": "mask_map",
-                    "path": str(pathlib.Path(args.mask_map).resolve(strict=False)),
-                    "sha256": mask_digest,
-                    "size": pathlib.Path(args.mask_map).stat().st_size,
-                }
+                manifest["extra"]["cybergym_source"]["tree_sha256"] = observed_source_digest
+                expected_mask = str(args.expected_mask_sha256 or "").strip().lower()
+                if not expected_mask:
+                    raise CyberGymError("paid CyberGym execution requires --expected-mask-sha256")
+                mask_info = verify_mask_map(args.mask_map, declared_ids, expected_sha256=expected_mask)
                 manifest["extra"]["mask_map"] = mask_info
             if args.tasks_file:
                 catalog = load_task_catalog(
@@ -535,6 +581,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else:
                     task_ids = list(catalog["task_ids"])
                 manifest["extra"]["task_catalog"] = catalog
+                if not args.dry_run and catalog is not None:
+                    # When no explicit subset was supplied, validate coverage
+                    # against the complete pinned order as well; a partial map
+                    # must never silently become a different denominator.
+                    if not declared_ids:
+                        manifest["extra"]["mask_map"] = verify_mask_map(
+                            args.mask_map, catalog["task_ids"], expected_sha256=str(args.expected_mask_sha256).lower()
+                        )
             if not task_ids:
                 final.update({
                     "outcome": "refused",
@@ -554,14 +608,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 data_revision=OFFICIAL_DATA_REVISION,
                 tasks_sha256=str(args.expected_tasks_sha256 or OFFICIAL_TASKS_SHA256),
                 final_poc_path=DEFAULT_FINAL_POC_PATH,
-                disabled_tools=DEFAULT_DISABLED_TOOLS,
+                disabled_tools=derive_disabled_tools(),
             )
+            if isinstance(manifest.get("extra", {}).get("mask_map"), Mapping):
+                contract["mask_map_sha256"] = str(
+                    manifest["extra"]["mask_map"].get("sha256") or ""
+                )
             manifest.setdefault("extra", {})["task_contract"] = contract
 
             applied_path, applied_metadata = _prepare_applied_settings(settings_path, out_root, args)
             manifest.setdefault("extra", {})["settings_snapshot"] = applied_metadata
             manifest.setdefault("output_paths", {})["settings_applied"] = str(applied_path)
             manifest["model_slots"] = dict(applied_metadata.get("model_slots") or {})
+            manifest["provider_credentials"] = dict(applied_metadata.get("provider_credentials") or {})
             manifest.setdefault("harness", {})["applied_model"] = str(
                 applied_metadata.get("model") or ""
             )
@@ -581,13 +640,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else _build_default_executor(args, out_root)
                 )
                 try:
+                    prepare = getattr(executor, "prepare", None)
+                    if callable(prepare):
+                        # Provider/network readiness is established before the
+                        # first budget claim, so a failed probe cannot consume
+                        # a task reservation or masquerade as a model result.
+                        prepare()
+                        executor_obj = getattr(executor, "executor", None)
+                        if executor_obj is not None:
+                            manifest["extra"]["provider_probe"] = dict(
+                                getattr(executor_obj, "provider_observation", {})
+                            )
                     rows = run_campaign(
                         _task_specs(task_ids, contract=contract),
                         run_root=out_root,
                         executor=executor,
                         estimated_cost_usd=float(args.per_task_estimate_usd),
                         budget_cap_usd=float(args.budget_usd),
+                        max_workers=int(args.workers),
                     )
+                    executor_obj = getattr(executor, "executor", None)
+                    if executor_obj is not None:
+                        manifest["extra"]["provider_probe"] = dict(getattr(executor_obj, "provider_observation", {}))
                 finally:
                     close = getattr(executor, "close", None)
                     if callable(close):
