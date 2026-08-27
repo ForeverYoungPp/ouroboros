@@ -7,6 +7,7 @@ import importlib
 import pytest
 
 sidecar = importlib.import_module("devtools.benchmarks.cybergym.cybergym_sidecar")
+IMAGE_DIGEST = "sha256:" + "a" * 64
 
 
 def _plan():
@@ -32,7 +33,7 @@ def _observation(plan, host, *, wildcard=False, workspace_socket=False, mode=Non
     server = {
         "Id": "server-123",
         "Name": "/cyber-server",
-        "Config": {"Labels": labels_server, "RepoDigests": ["cyber/server@sha256:" + "a" * 64]},
+        "Config": {"Labels": labels_server, "RepoDigests": [f"cyber/server@{IMAGE_DIGEST}"]},
         "State": {"Pid": 101, "Running": True},
         "HostConfig": {"NetworkMode": mode or plan.network_name},
         "NetworkSettings": {
@@ -47,7 +48,7 @@ def _observation(plan, host, *, wildcard=False, workspace_socket=False, mode=Non
     workspace = {
         "Id": "workspace-123",
         "Name": "/cyber-workspace",
-        "Config": {"Labels": labels_workspace},
+        "Config": {"Labels": labels_workspace, "RepoDigests": [f"cyber/worker@{IMAGE_DIGEST}"]},
         "State": {"Pid": 202, "Running": True},
         "HostConfig": {"NetworkMode": plan.network_name},
         "NetworkSettings": {"Networks": {plan.network_name: workspace_network}},
@@ -86,11 +87,27 @@ def test_network_plan_aliases_and_no_proxy_are_deterministic():
     first, second = _plan(), sidecar.build_network_plan("camp-7", "task-42", 8080, 18080)
     assert first.server_alias == second.server_alias
     assert first.workspace_alias == second.workspace_alias
+    assert first.task_id not in first.workspace_alias
+    assert first.opaque_agent_id in first.workspace_alias
+    workspace_labels = sidecar.required_resource_labels(first, "workspace")
+    assert workspace_labels["com.ouroboros.task"] == first.opaque_agent_id
+    assert first.task_id not in repr(workspace_labels)
     assert first.network_name == "cybergym-internal"
     assert first.no_proxy == f"{first.server_alias},{first.server_alias}:8080"
     assert sidecar.build_no_proxy(first.server_alias, 8080, existing="localhost") == f"localhost,{first.server_alias},{first.server_alias}:8080"
     with pytest.raises(sidecar.SidecarConfigurationError):
         sidecar.build_no_proxy("*", 8080)
+    with pytest.raises(sidecar.SidecarConfigurationError):
+        sidecar.build_network_plan("camp-7", "task-42", 8080, 18080, workspace_alias="task-42-agent")
+
+
+def test_opaque_agent_id_is_stable_and_task_free():
+    first = sidecar.make_opaque_agent_id("camp-7", "task-42")
+    assert first == sidecar.make_opaque_agent_id("camp-7", "task-42")
+    assert first.startswith("agent-") and len(first) == len("agent-") + 24
+    assert "task-42" not in first
+    short_plan = sidecar.build_network_plan("camp-7", "x", 8080, 18080)
+    assert short_plan.task_id not in short_plan.workspace_alias
 
 
 def test_network_argv_uses_internal_named_network_and_explicit_daemon():
@@ -120,9 +137,16 @@ def test_server_and_workspace_argv_preserve_socket_boundary():
     assert "--mount" in workspace_argv and host.socket_path not in workspace_argv
     assert f"CYBERGYM_SERVER_URL={plan.server_url}" in workspace_argv
     assert f"NO_PROXY={plan.no_proxy}" in workspace_argv
+    assert f"CYBERGYM_AGENT_ID={plan.opaque_agent_id}" in workspace_argv
+    assert "CYBERGYM_TASK_ID" not in " ".join(workspace_argv)
+    assert plan.task_id not in " ".join(workspace_argv)
     assert all("real-secret" not in item for item in server_argv + workspace_argv)
     with pytest.raises(sidecar.SidecarConfigurationError):
         sidecar.WorkspaceCommandSpec(host, plan, "cyber/worker:pin", "cyber-workspace", "/tmp/cyber-task", extra_env={"API_TOKEN": "real-secret"})
+    with pytest.raises(sidecar.SidecarConfigurationError):
+        sidecar.WorkspaceCommandSpec(host, plan, "cyber/worker:pin", "cyber-workspace", "/tmp/cyber-task", extra_env={"TASK_HINT": "task-42"})
+    with pytest.raises(sidecar.SidecarConfigurationError):
+        sidecar.WorkspaceCommandSpec(host, plan, "cyber/worker:pin", "cyber-workspace", "/tmp/cyber-task", labels={"hint": "task-42"})
 
 
 def test_forbidden_network_modes_and_wildcard_bind_fail_closed():
@@ -136,7 +160,7 @@ def test_forbidden_network_modes_and_wildcard_bind_fail_closed():
 
 def test_executor_host_declaration_is_not_docker_host_networking():
     plan, host = _plan(), _host()
-    expectation = sidecar.SidecarExpectation(plan, host, "cyber-server", "cyber-workspace", "server-123", "workspace-123", "net-123", host.socket_path, server_pid=101, workspace_pid=202)
+    expectation = sidecar.SidecarExpectation(plan, host, "cyber-server", "cyber-workspace", "server-123", "workspace-123", "net-123", host.socket_path, image_digest=IMAGE_DIGEST, server_pid=101, workspace_pid=202)
     report = sidecar.check_sidecar_attestation(
         _observation(plan, host), expectation, api_key={"present": True, "placeholder": False}, connectivity=_connectivity()
     )
@@ -160,7 +184,7 @@ def test_connectivity_requires_all_positive_and_negative_facts():
 
 def test_attestation_rejects_socket_leak_wildcard_and_default_bridge():
     plan, host = _plan(), _host()
-    expectation = sidecar.SidecarExpectation(plan, host, "cyber-server", "cyber-workspace", "server-123", "workspace-123", "net-123", host.socket_path, server_pid=101, workspace_pid=202)
+    expectation = sidecar.SidecarExpectation(plan, host, "cyber-server", "cyber-workspace", "server-123", "workspace-123", "net-123", host.socket_path, image_digest=IMAGE_DIGEST, server_pid=101, workspace_pid=202)
     for observation in (
         _observation(plan, host, workspace_socket=True),
         _observation(plan, host, wildcard=True),
@@ -170,16 +194,53 @@ def test_attestation_rejects_socket_leak_wildcard_and_default_bridge():
         assert report["ok"] is False
 
 
+def test_attestation_requires_resolved_digest_on_each_container():
+    plan, host = _plan(), _host()
+    expectation = sidecar.SidecarExpectation(
+        plan, host, "cyber-server", "cyber-workspace", "server-123", "workspace-123", "net-123", host.socket_path,
+        image_digest=IMAGE_DIGEST,
+    )
+    observation = _observation(plan, host)
+    observation["workspace"]["Config"].pop("RepoDigests")
+    report = sidecar.check_sidecar_attestation(observation, expectation, api_key="valid-key", connectivity=_connectivity())
+    assert report["ok"] is False
+    assert "workspace.image_digest" in report["failed_checks"]
+
+
 def test_cleanup_is_exact_and_never_broad():
     plan, host = _plan(), _host()
-    expectation = sidecar.SidecarExpectation(plan, host, "cyber-server", "cyber-workspace", "server-123", "workspace-123", "net-123", host.socket_path)
+    expectation = sidecar.SidecarExpectation(plan, host, "cyber-server", "cyber-workspace", "server-123", "workspace-123", "net-123", host.socket_path, image_digest=IMAGE_DIGEST)
     cleanup = sidecar.build_cleanup_plan(expectation)
     commands = sidecar.cleanup_argv(cleanup)
     assert commands[0] == ("docker", "--host", host.value, "rm", "--force", "workspace-123", "server-123")
     assert commands[1][-2:] == ("rm", "net-123")
     assert all("prune" not in item and "*" not in item for command in commands for item in command)
-    assert sidecar.validate_cleanup_observation({"removed_container_ids": ["workspace-123", "server-123"], "network_removed": True}, cleanup)["ok"] is True
-    assert sidecar.validate_cleanup_observation({"removed_container_ids": ["workspace-123", "server-123", "other"], "network_removed": True}, cleanup)["ok"] is False
+    good = {
+        "removed_container_ids": ["workspace-123", "server-123"],
+        "network_removed": True,
+        "removed_network_id": "net-123",
+        "ownership": {"campaign_id": plan.campaign_id, "container_ids": ["workspace-123", "server-123"], "network_id": "net-123"},
+    }
+    assert sidecar.validate_cleanup_observation(good, cleanup)["ok"] is True
+    assert sidecar.validate_cleanup_observation({**good, "removed_container_ids": ["workspace-123", "server-123", "other"]}, cleanup)["ok"] is False
+    assert sidecar.validate_cleanup_observation({key: value for key, value in good.items() if key != "ownership"}, cleanup)["ok"] is False
+    assert sidecar.validate_cleanup_observation({**good, "removed_network_id": "other-network"}, cleanup)["ok"] is False
+    conflicting_owner = {**good, "ownership": {**good["ownership"], "owner_label": "com.ouroboros.campaign=other"}}
+    assert sidecar.validate_cleanup_observation(conflicting_owner, cleanup)["ok"] is False
+
+
+def test_cleanup_requires_resolved_network_id_and_never_falls_back_to_name():
+    plan, host = _plan(), _host()
+    with pytest.raises(sidecar.SidecarConfigurationError):
+        sidecar.CleanupPlan(host, plan.campaign_id, server_container_id="server-123")
+    with pytest.raises(sidecar.SidecarConfigurationError):
+        sidecar.CleanupPlan(host, plan.campaign_id, network_id="net-123", workspace_container_ids="workspace-123")
+    expectation = sidecar.SidecarExpectation(
+        plan, host, "cyber-server", "cyber-workspace", "server-123", "workspace-123", None, host.socket_path,
+        image_digest=IMAGE_DIGEST,
+    )
+    with pytest.raises(sidecar.SidecarConfigurationError):
+        sidecar.build_cleanup_plan(expectation)
 
 
 def test_api_key_status_never_returns_secret():
@@ -189,6 +250,14 @@ def test_api_key_status_never_returns_secret():
     assert sidecar.is_placeholder_api_key("placeholder") is True
     with pytest.raises(sidecar.SidecarConfigurationError):
         sidecar.require_api_key("placeholder")
+
+
+def test_production_expectation_requires_resolved_image_digest():
+    plan, host = _plan(), _host()
+    with pytest.raises(sidecar.SidecarConfigurationError, match="image_digest"):
+        sidecar.SidecarExpectation(plan, host, "cyber-server", "cyber-workspace")
+    with pytest.raises(sidecar.SidecarConfigurationError, match="image digest"):
+        sidecar.SidecarExpectation(plan, host, "cyber-server", "cyber-workspace", image_digest="cyber/server:latest")
 
 
 def test_process_custody_attests_pid_cwd_and_port_without_spawning():

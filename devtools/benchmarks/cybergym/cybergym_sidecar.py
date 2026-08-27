@@ -174,14 +174,28 @@ def docker_host_environment(host: str | DockerHostRef) -> dict[str, str]:
     return dict(resolve_rootless_docker_host(host).env)
 
 
+def _dns_slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "item"
+
+
+def make_opaque_agent_id(campaign_id: str, task_id: str) -> str:
+    """Derive a stable agent identifier without putting the task id in container-visible strings."""
+
+    campaign = _safe_id(campaign_id, "campaign_id")
+    task = _safe_id(task_id, "task_id")
+    digest = hashlib.sha256(f"cybergym-agent\0{campaign}\0{task}".encode()).hexdigest()[:24]
+    return f"agent-{digest}"
+
+
 def make_dns_alias(campaign_id: str, role: str, task_id: str = "") -> str:
     campaign = _safe_id(campaign_id, "campaign_id")
     role = _safe_id(role, "role").lower()
-    task = _safe_id(task_id, "task_id") if task_id else "campaign"
-    digest = hashlib.sha256(f"{campaign}\0{role}\0{task}".encode()).hexdigest()[:10]
-    def slug(item: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "-", item.lower()).strip("-") or "item"
-    prefix = f"cybergym-{slug(role)}-{slug(campaign)}-{slug(task)}"
+    if role == "workspace" and task_id:
+        task_component = make_opaque_agent_id(campaign, task_id)
+    else:
+        task_component = "campaign"
+    digest = hashlib.sha256(f"{campaign}\0{role}\0{task_component}".encode()).hexdigest()[:10]
+    prefix = f"cybergym-{_dns_slug(role)}-{_dns_slug(campaign)}-{_dns_slug(task_component)}"
     return _dns_label((prefix[:52].rstrip("-") + "-" + digest)[:63], "dns_alias")
 
 
@@ -196,6 +210,7 @@ class NetworkPlan:
     workspace_alias: str = ""
     server_container_port: int | None = None
     verifier_bind_host: str = LOOPBACK_HOST
+    opaque_agent_id: str = ""
 
     def __post_init__(self) -> None:
         campaign = _safe_id(self.campaign_id, "campaign_id")
@@ -210,10 +225,21 @@ class NetworkPlan:
         object.__setattr__(self, "task_id", task)
         object.__setattr__(self, "server_container_port", container_port)
         object.__setattr__(self, "verifier_bind_host", _loopback(self.verifier_bind_host, "verifier_bind_host"))
+        _reject_task_exposure((campaign,), self)
+        agent_id = self.opaque_agent_id or make_opaque_agent_id(campaign, task)
+        if not isinstance(agent_id, str) or not re.fullmatch(r"agent-[0-9a-f]{24}", agent_id):
+            raise SidecarConfigurationError("opaque_agent_id must be an agent-<24 hex> value")
         server_alias = self.server_alias or make_dns_alias(campaign, "server")
-        workspace_alias = self.workspace_alias or make_dns_alias(campaign, "workspace", task)
+        workspace_alias = self.workspace_alias or f"cybergym-workspace-{agent_id}"
+        if self.workspace_alias:
+            _reject_task_exposure((workspace_alias,), self)
+        # The server alias is injected into the workspace URL/NO_PROXY too.
+        # Reject a campaign spelling that would smuggle the raw task id into
+        # either DNS name, including when a caller supplied a custom alias.
+        _reject_task_exposure((server_alias, workspace_alias), self)
         object.__setattr__(self, "server_alias", _dns_label(server_alias, "server_alias"))
         object.__setattr__(self, "workspace_alias", _dns_label(workspace_alias, "workspace_alias"))
+        object.__setattr__(self, "opaque_agent_id", agent_id)
         if self.server_alias == self.workspace_alias:
             raise SidecarConfigurationError("server and workspace aliases must differ")
 
@@ -240,6 +266,7 @@ def build_network_plan(
     workspace_alias: str | None = None,
     verifier_bind_host: str = LOOPBACK_HOST,
     server_container_port: int | None = None,
+    opaque_agent_id: str | None = None,
 ) -> NetworkPlan:
     return NetworkPlan(
         campaign_id,
@@ -250,6 +277,7 @@ def build_network_plan(
         workspace_alias=workspace_alias or "",
         verifier_bind_host=verifier_bind_host,
         server_container_port=server_container_port,
+        opaque_agent_id=opaque_agent_id or "",
     )
 
 
@@ -358,6 +386,13 @@ def _digest(value: str | None) -> str | None:
     return value
 
 
+def _required_digest(value: str | None, name: str = "image_digest") -> str:
+    value = _digest(value)
+    if value is None:
+        raise SidecarConfigurationError(f"{name} is required for production custody")
+    return value
+
+
 def _env_name(value: str) -> str:
     value = _text(value, "environment name")
     if not _ENV_NAME.fullmatch(value):
@@ -374,6 +409,24 @@ def _safe_env_items(values: Mapping[str, str]) -> None:
             raise SidecarConfigurationError(f"secret-bearing environment must be injected by name only: {key}")
 
 
+def _reject_task_exposure(values: Iterable[str], plan: NetworkPlan) -> None:
+    task = plan.task_id.lower()
+    slug = _dns_slug(task)
+
+    def _contains_token(value: str, token: str) -> bool:
+        if not token:
+            return False
+        pattern = rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])"
+        return re.search(pattern, value) is not None
+
+    for value in values:
+        if not isinstance(value, str):
+            raise SidecarConfigurationError("workspace command/environment must contain strings")
+        lowered = value.lower()
+        if _contains_token(lowered, task) or _contains_token(lowered, slug):
+            raise SidecarConfigurationError("workspace command/environment must use opaque_agent_id, not task_id")
+
+
 def _mount_path(value: str, name: str) -> str:
     value = _safe_path(value, name)
     if "," in value:
@@ -385,11 +438,14 @@ def _labels(plan: NetworkPlan, role: str, custom: Mapping[str, str] | None = Non
     role = _safe_id(role, "role").lower()
     if role not in {"server", "workspace"}:
         raise SidecarConfigurationError("unsupported sidecar role")
+    task_label = "campaign" if role == "server" else plan.opaque_agent_id
+    agent_label = "campaign" if role == "server" else plan.opaque_agent_id
     result = {
         "com.ouroboros.benchmark": "cybergym",
         "com.ouroboros.run": plan.campaign_id,
         "com.ouroboros.campaign": plan.campaign_id,
-        "com.ouroboros.task": plan.task_id,
+        "com.ouroboros.task": task_label,
+        "com.ouroboros.agent_id": agent_label,
         "com.ouroboros.role": role,
         "com.ouroboros.network": plan.network_name,
         "com.ouroboros.owner": "ouroboros",
@@ -477,6 +533,10 @@ class WorkspaceCommandSpec:
         for item in self.command:
             _text(item, "command argument", max_len=4096)
         _safe_env_items(self.extra_env)
+        _reject_task_exposure(self.extra_env.values(), self.plan)
+        _reject_task_exposure((*self.labels.keys(), *self.labels.values()), self.plan)
+        if self.container_docker_host:
+            _reject_task_exposure((self.container_docker_host,), self.plan)
         _labels(self.plan, "workspace", self.labels)
 
 
@@ -547,7 +607,7 @@ def build_workspace_argv(spec: WorkspaceCommandSpec) -> list[str]:
         "--mount", _mount_arg(spec.workspace_host_path, spec.workspace_container_path),
         "--env", f"CYBERGYM_SERVER_URL={plan.server_url}",
         "--env", f"NO_PROXY={no_proxy}", "--env", f"no_proxy={no_proxy}",
-        "--env", f"CYBERGYM_TASK_ID={plan.task_id}",
+        "--env", f"CYBERGYM_AGENT_ID={plan.opaque_agent_id}",
     ))
     if spec.container_docker_host:
         argv.extend(("--env", f"{DOCKER_HOST_ENV}={_text(spec.container_docker_host, 'container_docker_host')}"))
@@ -618,7 +678,8 @@ class SidecarExpectation:
             if path != host.socket_path:
                 raise SidecarConfigurationError("socket_path must equal selected rootless socket")
             object.__setattr__(self, "socket_path", path)
-        _digest(self.image_digest)
+        digest = _required_digest(self.image_digest)
+        object.__setattr__(self, "image_digest", digest)
         for value, name in ((self.server_pid, "server_pid"), (self.workspace_pid, "workspace_pid")):
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
                 raise SidecarConfigurationError(f"{name} must be positive")
@@ -989,6 +1050,16 @@ def _owned_target(value: str, name: str) -> str:
 
 @dataclass(frozen=True)
 class CleanupPlan:
+    """Exact, campaign-owned Docker cleanup targets.
+
+    ``network_id`` is deliberately mandatory even though the human-readable
+    network name is retained for attestation/reporting.  A name fallback can
+    resolve to an unrelated network after a retry or concurrent campaign.
+    Cleanup observations must carry the campaign ownership evidence described
+    by :func:`validate_cleanup_observation` before a caller treats removal as
+    complete.
+    """
+
     docker_host: str | DockerHostRef
     campaign_id: str
     network_name: str = NETWORK_NAME
@@ -998,17 +1069,27 @@ class CleanupPlan:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "docker_host", _host(self.docker_host))
-        _safe_id(self.campaign_id, "campaign_id")
+        campaign = _safe_id(self.campaign_id, "campaign_id")
+        object.__setattr__(self, "campaign_id", campaign)
         if self.network_name != NETWORK_NAME:
             raise SidecarConfigurationError("cleanup network must be cybergym-internal")
         if self.server_container_id is None and not self.workspace_container_ids:
             raise SidecarConfigurationError("cleanup requires owned container ids")
+        if isinstance(self.workspace_container_ids, (str, bytes, Mapping)):
+            raise SidecarConfigurationError("workspace_container_ids must be an iterable of ids")
         if self.server_container_id is not None:
-            _owned_target(self.server_container_id, "server_container_id")
-        for value in self.workspace_container_ids:
-            _owned_target(value, "workspace_container_id")
-        if self.network_id is not None:
-            _owned_target(self.network_id, "network_id")
+            object.__setattr__(self, "server_container_id", _owned_target(self.server_container_id, "server_container_id"))
+        workspace_ids = tuple(_owned_target(value, "workspace_container_id") for value in self.workspace_container_ids)
+        object.__setattr__(self, "workspace_container_ids", workspace_ids)
+        if self.network_id is None:
+            raise SidecarConfigurationError("cleanup requires an explicit resolved network_id")
+        object.__setattr__(self, "network_id", _owned_target(self.network_id, "network_id"))
+
+    @property
+    def owner_label(self) -> str:
+        """Canonical campaign label that cleanup evidence must attest."""
+
+        return f"com.ouroboros.campaign={self.campaign_id}"
 
 
 def build_cleanup_plan(
@@ -1017,15 +1098,20 @@ def build_cleanup_plan(
     workspace_container_ids: Iterable[str] = (),
     network_id: str | None = None,
 ) -> CleanupPlan:
+    if isinstance(workspace_container_ids, (str, bytes, Mapping)):
+        raise SidecarConfigurationError("workspace_container_ids must be an iterable of ids")
     workspace_ids = tuple(workspace_container_ids)
     if not workspace_ids and expected.workspace_container_id is not None:
         workspace_ids = (expected.workspace_container_id,)
+    resolved_network_id = expected.network_id if network_id is None else network_id
+    if network_id is not None and expected.network_id is not None and network_id != expected.network_id:
+        raise SidecarConfigurationError("cleanup network_id does not match attested expectation")
     return CleanupPlan(
         expected.docker_host,
         expected.plan.campaign_id,
         server_container_id=expected.server_container_id,
         workspace_container_ids=workspace_ids,
-        network_id=network_id or expected.network_id,
+        network_id=resolved_network_id,
     )
 
 
@@ -1038,7 +1124,7 @@ def cleanup_argv(plan: CleanupPlan) -> tuple[tuple[str, ...], ...]:
     commands: list[tuple[str, ...]] = []
     if targets:
         commands.append(("docker", "--host", plan.docker_host.value, "rm", "--force", *targets))
-    commands.append(("docker", "--host", plan.docker_host.value, "network", "rm", plan.network_id or plan.network_name))
+    commands.append(("docker", "--host", plan.docker_host.value, "network", "rm", plan.network_id))
     return tuple(commands)
 
 
@@ -1046,26 +1132,70 @@ build_cleanup_commands = cleanup_argv
 
 
 def validate_cleanup_observation(observation: Mapping[str, Any], plan: CleanupPlan) -> dict[str, Any]:
-    removed = observation.get("removed_container_ids", ())
-    removed_ids = (
-        {item for item in removed if isinstance(item, str)}
-        if isinstance(removed, Iterable) and not isinstance(removed, (str, bytes))
-        else set()
-    )
+    """Validate exact removals plus explicit campaign ownership evidence.
+
+    The runner may put ownership facts in an ``ownership`` mapping (the
+    canonical wire shape) or at the top level for compatibility.  In either
+    shape all three facts are required: the campaign label, the complete set
+    of owned container ids, and the owned network id.  Missing or malformed
+    facts fail closed; no network-name or ``all`` fallback is accepted.
+    """
+
+    def _id_tuple(value: Any) -> tuple[str, ...] | None:
+        if isinstance(value, (str, bytes, Mapping)) or not isinstance(value, Iterable):
+            return None
+        values = tuple(value)
+        if any(not isinstance(item, str) for item in values):
+            return None
+        if len(set(values)) != len(values):
+            return None
+        return values
+
+    removed = _id_tuple(observation.get("removed_container_ids", ()))
+    removed_ids = set(removed or ())
     expected = set(plan.workspace_container_ids)
     if plan.server_container_id is not None:
         expected.add(plan.server_container_id)
     network_removed = observation.get("network_removed") is True
     unexpected = removed_ids - expected
     observed_network = observation.get("removed_network_id")
-    network_target = plan.network_id or plan.network_name
-    network_matches = observed_network is None or observed_network == network_target
-    ok = expected == removed_ids and network_removed and network_matches
+    network_matches = observed_network == plan.network_id
+
+    ownership = observation.get("ownership")
+    ownership_map = ownership if isinstance(ownership, Mapping) else {}
+    owner_campaign = observation.get("owner_campaign_id")
+    if owner_campaign is None:
+        owner_campaign = ownership_map.get("campaign_id")
+    owner_label = observation.get("owner_label")
+    if owner_label is None:
+        owner_label = ownership_map.get("owner_label")
+    owned_raw = observation.get("owned_container_ids")
+    if owned_raw is None:
+        owned_raw = ownership_map.get("container_ids")
+    owned = _id_tuple(owned_raw)
+    owned_ids = set(owned or ())
+    owned_network = observation.get("owned_network_id")
+    if owned_network is None:
+        owned_network = ownership_map.get("network_id")
+    campaign_matches = (
+        (owner_campaign == plan.campaign_id and (owner_label is None or owner_label == plan.owner_label))
+        or (owner_campaign is None and owner_label == plan.owner_label)
+    )
+    containers_match = owned is not None and owned_ids == expected
+    owned_network_matches = owned_network == plan.network_id
+    ownership_ok = campaign_matches and containers_match and owned_network_matches
+    ok = expected == removed_ids and removed is not None and network_removed and network_matches and ownership_ok
     return {
         "schema": f"{SCHEMA_VERSION}.cleanup", "ok": ok, "expected_container_ids": sorted(expected),
-        "removed_container_ids": sorted(removed_ids), "network": plan.network_id or plan.network_name,
+        "removed_container_ids": sorted(removed_ids), "network": plan.network_id,
         "unexpected_container_ids": sorted(unexpected), "removed_network_id": observed_network,
         "network_removed": network_removed, "network_matches": network_matches,
+        "ownership": {
+            "campaign_id": owner_campaign, "owner_label": owner_label,
+            "container_ids": sorted(owned_ids), "network_id": owned_network,
+            "campaign_matches": campaign_matches, "containers_match": containers_match,
+            "network_matches": owned_network_matches, "ok": ownership_ok,
+        },
         "status": "verified" if ok else "failed",
     }
 
@@ -1101,6 +1231,7 @@ __all__ = [
     "build_lifecycle_commands",
     "build_server_sidecar_argv", "build_sidecar_argv", "build_task_workspace_argv", "build_workspace_argv", "check_sidecar_attestation",
     "cleanup_argv", "docker_host_environment", "evaluate_connectivity_checks", "is_placeholder_api_key", "make_dns_alias",
+    "make_opaque_agent_id",
     "required_resource_labels", "require_api_key", "require_explicit_rootless_docker_host", "resolve_rootless_docker_host",
     "validate_cleanup_observation", "validate_sidecar_attestation",
 ]
