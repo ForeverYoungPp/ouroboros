@@ -85,11 +85,15 @@ entry: plugin.py                    # type=extension only — relative to skill 
 scripts:                            # type=script only
   - name: fetch.py                  # name resolves under scripts/ unless slashes/extensions
     description: Fetch and render
-permissions: [net, tool, route, widget, read_settings]   # see "Permissions"
+permissions: [net, tool, route, widget, read_settings, companion_process, supervised_task] # see "Permissions"
 conflicts: [legacy-weather]            # optional incompatible installed skill names
 env_from_settings: [OPENROUTER_API_KEY]                  # core keys require an owner grant
 when_to_use: User asks for the weather forecast.
 timeout_sec: 60                     # default 60, hard cap 300
+companion_processes:                # optional; PLURAL, and needs the companion_process permission
+  - name: demo_worker               # see "Declaring a companion process"
+    command: [python3, scripts/worker.py]
+    runtime: python3
 scheduled_tasks:                    # optional reviewed cron jobs
   - name: refresh-cache
     cron: "0 * * * *"                # 5-field cron, host-local timezone by default
@@ -276,6 +280,80 @@ not by `start_service`. `start_service` is task-scoped and is stopped when the
 owning task ends. Companions require reviewed manifest declarations and the
 `companion_process` permission; scheduled tasks require review-visible manifest
 metadata and the `supervised_task` permission.
+
+### Declaring a companion process
+
+The descriptor lives in the manifest; `plugin.py` only names it. The key is
+`companion_processes` — **plural** — and `register_companion_process()` accepts
+only that name (positionally or by keyword):
+
+```yaml
+permissions: [companion_process]
+companion_processes:
+  - name: demo_worker                     # alnum/underscore only, max 24 chars
+    command: [python3, scripts/worker.py] # relative POSIX-style path in the skill
+    runtime: python3
+    restart_policy: on_failure            # default; the only policy that restarts
+    max_restarts: 5                       # default; the bound within a 300s window
+```
+
+```python
+def register(api):
+    api.register_companion_process("demo_worker")   # only the declared name
+```
+
+Two different layers check this, and they fail at different moments. The parser
+rejects a malformed descriptor when the skill is read:
+
+| Rule | Error when broken |
+|---|---|
+| `name` is present and non-empty | `each 'companion_processes' item must include name` |
+| `command` is present and non-empty | `each 'companion_processes' item must include a non-empty command list` |
+| `runtime` is declared | `each 'companion_processes' item must include runtime` |
+| A `python`/`python3` runtime names a script — a bare `[python3]` does not | `python companion command must name a reviewed script` |
+| No argument is `-c`, `-m`, `-e`, `--eval` or `eval`. `[python3, -m, mypackage, boot]` is caught here rather than by the rule above, even when the package is a declared dependency — and so is a script of your own passed a flag that happens to be named `-c` | `companion inline/eval commands are not allowed` |
+| Path arguments use relative POSIX-style paths (no leading `/` or `..` segment) | `companion command arguments must stay inside the reviewed skill tree` |
+
+The path check is lexical and does not verify that the target file exists. Keep
+the script in the skill payload and use `/` separators so the descriptor has the
+same meaning on every supported platform.
+
+Registration then checks the manifest permission, the name constraints that the
+parser does not enforce, and whether the name is declared. A manifest that has
+passed parsing but is wrong in these ways fails from `plugin.py`:
+
+| Rule | Error when broken |
+|---|---|
+| The manifest includes the `companion_process` permission | `skill 'x' cannot 'companion_process' — manifest permissions=[...]` when it is missing |
+| `name` is at most 24 characters | `tool name must be <= 24 characters: '...'` |
+| `name` contains only alnum/underscore — `demo-worker` parses in the manifest but is not a registrable name | `tool name must be alnum/underscore only: 'demo-worker'` |
+| The name passed to `register_companion_process()` is declared in the manifest | `companion 'x' is not declared in manifest.companion_processes` |
+
+**If you read that last error, check the key for a missing `s` first.** An
+unrecognised frontmatter key is kept as an extra rather than refused —
+`install_specs` and the forward-compatible `presence:` block are both read that
+way — so `companion_process:` in the singular parses, declares no companions,
+and currently produces no warning from the parser, `validate()`, or
+`skill_preflight`. The error you eventually meet names the
+plural key and cannot tell you that the singular one was sitting in the
+manifest all along.
+
+There is no `on_enable` trigger and no `once` flag. After a skill is enabled, the
+host starts a companion whose name `register()` has registered; for an
+out-of-process extension, this handoff can be asynchronous. The companion is
+supervised from there; `restart_policy: on_failure`
+restarts it only on a non-zero exit, so a one-shot script that exits 0 runs
+once, and `max_restarts` (default 5, counted within a 300-second window) bounds
+the loop before `companion_restart_exhausted` is recorded. For work that must
+happen before the first tool call, remember that an out-of-process extension
+already runs `register()` in every per-call child — see the out-of-process
+caveats above — so cheap idempotent setup belongs there, not in a companion.
+
+`env` and `ports` may also be declared on the descriptor. Neither is passed
+through as written: the host drops `HOST_SERVICE_TOKEN`, `HOST_SERVICE_URL` and
+any forbidden settings key out of `env` (and sets the first two itself), and it
+keeps only all-digit entries from `ports`, so a negative or non-numeric one is
+dropped in silence.
 
 ## The `skill_preflight` tool
 
@@ -895,7 +973,7 @@ def register(api):
 | `SKILL_TOGGLE_ERROR: dependency fingerprint is stale` | Re-run `skill_review`; post-review deps reconciliation will reinstall. |
 | `EXTENSION_NOT_LIVE` on tool dispatch | The skill is disabled or the loader had a load_error — check the Skills UI. |
 | `HEAL_MODE_BLOCKED: ...` | The Repair task tried to call a tool the internal heal-mode allowlist does not permit; finish the Repair flow with `skill_review` and exit. |
-| `PluginAPI.register_*` raises `ExtensionRegistrationError` | The skill is missing the matching permission in its manifest. |
+| `PluginAPI.register_*` raises `ExtensionRegistrationError` | Usually the skill is missing the matching permission in its manifest. For `register_companion_process` the name must also be alnum/underscore and declared under `companion_processes` — see "Declaring a companion process". |
 | Reviewer marks `widget_module_safety: FAIL` | `widget.js` is touching `document.cookie` / `localStorage` / cross-origin `fetch`. Move the data through `/api/extensions/<skill>/` routes. |
 
 For deeper integration questions read
