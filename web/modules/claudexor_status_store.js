@@ -934,6 +934,12 @@ export function claudexorPreparationLine(payload) {
         const version = runtime.target_version ? ` ${runtime.target_version}` : '';
         return `Installing Claudexor${version}…`;
     }
+    if (daemon.ownership_problem) {
+        // The producer's own refusal: ensure_running will not spawn into a
+        // foreign daemon home, so a "Starting…" claim would promise a start
+        // that is refused — the accounts panel carries the ownership sentence.
+        return 'Checking Claudexor…';
+    }
     if (state === 'ready' && String(daemon.state || '') === 'stale') {
         // POSITIVE knowledge only: 'stale' is the producer's own "installed,
         // engine idle, starts automatically" verdict. A partially failed

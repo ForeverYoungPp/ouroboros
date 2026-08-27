@@ -937,6 +937,16 @@ export function createLoginCardController({
             return custodyResult(null, { absent: true });
         }
         if (expected !== undefined && active !== expected) return custodyResult(null);
+        if ((active.error || active.needsProfile) && !active.jobId && !shuttingDown) {
+            // Re-proved at EXECUTION time, not at click time: a close queued
+            // during an in-flight create observes the world that create left.
+            // When it failed without a job id there is nothing a DELETE can
+            // address — the same honest local detach the pre-queue check in
+            // close() applies when the error is already visible at the press.
+            const result = detach();
+            onSettled();
+            return result;
+        }
 
         let result = custodyResult(active.envelope, { absent: Boolean(active.absent) });
         if (active.verdict?.kind === 'recovery'

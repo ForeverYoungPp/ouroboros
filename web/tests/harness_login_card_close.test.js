@@ -154,3 +154,34 @@ test('the preparation line advances with live snapshots and retreats on a dead r
         store.dispose();
     }
 });
+
+test('a close queued during a create that fails without a job detaches honestly', async () => {
+    // The queued close observes the world the create left: a failed create
+    // has no job id, so there is nothing a DELETE can address — the close
+    // must land on the same honest local detach the pre-queue check applies.
+    let releaseCreate = () => {};
+    const gate = new Promise((resolve) => { releaseCreate = resolve; });
+    let deletes = 0;
+    const host = interactiveHost();
+    const ctl = createLoginCardController({
+        host,
+        store: null,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                await gate;
+                return json(502, { error: 'engine exploded mid-create' });
+            }
+            if (init.method === 'DELETE') { deletes += 1; return json(200, { job: {} }); }
+            return json(404, {});
+        },
+    });
+    const starting = ctl.start('codex', '');
+    await flush();
+    const clicked = host.click('[data-login-dismiss]');
+    assert.ok(host.innerHTML.includes('Closing…'), 'the press acknowledged before the create settled');
+    releaseCreate();
+    await starting;
+    await clicked;
+    assert.equal(deletes, 0, 'no job id — nothing a DELETE can address');
+    assert.equal(host.innerHTML, '', 'the queued close detached the failed create honestly');
+});
