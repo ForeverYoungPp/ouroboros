@@ -1047,16 +1047,26 @@ build_cleanup_commands = cleanup_argv
 
 def validate_cleanup_observation(observation: Mapping[str, Any], plan: CleanupPlan) -> dict[str, Any]:
     removed = observation.get("removed_container_ids", ())
-    removed_ids = {item for item in removed if isinstance(item, str)} if isinstance(removed, Iterable) else set()
+    removed_ids = (
+        {item for item in removed if isinstance(item, str)}
+        if isinstance(removed, Iterable) and not isinstance(removed, (str, bytes))
+        else set()
+    )
     expected = set(plan.workspace_container_ids)
     if plan.server_container_id is not None:
         expected.add(plan.server_container_id)
     network_removed = observation.get("network_removed") is True
-    ok = expected.issubset(removed_ids) and network_removed
+    unexpected = removed_ids - expected
+    observed_network = observation.get("removed_network_id")
+    network_target = plan.network_id or plan.network_name
+    network_matches = observed_network is None or observed_network == network_target
+    ok = expected == removed_ids and network_removed and network_matches
     return {
         "schema": f"{SCHEMA_VERSION}.cleanup", "ok": ok, "expected_container_ids": sorted(expected),
         "removed_container_ids": sorted(removed_ids), "network": plan.network_id or plan.network_name,
-        "network_removed": network_removed, "status": "verified" if ok else "failed",
+        "unexpected_container_ids": sorted(unexpected), "removed_network_id": observed_network,
+        "network_removed": network_removed, "network_matches": network_matches,
+        "status": "verified" if ok else "failed",
     }
 
 

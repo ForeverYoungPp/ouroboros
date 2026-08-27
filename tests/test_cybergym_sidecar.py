@@ -179,6 +179,7 @@ def test_cleanup_is_exact_and_never_broad():
     assert commands[1][-2:] == ("rm", "net-123")
     assert all("prune" not in item and "*" not in item for command in commands for item in command)
     assert sidecar.validate_cleanup_observation({"removed_container_ids": ["workspace-123", "server-123"], "network_removed": True}, cleanup)["ok"] is True
+    assert sidecar.validate_cleanup_observation({"removed_container_ids": ["workspace-123", "server-123", "other"], "network_removed": True}, cleanup)["ok"] is False
 
 
 def test_api_key_status_never_returns_secret():
