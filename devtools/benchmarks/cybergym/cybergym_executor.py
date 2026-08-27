@@ -433,12 +433,30 @@ def _runtime_value(payload: Mapping[str, Any], *keys: str) -> Any:
     return None
 
 
-def _unwrap_http_json(value: Any, *, operation: str) -> Mapping[str, Any]:
-    """Normalize an injected HTTP response and reject transport/body errors."""
+_HTTP_BODY_MISSING = object()
 
+
+def _unwrap_http_payload(
+    value: Any, *, operation: str, allow_list: bool = False
+) -> Mapping[str, Any] | list[Any]:
+    """Normalize an injected HTTP response and reject transport/body errors.
+
+    ``urllib_json`` returns the decoded upstream body directly, while unit and
+    alternate transports may return an envelope such as
+    ``{"status_code": 200, "body": ...}``.  Keep both forms equivalent and
+    never turn an HTTP/body error into an empty result that could be mistaken
+    for a legitimate verifier response.
+    """
+
+    if isinstance(value, list):
+        if allow_list:
+            return value
+        raise ExecutorFailure(f"{operation} returned a list where an object was required")
     if not isinstance(value, Mapping):
         raise ExecutorFailure(f"{operation} returned a non-object response")
-    status_code = value.get("status_code", value.get("http_status"))
+
+    envelope = value
+    status_code = envelope.get("status_code", envelope.get("http_status"))
     if status_code is not None:
         try:
             status = int(status_code)
@@ -446,13 +464,41 @@ def _unwrap_http_json(value: Any, *, operation: str) -> Mapping[str, Any]:
             raise ExecutorFailure(f"{operation} returned an invalid HTTP status") from exc
         if status != 200:
             raise ExecutorFailure(f"{operation} returned HTTP {status}")
-    body = value.get("body")
-    if isinstance(body, Mapping):
-        value = body
-    error = value.get("error")
+
+    error = envelope.get("error")
     if error not in (None, "", False, {}):
         raise ExecutorFailure(f"{operation} returned an error object")
-    return value
+    if envelope.get("ok") is False:
+        raise ExecutorFailure(f"{operation} returned an unsuccessful response")
+
+    body = envelope.get("body", _HTTP_BODY_MISSING)
+    if body is not _HTTP_BODY_MISSING:
+        if isinstance(body, Mapping):
+            value = body
+        elif isinstance(body, list) and allow_list:
+            return body
+        else:
+            raise ExecutorFailure(f"{operation} returned an invalid response body")
+
+    if isinstance(value, Mapping):
+        error = value.get("error")
+        if error not in (None, "", False, {}):
+            raise ExecutorFailure(f"{operation} returned an error object")
+        if value.get("ok") is False:
+            raise ExecutorFailure(f"{operation} returned an unsuccessful response")
+        return value
+    if isinstance(value, list) and allow_list:
+        return value
+    raise ExecutorFailure(f"{operation} returned an invalid response body")
+
+
+def _unwrap_http_json(value: Any, *, operation: str) -> Mapping[str, Any]:
+    """Normalize an injected HTTP response that must contain an object."""
+
+    payload = _unwrap_http_payload(value, operation=operation, allow_list=False)
+    if not isinstance(payload, Mapping):  # defensive; the helper already checks
+        raise ExecutorFailure(f"{operation} returned a non-object response")
+    return payload
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -465,6 +511,15 @@ def _positive_int(value: Any, field: str) -> int:
     if number <= 0:
         raise ExecutorFailure(f"{field} must be a positive integer")
     return number
+
+
+def _require_exact_effort(value: Any) -> str:
+    """Accept only the owner-approved literal reasoning effort ``high``."""
+
+    effort = str(value or "").strip()
+    if effort != "high":
+        raise ExecutorFailure("gateway result effort is not exactly high")
+    return effort
 
 
 def _gateway_path(base: str, path: str) -> str:
@@ -568,17 +623,57 @@ def _response_task_id(response: Mapping[str, Any]) -> str:
     return str(value or "").strip()
 
 
-def _response_hash(response: Mapping[str, Any]) -> str:
-    nested = response.get("response")
-    if isinstance(nested, Mapping):
-        response = {**nested, **response}
-    return str(response.get("poc_hash") or response.get("sha256") or response.get("hash") or "").strip().lower()
-
-
 def _record_matches(record: Mapping[str, Any], task_id: str, digest: str) -> bool:
     record_task = str(record.get("task_id") or "")
     record_hash = str(record.get("poc_hash") or record.get("hash") or "").lower()
     return record_task == task_id and record_hash == digest
+
+
+def _response_poc_id(response: Mapping[str, Any]) -> str:
+    """Extract the upstream submission id without treating it as a byte hash."""
+
+    nested = response.get("response")
+    if isinstance(nested, Mapping):
+        response = {**nested, **response}
+    value = response.get("poc_id") or response.get("submission_id")
+    text = str(value or "").strip()
+    if not text or len(text) > 256 or any(char.isspace() or ord(char) < 32 for char in text):
+        raise ExecutorFailure("official submit response omitted a valid poc_id")
+    return text
+
+
+def _validate_verify_response(
+    value: Any, *, expected_poc_id: str = ""
+) -> Mapping[str, Any]:
+    """Validate the pinned ``/verify-agent-pocs`` response shape.
+
+    The upstream endpoint returns ``{"message": str, "poc_ids": [str, ...]}``
+    with HTTP 200.  A successful transport carrying an empty/malformed body is
+    not evidence that verification happened, so fail closed before querying
+    records.  ``expected_poc_id`` binds the response to the designated final
+    submission while preserving all raw exit codes in the later DB record.
+    """
+
+    response = _unwrap_http_json(value, operation="CyberGym verify-agent-pocs")
+    message = response.get("message")
+    if not isinstance(message, str) or not message.strip():
+        raise ExecutorFailure("verify-agent-pocs response omitted its message")
+    raw_ids = response.get("poc_ids")
+    if not isinstance(raw_ids, Sequence) or isinstance(raw_ids, (str, bytes)):
+        raise ExecutorFailure("verify-agent-pocs response omitted its poc_ids list")
+    poc_ids: list[str] = []
+    for raw_id in raw_ids:
+        if not isinstance(raw_id, str):
+            raise ExecutorFailure("verify-agent-pocs response contains a non-string poc_id")
+        poc_id = raw_id.strip()
+        if not poc_id or len(poc_id) > 256 or any(char.isspace() or ord(char) < 32 for char in poc_id):
+            raise ExecutorFailure("verify-agent-pocs response contains an invalid poc_id")
+        poc_ids.append(poc_id)
+    if not poc_ids:
+        raise ExecutorFailure("verify-agent-pocs response contains no verified poc_ids")
+    if expected_poc_id and expected_poc_id not in poc_ids:
+        raise ExecutorFailure("verify-agent-pocs response omitted the designated poc_id")
+    return response
 
 
 class CyberGymExecutor:
@@ -905,7 +1000,7 @@ class CyberGymExecutor:
                 paths = response.get("paths")
                 if not isinstance(paths, Mapping):
                     raise ExecutorFailure("CyberGym readiness response has no OpenAPI paths")
-                required = {"/submit-vul", "/query-poc", "/verify-agent-pocs"}
+                required = {"/submit-vul", "/submit-fix", "/query-poc", "/verify-agent-pocs"}
                 if not required.issubset(paths):
                     raise ExecutorFailure("CyberGym readiness response misses a required route")
                 return
@@ -1106,9 +1201,14 @@ class CyberGymExecutor:
             raise ExecutorFailure("official submit.sh response omitted its masked task id")
         if declared_masked_id and declared_masked_id != masked_id:
             raise ExecutorFailure("submit response task id conflicts with generated script")
-        response_hash = _response_hash(response)
-        if response_hash and response_hash != marker.sha256:
-            raise ExecutorFailure("submit response hash does not match final.poc")
+        # The pinned upstream /submit-vul response has no PoC hash.  Its
+        # ``poc_id`` is the submission identity; the bytes are bound by our
+        # local marker and the later protected query record.  Do not infer a
+        # hash from incidental ``hash``/``sha256`` fields in an alternate
+        # response body, which made a valid nonzero vulnerable exit look like
+        # a transport failure.
+        poc_id = _response_poc_id(response)
+        response["poc_id"] = poc_id
         response["final_poc_sha256"] = marker.sha256
         response["masked_task_id"] = masked_id
         response["submit_returncode"] = result.returncode
@@ -1120,19 +1220,31 @@ class CyberGymExecutor:
         # The private server is loopback-published; do not put the key in any
         # checkpoint or returned artifact.
         plan = self._network_plan("campaign")
-        payload = self.config.http_runner(
-            "POST", f"http://127.0.0.1:{plan.verifier_host_port}/query-poc",
-            body={"agent_id": agent_id, "task_id": real_task_id}, headers=headers, timeout=60,
+        payload = _unwrap_http_payload(
+            self.config.http_runner(
+                "POST", f"http://127.0.0.1:{plan.verifier_host_port}/query-poc",
+                body={"agent_id": agent_id, "task_id": real_task_id}, headers=headers, timeout=60,
+            ),
+            operation="CyberGym private query",
+            allow_list=True,
         )
         # The pinned upstream route returns a bare JSON list.  A few private
         # proxies wrap it in ``records``/``items``; accept both shapes without
         # weakening the task/hash binding below.
-        records = payload if isinstance(payload, list) else (
-            payload.get("records", payload.get("pocs", payload)) if isinstance(payload, Mapping) else []
-        )
-        if isinstance(records, Mapping):
-            records = records.get("items", [])
-        return [dict(item) for item in records if isinstance(item, Mapping)] if isinstance(records, Sequence) and not isinstance(records, (str, bytes)) else []
+        if isinstance(payload, list):
+            records: Any = payload
+        else:
+            records = payload.get("records", payload.get("pocs", payload.get("items")))
+        if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+            raise ExecutorFailure("CyberGym private query returned no records list")
+        normalized: list[dict[str, Any]] = []
+        for item in records:
+            if not isinstance(item, Mapping):
+                raise ExecutorFailure("CyberGym private query returned a malformed record")
+            normalized.append(dict(item))
+        if not normalized:
+            raise ExecutorFailure("CyberGym private query returned no records")
+        return normalized
 
     def run_task(self, task: TaskSpec, task_dir: pathlib.Path) -> Mapping[str, Any]:
         """Execute one admitted task; callback-compatible with ``run_campaign``."""
@@ -1168,9 +1280,20 @@ class CyberGymExecutor:
         # verify-agent-pocs is the upstream operation that reruns both images.
         key = self._ensure_key()
         plan_host = f"http://127.0.0.1:{plan.verifier_host_port}"
-        verify_response = self.config.http_runner("POST", plan_host + "/verify-agent-pocs", body={"agent_id": agent_id}, headers={"X-API-Key": key}, timeout=300)
+        submitted_poc_id = _response_poc_id(submit_response)
+        verify_response = _validate_verify_response(
+            self.config.http_runner(
+                "POST", plan_host + "/verify-agent-pocs",
+                body={"agent_id": agent_id}, headers={"X-API-Key": key}, timeout=300,
+            ),
+            expected_poc_id=submitted_poc_id,
+        )
         records = self._private_query(agent_id, task.task_id)
-        matching = [item for item in records if _record_matches(item, task.task_id, digest)]
+        matching = [
+            item for item in records
+            if _record_matches(item, task.task_id, digest)
+            and str(item.get("poc_id") or "").strip() == submitted_poc_id
+        ]
         if not matching:
             raise ExecutorFailure("private query returned no record for the designated final PoC")
         record = matching[-1]
@@ -1193,8 +1316,9 @@ class CyberGymExecutor:
         completion_tokens = _runtime_value(gateway_result, "completion_tokens", "output_tokens", "tokens_out")
         if observed_model != self.config.model:
             raise ExecutorFailure("gateway result omitted or changed the exact requested model")
-        if not observed_provider or not observed_effort:
-            raise ExecutorFailure("gateway result omitted provider or effort telemetry")
+        if not observed_provider:
+            raise ExecutorFailure("gateway result omitted provider telemetry")
+        observed_effort = _require_exact_effort(observed_effort)
         _positive_int(prompt_tokens, "gateway prompt_tokens")
         _positive_int(completion_tokens, "gateway completion_tokens")
         trial = {
