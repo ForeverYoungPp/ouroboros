@@ -13,6 +13,7 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 
 import {
+    claudexorPreparationLine,
     DAEMON_STATES_STOPPED,
     FACET_ACCOUNTS,
     FACET_CATALOG,
@@ -880,4 +881,24 @@ test('a refused wake does not stop the visible panel from polling', async (t) =>
     } finally {
         globalThis.setTimeout = origSet; globalThis.clearTimeout = origClear;
     }
+});
+
+test('claudexorPreparationLine phases by runtime state and daemon liveness', () => {
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'unreachable', runtime: { state: 'installing', target_version: '3.3.14' } },
+    }), 'Installing Claudexor 3.3.14…');
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'unreachable', runtime: { state: 'installing' } },
+    }), 'Installing Claudexor…', 'no version claim without a version');
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'stale', runtime: { state: 'ready' } },
+    }), 'Starting the Claudexor daemon…');
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'running', runtime: { state: 'ready' } },
+    }), 'Checking Claudexor…', 'a serving engine is being checked, not started');
+    assert.equal(claudexorPreparationLine(null), 'Checking Claudexor…',
+        'no snapshot is no phase evidence — the honest generic');
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'running', runtime: {} },
+    }), 'Checking Claudexor…');
 });

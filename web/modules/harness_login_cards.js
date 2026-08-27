@@ -41,6 +41,7 @@ import {
     accountLoginConfirmed,
     claudexorStatus,
     familyLabel,
+    claudexorPreparationLine,
 } from './claudexor_status_store.js';
 import { escapeHtmlAttr as escapeHtml, safeExternalHrefAttr } from './utils.js';
 
@@ -472,7 +473,7 @@ export async function reconcileLoginJob(jobId, fetchImpl = apiFetch) {
     }
 }
 
-export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FULL } = {}) {
+export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FULL, statusPayload = null } = {}) {
     // The card's whole body as a STRING — pure, so every face is asserted in
     // node without a DOM: the unsafe-URL refusal, the unconfirmed re-check,
     // and the rule that a verdict silences the live status line.
@@ -547,7 +548,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
     // underneath "Connected.".
     if (face !== 'error' && face !== 'name' && !active.verdict && !active.confirming) {
         const line = active.preparingRuntime
-            ? 'Installing or checking Claudexor…'
+            ? claudexorPreparationLine(statusPayload)
             : loginStatusLine(active.envelope || {});
         if (line) bits.push(`<div class="settings-inline-status" data-tone="muted" data-login-state>${escapeHtml(line)}</div>`);
     }
@@ -672,7 +673,10 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
         `);
     }
     if (!compact) {
-        bits.push('<button type="button" class="btn btn-default" data-login-dismiss>Close</button>');
+        // A pressed Close queues behind the in-flight start transition (C7) —
+        // possibly for a whole runtime install. The press must ANSWER at once,
+        // or a working control reads as a dead one (owner report, 2026-08-27).
+        bits.push(`<button type="button" class="btn btn-default" data-login-dismiss${active.closing ? ' disabled' : ''}>${active.closing ? 'Closing…' : 'Close'}</button>`);
     }
     bits.push('</div>');
     return bits.join('');
@@ -775,13 +779,22 @@ export function createLoginCardController({
         if (hostEl) hostEl.innerHTML = '';
     }
 
+    // While the create POST holds the transition (runtime ensure included),
+    // no job polling exists yet, so nothing re-rendered the card as the
+    // runtime moved through installing -> starting -> serving; the phase line
+    // froze on its first words. A BARE subscription reacts to the snapshots
+    // the visible accounts surface fetches without arming the poll itself.
+    const releasePhaseFollow = store?.subscribe
+        ? store.subscribe(() => { if (ctl.active?.preparingRuntime) render(); })
+        : () => {};
+
     function render() {
         const hostEl = getHost();
         if (!hostEl) return;
         const active = ctl.active;
         if (!active) { hostEl.innerHTML = ''; return; }
         preserveCardFocus(hostEl, () => {
-            hostEl.innerHTML = loginCardHtml(active, now(), { mode });
+            hostEl.innerHTML = loginCardHtml(active, now(), { mode, statusPayload: store?.snapshot || null });
         }, getDoc());
         wireLoginCard(hostEl, active);
     }
@@ -848,7 +861,24 @@ export function createLoginCardController({
         hostEl.querySelector('[data-profile-name-submit]')?.addEventListener('click', () => submitProfileNameFromCard(active));
         hostEl.querySelector('[data-login-code-submit]')?.addEventListener('click', () => submitCodeFromCard(active));
         hostEl.querySelector('[data-login-reconcile]')?.addEventListener('click', () => reconcile(active));
-        hostEl.querySelector('[data-login-dismiss]')?.addEventListener('click', () => close(active));
+        hostEl.querySelector('[data-login-dismiss]')?.addEventListener('click', () => {
+            // Instant local acknowledgement: the close itself queues behind
+            // whatever transition is in flight (C7), and during a runtime
+            // install that wait is minutes — a silent queued click reads as a
+            // broken button. The close promise is RETURNED for harnesses that
+            // invoke the handler directly (the DOM discards listener returns),
+            // and the flag resets on settle only when this card is still the
+            // active one (a settled close usually cleared it).
+            if (active.closing) return undefined;
+            active.closing = true;
+            render();
+            return close(active).finally(() => {
+                if (ctl.active === active && active.closing) {
+                    active.closing = false;
+                    render();
+                }
+            });
+        });
     }
 
     function showRecovery(active, result, fallbackDetail = '') {
@@ -884,6 +914,10 @@ export function createLoginCardController({
         ctl.pendingStart = null;
         stopJobPolling();
         releaseStatusPolling();
+        // Same fence as the timers and the polling hold: a detached controller
+        // must not keep reacting to store snapshots (the disposer is
+        // idempotent, so a later dispose() releasing again is a no-op).
+        try { releasePhaseFollow(); } catch (err) { /* detach must not throw */ }
         ctl.active = null;
         ctl.detachedStatus = result.status;
         clearHost();
@@ -1196,6 +1230,7 @@ export function createLoginCardController({
             inputValue: '', inputBusy: false, inputSent: false, inputError: '', inputNote: '',
             needsProfile: null, profileNameValue: '', profileNameNote: '',
             verdict: null, confirming: false, advancedOpen: false, preparingRuntime: true,
+            closing: false,
         };
         const active = ctl.active;
         render();
@@ -1469,6 +1504,7 @@ export function createLoginCardController({
         // Set FIRST: no new start may be queued behind the shutdown.
         ctl.disposed = true;
         ctl.pendingStart = null;
+        try { releasePhaseFollow(); } catch (err) { /* disposal must not throw */ }
         return withLoginTransition(() => _closeLocked(undefined, { shuttingDown: true }))
             .then((result) => {
                 if (!ctl.active) ctl.detachedStatus = result.status;

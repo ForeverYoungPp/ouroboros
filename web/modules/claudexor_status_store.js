@@ -916,3 +916,26 @@ export function boundedStatusRefresh(store, { includeModels = true, beatMs = 200
     const beat = new Promise((resolve) => { timer = setTimeout(resolve, beatMs); });
     return Promise.race([refresh, beat]).finally(() => { if (timer) clearTimeout(timer); });
 }
+
+/**
+ * The one sentence for "Claudexor is being made ready", phased by what is
+ * actually happening: the runtime manager's status projection distinguishes
+ * installing from ready, and the daemon aggregate says whether the engine is
+ * serving — printing "Installing or checking" when the payload names the
+ * phase made a minutes-long first install indistinguishable from a
+ * sub-second probe. An absent or unread payload answers the honest generic:
+ * this caller IS mid-check, it just has no phase evidence yet.
+ */
+export function claudexorPreparationLine(payload) {
+    const daemon = payload?.daemon || {};
+    const runtime = daemon.runtime || {};
+    const state = String(runtime.state || '');
+    if (state === 'installing') {
+        const version = runtime.target_version ? ` ${runtime.target_version}` : '';
+        return `Installing Claudexor${version}…`;
+    }
+    if (state === 'ready' && String(daemon.state || '') !== 'running') {
+        return 'Starting the Claudexor daemon…';
+    }
+    return 'Checking Claudexor…';
+}
