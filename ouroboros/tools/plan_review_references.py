@@ -43,9 +43,13 @@ def _emit_plan_review_reference(
     serialized = json.dumps(state, ensure_ascii=False, sort_keys=True, default=str)
     revision = sha256(serialized.encode("utf-8")).hexdigest()
     try:
-        chat_id = int(getattr(ctx, "current_chat_id", 0))
+        from supervisor.message_bus import notification_chat_route
+
+        chat_id = notification_chat_route(getattr(ctx, "current_chat_id", None), 1)
+        if chat_id is None:
+            chat_id = 1
     except (TypeError, ValueError):
-        chat_id = 0
+        chat_id = 1
     ts = utc_now_iso()
     payload = {
         "type": "review_reference", "surface": "plan_review",

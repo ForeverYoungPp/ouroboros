@@ -880,6 +880,8 @@ def _collect_chat_rows(
                 rec["mime"] = str(entry.get("mime") or "")
                 rec["download_url"] = str(entry["download_url"])
                 rec["caption"] = str(entry.get("caption") or "")
+            if "task_terminal_status" in entry:
+                rec["task_terminal_status"] = str(entry.get("task_terminal_status") or "")
             _copy_task_summary_metadata(rec, entry)
             for field in SUBAGENT_MESSAGE_FIELDS:
                 if field in entry:

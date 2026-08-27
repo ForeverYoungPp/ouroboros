@@ -55,6 +55,38 @@ def test_plan_reference_uses_shared_best_effort_log_event_seam(monkeypatch):
     }
 
 
+def test_plan_reference_defaults_unbound_context_to_main_chat(monkeypatch):
+    events: queue.Queue = queue.Queue()
+    ctx = SimpleNamespace(event_queue=events)
+    state = {"current_attempt": {"fingerprint": "review-fingerprint"}, "waves": []}
+    calls = []
+
+    monkeypatch.setattr(
+        plan_review_references,
+        "emit_log_event",
+        lambda _queue, payload, **_kwargs: calls.append(payload),
+    )
+    plan_review_references._emit_plan_review_reference(ctx, "task-1", state)
+
+    assert calls[0]["chat_id"] == 1
+
+
+def test_plan_reference_preserves_explicit_panel_chat_zero(monkeypatch):
+    events: queue.Queue = queue.Queue()
+    ctx = SimpleNamespace(event_queue=events, current_chat_id=0)
+    state = {"current_attempt": {"fingerprint": "review-fingerprint"}, "waves": []}
+    calls = []
+
+    monkeypatch.setattr(
+        plan_review_references,
+        "emit_log_event",
+        lambda _queue, payload, **_kwargs: calls.append(payload),
+    )
+    plan_review_references._emit_plan_review_reference(ctx, "task-1", state)
+
+    assert calls[0]["chat_id"] == 0
+
+
 def test_attempt_helper_publishes_immediately_after_the_canonical_write(monkeypatch):
     ctx = SimpleNamespace(event_queue=queue.Queue())
     calls = []
