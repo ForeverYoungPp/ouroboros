@@ -2140,7 +2140,6 @@ export function createChatInstance({
         if (!isLegacyParentSubagentKey) {
             record.finished = isTerminalTaskPhase(nextPhase, summary.terminal);
         }
-        record.root.dataset.finished = record.finished ? '1' : '0';
         if (summary.human && headline) {
             record.lastHumanHeadline = headline;
         }
@@ -2278,6 +2277,7 @@ export function createChatInstance({
         // task_done terminates the card HERE without passing finishLiveCard, so
         // the cancelable marker must be dropped on this path too (P3 growth cap).
         if (justFinished) {
+            record.root.dataset.finished = '1';
             cancelableTaskIds.delete(record.groupId);
             syncCancelRunButton(record);
         }
@@ -2318,7 +2318,6 @@ export function createChatInstance({
         const wasFinished = record.finished;
         record.finished = true;
         record.finalizingHold = false;
-        record.root.dataset.finished = '1';
         // A finished task can never be cancelled again; dropping the marker here
         // keeps the set from accumulating every task id of a long session (P3).
         cancelableTaskIds.delete(record.groupId);
@@ -2332,6 +2331,7 @@ export function createChatInstance({
         setLiveCardTypingVisible(record, false);
         markTaskComplete(record.groupId, activePhase);
         if (!wasFinished) {
+            record.root.dataset.finished = '1';
             if (!stickyExpandedSlots.has(record.groupId)) {
                 setLiveCardExpanded(record, record.isSubagent && nestedSubagentsExpanded);
             }
