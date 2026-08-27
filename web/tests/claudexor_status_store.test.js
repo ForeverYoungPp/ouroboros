@@ -896,6 +896,10 @@ test('claudexorPreparationLine phases by runtime state and daemon liveness', () 
     assert.equal(claudexorPreparationLine({
         daemon: { state: 'running', runtime: { state: 'ready' } },
     }), 'Checking Claudexor…', 'a serving engine is being checked, not started');
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'unreachable', runtime: { state: 'ready' } },
+    }), 'Checking Claudexor…',
+        'a failed fan-out rewrites a LIVE daemon to unreachable — never a Starting claim');
     assert.equal(claudexorPreparationLine(null), 'Checking Claudexor…',
         'no snapshot is no phase evidence — the honest generic');
     assert.equal(claudexorPreparationLine({

@@ -39,9 +39,9 @@
 import { apiFetch } from './api_client.js';
 import {
     accountLoginConfirmed,
+    claudexorPreparationLine,
     claudexorStatus,
     familyLabel,
-    claudexorPreparationLine,
 } from './claudexor_status_store.js';
 import { escapeHtmlAttr as escapeHtml, safeExternalHrefAttr } from './utils.js';
 

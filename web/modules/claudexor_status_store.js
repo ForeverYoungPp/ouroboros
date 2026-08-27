@@ -934,7 +934,13 @@ export function claudexorPreparationLine(payload) {
         const version = runtime.target_version ? ` ${runtime.target_version}` : '';
         return `Installing Claudexor${version}…`;
     }
-    if (state === 'ready' && String(daemon.state || '') !== 'running') {
+    if (state === 'ready' && String(daemon.state || '') === 'stale') {
+        // POSITIVE knowledge only: 'stale' is the producer's own "installed,
+        // engine idle, starts automatically" verdict. A partially failed
+        // fan-out rewrites a LIVE daemon's aggregate to 'unreachable' while
+        // preserving the runtime projection, so anything but 'stale' falls to
+        // the generic — never a "Starting…" claim about an engine that may
+        // already be serving.
         return 'Starting the Claudexor daemon…';
     }
     return 'Checking Claudexor…';
