@@ -187,3 +187,36 @@ test('a close queued during a create that fails without a job detaches honestly'
     assert.ok(typeof settledStatus === 'string' && settledStatus.length > 0,
         `the close must keep its released|retained|unknown contract, got: ${String(settledStatus)}`);
 });
+
+test('a malformed 2xx create with a job id is still cancellable by a queued close', async () => {
+    // The id names a job the daemon may be running however malformed the rest
+    // of the answer is: the queued close must DELETE it, never take the
+    // no-job detach shortcut.
+    let releaseCreate = () => {};
+    const gate = new Promise((resolve) => { releaseCreate = resolve; });
+    let deletes = 0;
+    const host = interactiveHost();
+    const ctl = createLoginCardController({
+        host,
+        store: null,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                await gate;
+                return json(200, { job_id: 'job-malformed' /* no job body */ });
+            }
+            if (init.method === 'DELETE') {
+                deletes += 1;
+                return json(200, { job: { state: 'cancelled', outcome: { reason: 'user_cancelled' } } });
+            }
+            return json(200, { job: { state: 'cancelled' } });
+        },
+    });
+    const starting = ctl.start('codex', '');
+    await flush();
+    const clicked = host.click('[data-login-dismiss]');
+    releaseCreate();
+    await starting;
+    const status = await clicked;
+    assert.equal(deletes, 1, 'the id was adopted before body validation — the job got its DELETE');
+    assert.ok(typeof status === 'string' && status.length > 0);
+})

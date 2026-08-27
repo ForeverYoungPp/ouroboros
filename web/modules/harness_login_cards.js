@@ -782,8 +782,9 @@ export function createLoginCardController({
     // While the create POST holds the transition (runtime ensure included),
     // no job polling exists yet, so nothing re-rendered the card as the
     // runtime moved through installing -> starting -> serving; the phase line
-    // froze on its first words. A BARE subscription reacts to the snapshots
-    // the visible accounts surface fetches without arming the poll itself.
+    // froze on its first words. A BARE subscription (no visibility predicate)
+    // cannot by itself make the store poll — it rides whatever reads the
+    // visible surfaces and the login hold cause.
     const releasePhaseFollow = store?.subscribe
         ? store.subscribe(() => { if (ctl.active?.preparingRuntime) render(); })
         : () => {};
@@ -1305,9 +1306,13 @@ export function createLoginCardController({
             // face and its Try again already exist.
             const jobId = String(data?.job_id || '');
             if (!jobId) throw new Error('the sign-in service returned no job id');
+            // Adopted BEFORE the body validation: a nonempty id names a job
+            // the daemon may be running regardless of how malformed the rest
+            // of the answer is, and a queued close must be able to DELETE it —
+            // the no-job detach is only for creates that produced no id.
+            active.jobId = jobId;
             if (!hasJobState(data)) throw new Error('the sign-in service returned no job');
             active.preparingRuntime = false;
-            active.jobId = jobId;
             active.envelope = data;
             active.attachCommand = String(data.attach_command || '');
             active.attachShell = String(data.attach_shell || '');
