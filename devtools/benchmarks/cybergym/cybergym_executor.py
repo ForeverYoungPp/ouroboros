@@ -1235,6 +1235,10 @@ class CyberGymExecutor:
             records: Any = payload
         else:
             records = payload.get("records", payload.get("pocs", payload.get("items")))
+            if isinstance(records, Mapping):
+                # Some private proxies use ``{"pocs": {"items": [...]}}``
+                # rather than placing ``items`` at the top level.
+                records = records.get("items")
         if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
             raise ExecutorFailure("CyberGym private query returned no records list")
         normalized: list[dict[str, Any]] = []

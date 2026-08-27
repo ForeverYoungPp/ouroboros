@@ -194,6 +194,19 @@ def test_private_query_rejects_http_and_body_errors(tmp_path, monkeypatch):
         executor._private_query("agent-" + "a" * 24, "arvo:1")
 
 
+def test_private_query_accepts_nested_items_wrapper(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    monkeypatch.setenv("CYBERGYM_API_KEY", "test-secret-value")
+    record = {"task_id": "arvo:1", "poc_id": "poc-1", "poc_hash": "a" * 64}
+    executor = CyberGymExecutor(
+        dataclasses_replace(
+            config,
+            http_runner=lambda *args, **kwargs: {"pocs": {"items": [record]}},
+        )
+    )
+    assert executor._private_query("agent-" + "a" * 24, "arvo:1") == [record]
+
+
 def test_submit_response_binds_poc_id_not_nonexistent_hash_and_keeps_exit_code(tmp_path):
     config = _config(tmp_path)
     task_dir = config.run_root / "task"
