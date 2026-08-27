@@ -602,3 +602,44 @@ def test_review_does_not_retry_an_unknown_dispatched_api_attempt(tmp_path):
         with _ACTIVE_LOCK:
             _ACTIVE.pop(key, None)
             _NO_RESEND.pop(key, None)
+
+
+@pytest.mark.parametrize(
+    ("surface", "raw_text"),
+    [("task_acceptance", "malformed reviewer output"), ("multi_model_review", "")],
+)
+def test_review_retry_rail_honors_durable_cancel_for_format_and_empty_paths(
+    tmp_path, monkeypatch, surface, raw_text,
+):
+    """A cancel that lands after attempt one forbids every retry shape."""
+    from types import SimpleNamespace
+
+    from ouroboros.cancel_intents import request_cancel
+    from ouroboros.review_execution import ReviewAttemptResult, ReviewRouteKind
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+
+    calls = []
+    task_id = f"cancel-retry-{surface.replace('_', '-')}"
+
+    def attempt(_assignment, **_kwargs):
+        calls.append(1)
+        request_cancel(tmp_path, task_id, reason="owner stopped retry rail", source="test")
+        return ReviewAttemptResult(
+            message={"content": raw_text}, usage={}, raw_text=raw_text,
+        )
+
+    monkeypatch.setattr("ouroboros.review_substrate._execute_slot_attempt", attempt)
+    ctx = SimpleNamespace(task_id=task_id, drive_root=tmp_path)
+    result = run_review_request(
+        ReviewRequest(
+            surface=surface, goal="review", task_id=task_id,
+            evidence={}, call_type=f"{surface}_review",
+        ),
+        slots=[ReviewSlot(
+            slot_id="slot-1", model="test/model", route=ReviewRouteKind.API_CHAT,
+        )],
+        drive_root=tmp_path, usage_ctx=ctx,
+    )
+
+    assert calls == [1]
+    assert result.actors[0]["raw_text"] == raw_text

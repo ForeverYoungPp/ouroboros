@@ -304,14 +304,13 @@ def merge_frozen_review_reconciliation(usage_ctx: Any) -> None:
     usage_ctx._last_scope_raw_result = scope_wrapper
 
 
-def retryable_review_exception(exc: Exception, usage_ctx: Any) -> bool:
-    """Whether a second byte-identical review send has a terminal basis."""
-    from ouroboros.loop_llm_call import classify_llm_exception
+def review_retry_cancelled(usage_ctx: Any) -> bool:
+    """Return whether durable cancellation forbids another review send.
 
-    # A cancellation requested after the first route attempt is a terminal
-    # owner decision for this wave, even when the transport wrapper surfaced a
-    # generic retryable preparation error. Reusing the existing durable cancel
-    # intent prevents a zero-cost pre-dispatch retry from racing the stop rail.
+    Retry rails have more than one entry point (transport exceptions and
+    format-repair/empty responses). Keep the durable stop check in one seam so
+    every path observes the same fail-closed owner decision before dispatch.
+    """
     if usage_ctx is not None:
         task_id = str(getattr(usage_ctx, "task_id", "") or "")
         drive_root = getattr(usage_ctx, "drive_root", None)
@@ -320,11 +319,24 @@ def retryable_review_exception(exc: Exception, usage_ctx: Any) -> bool:
                 from ouroboros.cancel_intents import cancel_pending
 
                 if cancel_pending(drive_root, task_id, strict=True):
-                    return False
+                    return True
             except Exception:
                 # An unreadable cancel projection must not authorize another
                 # paid/retryable physical attempt.
-                return False
+                return True
+    return False
+
+
+def retryable_review_exception(exc: Exception, usage_ctx: Any) -> bool:
+    """Whether a second byte-identical review send has a terminal basis."""
+    from ouroboros.loop_llm_call import classify_llm_exception
+
+    # A cancellation requested after the first route attempt is a terminal
+    # owner decision for this wave, even when the transport wrapper surfaced a
+    # generic retryable preparation error. Reusing the existing durable cancel
+    # intent prevents a zero-cost pre-dispatch retry from racing the stop rail.
+    if review_retry_cancelled(usage_ctx):
+        return False
 
     classification = classify_llm_exception(exc)
     if classification.kind == "provider_outcome_unknown":

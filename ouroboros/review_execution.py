@@ -401,7 +401,8 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
                 # transport did not enter usage_accounting's canonical marker.
                 # The coordinator wraps raw stamps once-only, so this fallback
                 # cannot double-charge a route that already marked dispatch.
-                if getattr(exc, "physical_attempt_capture", None) is not None:
+                capture = getattr(exc, "physical_attempt_capture", None)
+                if str(getattr(capture, "state", "") or "") in {"dispatched", "settled", "unresolved"}:
                     invoke_review_paid_stamp(self.assignment.dispatch_stamp)
                 raise
         # Null/non-object provider messages follow the caller's empty-response rail.

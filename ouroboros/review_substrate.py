@@ -45,6 +45,7 @@ from ouroboros.review_execution import (  # noqa: F401  (compat re-exports)
     assert_cache_breakpoint_cap,
     configured_review_routes,
 )
+from ouroboros.review_custody import review_retry_cancelled
 # Reviewer-output JSON extraction lives in ONE place beside the array
 # extractor it falls back to (the fenced-object and verdict parsers were
 # split across two modules for no reason).
@@ -1376,6 +1377,17 @@ class ReviewCoordinator:
                 _prior_msg, _prior_usage, _prior_text = None, None, ""
                 _last_msg, _last_usage, _last_text, _has_prior = None, None, "", False
                 for actor_attempt in range(actor_attempts):
+                    if actor_attempt and review_retry_cancelled(self.usage_ctx):
+                        # Every retry shape (transport, malformed output, and
+                        # empty output) shares this durable stop fence. The
+                        # first response remains the forensic answer; no new
+                        # paid physical attempt is authorized after cancel.
+                        if _has_prior:
+                            msg, usage, raw_text = _last_msg, _last_usage, _last_text
+                            break
+                        raise UsageAccountingError(
+                            "review retry cancelled before physical dispatch"
+                        )
                     if (
                         actor_attempt and logical_deadline_monotonic is not None
                         and time.monotonic() >= logical_deadline_monotonic
@@ -1438,6 +1450,11 @@ class ReviewCoordinator:
                                     "Failed to persist malformed first acceptance attempt for %s/%s — the repair resend will overwrite it",
                                     request.surface, slot.slot_id, exc_info=True,
                                 )
+                            if review_retry_cancelled(self.usage_ctx):
+                                # Cancellation is a durable owner decision,
+                                # not a transport-only concern. Do not issue a
+                                # format-repair resend after it linearizes.
+                                break
                             continue  # extraction/format repair: one same-route resend
                         break
                     if _prior_text:

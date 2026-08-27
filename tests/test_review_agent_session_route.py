@@ -1758,6 +1758,40 @@ def test_api_review_rechecks_owner_deadline_at_physical_boundary(tmp_path, fake_
     assert llm.calls == []
 
 
+def test_api_review_does_not_stamp_pre_dispatch_released_capture(
+    tmp_path, fake_route,
+):
+    from ouroboros.usage_accounting import PhysicalAttemptCapture
+    from ouroboros.review_execution import (
+        ApiChatReviewExecutor, ReviewAssignment,
+    )
+
+    stamps = []
+
+    class ReleasedBeforeSend:
+        def chat(self, **_kwargs):
+            error = RuntimeError("request preparation failed")
+            error.physical_attempt_capture = PhysicalAttemptCapture(
+                attempt_id="attempt-released", model="fake", provider="test",
+                state="released", candidate_measurement_kind="opaque",
+            )
+            raise error
+
+    executor = ApiChatReviewExecutor(
+        ReviewAssignment(
+            request=_agent_request(),
+            slot=_agent_slot(route=ReviewRouteKind.API_CHAT),
+            custody_root=tmp_path,
+            dispatch_stamp=lambda: stamps.append("paid"),
+        ),
+        llm=ReleasedBeforeSend(),
+    )
+
+    with pytest.raises(RuntimeError, match="request preparation failed"):
+        executor.execute()
+    assert stamps == []
+
+
 def test_api_review_does_not_dispatch_inside_finalization_reserve(
     tmp_path, fake_route, monkeypatch,
 ):
