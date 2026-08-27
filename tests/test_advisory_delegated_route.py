@@ -12,6 +12,7 @@ agent-session route tests stands in for the Claudexor control plane.
 import json
 import pathlib
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -455,6 +456,36 @@ def test_api_route_applies_the_advisory_rows_model_and_effort(tmp_path, monkeypa
     assert [i["item"] for i in items] == ["correctness"]
     assert captured["model"] == "sonnet" and model == "sonnet"
     assert captured["effort"] == "high"
+
+
+def test_api_advisory_narrows_child_wait_to_owner_deadline(tmp_path, monkeypatch):
+    """The nested Claude child cannot outlive the owner's remaining window."""
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", _SLOTS_API_ADVISORY)
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "1")
+    captured = {}
+
+    def _fake_run(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            success=True, result_text=_ADVISORY_ITEMS, session_id="sess-1",
+            cost_usd=0.0, usage={}, error="", stderr_tail="",
+        )
+
+    monkeypatch.setattr("ouroboros.gateways.claude_code.run_readonly", _fake_run)
+    ctx = _ctx(tmp_path)
+    ctx.task_metadata = {
+        "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=8)).isoformat(),
+    }
+
+    _items, raw, _model, _chars = advisory._run_claude_advisory(
+        ctx.repo_dir, "msg", ctx, options={"include_repo_diff": False},
+    )
+
+    assert not raw.startswith("⚠️ ADVISORY_ERROR"), raw
+    assert 0 < captured["timeout_sec"] <= 7.1
 
 
 def test_api_advisory_does_not_start_inside_finalization_reserve(tmp_path, monkeypatch):

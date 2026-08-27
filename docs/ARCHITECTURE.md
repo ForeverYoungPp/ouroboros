@@ -1987,7 +1987,9 @@ reusing one fixed structural settlement margin; the global owner tool-timeout
 setting may widen the outer envelope, while the complete hierarchy is narrowed
 inside the owner deadline and finalization reserve before dispatch. Anthropic's direct
 route keeps its 120-second provider default, and neither provider value is used
-as a generic review-reasoning cutoff. A returned provider response or typed
+as a generic review-reasoning cutoff. The non-delegated Claude advisory child
+also inherits the remaining owner window, while its 900-second process cap is
+kept when no owner deadline exists. A returned provider response or typed
 terminal error
 is settled even when its body is empty/incomplete, so bounded repair/retry may
 apply. A dead socket or unterminated stream after dispatch is instead

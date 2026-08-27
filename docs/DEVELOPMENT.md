@@ -1754,7 +1754,9 @@ Before every commit, verify the following:
   `plan_task` ToolEntry envelope covers `max(transport + 2 × grace,
   task-absolute-ceiling + grace)`, so an `agent_session` worker can settle
   inside the same existing task lifetime instead of being abandoned by an
-  API-only wrapper.
+  API-only wrapper. The non-delegated Claude advisory child follows the same
+  owner-narrowed process bound; with no owner deadline it keeps its 900-second
+  child-safety ceiling.
 - [ ] A paid process-local review belongs to the exact existing process-custody
   identity stamped in its commit-attempt row: server session plus pid. A new
   Agent, a sibling worker boot, task return, heartbeat silence, or elapsed time

@@ -36,7 +36,10 @@ from ouroboros.review_state import (
 )
 from ouroboros.config import get_review_enforcement as _get_review_enforcement
 from ouroboros.config import get_finalization_grace_sec
-from ouroboros.deadline_utils import owner_deadline_exhausted_for_context
+from ouroboros.deadline_utils import (
+    dispatch_window_remaining_sec,
+    owner_deadline_exhausted_for_context,
+)
 from ouroboros.tools.review_helpers import (
     build_advisory_changed_context,
     build_skill_host_context,
@@ -696,6 +699,15 @@ def advisory_slot_enabled() -> bool:
     return bool(advisory_slot_config().enabled)
 
 
+def _advisory_child_timeout(ctx: object) -> Optional[float]:
+    metadata = getattr(ctx, "task_metadata", {})
+    return dispatch_window_remaining_sec(
+        deadline_at=(metadata or {}).get("deadline_at") if isinstance(metadata, dict) else None,
+        deadline_ts=getattr(ctx, "deadline_ts", None),
+        reserve_sec=get_finalization_grace_sec(),
+    )
+
+
 def advisory_route_requires_api_key() -> bool:
     """Whether THIS advisory route needs ANTHROPIC_API_KEY (plan 5.8: the four
     key checks are route-dependent — an api route requires the key exactly as
@@ -1279,7 +1291,6 @@ def _run_claude_advisory(
 
     prompt_chars = len(prompt)
     diag = _get_runtime_diagnostics(model, prompt_chars, resolved_paths)
-
     size_skip = _predispatch_size_skip(ctx, delegated_route, model, prompt, managed_subject_diff)
     if size_skip is not None:
         return size_skip
@@ -1317,6 +1328,7 @@ def _run_claude_advisory(
                 max_budget_usd = _advisory_sdk_budget(ctx, active_scope, drive_root, repo_dir)
             if owner_deadline_exhausted_for_context(ctx, reserve_sec=get_finalization_grace_sec()):
                 raise TimeoutError("owner deadline leaves no dispatch window for advisory review")
+            child_timeout_sec = _advisory_child_timeout(ctx)
             if active_scope is not None:
                 from dataclasses import replace
                 from ouroboros.usage_accounting import usage_scope
@@ -1327,13 +1339,13 @@ def _run_claude_advisory(
                     result = run_readonly(
                         prompt=prompt, cwd=str(repo_dir), model=model,
                         max_turns=DEFAULT_CLAUDE_CODE_MAX_TURNS,
-                        effort=scope_effort, max_budget_usd=max_budget_usd,
+                        effort=scope_effort, max_budget_usd=max_budget_usd, timeout_sec=child_timeout_sec,
                     )
             else:
                 result = run_readonly(
                     prompt=prompt, cwd=str(repo_dir), model=model,
                     max_turns=DEFAULT_CLAUDE_CODE_MAX_TURNS,
-                    effort=scope_effort, max_budget_usd=max_budget_usd,
+                    effort=scope_effort, max_budget_usd=max_budget_usd, timeout_sec=child_timeout_sec,
                 )
 
         meta = {
