@@ -333,6 +333,14 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
         False,
         "agent_task_pipeline.py terminal custody audit; a delegated-child infrastructure terminal, never a root benchmark capability result",
     ),
+    "provider_outcome_unknown": (
+        False,
+        "tools/search.py recoverable ambiguous paid-call result returned to the LLM; the root task remains live",
+    ),
+    "deadline_exhausted": (
+        False,
+        "loop_llm_call.py owner deadline admission rail; no provider call was dispatched",
+    ),
     "task_exception": (False, "agent.py:777 the attempt ran and crashed; an honest failure"),
     "capability_profile_mismatch": (False, "control_delegation.py:81 rejected delegate call"),
     "delegation_rights_may_delegate": (False, "control_delegation.py explicit parent recursion-right refusal"),

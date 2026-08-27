@@ -6,14 +6,17 @@ Q16/Q17; Max-Review-Cycles fix round).
 The ``paid`` fact of Max-Review-Cycles accounting is recorded at PHYSICAL
 dispatch: a gate that must durably record "this wave spent reviewer money"
 installs a :class:`ReviewPaidStamp` on ``ctx._review_paid_stamp`` for the
-duration of its wave. The coordinator captures that exact once-only object;
-session routes invoke it at their physical point of no return, while API routes
-bind it for the canonical physical-attempt boundary to invoke.
-Assembly-only refusals (triad fit ladder, scope pack
-signals, skill prompt building) exit before the seam, so a $0 attempt stays
-outside every ceiling; a crash after dispatch keeps the durable paid fact
-(write-ahead). This seam is also where the L-review lane's two-phase
-admission slots in at synthesis.
+duration of its wave, and the shared reviewer transport entry
+(``review_custody.run_custodied_review_slots``) invokes it after slot resolution and
+immediately before worker fan-out. The coordinator also captures that exact
+once-only object: session routes invoke it before their replayable
+``START_REQUESTED`` row, while API routes bind it for the canonical physical-
+attempt boundary. Assembly-only refusals (triad fit ladder, scope pack signals,
+skill prompt building) exit before the seam, so a $0 attempt stays outside
+every ceiling; a worker that outlives its logical caller cannot race the
+write-ahead fact, and a crash after dispatch keeps the durable paid fact.
+Commit review verifies this write fail-closed; other callers retain historical
+fail-open accounting. This seam also hosts the L-review lane's two-phase admission.
 """
 
 from __future__ import annotations
@@ -266,7 +269,7 @@ def invoke_bound_api_review_paid_stamp(
 
 
 def stamp_review_paid_on_dispatch(ctx: Any) -> None:
-    """Invoke the caller-installed stamp; retained for legacy/test callers."""
+    """Invoke the caller-installed stamp at the shared dispatch boundary."""
     invoke_review_paid_stamp(
         getattr(ctx, "_review_paid_stamp", None) if ctx is not None else None
     )

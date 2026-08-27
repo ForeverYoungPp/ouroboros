@@ -104,7 +104,13 @@ def test_drain_incoming_messages_preserves_image_payload():
 
 
 def test_owner_directives_survive_compaction_without_control_prose(tmp_path):
-    from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
+    from ouroboros import task_pacing
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.owner_mailbox import (
+        KIND_FINALIZE_NOW,
+        drain_owner_entries,
+        write_owner_message,
+    )
 
     ctx = SimpleNamespace()
     messages = [
@@ -119,6 +125,14 @@ def test_owner_directives_survive_compaction_without_control_prose(tmp_path):
         tmp_path, "deadline control", task_id="root", msg_id="control-1",
         kind=KIND_FINALIZE_NOW,
     )
+    control_entry = next(
+        row for row in drain_owner_entries(tmp_path, "root")
+        if row["msg_id"] == "control-1"
+    )
+    expected_deadline = (
+        parse_deadline_ts(control_entry["ts"]).timestamp()
+        + task_pacing.effective_finalization_reserve_sec(ctx)
+    )
 
     controls = _drain_incoming_messages(
         messages,
@@ -130,7 +144,9 @@ def test_owner_directives_survive_compaction_without_control_prose(tmp_path):
         owner_ctx=ctx,
     )
 
-    assert controls == {"finalize_now": "deadline control"}
+    assert set(controls) == {"finalize_now", "finalize_deadline_ts"}
+    assert controls["finalize_now"] == "deadline control"
+    assert controls["finalize_deadline_ts"] == expected_deadline
     assert [row["source"] for row in ctx._owner_directives] == [
         "initial_user", "direct_incoming", "owner_mailbox",
     ]
@@ -1118,6 +1134,48 @@ def test_budget_rail_after_dispatch_is_terminal_without_provider_fallback(tmp_pa
     root_fence = events.get_nowait()
     assert root_fence["type"] == "budget_root_fence"
     assert root_fence["root_task_id"] == "budget-root"
+
+
+def test_unknown_dispatched_outcome_skips_cross_model_fallback(tmp_path, monkeypatch):
+    from ouroboros.tools.registry import ToolRegistry
+
+    class FakeLLM:
+        def default_model(self):
+            return "test-model"
+
+    calls = {"primary": 0, "fallback": 0}
+
+    def ambiguous(*args, **_kwargs):
+        calls["primary"] += 1
+        usage = args[10]
+        usage["_last_llm_error"] = "provider outcome unknown"
+        usage["_last_llm_error_kind"] = "provider_outcome_unknown"
+        usage["_last_llm_retry_same_request"] = False
+        return None, 0.0
+
+    def forbidden_fallback(**_kwargs):
+        calls["fallback"] += 1
+        raise AssertionError("unknown physical work must stop the paid chain")
+
+    monkeypatch.setattr(loop_mod, "call_llm_with_retry", ambiguous)
+    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", forbidden_fallback)
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+
+    result, usage, _trace = run_llm_loop(
+        messages=[{"role": "user", "content": "go"}],
+        tools=registry,
+        llm=FakeLLM(),
+        drive_logs=tmp_path,
+        emit_progress=lambda _text: None,
+        incoming_messages=queue.Queue(),
+        task_id="unknown-provider-task",
+        drive_root=tmp_path,
+    )
+
+    assert calls == {"primary": 1, "fallback": 0}
+    assert usage["_last_llm_error_kind"] == "provider_outcome_unknown"
+    assert "no retry or paid fallback" in result
 
 
 def test_run_llm_loop_narrates_reasoning_to_bubble_not_trace(tmp_path, monkeypatch):

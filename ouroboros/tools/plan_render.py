@@ -67,6 +67,12 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
     at_cap = cap is not None and cycles_paid >= cap
     if bool(wave.get("closed")):
         return "Closed: proceed with the reviewed spec."
+    if bool(wave.get("custody_pending")):
+        return (
+            "Open: one or more paid reviewer operations are still in flight. "
+            "The responses received so far are not final authority; wait for "
+            "custody reconciliation before treating this wave as closed."
+        )
     if aggregate == "DEGRADED":
         # B2: facts, not a retry coach (BIBLE P5 — the host never dictates the next tool
         # call). Quorum arithmetic, per-slot typed states above, and the replay mechanics;
@@ -170,7 +176,12 @@ def _render_wave(
         lines += ["", f"(bounded hot history: this wave is a compact summary; {detail})"]
     if reminder:
         lines += ["", "⚠️ " + reminder]
-    if aggregate == "DEGRADED":
+    if wave.get("custody_pending"):
+        lines += [
+            "", "⚠️ REVIEW CUSTODY PENDING: the received quorum is provisional; "
+            "a paid reviewer operation is still in flight and this wave remains open."
+        ]
+    elif aggregate == "DEGRADED":
         # Banner aligned with _next_step: the replay promise depends on whether the
         # wave carries structural snapshot evidence (see _degraded_replay_note).
         lines += ["", "⚠️ DEGRADED: no parseable reviewer quorum — recorded as an OPEN wave; "

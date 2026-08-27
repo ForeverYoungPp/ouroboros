@@ -78,6 +78,89 @@ def authority_wave(drive_root: Any, task_id: str, hot_wave: Optional[dict]) -> O
     return {**exact, **hot_wave, "findings": list(exact.get("findings") or [])}
 
 
+def in_flight_resume_inputs(
+    existing: Dict[str, Any], state: Dict[str, Any], state_root: pathlib.Path,
+    task_id: str, configured_slots: list,
+) -> Dict[str, Any]:
+    """Recover the exact physical set of one already-paid plan-review cycle."""
+    from ouroboros.tools.plan_review_runtime import plan_reviewer_config_fingerprint
+
+    stored_roster = str(existing.get("reviewer_config_fingerprint") or "")
+    if stored_roster and stored_roster != plan_reviewer_config_fingerprint(configured_slots):
+        return {"error": (
+            "The reviewer roster changed while the prior paid cycle is still in flight. "
+            "Refusing to mix rosters or start a second panel before that cycle settles."
+        )}
+    previous = None
+    previous_fingerprint = str(existing.get("previous_fingerprint") or "")
+    if previous_fingerprint:
+        from ouroboros.task_results import plan_review_wave
+
+        previous = plan_review_wave(state, previous_fingerprint)
+        if previous is not None:
+            try:
+                previous = authority_wave(state_root, task_id, previous)
+            except (OSError, ValueError, json.JSONDecodeError):
+                return {"error": (
+                    "Prior exact plan-review authority is unreadable; "
+                    "in-flight reconciliation is refused."
+                )}
+    actor_rows = [row for row in (existing.get("actors") or []) if isinstance(row, dict)]
+    configured_ids = {str(getattr(slot, "slot_id", "") or "") for slot in configured_slots}
+    actor_ids = [str(row.get("slot_id") or "") for row in actor_rows]
+    if not actor_rows or any(not slot_id for slot_id in actor_ids) \
+            or len(actor_ids) != len(set(actor_ids)) or set(actor_ids) != configured_ids:
+        return {"error": (
+            "The prior paid cycle's exact reviewer rows do not match its frozen roster. "
+            "Refusing to guess which physical calls own custody."
+        )}
+    dispatched_ids = {
+        str(row.get("slot_id") or "") for row in actor_rows
+        if str(row.get("operation_id") or "")
+    }
+    if not dispatched_ids or any(
+        (str(row.get("operation_state") or "") == "in_flight"
+         or bool(row.get("late_result_pending")))
+        and str(row.get("slot_id") or "") not in dispatched_ids
+        for row in actor_rows
+    ):
+        return {"error": (
+            "The prior paid cycle does not contain an exact physical-dispatch set. "
+            "Refusing to infer custody from current reviewer health."
+        )}
+    frozen_rows = []
+    for row in actor_rows:
+        if str(row.get("slot_id") or "") in dispatched_ids:
+            continue
+        if bool(row.get("ok")) or not str(row.get("error") or ""):
+            return {"error": (
+                "A prior reviewer row lacks physical-dispatch custody and is not a frozen "
+                "$0 refusal. Reconciliation is refused."
+            )}
+        frozen = dict(row)
+        frozen.setdefault("text", "")
+        frozen.setdefault("request_model", str(row.get("model") or ""))
+        frozen_rows.append(frozen)
+    health_evidence = {
+        str(row.get("slot") or ""): {
+            "failure_code": str(row.get("code") or ""),
+            "reset_at": str(row.get("reset_at") or ""),
+        }
+        for row in (existing.get("health_epoch") or []) if isinstance(row, dict)
+        and str(row.get("slot") or "")
+    }
+    cycle_index = int(existing.get("cycle_index") or state.get("cycles_paid") or 1)
+    return {
+        "previous": previous,
+        "cycle_index": cycle_index,
+        "retry_key": str(existing.get("retry_key") or "")
+        or f"plan_review:{existing.get('request_fingerprint')}:{cycle_index}",
+        "dispatched_slot_ids": sorted(dispatched_ids),
+        "frozen_rows": frozen_rows,
+        "health_evidence": health_evidence,
+    }
+
+
 def hot_index_wave(wave: dict, *, page_size: int) -> dict:
     """Keep a bounded per-slot page; exact authority stays in ``wave_artifact``."""
     findings = [dict(row) for row in wave.get("findings") or [] if isinstance(row, dict)]
