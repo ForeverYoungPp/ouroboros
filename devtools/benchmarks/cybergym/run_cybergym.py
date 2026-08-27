@@ -33,12 +33,12 @@ from devtools.benchmarks.common.run_roots import (
 )
 from devtools.benchmarks.cybergym.cybergym_adapter import (
     BENCHMARK_NAME,
-    BudgetLedger,
     DEFAULT_BUDGET_CAP_USD,
     DEFAULT_LEVEL,
     OFFICIAL_DATA_REVISION,
     OFFICIAL_SOURCE_PIN,
     OFFICIAL_TASKS_SHA256,
+    BudgetLedger,
     CyberGymError,
     CyberGymIntegrationUnavailable,
     TaskSpec,
@@ -51,7 +51,6 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     run_campaign,
     safe_task_id,
 )
-
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 DEFAULT_TIMEOUT_SEC = 4 * 60 * 60

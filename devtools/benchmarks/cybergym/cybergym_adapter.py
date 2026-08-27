@@ -23,7 +23,6 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
-
 BENCHMARK_NAME = "cybergym"
 DEFAULT_LEVEL = "level1"
 FINAL_POC_BASENAME = "final.poc"
@@ -318,12 +317,17 @@ def pre_admission_report(
     if not url:
         reasons.append("server_url_missing")
     else:
-        parsed = urlsplit(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        try:
+            parsed = urlsplit(url)
+            hostname = parsed.hostname
+        except ValueError:
+            parsed = None
+            hostname = None
+        if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.netloc:
             reasons.append("server_url_must_be_http")
-        if parsed.username or parsed.password:
+        elif parsed.username or parsed.password:
             reasons.append("server_url_must_not_contain_credentials")
-        if parsed.hostname in {"0.0.0.0", "::", "*"}:
+        if hostname in {"0.0.0.0", "::", "*"}:
             reasons.append("server_url_wildcard_host")
     return {
         "ok": not reasons,
@@ -1126,7 +1130,7 @@ def run_campaign(
                 ledger.mark_unresolved(str(claim["attempt_id"]), outcome.get("cost_upper_bound_usd"))
             else:
                 ledger.settle(str(claim["attempt_id"]), float(outcome["cost_usd"]))
-        except (CyberGymError, OSError, TypeError, ValueError) as exc:
+        except Exception as exc:
             if claim is not None:
                 try:
                     ledger.mark_unresolved(str(claim["attempt_id"]), None)

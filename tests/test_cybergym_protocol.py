@@ -11,6 +11,7 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     BudgetRefused,
     ClaimRefused,
     FinalPocRefused,
+    LedgerError,
     build_generate_task_argv,
     build_task_result_row,
     classify_official_exit,
@@ -122,5 +123,5 @@ def test_budget_projection_replays_terminal_states():
     )
     assert projection.projected_usd == 1.5
     assert projection.can_dispatch
-    with pytest.raises(Exception):
+    with pytest.raises(LedgerError):
         project_budget([{"event": "settle", "attempt_id": "orphan", "cost_usd": 1}])
