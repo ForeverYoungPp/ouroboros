@@ -126,6 +126,70 @@ def test_true_default_still_materializes_child_artifacts(tmp_path):
     )
 
 
+def test_generic_receipt_named_output_never_owns_receipt_authority(tmp_path):
+    """A user/process output may keep its name, never the receipt SSOT path."""
+    from ouroboros.artifacts import (
+        collect_task_artifact_records,
+        copy_file_to_task_artifacts,
+    )
+    from ouroboros.outcomes import (
+        append_verification_receipt,
+        read_verification_receipts,
+        verification_receipts_path,
+    )
+
+    drive = tmp_path / "data"
+    source = tmp_path / "outside" / "verification_receipts.jsonl"
+    source.parent.mkdir()
+    source.write_text('{"artifact":"v1"}\n', encoding="utf-8")
+    ctx = SimpleNamespace(drive_root=drive, task_id="receipt-collision")
+
+    first = copy_file_to_task_artifacts(ctx, source, kind="process_output")
+    authority = verification_receipts_path(drive, ctx.task_id)
+    assert first is not None
+    assert first["name"].startswith("verification_receipts.")
+    assert first["name"].endswith(".jsonl")
+    assert first["path"] != str(authority)
+
+    assert append_verification_receipt(
+        drive,
+        ctx.task_id,
+        {"status": "pass", "criterion_id": "host"},
+    )
+    source.write_text('{"artifact":"v2"}\n', encoding="utf-8")
+    second = copy_file_to_task_artifacts(ctx, source, kind="process_output")
+
+    assert second is not None
+    assert second["path"] == first["path"]
+    assert any(
+        row.get("criterion_id") == "host"
+        for row in read_verification_receipts(drive, ctx.task_id)
+    )
+    records = collect_task_artifact_records(drive, ctx.task_id)
+    assert [item["path"] for item in records] == [first["path"]]
+
+    from ouroboros.tools.core import _write_file
+    from ouroboros.tools.registry import ToolContext
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    tool_ctx = ToolContext(repo_dir=repo, drive_root=drive, task_id=ctx.task_id)
+    blocked = _write_file(
+        tool_ctx,
+        path="verification_receipts.jsonl",
+        content='{"generic":"overwrite"}\n',
+        root="artifact_store",
+    )
+    assert "verification receipt authority path is reserved" in blocked
+    nested = _write_file(
+        tool_ctx,
+        path="nested/verification_receipts.jsonl",
+        content='{"generic":"allowed"}\n',
+        root="artifact_store",
+    )
+    assert nested.startswith("OK: wrote artifact_store:nested/")
+
+
 def test_history_and_tasks_list_paths_do_no_artifact_work(tmp_path, monkeypatch):
     """Counter-assert: GET /api/chat/history and GET /api/tasks perform ZERO
     collect_task_artifact_records / copy_file_to_task_artifacts calls."""

@@ -305,7 +305,9 @@ def test_strict_paid_stamp_failure_starts_no_worker_and_leaks_no_active_row(tmp_
         )
 
     assert calls == []
-    assert stamp.fired is False
+    # Strict task-acceptance stamps latch the failed write so every parallel
+    # dispatcher replays the same refusal without attempting another payment.
+    assert stamp.fired is True
     assert _attempt_key(request, slot) not in _ACTIVE
 
 

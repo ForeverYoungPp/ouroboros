@@ -3058,7 +3058,7 @@ def test_ui_smoke_v679_subagent_depth_zero_round_trips_through_settings(direct_s
                 assert depth.get_attribute("min") == "0"
                 assert depth.get_attribute("max") == "10"
                 assert depth.is_enabled()
-                assert depth.input_value() == "2"  # unset -> visible fallback
+                assert depth.input_value() == "3"  # unset -> visible fallback
                 page.screenshot(path=str(evidence_dir / "v679-depth-01-initial-unset.png"))
 
                 # 0 is a valid value for the control, not a validation error.
@@ -3076,7 +3076,7 @@ def test_ui_smoke_v679_subagent_depth_zero_round_trips_through_settings(direct_s
                 assert saved_depth() == 0
                 page.screenshot(path=str(evidence_dir / "v679-depth-03-saved-zero.png"))
 
-                # The round trip is the point: a reload must not rewrite 0 back to 2.
+                # The round trip is the point: a reload must not rewrite 0 back to 3.
                 open_settings_advanced()
                 assert page.locator("#s-subagent-depth").input_value() == "0"
                 assert saved_depth() == 0
@@ -3090,14 +3090,14 @@ def test_ui_smoke_v679_subagent_depth_zero_round_trips_through_settings(direct_s
                 assert page.locator("#s-subagent-depth").input_value() == "3"
                 page.screenshot(path=str(evidence_dir / "v679-depth-05-reload-three.png"))
 
-                # Neighbouring state: empty is not a value — it falls back to 2 rather than
+                # Neighbouring state: empty is not a value — it falls back to 3 rather than
                 # persisting an unparsable setting.
                 type_depth("")
                 page.screenshot(path=str(evidence_dir / "v679-depth-06-empty-typed.png"))
                 save_and_wait()
-                assert saved_depth() == 2
+                assert saved_depth() == 3
                 open_settings_advanced()
-                assert page.locator("#s-subagent-depth").input_value() == "2"
+                assert page.locator("#s-subagent-depth").input_value() == "3"
                 page.screenshot(path=str(evidence_dir / "v679-depth-07-reload-after-empty.png"))
             finally:
                 browser.close()

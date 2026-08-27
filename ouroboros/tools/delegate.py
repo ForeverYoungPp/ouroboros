@@ -48,6 +48,11 @@ from ouroboros.delegate_source_coverage import (
     record_started_custody,
 )
 from ouroboros.delegate_supervision import delegate_wait_entry as _delegate_wait_entry
+from ouroboros.delegate_start_instructions import (
+    HOST_INSTRUCTIONS as _HOST_INSTRUCTIONS,
+    UNPROVEN_BOUNDARY_INSTRUCTION as _UNPROVEN_BOUNDARY_INSTRUCTION,
+    append_coordination_context,
+)
 from ouroboros.subagent_runtime import (  # noqa: F401 - shared primitive re-export
     delegate_start_entry as _delegate_start_entry,
     exact_start,
@@ -143,40 +148,6 @@ _CLAUDEXOR_MAX_SECONDS = 604_800
 # above); re-bound here because sibling code and tests name it on this surface.
 _CUSTODY = custody._CUSTODY
 
-# Layered onto every lane by Claudexor (native system-prompt channel per harness). The
-# SAME prohibitions an ordinary subagent carries; a statement, not the enforcement —
-# that is the access profile plus the nanny's own workspace-patch capture.
-_HOST_INSTRUCTIONS = (
-    "You are a delegated worker running inside another agent's working tree. Your "
-    "authority is everything INSIDE this root and nothing outside it. Do not run git "
-    "commit, tag, push, rebase, reset or any other history-moving command: your host "
-    "takes the diff of this tree and integrates it itself, and a moved HEAD invalidates "
-    "that diff and destroys your work. Do not review or accept your own change, do not "
-    "touch the host's runtime controls, skills, or memory, and do not write outside "
-    "this root. If your environment offers a way to ask your host a clarifying "
-    "question, you may use it: your host may answer from its task context; a question "
-    "that carries an engine expiry times out benignly if unanswered — continue with "
-    "stated assumptions rather than blocking — while one without an expiry waits until "
-    "answered. If your harness cannot ask mid-run, do NOT end the run to ask — "
-    "state your assumption and continue."
-)
-
-# DESTINATION 2 of the disclosure ("Disclose instead of forbid": durable record, the
-# CHILD'S PROMPT, the parent's result). The OS boundary is a REQUEST — the engine applies
-# one only where it has a mechanism, and nothing at start knows which — so the child is
-# told the only true thing: behave as though nothing is stopping you, and do not claim an
-# isolation you cannot show. What was applied reaches the parent from the run's own
-# artifacts through `_containment_evidence`.
-_UNPROVEN_BOUNDARY_INSTRUCTION = (
-    " An OS-enforced filesystem boundary was REQUESTED for this run but is NOT guaranteed: "
-    "your engine applies one only where it has a mechanism for this host, and your host "
-    "reads back from your own attempt records what was actually applied. Work as if there "
-    "is no boundary — stay inside this root, do not read the operator's home directory, "
-    "credential stores, or the harness runtime tree, and do NOT describe yourself in your "
-    "answer as sandboxed or confined. If your own environment shows you whether a boundary "
-    "was in force, say so plainly."
-)
-
 
 def _host_instructions(authority: "DelegatedRunShape", assignment: str = "",
                        payload_skill: str = "") -> str:
@@ -195,6 +166,17 @@ def _host_instructions(authority: "DelegatedRunShape", assignment: str = "",
     if assignment:
         text += "\n\n" + assignment
     return text
+
+
+def _build_start_instructions(
+    authority: "DelegatedRunShape", assignment: str = "", payload_skill: str = "",
+    coordination_context: str = "",
+) -> tuple[str, str]:
+    """Build the bounded instruction field for a fresh physical start."""
+    return append_coordination_context(
+        _host_instructions(authority, assignment, payload_skill), coordination_context,
+        instruction_budget_chars=_ASSIGNMENT_FIELD_CHARS,
+    )
 
 
 def _derive_authority(ctx: ToolContext) -> "DelegatedRunShape":
@@ -596,7 +578,7 @@ def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str,
 
 
 def _start_request(ctx: ToolContext, route: Any, authority: "DelegatedRunShape",
-                   root: str, text: str, seconds: int, instructions: str) -> Dict[str, Any]:
+                   root: str, text: str, seconds: int, instructions: str, execution_root: str = "") -> Dict[str, Any]:
     """The POST body for one delegated run, built from the derived SHAPE.
 
     Extracted so the caller stays inside the method-size gate, and so the body has ONE
@@ -643,10 +625,8 @@ def _start_request(ctx: ToolContext, route: Any, authority: "DelegatedRunShape",
         # Claudexor would otherwise hand the harness the operator's real `$HOME`
         # — daemon control token included. Sending one without the other is the
         # containment hole, so neither is assembled separately.
-        request["execution"] = {
-            "isolation": authority.isolation,
-            "delegated": authority.delegated,
-        }
+        request["execution"] = {"isolation": authority.isolation, "delegated": authority.delegated,
+                                **({"workspaceRoot": execution_root} if execution_root else {})}
     if route.model:
         request["model"] = route.model
     if route.effort:
@@ -664,11 +644,12 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                     bucket: Optional[str] = None, skill_name: Optional[str] = None,
                     _resolved_binding: Any = None,
                     _canonical_work_order_fingerprint: str = "",
-                    _work_order_source_request: Any = None) -> str:
+                    _work_order_source_request: Any = None,
+                    _coordination_context: str = "") -> str:
     from ouroboros.claudexor_daemon import ensure_owned_gateway
     from ouroboros.delegate_evidence import record_start_blocked
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
-    from ouroboros.subagents import resolve_subagent_executor, route_health
+    from ouroboros.subagents import delegated_execution_workspace_root, resolve_subagent_executor, route_health
 
     text = str(prompt or "").strip()
     if not text:
@@ -738,6 +719,23 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             if refusal := _presence_delegate_read_refusal(ctx):
                 return refusal
 
+    instructions = ""
+    if not recovering:
+        assignment = "" if bool(actor.get("compiled_work_order")) else _assignment_instructions(ctx)
+        payload_skill = ""
+        if isinstance(payload_auth, dict):
+            payload_skill = str(
+                (payload_auth.get("resource_ref") or {}).get("skill_name") or ""
+            )
+        instructions, instruction_error = _build_start_instructions(
+            authority,
+            assignment,
+            payload_skill=payload_skill,
+            coordination_context=_coordination_context,
+        )
+        if instruction_error:
+            return instruction_error
+
     access = authority.access
     try:
         gateway = ensure_owned_gateway()
@@ -775,7 +773,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             if authority.access == "workspace_write":
                 # C1: the run executes in a PRIVATE snapshot of the authority target,
                 # never in the shared tree. Provisioned (and durably registered)
-                # BEFORE the start intent below; scope.root becomes the snapshot.
+                # BEFORE start; 3.8.1+ separates it from the stable project root.
                 # A payload target gets the STANDALONE snapshot (the live payload
                 # is never initialized as Git); a Git target keeps the worktree
                 # snapshot byte-identically.
@@ -792,30 +790,28 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 baseline_sha = snapshot.baseline_sha
                 root = snapshot.path
                 resource_ref = dict(record_auth.get("resource_ref") or {})
-            existing_project = gateway.find_project_id(root)
-            project_id = existing_project or gateway.register_project(root)
+            execution_root = delegated_execution_workspace_root(gateway, authority, root)
+            scope_root = target_root if execution_root else root
+            existing_project = gateway.find_project_id(scope_root)
+            project_id = existing_project or gateway.register_project(scope_root)
             owned_project_id = "" if existing_project else project_id
             # The canonical ASSIGNMENT — prompt plus host-authored instructions —
             # is digested together: two starts whose prompts agree but whose
             # contract blocks differ are two different logical starts. The digest
             # is the LOOKUP identity only; the wire key stays the invocation id,
             # and a retry replays the STORED body byte-identically regardless.
-            instructions = _host_instructions(
-                authority, "" if bool(actor.get("compiled_work_order")) else _assignment_instructions(ctx),
-                payload_skill=(str((record_auth.get("resource_ref") or {})
-                                   .get("skill_name") or "")
-                               if payload_auth is not None else ""))
-            key = custody.idempotency_key(getattr(ctx, "task_id", ""), route.route_id, access,
-                                          authority.mode, authority.isolation, root, text,
-                                          instructions)
+            key = custody.idempotency_key(getattr(ctx, "task_id", ""), route.route_id,
+                                          access, authority.mode, authority.isolation,
+                                          root, text, instructions)
             seconds = _bounded_max_seconds(ctx, max_seconds)
-            request_body = _start_request(ctx, route, authority, root, text, seconds, instructions)
+            request_body = _start_request(ctx, route, authority, scope_root, text,
+                                          seconds, instructions, execution_root)
         lineage = getattr(ctx, "task_metadata", {}) or {}
         lineage = lineage if isinstance(lineage, dict) else {}
         # Fresh payload run: busy check + durable write = ONE atomic claim (fix 5).
-        requested, claim_holder = claimed_start_request(
-            drive, claim_target=(target_root if (not recovering and
-                                 authority_source == "skill_payload") else ""),
+        requested, claim_refusal = claimed_start_request(
+            drive, claim_target=(target_root if not recovering and authority_source == "skill_payload" else ""),
+            actor_ctx=ctx, enforce_actor_idle=not recovering,
             run_id="", task_id=str(getattr(ctx, "task_id", "") or ""),
             idempotency_key=key, invocation_id=invocation_id,
             max_seconds=seconds, request=request_body, project_id=project_id,
@@ -839,18 +835,19 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             authority_fingerprint=authority_fingerprint,
             work_order_source_request=work_order_source_request,
         )
-        if claim_holder:
+        if claim_refusal:
+            reason = str(claim_refusal.get("reason") or "replacement_custody_unknown")
+            detail = str(claim_refusal.get("detail") or "Actor start claim unavailable.")
+            facts = {key: value for key, value in claim_refusal.items()
+                     if key not in {"reason", "detail"}}
             return _fail(
-                "delegate_start", "payload_delegation_busy",
-                "Another delegated run claimed this exact payload first (the busy "
-                "check and the start-request write are one atomic claim). Finish "
-                "that run before starting another delegation against the same "
-                "skill.", holder=claim_holder,
+                "delegate_start", reason, detail,
+                **facts,
                 **_retire_orphaned_registration(ctx, gateway, owned_project_id,
-                                                definite_refusal=True,
-                                                reason="payload_delegation_busy",
-                                                invocation_id=invocation_id,
-                                                snapshot_id=snapshot_id))
+                    definite_refusal=True,
+                    reason=reason, invocation_id=invocation_id, snapshot_id=snapshot_id,
+                ),
+            )
         if not requested:
             # The POST is CONDITIONAL on the durable request row: a run started
             # without it is live and unfindable if this worker dies. A fresh
@@ -999,9 +996,8 @@ def _started_payload(handle: Dict[str, Any], run_id: str, route: Any, access: st
     if not durable:
         payload["pending_invocation_id"] = str(invocation_id or "")
     if snapshot_id:
-        # The C1 binding, stated where the nanny can read it: the run's scope.root is
-        # the EXECUTION snapshot; the authority target receives nothing until the
-        # explicit apply.
+        # The C1 binding, stated where the nanny can read it: the run edits the
+        # EXECUTION snapshot; the authority target receives nothing until apply.
         payload["execution_root"] = root
         payload["authority_target_root"] = target_root
         payload["baseline_id"] = baseline_sha
@@ -1459,18 +1455,21 @@ def get_tools() -> List[ToolEntry]:
                 "delegate_cancel. The run's output is a CLAIM you must check — you are the "
                 "host, so verification receipts are still yours to write. If no route is "
                 "configured or it is unavailable you get a typed refusal: choose an "
-                "explicit configured alternative, wait, narrow, or report blocked. Fresh "
-                "starts require subagent_id; recovery retries use retry_of without a new "
-                "subagent selector."
+                "explicit configured alternative, wait, narrow, or report blocked. A direct "
+                "fresh start requires subagent_id. In an actor-first configured session the "
+                "host already froze the route and canonical work order: call delegate_start(prompt='') or "
+                "put only optional advisory coordination context in prompt; do not copy the canonical brief. Recovery retries use retry_of without a new selector."
             ),
             "parameters": {
                 "type": "object",
                 "required": ["prompt"],
                 "properties": {
-                "prompt": {"type": "string", "description": "The complete task for the delegated session."},
+                "prompt": {"type": "string", "description":
+                    "Complete task for a direct start; for an actor-first snapshotted session, "
+                    "only optional advisory coordination context (the host supplies the canonical work order)."},
                 "subagent_id": {"type": "string", "description":
-                    "Required for a fresh start: exact agent_session actor id from Available "
-                    "subagents. Omit when replaying retry_of. API actor ids are refused here "
+                    "Required for a fresh start made directly: exact agent_session actor id from Available "
+                    "subagents. Omit for the current actor-first snapshotted route and for retry_of. API actor ids are refused here "
                     "and must be scheduled as recursive children."},
                 "root": {"type": "string", "enum": ["skill_payload"], "description":
                     "Optional exact-resource selector: 'skill_payload' delegates ONE "
@@ -1506,8 +1505,9 @@ def get_tools() -> List[ToolEntry]:
                 "Sleep on a delegated run until a meaningful event. Quiet transport windows "
                 "are renewed by the host with zero model calls; journal progress still streams "
                 "to the human but does not wake you. Terminal settlement, a new interaction, "
-                "fault, addressed owner/task message, cancel/deadline control, or an explicit "
-                "one-shot checkpoint wakes exactly once. A run that asks its "
+                "fault, addressed owner/task message, a direct-child attention/terminal event, "
+                "cancel/deadline control, recovery judgment, or an explicit one-shot checkpoint "
+                "wakes exactly once. A run that asks its "
                 "user a question returns IMMEDIATELY as status='waiting_on_user' with "
                 "the full question set (interaction/question ids ride WHOLE, never "
                 "truncated): answer it with delegate_answer, or escalate to your "

@@ -247,6 +247,72 @@ def test_tree_ledger_scope_and_attention(monkeypatch, tmp_path):
     assert "contract" in digest and "needs_parent_attention" in digest
 
 
+def test_review_requested_preserves_typed_concerns_and_exact_hash(monkeypatch, tmp_path):
+    import ouroboros.task_tree_ledger as L
+    from ouroboros.tools.control import _wait_attention_poll
+
+    monkeypatch.setattr(L, "DATA_DIR", str(tmp_path))
+    payload = {"evidence_ref": "artifact:research-notes", "evidence_sha256": "a" * 64}
+    first = L.tree_ledger_append(
+        "rootA", "review_requested", "Challenge the source coverage.",
+        task_id="childA", role="researcher", payload=payload,
+    )
+    assert first.startswith("OK:")
+    second = L.tree_ledger_append(
+        "rootA", "review_requested", "Same bytes, different security concern.",
+        task_id="childB", role="critic", payload={**payload, "evidence_ref": "artifact:copy"},
+    )
+    assert second.startswith("OK:")
+    rows = [row for row in L.tree_ledger_rows("rootA") if row["kind"] == "review_requested"]
+    assert len(rows) == 2
+    assert all(row["needs_parent_attention"] is True for row in rows)
+    assert rows[0]["payload"] == payload
+    # Recovery/context projections retain the exact 64-character binding, not
+    # merely a prefix that cannot identify the evidence after wake acknowledgement.
+    assert "a" * 64 in L.tree_ledger_page("rootA", data_root=tmp_path)
+    assert "a" * 64 in L.tree_ledger_tail_digest("rootA", data_root=tmp_path)
+
+    # Ordinary sliced waits are branch-local: waiting for childA must not surface
+    # childB's request merely because both share the same tree ledger.
+    ctx = SimpleNamespace(task_id="parentA", task_metadata={"root_task_id": "rootA"})
+    early = _wait_attention_poll(ctx, "", ["childA"])({}, {})
+    assert early is not None
+    assert [row["task_id"] for row in early["beacons"]] == ["childA"]
+    assert "TOOL_ARG_ERROR" in L.tree_ledger_append(
+        "rootA", "review_requested", "missing hash", task_id="childA",
+        payload={"evidence_ref": "artifact:x"},
+    )
+
+
+def test_wait_attention_cursor_delivers_preexisting_same_timestamp_rows_fifo(
+    monkeypatch, tmp_path,
+):
+    import ouroboros.task_tree_ledger as L
+    from ouroboros.tools.control import _wait_attention_poll
+
+    monkeypatch.setattr(L, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(L, "utc_now_iso", lambda: "2026-08-24T12:00:00Z")
+    for index in range(7):
+        assert L.tree_ledger_append(
+            "rootA", "question", f"question-{index}", task_id="childA",
+        ).startswith("OK:")
+
+    # All rows predate entry into the wait.  The response stays bounded, but
+    # advances only across rows it actually delivered, including a timestamp
+    # shared by more rows than the five-item response bound.
+    ctx = SimpleNamespace(task_id="parentA", task_metadata={"root_task_id": "rootA"})
+    first = _wait_attention_poll(ctx, "", ["childA"])({}, {})
+    assert [row["text"] for row in first["beacons"]] == [
+        f"question-{index}" for index in range(5)
+    ]
+    assert first["beacons_remaining"] == 2
+
+    second = _wait_attention_poll(ctx, "", ["childA"])({}, {})
+    assert [row["text"] for row in second["beacons"]] == ["question-5", "question-6"]
+    assert second["beacons_remaining"] == 0
+    assert _wait_attention_poll(ctx, "", ["childA"])({}, {}) is None
+
+
 def test_delegation_constraint_payload_and_override(monkeypatch, tmp_path):
     import ouroboros.task_tree_ledger as L
 

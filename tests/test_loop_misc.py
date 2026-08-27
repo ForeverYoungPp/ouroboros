@@ -39,6 +39,36 @@ from ouroboros.skill_loader import (
 )
 
 
+def _seed_acceptance_root(tmp_path, task_id: str, ctx: SimpleNamespace):
+    """Mirror the production pre-loop canonical RUNNING admission."""
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+
+    contract = build_task_contract({
+        "id": task_id,
+        "root_task_id": task_id,
+        "delegation_role": "root",
+    })
+    write_task_result(
+        tmp_path,
+        task_id,
+        STATUS_RUNNING,
+        root_task_id=task_id,
+        delegation_role="root",
+        task_contract=contract,
+        result="Task is running.",
+    )
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    metadata.update({"root_task_id": task_id, "budget_drive_root": str(tmp_path)})
+    ctx.task_id = task_id
+    ctx.root_task_id = task_id
+    ctx.delegation_role = "root"
+    ctx.task_metadata = metadata
+    ctx.task_contract = contract
+    return contract
+
+
 # ---------------------------------------------------------------------------
 # _drain_incoming_messages — telegram image payload preservation
 # ---------------------------------------------------------------------------
@@ -484,6 +514,7 @@ def test_task_acceptance_agent_tool_is_advisory_before_auto_host_gate(monkeypatc
         is_direct_chat=True,
         drive_root=str(tmp_path),
     )
+    _seed_acceptance_root(tmp_path, "task1", ctx)
 
     def host_panel(*_args, **_kwargs):
         panel_state["calls"] += 1
@@ -596,6 +627,7 @@ def _exercise_owner_followup_during_acceptance_panel(monkeypatch, tmp_path, *, d
         inspect_acceptance_fence=inspect_fence,
         end_acceptance_fence=end_fence,
     )
+    task["task_contract"] = _seed_acceptance_root(tmp_path, root_id, acceptance_ctx)
     acknowledgements = []
     supervisor_ctx = SimpleNamespace(
         DRIVE_ROOT=tmp_path,
@@ -720,6 +752,7 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: solved)
     ctx = SimpleNamespace(_task_acceptance_reviewed=False, is_direct_chat=False, drive_root=str(tmp_path))
+    _seed_acceptance_root(tmp_path, "t", ctx)
     trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
     messages = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     result = _run_task_acceptance_review_once(
@@ -740,11 +773,12 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: blocked)
     ctx2 = SimpleNamespace(_task_acceptance_reviewed=False, is_direct_chat=False, drive_root=str(tmp_path))
+    _seed_acceptance_root(tmp_path, "t-blocked", ctx2)
     trace2 = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
     messages2 = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     tools2 = SimpleNamespace(_ctx=ctx2)
     result2 = _run_task_acceptance_review_once(
-        tools=tools2, content="done", task_id="t", task_type="task",
+        tools=tools2, content="done", task_id="t-blocked", task_type="task",
         llm_trace=trace2, drive_root=None, messages=messages2, emit_progress=lambda _m: None,
     )
     assert result2 is True                                        # capsule -> one bounded re-loop
@@ -762,7 +796,7 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
 
     monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: solved)
     replacement = _run_task_acceptance_review_once(
-        tools=tools2, content="revised", task_id="t", task_type="task",
+        tools=tools2, content="revised", task_id="t-blocked", task_type="task",
         llm_trace=trace2, drive_root=None, messages=messages2, emit_progress=lambda _m: None,
     )
     assert replacement is False
@@ -775,8 +809,9 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     # earlier revision_requested state rather than leaving stale telemetry.
     trace_ok = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
     messages_ok = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
+    _seed_acceptance_root(tmp_path, "t-ok", tools2._ctx)
     result_ok = _run_task_acceptance_review_once(
-        tools=tools2, content="revised", task_id="t", task_type="task",
+        tools=tools2, content="revised", task_id="t-ok", task_type="task",
         llm_trace=trace_ok, drive_root=None, messages=messages_ok, emit_progress=lambda _m: None,
     )
     assert result_ok is False
@@ -788,10 +823,11 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: blocked)
     trace3 = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
     messages3 = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
+    _seed_acceptance_root(tmp_path, "t-blocked-alt", tools2._ctx)
     result3 = _run_task_acceptance_review_once(
         # A changed candidate creates a fresh binding; an unchanged candidate
         # must reuse the already-paid host panel under the v6.65 contract.
-        tools=tools2, content="revised again", task_id="t", task_type="task",
+        tools=tools2, content="revised again", task_id="t-blocked-alt", task_type="task",
         llm_trace=trace3, drive_root=None, messages=messages3, emit_progress=lambda _m: None,
     )
     assert result3 is False                                       # capsule already spent -> finalize
@@ -825,6 +861,7 @@ def test_required_review_blocked_commit_does_not_surface_prior_head(monkeypatch,
     monkeypatch.setattr(re_mod, "collect_turn_diff", _fake_collect)
 
     ctx = SimpleNamespace(_task_acceptance_reviewed=False, is_direct_chat=False, drive_root=str(tmp_path))
+    _seed_acceptance_root(tmp_path, "t", ctx)
     # A blocked commit attempt: is_error False, but structured status is "blocked".
     trace = {"tool_calls": [{"tool": "commit_reviewed", "is_error": False, "status": "blocked"}]}
     messages = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]

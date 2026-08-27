@@ -374,6 +374,7 @@ def test_task_acceptance_abstains_before_review_on_unresolved_partial_source(tmp
     assert evidence["__unresolved_partial_artifacts__"][0]["status"] == "source_unavailable"
 
     llm = _MustNotReviewPartial()
+    paid = []
     result = run_review_request(
         ReviewRequest(
             surface="task_acceptance",
@@ -386,9 +387,11 @@ def test_task_acceptance_abstains_before_review_on_unresolved_partial_source(tmp
         slots=[ReviewSlot(slot_id="slot", model="review-model")],
         drive_root=tmp_path,
         llm=llm,
+        usage_ctx=SimpleNamespace(_review_paid_stamp=lambda: paid.append(True)),
     )
 
     assert llm.calls == 0
+    assert paid == []
     assert result.aggregate_signal == "DEGRADED"
     assert result.degraded is True
     assert result.actors[0]["status"] == "ok"

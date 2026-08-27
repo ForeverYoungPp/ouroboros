@@ -1,6 +1,7 @@
 """WS8: swarm_fanout telemetry shape + reject-meta marker."""
 from __future__ import annotations
 
+import hashlib
 import json
 import types
 
@@ -131,7 +132,10 @@ def test_delegated_run_fanout_silent_when_start_uncustodied(tmp_path):
     assert _fanout_events(tmp_path) == []
 
 
-def _real_delegate_start(tmp_path, monkeypatch, *, metadata, custody_durable=True):
+def _real_delegate_start(
+    tmp_path, monkeypatch, *, metadata, custody_durable=True,
+    actor_first_work_order="", coordination_context="",
+):
     """Run the REAL _delegate_start against a stubbed gateway with an explicit
     exact-start selection (the test_delegated_subagent_transport idiom) and
     return its parsed payload."""
@@ -191,7 +195,8 @@ def _real_delegate_start(tmp_path, monkeypatch, *, metadata, custody_durable=Tru
         finally:
             subagent_runtime._EXACT_START_SELECTION.reset(token)
 
-    monkeypatch.setattr(delegate, "prepare_delegate_start_actor", explicit_transport_actor)
+    if not actor_first_work_order:
+        monkeypatch.setattr(delegate, "prepare_delegate_start_actor", explicit_transport_actor)
     if not custody_durable:
         monkeypatch.setattr(delegate, "record_started_custody", lambda *a, **k: False)
     repo = tmp_path / "repo"
@@ -204,7 +209,38 @@ def _real_delegate_start(tmp_path, monkeypatch, *, metadata, custody_durable=Tru
     ctx.task_depth = 1
     ctx.task_metadata = metadata
     delegate_custody._CUSTODY.clear()
-    payload = json.loads(delegate._delegate_start(ctx, "edit the README"))
+    if actor_first_work_order:
+        target = "some-route=weak-model:low"
+        snapshot = {
+            "schema": 1,
+            "selected_subagent_id": "transport-fixture",
+            "config_fingerprint": "transport-fixture-v1",
+            "route": {
+                "kind": "agent_session",
+                "target_id": target,
+                "credential_profile_id": "",
+            },
+            "effort": "low",
+        }
+        ctx._configured_actor_bootstrap = {
+            "snapshot": snapshot,
+            "selected_subagent_id": "transport-fixture",
+            "config_fingerprint": "transport-fixture-v1",
+            "canonical_work_order": actor_first_work_order,
+            "work_order_fingerprint": hashlib.sha256(
+                actor_first_work_order.encode("utf-8")
+            ).hexdigest(),
+            "source_request": {},
+            "source_channel": {},
+            "exact_start_pending": True,
+            "physical_started": False,
+            "route_available": True,
+        }
+        payload = json.loads(
+            subagent_runtime.delegate_start_entry(ctx, coordination_context)
+        )
+    else:
+        payload = json.loads(delegate._delegate_start(ctx, "edit the README"))
     delegate_custody._CUSTODY.clear()
     return payload
 
@@ -241,6 +277,46 @@ def test_delegate_start_uncustodied_emits_no_fanout_even_under_swarm_intent(tmp_
             "force_plan_source": "swarm",
         },
     )
+    assert payload["status"] == "started_uncustodied"
+    assert _fanout_events(tmp_path) == []
+
+
+def test_actor_first_swarm_fanout_uses_frozen_work_order_after_custody(
+    tmp_path, monkeypatch,
+):
+    canonical = "CANONICAL_WORK_ORDER:" + ("source-owned " * 30)
+    appendix = "COORDINATION_APPENDIX_ONLY"
+    payload = _real_delegate_start(
+        tmp_path,
+        monkeypatch,
+        metadata={
+            "root_task_id": "t-root",
+            "parent_task_id": "t-root",
+            "force_plan_source": "swarm",
+        },
+        actor_first_work_order=canonical,
+        coordination_context=appendix,
+    )
+
+    assert payload["status"] == "started" and payload["custody_durable"] is True
+    events = _fanout_events(tmp_path)
+    assert len(events) == 1
+    assert events[0]["objective_preview"] == canonical[:200]
+    assert appendix not in events[0]["objective_preview"]
+
+
+def test_actor_first_uncustodied_start_stays_out_of_swarm_telemetry(
+    tmp_path, monkeypatch,
+):
+    payload = _real_delegate_start(
+        tmp_path,
+        monkeypatch,
+        custody_durable=False,
+        metadata={"force_plan_source": "swarm"},
+        actor_first_work_order="CANONICAL_WORK_ORDER",
+        coordination_context="coordination only",
+    )
+
     assert payload["status"] == "started_uncustodied"
     assert _fanout_events(tmp_path) == []
 

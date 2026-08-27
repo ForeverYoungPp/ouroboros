@@ -42,7 +42,11 @@ test('the cancel click shows the honest interim, not an instant Cancelled', () =
     // interim for a nonterminal record with cancel_state=pending instead of
     // finishing the card — through the SHARED taskCancelPending helper (AR2-8:
     // one consumer path for the typed projection, never an inline status peek).
-    const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
+    // Git's Windows checkout may expose CRLF even though the committed blob is
+    // LF. Normalize the source before asserting the cross-file wiring so the
+    // contract tests check behavior, not the platform's line-ending policy.
+    const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8')
+        .replace(/\r\n/g, '\n');
     assert.match(chat, /function markLiveCardCancelPending\(/);
     assert.match(chat, /markLiveCardCancelPending\(taskId, soft\);\n[\s\S]{0,600}await requestStop\(/);
     assert.match(chat, /taskCancelPending\(stored\)[\s\S]{0,400}markLiveCardCancelPending\(taskId[,)]/);
@@ -221,7 +225,8 @@ test('a failed cancel reconciles through the shared helper before touching the b
     // cancel_state=pending, finish the card for a terminal record — and only
     // a genuinely-live, non-pending task gets its prior phase restored and
     // the button re-enabled.
-    const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
+    const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8')
+        .replace(/\r\n/g, '\n');
     assert.match(chat, /const priorPhase = captureLiveCardPhaseState\(record\);\n\s*markLiveCardCancelPending\(taskId, soft\);/);
     const failure = chat.slice(chat.indexOf('showToast(`Cancel failed:'));
     const branch = failure.slice(0, 2200);

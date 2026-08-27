@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 
 from ouroboros.utils import atomic_write_json, read_json_dict, write_bytes_atomic
 from ouroboros.headless import ARTIFACT_STATUS_READY, SCRATCH_MANIFEST_NAME, task_artifacts_dir
+from ouroboros.outcome_receipt_store import is_verification_receipts_path
 from ouroboros.task_results import validate_task_id
 
 log = logging.getLogger(__name__)
@@ -462,16 +463,30 @@ def handoff_task_attachments_for_retry(
         return {}, f"{type(exc).__name__}: {exc}"
 
 
-def artifact_store_path_block_reason(path: pathlib.Path) -> str:
+def artifact_store_path_block_reason(
+    path: pathlib.Path,
+    *,
+    base_path: pathlib.Path | None = None,
+) -> str:
     """Return a block reason for task-artifact control/provenance paths."""
 
     try:
-        parts = pathlib.Path(path).parts
+        candidate = pathlib.Path(path)
+        if base_path is not None:
+            try:
+                candidate = candidate.resolve(strict=False).relative_to(
+                    pathlib.Path(base_path).resolve(strict=False)
+                )
+            except ValueError:
+                pass
+        parts = candidate.parts
     except TypeError:
         parts = (str(path),)
     for part in parts:
         if part.startswith("."):
             return "artifact_store hidden/control metadata paths are reserved"
+    if parts == ("verification_receipts.jsonl",):
+        return "artifact_store verification receipt authority path is reserved"
     return ""
 
 
@@ -937,7 +952,10 @@ def copy_file_to_task_artifacts(ctx: Any, source_path: Union[pathlib.Path, str],
     if not source.is_file():
         return None
     task_id = task_id_for_artifacts(ctx)
-    artifact_dir = task_artifact_dir_path(pathlib.Path(getattr(ctx, "drive_root")), task_id, create=True)
+    drive_root = pathlib.Path(getattr(ctx, "drive_root"))
+    if is_verification_receipts_path(drive_root, task_id, source):
+        return None
+    artifact_dir = task_artifact_dir_path(drive_root, task_id, create=True)
     data = read_json_dict(artifact_dir / _ARTIFACT_MANIFEST) or {}
     manifest = data.get("artifacts") if isinstance(data.get("artifacts"), dict) else {}
     manifest = {str(key): dict(value) for key, value in manifest.items() if isinstance(value, dict)}
@@ -948,11 +966,21 @@ def copy_file_to_task_artifacts(ctx: Any, source_path: Union[pathlib.Path, str],
         existing_path = str(existing.get("path") or "")
         if existing_source == str(source) and existing_path:
             candidate = pathlib.Path(existing_path).resolve(strict=False)
-            if candidate.parent == artifact_dir.resolve(strict=False):
+            if (
+                candidate.parent == artifact_dir.resolve(strict=False)
+                and not is_verification_receipts_path(drive_root, task_id, candidate)
+            ):
                 dest = candidate
                 reused_existing_source = True
                 break
-    if dest.exists() and dest.resolve(strict=False) != source.resolve(strict=False) and not reused_existing_source:
+    if (
+        is_verification_receipts_path(drive_root, task_id, dest)
+        or (
+            dest.exists()
+            and dest.resolve(strict=False) != source.resolve(strict=False)
+            and not reused_existing_source
+        )
+    ):
         suffix = source.suffix
         stem = source.name[: -len(suffix)] if suffix else source.name
         digest = sha256(str(source.resolve(strict=False)).encode("utf-8", errors="replace")).hexdigest()[:8]
@@ -1074,6 +1102,12 @@ def collect_task_artifact_records(drive_root: Union[pathlib.Path, str], task_id:
         # Internal task-metadata files (the artifact manifest and the v6.52.2 scratch manifest)
         # are NOT deliverables — never record them as produced artifacts.
         if path.name in (_ARTIFACT_MANIFEST, SCRATCH_MANIFEST_NAME):
+            continue
+        # Verification receipts live beside artifacts for durable custody, but
+        # they are an append-only authority stream, not a deliverable.  Letting
+        # generic materialization register/copy this file can replace a newer
+        # canonical-only lifecycle row with a stale child replica.
+        if is_verification_receipts_path(drive_root, task_id, path):
             continue
         try:
             rel_parts = path.resolve(strict=False).relative_to(artifact_root).parts

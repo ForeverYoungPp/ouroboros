@@ -270,7 +270,17 @@ def test_blocked_session_bootstrap_wakes_first_turn_with_alternatives(monkeypatc
         "subagent_id": "api-scout", "route_kind": "api_model",
         "target_id": "google/gemini-3.7-flash", "availability": "check_at_dispatch",
     }])
-    ctx = SimpleNamespace(task_id="child1", drive_root=tmp_path, budget_drive_root=str(tmp_path))
+    ctx = SimpleNamespace(
+        task_id="child1",
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        task_metadata={
+            "root_task_id": "root",
+            "parent_task_id": "root",
+            "delegation_role": "subagent",
+            "budget_drive_root": str(tmp_path),
+        },
+    )
     dispatch = SimpleNamespace(
         blocked=True,
         executor_resolution=SimpleNamespace(
@@ -280,8 +290,14 @@ def test_blocked_session_bootstrap_wakes_first_turn_with_alternatives(monkeypatc
     out = json.loads(bootstrap_before_context(
         ctx, {"id": "child1", "configured_subagent": snapshot}, dispatch,
     ))
-    assert out["status"] == "configured_session_start_wake"
-    assert out["startup"] == {
+    assert out["status"] == "configured_session_actor_ready"
+    assert out["coordination_context"]["parent_intent"]["state"] == "absent"
+    assert out["coordination_context"]["review_capacity"]["state"] == "unknown"
+    startup = out["startup"]
+    assert {key: startup[key] for key in (
+        "status", "reason", "reset_at", "selected_subagent_id", "alternatives",
+        "host_fallback", "actor_first", "exact_start_pending",
+    )} == {
         "status": "temporarily_unavailable",
         "reason": "subscription_window_exhausted",
         "reset_at": "2030-01-01T00:00:00Z",
@@ -291,40 +307,15 @@ def test_blocked_session_bootstrap_wakes_first_turn_with_alternatives(monkeypatc
             "target_id": "google/gemini-3.7-flash", "availability": "check_at_dispatch",
         }],
         "host_fallback": False,
+        "actor_first": True,
+        "exact_start_pending": True,
     }
+    assert startup["route"] == "codex=gpt-5.6-sol"
+    assert len(startup["work_order_fingerprint"]) == 64
+    assert startup["work_order_chars"] > 0
+    assert startup["work_order_complete"] is True
     rows = [json.loads(line) for line in custody.event_log_path(tmp_path).read_text().splitlines()]
     assert rows[-1]["type"] == "configured_subagent_startup_fault"
-
-
-def test_atomic_bootstrap_starts_before_wait_and_zero_nanny_rounds(monkeypatch, tmp_path):
-    import ouroboros.tools.delegate as delegate
-    import ouroboros.delegate_supervision as supervision
-    from ouroboros.subagent_bootstrap import bootstrap_session_leaf
-
-    calls = []
-    monkeypatch.setattr(delegate, "exact_start", lambda ctx, prompt, spec: (
-        calls.append(("start", prompt, spec))
-        or json.dumps({"status": "started", "run_id": "run-1", "custody_durable": True})
-    ))
-    monkeypatch.setattr(supervision, "supervised_wait", lambda ctx, run_id: (
-        calls.append(("wait", run_id))
-        or json.dumps({"status": "completed", "run_id": run_id})
-    ))
-    snapshot = _snapshot(_settings(_session_row()), "session-builder")
-    task = {
-        "id": "child1",
-        "objective": "Build",
-        "expected_output": "Patch",
-        "configured_subagent": snapshot,
-        "task_contract": {"objective": "Build", "expected_output": "Patch"},
-    }
-    ctx = SimpleNamespace(
-        task_id="child1", drive_root=tmp_path, budget_drive_root=str(tmp_path),
-        task_metadata={},
-    )
-    out = json.loads(bootstrap_session_leaf(ctx, task, SimpleNamespace(executor="harness")))
-    assert [call[0] for call in calls] == ["start", "wait"]
-    assert out["status"] == "configured_session_wake"
 
 
 @pytest.mark.parametrize(
@@ -337,11 +328,11 @@ def test_atomic_bootstrap_starts_before_wait_and_zero_nanny_rounds(monkeypatch, 
 def test_over_budget_bootstrap_uses_only_a_live_interaction_channel(
     monkeypatch, tmp_path, interactive, expected_reason,
 ):
+    from ouroboros import delegate_custody as custody
     import ouroboros.claudexor_daemon as daemon
     import ouroboros.subagent_bootstrap as bootstrap
+    import ouroboros.subagent_runtime as runtime
     from ouroboros.subagent_work_order import work_order_fingerprint
-    import ouroboros.tools.delegate as delegate
-    import ouroboros.delegate_supervision as supervision
 
     class Gateway:
         def harnesses(self):
@@ -355,14 +346,10 @@ def test_over_budget_bootstrap_uses_only_a_live_interaction_channel(
 
     monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: Gateway())
     calls = []
-    monkeypatch.setattr(delegate, "exact_start", lambda ctx, prompt, spec: (
+    monkeypatch.setattr(runtime, "exact_start", lambda ctx, prompt, spec: (
         calls.append((prompt, spec))
         or json.dumps({"status": "started", "run_id": "run-source", "custody_durable": True})
     ))
-    monkeypatch.setattr(
-        supervision, "supervised_wait",
-        lambda _ctx, run_id: json.dumps({"status": "completed", "run_id": run_id}),
-    )
     snapshot = _snapshot(_settings(_session_row(target="codex=gpt-5.6-sol")), "session-builder")
     dispatch = SimpleNamespace(
         executor="harness",
@@ -379,35 +366,136 @@ def test_over_budget_bootstrap_uses_only_a_live_interaction_channel(
         "task_contract": {"objective": "THIS MUST NOT BE SENT AS A PREFIX " + ("x" * 250_100)},
     }
     full_sha = work_order_fingerprint(task)
-    out = json.loads(bootstrap.bootstrap_session_leaf(ctx, task, dispatch))
+    out = json.loads(bootstrap.bootstrap_before_context(ctx, task, dispatch))
+    assert out["status"] == "configured_session_actor_ready"
+    assert out["startup"]["exact_start_pending"] is True
+    assert calls == []
+    started = json.loads(runtime.delegate_start_entry(ctx, ""))
+    custody_rows = [
+        json.loads(line)
+        for line in custody.event_log_path(tmp_path).read_text().splitlines()
+    ]
 
     if interactive:
-        assert out["status"] == "configured_session_wake"
+        assert started["status"] == "started"
         assert len(calls) == 1
         prompt, spec = calls[0]
         assert "WORK ORDER SOURCE REQUEST" in prompt
         assert "THIS MUST NOT BE SENT AS A PREFIX" not in prompt
         assert spec["compiled_work_order"] is True
         assert spec["work_order_fingerprint"] == full_sha
-        assert out["startup"]["work_order_source_request"]["complete_sha256"] == full_sha
+        assert spec["work_order_source_request"]["complete_sha256"] == full_sha
+        assert custody_rows[-1]["type"] == "configured_subagent_work_order_source_request"
+        assert custody_rows[-1]["status"] == "attempted"
+        assert custody_rows[-1]["source_channel"] == {
+            "status": "available",
+            "reason": "interactive",
+            "route": "codex",
+        }
     else:
-        assert out["startup"]["reason"] == expected_reason
-        assert out["startup"]["complete_sha256"] == full_sha
+        assert started["status"] == "refused"
+        assert started["reason"] == expected_reason
+        assert started["work_order_fingerprint"] == full_sha
         assert calls == []
+        assert custody_rows[-1]["type"] == "configured_subagent_work_order_refused"
+        assert custody_rows[-1]["reason"] == expected_reason
 
 
-def test_route_source_request_channel_fails_closed_on_unknown_manifest():
-    from ouroboros.subagent_work_order import route_source_request_channel
+@pytest.mark.parametrize(
+    ("bootstrap_interactive", "start_interactive", "expected_status", "expected_reason"),
+    [
+        (True, False, "refused", "work_order_source_channel_unavailable"),
+        (None, True, "started", ""),
+        (True, None, "refused", "work_order_source_channel_unverified"),
+    ],
+)
+def test_over_budget_start_reprobes_live_interaction_capability(
+    monkeypatch, tmp_path, bootstrap_interactive, start_interactive,
+    expected_status, expected_reason,
+):
+    from ouroboros import delegate_custody as custody
+    import ouroboros.claudexor_daemon as daemon
+    import ouroboros.subagent_bootstrap as bootstrap
+    import ouroboros.subagent_runtime as runtime
+
+    observations = iter([bootstrap_interactive, start_interactive])
+    closed = []
 
     class Gateway:
         def harnesses(self):
-            return [{"id": "route", "manifest": {"capabilities": {}}}]
+            interactive = next(observations)
+            capabilities = (
+                {} if interactive is None else {"interactive": interactive}
+            )
+            return [{
+                "id": "codex",
+                "manifest": {"capabilities": capabilities},
+            }]
 
-    assert route_source_request_channel(Gateway(), "route") == {
-        "status": "unverified",
-        "reason": "interactive_capability_missing",
-        "route": "route",
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(daemon, "ensure_owned_gateway", Gateway)
+    starts = []
+    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, prompt, spec: (
+        starts.append((prompt, spec))
+        or json.dumps({"status": "started", "run_id": "run-live-probe"})
+    ))
+    snapshot = _snapshot(
+        _settings(_session_row(target="codex=gpt-5.6-sol")),
+        "session-builder",
+    )
+    dispatch = SimpleNamespace(
+        executor="harness",
+        executor_resolution=SimpleNamespace(route=SimpleNamespace(route_id="codex")),
+    )
+    ctx = SimpleNamespace(
+        task_id="child-live-probe",
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        task_metadata={},
+    )
+    task = {
+        "id": "child-live-probe",
+        "objective": "x" * 250_100,
+        "configured_subagent": snapshot,
+        "task_contract": {"objective": "x" * 250_100},
     }
+
+    bootstrap.bootstrap_before_context(ctx, task, dispatch)
+    # A cached observation is context only, never route authority.  Poison it
+    # to prove the live probe is derived from the immutable selected snapshot.
+    ctx._configured_actor_bootstrap["source_channel"]["route"] = "cursor"
+    outcome = json.loads(runtime.delegate_start_entry(ctx, ""))
+    custody_rows = [
+        json.loads(line)
+        for line in custody.event_log_path(tmp_path).read_text().splitlines()
+    ]
+
+    assert outcome["status"] == expected_status
+    assert len(closed) == 2
+    assert ctx._configured_actor_bootstrap["source_channel"]["route"] == "codex"
+    assert custody_rows[-1]["route"] == "codex"
+    if expected_reason:
+        assert outcome["reason"] == expected_reason
+        assert starts == []
+        assert custody_rows[-1]["type"] == "configured_subagent_work_order_refused"
+        assert custody_rows[-1]["reason"] == expected_reason
+        assert custody_rows[-1]["source_channel"]["reason"] == (
+            "interactive_unsupported"
+            if start_interactive is False
+            else "interactive_capability_missing"
+        )
+    else:
+        assert len(starts) == 1
+        assert "WORK ORDER SOURCE REQUEST" in starts[0][0]
+        assert custody_rows[-1]["type"] == "configured_subagent_work_order_source_request"
+        assert custody_rows[-1]["status"] == "attempted"
+        assert custody_rows[-1]["source_channel"] == {
+            "status": "available",
+            "reason": "interactive",
+            "route": "codex",
+        }
 
 
 def test_pending_over_budget_recovery_replays_compact_body_and_full_fingerprint(
@@ -499,7 +587,6 @@ def test_pending_over_budget_recovery_replays_compact_body_and_full_fingerprint(
 def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tmp_path):
     from ouroboros import agent as agent_module
     import ouroboros.claudexor_daemon as daemon
-    import ouroboros.subagent_bootstrap as bootstrap
     import ouroboros.subagents as subagents
     from ouroboros.agent import Env, OuroborosAgent
 
@@ -518,13 +605,6 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
         lambda *_a, **_k: ("", ""),
     )
     monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
-    monkeypatch.setattr(
-        bootstrap, "bootstrap_session_leaf",
-        lambda *_a, **_k: order.append("atomic_start_and_wait") or json.dumps({
-            "status": "configured_session_wake", "wake": {"status": "completed"},
-        }),
-    )
-
     def build_context(**_kwargs):
         order.append("context_build")
         return [], {}
@@ -534,7 +614,7 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
     agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
     agent.tools.available_tools = lambda: ["delegate_start", "delegate_wait", "delegate_cancel"]
     agent.llm.chat = lambda *_a, **_k: (_ for _ in ()).throw(
-        AssertionError("no nanny LLM call is legal before external custody")
+        AssertionError("_prepare_task_context must not call the model")
     )
     _ctx, messages, _caps = agent._prepare_task_context({
         "id": "child1", "type": "task", "chat_id": 1, "text": "Build",
@@ -546,32 +626,398 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
         "task_contract": {"objective": "Build", "expected_output": "Patch"},
         "drive_root": str(drive), "budget_drive_root": str(drive),
     })
-    assert order == ["atomic_start_and_wait", "context_build"]
+    assert order == ["context_build"]
     assert any("CONFIGURED SESSION STARTUP / WAKE RECEIPT" in item["content"] for item in messages)
-    assert _ctx._nanny_delegate_baseline == {"round": 0, "cost": 0.0}
+    receipt = next(item["content"] for item in messages if "CONFIGURED SESSION STARTUP / WAKE RECEIPT" in item["content"])
+    assert "exact_start_pending" in receipt
+    assert _ctx._configured_actor_bootstrap["selected_subagent_id"] == "session-builder"
+    assert _ctx._configured_actor_bootstrap["canonical_work_order"]
+    # No physical run exists yet, so the pacing baseline must not pretend a
+    # delegated activity already happened.
+    assert _ctx._nanny_delegate_baseline is None
 
 
-def test_started_uncustodied_wakes_without_entering_quiet_wait(monkeypatch, tmp_path):
+def test_actor_first_delegate_start_binds_snapshot_and_canonical_work_order(monkeypatch, tmp_path):
+    import ouroboros.subagent_runtime as runtime
+
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    calls = []
+
+    monkeypatch.setattr(
+        runtime, "exact_start",
+        lambda ctx, prompt, spec: calls.append((prompt, spec)) or json.dumps({
+            "status": "started", "run_id": "run-actor-first",
+        }),
+    )
+    ctx = SimpleNamespace(
+        task_id="child1", drive_root=tmp_path, budget_drive_root=str(tmp_path),
+        _configured_actor_bootstrap={
+            "snapshot": snapshot,
+            "selected_subagent_id": "session-builder",
+            "canonical_work_order": "OBJECTIVE\nBuild the patch",
+            "work_order_fingerprint": "full-work-order-sha",
+            "work_order_chars": 23,
+        },
+    )
+
+    out = json.loads(runtime.delegate_start_entry(ctx, ""))
+    assert out["status"] == "started"
+    assert calls == [(
+        "OBJECTIVE\nBuild the patch",
+        {
+            "snapshot": snapshot,
+            "compiled_work_order": True,
+            "work_order_fingerprint": "full-work-order-sha",
+            "_coordination_context": "",
+        },
+    )]
+
+
+def test_selectorless_fresh_start_outside_actor_first_is_refused(tmp_path):
+    import ouroboros.subagent_runtime as runtime
+    from ouroboros.tools.registry import ToolContext
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "ordinary-root"
+
+    out = json.loads(runtime.delegate_start_entry(ctx, ""))
+
+    assert out["status"] == "refused"
+    assert out["reason"] == "subagent_selection_required"
+
+
+def test_actor_first_start_marks_physical_activity_and_closes_zero_run(monkeypatch, tmp_path):
+    """A started (including uncustodied) leaf cannot later be reported as zero-run."""
+    import ouroboros.subagent_runtime as runtime
     import ouroboros.tools.delegate as delegate
-    import ouroboros.delegate_supervision as supervision
-    from ouroboros.subagent_bootstrap import bootstrap_session_leaf
 
-    monkeypatch.setattr(delegate, "exact_start", lambda *_a, **_k: json.dumps({
-        "status": "started_uncustodied", "run_id": "run-1", "custody_durable": False,
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    ctx = SimpleNamespace(
+        task_id="child-start-marker", drive_root=tmp_path, budget_drive_root=str(tmp_path),
+        _configured_actor_bootstrap={
+            "snapshot": snapshot,
+            "selected_subagent_id": "session-builder",
+            "canonical_work_order": "OBJECTIVE\nBuild the patch",
+            "work_order_fingerprint": "full-work-order-sha",
+            "physical_started": False,
+            "exact_start_pending": True,
+        },
+    )
+    monkeypatch.setattr(delegate, "_delegate_start", lambda *_a, **_k: json.dumps({
+        "status": "started_uncustodied", "run_id": "run-live",
     }))
-    monkeypatch.setattr(supervision, "supervised_wait", lambda *_a, **_k: (_ for _ in ()).throw(
-        AssertionError("uncustodied starts must not sleep")))
+
+    started = json.loads(runtime.exact_start(
+        ctx,
+        "OBJECTIVE\nBuild the patch",
+        {"snapshot": snapshot, "compiled_work_order": True},
+    ))
+    assert started["status"] == "started_uncustodied"
+    assert ctx._configured_actor_bootstrap["physical_started"] is True
+    assert ctx._configured_actor_bootstrap["exact_start_pending"] is False
+    assert ctx._nanny_physical_activity_seed is True
+
+    # The opposite contradiction is guarded by exact_start as well: once a
+    # durable zero-run decision exists, a later physical invocation is refused.
+    ctx._configured_actor_bootstrap["physical_started"] = False
+    ctx._configured_actor_bootstrap["exact_start_pending"] = True
+    ctx._configured_actor_bootstrap["zero_run_receipt_recorded"] = True
+    refused = json.loads(runtime.exact_start(
+        ctx,
+        "OBJECTIVE\nBuild the patch",
+        {"snapshot": snapshot, "compiled_work_order": True},
+    ))
+    assert refused["status"] == "refused"
+    assert refused["reason"] == "zero_run_already_recorded"
+
+
+def test_actor_first_exact_start_hydrates_terminal_zero_run_receipt(monkeypatch, tmp_path):
+    import ouroboros.subagent_runtime as runtime
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.outcomes import append_verification_receipt
+
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    task_id = "hydrated-zero-run"
+    assert append_verification_receipt(tmp_path, task_id, {
+        "status": "declared",
+        "contract_kind": "delegation_zero_run",
+        "zero_run": True,
+        "zero_run_decision": "unknown",
+        "zero_run_basis": "No physical leaf was started.",
+        "physical_run_started": False,
+    })
+    ctx = SimpleNamespace(
+        task_id=task_id,
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        _configured_actor_bootstrap={
+            "physical_started": False,
+            "exact_start_pending": True,
+        },
+    )
+    monkeypatch.setattr(delegate, "_delegate_start", lambda *_a, **_k: pytest.fail("must not start"))
+    refused = json.loads(runtime.exact_start(
+        ctx,
+        "OBJECTIVE\nBuild the patch",
+        {"snapshot": snapshot, "compiled_work_order": True},
+    ))
+    assert refused["reason"] == "zero_run_already_recorded"
+    assert ctx._configured_actor_bootstrap["zero_run_decision"] == "unknown"
+
+
+@pytest.mark.parametrize("gap_kind", ["malformed", "unreadable", "invalid_schema"])
+def test_actor_first_exact_start_blocks_unknown_zero_run_evidence(
+    monkeypatch, tmp_path, gap_kind,
+):
+    import ouroboros.outcome_receipt_store as receipt_store
+    import ouroboros.subagent_bootstrap as bootstrap
+    import ouroboros.subagent_runtime as runtime
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.outcomes import verification_receipts_path
+
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    task_id = f"unknown-zero-run-{gap_kind}"
+    path = verification_receipts_path(tmp_path, task_id, create=True)
+    if gap_kind == "invalid_schema":
+        path.write_text(json.dumps({
+            "status": "declared",
+            "contract_kind": "delegation_zero_run",
+            "zero_run": "false",
+            "zero_run_decision": "complete",
+            "zero_run_basis": "malformed boolean",
+            "physical_run_started": False,
+        }) + "\n")
+    else:
+        path.write_text('{"contract_kind":"delegation_zero_run","zero_run":true\n')
+    if gap_kind == "unreadable":
+        monkeypatch.setattr(
+            receipt_store,
+            "iter_jsonl_objects",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("denied")),
+        )
+    ctx = SimpleNamespace(
+        task_id=task_id,
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        task_metadata={},
+    )
+    task = {
+        "id": task_id,
+        "objective": "Inspect the evidence",
+        "expected_output": "A truthful result",
+        "configured_subagent": snapshot,
+        "task_contract": {
+            "objective": "Inspect the evidence",
+            "expected_output": "A truthful result",
+        },
+    }
+    startup = json.loads(bootstrap._prepare_actor_first_bootstrap(
+        ctx, task, SimpleNamespace(blocked=False, executor_resolution=None),
+    ))
+    assert startup["startup"]["zero_run_evidence_status"] == "unknown"
+    assert startup["startup"]["exact_start_pending"] is False
+    monkeypatch.setattr(
+        delegate, "_delegate_start", lambda *_a, **_k: pytest.fail("must not start"),
+    )
+
+    refused = json.loads(runtime.exact_start(
+        ctx,
+        "OBJECTIVE\nBuild the patch",
+        {"snapshot": snapshot, "compiled_work_order": True},
+    ))
+
+    assert refused["status"] == "refused"
+    assert refused["reason"] == "zero_run_evidence_unavailable"
+    assert ctx._configured_actor_bootstrap["zero_run_evidence_status"] == "unknown"
+    assert ctx._configured_actor_bootstrap["exact_start_pending"] is False
+
+
+def test_valid_zero_run_wins_over_unrelated_malformed_receipt(monkeypatch, tmp_path):
+    import ouroboros.subagent_runtime as runtime
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.outcomes import append_verification_receipt, verification_receipts_path
+
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    task_id = "valid-zero-run-with-gap"
+    path = verification_receipts_path(tmp_path, task_id, create=True)
+    path.write_text("not-json\n", encoding="utf-8")
+    assert append_verification_receipt(tmp_path, task_id, {
+        "status": "declared",
+        "contract_kind": "delegation_zero_run",
+        "zero_run": True,
+        "zero_run_decision": "complete",
+        "zero_run_basis": "No physical leaf was started.",
+        "physical_run_started": False,
+    })
+    ctx = SimpleNamespace(
+        task_id=task_id,
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        _configured_actor_bootstrap={
+            "physical_started": False,
+            "exact_start_pending": True,
+        },
+    )
+    monkeypatch.setattr(
+        delegate, "_delegate_start", lambda *_a, **_k: pytest.fail("must not start"),
+    )
+
+    refused = json.loads(runtime.exact_start(
+        ctx,
+        "OBJECTIVE\nBuild the patch",
+        {"snapshot": snapshot, "compiled_work_order": True},
+    ))
+
+    assert refused["reason"] == "zero_run_already_recorded"
+    assert ctx._configured_actor_bootstrap["zero_run_decision"] == "complete"
+    assert "zero_run_evidence_status" not in ctx._configured_actor_bootstrap
+
+
+def test_actor_first_delegate_start_rejects_alternate_snapshot(monkeypatch, tmp_path):
+    import ouroboros.subagent_runtime as runtime
+
     snapshot = _snapshot(_settings(_session_row()), "session-builder")
     ctx = SimpleNamespace(
         task_id="child1", drive_root=tmp_path, budget_drive_root=str(tmp_path),
-        task_metadata={},
+        _configured_actor_bootstrap={
+            "snapshot": snapshot,
+            "selected_subagent_id": "session-builder",
+            "canonical_work_order": "OBJECTIVE\nBuild the patch",
+            "work_order_fingerprint": "full-work-order-sha",
+            "work_order_chars": 23,
+        },
     )
-    out = json.loads(bootstrap_session_leaf(
-        ctx,
-        {"id": "child1", "configured_subagent": snapshot},
-        SimpleNamespace(executor="harness"),
+    out = json.loads(runtime.delegate_start_entry(
+        ctx, "retarget me", subagent_id="other-session",
     ))
-    assert out["startup"]["status"] == "started_uncustodied"
+    assert out["status"] == "refused"
+    assert out["reason"] == "configured_actor_route_mismatch"
+    assert out["host_fallback"] is False
+
+
+def test_actor_first_retry_cannot_turn_coordination_prompt_into_work_order_prefix(monkeypatch, tmp_path):
+    import ouroboros.subagent_runtime as runtime
+    import ouroboros.claudexor_daemon as daemon
+
+    class Gateway:
+        def harnesses(self):
+            return [{"id": "codex", "manifest": {"capabilities": {}}}]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(daemon, "ensure_owned_gateway", Gateway)
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+
+    ctx = SimpleNamespace(
+        task_id="child-over-budget", drive_root=tmp_path, budget_drive_root=str(tmp_path),
+        _configured_actor_bootstrap={
+            "snapshot": snapshot,
+            "selected_subagent_id": "session-builder",
+            "canonical_work_order": "",
+            "source_request": {"kind": "complete_work_order", "sha256": "f" * 64},
+            "source_channel": {"status": "unverified", "route": "codex"},
+            "work_order_fingerprint": "f" * 64,
+            "work_order_chars": 250001,
+        },
+    )
+    monkeypatch.setattr(
+        runtime, "exact_start",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an over-budget retry must refuse before exact_start")
+        ),
+    )
+    out = json.loads(runtime.delegate_start_entry(
+        ctx, "coordination text is not the canonical assignment", retry_of="inv-1",
+    ))
+    assert out["status"] == "refused"
+    assert out["reason"] == "work_order_source_channel_unverified"
+
+
+def test_actor_first_over_budget_retry_reprobes_source_channel(monkeypatch, tmp_path):
+    import ouroboros.claudexor_daemon as daemon
+    import ouroboros.subagent_runtime as runtime
+
+    class Gateway:
+        def harnesses(self):
+            return [{
+                "id": "codex",
+                "manifest": {"capabilities": {"interactive": True}},
+            }]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(daemon, "ensure_owned_gateway", Gateway)
+    starts = []
+    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, prompt, spec: (
+        starts.append((prompt, spec))
+        or json.dumps({"status": "started", "run_id": "run-retry"})
+    ))
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    ctx = SimpleNamespace(
+        task_id="child-over-budget-retry",
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        _configured_actor_bootstrap={
+            "snapshot": snapshot,
+            "selected_subagent_id": "session-builder",
+            "canonical_work_order": "",
+            "source_prompt": "WORK ORDER SOURCE REQUEST\ncoverage=partial",
+            "source_request": {"kind": "complete_work_order", "sha256": "f" * 64},
+            "source_channel": {"status": "unavailable", "route": "cursor"},
+            "work_order_fingerprint": "f" * 64,
+            "work_order_chars": 250001,
+        },
+    )
+
+    out = json.loads(runtime.delegate_start_entry(ctx, "ignored", retry_of="inv-1"))
+
+    assert out["status"] == "started"
+    assert len(starts) == 1
+    assert starts[0][1]["retry_of"] == "inv-1"
+    assert ctx._configured_actor_bootstrap["source_channel"]["route"] == "codex"
+
+
+def test_actor_first_bootstrap_adopts_existing_handoff_without_new_start(monkeypatch, tmp_path):
+    import ouroboros.delegate_recovery as recovery
+    import ouroboros.subagent_runtime as runtime
+    from ouroboros.subagent_bootstrap import bootstrap_before_context
+
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    monkeypatch.setattr(recovery, "adopt_handoff", lambda _ctx, _task: {
+        "status": "adopted", "run_id": "run-recovered",
+    })
+    monkeypatch.setattr(
+        "ouroboros.delegate_supervision.supervised_wait",
+        lambda _ctx, run_id: json.dumps({"status": "completed", "run_id": run_id}),
+    )
+    dispatch = SimpleNamespace(
+        blocked=False,
+        executor="harness",
+        executor_resolution=SimpleNamespace(reason="harness_ready"),
+    )
+    ctx = SimpleNamespace(task_id="child-recovery", drive_root=tmp_path, budget_drive_root=str(tmp_path))
+    out = json.loads(bootstrap_before_context(
+        ctx,
+        {
+            "id": "child-recovery",
+            "objective": "Recover",
+            "configured_subagent": snapshot,
+            "task_contract": {"objective": "Recover"},
+        },
+        dispatch,
+    ))
+    assert out["status"] == "configured_session_recovered_wake"
+    assert out["recovery"]["run_id"] == "run-recovered"
+    assert out["wake"]["status"] == "completed"
+    assert ctx._configured_actor_bootstrap["selected_subagent_id"] == "session-builder"
+    assert ctx._configured_actor_bootstrap["canonical_work_order"]
+    assert ctx._configured_actor_bootstrap["physical_started"] is True
+    mismatch = json.loads(runtime.delegate_start_entry(
+        ctx, "switch route", subagent_id="another-session",
+    ))
+    assert mismatch["reason"] == "configured_actor_route_mismatch"
 
 
 def test_atomic_start_attempt_does_not_trigger_legacy_no_delegate_nudges(tmp_path):
@@ -668,13 +1114,25 @@ def test_pending_wake_replays_until_post_injection_ack(tmp_path):
 
 def test_one_shot_checkpoint_is_reasoned_and_consumed(monkeypatch, tmp_path):
     from ouroboros import delegate_custody as custody
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
     import ouroboros.delegate_supervision as supervision
 
     now = [100.0]
     monkeypatch.setattr(supervision.time, "time", lambda: now[0])
+    contract = build_task_contract({})
+    write_task_result(
+        tmp_path, "child1", STATUS_RUNNING, root_task_id="child1",
+        delegation_role="root", task_contract=contract,
+    )
     ctx = SimpleNamespace(
         task_id="child1", drive_root=tmp_path, budget_drive_root=str(tmp_path),
-        task_metadata={"configured_subagent": {"config_fingerprint": "fp"}},
+        task_contract=contract,
+        task_metadata={
+            "configured_subagent": {"config_fingerprint": "fp"},
+            "root_task_id": "child1", "delegation_role": "root",
+            "task_contract": contract, "budget_drive_root": str(tmp_path),
+        },
     )
 
     def wait_once(_ctx, run_id, _sec, _since):
@@ -687,6 +1145,11 @@ def test_one_shot_checkpoint_is_reasoned_and_consumed(monkeypatch, tmp_path):
     ))
     wake_id = out.pop("supervision_wake_id")
     assert wake_id
+    coordination_context = out.pop("coordination_context")
+    assert coordination_context["root_task_id"] == "child1"
+    assert coordination_context["parent_intent"]["state"] == "absent"
+    assert coordination_context["time"]["state"] == "not_set"
+    assert coordination_context["review_capacity"]["state"] == "available"
     assert out == {
         "status": "inspection_checkpoint",
         "run_id": "run-1",
@@ -787,6 +1250,36 @@ def test_replacement_is_refused_before_gateway_or_post(monkeypatch, tmp_path):
     assert out["status"] == "refused"
     assert out["reason"] == "replacement_requires_settlement"
     assert out["undisposed_patch_run_ids"] == ["run-old"]
+
+
+def test_replacement_refuses_unreadable_custody_before_fail_soft_scan(
+    monkeypatch, tmp_path,
+):
+    from ouroboros import delegate_custody as custody
+    from ouroboros import delegate_recovery
+    import ouroboros.claudexor_daemon as daemon
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: True)
+    monkeypatch.setattr(
+        delegate_recovery,
+        "unsettled_start_ids",
+        lambda *_a, **_k: pytest.fail("unreadable custody must stop before scan"),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "ensure_owned_gateway",
+        lambda: pytest.fail("unreadable custody must stop before gateway work"),
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "child-unknown"
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    out = json.loads(delegate.exact_start(
+        ctx, "replacement work", {"snapshot": snapshot},
+    ))
+    assert out["status"] == "refused"
+    assert out["reason"] == "replacement_custody_unknown"
 
 
 def test_terminal_boundary_reaudits_durable_pending_starts(monkeypatch, tmp_path):
@@ -1103,67 +1596,3 @@ def test_only_approved_restart_causes_reserve_and_abrupt_gap_vetoes(monkeypatch,
     monkeypatch.setattr(custody, "reconcile_task_runs", lambda *_a, **_k: [])
     assert recovery.pre_adopt_planned_handoffs(tmp_path, []) == set()
     assert recovery._read(tmp_path, "child1")["veto_reason"] == "restart_transaction_missing"
-
-
-def test_planned_restart_kill_keeps_selected_child_even_if_parent_is_interrupted(
-    monkeypatch, tmp_path,
-):
-    from supervisor import queue as task_queue
-    from supervisor import workers
-
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    workers.init(repo, tmp_path, 2, 600, 1800, 100.0)
-    workers.WORKERS.clear()
-    workers.PENDING.clear()
-    workers.RUNNING.clear()
-    workers.RUNNING.update({
-        "parent": {"task": {"id": "parent", "root_task_id": "parent"}, "attempt": 1},
-        "child": {"task": {
-            "id": "child", "parent_task_id": "parent", "root_task_id": "parent",
-        }, "attempt": 1},
-    })
-    monkeypatch.setattr(workers, "_write_failure_result", lambda *_a, **_k: "cancelled")
-    monkeypatch.setattr(workers, "_emit_task_done_terminal", lambda *_a, **_k: True)
-    monkeypatch.setattr(task_queue, "persist_queue_snapshot", lambda *a, **k: True)
-    workers.kill_workers(
-        terminal_status="cancelled", preserve_pending=True,
-        preserve_running_task_ids={"child"},
-    )
-    assert [task["id"] for task in workers.PENDING] == ["child"]
-    assert workers.PENDING[0]["_attempt"] == 2
-    workers.PENDING.clear()
-    workers.RUNNING.clear()
-
-
-def test_api_row_is_refused_by_root_direct_exact_start_before_daemon(monkeypatch, tmp_path):
-    import ouroboros.tools.delegate as delegate
-    import ouroboros.claudexor_daemon as daemon
-    from ouroboros.tools.registry import ToolContext
-    settings = _settings(_api_row())
-    monkeypatch.setattr("ouroboros.config.load_settings", lambda: settings)
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: (_ for _ in ()).throw(
-        AssertionError("API rows never POST to Claudexor")))
-    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
-    ctx.task_id = "root1"
-    schema = next(e.schema for e in delegate.get_tools() if e.name == "delegate_start")["parameters"]
-    assert schema["required"] == ["prompt"] and not ({"anyOf", "oneOf", "allOf"} & schema.keys())
-    missing = json.loads(delegate.exact_start(ctx, "bounded leaf"))
-    assert missing["reason"] == "subagent_selection_required"
-    out = json.loads(delegate.exact_start(
-        ctx, "bounded leaf", {"subagent_id": "api-builder"},
-    ))
-    assert out["reason"] == "api_actor_requires_schedule_subagent"
-    retry = json.loads(delegate.exact_start(
-        ctx, "bounded leaf", {"subagent_id": "api-builder", "retry_of": "inv-old"},
-    ))
-    assert retry["reason"] == "retry_selector_conflict"
-def test_heavy_is_absent_from_active_runtime_and_vision_consumers(monkeypatch):
-    from ouroboros.llm import LLMClient
-    from ouroboros.tools.vision import _vision_capable_slot_candidates
-
-    monkeypatch.setenv("OUROBOROS_MODEL", "openai/main")
-    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "openai/light")
-    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "openai/legacy-heavy")
-    assert "openai/legacy-heavy" not in LLMClient().available_models()
-    assert "openai/legacy-heavy" not in _vision_capable_slot_candidates(LLMClient())

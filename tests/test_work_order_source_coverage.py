@@ -92,6 +92,35 @@ def _source_response(request, text, start, end):
     }
 
 
+def test_route_source_request_channel_fails_closed_on_unknown_manifest():
+    from ouroboros.subagent_work_order import route_source_request_channel
+
+    class Gateway:
+        def harnesses(self):
+            return [{"id": "route", "manifest": {"capabilities": {}}}]
+
+    assert route_source_request_channel(Gateway(), "route") == {
+        "status": "unverified",
+        "reason": "interactive_capability_missing",
+        "route": "route",
+    }
+
+
+def test_actor_first_coordination_appendix_refuses_without_truncation(monkeypatch):
+    import ouroboros.tools.delegate as delegate
+
+    authority = SimpleNamespace(delegated=False)
+    monkeypatch.setattr(delegate, "_host_instructions", lambda *_a, **_k: "base")
+    monkeypatch.setattr(delegate, "_ASSIGNMENT_FIELD_CHARS", 32)
+    instructions, refusal = delegate._build_start_instructions(
+        authority, coordination_context="x" * 100,
+    )
+    assert instructions == ""
+    payload = json.loads(refusal)
+    assert payload["reason"] == "coordination_context_over_budget"
+    assert payload["coordination_context_chars"] == 100
+
+
 def test_started_replay_keeps_partial_request_and_verified_ranges(tmp_path):
     from ouroboros import delegate_custody as custody
 

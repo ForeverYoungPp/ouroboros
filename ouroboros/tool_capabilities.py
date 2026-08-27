@@ -63,7 +63,7 @@ LOCAL_READONLY_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file", "list_files", "search_code", "query_code",
     "vcs_status", "vcs_diff",
     "chat_history", "recent_tasks", "get_task_result", "wait_task", "wait_tasks",
-    "forward_to_worker",
+    "forward_to_worker", "peek_task", "cancel_task", "discard_child_result",
     "schedule_subagent",
     # Task-tree coordination: a child reads the shared frame and raises beacons. tree_note
     # is a bounded tree-scoped write; its tagged child-result disposition branch also
@@ -103,7 +103,7 @@ ACTING_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "start_service", "service_status", "service_logs", "stop_service",
     "integrate_subagent_patch", "compare_subagent_patches",
     "schedule_subagent", "wait_task", "wait_tasks", "get_task_result",
-    "forward_to_worker",
+    "forward_to_worker", "peek_task", "cancel_task", "discard_child_result",
     "verify_and_record",
     "knowledge_read", "knowledge_list",
     "tree_note", "tree_read", "override_delegation_constraint",

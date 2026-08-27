@@ -522,10 +522,31 @@ def _acceptance_harness(monkeypatch, tmp_path, review_result, *, enforcement="bl
             "created_at": (now - timedelta(seconds=1000 - deadline_remaining)).isoformat(),
             "deadline_at": (now + timedelta(seconds=deadline_remaining)).isoformat(),
         }
+    contract_task = {
+        "id": "t",
+        "root_task_id": "t",
+        "delegation_role": "root",
+        "metadata": meta,
+    }
+    if budget_profile is not None:
+        contract_task["budget_profile"] = budget_profile
+    contract = build_task_contract(contract_task)
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+
+    write_task_result(
+        tmp_path,
+        "t",
+        STATUS_RUNNING,
+        root_task_id="t",
+        delegation_role="root",
+        task_contract=contract,
+        result="Task is running.",
+    )
     ctx = SimpleNamespace(
         _task_acceptance_reviewed=False, is_direct_chat=False,
-        drive_root=str(tmp_path), task_metadata=meta,
-        task_contract={"budget_profile": budget_profile} if budget_profile is not None else {},
+        drive_root=str(tmp_path), root_task_id="t", delegation_role="root",
+        task_metadata={**meta, "root_task_id": "t", "budget_drive_root": str(tmp_path)},
+        task_contract=contract,
     )
     if passes_done:
         ctx._task_acceptance_improvement_passes = passes_done

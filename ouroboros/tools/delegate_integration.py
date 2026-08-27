@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
-import threading
 from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Tuple
 
 from ouroboros import delegate_custody as custody
@@ -264,12 +263,18 @@ def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token
                                   mode=str(request_body.get("mode") or ""),
                                   isolation=str(execution.get("isolation") or ""),
                                   delegated=bool(execution.get("delegated")))
-    root = str(scope.get("root") or "")
+    scope_root = str(scope.get("root") or "")
+    # Claudexor 3.8.1+ separates stable project identity (scope.root) from
+    # the one-shot execution snapshot.  Retry still replays the stored body
+    # byte-for-byte, but host custody/capture must keep naming the snapshot.
+    # On the strict 3.8.0 wire workspaceRoot is absent and scope.root remains
+    # the execution root, so this is byte-compatible with the legacy shape.
+    root = str(execution.get("workspaceRoot") or scope_root)
     project_id = str(record.get("project_id") or "")
     # The C1 isolation binding recorded at the original attempt. Pre-C1 rows
     # carry none; their scope.root IS the authority target (in-place regime).
     snapshot_id = str(record.get("snapshot_id") or "")
-    target_root = str(record.get("target_root") or "") or root
+    target_root = str(record.get("target_root") or "") or scope_root
     if authority.access == "workspace_write":
         binding_refusal = _retry_binding_refusal(record, retry_token)
         if binding_refusal:
@@ -539,6 +544,23 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody) -> Optional
     return _capture_block(entry, cap_dir, manifest)
 
 
+def capture_stranded_patch(drive_root: Any, run: _RunCustody) -> Dict[str, Any]:
+    """Capture a reconciled dead-owner run without deciding its disposition."""
+
+    if not (run.execution_root and run.settled and not run.patch_disposed):
+        return {}
+    try:
+        block = capture_terminal_patch_for_drive(drive_root, run) or {}
+    except Exception:
+        log.warning("Reconcile patch capture failed for %s", run.run_id, exc_info=True)
+        return {"patch_capture": "failed", "patch_disposition": "pending"}
+    return {
+        "patch_capture": str(block.get("status") or ""),
+        "patch_artifact": block.get("patch_artifact"),
+        "patch_disposition": "pending",
+    }
+
+
 # -- exact skill-payload delegation (R1) ---------------------------------------
 #
 # The restored delegated coding target class: an ordinary top-level task selects
@@ -652,46 +674,18 @@ def payload_host_instructions(text: str, skill_name: str) -> str:
         "review then re-runs before the new content is relied on.")
 
 
-# In-process half of the atomic payload start claim; the cross-process half is
-# the O_EXCL lockfile below. Both exist because two parallel delegate_start
-# calls (same process or two workers) must produce exactly ONE started run.
-_PAYLOAD_CLAIM_LOCK = threading.Lock()
-
-
 def claimed_start_request(
-    drive: pathlib.Path, *, claim_target: str, **request_row: Any,
-) -> Tuple[bool, str]:
-    """Write the START_REQUESTED row, atomically fused with the payload busy check.
+    drive: pathlib.Path, *, claim_target: str, actor_ctx: Any = None,
+    enforce_actor_idle: bool = False, **request_row: Any,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Compatibility facade for the one atomic pre-transport claim owner."""
 
-    Gate fix 5: for a payload run (``claim_target`` non-empty) the busy check
-    and the durable request write happen under ONE claim lock, so exactly one
-    of two synchronized starts wins; the loser gets the holder id back and
-    refuses typed. Non-payload rows pass straight through.
-    Returns ``(requested, busy_holder)``.
-    """
-    if not claim_target:
-        return custody.record_start_requested(drive, **request_row), ""
-    from ouroboros.platform_layer import (
-        acquire_exclusive_file_lock,
-        release_exclusive_file_lock,
+    from ouroboros.delegate_start_claims import claimed_start_request as claim
+
+    return claim(
+        drive, claim_target=claim_target, payload_busy=_payload_delegation_busy,
+        actor_ctx=actor_ctx, enforce_actor_idle=enforce_actor_idle, **request_row,
     )
-
-    lock_path = pathlib.Path(drive) / "state" / ".payload_delegation_claim.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with _PAYLOAD_CLAIM_LOCK:
-        fd = acquire_exclusive_file_lock(lock_path, timeout_sec=20.0, stale_sec=120.0)
-        if fd is None:
-            # Fail CLOSED: without the cross-process half the claim would be a
-            # plain unlocked read again — the exact race this fix removes.
-            return False, "(payload claim lock unavailable — another start holds it)"
-        try:
-            holder = _payload_delegation_busy(drive, pathlib.Path(claim_target))
-            if holder:
-                return False, holder
-            return custody.record_start_requested(drive, **request_row), ""
-        finally:
-            if fd is not None:
-                release_exclusive_file_lock(lock_path, fd)
 
 
 def _payload_mutation_authority(
@@ -1538,6 +1532,7 @@ __all__ = [
     "_retry_binding_refusal",
     "_validated_invocation",
     "capture_terminal_patch_for_drive",
+    "capture_stranded_patch",
     "claimed_start_request",
     "integrate_payload_patch",
     "payload_content_hash",

@@ -1033,6 +1033,7 @@ def _task_acceptance_subtree_snapshot(
             return False, []
     try:
         from ouroboros.task_status import SETTLED_STATUSES, find_child_tasks
+        from ouroboros.depth_evidence import task_depth_provenance
         from ouroboros.tools.join_ledger import _child_result_sha256
 
         meta = getattr(ctx, "task_metadata", {})
@@ -1062,6 +1063,8 @@ def _task_acceptance_subtree_snapshot(
                 "status": status,
                 "artifact_status": str(row.get("artifact_status") or ""),
             }
+            if depth_provenance := task_depth_provenance(row):
+                projected["depth_provenance"] = depth_provenance
             if status in SETTLED_STATUSES:
                 projected["child_result_sha256"] = _child_result_sha256(row)
             compact.append(projected)
@@ -1579,6 +1582,12 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
         reviewer_slots,
         run_review_request,
     )
+    from ouroboros.review_dispatch import (
+        TaskAcceptanceDispatchUnavailable,
+        bind_task_acceptance_paid_dispatch,
+        run_zero_physical_task_acceptance as _free_dispatch,
+        task_acceptance_preclaim_refusal,
+    )
 
     evidence = ctx.evidence or _build_host_acceptance_evidence(ctx)
     slots = reviewer_slots(effort=resolve_effort("review"), role_hint="task acceptance")
@@ -1601,6 +1610,21 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
         },
         task_id=ctx.task_id, retry_key=f"task_acceptance:{task_acceptance_evidence_revision(evidence)}",
     )
+    if not slots:
+        return ReviewRunResult(
+            request={"surface": "task_acceptance", "task_id": str(ctx.task_id)},
+            actors=[],
+            parsed_findings=[],
+            aggregate_signal="DEGRADED",
+            degraded=True,
+            degraded_reasons=["no_review_slots"],
+        )
+    # Budget admission for the whole acceptance wave (v6.69.0): a wave that
+    # cannot fit the remaining root budget is declined up front as a terminal
+    # DEGRADED (no-quorum semantics) instead of dying mid-wave. The estimate
+    # renders the REAL per-slot message pair; the rare second physical attempt
+    # is deliberately not multiplied in — a fail-open coarse filter, not a
+    # hard reservation.
     # Budget-admit the panel from real per-slot prompts; repair resends remain unreserved.
     from ouroboros.tools.review_helpers import review_wave_budget_gate
 
@@ -1629,17 +1653,30 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
                 f"${_admission.get('remaining_usd')} (no reviewer was called)"
             ],
         )
+    free_result = _free_dispatch(
+        request, slots, drive_root=ctx.drive_root or ctx.tools._ctx.drive_root, usage_ctx=ctx.tools._ctx)
+    if free_result is not None:
+        return free_result
+    refusal = task_acceptance_preclaim_refusal(ctx)
+    if refusal is not None:
+        return refusal
+    # Q6: bind the exact tree wallet to the target's physical-dispatch stamp.
+    # Route/candidate refusals remain free; one strict stamp gates every slot.
     started = time.monotonic()
-    result = run_review_request(
-        request,
-        slots=slots,
-        drive_root=(
-            pathlib.Path(ctx.drive_root)
-            if ctx.drive_root is not None
-            else pathlib.Path(ctx.tools._ctx.drive_root)
-        ),
-        usage_ctx=ctx.tools._ctx,
-    )
+    try:
+        with bind_task_acceptance_paid_dispatch(ctx) as usage_ctx:
+            result = run_review_request(
+                request, slots=slots,
+                drive_root=(pathlib.Path(ctx.drive_root) if ctx.drive_root is not None
+                            else pathlib.Path(ctx.tools._ctx.drive_root)),
+                usage_ctx=usage_ctx,
+            )
+    except TaskAcceptanceDispatchUnavailable as exc:
+        return ReviewRunResult(
+            request={"surface": "task_acceptance", "task_id": str(ctx.task_id)},
+            actors=[], parsed_findings=[], aggregate_signal="DEGRADED", degraded=True,
+            degraded_reasons=[f"{exc} (no reviewer was called)"],
+        )
     duration_sec = round(time.monotonic() - started, 3)
     try:
         from ouroboros.utils import append_jsonl, utc_now_iso
@@ -2744,126 +2781,12 @@ def _maybe_inject_cost_budget_milestone(
     return True
 
 
-# The verbs whose call IS delegated-run activity for the nanny-economics baseline.
-# Exact tool-call transitions, observed in the loop as they happen — never a scan
-# of the custody log or events.jsonl (the baseline must be free to read per round).
-_DELEGATE_ACTIVITY_TOOLS = frozenset({
-    "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
-})
-
-
-def _note_nanny_delegate_activity(
-    ctx: Any, round_idx: int, accumulated_usage: Dict[str, Any],
-    tool_calls: List[Dict[str, Any]],
-) -> None:
-    """Advance the nanny's metered-progress marker, and its delegate-activity baseline
-    when this round actually touched a delegated run.
-
-    Two process-local marks on the ToolContext, written once per round: what the task
-    has spent so far (round index + accumulated cost), and where that stood at the
-    LAST delegate-verb call. Their difference is the whole input of the proportional
-    reminder — the poltergeist children burned $87 of opus rounds co-building around
-    their $0 runs, and nothing measured the burn while it happened.
-    """
-    if not getattr(ctx, "_nanny_route_dispatched", False):
-        return
-    try:
-        cost = float(accumulated_usage.get("cost") or 0.0)
-    except (TypeError, ValueError):
-        cost = 0.0
-    mark = {"round": int(round_idx), "cost": cost}
-    ctx._nanny_metered_progress = mark
-    verbs = set()
-    for call in tool_calls or []:
-        fn = call.get("function") if isinstance(call, dict) else None
-        name = str((fn or {}).get("name") or "").strip() if isinstance(fn, dict) else ""
-        if name in _DELEGATE_ACTIVITY_TOOLS:
-            verbs.add(name)
-    if not verbs:
-        return
-    if verbs == {"delegate_wait"}:
-        # R2-5: a wait is WATCHING, not delegating — it advances only the
-        # ROUND half of the baseline. Preserving the COST half keeps the
-        # dollar axis cumulative across waits: re-zeroing BOTH axes at every
-        # wait never heard the reminder ($0.24/round probe), while a genuinely
-        # holding nanny stays under the dollar threshold anyway.
-        prior = getattr(ctx, "_nanny_delegate_baseline", None)
-        prior_cost = float(prior.get("cost") or 0.0) if isinstance(prior, dict) else 0.0
-        ctx._nanny_delegate_baseline = {"round": mark["round"], "cost": prior_cost}
-    else:
-        ctx._nanny_delegate_baseline = dict(mark)
-    # Delegate activity also RE-ARMS the reminder: the fire cursor is
-    # cleared so a cooldown earned BEFORE this activity can never mute
-    # the reminder for burn that happens AFTER it (gemini, fix F1).
-    ctx._nanny_reminder_mark = None
-
-
-def _nanny_metered_since_delegate_activity(ctx: Any) -> Tuple[int, float]:
-    """(rounds, dollars) this task's OWN metered loop has spent since the last
-    delegate-verb call — zero before the first round is marked."""
-    progress = getattr(ctx, "_nanny_metered_progress", None)
-    progress = progress if isinstance(progress, dict) else {}
-    baseline = getattr(ctx, "_nanny_delegate_baseline", None)
-    baseline = baseline if isinstance(baseline, dict) else {}
-    try:
-        rounds = max(0, int(progress.get("round") or 0) - int(baseline.get("round") or 0))
-    except (TypeError, ValueError):
-        rounds = 0
-    try:
-        cost = max(0.0, float(progress.get("cost") or 0.0) - float(baseline.get("cost") or 0.0))
-    except (TypeError, ValueError):
-        cost = 0.0
-    return rounds, cost
-
-
-def _nanny_reminder_due(ctx: Any, round_idx: int) -> Tuple[int, float, bool]:
-    """The measured burn plus whether the proportional reminder is due THIS round.
-
-    Due when EITHER axis (rounds or dollars, ``task_pacing.NANNY_REMINDER_*``)
-    crossed its threshold since the last delegate-verb call. The re-arm is
-    dual-axis too (fix F1): the next firing waits for a further threshold-width
-    on EITHER axis, so a fast dollar burn is never muted by round spacing. The
-    first firing has no spacing gate; delegate activity clears the fire cursor
-    (``_note_nanny_delegate_activity``). Proportional and repeating, never a cap
-    (owner decision 2=B). With no delegate verb AND no prior firing, the first
-    reminder fires early (``NANNY_FIRST_REMINDER_ROUNDS``, owner-approved
-    2026-08-15) regardless of dollars; any delegate activity or re-arm restores
-    the ordinary dual-axis thresholds unchanged."""
-    from ouroboros.task_pacing import (
-        NANNY_FIRST_REMINDER_ROUNDS, NANNY_REMINDER_ROUNDS, NANNY_REMINDER_USD,
-    )
-
-    rounds, cost = _nanny_metered_since_delegate_activity(ctx)
-    round_threshold = NANNY_REMINDER_ROUNDS
-    if (
-        not isinstance(getattr(ctx, "_nanny_delegate_baseline", None), dict)
-        and not isinstance(getattr(ctx, "_nanny_reminder_mark", None), dict)
-    ):
-        # No delegate verb AND no reminder yet: first firing comes early.
-        round_threshold = NANNY_FIRST_REMINDER_ROUNDS
-    if rounds < round_threshold and cost < NANNY_REMINDER_USD:
-        return rounds, cost, False
-    mark = getattr(ctx, "_nanny_reminder_mark", None)
-    if not isinstance(mark, dict):
-        return rounds, cost, True  # first firing: no spacing gate
-    progress = getattr(ctx, "_nanny_metered_progress", None)
-    progress = progress if isinstance(progress, dict) else {}
-    try:
-        rounds_since_fire = int(progress.get("round") or 0) - int(mark.get("round") or 0)
-    except (TypeError, ValueError):
-        rounds_since_fire = 0
-    try:
-        cost_since_fire = float(progress.get("cost") or 0.0) - float(mark.get("cost") or 0.0)
-    except (TypeError, ValueError):
-        cost_since_fire = 0.0
-    if rounds_since_fire >= NANNY_REMINDER_ROUNDS or cost_since_fire >= NANNY_REMINDER_USD:
-        return rounds, cost, True
-    return rounds, cost, False
-
-
-def _nanny_burn_phrase(rounds: int, cost: float) -> str:
-    return (f"{rounds} of your own metered LLM rounds (~${cost:.2f})" if cost > 0
-            else f"{rounds} of your own metered LLM rounds")
+from ouroboros.nanny_pacing import (
+    _nanny_burn_phrase,
+    _nanny_metered_since_delegate_activity,
+    _nanny_reminder_due,
+    _note_nanny_delegate_activity,
+)
 
 
 def _maybe_inject_nanny_economics_reminder(
@@ -2900,8 +2823,14 @@ def _maybe_inject_nanny_economics_reminder(
     # activity" — the burn is measured from the task's start, and the wording
     # says so instead of implying an activity that never happened.
     _baseline_known = isinstance(getattr(ctx, "_nanny_delegate_baseline", None), dict)
-    since_phrase = ("since your last delegated-run activity" if _baseline_known
-                    else "since this task started (no delegated-run activity yet)")
+    coordination = bool(getattr(ctx, "_nanny_coordination_activity", False))
+    if _baseline_known:
+        since_phrase = (
+            "since your last delegated-run or host-coordination activity"
+            if coordination else "since your last delegated-run activity"
+        )
+    else:
+        since_phrase = "since this task started (no delegated-run activity yet)"
     # BR1-3: never an unconditional "$0" claim — the owner's wording law is
     # typed cost classes: known-zero only on a settled $0 spend, never "free"
     # unqualified (estimated/undisclosed spend is never zero).
@@ -3687,7 +3616,7 @@ def _delivery_evidence_state(
 ) -> tuple[int, str]:
     """Fingerprint only evidence that can invalidate a complete answer."""
 
-    from ouroboros.outcomes import read_verification_receipts
+    from ouroboros.outcomes import read_context_verification_receipts
     from ouroboros.tools.join_ledger import _child_result_sha256
 
     owner_directives = getattr(tools._ctx, "_owner_directives", [])
@@ -3701,7 +3630,12 @@ def _delivery_evidence_state(
             "disposition": _child_disposition_state(child),
         })
     receipt_root = pathlib.Path(
-        str(getattr(tools._ctx, "drive_root", "") or ctx.drive_root or ctx.status_drive_root or ctx.drive_logs.parent)
+        str(
+            getattr(tools._ctx, "drive_root", "")
+            or ctx.drive_root
+            or ctx.status_drive_root
+            or ctx.drive_logs.parent
+        )
     )
     evidence = {
         "owner_directives": owner_directives,
@@ -3719,7 +3653,9 @@ def _delivery_evidence_state(
             if isinstance(call, dict) and call.get("plan_review_outcome")
         ],
         "children": children,
-        "verification_receipts": read_verification_receipts(receipt_root, ctx.task_id),
+        "verification_receipts": read_context_verification_receipts(
+            tools._ctx, ctx.task_id, fallback_root=receipt_root,
+        ),
         # Task-scoped service teardown can register declared outputs or surface an
         # output-finalization failure.  Those facts are produced outside an ordinary
         # tool call, so bind their stable projection explicitly; otherwise a host
@@ -5853,6 +5789,15 @@ def _nanny_finalization_message(
             "or state in your final answer that the delegated run failed and why "
             "the remaining work ran on metered API tokens."
         )
+    from ouroboros.subagent_bootstrap import (
+        actor_first_coordination_finalization_message,
+    )
+
+    actor_first = actor_first_coordination_finalization_message(
+        tools._ctx, task_id=str(task_id or ""), fallback_root=drive_root,
+    )
+    if actor_first is not None:
+        return actor_first
     return (
         "⚠️ NANNY_DID_NOT_DELEGATE: this task was dispatched onto the delegated "
         "substrate (executor=harness), but you are finalizing with ZERO "
@@ -5874,6 +5819,19 @@ def _maybe_inject_finalization_nudges(
     run_llm_loop to keep it under the method size gate."""
     if drive_root is None:
         return False
+    # Forked actors keep ordinary verification locally while actor-first zero-run
+    # authority is canonical immediately. Never let one non-empty replica hide the
+    # other: all verification/nudge decisions consume the shared merged view.
+    try:
+        from ouroboros.outcomes import read_context_verification_receipts
+
+        receipt_rows = read_context_verification_receipts(
+            tools._ctx, task_id, fallback_root=drive_root,
+        )
+    except Exception:
+        from ouroboros.outcomes import read_verification_receipts
+
+        receipt_rows = read_verification_receipts(drive_root, task_id)
     if (getattr(tools._ctx, "_nanny_route_dispatched", False)
             and not getattr(tools._ctx, "_nanny_finalization_injected", False)):
         # Nanny postcondition (owner 2026-08-07): a harness-dispatched child
@@ -5927,7 +5885,9 @@ def _maybe_inject_finalization_nudges(
         # ("no grounding" vs "grounding says FAIL"). Ordered BEFORE the FR3 verify
         # nudge. Binary latch; advisory; forced-finalization paths bypass it.
         # Keyed on the typed receipt status, never content (Bible P5).
-        _failed_receipt = latest_unreconciled_failed_verification(drive_root, task_id)
+        _failed_receipt = latest_unreconciled_failed_verification(
+            drive_root, task_id, receipts=receipt_rows,
+        )
         if _failed_receipt is not None:
             tools._ctx._verify_red_nudged = True
             _check = str(_failed_receipt.get("check") or "").strip()
@@ -5952,7 +5912,9 @@ def _maybe_inject_finalization_nudges(
         # false-green tutanota hit). Distinct from the red nudge; ordered
         # after it. Binary latch; advisory; forced paths bypass it. Flag-
         # driven on the typed receipt sensor, never content (Bible P5).
-        _masked_receipt = latest_unreconciled_masked_verification(drive_root, task_id)
+        _masked_receipt = latest_unreconciled_masked_verification(
+            drive_root, task_id, receipts=receipt_rows,
+        )
         if _masked_receipt is not None:
             tools._ctx._verify_masked_nudged = True
             _mcheck = str(_masked_receipt.get("check") or "").strip()
@@ -5979,7 +5941,9 @@ def _maybe_inject_finalization_nudges(
         # confirm equivalence with the task's real requirement (or state the basis via
         # criterion_basis). Ordered AFTER the masked nudge, BEFORE FR3. Flag-driven on
         # the typed receipt field, never content (P5); forced paths bypass earlier.
-        _agent_defined = latest_agent_defined_verification(drive_root, task_id)
+        _agent_defined = latest_agent_defined_verification(
+            drive_root, task_id, receipts=receipt_rows,
+        )
         if _agent_defined is not None:
             tools._ctx._criterion_source_nudged = True
             _acheck = str(_agent_defined.get("check") or "").strip()
@@ -5997,7 +5961,24 @@ def _maybe_inject_finalization_nudges(
             emit_progress("Criterion-provenance nudge injected before final response.")
             llm_trace["reasoning_notes"].append("Criterion-provenance nudge injected before final response.")
             return True
-    if not getattr(tools._ctx, "_verify_nudged", False) and should_nudge_verification(llm_trace, drive_root, task_id):
+    suppress_unavailable_zero_run_verify = False
+    try:
+        from ouroboros.outcomes import _terminal_zero_run_receipt_present
+        from ouroboros.tool_access import active_tool_profile
+
+        suppress_unavailable_zero_run_verify = (
+            active_tool_profile(tools._ctx) == "local_readonly_subagent"
+            and _terminal_zero_run_receipt_present(receipt_rows)
+        )
+    except Exception:
+        pass
+    if (
+        not getattr(tools._ctx, "_verify_nudged", False)
+        and not suppress_unavailable_zero_run_verify
+        and should_nudge_verification(
+            llm_trace, drive_root, task_id, receipts=receipt_rows,
+        )
+    ):
         # FR3 one-shot verify-before-done nudge: real effects, no host-attested grounding
         # yet. Binary latch (not a tunable counter), sibling BEFORE the acceptance-review
         # gate so it reaches both required and auto. Forced finalization paths return
@@ -6814,11 +6795,12 @@ def run_llm_loop(
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {"_task_attempt": getattr(ctx, "task_attempt", None)}
     tools._ctx._accumulated_usage = accumulated_usage
+    ctx._accumulated_usage = accumulated_usage
     max_retries = 3
     cost_ceiling = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)
     if cost_ceiling.root_cap_usd is not None:
-        # Loop-start seed (one rare ledger read): a resumed/late-started member
-        # of a spending tree must see the real tree number before its first
+        # One ledger read seeds a resumed/late-started member
+        # of a spending tree must see tree spend before its first
         # pacing surface, not a process-local empty stash.
         _loop_tree_accounting(refresh=True, max_age_sec=0.0)
     from ouroboros.tools import tool_discovery as _td

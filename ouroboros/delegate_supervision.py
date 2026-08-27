@@ -20,6 +20,7 @@ from ouroboros.utils import atomic_write_json, utc_now_iso
 _TICK_SEC = 3
 _QUIET_STATUSES = {"progress", "no_progress"}
 _LOOP_CONTROL_KINDS = {KIND_FINALIZE_NOW, KIND_HURRY}
+_MAX_COORDINATION_SEEN = 256
 
 
 def _attempt_key(ctx: Any) -> str:
@@ -63,6 +64,327 @@ def _payload(raw: str) -> dict[str, Any]:
         return data if isinstance(data, dict) else {"status": "fault", "detail": raw}
     except (TypeError, ValueError):
         return {"status": "fault", "detail": str(raw or "")}
+
+
+def _coordination_root_id(ctx: Any) -> str:
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return str(
+        metadata.get("root_task_id")
+        or getattr(ctx, "root_task_id", "")
+        or getattr(ctx, "task_id", "")
+        or ""
+    )
+
+
+def _parent_intent_fact(ctx: Any) -> dict[str, Any]:
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    contract = (
+        getattr(ctx, "task_contract", None)
+        if isinstance(getattr(ctx, "task_contract", None), dict)
+        else metadata.get("task_contract")
+        if isinstance(metadata.get("task_contract"), dict)
+        else {}
+    )
+    budget = contract.get("delegation_budget") if isinstance(contract, dict) else {}
+    note = str((budget or {}).get("intent_note") or "").strip()
+    return {
+        "state": "present" if note else "absent",
+        "authority": "parent_authored_advisory",
+        "text": note,
+    }
+
+
+def _time_fact(ctx: Any) -> dict[str, Any]:
+    try:
+        from ouroboros.task_pacing import build_budget_snapshot, resolve_budget_profile
+
+        snapshot = build_budget_snapshot(ctx, profile=resolve_budget_profile(ctx))
+        if not snapshot.has_deadline:
+            return {
+                "state": "not_set", "remaining_sec": None,
+                "reserve_sec": None, "inside_reserve": None, "expired": None,
+            }
+        return {
+            "state": "known",
+            "remaining_sec": round(max(0.0, snapshot.remaining_sec), 3),
+            "reserve_sec": round(max(0.0, snapshot.reserve_sec), 3),
+            "inside_reserve": bool(snapshot.inside_reserve),
+            "expired": bool(snapshot.remaining_sec <= 0),
+        }
+    except Exception as exc:
+        return {
+            "state": "unknown", "remaining_sec": None,
+            "reserve_sec": None, "inside_reserve": None, "expired": None,
+            "reason": type(exc).__name__,
+        }
+
+
+def _settled_spend_fact(ctx: Any, root_task_id: str) -> dict[str, Any]:
+    try:
+        from ouroboros.usage_accounting import usage_breakdown
+
+        projection = usage_breakdown(
+            custody.custody_root(ctx), root_task_id=root_task_id,
+        )
+        integrity = bool(projection.get("integrity_degraded"))
+        unknown = int(projection.get("unknown_unmetered") or 0)
+        return {
+            "state": "partial" if integrity or unknown else "known",
+            "settled_usd": float(projection.get("settled_usd") or 0.0),
+            "accounted_usd": float(projection.get("accounted_usd") or 0.0),
+            "cost_final": bool(projection.get("cost_final")),
+            "unknown_unmetered": unknown,
+            "integrity_degraded": integrity,
+        }
+    except Exception as exc:
+        return {
+            "state": "unknown", "settled_usd": None, "accounted_usd": None,
+            "cost_final": None, "unknown_unmetered": None,
+            "integrity_degraded": None, "reason": type(exc).__name__,
+        }
+
+
+def _active_descendants_fact(ctx: Any) -> dict[str, Any]:
+    """Strict host-visible ancestry walk; vendor-internal children stay opaque."""
+
+    try:
+        from ouroboros.task_results import load_task_result
+        from ouroboros.task_status import (
+            SETTLED_STATUSES,
+            _load_queue_snapshot,
+            _merge_queue_status,
+            _snapshot_is_stale,
+        )
+
+        root = custody.custody_root(ctx)
+        snapshot = _load_queue_snapshot(pathlib.Path(root))
+        if snapshot.get("_snapshot_missing") or snapshot.get("_snapshot_invalid"):
+            raise ValueError("queue_snapshot_unavailable")
+        if _snapshot_is_stale(snapshot):
+            raise ValueError("queue_snapshot_stale")
+        rows: dict[str, dict[str, Any]] = {}
+        for group, status in (("pending", "scheduled"), ("running", "running")):
+            for item in snapshot.get(group) or []:
+                if not isinstance(item, dict):
+                    raise ValueError("queue_snapshot_row_invalid")
+                task = item.get("task") if isinstance(item.get("task"), dict) else item
+                task_id = str(item.get("id") or task.get("id") or "")
+                if not task_id:
+                    raise ValueError("queue_snapshot_task_id_missing")
+                rows[task_id] = {
+                    **task,
+                    "task_id": task_id,
+                    "_queue_status": status,
+                }
+        ancestor = str(getattr(ctx, "task_id", "") or "")
+        lineage_cache = dict(rows)
+
+        def _belongs(row: dict[str, Any]) -> bool:
+            parent_id = str(row.get("parent_task_id") or "")
+            seen = {str(row.get("task_id") or row.get("id") or "")}
+            while parent_id:
+                if parent_id == ancestor:
+                    return True
+                if parent_id in seen:
+                    raise ValueError("task_lineage_cycle")
+                seen.add(parent_id)
+                parent = lineage_cache.get(parent_id)
+                if parent is None:
+                    parent = load_task_result(root, parent_id, strict=True)
+                    if not isinstance(parent, dict):
+                        raise ValueError("task_lineage_unavailable")
+                    lineage_cache[parent_id] = parent
+                parent_id = str(parent.get("parent_task_id") or "")
+            return False
+
+        active: list[dict[str, Any]] = []
+        for task_id, row in rows.items():
+            if task_id == ancestor or not _belongs(row):
+                continue
+            # Only exact rows proven to be descendants can poison this fact.
+            # Unrelated active tasks are outside the nanny's authority surface.
+            durable = load_task_result(root, task_id, strict=True) or {}
+            merged = {**durable, **row}
+            merged["status"] = _merge_queue_status(
+                str(durable.get("status") or ""),
+                str(row.get("_queue_status") or ""),
+            )
+            merged.pop("_queue_status", None)
+            if str(merged.get("status") or "").strip().lower() not in SETTLED_STATUSES:
+                active.append(merged)
+        by_status: dict[str, int] = {}
+        for row in active:
+            status = str(row.get("status") or "unknown").strip().lower() or "unknown"
+            by_status[status] = by_status.get(status, 0) + 1
+        return {
+            "state": "known", "count": len(active),
+            "by_status": dict(sorted(by_status.items())),
+            "scope": "host_visible_descendants",
+            "vendor_internal": "opaque_not_counted",
+        }
+    except Exception as exc:
+        return {
+            "state": "unknown", "count": None, "by_status": {},
+            "scope": "host_visible_descendants",
+            "vendor_internal": "opaque_not_counted",
+            "reason": type(exc).__name__,
+        }
+
+
+def coordination_live_context(ctx: Any) -> dict[str, Any]:
+    """One LLM-first planning snapshot for startup and meaningful nanny wakes."""
+
+    root_task_id = _coordination_root_id(ctx)
+    try:
+        from ouroboros.task_pacing import project_task_acceptance_review_capacity
+
+        review_capacity = project_task_acceptance_review_capacity(ctx)
+    except Exception as exc:
+        review_capacity = {
+            "state": "unknown", "reason": type(exc).__name__,
+            "root_task_id": root_task_id, "cap_cycles": None,
+            "claimed_cycles": None, "remaining_cycles": None,
+            "binding_seen": False, "dedupe": "task_acceptance_binding_sha256",
+        }
+    return {
+        "observed_at": utc_now_iso(),
+        "root_task_id": root_task_id,
+        "parent_intent": _parent_intent_fact(ctx),
+        "time": _time_fact(ctx),
+        "settled_spend": _settled_spend_fact(ctx, root_task_id),
+        "active_descendants": _active_descendants_fact(ctx),
+        "review_capacity": review_capacity,
+    }
+
+
+def _coordination_cursor(state: dict[str, Any]) -> dict[str, Any]:
+    cursor = state.get("coordination_cursor")
+    if not isinstance(cursor, dict):
+        cursor = {}
+    seen = cursor.get("attention_seen")
+    return {
+        "attention_after_ts": str(cursor.get("attention_after_ts") or ""),
+        "attention_seen": [str(item) for item in seen if str(item)]
+        if isinstance(seen, list) else [],
+        "children": dict(cursor.get("children"))
+        if isinstance(cursor.get("children"), dict) else {},
+    }
+
+
+def _coordination_row_id(row: dict[str, Any]) -> str:
+    from ouroboros.task_tree_ledger import tree_ledger_row_id
+
+    return tree_ledger_row_id(row)
+
+
+def _direct_children(ctx: Any) -> dict[str, dict[str, Any]]:
+    """Read the existing durable direct-child projection for this nanny."""
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    if not task_id:
+        return {}
+    try:
+        from ouroboros.task_status import find_child_tasks
+
+        children = find_child_tasks(
+            custody.custody_root(ctx), parent_task_id=task_id,
+            root_task_id="", scope="direct", materialize_artifacts=True,
+        )
+    except Exception:
+        return {}
+    return {
+        str(child.get("task_id") or child.get("id") or ""): dict(child)
+        for child in children
+        if isinstance(child, dict)
+        and str(child.get("task_id") or child.get("id") or "")
+    }
+
+
+def _child_marker(child: dict[str, Any]) -> dict[str, str]:
+    stored_hash = str(
+        child.get("child_result_sha256") or child.get("result_sha256") or ""
+    )
+    try:
+        from ouroboros.tools.join_ledger import _child_result_sha256
+
+        result_hash = _child_result_sha256(child)
+    except Exception:
+        result_hash = stored_hash
+    return {
+        "status": str(child.get("status") or "").strip().lower(),
+        "updated_at": str(child.get("updated_at") or child.get("ts") or ""),
+        "result_sha256": result_hash,
+    }
+
+
+def _coordination_wakes(
+    ctx: Any, state: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Collect direct-child beacons and terminal transitions on one cursor."""
+    cursor = _coordination_cursor(state)
+    children = _direct_children(ctx)
+    markers = {
+        child_id: _child_marker(child) for child_id, child in children.items()
+    }
+    metadata = getattr(ctx, "task_metadata", {})
+    root_id = str(metadata.get("root_task_id") or "").strip() if isinstance(metadata, dict) else ""
+    root_id = root_id or str(getattr(ctx, "task_id", "") or "").strip()
+    attention: list[dict[str, Any]] = []
+    seen = {str(item) for item in cursor.get("attention_seen", []) if str(item)}
+    try:
+        from ouroboros.task_tree_ledger import tree_ledger_attention_after
+
+        attention = tree_ledger_attention_after(
+            root_id,
+            str(cursor.get("attention_after_ts") or ""),
+            task_ids=set(children),
+            seen_ids=seen,
+            data_root=custody.custody_root(ctx),
+        )
+    except Exception:
+        attention = []
+    new_attention = [row for row in attention if _coordination_row_id(row) not in seen]
+    terminal_events: list[dict[str, Any]] = []
+    prior_children = cursor.get("children") if isinstance(cursor.get("children"), dict) else {}
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    for child_id, marker in markers.items():
+        previous = prior_children.get(child_id) if isinstance(prior_children.get(child_id), dict) else {}
+        status = marker["status"]
+        if (
+            status in SETTLED_STATUSES
+            and str(previous.get("status") or "") not in SETTLED_STATUSES
+        ):
+            terminal_events.append({
+                "type": "child_terminal",
+                "child_task_id": child_id,
+                "status": status,
+                "updated_at": marker["updated_at"],
+                "result_sha256": marker["result_sha256"],
+            })
+    events = [
+        {"type": "child_attention_beacon", "beacon": row}
+        for row in new_attention
+    ] + terminal_events
+    next_cursor = {
+        "attention_after_ts": str(cursor.get("attention_after_ts") or ""),
+        "attention_seen": list(cursor.get("attention_seen", [])),
+        "children": {**prior_children, **markers},
+    }
+    if new_attention:
+        timestamps = [
+            str(row.get("ts") or "") for row in new_attention if str(row.get("ts") or "")
+        ]
+        if timestamps:
+            next_cursor["attention_after_ts"] = max(
+                str(next_cursor["attention_after_ts"] or ""), max(timestamps)
+            )
+        next_cursor["attention_seen"] = list(dict.fromkeys([
+            *next_cursor["attention_seen"],
+            *(_coordination_row_id(row) for row in new_attention),
+        ]))[-_MAX_COORDINATION_SEEN:]
+    return events, next_cursor
 
 
 def _addressed_wakes(ctx: Any, state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -126,6 +448,139 @@ def _wake_ids(value: Any) -> set[str]:
     return found
 
 
+def _wake_event_summary(event: Any) -> dict[str, Any]:
+    """Compact one wake event while retaining its routing/exact-evidence facts."""
+
+    if not isinstance(event, dict):
+        return {"type": "unknown"}
+    if str(event.get("type") or "") == "child_attention_beacon":
+        beacon = event.get("beacon") if isinstance(event.get("beacon"), dict) else {}
+        text = str(beacon.get("text") or "")
+        summary: dict[str, Any] = {
+            "type": "child_attention_beacon",
+            "beacon": {
+                key: beacon.get(key)
+                for key in ("ts", "kind", "task_id", "role", "needs_parent_attention")
+                if beacon.get(key) not in (None, "")
+            },
+        }
+        summary["beacon"]["text"] = text[:600]
+        if len(text) > 600:
+            summary["beacon"]["text_omitted_chars"] = len(text) - 600
+        payload = beacon.get("payload") if isinstance(beacon.get("payload"), dict) else {}
+        if str(beacon.get("kind") or "") == "review_requested":
+            evidence_ref = str(payload.get("evidence_ref") or "")
+            summary["beacon"]["payload"] = {
+                "evidence_ref": evidence_ref[:600],
+                "evidence_sha256": str(payload.get("evidence_sha256") or ""),
+            }
+            if len(evidence_ref) > 600:
+                summary["beacon"]["payload"]["evidence_ref_omitted_chars"] = (
+                    len(evidence_ref) - 600
+                )
+        elif payload:
+            summary["beacon"]["payload_available_in_full_source"] = True
+        return summary
+    summary = {
+        key: event.get(key)
+        for key in (
+            "type", "kind", "msg_id", "source_task_id", "child_task_id",
+            "status", "updated_at", "result_sha256",
+        )
+        if event.get(key) not in (None, "")
+    }
+    if "text" in event:
+        text = str(event.get("text") or "")
+        summary["text"] = text[:600]
+        if len(text) > 600:
+            summary["text_omitted_chars"] = len(text) - 600
+    return summary or {"type": str(event.get("type") or "unknown")}
+
+
+def _render_wake_payload(ctx: Any, payload: dict[str, Any]) -> str:
+    """Render valid bounded JSON, spilling an oversized exact wake to artifacts."""
+
+    raw = json.dumps(payload, ensure_ascii=False, indent=2)
+    from ouroboros.tool_capabilities import tool_result_limit
+
+    budget = tool_result_limit("delegate_wait")
+    if len(raw) <= budget:
+        return raw
+    wake_id = str(payload.get("supervision_wake_id") or "")
+    try:
+        from ouroboros.artifacts import store_actor_source_bytes, task_id_for_artifacts
+
+        source = store_actor_source_bytes(
+            pathlib.Path(getattr(ctx, "drive_root", custody.custody_root(ctx))),
+            task_id_for_artifacts(ctx),
+            category="tool_results",
+            source_id=f"delegate-wake-{wake_id or uuid.uuid4().hex}",
+            data=raw.encode("utf-8"),
+            extension="json",
+        )
+    except Exception:
+        # Keep the exact wake pending and let the ordinary outer truncation fail
+        # acknowledgement rather than falsely claiming lossy delivery.
+        _emit(ctx, "delegate_supervision_wake_source_failed", {
+            "run_id": str(payload.get("run_id") or ""),
+            "wake_id": wake_id,
+            "total_chars": len(raw),
+        })
+        return raw
+    events = payload.get("wake_events") if isinstance(payload.get("wake_events"), list) else []
+    summaries = [_wake_event_summary(event) for event in events]
+    envelope: dict[str, Any] = {
+        key: (str(value)[:600] if isinstance(value, str) else value)
+        for key in ("status", "run_id", "state", "last_seq", "reason")
+        if (value := payload.get(key)) not in (None, "")
+    }
+    envelope["supervision_wake_id"] = wake_id
+    envelope["wake_events"] = summaries
+    if isinstance(payload.get("coordination_context"), dict):
+        envelope["coordination_context"] = payload["coordination_context"]
+    envelope["wake_delivery"] = {
+        "complete": False,
+        "total_chars": len(raw),
+        "wake_events_total": len(events),
+        "wake_events_summarized": len(summaries),
+        "wake_events_omitted": 0,
+        "source": source,
+        "note": (
+            "The exact combined delegate/coordination wake is staged at source. "
+            "Read it with the supplied read_file arguments before relying on omitted detail."
+        ),
+    }
+    rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+    while len(rendered) > budget and summaries:
+        summaries.pop()
+        envelope["wake_delivery"]["wake_events_summarized"] = len(summaries)
+        envelope["wake_delivery"]["wake_events_omitted"] = len(events) - len(summaries)
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+    if len(rendered) > budget:
+        envelope.pop("wake_events", None)
+        envelope["wake_delivery"]["wake_events_summarized"] = 0
+        envelope["wake_delivery"]["wake_events_omitted"] = len(events)
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+    if len(rendered) > budget and isinstance(envelope.get("coordination_context"), dict):
+        context = envelope["coordination_context"]
+        envelope["coordination_context"] = {
+            "state": "available_in_full_wake_source",
+            "observed_at": str(context.get("observed_at") or ""),
+            "root_task_id": str(context.get("root_task_id") or ""),
+        }
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+    if len(rendered) > budget:
+        envelope = {
+            "status": str(payload.get("status") or "wake_available")[:120],
+            "run_id": str(payload.get("run_id") or "")[:200],
+            "supervision_wake_id": wake_id,
+            "coordination_context": {"state": "available_in_full_wake_source"},
+            "wake_delivery": envelope["wake_delivery"],
+        }
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+    return rendered
+
+
 def _pending_payload(ctx: Any, state: dict[str, Any]) -> dict[str, Any]:
     pending = state.get("pending_wake") if isinstance(state.get("pending_wake"), dict) else {}
     payload = pending.get("payload") if isinstance(pending.get("payload"), dict) else {}
@@ -154,7 +609,7 @@ def _pending_payload(ctx: Any, state: dict[str, Any]) -> dict[str, Any]:
 
 
 def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
-    """Durably ack one wake only after its full payload entered the transcript."""
+    """Ack only after the exact wake or its verified source handle was delivered."""
 
     state = _load_state(ctx, "")
     pending = state.get("pending_wake") if isinstance(state.get("pending_wake"), dict) else {}
@@ -162,20 +617,17 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
         return True
     expected = str(pending.get("wake_id") or "")
     attempt = _attempt_key(ctx)
-    delivered_wake = False
-    if delivered is not None:
-        try:
-            payload = json.loads(delivered) if isinstance(delivered, str) else delivered
-        except (TypeError, ValueError):
-            return False
-        payload = payload if isinstance(payload, dict) else {}
-        if expected and expected not in _wake_ids(payload):
-            return False
-        delivered_wake = True
-    if str(pending.get("attempt_key") or "") != attempt and not delivered_wake:
-        # A fresh physical attempt has not seen the predecessor's returned wake.
-        # Leave it pending so supervised_wait replays the exact payload first.
-        return True
+    if delivered is None:
+        # Observation, not acknowledgement: without the exact payload (or its
+        # host-staged source envelope) no attempt has proved transcript delivery.
+        return False
+    try:
+        payload = json.loads(delivered) if isinstance(delivered, str) else delivered
+    except (TypeError, ValueError):
+        return False
+    payload = payload if isinstance(payload, dict) else {}
+    if expected and expected not in _wake_ids(payload):
+        return False
     from ouroboros.owner_mailbox import acknowledge_task_messages
 
     mailbox_ids = [str(item) for item in (pending.get("mailbox_ids") or []) if str(item)]
@@ -221,6 +673,11 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
         "mailbox_ids": mailbox_ids,
         "attempt_key": attempt,
         "interaction_ids": list(pending.get("interaction_ids") or []),
+        "coordination": any(
+            isinstance(item, dict)
+            and str(item.get("type") or "").startswith("child_")
+            for item in wake_events
+        ),
     }):
         return False
     interaction_ids = frozenset(
@@ -247,6 +704,9 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
         *(str(item) for item in (state.get("interaction_acknowledged_ids") or []) if str(item)),
         *interaction_ids,
     })
+    coordination_cursor = pending.get("coordination_cursor")
+    if isinstance(coordination_cursor, dict):
+        state["coordination_cursor"] = coordination_cursor
     pending["acknowledged_at"] = utc_now_iso()
     state["last_acknowledged_wake"] = pending
     state["pending_wake"] = {}
@@ -305,7 +765,7 @@ def supervised_wait(
             "run_id": str(run_id),
             "wake_id": str(replay.get("supervision_wake_id") or ""),
         })
-        return json.dumps(replay, ensure_ascii=False, indent=2)
+        return _render_wake_payload(ctx, replay)
     snapshot = getattr(ctx, "task_metadata", {})
     snapshot = snapshot.get("configured_subagent") if isinstance(snapshot, dict) else {}
     snapshot = snapshot if isinstance(snapshot, dict) else {}
@@ -325,6 +785,10 @@ def supervised_wait(
             "run_id": str(run_id), "due_at_unix": state["checkpoint"]["due_at_unix"],
             "reason": state["checkpoint"]["reason"],
         })
+    # Do not baseline already-terminal children before the first poll.  The model
+    # has not observed them yet; treating them as prior state loses a fast child
+    # forever when the physical leaf stays quiet.  The ordinary pending-wake
+    # cursor/ack path below publishes each existing terminal/attention fact once.
     _save_state(ctx, state)
     _emit(ctx, "delegate_supervision_wait_entered", {
         "run_id": str(run_id), "journal_cursor": int(state.get("journal_cursor") or 0),
@@ -342,7 +806,10 @@ def supervised_wait(
         cursor = payload.get("last_seq")
         if isinstance(cursor, int):
             state["journal_cursor"] = max(int(state.get("journal_cursor") or 0), cursor)
-        wakes = _addressed_wakes(ctx, state) + _control_wakes(ctx)
+        addressed_wakes = _addressed_wakes(ctx, state)
+        control_wakes = _control_wakes(ctx)
+        coordination_events, next_coordination_cursor = _coordination_wakes(ctx, state)
+        wakes = addressed_wakes + control_wakes + coordination_events
         checkpoint = state.get("checkpoint") if isinstance(state.get("checkpoint"), dict) else {}
         due = bool(
             checkpoint
@@ -371,6 +838,7 @@ def supervised_wait(
                 }
             if wakes:
                 payload["wake_events"] = wakes
+            payload["coordination_context"] = coordination_live_context(ctx)
             wake_id = uuid.uuid4().hex
             payload["supervision_wake_id"] = wake_id
             state["status"] = "wake_pending"
@@ -389,6 +857,7 @@ def supervised_wait(
                     if str(item.get("msg_id") or "")
                 ],
                 "interaction_ids": sorted(_interaction_ids(payload)),
+                "coordination_cursor": next_coordination_cursor,
                 "created_at": utc_now_iso(),
             }
             _save_state(ctx, state)
@@ -398,7 +867,8 @@ def supervised_wait(
                 "mailbox_ids": list(state["pending_wake"]["mailbox_ids"]),
                 "interaction_ids": list(state["pending_wake"]["interaction_ids"]),
             })
-            return json.dumps(payload, ensure_ascii=False, indent=2)
+            return _render_wake_payload(ctx, payload)
+        state["coordination_cursor"] = next_coordination_cursor
         state["quiet_renewals"] = int(state.get("quiet_renewals") or 0) + 1
         renewals = int(state["quiet_renewals"])
         if renewals == 1 or renewals & (renewals - 1) == 0:
@@ -430,7 +900,6 @@ def delegate_wait_entry(
 ) -> str:
     """Event-only wait; hidden ``wait_sec`` is accepted only for old transcripts."""
 
-    acknowledge_pending_wake(ctx)
     if wait_sec is not None:
         _emit(ctx, "delegate_supervision_legacy_wait_ignored", {
             "run_id": str(run_id), "wait_sec": int(wait_sec),
@@ -446,5 +915,5 @@ def delegate_wait_entry(
 
 __all__ = [
     "acknowledge_pending_wake", "delegate_wait_entry", "supervised_wait",
-    "supervision_checkpoint",
+    "supervision_checkpoint", "coordination_live_context",
 ]

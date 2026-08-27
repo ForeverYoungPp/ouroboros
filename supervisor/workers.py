@@ -455,7 +455,9 @@ def _promote_duplicate_reason(task_id: str, ctx: Any) -> str:
         from ouroboros.task_results import load_task_result
 
         stored_duplicate = bool(
-            load_task_result(getattr(ctx, "DRIVE_ROOT", DRIVE_ROOT), task_id)
+            load_task_result(
+                getattr(ctx, "DRIVE_ROOT", DRIVE_ROOT), task_id, strict=True,
+            )
         )
     except Exception:
         log.warning("promote: duplicate-id lookup failed for %s", task_id, exc_info=True)
@@ -644,6 +646,22 @@ def _relocate_promoted_attachments(task: dict, tid: str, manifest: list[dict]) -
     except Exception:
         log.warning("promote: attachment relocation failed for %s", tid, exc_info=True)
         return False
+
+
+def _promoted_scheduled_outcome(task: dict, admitted: Any, tid: str) -> dict:
+    """Carry the exact admitted contract to the canonical result writer."""
+
+    admitted_contract = (
+        admitted.get("task_contract")
+        if isinstance(admitted, dict)
+        and isinstance(admitted.get("task_contract"), dict)
+        else task.get("task_contract")
+    )
+    return {
+        "status": "scheduled",
+        "task_id": tid,
+        "_admitted_task_contract": dict(admitted_contract or {}),
+    }
 
 
 def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
@@ -935,7 +953,9 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     # message seam (tests/test_heartbeat_presentation.py). While it is still
     # PENDING the Dashboard Activity row cancels it; the card action appears once
     # it starts.
-    outcome = {"status": "scheduled", "task_id": tid}
+    # A project root may execute from a forked child drive.  Its budget-root
+    # result therefore receives this admitted contract before worker startup.
+    outcome = _promoted_scheduled_outcome(task, admitted, tid)
     if attachment_manifest:
         outcome["attachment_manifest"] = [dict(row) for row in attachment_manifest]
     if effective_pid:
@@ -2885,6 +2905,14 @@ def assign_tasks() -> None:
                 if str(task.get("delegation_role") or "") == "subagent" and str(task.get("drive_root") or ""):
                     try:
                         from ouroboros.task_results import STATUS_RUNNING, write_task_result
+                        from ouroboros.tools.control_delegation import stamp_task_assignment_depth
+                        from ouroboros.config import get_max_subagent_depth
+
+                        # Assignment is the first host-visible execution fact. Stamp
+                        # the worker payload and canonical result from one projection.
+                        _depth_fields = stamp_task_assignment_depth(
+                            task, max_depth=get_max_subagent_depth(),
+                        )
                         write_task_result(
                             DRIVE_ROOT,
                             str(task.get("id") or ""),
@@ -2906,6 +2934,7 @@ def assign_tasks() -> None:
                             child_drive_root=task.get("child_drive_root") or task.get("drive_root"),
                             budget_drive_root=task.get("budget_drive_root"),
                             task_constraint=task.get("task_constraint"),
+                            **_depth_fields,
                             # INTENT ONLY. This mirror is written at ASSIGNMENT, one
                             # step before the worker dispatches and resolves the
                             # child; naming `effective_model_lane`/`model` here wrote

@@ -211,6 +211,21 @@ def test_the_baseline_advances_on_delegate_verbs_only():
     assert _nanny_metered_since_delegate_activity(ctx) == (0, 0.0)
 
 
+def test_host_coordination_is_activity_without_fabricating_physical_custody():
+    from ouroboros.loop import (
+        _nanny_metered_since_delegate_activity,
+        _note_nanny_delegate_activity,
+    )
+
+    ctx = _nanny_ctx()
+    _note_nanny_delegate_activity(ctx, 3, {"cost": 0.4}, [
+        _delegate_call("schedule_subagent"),
+    ])
+    assert ctx._nanny_coordination_activity is True
+    assert ctx._nanny_coordination_tools == ("schedule_subagent",)
+    assert _nanny_metered_since_delegate_activity(ctx) == (0, 0.0)
+
+
 def test_a_non_nanny_task_is_never_tracked_or_reminded():
     from ouroboros.loop import (
         _maybe_inject_nanny_economics_reminder,

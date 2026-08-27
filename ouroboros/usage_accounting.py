@@ -942,10 +942,10 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
 
 
 def mark_dispatched(
-    reservation: AttemptReservation,
-    *,
+    reservation: AttemptReservation, *,
     candidate_manifest_ref: Optional[Dict[str, Any]] = None,
 ) -> None:
+    invoke_bound_api_review_paid_stamp(fail_closed=True)
     try:
         _claim_physical_dispatch()
     except PhysicalAttemptLimitExceeded:
@@ -957,7 +957,7 @@ def mark_dispatched(
         raise
     fields = {"candidate_manifest_ref": candidate_manifest_ref} if candidate_manifest_ref else {}
     _transition(reservation, "dispatched", **fields)
-    invoke_bound_api_review_paid_stamp()
+    invoke_bound_api_review_paid_stamp(fail_closed=False)
 
 
 def release_attempt(

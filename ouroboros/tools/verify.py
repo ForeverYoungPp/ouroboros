@@ -25,7 +25,9 @@ from ouroboros.platform_layer import bootstrap_process_path
 from ouroboros.shell_parse import normalize_check_argv
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
+    active_tool_profile,
     build_resolved_resource_binding,
+    canonical_data_root,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
 from ouroboros.utils import utc_now_iso
@@ -46,14 +48,26 @@ def _bounded(text: Any, cap: int) -> str:
         return t
     return t[:cap] + f"\n…[truncated {len(t) - cap} of {len(t)} chars]"
 
+
+def _receipt_custody_failure(kind: str, detail: str = "") -> str:
+    suffix = f" Observed result: {detail}" if detail else ""
+    return (
+        f"⚠️ TOOL_ERROR (verify_and_record): receipt_custody_failed for {kind}; "
+        "the check/observation may have run, but no durable receipt was recorded. "
+        "Do not treat this verification as attested; retry after receipt custody "
+        f"recovers.{suffix}"
+    )
+
 _CONTRACT_KINDS = (
     "visible_verifier",
     "explicit_command",
     "explicit_metric",
     "artifact_observation",
     "no_visible_machine_contract",
+    "delegation_zero_run",
 )
 _RUN_KINDS = frozenset({"visible_verifier", "explicit_command", "explicit_metric"})
+_ZERO_RUN_DECISIONS = ("complete", "incomplete", "unknown")
 # How `expected` is matched against the check output. `substring` is the DEFAULT
 # and keeps the historical behavior byte-identical when the param is omitted.
 # `bytes_equal` (v6.60.0) compares TWO FILES byte-for-byte (artifact_paths[0] vs
@@ -398,6 +412,125 @@ def _probe_artifact_lifecycle(
     return lifecycle, missing_after
 
 
+def _record_delegation_zero_run(
+    ctx: ToolContext,
+    *,
+    bootstrap: dict[str, Any],
+    task_id: str,
+    criterion_id: str,
+    criterion_basis: Any,
+    check: Any,
+    kwargs: dict[str, Any],
+) -> str:
+    """Record one actor-first no-physical-run decision after custody is clear."""
+
+    if bool(bootstrap.get("physical_started")):
+        return (
+            "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run is no longer "
+            "available after the selected physical leaf has started."
+        )
+    if bool(bootstrap.get("zero_run_receipt_recorded")):
+        return (
+            "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run already "
+            "has a durable terminal decision for this actor."
+        )
+    decision = str(
+        kwargs.get("zero_run_decision") or kwargs.get("decision") or ""
+    ).strip().lower()
+    if decision not in _ZERO_RUN_DECISIONS:
+        return (
+            "⚠️ TOOL_ARG_ERROR (verify_and_record): zero_run_decision must be one of "
+            f"{', '.join(_ZERO_RUN_DECISIONS)}."
+        )
+    basis = " ".join(str(
+        kwargs.get("zero_run_basis")
+        or kwargs.get("reason")
+        or criterion_basis
+        or check
+        or ""
+    ).split()).strip()
+    if not basis:
+        return (
+            "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run requires a "
+            "non-empty zero_run_basis explaining the host-visible evidence or blocker."
+        )
+    receipt: dict[str, Any] = {
+        "tool": "verify_and_record",
+        "contract_kind": "delegation_zero_run",
+        "status": "declared",
+        "zero_run": True,
+        "zero_run_decision": decision,
+        "zero_run_basis": _bounded(basis, _RECEIPT_DECLARED_SUMMARY_CAP),
+        "physical_run_started": False,
+        "route": str(bootstrap.get("route_id") or ""),
+        "work_order_fingerprint": str(bootstrap.get("work_order_fingerprint") or ""),
+        "ts": utc_now_iso(),
+    }
+    if crit := str(criterion_id or "").strip():
+        receipt["criterion_id"] = crit[:120]
+    try:
+        from ouroboros import delegate_custody as custody
+        from ouroboros.delegate_recovery import unsettled_start_ids
+        from ouroboros.subagent_bootstrap import _durable_zero_run_receipt
+
+        drive_root = custody.custody_root(ctx)
+        with custody.actor_decision_lock(drive_root, task_id):
+            if custody.custody_log_unreadable(drive_root):
+                return (
+                    "⚠️ TOOL_ERROR (verify_and_record): zero_run_custody_unknown: "
+                    "the custody event log exists but cannot be read, so the host "
+                    "cannot prove that no physical start/run remains; no zero-run "
+                    "receipt was written (custody_log_unreadable)."
+                )
+            gaps: set[str] = set()
+            prior = _durable_zero_run_receipt(ctx, gap_reasons=gaps)
+            if prior:
+                return (
+                    "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run already "
+                    "has a durable terminal decision for this actor."
+                )
+            blockers = unsettled_start_ids(drive_root, task_id)
+            if any(blockers.values()):
+                return (
+                    "⚠️ TOOL_ERROR (verify_and_record): zero_run_requires_settlement: "
+                    "this task has an open run, ambiguous start invocation, or "
+                    "undisposed physical result. blockers="
+                    + json.dumps(blockers, ensure_ascii=False, sort_keys=True)
+                )
+            if gaps:
+                # Empty physical custody is the authority needed to re-ground a
+                # damaged zero-run stream.  Preserve the evidence gap on the new
+                # typed receipt instead of turning recovery into a self-deadlock.
+                receipt["regrounds_zero_run_authority"] = True
+                receipt["prior_zero_run_evidence_gaps"] = sorted(gaps)
+            # A zero-run is lifecycle authority for the actor, so keep it on the
+            # canonical budget root rather than an ephemeral child drive.
+            written = append_verification_receipt(
+                canonical_data_root(ctx), task_id, receipt,
+            )
+    except Exception as exc:
+        return (
+            "⚠️ TOOL_ERROR (verify_and_record): zero_run_custody_unknown: "
+            "the host could not atomically prove empty custody and claim the "
+            f"zero-run decision; no receipt was written ({type(exc).__name__})."
+        )
+    if not written:
+        return (
+            "⚠️ TOOL_ERROR (verify_and_record): the delegation_zero_run receipt "
+            "could not be durably written; no zero-run decision was recorded."
+        )
+    bootstrap["zero_run_decision"] = decision
+    bootstrap["zero_run_basis"] = receipt["zero_run_basis"]
+    bootstrap["zero_run_receipt_recorded"] = True
+    bootstrap["exact_start_pending"] = False
+    bootstrap.pop("zero_run_evidence_status", None)
+    bootstrap.pop("zero_run_evidence_gaps", None)
+    return (
+        "verify_and_record [delegation_zero_run] "
+        f"{decision.upper()}: no physical leaf was started; typed host receipt recorded."
+    )
+
+
 def _verify_and_record(
     ctx: ToolContext,
     contract_kind: str = "",
@@ -418,6 +551,21 @@ def _verify_and_record(
     kind = str(contract_kind or "").strip()
     if kind not in _CONTRACT_KINDS:
         return f"⚠️ TOOL_ARG_ERROR (verify_and_record): contract_kind must be one of {', '.join(_CONTRACT_KINDS)}."
+    if active_tool_profile(ctx) == "local_readonly_subagent":
+        # Read-only actor-first sessions need a host-owned zero-run disclosure,
+        # not the general command/artifact verification surface.  Keep the
+        # profile and lifecycle checks here as defense in depth for stale schemas
+        # or forced dispatches after the physical leaf has started.
+        bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+        if (
+            kind != "delegation_zero_run"
+            or not isinstance(bootstrap, dict)
+            or bool(bootstrap.get("physical_started"))
+        ):
+            return (
+                "⚠️ LOCAL_READONLY_SUBAGENT_BLOCKED: this profile may record only a "
+                "delegation_zero_run receipt before its selected physical leaf starts."
+            )
     match_mode = str(expected_match or "substring").strip().lower() or "substring"
     if match_mode not in _EXPECTED_MATCH_KINDS:
         return f"⚠️ TOOL_ARG_ERROR (verify_and_record): expected_match must be one of {', '.join(_EXPECTED_MATCH_KINDS)}."
@@ -440,6 +588,26 @@ def _verify_and_record(
     task_id = str(getattr(ctx, "task_id", "") or "")
     drive_root = getattr(ctx, "drive_root", None)
     expected_s = str(expected or "").strip()
+    if kind == "delegation_zero_run":
+        # This is a typed actor-first disclosure, not a general-purpose way to
+        # relabel an ordinary task.  The private bootstrap marker is created by
+        # the host before the first model episode and is intentionally the only
+        # authority that can mint this receipt.
+        bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+        if not isinstance(bootstrap, dict):
+            return (
+                "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run is only "
+                "available to a configured actor-first session."
+            )
+        return _record_delegation_zero_run(
+            ctx,
+            bootstrap=bootstrap,
+            task_id=task_id,
+            criterion_id=criterion_id,
+            criterion_basis=criterion_basis,
+            check=check,
+            kwargs=kwargs,
+        )
     receipt: dict[str, Any] = {"tool": "verify_and_record", "contract_kind": kind, "expected": expected_s, "expected_match": match_mode, "ts": utc_now_iso()}
     crit = str(criterion_id or "").strip()
     if crit:
@@ -516,7 +684,10 @@ def _verify_and_record(
             # Same renderer as the completed-run receipt below, so it carries the same
             # stamp: a timeout red must be reconcilable by the later green of that argv.
             receipt.update({"status": "fail", "returncode": None, "matched": False, "check": shlex.join(argv), "check_rendering": CHECK_RENDERING_SHLEX_JOIN, "summary": f"check timed out after {timeout}s"})
-            append_verification_receipt(drive_root, task_id, receipt)
+            if not append_verification_receipt(drive_root, task_id, receipt):
+                return _receipt_custody_failure(
+                    kind, f"check timed out after {timeout}s",
+                )
             return (
                 f"verify_and_record [{kind}] FAIL: check timed out after {timeout}s. "
                 f"root={binding.root}, cwd={binding.target_path}. Receipt recorded."
@@ -563,7 +734,10 @@ def _verify_and_record(
         if _masked:
             receipt["check_exit_masking"] = True
             receipt["check_exit_masking_reasons"] = _mask_reasons
-        append_verification_receipt(drive_root, task_id, receipt)
+        if not append_verification_receipt(drive_root, task_id, receipt):
+            return _receipt_custody_failure(
+                kind, f"verdict={'PASS' if passed else 'FAIL'}, exit={rc}",
+            ) + f"\n\n{_bounded(out, _TOOL_OUTPUT_CAP)}"
         verdict = "PASS" if passed else "FAIL"
         exp_note = f" expected={expected_s!r}" if expected_s else ""
         return (
@@ -576,7 +750,8 @@ def _verify_and_record(
         paths = [str(p) for p in (artifact_paths or []) if str(p or "").strip()]
         obs_status, detail = _observe_artifacts(ctx, paths)
         receipt.update({"status": obs_status, "paths": paths[:20], "summary": detail})
-        append_verification_receipt(drive_root, task_id, receipt)
+        if not append_verification_receipt(drive_root, task_id, receipt):
+            return _receipt_custody_failure(kind, f"{obs_status}: {detail}")
         # refused_out_of_scope is a POLICY block, not a verification failure — surface it
         # honestly (not a red FAIL) so a deliverable outside the observable roots doesn't
         # force the agent to declare no_visible_machine_contract (v6.57.0).
@@ -595,7 +770,8 @@ def _verify_and_record(
     # best proxy + residual risk is recorded as a receipt and judged by a reviewer.
     # The agent's own text, not a render of an argv that ran — its own rendering stamp.
     receipt.update({"status": "declared", "check": str(check or ""), "check_rendering": CHECK_RENDERING_DECLARED_TEXT, "summary": _bounded(expected_s or str(check or ""), _RECEIPT_DECLARED_SUMMARY_CAP)})
-    append_verification_receipt(drive_root, task_id, receipt)
+    if not append_verification_receipt(drive_root, task_id, receipt):
+        return _receipt_custody_failure(kind, receipt["summary"])
     return (
         "verify_and_record [no_visible_machine_contract] DECLARED: no host-checkable contract; "
         "your stated proxy + residual risk recorded as a receipt for review."
@@ -613,7 +789,9 @@ def get_tools() -> List[ToolEntry]:
                 "(run `check`, pass on exit 0 and, if given, `expected` substring present) · explicit_metric "
                 "(run `check`, pass when the `expected` metric string appears) · artifact_observation (the host "
                 "confirms the declared artifact_paths exist) · no_visible_machine_contract (honest escape hatch: "
-                "no machine check exists; your best proxy + risk is recorded for review). Recording a receipt "
+                "no machine check exists; your best proxy + risk is recorded for review) · delegation_zero_run "
+                "(configured actor-first only: record a typed complete/incomplete/unknown decision when no "
+                "physical leaf was started, with zero_run_decision and zero_run_basis). Recording a receipt "
                 "suppresses the receipt_absent transparency flag on a clean turn. ANTI-CHEAT: verify ONLY against "
                 "PUBLIC task info — the instruction text, examples embedded in it, installed oracles, and your own "
                 "independent checks. NEVER read a hidden /tests/ dir, solution.sh, copied verifier code, or look up "
@@ -624,6 +802,8 @@ def get_tools() -> List[ToolEntry]:
                 "criterion_id": {"type": "string", "default": "", "description": "Optional id of the task_contract acceptance claim this receipt supports. Use ids from task_contract.acceptance_claims when present."},
                 "criterion_source": {"type": "string", "enum": ["task_stated", "agent_defined"], "default": "agent_defined", "description": "Where this success criterion came from: task_stated (the task/instructions state it) or agent_defined (you synthesized it). Flag-only honesty — an agent_defined criterion asks you to double-check it is equivalent to what the task actually requires."},
                 "criterion_basis": {"type": "string", "default": "", "description": "Optional one-line basis for an agent_defined criterion: why this check is sufficient evidence for the task's real requirement."},
+                "zero_run_decision": {"type": "string", "enum": list(_ZERO_RUN_DECISIONS), "description": "For delegation_zero_run only: the actor's typed decision when no selected physical leaf was started."},
+                "zero_run_basis": {"type": "string", "description": "For delegation_zero_run only: concise host-visible evidence or blocker; required and never inferred from final prose."},
                 "check": {"description": "The verification command: an argv list (['pytest','-q']) or a shell one-liner string. Required for visible_verifier/explicit_command/explicit_metric.", "type": ["array", "string"], "items": {"type": "string"}},
                 "expected": {"type": "string", "default": "", "description": "Optional expected substring/metric in the check output (explicit_command/explicit_metric)."},
                 "expected_match": {"type": "string", "enum": list(_EXPECTED_MATCH_KINDS), "default": "substring", "description": "How `expected` is matched: substring (default) · exact (whole stripped output equals expected) · exact_line (expected equals one stripped output line) · json_equals (output and expected parse to equal JSON, key-order tolerant) · bytes_equal (after the check runs, artifact_paths=[a, b] are compared BYTE-FOR-BYTE — golden files, migration parity; the receipt records a bounded hexdump of the first divergence). Use a stricter mode when the task gives a worked example / exact output."},

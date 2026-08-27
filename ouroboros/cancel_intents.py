@@ -30,8 +30,9 @@ import logging
 import os
 import pathlib
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from ouroboros.utils import append_jsonl, update_json_locked, utc_now_iso
 
@@ -88,6 +89,30 @@ def _intents_path(drive_root: Any) -> pathlib.Path:
     root = pathlib.Path(drive_root) / "state"
     root.mkdir(parents=True, exist_ok=True)
     return root / "cancel_intents.json"
+
+
+@contextmanager
+def cancellation_projection_lock(drive_root: Any) -> Iterator[None]:
+    """Hold the same short lock used by cancel-intent mutators.
+
+    Cross-store decisions such as a paid acceptance claim use this only while
+    committing their own atomic row.  If cancellation linearizes first they see
+    it; if this lock wins first, the claim linearizes before cancellation.
+    """
+    from ouroboros.platform_layer import (
+        acquire_exclusive_file_lock,
+        release_exclusive_file_lock,
+    )
+
+    path = _intents_path(drive_root)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_fd = acquire_exclusive_file_lock(lock_path)
+    if lock_fd is None:
+        raise TimeoutError("cancel-intent projection lock unavailable")
+    try:
+        yield
+    finally:
+        release_exclusive_file_lock(lock_path, lock_fd)
 
 
 def _forensic(drive_root: Any, row: Dict[str, Any]) -> None:
@@ -400,7 +425,7 @@ def mark_intent_scope(drive_root: Any, task_id: str, scope: str) -> bool:
 
 
 def active_intents(
-    drive_root: Any, *, disclose_corruption: bool = False,
+    drive_root: Any, *, disclose_corruption: bool = False, strict: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """All active intents keyed by task id (a private copy; read-only callers).
 
@@ -433,6 +458,8 @@ def active_intents(
                 "event": "projection_corrupt_refused",
                 "op": "active_intents", "error": str(exc)[:200],
             })
+        if strict:
+            raise CancelIntentProjectionCorrupt(str(exc)) from exc
         return {}
     malformed = [str(tid) for tid, row in intents.items() if not isinstance(row, dict)]
     if malformed:
@@ -467,6 +494,10 @@ def active_intents(
                 "op": "active_intents_row",
                 "error": f"malformed intent row(s): {', '.join(fresh[:5])}"[:200],
             })
+        if strict:
+            raise CancelIntentProjectionCorrupt(
+                f"malformed intent row(s): {', '.join(malformed[:5])}"
+            )
     return {
         str(tid): dict(row)
         for tid, row in intents.items()
@@ -495,17 +526,21 @@ def _malformed_row_memo_key(drive_root: Any, task_id: str, row: Any) -> str:
     ).hexdigest()[:16]
 
 
-def active_intent(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
+def active_intent(
+    drive_root: Any, task_id: str, *, strict: bool = False,
+) -> Optional[Dict[str, Any]]:
     try:
         tid = _valid_task_id(task_id)
     except ValueError:
+        if strict:
+            raise
         return None
-    row = active_intents(drive_root).get(tid)
+    row = active_intents(drive_root, strict=strict).get(tid)
     return dict(row) if isinstance(row, dict) else None
 
 
-def has_active_intent(drive_root: Any, task_id: str) -> bool:
-    return active_intent(drive_root, task_id) is not None
+def has_active_intent(drive_root: Any, task_id: str, *, strict: bool = False) -> bool:
+    return active_intent(drive_root, task_id, strict=strict) is not None
 
 
 def claim_intent(drive_root: Any, task_id: str, *, owner: str) -> Optional[Dict[str, Any]]:
@@ -864,7 +899,7 @@ def cancel_state_fields(drive_root: Any, task_id: str) -> Dict[str, Any]:
     return fields
 
 
-def cancel_pending(drive_root: Any, task_id: str) -> bool:
+def cancel_pending(drive_root: Any, task_id: str, *, strict: bool = False) -> bool:
     """Both cancel-pending carriers in ONE predicate — fail-soft.
 
     The durable intent projection is the live authority; the legacy
@@ -874,15 +909,21 @@ def cancel_pending(drive_root: Any, task_id: str) -> bool:
     while the supervisor is tearing it down.
     """
     try:
-        if has_active_intent(drive_root, task_id):
+        if has_active_intent(drive_root, task_id, strict=strict):
             return True
     except Exception:
+        if strict:
+            raise
         log.debug("cancel-pending intent read failed for %s", task_id, exc_info=True)
     try:
         from ouroboros.task_results import STATUS_CANCEL_REQUESTED, load_task_result
 
-        status = str((load_task_result(drive_root, task_id) or {}).get("status") or "")
+        status = str(
+            (load_task_result(drive_root, task_id, strict=strict) or {}).get("status") or ""
+        )
         return status == STATUS_CANCEL_REQUESTED
     except Exception:
+        if strict:
+            raise
         log.debug("cancel-pending legacy latch read failed for %s", task_id, exc_info=True)
         return False

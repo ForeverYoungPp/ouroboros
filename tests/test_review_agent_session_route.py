@@ -1833,6 +1833,25 @@ def test_session_stamp_precedes_durable_start_request(
     assert stamped.is_set()
 
 
+def test_session_strict_wallet_refusal_blocks_start_request(tmp_path, fake_route):
+    from ouroboros.review_dispatch import ReviewPaidStamp
+
+    def refuse():
+        raise RuntimeError("acceptance wallet unavailable")
+
+    ctx = SimpleNamespace(
+        _review_paid_stamp=ReviewPaidStamp(refuse, fail_closed=True),
+    )
+    result = run_review_request(
+        _agent_request(), slots=[_agent_slot()], drive_root=tmp_path,
+        llm=FakeLLM(), usage_ctx=ctx,
+    )
+
+    assert result.actors[0]["status"] == "error"
+    assert "acceptance wallet unavailable" in result.actors[0]["error"]
+    assert fake_route.instances[0].start_requests == []
+
+
 def test_late_worker_uses_its_captured_stamp_after_caller_restores_context(
     tmp_path, fake_route, monkeypatch,
 ):

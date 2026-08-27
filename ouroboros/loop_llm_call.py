@@ -38,6 +38,7 @@ from ouroboros.usage_accounting import (
 from ouroboros.utils import (
     append_jsonl,
     emit_cognitive_operation_event,
+    emit_main_llm_call_state_event,
     emit_log_event,
     sanitize_tool_result_for_log,
     truncate_review_artifact,
@@ -1116,6 +1117,60 @@ def _clear_custom_receipts(accumulated_usage: Dict[str, Any]) -> None:
     accumulated_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, None)
 
 
+def _emit_main_llm_call_state(
+    event_queue: Optional[queue.Queue],
+    identity: Tuple[Any, ...],
+    phase: str,
+) -> None:
+    task_id, task_attempt, llm_call_id, execution_id, round_id, call_attempt = identity
+    emit_main_llm_call_state_event(
+        event_queue,
+        task_id=task_id,
+        task_attempt=task_attempt,
+        llm_call_id=llm_call_id,
+        execution_id=execution_id,
+        round_id=round_id,
+        call_attempt=call_attempt,
+        phase=phase,
+    )
+
+
+def _handle_main_llm_call_exception(
+    error: Exception,
+    ctx: _LlmErrorContext,
+    call_identity: Tuple[Any, ...],
+    *,
+    max_retries: int,
+    transient_budget: int,
+    deadline_ts: Optional[float],
+) -> bool:
+    """Close the exact call and decide whether the attempt loop must stop."""
+    _emit_main_llm_call_state(ctx.event_queue, call_identity, "failed")
+    _emit_llm_operation(
+        ctx.event_queue, ctx.task_id, ctx.llm_call_id, "failed", ctx.task_attempt,
+        ctx.execution_id, ctx.round_id,
+    )
+    _clear_custom_receipts(ctx.accumulated_usage)
+    if _record_llm_call_error(error, ctx):
+        return True
+    error_kind = str(ctx.accumulated_usage.get("_last_llm_error_kind") or "")
+    is_transient = error_kind in _TRANSIENT_RETRY_KINDS
+    attempt_budget = transient_budget if is_transient else min(max_retries, transient_budget)
+    if ctx.attempt >= attempt_budget - 1:
+        return True
+    backoff = _retry_backoff_sec(
+        ctx.accumulated_usage, error_kind, ctx.attempt, is_transient,
+    )
+    if _sleep_within_deadline(backoff, deadline_ts):
+        return False
+    _emit_retry_deadline_exhausted(
+        ctx.drive_logs, task_id=ctx.task_id, execution_id=ctx.execution_id,
+        round_id=ctx.round_id, round_idx=ctx.round_idx, attempt=ctx.attempt,
+        model=ctx.model, error_kind=error_kind,
+    )
+    return True
+
+
 def _replace_response_meta(
     target: Optional[Dict[str, Any]],
     usage: Optional[Dict[str, Any]] = None,
@@ -1209,21 +1264,17 @@ def call_llm_with_retry(
     allow_server_web_search: bool = False,
     physical_context: Optional[PhysicalAttemptContext] = None,
     candidate_predicate: Optional[Callable[[Any], Any]] = None,
-    response_meta_out: Optional[Dict[str, Any]] = None,
     task_attempt: Any = None,
+    response_meta_out: Optional[Dict[str, Any]] = None,
     transport_reserve_sec: Optional[float] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
-    """Call one model with bounded retries, typed operation events, and deadline-aware transport."""
+    """Call one model with bounded retries and deadline-aware transport."""
     msg = None
     _replace_response_meta(response_meta_out)
     drive_root = pathlib.Path(drive_logs).parent
     execution_id = str(accumulated_usage.setdefault("execution_id", new_execution_id()))
     round_id = f"{execution_id}:round:{round_idx}"
-    context_fit_event_fields = (
-        _context_fit_event_fields(accumulated_usage)
-        if physical_context is not None
-        else {}
-    )
+    context_fit_event_fields = _context_fit_event_fields(accumulated_usage) if physical_context is not None else {}
     transient_budget = _attempt_loop_budget(max_retries, attempt_cap)
     if task_attempt is None:
         task_attempt = accumulated_usage.get("_task_attempt")
@@ -1238,6 +1289,7 @@ def call_llm_with_retry(
             return None, None
         accumulated_usage["_llm_attempts_used"] = attempt + 1
         llm_call_id = new_call_id("llm")
+        call_identity = (task_id, task_attempt, llm_call_id, execution_id, round_id, attempt + 1)
         request_ref: Dict[str, Any] = {}
         try:
             _emit_llm_operation(event_queue, task_id, llm_call_id, "started", task_attempt, execution_id, round_id)
@@ -1313,6 +1365,7 @@ def call_llm_with_retry(
                 round_id=round_id, reserve_sec=transport_reserve_sec,
             ):
                 return None, None
+            _emit_main_llm_call_state(event_queue, call_identity, "started")
             resp_msg, usage = _send_main_candidate(
                 llm, kwargs, model=model, use_local=use_local, deadline_ts=deadline_ts,
                 physical_context=physical_context, candidate_predicate=candidate_predicate,
@@ -1385,18 +1438,17 @@ def call_llm_with_retry(
             _replace_response_meta(response_meta_out, usage, msg)
             if not tool_calls and (not content or not content.strip()):
                 event_type, is_provider_glitch, permanent_body_error = _record_and_emit_empty_response(
-                    usage=usage, msg=msg, accumulated_usage=accumulated_usage, event_queue=event_queue,
-                    drive_logs=drive_logs, task_id=task_id, execution_id=execution_id, round_id=round_id,
-                    llm_call_id=llm_call_id, round_idx=round_idx, attempt=attempt, model=model,
-                    task_type=task_type, content=content, tool_calls=tool_calls,
-                    request_ref=request_ref, response_ref=response_ref, transient_budget=transient_budget,
-                    context_fit_event_fields=context_fit_event_fields,
-                    task_attempt=task_attempt,
-                )
+                    usage=usage, msg=msg, accumulated_usage=accumulated_usage,
+                    event_queue=event_queue, drive_logs=drive_logs, task_id=task_id,
+                    execution_id=execution_id, round_id=round_id, llm_call_id=llm_call_id,
+                    round_idx=round_idx, attempt=attempt, model=model, task_type=task_type,
+                    content=content, tool_calls=tool_calls, request_ref=request_ref,
+                    response_ref=response_ref, transient_budget=transient_budget,
+                    context_fit_event_fields=context_fit_event_fields, task_attempt=task_attempt)
                 _emit_llm_operation(event_queue, task_id, llm_call_id, "failed", task_attempt, execution_id, round_id)
+                _emit_main_llm_call_state(event_queue, call_identity, "failed")
                 if event_type == "provider_incomplete_response" and not usage.get("provider_error"):
                     response_cache_bypass_requested = True
-                # Transient response glitches retry the same model; permanent body errors fail fast.
                 if not permanent_body_error and attempt < transient_budget - 1:
                     if _sleep_within_deadline(
                         min(2.0 ** attempt, _TRANSIENT_BACKOFF_CAP_SEC), deadline_ts
@@ -1408,12 +1460,10 @@ def call_llm_with_retry(
                         model=model, error_kind=event_type,
                     )
                 return None, cost
-
             accumulated_usage.pop("execution_status", None)
             accumulated_usage.pop("result_status", None)
             accumulated_usage.pop("reason_code", None)
             accumulated_usage["rounds"] = accumulated_usage.get("rounds", 0) + 1
-
             prompt_tokens = int(usage.get("prompt_tokens") or 0)
             completion_tokens = int(usage.get("completion_tokens") or 0)
             cached_tokens = int(usage.get("cached_tokens") or 0)
@@ -1469,12 +1519,12 @@ def call_llm_with_retry(
             append_jsonl(drive_logs / "events.jsonl", _round_event)
             _emit_llm_operation(event_queue, task_id, llm_call_id, "finished", task_attempt, execution_id, round_id)
             return msg, cost
-
         except UsageAccountingError:
             _emit_llm_operation(event_queue, task_id, llm_call_id, "failed", task_attempt, execution_id, round_id)
+            _emit_main_llm_call_state(event_queue, call_identity, "failed")
             raise  # Monetary/ledger rails are not provider failures.
         except Exception as e:
-            if _handle_llm_call_exception(
+            if _handle_main_llm_call_exception(
                 e,
                 _LlmErrorContext(
                     task_id=task_id, task_type=task_type, execution_id=execution_id,
@@ -1486,7 +1536,10 @@ def call_llm_with_retry(
                     task_attempt=task_attempt, deadline_ts=deadline_ts,
                     max_retries=max_retries, transient_budget=transient_budget,
                 ),
+                call_identity,
+                max_retries=max_retries,
+                transient_budget=transient_budget,
+                deadline_ts=deadline_ts,
             ):
                 break
-
     return None, 0.0

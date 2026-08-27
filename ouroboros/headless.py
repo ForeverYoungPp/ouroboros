@@ -23,7 +23,7 @@ from ouroboros.post_task_checkpoint import project_replica_task_result_fields
 from ouroboros.task_results import (
     cancellation_blocks_child_result, load_task_result, validate_task_id, write_task_result,
 )
-from ouroboros.utils import atomic_write_json, replace_atomic, utc_now_iso
+from ouroboros.utils import atomic_write_json, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -514,28 +514,17 @@ def _publish_child_verification_receipts(
 ) -> None:
     """Publish the child's durable ``verification_receipts.jsonl`` to the canonical root.
 
-    ``verify_and_record`` appends receipts under the CHILD's isolated drive while
-    the parent-side W2 readers (``control._get_task_result`` / ``wait_task``)
-    resolve receipts against the canonical status root — without this copy the
-    rows depend on a fail-silent artifact-sync side effect and rot entirely once
-    the child drive is pruned. Whole-file atomic tmp+rename, not append-merge:
-    receipts key on ``(drive_root, task_id)`` and this publish is the canonical
-    file's only writer for a CHILD task_id, so the copy is collision-free; the
-    append-only source makes re-publish (task_done + reaper/cancel re-checks) an
-    idempotent refresh. Fail-soft: logged, never blocks finalization."""
+    Ordinary ``verify_and_record`` receipts live under the CHILD's isolated
+    drive, while actor-first ``delegation_zero_run`` is canonical immediately.
+    Publish the union so a whole-file refresh cannot erase that canonical-only
+    lifecycle fact. Exact-row de-duplication makes task_done + reaper/cancel
+    re-entry idempotent. Fail-soft: logged, never blocks finalization."""
     try:
-        # Lazy import: ouroboros.outcomes imports from ouroboros.headless at module level.
-        from ouroboros.outcomes import verification_receipts_path
+        from ouroboros.outcome_receipt_store import publish_verification_receipt_union
 
-        src = verification_receipts_path(child_drive, task_id, create=False)
-        if not src.is_file():
-            return
-        dest = verification_receipts_path(parent_drive_root, task_id, create=True)
-        if dest.exists() and os.path.samefile(src, dest):
-            return  # shared-drive shape: already the canonical file
-        tmp = dest.with_name(f"{dest.name}.tmp.{os.getpid()}")
-        shutil.copy2(src, tmp)
-        replace_atomic(tmp, dest)
+        publish_verification_receipt_union(
+            parent_drive_root, task_id, child_drive,
+        )
     except Exception:
         log.warning("Failed to publish child receipts for task %s", task_id, exc_info=True)
 
@@ -548,6 +537,8 @@ def _copy_child_artifacts_to_parent(
 ) -> List[Dict[str, Any]]:
     """Rebase child-drive artifact files into the parent task artifact store."""
 
+    from ouroboros.outcome_receipt_store import is_verification_receipts_path
+
     parent_dir = task_artifacts_dir(parent_drive_root, task_id)
     rebased: List[Dict[str, Any]] = []
     for artifact in artifacts:
@@ -559,6 +550,12 @@ def _copy_child_artifacts_to_parent(
         src = pathlib.Path(raw_path)
         if not src.is_absolute():
             src = (child_drive / raw_path).resolve(strict=False)
+        if is_verification_receipts_path(child_drive, task_id, src):
+            # ``copy_child_task_result`` publishes this stream through the
+            # locked union immediately before rebasing ordinary artifacts.
+            # A stale generic copy would create a competing replica (or, on a
+            # reused destination, erase canonical-only lifecycle rows).
+            continue
         try:
             src.resolve(strict=False).relative_to(parent_dir.resolve(strict=False))
             rebased.append(item)

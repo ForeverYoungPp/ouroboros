@@ -145,6 +145,17 @@ def delegated_run_shape(acting: bool) -> DelegatedRunShape:
     return DelegatedRunShape(access="readonly", mode="ask")
 
 
+def delegated_execution_workspace_root(
+    gateway: Any, shape: DelegatedRunShape, root: str,
+) -> str:
+    """Return the live-workspace field only when the engine's strict schema accepts it."""
+    from ouroboros.gateways.claudexor import engine_at_least
+
+    version = str(getattr(gateway, "engine_version", "") or "")
+    supported = engine_at_least(version, "3.8.1")
+    return str(root) if supported and shape.delegated and shape.isolation == "live" else ""
+
+
 @dataclass(frozen=True)
 class DelegationRoute:
     """An OPAQUE Claudexor route plus optional model/effort.
