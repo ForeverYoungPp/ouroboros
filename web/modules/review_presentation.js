@@ -401,6 +401,7 @@ function planAttempt(wave, index, isCurrent) {
         label: wave.cycle_index != null ? `wave ${wave.cycle_index}` : `wave ${index + 1}`,
         summary: text(wave.reason || wave.summary),
         superseded,
+        compact: Boolean(wave.compact),
         replayed: Boolean(wave.replayed || wave.cached),
         revised: Boolean(wave.revised),
         initiatorTaskId: '',
@@ -433,6 +434,7 @@ function currentPlanAttempt(current, index) {
         label: 'current attempt',
         summary: text(current.reason),
         superseded: false,
+        compact: false,
         replayed: false,
         revised: false,
         initiatorTaskId: '',
@@ -461,9 +463,19 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
     if (!owner || !stateRecord || typeof stateRecord !== 'object') return null;
     const current = stateRecord.current_attempt && typeof stateRecord.current_attempt === 'object'
         ? stateRecord.current_attempt : {};
-    const waves = Array.isArray(stateRecord.waves) ? stateRecord.waves : [];
-    if (!waves.length && !text(current.status)) return null;
+    const recordedWaves = Array.isArray(stateRecord.waves) ? stateRecord.waves : [];
+    if (!recordedWaves.length && !text(current.status)) return null;
     const currentFingerprint = text(current.fingerprint);
+    const typedCurrentStatus = text(current.status).toLowerCase();
+    // C-09: a compact row proves history, not reusable authority. While the
+    // same envelope is being reviewed again, replace that stale projection
+    // with current_attempt; the eventual full wave reuses the same identity.
+    const waves = recordedWaves.filter((wave) => !(
+        wave?.compact
+        && currentFingerprint
+        && typedCurrentStatus
+        && text(wave.request_fingerprint) === currentFingerprint
+    ));
     const currentWaveIndex = currentFingerprint
         ? waves.findIndex((wave) => text(wave?.request_fingerprint) === currentFingerprint)
         : (waves.length ? waves.length - 1 : -1);
@@ -480,7 +492,7 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
             `${currentFingerprint || 'wave'}:${waves[currentWaveIndex]?.cycle_index ?? currentWaveIndex + 1}`,
         )) || null
         : null;
-    const currentStatus = text(current.status || (currentAttempt ? 'closed' : 'open')).toLowerCase();
+    const currentStatus = typedCurrentStatus || (currentAttempt ? 'closed' : 'open');
     let state = 'terminal';
     let activeCount = 0;
     if (!currentAttempt) {
@@ -628,10 +640,16 @@ export function mergeReviewGroup(store, incoming) {
         const previous = priorById.get(attempt.id);
         const previousTerminal = previous?.state === 'terminal' || previous?.state === 'superseded';
         const incomingActive = attempt.state === 'queued' || attempt.state === 'running';
+        const replacesCompactedPlan = (
+            incoming.surface === 'plan'
+            && previous?.compact === true
+            && attempt.compact === false
+            && incomingActive
+        );
         // Attempt ids are immutable domain references. A delayed lifecycle row
         // for the same attempt may arrive after its terminal history row, but
         // it cannot make that physical attempt non-terminal again.
-        let mergedAttempt = previousTerminal && incomingActive
+        let mergedAttempt = previousTerminal && incomingActive && !replacesCompactedPlan
             ? { ...attempt, ...previous }
             : { ...(previous || {}), ...attempt };
         // A lifecycle terminal frame can arrive after the domain history row
@@ -662,8 +680,10 @@ export function mergeReviewGroup(store, incoming) {
             mergedAttempt.timestamp = previous.timestamp || mergedAttempt.timestamp;
         }
         mergedById.set(attempt.id, mergedAttempt);
-        if (incomingActive && previousTerminal) hasStaleActiveAttempt = true;
-        if (incomingActive && !previousTerminal && !previous) introducedActiveAttempt = true;
+        if (incomingActive && previousTerminal && !replacesCompactedPlan) {
+            hasStaleActiveAttempt = true;
+        }
+        if (incomingActive && (!previous || replacesCompactedPlan)) introducedActiveAttempt = true;
     }
     if (incoming.surface === 'plan') {
         // Plan task detail owns one canonical current fingerprint. An omitted

@@ -262,6 +262,80 @@ test('an unmatched open Plan attempt restores liveness before its first wave lan
     assert.equal(next.attempts.at(-1).label, 'current attempt');
 });
 
+test('a fresh Plan attempt replaces matching compact history until its full wave lands', () => {
+    const firstFingerprint = 'a'.repeat(64);
+    const secondFingerprint = 'b'.repeat(64);
+    const compactFirst = {
+        compact: true,
+        request_fingerprint: firstFingerprint,
+        cycle_index: 1,
+        aggregate: 'REVISE_PLAN',
+        closed: false,
+    };
+    const fullSecond = {
+        request_fingerprint: secondFingerprint,
+        cycle_index: 2,
+        aggregate: 'GREEN',
+        closed: true,
+    };
+    const store = new Map();
+    mergeReviewGroup(store, planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            current_attempt: { fingerprint: secondFingerprint, status: 'closed' },
+            waves: [compactFirst, fullSecond],
+        },
+    }));
+
+    const activeProjection = planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            current_attempt: { fingerprint: firstFingerprint, status: 'open' },
+            waves: [compactFirst, fullSecond],
+        },
+    });
+    assert.equal(activeProjection.state, 'running');
+    assert.equal(activeProjection.activeCount, 1);
+    assert.equal(activeProjection.verdict, 'open');
+    assert.deepEqual(activeProjection.attempts.map((attempt) => attempt.id), [
+        secondFingerprint, firstFingerprint,
+    ]);
+    assert.equal(activeProjection.attempts.at(-1).label, 'current attempt');
+    assert.equal(activeProjection.attempts.at(-1).compact, false);
+
+    mergeReviewGroup(store, activeProjection);
+    const active = store.get('plan:root');
+    assert.equal(active.state, 'running');
+    assert.equal(active.activeCount, 1);
+    assert.equal(active.verdict, 'open');
+    assert.deepEqual(active.attempts.map((attempt) => attempt.id), [
+        secondFingerprint, firstFingerprint,
+    ]);
+    assert.equal(active.attempts.at(-1).state, 'running');
+
+    mergeReviewGroup(store, planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            current_attempt: { fingerprint: firstFingerprint, status: 'open' },
+            waves: [fullSecond, {
+                request_fingerprint: firstFingerprint,
+                cycle_index: 3,
+                aggregate: 'REVIEW_REQUIRED',
+                closed: false,
+            }],
+        },
+    }));
+    const terminal = store.get('plan:root');
+    assert.equal(terminal.state, 'terminal');
+    assert.equal(terminal.activeCount, 0);
+    assert.equal(terminal.verdict, 'REVIEW_REQUIRED');
+    assert.deepEqual(terminal.attempts.map((attempt) => attempt.id), [
+        secondFingerprint, firstFingerprint,
+    ]);
+    assert.equal(terminal.attempts.at(-1).state, 'terminal');
+    assert.equal(terminal.attempts.at(-1).compact, false);
+});
+
 test('a newer canonical Plan attempt retires prior unmatched liveness', () => {
     const settledFingerprint = 'a'.repeat(64);
     const firstOpen = 'b'.repeat(64);
