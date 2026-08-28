@@ -35,6 +35,11 @@ from ouroboros.review_state import (
     _utc_now,
 )
 from ouroboros.config import get_review_enforcement as _get_review_enforcement
+from ouroboros.config import get_finalization_grace_sec
+from ouroboros.deadline_utils import (
+    dispatch_window_remaining_sec,
+    owner_deadline_exhausted_for_context,
+)
 from ouroboros.tools.review_helpers import (
     build_advisory_changed_context,
     build_skill_host_context,
@@ -528,6 +533,7 @@ def _llm_extract_advisory_items(raw_text: str, ctx: object) -> list:
             # the trusted-schema branch is never taken on this path.
             conformance_passed=False,
             contract=_ADVISORY_EXTRACT_CONTRACT,
+            deadline_at=(getattr(ctx, "task_metadata", {}) or {}).get("deadline_at"),
         )
         if method == "extraction_incomplete":
             log.warning(
@@ -693,6 +699,15 @@ def advisory_slot_enabled() -> bool:
     return bool(advisory_slot_config().enabled)
 
 
+def _advisory_child_timeout(ctx: object) -> Optional[float]:
+    metadata = getattr(ctx, "task_metadata", {})
+    return dispatch_window_remaining_sec(
+        deadline_at=(metadata or {}).get("deadline_at") if isinstance(metadata, dict) else None,
+        deadline_ts=getattr(ctx, "deadline_ts", None),
+        reserve_sec=get_finalization_grace_sec(),
+    )
+
+
 def advisory_route_requires_api_key() -> bool:
     """Whether THIS advisory route needs ANTHROPIC_API_KEY (plan 5.8: the four
     key checks are route-dependent — an api route requires the key exactly as
@@ -766,9 +781,15 @@ def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContex
 
         from ouroboros.reviewer_slot_config import advisory_slot_config
         from ouroboros.subagents import parse_subagent_harness
+        from ouroboros.config import get_finalization_grace_sec
+        from ouroboros.deadline_utils import review_operation_timeout_sec
 
         _slot = advisory_slot_config()
         _session_route = parse_subagent_harness(_slot.target_id) if _slot.target_id else None
+        _task_metadata = getattr(ctx, "task_metadata", {}) or {}
+        _owner_deadline_at = str(_task_metadata.get("deadline_at") or "") if isinstance(
+            _task_metadata, dict
+        ) else ""
         # D1/6.3: the effort field is the ONE source; any effort embedded in the
         # target identity is dropped so it can never override the field.
         if _session_route is not None:
@@ -784,7 +805,13 @@ def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContex
                 task_id=str(getattr(ctx, "task_id", "") or ""),
                 surface="advisory_review",
                 slot_id="advisory_slot_1",
-                timeout_sec=_ADVISORY_SESSION_MAX_SECONDS,
+                timeout_sec=review_operation_timeout_sec(
+                    _ADVISORY_SESSION_MAX_SECONDS,
+                    route="agent_session",
+                    deadline_at=_owner_deadline_at,
+                    reserve_sec=get_finalization_grace_sec(),
+                ),
+                owner_deadline_at=_owner_deadline_at,
                 # The owner's configured advisory slot route (6.1 SSOT) rides the
                 # invocation — the one identity+delivery value — not a parallel kwarg.
                 session_route=_session_route,
@@ -1188,7 +1215,6 @@ def _run_claude_advisory(
     # as before; the delegated route runs on the subscription and needs none.
     if not api_key and not delegated_route:
         return [], "⚠️ ADVISORY_ERROR: ANTHROPIC_API_KEY not set (advisory route=api).", "", 0
-
     if delegated_route:
         model = ""  # the session route resolves its own model; reported after the run
         _slot = None
@@ -1265,7 +1291,6 @@ def _run_claude_advisory(
 
     prompt_chars = len(prompt)
     diag = _get_runtime_diagnostics(model, prompt_chars, resolved_paths)
-
     size_skip = _predispatch_size_skip(ctx, delegated_route, model, prompt, managed_subject_diff)
     if size_skip is not None:
         return size_skip
@@ -1301,6 +1326,9 @@ def _run_claude_advisory(
             max_budget_usd = options.get("max_budget_usd")
             if max_budget_usd is None:
                 max_budget_usd = _advisory_sdk_budget(ctx, active_scope, drive_root, repo_dir)
+            if owner_deadline_exhausted_for_context(ctx, reserve_sec=get_finalization_grace_sec()):
+                raise TimeoutError("owner deadline leaves no dispatch window for advisory review")
+            child_timeout_sec = _advisory_child_timeout(ctx)
             if active_scope is not None:
                 from dataclasses import replace
                 from ouroboros.usage_accounting import usage_scope
@@ -1311,13 +1339,13 @@ def _run_claude_advisory(
                     result = run_readonly(
                         prompt=prompt, cwd=str(repo_dir), model=model,
                         max_turns=DEFAULT_CLAUDE_CODE_MAX_TURNS,
-                        effort=scope_effort, max_budget_usd=max_budget_usd,
+                        effort=scope_effort, max_budget_usd=max_budget_usd, timeout_sec=child_timeout_sec,
                     )
             else:
                 result = run_readonly(
                     prompt=prompt, cwd=str(repo_dir), model=model,
                     max_turns=DEFAULT_CLAUDE_CODE_MAX_TURNS,
-                    effort=scope_effort, max_budget_usd=max_budget_usd,
+                    effort=scope_effort, max_budget_usd=max_budget_usd, timeout_sec=child_timeout_sec,
                 )
 
         meta = {

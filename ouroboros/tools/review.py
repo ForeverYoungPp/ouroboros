@@ -24,12 +24,15 @@ from ouroboros.triad_review import (
     parse_model_review_results,
     review_query_error_payload as _review_query_error_payload,
 )
+from ouroboros.tools.review_response import (
+    parse_model_response as _parse_model_response,
+    review_operation_fields as _review_operation_fields,
+)
 
 log = logging.getLogger(__name__)
 
 MAX_MODELS = 10
 CONCURRENCY_LIMIT = 5
-DEFAULT_REVIEW_MODEL_TIMEOUT_SEC = 600.0
 
 _CONSTITUTIONAL_PREAMBLE = """\
 ## CONSTITUTIONAL CONTEXT — TOP PRIORITY
@@ -55,23 +58,6 @@ err on the side of NOT recommending it and explain the tension.
 ---
 
 """
-
-
-def _review_model_timeout_sec() -> float:
-    raw = os.environ.get("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", "")
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        value = 0.0
-    if value > 0:
-        return value
-    if raw:
-        log.warning(
-            "Invalid or non-positive OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC=%r; using %.0fs",
-            raw,
-            DEFAULT_REVIEW_MODEL_TIMEOUT_SEC,
-        )
-    return DEFAULT_REVIEW_MODEL_TIMEOUT_SEC
 
 
 # The window/limit names below stay importable and MONKEYPATCHABLE on this
@@ -155,7 +141,7 @@ def get_tools():
                 },
             },
             handler=_handle_task_acceptance_review,
-            timeout_sec=900,
+            timeout_sec=int(_cfg.get_llm_transport_read_timeout_sec() + _cfg.get_finalization_grace_sec()),
         )
     ]
 
@@ -329,7 +315,7 @@ def _handle_task_acceptance_review(
             "classify_outcome_tier": True,
             "max_physical_attempts_per_actor": 2,
         },
-        task_id=str(getattr(ctx, "task_id", "") or ""),
+        task_id=str(getattr(ctx, "task_id", "") or ""), retry_key=f"task_acceptance:{task_acceptance_evidence_revision(evidence)}",
     )
     # Task acceptance alone stays API-only by owner decision (D15); configured
     # rows now also route commit, scope, advisory, plan, and Skill Review.
@@ -356,7 +342,11 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
                                 routes: list = None,
                                 session_task: str = "",
                                 session_root: str = "",
-                                row_plan: dict = None, surface: str = "multi_model_review", session_policy: dict = None, usage_attribution: dict = None) -> str:
+                                row_plan: dict = None,
+                                surface: str = "multi_model_review",
+                                session_policy: dict = None,
+                                usage_attribution: dict = None,
+                                retry_key: str = "") -> str:
     if models is None:
         models = []
     try:
@@ -366,12 +356,16 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 result = pool.submit(
                     asyncio.run,
-                    _multi_model_review_async(content, prompt, models, ctx, stable_prefix_len, routes,
-                                              session_task, session_root, row_plan, surface, session_policy, usage_attribution),
+                    _multi_model_review_async(content, prompt, models, ctx, stable_prefix_len,
+                                              routes, session_task, session_root, row_plan,
+                                              surface, session_policy, usage_attribution,
+                                              retry_key),
                 ).result()
         except RuntimeError:
-            result = asyncio.run(_multi_model_review_async(content, prompt, models, ctx, stable_prefix_len, routes,
-                                                           session_task, session_root, row_plan, surface, session_policy, usage_attribution))
+            result = asyncio.run(_multi_model_review_async(content, prompt, models, ctx, stable_prefix_len,
+                                                           routes, session_task, session_root, row_plan,
+                                                           surface, session_policy, usage_attribution,
+                                                           retry_key))
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         log.error("Multi-model review failed: %s", e, exc_info=True)
@@ -403,9 +397,9 @@ async def _query_model(
     session_target: str = "",
     session_profile: str = "",
     surface: str = "multi_model_review", session_policy: dict = None, usage_attribution: dict = None,
+    retry_key: str = "",
 ):
     async with semaphore:
-        timeout_sec = _review_model_timeout_sec()
         slot = None
         try:
             from ouroboros.review_execution import ReviewRouteKind
@@ -427,12 +421,14 @@ async def _query_model(
                 session_root=session_root if delegated else "",
                 policy=(session_policy or {"output_contract": REVIEW_JSON_ARRAY_CONTRACT}) if delegated else {},
                 usage_attribution=usage_attribution or {},
+                task_attempt=getattr(ctx, "task_attempt", None) if ctx is not None else None,
+                retry_key=str(retry_key or ""),
+                reconcile_only=bool(getattr(ctx, "_review_reconcile_only", False)),
             )
             slot = ReviewSlot(
                 slot_id=slot_id,
                 model=model,
                 effort=effort or _cfg.resolve_effort("review"),
-                timeout_sec=timeout_sec,
                 max_tokens=_out_budget,
                 temperature=0.2,
                 role_hint="multi-model review",
@@ -442,18 +438,15 @@ async def _query_model(
                 session_profile=session_profile if delegated else "",
             )
             loop = asyncio.get_running_loop()
-            run_result = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    lambda: run_review_request(
-                        request,
-                        slots=[slot],
-                        drive_root=review_drive_root(ctx),
-                        llm=llm_client,
-                        usage_ctx=ctx,
-                    ),
+            run_result = await loop.run_in_executor(
+                None,
+                lambda: run_review_request(
+                    request,
+                    slots=[slot],
+                    drive_root=review_drive_root(ctx),
+                    llm=llm_client,
+                    usage_ctx=ctx,
                 ),
-                timeout=timeout_sec,
             )
             actor = (run_result.actors or [{}])[0]
             # Carry the substrate's real row id instead of re-deriving position.
@@ -464,6 +457,7 @@ async def _query_model(
                     "error": f"Error: {actor.get('error') or actor.get('status') or 'review failed'}",
                     "usage": actor.get("usage") or {},
                     "slot_id": ran_as,
+                    **_review_operation_fields(actor),
                     "prompt_ref": actor.get("prompt_ref") or {},
                     "response_ref": actor.get("response_ref") or {},
                     **typed,
@@ -472,13 +466,11 @@ async def _query_model(
                 "choices": [{"message": {"content": actor.get("raw_text") or ""}}],
                 "usage": actor.get("usage") or {},
                 "slot_id": ran_as,
+                **_review_operation_fields(actor),
                 "prompt_ref": actor.get("prompt_ref") or {},
                 "response_ref": actor.get("response_ref") or {},
             }
             return model, payload, None
-        except asyncio.TimeoutError:
-            error = f"Error: Timeout after {timeout_sec:g}s"
-            return model, _review_query_error_payload(ctx=ctx, model=model, messages=messages, slot_id=slot_id, error=error, slot=slot), None
         except Exception as e:
             # Preserve full review errors; helper adds an omission note if needed.
             error_msg = truncate_review_artifact(str(e), limit=4000)
@@ -492,7 +484,11 @@ async def _multi_model_review_async(content: str, prompt: str,
                                      routes: list = None,
                                      session_task: str = "",
                                      session_root: str = "",
-                                     row_plan: dict = None, surface: str = "multi_model_review", session_policy: dict = None, usage_attribution: dict = None):
+                                     row_plan: dict = None,
+                                     surface: str = "multi_model_review",
+                                     session_policy: dict = None,
+                                     usage_attribution: dict = None,
+                                     retry_key: str = ""):
     from ouroboros.review_execution import ReviewRouteKind
 
     row_routes = list(routes or []) + [ReviewRouteKind.API_CHAT] * max(0, len(models) - len(routes or []))
@@ -558,7 +554,9 @@ async def _multi_model_review_async(content: str, prompt: str,
         _query_model(llm_client, m, messages, semaphore, ctx, slot_id=row_ids[idx],
                      route=row_routes[idx], session_task=session_task, session_root=session_root,
                      effort=row_efforts[idx], session_target=row_targets[idx],
-                     session_profile=row_profiles[idx], surface=surface, session_policy=session_policy, usage_attribution=usage_attribution)
+                     session_profile=row_profiles[idx], surface=surface,
+                     session_policy=session_policy, usage_attribution=usage_attribution,
+                     retry_key=retry_key)
         for idx, m in enumerate(models)
     ]
     results = await asyncio.gather(*tasks)
@@ -586,87 +584,6 @@ async def _multi_model_review_async(content: str, prompt: str,
         "model_count": len(models),
         "constitutional_context": bool(bible_text),
         "results": review_results,
-    }
-
-
-def _parse_model_response(model: str, result, headers_dict) -> dict:
-    usage = result.get("usage", {}) if isinstance(result, dict) else {}
-    resolved_model = str(usage.get("resolved_model") or model)
-    provider = str(usage.get("provider") or "openrouter")
-    # Row identity travels with the envelope on EVERY branch — success, transport
-    # error, malformed body — so no consumer has to guess it back from position.
-    slot_id = str(result.get("slot_id") or "") if isinstance(result, dict) else ""
-    if isinstance(result, str) or (isinstance(result, dict) and result.get("error")):
-        return {
-            "model": resolved_model, "request_model": model,
-            "provider": provider, "verdict": "ERROR",
-            "text": result if isinstance(result, str) else str(result.get("error") or ""),
-            "tokens_in": 0, "tokens_out": 0, "cost_estimate": None,
-            "slot_id": slot_id,
-            "prompt_ref": result.get("prompt_ref", {}) if isinstance(result, dict) else {},
-            "response_ref": result.get("response_ref", {}) if isinstance(result, dict) else {},
-            **{key: result.get(key) for key in TYPED_FAILURE_FACT_KEYS if isinstance(result, dict) and result.get(key) not in (None, "")},
-        }
-    try:
-        choices = result.get("choices", [])
-        if not choices:
-            # Preserve full response body; no bare hardcoded truncation.
-            text = (
-                "(no choices in response: "
-                f"{truncate_review_artifact(json.dumps(result), limit=4000)})"
-            )
-            verdict = "ERROR"
-        else:
-            text = choices[0]["message"]["content"]
-            verdict = "UNKNOWN"
-            for line in text.split("\n")[:3]:
-                line_upper = line.upper()
-                if "PASS" in line_upper:
-                    verdict = "PASS"
-                    break
-                elif "CONCERNS" in line_upper:
-                    verdict = "CONCERNS"
-                    break
-                elif "FAIL" in line_upper:
-                    verdict = "FAIL"
-                    break
-    except (KeyError, IndexError, TypeError):
-        text = (
-            "(unexpected response format: "
-            f"{truncate_review_artifact(json.dumps(result), limit=4000)})"
-        )
-        verdict = "ERROR"
-
-    prompt_tokens = usage.get("prompt_tokens", 0)
-    completion_tokens = usage.get("completion_tokens", 0)
-    cached_tokens = usage.get("cached_tokens", 0)
-    cache_write_tokens = usage.get("cache_write_tokens", 0)
-    prompt_cache_ttl = str(usage.get("prompt_cache_ttl") or "")
-
-    cost = None
-    try:
-        if "cost" in usage:
-            cost = float(usage["cost"])
-        elif "total_cost" in usage:
-            cost = float(usage["total_cost"])
-        elif headers_dict:
-            for key, value in headers_dict.items():
-                if key.lower() == "x-openrouter-cost":
-                    cost = float(value)
-                    break
-    except (ValueError, TypeError, KeyError):
-        pass
-
-    return {
-        "model": resolved_model, "request_model": model,
-        "provider": provider, "verdict": verdict, "text": text,
-        "tokens_in": prompt_tokens, "tokens_out": completion_tokens,
-        "cached_tokens": cached_tokens, "cache_write_tokens": cache_write_tokens,
-        "prompt_cache_ttl": prompt_cache_ttl,
-        "cost_estimate": cost,
-        "slot_id": slot_id,
-        "prompt_ref": result.get("prompt_ref", {}) if isinstance(result, dict) else {},
-        "response_ref": result.get("response_ref", {}) if isinstance(result, dict) else {},
     }
 
 
@@ -1441,6 +1358,10 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
     }, None, False
 
 
+def _review_actor_label(row: dict) -> str:
+    return str(row.get("model_id") or row.get("slot_id") or row.get("slot") or "reviewer")
+
+
 def _dispatch_unified_review(ctx: ToolContext, commit_message: str, prepared: dict) -> Optional[str]:
     """Dispatch an assembled triad packet and post-process the panel verdict."""
     blocking_review = prepared["blocking_review"]
@@ -1455,6 +1376,7 @@ def _dispatch_unified_review(ctx: ToolContext, commit_message: str, prepared: di
             session_task=prepared["session_task"],
             session_root=str(prepared["target_repo"]),
             row_plan=prepared["row_plan"],
+            retry_key=str(prepared.get("retry_key") or ""),
         )
         result = json.loads(result_json)
     except Exception as e:
@@ -1488,8 +1410,6 @@ def _dispatch_unified_review(ctx: ToolContext, commit_message: str, prepared: di
     model_results = result.get("results", [])
     if not model_results:
         ctx._last_review_block_reason = "infra_failure"
-        # Withheld Q28-A not_dispatched seat records survive an empty panel —
-        # their merge point (_collect_review_findings) is never reached here.
         if getattr(ctx, "_triad_withheld_seat_records", None):
             ctx._last_triad_raw_results = list(ctx._triad_withheld_seat_records)
         blocked_msg = ("⚠️ REVIEW_BLOCKED: Review returned no results from any "
@@ -1500,14 +1420,23 @@ def _dispatch_unified_review(ctx: ToolContext, commit_message: str, prepared: di
 
     critical_fails, advisory_warns, errored_models, _triad_raw = _collect_review_findings(ctx, model_results)
     models_total = len(model_results)
-
-    # Quorum counts only parseable responded actors, not errors/parse failures.
     triad_raw = getattr(ctx, "_last_triad_raw_results", []) or []
+    pending_models = [_review_actor_label(r) for r in triad_raw if (
+        r.get("late_result_pending") or str(r.get("operation_state") or "")
+        in {"in_flight", "custody_lost"})]
+    if pending_models:
+        ctx._last_review_block_reason = "review_late_result_pending"
+        blocked_msg = ("⚠️ REVIEW_PENDING: Physical review operation(s) remain unresolved: "
+                       f"{', '.join(pending_models)}. Retry the same commit to reconcile them without a blind paid resend.")
+        pending_block = _handle_review_block_or_warning(
+            ctx, blocking_review, blocked_msg,
+            "Review enforcement=Advisory: pending review work did not block commit. ",
+        )
+        if pending_block is not None:
+            return pending_block
     successful_reviewers = sum(1 for r in triad_raw if r.get("status") == "responded")
-    # Non-successful actors are shown for transport/parse diagnostics; a
-    # not_dispatched seat (Q28-A drop) never ran, so it is not a FAILED actor.
     failed_actors = [
-        r["model_id"] for r in triad_raw
+        _review_actor_label(r) for r in triad_raw
         if r.get("status") not in ("responded", "not_dispatched")]
     required_quorum = _cfg.adaptive_quorum(models_total)
     if successful_reviewers < required_quorum:

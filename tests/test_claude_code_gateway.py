@@ -310,6 +310,26 @@ class TestSDKOnlyPath:
         assert "SIGABRT" in result.error
         assert "abort trap" in result.stderr_tail
 
+    def test_readonly_child_honors_explicit_process_timeout(self, monkeypatch, tmp_path):
+        """An owner-narrowed advisory window reaches the child wait boundary."""
+        import ouroboros.gateways.claude_code as gw
+
+        captured = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                captured["timeout"] = timeout
+                return json.dumps({"success": True, "result_text": "ok"}), ""
+
+        monkeypatch.delenv("OUROBOROS_CLAUDE_READONLY_CHILD", raising=False)
+        monkeypatch.setattr(gw.subprocess, "Popen", lambda *args, **kwargs: FakeProc())
+        result = gw.run_readonly("review this", cwd=str(tmp_path), timeout_sec=7.5)
+
+        assert result.success is True
+        assert captured["timeout"] == 7.5
+
     def test_readonly_child_timeout_uses_process_tree_cleanup(self):
         """Timeout cleanup must kill the child process group/tree, not only direct child."""
         import inspect

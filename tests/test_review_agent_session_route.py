@@ -76,6 +76,7 @@ class FakeGateway:
     detail = {}
     # Optional scripted behaviors.
     start_error = None            # exception raised on the FIRST start only
+    poll_error = None             # exception raised on the FIRST terminal read only
     artifact_bytes = None
     artifact_error = None
     nonterminal = False
@@ -109,6 +110,7 @@ class FakeGateway:
         cls.manifest_capabilities = {"json_schema_output": True}
         cls.detail = _terminal_detail('{"findings": []}', conformance="passed")
         cls.start_error = None
+        cls.poll_error = None
         cls.artifact_bytes = None
         cls.artifact_error = None
         cls.nonterminal = False
@@ -153,6 +155,10 @@ class FakeGateway:
 
     def get_run(self, run_id, **_kw):
         self.run_gets.append(run_id)
+        if FakeGateway.poll_error is not None:
+            exc = FakeGateway.poll_error
+            FakeGateway.poll_error = None
+            raise exc
         if FakeGateway.nonterminal:
             return {"summary": {"state": "running"}, "lastSeq": 1}
         return json.loads(json.dumps(FakeGateway.detail))
@@ -263,6 +269,37 @@ def test_schema_conformant_clean_verdict_survives(tmp_path, fake_route):
     # the schema was asked on the EFFECTIVE route (D19).
     assert "outputSchema" in start
     assert gateway.start_keys[0]  # the invocation id rode the wire
+
+
+def test_unset_session_window_uses_task_absolute_ceiling(tmp_path, fake_route, monkeypatch):
+    monkeypatch.setattr("ouroboros.config.get_task_abs_ceiling_sec", lambda: 21_600)
+
+    run_review_request(
+        _agent_request(), slots=[_agent_slot(timeout_sec=None)],
+        drive_root=tmp_path, llm=FakeLLM(),
+    )
+
+    assert fake_route.instances[0].start_requests[0]["maxSeconds"] == 21_600
+
+
+def test_task_metadata_deadline_narrows_session_engine_horizon(
+    tmp_path, fake_route, monkeypatch,
+):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr("ouroboros.config.get_finalization_grace_sec", lambda: 0)
+    ctx = SimpleNamespace(
+        task_id="t-agent", event_queue=None, pending_events=[],
+        task_metadata={
+            "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat(),
+        },
+    )
+    run_review_request(
+        _agent_request(), slots=[_agent_slot(timeout_sec=None)],
+        drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
+    )
+
+    assert 1 <= fake_route.instances[0].start_requests[0]["maxSeconds"] <= 300
 
 
 def test_structured_session_compares_the_parsed_model_not_the_harness_spec(
@@ -451,6 +488,22 @@ def test_extraction_never_fabricates_a_clean_verdict():
     assert method == "unparsed"
 
 
+def test_light_extraction_transport_is_narrowed_by_the_request_deadline(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "1")
+    llm = FakeLLM(reply="[]")
+    deadline = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    text, method, _usage = canonicalize_session_verdict(
+        "narrative: clean",
+        conformance_passed=False,
+        llm=llm,
+        deadline_at=deadline,
+    )
+    assert method == "light_model_extraction" and text == "[]"
+    assert 0 < llm.calls[0]["timeout"] <= 4.1
+
+
 def test_a_fenced_verdict_stays_unparsed_at_this_layer():
     """Disclosed residual (audit 2026-08-05): a verdict wrapped in a ```json
     fence that only the coordinator's downstream scanner parses is telemetered
@@ -544,6 +597,42 @@ def test_oversized_transcript_is_typed_extraction_incomplete_never_clean(tmp_pat
     assert any(d["reason"] == "extraction_incomplete_transcript_exceeds_bound"
                for d in deltas)
     assert llm.calls == []
+
+
+def test_spent_owner_deadline_skips_light_model_extraction():
+    from ouroboros.review_execution import _extract_verdict_via_light_model
+
+    class NeverCalled:
+        def chat(self, **_kwargs):
+            raise AssertionError("spent deadline must not dispatch extraction")
+
+    canonical, usage = _extract_verdict_via_light_model(
+        "narrative", llm=NeverCalled(), deadline_at="2000-01-01T00:00:00Z",
+    )
+
+    assert canonical is None
+    assert usage["reason_code"] == "deadline_exhausted"
+    assert usage["dispatch"] == "not_dispatched"
+
+
+def test_reserve_only_owner_window_skips_light_model_extraction(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from ouroboros.review_execution import _extract_verdict_via_light_model
+
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+
+    class NeverCalled:
+        def chat(self, **_kwargs):
+            raise AssertionError("reserve-only owner window must not dispatch extraction")
+
+    deadline = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    canonical, usage = _extract_verdict_via_light_model(
+        "narrative", llm=NeverCalled(), deadline_at=deadline,
+    )
+
+    assert canonical is None
+    assert usage["reason_code"] == "deadline_exhausted"
+    assert usage["dispatch"] == "not_dispatched"
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +961,19 @@ def test_transport_retry_reuses_the_pending_invocation_id(tmp_path, fake_route):
     assert bodies[0] == bodies[1]  # byte-identical replay, maxSeconds included
 
 
+def test_terminal_read_transport_failure_reuses_started_run(tmp_path, fake_route):
+    """A run accepted by Claudexor must not be posted a second time when its
+    first terminal read is temporarily unavailable."""
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    fake_route.poll_error = ClaudexorUnavailable("daemon_unreachable", "boom", status_code=0)
+    result = run_review_request(_agent_request(), slots=[_agent_slot()],
+                                drive_root=tmp_path, llm=FakeLLM())
+    assert result.actors[0]["status"] == "ok"
+    assert sum(len(inst.start_requests) for inst in fake_route.instances) == 1
+    assert sum(len(inst.run_gets) for inst in fake_route.instances) == 2
+
+
 def _run_session_directly(tmp_path, **overrides):
     """Call the shared session runner with explicit knobs (the B-class surface)."""
     from ouroboros.review_execution import (
@@ -883,10 +985,68 @@ def _run_session_directly(tmp_path, **overrides):
     kwargs = dict(prompt="review this", root="/tmp/fake-repo", custody_drive=tmp_path)
     for key in list(overrides):
         if key in ("task_id", "surface", "slot_id", "timeout_sec", "logical_key_extra",
-                   "output_schema", "session_route", "instructions", "retry_state"):
+                   "output_schema", "session_route", "instructions", "retry_state",
+                   "operation_id", "pending_invocation_checkpoint"):
             invocation[key] = overrides.pop(key)
     kwargs.update(overrides)
     return run_delegated_review_session(invocation=SessionInvocation(**invocation), **kwargs)
+
+
+def test_pending_invocation_checkpoint_precedes_provider_post(
+    tmp_path, fake_route, monkeypatch,
+):
+    from ouroboros.delegate_custody import START_REQUESTED
+
+    checkpoints = []
+    original_start = FakeGateway.start_run
+
+    def _start_after_checkpoint(self, request, *, idempotency_key=""):
+        assert checkpoints == [idempotency_key]
+        return original_start(self, request, idempotency_key=idempotency_key)
+
+    monkeypatch.setattr(FakeGateway, "start_run", _start_after_checkpoint)
+
+    facts = _run_session_directly(
+        tmp_path,
+        operation_id="op-checkpoint",
+        pending_invocation_checkpoint=lambda invocation_id: checkpoints.append(
+            invocation_id
+        ),
+    )
+
+    assert facts["run_id"] == "run-1"
+    assert checkpoints == [fake_route.instances[-1].start_keys[0]]
+    requested = [
+        row for row in _custody_rows(tmp_path)
+        if row.get("type") == START_REQUESTED
+    ][-1]
+    assert requested["surface"] == "scope_review"
+    assert requested["slot_id"] == "scope_slot_1"
+    assert requested["operation_id"] == "op-checkpoint"
+
+
+def test_failed_pending_invocation_checkpoint_refuses_provider_post(
+    tmp_path, fake_route,
+):
+    from ouroboros.review_execution import ReviewRouteUnavailable
+
+    state = {}
+
+    def _fail(_invocation_id):
+        raise OSError("ledger unavailable")
+
+    with pytest.raises(ReviewRouteUnavailable) as raised:
+        _run_session_directly(
+            tmp_path,
+            retry_state=state,
+            pending_invocation_checkpoint=_fail,
+        )
+
+    assert raised.value.code == "review_custody_checkpoint_unwritable"
+    gateway = fake_route.instances[-1]
+    assert gateway.start_requests == []
+    assert gateway.removals == []
+    assert state == {}
 
 
 def _lineage_scope(*, skill_review=False):
@@ -1202,15 +1362,12 @@ def test_retry_replays_the_stored_route_and_registers_nothing_new(tmp_path, fake
     monkeypatch.setenv(REVIEW_SESSION_ROUTE_ENV, "other-route=other-model:high")
     before = [len(i.registrations) for i in fake_route.instances]
     health_calls = []
-    real_route_health = subagents.route_health
 
-    def _track_route_health(gateway, route_id, shape, *, route_model="", pinned_profile=""):
-        health_calls.append((route_id, route_model, pinned_profile))
-        return real_route_health(
-            gateway, route_id, shape, route_model=route_model, pinned_profile=pinned_profile,
-        )
+    def _health_must_not_run(*args, **kwargs):
+        health_calls.append((args, kwargs))
+        raise AssertionError("route health is fresh admission, not idempotent recovery")
 
-    monkeypatch.setattr(subagents, "route_health", _track_route_health)
+    monkeypatch.setattr(subagents, "route_health", _health_must_not_run)
 
     facts = _run_session_directly(tmp_path, retry_state=state)
 
@@ -1220,9 +1377,10 @@ def test_retry_replays_the_stored_route_and_registers_nothing_new(tmp_path, fake
     retry_gateway = fake_route.instances[-1]
     assert retry_gateway.start_requests[0]["primaryHarness"] == "fake-review"
     assert retry_gateway.start_requests[0]["harnesses"] == ["fake-review"]
-    # Pending recovery can still POST, so it remains admission-health gated —
-    # against the STORED route/model, never the drifted current configuration.
-    assert health_calls == [("fake-review", "fake-small", "")]
+    # The original request already passed admission. A fresh health snapshot can
+    # drift while the first POST's outcome is unknown, so recovery joins by the
+    # stored body/key and never re-admits it.
+    assert health_calls == []
     # No project lookup or registration happened on the retry: the original
     # attempt's project rides the record.
     assert retry_gateway.project_lookups == []
@@ -1232,12 +1390,10 @@ def test_retry_replays_the_stored_route_and_registers_nothing_new(tmp_path, fake
     assert retry_gateway.start_keys == [pending]
 
 
-def test_retry_of_a_pinned_session_health_checks_the_stored_account(tmp_path, fake_route,
-                                                                    monkeypatch):
-    """§K.7 on the review lane's OWN recovery: the stored canonical request
-    carries the account pin (`credentialProfileId`), so a retry's pre-flight
-    health must judge that exact subject — never the harness-wide pool, and
-    never whatever pin the settings drifted to after the original attempt."""
+def test_retry_of_a_pinned_session_replays_without_fresh_account_health(
+    tmp_path, fake_route, monkeypatch,
+):
+    """A pending retry replays its admitted pin without consulting live health."""
     from ouroboros import subagents
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.subagents import DelegationRoute
@@ -1253,20 +1409,16 @@ def test_retry_of_a_pinned_session_health_checks_the_stored_account(tmp_path, fa
     # The setting drifts to another route between the attempts.
     monkeypatch.setenv(REVIEW_SESSION_ROUTE_ENV, "other-route=other-model:high")
     health_calls = []
-    real_route_health = subagents.route_health
 
-    def _track_route_health(gateway, route_id, shape, *, route_model="", pinned_profile=""):
-        health_calls.append((route_id, route_model, pinned_profile))
-        return real_route_health(
-            gateway, route_id, shape, route_model=route_model, pinned_profile=pinned_profile,
-        )
+    def _health_must_not_run(*args, **kwargs):
+        health_calls.append((args, kwargs))
+        raise AssertionError("pending replay must not be blocked by current account health")
 
-    monkeypatch.setattr(subagents, "route_health", _track_route_health)
+    monkeypatch.setattr(subagents, "route_health", _health_must_not_run)
 
     facts = _run_session_directly(tmp_path, retry_state=state)
 
-    # The health check received the STORED pin — not '' and not the drift.
-    assert health_calls == [("fake-review", "fake-small", "pinned-account")]
+    assert health_calls == []
     retry_gateway = fake_route.instances[-1]
     assert retry_gateway.start_requests[0]["credentialProfileId"] == "pinned-account"
     # And the fresh STARTED custody row carries the pin, symmetric with the
@@ -1279,8 +1431,8 @@ def test_retry_of_a_pinned_session_health_checks_the_stored_account(tmp_path, fa
 def test_pending_retry_replays_the_stored_credential_pin(tmp_path, fake_route):
     """Phase D1 on the RECOVERY path: the stored request is the durable pin
     carrier. A pinned slot whose first attempt died mid-flight must replay as
-    PINNED — both past route_health (the row status the pin exists to skip)
-    and on the wire — or the retry re-refuses on the exact class D1 removed."""
+    PINNED on the wire. Live route health is fresh admission and cannot block
+    recovery of a POST whose provider outcome is still unknown."""
     import dataclasses
 
     from ouroboros import subagents
@@ -1301,23 +1453,101 @@ def test_pending_retry_replays_the_stored_credential_pin(tmp_path, fake_route):
     fake_route.start_error = None
     fake_route.catalog_entry["status"] = "unavailable"
     fake_route.catalog_entry["enabled"] = False
-    pins_seen = []
-    real_route_health = subagents.route_health
+    health_calls = []
 
-    def _track(gateway, route_id, shape, *, route_model="", pinned_profile=""):
-        pins_seen.append(pinned_profile)
-        return real_route_health(
-            gateway, route_id, shape, route_model=route_model, pinned_profile=pinned_profile,
-        )
+    def _health_must_not_run(*args, **kwargs):
+        health_calls.append((args, kwargs))
+        raise AssertionError("pending replay must not consult current route health")
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(subagents, "route_health", _track)
+        mp.setattr(subagents, "route_health", _health_must_not_run)
         facts = _run_session_directly(tmp_path, retry_state=state, session_route=pinned)
 
     assert facts["idempotent_recovery"] is True
-    assert pins_seen == ["acct-pinned"]  # the rebuilt route carries the pin
+    assert health_calls == []
     retry_starts = [r for inst in fake_route.instances for r in inst.start_requests]
     assert retry_starts[-1]["credentialProfileId"] == "acct-pinned"
+
+
+def _record_pending_review_invocation(
+    drive_root, *, invocation_id: str, task_id: str = "t-b", request=None,
+):
+    route_id = "fake-review"
+    body = request or {
+        "prompt": "review this",
+        "instructions": "stored review instructions",
+        "authPreference": "subscription",
+        "mode": "ask",
+        "access": "readonly",
+        "scope": {"kind": "project", "root": "/tmp/fake-repo"},
+        "harnesses": [route_id],
+        "primaryHarness": route_id,
+        "maxSeconds": 30,
+        "model": "fake-small",
+        "effort": "low",
+    }
+    assert custody.record_start_requested(
+        drive_root, run_id="", task_id=task_id,
+        idempotency_key="stored-logical-key", invocation_id=invocation_id,
+        max_seconds=30, request=body, project_id="proj-owned",
+        project_owned=True, route=route_id, surface="scope_review",
+        slot_id="scope_slot_1",
+    )
+
+
+def test_pending_recovery_refuses_foreign_owner_before_gateway(tmp_path, fake_route):
+    from ouroboros.review_execution import ReviewRouteUnavailable
+
+    invocation_id = "inv-foreign-pending"
+    _record_pending_review_invocation(
+        tmp_path, invocation_id=invocation_id, task_id="another-task",
+    )
+    state = {"pending_invocation_id": invocation_id}
+    before = len(fake_route.instances)
+
+    with pytest.raises(ReviewRouteUnavailable) as excinfo:
+        _run_session_directly(tmp_path, task_id="t-b", retry_state=state)
+
+    assert excinfo.value.code == "review_recovery_ownership_unverified"
+    assert len(fake_route.instances) == before
+    assert state == {"pending_invocation_id": invocation_id}
+
+
+@pytest.mark.parametrize("invalid_field", ["route_pool", "access"])
+def test_pending_recovery_refuses_malformed_stored_request_before_gateway(
+    tmp_path, fake_route, invalid_field,
+):
+    from ouroboros.review_execution import ReviewRouteUnavailable
+
+    invocation_id = f"inv-malformed-{invalid_field}"
+    route_id = "fake-review"
+    request = {
+        "prompt": "review this",
+        "instructions": "stored review instructions",
+        "authPreference": "subscription",
+        "mode": "ask",
+        "access": "readonly",
+        "scope": {"kind": "project", "root": "/tmp/fake-repo"},
+        "harnesses": [route_id],
+        "primaryHarness": route_id,
+        "maxSeconds": 30,
+    }
+    if invalid_field == "route_pool":
+        request["harnesses"] = ["different-route"]
+    else:
+        request["access"] = "workspace_write"
+    _record_pending_review_invocation(
+        tmp_path, invocation_id=invocation_id, request=request,
+    )
+    state = {"pending_invocation_id": invocation_id}
+    before = len(fake_route.instances)
+
+    with pytest.raises(ReviewRouteUnavailable) as excinfo:
+        _run_session_directly(tmp_path, retry_state=state)
+
+    assert excinfo.value.code == "review_recovery_request_invalid"
+    assert len(fake_route.instances) == before
+    assert state == {"pending_invocation_id": invocation_id}
 
 
 def test_retry_refuses_typed_when_the_stored_prompt_diverges(tmp_path, fake_route):
@@ -1391,16 +1621,21 @@ def test_started_run_reports_whether_its_custody_row_landed(tmp_path, fake_route
     assert _run_session_directly(tmp_path)["custody_durable"] is False
 
 
-def test_session_is_never_restarted_for_format_repair(tmp_path, fake_route):
+def test_session_is_never_restarted_for_format_repair(tmp_path, fake_route, monkeypatch):
     """5.5: a resend over bad output performs local extraction over the already
     collected transcript — the session is not relaunched."""
     from ouroboros.review_execution import AgentSessionReviewExecutor, ReviewAssignment
 
     fake_route.manifest_capabilities = {}
     fake_route.detail = _terminal_detail("prose without a verdict")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "0")
     llm = FakeLLM(reply="UNEXTRACTABLE")
+    from datetime import datetime, timedelta, timezone
+
+    deadline = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
     executor = AgentSessionReviewExecutor(
-        ReviewAssignment(request=_agent_request(), slot=_agent_slot(),
+        ReviewAssignment(request=_agent_request(deadline_at=deadline),
+                         slot=_agent_slot(transport_timeout_sec=17),
                          call_id="c1", call_type="scope_review",
                          custody_root=tmp_path),
         llm=llm,
@@ -1411,6 +1646,8 @@ def test_session_is_never_restarted_for_format_repair(tmp_path, fake_route):
     assert len(fake_route.instances[0].start_requests) == 1
     assert first.raw_text == second.raw_text == "prose without a verdict"
     assert len(llm.calls) == 2  # local extraction ran each time, no new session
+    assert all(0 < call["timeout"] <= 17 for call in llm.calls)
+    assert llm.calls[1]["timeout"] <= llm.calls[0]["timeout"]
 
 
 # ---------------------------------------------------------------------------
@@ -1495,6 +1732,91 @@ def test_callable_api_refusal_before_physical_attempt_stays_unpaid(tmp_path, fak
     assert result.actors[0]["status"] == "error"
     assert "route resolution failed" in result.actors[0]["error"]
     assert stamps == []
+
+
+def test_api_review_rechecks_owner_deadline_at_physical_boundary(tmp_path, fake_route, monkeypatch):
+    from ouroboros.review_execution import (
+        ApiChatReviewExecutor, ReviewAssignment, ReviewRouteUnavailable,
+    )
+
+    llm = FakeLLM()
+    executor = ApiChatReviewExecutor(
+        ReviewAssignment(
+            request=_agent_request(deadline_at="2000-01-01T00:00:00Z"),
+            slot=_agent_slot(route=ReviewRouteKind.API_CHAT),
+            custody_root=tmp_path,
+        ),
+        llm=llm,
+    )
+    # Stand in for a long prompt/render/persistence phase. The final check is
+    # deliberately after `_kwargs()` and immediately before `chat`.
+    monkeypatch.setattr(executor, "_kwargs", lambda: {"messages": [], "model": "fake"})
+
+    with pytest.raises(ReviewRouteUnavailable) as caught:
+        executor.execute()
+    assert caught.value.code == "deadline_exhausted"
+    assert llm.calls == []
+
+
+def test_api_review_does_not_stamp_pre_dispatch_released_capture(
+    tmp_path, fake_route,
+):
+    from ouroboros.usage_accounting import PhysicalAttemptCapture
+    from ouroboros.review_execution import (
+        ApiChatReviewExecutor, ReviewAssignment,
+    )
+
+    stamps = []
+
+    class ReleasedBeforeSend:
+        def chat(self, **_kwargs):
+            error = RuntimeError("request preparation failed")
+            error.physical_attempt_capture = PhysicalAttemptCapture(
+                attempt_id="attempt-released", model="fake", provider="test",
+                state="released", candidate_measurement_kind="opaque",
+            )
+            raise error
+
+    executor = ApiChatReviewExecutor(
+        ReviewAssignment(
+            request=_agent_request(),
+            slot=_agent_slot(route=ReviewRouteKind.API_CHAT),
+            custody_root=tmp_path,
+            dispatch_stamp=lambda: stamps.append("paid"),
+        ),
+        llm=ReleasedBeforeSend(),
+    )
+
+    with pytest.raises(RuntimeError, match="request preparation failed"):
+        executor.execute()
+    assert stamps == []
+
+
+def test_api_review_does_not_dispatch_inside_finalization_reserve(
+    tmp_path, fake_route, monkeypatch,
+):
+    from datetime import datetime, timedelta, timezone
+    from ouroboros.review_execution import (
+        ApiChatReviewExecutor, ReviewAssignment, ReviewRouteUnavailable,
+    )
+
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+    deadline = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    llm = FakeLLM()
+    executor = ApiChatReviewExecutor(
+        ReviewAssignment(
+            request=_agent_request(deadline_at=deadline),
+            slot=_agent_slot(route=ReviewRouteKind.API_CHAT),
+            custody_root=tmp_path,
+        ),
+        llm=llm,
+    )
+    monkeypatch.setattr(executor, "_kwargs", lambda: {"messages": [], "model": "fake"})
+
+    with pytest.raises(ReviewRouteUnavailable) as caught:
+        executor.execute()
+    assert caught.value.code == "deadline_exhausted"
+    assert llm.calls == []
 
 
 def test_async_only_api_transport_fires_at_the_same_physical_boundary(tmp_path, fake_route):
@@ -1593,6 +1915,22 @@ def test_late_worker_uses_its_captured_stamp_after_caller_restores_context(
     release.set()
     assert stamped.wait(2), "the late physical start must retain its original wave stamp"
     assert finished.wait(2), "the delayed worker must not leak into the next test"
+    # Gateway close precedes the substrate's final actor publication by a few
+    # instructions. Wait for process-local custody too, otherwise the following
+    # equal-content test can legitimately join this late actor.
+    import time
+
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
+
+    key = _attempt_key(_agent_request(), _agent_slot(timeout_sec=0.02))
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with _ACTIVE_LOCK:
+            if key not in _ACTIVE:
+                break
+        time.sleep(0.005)
+    else:
+        raise AssertionError("the delayed review worker did not settle its custody")
 
 
 def test_unhealthy_route_refuses_typed_never_falls_back(tmp_path, fake_route):
@@ -2776,6 +3114,27 @@ def test_slot_timeout_raise_carries_the_honest_cancel_outcome(
     assert stub.cancels == ["review_slot_timeout"]
 
 
+def test_clock_crossing_between_timeout_checks_still_cancels_the_running_session(
+        tmp_path, monkeypatch):
+    """The second clock read may cross the deadline before sleep is entered."""
+    from ouroboros import review_execution as rx
+
+    ticks = iter([0.0, 0.0, 0.5, 1.1, 1.2])
+    monkeypatch.setattr(rx.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        rx,
+        "_poll_detail",
+        lambda *_args, **_kwargs: {"lastSeq": 1, "summary": {"state": "running"}},
+    )
+    stub = _OutcomeCustodyStub("confirmed")
+    with pytest.raises(TimeoutError, match="exceeded the slot budget"):
+        rx._poll_session_terminal(
+            _RunningGateway(), stub, tmp_path,
+            SimpleNamespace(run_id="run-cross"), "run-cross", 1.0,
+        )
+    assert stub.cancels == ["review_slot_timeout"]
+
+
 @pytest.mark.parametrize("waiting,slot_seconds", [
     (True, 600.0),   # waiting-on-user branch
     (False, 1.0),    # slot-timeout branch
@@ -2940,6 +3299,8 @@ def test_an_unreadable_settled_success_raises_typed_never_may_still_be_live(
     assert "may still be live" not in text
     assert "host-cancelled" not in text
     assert gateway.reads_after_cancel == 2, "one bounded retry, never a loop"
+    assert excinfo.value.delegated_run_started is True
+    assert excinfo.value.delegated_run_id == "run-u"
 
 
 @pytest.mark.parametrize("state,must,must_not", [

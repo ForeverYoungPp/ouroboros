@@ -11,11 +11,46 @@ import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
-from ouroboros.config import resolve_effort
+from ouroboros.config import (
+    NESTED_SETTLEMENT_MARGIN_SEC,
+    get_vision_caption_timeout_sec,
+    resolve_effort,
+)
+from ouroboros.deadline_utils import owner_deadline_exhausted, transport_timeout_with_deadline
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.usage_accounting import current_usage_scope
+from ouroboros.utils import emit_cognitive_operation_event
+from ouroboros.observability import new_call_id
 
 log = logging.getLogger(__name__)
+
+
+def _vision_timeout_for_context(ctx: Any) -> float:
+    metadata = getattr(ctx, "task_metadata", {})
+    deadline_at = metadata.get("deadline_at") if isinstance(metadata, dict) else None
+    deadline_ts = getattr(ctx, "deadline_ts", None)
+    try:
+        from ouroboros.task_pacing import effective_finalization_reserve_sec
+
+        reserve = effective_finalization_reserve_sec(ctx)
+    except Exception:
+        reserve = 0
+    # Admission consumes the whole provider/child/finalization reserve. The
+    # transport helper repeats the same bound for an already-admitted call.
+    transport_reserve = reserve + (2 * NESTED_SETTLEMENT_MARGIN_SEC)
+    if owner_deadline_exhausted(
+        deadline_at=deadline_at, deadline_ts=deadline_ts, reserve_sec=transport_reserve,
+    ):
+        raise TimeoutError(
+            "insufficient owner-deadline window for VLM provider and settlement custody"
+        )
+    timeout = transport_timeout_with_deadline(
+        get_vision_caption_timeout_sec(),
+        deadline_at=deadline_at,
+        deadline_ts=deadline_ts,
+        reserve_sec=transport_reserve,
+    )
+    return timeout
 
 
 def _get_llm_client():
@@ -38,19 +73,45 @@ def _analyze_screenshot(ctx: ToolContext, prompt: str = "Describe what you see i
         vlm_model = _resolve_vlm_model(client, model, ctx=ctx)
         if not vlm_model:
             return _VLM_NO_VISION_MODEL_MSG
+        operation_id = new_call_id("vlm_analysis")
+        emit_cognitive_operation_event(
+            getattr(ctx, "event_queue", None),
+            task_id=getattr(ctx, "task_id", ""),
+            operation_id=operation_id,
+            phase="started",
+            kind="vlm",
+            task_attempt=getattr(ctx, "task_attempt", None),
+        )
         text, usage = _vision_query_with_timeout(
             client,
             prompt=prompt,
             images=[_image_payload_from_base64(b64, "image/png")],
             model=vlm_model,
             reasoning_effort=resolve_effort("task"),
-            timeout=_VLM_HTTP_TIMEOUT_SEC,
+            timeout=_vision_timeout_for_context(ctx),
+        )
+        emit_cognitive_operation_event(
+            getattr(ctx, "event_queue", None),
+            task_id=getattr(ctx, "task_id", ""),
+            operation_id=operation_id,
+            phase="finished",
+            kind="vlm",
+            task_attempt=getattr(ctx, "task_attempt", None),
         )
 
         _emit_usage(ctx, usage, vlm_model)
 
         return text or "(no response from VLM)"
     except Exception as e:
+        if "operation_id" in locals():
+            emit_cognitive_operation_event(
+                getattr(ctx, "event_queue", None),
+                task_id=getattr(ctx, "task_id", ""),
+                operation_id=operation_id,
+                phase="failed",
+                kind="vlm",
+                task_attempt=getattr(ctx, "task_attempt", None),
+            )
         log.warning("analyze_screenshot failed: %s", e, exc_info=True)
         return f"⚠️ VLM_ANALYSIS_FAILED: {e}"
 
@@ -65,13 +126,11 @@ _IMAGE_WEBP_MAGIC = (b'RIFF', b'WEBP')
 _VLM_MAX_FILE_BYTES = 20 * 1024 * 1024
 _VLM_MAX_PROVIDER_BYTES = 6 * 1024 * 1024
 _VLM_MAX_IMAGE_SIDE = 1600
-_VLM_HTTP_TIMEOUT_SEC = 90.0
-
-
 def _vision_query_with_timeout(client: Any, **kwargs: Any) -> tuple[str, dict]:
     """Run a VLM query behind a tracked, killable child process."""
     del client  # production path constructs the client in the tracked child.
-    timeout = float(kwargs.get("timeout") or _VLM_HTTP_TIMEOUT_SEC)
+    provider_timeout = float(kwargs.get("timeout") or get_vision_caption_timeout_sec())
+    child_timeout = provider_timeout + NESTED_SETTLEMENT_MARGIN_SEC
     payload = dict(kwargs)
     active_scope = current_usage_scope()
     if active_scope is not None:
@@ -115,10 +174,13 @@ print(json.dumps({"ok": True, "text": text, "usage": usage}))
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
+            timeout=child_timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        raise TimeoutError(f"VLM query exceeded {timeout:g}s wall-clock timeout") from exc
+        raise TimeoutError(
+            f"VLM query child did not settle within {child_timeout:g}s "
+            f"after its {provider_timeout:g}s provider bound"
+        ) from exc
     finally:
         try:
             os.unlink(payload_path)
@@ -572,19 +634,45 @@ def _vlm_query(ctx: ToolContext, prompt: str, image_url: str = "", image_base64:
         vlm_model = _resolve_vlm_model(client, model, ctx=ctx)
         if not vlm_model:
             return _VLM_NO_VISION_MODEL_MSG
+        operation_id = new_call_id("vlm_query")
+        emit_cognitive_operation_event(
+            getattr(ctx, "event_queue", None),
+            task_id=getattr(ctx, "task_id", ""),
+            operation_id=operation_id,
+            phase="started",
+            kind="vlm",
+            task_attempt=getattr(ctx, "task_attempt", None),
+        )
         text, usage = _vision_query_with_timeout(
             client,
             prompt=prompt,
             images=images,
             model=vlm_model,
             reasoning_effort=resolve_effort("task"),
-            timeout=_VLM_HTTP_TIMEOUT_SEC,
+            timeout=_vision_timeout_for_context(ctx),
+        )
+        emit_cognitive_operation_event(
+            getattr(ctx, "event_queue", None),
+            task_id=getattr(ctx, "task_id", ""),
+            operation_id=operation_id,
+            phase="finished",
+            kind="vlm",
+            task_attempt=getattr(ctx, "task_attempt", None),
         )
 
         _emit_usage(ctx, usage, vlm_model)
 
         return text or "(no response from VLM)"
     except Exception as e:
+        if "operation_id" in locals():
+            emit_cognitive_operation_event(
+                getattr(ctx, "event_queue", None),
+                task_id=getattr(ctx, "task_id", ""),
+                operation_id=operation_id,
+                phase="failed",
+                kind="vlm",
+                task_attempt=getattr(ctx, "task_attempt", None),
+            )
         log.warning("vlm_query failed: %s", e, exc_info=True)
         return f"⚠️ VLM_QUERY_FAILED: {e}"
 
@@ -714,7 +802,9 @@ def get_tools() -> List[ToolEntry]:
                 },
             },
             handler=_analyze_screenshot,
-            timeout_sec=90,
+            timeout_sec=(
+                get_vision_caption_timeout_sec() + (2 * NESTED_SETTLEMENT_MARGIN_SEC)
+            ),
         ),
         ToolEntry(
             name="vlm_query",
@@ -762,7 +852,9 @@ def get_tools() -> List[ToolEntry]:
                 },
             },
             handler=_vlm_query,
-            timeout_sec=90,
+            timeout_sec=(
+                get_vision_caption_timeout_sec() + (2 * NESTED_SETTLEMENT_MARGIN_SEC)
+            ),
         ),
         ToolEntry(
             name="view_image",

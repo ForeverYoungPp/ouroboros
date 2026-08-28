@@ -205,6 +205,95 @@ def test_web_search_falls_back_to_openrouter_server_tool(monkeypatch):
     assert ctx.pending_events[0]["provider"] == "openrouter"
 
 
+def test_provider_owned_search_recomputes_the_owner_bounded_timeout(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from ouroboros import llm
+
+    captured = {}
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test-key")
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "480")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+    ctx = types.SimpleNamespace(
+        pending_events=[],
+        task_metadata={
+            "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=150)).isoformat(),
+        },
+    )
+
+    def fake_openrouter(**kwargs):
+        captured["openrouter"] = kwargs["timeout"]
+        message = types.SimpleNamespace(content="openrouter answer")
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)], usage=None)
+
+    def fake_anthropic(**kwargs):
+        captured["anthropic"] = kwargs["timeout"]
+        block = types.SimpleNamespace(type="text", text="anthropic answer")
+        return types.SimpleNamespace(content=[block], usage=None)
+
+    monkeypatch.setattr(llm, "openrouter_web_search_server_tool", fake_openrouter)
+    monkeypatch.setattr(llm, "anthropic_web_search_server_tool", fake_anthropic)
+    assert json.loads(search_module._web_search_openrouter(ctx, "q"))["answer"] == "openrouter answer"
+    assert json.loads(search_module._web_search_anthropic(ctx, "q"))["answer"] == "anthropic answer"
+    assert 0 < captured["anthropic"] <= captured["openrouter"] <= 31
+
+
+def test_provider_owned_search_refuses_inside_finalization_reserve(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from ouroboros import llm
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
+    calls = []
+
+    def fake_openrouter(**_kwargs):
+        calls.append(1)
+        raise AssertionError("reserve-only owner window must not dispatch search")
+
+    monkeypatch.setattr(llm, "openrouter_web_search_server_tool", fake_openrouter)
+    ctx = types.SimpleNamespace(
+        pending_events=[], emit_progress_fn=MagicMock(),
+        task_metadata={
+            "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat(),
+        },
+    )
+
+    result = json.loads(search_module._web_search_openrouter(ctx, "q"))
+
+    assert result["reason_code"] == "deadline_exhausted"
+    assert calls == []
+
+
+def test_provider_owned_search_without_deadline_uses_the_configured_transport_cap(monkeypatch):
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "321")
+    ctx = types.SimpleNamespace(task_metadata={})
+    assert search_module._web_search_transport_timeout(ctx) == 321
+
+
+def test_web_search_outer_envelope_covers_configured_paid_cascade(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "200")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "10")
+    monkeypatch.delenv("OUROBOROS_WEBSEARCH_BACKEND", raising=False)
+    monkeypatch.setitem(sys.modules, "ddgs", None)
+
+    [entry] = [tool for tool in search_module.get_tools() if tool.name == "web_search"]
+    assert entry.timeout_sec == 810  # Safe terminal retry + OpenRouter + Anthropic + grace.
+
+
+def test_pinned_web_search_preserves_the_legacy_outer_floor(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_BACKEND", "openrouter")
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "200")
+    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "10")
+
+    [entry] = [tool for tool in search_module.get_tools() if tool.name == "web_search"]
+    assert entry.timeout_sec == 600
+
+
 def test_web_search_falls_back_to_ddgs(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -422,11 +511,323 @@ def test_web_search_sanitizes_provider_errors(ctx, patch_env, monkeypatch):
 
     result = json.loads(_web_search(ctx, "error query"))
 
-    assert result["error"].startswith("web_search unavailable")
+    assert result["reason_code"] == "provider_outcome_unknown"
     serialized = json.dumps(result)
     assert leaked_secret not in serialized
-    assert "***REDACTED***" in serialized
-    assert any("OpenAI web search failed" in item for item in result["backend_errors"])
+    assert result["backend"] == "openai_responses"
+
+
+def test_dispatched_web_timeout_never_retries_or_cascades(ctx, patch_env, monkeypatch):
+    calls = {"openai": 0, "fallback": 0}
+
+    class _Responses:
+        def create(self, **_kwargs):
+            calls["openai"] += 1
+            raise TimeoutError("read timed out after dispatch")
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.responses = _Responses()
+
+    def forbidden(*_args, **_kwargs):
+        calls["fallback"] += 1
+        raise AssertionError("ambiguous work must not start another backend")
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+    monkeypatch.setattr(search_module, "_web_search_openrouter", forbidden)
+    monkeypatch.setattr(search_module, "_web_search_anthropic", forbidden)
+    monkeypatch.setattr(search_module, "_web_search_ddgs", forbidden)
+
+    result = json.loads(_web_search(ctx, "error query"))
+
+    assert result["reason_code"] == "provider_outcome_unknown"
+    assert calls == {"openai": 1, "fallback": 0}
+
+
+def test_connect_phase_failure_releases_attempt_and_uses_fallback(ctx, patch_env, monkeypatch):
+    import httpx
+
+    calls = {"openai": 0, "fallback": 0}
+
+    class _Responses:
+        def create(self, **_kwargs):
+            calls["openai"] += 1
+            raise httpx.ConnectError("connection refused")
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.responses = _Responses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setattr(
+        search_module,
+        "_web_search_openrouter",
+        lambda *_args, **_kwargs: calls.__setitem__("fallback", calls["fallback"] + 1)
+        or json.dumps({"answer": "fallback", "backend": "openrouter_server_tool"}),
+    )
+
+    result = json.loads(_web_search(ctx, "connect failure"))
+
+    assert result["answer"] == "fallback"
+    assert calls == {"openai": 1, "fallback": 1}
+
+
+def test_fallback_read_timeout_keeps_its_dispatched_attempt_unresolved(
+    ctx, patch_env, monkeypatch, tmp_path,
+):
+    """An exception raised in a prior-leg handler inherits that leg as context."""
+    import httpx
+    from ouroboros import usage_accounting as ua
+
+    class _Responses:
+        def create(self, **_kwargs):
+            raise httpx.ConnectError("first leg refused")
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.responses = _Responses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setitem(sys.modules, "ddgs", None)
+
+    def fallback(_ctx, *_args, **_kwargs):
+        request = ua.AttemptRequest(
+            model="openai/fallback", provider="openrouter", reservation_usd=1.0,
+            drive_root=tmp_path, task_id="fallback", root_task_id="fallback",
+            source="test.web_search",
+        )
+
+        def send():
+            raise httpx.ReadTimeout("second leg timed out after dispatch")
+
+        return ua.execute_physical_attempt(request, send)
+
+    monkeypatch.setattr(search_module, "_web_search_openrouter", fallback)
+    ctx.task_metadata["budget_drive_root"] = str(tmp_path)
+    result = json.loads(_web_search(ctx, "fallback timeout"))
+
+    assert result["reason_code"] == "provider_outcome_unknown"
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / ua.LEDGER_REL).read_text().splitlines()
+        if line.strip()
+    ]
+    final_states = {}
+    for row in rows:
+        final_states[row["attempt_id"]] = row["state"]
+    assert list(final_states.values()) == ["released", "unresolved"]
+
+
+def test_spent_owner_deadline_does_not_start_web_search(ctx, patch_env, monkeypatch):
+    calls = []
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            calls.append(_kwargs)
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    ctx.task_metadata = {"deadline_at": "2000-01-01T00:00:00Z"}
+
+    result = json.loads(_web_search(ctx, "expired query"))
+
+    assert result["reason_code"] == "deadline_exhausted"
+    assert calls == []
+
+
+def test_web_search_rechecks_owner_deadline_after_client_preparation(
+    ctx, patch_env, monkeypatch, tmp_path,
+):
+    import ouroboros.deadline_utils as deadlines
+
+    clock = [100.0]
+    monkeypatch.setattr(deadlines.time, "time", lambda: clock[0])
+    ctx.deadline_ts = 100.5
+    ctx.task_metadata = {
+        "budget_drive_root": str(tmp_path),
+        "root_task_id": "root-web-prep",
+        "parent_task_id": "parent-web-prep",
+    }
+    calls = []
+
+    class _Responses:
+        def create(self, **_kwargs):
+            calls.append("provider")
+            raise AssertionError("expired preparation must not dispatch search")
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            # Client construction stands in for a slow setup phase.
+            clock[0] = 101.0
+            self.responses = _Responses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+
+    result = json.loads(_web_search(ctx, "expired after setup"))
+
+    assert result["reason_code"] == "deadline_exhausted"
+    assert calls == []
+
+
+def _captured_provider_error(*, provider="openrouter", status=None):
+    from ouroboros.usage_accounting import PhysicalAttemptCapture
+
+    exc = RuntimeError("provider transport ended")
+    exc.physical_attempt_capture = PhysicalAttemptCapture(
+        attempt_id="attempt-1",
+        model="model-1",
+        provider=provider,
+        state="unresolved",
+        candidate_measurement_kind="opaque",
+        provider_status_code=status,
+    )
+    return exc
+
+
+def test_openrouter_ambiguous_outcome_stops_cross_provider_cascade(ctx, monkeypatch):
+    from ouroboros import llm
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.delenv("OUROBOROS_WEBSEARCH_BACKEND", raising=False)
+    monkeypatch.setattr(
+        llm, "openrouter_web_search_server_tool",
+        lambda **_kwargs: (_ for _ in ()).throw(_captured_provider_error()),
+    )
+    monkeypatch.setattr(
+        search_module, "_web_search_anthropic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambiguous OpenRouter work must stop the cascade")
+        ),
+    )
+    monkeypatch.setattr(
+        search_module, "_web_search_ddgs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambiguous OpenRouter work must stop the cascade")
+        ),
+    )
+
+    result = json.loads(_web_search(ctx, "ambiguous OpenRouter query"))
+
+    assert result["backend"] == "openrouter_server_tool"
+    assert result["reason_code"] == "provider_outcome_unknown"
+
+
+def test_anthropic_ambiguous_outcome_stops_ddgs_cascade(ctx, monkeypatch):
+    from ouroboros import llm
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.delenv("OUROBOROS_WEBSEARCH_BACKEND", raising=False)
+    monkeypatch.setattr(
+        search_module, "_web_search_openrouter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pre-dispatch")),
+    )
+    monkeypatch.setattr(
+        llm, "anthropic_web_search_server_tool",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            _captured_provider_error(provider="anthropic")
+        ),
+    )
+    monkeypatch.setattr(
+        search_module, "_web_search_ddgs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambiguous Anthropic work must stop the cascade")
+        ),
+    )
+
+    result = json.loads(_web_search(ctx, "ambiguous Anthropic query"))
+
+    assert result["backend"] == "anthropic_server_tool"
+    assert result["reason_code"] == "provider_outcome_unknown"
+
+
+def test_terminal_openrouter_status_allows_next_backend(ctx, monkeypatch):
+    from ouroboros import llm
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.delenv("OUROBOROS_WEBSEARCH_BACKEND", raising=False)
+    monkeypatch.setattr(
+        llm, "openrouter_web_search_server_tool",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            _captured_provider_error(status=503)
+        ),
+    )
+    monkeypatch.setattr(
+        search_module, "_web_search_anthropic",
+        lambda *_args, **_kwargs: json.dumps({
+            "answer": "recovered", "backend": "anthropic_server_tool",
+        }),
+    )
+
+    result = json.loads(_web_search(ctx, "terminal OpenRouter query"))
+
+    assert result == {"answer": "recovered", "backend": "anthropic_server_tool"}
+
+
+def test_explicit_web_503_allows_one_safe_retry(ctx, patch_env, monkeypatch):
+    calls = 0
+
+    class _Terminal503(Exception):
+        status_code = 503
+
+    class _Responses:
+        def create(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise _Terminal503("service unavailable")
+            return _FakeStream([
+                _make_event("response.output_text.delta", delta="recovered"),
+                _make_completed_event(),
+            ])
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.responses = _Responses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+    result = json.loads(_web_search(ctx, "retry query"))
+
+    assert calls == 2
+    assert result["answer"] == "recovered"
+
+
+def test_streamed_web_503_preserves_status_for_one_safe_retry(ctx, patch_env, monkeypatch):
+    calls = 0
+
+    class _Responses:
+        def create(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return _FakeStream([
+                    _make_event(
+                        "response.failed",
+                        error=types.SimpleNamespace(message="service unavailable", status_code=503),
+                    )
+                ])
+            return _FakeStream([
+                _make_event("response.output_text.delta", delta="recovered from event"),
+                _make_completed_event(),
+            ])
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.responses = _Responses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_Client))
+    result = json.loads(_web_search(ctx, "retry streamed failure"))
+
+    assert calls == 2
+    assert result["answer"] == "recovered from event"
 
 
 def test_streaming_no_progress_without_search_events(ctx, patch_env, mock_openai):

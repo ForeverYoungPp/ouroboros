@@ -49,9 +49,9 @@ _READ_TIMEOUT_SEC = 60.0
 # itself to (measured, 4.51s of wall against a 4.2s window, and that was a fast daemon).
 # Five seconds is a real answer from a healthy loopback daemon and a rounding error
 # against the finalization grace the clamp reserves. It bounds the READ phase only:
-# `_request` gives connect its own `_CONNECT_TIMEOUT_SEC`, so a call bounded here can
-# still cost up to ~10s of wall when the connection itself is what hangs. Passed per
-# request via ``_request(timeout_sec=...)``; it never changes the default.
+# `_request` applies the caller bound to every HTTPX phase. Strict review polls add
+# their total wall-clock bound outside this phase-local adapter.
+# Passed per request via ``_request(timeout_sec=...)``; it never changes the default.
 SHORT_POLL_TIMEOUT_SEC = 5.0
 _ATTEMPTS_REL = "attempts"
 _ATTEMPT_RECORD = "attempt.yaml"
@@ -297,15 +297,22 @@ class ClaudexorGateway:
         # ``timeout_sec`` replaces the client's read default for THIS call only, for a
         # caller that is bounding ITSELF — today every `delegate_wait` poll, each asking
         # for what its window has left, floored at ``SHORT_POLL_TIMEOUT_SEC`` and never
-        # raised above the default (``delegate_progress.poll_bound``). It sets the
-        # read/write/pool phases; connect keeps its own ``_CONNECT_TIMEOUT_SEC``, so a
-        # call bounded at five seconds is up to ~10s of wall across the two phases, and
-        # any claim about what a bound costs has to say which of the two it means.
+        # raised above the default (``delegate_progress.poll_bound``). The caller's
+        # bound applies to connect as well as read/write/pool phases. HTTPX treats
+        # these as phase-local, so strict total budgeting happens in bounded_poll.
         # Absent, the call is not passed at all rather than passed as None — httpx reads
         # an explicit ``timeout=None`` as "no timeout", which is the opposite of the
         # default it would otherwise inherit.
-        bound: Dict[str, Any] = {} if timeout_sec is None else {
-            "timeout": httpx.Timeout(float(timeout_sec), connect=_CONNECT_TIMEOUT_SEC)}
+        if timeout_sec is None:
+            bound: Dict[str, Any] = {}
+        else:
+            bounded = max(0.000001, float(timeout_sec))
+            bound = {
+                "timeout": httpx.Timeout(
+                    bounded,
+                    connect=min(_CONNECT_TIMEOUT_SEC, bounded),
+                )
+            }
         try:
             response = self._client.request(method, path, json=json_body,
                                             headers=headers or None, **bound)

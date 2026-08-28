@@ -695,8 +695,15 @@ def _run_readonly_out_of_process(
     max_turns: int,
     effort: Optional[str],
     max_budget_usd: Optional[float] = None,
+    timeout_sec: Optional[float] = None,
 ) -> ClaudeCodeResult:
     """Run advisory SDK in a child process so native aborts cannot kill workers."""
+    try:
+        child_timeout = _READONLY_CHILD_TIMEOUT_SEC if timeout_sec is None else max(
+            0.001, min(_READONLY_CHILD_TIMEOUT_SEC, float(timeout_sec))
+        )
+    except (TypeError, ValueError, OverflowError):
+        child_timeout = _READONLY_CHILD_TIMEOUT_SEC
     payload = {
         "prompt": prompt,
         "cwd": cwd,
@@ -740,12 +747,12 @@ def _run_readonly_out_of_process(
         try:
             stdout, stderr = proc.communicate(
                 input=json.dumps(payload, ensure_ascii=False),
-                timeout=_READONLY_CHILD_TIMEOUT_SEC,
+                timeout=child_timeout,
             )
         except subprocess.TimeoutExpired:
             kill_process_tree(proc)
             stdout, stderr = proc.communicate(timeout=10)
-            timeout_error = f"Claude readonly child timed out after {_READONLY_CHILD_TIMEOUT_SEC}s"
+            timeout_error = f"Claude readonly child timed out after {child_timeout}s"
             attempt, usage, plain = _parse_child_stdout(stdout)
             _settle_abandoned_child(attempt, usage, timeout_error)
             return ClaudeCodeResult(
@@ -755,7 +762,7 @@ def _run_readonly_out_of_process(
                 stderr_tail=((plain or "") + (stderr or ""))[-4000:],
             )
     except subprocess.TimeoutExpired as exc:
-        timeout_error = f"Claude readonly child timed out after {_READONLY_CHILD_TIMEOUT_SEC}s"
+        timeout_error = f"Claude readonly child timed out after {child_timeout}s"
         attempt, usage, plain = _parse_child_stdout(exc.stdout)
         _settle_abandoned_child(attempt, usage, timeout_error)
         return ClaudeCodeResult(
@@ -817,6 +824,7 @@ def run_readonly(
     max_turns: int = DEFAULT_CLAUDE_CODE_MAX_TURNS,
     effort: Optional[str] = "high",
     max_budget_usd: Optional[float] = None,
+    timeout_sec: Optional[float] = None,
 ) -> ClaudeCodeResult:
     """Synchronous read-only advisory entry point."""
     if os.environ.get("OUROBOROS_CLAUDE_READONLY_CHILD") == "1":
@@ -835,6 +843,7 @@ def run_readonly(
         max_turns=max_turns,
         effort=effort,
         max_budget_usd=max_budget_usd,
+        timeout_sec=timeout_sec,
     )
 
 
