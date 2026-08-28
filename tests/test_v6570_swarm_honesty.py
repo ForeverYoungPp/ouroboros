@@ -131,9 +131,10 @@ def test_genuine_error_still_headlines_tool_failure():
 # --- EFFORT_SCALE SSOT (1.8) -------------------------------------------------
 
 def test_effort_scale_ordered_and_includes_xhigh_max():
-    assert EFFORT_SCALE == ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+    assert EFFORT_SCALE == ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
     assert effort_rank("xhigh") > effort_rank("high")
-    assert effort_rank("max") == len(EFFORT_SCALE) - 1
+    assert effort_rank("ultra") > effort_rank("max")
+    assert effort_rank("ultra") == len(EFFORT_SCALE) - 1
     assert effort_rank("bogus") == -1
 
 
@@ -145,6 +146,7 @@ def test_clamp_effort_to_ceiling():
 
 
 def test_effort_one_step_down():
+    assert effort_one_step_down("ultra") == "max"
     assert effort_one_step_down("max") == "xhigh"
     assert effort_one_step_down("xhigh") == "high"
     assert effort_one_step_down("none") == "none"       # floor
@@ -155,6 +157,8 @@ def test_resolve_effort_accepts_xhigh_and_max(monkeypatch):
     assert resolve_effort("task") == "xhigh"
     monkeypatch.setenv("OUROBOROS_EFFORT_TASK", "max")
     assert resolve_effort("task") == "max"
+    monkeypatch.setenv("OUROBOROS_EFFORT_TASK", "ultra")
+    assert resolve_effort("task") == "ultra"
 
 
 def test_normalize_reasoning_effort_uses_scale():
@@ -162,6 +166,7 @@ def test_normalize_reasoning_effort_uses_scale():
 
     assert normalize_reasoning_effort("max") == "max"
     assert normalize_reasoning_effort("xhigh") == "xhigh"
+    assert normalize_reasoning_effort("ultra") == "ultra"
     assert normalize_reasoning_effort("bogus") == "medium"
 
 

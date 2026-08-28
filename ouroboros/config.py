@@ -449,10 +449,10 @@ def get_consciousness_model() -> str:
     """Return the high-horizon background-consciousness model slot."""
     return str(os.environ.get("OUROBOROS_MODEL_CONSCIOUSNESS", "") or "").strip() or _main_model()
 
-# v6.57.0 — EFFORT_SCALE: ORDERED reasoning-effort SSOT (low→high), the single place a tier
-# is defined (settings, llm.py builder, switch_model enum, subagent lanes). Exact-route
-# request-wire recovery, not legacy model-global evidence, owns provider adaptation.
-EFFORT_SCALE: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# v6.57.0 — EFFORT_SCALE: ORDERED reasoning-effort SSOT (low→high), the single place a tier is
+# defined (settings, llm.py builder, switch_model enum, subagent lanes). `ultra` = the codex
+# vendor tier above `max`; above-ceiling tiers adapt per route (API wire recovery / delegated).
+EFFORT_SCALE: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
 
 def effort_rank(value: str) -> int:

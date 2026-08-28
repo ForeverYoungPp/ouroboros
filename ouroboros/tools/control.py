@@ -2945,6 +2945,8 @@ _PROMOTE_CHAT_DESCRIPTION = (
 
 
 def get_tools() -> List[ToolEntry]:
+    from ouroboros.config import EFFORT_SCALE
+
     return [
         ToolEntry("set_tool_timeout", {
             "name": "set_tool_timeout",
@@ -3179,7 +3181,7 @@ def get_tools() -> List[ToolEntry]:
                            "or want to save budget (simple tasks). Takes effect on next round.",
             "parameters": {"type": "object", "properties": {
                 "model": {"type": "string", "description": "Model name (e.g. anthropic/claude-sonnet-4). Leave empty to keep current."},
-                "effort": {"type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                "effort": {"type": "string", "enum": list(EFFORT_SCALE),
                            "description": "Reasoning effort level (clamped to the model's real ceiling). Leave empty to keep current."},
             }, "required": []},
         }, _switch_model),

@@ -478,7 +478,7 @@ def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
         from ouroboros.config import EFFORT_SCALE as _SCALE
         allowed = set(_SCALE)
     except Exception:
-        allowed = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+        allowed = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
     v = str(value or "").strip().lower()
     return v if v in allowed else default
 
