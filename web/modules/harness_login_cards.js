@@ -790,16 +790,6 @@ export function createLoginCardController({
         ? store.subscribe(() => { if (ctl.active?.preparingRuntime) render(); })
         : () => {};
 
-    function currentFamilyLabel(harness) {
-        // The store deliberately retains its last snapshot across a failed
-        // read. That snapshot keeps controls usable, but its display_name is
-        // not current catalog evidence. Use it only after a proven catalog
-        // read; otherwise the shared presentation catalog is the safe label.
-        return familyLabel(harness, store?.snapshot || null, {
-            catalogKnown: Boolean(store?.catalogKnown),
-        }) || String(harness || '');
-    }
-
     function render() {
         const hostEl = getHost();
         if (!hostEl) return;

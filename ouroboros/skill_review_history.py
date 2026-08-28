@@ -282,6 +282,18 @@ def _ordinal(value: Any, default: int = 0) -> int:
         return default
 
 
+def _normalize_bounded_ordinals(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize stored ordinals when a bounded read cannot derive them."""
+    normalized = dict(record)
+    for key in ("review_round", "snapshot_attempt"):
+        try:
+            normalized[key] = max(0, int(record.get(key)))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    normalized["snapshot_revised"] = bool(record.get("snapshot_revised"))
+    return normalized
+
+
 def normalize_history(entries: List[Dict[str, Any]], skill_name: str) -> List[Dict[str, Any]]:
     """Add read-time ordinals to legacy rows without rewriting the audit log."""
     group_rounds: Dict[str, int] = {}
@@ -400,7 +412,10 @@ def find_history_job_bounded(
         if projection_incomplete and any(key not in source_record for key in ordinal_fields):
             return None, "unavailable"
         if projection_incomplete:
-            return dict(source_record), "found"
+            normalized = _normalize_bounded_ordinals(source_record)
+            if normalized is None:
+                return None, "unavailable"
+            return normalized, "found"
         normalized = normalize_history([
             _merge_marker_facts(
                 row,

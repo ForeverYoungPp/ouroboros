@@ -531,6 +531,29 @@ def test_review_history_detail_reads_stored_ordinals_from_truncated_windows(
     assert "(attempt 33)" in resp.json()["markdown"]
 
 
+def test_review_history_detail_rejects_malformed_ordinals_from_truncated_window(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import skill_review_history
+
+    client, drive_root = _detail_client(tmp_path)
+    path = _history_path(drive_root, "alpha")
+    append_jsonl(path, _terminal_record(job_id="old", raw_actor_records=[], padding="x" * 3000))
+    append_jsonl(path, _terminal_record(
+        job_id="skill-job-malformed", raw_actor_records=[],
+        review_round="not-a-number", snapshot_attempt="not-a-number",
+    ))
+    monkeypatch.setattr(skill_review_history, "_DETAIL_LOOKUP_MAX_BYTES", 2048)
+    monkeypatch.setattr(skill_review_history, "_DETAIL_LOOKUP_MAX_RECORDS", 1)
+
+    resp = client.get("/api/skills/alpha/review-history/skill-job-malformed")
+
+    assert resp.status_code == 404
+    assert resp.json()["error"] == (
+        "review record unavailable outside the bounded history window"
+    )
+
+
 @pytest.mark.parametrize("stored_ordinals", [False, True])
 def test_bounded_detail_record_window_never_invents_legacy_ordinals(
     tmp_path, monkeypatch, stored_ordinals,

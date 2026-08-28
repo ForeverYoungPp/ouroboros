@@ -83,3 +83,21 @@ def test_grouped_skill_attempts_preserve_legacy_text_initiator_and_supersession(
     assert attempts[0]["text"] == "legacy jobless terminal review text"
     assert [attempt["superseded"] for attempt in attempts] == [True, False]
     assert attempts[0]["executions"] == [{"kind": "api", "model": "m1"}]
+
+
+def test_grouped_skill_attempts_coerce_malformed_ordinals_without_raising():
+    base = {
+        "is_progress": False, "system_type": "skill_review", "skill": "alpha",
+        "group_id": "task:root:alpha", "presentation_owner_task_id": "root",
+    }
+    folded = _fold_task_bound_skill_reviews([{
+        **base,
+        "ts": "2026-08-25T00:00:00Z",
+        "job_id": "job-malformed",
+        "review_round": "not-a-number",
+        "snapshot_attempt": "not-a-number",
+    }])
+
+    attempt = folded[0]["review_group"]["attempts"][0]
+    assert attempt["review_round"] == 0
+    assert attempt["snapshot_attempt"] == 0

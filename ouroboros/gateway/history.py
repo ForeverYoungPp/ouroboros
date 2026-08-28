@@ -13,11 +13,15 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
-from ouroboros.gateway._helpers import _TAIL_WINDOW_START_BYTES, read_rotated_jsonl_entries
-from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
-from ouroboros.task_results import TASK_COST_META_FIELDS as _TASK_COST_META_FIELDS
-from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, subagent_message_meta
+from ouroboros.gateway._helpers import (
+    _TAIL_WINDOW_START_BYTES,
+    coerce_int,
+    read_rotated_jsonl_entries,
+)
 from ouroboros.outcomes import normalize_outcome_axes
+from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
+from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, subagent_message_meta
+from ouroboros.task_results import TASK_COST_META_FIELDS as _TASK_COST_META_FIELDS
 from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -859,10 +863,7 @@ def _collect_chat_rows(
                 for key in _SKILL_REVIEW_STRING_FIELDS:
                     rec[key] = str(entry.get(key, "") or "")
                 for key in _SKILL_REVIEW_INT_FIELDS:
-                    try:
-                        rec[key] = int(entry.get(key) or 0)
-                    except (TypeError, ValueError):
-                        rec[key] = 0
+                    rec[key] = coerce_int(entry.get(key), 0)
                 for key in _SKILL_REVIEW_BOOL_FIELDS:
                     rec[key] = bool(entry.get(key))
                 rec["executions"] = _review_executions(entry.get("executions"))
@@ -1048,7 +1049,7 @@ def _fold_task_bound_skill_reviews(combined: list[Dict[str, Any]]) -> list[Dict[
                     attempt[key] = str(row.get(key) or "")
             for key in _SKILL_REVIEW_INT_FIELDS:
                 if key in row:
-                    attempt[key] = int(row.get(key) or 0)
+                    attempt[key] = coerce_int(row.get(key), 0)
             for key in _SKILL_REVIEW_BOOL_FIELDS:
                 if key in row:
                     attempt[key] = bool(row.get(key))
