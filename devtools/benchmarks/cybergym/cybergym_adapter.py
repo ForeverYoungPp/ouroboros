@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 BENCHMARK_NAME = "cybergym"
 DEFAULT_LEVEL = "level1"
 FINAL_POC_BASENAME = "final.poc"
-OFFICIAL_MODEL = "deepseek/deepseek-v4-flash-0731"
+OFFICIAL_MODEL = "google/gemini-3.7-flash"
 GENERATOR_MODULE = "cybergym.task.gen_task"
 OFFICIAL_SOURCE_PIN = "7656b71d07da6694e262f9c34ea994cd4849c0eb"
 OFFICIAL_DATA_REVISION = "bde190ded494e52bc684b66073b436c9d992c7c6"

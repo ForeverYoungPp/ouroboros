@@ -977,12 +977,12 @@ def test_served_telemetry_prefers_authoritative_trace_refs_over_requested_fields
         "reasoning_effort": "high",
         "trace_refs": {
             "llm_call_refs": [
-                {"resolved_model": "deepseek/deepseek-v4-flash-0731", "provider": "provider-a"}
+                {"resolved_model": "google/gemini-3.7-flash", "provider": "provider-a"}
             ]
         },
     }
     observed = _served_telemetry(payload)
-    assert observed["observed_model"] == "deepseek/deepseek-v4-flash-0731"
+    assert observed["observed_model"] == "google/gemini-3.7-flash"
     assert observed["observed_provider"] == "provider-a"
     assert observed["trace_call_count"] == 1
     assert observed["effort_source"] == "runtime_requested_field"
@@ -1051,7 +1051,7 @@ def test_served_telemetry_reads_verified_response_wire_effort(tmp_path):
                 "llm_call_refs": [
                     {
                         "llm_call_id": "llm-1",
-                        "resolved_model": "deepseek/deepseek-v4-flash-0731",
+                        "resolved_model": "google/gemini-3.7-flash",
                         "provider": "provider-a",
                         "response_ref": manifest_ref,
                     }

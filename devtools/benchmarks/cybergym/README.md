@@ -120,7 +120,7 @@ The important distinction is the OpenRouter provider object:
   dated-model mismatch is a hard failure.
 
 The template pins every model slot to
-`deepseek/deepseek-v4-flash-0731`, including the canonical Available-subagents
+`google/gemini-3.7-flash`, including the canonical Available-subagents
 row and API-only reviewer slots.  The applied measured cohort explicitly
 disables that actor list; the template keeps it available for review/copying.
 The Claude Agent SDK transport names are explicit empty/inactive fields rather

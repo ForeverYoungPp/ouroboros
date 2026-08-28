@@ -2136,7 +2136,7 @@ class CyberGymExecutor:
                 "limit_remaining": remaining,
             }
         body = {
-            "model": "deepseek/deepseek-v4-flash-0731",
+            "model": _EXPECTED_MODEL,
             "messages": [{"role": "user", "content": "Reply with OK."}],
             "max_tokens": 1,
             "temperature": 0,

@@ -99,7 +99,7 @@ def test_pre_admission_is_pure_and_fail_closed(tmp_path):
         settings_path=tmp_path / "settings.json",
         require_settings=True,
         server_url="http://cybergym-internal:8666",
-        model="deepseek/deepseek-v4-flash-0731",
+        model="google/gemini-3.7-flash",
     )
     assert report["ok"]
     assert not (tmp_path / "out").exists()

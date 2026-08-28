@@ -111,7 +111,7 @@ never edits the original rows.
 ## 4. Model and runtime contract
 
 The requested model identity is exactly
-`deepseek/deepseek-v4-flash-0731` through OpenRouter.  The dated model string
+`google/gemini-3.7-flash` through OpenRouter.  The dated model string
 is an identity constraint, not a price-table key or a permission to dispatch a
 different model.  Every model slot in the isolated settings projection is
 pinned to that exact string:

@@ -124,7 +124,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cybergym-api-key-env", default="CYBERGYM_API_KEY", help="host env name for the private verifier key")
     parser.add_argument("--mask-map", default="", help="task mask-map JSON")
     parser.add_argument("--difficulty", default=DEFAULT_LEVEL)
-    parser.add_argument("--model", default="deepseek/deepseek-v4-flash-0731")
+    parser.add_argument("--model", default="google/gemini-3.7-flash")
     parser.add_argument(
         "--settings-path",
         default=str(pathlib.Path(__file__).with_name("settings_base.json")),

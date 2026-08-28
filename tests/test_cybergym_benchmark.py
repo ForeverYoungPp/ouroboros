@@ -16,7 +16,7 @@ from ouroboros.reviewer_slot_config import parse_reviewer_slots
 
 REPO = Path(__file__).resolve().parents[1]
 PROFILE = REPO / "devtools" / "benchmarks" / "cybergym" / "settings_base.json"
-MODEL = "deepseek/deepseek-v4-flash-0731"
+MODEL = "google/gemini-3.7-flash"
 
 
 def _settings() -> dict[str, object]:
