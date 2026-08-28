@@ -78,7 +78,7 @@ def test_terminalization_retry_restore_survives_durable_result_until_event_publi
     """A durable outcome must not discard its still-unpublished terminal event."""
     from ouroboros.task_results import STATUS_FAILED, load_task_result, write_task_result
     from ouroboros.utils import utc_now_iso
-    from supervisor import queue, workers
+    from supervisor import queue, state, workers
 
     pending, running = [], {}
     counter = {"value": 0}
@@ -122,6 +122,18 @@ def test_terminalization_retry_restore_survives_durable_result_until_event_publi
     assert pending[0]["_terminalization_retry"]["status"] == STATUS_FAILED
 
     writes, emitted = [], []
+    delivered = []
+    worker = SimpleNamespace(
+        wid=1,
+        busy_task_id=None,
+        reaping=False,
+        in_q=SimpleNamespace(put=lambda row: delivered.append(row)),
+    )
+    monkeypatch.setattr(workers, "WORKERS", {1: worker})
+    monkeypatch.setattr(workers, "load_state", lambda: {})
+    monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 100.0)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    queue.BUDGET_ROOT_FENCES.clear()
     monkeypatch.setattr(workers, "_audit_delegate_terminal_custody", lambda *a, **k: None)
     monkeypatch.setattr(
         workers,
@@ -135,11 +147,14 @@ def test_terminalization_retry_restore_survives_durable_result_until_event_publi
         lambda task_row, tid, status: emitted.append((tid, status)) or next(publish_results),
     )
 
-    # A failed publication keeps custody; the next retry removes it only after success.
-    assert workers._retry_terminalization_pending() == ([], [task_id])
+    # A failed publication keeps custody; assign_tasks must not drop the row
+    # merely because its outcome is already terminal.
+    workers.assign_tasks()
     assert [row["id"] for row in pending] == [task_id]
-    assert workers._retry_terminalization_pending() == ([task_id], [])
+    assert delivered == []
+    workers.assign_tasks()
     assert pending == []
+    assert worker.busy_task_id is None
     assert writes[0][0] == writes[1][0] == task_id
     assert emitted == [(task_id, STATUS_FAILED), (task_id, STATUS_FAILED)]
     assert load_task_result(tmp_path, task_id)["status"] == STATUS_FAILED

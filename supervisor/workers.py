@@ -2837,7 +2837,7 @@ def _drop_cancelled_pending() -> None:
             _emit_task_done_terminal(t, tid, stored_status, cost_fields=cost_fields)
             dropped.append(tid)
             continue
-        if status in _TRULY_TERMINAL_STATUSES:
+        if status in _TRULY_TERMINAL_STATUSES and _terminalization_retry_spec(t) is None:
             dropped.append(tid)
             continue
         survivors.append(t)
