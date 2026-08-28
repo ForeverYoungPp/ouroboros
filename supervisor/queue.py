@@ -32,13 +32,15 @@ from ouroboros.schedule_contract import RESERVED_TEMPLATE_FIELDS, schedule_slug
 from ouroboros.skill_loader import skill_identity_collision_names
 from ouroboros.outcomes import terminal_outcome_axes
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
-from supervisor.evolution_lifecycle import (
+from supervisor.evolution_lifecycle import (  # noqa: F401 -- public queue API and lazy scheduler dependencies
+    _deliver_pending_owner_report,
     _read_evolution_campaign,
     begin_evolution_transaction,
     build_evolution_task_text,
     disable_evolution_authority,
     disable_evolution_projection,
     deliver_pending_owner_report,
+    enqueue_evolution_task_if_needed,
     evolution_block_reason,
     notify_owner_cycle_outcome,
     pause_evolution_campaign,
@@ -46,7 +48,7 @@ from supervisor.evolution_lifecycle import (
 )
 from supervisor.task_lifecycle import (  # noqa: F401 -- public queue API re-exports
     BUDGET_ROOT_FENCES, apply_budget_root_admission_fence, cancel_task_by_id,
-    clear_acceptance_fence_for_root, record_scheduled_admission,
+    clear_acceptance_fence_for_root,
     resume_budget_paused_task, restore_queue_fences, transition_acceptance_fence,
 )
 from supervisor.cognitive_operations import _active_operation_progressing
@@ -141,7 +143,10 @@ _queue_lock = threading.RLock()
 _last_skill_schedule_sync: float = 0.0
 _SKILL_SCHEDULE_SYNC_INTERVAL_SEC: float = 60.0
 from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
-    coerce_queue_order, prefer_terminalization_retry_rows, reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission, restore_terminalization_retry, restore_terminalization_retry_rows, reserve_task_admission,
+    coerce_queue_order, prefer_terminalization_retry_rows, record_scheduled_admission,
+    reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission,
+    restore_terminalization_retry, restore_terminalization_retry_rows,
+    reserve_task_admission,
 )
 # Variant A off-loop worker reaper lives in supervisor/task_reaper.py (module size); re-export
 # the thin names the enforce path and tests use — monkeypatching these queue names still works.
@@ -1580,120 +1585,3 @@ def get_evolution_status_snapshot(*, budget_projection: Optional[Dict[str, Any]]
         "queued_task_id": str((queued_task or {}).get("id") or ""),
         "running_task_id": str((running_task or {}).get("id") or ""),
     }
-
-
-def _deliver_pending_owner_report() -> None:
-    deliver_pending_owner_report(notify_owner_cycle_outcome)
-
-
-def enqueue_evolution_task_if_needed() -> None:
-    """Queue evolution only when idle, enabled, within budget, and not failure-paused."""
-    _deliver_pending_owner_report()
-    if PENDING or RUNNING:
-        return
-    st = load_state()
-    if not bool(st.get("evolution_mode_enabled")):
-        return
-    owner_chat_id = st.get("owner_chat_id")
-    if not owner_chat_id:
-        return
-    campaign = _read_evolution_campaign()
-    from supervisor.state import update_state
-    has_authority = all(str(campaign.get(key) or "").strip() for key in ("id", "source"))
-    if campaign.get("status") != "active" or not has_authority:
-        disable_evolution_authority("bare_flag_disabled", campaign_id=str(campaign.get("id") or ""))
-        send_with_budget(
-            int(owner_chat_id),
-            "🧬 Evolution stayed off: the enable flag had no active campaign authority. Use /evolve start to begin a fresh campaign.",
-        )
-        return
-    active_tx = campaign.get("active_transaction") if isinstance(campaign.get("active_transaction"), dict) else {}
-    if active_tx and (
-        str(active_tx.get("commit_sha") or "").strip()
-        or str(active_tx.get("dispatch_status") or "") == "reaping"
-    ):
-        return
-
-    # Defensive net: light mode must never run evolution even if the flag was
-    # left enabled (e.g. carried across a restart into light mode). Disable and
-    # pause once; entry points already refuse new starts up front.
-    block = evolution_block_reason()
-    if block:
-        pause_evolution_campaign("blocked in light runtime mode")
-        disable_evolution_projection()
-        send_with_budget(int(owner_chat_id), block)
-        return
-
-    consecutive_failures = int(st.get("evolution_consecutive_failures") or 0)
-    if consecutive_failures >= 3:
-        pause_evolution_campaign("paused after consecutive failures")
-        disable_evolution_projection()
-        send_with_budget(
-            int(owner_chat_id),
-            f"🧬⚠️ Evolution paused: {consecutive_failures} consecutive failures. "
-            f"Use /evolve start to resume after investigating the issue."
-        )
-        return
-
-    # BUG3: pause if the SAME objective has been re-proposed and no-op'd OBJECTIVE_REPEAT_CAP
-    # times without ever absorbing. This is a SEPARATE breaker from consecutive_failures
-    # above: that counter is reset to 0 by ANY non-failing cycle (events.py), so it cannot
-    # catch a self-maintenance loop where a blocked objective is re-proposed NON-consecutively
-    # (interleaved with other no_op work). The per-objective count is keyed on the same
-    # canonical fingerprint the transaction stamps, accumulates across non-consecutive
-    # recurrence, and is cleared only on a genuine absorb.
-    from ouroboros.evolution_fingerprint import canonical_objective_fingerprint
-
-    _objective_repeat_counts = campaign.get("objective_repeat_counts") or {}
-    _active_objective_fp = canonical_objective_fingerprint(str(campaign.get("objective") or ""))
-    _objective_repeats = int(_objective_repeat_counts.get(_active_objective_fp, 0)) if _active_objective_fp else 0
-    if _objective_repeats >= OBJECTIVE_REPEAT_CAP:
-        pause_evolution_campaign("paused: objective re-proposed without ever absorbing")
-        disable_evolution_projection()
-        send_with_budget(
-            int(owner_chat_id),
-            f"🧬⚠️ Evolution paused: the current objective ran {_objective_repeats} reviewed "
-            f"cycles WITHOUT ever being absorbed — it keeps getting re-proposed and never lands "
-            f"(a self-maintenance loop, not progress). A plain resume won't help; use "
-            f"/evolve start with a DIFFERENT objective."
-        )
-        return
-
-    try:
-        remaining = budget_remaining(st, strict=True)
-    except Exception:
-        log.error("Evolution scheduling deferred: cost accounting unavailable", exc_info=True)
-        append_jsonl(DRIVE_ROOT / "logs" / "events.jsonl", {
-            "ts": utc_now_iso(), "type": "evolution_accounting_unavailable",
-            "action": "dispatch_deferred", "owner_visible": True,
-        })
-        return
-    if remaining < EVOLUTION_BUDGET_RESERVE:
-        pause_evolution_campaign("budget reserve reached")
-        disable_evolution_projection()
-        send_with_budget(int(owner_chat_id), f"💸 Evolution stopped: ${remaining:.2f} remaining (reserve ${EVOLUTION_BUDGET_RESERVE:.0f} for conversations).")
-        return
-    cycle = int(st.get("evolution_cycle") or 0) + 1
-    tid = uuid.uuid4().hex[:8]
-    transaction = begin_evolution_transaction(tid, cycle=cycle, campaign=campaign)
-    if not transaction:
-        disable_evolution_authority("transaction_attach_failed", campaign_id=str(campaign.get("id") or ""), task_id=tid)
-        send_with_budget(
-            int(owner_chat_id),
-            "🧬 Evolution stayed off: the campaign changed before its next task could be attached. Start it again when ready.",
-        )
-        return
-    task = {
-        "id": tid, "type": "evolution",
-        "chat_id": int(owner_chat_id),
-        "text": build_evolution_task_text(cycle),
-        "metadata": {"evolution_transaction": transaction},
-    }
-    attach_task_contract(task)
-    enqueue_task(task)
-
-    def _record_cycle(live: Dict[str, Any]) -> None:
-        live["evolution_cycle"] = cycle
-        live["last_evolution_task_at"] = utc_now_iso()
-
-    update_state(_record_cycle)

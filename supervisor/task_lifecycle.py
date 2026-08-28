@@ -32,6 +32,8 @@ from supervisor.cancel_publication import (  # noqa: F401 -- intentional public 
     _cancel_result_fields,
     _cascade_delivery_row_locked,
     _deliver_on_miss,
+    _finalize_cancel_intent_on_miss,
+    _intent_outcome_fields,
     _is_workspace_task_record,
     _load_result_row,
     _publish_cancelled_task,
@@ -228,262 +230,6 @@ def _queue_module():
     return queue
 
 
-def record_scheduled_admission(
-    task: Dict[str, Any], admitted: Any, record: Dict[str, Any],
-) -> None:
-    """Project a cron dispatch refusal into terminal task/schedule state."""
-    q = _queue_module()
-    block = (
-        str(admitted.get("_admission_blocked") or "")
-        if isinstance(admitted, dict)
-        else ""
-    )
-    if not block:
-        record["failure_count"] = int(record.get("failure_count") or 0)
-        record["last_error"] = ""
-        return
-    detail = f"Scheduled task was not queued: {block}."
-    try:
-        from ouroboros.task_results import STATUS_FAILED, write_task_result
-
-        write_task_result(
-            q.DRIVE_ROOT,
-            str(task["id"]),
-            STATUS_FAILED,
-            result=detail,
-            reason_code=block,
-            cost_usd=0.0,
-        )
-    except Exception:
-        q.log.warning(
-            "Failed to terminalize admission-blocked scheduled task %s",
-            task.get("id"),
-            exc_info=True,
-        )
-    record["failure_count"] = int(record.get("failure_count") or 0) + 1
-    record["last_error"] = detail
-
-
-def task_subtree_is_live(task_id: str, *, ignore_intents: bool = False) -> bool:
-    """Cheap liveness pre-check for the HTTP cascade-cancel path (v6.82).
-
-    True when the task itself is queued/running, when it still has live
-    descendants in the queue, or when it holds an ACTIVE durable cancel intent
-    (or the legacy ``cancel_requested`` status latch of pre-redesign files) —
-    the intent's settle still has honest work to do. Everything else is
-    inactive and must keep today's 404 contract.
-
-    ``ignore_intents=True`` is the PHYSICAL variant for the cascade
-    postcondition (GR2-1e): the root's own cascade intent now survives until
-    that postcondition passes, so the postcondition must judge queue/durable
-    liveness only — counting the coordination intent itself would make the
-    check circular and the cascade unable to ever report success.
-    """
-    q = _queue_module()
-    task_id = str(task_id or "").strip()
-    if not task_id:
-        return False
-    with q._queue_lock:
-        self_running = task_id in q.RUNNING
-        self_pending = any(
-            isinstance(task, dict) and str(task.get("id") or "") == task_id
-            for task in q.PENDING
-        )
-        descendants = [
-            str(row.get("task_id") or "")
-            for row in _live_descendants_locked(q, task_id, exclude_task_id=task_id)
-        ]
-    if self_pending:
-        return True
-    # A row whose DURABLE result already settled is a worker winding down, not
-    # live work: its own finalizer owns the removal, and counting it as live would
-    # make a cascade fail its postcondition and answer 503 for the documented
-    # natural-completion race. The durable reads happen OUTSIDE the queue lock.
-    if self_running and not _durable_settled_status(q, task_id):
-        return True
-    if any(tid and not _durable_settled_status(q, tid) for tid in descendants):
-        return True
-    if ignore_intents:
-        return False
-    try:
-        from ouroboros.cancel_intents import has_active_intent
-        from ouroboros.task_results import STATUS_CANCEL_REQUESTED, load_task_result
-
-        if has_active_intent(q.DRIVE_ROOT, task_id):
-            return True
-        existing = load_task_result(q.DRIVE_ROOT, task_id) or {}
-        return str(existing.get("status") or "") == STATUS_CANCEL_REQUESTED
-    except Exception:
-        return False
-
-
-def _live_retry_target_locked(q: Any, task_id: str) -> Tuple[str, str]:
-    """Resolve an old root id to its one validated live retry leaf.
-
-    A live row is not lineage authority by itself: ingress fields can be stale
-    or malformed, and choosing one of several candidates would let a cancel
-    intent settle against the wrong physical task.  Follow the reciprocal
-    host-written result chain (old points to new; new points back to old), then
-    require the live task row to satisfy the existing root-retry contract.
-    Corrupt, overlong, cyclic, or ambiguous chains raise so custody leaves the
-    intent open and fails closed.
-    """
-    requested = str(task_id or "").strip()
-    if not requested:
-        return requested, ""
-    live_rows: list[Dict[str, Any]] = [
-        row for row in q.PENDING if isinstance(row, dict)
-    ]
-    live_rows.extend(
-        meta["task"]
-        for meta in q.RUNNING.values()
-        if isinstance(meta, dict) and isinstance(meta.get("task"), dict)
-    )
-    live_by_id = {
-        str(row.get("id") or ""): row
-        for row in live_rows
-        if str(row.get("id") or "")
-    }
-
-    from ouroboros.task_results import load_task_result, resolve_task_lineage
-
-    requested_result = load_task_result(q.DRIVE_ROOT, requested, strict=True)
-    requested_shape = (
-        requested_result
-        if isinstance(requested_result, dict)
-        else live_by_id.get(requested, {})
-    )
-    requested_lineage = resolve_task_lineage(
-        requested,
-        metadata=requested_shape.get("metadata"),
-        root_task_id=requested_shape.get("root_task_id"),
-        parent_task_id=requested_shape.get("parent_task_id"),
-        delegation_role=requested_shape.get("delegation_role"),
-        original_task_id=requested_shape.get("original_task_id"),
-        timeout_retry_from=requested_shape.get("timeout_retry_from"),
-    )
-    if not requested_lineage.get("is_root_task"):
-        # Retry aliases exist only for top-level root attempts.  A subagent or
-        # other descendant is already a physical id; scanning root-shaped rows
-        # from its wider tree would misclassify an unrelated root retry as this
-        # child's successor and block cascade custody.
-        return requested, ""
-
-    chain_predecessor: Dict[str, str] = {}
-    current_id = requested
-    seen = {requested}
-    try:
-        max_edges = max(0, int(getattr(q, "QUEUE_MAX_RETRIES", 0) or 0))
-    except (TypeError, ValueError, OverflowError):
-        max_edges = 0
-    logical_root = requested
-    while True:
-        current = load_task_result(q.DRIVE_ROOT, current_id, strict=True) or {}
-        if current_id == requested:
-            logical_root = str(current.get("root_task_id") or requested)
-        superseded_by = str(current.get("superseded_by") or "").strip()
-        retry_task_id = str(current.get("retry_task_id") or "").strip()
-        # Subagent/evolution timeout retries intentionally reuse the exact id.
-        # Their result carries retry_task_id=self as attempt metadata, not as a
-        # physical lineage edge.
-        if not superseded_by and retry_task_id == current_id:
-            break
-        if not superseded_by and not retry_task_id:
-            break
-        if not superseded_by or superseded_by != retry_task_id:
-            raise RuntimeError(
-                f"timeout retry lineage from {current_id} is not reciprocal"
-            )
-        if len(chain_predecessor) >= max_edges:
-            raise RuntimeError(
-                f"timeout retry lineage from {requested} exceeds retry authority"
-            )
-        successor_id = superseded_by
-        if successor_id in seen:
-            raise RuntimeError(
-                f"timeout retry lineage from {requested} contains a cycle"
-            )
-        successor = load_task_result(q.DRIVE_ROOT, successor_id, strict=True) or {}
-        if (
-            str(successor.get("supersedes_task_id") or "") != current_id
-            or str(successor.get("original_task_id") or "") != current_id
-            or str(successor.get("timeout_retry_from") or "") != current_id
-        ):
-            raise RuntimeError(
-                f"timeout retry lineage {current_id} -> {successor_id} is incomplete"
-            )
-        chain_predecessor[successor_id] = current_id
-        seen.add(successor_id)
-        current_id = successor_id
-
-    relevant_live: list[str] = []
-    if requested in live_by_id:
-        relevant_live.append(requested)
-    for candidate_id, predecessor_id in chain_predecessor.items():
-        row = live_by_id.get(candidate_id)
-        if row is None:
-            continue
-        lineage = resolve_task_lineage(
-            candidate_id,
-            metadata=row.get("metadata"),
-            root_task_id=row.get("root_task_id"),
-            parent_task_id=row.get("parent_task_id"),
-            delegation_role=row.get("delegation_role"),
-            original_task_id=row.get("original_task_id"),
-            timeout_retry_from=row.get("timeout_retry_from"),
-        )
-        if (
-            not lineage.get("is_retry_root_attempt")
-            or str(lineage.get("root_task_id") or "") != logical_root
-            or str(lineage.get("original_task_id") or "") != predecessor_id
-            or str(lineage.get("timeout_retry_from") or "") != predecessor_id
-        ):
-            raise RuntimeError(
-                f"live timeout retry {candidate_id} fails root-lineage validation"
-            )
-        relevant_live.append(candidate_id)
-
-    # A root-shaped live retry under the same logical root but outside the
-    # reciprocal chain is authority corruption, not an ignorable bystander.
-    for candidate_id, row in live_by_id.items():
-        if candidate_id == requested or candidate_id in chain_predecessor:
-            continue
-        lineage = resolve_task_lineage(
-            candidate_id,
-            metadata=row.get("metadata"),
-            root_task_id=row.get("root_task_id"),
-            parent_task_id=row.get("parent_task_id"),
-            delegation_role=row.get("delegation_role"),
-            original_task_id=row.get("original_task_id"),
-            timeout_retry_from=row.get("timeout_retry_from"),
-        )
-        if (
-            lineage.get("is_retry_root_attempt")
-            and str(lineage.get("root_task_id") or "") == logical_root
-        ):
-            raise RuntimeError(
-                f"live timeout retry {candidate_id} is outside the durable chain"
-            )
-
-    if len(relevant_live) > 1:
-        raise RuntimeError(
-            f"multiple live timeout attempts resolve from {requested}: "
-            f"{', '.join(relevant_live)}"
-        )
-    if relevant_live:
-        return relevant_live[0], ""
-    if chain_predecessor:
-        from ouroboros.task_status import SETTLED_STATUSES
-
-        leaf_status = str(
-            (load_task_result(q.DRIVE_ROOT, current_id, strict=True) or {}).get("status")
-            or ""
-        )
-        if leaf_status in SETTLED_STATUSES:
-            return current_id, leaf_status
-    return requested, ""
-
-
 def cancel_task_by_id(task_id: str, *, cascade: bool = False) -> bool:
     """Cancel a task and, when requested, its atomically captured live subtree.
 
@@ -585,7 +331,10 @@ def cancel_task_by_id(task_id: str, *, cascade: bool = False) -> bool:
         # against the CURRENT durable status — only a genuinely-unsettled
         # refusal vetoes a converged tree; a stale one must not turn a settled
         # subtree into a skipped summary and a 503.
-        failed = {tid for tid in failed if tid and not _durable_settled_status(q, tid)}
+        failed = {
+            tid for tid in failed
+            if tid and not _settled_status(q.DRIVE_ROOT, tid)
+        }
         if failed or still_live:
             log.error(
                 "Subtree cancellation for %s did not settle (failed=%s, still_live=%s)",
@@ -733,19 +482,6 @@ def _record_cascade_scope(q: Any, task_id: str) -> None:
             log.debug("cascade-scope forensic append failed for %s", task_id, exc_info=True)
 
 
-def _durable_settled_status(q: Any, task_id: str) -> str:
-    """The task's own already-settled outcome, or "" — read once, off the hot path."""
-    try:
-        from ouroboros.task_results import load_task_result
-        from ouroboros.task_status import SETTLED_STATUSES
-
-        status = str((load_task_result(q.DRIVE_ROOT, task_id) or {}).get("status") or "")
-        return status if status in SETTLED_STATUSES else ""
-    except Exception:
-        log.debug("Could not read durable status for %s", task_id, exc_info=True)
-        return ""
-
-
 def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
     """Cancel one task and return a TYPED outcome, never a bare boolean.
 
@@ -854,7 +590,7 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
     captured_worker = None
     captured_meta = None
     with q._queue_lock:
-        settled = _durable_settled_status(q, task_id)
+        settled = _settled_status(q.DRIVE_ROOT, task_id)
         if settled:
             # Natural completion (or an earlier cancel) already decided this task.
             # A QUEUED row for a task with a terminal result is a ghost and is
@@ -955,7 +691,7 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
                 task_id, captured_worker, captured_meta or {},
                 intent=intent, deliver=deliver, settled_status=settled,
             )
-        return _finalize_cancel_intent_on_miss(task_id, intent=intent)
+        return _finalize_cancel_intent_on_miss(q, task_id, intent=intent)
     except Exception:
         # A crash BETWEEN the capture and the respawn is what strands a slot at
         # ``reaping`` forever (the reaper's step-5 self-heal has the same
@@ -1250,18 +986,6 @@ def _release_intent_claim(
         )
     except Exception:
         log.debug("cancel-intent claim release failed for %s", task_id, exc_info=True)
-
-
-def _intent_outcome_fields(intent: Dict[str, Any]) -> Dict[str, Any]:
-    """``parent_decision`` written only at OUTCOME (phase A): a parent-requested
-    cancel stamps its decision on the SETTLED cancelled result, never at intent
-    time — so a child that finished first keeps a decision-free completed record."""
-    if not isinstance(intent, dict) or not intent.get("requested_by"):
-        return {}
-    fields: Dict[str, Any] = {"parent_decision": "cancelled"}
-    if intent.get("reason"):
-        fields["parent_decision_reason"] = str(intent.get("reason") or "")
-    return fields
 
 
 def _restore_custody(
@@ -1605,119 +1329,6 @@ def _finish_captured_running(
     )
 
 
-def _finalize_cancel_intent_on_miss(
-    task_id: str, *, intent: Optional[Dict[str, Any]] = None,
-) -> str:
-    """Neither queued nor running: settle an open cancel intent (or a legacy
-    ``cancel_requested`` latch file) as cancelled with reconstructed cost.
-
-    Two things this lane must NOT do. It must not invent a task: an intent for an
-    id that has no durable result at all names a task that never existed, and
-    fabricating a ``cancelled`` row with $0 for it would put a phantom task in the
-    ledger — it settles as ``not_found`` instead. And it must not bury a child
-    that finished: when the row names a child drive, the child's own result is
-    copied back BEFORE the cancelled write, so a crash of the split-drive
-    copy-back window cannot cost a completed answer.
-    """
-    q = _queue_module()
-    from ouroboros.task_results import (
-        STATUS_CANCEL_REQUESTED, STATUS_CANCELLED, load_task_result, write_task_result,
-    )
-
-    try:
-        active = dict(intent or {})
-        if not active:
-            active = _active_intent(q, task_id)
-        existing = load_task_result(q.DRIVE_ROOT, task_id) or {}
-        legacy_latch = str(existing.get("status") or "") == STATUS_CANCEL_REQUESTED
-        if not active and not legacy_latch:
-            return CANCEL_NOT_FOUND
-        if not existing:
-            # No durable row ANYWHERE for this id: nothing was ever scheduled
-            # under it (a mistyped/stale id reaching the cancel ingress). Settle
-            # the intent honestly rather than minting a cancelled task.
-            _settle_intent(q, task_id, outcome="not_found",
-                           detail="no durable task result for this id", intent=intent)
-            return CANCEL_NOT_FOUND
-        # A concurrent custody attempt may have captured this task between our
-        # own capture miss and here (the pending double-settle probe). If the
-        # live claim is no longer ours, it owns the settle — refuse and let it,
-        # or the watchdog, finish.
-        current = _active_intent(q, task_id)
-        if (
-            intent
-            and current
-            and str(current.get("request_id") or "") == str(intent.get("request_id") or "")
-            and int(current.get("generation") or 0) != int(intent.get("generation") or 0)
-        ):
-            log.warning(
-                "Cancel finalize-on-miss for %s yielded to a newer custody claim", task_id,
-            )
-            return CANCEL_FAILED
-        # A4/completion-wins on the split-drive lane: promote the child's own
-        # terminal result first when the row names a child drive.
-        try:
-            from ouroboros.headless import copy_child_task_result
-
-            if str(existing.get("child_drive_root") or "").strip():
-                copy_child_task_result(pathlib.Path(q.DRIVE_ROOT), {
-                    "id": task_id,
-                    "drive_root": str(existing.get("child_drive_root") or ""),
-                    "child_drive_root": str(existing.get("child_drive_root") or ""),
-                    "delegation_role": str(existing.get("delegation_role") or ""),
-                })
-        except Exception:
-            log.debug("Finalize-on-miss child copy-back failed for %s", task_id, exc_info=True)
-        # GR5-3: neither queued nor running — the worker is gone, but its
-        # delegated runs may still be live; audit custody like the kill path
-        # and thread the disclosure into every miss-lane delivery below.
-        unreconciled = _reconcile_delegated_runs_on_kill(q, task_id)
-        settled = _durable_settled_status(q, task_id)
-        if settled:
-            _recover_stranded_reaping_slot(q, task_id, active)
-            owed_ok = _deliver_on_miss(
-                q, task_id, load_task_result(q.DRIVE_ROOT, task_id) or existing, settled,
-                unreconciled_runs=unreconciled,
-            )
-            _settle_or_reopen_intent(q, task_id, owed_ok=owed_ok, intent=intent,
-                                     outcome=SETTLED_ALREADY, detail=settled)
-            return CANCEL_ALREADY_SETTLED
-        existing = load_task_result(q.DRIVE_ROOT, task_id) or existing
-        cost_fields = _reconstructed_cost_fields(q, task_id, existing)
-        stored = write_task_result(
-            q.DRIVE_ROOT, task_id, STATUS_CANCELLED,
-            **_cancel_result_fields(
-                existing, existing=existing, **cost_fields,
-                **_intent_outcome_fields(active),
-                result="Task cancelled (was neither queued nor running at supervisor teardown).",
-            ),
-        )
-        stored_status = str((stored or {}).get("status") or "")
-        if stored_status != STATUS_CANCELLED:
-            # The monotonic guard refused: something settled it while we worked.
-            owed_ok = _deliver_on_miss(q, task_id, stored or existing, stored_status,
-                                       unreconciled_runs=unreconciled)
-            _settle_or_reopen_intent(q, task_id, owed_ok=owed_ok, intent=intent,
-                                     outcome=SETTLED_ALREADY, detail=stored_status)
-            return CANCEL_ALREADY_SETTLED
-        # GR2-4 ordering: the delivery seam registers the answer as OWED before
-        # the intent settles — a crash between the two replays instead of losing
-        # both the watchdog trigger and the answer. GR4-1: an unowed answer
-        # reopens the intent; the publication below still proceeds — the
-        # terminal truth is on disk.
-        owed_ok = _deliver_on_miss(q, task_id, stored or existing, STATUS_CANCELLED,
-                                   unreconciled_runs=unreconciled)
-        _settle_or_reopen_intent(q, task_id, owed_ok=owed_ok, intent=intent,
-                                 outcome="cancelled", detail="finalized on miss")
-        q._emit_cancel_task_done(existing, task_id, cost_fields=cost_fields)
-        q.persist_queue_snapshot(reason="cancel_finalize")
-        return CANCEL_CANCELLED
-    except Exception:
-        log.debug("Cancel finalize-on-miss failed for %s", task_id, exc_info=True)
-        _release_intent_claim(q, task_id, error="finalize-on-miss failed", intent=intent)
-        return CANCEL_FAILED
-
-
 # Watchdog cadence guards: an intent younger than this may still be riding its
 # own control event; the watchdog leaves it one tick before feeding custody.
 _INTENT_WATCHDOG_MIN_AGE_SEC = 10.0
@@ -1927,11 +1538,14 @@ def _append_cascade_snapshot_log(
 # unchanged. The dependency is one-way: that module imports nothing from here.
 from supervisor.queue_transitions import (  # noqa: E402, F401 -- intentional public re-exports
     _live_descendants_locked,
+    _live_retry_target_locked,
+    _settled_status,
     clear_acceptance_fence_for_root,
     resume_budget_paused_task,
     resume_project_deletions,
     run_project_deletion,
     start_project_deletion,
     task_has_live_ownership,
+    task_subtree_is_live,
     transition_acceptance_fence,
 )

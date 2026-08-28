@@ -3059,6 +3059,271 @@ def _persist_pending_terminalization_retries(task_ids: List[str]) -> None:
         )
 
 
+def _read_pending_cancel_intents(
+    active_intents: Any, assignment: Dict[str, bool],
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Read the live cancel projection, preserving authority failure."""
+    try:
+        current = active_intents(DRIVE_ROOT, strict=True)
+    except Exception:
+        assignment["safe"] = False
+        log.error(
+            "Cancel-intent authority became unreadable during pending cleanup; "
+            "assignment is blocked",
+            exc_info=True,
+        )
+        return None
+    if not isinstance(current, dict):
+        assignment["safe"] = False
+        log.error(
+            "Cancel-intent authority returned a non-object projection; "
+            "assignment is blocked",
+        )
+        return None
+    return current
+
+
+def _settle_cancelled_pending_row(
+    task: Dict[str, Any],
+    task_id: str,
+    marker: Optional[Dict[str, Any]],
+    current_intents: Dict[str, Dict[str, Any]],
+    *,
+    pending_tail: List[Dict[str, Any]],
+    survivors: List[Dict[str, Any]],
+    dropped: List[str],
+    terminalization_retry_ids: List[str],
+    assignment: Dict[str, bool],
+    active_intents: Any,
+    claim_intent: Any,
+    release_claim: Any,
+    settle_intent: Any,
+    intent_outcome_fields: Any,
+    write_task_result: Any,
+    status_cancelled: str,
+) -> bool:
+    """Settle one pre-assignment cancellation; return True to abort the pass.
+
+    The caller holds ``_queue_lock`` and owns the ordered pending partition.
+    Keeping those containers explicit preserves the existing whole-pass abort
+    semantics without giving this leaf a second queue owner.
+    """
+
+    def _release_pending_claim(claim: Dict[str, Any], error: str) -> bool:
+        """Prove that this drop's claim is no longer live after a failed step."""
+        request_id = str(claim.get("request_id") or "")
+        if not request_id:
+            return True
+        try:
+            if release_claim is not None and release_claim(
+                DRIVE_ROOT, task_id, error=error,
+                expected_generation=claim.get("generation"), request_id=request_id,
+            ):
+                return True
+        except Exception:
+            log.warning("pending-drop claim release failed for %s", task_id, exc_info=True)
+        if active_intents is None:
+            return False
+        current = _read_pending_cancel_intents(active_intents, assignment)
+        if current is None:
+            return False
+        current = current.get(task_id)
+        if not isinstance(current, dict) or current.get("state") != "claimed":
+            return True
+        # A changed live claim belongs to another custody owner; it is not proof
+        # that this drop released its own claim.
+        return False
+
+    def _pending_claim_is_ours(claim: Dict[str, Any]) -> bool:
+        """Allow publication only while an unresolved claim is still ours."""
+        if not claim or not claim.get("request_id") or active_intents is None:
+            return False
+        current = _read_pending_cancel_intents(active_intents, assignment)
+        if current is None:
+            return False
+        current = current.get(task_id)
+        try:
+            return bool(
+                isinstance(current, dict)
+                and current.get("state") == "claimed"
+                and str(current.get("request_id") or "") == str(claim.get("request_id") or "")
+                and int(current.get("generation") or 0) == int(claim.get("generation") or 0)
+                and int(current.get("claim_pid") or 0) == os.getpid()
+                and str(current.get("claim_owner") or "") == "pending_drop"
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def _pending_claim_is_released(claim: Dict[str, Any]) -> bool:
+        """Observe that a failed settle already removed the claim."""
+        if not claim or not claim.get("request_id") or active_intents is None:
+            return not claim or not claim.get("request_id")
+        current = _read_pending_cancel_intents(active_intents, assignment)
+        if current is None:
+            return False
+        current = current.get(task_id)
+        return not (isinstance(current, dict) and current.get("state") == "claimed")
+
+    # AR2-2 settle-owner unity: claim before writing. A marker may carry the
+    # exact claim that this same pending-drop process still owns; recognize
+    # that fenced refusal instead of dropping its custody.
+    claim: Dict[str, Any] = {}
+    if task_id in current_intents:
+        if claim_intent is None:
+            survivors.append(task)
+            return False
+        try:
+            claim = claim_intent(DRIVE_ROOT, task_id, owner="pending_drop") or {}
+        except Exception:
+            # A raised claim write/read is not evidence that another custody
+            # owner won. Retain this row and stop the pass so a transiently
+            # unreadable projection cannot lose queue custody or dispatch it.
+            assignment["safe"] = False
+            log.error(
+                "Pending-drop claim authority is unreadable for %s; "
+                "assignment is blocked",
+                task_id,
+                exc_info=True,
+            )
+            survivors.append(task)
+            survivors.extend(pending_tail)
+            return True
+        if not isinstance(claim, dict):
+            assignment["safe"] = False
+            log.error(
+                "Pending-drop claim returned a non-object for %s; "
+                "assignment is blocked",
+                task_id,
+            )
+            survivors.append(task)
+            survivors.extend(pending_tail)
+            return True
+        if claim.get("claim_refused"):
+            if marker is not None and _retry_claim_matches(task, claim):
+                pass
+            elif marker is not None:
+                survivors.append(task)
+                return False
+            else:
+                # A different live custody owner is waiting for the queue lock
+                # this pass holds. Keep the row for that owner and abort dispatch.
+                assignment["safe"] = False
+                survivors.append(task)
+                survivors.extend(pending_tail)
+                return True
+    if task_id in current_intents and not claim:
+        # The projection may have changed after the snapshot. Without an owned
+        # claim this drop cannot fence its settle, so defer the whole pass.
+        assignment["safe"] = False
+        log.info(
+            "Pending cancellation custody changed during claim for %s; "
+            "deferring the assignment pass",
+            task_id,
+        )
+        survivors.append(task)
+        survivors.extend(pending_tail)
+        return True
+    intent = claim or current_intents.get(task_id) or {}
+    try:
+        cost_fields = reconstruct_task_cost(task_id, fields=True)
+    except Exception:
+        cost_fields = {
+            "cost_accounting_status": "unavailable",
+            "cost_final": False,
+            "cost_usd": None,
+        }
+    try:
+        stored = write_task_result(
+            DRIVE_ROOT, task_id, status_cancelled,
+            strict_existing_dict=True,
+            result="Cancelled before start.", **cost_fields,
+            **intent_outcome_fields(intent),
+        ) or {}
+        stored_status = str(stored.get("status") or "").strip()
+        if not stored_status:
+            raise ValueError("cancel result writer returned no durable status")
+    except Exception:
+        log.debug("Failed to finalize cancelled pending task %s", task_id, exc_info=True)
+        released = _release_pending_claim(claim, "pending-drop persistence failed")
+        if released:
+            dropped.append(task_id)
+        else:
+            survivors.append(_retain_terminalization_retry_task(
+                task, task_id,
+                reason="Cancelled pending task result is not durable and its claim needs recovery.",
+                status=status_cancelled, trigger="pending_cancel_result",
+                reconcile_delegate_custody=False, claim=claim,
+            ))
+            terminalization_retry_ids.append(task_id)
+        return False
+    intent_present = task_id in current_intents
+    # Presence of an active projection is the custody fact; availability of the
+    # settle helper cannot turn a live claim into a settled one.
+    intent_settled = not intent_present
+    claim_released = intent_settled
+    if intent_present and settle_intent is not None:
+        try:
+            # The durable scope is re-read by settle_intent; cascade refusal may
+            # auto-release this exact claim and is handled as replayable below.
+            settled_row = settle_intent(
+                DRIVE_ROOT, task_id,
+                outcome=("cancelled" if stored_status == status_cancelled else "already_settled"),
+                detail=("dropped before assignment" if stored_status == status_cancelled else stored_status),
+                expected_generation=claim.get("generation"),
+                request_id=str(claim.get("request_id") or ""),
+            )
+            intent_settled = settled_row is not None
+        except Exception:
+            intent_settled = False
+            log.debug("Failed to settle cancel intent for pending %s", task_id, exc_info=True)
+        if not intent_settled:
+            claim_released = _pending_claim_is_released(claim)
+    raw_marker = task.get(_TERMINALIZATION_RETRY_FIELD)
+    event_already_published = bool(
+        isinstance(raw_marker, dict) and raw_marker.get("event_published")
+    )
+    claim_unresolved = not intent_settled and not claim_released
+    event_published = event_already_published
+    can_publish = not claim_unresolved or _pending_claim_is_ours(claim)
+    if can_publish and not event_already_published:
+        try:
+            event_published = bool(
+                _emit_task_done_terminal(task, task_id, stored_status, cost_fields=cost_fields)
+            )
+        except Exception:
+            event_published = False
+            log.warning(
+                "Failed to emit terminal task_done for cancelled pending task %s",
+                task_id, exc_info=True,
+            )
+    if claim_unresolved and can_publish:
+        claim_released = _release_pending_claim(
+            claim, "pending-drop intent settlement failed",
+        )
+        claim_unresolved = not intent_settled and not claim_released
+    if claim_unresolved:
+        survivors.append(_retain_terminalization_retry_task(
+            task, task_id,
+            reason="Cancelled pending task has an unresolved intent claim.",
+            status=status_cancelled, trigger="pending_cancel_intent",
+            reconcile_delegate_custody=False, claim=claim,
+            event_published=event_published,
+        ))
+        terminalization_retry_ids.append(task_id)
+    elif event_published:
+        dropped.append(task_id)
+    else:
+        survivors.append(_retain_terminalization_retry_task(
+            task, task_id,
+            reason="Cancelled pending task has an unpublished terminal event.",
+            status=status_cancelled, trigger="pending_cancel_event",
+            reconcile_delegate_custody=False, claim=claim,
+            event_published=False,
+        ))
+        terminalization_retry_ids.append(task_id)
+    return False
+
+
 def _drop_cancelled_pending() -> bool:
     """Remove pending tasks cancelled/finished between scheduling and assignment
     so a cancelled subagent never actually starts. Caller holds _queue_lock.
@@ -3111,81 +3376,6 @@ def _drop_cancelled_pending() -> bool:
         def _intent_outcome_fields(_intent):  # type: ignore[misc]
             return {}
 
-    def _read_active_intents() -> Optional[Dict[str, Dict[str, Any]]]:
-        """Read the live projection, preserving an explicit authority failure."""
-        try:
-            current = active_intents(DRIVE_ROOT, strict=True)
-        except Exception:
-            assignment["safe"] = False
-            log.error(
-                "Cancel-intent authority became unreadable during pending cleanup; "
-                "assignment is blocked",
-                exc_info=True,
-            )
-            return None
-        if not isinstance(current, dict):
-            assignment["safe"] = False
-            log.error(
-                "Cancel-intent authority returned a non-object projection; "
-                "assignment is blocked",
-            )
-            return None
-        return current
-
-    def _release_pending_claim(tid: str, claim: Dict[str, Any], error: str) -> bool:
-        """Prove that this drop's claim is no longer live after a failed step."""
-        request_id = str(claim.get("request_id") or "")
-        if not request_id:
-            return True
-        try:
-            if release_claim is not None and release_claim(
-                DRIVE_ROOT, tid, error=error,
-                expected_generation=claim.get("generation"), request_id=request_id,
-            ):
-                return True
-        except Exception:
-            log.warning("pending-drop claim release failed for %s", tid, exc_info=True)
-        if active_intents is None:
-            return False
-        current = _read_active_intents()
-        if current is None:
-            return False
-        current = current.get(tid)
-        if not isinstance(current, dict) or current.get("state") != "claimed":
-            return True
-        # A changed live claim belongs to another custody owner; it is not proof
-        # that this drop released its own claim.
-        return False
-
-    def _pending_claim_is_ours(tid: str, claim: Dict[str, Any]) -> bool:
-        """Allow publication only while an unresolved claim is still ours."""
-        if not claim or not claim.get("request_id") or active_intents is None:
-            return False
-        current = _read_active_intents()
-        if current is None:
-            return False
-        current = current.get(tid)
-        try:
-            return bool(
-                isinstance(current, dict)
-                and current.get("state") == "claimed"
-                and str(current.get("request_id") or "") == str(claim.get("request_id") or "")
-                and int(current.get("generation") or 0) == int(claim.get("generation") or 0)
-                and int(current.get("claim_pid") or 0) == os.getpid()
-                and str(current.get("claim_owner") or "") == "pending_drop"
-            )
-        except (TypeError, ValueError, OverflowError):
-            return False
-
-    def _pending_claim_is_released(tid: str, claim: Dict[str, Any]) -> bool:
-        """Observe that a failed settle already removed the claim."""
-        if not claim or not claim.get("request_id") or active_intents is None:
-            return not claim or not claim.get("request_id")
-        current = _read_active_intents()
-        if current is None:
-            return False
-        current = current.get(tid)
-        return not (isinstance(current, dict) and current.get("state") == "claimed")
 
     survivors: List[Dict[str, Any]] = []
     dropped: List[str] = []
@@ -3237,7 +3427,7 @@ def _drop_cancelled_pending() -> bool:
                 ))
                 terminalization_retry_ids.append(tid)
             continue
-        current_intents = _read_active_intents()
+        current_intents = _read_pending_cancel_intents(active_intents, assignment)
         if current_intents is None:
             # Keep this row and every row not yet examined.  The caller will
             # abort the assignment pass; no ordinary pending row may cross the
@@ -3265,171 +3455,28 @@ def _drop_cancelled_pending() -> bool:
             survivors.append(t)
             continue
         if tid and (
-            status == STATUS_CANCEL_REQUESTED
-            or (current_intents is not None and tid in current_intents)
+            status == STATUS_CANCEL_REQUESTED or tid in current_intents
         ):
-            # AR2-2 settle-owner unity: claim before writing.  A marker may carry
-            # the exact claim that this same pending-drop process still owns;
-            # recognize that fenced refusal instead of dropping its custody.
-            claim: Dict[str, Any] = {}
-            if current_intents is not None and tid in current_intents:
-                if claim_intent is None:
-                    survivors.append(t)
-                    continue
-                try:
-                    claim = claim_intent(DRIVE_ROOT, tid, owner="pending_drop") or {}
-                except Exception:
-                    # A raised claim write/read is not evidence that another
-                    # custody owner won.  Retain this row and stop the pass so
-                    # a transiently unreadable projection cannot lose queue
-                    # custody or let the cancelled task be dispatched.
-                    assignment["safe"] = False
-                    log.error(
-                        "Pending-drop claim authority is unreadable for %s; "
-                        "assignment is blocked",
-                        tid,
-                        exc_info=True,
-                    )
-                    survivors.extend(pending_rows[index:])
-                    break
-                if not isinstance(claim, dict):
-                    assignment["safe"] = False
-                    log.error(
-                        "Pending-drop claim returned a non-object for %s; "
-                        "assignment is blocked",
-                        tid,
-                    )
-                    survivors.extend(pending_rows[index:])
-                    break
-                if claim.get("claim_refused"):
-                    if marker is not None and _retry_claim_matches(t, claim):
-                        pass
-                    elif marker is not None:
-                        survivors.append(t)
-                        continue
-                    else:
-                        # A different live custody owner is waiting for the
-                        # queue lock this assignment pass holds.  Keep the
-                        # authoritative pending row so that owner can capture
-                        # it, and abort dispatch; dropping it here would make
-                        # custody miss the task and lose its routing record.
-                        assignment["safe"] = False
-                        survivors.append(t)
-                        survivors.extend(pending_rows[index + 1:])
-                        break
-            if current_intents is not None and tid in current_intents and not claim:
-                # The projection may have changed after the snapshot (including
-                # another owner settling it and a new ingress minting a request).
-                # Without an owned claim this drop cannot fence its settle, so
-                # defer every such row instead of falling through with an empty
-                # request_id/generation.
-                assignment["safe"] = False
-                log.info(
-                    "Pending cancellation custody changed during claim for %s; "
-                    "deferring the assignment pass",
-                    tid,
-                )
-                survivors.append(t)
-                survivors.extend(pending_rows[index + 1:])
-                break
-            intent = claim or (current_intents or {}).get(tid) or {}
-            try:
-                cost_fields = reconstruct_task_cost(tid, fields=True)
-            except Exception:
-                cost_fields = {"cost_accounting_status": "unavailable",
-                               "cost_final": False, "cost_usd": None}
-            try:
-                stored = write_task_result(
-                    DRIVE_ROOT, tid, STATUS_CANCELLED,
-                    strict_existing_dict=True,
-                    result="Cancelled before start.", **cost_fields,
-                    **_intent_outcome_fields(intent),
-                ) or {}
-                stored_status = str(stored.get("status") or "").strip()
-                if not stored_status:
-                    raise ValueError("cancel result writer returned no durable status")
-            except Exception:
-                log.debug("Failed to finalize cancelled pending task %s", tid, exc_info=True)
-                released = _release_pending_claim(
-                    tid, claim, "pending-drop persistence failed",
-                )
-                if released:
-                    dropped.append(tid)
-                else:
-                    survivors.append(_retain_terminalization_retry_task(
-                        t, tid,
-                        reason="Cancelled pending task result is not durable and its claim needs recovery.",
-                        status=STATUS_CANCELLED, trigger="pending_cancel_result",
-                        reconcile_delegate_custody=False, claim=claim,
-                    ))
-                    terminalization_retry_ids.append(tid)
-                continue
-            intent_present = isinstance(current_intents, dict) and tid in current_intents
-            # Presence of an active projection is the custody fact; availability
-            # of the settle helper cannot turn a live claim into a settled one.
-            intent_settled = not intent_present
-            claim_released = intent_settled
-            if intent_present and settle_intent is not None:
-                try:
-                    # The durable scope is re-read by settle_intent; cascade
-                    # refusal may auto-release this exact claim and is handled
-                    # as a deferred, replayable intent below.
-                    settled_row = settle_intent(
-                        DRIVE_ROOT, tid,
-                        outcome=("cancelled" if stored_status == STATUS_CANCELLED else "already_settled"),
-                        detail=("dropped before assignment" if stored_status == STATUS_CANCELLED else stored_status),
-                        expected_generation=claim.get("generation"),
-                        request_id=str(claim.get("request_id") or ""),
-                    )
-                    intent_settled = settled_row is not None
-                except Exception:
-                    intent_settled = False
-                    log.debug("Failed to settle cancel intent for pending %s", tid, exc_info=True)
-                if not intent_settled:
-                    claim_released = _pending_claim_is_released(tid, claim)
-            raw_marker = t.get(_TERMINALIZATION_RETRY_FIELD) if isinstance(t, dict) else {}
-            event_already_published = bool(
-                isinstance(raw_marker, dict) and raw_marker.get("event_published")
+            abort_assignment = _settle_cancelled_pending_row(
+                t,
+                tid,
+                marker,
+                current_intents,
+                pending_tail=pending_rows[index + 1:],
+                survivors=survivors,
+                dropped=dropped,
+                terminalization_retry_ids=terminalization_retry_ids,
+                assignment=assignment,
+                active_intents=active_intents,
+                claim_intent=claim_intent,
+                release_claim=release_claim,
+                settle_intent=settle_intent,
+                intent_outcome_fields=_intent_outcome_fields,
+                write_task_result=write_task_result,
+                status_cancelled=STATUS_CANCELLED,
             )
-            claim_unresolved = not intent_settled and not claim_released
-            event_published = event_already_published
-            can_publish = not claim_unresolved or _pending_claim_is_ours(tid, claim)
-            if can_publish and not event_already_published:
-                try:
-                    event_published = bool(
-                        _emit_task_done_terminal(t, tid, stored_status, cost_fields=cost_fields)
-                    )
-                except Exception:
-                    event_published = False
-                    log.warning(
-                        "Failed to emit terminal task_done for cancelled pending task %s",
-                        tid, exc_info=True,
-                    )
-            if claim_unresolved and can_publish:
-                claim_released = _release_pending_claim(
-                    tid, claim, "pending-drop intent settlement failed",
-                )
-                claim_unresolved = not intent_settled and not claim_released
-            if claim_unresolved:
-                survivors.append(_retain_terminalization_retry_task(
-                    t, tid,
-                    reason="Cancelled pending task has an unresolved intent claim.",
-                    status=STATUS_CANCELLED, trigger="pending_cancel_intent",
-                    reconcile_delegate_custody=False, claim=claim,
-                    event_published=event_published,
-                ))
-                terminalization_retry_ids.append(tid)
-            elif event_published:
-                dropped.append(tid)
-            else:
-                survivors.append(_retain_terminalization_retry_task(
-                    t, tid,
-                    reason="Cancelled pending task has an unpublished terminal event.",
-                    status=STATUS_CANCELLED, trigger="pending_cancel_event",
-                    reconcile_delegate_custody=False, claim=claim,
-                    event_published=False,
-                ))
-                terminalization_retry_ids.append(tid)
+            if abort_assignment:
+                break
             continue
         if status in _TRULY_TERMINAL_STATUSES and marker is None:
             dropped.append(tid)
@@ -3651,6 +3698,45 @@ def _drop_assignable_evolution_tasks(deferred_ids: set[str]) -> list[str]:
     return blocked_ids
 
 
+def _running_subagent_count(root_task_id: str) -> int:
+    if not root_task_id:
+        return 0
+    count = 0
+    for meta in RUNNING.values():
+        task = meta.get("task") if isinstance(meta, dict) else None
+        if (
+            isinstance(task, dict)
+            and str(task.get("delegation_role") or "") == "subagent"
+            and str(task.get("root_task_id") or "") == root_task_id
+        ):
+            count += 1
+    return count
+
+
+def _assignment_depth_reservation_admits(candidate: dict) -> bool:
+    root_task_id = str(candidate.get("root_task_id") or "")
+    parent_id = str(candidate.get("parent_task_id") or "").strip()
+    if not root_task_id or not parent_id:
+        return False
+    parent_running = any(
+        str((meta.get("task") if isinstance(meta, dict) else {}).get("id") or "") == parent_id
+        and str((meta.get("task") if isinstance(meta, dict) else {}).get("root_task_id") or "") == root_task_id
+        and str((meta.get("task") if isinstance(meta, dict) else {}).get("delegation_role") or "") == "subagent"
+        for meta in RUNNING.values()
+    )
+    if not parent_running:
+        return False
+    direct_running_children = sum(
+        1 for meta in RUNNING.values()
+        if isinstance(meta, dict)
+        and isinstance(meta.get("task"), dict)
+        and str(meta["task"].get("root_task_id") or "") == root_task_id
+        and str(meta["task"].get("delegation_role") or "") == "subagent"
+        and str(meta["task"].get("parent_task_id") or "").strip() == parent_id
+    )
+    return direct_running_children < 1
+
+
 def assign_tasks() -> None:
     from supervisor import queue
     from supervisor.state import budget_remaining, EVOLUTION_BUDGET_RESERVE
@@ -3791,42 +3877,6 @@ def assign_tasks() -> None:
         from ouroboros.project_lease import candidate_is_leasable, running_project_ids
         from ouroboros.config import get_max_active_subagents_per_root
 
-        def _running_subagent_count(root_task_id: str) -> int:
-            if not root_task_id:
-                return 0
-            count = 0
-            for meta in RUNNING.values():
-                task = meta.get("task") if isinstance(meta, dict) else None
-                if (
-                    isinstance(task, dict)
-                    and str(task.get("delegation_role") or "") == "subagent"
-                    and str(task.get("root_task_id") or "") == root_task_id
-                ):
-                    count += 1
-            return count
-
-        def _assignment_depth_reservation_admits(candidate: dict) -> bool:
-            root_task_id = str(candidate.get("root_task_id") or "")
-            parent_id = str(candidate.get("parent_task_id") or "").strip()
-            if not root_task_id or not parent_id:
-                return False
-            parent_running = any(
-                str((meta.get("task") if isinstance(meta, dict) else {}).get("id") or "") == parent_id
-                and str((meta.get("task") if isinstance(meta, dict) else {}).get("root_task_id") or "") == root_task_id
-                and str((meta.get("task") if isinstance(meta, dict) else {}).get("delegation_role") or "") == "subagent"
-                for meta in RUNNING.values()
-            )
-            if not parent_running:
-                return False
-            direct_running_children = sum(
-                1 for meta in RUNNING.values()
-                if isinstance(meta, dict)
-                and isinstance(meta.get("task"), dict)
-                and str(meta["task"].get("root_task_id") or "") == root_task_id
-                and str(meta["task"].get("delegation_role") or "") == "subagent"
-                and str(meta["task"].get("parent_task_id") or "").strip() == parent_id
-            )
-            return direct_running_children < 1
 
         for w in WORKERS.values():
             if w.busy_task_id is None and not getattr(w, "reaping", False) and PENDING:

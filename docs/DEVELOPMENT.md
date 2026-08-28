@@ -1586,6 +1586,12 @@ Before every commit, verify the following:
   ONE shared `owner_hurry.retry_reset`. UI surfaces share
   `web/modules/task_control_menu.js`; the `owner_hurry` event family is
   non-chat (`log_events.js` hides it with `visible=false`).
+- Cancellation keeps one public queue/lifecycle surface while its code owners
+  stay narrow: retry-aware physical-target and subtree-liveness resolution live
+  in `supervisor/queue_transitions.py`, capture-miss terminalization/publication
+  lives in `supervisor/cancel_publication.py`, and owner-stop control delivery,
+  stale-control validation, and deadline narrowing live in
+  `supervisor/owner_stop.py` with compatibility re-exports from the loop.
 - `forward_to_worker` may write only to validated running tasks whose lineage
   belongs to the current task/root, and must route forked/empty child subagents
   to the child-drive mailbox.

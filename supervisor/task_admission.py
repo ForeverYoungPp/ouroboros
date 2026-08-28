@@ -28,6 +28,43 @@ def coerce_queue_order(value: Any, default: int = 0) -> int:
         return default
 
 
+def record_scheduled_admission(
+    task: Dict[str, Any], admitted: Any, record: Dict[str, Any],
+) -> None:
+    """Project a cron dispatch refusal into terminal task/schedule state."""
+    from supervisor import queue as q
+
+    block = (
+        str(admitted.get("_admission_blocked") or "")
+        if isinstance(admitted, dict)
+        else ""
+    )
+    if not block:
+        record["failure_count"] = int(record.get("failure_count") or 0)
+        record["last_error"] = ""
+        return
+    detail = f"Scheduled task was not queued: {block}."
+    try:
+        from ouroboros.task_results import STATUS_FAILED, write_task_result
+
+        write_task_result(
+            q.DRIVE_ROOT,
+            str(task["id"]),
+            STATUS_FAILED,
+            result=detail,
+            reason_code=block,
+            cost_usd=0.0,
+        )
+    except Exception:
+        q.log.warning(
+            "Failed to terminalize admission-blocked scheduled task %s",
+            task.get("id"),
+            exc_info=True,
+        )
+    record["failure_count"] = int(record.get("failure_count") or 0) + 1
+    record["last_error"] = detail
+
+
 def prefer_terminalization_retry_rows(tasks: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
     """Drop ordinary duplicate rows when a snapshot carries shutdown custody."""
     marker_ids = {
@@ -662,6 +699,7 @@ def release_task_admission(task_id: str, admission_token: str) -> bool:
 
 __all__ = [
     "enqueue_subagent_with_scheduled_result",
+    "record_scheduled_admission",
     "release_task_admission",
     "reserve_task_admission",
     "subagent_schedule_owned",

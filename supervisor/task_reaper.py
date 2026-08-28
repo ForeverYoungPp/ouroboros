@@ -336,27 +336,20 @@ def _retain_reaper_terminalization_custody(
     return retained_ids
 
 
-def _enqueue_retry(
+def _run_retry_admission_transaction(
     q: Any,
     task: Dict[str, Any],
+    retried: Dict[str, Any],
     *,
     task_id: str,
     retry_task_id: str,
-    attempt: int,
     terminal_reason: str,
     recon_fields: Dict[str, Any],
-    runtime_sec: float = 0.0,
-    unreconciled_runs: Optional[list] = None,
-    salvage_note: str = "",
-) -> tuple[bool, int, str, Dict[str, str]]:
-    """Atomically admit a dead task's retry or suppress it.
-
-    The queue row and reciprocal result lineage are published only inside the
-    final queue->cancel locked transition.  If cancellation/terminal truth wins
-    the boundary, no successor result or historical link is created.  If retry
-    admission wins, a later SINGLE cancel resolves the complete durable chain
-    under the same projection lock and targets the physical leaf.
-    """
+    runtime_sec: float,
+    unreconciled_runs: Optional[list],
+    salvage_note: str,
+) -> tuple[Dict[str, str], str]:
+    """Publish one retry admission under the queue -> cancel lock order."""
     from ouroboros.task_results import (
         STATUS_CANCELLED,
         STATUS_FAILED,
@@ -367,68 +360,6 @@ def _enqueue_retry(
         write_task_result,
     )
 
-    retried = dict(task)
-    retried["original_task_id"] = task_id
-    retried["id"] = retry_task_id or task_id
-    retried["_attempt"] = attempt + 1
-    retried["timeout_retry_from"] = task_id
-    retried["timeout_retry_at"] = utc_now_iso()
-    if retry_task_id and retry_task_id != task_id:
-        from ouroboros.artifacts import (
-            handoff_task_attachments_for_retry,
-            task_artifact_dir_path,
-        )
-        from ouroboros.owner_mailbox import cleanup_task_mailbox, copy_owner_mailbox_for_retry
-
-        task_drive = q._task_drive_for_task(task, task_id)
-        replacements, attachment_error = handoff_task_attachments_for_retry(
-            task_drive, task_id, retry_task_id, retried,
-        )
-        mailbox_ok = not attachment_error and copy_owner_mailbox_for_retry(
-            task_drive, task_id, retry_task_id, path_replacements=replacements,
-        )
-        if not mailbox_ok:
-            failure = "attachment" if attachment_error else "mailbox"
-            blocked_reason = f"{terminal_reason}_retry_{failure}_handoff_failed"
-            message = (
-                "Retry refused because durable task inputs could not be carried "
-                "to the new physical task id."
-                + str(salvage_note or "")
-            )
-            log.error(
-                "Reaper: %s handoff failed for retry %s -> %s: %s",
-                failure, task_id, retry_task_id, attachment_error,
-            )
-            shutil.rmtree(
-                task_artifact_dir_path(task_drive, retry_task_id), ignore_errors=True,
-            )
-            cleanup_task_mailbox(task_drive, retry_task_id)
-            outcome = terminal_outcome_axes(
-                lifecycle=STATUS_FAILED,
-                execution=EXECUTION_INFRA_FAILED,
-                reason_code=blocked_reason,
-                review_trigger="supervisor_terminal",
-            )
-            write_task_result(
-                q.DRIVE_ROOT,
-                task_id,
-                STATUS_FAILED,
-                reason_code=blocked_reason,
-                outcome_axes=outcome,
-                **recon_fields,
-                result=message,
-            )
-            write_task_result(
-                q.DRIVE_ROOT,
-                retry_task_id,
-                STATUS_FAILED,
-                reason_code=blocked_reason,
-                outcome_axes=outcome,
-                supersedes_task_id=task_id,
-                original_task_id=task_id,
-                result=message,
-            )
-            return False, attempt, blocked_reason, {}
     admitted: Dict[str, Any] = {}
     admission_selected = False
     suppression: Dict[str, str] = {}
@@ -642,6 +573,110 @@ def _enqueue_retry(
             retry_task_id,
             exc_info=True,
         )
+    return suppression, admission_block
+
+
+def _enqueue_retry(
+    q: Any,
+    task: Dict[str, Any],
+    *,
+    task_id: str,
+    retry_task_id: str,
+    attempt: int,
+    terminal_reason: str,
+    recon_fields: Dict[str, Any],
+    runtime_sec: float = 0.0,
+    unreconciled_runs: Optional[list] = None,
+    salvage_note: str = "",
+) -> tuple[bool, int, str, Dict[str, str]]:
+    """Atomically admit a dead task's retry or suppress it.
+
+    The queue row and reciprocal result lineage are published only inside the
+    final queue->cancel locked transition.  If cancellation/terminal truth wins
+    the boundary, no successor result or historical link is created.  If retry
+    admission wins, a later SINGLE cancel resolves the complete durable chain
+    under the same projection lock and targets the physical leaf.
+    """
+    from ouroboros.task_results import (
+        STATUS_FAILED,
+        load_task_result,
+        write_task_result,
+    )
+
+    retried = dict(task)
+    retried["original_task_id"] = task_id
+    retried["id"] = retry_task_id or task_id
+    retried["_attempt"] = attempt + 1
+    retried["timeout_retry_from"] = task_id
+    retried["timeout_retry_at"] = utc_now_iso()
+    if retry_task_id and retry_task_id != task_id:
+        from ouroboros.artifacts import (
+            handoff_task_attachments_for_retry,
+            task_artifact_dir_path,
+        )
+        from ouroboros.owner_mailbox import cleanup_task_mailbox, copy_owner_mailbox_for_retry
+
+        task_drive = q._task_drive_for_task(task, task_id)
+        replacements, attachment_error = handoff_task_attachments_for_retry(
+            task_drive, task_id, retry_task_id, retried,
+        )
+        mailbox_ok = not attachment_error and copy_owner_mailbox_for_retry(
+            task_drive, task_id, retry_task_id, path_replacements=replacements,
+        )
+        if not mailbox_ok:
+            failure = "attachment" if attachment_error else "mailbox"
+            blocked_reason = f"{terminal_reason}_retry_{failure}_handoff_failed"
+            message = (
+                "Retry refused because durable task inputs could not be carried "
+                "to the new physical task id."
+                + str(salvage_note or "")
+            )
+            log.error(
+                "Reaper: %s handoff failed for retry %s -> %s: %s",
+                failure, task_id, retry_task_id, attachment_error,
+            )
+            shutil.rmtree(
+                task_artifact_dir_path(task_drive, retry_task_id), ignore_errors=True,
+            )
+            cleanup_task_mailbox(task_drive, retry_task_id)
+            outcome = terminal_outcome_axes(
+                lifecycle=STATUS_FAILED,
+                execution=EXECUTION_INFRA_FAILED,
+                reason_code=blocked_reason,
+                review_trigger="supervisor_terminal",
+            )
+            write_task_result(
+                q.DRIVE_ROOT,
+                task_id,
+                STATUS_FAILED,
+                reason_code=blocked_reason,
+                outcome_axes=outcome,
+                **recon_fields,
+                result=message,
+            )
+            write_task_result(
+                q.DRIVE_ROOT,
+                retry_task_id,
+                STATUS_FAILED,
+                reason_code=blocked_reason,
+                outcome_axes=outcome,
+                supersedes_task_id=task_id,
+                original_task_id=task_id,
+                result=message,
+            )
+            return False, attempt, blocked_reason, {}
+    suppression, admission_block = _run_retry_admission_transaction(
+        q,
+        task,
+        retried,
+        task_id=task_id,
+        retry_task_id=retry_task_id,
+        terminal_reason=terminal_reason,
+        recon_fields=recon_fields,
+        runtime_sec=runtime_sec,
+        unreconciled_runs=unreconciled_runs,
+        salvage_note=salvage_note,
+    )
 
     if suppression:
         if retry_task_id and retry_task_id != task_id:
@@ -1080,6 +1115,62 @@ def _finish_self_finalized_task(
         log.debug("Reaper: failed to emit task_done for self-finalized %s", task_id, exc_info=True)
 
 
+def _load_post_kill_terminal_result(
+    q: Any, task: Dict[str, Any], task_id: str,
+) -> tuple[str, Optional[Dict[str, Any]]]:
+    """Return terminal truth that won the worker-death boundary, if any."""
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+
+    self_status = ""
+    existing: Optional[Dict[str, Any]] = None
+    try:
+        existing = load_task_result(q.DRIVE_ROOT, task_id)
+        if existing and str(existing.get("status") or "") in _TRULY_TERMINAL_STATUSES:
+            self_status = str(existing.get("status") or "")
+    except Exception:
+        log.debug("Reaper: post-kill terminal re-check failed for %s", task_id, exc_info=True)
+    # Forked/workspace/subagent tasks self-finalize on the CHILD drive and are copied back
+    # only on task_done; a worker that died after writing its child result but before
+    # copy-back would be missed by the parent-drive check above. Mirror the child result
+    # back and honor it (no interrupted/failed clobber, no duplicate retry).
+    if not self_status:
+        try:
+            from ouroboros.headless import copy_child_task_result
+
+            child = copy_child_task_result(pathlib.Path(q.DRIVE_ROOT), task)
+            if child and str(child.get("status") or "") in _TRULY_TERMINAL_STATUSES:
+                existing = child
+                self_status = str(child.get("status") or "")
+        except Exception:
+            log.debug("Reaper: child-drive terminal re-check failed for %s", task_id, exc_info=True)
+    return self_status, existing
+
+
+def _respawn_after_reap(q: Any, workers_mod: Any, worker_id: int) -> None:
+    """Reopen a reaped slot, leaving crash recovery available on failure."""
+    # respawn_worker owns the lifecycle race with shutdown and starts the child
+    # outside _queue_lock, so a fork can never inherit the RLock from this thread.
+    try:
+        workers_mod.respawn_worker(worker_id)
+    except Exception:
+        log.warning(
+            "Reaper: respawn failed for worker %d; clearing reaping for recovery",
+            worker_id,
+            exc_info=True,
+        )
+        try:
+            with q._queue_lock:
+                worker = workers_mod.WORKERS.get(worker_id)
+                if worker is not None:
+                    worker.reaping = False
+        except Exception:
+            pass
+    try:
+        q.persist_queue_snapshot(reason="worker_respawn_after_reap")
+    except Exception:
+        log.debug("Reaper: failed to persist queue snapshot after respawn", exc_info=True)
+
+
 def reap_timed_out_task(job: Dict[str, Any]) -> None:
     """Full teardown for a timed-out task, run OFF the supervisor loop (Variant A).
 
@@ -1155,35 +1246,13 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
 
     from ouroboros.task_results import (
         STATUS_FAILED,
-        _TRULY_TERMINAL_STATUSES,
         load_task_result,
         write_task_result,
     )
 
     # 2. POST-KILL already-terminal re-check: the worker may have self-finalized right at
     #    the boundary. The process is dead now, so this decision is final.
-    self_status = ""
-    _existing = None
-    try:
-        _existing = load_task_result(_q.DRIVE_ROOT, task_id)
-        if _existing and str(_existing.get("status") or "") in _TRULY_TERMINAL_STATUSES:
-            self_status = str(_existing.get("status") or "")
-    except Exception:
-        log.debug("Reaper: post-kill terminal re-check failed for %s", task_id, exc_info=True)
-    # Forked/workspace/subagent tasks self-finalize on the CHILD drive and are copied back
-    # only on task_done; a worker that died after writing its child result but before
-    # copy-back would be missed by the parent-drive check above. Mirror the child result
-    # back and honor it (no interrupted/failed clobber, no duplicate retry).
-    if not self_status:
-        try:
-            from ouroboros.headless import copy_child_task_result
-
-            _child = copy_child_task_result(pathlib.Path(_q.DRIVE_ROOT), task)
-            if _child and str(_child.get("status") or "") in _TRULY_TERMINAL_STATUSES:
-                _existing = _child
-                self_status = str(_child.get("status") or "")
-        except Exception:
-            log.debug("Reaper: child-drive terminal re-check failed for %s", task_id, exc_info=True)
+    self_status, _existing = _load_post_kill_terminal_result(_q, task, task_id)
 
     if self_status:
         _finish_self_finalized_task(
@@ -1395,22 +1464,6 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                 recon_fields, terminal_metadata,
             )
 
-    # 5. Respawn a fresh worker for the slot; on failure, CLEAR reaping so the crash detector
-    #    can recover the slot on a later tick instead of stranding it permanently.
-    #    respawn_worker owns the lifecycle race with shutdown and starts the child
-    #    outside _queue_lock, so a fork can never inherit the RLock from this thread.
-    try:
-        workers_mod.respawn_worker(worker_id)
-    except Exception:
-        log.warning("Reaper: respawn failed for worker %d; clearing reaping for recovery", worker_id, exc_info=True)
-        try:
-            with _q._queue_lock:
-                _w = workers_mod.WORKERS.get(worker_id)
-                if _w is not None:
-                    _w.reaping = False
-        except Exception:
-            pass
-    try:
-        _q.persist_queue_snapshot(reason="worker_respawn_after_reap")
-    except Exception:
-        log.debug("Reaper: failed to persist queue snapshot after respawn", exc_info=True)
+    # 5. Respawn a fresh worker for the slot; on failure, clear reaping so the
+    # crash detector can recover it instead of leaving a permanently held slot.
+    _respawn_after_reap(_q, workers_mod, worker_id)
