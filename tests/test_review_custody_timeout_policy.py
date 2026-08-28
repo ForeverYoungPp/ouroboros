@@ -764,7 +764,10 @@ def test_keyed_terminal_api_error_is_replayed_while_sibling_is_late(tmp_path):
             slot_id=slot.slot_id, model=slot.model, status="error",
             error=f"{slot.slot_id} terminal API error", operation_id=operation_id,
             http_status=500 if slot.slot_id == "fast" else 503,
-            usage={"physical_attempt_state": "settled"},
+            # A terminal actor is sufficient for same-cycle custody.  The
+            # optional PhysicalAttemptCapture is intentionally absent here,
+            # matching adapters that return only the typed actor record.
+            usage={},
         )
 
     def error_actor(slot, error, operation_id="", operation_state="settled"):
@@ -792,3 +795,51 @@ def test_keyed_terminal_api_error_is_replayed_while_sibling_is_late(tmp_path):
 
     release_late.set()
     assert late_finished.wait(1.0)
+
+
+def test_not_dispatched_error_remains_retryable_for_same_cycle(tmp_path):
+    """A $0 admission refusal must not become a sticky replay actor."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import run_custodied_review_slots
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    calls = []
+    ctx = SimpleNamespace()
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="retryable-refusal",
+        retry_key="plan_review:retryable-refusal:1",
+    )
+    slot = ReviewSlot(
+        slot_id="only", model="test/model", route=ReviewRouteKind.API_CHAT,
+        timeout_sec=0.2,
+    )
+
+    def run_slot(slot, operation_id, _retry_state, _deadline, _checkpoint):
+        calls.append(slot.slot_id)
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error",
+            error="deadline exhausted before dispatch", operation_id=operation_id,
+            operation_state="not_dispatched",
+        )
+
+    def error_actor(slot, error, operation_id="", operation_state="settled"):
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="not_dispatched",
+            error=error, operation_id=operation_id, operation_state=operation_state,
+        )
+
+    args = dict(
+        request=request, slots=[slot], usage_ctx=ctx, task_id=request.task_id,
+        usage_meta={}, review_usage_scope=UsageScope(drive_root=tmp_path, task_id=request.task_id),
+        run_slot=run_slot, error_actor=error_actor,
+    )
+    first = run_custodied_review_slots(**args)
+    second = run_custodied_review_slots(**args)
+
+    assert [actor.operation_state for actor in first] == ["not_dispatched"]
+    assert [actor.operation_state for actor in second] == ["not_dispatched"]
+    assert calls == ["only", "only"]
+    assert not getattr(ctx, "_review_settled_attempts", {})

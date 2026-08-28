@@ -2071,8 +2071,10 @@ cancel path, while API/thread calls disclose `in_flight` and reconcile a late
 answer before the same retry identity can dispatch again. In a mixed plan or
 commit cycle, a settled terminal API error is retained as part of the exact
 cycle's replayable actor roster, so a sibling cannot make the cycle lose its
-terminal fact or buy a duplicate physical call. A new retry cycle uses a new
-identity. Send-time VLM
+terminal fact or buy a duplicate physical call. The typed actor state is
+sufficient for this same-cycle custody fact even when optional physical-attempt
+capture metadata is absent; a `$0` not-dispatched row remains retryable. A new
+retry cycle uses a new identity. Send-time VLM
 captioning keeps its direct 90-second provider cap. Explicit VLM helpers order
 their nested bounds as provider, killable child, then a ToolEntry minimum by
 reusing one fixed structural settlement margin; the global owner tool-timeout

@@ -553,7 +553,12 @@ def _settle_review_attempt(
             )
             and route_value != "agent_session"
             and not pending_invocation
-            and str(failure_custody.get("physical_attempt_state") or "") == "settled"
+            # The actor's terminal state is the canonical settlement fact;
+            # adapters are not required to populate the optional physical
+            # capture metadata just to make same-cycle custody replayable.
+            and actor.status == "error"
+            and str(getattr(actor, "operation_state", "") or "")
+            not in {"not_dispatched", "in_flight", "custody_lost"}
         )
         replayable = (
             actor.status in {"ok", "empty"}
