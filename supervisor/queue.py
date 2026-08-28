@@ -933,7 +933,7 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                 except Exception:
                     log.warning("Failed to terminalize fenced snapshot task %s", task_id, exc_info=True)
                 continue
-            # Never resurrect a terminal/cancelled task as a ghost pending entry.
+            # Never resurrect ordinary terminal rows; retain terminalization markers until task_done is published.
             # AR2-10 (§8-A1): the intent projection is consulted UNDER the queue lock at
             # restore — the "no active intent" read and the enqueue form one serialized step
             # against assignment/drop (same invariant as the pre-assignment consult). Boot-time
@@ -946,9 +946,9 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                     # Terminal OR cancel-intent — both must not be resurrected as
                     # pending. Intent lives in the durable projection (phase A);
                     # the status check covers legacy latch files.
-                    if existing_status in _TRULY_TERMINAL_STATUSES or existing_status == STATUS_CANCEL_REQUESTED:
+                    if not isinstance(task.get("_terminalization_retry"), dict) and (existing_status in _TRULY_TERMINAL_STATUSES or existing_status == STATUS_CANCEL_REQUESTED):
                         skip_revival = True
-                    else:
+                    elif not isinstance(task.get("_terminalization_retry"), dict):
                         from ouroboros.cancel_intents import has_active_intent
 
                         if has_active_intent(DRIVE_ROOT, str(task.get("id"))):

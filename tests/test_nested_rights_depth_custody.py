@@ -72,6 +72,79 @@ def test_interrupted_terminalization_retry_is_finalized_after_worker_boot(
     assert load_effective_task_result(tmp_path, "post-boot-interrupted")["status"] == "failed"
 
 
+def test_terminalization_retry_restore_survives_durable_result_until_event_published(
+    tmp_path, monkeypatch,
+):
+    """A durable outcome must not discard its still-unpublished terminal event."""
+    from ouroboros.task_results import STATUS_FAILED, load_task_result, write_task_result
+    from ouroboros.utils import utc_now_iso
+    from supervisor import queue, workers
+
+    pending, running = [], {}
+    counter = {"value": 0}
+    queue.init_queue_refs(pending, running, counter)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    snapshot_path = tmp_path / "state" / "queue_snapshot.json"
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snapshot_path)
+    queue.ACCEPTANCE_FENCES.clear()
+    queue.ADMISSION_RESERVATIONS.clear()
+
+    task_id = "durable-terminal-event-retry"
+    task = {
+        "id": task_id,
+        "type": "task",
+        "chat_id": 0,
+        "depth": -1,
+        "_terminalization_retry": {
+            "status": STATUS_FAILED,
+            "reason": "terminal event was not published before shutdown",
+            "trigger": "worker_pool_kill",
+        },
+    }
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text(
+        json.dumps({
+            "ts": utc_now_iso(),
+            "pending": [{"id": task_id, "queue_seq": 1, "task": task}],
+            "running": [],
+            "acceptance_fences": [],
+        }),
+        encoding="utf-8",
+    )
+    # This is the failure window: the result write succeeded, but task_done did not.
+    write_task_result(tmp_path, task_id, STATUS_FAILED, result="already durable")
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", running)
+    assert queue.restore_pending_from_snapshot() == 1
+    assert [row["id"] for row in pending] == [task_id]
+    assert pending[0]["_terminalization_retry"]["status"] == STATUS_FAILED
+
+    writes, emitted = [], []
+    monkeypatch.setattr(workers, "_audit_delegate_terminal_custody", lambda *a, **k: None)
+    monkeypatch.setattr(
+        workers,
+        "_write_failure_result",
+        lambda tid, *, reason, status: writes.append((tid, reason, status)) or STATUS_FAILED,
+    )
+    publish_results = iter([False, True])
+    monkeypatch.setattr(
+        workers,
+        "_emit_task_done_terminal",
+        lambda task_row, tid, status: emitted.append((tid, status)) or next(publish_results),
+    )
+
+    # A failed publication keeps custody; the next retry removes it only after success.
+    assert workers._retry_terminalization_pending() == ([], [task_id])
+    assert [row["id"] for row in pending] == [task_id]
+    assert workers._retry_terminalization_pending() == ([task_id], [])
+    assert pending == []
+    assert writes[0][0] == writes[1][0] == task_id
+    assert emitted == [(task_id, STATUS_FAILED), (task_id, STATUS_FAILED)]
+    assert load_task_result(tmp_path, task_id)["status"] == STATUS_FAILED
+
+
 def test_restore_failed_depth_terminalization_preserves_snapshot_order(
     tmp_path, monkeypatch,
 ):
