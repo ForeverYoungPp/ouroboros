@@ -171,10 +171,9 @@ changes.  Before paid work, the launcher must:
 1. probe the exact requested model through the configured OpenRouter endpoint;
 2. inspect the live provider inventory and status, model-family/date identity,
    context capacity, and requested-parameter support;
-3. choose an explicit ordered provider pool under the owner-approved Q17=C
-   fallback policy;
-4. serialize `only` and `order` in the exact JSON object selected by that
-   probe;
+3. retain automatic backend routing under the owner-approved Q17=C fallback
+   policy while requiring parameter-compatible endpoints;
+4. serialize that exact routing policy without an `only` or `order` pin;
 5. pass that object explicitly as
    `OUROBOROS_OR_PROVIDER=...` to
    `build_isolated_settings(...)` (the common settings allow-list does not
@@ -254,9 +253,9 @@ not a silent setting flip in this result.
 
 `OUROBOROS_MAX_WORKERS` is a cross-task server worker pool.  It is not a
 within-task swarm switch.  The protocol smoke starts with one lane; the
-ten-task pilot passes an explicit `--workers` value and ramps only across
-measured green boundaries, up to the validated ceiling of 10.  The server
-applies `OUROBOROS_MAX_WORKERS=10`.  The model governor's cap of 3 is
+ten-task pilot passes an explicit `--workers` value.  The owner-directed full
+capacity cohort fixes 32 lanes before launch.  The server applies
+`OUROBOROS_MAX_WORKERS=32`.  The model governor's cap of 3 is
 process-local, not global. Any higher worker/governor setting is a new
 append-only capacity cohort requiring fresh provider, Docker, network and disk
 validation. A live cohort is never resized.
@@ -465,7 +464,7 @@ The target is subordinate to the cap, provenance, capability, provider-rate,
 Docker, network, and disk gates.  Start the smoke with one independent lane.
 During the ten-task pilot, double cross-task lanes only while all measured
 health gates stay green.  Freeze the chosen full-run lane count before the
-full cohort; never resize a live cohort.  `OUROBOROS_MAX_WORKERS=10` in the
+full cohort; never resize a live cohort.  `OUROBOROS_MAX_WORKERS=32` in the
 template is a cross-task ceiling for this ramp, not permission to spawn
 within-task children.
 
@@ -490,7 +489,8 @@ explicit rootless `DOCKER_HOST`, disk headroom on `/`, `/mnt/data`, and
 
 Render a fresh settings file from the template, explicitly overriding every
 model/review/depth/budget key needed by the launcher.  Probe the exact model
-and provider pool, persist the exact applied `OUROBOROS_OR_PROVIDER` JSON,
+and automatically selected backend, persist the exact applied
+`OUROBOROS_OR_PROVIDER` JSON,
 and verify that startup telemetry agrees.  Do not start paid tasks if the
 manifest names only a template value or pre-override CLI argument.
 
@@ -558,7 +558,7 @@ The private run artifact may include a complete per-task JSONL/CSV, raw traces,
 logs, final PoCs, provider telemetry, and cleanup attestations.  The tracked
 PR includes none of those private results.  A report must state:
 
-* exact source/data/image/model/provider pins and applied settings;
+* exact source/data/image/model pins, observed provider route, and applied settings;
 * the population, order, trial count, and denominator policy;
 * headline final-submission numerator/denominator and diagnostic any-of value;
 * raw and normalized exit-code fields and the issue-15 classifier;
@@ -583,8 +583,8 @@ to each item below from source and artifacts alone:
 3. Does the applied settings file pin every active routed model slot, use task
    effort `high`, use review/scope/deep-self effort `max`, and have no
    local/legacy-heavy route or active Claude SDK slot?
-4. Does the provider manifest distinguish the template JSON from the live
-   probed `only`/`order` JSON, include observed telemetry, and disclose both
+4. Does the provider manifest record the live automatic-routing JSON and
+   observed backend telemetry, and disclose both
    persisted and runtime-injected credential grants by fingerprint?
 5. Are depth zero and the current delegation/web/MCP disabled-tool names
    present in the task contract and manifest?

@@ -358,10 +358,6 @@ def _build_default_executor(
         raise CyberGymIntegrationUnavailable(
             "the --cybergym-python executable is not available on PATH"
         )
-    if not _csv_values(getattr(args, "provider_only", ())) or not _csv_values(getattr(args, "provider_order", ())):
-        raise CyberGymIntegrationUnavailable(
-            "concrete CyberGym executor requires both --provider-only and --provider-order"
-        )
     from devtools.benchmarks.cybergym.cybergym_executor import ExecutorConfig, build_executor
 
     disabled_tools = derive_disabled_tools()
@@ -783,7 +779,7 @@ def _prepare_applied_settings(
         "OUROBOROS_SAFETY_MODE": "off",
         "OUROBOROS_CONTEXT_MODE": "max",
         "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "false",
-        "OUROBOROS_MAX_WORKERS": 10,
+        "OUROBOROS_MAX_WORKERS": MAX_CROSS_TASK_WORKERS,
         "OUROBOROS_MAX_ROUNDS": max_rounds,
         "OUROBOROS_TASK_IDLE_TIMEOUT_SEC": 900,
         "OUROBOROS_PER_TASK_COST_USD": per_task_cost_usd,
@@ -824,21 +820,11 @@ def _prepare_applied_settings(
         review_effort="max",
         scope_effort="max",
     )
-    # The provider pool is selected by a live probe in the sidecar lane.  Keep
-    # the template's safe fallback-ready shape until that callback supplies an
-    # evidence-backed ``only``/``order`` override.
+    # Keep automatic routing explicit and parameter-compatible. Optional
+    # only/order flags remain an auditable laboratory override.
     provider = {"allow_fallbacks": True, "require_parameters": True}
     provider_only = _csv_values(getattr(args, "provider_only", ()))
     provider_order = _csv_values(getattr(args, "provider_order", ()))
-    # ``argparse`` always supplies both flags for the production launcher.  A
-    # small library caller may omit them while rendering a settings snapshot;
-    # keep that pure helper usable, but never let the real paid CLI proceed
-    # without the explicit policy.
-    has_provider_flags = hasattr(args, "provider_only") or hasattr(args, "provider_order")
-    if not getattr(args, "dry_run", False) and has_provider_flags and (not provider_only or not provider_order):
-        raise CyberGymIntegrationUnavailable(
-            "paid CyberGym execution requires explicit provider-only and provider-order policy"
-        )
     if provider_only and provider_order and not set(provider_only).issubset(provider_order):
         raise CyberGymIntegrationUnavailable(
             "provider-only entries must be included in provider-order"
@@ -906,7 +892,8 @@ def _prepare_applied_settings(
         "task_abs_ceiling_sec": timeout_sec,
         "provider_policy": provider,
         "provider_probe_required": True,
-        "provider_policy_complete": bool(provider_only or provider_order),
+        "provider_policy_complete": True,
+        "provider_routing_mode": "pinned_pool" if provider_only or provider_order else "automatic",
         "provider_credentials": provider_credential_disclosure(
             output_path,
             runtime_credentials={

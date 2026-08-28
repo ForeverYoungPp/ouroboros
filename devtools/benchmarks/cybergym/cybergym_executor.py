@@ -86,7 +86,7 @@ from devtools.benchmarks.cybergym.cybergym_sidecar import (
 
 _SETTLED = frozenset({"completed", "failed", "cancelled", "rejected_duplicate"})
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
-_PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
+_PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/ -]{0,127}$")
 _GATEWAY_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _MASKED_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,255}$")
 _OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
@@ -607,8 +607,6 @@ class ExecutorConfig:
             if any(not isinstance(item, str) or not _PROVIDER_ID.fullmatch(item) for item in raw_values):
                 raise ExecutorFailure(f"{field_name} contains an unsafe provider id")
             object.__setattr__(self, field_name, tuple(dict.fromkeys(raw_values)))
-        if self.provider_probe and (not self.provider_only or not self.provider_order):
-            raise ExecutorFailure("provider probe requires explicit provider_only and provider_order")
         if self.provider_only and self.provider_order:
             overlap = set(self.provider_only) - set(self.provider_order)
             if overlap:
@@ -2065,8 +2063,6 @@ class CyberGymExecutor:
         if not self.config.provider_probe:
             self.provider_observation = {"required": False, "status": "disabled_by_injected_test"}
             return
-        if not (self.config.provider_only or self.config.provider_order):
-            raise ExecutorFailure("provider probe requires an explicit only/order pool")
         key = os.environ.get(self.config.provider_key_env, "")
         if not key or sidecar_is_placeholder_api_key(key):
             raise ExecutorFailure("OpenRouter provider key is missing or a placeholder")
@@ -2138,8 +2134,9 @@ class CyberGymExecutor:
         body = {
             "model": _EXPECTED_MODEL,
             "messages": [{"role": "user", "content": "Reply with OK."}],
-            "max_tokens": 1,
+            "max_tokens": 10,
             "temperature": 0,
+            "usage": {"include": True},
             # OpenRouter's canonical wire shape is the nested reasoning
             # object.  Keep the probe identical to the Ouroboros request path
             # rather than relying on an OpenAI-compatible alias.

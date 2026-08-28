@@ -106,9 +106,10 @@ The important distinction is the OpenRouter provider object:
   `{"allow_fallbacks":true,"require_parameters":true}`.  It intentionally
   contains no `only` or `order` list, because a stale provider allow-list is
   not evidence of a live route.
-* After a live probe of the exact model, the launcher chooses an ordered
-  provider pool, adds `only`/`order`, and writes that exact JSON as an explicit
-  `OUROBOROS_OR_PROVIDER` override to `build_isolated_settings(...)`.  The
+* A live probe of the exact model verifies the backend selected by OpenRouter
+  without pinning a provider pool, and writes that automatic-routing JSON as
+  an explicit `OUROBOROS_OR_PROVIDER` override to
+  `build_isolated_settings(...)`.  The
   probe timestamp, requested model, observed model/provider, supported
   parameters, response id, and available usage/cost metadata are recorded in
   the manifest.  If the probe cannot produce a complete record, paid work is
@@ -147,7 +148,7 @@ The template also records these run-shaping defaults:
 | Setting | Template value | Meaning |
 | --- | ---: | --- |
 | `OUROBOROS_MAX_SUBAGENT_DEPTH` | `0` | no delegation inside a measured task |
-| `OUROBOROS_MAX_WORKERS` | `10` | cross-task worker-pool ceiling, not within-task swarm |
+| `OUROBOROS_MAX_WORKERS` | `32` | cross-task worker-pool ceiling, not within-task swarm |
 | `OUROBOROS_MAX_ROUNDS` | `1000` | per-task Ouroboros loop ceiling for the current owner-authorized cohort |
 | `OUROBOROS_TASK_ABS_CEILING_SEC` | `14400` | four-hour absolute task backstop |
 | `TOTAL_BUDGET` | `3500.0` | first campaign-wide USD hard stop |
@@ -193,9 +194,9 @@ explicit contract change.
 
 `OUROBOROS_MAX_WORKERS` is the server's cross-task pool.  It is not a way to
 enable a swarm inside one task.  The protocol smoke starts with one lane.  The
-ten-task pilot then passes an explicit `--workers` value and may ramp through
-the validated ceiling of `10` only after each measured health boundary stays
-green; the isolated server records `OUROBOROS_MAX_WORKERS=10`.  Both knobs are
+ten-task pilot then passes an explicit `--workers` value.  The owner-directed
+full capacity cohort fixes `32` lanes before launch; the isolated server records
+`OUROBOROS_MAX_WORKERS=32`.  Both knobs are
 required because they govern different pools.  The per-process model governor
 remains `3`, so the aggregate provider burst is bounded by the selected
 independent workers; raising either limit requires a new append-only capacity
