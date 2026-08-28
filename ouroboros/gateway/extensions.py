@@ -1096,11 +1096,21 @@ def _skill_review_history_detail_sync(
     ]
     status = str(record.get("status") or "pending")
     terminal_reason = str(record.get("terminal_reason") or "")
+    lifecycle_status = str(
+        record.get("job_status") or record.get("lifecycle_status") or ""
+    ).strip().lower()
+    lifecycle_failed = lifecycle_status in {
+        "failed", "error", "timeout", "interrupted", "cancelled",
+    }
     # Interrupted/timeout/failed records carry no review verdict; surface the
     # terminal reason honestly instead of pretending a review body exists.
-    error_note = "" if status in {
-        STATUS_CLEAN, STATUS_WARNINGS, STATUS_BLOCKERS, STATUS_PENDING,
-    } else (terminal_reason or status)
+    error_note = (
+        terminal_reason or lifecycle_status or status
+        if lifecycle_failed
+        else ("" if status in {
+            STATUS_CLEAN, STATUS_WARNINGS, STATUS_BLOCKERS, STATUS_PENDING,
+        } else (terminal_reason or status))
+    )
     attempt = int(record.get("snapshot_attempt") or 1)
     outcome = {
         "skill": skill_name,

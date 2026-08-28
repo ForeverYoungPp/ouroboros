@@ -459,6 +459,32 @@ test('semantic history still wins when a successful lifecycle fact is present', 
     assert.equal(group.verdict, 'clean');
 });
 
+test('failed lifecycle stays visible beside a semantic clean verdict', () => {
+    const group = reviewGroupFromHistoryRow({
+        ...groupedSkillRow({
+            attempts: [{
+                job_id: 'deps-failed',
+                skill: 'alpha',
+                status: 'clean',
+                review_status: 'clean',
+                job_status: 'failed',
+                terminal_reason: 'dependency install failed',
+            }],
+        }),
+        status: 'clean',
+        review_status: 'clean',
+        job_status: 'failed',
+        terminal_reason: 'dependency install failed',
+        job_id: 'deps-failed',
+    });
+    assert.equal(group.verdict, 'clean');
+    assert.equal(group.tone, 'error');
+    assert.equal(group.lifecycleStatus, 'failed');
+    assert.equal(group.attempts[0].verdict, 'clean');
+    assert.equal(group.attempts[0].tone, 'error');
+    assert.match(renderReviewsSection([group]), /lifecycle failed/);
+});
+
 test('lifecycle completion stays neutral until a semantic review verdict arrives', () => {
     const lifecycle = reviewGroupFromLifecycle({ lifecycle: {
         kind: 'review', status: 'succeeded', target: 'alpha', job_id: 'job-live',

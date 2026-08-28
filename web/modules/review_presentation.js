@@ -70,6 +70,23 @@ function lifecycleOnlyTone(lifecycleStatus, state) {
     return statusTone(state, token);
 }
 
+function lifecycleFailure(status) {
+    const token = text(status).toLowerCase();
+    return LIFECYCLE_TERMINAL_STATES.has(token)
+        && !LIFECYCLE_SUCCESS_STATES.has(token);
+}
+
+function reviewTone(state, verdict, lifecycleStatus = '') {
+    return lifecycleFailure(lifecycleStatus)
+        ? lifecycleOnlyTone(lifecycleStatus, state)
+        : statusTone(state, verdict);
+}
+
+function lifecycleMeta(status) {
+    const token = text(status).toLowerCase();
+    return lifecycleFailure(token) ? `lifecycle ${token}` : '';
+}
+
 function hasSemanticVerdict(verdict) {
     const token = text(verdict).toLowerCase();
     return Boolean(token)
@@ -138,7 +155,7 @@ function normalizeSkillAttempt(attempt, defaults = {}, ordinal = 0) {
         state,
         tone: lifecycleOnly
             ? lifecycleOnlyTone(lifecycleStatus || explicitStatus, state)
-            : statusTone(state, rawStatus),
+            : reviewTone(state, rawStatus, lifecycleStatus),
         verdict: rawStatus,
         lifecycleStatus,
         timestamp: text(
@@ -231,9 +248,10 @@ function normalizeSkillGroup(group, row = {}, { allowRowTaskIdFallback = true } 
                 lifecycleStatus || latest?.lifecycleStatus || group.review_status || group.review_verdict,
                 state,
             )
-            : statusTone(
+            : reviewTone(
                 state,
                 text(group.verdict || group.review_status || group.status || latest?.verdict),
+                lifecycleStatus || latest?.lifecycleStatus,
             ),
         verdict: lifecycleOnly
             ? text(group.review_status || group.review_verdict || latest?.verdict)
@@ -628,7 +646,9 @@ export function mergeReviewGroup(store, incoming) {
             mergedAttempt = {
                 ...mergedAttempt,
                 state: previous.state,
-                tone: previous.tone,
+                tone: lifecycleFailure(attempt.lifecycleStatus)
+                    ? lifecycleOnlyTone(attempt.lifecycleStatus, previous.state)
+                    : previous.tone,
                 verdict: previous.verdict,
                 summary: previous.summary || attempt.summary,
                 lifecycleOnly: false,
@@ -698,7 +718,7 @@ export function mergeReviewGroup(store, incoming) {
     };
     if (staleActiveRegression) {
         merged.state = prior.state;
-        merged.tone = prior.tone;
+        merged.tone = reviewTone(merged.state, merged.verdict, merged.lifecycleStatus);
         merged.verdict = prior.verdict;
         merged.summary = prior.summary;
         merged.activeCount = prior.activeCount;
@@ -725,7 +745,11 @@ export function mergeReviewGroup(store, incoming) {
         const latestAttempt = merged.attempts.at(-1);
         if (latestAttempt) {
             merged.state = latestAttempt.state;
-            merged.tone = latestAttempt.tone;
+            merged.tone = reviewTone(
+                latestAttempt.state,
+                latestAttempt.verdict,
+                latestAttempt.lifecycleStatus,
+            );
             merged.verdict = latestAttempt.verdict || '';
             merged.summary = latestAttempt.summary || merged.summary;
             merged.lifecycleOnly = Boolean(latestAttempt.lifecycleOnly);
@@ -751,7 +775,11 @@ export function mergeReviewGroup(store, incoming) {
         // must not resurrect the older typed verdict at group level while the
         // newer attempt remains unresolved.
         merged.state = priorLatestAttempt.state;
-        merged.tone = priorLatestAttempt.tone;
+        merged.tone = reviewTone(
+            priorLatestAttempt.state,
+            priorLatestAttempt.verdict,
+            priorLatestAttempt.lifecycleStatus,
+        );
         merged.verdict = priorLatestAttempt.verdict || '';
         merged.summary = priorLatestAttempt.summary || merged.summary;
         merged.lifecycleOnly = true;
@@ -779,7 +807,11 @@ export function mergeReviewGroup(store, incoming) {
         // not known when the newer row arrived live. Keep the group header tied
         // to the newer proved attempt; the older row remains inspectable below.
         merged.state = priorLatestAttempt.state;
-        merged.tone = priorLatestAttempt.tone;
+        merged.tone = reviewTone(
+            priorLatestAttempt.state,
+            priorLatestAttempt.verdict,
+            priorLatestAttempt.lifecycleStatus,
+        );
         merged.verdict = priorLatestAttempt.verdict;
         merged.summary = priorLatestAttempt.summary || merged.summary;
         merged.lifecycleOnly = false;
@@ -900,6 +932,7 @@ function attemptMeta(attempt) {
         attempt.verdict || (attempt.lifecycleOnly
             ? (['queued', 'running'].includes(attempt.state) ? attempt.state : 'review verdict unavailable')
             : ''),
+        lifecycleMeta(attempt.lifecycleStatus),
         attempt.superseded ? 'superseded' : '',
         attempt.replayed ? 'replay' : '',
         attempt.revised ? 'revised snapshot' : '',
@@ -1027,7 +1060,7 @@ export function renderReviewsSection(groupsInput, disclosure = {}) {
                     </span>
                     <span class="chat-review-group-meta">${escapeHtmlText([group.verdict || (group.lifecycleOnly
                         ? (['queued', 'running'].includes(group.state) ? group.state : 'review verdict unavailable')
-                        : group.state), shown].filter(Boolean).join(' · '))}</span>
+                        : group.state), lifecycleMeta(group.lifecycleStatus), shown].filter(Boolean).join(' · '))}</span>
                 </button>
                 <div class="chat-review-attempts"${groupExpanded ? '' : ' hidden'}>
                     <div class="chat-review-group-cost">Cost unavailable</div>

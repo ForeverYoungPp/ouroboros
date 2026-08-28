@@ -130,6 +130,22 @@ def test_review_history_detail_found_record_renders_private_markdown(tmp_path):
     ) in markdown
 
 
+def test_review_history_detail_surfaces_failed_lifecycle_with_clean_verdict(tmp_path):
+    client, drive_root = _detail_client(tmp_path)
+    append_jsonl(_history_path(drive_root, "alpha"), _terminal_record(
+        status="clean",
+        job_status="failed",
+        terminal_reason="dependency install failed",
+    ))
+
+    markdown = client.get(
+        "/api/skills/alpha/review-history/skill-job-1",
+    ).json()["markdown"]
+
+    assert "`alpha` — status=clean" in markdown
+    assert "Error: dependency install failed" in markdown
+
+
 def test_review_history_detail_keeps_legacy_same_model_actors_distinct(tmp_path):
     client, drive_root = _detail_client(tmp_path)
     actors = []
