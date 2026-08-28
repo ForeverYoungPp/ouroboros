@@ -68,6 +68,17 @@ test('live task_done and replay/log task truth have phase and headline parity', 
     );
 });
 
+test('typed terminal status drives an error phase on live and replay cards', () => {
+    const failed = { task_terminal_status: 'failed' };
+    assert.equal(taskTerminalPhase(failed), 'error');
+    assert.equal(taskDoneIsTerminal(failed), true);
+    assert.match(
+        chatSource,
+        /const replayPhase = msg\.task_terminal_status\s*\? taskTerminalPhase\(msg\)\s*:\s*replayTerminalPhase\(taskState, record\);/,
+    );
+    assert.match(chatSource, /finishLiveCard\(explicitTaskId, taskTerminalPhase\(msg\)\);/);
+});
+
 test('interrupted task_done remains retryable and cannot finish a root card', () => {
     const evt = {
         type: 'task_done', status: 'interrupted',
@@ -252,7 +263,7 @@ test('history replay keeps open summaries live and terminal fallbacks factual', 
     } }), 'error');
     assert.equal(replayTerminalPhase({ completedPhase: 'warn' }, {}), 'warn');
     assert.equal(
-        [...chatSource.matchAll(/finishLiveCard\(taskId, replayTerminalPhase\(taskState, record\)\)/g)].length,
+        [...chatSource.matchAll(/finishLiveCard\(taskId, replayPhase\)/g)].length,
         2,
     );
     assert.doesNotMatch(

@@ -271,8 +271,15 @@ export function ownerHurryProjection(evt) {
     };
 }
 
+function normalizeTaskTerminalRecord(evt) {
+    if (!evt || typeof evt !== 'object') return evt || {};
+    const terminalStatus = String(evt.task_terminal_status || '').trim();
+    return terminalStatus ? { ...evt, status: terminalStatus } : evt;
+}
+
 export function taskOutcomeSeverity(evt) {
-    const lifecycle = String(evt.outcome_axes?.lifecycle?.status || evt.status || '').toLowerCase();
+    const record = normalizeTaskTerminalRecord(evt);
+    const lifecycle = String(record.outcome_axes?.lifecycle?.status || record.status || '').toLowerCase();
     // v6.82 (P5): a cancelled task is neither Done nor Failed — it is honestly
     // Cancelled. Checked first: forced teardown routinely leaves failure-shaped
     // side facts (e.g. artifacts missing on a cancelled workspace task) that must
@@ -283,11 +290,11 @@ export function taskOutcomeSeverity(evt) {
     if (lifecycle === 'cancelled' || lifecycle === 'cancel_requested') {
         return 'cancelled';
     }
-    const execution = String(evt.outcome_axes?.execution?.status || '').toLowerCase();
-    const objective = String(evt.outcome_axes?.objective?.status || '').toLowerCase();
-    const review = String(evt.outcome_axes?.review?.status || evt.review_status?.status || '').toLowerCase();
-    const artifacts = String(evt.outcome_axes?.artifacts?.status || evt.artifact_bundle?.status || evt.artifact_status || '').toLowerCase();
-    const artifactStatus = String(evt.artifact_bundle?.status || evt.artifact_status || '').toLowerCase();
+    const execution = String(record.outcome_axes?.execution?.status || '').toLowerCase();
+    const objective = String(record.outcome_axes?.objective?.status || '').toLowerCase();
+    const review = String(record.outcome_axes?.review?.status || record.review_status?.status || '').toLowerCase();
+    const artifacts = String(record.outcome_axes?.artifacts?.status || record.artifact_bundle?.status || record.artifact_status || '').toLowerCase();
+    const artifactStatus = String(record.artifact_bundle?.status || record.artifact_status || '').toLowerCase();
     if (
         lifecycle === 'failed'
         || ['failed', 'infra_failed'].includes(execution)
@@ -308,7 +315,7 @@ export function taskOutcomeSeverity(evt) {
         || ['degraded', 'best_effort'].includes(execution)
         || ['degraded', 'best_effort'].includes(objective)
         || review === 'degraded'
-        || Boolean(evt.outcome_axes?.objective?.warning)
+        || Boolean(record.outcome_axes?.objective?.warning)
     ) {
         return 'warn';
     }
@@ -347,8 +354,9 @@ export function isTerminalTaskDetail(record) {
 // frames, not in durable detail (`done`, and the pre-cancel-redesign settled
 // `cancel_requested` event spelling).
 export function taskDoneIsTerminal(evt) {
-    const status = String(evt?.status || '').toLowerCase();
-    return isTerminalTaskDetail(evt) || status === 'done' || status === 'cancel_requested';
+    const record = normalizeTaskTerminalRecord(evt);
+    const status = String(record?.status || '').toLowerCase();
+    return isTerminalTaskDetail(record) || status === 'done' || status === 'cancel_requested';
 }
 
 // One factual phase -> presentation vocabulary for task chips and terminal

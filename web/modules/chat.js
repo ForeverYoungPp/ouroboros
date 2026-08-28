@@ -3140,7 +3140,10 @@ export function createChatInstance({
                             routeSubagentFinalMessageToCard(taskId, msg);
                             const taskState = getTaskUiState(taskId, false);
                             const record = liveCardRecords.get(taskId);
-                            finishLiveCard(taskId, replayTerminalPhase(taskState, record));
+                            const replayPhase = msg.task_terminal_status
+                                ? taskTerminalPhase(msg)
+                                : replayTerminalPhase(taskState, record);
+                            finishLiveCard(taskId, replayPhase);
                             continue;
                         }
                         insertCardIfNeeded(taskId);
@@ -3150,7 +3153,10 @@ export function createChatInstance({
                         } else {
                             const taskState = getTaskUiState(taskId, false);
                             const record = liveCardRecords.get(taskId);
-                            finishLiveCard(taskId, replayTerminalPhase(taskState, record));
+                            const replayPhase = msg.task_terminal_status
+                                ? taskTerminalPhase(msg)
+                                : replayTerminalPhase(taskState, record);
+                            finishLiveCard(taskId, replayPhase);
                         }
                     }
                     // A replayed durable routing receipt carries the same
@@ -4265,7 +4271,9 @@ export function createChatInstance({
                 return;
             }
             if (finalizing) markLiveCardFinalizing(explicitTaskId);
-            else if (explicitTaskId && typedTerminal) finishLiveCard(explicitTaskId);
+            else if (explicitTaskId && typedTerminal) {
+                finishLiveCard(explicitTaskId, taskTerminalPhase(msg));
+            }
             if (!finalizing && typedTerminal) markAssistantReply(explicitTaskId);
             clearTransientRoutingAnnotations();
             addMessage(msg.content, msg.role, msg.markdown, msg.ts || null, false, {

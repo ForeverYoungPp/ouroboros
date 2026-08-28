@@ -14,6 +14,7 @@ import {
 import {
     isTerminalTaskDetail,
     summarizeChatLiveEvent,
+    taskOutcomeSeverity,
     taskTerminalPhase,
 } from '../modules/log_events.js';
 
@@ -260,4 +261,11 @@ test('history terminal truth requires a positive typed fact', () => {
     assert.equal(positiveTaskTerminalFact({
         delegation_role: 'subagent', task_id: 'child', subagent_event: 'interrupted',
     }), false);
+});
+
+test('typed terminal status is the phase authority even without a legacy status field', () => {
+    assert.equal(taskOutcomeSeverity({ task_terminal_status: 'failed' }), 'error');
+    assert.equal(taskTerminalPhase({ task_terminal_status: 'failed' }), 'error');
+    assert.equal(taskOutcomeSeverity({ task_terminal_status: 'cancelled' }), 'cancelled');
+    assert.equal(taskTerminalPhase({ task_terminal_status: 'completed' }), 'done');
 });
