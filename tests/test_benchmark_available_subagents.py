@@ -39,6 +39,7 @@ PROFILE_TARGETS = {
     "devtools/benchmarks/osworld/settings_base.json": "anthropic/claude-sonnet-4.6",
     "devtools/benchmarks/programbench/settings_base.json": "openai/gpt-5.5",
     "devtools/benchmarks/continual_learning/settings_base.json": "anthropic/claude-sonnet-4.6",
+    "devtools/benchmarks/cybergym/settings_base.json": "deepseek/deepseek-v4-flash-0731",
     "devtools/benchmarks/swe_bench_pro/e1v2/settings_base.json": "anthropic/claude-sonnet-4.5",
     "devtools/benchmarks/swe_bench_pro/e1v2/settings_sonnet46_probe.json":
         "anthropic/claude-sonnet-4.6",
