@@ -85,6 +85,33 @@ def restore_terminalization_retry(
     return restored
 
 
+def restore_terminalization_retry_rows(
+    tasks: list[Dict[str, Any]], *, pending: list[Dict[str, Any]],
+    running: Dict[str, Any], queue_seq_counter_ref: Dict[str, Any], sort_pending: Any,
+) -> tuple[list[Dict[str, Any]], dict[str, Dict[str, Any]], int]:
+    """Restore marker rows and return ordinary rows plus their lineage map."""
+    from supervisor import queue
+
+    preferred = prefer_terminalization_retry_rows(tasks)
+    pending_by_id = {
+        str(task.get("id") or ""): task for task in preferred if str(task.get("id") or "")
+    }
+    ordinary: list[Dict[str, Any]] = []
+    restored = 0
+    with queue._queue_lock:
+        for task in preferred:
+            if not isinstance(task.get("_terminalization_retry"), dict):
+                ordinary.append(task)
+                continue
+            row = restore_terminalization_retry(
+                task, pending=pending, running=running,
+                queue_seq_counter_ref=queue_seq_counter_ref, sort_pending=sort_pending,
+            )
+            if row is not None and not row.get("_admission_blocked"):
+                restored += 1
+    return ordinary, pending_by_id, restored
+
+
 def parse_schedule_task_depth(
     ctx: Any,
     evt: Dict[str, Any],

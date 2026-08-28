@@ -160,6 +160,72 @@ def test_terminalization_retry_restore_survives_durable_result_until_event_publi
     assert load_task_result(tmp_path, task_id)["status"] == STATUS_FAILED
 
 
+@pytest.mark.parametrize(
+    "fence_case", ["active", "sealed", "malformed_acceptance", "malformed_budget"],
+)
+def test_terminalization_retry_restore_precedes_fence_validation(
+    tmp_path, monkeypatch, fence_case,
+):
+    """Fence metadata must not discard a non-dispatchable terminal-event marker."""
+    from ouroboros.task_results import STATUS_FAILED, load_task_result, write_task_result
+    from ouroboros.utils import utc_now_iso
+    from supervisor import queue
+
+    pending, running = [], {}
+    queue.init_queue_refs(pending, running, {"value": 0})
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    snapshot_path = tmp_path / "state" / "queue_snapshot.json"
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snapshot_path)
+    queue.ACCEPTANCE_FENCES.clear()
+    queue.BUDGET_ROOT_FENCES.clear()
+    queue.ADMISSION_RESERVATIONS.clear()
+
+    task_id = f"fenced-terminal-event-{fence_case}"
+    task = {
+        "id": task_id,
+        "type": "task",
+        "chat_id": 0,
+        "depth": -1,
+        "root_task_id": "fenced-root",
+        "_terminalization_retry": {
+            "status": STATUS_FAILED,
+            "reason": "terminal event was not published before shutdown",
+            "trigger": "worker_pool_kill",
+        },
+    }
+    acceptance = []
+    budget = []
+    if fence_case in {"active", "sealed"}:
+        acceptance = [{
+            "root_task_id": "fenced-root",
+            "task_id": "fenced-root",
+            "status": fence_case,
+            "token": "f" * 32,
+        }]
+    elif fence_case == "malformed_acceptance":
+        acceptance = {"invalid": True}
+    else:
+        budget = {"invalid": True}
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text(
+        json.dumps({
+            "ts": utc_now_iso(),
+            "pending": [{"id": task_id, "queue_seq": 1, "task": task}],
+            "running": [],
+            "acceptance_fences": acceptance,
+            "budget_root_fences": budget,
+        }),
+        encoding="utf-8",
+    )
+    write_task_result(tmp_path, task_id, STATUS_FAILED, result="already durable")
+
+    assert queue.restore_pending_from_snapshot() == 1
+    assert [row["id"] for row in pending] == [task_id]
+    assert load_task_result(tmp_path, task_id)["status"] == STATUS_FAILED
+    persisted = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert [row["task"]["id"] for row in persisted["pending"]] == [task_id]
+
+
 def test_restore_failed_depth_terminalization_preserves_snapshot_order(
     tmp_path, monkeypatch,
 ):

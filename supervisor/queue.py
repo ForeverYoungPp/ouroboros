@@ -141,7 +141,7 @@ _queue_lock = threading.RLock()
 _last_skill_schedule_sync: float = 0.0
 _SKILL_SCHEDULE_SYNC_INTERVAL_SEC: float = 60.0
 from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
-    coerce_queue_order, prefer_terminalization_retry_rows, reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission, restore_terminalization_retry, reserve_task_admission,
+    coerce_queue_order, prefer_terminalization_retry_rows, reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission, restore_terminalization_retry, restore_terminalization_retry_rows, reserve_task_admission,
 )
 # Variant A off-loop worker reaper lives in supervisor/task_reaper.py (module size); re-export
 # the thin names the enforce path and tests use — monkeypatching these queue names still works.
@@ -849,7 +849,10 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
             for row in (snap.get("pending") or [])
             if isinstance(row, dict) and isinstance(row.get("task"), dict)
         ]
-        snapshot_pending = prefer_terminalization_retry_rows(snapshot_pending)
+        snapshot_pending, pending_by_id, restored = restore_terminalization_retry_rows(
+            snapshot_pending, pending=PENDING, running=RUNNING,
+            queue_seq_counter_ref=QUEUE_SEQ_COUNTER_REF, sort_pending=sort_pending,
+        )
         fenced_roots, malformed_fences, malformed_budget_fences = restore_queue_fences(raw_fences, raw_budget_fences)
         if malformed_budget_fences:
             append_jsonl(
@@ -857,7 +860,7 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                 {"ts": utc_now_iso(), "type": "queue_restore_invalid_budget_root_fences",
                  "action": "fail_closed_no_restore"},
             )
-            return 0
+            return restored
         if malformed_fences:
             affected = [str(task.get("id") or "") for task in snapshot_pending if task.get("id")]
             append_jsonl(
@@ -886,12 +889,9 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                         )
             except Exception:
                 log.warning("Failed to terminalize tasks from invalid acceptance-fence snapshot", exc_info=True)
-            return 0
+            return restored
 
-        pending_by_id = {
-            str(task.get("id") or ""): task for task in snapshot_pending if str(task.get("id") or "")
-        }
-        restored, skipped_terminal, invalid_depth_restore = 0, 0, []
+        skipped_terminal, invalid_depth_restore = 0, []
         skipped_fenced, blocked_restore = [], []
         for task in snapshot_pending:
             chat_id = task.get("chat_id")
