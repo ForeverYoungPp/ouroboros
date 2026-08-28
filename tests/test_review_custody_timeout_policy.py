@@ -519,6 +519,89 @@ def test_review_owner_deadline_rechecked_after_prompt_persistence(
     assert actor["status"] == "not_dispatched"
 
 
+def test_coordinator_rejoins_exact_recovery_after_spent_owner_deadline(
+    tmp_path, monkeypatch,
+):
+    """The public coordinator must not launder a paid recovery as $0 dispatch."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import (
+        merge_frozen_review_reconciliation, prepare_frozen_review_reconciliation,
+    )
+    from ouroboros.review_execution import ReviewAttemptResult
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+
+    class RecoveringExecutor:
+        def __init__(self):
+            self.state = None
+            self.execute_calls = 0
+
+        def restore_custody(self, state):
+            self.state = state
+
+        def set_pending_invocation_checkpoint(self, _checkpoint):
+            return None
+
+        def prompt_payload(self):
+            return {"session_prompt": "review"}
+
+        def prompt_chars(self):
+            return 6
+
+        def execute(self):
+            self.execute_calls += 1
+            return ReviewAttemptResult(
+                message={"content": "[]"}, usage={}, raw_text="[]",
+            )
+
+        def failure_custody(self):
+            return dict(self.state or {})
+
+    executor = RecoveringExecutor()
+    monkeypatch.setattr(
+        "ouroboros.review_substrate._review_route_executor",
+        lambda *_args, **_kwargs: executor,
+    )
+    ctx = SimpleNamespace(
+        task_id="spent-recovery",
+        drive_root=tmp_path,
+        task_metadata={"deadline_at": "2000-01-01T00:00:00Z"},
+    )
+    prepare_frozen_review_reconciliation(ctx, SimpleNamespace(
+        triad_raw_results=[{
+            "slot_id": "slot-1", "model_id": "test/model", "status": "error",
+            "operation_id": "op-existing", "operation_state": "in_flight",
+            "late_result_pending": True, "pending_invocation_id": "inv-existing",
+        }],
+        scope_raw_result={},
+    ))
+    request = ReviewRequest(
+        surface="multi_model_review", goal="review", task_id="spent-recovery",
+        retry_key="commit_review:spent-recovery", reconcile_only=True,
+        deadline_at="2000-01-01T00:00:00Z",
+    )
+    result = run_review_request(
+        request,
+        slots=[ReviewSlot(
+            slot_id="slot-1", model="test/model",
+            route="agent_session",
+        )],
+        drive_root=tmp_path,
+        usage_ctx=ctx,
+    )
+
+    actor = result.actors[0]
+    assert executor.execute_calls == 1
+    assert actor["operation_id"] == "op-existing"
+    assert actor["operation_state"] == "settled"
+    assert actor["status"] == "ok"
+    ctx._last_triad_raw_results = result.actors
+    merge_frozen_review_reconciliation(ctx)
+    row = ctx._last_triad_raw_results[0]
+    assert row["operation_state"] == "settled"
+    assert row.get("pending_invocation_id", "") == ""
+
+
 def test_durable_triad_and_scope_rows_carry_delegated_restart_identity():
     from ouroboros.tools.review import _parse_model_response
     from ouroboros.tools.review_helpers import build_scope_actor_record

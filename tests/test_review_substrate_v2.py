@@ -2554,10 +2554,10 @@ def test_undeliverable_route_is_a_typed_refusal_not_a_fallback(tmp_path):
         raise AssertionError("unimplemented route must raise ReviewRouteUnavailable")
     assert llm.calls == []
 
-    # The refusal is contained: the slot errors, the panel stays honest.
+    # The refusal is contained before dispatch: the panel stays honest and free.
     result = run_review_request(request, slots=[slot], drive_root=tmp_path, llm=llm)
     assert result.aggregate_signal == "DEGRADED"
-    assert result.actors[0]["status"] == "error"
+    assert result.actors[0]["status"] == "not_dispatched"
     assert llm.calls == []
 
 

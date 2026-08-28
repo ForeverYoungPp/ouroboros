@@ -45,12 +45,16 @@ from ouroboros.review_execution import (  # noqa: F401  (compat re-exports)
     assert_cache_breakpoint_cap,
     configured_review_routes,
 )
-from ouroboros.review_custody import review_retry_cancelled
+from ouroboros.review_custody import (
+    _ReviewAttemptHistory, _review_exception_projection,
+    review_retry_cancelled,
+)
 # Reviewer-output JSON extraction lives in ONE place beside the array
 # extractor it falls back to (the fenced-object and verdict parsers were
 # split across two modules for no reason).
 from ouroboros.triad_review import parse_review_findings
 from ouroboros.usage_accounting import (
+    PhysicalAttemptLimitExceeded,
     UsageAccountingError,
     UsageScope,
     current_usage_scope,
@@ -1303,6 +1307,7 @@ class ReviewCoordinator:
         prompt_ref: Dict[str, Any] = {}
         response_ref: Dict[str, Any] = {}
         start = time.time()
+        attempt_history = _ReviewAttemptHistory()
         try:
             prompt_ref = persist_call(
                 self.drive_root,
@@ -1352,7 +1357,18 @@ class ReviewCoordinator:
         owner_deadline = str(getattr(request, "deadline_at", "") or "")
         from ouroboros.config import get_finalization_grace_sec
         from ouroboros.deadline_utils import owner_deadline_exhausted
-        if owner_deadline_exhausted(
+        # An exact delegated recovery has already crossed the paid boundary and
+        # carries both the durable invocation token and its operation id.  It is
+        # a settlement join, not a fresh dispatch, so the small custody window
+        # selected by ``run_custodied_review_slots`` must remain usable after the
+        # owner deadline.  The executor still validates the token and refuses a
+        # missing/mismatched durable record before any new POST.
+        recovery_token = str(
+            (retry_state or {}).get("pending_invocation_id") or ""
+        ).strip()
+        exact_recovery = bool(recovery_token and str(operation_id or "").strip()
+            and str(getattr(slot.route, "value", slot.route) or "") == "agent_session")
+        if not exact_recovery and owner_deadline_exhausted(
             deadline_at=owner_deadline, reserve_sec=get_finalization_grace_sec(),
         ):
             return self._error_actor(
@@ -1402,16 +1418,27 @@ class ReviewCoordinator:
                             assignment, llm=self.llm, executor=executor,
                         )
                         msg, usage, raw_text = attempt.message, attempt.usage, attempt.raw_text
-                    except UsageAccountingError:
+                        attempt_history.observe()
+                    except UsageAccountingError as exc:
+                        attempt_history.observe(exc)
+                        if isinstance(exc, PhysicalAttemptLimitExceeded):
+                            # The rail raises only after its maximum claims have
+                            # already succeeded; the current reservation is the
+                            # released, unpaid one and must not erase those sends.
+                            attempt_history.dispatched = True
                         # Budget/ledger/rail failures never trigger another send;
-                        # retain a prior malformed answer as forensic evidence.
-                        if _prior_text:
+                        # retain a prior response, including an empty response,
+                        # as forensic evidence.
+                        if _has_prior:
                             msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
+                            if _prior_msg is None:
+                                msg, usage, raw_text = _last_msg, _last_usage, _last_text
                             break
                         raise
                     except Exception as exc:
+                        attempt_history.observe(exc)
                         from ouroboros.review_custody import retryable_review_exception
-                        if not retryable_review_exception(exc, self.usage_ctx):
+                        if not retryable_review_exception(exc, self.usage_ctx, attempt_history):
                             raise
                         if actor_attempt + 1 < actor_attempts:
                             if (
@@ -1420,10 +1447,10 @@ class ReviewCoordinator:
                             ):
                                 raise
                             continue
-                        if _prior_text:
+                        if _has_prior:
                             # The repair RESEND failed (transport, timeout): keep the
-                            # malformed-but-substantive first answer as forensics.
-                            msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
+                            # first answer, including an empty response, as forensics.
+                            msg, usage, raw_text = _last_msg, _last_usage, _last_text
                             break
                         raise
                     _last_msg, _last_usage, _last_text, _has_prior = msg, usage, raw_text, True
@@ -1502,20 +1529,26 @@ class ReviewCoordinator:
                 )
             except Exception:
                 response_ref = {}
-            http_status = getattr(exc, "status_code", None)
+            (
+                failure_custody, _capture_state, http_status,
+                operation_state, failure_code,
+            ) = _review_exception_projection(
+                exc, executor.failure_custody(), attempt_history, retry_state,
+            )
             return ReviewActorRecord(
                 slot_id=slot.slot_id,
                 model=slot.model,
                 status="error",
                 error=sanitize_tool_result_for_log(error_msg),
                 transport_status=_transport_error_status(exc),
-                failure_code=str(getattr(exc, "code", "") or ""),
+                failure_code=failure_code,
                 reset_at=str(getattr(exc, "reset_at", "") or ""),
                 http_status=http_status if isinstance(http_status, int) and http_status else None,
-                usage=executor.failure_custody(),
+                usage=failure_custody,
                 prompt_ref=prompt_ref,
                 response_ref=response_ref,
                 duration_sec=round(time.time() - start, 3),
+                operation_state=operation_state,
             )
 
     def _emit_usage(

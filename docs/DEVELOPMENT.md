@@ -1920,6 +1920,9 @@ Before every commit, verify the following:
   attempt and remain bound to its retry identity. Once the owner deadline minus
   finalization reserve is spent, an unstarted review row is a typed `$0
   not_dispatched` actor: no worker, paid stamp, or active lease is created.
+  An already-paid in-flight review wave remains eligible for exact custody
+  reconciliation after that deadline; this settlement path does not authorize
+  a new dispatch or extend the task's cognition window.
   A commit attempt cannot treat an in-flight reviewer as a final quorum verdict,
   including under advisory enforcement. Plan review applies the same rule: if a
   paid actor remains in flight, the wave is projected as the existing open
@@ -1928,7 +1931,32 @@ Before every commit, verify the following:
   the wave cannot close until custody settles.
 - [ ] A returned provider response (including an empty/incomplete body) or typed
   terminal 408/429/5xx is settled and may use the surface's bounded retry/repair
-  rail. A dispatched request whose socket or stream ends without terminal
+  rail. During a mixed plan/commit cycle, the typed settled terminal API actor
+  remains in the exact cycle's replay roster even when optional physical-attempt
+  capture metadata is absent; when that metadata is present it must say `settled`,
+  while explicit `reserved` or `released` states remain eligible for a real retry
+  rather than becoming sticky replay rows. `dispatched` or `unresolved` states
+  without a typed terminal HTTP status stay under the custody-lost/no-resend
+  classification; with such a status they are retained as terminal actors for
+  same-cycle replay, never as a second physical send. An identical envelope
+  never buys a settled actor twice, and a new retry cycle uses a new key. A
+  pre-write-ahead route/configuration/admission refusal is a retryable
+  `$0 not_dispatched` actor even though the host minted a synthetic operation id;
+  a later checkpoint failure cannot erase an already-fired paid stamp.
+  Positive `settled`/`dispatched`/`unresolved` capture evidence outranks a
+  contradictory synthetic `not_dispatched` label; only `reserved`/`released`
+  is pre-dispatch. Reuse the physical-state vocabulary exported by
+  `usage_accounting`, never a surface-local copy.
+  Carry `physical_attempt_state` and `provider_status_code` through durable plan
+  rows and frozen actors. Across one bounded retry rail, retain the strongest
+  earlier capture: a later released reservation or budget refusal cannot erase a
+  prior dispatch, and any unknown prior outcome monotonically forces no-resend.
+  For non-Skill-Review delegated surfaces, a supplied retry token with no valid
+  durable invocation is `review_custody_lost` before route/project/POST work; it
+  is never reinterpreted as permission for a fresh paid session. Recovery also
+  binds the token to the recorded delegated surface, slot, and operation; an API
+  row has no durable-token recovery authority without process-local custody.
+  A dispatched request whose socket or stream ends without terminal
   provider evidence is `provider_outcome_unknown`: no same-model, fallback,
   provider, local-server, or forced-final resend until custody settles.
 - [ ] A reviewed mutative wrapper must retain foreground custody until the
