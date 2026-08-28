@@ -559,6 +559,72 @@ def test_window_metadata_reports_quota_truncation(tmp_path):
     assert len(payload["messages"]) == 3  # the slice actually applied
 
 
+def test_review_references_use_the_progress_window_without_consuming_telemetry(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text("", encoding="utf-8")
+    rows = [
+        {
+            "ts": f"2026-08-28T00:00:0{i}Z",
+            "type": "review_reference",
+            "surface": "plan_review",
+            "task_id": f"owner-{i}",
+            "presentation_owner_task_id": f"owner-{i}",
+            "review_fingerprint": str(i) * 64,
+            "state_revision": f"revision-{i}",
+            "content": "",
+        }
+        for i in range(5)
+    ]
+    rows.append({
+        "ts": "2026-08-28T00:00:05Z",
+        "type": "review_reference",
+        "surface": "plan_review",
+        "task_id": "owner-1",
+        "presentation_owner_task_id": "owner-1",
+        "review_fingerprint": "a" * 64,
+        "state_revision": "revision-1-new",
+        "content": "",
+    })
+    rows.extend({
+        "ts": f"2026-08-28T00:01:0{i}Z",
+        "task_id": "root",
+        "content": f"telemetry-{i}",
+    } for i in range(4))
+    (logs / "progress.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8",
+    )
+
+    payload = _run_full(tmp_path, {"n_progress": "3"})
+    references = [
+        row for row in payload["messages"]
+        if row.get("system_type") == "review_reference"
+    ]
+    telemetry = [
+        row for row in payload["messages"]
+        if row.get("is_progress") and row.get("system_type") != "review_reference"
+    ]
+    assert [row["presentation_owner_task_id"] for row in references] == [
+        "owner-3", "owner-4", "owner-1",
+    ]
+    assert references[-1]["state_revision"] == "revision-1-new"
+    assert [row["text"] for row in telemetry] == [
+        "telemetry-1", "telemetry-2", "telemetry-3",
+    ]
+    assert payload["window"] == {"complete": False, "truncated_by": ["quota"]}
+
+    expanded = _run_full(tmp_path, {"n_progress": "10"})
+    assert len([
+        row for row in expanded["messages"]
+        if row.get("system_type") == "review_reference"
+    ]) == 5
+    assert expanded["window"] == {"complete": True, "truncated_by": []}
+    assert not [
+        row for row in _run(tmp_path, {"n_progress": "0"})
+        if row.get("system_type") == "review_reference"
+    ]
+
+
 def test_window_metadata_reports_quota_when_slice_cuts_only_system_rows(tmp_path):
     """MAJOR review fix: direction:"system" rows (per-task task_summary) do not
     count toward the reader's in/out quota, but the n_human tail slice still

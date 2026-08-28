@@ -1133,12 +1133,12 @@ def _apply_window_quotas(
     combined: list,
     n_human: int,
     n_progress: int,
-) -> tuple[list, Dict[str, Dict[str, Any]], bool, bool, str, set]:
+) -> tuple[list, Dict[str, Dict[str, Any]], bool, bool, bool, str, set]:
     """Quota slicing, origin fallback, and the lineage floor/cap (perf2 P3).
 
     Returns ``(messages, result_cache, human_rows_dropped, lineage_truncated,
-    floor, active_children)`` for the annotation pass and the window metadata
-    (the last two feed the chat-final lineage strip in
+    review_references_truncated, floor, active_children)`` for annotation and
+    window metadata (the last two feed the chat-final lineage strip in
     ``_annotate_terminal_task_truth``).
     """
     # Tail human conversation and progress telemetry with SEPARATE quotas so a
@@ -1195,9 +1195,9 @@ def _apply_window_quotas(
         except Exception:
             log.debug("Project origin fallback synthesis failed", exc_info=True)
     # Plan references are durable invalidations on the existing progress rail.
-    # They neither consume visible telemetry quota nor need every historical
-    # revision: task detail remains authority, so the latest ref per owner is
-    # sufficient to rehydrate after reload.
+    # They do not consume visible telemetry quota. Task detail remains
+    # authority, so keep only the latest ref per owner, then independently cap
+    # the overlay to the same requested progress window.
     review_references_by_owner: Dict[tuple[str, str], Dict[str, Any]] = {}
     for message in progress:
         if str(message.get("system_type") or "") != "review_reference":
@@ -1207,7 +1207,11 @@ def _apply_window_quotas(
             str(message.get("presentation_owner_task_id") or message.get("task_id") or ""),
         )
         review_references_by_owner[key] = message
-    review_references = list(review_references_by_owner.values())
+    review_references = sorted(
+        review_references_by_owner.values(), key=lambda m: m.get("ts", ""),
+    )
+    review_references_truncated = len(review_references) > n_progress
+    review_references = review_references[-n_progress:] if n_progress > 0 else []
     other = [
         m for m in progress
         if not _is_subagent_lineage(m)
@@ -1259,7 +1263,7 @@ def _apply_window_quotas(
     )
     return (
         messages, result_cache, human_rows_dropped, lineage_truncated,
-        floor, active_children,
+        review_references_truncated, floor, active_children,
     )
 
 
@@ -1273,6 +1277,7 @@ def _window_metadata(
     archive_dir: pathlib.Path,
     human_rows_dropped: bool,
     lineage_truncated: bool,
+    review_references_truncated: bool,
     stream_gaps: Optional[Dict[str, set[str]]] = None,
 ) -> Dict[str, Any]:
     """Additive window metadata (perf2 P3; frozen contract extended explicitly).
@@ -1293,6 +1298,7 @@ def _window_metadata(
             progress_quota_rows, n_progress, _live_log_size(progress_path),
             _archive_segment_count(archive_dir, "progress"),
         ),
+        "quota" if review_references_truncated else None,
         "lineage_cap" if lineage_truncated else None,
     ):
         if cause and cause not in truncated_by:
@@ -1342,10 +1348,11 @@ def _assemble_history_response(
     lifecycle_row = _active_lifecycle_row(row_matches_thread)
     if lifecycle_row is not None:
         combined.append(lifecycle_row)
-    messages, result_cache, human_rows_dropped, lineage_truncated, floor, active_children = (
-        _apply_window_quotas(
-            data_dir, thread_id, project_chat_ids, combined, n_human, n_progress
-        )
+    (
+        messages, result_cache, human_rows_dropped, lineage_truncated,
+        review_references_truncated, floor, active_children,
+    ) = _apply_window_quotas(
+        data_dir, thread_id, project_chat_ids, combined, n_human, n_progress
     )
 
     # Annotate progress messages whose task already reached a terminal (or
@@ -1382,7 +1389,7 @@ def _assemble_history_response(
         "window": _window_metadata(
             chat_quota_rows, progress_quota_rows, n_human, n_progress,
             chat_path, progress_path, archive_dir,
-            human_rows_dropped, lineage_truncated,
+            human_rows_dropped, lineage_truncated, review_references_truncated,
             {"chat": chat_gaps, "progress": progress_gaps},
         ),
     }
