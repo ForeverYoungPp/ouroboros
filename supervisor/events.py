@@ -3887,20 +3887,19 @@ def _handle_cancel_task(evt: Dict[str, Any], ctx: Any) -> None:
             f"⚠️ cancel {display_task_id or '?'}: no such live task (event)",
         )
     else:
+        incident_meta = {
+            "task_incident": "cancellation_fault",
+            "toast_once": f"{display_task_id or 'unknown'}:cancellation_fault",
+        }
+        if task_id and display_task_id != task_id:
+            incident_meta["cancel_physical_task_id"] = task_id
         ctx.send_with_budget(
             int(owner_chat_id),
             f"❌ cancel {display_task_id or '?'} did not settle — the task is still live; "
             "the durable cancel intent stays open and the supervisor watchdog retries (event)",
             is_progress=True,
             task_id=display_task_id,
-            progress_meta={
-                "task_incident": "cancellation_fault",
-                "toast_once": f"{display_task_id or 'unknown'}:cancellation_fault",
-                **(
-                    {"cancel_physical_task_id": task_id}
-                    if task_id and display_task_id != task_id else {}
-                ),
-            },
+            progress_meta=incident_meta,
         )
 
 

@@ -394,7 +394,27 @@ def test_sleeping_control_wakes_then_loop_routes_without_supervision_ack(tmp_pat
 
     kind = KIND_FINALIZE_NOW if control_kind == "finalize_now" else KIND_HURRY
     text = "owner_requested_finalization" if kind == KIND_FINALIZE_NOW else "owner_hurry"
-    assert write_owner_message(tmp_path, text, "child1", msg_id="control-1", kind=kind)
+    control_msg_id = "control-1"
+    if kind == KIND_FINALIZE_NOW:
+        from ouroboros.cancel_intents import (
+            STOP_POLICY_FINALIZE,
+            request_cancel,
+        )
+        from supervisor.owner_stop import owner_stop_control_id
+
+        intent = request_cancel(
+            tmp_path,
+            "child1",
+            requested_stop_policy=STOP_POLICY_FINALIZE,
+        )
+        control_msg_id = owner_stop_control_id(intent)
+    assert write_owner_message(
+        tmp_path,
+        text,
+        "child1",
+        msg_id=control_msg_id,
+        kind=kind,
+    )
     ctx = SimpleNamespace(
         task_id="child1", drive_root=tmp_path, budget_drive_root=str(tmp_path),
         task_metadata={}, task_attempt=1,
