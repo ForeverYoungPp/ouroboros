@@ -605,7 +605,10 @@ def review_retry_cancelled(usage_ctx: Any) -> bool:
     return False
 
 
-def retryable_review_exception(exc: Exception, usage_ctx: Any) -> bool:
+def retryable_review_exception(
+    exc: Exception, usage_ctx: Any,
+    attempt_history: Optional[_ReviewAttemptHistory] = None,
+) -> bool:
     """Whether a second byte-identical review send has a terminal basis."""
     from ouroboros.loop_llm_call import classify_llm_exception
 
@@ -614,6 +617,17 @@ def retryable_review_exception(exc: Exception, usage_ctx: Any) -> bool:
     # generic retryable preparation error. Reusing the existing durable cancel
     # intent prevents a zero-cost pre-dispatch retry from racing the stop rail.
     if review_retry_cancelled(usage_ctx):
+        return False
+
+    history = attempt_history
+    if history is None:
+        history = _ReviewAttemptHistory()
+        history.observe(exc)
+    if history.unknown_outcome_seen:
+        if usage_ctx is not None:
+            setattr(usage_ctx, "_review_custody_lost", True)
+        if not str(getattr(exc, "code", "") or ""):
+            setattr(exc, "code", "provider_outcome_unknown")
         return False
 
     classification = classify_llm_exception(exc)

@@ -255,6 +255,64 @@ def test_unknown_exception_capture_projects_custody_loss_over_http_status():
     assert custody == {"physical_attempt_state": "unresolved"}
 
 
+def test_coordinator_does_not_retry_malformed_physical_capture(tmp_path, monkeypatch):
+    """A typed 503 cannot launder an unknown capture into retry authority."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+
+    class MalformedCaptureExecutor:
+        def __init__(self):
+            self.execute_calls = 0
+
+        def restore_custody(self, _state):
+            return None
+
+        def set_pending_invocation_checkpoint(self, _checkpoint):
+            return None
+
+        def prompt_payload(self):
+            return {"messages": []}
+
+        def prompt_chars(self):
+            return 0
+
+        def execute(self):
+            self.execute_calls += 1
+            error = RuntimeError("provider returned 503")
+            error.status_code = 503
+            error.physical_attempt_capture = SimpleNamespace(
+                state="future_state", provider_status_code=503,
+            )
+            raise error
+
+        def failure_custody(self):
+            return {}
+
+    executor = MalformedCaptureExecutor()
+    monkeypatch.setattr(
+        "ouroboros.review_substrate._review_route_executor",
+        lambda *_args, **_kwargs: executor,
+    )
+    result = run_review_request(
+        ReviewRequest(
+            surface="multi_model_review", goal="review",
+            task_id="malformed-capture-retry",
+            retry_key="commit_review:malformed-capture-retry:1",
+        ),
+        slots=[ReviewSlot(
+            slot_id="only", model="test/model", route=ReviewRouteKind.API_CHAT,
+        )],
+        drive_root=tmp_path, usage_ctx=SimpleNamespace(),
+    )
+
+    assert executor.execute_calls == 1
+    assert result.actors[0]["operation_state"] == "custody_lost"
+    assert result.actors[0]["failure_code"] == "provider_outcome_unknown"
+    assert result.actors[0]["late_result_pending"] is True
+
+
 def test_coordinator_propagates_terminal_capture_status_for_same_cycle_replay(
     tmp_path, monkeypatch,
 ):

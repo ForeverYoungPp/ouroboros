@@ -1438,7 +1438,7 @@ class ReviewCoordinator:
                     except Exception as exc:
                         attempt_history.observe(exc)
                         from ouroboros.review_custody import retryable_review_exception
-                        if not retryable_review_exception(exc, self.usage_ctx):
+                        if not retryable_review_exception(exc, self.usage_ctx, attempt_history):
                             raise
                         if actor_attempt + 1 < actor_attempts:
                             if (
