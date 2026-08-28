@@ -992,6 +992,25 @@ def _run_session_directly(tmp_path, **overrides):
     return run_delegated_review_session(invocation=SessionInvocation(**invocation), **kwargs)
 
 
+def test_stale_retry_token_cannot_be_reinterpreted_as_fresh_review(
+    tmp_path, fake_route,
+):
+    """A missing durable invocation is custody loss, even with time left."""
+    from ouroboros.review_execution import ReviewRouteUnavailable
+
+    state = {"pending_invocation_id": "stale-token"}
+    with pytest.raises(ReviewRouteUnavailable) as raised:
+        _run_session_directly(
+            tmp_path, retry_state=state, operation_id="op-stale",
+        )
+
+    assert raised.value.code == "review_custody_lost"
+    gateway = fake_route.instances[-1] if fake_route.instances else None
+    if gateway is not None:
+        assert gateway.start_requests == []
+        assert gateway.registrations == []
+
+
 def test_pending_invocation_checkpoint_precedes_provider_post(
     tmp_path, fake_route, monkeypatch,
 ):

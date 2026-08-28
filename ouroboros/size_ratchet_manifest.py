@@ -145,6 +145,7 @@ BAND_PATHS = {
     "ouroboros/projects_registry.py": "Entered the band from 999 lines: the stuck-Working liveness sprint homed the project-thread membership lens (mtime-cached) and its broadcast-choke marker here \u2014 registry semantics belong to the registry, not to message_bus.",
     "ouroboros/protected_artifacts.py": None,
     "ouroboros/review.py": "Entered the band from 952 lines: re-anchoring the size ratchet on the official line added the candidate and pairwise base-vs-tip transition validators (validate_size_ratchet_candidate/validate_size_ratchet_transition_against_base) with merge-aware previous-manifest resolution, replacing the retired first-parent history audit (update-flow-redesign sprint, Q7-C/Q18-A/Q19-A owner decisions).",
+    "ouroboros/review_custody.py": "Review custody now owns the shared typed retry-rail history and frozen actor reconstruction so physical outcomes cannot be lost between the substrate and reconciliation.",
     "ouroboros/skill_review_runner.py": None,
     "ouroboros/task_results.py": "Authority reads need an explicit strict mode so malformed child records cannot become a false zero count.",
     "ouroboros/task_status.py": None,

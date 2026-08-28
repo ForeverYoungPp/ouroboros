@@ -177,3 +177,33 @@ def test_in_flight_wave_defers_need_evidence_until_terminal_reconciliation(
     assert state["waves"][-1]["request_fingerprint"] == first_fp
     assert state["waves"][-1]["cycle_index"] == 1 and state["cycles_paid"] == 1
     assert state["need_evidence_seen"] == ["notes.md"]
+
+
+def test_resume_excludes_synthetic_not_dispatched_operation_ids(tmp_path):
+    """A pre-dispatch $0 row has an operation id, but is not a callable lane."""
+    from ouroboros.tools.plan_review_artifacts import in_flight_resume_inputs
+
+    slots = [
+        SimpleNamespace(slot_id="s1", model="model/one"),
+        SimpleNamespace(slot_id="s2", model="model/two"),
+    ]
+    result = in_flight_resume_inputs(
+        {
+            "actors": [
+                {
+                    "slot_id": "s1", "operation_id": "op-paid",
+                    "operation_state": "in_flight", "late_result_pending": True,
+                    "status": "error", "error": "still running",
+                },
+                {
+                    "slot_id": "s2", "operation_id": "op-free",
+                    "operation_state": "not_dispatched", "status": "not_dispatched",
+                    "error": "budget admission refused",
+                },
+            ],
+        },
+        {}, tmp_path, "mixed-resume", slots,
+    )
+
+    assert result["dispatched_slot_ids"] == ["s1"]
+    assert [row["slot_id"] for row in result["frozen_rows"]] == ["s2"]

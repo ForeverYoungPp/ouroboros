@@ -45,13 +45,16 @@ from ouroboros.review_execution import (  # noqa: F401  (compat re-exports)
     assert_cache_breakpoint_cap,
     configured_review_routes,
 )
-from ouroboros.review_custody import review_retry_cancelled
+from ouroboros.review_custody import (
+    _ReviewAttemptHistory, _review_exception_projection,
+    review_retry_cancelled,
+)
 # Reviewer-output JSON extraction lives in ONE place beside the array
 # extractor it falls back to (the fenced-object and verdict parsers were
 # split across two modules for no reason).
 from ouroboros.triad_review import parse_review_findings
 from ouroboros.usage_accounting import (
-    BudgetExceeded,
+    PhysicalAttemptLimitExceeded,
     UsageAccountingError,
     UsageScope,
     current_usage_scope,
@@ -1304,6 +1307,7 @@ class ReviewCoordinator:
         prompt_ref: Dict[str, Any] = {}
         response_ref: Dict[str, Any] = {}
         start = time.time()
+        attempt_history = _ReviewAttemptHistory()
         try:
             prompt_ref = persist_call(
                 self.drive_root,
@@ -1413,14 +1417,25 @@ class ReviewCoordinator:
                             assignment, llm=self.llm, executor=executor,
                         )
                         msg, usage, raw_text = attempt.message, attempt.usage, attempt.raw_text
-                    except UsageAccountingError:
+                        attempt_history.observe()
+                    except UsageAccountingError as exc:
+                        attempt_history.observe(exc)
+                        if isinstance(exc, PhysicalAttemptLimitExceeded):
+                            # The rail raises only after its maximum claims have
+                            # already succeeded; the current reservation is the
+                            # released, unpaid one and must not erase those sends.
+                            attempt_history.dispatched = True
                         # Budget/ledger/rail failures never trigger another send;
-                        # retain a prior malformed answer as forensic evidence.
-                        if _prior_text:
+                        # retain a prior response, including an empty response,
+                        # as forensic evidence.
+                        if _has_prior:
                             msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
+                            if _prior_msg is None:
+                                msg, usage, raw_text = _last_msg, _last_usage, _last_text
                             break
                         raise
                     except Exception as exc:
+                        attempt_history.observe(exc)
                         from ouroboros.review_custody import retryable_review_exception
                         if not retryable_review_exception(exc, self.usage_ctx):
                             raise
@@ -1431,10 +1446,10 @@ class ReviewCoordinator:
                             ):
                                 raise
                             continue
-                        if _prior_text:
+                        if _has_prior:
                             # The repair RESEND failed (transport, timeout): keep the
-                            # malformed-but-substantive first answer as forensics.
-                            msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
+                            # first answer, including an empty response, as forensics.
+                            msg, usage, raw_text = _last_msg, _last_usage, _last_text
                             break
                         raise
                     _last_msg, _last_usage, _last_text, _has_prior = msg, usage, raw_text, True
@@ -1513,25 +1528,11 @@ class ReviewCoordinator:
                 )
             except Exception:
                 response_ref = {}
-            failure_custody = dict(executor.failure_custody() or {})
-            capture = getattr(exc, "physical_attempt_capture", None)
-            capture_state = str(getattr(capture, "state", "") or "")
-            if capture_state:
-                failure_custody["physical_attempt_state"] = capture_state
-            http_status = next((value for value in (
-                getattr(exc, "status_code", None),
-                getattr(getattr(exc, "response", None), "status_code", None),
-                getattr(capture, "provider_status_code", None),
-                failure_custody.get("provider_status_code"),
-            ) if isinstance(value, int) and not isinstance(value, bool)), None)
-            if http_status is not None:
-                failure_custody["provider_status_code"] = http_status
-            operation_state = (
-                "not_dispatched"
-                if capture_state in {"reserved", "released"}
-                or isinstance(exc, BudgetExceeded)
-                or str(getattr(exc, "code", "") or "") == "deadline_exhausted"
-                else "settled"
+            (
+                failure_custody, _capture_state, http_status,
+                operation_state, failure_code,
+            ) = _review_exception_projection(
+                exc, executor.failure_custody(), attempt_history, retry_state,
             )
             return ReviewActorRecord(
                 slot_id=slot.slot_id,
@@ -1539,7 +1540,7 @@ class ReviewCoordinator:
                 status="error",
                 error=sanitize_tool_result_for_log(error_msg),
                 transport_status=_transport_error_status(exc),
-                failure_code=str(getattr(exc, "code", "") or ""),
+                failure_code=failure_code,
                 reset_at=str(getattr(exc, "reset_at", "") or ""),
                 http_status=http_status if isinstance(http_status, int) and http_status else None,
                 usage=failure_custody,

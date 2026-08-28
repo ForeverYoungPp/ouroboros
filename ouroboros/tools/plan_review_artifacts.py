@@ -78,6 +78,30 @@ def authority_wave(drive_root: Any, task_id: str, hot_wave: Optional[dict]) -> O
     return {**exact, **hot_wave, "findings": list(exact.get("findings") or [])}
 
 
+def _row_has_physical_dispatch(row: Dict[str, Any]) -> bool:
+    """Identify paid rows from explicit custody facts, with legacy fallback."""
+    if not str(row.get("operation_id") or ""):
+        return False
+    operation_state = str(row.get("operation_state") or "").strip().lower()
+    status = str(row.get("status") or "").strip().lower()
+    physical_state = str(row.get("physical_attempt_state") or "").strip().lower()
+    if not physical_state and isinstance(row.get("usage"), dict):
+        physical_state = str(
+            row["usage"].get("physical_attempt_state") or ""
+        ).strip().lower()
+    # Explicit $0 states always win over the synthetic operation id assigned by
+    # the host before it knows whether a provider call was admitted.
+    if operation_state == "not_dispatched" or status == "not_dispatched":
+        return False
+    if physical_state in {"reserved", "released"}:
+        return False
+    if physical_state in {"dispatched", "settled", "unresolved"}:
+        return True
+    # Pre-B1 rows did not carry a physical state. Their non-$0 operation id is
+    # the only durable evidence available, so retain that compatibility path.
+    return True
+
+
 def in_flight_resume_inputs(
     existing: Dict[str, Any], state: Dict[str, Any], state_root: pathlib.Path,
     task_id: str, configured_slots: list,
@@ -116,7 +140,7 @@ def in_flight_resume_inputs(
         )}
     dispatched_ids = {
         str(row.get("slot_id") or "") for row in actor_rows
-        if str(row.get("operation_id") or "")
+        if _row_has_physical_dispatch(row)
     }
     if not dispatched_ids or any(
         (str(row.get("operation_state") or "") == "in_flight"

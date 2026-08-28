@@ -318,6 +318,21 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
     if actor.get("status") not in {"ok", "empty"} and not error:
         error = str(actor.get("status") or "review failed")
     session = slot_is_session(slot) if slot is not None else False
+    physical_attempt_state = str(
+        usage.get("physical_attempt_state")
+        or actor.get("physical_attempt_state")
+        or ""
+    )
+    provider_status_code = usage.get("provider_status_code")
+    if provider_status_code is None:
+        provider_status_code = actor.get("provider_status_code")
+    if isinstance(provider_status_code, bool):
+        provider_status_code = None
+    elif provider_status_code is not None:
+        try:
+            provider_status_code = int(provider_status_code)
+        except (TypeError, ValueError, OverflowError):
+            provider_status_code = None
     return {
         # Identity is CARRIED, never re-derived: the row keeps the slot_id the
         # substrate ran, so duplicate-model plan rows stay distinguishable.
@@ -337,6 +352,8 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         # success and on pre-typed engines) so downstream never regresses to matching
         # the error prose for the code or the reset instant.
         **_typed_facts_from(actor, lambda source, key: source.get(key)),
+        "physical_attempt_state": physical_attempt_state,
+        "provider_status_code": provider_status_code,
         "capability_delta": usage.get("capability_delta") or [],
         "review_thread_id": str(usage.get("review_thread_id") or ""),
         "review_turn_id": str(usage.get("review_turn_id") or ""),
@@ -367,6 +384,13 @@ def plan_row_typed_facts(row: Dict[str, Any]) -> Dict[str, Any]:
         **_typed_facts_from(row, lambda source, key: source.get(key)),
         "capability_delta": row.get("capability_delta") or [],
     }
+    physical_attempt_state = str(row.get("physical_attempt_state") or "")
+    provider_status_code = row.get("provider_status_code")
+    if physical_attempt_state or provider_status_code is not None:
+        facts.update({
+            "physical_attempt_state": physical_attempt_state,
+            "provider_status_code": provider_status_code,
+        })
     pending_invocation_id = str(row.get("pending_invocation_id") or "")
     delegated_run_id = str(row.get("delegated_run_id") or "")
     if row.get("operation_id") or row.get("late_result_pending") \

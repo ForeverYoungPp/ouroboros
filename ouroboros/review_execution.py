@@ -852,7 +852,6 @@ def run_delegated_review_session(
     state = retry_state if retry_state is not None else {}
     run_id, run_request, invocation_id = "", None, ""
     started_custody = None
-    # Read retry custody before daemon calls; its stored route/request are authoritative.
     retry_token = str(state.get("pending_invocation_id") or "")
     record = custody.invocation_record(custody_drive, retry_token) if retry_token else None
     if record is not None and record["state"] == "started" and record["run_id"]:
@@ -863,6 +862,11 @@ def run_delegated_review_session(
           and isinstance(record.get("request"), dict) and record["request"]):
         run_request, invocation_id = record["request"], retry_token
     recovering = bool(run_id) or run_request is not None
+    if retry_token and not recovering and surface != "skill_review":
+        raise ReviewRouteUnavailable(
+            "delegated retry token has no durable invocation; refusing a second paid run",
+            code="review_custody_lost",
+        )
     if recovering:
         route, project_id, existing_project, key, schema_asked = (
             review_recovery_facts(
@@ -976,9 +980,6 @@ def run_delegated_review_session(
                 raise ReviewRouteUnavailable(
                     "the durable start-request row could not be written; the "
                     "delegated review session was NOT started", code="start_request_row_unwritable")
-            # Share the durable token with the logical caller before POST/poll.
-            # If its wait window closes while this worker is still alive, the
-            # synthetic in-flight actor can persist an exact restart handle.
             state["pending_invocation_id"] = invocation_id
             checkpoint_pending_invocation(
                 checkpoint=invocation.pending_invocation_checkpoint, invocation_id=invocation_id,
@@ -1059,7 +1060,6 @@ def run_delegated_review_session(
         summary = custody.summary_of(detail)
         run_state = str(summary.get("state") or "")
         if run_state != "succeeded":
-            # Preserve typed RunFailure code/resetAt instead of flattening it into prose.
             failure = summary.get("failure") if isinstance(summary.get("failure"), dict) else {}
             message = (f"delegated review session {run_id} ended {run_state or 'unknown'}"
                        + (f": {json.dumps(failure, ensure_ascii=False)}" if failure else ""))

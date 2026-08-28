@@ -1914,7 +1914,14 @@ Before every commit, verify the following:
   same-cycle replay, never as a second physical send. An identical envelope
   never buys a settled actor twice, and a new retry cycle uses a new key. A `$0`
   `not_dispatched` refusal remains retryable rather than becoming a sticky replay
-  actor.
+  actor, even though the host minted its synthetic operation id before admission.
+  Carry `physical_attempt_state` and `provider_status_code` through durable plan
+  rows and frozen actors. Across one bounded retry rail, retain the strongest
+  earlier capture: a later released reservation or budget refusal cannot erase a
+  prior dispatch, and any unknown prior outcome monotonically forces no-resend.
+  For non-Skill-Review delegated surfaces, a supplied retry token with no valid
+  durable invocation is `review_custody_lost` before route/project/POST work; it
+  is never reinterpreted as permission for a fresh paid session.
   A dispatched request whose socket or stream ends without terminal
   provider evidence is `provider_outcome_unknown`: no same-model, fallback,
   provider, local-server, or forced-final resend until custody settles.
