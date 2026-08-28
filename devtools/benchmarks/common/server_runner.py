@@ -16,6 +16,7 @@ devtools/benchmarks/terminal_bench/harbor_installed_agent.py.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -34,15 +35,15 @@ if __package__ in {None, ""}:
 from devtools.benchmarks.common.manifests import runtime_attestation
 from devtools.benchmarks.common.secrets import isolated_credential_grants  # noqa: F401 (re-export)
 from ouroboros.context_mode_compat import normalize_context_mode_compat
-from ouroboros.provider_models import (
-    ALL_PROVIDER_CREDENTIAL_KEYS,
-    LEGACY_MODEL_SETTING_KEYS,
-    provider_credential_plan,
-)
 from ouroboros.platform_layer import (
     kill_pid_tree,
     subprocess_new_group_kwargs,
     terminate_process_tree,
+)
+from ouroboros.provider_models import (
+    ALL_PROVIDER_CREDENTIAL_KEYS,
+    LEGACY_MODEL_SETTING_KEYS,
+    provider_credential_plan,
 )
 
 _FINAL_STATUSES = {"completed", "failed", "cancelled", "rejected_duplicate"}
@@ -151,6 +152,11 @@ _AUTHORITATIVE_ENV_EXACT = frozenset({
     "USE_LOCAL_CODE",
     "TOTAL_BUDGET",
 })
+
+
+def _settings_json_bytes(config: dict) -> bytes:
+    """Serialize a settings snapshot exactly as it is written to disk."""
+    return json.dumps(config, ensure_ascii=False, indent=2).encode("utf-8")
 
 
 def _is_secret_env_key(key: str) -> bool:
@@ -269,7 +275,8 @@ def absorbed_cycles_done(data_root: pathlib.Path) -> int:
 
 
 def patch_settings_ports(settings_path: pathlib.Path, *, host: str, port: int,
-                         host_service_port: int, require_existing_object: bool = False) -> dict:
+                         host_service_port: int, require_existing_object: bool = False,
+                         expected_sha256: str | None = None) -> dict:
     """Write the chosen ports INTO a settings.json, returning the merged config.
 
     THE reason this exists rather than exporting the ports in the environment: the server
@@ -280,23 +287,19 @@ def patch_settings_ports(settings_path: pathlib.Path, *, host: str, port: int,
     same per-instance isolation ``IsolatedServer`` gets.
     """
     settings_path = pathlib.Path(settings_path)
-    if require_existing_object:
-        # Strict adapters have already validated the snapshot once before this
-        # write.  Validate the file again here so a concurrent replacement or
-        # unlink cannot be silently converted into a ports-only defaults file.
-        try:
-            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("isolated settings snapshot is unreadable") from exc
-        if not isinstance(loaded, dict):
-            raise RuntimeError("isolated settings snapshot must be a JSON object")
     cfg: dict = {}
+    raw: bytes | None = None
     try:
-        loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+        raw = settings_path.read_bytes()
+        if expected_sha256 is not None:
+            observed_sha256 = hashlib.sha256(raw).hexdigest()
+            if observed_sha256 != expected_sha256:
+                raise RuntimeError("isolated settings snapshot changed")
+        loaded = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         if require_existing_object:
-            # Do not fall through to the legacy ports-only write after a
-            # strict snapshot disappears or becomes malformed between reads.
+            # Do not fall through to the legacy ports-only write after a strict
+            # snapshot disappears or becomes malformed between reads.
             raise RuntimeError("isolated settings snapshot is unreadable") from exc
     else:
         if isinstance(loaded, dict):
@@ -306,8 +309,10 @@ def patch_settings_ports(settings_path: pathlib.Path, *, host: str, port: int,
     cfg["OUROBOROS_SERVER_HOST"] = host
     cfg["OUROBOROS_SERVER_PORT"] = int(port)
     cfg["OUROBOROS_HOST_SERVICE_PORT"] = int(host_service_port)
+    if expected_sha256 is not None and raw is None:  # pragma: no cover - defensive invariant
+        raise RuntimeError("isolated settings snapshot is unreadable")
     settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    settings_path.write_bytes(_settings_json_bytes(cfg))
     return cfg
 
 
@@ -341,6 +346,10 @@ class IsolatedServer:
         self.host_service_port = free_port()
         self.base_url = f"http://{host}:{self.port}"
         self.proc: subprocess.Popen | None = None
+        # Digest of the exact settings snapshot admitted by a strict adapter.  It
+        # is carried across the port patch and checked again immediately before
+        # spawn, so a valid replacement cannot silently alter the applied run.
+        self._authoritative_settings_sha256: str | None = None
         # Filled by _wait_ready: the HTTP runtime_version + the clone's HEAD/VERSION that
         # produced it, so a driver can record WHICH agent identity its numbers came from.
         self.attestation: dict = {}
@@ -398,22 +407,42 @@ class IsolatedServer:
     def _read_authoritative_settings(self) -> dict:
         """Read the applied snapshot or fail closed before spawning the server."""
         try:
-            loaded = json.loads(self.settings_path.read_text(encoding="utf-8"))
+            raw = self.settings_path.read_bytes()
+            observed_sha256 = hashlib.sha256(raw).hexdigest()
+            if (
+                self._authoritative_settings_sha256 is not None
+                and observed_sha256 != self._authoritative_settings_sha256
+            ):
+                raise RuntimeError("isolated settings snapshot changed")
+            loaded = json.loads(raw.decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RuntimeError("isolated settings snapshot is unreadable") from exc
         if not isinstance(loaded, dict):
             raise RuntimeError("isolated settings snapshot must be a JSON object")
+        self._authoritative_settings_sha256 = observed_sha256
         return loaded
 
     def _patch_settings_ports(self) -> None:
         """Write the chosen free ports INTO settings.json (see `patch_settings_ports`)."""
-        patch_settings_ports(
+        _patched_settings = patch_settings_ports(
             self.settings_path,
             host=self.host,
             port=self.port,
             host_service_port=self.host_service_port,
             require_existing_object=self.settings_authoritative_env,
+            expected_sha256=(
+                self._authoritative_settings_sha256
+                if self.settings_authoritative_env
+                else None
+            ),
         )
+        if self.settings_authoritative_env:
+            # Derive the digest from the exact bytes handed to the writer,
+            # rather than accepting an independently replaced file as the next
+            # baseline during a second read.
+            self._authoritative_settings_sha256 = hashlib.sha256(
+                _settings_json_bytes(_patched_settings)
+            ).hexdigest()
 
     def start(self, ready_timeout: float = 180) -> "IsolatedServer":
         if self.settings_authoritative_env:

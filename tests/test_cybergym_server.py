@@ -224,10 +224,49 @@ def test_authoritative_port_patch_rechecks_snapshot_after_preflight(tmp_path, mo
         return value
 
     monkeypatch.setattr(server, "_read_authoritative_settings", preflight_then_corrupt)
-    with pytest.raises(RuntimeError, match="settings snapshot is unreadable"):
+    with pytest.raises(RuntimeError, match="settings snapshot (?:is unreadable|changed)"):
         server.start()
     assert server.proc is None
     assert settings.read_text(encoding="utf-8") == "{broken"
+
+
+def test_authoritative_port_patch_rejects_valid_snapshot_replacement(tmp_path, monkeypatch):
+    seed, _commit = _seed_repo(tmp_path)
+    settings = tmp_path / "settings.json"
+    original = {"OUROBOROS_MODEL": "file/model", "OUROBOROS_MAX_ROUNDS": "1000"}
+    settings.write_text(json.dumps(original), encoding="utf-8")
+    from devtools.benchmarks.common.server_runner import IsolatedServer
+
+    server = IsolatedServer(
+        seed,
+        tmp_path / "data",
+        settings,
+        settings_authoritative_env=True,
+    )
+    original_read = server._read_authoritative_settings
+    calls = 0
+
+    def preflight_then_replace_with_valid_snapshot():
+        nonlocal calls
+        value = original_read()
+        calls += 1
+        if calls == 1:
+            settings.write_text(
+                json.dumps({
+                    "OUROBOROS_MODEL": "wrong/model",
+                    "OUROBOROS_MAX_ROUNDS": "1",
+                    "OUROBOROS_SAFETY_MODE": "full",
+                }),
+                encoding="utf-8",
+            )
+        return value
+
+    monkeypatch.setattr(server, "_read_authoritative_settings", preflight_then_replace_with_valid_snapshot)
+    with pytest.raises(RuntimeError, match="settings snapshot changed"):
+        server.start()
+    assert server.proc is None
+    replaced = json.loads(settings.read_text(encoding="utf-8"))
+    assert replaced["OUROBOROS_MAX_ROUNDS"] == "1"
 
 
 def test_rootless_wrapper_start_does_not_recurse_when_delegate_calls_env(monkeypatch, tmp_path):

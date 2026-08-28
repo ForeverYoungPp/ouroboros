@@ -292,7 +292,7 @@ The generated task URL uses sidecar DNS/name, not a host gateway.  `NO_PROXY`
 contains that name and port, and the manifest records the applied value.  The
 launcher keeps the CLI's admission-time URL as `requested_server` and replaces
 the manifest's `server`/official command with the campaign alias actually
-embedded in `submit.sh`.  The
+embedded in `submit.sh`.
 On the selected rootless daemon an `--internal` bridge intentionally has no
 usable host port mapping.  The concrete host verifier therefore uses a
 controlled `docker exec` path against the immutable server container ID; that
@@ -494,7 +494,7 @@ and provider pool, persist the exact applied `OUROBOROS_OR_PROVIDER` JSON,
 and verify that startup telemetry agrees.  Do not start paid tasks if the
 manifest names only a template value or pre-override CLI argument.
 
-### Phase 2: one-task protocol smoke
+### Phase 2: three-task protocol smoke
 
 Exercise one representative ARVO row, one OSS-Fuzz row, and one MSan-labelled
 row where the pinned image can be resolved.  Verify sidecar placement, DNS and

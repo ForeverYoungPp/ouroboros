@@ -18,6 +18,7 @@ import threading
 
 import pytest
 
+from devtools.benchmarks.cybergym import cybergym_executor as executor_module
 from devtools.benchmarks.cybergym.cybergym_executor import (
     CommandResult,
     CyberGymExecutor,
@@ -181,6 +182,106 @@ def test_safe_extract_publish_dirfd_survives_destination_replacement(tmp_path, m
     assert replaced
     assert outside_sentinel.read_text(encoding="utf-8") == "untouched"
     assert (backup / "root/file").read_text(encoding="utf-8") == "payload"
+
+
+def test_safe_extract_rollback_dirfd_does_not_follow_replaced_destination(
+    tmp_path, monkeypatch
+):
+    if os.rename not in os.supports_dir_fd:
+        pytest.skip("platform has no dirfd-safe rename")
+    archive = tmp_path / "rollback-race.tar.gz"
+    _write_archive(
+        archive,
+        [
+            ("a-root", "dir", ""),
+            ("a-root/file", "file", "first"),
+            ("b-root", "dir", ""),
+            ("b-root/file", "file", "second"),
+        ],
+    )
+    destination = tmp_path / "workspace"
+    destination.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_entry = outside / "a-root"
+    outside_entry.mkdir()
+    outside_sentinel = outside_entry / "sentinel"
+    outside_sentinel.write_text("must-survive", encoding="utf-8")
+    backup = tmp_path / "workspace-before-race"
+    original_rename = os.rename
+    publishes = 0
+
+    def replace_then_fail(src, dst, *args, **kwargs):
+        nonlocal publishes
+        if kwargs.get("dst_dir_fd") is None:
+            return original_rename(src, dst, *args, **kwargs)
+        publishes += 1
+        if publishes == 1:
+            result = original_rename(src, dst, *args, **kwargs)
+            original_rename(destination, backup)
+            destination.symlink_to(outside, target_is_directory=True)
+            return result
+        raise OSError("injected publish failure")
+
+    monkeypatch.setattr(os, "rename", replace_then_fail)
+    with pytest.raises(ExecutorFailure, match="extraction failed"):
+        _safe_extract(archive, destination)
+
+    assert outside_sentinel.read_text(encoding="utf-8") == "must-survive"
+    assert not (outside / "a-root/file").exists()
+    assert not (backup / "a-root").exists()
+    assert destination.is_symlink()
+
+
+def test_safe_extract_path_publish_uses_descriptor_for_rollback(
+    tmp_path, monkeypatch
+):
+    """The non-dirfd publish ABI must retain the same rollback anchor."""
+    if not executor_module._ARCHIVE_CLEANUP_DIR_FD:  # noqa: SLF001 - capability seam
+        pytest.skip("platform has no descriptor-safe cleanup primitives")
+    archive = tmp_path / "path-rollback-race.tar.gz"
+    _write_archive(
+        archive,
+        [
+            ("a-root", "dir", ""),
+            ("a-root/file", "file", "first"),
+            ("b-root", "dir", ""),
+            ("b-root/file", "file", "second"),
+        ],
+    )
+    destination = tmp_path / "workspace"
+    destination.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_entry = outside / "a-root"
+    outside_entry.mkdir()
+    outside_sentinel = outside_entry / "sentinel"
+    outside_sentinel.write_text("must-survive", encoding="utf-8")
+    backup = tmp_path / "workspace-before-race"
+    original_replace = os.replace
+    publishes = 0
+
+    def replace_then_fail(src, dst):
+        nonlocal publishes
+        if pathlib.Path(src).parent.name.startswith(".workspace.extract-"):
+            publishes += 1
+            if publishes == 1:
+                result = original_replace(src, dst)
+                original_replace(destination, backup)
+                destination.symlink_to(outside, target_is_directory=True)
+                return result
+            raise OSError("injected publish failure")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(executor_module, "_ARCHIVE_RENAME_DIR_FD", False)
+    monkeypatch.setattr(os, "replace", replace_then_fail)
+    with pytest.raises(ExecutorFailure, match="destination changed before publish"):
+        _safe_extract(archive, destination)
+
+    assert outside_sentinel.read_text(encoding="utf-8") == "must-survive"
+    assert not (outside / "a-root/file").exists()
+    assert not (backup / "a-root").exists()
+    assert destination.is_symlink()
 
 
 @pytest.mark.parametrize(

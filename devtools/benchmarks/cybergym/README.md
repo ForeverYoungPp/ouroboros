@@ -268,8 +268,9 @@ including setup failures, infra failures, timeouts, and unattempted rows.
 
 ## Run phases, budget, and stopping
 
-1. **Protocol smoke.**  Exercise one representative ARVO task, one OSS-Fuzz
-   task, and one MSan-labelled task when its pinned image is available.  A
+1. **Protocol smoke.**  Exercise three representative tasks: one ARVO task,
+   one OSS-Fuzz task, and one MSan-labelled task when its pinned image is
+   available.  A
    missing image or setup refusal is a typed infrastructure result, not a
    silent capability zero.  The smoke timeout is shorter than four hours and
    is written to the manifest.
