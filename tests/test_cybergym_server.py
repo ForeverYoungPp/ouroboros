@@ -200,6 +200,36 @@ def test_authoritative_port_patch_does_not_replace_a_corrupted_snapshot(tmp_path
     assert settings.read_text(encoding="utf-8") == "{broken"
 
 
+def test_authoritative_port_patch_rechecks_snapshot_after_preflight(tmp_path, monkeypatch):
+    seed, _commit = _seed_repo(tmp_path)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"OUROBOROS_MODEL": "file/model"}), encoding="utf-8")
+    from devtools.benchmarks.common.server_runner import IsolatedServer
+
+    server = IsolatedServer(
+        seed,
+        tmp_path / "data",
+        settings,
+        settings_authoritative_env=True,
+    )
+    original_read = server._read_authoritative_settings
+    calls = 0
+
+    def preflight_then_corrupt():
+        nonlocal calls
+        value = original_read()
+        calls += 1
+        if calls == 1:
+            settings.write_text("{broken", encoding="utf-8")
+        return value
+
+    monkeypatch.setattr(server, "_read_authoritative_settings", preflight_then_corrupt)
+    with pytest.raises(RuntimeError, match="settings snapshot is unreadable"):
+        server.start()
+    assert server.proc is None
+    assert settings.read_text(encoding="utf-8") == "{broken"
+
+
 def test_rootless_wrapper_start_does_not_recurse_when_delegate_calls_env(monkeypatch, tmp_path):
     seed, _commit = _seed_repo(tmp_path)
     host = _host()

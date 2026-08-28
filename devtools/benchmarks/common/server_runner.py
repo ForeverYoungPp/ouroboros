@@ -292,12 +292,17 @@ def patch_settings_ports(settings_path: pathlib.Path, *, host: str, port: int,
             raise RuntimeError("isolated settings snapshot must be a JSON object")
     cfg: dict = {}
     try:
-        if settings_path.exists():
-            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                cfg = loaded
-    except (OSError, ValueError):
-        cfg = {}
+        loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if require_existing_object:
+            # Do not fall through to the legacy ports-only write after a
+            # strict snapshot disappears or becomes malformed between reads.
+            raise RuntimeError("isolated settings snapshot is unreadable") from exc
+    else:
+        if isinstance(loaded, dict):
+            cfg = loaded
+        elif require_existing_object:
+            raise RuntimeError("isolated settings snapshot must be a JSON object")
     cfg["OUROBOROS_SERVER_HOST"] = host
     cfg["OUROBOROS_SERVER_PORT"] = int(port)
     cfg["OUROBOROS_HOST_SERVICE_PORT"] = int(host_service_port)
