@@ -612,6 +612,16 @@ def retryable_review_exception(
     """Whether a second byte-identical review send has a terminal basis."""
     from ouroboros.loop_llm_call import classify_llm_exception
 
+    def _annotate_unknown_outcome() -> None:
+        # Provider exception types may expose ``code`` as a read-only property.
+        # This annotation is diagnostic only; it must never replace the
+        # original failure or weaken the no-resend decision.
+        try:
+            if not str(getattr(exc, "code", "") or ""):
+                setattr(exc, "code", "provider_outcome_unknown")
+        except Exception:
+            pass
+
     # A cancellation requested after the first route attempt is a terminal
     # owner decision for this wave, even when the transport wrapper surfaced a
     # generic retryable preparation error. Reusing the existing durable cancel
@@ -626,16 +636,14 @@ def retryable_review_exception(
     if history.unknown_outcome_seen:
         if usage_ctx is not None:
             setattr(usage_ctx, "_review_custody_lost", True)
-        if not str(getattr(exc, "code", "") or ""):
-            setattr(exc, "code", "provider_outcome_unknown")
+        _annotate_unknown_outcome()
         return False
 
     classification = classify_llm_exception(exc)
     if classification.kind == "provider_outcome_unknown":
         if usage_ctx is not None:
             setattr(usage_ctx, "_review_custody_lost", True)
-        if not str(getattr(exc, "code", "") or ""):
-            setattr(exc, "code", "provider_outcome_unknown")
+        _annotate_unknown_outcome()
     return classification.retry_same_request
 
 

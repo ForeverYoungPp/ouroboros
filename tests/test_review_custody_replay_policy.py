@@ -266,6 +266,11 @@ def test_coordinator_does_not_retry_malformed_physical_capture(tmp_path, monkeyp
         def __init__(self):
             self.execute_calls = 0
 
+        class ProviderFailure(RuntimeError):
+            @property
+            def code(self):
+                return ""
+
         def restore_custody(self, _state):
             return None
 
@@ -280,7 +285,7 @@ def test_coordinator_does_not_retry_malformed_physical_capture(tmp_path, monkeyp
 
         def execute(self):
             self.execute_calls += 1
-            error = RuntimeError("provider returned 503")
+            error = self.ProviderFailure("provider returned 503")
             error.status_code = 503
             error.physical_attempt_capture = SimpleNamespace(
                 state="future_state", provider_status_code=503,
@@ -311,6 +316,7 @@ def test_coordinator_does_not_retry_malformed_physical_capture(tmp_path, monkeyp
     assert result.actors[0]["operation_state"] == "custody_lost"
     assert result.actors[0]["failure_code"] == "provider_outcome_unknown"
     assert result.actors[0]["late_result_pending"] is True
+    assert "provider returned 503" in result.actors[0]["error"]
 
 
 def test_coordinator_propagates_terminal_capture_status_for_same_cycle_replay(
