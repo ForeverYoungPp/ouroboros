@@ -74,7 +74,7 @@ test('typed terminal status drives an error phase on live and replay cards', () 
     assert.equal(taskDoneIsTerminal(failed), true);
     assert.match(
         chatSource,
-        /const replayPhase = msg\.task_terminal_status\s*\? taskTerminalPhase\(msg\)\s*:\s*replayTerminalPhase\(taskState, record\);/,
+        /finishLiveCard\(taskId, msg\.task_terminal_status \? taskTerminalPhase\(msg\) : replayTerminalPhase\(taskState, record\)\);/,
     );
     assert.match(chatSource, /finishLiveCard\(explicitTaskId, taskTerminalPhase\(msg\)\);/);
 });
@@ -263,7 +263,7 @@ test('history replay keeps open summaries live and terminal fallbacks factual', 
     } }), 'error');
     assert.equal(replayTerminalPhase({ completedPhase: 'warn' }, {}), 'warn');
     assert.equal(
-        [...chatSource.matchAll(/finishLiveCard\(taskId, replayPhase\)/g)].length,
+        [...chatSource.matchAll(/finishLiveCard\(taskId, msg\.task_terminal_status \? taskTerminalPhase\(msg\) : replayTerminalPhase\(taskState, record\)\);/g)].length,
         2,
     );
     assert.doesNotMatch(
