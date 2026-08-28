@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import pathlib
 
+import pytest
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
@@ -123,6 +124,59 @@ def test_review_history_detail_found_record_renders_private_markdown(tmp_path):
     # Degraded reviewers are disclosed honestly by model + status.
     assert "anthropic/claude-y (empty_response)" in markdown
     assert "withheld from chat" in markdown
+    assert (
+        "A terminal reviewer slot that never started or refused has no "
+        "physical-attempt ledger row; incomplete attempt coverage can therefore be final."
+    ) in markdown
+
+
+def test_review_history_detail_surfaces_failed_lifecycle_with_clean_verdict(tmp_path):
+    client, drive_root = _detail_client(tmp_path)
+    append_jsonl(_history_path(drive_root, "alpha"), _terminal_record(
+        status="clean",
+        job_status="failed",
+        terminal_reason="dependency install failed",
+    ))
+
+    markdown = client.get(
+        "/api/skills/alpha/review-history/skill-job-1",
+    ).json()["markdown"]
+
+    assert "`alpha` — status=clean" in markdown
+    assert "Error: dependency install failed" in markdown
+
+
+def test_review_history_detail_keeps_legacy_same_model_actors_distinct(tmp_path):
+    client, drive_root = _detail_client(tmp_path)
+    actors = []
+    for item in ("manifest_schema", "secrets_hygiene"):
+        actors.append({
+            "model_id": "openai/gpt-x",
+            "status": "responded",
+            "parsed_items": [{
+                "item": item,
+                "verdict": "PASS",
+                "severity": "advisory",
+                "reason": "ok",
+                "model": "openai/gpt-x",
+            }],
+        })
+    append_jsonl(
+        _history_path(drive_root, "alpha"),
+        _terminal_record(raw_actor_records=actors),
+    )
+
+    markdown = client.get(
+        "/api/skills/alpha/review-history/skill-job-1",
+    ).json()["markdown"]
+
+    assert (
+        "Reviewers: openai/gpt-x [legacy-actor-1], "
+        "openai/gpt-x [legacy-actor-2]"
+    ) in markdown
+    assert "### Reviewer: openai/gpt-x [legacy-actor-1]" in markdown
+    assert "### Reviewer: openai/gpt-x [legacy-actor-2]" in markdown
+    assert markdown.count("### Reviewer:") == 2
 
 
 def test_review_history_detail_renders_exact_canonical_wave_usage(tmp_path, monkeypatch):
@@ -173,6 +227,7 @@ def test_review_history_detail_renders_exact_canonical_wave_usage(tmp_path, monk
     assert "claude resets 2026-08-25T00:00:00Z" in markdown
     assert "model=claude-fable-5, requested route=claude, profile=fable-profile" in markdown
     assert "ledger integrity=verified; slot attribution=complete" in markdown
+    assert "Cost unavailable" not in markdown
 
 
 def test_review_history_detail_discloses_legacy_paid_wave_as_unattributable(tmp_path):
@@ -186,6 +241,7 @@ def test_review_history_detail_discloses_legacy_paid_wave_as_unattributable(tmp_
     assert "paid panel dispatch" in markdown
     assert "exact per-wave physical-attempt attribution was unavailable in this version" in markdown
     assert "### Review accounting" not in markdown
+    assert "Cost unavailable" in markdown
 
 
 def test_review_history_detail_empty_exact_wave_never_invents_zero_cash(tmp_path):
@@ -204,6 +260,7 @@ def test_review_history_detail_empty_exact_wave_never_invents_zero_cash(tmp_path
     assert "$0.000000" not in markdown
     assert "ledger integrity=verified" not in markdown
     assert "### Review accounting" not in markdown
+    assert "Cost unavailable" in markdown
 
 
 def test_review_history_detail_projects_a_late_dispatch_marker_without_rewriting_history(
@@ -370,6 +427,7 @@ def test_review_history_detail_free_replay_names_zero_physical_dispatch(tmp_path
     assert "free replay of the 2026-08-14T12:00:00Z verdict" in markdown
     assert "no physical reviewer dispatch for this replay" in markdown
     assert "### Review accounting" not in markdown
+    assert "Cost: $0 (free replay)" in markdown
 
 
 def test_review_history_detail_missing_skill_is_typed_404(tmp_path):
@@ -389,6 +447,271 @@ def test_review_history_detail_missing_job_is_typed_404(tmp_path):
 
     assert resp.status_code == 404
     assert resp.json()["error"] == "review record not found"
+
+
+def test_review_history_detail_outside_fixed_tail_is_honestly_unavailable(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import skill_review_history
+
+    client, drive_root = _detail_client(tmp_path)
+    path = _history_path(drive_root, "alpha")
+    append_jsonl(path, _terminal_record(job_id="skill-job-old"))
+    append_jsonl(
+        path,
+        _terminal_record(job_id="skill-job-new", raw_actor_records=[], padding="x" * 600),
+    )
+    monkeypatch.setattr(skill_review_history, "_DETAIL_LOOKUP_MAX_BYTES", 256)
+
+    resp = client.get("/api/skills/alpha/review-history/skill-job-old")
+
+    assert resp.status_code == 404
+    assert resp.json()["error"] == (
+        "review record unavailable outside the bounded history window"
+    )
+
+
+def test_review_history_detail_normalizes_legacy_ordinals_only_with_full_history(tmp_path):
+    client, drive_root = _detail_client(tmp_path)
+    path = _history_path(drive_root, "alpha")
+    for job_id in ("skill-job-first", "skill-job-legacy"):
+        record = _terminal_record(job_id=job_id, raw_actor_records=[])
+        for key in ("review_round", "snapshot_attempt", "snapshot_revised"):
+            record.pop(key)
+        append_jsonl(path, record)
+
+    resp = client.get("/api/skills/alpha/review-history/skill-job-legacy")
+
+    assert resp.status_code == 200
+    assert "Skill review round 2" in resp.json()["markdown"]
+    assert "(attempt 2)" in resp.json()["markdown"]
+
+
+def test_review_history_detail_refuses_legacy_ordinals_from_truncated_byte_window(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import skill_review_history
+
+    client, drive_root = _detail_client(tmp_path)
+    path = _history_path(drive_root, "alpha")
+    append_jsonl(path, _terminal_record(job_id="old", raw_actor_records=[], padding="x" * 3000))
+    legacy = _terminal_record(job_id="skill-job-legacy", raw_actor_records=[])
+    for key in ("review_round", "snapshot_attempt", "snapshot_revised"):
+        legacy.pop(key)
+    append_jsonl(path, legacy)
+    monkeypatch.setattr(skill_review_history, "_DETAIL_LOOKUP_MAX_BYTES", 2048)
+
+    resp = client.get("/api/skills/alpha/review-history/skill-job-legacy")
+
+    assert resp.status_code == 404
+    assert resp.json()["error"] == (
+        "review record unavailable outside the bounded history window"
+    )
+
+
+def test_review_history_detail_reads_stored_ordinals_from_truncated_windows(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import skill_review_history
+
+    client, drive_root = _detail_client(tmp_path)
+    path = _history_path(drive_root, "alpha")
+    append_jsonl(path, _terminal_record(job_id="old", raw_actor_records=[], padding="x" * 3000))
+    append_jsonl(path, _terminal_record(
+        job_id="skill-job-modern", raw_actor_records=[],
+        review_round=77, snapshot_attempt=33, snapshot_revised=True,
+    ))
+    monkeypatch.setattr(skill_review_history, "_DETAIL_LOOKUP_MAX_BYTES", 2048)
+    monkeypatch.setattr(skill_review_history, "_DETAIL_LOOKUP_MAX_RECORDS", 1)
+
+    resp = client.get("/api/skills/alpha/review-history/skill-job-modern")
+
+    assert resp.status_code == 200
+    assert "Skill review round 77" in resp.json()["markdown"]
+    assert "(attempt 33)" in resp.json()["markdown"]
+
+
+def test_review_history_detail_rejects_malformed_ordinals_from_truncated_window(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import skill_review_history
+
+    client, drive_root = _detail_client(tmp_path)
+    path = _history_path(drive_root, "alpha")
+    append_jsonl(path, _terminal_record(job_id="old", raw_actor_records=[], padding="x" * 3000))
+    append_jsonl(path, _terminal_record(
+        job_id="skill-job-malformed", raw_actor_records=[],
+        review_round="not-a-number", snapshot_attempt="not-a-number",
+    ))
+    monkeypatch.setattr(skill_review_history, "_DETAIL_LOOKUP_MAX_BYTES", 2048)
+    monkeypatch.setattr(skill_review_history, "_DETAIL_LOOKUP_MAX_RECORDS", 1)
+
+    resp = client.get("/api/skills/alpha/review-history/skill-job-malformed")
+
+    assert resp.status_code == 404
+    assert resp.json()["error"] == (
+        "review record unavailable outside the bounded history window"
+    )
+
+
+@pytest.mark.parametrize("stored_ordinals", [False, True])
+def test_bounded_detail_record_window_never_invents_legacy_ordinals(
+    tmp_path, monkeypatch, stored_ordinals,
+):
+    from ouroboros import skill_review_history
+
+    _client, drive_root = _detail_client(tmp_path)
+    path = _history_path(drive_root, "alpha")
+    append_jsonl(path, _terminal_record(job_id="old", raw_actor_records=[]))
+    target = _terminal_record(job_id="target", raw_actor_records=[])
+    if not stored_ordinals:
+        target.pop("snapshot_revised")
+    append_jsonl(path, target)
+    monkeypatch.setattr(skill_review_history, "_DETAIL_LOOKUP_MAX_RECORDS", 1)
+
+    record, status = skill_review_history.find_history_job_bounded(
+        drive_root, "alpha", "target",
+    )
+
+    if stored_ordinals:
+        assert status == "found" and record is not None
+    else:
+        assert (record, status) == (None, "unavailable")
+
+
+def test_bounded_detail_refuses_legacy_ordinals_across_malformed_raw_gap(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import skill_review_history
+
+    _client, drive_root = _detail_client(tmp_path)
+    path = _history_path(drive_root, "alpha")
+
+    def legacy(job_id):
+        record = _terminal_record(job_id=job_id, raw_actor_records=[])
+        for key in ("review_round", "snapshot_attempt", "snapshot_revised"):
+            record.pop(key)
+        return json.dumps(record)
+
+    path.write_text(
+        "\n".join([
+            legacy("skill-job-first"),
+            "{malformed",
+            legacy("skill-job-second"),
+            legacy("skill-job-target"),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(skill_review_history, "_DETAIL_LOOKUP_MAX_RECORDS", 3)
+
+    record, status = skill_review_history.find_history_job_bounded(
+        drive_root, "alpha", "skill-job-target",
+    )
+
+    assert record is None
+    assert status == "unavailable"
+
+
+def test_bounded_detail_lookup_uses_shared_jsonl_tail_reader(tmp_path, monkeypatch):
+    from ouroboros import skill_review_history
+
+    _client, drive_root = _detail_client(tmp_path)
+    append_jsonl(
+        _history_path(drive_root, "alpha"),
+        _terminal_record(job_id="skill-job-modern", raw_actor_records=[]),
+    )
+    original = skill_review_history.iter_jsonl_objects
+    calls = []
+
+    def recording_reader(path, **kwargs):
+        calls.append((path, kwargs))
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(skill_review_history, "iter_jsonl_objects", recording_reader)
+
+    record, status = skill_review_history.find_history_job_bounded(
+        drive_root, "alpha", "skill-job-modern",
+    )
+
+    assert status == "found" and record is not None
+    assert len(calls) == 1
+    assert calls[0][1]["tail_bytes"] == skill_review_history._DETAIL_LOOKUP_MAX_BYTES
+    assert calls[0][1]["max_entries"] == (
+        skill_review_history._DETAIL_LOOKUP_MAX_RECORDS + 1
+    )
+    assert isinstance(calls[0][1]["gap_reasons"], set)
+
+
+def test_bounded_detail_lookup_missing_and_empty_history_are_absent(tmp_path):
+    from ouroboros import skill_review_history
+
+    _client, drive_root = _detail_client(tmp_path)
+    missing = skill_review_history.find_history_job_bounded(
+        drive_root, "alpha", "missing",
+    )
+    _history_path(drive_root, "alpha").write_text("", encoding="utf-8")
+    empty = skill_review_history.find_history_job_bounded(
+        drive_root, "alpha", "missing",
+    )
+
+    assert missing == (None, "absent")
+    assert empty == (None, "absent")
+
+
+def test_bounded_detail_lookup_stat_permission_error_is_retryable_io_error(tmp_path, monkeypatch):
+    from ouroboros import skill_review_history
+
+    _client, drive_root = _detail_client(tmp_path)
+    path = _history_path(drive_root, "alpha")
+    path.write_text("{}\n", encoding="utf-8")
+    original_stat = pathlib.Path.stat
+
+    def guarded_stat(candidate, *args, **kwargs):
+        if candidate == path:
+            raise PermissionError("denied")
+        return original_stat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "stat", guarded_stat)
+    assert skill_review_history.find_history_job_bounded(
+        drive_root, "alpha", "missing",
+    ) == (None, "io_error")
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [(FileNotFoundError("gone"), "absent"), (PermissionError("denied"), "io_error")],
+)
+def test_bounded_detail_lookup_read_errors_are_typed(tmp_path, monkeypatch, error, expected):
+    from ouroboros import skill_review_history
+
+    _client, drive_root = _detail_client(tmp_path)
+    _history_path(drive_root, "alpha").write_text("{}\n", encoding="utf-8")
+
+    def fail_read(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(skill_review_history, "iter_jsonl_objects", fail_read)
+    assert skill_review_history.find_history_job_bounded(
+        drive_root, "alpha", "missing",
+    ) == (None, expected)
+
+
+def test_review_history_detail_io_error_is_retryable_503(tmp_path, monkeypatch):
+    from ouroboros import skill_review_history
+
+    client, _drive_root = _detail_client(tmp_path)
+    monkeypatch.setattr(
+        skill_review_history,
+        "find_history_job_bounded",
+        lambda *_args, **_kwargs: (None, "io_error"),
+    )
+
+    resp = client.get("/api/skills/alpha/review-history/skill-job-1")
+
+    assert resp.status_code == 503
+    assert resp.json()["error"] == (
+        "review history is temporarily unavailable; retry the detail"
+    )
 
 
 def test_review_history_detail_malformed_lines_degrade_to_typed_404(tmp_path):
@@ -455,8 +778,16 @@ def test_chat_history_passes_skill_review_reference_fields(tmp_path):
         "status": "clean",
         "content_hash": "abc123def4567890",
         "job_id": "skill-job-1",
+        "group_id": "task:root-1:alpha",
+        "presentation_owner_task_id": "root-1",
+        "root_task_id": "root-1",
+        "origin_task_id": "child-1",
+        "origin_root_task_id": "root-1",
         "review_round": 2,
         "snapshot_attempt": 1,
+        "snapshot_revised": True,
+        "job_status": "succeeded",
+        "terminal_reason": "clean",
         "source": "skills",
         "format": "markdown",
         "text": "Skill review round 2 — snapshot abc123def456 (attempt 1): `alpha` — status=clean, source=skills",
@@ -489,6 +820,11 @@ def test_chat_history_passes_skill_review_reference_fields(tmp_path):
     assert reference["content_hash"] == "abc123def4567890"
     assert reference["review_round"] == 2
     assert reference["snapshot_attempt"] == 1
+    assert reference["snapshot_revised"] is True
+    assert reference["group_id"] == "task:root-1:alpha"
+    assert reference["presentation_owner_task_id"] == "root-1"
+    assert reference["origin_task_id"] == "child-1"
+    assert reference["job_status"] == "succeeded"
     assert reference["source"] == "skills"
     # Legacy skill_review rows expose empty reference fields (frontend keeps
     # exactly today's local expansion for them).

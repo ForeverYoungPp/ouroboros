@@ -308,6 +308,16 @@ def test_push_log_broadcast_surfaces_chat_id(monkeypatch):
     assert logs[1]["chat_id"] == 0
 
 
+def test_push_log_suppresses_negative_a2a_chat_from_browser_broadcast(monkeypatch):
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+
+    bridge.push_log({"type": "task_started", "task_id": "a2a", "chat_id": -1001})
+
+    assert frames == []
+
+
 def test_budget_line_replays_unresolved_attempt_not_stale_state(monkeypatch, tmp_path):
     from ouroboros import usage_accounting as ua
     from supervisor import state as state_module

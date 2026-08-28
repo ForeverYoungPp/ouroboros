@@ -48,11 +48,26 @@ class TestLifecycleChatRouting:
         async def runner():
             return "ok"
 
-        _run(q.run_lifecycle_job(kind="review", target="alpha", runner=runner, chat_id=17))
+        _run(q.run_lifecycle_job(
+            kind="review", target="alpha", runner=runner, chat_id=17,
+            options=q.LifecycleJobOptions(presentation={
+                "group_id": "task:root-1:alpha",
+                "task_id": "child-1",
+                "root_task_id": "root-1",
+                "origin_task_id": "child-1",
+                "origin_root_task_id": "root-1",
+                "presentation_owner_task_id": "root-1",
+            }),
+        ))
         assert sent, "lifecycle notifications must fire"
         assert {cid for cid, _, _ in sent} == {17}
         lifecycle = sent[0][2]["progress_meta"]["lifecycle"]
         assert lifecycle["chat_id"] == 17
+        assert lifecycle["status"] == "queued"
+        assert lifecycle["group_id"] == "task:root-1:alpha"
+        assert lifecycle["task_id"] == "child-1"
+        assert lifecycle["root_task_id"] == "root-1"
+        assert lifecycle["presentation_owner_task_id"] == "root-1"
 
     def test_unbound_job_stays_on_the_panel_chat_zero(self, monkeypatch):
         sent = _capture_sends(monkeypatch)
@@ -89,6 +104,7 @@ class TestLifecycleChatRouting:
         assert len(pointers) == 1
         cid, _text, kwargs = pointers[0]
         assert cid == 25  # the DUPLICATE caller's own chat
+        assert kwargs["task_id"] == ""  # pointer ack never becomes a second task card
         pointer = kwargs["progress_meta"]["lifecycle_pointer"]
         assert pointer["job_id"] == "skill-job-1"
         assert pointer["chat_id"] == 17  # where the routing actually lives

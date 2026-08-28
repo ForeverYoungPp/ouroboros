@@ -26,6 +26,7 @@ import {
     familyActionLabel,
     familyLabel,
     familyStatus,
+    harnessFamilyMarkup,
     humanizeResetAt,
     nextUpBadge,
     quotaSubjectAliases,
@@ -100,7 +101,7 @@ test('a fresh install still shows every family, each with its own way in', () =>
 
 test('an empty family that WAS read says so, and its button still connects', () => {
     const groups = accountGroups(payload({ harnesses: [{ id: 'codex', display_name: 'Codex CLI' }] }),
-        { accountsRead: 'ok' });
+        { accountsRead: 'ok', catalogKnown: true });
     const codex = groups.find((g) => g.harness === 'codex');
     assert.equal(codex.label, 'Codex CLI');  // discovery wins over the bootstrap name
     assert.equal(codex.status.label, 'No account connected');
@@ -831,8 +832,105 @@ test('a review row pinned to a removed account stays visible with ONE warning', 
 
 test('familyLabel prefers live discovery and falls back to the product name', () => {
     assert.equal(familyLabel('claude', payload()), 'Claude Code');
-    assert.equal(familyLabel('claude', payload({ harnesses: [{ id: 'claude', display_name: 'Claude Code CLI' }] })),
+    assert.equal(familyLabel('claude',
+        payload({ harnesses: [{ id: 'claude', display_name: 'Claude Code CLI' }] }),
+        { catalogKnown: true }),
         'Claude Code CLI');
+    assert.equal(familyLabel('claude',
+        payload({ harnesses: [{ id: 'claude', display_name: 'Stale daemon label' }] })),
+        'Claude Code', 'omitted catalog provenance fails closed over a retained snapshot');
     // An unknown harness is named by its own id rather than invented.
     assert.equal(familyLabel('mystery', payload()), 'mystery');
+});
+
+test('account headers and dialogs withdraw retained daemon labels until catalog recovery', async () => {
+    const status = (label, catalog = 'ok') => ({
+        daemon: { state: 'running', engine_version: '3.8.1', runtime: {} },
+        harnesses: [{ id: 'codex', display_name: label }],
+        profiles: {
+            harnessAccounts: [],
+            profiles: [{
+                profile: {
+                    harness_id: 'codex', profile_id: 'work',
+                    display_name: 'Work', enabled: true,
+                },
+                status: { availability: 'available', verification: 'passed' },
+                identity: {},
+            }],
+        },
+        quota: [],
+        reads: { catalog, accounts: 'ok', quota: 'ok' },
+    });
+    const responses = [
+        { ok: true, status: 200, body: status('Codex Live') },
+        // The backend can retain the last catalog projection in a partial
+        // answer while explicitly refusing authority for that facet.
+        { ok: true, status: 200, body: status('Codex Live', 'failed') },
+        // A transport failure is the other retained-snapshot shape: the store
+        // deliberately keeps the partial answer above for usable controls.
+        { ok: false, status: 503, body: { error: 'catalog transport died' } },
+        { ok: true, status: 200, body: status('Codex Restored') },
+    ];
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => {
+            const response = responses.shift();
+            return {
+                ok: response.ok,
+                status: response.status,
+                json: async () => response.body,
+            };
+        },
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    const header = () => {
+        const group = accountGroups(store.snapshot, {
+            accountsRead: store.facet('accounts'),
+            catalogKnown: store.catalogKnown,
+        }).find((candidate) => candidate.harness === 'codex');
+        return harnessFamilyMarkup(group, store.snapshot, {
+            accountsRead: store.facet('accounts'),
+            quotaRead: store.facet('quota'),
+        });
+    };
+    const removeBody = async () => {
+        let body = '';
+        await confirmRemoveAccount('codex', 'work', {
+            store,
+            dialogImpl: async (options) => {
+                body = options.body;
+                return false;
+            },
+            removeImpl: async () => assert.fail('cancelled dialog removed an account'),
+            renderImpl: () => {},
+        });
+        return body;
+    };
+    try {
+        await store.refresh();
+        assert.equal(store.catalogKnown, true);
+        assert.match(header(), />Codex Live<\/span>/);
+        assert.match(await removeBody(), /for Codex Live account/);
+
+        await store.refresh();
+        assert.equal(store.catalogKnown, false);
+        assert.match(header(), />Codex<\/span>/);
+        assert.doesNotMatch(header(), /Codex Live/);
+        assert.match(await removeBody(), /for Codex account/);
+        assert.doesNotMatch(await removeBody(), /Codex Live/);
+
+        const retained = store.snapshot;
+        await store.refresh();
+        assert.equal(store.snapshot, retained, 'transport failure discarded the usable snapshot');
+        assert.equal(store.catalogKnown, false);
+        assert.match(header(), />Codex<\/span>/);
+        assert.doesNotMatch(header(), /Codex Live/);
+        assert.doesNotMatch(await removeBody(), /Codex Live/);
+
+        await store.refresh();
+        assert.equal(store.catalogKnown, true);
+        assert.match(header(), />Codex Restored<\/span>/);
+        assert.match(await removeBody(), /for Codex Restored account/);
+    } finally {
+        store.dispose();
+    }
 });

@@ -133,7 +133,6 @@ BAND_PATHS = {
     "ouroboros/consciousness.py": "Durable Background Consciousness observation inbox and bounded truthful replay",
     "ouroboros/extension_process_runner.py": None,
     "ouroboros/gateway/control.py": "Entered the band from 966 lines: the update-flow redesign added the shared stash-first prologue (_stash_local_work_fenced/_unwind_stashed_update) and the review-wave affordability floor to the update apply orchestration (update-flow-redesign sprint, Q9/Q10 owner decisions).",
-    "ouroboros/gateway/extensions.py": None,
     "ouroboros/gateway/history.py": None,
     "ouroboros/gateway/settings.py": "Retiring persistent auto-Low removed the former giant debt; the remaining owner and reviewer settings endpoints stay centralized while tracked in the shrinking band.",
     "ouroboros/gateway/tasks.py": None,
@@ -160,6 +159,7 @@ BAND_PATHS = {
     "skills/telegram/scripts/companion.py": None,
     "skills/telegram/scripts/sidecar.py": None,
     "supervisor/evolution_lifecycle.py": None,
+    "supervisor/message_bus.py": "Typed terminal task metadata remains in the shared message-bus authority so direct-chat failures replay with truthful lifecycle state.",
     "supervisor/terminal_delivery.py": None,
     "tests/test_acting_subagents.py": None,
     "tests/test_advisory_observability.py": None,
@@ -180,6 +180,7 @@ BAND_PATHS = {
     "tests/test_review_fidelity.py": None,
     "tests/test_review_verification_v6544.py": None,
     "tests/test_safety_policy.py": None,
+    "tests/test_skill_review_runner.py": "Skill lifecycle/review terminal-state regression coverage stays one focused suite below the 1500-line band cap.",
     "tests/test_swe_pro_e1v2.py": None,
     "tests/test_telegram_miniapp_lifecycle.py": None,
     "tests/test_timeout_policy.py": "Adaptive timeout and custody regression suite covers raw-deadline admission, explicit finalization reserve, transport bounds, and late-result reconciliation.",
@@ -190,10 +191,11 @@ BAND_PATHS = {
     "web/modules/api_types.js": "The shared browser contract module now includes issue 265 publication-preflight types alongside the target settings and subagent contracts.",
     "web/modules/harness_accounts.js": None,
     "web/modules/log_events.js": None,
-    "web/modules/onboarding_wizard.js": None,
+    "web/modules/review_presentation.js": "Review Checkpoint read-side grouping, lifecycle/verdict separation, and keyed disclosure reconciliation remain one pure adapter below the 1500-line band cap.",
     "web/modules/settings.js": None,
     "web/modules/widgets.js": None,
     "web/tests/harness_login_cards.test.js": "Login-card suite grew past 1000 lines with the name-the-account face cases (agy pickup, issue #232); split when the next face lands.",
+    "web/tests/review_presentation.test.js": "Review Checkpoint lifecycle and verdict reconciliation remain covered by one focused presentation suite.",
 }
 
 BYTE_BASELINE_DEBT = {
@@ -209,5 +211,5 @@ BYTE_DEBT = {
     "ouroboros/loop.py": 314553,
     "tests/test_delegated_subagent_transport.py": 320571,
     "tests/test_devtools_benchmarks.py": 328282,
-    "web/modules/chat.js": 225642,
+    "web/modules/chat.js": 224732,
 }
