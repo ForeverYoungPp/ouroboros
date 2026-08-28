@@ -92,6 +92,19 @@ test('interrupted task_done remains retryable and cannot finish a root card', ()
     }), false);
 });
 
+test('review lifecycle timeout and error are terminal lifecycle errors', () => {
+    for (const status of ['timeout', 'error']) {
+        const view = summarizeChatLiveEvent({
+            type: 'send_message',
+            is_progress: true,
+            task_id: 'review-task',
+            lifecycle: { kind: 'review', status, target: 'alpha', error: 'transport failed' },
+        });
+        assert.equal(view.phase, 'lifecycle_error', status);
+        assert.equal(view.terminal, true, status);
+    }
+});
+
 test('owner soft-stop is factual Done and keeps its marker in details', () => {
     const evt = {
         type: 'task_done', status: 'done', reason_code: 'owner_requested_finalization',

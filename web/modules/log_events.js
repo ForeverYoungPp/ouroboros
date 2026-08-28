@@ -6,6 +6,10 @@ import {
     formatReviewProjection,
 } from './review_presentation.js';
 
+const REVIEW_LIFECYCLE_ERROR_STATUSES = new Set([
+    'failed', 'interrupted', 'timeout', 'error',
+]);
+
 export { formatReviewProjection } from './review_presentation.js';
 
 export const LOG_CATEGORIES = {
@@ -738,7 +742,7 @@ export function summarizeChatLiveEvent(evt) {
         const stale = Boolean(lifecycle.stale);
         const phase = status === 'succeeded' ? 'done'
             : status === 'cancelled' ? 'cancelled'
-                : ['failed', 'interrupted'].includes(status) ? 'lifecycle_error'
+                : REVIEW_LIFECYCLE_ERROR_STATUSES.has(status) ? 'lifecycle_error'
                     : stale ? 'warn'
                         : 'working';
         const label = lifecycle.phase || status || 'working';
