@@ -2074,8 +2074,9 @@ cycle's replayable actor roster, so a sibling cannot make the cycle lose its
 terminal fact or buy a duplicate physical call. The typed actor state is
 sufficient for this same-cycle custody fact when optional physical-attempt
 capture metadata is absent; when that metadata is present it must say `settled`,
-while explicit `reserved`, `released`, `dispatched`, or `unresolved` states stay
-retryable rather than becoming sticky replay rows. A `$0` not-dispatched row
+while explicit `reserved` or `released` states remain eligible for a real retry
+rather than becoming sticky replay rows. `dispatched` or `unresolved` states
+stay under the custody-lost/no-resend classification. A `$0` not-dispatched row
 remains retryable. A new
 retry cycle uses a new identity. Send-time VLM
 captioning keeps its direct 90-second provider cap. Explicit VLM helpers order

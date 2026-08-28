@@ -570,10 +570,11 @@ def _settle_review_attempt(
             and str(getattr(actor, "operation_state", "") or "")
             not in {"not_dispatched", "in_flight", "custody_lost"}
             # If capture metadata is present, it must prove that the physical
-            # attempt settled. Explicit reserved/released/dispatched/
-            # unresolved states are not terminal API outcomes and must remain
-            # eligible for a real retry. Empty keeps legacy typed actors
-            # replayable when their adapter emitted no capture at all.
+            # attempt settled. Explicit reserved/released states are
+            # pre-dispatch and stay eligible for a real retry; dispatched or
+            # unresolved states are excluded here and remain governed by the
+            # custody_lost/no-resend classification. Empty keeps legacy typed
+            # actors replayable when their adapter emitted no capture at all.
             and physical_attempt_state in {"", "settled"}
         )
         replayable = (

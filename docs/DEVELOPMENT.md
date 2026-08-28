@@ -1907,9 +1907,10 @@ Before every commit, verify the following:
   rail. During a mixed plan/commit cycle, the typed settled terminal API actor
   remains in the exact cycle's replay roster even when optional physical-attempt
   capture metadata is absent; when that metadata is present it must say `settled`,
-  while explicit `reserved`, `released`, `dispatched`, or `unresolved` states stay
-  retryable rather than becoming sticky replay rows. An identical envelope never
-  buys that actor twice, and a new retry cycle uses a new key. A `$0`
+  while explicit `reserved` or `released` states remain eligible for a real retry
+  rather than becoming sticky replay rows. `dispatched` or `unresolved` states
+  stay under the custody-lost/no-resend classification. An identical envelope
+  never buys a settled actor twice, and a new retry cycle uses a new key. A `$0`
   `not_dispatched` refusal remains retryable rather than becoming a sticky replay
   actor.
   A dispatched request whose socket or stream ends without terminal
