@@ -3853,19 +3853,24 @@ def _handle_cancel_task(evt: Dict[str, Any], ctx: Any) -> None:
     acknowledgement, and ✅ is sent only after a CONFIRMED teardown + durable
     settled write."""
     task_id = str(evt.get("task_id") or "").strip()
+    requested_task_id = str(evt.get("requested_task_id") or "").strip()
+    display_task_id = requested_task_id or task_id
     st = ctx.load_state()
     owner_chat_id = st.get("owner_chat_id")
     from supervisor.queue import (
-        CANCEL_ALREADY_SETTLED, CANCEL_CANCELLED, CANCEL_NOT_FOUND, cancel_task_custody,
+        CANCEL_ALREADY_SETTLED,
+        CANCEL_CANCELLED,
+        CANCEL_NOT_FOUND,
+        drive_cancel_intent_scope,
     )
 
-    outcome = cancel_task_custody(task_id) if task_id else CANCEL_NOT_FOUND
+    outcome = drive_cancel_intent_scope(task_id) if task_id else CANCEL_NOT_FOUND
     if not owner_chat_id:
         return
     if outcome == CANCEL_CANCELLED:
         ctx.send_with_budget(
             int(owner_chat_id),
-            f"✅ cancel {task_id or '?'}: teardown confirmed, outcome settled (event)",
+            f"✅ cancel {display_task_id or '?'}: teardown confirmed, outcome settled (event)",
         )
     elif outcome == CANCEL_ALREADY_SETTLED:
         settled_status = str(
@@ -3873,24 +3878,28 @@ def _handle_cancel_task(evt: Dict[str, Any], ctx: Any) -> None:
         )
         ctx.send_with_budget(
             int(owner_chat_id),
-            f"ℹ️ cancel {task_id or '?'}: the task had already finished "
+            f"ℹ️ cancel {display_task_id or '?'}: the task had already finished "
             f"({settled_status}) — its result is preserved, nothing was torn down (event)",
         )
     elif outcome == CANCEL_NOT_FOUND:
         ctx.send_with_budget(
             int(owner_chat_id),
-            f"⚠️ cancel {task_id or '?'}: no such live task (event)",
+            f"⚠️ cancel {display_task_id or '?'}: no such live task (event)",
         )
     else:
         ctx.send_with_budget(
             int(owner_chat_id),
-            f"❌ cancel {task_id or '?'} did not settle — the task is still live; "
+            f"❌ cancel {display_task_id or '?'} did not settle — the task is still live; "
             "the durable cancel intent stays open and the supervisor watchdog retries (event)",
             is_progress=True,
-            task_id=task_id,
+            task_id=display_task_id,
             progress_meta={
                 "task_incident": "cancellation_fault",
-                "toast_once": f"{task_id or 'unknown'}:cancellation_fault",
+                "toast_once": f"{display_task_id or 'unknown'}:cancellation_fault",
+                **(
+                    {"cancel_physical_task_id": task_id}
+                    if task_id and display_task_id != task_id else {}
+                ),
             },
         )
 

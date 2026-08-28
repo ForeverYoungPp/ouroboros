@@ -457,7 +457,7 @@ def stop_evolution_tasks(reason: str = "evolution stopped") -> Dict[str, List[st
             # evolution task whose worker is still winding down (post-task
             # cognition) must still be fenced and killed — ``already_settled``
             # is only terminal when no live ownership remains.
-            request_cancel(
+            intent = request_cancel(
                 q.DRIVE_ROOT, task_id, reason=reason, source="evolution_stop",
                 allow_settled_target=task_has_live_ownership(task_id),
             )
@@ -470,7 +470,9 @@ def stop_evolution_tasks(reason: str = "evolution stopped") -> Dict[str, List[st
             outcomes["intent_write_failed"].append(task_id)
             continue
         try:
-            outcome = q.cancel_task_custody(task_id)
+            outcome = q.drive_cancel_intent_scope(
+                str(intent.get("task_id") or task_id),
+            )
         except Exception:
             q.log.warning(
                 "Failed to cancel evolution task %s (%s)", task_id, reason, exc_info=True
@@ -556,8 +558,28 @@ def task_has_live_ownership(task_id: str) -> bool:
     with q._queue_lock:
         if task_id in q.RUNNING:
             return True
-        return any(
+        if any(
             worker.busy_task_id == task_id for worker in workers.WORKERS.values()
+        ):
+            return True
+        try:
+            from supervisor.task_lifecycle import _live_retry_target_locked
+
+            retry_target, _settled_status = _live_retry_target_locked(q, task_id)
+        except Exception:
+            # An indeterminate chain cannot prove that physical ownership is
+            # absent.  Fail open toward liveness so intent minting, which does
+            # the authoritative locked validation, decides the request.
+            return True
+        return bool(
+            retry_target != task_id
+            and (
+                retry_target in q.RUNNING
+                or any(
+                    worker.busy_task_id == retry_target
+                    for worker in workers.WORKERS.values()
+                )
+            )
         )
 
 

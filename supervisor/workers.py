@@ -1956,6 +1956,7 @@ def _emit_task_done_terminal(
 
 _TERMINALIZATION_RETRY_FIELD = "_terminalization_retry"
 _TERMINALIZATION_RETRY_STATUSES = frozenset({"failed", "cancelled", "interrupted"})
+_CANCEL_INTENT_AUTHORITY_HOLD_FIELD = "_cancel_intent_authority_hold"
 
 
 def _terminalization_retry_spec(task: Any) -> Optional[Dict[str, Any]]:
@@ -3058,14 +3059,16 @@ def _persist_pending_terminalization_retries(task_ids: List[str]) -> None:
         )
 
 
-def _drop_cancelled_pending() -> None:
+def _drop_cancelled_pending() -> bool:
     """Remove pending tasks cancelled/finished between scheduling and assignment
     so a cancelled subagent never actually starts. Caller holds _queue_lock.
 
     The pre-assignment consult of the durable cancel-intent projection (phase A):
     a task with an active intent (or a legacy ``cancel_requested`` latch file) is
     settled as ``cancelled`` with a reconstructed — usually confirmed pre-start
-    zero — cost, never assigned to a worker.
+    zero — cost, never assigned to a worker.  Return ``False`` when the
+    projection cannot be read authoritatively; the caller must then abort the
+    assignment pass before selecting a worker.
 
     It settles under the SAME rules ``cancel_task_custody`` follows, because it
     cannot call custody (the caller already holds ``_queue_lock``, which custody
@@ -3077,27 +3080,57 @@ def _drop_cancelled_pending() -> None:
     about a child it cancelled itself.
     """
     if not PENDING:
-        return
+        return True
     try:
         from ouroboros.task_results import (
             STATUS_CANCEL_REQUESTED, STATUS_CANCELLED, _TRULY_TERMINAL_STATUSES,
             load_task_result, write_task_result,
         )
     except Exception:
-        return
+        log.error(
+            "Pending task-result authority imports are unavailable; assignment is blocked",
+            exc_info=True,
+        )
+        return False
+    assignment = {"safe": True}
     try:
         from ouroboros.cancel_intents import (
             active_intents, claim_intent, release_claim, settle_intent,
         )
-        intents = active_intents(DRIVE_ROOT, strict=True)
+        if not isinstance(active_intents(DRIVE_ROOT, strict=True), dict):
+            raise TypeError("cancel-intent authority returned a non-object projection")
     except Exception:
-        intents = None
-        active_intents = claim_intent = release_claim = settle_intent = None
+        log.error(
+            "Cancel-intent authority is unreadable; pending assignment is blocked",
+            exc_info=True,
+        )
+        return False
     try:
         from supervisor.task_lifecycle import _intent_outcome_fields
     except Exception:
         def _intent_outcome_fields(_intent):  # type: ignore[misc]
             return {}
+
+    def _read_active_intents() -> Optional[Dict[str, Dict[str, Any]]]:
+        """Read the live projection, preserving an explicit authority failure."""
+        try:
+            current = active_intents(DRIVE_ROOT, strict=True)
+        except Exception:
+            assignment["safe"] = False
+            log.error(
+                "Cancel-intent authority became unreadable during pending cleanup; "
+                "assignment is blocked",
+                exc_info=True,
+            )
+            return None
+        if not isinstance(current, dict):
+            assignment["safe"] = False
+            log.error(
+                "Cancel-intent authority returned a non-object projection; "
+                "assignment is blocked",
+            )
+            return None
+        return current
 
     def _release_pending_claim(tid: str, claim: Dict[str, Any], error: str) -> bool:
         """Prove that this drop's claim is no longer live after a failed step."""
@@ -3114,10 +3147,10 @@ def _drop_cancelled_pending() -> None:
             log.warning("pending-drop claim release failed for %s", tid, exc_info=True)
         if active_intents is None:
             return False
-        try:
-            current = active_intents(DRIVE_ROOT, strict=True).get(tid)
-        except Exception:
+        current = _read_active_intents()
+        if current is None:
             return False
+        current = current.get(tid)
         if not isinstance(current, dict) or current.get("state") != "claimed":
             return True
         # A changed live claim belongs to another custody owner; it is not proof
@@ -3128,10 +3161,10 @@ def _drop_cancelled_pending() -> None:
         """Allow publication only while an unresolved claim is still ours."""
         if not claim or not claim.get("request_id") or active_intents is None:
             return False
-        try:
-            current = active_intents(DRIVE_ROOT, strict=True).get(tid)
-        except Exception:
+        current = _read_active_intents()
+        if current is None:
             return False
+        current = current.get(tid)
         try:
             return bool(
                 isinstance(current, dict)
@@ -3148,17 +3181,26 @@ def _drop_cancelled_pending() -> None:
         """Observe that a failed settle already removed the claim."""
         if not claim or not claim.get("request_id") or active_intents is None:
             return not claim or not claim.get("request_id")
-        try:
-            current = active_intents(DRIVE_ROOT, strict=True).get(tid)
-        except Exception:
+        current = _read_active_intents()
+        if current is None:
             return False
+        current = current.get(tid)
         return not (isinstance(current, dict) and current.get("state") == "claimed")
 
     survivors: List[Dict[str, Any]] = []
     dropped: List[str] = []
     terminalization_retry_ids: List[str] = []
-    for t in list(PENDING):
+    hold_state_changed = False
+    pending_rows = list(PENDING)
+    for index, t in enumerate(pending_rows):
+        if not assignment["safe"]:
+            survivors.extend(pending_rows[index:])
+            break
         tid = str(t.get("id") or "") if isinstance(t, dict) else ""
+        authority_hold = bool(
+            isinstance(t, dict)
+            and isinstance(t.get(_CANCEL_INTENT_AUTHORITY_HOLD_FIELD), dict)
+        )
         marker = _terminalization_retry_spec(t)
         marker_trigger = str((t.get(_TERMINALIZATION_RETRY_FIELD) or {}).get("trigger") or "") if isinstance(t, dict) else ""
         # Existing shutdown custody owns its outcome.  Only the cancellation
@@ -3175,6 +3217,15 @@ def _drop_cancelled_pending() -> None:
             except Exception:
                 authority_error = True
         if authority_error:
+            if authority_hold:
+                assignment["safe"] = False
+                log.error(
+                    "Pending cancel-authority hold remains: task-result authority "
+                    "is unreadable for %s",
+                    tid or "<missing-task-id>",
+                )
+                survivors.extend(pending_rows[index:])
+                break
             if marker is not None or not tid:
                 survivors.append(t)
             else:
@@ -3186,24 +3237,27 @@ def _drop_cancelled_pending() -> None:
                 ))
                 terminalization_retry_ids.append(tid)
             continue
-        current_intents = intents
-        if active_intents is not None:
-            try:
-                current_intents = active_intents(DRIVE_ROOT, strict=True)
-            except Exception:
-                current_intents = None
-        if current_intents is None and (marker is not None or status == STATUS_CANCEL_REQUESTED):
-            if marker is None:
-                survivors.append(_make_terminalization_retry_task(
-                    t, tid,
-                    reason="Cancel-intent authority is unreadable; dispatch is blocked.",
-                    status=STATUS_CANCELLED, trigger="pending_cancel_authority",
-                    reconcile_delegate_custody=False,
-                ))
-                terminalization_retry_ids.append(tid)
-            else:
-                survivors.append(t)
-            continue
+        current_intents = _read_active_intents()
+        if current_intents is None:
+            # Keep this row and every row not yet examined.  The caller will
+            # abort the assignment pass; no ordinary pending row may cross the
+            # dispatch boundary while cancellation authority is unknown.
+            survivors.extend(pending_rows[index:])
+            break
+        if authority_hold:
+            if not tid:
+                assignment["safe"] = False
+                survivors.extend(pending_rows[index:])
+                break
+            hold_state_changed = True
+            if status in _TRULY_TERMINAL_STATUSES:
+                dropped.append(tid)
+                continue
+            # The projection and result are now authoritative.  Remove only the
+            # restore-time nonterminal hold; an active intent or legacy latch
+            # falls through into the ordinary cancellation-custody path below.
+            t = dict(t)
+            t.pop(_CANCEL_INTENT_AUTHORITY_HOLD_FIELD, None)
         if marker is not None and not (
             status == STATUS_CANCEL_REQUESTED
             or (current_intents is not None and tid in current_intents)
@@ -3225,7 +3279,28 @@ def _drop_cancelled_pending() -> None:
                 try:
                     claim = claim_intent(DRIVE_ROOT, tid, owner="pending_drop") or {}
                 except Exception:
-                    claim = {"claim_refused": True}
+                    # A raised claim write/read is not evidence that another
+                    # custody owner won.  Retain this row and stop the pass so
+                    # a transiently unreadable projection cannot lose queue
+                    # custody or let the cancelled task be dispatched.
+                    assignment["safe"] = False
+                    log.error(
+                        "Pending-drop claim authority is unreadable for %s; "
+                        "assignment is blocked",
+                        tid,
+                        exc_info=True,
+                    )
+                    survivors.extend(pending_rows[index:])
+                    break
+                if not isinstance(claim, dict):
+                    assignment["safe"] = False
+                    log.error(
+                        "Pending-drop claim returned a non-object for %s; "
+                        "assignment is blocked",
+                        tid,
+                    )
+                    survivors.extend(pending_rows[index:])
+                    break
                 if claim.get("claim_refused"):
                     if marker is not None and _retry_claim_matches(t, claim):
                         pass
@@ -3233,18 +3308,30 @@ def _drop_cancelled_pending() -> None:
                         survivors.append(t)
                         continue
                     else:
-                        # A different live custody owner is responsible for the
-                        # terminal result; this row must still never dispatch.
-                        dropped.append(tid)
-                        continue
+                        # A different live custody owner is waiting for the
+                        # queue lock this assignment pass holds.  Keep the
+                        # authoritative pending row so that owner can capture
+                        # it, and abort dispatch; dropping it here would make
+                        # custody miss the task and lose its routing record.
+                        assignment["safe"] = False
+                        survivors.append(t)
+                        survivors.extend(pending_rows[index + 1:])
+                        break
             if current_intents is not None and tid in current_intents and not claim:
                 # The projection may have changed after the snapshot (including
                 # another owner settling it and a new ingress minting a request).
                 # Without an owned claim this drop cannot fence its settle, so
                 # defer every such row instead of falling through with an empty
                 # request_id/generation.
+                assignment["safe"] = False
+                log.info(
+                    "Pending cancellation custody changed during claim for %s; "
+                    "deferring the assignment pass",
+                    tid,
+                )
                 survivors.append(t)
-                continue
+                survivors.extend(pending_rows[index + 1:])
+                break
             intent = claim or (current_intents or {}).get(tid) or {}
             try:
                 cost_fields = reconstruct_task_cost(tid, fields=True)
@@ -3349,12 +3436,33 @@ def _drop_cancelled_pending() -> None:
             continue
         survivors.append(t)
     PENDING[:] = survivors
+    if hold_state_changed:
+        try:
+            from supervisor import queue
+
+            persisted = queue.persist_queue_snapshot(
+                reason="cancel_intent_authority_hold_resolved",
+            )
+        except Exception:
+            persisted = False
+            log.error(
+                "Failed to persist resolved cancel-intent authority hold",
+                exc_info=True,
+            )
+        if persisted is not True:
+            # A resumed ordinary row must not cross dispatch until removal of
+            # its restart-visible hold is durable.  Restore the pre-pass queue;
+            # any terminal side effects are monotonic and will be observed on
+            # the next pass.
+            PENDING[:] = pending_rows
+            assignment["safe"] = False
     if dropped:
         append_jsonl(
             DRIVE_ROOT / "logs" / "supervisor.jsonl",
             {"ts": utc_now_iso(), "type": "pending_cancelled_dropped", "task_ids": dropped},
         )
     _persist_pending_terminalization_retries(terminalization_retry_ids)
+    return bool(assignment["safe"])
 
 
 def _normalize_pending_task_depth(task: Dict[str, Any]) -> str:
@@ -3551,7 +3659,13 @@ def assign_tasks() -> None:
         # Cancellation/terminal custody wins before validating rows left in the
         # queue.  Then quarantine every malformed depth before budget, lease, or
         # capacity filters can leave it waiting indefinitely.
-        _drop_cancelled_pending()
+        if not _drop_cancelled_pending():
+            log.error(
+                "Task assignment blocked: cancellation authority or custody "
+                "state is indeterminate",
+            )
+            queue.persist_queue_snapshot(reason="cancellation_authority_indeterminate")
+            return
         _retry_terminalization_pending_for_assignment(queue)
         invalid_ids, unresolved_invalid_ids = _quarantine_invalid_pending_depths()
         unresolved_invalid_id_set = set(unresolved_invalid_ids)

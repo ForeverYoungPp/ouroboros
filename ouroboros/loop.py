@@ -3070,7 +3070,7 @@ def _setup_dynamic_tools(tools_registry, tool_schemas, messages):
 
 def _mark_owner_stop_control_drained(
     owner_ctx: Any, drive_root: Optional[pathlib.Path], task_id: str,
-) -> None:
+) -> bool:
     """Stamp the owner-stop finalize control's DELIVERY on the durable intent.
 
     The intent lives on the CANONICAL data root (``budget_drive_root`` first;
@@ -3080,47 +3080,113 @@ def _mark_owner_stop_control_drained(
     request+outer-cap deadline, and ``_owner_stop_window_elapsed`` reads the
     same unstamped intent, bounding the worker by that anchor."""
     try:
-        from ouroboros.cancel_intents import active_intent, mark_finalize_control_drained
+        from ouroboros.cancel_intents import (
+            mark_finalize_control_drained,
+            resolve_owner_stop_intent,
+        )
 
         root = (
             str(getattr(owner_ctx, "budget_drive_root", "") or "")
             or (str(drive_root) if drive_root is not None else "")
         )
         if not (root and task_id):
-            return
+            return False
         root_path = pathlib.Path(root)
         for _ in range(2):
             if mark_finalize_control_drained(root_path, task_id):
-                return
-            row = active_intent(root_path, task_id)
+                return True
+            _intent_task_id, row = resolve_owner_stop_intent(root_path, task_id)
             if isinstance(row, dict) and str(row.get("control_drained_at") or ""):
-                return  # already stamped: the durable anchor is confirmed
+                return True  # already stamped: the durable anchor is confirmed
+            if not isinstance(row, dict) or not row:
+                # The same stop request was hardened/settled while this
+                # mailbox row was being drained.  It is a stale control, not a
+                # persistence failure and must not buy a final model turn.
+                return False
         from ouroboros.utils import append_jsonl, utc_now_iso
 
         append_jsonl(root_path / "logs" / "events.jsonl", {
             "ts": utc_now_iso(), "type": "owner_stop_stamp_failed",
             "task_id": task_id,
         })
+        return False
     except Exception:
         log.debug("owner-stop drain stamp failed for %s", task_id, exc_info=True)
+        return False
+
+
+def _owner_stop_control_is_current(
+    owner_ctx: Any,
+    drive_root: Optional[pathlib.Path],
+    task_id: str,
+    control_msg_id: str,
+) -> bool:
+    """Whether this deterministic mailbox control still names the live policy."""
+    try:
+        from ouroboros.cancel_intents import resolve_owner_stop_intent
+        from supervisor.owner_stop import owner_stop_control_id
+
+        root = (
+            str(getattr(owner_ctx, "budget_drive_root", "") or "")
+            or (str(drive_root) if drive_root is not None else "")
+        )
+        if not (root and task_id and control_msg_id):
+            return False
+        _intent_task_id, intent = resolve_owner_stop_intent(
+            pathlib.Path(root), task_id,
+        )
+        return bool(intent) and owner_stop_control_id(intent) == str(control_msg_id)
+    except Exception:
+        log.debug(
+            "owner-stop control validation failed for %s",
+            task_id,
+            exc_info=True,
+        )
+        return False
+
+
+def _narrow_round_deadline(
+    ctx: "_RoundLimitContext", candidate: Any,
+) -> Optional[float]:
+    """Apply a later control deadline without ever widening task authority."""
+    try:
+        deadline = float(candidate)
+    except (TypeError, ValueError, OverflowError):
+        return ctx.deadline_ts
+    current = ctx.deadline_ts
+    if current is None:
+        ctx.deadline_ts = deadline
+    else:
+        try:
+            ctx.deadline_ts = min(float(current), deadline)
+        except (TypeError, ValueError, OverflowError):
+            ctx.deadline_ts = deadline
+    return ctx.deadline_ts
 
 
 def _owner_stop_window_elapsed(ctx: "_RoundLimitContext") -> bool:
     """Bind and check the owner-stop deadline."""
     try:
-        from ouroboros.cancel_intents import STOP_POLICY_FINALIZE, active_intent, stop_policy
+        from ouroboros.cancel_intents import (
+            STOP_POLICY_FINALIZE,
+            resolve_owner_stop_intent,
+            stop_policy,
+        )
         from supervisor.owner_stop import owner_stop_deadline_ts
 
         root = getattr(ctx, "status_drive_root", None) or ctx.drive_root
         if root is None or not ctx.task_id:
             return False
-        intent = active_intent(pathlib.Path(root), ctx.task_id)
+        _intent_task_id, intent = resolve_owner_stop_intent(
+            pathlib.Path(root), ctx.task_id,
+        )
         if not isinstance(intent, dict) or stop_policy(intent) != STOP_POLICY_FINALIZE:
             return False
         deadline = owner_stop_deadline_ts(intent, float(task_pacing.get_finalization_grace_sec()))
         if deadline:
-            ctx.deadline_ts = deadline
-        return time.time() >= deadline if deadline else True
+            effective_deadline = _narrow_round_deadline(ctx, deadline)
+            return time.time() >= float(effective_deadline)
+        return True
     except Exception:
         log.debug("owner-stop window check failed for %s", ctx.task_id, exc_info=True)
         return False
@@ -3171,16 +3237,35 @@ def _drain_incoming_messages(
             kind = entry.get("kind") or KIND_OWNER_TEXT
             if kind == KIND_FINALIZE_NOW:
                 text = str(entry.get("text") or "deadline")
-                controls["finalize_now"] = text
-                opened = parse_deadline_ts(entry.get("ts"))
-                if opened is not None:
-                    controls["finalize_deadline_ts"] = (
-                        opened.timestamp() + task_pacing.effective_finalization_reserve_sec(owner_ctx)
-                    )
                 first_line = text.splitlines()[0].strip() if text else ""
                 if first_line == REASON_OWNER_REQUESTED_FINALIZATION:
+                    if not _owner_stop_control_is_current(
+                        owner_ctx,
+                        drive_root,
+                        task_id,
+                        str(entry.get("msg_id") or ""),
+                    ):
+                        continue
                     # Owner-stop budget starts at delivery; first drain wins.
-                    _mark_owner_stop_control_drained(owner_ctx, drive_root, task_id)
+                    if not _mark_owner_stop_control_drained(
+                        owner_ctx, drive_root, task_id,
+                    ):
+                        continue
+                    if not _owner_stop_control_is_current(
+                        owner_ctx,
+                        drive_root,
+                        task_id,
+                        str(entry.get("msg_id") or ""),
+                    ):
+                        continue
+                else:
+                    opened = parse_deadline_ts(entry.get("ts"))
+                    if opened is not None:
+                        controls["finalize_deadline_ts"] = (
+                            opened.timestamp()
+                            + task_pacing.effective_finalization_reserve_sec(owner_ctx)
+                        )
+                controls["finalize_now"] = text
                 continue
             if kind == KIND_HURRY:
                 # HQ1 no-chat contract (§19.7.2 item 6): a typed hurry control is
@@ -3509,7 +3594,9 @@ def _maybe_early_finalize(
     """Consume supervisor grace first, then a local deadline."""
     if controls.get("finalize_now"):
         if controls.get("finalize_deadline_ts") is not None:
-            limit_ctx.deadline_ts = float(controls["finalize_deadline_ts"])
+            _narrow_round_deadline(
+                limit_ctx, controls["finalize_deadline_ts"],
+            )
         return _handle_forced_finalization(limit_ctx, str(controls["finalize_now"]))
     return _maybe_deadline_local_finalize(limit_ctx, tools)
 

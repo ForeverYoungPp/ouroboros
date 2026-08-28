@@ -775,6 +775,7 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 "origin_message_text": t.get("origin_message_text"), "_attempt": t.get("_attempt"),
                 "review_reason": t.get("review_reason"), "review_source_task_id": t.get("review_source_task_id"),
                 "_budget_pause": t.get("_budget_pause"), "budget_resumed_at": t.get("budget_resumed_at"), "_terminalization_retry": t.get("_terminalization_retry"),
+                "_cancel_intent_authority_hold": t.get("_cancel_intent_authority_hold"),
             },
         })
     running_rows = []
@@ -892,6 +893,7 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
             return restored
 
         skipped_terminal, invalid_depth_restore = 0, []
+        cancel_authority_holds: list[str] = []
         skipped_fenced, blocked_restore = [], []
         for task in snapshot_pending:
             chat_id = task.get("chat_id")
@@ -939,23 +941,77 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                 try:
                     existing = load_task_result(DRIVE_ROOT, str(task.get("id")), strict=True)
                     existing_status = str(existing.get("status") or "") if existing else ""
+                except Exception:
+                    # Result-authority loss already has terminal custody: once
+                    # its retry can prove a writable result, the task is failed
+                    # rather than replayed over an unknown exact-id lifecycle.
+                    task["_terminalization_retry"] = {
+                        "reason": "Pending task result authority is unreadable; dispatch is blocked.",
+                        "status": "failed",
+                        "trigger": "pending_result_authority",
+                        "reconcile_delegate_custody": False,
+                    }
+                    restore_terminalization_retry(
+                        task, pending=PENDING, running=RUNNING,
+                        queue_seq_counter_ref=QUEUE_SEQ_COUNTER_REF,
+                        sort_pending=sort_pending,
+                    )
+                    skipped_terminal += 1
+                    log.debug(
+                        "Snapshot restore result-authority check failed for %s",
+                        task.get("id"),
+                        exc_info=True,
+                    )
+                    continue
+                else:
                     # Terminal OR cancel-intent — both must not be resurrected as
                     # pending. Intent lives in the durable projection (phase A);
                     # the status check covers legacy latch files.
                     if not isinstance(task.get("_terminalization_retry"), dict) and (existing_status in _TRULY_TERMINAL_STATUSES or existing_status == STATUS_CANCEL_REQUESTED):
                         skip_revival = True
                     elif not isinstance(task.get("_terminalization_retry"), dict):
-                        from ouroboros.cancel_intents import has_active_intent
+                        try:
+                            from ouroboros.cancel_intents import has_active_intent
 
-                        if has_active_intent(DRIVE_ROOT, str(task.get("id"))):
-                            # Cancellation custody owns it; never revive a pending row.
-                            skip_revival = True
-                except Exception:
-                    if not isinstance(task.get("_terminalization_retry"), dict):
-                        task["_terminalization_retry"] = {"reason": "Pending task result authority is unreadable; dispatch is blocked.", "status": "failed", "trigger": "pending_result_authority", "reconcile_delegate_custody": False}
-                    restore_terminalization_retry(task, pending=PENDING, running=RUNNING, queue_seq_counter_ref=QUEUE_SEQ_COUNTER_REF, sort_pending=sort_pending)
-                    skip_revival = True
-                    log.debug("Snapshot restore terminal-status check failed for %s", task.get("id"), exc_info=True)
+                            if has_active_intent(
+                                DRIVE_ROOT, str(task.get("id")), strict=True,
+                            ):
+                                # Cancellation custody owns it; never revive a pending row.
+                                skip_revival = True
+                        except Exception:
+                            # This is an UNKNOWN cancel fact, not a terminal
+                            # outcome. Restore the ordinary row under a durable,
+                            # non-dispatchable hold; the pre-dispatch SSOT later
+                            # resolves it after both authorities are readable.
+                            task = dict(task)
+                            task["_cancel_intent_authority_hold"] = {
+                                "reason": "Cancel-intent authority is unreadable; dispatch is blocked.",
+                                "held_at": utc_now_iso(),
+                            }
+                            admitted = enqueue_task(task, restoring_snapshot=True)
+                            if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
+                                restore_invalid_depth_admission(
+                                    task, admitted, drive_root=DRIVE_ROOT,
+                                    pending=PENDING, blocked=blocked_restore,
+                                    terminalized=invalid_depth_restore,
+                                    queue_seq_counter_ref=QUEUE_SEQ_COUNTER_REF,
+                                )
+                                try:
+                                    sort_pending()
+                                except (TypeError, ValueError, OverflowError):
+                                    log.warning(
+                                        "Deferred snapshot sort failed; custody retained",
+                                        exc_info=True,
+                                    )
+                            else:
+                                restored += 1
+                                cancel_authority_holds.append(str(task.get("id") or ""))
+                            log.debug(
+                                "Snapshot restore cancel-intent authority check failed for %s",
+                                task.get("id"),
+                                exc_info=True,
+                            )
+                            continue
                 if skip_revival:
                     skipped_terminal += 1
                     continue
@@ -986,6 +1042,7 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                     "type": "queue_restored_from_snapshot",
                     "restored_pending": restored,
                     "skipped_terminal": skipped_terminal,
+                    "cancel_authority_holds": cancel_authority_holds,
                     "blocked_admission": blocked_restore, "invalid_task_depth": invalid_depth_restore,
                 },
             )
@@ -1047,6 +1104,7 @@ from supervisor.task_lifecycle import (  # noqa: E402, F401 -- intentional publi
     _CANCEL_TERMINALIZED,
     _cancel_result_fields,
     cancel_task_custody,
+    drive_cancel_intent_scope,
     task_has_live_ownership,
     task_subtree_is_live,
 )
@@ -1174,13 +1232,12 @@ def _has_pending_descendant(task_id: str) -> bool:
 def _enforce_task_timeouts_locked(
     workers: Any, now: float, owner_chat_id: int, st: Dict[str, Any]
 ) -> None:
-    # ONE typed owner-stop predicate before every generic timeout-grace consumer (S3
-    # §12.2 item 8): a task whose owner-requested finalization intent is still OPEN is
-    # bypassed whole — no spare-withdraw, no spare-clock reset, no second grace episode,
-    # no expiry kill, no RUNNING.pop, no reaper enqueue, no retry scheduling. The hold
-    # deliberately outlives the grace deadline (the expiry window): the deadline gates only
-    # the sweep's arm-vs-feed-custody decision in supervisor/owner_stop.py +
-    # sweep_cancel_intents; the intent stays the one owner will and custody stays the only killer.
+    # ONE typed owner-stop predicate before the generic idle/grace consumers (S3
+    # §12.2 item 8): an OPEN owner-requested finalization intent suppresses the
+    # ordinary spare-withdraw/second-grace/retry path only while the task remains
+    # inside its independent explicit deadline and absolute safety ceiling. The
+    # intent stays the one owner will and cancellation custody stays the killer;
+    # a later graceful request can never extend either hard axis.
     from supervisor.owner_stop import running_owner_stop_tasks
 
     owner_stop_held = running_owner_stop_tasks(
@@ -1188,8 +1245,6 @@ def _enforce_task_timeouts_locked(
     )
     for task_id, meta in list(RUNNING.items()):
         if not isinstance(meta, dict):
-            continue
-        if str(task_id) in owner_stop_held:
             continue
         task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
         started_at = float(meta.get("started_at") or 0.0)
@@ -1235,6 +1290,17 @@ def _enforce_task_timeouts_locked(
                        or llm_call_in_flight
                        or _active_operation_progressing(meta, now))
         ceiling_reached = runtime_sec >= abs_ceiling
+
+        if (
+            str(task_id) in owner_stop_held
+            and not deadline_reached
+            and not ceiling_reached
+        ):
+            # The owner-stop episode replaces only the generic idle/grace
+            # machinery.  Explicit task deadline and the absolute safety
+            # ceiling remain independent hard axes and may never be extended
+            # by a later graceful-stop request.
+            continue
 
         # Hard axes (deadline_at, abs ceiling) stop the task regardless of activity; the
         # idle/subtree gate only spares a still-progressing task with NO explicit deadline —
@@ -1285,6 +1351,44 @@ def _enforce_task_timeouts_locked(
         # stays fast and the terminal write + retry enqueue happen only AFTER kill/join
         # (no race with a concurrently-assigned retry; a subagent retry reuses id/drive).
         # Live-RUNNING decisions (orchestrator -> no blind retry; retry id) freeze HERE.
+        # Linearize the timeout decision against cancellation before withdrawing
+        # RUNNING.  When an intent already owns either this physical attempt or
+        # its proven logical retry root, yield the whole rail: cancellation
+        # custody remains the sole killer and preserves the owner's outcome and
+        # reason instead of racing a generic timeout FAILED write.
+        cancel_authority_unreadable = False
+        try:
+            from ouroboros.cancel_intents import (
+                _validated_retry_root_cancel_key,
+                active_intents,
+                cancellation_projection_lock,
+            )
+
+            with cancellation_projection_lock(DRIVE_ROOT):
+                retry_root = _validated_retry_root_cancel_key(
+                    DRIVE_ROOT, str(task_id), task_hint=task,
+                )
+                intents = active_intents(DRIVE_ROOT, strict=True)
+                cancel_target = next(
+                    (
+                        candidate
+                        for candidate in dict.fromkeys((str(task_id), retry_root))
+                        if candidate and candidate in intents
+                    ),
+                    "",
+                )
+                if cancel_target:
+                    continue
+        except Exception:
+            # Preserve the prior absolute/deadline timeout behavior when
+            # cancellation authority itself is damaged, but never let that
+            # uncertainty mint a fresh retry authority below.
+            cancel_authority_unreadable = True
+            log.error(
+                "Task timeout could not prove cancel-intent authority for %s",
+                task_id,
+                exc_info=True,
+            )
         if task_type == "evolution":
             from supervisor.evolution_lifecycle import update_evolution_transaction
             if not update_evolution_transaction(task_id, dispatch_status="reaping"):
@@ -1318,15 +1422,10 @@ def _enforce_task_timeouts_locked(
         # loaded this tick, so this reflects the current owner decision.
         if will_retry and task_type == "evolution" and not bool(st.get("evolution_mode_enabled")):
             will_retry = False
-        # An ACTIVE cancel intent (immediate policy, or a finalize intent already
-        # CLAIMED by custody — open finalize intents never reach here, the hold
-        # above skips them) must never spawn a retry clone: a new-uuid retry
-        # escapes the intent (keyed by the old id) and CANCELLED_ROOT_FENCES,
-        # restarting work the owner stopped.
-        if will_retry:
-            from ouroboros.cancel_intents import has_active_intent
-
-            will_retry = not has_active_intent(DRIVE_ROOT, str(task_id))
+        # An unreadable projection/lineage cannot authorize a new dispatch.
+        # Readable active intents already yielded the timeout rail above.
+        if will_retry and cancel_authority_unreadable:
+            will_retry = False
         retry_task_id = ""
         if will_retry:
             same_id = task_type == "evolution" or str(task.get("delegation_role") or "") == "subagent"

@@ -56,6 +56,188 @@ def test_request_cancel_is_idempotent_and_forensically_logged(tmp_path):
     assert len(requested) == 1 and requested[0]["task_id"] == "t1"
 
 
+def _write_root_retry_pair(tmp_path, old_id: str, new_id: str, *, new_status="scheduled"):
+    write_task_result(
+        tmp_path,
+        old_id,
+        "interrupted",
+        root_task_id=old_id,
+        delegation_role="root",
+        superseded_by=new_id,
+        retry_task_id=new_id,
+    )
+    write_task_result(
+        tmp_path,
+        new_id,
+        new_status,
+        root_task_id=old_id,
+        parent_task_id="",
+        delegation_role="root",
+        supersedes_task_id=old_id,
+        original_task_id=old_id,
+        timeout_retry_from=old_id,
+    )
+
+
+def test_request_cancel_canonicalizes_a_valid_new_id_retry(tmp_path):
+    _write_root_retry_pair(tmp_path, "old-root", "new-root")
+
+    intent = ci.request_cancel(tmp_path, "old-root", reason="stop retry")
+
+    assert intent["task_id"] == "new-root"
+    assert intent["requested_task_id"] == "old-root"
+    assert ci.active_intent(tmp_path, "old-root") is None
+    assert ci.active_intent(tmp_path, "new-root")["request_id"] == intent["request_id"]
+
+
+def test_cascade_rekeys_an_existing_single_retry_intent_to_the_logical_root(tmp_path):
+    _write_root_retry_pair(tmp_path, "rekey-old", "rekey-new")
+    single = ci.request_cancel(tmp_path, "rekey-old", reason="stop retry")
+
+    cascade = ci.request_cancel(
+        tmp_path,
+        "rekey-old",
+        reason="stop the whole tree",
+        scope=ci.SCOPE_CASCADE,
+    )
+
+    assert cascade["request_id"] == single["request_id"]
+    assert cascade["task_id"] == "rekey-old"
+    assert cascade["scope"] == ci.SCOPE_CASCADE
+    assert ci.active_intent(tmp_path, "rekey-new") is None
+    assert ci.active_intent(tmp_path, "rekey-old")["request_id"] == single["request_id"]
+
+
+def test_stop_now_on_retry_leaf_hardens_the_logical_root_cascade_intent(tmp_path):
+    """A physical retry is an alias of an existing logical cascade owner.
+
+    Stop-now must harden that one durable episode; minting a leaf-scoped single
+    intent would create two cancellation owners and let the HTTP path narrow
+    the already-authoritative cascade.
+    """
+    root_id, leaf_id = "cascade-stop-root", "cascade-stop-leaf"
+    _write_root_retry_pair(tmp_path, root_id, leaf_id, new_status=STATUS_RUNNING)
+    graceful = ci.request_cancel(
+        tmp_path,
+        root_id,
+        reason="finish before stopping the tree",
+        scope=ci.SCOPE_CASCADE,
+        requested_stop_policy=ci.STOP_POLICY_FINALIZE,
+    )
+
+    hardened = ci.request_cancel(
+        tmp_path,
+        leaf_id,
+        reason="stop now",
+        requested_stop_policy=ci.STOP_POLICY_IMMEDIATE,
+    )
+
+    assert hardened["task_id"] == root_id
+    assert hardened["request_id"] == graceful["request_id"]
+    assert hardened["scope"] == ci.SCOPE_CASCADE
+    assert ci.stop_policy(hardened) == ci.STOP_POLICY_IMMEDIATE
+    assert ci.active_intent(tmp_path, leaf_id) is None
+    assert set(ci.active_intents(tmp_path)) == {root_id}
+
+
+def test_stable_retry_root_status_keeps_logical_cascade_cancel_state(tmp_path):
+    """Following a stable root handle to its live retry keeps owner-stop state."""
+    from ouroboros.task_status import load_effective_task_result
+
+    root_id, leaf_id = "status-cascade-root", "status-cascade-leaf"
+    _write_root_retry_pair(tmp_path, root_id, leaf_id, new_status=STATUS_RUNNING)
+    ci.request_cancel(
+        tmp_path,
+        root_id,
+        reason="wrap up the whole tree",
+        scope=ci.SCOPE_CASCADE,
+        requested_stop_policy=ci.STOP_POLICY_FINALIZE,
+    )
+
+    effective = load_effective_task_result(tmp_path, root_id)
+
+    assert effective["task_id"] == leaf_id
+    assert effective["status"] == STATUS_RUNNING
+    assert effective["cancel_state"] == "pending"
+    assert effective["cancel_reason"] == "wrap up the whole tree"
+    assert effective["stop_policy"] == ci.STOP_POLICY_FINALIZE
+    assert ci.active_intent(tmp_path, leaf_id) is None
+
+
+def test_request_cancel_same_id_retry_stays_exact(tmp_path):
+    write_task_result(
+        tmp_path,
+        "same-id-child",
+        "interrupted",
+        root_task_id="root",
+        parent_task_id="root",
+        delegation_role="subagent",
+        retry_task_id="same-id-child",
+    )
+
+    intent = ci.request_cancel(tmp_path, "same-id-child")
+
+    assert intent["task_id"] == "same-id-child"
+    assert "requested_task_id" not in intent
+
+
+def test_request_cancel_refuses_partial_retry_lineage(tmp_path):
+    write_task_result(
+        tmp_path,
+        "broken-old",
+        "interrupted",
+        superseded_by="broken-new",
+        retry_task_id="different-new",
+    )
+
+    with pytest.raises(ci.CancelIntentLineageIndeterminate):
+        ci.request_cancel(tmp_path, "broken-old")
+
+    assert ci.active_intents(tmp_path) == {}
+
+
+def test_request_cancel_refuses_a_retry_leaf_bound_to_a_foreign_root(tmp_path):
+    write_task_result(
+        tmp_path,
+        "lineage-old",
+        "interrupted",
+        root_task_id="lineage-old",
+        delegation_role="root",
+        superseded_by="lineage-new",
+        retry_task_id="lineage-new",
+    )
+    write_task_result(
+        tmp_path,
+        "lineage-new",
+        "scheduled",
+        root_task_id="foreign-root",
+        parent_task_id="",
+        delegation_role="root",
+        supersedes_task_id="lineage-old",
+        original_task_id="lineage-old",
+        timeout_retry_from="lineage-old",
+    )
+
+    with pytest.raises(ci.CancelIntentLineageIndeterminate):
+        ci.request_cancel(tmp_path, "lineage-old")
+
+    assert ci.active_intents(tmp_path) == {}
+
+
+def test_request_cancel_reports_a_terminal_retry_leaf_as_already_settled(tmp_path):
+    _write_root_retry_pair(
+        tmp_path, "finished-old", "finished-new", new_status=STATUS_COMPLETED,
+    )
+
+    result = ci.request_cancel(tmp_path, "finished-old")
+
+    assert result["already_settled"] is True
+    assert result["task_id"] == "finished-new"
+    assert result["requested_task_id"] == "finished-old"
+    assert result["status"] == STATUS_COMPLETED
+    assert ci.active_intents(tmp_path) == {}
+
+
 def test_claim_settle_and_release_lifecycle(tmp_path):
     ci.request_cancel(tmp_path, "t2", source="http_single")
     claimed = ci.claim_intent(tmp_path, "t2", owner="cancel_task_custody")
@@ -84,6 +266,36 @@ def test_claim_settle_and_release_lifecycle(tmp_path):
     fresh = ci.claim_intent(tmp_path, "t3", owner="x")
     assert ci.claim_is_stale(fresh) is False
     assert ci.claim_is_stale({**fresh, "claimed_at": "not-a-time"}) is True
+
+
+@pytest.mark.parametrize(
+    "corrupt_bytes",
+    [
+        b'{"intents": [broken',
+        b'{"schema_version": 1, "intents": []}',
+        b'{"schema_version": 1, "intents": {"corrupt-claim": []}}',
+        b'{"schema_version": 1, "intents": {"unrelated": []}}',
+    ],
+)
+def test_claim_intent_refuses_an_existing_corrupt_projection(
+    tmp_path, corrupt_bytes,
+):
+    """A claim mutator cannot collapse corrupt authority into an empty store."""
+    projection = tmp_path / "state" / "cancel_intents.json"
+    projection.parent.mkdir(parents=True)
+    projection.write_bytes(corrupt_bytes)
+
+    with pytest.raises(ci.CancelIntentProjectionCorrupt):
+        ci.claim_intent(tmp_path, "corrupt-claim", owner="pending_drop")
+
+    assert projection.read_bytes() == corrupt_bytes
+
+
+def test_claim_intent_absent_projection_is_a_read_only_miss(tmp_path):
+    projection = tmp_path / "state" / "cancel_intents.json"
+
+    assert ci.claim_intent(tmp_path, "no-intent", owner="pending_drop") is None
+    assert not projection.exists()
 
 
 def test_cancel_state_fields_and_migration(tmp_path):
@@ -178,7 +390,7 @@ def test_custody_settles_an_intent_for_a_missing_task(qenv):
 
 def test_watchdog_sweep_feeds_open_and_stale_claimed_intents(qenv, monkeypatch):
     fed: list[str] = []
-    monkeypatch.setattr(qenv.tl, "cancel_task_custody",
+    monkeypatch.setattr(qenv.q, "cancel_task_custody",
                         lambda tid, **_kw: fed.append(tid) or "cancelled")
 
     now = 1_000_000.0
@@ -263,6 +475,721 @@ def test_drop_cancelled_pending_consults_the_intent_projection(qenv, monkeypatch
     assert emitted and emitted[0][0] == "dropme" and emitted[0][1] == "cancelled"
 
 
+def test_assignment_blocks_when_cancel_intent_projection_is_unreadable(
+    tmp_path, monkeypatch,
+):
+    """A corrupt intent projection cannot be treated as an empty projection."""
+    from supervisor import queue, state, workers
+
+    delivered: list[dict] = []
+    worker = types.SimpleNamespace(
+        wid=1,
+        busy_task_id=None,
+        reaping=False,
+        in_q=types.SimpleNamespace(put=lambda task: delivered.append(dict(task))),
+    )
+    task = {
+        "id": "blocked-by-intent-corruption",
+        "type": "task",
+        "chat_id": 1,
+        "depth": 0,
+        "budget_drive_root": str(tmp_path),
+    }
+    pending = [task]
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "WORKERS", {1: worker})
+    monkeypatch.setattr(workers, "load_state", lambda: {})
+    monkeypatch.setattr(
+        state,
+        "budget_remaining",
+        lambda *_args, **_kwargs: pytest.fail("budget must not run after authority failure"),
+    )
+    snapshots: list[str] = []
+    monkeypatch.setattr(
+        queue,
+        "persist_queue_snapshot",
+        lambda reason="": snapshots.append(reason) or True,
+    )
+    queue.BUDGET_ROOT_FENCES.clear()
+
+    write_task_result(tmp_path, task["id"], "scheduled")
+    projection = tmp_path / "state" / "cancel_intents.json"
+    projection.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_bytes = b'{"intents": [broken'
+    projection.write_bytes(corrupt_bytes)
+
+    workers.assign_tasks()
+
+    assert pending == [task]
+    assert delivered == []
+    assert worker.busy_task_id is None
+    assert projection.read_bytes() == corrupt_bytes
+    assert snapshots == ["cancellation_authority_indeterminate"]
+
+
+def test_assignment_retains_pending_when_claim_authority_raises(qenv, monkeypatch):
+    """Only an explicit claim refusal may yield custody to another owner."""
+    from supervisor import state, workers
+
+    task_id = "claim-authority-failure"
+    pending = [{"id": task_id, "type": "task", "chat_id": 1, "depth": 0}]
+    delivered: list[dict] = []
+    worker = types.SimpleNamespace(
+        wid=1,
+        busy_task_id=None,
+        reaping=False,
+        in_q=types.SimpleNamespace(put=lambda task: delivered.append(dict(task))),
+    )
+    monkeypatch.setattr(workers, "DRIVE_ROOT", qenv.drive)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "WORKERS", {1: worker})
+    monkeypatch.setattr(workers, "load_state", lambda: {})
+    monkeypatch.setattr(
+        state,
+        "budget_remaining",
+        lambda *_args, **_kwargs: pytest.fail("budget must not run after claim failure"),
+    )
+    monkeypatch.setattr(
+        ci,
+        "claim_intent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ci.CancelIntentProjectionCorrupt("projection changed during claim")
+        ),
+    )
+    write_task_result(qenv.drive, task_id, "scheduled")
+    ci.request_cancel(qenv.drive, task_id, reason="stop")
+
+    workers.assign_tasks()
+
+    assert [row["id"] for row in pending] == [task_id]
+    assert delivered == []
+    assert worker.busy_task_id is None
+    assert load_task_result(qenv.drive, task_id)["status"] == "scheduled"
+    assert ci.active_intent(qenv.drive, task_id)["state"] == ci.INTENT_REQUESTED
+
+
+def test_timeout_reaper_does_not_clone_over_unreadable_cancel_authority(
+    tmp_path, monkeypatch,
+):
+    """Every physical retry must prove that the old id has no cancel intent."""
+    from supervisor import queue, workers
+
+    now = 10_000.0
+    task_id = "timeout-over-corrupt-intent-store"
+    task = {"id": task_id, "type": "task", "chat_id": 0}
+    meta = {
+        "task": task,
+        "started_at": now - 1000.0,
+        "last_heartbeat_at": now - 1000.0,
+        "last_progress_at": now - 1000.0,
+        "attempt": 1,
+        "worker_id": -1,
+    }
+    running = {task_id: meta}
+    queue.init_queue_refs([], running, {"value": 0})
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "FINALIZATION_GRACE_SEC", 0.0)
+    monkeypatch.setattr(queue, "get_task_idle_timeout_sec", lambda: 60.0)
+    monkeypatch.setattr(queue, "get_per_call_timeout_ceiling_sec", lambda: 0.0)
+    monkeypatch.setattr(queue, "get_task_abs_ceiling_sec", lambda: 10_000_000.0)
+    monkeypatch.setattr(queue, "_ensure_reaper_started", lambda: None)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
+    jobs: list[dict] = []
+    monkeypatch.setattr(queue, "_reap_queue", types.SimpleNamespace(put=jobs.append))
+    monkeypatch.setattr(workers, "WORKERS", {})
+
+    projection = tmp_path / "state" / "cancel_intents.json"
+    projection.parent.mkdir(parents=True)
+    projection.write_bytes(b'{"intents": [broken')
+
+    queue._enforce_task_timeouts_locked(workers, now, 0, {})
+
+    assert len(jobs) == 1
+    assert jobs[0]["task_id"] == task_id
+    assert jobs[0]["will_retry"] is False
+    assert jobs[0]["retry_task_id"] == ""
+    assert task_id not in running
+
+
+def _patch_retry_input_handoff(monkeypatch):
+    monkeypatch.setattr(
+        "ouroboros.artifacts.handoff_task_attachments_for_retry",
+        lambda *_args, **_kwargs: ({}, ""),
+    )
+    monkeypatch.setattr(
+        "ouroboros.owner_mailbox.copy_owner_mailbox_for_retry",
+        lambda *_args, **_kwargs: True,
+    )
+
+
+def _root_retry_task(task_id: str) -> dict:
+    return {
+        "id": task_id,
+        "type": "task",
+        "chat_id": 0,
+        "depth": 0,
+        "root_task_id": task_id,
+        "parent_task_id": "",
+        "delegation_role": "root",
+    }
+
+
+def test_retry_cancel_before_admission_publishes_no_successor(qenv, monkeypatch):
+    from supervisor import task_reaper as tr
+
+    _patch_retry_input_handoff(monkeypatch)
+    old_id, new_id = "cancel-before-old", "cancel-before-new"
+    task = _root_retry_task(old_id)
+    write_task_result(qenv.drive, old_id, STATUS_RUNNING, result="working")
+    ci.request_cancel(qenv.drive, old_id, reason="stop before retry")
+
+    requeued, _attempt, _reason, suppression = tr._enqueue_retry(
+        qenv.q,
+        task,
+        task_id=old_id,
+        retry_task_id=new_id,
+        attempt=1,
+        terminal_reason="idle_timeout",
+        recon_fields={},
+    )
+
+    assert requeued is False
+    assert suppression == {"kind": "cancel_intent", "target": old_id}
+    assert qenv.q.PENDING == []
+    old = load_task_result(qenv.drive, old_id)
+    assert old["status"] == "failed"
+    assert not old.get("superseded_by")
+    assert load_task_result(qenv.drive, new_id) is None
+
+
+def test_retry_admission_before_cancel_canonicalizes_and_stops_leaf(qenv, monkeypatch):
+    from ouroboros.task_status import load_effective_task_result
+    from supervisor import task_reaper as tr
+
+    _patch_retry_input_handoff(monkeypatch)
+    old_id, new_id = "admit-before-old", "admit-before-new"
+    task = _root_retry_task(old_id)
+    write_task_result(qenv.drive, old_id, STATUS_RUNNING, result="working")
+
+    requeued, new_attempt, _reason, suppression = tr._enqueue_retry(
+        qenv.q,
+        task,
+        task_id=old_id,
+        retry_task_id=new_id,
+        attempt=1,
+        terminal_reason="idle_timeout",
+        recon_fields={},
+    )
+    assert requeued is True and new_attempt == 2 and suppression == {}
+    assert [row["id"] for row in qenv.q.PENDING] == [new_id]
+    intent = ci.request_cancel(qenv.drive, old_id, reason="late stop")
+    assert intent["task_id"] == new_id
+    effective = load_effective_task_result(qenv.drive, old_id)
+    assert effective["task_id"] == new_id
+    assert effective["cancel_state"] == "pending"
+
+    assert qenv.tl.cancel_task_custody(new_id) == qenv.tl.CANCEL_CANCELLED
+
+    assert qenv.q.PENDING == []
+    assert load_task_result(qenv.drive, new_id)["status"] == STATUS_CANCELLED
+    assert load_effective_task_result(qenv.drive, old_id)["status"] == STATUS_CANCELLED
+    assert ci.active_intents(qenv.drive) == {}
+
+
+@pytest.mark.parametrize(
+    "stop_policy",
+    [ci.STOP_POLICY_IMMEDIATE, ci.STOP_POLICY_FINALIZE],
+)
+def test_retry_leaf_cannot_escape_a_logical_root_cascade_at_final_boundary(
+    qenv, monkeypatch, stop_policy,
+):
+    from ouroboros.task_status import load_effective_task_result
+    from supervisor import task_reaper as tr
+
+    _patch_retry_input_handoff(monkeypatch)
+    root_id, leaf_id, next_id = "cascade-root", "cascade-leaf", "cascade-next"
+    _write_root_retry_pair(
+        qenv.drive, root_id, leaf_id, new_status=STATUS_RUNNING,
+    )
+    leaf_task = {
+        "id": leaf_id,
+        "type": "task",
+        "chat_id": 0,
+        "depth": 0,
+        "root_task_id": root_id,
+        "parent_task_id": "",
+        "delegation_role": "root",
+        "original_task_id": root_id,
+        "timeout_retry_from": root_id,
+    }
+    intent = ci.request_cancel(
+        qenv.drive,
+        root_id,
+        reason="stop every retry",
+        scope=ci.SCOPE_CASCADE,
+        requested_stop_policy=stop_policy,
+    )
+    assert intent["task_id"] == root_id
+    monkeypatch.setattr(qenv.q, "QUEUE_MAX_RETRIES", 2)
+    summaries = []
+    individual_deliveries = []
+    terminal_events = []
+    monkeypatch.setattr(
+        "supervisor.terminal_delivery.deliver_cascade_summary",
+        lambda *_args, **_kwargs: summaries.append(1) or True,
+    )
+    monkeypatch.setattr(
+        "supervisor.terminal_delivery.deliver_miss_lane_outcome",
+        lambda *_args, **_kwargs: individual_deliveries.append(1) or True,
+    )
+    monkeypatch.setattr(
+        qenv.workers,
+        "get_event_q",
+        lambda: types.SimpleNamespace(put=terminal_events.append),
+    )
+
+    requeued, _attempt, _reason, suppression = tr._enqueue_retry(
+        qenv.q,
+        leaf_task,
+        task_id=leaf_id,
+        retry_task_id=next_id,
+        attempt=2,
+        terminal_reason="idle_timeout",
+        recon_fields={},
+        salvage_note="\n\nPreserved partial retry answer.",
+    )
+
+    assert requeued is False
+    assert suppression == {"kind": "cancel_intent", "target": root_id}
+    assert qenv.q.PENDING == []
+    leaf = load_task_result(qenv.drive, leaf_id)
+    assert leaf["status"] == "failed"
+    assert "Preserved partial retry answer." in leaf["result"]
+    assert not leaf.get("superseded_by")
+    assert load_task_result(qenv.drive, next_id) is None
+    assert ci.active_intent(qenv.drive, root_id)["request_id"] == intent["request_id"]
+
+    # A settled physical row alone is insufficient: until the winning cascade
+    # has durably registered its one summary and settled its intent, publishing
+    # task_done would resolve the card before the owner's answer is owed.
+    assert tr._emit_cancel_suppressed_retry_task_done(
+        qenv.q,
+        qenv.workers,
+        leaf_task,
+        leaf_id,
+        "task",
+        root_id,
+        {root_id: qenv.q.CANCEL_CANCELLED},
+        {},
+    ) is False
+    assert terminal_events == []
+
+    handoff = tr._settle_retry_cancel_handoff(
+        qenv.q, leaf_id, next_id, root_id,
+    )
+
+    assert handoff == {root_id: qenv.q.CANCEL_CANCELLED}
+    assert summaries == [1]
+    assert ci.active_intent(qenv.drive, root_id) is None
+    assert load_effective_task_result(qenv.drive, root_id)["status"] == "failed"
+    assert load_task_result(qenv.drive, next_id) is None
+    assert tr._emit_cancel_suppressed_retry_task_done(
+        qenv.q,
+        qenv.workers,
+        leaf_task,
+        leaf_id,
+        "task",
+        root_id,
+        handoff,
+        {},
+    ) is True
+    terminal = [event for event in terminal_events if event.get("type") == "task_done"]
+    assert len(terminal) == 1
+    assert terminal[0]["task_id"] == leaf_id
+    assert terminal[0]["status"] == "failed"
+    assert individual_deliveries == []
+
+
+def test_cancel_suppressed_retry_task_done_waits_for_summary_obligation(
+    qenv, monkeypatch,
+):
+    from supervisor import task_reaper as tr
+
+    _patch_retry_input_handoff(monkeypatch)
+    root_id, leaf_id, next_id = "summary-root", "summary-leaf", "summary-next"
+    _write_root_retry_pair(
+        qenv.drive, root_id, leaf_id, new_status=STATUS_RUNNING,
+    )
+    leaf_task = {
+        "id": leaf_id,
+        "type": "task",
+        "chat_id": 0,
+        "depth": 0,
+        "root_task_id": root_id,
+        "parent_task_id": "",
+        "delegation_role": "root",
+        "original_task_id": root_id,
+        "timeout_retry_from": root_id,
+    }
+    ci.request_cancel(
+        qenv.drive,
+        root_id,
+        reason="stop every retry",
+        scope=ci.SCOPE_CASCADE,
+    )
+    summary_attempts = []
+    individual_deliveries = []
+    terminal_events = []
+    monkeypatch.setattr(qenv.q, "QUEUE_MAX_RETRIES", 2)
+    monkeypatch.setattr(
+        "supervisor.terminal_delivery.deliver_cascade_summary",
+        lambda *_args, **_kwargs: summary_attempts.append(1) or False,
+    )
+    monkeypatch.setattr(
+        "supervisor.terminal_delivery.deliver_miss_lane_outcome",
+        lambda *_args, **_kwargs: individual_deliveries.append(1) or True,
+    )
+    monkeypatch.setattr(
+        qenv.workers,
+        "get_event_q",
+        lambda: types.SimpleNamespace(put=terminal_events.append),
+    )
+
+    requeued, _attempt, _reason, suppression = tr._enqueue_retry(
+        qenv.q,
+        leaf_task,
+        task_id=leaf_id,
+        retry_task_id=next_id,
+        attempt=2,
+        terminal_reason="idle_timeout",
+        recon_fields={},
+    )
+    assert requeued is False
+    assert suppression == {"kind": "cancel_intent", "target": root_id}
+    assert load_task_result(qenv.drive, leaf_id)["status"] == "failed"
+
+    handoff = tr._settle_retry_cancel_handoff(
+        qenv.q, leaf_id, next_id, root_id,
+    )
+
+    # The physical task is durable and the tree is down, but the summary could
+    # not be registered as owed.  The cascade intent therefore remains the
+    # replay owner and the UI event must wait instead of racing it.
+    assert handoff == {root_id: qenv.q.CANCEL_CANCELLED}
+    assert summary_attempts == [1]
+    assert ci.active_intent(qenv.drive, root_id) is not None
+    assert tr._emit_cancel_suppressed_retry_task_done(
+        qenv.q,
+        qenv.workers,
+        leaf_task,
+        leaf_id,
+        "task",
+        root_id,
+        handoff,
+        {},
+    ) is False
+    assert terminal_events == []
+    assert individual_deliveries == []
+
+
+def test_timeout_precheck_yields_retry_leaf_to_logical_root_cascade(
+    qenv, monkeypatch,
+):
+    from supervisor import workers
+
+    now = 20_000.0
+    root_id, leaf_id = "precheck-root", "precheck-leaf"
+    _write_root_retry_pair(
+        qenv.drive, root_id, leaf_id, new_status=STATUS_RUNNING,
+    )
+    leaf_task = {
+        "id": leaf_id,
+        "type": "task",
+        "chat_id": 0,
+        "depth": 0,
+        "root_task_id": root_id,
+        "parent_task_id": "",
+        "delegation_role": "root",
+        "original_task_id": root_id,
+        "timeout_retry_from": root_id,
+    }
+    qenv.q.RUNNING[leaf_id] = {
+        "task": leaf_task,
+        "started_at": now - 1000.0,
+        "last_heartbeat_at": now - 1000.0,
+        "last_progress_at": now - 1000.0,
+        "attempt": 2,
+        "worker_id": -1,
+    }
+    monkeypatch.setattr(qenv.q, "FINALIZATION_GRACE_SEC", 0.0)
+    monkeypatch.setattr(qenv.q, "get_task_idle_timeout_sec", lambda: 60.0)
+    monkeypatch.setattr(qenv.q, "get_per_call_timeout_ceiling_sec", lambda: 0.0)
+    monkeypatch.setattr(qenv.q, "get_task_abs_ceiling_sec", lambda: 10_000_000.0)
+    monkeypatch.setattr(qenv.q, "_ensure_reaper_started", lambda: None)
+    monkeypatch.setattr(qenv.q, "QUEUE_MAX_RETRIES", 2)
+    monkeypatch.setattr(qenv.q, "persist_queue_snapshot", lambda reason="": True)
+    jobs: list[dict] = []
+    monkeypatch.setattr(qenv.q, "_reap_queue", types.SimpleNamespace(put=jobs.append))
+    monkeypatch.setattr(workers, "WORKERS", {})
+    ci.request_cancel(
+        qenv.drive,
+        root_id,
+        reason="stop every retry",
+        scope=ci.SCOPE_CASCADE,
+    )
+
+    qenv.q._enforce_task_timeouts_locked(workers, now, 0, {})
+
+    assert jobs == []
+    assert leaf_id in qenv.q.RUNNING
+
+
+def test_retry_boundary_refuses_missing_physical_leaf_authority(qenv, monkeypatch):
+    from ouroboros.task_results import task_result_path
+    from supervisor import task_reaper as tr
+
+    _patch_retry_input_handoff(monkeypatch)
+    root_id, leaf_id, next_id = "missing-root", "missing-leaf", "missing-next"
+    _write_root_retry_pair(
+        qenv.drive, root_id, leaf_id, new_status=STATUS_RUNNING,
+    )
+    leaf_task = {
+        "id": leaf_id,
+        "type": "task",
+        "chat_id": 0,
+        "root_task_id": root_id,
+        "parent_task_id": "",
+        "delegation_role": "root",
+        "original_task_id": root_id,
+        "timeout_retry_from": root_id,
+    }
+    ci.request_cancel(
+        qenv.drive,
+        root_id,
+        scope=ci.SCOPE_CASCADE,
+        requested_stop_policy=ci.STOP_POLICY_FINALIZE,
+    )
+    task_result_path(qenv.drive, leaf_id, create=False).unlink()
+
+    requeued, _attempt, reason, suppression = tr._enqueue_retry(
+        qenv.q,
+        leaf_task,
+        task_id=leaf_id,
+        retry_task_id=next_id,
+        attempt=2,
+        terminal_reason="idle_timeout",
+        recon_fields={},
+    )
+
+    assert requeued is False
+    assert reason == "idle_timeout_retry_admission_blocked"
+    assert suppression == {}
+    assert qenv.q.PENDING == []
+    assert not load_task_result(qenv.drive, leaf_id).get("superseded_by")
+    assert load_task_result(qenv.drive, next_id) is None
+    assert ci.active_intent(qenv.drive, root_id) is not None
+
+
+def test_terminal_retry_leaf_wins_even_when_predecessor_lineage_is_corrupt(
+    qenv, monkeypatch,
+):
+    from supervisor import task_reaper as tr
+
+    _patch_retry_input_handoff(monkeypatch)
+    root_id, leaf_id, next_id = "terminal-root", "terminal-leaf", "terminal-next"
+    _write_root_retry_pair(
+        qenv.drive, root_id, leaf_id, new_status=STATUS_COMPLETED,
+    )
+    # Damage only the predecessor link after the physical leaf completed.
+    # Completion is already terminal truth and must short-circuit lineage work.
+    write_task_result(
+        qenv.drive,
+        root_id,
+        "interrupted",
+        superseded_by="wrong-leaf",
+        retry_task_id="wrong-leaf",
+    )
+    leaf_task = {
+        "id": leaf_id,
+        "type": "task",
+        "chat_id": 0,
+        "root_task_id": root_id,
+        "parent_task_id": "",
+        "delegation_role": "root",
+        "original_task_id": root_id,
+        "timeout_retry_from": root_id,
+    }
+
+    requeued, _attempt, _reason, suppression = tr._enqueue_retry(
+        qenv.q,
+        leaf_task,
+        task_id=leaf_id,
+        retry_task_id=next_id,
+        attempt=2,
+        terminal_reason="idle_timeout",
+        recon_fields={},
+    )
+
+    assert requeued is False
+    assert suppression == {
+        "kind": "terminal_result",
+        "target": leaf_id,
+        "status": STATUS_COMPLETED,
+    }
+    assert load_task_result(qenv.drive, next_id) is None
+
+
+def test_terminal_before_retry_boundary_creates_no_scheduled_ghost(qenv, monkeypatch):
+    from ouroboros.task_status import load_effective_task_result
+    from supervisor import task_reaper as tr
+
+    _patch_retry_input_handoff(monkeypatch)
+    old_id, new_id = "terminal-before-old", "terminal-before-new"
+    task = _root_retry_task(old_id)
+    write_task_result(qenv.drive, old_id, STATUS_COMPLETED, result="finished")
+
+    requeued, _attempt, _reason, suppression = tr._enqueue_retry(
+        qenv.q,
+        task,
+        task_id=old_id,
+        retry_task_id=new_id,
+        attempt=1,
+        terminal_reason="idle_timeout",
+        recon_fields={},
+    )
+
+    assert requeued is False
+    assert suppression == {
+        "kind": "terminal_result",
+        "target": old_id,
+        "status": STATUS_COMPLETED,
+    }
+    assert qenv.q.PENDING == []
+    assert load_task_result(qenv.drive, new_id) is None
+    assert load_task_result(qenv.drive, old_id)["result"] == "finished"
+    assert load_effective_task_result(qenv.drive, old_id)["status"] == STATUS_COMPLETED
+
+
+def test_same_id_timeout_retry_cancels_exactly(qenv):
+    task_id = "same-id-timeout-child"
+    task = {
+        "id": task_id,
+        "chat_id": 0,
+        "root_task_id": "root",
+        "parent_task_id": "root",
+        "delegation_role": "subagent",
+        "timeout_retry_from": task_id,
+        "original_task_id": task_id,
+    }
+    qenv.q.PENDING[:] = [task]
+    write_task_result(
+        qenv.drive,
+        task_id,
+        "interrupted",
+        retry_task_id=task_id,
+        root_task_id="root",
+        parent_task_id="root",
+        delegation_role="subagent",
+    )
+    ci.request_cancel(qenv.drive, task_id)
+
+    assert qenv.tl.cancel_task_custody(task_id) == qenv.tl.CANCEL_CANCELLED
+    assert qenv.q.PENDING == []
+    assert load_task_result(qenv.drive, task_id)["status"] == STATUS_CANCELLED
+
+
+def test_retry_leaf_completion_between_request_and_custody_wins(qenv, monkeypatch):
+    from ouroboros.task_status import load_effective_task_result
+    from supervisor import task_reaper as tr
+
+    _patch_retry_input_handoff(monkeypatch)
+    old_id, new_id = "completion-race-old", "completion-race-new"
+    task = _root_retry_task(old_id)
+    write_task_result(qenv.drive, old_id, STATUS_RUNNING, result="working")
+    assert tr._enqueue_retry(
+        qenv.q,
+        task,
+        task_id=old_id,
+        retry_task_id=new_id,
+        attempt=1,
+        terminal_reason="idle_timeout",
+        recon_fields={},
+    )[0] is True
+    intent = ci.request_cancel(qenv.drive, old_id, reason="late stop")
+    assert intent["task_id"] == new_id
+    qenv.q.PENDING.clear()
+    write_task_result(qenv.drive, new_id, STATUS_COMPLETED, result="won the race")
+
+    assert qenv.tl.cancel_task_custody(new_id) == qenv.tl.CANCEL_ALREADY_SETTLED
+
+    assert load_task_result(qenv.drive, old_id)["status"] == "interrupted"
+    assert load_task_result(qenv.drive, new_id)["status"] == STATUS_COMPLETED
+    assert load_effective_task_result(qenv.drive, old_id)["status"] == STATUS_COMPLETED
+    assert ci.active_intents(qenv.drive) == {}
+
+
+def test_graceful_single_retry_targets_leaf_and_stop_now_hardens_same_intent(
+    qenv, monkeypatch,
+):
+    from supervisor import owner_stop
+    from supervisor import task_reaper as tr
+
+    _patch_retry_input_handoff(monkeypatch)
+    old_id, new_id = "graceful-old", "graceful-new"
+    task = _root_retry_task(old_id)
+    write_task_result(qenv.drive, old_id, STATUS_RUNNING, result="working")
+    assert tr._enqueue_retry(
+        qenv.q,
+        task,
+        task_id=old_id,
+        retry_task_id=new_id,
+        attempt=1,
+        terminal_reason="idle_timeout",
+        recon_fields={},
+    )[0] is True
+    retry_task = qenv.q.PENDING.pop()
+    qenv.q.RUNNING[new_id] = {
+        "task": retry_task,
+        "worker_id": 0,
+        "attempt": 2,
+    }
+    monkeypatch.setattr(qenv.q, "FINALIZATION_GRACE_SEC", 120.0)
+    armed: list[tuple[str, str]] = []
+
+    def _arm(_drive, task_id, _reason, **kwargs):
+        armed.append((task_id, str(kwargs.get("control_msg_id") or "")))
+        return str(kwargs.get("control_msg_id") or "")
+
+    monkeypatch.setattr(tr, "request_finalization_grace", _arm)
+    graceful = ci.request_cancel(
+        qenv.drive,
+        old_id,
+        reason="wrap up",
+        requested_stop_policy=ci.STOP_POLICY_FINALIZE,
+    )
+    assert graceful["task_id"] == new_id
+
+    owner_stop.begin_graceful_stop(new_id)
+
+    assert armed and armed[0][0] == new_id
+    assert qenv.q.RUNNING[new_id]["finalization_control_msg_id"].startswith(
+        "ownerstop:ci_"
+    )
+    hardened = ci.request_cancel(
+        qenv.drive,
+        old_id,
+        reason="stop now",
+        requested_stop_policy=ci.STOP_POLICY_IMMEDIATE,
+    )
+    assert hardened["task_id"] == new_id
+    assert hardened["request_id"] == graceful["request_id"]
+    assert ci.stop_policy(ci.active_intent(qenv.drive, new_id)) == ci.STOP_POLICY_IMMEDIATE
+    assert ci.active_intent(qenv.drive, old_id) is None
+
+
 def test_snapshot_restore_refuses_a_task_with_active_intent(qenv, monkeypatch):
     from ouroboros.utils import utc_now_iso
 
@@ -284,6 +1211,177 @@ def test_snapshot_restore_refuses_a_task_with_active_intent(qenv, monkeypatch):
 
     assert restored == 0
     assert qenv.q.PENDING == []
+
+
+def test_snapshot_restore_blocks_when_cancel_intent_projection_is_unreadable(
+    tmp_path, monkeypatch,
+):
+    """Restart recovery must not resurrect a row over a corrupt intent store."""
+    from ouroboros.utils import utc_now_iso
+    from supervisor import queue
+
+    pending: list[dict] = []
+    running: dict = {}
+    counter = {"value": 0}
+    queue.init_queue_refs(pending, running, counter)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    snapshot_path = tmp_path / "state" / "queue_snapshot.json"
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snapshot_path)
+    queue.ACCEPTANCE_FENCES.clear()
+    queue.BUDGET_ROOT_FENCES.clear()
+    queue.ADMISSION_RESERVATIONS.clear()
+
+    task_id = "restore-over-corrupt-intent-store"
+    write_task_result(tmp_path, task_id, "scheduled")
+    projection = tmp_path / "state" / "cancel_intents.json"
+    projection.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_bytes = b'{"intents": [broken'
+    projection.write_bytes(corrupt_bytes)
+    task = {
+        "id": task_id,
+        "type": "task",
+        "chat_id": 1,
+        "depth": 0,
+        "budget_drive_root": str(tmp_path),
+    }
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps({
+            "ts": utc_now_iso(),
+            "pending": [{"id": task_id, "queue_seq": 1, "task": task}],
+            "running": [],
+            "acceptance_fences": [],
+            "budget_root_fences": [],
+        }),
+        encoding="utf-8",
+    )
+
+    assert queue.restore_pending_from_snapshot() == 1
+    assert [row["id"] for row in pending] == [task_id]
+    assert "_terminalization_retry" not in pending[0]
+    assert isinstance(pending[0].get("_cancel_intent_authority_hold"), dict)
+    assert load_task_result(tmp_path, task_id)["status"] == "scheduled"
+    assert projection.read_bytes() == corrupt_bytes
+    persisted = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    persisted_task = persisted["pending"][0]["task"]
+    assert isinstance(persisted_task.get("_cancel_intent_authority_hold"), dict)
+    assert not isinstance(persisted_task.get("_terminalization_retry"), dict)
+
+    # Repairing the projection releases this authority hold; it must not turn
+    # the ordinary scheduled row into a synthetic terminal failure.
+    from supervisor import state, workers
+
+    delivered: list[dict] = []
+    worker = types.SimpleNamespace(
+        wid=1,
+        busy_task_id=None,
+        reaping=False,
+        in_q=types.SimpleNamespace(put=lambda row: delivered.append(dict(row))),
+    )
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", running)
+    monkeypatch.setattr(workers, "WORKERS", {1: worker})
+    monkeypatch.setattr(workers, "load_state", lambda: {})
+    monkeypatch.setattr(workers, "repo_writer_task_allowed", lambda _task: True)
+    monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 100.0)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
+    queue.BUDGET_ROOT_FENCES.clear()
+    projection.unlink()
+
+    workers.assign_tasks()
+
+    assert pending == []
+    assert [row["id"] for row in delivered] == [task_id]
+    assert "_terminalization_retry" not in delivered[0]
+    assert "_cancel_intent_authority_hold" not in delivered[0]
+    assert load_task_result(tmp_path, task_id)["status"] == "scheduled"
+
+
+def test_cancel_authority_hold_never_releases_a_terminal_row_to_dispatch(
+    tmp_path, monkeypatch,
+):
+    """A repaired hold distinguishes ordinary resume from terminal cleanup."""
+    from supervisor import queue, state, workers
+
+    task_id = "terminal-under-authority-hold"
+    task = {
+        "id": task_id,
+        "type": "task",
+        "chat_id": 1,
+        "depth": 0,
+        "_cancel_intent_authority_hold": {
+            "reason": "Cancel-intent authority is unreadable; dispatch is blocked.",
+            "held_at": "2026-08-28T00:00:00+00:00",
+        },
+    }
+    pending = [task]
+    running: dict = {}
+    delivered: list[dict] = []
+    worker = types.SimpleNamespace(
+        wid=1,
+        busy_task_id=None,
+        reaping=False,
+        in_q=types.SimpleNamespace(put=lambda row: delivered.append(dict(row))),
+    )
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", running)
+    monkeypatch.setattr(workers, "WORKERS", {1: worker})
+    monkeypatch.setattr(workers, "load_state", lambda: {})
+    monkeypatch.setattr(workers, "repo_writer_task_allowed", lambda _task: True)
+    monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 100.0)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
+    monkeypatch.setattr(
+        workers,
+        "_emit_task_done_terminal",
+        lambda *_args, **_kwargs: pytest.fail("authority hold does not own terminal events"),
+    )
+    queue.BUDGET_ROOT_FENCES.clear()
+    write_task_result(tmp_path, task_id, STATUS_CANCELLED, result="cancelled")
+
+    workers.assign_tasks()
+
+    assert pending == []
+    assert delivered == []
+    assert worker.busy_task_id is None
+    assert load_task_result(tmp_path, task_id)["status"] == STATUS_CANCELLED
+
+
+def test_preserve_pending_shutdown_keeps_cancel_authority_hold_nonterminal(
+    qenv, monkeypatch,
+):
+    """A restart hold is queue custody, never a synthetic failed outcome."""
+    from supervisor import queue, workers
+
+    task_id = "held-through-planned-restart"
+    held = {
+        "id": task_id,
+        "type": "task",
+        "chat_id": 0,
+        "depth": 0,
+        "_cancel_intent_authority_hold": {
+            "reason": "Cancel-intent authority is unreadable; dispatch is blocked.",
+            "held_at": "2026-08-28T00:00:00+00:00",
+        },
+    }
+    qenv.q.PENDING[:] = [held]
+    monkeypatch.setattr(workers, "PENDING", qenv.q.PENDING, raising=False)
+    monkeypatch.setattr(workers, "RUNNING", {}, raising=False)
+    monkeypatch.setattr(workers, "WORKERS", {}, raising=False)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", qenv.drive, raising=False)
+    monkeypatch.setattr(workers, "_WORKER_POOL_DISABLED_REASON", "")
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
+    write_task_result(qenv.drive, task_id, "scheduled")
+
+    assert workers.kill_workers(
+        preserve_pending=True,
+        reconcile_delegate_custody=False,
+    ) is True
+
+    assert qenv.q.PENDING == [held]
+    assert "_terminalization_retry" not in qenv.q.PENDING[0]
+    assert load_task_result(qenv.drive, task_id)["status"] == "scheduled"
 
 
 # --------------------------------------------------------------------------
@@ -1150,9 +2248,9 @@ def test_cascade_mints_child_intents_and_records_scope(qenv, monkeypatch):
 def test_watchdog_replays_a_cascade_intent_as_a_cascade(qenv, monkeypatch):
     """A-F9: replaying a cascade as a single cancel would leave descendants live."""
     calls: list = []
-    monkeypatch.setattr(qenv.tl, "cancel_task_by_id",
+    monkeypatch.setattr(qenv.q, "cancel_task_by_id",
                         lambda tid, **kw: calls.append((tid, kw)) or True)
-    monkeypatch.setattr(qenv.tl, "cancel_task_custody",
+    monkeypatch.setattr(qenv.q, "cancel_task_custody",
                         lambda tid, **kw: calls.append((tid, "single")) or "cancelled")
     ci.request_cancel(qenv.drive, "casc-root", scope=ci.SCOPE_CASCADE)
     store = qenv.drive / "state" / "cancel_intents.json"
@@ -1766,8 +2864,8 @@ def test_cascade_descendant_intent_failure_is_surfaced_not_silent(qenv, monkeypa
 
 def test_drop_cancelled_pending_yields_to_a_live_claim_owner(qenv, monkeypatch):
     """AR2-2: the pre-assignment drop CLAIMS before it settles. A live custody's
-    claim wins — the task still leaves the queue (it must not be assigned) but
-    nothing is written, settled, or emitted here; the claim owner does all three."""
+    claim wins — assignment retains the authoritative pending row and aborts,
+    then the claim owner captures/removes that same row."""
     from supervisor import workers
 
     emitted: list = []
@@ -1780,31 +2878,54 @@ def test_drop_cancelled_pending_yields_to_a_live_claim_owner(qenv, monkeypatch):
     ci.request_cancel(qenv.drive, "drop-owned")
     ci.claim_intent(qenv.drive, "drop-owned", owner="cancel_task_custody")  # live owner
 
-    workers._drop_cancelled_pending()
+    assert workers._drop_cancelled_pending() is False
 
-    assert qenv.q.PENDING == [], "it must not be assigned to a worker"
+    assert [row["id"] for row in qenv.q.PENDING] == ["drop-owned"]
     assert emitted == [], "the claim owner emits, not the drop"
     assert load_task_result(qenv.drive, "drop-owned")["status"] == "scheduled"
     intent = ci.active_intent(qenv.drive, "drop-owned")
     assert intent["state"] == ci.INTENT_CLAIMED
     assert intent["claim_owner"] == "cancel_task_custody"
 
+    assert ci.release_claim(qenv.drive, "drop-owned", error="test owner resumes")
+    assert qenv.tl.cancel_task_custody("drop-owned") == qenv.tl.CANCEL_CANCELLED
+    assert qenv.q.PENDING == []
+
 
 def test_drop_cancelled_pending_defers_when_intent_vanishes_before_settle(
     qenv, monkeypatch,
 ):
-    """A stale pending row must never settle a newly minted unfenced intent."""
-    from supervisor import workers
+    """A changed claim aborts the whole assignment pass, not just the drop."""
+    from supervisor import queue, state, workers
 
     task_id = "drop-intent-race"
-    monkeypatch.setattr(workers, "PENDING", qenv.q.PENDING, raising=False)
-    monkeypatch.setattr(workers, "DRIVE_ROOT", qenv.drive, raising=False)
-    emitted: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        workers, "_emit_task_done_terminal",
-        lambda _task, tid, status, **_kwargs: emitted.append((tid, status)) or True,
+    pending = [{"id": task_id, "type": "task", "chat_id": 1, "depth": 0}]
+    delivered: list[dict] = []
+    worker = types.SimpleNamespace(
+        wid=1,
+        busy_task_id=None,
+        reaping=False,
+        in_q=types.SimpleNamespace(put=lambda task: delivered.append(dict(task))),
     )
-    qenv.q.PENDING[:] = [{"id": task_id, "chat_id": 1}]
+    monkeypatch.setattr(workers, "PENDING", pending, raising=False)
+    monkeypatch.setattr(workers, "RUNNING", {}, raising=False)
+    monkeypatch.setattr(workers, "WORKERS", {1: worker}, raising=False)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", qenv.drive, raising=False)
+    monkeypatch.setattr(workers, "load_state", lambda: {})
+    monkeypatch.setattr(
+        state,
+        "budget_remaining",
+        lambda *_args, **_kwargs: pytest.fail(
+            "budget must not run after cancellation custody changes"
+        ),
+    )
+    snapshots: list[str] = []
+    monkeypatch.setattr(
+        queue,
+        "persist_queue_snapshot",
+        lambda reason="": snapshots.append(reason) or True,
+    )
+    queue.BUDGET_ROOT_FENCES.clear()
     write_task_result(qenv.drive, task_id, "scheduled")
     first = ci.request_cancel(qenv.drive, task_id, reason="old request")
     real_settle = ci.settle_intent
@@ -1815,21 +2936,21 @@ def test_drop_cancelled_pending_defers_when_intent_vanishes_before_settle(
             root, tid, outcome="cancelled",
             expected_generation=first["generation"], request_id=first["request_id"],
         )
-        # A concurrent ingress can mint a new ordinary request after the old
-        # claim disappeared while this row is still pending.
         ci.request_cancel(root, tid, reason="new request", source="race")
         return None
 
     monkeypatch.setattr(ci, "claim_intent", vanished_claim)
-    workers._drop_cancelled_pending()
+    workers.assign_tasks()
 
-    assert [row["id"] for row in qenv.q.PENDING] == [task_id]
+    assert [row["id"] for row in pending] == [task_id]
+    assert delivered == []
+    assert worker.busy_task_id is None
     assert load_task_result(qenv.drive, task_id)["status"] == "scheduled"
     replacement = ci.active_intent(qenv.drive, task_id)
     assert replacement is not None
     assert replacement["state"] == ci.INTENT_REQUESTED
     assert replacement["reason"] == "new request"
-    assert emitted == []
+    assert snapshots == ["cancellation_authority_indeterminate"]
 
 
 def test_fail_tasks_yields_to_a_live_claim_owner(tmp_path):
@@ -2066,7 +3187,7 @@ def test_snapshot_restore_consults_the_intent_projection_under_the_queue_lock(
 
     consults: list = []
 
-    def _spy(root, tid):
+    def _spy(root, tid, *, strict=False):
         consults.append(qenv.q._queue_lock._is_owned())
         return True  # refusal path: no enqueue side effects in this harness
 

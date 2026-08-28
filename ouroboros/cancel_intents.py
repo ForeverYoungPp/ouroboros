@@ -32,7 +32,7 @@ import pathlib
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from ouroboros.utils import append_jsonl, update_json_locked, utc_now_iso
 
@@ -48,6 +48,10 @@ class CancelIntentProjectionCorrupt(RuntimeError):
     the caller fails closed (the cancel ingress reports the intent write as
     failed rather than pretending the intent is durable).
     """
+
+
+class CancelIntentLineageIndeterminate(RuntimeError):
+    """A historical id points through an invalid timeout-retry chain."""
 
 
 _SCHEMA_VERSION = 1
@@ -72,6 +76,11 @@ SCOPE_CASCADE = "cascade"
 # request, single kill-owner); graceful can never soften an accepted immediate.
 STOP_POLICY_IMMEDIATE = "immediate"
 STOP_POLICY_FINALIZE = "finalize_then_cancel"
+
+# Integrity bound only: the queue currently permits far fewer physical retry
+# hops, but a corrupted on-disk chain must never make one cancel ingress scan
+# without limit.
+_RETRY_LINEAGE_MAX_HOPS = 32
 
 
 def stop_policy(intent: Any) -> str:
@@ -167,6 +176,145 @@ def settled_status(drive_root: Any, task_id: str) -> str:
         return ""
 
 
+def _validated_single_cancel_target(drive_root: Any, task_id: str) -> str:
+    """Resolve a historical root id to its durable physical retry leaf.
+
+    Only reciprocal host-written result lineage is authority.  Same-id retries
+    (subagent/evolution) stay exact.  This helper is called while the cancel
+    projection lock is held, which makes retry publication and intent minting
+    one ordered decision with the reaper's admission boundary.
+    """
+    from ouroboros.task_results import load_task_result, resolve_task_lineage
+
+    current_id = _valid_task_id(task_id)
+    seen = {current_id}
+    logical_root = current_id
+    for _hop in range(_RETRY_LINEAGE_MAX_HOPS + 1):
+        try:
+            current = load_task_result(drive_root, current_id, strict=True) or {}
+        except Exception as exc:
+            raise CancelIntentLineageIndeterminate(
+                f"task-result authority is unreadable for {current_id}"
+            ) from exc
+        if _hop == 0:
+            logical_root = str(current.get("root_task_id") or current_id)
+        superseded_by = str(current.get("superseded_by") or "").strip()
+        retry_task_id = str(current.get("retry_task_id") or "").strip()
+        if not superseded_by and retry_task_id == current_id:
+            return current_id
+        if not superseded_by and not retry_task_id:
+            return current_id
+        if not superseded_by or superseded_by != retry_task_id:
+            raise CancelIntentLineageIndeterminate(
+                f"timeout retry lineage from {current_id} is not reciprocal"
+            )
+        successor_id = _valid_task_id(superseded_by)
+        if successor_id in seen:
+            raise CancelIntentLineageIndeterminate(
+                f"timeout retry lineage from {task_id} contains a cycle"
+            )
+        if _hop >= _RETRY_LINEAGE_MAX_HOPS:
+            raise CancelIntentLineageIndeterminate(
+                f"timeout retry lineage from {task_id} exceeds the integrity bound"
+            )
+        try:
+            successor = load_task_result(drive_root, successor_id, strict=True)
+        except Exception as exc:
+            raise CancelIntentLineageIndeterminate(
+                f"task-result authority is unreadable for {successor_id}"
+            ) from exc
+        if not isinstance(successor, dict):
+            raise CancelIntentLineageIndeterminate(
+                f"timeout retry successor {successor_id} has no durable result"
+            )
+        lineage = resolve_task_lineage(
+            successor_id,
+            metadata=successor.get("metadata"),
+            root_task_id=successor.get("root_task_id"),
+            parent_task_id=successor.get("parent_task_id"),
+            delegation_role=successor.get("delegation_role"),
+            original_task_id=successor.get("original_task_id"),
+            timeout_retry_from=successor.get("timeout_retry_from"),
+        )
+        if (
+            str(successor.get("supersedes_task_id") or "") != current_id
+            or str(successor.get("original_task_id") or "") != current_id
+            or str(successor.get("timeout_retry_from") or "") != current_id
+            or not lineage.get("is_retry_root_attempt")
+            or str(lineage.get("root_task_id") or "") != logical_root
+        ):
+            raise CancelIntentLineageIndeterminate(
+                f"timeout retry lineage {current_id} -> {successor_id} is incomplete"
+            )
+        seen.add(successor_id)
+        current_id = successor_id
+    raise CancelIntentLineageIndeterminate(
+        f"timeout retry lineage from {task_id} exceeds the integrity bound"
+    )
+
+
+def _validated_retry_root_cancel_key(
+    drive_root: Any, task_id: str, *, task_hint: Any = None,
+) -> str:
+    """Return the logical root key for a proven physical root retry leaf.
+
+    Ordinary tasks and same-id retries return ``""``.  A new-id retry is an
+    alias of its logical root only when its durable row has the typed root
+    attempt shape *and* the reciprocal forward chain from that root ends at
+    this exact physical id.  Retry admission uses this while checking cancel
+    authority so a cascade/finalize intent that deliberately remains keyed by
+    the logical root cannot be escaped by a second timeout retry.
+    """
+    from ouroboros.task_results import load_task_result, resolve_task_lineage
+
+    tid = _valid_task_id(task_id)
+    try:
+        current = load_task_result(drive_root, tid, strict=True)
+    except Exception as exc:
+        raise CancelIntentLineageIndeterminate(
+            f"task-result authority is unreadable for {tid}"
+        ) from exc
+    if not isinstance(current, dict):
+        # A first physical attempt (or a same-id descendant retry) can reach
+        # timeout during the narrow spawn->first-result window.  It has no
+        # logical alias to escape, so the live host-owned task row is enough to
+        # classify it as exact.  A new-id root retry is different: its missing
+        # durable reciprocal row destroys the only proof that a logical-root
+        # intent covers this physical id, so admission must fail closed.
+        hint = task_hint if isinstance(task_hint, dict) else {}
+        hinted = resolve_task_lineage(
+            tid,
+            metadata=hint.get("metadata"),
+            root_task_id=hint.get("root_task_id"),
+            parent_task_id=hint.get("parent_task_id"),
+            delegation_role=hint.get("delegation_role"),
+            original_task_id=hint.get("original_task_id"),
+            timeout_retry_from=hint.get("timeout_retry_from"),
+        )
+        if hinted.get("is_retry_root_attempt"):
+            raise CancelIntentLineageIndeterminate(
+                f"task-result authority has no durable row for retry leaf {tid}"
+            )
+        return ""
+    lineage = resolve_task_lineage(
+        tid,
+        metadata=current.get("metadata"),
+        root_task_id=current.get("root_task_id"),
+        parent_task_id=current.get("parent_task_id"),
+        delegation_role=current.get("delegation_role"),
+        original_task_id=current.get("original_task_id"),
+        timeout_retry_from=current.get("timeout_retry_from"),
+    )
+    if not lineage.get("is_retry_root_attempt"):
+        return ""
+    logical_root = _valid_task_id(str(lineage.get("root_task_id") or ""))
+    if _validated_single_cancel_target(drive_root, logical_root) != tid:
+        raise CancelIntentLineageIndeterminate(
+            f"logical retry root {logical_root} does not resolve to {tid}"
+        )
+    return logical_root
+
+
 def request_cancel(
     drive_root: Any,
     task_id: str,
@@ -213,16 +361,9 @@ def request_cancel(
     tid = _valid_task_id(task_id)
     reason_text = " ".join(str(reason or "").split())[:500]
     policy_text = str(requested_stop_policy or "").strip()
-    settled = settled_status(drive_root, tid)
-    if settled and not allow_settled_target:
-        _forensic(drive_root, {
-            "event": "already_settled", "task_id": tid, "status": settled,
-            "source": str(source or ""), "reason": reason_text,
-        })
-        return {"task_id": tid, "already_requested": False, "already_settled": True,
-                "status": settled}
     minted: Dict[str, Any] = {}
     scope_text = str(scope or "").strip()
+    resolved = {"task_id": tid, "status": ""}
     # Whether THIS mutation recorded a new hardening — a duplicate immediate
     # request over an already-hardened intent must not re-emit the forensic row.
     newly_hardened = {"value": False}
@@ -230,20 +371,124 @@ def request_cancel(
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         newly_hardened["value"] = False
         intents = _load_intents(current, strict=True)
-        existing = intents.get(tid)
+        # A pre-existing logical-root intent remains its own authority.  New
+        # SINGLE requests canonicalize to the physical retry leaf; cascades
+        # deliberately stay on the logical root because their subtree owner
+        # uses that id for fences, descendant capture, and the one summary.
+        requested_existing = intents.get(tid)
+        if requested_existing is not None and not isinstance(requested_existing, dict):
+            raise ValueError(
+                f"cancel-intent row for {tid} is malformed (not an object)"
+            )
+        target_id = tid
+        rekeyed = False
+        # A physical timeout-retry leaf may already be governed by a cascade
+        # intent that deliberately remains keyed by the stable logical root.
+        # Reuse that proven authority instead of minting a second SINGLE intent
+        # on the leaf (Stop-now must harden the same owner request).  Do not
+        # infer a new logical cascade: only an already-present, validated
+        # cascade row is eligible for this reverse alias.
+        if not (
+            isinstance(requested_existing, dict)
+            and requested_existing.get("request_id")
+        ):
+            retry_root_id = _validated_retry_root_cancel_key(
+                drive_root, tid,
+            )
+            retry_root_existing = (
+                intents.get(retry_root_id) if retry_root_id else None
+            )
+            if retry_root_existing is not None and not isinstance(
+                retry_root_existing, dict,
+            ):
+                raise ValueError(
+                    f"cancel-intent row for {retry_root_id} is malformed "
+                    "(not an object)"
+                )
+            if (
+                isinstance(retry_root_existing, dict)
+                and retry_root_existing.get("request_id")
+                and str(retry_root_existing.get("scope") or "")
+                == SCOPE_CASCADE
+            ):
+                target_id = retry_root_id
+                requested_existing = retry_root_existing
+        if (
+            not (
+                isinstance(requested_existing, dict)
+                and requested_existing.get("request_id")
+            )
+            and scope_text == SCOPE_CASCADE
+        ):
+            leaf_id = _validated_single_cancel_target(drive_root, tid)
+            leaf_existing = intents.get(leaf_id) if leaf_id != tid else None
+            if leaf_existing is not None and not isinstance(leaf_existing, dict):
+                raise ValueError(
+                    f"cancel-intent row for {leaf_id} is malformed (not an object)"
+                )
+            if isinstance(leaf_existing, dict) and leaf_existing.get("request_id"):
+                if leaf_existing.get("state") == INTENT_CLAIMED:
+                    raise CancelIntentLineageIndeterminate(
+                        f"cannot re-key a claimed retry intent from {leaf_id} to {tid}"
+                    )
+                requested_existing = {
+                    **leaf_existing,
+                    "task_id": tid,
+                    "scope": SCOPE_CASCADE,
+                }
+                intents.pop(leaf_id, None)
+                intents[tid] = requested_existing
+                rekeyed = True
+        elif not (
+            isinstance(requested_existing, dict)
+            and requested_existing.get("request_id")
+        ):
+            target_id = _validated_single_cancel_target(drive_root, tid)
+        resolved["task_id"] = target_id
+        existing = intents.get(target_id)
         if existing is not None and not isinstance(existing, dict):
             # GR6-3 row strictness: a present-but-malformed ROW is corruption,
             # not an absent intent — silently overwriting it would destroy the
             # forensic bytes exactly like the {}-collapse the container check
             # refuses. Same typed ValueError → CancelIntentProjectionCorrupt.
             raise ValueError(
-                f"cancel-intent row for {tid} is malformed (not an object)"
+                f"cancel-intent row for {target_id} is malformed (not an object)"
             )
+        from ouroboros.task_results import load_task_result
+        from ouroboros.task_status import SETTLED_STATUSES
+
+        try:
+            target_result = load_task_result(drive_root, target_id, strict=True) or {}
+        except Exception as exc:
+            raise CancelIntentLineageIndeterminate(
+                f"task-result authority is unreadable for {target_id}"
+            ) from exc
+        target_status = str(target_result.get("status") or "")
+        resolved["status"] = target_status if target_status in SETTLED_STATUSES else ""
+        if (
+            resolved["status"]
+            and not allow_settled_target
+            and not (
+                isinstance(existing, dict)
+                and existing.get("request_id")
+            )
+        ):
+            # An existing intent can still own unfinished coordination (most
+            # importantly a settled logical root with live descendants).  The
+            # already-settled fast path applies only when there is no durable
+            # owner request left to harden or settle.
+            minted.update({
+                "task_id": target_id,
+                "already_requested": False,
+                "already_settled": True,
+                "status": resolved["status"],
+            })
+            return None
         if isinstance(existing, dict) and existing.get("request_id"):
             minted.update(existing)
             minted["already_requested"] = True
             updated_row = dict(existing)
-            changed = False
+            changed = rekeyed
             if scope_text == SCOPE_CASCADE and str(existing.get("scope") or "") != SCOPE_CASCADE:
                 # A single-cancel intent later re-entered through the cascade
                 # ingress must be replayed as a cascade. WIDEN-ONLY (GR2-1d):
@@ -265,13 +510,13 @@ def request_cancel(
                 newly_hardened["value"] = True
                 changed = True
             if changed:
-                intents[tid] = updated_row
+                intents[target_id] = updated_row
                 minted.update(updated_row)
                 return {"schema_version": _SCHEMA_VERSION, "intents": intents}
             return None
         row = {
             "request_id": f"ci_{uuid.uuid4().hex[:12]}",
-            "task_id": tid,
+            "task_id": target_id,
             "state": INTENT_REQUESTED,
             "reason": reason_text,
             "source": str(source or ""),
@@ -282,7 +527,7 @@ def request_cancel(
         }
         if policy_text == STOP_POLICY_FINALIZE:
             row["stop_policy"] = STOP_POLICY_FINALIZE
-        intents[tid] = row
+        intents[target_id] = row
         minted.update(row)
         minted["already_requested"] = False
         return {"schema_version": _SCHEMA_VERSION, "intents": intents}
@@ -293,6 +538,16 @@ def request_cancel(
         # would silently drop every other active intent. Absent file (first
         # write) is unaffected.
         update_json_locked(_intents_path(drive_root), _mutate, strict_existing_dict=True)
+    except CancelIntentLineageIndeterminate as exc:
+        _forensic(drive_root, {
+            "event": "retry_lineage_refused", "task_id": tid,
+            "op": "request_cancel", "error": str(exc)[:200],
+        })
+        log.error(
+            "cancel-intent retry lineage is indeterminate for %s; refusing intent",
+            tid,
+        )
+        raise
     except ValueError as exc:
         _forensic(drive_root, {
             "event": "projection_corrupt_refused", "task_id": tid,
@@ -302,22 +557,46 @@ def request_cancel(
             "cancel-intent projection is corrupt; refusing to record intent for %s", tid,
         )
         raise CancelIntentProjectionCorrupt(str(exc)) from exc
-    if not minted.get("already_requested"):
+    if minted.get("already_settled"):
         _forensic(drive_root, {
-            "event": "requested", "task_id": tid,
+            "event": "already_settled",
+            "task_id": str(resolved.get("task_id") or tid),
+            "requested_task_id": tid,
+            "status": str(minted.get("status") or ""),
+            "source": str(source or ""),
+            "reason": reason_text,
+        })
+    elif not minted.get("already_requested"):
+        _forensic(drive_root, {
+            "event": "requested", "task_id": str(resolved.get("task_id") or tid),
+            **(
+                {"requested_task_id": tid}
+                if str(resolved.get("task_id") or tid) != tid else {}
+            ),
             "request_id": minted.get("request_id"),
             "source": minted.get("source"), "requested_by": minted.get("requested_by"),
             "scope": minted.get("scope"), "reason": reason_text,
             **({"stop_policy": minted.get("stop_policy")} if minted.get("stop_policy") else {}),
-            **({"settled_target_status": settled} if settled else {}),
+            **(
+                {"settled_target_status": resolved.get("status")}
+                if resolved.get("status") else {}
+            ),
         })
     elif newly_hardened["value"]:
         _forensic(drive_root, {
-            "event": "stop_policy_hardened", "task_id": tid,
+            "event": "stop_policy_hardened",
+            "task_id": str(resolved.get("task_id") or tid),
+            **(
+                {"requested_task_id": tid}
+                if str(resolved.get("task_id") or tid) != tid else {}
+            ),
             "request_id": minted.get("request_id"), "stop_policy": STOP_POLICY_IMMEDIATE,
         })
     minted.setdefault("already_settled", False)
-    return dict(minted)
+    result = dict(minted)
+    if str(resolved.get("task_id") or tid) != tid:
+        result["requested_task_id"] = tid
+    return result
 
 
 def mark_finalize_control_drained(
@@ -337,9 +616,10 @@ def mark_finalize_control_drained(
     never breaks the round loop. Returns whether THIS call recorded the stamp.
     """
     try:
-        tid = _valid_task_id(task_id)
+        requested_tid = _valid_task_id(task_id)
     except ValueError:
         return False
+    tid, _resolved_intent = resolve_owner_stop_intent(drive_root, requested_tid)
     stamp = str(drained_at or "") or utc_now_iso()
     recorded: Dict[str, Any] = {}
 
@@ -539,6 +819,49 @@ def active_intent(
     return dict(row) if isinstance(row, dict) else None
 
 
+def resolve_owner_stop_intent(
+    drive_root: Any, task_id: str,
+) -> Tuple[str, Dict[str, Any]]:
+    """Return the durable owner-stop key/row for a physical retry task.
+
+    SINGLE intents are already canonicalized to the physical leaf.  Graceful
+    cascades deliberately remain keyed by their logical root, so a worker on a
+    new-id retry needs this validated reverse lookup for its drain stamp and
+    deadline check.  No alias state is persisted; reciprocal result lineage is
+    the authority.
+    """
+    try:
+        tid = _valid_task_id(task_id)
+    except ValueError:
+        return "", {}
+    exact = active_intent(drive_root, tid)
+    if isinstance(exact, dict) and stop_policy(exact) == STOP_POLICY_FINALIZE:
+        return tid, exact
+    try:
+        from ouroboros.task_results import load_task_result
+
+        result = load_task_result(drive_root, tid, strict=True) or {}
+        logical_root = str(result.get("root_task_id") or "").strip()
+        if not logical_root or logical_root == tid:
+            return tid, {}
+        logical = active_intent(drive_root, logical_root)
+        if not (
+            isinstance(logical, dict)
+            and str(logical.get("scope") or "") == SCOPE_CASCADE
+            and stop_policy(logical) == STOP_POLICY_FINALIZE
+            and _validated_single_cancel_target(drive_root, logical_root) == tid
+        ):
+            return tid, {}
+        return logical_root, logical
+    except Exception:
+        log.debug(
+            "owner-stop intent resolution failed for physical task %s",
+            tid,
+            exc_info=True,
+        )
+        return tid, {}
+
+
 def has_active_intent(drive_root: Any, task_id: str, *, strict: bool = False) -> bool:
     return active_intent(drive_root, task_id, strict=strict) is not None
 
@@ -567,7 +890,16 @@ def claim_intent(drive_root: Any, task_id: str, *, owner: str) -> Optional[Dict[
     refused: Dict[str, Any] = {}
 
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        intents = _load_intents(current)
+        intents = _load_intents(current, strict=True)
+        malformed = [
+            str(intent_id)
+            for intent_id, intent_row in intents.items()
+            if not isinstance(intent_row, dict)
+        ]
+        if malformed:
+            raise ValueError(
+                f"malformed intent row(s): {', '.join(malformed[:5])}"
+            )
         row = intents.get(tid)
         if not isinstance(row, dict):
             return None
@@ -584,7 +916,24 @@ def claim_intent(drive_root: Any, task_id: str, *, owner: str) -> Optional[Dict[
         claimed.update(row)
         return {"schema_version": _SCHEMA_VERSION, "intents": intents}
 
-    update_json_locked(_intents_path(drive_root), _mutate)
+    # Claiming is an enforcement write: an existing malformed projection must
+    # raise instead of being treated as an empty store and returning ``None``.
+    # The latter would look like a harmless claim race to the pending-drop
+    # caller and could let a cancelled row cross the dispatch boundary.  An
+    # absent file still initializes normally, so first-use behavior is intact.
+    try:
+        update_json_locked(
+            _intents_path(drive_root), _mutate, strict_existing_dict=True,
+        )
+    except ValueError as exc:
+        _forensic(drive_root, {
+            "event": "projection_corrupt_refused", "task_id": tid,
+            "op": "claim_intent", "error": str(exc)[:200],
+        })
+        log.error(
+            "cancel-intent projection is corrupt; refusing claim for %s", tid,
+        )
+        raise CancelIntentProjectionCorrupt(str(exc)) from exc
     if claimed:
         _forensic(drive_root, {
             "event": "claimed", "task_id": tid,

@@ -317,6 +317,173 @@ def task_subtree_is_live(task_id: str, *, ignore_intents: bool = False) -> bool:
         return False
 
 
+def _live_retry_target_locked(q: Any, task_id: str) -> Tuple[str, str]:
+    """Resolve an old root id to its one validated live retry leaf.
+
+    A live row is not lineage authority by itself: ingress fields can be stale
+    or malformed, and choosing one of several candidates would let a cancel
+    intent settle against the wrong physical task.  Follow the reciprocal
+    host-written result chain (old points to new; new points back to old), then
+    require the live task row to satisfy the existing root-retry contract.
+    Corrupt, overlong, cyclic, or ambiguous chains raise so custody leaves the
+    intent open and fails closed.
+    """
+    requested = str(task_id or "").strip()
+    if not requested:
+        return requested, ""
+    live_rows: list[Dict[str, Any]] = [
+        row for row in q.PENDING if isinstance(row, dict)
+    ]
+    live_rows.extend(
+        meta["task"]
+        for meta in q.RUNNING.values()
+        if isinstance(meta, dict) and isinstance(meta.get("task"), dict)
+    )
+    live_by_id = {
+        str(row.get("id") or ""): row
+        for row in live_rows
+        if str(row.get("id") or "")
+    }
+
+    from ouroboros.task_results import load_task_result, resolve_task_lineage
+
+    requested_result = load_task_result(q.DRIVE_ROOT, requested, strict=True)
+    requested_shape = (
+        requested_result
+        if isinstance(requested_result, dict)
+        else live_by_id.get(requested, {})
+    )
+    requested_lineage = resolve_task_lineage(
+        requested,
+        metadata=requested_shape.get("metadata"),
+        root_task_id=requested_shape.get("root_task_id"),
+        parent_task_id=requested_shape.get("parent_task_id"),
+        delegation_role=requested_shape.get("delegation_role"),
+        original_task_id=requested_shape.get("original_task_id"),
+        timeout_retry_from=requested_shape.get("timeout_retry_from"),
+    )
+    if not requested_lineage.get("is_root_task"):
+        # Retry aliases exist only for top-level root attempts.  A subagent or
+        # other descendant is already a physical id; scanning root-shaped rows
+        # from its wider tree would misclassify an unrelated root retry as this
+        # child's successor and block cascade custody.
+        return requested, ""
+
+    chain_predecessor: Dict[str, str] = {}
+    current_id = requested
+    seen = {requested}
+    try:
+        max_edges = max(0, int(getattr(q, "QUEUE_MAX_RETRIES", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        max_edges = 0
+    logical_root = requested
+    while True:
+        current = load_task_result(q.DRIVE_ROOT, current_id, strict=True) or {}
+        if current_id == requested:
+            logical_root = str(current.get("root_task_id") or requested)
+        superseded_by = str(current.get("superseded_by") or "").strip()
+        retry_task_id = str(current.get("retry_task_id") or "").strip()
+        # Subagent/evolution timeout retries intentionally reuse the exact id.
+        # Their result carries retry_task_id=self as attempt metadata, not as a
+        # physical lineage edge.
+        if not superseded_by and retry_task_id == current_id:
+            break
+        if not superseded_by and not retry_task_id:
+            break
+        if not superseded_by or superseded_by != retry_task_id:
+            raise RuntimeError(
+                f"timeout retry lineage from {current_id} is not reciprocal"
+            )
+        if len(chain_predecessor) >= max_edges:
+            raise RuntimeError(
+                f"timeout retry lineage from {requested} exceeds retry authority"
+            )
+        successor_id = superseded_by
+        if successor_id in seen:
+            raise RuntimeError(
+                f"timeout retry lineage from {requested} contains a cycle"
+            )
+        successor = load_task_result(q.DRIVE_ROOT, successor_id, strict=True) or {}
+        if (
+            str(successor.get("supersedes_task_id") or "") != current_id
+            or str(successor.get("original_task_id") or "") != current_id
+            or str(successor.get("timeout_retry_from") or "") != current_id
+        ):
+            raise RuntimeError(
+                f"timeout retry lineage {current_id} -> {successor_id} is incomplete"
+            )
+        chain_predecessor[successor_id] = current_id
+        seen.add(successor_id)
+        current_id = successor_id
+
+    relevant_live: list[str] = []
+    if requested in live_by_id:
+        relevant_live.append(requested)
+    for candidate_id, predecessor_id in chain_predecessor.items():
+        row = live_by_id.get(candidate_id)
+        if row is None:
+            continue
+        lineage = resolve_task_lineage(
+            candidate_id,
+            metadata=row.get("metadata"),
+            root_task_id=row.get("root_task_id"),
+            parent_task_id=row.get("parent_task_id"),
+            delegation_role=row.get("delegation_role"),
+            original_task_id=row.get("original_task_id"),
+            timeout_retry_from=row.get("timeout_retry_from"),
+        )
+        if (
+            not lineage.get("is_retry_root_attempt")
+            or str(lineage.get("root_task_id") or "") != logical_root
+            or str(lineage.get("original_task_id") or "") != predecessor_id
+            or str(lineage.get("timeout_retry_from") or "") != predecessor_id
+        ):
+            raise RuntimeError(
+                f"live timeout retry {candidate_id} fails root-lineage validation"
+            )
+        relevant_live.append(candidate_id)
+
+    # A root-shaped live retry under the same logical root but outside the
+    # reciprocal chain is authority corruption, not an ignorable bystander.
+    for candidate_id, row in live_by_id.items():
+        if candidate_id == requested or candidate_id in chain_predecessor:
+            continue
+        lineage = resolve_task_lineage(
+            candidate_id,
+            metadata=row.get("metadata"),
+            root_task_id=row.get("root_task_id"),
+            parent_task_id=row.get("parent_task_id"),
+            delegation_role=row.get("delegation_role"),
+            original_task_id=row.get("original_task_id"),
+            timeout_retry_from=row.get("timeout_retry_from"),
+        )
+        if (
+            lineage.get("is_retry_root_attempt")
+            and str(lineage.get("root_task_id") or "") == logical_root
+        ):
+            raise RuntimeError(
+                f"live timeout retry {candidate_id} is outside the durable chain"
+            )
+
+    if len(relevant_live) > 1:
+        raise RuntimeError(
+            f"multiple live timeout attempts resolve from {requested}: "
+            f"{', '.join(relevant_live)}"
+        )
+    if relevant_live:
+        return relevant_live[0], ""
+    if chain_predecessor:
+        from ouroboros.task_status import SETTLED_STATUSES
+
+        leaf_status = str(
+            (load_task_result(q.DRIVE_ROOT, current_id, strict=True) or {}).get("status")
+            or ""
+        )
+        if leaf_status in SETTLED_STATUSES:
+            return current_id, leaf_status
+    return requested, ""
+
+
 def cancel_task_by_id(task_id: str, *, cascade: bool = False) -> bool:
     """Cancel a task and, when requested, its atomically captured live subtree.
 
@@ -486,6 +653,53 @@ def cancel_task_by_id(task_id: str, *, cascade: bool = False) -> bool:
             _ACTIVE_CASCADE_FENCES.pop(cascade_token, None)
 
 
+def drive_cancel_intent_scope(task_id: str, *, deliver: bool = True) -> str:
+    """Execute the CURRENT durable cancel scope through its existing owner.
+
+    Ingress may widen a previously-single request to ``cascade`` and Stop-now
+    may harden an already-graceful cascade.  Every in-band consumer therefore
+    reads the durable row immediately before teardown instead of replaying the
+    raw request shape.  Absence keeps the legacy direct-custody behavior;
+    unreadable authority fails closed.
+    """
+    q = _queue_module()
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return CANCEL_NOT_FOUND
+    try:
+        from ouroboros.cancel_intents import (
+            SCOPE_CASCADE,
+            active_intent,
+        )
+
+        intent = active_intent(q.DRIVE_ROOT, task_id, strict=True)
+    except Exception:
+        log.error(
+            "Cancellation scope authority is unreadable for %s",
+            task_id,
+            exc_info=True,
+        )
+        return CANCEL_FAILED
+    if isinstance(intent, dict):
+        try:
+            from supervisor.owner_stop import revoke_hardened_owner_stop_control
+
+            revoke_hardened_owner_stop_control(q, task_id, intent)
+        except Exception:
+            log.debug(
+                "Hardened owner-stop cleanup failed for %s",
+                task_id,
+                exc_info=True,
+            )
+        if str(intent.get("scope") or "") == SCOPE_CASCADE:
+            return (
+                CANCEL_CANCELLED
+                if q.cancel_task_by_id(task_id, cascade=True)
+                else CANCEL_FAILED
+            )
+    return q.cancel_task_custody(task_id, deliver=deliver)
+
+
 def _record_cascade_scope(q: Any, task_id: str) -> None:
     """Stamp ``scope=cascade`` on the root's EXISTING intent.
 
@@ -574,6 +788,31 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
     task_id = str(task_id or "").strip()
     if not task_id:
         return CANCEL_NOT_FOUND
+
+    # A top-level timeout retry has a new physical id while the old id remains
+    # the stable logical/status handle. Resolve that handoff under the same
+    # queue lock as retry admission. If admission won the race, cancellation
+    # follows the host-written lineage; if it did not, ordinary custody below
+    # settles the old attempt and the reaper's final terminal check suppresses
+    # the clone.
+    try:
+        with q._queue_lock:
+            retry_target, settled_retry_status = _live_retry_target_locked(q, task_id)
+    except Exception:
+        log.error(
+            "Cancellation retry-lineage authority is indeterminate for %s",
+            task_id,
+            exc_info=True,
+        )
+        return CANCEL_FAILED
+    if settled_retry_status:
+        return _settle_retry_lineage_completion(
+            q, task_id, retry_target, settled_retry_status,
+        )
+    if retry_target != task_id:
+        return _cancel_live_retry_successor(
+            q, task_id, retry_target, deliver=deliver,
+        )
 
     # Read the durable intent BEFORE claiming it. The pre-claim row is what the
     # reaping-takeover gate below judges: a slot already marked ``reaping`` is
@@ -851,6 +1090,113 @@ def _claim_intent(q: Any, task_id: str) -> Dict[str, Any]:
     except Exception:
         log.warning("cancel-intent claim failed for %s; refusing custody", task_id, exc_info=True)
         return {"claim_refused": True, "claim_error": "claim_read_failed"}
+
+
+def _settle_retry_lineage_completion(
+    q: Any, intent_task_id: str, retry_task_id: str, retry_status: str,
+) -> str:
+    """Settle an ancestor intent after its physical retry already finished.
+
+    The successor's terminal result is the completion-wins authority.  Rewriting
+    the historical interrupted row as cancelled would publish a second outcome
+    and hide the successor that actually finished.  A cascade claim is released
+    by the existing scope guard and remains for the cascade postcondition.
+    """
+    intent = _claim_intent(q, intent_task_id)
+    if intent.get("claim_refused"):
+        return CANCEL_FAILED
+    if intent:
+        _settle_intent(
+            q,
+            intent_task_id,
+            outcome=SETTLED_ALREADY,
+            detail=f"physical retry {retry_task_id} already settled as {retry_status}",
+            intent=intent,
+        )
+    return CANCEL_ALREADY_SETTLED
+
+
+def _cancel_live_retry_successor(
+    q: Any, intent_task_id: str, retry_task_id: str, *, deliver: bool,
+) -> str:
+    """Carry one legacy immediate-single intent onto its physical retry.
+
+    New single ingresses canonicalize in ``request_cancel`` and never need this
+    compatibility lane.  Cascade and graceful policies have different owners;
+    copying either onto a leaf and immediately calling custody would bypass the
+    cascade postcondition or the paid finalization window, so those shapes fail
+    closed and retain their original intent.
+    """
+    intent_before = _active_intent(q, intent_task_id)
+    try:
+        from ouroboros.cancel_intents import (
+            SCOPE_CASCADE,
+            STOP_POLICY_FINALIZE,
+            stop_policy,
+        )
+
+        if (
+            str(intent_before.get("scope") or "") == SCOPE_CASCADE
+            or stop_policy(intent_before) == STOP_POLICY_FINALIZE
+        ):
+            log.error(
+                "Refusing legacy retry-intent transfer for policy-owned task %s -> %s",
+                intent_task_id,
+                retry_task_id,
+            )
+            return CANCEL_FAILED
+    except Exception:
+        return CANCEL_FAILED
+    intent = _claim_intent(q, intent_task_id)
+    if intent.get("claim_refused"):
+        return CANCEL_FAILED
+    source_intent = intent or intent_before
+    try:
+        from ouroboros.cancel_intents import (
+            request_cancel,
+        )
+
+        request_cancel(
+            q.DRIVE_ROOT,
+            retry_task_id,
+            reason=str(source_intent.get("reason") or "logical retry cancellation"),
+            source="timeout_retry_lineage",
+            requested_by=str(source_intent.get("requested_by") or ""),
+            allow_settled_target=True,
+        )
+    except Exception:
+        log.error(
+            "Could not carry cancellation from retry ancestor %s to %s",
+            intent_task_id,
+            retry_task_id,
+            exc_info=True,
+        )
+        if intent:
+            _release_intent_claim(
+                q, intent_task_id,
+                error="retry-lineage cancel intent write failed",
+                intent=intent,
+            )
+        return CANCEL_FAILED
+
+    outcome = cancel_task_custody(retry_task_id, deliver=deliver)
+    if outcome not in _CANCEL_TERMINALIZED:
+        if intent:
+            _release_intent_claim(
+                q, intent_task_id,
+                error=f"retry-lineage custody did not settle ({outcome})",
+                intent=intent,
+            )
+        return CANCEL_FAILED
+    if intent:
+        _settle_intent(
+            q,
+            intent_task_id,
+            outcome=outcome,
+            detail=f"logical cancellation followed live retry {retry_task_id}",
+            intent=intent,
+        )
+    return outcome
 
 
 def _settle_intent(
@@ -1390,7 +1736,7 @@ def sweep_cancel_intents(*, now: Optional[float] = None) -> Dict[str, str]:
     q = _queue_module()
     try:
         from ouroboros.cancel_intents import (
-            INTENT_CLAIMED, SCOPE_CASCADE, active_intents, claim_is_abandoned,
+            INTENT_CLAIMED, active_intents, claim_is_abandoned,
         )
         from supervisor.owner_stop import OWNER_STOP_HOLDING, sweep_owner_stop_hold
     except Exception:
@@ -1422,16 +1768,7 @@ def sweep_cancel_intents(*, now: Optional[float] = None) -> Dict[str, str]:
         if requested_ts and (current - requested_ts) < _INTENT_WATCHDOG_MIN_AGE_SEC:
             continue  # give the in-band control event its tick first
         try:
-            if str(intent.get("scope") or "") == SCOPE_CASCADE:
-                # A cascade intent replays as a CASCADE. Re-feeding it as a single
-                # cancel would settle the root and leave its descendants running —
-                # exactly the shape a crash mid-cascade leaves behind.
-                outcomes[task_id] = (
-                    CANCEL_CANCELLED if cancel_task_by_id(task_id, cascade=True)
-                    else CANCEL_FAILED
-                )
-            else:
-                outcomes[task_id] = cancel_task_custody(task_id)
+            outcomes[task_id] = drive_cancel_intent_scope(task_id)
         except Exception:
             log.warning("cancel-intent sweep custody failed for %s", task_id, exc_info=True)
             outcomes[task_id] = CANCEL_FAILED
