@@ -59,12 +59,10 @@ from ouroboros.tools.plan_review_runtime import (
     plan_deadline_skip as _plan_deadline_skip,
     plan_payload_roots as _plan_payload_roots,
     plan_review_slots as _plan_review_slots,
-    plan_quorum_unreachable_facts as _plan_quorum_unreachable_facts,
     plan_reviewer_config_fingerprint as _plan_reviewer_config_fingerprint,
     plan_wave_replay_decision as _plan_wave_replay_decision,
     plan_wave_has_in_flight as _plan_wave_has_in_flight,
     plan_wave_progress_line as _plan_wave_progress_line,
-    record_raw_plan_request_attempt as _record_raw_plan_request_attempt,
     root_exploration_log as _root_exploration_log,  # noqa: F401 - compatibility seam
     run_plan_review_slots as _run_plan_review_slots,
     synthesize_plan_review_wave as _synthesize_plan_review_wave,
