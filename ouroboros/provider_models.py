@@ -228,7 +228,12 @@ def declared_model_settings(
     declared: dict[str, str] = {}
     for key in (*MODEL_SETTING_KEYS, *CLAUDE_SDK_MODEL_SETTING_KEYS):
         value = str((settings or {}).get(key) or "").strip()
-        if not value and include_claude_sdk_defaults:
+        # The opt-out is scoped to the Claude SDK transport only.  Ordinary
+        # model slots still inherit their runtime defaults; otherwise a
+        # benchmark that merely disables the SDK would silently change the
+        # generic provider plan (or fall open to every credential when all
+        # slots happen to be sparse).
+        if not value and (include_claude_sdk_defaults or key not in CLAUDE_SDK_MODEL_SETTING_KEYS):
             value = str(SETTINGS_DEFAULTS.get(key) or "").strip()
         if value:
             declared[key] = value

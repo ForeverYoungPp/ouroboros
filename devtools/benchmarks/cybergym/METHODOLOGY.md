@@ -238,10 +238,12 @@ task requires it.
 This is a tool policy, not a claim that the container has no network.  The
 generated `submit.sh` must reach the private server, so
 `allowed_resources.network` stays explicitly available for the declared
-private route while general web/search tools are disabled.  The manifest must
-show the exact `allowed_resources` and `disabled_tools` values actually sent
-to the task API.  Unknown names are not silently treated as proof of a deny;
-the launcher fails closed when a required delegation name cannot be resolved.
+private route while general web/search tools are disabled.  The task result
+row records the exact `allowed_resources` and `disabled_tools` values sent to
+the task API; the run manifest carries the derived `task_contract` reference
+and does not duplicate every task-body field.  Unknown names are not silently
+treated as proof of a deny; the launcher fails closed when a required
+delegation name cannot be resolved.
 
 The upstream FAQ treats network access as optional rather than universally
 forbidden and warns that unrestricted access can enable reward hacking. Public

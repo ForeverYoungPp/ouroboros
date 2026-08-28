@@ -1025,6 +1025,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             # The applied CyberGym profile explicitly disables both Claude SDK
             # transports; keep even the pre-admission/refusal disclosure truthful.
             include_claude_sdk_defaults=False,
+            # The sidecar receives a settings file and a fresh environment;
+            # refusal provenance must use that same file as its authority.
+            settings_authoritative_env=True,
             output_paths={
                 "run_root": str(out_root),
                 "manifest": str(manifest_path),

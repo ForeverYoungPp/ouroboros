@@ -269,7 +269,7 @@ def absorbed_cycles_done(data_root: pathlib.Path) -> int:
 
 
 def patch_settings_ports(settings_path: pathlib.Path, *, host: str, port: int,
-                         host_service_port: int) -> dict:
+                         host_service_port: int, require_existing_object: bool = False) -> dict:
     """Write the chosen ports INTO a settings.json, returning the merged config.
 
     THE reason this exists rather than exporting the ports in the environment: the server
@@ -280,6 +280,16 @@ def patch_settings_ports(settings_path: pathlib.Path, *, host: str, port: int,
     same per-instance isolation ``IsolatedServer`` gets.
     """
     settings_path = pathlib.Path(settings_path)
+    if require_existing_object:
+        # Strict adapters have already validated the snapshot once before this
+        # write.  Validate the file again here so a concurrent replacement or
+        # unlink cannot be silently converted into a ports-only defaults file.
+        try:
+            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("isolated settings snapshot is unreadable") from exc
+        if not isinstance(loaded, dict):
+            raise RuntimeError("isolated settings snapshot must be a JSON object")
     cfg: dict = {}
     try:
         if settings_path.exists():
@@ -365,6 +375,19 @@ class IsolatedServer:
             "OUROBOROS_SERVER_PORT": str(self.port),
             "OUROBOROS_HOST_SERVICE_PORT": str(self.host_service_port),
         })
+        if self.settings_authoritative_env:
+            # A headless benchmark task may still resolve the logical
+            # user_files/deliverables roots.  Keep those roots inside the
+            # throwaway data root instead of letting the runtime fall back to
+            # the operator's real home when the ambient variables were scrubbed.
+            user_files = self.data_root / "user_files"
+            deliverables = user_files / "Deliverables"
+            user_files.mkdir(parents=True, exist_ok=True)
+            deliverables.mkdir(parents=True, exist_ok=True)
+            env.update({
+                "OUROBOROS_USER_FILES_ROOT": str(user_files),
+                "OUROBOROS_DELIVERABLES_ROOT": str(deliverables),
+            })
         return env
 
     def _read_authoritative_settings(self) -> dict:
@@ -379,8 +402,13 @@ class IsolatedServer:
 
     def _patch_settings_ports(self) -> None:
         """Write the chosen free ports INTO settings.json (see `patch_settings_ports`)."""
-        patch_settings_ports(self.settings_path, host=self.host, port=self.port,
-                             host_service_port=self.host_service_port)
+        patch_settings_ports(
+            self.settings_path,
+            host=self.host,
+            port=self.port,
+            host_service_port=self.host_service_port,
+            require_existing_object=self.settings_authoritative_env,
+        )
 
     def start(self, ready_timeout: float = 180) -> "IsolatedServer":
         if self.settings_authoritative_env:

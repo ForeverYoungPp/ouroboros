@@ -113,6 +113,12 @@ def test_rootless_wrapper_makes_applied_settings_authoritative(monkeypatch, tmp_
     assert "CLAUDE_AGENT_SDK_MODEL" not in env
     assert "OUROBOROS_RUNTIME_MODE" not in env
     assert env["DOCKER_HOST"] == _host().value
+    assert pathlib.Path(env["OUROBOROS_USER_FILES_ROOT"]) == (tmp_path / "data" / "user_files").resolve()
+    assert pathlib.Path(env["OUROBOROS_DELIVERABLES_ROOT"]) == (
+        tmp_path / "data" / "user_files" / "Deliverables"
+    ).resolve()
+    assert pathlib.Path(env["OUROBOROS_USER_FILES_ROOT"]).is_dir()
+    assert pathlib.Path(env["OUROBOROS_DELIVERABLES_ROOT"]).is_dir()
 
 
 def test_authoritative_env_scrubs_legacy_and_future_runtime_overrides(monkeypatch, tmp_path):
@@ -175,6 +181,23 @@ def test_authoritative_server_refuses_unreadable_settings_before_spawn(monkeypat
     with pytest.raises(RuntimeError, match="settings snapshot is unreadable"):
         server.start()
     assert server.proc is None
+
+
+def test_authoritative_port_patch_does_not_replace_a_corrupted_snapshot(tmp_path):
+    seed, _commit = _seed_repo(tmp_path)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{broken", encoding="utf-8")
+    from devtools.benchmarks.common.server_runner import IsolatedServer
+
+    server = IsolatedServer(
+        seed,
+        tmp_path / "data",
+        settings,
+        settings_authoritative_env=True,
+    )
+    with pytest.raises(RuntimeError, match="settings snapshot is unreadable"):
+        server._patch_settings_ports()  # noqa: SLF001 - strict write seam
+    assert settings.read_text(encoding="utf-8") == "{broken"
 
 
 def test_rootless_wrapper_start_does_not_recurse_when_delegate_calls_env(monkeypatch, tmp_path):

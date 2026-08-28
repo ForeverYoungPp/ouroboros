@@ -622,6 +622,13 @@ def benchmark_run_manifest(
     include_claude_sdk_defaults = meta.get("include_claude_sdk_defaults", True)
     if not isinstance(include_claude_sdk_defaults, bool):
         raise ValueError("include_claude_sdk_defaults metadata must be a boolean")
+    # Some adapters hand a settings file plus a fresh child environment to a
+    # container.  Their initial/refusal manifest must describe that file, not
+    # ambient model/effort values from the operator process.  Keep the
+    # historical env-first default for all other benchmark drivers.
+    settings_authoritative_env = meta.get("settings_authoritative_env", False)
+    if not isinstance(settings_authoritative_env, bool):
+        raise ValueError("settings_authoritative_env metadata must be a boolean")
     source = repo_provenance(repo_dir)
     gate = _seed_gate(source, require_clean=require_clean, expect=str(expect or ""))
     manifest: dict[str, Any] = {
@@ -638,7 +645,10 @@ def benchmark_run_manifest(
         "timeout_sec": meta.get("timeout_sec"),
         "isolated_data_root": str(meta.get("isolated_data_root") or ""),
         "output_paths": meta.get("output_paths") or {},
-        "model_slots": model_slot_snapshot(meta_settings_path),
+        "model_slots": model_slot_snapshot(
+            meta_settings_path,
+            env_overrides=not settings_authoritative_env,
+        ),
         "provider_credentials": provider_credential_disclosure(
             meta_settings_path,
             include_claude_sdk_defaults=include_claude_sdk_defaults,
