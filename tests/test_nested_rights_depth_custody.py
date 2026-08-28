@@ -23,6 +23,55 @@ def test_terminalization_retry_status_normalizes_unknown_value():
     assert spec["status"] == "failed"
 
 
+def test_interrupted_terminalization_retry_is_finalized_after_worker_boot(
+    tmp_path, monkeypatch,
+):
+    """A post-boot retry must not leave a retry-less interrupted result wedged."""
+    from supervisor import workers
+    from ouroboros.task_results import load_task_result, write_task_result
+    from ouroboros.task_status import load_effective_task_result
+    from ouroboros.utils import append_jsonl, utc_now_iso
+
+    (tmp_path / "state").mkdir(parents=True)
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        '{"pending": [], "running": []}', encoding="utf-8",
+    )
+    append_jsonl(tmp_path / "logs" / "events.jsonl", {
+        "ts": utc_now_iso(), "type": "worker_boot",
+    })
+
+    pending = [{
+        "id": "post-boot-interrupted",
+        "chat_id": 0,
+        "_terminalization_retry": {
+            "status": "interrupted",
+            "reason": "terminal event was unavailable during update",
+            "trigger": "worker_pool_kill",
+        },
+    }]
+    writes = []
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "_audit_delegate_terminal_custody", lambda *a, **k: None)
+
+    def write_retry(task_id, *, reason, status):
+        writes.append({"reason": reason, "status": status})
+        write_task_result(tmp_path, task_id, status, result=reason)
+        return status
+
+    monkeypatch.setattr(workers, "_write_failure_result", write_retry)
+    monkeypatch.setattr(workers, "_emit_task_done_terminal", lambda *a, **k: True)
+
+    assert workers._retry_terminalization_pending() == (
+        ["post-boot-interrupted"], [],
+    )
+    assert pending == []
+    assert writes[0]["status"] == "failed"
+    assert "Original shutdown status was interrupted" in writes[0]["reason"]
+    assert load_task_result(tmp_path, "post-boot-interrupted")["status"] == "failed"
+    assert load_effective_task_result(tmp_path, "post-boot-interrupted")["status"] == "failed"
+
+
 def test_restore_failed_depth_terminalization_preserves_snapshot_order(
     tmp_path, monkeypatch,
 ):

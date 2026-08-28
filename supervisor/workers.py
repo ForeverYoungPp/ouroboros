@@ -2071,6 +2071,8 @@ def _settle_terminalization_task(
 
 def _retry_terminalization_pending() -> Tuple[List[str], List[str]]:
     """Retry retained shutdown rows before any assignment can inspect them."""
+    from ouroboros.task_results import STATUS_FAILED, STATUS_INTERRUPTED
+
     terminalized: List[str] = []
     unresolved: List[str] = []
     survivors: List[Dict[str, Any]] = []
@@ -2080,13 +2082,29 @@ def _retry_terminalization_pending() -> Tuple[List[str], List[str]]:
             survivors.append(task)
             continue
         task_id = str(task.get("id") or "").strip() if isinstance(task, dict) else ""
+        retry_status = spec["status"]
+        retry_reason = spec["reason"]
+        if retry_status == STATUS_INTERRUPTED:
+            # ``interrupted`` is the transient status used before an ordinary
+            # crash-requeue.  A terminalization-retry row has no successor
+            # attempt: once its durable write and terminal event both succeed,
+            # retaining that status would leave a non-terminal task with no
+            # queue ownership.  Finalize the recovered custody as an honest
+            # infrastructure failure instead of relying on a later worker-boot
+            # orphan sweep (which cannot prove staleness when this retry runs
+            # after the boot).
+            retry_status = STATUS_FAILED
+            retry_reason = (
+                f"{retry_reason} Original shutdown status was interrupted; "
+                "the retained terminalization custody was finalized as failed."
+            )
         if not task_id or not _settle_terminalization_task(
             task,
-            reason=spec["reason"],
-            status=spec["status"],
+            reason=retry_reason,
+            status=retry_status,
             trigger=spec["trigger"],
             reconcile_delegate_custody=spec["reconcile_delegate_custody"],
-            allow_interrupted=True,
+            allow_interrupted=False,
         ):
             unresolved.append(task_id or "<missing-task-id>")
             survivors.append(task)
