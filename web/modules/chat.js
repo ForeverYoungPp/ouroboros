@@ -1467,7 +1467,9 @@ export function createChatInstance({
         }
         const lifecycle = classifyReviewLifecycle(row);
         if (lifecycle.classification === 'source_complete') {
-            return attachReviewGroup(lifecycle.group, rawTs || row?.ts || row?.timestamp || '');
+            const attached = attachReviewGroup(lifecycle.group, rawTs || row?.ts || row?.timestamp || '');
+            if (lifecycle.group.activeCount === 0 && lifecycle.group.lifecycleStatus) scheduleHistorySync();
+            return attached;
         }
         // Incomplete review lifecycle stays domain-local and never mints a task.
         return lifecycle.classification === 'source_incomplete';
@@ -2018,11 +2020,7 @@ export function createChatInstance({
         historyResyncScheduler.schedule();
     }
 
-    // perf2 P4 follow-up (double-fetch fix): finished transitions replayed by
-    // syncHistory itself (_historyReplayActive) are dropped by the scheduler —
-    // the rows just arrived from the canonical source, so the 700ms resync was
-    // refetching the whole window after every history load. A LIVE completion
-    // (WS frame outside a replay) still always schedules a REAL fetch [GPT#12].
+    // Replay finishes are already canonical; live finishes still schedule a real fetch.
     const historyResyncScheduler = createHistoryResyncScheduler({
         isReplayActive: () => _historyReplayActive,
         run: () => syncHistory({ includeUser: false }).catch(() => {}),
@@ -3140,10 +3138,7 @@ export function createChatInstance({
                             routeSubagentFinalMessageToCard(taskId, msg);
                             const taskState = getTaskUiState(taskId, false);
                             const record = liveCardRecords.get(taskId);
-                            const replayPhase = msg.task_terminal_status
-                                ? taskTerminalPhase(msg)
-                                : replayTerminalPhase(taskState, record);
-                            finishLiveCard(taskId, replayPhase);
+                            finishLiveCard(taskId, msg.task_terminal_status ? taskTerminalPhase(msg) : replayTerminalPhase(taskState, record));
                             continue;
                         }
                         insertCardIfNeeded(taskId);
@@ -3153,10 +3148,7 @@ export function createChatInstance({
                         } else {
                             const taskState = getTaskUiState(taskId, false);
                             const record = liveCardRecords.get(taskId);
-                            const replayPhase = msg.task_terminal_status
-                                ? taskTerminalPhase(msg)
-                                : replayTerminalPhase(taskState, record);
-                            finishLiveCard(taskId, replayPhase);
+                            finishLiveCard(taskId, msg.task_terminal_status ? taskTerminalPhase(msg) : replayTerminalPhase(taskState, record));
                         }
                     }
                     // A replayed durable routing receipt carries the same

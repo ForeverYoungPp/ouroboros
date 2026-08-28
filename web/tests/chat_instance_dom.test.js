@@ -618,6 +618,84 @@ test('source-incomplete typed review lifecycle is consumed in history, live chat
     }
 });
 
+test('terminal task-bound review lifecycle resyncs canonical verdict without reconnect', async () => {
+    const calls = [];
+    let historyRows = [];
+    const { prior, mount } = installDom(async (url) => {
+        const value = String(url);
+        calls.push(value);
+        if (value.startsWith('/api/chat/history')) {
+            return { ok: true, json: async () => ({ messages: historyRows }) };
+        }
+        return { ok: true, json: async () => ({ active_direct_turns: [] }) };
+    });
+    const handlers = new Map();
+    const ws = {
+        on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
+        isConnected: () => true,
+        send() {},
+    };
+    let generation = 0;
+    const stateSnapshots = {
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        isCurrent: () => true,
+        apply() {},
+    };
+    let instance;
+    try {
+        instance = createChatInstance({
+            ws,
+            state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
+            updateUnreadBadge() {}, stateSnapshots, chatId: 2, idPrefix: 'chat', mountEl: mount,
+            asPanel: true,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const groupId = 'task:live-review:alpha';
+        const lifecycleBase = {
+            kind: 'review', target: 'alpha', job_id: 'job-terminal',
+            group_id: groupId, presentation_owner_task_id: 'live-review',
+        };
+        handlers.get('chat')({
+            chat_id: 2, role: 'system', is_progress: true,
+            task_id: 'skill_lifecycle_review_alpha_job-terminal',
+            progress_meta: { lifecycle: { ...lifecycleBase, status: 'running' } },
+        });
+        const messages = globalThis.document.byId.get('chat-messages');
+        const owner = messages.children.find((node) => node.dataset.taskId === 'live-review');
+        assert.ok(owner, 'source-complete lifecycle attaches to its owner card');
+        const reviewHost = owner.querySelector('[data-live-reviews-host]');
+        assert.match(reviewHost?.innerHTML || '', /running/);
+        const initialHistoryCalls = calls.filter((url) => url.startsWith('/api/chat/history')).length;
+
+        historyRows = [{
+            chat_id: 2, role: 'system', system_type: 'skill_review',
+            task_id: 'review-child', ts: '2026-08-28T00:00:02Z',
+            review_group: {
+                surface: 'skill', id: groupId,
+                presentation_owner_task_id: 'live-review', skill: 'alpha', status: 'clean',
+                attempts: [{ job_id: 'job-terminal', skill: 'alpha', status: 'clean' }],
+            },
+        }];
+        handlers.get('chat')({
+            chat_id: 2, role: 'system', is_progress: true,
+            task_id: 'skill_lifecycle_review_alpha_job-terminal',
+            progress_meta: {
+                lifecycle: { ...lifecycleBase, status: 'succeeded', phase: 'completed' },
+            },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 760));
+        assert.equal(calls.filter((url) => url.startsWith('/api/chat/history')).length, initialHistoryCalls + 1,
+            'terminal lifecycle schedules one debounced canonical history fetch');
+        const refreshedOwner = messages.children.find((node) => node.dataset.taskId === 'live-review');
+        const refreshedReviewHost = refreshedOwner?.querySelector('[data-live-reviews-host]');
+        assert.doesNotMatch(refreshedReviewHost?.innerHTML || '', /Review verdict unavailable/);
+        assert.match(refreshedReviewHost?.innerHTML || '', /clean/i);
+    } finally {
+        instance?.destroy();
+        restoreDom(prior);
+    }
+});
+
 test('duplicate lifecycle pointer never mints a task and enriches only an existing exact owner', async () => {
     const { prior, mount } = installDom();
     const handlers = new Map();
