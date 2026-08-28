@@ -933,15 +933,11 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                 except Exception:
                     log.warning("Failed to terminalize fenced snapshot task %s", task_id, exc_info=True)
                 continue
-            # Never resurrect ordinary terminal rows; retain terminalization markers until task_done is published.
-            # AR2-10 (§8-A1): the intent projection is consulted UNDER the queue lock at
-            # restore — the "no active intent" read and the enqueue form one serialized step
-            # against assignment/drop (same invariant as the pre-assignment consult). Boot-time
-            # and contention-free; _queue_lock is an RLock, so enqueue_task stays re-entrant.
+            # AR2-10 (§8-A1): restore and the intent check share the queue lock.
             with _queue_lock:
                 skip_revival = False
                 try:
-                    existing = load_task_result(DRIVE_ROOT, str(task.get("id")))
+                    existing = load_task_result(DRIVE_ROOT, str(task.get("id")), strict=True)
                     existing_status = str(existing.get("status") or "") if existing else ""
                     # Terminal OR cancel-intent — both must not be resurrected as
                     # pending. Intent lives in the durable projection (phase A);
@@ -955,6 +951,10 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                             # Cancellation custody owns it; never revive a pending row.
                             skip_revival = True
                 except Exception:
+                    if not isinstance(task.get("_terminalization_retry"), dict):
+                        task["_terminalization_retry"] = {"reason": "Pending task result authority is unreadable; dispatch is blocked.", "status": "failed", "trigger": "pending_result_authority", "reconcile_delegate_custody": False}
+                    restore_terminalization_retry(task, pending=PENDING, running=RUNNING, queue_seq_counter_ref=QUEUE_SEQ_COUNTER_REF, sort_pending=sort_pending)
+                    skip_revival = True
                     log.debug("Snapshot restore terminal-status check failed for %s", task.get("id"), exc_info=True)
                 if skip_revival:
                     skipped_terminal += 1
@@ -989,7 +989,7 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                     "blocked_admission": blocked_restore, "invalid_task_depth": invalid_depth_restore,
                 },
             )
-        if restored > 0 or invalid_depth_restore:
+        if restored > 0 or skipped_terminal > 0 or invalid_depth_restore:
             persist_queue_snapshot(reason="queue_restored")
         return restored
     except Exception:

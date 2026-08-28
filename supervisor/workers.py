@@ -1826,14 +1826,14 @@ def _write_failure_result(
         )
         # STATUS_INTERRUPTED is not final; it is written before requeue.
         _FINAL_STATUSES = {STATUS_COMPLETED, STATUS_FAILED, STATUS_REJECTED_DUPLICATE, STATUS_CANCELLED}
-        existing = load_task_result(DRIVE_ROOT, task_id)
+        existing = load_task_result(DRIVE_ROOT, task_id, strict=True)
         if existing and existing.get("status") in _FINAL_STATUSES:
             return str(existing.get("status") or "")
         final_status = status or STATUS_FAILED
         # Reconstruct from durable llm_usage so an abnormally-finalized task does
         # not record zero cost/rounds (understating per-task + campaign metrics).
         f_cost_fields = reconstruct_task_cost(str(task_id), fields=True)
-        write_task_result(
+        stored = write_task_result(
             DRIVE_ROOT,
             task_id,
             final_status,
@@ -1848,7 +1848,16 @@ def _write_failure_result(
             ),
             **f_cost_fields,
         )
-        return final_status
+        persisted_status = str((stored or {}).get("status") or "").strip()
+        if (
+            not isinstance(stored, dict)
+            or str(stored.get("task_id") or "") != str(task_id)
+            or not persisted_status
+        ):
+            raise ValueError(
+                f"failure result writer returned invalid durable identity for {task_id}"
+            )
+        return persisted_status
     except Exception:
         log.warning("Failed to write failure result for task %s", task_id, exc_info=True)
         raise
@@ -1965,9 +1974,169 @@ def _terminalization_retry_spec(task: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _terminalization_retry_request(task: Any) -> Optional[Dict[str, Any]]:
+    """Return the exact terminalization request, finalizing interrupted custody."""
+    spec = _terminalization_retry_spec(task)
+    if spec is None:
+        return None
+    if spec["status"] == "interrupted":
+        spec["status"] = "failed"
+        spec["reason"] = (
+            f"{spec['reason']} Original shutdown status was interrupted; "
+            "the retained terminalization custody was finalized as failed."
+        )
+    return spec
+
+
+def _retry_claim_identity(task: Any, intent: Any) -> bool:
+    """Prove that a marker and claimed intent name the same custody request."""
+    if not isinstance(task, dict) or not isinstance(intent, dict):
+        return False
+    raw = task.get(_TERMINALIZATION_RETRY_FIELD)
+    request_id = str(raw.get("claim_request_id") or "") if isinstance(raw, dict) else ""
+    owner = str(raw.get("claim_owner") or "") if isinstance(raw, dict) else ""
+    if not request_id or owner != "pending_drop":
+        return False
+    if request_id != str(intent.get("request_id") or ""):
+        return False
+    try:
+        int(raw.get("claim_generation"))
+        int(raw.get("claim_pid"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return str(intent.get("claim_owner") or "") == owner
+
+
+def _retry_claim_matches(task: Any, intent: Any) -> bool:
+    """Prove that a refused claim is this process's exact marker claim."""
+    if not _retry_claim_identity(task, intent):
+        return False
+    raw = task.get(_TERMINALIZATION_RETRY_FIELD)
+    try:
+        return (
+            int(raw.get("claim_generation")) == int(intent.get("generation"))
+            and int(raw.get("claim_pid")) == int(intent.get("claim_pid")) == os.getpid()
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _prepare_retry_claim(task: Dict[str, Any], task_id: str) -> Optional[Dict[str, Any]]:
+    """Hold or safely recover a pending-drop claim before terminal retry.
+
+    A live claim owned by another process is never touched.  If the marker names
+    an older claim whose owner is abandoned, ``claim_intent`` performs the
+    atomic generation-fenced takeover; the marker is updated before any later
+    failure can retain it.  The returned claim stays held until the terminal
+    result and event are durable; ``None`` means custody cannot be proven.
+    """
+    if not task_id:
+        return None
+    spec = _terminalization_retry_spec(task)
+    if spec is None or not str(spec.get("trigger") or "").startswith("pending_cancel"):
+        return {}
+    try:
+        from ouroboros.cancel_intents import (
+            active_intents, claim_intent, claim_is_abandoned,
+        )
+        intents = active_intents(DRIVE_ROOT, strict=True)
+    except Exception:
+        log.debug("Pending-drop claim read failed for retry %s", task_id, exc_info=True)
+        return None
+    intent = intents.get(task_id) if isinstance(intents, dict) else None
+    if not isinstance(intent, dict):
+        return {}
+    if intent.get("state") == "requested":
+        try:
+            claim = claim_intent(DRIVE_ROOT, task_id, owner="pending_drop") or {}
+        except Exception:
+            log.warning("Pending-drop claim acquisition failed for retry %s", task_id, exc_info=True)
+            return None
+        if not claim or claim.get("claim_refused"):
+            try:
+                current = active_intents(DRIVE_ROOT, strict=True).get(task_id)
+            except Exception:
+                return None
+            return {} if not isinstance(current, dict) else None
+        task.update(_attach_retry_claim(task, claim))
+        return dict(claim)
+    if intent.get("state") != "claimed":
+        return None
+    claim = intent
+    if not _retry_claim_matches(task, intent):
+        identity = _retry_claim_identity(task, intent)
+        raw_marker = task.get(_TERMINALIZATION_RETRY_FIELD)
+        has_claim_metadata = isinstance(raw_marker, dict) and any(
+            key in raw_marker
+            for key in ("claim_request_id", "claim_owner", "claim_generation", "claim_pid")
+        )
+        if not identity and has_claim_metadata:
+            return None
+        try:
+            abandoned = bool(claim_is_abandoned(intent))
+        except Exception:
+            log.debug("Pending-drop claim liveness failed for retry %s", task_id, exc_info=True)
+            return None
+        if not abandoned:
+            return None
+        try:
+            claim = claim_intent(DRIVE_ROOT, task_id, owner="pending_drop") or {}
+        except Exception:
+            log.warning("Pending-drop claim takeover failed for retry %s", task_id, exc_info=True)
+            return None
+        if not claim or claim.get("claim_refused"):
+            try:
+                current = active_intents(DRIVE_ROOT, strict=True).get(task_id)
+            except Exception:
+                return None
+            return {} if not (isinstance(current, dict) and current.get("state") == "claimed") else None
+        task.update(_attach_retry_claim(task, claim))
+    return dict(claim)
+
+
+def _attach_retry_claim(task: Dict[str, Any], claim: Any) -> Dict[str, Any]:
+    """Copy a retry row and attach only its current fenced claim metadata."""
+    retained = dict(task)
+    raw = retained.get(_TERMINALIZATION_RETRY_FIELD)
+    if not isinstance(raw, dict) or not isinstance(claim, dict):
+        return retained
+    request_id = str(claim.get("request_id") or "")
+    if not request_id:
+        return retained
+    marker = dict(raw)
+    marker["claim_request_id"] = request_id
+    marker["claim_owner"] = str(claim.get("claim_owner") or "pending_drop")
+    try:
+        marker["claim_generation"] = int(claim.get("generation"))
+    except (TypeError, ValueError, OverflowError):
+        marker.pop("claim_generation", None)
+    try:
+        marker["claim_pid"] = int(claim.get("claim_pid"))
+    except (TypeError, ValueError, OverflowError):
+        marker.pop("claim_pid", None)
+    retained[_TERMINALIZATION_RETRY_FIELD] = marker
+    return retained
+
+
+def _attach_retry_event_state(task: Dict[str, Any], event_published: Optional[bool]) -> Dict[str, Any]:
+    """Copy a retry row while recording whether its terminal event was sent."""
+    retained = dict(task)
+    if event_published is None:
+        return retained
+    raw = retained.get(_TERMINALIZATION_RETRY_FIELD)
+    if not isinstance(raw, dict):
+        return retained
+    marker = dict(raw)
+    if event_published or marker.get("event_published"):
+        marker["event_published"] = True
+    retained[_TERMINALIZATION_RETRY_FIELD] = marker
+    return retained
+
+
 def _make_terminalization_retry_task(
     task: Dict[str, Any], task_id: str, *, reason: str, status: str, trigger: str,
-    reconcile_delegate_custody: bool = True,
+    reconcile_delegate_custody: bool = True, claim: Optional[Dict[str, Any]] = None,
+    event_published: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Copy a killed task into durable, non-dispatchable terminalization custody."""
     retry = dict(task) if isinstance(task, dict) else {}
@@ -1983,22 +2152,26 @@ def _make_terminalization_retry_task(
         except (TypeError, ValueError, OverflowError):
             retry.pop("_attempt", None)
     normalized_status = str(status or "failed").strip() or "failed"
-    retry[_TERMINALIZATION_RETRY_FIELD] = {
+    retry_spec = {
         "reason": str(reason or "Worker shutdown terminalization was not durable.")[:2000],
         "status": normalized_status if normalized_status in _TERMINALIZATION_RETRY_STATUSES else "failed",
         "trigger": str(trigger or "terminalization_retry").strip() or "terminalization_retry",
         "reconcile_delegate_custody": bool(reconcile_delegate_custody),
     }
-    return retry
+    if event_published:
+        retry_spec["event_published"] = True
+    retry[_TERMINALIZATION_RETRY_FIELD] = retry_spec
+    return _attach_retry_event_state(_attach_retry_claim(retry, claim), event_published)
 
 
 def _retain_terminalization_retry_task(
     task: Dict[str, Any], task_id: str, *, reason: str, status: str, trigger: str,
-    reconcile_delegate_custody: bool = True,
+    reconcile_delegate_custody: bool = True, claim: Optional[Dict[str, Any]] = None,
+    event_published: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Return retry custody without replacing an existing stronger marker."""
     if isinstance(task, dict) and isinstance(task.get(_TERMINALIZATION_RETRY_FIELD), dict):
-        return dict(task)
+        return _attach_retry_event_state(_attach_retry_claim(task, claim), event_published)
     return _make_terminalization_retry_task(
         task,
         task_id,
@@ -2006,6 +2179,8 @@ def _retain_terminalization_retry_task(
         status=status,
         trigger=trigger,
         reconcile_delegate_custody=reconcile_delegate_custody,
+        claim=claim,
+        event_published=event_published,
     )
 
 
@@ -2049,6 +2224,7 @@ def _terminalization_status_accepted(
 def _settle_terminalization_task(
     task: Dict[str, Any], *, reason: str, status: str, trigger: str,
     reconcile_delegate_custody: bool = True, allow_interrupted: bool = False,
+    event_already_published: bool = False,
 ) -> bool:
     """Write and publish one shutdown outcome, retaining custody on any failure."""
     task_id = str(task.get("id") or "").strip()
@@ -2077,6 +2253,8 @@ def _settle_terminalization_task(
             persisted,
         )
         return False
+    if event_already_published:
+        return True
     try:
         if not _emit_task_done_terminal(task, task_id, str(persisted).strip()):
             log.warning("Failed to emit terminal task_done for %s", task_id)
@@ -2087,48 +2265,93 @@ def _settle_terminalization_task(
     return True
 
 
+def _settle_terminalization_retry_task(
+    task: Dict[str, Any], claim: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Retry a retained marker using its own immutable terminal contract."""
+    request = _terminalization_retry_request(task)
+    if request is None:
+        return False
+    if claim and claim.get("request_id"):
+        try:
+            from ouroboros.cancel_intents import claim_still_owned
+
+            if not claim_still_owned(DRIVE_ROOT, str(task.get("id") or ""), claim):
+                return False
+        except Exception:
+            log.debug("Pending-drop claim ownership check failed", exc_info=True)
+            return False
+    settled = _settle_terminalization_task(
+        task,
+        reason=request["reason"],
+        status=request["status"],
+        trigger=request["trigger"],
+        reconcile_delegate_custody=request["reconcile_delegate_custody"],
+        allow_interrupted=False,
+        event_already_published=bool(
+            isinstance(task.get(_TERMINALIZATION_RETRY_FIELD), dict)
+            and task[_TERMINALIZATION_RETRY_FIELD].get("event_published")
+        ),
+    )
+    if not settled:
+        return False
+    if not claim or not claim.get("request_id"):
+        return True
+    task.update(_attach_retry_event_state(task, True))
+    try:
+        from ouroboros.cancel_intents import active_intents, release_claim
+
+        if release_claim(
+            DRIVE_ROOT,
+            str(task.get("id") or ""),
+            error="terminalization retry completed",
+            expected_generation=claim.get("generation"),
+            request_id=str(claim.get("request_id") or ""),
+        ):
+            return True
+        current = active_intents(DRIVE_ROOT, strict=True).get(str(task.get("id") or ""))
+    except Exception:
+        log.warning("Pending-drop claim release failed after retry %s", task.get("id"), exc_info=True)
+        return False
+    return not (isinstance(current, dict) and current.get("state") == "claimed")
+
+
 def _retry_terminalization_pending() -> Tuple[List[str], List[str]]:
     """Retry retained shutdown rows before any assignment can inspect them."""
-    from ouroboros.task_results import STATUS_FAILED, STATUS_INTERRUPTED
-
     terminalized: List[str] = []
     unresolved: List[str] = []
+    retry_state_changed = False
     survivors: List[Dict[str, Any]] = []
     for task in list(PENDING):
         spec = _terminalization_retry_spec(task)
         if spec is None:
             survivors.append(task)
             continue
+        raw_marker = task.get(_TERMINALIZATION_RETRY_FIELD) if isinstance(task, dict) else None
+        marker_before = dict(raw_marker) if isinstance(raw_marker, dict) else None
         task_id = str(task.get("id") or "").strip() if isinstance(task, dict) else ""
-        retry_status = spec["status"]
-        retry_reason = spec["reason"]
-        if retry_status == STATUS_INTERRUPTED:
-            # ``interrupted`` is the transient status used before an ordinary
-            # crash-requeue.  A terminalization-retry row has no successor
-            # attempt: once its durable write and terminal event both succeed,
-            # retaining that status would leave a non-terminal task with no
-            # queue ownership.  Finalize the recovered custody as an honest
-            # infrastructure failure instead of relying on a later worker-boot
-            # orphan sweep (which cannot prove staleness when this retry runs
-            # after the boot).
-            retry_status = STATUS_FAILED
-            retry_reason = (
-                f"{retry_reason} Original shutdown status was interrupted; "
-                "the retained terminalization custody was finalized as failed."
-            )
-        if not task_id or not _settle_terminalization_task(
-            task,
-            reason=retry_reason,
-            status=retry_status,
-            trigger=spec["trigger"],
-            reconcile_delegate_custody=spec["reconcile_delegate_custody"],
-            allow_interrupted=False,
-        ):
+        retry_claim = _prepare_retry_claim(task, task_id)
+        if retry_claim is None:
             unresolved.append(task_id or "<missing-task-id>")
             survivors.append(task)
         else:
-            terminalized.append(task_id)
+            if not task_id or not _settle_terminalization_retry_task(task, retry_claim):
+                unresolved.append(task_id or "<missing-task-id>")
+                survivors.append(task)
+            else:
+                terminalized.append(task_id)
+        current_marker = task.get(_TERMINALIZATION_RETRY_FIELD) if isinstance(task, dict) else None
+        if marker_before != (dict(current_marker) if isinstance(current_marker, dict) else None):
+            retry_state_changed = True
     PENDING[:] = survivors
+    if retry_state_changed and unresolved:
+        try:
+            from supervisor import queue
+
+            if queue.persist_queue_snapshot(reason="terminalization_retry_state") is not True:
+                log.warning("Failed to persist terminalization retry state")
+        except Exception:
+            log.warning("Failed to persist terminalization retry state", exc_info=True)
     return terminalized, unresolved
 
 
@@ -2432,7 +2655,7 @@ def kill_workers(
     preserve_pending: bool = False,
     preserve_running_task_ids: Optional[set[str]] = None,
     reconcile_delegate_custody: bool = True,
-) -> None:
+) -> bool:
     global _WORKER_POOL_DISABLED_REASON
     from supervisor import queue
     with _queue_lock:
@@ -2441,7 +2664,17 @@ def kill_workers(
             # Publish the admission fence before slow process-tree teardown so
             # concurrent ingress can refuse without starting project/workspace
             # side effects while workers are being joined.
-            queue.persist_queue_snapshot(reason="worker_pool_disabling")
+            try:
+                fence_persisted = queue.persist_queue_snapshot(reason="worker_pool_disabling") is not False
+            except Exception:
+                fence_persisted = False
+                log.warning("Failed to persist worker-pool disable fence", exc_info=True)
+            if not fence_persisted:
+                # No worker or queue mutation happened yet.  Re-open the local
+                # pool admission so an aborted managed update can recover it.
+                _WORKER_POOL_DISABLED_REASON = ""
+                log.error("Worker shutdown blocked: disable fence was not durable")
+                return False
         cleared_running = len(RUNNING)
         from ouroboros.platform_layer import kill_pid_tree
         for w in WORKERS.values():
@@ -2466,6 +2699,7 @@ def kill_workers(
         orphaned_ids = []
         drained_ids = []
         terminalization_retry_ids = []
+        cleanup_ok = True
         try:
             done_status = terminal_status or "failed"
             preserve_running = set(preserve_running_task_ids or ())
@@ -2504,9 +2738,37 @@ def kill_workers(
                 terminalization_retry_ids.append(task_id or "<missing-task-id>")
                 return retry
 
+            def _settle_existing_retry(task: Dict[str, Any]) -> Optional[bool]:
+                """Process a marker without allowing the current kill reason to replace it."""
+                if _terminalization_retry_spec(task) is None:
+                    return None
+                task_id = str(task.get("id") or "").strip()
+                retry_claim = _prepare_retry_claim(task, task_id)
+                if retry_claim is None:
+                    terminalization_retry_ids.append(task_id or "<missing-task-id>")
+                    return False
+                if _settle_terminalization_retry_task(task, retry_claim):
+                    return True
+                terminalization_retry_ids.append(task_id or "<missing-task-id>")
+                return False
+
             for task_id in list(RUNNING):
                 meta = RUNNING.get(task_id) or {}
                 task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
+                existing_retry = next(
+                    (
+                        row for row in PENDING
+                        if isinstance(row, dict) and str(row.get("id") or "") == str(task_id)
+                        and _terminalization_retry_spec(row) is not None
+                    ),
+                    None,
+                )
+                if existing_retry is not None:
+                    if _settle_existing_retry(existing_retry):
+                        PENDING.remove(existing_retry)
+                        orphaned_ids.append(str(task_id))
+                    RUNNING.pop(str(task_id), None)
+                    continue
                 if task_id in preserve_running:
                     successor = dict(task)
                     successor["_attempt"] = int(meta.get("attempt") or task.get("_attempt") or 1) + 1
@@ -2545,7 +2807,7 @@ def kill_workers(
                     # The worker is already dead, but the durable outcome or its
                     # terminal event is not proven. Move the row to a
                     # non-dispatchable retry custody that survives snapshot/boot.
-                    retry_task = _make_terminalization_retry_task(
+                    retry_task = _retain_terminalization_retry_task(
                         task,
                         str(task_id),
                         reason=result_reason,
@@ -2568,6 +2830,13 @@ def kill_workers(
             if preserve_pending:
                 kept = []
                 for task in PENDING:
+                    retry_outcome = _settle_existing_retry(task)
+                    if retry_outcome is not None:
+                        if retry_outcome:
+                            drained_ids.append(str(task.get("id") or ""))
+                        else:
+                            kept.append(task)
+                        continue
                     if str(task.get("id") or "") in preserve_running:
                         kept.append(task)
                         continue
@@ -2598,6 +2867,13 @@ def kill_workers(
                 drained = queue.drain_all_pending(persist=False)
                 for task in drained:
                     tid = str(task.get("id") or "").strip()
+                    retry_outcome = _settle_existing_retry(task)
+                    if retry_outcome is not None:
+                        if retry_outcome:
+                            drained_ids.append(tid)
+                        else:
+                            PENDING.append(task)
+                        continue
                     if _settle_killed_pending(
                         task,
                         reason=result_reason,
@@ -2627,10 +2903,17 @@ def kill_workers(
                     },
                 )
         except Exception:
+            cleanup_ok = False
             log.warning("Zombie prevention cleanup failed", exc_info=True)
         for terminal_id in orphaned_ids:
             RUNNING.pop(str(terminal_id), None)
-    queue.persist_queue_snapshot(reason="kill_workers")
+    try:
+        snapshot_ok = queue.persist_queue_snapshot(reason="kill_workers") is not False
+    except Exception:
+        snapshot_ok = False
+        log.warning("Failed to persist queue snapshot after worker shutdown", exc_info=True)
+    if not snapshot_ok:
+        log.error("Worker shutdown completed without a durable final queue snapshot")
     if cleared_running:
         append_jsonl(
             DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -2640,6 +2923,7 @@ def kill_workers(
                 "force": force,
             },
         )
+    return bool(cleanup_ok and snapshot_ok)
 
 
 @_serialized_worker_lifecycle
@@ -2651,12 +2935,14 @@ def kill_workers_for_update(*, result_reason: str, terminal_status: str = "inter
         fenced = list(WORKERS.values())
     teardown_error = ""
     try:
-        kill_workers(
+        kill_ok = kill_workers(
             result_reason=result_reason,
             terminal_status=terminal_status,
             disable_reason="managed_update",
             preserve_pending=True,
         )
+        if kill_ok is False:
+            teardown_error = "teardown:queue_snapshot_persist_failed"
     except Exception as exc:
         teardown_error = f"teardown:{type(exc).__name__}: {exc}"
     survivors: List[str] = []
@@ -2752,6 +3038,26 @@ def respawn_worker(wid: int) -> bool:
     return True
 
 
+def _persist_pending_terminalization_retries(task_ids: List[str]) -> None:
+    """Record retained pending-terminal rows and make their custody restart-safe."""
+    if not task_ids:
+        return
+    append_jsonl(
+        DRIVE_ROOT / "logs" / "supervisor.jsonl",
+        {"ts": utc_now_iso(), "type": "pending_terminal_event_retry", "task_ids": task_ids},
+    )
+    try:
+        from supervisor import queue
+
+        if not queue.persist_queue_snapshot(reason="pending_terminal_event_retry"):
+            log.warning("Failed to persist pending terminal-event retry custody")
+    except Exception:
+        log.warning(
+            "Failed to persist pending terminal-event retry custody",
+            exc_info=True,
+        )
+
+
 def _drop_cancelled_pending() -> None:
     """Remove pending tasks cancelled/finished between scheduling and assignment
     so a cancelled subagent never actually starts. Caller holds _queue_lock.
@@ -2783,95 +3089,211 @@ def _drop_cancelled_pending() -> None:
         from ouroboros.cancel_intents import (
             active_intents, claim_intent, release_claim, settle_intent,
         )
-
-        intents = active_intents(DRIVE_ROOT)
+        intents = active_intents(DRIVE_ROOT, strict=True)
     except Exception:
-        intents = {}
-        settle_intent = claim_intent = release_claim = None
+        intents = None
+        active_intents = claim_intent = release_claim = settle_intent = None
     try:
         from supervisor.task_lifecycle import _intent_outcome_fields
     except Exception:
         def _intent_outcome_fields(_intent):  # type: ignore[misc]
             return {}
+
+    def _release_pending_claim(tid: str, claim: Dict[str, Any], error: str) -> bool:
+        """Prove that this drop's claim is no longer live after a failed step."""
+        request_id = str(claim.get("request_id") or "")
+        if not request_id:
+            return True
+        try:
+            if release_claim is not None and release_claim(
+                DRIVE_ROOT, tid, error=error,
+                expected_generation=claim.get("generation"), request_id=request_id,
+            ):
+                return True
+        except Exception:
+            log.warning("pending-drop claim release failed for %s", tid, exc_info=True)
+        if active_intents is None:
+            return False
+        try:
+            current = active_intents(DRIVE_ROOT, strict=True).get(tid)
+        except Exception:
+            return False
+        if not isinstance(current, dict) or current.get("state") != "claimed":
+            return True
+        # A changed live claim belongs to another custody owner; it is not proof
+        # that this drop released its own claim.
+        return False
+
+    def _pending_claim_is_ours(tid: str, claim: Dict[str, Any]) -> bool:
+        """Allow publication only while an unresolved claim is still ours."""
+        if not claim or not claim.get("request_id") or active_intents is None:
+            return False
+        try:
+            current = active_intents(DRIVE_ROOT, strict=True).get(tid)
+        except Exception:
+            return False
+        try:
+            return bool(
+                isinstance(current, dict)
+                and current.get("state") == "claimed"
+                and str(current.get("request_id") or "") == str(claim.get("request_id") or "")
+                and int(current.get("generation") or 0) == int(claim.get("generation") or 0)
+                and int(current.get("claim_pid") or 0) == os.getpid()
+                and str(current.get("claim_owner") or "") == "pending_drop"
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def _pending_claim_is_released(tid: str, claim: Dict[str, Any]) -> bool:
+        """Observe that a failed settle already removed the claim."""
+        if not claim or not claim.get("request_id") or active_intents is None:
+            return not claim or not claim.get("request_id")
+        try:
+            current = active_intents(DRIVE_ROOT, strict=True).get(tid)
+        except Exception:
+            return False
+        return not (isinstance(current, dict) and current.get("state") == "claimed")
+
     survivors: List[Dict[str, Any]] = []
     dropped: List[str] = []
     terminalization_retry_ids: List[str] = []
-    for t in PENDING:
-        tid = str(t.get("id") or "")
+    for t in list(PENDING):
+        tid = str(t.get("id") or "") if isinstance(t, dict) else ""
+        marker = _terminalization_retry_spec(t)
+        marker_trigger = str((t.get(_TERMINALIZATION_RETRY_FIELD) or {}).get("trigger") or "") if isinstance(t, dict) else ""
+        # Existing shutdown custody owns its outcome.  Only the cancellation
+        # markers below may re-enter this drop path to recover an intent claim.
+        if marker is not None and not marker_trigger.startswith("pending_cancel"):
+            survivors.append(t)
+            continue
         status = ""
+        authority_error = False
         if tid:
             try:
-                existing = load_task_result(DRIVE_ROOT, tid)
+                existing = load_task_result(DRIVE_ROOT, tid, strict=True)
                 status = str((existing or {}).get("status") or "")
             except Exception:
-                status = ""
-        if tid and (status == STATUS_CANCEL_REQUESTED or tid in intents):
-            # AR2-2 settle-owner unity: the drop CLAIMS the intent before it
-            # settles, the same fence custody holds. A REFUSED claim means a
-            # live custody attempt owns this teardown (it claimed on a capture
-            # miss while the enqueue raced): the task still leaves the queue —
-            # it must not be assigned — but the claim owner writes the terminal,
-            # settles, and emits; a parallel settle here is the double-settle
-            # the fence exists to stop.
+                authority_error = True
+        if authority_error:
+            if marker is not None or not tid:
+                survivors.append(t)
+            else:
+                survivors.append(_make_terminalization_retry_task(
+                    t, tid,
+                    reason="Pending task result authority is unreadable; dispatch is blocked.",
+                    status="failed", trigger="pending_result_authority",
+                    reconcile_delegate_custody=False,
+                ))
+                terminalization_retry_ids.append(tid)
+            continue
+        current_intents = intents
+        if active_intents is not None:
+            try:
+                current_intents = active_intents(DRIVE_ROOT, strict=True)
+            except Exception:
+                current_intents = None
+        if current_intents is None and (marker is not None or status == STATUS_CANCEL_REQUESTED):
+            if marker is None:
+                survivors.append(_make_terminalization_retry_task(
+                    t, tid,
+                    reason="Cancel-intent authority is unreadable; dispatch is blocked.",
+                    status=STATUS_CANCELLED, trigger="pending_cancel_authority",
+                    reconcile_delegate_custody=False,
+                ))
+                terminalization_retry_ids.append(tid)
+            else:
+                survivors.append(t)
+            continue
+        if marker is not None and not (
+            status == STATUS_CANCEL_REQUESTED
+            or (current_intents is not None and tid in current_intents)
+        ):
+            survivors.append(t)
+            continue
+        if tid and (
+            status == STATUS_CANCEL_REQUESTED
+            or (current_intents is not None and tid in current_intents)
+        ):
+            # AR2-2 settle-owner unity: claim before writing.  A marker may carry
+            # the exact claim that this same pending-drop process still owns;
+            # recognize that fenced refusal instead of dropping its custody.
             claim: Dict[str, Any] = {}
-            if claim_intent is not None and tid in intents:
+            if current_intents is not None and tid in current_intents:
+                if claim_intent is None:
+                    survivors.append(t)
+                    continue
                 try:
                     claim = claim_intent(DRIVE_ROOT, tid, owner="pending_drop") or {}
                 except Exception:
                     claim = {"claim_refused": True}
                 if claim.get("claim_refused"):
-                    dropped.append(tid)
+                    if marker is not None and _retry_claim_matches(t, claim):
+                        pass
+                    elif marker is not None:
+                        survivors.append(t)
+                        continue
+                    else:
+                        # A different live custody owner is responsible for the
+                        # terminal result; this row must still never dispatch.
+                        dropped.append(tid)
+                        continue
+            if current_intents is not None and tid in current_intents and not claim:
+                try:
+                    latest = (
+                        active_intents(DRIVE_ROOT, strict=True).get(tid)
+                        if active_intents is not None else None
+                    )
+                except Exception:
+                    latest = {"state": "claimed"}
+                if isinstance(latest, dict):
+                    survivors.append(t)
                     continue
-            intent = claim or intents.get(tid) or {}
+            intent = claim or (current_intents or {}).get(tid) or {}
             try:
                 cost_fields = reconstruct_task_cost(tid, fields=True)
             except Exception:
                 cost_fields = {"cost_accounting_status": "unavailable",
                                "cost_final": False, "cost_usd": None}
-            stored: Dict[str, Any] = {}
-            write_failed = False
             try:
                 stored = write_task_result(
                     DRIVE_ROOT, tid, STATUS_CANCELLED,
+                    strict_existing_dict=True,
                     result="Cancelled before start.", **cost_fields,
                     **_intent_outcome_fields(intent),
                 ) or {}
+                stored_status = str(stored.get("status") or "").strip()
+                if not stored_status:
+                    raise ValueError("cancel result writer returned no durable status")
             except Exception:
-                write_failed = True
                 log.debug("Failed to finalize cancelled pending task %s", tid, exc_info=True)
-            if write_failed:
-                # Nothing durable happened. The task leaves the queue (it must
-                # not be assigned) but the intent stays ACTIVE — the held claim
-                # is RELEASED so the watchdog re-feeds custody, which writes the
-                # real terminal; a settle+task_done here would publish a
-                # cancellation that is not on disk.
-                if release_claim is not None and claim.get("request_id"):
-                    try:
-                        release_claim(
-                            DRIVE_ROOT, tid, error="pending-drop persistence failed",
-                            expected_generation=claim.get("generation"),
-                            request_id=str(claim.get("request_id") or ""),
-                        )
-                    except Exception:
-                        log.debug("pending-drop claim release failed for %s", tid, exc_info=True)
-                dropped.append(tid)
+                released = _release_pending_claim(
+                    tid, claim, "pending-drop persistence failed",
+                )
+                if released:
+                    dropped.append(tid)
+                else:
+                    survivors.append(_retain_terminalization_retry_task(
+                        t, tid,
+                        reason="Cancelled pending task result is not durable and its claim needs recovery.",
+                        status=STATUS_CANCELLED, trigger="pending_cancel_result",
+                        reconcile_delegate_custody=False, claim=claim,
+                    ))
+                    terminalization_retry_ids.append(tid)
                 continue
-            stored_status = str(stored.get("status") or STATUS_CANCELLED)
-            intent_settled = not (settle_intent is not None and tid in intents)
-            if settle_intent is not None and tid in intents:
+            intent_present = isinstance(current_intents, dict) and tid in current_intents
+            # Presence of an active projection is the custody fact; availability
+            # of the settle helper cannot turn a live claim into a settled one.
+            intent_settled = not intent_present
+            claim_released = intent_settled
+            if intent_present and settle_intent is not None:
                 try:
-                    # Fenced by this drop's OWN claim: a settle from a claim that
-                    # was taken over is a no-op plus a forensic row. A
-                    # scope=cascade intent — including one durably WIDENED after
-                    # this loop's snapshot was read — is refused ATOMICALLY
-                    # inside the settle (GR3-1: the cascade postcondition is its
-                    # only settle owner) and this drop's claim is auto-released
-                    # in the same write so the watchdog re-feeds the cascade.
+                    # The durable scope is re-read by settle_intent; cascade
+                    # refusal may auto-release this exact claim and is handled
+                    # as a deferred, replayable intent below.
                     settled_row = settle_intent(
                         DRIVE_ROOT, tid,
-                        outcome="cancelled" if stored_status == STATUS_CANCELLED else "already_settled",
-                        detail=("dropped before assignment" if stored_status == STATUS_CANCELLED
-                                else stored_status),
+                        outcome=("cancelled" if stored_status == STATUS_CANCELLED else "already_settled"),
+                        detail=("dropped before assignment" if stored_status == STATUS_CANCELLED else stored_status),
                         expected_generation=claim.get("generation"),
                         request_id=str(claim.get("request_id") or ""),
                     )
@@ -2879,80 +3301,63 @@ def _drop_cancelled_pending() -> None:
                 except Exception:
                     intent_settled = False
                     log.debug("Failed to settle cancel intent for pending %s", tid, exc_info=True)
-                if not intent_settled and release_claim is not None and claim.get("request_id"):
-                    try:
-                        release_claim(
-                            DRIVE_ROOT, tid,
-                            error="pending-drop intent settlement failed",
-                            expected_generation=claim.get("generation"),
-                            request_id=str(claim.get("request_id") or ""),
-                        )
-                    except Exception:
-                        log.debug("pending-drop intent release failed for %s", tid, exc_info=True)
-            # The STORED status, never a blanket "cancelled": the monotonic guard
-            # refuses our write when the task settled on its own, and the card
-            # must resolve to what actually happened (completion wins).
-            try:
-                event_published = bool(
-                    _emit_task_done_terminal(
-                        t, tid, stored_status, cost_fields=cost_fields,
+                if not intent_settled:
+                    claim_released = _pending_claim_is_released(tid, claim)
+            raw_marker = t.get(_TERMINALIZATION_RETRY_FIELD) if isinstance(t, dict) else {}
+            event_already_published = bool(
+                isinstance(raw_marker, dict) and raw_marker.get("event_published")
+            )
+            claim_unresolved = not intent_settled and not claim_released
+            event_published = event_already_published
+            can_publish = not claim_unresolved or _pending_claim_is_ours(tid, claim)
+            if can_publish and not event_already_published:
+                try:
+                    event_published = bool(
+                        _emit_task_done_terminal(t, tid, stored_status, cost_fields=cost_fields)
                     )
+                except Exception:
+                    event_published = False
+                    log.warning(
+                        "Failed to emit terminal task_done for cancelled pending task %s",
+                        tid, exc_info=True,
+                    )
+            if claim_unresolved and can_publish:
+                claim_released = _release_pending_claim(
+                    tid, claim, "pending-drop intent settlement failed",
                 )
-            except Exception:
-                event_published = False
-                log.warning(
-                    "Failed to emit terminal task_done for cancelled pending task %s",
-                    tid,
-                    exc_info=True,
-                )
-            if event_published:
+                claim_unresolved = not intent_settled and not claim_released
+            if claim_unresolved:
+                survivors.append(_retain_terminalization_retry_task(
+                    t, tid,
+                    reason="Cancelled pending task has an unresolved intent claim.",
+                    status=STATUS_CANCELLED, trigger="pending_cancel_intent",
+                    reconcile_delegate_custody=False, claim=claim,
+                    event_published=event_published,
+                ))
+                terminalization_retry_ids.append(tid)
+            elif event_published:
                 dropped.append(tid)
             else:
-                # The durable result already settled, but publication did not.
-                # Keep a non-dispatchable marker so completion/cancellation
-                # precedence stays intact while task_done is retried.
                 survivors.append(_retain_terminalization_retry_task(
-                    t,
-                    tid,
+                    t, tid,
                     reason="Cancelled pending task has an unpublished terminal event.",
-                    status=STATUS_CANCELLED,
-                    trigger="pending_cancel_event",
-                    reconcile_delegate_custody=False,
+                    status=STATUS_CANCELLED, trigger="pending_cancel_event",
+                    reconcile_delegate_custody=False, claim=claim,
+                    event_published=False,
                 ))
                 terminalization_retry_ids.append(tid)
             continue
-        if status in _TRULY_TERMINAL_STATUSES and _terminalization_retry_spec(t) is None:
+        if status in _TRULY_TERMINAL_STATUSES and marker is None:
             dropped.append(tid)
             continue
         survivors.append(t)
-    if dropped or terminalization_retry_ids:
-        PENDING[:] = survivors
+    PENDING[:] = survivors
     if dropped:
         append_jsonl(
             DRIVE_ROOT / "logs" / "supervisor.jsonl",
             {"ts": utc_now_iso(), "type": "pending_cancelled_dropped", "task_ids": dropped},
         )
-    if terminalization_retry_ids:
-        append_jsonl(
-            DRIVE_ROOT / "logs" / "supervisor.jsonl",
-            {
-                "ts": utc_now_iso(),
-                "type": "pending_terminal_event_retry",
-                "task_ids": terminalization_retry_ids,
-            },
-        )
-        try:
-            from supervisor import queue
-
-            if not queue.persist_queue_snapshot(reason="pending_terminal_event_retry"):
-                log.warning(
-                    "Failed to persist pending terminal-event retry custody",
-                )
-        except Exception:
-            log.warning(
-                "Failed to persist pending terminal-event retry custody",
-                exc_info=True,
-            )
+    _persist_pending_terminalization_retries(terminalization_retry_ids)
 
 
 def _normalize_pending_task_depth(task: Dict[str, Any]) -> str:

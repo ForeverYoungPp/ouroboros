@@ -8,6 +8,8 @@ Covers:
 import json
 from unittest import mock
 
+import pytest
+
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +76,37 @@ def test_write_failure_result_none_task_id(tmp_path):
     results_dir = tmp_path / "task_results"
     if results_dir.exists():
         assert list(results_dir.iterdir()) == [], "Files created for None/empty task_id"
+
+
+def test_write_failure_result_rejects_a_writer_identity_mismatch(tmp_path, monkeypatch):
+    """A terminal writer must return the same task identity it was asked to store."""
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        "ouroboros.task_results.write_task_result",
+        lambda *_args, **_kwargs: {"task_id": "another-task", "status": "completed"},
+    )
+
+    with pytest.raises(ValueError, match="invalid durable identity"):
+        workers._write_failure_result("identity-victim")
+
+
+def test_write_failure_result_returns_status_won_by_a_concurrent_terminal_writer(
+    tmp_path, monkeypatch,
+):
+    """A completion that wins during the pre-read must drive the emitted status."""
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        "ouroboros.task_results.write_task_result",
+        lambda *_args, **_kwargs: {
+            "task_id": "race-victim", "status": "completed", "result": "done",
+        },
+    )
+
+    assert workers._write_failure_result("race-victim") == "completed"
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +223,65 @@ def test_kill_workers_retains_pending_when_failure_result_is_not_durable(
     assert pending[0]["depth"] == -1
     assert snapshots[0][0] == "kill_workers"
     assert snapshots[0][1][0]["_terminalization_retry"] == retry
+
+
+def test_kill_workers_keeps_pending_cancel_custody_when_claim_release_fails(
+    tmp_path, monkeypatch,
+):
+    """Shutdown cannot discard a marker while its cancellation claim is live."""
+    from ouroboros import cancel_intents as ci
+    from ouroboros.task_results import STATUS_CANCELLED, write_task_result
+    import supervisor.workers as workers
+    import supervisor.queue as queue
+
+    pending = []
+    task_id = "kill-cancel-claim"
+    task = {"id": task_id, "chat_id": 0}
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(queue, "RUNNING", {})
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda **_kw: True)
+    write_task_result(tmp_path, task_id, "scheduled")
+    ci.request_cancel(tmp_path, task_id)
+    claim = ci.claim_intent(tmp_path, task_id, owner="pending_drop")
+    task["_terminalization_retry"] = {
+        "status": STATUS_CANCELLED,
+        "reason": "event retry",
+        "trigger": "pending_cancel_event",
+        "reconcile_delegate_custody": False,
+        "claim_request_id": claim["request_id"],
+        "claim_owner": "pending_drop",
+        "claim_generation": claim["generation"],
+        "claim_pid": claim["claim_pid"],
+    }
+    pending.append(task)
+    emitted = []
+    monkeypatch.setattr(workers, "_write_failure_result", lambda *_a, **_k: STATUS_CANCELLED)
+    monkeypatch.setattr(
+        workers, "_emit_task_done_terminal", lambda *a, **_k: emitted.append(a) or True,
+    )
+    real_release = ci.release_claim
+    monkeypatch.setattr(ci, "release_claim", lambda *_a, **_k: False)
+
+    workers.kill_workers(
+        preserve_pending=True,
+        archive_service_logs=False,
+        reconcile_delegate_custody=False,
+    )
+    assert [row["id"] for row in pending] == [task_id]
+    assert pending[0]["_terminalization_retry"]["event_published"] is True
+    assert ci.active_intent(tmp_path, task_id)["state"] == ci.INTENT_CLAIMED
+    assert len(emitted) == 1
+
+    monkeypatch.setattr(ci, "release_claim", real_release)
+    assert workers._retry_terminalization_pending() == ([task_id], [])
+    assert pending == []
+    assert ci.active_intent(tmp_path, task_id)["state"] == ci.INTENT_REQUESTED
+    assert len(emitted) == 1, "the durable event marker suppresses a duplicate"
 
 
 def test_kill_workers_retains_running_custody_when_failure_result_is_not_durable(

@@ -631,16 +631,18 @@ def _generation_mismatch(
 def release_claim(
     drive_root: Any, task_id: str, *, error: str = "",
     expected_generation: Optional[int] = None, request_id: str = "",
-) -> None:
+) -> bool:
     """Return a claimed intent to ``requested`` after a failed custody attempt.
 
     Fenced by ``expected_generation``/``request_id``: a stale claimant's release
     must never revert the claim of the custody attempt that took over from it.
+    Returns ``True`` only when this exact claim was durably reopened; ``False``
+    means the row was absent, already changed, or did not match the fence.
     """
     try:
         tid = _valid_task_id(task_id)
     except ValueError:
-        return
+        return False
     released: Dict[str, Any] = {}
     mismatch: Dict[str, Any] = {}
 
@@ -676,6 +678,7 @@ def release_claim(
             "reason": mismatch.get("_reason"),
             "expected_generation": expected_generation,
         })
+    return bool(released)
 
 
 def settle_intent(

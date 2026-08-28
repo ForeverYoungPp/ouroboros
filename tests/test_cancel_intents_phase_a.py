@@ -63,7 +63,7 @@ def test_claim_settle_and_release_lifecycle(tmp_path):
     assert claimed["generation"] == 1
 
     # A failed custody attempt releases the claim; the watchdog can re-feed it.
-    ci.release_claim(tmp_path, "t2", error="worker refused to die")
+    assert ci.release_claim(tmp_path, "t2", error="worker refused to die") is True
     row = ci.active_intent(tmp_path, "t2")
     assert row["state"] == ci.INTENT_REQUESTED
     assert row["last_error"] == "worker refused to die"
@@ -76,6 +76,8 @@ def test_claim_settle_and_release_lifecycle(tmp_path):
     # Settled rows LEAVE the projection (compactness is the design).
     assert ci.active_intent(tmp_path, "t2") is None
     assert ci.settle_intent(tmp_path, "t2", outcome="cancelled") is None  # idempotent
+
+    assert ci.release_claim(tmp_path, "t2", error="already released") is False
 
     # Claim staleness: a fresh claim is respected; unreadable provenance is stale.
     ci.request_cancel(tmp_path, "t3")
@@ -1317,6 +1319,53 @@ def test_drop_cancelled_pending_releases_a_failed_intent_claim(
     assert emitted == [(task_id, STATUS_CANCELLED), (task_id, STATUS_CANCELLED)]
     intent = ci.active_intent(qenv.drive, task_id)
     assert intent is not None and intent["state"] == ci.INTENT_REQUESTED
+
+
+def test_drop_cancelled_pending_does_not_assume_settled_when_settle_helper_missing(
+    qenv, monkeypatch,
+):
+    """A missing settle helper must retain the active claim for a later retry."""
+    from supervisor import workers
+
+    task_id = "drop-missing-settle"
+    emitted: list[tuple[str, str]] = []
+    monkeypatch.setattr(workers, "PENDING", qenv.q.PENDING, raising=False)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", qenv.drive, raising=False)
+    monkeypatch.setattr(
+        workers,
+        "_emit_task_done_terminal",
+        lambda _task, tid, status, **_kwargs: emitted.append((tid, status)) or True,
+    )
+    monkeypatch.setattr(qenv.q, "persist_queue_snapshot", lambda reason="": True)
+
+    qenv.q.PENDING[:] = [{"id": task_id, "chat_id": 1, "depth": 0}]
+    write_task_result(qenv.drive, task_id, "scheduled")
+    ci.request_cancel(qenv.drive, task_id, reason="parent stopped the plan")
+
+    real_settle = ci.settle_intent
+    real_release = ci.release_claim
+    monkeypatch.setattr(ci, "settle_intent", None)
+    monkeypatch.setattr(ci, "release_claim", lambda *_args, **_kwargs: False)
+
+    workers._drop_cancelled_pending()
+
+    assert [row["id"] for row in qenv.q.PENDING] == [task_id]
+    retry = qenv.q.PENDING[0]["_terminalization_retry"]
+    assert retry["trigger"] == "pending_cancel_intent"
+    assert retry["event_published"] is True
+    intent = ci.active_intent(qenv.drive, task_id)
+    assert intent is not None and intent["state"] == ci.INTENT_CLAIMED
+    assert emitted == [(task_id, STATUS_CANCELLED)]
+
+    # Restore the real helpers: the retained claim and marker can now finish
+    # without emitting a second terminal event.
+    monkeypatch.setattr(ci, "settle_intent", real_settle)
+    monkeypatch.setattr(ci, "release_claim", real_release)
+    assert workers._retry_terminalization_pending() == ([task_id], [])
+    assert qenv.q.PENDING == []
+    intent = ci.active_intent(qenv.drive, task_id)
+    assert intent is not None and intent["state"] == ci.INTENT_REQUESTED
+    assert emitted == [(task_id, STATUS_CANCELLED)]
 
 
 def test_drop_cancelled_pending_leaves_the_intent_open_when_the_write_fails(

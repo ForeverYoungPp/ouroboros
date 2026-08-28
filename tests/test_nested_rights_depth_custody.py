@@ -1,6 +1,7 @@
 """Queue-custody regressions for malformed nested-task depth rows."""
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -70,6 +71,163 @@ def test_interrupted_terminalization_retry_is_finalized_after_worker_boot(
     assert "Original shutdown status was interrupted" in writes[0]["reason"]
     assert load_task_result(tmp_path, "post-boot-interrupted")["status"] == "failed"
     assert load_effective_task_result(tmp_path, "post-boot-interrupted")["status"] == "failed"
+
+
+def test_pending_cancel_retry_recovers_a_dead_claim_after_restart(tmp_path, monkeypatch):
+    """A retained cancellation marker can take over a claim from a dead server."""
+    from ouroboros import cancel_intents as ci
+    from ouroboros.task_results import STATUS_CANCELLED, write_task_result
+    from supervisor import workers
+
+    task_id = "restart-cancel-retry"
+    pending = []
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    write_task_result(tmp_path, task_id, "scheduled")
+    ci.request_cancel(tmp_path, task_id)
+    original_claim = ci.claim_intent(tmp_path, task_id, owner="pending_drop")
+    store = tmp_path / "state" / "cancel_intents.json"
+    data = json.loads(store.read_text(encoding="utf-8"))
+    data["intents"][task_id]["claim_pid"] = 2 ** 22
+    store.write_text(json.dumps(data), encoding="utf-8")
+    task = {
+        "id": task_id,
+        "chat_id": 0,
+        "_terminalization_retry": {
+            "status": STATUS_CANCELLED,
+            "reason": "terminal event was not published",
+            "trigger": "pending_cancel_event",
+            "reconcile_delegate_custody": False,
+            "event_published": True,
+            "claim_request_id": original_claim["request_id"],
+            "claim_owner": "pending_drop",
+            "claim_generation": original_claim["generation"],
+            "claim_pid": 2 ** 22,
+        },
+    }
+    pending.append(task)
+    monkeypatch.setattr(
+        workers, "_write_failure_result",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("temporary result outage")),
+    )
+    emitted = []
+    monkeypatch.setattr(
+        workers, "_emit_task_done_terminal",
+        lambda *args, **_kwargs: emitted.append(args) or True,
+    )
+
+    assert workers._retry_terminalization_pending() == ([], [task_id])
+    recovered = ci.active_intent(tmp_path, task_id)
+    assert recovered["state"] == ci.INTENT_CLAIMED
+    assert recovered["generation"] == original_claim["generation"] + 1
+    assert recovered["claim_pid"] == os.getpid()
+    marker = pending[0]["_terminalization_retry"]
+    assert marker["claim_generation"] == recovered["generation"]
+    assert marker["claim_pid"] == os.getpid()
+
+    monkeypatch.setattr(workers, "_write_failure_result", lambda *_a, **_k: STATUS_CANCELLED)
+    assert workers._retry_terminalization_pending() == ([task_id], [])
+    assert pending == []
+    assert ci.active_intent(tmp_path, task_id)["state"] == ci.INTENT_REQUESTED
+    assert emitted == [], "event_published survives recovery and suppresses a duplicate"
+
+
+def test_pending_cancel_retry_does_not_touch_a_live_foreign_claim(tmp_path, monkeypatch):
+    """A live custody owner keeps its marker and terminal event untouched."""
+    from ouroboros import cancel_intents as ci
+    from ouroboros.task_results import STATUS_CANCELLED, write_task_result
+    from supervisor import workers
+
+    task_id = "foreign-cancel-retry"
+    pending = []
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    write_task_result(tmp_path, task_id, "scheduled")
+    ci.request_cancel(tmp_path, task_id)
+    claim = ci.claim_intent(tmp_path, task_id, owner="pending_drop")
+    store = tmp_path / "state" / "cancel_intents.json"
+    data = json.loads(store.read_text(encoding="utf-8"))
+    data["intents"][task_id]["claim_pid"] = 2 ** 22
+    store.write_text(json.dumps(data), encoding="utf-8")
+    marker = {
+        "status": STATUS_CANCELLED,
+        "reason": "foreign owner is finishing",
+        "trigger": "pending_cancel_result",
+        "reconcile_delegate_custody": False,
+        "claim_request_id": claim["request_id"],
+        "claim_owner": "pending_drop",
+        "claim_generation": claim["generation"],
+        "claim_pid": 2 ** 22,
+    }
+    task = {"id": task_id, "chat_id": 0, "_terminalization_retry": marker}
+    pending.append(task)
+    monkeypatch.setattr(ci, "claim_is_abandoned", lambda *_a, **_k: False)
+    writes, emitted = [], []
+    monkeypatch.setattr(workers, "_write_failure_result", lambda *a, **k: writes.append(a))
+    monkeypatch.setattr(workers, "_emit_task_done_terminal", lambda *a, **k: emitted.append(a))
+
+    assert workers._retry_terminalization_pending() == ([], [task_id])
+    assert writes == [] and emitted == []
+    assert pending[0]["_terminalization_retry"] == marker
+    current = ci.active_intent(tmp_path, task_id)
+    assert current["state"] == ci.INTENT_CLAIMED
+    assert current["generation"] == claim["generation"]
+
+
+def test_pending_cancel_retry_persists_event_marker_when_release_is_unresolved(
+    tmp_path, monkeypatch,
+):
+    """An unresolved claim retry must persist its successful event publication."""
+    from ouroboros import cancel_intents as ci
+    from ouroboros.task_results import STATUS_CANCELLED, write_task_result
+    from supervisor import queue, workers
+
+    pending, running = [], {}
+    queue.init_queue_refs(pending, running, {"value": 0})
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    snapshot_path = tmp_path / "state" / "queue_snapshot.json"
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snapshot_path)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", running)
+    monkeypatch.setattr(queue, "ACCEPTANCE_FENCES", {})
+    monkeypatch.setattr(queue, "BUDGET_ROOT_FENCES", {})
+
+    task_id = "retry-marker-persist"
+    write_task_result(tmp_path, task_id, "scheduled")
+    ci.request_cancel(tmp_path, task_id)
+    claim = ci.claim_intent(tmp_path, task_id, owner="pending_drop")
+    pending.append({
+        "id": task_id,
+        "chat_id": 0,
+        "_terminalization_retry": {
+            "status": STATUS_CANCELLED,
+            "reason": "terminal event was published but claim release failed",
+            "trigger": "pending_cancel_event",
+            "reconcile_delegate_custody": False,
+            "claim_request_id": claim["request_id"],
+            "claim_owner": "pending_drop",
+            "claim_generation": claim["generation"],
+            "claim_pid": claim["claim_pid"],
+        },
+    })
+    queue.persist_queue_snapshot(reason="initial_retry_marker")
+
+    monkeypatch.setattr(
+        workers,
+        "_write_failure_result",
+        lambda tid, *, reason, status: (
+            write_task_result(tmp_path, tid, status, result=reason) and status
+        ),
+    )
+    monkeypatch.setattr(workers, "_emit_task_done_terminal", lambda *_a, **_k: True)
+    monkeypatch.setattr(ci, "release_claim", lambda *_a, **_k: False)
+
+    assert workers._retry_terminalization_pending() == ([], [task_id])
+    persisted = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    marker = persisted["pending"][0]["task"]["_terminalization_retry"]
+    assert marker["event_published"] is True
+    assert ci.active_intent(tmp_path, task_id)["state"] == ci.INTENT_CLAIMED
 
 
 def test_terminalization_retry_restore_survives_durable_result_until_event_published(
@@ -330,6 +488,8 @@ def test_invalid_depth_restore_preserves_unreadable_result_authority(
     assert [row["id"] for row in pending] == [task_id]
     assert pending[0]["depth"] == -1
     assert result_path.read_bytes() == malformed
+    persisted = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert persisted["pending"][0]["task"]["_terminalization_retry"]["trigger"] == "pending_result_authority"
 
     # The retained row is retried by the live quarantine on the next tick;
     # strict terminalization must preserve the same unreadable authority there.
