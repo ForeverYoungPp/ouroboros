@@ -718,10 +718,11 @@ export function mergeReviewGroup(store, incoming) {
     };
     if (staleActiveRegression) {
         merged.state = prior.state;
-        merged.tone = reviewTone(merged.state, merged.verdict, merged.lifecycleStatus);
         merged.verdict = prior.verdict;
         merged.summary = prior.summary;
         merged.activeCount = prior.activeCount;
+        merged.lifecycleStatus = prior.lifecycleStatus;
+        merged.tone = reviewTone(merged.state, merged.verdict, merged.lifecycleStatus);
     }
     const activeAttempts = merged.attempts.filter(
         (attempt) => attempt.state === 'queued' || attempt.state === 'running',

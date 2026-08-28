@@ -194,6 +194,8 @@ test('terminal attempt state is monotonic while a genuinely new attempt restores
     const stale = store.get('task:root:alpha');
     assert.equal(stale.state, 'terminal');
     assert.equal(stale.activeCount, 0);
+    assert.equal(stale.verdict, 'clean');
+    assert.equal(stale.tone, 'done');
     assert.equal(stale.attempts.find((attempt) => attempt.id === 'job-2')?.state, 'terminal');
 
     mergeReviewGroup(store, reviewGroupFromLifecycle({ lifecycle: {
