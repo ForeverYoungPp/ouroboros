@@ -245,6 +245,15 @@ test('first task-bound review hydrates a progress-created owner once and reconci
             return { ok: true, json: async () => ({
                 task_id: 'root-review', status: 'running', cancel_state: 'pending',
                 stop_policy: 'finalize_then_cancel',
+                plan_review_state: {
+                    current_attempt: { fingerprint: 'plan-root-review', status: 'closed' },
+                    waves_omitted: 0,
+                    waves: [{
+                        request_fingerprint: 'plan-root-review',
+                        aggregate: 'GREEN',
+                        closed: true,
+                    }],
+                },
             }) };
         }
         if (String(url).startsWith('/api/tasks/root-synthesis')) {
@@ -319,6 +328,8 @@ test('first task-bound review hydrates a progress-created owner once and reconci
         const pendingCard = messages.children.find((node) => node.dataset.taskId === 'root-review');
         assert.equal(pendingCard, progressCard, 'the review reused the progress-created card');
         assert.ok(pendingCard, 'the review was attached to its explicit owner card');
+        assert.equal(pendingCard.querySelector('[data-live-review-summary]')?.textContent, 'Reviews 2',
+            'the same task-detail read hydrated the resident Plan and live Skill groups');
         assert.equal(pendingCard.dataset.finished, '0');
         assert.equal(pendingCard.querySelector('.chat-live-phase')?.textContent, 'Finalizing…');
         assert.equal(messages.children.some((node) => node.classList.contains('system')), false,

@@ -4040,10 +4040,10 @@ export function createChatInstance({
         try {
             const detail = await fetchTaskDetail(taskId);
             if (destroyed || concludedDirectActivities.has(taskId)) return;
-            // Reconnect/full rebuild may replace the card while this bounded
-            // read is in flight. Reconcile only the current generation.
+            // A reconnect may rebuild the card; reconcile only the current live card generation.
             const currentRecord = liveCardRecords.get(taskId);
             if (!currentRecord || currentRecord.isSubagent || subagentChildParents.has(taskId)) return;
+            attachTaskDetailReviews(taskId, detail);
             // A durable cancel intent must remain visible even when fresher
             // activity proves the task is still alive. The same activity still
             // vetoes every non-pending or terminal detail below.
