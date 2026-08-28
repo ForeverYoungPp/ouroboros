@@ -486,6 +486,9 @@ def _settle_review_attempt(
     with _ACTIVE_LOCK:
         late = bool(entry.timed_out)
         failure_custody = getattr(actor, "usage", None) or {}
+        physical_attempt_state = str(
+            failure_custody.get("physical_attempt_state") or ""
+        )
         pending_invocation = str(failure_custody.get("pending_invocation_id") or "")
         custody_lost = (
             str(getattr(actor, "failure_code", "") or "")
@@ -542,6 +545,13 @@ def _settle_review_attempt(
             )
             and route_value != "agent_session"
             and not pending_invocation
+            and actor.status == "error"
+            and str(getattr(actor, "operation_state", "") or "")
+            not in {"not_dispatched", "in_flight", "custody_lost"}
+            # A late worker can still report a pre-dispatch release after the
+            # logical waiter expired. It is retryable, not a terminal API
+            # outcome; only absent or settled capture can be replayed.
+            and physical_attempt_state in {"", "settled"}
         )
         keyed_terminal_api_error = bool(
             explicit_retry
@@ -559,6 +569,12 @@ def _settle_review_attempt(
             and actor.status == "error"
             and str(getattr(actor, "operation_state", "") or "")
             not in {"not_dispatched", "in_flight", "custody_lost"}
+            # If capture metadata is present, it must prove that the physical
+            # attempt settled. Explicit reserved/released/dispatched/
+            # unresolved states are not terminal API outcomes and must remain
+            # eligible for a real retry. Empty keeps legacy typed actors
+            # replayable when their adapter emitted no capture at all.
+            and physical_attempt_state in {"", "settled"}
         )
         replayable = (
             actor.status in {"ok", "empty"}

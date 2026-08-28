@@ -1518,6 +1518,12 @@ class ReviewCoordinator:
             capture_state = str(getattr(capture, "state", "") or "")
             if capture_state:
                 failure_custody["physical_attempt_state"] = capture_state
+            operation_state = (
+                "not_dispatched"
+                if capture_state in {"reserved", "released"}
+                or str(getattr(exc, "code", "") or "") == "deadline_exhausted"
+                else "settled"
+            )
             return ReviewActorRecord(
                 slot_id=slot.slot_id,
                 model=slot.model,
@@ -1531,6 +1537,7 @@ class ReviewCoordinator:
                 prompt_ref=prompt_ref,
                 response_ref=response_ref,
                 duration_sec=round(time.time() - start, 3),
+                operation_state=operation_state,
             )
 
     def _emit_usage(

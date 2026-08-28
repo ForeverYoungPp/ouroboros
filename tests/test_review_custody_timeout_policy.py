@@ -843,3 +843,116 @@ def test_not_dispatched_error_remains_retryable_for_same_cycle(tmp_path):
     assert [actor.operation_state for actor in second] == ["not_dispatched"]
     assert calls == ["only", "only"]
     assert not getattr(ctx, "_review_settled_attempts", {})
+
+
+@pytest.mark.parametrize("physical_state", ["reserved", "released"])
+def test_pre_dispatch_capture_state_remains_retryable_for_same_cycle(
+    tmp_path, physical_state,
+):
+    """Explicit pre-dispatch capture facts must not become sticky replay rows."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import run_custodied_review_slots
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    calls = []
+    ctx = SimpleNamespace()
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id=f"retryable-{physical_state}",
+        retry_key=f"plan_review:retryable-{physical_state}:1",
+    )
+    slot = ReviewSlot(
+        slot_id="only", model="test/model", route=ReviewRouteKind.API_CHAT,
+        timeout_sec=0.2,
+    )
+
+    def run_slot(slot, operation_id, _retry_state, _deadline, _checkpoint):
+        calls.append(slot.slot_id)
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error",
+            error="pre-dispatch failure", operation_id=operation_id,
+            usage={"physical_attempt_state": physical_state},
+        )
+
+    def error_actor(slot, error, operation_id="", operation_state="settled"):
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error", error=error,
+            operation_id=operation_id, operation_state=operation_state,
+        )
+
+    args = dict(
+        request=request, slots=[slot], usage_ctx=ctx, task_id=request.task_id,
+        usage_meta={},
+        review_usage_scope=UsageScope(drive_root=tmp_path, task_id=request.task_id),
+        run_slot=run_slot, error_actor=error_actor,
+    )
+    first = run_custodied_review_slots(**args)
+    second = run_custodied_review_slots(**args)
+
+    assert [actor.operation_state for actor in first] == ["settled"]
+    assert [actor.operation_state for actor in second] == ["settled"]
+    assert calls == ["only", "only"]
+    assert not getattr(ctx, "_review_settled_attempts", {})
+
+
+def test_late_pre_dispatch_capture_state_remains_retryable_for_same_cycle(tmp_path):
+    """A late worker release must not become a sticky replay row either."""
+    import threading
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import run_custodied_review_slots
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    calls = []
+    late_started = threading.Event()
+    release_late = threading.Event()
+    late_finished = threading.Event()
+    ctx = SimpleNamespace()
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="late-retryable-release",
+        retry_key="plan_review:late-retryable-release:1",
+    )
+    slot = ReviewSlot(
+        slot_id="only", model="test/model", route=ReviewRouteKind.API_CHAT,
+        timeout_sec=0.01,
+    )
+
+    def run_slot(slot, operation_id, _retry_state, _deadline, _checkpoint):
+        calls.append(slot.slot_id)
+        if len(calls) == 1:
+            late_started.set()
+            assert release_late.wait(1.0)
+            late_finished.set()
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error",
+            error="pre-dispatch failure", operation_id=operation_id,
+            usage={"physical_attempt_state": "released"},
+        )
+
+    def error_actor(slot, error, operation_id="", operation_state="settled"):
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error", error=error,
+            operation_id=operation_id, operation_state=operation_state,
+        )
+
+    args = dict(
+        request=request, slots=[slot], usage_ctx=ctx, task_id=request.task_id,
+        usage_meta={},
+        review_usage_scope=UsageScope(drive_root=tmp_path, task_id=request.task_id),
+        run_slot=run_slot, error_actor=error_actor,
+    )
+    first = run_custodied_review_slots(**args)
+    assert [actor.operation_state for actor in first] == ["in_flight"]
+    assert late_started.wait(1.0)
+    release_late.set()
+    assert late_finished.wait(1.0)
+    assert not getattr(ctx, "_review_settled_attempts", {})
+
+    second = run_custodied_review_slots(**args)
+    assert [actor.operation_state for actor in second] == ["settled"]
+    assert calls == ["only", "only"]
+    assert not getattr(ctx, "_review_settled_attempts", {})

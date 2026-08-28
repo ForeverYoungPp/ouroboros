@@ -1906,9 +1906,12 @@ Before every commit, verify the following:
   terminal 408/429/5xx is settled and may use the surface's bounded retry/repair
   rail. During a mixed plan/commit cycle, the typed settled terminal API actor
   remains in the exact cycle's replay roster even when optional physical-attempt
-  capture metadata is absent; an identical envelope never buys that actor twice,
-  and a new retry cycle uses a new key. A `$0` `not_dispatched` refusal remains
-  retryable rather than becoming a sticky replay actor.
+  capture metadata is absent; when that metadata is present it must say `settled`,
+  while explicit `reserved`, `released`, `dispatched`, or `unresolved` states stay
+  retryable rather than becoming sticky replay rows. An identical envelope never
+  buys that actor twice, and a new retry cycle uses a new key. A `$0`
+  `not_dispatched` refusal remains retryable rather than becoming a sticky replay
+  actor.
   A dispatched request whose socket or stream ends without terminal
   provider evidence is `provider_outcome_unknown`: no same-model, fallback,
   provider, local-server, or forced-final resend until custody settles.
