@@ -44,6 +44,14 @@ def test_execution_wire_uses_returned_usage_only_and_allowlists_fields():
     ]) == [{"kind": "api", "model": "m"}]
 
 
+def test_empty_receipt_placeholders_do_not_mint_api_execution_badges():
+    assert review_executions_from_actor_usage([
+        {"usage": {"ledger_attempt_ids": []}},
+        {"usage": {"provider": "", "resolved_model": None}},
+        {"usage": {"ledger_attempt_ids": [""]}},
+    ]) == []
+
+
 def test_task_acceptance_public_actors_carry_only_actual_executions():
     projection = compact_review_projection([{
         "request": {

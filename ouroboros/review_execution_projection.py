@@ -17,6 +17,23 @@ _API_EXECUTION_RECEIPT_KEYS = frozenset({
 })
 
 
+def _has_receipt_value(value: Any) -> bool:
+    """Return whether a receipt field carries a non-placeholder value."""
+    if value is None or value == "":
+        return False
+    if isinstance(value, (list, tuple, set, dict)):
+        return any(_has_receipt_value(item) for item in value)
+    return True
+
+
+def _has_api_execution_receipt(usage: Dict[str, Any]) -> bool:
+    """Require at least one substantive allowlisted API receipt fact."""
+    return any(
+        key in usage and _has_receipt_value(usage.get(key))
+        for key in _API_EXECUTION_RECEIPT_KEYS
+    )
+
+
 def normalize_review_executions(value: Any) -> List[Dict[str, str]]:
     """Allowlist the tiny public execution wire and deduplicate it stably."""
     out: List[Dict[str, str]] = []
@@ -56,7 +73,7 @@ def review_executions_from_actor_usage(actors: Any) -> List[Dict[str, str]]:
                 "kind": "harness", "harness_id": delegated_route,
                 **({"model": model} if model else {}),
             })
-        elif any(key in usage for key in _API_EXECUTION_RECEIPT_KEYS):
+        elif _has_api_execution_receipt(usage):
             executions.append({"kind": "api", **({"model": model} if model else {})})
     return normalize_review_executions(executions)
 
