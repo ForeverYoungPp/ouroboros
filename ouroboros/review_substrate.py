@@ -1366,7 +1366,8 @@ class ReviewCoordinator:
         recovery_token = str(
             (retry_state or {}).get("pending_invocation_id") or ""
         ).strip()
-        exact_recovery = bool(recovery_token and str(operation_id or "").strip())
+        exact_recovery = bool(recovery_token and str(operation_id or "").strip()
+            and str(getattr(slot.route, "value", slot.route) or "") == "agent_session")
         if not exact_recovery and owner_deadline_exhausted(
             deadline_at=owner_deadline, reserve_sec=get_finalization_grace_sec(),
         ):

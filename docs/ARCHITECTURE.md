@@ -2081,13 +2081,18 @@ classification; with such a status they are retained as terminal actors for
 same-cycle replay, never as a second physical send. Physical custody is proved
 by the capture/operation state, not by the synthetic operation id alone, so an
 explicit `$0` `not_dispatched` row stays frozen and retryable. A retry rail is
-monotonic: a later released reservation or budget refusal cannot erase an
+monotonic. A positive `settled`/`dispatched`/`unresolved` capture outranks a
+contradictory synthetic `not_dispatched` label; only `reserved`/`released`
+proves pre-dispatch, and `usage_accounting` owns the state vocabulary. A later
+released reservation or budget refusal cannot erase an
 earlier dispatch; an earlier unknown outcome remains custody-lost/no-resend,
 while a preserved terminal status may replay. Frozen rows carry the typed
 failure and capture facts needed to make that decision after reconciliation. A
 retry token without a durable invocation is custody-lost before route health or
 project registration for every delegated review surface except the separately
-owned Skill Review restart contract. A new
+owned Skill Review restart contract. A durable token is valid only for its
+recorded delegated surface, slot, and operation; an API row cannot use one to
+impersonate delegated recovery. A new
 retry cycle uses a new identity. Send-time VLM
 captioning keeps its direct 90-second provider cap. Explicit VLM helpers order
 their nested bounds as provider, killable child, then a ToolEntry minimum by

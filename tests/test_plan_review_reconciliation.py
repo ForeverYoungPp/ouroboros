@@ -6,6 +6,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from tests.test_plan_review_engine import (
     CLEAN,
     _call,
@@ -179,6 +181,102 @@ def test_in_flight_wave_defers_need_evidence_until_terminal_reconciliation(
     assert state["need_evidence_seen"] == ["notes.md"]
 
 
+@pytest.mark.parametrize(
+    ("actors", "custody_pending"),
+    [
+        (["CORRUPT-ROW"], True),
+        ([{
+            "slot_id": "s1", "operation_id": "op-s1",
+            "operation_state": "settled", "late_result_pending": False,
+            "status": "error", "error": "unknown custody",
+            "usage": {"physical_attempt_state": "future_state"},
+        }], False),
+    ],
+)
+def test_malformed_paid_wave_cannot_bypass_resume_validation(
+    harness, monkeypatch, actors, custody_pending,
+):
+    """Malformed exact custody must not fall through to a fresh paid cycle."""
+    from ouroboros.tools import plan_review as plan_review_tool
+
+    calls = []
+    _install_two_turn_substrate(monkeypatch, calls)
+    ctx = harness.make_ctx()
+    first = _call(ctx)
+    assert _control(first) == {"outcome": "DEGRADED", "closed": False}
+    assert len(calls) == 1
+
+    materialize = plan_review_tool._authority_wave
+
+    def malformed_authority(*args, **kwargs):
+        wave = dict(materialize(*args, **kwargs))
+        wave.update({
+            "actors": actors, "paid": True,
+            "custody_pending": custody_pending,
+            "aggregate": "DEGRADED", "closed": False, "health_epoch": [],
+        })
+        return wave
+
+    monkeypatch.setattr(plan_review_tool, "_authority_wave", malformed_authority)
+    second = _call(ctx)
+
+    assert len(calls) == 1
+    assert second.startswith("ERROR: PLAN_REVIEW_CUSTODY_INVALID:")
+    assert "Refusing" in second
+
+
+def test_contradictory_positive_capture_reenters_custody_instead_of_fresh_cycle(
+    harness, monkeypatch,
+):
+    """A synthetic $0 label cannot erase a positive physical-attempt fact."""
+    import ouroboros.review_custody as review_custody
+    from ouroboros.tools import plan_review as plan_review_tool
+
+    calls = []
+    _install_two_turn_substrate(monkeypatch, calls)
+    ctx = harness.make_ctx()
+    first = _call(ctx)
+    assert _control(first) == {"outcome": "DEGRADED", "closed": False}
+    assert len(calls) == 1
+
+    materialize = plan_review_tool._authority_wave
+
+    def contradictory_authority(*args, **kwargs):
+        wave = dict(materialize(*args, **kwargs))
+        wave.update({
+            "actors": [{
+                "slot_id": "s1", "operation_id": "op-s1",
+                "operation_state": "not_dispatched", "late_result_pending": False,
+                "status": "not_dispatched", "error": "synthetic refusal",
+                "usage": {
+                    "physical_attempt_state": "unresolved",
+                    "provider_status_code": 503,
+                },
+            }, {
+                "slot_id": "s2", "operation_id": "op-s2-free",
+                "operation_state": "not_dispatched", "status": "not_dispatched",
+                "error": "frozen $0 refusal",
+            }, {
+                "slot_id": "s3", "operation_id": "op-s3-free",
+                "operation_state": "not_dispatched", "status": "not_dispatched",
+                "error": "frozen $0 refusal",
+            }],
+            "paid": True, "custody_pending": False,
+            "aggregate": "DEGRADED", "closed": False, "health_epoch": [],
+        })
+        return wave
+
+    monkeypatch.setattr(plan_review_tool, "_authority_wave", contradictory_authority)
+    monkeypatch.setattr(
+        review_custody, "review_retry_custody_available", lambda **_kwargs: False,
+    )
+    second = _call(ctx)
+
+    assert len(calls) == 1
+    assert _control(second) == {"outcome": "DEGRADED", "closed": False}
+    assert "process-local custody is unavailable" in second
+
+
 def test_resume_excludes_synthetic_not_dispatched_operation_ids(tmp_path):
     """A pre-dispatch $0 row has an operation id, but is not a callable lane."""
     from ouroboros.tools.plan_review_artifacts import in_flight_resume_inputs
@@ -207,6 +305,31 @@ def test_resume_excludes_synthetic_not_dispatched_operation_ids(tmp_path):
 
     assert result["dispatched_slot_ids"] == ["s1"]
     assert [row["slot_id"] for row in result["frozen_rows"]] == ["s2"]
+
+
+def test_resume_counts_positive_capture_despite_synthetic_not_dispatched(tmp_path):
+    """Positive physical custody outranks contradictory synthetic $0 labels."""
+    from ouroboros.tools.plan_review_artifacts import in_flight_resume_inputs
+
+    result = in_flight_resume_inputs(
+        {
+            "actors": [{
+                "slot_id": "s1", "operation_id": "op-paid",
+                "operation_state": "not_dispatched", "status": "not_dispatched",
+                "error": "synthetic refusal",
+                "usage": {
+                    "physical_attempt_state": "unresolved",
+                    "provider_status_code": 503,
+                },
+            }],
+        },
+        {}, tmp_path, "contradictory-resume", [
+            SimpleNamespace(slot_id="s1", model="model/one"),
+        ],
+    )
+
+    assert result["dispatched_slot_ids"] == ["s1"]
+    assert result["frozen_rows"] == []
 
 
 def test_resume_rejects_non_object_rows_in_exact_paid_roster(tmp_path):

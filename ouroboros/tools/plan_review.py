@@ -586,9 +586,10 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         existing, state, state_root, task_id, configured_slots,
     ) if resume_in_flight else {}
     if resume.get("error"):
-        return _render_wave(
-            existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
-            cached=True, reminder="\n".join(x for x in (reminder, resume["error"]) if x),
+        return _plan_unavailable(
+            ctx,
+            "ERROR: PLAN_REVIEW_CUSTODY_INVALID: " + str(resume["error"]),
+            "plan_review_custody_invalid",
         )
     previous = resume.get("previous") if resume_in_flight else (
         previous_override if previous_override is not None else _last_paid_wave(state)

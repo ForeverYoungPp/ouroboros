@@ -29,6 +29,8 @@ from ouroboros.utils import utc_now_iso
 PLAN_REVIEW_MAX_TOKENS = 65536
 PLAN_RAW_TEXT_PREVIEW_CHARS = 2_000
 from ouroboros.tools.plan_review_artifacts import (  # noqa: E402, F401 - compatibility imports
+    PHYSICAL_ATTEMPT_STATES,
+    POSITIVE_PHYSICAL_ATTEMPT_STATES,
     persist_wave as persist_plan_review_wave_artifact,
     read_wave as read_plan_review_wave_artifact,
 )
@@ -928,11 +930,39 @@ def plan_wave_replay_decision(slots_fn: Any, existing: Dict[str, Any]) -> tuple:
 
 
 def plan_wave_has_in_flight(wave: Dict[str, Any]) -> bool:
+    """Whether a paid wave must re-enter exact custody reconciliation.
+
+    The durable summary and malformed physical facts are conservative ingress
+    signals: they must reach ``in_flight_resume_inputs`` so its exact-roster
+    validator can fail closed instead of falling through to a fresh paid cycle.
+    """
+    if bool(wave.get("custody_pending")):
+        return True
+    actors = wave.get("actors")
+    malformed_roster = (
+        not isinstance(actors, list)
+        or not actors
+        or any(not isinstance(actor, dict) for actor in actors)
+    )
+    if malformed_roster:
+        return bool(wave.get("paid"))
+    for actor in actors or []:
+        physical_state = str(actor.get("physical_attempt_state") or "").strip().lower()
+        if not physical_state and isinstance(actor.get("usage"), dict):
+            physical_state = str(
+                actor["usage"].get("physical_attempt_state") or ""
+            ).strip().lower()
+        if physical_state and physical_state not in PHYSICAL_ATTEMPT_STATES:
+            return True
+        if physical_state in POSITIVE_PHYSICAL_ATTEMPT_STATES and (
+            str(actor.get("operation_state") or "").strip().lower() == "not_dispatched"
+            or str(actor.get("status") or "").strip().lower() == "not_dispatched"
+        ):
+            return True
     return any(
         str(actor.get("operation_state") or "") == "in_flight"
         or bool(actor.get("late_result_pending"))
-        for actor in (wave.get("actors") or [])
-        if isinstance(actor, dict)
+        for actor in actors or []
     )
 
 

@@ -785,8 +785,6 @@ def _retire_orphaned_review_registration(
         ),
     })
     return retired
-
-
 @dataclass(frozen=True)
 class SessionInvocation:
     """WHO is asking and HOW it should be delivered, as one immutable value.
@@ -871,7 +869,9 @@ def run_delegated_review_session(
         route, project_id, existing_project, key, schema_asked = (
             review_recovery_facts(
                 record, run_request, started_custody, prompt=prompt, root=root,
-                claimant_task_id=task_id)
+                claimant_task_id=task_id, claimant_surface=surface,
+                claimant_slot_id=slot_id,
+                claimant_operation_id=str(invocation.operation_id or ""))
         )
         thread_id = str(run_request.get("_thread_id") or thread_id)
         use_thread = bool(thread_id or run_request.get("_use_thread"))

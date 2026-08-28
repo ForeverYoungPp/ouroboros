@@ -13,10 +13,9 @@ import json
 import pathlib
 from typing import Any, Dict, List, Optional
 
-
-_KNOWN_PHYSICAL_ATTEMPT_STATES = {
-    "reserved", "released", "settled", "dispatched", "unresolved",
-}
+from ouroboros.usage_accounting import (
+    PHYSICAL_ATTEMPT_STATES, POSITIVE_PHYSICAL_ATTEMPT_STATES,
+)
 
 
 def persist_wave(drive_root: Any, task_id: str, wave: Dict[str, Any]) -> Dict[str, Any]:
@@ -98,16 +97,16 @@ def _row_has_physical_dispatch(row: Dict[str, Any]) -> bool:
     # not evidence that the synthetic operation id was free.  Keep it on the
     # paid side until the caller rejects the row rather than laundering it into
     # a $0 pre-dispatch refusal.
-    if physical_state and physical_state not in _KNOWN_PHYSICAL_ATTEMPT_STATES:
+    if physical_state and physical_state not in PHYSICAL_ATTEMPT_STATES:
         return True
-    # Explicit $0 states always win over the synthetic operation id assigned by
-    # the host before it knows whether a provider call was admitted.
-    if operation_state == "not_dispatched" or status == "not_dispatched":
-        return False
     if physical_state in {"reserved", "released"}:
         return False
-    if physical_state in {"dispatched", "settled", "unresolved"}:
+    if physical_state in POSITIVE_PHYSICAL_ATTEMPT_STATES:
         return True
+    # With no physical capture, an explicit $0 state wins over the synthetic
+    # operation id assigned before provider admission.
+    if operation_state == "not_dispatched" or status == "not_dispatched":
+        return False
     # Pre-B1 rows did not carry a physical state. Their non-$0 operation id is
     # the only durable evidence available, so retain that compatibility path.
     return True
@@ -155,7 +154,7 @@ def in_flight_resume_inputs(
             physical_state = str(
                 row["usage"].get("physical_attempt_state") or ""
             ).strip().lower()
-        if physical_state and physical_state not in _KNOWN_PHYSICAL_ATTEMPT_STATES:
+        if physical_state and physical_state not in PHYSICAL_ATTEMPT_STATES:
             return {"error": (
                 "The prior paid cycle contains an unknown physical-attempt state. "
                 "Refusing to infer custody from malformed reviewer facts."

@@ -528,7 +528,7 @@ def test_coordinator_rejoins_exact_recovery_after_spent_owner_deadline(
     from ouroboros.review_custody import (
         merge_frozen_review_reconciliation, prepare_frozen_review_reconciliation,
     )
-    from ouroboros.review_execution import ReviewAttemptResult, ReviewRouteKind
+    from ouroboros.review_execution import ReviewAttemptResult
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
 
     class RecoveringExecutor:
@@ -584,7 +584,7 @@ def test_coordinator_rejoins_exact_recovery_after_spent_owner_deadline(
         request,
         slots=[ReviewSlot(
             slot_id="slot-1", model="test/model",
-            route=ReviewRouteKind.AGENT_SESSION,
+            route="agent_session",
         )],
         drive_root=tmp_path,
         usage_ctx=ctx,

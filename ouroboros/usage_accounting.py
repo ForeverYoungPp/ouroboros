@@ -23,7 +23,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Callable, Dict, Iterator, Literal, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, Literal, Optional, Sequence, Tuple, get_args
 
 from ouroboros.pricing import estimate_cost_optional
 from ouroboros._usage_response import _reported_token_count, usage_from_response
@@ -65,6 +65,7 @@ __all__ = (
     "AttemptRequest", "AttemptReservation", "BudgetExceeded", "PhysicalAttemptCapture",
     "PhysicalAttemptContext", "PhysicalAttemptLimitExceeded", "PhysicalAttemptPreconditionFailed",
     "PhysicalAttemptPreparationFailed",
+    "PhysicalAttemptState", "PHYSICAL_ATTEMPT_STATES", "POSITIVE_PHYSICAL_ATTEMPT_STATES",
     "UsageAccountingError", "UsageLedgerCorrupt", "UsageScope", "capture_attempt_ids",
     "bind_physical_attempt_context", "current_physical_attempt_context",
     "current_physical_attempt_predicate", "current_usage_scope",
@@ -234,8 +235,6 @@ class AttemptRequest:
     candidate_context_size_bytes: Optional[int] = None
     candidate_measurement_kind: Literal["canonical_json_v1", "opaque"] = "opaque"
     physical_context: Optional[PhysicalAttemptContext] = None
-
-
 @dataclass(frozen=True)
 class AttemptReservation:
     attempt_id: str
@@ -243,14 +242,15 @@ class AttemptReservation:
     model: str
     provider: str
     reservation_upper_bound_usd: Optional[float]
-
-
+PhysicalAttemptState = Literal["reserved", "released", "dispatched", "settled", "unresolved"]
+PHYSICAL_ATTEMPT_STATES = frozenset(get_args(PhysicalAttemptState))
+POSITIVE_PHYSICAL_ATTEMPT_STATES = frozenset({"settled", "dispatched", "unresolved"})
 @dataclass(frozen=True)
 class PhysicalAttemptCapture:
     attempt_id: str
     model: str
     provider: str
-    state: Literal["reserved", "released", "dispatched", "settled", "unresolved"]
+    state: PhysicalAttemptState
     candidate_measurement_kind: Literal["canonical_json_v1", "opaque"]
     max_completion_tokens: int = 0
     candidate_raw_sha256: Optional[str] = None

@@ -22,6 +22,9 @@ from typing import Any, Callable, Dict, List, Optional
 from ouroboros.deadline_utils import review_operation_timeout_sec
 from ouroboros.observability import new_call_id
 from ouroboros.review_dispatch import slot_id_for_row
+from ouroboros.usage_accounting import (
+    PHYSICAL_ATTEMPT_STATES, POSITIVE_PHYSICAL_ATTEMPT_STATES,
+)
 from ouroboros.utils import emit_cognitive_operation_event
 
 log = logging.getLogger("review_custody")
@@ -45,11 +48,8 @@ _ACTIVE: Dict[str, ActiveReviewAttempt] = {}
 # not the full actor/prompt, until process exit.
 _NO_RESEND: Dict[str, str] = {}
 _PENDING_STATES = {"in_flight", "custody_lost"}
-_KNOWN_PHYSICAL_CAPTURE_STATES = {
-    "", "reserved", "released", "settled", "dispatched", "unresolved",
-}
 _PHYSICAL_CAPTURE_STATES = {"", "settled", "dispatched", "unresolved"}
-_POSITIVE_CAPTURE_STATES = {"settled", "dispatched", "unresolved"}
+_POSITIVE_CAPTURE_STATES = POSITIVE_PHYSICAL_ATTEMPT_STATES
 
 
 @dataclass
@@ -71,7 +71,7 @@ class _ReviewAttemptHistory:
             except Exception:
                 capture = None
         state = str(getattr(capture, "state", "") or "").strip().lower()
-        if state and state not in _KNOWN_PHYSICAL_CAPTURE_STATES:
+        if state and state not in PHYSICAL_ATTEMPT_STATES:
             # A malformed non-empty capture cannot prove that no request was
             # admitted.  Preserve the strongest safe interpretation across the
             # whole retry rail, so a later exception/status cannot authorize a
@@ -120,7 +120,7 @@ def _review_exception_projection(
     capture = getattr(exc, "physical_attempt_capture", None)
     capture_state = str(getattr(capture, "state", "") or "").strip().lower()
     malformed_capture = bool(
-        capture_state and capture_state not in _KNOWN_PHYSICAL_CAPTURE_STATES
+        capture_state and capture_state not in PHYSICAL_ATTEMPT_STATES
     )
     if malformed_capture:
         # Unknown capture values are custody loss, even when the exception also
@@ -192,7 +192,7 @@ def _worker_exception_operation_state(
     code = str(getattr(exc, "code", "") or "")
     capture = getattr(exc, "physical_attempt_capture", None)
     capture_state = str(getattr(capture, "state", "") or "").strip().lower()
-    if capture_state and capture_state not in _KNOWN_PHYSICAL_CAPTURE_STATES:
+    if capture_state and capture_state not in PHYSICAL_ATTEMPT_STATES:
         return "custody_lost"
     if capture_state in _POSITIVE_CAPTURE_STATES:
         return "settled"
@@ -766,7 +766,7 @@ def _settle_review_attempt(
         ).strip().lower()
         malformed_physical_state = bool(
             physical_attempt_state
-            and physical_attempt_state not in _KNOWN_PHYSICAL_CAPTURE_STATES
+            and physical_attempt_state not in PHYSICAL_ATTEMPT_STATES
         )
         if malformed_physical_state:
             # Treat malformed provenance as an unknown paid outcome.  A typed
@@ -803,9 +803,23 @@ def _settle_review_attempt(
             actor.failure_code = "provider_outcome_unknown"
         if malformed_physical_state and hasattr(actor, "http_status"):
             actor.http_status = None
-        not_dispatched = str(
-            getattr(actor, "operation_state", "") or ""
-        ) == "not_dispatched"
+        positive_physical_custody = physical_attempt_state in _POSITIVE_CAPTURE_STATES
+        synthetic_not_dispatched = (
+            str(getattr(actor, "operation_state", "") or "").strip().lower()
+            == "not_dispatched"
+            or str(getattr(actor, "status", "") or "").strip().lower()
+            == "not_dispatched"
+        )
+        not_dispatched = synthetic_not_dispatched and not positive_physical_custody
+        if positive_physical_custody and str(
+            getattr(actor, "status", "") or ""
+        ).strip().lower() == "not_dispatched":
+            actor.status = "error"
+            if not str(getattr(actor, "error", "") or ""):
+                actor.error = (
+                    "Positive physical-attempt custody contradicted a synthetic "
+                    "not-dispatched status"
+                )
         actor.operation_id = entry.operation_id
         actor.operation_state = (
             "custody_lost" if custody_lost else
@@ -932,6 +946,8 @@ def run_custodied_review_slots(
         nonlocal paid_stamped
         key = _attempt_key(request, slot)
         slot_id = str(getattr(slot, "slot_id", "") or "")
+        route = getattr(slot, "route", "")
+        route_value = str(getattr(route, "value", route) or "")
         reserved_surface = (getattr(usage_ctx, "_review_reserved_operations", {}) or {}).get(
             str(getattr(request, "surface", "") or ""), {}
         )
@@ -968,7 +984,12 @@ def run_custodied_review_slots(
                     cached_actor = _frozen_actor(frozen_row, slot)
             retry_token = str(retry_state.get("pending_invocation_id") or "")
             retry_operation_id = str(retry_state.get("operation_id") or "")
-            exact_recovery = bool(retry_token and retry_operation_id)
+            # Only delegated sessions have a durable invocation token that can
+            # rejoin work after process-local custody is gone. An API row with
+            # such a token is malformed state, not permission for a fresh send.
+            exact_recovery = bool(
+                retry_token and retry_operation_id and route_value == "agent_session"
+            )
             retry_payload = dict(retry_state)
             retry_payload.pop("operation_id", None)
             if cached_actor is not None:
