@@ -717,6 +717,24 @@ def _prepare_applied_settings(
         ) from exc
     if not isinstance(template, dict):
         raise CyberGymIntegrationUnavailable("settings template must contain a JSON object")
+    # The template is intentionally credential-free.  ``build_isolated_settings``
+    # derives grants from declared slots, and its general-purpose provider planner
+    # retains a dormant Claude default for compatibility.  Accepting a custom
+    # template that already contains a provider secret would therefore make a
+    # single-OpenRouter CyberGym run reach a second provider.  Refuse before the
+    # artifact is written; never copy or print the value.
+    from ouroboros.provider_models import ALL_PROVIDER_CREDENTIAL_KEYS
+
+    provider_fields = set(ALL_PROVIDER_CREDENTIAL_KEYS) | {"GIGACHAT_PROFANITY_CHECK"}
+    supplied_provider_fields = sorted(
+        key for key in provider_fields
+        if str(template.get(key) or "").strip()
+    )
+    if supplied_provider_fields:
+        raise CyberGymIntegrationUnavailable(
+            "CyberGym settings template must not carry provider credentials/fields: "
+            + ", ".join(supplied_provider_fields)
+        )
     from devtools.benchmarks.common.manifests import (
         model_slot_snapshot,
         provider_credential_disclosure,
@@ -744,6 +762,11 @@ def _prepare_applied_settings(
         "OUROBOROS_WEBSEARCH_MODEL": model,
         "OUROBOROS_SCOPE_REVIEW_MODELS": model,
         "OUROBOROS_SCOPE_REVIEW_MODEL": model,
+        # These are Claude Agent SDK transport names, not routed model slots. Keep
+        # them explicitly empty so a parent process cannot resurrect the optional
+        # advisory transport in an applied CyberGym snapshot.
+        "CLAUDE_CODE_MODEL": "",
+        "CLAUDE_AGENT_SDK_MODEL": "",
         # One routed reviewer is the explicit single-model campaign contract.
         # Keeping the legacy projection in sync prevents a stale three-row
         # value from shadowing the structured panel in older consumers.
@@ -819,7 +842,14 @@ def _prepare_applied_settings(
     if provider_order:
         provider["order"] = list(provider_order)
     overrides["OUROBOROS_OR_PROVIDER"] = json.dumps(provider, separators=(",", ":"))
-    applied = build_isolated_settings(template, **overrides)
+    # The structured panel explicitly disables the optional Claude SDK advisory
+    # route. Preserve the generic planner's default-fallback semantics elsewhere,
+    # but do not let an empty transport field resurrect an Anthropic grant here.
+    applied = build_isolated_settings(
+        template,
+        include_claude_sdk_defaults=False,
+        **overrides,
+    )
     output_path = out_root / "settings_applied.json"
     write_json(output_path, applied)
     model_slots = model_slot_snapshot(output_path, env_overrides=False)
@@ -854,7 +884,11 @@ def _prepare_applied_settings(
         "provider_probe_required": True,
         "provider_policy_complete": bool(provider_only or provider_order),
         "provider_credentials": provider_credential_disclosure(
-            output_path
+            output_path,
+            runtime_credentials={
+                "OPENROUTER_API_KEY": os.environ.get("OPENROUTER_API_KEY", ""),
+            },
+            include_claude_sdk_defaults=False,
         ),
         "effective_overrides": {
             key: overrides[key]

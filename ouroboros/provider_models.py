@@ -210,18 +210,25 @@ def resolve_credentialed_model(default_model: str) -> str:
     return default_model
 
 
-def declared_model_settings(settings: dict) -> dict[str, str]:
+def declared_model_settings(
+    settings: dict,
+    *,
+    include_claude_sdk_defaults: bool = True,
+) -> dict[str, str]:
     """Return the model slots a settings mapping DECLARES, with runtime defaults filled in.
 
     An absent or empty slot is not "unused": the server falls back to
     ``config.SETTINGS_DEFAULTS`` for it, so the default's provider is genuinely reachable and
-    must be declared.  Lazy config import (config imports this module)."""
+    must be declared.  Benchmark profiles that explicitly disable the Claude SDK transport may
+    set ``include_claude_sdk_defaults=False``; explicit non-empty Claude SDK values remain
+    declared, while an empty disabled slot does not resurrect the global Claude default.
+    Lazy config import (config imports this module)."""
     from ouroboros.config import SETTINGS_DEFAULTS
 
     declared: dict[str, str] = {}
     for key in (*MODEL_SETTING_KEYS, *CLAUDE_SDK_MODEL_SETTING_KEYS):
         value = str((settings or {}).get(key) or "").strip()
-        if not value:
+        if not value and include_claude_sdk_defaults:
             value = str(SETTINGS_DEFAULTS.get(key) or "").strip()
         if value:
             declared[key] = value
@@ -268,14 +275,28 @@ ALL_PROVIDER_CREDENTIAL_KEYS: frozenset[str] = frozenset(
 )
 
 
-def provider_credential_plan(settings: dict) -> dict:
+def provider_credential_plan(
+    settings: dict,
+    *,
+    include_claude_sdk_defaults: bool = True,
+) -> dict:
     """Derive WHICH provider credentials a settings mapping's declared models actually need.
 
     Returns ``{declared_model_slots, providers, planned_keys, fail_open}``.  ``fail_open`` is
     the disclosed escape hatch: when nothing resolves (a settings mapping with no model slot
     at all) the plan is the FULL credential universe, because a benchmark that dies on a
-    missing key at hour six is worse than one that carries a spare."""
-    declared = declared_model_settings(settings)
+    missing key at hour six is worse than one that carries a spare.  The optional
+    ``include_claude_sdk_defaults`` switch is for an explicit profile that has disabled that
+    transport; the default remains backward-compatible with runtime fallback semantics."""
+    if include_claude_sdk_defaults:
+        # Keep the historical call shape for embedders that monkeypatch this
+        # pure helper (and preserve the default-runtime contract byte-for-byte).
+        declared = declared_model_settings(settings)
+    else:
+        declared = declared_model_settings(
+            settings,
+            include_claude_sdk_defaults=False,
+        )
     providers = providers_for_declared_models(declared)
     planned = credential_keys_for_providers(providers)
     fail_open = not planned

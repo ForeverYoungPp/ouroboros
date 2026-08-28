@@ -632,6 +632,8 @@ def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):
     assert applied["OUROBOROS_REVIEW_ENFORCEMENT"] == "advisory"
     assert applied["OUROBOROS_REVIEW_MAX_CYCLES"] == "2"
     assert applied["OUROBOROS_SAFETY_MODE"] == "off"
+    assert applied["CLAUDE_CODE_MODEL"] == ""
+    assert applied["CLAUDE_AGENT_SDK_MODEL"] == ""
     assert applied["OUROBOROS_EFFORT_TASK"] == "high"
     assert applied["OUROBOROS_EFFORT_REVIEW"] == "max"
     assert applied["OUROBOROS_EFFORT_SCOPE_REVIEW"] == "max"
@@ -641,6 +643,36 @@ def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):
     assert len(reviewers.triad) == len(reviewers.scope) == 1
     assert all(row.effort == "max" for row in (*reviewers.triad, *reviewers.scope))
     assert reviewers.advisory.enabled is False
+
+
+def test_applied_settings_reject_provider_credentials_in_custom_template(tmp_path):
+    from types import SimpleNamespace
+
+    from devtools.benchmarks.cybergym.run_cybergym import _prepare_applied_settings
+
+    template = tmp_path / "settings-with-secret.json"
+    template.write_text(
+        json.dumps({
+            "OUROBOROS_MODEL": OFFICIAL_MODEL,
+            "ANTHROPIC_API_KEY": "must-not-be-copied",
+        }),
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "run"
+    output_root.mkdir()
+    with pytest.raises(CyberGymIntegrationUnavailable, match="provider credentials"):
+        _prepare_applied_settings(
+            template,
+            output_root,
+            SimpleNamespace(
+                model=OFFICIAL_MODEL,
+                budget_usd=3500,
+                timeout_sec=4,
+                max_rounds=1000,
+                per_task_cost_usd=20,
+            ),
+        )
+    assert not (output_root / "settings_applied.json").exists()
 
 
 def test_launcher_row_counts_do_not_count_planned_as_completed():

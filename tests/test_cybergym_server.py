@@ -80,6 +80,103 @@ def test_rootless_wrapper_injects_selected_socket(monkeypatch, tmp_path):
     assert isinstance(delegate._delegate, IsolatedServer)
 
 
+def test_rootless_wrapper_makes_applied_settings_authoritative(monkeypatch, tmp_path):
+    seed, _commit = _seed_repo(tmp_path)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "OPENROUTER_API_KEY": "",
+        "OUROBOROS_MODEL": "deepseek/deepseek-v4-flash-0731",
+        "CLAUDE_CODE_MODEL": "",
+        "OUROBOROS_RUNTIME_MODE": "pro",
+    }), encoding="utf-8")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "ambient-router")
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-openai")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-anthropic")
+    monkeypatch.setenv("OUROBOROS_MODEL", "ambient/model")
+    monkeypatch.setenv("CLAUDE_AGENT_SDK_MODEL", "ambient-claude")
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+
+    delegate = _RootlessIsolatedServer(
+        seed,
+        tmp_path / "data",
+        settings,
+        docker_host=_host(),
+        provider_key="selected-router",
+        settings_authoritative_env=True,
+    )
+    env = delegate._env()
+
+    assert env["OPENROUTER_API_KEY"] == "selected-router"
+    assert "OPENAI_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "OUROBOROS_MODEL" not in env
+    assert "CLAUDE_AGENT_SDK_MODEL" not in env
+    assert "OUROBOROS_RUNTIME_MODE" not in env
+    assert env["DOCKER_HOST"] == _host().value
+
+
+def test_authoritative_env_scrubs_legacy_and_future_runtime_overrides(monkeypatch, tmp_path):
+    seed, _commit = _seed_repo(tmp_path)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "OUROBOROS_MODEL": "deepseek/deepseek-v4-flash-0731",
+        "OUROBOROS_RUNTIME_MODE": "pro",
+    }), encoding="utf-8")
+    inherited = {
+        "OUROBOROS_MODEL_CODE": "legacy-code",
+        "OUROBOROS_VISION_MODEL": "legacy-vision",
+        "OUROBOROS_MODEL_FALLBACK": "legacy-fallback",
+        "OUROBOROS_EFFORT_TASK": "low",
+        "OUROBOROS_RUNTIME_MODE": "light",
+        "OUROBOROS_SAFETY_MODE": "full",
+        "OUROBOROS_CONTEXT_MODE": "low",
+        "OUROBOROS_REVIEW_MODELS": "wrong/reviewer",
+        "OUROBOROS_MAX_ROUNDS": "7",
+        "OUROBOROS_MAX_WORKERS": "1",
+        "OUROBOROS_SUBAGENT_HARNESS": "cursor",
+        "USE_LOCAL_HEAVY": "true",
+        "USE_LOCAL_CODE": "true",
+        "CLAUDE_AGENT_SDK_MODEL": "ambient-claude",
+        "OPENAI_BASE_URL": "https://ambient.invalid/v1",
+        "OUROBOROS_FUTURE_RUNTIME_SWITCH": "ambient",
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+
+    delegate = _RootlessIsolatedServer(
+        seed,
+        tmp_path / "data",
+        settings,
+        docker_host=_host(),
+        provider_key="selected-router",
+        settings_authoritative_env=True,
+    )
+    env = delegate._env()
+
+    for key in inherited:
+        assert key not in env, key
+    assert env["OPENROUTER_API_KEY"] == "selected-router"
+    assert env["OUROBOROS_APP_ROOT"] == str(seed.parent)
+    assert "PATH" in env
+
+
+def test_authoritative_server_refuses_unreadable_settings_before_spawn(monkeypatch, tmp_path):
+    seed, _commit = _seed_repo(tmp_path)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{not-json", encoding="utf-8")
+    from devtools.benchmarks.common.server_runner import IsolatedServer
+
+    server = IsolatedServer(
+        seed,
+        tmp_path / "data",
+        settings,
+        settings_authoritative_env=True,
+    )
+    with pytest.raises(RuntimeError, match="settings snapshot is unreadable"):
+        server.start()
+    assert server.proc is None
+
+
 def test_rootless_wrapper_start_does_not_recurse_when_delegate_calls_env(monkeypatch, tmp_path):
     seed, _commit = _seed_repo(tmp_path)
     host = _host()
@@ -123,9 +220,13 @@ def test_start_exposes_attested_base_url_and_closes(tmp_path):
     seed, commit = _seed_repo(tmp_path)
     seen = {}
 
-    def factory(*args, **kwargs):
-        seen["args"] = args
-        seen["kwargs"] = kwargs
+    def factory(seed_repo, data_root, settings_path, *, docker_host, provider_key, provider_key_env):
+        seen["args"] = (seed_repo, data_root, settings_path)
+        seen["kwargs"] = {
+            "docker_host": docker_host,
+            "provider_key": provider_key,
+            "provider_key_env": provider_key_env,
+        }
         fake = _FakeServer()
         fake.attestation = {"repo_head": commit, "runtime_version": "test-version"}
         return fake

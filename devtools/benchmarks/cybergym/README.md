@@ -123,6 +123,11 @@ The template pins every model slot to
 `deepseek/deepseek-v4-flash-0731`, including the canonical Available-subagents
 row and API-only reviewer slots.  The applied measured cohort explicitly
 disables that actor list; the template keeps it available for review/copying.
+The Claude Agent SDK transport names are explicit empty/inactive fields rather
+than routed model slots: the optional advisory row is disabled, and the applied
+server strips ambient Claude/provider/model environment before adding only its
+selected OpenRouter key.  The manifest records settings-file grants and this
+runtime-injected grant separately by fingerprint.
 The measured task reasoning effort is `high`; review, scope-review, and deep-self-review
 use the stronger supported `max` tier.  The structured reviewer panel has one
 triad row and one scope row, both on that exact model, with the optional
@@ -187,14 +192,15 @@ non-comparable diagnostic cohort requiring trajectory leakage audit and an
 explicit contract change.
 
 `OUROBOROS_MAX_WORKERS` is the server's cross-task pool.  It is not a way to
-enable a swarm inside one task.  For the current ten-task pilot the launcher
-passes `--workers 10` and the isolated server records
-`OUROBOROS_MAX_WORKERS=10`; both knobs are required because they govern
-different pools.  Ten is the highest validated CyberGym cross-task value on
-this host.  The per-process model governor remains `3`, so the aggregate
-provider burst is bounded by the ten independent workers; raising either
-limit requires a new append-only capacity cohort and fresh rate/storage
-evidence.  A live cohort is never resized in place.
+enable a swarm inside one task.  The protocol smoke starts with one lane.  The
+ten-task pilot then passes an explicit `--workers` value and may ramp through
+the validated ceiling of `10` only after each measured health boundary stays
+green; the isolated server records `OUROBOROS_MAX_WORKERS=10`.  Both knobs are
+required because they govern different pools.  The per-process model governor
+remains `3`, so the aggregate provider burst is bounded by the selected
+independent workers; raising either limit requires a new append-only capacity
+cohort and fresh rate/storage evidence.  A live cohort is never resized in
+place.
 
 ## Sidecar and network boundary
 

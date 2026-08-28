@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 
@@ -405,28 +405,54 @@ def model_slot_snapshot(settings_path: pathlib.Path | None = None, *,
     return slots
 
 
-def provider_credential_disclosure(settings_path: pathlib.Path | None = None) -> dict[str, Any]:
+def provider_credential_disclosure(
+    settings_path: pathlib.Path | None = None,
+    *,
+    runtime_credentials: Mapping[str, Any] | None = None,
+    include_claude_sdk_defaults: bool = True,
+) -> dict[str, Any]:
     """Record WHICH provider credentials the described server can reach — by fingerprint.
 
     ``model_slots`` already says which models a run declared; this says which providers it
     could actually have spent on, which is not the same fact and is the one a routing
-    fallback can falsify. Reads the settings FILE only: an isolated benchmark server loads
-    its provider credentials from the sanitized settings.json (see
-    ``server_runner.build_isolated_settings``), not from the launcher's own environment.
+    fallback can falsify. The settings-file grant and an explicitly injected runtime grant
+    are reported as separate fingerprint maps: a benchmark may keep a long-lived key out of
+    its persisted settings while passing it to one server process. Values are never returned.
     An absent/unreadable settings path yields ``{"available": False}`` — a stated gap, never
     a silently empty grant list."""
-    from devtools.benchmarks.common.secrets import isolated_credential_grants
+    from devtools.benchmarks.common.secrets import credential_disclosure, isolated_credential_grants
+    from ouroboros.provider_models import ALL_PROVIDER_CREDENTIAL_KEYS
+
+    runtime_granted: dict[str, dict[str, Any]] = {}
+    if runtime_credentials is not None:
+        selected = {
+            str(key): value
+            for key, value in runtime_credentials.items()
+            if str(key) in ALL_PROVIDER_CREDENTIAL_KEYS
+        }
+        runtime_granted = credential_disclosure(selected, sorted(selected))
+
+    def with_runtime(payload: dict[str, Any]) -> dict[str, Any]:
+        if runtime_credentials is not None:
+            payload["runtime_granted"] = runtime_granted
+        return payload
 
     path = pathlib.Path(settings_path) if settings_path else None
     if not path or not path.exists():
-        return {"available": False, "reason": "settings_path_absent"}
+        return with_runtime({"available": False, "reason": "settings_path_absent"})
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {"available": False, "reason": "settings_unreadable"}
+        return with_runtime({"available": False, "reason": "settings_unreadable"})
     if not isinstance(loaded, dict):
-        return {"available": False, "reason": "settings_not_an_object"}
-    return {"available": True, **isolated_credential_grants(loaded)}
+        return with_runtime({"available": False, "reason": "settings_not_an_object"})
+    return with_runtime({
+        "available": True,
+        **isolated_credential_grants(
+            loaded,
+            include_claude_sdk_defaults=include_claude_sdk_defaults,
+        ),
+    })
 
 
 class BenchmarkAdmissionRefused(RuntimeError):

@@ -235,15 +235,23 @@ class CyberGymIsolatedServer:
             return self
         self.prepare()
         factory = self._server_factory
+        factory_kwargs = {
+            "docker_host": self.docker_host,
+            "provider_key": self.provider_key,
+            "provider_key_env": self.provider_key_env,
+        }
         if factory is None:
             factory = _RootlessIsolatedServer
+            # CyberGym's applied snapshot is authoritative. The default wrapper
+            # adds the selected OpenRouter key after the common runner removes
+            # ambient provider/model settings. Custom test factories retain their
+            # historical call contract and do not need this implementation detail.
+            factory_kwargs["settings_authoritative_env"] = True
         self._server = factory(
             self.clone_root,
             self.data_root,
             self.settings_path,
-            docker_host=self.docker_host,
-            provider_key=self.provider_key,
-            provider_key_env=self.provider_key_env,
+            **factory_kwargs,
         )
         try:
             self._server.start(ready_timeout=ready_timeout)

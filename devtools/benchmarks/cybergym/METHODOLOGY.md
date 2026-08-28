@@ -121,6 +121,13 @@ pinned to that exact string:
 * the one API triad reviewer row; and
 * the one API scope reviewer row.
 
+`CLAUDE_CODE_MODEL` and `CLAUDE_AGENT_SDK_MODEL` are Claude-transport names,
+not alternate routed model slots.  They are explicitly empty in the applied
+snapshot; the optional advisory reviewer is disabled.  The CyberGym server
+uses that snapshot as its environment authority and injects only the selected
+OpenRouter credential at runtime.  The manifest records the file grant and
+runtime grant separately by fingerprint, without storing the key.
+
 The applied task reasoning effort is `high`, because the CyberGym task wire
 and result validator require that literal value.  Review, scope-review, and
 deep-self-review use the core's supported `max` tier.  The reviewer panel is
@@ -244,10 +251,11 @@ create a separate diagnostic cohort with an explicit trajectory leakage audit,
 not a silent setting flip in this result.
 
 `OUROBOROS_MAX_WORKERS` is a cross-task server worker pool.  It is not a
-within-task swarm switch.  The current pilot passes `--workers 10` to the
-adapter and applies `OUROBOROS_MAX_WORKERS=10` to the server.  The adapter cap
-of 10 is the highest validated value for this host; the model governor's cap
-of 3 is process-local, not global. Any higher worker/governor setting is a new
+within-task swarm switch.  The protocol smoke starts with one lane; the
+ten-task pilot passes an explicit `--workers` value and ramps only across
+measured green boundaries, up to the validated ceiling of 10.  The server
+applies `OUROBOROS_MAX_WORKERS=10`.  The model governor's cap of 3 is
+process-local, not global. Any higher worker/governor setting is a new
 append-only capacity cohort requiring fresh provider, Docker, network and disk
 validation. A live cohort is never resized.
 
@@ -570,10 +578,12 @@ to each item below from source and artifacts alone:
 1. Is the source commit, dataset revision, `tasks.json` hash, and source order
    recorded and verified?
 2. Is the seed clean, and are all four Ouroboros roots outside live data?
-3. Does the applied settings file pin every active model slot and high effort,
-   with no local/legacy-heavy route?
+3. Does the applied settings file pin every active routed model slot, use task
+   effort `high`, use review/scope/deep-self effort `max`, and have no
+   local/legacy-heavy route or active Claude SDK slot?
 4. Does the provider manifest distinguish the template JSON from the live
-   probed `only`/`order` JSON and include observed telemetry?
+   probed `only`/`order` JSON, include observed telemetry, and disclose both
+   persisted and runtime-injected credential grants by fingerprint?
 5. Are depth zero and the current delegation/web/MCP disabled-tool names
    present in the task contract and manifest?
 6. Does the sidecar use the explicit rootless daemon and labelled internal
@@ -583,7 +593,7 @@ to each item below from source and artifacts alone:
 8. Are raw issue-15 exits preserved, including timeout `300`, and are all
    requested tasks represented in the denominator?
 9. Are four-hour task ceilings, shorter smoke timeout, cross-task ramp, one
-    campaign ledger, explicit per-task reservation, and USD 3,500 stop visible?
+   campaign ledger, explicit per-task reservation, and USD 3,500 stop visible?
 10. Are unknown cost, late results, setup failures, secrets, and cleanup
     attestations handled without silent deletion or relabeling?
 
