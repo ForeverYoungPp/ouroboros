@@ -106,12 +106,32 @@ test('a slow first read says it is checking, and an idle daemon is not dressed a
 });
 
 test('the login card explains foreground runtime preparation and retries the same intent', () => {
+    // No status snapshot: the card IS mid-check but has no phase evidence —
+    // the honest generic, never the old "Installing or checking" hedge.
     const preparing = loginCardHtml({
         harness: 'claude', profile: '', envelope: null, preparingRuntime: true,
         error: '', verdict: null, confirming: false,
     });
-    assert.ok(preparing.includes('Installing or checking Claudexor…'));
+    assert.ok(preparing.includes('Checking Claudexor…'));
+    assert.ok(!preparing.includes('Installing or checking'));
     assert.ok(!preparing.includes('data-login-retry'));
+
+    // The status snapshot names the phase: a minutes-long install says so.
+    const installing = loginCardHtml({
+        harness: 'claude', profile: '', envelope: null, preparingRuntime: true,
+        error: '', verdict: null, confirming: false,
+    }, Date.now(), { statusPayload: {
+        daemon: { state: 'unreachable', runtime: { state: 'installing', target_version: '3.3.14' } },
+    } });
+    assert.ok(installing.includes('Installing Claudexor 3.3.14…'));
+
+    const starting = loginCardHtml({
+        harness: 'claude', profile: '', envelope: null, preparingRuntime: true,
+        error: '', verdict: null, confirming: false,
+    }, Date.now(), { statusPayload: {
+        daemon: { state: 'stale', runtime: { state: 'ready' } },
+    } });
+    assert.ok(starting.includes('Starting the Claudexor daemon…'));
 
     const failed = loginCardHtml({
         harness: 'claude', profile: '', envelope: null, preparingRuntime: false,
@@ -119,7 +139,7 @@ test('the login card explains foreground runtime preparation and retries the sam
     });
     assert.ok(failed.includes('checksum mismatch'));
     assert.ok(failed.includes('data-login-retry'));
-    assert.ok(!failed.includes('Installing or checking Claudexor…'));
+    assert.ok(!failed.includes('Checking Claudexor…'));
 });
 
 // GOLDEN fixture: the real /v2/credential-profiles body, produced by PARSING a
