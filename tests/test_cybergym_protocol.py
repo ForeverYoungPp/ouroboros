@@ -439,6 +439,13 @@ def test_run_campaign_records_terminal_total_accounted_bound_not_residual(tmp_pa
     assert projected["cost_upper_bound_usd"] == pytest.approx(0.060914)
     assert projected["cost_upper_bound_usd"] != pytest.approx(0.020062)
     assert _terminal_gateway_accounting(
+        {
+            "status": "failed",
+            "cost_usd": 0.001,
+            "cost_breakdown": {"accounted_upper_bound_usd": 0.060914},
+        }
+    )["cost_upper_bound_usd"] == pytest.approx(0.060914)
+    assert _terminal_gateway_accounting(
         {"status": "failed", "unresolved_upper_bound_usd": 0.020062}
     ) == {}
     assert _terminal_gateway_accounting(

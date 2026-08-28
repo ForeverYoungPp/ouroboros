@@ -1543,8 +1543,18 @@ def _terminal_gateway_accounting(payload: Mapping[str, Any] | None) -> dict[str,
                     return source[name]
         return None
 
+    def first_preferred_name(*names: str) -> Any:
+        # Prefer the authoritative total field across every response view
+        # before consulting the deprecated cost_usd alias.  A top-level alias
+        # must not hide a fuller cost_breakdown total.
+        for name in names:
+            for source in sources:
+                if name in source and source[name] is not None:
+                    return source[name]
+        return None
+
     total: float | None = None
-    total_raw = first_value("accounted_upper_bound_usd", "cost_usd")
+    total_raw = first_preferred_name("accounted_upper_bound_usd", "cost_usd")
     if total_raw is not None:
         try:
             total = _money(total_raw, field="accounted_upper_bound_usd")
