@@ -131,6 +131,18 @@ _WORKSPACE_TOOL_GUIDANCE = (
     "(equivalently `bash ./submit.sh ./final.poc` in a shell)."
 )
 
+# The core external-workspace dispatcher currently treats an absolute backend
+# spelling such as ``/workspace/final.poc`` as the relative host path
+# ``workspace/final.poc``.  CyberGym's container mount is intentionally fixed
+# at ``/workspace`` and the benchmark prompt uses that spelling, so the adapter
+# installs a confined alias in each generated workspace.  The alias is adapter
+# metadata, not a second output tree: ``workspace -> .`` makes both spellings
+# resolve to the same inode without copying or fabricating the final PoC.
+_WORKSPACE_BACKEND_ALIAS_NAME = "workspace"
+_WORKSPACE_BACKEND_ALIAS_TARGET = "."
+_WORKSPACE_BACKEND_ALIAS_EXCLUDE = f"/{_WORKSPACE_BACKEND_ALIAS_NAME}"
+_WORKSPACE_BACKEND_ALIAS_SCHEMA = "ouroboros.benchmark.cybergym.workspace_backend_alias.v1"
+
 # The rootless Docker daemon deliberately does not publish ports from an
 # ``--internal`` bridge.  Keep host-side private API calls on that same
 # internal segment by executing this fixed, dependency-free Python transport
@@ -1110,6 +1122,90 @@ def _write_json(path: pathlib.Path, value: Mapping[str, Any]) -> None:
     tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
     tmp.write_text(json.dumps(dict(value), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _install_workspace_backend_alias(workspace_root: pathlib.Path) -> pathlib.Path:
+    """Install the confined host alias for the container's ``/workspace`` root.
+
+    The generated task is a git worktree, so the alias is hidden through that
+    worktree's local ``.git/info/exclude`` rather than by changing source files
+    or the global patch policy.  A pre-existing entry is refused: replacing a
+    task file/directory would silently alter the benchmark input.  Every
+    fallible metadata operation completes before the final symlink creation;
+    there is deliberately no post-create check-and-delete rollback, because
+    that sequence cannot be made race-free against a child replacing the link.
+    A failed or interrupted final creation therefore leaves either no alias or
+    the alias in the unique task workspace for ordinary cleanup custody.
+    """
+
+    root = pathlib.Path(workspace_root).expanduser().resolve(strict=False)
+    if not root.is_dir():
+        raise ExecutorFailure("workspace backend alias requires a directory root")
+
+    alias = root / _WORKSPACE_BACKEND_ALIAS_NAME
+    if os.path.lexists(alias):
+        raise ExecutorFailure(
+            "generated workspace contains the reserved backend alias path"
+        )
+
+    git_dir = root / ".git"
+    if git_dir.is_symlink() or not git_dir.is_dir():
+        raise ExecutorFailure("workspace backend alias requires local git metadata")
+    info_dir = git_dir / "info"
+    # Do not let a generated workspace redirect the exclude update through a
+    # symlinked (including dangling) metadata ancestor.  ``Path.is_file``
+    # follows links, so inspect every relevant component explicitly first.
+    if info_dir.is_symlink() or not info_dir.is_dir():
+        raise ExecutorFailure("workspace backend alias requires local git info directory")
+    exclude = info_dir / "exclude"
+    if exclude.is_symlink() or not exclude.is_file():
+        raise ExecutorFailure("workspace backend alias requires git info/exclude")
+
+    temporary: pathlib.Path | None = None
+
+    try:
+        try:
+            current = exclude.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ExecutorFailure("workspace git exclude file is unreadable") from exc
+        if _WORKSPACE_BACKEND_ALIAS_EXCLUDE not in current.splitlines():
+            separator = "" if not current or current.endswith(("\n", "\r")) else "\n"
+            replacement = current + separator + _WORKSPACE_BACKEND_ALIAS_EXCLUDE + "\n"
+            # ``NamedTemporaryFile`` creates the file with O_EXCL in the same
+            # directory.  This prevents a stale/foreign predictable temp path
+            # from being truncated before the atomic replacement.
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=exclude.parent,
+                prefix=f".{exclude.name}.tmp.",
+                delete=False,
+            ) as handle:
+                temporary = pathlib.Path(handle.name)
+                handle.write(replacement)
+            os.replace(temporary, exclude)
+            temporary = None
+    except (FileExistsError, OSError, RuntimeError, TypeError) as exc:
+        raise ExecutorFailure("unable to install workspace backend alias") from exc
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+    # This must remain the final fallible operation.  In particular, do not
+    # lstat/readlink/unlink here: a concurrent replacement could turn a
+    # check-then-delete rollback into deletion of a task-owned object.
+    try:
+        os.symlink(
+            _WORKSPACE_BACKEND_ALIAS_TARGET,
+            alias,
+            target_is_directory=True,
+        )
+    except (FileExistsError, OSError, RuntimeError, TypeError) as exc:
+        raise ExecutorFailure("unable to install workspace backend alias") from exc
+    return alias
 
 
 _ARCHIVE_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
@@ -3524,8 +3620,26 @@ class CyberGymExecutor:
         cleanup_ref = safe_task_path(
             self.config.run_root / "attestations", task.task_id, attempt_id
         ) / "workspace_cleanup.json"
+        alias_ref = safe_task_path(
+            self.config.run_root / "attestations", task.task_id, attempt_id
+        ) / "workspace_backend_alias.json"
         try:
             self._generate(task, workspace_dir, agent_id)
+            _install_workspace_backend_alias(workspace_dir)
+            # Keep the topology change explicit in host-private run evidence.
+            # This records an alias, never PoC bytes or a post-run promotion.
+            _write_json(
+                alias_ref,
+                {
+                    "schema": _WORKSPACE_BACKEND_ALIAS_SCHEMA,
+                    "status": "installed",
+                    "workspace_root": str(workspace_dir),
+                    "alias_path": _WORKSPACE_BACKEND_ALIAS_NAME,
+                    "alias_target": _WORKSPACE_BACKEND_ALIAS_TARGET,
+                    "backend_path": "/workspace",
+                    "same_root": True,
+                },
+            )
             container_name = self._workspace(task, workspace_dir, plan)
             sidecar_attestation = {
                 "status": "not_run",
@@ -3559,6 +3673,7 @@ class CyberGymExecutor:
                     "artifact_refs": {
                         "task_dir": str(task_dir),
                         "checkpoint": str(checkpoint),
+                        "workspace_backend_alias": str(alias_ref),
                         "workspace_cleanup": str(cleanup_ref),
                     },
                 }
@@ -3662,6 +3777,7 @@ class CyberGymExecutor:
                 "workspace_dir": str(workspace_dir),
                 "checkpoint": str(checkpoint),
                 "submit": str(private_artifact),
+                "workspace_backend_alias": str(alias_ref),
                 "workspace_cleanup": str(cleanup_ref),
             }
             if attestation_ref:

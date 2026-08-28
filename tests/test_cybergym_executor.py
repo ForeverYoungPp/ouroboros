@@ -13,18 +13,21 @@ import io
 import json
 import os
 import pathlib
+import subprocess
 import tarfile
 import threading
 
 import pytest
 
 from devtools.benchmarks.cybergym import cybergym_executor as executor_module
+from devtools.benchmarks.cybergym.cybergym_adapter import final_poc_record
 from devtools.benchmarks.cybergym.cybergym_executor import (
     CommandResult,
     CyberGymExecutor,
     ExecutorConfig,
     ExecutorFailure,
     _bind_container_image,
+    _install_workspace_backend_alias,
     _parse_json_stdout,
     _require_exact_effort,
     _safe_extract,
@@ -32,6 +35,8 @@ from devtools.benchmarks.cybergym.cybergym_executor import (
     _validate_verify_response,
 )
 from devtools.benchmarks.cybergym.cybergym_sidecar import required_resource_labels
+from ouroboros.headless import write_workspace_patch_artifacts
+from ouroboros.tools.registry import ToolContext, ToolRegistry
 
 
 def _config(tmp_path: pathlib.Path, **overrides):
@@ -570,6 +575,227 @@ def test_container_image_binding_rejects_cached_digest_for_wrong_container():
             digest,
             "server",
         )
+
+
+def test_workspace_backend_alias_is_confined_and_git_ignored(tmp_path):
+    workspace = tmp_path / "generated"
+    workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(workspace)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    alias = _install_workspace_backend_alias(workspace)
+    assert alias == workspace / "workspace"
+    assert alias.is_symlink()
+    assert os.readlink(alias) == "."
+    assert alias.resolve(strict=False) == workspace.resolve(strict=False)
+    assert "/workspace" in (
+        workspace / ".git" / "info" / "exclude"
+    ).read_text(encoding="utf-8").splitlines()
+
+    status = subprocess.run(
+        ["git", "-C", str(workspace), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+
+    marker = workspace / "final.poc"
+    marker.write_bytes(b"adapter-alias-poc")
+    record = final_poc_record(workspace)
+    assert record.path == str(marker.resolve(strict=False))
+    assert record.sha256 == hashlib.sha256(marker.read_bytes()).hexdigest()
+    assert (alias / "final.poc").samefile(marker)
+    _, patch_manifest = write_workspace_patch_artifacts(
+        workspace, tmp_path / "artifacts", task={}
+    )
+    assert patch_manifest["status"] == "ready_with_changes"
+    assert "workspace" not in patch_manifest["untracked_included"]
+    assert "final.poc" in patch_manifest["untracked_included"]
+
+    collision = tmp_path / "collision"
+    collision.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(collision)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    reserved = collision / "workspace"
+    reserved.mkdir()
+    with pytest.raises(ExecutorFailure, match="reserved backend alias"):
+        _install_workspace_backend_alias(collision)
+    assert reserved.is_dir() and not reserved.is_symlink()
+
+    temp_collision = tmp_path / "temp-collision"
+    temp_collision.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(temp_collision)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    sentinel = temp_collision / ".git" / "info" / f".exclude.tmp.{os.getpid()}"
+    sentinel.write_text("foreign temporary content\n", encoding="utf-8")
+    _install_workspace_backend_alias(temp_collision)
+    assert sentinel.read_text(encoding="utf-8") == "foreign temporary content\n"
+
+
+@pytest.mark.parametrize(
+    "target_kind",
+    ["external", "dangling"],
+    ids=["external_symlink", "dangling_symlink"],
+)
+def test_workspace_backend_alias_rejects_symlinked_git_info(tmp_path, target_kind):
+    workspace = tmp_path / target_kind
+    workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(workspace)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    info = workspace / ".git" / "info"
+    (info / "exclude").unlink()
+    info.rmdir()
+    if target_kind == "external":
+        target = tmp_path / "external-info"
+        target.mkdir()
+    else:
+        target = tmp_path / "missing-info"
+    os.symlink(target, info, target_is_directory=True)
+
+    with pytest.raises(ExecutorFailure, match="local git info directory"):
+        _install_workspace_backend_alias(workspace)
+    assert not os.path.lexists(workspace / "workspace")
+
+
+def test_workspace_backend_alias_create_race_never_unlinks_replacement(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "create-race"
+    workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(workspace)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    exclude = workspace / ".git" / "info" / "exclude"
+    alias = workspace / "workspace"
+    original_replace = executor_module.os.replace
+    original_symlink = executor_module.os.symlink
+    original_unlink = pathlib.Path.unlink
+    unlink_calls: list[pathlib.Path] = []
+
+    def replace_then_publish(src, dst, *args, **kwargs):
+        result = original_replace(src, dst, *args, **kwargs)
+        if pathlib.Path(dst) == exclude:
+            # Simulate a child winning the alias name after all metadata checks
+            # but before the final symlink syscall.
+            original_symlink("./", alias, target_is_directory=True)
+        return result
+
+    def track_unlink(path, *args, **kwargs):
+        if path == alias:
+            unlink_calls.append(path)
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(executor_module.os, "replace", replace_then_publish)
+    monkeypatch.setattr(pathlib.Path, "unlink", track_unlink)
+    with pytest.raises(ExecutorFailure, match="unable to install workspace backend alias"):
+        _install_workspace_backend_alias(workspace)
+    assert alias.is_symlink() and os.readlink(alias) == "./"
+    assert unlink_calls == []
+    monkeypatch.undo()
+    alias.unlink()
+
+
+def test_workspace_backend_alias_keeps_immediate_post_create_replacement(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "post-create-replacement"
+    workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(workspace)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    alias = workspace / "workspace"
+    original_symlink = executor_module.os.symlink
+    original_unlink = pathlib.Path.unlink
+
+    def publish_then_replace(target, link, *args, **kwargs):
+        original_symlink(target, link, *args, **kwargs)
+        if pathlib.Path(link) == alias:
+            original_unlink(alias)
+            # Replace the just-created alias before the helper returns.  Since
+            # no post-create check or rollback exists, the replacement remains
+            # untouched and the helper does not race with it.
+            original_symlink("./", alias, target_is_directory=True)
+
+    monkeypatch.setattr(executor_module.os, "symlink", publish_then_replace)
+    returned = _install_workspace_backend_alias(workspace)
+    assert returned == alias
+    assert alias.is_symlink() and os.readlink(alias) == "./"
+    monkeypatch.undo()
+    alias.unlink()
+
+
+def test_workspace_backend_alias_bridges_structured_absolute_path(tmp_path):
+    system = tmp_path / "system"
+    data = tmp_path / "data"
+    workspace = tmp_path / "generated"
+    for path in (system, data, workspace):
+        path.mkdir()
+    (workspace / "README.md").write_text("hello from workspace\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "init", "--quiet", str(workspace)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _install_workspace_backend_alias(workspace)
+
+    context = ToolContext(
+        repo_dir=system,
+        drive_root=data,
+        system_repo_dir=system,
+        workspace_root=workspace,
+        workspace_mode="external",
+        task_id="cybergym-alias-test",
+        executor_ref={
+            "type": "docker_exec",
+            "id": "container-id",
+            "container_name": "container-id",
+            "network": "none",
+            "workspace_host_path": str(workspace),
+            "workspace_backend_path": "/workspace",
+        },
+    )
+    registry = ToolRegistry(repo_dir=system, drive_root=data)
+    registry.set_context(context)
+
+    write_result = registry.execute(
+        "write_file",
+        {"root": "active_workspace", "path": "/workspace/final.poc", "content": "POC"},
+    )
+    assert "Written 1 file(s)" in write_result
+    marker = workspace / "final.poc"
+    assert marker.read_text(encoding="utf-8") == "POC"
+    assert (workspace / "workspace" / "final.poc").samefile(marker)
+
+    read_result = registry.execute(
+        "read_file",
+        {"root": "active_workspace", "path": "/workspace/final.poc"},
+    )
+    assert "POC" in read_result
+    assert final_poc_record(workspace).sha256 == hashlib.sha256(b"POC").hexdigest()
 
 
 def test_task_body_is_opaque_and_preserves_network_contract(tmp_path):
