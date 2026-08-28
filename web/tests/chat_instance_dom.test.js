@@ -454,11 +454,21 @@ test('first task-bound review hydrates a progress-created owner once and reconci
     }
 });
 
-test('reconnect with only a task-bound review row inserts the owner checkpoint card', async () => {
+test('review-only reconnect anchors stay inert until task truth arrives', async () => {
     let historyRows = [];
     const { prior, mount } = installDom(async (url) => {
         if (String(url).startsWith('/api/chat/history')) {
             return { ok: true, json: async () => ({ messages: historyRows }) };
+        }
+        if (String(url).startsWith('/api/tasks/review-404')) {
+            return { ok: false, status: 404, text: async () => 'not found' };
+        }
+        if (String(url).startsWith('/api/tasks/review-error')) throw new Error('offline');
+        if (String(url).startsWith('/api/tasks/review-running')) {
+            return { ok: true, json: async () => ({ task_id: 'review-running', status: 'running' }) };
+        }
+        if (String(url) === '/api/tasks/review-terminal') {
+            return { ok: true, json: async () => ({ task_id: 'review-terminal', status: 'completed' }) };
         }
         return { ok: true, json: async () => ({ active_direct_turns: [] }) };
     });
@@ -483,24 +493,89 @@ test('reconnect with only a task-bound review row inserts the owner checkpoint c
             asPanel: true,
         });
         await new Promise((resolve) => setTimeout(resolve, 0));
-        historyRows = [{
-            chat_id: 2,
-            role: 'system',
-            system_type: 'skill_review',
-            task_id: 'review-child',
-            ts: '2026-08-24T00:00:01Z',
-            review_group: {
-                surface: 'skill', id: 'task:review-root:alpha',
-                presentation_owner_task_id: 'review-root', skill: 'alpha', status: 'clean',
-                attempts: [{ job_id: 'review-job', skill: 'alpha', status: 'clean' }],
-            },
-        }];
+        historyRows = [
+            'review-root', 'review-404', 'review-error', 'review-running', 'review-terminal',
+            'review-snapshot', 'review-finalizing-ws', 'review-terminal-ws',
+        ]
+            .map((owner, index) => ({
+                chat_id: 2,
+                role: 'system',
+                system_type: 'skill_review',
+                task_id: `review-child-${index}`,
+                ts: `2026-08-24T00:00:0${index + 1}Z`,
+                review_group: {
+                    surface: 'skill', id: `task:${owner}:alpha`,
+                    presentation_owner_task_id: owner, skill: 'alpha', status: 'clean',
+                    attempts: [{ job_id: `review-job-${index}`, skill: 'alpha', status: 'clean' }],
+                },
+            }));
         handlers.get('open')({ previouslyConnected: true });
         await new Promise((resolve) => setTimeout(resolve, 25));
         const messages = globalThis.document.byId.get('chat-messages');
-        const ownerCard = messages.children.find((node) => node.dataset.taskId === 'review-root');
-        assert.ok(ownerCard, 'review-only history replay must insert the explicit owner card');
-        assert.equal(ownerCard.querySelector('[data-live-review-summary]')?.textContent, 'Reviews 1');
+        const card = (owner) => messages.children.find((node) => node.dataset.taskId === owner);
+        for (const owner of [
+            'review-root', 'review-404', 'review-error', 'review-snapshot',
+            'review-finalizing-ws', 'review-terminal-ws',
+        ]) {
+            const ownerCard = card(owner);
+            assert.ok(ownerCard, `${owner} keeps the explicit review owner card`);
+            assert.equal(ownerCard.querySelector('[data-live-review-summary]')?.textContent, 'Reviews 1');
+            assert.equal(ownerCard.querySelector('[data-live-phase]')?.hidden, true, owner);
+            assert.equal(ownerCard.querySelector('[data-live-title]')?.textContent, 'Reviews');
+            assert.equal(ownerCard.querySelector('[data-live-typing]')?.style.display, 'none');
+        }
+        assert.equal(card('review-running')?.querySelector('[data-live-phase]')?.hidden, false);
+        assert.equal(card('review-running')?.querySelector('[data-live-phase]')?.textContent, 'Working');
+        assert.equal(card('review-terminal')?.dataset.finished, '1');
+
+        const snapshotCard = card('review-snapshot');
+        instance.hydrateStateSnapshot({
+            active_direct_turns: [{
+                activity_id: 'review-snapshot', chat_id: 2,
+                kind: 'managed_task', phase: 'working',
+            }],
+        });
+        assert.equal(card('review-snapshot'), snapshotCard, 'late task truth promotes the same card');
+        assert.equal(snapshotCard.querySelector('[data-live-phase]')?.hidden, false);
+        assert.equal(snapshotCard.querySelector('[data-live-phase]')?.textContent, 'Working');
+
+        const finalizingCard = card('review-finalizing-ws');
+        handlers.get('chat')({
+            chat_id: 2, role: 'assistant', task_id: 'review-finalizing-ws',
+            content: 'Answer delivered while synthesis runs', task_phase: 'finalizing',
+        });
+        assert.equal(card('review-finalizing-ws'), finalizingCard);
+        assert.equal(finalizingCard.querySelector('[data-live-phase]')?.hidden, false);
+        assert.equal(finalizingCard.querySelector('[data-live-phase]')?.textContent, 'Finalizing…');
+
+        const terminalWsCard = card('review-terminal-ws');
+        handlers.get('chat')({
+            chat_id: 2, role: 'assistant', task_id: 'review-terminal-ws',
+            content: 'Task completed', task_terminal_status: 'completed',
+        });
+        assert.equal(card('review-terminal-ws'), terminalWsCard);
+        assert.equal(terminalWsCard.dataset.finished, '1');
+        assert.equal(terminalWsCard.querySelector('[data-live-phase]')?.hidden, false);
+        assert.equal(terminalWsCard.querySelector('[data-live-phase]')?.textContent, 'Done');
+        handlers.get('log')({
+            chat_id: 2,
+            data: {
+                type: 'task_cost_finalized', task_id: 'review-terminal-ws',
+                post_task_status: 'completed', cost_accounting_status: 'available',
+                accounted_upper_bound_usd: 0.42, cost_final: true,
+            },
+        });
+        assert.equal(terminalWsCard.dataset.finished, '1');
+        assert.equal(terminalWsCard.querySelector('[data-live-phase]')?.textContent, 'Done');
+
+        const anchoredCard = card('review-root');
+        handlers.get('typing')({
+            chat_id: 2, activity_id: 'review-root', task_id: 'review-root',
+            kind: 'managed_task', phase: 'working',
+        });
+        assert.equal(card('review-root'), anchoredCard, 'task activity promotes the same card');
+        assert.equal(anchoredCard.querySelector('[data-live-phase]')?.hidden, false);
+        assert.equal(anchoredCard.querySelector('[data-live-phase]')?.textContent, 'Working');
     } finally {
         instance?.destroy();
         restoreDom(prior);

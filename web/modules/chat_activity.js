@@ -136,7 +136,10 @@ export function shouldAlwaysShowTaskCard(taskId = '') {
 }
 
 export function isForegroundLiveCard(record) {
-    return Boolean(record?.root?.isConnected && !record.finished && !isBackgroundTaskId(record.groupId));
+    return Boolean(
+        record?.root?.isConnected && !record.finished && !record.reviewAnchor
+        && !isBackgroundTaskId(record.groupId)
+    );
 }
 
 export function shouldFirePanic(dialogResult) {

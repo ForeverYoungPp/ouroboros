@@ -128,6 +128,11 @@ Status, owner action, and urgent notification are separate product concepts:
   product's explicit incident/notification seam, not a red status or a failed
   task as a proxy.
 
+A task-bound `Reviews` history row may be the only retained fact for its owner.
+That row keeps a neutral owner anchor visible, but hides task status and typing
+until a real task status or activity arrives; review presence alone never means
+`Working`, `Done`, or owner attention.
+
 Local diagnostic failures remain inspectable in details and Logs, but do not
 relabel the whole still-working task. A failed child keeps a compact factual
 `Failed` marker inside its parent while the root continues under its own

@@ -8,10 +8,19 @@ import {
 } from '../modules/chat.js';
 import {
     createStateSnapshotSequencer,
+    isForegroundLiveCard,
     routingAnnotationText,
 } from '../modules/chat_activity.js';
 
 const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
+
+test('review-only owner anchors do not advertise foreground task activity', () => {
+    const root = { isConnected: true };
+    assert.equal(isForegroundLiveCard({ root, groupId: 'owner', finished: false }), true);
+    assert.equal(isForegroundLiveCard({
+        root, groupId: 'owner', finished: false, reviewAnchor: true,
+    }), false);
+});
 
 test('unkeyed terminal incidents do not clear unrelated live turns', () => {
     // The cleanup guard also requires positive terminal evidence. Keep this

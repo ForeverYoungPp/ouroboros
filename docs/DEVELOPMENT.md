@@ -546,6 +546,13 @@ exact detail reference when detail is offered, and exact task/candidate binding
 for repository review. Omit an incomplete row; never guess from current chat,
 repository, timestamps, model, tool name, or activity.
 
+Legacy Plan Review is normalized once by `task_results.legacy_plan_review_projection`:
+`public_task_result` adds that derived field only to its copied v1 state, and the
+frontend adapter never reparses the nested legacy schema. A task-bound review may
+create an inert owner anchor when no task activity survived the history window;
+the anchor renders `Reviews` but contributes no task phase or liveness until a
+typed task status, cancel state, progress/typing frame, or terminal detail proves it.
+
 `ouroboros/review_execution_projection.py` owns the tiny cross-domain
 `executions[]` wire. It admits only returned API usage or an actually resolved
 delegated harness route plus model, and strips money, profile, raw output, and

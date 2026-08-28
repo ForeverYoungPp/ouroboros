@@ -336,6 +336,100 @@ test('a fresh Plan attempt replaces matching compact history until its full wave
     assert.equal(terminal.attempts.at(-1).compact, false);
 });
 
+test('terminal Plan controls retain an open compact wave but never revive closed compact authority', () => {
+    const fingerprint = 'a'.repeat(64);
+    const compactOpen = {
+        compact: true, request_fingerprint: fingerprint, cycle_index: 1,
+        aggregate: 'REVIEW_REQUIRED', closed: false, cycles_exhausted: true,
+    };
+    for (const status of ['rail_degraded', 'cycles_exhausted', 'unavailable']) {
+        const wave = status === 'unavailable'
+            ? { ...compactOpen, cycles_exhausted: false }
+            : compactOpen;
+        const group = planReviewGroupFromTaskDetail({
+            task_id: 'root',
+            plan_review_state: {
+                current_attempt: { fingerprint, status, reason: status },
+                waves: [wave],
+            },
+        });
+        assert.equal(group.attempts.length, 1, status);
+        assert.equal(group.attempts[0].compact, true, status);
+        assert.equal(group.attempts[0].verdict, 'REVIEW_REQUIRED', status);
+        assert.match(group.attempts[0].detailText, /Verdict: REVIEW_REQUIRED/, status);
+        assert.doesNotMatch(group.attempts[0].detailText, /Review result unavailable/, status);
+        assert.equal(
+            group.verdict,
+            status === 'rail_degraded' ? 'rail_degraded'
+                : (status === 'cycles_exhausted' ? 'cycles_exhausted' : 'REVIEW_REQUIRED'),
+            status,
+        );
+    }
+    const closed = planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            current_attempt: { fingerprint, status: 'rail_degraded', reason: 'fresh rail' },
+            waves: [{ ...compactOpen, aggregate: 'GREEN', closed: true }],
+        },
+    });
+    assert.equal(closed.verdict, 'rail_degraded');
+    assert.equal(closed.attempts[0].compact, false);
+    assert.equal(closed.attempts[0].verdict, 'rail_degraded');
+});
+
+test('legacy Plan state uses the backend-derived compatibility projection', () => {
+    const fingerprint = 'a'.repeat(64);
+    const project = (legacy_v1_projection) => planReviewGroupFromTaskDetail({
+        task_id: 'legacy-root',
+        plan_review_state: { schema_version: 1, legacy_v1_projection },
+    });
+    const reviewedOpen = project({
+        fingerprint, status: 'open', outcome: 'REVIEW_REQUIRED', closed: false, reason: '',
+    });
+    assert.equal(reviewedOpen.state, 'terminal');
+    assert.equal(reviewedOpen.verdict, 'REVIEW_REQUIRED');
+    assert.equal(reviewedOpen.attempts[0].verdict, 'REVIEW_REQUIRED');
+    assert.equal(reviewedOpen.countIsAuthoritative, false);
+    assert.deepEqual(reviewedOpen.attempts[0].executions, []);
+    assert.match(reviewedOpen.attempts[0].detailText, /Cost unavailable/);
+
+    const pending = project({ fingerprint: '', status: 'pending', outcome: '', closed: false });
+    assert.equal(pending.state, 'queued');
+    assert.equal(pending.activeCount, 1);
+    assert.equal(pending.attempts.length, 0);
+
+    const unavailable = project({
+        fingerprint, status: 'open', outcome: '', closed: false, reason: 'reviewer unavailable',
+    });
+    assert.equal(unavailable.state, 'unavailable');
+    assert.equal(unavailable.verdict, 'open');
+    assert.equal(unavailable.tone, 'neutral');
+    assert.equal(unavailable.summary, 'reviewer unavailable');
+
+    const rail = project({
+        fingerprint, status: 'rail_degraded', outcome: 'REVIEW_REQUIRED', closed: false,
+        reason: 'deadline',
+    });
+    assert.equal(rail.verdict, 'rail_degraded');
+    assert.equal(rail.attempts[0].verdict, 'REVIEW_REQUIRED');
+
+    const closed = project({
+        fingerprint, status: 'closed', outcome: 'GREEN', closed: true, reason: '',
+    });
+    assert.equal(closed.state, 'terminal');
+    assert.equal(closed.verdict, 'GREEN');
+    assert.equal(closed.attempts[0].verdict, 'GREEN');
+
+    assert.equal(planReviewGroupFromTaskDetail({
+        task_id: 'legacy-root',
+        plan_review_state: {
+            schema_version: 1,
+            current_attempt: { fingerprint, status: 'open' },
+            waves: [{ request_fingerprint: fingerprint, review: { aggregate_signal: 'GREEN' } }],
+        },
+    }), null, 'raw v1 never falls through the v2 parser');
+});
+
 test('typed Plan rail degradation controls the group without erasing open wave evidence', () => {
     const fingerprint = 'a'.repeat(64);
     const openWave = {

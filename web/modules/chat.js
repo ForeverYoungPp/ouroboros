@@ -58,6 +58,7 @@ import {
     reviewReferenceFromRow,
     reviewGroupFromHistoryRow,
     reviewGroupsFromTaskDetail,
+    setReviewAnchor,
 } from './review_presentation.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
 import {
@@ -142,7 +143,6 @@ const CHAT_INPUT_HISTORY_KEY = 'ouro_chat_input_history';
 const MAX_PENDING_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_PENDING_ATTACHMENT_BYTES = 100 * 1024 * 1024;
-// One incident toast per page.
 const shownIncidentToastKeys = new Set();
 
 function showTaskIncidentToast(msg) {
@@ -501,8 +501,7 @@ export function createChatInstance({
     const isInstanceVisible = () =>
         Boolean(messagesDiv) && messagesDiv.offsetParent !== null && !document.hidden;
     const liveCardRecords = new Map();
-    // Disclosure belongs to the owner, not lifecycle/review/terminal/reconnect
-    // events. These maps outlive record rebuilds for this Chat instance.
+    const markReviewAnchor = (r, on = false) => setReviewAnchor(r, on, setLiveCardPhase);
     const explicitCardExpansion = new Map();
     const reviewDisclosureByTask = new Map();
     const skillReviewDetailStore = new Map();
@@ -1264,6 +1263,7 @@ export function createChatInstance({
     function markLiveCardFinalizing(taskId = '') {
         const record = liveCardRecords.get(String(taskId || '').trim());
         if (!record || record.finished || !record.phaseEl) return;
+        markReviewAnchor(record);
         if (record.cancelPendingPolicy) return;
         record.finalizingHold = true;
         setLiveCardPhase(record, 'working', 'Finalizing…', 'chat-live-phase working finalizing');
@@ -1414,9 +1414,12 @@ export function createChatInstance({
         const ownerTaskId = String(group?.presentationOwnerTaskId || '').trim();
         if (!ownerTaskId) return false;
         if (retiredTaskIds.has(ownerTaskId) && !liveCardRecords.has(ownerTaskId)) return true;
+        const reviewAnchor = !liveCardRecords.has(ownerTaskId)
+            && !taskUiStates.has(ownerTaskId) && !activeDirectActivities.has(ownerTaskId);
         const ownerState = forceTaskCard(ownerTaskId, rawTs);
         if (!ownerState?.cardVisible) return false;
         const record = liveCardRecords.get(ownerTaskId);
+        if (reviewAnchor) markReviewAnchor(record, true);
         const merged = record?.reviewController?.update(group);
         if (merged) {
             if (!_syncPass1Active) ensureLiveCardVisible(record);
@@ -1471,7 +1474,6 @@ export function createChatInstance({
             if (lifecycle.group.activeCount === 0 && lifecycle.group.lifecycleStatus) scheduleHistorySync();
             return attached;
         }
-        // Incomplete review lifecycle stays domain-local and never mints a task.
         return lifecycle.classification === 'source_incomplete';
     }
 
@@ -2020,7 +2022,6 @@ export function createChatInstance({
         historyResyncScheduler.schedule();
     }
 
-    // Replay finishes are already canonical; live finishes still schedule a real fetch.
     const historyResyncScheduler = createHistoryResyncScheduler({
         isReplayActive: () => _historyReplayActive,
         run: () => syncHistory({ includeUser: false }).catch(() => {}),
@@ -2070,6 +2071,7 @@ export function createChatInstance({
             }
             return;
         }
+        markReviewAnchor(record);
 
         if (!record.isSubagent) {
             activeLiveGroupId = nextGroupId;
@@ -2260,6 +2262,7 @@ export function createChatInstance({
         // A converted card is a terminal project chip now — ignore late terminal
         // frames so they neither overwrite the chip nor touch its element refs (T4).
         if (record.root?.dataset?.projectCreated === '1') return;
+        markReviewAnchor(record);
         const wasFinished = record.finished;
         record.finished = true;
         record.finalizingHold = false;
@@ -4001,6 +4004,7 @@ export function createChatInstance({
             clientMessageId: meta.clientMessageId || '',
             startedAt: Date.now(),
         });
+        markReviewAnchor(liveCardRecords.get(actId));
         if (meta.clientMessageId) {
             pendingSubmissions.delete(meta.clientMessageId);
         }
@@ -4040,14 +4044,14 @@ export function createChatInstance({
         try {
             const detail = await fetchTaskDetail(taskId);
             if (destroyed || concludedDirectActivities.has(taskId)) return;
-            // A reconnect may rebuild the card; reconcile only the current live card generation.
             const currentRecord = liveCardRecords.get(taskId);
             if (!currentRecord || currentRecord.isSubagent || subagentChildParents.has(taskId)) return;
             attachTaskDetailReviews(taskId, detail);
-            // A durable cancel intent must remain visible even when fresher
-            // activity proves the task is still alive. The same activity still
-            // vetoes every non-pending or terminal detail below.
-            if (taskCancelPending(detail)) {
+            const cancelPending = taskCancelPending(detail);
+            if (cancelPending || String(detail?.status || '').trim()) {
+                markReviewAnchor(currentRecord);
+            }
+            if (cancelPending) {
                 reconcileCancelCardFromDetail(currentRecord, taskId, detail);
                 return;
             }
@@ -4091,6 +4095,7 @@ export function createChatInstance({
         activeDirectActivities.clear();
         for (const [k, v] of nextMap.entries()) {
             activeDirectActivities.set(k, v);
+            markReviewAnchor(liveCardRecords.get(k));
             if (v.kind === 'managed_task') missingManagedTaskIds.delete(k);
             if (v.clientMessageId) {
                 pendingSubmissions.delete(v.clientMessageId);
@@ -4105,7 +4110,6 @@ export function createChatInstance({
             })),
             globallyActiveActivityIds,
         )) observeMissingManagedTask(taskId);
-        // Null or nonterminal detail retries on the next authoritative snapshot.
         for (const taskId of missingManagedTaskIds) {
             if (!activeDirectActivities.has(taskId)) void reconcileMissingManagedTask(taskId);
         }

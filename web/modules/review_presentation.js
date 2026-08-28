@@ -39,6 +39,22 @@ const finiteCount = (value) => {
     return Number.isFinite(number) && number >= 0 ? Math.trunc(number) : null;
 };
 
+export function setReviewAnchor(record, enabled, writePhase) {
+    if (!record || Boolean(record.reviewAnchor) === enabled) return;
+    record.reviewAnchor = enabled;
+    record.phaseEl.hidden = enabled;
+    if (enabled) {
+        record.titleEl.textContent = record.suggestedName || 'Reviews';
+        record.inlineTypingEl.style.display = 'none';
+    } else {
+        writePhase(record, 'working');
+        if (!record.suggestedName && !record.lastHumanHeadline) {
+            record.titleEl.textContent = 'Working...';
+        }
+        record.inlineTypingEl.style.display = '';
+    }
+}
+
 function normalizedState(value, fallback = 'unavailable') {
     const state = text(value).toLowerCase();
     if (ACTIVE_STATES.has(state)) {
@@ -457,10 +473,67 @@ function planWaveDetail(wave) {
     return lines.filter(Boolean).join('\n');
 }
 
+function legacyPlanReviewGroup(owner, stateRecord) {
+    const projection = stateRecord?.legacy_v1_projection;
+    if (!projection || typeof projection !== 'object') return null;
+    const status = text(projection.status).toLowerCase();
+    if (!status || status === 'absent') return null;
+    const outcome = text(projection.outcome);
+    const fingerprint = text(projection.fingerprint);
+    const attempts = fingerprint && outcome ? [{
+        id: fingerprint,
+        surface: 'plan',
+        state: 'terminal',
+        tone: statusTone('terminal', outcome),
+        verdict: outcome,
+        timestamp: '',
+        ordinal: 0,
+        label: 'legacy wave',
+        summary: text(projection.reason),
+        superseded: false,
+        compact: false,
+        replayed: false,
+        revised: false,
+        initiatorTaskId: '',
+        executions: [],
+        execution: null,
+        detailRef: null,
+        detailText: [
+            `Status: ${status}`,
+            `Verdict: ${outcome}`,
+            projection.closed != null ? `Closed: ${projection.closed ? 'yes' : 'no'}` : '',
+            projection.reason ? `Reason: ${text(projection.reason)}` : '',
+            'Cost unavailable',
+        ].filter(Boolean).join('\n'),
+    }] : [];
+    const pending = status === 'pending';
+    const controlVerdict = status === 'rail_degraded' ? status : outcome || status;
+    const state = pending ? 'queued'
+        : (status === 'open' && !outcome ? 'unavailable' : 'terminal');
+    return {
+        id: `plan:${owner}`,
+        surface: 'plan',
+        label: 'Plan review',
+        subject: '',
+        presentationOwnerTaskId: owner,
+        subjectTaskId: owner,
+        initiatorTaskId: owner,
+        state,
+        tone: statusTone(state, outcome || (status === 'open' ? 'unavailable' : controlVerdict)),
+        verdict: controlVerdict,
+        summary: text(projection.reason),
+        activeCount: pending ? 1 : 0,
+        attemptCount: attempts.length,
+        countIsAuthoritative: false,
+        attempts,
+    };
+}
+
 export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
     const owner = text(ownerTaskId || detail?.task_id);
     const stateRecord = detail?.plan_review_state;
     if (!owner || !stateRecord || typeof stateRecord !== 'object') return null;
+    if (stateRecord.schema_version === 1) return legacyPlanReviewGroup(owner, stateRecord);
     const current = stateRecord.current_attempt && typeof stateRecord.current_attempt === 'object'
         ? stateRecord.current_attempt : {};
     const recordedWaves = Array.isArray(stateRecord.waves) ? stateRecord.waves : [];
@@ -475,6 +548,7 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
         && currentFingerprint
         && typedCurrentStatus
         && text(wave.request_fingerprint) === currentFingerprint
+        && (typedCurrentStatus === 'open' || wave.closed === true)
     ));
     const currentWaveIndex = currentFingerprint
         ? waves.findIndex((wave) => text(wave?.request_fingerprint) === currentFingerprint)
@@ -510,14 +584,13 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
     // The typed Plan gate releases an open wave when the task-wide deadline
     // rail degrades. Preserve the wave as semantic review evidence, but mirror
     // the backend precedence in the group header. A closed wave remains final.
-    if (
-        currentAttempt
-        && typedCurrentStatus === 'rail_degraded'
-        && waves[currentWaveIndex]?.closed !== true
-    ) {
-        state = normalizedState(typedCurrentStatus);
+    const terminalControl = typedCurrentStatus === 'rail_degraded'
+        ? typedCurrentStatus
+        : (waves[currentWaveIndex]?.cycles_exhausted === true ? 'cycles_exhausted' : '');
+    if (currentAttempt && terminalControl && waves[currentWaveIndex]?.closed !== true) {
+        state = normalizedState(terminalControl);
         activeCount = 0;
-        currentVerdict = typedCurrentStatus;
+        currentVerdict = terminalControl;
     }
     return {
         id: `plan:${owner}`,
