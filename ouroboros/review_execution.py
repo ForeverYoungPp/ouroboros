@@ -28,6 +28,7 @@ from ouroboros.review_slot_cancel import (  # noqa: F401 — re-exported seam su
     _slot_cancel_outcome,
 )
 from ouroboros.review_dispatch import bind_api_review_paid_stamp, invoke_review_paid_stamp
+from ouroboros.usage_accounting import POSITIVE_PHYSICAL_ATTEMPT_STATES
 from ouroboros.triad_review import (
     ACCEPTANCE_SURFACE_RULES,
     REVIEW_JSON_ARRAY_CONTRACT,
@@ -53,7 +54,6 @@ if TYPE_CHECKING:  # annotations only — importing the substrate here would cyc
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot
 
 log = logging.getLogger("review_execution")
-
 class ReviewRouteKind(str, Enum):
     """Closed set of review delivery routes.
 
@@ -402,7 +402,7 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
                 # The coordinator wraps raw stamps once-only, so this fallback
                 # cannot double-charge a route that already marked dispatch.
                 capture = getattr(exc, "physical_attempt_capture", None)
-                if str(getattr(capture, "state", "") or "") in {"dispatched", "settled", "unresolved"}:
+                if str(getattr(capture, "state", "") or "") in POSITIVE_PHYSICAL_ATTEMPT_STATES:
                     invoke_review_paid_stamp(self.assignment.dispatch_stamp)
                 raise
         # Null/non-object provider messages follow the caller's empty-response rail.

@@ -48,7 +48,7 @@ _ACTIVE: Dict[str, ActiveReviewAttempt] = {}
 # not the full actor/prompt, until process exit.
 _NO_RESEND: Dict[str, str] = {}
 _PENDING_STATES = {"in_flight", "custody_lost"}
-_PHYSICAL_CAPTURE_STATES = {"", "settled", "dispatched", "unresolved"}
+_PHYSICAL_CAPTURE_STATES = frozenset({"", *POSITIVE_PHYSICAL_ATTEMPT_STATES})
 _POSITIVE_CAPTURE_STATES = POSITIVE_PHYSICAL_ATTEMPT_STATES
 
 
@@ -209,14 +209,17 @@ def _worker_exception_operation_state(
             retry_state.get("pending_invocation_id") or ""
         ).strip():
             return "custody_lost"
-        # Only transient route/admission refusals are retryable. Configuration
-        # errors (for example a missing session task/root) remain visible as
-        # ordinary settled failures rather than being relabeled as $0 health.
+        # Only refusals emitted before the route's paid write-ahead boundary
+        # are retryable $0. Later custody/checkpoint failures remain settled:
+        # their absence of provider-capture metadata cannot erase the stamp.
         if code in {
             "api_chat_unavailable", "route_unavailable", "harness_unavailable",
-            "provider_unavailable", "start_request_row_unwritable",
-            "deadline_exhausted", "subscription_window_exhausted",
-            "credential_pool_exhausted",
+            "provider_unavailable", "deadline_exhausted",
+            "subscription_window_exhausted",
+            "credential_pool_exhausted", "session_task_missing",
+            "session_target_unparsable", "session_route_unconfigured",
+            "custody_root_missing", "session_root_missing",
+            "unknown_review_route", "review_route_not_implemented",
         }:
             return "not_dispatched"
         return "settled"

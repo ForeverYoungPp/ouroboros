@@ -2202,7 +2202,7 @@ def test_agent_slot_without_session_task_refuses_the_api_pack(tmp_path, fake_rou
     result = run_review_request(request, slots=[_agent_slot()],
                                 drive_root=tmp_path, llm=llm)
     actor = result.actors[0]
-    assert actor["status"] == "error"
+    assert actor["status"] == "not_dispatched"
     assert "no session task" in actor["error"]
     assert llm.calls == []
     assert not any(inst.start_requests for inst in fake_route.instances)

@@ -373,3 +373,40 @@ def test_resume_rejects_unknown_physical_attempt_state(tmp_path):
 
     assert "error" in result
     assert "unknown physical-attempt state" in result["error"]
+
+
+def test_zero_send_route_refusal_does_not_spend_a_plan_cycle(harness, monkeypatch):
+    """Callable configuration is not monetary proof when every slot refuses pre-send."""
+    import ouroboros.review_substrate as review_substrate
+
+    calls = []
+
+    def zero_send(request, *, slots, drive_root, llm, usage_ctx=None):
+        calls.append([slot.slot_id for slot in slots])
+        return SimpleNamespace(actors=[{
+            "slot_id": slot.slot_id,
+            "model": slot.model,
+            "status": "not_dispatched",
+            "raw_text": "",
+            "error": "agent session slot has no session task",
+            "failure_code": "session_task_missing",
+            "usage": {},
+            "prompt_ref": {},
+            "response_ref": {},
+            "operation_id": f"op-{slot.slot_id}",
+            "operation_state": "not_dispatched",
+            "late_result_pending": False,
+        } for slot in slots])
+
+    monkeypatch.setattr(review_substrate, "run_review_request", zero_send)
+    output = _call(harness.make_ctx())
+    state = _state(harness)
+    wave = state["waves"][-1]
+
+    assert calls == [["s1", "s2", "s3"]]
+    assert _control(output) == {"outcome": "DEGRADED", "closed": False}
+    assert wave["paid"] is False
+    assert state["cycles_paid"] == 0
+    assert {row["failure_code"] for row in wave["actors"]} == {
+        "session_task_missing",
+    }

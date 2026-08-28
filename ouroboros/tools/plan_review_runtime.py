@@ -23,14 +23,16 @@ from ouroboros.config import review_model_uses_local
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.llm import LLMClient
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for
+from ouroboros.usage_accounting import (
+    PHYSICAL_ATTEMPT_STATES, POSITIVE_PHYSICAL_ATTEMPT_STATES,
+)
 from ouroboros.utils import utc_now_iso
 
 
 PLAN_REVIEW_MAX_TOKENS = 65536
 PLAN_RAW_TEXT_PREVIEW_CHARS = 2_000
 from ouroboros.tools.plan_review_artifacts import (  # noqa: E402, F401 - compatibility imports
-    PHYSICAL_ATTEMPT_STATES,
-    POSITIVE_PHYSICAL_ATTEMPT_STATES,
+    _row_has_physical_dispatch,
     persist_wave as persist_plan_review_wave_artifact,
     read_wave as read_plan_review_wave_artifact,
 )
@@ -413,7 +415,7 @@ def synthesize_plan_review_wave(
     fingerprint: str, previous: Optional[dict], manifest: dict, manifest_hash: str,
     constitutional: bool, constitutional_note: str, cycle_index: int, retry_key: str,
     enforcement: str, cap: Any, quorum: int, configured_slots: list,
-    callable_slots: list, health_evidence: Any,
+    health_evidence: Any,
 ) -> tuple[dict, set[str], dict]:
     """Validate raw actor rows and build one durable plan-review wave."""
     from ouroboros.tools import plan_spec
@@ -482,7 +484,8 @@ def synthesize_plan_review_wave(
         "closed": aggregate == "GREEN", "dispositions": [], "actors": slot_records,
         "custody_pending": False,
         "actors_degraded": [str(r["slot_id"]) for r in slot_records if not r["ok"]],
-        "enforcement": enforcement, "cycle_cap": cap, "paid": bool(callable_slots),
+        "enforcement": enforcement, "cycle_cap": cap,
+        "paid": any(_row_has_physical_dispatch(row) for row in slot_records),
         "health_epoch": plan_health_epoch(health_evidence),
         "reviewer_config_fingerprint": plan_reviewer_config_fingerprint(configured_slots),
         **plan_quorum_unreachable_facts(slot_records, quorum=quorum), "reviewed_at": utc_now_iso(),

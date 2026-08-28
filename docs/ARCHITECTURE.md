@@ -2080,7 +2080,8 @@ without a typed terminal HTTP status stay under the custody-lost/no-resend
 classification; with such a status they are retained as terminal actors for
 same-cycle replay, never as a second physical send. Physical custody is proved
 by the capture/operation state, not by the synthetic operation id alone, so an
-explicit `$0` `not_dispatched` row stays frozen and retryable. A retry rail is
+explicit pre-write-ahead `$0` `not_dispatched` row stays frozen and retryable;
+a post-stamp checkpoint failure cannot rewind paid authority. A retry rail is
 monotonic. A positive `settled`/`dispatched`/`unresolved` capture outranks a
 contradictory synthetic `not_dispatched` label; only `reserved`/`released`
 proves pre-dispatch, and `usage_accounting` owns the state vocabulary. A later

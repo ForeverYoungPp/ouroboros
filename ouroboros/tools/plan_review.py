@@ -692,7 +692,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         previous=previous, manifest=manifest, manifest_hash=manifest_hash,
         constitutional=constitutional, constitutional_note=constitutional_note,
         cycle_index=cycle_index, retry_key=retry_key, enforcement=enforcement, cap=cap,
-        quorum=quorum, configured_slots=configured_slots, callable_slots=callable_slots,
+        quorum=quorum, configured_slots=configured_slots,
         health_evidence=health_evidence,
     )
     aggregate = str(wave["aggregate"])
