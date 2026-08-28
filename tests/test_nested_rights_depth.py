@@ -7,7 +7,12 @@ import pytest
 
 from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.depth_evidence import build_depth_summary
-from ouroboros.task_results import STATUS_FAILED, STATUS_RUNNING, write_task_result
+from ouroboros.task_results import (
+    STATUS_FAILED,
+    STATUS_RUNNING,
+    STATUS_SCHEDULED,
+    write_task_result,
+)
 from ouroboros.tools.control_delegation import (
     admitted_depth_cap,
     check_delegation_admission,
@@ -1129,6 +1134,57 @@ def test_generic_schedule_replay_preserves_valid_exact_result(tmp_path, monkeypa
 
     assert pending == []
     assert result_path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    ("status", "location"),
+    [(STATUS_SCHEDULED, "pending"), (STATUS_RUNNING, "running")],
+)
+def test_generic_malformed_replay_preserves_live_exact_result(
+    tmp_path, monkeypatch, status, location,
+):
+    from supervisor import events, queue
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    tid = f"generic-live-{location}"
+    write_task_result(
+        tmp_path,
+        tid,
+        status,
+        root_task_id=tid,
+        delegation_role="root",
+        result="keep live work",
+    )
+    result_path = tmp_path / "task_results" / f"{tid}.json"
+    original = result_path.read_bytes()
+    pending = []
+    running = {}
+    if location == "pending":
+        pending.append({"id": tid, "depth": 0, "delegation_role": "root"})
+    else:
+        running[tid] = {"task": {"id": tid, "delegation_role": "root"}}
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(queue, "RUNNING", running)
+    monkeypatch.setattr(queue, "ADMISSION_RESERVATIONS", {})
+    enqueued = []
+    ctx = _fake_ctx(tmp_path, enqueued)
+    ctx.PENDING = pending
+    ctx.RUNNING = running
+    ctx.enqueue_task = queue.enqueue_task
+    event = _schedule_event(tid, "parent", depth=-1, drive_root=tmp_path)
+    event["delegation_role"] = "root"
+    event["chat_id"] = 7
+
+    events._handle_schedule_task(event, ctx)
+
+    assert result_path.read_bytes() == original
+    assert pending == (
+        [{"id": tid, "depth": 0, "delegation_role": "root"}]
+        if location == "pending" else []
+    )
+    assert set(running) == ({tid} if location == "running" else set())
+    assert not enqueued
 
 
 def test_supervisor_rejects_count_bounded_child_when_count_scan_fails(

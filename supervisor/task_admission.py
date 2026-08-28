@@ -260,21 +260,36 @@ def subagent_schedule_owned(
         )
 
 
-def subagent_schedule_preflight(ctx: Any, evt: Dict[str, Any], chat_id: int) -> bool:
-    """Stop an owned or unreadable exact child id before provisioning side effects."""
-    tid = str(evt.get("task_id") or "")
+def subagent_schedule_preflight(
+    ctx: Any,
+    evt: Dict[str, Any],
+    chat_id: int,
+    *,
+    delegation_role: str = "subagent",
+) -> bool:
+    """Stop an owned or unreadable exact task id before parsing or side effects.
+
+    The historical name is kept for compatibility with subagent callers, but
+    the exact-id replay fence applies to every schedule role.  A task without
+    an explicit id is not idempotent at this boundary and is left to the
+    normal fresh-id/queue path.
+    """
+    tid = str(evt.get("task_id") or "").strip()
+    if not tid:
+        return False
     try:
         return subagent_schedule_owned(ctx, tid)
     except (OSError, ValueError):
         from supervisor.events import _reject_schedule_task
 
+        label = "Subagent" if delegation_role == "subagent" else "Task"
         _reject_schedule_task(
-            ctx, tid=tid, chat_id=chat_id, delegation_role="subagent",
+            ctx, tid=tid, chat_id=chat_id, delegation_role=delegation_role,
             parent_id=evt.get("parent_task_id"),
             root_task_id=str(evt.get("root_task_id") or evt.get("parent_task_id") or tid),
             role=str(evt.get("role") or "researcher"), result_fields={},
             detail=(
-                "Subagent not scheduled: the existing durable result for this task id "
+                f"{label} not scheduled: the existing durable result for this task id "
                 "is unreadable, so its identity authority was preserved."
             ),
             reason_code="scheduled_result_authority_unknown", persist_result=False,

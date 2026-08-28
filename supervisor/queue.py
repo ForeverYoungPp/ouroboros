@@ -215,6 +215,30 @@ def enqueue_task(
             # Tokenless internal callers and competing ingress must not consume/collide with it.
             t["_admission_blocked"] = "admission_reservation_owned"
             return t
+        if require_unique_id and task_id:
+            # Exact-id ownership wins over malformed-depth replay.
+            live_duplicate = task_id in RUNNING or any(
+                isinstance(row, dict) and str(row.get("id") or "") == task_id
+                for row in PENDING
+            )
+            if live_duplicate:
+                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                    ADMISSION_RESERVATIONS.pop(task_id, None)
+                t["_admission_blocked"] = "duplicate_task_id"
+                return t
+            try:
+                from ouroboros.task_results import load_task_result
+                if load_task_result(DRIVE_ROOT, task_id, strict=True):
+                    if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                        ADMISSION_RESERVATIONS.pop(task_id, None)
+                    t["_admission_blocked"] = "duplicate_task_id"
+                    return t
+            except Exception:
+                log.warning("Fresh task-id lookup failed for %s", task_id, exc_info=True)
+                t["_admission_blocked"] = "task_id_lookup_failed"
+                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                    ADMISSION_RESERVATIONS.pop(task_id, None)
+                return t
         if reject_invalid_task_depth(t, reservations=ADMISSION_RESERVATIONS, admission_token=admission_token):
             return t
         if require_worker_pool:
@@ -235,30 +259,6 @@ def enqueue_task(
         if admission_token and reserved_token != admission_token:
             t["_admission_blocked"] = "admission_reservation_lost"
             return t
-        if require_unique_id and task_id:
-            live_duplicate = task_id in RUNNING or any(
-                isinstance(row, dict) and str(row.get("id") or "") == task_id
-                for row in PENDING
-            )
-            if live_duplicate:
-                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
-                    ADMISSION_RESERVATIONS.pop(task_id, None)
-                t["_admission_blocked"] = "duplicate_task_id"
-                return t
-            try:
-                from ouroboros.task_results import load_task_result
-
-                if load_task_result(DRIVE_ROOT, task_id, strict=True):
-                    if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
-                        ADMISSION_RESERVATIONS.pop(task_id, None)
-                    t["_admission_blocked"] = "duplicate_task_id"
-                    return t
-            except Exception:
-                log.warning("Fresh task-id lookup failed for %s", task_id, exc_info=True)
-                t["_admission_blocked"] = "task_id_lookup_failed"
-                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
-                    ADMISSION_RESERVATIONS.pop(task_id, None)
-                return t
         project_id = str(t.get("project_id") or "").strip()
         if project_id:
             try:

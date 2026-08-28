@@ -3326,13 +3326,15 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     session_id = str(evt.get("session_id") or "")
     actor_id = str(evt.get("actor_id") or "ouroboros")
     delegation_role = str(evt.get("delegation_role") or "subagent")
-    if delegation_role == "subagent":
-        # Idempotency/ownership is checked before parsing so a malformed replay
-        # cannot terminalize an already-owned task id. Fresh events still reach
-        # the typed depth rejection below before any provisioning or enqueue.
-        from supervisor.task_admission import subagent_schedule_preflight
-        if subagent_schedule_preflight(ctx, evt, chat_id):
-            return
+    # Idempotency/ownership is checked before parsing for every scheduling role
+    # so a malformed replay cannot terminalize an already-owned task id. Fresh
+    # events still reach the typed depth rejection below before provisioning or
+    # enqueue; events without an explicit id use the normal fresh-id path.
+    from supervisor.task_admission import subagent_schedule_preflight
+    if subagent_schedule_preflight(
+        ctx, evt, chat_id, delegation_role=delegation_role,
+    ):
+        return
     from supervisor.task_admission import parse_schedule_task_depth
 
     depth, depth_rejected = parse_schedule_task_depth(
