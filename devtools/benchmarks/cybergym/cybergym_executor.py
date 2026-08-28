@@ -1134,8 +1134,11 @@ def _install_workspace_backend_alias(workspace_root: pathlib.Path) -> pathlib.Pa
     fallible metadata operation completes before the final symlink creation;
     there is deliberately no post-create check-and-delete rollback, because
     that sequence cannot be made race-free against a child replacing the link.
-    A failed or interrupted final creation therefore leaves either no alias or
-    the alias in the unique task workspace for ordinary cleanup custody.
+    A failed preparation may leave its O_EXCL temporary under ``.git/info``;
+    that metadata is ignored and the workspace is append-only disposable, so
+    no path-based cleanup is attempted.  A failed or interrupted final
+    creation therefore leaves either no alias or the alias in the unique task
+    workspace for ordinary cleanup custody.
     """
 
     root = pathlib.Path(workspace_root).expanduser().resolve(strict=False)
@@ -1162,7 +1165,6 @@ def _install_workspace_backend_alias(workspace_root: pathlib.Path) -> pathlib.Pa
         raise ExecutorFailure("workspace backend alias requires git info/exclude")
 
     temporary: pathlib.Path | None = None
-
     try:
         try:
             current = exclude.read_text(encoding="utf-8")
@@ -1184,15 +1186,8 @@ def _install_workspace_backend_alias(workspace_root: pathlib.Path) -> pathlib.Pa
                 temporary = pathlib.Path(handle.name)
                 handle.write(replacement)
             os.replace(temporary, exclude)
-            temporary = None
     except (FileExistsError, OSError, RuntimeError, TypeError) as exc:
         raise ExecutorFailure("unable to install workspace backend alias") from exc
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
 
     # This must remain the final fallible operation.  In particular, do not
     # lstat/readlink/unlink here: a concurrent replacement could turn a
@@ -3628,6 +3623,9 @@ class CyberGymExecutor:
             _install_workspace_backend_alias(workspace_dir)
             # Keep the topology change explicit in host-private run evidence.
             # This records an alias, never PoC bytes or a post-run promotion.
+            # Later setup failures intentionally leave the alias in this
+            # attempt's opaque workspace; path-based rollback could delete a
+            # child replacement and is therefore never attempted.
             _write_json(
                 alias_ref,
                 {

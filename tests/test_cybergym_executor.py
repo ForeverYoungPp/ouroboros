@@ -715,6 +715,40 @@ def test_workspace_backend_alias_create_race_never_unlinks_replacement(
     alias.unlink()
 
 
+def test_workspace_backend_alias_temp_replacement_is_not_unlinked(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "temp-replacement"
+    workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(workspace)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    exclude = workspace / ".git" / "info" / "exclude"
+    alias = workspace / "workspace"
+    original_replace = executor_module.os.replace
+    foreign_temp: dict[str, pathlib.Path] = {}
+
+    def replace_then_swap_temp(src, dst, *args, **kwargs):
+        if pathlib.Path(dst) == exclude:
+            temp_path = pathlib.Path(src)
+            os.unlink(temp_path)
+            temp_path.write_text("foreign temporary content\n", encoding="utf-8")
+            foreign_temp["path"] = temp_path
+            raise OSError("injected metadata replace failure")
+        return original_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(executor_module.os, "replace", replace_then_swap_temp)
+    with pytest.raises(ExecutorFailure, match="unable to install workspace backend alias"):
+        _install_workspace_backend_alias(workspace)
+    temp_path = foreign_temp["path"]
+    assert temp_path.read_text(encoding="utf-8") == "foreign temporary content\n"
+    assert not os.path.lexists(alias)
+    assert "/workspace" not in exclude.read_text(encoding="utf-8").splitlines()
+
+
 def test_workspace_backend_alias_keeps_immediate_post_create_replacement(
     tmp_path, monkeypatch
 ):
