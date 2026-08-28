@@ -910,6 +910,170 @@ def test_assignment_quarantines_invalid_depth_before_budget_pause(tmp_path, monk
     assert "_budget_pause" not in rejected
 
 
+def test_restore_failed_depth_terminalization_mutates_pending_under_queue_lock(
+    tmp_path, monkeypatch,
+):
+    from supervisor import queue, task_admission
+    from ouroboros.utils import utc_now_iso
+
+    pending, running = [], {}
+    queue.init_queue_refs(pending, running, {"value": 0})
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    snapshot_path = tmp_path / "state" / "queue_snapshot.json"
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snapshot_path)
+    queue.ACCEPTANCE_FENCES.clear()
+    queue.ADMISSION_RESERVATIONS.clear()
+    task = {
+        "id": "restore-retry-invalid-depth",
+        "type": "task",
+        "chat_id": 1,
+        "description": "retry terminal custody",
+        "depth": -1,
+        "priority": "not-an-integer",
+        "_queue_seq": "not-a-sequence",
+    }
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text(
+        json.dumps({
+            "ts": utc_now_iso(),
+            "pending": [{"task": task}],
+            "running": [],
+            "acceptance_fences": [],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        task_admission,
+        "terminalize_invalid_depth_restore",
+        lambda *_args, **_kwargs: False,
+    )
+    lock_observations = []
+    original_restore = queue.restore_invalid_depth_admission
+
+    def checked_restore(*args, **kwargs):
+        lock_observations.append(queue._queue_lock._is_owned())
+        return original_restore(*args, **kwargs)
+
+    monkeypatch.setattr(queue, "restore_invalid_depth_admission", checked_restore)
+
+    assert queue.restore_pending_from_snapshot() == 0
+    assert lock_observations == [True]
+    assert len(pending) == 1
+    assert pending[0]["id"] == task["id"]
+    assert pending[0]["depth"] == -1
+    assert "priority" not in pending[0]
+    assert "_queue_seq" not in pending[0]
+
+    admitted = queue.enqueue_task({"id": "healthy-after-bad-order", "type": "task", "depth": 0})
+    assert admitted["id"] == "healthy-after-bad-order"
+    assert [row["id"] for row in pending] == [
+        "restore-retry-invalid-depth", "healthy-after-bad-order",
+    ]
+
+
+@pytest.mark.parametrize("raw_value", [float("inf"), float("-inf")])
+def test_restore_failed_depth_terminalization_sanitizes_nonfinite_queue_metadata(
+    raw_value, tmp_path, monkeypatch,
+):
+    from supervisor import queue, task_admission
+    from ouroboros.utils import utc_now_iso
+
+    pending, running = [], {}
+    queue.init_queue_refs(pending, running, {"value": 0})
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    snapshot_path = tmp_path / "state" / "queue_snapshot.json"
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snapshot_path)
+    queue.ACCEPTANCE_FENCES.clear()
+    queue.ADMISSION_RESERVATIONS.clear()
+    task = {
+        "id": "restore-retry-nonfinite-order",
+        "type": "task",
+        "chat_id": 1,
+        "description": "retain malformed depth",
+        "depth": -1,
+        "priority": raw_value,
+        "_queue_seq": raw_value,
+    }
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text(
+        json.dumps({
+            "ts": utc_now_iso(),
+            "pending": [{"task": task}],
+            "running": [],
+            "acceptance_fences": [],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        task_admission,
+        "terminalize_invalid_depth_restore",
+        lambda *_args, **_kwargs: False,
+    )
+
+    assert queue.restore_pending_from_snapshot() == 0
+    assert len(pending) == 1
+    assert pending[0]["id"] == task["id"]
+    assert pending[0]["depth"] == -1
+    assert "priority" not in pending[0]
+    assert "_queue_seq" not in pending[0]
+    admitted = queue.enqueue_task({"id": "healthy-after-nonfinite-order", "type": "task", "depth": 0})
+    assert admitted["id"] == "healthy-after-nonfinite-order"
+
+
+def test_budget_pause_leaves_unresolved_invalid_depth_in_retry_custody(
+    tmp_path, monkeypatch,
+):
+    from supervisor import queue, state, workers
+    from ouroboros.task_results import load_task_result
+
+    pending = [
+        {
+            "id": "unresolved-before-budget",
+            "type": "task",
+            "chat_id": 1,
+            "description": "retry terminal custody",
+            "depth": -1,
+            "budget_drive_root": str(tmp_path),
+        },
+        {
+            "id": "healthy-before-budget",
+            "type": "task",
+            "chat_id": 1,
+            "description": "pause this task",
+            "depth": 0,
+            "budget_drive_root": str(tmp_path),
+        },
+    ]
+    worker = SimpleNamespace(wid=1, busy_task_id=None, reaping=False, in_q=SimpleNamespace(put=lambda _task: None))
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "WORKERS", {1: worker})
+    monkeypatch.setattr(workers, "load_state", lambda: {"owner_chat_id": 0})
+    monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    original_terminalize = workers._terminalize_invalid_pending_depth
+    monkeypatch.setattr(
+        workers,
+        "_terminalize_invalid_pending_depth",
+        lambda task, detail: (
+            False
+            if task.get("id") == "unresolved-before-budget"
+            else original_terminalize(task, detail)
+        ),
+    )
+    queue.BUDGET_ROOT_FENCES.clear()
+
+    workers.assign_tasks()
+
+    unresolved = next(task for task in pending if task["id"] == "unresolved-before-budget")
+    healthy = next(task for task in pending if task["id"] == "healthy-before-budget")
+    assert "_budget_pause" not in unresolved
+    assert healthy.get("_budget_pause", {}).get("status") == "paused_before_dispatch"
+    assert load_task_result(tmp_path, "healthy-before-budget")["status"] == STATUS_SCHEDULED
+    assert worker.busy_task_id is None
+
+
 def test_supervisor_keeps_admission_when_scheduled_write_raises_after_commit(
     tmp_path, monkeypatch,
 ):

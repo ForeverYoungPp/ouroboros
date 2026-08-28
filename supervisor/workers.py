@@ -2293,6 +2293,46 @@ def kill_workers(
                         exc_info=True,
                     )
 
+            def _settle_killed_pending(
+                task: Dict[str, Any], *, reason: str, status: str, trigger: str,
+            ) -> bool:
+                """Return true only after pending custody is durably terminal."""
+                task_id = str(task.get("id") or "").strip()
+                if not task_id:
+                    return False
+                try:
+                    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES
+
+                    _audit_delegate_terminal(task_id, trigger)
+                    persisted = _write_failure_result(
+                        task_id, reason=reason, status=status,
+                    )
+                except Exception:
+                    log.warning(
+                        "Failed to write failure result for pending task %s",
+                        task_id,
+                        exc_info=True,
+                    )
+                    return False
+                if str(persisted or "").strip() not in _TRULY_TERMINAL_STATUSES:
+                    log.warning(
+                        "Pending task %s did not reach terminal status during kill: %r",
+                        task_id,
+                        persisted,
+                    )
+                    return False
+                try:
+                    return bool(
+                        _emit_task_done_terminal(task, task_id, persisted)
+                    )
+                except Exception:
+                    log.warning(
+                        "Failed to emit terminal event for pending task %s",
+                        task_id,
+                        exc_info=True,
+                    )
+                    return False
+
             for task_id in list(RUNNING):
                 meta = RUNNING.get(task_id) or {}
                 task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
@@ -2338,33 +2378,36 @@ def kill_workers(
                     root_id = str(task.get("root_task_id") or "")
                     if parent_id and (parent_id in running_task_ids or root_id in interrupted_roots):
                         tid = str(task.get("id") or "")
-                        if tid:
-                            _audit_delegate_terminal(tid, "pending_parent_interrupted")
-                            persisted = _write_failure_result(
-                                tid,
-                                reason="Parent task was interrupted before this child started.",
-                                status="cancelled",
-                            )
-                            if _emit_task_done_terminal(task, tid, persisted or "cancelled"):
-                                drained_ids.append(tid)
+                        if _settle_killed_pending(
+                            task,
+                            reason="Parent task was interrupted before this child started.",
+                            status="cancelled",
+                            trigger="pending_parent_interrupted",
+                        ):
+                            drained_ids.append(tid)
+                        else:
+                            kept.append(task)
                         continue
                     kept.append(task)
                 PENDING[:] = kept
             else:
-                drained = queue.drain_all_pending()
+                # Keep the previous snapshot authoritative until every drained
+                # row has either durable terminal custody or been requeued.
+                drained = queue.drain_all_pending(persist=False)
                 for task in drained:
-                    tid = task.get("id")
-                    if tid:
-                        try:
-                            _audit_delegate_terminal(str(tid), "pending_pool_kill")
-                            persisted = _write_failure_result(tid, reason=result_reason, status=terminal_status)
-                        except Exception:
-                            log.warning("Failed to write failure result for pending task %s", tid, exc_info=True)
-                            persisted = done_status
-                        if _emit_task_done_terminal(task, str(tid), persisted or done_status):
-                            drained_ids.append(tid)
-                        else:
-                            PENDING.append(task)
+                    tid = str(task.get("id") or "").strip()
+                    if _settle_killed_pending(
+                        task,
+                        reason=result_reason,
+                        status=terminal_status,
+                        trigger="pending_pool_kill",
+                    ):
+                        drained_ids.append(tid)
+                    else:
+                        # No id, failed durable write, or failed notification:
+                        # retain the exact row so the final snapshot and a later
+                        # supervisor pass can retry custody.
+                        PENDING.append(task)
             if orphaned_ids or drained_ids:
                 append_jsonl(
                     DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -2802,6 +2845,24 @@ def _cancel_unauthorized_evolution(task: Dict[str, Any], reason: str) -> bool:
     return True
 
 
+def _invalid_depth_deferred(task: dict, deferred_ids: set[str]) -> bool:
+    task_id = str(task.get("id") or "").strip()
+    return (task_id or "<missing-task-id>") in deferred_ids
+
+
+def _drop_assignable_evolution_tasks(deferred_ids: set[str]) -> list[str]:
+    """Remove policy-blocked evolution rows while retaining deferred custody."""
+    blocked_ids = []
+    kept = []
+    for task in PENDING:
+        if str(task.get("type") or "") == "evolution" and not _invalid_depth_deferred(task, deferred_ids):
+            blocked_ids.append(str(task.get("id") or ""))
+        else:
+            kept.append(task)
+    PENDING[:] = kept
+    return blocked_ids
+
+
 def assign_tasks() -> None:
     from supervisor import queue
     from supervisor.state import budget_remaining, EVOLUTION_BUDGET_RESERVE
@@ -2812,14 +2873,15 @@ def assign_tasks() -> None:
         # capacity filters can leave it waiting indefinitely.
         _drop_cancelled_pending()
         invalid_ids, unresolved_invalid_ids = _quarantine_invalid_pending_depths()
+        unresolved_invalid_id_set = set(unresolved_invalid_ids)
+
         if invalid_ids:
             queue.persist_queue_snapshot(reason="invalid_task_depth")
         if unresolved_invalid_ids:
             log.error(
-                "Task assignment blocked: invalid depths could not be terminalized for %s",
+                "Invalid-depth rows deferred until terminal custody is available; continuing assignment for other tasks: %s",
                 ", ".join(unresolved_invalid_ids),
             )
-            return
         try:
             remaining = budget_remaining(st, strict=True)
         except Exception:
@@ -2828,6 +2890,8 @@ def assign_tasks() -> None:
         if remaining <= 0:
             planned = []
             for task in PENDING:
+                if _invalid_depth_deferred(task, unresolved_invalid_id_set):
+                    continue
                 if isinstance(task.get("_budget_pause"), dict):
                     continue
                 task_id = str(task.get("id") or "")
@@ -2914,9 +2978,8 @@ def assign_tasks() -> None:
         # mode switch must never actually run. Cancel them terminally.
         from supervisor.evolution_lifecycle import evolution_block_reason
         evo_block = evolution_block_reason()
-        if evo_block and any(str(t.get("type") or "") == "evolution" for t in PENDING):
-            blocked_ids = [str(t.get("id") or "") for t in PENDING if str(t.get("type") or "") == "evolution"]
-            PENDING[:] = [t for t in PENDING if str(t.get("type") or "") != "evolution"]
+        blocked_ids = _drop_assignable_evolution_tasks(unresolved_invalid_id_set) if evo_block else []
+        if blocked_ids:
             from ouroboros.task_results import STATUS_CANCELLED, write_task_result
             for tid in blocked_ids:
                 try:
@@ -2979,6 +3042,8 @@ def assign_tasks() -> None:
                 # and project-leased candidates)
                 chosen_idx = None
                 for i, candidate in enumerate(PENDING):
+                    if _invalid_depth_deferred(candidate, unresolved_invalid_id_set):
+                        continue
                     if not repo_writer_task_allowed(candidate):
                         continue
                     if isinstance(candidate.get("_budget_pause"), dict):
@@ -3000,14 +3065,11 @@ def assign_tasks() -> None:
                     chosen_idx = i
                     break
                 if chosen_idx is None:
-                    # Nothing assignable: project-leased tasks WAIT in PENDING
-                    # for the next pass; only over-budget evolution tasks are
-                    # cleaned out.
-                    if remaining < EVOLUTION_BUDGET_RESERVE and any(
-                        str(t.get("type") or "") == "evolution" for t in PENDING
-                    ):
-                        PENDING[:] = [t for t in PENDING if str(t.get("type") or "") != "evolution"]
-                        queue.persist_queue_snapshot(reason="evolution_dropped_budget")
+                    # Project-leased rows wait; over-budget evolution rows are cleaned.
+                    if remaining < EVOLUTION_BUDGET_RESERVE:
+                        dropped_ids = _drop_assignable_evolution_tasks(unresolved_invalid_id_set)
+                        if dropped_ids:
+                            queue.persist_queue_snapshot(reason="evolution_dropped_budget")
                     continue
                 task = PENDING.pop(chosen_idx)
                 depth_error = _normalize_pending_task_depth(task)
@@ -3015,9 +3077,7 @@ def assign_tasks() -> None:
                     if _terminalize_invalid_pending_depth(task, depth_error):
                         queue.persist_queue_snapshot(reason="invalid_task_depth")
                         continue
-                    # A failed terminal write must not turn into either a worker
-                    # dispatch or a disappearing queue row. Leave custody in the
-                    # queue and stop this assignment pass for a retry.
+                    # Keep failed terminalization in queue custody for retry.
                     PENDING.insert(chosen_idx, task)
                     log.error(
                         "Assignment blocked: invalid task depth could not be terminalized for %s",

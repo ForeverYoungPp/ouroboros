@@ -142,7 +142,7 @@ _last_skill_schedule_sync: float = 0.0
 _SKILL_SCHEDULE_SYNC_INTERVAL_SEC: float = 60.0
 
 from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
-    reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission,
+    coerce_queue_order, reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission,
     reserve_task_admission,
 )
 
@@ -177,10 +177,8 @@ def _task_priority(task_type: str) -> int:
 
 
 def _queue_sort_key(task: Dict[str, Any]) -> Tuple[int, int]:
-    _pr = task.get("priority")
-    pr = int(_pr) if _pr is not None else _task_priority(str(task.get("type") or ""))
-    _seq = task.get("_queue_seq")
-    seq = int(_seq) if _seq is not None else 0
+    pr = coerce_queue_order(task.get("priority"), _task_priority(str(task.get("type") or "")))
+    seq = coerce_queue_order(task.get("_queue_seq"))
     return pr, seq
 
 
@@ -189,11 +187,12 @@ def sort_pending() -> None:
     PENDING.sort(key=_queue_sort_key)
 
 
-def drain_all_pending() -> list:
-    """Drain pending tasks during crash-storm cleanup; caller holds _queue_lock."""
+def drain_all_pending(*, persist: bool = True) -> list:
+    """Drain pending tasks; optionally defer snapshot persistence until custody settles."""
     drained = list(PENDING)
     PENDING.clear()
-    persist_queue_snapshot(reason="drain_all_pending")
+    if persist:
+        persist_queue_snapshot(reason="drain_all_pending")
     return drained
 
 
@@ -295,7 +294,7 @@ def enqueue_task(
             return t
         QUEUE_SEQ_COUNTER_REF["value"] += 1
         seq = QUEUE_SEQ_COUNTER_REF["value"]
-        t.setdefault("priority", _task_priority(str(t.get("type") or "")))
+        t["priority"] = coerce_queue_order(t.get("priority"), _task_priority(str(t.get("type") or "")))
         _att = t.get("_attempt")
         t.setdefault("_attempt", int(_att) if _att is not None else 1)
         t["_queue_seq"] = -seq if front else seq
@@ -953,20 +952,21 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                         from ouroboros.cancel_intents import has_active_intent
 
                         if has_active_intent(DRIVE_ROOT, str(task.get("id"))):
-                            # Left for cancellation custody/watchdog to settle —
-                            # never a pending revival racing its own teardown.
+                            # Cancellation custody owns it; never revive a pending row.
                             skip_revival = True
                 except Exception:
                     log.debug("Snapshot restore terminal-status check failed for %s", task.get("id"), exc_info=True)
                 if skip_revival:
                     skipped_terminal += 1
                     continue
-                # These tasks already existed when the root pause was snapshotted.
-                # Restore them behind the root marker; only new admission is fenced.
                 admitted = enqueue_task(task, restoring_snapshot=True)
-            if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
-                restore_invalid_depth_admission(task, admitted, drive_root=DRIVE_ROOT, pending=PENDING, blocked=blocked_restore, terminalized=invalid_depth_restore)
-                continue
+                if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
+                    restore_invalid_depth_admission(task, admitted, drive_root=DRIVE_ROOT, pending=PENDING, blocked=blocked_restore, terminalized=invalid_depth_restore)
+                    try:
+                        sort_pending()
+                    except (TypeError, ValueError, OverflowError):
+                        log.warning("Deferred snapshot sort failed; custody retained", exc_info=True)
+                    continue
             restored += 1
         if skipped_fenced:
             append_jsonl(

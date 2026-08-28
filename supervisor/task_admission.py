@@ -19,6 +19,14 @@ from ouroboros.task_results import (
 log = logging.getLogger(__name__)
 
 
+def coerce_queue_order(value: Any, default: int = 0) -> int:
+    """Coerce persisted queue ordering metadata without exposing parse failures."""
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def parse_schedule_task_depth(
     ctx: Any,
     evt: Dict[str, Any],
@@ -164,7 +172,12 @@ def restore_invalid_depth_admission(
     task: Dict[str, Any], admitted: Dict[str, Any], *, drive_root: pathlib.Path,
     pending: list[Dict[str, Any]], blocked: list[str], terminalized: list[str],
 ) -> None:
-    """Handle one blocked snapshot admission and retain invalid rows on failure."""
+    """Handle one blocked snapshot admission and retain invalid rows on failure.
+
+    The queue caller must hold its queue lock while passing the live ``pending``
+    list.  A failed terminal write remains retryable in memory and in the
+    unchanged snapshot, but must not race queue assignment while it is restored.
+    """
     task_id = str(task.get("id") or "")
     blocked.append(task_id)
     if str(admitted.get("_admission_blocked") or "") != "invalid_task_depth":
@@ -176,10 +189,25 @@ def restore_invalid_depth_admission(
     if terminalize_invalid_depth_restore(task, detail, drive_root=drive_root):
         terminalized.append(task_id)
         return
-    if task_id and not any(str(row.get("id") or "") == task_id for row in pending):
+    if task_id and not any(
+        isinstance(row, dict) and str(row.get("id") or "") == task_id
+        for row in pending
+    ):
         # Keep the row in live custody; the unchanged snapshot remains a retry
-        # point if this process exits before the next assignment pass.
-        pending.append(dict(task))
+        # point if this process exits before the next assignment pass.  The
+        # queue owns the lock and ordering around this mutation.  Normalize only
+        # queue-order fields on the retry copy so malformed snapshot metadata
+        # cannot poison a later enqueue; the rejected depth evidence is intact.
+        pending_task = dict(task)
+        for field in ("priority", "_queue_seq"):
+            raw_value = pending_task.get(field)
+            if raw_value is None:
+                continue
+            try:
+                pending_task[field] = int(raw_value)
+            except (TypeError, ValueError, OverflowError):
+                pending_task.pop(field, None)
+        pending.append(pending_task)
 
 
 def scheduled_admission_rejection(

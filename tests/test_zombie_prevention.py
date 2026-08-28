@@ -155,6 +155,121 @@ def test_kill_workers_writes_failure_for_running_and_pending(tmp_path):
         assert data["task_id"] == tid
 
 
+def test_kill_workers_retains_pending_when_failure_result_is_not_durable(
+    tmp_path, monkeypatch,
+):
+    import supervisor.workers as workers
+    import supervisor.queue as queue
+
+    task = {"id": "bad/id", "type": "task", "depth": -1}
+    pending = [task]
+    snapshots = []
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(
+        queue,
+        "persist_queue_snapshot",
+        lambda reason="": snapshots.append((reason, [dict(row) for row in queue.PENDING])),
+    )
+    monkeypatch.setattr(
+        workers,
+        "_write_failure_result",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    workers.kill_workers(reconcile_delegate_custody=False)
+
+    assert pending == [task]
+    assert snapshots == [("kill_workers", [task])]
+
+
+def test_kill_workers_retains_pending_when_status_is_not_terminal(
+    tmp_path, monkeypatch,
+):
+    import supervisor.workers as workers
+    import supervisor.queue as queue
+
+    task = {"id": "interrupted-pending", "type": "task"}
+    pending = [task]
+    snapshots = []
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(
+        queue,
+        "persist_queue_snapshot",
+        lambda reason="": snapshots.append((reason, [dict(row) for row in queue.PENDING])),
+    )
+    monkeypatch.setattr(workers, "_write_failure_result", lambda *_args, **_kwargs: "interrupted")
+    monkeypatch.setattr(workers, "_emit_task_done_terminal", lambda *_args, **_kwargs: True)
+
+    workers.kill_workers(
+        terminal_status="interrupted",
+        reconcile_delegate_custody=False,
+    )
+
+    assert pending == [task]
+    assert snapshots == [("kill_workers", [task])]
+
+
+def test_kill_workers_preserves_interrupted_pending_when_terminal_event_fails(
+    tmp_path, monkeypatch,
+):
+    import supervisor.workers as workers
+    import supervisor.queue as queue
+
+    parent_id = "interrupted-parent"
+    child = {
+        "id": "interrupted-child",
+        "type": "task",
+        "parent_task_id": parent_id,
+        "root_task_id": parent_id,
+        "depth": 0,
+    }
+    pending = [child]
+    running = {
+        parent_id: {
+            "task": {"id": parent_id, "root_task_id": parent_id, "type": "task"},
+            "worker_id": 0,
+        },
+    }
+    snapshots = []
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "RUNNING", running)
+    monkeypatch.setattr(queue, "RUNNING", running)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(
+        queue,
+        "persist_queue_snapshot",
+        lambda reason="": snapshots.append((reason, [dict(row) for row in queue.PENDING])),
+    )
+    monkeypatch.setattr(workers, "_write_failure_result", lambda *_args, **_kwargs: "cancelled")
+    monkeypatch.setattr(
+        workers,
+        "_emit_task_done_terminal",
+        lambda _task, task_id, *_args, **_kwargs: task_id == parent_id,
+    )
+
+    workers.kill_workers(
+        preserve_pending=True,
+        archive_service_logs=False,
+        reconcile_delegate_custody=False,
+    )
+
+    assert pending == [child]
+    assert snapshots == [("kill_workers", [child])]
+
+
 def test_kill_workers_can_record_owner_restart_cancellation(tmp_path):
     """Owner restart should not describe intentional aborts as crash storms."""
     import supervisor.workers as workers
