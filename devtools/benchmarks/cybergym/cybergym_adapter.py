@@ -1510,6 +1510,61 @@ def _event_amount(event: Mapping[str, Any], *keys: str, allow_none: bool = False
     raise LedgerError(f"ledger event missing {keys[0]}")
 
 
+_TERMINAL_GATEWAY_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "rejected_duplicate"}
+)
+
+
+def _terminal_gateway_accounting(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Project a terminal gateway's total accounted bound for the outer ledger.
+
+    The outer CyberGym ledger cannot see the gateway's physical attempt rows,
+    so a terminal task response must contribute its total
+    ``accounted_upper_bound_usd`` (with ``cost_usd`` as the frozen alias).
+    ``unresolved_upper_bound_usd`` is only the inner ledger's residual and is
+    never sufficient by itself.  Restricting this helper to terminal payloads
+    prevents an intermediate/running snapshot from authorizing dispatch.
+    """
+
+    if not isinstance(payload, Mapping):
+        return {}
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in _TERMINAL_GATEWAY_STATUSES:
+        return {}
+    sources: list[Mapping[str, Any]] = [payload]
+    breakdown = payload.get("cost_breakdown")
+    if isinstance(breakdown, Mapping):
+        sources.append(breakdown)
+
+    def first_value(*names: str) -> Any:
+        for source in sources:
+            for name in names:
+                if name in source and source[name] is not None:
+                    return source[name]
+        return None
+
+    total: float | None = None
+    total_raw = first_value("accounted_upper_bound_usd", "cost_usd")
+    if total_raw is not None:
+        try:
+            total = _money(total_raw, field="accounted_upper_bound_usd")
+        except LedgerError:
+            total = None
+    projected: dict[str, Any] = {}
+    if total is not None:
+        projected.update({"cost_upper_bound_usd": total, "cost_usd": total})
+    final = first_value("cost_final")
+    if isinstance(final, bool):
+        projected["cost_final"] = final
+    estimated = first_value("cost_estimated")
+    if isinstance(estimated, bool):
+        projected["cost_estimated"] = estimated
+    accounting_status = first_value("cost_accounting_status", "cost_status")
+    if isinstance(accounting_status, str) and accounting_status.strip():
+        projected["cost_status"] = accounting_status.strip()
+    return projected
+
+
 def project_budget(
     events: Iterable[Mapping[str, Any]], cap_usd: float | None = DEFAULT_BUDGET_CAP_USD
 ) -> BudgetProjection:
@@ -1999,6 +2054,16 @@ def run_campaign(
             if not isinstance(result, Mapping):
                 raise CyberGymIntegrationUnavailable("CyberGym executor must return a mapping")
             outcome = dict(result)
+            # A terminal gateway result is the only authoritative source for
+            # an outer-ledger bound when the executor stopped during custody.
+            # Project its TOTAL accounted amount before building the row and
+            # settling/unresolving the claim; the inner unresolved remainder
+            # alone would omit already-settled gateway usage.
+            terminal_accounting = _terminal_gateway_accounting(
+                outcome.get("runtime_result")
+            )
+            if terminal_accounting:
+                outcome.update(terminal_accounting)
             requested_status = str(outcome.get("status") or "completed").strip().lower()
             raw_cost_estimated = outcome.get("cost_estimated")
             if raw_cost_estimated not in (None, False, True):

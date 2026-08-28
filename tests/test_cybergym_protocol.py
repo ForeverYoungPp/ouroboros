@@ -414,6 +414,52 @@ def test_run_campaign_does_not_settle_nonfinal_cost(tmp_path):
     assert projection.can_dispatch is False
 
 
+def test_run_campaign_records_terminal_total_accounted_bound_not_residual(tmp_path):
+    """The outer ledger must retain known inner spend plus its open remainder."""
+
+    from devtools.benchmarks.cybergym.cybergym_adapter import _terminal_gateway_accounting
+
+    terminal = {
+        "status": "failed",
+        "cost_usd": 0.060914,
+        "accounted_upper_bound_usd": 0.060914,
+        "unresolved_upper_bound_usd": 0.020062,
+        "cost_final": False,
+    }
+
+    def callback(_task, _task_dir):
+        return {
+            "status": "infra_failed",
+            "lifecycle": "gateway_terminal",
+            "infra_reason": "failed",
+            "runtime_result": terminal,
+        }
+
+    projected = _terminal_gateway_accounting(terminal)
+    assert projected["cost_upper_bound_usd"] == pytest.approx(0.060914)
+    assert projected["cost_upper_bound_usd"] != pytest.approx(0.020062)
+    assert _terminal_gateway_accounting(
+        {"status": "failed", "unresolved_upper_bound_usd": 0.020062}
+    ) == {}
+    assert _terminal_gateway_accounting(
+        {"status": "running", "accounted_upper_bound_usd": 0.060914}
+    ) == {}
+
+    root = tmp_path / "terminal-bound"
+    rows = run_campaign(
+        ["arvo:1"],
+        run_root=root,
+        executor=callback,
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+    )
+    assert rows[0]["status"] == "infra_failed"
+    projection = BudgetLedger(root / "claims.jsonl", cap_usd=2).projection()
+    assert projection.unresolved_upper_bound_usd == pytest.approx(0.060914)
+    assert projection.projected_usd == pytest.approx(0.060914)
+    assert projection.unresolved_upper_bound_usd != pytest.approx(0.020062)
+
+
 def test_strict_trial_bool_rejects_truthy_strings_and_contract_is_pinned():
     assert parse_strict_bool("false") is False
     assert parse_strict_bool("TRUE") is True

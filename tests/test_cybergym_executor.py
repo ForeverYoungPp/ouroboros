@@ -1443,6 +1443,88 @@ def test_gateway_waits_for_final_cost_after_completed_status(tmp_path):
     assert calls == ["POST", "GET", "GET"]
 
 
+def test_cancel_503_recovers_terminal_gateway_payload(tmp_path):
+    config = _config(tmp_path, poll_interval_sec=0)
+    task_id = "cybergym-cancel-503"
+    terminal = {
+        "task_id": task_id,
+        "status": "failed",
+        "cost_usd": 0.060914,
+        "accounted_upper_bound_usd": 0.060914,
+        "unresolved_upper_bound_usd": 0.020062,
+        "cost_final": False,
+    }
+    calls = []
+    responses = iter(
+        (
+            {"status_code": 503, "body": {"detail": "teardown still live"}},
+            {"status_code": 200, "body": terminal},
+        )
+    )
+
+    def http(method, _url, **_kwargs):
+        calls.append(method)
+        return next(responses)
+
+    executor = CyberGymExecutor(dataclasses_replace(config, http_runner=http))
+    executor._gateway_attempts[task_id] = {  # noqa: SLF001 - custody assertion
+        "gateway_task_id": task_id,
+        "status": "submitted",
+    }
+    checkpoint = config.run_root / "checkpoint.json"
+    result = executor._cancel_gateway_task(task_id, checkpoint)  # noqa: SLF001
+
+    assert result == terminal
+    assert calls == ["POST", "GET"]
+    assert task_id not in executor._gateway_attempts
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert saved["status"] == "failed"
+    assert saved["cancel_status_code"] == 503
+    assert saved["result"]["accounted_upper_bound_usd"] == pytest.approx(0.060914)
+
+
+def test_cancel_auth_failure_does_not_fallback_to_get(tmp_path):
+    config = _config(tmp_path, poll_interval_sec=0)
+    task_id = "cybergym-cancel-auth"
+    calls = []
+
+    def http(method, _url, **_kwargs):
+        calls.append(method)
+        return {"status_code": 401, "body": {"detail": "unauthorized"}}
+
+    executor = CyberGymExecutor(dataclasses_replace(config, http_runner=http))
+    executor._gateway_attempts[task_id] = {  # noqa: SLF001 - custody assertion
+        "gateway_task_id": task_id,
+        "status": "submitted",
+    }
+    with pytest.raises(ExecutorFailure, match="cancellation request failed"):
+        executor._cancel_gateway_task(task_id, config.run_root / "checkpoint.json")  # noqa: SLF001
+    assert calls == ["POST"]
+    assert task_id in executor._gateway_attempts
+
+
+def test_cancel_503_with_get_failure_keeps_custody_block(tmp_path):
+    config = _config(tmp_path, poll_interval_sec=0)
+    task_id = "cybergym-cancel-no-terminal"
+    calls = []
+
+    def http(method, _url, **_kwargs):
+        calls.append(method)
+        if method == "POST":
+            return {"status_code": 503, "body": {"detail": "teardown still live"}}
+        raise ExecutorFailure("status transport failed")
+
+    executor = CyberGymExecutor(dataclasses_replace(config, http_runner=http))
+    executor._gateway_attempts[task_id] = {  # noqa: SLF001 - custody assertion
+        "gateway_task_id": task_id,
+        "status": "submitted",
+    }
+    with pytest.raises(ExecutorFailure, match="status transport failed"):
+        executor._cancel_gateway_task(task_id, config.run_root / "checkpoint.json")  # noqa: SLF001
+    assert calls == ["POST", "GET"]
+    assert task_id in executor._gateway_attempts
+
+
 def dataclasses_replace(config, **changes):
     import dataclasses
 
