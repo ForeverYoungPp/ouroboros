@@ -89,6 +89,33 @@ integrity and authority boundaries plus truthful receipts; do not add
 task-specific auto-retry, fallback, cleanup, resume, or terminal-flow state
 machines.
 
+### Generality and emergence (P13)
+
+Every non-trivial change picks a level: patch the case in front of you,
+solve the class it belongs to, or build a framework for cases that do
+not exist yet. The first fossilizes, the third speculates; aim for the
+second. Two questions find it:
+
+- **The invariant question.** What must stay true here for every
+  install, provider, model, and consumer this seam serves — and what is
+  merely a feature of the case at hand? Mechanism goes where the
+  invariant lives, at its existing SSOT owner; the case's accidents —
+  today's provider quirk, config, workflow, team shape, benchmark —
+  stay out of shared surfaces.
+- **The stronger-mind question.** If tomorrow's model were sharply more
+  capable, would this change let it do more through the same seam — or
+  would the change itself have to be torn out first? Strategies the
+  current model exhibits (orderings, roles, decomposition habits) are
+  examples worth recording as hints, never contracts to enforce.
+
+The proof burden is symmetric: promoting a case detail into shared
+structure requires showing it is an invariant (several real variants,
+or one already-stable boundary); adding an abstraction requires a
+demonstrated class — an imagined consumer is not one. In doubt,
+generalize the meaning and the authority, keep the mechanism minimal
+and local, and let the next real case pay for the next step. Reviewer
+findings are evidence for this judgment, never policy that overrides it.
+
 ### Pricing and admission
 
 Never add hand-maintained model-price tables, inherited prefix tariffs, or
