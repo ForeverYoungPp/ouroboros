@@ -33,6 +33,11 @@ class ReviewActorRecord:
     reset_at: str = ""
     http_status: Optional[int] = None
     transport_status: str = ""
+    operation_id: str = ""
+    operation_state: str = "settled"
+    late_result_pending: bool = False
+    pending_invocation_id: str = ""
+    delegated_run_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         # The durable id is the one the review substrate actually ran this row
@@ -62,6 +67,11 @@ class ReviewActorRecord:
             "reset_at": self.reset_at,
             "http_status": self.http_status,
             "transport_status": self.transport_status,
+            "operation_id": self.operation_id,
+            "operation_state": self.operation_state,
+            "late_result_pending": self.late_result_pending,
+            "pending_invocation_id": self.pending_invocation_id,
+            "delegated_run_id": self.delegated_run_id,
         }
 
 
@@ -114,6 +124,11 @@ def _actor_record(
         reset_at=str(actor.get("reset_at") or ""),
         http_status=(int(actor["http_status"]) if isinstance(actor.get("http_status"), int) else None),
         transport_status=str(actor.get("transport_status") or ""),
+        operation_id=str(actor.get("operation_id") or ""),
+        operation_state=str(actor.get("operation_state") or "settled"),
+        late_result_pending=bool(actor.get("late_result_pending")),
+        pending_invocation_id=str(actor.get("pending_invocation_id") or ""),
+        delegated_run_id=str(actor.get("delegated_run_id") or ""),
     )
 
 
@@ -346,6 +361,12 @@ def parse_model_review_results(
         raw_text = str(actor.get("text") or "")
         model_label = model or "reviewer"
         actor_slot_id = str(actor.get("slot_id") or "")
+        if str(actor.get("operation_state") or "") == "not_dispatched":
+            records.append(_actor_record(
+                actor, idx=idx, model_label=model_label,
+                status="not_dispatched", raw_text=raw_text,
+            ))
+            continue
         if str(actor.get("verdict") or "").upper() == "ERROR":
             records.append(_actor_record(actor, idx=idx, model_label=model_label, status="error", raw_text=raw_text))
             continue

@@ -28,6 +28,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from ouroboros._usage_rows import REVIEW_ATTRIBUTION_KEYS
+from ouroboros.delegate_custody_usage import (
+    disclosed_spend,
+    disclosed_tokens,
+    summary_of,
+)
 from ouroboros.utils import append_jsonl, utc_now_iso
 log = logging.getLogger(__name__)
 # The harness's own terminal vocabulary — one definition for the tool, the settler and
@@ -659,11 +664,24 @@ def new_invocation_id() -> str:
 
 
 def invocation_record(drive_root: Any, invocation_id: str) -> Optional[Dict[str, Any]]:
-    """Return the first request's exact body/binding and its durable fate.
-
-    Only ``pending`` may replay the stored bytes; ``started`` waits on its bound
-    run and ``failed_definite`` is dead. First-request route, project, lineage,
-    usage attribution and isolation facts are never re-derived on retry.
+    """One invocation's durable fate: who requested it, the EXACT body it sent,
+    the resources that attempt bound, and how it resolved.
+    ``state`` is ``pending`` (requested, never bound, never definitely refused —
+    the only state an explicit retry may replay), ``started`` (a run bound to it;
+    carried with its ``run_id`` so the caller can wait instead of re-posting), or
+    ``failed_definite`` (the daemon definitively refused; the id is dead — replaying
+    it against a since-reconfigured route is how a key wedges into a permanent 409).
+    ``request`` is the canonical POST body recorded before the wire attempt: a retry
+    replays THESE bytes, never a re-derivation, because the engine's replay match
+    digests the request and answers a same-key-different-digest POST with 409
+    ``idempotency_conflict``.
+    ``route``, ``project_id``, ``project_owned`` and ``idempotency_key`` are the
+    attempt facts that never ride the wire, read from the FIRST request row — the
+    minting — because the invocation stores its facts ONCE and a retry replays them.
+    A retry that re-derived any of these from the current route/model/workspace
+    context wrote a durable record contradicting the body it actually POSTed.
+    First-request lineage, usage attribution (category/source/skill/wave/slot),
+    and isolation facts are likewise replayed rather than re-derived.
     """
     target = str(invocation_id or "").strip()
     if not target:
@@ -677,6 +695,9 @@ def invocation_record(drive_root: Any, invocation_id: str) -> Optional[Dict[str,
         if kind == START_REQUESTED and found is None:
             found = {
                 "task_id": str(row.get("task_id") or ""),
+                "surface": str(row.get("surface") or ""),
+                "slot_id": str(row.get("slot_id") or ""),
+                "operation_id": str(row.get("operation_id") or ""),
                 "request": row.get("request") if isinstance(row.get("request"), dict) else None,
                 "route": str(row.get("route") or ""),
                 "project_id": str(row.get("project_id") or ""),
@@ -776,54 +797,10 @@ def output_disposition(custody: RunCustody) -> Dict[str, Any]:
     return _disposition(custody)
 
 
-# -- money and terminal state --------------------------------------------------
-
-
-def summary_of(detail: Dict[str, Any]) -> Dict[str, Any]:
-    return detail.get("summary") if isinstance(detail.get("summary"), dict) else {}
-
-
-def disclosed_spend(summary: Dict[str, Any]) -> Tuple[Optional[float], bool]:
-    """The cash the harness reported AND whether it is settled — never one without both.
-
-    `spendUsd` is only half the disclosure: the engine populates the sibling
-    `spendEstimated` ("True when settled cash is estimated rather than exact") and really
-    sets it — 8 of 60 live `/v2/runs` rows carry it. Reading the amount alone made an
-    ESTIMATE indistinguishable from settled cash, so an unsettled charge was written to
-    the ledger as final and relayed to the agent as a closed book.
-
-    Returned as ONE pair rather than two readers, so no call site can ask half the
-    question — the shape that produced this defect. "Disclosed nothing" is `(None, False)`
-    and not `(None, None)`: the flag is DEFINITELY false with no amount, so the settled
-    envelope can publish it verbatim instead of deciding for itself what silence means.
-    """
-    raw = summary.get("spendUsd")
-    if raw is None:
-        return None, False
-    try:
-        return float(raw), summary.get("spendEstimated") is True
-    except (TypeError, ValueError):
-        return None, False
-
-
-def disclosed_tokens(raw: Any) -> Optional[int]:
-    """A reported token count, or None when the harness reported nothing.
-
-    The control schema is explicit that these are "null until a harness reported it —
-    never render null as 0", and null is what live rows really carry. `int(raw or 0)`
-    erased the distinction, making a run that disclosed nothing look like one that
-    genuinely used zero tokens. Same rule as cost, one axis over.
-    """
-    if raw is None:
-        return None
-    try:
-        return max(0, int(raw))
-    except (TypeError, ValueError):
-        return None
-
-
 def is_terminal(detail: Dict[str, Any]) -> bool:
-    return str(summary_of(detail).get("state") or "") in TERMINAL_STATES
+    from ouroboros.delegate_custody_usage import is_terminal as _is_terminal
+
+    return _is_terminal(detail, TERMINAL_STATES)
 
 
 def retire_project(drive_root: Any, gateway: Any, custody: RunCustody) -> None:

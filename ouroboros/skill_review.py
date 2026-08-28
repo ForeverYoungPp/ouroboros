@@ -1428,7 +1428,7 @@ def review_skill(
             models=models,
             row_plan=delivery,
             session_root=str(_REPO_ROOT),
-            usage_attribution={"review_skill": skill.name, "review_wave_id": stamp.wave_id},
+            usage_attribution={"review_skill": skill.name, "review_wave_id": stamp.wave_id}, review_contract_fingerprint=contract_fp, rebuttal_sha256=rebuttal_sha,
             build_prompt=_build_review_prompt_for_attempt,
             run_review=_handle_multi_model_review,
         )

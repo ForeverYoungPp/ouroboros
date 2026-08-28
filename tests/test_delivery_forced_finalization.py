@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import queue
+import threading
+import time
 from types import SimpleNamespace
 
 from tests._delivery_candidate_shared import (
@@ -125,6 +127,57 @@ def test_round_limit_projects_deferred_child_before_forced_return(tmp_path, monk
     _assert_forced_deferred_outcome(
         text, usage, returned_trace, "round_limit",
     )
+
+
+def test_post_round_finalize_control_binds_its_grace_deadline(tmp_path, monkeypatch):
+    """A finalize control drained after an answer uses the mailbox grace deadline.
+
+    The post-round drain reaches the same forced rail as the early-round path;
+    it must not fall back to the task's raw transport deadline.
+    """
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    registry._ctx.owner_message_admission_lock = threading.RLock()
+    registry._ctx.owner_message_admission_agent = SimpleNamespace(
+        _accepting_owner_messages=False,
+        _busy=True,
+        _current_task_id="parent1",
+    )
+    grace_deadline = time.time() + 42.0
+    monkeypatch.setattr(loop, "_resolve_delivery_control", lambda content, *_args: ("fresh", content))
+    monkeypatch.setattr(loop, "_enforce_swarm_actions", lambda *_args: False)
+    monkeypatch.setattr(loop, "_compute_subagent_handoff", lambda *_args: None)
+    monkeypatch.setattr(loop, "_maybe_enforce_child_absorption_gate", lambda *_args: None)
+    monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_args: False)
+    monkeypatch.setattr(loop, "_finalize_task_services", lambda *_args: False)
+    monkeypatch.setattr(loop, "_run_task_acceptance_review_once", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        loop,
+        "_drain_incoming_messages",
+        lambda *_args, **_kwargs: {
+            "finalize_now": "deadline",
+            "finalize_deadline_ts": grace_deadline,
+        },
+    )
+    observed = {}
+
+    def _capture_forced(ctx, reason):
+        observed["deadline_ts"] = ctx.deadline_ts
+        observed["reason"] = reason
+        return "forced", {}, {}
+
+    monkeypatch.setattr(loop, "_handle_forced_finalization", _capture_forced)
+    result = loop._no_tool_final_answer(
+        "answer",
+        limit_ctx,
+        trace,
+        registry,
+        queue.Queue(),
+        set(),
+        lambda _msg: None,
+    )
+
+    assert result[:2] == ("forced", {})
+    assert observed == {"deadline_ts": grace_deadline, "reason": "deadline"}
 
 
 def test_budget_exhaustion_projects_deferred_child_before_forced_return(
@@ -687,6 +740,37 @@ def test_provider_unavailable_without_model_answer_stamps_host_salvage(
     assert usage["terminal_origin"] == "host_salvage"
 
 
+def test_deadline_exhausted_forced_finalization_keeps_local_reason(tmp_path, monkeypatch):
+    import time
+    from ouroboros.outcomes import derive_loop_outcome
+
+    loop, _registry, limit_ctx, _trace = _forced_test_context(
+        tmp_path, usage={"_last_llm_error_kind": "deadline_exhausted"},
+    )
+    limit_ctx.deadline_ts = time.time() + 30
+    monkeypatch.setattr(
+        loop,
+        "call_llm_with_retry",
+        lambda *_args, **_kwargs: (
+            {"role": "assistant", "content": "Best answer before deadline."},
+            0.0,
+        ),
+    )
+
+    text, usage, returned_trace = loop._handle_provider_unavailable(
+        limit_ctx, error_kind="deadline_exhausted",
+    )
+
+    assert text == "Best answer before deadline."
+    assert usage["reason_code"] == "deadline_local"
+    assert usage["execution_status"] == "failed"
+    assert usage["_best_effort_extracted"] is True
+    assert returned_trace["forced_finalization"]["reason_code"] == "deadline_local"
+    outcome = derive_loop_outcome(text, usage, returned_trace)
+    assert outcome["outcome_axes"]["execution"]["status"] == "best_effort"
+    assert outcome["outcome_axes"]["execution"]["reason_code"] == "deadline_local"
+
+
 def test_normal_host_suffix_is_inside_candidate_and_panel_subject(tmp_path, monkeypatch):
     import hashlib
 
@@ -1129,6 +1213,34 @@ def test_second_forced_owner_arrival_returns_exact_resume_fallback(tmp_path, mon
     ).hexdigest()
     assert returned_trace["forced_finalization"]["source"] == (
         "late_owner_directive_requires_resume"
+    )
+
+
+def test_forced_owner_refresh_does_not_resend_unknown_provider_outcome(tmp_path, monkeypatch):
+    incoming = queue.Queue()
+    loop, registry, ctx, _trace = _forced_test_context(tmp_path, incoming=incoming)
+    calls = 0
+
+    def forced_model(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        ctx.accumulated_usage["_last_llm_error_kind"] = "provider_outcome_unknown"
+        incoming.put("retain this owner directive for resume")
+        return {"role": "assistant", "content": ""}, 0.0
+
+    monkeypatch.setattr(loop, "call_llm_with_retry", forced_model)
+    text, _usage, returned_trace = loop._forced_final_answer(
+        ctx,
+        prompt="finalize",
+        fallback_text="fallback",
+        reason_code="round_limit",
+    )
+
+    assert calls == 1
+    assert "Resume the task" in text
+    assert len(registry._ctx._owner_directives) == 1
+    assert returned_trace["forced_finalization"]["source"] == (
+        "provider_outcome_unknown_no_resend"
     )
 
 

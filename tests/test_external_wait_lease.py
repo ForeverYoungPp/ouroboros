@@ -282,6 +282,184 @@ def test_the_lease_never_spares_deadline_or_ceiling(monkeypatch, tmp_path):
     assert meta2.get("finalization_reason") == "deadline"
 
 
+def test_parallel_cognitive_operations_are_independent_and_attempt_bound(
+    monkeypatch, tmp_path,
+):
+    from supervisor import events as events_mod
+
+    monkeypatch.setattr("ouroboros.config.get_task_abs_ceiling_sec", lambda: 10_000)
+    monkeypatch.setattr(events_mod.time, "time", lambda: 1100.0)
+
+    meta = {
+        "task": {"id": "t3", "chat_id": 7},
+        "attempt": 2,
+        "started_at": 1000.0,
+        "last_progress_at": 1000.0,
+        "worker_id": 0,
+    }
+    ctx = types.SimpleNamespace(RUNNING={"t3": meta})
+
+    for operation_id in ("llm-1", "review-1"):
+        events_mod._handle_cognitive_operation(
+            {
+                "type": "cognitive_operation", "task_id": "t3",
+                "operation_id": operation_id, "phase": "started",
+                "kind": "llm", "task_attempt": 2, "lease_until": 3000.0,
+            },
+            ctx,
+        )
+    assert set(meta["active_operation_leases"]) == {"llm-1", "review-1"}
+
+    # A late event from attempt 1 cannot close either operation of attempt 2.
+    events_mod._handle_cognitive_operation(
+        {
+            "type": "cognitive_operation", "task_id": "t3",
+            "operation_id": "llm-1", "phase": "finished",
+            "task_attempt": 1,
+        },
+        ctx,
+    )
+    assert set(meta["active_operation_leases"]) == {"llm-1", "review-1"}
+
+    # One operation may settle while the other still spares the idle rail.
+    events_mod._handle_cognitive_operation(
+        {
+            "type": "cognitive_operation", "task_id": "t3",
+            "operation_id": "llm-1", "phase": "finished",
+            "task_attempt": 2,
+        },
+        ctx,
+    )
+    assert set(meta["active_operation_leases"]) == {"review-1"}
+    _enforcer(monkeypatch, tmp_path, {"t3": meta})(2500.0)
+    assert "finalization_requested_at" not in meta
+
+    events_mod._handle_cognitive_operation(
+        {
+            "type": "cognitive_operation", "task_id": "t3",
+            "operation_id": "review-1", "phase": "failed",
+            "task_attempt": 2,
+        },
+        ctx,
+    )
+    assert "active_operation_leases" not in meta
+    _enforcer(monkeypatch, tmp_path, {"t3": meta})(2500.0)
+    assert meta.get("finalization_requested_at") == 2500.0
+
+
+def test_cognitive_operation_event_reaches_idle_enforcer_via_dispatch(
+    monkeypatch, tmp_path,
+):
+    from supervisor import events as events_mod
+
+    monkeypatch.setattr(events_mod.time, "time", lambda: 1100.0)
+    meta = {
+        "task": {"id": "t4", "chat_id": 7},
+        "attempt": 1,
+        "started_at": 1000.0,
+        "last_progress_at": 1000.0,
+        "worker_id": 0,
+    }
+    ctx = types.SimpleNamespace(
+        RUNNING={"t4": meta},
+        DRIVE_ROOT=tmp_path,
+        append_jsonl=lambda *_args, **_kwargs: None,
+    )
+    events_mod.dispatch_event(
+        {
+            "type": "cognitive_operation", "task_id": "t4",
+            "operation_id": "llm-live", "phase": "started", "kind": "llm",
+            "task_attempt": 1, "lease_until": 3000.0,
+        },
+        ctx,
+    )
+    _enforcer(monkeypatch, tmp_path, {"t4": meta})(2500.0)
+    assert "finalization_requested_at" not in meta
+
+
+def test_cognitive_operation_terminal_event_matches_execution_identity(
+    monkeypatch,
+):
+    from supervisor import events as events_mod
+
+    monkeypatch.setattr(events_mod.time, "time", lambda: 1100.0)
+    meta = {
+        "task": {"id": "t5", "chat_id": 7}, "attempt": 1,
+        "started_at": 1000.0, "last_progress_at": 1000.0, "worker_id": 0,
+    }
+    ctx = types.SimpleNamespace(RUNNING={"t5": meta})
+    for execution_id, round_id in (("exec-1", "round-1"), ("exec-2", "round-2")):
+        events_mod._handle_cognitive_operation(
+            {
+                "type": "cognitive_operation", "task_id": "t5",
+                "operation_id": "call-1", "phase": "started", "kind": "tool",
+                "task_attempt": 1, "lease_until": 3000.0,
+                "execution_id": execution_id, "round_id": round_id,
+            },
+            ctx,
+        )
+    events_mod._handle_cognitive_operation(
+        {
+            "type": "cognitive_operation", "task_id": "t5",
+            "operation_id": "call-1", "phase": "finished", "kind": "tool",
+            "task_attempt": 1, "execution_id": "exec-1", "round_id": "round-1",
+        },
+        ctx,
+    )
+    assert "call-1" in meta["active_operation_leases"]
+    # A legacy/partial terminal event cannot close a row whose correlation
+    # identity is known; it remains leased until its real settlement or ceiling.
+    events_mod._handle_cognitive_operation(
+        {
+            "type": "cognitive_operation", "task_id": "t5",
+            "operation_id": "call-1", "phase": "finished", "kind": "tool",
+            "task_attempt": 1,
+        },
+        ctx,
+    )
+    assert "call-1" in meta["active_operation_leases"]
+
+
+def test_timed_out_tool_closes_its_cognitive_lease_when_worker_settles(tmp_path, monkeypatch):
+    from ouroboros import loop_tool_execution as loop_tools
+
+    events = stdqueue.Queue()
+    ctx = types.SimpleNamespace(
+        event_queue=events, task_id="tool-task", task_attempt=1,
+        task_metadata={}, _current_llm_call_meta={"execution_id": "exec-1", "round_id": "round-1"},
+    )
+    tools = types.SimpleNamespace(_ctx=ctx, CODE_TOOLS=set())
+
+    def slow_tool(*_args):
+        time.sleep(0.05)
+        return {
+            "tool_call_id": "tool-1", "fn_name": "read_file", "result": "ok",
+            "is_error": False, "args_for_log": {}, "is_code_tool": False,
+            "result_meta": {},
+        }
+
+    monkeypatch.setattr(loop_tools, "_execute_single_tool", slow_tool)
+    result = loop_tools._execute_with_timeout(
+        tools,
+        {"id": "tool-1", "function": {"name": "read_file", "arguments": "{}"}},
+        tmp_path / "logs",
+        timeout_sec=0.01,
+        task_id="tool-task",
+    )
+    assert result["is_error"] is True
+    time.sleep(0.1)
+    rows = []
+    while not events.empty():
+        rows.append(events.get_nowait())
+    terminal = [
+        row for row in rows
+        if row.get("type") == "cognitive_operation"
+        and row.get("operation_id") == "tool-1"
+        and row.get("phase") == "finished"
+    ]
+    assert terminal
+
+
 def _llm_call_event(phase, **overrides):
     return {
         "type": "main_llm_call_state",

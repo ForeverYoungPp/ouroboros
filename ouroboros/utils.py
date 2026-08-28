@@ -68,6 +68,48 @@ def emit_log_event(
         log.debug("Failed to emit %s event", log_label, exc_info=True)
 
 
+def emit_cognitive_operation_event(
+    event_queue: Any,
+    *,
+    task_id: str,
+    operation_id: str,
+    phase: str,
+    kind: str,
+    task_attempt: Any = None,
+    lease_until: Optional[float] = None,
+    **payload: Any,
+) -> None:
+    """Publish one typed lifecycle fact for a live cognitive operation.
+
+    This is deliberately a direct worker event, rather than a UI ``log_event``
+    envelope.  The supervisor uses it only to spare its idle rail while the
+    physical call is in flight; deadlines, budgets, cancellation and the
+    absolute task ceiling remain independent.  Callers may omit ``lease_until``
+    so the supervisor derives a bounded ceiling from the task it owns.
+    """
+    if event_queue is None:
+        return
+    try:
+        event = {
+            "type": "cognitive_operation",
+            "task_id": str(task_id or ""),
+            "operation_id": str(operation_id or ""),
+            "phase": str(phase or ""),
+            "kind": str(kind or ""),
+            **payload,
+        }
+        if task_attempt is not None:
+            event["task_attempt"] = task_attempt
+        if lease_until is not None:
+            event["lease_until"] = float(lease_until)
+        if str(phase or "").strip().lower() == "started":
+            event_queue.put(event)
+        else:
+            event_queue.put_nowait(event)
+    except Exception:
+        log.debug("Failed to emit cognitive operation event", exc_info=True)
+
+
 def emit_main_llm_call_state_event(
     event_queue: Any,
     *,

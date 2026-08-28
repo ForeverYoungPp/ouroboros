@@ -1750,7 +1750,9 @@ Before every commit, verify the following:
 - [ ] `usage.request_wire` describes the terminal candidate returned by one LLM call. Nested aggregation preserves those terminal disclosures in ordered `request_wire_history` with explicit omission accounting; it does not copy failed physical sends or replace `state/usage_attempts.jsonl`. Keep these evidence domains distinct in names, docs, and tests.
 - [ ] Official direct OpenAI Chat sends `max_completion_tokens` and the requested `reasoning_effort` for the provider route as a whole, not for a hand-maintained model-name allowlist. Every eligible function-tool/non-`none` call begins custom+same effort; generic repairs stay on that rung; exact custom rejection creates fresh function+the original effort; exact function rejection may create task-local function+`none`. Keep ordinals fixed at 1/2/3 and never persist custom→function as learned dialect evidence. The last rung exists only within remaining physical-attempt authority. There is no Responses migration in this contract.
 - [ ] Preserve exact direct-Anthropic native assistant content only as private unfinished-turn custody: same-route replay must include the complete original block list/order and every opaque member; cross-route send, summarizer input, and public observability must scrub values. The active assistant/tool-result unit cannot compact until a later successful assistant response consumes it. Owner `none` is `thinking.type=disabled`; do not guess legacy manual-thinking budgets.
-- [ ] Every core-mediated physical provider send goes through `usage_accounting.execute_physical_attempt[_async]`: reserve, mark dispatched, then settle/unresolve. A transport retry is a new attempt. `llm_usage`, state, and UI counters are projections carrying attempt ids, never a second monetary authority. Provider tier pricing and any empirical tokenizer margin affect only a known reservation; settlement prefers actual provider usage/cost. Unknown price reserves `None`, remains nullable in usage events, and never blocks a model merely because its tariff is unavailable. An external skill with granted model-provider credentials is explicitly unknown/unmetered when it bypasses core transport—not `$0`; an ordinary spawned process must not be mislabeled as monetary work.
+- [ ] Every core-mediated physical provider send goes through `usage_accounting.execute_physical_attempt[_async]`: reserve, mark dispatched, then settle/unresolve. A marked dispatch may be released only through a typed pre-dispatch connection/pool failure that proves no request bytes were sent; an ordinary timeout or unknown error remains unresolved. A transport retry is a new attempt. `llm_usage`, state, and UI counters are projections carrying attempt ids, never a second monetary authority. Provider tier pricing and any empirical tokenizer margin affect only a known reservation; settlement prefers actual provider usage/cost. Unknown price reserves `None`, remains nullable in usage events, and never blocks a model merely because its tariff is unavailable. An external skill with granted model-provider credentials is explicitly unknown/unmetered when it bypasses core transport—not `$0`; an ordinary spawned process must not be mislabeled as monetary work.
+- [ ] Custody classifiers must not treat Python's implicit exception `__context__` as transport provenance: a fallback raised inside a prior provider's `except` block inherits that prior attempt even after its own request was dispatched. Use the explicit `__cause__` chain or typed transport metadata only; an ambiguous timeout remains unresolved.
+- [ ] The low-level `call_llm_with_retry` seam treats an omitted transport reserve as the raw owner-deadline window; callers that own a finalization reserve must pass it explicitly so admission and the transport bound cannot disagree.
 - [ ] Hold the usage-ledger cross-process lock only for budget check, validated append, and fsync. Never hold it over network I/O. Preserve a paid response if settlement persistence fails and leave an honest dispatched/unresolved bound.
 - [ ] **Tree-spend visibility.** Under a root cap, pacing and stop text use root-subtree ledger spend including in-flight holds; own cost is diagnostic, and unavailable remains unknown rather than `$0`. Reuse `usage_accounting.last_root_accounting` and refresh only at rare cache-breaking/explicitly stale decision surfaces, never by an unconditional per-round ledger scan or inside a stable cached prefix. `task_pacing.resolve_cost_ceiling` returns `disabled|active|exhausted_soft_land|unknown` from the independent global-percentage and root-cap-minus-absolute-margin axes; graceful finalization precedes, but cannot bypass, the ledger fence. `resolve_deciding_spend` is the sole fallback seam and must label own-cost-under-root-cap as a lower bound.
 - [ ] Before dispatching any post-task consolidation or synthesis worker, read `usage_breakdown` once for the whole root subtree and pass the same loop-local snapshot to summary and reflection. It is explicitly non-final (`cost_final=false`, `cost_with_children_partial=true`) and carries child-inclusive accounted cost, reservations, unresolved upper bound, unknown/unmetered count, ledger integrity, and capture time. A read failure is unavailable/null, never `$0`. Consolidation, summary, and reflection model spend belongs only to the existing terminal checkpoint; do not add another ledger or reconciliation LLM call.
@@ -1803,8 +1805,9 @@ Before every commit, verify the following:
 - [ ] Provider failures must be classified before retrying the same request.
   Quota/auth/billing, hard bad-request, and request-too-large/context failures
   are non-retryable as-is: record the exact category and surface a recovery hint
-  instead of burning rounds on identical calls. Transient rate limits/timeouts may
-  still use the normal retry path.
+  instead of burning rounds on identical calls. A typed 408/429/5xx or a failure
+  proven pre-dispatch may retry; a dispatched request with no terminal provider
+  outcome must stop same-model and cross-model sends until it is reconciled.
 
 #### Timeout & Wait Control
 - [ ] For a session nanny, `delegate_wait` is **event-only** at the model surface.
@@ -1835,6 +1838,114 @@ Before every commit, verify the following:
 - [ ] New numeric timeout constants are an SSOT in `config.py` `SETTINGS_DEFAULTS`
   with a getter and env registration; do not scatter magic wait numbers across
   call sites.
+- [ ] Cognitive waits use separate axes. A transport timeout only bounds a dead
+  socket; it is not a reasoning cutoff. The shared no-proxy LLM transport bound
+  is `OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC` (2700s), while review slots,
+  plan/acceptance wrappers, web-search attempts, delegated polling, and VLM
+  calls use their own logical deadline or provider-specific transport setting.
+  An explicit slot deadline narrows the route-owned bound. API review uses its
+  transport bound as a settlement fallback because that request ends there;
+  a delegated agent session instead inherits the existing task absolute ceiling
+  because the paid engine run can outlive an HTTP read. The owner deadline always
+  narrows either route. A caller/task deadline always narrows nested waits, and Anthropic (120s) plus
+  VLM captioning (90s) retain their separate provider transport defaults as
+  ceilings, not promises to run past the owner deadline. Delegated review uses
+  an opt-in strict poll bound for the remaining logical window; the general
+  delegate-wait floor remains unchanged for its existing transport contract.
+  Default reviewer slots intentionally have no short cognition cap. The outer
+  `plan_task` ToolEntry envelope covers `max(transport + 2 × grace,
+  task-absolute-ceiling + grace)`, so an `agent_session` worker can settle
+  inside the same existing task lifetime instead of being abandoned by an
+  API-only wrapper. The non-delegated Claude advisory child follows the same
+  owner-narrowed process bound; with no owner deadline it keeps its 900-second
+  child-safety ceiling.
+- [ ] A paid process-local review belongs to the exact existing process-custody
+  identity stamped in its commit-attempt row: server session plus pid. A new
+  Agent, a sibling worker boot, task return, heartbeat silence, or elapsed time
+  is not owner death. Settle tokenless rows only after an existing supervisor
+  teardown seam confirms that pid is dead, or when a later server generation
+  observes the prior-session pid already dead; retain delegated rows carrying
+  their durable invocation token, and leave legacy ownerless rows fail-closed.
+  Do not add a second process ledger or use TTL as resend authority.
+- [ ] Without an owner deadline, `web_search` sizes its outer ToolEntry
+  envelope for the complete configured paid cascade: two safe OpenAI attempts,
+  one OpenRouter attempt, one Anthropic attempt, and finalization grace. With
+  all three provider routes available at the defaults, that is
+  `4 × 480s + 120s = 2040s` (about 34 minutes). An owner deadline is narrower
+  authority: the outer wait and every provider leg recompute against the
+  remaining window minus finalization reserve, so the no-deadline envelope is
+  not promised under a shorter deadline.
+- [ ] Nested process wrappers are ordered, never tied: the provider bound must
+  settle before its killable child, and the child must settle before the generic
+  ToolEntry envelope. Explicit VLM helpers reuse the fixed structural settlement
+  margin from `config.py` (`provider`, `provider + margin`, and a ToolEntry
+  minimum of `provider + 2 × margin`) and subtract the whole hierarchy from the
+  owner window before dispatch. The global owner tool-timeout setting may widen
+  that outer envelope; the margin is not a user-facing cognition timeout.
+  Send-time captions have no child wrapper and keep the direct 90-second provider
+  contract.
+- [ ] Every physical LLM/review/VLM/tool operation that can outlive a logical
+  wait emits a typed `cognitive_operation` start and terminal fact. The
+  supervisor uses the active-operation map only to spare the idle rail; the
+  task deadline, budget, cancellation and absolute ceiling still cut through.
+  A logical timeout with a live worker is custody/reconciliation-pending, never
+  permission for a blind paid retry. Late review results settle the original
+  attempt and remain bound to its retry identity. Once the owner deadline minus
+  finalization reserve is spent, an unstarted review row is a typed `$0
+  not_dispatched` actor: no worker, paid stamp, or active lease is created.
+  A commit attempt cannot treat an in-flight reviewer as a final quorum verdict,
+  including under advisory enforcement. Plan review applies the same rule: if a
+  paid actor remains in flight, the wave is projected as the existing open
+  `DEGRADED` state with `review_late_result_pending`, even when the settled
+  responses already meet the arithmetic quorum; the counts remain factual, but
+  the wave cannot close until custody settles.
+- [ ] A returned provider response (including an empty/incomplete body) or typed
+  terminal 408/429/5xx is settled and may use the surface's bounded retry/repair
+  rail. A dispatched request whose socket or stream ends without terminal
+  provider evidence is `provider_outcome_unknown`: no same-model, fallback,
+  provider, local-server, or forced-final resend until custody settles.
+- [ ] A reviewed mutative wrapper must retain foreground custody until the
+  workflow settles. Inner phase bounds and the task/supervisor absolute deadline
+  are the stop axes; never use the global 600s tool default or a separately
+  guessed hard ceiling to abandon a still-live reviewer or commit pipeline.
+- [ ] A custody retry key names semantic material and an admitted cycle, not its
+  rendered prompt. Prior-round/history scaffolding may change while the same
+  physical operation is settling and must still join that operation; changed
+  snapshots, owner intent, route/model rows, or a genuinely new review cycle
+  must mint a new key. Use the canonical staged tree/parent binding for commit
+  review, pass the key immutably to every row, and do not admit the next paid
+  plan-review cycle while the previous cycle is still in flight. Plan-cycle
+  reconciliation freezes its originally dispatched rows and `$0` skip rows instead
+  of re-running live health/fit admission; reviewer-requested evidence advances
+  the next envelope only after every actor in the current cycle is terminal.
+  Skill Review keys additionally bind the exact skill, lifecycle wave, content,
+  panel/rebuttal contract, and frozen chunk digest/index so concurrent waves or
+  oversized chunks cannot join one another; they remain process-local custody,
+  not a promise of restart recovery without a durable invocation token.
+- [ ] Commit review writes and rereads `paid=True`, the exact nonempty retry
+  key, and both complete slot rosters with reserved operation ids in one locked
+  write before either parallel surface starts, except when the owner window
+  already has no dispatch capacity after finalization reserve: that prepared
+  roster remains an unpaid `$0` wave and no paid stamp is fired. A delegated row must add its
+  `pending_invocation_id` to that exact reservation after `START_REQUESTED` and
+  before POST. Exact resume keeps the durable actor roster. Deterministic packet reassembly may reconstruct unchanged executor
+  inputs, but cannot erase a frozen row, admit an unmatched paid row, or replace
+  a pending row with a different `slot_id`/`operation_id`. Delegated pending rows
+  carry the durable invocation token; API rows without process custody stay unresolved.
+- [ ] Cooperative cancellation is used where the existing route supports it
+  (delegated sessions); API/thread routes disclose an in-flight custody state
+  until their physical result settles. Do not replace this with a keyword or
+  model-name heuristic, a second scheduler, or a new global timing ledger.
+  A typed transport failure after a delegated run has an id is an unknown
+  outcome: retain the durable invocation token and replay that started run on
+  the permitted retry instead of posting a second paid run. A late tool worker
+  closes its own cognitive lease through its completion callback, and a partial
+  terminal event that lacks the stored correlation identity cannot close it.
+  While the process lives, unknown local custody remains a no-resend tombstone.
+  A later process startup is separate causal evidence that a tokenless local
+  waiter cannot return: settle that row as a typed paid infrastructure failure,
+  while rows with durable delegated tokens stay pending for exact rejoin. This
+  allows a new explicit attempt after restart; elapsed TTL alone never does.
 
 #### Loop / State-Machine Changes
 - [ ] Changes to `loop.py` or other task state-machine logic include adversarial tests for malformed output, false-completion prevention, replay/log durability, and failure modes — not just the happy path.
