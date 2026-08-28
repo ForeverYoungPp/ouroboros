@@ -900,9 +900,15 @@ def test_pre_dispatch_capture_state_remains_retryable_for_same_cycle(
 def test_late_pre_dispatch_capture_state_remains_retryable_for_same_cycle(tmp_path):
     """A late worker release must not become a sticky replay row either."""
     import threading
+    import time
     from types import SimpleNamespace
 
-    from ouroboros.review_custody import run_custodied_review_slots
+    from ouroboros.review_custody import (
+        _ACTIVE,
+        _ACTIVE_LOCK,
+        _attempt_key,
+        run_custodied_review_slots,
+    )
     from ouroboros.review_execution import ReviewRouteKind
     from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
     from ouroboros.usage_accounting import UsageScope
@@ -920,6 +926,7 @@ def test_late_pre_dispatch_capture_state_remains_retryable_for_same_cycle(tmp_pa
         slot_id="only", model="test/model", route=ReviewRouteKind.API_CHAT,
         timeout_sec=0.01,
     )
+    key = _attempt_key(request, slot)
 
     def run_slot(slot, operation_id, _retry_state, _deadline, _checkpoint):
         calls.append(slot.slot_id)
@@ -950,6 +957,17 @@ def test_late_pre_dispatch_capture_state_remains_retryable_for_same_cycle(tmp_pa
     assert late_started.wait(1.0)
     release_late.set()
     assert late_finished.wait(1.0)
+    # The worker signals just before returning, while settlement and removal
+    # from process-local custody happen in the coordinator thread afterwards.
+    # Wait for that handoff so the second call cannot race the first settlement.
+    deadline = time.monotonic() + 1.0
+    while True:
+        with _ACTIVE_LOCK:
+            settled = key not in _ACTIVE
+        if settled:
+            break
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
     assert not getattr(ctx, "_review_settled_attempts", {})
 
     second = run_custodied_review_slots(**args)
