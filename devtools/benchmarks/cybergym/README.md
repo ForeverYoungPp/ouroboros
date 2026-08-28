@@ -121,11 +121,14 @@ The important distinction is the OpenRouter provider object:
 
 The template pins every model slot to
 `deepseek/deepseek-v4-flash-0731`, including the canonical Available-subagents
-row and API-only reviewer slots.  All measured reasoning efforts are `high`.
-The structured reviewer panel has three triad rows and one scope row, all on
-that exact model, with advisory disabled.  `required` task review and
-`blocking` enforcement are intentional.  No local model, Claude session,
-legacy heavy slot, or hidden fallback family is inherited.
+row and API-only reviewer slots.  The applied measured cohort explicitly
+disables that actor list; the template keeps it available for review/copying.
+The measured task reasoning effort is `high`; review, scope-review, and deep-self-review
+use the stronger supported `max` tier.  The structured reviewer panel has one
+triad row and one scope row, both on that exact model, with the optional
+advisory lane disabled.  Task review remains `required`, while enforcement is
+`advisory`, and the shared review-cycle cap is `2`.  No local model, Claude
+session, legacy heavy slot, or hidden fallback family is inherited.
 
 This in-server panel is separate from the owner-authorized review of this
 adapter before any paid run.  That external review uses Codex
@@ -140,11 +143,11 @@ The template also records these run-shaping defaults:
 | --- | ---: | --- |
 | `OUROBOROS_MAX_SUBAGENT_DEPTH` | `0` | no delegation inside a measured task |
 | `OUROBOROS_MAX_WORKERS` | `10` | cross-task worker-pool ceiling, not within-task swarm |
-| `OUROBOROS_MAX_ROUNDS` | `200` (launcher default) | per-task Ouroboros loop ceiling; the current owner-authorized pilot explicitly uses `--max-rounds 1000` |
+| `OUROBOROS_MAX_ROUNDS` | `1000` | per-task Ouroboros loop ceiling for the current owner-authorized cohort |
 | `OUROBOROS_TASK_ABS_CEILING_SEC` | `14400` | four-hour absolute task backstop |
 | `TOTAL_BUDGET` | `3500.0` | first campaign-wide USD hard stop |
 | `OUROBOROS_RUNTIME_MODE` | `pro` | container benchmark runtime |
-| `OUROBOROS_SAFETY_MODE` | `light` | disposable benchmark data roots |
+| `OUROBOROS_SAFETY_MODE` | `off` | owner-authorized isolated cohort setting; deterministic benchmark guards still apply |
 | `OUROBOROS_CONTEXT_MODE` | `max` | retain the selected context mode |
 | `OUROBOROS_POST_TASK_EVOLUTION` | `false` | no post-task self-evolution |
 | `MCP_ENABLED` | `false` | no MCP capability in the measured task |
@@ -156,8 +159,8 @@ owner-authorized pilot, it also applies the runtime tree cap
 `OUROBOROS_PER_TASK_COST_USD=20.0` to the isolated settings snapshot.  This is
 separate from the ledger reservation: the pilot passes both
 `--per-task-cost-usd 20` and `--per-task-estimate-usd 20`, so both rails are
-explicit and auditable.  The template/default remains unchanged for other
-runs; paid invocations must state the runtime cap explicitly.  Missing,
+explicit and auditable.  Paid invocations must state the runtime cap
+explicitly.  Missing,
 unsettled, or unknown cost is a stop condition, never zero cost.
 
 ## No-swarm task contract
@@ -176,12 +179,22 @@ current registry and records the exact list rather than maintaining a stale
 allow-list.  This is a tool policy, not a blanket network denial: CyberGym's
 generated `submit.sh` needs the private server route, so
 `allowed_resources.network` remains explicitly available for that route while
-the agent has no general web/search capability.
+the agent has no general web/search capability.  Upstream does not impose an
+absolute ban on network access; this profile keeps general web/search off to
+preserve a model-focused, leakage-auditable headline.  Operator research may
+use the public web.  Enabling web/search inside an agent is a separate,
+non-comparable diagnostic cohort requiring trajectory leakage audit and an
+explicit contract change.
 
 `OUROBOROS_MAX_WORKERS` is the server's cross-task pool.  It is not a way to
-enable a swarm inside one task.  The one-task smoke starts with one lane; the
-ten-task pilot measures independent lanes and freezes the selected full-run
-lane count before the full cohort.  A live cohort is never resized in place.
+enable a swarm inside one task.  For the current ten-task pilot the launcher
+passes `--workers 10` and the isolated server records
+`OUROBOROS_MAX_WORKERS=10`; both knobs are required because they govern
+different pools.  Ten is the highest validated CyberGym cross-task value on
+this host.  The per-process model governor remains `3`, so the aggregate
+provider burst is bounded by the ten independent workers; raising either
+limit requires a new append-only capacity cohort and fresh rate/storage
+evidence.  A live cohort is never resized in place.
 
 ## Sidecar and network boundary
 

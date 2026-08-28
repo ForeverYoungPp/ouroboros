@@ -27,6 +27,8 @@ def test_profile_pins_one_canonical_model_and_review_panel():
     settings = _settings()
     assert settings["OUROBOROS_MODEL"] == MODEL
     configured = parse_configured_subagents(settings["OUROBOROS_SUBAGENTS"])
+    # The template keeps the canonical actor available for review/copying; the
+    # launcher turns it off in the applied cohort snapshot.
     assert configured.enabled is True
     assert len(configured.items) == 1
     actor = configured.items[0]
@@ -48,15 +50,15 @@ def test_profile_pins_one_canonical_model_and_review_panel():
     )
     for key in active_slots:
         assert settings[key] == MODEL, key
-    assert settings["OUROBOROS_REVIEW_MODELS"] == ",".join([MODEL] * 3)
+    assert settings["OUROBOROS_REVIEW_MODELS"] == MODEL
     assert settings["CLAUDE_CODE_MODEL"] == ""
     assert "OUROBOROS_MODEL_HEAVY" not in settings
     assert "USE_LOCAL_HEAVY" not in settings
 
     reviewers = parse_reviewer_slots(settings["OUROBOROS_REVIEWER_SLOTS"])
-    assert [row.target_id for row in reviewers.triad] == [MODEL] * 3
+    assert [row.target_id for row in reviewers.triad] == [MODEL]
     assert [row.target_id for row in reviewers.scope] == [MODEL]
-    assert all(row.effort == "high" for row in (*reviewers.triad, *reviewers.scope))
+    assert all(row.effort == "max" for row in (*reviewers.triad, *reviewers.scope))
     assert all(not row.is_session for row in (*reviewers.triad, *reviewers.scope))
     assert reviewers.advisory.enabled is False
 
@@ -68,17 +70,23 @@ def test_profile_records_safe_runtime_and_budget_defaults():
     assert settings["OUROBOROS_TASK_ABS_CEILING_SEC"] == 14_400
     assert settings["TOTAL_BUDGET"] == 3_500.0
     assert settings["OUROBOROS_RUNTIME_MODE"] == "pro"
-    assert settings["OUROBOROS_SAFETY_MODE"] == "light"
+    assert settings["OUROBOROS_SAFETY_MODE"] == "off"
     assert settings["OUROBOROS_CONTEXT_MODE"] == "max"
     assert settings["OUROBOROS_TASK_REVIEW_MODE"] == "required"
-    assert settings["OUROBOROS_REVIEW_ENFORCEMENT"] == "blocking"
-    assert settings["OUROBOROS_REVIEW_MAX_CYCLES"] == "unlimited"
+    assert settings["OUROBOROS_REVIEW_ENFORCEMENT"] == "advisory"
+    assert settings["OUROBOROS_REVIEW_MAX_CYCLES"] == "2"
     for key in (
         "OUROBOROS_EFFORT_TASK",
         "OUROBOROS_EFFORT_EVOLUTION",
+    ):
+        assert settings[key] == "high", key
+    for key in (
         "OUROBOROS_EFFORT_REVIEW",
         "OUROBOROS_EFFORT_SCOPE_REVIEW",
         "OUROBOROS_EFFORT_DEEP_SELF_REVIEW",
+    ):
+        assert settings[key] == "max", key
+    for key in (
         "OUROBOROS_EFFORT_CONSCIOUSNESS",
     ):
         assert settings[key] == "high", key

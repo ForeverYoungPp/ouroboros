@@ -7,6 +7,9 @@ import json
 
 import pytest
 
+from ouroboros.configured_subagents import parse_configured_subagents
+from ouroboros.reviewer_slot_config import parse_reviewer_slots
+
 from devtools.benchmarks.cybergym.cybergym_adapter import (
     DEFAULT_FINAL_POC_PATH,
     DEFAULT_LEVEL,
@@ -625,6 +628,19 @@ def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):
     applied = json.loads(path.read_text(encoding="utf-8"))
     assert applied["OUROBOROS_MAX_ROUNDS"] == 1000
     assert applied["OUROBOROS_PER_TASK_COST_USD"] == 20.0
+    assert applied["OUROBOROS_REVIEW_MODELS"] == OFFICIAL_MODEL
+    assert applied["OUROBOROS_REVIEW_ENFORCEMENT"] == "advisory"
+    assert applied["OUROBOROS_REVIEW_MAX_CYCLES"] == "2"
+    assert applied["OUROBOROS_SAFETY_MODE"] == "off"
+    assert applied["OUROBOROS_EFFORT_TASK"] == "high"
+    assert applied["OUROBOROS_EFFORT_REVIEW"] == "max"
+    assert applied["OUROBOROS_EFFORT_SCOPE_REVIEW"] == "max"
+    subagents = parse_configured_subagents(applied["OUROBOROS_SUBAGENTS"])
+    assert subagents.enabled is False
+    reviewers = parse_reviewer_slots(applied["OUROBOROS_REVIEWER_SLOTS"])
+    assert len(reviewers.triad) == len(reviewers.scope) == 1
+    assert all(row.effort == "max" for row in (*reviewers.triad, *reviewers.scope))
+    assert reviewers.advisory.enabled is False
 
 
 def test_launcher_row_counts_do_not_count_planned_as_completed():

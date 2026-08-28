@@ -118,18 +118,17 @@ pinned to that exact string:
 
 * main, light, vision, consciousness, fallback, and deep-self-review slots;
 * the web-search slot (the task still disables web/search tools);
-* the three API triad reviewer rows; and
+* the one API triad reviewer row; and
 * the one API scope reviewer row.
 
-All applied task, review, scope-review, deep-self, evolution, and
-consciousness efforts are `high`.  The reviewer panel is API-only and has
-advisory disabled; three identical triad rows are a review-policy requirement,
-not evidence of model diversity.  Task review is `required`, enforcement is
-`blocking`, and the review cycle value is `unlimited` as represented by the
-current settings schema.
+The applied task reasoning effort is `high`, because the CyberGym task wire
+and result validator require that literal value.  Review, scope-review, and
+deep-self-review use the core's supported `max` tier.  The reviewer panel is
+API-only, has one triad row and one scope row, and has the optional advisory
+lane disabled.  Task review is `required`, enforcement is `advisory`, and the
+shared review-cycle value is `2` (at most two paid cycles).
 
-The template's `OUROBOROS_MAX_ROUNDS=200` is a safe launcher default.  The
-current owner-authorized pilot overrides it with `--max-rounds 1000`; the
+The current owner-authorized cohort applies `OUROBOROS_MAX_ROUNDS=1000`; the
 applied settings and run manifest are the authority for the value used by a
 particular cohort.
 
@@ -141,8 +140,10 @@ profile-pinned review runs are pre-spend validation evidence only; they are not
 additional CyberGym agents and do not alter the measured model contract.
 
 The template also pins `OUROBOROS_RUNTIME_MODE=pro`,
-`OUROBOROS_SAFETY_MODE=light`, `OUROBOROS_CONTEXT_MODE=max`, disables local
-routes, turns post-task evolution off, and disables MCP.  These values are
+`OUROBOROS_SAFETY_MODE=off`, `OUROBOROS_CONTEXT_MODE=max`, disables local
+routes, turns post-task evolution off, and disables MCP.  `off` suppresses
+LLM safety calls for this owner-authorized isolated cohort; deterministic
+tool/sidecar/path guards remain active.  These values are
 scaffold defaults; the applied settings and startup telemetry are the
 authority for a run.
 
@@ -206,9 +207,12 @@ paid dispatch.
 
 ## 5. No-swarm and tool policy
 
-The measured task has one model loop and no nested delegation.  The settings
-template sets `OUROBOROS_MAX_SUBAGENT_DEPTH=0`, whose current config contract
-means no delegation at all.  The task contract independently withholds the
+The measured task has one model loop and no nested delegation.  The applied
+cohort overrides the template's canonical actor row with an explicit
+`OUROBOROS_SUBAGENTS` value whose `enabled=false` flag is the execution
+authority (the row is retained only for provenance) and sets
+`OUROBOROS_MAX_SUBAGENT_DEPTH=0`, whose current config contract means no
+delegation at all.  The task contract independently withholds the
 delegation names `schedule_subagent`, `delegate_start`, and the retained legacy
 `claude_code_edit` name wherever those capabilities are registered.  Keeping
 the legacy name matters: the registry maps it to the successor surface, so a
@@ -232,10 +236,20 @@ show the exact `allowed_resources` and `disabled_tools` values actually sent
 to the task API.  Unknown names are not silently treated as proof of a deny;
 the launcher fails closed when a required delegation name cannot be resolved.
 
+The upstream FAQ treats network access as optional rather than universally
+forbidden and warns that unrestricted access can enable reward hacking. Public
+web access is allowed for operator methodology research, but it is deliberately
+absent from this measured headline contract. Turning it on for an agent would
+create a separate diagnostic cohort with an explicit trajectory leakage audit,
+not a silent setting flip in this result.
+
 `OUROBOROS_MAX_WORKERS` is a cross-task server worker pool.  It is not a
-within-task swarm switch.  The template value `10` is a ceiling for the
-operator ramp; the launcher freezes the measured full-run lane count after the
-pilot.  A separate lane-count experiment gets a separate append-only cohort.
+within-task swarm switch.  The current pilot passes `--workers 10` to the
+adapter and applies `OUROBOROS_MAX_WORKERS=10` to the server.  The adapter cap
+of 10 is the highest validated value for this host; the model governor's cap
+of 3 is process-local, not global. Any higher worker/governor setting is a new
+append-only capacity cohort requiring fresh provider, Docker, network and disk
+validation. A live cohort is never resized.
 
 ## 6. Sidecar topology and security boundary
 

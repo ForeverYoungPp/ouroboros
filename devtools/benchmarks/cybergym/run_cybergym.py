@@ -31,6 +31,10 @@ from devtools.benchmarks.common.manifests import (
     admit_benchmark_run,
     finalize_run_manifest,
 )
+from devtools.benchmarks.common.model_slots import (
+    disabled_subagents_setting,
+    single_model_reviewer_slots_setting,
+)
 from devtools.benchmarks.common.run_roots import (
     assert_file_output_outside_repo,
     assert_outside_repo,
@@ -72,7 +76,7 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 DEFAULT_TIMEOUT_SEC = 4 * 60 * 60
-DEFAULT_MAX_ROUNDS = 200
+DEFAULT_MAX_ROUNDS = 1000
 # Runtime tree cap for each measured task.  This is deliberately separate from
 # ``--per-task-estimate-usd``: the latter is the campaign reservation, while
 # this value is consumed by the isolated Ouroboros server's UsageScope.
@@ -740,11 +744,14 @@ def _prepare_applied_settings(
         "OUROBOROS_WEBSEARCH_MODEL": model,
         "OUROBOROS_SCOPE_REVIEW_MODELS": model,
         "OUROBOROS_SCOPE_REVIEW_MODEL": model,
-        "OUROBOROS_REVIEW_MODELS": ",".join([model] * 3),
+        # One routed reviewer is the explicit single-model campaign contract.
+        # Keeping the legacy projection in sync prevents a stale three-row
+        # value from shadowing the structured panel in older consumers.
+        "OUROBOROS_REVIEW_MODELS": model,
         "OUROBOROS_MAX_SUBAGENT_DEPTH": 0,
         "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS": "false",
         "OUROBOROS_RUNTIME_MODE": "pro",
-        "OUROBOROS_SAFETY_MODE": "light",
+        "OUROBOROS_SAFETY_MODE": "off",
         "OUROBOROS_CONTEXT_MODE": "max",
         "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "false",
         "OUROBOROS_MAX_WORKERS": 10,
@@ -754,8 +761,10 @@ def _prepare_applied_settings(
         "TOTAL_BUDGET": budget_usd,
         "OUROBOROS_TASK_ABS_CEILING_SEC": timeout_sec,
         "OUROBOROS_TASK_REVIEW_MODE": "required",
-        "OUROBOROS_REVIEW_ENFORCEMENT": "blocking",
-        "OUROBOROS_REVIEW_MAX_CYCLES": "unlimited",
+        # Required task review still runs, but its verdict is advisory and is
+        # bounded to two paid review cycles as requested for this cohort.
+        "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
+        "OUROBOROS_REVIEW_MAX_CYCLES": "2",
         "OUROBOROS_POST_TASK_EVOLUTION": "false",
         "OUROBOROS_POST_TASK_EVOLUTION_CADENCE": "off",
         "OUROBOROS_MAIN_WEB_SEARCH": "off",
@@ -767,16 +776,25 @@ def _prepare_applied_settings(
         "MCP_SERVERS": [],
         "OUROBOROS_EFFORT_TASK": "high",
         "OUROBOROS_EFFORT_EVOLUTION": "high",
-        "OUROBOROS_EFFORT_REVIEW": "high",
-        "OUROBOROS_EFFORT_SCOPE_REVIEW": "high",
-        "OUROBOROS_EFFORT_DEEP_SELF_REVIEW": "high",
+        # The benchmark task wire is validated as literal ``high``; the
+        # broader review surfaces support the stronger ``max`` tier.
+        "OUROBOROS_EFFORT_REVIEW": "max",
+        "OUROBOROS_EFFORT_SCOPE_REVIEW": "max",
+        "OUROBOROS_EFFORT_DEEP_SELF_REVIEW": "max",
         "OUROBOROS_EFFORT_CONSCIOUSNESS": "high",
     }
     # Structured no-swarm/reviewer declarations are explicit overrides rather
-    # than values accidentally inherited from the live settings file.
-    for key in ("OUROBOROS_SUBAGENTS", "OUROBOROS_REVIEWER_SLOTS"):
-        if key in template:
-            overrides[key] = template[key]
+    # than values accidentally inherited from the live settings file.  Keep a
+    # disabled actor row for provenance, but make the execution authority
+    # explicit: the runtime must refuse delegated children.
+    overrides["OUROBOROS_SUBAGENTS"] = disabled_subagents_setting(model)
+    overrides["OUROBOROS_REVIEWER_SLOTS"] = single_model_reviewer_slots_setting(
+        model,
+        review_slots=1,
+        scope_slots=1,
+        review_effort="max",
+        scope_effort="max",
+    )
     # The provider pool is selected by a live probe in the sidecar lane.  Keep
     # the template's safe fallback-ready shape until that callback supplies an
     # evidence-backed ``only``/``order`` override.
