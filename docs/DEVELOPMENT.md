@@ -1909,7 +1909,9 @@ Before every commit, verify the following:
   capture metadata is absent; when that metadata is present it must say `settled`,
   while explicit `reserved` or `released` states remain eligible for a real retry
   rather than becoming sticky replay rows. `dispatched` or `unresolved` states
-  stay under the custody-lost/no-resend classification. An identical envelope
+  without a typed terminal HTTP status stay under the custody-lost/no-resend
+  classification; with such a status they are retained as terminal actors for
+  same-cycle replay, never as a second physical send. An identical envelope
   never buys a settled actor twice, and a new retry cycle uses a new key. A `$0`
   `not_dispatched` refusal remains retryable rather than becoming a sticky replay
   actor.

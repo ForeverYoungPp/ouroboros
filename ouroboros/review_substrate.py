@@ -51,6 +51,7 @@ from ouroboros.review_custody import review_retry_cancelled
 # split across two modules for no reason).
 from ouroboros.triad_review import parse_review_findings
 from ouroboros.usage_accounting import (
+    BudgetExceeded,
     UsageAccountingError,
     UsageScope,
     current_usage_scope,
@@ -1512,15 +1513,23 @@ class ReviewCoordinator:
                 )
             except Exception:
                 response_ref = {}
-            http_status = getattr(exc, "status_code", None)
             failure_custody = dict(executor.failure_custody() or {})
             capture = getattr(exc, "physical_attempt_capture", None)
             capture_state = str(getattr(capture, "state", "") or "")
             if capture_state:
                 failure_custody["physical_attempt_state"] = capture_state
+            http_status = next((value for value in (
+                getattr(exc, "status_code", None),
+                getattr(getattr(exc, "response", None), "status_code", None),
+                getattr(capture, "provider_status_code", None),
+                failure_custody.get("provider_status_code"),
+            ) if isinstance(value, int) and not isinstance(value, bool)), None)
+            if http_status is not None:
+                failure_custody["provider_status_code"] = http_status
             operation_state = (
                 "not_dispatched"
                 if capture_state in {"reserved", "released"}
+                or isinstance(exc, BudgetExceeded)
                 or str(getattr(exc, "code", "") or "") == "deadline_exhausted"
                 else "settled"
             )

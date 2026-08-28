@@ -2076,7 +2076,9 @@ sufficient for this same-cycle custody fact when optional physical-attempt
 capture metadata is absent; when that metadata is present it must say `settled`,
 while explicit `reserved` or `released` states remain eligible for a real retry
 rather than becoming sticky replay rows. `dispatched` or `unresolved` states
-stay under the custody-lost/no-resend classification. A `$0` not-dispatched row
+without a typed terminal HTTP status stay under the custody-lost/no-resend
+classification; with such a status they are retained as terminal actors for
+same-cycle replay, never as a second physical send. A `$0` not-dispatched row
 remains retryable. A new
 retry cycle uses a new identity. Send-time VLM
 captioning keeps its direct 90-second provider cap. Explicit VLM helpers order

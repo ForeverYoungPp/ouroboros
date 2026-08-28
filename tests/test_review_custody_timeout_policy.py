@@ -797,6 +797,214 @@ def test_keyed_terminal_api_error_is_replayed_while_sibling_is_late(tmp_path):
     assert late_finished.wait(1.0)
 
 
+def test_unresolved_terminal_http_capture_is_replayed_without_second_dispatch(tmp_path):
+    """A typed provider response makes an unresolved ledger row known-terminal."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import run_custodied_review_slots
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    calls = []
+    ctx = SimpleNamespace()
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="terminal-capture",
+        retry_key="plan_review:terminal-capture:1",
+    )
+    slot = ReviewSlot(
+        slot_id="only", model="test/model", route=ReviewRouteKind.API_CHAT,
+        timeout_sec=0.2,
+    )
+
+    def run_slot(slot, operation_id, _retry_state, _deadline, _checkpoint):
+        calls.append(slot.slot_id)
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error",
+            error="provider returned 503", operation_id=operation_id,
+            http_status=503,
+            usage={"physical_attempt_state": "unresolved", "provider_status_code": 503},
+        )
+
+    def error_actor(slot, error, operation_id="", operation_state="settled"):
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error", error=error,
+            operation_id=operation_id, operation_state=operation_state,
+        )
+
+    args = dict(
+        request=request, slots=[slot], usage_ctx=ctx, task_id=request.task_id,
+        usage_meta={}, review_usage_scope=UsageScope(drive_root=tmp_path, task_id=request.task_id),
+        run_slot=run_slot, error_actor=error_actor,
+    )
+    first = run_custodied_review_slots(**args)
+    second = run_custodied_review_slots(**args)
+
+    assert calls == ["only"]
+    assert first[0].operation_state == "settled"
+    assert second[0].operation_id == first[0].operation_id
+    assert second[0].usage["physical_attempt_state"] == "unresolved"
+    assert second[0].http_status == 503
+
+
+def test_unresolved_capture_without_terminal_status_is_no_resend_without_typed_code(tmp_path):
+    """A legacy actor cannot turn an unknown physical outcome into a resend."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import run_custodied_review_slots
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    calls = []
+    ctx = SimpleNamespace()
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="unknown-capture",
+        retry_key="plan_review:unknown-capture:1",
+    )
+    slot = ReviewSlot(
+        slot_id="only", model="test/model", route=ReviewRouteKind.API_CHAT,
+        timeout_sec=0.2,
+    )
+
+    def run_slot(slot, operation_id, _retry_state, _deadline, _checkpoint):
+        calls.append(slot.slot_id)
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error",
+            error="socket outcome unknown", operation_id=operation_id,
+            usage={"physical_attempt_state": "unresolved"},
+        )
+
+    def error_actor(slot, error, operation_id="", operation_state="settled"):
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error", error=error,
+            operation_id=operation_id, operation_state=operation_state,
+        )
+
+    args = dict(
+        request=request, slots=[slot], usage_ctx=ctx, task_id=request.task_id,
+        usage_meta={}, review_usage_scope=UsageScope(drive_root=tmp_path, task_id=request.task_id),
+        run_slot=run_slot, error_actor=error_actor,
+    )
+    first = run_custodied_review_slots(**args)
+    second = run_custodied_review_slots(**args)
+
+    assert calls == ["only"]
+    assert first[0].operation_state == "custody_lost"
+    assert second[0].operation_state == "custody_lost"
+    assert second[0].failure_code == "provider_outcome_unknown"
+    assert second[0].late_result_pending is True
+
+
+def test_coordinator_propagates_terminal_capture_status_for_same_cycle_replay(
+    tmp_path, monkeypatch,
+):
+    """The coordinator must carry capture status into custody, not just its state."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+
+    class ProviderFailure(RuntimeError):
+        pass
+
+    class TerminalExecutor:
+        def __init__(self):
+            self.execute_calls = 0
+
+        def restore_custody(self, _state):
+            return None
+
+        def set_pending_invocation_checkpoint(self, _checkpoint):
+            return None
+
+        def prompt_payload(self):
+            return {"messages": []}
+
+        def prompt_chars(self):
+            return 0
+
+        def execute(self):
+            self.execute_calls += 1
+            error = ProviderFailure("provider HTTP 503")
+            error.physical_attempt_capture = SimpleNamespace(
+                state="unresolved", provider_status_code=503,
+            )
+            raise error
+
+        def failure_custody(self):
+            return {}
+
+    executor = TerminalExecutor()
+    monkeypatch.setattr(
+        "ouroboros.review_substrate._review_route_executor",
+        lambda *_args, **_kwargs: executor,
+    )
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="capture-propagation",
+        retry_key="plan_review:capture-propagation:1",
+    )
+    slot = ReviewSlot(slot_id="only", model="test/model", route=ReviewRouteKind.API_CHAT)
+    ctx = SimpleNamespace()
+    first = run_review_request(request, slots=[slot], drive_root=tmp_path, usage_ctx=ctx)
+    second = run_review_request(request, slots=[slot], drive_root=tmp_path, usage_ctx=ctx)
+
+    assert executor.execute_calls == 1
+    assert first.actors[0]["http_status"] == 503
+    assert first.actors[0]["usage"]["provider_status_code"] == 503
+    assert second.actors[0]["operation_id"] == first.actors[0]["operation_id"]
+
+
+def test_budget_exceeded_review_failure_remains_retryable(tmp_path, monkeypatch):
+    """A budget refusal before reserve is a $0 row, never sticky custody."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+    from ouroboros.usage_accounting import BudgetExceeded
+
+    class BudgetExecutor:
+        execute_calls = 0
+
+        def restore_custody(self, _state):
+            return None
+
+        def set_pending_invocation_checkpoint(self, _checkpoint):
+            return None
+
+        def prompt_payload(self):
+            return {"messages": []}
+
+        def prompt_chars(self):
+            return 0
+
+        def execute(self):
+            self.execute_calls += 1
+            raise BudgetExceeded("review budget exhausted")
+
+        def failure_custody(self):
+            return {}
+
+    executor = BudgetExecutor()
+    monkeypatch.setattr(
+        "ouroboros.review_substrate._review_route_executor",
+        lambda *_args, **_kwargs: executor,
+    )
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="budget-refusal",
+        retry_key="plan_review:budget-refusal:1",
+    )
+    slot = ReviewSlot(slot_id="only", model="test/model", route=ReviewRouteKind.API_CHAT)
+    ctx = SimpleNamespace()
+    first = run_review_request(request, slots=[slot], drive_root=tmp_path, usage_ctx=ctx)
+    second = run_review_request(request, slots=[slot], drive_root=tmp_path, usage_ctx=ctx)
+
+    assert executor.execute_calls == 2
+    assert first.actors[0]["operation_state"] == "not_dispatched"
+    assert second.actors[0]["operation_state"] == "not_dispatched"
+    assert not getattr(ctx, "_review_settled_attempts", {})
+
+
 def test_not_dispatched_error_remains_retryable_for_same_cycle(tmp_path):
     """A $0 admission refusal must not become a sticky replay actor."""
     from types import SimpleNamespace

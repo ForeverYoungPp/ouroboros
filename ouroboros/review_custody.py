@@ -45,6 +45,31 @@ _ACTIVE: Dict[str, ActiveReviewAttempt] = {}
 # not the full actor/prompt, until process exit.
 _NO_RESEND: Dict[str, str] = {}
 _PENDING_STATES = {"in_flight", "custody_lost"}
+_PHYSICAL_CAPTURE_STATES = {"", "settled", "dispatched", "unresolved"}
+
+
+def _terminal_provider_status(actor: Any, failure_custody: Dict[str, Any]) -> int | None:
+    """Return a typed terminal HTTP status carried by this actor only.
+
+    A dispatched/unresolved capture is safe to replay inside its exact logical
+    cycle only when the provider returned a terminal HTTP response. Never use
+    an unrelated ContextVar or exception text as proof of that response.
+    """
+    candidates = (
+        getattr(actor, "http_status", None),
+        failure_custody.get("provider_status_code"),
+        failure_custody.get("http_status"),
+    )
+    for value in candidates:
+        if isinstance(value, bool):
+            continue
+        try:
+            status = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if 400 <= status <= 599:
+            return status
+    return None
 
 
 def _row_is_pending(row: Dict[str, Any]) -> bool:
@@ -488,12 +513,21 @@ def _settle_review_attempt(
         failure_custody = getattr(actor, "usage", None) or {}
         physical_attempt_state = str(
             failure_custody.get("physical_attempt_state") or ""
-        )
+        ).strip().lower()
         pending_invocation = str(failure_custody.get("pending_invocation_id") or "")
+        terminal_provider_status = _terminal_provider_status(actor, failure_custody)
+        capture_outcome_unknown = (
+            physical_attempt_state in {"dispatched", "unresolved"}
+            and terminal_provider_status is None
+        )
         custody_lost = (
             str(getattr(actor, "failure_code", "") or "")
             == "provider_outcome_unknown"
-        )
+        ) or capture_outcome_unknown
+        if capture_outcome_unknown and str(getattr(actor, "failure_code", "") or "") != "provider_outcome_unknown":
+            # The physical capture is stronger than a legacy/mocked actor code:
+            # without a terminal provider response, a second paid send is unsafe.
+            actor.failure_code = "provider_outcome_unknown"
         not_dispatched = str(
             getattr(actor, "operation_state", "") or ""
         ) == "not_dispatched"
@@ -534,25 +568,6 @@ def _settle_review_attempt(
         # A keyed plan/commit cycle owns one exact paid API attempt. Retain a
         # terminal API actor while the sibling cycle is still settling; otherwise
         # a retry can buy this already-settled slot again before the wave closes.
-        late_keyed_api_error = bool(
-            late
-            and explicit_retry
-            and (
-                str(getattr(request, "surface", "") or "") == "plan_review"
-                or str(getattr(request, "retry_key", "") or "").startswith(
-                    "commit_review:"
-                )
-            )
-            and route_value != "agent_session"
-            and not pending_invocation
-            and actor.status == "error"
-            and str(getattr(actor, "operation_state", "") or "")
-            not in {"not_dispatched", "in_flight", "custody_lost"}
-            # A late worker can still report a pre-dispatch release after the
-            # logical waiter expired. It is retryable, not a terminal API
-            # outcome; only absent or settled capture can be replayed.
-            and physical_attempt_state in {"", "settled"}
-        )
         keyed_terminal_api_error = bool(
             explicit_retry
             and (
@@ -569,17 +584,18 @@ def _settle_review_attempt(
             and actor.status == "error"
             and str(getattr(actor, "operation_state", "") or "")
             not in {"not_dispatched", "in_flight", "custody_lost"}
-            # If capture metadata is present, it must prove that the physical
-            # attempt settled. Explicit reserved/released states are
-            # pre-dispatch and stay eligible for a real retry; dispatched or
-            # unresolved states are excluded here and remain governed by the
-            # custody_lost/no-resend classification. Empty keeps legacy typed
-            # actors replayable when their adapter emitted no capture at all.
-            and physical_attempt_state in {"", "settled"}
+            # Explicit reserved/released states are pre-dispatch and stay
+            # eligible for a real retry. A dispatched/unresolved state is
+            # replayable only with a typed terminal HTTP response; otherwise
+            # the capture-outcome guard above records custody_lost/no-resend.
+            and physical_attempt_state in _PHYSICAL_CAPTURE_STATES
+            and (
+                physical_attempt_state in {"", "settled"}
+                or terminal_provider_status is not None
+            )
         )
         replayable = (
             actor.status in {"ok", "empty"}
-            or late_keyed_api_error
             or keyed_terminal_api_error
             or bool(failure_custody.get("delegated_run_started") and not pending_invocation)
         )
