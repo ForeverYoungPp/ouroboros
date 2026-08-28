@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pathlib
 
 import pytest
 
@@ -622,6 +623,7 @@ def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):
     )
     assert path.exists()
     assert metadata["model"] == OFFICIAL_MODEL
+    assert metadata["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     assert metadata["model_slots"]["OUROBOROS_MODEL"] == OFFICIAL_MODEL
     assert metadata["max_rounds"] == 1000
     assert metadata["per_task_cost_usd"] == 20.0
@@ -643,6 +645,46 @@ def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):
     assert len(reviewers.triad) == len(reviewers.scope) == 1
     assert all(row.effort == "max" for row in (*reviewers.triad, *reviewers.scope))
     assert reviewers.advisory.enabled is False
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        json.dumps({"OUROBOROS_MODEL": OFFICIAL_MODEL, "OUROBOROS_MAX_ROUNDS": 1}),
+        "{malformed",
+    ],
+)
+def test_applied_settings_producer_rejects_replacement_after_atomic_write(
+    monkeypatch, tmp_path, replacement
+):
+    from types import SimpleNamespace
+
+    import devtools.benchmarks.common.manifests as manifests
+    from devtools.benchmarks.cybergym.run_cybergym import _prepare_applied_settings
+
+    template = tmp_path / "settings.json"
+    template.write_text("{}", encoding="utf-8")
+    output_root = tmp_path / "run"
+    output_root.mkdir()
+    original_write = manifests.write_json
+
+    def write_then_replace(path, payload):
+        original_write(path, payload)
+        pathlib.Path(path).write_text(replacement, encoding="utf-8")
+
+    monkeypatch.setattr(manifests, "write_json", write_then_replace)
+    with pytest.raises(CyberGymIntegrationUnavailable, match="changed during producer write"):
+        _prepare_applied_settings(
+            template,
+            output_root,
+            SimpleNamespace(
+                model=OFFICIAL_MODEL,
+                budget_usd=3500,
+                timeout_sec=4,
+                max_rounds=1000,
+                per_task_cost_usd=20,
+            ),
+        )
 
 
 def test_applied_settings_reject_provider_credentials_in_custom_template(tmp_path):
@@ -744,6 +786,7 @@ def test_launcher_isolated_server_helper_uses_seed_and_closes(monkeypatch, tmp_p
         tmp_path / "run",
         applied,
         expected_commit,
+        hashlib.sha256(applied.read_bytes()).hexdigest(),
     )
 
     assert events[0][0] == "init"
@@ -784,6 +827,8 @@ def test_launcher_wraps_server_start_error_and_closes_partial(monkeypatch, tmp_p
         repo_dir=tmp_path / "seed",
         docker_host="unix:///run/user/1006/docker.sock",
     )
+    applied = tmp_path / "settings_applied.json"
+    applied.write_text("{}", encoding="utf-8")
 
     with pytest.raises(
         launcher.CyberGymIntegrationUnavailable,
@@ -792,8 +837,9 @@ def test_launcher_wraps_server_start_error_and_closes_partial(monkeypatch, tmp_p
         launcher._start_isolated_ouroboros_server(
             args,
             tmp_path / "run",
-            tmp_path / "settings_applied.json",
+            applied,
             "a" * 40,
+            hashlib.sha256(applied.read_bytes()).hexdigest(),
         )
 
     assert isinstance(caught.value.__cause__, RuntimeError)

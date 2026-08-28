@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import pathlib
 import subprocess
 
@@ -48,14 +49,41 @@ def _host():
 
 def test_prepare_clones_pinned_seed_and_copies_settings(tmp_path):
     seed, commit = _seed_repo(tmp_path)
-    wrapper = CyberGymIsolatedServer(seed, tmp_path / "run", _settings(tmp_path), _host(), expected_commit=commit)
+    settings = _settings(tmp_path)
+    wrapper = CyberGymIsolatedServer(
+        seed,
+        tmp_path / "run",
+        settings,
+        _host(),
+        expected_commit=commit,
+        expected_settings_sha256=hashlib.sha256(settings.read_bytes()).hexdigest(),
+    )
     wrapper.prepare()
     assert wrapper.clone_root.is_dir()
+    assert wrapper.settings_path.read_bytes() == settings.read_bytes()
     assert wrapper.settings_path.read_text(encoding="utf-8").startswith("{")
     assert wrapper.settings_path.stat().st_mode & 0o777 == 0o600
     assert (wrapper.data_root / ".ouroboros_isolated_benchmark").is_file()
     assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=wrapper.clone_root, text=True).strip() == commit
     assert subprocess.run(["git", "config", "--get", "remote.origin.url"], cwd=wrapper.clone_root, check=False, stdout=subprocess.DEVNULL).returncode != 0
+
+
+def test_prepare_rejects_replaced_settings_before_copy(tmp_path):
+    seed, commit = _seed_repo(tmp_path)
+    settings = _settings(tmp_path)
+    expected = hashlib.sha256(settings.read_bytes()).hexdigest()
+    settings.write_text(json.dumps({"OUROBOROS_MODEL": "wrong/model"}), encoding="utf-8")
+    wrapper = CyberGymIsolatedServer(
+        seed,
+        tmp_path / "run",
+        settings,
+        _host(),
+        expected_commit=commit,
+        expected_settings_sha256=expected,
+    )
+    with pytest.raises(CyberGymServerError, match="digest changed"):
+        wrapper.prepare()
+    assert not wrapper.data_root.exists()
 
 
 def test_wrapper_requires_fresh_root_and_explicit_commit(tmp_path):
@@ -112,6 +140,7 @@ def test_rootless_wrapper_makes_applied_settings_authoritative(monkeypatch, tmp_
     assert "OUROBOROS_MODEL" not in env
     assert "CLAUDE_AGENT_SDK_MODEL" not in env
     assert "OUROBOROS_RUNTIME_MODE" not in env
+    assert len(env["OUROBOROS_SETTINGS_SHA256"]) == 64
     assert env["DOCKER_HOST"] == _host().value
     assert pathlib.Path(env["OUROBOROS_USER_FILES_ROOT"]) == (tmp_path / "data" / "user_files").resolve()
     assert pathlib.Path(env["OUROBOROS_DELIVERABLES_ROOT"]) == (
@@ -228,6 +257,86 @@ def test_authoritative_port_patch_rechecks_snapshot_after_preflight(tmp_path, mo
         server.start()
     assert server.proc is None
     assert settings.read_text(encoding="utf-8") == "{broken"
+
+
+def test_authoritative_env_child_pin_rejects_replacement_after_parent_env_check(
+    monkeypatch, tmp_path
+):
+    seed, _commit = _seed_repo(tmp_path)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"OUROBOROS_MODEL": "file/model"}), encoding="utf-8")
+    from devtools.benchmarks.common.server_runner import IsolatedServer
+
+    expected = hashlib.sha256(settings.read_bytes()).hexdigest()
+    server = IsolatedServer(
+        seed,
+        tmp_path / "data",
+        settings,
+        settings_authoritative_env=True,
+        expected_settings_sha256=expected,
+    )
+    env = server._env()
+    settings.write_text(json.dumps({"OUROBOROS_MODEL": "wrong/model"}), encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_SETTINGS_SHA256", env["OUROBOROS_SETTINGS_SHA256"])
+    with pytest.raises(RuntimeError, match="settings snapshot changed"):
+        # This models the child-side verified read after the parent has already
+        # returned its environment mapping.
+        server._read_authoritative_settings()
+
+
+def test_runtime_config_load_rejects_changed_pinned_snapshot(monkeypatch, tmp_path):
+    import ouroboros.config as config
+
+    path = tmp_path / "settings.json"
+    payload = {
+        "OUROBOROS_MODEL": "deepseek/deepseek-v4-flash-0731",
+        "OUROBOROS_CONTEXT_MODE": "max",
+        "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "false",
+    }
+    raw = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+    path.write_bytes(raw)
+    monkeypatch.setattr(config, "SETTINGS_PATH", path)
+    monkeypatch.setenv(
+        config.SETTINGS_INTEGRITY_ENV,
+        hashlib.sha256(raw).hexdigest(),
+    )
+    assert config.load_settings()["OUROBOROS_MODEL"] == payload["OUROBOROS_MODEL"]
+    path.write_text(json.dumps({**payload, "OUROBOROS_MAX_ROUNDS": 1}), encoding="utf-8")
+    with pytest.raises(config.SettingsIntegrityError, match="settings snapshot changed"):
+        config.load_settings()
+
+
+def test_runtime_config_strict_snapshot_cannot_be_mutated_by_save(monkeypatch, tmp_path):
+    import ouroboros.config as config
+
+    path = tmp_path / "settings.json"
+    path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "SETTINGS_PATH", path)
+    monkeypatch.setenv(config.SETTINGS_INTEGRITY_ENV, "a" * 64)
+    with pytest.raises(config.SettingsIntegrityError, match="immutable"):
+        config.save_settings({})
+
+
+def test_runtime_config_strict_snapshot_cannot_be_mutated_by_owner_writer(
+    monkeypatch, tmp_path
+):
+    import ouroboros.config as config
+    from ouroboros.gateway import owner_settings
+
+    path = tmp_path / "settings.json"
+    path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "SETTINGS_PATH", path)
+    monkeypatch.setenv(config.SETTINGS_INTEGRITY_ENV, "b" * 64)
+    wrote = False
+
+    def record_write(*args, **kwargs):
+        nonlocal wrote
+        wrote = True
+
+    monkeypatch.setattr(owner_settings, "atomic_write_json", record_write)
+    with pytest.raises(config.SettingsIntegrityError, match="immutable"):
+        owner_settings._owner_write_settings({"OUROBOROS_MODEL": "wrong/model"})
+    assert not wrote
 
 
 def test_authoritative_port_patch_rejects_valid_snapshot_replacement(tmp_path, monkeypatch):

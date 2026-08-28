@@ -10,6 +10,7 @@ while the repository clone and settings/data roots remain run-local.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -71,6 +72,7 @@ class _RootlessIsolatedServer:
         docker_host: DockerHostRef,
         provider_key: str = "",
         provider_key_env: str = "OPENROUTER_API_KEY",
+        expected_settings_sha256: str | None = None,
         **kwargs: Any,
     ) -> None:
         from devtools.benchmarks.common.server_runner import IsolatedServer
@@ -78,7 +80,11 @@ class _RootlessIsolatedServer:
         self._docker_host = docker_host
         self._provider_key = str(provider_key or "").strip()
         self._provider_key_env = str(provider_key_env or "").strip()
-        self._delegate = IsolatedServer(*args, **kwargs)
+        self._delegate = IsolatedServer(
+            *args,
+            expected_settings_sha256=expected_settings_sha256,
+            **kwargs,
+        )
         # Keep the original bound method before ``start`` installs our
         # adapter-owned shim on the delegate.  Calling ``delegate._env`` from
         # the shim after that assignment would recurse forever.
@@ -124,6 +130,7 @@ class CyberGymIsolatedServer:
         provider_key_env: str = "OPENROUTER_API_KEY",
         server_factory: ServerFactory | None = None,
         git_runner: GitRunner | None = None,
+        expected_settings_sha256: str = "",
     ) -> None:
         self.seed_repo = pathlib.Path(seed_repo).expanduser().resolve(strict=False)
         self.run_root = pathlib.Path(run_root).expanduser().resolve(strict=False)
@@ -132,6 +139,12 @@ class CyberGymIsolatedServer:
         self.expected_commit = str(expected_commit or "").strip().lower()
         self.provider_key = str(provider_key or "").strip()
         self.provider_key_env = str(provider_key_env or "").strip()
+        self.expected_settings_sha256 = str(expected_settings_sha256 or "").strip().lower()
+        if self.expected_settings_sha256 and (
+            len(self.expected_settings_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.expected_settings_sha256)
+        ):
+            raise CyberGymServerError("expected_settings_sha256 must be a SHA-256 digest")
         self._server_factory = server_factory
         self._git_runner = git_runner or _run_git
         self.clone_root = self.run_root / "ouroboros-clone"
@@ -141,6 +154,7 @@ class CyberGymIsolatedServer:
         self._prepared = False
         self._started = False
         self.attestation: dict[str, Any] = {}
+        self._copied_settings_sha256: str | None = None
 
         if not self.seed_repo.is_dir():
             raise CyberGymServerError("seed_repo must be an existing directory")
@@ -194,8 +208,15 @@ class CyberGymIsolatedServer:
 
     def _copy_settings(self) -> None:
         try:
-            payload = json.loads(self.applied_settings.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raw = self.applied_settings.read_bytes()
+        except OSError as exc:
+            raise CyberGymServerError("applied settings are unreadable") from exc
+        observed_sha256 = hashlib.sha256(raw).hexdigest()
+        if self.expected_settings_sha256 and observed_sha256 != self.expected_settings_sha256:
+            raise CyberGymServerError("applied settings digest changed before isolated copy")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise CyberGymServerError("applied settings are unreadable") from exc
         if not isinstance(payload, Mapping):
             raise CyberGymServerError("applied settings must be a JSON object")
@@ -203,15 +224,15 @@ class CyberGymIsolatedServer:
         (self.data_root / "state").mkdir(parents=True, exist_ok=False)
         temporary = self.settings_path.with_name(self.settings_path.name + f".tmp.{os.getpid()}")
         try:
-            temporary.write_text(
-                json.dumps(dict(payload), ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
+            # Preserve the producer's exact bytes. Re-serializing here would
+            # create a new unaudited snapshot and reopen the producer→copy race.
+            temporary.write_bytes(raw)
             os.replace(temporary, self.settings_path)
         except OSError as exc:
             temporary.unlink(missing_ok=True)
             raise CyberGymServerError("unable to copy applied settings into isolated data") from exc
         self.settings_path.chmod(0o600)
+        self._copied_settings_sha256 = observed_sha256
         try:
             from supervisor import state as supervisor_state
 
@@ -247,6 +268,7 @@ class CyberGymIsolatedServer:
             # ambient provider/model settings. Custom test factories retain their
             # historical call contract and do not need this implementation detail.
             factory_kwargs["settings_authoritative_env"] = True
+            factory_kwargs["expected_settings_sha256"] = self._copied_settings_sha256
         self._server = factory(
             self.clone_root,
             self.data_root,
@@ -265,6 +287,7 @@ class CyberGymIsolatedServer:
                 "clone_root": str(self.clone_root),
                 "data_root": str(self.data_root),
                 "settings_path": str(self.settings_path),
+                "settings_sha256": self._copied_settings_sha256,
                 "repo_head": observed_head,
                 "runtime": observed,
             }

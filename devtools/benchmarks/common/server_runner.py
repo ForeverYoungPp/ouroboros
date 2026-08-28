@@ -57,6 +57,7 @@ STALE_INHERITED_ENV_KEYS = (
     "OUROBOROS_SERVER_HOST", "OUROBOROS_SERVER_PORT", "OUROBOROS_HOST_SERVICE_PORT",
     "OUROBOROS_APP_ROOT", "OUROBOROS_REPO_DIR", "OUROBOROS_DATA_DIR", "OUROBOROS_SETTINGS_PATH",
     "OUROBOROS_URL", "OUROBOROS_MANAGED_BY_LAUNCHER",
+    "OUROBOROS_SETTINGS_SHA256",
     # The launcher-exported presentation posture describes the OPERATOR's desktop
     # process; an isolated benchmark server is a headless web process and must
     # not inherit "desktop_window".
@@ -152,6 +153,12 @@ _AUTHORITATIVE_ENV_EXACT = frozenset({
     "USE_LOCAL_CODE",
     "TOTAL_BUDGET",
 })
+
+# A strict isolated server receives the digest of the post-port-patch settings
+# bytes in its child environment. The child verifies the same open-file bytes
+# before applying defaults, so a replacement between parent preflight and child
+# import cannot silently fall back to product defaults.
+SETTINGS_INTEGRITY_ENV = "OUROBOROS_SETTINGS_SHA256"
 
 
 def _settings_json_bytes(config: dict) -> bytes:
@@ -332,7 +339,8 @@ class IsolatedServer:
     """A throwaway Ouroboros server bound to an isolated clone + data root + port."""
 
     def __init__(self, clone: pathlib.Path, data_root: pathlib.Path, settings_path: pathlib.Path,
-                 *, host: str = "127.0.0.1", settings_authoritative_env: bool = False) -> None:
+                 *, host: str = "127.0.0.1", settings_authoritative_env: bool = False,
+                 expected_settings_sha256: str | None = None) -> None:
         self.clone = pathlib.Path(clone)
         self.data_root = pathlib.Path(data_root)
         self.settings_path = pathlib.Path(settings_path)
@@ -349,7 +357,15 @@ class IsolatedServer:
         # Digest of the exact settings snapshot admitted by a strict adapter.  It
         # is carried across the port patch and checked again immediately before
         # spawn, so a valid replacement cannot silently alter the applied run.
-        self._authoritative_settings_sha256: str | None = None
+        expected = str(expected_settings_sha256 or "").strip().lower()
+        if expected and (
+            len(expected) != 64
+            or any(char not in "0123456789abcdef" for char in expected)
+        ):
+            raise ValueError("expected_settings_sha256 must be a lowercase SHA-256 digest")
+        if expected and not self.settings_authoritative_env:
+            raise ValueError("expected_settings_sha256 requires settings_authoritative_env")
+        self._authoritative_settings_sha256: str | None = expected or None
         # Filled by _wait_ready: the HTTP runtime_version + the clone's HEAD/VERSION that
         # produced it, so a driver can record WHICH agent identity its numbers came from.
         self.attestation: dict = {}
@@ -390,6 +406,12 @@ class IsolatedServer:
             "OUROBOROS_HOST_SERVICE_PORT": str(self.host_service_port),
         })
         if self.settings_authoritative_env:
+            # _read_authoritative_settings above has just verified the exact
+            # post-port-patch bytes. Carry that digest into the child; the
+            # child repeats the open/read/hash check before defaults are applied.
+            if not self._authoritative_settings_sha256:
+                raise RuntimeError("isolated settings snapshot has no integrity digest")
+            env[SETTINGS_INTEGRITY_ENV] = self._authoritative_settings_sha256
             # A headless benchmark task may still resolve the logical
             # user_files/deliverables roots.  Keep those roots inside the
             # throwaway data root instead of letting the runtime fall back to

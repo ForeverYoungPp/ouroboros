@@ -88,7 +88,7 @@ and manifest:
   `DATA_DIR`, and `SETTINGS_PATH`), and no path resolves to live `data/`;
 * the requested model, applied settings, provider probe, and task contract
   agree; and
-* the one-task protocol smoke has a positive submission and verifier result,
+* the three-task protocol smoke has a positive submission and verifier result,
   valid model-token telemetry, and the required negative-connectivity checks.
 
 ## Template settings versus applied settings

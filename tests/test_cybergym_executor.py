@@ -233,10 +233,10 @@ def test_safe_extract_rollback_dirfd_does_not_follow_replaced_destination(
     assert destination.is_symlink()
 
 
-def test_safe_extract_path_publish_uses_descriptor_for_rollback(
+def test_safe_extract_rejects_path_only_publish_abi(
     tmp_path, monkeypatch
 ):
-    """The non-dirfd publish ABI must retain the same rollback anchor."""
+    """The non-dirfd publish ABI is refused before any staging write."""
     if not executor_module._ARCHIVE_CLEANUP_DIR_FD:  # noqa: SLF001 - capability seam
         pytest.skip("platform has no descriptor-safe cleanup primitives")
     archive = tmp_path / "path-rollback-race.tar.gz"
@@ -275,13 +275,231 @@ def test_safe_extract_path_publish_uses_descriptor_for_rollback(
 
     monkeypatch.setattr(executor_module, "_ARCHIVE_RENAME_DIR_FD", False)
     monkeypatch.setattr(os, "replace", replace_then_fail)
-    with pytest.raises(ExecutorFailure, match="destination changed before publish"):
+    with pytest.raises(ExecutorFailure, match="descriptor-safe publish and cleanup"):
         _safe_extract(archive, destination)
 
     assert outside_sentinel.read_text(encoding="utf-8") == "must-survive"
     assert not (outside / "a-root/file").exists()
-    assert not (backup / "a-root").exists()
-    assert destination.is_symlink()
+    assert not backup.exists()
+    assert destination.is_dir()
+
+
+def test_safe_extract_rejects_destination_replacement_before_open(tmp_path, monkeypatch):
+    if not (executor_module._ARCHIVE_RENAME_DIR_FD and executor_module._ARCHIVE_CLEANUP_DIR_FD):
+        pytest.skip("platform has no descriptor-safe archive primitives")
+    archive = tmp_path / "pre-open.tar.gz"
+    _write_archive(archive, [("root", "dir", ""), ("root/file", "file", "payload")])
+    destination = tmp_path / "workspace"
+    destination.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_text("keep", encoding="utf-8")
+    backup = tmp_path / "workspace-before-open"
+    original_open = os.open
+    replaced = False
+
+    def replace_before_destination_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if not replaced and kwargs.get("dir_fd") is not None and str(path) == destination.name:
+            os.rename(destination, backup)
+            destination.symlink_to(outside, target_is_directory=True)
+            replaced = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", replace_before_destination_open)
+    with pytest.raises(ExecutorFailure):
+        _safe_extract(archive, destination)
+    assert replaced
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not (outside / "root").exists()
+    assert not (backup / "root").exists()
+
+
+def test_safe_extract_rejects_parent_replacement_before_open(tmp_path, monkeypatch):
+    if not (executor_module._ARCHIVE_RENAME_DIR_FD and executor_module._ARCHIVE_CLEANUP_DIR_FD):
+        pytest.skip("platform has no descriptor-safe archive primitives")
+    archive = tmp_path / "parent-open.tar.gz"
+    _write_archive(archive, [("root", "dir", ""), ("root/file", "file", "payload")])
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    destination = parent / "workspace"
+    destination.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_text("keep", encoding="utf-8")
+    backup = tmp_path / "parent-before-open"
+    original_open = os.open
+    replaced = False
+
+    def replace_before_parent_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if not replaced and kwargs.get("dir_fd") is None and pathlib.Path(path) == parent:
+            os.rename(parent, backup)
+            parent.symlink_to(outside, target_is_directory=True)
+            replaced = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", replace_before_parent_open)
+    with pytest.raises(ExecutorFailure):
+        _safe_extract(archive, destination)
+    assert replaced
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not (outside / "workspace").exists()
+    assert not (backup / "workspace/root").exists()
+
+
+def test_safe_extract_anchors_staging_open_to_admitted_parent(tmp_path, monkeypatch):
+    if not (executor_module._ARCHIVE_RENAME_DIR_FD and executor_module._ARCHIVE_CLEANUP_DIR_FD):
+        pytest.skip("platform has no descriptor-safe archive primitives")
+    archive = tmp_path / "staging-race.tar.gz"
+    _write_archive(archive, [("root", "dir", ""), ("root/file", "file", "trusted")])
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    destination = parent / "workspace"
+    destination.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    backup = tmp_path / "parent-before-staging-race"
+    original_open = os.open
+    original_fstat = os.fstat
+    parent_fd = None
+    replaced = False
+
+    def track_parent_open(path, flags, *args, **kwargs):
+        nonlocal parent_fd
+        fd = original_open(path, flags, *args, **kwargs)
+        if kwargs.get("dir_fd") is None and pathlib.Path(path) == parent:
+            parent_fd = fd
+        return fd
+
+    def replace_after_parent_admission(fd):
+        nonlocal replaced
+        info = original_fstat(fd)
+        if fd == parent_fd and not replaced:
+            staging = next(parent.glob(".workspace.extract-*"))
+            attacker = outside / staging.name
+            (attacker / "root").mkdir(parents=True)
+            (attacker / "root/file").write_text("attacker", encoding="utf-8")
+            os.rename(parent, backup)
+            parent.symlink_to(outside, target_is_directory=True)
+            replaced = True
+        return info
+
+    monkeypatch.setattr(os, "open", track_parent_open)
+    monkeypatch.setattr(os, "fstat", replace_after_parent_admission)
+    _safe_extract(archive, destination)
+
+    assert replaced
+    assert (backup / "workspace/root/file").read_text(encoding="utf-8") == "trusted"
+    attacker_staging = next(outside.glob(".workspace.extract-*"))
+    assert (attacker_staging / "root/file").read_text(encoding="utf-8") == "attacker"
+
+
+def test_safe_extract_rejects_replaced_staging_inode(tmp_path, monkeypatch):
+    if not (executor_module._ARCHIVE_RENAME_DIR_FD and executor_module._ARCHIVE_CLEANUP_DIR_FD):
+        pytest.skip("platform has no descriptor-safe archive primitives")
+    archive = tmp_path / "staging-inode-race.tar.gz"
+    _write_archive(archive, [("root", "dir", ""), ("root/file", "file", "trusted")])
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    destination = parent / "workspace"
+    destination.mkdir()
+    original_open = os.open
+    original_fstat = os.fstat
+    parent_fd = None
+    swapped = False
+
+    def track_parent_open(path, flags, *args, **kwargs):
+        nonlocal parent_fd
+        fd = original_open(path, flags, *args, **kwargs)
+        if kwargs.get("dir_fd") is None and pathlib.Path(path) == parent:
+            parent_fd = fd
+        return fd
+
+    def replace_staging_after_parent_admission(fd):
+        nonlocal swapped
+        info = original_fstat(fd)
+        if fd == parent_fd and not swapped:
+            swapped = True
+            staging = next(parent.glob(".workspace.extract-*"))
+            saved = parent / (staging.name + ".saved")
+            os.rename(staging, saved)
+            replacement = parent / staging.name
+            (replacement / "root").mkdir(parents=True)
+            (replacement / "root/file").write_text("attacker", encoding="utf-8")
+        return info
+
+    monkeypatch.setattr(os, "open", track_parent_open)
+    monkeypatch.setattr(os, "fstat", replace_staging_after_parent_admission)
+    with pytest.raises(ExecutorFailure, match="staging (?:changed|directory was replaced)"):
+        _safe_extract(archive, destination)
+
+    assert swapped
+    assert not (destination / "root").exists()
+    replacement = next(
+        path for path in parent.glob(".workspace.extract-*")
+        if not path.name.endswith(".saved")
+    )
+    assert (replacement / "root/file").read_text(encoding="utf-8") == "attacker"
+
+
+def test_safe_extract_closes_publish_fds_if_staging_cleanup_raises(tmp_path, monkeypatch):
+    if not (executor_module._ARCHIVE_RENAME_DIR_FD and executor_module._ARCHIVE_CLEANUP_DIR_FD):
+        pytest.skip("platform has no descriptor-safe archive primitives")
+    archive = tmp_path / "cleanup-fd.tar.gz"
+    _write_archive(archive, [("root", "dir", ""), ("root/file", "file", "payload")])
+    destination = tmp_path / "workspace"
+    destination.mkdir()
+    original_open = os.open
+    original_close = os.close
+    original_remove = executor_module._remove_archive_entry_at
+    parent_fd = None
+    destination_fd = None
+    closed: list[int] = []
+
+    def capture_open(path, flags, *args, **kwargs):
+        nonlocal parent_fd, destination_fd
+        fd = original_open(path, flags, *args, **kwargs)
+        if kwargs.get("dir_fd") is None and pathlib.Path(path) == destination.parent:
+            parent_fd = fd
+        elif kwargs.get("dir_fd") == parent_fd and str(path) == destination.name:
+            destination_fd = fd
+        return fd
+
+    def capture_close(fd):
+        closed.append(fd)
+        return original_close(fd)
+
+    def fail_staging_cleanup(dir_fd, name, expected_identity=None):
+        if str(name).startswith(".workspace.extract-"):
+            raise OSError("injected staging cleanup failure")
+        return original_remove(dir_fd, name, expected_identity=expected_identity)
+
+    monkeypatch.setattr(os, "open", capture_open)
+    monkeypatch.setattr(os, "close", capture_close)
+    monkeypatch.setattr(executor_module, "_remove_archive_entry_at", fail_staging_cleanup)
+    with pytest.raises(ExecutorFailure, match="staging cleanup failed"):
+        _safe_extract(archive, destination)
+
+    assert parent_fd is not None and destination_fd is not None
+    assert parent_fd in closed
+    assert destination_fd in closed
+    with pytest.raises(OSError):
+        os.fstat(parent_fd)
+    with pytest.raises(OSError):
+        os.fstat(destination_fd)
+
+
+def test_safe_extract_requires_descriptor_cleanup_capability(tmp_path, monkeypatch):
+    archive = tmp_path / "no-cleanup.tar.gz"
+    _write_archive(archive, [("root", "dir", ""), ("root/file", "file", "payload")])
+    destination = tmp_path / "workspace"
+    monkeypatch.setattr(executor_module, "_ARCHIVE_CLEANUP_DIR_FD", False)
+    with pytest.raises(ExecutorFailure, match="descriptor-safe publish and cleanup"):
+        _safe_extract(archive, destination)
+    assert not list(tmp_path.glob(".workspace.extract-*"))
 
 
 @pytest.mark.parametrize(

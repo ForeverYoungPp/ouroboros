@@ -532,6 +532,7 @@ def _start_isolated_ouroboros_server(
     out_root: pathlib.Path,
     applied_settings: pathlib.Path,
     expected_commit: str,
+    expected_settings_sha256: str = "",
 ) -> Any:
     """Start the campaign-owned Ouroboros gateway on the selected Docker daemon.
 
@@ -546,6 +547,10 @@ def _start_isolated_ouroboros_server(
         raise CyberGymIntegrationUnavailable(
             "OPENROUTER_API_KEY must be injected in the host environment for the isolated server"
         )
+    if not re.fullmatch(r"[0-9a-f]{64}", str(expected_settings_sha256 or "").strip().lower()):
+        raise CyberGymIntegrationUnavailable(
+            "paid CyberGym execution requires a producer settings SHA-256 digest"
+        )
 
     server: Any | None = None
     try:
@@ -556,6 +561,7 @@ def _start_isolated_ouroboros_server(
             str(args.docker_host),
             expected_commit=str(expected_commit or ""),
             provider_key=provider_key,
+            expected_settings_sha256=str(expected_settings_sha256 or ""),
         )
         return server.start(ready_timeout=180)
     except Exception as exc:
@@ -852,6 +858,23 @@ def _prepare_applied_settings(
     )
     output_path = out_root / "settings_applied.json"
     write_json(output_path, applied)
+    # Hash the exact producer serialization, then verify the atomic writer
+    # left those bytes in place. The expected digest is passed downstream;
+    # a replacement after this point is rejected instead of becoming a new
+    # baseline during isolated-server setup.
+    serialized_settings = (
+        json.dumps(applied, ensure_ascii=False, indent=2) + "\n"
+    ).encode("utf-8")
+    try:
+        if output_path.read_bytes() != serialized_settings:
+            raise CyberGymIntegrationUnavailable(
+                "applied settings changed during producer write"
+            )
+    except OSError as exc:
+        raise CyberGymIntegrationUnavailable(
+            "applied settings cannot be verified after producer write"
+        ) from exc
+    settings_sha256 = hashlib.sha256(serialized_settings).hexdigest()
     model_slots = model_slot_snapshot(output_path, env_overrides=False)
     applied_model = str(model_slots.get("OUROBOROS_MODEL") or "").strip()
     if applied_model != model:
@@ -872,6 +895,7 @@ def _prepare_applied_settings(
         )
     return output_path, {
         "path": str(output_path),
+        "sha256": settings_sha256,
         "template_path": str(template_path),
         "requested_model": model,
         "model": applied_model,
@@ -1192,7 +1216,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 "admission did not provide a committed Ouroboros seed identity"
                             )
                         isolated_server = _start_isolated_ouroboros_server(
-                            args, out_root, applied_path, expected_seed_commit
+                            args,
+                            out_root,
+                            applied_path,
+                            expected_seed_commit,
+                            str(applied_metadata.get("sha256") or ""),
                         )
                         manifest.setdefault("extra", {})["ouroboros_server"] = dict(
                             getattr(isolated_server, "attestation", {}) or {}

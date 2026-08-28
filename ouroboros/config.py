@@ -6,6 +6,7 @@ Paths, settings defaults, load/save with file locking and cycle-free setting met
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -31,6 +32,21 @@ SETTINGS_PATH = pathlib.Path(os.environ.get("OUROBOROS_SETTINGS_PATH", DATA_DIR 
 PID_FILE = pathlib.Path(os.environ.get("OUROBOROS_PID_FILE", APP_ROOT / "ouroboros.pid"))
 PORT_FILE = pathlib.Path(os.environ.get("OUROBOROS_PORT_FILE", DATA_DIR / "state" / "server_port"))
 
+# A strict benchmark child receives this digest from its parent. Settings are
+# an owner-authored trust root for that child and must not be rewritten while
+# the pin is present.
+SETTINGS_INTEGRITY_ENV = "OUROBOROS_SETTINGS_SHA256"
+
+
+class SettingsIntegrityError(RuntimeError):
+    """The settings snapshot changed or became unreadable under a strict pin."""
+
+
+def _guard_settings_snapshot_mutation() -> None:
+    """Refuse every settings writer while a benchmark snapshot is pinned."""
+    if os.environ.get(SETTINGS_INTEGRITY_ENV):
+        raise SettingsIntegrityError("strict isolated settings snapshot is immutable")
+
 RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 AGENT_SERVER_PORT = 8765
@@ -49,6 +65,7 @@ SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC = 90
 
 
 def _guard_live_settings_write() -> None:
+    _guard_settings_snapshot_mutation()
     if os.environ.get("OUROBOROS_ALLOW_LIVE_DATA_TESTS") == "1":
         return
     try:
@@ -907,10 +924,17 @@ def _settings_flag_enabled(key: str) -> bool:
     applies without a restart, while env still seeds a key the file never mentions."""
     raw = None
     try:
-        if SETTINGS_PATH.exists():
-            disk = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        disk_bytes = _read_settings_bytes_verified()
+        if disk_bytes is not None:
+            disk = json.loads(disk_bytes.decode("utf-8"))
             if isinstance(disk, dict) and key in disk:
                 raw = disk.get(key)
+    except SettingsIntegrityError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if _expected_settings_sha256():
+            raise SettingsIntegrityError("settings snapshot is unreadable") from exc
+        raw = None
     except Exception:
         raw = None
     if raw is None:
@@ -1300,6 +1324,38 @@ def _coerce_setting_value(key: str, value):
     return str(value or "")
 
 
+def _expected_settings_sha256() -> str:
+    value = str(os.environ.get(SETTINGS_INTEGRITY_ENV, "") or "").strip().lower()
+    if value and (len(value) != 64 or any(char not in "0123456789abcdef" for char in value)):
+        raise SettingsIntegrityError("settings integrity digest is malformed")
+    return value
+
+
+def _read_settings_bytes_verified() -> bytes | None:
+    """Read one stable file descriptor and verify its complete byte stream."""
+    expected = _expected_settings_sha256()
+    try:
+        with SETTINGS_PATH.open("rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        if expected:
+            raise SettingsIntegrityError("settings snapshot is missing") from None
+        return None
+    except OSError as exc:
+        if expected:
+            raise SettingsIntegrityError("settings snapshot is unreadable") from exc
+        return None
+    if expected and hashlib.sha256(raw).hexdigest() != expected:
+        raise SettingsIntegrityError("settings snapshot changed")
+    return raw
+
+
+def verify_settings_integrity() -> str | None:
+    """Verify the strict child pin, returning the observed digest when present."""
+    raw = _read_settings_bytes_verified()
+    return hashlib.sha256(raw).hexdigest() if raw is not None else None
+
+
 # Load / Save
 # Setting keys a release DELETED. `load_settings` keeps unrecognized keys so a rename never destroys
 # an owner customization — which would otherwise leave a removed key living in data/settings.json
@@ -1346,22 +1402,30 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
     compatibility migration is persisted only while that lock is held; the write contains
     the raw mapping plus the normalized pair, never a defaults-merged settings document."""
     loaded: dict = {}
-    if SETTINGS_PATH.exists():
+    try:
+        raw_bytes = _read_settings_bytes_verified()
+    except SettingsIntegrityError:
+        raise
+    except Exception:
+        raw_bytes = None
+    if raw_bytes is not None:
         try:
-            raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                raw = normalize_and_persist_context_mode_compat(
-                    raw,
-                    settings_path=SETTINGS_PATH,
-                    lock_held=_settings_lock_held,
-                    guard_live_write=_guard_live_settings_write,
-                )
-                loaded = {
-                    key: _coerce_setting_value(key, value) if key in SETTINGS_DEFAULTS else value
-                    for key, value in raw.items()
-                }
-        except Exception:
-            pass
+            raw = json.loads(raw_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if _expected_settings_sha256():
+                raise SettingsIntegrityError("settings snapshot is unreadable") from exc
+            raw = None
+        if isinstance(raw, dict):
+            raw = normalize_and_persist_context_mode_compat(
+                raw,
+                settings_path=SETTINGS_PATH,
+                lock_held=_settings_lock_held,
+                guard_live_write=_guard_live_settings_write,
+            )
+            loaded = {
+                key: _coerce_setting_value(key, value) if key in SETTINGS_DEFAULTS else value
+                for key, value in raw.items()
+            }
     # Rename-alias migration: fold deprecated per-subsystem retention keys into the unified
     # OUROBOROS_GC_RETENTION_DAYS, then drop the legacy keys. Prefer a CUSTOMIZED legacy value
     # so a rename never orphans it; an all-defaults file collapses to the unified default.

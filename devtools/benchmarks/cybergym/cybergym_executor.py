@@ -1207,19 +1207,11 @@ def _archive_link_kind(
     return _archive_resolve(relative, member_types, link_targets, implicit_dirs)[1]
 
 
-def _remove_archive_path(path: pathlib.Path) -> None:
-    """Remove one known staging/published path without following a symlink."""
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return
-    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-        shutil.rmtree(path)
-    else:
-        path.unlink()
-
-
-def _remove_archive_entry_at(dir_fd: int, name: str) -> None:
+def _remove_archive_entry_at(
+    dir_fd: int,
+    name: str,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
     """Remove one archive entry relative to an already-open directory.
 
     A lexical ``Path`` is unsafe during rollback: the destination's parent may
@@ -1232,16 +1224,35 @@ def _remove_archive_entry_at(dir_fd: int, name: str) -> None:
         info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     except FileNotFoundError:
         return
+    if expected_identity is not None and (
+        int(info.st_dev), int(info.st_ino)
+    ) != expected_identity:
+        raise RuntimeError("published archive entry was replaced")
     if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         child_fd = os.open(name, flags, dir_fd=dir_fd)
         try:
+            child_info = os.fstat(child_fd)
+            if (
+                int(child_info.st_dev), int(child_info.st_ino)
+            ) != (int(info.st_dev), int(info.st_ino)):
+                raise RuntimeError("published archive entry was replaced")
             for child in os.listdir(child_fd):
                 _remove_archive_entry_at(child_fd, child)
         finally:
             os.close(child_fd)
+        current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if expected_identity is not None and (
+            int(current.st_dev), int(current.st_ino)
+        ) != expected_identity:
+            raise RuntimeError("published archive entry was replaced")
         os.rmdir(name, dir_fd=dir_fd)
     else:
+        current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if expected_identity is not None and (
+            int(current.st_dev), int(current.st_ino)
+        ) != expected_identity:
+            raise RuntimeError("published archive entry was replaced")
         os.unlink(name, dir_fd=dir_fd)
 
 
@@ -1276,37 +1287,25 @@ def _safe_extract(archive: pathlib.Path, destination: pathlib.Path) -> None:
         int(destination_parent_info.st_ino),
     )
 
-    def destination_is_stable() -> bool:
-        """Check the lexical fallback still names the admitted directory."""
-        try:
-            current = destination.lstat()
-        except OSError:
-            return False
-        return (
-            stat.S_ISDIR(current.st_mode)
-            and not stat.S_ISLNK(current.st_mode)
-            and (int(current.st_dev), int(current.st_ino)) == destination_identity
-        )
-
-    def destination_parent_is_stable() -> bool:
-        """Check that a lexical staging path still has its admitted parent."""
-        try:
-            current = destination.parent.lstat()
-        except OSError:
-            return False
-        return (
-            stat.S_ISDIR(current.st_mode)
-            and not stat.S_ISLNK(current.st_mode)
-            and (int(current.st_dev), int(current.st_ino)) == destination_parent_identity
+    # The CyberGym task workspace is an untrusted boundary.  On a platform
+    # without both descriptor-relative rename and descriptor-safe cleanup there
+    # is no race-free way to publish several top-level entries and roll them
+    # back. Refuse before creating staging rather than silently leaving a
+    # partially published tree or following a replaced path.
+    if not (_ARCHIVE_RENAME_DIR_FD and _ARCHIVE_CLEANUP_DIR_FD):
+        raise ExecutorFailure(
+            "task archive requires descriptor-safe publish and cleanup primitives"
         )
 
     staging: pathlib.Path | None = None
     staging_identity: tuple[int, int] | None = None
     # Entries published through a directory descriptor carry that descriptor
-    # into rollback.  The lexical path is retained only for the portable
-    # fallback where dirfd-aware rename is unavailable.
+    # into rollback. The source inode is recorded before rename, avoiding a
+    # post-rename stat window in which a replacement could be mistaken for our
+    # entry.
     published: list[tuple[pathlib.Path, int | None, str | None, tuple[int, int] | None]] = []
     publish_dir_fd: int | None = None
+    publish_parent_fd: int | None = None
 
     def rollback() -> None:
         rollback_error: Exception | None = None
@@ -1322,12 +1321,9 @@ def _safe_extract(archive: pathlib.Path, destination: pathlib.Path) -> None:
                     # Refuse to unlink a replacement entry.  Leaving it in
                     # place is safer than deleting an object not authored by
                     # this extraction attempt.
-                    current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-                    if identity is not None and (
-                        int(current.st_dev), int(current.st_ino)
-                    ) != identity:
-                        raise RuntimeError("published archive entry was replaced")
-                    _remove_archive_entry_at(dir_fd, name)
+                    if identity is None:
+                        raise RuntimeError("published archive entry identity is unavailable")
+                    _remove_archive_entry_at(dir_fd, name, expected_identity=identity)
             except Exception as exc:  # pragma: no cover - filesystem failure
                 rollback_error = exc
         published.clear()
@@ -1474,69 +1470,64 @@ def _safe_extract(archive: pathlib.Path, destination: pathlib.Path) -> None:
             dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
             dest_fd: int | None = None
             stage_fd: int | None = None
+            publish_parent_fd = None
             try:
-                if _ARCHIVE_RENAME_DIR_FD:
-                    dest_fd = os.open(destination, dir_flags)
-                    if _ARCHIVE_CLEANUP_DIR_FD:
-                        publish_dir_fd = dest_fd
-                    stage_fd = os.open(staging, dir_flags)
-                    for top in top_levels:
-                        try:
-                            os.stat(top, dir_fd=dest_fd, follow_symlinks=False)
-                        except FileNotFoundError:
-                            pass
-                        else:
-                            raise ExecutorFailure("task archive destination changed before publish")
-                        os.rename(top, top, src_dir_fd=stage_fd, dst_dir_fd=dest_fd)
-                        if _ARCHIVE_CLEANUP_DIR_FD:
-                            published_info = os.stat(top, dir_fd=dest_fd, follow_symlinks=False)
-                            published.append(
-                                (
-                                    destination / top,
-                                    dest_fd,
-                                    top,
-                                    (int(published_info.st_dev), int(published_info.st_ino)),
-                                )
-                            )
-                        else:
-                            # The descriptor was needed for publish, but this
-                            # platform cannot prove a safe recursive rollback.
-                            published.append((destination / top, None, None, None))
-                else:  # pragma: no cover - Python platforms without dir_fd rename
-                    if _ARCHIVE_CLEANUP_DIR_FD:
-                        # Path-based replace is retained for this platform's
-                        # publish ABI, but rollback remains anchored to the
-                        # admitted destination inode.
-                        dest_fd = os.open(destination, dir_flags)
-                        publish_dir_fd = dest_fd
-                    for top in top_levels:
-                        if not destination_is_stable():
-                            raise ExecutorFailure("task archive destination changed before publish")
-                        target = destination / top
-                        try:
-                            target.lstat()
-                        except FileNotFoundError:
-                            pass
-                        else:
-                            raise ExecutorFailure("task archive destination changed before publish")
-                        os.replace(staging / top, target)
-                        if dest_fd is not None and _ARCHIVE_CLEANUP_DIR_FD:
-                            published_info = os.stat(top, dir_fd=dest_fd, follow_symlinks=False)
-                            published.append(
-                                (
-                                    target,
-                                    dest_fd,
-                                    top,
-                                    (int(published_info.st_dev), int(published_info.st_ino)),
-                                )
-                            )
-                        else:
-                            published.append((target, None, None, None))
+                # Open the admitted parent first, then open the destination
+                # relative to that descriptor. fstat on both handles closes
+                # the pre-open destination/parent replacement window; later
+                # renames stay anchored even if the lexical path is swapped.
+                publish_parent_fd = os.open(destination.parent, dir_flags)
+                parent_info = os.fstat(publish_parent_fd)
+                if (
+                    int(parent_info.st_dev), int(parent_info.st_ino)
+                ) != destination_parent_identity:
+                    raise ExecutorFailure("task archive destination parent changed before publish")
+                dest_fd = os.open(destination.name, dir_flags, dir_fd=publish_parent_fd)
+                dest_info = os.fstat(dest_fd)
+                if (
+                    int(dest_info.st_dev), int(dest_info.st_ino)
+                ) != destination_identity:
+                    raise ExecutorFailure("task archive destination changed before publish")
+                publish_dir_fd = dest_fd
+                # Open staging relative to the already-admitted parent. A
+                # lexical open after the parent fstat would reintroduce the
+                # parent-replacement race this descriptor path is meant to
+                # close.
+                stage_fd = os.open(staging.name, dir_flags, dir_fd=publish_parent_fd)
+                stage_info = os.fstat(stage_fd)
+                if staging_identity is None or (
+                    int(stage_info.st_dev), int(stage_info.st_ino)
+                ) != staging_identity:
+                    raise ExecutorFailure("task archive staging changed before publish")
+                for top in top_levels:
+                    try:
+                        os.stat(top, dir_fd=dest_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise ExecutorFailure("task archive destination changed before publish")
+                    # Capture the source inode before the atomic rename. A
+                    # post-rename stat can observe a concurrent replacement
+                    # and accidentally record that foreign inode as ours.
+                    source_info = os.stat(top, dir_fd=stage_fd, follow_symlinks=False)
+                    source_identity = (int(source_info.st_dev), int(source_info.st_ino))
+                    os.rename(top, top, src_dir_fd=stage_fd, dst_dir_fd=dest_fd)
+                    published.append(
+                        (destination / top, dest_fd, top, source_identity)
+                    )
             finally:
+                # Close each descriptor independently: a failure closing one
+                # must not leak the other into the worker process.
                 if stage_fd is not None:
-                    os.close(stage_fd)
+                    try:
+                        os.close(stage_fd)
+                    except OSError:
+                        pass
                 if dest_fd is not None and dest_fd != publish_dir_fd:
-                    os.close(dest_fd)
+                    try:
+                        os.close(dest_fd)
+                    except OSError:
+                        pass
     except ExecutorFailure:
         rollback()
         raise
@@ -1544,20 +1535,20 @@ def _safe_extract(archive: pathlib.Path, destination: pathlib.Path) -> None:
         rollback()
         raise ExecutorFailure("task archive extraction failed") from exc
     finally:
-        if publish_dir_fd is not None:
-            try:
-                os.close(publish_dir_fd)
-            except OSError:  # pragma: no cover - descriptor cleanup
-                pass
-        if staging is not None:
-            try:
-                if _ARCHIVE_CLEANUP_DIR_FD:
+        cleanup_error: Exception | None = None
+        try:
+            if staging is not None:
+                try:
                     cleanup_flags = (
                         os.O_RDONLY
                         | getattr(os, "O_DIRECTORY", 0)
                         | getattr(os, "O_NOFOLLOW", 0)
                     )
-                    cleanup_parent_fd = os.open(staging.parent, cleanup_flags)
+                    cleanup_parent_fd = publish_parent_fd
+                    owns_cleanup_parent_fd = False
+                    if cleanup_parent_fd is None:
+                        cleanup_parent_fd = os.open(staging.parent, cleanup_flags)
+                        owns_cleanup_parent_fd = True
                     try:
                         parent_info = os.fstat(cleanup_parent_fd)
                         if (
@@ -1575,24 +1566,36 @@ def _safe_extract(archive: pathlib.Path, destination: pathlib.Path) -> None:
                             int(current.st_ino),
                         ) != staging_identity:
                             raise ExecutorFailure("task archive staging directory was replaced")
-                        _remove_archive_entry_at(cleanup_parent_fd, staging.name)
+                        _remove_archive_entry_at(
+                            cleanup_parent_fd,
+                            staging.name,
+                            expected_identity=staging_identity,
+                        )
                     finally:
-                        os.close(cleanup_parent_fd)
-                else:
-                    # Keep the portable path working, but never follow a
-                    # parent replacement observed by the identity guard.
-                    if not destination_parent_is_stable():
-                        raise ExecutorFailure("task archive staging parent changed during cleanup")
-                    if staging_identity is not None:
-                        current = staging.lstat()
-                        if (
-                            int(current.st_dev),
-                            int(current.st_ino),
-                        ) != staging_identity:
-                            raise ExecutorFailure("task archive staging directory was replaced")
-                    _remove_archive_path(staging)
-            except OSError as exc:  # pragma: no cover - filesystem failure
-                raise ExecutorFailure("task archive staging cleanup failed") from exc
+                        if owns_cleanup_parent_fd:
+                            os.close(cleanup_parent_fd)
+                except OSError as exc:  # pragma: no cover - filesystem failure
+                    cleanup_error = ExecutorFailure("task archive staging cleanup failed")
+                    cleanup_error.__cause__ = exc
+                except Exception as exc:  # preserve typed cleanup failures
+                    cleanup_error = exc
+        finally:
+            # Keep the admitted directory descriptors alive through staging
+            # cleanup; close each independently even if one close reports an
+            # OS error. The outer ``finally`` guarantees both attempts happen
+            # even when cleanup itself raises.
+            if publish_dir_fd is not None:
+                try:
+                    os.close(publish_dir_fd)
+                except OSError:  # pragma: no cover - descriptor cleanup
+                    pass
+            if publish_parent_fd is not None:
+                try:
+                    os.close(publish_parent_fd)
+                except OSError:  # pragma: no cover - descriptor cleanup
+                    pass
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 def _read_text(path: pathlib.Path, name: str, limit: int = 256_000) -> str:
