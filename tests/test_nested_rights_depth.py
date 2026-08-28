@@ -1187,6 +1187,84 @@ def test_generic_malformed_replay_preserves_live_exact_result(
     assert not enqueued
 
 
+@pytest.mark.parametrize("delegation_role", ["root", "subagent"])
+def test_malformed_replay_preserves_preexisting_admission_reservation(
+    tmp_path, monkeypatch, delegation_role,
+):
+    from supervisor import events, queue
+
+    tid = f"reserved-{delegation_role}"
+    pending, running = [], {}
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(queue, "RUNNING", running)
+    monkeypatch.setattr(queue, "ADMISSION_RESERVATIONS", {tid: "owner-token"})
+    enqueued = []
+    ctx = _fake_ctx(tmp_path, enqueued)
+    ctx.PENDING, ctx.RUNNING = pending, running
+    ctx.enqueue_task = queue.enqueue_task
+    event = _schedule_event(tid, "parent", depth=-1, drive_root=tmp_path)
+    event["delegation_role"], event["chat_id"] = delegation_role, 7
+
+    events._handle_schedule_task(event, ctx)
+
+    assert not (tmp_path / "task_results" / f"{tid}.json").exists()
+    assert queue.ADMISSION_RESERVATIONS == {tid: "owner-token"}
+    assert pending == []
+    assert running == {}
+    assert enqueued == []
+
+
+@pytest.mark.parametrize("delegation_role", ["root", "subagent"])
+@pytest.mark.parametrize("late_custody", ["reservation", "pending"])
+def test_malformed_replay_rechecks_identity_after_initial_preflight(
+    tmp_path, monkeypatch, delegation_role, late_custody,
+):
+    from supervisor import events, queue, task_admission
+
+    tid = f"late-{delegation_role}-{late_custody}"
+    pending, running = [], {}
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(queue, "RUNNING", running)
+    monkeypatch.setattr(queue, "ADMISSION_RESERVATIONS", {})
+    calls = 0
+
+    def raced_owned(_ctx, _task_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if late_custody == "reservation":
+                queue.ADMISSION_RESERVATIONS[tid] = "late-token"
+            else:
+                pending.append({"id": tid, "delegation_role": delegation_role})
+            return False
+        return bool(
+            queue.ADMISSION_RESERVATIONS.get(tid)
+            or any(str(row.get("id") or "") == tid for row in pending)
+        )
+
+    monkeypatch.setattr(task_admission, "subagent_schedule_owned", raced_owned)
+    enqueued = []
+    ctx = _fake_ctx(tmp_path, enqueued)
+    ctx.PENDING, ctx.RUNNING = pending, running
+    ctx.enqueue_task = queue.enqueue_task
+    event = _schedule_event(tid, "parent", depth=-1, drive_root=tmp_path)
+    event["delegation_role"], event["chat_id"] = delegation_role, 7
+
+    events._handle_schedule_task(event, ctx)
+
+    assert calls == 2
+    assert not (tmp_path / "task_results" / f"{tid}.json").exists()
+    assert enqueued == []
+    if late_custody == "reservation":
+        assert queue.ADMISSION_RESERVATIONS == {tid: "late-token"}
+        assert pending == []
+    else:
+        assert queue.ADMISSION_RESERVATIONS == {}
+        assert pending == [{"id": tid, "delegation_role": delegation_role}]
+
+
 def test_supervisor_rejects_count_bounded_child_when_count_scan_fails(
     tmp_path, monkeypatch,
 ):

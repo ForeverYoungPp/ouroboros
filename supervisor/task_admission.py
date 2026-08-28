@@ -34,42 +34,56 @@ def parse_schedule_task_depth(
     constraints: str,
     task_context: str,
 ) -> tuple[int, bool]:
-    """Parse schedule depth and terminalize a fresh invalid event."""
-    try:
-        return parse_task_depth(evt.get("depth", 0), default=0), False
-    except (TypeError, ValueError) as exc:
-        from supervisor.events import _reject_schedule_task
+    """Parse depth after an atomic final freshness check.
 
-        _reject_schedule_task(
-            ctx,
-            tid=tid,
-            chat_id=chat_id,
-            delegation_role=delegation_role,
-            parent_id=parent_id,
-            root_task_id=root_task_id,
-            role=role,
-            result_fields={
-                "parent_task_id": parent_id,
-                "root_task_id": root_task_id,
-                "session_id": str(evt.get("session_id") or ""),
-                "actor_id": str(evt.get("actor_id") or "ouroboros"),
-                "delegation_role": delegation_role,
-                "role": role,
-                "description": desc,
-                "objective": desc,
-                "expected_output": expected_output,
-                "constraints": constraints,
-                "context": task_context,
-                "chat_id": chat_id or None,
-                "depth": 0,
-                "raw_task_depth": evt.get("depth"),
-                "invalid_task_depth": True,
-            },
-            detail=f"{'Subagent' if delegation_role == 'subagent' else 'Task'} rejected: invalid task depth: {exc}",
-            reason_code="invalid_task_depth",
-            fallback_message="⚠️ Task rejected: depth must be a non-negative integer.",
-        )
-        return 0, True
+    The initial replay probe runs before expensive admission work, but a
+    concurrent reservation or queue assignment can arrive before parsing.  The
+    final check below shares the queue lock with those writers and keeps the
+    malformed-result write under that lock, so an invalid replay cannot steal
+    custody between the probe and rejection.
+    """
+    from supervisor import queue
+
+    with queue._queue_lock:
+        if tid and subagent_schedule_preflight(
+            ctx, evt, chat_id, delegation_role=delegation_role,
+        ):
+            return 0, True
+        try:
+            return parse_task_depth(evt.get("depth", 0), default=0), False
+        except (TypeError, ValueError) as exc:
+            from supervisor.events import _reject_schedule_task
+
+            _reject_schedule_task(
+                ctx,
+                tid=tid,
+                chat_id=chat_id,
+                delegation_role=delegation_role,
+                parent_id=parent_id,
+                root_task_id=root_task_id,
+                role=role,
+                result_fields={
+                    "parent_task_id": parent_id,
+                    "root_task_id": root_task_id,
+                    "session_id": str(evt.get("session_id") or ""),
+                    "actor_id": str(evt.get("actor_id") or "ouroboros"),
+                    "delegation_role": delegation_role,
+                    "role": role,
+                    "description": desc,
+                    "objective": desc,
+                    "expected_output": expected_output,
+                    "constraints": constraints,
+                    "context": task_context,
+                    "chat_id": chat_id or None,
+                    "depth": 0,
+                    "raw_task_depth": evt.get("depth"),
+                    "invalid_task_depth": True,
+                },
+                detail=f"{'Subagent' if delegation_role == 'subagent' else 'Task'} rejected: invalid task depth: {exc}",
+                reason_code="invalid_task_depth",
+                fallback_message="⚠️ Task rejected: depth must be a non-negative integer.",
+            )
+            return 0, True
 
 
 def reject_if_no_chat_target(
@@ -247,6 +261,8 @@ def subagent_schedule_owned(
             ctx, "PENDING", queue.PENDING,
         )
         running = getattr(ctx, "RUNNING", queue.RUNNING)
+        if queue.ADMISSION_RESERVATIONS.get(tid):
+            return True
         status = str((load_task_result(
             ctx.DRIVE_ROOT, tid, strict=True,
         ) or {}).get("status") or "")
