@@ -14,6 +14,11 @@ import pathlib
 from typing import Any, Dict, List, Optional
 
 
+_KNOWN_PHYSICAL_ATTEMPT_STATES = {
+    "reserved", "released", "settled", "dispatched", "unresolved",
+}
+
+
 def persist_wave(drive_root: Any, task_id: str, wave: Dict[str, Any]) -> Dict[str, Any]:
     from ouroboros.artifacts import store_task_artifact_bytes
     from ouroboros.observability import redact_projection
@@ -89,6 +94,12 @@ def _row_has_physical_dispatch(row: Dict[str, Any]) -> bool:
         physical_state = str(
             row["usage"].get("physical_attempt_state") or ""
         ).strip().lower()
+    # A non-empty state outside the physical-attempt enum is malformed custody,
+    # not evidence that the synthetic operation id was free.  Keep it on the
+    # paid side until the caller rejects the row rather than laundering it into
+    # a $0 pre-dispatch refusal.
+    if physical_state and physical_state not in _KNOWN_PHYSICAL_ATTEMPT_STATES:
+        return True
     # Explicit $0 states always win over the synthetic operation id assigned by
     # the host before it knows whether a provider call was admitted.
     if operation_state == "not_dispatched" or status == "not_dispatched":
@@ -129,7 +140,26 @@ def in_flight_resume_inputs(
                     "Prior exact plan-review authority is unreadable; "
                     "in-flight reconciliation is refused."
                 )}
-    actor_rows = [row for row in (existing.get("actors") or []) if isinstance(row, dict)]
+    raw_actor_rows = existing.get("actors")
+    if not isinstance(raw_actor_rows, list) or any(
+        not isinstance(row, dict) for row in raw_actor_rows
+    ):
+        return {"error": (
+            "The prior paid cycle's reviewer roster is malformed. Refusing to "
+            "drop rows or infer which physical calls own custody."
+        )}
+    actor_rows = list(raw_actor_rows)
+    for row in actor_rows:
+        physical_state = str(row.get("physical_attempt_state") or "").strip().lower()
+        if not physical_state and isinstance(row.get("usage"), dict):
+            physical_state = str(
+                row["usage"].get("physical_attempt_state") or ""
+            ).strip().lower()
+        if physical_state and physical_state not in _KNOWN_PHYSICAL_ATTEMPT_STATES:
+            return {"error": (
+                "The prior paid cycle contains an unknown physical-attempt state. "
+                "Refusing to infer custody from malformed reviewer facts."
+            )}
     configured_ids = {str(getattr(slot, "slot_id", "") or "") for slot in configured_slots}
     actor_ids = [str(row.get("slot_id") or "") for row in actor_rows]
     if not actor_rows or any(not slot_id for slot_id in actor_ids) \

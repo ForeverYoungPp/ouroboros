@@ -207,3 +207,46 @@ def test_resume_excludes_synthetic_not_dispatched_operation_ids(tmp_path):
 
     assert result["dispatched_slot_ids"] == ["s1"]
     assert [row["slot_id"] for row in result["frozen_rows"]] == ["s2"]
+
+
+def test_resume_rejects_non_object_rows_in_exact_paid_roster(tmp_path):
+    """A corrupt durable roster must not lose rows during reconciliation."""
+    from ouroboros.tools.plan_review_artifacts import in_flight_resume_inputs
+
+    result = in_flight_resume_inputs(
+        {
+            "actors": [{
+                "slot_id": "s1", "operation_id": "op-paid",
+                "operation_state": "in_flight", "late_result_pending": True,
+                "status": "error", "error": "still running",
+            }, "CORRUPT-ROW"],
+        },
+        {}, tmp_path, "malformed-roster", [
+            SimpleNamespace(slot_id="s1", model="model/one"),
+        ],
+    )
+
+    assert "error" in result
+    assert "drop rows" in result["error"]
+
+
+def test_resume_rejects_unknown_physical_attempt_state(tmp_path):
+    """Unknown custody facts cannot be inferred as a safe retry or refusal."""
+    from ouroboros.tools.plan_review_artifacts import in_flight_resume_inputs
+
+    result = in_flight_resume_inputs(
+        {
+            "actors": [{
+                "slot_id": "s1", "operation_id": "op-paid",
+                "operation_state": "settled", "status": "error",
+                "error": "provider state unavailable",
+                "usage": {"physical_attempt_state": "future_state"},
+            }],
+        },
+        {}, tmp_path, "unknown-roster-state", [
+            SimpleNamespace(slot_id="s1", model="model/one"),
+        ],
+    )
+
+    assert "error" in result
+    assert "unknown physical-attempt state" in result["error"]

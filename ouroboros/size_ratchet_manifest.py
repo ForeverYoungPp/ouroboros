@@ -177,7 +177,6 @@ BAND_PATHS = {
     "tests/test_onboarding_wizard.py": None,
     "tests/test_packaged_runtime_and_lifecycle.py": None,
     "tests/test_repo_health_smoke.py": "size-ratchet redesign: merge-aware previous, pairwise base-vs-tip, candidate-mode generator contract tests",
-    "tests/test_review_custody_timeout_policy.py": "Physical review-custody timeout, terminal-status, unknown-outcome, and zero-budget replay regressions share one focused lifecycle suite.",
     "tests/test_review_cycles_dispatch.py": "Task acceptance wallet and paid-stamp dispatch regression matrix was integrated from the current managed target alongside the existing review-cycle tests.",
     "tests/test_review_fidelity.py": None,
     "tests/test_review_verification_v6544.py": None,

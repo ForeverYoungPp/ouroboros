@@ -896,6 +896,88 @@ def test_unresolved_capture_without_terminal_status_is_no_resend_without_typed_c
     assert second[0].late_result_pending is True
 
 
+def test_unknown_physical_capture_state_is_no_resend_even_with_terminal_status(tmp_path):
+    """Malformed physical provenance must win over an otherwise typed status."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import (
+        _NO_RESEND, _attempt_key, run_custodied_review_slots,
+    )
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    calls = []
+    ctx = SimpleNamespace()
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="unknown-physical-state",
+        retry_key="plan_review:unknown-physical-state:1",
+    )
+    slot = ReviewSlot(
+        slot_id="only", model="test/model", route=ReviewRouteKind.API_CHAT,
+        timeout_sec=0.2,
+    )
+
+    def run_slot(slot, operation_id, _retry_state, _deadline, _checkpoint):
+        calls.append(operation_id)
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error",
+            error="malformed physical state", operation_id=operation_id,
+            http_status=503,
+            usage={"physical_attempt_state": "future_state", "provider_status_code": 503},
+        )
+
+    def error_actor(slot, error, operation_id="", operation_state="settled"):
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error", error=error,
+            operation_id=operation_id, operation_state=operation_state,
+        )
+
+    args = dict(
+        request=request, slots=[slot], usage_ctx=ctx, task_id=request.task_id,
+        usage_meta={}, review_usage_scope=UsageScope(
+            drive_root=tmp_path, task_id=request.task_id,
+        ), run_slot=run_slot, error_actor=error_actor,
+    )
+    first = run_custodied_review_slots(**args)
+    second = run_custodied_review_slots(**args)
+
+    assert len(calls) == 1
+    assert first[0].operation_state == "custody_lost"
+    assert first[0].failure_code == "provider_outcome_unknown"
+    assert first[0].late_result_pending is True
+    assert first[0].usage["physical_attempt_state"] == "unresolved"
+    assert first[0].usage.get("provider_status_code") is None
+    assert first[0].http_status is None
+    assert second[0].operation_state == "custody_lost"
+    assert second[0].operation_id == first[0].operation_id
+    assert _attempt_key(request, slot) in _NO_RESEND
+
+
+def test_unknown_exception_capture_projects_custody_loss_over_http_status():
+    """Exception capture validation must not let status text launder custody."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import _ReviewAttemptHistory, _review_exception_projection
+
+    exc = RuntimeError("provider returned 503")
+    exc.physical_attempt_capture = SimpleNamespace(
+        state="future_state", provider_status_code=503,
+    )
+    history = _ReviewAttemptHistory()
+    history.observe(exc)
+
+    custody, state, status, operation_state, failure_code = _review_exception_projection(
+        exc, {"provider_status_code": 503}, history, {},
+    )
+
+    assert state == "unresolved"
+    assert status is None
+    assert operation_state == "custody_lost"
+    assert failure_code == "provider_outcome_unknown"
+    assert custody == {"physical_attempt_state": "unresolved"}
+
+
 def test_coordinator_propagates_terminal_capture_status_for_same_cycle_replay(
     tmp_path, monkeypatch,
 ):

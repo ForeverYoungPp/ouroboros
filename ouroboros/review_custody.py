@@ -45,6 +45,9 @@ _ACTIVE: Dict[str, ActiveReviewAttempt] = {}
 # not the full actor/prompt, until process exit.
 _NO_RESEND: Dict[str, str] = {}
 _PENDING_STATES = {"in_flight", "custody_lost"}
+_KNOWN_PHYSICAL_CAPTURE_STATES = {
+    "", "reserved", "released", "settled", "dispatched", "unresolved",
+}
 _PHYSICAL_CAPTURE_STATES = {"", "settled", "dispatched", "unresolved"}
 _POSITIVE_CAPTURE_STATES = {"settled", "dispatched", "unresolved"}
 
@@ -68,6 +71,16 @@ class _ReviewAttemptHistory:
             except Exception:
                 capture = None
         state = str(getattr(capture, "state", "") or "").strip().lower()
+        if state and state not in _KNOWN_PHYSICAL_CAPTURE_STATES:
+            # A malformed non-empty capture cannot prove that no request was
+            # admitted.  Preserve the strongest safe interpretation across the
+            # whole retry rail, so a later exception/status cannot authorize a
+            # second paid send.
+            self.dispatched = True
+            self.capture_state = "unresolved"
+            self.unknown_outcome_seen = True
+            self.provider_status_code = None
+            return
         if state not in _POSITIVE_CAPTURE_STATES:
             return
         self.dispatched = True
@@ -106,6 +119,20 @@ def _review_exception_projection(
     failure_custody = dict(executor_custody or {})
     capture = getattr(exc, "physical_attempt_capture", None)
     capture_state = str(getattr(capture, "state", "") or "").strip().lower()
+    malformed_capture = bool(
+        capture_state and capture_state not in _KNOWN_PHYSICAL_CAPTURE_STATES
+    )
+    if malformed_capture:
+        # Unknown capture values are custody loss, even when the exception also
+        # carries an HTTP status.  The status cannot repair malformed physical
+        # provenance, and retaining it would make the row appear replayable.
+        capture_state = "unresolved"
+        failure_custody["physical_attempt_state"] = capture_state
+        failure_custody.pop("provider_status_code", None)
+        history.dispatched = True
+        history.capture_state = capture_state
+        history.unknown_outcome_seen = True
+        history.provider_status_code = None
     if capture_state:
         failure_custody["physical_attempt_state"] = capture_state
     http_status = next((value for value in (
@@ -114,8 +141,11 @@ def _review_exception_projection(
         getattr(capture, "provider_status_code", None),
         failure_custody.get("provider_status_code"),
     ) if isinstance(value, int) and not isinstance(value, bool)), None)
-    if http_status is not None:
+    if http_status is not None and not malformed_capture:
         failure_custody["provider_status_code"] = http_status
+    elif malformed_capture:
+        http_status = None
+        failure_custody.pop("provider_status_code", None)
     history.preserve(failure_custody, capture_state)
     dispatched = history.dispatched
     if history.unknown_outcome_seen:
@@ -133,7 +163,7 @@ def _review_exception_projection(
             exc, {**(retry_state or {}), **failure_custody},
         )
     operation_state = (
-        route_state
+        "custody_lost" if history.unknown_outcome_seen else route_state
         or ("not_dispatched" if not dispatched and (
             capture_state in {"reserved", "released"}
             or isinstance(exc, BudgetExceeded)
@@ -162,6 +192,8 @@ def _worker_exception_operation_state(
     code = str(getattr(exc, "code", "") or "")
     capture = getattr(exc, "physical_attempt_capture", None)
     capture_state = str(getattr(capture, "state", "") or "").strip().lower()
+    if capture_state and capture_state not in _KNOWN_PHYSICAL_CAPTURE_STATES:
+        return "custody_lost"
     if capture_state in _POSITIVE_CAPTURE_STATES:
         return "settled"
     if bool(getattr(exc, "delegated_run_started", False)) or str(
@@ -732,8 +764,22 @@ def _settle_review_attempt(
         physical_attempt_state = str(
             failure_custody.get("physical_attempt_state") or ""
         ).strip().lower()
+        malformed_physical_state = bool(
+            physical_attempt_state
+            and physical_attempt_state not in _KNOWN_PHYSICAL_CAPTURE_STATES
+        )
+        if malformed_physical_state:
+            # Treat malformed provenance as an unknown paid outcome.  A typed
+            # HTTP status cannot make an unrecognized state safe to replay.
+            physical_attempt_state = "unresolved"
+            failure_custody["physical_attempt_state"] = physical_attempt_state
+            failure_custody.pop("provider_status_code", None)
+            if hasattr(actor, "usage"):
+                actor.usage = failure_custody
         pending_invocation = str(failure_custody.get("pending_invocation_id") or "")
         terminal_provider_status = _terminal_provider_status(actor, failure_custody)
+        if malformed_physical_state:
+            terminal_provider_status = None
         capture_outcome_unknown = (
             physical_attempt_state in {"dispatched", "unresolved"}
             and terminal_provider_status is None
@@ -747,13 +793,16 @@ def _settle_review_attempt(
         ).strip().lower() == "custody_lost"
         custody_lost = (
             explicit_custody_lost
+            or malformed_physical_state
             or (legacy_unknown and terminal_provider_status is None)
             or capture_outcome_unknown
         )
-        if capture_outcome_unknown and str(getattr(actor, "failure_code", "") or "") != "provider_outcome_unknown":
+        if (malformed_physical_state or capture_outcome_unknown) and str(getattr(actor, "failure_code", "") or "") != "provider_outcome_unknown":
             # The physical capture is stronger than a legacy/mocked actor code:
             # without a terminal provider response, a second paid send is unsafe.
             actor.failure_code = "provider_outcome_unknown"
+        if malformed_physical_state and hasattr(actor, "http_status"):
+            actor.http_status = None
         not_dispatched = str(
             getattr(actor, "operation_state", "") or ""
         ) == "not_dispatched"
