@@ -26,6 +26,7 @@ import {
     accountLoginConfirmed,
     accountRows,
     bindStatusSurface,
+    claudexorPreparationLine,
     createClaudexorStatusStore,
     facetGapClause,
     facetKnown,
@@ -880,4 +881,37 @@ test('a refused wake does not stop the visible panel from polling', async (t) =>
     } finally {
         globalThis.setTimeout = origSet; globalThis.clearTimeout = origClear;
     }
+});
+
+test('claudexorPreparationLine phases by runtime state and daemon liveness', () => {
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'unreachable', runtime: { state: 'installing', target_version: '3.3.14' } },
+    }), 'Installing Claudexor 3.3.14…');
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'unreachable', runtime: { state: 'installing' } },
+    }), 'Installing Claudexor…', 'no version claim without a version');
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'stale', runtime: { state: 'ready' } },
+    }), 'Starting the Claudexor daemon…');
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'running', runtime: { state: 'ready' } },
+    }), 'Checking Claudexor…', 'a serving engine is being checked, not started');
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'unreachable', runtime: { state: 'ready' } },
+    }), 'Checking Claudexor…',
+        'a failed fan-out rewrites a LIVE daemon to unreachable — never a Starting claim');
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'stale', ownership_problem: 'foreign home', runtime: { state: 'ready' } },
+    }), 'Checking Claudexor…',
+        'ensure refuses a foreign daemon home — never promise a start that is refused');
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'unreachable', ownership_problem: 'foreign home',
+            runtime: { state: 'installing', target_version: '3.3.14' } },
+    }), 'Checking Claudexor…',
+        'an ownership refusal outranks every positive phase claim, installing included');
+    assert.equal(claudexorPreparationLine(null), 'Checking Claudexor…',
+        'no snapshot is no phase evidence — the honest generic');
+    assert.equal(claudexorPreparationLine({
+        daemon: { state: 'running', runtime: {} },
+    }), 'Checking Claudexor…');
 });

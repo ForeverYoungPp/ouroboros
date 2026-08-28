@@ -39,6 +39,7 @@
 import { apiFetch } from './api_client.js';
 import {
     accountLoginConfirmed,
+    claudexorPreparationLine,
     claudexorStatus,
     familyLabel,
 } from './claudexor_status_store.js';
@@ -472,7 +473,7 @@ export async function reconcileLoginJob(jobId, fetchImpl = apiFetch) {
     }
 }
 
-export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FULL } = {}) {
+export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FULL, statusPayload = null } = {}) {
     // The card's whole body as a STRING — pure, so every face is asserted in
     // node without a DOM: the unsafe-URL refusal, the unconfirmed re-check,
     // and the rule that a verdict silences the live status line.
@@ -547,7 +548,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
     // underneath "Connected.".
     if (face !== 'error' && face !== 'name' && !active.verdict && !active.confirming) {
         const line = active.preparingRuntime
-            ? 'Installing or checking Claudexor…'
+            ? claudexorPreparationLine(statusPayload)
             : loginStatusLine(active.envelope || {});
         if (line) bits.push(`<div class="settings-inline-status" data-tone="muted" data-login-state>${escapeHtml(line)}</div>`);
     }
@@ -672,7 +673,10 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
         `);
     }
     if (!compact) {
-        bits.push('<button type="button" class="btn btn-default" data-login-dismiss>Close</button>');
+        // A pressed Close queues behind the in-flight start transition (C7) —
+        // possibly for a whole runtime install. The press must ANSWER at once,
+        // or a working control reads as a dead one (owner report, 2026-08-27).
+        bits.push(`<button type="button" class="btn btn-default" data-login-dismiss${active.closing ? ' disabled' : ''}>${active.closing ? 'Closing…' : 'Close'}</button>`);
     }
     bits.push('</div>');
     return bits.join('');
@@ -775,13 +779,29 @@ export function createLoginCardController({
         if (hostEl) hostEl.innerHTML = '';
     }
 
+    // While the create POST holds the transition (runtime ensure included),
+    // no job polling exists yet, so nothing re-rendered the card as the
+    // runtime moved through installing -> starting -> serving; the phase line
+    // froze on its first words. A BARE subscription (no visibility predicate)
+    // cannot by itself make the store poll — it rides whatever reads the
+    // visible surfaces and the login hold cause.
+    const releasePhaseFollow = store?.subscribe
+        ? store.subscribe(() => { if (ctl.active?.preparingRuntime) render(); })
+        : () => {};
+
     function render() {
         const hostEl = getHost();
         if (!hostEl) return;
         const active = ctl.active;
         if (!active) { hostEl.innerHTML = ''; return; }
         preserveCardFocus(hostEl, () => {
-            hostEl.innerHTML = loginCardHtml(active, now(), { mode });
+            // A failed refresh RETAINS the prior snapshot and records the
+            // error; a retained snapshot is not phase evidence, and rendering
+            // it kept a positive "Installing…" claim alive off a dead read.
+            hostEl.innerHTML = loginCardHtml(active, now(), {
+                mode,
+                statusPayload: store?.error ? null : (store?.snapshot || null),
+            });
         }, getDoc());
         wireLoginCard(hostEl, active);
     }
@@ -848,7 +868,24 @@ export function createLoginCardController({
         hostEl.querySelector('[data-profile-name-submit]')?.addEventListener('click', () => submitProfileNameFromCard(active));
         hostEl.querySelector('[data-login-code-submit]')?.addEventListener('click', () => submitCodeFromCard(active));
         hostEl.querySelector('[data-login-reconcile]')?.addEventListener('click', () => reconcile(active));
-        hostEl.querySelector('[data-login-dismiss]')?.addEventListener('click', () => close(active));
+        hostEl.querySelector('[data-login-dismiss]')?.addEventListener('click', () => {
+            // Instant local acknowledgement: the close itself queues behind
+            // whatever transition is in flight (C7), and during a runtime
+            // install that wait is minutes — a silent queued click reads as a
+            // broken button. The close promise is RETURNED for harnesses that
+            // invoke the handler directly (the DOM discards listener returns),
+            // and the flag resets on settle only when this card is still the
+            // active one (a settled close usually cleared it).
+            if (active.closing) return undefined;
+            active.closing = true;
+            render();
+            return close(active).finally(() => {
+                if (ctl.active === active && active.closing) {
+                    active.closing = false;
+                    render();
+                }
+            });
+        });
     }
 
     function showRecovery(active, result, fallbackDetail = '') {
@@ -872,7 +909,18 @@ export function createLoginCardController({
         // are non-awaitable and must make every continuation inert NOW. The
         // monotone disposed flag plus active identity checks are the fence; a
         // second generation counter would duplicate that authority.
-        if (ctl.disposed && !ctl.active && ctl.detachedStatus) return ctl.detachedStatus;
+        if (!ctl.active && ctl.detachedStatus) {
+            // Disposed or not: an empty slot with a remembered verdict answers
+            // that verdict — the same invariant _closeLocked and dispose hold.
+            // The per-card no-job close leaves {disposed:false, active:null,
+            // detachedStatus}, and fabricating absent/released here would be
+            // exactly the empty-slot release proof this seam forbids.
+            ctl.disposed = true;
+            stopJobPolling();
+            releaseStatusPolling();
+            clearHost();
+            return ctl.detachedStatus;
+        }
         const active = ctl.active;
         let result = active
             ? custodyResult(active.envelope, { absent: Boolean(active.absent) })
@@ -884,6 +932,10 @@ export function createLoginCardController({
         ctl.pendingStart = null;
         stopJobPolling();
         releaseStatusPolling();
+        // Same fence as the timers and the polling hold: a detached controller
+        // must not keep reacting to store snapshots (the disposer is
+        // idempotent, so a later dispose() releasing again is a no-op).
+        try { releasePhaseFollow(); } catch (err) { /* detach must not throw */ }
         ctl.active = null;
         ctl.detachedStatus = result.status;
         clearHost();
@@ -894,9 +946,36 @@ export function createLoginCardController({
         const active = ctl.active;
         if (!active) {
             if (shuttingDown) { stopJobPolling(); releaseStatusPolling(); clearHost(); }
+            // A remembered detach verdict outranks the empty-slot default: a
+            // queued close that detached with UNKNOWN must not be overwritten
+            // by a later shutdown answering absent/released for the same card
+            // — that would fabricate release proof out of an empty slot.
+            if (ctl.detachedStatus) return { status: ctl.detachedStatus };
             return custodyResult(null, { absent: true });
         }
         if (expected !== undefined && active !== expected) return custodyResult(null);
+        if ((active.error || active.needsProfile) && !active.jobId && !shuttingDown) {
+            // Re-proved at EXECUTION time, not at click time: a close queued
+            // during an in-flight create observes the world that create left.
+            // When it failed without a job id there is nothing a DELETE can
+            // address. This is the PER-CARD half of detach() only: the full
+            // detach permanently fences the controller, which silently dropped
+            // a second Connect legitimately queued behind this close. The
+            // verdict is still remembered so a dispose queued behind this
+            // close answers it instead of fabricating release from the empty
+            // slot; a later start opens a new custody story and clears it.
+            let result = custodyResult(active.envelope, { absent: Boolean(active.absent) });
+            if (active.custodyStatus === LOGIN_CUSTODY_UNKNOWN) {
+                result = { ...result, status: LOGIN_CUSTODY_UNKNOWN };
+            }
+            stopJobPolling();
+            releaseStatusPolling();
+            ctl.active = null;
+            ctl.detachedStatus = result.status;
+            clearHost();
+            onSettled();
+            return result;
+        }
 
         let result = custodyResult(active.envelope, { absent: Boolean(active.absent) });
         if (active.verdict?.kind === 'recovery'
@@ -1147,6 +1226,9 @@ export function createLoginCardController({
         // this start, and a disposed controller must not create a job nobody
         // will ever poll or cancel.
         if (ctl.disposed) return;
+        // A new card is a new custody story: the remembered verdict belonged
+        // to the card the queued close detached, not to this one.
+        ctl.detachedStatus = null;
         // C7 (plan roast, accepted): a NEW login may start only once release of
         // the previous job is PROVEN (loginReleaseProven): a terminal snapshot
         // whose reason is not termination_unconfirmed, a reconciliation that
@@ -1196,6 +1278,7 @@ export function createLoginCardController({
             inputValue: '', inputBusy: false, inputSent: false, inputError: '', inputNote: '',
             needsProfile: null, profileNameValue: '', profileNameNote: '',
             verdict: null, confirming: false, advancedOpen: false, preparingRuntime: true,
+            closing: false,
         };
         const active = ctl.active;
         render();
@@ -1252,9 +1335,13 @@ export function createLoginCardController({
             // face and its Try again already exist.
             const jobId = String(data?.job_id || '');
             if (!jobId) throw new Error('the sign-in service returned no job id');
+            // Adopted BEFORE the body validation: a nonempty id names a job
+            // the daemon may be running regardless of how malformed the rest
+            // of the answer is, and a queued close must be able to DELETE it —
+            // the no-job detach is only for creates that produced no id.
+            active.jobId = jobId;
             if (!hasJobState(data)) throw new Error('the sign-in service returned no job');
             active.preparingRuntime = false;
-            active.jobId = jobId;
             active.envelope = data;
             active.attachCommand = String(data.attach_command || '');
             active.attachShell = String(data.attach_shell || '');
@@ -1469,6 +1556,7 @@ export function createLoginCardController({
         // Set FIRST: no new start may be queued behind the shutdown.
         ctl.disposed = true;
         ctl.pendingStart = null;
+        try { releasePhaseFollow(); } catch (err) { /* disposal must not throw */ }
         return withLoginTransition(() => _closeLocked(undefined, { shuttingDown: true }))
             .then((result) => {
                 if (!ctl.active) ctl.detachedStatus = result.status;
