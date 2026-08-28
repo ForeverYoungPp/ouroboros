@@ -3238,16 +3238,13 @@ def _drop_cancelled_pending() -> None:
                         dropped.append(tid)
                         continue
             if current_intents is not None and tid in current_intents and not claim:
-                try:
-                    latest = (
-                        active_intents(DRIVE_ROOT, strict=True).get(tid)
-                        if active_intents is not None else None
-                    )
-                except Exception:
-                    latest = {"state": "claimed"}
-                if isinstance(latest, dict):
-                    survivors.append(t)
-                    continue
+                # The projection may have changed after the snapshot (including
+                # another owner settling it and a new ingress minting a request).
+                # Without an owned claim this drop cannot fence its settle, so
+                # defer every such row instead of falling through with an empty
+                # request_id/generation.
+                survivors.append(t)
+                continue
             intent = claim or (current_intents or {}).get(tid) or {}
             try:
                 cost_fields = reconstruct_task_cost(tid, fields=True)

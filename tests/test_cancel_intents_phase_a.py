@@ -1790,6 +1790,48 @@ def test_drop_cancelled_pending_yields_to_a_live_claim_owner(qenv, monkeypatch):
     assert intent["claim_owner"] == "cancel_task_custody"
 
 
+def test_drop_cancelled_pending_defers_when_intent_vanishes_before_settle(
+    qenv, monkeypatch,
+):
+    """A stale pending row must never settle a newly minted unfenced intent."""
+    from supervisor import workers
+
+    task_id = "drop-intent-race"
+    monkeypatch.setattr(workers, "PENDING", qenv.q.PENDING, raising=False)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", qenv.drive, raising=False)
+    emitted: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        workers, "_emit_task_done_terminal",
+        lambda _task, tid, status, **_kwargs: emitted.append((tid, status)) or True,
+    )
+    qenv.q.PENDING[:] = [{"id": task_id, "chat_id": 1}]
+    write_task_result(qenv.drive, task_id, "scheduled")
+    first = ci.request_cancel(qenv.drive, task_id, reason="old request")
+    real_settle = ci.settle_intent
+
+    def vanished_claim(root, tid, *, owner):
+        assert owner == "pending_drop"
+        real_settle(
+            root, tid, outcome="cancelled",
+            expected_generation=first["generation"], request_id=first["request_id"],
+        )
+        # A concurrent ingress can mint a new ordinary request after the old
+        # claim disappeared while this row is still pending.
+        ci.request_cancel(root, tid, reason="new request", source="race")
+        return None
+
+    monkeypatch.setattr(ci, "claim_intent", vanished_claim)
+    workers._drop_cancelled_pending()
+
+    assert [row["id"] for row in qenv.q.PENDING] == [task_id]
+    assert load_task_result(qenv.drive, task_id)["status"] == "scheduled"
+    replacement = ci.active_intent(qenv.drive, task_id)
+    assert replacement is not None
+    assert replacement["state"] == ci.INTENT_REQUESTED
+    assert replacement["reason"] == "new request"
+    assert emitted == []
+
+
 def test_fail_tasks_yields_to_a_live_claim_owner(tmp_path):
     """AR2-2: the budget drain claims before settling; a live custody's claim
     wins and the drain leaves the task entirely to that owner."""
