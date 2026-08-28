@@ -1184,7 +1184,9 @@ Before every commit, verify the following:
   prose or a vendor's internal children. Persisted permission remains monotonic
   across ordinary Settings changes, while the explicit global depth value `0`
   still refuses every new descendant and the immutable hard ceiling bounds any
-  malformed persisted projection.
+  malformed persisted projection. External task ingress and supervisor queue
+  admission accept only non-negative typed depths; malformed or negative persisted
+  rows are terminalized before assignment rather than clamped.
 - `subagent_id` selects one complete row from the canonical enabled
   `OUROBOROS_SUBAGENTS` list. At schedule time, freeze the normalized row and list
   fingerprint into the task; dispatch/restart must use that snapshot rather than

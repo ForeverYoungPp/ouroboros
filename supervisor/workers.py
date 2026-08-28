@@ -19,6 +19,7 @@ from supervisor.state import load_state, append_jsonl, reconstruct_task_cost
 from supervisor.message_bus import coerce_chat_identity, send_with_budget
 from ouroboros.config import DATA_DIR, REPO_DIR as CONFIG_REPO_DIR
 from ouroboros.outcomes import EXECUTION_FAILED, EXECUTION_INFRA_FAILED, terminal_outcome_axes
+from ouroboros.depth_evidence import parse_task_depth
 from ouroboros.utils import utc_now_iso
 
 
@@ -2620,6 +2621,110 @@ def _drop_cancelled_pending() -> None:
         )
 
 
+def _normalize_pending_task_depth(task: Dict[str, Any]) -> str:
+    """Normalize a pending depth, or return the typed-ingress error."""
+    try:
+        task["depth"] = parse_task_depth(task.get("depth"), default=0)
+    except (TypeError, ValueError) as exc:
+        return str(exc)
+    return ""
+
+
+def _terminalize_invalid_pending_depth(task: Dict[str, Any], detail: str) -> bool:
+    """Give a bypassed pending row terminal custody before any worker dispatch."""
+    task_id = str(task.get("id") or "").strip()
+    if not task_id:
+        return False
+    result_root = pathlib.Path(task.get("budget_drive_root") or DRIVE_ROOT)
+    raw_depth = task.get("depth")
+    if raw_depth is not None and not isinstance(raw_depth, (str, int, float, bool)):
+        raw_depth = repr(raw_depth)[:200]
+    try:
+        from ouroboros.task_results import STATUS_FAILED, write_task_result
+
+        try:
+            cost_fields = reconstruct_task_cost(task_id, fields=True, drive_root=result_root)
+        except Exception:
+            cost_fields = {
+                "cost_accounting_status": "unavailable",
+                "cost_final": False,
+                "cost_usd": None,
+            }
+        stored = write_task_result(
+            result_root,
+            task_id,
+            STATUS_FAILED,
+            reason_code="invalid_task_depth",
+            result=f"Task was not dispatched: {str(detail)[:500]}",
+            # Keep the rejected value as evidence, never as an executable depth.
+            depth=0,
+            raw_task_depth=raw_depth,
+            invalid_task_depth=True,
+            parent_task_id=task.get("parent_task_id"),
+            root_task_id=task.get("root_task_id"),
+            delegation_role=task.get("delegation_role"),
+            chat_id=task.get("chat_id"),
+            metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
+            **cost_fields,
+        )
+        if str((stored or {}).get("status") or "") != STATUS_FAILED:
+            return False
+    except Exception:
+        log.warning("Failed to terminalize invalid pending task %s", task_id, exc_info=True)
+        return False
+    # Durable custody is authoritative; notification and diagnostics are
+    # best-effort and must not make an already-terminal row look uncommitted.
+    _emit_task_done_terminal(
+        task, task_id, "failed", reason_code="invalid_task_depth", cost_fields=cost_fields,
+    )
+    try:
+        append_jsonl(
+            DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "pending_invalid_task_depth",
+                "task_id": task_id,
+                "raw_task_depth": raw_depth,
+            },
+        )
+    except Exception:
+        log.debug("Failed to record invalid pending depth for %s", task_id, exc_info=True)
+    return True
+
+
+def _quarantine_invalid_pending_depths() -> tuple[list[str], list[str]]:
+    """Settle malformed pending rows before budget or capacity filters run."""
+    terminalized: list[str] = []
+    unresolved: list[str] = []
+    for index in range(len(PENDING) - 1, -1, -1):
+        task = PENDING[index]
+        if not isinstance(task, dict):
+            continue
+        detail = _normalize_pending_task_depth(task)
+        if not detail:
+            continue
+        task_id = str(task.get("id") or "").strip()
+        if _terminalize_invalid_pending_depth(task, detail):
+            PENDING.pop(index)
+            if task_id:
+                terminalized.append(task_id)
+        else:
+            unresolved.append(task_id or "<missing-task-id>")
+    if terminalized:
+        try:
+            append_jsonl(
+                DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "pending_invalid_task_depth_quarantined",
+                    "task_ids": terminalized,
+                },
+            )
+        except Exception:
+            log.debug("Failed to record invalid pending-depth quarantine", exc_info=True)
+    return terminalized, unresolved
+
+
 def _evolution_assignment_error(task: Dict[str, Any]) -> str:
     """Return the exact authority error for an evolution task about to run."""
     if str(task.get("type") or "") != "evolution":
@@ -2681,6 +2786,19 @@ def assign_tasks() -> None:
     from supervisor.state import budget_remaining, EVOLUTION_BUDGET_RESERVE
     with _queue_lock:
         st = load_state()
+        # Cancellation/terminal custody wins before validating rows left in the
+        # queue.  Then quarantine every malformed depth before budget, lease, or
+        # capacity filters can leave it waiting indefinitely.
+        _drop_cancelled_pending()
+        invalid_ids, unresolved_invalid_ids = _quarantine_invalid_pending_depths()
+        if invalid_ids:
+            queue.persist_queue_snapshot(reason="invalid_task_depth")
+        if unresolved_invalid_ids:
+            log.error(
+                "Task assignment blocked: invalid depths could not be terminalized for %s",
+                ", ".join(unresolved_invalid_ids),
+            )
+            return
         try:
             remaining = budget_remaining(st, strict=True)
         except Exception:
@@ -2769,9 +2887,6 @@ def assign_tasks() -> None:
                     )
                 queue.persist_queue_snapshot(reason="budget_paused_before_dispatch")
             return
-
-        # Drop tasks cancelled after scheduling but before assignment.
-        _drop_cancelled_pending()
 
         # Evolution is hard-blocked in light runtime mode at the assignment
         # chokepoint too: a task restored from a snapshot or created before the
@@ -2874,6 +2989,20 @@ def assign_tasks() -> None:
                         queue.persist_queue_snapshot(reason="evolution_dropped_budget")
                     continue
                 task = PENDING.pop(chosen_idx)
+                depth_error = _normalize_pending_task_depth(task)
+                if depth_error:
+                    if _terminalize_invalid_pending_depth(task, depth_error):
+                        queue.persist_queue_snapshot(reason="invalid_task_depth")
+                        continue
+                    # A failed terminal write must not turn into either a worker
+                    # dispatch or a disappearing queue row. Leave custody in the
+                    # queue and stop this assignment pass for a retry.
+                    PENDING.insert(chosen_idx, task)
+                    log.error(
+                        "Assignment blocked: invalid task depth could not be terminalized for %s",
+                        task.get("id"),
+                    )
+                    break
                 evolution_error = _evolution_assignment_error(task)
                 if evolution_error:
                     if _cancel_unauthorized_evolution(task, evolution_error):

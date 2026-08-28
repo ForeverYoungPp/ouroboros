@@ -7,7 +7,9 @@ import pathlib
 import uuid
 from typing import Any, Dict
 
+from ouroboros.depth_evidence import parse_task_depth
 from ouroboros.task_results import (
+    STATUS_FAILED,
     STATUS_REQUESTED,
     STATUS_SCHEDULED,
     load_task_result,
@@ -15,6 +17,155 @@ from ouroboros.task_results import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def parse_schedule_task_depth(
+    ctx: Any,
+    evt: Dict[str, Any],
+    *,
+    tid: str,
+    chat_id: int,
+    delegation_role: str,
+    parent_id: Any,
+    root_task_id: str,
+    role: str,
+    desc: str,
+    expected_output: str,
+    constraints: str,
+    task_context: str,
+) -> tuple[int, bool]:
+    """Parse schedule depth and terminalize a fresh invalid event."""
+    try:
+        return parse_task_depth(evt.get("depth", 0), default=0), False
+    except (TypeError, ValueError) as exc:
+        from supervisor.events import _reject_schedule_task
+
+        _reject_schedule_task(
+            ctx,
+            tid=tid,
+            chat_id=chat_id,
+            delegation_role=delegation_role,
+            parent_id=parent_id,
+            root_task_id=root_task_id,
+            role=role,
+            result_fields={
+                "parent_task_id": parent_id,
+                "root_task_id": root_task_id,
+                "session_id": str(evt.get("session_id") or ""),
+                "actor_id": str(evt.get("actor_id") or "ouroboros"),
+                "delegation_role": delegation_role,
+                "role": role,
+                "description": desc,
+                "objective": desc,
+                "expected_output": expected_output,
+                "constraints": constraints,
+                "context": task_context,
+                "chat_id": chat_id or None,
+                "depth": 0,
+                "raw_task_depth": evt.get("depth"),
+                "invalid_task_depth": True,
+            },
+            detail=f"{'Subagent' if delegation_role == 'subagent' else 'Task'} rejected: invalid task depth: {exc}",
+            reason_code="invalid_task_depth",
+            fallback_message="⚠️ Task rejected: depth must be a non-negative integer.",
+        )
+        return 0, True
+
+
+def reject_if_no_chat_target(
+    ctx: Any, *, desc: str, chat_id: int, delegation_role: str, tid: str, role: str,
+    parent_id: Any, root_task_id: str, result_fields: Dict[str, Any],
+) -> bool:
+    """Reject a non-subagent schedule that has no live chat target."""
+    if not (desc and not chat_id):
+        return False
+    from supervisor.events import _reject_schedule_task
+
+    if delegation_role != "subagent":
+        log.warning("Rejected scheduled task without chat target: task_id=%s desc=%s", tid, desc[:100])
+        _reject_schedule_task(
+            ctx,
+            tid=tid,
+            chat_id=chat_id,
+            delegation_role=delegation_role,
+            parent_id=parent_id,
+            root_task_id=root_task_id,
+            role=role,
+            result_fields=result_fields,
+            detail="Subagent rejected: no chat target is available for live scheduling.",
+        )
+        return True
+    log.info("Scheduled headless subagent without live chat target: task_id=%s role=%s", tid, role)
+    return False
+
+
+def reject_invalid_task_depth(
+    task: Dict[str, Any], *, reservations: Dict[str, str], admission_token: str,
+) -> bool:
+    """Normalize an admitted task depth, or mark and release an invalid request."""
+    try:
+        task["depth"] = parse_task_depth(task.get("depth"), default=0)
+    except (TypeError, ValueError) as exc:
+        task_id = str(task.get("id") or "").strip()
+        if reservations.get(task_id) == admission_token:
+            reservations.pop(task_id, None)
+        task["_admission_blocked"] = "invalid_task_depth"
+        task["_admission_detail"] = f"Task was not queued: {exc}."
+        return True
+    return False
+
+
+def terminalize_invalid_depth_restore(
+    task: Dict[str, Any], detail: str, *, drive_root: pathlib.Path,
+) -> bool:
+    """Give a malformed snapshot row terminal custody outside the queue module."""
+    task_id = str(task.get("id") or "").strip()
+    if not task_id:
+        return False
+    raw_depth = task.get("depth")
+    if raw_depth is not None and not isinstance(raw_depth, (str, int, float, bool)):
+        raw_depth = repr(raw_depth)[:200]
+    try:
+        stored = write_task_result(
+            pathlib.Path(task.get("budget_drive_root") or drive_root),
+            task_id,
+            STATUS_FAILED,
+            reason_code="invalid_task_depth",
+            result=detail,
+            depth=0,
+            raw_task_depth=raw_depth,
+            invalid_task_depth=True,
+            parent_task_id=task.get("parent_task_id"),
+            root_task_id=task.get("root_task_id"),
+            delegation_role=task.get("delegation_role"),
+            metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
+        )
+    except Exception:
+        log.warning("Failed to terminalize invalid-depth snapshot task %s", task_id, exc_info=True)
+        return False
+    return str((stored or {}).get("status") or "") == STATUS_FAILED
+
+
+def restore_invalid_depth_admission(
+    task: Dict[str, Any], admitted: Dict[str, Any], *, drive_root: pathlib.Path,
+    pending: list[Dict[str, Any]], blocked: list[str], terminalized: list[str],
+) -> None:
+    """Handle one blocked snapshot admission and retain invalid rows on failure."""
+    task_id = str(task.get("id") or "")
+    blocked.append(task_id)
+    if str(admitted.get("_admission_blocked") or "") != "invalid_task_depth":
+        return
+    detail = str(
+        admitted.get("_admission_detail")
+        or "Task was not restored: depth must be a non-negative integer."
+    )
+    if terminalize_invalid_depth_restore(task, detail, drive_root=drive_root):
+        terminalized.append(task_id)
+        return
+    if task_id and not any(str(row.get("id") or "") == task_id for row in pending):
+        # Keep the row in live custody; the unchanged snapshot remains a retry
+        # point if this process exits before the next assignment pass.
+        pending.append(dict(task))
 
 
 def scheduled_admission_rejection(
@@ -59,6 +210,12 @@ def scheduled_admission_rejection(
             "root_task_id": str(admitted.get("_budget_root_task_id") or root_task_id),
             "budget_fence_id": str(admitted.get("_budget_fence_id") or ""),
         }
+    elif reason == "invalid_task_depth":
+        detail = str(
+            admitted.get("_admission_detail")
+            or "Subagent not scheduled: task depth must be a non-negative integer."
+        )
+        extra = {}
     else:
         lifecycle = str(admitted.get("_acceptance_fence_status") or "active")
         detail = (

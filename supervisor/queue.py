@@ -142,7 +142,7 @@ _last_skill_schedule_sync: float = 0.0
 _SKILL_SCHEDULE_SYNC_INTERVAL_SEC: float = 60.0
 
 from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
-    release_task_admission,
+    reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission,
     reserve_task_admission,
 )
 
@@ -214,6 +214,8 @@ def enqueue_task(
             # A reservation owns this id until its request either enqueues or releases it.
             # Tokenless internal callers and competing ingress must not consume/collide with it.
             t["_admission_blocked"] = "admission_reservation_owned"
+            return t
+        if reject_invalid_task_depth(t, reservations=ADMISSION_RESERVATIONS, admission_token=admission_token):
             return t
         if require_worker_pool:
             try:
@@ -890,10 +892,8 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
         pending_by_id = {
             str(task.get("id") or ""): task for task in snapshot_pending if str(task.get("id") or "")
         }
-        restored = 0
-        skipped_terminal = 0
-        skipped_fenced: list[str] = []
-        blocked_restore: list[str] = []
+        restored, skipped_terminal, invalid_depth_restore = 0, 0, []
+        skipped_fenced, blocked_restore = [], []
         for task in snapshot_pending:
             chat_id = task.get("chat_id")
             if not task.get("id") or chat_id is None or chat_id == "":
@@ -965,7 +965,7 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                 # Restore them behind the root marker; only new admission is fenced.
                 admitted = enqueue_task(task, restoring_snapshot=True)
             if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
-                blocked_restore.append(str(task.get("id") or ""))
+                restore_invalid_depth_admission(task, admitted, drive_root=DRIVE_ROOT, pending=PENDING, blocked=blocked_restore, terminalized=invalid_depth_restore)
                 continue
             restored += 1
         if skipped_fenced:
@@ -986,10 +986,10 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                     "type": "queue_restored_from_snapshot",
                     "restored_pending": restored,
                     "skipped_terminal": skipped_terminal,
-                    "blocked_admission": blocked_restore,
+                    "blocked_admission": blocked_restore, "invalid_task_depth": invalid_depth_restore,
                 },
             )
-        if restored > 0:
+        if restored > 0 or invalid_depth_restore:
             persist_queue_snapshot(reason="queue_restored")
         return restored
     except Exception:

@@ -18,6 +18,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 
 from ouroboros.gateway._helpers import coerce_int, json_error, json_exception, request_drive_root, request_json_or, request_repo_dir, stage_initial_task_attachments
+from ouroboros.depth_evidence import parse_task_depth
 # Re-exported SSE surface (split out by the 1600-line module gate): route
 # wiring, the CLI, and long-standing monkeypatch pins address these names on
 # gateway.tasks; task_events resolves its patched collaborators back through
@@ -186,6 +187,8 @@ def _admission_rejection_response(
     if not (isinstance(admitted, dict) and admitted.get("_admission_blocked")):
         return None
     reason_code = str(admitted.get("_admission_blocked") or "admission_fence")
+    if reason_code == "invalid_task_depth":
+        detail, status_code = str(admitted.get("_admission_detail") or "Task was not scheduled: depth must be a non-negative integer."), 400
     if reason_code == "task_id_lookup_failed":
         return JSONResponse(
             {
@@ -470,9 +473,14 @@ async def api_tasks_create(request: Request) -> JSONResponse:
         return json_error("external workspace tasks must use type='task'", 400)
     try:
         chat_id = int(body.get("chat_id") if body.get("chat_id") is not None else 0)
-        depth = int(body.get("depth") or 0)
-    except (TypeError, ValueError):
-        return json_error("chat_id and depth must be integers", 400)
+        depth = parse_task_depth(body.get("depth"), default=0)
+    except (TypeError, ValueError) as exc:
+        return json_error(
+            "depth must be a non-negative integer"
+            if str(getattr(exc, "code", "")) == "negative_task_depth"
+            else "chat_id and depth must be integers",
+            400,
+        )
 
     raw_metadata = dict(body.get("metadata") or {}) if isinstance(body.get("metadata"), dict) else {}
     if _external_subagent_label(body, raw_metadata):

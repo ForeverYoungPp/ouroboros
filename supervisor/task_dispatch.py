@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from ouroboros.depth_evidence import parse_task_depth
+
 
 def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize an admitted schedule event into the worker payload shape."""
@@ -16,7 +18,7 @@ def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     constraints = str(fields.get("constraints") or "")
     role = str(fields.get("role") or "")
     task_context = str(fields.get("task_context") or "")
-    depth = int(fields.get("depth") or 0)
+    depth = parse_task_depth(fields.get("depth"), default=0)
     root_task_id = str(fields.get("root_task_id") or "")
     session_id = str(fields.get("session_id") or "")
     actor_id = str(fields.get("actor_id") or "")

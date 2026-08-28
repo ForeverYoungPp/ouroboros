@@ -1210,6 +1210,9 @@ acceptance carries the per-child facts and a host-attested depth summary; persis
 admission facts are monotonic authority and outrank later Settings changes, except
 that the explicit global depth setting `0` disables every new descendant and the
 immutable hard ceiling remains authoritative over malformed persisted projections.
+External task ingress and supervisor queue admission accept only non-negative
+typed depths; malformed or negative persisted rows are terminalized before
+assignment rather than clamped.
 A normal over-cap `schedule_subagent` attempt writes a typed rejected child result
 carrying the same provenance, and a lower permitted depth is reported as
 `capability_reduced` rather than a silent flat tree.

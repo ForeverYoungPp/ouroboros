@@ -23,6 +23,7 @@ from ouroboros.contracts.task_contract import (
     normalize_depth_provenance,
 )
 from ouroboros.config import MAX_SUBAGENT_DEPTH_HARD_CAP
+from ouroboros.depth_evidence import parse_task_depth
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import utc_now_iso
 
@@ -286,9 +287,11 @@ def stamp_depth_provenance(
         if isinstance(remaining, int) and not isinstance(remaining, bool):
             if max(0, int(attempted_depth)) == 0:
                 requested = max(0, remaining)
-            permitted = min(
-                max(0, int(max_depth)),
-                max(0, int(attempted_depth)) + max(0, remaining),
+            permitted = _bounded_permitted_depth(
+                min(
+                    min(MAX_SUBAGENT_DEPTH_HARD_CAP, max(0, int(max_depth))),
+                    max(0, int(attempted_depth)) + max(0, remaining),
+                )
             )
         provenance = {
             "requested_depth": requested,
@@ -326,7 +329,8 @@ def stamp_task_assignment_depth(
     contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
     if not contract:
         return {}
-    depth = int(task.get("depth", 0) or 0)
+    depth = parse_task_depth(task.get("depth"), default=0)
+    task["depth"] = depth
     budget = dict(contract.get("delegation_budget") or {})
     admitted = normalize_depth_provenance(budget.get("depth_provenance"))
     if admitted:

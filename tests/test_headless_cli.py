@@ -483,6 +483,43 @@ def test_task_api_rejects_unsafe_task_id_and_system_workspace(tmp_path, monkeypa
     assert typed.status_code == 400
 
 
+def test_task_api_rejects_negative_depth_before_reservation_or_queue(tmp_path, monkeypatch):
+    from supervisor import queue as queue_module
+
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    captured = []
+    monkeypatch.setattr("supervisor.queue.enqueue_task", lambda task: captured.append(task) or task)
+    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": True)
+
+    def fail_reservation(*_args, **_kwargs):
+        pytest.fail("invalid depth must be rejected before admission reservation")
+
+    monkeypatch.setattr(queue_module, "reserve_task_admission", fail_reservation)
+
+    app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
+    app.state.drive_root = data
+    app.state.repo_dir = repo
+    client = TestClient(app)
+
+    cases = ((-1, "depth must be a non-negative integer"),
+             (-0.5, "depth must be a non-negative integer"),
+             ("-1", "depth must be a non-negative integer"),
+             ("not-a-depth", "chat_id and depth must be integers"))
+    for index, (raw_depth, expected_error) in enumerate(cases):
+        task_id = f"api-invalid-depth-{index}"
+        response = client.post(
+            "/api/tasks", json={"task_id": task_id, "description": "x", "depth": raw_depth}
+        )
+        assert response.status_code == 400
+        assert response.json()["error"] == expected_error
+        assert task_id not in queue_module.ADMISSION_RESERVATIONS
+        assert not (data / "task_results" / f"{task_id}.json").exists()
+    assert captured == []
+
+
 def test_resolve_workspace_root_blocks_case_variant_control_plane(tmp_path):
     system_repo = tmp_path / "Ouroboros" / "repo"
     drive = tmp_path / "Ouroboros" / "data"

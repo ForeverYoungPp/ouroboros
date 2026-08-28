@@ -46,6 +46,7 @@ from ouroboros.tools.control_delegation import (
 from supervisor.task_dispatch import (
     build_scheduled_task_payload as _build_scheduled_task_payload,
 )
+from supervisor.task_admission import reject_if_no_chat_target as _reject_if_no_chat_target
 
 log = logging.getLogger(__name__)
 
@@ -3302,30 +3303,6 @@ from supervisor.steering import (  # noqa: E402 -- intentional re-import
 )
 
 
-def _reject_if_no_chat_target(
-    ctx: Any, *, desc: str, chat_id: int, delegation_role: str, tid: str, role: str,
-    parent_id: Any, root_task_id: str, result_fields: Dict[str, Any],
-) -> bool:
-    """Chat-target gate. A non-subagent task needs a live chat to schedule to; a
-    subagent returns its result to its PARENT, not a UI thread, so headless roots
-    (created via /api/tasks with no chat_id and owner_chat_id=None — CLI/Terminal-
-    Bench) schedule it without a chat target (the chat-only notification later is
-    skipped when chat_id is 0). Returns True when rejected (caller must return)."""
-    if not (desc and not chat_id):
-        return False
-    if delegation_role != "subagent":
-        log.warning("Rejected scheduled task without chat target: task_id=%s desc=%s", tid, desc[:100])
-        _reject_schedule_task(
-            ctx, tid=tid, chat_id=chat_id, delegation_role=delegation_role,
-            parent_id=parent_id, root_task_id=root_task_id, role=role,
-            result_fields=result_fields,
-            detail="Subagent rejected: no chat target is available for live scheduling.",
-        )
-        return True
-    log.info("Scheduled headless subagent without live chat target: task_id=%s role=%s", tid, role)
-    return False
-
-
 def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     st = ctx.load_state()
     owner_chat_id = st.get("owner_chat_id")
@@ -3344,16 +3321,36 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     constraints = str(evt.get("constraints") or "").strip()
     role = str(evt.get("role") or "researcher").strip() or "researcher"
     task_context = str(evt.get("context") or "").strip()
-    depth = int(evt.get("depth", 0))
     parent_id = evt.get("parent_task_id")
     root_task_id = str(evt.get("root_task_id") or parent_id or tid)
     session_id = str(evt.get("session_id") or "")
     actor_id = str(evt.get("actor_id") or "ouroboros")
     delegation_role = str(evt.get("delegation_role") or "subagent")
     if delegation_role == "subagent":
+        # Idempotency/ownership is checked before parsing so a malformed replay
+        # cannot terminalize an already-owned task id. Fresh events still reach
+        # the typed depth rejection below before any provisioning or enqueue.
         from supervisor.task_admission import subagent_schedule_preflight
         if subagent_schedule_preflight(ctx, evt, chat_id):
             return
+    from supervisor.task_admission import parse_schedule_task_depth
+
+    depth, depth_rejected = parse_schedule_task_depth(
+        ctx,
+        evt,
+        tid=tid,
+        chat_id=chat_id,
+        delegation_role=delegation_role,
+        parent_id=parent_id,
+        root_task_id=root_task_id,
+        role=role,
+        desc=desc,
+        expected_output=expected_output,
+        constraints=constraints,
+        task_context=task_context,
+    )
+    if depth_rejected:
+        return
     memory_mode = str(evt.get("memory_mode") or "").strip()
     drive_root = str(evt.get("drive_root") or "").strip()
     child_drive_root = str(evt.get("child_drive_root") or drive_root).strip()

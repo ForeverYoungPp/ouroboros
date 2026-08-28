@@ -3,6 +3,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.depth_evidence import build_depth_summary
 from ouroboros.task_results import STATUS_FAILED, STATUS_RUNNING, write_task_result
@@ -15,6 +17,23 @@ from ouroboros.tools.control_delegation import (
     stamp_depth_provenance,
     stamp_task_assignment_depth,
 )
+
+
+def test_task_depth_parser_rejects_negative_values_before_int_truncation():
+    from ouroboros.depth_evidence import TaskDepthError, parse_task_depth
+
+    assert parse_task_depth(None) == 0
+    assert parse_task_depth("2") == 2
+    # Preserve the historical coercion contract for non-negative legacy values.
+    assert parse_task_depth(True) == 1
+    assert parse_task_depth(1.5) == 1
+    for raw in (-1, -0.5, "-1"):
+        with pytest.raises(TaskDepthError) as raised:
+            parse_task_depth(raw)
+        assert raised.value.code == "negative_task_depth"
+    with pytest.raises(TaskDepthError) as raised:
+        parse_task_depth("not-a-depth")
+    assert raised.value.code == "invalid_task_depth"
 
 
 def test_persisted_depth_provenance_cannot_exceed_immutable_host_ceiling():
@@ -408,6 +427,18 @@ def test_assignment_does_not_reconstruct_legacy_depth_authority_from_live_settin
     }
 
 
+def test_legacy_depth_provenance_branch_respects_host_ceiling():
+    contract = build_task_contract({
+        "delegation_budget": {"depth_remaining": 20},
+    })
+
+    _stamped, provenance = stamp_depth_provenance(
+        contract, attempted_depth=1, max_depth=99, achieved_depth=None,
+    )
+
+    assert provenance["permitted_depth"] == 10
+
+
 def test_supervisor_ingress_bounds_legacy_permission_by_admitted_remaining_envelope():
     contract = build_task_contract({
         "delegation_budget": {"depth_remaining": 2},
@@ -558,6 +589,23 @@ def test_supervisor_admission_enforces_parent_rights_and_allows_one_non_fanout_c
     rejected = json.loads((tmp_path / "task_results" / "child-2.json").read_text(encoding="utf-8"))
     assert len(enqueued) == 1
     assert rejected["reason_code"] == "delegation_rights_may_fan_out"
+
+
+def test_supervisor_rejects_invalid_depth_before_provisioning_or_enqueue(tmp_path, monkeypatch):
+    from supervisor import events
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    for index, raw_depth in enumerate((-1, -0.5, "-1", "not-a-depth")):
+        task_id = f"invalid-depth-{index}"
+        enqueued = []
+        events._handle_schedule_task(
+            _schedule_event(task_id, "parent", depth=raw_depth, drive_root=tmp_path),
+            _fake_ctx(tmp_path, enqueued),
+        )
+        result = json.loads((tmp_path / "task_results" / f"{task_id}.json").read_text())
+        assert enqueued == []
+        assert result["status"] == STATUS_FAILED
+        assert result["reason_code"] == "invalid_task_depth"
 
 
 def test_supervisor_rolls_back_subagent_when_scheduled_result_write_fails(
@@ -754,6 +802,107 @@ def test_replayed_schedule_event_keeps_one_physical_task_and_transition(
     assert [task["id"] for task in delivered] == ["same-child"]
     assert sum(worker.busy_task_id == "same-child" for worker in worker_map.values()) == 1
     assert ctx.RUNNING["same-child"]["worker_id"] in worker_map
+
+
+def test_assignment_quarantines_bypassed_invalid_depth_and_normalizes_legacy_rows(
+    tmp_path, monkeypatch,
+):
+    from supervisor import queue, state, workers
+    from ouroboros.task_results import load_task_result
+
+    delivered = []
+    terminal_events = []
+
+    class FakeWorkerQueue:
+        def put(self, task):
+            delivered.append(dict(task))
+
+    worker = SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())
+    pending = [{
+        "id": "invalid-pending-depth",
+        "type": "task",
+        "chat_id": 1,
+        "description": "invalid depth",
+        "depth": -1,
+        "budget_drive_root": str(tmp_path),
+    }]
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "WORKERS", {1: worker})
+    monkeypatch.setattr(workers, "load_state", lambda: {})
+    monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 100.0)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(
+        workers,
+        "_emit_task_done_terminal",
+        lambda task, task_id, status="failed", **kwargs: terminal_events.append(
+            (task_id, status, kwargs)
+        ) or True,
+    )
+    queue.BUDGET_ROOT_FENCES.clear()
+
+    workers.assign_tasks()
+
+    rejected = load_task_result(tmp_path, "invalid-pending-depth")
+    assert pending == []
+    assert delivered == []
+    assert worker.busy_task_id is None
+    assert rejected["status"] == STATUS_FAILED
+    assert rejected["reason_code"] == "invalid_task_depth"
+    assert rejected["depth"] == 0
+    assert rejected["raw_task_depth"] == -1
+    assert terminal_events and terminal_events[0][0] == "invalid-pending-depth"
+
+    pending.append({
+        "id": "legacy-pending-depth",
+        "type": "task",
+        "chat_id": 1,
+        "description": "legacy missing depth",
+        "depth": None,
+        "budget_drive_root": str(tmp_path),
+    })
+    workers.assign_tasks()
+    assert delivered and delivered[-1]["id"] == "legacy-pending-depth"
+    assert delivered[-1]["depth"] == 0
+
+
+def test_assignment_quarantines_invalid_depth_before_budget_pause(tmp_path, monkeypatch):
+    from supervisor import queue, state, workers
+    from ouroboros.task_results import load_task_result
+
+    delivered = []
+    worker = SimpleNamespace(
+        wid=1,
+        busy_task_id=None,
+        in_q=SimpleNamespace(put=lambda task: delivered.append(dict(task))),
+    )
+    pending = [{
+        "id": "invalid-before-budget",
+        "type": "task",
+        "chat_id": 1,
+        "description": "invalid depth must not become a pause",
+        "depth": -0.5,
+        "budget_drive_root": str(tmp_path),
+    }]
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "WORKERS", {1: worker})
+    monkeypatch.setattr(workers, "load_state", lambda: {"owner_chat_id": 0})
+    monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    queue.BUDGET_ROOT_FENCES.clear()
+
+    workers.assign_tasks()
+
+    rejected = load_task_result(tmp_path, "invalid-before-budget")
+    assert pending == []
+    assert delivered == []
+    assert rejected["status"] == STATUS_FAILED
+    assert rejected["reason_code"] == "invalid_task_depth"
+    assert rejected["raw_task_depth"] == -0.5
+    assert "_budget_pause" not in rejected
 
 
 def test_supervisor_keeps_admission_when_scheduled_write_raises_after_commit(
