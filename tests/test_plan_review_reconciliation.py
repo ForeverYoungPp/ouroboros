@@ -410,3 +410,55 @@ def test_zero_send_route_refusal_does_not_spend_a_plan_cycle(harness, monkeypatc
     assert {row["failure_code"] for row in wave["actors"]} == {
         "session_task_missing",
     }
+
+
+@pytest.mark.parametrize("row", [
+    {"status": "error", "error": "substrate omitted the actor"},
+    {"status": "error", "usage": {"physical_attempt_state": "settled"}},
+    {"status": "error", "usage": {"physical_attempt_state": "future_state"}},
+])
+def test_missing_operation_identity_cannot_prove_a_free_wave(row):
+    from ouroboros.tools.plan_review_artifacts import _row_has_physical_dispatch
+
+    assert _row_has_physical_dispatch(row) is True
+
+
+def test_explicit_zero_send_fact_is_the_only_missing_identity_free_proof():
+    from ouroboros.tools.plan_review_artifacts import _row_has_physical_dispatch
+
+    assert _row_has_physical_dispatch({
+        "status": "not_dispatched", "operation_state": "not_dispatched",
+    }) is False
+
+
+def test_missing_substrate_actor_stays_paid_and_custody_lost(harness, monkeypatch):
+    """A dropped actor is unknown physical custody, never a terminal free retry."""
+    import ouroboros.review_substrate as review_substrate
+
+    calls = []
+
+    def no_actors(request, *, slots, drive_root, llm, usage_ctx=None):
+        calls.append([slot.slot_id for slot in slots])
+        return SimpleNamespace(actors=[])
+
+    monkeypatch.setattr(review_substrate, "run_review_request", no_actors)
+    first = _call(harness.make_ctx())
+    state = _state(harness)
+    wave = state["waves"][-1]
+
+    assert calls == [["s1", "s2", "s3"]]
+    assert _control(first) == {"outcome": "DEGRADED", "closed": False}
+    assert wave["paid"] is True and wave["custody_pending"] is True
+    assert state["cycles_paid"] == 1
+    assert {row["failure_code"] for row in wave["actors"]} == {
+        "review_custody_lost",
+    }
+    assert {row["operation_state"] for row in wave["actors"]} == {
+        "custody_lost",
+    }
+
+    second = _call(harness.make_ctx())
+    assert _control(second) == {"outcome": "DEGRADED", "closed": False}
+    assert "Refusing a duplicate paid send" in second
+    assert calls == [["s1", "s2", "s3"]]
+    assert _state(harness)["cycles_paid"] == 1

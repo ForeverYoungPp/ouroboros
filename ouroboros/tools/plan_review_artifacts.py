@@ -84,8 +84,6 @@ def authority_wave(drive_root: Any, task_id: str, hot_wave: Optional[dict]) -> O
 
 def _row_has_physical_dispatch(row: Dict[str, Any]) -> bool:
     """Identify paid rows from explicit custody facts, with legacy fallback."""
-    if not str(row.get("operation_id") or ""):
-        return False
     operation_state = str(row.get("operation_state") or "").strip().lower()
     status = str(row.get("status") or "").strip().lower()
     physical_state = str(row.get("physical_attempt_state") or "").strip().lower()
@@ -107,8 +105,9 @@ def _row_has_physical_dispatch(row: Dict[str, Any]) -> bool:
     # operation id assigned before provider admission.
     if operation_state == "not_dispatched" or status == "not_dispatched":
         return False
-    # Pre-B1 rows did not carry a physical state. Their non-$0 operation id is
-    # the only durable evidence available, so retain that compatibility path.
+    # Pre-B1 rows and a current substrate omission may lack an operation id.
+    # Absence is not proof of $0: only the explicit states above authorize that
+    # conclusion, while every ambiguous row stays on the conservative side.
     return True
 
 

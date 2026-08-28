@@ -300,7 +300,10 @@ async def run_plan_review_slots(
     for slot in slots:  # a slot the substrate never answered for is still a configured row
         if str(slot.slot_id) not in answered:
             rows.append(_plan_row_from_actor({"slot_id": slot.slot_id, "model": slot.model,
-                                              "status": "error", "error": "no actor record"}, slot))
+                                              "status": "error", "error": "no actor record",
+                                              "failure_code": "review_custody_lost",
+                                              "operation_state": "custody_lost",
+                                              "late_result_pending": True}, slot))
     return rows
 
 
@@ -843,6 +846,7 @@ def plan_health_skip_rows(slots: list, evidence: Optional[Dict[str, Dict[str, st
             ),
             "failure_code": code, "reset_at": reset,
             "prompt_ref": {}, "response_ref": {}, "tokens_in": 0, "tokens_out": 0, "cost": 0.0,
+            "status": "not_dispatched", "operation_state": "not_dispatched",
         })
     return live, rows
 
@@ -1053,6 +1057,7 @@ def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int) -> tuple[list,
             "error": (f"preflight_oversize: assembled packet ~{estimated:,} estimated tokens exceeds "
                       f"this slot's calibrated input cap {cap:,}"),
             "prompt_ref": {}, "response_ref": {}, "tokens_in": 0, "tokens_out": 0, "cost": 0.0,
+            "status": "not_dispatched", "operation_state": "not_dispatched",
         })
     error = ""
     if slots and len(callable_slots) < int(quorum):
