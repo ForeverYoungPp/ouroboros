@@ -3728,3 +3728,37 @@ def test_double_takeover_loser_restores_the_reaping_marker_as_found(qenv, monkey
     assert qenv.workers.WORKERS[0].reaping is True, (
         "the loser must restore the marker as found — the winner is mid-kill behind it"
     )
+
+
+def test_task_lifecycle_keeps_scheduled_admission_import_surface():
+    from supervisor import task_admission, task_lifecycle
+
+    assert (
+        task_lifecycle.record_scheduled_admission
+        is task_admission.record_scheduled_admission
+    )
+
+
+def test_task_lifecycle_keeps_capture_miss_calling_convention(monkeypatch):
+    from supervisor import cancel_publication, task_lifecycle
+
+    queue_sentinel = object()
+    intent = {"request_id": "compat-request"}
+    seen = {}
+
+    def fake_finalize(q, task_id, *, intent=None):
+        seen.update(q=q, task_id=task_id, intent=intent)
+        return "compat-result"
+
+    monkeypatch.setattr(task_lifecycle, "_queue_module", lambda: queue_sentinel)
+    monkeypatch.setattr(cancel_publication, "_finalize_cancel_intent_on_miss", fake_finalize)
+
+    assert (
+        task_lifecycle._finalize_cancel_intent_on_miss("compat-task", intent=intent)
+        == "compat-result"
+    )
+    assert seen == {
+        "q": queue_sentinel,
+        "task_id": "compat-task",
+        "intent": intent,
+    }

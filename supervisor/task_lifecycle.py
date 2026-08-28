@@ -32,7 +32,6 @@ from supervisor.cancel_publication import (  # noqa: F401 -- intentional public 
     _cancel_result_fields,
     _cascade_delivery_row_locked,
     _deliver_on_miss,
-    _finalize_cancel_intent_on_miss,
     _intent_outcome_fields,
     _is_workspace_task_record,
     _load_result_row,
@@ -228,6 +227,15 @@ def _queue_module():
     from supervisor import queue
 
     return queue
+
+
+def _finalize_cancel_intent_on_miss(
+    task_id: str, *, intent: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Preserve the lifecycle import surface while publication owns the work."""
+    from supervisor.cancel_publication import _finalize_cancel_intent_on_miss as finalize
+
+    return finalize(_queue_module(), task_id, intent=intent)
 
 
 def cancel_task_by_id(task_id: str, *, cascade: bool = False) -> bool:
@@ -691,7 +699,7 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
                 task_id, captured_worker, captured_meta or {},
                 intent=intent, deliver=deliver, settled_status=settled,
             )
-        return _finalize_cancel_intent_on_miss(q, task_id, intent=intent)
+        return _finalize_cancel_intent_on_miss(task_id, intent=intent)
     except Exception:
         # A crash BETWEEN the capture and the respawn is what strands a slot at
         # ``reaping`` forever (the reaper's step-5 self-heal has the same
@@ -1549,3 +1557,7 @@ from supervisor.queue_transitions import (  # noqa: E402, F401 -- intentional pu
     task_subtree_is_live,
     transition_acceptance_fence,
 )
+
+# Scheduled-admission projection moved to its owner module, but callers may
+# still import the established lifecycle surface.
+from supervisor.task_admission import record_scheduled_admission  # noqa: E402, F401
