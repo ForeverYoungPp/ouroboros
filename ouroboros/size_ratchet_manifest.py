@@ -190,7 +190,6 @@ BAND_PATHS = {
     "tests/test_v678_receipt_reconciliation.py": None,
     "web/modules/api_types.js": "The shared browser contract module now includes issue 265 publication-preflight types alongside the target settings and subagent contracts.",
     "web/modules/harness_accounts.js": None,
-    "web/modules/harness_login_cards.js": None,
     "web/modules/log_events.js": None,
     "web/modules/onboarding_wizard.js": None,
     "web/modules/settings.js": None,

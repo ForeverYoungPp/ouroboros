@@ -916,3 +916,39 @@ export function boundedStatusRefresh(store, { includeModels = true, beatMs = 200
     const beat = new Promise((resolve) => { timer = setTimeout(resolve, beatMs); });
     return Promise.race([refresh, beat]).finally(() => { if (timer) clearTimeout(timer); });
 }
+
+/**
+ * The one sentence for "Claudexor is being made ready", phased by what is
+ * actually happening: the runtime manager's status projection distinguishes
+ * installing from ready, and the daemon aggregate says whether the engine is
+ * serving — printing "Installing or checking" when the payload names the
+ * phase made a minutes-long first install indistinguishable from a
+ * sub-second probe. An absent or unread payload answers the honest generic:
+ * this caller IS mid-check, it just has no phase evidence yet.
+ */
+export function claudexorPreparationLine(payload) {
+    const daemon = payload?.daemon || {};
+    const runtime = daemon.runtime || {};
+    const state = String(runtime.state || '');
+    if (daemon.ownership_problem) {
+        // Checked before EVERY positive phase claim: ensure_running refuses a
+        // foreign daemon home, so neither an install nor a start proceeds on
+        // this payload however the runtime projection reads — the accounts
+        // panel carries the ownership sentence itself.
+        return 'Checking Claudexor…';
+    }
+    if (state === 'installing') {
+        const version = runtime.target_version ? ` ${runtime.target_version}` : '';
+        return `Installing Claudexor${version}…`;
+    }
+    if (state === 'ready' && String(daemon.state || '') === 'stale') {
+        // POSITIVE knowledge only: 'stale' is the producer's own "installed,
+        // engine idle, starts automatically" verdict. A partially failed
+        // fan-out rewrites a LIVE daemon's aggregate to 'unreachable' while
+        // preserving the runtime projection, so anything but 'stale' falls to
+        // the generic — never a "Starting…" claim about an engine that may
+        // already be serving.
+        return 'Starting the Claudexor daemon…';
+    }
+    return 'Checking Claudexor…';
+}

@@ -52,6 +52,7 @@ import {
     STATUS_FACETS,
     accountRows,
     bindStatusSurface,
+    claudexorPreparationLine,
     claudexorStatus,
     facetReadState,
     familyLabel,
@@ -366,8 +367,9 @@ export function daemonStatusLine(payload, { checking = false, reads = null } = {
     const gapNames = facetGapNames(facetReads);
     const unreadTail = gapNames ? ` ${capitalize(gapNames)} were not read.` : '';
     if (runtimeState === 'installing') {
-        const version = runtime.target_version ? ` ${runtime.target_version}` : '';
-        return { tone: 'muted', text: `Installing or checking Claudexor${version}…${unreadTail}` };
+        // The branch condition IS the phase: say "installing", not a hedge
+        // that makes a minutes-long download read like a sub-second probe.
+        return { tone: 'muted', text: `${claudexorPreparationLine(payload)}${unreadTail}` };
     }
     if (runtimeState === 'error') {
         const detail = runtime.last_error ? `: ${runtime.last_error}.` : '.';
