@@ -17,11 +17,14 @@ import threading
 import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.deadline_utils import review_operation_timeout_sec
 from ouroboros.observability import new_call_id
 from ouroboros.review_dispatch import slot_id_for_row
+from ouroboros.usage_accounting import (
+    PHYSICAL_ATTEMPT_STATES, POSITIVE_PHYSICAL_ATTEMPT_STATES,
+)
 from ouroboros.utils import emit_cognitive_operation_event
 
 log = logging.getLogger("review_custody")
@@ -45,6 +48,251 @@ _ACTIVE: Dict[str, ActiveReviewAttempt] = {}
 # not the full actor/prompt, until process exit.
 _NO_RESEND: Dict[str, str] = {}
 _PENDING_STATES = {"in_flight", "custody_lost"}
+_PHYSICAL_CAPTURE_STATES = frozenset({"", *POSITIVE_PHYSICAL_ATTEMPT_STATES})
+_POSITIVE_CAPTURE_STATES = POSITIVE_PHYSICAL_ATTEMPT_STATES
+
+
+@dataclass
+class _ReviewAttemptHistory:
+    """The strongest physical fact observed across one actor's retry rail."""
+
+    dispatched: bool = False
+    capture_state: str = ""
+    provider_status_code: Optional[int] = None
+    unknown_outcome_seen: bool = False
+
+    def observe(self, error: Any = None) -> None:
+        capture = getattr(error, "physical_attempt_capture", None)
+        if capture is None:
+            try:
+                from ouroboros.usage_accounting import last_physical_attempt_capture
+
+                capture = last_physical_attempt_capture()
+            except Exception:
+                capture = None
+        state = str(getattr(capture, "state", "") or "").strip().lower()
+        if state and state not in PHYSICAL_ATTEMPT_STATES:
+            # A malformed non-empty capture cannot prove that no request was
+            # admitted.  Preserve the strongest safe interpretation across the
+            # whole retry rail, so a later exception/status cannot authorize a
+            # second paid send.
+            self.dispatched = True
+            self.capture_state = "unresolved"
+            self.unknown_outcome_seen = True
+            self.provider_status_code = None
+            return
+        if state not in _POSITIVE_CAPTURE_STATES:
+            return
+        self.dispatched = True
+        self.capture_state = state
+        status = getattr(capture, "provider_status_code", None)
+        if state in {"dispatched", "unresolved"} and not (
+            isinstance(status, int) and not isinstance(status, bool)
+            and 400 <= status <= 599
+        ):
+            self.unknown_outcome_seen = True
+        elif isinstance(status, int) and not isinstance(status, bool):
+            self.provider_status_code = status
+
+    def preserve(self, failure_custody: Dict[str, Any], current_state: str) -> None:
+        if not self.dispatched or current_state not in {"", "reserved", "released"}:
+            return
+        failure_custody["physical_attempt_state"] = (
+            "unresolved" if self.unknown_outcome_seen else self.capture_state or "unresolved"
+        )
+        if self.provider_status_code is not None and not self.unknown_outcome_seen:
+            failure_custody["provider_status_code"] = self.provider_status_code
+        elif self.unknown_outcome_seen:
+            failure_custody.pop("provider_status_code", None)
+
+
+def _review_exception_projection(
+    exc: BaseException,
+    executor_custody: Any,
+    history: _ReviewAttemptHistory,
+    retry_state: Optional[Dict[str, Any]],
+) -> tuple[Dict[str, Any], str, Optional[int], str, str]:
+    """Project one failed actor while retaining earlier rail custody."""
+    from ouroboros.review_execution import ReviewRouteUnavailable
+    from ouroboros.usage_accounting import BudgetExceeded
+
+    failure_custody = dict(executor_custody or {})
+    capture = getattr(exc, "physical_attempt_capture", None)
+    capture_state = str(getattr(capture, "state", "") or "").strip().lower()
+    malformed_capture = bool(
+        capture_state and capture_state not in PHYSICAL_ATTEMPT_STATES
+    )
+    if malformed_capture:
+        # Unknown capture values are custody loss, even when the exception also
+        # carries an HTTP status.  The status cannot repair malformed physical
+        # provenance, and retaining it would make the row appear replayable.
+        capture_state = "unresolved"
+        failure_custody["physical_attempt_state"] = capture_state
+        failure_custody.pop("provider_status_code", None)
+        history.dispatched = True
+        history.capture_state = capture_state
+        history.unknown_outcome_seen = True
+        history.provider_status_code = None
+    if capture_state:
+        failure_custody["physical_attempt_state"] = capture_state
+    http_status = next((value for value in (
+        getattr(exc, "status_code", None),
+        getattr(getattr(exc, "response", None), "status_code", None),
+        getattr(capture, "provider_status_code", None),
+        failure_custody.get("provider_status_code"),
+    ) if isinstance(value, int) and not isinstance(value, bool)), None)
+    if http_status is not None and not malformed_capture:
+        failure_custody["provider_status_code"] = http_status
+    elif malformed_capture:
+        http_status = None
+        failure_custody.pop("provider_status_code", None)
+    history.preserve(failure_custody, capture_state)
+    dispatched = history.dispatched
+    if history.unknown_outcome_seen:
+        http_status = None
+    if (
+        history.provider_status_code is not None
+        and not history.unknown_outcome_seen
+        and capture_state in {"", "reserved", "released"}
+    ):
+        http_status = history.provider_status_code
+    physical_state = str(failure_custody.get("physical_attempt_state") or "").strip().lower()
+    route_state = ""
+    if not dispatched and isinstance(exc, ReviewRouteUnavailable):
+        route_state = _worker_exception_operation_state(
+            exc, {**(retry_state or {}), **failure_custody},
+        )
+    operation_state = (
+        "custody_lost" if history.unknown_outcome_seen else route_state
+        or ("not_dispatched" if not dispatched and (
+            capture_state in {"reserved", "released"}
+            or isinstance(exc, BudgetExceeded)
+            or str(getattr(exc, "code", "") or "") == "deadline_exhausted"
+        ) else "settled")
+    )
+    failure_code = (
+        "provider_outcome_unknown"
+        if dispatched and physical_state in {"dispatched", "unresolved"}
+        and not isinstance(http_status, int)
+        else str(getattr(exc, "code", "") or "")
+    )
+    return failure_custody, capture_state, http_status, operation_state, failure_code
+
+
+def _worker_exception_operation_state(
+    exc: BaseException, retry_state: Dict[str, Any],
+) -> str:
+    """Project a worker exception onto custody without guessing from prose.
+
+    Route construction and admission can fail before a physical attempt exists.
+    Those typed refusals are retryable $0 rows. A pending invocation, a started
+    delegated run, or a positive physical capture is already custody-bearing,
+    so it must not be turned into a fresh retry.
+    """
+    code = str(getattr(exc, "code", "") or "")
+    capture = getattr(exc, "physical_attempt_capture", None)
+    capture_state = str(getattr(capture, "state", "") or "").strip().lower()
+    if capture_state and capture_state not in PHYSICAL_ATTEMPT_STATES:
+        return "custody_lost"
+    if capture_state in _POSITIVE_CAPTURE_STATES:
+        return "settled"
+    if bool(getattr(exc, "delegated_run_started", False)) or str(
+        getattr(exc, "delegated_run_id", "") or ""
+    ).strip():
+        return "settled"
+    try:
+        from ouroboros.review_execution import ReviewRouteUnavailable
+    except Exception:
+        ReviewRouteUnavailable = ()  # type: ignore[assignment]
+    if isinstance(exc, ReviewRouteUnavailable):
+        if code == "review_custody_lost" or str(
+            retry_state.get("pending_invocation_id") or ""
+        ).strip():
+            return "custody_lost"
+        # Only refusals emitted before the route's paid write-ahead boundary
+        # are retryable $0. Later custody/checkpoint failures remain settled:
+        # their absence of provider-capture metadata cannot erase the stamp.
+        if code in {
+            "api_chat_unavailable", "route_unavailable", "harness_unavailable",
+            "provider_unavailable", "deadline_exhausted",
+            "subscription_window_exhausted",
+            "credential_pool_exhausted", "session_task_missing",
+            "session_target_unparsable", "session_route_unconfigured",
+            "custody_root_missing", "session_root_missing",
+            "unknown_review_route", "review_route_not_implemented",
+        }:
+            return "not_dispatched"
+        return "settled"
+    if code == "deadline_exhausted":
+        return "not_dispatched"
+    # A subscription/credential window refusal from route health is also before
+    # POST. Once a delegated run exists, the started-run branch above wins.
+    if code in {"subscription_window_exhausted", "credential_pool_exhausted"}:
+        return "not_dispatched"
+    return "settled"
+
+
+def _attach_worker_exception_facts(
+    actor: Any, exc: BaseException, retry_state: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Carry typed capture/status facts onto a synthetic worker actor."""
+    if isinstance(actor, dict):
+        usage = dict(actor.get("usage") or {})
+    else:
+        usage = dict(getattr(actor, "usage", None) or {})
+    capture = getattr(exc, "physical_attempt_capture", None)
+    capture_state = str(getattr(capture, "state", "") or "").strip().lower()
+    if capture_state:
+        usage["physical_attempt_state"] = capture_state
+    for key in ("pending_invocation_id", "delegated_run_id"):
+        value = str((retry_state or {}).get(key) or "").strip()
+        if value and key not in usage:
+            usage[key] = value
+    status = getattr(capture, "provider_status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        usage["provider_status_code"] = status
+        if not isinstance(actor, dict) and getattr(actor, "http_status", None) is None:
+            actor.http_status = status
+    if isinstance(actor, dict):
+        actor["usage"] = usage
+        code = str(getattr(exc, "code", "") or "")
+        if code:
+            actor["failure_code"] = code
+        reset_at = str(getattr(exc, "reset_at", "") or "")
+        if reset_at:
+            actor["reset_at"] = reset_at
+    else:
+        actor.usage = usage
+        code = str(getattr(exc, "code", "") or "")
+        if code and not str(getattr(actor, "failure_code", "") or ""):
+            actor.failure_code = code
+        reset_at = str(getattr(exc, "reset_at", "") or "")
+        if reset_at and not str(getattr(actor, "reset_at", "") or ""):
+            actor.reset_at = reset_at
+
+
+def _terminal_provider_status(actor: Any, failure_custody: Dict[str, Any]) -> int | None:
+    """Return a typed terminal HTTP status carried by this actor only.
+
+    A dispatched/unresolved capture is safe to replay inside its exact logical
+    cycle only when the provider returned a terminal HTTP response. Never use
+    an unrelated ContextVar or exception text as proof of that response.
+    """
+    candidates = (
+        getattr(actor, "http_status", None),
+        failure_custody.get("provider_status_code"),
+        failure_custody.get("http_status"),
+    )
+    for value in candidates:
+        if isinstance(value, bool):
+            continue
+        try:
+            status = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if 400 <= status <= 599:
+            return status
+    return None
 
 
 def _row_is_pending(row: Dict[str, Any]) -> bool:
@@ -161,16 +409,34 @@ def _frozen_actor(row: Dict[str, Any], slot: Any) -> Any:
     from ouroboros.review_substrate import ReviewActorRecord
 
     status = str(row.get("status") or "")
-    raw_text = str(row.get("raw_text") or "")
+    raw_text = str(row.get("raw_text") or row.get("text") or "")
     actor_status = (
         "not_dispatched" if status == "not_dispatched"
         else "ok" if raw_text or status in {"responded", "ok", "empty", "parse_failure", "partial"}
         else "error"
     )
-    usage = {
-        "pending_invocation_id": str(row.get("pending_invocation_id") or ""),
-        "delegated_run_id": str(row.get("delegated_run_id") or ""),
-    }
+    usage = copy.deepcopy(row.get("usage") or {}) if isinstance(row.get("usage"), dict) else {}
+    for key in (
+        "pending_invocation_id", "delegated_run_id", "physical_attempt_state",
+        "provider_status_code", "delegated_run_started", "review_thread_id",
+        "review_turn_id", "review_thread_receipt", "auth_route_receipt",
+        "profile_continuity_receipt", "applied_profile", "capability_delta",
+    ):
+        value = row.get(key)
+        if value not in (None, "") and key not in usage:
+            usage[key] = copy.deepcopy(value)
+    operation_state = str(row.get("operation_state") or "settled")
+    http_status = row.get("http_status")
+    if isinstance(http_status, bool):
+        http_status = None
+    elif http_status is not None:
+        try:
+            http_status = int(http_status)
+        except (TypeError, ValueError, OverflowError):
+            http_status = None
+    if http_status is not None and "http_status" not in usage:
+        usage["http_status"] = http_status
+    pending = bool(row.get("late_result_pending")) or operation_state in _PENDING_STATES
     return ReviewActorRecord(
         slot_id=str(getattr(slot, "slot_id", "") or ""),
         model=str(row.get("model_id") or row.get("model") or getattr(slot, "model", "")),
@@ -181,8 +447,20 @@ def _frozen_actor(row: Dict[str, Any], slot: Any) -> Any:
         prompt_ref=dict(row.get("prompt_ref") or {}),
         response_ref=dict(row.get("response_ref") or {}),
         operation_id=str(row.get("operation_id") or ""),
-        operation_state=str(row.get("operation_state") or "settled"),
-        late_result_pending=False,
+        late_result_pending=pending,
+        transport_status=str(row.get("transport_status") or ""),
+        failure_code=str(row.get("failure_code") or ""),
+        reset_at=str(row.get("reset_at") or ""),
+        http_status=http_status,
+        parse_status=str(row.get("parse_status") or ""),
+        semantic_verdict=str(row.get("semantic_verdict") or ""),
+        provider=str(row.get("provider") or ""),
+        actor_role=str(row.get("actor_role") or ""),
+        coverage=copy.deepcopy(row.get("coverage") or {}) if isinstance(row.get("coverage"), dict) else {},
+        quorum_contribution=bool(row.get("quorum_contribution")),
+        reason=str(row.get("reason") or ""),
+        enforcement_impact=str(row.get("enforcement_impact") or ""),
+        operation_state=operation_state,
     )
 
 
@@ -327,9 +605,22 @@ def review_retry_cancelled(usage_ctx: Any) -> bool:
     return False
 
 
-def retryable_review_exception(exc: Exception, usage_ctx: Any) -> bool:
+def retryable_review_exception(
+    exc: Exception, usage_ctx: Any,
+    attempt_history: Optional[_ReviewAttemptHistory] = None,
+) -> bool:
     """Whether a second byte-identical review send has a terminal basis."""
     from ouroboros.loop_llm_call import classify_llm_exception
+
+    def _annotate_unknown_outcome() -> None:
+        # Provider exception types may expose ``code`` as a read-only property.
+        # This annotation is diagnostic only; it must never replace the
+        # original failure or weaken the no-resend decision.
+        try:
+            if not str(getattr(exc, "code", "") or ""):
+                setattr(exc, "code", "provider_outcome_unknown")
+        except Exception:
+            pass
 
     # A cancellation requested after the first route attempt is a terminal
     # owner decision for this wave, even when the transport wrapper surfaced a
@@ -338,12 +629,21 @@ def retryable_review_exception(exc: Exception, usage_ctx: Any) -> bool:
     if review_retry_cancelled(usage_ctx):
         return False
 
+    history = attempt_history
+    if history is None:
+        history = _ReviewAttemptHistory()
+        history.observe(exc)
+    if history.unknown_outcome_seen:
+        if usage_ctx is not None:
+            setattr(usage_ctx, "_review_custody_lost", True)
+        _annotate_unknown_outcome()
+        return False
+
     classification = classify_llm_exception(exc)
     if classification.kind == "provider_outcome_unknown":
         if usage_ctx is not None:
             setattr(usage_ctx, "_review_custody_lost", True)
-        if not str(getattr(exc, "code", "") or ""):
-            setattr(exc, "code", "provider_outcome_unknown")
+        _annotate_unknown_outcome()
     return classification.retry_same_request
 
 
@@ -486,14 +786,65 @@ def _settle_review_attempt(
     with _ACTIVE_LOCK:
         late = bool(entry.timed_out)
         failure_custody = getattr(actor, "usage", None) or {}
-        pending_invocation = str(failure_custody.get("pending_invocation_id") or "")
-        custody_lost = (
-            str(getattr(actor, "failure_code", "") or "")
-            == "provider_outcome_unknown"
+        physical_attempt_state = str(
+            failure_custody.get("physical_attempt_state") or ""
+        ).strip().lower()
+        malformed_physical_state = bool(
+            physical_attempt_state
+            and physical_attempt_state not in PHYSICAL_ATTEMPT_STATES
         )
-        not_dispatched = str(
+        if malformed_physical_state:
+            # Treat malformed provenance as an unknown paid outcome.  A typed
+            # HTTP status cannot make an unrecognized state safe to replay.
+            physical_attempt_state = "unresolved"
+            failure_custody["physical_attempt_state"] = physical_attempt_state
+            failure_custody.pop("provider_status_code", None)
+            if hasattr(actor, "usage"):
+                actor.usage = failure_custody
+        pending_invocation = str(failure_custody.get("pending_invocation_id") or "")
+        terminal_provider_status = _terminal_provider_status(actor, failure_custody)
+        if malformed_physical_state:
+            terminal_provider_status = None
+        capture_outcome_unknown = (
+            physical_attempt_state in {"dispatched", "unresolved"}
+            and terminal_provider_status is None
+        )
+        legacy_unknown = str(getattr(actor, "failure_code", "") or "") == "provider_outcome_unknown"
+        # A typed terminal provider response is stronger than the legacy
+        # catch-all code. The latter only means that custody is lost when no
+        # terminal status survived the boundary.
+        explicit_custody_lost = str(
             getattr(actor, "operation_state", "") or ""
-        ) == "not_dispatched"
+        ).strip().lower() == "custody_lost"
+        custody_lost = (
+            explicit_custody_lost
+            or malformed_physical_state
+            or (legacy_unknown and terminal_provider_status is None)
+            or capture_outcome_unknown
+        )
+        if (malformed_physical_state or capture_outcome_unknown) and str(getattr(actor, "failure_code", "") or "") != "provider_outcome_unknown":
+            # The physical capture is stronger than a legacy/mocked actor code:
+            # without a terminal provider response, a second paid send is unsafe.
+            actor.failure_code = "provider_outcome_unknown"
+        if malformed_physical_state and hasattr(actor, "http_status"):
+            actor.http_status = None
+        positive_physical_custody = physical_attempt_state in _POSITIVE_CAPTURE_STATES
+        synthetic_not_dispatched = (
+            str(getattr(actor, "operation_state", "") or "").strip().lower()
+            == "not_dispatched"
+            or str(getattr(actor, "status", "") or "").strip().lower()
+            == "not_dispatched"
+        )
+        not_dispatched = synthetic_not_dispatched and not positive_physical_custody
+        if positive_physical_custody and str(
+            getattr(actor, "status", "") or ""
+        ).strip().lower() == "not_dispatched":
+            actor.status = "error"
+            if not str(getattr(actor, "error", "") or ""):
+                actor.error = (
+                    "Positive physical-attempt custody contradicted a synthetic "
+                    "not-dispatched status"
+                )
         actor.operation_id = entry.operation_id
         actor.operation_state = (
             "custody_lost" if custody_lost else
@@ -528,11 +879,11 @@ def _settle_review_attempt(
         explicit_retry = bool(str(getattr(request, "retry_key", "") or "").strip())
         route = getattr(slot, "route", "")
         route_value = str(getattr(route, "value", route) or "")
-        # A keyed plan/commit cycle owns one exact paid API attempt. If its
-        # logical window expired, retain its terminal actor for reconciliation.
-        late_keyed_api_error = bool(
-            late
-            and explicit_retry
+        # A keyed plan/commit cycle owns one exact paid API attempt. Retain a
+        # terminal API actor while the sibling cycle is still settling; otherwise
+        # a retry can buy this already-settled slot again before the wave closes.
+        keyed_terminal_api_error = bool(
+            explicit_retry
             and (
                 str(getattr(request, "surface", "") or "") == "plan_review"
                 or str(getattr(request, "retry_key", "") or "").startswith(
@@ -541,10 +892,25 @@ def _settle_review_attempt(
             )
             and route_value != "agent_session"
             and not pending_invocation
+            # The actor's terminal state is the canonical settlement fact;
+            # adapters are not required to populate the optional physical
+            # capture metadata just to make same-cycle custody replayable.
+            and actor.status == "error"
+            and str(getattr(actor, "operation_state", "") or "")
+            not in {"not_dispatched", "in_flight", "custody_lost"}
+            # Explicit reserved/released states are pre-dispatch and stay
+            # eligible for a real retry. A dispatched/unresolved state is
+            # replayable only with a typed terminal HTTP response; otherwise
+            # the capture-outcome guard above records custody_lost/no-resend.
+            and physical_attempt_state in _PHYSICAL_CAPTURE_STATES
+            and (
+                physical_attempt_state in {"", "settled"}
+                or terminal_provider_status is not None
+            )
         )
         replayable = (
             actor.status in {"ok", "empty"}
-            or late_keyed_api_error
+            or keyed_terminal_api_error
             or bool(failure_custody.get("delegated_run_started") and not pending_invocation)
         )
         if replayable and usage_ctx is not None and (late or explicit_retry):
@@ -605,6 +971,8 @@ def run_custodied_review_slots(
         nonlocal paid_stamped
         key = _attempt_key(request, slot)
         slot_id = str(getattr(slot, "slot_id", "") or "")
+        route = getattr(slot, "route", "")
+        route_value = str(getattr(route, "value", route) or "")
         reserved_surface = (getattr(usage_ctx, "_review_reserved_operations", {}) or {}).get(
             str(getattr(request, "surface", "") or ""), {}
         )
@@ -641,7 +1009,12 @@ def run_custodied_review_slots(
                     cached_actor = _frozen_actor(frozen_row, slot)
             retry_token = str(retry_state.get("pending_invocation_id") or "")
             retry_operation_id = str(retry_state.get("operation_id") or "")
-            exact_recovery = bool(retry_token and retry_operation_id)
+            # Only delegated sessions have a durable invocation token that can
+            # rejoin work after process-local custody is gone. An API row with
+            # such a token is malformed state, not permission for a fresh send.
+            exact_recovery = bool(
+                retry_token and retry_operation_id and route_value == "agent_session"
+            )
             retry_payload = dict(retry_state)
             retry_payload.pop("operation_id", None)
             if cached_actor is not None:
@@ -783,15 +1156,14 @@ def run_custodied_review_slots(
                             entry.pending_invocation_checkpoint,
                         )
                 except Exception as exc:
-                    operation_state = (
-                        "not_dispatched"
-                        if str(getattr(exc, "code", "") or "") == "deadline_exhausted"
-                        else "settled"
+                    operation_state = _worker_exception_operation_state(
+                        exc, entry.retry_state,
                     )
                     actor = error_actor(
                         slot, f"{type(exc).__name__}: {exc}", entry.operation_id,
                         operation_state,
                     )
+                    _attach_worker_exception_facts(actor, exc, entry.retry_state)
                 _settle_review_attempt(
                     entry, slot, actor, usage_ctx=usage_ctx, request=request,
                     task_id=task_id, result_queue=result_queue,

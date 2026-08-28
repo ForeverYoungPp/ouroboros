@@ -553,7 +553,11 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
                                                     wave=existing, cycles_paid=cycles_paid, cap=cap)
                 return _render_wave(existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement, cached=True, reminder=reminder)
     deadline_skip = _plan_deadline_skip(ctx)
-    if deadline_skip:
+    # An existing paid wave with a live physical reviewer is a custody
+    # reconciliation, not a new planning dispatch.  Let it pass the owner
+    # deadline rail so the exact frozen cycle can settle; fresh envelopes still
+    # take the ordinary no-new-work deadline path below.
+    if deadline_skip and not resume_in_flight:
         try:
             record_plan_review_attempt(state_root, task_id, fingerprint=fingerprint,
                                        status="rail_degraded", reason="plan_task_deadline")
@@ -582,9 +586,10 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         existing, state, state_root, task_id, configured_slots,
     ) if resume_in_flight else {}
     if resume.get("error"):
-        return _render_wave(
-            existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
-            cached=True, reminder="\n".join(x for x in (reminder, resume["error"]) if x),
+        return _plan_unavailable(
+            ctx,
+            "ERROR: PLAN_REVIEW_CUSTODY_INVALID: " + str(resume["error"]),
+            "plan_review_custody_invalid",
         )
     previous = resume.get("previous") if resume_in_flight else (
         previous_override if previous_override is not None else _last_paid_wave(state)
@@ -687,7 +692,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         previous=previous, manifest=manifest, manifest_hash=manifest_hash,
         constitutional=constitutional, constitutional_note=constitutional_note,
         cycle_index=cycle_index, retry_key=retry_key, enforcement=enforcement, cap=cap,
-        quorum=quorum, configured_slots=configured_slots, callable_slots=callable_slots,
+        quorum=quorum, configured_slots=configured_slots,
         health_evidence=health_evidence,
     )
     aggregate = str(wave["aggregate"])

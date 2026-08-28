@@ -64,8 +64,10 @@ class _Substrate:
             actors.append({
                 "slot_id": slot.slot_id, "model": slot.model, "status": "ok" if text else "error",
                 "raw_text": text or "", "error": "" if text else "transport died",
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "resolved_model": slot.model},
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                          "resolved_model": slot.model, "physical_attempt_state": "settled"},
                 "prompt_ref": {}, "response_ref": {},
+                "operation_id": f"op-{slot.slot_id}", "operation_state": "settled",
             })
         return SimpleNamespace(actors=actors)
 
