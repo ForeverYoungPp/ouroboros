@@ -553,7 +553,11 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
                                                     wave=existing, cycles_paid=cycles_paid, cap=cap)
                 return _render_wave(existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement, cached=True, reminder=reminder)
     deadline_skip = _plan_deadline_skip(ctx)
-    if deadline_skip:
+    # An existing paid wave with a live physical reviewer is a custody
+    # reconciliation, not a new planning dispatch.  Let it pass the owner
+    # deadline rail so the exact frozen cycle can settle; fresh envelopes still
+    # take the ordinary no-new-work deadline path below.
+    if deadline_skip and not resume_in_flight:
         try:
             record_plan_review_attempt(state_root, task_id, fingerprint=fingerprint,
                                        status="rail_degraded", reason="plan_task_deadline")

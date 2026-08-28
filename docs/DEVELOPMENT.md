@@ -1893,6 +1893,9 @@ Before every commit, verify the following:
   attempt and remain bound to its retry identity. Once the owner deadline minus
   finalization reserve is spent, an unstarted review row is a typed `$0
   not_dispatched` actor: no worker, paid stamp, or active lease is created.
+  An already-paid in-flight review wave remains eligible for exact custody
+  reconciliation after that deadline; this settlement path does not authorize
+  a new dispatch or extend the task's cognition window.
   A commit attempt cannot treat an in-flight reviewer as a final quorum verdict,
   including under advisory enforcement. Plan review applies the same rule: if a
   paid actor remains in flight, the wave is projected as the existing open
@@ -1901,7 +1904,10 @@ Before every commit, verify the following:
   the wave cannot close until custody settles.
 - [ ] A returned provider response (including an empty/incomplete body) or typed
   terminal 408/429/5xx is settled and may use the surface's bounded retry/repair
-  rail. A dispatched request whose socket or stream ends without terminal
+  rail. During a mixed plan/commit cycle, a settled terminal API actor remains
+  in the exact cycle's replay roster while a sibling is live; an identical
+  envelope never buys that actor twice, and a new retry cycle uses a new key.
+  A dispatched request whose socket or stream ends without terminal
   provider evidence is `provider_outcome_unknown`: no same-model, fallback,
   provider, local-server, or forced-final resend until custody settles.
 - [ ] A reviewed mutative wrapper must retain foreground custody until the

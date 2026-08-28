@@ -519,6 +519,89 @@ def test_review_owner_deadline_rechecked_after_prompt_persistence(
     assert actor["status"] == "not_dispatched"
 
 
+def test_coordinator_rejoins_exact_recovery_after_spent_owner_deadline(
+    tmp_path, monkeypatch,
+):
+    """The public coordinator must not launder a paid recovery as $0 dispatch."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import (
+        merge_frozen_review_reconciliation, prepare_frozen_review_reconciliation,
+    )
+    from ouroboros.review_execution import ReviewAttemptResult, ReviewRouteKind
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+
+    class RecoveringExecutor:
+        def __init__(self):
+            self.state = None
+            self.execute_calls = 0
+
+        def restore_custody(self, state):
+            self.state = state
+
+        def set_pending_invocation_checkpoint(self, _checkpoint):
+            return None
+
+        def prompt_payload(self):
+            return {"session_prompt": "review"}
+
+        def prompt_chars(self):
+            return 6
+
+        def execute(self):
+            self.execute_calls += 1
+            return ReviewAttemptResult(
+                message={"content": "[]"}, usage={}, raw_text="[]",
+            )
+
+        def failure_custody(self):
+            return dict(self.state or {})
+
+    executor = RecoveringExecutor()
+    monkeypatch.setattr(
+        "ouroboros.review_substrate._review_route_executor",
+        lambda *_args, **_kwargs: executor,
+    )
+    ctx = SimpleNamespace(
+        task_id="spent-recovery",
+        drive_root=tmp_path,
+        task_metadata={"deadline_at": "2000-01-01T00:00:00Z"},
+    )
+    prepare_frozen_review_reconciliation(ctx, SimpleNamespace(
+        triad_raw_results=[{
+            "slot_id": "slot-1", "model_id": "test/model", "status": "error",
+            "operation_id": "op-existing", "operation_state": "in_flight",
+            "late_result_pending": True, "pending_invocation_id": "inv-existing",
+        }],
+        scope_raw_result={},
+    ))
+    request = ReviewRequest(
+        surface="multi_model_review", goal="review", task_id="spent-recovery",
+        retry_key="commit_review:spent-recovery", reconcile_only=True,
+        deadline_at="2000-01-01T00:00:00Z",
+    )
+    result = run_review_request(
+        request,
+        slots=[ReviewSlot(
+            slot_id="slot-1", model="test/model",
+            route=ReviewRouteKind.AGENT_SESSION,
+        )],
+        drive_root=tmp_path,
+        usage_ctx=ctx,
+    )
+
+    actor = result.actors[0]
+    assert executor.execute_calls == 1
+    assert actor["operation_id"] == "op-existing"
+    assert actor["operation_state"] == "settled"
+    assert actor["status"] == "ok"
+    ctx._last_triad_raw_results = result.actors
+    merge_frozen_review_reconciliation(ctx)
+    row = ctx._last_triad_raw_results[0]
+    assert row["operation_state"] == "settled"
+    assert row.get("pending_invocation_id", "") == ""
+
+
 def test_durable_triad_and_scope_rows_carry_delegated_restart_identity():
     from ouroboros.tools.review import _parse_model_response
     from ouroboros.tools.review_helpers import build_scope_actor_record
@@ -643,3 +726,69 @@ def test_review_retry_rail_honors_durable_cancel_for_format_and_empty_paths(
 
     assert calls == [1]
     assert result.actors[0]["raw_text"] == raw_text
+
+
+def test_keyed_terminal_api_error_is_replayed_while_sibling_is_late(tmp_path):
+    """A settled API slot must not be bought twice while its cycle sibling settles."""
+    import threading
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import run_custodied_review_slots
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    calls = []
+    late_started = threading.Event()
+    late_finished = threading.Event()
+    release_late = threading.Event()
+    ctx = SimpleNamespace()
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="mixed-cycle",
+        retry_key="plan_review:mixed-cycle:1",
+    )
+    slots = [
+        ReviewSlot(slot_id="fast", model="test/model", route=ReviewRouteKind.API_CHAT,
+                   timeout_sec=0.2),
+        ReviewSlot(slot_id="late", model="test/model", route=ReviewRouteKind.API_CHAT,
+                   timeout_sec=0.01),
+    ]
+
+    def run_slot(slot, operation_id, _retry_state, _deadline, _checkpoint):
+        calls.append(slot.slot_id)
+        if slot.slot_id == "late":
+            late_started.set()
+            release_late.wait(1.0)
+            late_finished.set()
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error",
+            error=f"{slot.slot_id} terminal API error", operation_id=operation_id,
+            http_status=500 if slot.slot_id == "fast" else 503,
+            usage={"physical_attempt_state": "settled"},
+        )
+
+    def error_actor(slot, error, operation_id="", operation_state="settled"):
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error", error=error,
+            operation_id=operation_id, operation_state=operation_state,
+        )
+
+    args = dict(
+        request=request, slots=slots, usage_ctx=ctx, task_id=request.task_id,
+        usage_meta={}, review_usage_scope=UsageScope(drive_root=tmp_path, task_id=request.task_id),
+        run_slot=run_slot, error_actor=error_actor,
+    )
+    first = run_custodied_review_slots(**args)
+    assert {actor.slot_id: actor.operation_state for actor in first} == {
+        "fast": "settled", "late": "in_flight",
+    }
+    assert late_started.wait(1.0)
+    assert getattr(ctx, "_review_settled_attempts", {})
+    second = run_custodied_review_slots(**args)
+    assert calls == ["fast", "late"]
+    assert {actor.slot_id: actor.operation_state for actor in second} == {
+        "fast": "settled", "late": "in_flight",
+    }
+
+    release_late.set()
+    assert late_finished.wait(1.0)

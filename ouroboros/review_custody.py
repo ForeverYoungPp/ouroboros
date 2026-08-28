@@ -528,8 +528,9 @@ def _settle_review_attempt(
         explicit_retry = bool(str(getattr(request, "retry_key", "") or "").strip())
         route = getattr(slot, "route", "")
         route_value = str(getattr(route, "value", route) or "")
-        # A keyed plan/commit cycle owns one exact paid API attempt. If its
-        # logical window expired, retain its terminal actor for reconciliation.
+        # A keyed plan/commit cycle owns one exact paid API attempt. Retain a
+        # terminal API actor while the sibling cycle is still settling; otherwise
+        # a retry can buy this already-settled slot again before the wave closes.
         late_keyed_api_error = bool(
             late
             and explicit_retry
@@ -542,9 +543,22 @@ def _settle_review_attempt(
             and route_value != "agent_session"
             and not pending_invocation
         )
+        keyed_terminal_api_error = bool(
+            explicit_retry
+            and (
+                str(getattr(request, "surface", "") or "") == "plan_review"
+                or str(getattr(request, "retry_key", "") or "").startswith(
+                    "commit_review:"
+                )
+            )
+            and route_value != "agent_session"
+            and not pending_invocation
+            and str(failure_custody.get("physical_attempt_state") or "") == "settled"
+        )
         replayable = (
             actor.status in {"ok", "empty"}
             or late_keyed_api_error
+            or keyed_terminal_api_error
             or bool(failure_custody.get("delegated_run_started") and not pending_invocation)
         )
         if replayable and usage_ctx is not None and (late or explicit_retry):

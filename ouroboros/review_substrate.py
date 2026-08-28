@@ -1352,7 +1352,17 @@ class ReviewCoordinator:
         owner_deadline = str(getattr(request, "deadline_at", "") or "")
         from ouroboros.config import get_finalization_grace_sec
         from ouroboros.deadline_utils import owner_deadline_exhausted
-        if owner_deadline_exhausted(
+        # An exact delegated recovery has already crossed the paid boundary and
+        # carries both the durable invocation token and its operation id.  It is
+        # a settlement join, not a fresh dispatch, so the small custody window
+        # selected by ``run_custodied_review_slots`` must remain usable after the
+        # owner deadline.  The executor still validates the token and refuses a
+        # missing/mismatched durable record before any new POST.
+        recovery_token = str(
+            (retry_state or {}).get("pending_invocation_id") or ""
+        ).strip()
+        exact_recovery = bool(recovery_token and str(operation_id or "").strip())
+        if not exact_recovery and owner_deadline_exhausted(
             deadline_at=owner_deadline, reserve_sec=get_finalization_grace_sec(),
         ):
             return self._error_actor(
@@ -1503,6 +1513,11 @@ class ReviewCoordinator:
             except Exception:
                 response_ref = {}
             http_status = getattr(exc, "status_code", None)
+            failure_custody = dict(executor.failure_custody() or {})
+            capture = getattr(exc, "physical_attempt_capture", None)
+            capture_state = str(getattr(capture, "state", "") or "")
+            if capture_state:
+                failure_custody["physical_attempt_state"] = capture_state
             return ReviewActorRecord(
                 slot_id=slot.slot_id,
                 model=slot.model,
@@ -1512,7 +1527,7 @@ class ReviewCoordinator:
                 failure_code=str(getattr(exc, "code", "") or ""),
                 reset_at=str(getattr(exc, "reset_at", "") or ""),
                 http_status=http_status if isinstance(http_status, int) and http_status else None,
-                usage=executor.failure_custody(),
+                usage=failure_custody,
                 prompt_ref=prompt_ref,
                 response_ref=response_ref,
                 duration_sec=round(time.time() - start, 3),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from tests.test_plan_review_engine import (
@@ -69,6 +70,31 @@ def test_partial_quorum_stays_open_while_one_paid_slot_is_in_flight(harness, mon
 
     second = _call(ctx)
     assert _control(second) == {"outcome": "GREEN", "closed": True}
+
+
+def test_expired_deadline_still_reconciles_existing_paid_wave(harness, monkeypatch):
+    """An owner deadline must not strand a reviewer cycle already in flight."""
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
+    calls = []
+    _install_two_turn_substrate(monkeypatch, calls, pending_ids={"s3"})
+    ctx = harness.make_ctx()
+    ctx.task_metadata["deadline_at"] = (
+        datetime.now(timezone.utc) + timedelta(seconds=2000)
+    ).isoformat()
+
+    first = _call(ctx)
+    assert _control(first) == {"outcome": "DEGRADED", "closed": False}
+    assert _state(harness)["waves"][-1]["custody_pending"] is True
+
+    # The second envelope arrives after the task's logical deadline. It must
+    # rejoin the exact paid cycle, not return a fresh-deadline skip forever.
+    ctx.task_metadata["deadline_at"] = "2000-01-01T00:00:00+00:00"
+    second = _call(ctx)
+
+    assert _control(second) == {"outcome": "GREEN", "closed": True}
+    assert calls == [calls[0], calls[0]]
+    wave = _state(harness)["waves"][-1]
+    assert wave["custody_pending"] is False and wave["closed"] is True
 
 
 def test_resume_keeps_original_dispatched_set_when_skipped_lane_heals(harness, monkeypatch):
