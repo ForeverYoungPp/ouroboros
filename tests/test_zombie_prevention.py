@@ -183,8 +183,13 @@ def test_kill_workers_retains_pending_when_failure_result_is_not_durable(
 
     workers.kill_workers(reconcile_delegate_custody=False)
 
-    assert pending == [task]
-    assert snapshots == [("kill_workers", [task])]
+    assert [row["id"] for row in pending] == [task["id"]]
+    retry = pending[0]["_terminalization_retry"]
+    assert retry["status"] == "failed"
+    assert retry["trigger"] == "pending_pool_kill"
+    assert pending[0]["depth"] == -1
+    assert snapshots[0][0] == "kill_workers"
+    assert snapshots[0][1][0]["_terminalization_retry"] == retry
 
 
 def test_kill_workers_retains_running_custody_when_failure_result_is_not_durable(
@@ -288,8 +293,12 @@ def test_kill_workers_retains_pending_when_status_is_not_terminal(
         reconcile_delegate_custody=False,
     )
 
-    assert pending == [task]
-    assert snapshots == [("kill_workers", [task])]
+    assert [row["id"] for row in pending] == [task["id"]]
+    retry = pending[0]["_terminalization_retry"]
+    assert retry["status"] == "interrupted"
+    assert retry["trigger"] == "pending_pool_kill"
+    assert snapshots[0][0] == "kill_workers"
+    assert snapshots[0][1][0]["_terminalization_retry"] == retry
 
 
 def test_kill_workers_preserves_interrupted_pending_when_terminal_event_fails(
@@ -339,8 +348,12 @@ def test_kill_workers_preserves_interrupted_pending_when_terminal_event_fails(
         reconcile_delegate_custody=False,
     )
 
-    assert pending == [child]
-    assert snapshots == [("kill_workers", [child])]
+    assert [row["id"] for row in pending] == [child["id"]]
+    retry = pending[0]["_terminalization_retry"]
+    assert retry["status"] == "cancelled"
+    assert retry["trigger"] == "pending_parent_interrupted"
+    assert snapshots[0][0] == "kill_workers"
+    assert snapshots[0][1][0]["_terminalization_retry"] == retry
 
 
 def test_kill_workers_can_record_owner_restart_cancellation(tmp_path):

@@ -237,6 +237,7 @@ def terminalize_invalid_depth_restore(
             pathlib.Path(task.get("budget_drive_root") or drive_root),
             task_id,
             STATUS_FAILED,
+            strict_existing_dict=True,
             reason_code="invalid_task_depth",
             result=detail,
             depth=0,

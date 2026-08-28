@@ -277,6 +277,86 @@ def test_restore_failed_depth_terminalization_preserves_snapshot_order(
     assert counter["value"] == 3
 
 
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        b"{authority-is-not-json",
+        b"{}",
+        b'{"task_id":"another-task","status":"scheduled"}',
+    ],
+)
+def test_invalid_depth_restore_preserves_unreadable_result_authority(
+    tmp_path, monkeypatch,
+    malformed,
+):
+    """A malformed result must stay unreadable and keep its queue custody."""
+    from supervisor import queue
+    from ouroboros.utils import utc_now_iso
+
+    pending, running = [], {}
+    counter = {"value": 0}
+    queue.init_queue_refs(pending, running, counter)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    snapshot_path = tmp_path / "state" / "queue_snapshot.json"
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snapshot_path)
+    queue.ACCEPTANCE_FENCES.clear()
+    queue.BUDGET_ROOT_FENCES.clear()
+    queue.ADMISSION_RESERVATIONS.clear()
+
+    task_id = "restore-corrupt-authority"
+    result_path = tmp_path / "task_results" / f"{task_id}.json"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_bytes(malformed)
+    task = {
+        "id": task_id,
+        "type": "task",
+        "chat_id": 1,
+        "depth": -1,
+        "budget_drive_root": str(tmp_path),
+    }
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text(
+        json.dumps({
+            "ts": utc_now_iso(),
+            "pending": [{"id": task_id, "queue_seq": 4, "task": task}],
+            "running": [],
+            "acceptance_fences": [],
+            "budget_root_fences": [],
+        }),
+        encoding="utf-8",
+    )
+
+    assert queue.restore_pending_from_snapshot() == 0
+    assert [row["id"] for row in pending] == [task_id]
+    assert pending[0]["depth"] == -1
+    assert result_path.read_bytes() == malformed
+
+    # The retained row is retried by the live quarantine on the next tick;
+    # strict terminalization must preserve the same unreadable authority there.
+    from supervisor import state, workers
+
+    worker = SimpleNamespace(
+        wid=1,
+        busy_task_id=None,
+        reaping=False,
+        in_q=SimpleNamespace(put=lambda _row: pytest.fail("corrupt row dispatched")),
+    )
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", running)
+    monkeypatch.setattr(workers, "WORKERS", {1: worker})
+    monkeypatch.setattr(workers, "load_state", lambda: {})
+    monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_k: 100.0)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda *_a, **_k: None)
+    queue.BUDGET_ROOT_FENCES.clear()
+
+    workers.assign_tasks()
+
+    assert [row["id"] for row in pending] == [task_id]
+    assert result_path.read_bytes() == malformed
+    assert worker.busy_task_id is None
+
+
 def test_assignment_skips_unresolved_invalid_depth_without_starving_healthy_rows(
     tmp_path, monkeypatch,
 ):

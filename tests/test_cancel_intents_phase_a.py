@@ -240,7 +240,7 @@ def test_drop_cancelled_pending_consults_the_intent_projection(qenv, monkeypatch
 
     emitted: list = []
     monkeypatch.setattr(workers, "_emit_task_done_terminal",
-                        lambda task, tid, status, **kw: emitted.append((tid, status, kw)))
+                        lambda task, tid, status, **kw: emitted.append((tid, status, kw)) or True)
     monkeypatch.setattr(workers, "PENDING", qenv.q.PENDING, raising=False)
     monkeypatch.setattr(workers, "DRIVE_ROOT", qenv.drive, raising=False)
 
@@ -1174,7 +1174,7 @@ def test_drop_cancelled_pending_stamps_the_decision_and_honors_the_stored_status
 
     emitted: list = []
     monkeypatch.setattr(workers, "_emit_task_done_terminal",
-                        lambda task, tid, status, **kw: emitted.append((tid, status)))
+                        lambda task, tid, status, **kw: emitted.append((tid, status)) or True)
     monkeypatch.setattr(workers, "PENDING", qenv.q.PENDING, raising=False)
     monkeypatch.setattr(workers, "DRIVE_ROOT", qenv.drive, raising=False)
 
@@ -1202,6 +1202,123 @@ def test_drop_cancelled_pending_stamps_the_decision_and_honors_the_stored_status
     assert ("drop-decided", STATUS_CANCELLED) in emitted
 
 
+def test_drop_cancelled_pending_retains_custody_until_task_done_is_published(
+    qenv, monkeypatch,
+):
+    """A durable cancellation without task_done remains non-dispatchable."""
+    from supervisor import workers
+
+    emitted: list = []
+    publish_results = iter([False, True])
+    snapshots: list[str] = []
+
+    def publish(_task, task_id, status, **_kwargs):
+        emitted.append((task_id, status))
+        return next(publish_results)
+
+    monkeypatch.setattr(workers, "_emit_task_done_terminal", publish)
+    monkeypatch.setattr(workers, "PENDING", qenv.q.PENDING, raising=False)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", qenv.drive, raising=False)
+    monkeypatch.setattr(
+        qenv.q,
+        "persist_queue_snapshot",
+        lambda reason="": snapshots.append(reason) or True,
+    )
+    qenv.q.PENDING[:] = [{"id": "drop-event-gap", "chat_id": 1, "depth": 0}]
+    write_task_result(qenv.drive, "drop-event-gap", "scheduled")
+    ci.request_cancel(
+        qenv.drive,
+        "drop-event-gap",
+        reason="parent stopped the plan",
+        requested_by="parent7",
+    )
+
+    workers._drop_cancelled_pending()
+
+    assert [row["id"] for row in qenv.q.PENDING] == ["drop-event-gap"]
+    retry = qenv.q.PENDING[0]["_terminalization_retry"]
+    assert retry["status"] == STATUS_CANCELLED
+    assert retry["trigger"] == "pending_cancel_event"
+    assert retry["reconcile_delegate_custody"] is False
+    assert snapshots == ["pending_terminal_event_retry"]
+    stored = load_task_result(qenv.drive, "drop-event-gap")
+    assert stored["status"] == STATUS_CANCELLED
+    assert stored["parent_decision"] == "cancelled"
+    assert ci.active_intent(qenv.drive, "drop-event-gap") is None
+
+    assert workers._retry_terminalization_pending() == (["drop-event-gap"], [])
+    assert qenv.q.PENDING == []
+    assert emitted == [
+        ("drop-event-gap", STATUS_CANCELLED),
+        ("drop-event-gap", STATUS_CANCELLED),
+    ]
+
+
+@pytest.mark.parametrize("settle_failure", ["returns_none", "raises"])
+def test_drop_cancelled_pending_releases_a_failed_intent_claim(
+    qenv, monkeypatch, settle_failure,
+):
+    """A failed intent settle cannot strand a claim while event custody retries."""
+    from supervisor import workers
+
+    emitted: list[tuple[str, str]] = []
+    publish_results = iter([False, True])
+
+    def publish(_task, task_id, status, **_kwargs):
+        emitted.append((task_id, status))
+        return next(publish_results)
+
+    monkeypatch.setattr(workers, "_emit_task_done_terminal", publish)
+    monkeypatch.setattr(workers, "PENDING", qenv.q.PENDING, raising=False)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", qenv.drive, raising=False)
+    monkeypatch.setattr(
+        qenv.q,
+        "persist_queue_snapshot",
+        lambda reason="": True,
+    )
+
+    def failed_settle(*_args, **_kwargs):
+        if settle_failure == "raises":
+            raise OSError("intent projection temporarily unavailable")
+        return None
+
+    released: list[dict] = []
+    real_release = ci.release_claim
+
+    def release_claim(root, task_id, **kwargs):
+        released.append({"task_id": task_id, **kwargs})
+        return real_release(root, task_id, **kwargs)
+
+    monkeypatch.setattr(ci, "settle_intent", failed_settle)
+    monkeypatch.setattr(ci, "release_claim", release_claim)
+
+    task_id = "drop-settle-gap"
+    qenv.q.PENDING[:] = [{"id": task_id, "chat_id": 1, "depth": 0}]
+    write_task_result(qenv.drive, task_id, "scheduled")
+    ci.request_cancel(qenv.drive, task_id, reason="parent stopped the plan")
+
+    workers._drop_cancelled_pending()
+
+    assert released and released[0]["task_id"] == task_id
+    intent = ci.active_intent(qenv.drive, task_id)
+    assert intent is not None
+    assert intent["state"] == ci.INTENT_REQUESTED
+    assert "claim_owner" not in intent
+    assert intent["last_error"] == "pending-drop intent settlement failed"
+    retry = qenv.q.PENDING[0]["_terminalization_retry"]
+    assert retry["status"] == STATUS_CANCELLED
+    assert retry["trigger"] == "pending_cancel_event"
+    assert retry["reconcile_delegate_custody"] is False
+
+    # The durable result/event retry is independent of the re-opened intent;
+    # the watchdog can settle that intent on its next custody pass.
+    assert workers._retry_terminalization_pending() == ([task_id], [])
+    assert qenv.q.PENDING == []
+    assert emitted == [(task_id, STATUS_CANCELLED), (task_id, STATUS_CANCELLED)]
+    intent = ci.active_intent(qenv.drive, task_id)
+    assert intent is not None and intent["state"] == ci.INTENT_REQUESTED
+
+
 def test_drop_cancelled_pending_leaves_the_intent_open_when_the_write_fails(
     qenv, monkeypatch,
 ):
@@ -1210,7 +1327,7 @@ def test_drop_cancelled_pending_leaves_the_intent_open_when_the_write_fails(
 
     emitted: list = []
     monkeypatch.setattr(workers, "_emit_task_done_terminal",
-                        lambda task, tid, status, **kw: emitted.append((tid, status)))
+                        lambda task, tid, status, **kw: emitted.append((tid, status)) or True)
     monkeypatch.setattr(workers, "PENDING", qenv.q.PENDING, raising=False)
     monkeypatch.setattr(workers, "DRIVE_ROOT", qenv.drive, raising=False)
     monkeypatch.setattr(
@@ -1606,7 +1723,7 @@ def test_drop_cancelled_pending_yields_to_a_live_claim_owner(qenv, monkeypatch):
 
     emitted: list = []
     monkeypatch.setattr(workers, "_emit_task_done_terminal",
-                        lambda task, tid, status, **kw: emitted.append((tid, status)))
+                        lambda task, tid, status, **kw: emitted.append((tid, status)) or True)
     monkeypatch.setattr(workers, "PENDING", qenv.q.PENDING, raising=False)
     monkeypatch.setattr(workers, "DRIVE_ROOT", qenv.drive, raising=False)
     qenv.q.PENDING[:] = [{"id": "drop-owned", "chat_id": 1}]

@@ -724,7 +724,9 @@ def write_task_result(
     results_drive_root: Any,
     task_id: str,
     status: str,
-    *, _field_projector: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = None,
+    *,
+    _field_projector: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = None,
+    strict_existing_dict: bool = False,
     **fields: Any,
 ) -> Dict[str, Any]:
     """Merge-write a task result under a per-file lock.
@@ -738,11 +740,24 @@ def write_task_result(
     replace an already-completed result (discarding a result is a separate
     explicit parent action, ``discard_child_result``). ``_field_projector`` is the narrow
     custody seam for fields and status that depend on CURRENT; it runs under this same lock.
+    ``strict_existing_dict`` is reserved for authority-preserving callers:
+    when true, an existing malformed/non-object or wrong-schema result raises
+    instead of being treated as an empty row and overwritten.  The check
+    happens inside the same file lock as the merge, so a malformed authority
+    cannot slip in between a caller's probe and its terminal write.
     """
     path = task_result_path(results_drive_root, task_id)
     explicit_ts = str(fields.pop("ts", "") or "")
 
     def _merge(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if strict_existing_dict and existing and (
+            str(existing.get("task_id") or "") != str(task_id)
+            or not isinstance(existing.get("status"), str)
+            or not str(existing.get("status") or "").strip()
+        ):
+            raise ValueError(
+                f"task result authority is unreadable or invalid: {path}"
+            )
         projected_fields = _field_projector(existing, {**fields, "status": status}) if _field_projector else dict(fields)
         projected_status = str(projected_fields.pop("status", status))
         # Monotonic lifecycle: no stale mirror may overwrite a terminal outcome.
@@ -767,7 +782,12 @@ def write_task_result(
     # lifecycle authority; accepting stale state here makes the winner of a
     # completed-vs-cancelled race depend on timing rather than the monotonic
     # reducer above. Callers may retry or fail their transition explicitly.
-    return update_json_locked(path, _merge)
+    return update_json_locked(
+        path,
+        _merge,
+        strict_existing_dict=bool(strict_existing_dict),
+        reject_existing_empty_dict=bool(strict_existing_dict),
+    )
 
 
 # --------------------------------------------------------------------------- plan review state

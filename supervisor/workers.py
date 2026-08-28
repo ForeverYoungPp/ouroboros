@@ -1837,6 +1837,7 @@ def _write_failure_result(
             DRIVE_ROOT,
             task_id,
             final_status,
+            strict_existing_dict=True,
             result=reason,
             reason_code="worker_terminal_failure" if final_status == STATUS_FAILED else str(final_status or ""),
             outcome_axes=terminal_outcome_axes(
@@ -1989,6 +1990,23 @@ def _make_terminalization_retry_task(
         "reconcile_delegate_custody": bool(reconcile_delegate_custody),
     }
     return retry
+
+
+def _retain_terminalization_retry_task(
+    task: Dict[str, Any], task_id: str, *, reason: str, status: str, trigger: str,
+    reconcile_delegate_custody: bool = True,
+) -> Dict[str, Any]:
+    """Return retry custody without replacing an existing stronger marker."""
+    if isinstance(task, dict) and isinstance(task.get(_TERMINALIZATION_RETRY_FIELD), dict):
+        return dict(task)
+    return _make_terminalization_retry_task(
+        task,
+        task_id,
+        reason=reason,
+        status=status,
+        trigger=trigger,
+        reconcile_delegate_custody=reconcile_delegate_custody,
+    )
 
 
 def _audit_delegate_terminal_custody(
@@ -2470,6 +2488,22 @@ def kill_workers(
                     reconcile_delegate_custody=reconcile_delegate_custody,
                 )
 
+            def _retain_killed_pending(
+                task: Dict[str, Any], *, reason: str, status: str, trigger: str,
+            ) -> Dict[str, Any]:
+                """Keep failed pending settlement in non-dispatchable custody."""
+                task_id = str(task.get("id") or "").strip()
+                retry = _retain_terminalization_retry_task(
+                    task,
+                    task_id,
+                    reason=reason,
+                    status=status,
+                    trigger=trigger,
+                    reconcile_delegate_custody=reconcile_delegate_custody,
+                )
+                terminalization_retry_ids.append(task_id or "<missing-task-id>")
+                return retry
+
             for task_id in list(RUNNING):
                 meta = RUNNING.get(task_id) or {}
                 task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
@@ -2549,7 +2583,12 @@ def kill_workers(
                         ):
                             drained_ids.append(tid)
                         else:
-                            kept.append(task)
+                            kept.append(_retain_killed_pending(
+                                task,
+                                reason="Parent task was interrupted before this child started.",
+                                status="cancelled",
+                                trigger="pending_parent_interrupted",
+                            ))
                         continue
                     kept.append(task)
                 PENDING[:] = kept
@@ -2562,15 +2601,20 @@ def kill_workers(
                     if _settle_killed_pending(
                         task,
                         reason=result_reason,
-                        status=terminal_status,
+                        status=done_status,
                         trigger="pending_pool_kill",
                     ):
                         drained_ids.append(tid)
                     else:
                         # No id, failed durable write, or failed notification:
-                        # retain the exact row so the final snapshot and a later
-                        # supervisor pass can retry custody.
-                        PENDING.append(task)
+                        # retain non-dispatchable custody so a later supervisor
+                        # pass can retry without starting the task.
+                        PENDING.append(_retain_killed_pending(
+                            task,
+                            reason=result_reason,
+                            status=done_status,
+                            trigger="pending_pool_kill",
+                        ))
             if orphaned_ids or drained_ids or terminalization_retry_ids:
                 append_jsonl(
                     DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -2751,6 +2795,7 @@ def _drop_cancelled_pending() -> None:
             return {}
     survivors: List[Dict[str, Any]] = []
     dropped: List[str] = []
+    terminalization_retry_ids: List[str] = []
     for t in PENDING:
         tid = str(t.get("id") or "")
         status = ""
@@ -2812,6 +2857,7 @@ def _drop_cancelled_pending() -> None:
                 dropped.append(tid)
                 continue
             stored_status = str(stored.get("status") or STATUS_CANCELLED)
+            intent_settled = not (settle_intent is not None and tid in intents)
             if settle_intent is not None and tid in intents:
                 try:
                     # Fenced by this drop's OWN claim: a settle from a claim that
@@ -2821,7 +2867,7 @@ def _drop_cancelled_pending() -> None:
                     # inside the settle (GR3-1: the cascade postcondition is its
                     # only settle owner) and this drop's claim is auto-released
                     # in the same write so the watchdog re-feeds the cascade.
-                    settle_intent(
+                    settled_row = settle_intent(
                         DRIVE_ROOT, tid,
                         outcome="cancelled" if stored_status == STATUS_CANCELLED else "already_settled",
                         detail=("dropped before assignment" if stored_status == STATUS_CANCELLED
@@ -2829,24 +2875,84 @@ def _drop_cancelled_pending() -> None:
                         expected_generation=claim.get("generation"),
                         request_id=str(claim.get("request_id") or ""),
                     )
+                    intent_settled = settled_row is not None
                 except Exception:
+                    intent_settled = False
                     log.debug("Failed to settle cancel intent for pending %s", tid, exc_info=True)
+                if not intent_settled and release_claim is not None and claim.get("request_id"):
+                    try:
+                        release_claim(
+                            DRIVE_ROOT, tid,
+                            error="pending-drop intent settlement failed",
+                            expected_generation=claim.get("generation"),
+                            request_id=str(claim.get("request_id") or ""),
+                        )
+                    except Exception:
+                        log.debug("pending-drop intent release failed for %s", tid, exc_info=True)
             # The STORED status, never a blanket "cancelled": the monotonic guard
             # refuses our write when the task settled on its own, and the card
             # must resolve to what actually happened (completion wins).
-            _emit_task_done_terminal(t, tid, stored_status, cost_fields=cost_fields)
-            dropped.append(tid)
+            try:
+                event_published = bool(
+                    _emit_task_done_terminal(
+                        t, tid, stored_status, cost_fields=cost_fields,
+                    )
+                )
+            except Exception:
+                event_published = False
+                log.warning(
+                    "Failed to emit terminal task_done for cancelled pending task %s",
+                    tid,
+                    exc_info=True,
+                )
+            if event_published:
+                dropped.append(tid)
+            else:
+                # The durable result already settled, but publication did not.
+                # Keep a non-dispatchable marker so completion/cancellation
+                # precedence stays intact while task_done is retried.
+                survivors.append(_retain_terminalization_retry_task(
+                    t,
+                    tid,
+                    reason="Cancelled pending task has an unpublished terminal event.",
+                    status=STATUS_CANCELLED,
+                    trigger="pending_cancel_event",
+                    reconcile_delegate_custody=False,
+                ))
+                terminalization_retry_ids.append(tid)
             continue
         if status in _TRULY_TERMINAL_STATUSES and _terminalization_retry_spec(t) is None:
             dropped.append(tid)
             continue
         survivors.append(t)
-    if dropped:
+    if dropped or terminalization_retry_ids:
         PENDING[:] = survivors
+    if dropped:
         append_jsonl(
             DRIVE_ROOT / "logs" / "supervisor.jsonl",
             {"ts": utc_now_iso(), "type": "pending_cancelled_dropped", "task_ids": dropped},
         )
+    if terminalization_retry_ids:
+        append_jsonl(
+            DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "pending_terminal_event_retry",
+                "task_ids": terminalization_retry_ids,
+            },
+        )
+        try:
+            from supervisor import queue
+
+            if not queue.persist_queue_snapshot(reason="pending_terminal_event_retry"):
+                log.warning(
+                    "Failed to persist pending terminal-event retry custody",
+                )
+        except Exception:
+            log.warning(
+                "Failed to persist pending terminal-event retry custody",
+                exc_info=True,
+            )
 
 
 def _normalize_pending_task_depth(task: Dict[str, Any]) -> str:
@@ -2882,6 +2988,7 @@ def _terminalize_invalid_pending_depth(task: Dict[str, Any], detail: str) -> boo
             result_root,
             task_id,
             STATUS_FAILED,
+            strict_existing_dict=True,
             reason_code="invalid_task_depth",
             result=f"Task was not dispatched: {str(detail)[:500]}",
             # Keep the rejected value as evidence, never as an executable depth.
