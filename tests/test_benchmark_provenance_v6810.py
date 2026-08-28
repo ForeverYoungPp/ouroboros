@@ -18,7 +18,10 @@ import json
 import pathlib
 import re
 
-from devtools.benchmarks.common.manifests import provider_credential_disclosure
+from devtools.benchmarks.common.manifests import (
+    benchmark_run_manifest,
+    provider_credential_disclosure,
+)
 from devtools.benchmarks.common.result_index import (
     RUNTIME_TRUNCATION_REASON_CODES,
     runtime_terminal_disclosure,
@@ -280,6 +283,49 @@ def test_manifest_discloses_runtime_injected_credentials_separately(tmp_path):
     blob = json.dumps(disclosure)
     assert "runtime-router-value" not in blob
     assert "runtime-openai-value" not in blob
+
+
+def test_initial_manifest_uses_disabled_claude_projection(tmp_path, monkeypatch):
+    """A pre-application/refusal manifest must not reintroduce the Claude default projection."""
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps({
+            "OUROBOROS_MODEL": "openrouter/model",
+            "CLAUDE_CODE_MODEL": "",
+            "CLAUDE_AGENT_SDK_MODEL": "",
+            "OPENROUTER_API_KEY": "",
+        }),
+        encoding="utf-8",
+    )
+    import devtools.benchmarks.common.manifests as manifests
+
+    monkeypatch.setattr(
+        manifests,
+        "repo_provenance",
+        lambda _path: {
+            "repo_dir": str(tmp_path / "repo"),
+            "git_available": True,
+            "status_available": True,
+            "dirty": False,
+            "head": "a" * 40,
+            "version": "",
+            "describe": "a" * 40,
+        },
+    )
+    manifest = benchmark_run_manifest(
+        benchmark="cybergym",
+        run_root=tmp_path / "run",
+        repo_dir=tmp_path / "repo",
+        requested_task_ids=["arvo:1"],
+        metadata={
+            "settings_path": settings_path,
+            "include_claude_sdk_defaults": False,
+        },
+    )
+    disclosure = manifest["provider_credentials"]
+    assert disclosure["providers"] == {"openrouter": ["openrouter/model"]}
+    assert disclosure["planned_keys"] == ["OPENROUTER_API_KEY"]
+    assert "CLAUDE_CODE_MODEL" not in disclosure["declared_model_slots"]
 
 
 def test_isolated_credential_grants_reports_the_file_not_the_intent():

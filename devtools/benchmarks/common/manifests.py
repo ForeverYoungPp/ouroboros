@@ -619,6 +619,9 @@ def benchmark_run_manifest(
     meta_settings_path = meta.get("settings_path")
     if meta_settings_path is not None:
         meta_settings_path = pathlib.Path(meta_settings_path)
+    include_claude_sdk_defaults = meta.get("include_claude_sdk_defaults", True)
+    if not isinstance(include_claude_sdk_defaults, bool):
+        raise ValueError("include_claude_sdk_defaults metadata must be a boolean")
     source = repo_provenance(repo_dir)
     gate = _seed_gate(source, require_clean=require_clean, expect=str(expect or ""))
     manifest: dict[str, Any] = {
@@ -636,7 +639,10 @@ def benchmark_run_manifest(
         "isolated_data_root": str(meta.get("isolated_data_root") or ""),
         "output_paths": meta.get("output_paths") or {},
         "model_slots": model_slot_snapshot(meta_settings_path),
-        "provider_credentials": provider_credential_disclosure(meta_settings_path),
+        "provider_credentials": provider_credential_disclosure(
+            meta_settings_path,
+            include_claude_sdk_defaults=include_claude_sdk_defaults,
+        ),
         "source": source,
         "seed_gate": gate,
         "extra": meta.get("extra") or {},

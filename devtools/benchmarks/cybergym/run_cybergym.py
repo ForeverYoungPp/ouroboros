@@ -1022,6 +1022,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             official_command=_generator_template(args),
             isolated_data_root=str(args.data_root or ""),
             settings_path=settings_path,
+            # The applied CyberGym profile explicitly disables both Claude SDK
+            # transports; keep even the pre-admission/refusal disclosure truthful.
+            include_claude_sdk_defaults=False,
             output_paths={
                 "run_root": str(out_root),
                 "manifest": str(manifest_path),
