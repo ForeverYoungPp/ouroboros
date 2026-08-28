@@ -506,7 +506,19 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
             state = normalizedState(currentStatus);
         }
     }
-    const currentVerdict = text(currentAttempt?.verdict || currentStatus);
+    let currentVerdict = text(currentAttempt?.verdict || currentStatus);
+    // The typed Plan gate releases an open wave when the task-wide deadline
+    // rail degrades. Preserve the wave as semantic review evidence, but mirror
+    // the backend precedence in the group header. A closed wave remains final.
+    if (
+        currentAttempt
+        && typedCurrentStatus === 'rail_degraded'
+        && waves[currentWaveIndex]?.closed !== true
+    ) {
+        state = normalizedState(typedCurrentStatus);
+        activeCount = 0;
+        currentVerdict = typedCurrentStatus;
+    }
     return {
         id: `plan:${owner}`,
         surface: 'plan',

@@ -95,7 +95,7 @@ def test_task_bound_skill_review_refs_fold_before_human_quota(tmp_path):
     )
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
 
-    messages = _run(tmp_path, {"n_human": "3", "n_progress": "0"})
+    messages = _run(tmp_path, {"n_human": "3", "n_progress": "1"})
 
     assert [m["text"] for m in messages if m.get("role") != "system"] == [
         "human-0", "human-1", "human-2",
@@ -118,8 +118,64 @@ def test_task_bound_skill_review_refs_fold_before_human_quota(tmp_path):
     assert [attempt["job_id"] for attempt in group["attempts"]] == [
         f"job-{i}" for i in range(6)
     ]
-    review_only = _run(tmp_path, {"n_human": "0", "n_progress": "0"})
+    review_only = _run(tmp_path, {"n_human": "0", "n_progress": "1"})
     assert [m["system_type"] for m in review_only] == ["skill_review"]
+    zero_window = _run_full(tmp_path, {"n_human": "0", "n_progress": "0"})
+    assert not [
+        row for row in zero_window["messages"]
+        if row.get("system_type") == "skill_review"
+    ]
+    assert zero_window["window"] == {"complete": False, "truncated_by": ["quota"]}
+
+
+def test_task_bound_skill_review_owners_use_the_progress_window(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    rows = []
+    for owner_index in range(5):
+        for skill in ("alpha", "beta"):
+            for attempt_index in range(2):
+                rows.append({
+                    "ts": f"2026-08-24T00:{owner_index:02d}:{attempt_index:02d}Z",
+                    "direction": "system",
+                    "type": "skill_review",
+                    "chat_id": 1,
+                    "text": f"{skill}-{owner_index}-{attempt_index}",
+                    "task_id": f"child-{owner_index}",
+                    "root_task_id": f"owner-{owner_index}",
+                    "presentation_owner_task_id": f"owner-{owner_index}",
+                    "group_id": f"task:owner-{owner_index}:{skill}",
+                    "skill": skill,
+                    "status": "clean",
+                    "job_id": f"job-{owner_index}-{skill}-{attempt_index}",
+                })
+    (logs / "chat.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+
+    payload = _run_full(tmp_path, {"n_progress": "2"})
+    review_rows = [
+        row for row in payload["messages"]
+        if row.get("system_type") == "skill_review"
+    ]
+    assert {row["presentation_owner_task_id"] for row in review_rows} == {
+        "owner-3", "owner-4",
+    }
+    assert len(review_rows) == 4
+    assert all(len(row["review_group"]["attempts"]) == 2 for row in review_rows)
+    assert payload["window"] == {"complete": False, "truncated_by": ["quota"]}
+
+    expanded = _run_full(tmp_path, {"n_progress": "10"})
+    expanded_reviews = [
+        row for row in expanded["messages"]
+        if row.get("system_type") == "skill_review"
+    ]
+    assert len(expanded_reviews) == 10
+    assert {row["presentation_owner_task_id"] for row in expanded_reviews} == {
+        f"owner-{index}" for index in range(5)
+    }
+    assert expanded["window"] == {"complete": True, "truncated_by": []}
 
 
 def test_legacy_skill_refs_fold_only_with_safe_root_and_skill(tmp_path):
@@ -154,7 +210,7 @@ def test_legacy_skill_refs_fold_only_with_safe_root_and_skill(tmp_path):
     )
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
 
-    messages = _run(tmp_path, {"n_human": "10", "n_progress": "0"})
+    messages = _run(tmp_path, {"n_human": "10", "n_progress": "1"})
 
     groups = [m["review_group"] for m in messages if m.get("review_group")]
     assert len(groups) == 1
@@ -196,7 +252,7 @@ def test_skill_review_group_dedupes_only_nonempty_job_ids_latest_wins(tmp_path):
     )
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
 
-    messages = _run(tmp_path, {"n_human": "10", "n_progress": "0"})
+    messages = _run(tmp_path, {"n_human": "10", "n_progress": "1"})
 
     review_rows = [m for m in messages if m.get("system_type") == "skill_review"]
     assert len(review_rows) == 1

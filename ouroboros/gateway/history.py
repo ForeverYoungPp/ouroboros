@@ -1137,7 +1137,7 @@ def _apply_window_quotas(
     """Quota slicing, origin fallback, and the lineage floor/cap (perf2 P3).
 
     Returns ``(messages, result_cache, human_rows_dropped, lineage_truncated,
-    review_references_truncated, floor, active_children)`` for annotation and
+    review_overlays_truncated, floor, active_children)`` for annotation and
     window metadata (the last two feed the chat-final lineage strip in
     ``_annotate_terminal_task_truth``).
     """
@@ -1165,6 +1165,32 @@ def _apply_window_quotas(
         )
 
     folded_reviews = [m for m in combined if _is_folded_review(m)]
+    # Folded Skill groups are a task-detail hydration overlay, just like Plan
+    # references below: neither consumes human/telemetry rows, but distinct
+    # owners still fan out to one lazy task-detail read each. Bound owners to
+    # the requested progress window while retaining every group/attempt for a
+    # selected owner. Load older already expands this one shared window.
+    folded_review_owner_latest: Dict[str, str] = {}
+    for message in folded_reviews:
+        owner = str(message.get("presentation_owner_task_id") or "")
+        if not owner:
+            continue
+        latest = str(message.get("ts") or "")
+        if latest >= folded_review_owner_latest.get(owner, ""):
+            folded_review_owner_latest[owner] = latest
+    folded_review_owners = sorted(
+        folded_review_owner_latest,
+        key=lambda owner: (folded_review_owner_latest[owner], owner),
+    )
+    folded_reviews_truncated = len(folded_review_owners) > n_progress
+    selected_folded_review_owners = set(
+        folded_review_owners[-n_progress:] if n_progress > 0 else []
+    )
+    folded_reviews = [
+        message for message in folded_reviews
+        if str(message.get("presentation_owner_task_id") or "")
+        in selected_folded_review_owners
+    ]
     human = sorted(
         (
             m for m in combined
@@ -1211,6 +1237,9 @@ def _apply_window_quotas(
         review_references_by_owner.values(), key=lambda m: m.get("ts", ""),
     )
     review_references_truncated = len(review_references) > n_progress
+    review_overlays_truncated = (
+        folded_reviews_truncated or review_references_truncated
+    )
     review_references = review_references[-n_progress:] if n_progress > 0 else []
     other = [
         m for m in progress
@@ -1263,7 +1292,7 @@ def _apply_window_quotas(
     )
     return (
         messages, result_cache, human_rows_dropped, lineage_truncated,
-        review_references_truncated, floor, active_children,
+        review_overlays_truncated, floor, active_children,
     )
 
 
@@ -1277,7 +1306,7 @@ def _window_metadata(
     archive_dir: pathlib.Path,
     human_rows_dropped: bool,
     lineage_truncated: bool,
-    review_references_truncated: bool,
+    review_overlays_truncated: bool,
     stream_gaps: Optional[Dict[str, set[str]]] = None,
 ) -> Dict[str, Any]:
     """Additive window metadata (perf2 P3; frozen contract extended explicitly).
@@ -1298,7 +1327,7 @@ def _window_metadata(
             progress_quota_rows, n_progress, _live_log_size(progress_path),
             _archive_segment_count(archive_dir, "progress"),
         ),
-        "quota" if review_references_truncated else None,
+        "quota" if review_overlays_truncated else None,
         "lineage_cap" if lineage_truncated else None,
     ):
         if cause and cause not in truncated_by:
@@ -1350,7 +1379,7 @@ def _assemble_history_response(
         combined.append(lifecycle_row)
     (
         messages, result_cache, human_rows_dropped, lineage_truncated,
-        review_references_truncated, floor, active_children,
+        review_overlays_truncated, floor, active_children,
     ) = _apply_window_quotas(
         data_dir, thread_id, project_chat_ids, combined, n_human, n_progress
     )
@@ -1389,7 +1418,7 @@ def _assemble_history_response(
         "window": _window_metadata(
             chat_quota_rows, progress_quota_rows, n_human, n_progress,
             chat_path, progress_path, archive_dir,
-            human_rows_dropped, lineage_truncated, review_references_truncated,
+            human_rows_dropped, lineage_truncated, review_overlays_truncated,
             {"chat": chat_gaps, "progress": progress_gaps},
         ),
     }

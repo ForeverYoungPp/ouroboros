@@ -573,8 +573,11 @@ state write also appends one empty typed `review_reference` to the existing
 bounded progress-history rail before publishing its live invalidation; the task
 result remains the only Plan authority. Reconnect retains the latest reference
 per owner, then independently limits references to the requested progress
-window without consuming visible telemetry quota; omitted references use the
-existing `quota` truncation reason and Load older expansion. Duplicate Skill
+window without consuming visible telemetry quota. Folded Skill groups likewise
+retain every group and attempt for only the newest distinct owners within that
+window, so one history rebuild cannot fan out unbounded task-detail reads.
+Omitted review overlays use the existing `quota` truncation reason and Load
+older expansion. Duplicate Skill
 lifecycle acknowledgements remain typed `lifecycle_pointer` rows with no task
 id, so they can never become lineage. They
 enrich an existing exact owner card, or render once as subdued non-task progress

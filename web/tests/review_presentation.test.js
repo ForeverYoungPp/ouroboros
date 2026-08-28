@@ -336,6 +336,66 @@ test('a fresh Plan attempt replaces matching compact history until its full wave
     assert.equal(terminal.attempts.at(-1).compact, false);
 });
 
+test('typed Plan rail degradation controls the group without erasing open wave evidence', () => {
+    const fingerprint = 'a'.repeat(64);
+    const openWave = {
+        request_fingerprint: fingerprint,
+        cycle_index: 1,
+        aggregate: 'REVIEW_REQUIRED',
+        closed: false,
+    };
+    const openDetail = {
+        task_id: 'root',
+        plan_review_state: {
+            current_attempt: { fingerprint, status: 'open' },
+            waves: [openWave],
+        },
+    };
+    const initial = planReviewGroupFromTaskDetail(openDetail);
+    assert.equal(initial.verdict, 'REVIEW_REQUIRED');
+    assert.equal(initial.attempts.length, 1);
+
+    const degradedDetail = {
+        task_id: 'root',
+        plan_review_state: {
+            current_attempt: {
+                fingerprint,
+                status: 'rail_degraded',
+                reason: 'plan_task_deadline',
+            },
+            waves: [openWave],
+        },
+    };
+    const degraded = planReviewGroupFromTaskDetail(degradedDetail);
+    assert.equal(degraded.state, 'terminal');
+    assert.equal(degraded.activeCount, 0);
+    assert.equal(degraded.verdict, 'rail_degraded');
+    assert.equal(degraded.summary, 'plan_task_deadline');
+    assert.equal(degraded.attempts.length, 1);
+    assert.equal(degraded.attempts[0].id, fingerprint);
+    assert.equal(degraded.attempts[0].verdict, 'REVIEW_REQUIRED');
+
+    const store = new Map();
+    mergeReviewGroup(store, initial);
+    mergeReviewGroup(store, degraded);
+    const merged = store.get('plan:root');
+    assert.equal(merged.state, 'terminal');
+    assert.equal(merged.activeCount, 0);
+    assert.equal(merged.verdict, 'rail_degraded');
+    assert.equal(merged.summary, 'plan_task_deadline');
+    assert.equal(merged.attempts.length, 1);
+    assert.equal(merged.attempts[0].verdict, 'REVIEW_REQUIRED');
+
+    const closed = planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            current_attempt: { fingerprint, status: 'rail_degraded' },
+            waves: [{ ...openWave, aggregate: 'GREEN', closed: true }],
+        },
+    });
+    assert.equal(closed.verdict, 'GREEN');
+});
+
 test('a newer canonical Plan attempt retires prior unmatched liveness', () => {
     const settledFingerprint = 'a'.repeat(64);
     const firstOpen = 'b'.repeat(64);
