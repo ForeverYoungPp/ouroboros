@@ -962,7 +962,7 @@ def test_restore_failed_depth_terminalization_mutates_pending_under_queue_lock(
     assert pending[0]["id"] == task["id"]
     assert pending[0]["depth"] == -1
     assert "priority" not in pending[0]
-    assert "_queue_seq" not in pending[0]
+    assert pending[0]["_queue_seq"] == 1
 
     admitted = queue.enqueue_task({"id": "healthy-after-bad-order", "type": "task", "depth": 0})
     assert admitted["id"] == "healthy-after-bad-order"
@@ -1015,7 +1015,7 @@ def test_restore_failed_depth_terminalization_sanitizes_nonfinite_queue_metadata
     assert pending[0]["id"] == task["id"]
     assert pending[0]["depth"] == -1
     assert "priority" not in pending[0]
-    assert "_queue_seq" not in pending[0]
+    assert pending[0]["_queue_seq"] == 1
     admitted = queue.enqueue_task({"id": "healthy-after-nonfinite-order", "type": "task", "depth": 0})
     assert admitted["id"] == "healthy-after-nonfinite-order"
 

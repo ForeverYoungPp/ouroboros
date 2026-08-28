@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import uuid
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ouroboros.depth_evidence import parse_task_depth
 from ouroboros.task_results import (
@@ -15,6 +15,7 @@ from ouroboros.task_results import (
     load_task_result,
     write_task_result,
 )
+from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +26,63 @@ def coerce_queue_order(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def prefer_terminalization_retry_rows(tasks: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """Drop ordinary duplicate rows when a snapshot carries shutdown custody."""
+    marker_ids = {
+        str(task.get("id") or "").strip()
+        for task in tasks
+        if isinstance(task.get("_terminalization_retry"), dict)
+        and str(task.get("id") or "").strip()
+    }
+    if not marker_ids:
+        return tasks
+    seen_markers: set[str] = set()
+    preferred: list[Dict[str, Any]] = []
+    for task in tasks:
+        task_id = str(task.get("id") or "").strip()
+        marker = isinstance(task.get("_terminalization_retry"), dict)
+        if task_id in marker_ids and not marker:
+            continue
+        if marker and task_id in seen_markers:
+            continue
+        if marker:
+            seen_markers.add(task_id)
+        preferred.append(task)
+    return preferred
+
+
+def restore_terminalization_retry(
+    task: Dict[str, Any], *, pending: list[Dict[str, Any]],
+    running: Dict[str, Any], queue_seq_counter_ref: Dict[str, Any],
+    sort_pending: Any,
+) -> Optional[Dict[str, Any]]:
+    """Restore a shutdown-custody row before ordinary admission gates."""
+    if not isinstance(task.get("_terminalization_retry"), dict):
+        return None
+    restored = dict(task)
+    task_id = str(restored.get("id") or "").strip()
+    if task_id and (
+        task_id in running
+        or any(isinstance(row, dict) and str(row.get("id") or "") == task_id for row in pending)
+    ):
+        restored["_admission_blocked"] = "duplicate_task_id"
+        return restored
+    try:
+        queue_seq_counter_ref["value"] = int(queue_seq_counter_ref.get("value", 0) or 0) + 1
+    except (TypeError, ValueError, OverflowError):
+        queue_seq_counter_ref["value"] = 1
+    restored["priority"] = coerce_queue_order(restored.get("priority"))
+    try:
+        restored["_attempt"] = max(1, int(restored.get("_attempt") or 1))
+    except (TypeError, ValueError, OverflowError):
+        restored["_attempt"] = 1
+    restored["_queue_seq"] = queue_seq_counter_ref["value"]
+    restored.setdefault("queued_at", utc_now_iso())
+    pending.append(restored)
+    sort_pending()
+    return restored
 
 
 def parse_schedule_task_depth(
@@ -171,6 +229,7 @@ def terminalize_invalid_depth_restore(
 def restore_invalid_depth_admission(
     task: Dict[str, Any], admitted: Dict[str, Any], *, drive_root: pathlib.Path,
     pending: list[Dict[str, Any]], blocked: list[str], terminalized: list[str],
+    queue_seq_counter_ref: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Handle one blocked snapshot admission and retain invalid rows on failure.
 
@@ -207,6 +266,23 @@ def restore_invalid_depth_admission(
                 pending_task[field] = int(raw_value)
             except (TypeError, ValueError, OverflowError):
                 pending_task.pop(field, None)
+        if queue_seq_counter_ref is not None:
+            # Snapshot sequence lives on the outer row, while this helper receives
+            # only the nested task. Allocate a fresh sequence in encounter order
+            # so a retained malformed row cannot sort ahead of restored rows.
+            try:
+                current = int(queue_seq_counter_ref.get("value", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                current = 0
+            highest_seen = current
+            for row in pending:
+                try:
+                    highest_seen = max(highest_seen, abs(int(row.get("_queue_seq"))))
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    continue
+            sequence = highest_seen + 1
+            queue_seq_counter_ref["value"] = sequence
+            pending_task["_queue_seq"] = sequence
         pending.append(pending_task)
 
 

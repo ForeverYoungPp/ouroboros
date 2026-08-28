@@ -187,6 +187,79 @@ def test_kill_workers_retains_pending_when_failure_result_is_not_durable(
     assert snapshots == [("kill_workers", [task])]
 
 
+def test_kill_workers_retains_running_custody_when_failure_result_is_not_durable(
+    tmp_path, monkeypatch,
+):
+    import supervisor.workers as workers
+    import supervisor.queue as queue
+
+    task = {"id": "running-write-fails", "type": "task", "depth": 0}
+    pending = []
+    running = {
+        task["id"]: {"task": task, "worker_id": 0},
+    }
+    snapshots = []
+    emitted = []
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "RUNNING", running)
+    monkeypatch.setattr(queue, "RUNNING", running)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(
+        queue,
+        "persist_queue_snapshot",
+        lambda reason="": snapshots.append(
+            (reason, [dict(row) for row in queue.PENDING], dict(queue.RUNNING))
+        ),
+    )
+    monkeypatch.setattr(
+        workers,
+        "_write_failure_result",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(
+        workers,
+        "_emit_task_done_terminal",
+        lambda *args, **kwargs: emitted.append((args, kwargs)) or True,
+    )
+
+    workers.kill_workers(reconcile_delegate_custody=False)
+
+    assert running == {}
+    assert [row["id"] for row in pending] == [task["id"]]
+    retry = pending[0]["_terminalization_retry"]
+    assert retry["status"] == "failed"
+    assert retry["trigger"] == "worker_pool_kill"
+    assert "disk full" not in retry["reason"]
+    assert emitted == []
+    assert snapshots[-1][0] == "kill_workers"
+    assert snapshots[-1][1][0]["_terminalization_retry"] == retry
+    assert snapshots[-1][2] == {}
+
+    writes = []
+    monkeypatch.setattr(
+        workers,
+        "_audit_delegate_terminal_custody",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        workers,
+        "_write_failure_result",
+        lambda task_id, **kwargs: writes.append((task_id, kwargs)) or "failed",
+    )
+    monkeypatch.setattr(
+        workers,
+        "_emit_task_done_terminal",
+        lambda task_row, task_id, status: emitted.append((task_id, status)) or True,
+    )
+    assert workers._retry_terminalization_pending() == ([task["id"]], [])
+    assert pending == []
+    assert writes[0][0] == task["id"]
+    assert emitted == [(task["id"], "failed")]
+
+
 def test_kill_workers_retains_pending_when_status_is_not_terminal(
     tmp_path, monkeypatch,
 ):

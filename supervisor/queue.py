@@ -140,12 +140,9 @@ ADMISSION_RESERVATIONS: Dict[str, str] = {}
 _queue_lock = threading.RLock()
 _last_skill_schedule_sync: float = 0.0
 _SKILL_SCHEDULE_SYNC_INTERVAL_SEC: float = 60.0
-
 from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
-    coerce_queue_order, reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission,
-    reserve_task_admission,
+    coerce_queue_order, prefer_terminalization_retry_rows, reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission, restore_terminalization_retry, reserve_task_admission,
 )
-
 # Variant A off-loop worker reaper lives in supervisor/task_reaper.py (module size); re-export
 # the thin names the enforce path and tests use — monkeypatching these queue names still works.
 from supervisor.task_reaper import (  # noqa: E402,F401 — re-exported for enforce path + tests
@@ -238,6 +235,9 @@ def enqueue_task(
                 if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
                     ADMISSION_RESERVATIONS.pop(task_id, None)
                 return t
+        retry = restore_terminalization_retry(t, pending=PENDING, running=RUNNING, queue_seq_counter_ref=QUEUE_SEQ_COUNTER_REF, sort_pending=sort_pending) if restoring_snapshot else None
+        if retry:
+            return retry
         if reject_invalid_task_depth(t, reservations=ADMISSION_RESERVATIONS, admission_token=admission_token):
             return t
         if require_worker_pool:
@@ -774,8 +774,7 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 "metadata": t.get("metadata"), "origin_message_ref": t.get("origin_message_ref"),
                 "origin_message_text": t.get("origin_message_text"), "_attempt": t.get("_attempt"),
                 "review_reason": t.get("review_reason"), "review_source_task_id": t.get("review_source_task_id"),
-                "_budget_pause": t.get("_budget_pause"),
-                "budget_resumed_at": t.get("budget_resumed_at"),
+                "_budget_pause": t.get("_budget_pause"), "budget_resumed_at": t.get("budget_resumed_at"), "_terminalization_retry": t.get("_terminalization_retry"),
             },
         })
     running_rows = []
@@ -850,6 +849,7 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
             for row in (snap.get("pending") or [])
             if isinstance(row, dict) and isinstance(row.get("task"), dict)
         ]
+        snapshot_pending = prefer_terminalization_retry_rows(snapshot_pending)
         fenced_roots, malformed_fences, malformed_budget_fences = restore_queue_fences(raw_fences, raw_budget_fences)
         if malformed_budget_fences:
             append_jsonl(
@@ -961,7 +961,7 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                     continue
                 admitted = enqueue_task(task, restoring_snapshot=True)
                 if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
-                    restore_invalid_depth_admission(task, admitted, drive_root=DRIVE_ROOT, pending=PENDING, blocked=blocked_restore, terminalized=invalid_depth_restore)
+                    restore_invalid_depth_admission(task, admitted, drive_root=DRIVE_ROOT, pending=PENDING, blocked=blocked_restore, terminalized=invalid_depth_restore, queue_seq_counter_ref=QUEUE_SEQ_COUNTER_REF)
                     try:
                         sort_pending()
                     except (TypeError, ValueError, OverflowError):

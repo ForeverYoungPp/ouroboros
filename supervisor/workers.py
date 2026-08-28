@@ -1944,6 +1944,170 @@ def _emit_task_done_terminal(
         return False
 
 
+_TERMINALIZATION_RETRY_FIELD = "_terminalization_retry"
+_TERMINALIZATION_RETRY_STATUSES = frozenset({"failed", "cancelled", "interrupted"})
+
+
+def _terminalization_retry_spec(task: Any) -> Optional[Dict[str, Any]]:
+    """Return the bounded retry contract carried by a non-dispatchable row."""
+    if not isinstance(task, dict):
+        return None
+    raw = task.get(_TERMINALIZATION_RETRY_FIELD)
+    if not isinstance(raw, dict):
+        return None
+    status = str(raw.get("status") or "failed").strip() or "failed"
+    return {
+        "reason": str(raw.get("reason") or "Worker shutdown terminalization was not durable.")[:2000],
+        "status": status if status in _TERMINALIZATION_RETRY_STATUSES else "failed",
+        "trigger": str(raw.get("trigger") or "terminalization_retry").strip() or "terminalization_retry",
+        "reconcile_delegate_custody": bool(raw.get("reconcile_delegate_custody", True)),
+    }
+
+
+def _make_terminalization_retry_task(
+    task: Dict[str, Any], task_id: str, *, reason: str, status: str, trigger: str,
+    reconcile_delegate_custody: bool = True,
+) -> Dict[str, Any]:
+    """Copy a killed task into durable, non-dispatchable terminalization custody."""
+    retry = dict(task) if isinstance(task, dict) else {}
+    retry["id"] = str(task_id)
+    if retry.get("chat_id") is None or retry.get("chat_id") == "":
+        # Snapshot restore requires a concrete chat identity; zero is the
+        # explicit no-chat route used by headless tasks.
+        retry["chat_id"] = 0
+    raw_attempt = retry.get("_attempt")
+    if raw_attempt is not None:
+        try:
+            retry["_attempt"] = max(1, int(raw_attempt))
+        except (TypeError, ValueError, OverflowError):
+            retry.pop("_attempt", None)
+    normalized_status = str(status or "failed").strip() or "failed"
+    retry[_TERMINALIZATION_RETRY_FIELD] = {
+        "reason": str(reason or "Worker shutdown terminalization was not durable.")[:2000],
+        "status": normalized_status if normalized_status in _TERMINALIZATION_RETRY_STATUSES else "failed",
+        "trigger": str(trigger or "terminalization_retry").strip() or "terminalization_retry",
+        "reconcile_delegate_custody": bool(reconcile_delegate_custody),
+    }
+    return retry
+
+
+def _audit_delegate_terminal_custody(
+    task_id: str, trigger: str, *, enabled: bool = True,
+) -> None:
+    """Best-effort delegated-run reconciliation before terminal publication."""
+    if not enabled:
+        return
+    try:
+        from ouroboros import delegate_terminal
+
+        audit = delegate_terminal.terminal_reconcile_task(
+            DRIVE_ROOT, task_id, trigger=trigger,
+        )
+        delegate_terminal.record_terminal_reconciliation(
+            DRIVE_ROOT, task_id, audit,
+        )
+    except Exception:
+        log.warning(
+            "Terminal delegate reconciliation failed for %s", task_id,
+            exc_info=True,
+        )
+
+
+def _terminalization_status_accepted(
+    persisted: Any, requested: str, *, allow_interrupted: bool,
+) -> bool:
+    """Accept only a durable terminal status (or the intentional interrupted marker)."""
+    from ouroboros.task_results import STATUS_INTERRUPTED, _TRULY_TERMINAL_STATUSES
+
+    persisted_status = str(persisted or "").strip()
+    requested_status = str(requested or "failed").strip() or "failed"
+    return persisted_status in _TRULY_TERMINAL_STATUSES or (
+        allow_interrupted
+        and requested_status == STATUS_INTERRUPTED
+        and persisted_status == STATUS_INTERRUPTED
+    )
+
+
+def _settle_terminalization_task(
+    task: Dict[str, Any], *, reason: str, status: str, trigger: str,
+    reconcile_delegate_custody: bool = True, allow_interrupted: bool = False,
+) -> bool:
+    """Write and publish one shutdown outcome, retaining custody on any failure."""
+    task_id = str(task.get("id") or "").strip()
+    if not task_id:
+        return False
+    requested_status = str(status or "failed").strip() or "failed"
+    try:
+        _audit_delegate_terminal_custody(
+            task_id, trigger, enabled=reconcile_delegate_custody,
+        )
+        persisted = _write_failure_result(
+            task_id, reason=reason, status=requested_status,
+        )
+    except Exception:
+        log.warning(
+            "Failed to write failure result for task %s", task_id,
+            exc_info=True,
+        )
+        return False
+    if not _terminalization_status_accepted(
+        persisted, requested_status, allow_interrupted=allow_interrupted,
+    ):
+        log.warning(
+            "Task %s did not reach an acceptable shutdown status during kill: %r",
+            task_id,
+            persisted,
+        )
+        return False
+    try:
+        if not _emit_task_done_terminal(task, task_id, str(persisted).strip()):
+            log.warning("Failed to emit terminal task_done for %s", task_id)
+            return False
+    except Exception:
+        log.warning("Failed to emit terminal task_done for %s", task_id, exc_info=True)
+        return False
+    return True
+
+
+def _retry_terminalization_pending() -> Tuple[List[str], List[str]]:
+    """Retry retained shutdown rows before any assignment can inspect them."""
+    terminalized: List[str] = []
+    unresolved: List[str] = []
+    survivors: List[Dict[str, Any]] = []
+    for task in list(PENDING):
+        spec = _terminalization_retry_spec(task)
+        if spec is None:
+            survivors.append(task)
+            continue
+        task_id = str(task.get("id") or "").strip() if isinstance(task, dict) else ""
+        if not task_id or not _settle_terminalization_task(
+            task,
+            reason=spec["reason"],
+            status=spec["status"],
+            trigger=spec["trigger"],
+            reconcile_delegate_custody=spec["reconcile_delegate_custody"],
+            allow_interrupted=True,
+        ):
+            unresolved.append(task_id or "<missing-task-id>")
+            survivors.append(task)
+        else:
+            terminalized.append(task_id)
+    PENDING[:] = survivors
+    return terminalized, unresolved
+
+
+def _retry_terminalization_pending_for_assignment(queue: Any) -> None:
+    """Settle shutdown custody and persist the changed queue before assignment."""
+    terminalized, unresolved = _retry_terminalization_pending()
+    if terminalized:
+        queue.persist_queue_snapshot(reason="terminalization_retry_settled")
+    if unresolved:
+        log.error(
+            "Shutdown terminalization rows remain deferred; continuing assignment for other tasks: %s",
+            ", ".join(unresolved),
+        )
+
+
 def _log_worker_crash(wid: int, drive_root: pathlib.Path, phase: str, exc: Exception, tb: str) -> None:
     """Best-effort worker-side crash logging."""
     import os as _os
@@ -2265,6 +2429,7 @@ def kill_workers(
         WORKERS.clear()
         orphaned_ids = []
         drained_ids = []
+        terminalization_retry_ids = []
         try:
             done_status = terminal_status or "failed"
             preserve_running = set(preserve_running_task_ids or ())
@@ -2275,63 +2440,17 @@ def kill_workers(
                 if isinstance(meta, dict) and task_id not in preserve_running
             }
 
-            def _audit_delegate_terminal(task_id: str, trigger: str) -> None:
-                if not reconcile_delegate_custody:
-                    return
-                try:
-                    from ouroboros import delegate_terminal
-
-                    audit = delegate_terminal.terminal_reconcile_task(
-                        DRIVE_ROOT, task_id, trigger=trigger,
-                    )
-                    delegate_terminal.record_terminal_reconciliation(
-                        DRIVE_ROOT, task_id, audit,
-                    )
-                except Exception:
-                    log.warning(
-                        "Terminal delegate reconciliation failed for %s", task_id,
-                        exc_info=True,
-                    )
-
             def _settle_killed_pending(
                 task: Dict[str, Any], *, reason: str, status: str, trigger: str,
             ) -> bool:
                 """Return true only after pending custody is durably terminal."""
-                task_id = str(task.get("id") or "").strip()
-                if not task_id:
-                    return False
-                try:
-                    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES
-
-                    _audit_delegate_terminal(task_id, trigger)
-                    persisted = _write_failure_result(
-                        task_id, reason=reason, status=status,
-                    )
-                except Exception:
-                    log.warning(
-                        "Failed to write failure result for pending task %s",
-                        task_id,
-                        exc_info=True,
-                    )
-                    return False
-                if str(persisted or "").strip() not in _TRULY_TERMINAL_STATUSES:
-                    log.warning(
-                        "Pending task %s did not reach terminal status during kill: %r",
-                        task_id,
-                        persisted,
-                    )
-                    return False
-                try:
-                    return bool(
-                        _emit_task_done_terminal(task, task_id, persisted)
-                    )
-                except Exception:
-                    log.warning(
-                        "Failed to emit terminal event for pending task %s",
-                        task_id,
-                        exc_info=True,
-                    )
-                    return False
+                return _settle_terminalization_task(
+                    task,
+                    reason=reason,
+                    status=status,
+                    trigger=trigger,
+                    reconcile_delegate_custody=reconcile_delegate_custody,
+                )
 
             for task_id in list(RUNNING):
                 meta = RUNNING.get(task_id) or {}
@@ -2354,20 +2473,46 @@ def kill_workers(
                     PENDING.insert(0, successor)
                     RUNNING.pop(str(task_id), None)
                     continue
-                try:
-                    _audit_delegate_terminal(str(task_id), "worker_pool_kill")
-                    persisted = _write_failure_result(task_id, reason=result_reason, status=terminal_status)
+                if _settle_terminalization_task(
+                    task,
+                    reason=result_reason,
+                    status=done_status,
+                    trigger="worker_pool_kill",
+                    reconcile_delegate_custody=reconcile_delegate_custody,
+                    allow_interrupted=True,
+                ):
                     if archive_service_logs:
                         try:
                             from ouroboros.tools.services import archive_task_service_logs
+
                             archive_task_service_logs(pathlib.Path(DRIVE_ROOT), str(task_id), task)
                         except Exception:
                             log.debug("Failed to archive service logs for task %s", task_id, exc_info=True)
-                except Exception:
-                    log.warning("Failed to write failure result for running task %s", task_id, exc_info=True)
-                    persisted = done_status
-                if _emit_task_done_terminal(task, str(task_id), persisted or done_status):
                     orphaned_ids.append(task_id)
+                else:
+                    # The worker is already dead, but the durable outcome or its
+                    # terminal event is not proven. Move the row to a
+                    # non-dispatchable retry custody that survives snapshot/boot.
+                    retry_task = _make_terminalization_retry_task(
+                        task,
+                        str(task_id),
+                        reason=result_reason,
+                        status=done_status,
+                        trigger="worker_pool_kill",
+                        reconcile_delegate_custody=reconcile_delegate_custody,
+                    )
+                    RUNNING.pop(str(task_id), None)
+                    replaced = False
+                    for index, row in enumerate(PENDING):
+                        if isinstance(row, dict) and str(row.get("id") or "") == str(task_id):
+                            merged = dict(row)
+                            merged.update(retry_task)
+                            PENDING[index] = merged
+                            replaced = True
+                            break
+                    if not replaced:
+                        PENDING.append(retry_task)
+                    terminalization_retry_ids.append(str(task_id))
             if preserve_pending:
                 kept = []
                 for task in PENDING:
@@ -2408,7 +2553,7 @@ def kill_workers(
                         # retain the exact row so the final snapshot and a later
                         # supervisor pass can retry custody.
                         PENDING.append(task)
-            if orphaned_ids or drained_ids:
+            if orphaned_ids or drained_ids or terminalization_retry_ids:
                 append_jsonl(
                     DRIVE_ROOT / "logs" / "supervisor.jsonl",
                     {
@@ -2416,6 +2561,7 @@ def kill_workers(
                         "type": "zombie_prevention_cleanup",
                         "orphaned_running": orphaned_ids,
                         "drained_pending": drained_ids,
+                        "terminalization_retry": terminalization_retry_ids,
                     },
                 )
         except Exception:
@@ -2764,6 +2910,10 @@ def _quarantine_invalid_pending_depths() -> tuple[list[str], list[str]]:
         task = PENDING[index]
         if not isinstance(task, dict):
             continue
+        if _terminalization_retry_spec(task) is not None:
+            # A shutdown custody row has an explicit retry contract; depth
+            # quarantine must not rewrite it before its intended outcome lands.
+            continue
         detail = _normalize_pending_task_depth(task)
         if not detail:
             continue
@@ -2847,7 +2997,10 @@ def _cancel_unauthorized_evolution(task: Dict[str, Any], reason: str) -> bool:
 
 def _invalid_depth_deferred(task: dict, deferred_ids: set[str]) -> bool:
     task_id = str(task.get("id") or "").strip()
-    return (task_id or "<missing-task-id>") in deferred_ids
+    return (
+        _terminalization_retry_spec(task) is not None
+        or (task_id or "<missing-task-id>") in deferred_ids
+    )
 
 
 def _drop_assignable_evolution_tasks(deferred_ids: set[str]) -> list[str]:
@@ -2872,6 +3025,7 @@ def assign_tasks() -> None:
         # queue.  Then quarantine every malformed depth before budget, lease, or
         # capacity filters can leave it waiting indefinitely.
         _drop_cancelled_pending()
+        _retry_terminalization_pending_for_assignment(queue)
         invalid_ids, unresolved_invalid_ids = _quarantine_invalid_pending_depths()
         unresolved_invalid_id_set = set(unresolved_invalid_ids)
 
