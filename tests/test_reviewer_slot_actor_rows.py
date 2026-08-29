@@ -184,3 +184,26 @@ def test_roster_edit_changes_next_load_only(roster_env):
     after = load_reviewer_slot_config().triad[0]
     assert before.target_id == "openai/gpt-5.6-terra"  # frozen materialization
     assert after.target_id == "openai/gpt-5.5"  # next load sees the edit
+
+
+def test_endpoint_round_trips_the_actor_reference(roster_env):
+    """GET /api/reviewer-slots returns an actor row as its subagent_id
+    REFERENCE (resolved route only as read-only disclosure) — else the next
+    UI save rewrites the reference into an inline route and the roster row
+    stops being the SSOT for that reviewer."""
+    import asyncio
+
+    from starlette.requests import Request
+
+    from ouroboros.gateway.settings import api_reviewer_slots
+
+    roster_env.setenv(REVIEWER_SLOTS_ENV, _payload(
+        [{"slot_id": "t1", "subagent_id": "api-critic"}]))
+    request = Request({"type": "http", "method": "GET", "path": "/api/reviewer-slots",
+                       "headers": [], "query_string": b""})
+    body = json.loads(asyncio.run(api_reviewer_slots(request)).body)
+    row = body["triad"][0]
+    assert row["subagent_id"] == "api-critic"
+    assert "route" not in row  # the reference IS the stored form
+    assert row["resolved_route"]["kind"] == "api_chat"
+    assert row["resolved_route"]["target_id"] == "openai/gpt-5.6-terra"

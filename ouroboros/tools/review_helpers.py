@@ -1403,31 +1403,15 @@ def build_scope_section(scope: str = "") -> str:
 
 def get_advisory_runtime_diagnostics(model: str, prompt_chars: int,
                                      touched_paths: list) -> dict:
-    """Collect best-effort advisory SDK diagnostics; never raises."""
-    diag: dict = {
+    """Best-effort advisory dispatch diagnostics; never raises. (The retired
+    Claude-SDK/CLI version probes died with that transport.)"""
+    return {
         "model": model,
         "prompt_chars": prompt_chars,
         "prompt_tokens_approx": max(1, prompt_chars // 4),
         "touched_paths": touched_paths,
         "python": sys.executable,
     }
-    try:
-        import importlib.metadata
-        diag["sdk_version"] = importlib.metadata.version("claude-agent-sdk")
-    except Exception:
-        diag["sdk_version"] = "(unavailable)"
-
-    # CLI version/path via compat resolver.
-    try:
-        from ouroboros.platform_layer import resolve_claude_runtime
-        rt = resolve_claude_runtime()
-        diag["cli_version"] = getattr(rt, "cli_version", "") or "(unavailable)"
-        diag["cli_path"] = getattr(rt, "cli_path", "") or "(unavailable)"
-    except Exception:
-        diag["cli_version"] = "(unavailable)"
-        diag["cli_path"] = "(unavailable)"
-
-    return diag
 
 
 def check_worktree_readiness(
@@ -1570,16 +1554,13 @@ def _run_review_preflight_tests(
         return f"⚠️ Unexpected error running tests: {exc}"
 
 
-def format_advisory_sdk_error(prefix: str, result_error: str, stderr_tail: str,
-                               session_id: str, diag: dict) -> str:
-    """Format advisory SDK diagnostics with the ADVISORY_ERROR sentinel."""
+def format_advisory_error(prefix: str, result_error: str, stderr_tail: str,
+                          session_id: str, diag: dict) -> str:
+    """Format advisory delivery diagnostics with the ADVISORY_ERROR sentinel."""
     lines = [
         f"⚠️ ADVISORY_ERROR: {prefix}",
         f"  error          : {result_error}",
         f"  model          : {diag.get('model', '?')}",
-        f"  sdk_version    : {diag.get('sdk_version', '?')}",
-        f"  cli_version    : {diag.get('cli_version', '?')}",
-        f"  cli_path       : {diag.get('cli_path', '?')}",
         f"  python         : {diag.get('python', '?')}",
         f"  prompt_chars   : {diag.get('prompt_chars', '?')}",
         f"  prompt_tokens  : ~{diag.get('prompt_tokens_approx', '?')}",

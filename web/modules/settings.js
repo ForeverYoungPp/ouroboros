@@ -2,7 +2,7 @@ import { refreshModelCatalog } from './settings_catalog.js';
 import { bindEffortSegments, syncEffortSegments } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
 import { applyMcpSettings, collectMcpSettings, initMcpSettings } from './mcp_settings.js';
-import { collectReviewerSlots, initReviewerSlots, reloadReviewerSlots } from './reviewer_slots.js';
+import { adoptSubagentRoster, collectReviewerSlots, initReviewerSlots, reloadReviewerSlots } from './reviewer_slots.js';
 import {
     applySubagentsSettings,
     availableSubagentsPreviewPayload,
@@ -29,8 +29,6 @@ let setupContract = {};
 const INPUT_FIELDS = [
     ['s-openai-base-url', 'OPENAI_BASE_URL'], ['s-openai-compatible-base-url', 'OPENAI_COMPATIBLE_BASE_URL'], ['s-cloudru-base-url', 'CLOUDRU_FOUNDATION_MODELS_BASE_URL'],
     ['s-gigachat-scope', 'GIGACHAT_SCOPE'], ['s-gigachat-user', 'GIGACHAT_USER'], ['s-gigachat-base-url', 'GIGACHAT_BASE_URL'], ['s-gigachat-verify-ssl', 'GIGACHAT_VERIFY_SSL_CERTS'],
-    // 6.4 (D10): the Claude Code model picker is gone with claude_code_edit;
-    // CLAUDE_CODE_MODEL stays a backend setting for the api-route advisory.
     ['s-minimax-region', 'MINIMAX_REGION'],
     ['s-server-host', 'OUROBOROS_SERVER_HOST', '127.0.0.1'],
     // 6.1: OUROBOROS_REVIEW_MODELS / OUROBOROS_SCOPE_REVIEW_MODELS are no
@@ -389,10 +387,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         })
         .catch(() => { /* about version is best-effort */ });
     let currentSettings = {};
-    let claudeCodePollStarted = false;
     let extensionRefreshPending = false;
-    // Runtime errors must surface even before ANTHROPIC_API_KEY is configured.
-    let claudeRuntimeHasError = false;
     let settingsLoaded = false;
     let settingsBaseline = '';
     let settingsDirty = false;
@@ -411,33 +406,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         ),
     });
     initHarnessAccounts();
-
-    function anthropicKeyConfigured() {
-        const input = byId('s-anthropic');
-        if (!input) return Boolean(String(currentSettings.ANTHROPIC_API_KEY || '').trim());
-        if (input.dataset.forceClear === '1') return false;
-        const liveValue = String(input.value || '').trim();
-        if (liveValue) return true;
-        return Boolean(String(currentSettings.ANTHROPIC_API_KEY || '').trim());
-    }
-
-    function shouldShowClaudeRuntimeCard() {
-        return anthropicKeyConfigured() || claudeRuntimeHasError;
-    }
-
-    function renderClaudeCodeUi() {
-        const panel = byId('settings-claude-code-panel');
-        const note = byId('settings-claude-code-copy');
-        const button = byId('btn-claude-code-install');
-        const visible = shouldShowClaudeRuntimeCard();
-        if (panel) panel.hidden = !visible;
-        if (note) note.hidden = !visible;
-        if (!visible) return;
-        if (button && button.dataset.busy !== '1' && button.dataset.ready !== '1') {
-            button.disabled = false;
-            button.textContent = 'Repair Runtime';
-        }
-    }
 
     function syncSettingsLoadState() {
         const saveBtn = byId('btn-save-settings');
@@ -538,49 +506,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         setStatus('', 'ok');
     }
 
-    function applyClaudeCodeStatus(payload = {}) {
-        const button = byId('btn-claude-code-install');
-        const status = byId('settings-claude-code-status');
-        const ready = Boolean(payload.ready);
-        const installed = Boolean(payload.installed);
-        const busy = Boolean(payload.busy);
-        const error = String(payload.error || '').trim();
-        // Backend error state controls visibility without an API key.
-        claudeRuntimeHasError = Boolean(error);
-        const message = String(payload.message || '').trim()
-            || (ready ? 'Claude runtime ready.' : (installed ? 'Claude runtime available but not ready.' : 'Claude runtime not available.'));
-        const tone = ready ? 'ok' : (error ? 'error' : (installed ? 'muted' : 'error'));
-        if (status) {
-            setInlineStatus(status, message, tone);
-        }
-        if (button) {
-            button.dataset.busy = busy ? '1' : '0';
-            button.dataset.ready = ready ? '1' : '0';
-            button.dataset.installed = installed ? '1' : '0';
-            setButtonBusy(button, busy);
-            button.textContent = busy ? 'Repairing...' : (ready ? 'Runtime OK' : 'Repair Runtime');
-        }
-        renderClaudeCodeUi();
-    }
-
-    async function refreshClaudeCodeStatus() {
-        // Poll even without API key; backend separates no_api_key from errors.
-        try {
-            const resp = await apiFetch('/api/claude-code/status', { cache: 'no-store' });
-            const data = await resp.json().catch(() => ({}));
-            if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-            applyClaudeCodeStatus(data);
-        } catch (error) {
-            applyClaudeCodeStatus({
-                installed: false,
-                ready: false,
-                busy: false,
-                error: String(error?.message || error || ''),
-                message: `Claude runtime status check failed: ${String(error?.message || error || '')}`,
-            });
-        }
-    }
-
     function syncAutoGrantBridgeState() {
         const hasBridge = Boolean(window.pywebview?.api?.request_auto_grant_reviewed_skills_change);
         const checkbox = byId('s-auto-grant-reviewed-skills');
@@ -591,15 +516,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 ? 'Requires native confirmation. Applies only after a fresh executable skill review and only to manifest-declared grants for that exact content hash.'
                 : 'Uses the owner endpoint. Applies only after a fresh executable skill review and only to manifest-declared grants for that exact content hash.';
         }
-    }
-
-    function startClaudeCodePolling() {
-        if (claudeCodePollStarted) return;
-        claudeCodePollStarted = true;
-        refreshClaudeCodeStatus();
-        setInterval(() => {
-            refreshClaudeCodeStatus();
-        }, 3000);
     }
 
     function applySettings(s) {
@@ -636,6 +552,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             ({ true: 'on', false: 'off' }[rawMutative] || (runtimeMode === 'light' ? 'auto' : 'on'));
         // The actor list lives next to it in Agents → Available subagents.
         applySubagentsSettings(s);
+        // The Review-lanes «Configured subagent» selects reference the SAME
+        // roster; adopt it from the same loaded document.
+        adoptSubagentRoster(s);
         // Post-task evolution: one owner-facing selector maps to enable + cadence.
         const evoEnabled =
             ({ true: 'on', '1': 'on', on: 'on', false: 'off', '0': 'off', off: 'off' }[
@@ -749,10 +668,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         armCleanBaselineOnStatusSettle();
         closeSettingsModelPickers();
         _renderNetworkHint(data._meta);
-        renderClaudeCodeUi();
         markSettingsDirty = updateSettingsDirtyState;
         syncSettingsLoadState();
-        startClaudeCodePolling();
     }
 
     async function reloadSettingsWithFeedback() {
@@ -1047,14 +964,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
     }
 
-    byId('s-anthropic')?.addEventListener('input', () => {
-        renderClaudeCodeUi();
-        if (anthropicKeyConfigured()) {
-            startClaudeCodePolling();
-            refreshClaudeCodeStatus();
-        }
-    });
-
     page.addEventListener('input', updateSettingsDirtyState);
     page.addEventListener('change', updateSettingsDirtyState);
     page.addEventListener('click', (event) => {
@@ -1193,15 +1102,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
     });
 
-    page.addEventListener('click', (event) => {
-        if (event.target.closest('.secret-clear[data-target="s-anthropic"]')) {
-            queueMicrotask(() => {
-                renderClaudeCodeUi();
-                refreshClaudeCodeStatus();
-            });
-        }
-    });
-
     // Provider readiness probe: one short model request against the card draft.
     page.querySelector('[data-settings-panel="providers"]')?.addEventListener('click', async (event) => {
         const button = event.target instanceof Element ? event.target.closest('[data-provider-test]') : null;
@@ -1269,33 +1169,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 if (status) setInlineStatus(status, '', 'muted');
                 break;
             }
-        }
-    });
-
-    byId('btn-claude-code-install')?.addEventListener('click', async () => {
-        applyClaudeCodeStatus({
-            installed: false,
-            ready: false,
-            busy: true,
-            message: 'Repairing Claude runtime...',
-            error: '',
-        });
-        try {
-            const resp = await apiFetch('/api/claude-code/install', { method: 'POST' });
-            const data = await resp.json().catch(() => ({}));
-            if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-            applyClaudeCodeStatus(data);
-            setStatus(data.repaired ? 'Claude runtime repaired' : 'Claude runtime up to date', 'ok');
-        } catch (error) {
-            const message = String(error?.message || error || '');
-            applyClaudeCodeStatus({
-                installed: false,
-                ready: false,
-                busy: false,
-                error: message,
-                message: `Claude runtime repair failed: ${message}`,
-            });
-            setStatus('Claude runtime repair failed', 'warn');
         }
     });
 

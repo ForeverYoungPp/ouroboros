@@ -897,11 +897,6 @@ def _prepare_applied_settings(
         "OUROBOROS_WEBSEARCH_MODEL": model,
         "OUROBOROS_SCOPE_REVIEW_MODELS": model,
         "OUROBOROS_SCOPE_REVIEW_MODEL": model,
-        # These are Claude Agent SDK transport names, not routed model slots. Keep
-        # them explicitly empty so a parent process cannot resurrect the optional
-        # advisory transport in an applied CyberGym snapshot.
-        "CLAUDE_CODE_MODEL": "",
-        "CLAUDE_AGENT_SDK_MODEL": "",
         # One routed reviewer is the explicit single-model campaign contract.
         # Keeping the legacy projection in sync prevents a stale three-row
         # value from shadowing the structured panel in older consumers.

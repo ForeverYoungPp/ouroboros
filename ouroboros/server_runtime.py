@@ -212,7 +212,6 @@ def _refresh_retired_model_defaults(settings: dict) -> tuple[dict, list[str]]:
         "OUROBOROS_MODEL_HEAVY",
         "OUROBOROS_MODEL_LIGHT",
         "OUROBOROS_MODEL_FALLBACKS",
-        "CLAUDE_CODE_MODEL",
         "OUROBOROS_SCOPE_REVIEW_MODEL",
     ]
     for key in keys:

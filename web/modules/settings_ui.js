@@ -144,17 +144,10 @@ const PROVIDER_CARDS = [
         note: 'Use model values like <code>gigachat::GigaChat-2-Max</code> in the Models tab to route directly through GigaChat. Authenticate with either an Authorization Key (OAuth, scope <code>GIGACHAT_API_PERS</code>, <code>GIGACHAT_API_B2B</code>, or <code>GIGACHAT_API_CORP</code>) or User + Password.',
     },
     {
-        id: 'anthropic', title: 'Anthropic', icon: '/static/providers/anthropic.png', hint: 'Direct runtime plus Claude tooling',
+        id: 'anthropic', title: 'Anthropic', icon: '/static/providers/anthropic.png', hint: 'Direct Anthropic API access',
         fields: [{ id: 's-anthropic', settingKey: 'ANTHROPIC_API_KEY', label: 'Anthropic API Key', placeholder: 'sk-ant-...' }],
         testProvider: 'anthropic', testInputs: { 's-anthropic': 'ANTHROPIC_API_KEY' },
-        note: 'Use model values like <code>anthropic::claude-sonnet-5</code> in the Models tab to route models directly through Anthropic. Claude tooling still reuses this key.',
-        extra: `
-            <div class="settings-action-row" id="settings-claude-code-panel" hidden>
-                <span id="settings-claude-code-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true">Checking Claude runtime...</span>
-                <button type="button" class="btn btn-default" id="btn-claude-code-install">Repair Runtime</button>
-            </div>
-            <div class="settings-inline-note" id="settings-claude-code-copy" hidden>Claude runtime powers the advisory pre-review on the API route. It is managed automatically by the app.</div>
-        `,
+        note: 'Use model values like <code>anthropic::claude-sonnet-5</code> in the Models tab to route models directly through Anthropic.',
     },
 ];
 
@@ -180,7 +173,7 @@ function providerSettingsCard(spec) {
         icon: spec.icon,
         hint: spec.hint,
         open: spec.open,
-        body: `<div class="form-row">${fields}</div>${test}${spec.note ? `<div class="settings-inline-note">${spec.note}</div>` : ''}${spec.extra || ''}`,
+        body: `<div class="form-row">${fields}</div>${test}${spec.note ? `<div class="settings-inline-note">${spec.note}</div>` : ''}`,
     });
 }
 

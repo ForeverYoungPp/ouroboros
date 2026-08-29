@@ -12,7 +12,6 @@
   "USE_LOCAL_LIGHT": false,
   "USE_LOCAL_FALLBACK": false,
   "USE_LOCAL_CONSCIOUSNESS": false,
-  "CLAUDE_CODE_MODEL": "",
   "OUROBOROS_WEBSEARCH_MODEL": "anthropic/claude-sonnet-4.6",
   "OUROBOROS_REVIEW_MODELS": "anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.6",
   "OUROBOROS_SCOPE_REVIEW_MODELS": "anthropic/claude-sonnet-4.6",

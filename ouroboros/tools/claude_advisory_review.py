@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import pathlib
 import re
 import subprocess
@@ -54,7 +53,7 @@ from ouroboros.tools.review_helpers import (
     REVIEW_SEVERITY_THRESHOLDS,
     REVIEW_THOROUGHNESS_BLOCK,
     get_advisory_runtime_diagnostics as _get_runtime_diagnostics,
-    format_advisory_sdk_error as _format_advisory_error,
+    format_advisory_error as _format_advisory_error,
     load_governance_doc,
     normalize_reviewer_obligation_id,
     strip_obligation_suffix,
@@ -596,7 +595,7 @@ def _check_expected_items(items: list, expected_items: Optional[List[str]]) -> t
     # occurrence BEFORE the contract comparison. Single-row items keep their
     # multiplicity, so a genuine duplicate of e.g. permissions_honesty still warns.
     # Without this, a valid multi-bug advisory falsely triggered duplicates=/count=
-    # contract warnings and got marked advisory_sdk_suspect_result.
+    # contract warnings and got marked advisory_suspect_result.
     collapsed: List[str] = []
     seen_severity: set[str] = set()
     for item in actual:
@@ -1011,35 +1010,6 @@ def _advisory_session_deltas(facts: dict) -> List[dict]:
     return deltas
 
 
-def _advisory_sdk_budget(ctx: ToolContext, active_scope, drive_root, repo_dir) -> Optional[float]:
-    """Remaining budget headroom for the SDK route's hard kill (api route only;
-    the delegated route's bound is the nanny's time cap)."""
-    from ouroboros.usage_accounting import usage_projection
-
-    budget_root = pathlib.Path(
-        drive_root
-        or getattr(ctx, "budget_drive_root", "")
-        or getattr(active_scope, "drive_root", "")
-        or getattr(ctx, "drive_root", "") or repo_dir
-    )
-    root_id = str(
-        (getattr(ctx, "task_metadata", {}) or {}).get("root_task_id")
-        or getattr(active_scope, "root_task_id", "")
-        or getattr(ctx, "task_id", "")
-        or ""
-    )
-    caps: List[float] = []
-    global_limit = getattr(active_scope, "global_limit_usd", None)
-    root_limit = getattr(active_scope, "root_limit_usd", None)
-    if global_limit is not None:
-        global_projection = usage_projection(budget_root, global_limit_usd=float(global_limit))
-        caps.append(max(0.0, float(global_limit) - float(global_projection.get("accounted_usd") or 0.0)))
-    if root_id and root_limit is not None:
-        root_projection = usage_projection(budget_root, root_task_id=root_id)
-        caps.append(max(0.0, float(root_limit) - float(root_projection.get("accounted_usd") or 0.0)))
-    return min(caps) if caps else None
-
-
 def _advisory_review_diff(
     repo_dir: pathlib.Path, ctx: ToolContext, paths: Optional[List[str]]
 ) -> tuple:
@@ -1406,9 +1376,8 @@ def _run_claude_advisory(
         return size_skip
 
     log.info(
-        "Advisory SDK call: model=%s prompt_chars=%d touched=%s sdk=%s cli=%s",
+        "Advisory dispatch: model=%s prompt_chars=%d touched=%s",
         diag["model"], diag["prompt_chars"], diag["touched_paths"],
-        diag["sdk_version"], diag["cli_version"],
     )
 
     try:
@@ -1452,62 +1421,33 @@ def _run_claude_advisory(
             if skip is not None:
                 return skip
             err_msg = _format_advisory_error(
-                prefix="SDK/CLI returned failure",
+                prefix="Advisory delivery returned failure",
                 result_error=result.error,
                 stderr_tail=result.stderr_tail,
                 session_id=result.session_id,
                 diag=diag,
             )
-            log.error("Advisory SDK failure:\n%s", err_msg)
+            log.error("Advisory delivery failure:\n%s", err_msg)
             _note_meta_error(ctx, meta, err_msg)
             return [], err_msg, model, prompt_chars
 
         raw_text = str(result.result_text or "")
 
-        if result.cost_usd > 0:
-            emit_review_usage(
-                ctx,
-                model=model,
-                cost_usd=result.cost_usd,
-                usage=result.usage or {},
-                source="advisory_sdk",
-                provider="anthropic",
-                session_id=meta.get("session_id", ""),
-                prompt_chars=prompt_chars,
-            )
-
-        prompt_tokens = int((result.usage or {}).get("prompt_tokens", 0) or 0)
-        completion_tokens = int((result.usage or {}).get("completion_tokens", 0) or 0)
-        cached_tokens = int((result.usage or {}).get("cached_tokens", 0) or 0)
-        cache_write_tokens = int((result.usage or {}).get("cache_write_tokens", 0) or 0)
-        if result.cost_usd > 0 and not any((
-            prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens,
-        )):
-            emit_review_event(ctx, {
-                "type": "advisory_sdk_suspect_result",
-                "model": model,
-                "session_id": meta.get("session_id", ""),
-                "prompt_chars": prompt_chars,
-                "cost_usd": float(result.cost_usd or 0),
-                "reason": "paid advisory SDK result had zero normalized token usage",
-                "review_surface": review_surface,
-            })
-
-        if raw_text.strip() in {"", "(no output)"} and result.cost_usd > 0:
+        if raw_text.strip() in {"", "(no output)"}:
             err_msg = _format_advisory_error(
-                prefix="SDK returned paid empty output",
+                prefix="Advisory returned empty output",
                 result_error="success=True but result_text was empty",
                 stderr_tail=getattr(result, "stderr_tail", "") or "",
                 session_id=meta.get("session_id", ""),
                 diag=diag,
             )
             emit_review_event(ctx, {
-                "type": "advisory_sdk_suspect_result",
+                "type": "advisory_suspect_result",
                 "model": model,
                 "session_id": meta.get("session_id", ""),
                 "prompt_chars": prompt_chars,
                 "cost_usd": float(result.cost_usd or 0),
-                "reason": "paid advisory SDK result had empty output",
+                "reason": "advisory result had empty output",
                 "review_surface": review_surface,
             })
             _note_meta_error(ctx, meta, err_msg)
@@ -1523,14 +1463,14 @@ def _run_claude_advisory(
         contract_error, contract_warning = _check_expected_items(items, expected_items)
         if contract_error:
             err_msg = _format_advisory_error(
-                prefix="SDK returned malformed checklist",
+                prefix="Advisory returned malformed checklist",
                 result_error=contract_error,
                 stderr_tail=getattr(result, "stderr_tail", "") or "",
                 session_id=meta.get("session_id", ""),
                 diag=diag,
             )
             emit_review_event(ctx, {
-                "type": "advisory_sdk_suspect_result",
+                "type": "advisory_suspect_result",
                 "model": model,
                 "session_id": meta.get("session_id", ""),
                 "prompt_chars": prompt_chars,
@@ -2263,7 +2203,7 @@ def _handle_advisory_pre_review(
     advisory_meta = dict(getattr(ctx, "_last_claude_advisory_meta", {}) or {})
     advisory_session_id = str(advisory_meta.get("session_id") or "")
 
-    # SDK/CLI errors.
+    # Delivery errors.
     if raw_result.startswith("⚠️ ADVISORY_ERROR"):
         _persist_preflight_record(
             ctx=ctx,

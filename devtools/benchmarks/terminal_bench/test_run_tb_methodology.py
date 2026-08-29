@@ -143,7 +143,6 @@ def test_apply_all_model_sets_forwarded_slots(monkeypatch):
         "google/gemini-3.5-flash"
     ]
     assert reviewers["advisory"]["enabled"] is False
-    assert os.environ["CLAUDE_CODE_MODEL"] == ""
     assert all(os.environ[key] == "false" for key in (
         "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
         "USE_LOCAL_CONSCIOUSNESS",
@@ -313,18 +312,16 @@ def test_metadata_omits_web_search_when_web_disabled(monkeypatch):
     assert not any("web_search" in r for r in roles_off.values())
 
 
-def test_metadata_declares_claude_code_and_dedupes_in_single_model(monkeypatch):
+def test_metadata_never_declares_the_retired_claude_code_role(monkeypatch):
+    """The Claude-SDK transport (claude_code_edit) is retired: a stale
+    CLAUDE_CODE_MODEL in the operator env must not add a metadata role."""
     monkeypatch.delenv("OUROBOROS_WEBSEARCH_MODEL", raising=False)
-    # ensemble: a different Claude Code model is declared honestly
     monkeypatch.setenv("CLAUDE_CODE_MODEL", "anthropic/claude-opus-4.8")
-    roles = dict(run_tb._effective_helper_models("google/gemini-3.5-flash", "google/gemini-3.5-flash", disable_agent_web=True))
-    assert any("claude_code_edit" in r for r in roles.values())
-    # single-model: CLAUDE_CODE_MODEL == measured -> everything dedupes to the one model
-    monkeypatch.setenv("CLAUDE_CODE_MODEL", "google/gemini-3.5-flash")
     monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_MODELS", "google/gemini-3.5-flash")
-    monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "google/gemini-3.5-flash,google/gemini-3.5-flash,google/gemini-3.5-flash")
-    roles2 = dict(run_tb._effective_helper_models("google/gemini-3.5-flash", "google/gemini-3.5-flash", disable_agent_web=True))
-    assert list(roles2.keys()) == ["google/gemini-3.5-flash"]
+    monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "google/gemini-3.5-flash")
+    roles = dict(run_tb._effective_helper_models("google/gemini-3.5-flash", "google/gemini-3.5-flash", disable_agent_web=True))
+    assert not any("claude_code_edit" in r for r in roles.values())
+    assert list(roles.keys()) == ["google/gemini-3.5-flash"]
 
 
 # --- report_grade (D: low-k variance warning) -----------------------------------

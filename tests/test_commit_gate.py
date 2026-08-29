@@ -22,9 +22,6 @@ import types
 
 import pytest
 
-from tests._shared import ensure_claude_agent_sdk_mock
-
-ensure_claude_agent_sdk_mock()
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

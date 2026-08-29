@@ -51,7 +51,7 @@ def test_profile_pins_one_canonical_model_and_review_panel():
     for key in active_slots:
         assert settings[key] == MODEL, key
     assert settings["OUROBOROS_REVIEW_MODELS"] == MODEL
-    assert settings["CLAUDE_CODE_MODEL"] == ""
+    assert "CLAUDE_CODE_MODEL" not in settings  # retired transport setting
     assert "OUROBOROS_MODEL_HEAVY" not in settings
     assert "USE_LOCAL_HEAVY" not in settings
 

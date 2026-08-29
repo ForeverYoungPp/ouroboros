@@ -92,29 +92,20 @@ def test_summary_and_background_token_budgets():
     assert context_compaction._summarizer_spec()["output_budget"] == 32_768
 
 
-def test_claude_code_advisory_sdk_max_turns():
-    """The advisory path must use the shared default Claude Code turn budget (50)."""
-    import ast
-    from pathlib import Path
+def test_native_review_episode_caps_are_ssot():
+    """The bounded native inspection episode (the advisory/actor-row successor
+    of the retired Claude-SDK max-turns budget) reads its caps from config
+    SSOT settings with shipped defaults, never a hardcoded literal."""
+    from ouroboros.config import SETTINGS_DEFAULTS
+    from ouroboros.review_native_episode import (
+        review_native_max_rounds,
+        review_native_max_transcript_chars,
+    )
 
-    # Verify the constant value via AST (works without claude_agent_sdk installed)
-    gw_src = Path("ouroboros/gateways/claude_code.py").read_text(encoding="utf-8")
-    tree = ast.parse(gw_src)
-    found = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "DEFAULT_CLAUDE_CODE_MAX_TURNS":
-                    assert isinstance(node.value, ast.Constant) and node.value.value == 50, (
-                        f"DEFAULT_CLAUDE_CODE_MAX_TURNS should be 50, got {getattr(node.value, 'value', '?')}"
-                    )
-                    found = True
-    assert found, "DEFAULT_CLAUDE_CODE_MAX_TURNS not found in claude_code.py"
-
-    # Verify the surviving caller references the shared constant
-    advisory_src = Path("ouroboros/tools/claude_advisory_review.py").read_text(encoding="utf-8")
-    assert "DEFAULT_CLAUDE_CODE_MAX_TURNS" in advisory_src
-    assert "max_turns=8" not in advisory_src
+    assert SETTINGS_DEFAULTS["OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS"] == "16"
+    assert SETTINGS_DEFAULTS["OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS"] == "400000"
+    assert review_native_max_rounds() >= 1
+    assert review_native_max_transcript_chars() >= 10_000
 
 
 def test_claude_code_sdk_only_no_cli_fallback():

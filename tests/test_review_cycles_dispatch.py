@@ -24,9 +24,6 @@ import types
 
 import pytest
 
-from tests._shared import ensure_claude_agent_sdk_mock
-
-ensure_claude_agent_sdk_mock()
 
 KEY = "OUROBOROS_REVIEW_MAX_CYCLES"
 

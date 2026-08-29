@@ -449,7 +449,6 @@ _SLOTS_API_ADVISORY = json.dumps({
 
 
 def _stub_run_readonly(captured):
-    from types import SimpleNamespace
 
     def _fake(prompt, cwd, model, max_turns=None, effort="", max_budget_usd=None, **kwargs):
         captured.update({"model": model, "effort": effort})
@@ -467,7 +466,6 @@ def test_native_route_applies_the_advisory_rows_model_and_effort(tmp_path, monke
     captured = {}
 
     def _capture_native(prompt, repo_dir, ctx_, slot, model):
-        from types import SimpleNamespace
 
         captured.update({"model": model, "effort": slot.effort})
         return SimpleNamespace(
@@ -551,7 +549,6 @@ def test_native_route_empty_target_falls_back_to_the_routed_default(tmp_path, mo
     captured = {}
 
     def _capture_native(prompt, repo_dir, ctx_, slot, model):
-        from types import SimpleNamespace
 
         captured.update({"model": model, "effort": slot.effort or "low"})
         return SimpleNamespace(

@@ -21,9 +21,6 @@ import types
 
 import pytest
 
-from tests._shared import ensure_claude_agent_sdk_mock
-
-ensure_claude_agent_sdk_mock()
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 KEY = "OUROBOROS_REVIEW_MAX_CYCLES"

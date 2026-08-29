@@ -635,7 +635,7 @@ test('reviewer structured bytes keep api_chat and profile_id after extraction', 
             slot_id: 'scope_1',
             route: { kind: 'api_chat', target_id: 'openai/gpt-5.6-sol' },
         }],
-        advisory: { enabled: true, route: { kind: 'api', target_id: '' }, effort: 'low' },
+        advisory: { enabled: true, route: { kind: 'api_chat', target_id: '' }, effort: 'low' },
     });
     const parsed = JSON.parse(reviewer);
     assert.equal(parsed.triad[0].route.profile_id, 'koshak');

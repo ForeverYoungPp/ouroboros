@@ -134,9 +134,9 @@ pinned to that exact string:
 * the one API triad reviewer row; and
 * the one API scope reviewer row.
 
-`CLAUDE_CODE_MODEL` and `CLAUDE_AGENT_SDK_MODEL` are Claude-transport names,
-not alternate routed model slots.  They are explicitly empty in the applied
-snapshot; the optional advisory reviewer is disabled.  The CyberGym server
+The retired Claude-transport settings (`CLAUDE_CODE_MODEL`,
+`CLAUDE_AGENT_SDK_MODEL`) are no longer part of the applied snapshot; the
+optional advisory reviewer is disabled for run comparability.  The CyberGym server
 uses that snapshot as its environment authority and injects only the selected
 OpenRouter credential at runtime.  The manifest records the file grant and
 runtime grant separately by fingerprint, without storing the key.

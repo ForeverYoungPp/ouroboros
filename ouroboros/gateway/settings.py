@@ -876,47 +876,6 @@ async def api_acknowledge_capability(request: Request) -> JSONResponse:
         return json_exception(exc)
 
 
-def _claude_code_status_payload() -> Dict[str, Any]:
-    """Return app-managed Claude runtime status, versions, readiness, and stderr."""
-    from ouroboros.platform_layer import resolve_claude_runtime
-
-    rt = resolve_claude_runtime()
-    label = rt.status_label()
-
-    stderr_tail = ""
-    try:
-        from ouroboros.gateways.claude_code import get_last_stderr as gw_stderr
-        stderr_tail = gw_stderr(max_chars=2000)
-    except Exception:
-        pass
-
-    message_map = {
-        "ready": f"Claude runtime ready (SDK {rt.sdk_version}, CLI {rt.cli_version})",
-        "no_api_key": f"Claude runtime available (SDK {rt.sdk_version}) but ANTHROPIC_API_KEY is not set. Add it in Settings.",
-        "error": f"Claude runtime error: {rt.error}",
-        "degraded": f"Claude runtime degraded (SDK {rt.sdk_version}, CLI {'found' if rt.cli_path else 'missing'}). Try Repair.",
-        "missing": "Claude runtime not available. Use Repair in Settings or reinstall the app.",
-    }
-
-    return {
-        "status": label,
-        "installed": bool(rt.sdk_version),
-        "ready": rt.ready,
-        "busy": False,
-        "version": rt.sdk_version,
-        "cli_version": rt.cli_version,
-        "cli_path": rt.cli_path,
-        "interpreter_path": rt.interpreter_path,
-        "app_managed": rt.app_managed,
-        "legacy_detected": rt.legacy_detected,
-        "legacy_sdk_version": rt.legacy_sdk_version,
-        "api_key_set": rt.api_key_set,
-        "message": message_map.get(label, f"Claude runtime: {label}"),
-        "error": rt.error,
-        "stderr_tail": stderr_tail,
-    }
-
-
 async def api_reviewer_slots(request: Request) -> JSONResponse:
     """GET /api/reviewer-slots — the effective slot rows plus «выполняется как».
 
@@ -943,13 +902,20 @@ async def api_reviewer_slots(request: Request) -> JSONResponse:
     except ValueError as exc:
         payload["config_error"] = str(exc)
         return JSONResponse(payload)
-    # The route object must round-trip profile_id (the Q2 manual credential
-    # pin), or a save after a load silently wipes the owner's pin — reversible
-    # by design, but the round-trip must be honest.
+    # The stored form must round-trip: an actor row comes back as its
+    # subagent_id REFERENCE (with the resolved route only as read-only
+    # disclosure), and a direct row must round-trip profile_id (the Q2 manual
+    # credential pin) — else a save after a load silently rewrites the
+    # reference into an inline route or wipes the owner's pin.
     def _row(r):
         route = {"kind": r.kind, "target_id": r.target_id}
         if r.profile_id:
             route["profile_id"] = r.profile_id
+        if getattr(r, "subagent_id", ""):
+            return {
+                "slot_id": r.slot_id, "subagent_id": r.subagent_id,
+                "effort": r.effort, "resolved_route": route,
+            }
         return {"slot_id": r.slot_id, "route": route, "effort": r.effort}
 
     payload["source"] = config.source
@@ -960,9 +926,13 @@ async def api_reviewer_slots(request: Request) -> JSONResponse:
         advisory_route["profile_id"] = config.advisory.profile_id
     payload["advisory"] = {
         "enabled": config.advisory.enabled,
-        "route": advisory_route,
         "effort": config.advisory.effort,
     }
+    if getattr(config.advisory, "subagent_id", ""):
+        payload["advisory"]["subagent_id"] = config.advisory.subagent_id
+        payload["advisory"]["resolved_route"] = advisory_route
+    else:
+        payload["advisory"]["route"] = advisory_route
     return JSONResponse(payload)
 
 
@@ -1027,68 +997,6 @@ async def api_onboarding(request: Request) -> Response:
     if has_startup_ready_provider(settings):
         return Response(status_code=204)
     return HTMLResponse(build_onboarding_html(settings, host_mode="web"))
-
-
-async def api_claude_code_status(request: Request) -> JSONResponse:
-    try:
-        payload = await asyncio.to_thread(_claude_code_status_payload)
-        return JSONResponse(payload)
-    except Exception as e:
-        return JSONResponse({
-            "status": "error",
-            "installed": False,
-            "busy": False,
-            "message": "Failed to read Claude Agent SDK status.",
-            "error": str(e),
-        }, status_code=500)
-
-
-async def api_claude_code_install(request: Request) -> JSONResponse:
-    """Repair/update Claude runtime using the app-managed interpreter."""
-    try:
-        import subprocess as _sp
-
-        interpreter = sys.executable
-        try:
-            from ouroboros.platform_layer import resolve_claude_runtime
-            rt = resolve_claude_runtime()
-            if rt.interpreter_path:
-                interpreter = rt.interpreter_path
-        except Exception:
-            pass
-
-        # Import SDK baseline at call time: one SSOT, clean endpoint error if broken.
-        from ouroboros.launcher_bootstrap import _CLAUDE_SDK_BASELINE as sdk_baseline
-        from ouroboros.platform_layer import pip_install_target_args
-
-        result = await asyncio.to_thread(
-            lambda: _sp.run(
-                [interpreter, "-m", "pip", "install",
-                 *pip_install_target_args(interpreter), "--upgrade", sdk_baseline],
-                capture_output=True, text=True, timeout=120,
-            )
-        )
-        if result.returncode == 0:
-            payload = await asyncio.to_thread(_claude_code_status_payload)
-            payload["repaired"] = True
-            return JSONResponse(payload)
-        return JSONResponse({
-            "status": "error",
-            "installed": False,
-            "ready": False,
-            "busy": False,
-            "message": "Claude runtime repair failed.",
-            "error": (result.stderr or result.stdout or "")[:500],
-        }, status_code=500)
-    except Exception as e:
-        return JSONResponse({
-            "status": "error",
-            "installed": False,
-            "ready": False,
-            "busy": False,
-            "message": "Claude runtime repair failed.",
-            "error": f"{type(e).__name__}: {e}",
-        }, status_code=500)
 
 
 def _apply_settings_save_side_effects(
