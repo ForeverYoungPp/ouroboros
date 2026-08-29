@@ -35,6 +35,7 @@ from devtools.benchmarks.cybergym.cybergym_executor import (
     _install_workspace_backend_alias,
     _parse_json_stdout,
     _require_exact_effort,
+    _reuse_directory_observation,
     _safe_extract,
     _served_telemetry,
     _validate_verify_response,
@@ -984,6 +985,42 @@ def test_provider_probe_checks_exact_model_without_server_search(monkeypatch, tm
     assert executor.provider_observation["observed_model"] == (
         "deepseek/deepseek-v4-flash-0731"
     )
+
+
+def test_reused_directory_observation_rechecks_small_manifest_only(tmp_path):
+    payload_root = tmp_path / "payload"
+    payload_root.mkdir()
+    source = tmp_path / "run_manifest.json"
+    source.write_text('{"receipt":true}', encoding="utf-8")
+    digest = "a" * 64
+    observation = {
+        "path": str(payload_root),
+        "sha256": digest,
+        "expected_sha256": digest,
+        "files": 2,
+        "bytes": 123,
+        "attestation_mode": "reused_manifest_observation",
+        "attestation_source_manifest": str(source),
+        "attestation_source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+    }
+
+    reused = _reuse_directory_observation(
+        observation,
+        path=payload_root,
+        expected_sha256=digest,
+        label="CyberGym data root",
+    )
+    assert reused["status"] == "passed"
+    assert reused["path"] == str(payload_root.resolve())
+
+    source.write_text('{"receipt":false}', encoding="utf-8")
+    with pytest.raises(ExecutorFailure, match="manifest changed"):
+        _reuse_directory_observation(
+            observation,
+            path=payload_root,
+            expected_sha256=digest,
+            label="CyberGym data root",
+        )
 
 
 def test_task_body_requires_immutable_workspace_id(tmp_path):

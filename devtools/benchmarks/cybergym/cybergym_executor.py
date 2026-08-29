@@ -537,6 +537,8 @@ class ExecutorConfig:
     binary_dir: pathlib.Path | None = None
     expected_data_sha256: str = ""
     expected_binary_sha256: str = ""
+    preverified_data_observation: Mapping[str, Any] | None = None
+    preverified_binary_observation: Mapping[str, Any] | None = None
     log_dir: pathlib.Path | None = None
     db_path: pathlib.Path | None = None
     python_executable: str = "python"
@@ -675,6 +677,71 @@ class ExecutorConfig:
             ):
                 if not re.fullmatch(r"[0-9a-fA-F]{64}", str(value or "").strip()):
                     raise ExecutorFailure(f"{name} is required for a paid immutable input")
+        if (self.preverified_data_observation is None) != (
+            self.preverified_binary_observation is None
+        ):
+            raise ExecutorFailure(
+                "preverified data and binary observations must be supplied together"
+            )
+
+
+def _reuse_directory_observation(
+    observation: Mapping[str, Any],
+    *,
+    path: pathlib.Path,
+    expected_sha256: str,
+    label: str,
+) -> dict[str, Any]:
+    """Revalidate one small manifest receipt without rereading its payload."""
+
+    expected = str(expected_sha256 or "").strip().lower()
+    try:
+        observed_path = pathlib.Path(str(observation.get("path") or "")).resolve(
+            strict=True
+        )
+        expected_path = path.resolve(strict=True)
+        source = pathlib.Path(
+            str(observation.get("attestation_source_manifest") or "")
+        ).resolve(strict=True)
+        source_payload = source.read_bytes()
+    except OSError as exc:
+        raise ExecutorFailure(f"{label} reused attestation is unavailable") from exc
+    if observed_path != expected_path:
+        raise ExecutorFailure(f"{label} reused attestation path changed")
+    if (
+        not _HEX64.fullmatch(expected)
+        or str(observation.get("sha256") or "").strip().lower() != expected
+        or str(observation.get("expected_sha256") or "").strip().lower()
+        != expected
+    ):
+        raise ExecutorFailure(f"{label} reused attestation digest changed")
+    source_sha256 = str(
+        observation.get("attestation_source_sha256") or ""
+    ).strip().lower()
+    if (
+        not _HEX64.fullmatch(source_sha256)
+        or hashlib.sha256(source_payload).hexdigest() != source_sha256
+    ):
+        raise ExecutorFailure(f"{label} reused attestation manifest changed")
+    files = observation.get("files")
+    size = observation.get("bytes")
+    if (
+        not isinstance(files, int)
+        or isinstance(files, bool)
+        or files <= 0
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 0
+    ):
+        raise ExecutorFailure(f"{label} reused attestation counts are invalid")
+    return {
+        **dict(observation),
+        "label": label,
+        "path": str(expected_path),
+        "sha256": expected,
+        "expected_sha256": expected,
+        "status": "passed",
+    }
 
 
 def _response_status(payload: Mapping[str, Any]) -> str:
@@ -2480,21 +2547,35 @@ class CyberGymExecutor:
                     raise ExecutorFailure("CyberGym binary directory is empty")
             except OSError as exc:
                 raise ExecutorFailure("CyberGym binary directory cannot be inspected") from exc
-            self.data_observation = verify_directory_digest(
-                self.config.data_root,
-                self.config.expected_data_sha256,
-                label="CyberGym data root",
-            )
-            self.binary_observation = verify_directory_digest(
-                binary_dir,
-                self.config.expected_binary_sha256,
-                label="CyberGym binary directory",
-                # A small number of pinned OSS-Fuzz artifacts contain
-                # absolute ``/src/...`` links resolved only inside the nested
-                # verifier image.  Keep that virtual namespace explicit while
-                # rejecting every other external target.
-                allowed_virtual_symlink_prefixes=("/src/",),
-            )
+            if self.config.preverified_data_observation is not None:
+                self.data_observation = _reuse_directory_observation(
+                    self.config.preverified_data_observation,
+                    path=self.config.data_root,
+                    expected_sha256=self.config.expected_data_sha256,
+                    label="CyberGym data root",
+                )
+                self.binary_observation = _reuse_directory_observation(
+                    self.config.preverified_binary_observation or {},
+                    path=binary_dir,
+                    expected_sha256=self.config.expected_binary_sha256,
+                    label="CyberGym binary directory",
+                )
+            else:
+                self.data_observation = verify_directory_digest(
+                    self.config.data_root,
+                    self.config.expected_data_sha256,
+                    label="CyberGym data root",
+                )
+                self.binary_observation = verify_directory_digest(
+                    binary_dir,
+                    self.config.expected_binary_sha256,
+                    label="CyberGym binary directory",
+                    # A small number of pinned OSS-Fuzz artifacts contain
+                    # absolute ``/src/...`` links resolved only inside the nested
+                    # verifier image. Keep that virtual namespace explicit while
+                    # rejecting every other external target.
+                    allowed_virtual_symlink_prefixes=("/src/",),
+                )
         else:
             binary_dir.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)

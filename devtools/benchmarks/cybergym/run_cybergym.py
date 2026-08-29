@@ -169,6 +169,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--expected-binary-sha256", default="",
         help="exact SHA-256 of the immutable CyberGym binary tree",
     )
+    parser.add_argument(
+        "--reuse-input-attestation",
+        default="",
+        help=(
+            "prior append-only run_manifest.json whose verified data/binary "
+            "observations may be reused without rereading the immutable trees"
+        ),
+    )
     parser.add_argument("--expected-tasks-sha256", default=OFFICIAL_TASKS_SHA256)
     parser.add_argument("--expected-mask-sha256", default="")
     parser.add_argument("--provider-only", action="append", default=[], help="OpenRouter provider id to allow (repeatable/comma-separated)")
@@ -183,6 +191,111 @@ def _csv_values(values: Sequence[str] | str | None) -> tuple[str, ...]:
     for item in raw:
         result.extend(part.strip() for part in str(item).split(",") if part.strip())
     return tuple(dict.fromkeys(result))
+
+
+def _load_reused_input_observations(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Load a small prior manifest as the authority for already-paid digests.
+
+    The operator still supplies the exact expected hashes. This fast path only
+    avoids rereading the immutable payload after an earlier append-only run
+    recorded matching path-bound observations.
+    """
+
+    raw_path = str(getattr(args, "reuse_input_attestation", "") or "").strip()
+    if not raw_path:
+        return None, None
+    source = pathlib.Path(raw_path).expanduser()
+    if not source.is_absolute():
+        raise CyberGymIntegrationUnavailable(
+            "--reuse-input-attestation must be an absolute manifest path"
+        )
+    try:
+        source = source.resolve(strict=True)
+        payload = source.read_bytes()
+        manifest = json.loads(payload)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CyberGymIntegrationUnavailable(
+            "reused input attestation is unreadable"
+        ) from exc
+    if source.name != "run_manifest.json" or not isinstance(manifest, Mapping):
+        raise CyberGymIntegrationUnavailable(
+            "reused input attestation must be a CyberGym run_manifest.json"
+        )
+    extra = manifest.get("extra")
+    if not isinstance(extra, Mapping):
+        raise CyberGymIntegrationUnavailable(
+            "reused input attestation has no benchmark observations"
+        )
+
+    source_sha256 = hashlib.sha256(payload).hexdigest()
+    created_at = manifest.get("created_at_unix")
+    specifications = (
+        (
+            "cybergym_data",
+            pathlib.Path(args.data_root),
+            str(args.expected_data_sha256 or "").strip().lower(),
+        ),
+        (
+            "cybergym_binary",
+            pathlib.Path(args.binary_dir),
+            str(args.expected_binary_sha256 or "").strip().lower(),
+        ),
+    )
+    observations: list[dict[str, Any]] = []
+    for field, expected_path, expected_sha256 in specifications:
+        value = extra.get(field)
+        if not isinstance(value, Mapping):
+            raise CyberGymIntegrationUnavailable(
+                f"reused input attestation omitted {field}"
+            )
+        try:
+            observed_path = pathlib.Path(str(value.get("path") or "")).resolve(
+                strict=True
+            )
+            resolved_expected_path = expected_path.resolve(strict=True)
+        except OSError as exc:
+            raise CyberGymIntegrationUnavailable(
+                f"reused input attestation path is unavailable for {field}"
+            ) from exc
+        observed_sha256 = str(value.get("sha256") or "").strip().lower()
+        observed_expected = str(value.get("expected_sha256") or "").strip().lower()
+        if observed_path != resolved_expected_path:
+            raise CyberGymIntegrationUnavailable(
+                f"reused input attestation path does not match {field}"
+            )
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+            or observed_sha256 != expected_sha256
+            or observed_expected != expected_sha256
+        ):
+            raise CyberGymIntegrationUnavailable(
+                f"reused input attestation digest does not match {field}"
+            )
+        files = value.get("files")
+        size = value.get("bytes")
+        if (
+            not isinstance(files, int)
+            or isinstance(files, bool)
+            or files <= 0
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size <= 0
+        ):
+            raise CyberGymIntegrationUnavailable(
+                f"reused input attestation counts are invalid for {field}"
+            )
+        observations.append(
+            {
+                **dict(value),
+                "attestation_mode": "reused_manifest_observation",
+                "attestation_source_manifest": str(source),
+                "attestation_source_sha256": source_sha256,
+                "attestation_created_at_unix": created_at,
+            }
+        )
+    return observations[0], observations[1]
 
 
 def _sha256_file(path: pathlib.Path | str) -> str:
@@ -367,6 +480,7 @@ def _build_default_executor(
     from devtools.benchmarks.cybergym.cybergym_executor import ExecutorConfig, build_executor
 
     disabled_tools = derive_disabled_tools()
+    data_attestation, binary_attestation = _load_reused_input_observations(args)
     config = ExecutorConfig(
         campaign_id=out_root.name,
         source_root=pathlib.Path(args.source_root),
@@ -377,6 +491,8 @@ def _build_default_executor(
         binary_dir=pathlib.Path(args.binary_dir),
         expected_data_sha256=str(getattr(args, "expected_data_sha256", "") or ""),
         expected_binary_sha256=str(getattr(args, "expected_binary_sha256", "") or ""),
+        preverified_data_observation=data_attestation,
+        preverified_binary_observation=binary_attestation,
         server_image=str(args.server_image),
         server_image_digest=str(args.server_image_digest),
         workspace_image=str(args.workspace_image),
@@ -515,6 +631,10 @@ def _redacted_observation(observation: Mapping[str, Any]) -> dict[str, Any]:
         "expected_sha256",
         "files",
         "bytes",
+        "attestation_mode",
+        "attestation_source_manifest",
+        "attestation_source_sha256",
+        "attestation_created_at_unix",
     }
     return {str(key): value for key, value in observation.items() if str(key) in allowed}
 

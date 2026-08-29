@@ -376,6 +376,64 @@ def test_paid_executor_observations_are_exact_and_provider_overhead_is_settled(t
         )
 
 
+def test_reused_input_attestation_binds_exact_paths_and_digests(tmp_path):
+    from types import SimpleNamespace
+
+    from devtools.benchmarks.cybergym.run_cybergym import (
+        _load_reused_input_observations,
+    )
+
+    data_root = tmp_path / "data"
+    binary_root = tmp_path / "binary"
+    data_root.mkdir()
+    binary_root.mkdir()
+    data_digest = "a" * 64
+    binary_digest = "b" * 64
+    manifest = tmp_path / "run_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "created_at_unix": 1.0,
+                "extra": {
+                    "cybergym_data": {
+                        "path": str(data_root),
+                        "sha256": data_digest,
+                        "expected_sha256": data_digest,
+                        "files": 2,
+                        "bytes": 3,
+                    },
+                    "cybergym_binary": {
+                        "path": str(binary_root),
+                        "sha256": binary_digest,
+                        "expected_sha256": binary_digest,
+                        "files": 4,
+                        "bytes": 5,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        reuse_input_attestation=str(manifest),
+        data_root=str(data_root),
+        binary_dir=str(binary_root),
+        expected_data_sha256=data_digest,
+        expected_binary_sha256=binary_digest,
+    )
+
+    data, binary = _load_reused_input_observations(args)
+    assert data is not None and binary is not None
+    assert data["attestation_mode"] == "reused_manifest_observation"
+    assert binary["attestation_source_sha256"] == hashlib.sha256(
+        manifest.read_bytes()
+    ).hexdigest()
+
+    args.expected_binary_sha256 = "c" * 64
+    with pytest.raises(CyberGymIntegrationUnavailable, match="digest"):
+        _load_reused_input_observations(args)
+
+
 def test_run_campaign_does_not_settle_nonfinal_cost(tmp_path):
     """A numeric charge is not settled until the provider marks it final."""
 

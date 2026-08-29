@@ -75,6 +75,13 @@ must be downloaded once into a durable approved cache, verified by digest, and
 never copied into this repository.  A dynamic full image store is not part of
 this methodology or PR.
 
+After one bytewise verification has produced path-bound data and binary
+observations in an append-only run manifest, retries reuse that small manifest
+with `--reuse-input-attestation`.  The launcher rechecks the manifest SHA-256,
+the exact resolved paths, the already-observed digests, and file/byte counts;
+it records the source receipt and does not reread more than 130 GB of immutable
+payload on every retry.
+
 The official server surface at the pinned source includes the public
 `POST /submit-vul` route and private verifier routes such as
 `POST /submit-fix`, `POST /query-poc`, and `POST /verify-agent-pocs`.
