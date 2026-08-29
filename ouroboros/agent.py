@@ -973,10 +973,20 @@ class OuroborosAgent:
         # THIS task was dispatched onto the delegated substrate. ALL economics
         # marks reset together per dispatch (F4) — defensive, since the
         # ToolContext above is freshly built per task; see the helper.
+        # A configured agent_session row counts as dispatched even when the
+        # executor resolution reads "blocked": for a blocked start that is moot
+        # (the task terminals unrun below), but a mid-run failure must keep the
+        # reminders/nudges/chip alive on the wake loops (charter, 2026-08-28).
+        _snapshot = task.get("configured_subagent") if isinstance(
+            task.get("configured_subagent"), dict) else {}
+        _snap_route = _snapshot.get("route") if isinstance(_snapshot.get("route"), dict) else {}
         reset_nanny_economics_marks(self.tools._ctx, route_dispatched=bool(
-            dispatch is not None
-            and dispatch.executor_resolution is not None
-            and dispatch.executor_resolution.executor == "harness"
+            str(_snap_route.get("kind") or "") == "agent_session"
+            or (
+                dispatch is not None
+                and dispatch.executor_resolution is not None
+                and dispatch.executor_resolution.executor == "harness"
+            )
         ), delegate_activity_seed=bool(
             isinstance(getattr(ctx, "_configured_actor_bootstrap", None), dict)
             and getattr(ctx, "_configured_actor_bootstrap", {}).get("physical_started")
@@ -1015,6 +1025,18 @@ class OuroborosAgent:
             )
             cap_info["executor_blocked_requested"] = str(_res.requested if _res is not None else "harness")
             cap_info["executor_blocked_reset_at"] = str(_res.reset_at if _res is not None else "")
+        elif not startup_wake and isinstance(
+            getattr(ctx, "_configured_startup_refusal", None), dict
+        ):
+            # Charter D2: the host's pre-start of a configured session leaf was
+            # DEFINITELY refused before the first model round (typed refusal, no
+            # custody handle) — the same $0 unrun terminal as a blocked pin.
+            _refusal = ctx._configured_startup_refusal
+            cap_info["executor_blocked_reason"] = str(
+                _refusal.get("reason") or "configured_session_unavailable"
+            )
+            cap_info["executor_blocked_requested"] = str(_refusal.get("requested") or "harness")
+            cap_info["executor_blocked_reset_at"] = str(_refusal.get("reset_at") or "")
         self._emit_live_log(
             "context_building_finished",
             task_id=str(task.get("id") or ""),

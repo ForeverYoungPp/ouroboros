@@ -414,18 +414,28 @@ def route_health(
     names no reset instant still reports ``subscription_window_exhausted`` — as the
     REASON with an empty ``reset_at``, since an unknown healing time is not health.
 
-    ``pinned_profile`` is the route's pinned ACCOUNT (``DelegationRoute.profile_id``;
-    authors: reviewer-slot rows and the Delegation account pin, unified-accounts
-    D-U5). It does two things at once. It SKIPS the harness-row status refusal AND
-    the ``enabled`` flag beside it: a no-default-credential row reads ``unavailable``
-    FOREVER by design (agy, INV-135) and commonly ships disabled too — the ENGINE's
-    typed refusal is authoritative for a pinned run (owner 2026-08-18; one wasted
-    round trip on a really-disabled harness). Catalog absence, access-profile fit,
-    version floor and quota still apply — and the quota judgement narrows to THAT
-    subject exactly (§K.7): a pin is strict (D-U6), so a healthy sibling account
-    must not mask a spent pinned one into a dispatch the engine is certain to
-    refuse. Empty (automatic rotation) keeps the harness-wide judgement: WHICH
-    profile an unpinned run lands on stays Claudexor's business.
+    The harness row's aggregate ``status``/``enabled`` pair is deliberately NOT
+    a refusal here (cx-delegation sprint, owner decisions 2026-08-28 «статус
+    обманывает, игнорируй его и всё равно пробуй запустить» + 7=A). That pair
+    describes the DEFAULT credential store, while real accounts live in the
+    engine's credential-profile pool — a pool-only harness read ``unavailable``
+    FOREVER (agy, INV-135) and blocked routes the engine itself would admit.
+    Admission belongs to the engine: a genuinely empty or exhausted pool answers
+    the start POST with its own typed refusal (INV-135
+    ``credential_pool_exhausted`` + earliest reset), which under the pre-start
+    charter costs zero model rounds. The engine's belt capability row
+    (``delegation.available`` — MCP-injection for Claudexor's own delegate
+    strategy) is likewise not consulted: Ouroboros runs never request the belt
+    (no ``extra_mcp_servers``), and the only structural engine gate for a
+    mutating run is the ``execution.delegated`` marker floor checked below.
+
+    ``pinned_profile`` (``DelegationRoute.profile_id``; authors: reviewer-slot
+    rows and the Delegation account pin, unified-accounts D-U5) narrows the
+    QUOTA judgement to that subject exactly (§K.7): a pin is strict (D-U6), so
+    a healthy sibling account must not mask a spent pinned one into a dispatch
+    the engine is certain to refuse. Empty (automatic rotation) keeps the
+    harness-wide judgement: WHICH profile an unpinned run lands on stays
+    Claudexor's business.
     """
     from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
     from ouroboros.gateways.claudexor import engine_at_least
@@ -438,16 +448,6 @@ def route_health(
             break
     if entry is None:
         return "route_not_in_capability_catalog", ""
-    if not pinned_profile and (
-            not entry.get("enabled") or str(entry.get("status") or "") != "ok"):
-        status = f"route_status_{entry.get('status') or 'disabled'}"
-        delegation = entry.get("delegation")
-        if (shape.delegated and isinstance(delegation, dict)
-                and delegation.get("available") is False):
-            # SAME refusal, refined (disclosure, never a new gate): the code carries
-            # the row's structural cannot-delegate fact for downstream wording.
-            return f"{status}:delegation_{delegation.get('reason') or 'unsupported'}", ""
-        return status, ""
     supported = [str(v) for v in entry.get("accessProfilesSupported") or []]
     # A DELEGATED run is externally confined, and the engine rewrites its access to
     # `external_sandbox_full` before admitting it (`RequestRequirementsResolver.adapterAccess`)

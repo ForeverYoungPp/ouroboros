@@ -838,6 +838,64 @@ def _accept_capability_deltas(drive_root: Any, task_id: str, root_task_id: str) 
     return out
 
 
+def _accept_substrate_execution(ctx: Any, task_id: str) -> Dict[str, Any]:
+    """Substrate FACTS for the task under review, from durable custody rows.
+
+    Acceptance used to see substrate truth only through the terminal result
+    envelope — written AFTER acceptance runs — so a harness-dispatched task was
+    always judged as if it ran as scheduled. Custody rows are durable and
+    complete before finalization, so the packet reads them directly. FACTS
+    ONLY, never a verdict rule (owner 2026-08-28: acceptance judges quality,
+    not the execution route — these rows are context, they gate nothing).
+    Empty for tasks never dispatched toward the delegated substrate.
+    """
+    bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+    if not bool(getattr(ctx, "_nanny_route_dispatched", False)) and not isinstance(
+        bootstrap, dict,
+    ):
+        return {}
+    out: Dict[str, Any] = {}
+    try:
+        from ouroboros.delegate_custody import custody_root
+        from ouroboros.delegate_evidence import task_execution_evidence
+        from ouroboros.subagents import actual_substrate
+
+        evidence = task_execution_evidence(custody_root(ctx), str(task_id or ""))
+        evidence = evidence if isinstance(evidence, dict) else {}
+        out["actual_substrate"] = actual_substrate(evidence)
+        for key in (
+            "delegated_runs_started", "delegated_runs_settled",
+            "delegated_runs_succeeded", "delegated_runs_failed",
+            "delegated_runs_source_unresolved",
+        ):
+            out[key] = int(evidence.get(key) or 0)
+        if evidence.get("evidence_read_failed"):
+            # Unreadable custody must not read as a proven-empty substrate.
+            out["evidence_read_failed"] = True
+            out.pop("actual_substrate", None)
+        failure_states = [
+            str(s) for s in (evidence.get("delegated_run_failure_states") or [])
+        ]
+        if failure_states:
+            out["delegated_run_failure_states"] = failure_states[:12]
+        if evidence.get("subscription_cost_usd") is not None:
+            out["subscription_cost_usd"] = evidence.get("subscription_cost_usd")
+    except Exception:
+        log.debug("Failed to read substrate custody evidence for acceptance", exc_info=True)
+        return {"evidence_read_failed": True}
+    if isinstance(bootstrap, dict):
+        out["configured_session"] = True
+        if bootstrap.get("zero_run_receipt_recorded"):
+            out["zero_run_decision"] = str(bootstrap.get("zero_run_decision") or "")
+            out["zero_run_basis"] = str(bootstrap.get("zero_run_basis") or "")
+        if bootstrap.get("route_available") is False:
+            out["route_available"] = False
+    refusal = getattr(ctx, "_configured_startup_refusal", None)
+    if isinstance(refusal, dict):
+        out["startup_refused"] = str(refusal.get("reason") or "")
+    return out
+
+
 def build_task_acceptance_evidence(
     ctx: Any,
     *,
@@ -933,6 +991,10 @@ def build_task_acceptance_evidence(
         if delta_aggregate:
             ev["capability_deltas"] = redact_projection(delta_aggregate).value
             prov["capability_deltas"] = "host_attested"
+        substrate_facts = _accept_substrate_execution(ctx, task_id)
+        if substrate_facts:
+            ev["substrate_execution"] = redact_projection(substrate_facts).value
+            prov["substrate_execution"] = "host_attested"
     repo_diff = collect_turn_diff(ctx, include_recent_commit=include_recent_commit)
     diff_meta: Dict[str, Any] = {}
     if "OMISSION NOTE: truncated at " in str(repo_diff or "") or "... (truncated from " in str(repo_diff or ""):

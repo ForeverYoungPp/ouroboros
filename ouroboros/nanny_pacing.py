@@ -9,6 +9,18 @@ DELEGATE_ACTIVITY_TOOLS = frozenset({
     "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
 })
 
+# Only genuine ACTS of delegation reset the burn baseline: starting a physical
+# run or spawning an explicit child (charter, owner 2026-08-28). Supervision
+# verbs advance the round baseline while dollars keep accumulating; every
+# other coordination verb is observed for nudge phrasing but never buys
+# metered silence — the poltergeist pattern was tens of metered rounds each
+# "paid for" by a cheap tree_read/verify_and_record baseline reset.
+BASELINE_RESET_TOOLS = frozenset({"delegate_start", "schedule_subagent"})
+
+SUPERVISION_ACTIVITY_TOOLS = frozenset({
+    "delegate_wait", "delegate_cancel", "delegate_answer",
+})
+
 HOST_COORDINATION_ACTIVITY_TOOLS = frozenset({
     "schedule_subagent", "wait_task", "wait_tasks", "get_task_result", "peek_task",
     "tree_note", "tree_read", "verify_and_record", "cancel_task",
@@ -37,25 +49,25 @@ def note_nanny_delegate_activity(
     for call in tool_calls or []:
         fn = call.get("function") if isinstance(call, dict) else None
         name = str((fn or {}).get("name") or "").strip() if isinstance(fn, dict) else ""
-        if name in DELEGATE_ACTIVITY_TOOLS:
+        if name in DELEGATE_ACTIVITY_TOOLS or name in BASELINE_RESET_TOOLS:
             verbs.add(name)
         if name in HOST_COORDINATION_ACTIVITY_TOOLS:
             coordination_verbs.add(name)
     if coordination_verbs:
+        # Observation only — a phrasing input for the reminder, never a meter
+        # reset (charter: coordination no longer buys metered silence).
         ctx._nanny_coordination_activity = True
         ctx._nanny_coordination_tools = tuple(sorted(coordination_verbs))
-        ctx._nanny_delegate_baseline = dict(mark)
-        ctx._nanny_reminder_mark = None
-        return
     if not verbs:
         return
-    if verbs == {"delegate_wait"}:
-        # Waiting advances the round baseline but preserves cumulative dollar burn.
+    if verbs & BASELINE_RESET_TOOLS:
+        ctx._nanny_delegate_baseline = dict(mark)
+    else:
+        # Supervision (wait/answer/cancel) advances the round baseline but
+        # preserves cumulative dollar burn.
         prior = getattr(ctx, "_nanny_delegate_baseline", None)
         prior_cost = float(prior.get("cost") or 0.0) if isinstance(prior, dict) else 0.0
         ctx._nanny_delegate_baseline = {"round": mark["round"], "cost": prior_cost}
-    else:
-        ctx._nanny_delegate_baseline = dict(mark)
     ctx._nanny_reminder_mark = None
 
 

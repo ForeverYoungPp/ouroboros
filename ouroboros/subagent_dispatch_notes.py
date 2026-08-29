@@ -45,24 +45,21 @@ def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
         if configured_atomic:
             return (
                 f"EXECUTOR: your parent selected the configured agent-session route ({route}). "
-                "You are its Ouroboros NANNY. This first model round is the host's ordinary "
-                "coordination episode: the host has not started a new physical leaf merely "
-                "because the row is configured. Choose whether to schedule host children, "
-                "publish evidence, start the snapshotted leaf with delegate_start, or record a "
-                "typed zero-run decision. A typed startup/wake receipt alone is not a zero-run decision; "
-                "record the typed zero-run "
-                "decision through verify_and_record(contract_kind=delegation_zero_run, "
-                "zero_run_decision, zero_run_basis). That receipt is terminal for this actor: "
-                "after it is durably recorded, do not start a physical leaf in the same task. "
-                "The typed startup/wake receipt "
-                "says whether a leaf is pending, live, recovered, or refused; do not repeat a receipt-proven "
-                "start or adoption in parallel. You retain your full ordinary tool surface and judgment: "
-                "supervise and inspect evidence, coordinate task-tree messages, answer "
-                "authorized leaf questions, wait again, and accept or reject the result. "
-                "When correction is necessary and no truthful in-place control exists, "
-                "verify cancellation and terminal settlement before starting a replacement. "
-                "Any API-backed or otherwise separate work must be an explicit separate "
-                "child, so its authorship and spend remain visible."
+                "You are its Ouroboros NANNY. The host starts the exact configured leaf run "
+                "BEFORE your first metered round and wakes you on meaningful facts; the "
+                "startup/wake receipt in this context is the truth about that run. Your "
+                "metered rounds are for judgment — verify and integrate what the run "
+                "produces, answer its authorized questions, decide recovery — never for "
+                "rebuilding its work: co-building beside a delegated run is a metered "
+                "duplicate of already-paid work. After a terminal failure, retry or replace "
+                "through delegate_start(retry_of=..., prompt=...) only once cancellation and "
+                "terminal settlement are verified. Auxiliary or API-backed work must be an "
+                "explicit separate child, so its authorship and spend remain visible. When "
+                "no physical run exists and none can be started, record the typed zero-run "
+                "terminal through verify_and_record(contract_kind=delegation_zero_run, "
+                "zero_run_decision=incomplete|unknown, zero_run_basis=...); that receipt is "
+                "terminal for this actor — after it is durably recorded, do not start a "
+                "physical leaf in the same task."
             )
         note = (
             f"EXECUTOR: your parent scheduled you on the delegated substrate ({route}). "
@@ -192,21 +189,18 @@ def executor_blocked_outcome(
         if decision.reason == "delegate_visibility_unverified":
             return text, {"execution_status": "infra_failed", "reason_code": "delegate_visibility_unverified"}
         return text, {"execution_status": "infra_failed", "reason_code": "delegate_tools_invisible"}
-    # ":delegation_" is route_health's structural refinement (Phase D3): the
-    # catalog row's manifest cannot run delegated work AT ALL, so "reschedule
-    # once the route recovers" would honestly mean "wait forever" (e.g. agy).
+    # The ":delegation_" wording branch retired with route_health's aggregate
+    # status refusal (cx-delegation sprint): the engine's belt capability was
+    # never a structural fact about Ouroboros's marker-based delegated runs,
+    # and the host no longer manufactures a "waiting will not heal it" verdict
+    # the engine did not give.
     text = (
         "⚠️ EXECUTOR_UNAVAILABLE: this subagent was pinned to the delegated substrate "
         f"(executor='harness') and the route cannot run: {decision.reason}."
         + (f" It resets at {decision.reset_at}." if decision.reset_at else "")
         + " The task was NOT run on metered API tokens, because that spend is exactly "
-        "what the pin exists to prevent. "
-        + ("This harness structurally cannot run delegated work (its manifest does not "
-           "support it), so waiting will not heal it: change the delegated route, or "
-           "select another Available subagent explicitly."
-           if ":delegation_" in decision.reason else
-           "Reschedule once the route recovers, or explicitly select another "
-           "Available subagent.")
+        "what the pin exists to prevent. Reschedule once the route recovers, or "
+        "explicitly select another Available subagent."
     )
     return text, {
         "execution_status": "infra_failed",

@@ -5787,15 +5787,43 @@ def _nanny_finalization_message(
             "or state in your final answer that the delegated run failed and why "
             "the remaining work ran on metered API tokens."
         )
-    from ouroboros.subagent_bootstrap import (
-        actor_first_coordination_finalization_message,
-    )
+    bootstrap = getattr(tools._ctx, "_configured_actor_bootstrap", None)
+    if isinstance(bootstrap, dict):
+        # Charter (owner 2026-08-28): a configured agent_session child is
+        # clean only through its own physical leaf or a durable typed
+        # zero-run receipt. Host children and coordination activity are
+        # auxiliary evidence and no longer silence this fact.
+        _meta = getattr(tools._ctx, "task_metadata", {})
+        _meta = _meta if isinstance(_meta, dict) else {}
+        status_root = pathlib.Path(str(
+            _meta.get("budget_drive_root")
+            or getattr(tools._ctx, "budget_drive_root", "")
+            or drive_root
+        ))
+        try:
+            from ouroboros.subagent_bootstrap import actor_first_unresolved_fact
 
-    actor_first = actor_first_coordination_finalization_message(
-        tools._ctx, task_id=str(task_id or ""), fallback_root=drive_root,
-    )
-    if actor_first is not None:
-        return actor_first
+            actor_fact = actor_first_unresolved_fact(
+                tools._ctx, task_id=str(task_id or ""), drive_root=status_root,
+            )
+        except Exception:
+            actor_fact = None
+        if not actor_fact:
+            return ""  # leaf started/adopted, or a typed zero-run receipt closed it
+        _status = str(actor_fact.get("status") or "unknown")
+        _code = (
+            "CONFIGURED_ACTOR_INCOMPLETE"
+            if _status == "incomplete" else "CONFIGURED_ACTOR_UNKNOWN"
+        )
+        return (
+            f"⚠️ {_code}: this configured session child is finalizing with no "
+            "physical leaf run and no durable typed zero-run decision. Start "
+            "the exact assigned session now (delegate_start), or record the "
+            "typed terminal via verify_and_record(contract_kind="
+            f"delegation_zero_run, zero_run_decision={_status!r}, "
+            "zero_run_basis=...). A plain prose answer cannot close this "
+            "evidence gap."
+        )
     return (
         "⚠️ NANNY_DID_NOT_DELEGATE: this task was dispatched onto the delegated "
         "substrate (executor=harness), but you are finalizing with ZERO "
