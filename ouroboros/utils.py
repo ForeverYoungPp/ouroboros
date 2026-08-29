@@ -589,7 +589,18 @@ def append_jsonl(
             except Exception:
                 log.debug("Failed to unlink lock file after jsonl append", exc_info=True)
                 pass
-        if _written and _log_sink is not None:
+        # Live-stream only runtime LOG files. chat.jsonl has its own live
+        # channel (the chat frame family), and state/memory/receipt jsonl
+        # stores are durable data, not a log feed — streaming them made every
+        # ledger append a raw WS "log" frame (noise the Logs panel's backfill
+        # never mirrors: it requests events/tools/progress/supervisor only).
+        if (
+            _written
+            and _log_sink is not None
+            and path.parent.name == "logs"
+            and path.suffix == ".jsonl"
+            and path.name != "chat.jsonl"
+        ):
             try:
                 _log_sink(obj)
             except Exception:

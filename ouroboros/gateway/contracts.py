@@ -320,8 +320,8 @@ class LogOutbound(TypedDict):
 
     type: Literal["log"]
     data: Dict[str, Any]
-    # Multi-project: surfaced at top level so live task progress routes to the
-    # owning project panel (and mirrors into main) by thread.
+    # Multi-project: surfaced at top level so live task progress routes to
+    # its own thread (Main admits only unstamped non-project frames).
     chat_id: NotRequired[int]
     # Server-stamped when chat_id is a reserved Project thread: Main never
     # adopts it, even before the browser has learned the project.

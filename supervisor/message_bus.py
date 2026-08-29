@@ -677,10 +677,11 @@ class LocalChatBridge:
                 self._log_queue.put_nowait(event)
             except queue.Full:
                 pass
-        if self._broadcast_fn:
-            # Surface the event's chat_id top-level so the browser's per-thread
-            # fan-out (isMyThread) can route the live card to its project panel
-            # instead of the main chat. Events without a chat_id default to main.
+        if self._broadcast_fn and not is_a2a_chat_id(event.get("chat_id")):
+            # Task-scoped events arrive already addressed
+            # (supervisor/log_addressing.py); an unaddressable event keeps the
+            # legacy chat-0 default, which Main still admits. A2A synthetic
+            # chats are machine traffic and never enter the human stream.
             frame = {"type": "log", "data": event, "chat_id": int(event.get("chat_id") or 0)}
             stamp_project_thread(DATA_DIR, frame)
             self._broadcast_fn(frame)

@@ -175,5 +175,17 @@ def emit_review_cycles_exhausted(
             append_jsonl(pathlib.Path(str(drive_root)) / "logs" / "events.jsonl", stamped)
         if event_queue is not None:
             emit_log_event(event_queue, stamped, log_label="review cycles")
+        else:
+            # A queue-less server-process caller (e.g. the HTTP skill-review
+            # ctx) still owes the ONE live frame: the raw sink copy of the
+            # append above is suppressed, so push the addressed sibling here.
+            from supervisor.log_addressing import address_handler_push
+            from supervisor.message_bus import try_get_bridge
+
+            bridge = try_get_bridge()
+            if bridge is not None:
+                bridge.push_log(address_handler_push(
+                    pathlib.Path(str(drive_root)) if drive_root else None, dict(stamped)
+                ))
     except Exception:
         log.debug("review_cycles_exhausted emission failed for %s", task_id, exc_info=True)

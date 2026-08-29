@@ -965,16 +965,28 @@ def _record_cascade_incident(task_id: str, kind: str, detail: str = "") -> None:
     same log every other cancel artifact uses) and are pushed to the live owner
     surfaces when a bridge exists.
     """
-    row = {"type": kind, "task_id": task_id}
+    # ONE event object for the durable row and the live frame: a second
+    # timestamp would defeat the Logs panel's backfill/live dedupe key.
+    incident = {"type": kind, "task_id": task_id}
     if detail:
-        row["error"] = detail
+        incident["error"] = detail
+    try:
+        from ouroboros.utils import utc_now_iso
+
+        incident = {"ts": utc_now_iso(), **incident}
+        from supervisor import queue as supervisor_queue
+        from supervisor.log_addressing import address_handler_push
+
+        incident = address_handler_push(pathlib.Path(supervisor_queue.DRIVE_ROOT), incident)
+    except Exception:
+        log.debug("Failed to address cascade cancel incident for %s", task_id, exc_info=True)
     try:
         from supervisor import queue as supervisor_queue
-        from ouroboros.utils import append_jsonl, utc_now_iso
+        from ouroboros.utils import append_jsonl
 
         append_jsonl(
             pathlib.Path(supervisor_queue.DRIVE_ROOT) / "logs" / "supervisor.jsonl",
-            {"ts": utc_now_iso(), **row},
+            incident,
         )
     except Exception:
         log.debug("Failed to persist cascade cancel incident for %s", task_id, exc_info=True)
@@ -983,9 +995,7 @@ def _record_cascade_incident(task_id: str, kind: str, detail: str = "") -> None:
 
         bridge = try_get_bridge()
         if bridge is not None:
-            from ouroboros.utils import utc_now_iso
-
-            bridge.push_log({"ts": utc_now_iso(), **row})
+            bridge.push_log(incident)
     except Exception:
         log.debug("Failed to surface cascade cancel incident for %s", task_id, exc_info=True)
 
