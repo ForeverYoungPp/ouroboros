@@ -51,6 +51,7 @@ def test_provider_probe_checks_exact_model_without_server_search(monkeypatch, tm
             return {"data": {"limit_remaining": 100}}
         assert method == "POST"
         captured["body"] = body
+        captured["headers"] = headers
         return {
             "id": "response-1",
             "model": "deepseek/deepseek-v4-flash-0731",
@@ -77,6 +78,11 @@ def test_provider_probe_checks_exact_model_without_server_search(monkeypatch, tm
 
     assert captured["body"]["messages"] == [{"role": "user", "content": "Reply with OK."}]
     assert "tools" not in captured["body"]
+    from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
+
+    assert {
+        key: captured["headers"][key] for key in OPENROUTER_APP_HEADERS
+    } == OPENROUTER_APP_HEADERS
     assert executor.provider_observation["observed_model"] == (
         "deepseek/deepseek-v4-flash-0731"
     )
