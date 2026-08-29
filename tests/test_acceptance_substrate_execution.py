@@ -104,10 +104,11 @@ def test_the_section_is_facts_only_no_acceptance_consumer_gates_on_it():
 
     repo = pathlib.Path(__file__).parents[1]
     hits = []
-    for path in (repo / "ouroboros").rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        if "substrate_execution" in text and path.name not in {"review_evidence.py", "delegate_evidence.py"}:
-            hits.append(path.name)
+    for root in ("ouroboros", "supervisor"):
+        for path in (repo / root).rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            if "substrate_execution" in text and path.name not in {"review_evidence.py", "delegate_evidence.py"}:
+                hits.append(path.name)
     assert hits == [], f"unexpected typed consumers of substrate_execution: {hits}"
     source = (repo / "ouroboros" / "review_evidence.py").read_text(encoding="utf-8")
     # The section is written into the packet and never compared/branched on.

@@ -19,13 +19,6 @@ DELEGATE_ACTIVITY_TOOLS = frozenset({
 # cheap tree_read/verify_and_record baseline reset.
 BASELINE_RESET_TOOLS = frozenset({"delegate_start", "schedule_subagent"})
 
-HOST_COORDINATION_ACTIVITY_TOOLS = frozenset({
-    "schedule_subagent", "wait_task", "wait_tasks", "get_task_result", "peek_task",
-    "tree_note", "tree_read", "verify_and_record", "cancel_task",
-    "discard_child_result", "override_delegation_constraint", "forward_to_worker",
-})
-
-
 def note_nanny_delegate_activity(
     ctx: Any,
     round_idx: int,
@@ -143,7 +136,6 @@ def nanny_burn_phrase(rounds: int, cost: float) -> str:
 
 # Compatibility spellings retained on ``ouroboros.loop`` through imports.
 _DELEGATE_ACTIVITY_TOOLS = DELEGATE_ACTIVITY_TOOLS
-_HOST_COORDINATION_ACTIVITY_TOOLS = HOST_COORDINATION_ACTIVITY_TOOLS
 _note_nanny_delegate_activity = note_nanny_delegate_activity
 _nanny_metered_since_delegate_activity = nanny_metered_since_delegate_activity
 _nanny_reminder_due = nanny_reminder_due

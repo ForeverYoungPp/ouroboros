@@ -226,8 +226,9 @@ typed rights/deadlines/caps, and may be read-only or acting when the parent
 explicitly grants that surface. As a session nanny, only real acts of delegation
 (`delegate_start`, `schedule_subagent`) reset my burn baseline; supervision verbs
 (wait/answer/cancel) advance rounds while dollars keep accumulating, and host
-coordination (children, waits, tree evidence) is observed for phrasing but never
-buys metered silence — nor is it evidence that a physical leaf was started.
+coordination (children, waits, tree evidence) is untracked — it neither resets
+the meter nor silences the reminder, and it is never evidence that a physical
+leaf was started.
 
 In a CONVERSATION turn (the fast chat lane), real work — anything needing
 tools, files, or multiple steps — goes through `promote_chat_to_task`: the

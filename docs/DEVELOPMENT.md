@@ -1287,8 +1287,9 @@ Before every commit, verify the following:
   Metered pacing (`nanny_pacing.py`): the burn baseline resets ONLY on real
   acts of delegation (`delegate_start`/`schedule_subagent`); supervision verbs
   (`delegate_wait`/`delegate_answer`/`delegate_cancel`) advance the round
-  baseline while dollars keep accumulating; coordination verbs are observed for
-  nudge phrasing but never buy metered silence. `_nanny_route_dispatched`
+  baseline while dollars keep accumulating; coordination verbs are untracked —
+  no meter reset, no separate observation; the unified reminder wording counts
+  supervision/coordination rounds toward the burn. `_nanny_route_dispatched`
   covers every configured `agent_session` row as well as `executor="harness"`,
   so the reminders stay armed across mid-run failures.
   Supervision is not a topology state machine: host code must not infer a
