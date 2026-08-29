@@ -29,14 +29,17 @@ def _fake_native_result(**overrides):
 
 
 def test_advisory_uses_the_shipped_default_model_helper():
-    """_run_claude_advisory resolves its model through _advisory_default_model()
-    (routed catalog id with a same-model direct-provider fallback) — never a
-    hardcoded model and never the retired Claude-SDK resolver."""
+    """_run_claude_advisory resolves its model through _advisory_native_model()
+    (the configured row or the shipped routed default, each through the
+    same-model payable-spelling fallback) — never a hardcoded model and never
+    the retired Claude-SDK resolver."""
     import inspect
     adv_mod = _get_advisory_module()
     source = inspect.getsource(adv_mod._run_claude_advisory)
-    assert "_advisory_default_model" in source
+    assert "_advisory_native_model" in source
     assert "resolve_claude_code_model" not in source
+    native_src = inspect.getsource(adv_mod._advisory_native_model)
+    assert "_same_model_payable_spelling" in native_src
 
 
 def test_advisory_row_effort_reaches_the_native_slot(monkeypatch, tmp_path):

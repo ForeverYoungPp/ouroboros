@@ -1029,7 +1029,10 @@ def _advisory_and_tests_gate(
             )
         except Exception:
             pass
-        test_err = _run_review_preflight_tests(ctx)
+        from ouroboros.commit_admission import run_tests_preflight_with_proof
+
+        test_err = run_tests_preflight_with_proof(
+            ctx, runner=lambda c: _run_review_preflight_tests(c))
         if test_err:
             msg = _tests_preflight_block_message(_managed_needs_proof, test_err)
             try:
@@ -1053,15 +1056,8 @@ def _advisory_and_tests_gate(
                 "message": msg,
                 "block_reason": "tests_preflight_blocked",
             }
-        # Q10 single-run: this green preflight IS the managed pre-commit proof.
-        # Process-held on ctx (the gates' authority, F2); the durable tx copy
-        # written alongside is forensic telemetry only.
-        try:
-            from supervisor.update_merge import record_managed_tests_proof
-
-            record_managed_tests_proof(ctx)
-        except Exception:
-            log.debug("managed tests evidence recording failed", exc_info=True)
+        # Q10 single-run: the green preflight IS the managed pre-commit proof —
+        # recorded by the shared admission helper (commit_admission SSOT).
     elif _advisory_bypassed:
         if skip_tests and _doc_only:
             _skip_reason = "skip_tests + doc_only"

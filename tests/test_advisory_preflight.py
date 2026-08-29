@@ -599,3 +599,36 @@ class TestPreflightBlockedPersistence:
             "A preflight_blocked record must NOT count as fresh — that would "
             "let repo_commit proceed without the SDK ever seeing the code."
         )
+
+
+class TestTestsPreflightProofBinding:
+    """The commit-admission SSOT owns the green-run -> Q10 proof coupling:
+    a green preflight ALWAYS records the managed proof (else the managed gate
+    pays a second identical full run), and the proof is only ever recorded off
+    a green run (else it forges admission evidence)."""
+
+    def _ctx(self, tmp_path):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            task_id="t", task_metadata={}, repo_dir=str(tmp_path),
+            emit_progress_fn=lambda *_a, **_k: None,
+        )
+
+    def test_red_run_returns_error_and_records_no_proof(self, tmp_path):
+        from ouroboros.commit_admission import run_tests_preflight_with_proof
+
+        ctx = self._ctx(tmp_path)
+        err = run_tests_preflight_with_proof(ctx, runner=lambda c: "FAILED: 2 failed")
+        assert err == "FAILED: 2 failed"
+        assert not getattr(ctx, "_managed_tests_proof_trees", None)
+
+    def test_green_run_records_the_managed_proof(self, tmp_path, monkeypatch):
+        from ouroboros.commit_admission import run_tests_preflight_with_proof
+        import supervisor.update_merge as um
+
+        ctx = self._ctx(tmp_path)
+        recorded = []
+        monkeypatch.setattr(um, "record_managed_tests_proof",
+                            lambda c: recorded.append(c) or "tree-sha")
+        assert run_tests_preflight_with_proof(ctx, runner=lambda c: None) is None
+        assert recorded == [ctx]

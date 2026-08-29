@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
-import re
 import subprocess
 from typing import List, Optional
 
@@ -48,7 +47,6 @@ from ouroboros.tools.review_helpers import (
     build_scope_section,
     check_worktree_readiness,
     check_worktree_version_sync as _check_worktree_version_sync_shared,
-    parse_changed_paths_from_porcelain,
     CRITICAL_FINDING_CALIBRATION,
     REVIEW_SEVERITY_THRESHOLDS,
     REVIEW_THOROUGHNESS_BLOCK,
@@ -164,126 +162,14 @@ def _get_changed_file_list(
         return f"⚠️ ADVISORY_ERROR: git status error: {exc}"
 
 
-def _changed_paths(repo_dir: pathlib.Path, paths: list[str] | None = None) -> list[str]:
-    status_text = _get_changed_file_list(repo_dir, paths=paths)
-    if status_text.startswith("⚠️ ADVISORY_ERROR"):
-        return []
-    return parse_changed_paths_from_porcelain(status_text)
-
-
-def _auto_sync_release_metadata_if_needed(
-    ctx: ToolContext,
-    repo_dir: pathlib.Path,
-    drive_root: pathlib.Path,
-    paths: list[str] | None,
-) -> list[str]:
-    """Sync VERSION-derived carriers before advisory snapshot hashing."""
-    selected = set(str(p) for p in (paths or []) if str(p).strip())
-    touched = set(_changed_paths(repo_dir))
-    if "VERSION" not in selected and "VERSION" not in touched:
-        return []
-    try:
-        from ouroboros.tools.release_sync import sync_release_metadata
-        changed = list(sync_release_metadata(str(repo_dir)) or [])
-        if changed:
-            subprocess.run(
-                ["git", "add", "--", *changed],
-                cwd=str(repo_dir),
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-            append_jsonl(drive_root / "logs" / "events.jsonl", {
-                "ts": utc_now_iso(),
-                "type": "release_metadata_auto_synced",
-                "changed_files": changed,
-                "task_id": str(getattr(ctx, "task_id", "") or ""),
-            })
-        return changed
-    except Exception as exc:
-        log.debug("release metadata auto-sync failed (non-fatal): %s", exc, exc_info=True)
-        return []
-
-
-def _release_metadata_preflight(
-    repo_dir: pathlib.Path,
-    commit_message: str,
-    paths: list[str] | None,
-) -> Optional[str]:
-    """Cheap P9/release checks over the current worktree before advisory SDK."""
-    touched = set(str(p) for p in (paths or []) if str(p).strip()) | set(_changed_paths(repo_dir, paths=paths))
-    version_in_scope = "VERSION" in touched
-    if touched and not version_in_scope:
-        return (
-            "⚠️ PREFLIGHT_BLOCKED: Changed files are present but VERSION is not in scope.\n"
-            "  BIBLE.md P9 requires every commit to bump VERSION and sync release artifacts.\n"
-            "  Stage or include VERSION plus pyproject.toml, web/package.json, README.md, and docs/ARCHITECTURE.md before advisory review.\n"
-            f"  Currently changed/in-scope: {', '.join(sorted(touched)) or '(none)'}"
-        )
-    if not version_in_scope:
-        return None
-    try:
-        from ouroboros.tools.release_sync import (
-            check_history_limit,
-            is_release_version,
-            version_carrier_desyncs,
-        )
-        version_path = repo_dir / "VERSION"
-        readme_path = repo_dir / "README.md"
-        pyproject_path = repo_dir / "pyproject.toml"
-        uv_lock_path = repo_dir / "uv.lock"
-        web_package_path = repo_dir / "web" / "package.json"
-        arch_path = repo_dir / "docs" / "ARCHITECTURE.md"
-        api_types_path = repo_dir / "web" / "modules" / "api_types.js"
-        site_install_path = repo_dir / "site" / "install" / "index.html"
-        docs_install_path = repo_dir / "docs" / "install" / "index.html"
-        version_str = version_path.read_text(encoding="utf-8").strip()
-        if not is_release_version(version_str):
-            return None
-        pyproject_text = pyproject_path.read_text(encoding="utf-8") if pyproject_path.exists() else ""
-        uv_lock_text = uv_lock_path.read_text(encoding="utf-8") if uv_lock_path.exists() else ""
-        web_package_text = web_package_path.read_text(encoding="utf-8") if web_package_path.exists() else ""
-        readme_text = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
-        arch_text = arch_path.read_text(encoding="utf-8") if arch_path.exists() else ""
-        api_types_text = api_types_path.read_text(encoding="utf-8") if api_types_path.exists() else ""
-        desync = version_carrier_desyncs(
-            version_str,
-            pyproject_text=pyproject_text,
-            uv_lock_text=uv_lock_text,
-            web_package_text=web_package_text,
-            readme_text=readme_text,
-            arch_text=arch_text,
-            api_types_text=api_types_text,
-            download_readme_text=readme_text,
-            site_install_text=(site_install_path.read_text(encoding="utf-8") if site_install_path.exists() else ""),
-            docs_install_text=(docs_install_path.read_text(encoding="utf-8") if docs_install_path.exists() else ""),
-            detailed=True,
-        )
-        if readme_text:
-            if not re.search(r'\|\s*' + re.escape(version_str) + r'\s*\|', readme_text):
-                return (
-                    f"⚠️ PREFLIGHT_BLOCKED: VERSION is {version_str} but README.md "
-                    "changelog has no table row for this version.\n"
-                    "  Add a changelog entry in the Version History table in README.md before advisory review."
-                )
-            limit_warnings = check_history_limit(readme_text)
-            if limit_warnings:
-                return (
-                    "⚠️ PREFLIGHT_BLOCKED: README.md Version History exceeds BIBLE.md P9 limits.\n"
-                    + "".join(f"  - {w}\n" for w in limit_warnings)
-                    + "  Trim the oldest entry in the over-limit category before advisory review."
-                )
-        if desync:
-            return (
-                f"⚠️ PREFLIGHT_BLOCKED: VERSION file says {version_str} but "
-                "the following worktree files have a different version value:\n"
-                + "".join(f"  - {d}\n" for d in desync)
-                + "Run release metadata sync before advisory review."
-            )
-    except Exception:
-        return None
-    return None
+# Deterministic admission preflights moved to ouroboros/commit_admission.py
+# (Q3=A SSOT). The module-level aliases below are this gate's monkeypatch
+# seams — the gate calls them through these names.
+from ouroboros.commit_admission import (  # noqa: E402
+    auto_sync_release_metadata_if_needed as _auto_sync_release_metadata_if_needed,
+    release_metadata_preflight as _release_metadata_preflight,
+    syntax_preflight_staged_py_files as _syntax_preflight_staged_py_files,
+)
 
 
 def _build_blocking_history_section(drive_root: pathlib.Path, repo_key: str = "") -> str:
@@ -630,46 +516,6 @@ def _check_expected_items(items: list, expected_items: Optional[List[str]]) -> t
     )
 
 
-def _syntax_preflight_staged_py_files(
-    repo_dir: pathlib.Path,
-    resolved_paths: List[str],
-) -> Optional[str]:
-    """Compile staged repo Python files before the expensive advisory SDK call."""
-    if not (repo_dir / "ouroboros" / "__init__.py").exists():
-        return None
-
-    errors: List[str] = []
-    for rel in resolved_paths:
-        if not rel.endswith(".py"):
-            continue
-        file_path = repo_dir / rel
-        try:
-            source = file_path.read_text(encoding="utf-8", errors="replace")
-        except FileNotFoundError:
-            continue
-        except OSError:
-            continue
-        try:
-            compile(source, rel, "exec", dont_inherit=True)
-        except SyntaxError as exc:
-            line = getattr(exc, "lineno", None) or "?"
-            msg = getattr(exc, "msg", None) or str(exc)
-            errors.append(f"{rel}:{line}: {msg}")
-        except ValueError as exc:
-            # Null bytes and tokenizer rejects are syntax preflight blockers too.
-            errors.append(f"{rel}:?: {exc}")
-
-    if not errors:
-        return None
-
-    return (
-        "⚠️ PREFLIGHT_BLOCKED: syntax errors:\n"
-        + "\n".join(f"- {err}" for err in errors)
-        + "\n\nFix the syntax error(s) above and re-run advisory_review. "
-        "Claude SDK advisory was skipped to save budget."
-    )
-
-
 ADVISORY_REVIEW_ROUTE_ENV = "OUROBOROS_ADVISORY_REVIEW_ROUTE"
 _ADVISORY_SESSION_MAX_SECONDS = 900  # the nanny's time cap replaces the SDK budget kill
 
@@ -693,34 +539,43 @@ def advisory_review_route() -> str:
     )
 
 
-def _advisory_default_model() -> str:
-    """The shipped advisory default on a route this install can actually pay.
+def _same_model_payable_spelling(model: str) -> str:
+    """``model`` on a spelling this install can actually pay.
 
-    The routed catalog id when its provider has credentials; otherwise the
-    SAME model through its direct-provider spelling (the direct-install
-    class); otherwise the routed id — the credentials gate then records its
-    loud audited bypass instead of a silent one.
+    The given id when its provider has credentials; otherwise the SAME model
+    through its direct-provider spelling (``provider/name`` →
+    ``provider::name`` — the direct-install class, e.g. an Anthropic-key-only
+    install with an OpenRouter catalog id); otherwise the id unchanged — the
+    credentials gate then records its loud audited bypass instead of a silent
+    one. Never a different model: an unpayable row is bypassed, not swapped.
     """
-    from ouroboros.provider_models import (
-        OPENROUTER_REVIEW_DEFAULTS,
-        model_has_credentials,
-    )
+    from ouroboros.provider_models import model_has_credentials
 
-    routed = str(OPENROUTER_REVIEW_DEFAULTS["advisory"])
-    if model_has_credentials(routed):
-        return routed
-    provider, _, name = routed.partition("/")
+    model = str(model or "").strip()
+    if not model or model_has_credentials(model):
+        return model
+    provider, _, name = model.partition("/")
     direct = f"{provider}::{name}" if name else ""
     if direct and model_has_credentials(direct):
         return direct
-    return routed
+    return model
+
+
+def _advisory_default_model() -> str:
+    """The shipped advisory default on a route this install can actually pay."""
+    from ouroboros.provider_models import OPENROUTER_REVIEW_DEFAULTS
+
+    return _same_model_payable_spelling(str(OPENROUTER_REVIEW_DEFAULTS["advisory"]))
 
 
 def _advisory_native_model() -> str:
     """The routed model the native advisory episode will run on."""
     from ouroboros.reviewer_slot_config import advisory_slot_config
 
-    return (advisory_slot_config().target_id or "").strip() or _advisory_default_model()
+    configured = (advisory_slot_config().target_id or "").strip()
+    if configured:
+        return _same_model_payable_spelling(configured)
+    return _advisory_default_model()
 
 
 def advisory_slot_enabled() -> bool:
@@ -1292,12 +1147,13 @@ def _run_claude_advisory(
         model = ""  # the session route resolves its own model; reported after the run
     else:
         # The native episode runs on the row's routed catalog model (6.1);
-        # '' keeps the shipped routed default. No provider credentials is a
+        # '' keeps the shipped routed default; either resolves through the
+        # same-model payable-spelling fallback. No provider credentials is a
         # loud typed error here — the commit gate pre-bypasses this state
         # (advisory_model_credentials_missing) before ever calling in.
         from ouroboros.provider_models import model_has_credentials
 
-        model = (_slot.target_id or "").strip() or _advisory_default_model()
+        model = _advisory_native_model()
         if not model_has_credentials(model):
             return [], (
                 f"⚠️ ADVISORY_ERROR: no provider credentials for advisory model "
@@ -2030,10 +1886,13 @@ def _advisory_pre_sdk_gate(
     if version_sync_warning:
         ctx.emit_progress_fn(f"⚠️ Advisory preflight: {version_sync_warning}")
 
-    # Test preflight before the expensive SDK call.
+    # Test preflight before the expensive delivery call.
     if not skip_tests:
-        ctx.emit_progress_fn("Running tests before advisory SDK call...")
-        test_err = _run_advisory_tests(ctx)
+        ctx.emit_progress_fn("Running tests before the advisory delivery call...")
+        from ouroboros.commit_admission import run_tests_preflight_with_proof
+
+        test_err = run_tests_preflight_with_proof(
+            ctx, runner=lambda c: _run_advisory_tests(c))
         if test_err:
             msg = (
                 "⚠️ TESTS_PREFLIGHT_BLOCKED: Tests must pass before advisory review.\n"
@@ -2061,18 +1920,9 @@ def _advisory_pre_sdk_gate(
                 "message": msg,
                 "readiness_warnings": readiness_warnings,
             })
-        ctx.emit_progress_fn("Tests passed ✓ — proceeding with advisory SDK call.")
-        # Single-run contract for managed-update resolutions (Q10): a green full
-        # hermetic run here is the proof for the exact candidate tree; the
-        # managed commit gate reuses it instead of paying a second full run.
-        # The gates' authority is the PROCESS-HELD ctx record (F2); the durable
-        # tx copy written alongside is forensic telemetry only.
-        try:
-            from supervisor.update_merge import record_managed_tests_proof
-
-            record_managed_tests_proof(ctx)
-        except Exception:
-            log.debug("managed tests evidence recording failed", exc_info=True)
+        # A green run already carries the Q10 managed proof: the shared
+        # admission helper records it (commit_admission SSOT).
+        ctx.emit_progress_fn("Tests passed ✓ — proceeding with the advisory delivery call.")
 
     return readiness_warnings, changed_files, None
 
