@@ -164,3 +164,85 @@ def test_blocked_session_bootstrap_terminals_unrun_with_alternatives(monkeypatch
     assert rows[-1]["type"] == "configured_subagent_startup_fault"
     assert rows[-1]["reason"] == "subscription_window_exhausted"
     assert rows[-1]["host_fallback"] is False
+
+
+def test_fence_outranks_the_blocked_terminal_and_carries_the_route_fact(
+    monkeypatch, tmp_path,
+):
+    # Charter F6 conjunction (grok triad finding): a durable zero-run fence over
+    # a BLOCKED dispatch must ride the episode — never the $0 terminal — and the
+    # wake receipt must carry the typed route_blocked facts visibly.
+    import ouroboros.subagent_bootstrap as bootstrap_module
+    from ouroboros.subagent_bootstrap import bootstrap_before_context
+
+    monkeypatch.setattr(
+        bootstrap_module, "_durable_zero_run_receipt",
+        lambda _ctx, gap_reasons=None: {
+            "zero_run_decision": "incomplete", "zero_run_basis": "recorded earlier",
+        },
+    )
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    ctx = SimpleNamespace(
+        task_id="child-fenced", drive_root=tmp_path,
+        budget_drive_root=str(tmp_path), task_metadata={},
+    )
+    dispatch = SimpleNamespace(
+        blocked=True,
+        executor_resolution=SimpleNamespace(
+            reason="subscription_window_exhausted", reset_at="2030-01-01T00:00:00Z",
+        ),
+    )
+    task = {"id": "child-fenced", "configured_subagent": snapshot,
+            "task_contract": {"objective": "Build"}}
+    raw = bootstrap_before_context(ctx, task, dispatch)
+    assert raw != ""  # the fence WAKES; no unrun terminal over a possibly-lived run
+    out = json.loads(raw)
+    assert out["status"] == "configured_session_actor_ready"
+    assert out["route_blocked"] == {
+        "reason": "subscription_window_exhausted",
+        "reset_at": "2030-01-01T00:00:00Z",
+    }
+    assert getattr(ctx, "_configured_startup_refusal", None) is None
+
+
+def test_definite_refusal_reaches_the_zero_dollar_terminal_without_a_model_round(
+    monkeypatch, tmp_path,
+):
+    # End-to-end pin (fable triad finding): the pre-start refusal seam is glue
+    # between two halves — this drives _handle_task_scoped and asserts the
+    # model is NEVER called and the durable record is the typed $0 terminal.
+    import json as _json
+
+    from ouroboros import agent as agent_module
+    import ouroboros.subagent_runtime as runtime
+    from tests.test_model_slot_role_model import _enqueue_through_supervisor
+
+    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
+    monkeypatch.setattr(agent_module.OuroborosAgent, "_log_worker_boot_once", lambda self: None)
+    monkeypatch.setattr("ouroboros.agent.build_llm_messages", lambda **kwargs: ([], {}))
+    calls: list = []
+    monkeypatch.setattr(agent_module, "run_llm_loop", lambda **kw: (
+        calls.append(kw) or ("model ran", {}, {"reasoning_notes": [], "tool_calls": []})
+    ))
+    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: _json.dumps({
+        "status": "refused", "reason": "credential_pool_exhausted",
+        "reset_at": "2030-01-01T00:00:00Z",
+    }))
+    monkeypatch.setattr(runtime, "current_subagent_alternatives", lambda _x: [])
+    import ouroboros.subagents as subagents
+    monkeypatch.setattr(subagents, "route_health", lambda *_a, **_k: ("", ""))
+    import ouroboros.claudexor_daemon as daemon
+    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: SimpleNamespace(close=lambda: None))
+
+    repo = tmp_path / "repo"; repo.mkdir()
+    drive = tmp_path / "drive"; drive.mkdir()
+    pinned = _enqueue_through_supervisor(tmp_path / "sched", monkeypatch, executor="harness")
+    pinned.update({"id": "pinned-refused", "chat_id": 1, "drive_root": str(drive)})
+    agent = agent_module.OuroborosAgent(agent_module.Env(repo_dir=repo, drive_root=drive))
+    agent.tools.available_tools = lambda: ["delegate_start", "delegate_wait", "delegate_cancel"]
+    agent._handle_task_scoped(dict(pinned))
+
+    assert calls == [], "a definite pre-start refusal must never reach the model"
+    record = _json.loads((drive / "task_results" / "pinned-refused.json").read_text())
+    assert float(record.get("cost_usd") or 0.0) == 0.0
+    assert "NOT run on metered API tokens" in str(record.get("result") or "")

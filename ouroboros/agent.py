@@ -351,8 +351,6 @@ def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool, delegate_ac
     ctx._nanny_finalization_injected = False
     ctx._nanny_metered_progress = None
     ctx._nanny_delegate_baseline = ({"round": 0, "cost": 0.0} if delegate_activity_seed else None)
-    ctx._nanny_coordination_activity = False
-    ctx._nanny_coordination_tools = ()
     ctx._nanny_physical_activity_seed = False
     ctx._nanny_reminder_mark = None
 

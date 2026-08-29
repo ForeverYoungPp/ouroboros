@@ -5368,8 +5368,8 @@ def _forced_delegation_note(tools_ctx: Any, llm_trace: Dict[str, Any]) -> str:
         if rounds >= NANNY_REMINDER_ROUNDS or cost >= NANNY_REMINDER_USD:
             return (
                 "\nNOTE: your delegated run(s) succeeded, but you have since spent "
-                f"{_nanny_burn_phrase(rounds, cost)} with no delegated-run activity. "
-                "Account for that metered spend honestly in your answer."
+                f"{_nanny_burn_phrase(rounds, cost)} beyond your last act of delegation. "
+                "Account for that spend honestly in your answer."
             )
         return ""
     if started > settled:

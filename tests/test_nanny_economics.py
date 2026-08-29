@@ -222,7 +222,10 @@ def test_the_baseline_advances_on_delegate_verbs_only():
     assert _nanny_metered_since_delegate_activity(ctx) == (0, 0.0)
 
 
-def test_host_coordination_is_activity_without_fabricating_physical_custody():
+def test_scheduling_a_child_is_a_real_act_of_delegation():
+    # schedule_subagent is a genuine act of delegation (charter D6): it fully
+    # resets the burn baseline. Coordination verbs are untracked entirely —
+    # no observation flag exists to buy phrasing or silence.
     from ouroboros.loop import (
         _nanny_metered_since_delegate_activity,
         _note_nanny_delegate_activity,
@@ -232,8 +235,7 @@ def test_host_coordination_is_activity_without_fabricating_physical_custody():
     _note_nanny_delegate_activity(ctx, 3, {"cost": 0.4}, [
         _delegate_call("schedule_subagent"),
     ])
-    assert ctx._nanny_coordination_activity is True
-    assert ctx._nanny_coordination_tools == ("schedule_subagent",)
+    assert not hasattr(ctx, "_nanny_coordination_activity")
     assert _nanny_metered_since_delegate_activity(ctx) == (0, 0.0)
 
 

@@ -110,7 +110,10 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
             # gets the fact from the scan it already pays for (B3).
             nudge_recorded = True
             continue
-        if str(row.get("type") or "") in (START_BLOCKED, custody.START_REQUESTED):
+        if str(row.get("type") or "") in (
+            START_BLOCKED, custody.START_REQUESTED,
+            "configured_subagent_startup_fault",
+        ):
             # An ATTEMPT is evidence of obedience even when nothing started:
             # a typed pre-mint refusal (START_BLOCKED) or a durable request
             # whose POST then failed (START_REQUESTED with no STARTED row).

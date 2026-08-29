@@ -1456,20 +1456,21 @@ def get_tools() -> List[ToolEntry]:
                 "host, so verification receipts are still yours to write. If no route is "
                 "configured or it is unavailable you get a typed refusal: choose an "
                 "explicit configured alternative, wait, narrow, or report blocked. A direct "
-                "fresh start requires subagent_id. In an actor-first configured session the "
-                "host already froze the route and canonical work order: call delegate_start(prompt='') or "
-                "put only optional advisory coordination context in prompt; do not copy the canonical brief. Recovery retries use retry_of without a new selector."
+                "fresh start requires subagent_id. In a configured session the host already STARTED the exact "
+                "leaf before your first round (the startup receipt carries its run id): never start a duplicate — "
+                "supervise it; a replacement delegate_start(prompt='') is legal only after verified cancellation/"
+                "terminal settlement or a typed refusal proving no run exists. Recovery retries use retry_of without a new selector."
             ),
             "parameters": {
                 "type": "object",
                 "required": ["prompt"],
                 "properties": {
                 "prompt": {"type": "string", "description":
-                    "Complete task for a direct start; for an actor-first snapshotted session, "
-                    "only optional advisory coordination context (the host supplies the canonical work order)."},
+                    "Complete task for a direct start; for the configured snapshotted session (retry/"
+                    "replacement), only optional advisory coordination context — the host supplies the canonical work order."},
                 "subagent_id": {"type": "string", "description":
                     "Required for a fresh start made directly: exact agent_session actor id from Available "
-                    "subagents. Omit for the current actor-first snapshotted route and for retry_of. API actor ids are refused here "
+                    "subagents. Omit for the current configured snapshotted route and for retry_of. API actor ids are refused here "
                     "and must be scheduled as recursive children."},
                 "root": {"type": "string", "enum": ["skill_payload"], "description":
                     "Optional exact-resource selector: 'skill_payload' delegates ONE "

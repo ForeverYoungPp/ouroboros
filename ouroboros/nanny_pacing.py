@@ -14,9 +14,9 @@ DELEGATE_ACTIVITY_TOOLS = frozenset({
 # the wait-style treatment of answer/cancel below is the operator's disclosed
 # reading of that plan — "only start/schedule reset" — not a separate owner
 # decision). Supervision verbs advance the round baseline while dollars keep
-# accumulating; every other coordination verb is observed for nudge phrasing
-# but never buys metered silence — the poltergeist pattern was tens of metered
-# rounds each "paid for" by a cheap tree_read/verify_and_record baseline reset.
+# accumulating; coordination verbs are untracked — never a meter reset, and
+# the poltergeist pattern was tens of metered rounds each "paid for" by a
+# cheap tree_read/verify_and_record baseline reset.
 BASELINE_RESET_TOOLS = frozenset({"delegate_start", "schedule_subagent"})
 
 HOST_COORDINATION_ACTIVITY_TOOLS = frozenset({
@@ -43,19 +43,14 @@ def note_nanny_delegate_activity(
     mark = {"round": int(round_idx), "cost": cost}
     ctx._nanny_metered_progress = mark
     verbs = set()
-    coordination_verbs = set()
     for call in tool_calls or []:
         fn = call.get("function") if isinstance(call, dict) else None
         name = str((fn or {}).get("name") or "").strip() if isinstance(fn, dict) else ""
         if name in DELEGATE_ACTIVITY_TOOLS or name in BASELINE_RESET_TOOLS:
             verbs.add(name)
-        if name in HOST_COORDINATION_ACTIVITY_TOOLS:
-            coordination_verbs.add(name)
-    if coordination_verbs:
-        # Observation only — a phrasing input for the reminder, never a meter
-        # reset (charter: coordination no longer buys metered silence).
-        ctx._nanny_coordination_activity = True
-        ctx._nanny_coordination_tools = tuple(sorted(coordination_verbs))
+    # Coordination verbs are deliberately NOT tracked: they neither reset the
+    # meter (charter) nor feed any reader — the unified reminder wording
+    # already counts supervision/coordination rounds toward the burn.
     if not verbs:
         return
     if verbs & BASELINE_RESET_TOOLS:

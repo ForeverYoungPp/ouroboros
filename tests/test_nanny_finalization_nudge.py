@@ -341,7 +341,6 @@ def test_host_coordination_no_longer_suppresses_zero_leaf_accusation(tmp_path):
     ctx = SimpleNamespace(
         _nanny_route_dispatched=True,
         _nanny_finalization_injected=False,
-        _nanny_coordination_activity=True,
         task_metadata={"budget_drive_root": str(drive)},
     )
     tools = _tools(ctx, ["delegate_start", "delegate_wait", "schedule_subagent"])
@@ -383,7 +382,6 @@ def test_actor_first_plain_finalization_requires_typed_zero_run_or_leaf(tmp_path
     ctx = SimpleNamespace(
         _nanny_route_dispatched=True,
         _nanny_finalization_injected=False,
-        _nanny_coordination_activity=True,
         task_id="actor-1",
         task_metadata={"budget_drive_root": str(drive)},
         _configured_actor_bootstrap={
