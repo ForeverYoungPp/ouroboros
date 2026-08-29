@@ -125,8 +125,9 @@ def test_watchdog_alerts_on_chat_turn_wedge(monkeypatch):
     monkeypatch.setattr("supervisor.message_bus.get_bridge", lambda: _Bridge())
     monkeypatch.setattr("supervisor.state.load_state", lambda: {"owner_chat_id": 7})
     monkeypatch.setattr("supervisor.state.append_jsonl", lambda *a, **k: None)
+    # The heartbeat stamp is MONOTONIC (OB-03) — seed it on the same clock.
     monkeypatch.setattr(w, "_chat_agent", types.SimpleNamespace(
-        _busy=True, _current_task_id="wedged1", _last_activity_ts=time.time() - 100))
+        _busy=True, _current_task_id="wedged1", _last_activity_ts=time.monotonic() - 100))
     stop = threading.Event()  # local per-test token
     try:
         server._start_supervisor_liveness_watchdog([time.monotonic()], stop)
@@ -146,7 +147,7 @@ def test_watchdog_alerts_on_chat_turn_wedge(monkeypatch):
     }
 
 
-# --- OB-03: the watchdog's two halves run on two different clocks ------------
+# --- OB-03: both watchdog halves share the one monotonic clock ---------------
 
 
 class _FakeServerClock:
@@ -253,15 +254,11 @@ def test_wall_clock_jump_neither_fabricates_nor_masks_a_supervisor_stall(monkeyp
     assert alerts[0][2]["progress_meta"]["task_incident"] == "supervisor_loop_stall"
 
 
-def test_wedge_half_stays_on_the_wall_clock_under_a_monotonic_tick(monkeypatch):
-    """OB-03 regression: the wedge half must keep comparing WALL stamps.
-
-    ``agent._last_activity_ts`` is a ``time.time()`` stamp. Swapping the whole
-    watchdog to one monotonic ``now`` makes ``now - turn_ts`` a large NEGATIVE
-    number on any host whose uptime is shorter than the Unix epoch — i.e. every
-    host — so ``_chat_turn_wedged`` would answer False forever and this alert
-    would silently never fire again. That is the split this test defends.
-    """
+def test_wall_clock_jump_neither_fabricates_nor_masks_a_chat_turn_wedge(monkeypatch):
+    """OB-03, the wedge half — the CONTRACT, not the implementation: a silent chat
+    turn is detected, and a wall-clock jump neither fabricates a wedge nor masks one.
+    ``agent._last_activity_ts`` is a monotonic stamp (agent.py), compared against the
+    same monotonic ``now`` as the stall half — one clock, one class."""
     import types
 
     import server
@@ -270,19 +267,57 @@ def test_wedge_half_stays_on_the_wall_clock_under_a_monotonic_tick(monkeypatch):
     monkeypatch.setenv("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC", "1")
     alerts = _collect_alerts(monkeypatch, 13)
 
+    boot_mono = 500.0
     wall = 1_700_000_000.0
-    clock = _FakeServerClock(wall=wall, mono=42.0)  # a freshly booted host
+    clock = _FakeServerClock(wall=wall, mono=boot_mono)
     monkeypatch.setattr(server, "time", clock)
-    monkeypatch.setattr(w, "_chat_agent", types.SimpleNamespace(
-        _busy=True, _current_task_id="wedged-split", _last_activity_ts=wall - 100.0))
+    agent_stub = types.SimpleNamespace(
+        _busy=True, _current_task_id="wedged-mono", _last_activity_ts=boot_mono)
+    monkeypatch.setattr(w, "_chat_agent", agent_stub)
     stop = threading.Event()  # local per-test token
     try:
-        # Liveness tick == the current monotonic reading: the loop is HEALTHY.
-        server._start_supervisor_liveness_watchdog([clock.mono], stop)
+        server._start_supervisor_liveness_watchdog([boot_mono], stop)
+        # The turn heartbeat is fresh; an hour-forward WALL step must not invent a
+        # wedge (pre-fix, a wall-fed comparison fabricated exactly this alert).
+        clock.wall = wall + 3600.0
+        _wait_until(lambda: clock.ticks >= 3)
+        assert alerts == [], "a wall-clock jump must not fabricate a chat-turn wedge"
+
+        # A genuine wedge: 100s of MONOTONIC heartbeat silence while the loop's own
+        # tick stays healthy; a backward wall step cannot hide it.
+        clock.wall = wall - 86_400.0
+        clock.mono = boot_mono + 100.0
+        stop_liveness = [clock.mono]  # loop keeps ticking; only the TURN is silent
+        _stop_watchdog(stop)
+        stop = threading.Event()
+        alerts.clear()
+        server._start_supervisor_liveness_watchdog(stop_liveness, stop)
         _wait_until(lambda: alerts)
     finally:
         _stop_watchdog(stop)
-    assert alerts, "a wall-stale chat turn must still be detected under a monotonic tick"
+    assert alerts, "a heartbeat-silent chat turn must be detected under any wall clock"
     assert "wedged" in alerts[0][1]
-    assert alerts[0][2]["task_id"] == "wedged-split"
+    assert alerts[0][2]["task_id"] == "wedged-mono"
     assert not any("stalled" in a[1] for a in alerts)  # the healthy tick raised nothing
+
+
+def test_watchdog_and_heartbeat_writers_share_the_monotonic_clock():
+    """Source-level pin of the PRODUCTION writers (the behavioural tests above feed
+    hand-built stamps, so a writer regressed to ``time.time()`` would leave them
+    green): the supervisor loop's two liveness stamps and the direct-chat turn's two
+    heartbeat stamps must all be taken on ``time.monotonic()``. The idiom follows
+    test_server_shutdown.py's existing ``inspect.getsource`` pin of _run_supervisor.
+    """
+    import inspect
+    import re
+
+    import server
+    from ouroboros.agent import OuroborosAgent
+
+    sup_src = inspect.getsource(server._run_supervisor)
+    liveness_writes = re.findall(r"_loop_liveness(?:\[0\])?\s*=\s*\[?time\.(\w+)\(\)", sup_src)
+    assert liveness_writes and set(liveness_writes) == {"monotonic"}, liveness_writes
+
+    agent_src = inspect.getsource(OuroborosAgent)
+    heartbeat_writes = re.findall(r"_last_activity_ts\s*=\s*time\.(\w+)\(\)", agent_src)
+    assert heartbeat_writes and set(heartbeat_writes) == {"monotonic"}, heartbeat_writes

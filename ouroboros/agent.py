@@ -469,8 +469,9 @@ class OuroborosAgent:
 
         self._incoming_messages: queue.Queue = queue.Queue()
         self._busy = False
-        # WS3 (v6.34.0): wall-clock of the last liveness tick for the CURRENT turn
-        # (set at turn start, refreshed by the heartbeat loop, cleared when idle). The
+        # WS3 (v6.34.0): MONOTONIC stamp of the last liveness tick for the CURRENT turn
+        # (set at turn start, refreshed by the heartbeat loop, cleared when idle) — the
+        # watchdog compares it as an elapsed gap, so a wall-clock jump must not touch it. The
         # supervisor liveness watchdog reads it directly to spot a wedged chat turn —
         # the direct turn is in-process, not a worker RUNNING entry, so its heartbeat
         # is invisible to the worker queue.
@@ -1439,14 +1440,14 @@ class OuroborosAgent:
         # WS3: stamp liveness at turn start and on every tick, INDEPENDENT of the event
         # queue, so the watchdog can spot a wedged in-process chat turn even when this
         # agent has no event queue (the direct chat lane).
-        self._last_activity_ts = time.time()
+        self._last_activity_ts = time.monotonic()
         emit = self._event_queue is not None
         if emit:
             self._emit_task_heartbeat(task_id, "start")
 
         def _loop() -> None:
             while not stop.wait(interval):
-                self._last_activity_ts = time.time()
+                self._last_activity_ts = time.monotonic()
                 if emit:
                     self._emit_task_heartbeat(task_id, "running")
 

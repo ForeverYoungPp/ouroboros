@@ -34,7 +34,6 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from ouroboros.platform_layer import (
-    _proc_start_ticks,
     kill_process_group_id,
     kill_process_tree,
     pid_is_alive,
@@ -128,7 +127,19 @@ def record_process(
         "pid": int(pid),
         "pgid": int(pgid or 0) if reap_process_group else 0,
         "fingerprint": {
-            "start_time": process_start_time(pid),
+            # DOWNGRADE-SAFE split: the unversioned field keeps the legacy ``ps``
+            # spelling an N-1 reader still understands (a rollback that reads a
+            # boot-qualified token here would mismatch every row and prune it
+            # WITHOUT killing, orphaning the process forever), while the current
+            # reader prefers the boot-qualified sibling below. One extra ``ps``
+            # per SPAWN (the write path always paid it before /proc-first); the
+            # hot sweep path stays subprocess-free.
+            "start_time": (legacy_start := process_start_time_legacy(pid)),
+            **(
+                {"start_time_boot": boot_start}
+                if (boot_start := process_start_time(pid)) and boot_start != legacy_start
+                else {}
+            ),
             # The LIVE command line (what the OS reports) is the reap-time
             # comparison anchor; the argv we passed may differ cosmetically.
             "cmd_sha256": _live_cmd_sha256(pid) or _cmd_sha256(cmd),
@@ -185,35 +196,37 @@ def spawn_supervised(
 
 
 def _legacy_start_matches(pid: int, recorded: str, current: str) -> bool:
-    """Accept a start-time token written BEFORE /proc-first, so the upgrade orphans no ledger row.
+    """Compare a recorded LEGACY spelling against a live boot-qualified token.
 
-    ``process_start_time`` now returns a boot-qualified ``"<ticks>.<boot8>"``. A row written
-    before that change carries the ``ps -o lstart=`` spelling instead, or — on the rare path
-    where ``ps`` itself failed — a BARE boot-relative tick count. Both are accepted, and only
-    here: this runs solely AFTER the current token already failed to match, so the extra ``ps``
-    stays off the reaper's hot path and a genuinely different process still fails every form.
-    A bare-tick row resolves against /proc directly even when the current primary token is the
-    ``ps`` spelling (boot id unreadable), so no legacy row shape is orphaned on a /proc host.
+    Runs solely AFTER the direct equalities already failed, so the one extra ``ps``
+    stays off the reaper's hot path and a genuinely different process still fails
+    every form. ``recorded`` is the ``ps -o lstart=`` field (the spelling the ledger
+    keeps writing for downgrade safety) or, from the one host class with no usable
+    ``ps``, a bare tick count — which ``process_start_time_legacy`` reproduces there,
+    so that shape resolves too. What this helper deliberately does NOT do is treat a
+    bare tick as the tick-half of a boot-qualified live token: ticks recur across
+    reboots, and a token carrying no boot id must never authorize a kill (a mismatch
+    prunes; it does not kill).
 
-    BOUNDED EXPOSURE, stated rather than hidden: the bare-tick form carries no boot id, so such a
-    row can still collide across a reboot exactly as it always could (same ticks, recycled pid,
-    same command line). No post-change token is written in that form — a /proc mint is
-    boot-qualified, a ``ps`` string, or separator-carrying — so the PRE-CHANGE window closes as the
-    ledger turns over. What does NOT close by turnover is the separator form itself, minted only
-    when the boot id AND ``ps`` both fail: two of those from different boots string-match on the
-    equality check above, before this helper is ever consulted. That is why the separator form is
-    the last resort rather than the boot-id-less default.
+    Residual, stated rather than hidden: the ``"<ticks>."`` separator form, minted
+    only when the boot id AND ``ps`` both fail, string-matches its cross-boot twin on
+    the direct equality BEFORE this helper is consulted. That is why the separator
+    form is the mint order's last resort rather than the boot-id-less default.
     """
     ticks, sep, _ = current.partition(".")
     if not (sep and ticks.isdigit()):
         # The current token IS the legacy ``ps`` form (no /proc, or the boot id was
-        # unreadable so ``ps`` won the mint order). Re-running ``ps`` would return the
-        # byte-identical value that already failed to match — but a recorded BARE-TICK
-        # row is still resolvable against /proc directly (0 on hosts without /proc,
-        # which never equals a digit row), at zero subprocess cost.
-        return recorded.isdigit() and recorded == str(_proc_start_ticks(pid))
-    if recorded.isdigit() and recorded == ticks:
-        return True  # pre-change bare-tick fallback row; the tick half of today's token
+        # unreadable so ``ps`` won the mint order): re-running ``ps`` would return the
+        # byte-identical value that already failed the equality above, and a bare-tick
+        # row deliberately does NOT resolve here — see below.
+        return False
+    # A token carrying NO boot id must never authorize a kill: boot-relative ticks
+    # recur across reboots, and a recycled pid + the same command hash is exactly the
+    # cross-boot collision this change exists to refuse. The one host class that ever
+    # MINTS bare ticks (no usable ``ps``) still resolves through
+    # ``process_start_time_legacy``, whose own fallback IS ``str(ticks)`` there; on a
+    # ``ps``-capable host a bare-tick row compares against the ``ps`` spelling, fails,
+    # and is PRUNED — the safe direction (prune, never kill).
     return bool(recorded) and process_start_time_legacy(pid) == recorded
 
 
@@ -230,11 +243,25 @@ def _fingerprint_matches(entry: Dict[str, Any]) -> bool:
     if pid <= 0 or not pid_is_alive(pid):
         return False
     fp = entry.get("fingerprint") if isinstance(entry.get("fingerprint"), dict) else {}
+    recorded_boot = str(fp.get("start_time_boot") or "")
     recorded_start = str(fp.get("start_time") or "")
-    if recorded_start:
+    if recorded_boot or recorded_start:
         live_start = process_start_time(pid)
-        if live_start and live_start != recorded_start and not _legacy_start_matches(
-            pid, recorded_start, live_start
+        if live_start and not (
+            # Preferred: the exact boot-qualified token of a row written by THIS line.
+            (recorded_boot and live_start == recorded_boot)
+            # Same-form equality (macOS/BSD ``ps`` rows, and every pre-upgrade row
+            # whose spelling the live mint still produces).
+            or live_start == recorded_start
+            # Compatibility spellings: a boot-qualified live token against the
+            # legacy ``ps`` field (boot id became readable mid-generation, or a
+            # pre-upgrade row) — one ``ps``, only on this already-mismatched path,
+            # and ONLY for rows carrying no boot sibling: a mismatched recorded
+            # boot token is POSITIVE evidence of another boot, and on a ``ps``-less
+            # host the legacy helper degrades to bare ticks, which would let a
+            # cross-boot recycled pid resolve through the fallback. Refuted boot
+            # evidence prunes; it never re-qualifies through a weaker spelling.
+            or (not recorded_boot and _legacy_start_matches(pid, recorded_start, live_start))
         ):
             return False
     recorded_cmd = str(fp.get("cmd_sha256") or "")
@@ -522,7 +549,8 @@ def reap_orphaned_processes(
         # the cheap path only ever KEEPS: an alive-but-RECYCLED same-session pid is
         # retained one generation (foreign next generation -> full fingerprint ->
         # prune), never killed. The skipped fingerprint only cost a `ps` per row on
-        # every 600s tick and startup sweep. This is the hot majority of the ledger:
+        # every 600s tick (the startup sweep sees prior-generation rows as
+        # foreign-session, so it saves nothing there). This is the hot majority of the ledger:
         # worker-pool members, the SyncManager, the claudexor daemon, the local-model
         # server and keep-services are all scope="session".
         #

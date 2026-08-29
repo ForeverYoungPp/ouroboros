@@ -990,16 +990,12 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
         wedged_task = None
         while not _restart_requested.is_set() and not (stop_event is not None and stop_event.is_set()):
             time.sleep(interval)
-            # TWO clocks, deliberately: each half must read the SAME clock its own
-            # stamps were taken on. The liveness tick is monotonic (it measures an
-            # elapsed gap, and a wall-clock jump — NTP step, DST/timezone change,
-            # manual set, VM resume — must neither fabricate a stall nor mask one),
-            # while the chat-turn wedge compares against ``agent._last_activity_ts``,
-            # a WALL stamp (agent.py). Feeding a monotonic ``now`` into that half
-            # would make ``now - turn_ts`` hugely negative and silently disable wedge
-            # detection forever. Do not collapse these back into one variable.
+            # ONE clock: both halves measure an ELAPSED GAP against stamps taken on
+            # the monotonic clock (the loop-liveness tick here, and the chat-turn
+            # heartbeat in agent.py), so a wall-clock jump — NTP step, DST/timezone
+            # change, manual set, VM resume — can neither fabricate a stall/wedge
+            # nor mask a real one on either half.
             now = time.monotonic()
-            now_wall = time.time()
             # (1) Supervisor loop stall — new-message intake starvation.
             if _supervisor_loop_stalled(liveness[0], now, deadline):
                 if not loop_alerted:
@@ -1025,7 +1021,10 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
                                 is_progress=True,
                                 progress_meta={
                                     "task_incident": "supervisor_loop_stall",
-                                    "toast_once": f"supervisor-loop-stall:{int(liveness[0])}",
+                                    # pid disambiguates server GENERATIONS: the monotonic stamp alone can
+                                    # repeat at a similar uptime offset across restarts, and the browser's
+                                    # toast-dedupe set outlives this process while the page stays open.
+                                    "toast_once": f"supervisor-loop-stall:{os.getpid()}:{int(liveness[0])}",
                                 },
                             )
                     except Exception:
@@ -1039,9 +1038,9 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
                 busy, turn_task, turn_ts = chat_turn_liveness()
             except Exception:
                 busy, turn_task, turn_ts = (False, None, None)
-            if _chat_turn_wedged(busy, turn_ts, now_wall, deadline):
+            if _chat_turn_wedged(busy, turn_ts, now, deadline):
                 if wedged_task != turn_task:  # alert once per wedged turn
-                    _alert_chat_turn_wedge(turn_task, now_wall - (turn_ts or now_wall))
+                    _alert_chat_turn_wedge(turn_task, now - (turn_ts or now))
                     wedged_task = turn_task
             elif not busy:
                 wedged_task = None

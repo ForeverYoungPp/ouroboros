@@ -585,7 +585,12 @@ def _fingerprint_entry(tmp_path, *, start_time=None):
     )
     if start_time is None:
         start_time = process_custody.process_start_time_legacy(proc.pid)
-    return proc, dict(record, fingerprint=dict(record["fingerprint"], start_time=start_time))
+    fp = dict(record["fingerprint"], start_time=start_time)
+    # The override simulates a PRE-change row: those carry no boot-qualified sibling
+    # (the current writer's `start_time_boot` would otherwise satisfy the boot-first
+    # equality and mask what the compatibility comparison under test actually does).
+    fp.pop("start_time_boot", None)
+    return proc, dict(record, fingerprint=fp)
 
 
 @_POSIX_ONLY
@@ -609,16 +614,21 @@ def test_fingerprint_accepts_a_pre_upgrade_ps_start_time(tmp_path, monkeypatch):
 
 
 @_POSIX_ONLY
-def test_fingerprint_accepts_a_pre_upgrade_bare_tick_row(tmp_path, monkeypatch):
-    """The rare pre-change row where ``ps`` failed carries a BARE boot-relative tick.
-
-    It is accepted against the tick half of today's token — the bounded compatibility
-    the matcher documents. Nothing new is ever written in this form.
+def test_fingerprint_refuses_a_bare_tick_row_on_a_ps_capable_host(tmp_path, monkeypatch):
+    """A recorded BARE tick (pre-change ps-failed fallback) must never authorize a kill:
+    ticks recur across reboots, so matching it against the tick half of a boot-qualified
+    live token is exactly the cross-boot collision the boot id exists to refuse. On a
+    ``ps``-capable host the row compares against the ``ps`` spelling, fails, and is
+    PRUNED — the safe direction. (The one host class that ever MINTS bare ticks has no
+    usable ``ps``; there ``process_start_time_legacy`` reproduces the bare tick and the
+    row still resolves — the matrix pins that arm.)
     """
     proc, entry = _fingerprint_entry(tmp_path, start_time="4242")
     try:
         monkeypatch.setattr(process_custody, "process_start_time", lambda pid: "4242.deadbeef")
-        assert process_custody._fingerprint_matches(entry) is True
+        monkeypatch.setattr(
+            process_custody, "process_start_time_legacy", lambda pid: "Mon Aug 25 12:00:00 2026")
+        assert process_custody._fingerprint_matches(entry) is False
     finally:
         proc.kill(); proc.wait(timeout=5)
 
@@ -638,11 +648,74 @@ def test_fingerprint_rejects_identical_ticks_from_another_boot(tmp_path, monkeyp
         proc.kill(); proc.wait(timeout=5)
 
 
+@_POSIX_ONLY
+def test_writer_keeps_the_legacy_spelling_downgrade_safe(tmp_path):
+    """Rollback safety (the durable-format hazard): the unversioned ``start_time``
+    field keeps the ``ps`` spelling an N−1 reader compares with its own
+    ``process_start_time`` — so after a managed-update ROLLBACK every row written by
+    this version still matches its live process (kill/prune reasoning intact) instead
+    of silently pruning WITHOUT a kill and orphaning the process forever. The
+    boot-qualified token rides the separate ``start_time_boot`` sibling, which an old
+    reader simply ignores."""
+    proc = _sleeper(tmp_path, "ob06-writer", "task")
+    try:
+        fp_row = record_process(
+            tmp_path, pid=proc.pid, cmd=["sleep", "60"], purpose="ob06w", scope="task",
+        )["fingerprint"]
+        legacy = process_custody.process_start_time_legacy(proc.pid)
+        assert fp_row["start_time"] == legacy, "the N-1 reader's comparison value"
+        boot = process_custody.process_start_time(proc.pid)
+        if boot and boot != legacy:  # Linux with a readable boot id
+            assert fp_row.get("start_time_boot") == boot
+        else:  # macOS/BSD: one spelling only, no redundant sibling
+            assert "start_time_boot" not in fp_row
+        # And the CURRENT reader accepts its own row (boot-first, no ps needed).
+        assert process_custody._fingerprint_matches(
+            {"pid": proc.pid, "fingerprint": fp_row}) is True
+    finally:
+        proc.kill(); proc.wait(timeout=5)
+
+
+@_POSIX_ONLY
+def test_sibling_free_row_falls_back_to_the_legacy_field(tmp_path, monkeypatch):
+    """The REACHABLE mid-generation case: the boot id was unreadable at mint (so the
+    row carries only the ``ps`` spelling, no boot sibling) and became readable by the
+    sweep — one ``ps`` on this already-mismatched path keeps the row instead of
+    pruning a live owned process."""
+    real_ps = process_custody.process_start_time_legacy(os.getpid())
+    if not real_ps or real_ps.isdigit():
+        pytest.skip("no usable ps/lstart start-time token on this host")
+    proc, entry = _fingerprint_entry(tmp_path, start_time=None)
+    try:
+        live_legacy = process_custody.process_start_time_legacy(proc.pid)
+        fp = {"start_time": live_legacy}
+        monkeypatch.setattr(process_custody, "process_start_time", lambda pid: "4242.aabbccdd")
+        assert process_custody._fingerprint_matches(dict(entry, fingerprint=fp)) is True
+    finally:
+        proc.kill(); proc.wait(timeout=5)
+
+
+@_POSIX_ONLY
+def test_refuted_boot_evidence_never_requalifies_through_bare_ticks(tmp_path, monkeypatch):
+    """A row minted on a ``ps``-less host carries a bare-tick ``start_time`` PLUS a
+    boot-qualified sibling. After a reboot, the mismatched sibling is positive evidence
+    of another boot; the legacy helper (which degrades to bare ticks there) must not
+    re-qualify the cross-boot recycled pid — the row prunes, never kills."""
+    proc, entry = _fingerprint_entry(tmp_path, start_time=None)
+    try:
+        fp = {"start_time": _B, "start_time_boot": _Q}
+        monkeypatch.setattr(process_custody, "process_start_time", lambda pid: _Q2)
+        monkeypatch.setattr(process_custody, "process_start_time_legacy", lambda pid: _B)
+        assert process_custody._fingerprint_matches(dict(entry, fingerprint=fp)) is False
+    finally:
+        proc.kill(); proc.wait(timeout=5)
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc start times are Linux-only")
 def test_process_start_time_is_boot_qualified_on_linux():
     """On Linux the token comes from /proc and carries the boot id, without spawning ``ps``."""
     token = process_custody.process_start_time(os.getpid())
-    assert re.fullmatch(r"\d+\.[0-9a-f]{1,8}", token), token
+    assert re.fullmatch(r"\d+\.[0-9a-f]{1,32}", token), token
     assert token != process_custody.process_start_time_legacy(os.getpid())
 
 
@@ -653,6 +726,9 @@ def test_foreign_row_mismatch_costs_no_second_ps_without_proc(tmp_path, monkeypa
     Re-running ``ps`` there would return the byte-identical value that just failed to
     match, so the mismatch path must refuse before paying for a second subprocess.
     """
+    proc, entry = _fingerprint_entry(tmp_path, start_time="FOREIGN")
+    # The WRITE path legitimately pays one ``ps`` for the downgrade-safe legacy field;
+    # the claim under test is about the SWEEP's mismatch path, so count from here.
     calls = []
     real_legacy = process_custody.process_start_time_legacy
     monkeypatch.setattr(
@@ -660,7 +736,6 @@ def test_foreign_row_mismatch_costs_no_second_ps_without_proc(tmp_path, monkeypa
         lambda pid: (calls.append(pid), real_legacy(pid))[1],
     )
     monkeypatch.setattr(process_custody, "process_start_time", lambda pid: "Mon Aug 25 12:00:00 2026")
-    proc, entry = _fingerprint_entry(tmp_path, start_time="FOREIGN")
     try:
         assert process_custody._fingerprint_matches(entry) is False
         assert calls == [], f"a legacy-form current token must not trigger a second ps; got {calls}"
@@ -739,9 +814,9 @@ def test_boot_id_read_failure_retries_then_latches(monkeypatch, boom):
 
     # The failed read falls to the collision-free ps token, NOT to "7." (see the priority order).
     assert platform_layer.process_start_time(os.getpid()) == "Mon Aug 25 12:00:00 2026"
-    assert platform_layer.process_start_time(os.getpid()) == "7.aabbccdd"   # retried, boot id now readable
+    assert platform_layer.process_start_time(os.getpid()) == "7.aabbccdd000000000000000000000000"   # retried, boot id now readable
     assert len(attempts) == 2
-    assert platform_layer.process_start_time(os.getpid()) == "7.aabbccdd"   # latched
+    assert platform_layer.process_start_time(os.getpid()) == "7.aabbccdd000000000000000000000000"   # latched
     assert len(attempts) == 2, "a successful read must latch and stop re-reading"
 
 
@@ -759,11 +834,11 @@ _Q, _Q2, _P, _S, _B = "4242.aabbccdd", "4242.bbbbbbbb", "Mon Aug 25 12:00:00 202
     (_Q, _Q, True, "same boot, same ticks"),
     (_Q, _Q2, False, "SAME ticks from another boot must never match"),
     (_Q, _P, True, "pre-change ps row still matches after the upgrade"),
-    (_Q, _B, True, "pre-change bare-tick fallback row still matches"),
+    (_Q, _B, False, "a bare tick carries no boot id and must never authorize a kill (prunes)"),
     (_Q, _S, False, "a row from a boot-id outage window mismatches after recovery (prunes, never kills)"),
     (_P, _P, True, "no boot id on either side: the ps token is the identity"),
     (_P, _Q, False, "a boot-qualified row mismatches once the boot id stops being readable"),
-    (_P, _B, True, "a bare-tick row resolves against /proc directly even when the primary token is ps"),
+    (_P, _B, False, "a bare-tick row against a ps-form live token prunes (never a tick-half kill)"),
     (_S, _S, True, "the disclosed last-resort collision: both sides degraded identically"),
     (_S, _B, True, "pre-change bare tick still matches the tick half of the last-resort form"),
     (_S, _P, False, "ps is broken here, so a ps-format row cannot be re-derived"),
@@ -775,8 +850,6 @@ def test_start_time_match_matrix(tmp_path, monkeypatch, live, recorded, expected
     monkeypatch.setattr(process_custody, "process_start_time_legacy",
                         lambda pid: _P if live in (_Q, _P) else _B)
     monkeypatch.setattr(process_custody, "process_start_time", lambda pid: live)
-    # simulated readable /proc: the direct bare-tick comparator sees today's tick count
-    monkeypatch.setattr(process_custody, "_proc_start_ticks", lambda pid: 4242)
     proc, entry = _fingerprint_entry(tmp_path, start_time=recorded)
     try:
         assert process_custody._fingerprint_matches(entry) is expected, why
