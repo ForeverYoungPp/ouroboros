@@ -259,9 +259,9 @@ def test_malformed_named_authority_shapes_refuse_before_model_or_tool_work(monke
 
 def test_context_build_exception_after_pre_start_still_propagates(monkeypatch, tmp_path):
     # Charter (owner 2026-08-28): the leaf pre-starts BEFORE the context build,
-    # so a context-assembly failure now happens with a settled run behind it.
+    # so a context-assembly failure now happens with a LIVE run behind it.
     # The failure must still propagate loudly (the durable custody rows let the
-    # retry adopt the finished run instead of starting a duplicate).
+    # retry adopt the running leaf instead of starting a duplicate).
     from ouroboros import agent as agent_module
     import ouroboros.claudexor_daemon as daemon
     import ouroboros.delegate_supervision as supervision
@@ -282,10 +282,7 @@ def test_context_build_exception_after_pre_start_still_propagates(monkeypatch, t
     ))
     monkeypatch.setattr(
         supervision, "supervised_wait",
-        lambda _ctx, run_id, **_kw: (
-            order.append("supervised_wait")
-            or json.dumps({"status": "leaf_terminal", "run_id": run_id})
-        ),
+        lambda *_a, **_kw: pytest.fail("the host must not wait inside bootstrap (owner 1=A)"),
     )
     def fail_context(**_kwargs):
         order.append("context_build_failed")
@@ -306,7 +303,7 @@ def test_context_build_exception_after_pre_start_still_propagates(monkeypatch, t
             "task_contract": {"objective": "Build", "expected_output": "Patch"},
             "drive_root": str(drive), "budget_drive_root": str(drive),
         })
-    assert order == ["physical_start", "supervised_wait", "context_build_failed"]
+    assert order == ["physical_start", "context_build_failed"]
 
 
 @pytest.mark.parametrize("message_kind", ["owner", "task"])

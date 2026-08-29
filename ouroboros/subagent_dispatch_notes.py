@@ -46,8 +46,9 @@ def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
             return (
                 f"EXECUTOR: your parent selected the configured agent-session route ({route}). "
                 "You are its Ouroboros NANNY. The host starts the exact configured leaf run "
-                "BEFORE your first metered round and wakes you on meaningful facts; the "
-                "startup/wake receipt in this context is the truth about that run. Your "
+                "BEFORE your first metered round; the startup/wake receipt in this context "
+                "is the truth about that run, and waiting on it is your own call "
+                "(delegate_wait when you want its facts). Your "
                 "metered rounds are for judgment — verify and integrate what the run "
                 "produces, answer its authorized questions, decide recovery — never for "
                 "rebuilding its work: co-building beside a delegated run is a metered "

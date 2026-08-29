@@ -177,8 +177,11 @@ def _pre_start_leaf(
     ctx: Any, task: Mapping[str, Any], actor_bootstrap: dict[str, Any],
 ) -> str:
     """Start the exact snapshotted leaf through the SAME wrapper the model's
-    ``delegate_start(prompt="")`` uses, then sleep until the first meaningful
-    wake. One start path, one set of refusal shapes (P7 SSOT)."""
+    ``delegate_start(prompt="")`` uses. One start path, one set of refusal
+    shapes (P7 SSOT). The host never WAITS here (owner 2026-08-29, 1=A):
+    the nanny's first round arrives immediately with the live run's receipt —
+    waiting is the model's own ``delegate_wait`` decision, so owner messages,
+    hurry controls and parallel children stay live for the whole run."""
 
     from ouroboros.subagent_runtime import delegate_start_entry
 
@@ -196,16 +199,8 @@ def _pre_start_leaf(
     if status == "started":
         run_id = str(payload.get("run_id") or "")
         if run_id:
-            from ouroboros.delegate_supervision import supervised_wait
-
-            wake_raw = supervised_wait(ctx, run_id)
-            try:
-                wake = json.loads(wake_raw)
-            except (TypeError, ValueError):
-                wake = {"status": "wake_fault", "detail": wake_raw}
             return json.dumps({
-                "status": "configured_session_wake",
-                "startup": payload, "wake": wake,
+                "status": "configured_session_started", "startup": payload,
             }, ensure_ascii=False, indent=2)
         # A started run the host cannot address is a custody fault, not quiet
         # supervision material: wake the model with the raw facts.
@@ -266,16 +261,12 @@ def _adopt_recovery_handoff(ctx: Any, task: Mapping[str, Any]) -> str:
                 "reason": "adopted_without_run_id",
             },
         }, ensure_ascii=False, indent=2)
-    from ouroboros.delegate_supervision import supervised_wait
-
-    wake_raw = supervised_wait(ctx, run_id)
-    try:
-        wake = json.loads(wake_raw)
-    except (TypeError, ValueError):
-        wake = {"status": "wake_fault", "detail": wake_raw}
+    # An adopted run with no pending wake is simply LIVE: the host does not
+    # wait inside bootstrap (owner 2026-08-29, 1=A) — the model supervises it
+    # with delegate_wait on its own first round.
     return json.dumps({
-        "status": "configured_session_recovered_wake",
-        "recovery": adoption, "wake": wake,
+        "status": "configured_session_started",
+        "recovery": adoption, "run_id": run_id,
     }, ensure_ascii=False, indent=2)
 
 
@@ -591,7 +582,16 @@ def append_startup_receipt(
     except (TypeError, ValueError):
         receipt = {}
     receipt_status = str(receipt.get("status") or "") if isinstance(receipt, dict) else ""
-    if receipt_status in {"configured_session_wake", "configured_session_recovered_wake"}:
+    if receipt_status == "configured_session_started":
+        guidance = (
+            "The exact configured leaf run is LIVE — the receipt carries its id. "
+            "Waiting is your decision: call delegate_wait when you want its facts, "
+            "or use this round for parallel judgment first (schedule auxiliary "
+            "children, prepare acceptance). Never rebuild its work on metered "
+            "tokens and never start a duplicate leaf; a replacement start is legal "
+            "only after cancellation and terminal settlement are verified."
+        )
+    elif receipt_status in {"configured_session_wake", "configured_session_recovered_wake"}:
         guidance = (
             "The receipt proves an existing physical run was started or recovered, "
             "with its wake facts attached. Do not start a duplicate leaf: verify and "

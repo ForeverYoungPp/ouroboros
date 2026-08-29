@@ -360,7 +360,7 @@ def test_over_budget_bootstrap_uses_only_a_live_interaction_channel(
 
     monkeypatch.setattr(
         supervision, "supervised_wait",
-        lambda _ctx, run_id, **_kw: json.dumps({"status": "leaf_terminal", "run_id": run_id}),
+        lambda *_a, **_kw: pytest.fail("the host must not wait inside bootstrap (owner 1=A)"),
     )
     snapshot = _snapshot(_settings(_session_row(target="codex=gpt-5.6-sol")), "session-builder")
     dispatch = SimpleNamespace(
@@ -379,9 +379,10 @@ def test_over_budget_bootstrap_uses_only_a_live_interaction_channel(
     }
     full_sha = work_order_fingerprint(task)
     # Charter D1: the host pre-starts the leaf during bootstrap, through the
-    # same wrapper the model's delegate_start(prompt="") uses. With a live
-    # interactive channel the oversized order rides the source-request lens;
-    # without one, the definite refusal ends the child unrun and typed at $0.
+    # same wrapper the model's delegate_start(prompt="") uses — and does NOT
+    # wait on it (owner 1=A). With a live interactive channel the oversized
+    # order rides the source-request lens; without one, the definite refusal
+    # ends the child unrun and typed at $0.
     raw = bootstrap.bootstrap_before_context(ctx, task, dispatch)
     custody_rows = [
         json.loads(line)
@@ -390,10 +391,9 @@ def test_over_budget_bootstrap_uses_only_a_live_interaction_channel(
 
     if interactive:
         out = json.loads(raw)
-        assert out["status"] == "configured_session_wake"
+        assert out["status"] == "configured_session_started"
         assert out["startup"]["status"] == "started"
         assert out["startup"]["run_id"] == "run-source"
-        assert out["wake"]["status"] == "leaf_terminal"
         assert len(calls) == 1
         prompt, spec = calls[0]
         assert "WORK ORDER SOURCE REQUEST" in prompt
@@ -460,7 +460,7 @@ def test_over_budget_start_reprobes_live_interaction_capability(
 
     monkeypatch.setattr(
         supervision, "supervised_wait",
-        lambda _ctx, run_id, **_kw: json.dumps({"status": "leaf_terminal", "run_id": run_id}),
+        lambda *_a, **_kw: pytest.fail("the host must not wait inside bootstrap (owner 1=A)"),
     )
     snapshot = _snapshot(
         _settings(_session_row(target="codex=gpt-5.6-sol")),
@@ -510,7 +510,7 @@ def test_over_budget_start_reprobes_live_interaction_capability(
         )
     else:
         out = json.loads(raw)
-        assert out["status"] == "configured_session_wake"
+        assert out["status"] == "configured_session_started"
         assert out["startup"]["status"] == expected_status
         assert len(starts) == 1
         assert "WORK ORDER SOURCE REQUEST" in starts[0][0]
@@ -632,18 +632,16 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
         lambda *_a, **_k: ("", ""),
     )
     monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
-    # Charter D1: the host pre-starts the exact leaf during bootstrap, before
-    # the context build and any model call.
+    # Charter D1 + owner 1=A: the host pre-starts the exact leaf during
+    # bootstrap, before the context build and any model call — and does NOT
+    # wait on it: the first round arrives immediately with the live receipt.
     monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: (
         order.append("physical_start")
         or json.dumps({"status": "started", "run_id": "run-pre-start"})
     ))
     monkeypatch.setattr(
         supervision, "supervised_wait",
-        lambda _ctx, run_id, **_kw: (
-            order.append("supervised_wait")
-            or json.dumps({"status": "leaf_terminal", "run_id": run_id})
-        ),
+        lambda *_a, **_kw: pytest.fail("the host must not wait inside bootstrap (owner 1=A)"),
     )
     def build_context(**_kwargs):
         order.append("context_build")
@@ -666,11 +664,12 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
         "task_contract": {"objective": "Build", "expected_output": "Patch"},
         "drive_root": str(drive), "budget_drive_root": str(drive),
     })
-    assert order == ["physical_start", "supervised_wait", "context_build"]
+    assert order == ["physical_start", "context_build"]
     assert any("CONFIGURED SESSION STARTUP / WAKE RECEIPT" in item["content"] for item in messages)
     receipt = next(item["content"] for item in messages if "CONFIGURED SESSION STARTUP / WAKE RECEIPT" in item["content"])
-    assert "configured_session_wake" in receipt
+    assert "configured_session_started" in receipt
     assert "run-pre-start" in receipt
+    assert "Waiting is your decision" in receipt
     assert _ctx._configured_actor_bootstrap["selected_subagent_id"] == "session-builder"
     assert _ctx._configured_actor_bootstrap["canonical_work_order"]
     assert _ctx._configured_actor_bootstrap["physical_started"] is True
@@ -1032,7 +1031,7 @@ def test_actor_first_bootstrap_adopts_existing_handoff_without_new_start(monkeyp
     })
     monkeypatch.setattr(
         "ouroboros.delegate_supervision.supervised_wait",
-        lambda _ctx, run_id: json.dumps({"status": "completed", "run_id": run_id}),
+        lambda *_a, **_kw: pytest.fail("the host must not wait inside bootstrap (owner 1=A)"),
     )
     dispatch = SimpleNamespace(
         blocked=False,
@@ -1050,9 +1049,11 @@ def test_actor_first_bootstrap_adopts_existing_handoff_without_new_start(monkeyp
         },
         dispatch,
     ))
-    assert out["status"] == "configured_session_recovered_wake"
+    # Owner 1=A: an adopted live run is handed to the model's first round
+    # immediately; waiting is the model's own delegate_wait decision.
+    assert out["status"] == "configured_session_started"
     assert out["recovery"]["run_id"] == "run-recovered"
-    assert out["wake"]["status"] == "completed"
+    assert out["run_id"] == "run-recovered"
     assert ctx._configured_actor_bootstrap["selected_subagent_id"] == "session-builder"
     assert ctx._configured_actor_bootstrap["canonical_work_order"]
     assert ctx._configured_actor_bootstrap["physical_started"] is True
