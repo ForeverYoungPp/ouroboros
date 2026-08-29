@@ -42,7 +42,7 @@ from devtools.benchmarks.common.run_roots import (
     safe_join_under,
 )
 from devtools.benchmarks.terminal_bench.run_harbor_smoke import AGENT_IMPORT
-from ouroboros.config import SETTINGS_DEFAULTS
+from ouroboros.config import EFFORT_SCALE, SETTINGS_DEFAULTS
 
 
 DEFAULT_DATASET = "terminal-bench/terminal-bench-2-1"
@@ -905,7 +905,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--review-effort",
         default="low",
-        choices=["none", "low", "medium", "high"],
+        choices=list(EFFORT_SCALE),
         help="reasoning effort for the in-task review under --all-model (default low; cuts the review-latency tax)",
     )
     parser.add_argument(
