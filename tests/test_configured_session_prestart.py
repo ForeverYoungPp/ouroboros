@@ -328,6 +328,9 @@ def test_unreadable_custody_projects_unknown_not_clean(tmp_path, monkeypatch, fa
         ctx, task_id="actor-started", fallback_root=tmp_path,
     )
     assert "CONFIGURED_ACTOR_UNKNOWN" in message
+    # Unknown-safe guidance: never a fresh-start recipe over unreadable custody.
+    assert "Start the exact assigned session now" not in message
+    assert "delegate_wait" in message
 
     projected, usage_out, _trace = actor_first_terminal_projection(
         ctx, {"id": "actor-started"}, {}, {}, tmp_path,

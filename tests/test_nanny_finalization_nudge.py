@@ -496,3 +496,73 @@ def test_forced_note_never_accuses_over_unreadable_evidence(tmp_path):
         assert "NOTE:" not in _forced_run(tmp_path, True, [])
     finally:
         os.chmod(log_path, 0o644)
+
+
+def _configured_started_ctx(parent, child):
+    ctx = _split_root_ctx(parent, child)
+    ctx._configured_actor_bootstrap = {
+        "physical_started": True,
+        "exact_start_pending": False,
+        "route_available": True,
+        "selected_subagent_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+    }
+    return ctx
+
+
+def test_unreadable_custody_surfaces_the_configured_unknown_nudge(tmp_path):
+    # Final-gate delta finding (sol): the early "unreadable proves nothing"
+    # return silenced the PRODUCTION nudge for configured actors, and the
+    # fallback guidance prescribed a fresh delegate_start over custody that
+    # may hide a live or settled leaf. Both shapes ride the real read: a
+    # custody log made unreadable on disk.
+    import os
+
+    from ouroboros import delegate_custody as custody
+    from ouroboros.loop import _nanny_finalization_message
+
+    parent, child = tmp_path / "parent", tmp_path / "child"
+    for root in (parent, child):
+        (root / "logs").mkdir(parents=True)
+    ctx = _configured_started_ctx(parent, child)
+    root = custody.custody_root(ctx)
+    assert custody.emit(root, custody.STARTED, {
+        "run_id": "run-x", "task_id": "child-x", "route": "claude", "max_seconds": 300,
+    })
+    log_path = custody.event_log_path(root)
+    os.chmod(log_path, 0)
+    try:
+        message = _nanny_finalization_message(
+            _tools(ctx, ["delegate_start", "delegate_wait"]), child, "child-x",
+        )
+    finally:
+        os.chmod(log_path, 0o600)
+    assert "CONFIGURED_ACTOR_UNKNOWN" in message
+    assert "UNREADABLE" in message
+    # Never a fresh-start recipe over a possibly-live leaf, never an accusation.
+    assert "Start the exact assigned session now" not in message
+    assert "NANNY_DID_NOT_DELEGATE" not in message
+
+
+def test_evidence_reader_crash_surfaces_the_configured_unknown_nudge(tmp_path, monkeypatch):
+    from ouroboros import delegate_evidence as evidence_mod
+    from ouroboros.loop import _nanny_finalization_message
+
+    parent, child = tmp_path / "parent", tmp_path / "child"
+    for root in (parent, child):
+        (root / "logs").mkdir(parents=True)
+
+    def _boom(_root, _tid):
+        raise OSError("custody log unreadable")
+
+    # One reader, re-exported by delegate_custody: patch the defining module.
+    monkeypatch.setattr(evidence_mod, "task_execution_evidence", _boom)
+    monkeypatch.setattr(
+        "ouroboros.delegate_custody.task_execution_evidence", _boom,
+    )
+    ctx = _configured_started_ctx(parent, child)
+    message = _nanny_finalization_message(
+        _tools(ctx, ["delegate_start", "delegate_wait"]), child, "child-x",
+    )
+    assert "CONFIGURED_ACTOR_UNKNOWN" in message
+    assert "Start the exact assigned session now" not in message

@@ -479,6 +479,18 @@ def configured_actor_finalization_message(
             "unreadable/ambiguous zero-run receipt evidence — a physical start "
             f"is fenced. Reconcile the durable evidence, then {close_clause}"
         )
+    if reason == "evidence_read_failed":
+        # Unreadable custody on a STARTED actor proves neither settlement nor
+        # absence: another physical start could double-run a possibly-live
+        # leaf, so the guidance must never prescribe one.
+        return (
+            f"⚠️ {code}: this configured session child is finalizing over an "
+            "UNREADABLE delegated-run custody log — whether its leaf ran is "
+            "unknown, not \"none\". Do NOT start another physical leaf over "
+            "it: check the run (delegate_wait) or reconcile the durable "
+            "evidence, and finalize with the unknown disclosed honestly in "
+            "your result."
+        )
     if reason in {"delegated_runs_failed_without_success", "delegated_run_unsettled",
                   "physical_start_uncustodied"}:
         return (

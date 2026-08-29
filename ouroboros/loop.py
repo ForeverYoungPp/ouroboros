@@ -5752,8 +5752,14 @@ def _nanny_finalization_message(
     if not started and (evidence.get("evidence_read_failed") or not evidence):
         # Zero attempts is an ACCUSATION and needs positively-established
         # evidence: an unreadable custody log (or a failed read above) proves
-        # nothing (scope finding on a5e59bdf).
-        return ""
+        # nothing (scope finding on a5e59bdf). A CONFIGURED actor still gets
+        # its own non-accusatory typed message (unknown over unreadable
+        # custody — never a fresh-start recipe); legacy nannies stay silent.
+        from ouroboros.subagent_bootstrap import configured_actor_finalization_message
+
+        _actor = configured_actor_finalization_message(
+            tools._ctx, task_id=str(task_id or ""), fallback_root=drive_root)
+        return _actor or ""
     if not started and (trace_attempted or evidence.get("delegate_start_attempted")):
         # Pending, refused or uncustodied starts are still real attempts.
         return ""
