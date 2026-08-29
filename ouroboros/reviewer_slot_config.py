@@ -128,24 +128,38 @@ class ConfiguredReviewerSlot:
 
 @dataclass(frozen=True)
 class AdvisorySlotConfig:
-    """The ONE optional advisory reviewer (D14).
+    """The ONE optional advisory reviewer (D14) — on the shared row vocabulary.
 
     ``enabled=False`` is a standing owner decision with a constitutional
     consequence the UI must state: every reviewed commit then records an
     AUDITED BYPASS instead of an advisory verdict (never a silent skip).
+
+    Delivery follows the shared closed kinds: an ``api_chat`` advisory row is
+    a routed catalog model that runs the bounded NATIVE inspection episode
+    (advisory is an inspection critic by definition — it never receives an
+    assembled packet), ``agent_session`` is a delegated Claudexor run, and a
+    ``subagent_id`` reference resolves the configured roster row. The retired
+    legacy ``api`` kind (Claude-Agent-SDK spellings) is migrated at parse:
+    a translatable target becomes its routed id; an untranslatable one keeps
+    the row DISABLED with a loud typed reason, never a silently swapped model.
     """
 
     enabled: bool = True
-    kind: str = "api"  # api | agent_session
-    # agent_session: harness[=model] spec ('' = shared route). api: the
-    # Claude-SDK model spelling — sonnet, opus[1m], claude-… — NOT an
-    # OpenRouter catalog id ('' = resolve_claude_code_model() default).
+    kind: str = ROUTE_KIND_API  # api_chat | agent_session
+    # agent_session: harness[=model] spec ('' = shared route). api_chat: a
+    # routed catalog model id ('' = the shipped advisory default).
     target_id: str = ""
-    # API keeps the historical low default. Session ``""`` means the route's
-    # own default; an explicit/compound route effort is materialized on legacy
-    # migration so Settings round-trips one authority without lowering it.
+    # api_chat keeps the historical low default. Session ``""`` means the
+    # route's own default; an explicit/compound route effort is materialized on
+    # legacy migration so Settings round-trips one authority.
     effort: str = "low"
     profile_id: str = ""  # optional manual credential pin (Q2-в); '' = rotation
+    # Configured-subagent reference ('' = direct row); resolved at parse into
+    # the execution fields above, exactly like triad/scope actor rows.
+    subagent_id: str = ""
+    # Non-empty ⇒ the row was force-disabled at parse with this typed reason
+    # (currently only the unmapped legacy Claude-SDK target migration).
+    disabled_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -329,12 +343,43 @@ def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
     )
 
 
+def _migrate_sdk_advisory_target(raw_kind: str, target: str) -> tuple[str, str]:
+    """Translate a retired Claude-SDK ``api``-kind target to ``(routed, reason)``.
+
+    The Claude-Agent-SDK advisory transport is retired (owner decision,
+    2026-08-29): its rows migrate to the routed catalog. Only translations
+    that keep the SAME model are performed; anything else keeps the row
+    DISABLED with a typed reason — a silently swapped reviewer model is the
+    exact class this parser exists to refuse.
+    """
+    if raw_kind != "api":
+        return target, ""
+    base = target.replace("[1m]", "").strip()
+    if not base or base in {"sonnet", "claude-sonnet-5"}:
+        # '' and the shipped default spelling both meant claude-sonnet-5.
+        return "", ""
+    if "/" in base or "::" in base:
+        return target, ""  # already a routed/provider-tagged id
+    if base.startswith("claude-"):
+        return f"anthropic/{base}", ""
+    return target, "legacy_claude_sdk_target_unmapped"
+
+
+def _resolve_advisory_actor(subagent_id: str, effort: str, enabled: bool) -> AdvisorySlotConfig:
+    row = _resolve_actor_slot("advisory_slot_1", subagent_id, effort, "advisory")
+    return AdvisorySlotConfig(
+        enabled=enabled, kind=row.kind, target_id=row.target_id,
+        effort=row.effort or ("low" if not row.is_session else ""),
+        profile_id=row.profile_id, subagent_id=subagent_id,
+    )
+
+
 def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
     if raw is None:
         return AdvisorySlotConfig()
     if not isinstance(raw, dict):
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory must be an object")
-    unknown = sorted(set(raw) - {"enabled", "route", "kind", "target_id", "effort"})
+    unknown = sorted(set(raw) - {"enabled", "route", "kind", "target_id", "effort", "subagent_id"})
     if unknown:
         raise ValueError(
             f"{REVIEWER_SLOTS_ENV}: advisory has unknown keys: {unknown}"
@@ -342,11 +387,14 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory enabled must be a boolean")
-    for key in ("kind", "target_id"):
+    for key in ("kind", "target_id", "subagent_id"):
         if key in raw and not isinstance(raw[key], str):
             raise ValueError(
                 f"{REVIEWER_SLOTS_ENV}: advisory {key} must be a string"
             )
+    actor_ref = str(raw.get("subagent_id") or "").strip()
+    if "subagent_id" in raw and not actor_ref:
+        raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory subagent_id must not be empty")
     route = raw.get("route")
     if route is not None and not isinstance(route, dict):
         # Same typed refusal _parse_slot gives (:150). Without it a non-dict
@@ -356,6 +404,15 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
         # reviewer_slot_config_error's callers.
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory route must be an object "
                          "{kind, target_id}")
+    if actor_ref and (route is not None or ({"kind", "target_id"} & set(raw))):
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: advisory must use either subagent_id or a "
+            "route, not both — the roster row is the route's SSOT"
+        )
+    if actor_ref:
+        return _resolve_advisory_actor(
+            actor_ref, _valid_effort(raw.get("effort"), "advisory"), enabled,
+        )
     if route is not None and ({"kind", "target_id"} & set(raw)):
         raise ValueError(
             f"{REVIEWER_SLOTS_ENV}: advisory must use either route or legacy "
@@ -363,9 +420,10 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
         )
     route_payload = dict(route or {})
     if "kind" not in route_payload:
-        route_payload["kind"] = raw.get("kind") or "api"
+        route_payload["kind"] = raw.get("kind") or ROUTE_KIND_API
     if "target_id" not in route_payload:
         route_payload["target_id"] = raw.get("target_id") or ""
+    raw_kind = str(route_payload.get("kind") or "").strip().lower()
     shared_route = parse_route_spec(
         route_payload,
         setting=REVIEWER_SLOTS_ENV,
@@ -393,12 +451,25 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
     validate_compound_session_effort(
         shared_route, effort, setting=REVIEWER_SLOTS_ENV, where="advisory",
     )
+    target, disabled_reason = (
+        _migrate_sdk_advisory_target(raw_kind, shared_route.target_id)
+        if not shared_route.is_session else (shared_route.target_id, "")
+    )
+    if disabled_reason:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "advisory row disabled: legacy Claude-SDK target %r has no same-model "
+            "routed translation; pick a routed model or a configured subagent in "
+            "Settings → Review lanes", target,
+        )
     return AdvisorySlotConfig(
-        enabled=enabled,
-        kind=ROUTE_KIND_SESSION if shared_route.is_session else "api",
-        target_id=shared_route.target_id,
+        enabled=enabled and not disabled_reason,
+        kind=ROUTE_KIND_SESSION if shared_route.is_session else ROUTE_KIND_API,
+        target_id=target,
         effort=effort,
         profile_id=shared_route.credential_profile_id,
+        disabled_reason=disabled_reason,
     )
 
 
@@ -524,7 +595,9 @@ def _legacy_config() -> ReviewerSlotConfig:
     # and no per-row effort; the route token is the phase-5 env.
     raw_route = str(os.environ.get("OUROBOROS_ADVISORY_REVIEW_ROUTE", "") or "").strip().lower()
     if raw_route in ("", "api", "api_chat"):
-        advisory_kind = "api"
+        # Legacy 'api' meant the retired Claude-SDK transport; both now mean
+        # the routed native inspection episode on the shipped default model.
+        advisory_kind = ROUTE_KIND_API
     elif raw_route == ROUTE_KIND_SESSION:
         advisory_kind = ROUTE_KIND_SESSION
     else:

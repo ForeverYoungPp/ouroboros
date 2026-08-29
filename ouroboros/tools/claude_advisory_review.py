@@ -676,16 +676,36 @@ _ADVISORY_SESSION_MAX_SECONDS = 900  # the nanny's time cap replaces the SDK bud
 
 
 def advisory_review_route() -> str:
-    """The advisory delivery route: ``api`` (Claude Agent SDK, needs the key)
-    or ``agent_session`` (a delegated Claudexor run, needs no key). An unknown
-    token raises — a typo must fail loudly, never silently pick a transport.
+    """The advisory delivery kind on the shared closed vocabulary: ``api_chat``
+    (the bounded NATIVE inspection episode on a routed model — the retired
+    Claude-SDK transport's successor; advisory never receives an assembled
+    packet) or ``agent_session`` (a delegated Claudexor run). An unknown token
+    raises — a typo must fail loudly, never silently pick a transport.
 
     Reads the reviewer-slot SSOT (6.1): the structured advisory row when the
     owner saved one, the legacy ``OUROBOROS_ADVISORY_REVIEW_ROUTE`` env
     otherwise (the SSOT's own migration read)."""
+    from ouroboros.reviewer_slot_config import ROUTE_KIND_SESSION, advisory_slot_config
+
+    return (
+        "agent_session"
+        if advisory_slot_config().kind == ROUTE_KIND_SESSION
+        else "api_chat"
+    )
+
+
+def _advisory_default_model() -> str:
+    """The shipped routed advisory default (provider_models SSOT)."""
+    from ouroboros.provider_models import OPENROUTER_REVIEW_DEFAULTS
+
+    return str(OPENROUTER_REVIEW_DEFAULTS["advisory"])
+
+
+def _advisory_native_model() -> str:
+    """The routed model the native advisory episode will run on."""
     from ouroboros.reviewer_slot_config import advisory_slot_config
 
-    return "api" if advisory_slot_config().kind == "api" else "agent_session"
+    return (advisory_slot_config().target_id or "").strip() or _advisory_default_model()
 
 
 def advisory_slot_enabled() -> bool:
@@ -708,13 +728,6 @@ def _advisory_child_timeout(ctx: object) -> Optional[float]:
     )
 
 
-def advisory_route_requires_api_key() -> bool:
-    """Whether THIS advisory route needs ANTHROPIC_API_KEY (plan 5.8: the four
-    key checks are route-dependent — an api route requires the key exactly as
-    before; the delegated route runs without it)."""
-    return advisory_review_route() == "api"
-
-
 def advisory_gate_unavailability_reason() -> str | None:
     """Why the advisory cannot run, or ``None`` when it is available.
 
@@ -729,8 +742,13 @@ def advisory_gate_unavailability_reason() -> str | None:
     """
     if not advisory_slot_enabled():
         return "advisory_slot_disabled"
-    if advisory_route_requires_api_key():
-        return None if os.environ.get("ANTHROPIC_API_KEY", "") else "anthropic_api_key_missing"
+    if advisory_review_route() == "api_chat":
+        from ouroboros.provider_models import model_has_credentials
+
+        return (
+            None if model_has_credentials(_advisory_native_model())
+            else "advisory_model_credentials_missing"
+        )
     # Delegated route: mirror the runner's resolution order — the slot's own
     # target when it parses, else the shared session route; None there is a
     # typed refusal at run time, so None here is UNAVAILABLE at gate time.
@@ -752,6 +770,77 @@ def advisory_gate_unavailable() -> bool:
     the reason helper's ``ValueError`` authority unchanged.
     """
     return advisory_gate_unavailability_reason() is not None
+
+
+def _run_advisory_native(
+    prompt: str, repo_dir: pathlib.Path, ctx: ToolContext, slot, model: str,
+):
+    """The advisory as a bounded native inspection episode, rehydrated into the
+    same result structure the retired SDK path produced (only the transport
+    changes). Cost: every provider call already rode the usage ledger inside
+    the rebound scope, so ``cost_usd`` stays 0.0 here — the ledger is the one
+    charge source; the disclosed total rides ``usage`` for forensics."""
+    from dataclasses import replace as _dc_replace
+    from types import SimpleNamespace
+
+    from ouroboros.llm import LLMClient
+    from ouroboros.review_execution import ReviewAssignment, ReviewRouteKind
+    from ouroboros.review_native_episode import NativeToolRoundReviewExecutor
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope, current_usage_scope, usage_scope
+
+    _task_metadata = getattr(ctx, "task_metadata", {}) or {}
+    deadline_at = (
+        str(_task_metadata.get("deadline_at") or "")
+        if isinstance(_task_metadata, dict) else ""
+    )
+    request = ReviewRequest(
+        surface="advisory_review",
+        goal="Advisory pre-review of the live worktree.",
+        task_id=str(getattr(ctx, "task_id", "") or ""),
+        session_root=str(repo_dir),
+        session_task=prompt,
+        policy={"output_contract": (
+            "A JSON array of checklist entries: "
+            '[{"item": str, "verdict": "PASS"|"FAIL", "severity": '
+            '"critical"|"advisory", "reason": str, "obligation_id"?: str}]'
+        )},
+        no_proxy=True,
+        deadline_at=deadline_at,
+    )
+    rslot = ReviewSlot(
+        slot_id="advisory_slot_1", model=model, effort=slot.effort or "low",
+        role_hint="advisory pre-reviewer", route=ReviewRouteKind.API_CHAT,
+        subagent_id=str(getattr(slot, "subagent_id", "") or ""),
+    )
+    assignment = ReviewAssignment(
+        request=request, slot=rslot,
+        call_id=f"advisory:{request.task_id or 'manual'}",
+    )
+    executor = NativeToolRoundReviewExecutor(assignment, llm=LLMClient())
+    _scope = _dc_replace(
+        current_usage_scope() or UsageScope(),
+        category="advisory_review", source="advisory_native",
+    )
+    try:
+        with usage_scope(_scope):
+            attempt = executor.execute()
+    except Exception as exc:
+        return SimpleNamespace(
+            success=False, result_text="(no output)", session_id="", cost_usd=0.0,
+            usage={}, error=f"{type(exc).__name__}: {exc}", stderr_tail="",
+        ), model
+    usage = dict(attempt.usage or {})
+    usage["cost_disclosed_usd"] = usage.get("cost")
+    return SimpleNamespace(
+        success=True,
+        result_text=str(attempt.raw_text or ""),
+        session_id="",
+        cost_usd=0.0,  # ledger rows are the charge source; never re-emitted
+        usage=usage,
+        error="",
+        stderr_tail="",
+    ), str(usage.get("resolved_model") or model)
 
 
 def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContext):
@@ -1177,7 +1266,7 @@ def _maybe_overflow_skip(
     exception (``verb="raised"``)."""
     if not _overflow_failure_text(failure, stderr_tail):
         return None
-    route_name = "agent_session" if delegated_route else "api"
+    route_name = "agent_session" if delegated_route else "native"
     log.warning(
         "Advisory skipped — %s route %s context overflow (%d chars)",
         route_name, verb, prompt_chars,
@@ -1210,23 +1299,25 @@ def _run_claude_advisory(
         delegated_route = advisory_review_route() == "agent_session"
     except ValueError as exc:
         return [], f"⚠️ ADVISORY_ERROR: {exc}", "", 0
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    # Route-dependent (plan 5.8 site 1): the api route requires the key exactly
-    # as before; the delegated route runs on the subscription and needs none.
-    if not api_key and not delegated_route:
-        return [], "⚠️ ADVISORY_ERROR: ANTHROPIC_API_KEY not set (advisory route=api).", "", 0
+    from ouroboros.reviewer_slot_config import advisory_slot_config
+
+    _slot = advisory_slot_config()
     if delegated_route:
         model = ""  # the session route resolves its own model; reported after the run
-        _slot = None
     else:
-        from ouroboros.gateways.claude_code import resolve_claude_code_model
-        from ouroboros.reviewer_slot_config import advisory_slot_config
+        # The native episode runs on the row's routed catalog model (6.1);
+        # '' keeps the shipped routed default. No provider credentials is a
+        # loud typed error here — the commit gate pre-bypasses this state
+        # (advisory_model_credentials_missing) before ever calling in.
+        from ouroboros.provider_models import model_has_credentials
 
-        # The advisory row's own target applies on the api kind too (6.1): here
-        # target_id is a Claude-SDK model spelling (sonnet, opus[1m], claude-…),
-        # NOT an OpenRouter catalog id; '' keeps today's environment default.
-        _slot = advisory_slot_config()
-        model = (_slot.target_id or "").strip() or resolve_claude_code_model()
+        model = (_slot.target_id or "").strip() or _advisory_default_model()
+        if not model_has_credentials(model):
+            return [], (
+                f"⚠️ ADVISORY_ERROR: no provider credentials for advisory model "
+                f"{model}; add the provider key or point the advisory row at a "
+                "configured subagent / another routed model."
+            ), "", 0
     options = dict(options or {})
     drive_root = options.get("drive_root")
     include_repo_diff = bool(options.get("include_repo_diff", True))
@@ -1281,8 +1372,11 @@ def _run_claude_advisory(
                 "review_surface": review_surface,
                 "expected_items": expected_items,
             },
-            # Route-aware pack: agent_session retrieves governance docs via pointers; api inlines them.
-            governance_by_retrieval=delegated_route,
+            # Both deliveries RETRIEVE governance docs via mandatory-read
+            # pointers (the session with its own tools, the native episode with
+            # host inspection tools): the inlined multi-hundred-KB governance
+            # pack died with the Claude-SDK transport.
+            governance_by_retrieval=True,
         )
     except RuntimeError as exc:
         return [], f"⚠️ ADVISORY_ERROR: failed to build advisory prompt: {exc}", "", 0
@@ -1310,43 +1404,15 @@ def _run_claude_advisory(
             scope_effort = ""  # the session route carries its own effort
             result, model = _run_advisory_delegated(prompt, repo_dir, ctx)
         else:
-            from ouroboros.gateways.claude_code import (
-                DEFAULT_CLAUDE_CODE_MAX_TURNS,
-                run_readonly,
-            )
-            from ouroboros.config import resolve_effort
-            from ouroboros.usage_accounting import current_usage_scope
-
-            # D-5b fix: the api route runs at the ADVISORY row's own effort, the
-            # same field the delegated branch already honors — never the scope
-            # reviewer's. The parser guarantees a non-empty effort ("low"
-            # default, legacy config included), so the fallback is dead but honest.
-            scope_effort = _slot.effort or resolve_effort("scope_review")
-            active_scope = current_usage_scope()
-            max_budget_usd = options.get("max_budget_usd")
-            if max_budget_usd is None:
-                max_budget_usd = _advisory_sdk_budget(ctx, active_scope, drive_root, repo_dir)
+            # The native inspection episode (the retired Claude-SDK
+            # transport's successor): same prompt, same repo root, same result
+            # structure. The SDK budget kill is replaced by the executor's
+            # config-owned round/transcript caps; every provider call rides
+            # the ordinary usage ledger under category=advisory_review.
+            scope_effort = _slot.effort or "low"
             if owner_deadline_exhausted_for_context(ctx, reserve_sec=get_finalization_grace_sec()):
                 raise TimeoutError("owner deadline leaves no dispatch window for advisory review")
-            child_timeout_sec = _advisory_child_timeout(ctx)
-            if active_scope is not None:
-                from dataclasses import replace
-                from ouroboros.usage_accounting import usage_scope
-
-                with usage_scope(replace(
-                    active_scope, category="advisory_review", source="claude_advisory_review",
-                )):
-                    result = run_readonly(
-                        prompt=prompt, cwd=str(repo_dir), model=model,
-                        max_turns=DEFAULT_CLAUDE_CODE_MAX_TURNS,
-                        effort=scope_effort, max_budget_usd=max_budget_usd, timeout_sec=child_timeout_sec,
-                    )
-            else:
-                result = run_readonly(
-                    prompt=prompt, cwd=str(repo_dir), model=model,
-                    max_turns=DEFAULT_CLAUDE_CODE_MAX_TURNS,
-                    effort=scope_effort, max_budget_usd=max_budget_usd, timeout_sec=child_timeout_sec,
-                )
+            result, model = _run_advisory_native(prompt, repo_dir, ctx, _slot, model)
 
         meta = {
             "model": model,
@@ -1478,11 +1544,6 @@ def _run_claude_advisory(
 
         return items, raw_text, model, prompt_chars
 
-    except ImportError:
-        return [], (
-            "⚠️ ADVISORY_ERROR: claude-agent-sdk not installed. "
-            "Install: pip install 'ouroboros[claude-sdk]'"
-        ), "", 0
     except Exception as e:
         skip = _maybe_overflow_skip(ctx, delegated_route, prompt_chars, model, None, str(e), verb="raised")
         if skip is not None:
@@ -2101,7 +2162,7 @@ def _handle_advisory_pre_review(
     # routine-looking "auto-bypassed" over a commit the free route could have
     # reviewed. A misconfigured route token is a loud error, not a bypass.
     try:
-        _requires_key = advisory_route_requires_api_key()
+        _native_route = advisory_review_route() == "api_chat"
         _advisory_enabled = advisory_slot_enabled()
     except ValueError as exc:
         return _json_response({
@@ -2112,18 +2173,28 @@ def _handle_advisory_pre_review(
                        "(OUROBOROS_REVIEWER_SLOTS / OUROBOROS_ADVISORY_REVIEW_ROUTE) and retry.",
         })
     if not _advisory_enabled:
-        # The owner switched the advisory slot off (6.2). The constitutional
-        # gate still runs — as an AUDITED BYPASS on this exact snapshot, the
-        # same durable record an explicit per-call skip produces.
+        # The owner switched the advisory slot off (6.2) — or the legacy
+        # Claude-SDK target migration force-disabled the row with a typed
+        # reason. The constitutional gate still runs — as an AUDITED BYPASS on
+        # this exact snapshot, the same durable record an explicit skip makes.
+        from ouroboros.reviewer_slot_config import advisory_slot_config as _asc
+
+        _dis = str(getattr(_asc(), "disabled_reason", "") or "")
         return _record_bypass(ctx, state, snapshot_hash, commit_message,
-                               "advisory reviewer disabled in settings — audited bypass",
+                               "advisory reviewer disabled in settings — audited bypass"
+                               + (f" ({_dis})" if _dis else ""),
                                task_id, drive_root,
                                snapshot_paths=paths)
-    if _requires_key and not os.environ.get("ANTHROPIC_API_KEY", ""):
-        return _record_bypass(ctx, state, snapshot_hash, commit_message,
-                               "ANTHROPIC_API_KEY not set — auto-bypassed (advisory route=api)",
-                               task_id, drive_root,
-                               snapshot_paths=paths)
+    if _native_route:
+        from ouroboros.provider_models import model_has_credentials
+
+        _m = _advisory_native_model()
+        if not model_has_credentials(_m):
+            return _record_bypass(ctx, state, snapshot_hash, commit_message,
+                                   f"no provider credentials for advisory model {_m} "
+                                   "— auto-bypassed (audited)",
+                                   task_id, drive_root,
+                                   snapshot_paths=paths)
 
     # Explicit audited bypass.
     if skip_advisory_pre_review:

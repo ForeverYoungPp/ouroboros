@@ -335,9 +335,9 @@ OPENROUTER_REVIEW_DEFAULTS = {
         "anthropic/claude-opus-5",
     ),
     "scope": ("openai/gpt-5.6-terra",),
-    # Claude Agent SDK spelling, not an OpenRouter model id. With no direct
-    # Anthropic key the existing advisory gate records an audited bypass.
-    "advisory": "claude-sonnet-5",
+    # Routed catalog id (the retired Claude-SDK spelling migrated same-model);
+    # without provider credentials the advisory gate records an audited bypass.
+    "advisory": "anthropic/claude-sonnet-5",
 }
 
 

@@ -1,9 +1,12 @@
-"""Phase 5.8: the advisory review's delegated route and the four key sites.
+"""The advisory review's two deliveries after the Claude-SDK retirement.
 
-The ANTHROPIC_API_KEY checks are ROUTE-DEPENDENT: an api route requires the key
-byte-for-byte as before, and the delegated route runs without it — most
-importantly, the constitutional pre-commit gate RUNS on the delegated route
-instead of recording a routine-looking "auto-bypassed".
+An ``api_chat`` advisory row runs the bounded NATIVE inspection episode on a
+routed catalog model — its availability follows the model's provider
+credentials (loud typed auto-bypass at the gate, typed error on a direct
+call), never a hardcoded ANTHROPIC_API_KEY probe. An ``agent_session`` row is
+a delegated Claudexor run, unchanged. The retired legacy ``api`` kind parses
+and migrates same-model; an untranslatable target force-disables the row with
+a typed reason.
 
 Offline fixtures throughout (owner test rule): the FakeGateway from the
 agent-session route tests stands in for the Claudexor control plane.
@@ -53,6 +56,26 @@ def _ctx(tmp_path):
     return ToolContext(repo_dir=repo, drive_root=drive)
 
 
+_PROVIDER_KEY_ENVS = (
+    "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+    "MINIMAX_API_KEY", "GIGACHAT_AUTH_KEY", "CLOUD_RU_API_KEY",
+)
+
+
+def _clear_provider_keys(monkeypatch):
+    for key in _PROVIDER_KEY_ENVS:
+        monkeypatch.delenv(key, raising=False)
+
+
+def _fake_attempt(text):
+    from ouroboros.review_execution import ReviewAttemptResult
+
+    return ReviewAttemptResult(
+        message={"content": text, "native_transcript": text},
+        usage={"cost": 0.01, "resolved_model": "", "native_rounds": 1},
+        raw_text=text,
+    )
+
 _ADVISORY_ITEMS = json.dumps([
     {"item": "correctness", "verdict": "PASS", "severity": "advisory",
      "reason": "checked the change end to end"},
@@ -64,15 +87,16 @@ _ADVISORY_ITEMS = json.dumps([
 # ---------------------------------------------------------------------------
 
 
-def test_api_route_without_key_errors_exactly_as_before(tmp_path, monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+def test_native_route_without_model_credentials_errors_typed(tmp_path, monkeypatch):
+    _clear_provider_keys(monkeypatch)
     monkeypatch.delenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, raising=False)
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
     ctx = _ctx(tmp_path)
     items, raw, model, chars = advisory._run_claude_advisory(
         ctx.repo_dir, "msg", ctx, options={"include_repo_diff": False},
     )
     assert items == [] and model == "" and chars == 0
-    assert raw.startswith("⚠️ ADVISORY_ERROR: ANTHROPIC_API_KEY not set")
+    assert raw.startswith("⚠️ ADVISORY_ERROR: no provider credentials for advisory model")
 
 
 def test_delegated_route_runs_without_the_key(tmp_path, monkeypatch, fake_route):
@@ -230,9 +254,9 @@ def _git_repo(tmp_path):
     return repo
 
 
-def test_missing_key_auto_bypasses_only_on_the_api_route(tmp_path, monkeypatch):
-    """THE dangerous site: on the api route a missing key still auto-bypasses
-    with the audited record, byte-compatible with today; on the delegated route
+def test_missing_credentials_auto_bypass_only_on_the_native_route(tmp_path, monkeypatch):
+    """THE dangerous site: a native route whose model has no provider
+    credentials auto-bypasses with the audited record; on the delegated route
     the gate RUNS — the advisory is actually invoked and no bypass is recorded."""
     from ouroboros.tools.registry import ToolContext
 
@@ -241,16 +265,17 @@ def test_missing_key_auto_bypasses_only_on_the_api_route(tmp_path, monkeypatch):
     drive = tmp_path / "data"
     drive.mkdir(exist_ok=True)
     ctx = ToolContext(repo_dir=repo, drive_root=drive)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _clear_provider_keys(monkeypatch)
 
-    # API route: auto-bypass, exactly as today (with the route named).
+    # Native route: credential-less model auto-bypasses, loudly and audited.
     monkeypatch.delenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, raising=False)
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
     payload = json.loads(advisory._handle_advisory_pre_review(
         ctx, commit_message="m", skip_tests=True,
     ))
     assert payload["status"] == "bypassed"
     assert "auto-bypassed" in payload["bypass_reason"]
-    assert "agent_session" in payload["message"]  # the keyless path is named
+    assert "no provider credentials" in payload["bypass_reason"]
 
     # Delegated route: the gate RUNS instead of bypassing. The downstream
     # deterministic pre-SDK gate (P9 metadata preflight, test preflight) and
@@ -275,14 +300,8 @@ def test_missing_key_auto_bypasses_only_on_the_api_route(tmp_path, monkeypatch):
     events = (drive / "logs" / "events.jsonl")
     if events.exists():
         rows = [json.loads(line) for line in events.read_text().splitlines() if line.strip()]
-        assert not any(
-            r.get("type") == "advisory_review_bypassed"
-            and "auto-bypassed" in str(r.get("bypass_reason"))
-            and "route=api" not in str(r.get("bypass_reason"))
-            for r in rows
-        )
         api_bypasses = [r for r in rows if r.get("type") == "advisory_review_bypassed"]
-        assert len(api_bypasses) == 1  # only the api-route attempt above
+        assert len(api_bypasses) == 1  # only the native-route attempt above
 
 
 def test_explicit_skip_still_bypasses_on_the_delegated_route(tmp_path, monkeypatch):
@@ -337,11 +356,11 @@ def test_disabled_slot_has_a_stable_reason_and_boolean_projection(monkeypatch):
     assert advisory.advisory_gate_unavailable() is True
 
 
-def test_keyless_api_slot_has_a_stable_reason_and_boolean_projection(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+def test_credential_less_native_slot_has_a_stable_reason_and_boolean_projection(monkeypatch):
+    _clear_provider_keys(monkeypatch)
     monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
     monkeypatch.delenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, raising=False)
-    assert advisory.advisory_gate_unavailability_reason() == "anthropic_api_key_missing"
+    assert advisory.advisory_gate_unavailability_reason() == "advisory_model_credentials_missing"
     assert advisory.advisory_gate_unavailable() is True
 
 
@@ -439,66 +458,77 @@ def _stub_run_readonly(captured):
     return _fake
 
 
-def test_api_route_applies_the_advisory_rows_model_and_effort(tmp_path, monkeypatch):
-    """On kind=api the row's target_id IS the Claude-SDK model and the row's
-    effort rides the call — not resolve_effort('scope_review') (D-5b): the
-    owner's advisory effort used to be silently ignored on this route."""
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+def test_native_route_applies_the_advisory_rows_model_and_effort(tmp_path, monkeypatch):
+    """The row's routed target (legacy 'sonnet' migrates same-model to the
+    shipped routed default) and the row's own effort ride the native episode
+    (D-5b) — never resolve_effort('scope_review')."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", _SLOTS_API_ADVISORY)
     captured = {}
-    monkeypatch.setattr("ouroboros.gateways.claude_code.run_readonly",
-                        _stub_run_readonly(captured))
+
+    def _capture_native(prompt, repo_dir, ctx_, slot, model):
+        from types import SimpleNamespace
+
+        captured.update({"model": model, "effort": slot.effort})
+        return SimpleNamespace(
+            success=True, result_text=_ADVISORY_ITEMS, session_id="",
+            cost_usd=0.0, usage={}, error="", stderr_tail="",
+        ), model
+
+    monkeypatch.setattr(advisory, "_run_advisory_native", _capture_native)
     ctx = _ctx(tmp_path)
     items, raw, model, _chars = advisory._run_claude_advisory(
         ctx.repo_dir, "msg", ctx, options={"include_repo_diff": False},
     )
     assert not raw.startswith("⚠️ ADVISORY_ERROR"), raw
     assert [i["item"] for i in items] == ["correctness"]
-    assert captured["model"] == "sonnet" and model == "sonnet"
+    assert captured["model"] == advisory._advisory_default_model() == model
     assert captured["effort"] == "high"
 
 
-def test_api_advisory_narrows_child_wait_to_owner_deadline(tmp_path, monkeypatch):
-    """The nested Claude child cannot outlive the owner's remaining window."""
+def test_native_advisory_passes_owner_deadline_into_the_episode(tmp_path, monkeypatch):
+    """The bounded episode enforces the owner deadline per round; the advisory
+    caller must hand it the task's deadline_at verbatim."""
     from datetime import datetime, timedelta, timezone
 
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    from ouroboros import review_native_episode as native
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", _SLOTS_API_ADVISORY)
     monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "1")
     captured = {}
 
-    def _fake_run(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(
-            success=True, result_text=_ADVISORY_ITEMS, session_id="sess-1",
-            cost_usd=0.0, usage={}, error="", stderr_tail="",
-        )
+    def _capture_execute(self):
+        captured["deadline_at"] = self.assignment.request.deadline_at
+        captured["session_root"] = self.assignment.request.session_root
+        return _fake_attempt(_ADVISORY_ITEMS)
 
-    monkeypatch.setattr("ouroboros.gateways.claude_code.run_readonly", _fake_run)
+    monkeypatch.setattr(
+        native.NativeToolRoundReviewExecutor, "execute", _capture_execute,
+    )
     ctx = _ctx(tmp_path)
-    ctx.task_metadata = {
-        "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=8)).isoformat(),
-    }
+    deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).isoformat()
+    ctx.task_metadata = {"deadline_at": deadline}
 
     _items, raw, _model, _chars = advisory._run_claude_advisory(
         ctx.repo_dir, "msg", ctx, options={"include_repo_diff": False},
     )
 
     assert not raw.startswith("⚠️ ADVISORY_ERROR"), raw
-    assert 0 < captured["timeout_sec"] <= 7.1
+    assert captured["deadline_at"] == deadline
+    assert captured["session_root"] == str(ctx.repo_dir)
 
 
-def test_api_advisory_does_not_start_inside_finalization_reserve(tmp_path, monkeypatch):
+def test_native_advisory_does_not_start_inside_finalization_reserve(tmp_path, monkeypatch):
     from datetime import datetime, timedelta, timezone
-    from ouroboros.gateways import claude_code
 
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
     monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", _SLOTS_API_ADVISORY)
     calls = []
     monkeypatch.setattr(
-        claude_code, "run_readonly",
-        lambda **_kwargs: calls.append(1),
+        advisory, "_run_advisory_native",
+        lambda *a, **k: calls.append(1),
     )
     ctx = _ctx(tmp_path)
     ctx.task_metadata = {
@@ -513,21 +543,29 @@ def test_api_advisory_does_not_start_inside_finalization_reserve(tmp_path, monke
     assert "owner deadline leaves no dispatch window" in raw
 
 
-def test_api_route_empty_target_falls_back_to_the_environment_default(tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    monkeypatch.setenv("CLAUDE_CODE_MODEL", "opus-env-default")
+def test_native_route_empty_target_falls_back_to_the_routed_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     slots = json.loads(_SLOTS_API_ADVISORY)
     slots["advisory"] = {"enabled": True, "route": {"kind": "api", "target_id": ""}}
     monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", json.dumps(slots))
     captured = {}
-    monkeypatch.setattr("ouroboros.gateways.claude_code.run_readonly",
-                        _stub_run_readonly(captured))
+
+    def _capture_native(prompt, repo_dir, ctx_, slot, model):
+        from types import SimpleNamespace
+
+        captured.update({"model": model, "effort": slot.effort or "low"})
+        return SimpleNamespace(
+            success=True, result_text=_ADVISORY_ITEMS, session_id="",
+            cost_usd=0.0, usage={}, error="", stderr_tail="",
+        ), model
+
+    monkeypatch.setattr(advisory, "_run_advisory_native", _capture_native)
     ctx = _ctx(tmp_path)
     _items, raw, model, _chars = advisory._run_claude_advisory(
         ctx.repo_dir, "msg", ctx, options={"include_repo_diff": False},
     )
     assert not raw.startswith("⚠️ ADVISORY_ERROR"), raw
-    assert captured["model"] == "opus-env-default" and model == "opus-env-default"
+    assert captured["model"] == advisory._advisory_default_model() == model
     # The parser's non-empty default ("low") is still the ROW's field — the
     # scope reviewer's effort never leaks in.
     assert captured["effort"] == "low"
@@ -550,11 +588,10 @@ def test_advisory_session_target_still_rejects_double_colon():
 
 def test_advisory_route_reader_vocabulary(monkeypatch):
     monkeypatch.delenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, raising=False)
-    assert advisory.advisory_review_route() == "api"
-    assert advisory.advisory_route_requires_api_key() is True
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    assert advisory.advisory_review_route() == "api_chat"
     monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "agent_session")
     assert advisory.advisory_review_route() == "agent_session"
-    assert advisory.advisory_route_requires_api_key() is False
     monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "cursor")
     with pytest.raises(ValueError):
         advisory.advisory_review_route()
