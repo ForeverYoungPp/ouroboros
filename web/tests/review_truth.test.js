@@ -197,7 +197,10 @@ test('a delegated frame yields a small harness chip; an ordinary frame yields no
     // ONE honest label — `{harness} · {state}` — never a bare product name: a
     // hover-only caveat is invisible on touch, to AT, and in copies, so the
     // run-state qualifier lives in the label itself.
-    assert.equal(chip.label, 'codex · no run yet');
+    // A live frame carries no evidence either way — the label states the
+    // dispatch-plan fact, never an evidence-grade negative (under the
+    // pre-start charter the leaf usually IS running by round 1).
+    assert.equal(chip.label, 'codex · dispatched');
     assert.ok(chip.icon);                        // icon, Claudexor-style
     assert.match(chip.title, /codex/);
     // WHERE it ran is all the chip can see. It has no access to the run's spend, so
@@ -206,9 +209,9 @@ test('a delegated frame yields a small harness chip; an ordinary frame yields no
     // says it — a zero there may mean unknown pricing, never "free").
     assert.ok(!/subscription/i.test(chip.title), chip.title);
     // The opaque `harness=model` spelling prints the HARNESS part only.
-    assert.equal(executorChip({ executor_route: 'codex=gpt-5.6-sol' }).label, 'codex · no run yet');
+    assert.equal(executorChip({ executor_route: 'codex=gpt-5.6-sol' }).label, 'codex · dispatched');
     // An unknown harness still gets a chip (a generic mark), never a crash.
-    assert.equal(executorChip({ executor_route: 'opencode' }).label, 'opencode · no run yet');
+    assert.equal(executorChip({ executor_route: 'opencode' }).label, 'opencode · dispatched');
     // ABSENT FACT -> no chip at all: no placeholder, no "api" noise on every
     // ordinary bubble (the native path is the unremarkable case).
     assert.equal(executorChip({}), null);
@@ -221,9 +224,9 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
     // that — never "Ran on your ... account", a receipt nothing has issued yet.
     // The claude harness prints its product name (owner decision: "Claude Code").
     const dispatched = executorChip({ executor_route: 'claude' });
-    assert.equal(dispatched.label, 'Claude Code · no run yet');
+    assert.equal(dispatched.label, 'Claude Code · dispatched');
     assert.match(dispatched.title, /Dispatched to Claude Code/);
-    assert.match(dispatched.title, /no delegated-run receipt yet/);
+    assert.match(dispatched.title, /run evidence arrives with the terminal receipt/);
     assert.match(dispatched.title, /itself runs on the API/);
     assert.doesNotMatch(dispatched.title, /Ran on your/);
 
@@ -265,7 +268,10 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
             subscription_cost_usd: null, harness_models: [],
         },
     });
-    assert.equal(inFlight.label, 'codex · running');
+    // Evidence is terminal-frame material: started-but-unsettled means the
+    // run(s) never settled — a present-tense "running" on a finished card
+    // would be a lie (adversarial wave B-ADV-4).
+    assert.equal(inFlight.label, 'codex · 1 started, none settled');
     assert.match(inFlight.title, /1 run\(s\) started, none settled/);
 
     // EVIDENCE with zero runs: the route was assigned and no delegated run left
@@ -404,4 +410,40 @@ test('the chip rides both projections: an ordinary progress bubble and a subagen
         is_progress: true, content: 'plain child', delegation_role: 'subagent',
         subagent_task_id: 'child-2', subagent_event: 'running',
     }), false);
+});
+
+test('historical frames without the failed counter reconstruct it from succeeded', () => {
+    // v6.94–v6.99 durable frames carry delegated_runs_succeeded but not
+    // delegated_runs_failed (the counters merged at v6.100.0): the chip must
+    // reconstruct the exact complement, never render an all-failed delegation
+    // as a clean receipt (adversarial wave B-ADV-1).
+    const historical = executorChip({
+        executor_route: 'codex',
+        execution_evidence: {
+            delegated_runs_started: 2, delegated_runs_settled: 2,
+            delegated_runs_succeeded: 0, subscription_cost_usd: null,
+        },
+    });
+    assert.equal(historical.label, 'codex · 2 runs, 2 failed');
+    // A frame with NEITHER counter stays plain — exactly as wide as disclosed.
+    const bare = executorChip({
+        executor_route: 'codex',
+        execution_evidence: {
+            delegated_runs_started: 1, delegated_runs_settled: 1,
+            subscription_cost_usd: null,
+        },
+    });
+    assert.equal(bare.label, 'codex · 1 run');
+});
+
+test('an evidence-bearing chip is marked so sticky rendering can refuse downgrades', () => {
+    // The card keeps an evidence-bearing (receipt) chip when a later
+    // evidence-less (dispatch) frame arrives — the history sync after
+    // justFinished anchors on a mid-run row (adversarial wave B-ADV-2). The
+    // marker is the contract between executorChip and the sticky card state.
+    assert.equal(executorChip({ executor_route: 'codex' }).hasEvidence, false);
+    assert.equal(executorChip({
+        executor_route: 'codex',
+        execution_evidence: { delegated_runs_started: 1, delegated_runs_settled: 1, delegated_runs_failed: 0, subscription_cost_usd: null },
+    }).hasEvidence, true);
 });

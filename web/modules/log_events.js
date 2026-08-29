@@ -127,18 +127,35 @@ export function executorChip(evt) {
     // hover-only tooltip is invisible on touch, to AT, and in copies.
     const evidence = (evt && typeof evt.execution_evidence === 'object' && evt.execution_evidence)
         ? evt.execution_evidence : null;
-    const substrateNote = SUBSTRATE_NOTE[String(evt?.actual_substrate || '')] || '';
+    // The substrate clause is a completion-seam claim coupled to evidence:
+    // never attach it to an evidence-less frame (a bare enum beside "dispatched"
+    // could contradict the label if a producer ever decoupled them).
+    const substrateNote = evidence ? (SUBSTRATE_NOTE[String(evt?.actual_substrate || '')] || '') : '';
     const withSubstrate = (title) => (substrateNote ? `${title} — ${substrateNote}` : title);
     if (!evidence) {
+        // Evidence rides TERMINAL frames only, so a live frame proves nothing
+        // either way — and under the pre-start charter the leaf usually IS
+        // running by now. "dispatched" states the dispatch-plan fact the frame
+        // actually carries; an evidence-grade negative ("no run yet") here
+        // would be false for most of the live phase.
         return {
             ...base,
-            label: `${name} · no run yet`,
-            title: withSubstrate(`Dispatched to ${name} — no delegated-run receipt yet; this subagent itself runs on the API`),
+            hasEvidence: false,
+            label: `${name} · dispatched`,
+            title: `Dispatched to ${name} — run evidence arrives with the terminal receipt; this subagent itself runs on the API`,
         };
     }
     const started = Number(evidence.delegated_runs_started || 0);
     const settled = Number(evidence.delegated_runs_settled || 0);
-    const failed = Number(evidence.delegated_runs_failed || 0);
+    // Historical frames (v6.94–v6.99) carry delegated_runs_succeeded without
+    // delegated_runs_failed: reconstruct the exact complement rather than
+    // rendering a clean receipt over an all-failed delegation. Frames with
+    // neither counter stay plain, exactly as wide as what they disclosed.
+    let failed = Number(evidence.delegated_runs_failed ?? NaN);
+    if (!Number.isFinite(failed)) {
+        const succeeded = Number(evidence.delegated_runs_succeeded ?? NaN);
+        failed = Number.isFinite(succeeded) ? Math.max(0, settled - succeeded) : 0;
+    }
     if (evidence.evidence_read_failed) {
         // The custody log EXISTS but could not be (fully) read: the counts are
         // UNKNOWN, not an established fact (sol finding, b49f8192 wave). This
@@ -148,7 +165,8 @@ export function executorChip(evt) {
         // the seam never claims a substrate over unreadable evidence.
         return {
             ...base,
-            label: `${name} (evidence unavailable)`,
+            hasEvidence: true,
+            label: `${name} · evidence unavailable`,
             title: started
                 ? `The ${name} route was assigned and at least ${started} delegated run(s) started, but the evidence could not be fully read — final counts are unknown`
                 : `The ${name} route was assigned, but the delegated-run evidence could not be read — whether a run happened is unknown, not "none"`,
@@ -157,14 +175,19 @@ export function executorChip(evt) {
     if (!started) {
         return {
             ...base,
+            hasEvidence: true,
             label: `${name} · no run yet`,
             title: withSubstrate(`The ${name} route was assigned, but there is no durable record of a delegated run for this subagent`),
         };
     }
     if (!settled) {
+        // Evidence is terminal-frame material: started-but-unsettled here means
+        // the run(s) never settled (orphaned or lost), not "still executing" —
+        // a present-tense "running" on a finished card would be a lie.
         return {
             ...base,
-            label: `${name} · running`,
+            hasEvidence: true,
+            label: `${name} · ${started} started, none settled`,
             title: withSubstrate(`Delegated to your ${name} account — ${started} run(s) started, none settled`),
         };
     }
@@ -174,12 +197,13 @@ export function executorChip(evt) {
         ? 'subscription spend undisclosed'
         : `${approx}$${Number(cost).toFixed(2)} subscription`;
     const runsPart = `${settled} run${settled === 1 ? '' : 's'}`;
-    // `delegated_runs_failed` = settled − succeeded from the evidence SSOT
-    // (delegate_evidence.task_execution_evidence): all-failed runs must never
-    // read as a clean receipt. A historical frame without the counter renders
-    // plain, exactly as wide as what it disclosed.
+    // `failed` comes from the evidence SSOT (or the succeeded-complement on
+    // historical frames): all-failed runs must never read as a clean receipt.
+    // A frame with neither counter renders plain, exactly as wide as what it
+    // disclosed.
     return {
         ...base,
+        hasEvidence: true,
         label: failed ? `${name} · ${runsPart}, ${failed} failed` : `${name} · ${runsPart}`,
         title: withSubstrate(`Delegated to your ${name} account — ${runsPart} settled${failed ? `, ${failed} failed` : ''}, ${costPart}`),
     };

@@ -2253,7 +2253,17 @@ export function createChatInstance({
         // Phase 6 (owner directive #1): the executor chip is STICKY on the card —
         // a later costless/quiet frame must not erase the fact that this bubble
         // ran on a harness. Absent fact leaves it absent; no placeholder chip.
-        if (summary.executorChip) record.executorChip = summary.executorChip;
+        // Layered-truth precedence: an evidence-bearing (receipt) chip is never
+        // downgraded by a later evidence-less (dispatch) frame — the routine
+        // history sync after justFinished anchors on a mid-run row without
+        // evidence and would otherwise knock a finished card's counts back to
+        // the bare dispatch label.
+        if (summary.executorChip) {
+            const prior = record.executorChip;
+            if (!(prior && prior.hasEvidence && !summary.executorChip.hasEvidence)) {
+                record.executorChip = summary.executorChip;
+            }
+        }
         // perf2 P4.3: meta renders from record state — immediately on the live
         // path, once per card at the end of a rebuildAll replay batch.
         record._lastFrameMeta = Array.isArray(summary.meta) ? summary.meta : [];
