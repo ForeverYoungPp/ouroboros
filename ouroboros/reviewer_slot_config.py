@@ -217,17 +217,17 @@ def _resolve_actor_slot(
     fail-closed (save-time 400, review-time typed block), never a silent
     fallback to another route or model.
     """
-    from ouroboros.config import load_settings
     from ouroboros.subagent_runtime import (
         SubagentSelectionError,
-        effective_runtime_subagent_settings,
         select_subagent_snapshot,
     )
 
     try:
+        # The roster is read from the APPLIED env, the same plane this module's
+        # own key lives on — a saved-but-unapplied roster edit is invisible
+        # here exactly as a saved-but-unapplied reviewer-slot edit would be.
         snapshot, _legacy = select_subagent_snapshot(
-            effective_runtime_subagent_settings(load_settings()),
-            subagent_id=subagent_id,
+            os.environ, subagent_id=subagent_id,
         )
     except SubagentSelectionError as exc:
         raise ValueError(
@@ -285,6 +285,25 @@ def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
             "receipts can only line up with ONE history"
         )
     seen_ids.add(slot_id)
+    raw_ref = row.get("subagent_id")
+    if raw_ref is not None and not isinstance(raw_ref, str):
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} subagent_id must be a string"
+        )
+    actor_ref = str(raw_ref or "").strip()
+    if raw_ref is not None and not actor_ref:
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} subagent_id must not be empty"
+        )
+    if actor_ref and row.get("route") is not None:
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} must use either route or "
+            "subagent_id, not both — the roster row is the route's SSOT"
+        )
+    if actor_ref:
+        return _resolve_actor_slot(
+            slot_id, actor_ref, _valid_effort(row.get("effort"), where), where,
+        )
     route = parse_route_spec(
         row.get("route"), setting=REVIEWER_SLOTS_ENV, where=where,
         kind_aliases={
