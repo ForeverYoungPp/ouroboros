@@ -124,6 +124,13 @@ BAND_BASELINE_PATHS = (
 )
 
 BAND_PATHS = {
+    "devtools/benchmarks/cybergym/cybergym_adapter.py": "Stateful campaign layer after the protocol split (ratchet heal); shrink next touch.",
+    "devtools/benchmarks/cybergym/cybergym_docker.py": "Docker runtime layer of the executor split: one container-machinery seam.",
+    "devtools/benchmarks/cybergym/cybergym_executor.py": "Executor assembly after docker/lifecycle/wire splits (ratchet heal); shrink next touch.",
+    "devtools/benchmarks/cybergym/cybergym_lifecycle.py": "Run/settle lifecycle layer of the executor split: one accounting seam.",
+    "devtools/benchmarks/cybergym/cybergym_protocol.py": "Stateless protocol layer of the adapter split: constants, validators, provenance.",
+    "devtools/benchmarks/cybergym/cybergym_sidecar.py": "Sidecar attestation core after the observations split (ratchet heal); shrink next touch.",
+    "devtools/benchmarks/cybergym/run_cybergym.py": "CyberGym launcher is one submit-shaped entry point (drift heal); split when a second arm lands.",
     "devtools/benchmarks/swe_bench_pro/e1v2/run_pro.py": None,
     "devtools/benchmarks/terminal_bench/harbor_installed_agent.py": None,
     "devtools/benchmarks/terminal_bench/run_tb.py": None,
@@ -169,6 +176,7 @@ BAND_PATHS = {
     "tests/test_claude_code_gateway.py": None,
     "tests/test_commit_gate.py": None,
     "tests/test_contracts.py": None,
+    "tests/test_cybergym_protocol.py": "CyberGym protocol suite arrived in one piece with the benchmark (drift heal); split when the next protocol family lands.",
     "tests/test_delegated_skill_payload.py": "Sol scope-review fix batch: P1 trust probes (forged index, symlinked git metadata), P2 golden-E2E review close and schema/docs pins joined the existing R1+gate-fix payload suite.",
     "tests/test_evolution_redesign.py": None,
     "tests/test_external_workspace_access.py": "Deliverables custody matrix covers nested roots, executor aliases, Presence ceilings, and direct shell target semantics.",
@@ -214,7 +222,7 @@ BYTE_BASELINE_DEBT = {
 
 BYTE_DEBT = {
     "ouroboros/loop.py": 312847,
-    "tests/test_delegated_subagent_transport.py": 320571,
-    "tests/test_devtools_benchmarks.py": 328282,
-    "web/modules/chat.js": 224689,
+    "tests/test_delegated_subagent_transport.py": 320568,
+    "tests/test_devtools_benchmarks.py": 328116,
+    "web/modules/chat.js": 224549,
 }

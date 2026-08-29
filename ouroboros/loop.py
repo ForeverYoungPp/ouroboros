@@ -2829,10 +2829,9 @@ def _maybe_inject_nanny_economics_reminder(
     # says so instead of implying an activity that never happened.
     _baseline_known = isinstance(getattr(ctx, "_nanny_delegate_baseline", None), dict)
     if _baseline_known:
-        # Supervision/coordination rounds COUNT toward this burn (charter).
         since_phrase = (
             "since your last act of delegation (delegate_start / "
-            "schedule_subagent); supervision rounds count toward it"
+            "schedule_subagent), supervision included"
         )
     else:
         since_phrase = "since this task started (no act of delegation yet)"
@@ -5711,7 +5710,7 @@ def _nanny_finalization_message(
         return (
             "⚠️ NANNY_METERED_OVERRUN: your delegated run(s) succeeded, but you have "
             f"since spent {_nanny_burn_phrase(rounds, cost)} beyond your last act of "
-            "delegation (supervision rounds count toward it). "
+            "delegation (supervision included). "
             "A successful run is verified and integrated, not rebuilt. If "
             "the remaining work is substantive, delegate it (a new delegate_start); "
             "if you are wrapping up, keep the wrap-up short and account for the "
@@ -5719,11 +5718,7 @@ def _nanny_finalization_message(
         )
     started = int(evidence.get("delegated_runs_started") or 0)
     if not started and (evidence.get("evidence_read_failed") or not evidence):
-        # Zero attempts is an ACCUSATION and needs positively-established
-        # evidence: an unreadable custody log (or a failed read above) proves
-        # nothing (scope finding on a5e59bdf). A CONFIGURED actor still gets
-        # its own non-accusatory typed message (unknown over unreadable
-        # custody — never a fresh-start recipe); legacy nannies stay silent.
+        # Unreadable custody (a5e59bdf): configured -> unknown message; legacy -> silence.
         from ouroboros.subagent_bootstrap import configured_actor_finalization_message
 
         _actor = configured_actor_finalization_message(
