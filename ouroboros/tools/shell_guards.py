@@ -24,75 +24,27 @@ PROTECTED_RUNTIME_PATHS_LOWER = frozenset(
     p.lower() for p in PROTECTED_RUNTIME_PATHS
 ) | frozenset(prefix.lower() for prefix in FROZEN_CONTRACT_PATH_PREFIXES)
 
-SHELL_WRITE_INDICATORS = (
-    "rm ", "rm\t", ">", "sed -i", "tee ", "truncate",
-    "mv ", "cp ", "chmod ", "chown ", "unlink ", "delete", "trash",
-    "rsync ", "write_text", ".write(", ".writelines(",
-    "os.remove(", "os.unlink(", "os.mkdir(", "os.makedirs(", "sort -o",
-    "writefilesync", "appendfilesync", "createwritestream",
+# Write-shape classification lives in its own leaf (extracted at the module-size
+# gate); every historical name stays importable from here.
+from ouroboros.tools.write_shape import (  # noqa: E402,F401
+    INTERPRETER_WRITE_RE,
+    PURE_FILTER_WRITER_COMMANDS,
+    SHELL_WRITE_INDICATORS,
+    _INTERPRETER_ANY_WRITE_RE,
+    _INTERPRETER_LANE_EXCLUDED_INDICATORS,
+    _OPEN_CALL_WRITE_INDICATOR_RE,
+    _SAFE_STDIO_REDIRECT_TOKENS,
+    _shell_write_indicator_scan,
+    interpreter_write_shape,
+    non_interpreter_write_shape,
+    shell_has_write_indicator,
 )
-# Preserve the longstanding coarse ``open(`` signal without matching it as the
-# suffix of another callable such as ``urlopen(``.
-_OPEN_CALL_WRITE_INDICATOR_RE = re.compile(r"(?<![A-Za-z0-9_])open\(")
-_SAFE_STDIO_REDIRECT_TOKENS = frozenset({
-    ">/dev/null",
-    "1>/dev/null",
-    "2>/dev/null",
-    "2>&1",
-    "1>&2",
-    "2>&-",
-})
 
 LIGHT_SHELL_WRITER_COMMANDS = frozenset({
     "chmod", "chown", "cp", "gunzip", "gzip", "ln", "mkdir", "mv",
     "perl", "rm", "ruby", "sed", "sort", "tar", "touch", "truncate", "uniq", "unzip",
 })
 
-INTERPRETER_WRITE_RE = re.compile(
-    r"""(?is)(?:\.write\(|write_text\(|write_bytes\(|fs\.write|fs\.append|"""
-    r"""createwritestream|unlink\(|rename\(|mkdir\(|rmtree\(|remove\(|"""
-    r"""open\s*\([^)]*,\s*['"][^'"]*[wax+])"""
-)
-# Wider write-indicator net for the read-vs-write runtime_data scan (v6.54.3):
-# includes filesystem-mutating calls the base write regex misses (shutil.copy*/move,
-# touch, symlink/link, chmod/chown, makedirs/removedirs, truncate) — a hit here
-# without AST-resolved targets stays on the conservative full mention scan instead
-# of being treated as a pure read. This list and the AST walker are NOT one
-# vocabulary and no invariant ties them: `<mod>.open(p,"w")` (io/codecs/gzip/bz2/lzma)
-# matches here, while `_python_path_open_target` reads arg 0 as the MODE — right for
-# `Path(p).open("w")`, wrong here — so the walker answers "no targets" and the fence
-# reads that as a proven read. Measured, not hypothetical: it truncates a repo source
-# file. DISCLOSED, not detected (owner direction: weaken, never strengthen; a false
-# invariant is removed rather than made true). NB: the leading
-# (?is) of INTERPRETER_WRITE_RE.pattern already applies globally to the whole
-# concatenated expression — a second mid-pattern global flag is a hard
-# re.error on Python 3.11+ (review round 2).
-_INTERPRETER_ANY_WRITE_RE = re.compile(
-    INTERPRETER_WRITE_RE.pattern
-    + r"""|(?:makedirs\(|removedirs\(|rmdir\(|copyfile\(|copy2\(|copytree\(|os\.replace\(|"""
-    + r"""shutil\.(?:copy|move)\(|\.touch\(|symlink\(|os\.link\(|\.link_to\(|hardlink_to\(|"""
-    + r"""chmod\(|chown\(|truncate\(|"""
-    # OPAQUE / unmodeled write-capable calls (adversarial review r2 #1): an
-    # external process (subprocess/os.system/popen) can `rm`/`mv`/`dd` anything,
-    # and archive-extract / db-open write to a directory the AST never resolves.
-    # A hit here has no AST-resolvable target, so it falls through to the
-    # conservative full mention scan (blocks drive paths OUTSIDE the task roots)
-    # instead of being mis-classified as a pure read. Pure reads (open()/read_text
-    # with no write token) still match nothing and stay allowed.
-    + r"""subprocess\.|os\.system\(|os\.popen\(|Popen\(|check_call\(|check_output\(|"""
-    + r"""\.extractall\(|unpack_archive\(|make_archive\(|sqlite3\.connect\(|"""
-    # LIBRARY save-APIs (fable-5 cumulative review F1): to_csv/savefig/.save &co
-    # write files while carrying no base write-token, so an interpreter command
-    # using them was classified as a PURE READ and skipped the runtime_data
-    # mention scan entirely. A false positive here only re-applies the
-    # conservative pre-v6.54.3 always-scan behavior (fail-closed direction).
-    # The mode-shaped single-arg .open("w"/"ab"/"x+") is the pathlib positional
-    # form the comma-anchored open() token above cannot see; the tight 1-3 char
-    # mode lookahead keeps .open("<path>") reads out.
-    + r"""\.save\(|\.to_csv\(|\.to_excel\(|\.to_parquet\(|\.to_json\(|\.to_pickle\(|"""
-    + r"""savefig\(|np\.save|imwrite\(|pickle\.dump\(|json\.dump\(|"""
-    + r"""\.open\(\s*(?:mode\s*=\s*)?['"](?=[a-z+]{1,3}['"])[a-z+]*[wax+][a-z+]*['"])"""
-)
 EMBEDDED_RELATIVE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])(?:\.\.?/)+[^\s'\"\\),;\]]+")
 _REDIRECT_TARGET_TOKENS = frozenset({">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>"})
 # ONE structural owner of "is this executable a script interpreter, and of which
@@ -215,7 +167,12 @@ _SCRIPT_LITERAL_WRITE_RE = {
         r"""(?:writeFileSync|appendFileSync|createWriteStream|mkdirSync|rmSync|rmdirSync|unlinkSync)\s*\(\s*(['"])(.*?)\1"""
     ),
     "ruby": re.compile(
-        r"""(?is)(?:File\.write|File\.open|FileUtils\.(?:touch|mkdir_p|rm|rm_rf|remove|copy|cp|mv))\s*\(\s*(['"])(.*?)\1"""
+        # File.write / FileUtils writers always write; File.open / File.new name a
+        # write TARGET only with a write-mode 2nd arg (sol review: the mode-blind
+        # form reported File.open('/x','r') and blocked a read outside the root).
+        r"""(?is)(?:File\.write|FileUtils\.(?:touch|mkdir_p|rm|rm_rf|remove|copy|cp|mv)|"""
+        r"""File\.(?:open|new)(?=\s*\([^)]*,\s*['"][^'"]*[wax+])"""
+        r""")\s*\(\s*(['"])(.*?)\1"""
     ),
 }
 
@@ -851,35 +808,6 @@ def runtime_data_guard_targets(
     )
 
 
-def shell_has_write_indicator(raw_cmd: Any) -> bool:
-    if isinstance(raw_cmd, list):
-        text = " ".join(str(x) for x in raw_cmd).lower()
-    else:
-        text = str(raw_cmd).lower()
-    tokens = [str(token).lower() for token in shell_argv_with_inline(raw_cmd)]
-    filtered_tokens: List[str] = []
-    i = 0
-    while i < len(tokens):
-        token = tokens[i]
-        if token in _SAFE_STDIO_REDIRECT_TOKENS:
-            i += 1
-            continue
-        if token in {">", "1>", "2>"} and i + 1 < len(tokens) and tokens[i + 1] == "/dev/null":
-            i += 2
-            continue
-        filtered_tokens.append(token)
-        i += 1
-    filtered_text = " ".join(filtered_tokens)
-    for token in _SAFE_STDIO_REDIRECT_TOKENS:
-        text = text.replace(token, " ")
-    return (
-        any(indicator in filtered_text for indicator in SHELL_WRITE_INDICATORS)
-        or bool(_OPEN_CALL_WRITE_INDICATOR_RE.search(filtered_text))
-        or any(indicator in text for indicator in SHELL_WRITE_INDICATORS if indicator != ">")
-        or bool(_OPEN_CALL_WRITE_INDICATOR_RE.search(text))
-    )
-
-
 def process_shell_guard_args(name: str, args: Dict[str, Any], *, ctx: Any = None, runtime_mode: str = "") -> Dict[str, Any]:
     """Normalize process-tool arguments into the command shape inspected by shell guards."""
 
@@ -1003,6 +931,16 @@ def repo_target_mentioned(
 
 
 _COMMAND_SEPARATOR_TOKENS = frozenset({"&&", "||", ";", "|", "&"})
+
+# A sed SCRIPT that can write or execute: the `w FILE`/`W FILE` command shape
+# (addressed `1w FILE` included — digits stay out of the lookbehind), the GNU
+# `e`/`e cmd` execute command, or a substitute's trailing flag run carrying w/e
+# after the closing `/` (`s/a/b/gw f`, `s/x/y/e` — the flag class [gpimM0-9]
+# keeps replacement words like `raw ` out). Word-embedded letters (`/delete/p`,
+# `s/e/x/`) stay reads; exotic non-`/` delimiters are a disclosed residual.
+_SED_SCRIPT_WRITE_RE = re.compile(
+    r"(?<![A-Za-z_])[wW]\s+\S|(?<![A-Za-z_])e(?:\s*(?:$|;)|\s+\S)|/[gpimM0-9]*[we](?=\s|$|;)"
+)
 
 
 def writer_target_tokens(argv: List[str]) -> List[str]:
@@ -1174,7 +1112,9 @@ def _writer_target_tokens_single(argv: List[str]) -> List[str]:
     if not argv:
         return []
     cmd = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe")
-    operands = [arg for arg in argv[1:] if arg and not arg.startswith("-")]
+    # A literal '-' is the STDIN OPERAND, not a flag: dropping it hid uniq's
+    # output operand (`uniq - OUT` writes OUT) from every consumer (sol-max r2).
+    operands = [arg for arg in argv[1:] if arg and (arg == "-" or not arg.startswith("-"))]
     targets: List[str] = []
     if cmd == "cp":
         targets.extend(operands[-1:] if len(operands) >= 2 else [])
@@ -1185,13 +1125,104 @@ def _writer_target_tokens_single(argv: List[str]) -> List[str]:
     elif cmd in {"chmod", "chown"}:
         targets.extend(operands[1:] if len(operands) >= 2 else [])
     elif cmd == "sed":
-        targets.extend(operands[1:] if len(operands) >= 2 else operands)
+        # sed's write channels are -i (any spelling, incl. GNU attached `-ibak`)
+        # AND the in-script `w`/`W` file commands and GNU `e` execute (fable-5
+        # round-2: POSIX `sed 'w f' in` writes f with no -i at all). A pure
+        # filter is only a script PROVABLY free of those; a -f script file or a
+        # single-letter w/W/e command shape fails closed to the operand fallback.
+        sed_args = [str(a) for a in argv[1:]]
+        inplace = any(
+            # -i in ANY short spelling, clustered included (`-ni.bak`, `-nibak`):
+            # 'i' anywhere in the leading cluster letters means in-place.
+            (
+                t.startswith("-")
+                and not t.startswith("--")
+                and "i" in t.split(".", 1)[0][1:]
+            )
+            or t == "--in-place"
+            or t.startswith("--in-place=")
+            for t in sed_args
+        )
+        scripts: list = []
+        script_unprovable = False
+        expect_expr = False
+        for t in sed_args:
+            if expect_expr:
+                scripts.append(t)
+                expect_expr = False
+            elif t in ("-e", "--expression"):
+                expect_expr = True
+            elif t.startswith("--expression="):
+                scripts.append(t.split("=", 1)[1])
+            elif t in ("-f", "--file") or t.startswith("--file="):
+                script_unprovable = True
+        if not scripts and operands:
+            scripts.append(operands[0])
+        writing_scripts = [s for s in scripts if _SED_SCRIPT_WRITE_RE.search(s)]
+        if inplace or script_unprovable or writing_scripts:
+            # The `w FILE` filename lives INSIDE the script operand; reporting the
+            # script text as a target lets the cwd-joining consumers (light fence,
+            # protected lane) see where it lands, exactly like the old operand
+            # fallback did.
+            targets.extend(writing_scripts)
+            targets.extend(operands[1:] if len(operands) >= 2 else operands)
+    elif cmd == "tar":
+        # Mode letters are the LEADING cluster letters only (`-cf/o.tar` is
+        # create+file with an attached path — the 't' inside the path is not
+        # list mode; sol-max r2). Old-style `tar tf a.tar` carries the letters
+        # in the first operand. Write modes (c/x/r/u/A/d, --extract/--create/…)
+        # keep the operand fallback plus the attached/long file and -C/--directory
+        # values; pure list (`t` with no write letter) reads.
+        tar_args = [str(a) for a in argv[1:]]
+        mode_letters = ""
+        attached_value = ""
+        for t in tar_args:
+            m = re.match(r"^-([A-Za-z]+)(.*)$", t)
+            if m:
+                mode_letters += m.group(1)
+                if attached_value == "" and m.group(2):
+                    attached_value = m.group(2)
+        old_style = ""
+        if not mode_letters and operands and re.fullmatch(r"[A-Za-z]+", operands[0] or ""):
+            old_style = operands[0]
+            mode_letters = old_style
+        long_write = any(
+            t in ("--create", "--extract", "--get", "--append", "--update", "--delete", "--concatenate", "--catenate")
+            for t in tar_args
+        )
+        write_mode = long_write or any(ch in mode_letters for ch in "cxruAd")
+        listing = ("t" in mode_letters or "--list" in tar_args) and not write_mode
+        if not listing:
+            targets.extend(op for op in operands if op != old_style)
+            if attached_value:
+                targets.append(attached_value)
+            for t in tar_args:
+                if t.startswith(("--file=", "--directory=")):
+                    targets.append(t.split("=", 1)[1])
+    elif cmd in {"gzip", "gunzip"}:
+        # Read modes by LEADING cluster letters only (`-S.tgz` is a suffix value,
+        # not test mode): -l/--list, -t/--test read; -c/--stdout writes stdout
+        # only. The default invocation replaces its operand (file <-> file.gz).
+        readonly_mode = False
+        for t in (str(a) for a in argv[1:]):
+            if t in ("--list", "--test", "--stdout", "--to-stdout"):
+                readonly_mode = True
+                break
+            m = re.match(r"^-([A-Za-z]+)", t) if not t.startswith("--") else None
+            if m and any(ch in m.group(1) for ch in "ltc"):
+                readonly_mode = True
+                break
+        if not readonly_mode:
+            targets.extend(operands)
     elif cmd == "sort":
         for idx, arg in enumerate(argv[1:], start=1):
-            if arg == "-o" and idx + 1 < len(argv):
+            if arg in ("-o", "--output") and idx + 1 < len(argv):
                 targets.append(argv[idx + 1])
-            if arg.startswith("--output="):
+            elif arg.startswith("--output="):
                 targets.append(arg.split("=", 1)[1])
+            elif arg.startswith("-o") and len(arg) > 2 and not arg.startswith("--"):
+                # Attached GNU spelling: `sort -oFILE`.
+                targets.append(arg[2:])
     elif cmd == "uniq":
         targets.extend(operands[1:2] if len(operands) >= 2 else [])
     elif _light_writer_command(cmd):

@@ -150,7 +150,9 @@ def test_scope_review_floor_self_lowering_detector():
     from ouroboros.tools.shell_guards import shell_has_write_indicator
 
     def verdict(cmd: str) -> bool:
-        """Judge exactly as the shell guard does: the same `writeish` fact it computes."""
+        """Judge with the coarse write-shape FACT arm of the guard's composition
+        (interpreter argv takes the mode-aware classifier in the registry; the
+        detector's own contract is identical for both facts)."""
         return det(cmd.lower(), writeish=shell_has_write_indicator(cmd))
 
     # Mutation shapes stay blocked — including the ones the write-shape fact alone does
