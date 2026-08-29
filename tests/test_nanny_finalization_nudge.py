@@ -517,10 +517,17 @@ def test_unreadable_custody_surfaces_the_configured_unknown_nudge(tmp_path):
     # may hide a live or settled leaf. Both shapes ride the real read: a
     # custody log made unreadable on disk.
     import os
+    import platform
+
+    import pytest
 
     from ouroboros import delegate_custody as custody
     from ouroboros.loop import _nanny_finalization_message
 
+    if platform.system() == "Windows":
+        pytest.skip("chmod-based permission test not portable to Windows")
+    if os.geteuid() == 0:  # pragma: no cover — only hit in root CI
+        pytest.skip("root user bypasses 0o000 chmod, cannot trigger OSError")
     parent, child = tmp_path / "parent", tmp_path / "child"
     for root in (parent, child):
         (root / "logs").mkdir(parents=True)
