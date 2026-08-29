@@ -130,7 +130,7 @@ def test_genuine_error_still_headlines_tool_failure():
 
 # --- EFFORT_SCALE SSOT (1.8) -------------------------------------------------
 
-def test_effort_scale_ordered_and_includes_xhigh_max():
+def test_effort_scale_ordered_and_top_tier_is_last():
     assert EFFORT_SCALE == ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
     assert effort_rank("xhigh") > effort_rank("high")
     assert effort_rank("ultra") > effort_rank("max")

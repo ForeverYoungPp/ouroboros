@@ -1716,3 +1716,10 @@ def test_switch_model_refuses_an_unknown_effort_instead_of_coercing(monkeypatch,
     # The new top tier is accepted, case/whitespace normalized like before.
     assert "OK: switching" in _switch_model(ctx, effort=" ULTRA ")
     assert ctx.active_effort_override == "ultra"
+
+    # Whitespace-only effort is neither refused nor applied: it stays an empty
+    # request and falls through to the listing, leaving no override behind.
+    blank = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    assert _switch_model(blank, effort="   ").startswith("Current available models:")
+    assert blank.active_effort_override is None
+    assert blank.active_model_override is None
