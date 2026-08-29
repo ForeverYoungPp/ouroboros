@@ -679,9 +679,11 @@ def _classify_action(
             "reason_code": "provider_required_reasoning",
         })
     if effort_implicated and named_effort_value:
-        from ouroboros.config import effort_one_step_down, effort_rank
+        from ouroboros.config import EFFORT_SCALE, effort_one_step_down, effort_rank
 
-        next_effort = effort_one_step_down(current_effort)
+        # Gated on the error naming the CURRENT value, so other scale words are prescription, not prose.
+        prescribed = [t for t in EFFORT_SCALE[:max(effort_rank(current_effort), 0)] if t in error_tokens]
+        next_effort = prescribed[-1] if prescribed else effort_one_step_down(current_effort)
         if effort_rank(next_effort) >= effort_rank("low") and next_effort != current_effort:
             value_path = {
                 "reasoning_effort": "reasoning_effort",
