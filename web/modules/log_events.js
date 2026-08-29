@@ -156,6 +156,7 @@ export function executorChip(evt) {
         const succeeded = Number(evidence.delegated_runs_succeeded ?? NaN);
         failed = Number.isFinite(succeeded) ? Math.max(0, settled - succeeded) : 0;
     }
+    failed = Math.max(0, failed);
     if (evidence.evidence_read_failed) {
         // The custody log EXISTS but could not be (fully) read: the counts are
         // UNKNOWN, not an established fact (sol finding, b49f8192 wave). This
@@ -197,15 +198,19 @@ export function executorChip(evt) {
         ? 'subscription spend undisclosed'
         : `${approx}$${Number(cost).toFixed(2)} subscription`;
     const runsPart = `${settled} run${settled === 1 ? '' : 's'}`;
-    // `failed` comes from the evidence SSOT (or the succeeded-complement on
-    // historical frames): all-failed runs must never read as a clean receipt.
-    // A frame with neither counter renders plain, exactly as wide as what it
-    // disclosed.
+    // The owner dictionary is "N ok, M failed" (plan D9): ok = settled − failed
+    // when either counter is disclosed; a frame with neither counter renders
+    // plain "N runs", exactly as wide as what it disclosed. All-failed runs
+    // must never read as a clean receipt.
+    const counted = Number.isFinite(Number(evidence.delegated_runs_failed ?? NaN))
+        || Number.isFinite(Number(evidence.delegated_runs_succeeded ?? NaN));
+    const ok = Math.max(0, settled - failed);
+    const okPart = `${ok} ok${failed ? `, ${failed} failed` : ''}`;
     return {
         ...base,
         hasEvidence: true,
-        label: failed ? `${name} · ${runsPart}, ${failed} failed` : `${name} · ${runsPart}`,
-        title: withSubstrate(`Delegated to your ${name} account — ${runsPart} settled${failed ? `, ${failed} failed` : ''}, ${costPart}`),
+        label: counted ? `${name} · ${okPart}` : `${name} · ${runsPart}`,
+        title: withSubstrate(`Delegated to your ${name} account — ${runsPart} settled${counted ? ` (${okPart})` : ''}, ${costPart}`),
     };
 }
 
@@ -1167,4 +1172,11 @@ export function isGroupedTaskEvent(evt) {
         || t === 'context_building_finished'
         || t === 'send_message'
     );
+}
+
+// Sticky-card precedence (adversarial wave B-ADV-2): an evidence-bearing
+// (receipt) chip is never downgraded by a later evidence-less (dispatch)
+// frame — the history sync after justFinished anchors on a mid-run row.
+export function keepStickyExecutorChip(prior, next) {
+    return !!(prior && prior.hasEvidence && next && !next.hasEvidence);
 }

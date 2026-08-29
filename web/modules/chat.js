@@ -24,6 +24,7 @@ import {
     taskSoftStopPending,
     taskStoppedWithSummary,
     taskDoneIsTerminal,
+    keepStickyExecutorChip,
     taskTerminalPhase,
 } from './log_events.js';
 import {
@@ -2078,9 +2079,27 @@ export function createChatInstance({
         run: () => syncHistory({ includeUser: false }).catch(() => {}),
     });
 
-    // perf2 P4.3: the ONE meta-line renderer, fed entirely from record state
-    // (sticky executor chip, last frame's meta strings, sticky cost, activity
-    // clock) so a replay batch can render it exactly once per card.
+    // The 12 cost-meta keys shared by both subagent whitelists (the delegation
+    // trio stays inline in each literal — the wire test scans those literals).
+    function costMetaKeys(src) {
+        return {
+            cost_usd: src?.cost_usd,
+            accounted_upper_bound_usd: src?.accounted_upper_bound_usd,
+            accounted_upper_bound_usd_with_children: src?.accounted_upper_bound_usd_with_children,
+            cost_accounting_status: src?.cost_accounting_status,
+            cost_accounting_error: src?.cost_accounting_error,
+            cost_final: src?.cost_final,
+            cost_usd_with_children: src?.cost_usd_with_children,
+            cost_with_children_partial: src?.cost_with_children_partial,
+            reserved_usd: src?.reserved_usd,
+            unresolved_upper_bound_usd: src?.unresolved_upper_bound_usd,
+            unknown_unmetered: src?.unknown_unmetered,
+            non_final_rows: src?.non_final_rows,
+        };
+    }
+
+    // perf2 P4.3: the ONE meta-line renderer, fed entirely from record state,
+    // so a replay batch renders it exactly once per card.
     function renderLiveCardMeta(record) {
         if (!record?.metaEl) return;
         const executorChipHtml = record.executorChip
@@ -2250,19 +2269,11 @@ export function createChatInstance({
         if (summary.costProjection) {
             record.costMeta = mergeStickyCostMeta(record.costMeta, summary.costProjection);
         }
-        // Phase 6 (owner directive #1): the executor chip is STICKY on the card —
-        // a later costless/quiet frame must not erase the fact that this bubble
-        // ran on a harness. Absent fact leaves it absent; no placeholder chip.
-        // Layered-truth precedence: an evidence-bearing (receipt) chip is never
-        // downgraded by a later evidence-less (dispatch) frame — the routine
-        // history sync after justFinished anchors on a mid-run row without
-        // evidence and would otherwise knock a finished card's counts back to
-        // the bare dispatch label.
-        if (summary.executorChip) {
-            const prior = record.executorChip;
-            if (!(prior && prior.hasEvidence && !summary.executorChip.hasEvidence)) {
-                record.executorChip = summary.executorChip;
-            }
+        // Phase 6: the chip is STICKY — quiet frames never erase it, and an
+        // evidence chip is never downgraded (keepStickyExecutorChip).
+        if (summary.executorChip
+                && !keepStickyExecutorChip(record.executorChip, summary.executorChip)) {
+            record.executorChip = summary.executorChip;
         }
         // perf2 P4.3: meta renders from record state — immediately on the live
         // path, once per card at the end of a rebuildAll replay batch.
@@ -2495,27 +2506,13 @@ export function createChatInstance({
             parent_task_id: msg?.parent_task_id || '',
             delegation_role: msg?.delegation_role || '',
             subagent_role: msg?.subagent_role || '',
-            // The resolved delegated route; without it a LIVE progress bubble drops
-            // the executor chip that the same bubble regains on reload.
+            // Delegation trio: a forgotten key freezes the chip
+            // (wire_contract.test.js pins all three).
             executor_route: msg?.executor_route || '',
-            // The completion-seam receipt beside the route: an enumerated list is
-            // a whitelist, and a whitelist that forgets the delegation keys keeps
-            // the chip at "no run yet" forever (wire_contract.test.js class).
             execution_evidence: msg?.execution_evidence,
             actual_substrate: msg?.actual_substrate || '',
             status: msg?.status || '',
-            cost_usd: msg?.cost_usd,
-            accounted_upper_bound_usd: msg?.accounted_upper_bound_usd,
-            accounted_upper_bound_usd_with_children: msg?.accounted_upper_bound_usd_with_children,
-            cost_accounting_status: msg?.cost_accounting_status,
-            cost_accounting_error: msg?.cost_accounting_error,
-            cost_final: msg?.cost_final,
-            cost_usd_with_children: msg?.cost_usd_with_children,
-            cost_with_children_partial: msg?.cost_with_children_partial,
-            reserved_usd: msg?.reserved_usd,
-            unresolved_upper_bound_usd: msg?.unresolved_upper_bound_usd,
-            unknown_unmetered: msg?.unknown_unmetered,
-            non_final_rows: msg?.non_final_rows,
+            ...costMetaKeys(msg),
             result: msg?.result || '',
             trace_summary: msg?.trace_summary || '',
             error: msg?.error || '',
@@ -2681,9 +2678,7 @@ export function createChatInstance({
             subagent_role: info.role,
             subagent_event: event,
             model: info.model || '',
-            // Delegation truth must survive this second whitelist too: a
-            // log-channel-only terminal still upgrades the executor chip from
-            // "no run yet" to the evidence/substrate receipt.
+            // Second whitelist: a log-channel-only terminal still upgrades the chip.
             executor_route: evt.executor_route || '',
             execution_evidence: evt.execution_evidence,
             actual_substrate: evt.actual_substrate || '',
@@ -2691,18 +2686,7 @@ export function createChatInstance({
             result: evt.result || '',
             error: evt.error || '',
             reason_code: evt.reason_code || '',
-            cost_usd: evt.cost_usd,
-            accounted_upper_bound_usd: evt.accounted_upper_bound_usd,
-            accounted_upper_bound_usd_with_children: evt.accounted_upper_bound_usd_with_children,
-            cost_accounting_status: evt.cost_accounting_status,
-            cost_accounting_error: evt.cost_accounting_error,
-            cost_final: evt.cost_final,
-            cost_usd_with_children: evt.cost_usd_with_children,
-            cost_with_children_partial: evt.cost_with_children_partial,
-            reserved_usd: evt.reserved_usd,
-            unresolved_upper_bound_usd: evt.unresolved_upper_bound_usd,
-            unknown_unmetered: evt.unknown_unmetered,
-            non_final_rows: evt.non_final_rows,
+            ...costMetaKeys(evt),
         }, evt.ts || evt.timestamp || new Date().toISOString());
         return true;
     }

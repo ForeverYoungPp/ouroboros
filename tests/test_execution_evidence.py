@@ -326,6 +326,7 @@ def test_terminal_frame_field_rides_the_history_replay_allowlist():
 
     assert "execution_evidence" in _PROGRESS_META_FIELDS
     assert "executor_route" in _PROGRESS_META_FIELDS
+    assert "actual_substrate" in _PROGRESS_META_FIELDS
 
 
 def test_run_timing_reads_the_started_row(tmp_path):

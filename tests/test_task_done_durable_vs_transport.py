@@ -13,7 +13,6 @@ Verifies Lane B claims at the byte level:
   5. Non-subagent task: push_log event carries NO delegation keys.
 """
 import json
-import pathlib
 
 
 def _mk_ctx(tmp_path, sent, pushed):

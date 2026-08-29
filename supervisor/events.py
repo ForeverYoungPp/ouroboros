@@ -1620,30 +1620,12 @@ def _finish_task_done_dispatch(
             or load_task_result(ctx.DRIVE_ROOT, str(task_id or ""))
             or {}
         )
-        _envelope = effective_result.get("subagent_envelope")
-        _envelope = _envelope if isinstance(_envelope, dict) else {}
-        # The LOG-channel terminal (push_log below) carries the same delegation
-        # truth as the chat frame — additive keys, stamped after the durable
-        # events.jsonl append (transport enrichment, not a log-shape change) —
-        # so a card whose chat frame never arrives still upgrades its executor
-        # chip from the task_done log event instead of staying at "no run yet".
-        if str(effective_result.get("executor_route") or ""):
-            task_done_event.setdefault(
-                "executor_route", str(effective_result["executor_route"]))
-        if isinstance(_envelope.get("execution_evidence"), dict):
-            task_done_event.setdefault(
-                "execution_evidence", _envelope["execution_evidence"])
-        if _envelope.get("actual_substrate"):
-            task_done_event.setdefault(
-                "actual_substrate", str(_envelope["actual_substrate"]))
         from supervisor.message_bus import notification_chat_route
+        from supervisor.subagent_task_truth import enrich_task_done_event
 
-        # Membership decides, not truthiness (C4): chat 0 is the Skill Review
-        # panel — a real destination whose terminal evidence frame the old
-        # `if chat_id:` silently dropped (the card kept its dispatch-only chip
-        # forever) — while a negative id is A2A traffic that must never enter a
-        # human stream. The project binding keeps precedence; ITS 0 means "no
-        # binding" (never the panel) and falls through to the task's own chat.
+        _envelope = enrich_task_done_event(task_done_event, effective_result)
+        # Membership, not truthiness (C4): chat 0 is real, negative is A2A;
+        # a binding 0 = no binding, falls through.
         chat_id = notification_chat_route(
             _bound_project_chat_id(
                 ctx, task_id, task.get("parent_task_id"), task.get("root_task_id")
@@ -1717,7 +1699,6 @@ def _finish_task_done_dispatch(
             if isinstance(_envelope.get("execution_evidence"), dict):
                 progress_meta["execution_evidence"] = _envelope["execution_evidence"]
             if _envelope.get("actual_substrate"):
-                # The FACT beside the plan (Q1A): harness_used / harness_attempted / native_only.
                 progress_meta["actual_substrate"] = str(_envelope["actual_substrate"])
             if isinstance(task_done_event.get("outcome_axes"), dict):
                 progress_meta["outcome_axes"] = task_done_event["outcome_axes"]

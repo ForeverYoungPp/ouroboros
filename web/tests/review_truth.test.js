@@ -241,8 +241,9 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
             subscription_cost_usd: 0.0, harness_models: ['claude-sonnet'],
         },
     });
-    assert.equal(delegated.label, 'Claude Code · 1 run');
-    assert.match(delegated.title, /Delegated to your Claude Code account — 1 run settled, \$0\.00 subscription/);
+    // Owner dictionary (plan D9): the label counts OK runs, not settled totals.
+    assert.equal(delegated.label, 'Claude Code · 1 ok');
+    assert.match(delegated.title, /Delegated to your Claude Code account — 1 run settled \(1 ok\), \$0\.00 subscription/);
 
     // ALL-FAILED runs must never read as success: the failure count rides the
     // LABEL, not only the tooltip (delegated_runs_failed was previously unread
@@ -255,7 +256,7 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
             subscription_cost_usd: null, harness_models: [],
         },
     });
-    assert.equal(allFailed.label, 'codex · 2 runs, 2 failed');
+    assert.equal(allFailed.label, 'codex · 0 ok, 2 failed');
     assert.match(allFailed.title, /2 failed/);
 
     // STARTED but none settled: as far as the durable rows know, the run is
@@ -424,7 +425,7 @@ test('historical frames without the failed counter reconstruct it from succeeded
             delegated_runs_succeeded: 0, subscription_cost_usd: null,
         },
     });
-    assert.equal(historical.label, 'codex · 2 runs, 2 failed');
+    assert.equal(historical.label, 'codex · 0 ok, 2 failed');
     // A frame with NEITHER counter stays plain — exactly as wide as disclosed.
     const bare = executorChip({
         executor_route: 'codex',
