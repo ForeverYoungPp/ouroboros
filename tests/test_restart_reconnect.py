@@ -435,18 +435,25 @@ def test_ws_sha_reload_decision_is_single_sourced():
     recovery_body = source.split("_scheduleUiRecovery(reason, delay = 15000) {", 1)[1].split(
         "_startWatchdog(socket) {", 1
     )[0]
-    assert "_applyShaDecision(" in recovery_body, (
-        "the recovery probe must consult the shared SHA decision"
+    assert "_applyShaDecision(servedSha, this._wasConnected, false)" in recovery_body, (
+        "the recovery probe must consult the shared SHA decision WITHOUT "
+        "remembering the served SHA (a pre-connect probe adopting a restarted "
+        "server's SHA would leave stale assets unhealed)"
+    )
+    assert "this._uiRecoveryProbeInFlight" in recovery_body, (
+        "arming recovery must be gated on the in-flight probe flag so hung "
+        "probes cannot pile up and multi-count the healthy fuse"
     )
     refresh_body = source.split("_refreshStateAfterOpen(previouslyConnected) {", 1)[1].split(
         "_flushPendingMessages() {", 1
     )[0]
-    assert "_applyShaDecision(" in refresh_body, (
-        "the post-open refresh must consult the shared SHA decision"
+    assert "_applyShaDecision(servedSha, previouslyConnected, true)" in refresh_body, (
+        "the post-open refresh must consult the shared SHA decision and is the "
+        "ONLY path that remembers the served SHA"
     )
-    apply_body = source.split("_applyShaDecision(servedSha, previouslyConnected) {", 1)[1].split(
-        "_reloadForShaDecision(decision) {", 1
-    )[0]
+    apply_body = source.split(
+        "_applyShaDecision(servedSha, previouslyConnected, storeServedSha) {", 1
+    )[1].split("_reloadForShaDecision(decision) {", 1)[0]
     assert "decide(this._lastSha, servedSha, previouslyConnected)" in apply_body, (
         "the shared applier must delegate to the exported SSOT decide()"
     )

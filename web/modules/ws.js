@@ -10,11 +10,13 @@ export const RECOVERY_HEALTHY_PROBE_LIMIT = 4;
  * SSOT for the served-SHA reload decision, shared by the post-open state
  * refresh and the socket-down recovery probe.
  *
- * A client that never connected has nothing to reconcile: keep the page (the
- * caller remembers the served SHA). After a connection existed, an equal SHA
- * keeps the page; a different SHA means the server now serves other assets
- * (reload); a missing, empty, or malformed SHA on either side means the page
- * can no longer be proven current (reload).
+ * A client that never connected has nothing to reconcile: keep the page.
+ * After a connection existed, an equal SHA keeps the page; a different SHA
+ * means the server now serves other assets (reload); a previously-known SHA
+ * that disappears or garbles means the page can no longer be proven current
+ * (reload). When no non-empty SHA was ever remembered AND the server serves
+ * none either — run-from-source installs never expose one — nothing was ever
+ * provable and nothing changed: keep (owner-flagged default, netres Q19).
  *
  * @param {*} prevSha last remembered served SHA (may be null/empty)
  * @param {*} servedSha SHA reported by /api/state (may be absent/malformed)
@@ -23,10 +25,10 @@ export const RECOVERY_HEALTHY_PROBE_LIMIT = 4;
  */
 export function decide(prevSha, servedSha, previouslyConnected) {
     const served = typeof servedSha === 'string' ? servedSha.trim() : '';
-    if (!previouslyConnected) return 'keep';
-    if (!served) return 'reload_unknown';
     const prev = typeof prevSha === 'string' ? prevSha.trim() : '';
-    if (!prev) return 'reload_unknown';
+    if (!previouslyConnected) return 'keep';
+    if (!prev && !served) return 'keep';
+    if (!served || !prev) return 'reload_unknown';
     return prev === served ? 'keep' : 'reload_changed';
 }
 
@@ -42,6 +44,7 @@ export class WS {
         this._lastMessageAt = 0;
         this._reconnectTimer = null;
         this._uiRecoveryTimer = null;
+        this._uiRecoveryProbeInFlight = false;
         this._watchdogTimer = null;
         this._recoveryHealthyProbes = 0;
         this._recoveryReloadFired = false;
@@ -85,9 +88,14 @@ export class WS {
         window.location.replace(this._freshWindowUrl(reason));
     }
 
-    _applyShaDecision(servedSha, previouslyConnected) {
+    _applyShaDecision(servedSha, previouslyConnected, storeServedSha) {
         const decision = decide(this._lastSha, servedSha, previouslyConnected);
-        if (decision === 'keep' && typeof servedSha === 'string' && servedSha.trim()) {
+        // Only the post-open refresh remembers the served SHA. A pre-connect
+        // recovery probe must never adopt a restarted server's SHA: doing so
+        // would make the eventual post-open compare a self-fulfilling "keep"
+        // and leave stale assets unhealed.
+        if (storeServedSha && decision === 'keep'
+                && typeof servedSha === 'string' && servedSha.trim()) {
             this._lastSha = servedSha.trim();
         }
         return decision;
@@ -100,46 +108,64 @@ export class WS {
     }
 
     _scheduleUiRecovery(reason, delay = 15000) {
-        if (this._uiRecoveryTimer) return;
+        // At most ONE recovery probe chain per episode: while a probe is in
+        // flight the timer slot is empty, so arming must also be gated on the
+        // in-flight flag — otherwise send()/_scheduleReconnect during a hung
+        // probe pile up extra probes whose late resolutions would all count
+        // toward the healthy fuse at once and could force a reload exactly
+        // when connectivity returns, destroying queued outbound messages.
+        if (this._uiRecoveryTimer || this._uiRecoveryProbeInFlight) return;
         this._uiRecoveryTimer = setTimeout(async () => {
             this._uiRecoveryTimer = null;
-            let healthy = false;
-            let servedSha;
+            this._uiRecoveryProbeInFlight = true;
+            let rearm = false;
             try {
-                const resp = await apiFetch('/api/state', { cache: 'no-store' });
-                if (resp.ok) {
-                    healthy = true;
-                    try {
-                        const body = await resp.json();
-                        servedSha = body ? body.sha : undefined;
-                    } catch {}
-                }
-            } catch {}
-            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                // The reconnect won the race while the probe was in flight;
-                // the post-open refresh owns the SHA decision now.
-                return;
-            }
-            if (healthy) {
-                const decision = this._applyShaDecision(servedSha, this._wasConnected);
-                if (decision !== 'keep') {
-                    this._reloadForShaDecision(decision);
+                let healthy = false;
+                let servedSha;
+                try {
+                    const resp = await apiFetch('/api/state', { cache: 'no-store' });
+                    if (resp.ok) {
+                        healthy = true;
+                        try {
+                            const body = await resp.json();
+                            servedSha = body ? body.sha : undefined;
+                        } catch {}
+                    }
+                } catch {}
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    // The reconnect won the race while the probe was in flight;
+                    // the post-open refresh owns the SHA decision now.
                     return;
                 }
-                this._recoveryHealthyProbes += 1;
-                if (this._recoveryHealthyProbes >= RECOVERY_HEALTHY_PROBE_LIMIT
-                        && !this._recoveryReloadFired) {
-                    // The server is reachable and serves the same page, yet the
-                    // socket never reopens: force one reload per disconnect
-                    // episode instead of reconnecting in place forever.
-                    this._recoveryReloadFired = true;
-                    this._refreshWindow(reason);
-                    return;
+                if (healthy) {
+                    const decision = this._applyShaDecision(servedSha, this._wasConnected, false);
+                    if (decision !== 'keep') {
+                        this._reloadForShaDecision(decision);
+                        return;
+                    }
+                    this._recoveryHealthyProbes += 1;
+                    if (this._recoveryHealthyProbes >= RECOVERY_HEALTHY_PROBE_LIMIT
+                            && !this._recoveryReloadFired) {
+                        // The server is reachable and serves the same page, yet the
+                        // socket never reopens: force one reload per disconnect
+                        // episode instead of reconnecting in place forever.
+                        this._recoveryReloadFired = true;
+                        this._refreshWindow(reason);
+                        return;
+                    }
+                } else {
+                    this._recoveryHealthyProbes = 0;
                 }
-            } else {
-                this._recoveryHealthyProbes = 0;
+                rearm = true;
+            } finally {
+                // Cleared before the re-arm below so the next arm attempt is
+                // not self-blocked; cleared on every exit so a bail or reload
+                // never leaves recovery permanently disarmed.
+                this._uiRecoveryProbeInFlight = false;
             }
-            this._scheduleUiRecovery(reason, Math.min(Math.round(delay * 1.5), 30000));
+            if (rearm) {
+                this._scheduleUiRecovery(reason, Math.min(Math.round(delay * 1.5), 30000));
+            }
         }, delay);
     }
 
@@ -172,7 +198,7 @@ export class WS {
             try {
                 servedSha = (await resp.json())?.sha;
             } catch {}
-            const decision = this._applyShaDecision(servedSha, previouslyConnected);
+            const decision = this._applyShaDecision(servedSha, previouslyConnected, true);
             if (decision !== 'keep') this._reloadForShaDecision(decision);
         }).catch(() => {});
     }
