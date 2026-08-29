@@ -1819,6 +1819,7 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                     function = tc.get("function") if isinstance(tc, dict) else {}
                     name = str((function or {}).get("name") or "")
                     raw_args = (function or {}).get("arguments")
+                    args: Optional[Dict[str, Any]] = None
                     verdict = validation_by_id.get(call_id)
                     if verdict is not None and not getattr(verdict, "allows_execution", True):
                         result = f"⚠️ TOOL_ARG_ERROR: {getattr(verdict, 'error', 'invalid arguments')}"
