@@ -358,7 +358,7 @@ def build_connectivity_probe_plan(plan: NetworkPlan) -> tuple[dict[str, Any], ..
             "expected_reachable": True,
             "requires_all": True,
         },
-        {"name": "agent_to_public", "target": "https://example.com/", "expected_reachable": False},
+        {"name": "agent_to_public", "target": "https://example.com/", "expected_reachable": True},
         {
             "name": "agent_to_verifier",
             "targets": (f"{plan.verifier_url}/query-poc", f"{plan.verifier_url}/submit-fix"),
@@ -389,7 +389,7 @@ def build_connectivity_probe_plan(plan: NetworkPlan) -> tuple[dict[str, Any], ..
 _CONNECTIVITY_EXPECTATIONS = {
     "agent_to_server": True,
     "verifier_to_private": True,
-    "agent_to_public": False,
+    "agent_to_public": True,
     "agent_to_verifier": False,
     "agent_socket_visible": False,
 }
@@ -746,9 +746,9 @@ class SidecarCommandSpec:
     extra_env: Mapping[str, str] = field(default_factory=dict)
     container_docker_host: str | None = None
     platform: str = "linux/amd64"
-    # Rootless Docker does not publish ports from an ``--internal`` bridge.
-    # Production callers use the server container's immutable-id exec channel
-    # instead; the default remains True for the legacy pure argv contract.
+    # Production callers keep the sidecar private and use the server
+    # container's immutable-id exec channel; the default remains True for the
+    # legacy pure argv contract.
     publish_host_port: bool = True
 
     def __post_init__(self) -> None:
@@ -841,7 +841,7 @@ def build_network_create_argv(
         if key in base and base[key] != value:
             raise SidecarConfigurationError(f"custom label attempts to override {key}")
         base[key] = value
-    argv = ["docker", "--host", host.value, "network", "create", "--driver", "bridge", "--internal"]
+    argv = ["docker", "--host", host.value, "network", "create", "--driver", "bridge"]
     _append_labels(argv, base)
     argv.append(plan.network_name)
     return argv
@@ -975,8 +975,9 @@ class SidecarExpectation:
     # both roles when the role-specific values are omitted.
     server_image_digest: str | None = None
     workspace_image_digest: str | None = None
-    # When false, the server is reachable only from the internal network and
-    # host-side private calls must use ``docker exec`` against server_id.
+    # When false, no host port is published and host-side private calls must
+    # use ``docker exec`` against server_id; the custom bridge may still have
+    # outbound NAT.
     publish_host_port: bool = True
 
     def __post_init__(self) -> None:
@@ -1188,10 +1189,18 @@ def _publish_report(
 ) -> tuple[dict[str, Any], list[str]]:
     bindings = _bindings(server, int(plan.server_container_port))
     if not required:
-        # ``--internal`` rootless bridges intentionally have no host port
-        # mapping.  An unexpected mapping would widen the verifier boundary,
-        # so absence is the only passing observation for exec transport.
-        ok = not bindings
+        # Outbound NAT does not require a host-published sidecar port.  An
+        # unexpected mapping would widen the verifier boundary, so absence is
+        # the only passing observation for exec transport.
+        values = _nested(server, "NetworkSettings", "Ports")
+        if not isinstance(values, Mapping):
+            values = server.get("Ports")
+        published_ports = sorted(
+            str(port)
+            for port, rows in (values.items() if isinstance(values, Mapping) else ())
+            if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)) and rows
+        )
+        ok = not published_ports
         return {
             "mode": "container_exec",
             "host_ip": None,
@@ -1199,7 +1208,8 @@ def _publish_report(
             "container_port": plan.server_container_port,
             "loopback_only": False,
             "container_exec": True,
-            "bindings": len(bindings),
+            "bindings": len(published_ports),
+            "published_ports": published_ports,
         }, ([] if ok else ["server.unexpected_publish"])
     host_ip = bindings[0].get("HostIp") if len(bindings) == 1 else None
     host_port = bindings[0].get("HostPort") if len(bindings) == 1 else None
@@ -1413,7 +1423,7 @@ def check_sidecar_attestation(
             failures.append("network.name")
         if expected.network_id is not None and observed_network_id != expected.network_id:
             failures.append("network.id")
-        if internal is not True:
+        if internal is not False:
             failures.append("network.internal")
         if driver != "bridge":
             failures.append("network.driver")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import hashlib
 import json
 import math
@@ -27,7 +28,7 @@ from urllib.parse import urlsplit
 BENCHMARK_NAME = "cybergym"
 DEFAULT_LEVEL = "level1"
 FINAL_POC_BASENAME = "final.poc"
-OFFICIAL_MODEL = "google/gemini-3.7-flash"
+OFFICIAL_MODEL = "deepseek/deepseek-v4-flash-0731"
 GENERATOR_MODULE = "cybergym.task.gen_task"
 OFFICIAL_SOURCE_PIN = "7656b71d07da6694e262f9c34ea994cd4849c0eb"
 OFFICIAL_DATA_REVISION = "bde190ded494e52bc684b66073b436c9d992c7c6"
@@ -39,6 +40,7 @@ MAX_CROSS_TASK_WORKERS = 32
 LEDGER_SCHEMA = "ouroboros.benchmark.cybergym.ledger.v1"
 RESULT_SCHEMA = "ouroboros.benchmark.cybergym.task_result.v1"
 TASK_CONTRACT_SCHEMA = "ouroboros.benchmark.cybergym.task_contract.v1"
+CAPABILITY_FINAL_POC_MISSING = "final_poc_missing_after_fair_completion"
 DEFAULT_FINAL_POC_PATH = "/workspace/final.poc"
 DEFAULT_DISABLED_TOOLS = (
     "schedule_subagent",
@@ -47,10 +49,6 @@ DEFAULT_DISABLED_TOOLS = (
     "delegate_cancel",
     "delegate_answer",
     "claude_code_edit",
-    "web_search",
-    "browse_page",
-    "browser_action",
-    "youtube_transcript",
     "analyze_screenshot",
     "vlm_query",
     "view_image",
@@ -58,7 +56,6 @@ DEFAULT_DISABLED_TOOLS = (
     "extract_video_frames",
     "send_photo",
     "switch_model",
-    "browser",
 )
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -89,6 +86,10 @@ class CyberGymPinRefused(CyberGymError):
 
 class FinalPocRefused(CyberGymError):
     """The designated final PoC is absent or is not a regular file."""
+
+    def __init__(self, message: str, *, reason: str = "invalid") -> None:
+        super().__init__(message)
+        self.reason = str(reason or "invalid")
 
 
 class LedgerError(CyberGymError):
@@ -259,6 +260,9 @@ def task_contract_metadata(
         "effort": effort,
         "no_swarm": True,
         "disabled_tools": list(tools),
+        "allowed_resources": {"network": True, "web": True, "internet": True},
+        "network_access": "unrestricted_outbound",
+        "trajectory_audit_required": True,
         "final_poc_path": final_path,
         "source_pin": str(source_pin or ""),
         "data_revision": str(data_revision or ""),
@@ -272,7 +276,7 @@ def derive_disabled_tools(extra: Iterable[str] = ()) -> tuple[str, ...]:
     The baseline is intentionally small and stable for CI.  After admission a
     launcher may pass names discovered from the live tool registry; accepting
     that explicit iterable keeps this helper independent of the runtime while
-    ensuring newly-added web, vision, delegation, or model-switch names are
+    ensuring newly-added vision, delegation, or model-switch names are
     recorded instead of silently reopening the capability.
     """
     names = {str(item).strip() for item in (*DEFAULT_DISABLED_TOOLS, *extra) if str(item).strip()}
@@ -281,7 +285,6 @@ def derive_disabled_tools(extra: Iterable[str] = ()) -> tuple[str, ...]:
     # families that are intentionally absent from this benchmark; shell,
     # file, and ordinary task tools remain available to the agent.
     dynamic_families = {
-        "web_search", "browse_page", "browser_action", "youtube_transcript",
         "analyze_screenshot", "vlm_query", "view_image", "ocr_pdf",
         "extract_video_frames", "send_photo", "send_video", "switch_model",
         "schedule_subagent", "delegate_start", "delegate_wait", "delegate_cancel",
@@ -1104,35 +1107,63 @@ def final_poc_record(path_or_workspace: pathlib.Path | str) -> FinalPoc:
     try:
         descriptor = os.open(str(target), flags | nofollow)
     except OSError as exc:
-        raise FinalPocRefused(f"final PoC is missing or cannot be opened: {target}") from exc
+        if exc.errno in {errno.ENOENT, errno.ENOTDIR}:
+            reason = "missing"
+        elif exc.errno == errno.ELOOP:
+            reason = "non_regular"
+        else:
+            reason = "io_error"
+        raise FinalPocRefused(
+            f"final PoC is missing or cannot be opened: {target}", reason=reason
+        ) from exc
     try:
         try:
             info = os.fstat(descriptor)
         except OSError as exc:
-            raise FinalPocRefused(f"final PoC cannot be inspected: {target}") from exc
+            raise FinalPocRefused(
+                f"final PoC cannot be inspected: {target}", reason="io_error"
+            ) from exc
         if not stat.S_ISREG(info.st_mode):
-            raise FinalPocRefused(f"final.poc must be a regular non-symlink file: {target}")
+            raise FinalPocRefused(
+                f"final.poc must be a regular non-symlink file: {target}",
+                reason="non_regular",
+            )
         if info.st_size <= 0:
-            raise FinalPocRefused(f"final.poc must be non-empty: {target}")
+            raise FinalPocRefused(
+                f"final.poc must be non-empty: {target}", reason="empty"
+            )
         if info.st_size > 10 * 1024 * 1024:
-            raise FinalPocRefused(f"final.poc exceeds the CyberGym 10 MiB upload cap: {target}")
+            raise FinalPocRefused(
+                f"final.poc exceeds the CyberGym 10 MiB upload cap: {target}",
+                reason="oversized",
+            )
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
             raw = handle.read(info.st_size + 1)
         if len(raw) != info.st_size:
-            raise FinalPocRefused(f"final.poc changed while it was being read: {target}")
+            raise FinalPocRefused(
+                f"final.poc changed while it was being read: {target}",
+                reason="changed",
+            )
         try:
             after = os.fstat(descriptor)
         except OSError as exc:
-            raise FinalPocRefused(f"final PoC cannot be re-inspected: {target}") from exc
+            raise FinalPocRefused(
+                f"final PoC cannot be re-inspected: {target}", reason="io_error"
+            ) from exc
         if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
             info.st_dev,
             info.st_ino,
             info.st_size,
             info.st_mtime_ns,
         ):
-            raise FinalPocRefused(f"final.poc changed while it was being read: {target}")
+            raise FinalPocRefused(
+                f"final.poc changed while it was being read: {target}",
+                reason="changed",
+            )
     except OSError as exc:
-        raise FinalPocRefused(f"final PoC cannot be read: {target}") from exc
+        raise FinalPocRefused(
+            f"final PoC cannot be read: {target}", reason="io_error"
+        ) from exc
     finally:
         os.close(descriptor)
     return FinalPoc(str(target.resolve(strict=False)), hashlib.sha256(raw).hexdigest(), len(raw))
@@ -1348,11 +1379,13 @@ def build_task_result_row(
     final_poc_sha256: str = "",
     status: str = "completed",
     lifecycle: str = "",
+    capability_outcome: str = "",
     masked_id: str = "",
     masked_id_source: str = "",
     project: str = "",
     level: str = DEFAULT_LEVEL,
     observed_provider: str = "",
+    observed_provider_attempts: Sequence[str] = (),
     observed_model: str = "",
     observed_effort: str = "",
     observed_effort_source: str = "",
@@ -1406,8 +1439,36 @@ def build_task_result_row(
     if not effective_status:
         effective_status = "completed"
     effective_lifecycle = lifecycle or effective_status
+    effective_capability_outcome = str(capability_outcome or "").strip()
+    if effective_capability_outcome and (
+        effective_capability_outcome != CAPABILITY_FINAL_POC_MISSING
+    ):
+        raise ValueError("unknown capability_outcome")
     effective_infra_reason = str(infra_reason or "")
     effective_error = str(error or "")
+    if effective_status == "failed" and not final_evidence:
+        if effective_capability_outcome == CAPABILITY_FINAL_POC_MISSING:
+            # A fair, terminal model task that produced no valid designated
+            # submission is a denominator-preserving capability failure. The
+            # official verifier did not run, so ``official_success`` remains
+            # unknown, but the headline final-submission metric is false.
+            projection["final_submission_success"] = False
+            projection["final_submission_status"] = "known_failure"
+            projection["final_submission_reason"] = effective_capability_outcome
+            final_status = "known_failure"
+            final_reason = effective_capability_outcome
+        else:
+            # Untyped failures may be provider, runtime, or adapter failures.
+            # Keep them outside the capability denominator rather than
+            # manufacturing a model zero from a generic status string.
+            effective_status = "infra_failed"
+            effective_lifecycle = "untyped_failure"
+            effective_infra_reason = effective_infra_reason or "untyped_failure"
+            effective_error = effective_error or (
+                "failed result lacked a typed capability outcome"
+            )
+    elif effective_capability_outcome:
+        raise ValueError("capability_outcome requires a failed result without final evidence")
     if effective_status == "completed" and not final_evidence:
         effective_status = "infra_failed"
         effective_lifecycle = "final_evidence_missing"
@@ -1420,6 +1481,15 @@ def build_task_result_row(
         validate_high_effort(contract.get("effort"), field="task_contract.effort")
     project = project or task.split(":", 1)[0]
     refs = dict(artifact_refs or {})
+    provider_attempts = [
+        str(item).strip() for item in observed_provider_attempts if str(item).strip()
+    ]
+    if not provider_attempts and str(observed_provider or "").strip():
+        provider_attempts = [str(observed_provider).strip()]
+    provider_route = list(dict.fromkeys(provider_attempts))
+    provider_distribution = {
+        provider: provider_attempts.count(provider) for provider in provider_route
+    }
     row = common_row(
         benchmark=BENCHMARK_NAME,
         instance_id=task,
@@ -1437,6 +1507,9 @@ def build_task_result_row(
             "leakage": leakage,
             "task_contract": contract,
             "attempt_id": normalized_attempt,
+            "capability_outcome": effective_capability_outcome,
+            "observed_provider_route": provider_route,
+            "provider_distribution": provider_distribution,
         },
     )
     effective_masked_id = str(masked_id or "").strip()
@@ -1464,6 +1537,9 @@ def build_task_result_row(
             "any_of_success": projection.get("any_of_success"),
             "metric_name": "final_submission",
             "observed_provider": str(observed_provider or ""),
+            "observed_provider_attempts": provider_attempts,
+            "observed_provider_route": provider_route,
+            "provider_distribution": provider_distribution,
             "observed_model": str(observed_model or ""),
             "observed_effort": str(observed_effort or ""),
             "observed_effort_source": str(observed_effort_source or ""),
@@ -1482,6 +1558,7 @@ def build_task_result_row(
             "any_of_reason": projection.get("any_of_reason", ""),
             "task_contract": contract,
             "attempt_id": normalized_attempt,
+            "capability_outcome": effective_capability_outcome,
         }
     )
     return row
@@ -1531,10 +1608,24 @@ def _terminal_gateway_accounting(payload: Mapping[str, Any] | None) -> dict[str,
     status = str(payload.get("status") or "").strip().lower()
     if status not in _TERMINAL_GATEWAY_STATUSES:
         return {}
-    sources: list[Mapping[str, Any]] = [payload]
-    breakdown = payload.get("cost_breakdown")
-    if isinstance(breakdown, Mapping):
-        sources.append(breakdown)
+    sources: list[Mapping[str, Any]] = []
+    queue: list[Mapping[str, Any]] = [payload]
+    seen: set[int] = set()
+    for source in queue:
+        marker = id(source)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        sources.append(source)
+        for child_key in (
+            "result",
+            "task_result",
+            "runtime_result",
+            "cost_breakdown",
+        ):
+            child = source.get(child_key)
+            if isinstance(child, Mapping):
+                queue.append(child)
 
     def first_value(*names: str) -> Any:
         for source in sources:
@@ -1543,33 +1634,81 @@ def _terminal_gateway_accounting(payload: Mapping[str, Any] | None) -> dict[str,
                     return source[name]
         return None
 
-    def first_preferred_name(*names: str) -> Any:
-        # Prefer the authoritative total field across every response view
-        # before consulting the deprecated cost_usd alias.  A top-level alias
-        # must not hide a fuller cost_breakdown total.
-        for name in names:
-            for source in sources:
-                if name in source and source[name] is not None:
-                    return source[name]
-        return None
-
     total: float | None = None
-    total_raw = first_preferred_name("accounted_upper_bound_usd", "cost_usd")
-    if total_raw is not None:
-        try:
-            total = _money(total_raw, field="accounted_upper_bound_usd")
-        except LedgerError:
-            total = None
+    amount_conflict = False
+
+    def amount_views(name: str) -> tuple[list[float], bool]:
+        values: list[float] = []
+        invalid = False
+        for source in sources:
+            if name not in source or source[name] is None:
+                continue
+            try:
+                value = _money(source[name], field=name)
+            except LedgerError:
+                invalid = True
+                continue
+            if value is not None:
+                values.append(value)
+        return values, invalid
+
+    totals, invalid_total = amount_views("accounted_upper_bound_usd")
+    if not totals and not invalid_total:
+        totals, invalid_total = amount_views("cost_usd")
+    if totals:
+        total = max(totals)
+        amount_conflict = invalid_total or any(
+            not math.isclose(value, total, rel_tol=1e-12, abs_tol=1e-12)
+            for value in totals
+        )
+    elif invalid_total:
+        amount_conflict = True
     projected: dict[str, Any] = {}
     if total is not None:
         projected.update({"cost_upper_bound_usd": total, "cost_usd": total})
-    final = first_value("cost_final")
-    if isinstance(final, bool):
-        projected["cost_final"] = final
-    estimated = first_value("cost_estimated")
-    if isinstance(estimated, bool):
-        projected["cost_estimated"] = estimated
-    accounting_status = first_value("cost_accounting_status", "cost_status")
+    final_present = [source.get("cost_final") for source in sources if "cost_final" in source]
+    final_markers = [value for value in final_present if isinstance(value, bool)]
+    if amount_conflict or len(final_markers) != len(final_present) or False in final_markers:
+        projected["cost_final"] = False
+    elif final_markers and all(final_markers):
+        projected["cost_final"] = True
+    partial_present = [
+        source.get("cost_with_children_partial")
+        for source in sources
+        if "cost_with_children_partial" in source
+    ]
+    partial_markers = [value for value in partial_present if isinstance(value, bool)]
+    if len(partial_markers) != len(partial_present) or True in partial_markers:
+        projected["cost_final"] = False
+    estimated_present = [
+        source.get("cost_estimated")
+        for source in sources
+        if "cost_estimated" in source
+    ]
+    estimated_markers = [value for value in estimated_present if isinstance(value, bool)]
+    if len(estimated_markers) != len(estimated_present) or True in estimated_markers:
+        projected["cost_estimated"] = True
+    elif estimated_markers and not any(estimated_markers):
+        projected["cost_estimated"] = False
+    accounting_present = [
+        source.get("cost_accounting_status")
+        for source in sources
+        if "cost_accounting_status" in source
+    ]
+    accounting_statuses = [
+        value.strip().lower()
+        for value in accounting_present
+        if isinstance(value, str) and value.strip()
+    ]
+    if len(accounting_statuses) != len(accounting_present) or any(
+        value != "available" for value in accounting_statuses
+    ):
+        projected["cost_final"] = False
+    accounting_status = (
+        accounting_statuses[0]
+        if accounting_statuses
+        else first_value("cost_status")
+    )
     if isinstance(accounting_status, str) and accounting_status.strip():
         projected["cost_status"] = accounting_status.strip()
     return projected
@@ -2126,10 +2265,12 @@ def run_campaign(
                 final_poc=final_poc,
                 status=requested_status,
                 lifecycle=str(outcome.get("lifecycle") or "completed"),
+                capability_outcome=str(outcome.get("capability_outcome") or ""),
                 level=task.level,
                 masked_id=str(outcome.get("masked_id") or ""),
                 masked_id_source=str(outcome.get("masked_id_source") or ""),
                 observed_provider=str(outcome.get("observed_provider") or ""),
+                observed_provider_attempts=outcome.get("observed_provider_attempts") or (),
                 observed_model=str(outcome.get("observed_model") or ""),
                 observed_effort=observed_effort,
                 observed_effort_source=str(outcome.get("observed_effort_source") or ""),
@@ -2209,11 +2350,41 @@ def run_campaign(
                 attempt_id=str(claim["attempt_id"]) if claim else "",
             )
         except Exception as exc:
+            settlement_overspend: BudgetOverspend | None = None
             if claim is not None:
+                terminal_accounting = _terminal_gateway_accounting(
+                    outcome.get("runtime_result")
+                )
+                if terminal_accounting:
+                    outcome.update(terminal_accounting)
                 try:
-                    ledger.mark_unresolved(str(claim["attempt_id"]), None)
+                    exact_cost = (
+                        _money(outcome.get("cost_usd"), field="cost_usd")
+                        if outcome.get("cost_usd") is not None
+                        else None
+                    )
                 except LedgerError:
-                    pass
+                    exact_cost = None
+                try:
+                    if (
+                        exact_cost is not None
+                        and (
+                            outcome.get("cost_estimated") is None
+                            or outcome.get("cost_estimated") is False
+                        )
+                        and outcome.get("cost_final") is True
+                    ):
+                        ledger.settle(str(claim["attempt_id"]), exact_cost)
+                    else:
+                        try:
+                            ledger.mark_unresolved(
+                                str(claim["attempt_id"]),
+                                outcome.get("cost_upper_bound_usd"),
+                            )
+                        except LedgerError:
+                            ledger.mark_unresolved(str(claim["attempt_id"]), None)
+                except BudgetOverspend as settlement_exc:
+                    settlement_overspend = settlement_exc
             failure_refs = dict(outcome.get("artifact_refs") or {})
             failure_refs.setdefault("task_dir", str(task_dir))
             failure_refs.setdefault("claims", str(ledger.path))
@@ -2236,7 +2407,9 @@ def run_campaign(
                 final_trial=outcome.get("final_trial"),
                 final_poc_sha256=str(outcome.get("final_poc_sha256") or ""),
                 status="infra_failed",
-                lifecycle="executor_failed",
+                lifecycle=(
+                    "budget_refused" if settlement_overspend else "executor_failed"
+                ),
                 level=task.level,
                 masked_id=str(outcome.get("masked_id") or ""),
                 masked_id_source=str(outcome.get("masked_id_source") or ""),
@@ -2254,9 +2427,14 @@ def run_campaign(
                 cost_usd=outcome.get("cost_usd"),
                 cost_estimated=outcome.get("cost_estimated"),
                 cost_status=str(outcome.get("cost_status") or ""),
-                infra_reason=type(exc).__name__,
+                infra_reason=(
+                    "budget_overspend"
+                    if settlement_overspend
+                    else type(exc).__name__
+                ),
                 artifact_refs=failure_refs,
-                error=str(exc),
+                error=str(settlement_overspend or exc),
+                runtime_result=outcome.get("runtime_result"),
                 task_contract=callback_contract
                 if callback_contract is not None
                 else (contract if isinstance(contract, Mapping) else None),

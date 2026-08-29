@@ -88,6 +88,12 @@ def _row_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     return {
         "rows_written": len(rows),
         "completed_count": sum(1 for row in rows if row.get("status") == "completed"),
+        "genuine_failure_count": sum(
+            1
+            for row in rows
+            if row.get("status") not in {"infra_failed", "blocked", "planned"}
+            and row.get("final_submission_success") is False
+        ),
         "planned_count": sum(1 for row in rows if row.get("status") == "planned"),
         "infra_count": sum(
             1 for row in rows if row.get("status") in {"infra_failed", "blocked"}
@@ -124,7 +130,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cybergym-api-key-env", default="CYBERGYM_API_KEY", help="host env name for the private verifier key")
     parser.add_argument("--mask-map", default="", help="task mask-map JSON")
     parser.add_argument("--difficulty", default=DEFAULT_LEVEL)
-    parser.add_argument("--model", default="google/gemini-3.7-flash")
+    parser.add_argument("--model", default="deepseek/deepseek-v4-flash-0731")
     parser.add_argument(
         "--settings-path",
         default=str(pathlib.Path(__file__).with_name("settings_base.json")),
@@ -754,6 +760,13 @@ def _prepare_applied_settings(
         getattr(args, "per_task_cost_usd", DEFAULT_PER_TASK_COST_USD),
         field="per_task_cost_usd",
     )
+    workers = validate_positive_integral(
+        getattr(args, "workers", 1), field="workers"
+    )
+    if workers > MAX_CROSS_TASK_WORKERS:
+        raise ValueError(
+            f"workers may not exceed the CyberGym cross-task cap of {MAX_CROSS_TASK_WORKERS}"
+        )
     overrides: dict[str, Any] = {
         "OUROBOROS_MODEL": model,
         "OUROBOROS_MODEL_LIGHT": model,
@@ -779,7 +792,7 @@ def _prepare_applied_settings(
         "OUROBOROS_SAFETY_MODE": "off",
         "OUROBOROS_CONTEXT_MODE": "max",
         "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "false",
-        "OUROBOROS_MAX_WORKERS": MAX_CROSS_TASK_WORKERS,
+        "OUROBOROS_MAX_WORKERS": workers,
         "OUROBOROS_MAX_ROUNDS": max_rounds,
         "OUROBOROS_TASK_IDLE_TIMEOUT_SEC": 900,
         "OUROBOROS_PER_TASK_COST_USD": per_task_cost_usd,
@@ -792,8 +805,14 @@ def _prepare_applied_settings(
         "OUROBOROS_REVIEW_MAX_CYCLES": "2",
         "OUROBOROS_POST_TASK_EVOLUTION": "false",
         "OUROBOROS_POST_TASK_EVOLUTION_CADENCE": "off",
+        # Keep internet access explicit and auditable.  Exact-model OpenRouter
+        # server search is model-discretionary and did not execute in live
+        # forced probes; the explicit web_search tool therefore uses the
+        # query-visible DDGS retrieval path instead.
         "OUROBOROS_MAIN_WEB_SEARCH": "off",
-        "OUROBOROS_WEBSEARCH_BACKEND": "auto",
+        "OUROBOROS_MAIN_WEB_SEARCH_ENGINE": "auto",
+        "OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS": 0,
+        "OUROBOROS_WEBSEARCH_BACKEND": "ddgs",
         "OUROBOROS_IMAGE_INPUT_MODE": "auto",
         "OUROBOROS_RETURN_REASONING": True,
         "OUROBOROS_REASONING_SUMMARY": "auto",
@@ -887,6 +906,7 @@ def _prepare_applied_settings(
         "model": applied_model,
         "max_rounds": max_rounds,
         "per_task_cost_usd": per_task_cost_usd,
+        "workers": workers,
         "model_slots": model_slots,
         "budget_usd": budget_usd,
         "task_abs_ceiling_sec": timeout_sec,
@@ -1056,7 +1076,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 "metric_name": "final_submission",
                 "any_of_projection": "diagnostic_only",
-                "network_contract": "cybergym-internal",
+                "network_contract": "custom_bridge_unrestricted_outbound_private_sidecar",
+                "network_name": "cybergym-internal",
+                "docker_network_internal": False,
+                "server_host_publish": False,
+                "trajectory_audit": {
+                    "required": True,
+                    "status": "pending",
+                    "promotion_gate": True,
+                },
                 "final_poc_basename": "final.poc",
                 "budget_cap_usd": float(args.budget_usd),
                 "max_rounds": int(getattr(args, "max_rounds", DEFAULT_MAX_ROUNDS)),

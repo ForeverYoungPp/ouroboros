@@ -16,9 +16,9 @@ from devtools.benchmarks.common.model_slots import (
     fixed_model_actor_snapshot,
     pin_single_model,
     runtime_actor_snapshot,
+    single_model_reviewer_slots_setting,
     single_model_slot_snapshot,
     single_model_subagents_setting,
-    single_model_reviewer_slots_setting,
 )
 from devtools.benchmarks.common.server_runner import (
     STALE_INHERITED_ENV_KEYS,
@@ -31,7 +31,6 @@ from ouroboros.configured_subagents import (
 )
 from ouroboros.provider_models import provider_for_model, review_model_uses_local
 from ouroboros.reviewer_slot_config import REVIEWER_SLOTS_ENV, parse_reviewer_slots
-
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 PROFILE_TARGETS = {

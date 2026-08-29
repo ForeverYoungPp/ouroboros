@@ -56,7 +56,7 @@ def _observation(plan, host, *, wildcard=False, workspace_socket=False, mode=Non
     }
     return {
         "docker_host": host.value,
-        "network": {"Name": plan.network_name, "Id": "net-123", "Internal": True, "Driver": "bridge"},
+        "network": {"Name": plan.network_name, "Id": "net-123", "Internal": False, "Driver": "bridge"},
         "server": server,
         "workspace": workspace,
         "executor_network": "host",
@@ -67,7 +67,7 @@ def _connectivity():
     return {
         "agent_to_server": True,
         "verifier_to_private": {"reachable": True},
-        "agent_to_public": False,
+        "agent_to_public": True,
         "agent_to_verifier": False,
         "agent_socket_visible": False,
     }
@@ -134,10 +134,10 @@ def test_opaque_agent_id_is_stable_and_task_free():
     assert short_plan.task_id not in short_plan.workspace_alias
 
 
-def test_network_argv_uses_internal_named_network_and_explicit_daemon():
+def test_network_argv_uses_egress_enabled_named_network_and_explicit_daemon():
     argv = sidecar.build_network_create_argv(_host(), _plan())
     assert argv[:7] == ["docker", "--host", _host().value, "network", "create", "--driver", "bridge"]
-    assert "--internal" in argv
+    assert "--internal" not in argv
     assert argv[-1] == "cybergym-internal"
     assert "--network" not in argv
 
@@ -386,6 +386,18 @@ def test_attestation_supports_internal_exec_private_route_without_publish():
     )
     assert report["ok"] is True
     assert report["published_verifier"]["mode"] == "container_exec"
+
+    observation["server"]["NetworkSettings"]["Ports"]["9999/tcp"] = [
+        {"HostIp": "127.0.0.1", "HostPort": "19999"}
+    ]
+    rejected = sidecar.check_sidecar_attestation(
+        observation,
+        expectation,
+        api_key="valid-key",
+        connectivity=_connectivity(),
+    )
+    assert rejected["ok"] is False
+    assert "server.unexpected_publish" in rejected["failed_checks"]
 
 
 def test_daemon_evidence_is_required_only_for_strict_production_entrypoint():

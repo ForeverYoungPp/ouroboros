@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import pathlib
 import subprocess
 
@@ -37,7 +37,7 @@ def _seed_repo(tmp_path: pathlib.Path) -> tuple[pathlib.Path, str]:
 
 def _settings(tmp_path: pathlib.Path) -> pathlib.Path:
     path = tmp_path / "settings_applied.json"
-    path.write_text(json.dumps({"OUROBOROS_MODEL": "google/gemini-3.7-flash"}), encoding="utf-8")
+    path.write_text(json.dumps({"OUROBOROS_MODEL": "deepseek/deepseek-v4-flash-0731"}), encoding="utf-8")
     return path
 
 
@@ -113,7 +113,7 @@ def test_rootless_wrapper_makes_applied_settings_authoritative(monkeypatch, tmp_
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({
         "OPENROUTER_API_KEY": "",
-        "OUROBOROS_MODEL": "google/gemini-3.7-flash",
+        "OUROBOROS_MODEL": "deepseek/deepseek-v4-flash-0731",
         "CLAUDE_CODE_MODEL": "",
         "OUROBOROS_RUNTIME_MODE": "pro",
     }), encoding="utf-8")
@@ -154,7 +154,7 @@ def test_authoritative_env_scrubs_legacy_and_future_runtime_overrides(monkeypatc
     seed, _commit = _seed_repo(tmp_path)
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({
-        "OUROBOROS_MODEL": "google/gemini-3.7-flash",
+        "OUROBOROS_MODEL": "deepseek/deepseek-v4-flash-0731",
         "OUROBOROS_RUNTIME_MODE": "pro",
     }), encoding="utf-8")
     inherited = {
@@ -289,7 +289,7 @@ def test_runtime_config_load_rejects_changed_pinned_snapshot(monkeypatch, tmp_pa
 
     path = tmp_path / "settings.json"
     payload = {
-        "OUROBOROS_MODEL": "google/gemini-3.7-flash",
+        "OUROBOROS_MODEL": "deepseek/deepseek-v4-flash-0731",
         "OUROBOROS_CONTEXT_MODE": "max",
         "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "false",
     }

@@ -16,7 +16,7 @@ from ouroboros.reviewer_slot_config import parse_reviewer_slots
 
 REPO = Path(__file__).resolve().parents[1]
 PROFILE = REPO / "devtools" / "benchmarks" / "cybergym" / "settings_base.json"
-MODEL = "google/gemini-3.7-flash"
+MODEL = "deepseek/deepseek-v4-flash-0731"
 
 
 def _settings() -> dict[str, object]:
@@ -91,6 +91,10 @@ def test_profile_records_safe_runtime_and_budget_defaults():
     ):
         assert settings[key] == "high", key
     assert settings["OUROBOROS_POST_TASK_EVOLUTION"] == "false"
+    assert settings["OUROBOROS_MAIN_WEB_SEARCH"] == "off"
+    assert settings["OUROBOROS_MAIN_WEB_SEARCH_ENGINE"] == "auto"
+    assert settings["OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS"] == 0
+    assert settings["OUROBOROS_WEBSEARCH_BACKEND"] == "ddgs"
     assert settings["MCP_ENABLED"] is False
     assert settings["MCP_SERVERS"] == []
     # The template remains neutral; the launcher applies a run-specific
@@ -162,6 +166,11 @@ def test_cybergym_docs_pin_the_owner_approved_contract():
         "only",
         "order",
         "cybergym-internal",
+        "Internal=false",
+        "unrestricted outbound",
+        "mandatory trajectory audit",
+        "issue tracker or bug reports",
+        "ready-made PoC",
         "rootless",
         "Docker `--network host`",
         "OUROBOROS_MAX_SUBAGENT_DEPTH=0",

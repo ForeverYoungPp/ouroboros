@@ -20,7 +20,12 @@ import threading
 import pytest
 
 from devtools.benchmarks.cybergym import cybergym_executor as executor_module
-from devtools.benchmarks.cybergym.cybergym_adapter import final_poc_record
+from devtools.benchmarks.cybergym.cybergym_adapter import (
+    CAPABILITY_FINAL_POC_MISSING,
+    BudgetLedger,
+    final_poc_record,
+    run_campaign,
+)
 from devtools.benchmarks.cybergym.cybergym_executor import (
     CommandResult,
     CyberGymExecutor,
@@ -577,6 +582,60 @@ def test_container_image_binding_rejects_cached_digest_for_wrong_container():
         )
 
 
+def test_generated_workspace_git_anchor_tracks_controls_without_source_blobs(tmp_path):
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    host = CyberGymExecutor(_config(config_root)).host
+
+    def generated(name: str) -> pathlib.Path:
+        workspace = tmp_path / name
+        workspace.mkdir()
+        (workspace / "README.md").write_text("task readme\n", encoding="utf-8")
+        (workspace / "description.txt").write_text("find the bug\n", encoding="utf-8")
+        (workspace / "submit.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        (workspace / "repo-vul.tar.gz").write_bytes(b"archive-input" * 10_000)
+        source = workspace / "src-vul"
+        source.mkdir()
+        (source / "large.c").write_bytes(b"int vulnerable;\n" * 10_000)
+        (workspace / "submissions").mkdir()
+        return workspace
+
+    first = generated("first")
+    second = generated("second")
+    first_anchor = executor_module._initialize_generated_workspace_git(
+        first, runner=executor_module.run_command, host=host
+    )
+    second_anchor = executor_module._initialize_generated_workspace_git(
+        second, runner=executor_module.run_command, host=host
+    )
+    assert first_anchor == second_anchor
+    assert len(first_anchor) == 40
+
+    tracked = subprocess.run(
+        ["git", "-C", str(first), "ls-files"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert tracked == ["README.md", "description.txt", "submit.sh"]
+    assert subprocess.run(
+        ["git", "-C", str(first), "status", "--porcelain", "--untracked-files=all"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+
+    (first / "src-vul" / "large.c").write_text("changed benchmark input\n", encoding="utf-8")
+    (first / "final.poc").write_text("poc\n", encoding="utf-8")
+    status = subprocess.run(
+        ["git", "-C", str(first), "status", "--porcelain", "--untracked-files=all"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert status == ["?? final.poc"]
+
+
 def test_workspace_backend_alias_is_confined_and_git_ignored(tmp_path):
     workspace = tmp_path / "generated"
     workspace.mkdir()
@@ -848,7 +907,15 @@ def test_task_body_is_opaque_and_preserves_network_contract(tmp_path):
     )
     assert body["task_id"].startswith("cybergym-")
     assert ":" not in body["task_id"]
-    assert body["allowed_resources"] == {"network": True, "web": False, "internet": False}
+    assert body["allowed_resources"] == {"network": True, "web": True, "internet": True}
+    assert body["resource_policy"]["network_declaration"] == (
+        "private_cybergym_sidecar_with_unrestricted_outbound_internet"
+    )
+    assert body["resource_policy"]["trajectory_audit"] == {
+        "required": True,
+        "promotion_gate": True,
+        "scope": "all_trajectories",
+    }
     assert body["executor_ref"]["network"] == "host"
     assert body["executor_ref"]["workspace_backend_path"] == "/workspace"
     assert body["executor_ref"]["id"] == "b" * 64
@@ -859,7 +926,64 @@ def test_task_body_is_opaque_and_preserves_network_contract(tmp_path):
     assert "do not give them '/workspace/...' paths" in guidance
     assert "do not set cwd='/workspace'" in guidance
     assert '["bash", "./submit.sh", "./final.poc"]' in guidance
+    assert "Internet access is available for general technical documentation" in guidance
+    assert "issue tracker or bug reports" in guidance
+    assert "changelog, commit history, release notes" in guidance
+    assert "published patch" in guidance
+    assert "ready-made PoC" in guidance
+    assert "prior CyberGym solutions" in guidance
+    assert "recorded tool and model trajectory is subject to mandatory audit" in guidance
+    assert "missing or incomplete evidence makes the result unreviewable" in guidance
+    assert "arvo:1" not in guidance
     assert str(task_dir) not in guidance
+
+
+def test_provider_probe_checks_exact_model_without_server_search(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    captured = {}
+
+    def http(method, url, *, body=None, headers=None, timeout=None):
+        if method == "GET" and url.endswith("/models"):
+            return {
+                "data": [{
+                    "id": "deepseek/deepseek-v4-flash-0731",
+                    "context_length": 1_310_720,
+                    "supported_parameters": ["reasoning", "tools"],
+                }]
+            }
+        if method == "GET" and url.endswith("/key"):
+            return {"data": {"limit_remaining": 100}}
+        assert method == "POST"
+        captured["body"] = body
+        return {
+            "id": "response-1",
+            "model": "deepseek/deepseek-v4-flash-0731",
+            "provider": "OpenInference",
+            "choices": [{"message": {"content": "OK"}}],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 3,
+                "cost": 0.006,
+                "cost_estimated": False,
+            },
+        }
+
+    executor = CyberGymExecutor(
+        _config(
+            tmp_path,
+            provider_probe=True,
+            expected_data_sha256="a" * 64,
+            expected_binary_sha256="b" * 64,
+            http_runner=http,
+        )
+    )
+    executor._probe_provider()  # noqa: SLF001 - provider boundary assertion
+
+    assert captured["body"]["messages"] == [{"role": "user", "content": "Reply with OK."}]
+    assert "tools" not in captured["body"]
+    assert executor.provider_observation["observed_model"] == (
+        "deepseek/deepseek-v4-flash-0731"
+    )
 
 
 def test_task_body_requires_immutable_workspace_id(tmp_path):
@@ -887,7 +1011,7 @@ def test_start_uses_same_absolute_server_root_and_docs_probe(tmp_path, monkeypat
         if "network" in argv and "create" in argv:
             return CommandResult(0, "network-id\n", "")
         if "inspect" in argv and "network" in argv:
-            return CommandResult(0, '[{"Name":"cybergym-internal","Id":"network-id","Internal":true,"Driver":"bridge","Labels":{"com.ouroboros.campaign":"test-campaign"}}]', "")
+            return CommandResult(0, '[{"Name":"cybergym-internal","Id":"network-id","Internal":false,"Driver":"bridge","Labels":{"com.ouroboros.campaign":"test-campaign"}}]', "")
         if "run" in argv:
             return CommandResult(0, "server-container-id\n", "")
         if "inspect" in argv and "container" in argv:
@@ -928,7 +1052,7 @@ def test_readiness_rejects_openapi_without_private_submit_fix(tmp_path, monkeypa
         if "inspect" in argv and "network" in argv:
             return CommandResult(
                 0,
-                '[{"Name":"cybergym-internal","Id":"network-id","Internal":true,"Driver":"bridge","Labels":{"com.ouroboros.campaign":"test-campaign"}}]',
+                '[{"Name":"cybergym-internal","Id":"network-id","Internal":false,"Driver":"bridge","Labels":{"com.ouroboros.campaign":"test-campaign"}}]',
                 "",
             )
         if "run" in argv:
@@ -977,12 +1101,12 @@ def test_served_telemetry_prefers_authoritative_trace_refs_over_requested_fields
         "reasoning_effort": "high",
         "trace_refs": {
             "llm_call_refs": [
-                {"resolved_model": "google/gemini-3.7-flash", "provider": "provider-a"}
+                {"resolved_model": "deepseek/deepseek-v4-flash-0731", "provider": "provider-a"}
             ]
         },
     }
     observed = _served_telemetry(payload)
-    assert observed["observed_model"] == "google/gemini-3.7-flash"
+    assert observed["observed_model"] == "deepseek/deepseek-v4-flash-0731"
     assert observed["observed_provider"] == "provider-a"
     assert observed["trace_call_count"] == 1
     assert observed["effort_source"] == "runtime_requested_field"
@@ -1015,7 +1139,8 @@ def test_served_telemetry_reads_verified_response_wire_effort(tmp_path):
         "candidate_sha256": "a" * 64,
     }
     blob_raw = json.dumps(
-        {"usage": {"request_wire": wire}}, sort_keys=True
+        {"usage": {"request_wire": wire, "response_provider": "backend-a"}},
+        sort_keys=True,
     ).encode("utf-8")
     blob_path = drive / "observability" / "blobs" / ("b" * 64 + ".json.gz")
     blob_path.parent.mkdir(parents=True)
@@ -1051,7 +1176,7 @@ def test_served_telemetry_reads_verified_response_wire_effort(tmp_path):
                 "llm_call_refs": [
                     {
                         "llm_call_id": "llm-1",
-                        "resolved_model": "google/gemini-3.7-flash",
+                        "resolved_model": "deepseek/deepseek-v4-flash-0731",
                         "provider": "provider-a",
                         "response_ref": manifest_ref,
                     }
@@ -1061,8 +1186,12 @@ def test_served_telemetry_reads_verified_response_wire_effort(tmp_path):
         allowed_roots=(drive,),
     )
     assert observed["observed_effort"] == "high"
+    assert observed["observed_provider"] == "backend-a"
+    assert observed["observed_provider_attempts"] == ["backend-a"]
+    assert observed["provider_distribution"] == {"backend-a": 1}
     assert observed["effort_source"] == "served_response_wire"
     assert observed["response_wire_effort_count"] == 1
+    assert observed["response_wire_provider_count"] == 1
 
 
 def test_submit_stdout_parser_accepts_preceding_prose_and_multiline_json():
@@ -1119,8 +1248,8 @@ def test_runtime_attestation_reinspects_immutable_ids_before_gateway_boundary(tm
                     "Aliases": [plan.server_alias],
                 }
             },
-            # Rootless Docker does not publish ports from an --internal
-            # bridge; private calls use the server's immutable-id exec path.
+            # The sidecar has no host-published port; private calls use the
+            # server's immutable-id exec path.
             "Ports": {"8666/tcp": None},
         },
         "Mounts": [
@@ -1152,7 +1281,7 @@ def test_runtime_attestation_reinspects_immutable_ids_before_gateway_boundary(tm
     network = {
         "Name": "cybergym-internal",
         "Id": "network-123",
-        "Internal": True,
+        "Internal": False,
         "Driver": "bridge",
         "Labels": {"com.ouroboros.campaign": config.campaign_id},
     }
@@ -1177,7 +1306,7 @@ def test_runtime_attestation_reinspects_immutable_ids_before_gateway_boundary(tm
         lambda plan, workspace_id, api_key: {
             "agent_to_server": True,
             "verifier_to_private": {"reachable": True},
-            "agent_to_public": False,
+            "agent_to_public": True,
             "agent_to_verifier": False,
             "agent_socket_visible": False,
             "agent_hidden_artifacts": {
@@ -1281,7 +1410,7 @@ def test_workspace_registration_and_attestation_share_registry_lock(tmp_path, mo
             return {
                 "Name": "cybergym-internal",
                 "Id": executor.network_id,
-                "Internal": True,
+                "Internal": False,
                 "Driver": "bridge",
                 "Labels": {"com.ouroboros.campaign": config.campaign_id},
                 "Containers": {container_id: {} for container_id in attached},
@@ -1301,7 +1430,7 @@ def test_workspace_registration_and_attestation_share_registry_lock(tmp_path, mo
         lambda plan, workspace_id, api_key: {
             "agent_to_server": True,
             "verifier_to_private": {"reachable": True},
-            "agent_to_public": False,
+            "agent_to_public": True,
             "agent_to_verifier": False,
             "agent_socket_visible": False,
             "agent_hidden_artifacts": {"hidden": True},
@@ -1680,8 +1809,16 @@ def test_gateway_waits_for_final_cost_after_completed_status(tmp_path):
     calls = []
     status_rows = iter(
         (
-            {"task_id": task_id, "status": "completed", "cost_final": False},
-            {"task_id": task_id, "status": "completed", "cost_final": True},
+            {
+                "task_id": task_id,
+                "status": "completed",
+                "result": {"cost_final": False},
+            },
+            {
+                "task_id": task_id,
+                "status": "completed",
+                "result": {"cost_final": True},
+            },
         )
     )
 
@@ -1699,8 +1836,300 @@ def test_gateway_waits_for_final_cost_after_completed_status(tmp_path):
         config.run_root / "checkpoint.json",
     )
 
-    assert result["cost_final"] is True
+    assert result["result"]["cost_final"] is True
     assert calls == ["POST", "GET", "GET"]
+
+
+def test_gateway_cost_finality_conflict_keeps_polling(tmp_path):
+    config = _config(tmp_path, provider_probe=False, task_timeout_sec=10)
+    task_id = "cybergym-cost-conflict"
+    calls = []
+    status_rows = iter(
+        (
+            {
+                "task_id": task_id,
+                "status": "completed",
+                "cost_final": True,
+                "cost_breakdown": {"cost_final": False},
+            },
+            {
+                "task_id": task_id,
+                "status": "completed",
+                "cost_final": True,
+                "cost_breakdown": {"cost_final": True},
+            },
+        )
+    )
+
+    def http(method, _url, **_kwargs):
+        calls.append(method)
+        if method == "POST":
+            return {"task_id": task_id, "status": "scheduled"}
+        return next(status_rows)
+
+    executor = CyberGymExecutor(
+        dataclasses_replace(config, http_runner=http, sleep=lambda _seconds: None)
+    )
+    result = executor._gateway_wait(  # noqa: SLF001 - accounting contract
+        {"task_id": task_id, "description": "test"},
+        config.run_root / "checkpoint.json",
+    )
+
+    assert result["cost_breakdown"]["cost_final"] is True
+    assert calls == ["POST", "GET", "GET"]
+
+
+def _stub_terminal_task_executor(tmp_path, monkeypatch, gateway_result):
+    config = _config(tmp_path, provider_probe=False)
+    executor = CyberGymExecutor(config)
+    monkeypatch.setattr(executor, "start", lambda: None)
+    monkeypatch.setattr(executor, "_generate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        executor_module,
+        "_install_workspace_backend_alias",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(executor, "_workspace", lambda *_args, **_kwargs: "container-a")
+    monkeypatch.setattr(
+        executor,
+        "_task_body",
+        lambda task, *_args, **_kwargs: {"task_id": "cybergym-" + task.task_id.replace(":", "-")},
+    )
+    monkeypatch.setattr(
+        executor, "_gateway_wait", lambda *_args, **_kwargs: dict(gateway_result)
+    )
+    monkeypatch.setattr(
+        executor,
+        "_cleanup_workspace_container",
+        lambda *_args, **_kwargs: {"status": "verified"},
+    )
+    return config, executor
+
+
+def test_fair_terminal_missing_marker_is_typed_and_settles_cost(tmp_path, monkeypatch):
+    gateway_result = {
+        "status": "completed",
+        "observed_model": "deepseek/deepseek-v4-flash-0731",
+        "observed_provider": "backend-a",
+        "reasoning_effort": "high",
+        "prompt_tokens": 185_217,
+        "completion_tokens": 754,
+        "cost_usd": 0.019249,
+        "cost_final": True,
+        "cost_breakdown": {
+            "accounted_upper_bound_usd": 0.019249,
+            "cost_final": True,
+        },
+        "outcome_axes": {"execution": {"status": "ok"}},
+    }
+    config, executor = _stub_terminal_task_executor(
+        tmp_path, monkeypatch, gateway_result
+    )
+
+    rows = run_campaign(
+        ["arvo:47101"],
+        run_root=config.run_root,
+        executor=executor.run_task,
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+    )
+
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["capability_outcome"] == CAPABILITY_FINAL_POC_MISSING
+    assert rows[0]["final_submission_success"] is False
+    assert rows[0]["prompt_tokens"] == 185_217
+    assert rows[0]["completion_tokens"] == 754
+    assert rows[0]["cost_usd"] == pytest.approx(0.019249)
+    projection = BudgetLedger(config.run_root / "claims.jsonl", cap_usd=2).projection()
+    assert projection.settled_usd == pytest.approx(0.019249)
+    assert projection.unresolved_upper_bound_usd == 0
+
+
+def test_terminal_telemetry_failure_preserves_settled_cost(tmp_path, monkeypatch):
+    gateway_result = {
+        "status": "completed",
+        "observed_model": "deepseek/deepseek-v4-flash-0731",
+        "reasoning_effort": "high",
+        "prompt_tokens": 100,
+        "completion_tokens": 10,
+        "cost_usd": 0.25,
+        "cost_final": True,
+        "cost_breakdown": {
+            "accounted_upper_bound_usd": 0.25,
+            "cost_final": True,
+        },
+        "outcome_axes": {"execution": {"status": "ok"}},
+    }
+    config, executor = _stub_terminal_task_executor(
+        tmp_path, monkeypatch, gateway_result
+    )
+
+    rows = run_campaign(
+        ["arvo:1"],
+        run_root=config.run_root,
+        executor=executor.run_task,
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+    )
+
+    assert rows[0]["status"] == "infra_failed"
+    assert rows[0]["lifecycle"] == "post_gateway_evaluation_failed"
+    assert rows[0]["cost_usd"] == pytest.approx(0.25)
+    projection = BudgetLedger(config.run_root / "claims.jsonl", cap_usd=2).projection()
+    assert projection.settled_usd == pytest.approx(0.25)
+    assert projection.unresolved_upper_bound_usd == 0
+
+
+def test_missing_marker_with_failed_execution_stays_infra(tmp_path, monkeypatch):
+    gateway_result = {
+        "status": "completed",
+        "observed_model": "deepseek/deepseek-v4-flash-0731",
+        "observed_provider": "backend-a",
+        "reasoning_effort": "high",
+        "prompt_tokens": 100,
+        "completion_tokens": 10,
+        "cost_usd": 0.25,
+        "cost_final": True,
+        "cost_breakdown": {
+            "accounted_upper_bound_usd": 0.25,
+            "cost_final": True,
+        },
+        "outcome_axes": {"execution": {"status": "infra_failed"}},
+    }
+    config, executor = _stub_terminal_task_executor(
+        tmp_path, monkeypatch, gateway_result
+    )
+
+    rows = run_campaign(
+        ["arvo:1"],
+        run_root=config.run_root,
+        executor=executor.run_task,
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+    )
+
+    assert rows[0]["status"] == "infra_failed"
+    assert rows[0]["capability_outcome"] == ""
+    assert rows[0]["final_submission_success"] is None
+    projection = BudgetLedger(config.run_root / "claims.jsonl", cap_usd=2).projection()
+    assert projection.settled_usd == pytest.approx(0.25)
+    assert projection.unresolved_upper_bound_usd == 0
+
+
+def test_cleanup_diagnostic_failure_does_not_erase_terminal_cost(
+    tmp_path, monkeypatch
+):
+    gateway_result = {
+        "status": "completed",
+        "observed_model": "deepseek/deepseek-v4-flash-0731",
+        "observed_provider": "backend-a",
+        "reasoning_effort": "high",
+        "prompt_tokens": 100,
+        "completion_tokens": 10,
+        "cost_usd": 0.25,
+        "cost_final": True,
+        "cost_breakdown": {
+            "accounted_upper_bound_usd": 0.25,
+            "cost_final": True,
+        },
+        "outcome_axes": {"execution": {"status": "ok"}},
+    }
+    config, executor = _stub_terminal_task_executor(
+        tmp_path, monkeypatch, gateway_result
+    )
+
+    def cleanup_failed(*_args, **_kwargs):
+        raise ExecutorFailure("cleanup failed")
+
+    original_write_json = executor_module._write_json
+
+    def fail_cleanup_report(path, value):
+        if pathlib.Path(path).name == "workspace_cleanup.json":
+            raise OSError("cleanup report failed")
+        return original_write_json(path, value)
+
+    monkeypatch.setattr(executor, "_cleanup_workspace_container", cleanup_failed)
+    monkeypatch.setattr(executor_module, "_write_json", fail_cleanup_report)
+    rows = run_campaign(
+        ["arvo:1"],
+        run_root=config.run_root,
+        executor=executor.run_task,
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+    )
+
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["capability_outcome"] == CAPABILITY_FINAL_POC_MISSING
+    projection = BudgetLedger(config.run_root / "claims.jsonl", cap_usd=2).projection()
+    assert projection.settled_usd == pytest.approx(0.25)
+    assert projection.unresolved_upper_bound_usd == 0
+
+
+def test_pre_gateway_failures_settle_zero_and_do_not_block_next_task(
+    tmp_path, monkeypatch
+):
+    config = _config(tmp_path, provider_probe=False)
+    executor = CyberGymExecutor(config)
+    monkeypatch.setattr(executor, "start", lambda: None)
+
+    def fail_generation(*_args, **_kwargs):
+        raise ExecutorFailure("generation failed")
+
+    monkeypatch.setattr(executor, "_generate", fail_generation)
+    rows = run_campaign(
+        ["arvo:1", "arvo:2"],
+        run_root=config.run_root,
+        executor=executor.run_task,
+        estimated_cost_usd=1,
+        budget_cap_usd=1,
+    )
+
+    assert [row["status"] for row in rows] == ["infra_failed", "infra_failed"]
+    assert all(row["cost_usd"] == 0 for row in rows)
+    assert all(row["cost_status"] == "known_no_dispatch" for row in rows)
+    projection = BudgetLedger(config.run_root / "claims.jsonl", cap_usd=1).projection()
+    assert projection.settled_usd == 0
+    assert projection.unresolved_upper_bound_usd == 0
+    assert projection.can_dispatch is True
+
+
+def test_post_admission_status_error_is_not_reclassified_as_zero_cost(
+    tmp_path, monkeypatch
+):
+    config = _config(tmp_path, provider_probe=False)
+    executor = CyberGymExecutor(config)
+    monkeypatch.setattr(executor, "start", lambda: None)
+    monkeypatch.setattr(executor, "_generate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        executor_module,
+        "_install_workspace_backend_alias",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(executor, "_workspace", lambda *_args, **_kwargs: "container-a")
+    monkeypatch.setattr(
+        executor,
+        "_task_body",
+        lambda task, *_args, **_kwargs: {"task_id": "cybergym-" + task.task_id.replace(":", "-")},
+    )
+
+    def status_failed(*_args, **_kwargs):
+        raise ExecutorFailure("Ouroboros task status returned HTTP 404")
+
+    monkeypatch.setattr(executor, "_gateway_wait", status_failed)
+    rows = run_campaign(
+        ["arvo:1"],
+        run_root=config.run_root,
+        executor=executor.run_task,
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+    )
+
+    assert rows[0]["status"] == "infra_failed"
+    assert rows[0]["cost_usd"] is None
+    projection = BudgetLedger(config.run_root / "claims.jsonl", cap_usd=2).projection()
+    assert projection.settled_usd == 0
+    assert projection.unresolved_upper_bound_usd is None
+    assert projection.can_dispatch is False
 
 
 def test_cancel_503_recovers_terminal_gateway_payload(tmp_path):

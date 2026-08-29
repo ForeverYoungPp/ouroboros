@@ -8,10 +8,8 @@ import pathlib
 
 import pytest
 
-from ouroboros.configured_subagents import parse_configured_subagents
-from ouroboros.reviewer_slot_config import parse_reviewer_slots
-
 from devtools.benchmarks.cybergym.cybergym_adapter import (
+    CAPABILITY_FINAL_POC_MISSING,
     DEFAULT_FINAL_POC_PATH,
     DEFAULT_LEVEL,
     OFFICIAL_MODEL,
@@ -43,6 +41,8 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     validate_positive_integral,
     verify_mask_map,
 )
+from ouroboros.configured_subagents import parse_configured_subagents
+from ouroboros.reviewer_slot_config import parse_reviewer_slots
 
 
 def test_safe_ids_and_argv_are_path_safe(tmp_path):
@@ -99,7 +99,7 @@ def test_pre_admission_is_pure_and_fail_closed(tmp_path):
         settings_path=tmp_path / "settings.json",
         require_settings=True,
         server_url="http://cybergym-internal:8666",
-        model="google/gemini-3.7-flash",
+        model="deepseek/deepseek-v4-flash-0731",
     )
     assert report["ok"]
     assert not (tmp_path / "out").exists()
@@ -451,6 +451,53 @@ def test_run_campaign_records_terminal_total_accounted_bound_not_residual(tmp_pa
     assert _terminal_gateway_accounting(
         {"status": "running", "accounted_upper_bound_usd": 0.060914}
     ) == {}
+    assert _terminal_gateway_accounting(
+        {
+            "status": "failed",
+            "cost_usd": 0.060914,
+            "cost_final": True,
+            "cost_breakdown": {"cost_final": False},
+        }
+    )["cost_final"] is False
+    nested = _terminal_gateway_accounting(
+        {
+            "status": "failed",
+            "result": {
+                "cost_usd": 0.060914,
+                "cost_final": True,
+                "cost_breakdown": {
+                    "accounted_upper_bound_usd": 0.060914,
+                    "cost_final": True,
+                },
+            },
+        }
+    )
+    assert nested["cost_upper_bound_usd"] == pytest.approx(0.060914)
+    assert nested["cost_usd"] == pytest.approx(0.060914)
+    assert nested["cost_final"] is True
+    conflict = _terminal_gateway_accounting(
+        {
+            "status": "failed",
+            "accounted_upper_bound_usd": 0.1,
+            "cost_final": True,
+            "cost_breakdown": {
+                "accounted_upper_bound_usd": 0.2,
+                "cost_final": True,
+            },
+        }
+    )
+    assert conflict["cost_upper_bound_usd"] == pytest.approx(0.2)
+    assert conflict["cost_final"] is False
+    unavailable = _terminal_gateway_accounting(
+        {
+            "status": "failed",
+            "accounted_upper_bound_usd": 0.1,
+            "cost_final": True,
+            "cost_accounting_status": "unavailable",
+        }
+    )
+    assert unavailable["cost_upper_bound_usd"] == pytest.approx(0.1)
+    assert unavailable["cost_final"] is False
 
     root = tmp_path / "terminal-bound"
     rows = run_campaign(
@@ -466,6 +513,33 @@ def test_run_campaign_records_terminal_total_accounted_bound_not_residual(tmp_pa
     assert projection.projected_usd == pytest.approx(0.060914)
     assert projection.unresolved_upper_bound_usd != pytest.approx(0.020062)
 
+    conflict_root = tmp_path / "terminal-conflict"
+    conflict_terminal = {
+        "status": "failed",
+        "accounted_upper_bound_usd": 0.1,
+        "cost_final": True,
+        "cost_breakdown": {
+            "accounted_upper_bound_usd": 0.2,
+            "cost_final": True,
+        },
+    }
+    conflict_rows = run_campaign(
+        ["arvo:2"],
+        run_root=conflict_root,
+        executor=lambda _task, _task_dir: {
+            "status": "infra_failed",
+            "runtime_result": conflict_terminal,
+        },
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+    )
+    assert conflict_rows[0]["status"] == "infra_failed"
+    conflict_projection = BudgetLedger(
+        conflict_root / "claims.jsonl", cap_usd=2
+    ).projection()
+    assert conflict_projection.settled_usd == 0
+    assert conflict_projection.unresolved_upper_bound_usd == pytest.approx(0.2)
+
 
 def test_strict_trial_bool_rejects_truthy_strings_and_contract_is_pinned():
     assert parse_strict_bool("false") is False
@@ -477,6 +551,18 @@ def test_strict_trial_bool_rejects_truthy_strings_and_contract_is_pinned():
     assert contract["final_poc_path"] == DEFAULT_FINAL_POC_PATH
     assert contract["no_swarm"] is True
     assert "schedule_subagent" in contract["disabled_tools"]
+    assert "web_search" not in contract["disabled_tools"]
+    assert "browse_page" not in contract["disabled_tools"]
+    assert "browser_action" not in contract["disabled_tools"]
+    assert "youtube_transcript" not in contract["disabled_tools"]
+    assert "browser" not in contract["disabled_tools"]
+    assert contract["allowed_resources"] == {
+        "network": True,
+        "web": True,
+        "internet": True,
+    }
+    assert contract["network_access"] == "unrestricted_outbound"
+    assert contract["trajectory_audit_required"] is True
 
 
 def test_completed_row_requires_marker_bound_final_evidence():
@@ -487,6 +573,11 @@ def test_completed_row_requires_marker_bound_final_evidence():
     )
     assert row["status"] == "infra_failed"
     assert row["infra_reason"] == "final_evidence_missing"
+
+    untyped = build_task_result_row("arvo:2", status="failed")
+    assert untyped["status"] == "infra_failed"
+    assert untyped["infra_reason"] == "untyped_failure"
+    assert untyped["final_submission_success"] is None
 
 
 def test_run_campaign_rejects_duplicate_ids_before_creating_output(tmp_path):
@@ -519,6 +610,61 @@ def test_run_campaign_requires_regular_marker_and_binds_hash(tmp_path):
     )
     assert rows[0]["status"] == "infra_failed"
     assert rows[0]["infra_reason"] == "FinalPocRefused"
+    missing_projection = BudgetLedger(
+        tmp_path / "missing" / "claims.jsonl", cap_usd=2
+    ).projection()
+    assert missing_projection.settled_usd == pytest.approx(0.5)
+    assert missing_projection.unresolved_upper_bound_usd == 0
+
+    overspend_root = tmp_path / "missing-overspend"
+
+    def missing_overspend(_task, _task_dir):
+        return {
+            "status": "completed",
+            "observed_effort": "high",
+            "cost_usd": 2.0,
+            "cost_final": True,
+        }
+
+    overspend_rows = run_campaign(
+        ["arvo:overspend"],
+        run_root=overspend_root,
+        executor=missing_overspend,
+        estimated_cost_usd=1,
+        budget_cap_usd=1,
+    )
+    assert overspend_rows[0]["status"] == "infra_failed"
+    assert overspend_rows[0]["infra_reason"] == "budget_overspend"
+    overspend_projection = BudgetLedger(
+        overspend_root / "claims.jsonl", cap_usd=1
+    ).projection()
+    assert overspend_projection.settled_usd == pytest.approx(2.0)
+
+    def genuine_missing_marker(_task, _task_dir):
+        return {
+            "status": "failed",
+            "lifecycle": CAPABILITY_FINAL_POC_MISSING,
+            "capability_outcome": CAPABILITY_FINAL_POC_MISSING,
+            "observed_effort": "high",
+            "cost_usd": 0.5,
+            "cost_final": True,
+        }
+
+    failed_root = tmp_path / "genuine-missing"
+    rows = run_campaign(
+        ["arvo:missing"],
+        run_root=failed_root,
+        executor=genuine_missing_marker,
+        estimated_cost_usd=1,
+        budget_cap_usd=2,
+    )
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["infra_reason"] == ""
+    assert rows[0]["final_submission_success"] is False
+    assert rows[0]["final_submission_reason"] == CAPABILITY_FINAL_POC_MISSING
+    projection = BudgetLedger(failed_root / "claims.jsonl", cap_usd=2).projection()
+    assert projection.settled_usd == pytest.approx(0.5)
+    assert projection.unresolved_upper_bound_usd == 0
 
     def good_marker(_task, task_dir):
         marker = task_dir / "final.poc"
@@ -672,6 +818,7 @@ def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):
             timeout_sec=4,
             max_rounds=1000,
             per_task_cost_usd=20,
+            workers=3,
         ),
     )
     assert path.exists()
@@ -680,13 +827,20 @@ def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):
     assert metadata["model_slots"]["OUROBOROS_MODEL"] == OFFICIAL_MODEL
     assert metadata["max_rounds"] == 1000
     assert metadata["per_task_cost_usd"] == 20.0
+    assert metadata["workers"] == 3
     applied = json.loads(path.read_text(encoding="utf-8"))
     assert applied["OUROBOROS_MAX_ROUNDS"] == 1000
     assert applied["OUROBOROS_PER_TASK_COST_USD"] == 20.0
+    assert applied["OUROBOROS_MAX_WORKERS"] == 3
     assert applied["OUROBOROS_REVIEW_MODELS"] == OFFICIAL_MODEL
     assert applied["OUROBOROS_REVIEW_ENFORCEMENT"] == "advisory"
     assert applied["OUROBOROS_REVIEW_MAX_CYCLES"] == "2"
     assert applied["OUROBOROS_SAFETY_MODE"] == "off"
+    assert applied["OUROBOROS_MAIN_WEB_SEARCH"] == "off"
+    assert applied["OUROBOROS_MAIN_WEB_SEARCH_ENGINE"] == "auto"
+    assert applied["OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS"] == 0
+    assert applied["OUROBOROS_WEBSEARCH_BACKEND"] == "ddgs"
+    assert applied["OUROBOROS_WEBSEARCH_MODEL"] == OFFICIAL_MODEL
     assert applied["CLAUDE_CODE_MODEL"] == ""
     assert applied["CLAUDE_AGENT_SDK_MODEL"] == ""
     assert applied["OUROBOROS_EFFORT_TASK"] == "high"
@@ -774,11 +928,18 @@ def test_launcher_row_counts_do_not_count_planned_as_completed():
     from devtools.benchmarks.cybergym.run_cybergym import _row_counts
 
     counts = _row_counts(
-        [{"status": "planned"}, {"status": "completed"}, {"status": "infra_failed"}]
+        [
+            {"status": "planned"},
+            {"status": "completed", "final_submission_success": True},
+            {"status": "completed", "final_submission_success": False},
+            {"status": "failed", "final_submission_success": False},
+            {"status": "infra_failed"},
+        ]
     )
     assert counts == {
-        "rows_written": 3,
-        "completed_count": 1,
+        "rows_written": 5,
+        "completed_count": 2,
+        "genuine_failure_count": 2,
         "planned_count": 1,
         "infra_count": 1,
     }
@@ -943,6 +1104,13 @@ def test_launcher_closes_server_when_executor_construction_fails(monkeypatch, tm
 
     @contextmanager
     def fake_finalize(_manifest_path, _manifest, *, outcome="completed", **_kwargs):
+        assert _manifest["extra"]["trajectory_audit"] == {
+            "required": True,
+            "status": "pending",
+            "promotion_gate": True,
+        }
+        assert _manifest["extra"]["docker_network_internal"] is False
+        assert _manifest["extra"]["server_host_publish"] is False
         yield {}
 
     args = SimpleNamespace(
@@ -991,7 +1159,7 @@ def test_launcher_closes_server_when_executor_construction_fails(monkeypatch, tm
         "admit_benchmark_run",
         lambda _path, **_kwargs: {
             "source": {"head": expected_commit},
-            "extra": {},
+            "extra": dict(_kwargs.get("extra") or {}),
             "harness": {},
             "output_paths": {},
         },
