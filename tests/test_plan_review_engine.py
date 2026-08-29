@@ -177,6 +177,9 @@ def test_domain_independent_plan_reviewed_end_to_end_green(harness):
     assert wave["constitutional"] is False
     assert [c["id"] for c in wave["spec"]["acceptance_claims"]] == ["claim_1", "claim_2"]
     assert wave["spec"]["evidence"] == [] and wave["evidence_manifest"]["declared"] == []
+    assert [actor["executions"] for actor in wave["actors"]] == [
+        [{"kind": "api", "model": model}] for model in ("m/a", "m/b", "m/c")
+    ]
     # The packet is domain-free: objective, spec, prose — no repository archaeology.
     request = sub.calls[0]["request"]
     user = _user_text(request.messages[1]["content"])
@@ -1119,6 +1122,28 @@ def test_final_cycle_ending_open_lands_the_cap_terminal_without_a_second_call(ha
 
     gate = plan_review_gate_projection(state, "blocking")
     assert gate["status"] == "cycles_exhausted" and gate["allow"] is True and gate["closed"] is False
+
+
+def test_final_cycle_survives_progress_reference_failure(harness, monkeypatch):
+    """A history/progress write is presentation-only and cannot abort cap finalization."""
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
+    blocking = json.dumps([_finding("f1", "blocking", breaks="claim_1")])
+    harness.install({"s1": blocking, "s2": blocking, "s3": CLEAN})
+    from ouroboros.tools import plan_review_references
+
+    monkeypatch.setattr(plan_review_references, "append_jsonl", lambda *_a, **_k: False)
+    out = _call(harness.make_ctx())
+
+    assert _control(out) == {"outcome": "REVISE_PLAN", "closed": False}
+    state = _state(harness)
+    assert state["current_attempt"]["status"] == "cycles_exhausted"
+    assert state["waves"][-1]["cycles_exhausted"] is True
+    assert any(
+        event.get("type") == "log_event"
+        and event.get("data", {}).get("type") == "review_cycles_exhausted"
+        for event in list(harness.events.queue)
+    )
 
 
 def test_duplicate_contradictory_dispositions_are_refused():

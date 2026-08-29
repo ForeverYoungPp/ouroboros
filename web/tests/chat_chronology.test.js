@@ -4,10 +4,10 @@ import test from 'node:test';
 import {
     chatMediaMessageKey,
     durableChatMediaUrl,
-    insertTimelineNode,
     isNonTerminalMediaHistoryRow,
     rawTimestampEpoch,
-} from '../modules/chat.js';
+} from '../modules/chat_activity.js';
+import { insertTimelineNode } from '../modules/chat.js';
 import { normalizeLogTs } from '../modules/log_events.js';
 
 function makeNode(id, ts = null, { height = 20, top = 100 } = {}) {

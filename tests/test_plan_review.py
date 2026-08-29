@@ -622,7 +622,7 @@ class TestPlanReviewDispositionEnvelope(unittest.TestCase):
                 "review_fingerprint": "f" * 64,
                 "items": [{"finding_id": "slot_1:f1", "decision": "reject", "rationale": "one"}],
             }
-            with patch.object(pr, "_record_raw_plan_request_attempt") as record, patch.object(
+            with patch.object(pr, "_record_raw_plan_request_with_reference") as record, patch.object(
                 pr, "_run_plan_review_async",
             ) as run:
                 out = pr._handle_plan_task(
@@ -660,7 +660,7 @@ class TestPlanReviewDispositionEnvelope(unittest.TestCase):
 
         ctx = ToolContext(repo_dir=pathlib.Path("."), drive_root=pathlib.Path("."))
         ctx.task_id = "parent"
-        with patch.object(pr, "_record_raw_plan_request_attempt") as record, patch.object(
+        with patch.object(pr, "_record_raw_plan_request_with_reference") as record, patch.object(
             pr, "_run_plan_review_async",
         ) as run:
             out = pr._handle_plan_task(

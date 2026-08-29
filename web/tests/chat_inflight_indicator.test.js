@@ -8,13 +8,25 @@ import {
 } from '../modules/chat.js';
 import {
     createStateSnapshotSequencer,
+    isForegroundLiveCard,
     routingAnnotationText,
 } from '../modules/chat_activity.js';
 
 const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
 
+test('review-only owner anchors do not advertise foreground task activity', () => {
+    const root = { isConnected: true };
+    assert.equal(isForegroundLiveCard({ root, groupId: 'owner', finished: false }), true);
+    assert.equal(isForegroundLiveCard({
+        root, groupId: 'owner', finished: false, reviewAnchor: true,
+    }), false);
+});
+
 test('unkeyed terminal incidents do not clear unrelated live turns', () => {
-    const cleanupStart = chatSource.indexOf('if (!finalizing) {');
+    // The cleanup guard also requires positive terminal evidence. Keep this
+    // source contract resilient to the guard's explicit conjunction while
+    // still checking the incident carve-out below it.
+    const cleanupStart = chatSource.indexOf('if (!finalizing && concludesTurn)');
     const finalCleanup = chatSource.slice(
         cleanupStart,
         chatSource.indexOf("if (msg.system_type === 'task_summary')", cleanupStart),

@@ -50,6 +50,15 @@ class LifecycleJob:
     # Skill Review panel chat. Note Main is chat 1, the panel is 0 — the two
     # must never be conflated (contracts/chat_id_policy.py).
     chat_id: int = 0
+    # Presentation identity is carried before the first queued notification.
+    # These are domain provenance facts only: the external progress task_id
+    # remains the synthetic lifecycle id minted by `_chat_task_id`.
+    group_id: str = ""
+    task_id: str = ""
+    root_task_id: str = ""
+    origin_task_id: str = ""
+    origin_root_task_id: str = ""
+    presentation_owner_task_id: str = ""
     queued_at: str = field(default_factory=_now_iso)
     started_at: str = ""
     finished_at: str = ""
@@ -64,6 +73,12 @@ class LifecycleJob:
             "source": self.source,
             "dedupe_key": self.dedupe_key,
             "chat_id": int(self.chat_id or 0),
+            "group_id": self.group_id,
+            "task_id": self.task_id,
+            "root_task_id": self.root_task_id,
+            "origin_task_id": self.origin_task_id,
+            "origin_root_task_id": self.origin_root_task_id,
+            "presentation_owner_task_id": self.presentation_owner_task_id,
             "status": self.status,
             "message": self.message,
             "error": self.error,
@@ -91,6 +106,7 @@ class LifecycleJobOptions:
     progress_target: Optional["JobProgressTarget"] = None
     on_started: Callable[[LifecycleJob], None] | None = None
     on_finished: Callable[[LifecycleJob, Any, BaseException | None], None] | None = None
+    presentation: Dict[str, Any] | None = None
 
 
 _lock: Optional[threading.Lock] = None
@@ -177,13 +193,23 @@ def _notify_duplicate_pointer(requested: LifecycleJob, existing: LifecycleJob) -
             f"Skill {existing.kind}: `{existing.target}` — already {existing.status} "
             f"(job {existing.id}); progress reports in its original chat.",
             is_progress=True,
-            task_id=_chat_task_id(existing),
+            # A pointer is an acknowledgement to the duplicate caller, not a
+            # scheduled task.  Giving it the synthetic lifecycle id promoted
+            # this harmless line into a second task card on replay.
+            task_id="",
             progress_meta={"lifecycle_pointer": {
                 "job_id": existing.id,
                 "kind": existing.kind,
                 "target": existing.target,
                 "status": existing.status,
                 "chat_id": _effective_chat_id(existing),
+                "group_id": existing.group_id,
+                "task_id": existing.task_id,
+                "root_task_id": existing.root_task_id,
+                "origin_task_id": existing.origin_task_id,
+                "origin_root_task_id": existing.origin_root_task_id,
+                "presentation_owner_task_id": existing.presentation_owner_task_id,
+                "source": existing.source,
             }},
         )
     except Exception:
@@ -329,6 +355,7 @@ async def run_lifecycle_job(
 
     global _active
     opts = options or LifecycleJobOptions()
+    presentation = opts.presentation if isinstance(opts.presentation, dict) else {}
     try:
         _chat = int(chat_id or 0)
     except (TypeError, ValueError):
@@ -341,6 +368,14 @@ async def run_lifecycle_job(
         dedupe_key=str(dedupe_key or ""),
         message=str(message or ""),
         chat_id=_chat,
+        group_id=str(presentation.get("group_id") or ""),
+        task_id=str(presentation.get("task_id") or ""),
+        root_task_id=str(presentation.get("root_task_id") or ""),
+        origin_task_id=str(presentation.get("origin_task_id") or ""),
+        origin_root_task_id=str(presentation.get("origin_root_task_id") or ""),
+        presentation_owner_task_id=str(
+            presentation.get("presentation_owner_task_id") or ""
+        ),
     )
     try:
         _register_dedupe(job)

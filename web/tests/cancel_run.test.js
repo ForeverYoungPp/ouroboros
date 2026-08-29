@@ -162,10 +162,10 @@ test('a timeout-retry root gains Cancel run: the host marker is the truth', () =
     assert.match(chat, /grantCancelAuthority && msg\?\.cancelable === true && msg\?\.task_id/);
     // Project-owned progress is now panel-local; Main only accepts its typed
     // terminal completion projection, so the old `!isMirror` branch is gone.
-    // Main's gate is the pure mainThreadAccepts predicate (server project_thread
+    // The shared thread predicate owns Main/Project routing (server project_thread
     // stamp + known project set) — behaviour is node-tested in
-    // chat_thread_routing.test.js; here we pin only that Main routes through it.
-    assert.match(chat, /const isMyThread = \(msg\) => \{[\s\S]{0,260}return mainThreadAccepts\(msg, state\.projectChatIds\);/);
+    // chat_thread_routing.test.js; here we pin only that Chat routes through it.
+    assert.match(chat, /return chatThreadAccepts\(msg, isMain, chatId, state\.projectChatIds\);/);
     assert.match(chat, /updateLiveCardFromProgressMessage\(msg, \{ grantCancelAuthority: true \}\)/);
     assert.doesNotMatch(chat, /frameRoot === taskId\) *&&[\s\S]{0,80}markTaskCancelable/);
     // ...and the eligibility reducer still refuses subagent/finished/reusable cards,
@@ -210,11 +210,11 @@ test('task-detail reconciliation consults taskCancelPending BEFORE the legacy te
     const terminalAt = helper.indexOf("'cancel_requested'");
     assert.ok(pendingAt > 0 && terminalAt > 0, 'both branches exist in the helper');
     assert.ok(pendingAt < terminalAt, 'the typed pending check runs before the terminal fallback');
-    // ALL reconcile call sites (success, 404, and the GR3-10 non-404 failure)
-    // route through the ONE helper (no inline order drift).
+    // Cancel success, 404, non-404 failure, and both freshness branches of the
+    // missing-card detail read route through the ONE helper (no inline drift).
     assert.equal(
-        chat.match(/reconcileCancelCardFromDetail\(record, taskId, (stored|await fetchTaskDetail\(taskId\))\);/g).length,
-        3,
+        chat.match(/reconcileCancelCardFromDetail\((?:record|currentRecord), taskId, (stored|detail|await fetchTaskDetail\(taskId\))\);/g).length,
+        5,
     );
 });
 

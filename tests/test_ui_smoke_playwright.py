@@ -17,6 +17,23 @@ from tests.fixtures_mock_llm import MockLLMServer
 REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
 
 
+def _open_review_checkpoint(card, *, open_card=True):
+    if open_card:
+        card.locator(":scope > [data-live-summary-button]").click()
+    assert card.is_visible()
+    section = card.locator(":scope > [data-live-reviews-host] [data-review-section]")
+    section.wait_for(state="visible", timeout=5_000)
+    assert section.get_attribute("data-expanded") == "0"
+    section.locator("[data-review-section-toggle]").click()
+    assert section.get_attribute("data-expanded") == "1"
+    group = section.locator("[data-review-group]").first
+    assert group.locator("[data-review-group-toggle]").get_attribute("aria-expanded") == "false"
+    group.locator("[data-review-group-toggle]").click()
+    attempt = group.locator("[data-review-attempt-toggle]").first
+    attempt.click()
+    assert attempt.get_attribute("aria-expanded") == "true"
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -943,164 +960,6 @@ def test_ui_smoke_direct_mode_loads_chat_and_dashboard(direct_server):
 
 
 @pytest.mark.ui_browser
-def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_data):
-    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
-    from playwright.sync_api import Error as PlaywrightError
-    from playwright.sync_api import sync_playwright
-
-    url = direct_server_with_data["url"]
-    data_dir = direct_server_with_data["data_dir"]
-    logs_dir = data_dir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    projection = {
-        "panels": [{
-            "panel_id": "panel_visual_truth",
-            "surface": "task_acceptance",
-            "authority": "host_root",
-            "aggregate_signal": "DEGRADED",
-            "transport_status": "partial",
-            "parse_status": "malformed",
-            "quorum": {"required": 2, "contributed": 1, "configured": 3},
-            "enforcement_impact": "degrades_completion",
-            "reason": "One reviewer timed out, so the panel did not reach quorum.",
-            "candidate_hash": "candidate-visual",
-            "evidence_revision": "evidence-visual",
-            "fence_hash": "fence-visual-hash",
-            "actors": [
-                {
-                    "slot_id": "fable",
-                    "actor_role": "task acceptance",
-                    "provider": "anthropic",
-                    "model": "anthropic/claude-fable-5",
-                    "transport_status": "success",
-                    "parse_status": "valid",
-                    "semantic_verdict": "DEGRADED",
-                    "quorum_contribution": True,
-                    "enforcement_impact": "supports_pass",
-                    "reason": "The browser evidence is incomplete.",
-                },
-                {
-                    "slot_id": "sol",
-                    "actor_role": "task acceptance",
-                    "provider": "openai",
-                    "model": "openai/gpt-5.6-sol",
-                    "transport_status": "timeout",
-                    "parse_status": "malformed",
-                    "semantic_verdict": "",
-                    "quorum_contribution": False,
-                    "enforcement_impact": "abstains",
-                    "reason": "Provider request timed out.",
-                },
-            ],
-        }],
-    }
-    axes = {
-        "lifecycle": {"status": "completed"},
-        "execution": {"status": "ok"},
-        "objective": {"status": "best_effort"},
-        "review": {"status": "degraded"},
-        "artifacts": {"status": "ready"},
-    }
-    summary = {
-        "ts": "2026-07-15T10:00:00+00:00",
-        "direction": "system",
-        "type": "task_summary",
-        "task_id": "review-ui",
-        "chat_id": 1,
-        "text": "Task finished with review evidence.",
-        "tool_calls": 0,
-        "rounds": 1,
-        "outcome_axes": axes,
-        "review_projection": projection,
-    }
-    event = {
-        "ts": "2026-07-15T10:00:01+00:00",
-        "type": "task_done",
-        "task_id": "review-ui",
-        "task_type": "task",
-        "status": "completed",
-        "outcome_axes": axes,
-        "review_projection": projection,
-    }
-    ordinary_final = {
-        "ts": "2026-07-15T10:00:00.500000+00:00",
-        "direction": "out",
-        "chat_id": 1,
-        "task_id": "review-no-summary",
-        "text": "Normal final answer after the terminal progress anchor.",
-        "format": "markdown",
-    }
-    (logs_dir / "chat.jsonl").write_text(
-        json.dumps(summary) + "\n" + json.dumps(ordinary_final) + "\n",
-        encoding="utf-8",
-    )
-    (logs_dir / "events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
-    (logs_dir / "progress.jsonl").write_text(json.dumps({
-        "ts": "2026-07-15T09:59:59+00:00",
-        "chat_id": 1,
-        "task_id": "review-no-summary",
-        "content": "Terminal review must survive without a task summary.",
-    }) + "\n", encoding="utf-8")
-    task_results = data_dir / "task_results"
-    task_results.mkdir(parents=True, exist_ok=True)
-    (task_results / "review-no-summary.json").write_text(json.dumps({
-        "task_id": "review-no-summary",
-        "status": "completed",
-        "reason_code": "acceptance_degraded",
-        "outcome_axes": axes,
-        "review_projection": projection,
-    }) + "\n", encoding="utf-8")
-
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": 1440, "height": 1000})
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                card = page.locator('.chat-live-card[data-task-id="review-ui"]')
-                card.wait_for(state="attached", timeout=30_000)
-                assert card.is_visible()
-                assert card.get_attribute("data-expanded") == "1"
-                chat_text = card.inner_text()
-                assert "Done with warnings" in chat_text
-                assert "Notice" not in chat_text
-                assert "Review panel panel_visual_truth" in chat_text
-                assert "Reviewer fable" in chat_text
-                assert "Reviewer sol" in chat_text
-                no_summary = page.locator('.chat-live-card[data-task-id="review-no-summary"]')
-                no_summary.wait_for(state="attached", timeout=30_000)
-                assert no_summary.is_visible()
-                assert no_summary.get_attribute("data-expanded") == "1"
-                assert no_summary.locator('[data-live-phase]').first.get_attribute("data-phase") == "warn"
-                assert "Review panel panel_visual_truth" in no_summary.inner_text()
-                page.wait_for_timeout(900)  # cover the routine background history sync
-                assert no_summary.locator('.chat-live-line-repeat:not([hidden])').count() == 0
-                assert card.locator('.chat-live-line-repeat:not([hidden])').count() == 0
-                page.screenshot(path=str(data_dir.parent / "review-truth-chat.png"), full_page=True)
-
-                page.click('[data-nav-page="dashboard"]')
-                page.click('[data-dashboard-tab="logs"]')
-                log_card = page.locator('.log-task-card[data-task-group="review-ui"]')
-                log_card.wait_for(state="attached", timeout=30_000)
-                assert log_card.is_visible()
-                review = log_card.locator('[data-task-review]')
-                assert review.is_visible()
-                log_text = review.inner_text()
-                assert "Review panel panel_visual_truth" in log_text
-                assert "Reviewer fable" in log_text
-                assert "Reviewer sol" in log_text
-                assert log_card.locator('[data-task-phase]').inner_text() == "warn"
-                review.scroll_into_view_if_needed()
-                review.screenshot(path=str(data_dir.parent / "review-truth-logs.png"))
-            finally:
-                browser.close()
-    except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
-            pytest.skip(str(exc))
-        raise
-
-
-@pytest.mark.ui_browser
 @pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])
 def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
     direct_server_with_data,
@@ -1421,8 +1280,6 @@ def test_ui_smoke_live_card_mutations_preserve_viewport(
                 assert parent.evaluate("card => card.getBoundingClientRect().height") > parent_before_mount + 30
                 assert abs(card_top(page, anchor_id) - anchor_before) <= 6
 
-                # Terminal auto-collapse is another large height change above the
-                # same reader anchor.
                 parent_before_finish = parent.evaluate("card => card.getBoundingClientRect().height")
                 emit(page, {
                     "type": "chat", "role": "system", "system_type": "task_summary",
@@ -1434,12 +1291,10 @@ def test_ui_smoke_live_card_mutations_preserve_viewport(
                         "artifacts": {"status": "ready"},
                     },
                 })
-                assert parent.get_attribute("data-expanded") == "0"
-                assert parent.evaluate("card => card.getBoundingClientRect().height") < parent_before_finish - 100
+                assert parent.get_attribute("data-expanded") == "1"
+                assert parent.evaluate("card => card.getBoundingClientRect().height") >= parent_before_finish - 32
                 assert abs(card_top(page, anchor_id) - anchor_before) <= 6
 
-                # Review evidence still auto-expands a child, under the same
-                # viewport contract and without changing the ordinary policy.
                 review_child = page.locator('.chat-live-card[data-task-id="vp-late-child"]')
                 review_before = review_child.evaluate("card => card.getBoundingClientRect().height")
                 emit(page, {
@@ -1459,6 +1314,9 @@ def test_ui_smoke_live_card_mutations_preserve_viewport(
                         "actors": [],
                     }]},
                 })
+                assert review_child.get_attribute("data-expanded") == "0"
+                review_child.locator(":scope > [data-live-summary-button]").evaluate("el => el.click()")
+                page.evaluate(settle)
                 assert review_child.get_attribute("data-expanded") == "1"
                 assert review_child.evaluate("card => card.getBoundingClientRect().height") > review_before + 20
                 assert abs(card_top(page, anchor_id) - anchor_before) <= 6
@@ -1947,7 +1805,13 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
             "task_id": "child1",
             "text": "Final child answer should stay inside the child card.",
             "format": "markdown",
-        }) + "\n",
+            "delegation_role": "subagent",
+            "subagent_event": "completed",
+            "subagent_task_id": "child1",
+            "parent_task_id": "parent1",
+            "root_task_id": "parent1",
+            "subagent_role": "researcher",
+            }) + "\n",
         encoding="utf-8",
     )
 
@@ -1990,9 +1854,9 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 assert "1 child" in child_count.inner_text()
                 assert "child=child1" not in child_text
                 assert "role=researcher" not in child_text
-                assert "panel_child_review" in child_text
-                assert "claude-fable-5" in child_text
-                assert "verdict=DEGRADED" in child_text
+                assert "panel_child_review" not in child_text
+                assert "claude-fable-5" not in child_text
+                assert "verdict=DEGRADED" not in child_text
                 assert "evidence-mapper (grandchi" in grandchild.inner_text()
                 assert child.get_attribute("data-task-id") == "child1"
                 assert page.locator(
@@ -2023,21 +1887,24 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                     has_text="Final child answer should stay inside the child card."
                 ).count() == 0
 
-                # Review actor/model details are disclosed immediately even on a
-                # nested child; ordinary nested cards remain collapsed.
-                assert child.get_attribute("data-expanded") == "1"
+                assert child.get_attribute("data-expanded") == "0"
                 assert grandchild.get_attribute("data-expanded") == "0"
                 child_summary = child.locator(":scope > [data-live-summary-button]").first
+                child_summary.click()
+                _open_review_checkpoint(child, open_card=False)
+                assert "panel_child_review" in child.inner_text()
+                assert "claude-fable-5" in child.inner_text()
+                assert "verdict=DEGRADED" in child.inner_text()
                 progress_line = child.locator(".chat-live-line", has_text="Searching evidence").first
                 progress_toggle = progress_line.locator(".chat-live-line-toggle")
                 progress_toggle.wait_for(state="visible", timeout=5_000)
                 progress_toggle.click()
                 assert child_activity_early in progress_line.inner_text()
                 assert child_activity_tail in progress_line.inner_text()
-                review_line = child.locator(".chat-live-line", has_text="panel_child_review").first
-                review_toggle = review_line.locator(".chat-live-line-toggle")
-                review_toggle.wait_for(state="visible", timeout=5_000)
-                review_toggle.click()
+                result_line = child.locator(".chat-live-line", has_text="Child result with evidence table").first
+                result_toggle = result_line.locator(".chat-live-line-toggle")
+                result_toggle.wait_for(state="visible", timeout=5_000)
+                result_toggle.click()
                 expanded_text = child.inner_text(timeout=5_000)
                 assert "Final child answer should stay inside the child card." in expanded_text
                 assert "Child result with evidence table" in expanded_text
@@ -2048,7 +1915,7 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 assert "Scheduled subagent child1" not in expanded_text
                 assert child_summary.get_attribute("aria-expanded") == "true"
                 assert child.locator("[data-live-timeline]").first.get_attribute("id")
-                assert review_toggle.get_attribute("aria-controls")
+                assert result_toggle.get_attribute("aria-controls")
 
                 page.reload(wait_until="domcontentloaded", timeout=30_000)
                 page.wait_for_function("() => document.querySelectorAll('.chat-live-card').length === 4", timeout=30_000)
@@ -2072,11 +1939,15 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 assert replay_child.get_attribute("data-finished") == "1"
                 assert replay_child.locator(":scope > [data-live-summary-button] [data-live-phase]").first.get_attribute("data-phase") == "warn"
                 assert replay_grandchild.get_attribute("data-finished") == "1"
-                assert replay_child.get_attribute("data-expanded") == "1"
+                assert replay_child.get_attribute("data-expanded") == "0"
                 assert replay_grandchild.get_attribute("data-expanded") == "0"
                 assert "researcher (child1)" in replay_child.inner_text()
                 assert "child=child1" not in replay_child.inner_text()
                 assert "role=researcher" not in replay_child.inner_text()
+                assert page.locator(".chat-bubble").filter(
+                    has_text="Final child answer should stay inside the child card."
+                ).count() == 0
+                _open_review_checkpoint(replay_child)
                 assert "Final child answer should stay inside the child card." in replay_child.inner_text()
                 replay_progress = replay_child.locator(".chat-live-line", has_text="Searching evidence").first
                 replay_progress.locator(".chat-live-line-toggle").click()

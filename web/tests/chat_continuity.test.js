@@ -8,11 +8,13 @@ import {
     computeDerivedChatStatus,
     computeHydratedDirectActivities,
     partitionLocalEchoJournal,
+    positiveTaskTerminalFact,
     reconcileHydratedDirectActivities,
 } from '../modules/chat_activity.js';
 import {
     isTerminalTaskDetail,
     summarizeChatLiveEvent,
+    taskOutcomeSeverity,
     taskTerminalPhase,
 } from '../modules/log_events.js';
 
@@ -238,4 +240,32 @@ test('task_done stays the terminal card projection', () => {
         outcome_axes: { lifecycle: { status: 'completed' } },
     });
     assert.equal(summary.terminal, true);
+});
+
+test('history terminal truth requires a positive typed fact', () => {
+    assert.equal(positiveTaskTerminalFact({
+        role: 'system', task_id: 'root', system_type: 'skill_review',
+    }), false);
+    assert.equal(positiveTaskTerminalFact({
+        role: 'assistant', task_id: 'root', system_type: 'photo',
+    }), false);
+    assert.equal(positiveTaskTerminalFact({
+        role: 'system', task_id: 'root', system_type: 'task_summary',
+    }), true);
+    assert.equal(positiveTaskTerminalFact({
+        role: 'assistant', task_id: 'root', task_terminal_status: 'failed',
+    }), true);
+    assert.equal(positiveTaskTerminalFact({
+        delegation_role: 'subagent', task_id: 'child', subagent_event: 'completed',
+    }), true);
+    assert.equal(positiveTaskTerminalFact({
+        delegation_role: 'subagent', task_id: 'child', subagent_event: 'interrupted',
+    }), false);
+});
+
+test('typed terminal status is the phase authority even without a legacy status field', () => {
+    assert.equal(taskOutcomeSeverity({ task_terminal_status: 'failed' }), 'error');
+    assert.equal(taskTerminalPhase({ task_terminal_status: 'failed' }), 'error');
+    assert.equal(taskOutcomeSeverity({ task_terminal_status: 'cancelled' }), 'cancelled');
+    assert.equal(taskTerminalPhase({ task_terminal_status: 'completed' }), 'done');
 });

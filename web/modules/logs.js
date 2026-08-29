@@ -1,9 +1,11 @@
 import { escapeHtml } from './utils.js';
 import { apiFetch } from './api_client.js';
+import { harnessIdentityMarkup } from './harness_presentation.js';
 import {
     LOG_CATEGORIES,
     categorizeLogEvent,
     duplicateLogEventKey,
+    executorChip,
     formatReviewProjection,
     getLogTaskGroupId,
     isGroupedTaskEvent,
@@ -133,6 +135,7 @@ export function initLogs({ ws, state, mount }) {
 
     function createStandaloneEntry(evt) {
         const view = summarizeLogEvent(evt);
+        const execution = executorChip(evt);
         const cat = categorizeLogEvent(evt);
         const dedupeKey = duplicateLogEventKey(evt);
         const now = (() => {
@@ -177,6 +180,10 @@ export function initLogs({ ws, state, mount }) {
                 phase: view.phase || 'info',
                 headline: view.headline || 'Event',
             })}
+            ${execution ? `<div class="harness-chip log-executor-chip" title="${escapeHtml(execution.title || '')}">${harnessIdentityMarkup(execution.harness, {
+                label: execution.label || '',
+                className: 'log-executor-identity',
+            })}</div>` : ''}
             ${metaPills(view.meta)}
             ${bodyHtml}
             <div class="log-actions">
@@ -216,6 +223,7 @@ export function initLogs({ ws, state, mount }) {
                 },
             })}
             <div class="log-task-summary" data-task-summary></div>
+            <div class="harness-chip log-executor-chip" data-task-executor hidden></div>
             <div class="log-body log-task-review" data-task-review hidden></div>
             <details class="log-task-details">
                 <summary>Timeline</summary>
@@ -230,6 +238,7 @@ export function initLogs({ ws, state, mount }) {
             headline: entry.querySelector('[data-task-headline]'),
             count: entry.querySelector('[data-task-count]'),
             summary: entry.querySelector('[data-task-summary]'),
+            executor: entry.querySelector('[data-task-executor]'),
             review: entry.querySelector('[data-task-review]'),
             timeline: entry.querySelector('[data-task-timeline]'),
             events: 0,
@@ -295,6 +304,15 @@ export function initLogs({ ws, state, mount }) {
             groupId === 'bg-consciousness' ? 'background' : `task=${groupId}`,
             ...view.meta,
         ]);
+        const execution = executorChip(evt);
+        if (execution && record.executor) {
+            record.executor.title = execution.title || '';
+            record.executor.innerHTML = harnessIdentityMarkup(execution.harness, {
+                label: execution.label || '',
+                className: 'log-executor-identity',
+            });
+            record.executor.hidden = false;
+        }
         const reviewDetails = formatReviewProjection(evt.review_projection);
         if (reviewDetails && record.review) {
             record.review.textContent = reviewDetails;

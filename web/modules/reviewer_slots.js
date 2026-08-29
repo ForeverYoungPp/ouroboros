@@ -21,6 +21,7 @@
 
 import { apiFetch } from './api_client.js';
 import { bindStatusSurface, boundedStatusRefresh, claudexorStatus } from './claudexor_status_store.js';
+import { harnessIdentityMarkup } from './harness_presentation.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import * as routeEditor from './route_editor_primitives.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
@@ -364,6 +365,23 @@ function effortSelectHtml(attrs, selected, surfaceDefault) {
     return routeEditor.effortSelectHtml(attrs, selected, surfaceDefault);
 }
 
+export function reviewerRouteIdentityMarkup(route, harnesses = {}, {
+    catalogKnown = false,
+} = {}) {
+    if (route?.kind !== ROUTE_KIND_SESSION) {
+        return harnessIdentityMarkup('api', {
+            channel: 'api',
+            className: 'reviewer-slot-route-identity',
+        });
+    }
+    const split = splitSessionTarget(route.target_id);
+    const harness = harnesses?.[split.harness];
+    return harnessIdentityMarkup(split.harness, {
+        label: catalogKnown ? String(harness?.display_name || '') : '',
+        className: 'reviewer-slot-route-identity',
+    });
+}
+
 function rowHtml(row, group) {
     const { catalogKnown, accountsKnown } = state;
     const choice = encodeRouteChoice(row);
@@ -386,6 +404,7 @@ function rowHtml(row, group) {
     const surfaceDefault = group === 'scope' ? 'scope review effort' : 'review effort';
     return `
         <div class="reviewer-slot-row" data-slot-group="${group}" data-slot-id="${escapeHtml(row.slot_id)}">
+            ${reviewerRouteIdentityMarkup(row.route, harnessesById(), { catalogKnown })}
             <div class="reviewer-slot-controls">
                 ${selectHtml(`data-slot-route aria-label="Reviewer route"`, groups, choice)}
                 ${session ? '' : `<input data-slot-custom-api list="reviewer-api-model-catalog" placeholder="provider/model-id" value="${escapeHtml(row.route.target_id || '')}" spellcheck="false" aria-label="API model id">`}
@@ -434,6 +453,7 @@ function advisoryHtml() {
     if (lastText) metaParts.push(`Last run: ${lastText}`);
     return `
         <div class="reviewer-slot-row" data-advisory-row>
+            ${reviewerRouteIdentityMarkup(advisory.route, harnessesById(), { catalogKnown })}
             <div class="reviewer-slot-controls">
                 <label class="local-toggle"><input type="checkbox" data-advisory-enabled ${advisory.enabled !== false ? 'checked' : ''}> Enabled</label>
                 ${selectHtml('data-advisory-route aria-label="Advisory route"', groups, choice)}

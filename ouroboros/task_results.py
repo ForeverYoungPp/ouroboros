@@ -802,7 +802,7 @@ def _empty_plan_review_state() -> Dict[str, Any]:
     }
 
 
-def _legacy_v1_projection(value: Dict[str, Any]) -> Dict[str, Any]:
+def legacy_plan_review_projection(value: Dict[str, Any]) -> Dict[str, Any]:
     """Read-only projection of a v1 record: ``{fingerprint, status, outcome, closed,
     acceptance_claims}`` where status ∈ closed | rail_degraded | open (every non-closed
     v1 ATTEMPT: open review, unavailable) | pending (a wave without any attempt) | absent."""
@@ -846,7 +846,7 @@ def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
     if value.get("schema_version") == 1:
         state = _empty_plan_review_state()
         state["legacy_v1"] = copy.deepcopy(value)
-        state["legacy_v1_projection"] = _legacy_v1_projection(value)
+        state["legacy_v1_projection"] = legacy_plan_review_projection(value)
         return state
     if value.get("schema_version") != _PLAN_REVIEW_STATE_VERSION:
         raise ValueError("PLAN_REVIEW_STATE_INVALID: unsupported or malformed schema")
@@ -933,7 +933,7 @@ def _legacy_projection_of(state: Any) -> Dict[str, Any]:
     if not isinstance(state, dict):
         return {}
     if state.get("schema_version") == 1:
-        return _legacy_v1_projection(state)
+        return legacy_plan_review_projection(state)
     projection = state.get("legacy_v1_projection")
     return projection if isinstance(projection, dict) else {}
 
