@@ -1147,7 +1147,7 @@ Before every commit, verify the following:
 - Project-room promotion with no working folder and no `workspace="none"` opt-out idempotently provisions a standalone git repo through `ensure_project_workspace`, then runs the ordinary workspace admission checks. Never provision over a non-empty broken binding or an unreadable registry; those cases fail loudly. Binding affects tool profile, memory, lease, and preflight, not the Max-mode Architecture projection.
 - Keep policy denials separate from execution failures: `user_files_path_blocked`, `cwd_blocked`, and `artifact_output_undeclared` are non-failure outcomes, while failure to register an explicitly declared output remains `artifact_output_error`.
 - The DEFAULT (non-workspace) shell lane carries the SAME target-aware git policy in every runtime mode including light (Q4=A sandbox unwind): mutating git is blocked only when it targets the Ouroboros runtime (system repo / any data drive — bidirectional, casefold, symlink-resolved containment; `commit_reviewed` is the remedy for self-repo changes), read-only git works everywhere including at the system repo, `allowed_resources.network=false` still fences network git subcommands, and acting `self_worktree` children keep the strict no-commit policy. `git init`/`commit`/`push` in `~/projects`, `/tmp`, an attached project folder, or a host-minted coop tree is legitimate task work, not a violation.
-- `claude_code_edit` is RETIRED (D10, owner-approved migration, phase 6.4): the SDK edit gateway's job moved to the configured session-actor path — `schedule_subagent(subagent_id=...)` freezes a mutating nanny's selected row and gives it an ordinary actor-first episode; if it chooses the exact subscription leaf, it starts it through the configured `delegate_start` bridge. `delegate_wait`/`delegate_answer`/`delegate_cancel` supervise it, and explicit `delegate_start(subagent_id=..., prompt=...)` handles bounded direct or replacement starts. The D10 migration shipped INCOMPLETE for one supported target class — the old gateway could edit an exact non-Git skill payload directly, while the successor knew only Git workspaces — and that class was RESTORED (owner option A, 2026-08-14): a top-level task selects the session transport and exact user-managed payload with `delegate_start(subagent_id=..., prompt=..., root="skill_payload", bucket=..., skill_name=...)`, including a markerless physical native payload through logical `external`; the harness edits a private standalone Git snapshot, and the parent applies the captured diff explicitly under a whole-payload content-hash CAS, after which the existing skill review is stale. The resource fields select authority and never select transport. Compatibility is one-way and permanent: a saved task contract carrying `disabled_tools=["claude_code_edit"]` also withholds the successor `delegate_start` (registry `_disabled_tools`), and the frozen `GET /api/claude-code/status` + `POST /api/claude-code/install` endpoints stay — the Claude runtime still powers the api-route advisory review. Do not resurrect the tool name.
+- `claude_code_edit` is RETIRED (D10, owner-approved migration, phase 6.4): the SDK edit gateway's job moved to the configured session-actor path — `schedule_subagent(subagent_id=...)` freezes a mutating nanny's selected row, and the host pre-starts the exact subscription leaf through the configured `delegate_start` bridge before the nanny's first round. `delegate_wait`/`delegate_answer`/`delegate_cancel` supervise it, and explicit `delegate_start(subagent_id=..., prompt=...)` handles bounded direct or replacement starts. The D10 migration shipped INCOMPLETE for one supported target class — the old gateway could edit an exact non-Git skill payload directly, while the successor knew only Git workspaces — and that class was RESTORED (owner option A, 2026-08-14): a top-level task selects the session transport and exact user-managed payload with `delegate_start(subagent_id=..., prompt=..., root="skill_payload", bucket=..., skill_name=...)`, including a markerless physical native payload through logical `external`; the harness edits a private standalone Git snapshot, and the parent applies the captured diff explicitly under a whole-payload content-hash CAS, after which the existing skill review is stale. The resource fields select authority and never select transport. Compatibility is one-way and permanent: a saved task contract carrying `disabled_tools=["claude_code_edit"]` also withholds the successor `delegate_start` (registry `_disabled_tools`), and the frozen `GET /api/claude-code/status` + `POST /api/claude-code/install` endpoints stay — the Claude runtime still powers the api-route advisory review. Do not resurrect the tool name.
 - Successor parity rule (from the D10 postmortem): a tool may be called replaced, retired with a successor, or fully migrated only after a persistent golden test proves every previously supported user-visible target class through the successor to the final outcome. Deleted-test tombstones and disclosure prove intentional code removal, not successor parity. Dropping a target class requires an explicit owner decision naming the lost user outcome; approval to remove the old tool name or implementation is not that approval.
 - Do not recommend `runtime_data/uploads`, skill payloads, or owner state directories as generic artifact transport.
 
@@ -1214,7 +1214,8 @@ Before every commit, verify the following:
   fingerprint into the task; dispatch/restart must use that snapshot rather than
   mutable Settings. An `api_model` row is the recursive API child. An
   `agent_session` row is the recursive nanny bound to one exact external session
-  route; a physical leaf starts only if the actor chooses it, and its model/account
+  route; selecting the row IS the parent's substrate decision — the host starts
+  that leaf before the nanny's first round — and its model/account
   facts come from requested→effective custody evidence. Do not add a
   second model/lane/executor selector to the public schema, parse `recommended_use`,
   rank rows in host code, or substitute another actor after a typed refusal.
@@ -1223,31 +1224,80 @@ Before every commit, verify the following:
   one migrated configured row; new+legacy is a conflict and omitted/ambiguous
   `auto`, zero matches, or multiple matches returns `subagent_selection_required`.
   Historical task/result fields remain readable; do not make them active defaults.
-- A configured session child opens one ordinary host actor episode before starting a
-  new external leaf. The actor may schedule zero, one, or many host-visible children,
-  publish typed tree evidence, call `delegate_start` for its immutable snapshotted
-  session row, or finish with an explicitly typed zero-run receipt through
+- A configured session child means the work EXECUTES ON THE HARNESS by
+  construction: the substrate choice is the PARENT's, made by selecting the row,
+  and the host executes that choice — the nanny never re-decides it. The typed
+  parent-LLM choice is the floor (truth, money, and authorship stay where the
+  parent put them); topology, decomposition, and supervision judgment remain the
+  model's ceiling (BIBLE P5/P13 — code executes a typed LLM decision, it does
+  not choreograph cognition). `subagent_bootstrap.bootstrap_before_context`
+  starts the exact snapshotted leaf BEFORE the first model round through the
+  SAME wrapper the model's `delegate_start(prompt="")` call uses
+  (`delegate_start_entry`) — one start path, one set of refusal shapes. Branch
+  order: recovery adoption first; durable zero-run / unknown-evidence fences
+  second (a fence may hide a live prior run, so a fence-wake outranks every
+  terminal); dispatch-blocked third; otherwise pre-start. The host NEVER waits
+  inside bootstrap: a live run — fresh start or adopted recovery — hands the
+  model its first round immediately with a `configured_session_started` receipt
+  carrying the run id, and waiting is the model's own `delegate_wait` decision,
+  which keeps owner messages, hurry controls, loop checkpoints, and PARALLEL
+  auxiliary children (critics, follow-ups) live for the whole run. Do not
+  reintroduce a host-side wait, poll, or supervised-wait call on this seam.
+  A blocked dispatch (unless fenced) or a DEFINITE start refusal — a typed
+  `refused` payload with no custody handle and a reason inside the closed
+  `subagent_bootstrap._DEFINITE_UNRUN_REASONS` set or in the
+  `access_profile_unsupported` prefix family beside it — ends the child UNRUN
+  and typed at $0 through the existing
+  `executor_blocked_outcome` (`agent.py` fills `cap_info` from
+  `ctx._configured_startup_refusal`); there is never a silent vendor/API
+  fallback. Everything ambiguous — any custody handle, `started_uncustodied`,
+  an unknown reason code, unparseable output — wakes the model instead: a false
+  "spent nothing" terminal over a possibly-live run is the one direction this
+  classification must never fail toward. Grow the definite set only with
+  reasons that PROVE no run can exist.
+  The zero-run receipt remains
   `verify_and_record(contract_kind="delegation_zero_run", zero_run_decision,
-  zero_run_basis)`. The decision may be complete, incomplete, or unknown; prose
-  alone is not a zero-run receipt. Before writing it, the host must prove from the
-  canonical custody root that no open run, ambiguous start invocation, or undisposed
-  physical result remains. Once durably recorded, it is terminal for that actor; a
-  later physical start is refused rather than contradicting the receipt.
-  A malformed or unreadable receipt store with no still-parseable terminal row is
-  typed unknown and also blocks a physical start; the narrow zero-run form remains
-  available to re-ground the decision, and child copy-back must preserve rather
-  than rewrite away the corrupt evidence. A valid terminal row still wins over an
-  unrelated malformed row.
-  This is an affordance, not a topology state machine: host code must not infer a
-  required number or order of descendants. The canonical brief and its hash remain
-  unchanged; any coordination appendix is additive and separately disclosed. A
-  route-unavailable fact still permits this first episode, with no silent vendor/API
-  fallback. When a physical start or recovery actually occurs, inject the existing
-  custody-durable startup/wake receipt. `started_uncustodied` is a fault with a
-  possibly live run: do not enter quiet sleep or start a replacement until the
-  invocation is proven absent or terminal and any captured physical result is
-  explicitly disposed; replay the original pending invocation/idempotency key after
-  worker loss.
+  zero_run_basis)`, with the WRITE enum `incomplete | unknown`
+  (`ZERO_RUN_WRITE_DECISIONS` in `outcome_receipt_store.py`): a zero-run
+  "complete" is unverifiable self-report and stopped being writable. The READ
+  enum additionally keeps historical `complete` receipts valid — an old receipt
+  still fences a second physical start — but the terminal projection degrades
+  them to `unknown` plus disclosure (reason `historical_zero_run_complete`),
+  never clean. Prose alone is not a zero-run receipt. Before writing one, the
+  host must prove from the canonical custody root that no open run, ambiguous
+  start invocation, or undisposed physical result remains. Once durably
+  recorded, it is terminal for that actor; a later physical start is refused
+  rather than contradicting the receipt. A malformed or unreadable receipt
+  store with no still-parseable terminal row is typed unknown and also blocks a
+  physical start; the narrow zero-run form remains available to re-ground the
+  decision, and child copy-back must preserve rather than rewrite away the
+  corrupt evidence. A valid terminal row still wins over an unrelated malformed
+  row.
+  A session actor's terminal is CLEAN only through its own physical leaf
+  (started or adopted) or a durable typed zero-run receipt. "Completed direct
+  child ⇒ clean" is DELETED: host children are auxiliary evidence — the
+  unresolved fact carries `reason=physical_leaf_not_started` plus
+  `direct_child_statuses`, and the `CONFIGURED_ACTOR_INCOMPLETE`/
+  `CONFIGURED_ACTOR_UNKNOWN` finalization fact fires no matter how much
+  coordination activity or how many children the round had. A substrate swap
+  onto host API children is a disclosed incomplete execution, never a clean
+  one.
+  Metered pacing (`nanny_pacing.py`): the burn baseline resets ONLY on real
+  acts of delegation (`delegate_start`/`schedule_subagent`); supervision verbs
+  (`delegate_wait`/`delegate_answer`/`delegate_cancel`) advance the round
+  baseline while dollars keep accumulating; coordination verbs are observed for
+  nudge phrasing but never buy metered silence. `_nanny_route_dispatched`
+  covers every configured `agent_session` row as well as `executor="harness"`,
+  so the reminders stay armed across mid-run failures.
+  Supervision is not a topology state machine: host code must not infer a
+  required number or order of descendants. The canonical brief and its hash
+  remain unchanged; any coordination appendix is additive and separately
+  disclosed. When a physical start or recovery actually occurs, inject the
+  existing custody-durable startup/wake receipt. `started_uncustodied` is a
+  fault with a possibly live run: do not enter quiet sleep or start a
+  replacement until the invocation is proven absent or terminal and any
+  captured physical result is explicitly disposed; replay the original pending
+  invocation/idempotency key after worker loss.
   A fresh physical start and `delegation_zero_run` are mutually exclusive actor
   decisions. Rebuild all run/start/patch blockers from one custody-log snapshot and
   hold the existing short per-task file-lock seam only across the final recheck plus
@@ -1261,7 +1311,7 @@ Before every commit, verify the following:
   The complete external work-order wire budget is one total 250,000-character
   limit, not a model-context claim and not a per-field prefix rule. A brief that
   fits is sent byte-complete. A brief above that limit is never silently prefixed:
-  the actor-first exact-start path may send only a compact `coverage=partial`
+  the exact-start path may send only a compact `coverage=partial`
   source-request lens when the selected route's live manifest positively
   declares an interactive question channel. The lens carries the full brief SHA/size and an
   actor-resolvable `get_task_result` canonical-work-order selector; the child must
@@ -1285,6 +1335,30 @@ Before every commit, verify the following:
   a second probe/lease to pretend the race vanished. Durable verified range coverage
   remains the authority; a raced run stays `cannot_verify` and its patch stays
   unapplied until coverage is complete.
+- `subagents.route_health` is the ONE route reader for every consumer —
+  dispatcher, the nanny's own `delegate_start`, and review slots alike: a
+  degraded-status reviewer slot now reaches the engine and receives its typed
+  refusal, never a silent api fallback. The harness row's aggregate doctor
+  `status` is NOT a refusal: it describes the default credential store while
+  real accounts live in the engine's credential-profile pool, so admission
+  belongs to the engine — a genuinely empty or exhausted pool answers the start
+  POST with its own typed refusal (INV-135 `credential_pool_exhausted` plus the
+  earliest reset), which under pre-start costs $0 and zero model rounds. The
+  row's `enabled` field IS honored for unpinned routes as `route_disabled`: the
+  engine schema defines it as the OWNER's settings toggle, not an observation
+  (a pinned profile keeps its historical skip — the pin is itself an explicit
+  owner row). The engine's belt capability row (`delegation.available`) is not
+  consulted: Ouroboros runs never request the belt. The remaining typed
+  refusals are `route_not_in_capability_catalog`, `route_disabled` (unpinned),
+  access-profile mismatch, `engine_rejects_delegated_marker`, and positive
+  quota exhaustion for the route's own model.
+- The acceptance packet carries a host-attested `substrate_execution` section —
+  `actual_substrate`, `delegated_runs_*` counters, zero-run facts — read from
+  durable custody rows at packet-build time
+  (`review_evidence._accept_substrate_execution`). VISIBILITY ONLY: zero typed
+  rules tie substrate to the verdict — acceptance judges quality, never the
+  execution route. An unreadable custody log reads `evidence_read_failed`,
+  never a proven-empty substrate.
 - `delegate_wait` is an event-only model sleep. Renew bounded transport windows in
   `delegate_supervision` with zero LLM calls; journal progress may stream to the
   owner but is not a wake. Wake only for terminal/interaction/fault, an addressed
@@ -1298,7 +1372,7 @@ Before every commit, verify the following:
   and replay it rather than advancing the coordination cursor. On wake the nanny retains its full ordinary
   tool surface and inherited parent cognitive route; no-co-building is a
   prompt/review/receipt role contract, not a host allowlist.
-  Actor-first startup and every newly minted meaningful wake carry one fresh
+  Session-child startup receipts and every newly minted meaningful wake carry one fresh
   `coordination_context`: full parent-authored advisory `intent_note`, explicit
   deadline time remaining, known/partial/unknown tree spend, active host-visible
   descendants and root acceptance capacity. Vendor-internal descendants stay opaque.

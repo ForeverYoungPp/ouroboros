@@ -591,7 +591,7 @@ def append_startup_receipt(
             "tokens and never start a duplicate leaf; a replacement start is legal "
             "only after cancellation and terminal settlement are verified."
         )
-    elif receipt_status in {"configured_session_wake", "configured_session_recovered_wake"}:
+    elif receipt_status == "configured_session_recovered_wake":
         guidance = (
             "The receipt proves an existing physical run was started or recovered, "
             "with its wake facts attached. Do not start a duplicate leaf: verify and "
