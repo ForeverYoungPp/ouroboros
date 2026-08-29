@@ -9,12 +9,15 @@ DELEGATE_ACTIVITY_TOOLS = frozenset({
     "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
 })
 
-HOST_COORDINATION_ACTIVITY_TOOLS = frozenset({
-    "schedule_subagent", "wait_task", "wait_tasks", "get_task_result", "peek_task",
-    "tree_note", "tree_read", "verify_and_record", "cancel_task",
-    "discard_child_result", "override_delegation_constraint", "forward_to_worker",
-})
-
+# Only genuine ACTS of delegation reset the burn baseline: starting a physical
+# run or spawning an explicit child (sprint plan D6, owner-approved 2026-08-28;
+# the wait-style treatment of answer/cancel below is the operator's disclosed
+# reading of that plan — "only start/schedule reset" — not a separate owner
+# decision). Supervision verbs advance the round baseline while dollars keep
+# accumulating; coordination verbs are untracked — never a meter reset, and
+# the poltergeist pattern was tens of metered rounds each "paid for" by a
+# cheap tree_read/verify_and_record baseline reset.
+BASELINE_RESET_TOOLS = frozenset({"delegate_start", "schedule_subagent"})
 
 def note_nanny_delegate_activity(
     ctx: Any,
@@ -33,30 +36,32 @@ def note_nanny_delegate_activity(
     mark = {"round": int(round_idx), "cost": cost}
     ctx._nanny_metered_progress = mark
     verbs = set()
-    coordination_verbs = set()
     for call in tool_calls or []:
         fn = call.get("function") if isinstance(call, dict) else None
         name = str((fn or {}).get("name") or "").strip() if isinstance(fn, dict) else ""
-        if name in DELEGATE_ACTIVITY_TOOLS:
+        if name in DELEGATE_ACTIVITY_TOOLS or name in BASELINE_RESET_TOOLS:
             verbs.add(name)
-        if name in HOST_COORDINATION_ACTIVITY_TOOLS:
-            coordination_verbs.add(name)
-    if coordination_verbs:
-        ctx._nanny_coordination_activity = True
-        ctx._nanny_coordination_tools = tuple(sorted(coordination_verbs))
-        ctx._nanny_delegate_baseline = dict(mark)
-        ctx._nanny_reminder_mark = None
-        return
+    # Coordination verbs are deliberately NOT tracked: they neither reset the
+    # meter (charter) nor feed any reader — the unified reminder wording
+    # already counts supervision/coordination rounds toward the burn.
     if not verbs:
         return
-    if verbs == {"delegate_wait"}:
-        # Waiting advances the round baseline but preserves cumulative dollar burn.
+    if verbs & BASELINE_RESET_TOOLS:
+        ctx._nanny_delegate_baseline = dict(mark)
+        # Only a real act of delegation re-arms the reminder from scratch.
+        ctx._nanny_reminder_mark = None
+    else:
+        # Supervision (wait/answer/cancel) advances the round baseline but
+        # preserves cumulative dollar burn — and deliberately KEEPS the
+        # reminder cursor: with dollars accumulating across supervision,
+        # wiping the cursor on every wait/answer would re-fire the reminder
+        # each following round once lifetime burn crosses the threshold
+        # (the adversarial-wave "reminder storm"), bypassing the
+        # threshold-width re-arm and punishing honest waiting harder than
+        # co-building.
         prior = getattr(ctx, "_nanny_delegate_baseline", None)
         prior_cost = float(prior.get("cost") or 0.0) if isinstance(prior, dict) else 0.0
         ctx._nanny_delegate_baseline = {"round": mark["round"], "cost": prior_cost}
-    else:
-        ctx._nanny_delegate_baseline = dict(mark)
-    ctx._nanny_reminder_mark = None
 
 
 def nanny_metered_since_delegate_activity(ctx: Any) -> Tuple[int, float]:
@@ -120,6 +125,10 @@ def nanny_reminder_due(ctx: Any, round_idx: int) -> Tuple[int, float, bool]:
 
 
 def nanny_burn_phrase(rounds: int, cost: float) -> str:
+    if rounds <= 0 and cost > 0:
+        # Supervision advances the round baseline while dollars accumulate, so
+        # "0 rounds (~$2.45)" would be an absurd self-contradiction.
+        return f"~${cost:.2f} of your own metered spend"
     if cost > 0:
         return f"{rounds} of your own metered LLM rounds (~${cost:.2f})"
     return f"{rounds} of your own metered LLM rounds"
@@ -127,7 +136,6 @@ def nanny_burn_phrase(rounds: int, cost: float) -> str:
 
 # Compatibility spellings retained on ``ouroboros.loop`` through imports.
 _DELEGATE_ACTIVITY_TOOLS = DELEGATE_ACTIVITY_TOOLS
-_HOST_COORDINATION_ACTIVITY_TOOLS = HOST_COORDINATION_ACTIVITY_TOOLS
 _note_nanny_delegate_activity = note_nanny_delegate_activity
 _nanny_metered_since_delegate_activity = nanny_metered_since_delegate_activity
 _nanny_reminder_due = nanny_reminder_due

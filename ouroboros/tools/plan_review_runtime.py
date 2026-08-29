@@ -766,7 +766,7 @@ def _slot_session_route(slot: Any) -> Any:
 def _structural_skip_code(reason: str, reset_at: str) -> str:
     """POSITIVE structural evidence only: a dated window exhaustion whose reset is
     still ahead, or a typed dead-pool code. An UNDATED exhaustion, a stale reset and
-    every other reason (route_status_*, transient daemon states, unknown) dispatch —
+    every other reason (route_disabled, transient daemon states, unknown) dispatch —
     the pre-dispatch admission and the run itself refuse typed downstream at ~$0."""
     from ouroboros.gateways.claudexor import WINDOW_EXHAUSTED_CODES
 

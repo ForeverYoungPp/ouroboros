@@ -2828,14 +2828,13 @@ def _maybe_inject_nanny_economics_reminder(
     # activity" — the burn is measured from the task's start, and the wording
     # says so instead of implying an activity that never happened.
     _baseline_known = isinstance(getattr(ctx, "_nanny_delegate_baseline", None), dict)
-    coordination = bool(getattr(ctx, "_nanny_coordination_activity", False))
     if _baseline_known:
         since_phrase = (
-            "since your last delegated-run or host-coordination activity"
-            if coordination else "since your last delegated-run activity"
+            "since your last act of delegation (delegate_start / "
+            "schedule_subagent), supervision included"
         )
     else:
-        since_phrase = "since this task started (no delegated-run activity yet)"
+        since_phrase = "since this task started (no act of delegation yet)"
     # BR1-3: never an unconditional "$0" claim — the owner's wording law is
     # typed cost classes: known-zero only on a settled $0 spend, never "free"
     # unqualified (estimated/undisclosed spend is never zero).
@@ -5337,8 +5336,8 @@ def _forced_delegation_note(tools_ctx: Any, llm_trace: Dict[str, Any]) -> str:
         if rounds >= NANNY_REMINDER_ROUNDS or cost >= NANNY_REMINDER_USD:
             return (
                 "\nNOTE: your delegated run(s) succeeded, but you have since spent "
-                f"{_nanny_burn_phrase(rounds, cost)} with no delegated-run activity. "
-                "Account for that metered spend honestly in your answer."
+                f"{_nanny_burn_phrase(rounds, cost)} beyond your last act of delegation. "
+                "Account for that spend honestly in your answer."
             )
         return ""
     if started > settled:
@@ -5710,18 +5709,21 @@ def _nanny_finalization_message(
             return ""
         return (
             "⚠️ NANNY_METERED_OVERRUN: your delegated run(s) succeeded, but you have "
-            f"since spent {_nanny_burn_phrase(rounds, cost)} with no delegated-run "
-            "activity. A successful run is verified and integrated, not rebuilt. If "
+            f"since spent {_nanny_burn_phrase(rounds, cost)} beyond your last act of "
+            "delegation (supervision included). "
+            "A successful run is verified and integrated, not rebuilt. If "
             "the remaining work is substantive, delegate it (a new delegate_start); "
             "if you are wrapping up, keep the wrap-up short and account for the "
             "metered spend honestly in your result."
         )
     started = int(evidence.get("delegated_runs_started") or 0)
     if not started and (evidence.get("evidence_read_failed") or not evidence):
-        # Zero attempts is an ACCUSATION and needs positively-established
-        # evidence: an unreadable custody log (or a failed read above) proves
-        # nothing (scope finding on a5e59bdf).
-        return ""
+        # Unreadable custody (a5e59bdf): configured -> unknown message; legacy -> silence.
+        from ouroboros.subagent_bootstrap import configured_actor_finalization_message
+
+        _actor = configured_actor_finalization_message(
+            tools._ctx, task_id=str(task_id or ""), fallback_root=drive_root)
+        return _actor or ""
     if not started and (trace_attempted or evidence.get("delegate_start_attempted")):
         # Pending, refused or uncustodied starts are still real attempts.
         return ""
@@ -5756,15 +5758,12 @@ def _nanny_finalization_message(
             "or state in your final answer that the delegated run failed and why "
             "the remaining work ran on metered API tokens."
         )
-    from ouroboros.subagent_bootstrap import (
-        actor_first_coordination_finalization_message,
-    )
+    from ouroboros.subagent_bootstrap import configured_actor_finalization_message
 
-    actor_first = actor_first_coordination_finalization_message(
-        tools._ctx, task_id=str(task_id or ""), fallback_root=drive_root,
-    )
-    if actor_first is not None:
-        return actor_first
+    _actor = configured_actor_finalization_message(
+        tools._ctx, task_id=str(task_id or ""), fallback_root=drive_root)
+    if _actor is not None:
+        return _actor
     return (
         "⚠️ NANNY_DID_NOT_DELEGATE: this task was dispatched onto the delegated "
         "substrate (executor=harness), but you are finalizing with ZERO "

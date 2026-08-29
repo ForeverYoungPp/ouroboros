@@ -68,24 +68,52 @@ test('every accounting field the costs page reads is a field the history endpoin
 
 test('the live progress path forwards every progress field the endpoint emits and the chat UI consumes', () => {
     const emitted = pythonTupleNames(repoFile('ouroboros/gateway/history.py'), '_PROGRESS_META_FIELDS');
-    for (const field of ['executor_route', 'model_lane', 'status', 'subagent_event']) {
+    for (const field of ['executor_route', 'model_lane', 'status', 'subagent_event',
+        'execution_evidence', 'actual_substrate']) {
         assert.ok(emitted.has(field), `${field} is no longer emitted by the history endpoint`);
     }
     // executor_route drives the executor chip in log_events.js; it must reach the
-    // live summarizer, not only the replayed history row.
+    // live summarizer, not only the replayed history row. The evidence/substrate
+    // pair upgrades the same chip at terminal, so the whole trio travels together.
     assert.match(moduleFile('log_events.js'), /evt\?\.executor_route/);
+    assert.match(moduleFile('log_events.js'), /evt\.execution_evidence/);
+    assert.match(moduleFile('log_events.js'), /evt\?\.actual_substrate/);
     // Every LIVE call site that ENUMERATES fields instead of spreading the frame is
     // a whitelist, and a whitelist silently drops whatever it forgot — which is how
     // a chip came back on reload and was missing while the task ran.
     const chat = moduleFile('chat.js');
+    const DELEGATION_KEYS = ['executor_route', 'execution_evidence', 'actual_substrate'];
     const whitelists = chat.split('summarizeChatLiveEvent({').slice(1)
         .map((chunk) => chunk.slice(0, chunk.indexOf('});')))
         .filter((chunk) => !chunk.includes('...evt'));
     assert.ok(whitelists.length > 0, 'no enumerated live call site found — update this test');
     for (const chunk of whitelists) {
         const forwarded = new Set([...chunk.matchAll(/^\s+([a-z_]+):/gm)].map((m) => m[1]));
-        assert.ok(forwarded.has('executor_route'),
-            'a chat.js live whitelist drops executor_route: the chip only appears after a reload');
+        for (const key of DELEGATION_KEYS) {
+            assert.ok(forwarded.has(key),
+                `a chat.js live whitelist drops ${key}: the chip only tells the truth after a reload`);
+        }
+    }
+    // The SECOND whitelist of the same class: routeSubagentTerminalToCard
+    // synthesizes a terminal from the log-channel task_done through an
+    // enumerated updateSubagentCardFromEvent({...}) literal. Forgetting the
+    // delegation keys there keeps a log-channel-only card at "no run yet"
+    // forever — the exact defect family this file was written for.
+    const terminalWhitelists = chat.split('updateSubagentCardFromEvent({').slice(1)
+        .map((chunk) => {
+            // The literal closes with `}, ts)` — cut at its closing brace line so
+            // the scanned chunk is exactly the enumerated field list.
+            const end = chunk.search(/^\s*\},/m);
+            return end === -1 ? chunk : chunk.slice(0, end);
+        });
+    assert.ok(terminalWhitelists.length > 0,
+        'no enumerated updateSubagentCardFromEvent call site found — update this test');
+    for (const chunk of terminalWhitelists) {
+        const forwarded = new Set([...chunk.matchAll(/^\s+([a-z_]+):/gm)].map((m) => m[1]));
+        for (const key of DELEGATION_KEYS) {
+            assert.ok(forwarded.has(key),
+                `the synthesized subagent terminal drops ${key}: a log-channel-only terminal cannot upgrade the chip`);
+        }
     }
 });
 

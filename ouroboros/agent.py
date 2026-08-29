@@ -69,6 +69,8 @@ _worker_boot_lock = threading.Lock()
 from ouroboros.subagent_dispatch_notes import (  # noqa: E402
     dispatch_executor_note,
     executor_blocked_outcome,
+    _fill_executor_blocked_caps,
+    _nanny_route_dispatched_for,
 )
 
 
@@ -349,8 +351,6 @@ def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool, delegate_ac
     ctx._nanny_finalization_injected = False
     ctx._nanny_metered_progress = None
     ctx._nanny_delegate_baseline = ({"round": 0, "cost": 0.0} if delegate_activity_seed else None)
-    ctx._nanny_coordination_activity = False
-    ctx._nanny_coordination_tools = ()
     ctx._nanny_physical_activity_seed = False
     ctx._nanny_reminder_mark = None
 
@@ -972,16 +972,16 @@ class OuroborosAgent:
         # The nanny postcondition's input fact for the loop's finalization seam:
         # THIS task was dispatched onto the delegated substrate. ALL economics
         # marks reset together per dispatch (F4) — defensive, since the
-        # ToolContext above is freshly built per task; see the helper.
-        reset_nanny_economics_marks(self.tools._ctx, route_dispatched=bool(
-            dispatch is not None
-            and dispatch.executor_resolution is not None
-            and dispatch.executor_resolution.executor == "harness"
-        ), delegate_activity_seed=bool(
-            isinstance(getattr(ctx, "_configured_actor_bootstrap", None), dict)
-            and getattr(ctx, "_configured_actor_bootstrap", {}).get("physical_started")
-            or getattr(ctx, "_nanny_physical_activity_seed", False)
-        ))
+        # ToolContext above is freshly built per task; see the helpers.
+        reset_nanny_economics_marks(
+            self.tools._ctx,
+            route_dispatched=_nanny_route_dispatched_for(task, dispatch),
+            delegate_activity_seed=bool(
+                isinstance(getattr(ctx, "_configured_actor_bootstrap", None), dict)
+                and getattr(ctx, "_configured_actor_bootstrap", {}).get("physical_started")
+                or getattr(ctx, "_nanny_physical_activity_seed", False)
+            ),
+        )
 
         budget_remaining = None
         budget_accounting_status = "available"
@@ -1007,14 +1007,8 @@ class OuroborosAgent:
         # rather than a new return value or module-level helper, so synthesis can
         # adopt p34's `SubagentExecutorResolution`/`executor_blocked_outcome` without
         # a same-named twin to dedup here.
-        if dispatch is not None and dispatch.blocked and not startup_wake:
-            _res = dispatch.executor_resolution
-            cap_info["executor_blocked_reason"] = str(
-                (_res.reason if _res is not None else "")
-                or dispatch.delta.reason or "harness_not_configured"
-            )
-            cap_info["executor_blocked_requested"] = str(_res.requested if _res is not None else "harness")
-            cap_info["executor_blocked_reset_at"] = str(_res.reset_at if _res is not None else "")
+        if not startup_wake:
+            _fill_executor_blocked_caps(ctx, cap_info, dispatch)
         self._emit_live_log(
             "context_building_finished",
             task_id=str(task.get("id") or ""),

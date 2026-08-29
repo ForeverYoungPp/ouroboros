@@ -21,7 +21,15 @@ from ouroboros.utils import (
 
 log = logging.getLogger(__name__)
 
-_ZERO_RUN_DECISIONS = frozenset({"complete", "incomplete", "unknown"})
+# The one canonical zero-run decision vocabulary (P7 SSOT), split by contract:
+# WRITE — what an actor may still declare: it did not finish (incomplete) or
+# cannot know (unknown). A zero-run "complete" is unverifiable self-report and
+# stopped being writable under the charter (owner 2026-08-28).
+# READ — hydration additionally keeps historical "complete" receipts valid:
+# they still fence a second physical start on the same actor; the terminal
+# projection degrades them to unknown-with-disclosure instead of clean.
+ZERO_RUN_WRITE_DECISIONS = ("incomplete", "unknown")
+ZERO_RUN_READ_DECISIONS = frozenset({"complete", *ZERO_RUN_WRITE_DECISIONS})
 
 
 def terminal_zero_run_receipt(
@@ -35,7 +43,7 @@ def terminal_zero_run_receipt(
     valid = (
         receipt.get("zero_run") is True
         and str(receipt.get("status") or "") == "declared"
-        and str(receipt.get("zero_run_decision") or "") in _ZERO_RUN_DECISIONS
+        and str(receipt.get("zero_run_decision") or "") in ZERO_RUN_READ_DECISIONS
         and bool(str(receipt.get("zero_run_basis") or "").strip())
         and receipt.get("physical_run_started") is False
     )

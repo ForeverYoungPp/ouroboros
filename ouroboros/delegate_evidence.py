@@ -34,6 +34,13 @@ NANNY_NUDGE_STAMP = "delegate_run_nanny_nudge_injected"
 # two together answer "did the nanny TRY?" without a new scan.
 START_BLOCKED = "delegate_run_start_blocked"
 
+# The host's pre-start found the dispatch BLOCKED (charter D2): a typed,
+# task-scoped attempt row. The ``delegate_run`` prefix is LOAD-BEARING —
+# ``delegate_custody._iter_rows`` prefilters rows to that prefix, so an
+# unprefixed spelling is invisible to every evidence reader (delta finding D1:
+# the first spelling of this row was exactly that dead letter).
+STARTUP_FAULT = "delegate_run_configured_startup_fault"
+
 
 def record_start_blocked(ctx: Any, task_id: str, reason: str) -> None:
     """Durably record "delegate_start was attempted and refused typed".
@@ -110,7 +117,9 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
             # gets the fact from the scan it already pays for (B3).
             nudge_recorded = True
             continue
-        if str(row.get("type") or "") in (START_BLOCKED, custody.START_REQUESTED):
+        if str(row.get("type") or "") in (
+            START_BLOCKED, STARTUP_FAULT, custody.START_REQUESTED,
+        ):
             # An ATTEMPT is evidence of obedience even when nothing started:
             # a typed pre-mint refusal (START_BLOCKED) or a durable request
             # whose POST then failed (START_REQUESTED with no STARTED row).
@@ -210,3 +219,120 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
 
 __all__ = ["NANNY_NUDGE_STAMP", "START_BLOCKED", "record_nanny_nudge_stamp",
            "record_start_blocked", "task_execution_evidence"]
+
+
+def acceptance_substrate_facts(ctx: Any, task_id: str) -> Dict[str, Any]:
+    """Substrate FACTS for the task under review, from durable custody rows.
+
+    Acceptance used to see substrate truth only through the terminal result
+    envelope — written AFTER acceptance runs — so a harness-dispatched task was
+    always judged as if it ran as scheduled. Custody rows are durable and
+    complete before finalization, so the packet reads them directly. FACTS
+    ONLY, never a verdict rule (owner 2026-08-28: acceptance judges quality,
+    not the execution route — these rows are context, they gate nothing).
+    Empty for tasks never dispatched toward the delegated substrate.
+    """
+    bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+    if not bool(getattr(ctx, "_nanny_route_dispatched", False)) and not isinstance(
+        bootstrap, dict,
+    ):
+        return {}
+    out: Dict[str, Any] = {}
+    try:
+        from ouroboros.delegate_custody import custody_root
+        from ouroboros.subagents import actual_substrate
+
+        evidence = task_execution_evidence(custody_root(ctx), str(task_id or ""))
+        evidence = evidence if isinstance(evidence, dict) else {}
+        if evidence.get("evidence_read_failed"):
+            # Unreadable custody must not read as a proven-empty substrate —
+            # neither the enum NOR the zero-valued counters (which would be
+            # exactly the proven-empty reading beside the flag).
+            out["evidence_read_failed"] = True
+        else:
+            out["actual_substrate"] = actual_substrate(evidence)
+            for key in (
+                "delegated_runs_started", "delegated_runs_settled",
+                "delegated_runs_succeeded", "delegated_runs_failed",
+                "delegated_runs_source_unresolved",
+            ):
+                out[key] = int(evidence.get(key) or 0)
+            if evidence.get("delegate_start_attempted"):
+                # Durable start-blocked/requested rows: an ATTEMPT is evidence
+                # of obedience even when nothing started (plan D8: start-blocked
+                # facts ride the packet, not only the run counters).
+                out["delegate_start_attempted"] = True
+        failure_states = [
+            str(s) for s in (evidence.get("delegated_run_failure_states") or [])
+        ]
+        if failure_states:
+            out["delegated_run_failure_states"] = failure_states[:12]
+            if len(failure_states) > 12:
+                # Bounded but DISCLOSED (P1): never a silent truncation.
+                out["failure_states_omitted"] = len(failure_states) - 12
+        if evidence.get("subscription_cost_usd") is not None:
+            out["subscription_cost_usd"] = evidence.get("subscription_cost_usd")
+    except Exception:
+        log.debug("Failed to read substrate custody evidence for acceptance", exc_info=True)
+        return {"evidence_read_failed": True}
+    if isinstance(bootstrap, dict):
+        out["configured_session"] = True
+        if bootstrap.get("zero_run_receipt_recorded"):
+            out["zero_run_decision"] = str(bootstrap.get("zero_run_decision") or "")
+            out["zero_run_basis"] = str(bootstrap.get("zero_run_basis") or "")
+        if bootstrap.get("route_available") is False:
+            out["route_available"] = False
+    refusal = getattr(ctx, "_configured_startup_refusal", None)
+    if isinstance(refusal, dict):
+        out["startup_refused"] = str(refusal.get("reason") or "")
+    return out
+
+
+_ACCEPT_DELTA_CHILD_CAP = 20  # reduced-children rows in the finalizer aggregate
+
+
+def acceptance_capability_deltas(drive_root: Any, task_id: str, root_task_id: str) -> Dict[str, Any]:
+    """Typed aggregate of capability reductions for the FINALIZER (one section).
+
+    The task's own dispatch delta plus every DIRECT child that ran below what
+    was asked for (lane served on Main, executor fallback to metered tokens,
+    profile reduction). Each delta is disclosed at absorption — but absorption
+    happens mid-flight, dozens of rounds before the final claim is written, and
+    nothing carried the accumulated picture to finalization: a result built on
+    degraded runs was judged as if everything ran as scheduled. One bounded,
+    host-attested section; ``disclosable_capability_delta`` is the SAME predicate
+    the absorption surfaces use, so this cannot disagree with what the parent
+    was told. Empty dict when nothing was reduced (noise-free by construction).
+    """
+    from ouroboros.task_results import load_task_result
+    from ouroboros.task_status import find_child_tasks
+    from ouroboros.tools.control import disclosable_capability_delta
+
+    out: Dict[str, Any] = {}
+    try:
+        own = disclosable_capability_delta(load_task_result(drive_root, task_id) or {})
+        if own:
+            out["own"] = own
+        children: List[Dict[str, Any]] = []
+        for row in find_child_tasks(
+            drive_root,
+            parent_task_id=task_id,
+            root_task_id=root_task_id or task_id,
+            scope="direct",
+        ):
+            delta = disclosable_capability_delta(row)
+            if delta:
+                children.append({
+                    "task_id": str(row.get("task_id") or ""),
+                    "status": str(row.get("status") or ""),
+                    "capability_delta": delta,
+                })
+        if children:
+            out["children_reduced_count"] = len(children)
+            if len(children) > _ACCEPT_DELTA_CHILD_CAP:
+                out["children_omitted"] = len(children) - _ACCEPT_DELTA_CHILD_CAP
+                children = children[:_ACCEPT_DELTA_CHILD_CAP]
+            out["children"] = children
+    except Exception:
+        log.debug("Failed to aggregate capability deltas for acceptance evidence", exc_info=True)
+    return out

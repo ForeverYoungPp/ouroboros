@@ -1616,19 +1616,23 @@ def _finish_task_done_dispatch(
     )
 
     if task_id and str(task.get("delegation_role") or "") == "subagent":
-        try:
-            raw_chat = int(task.get("chat_id") or 0)
-        except (TypeError, ValueError):
-            raw_chat = 0
-        chat_id = _bound_project_chat_id(
-            ctx, task_id, task.get("parent_task_id"), task.get("root_task_id")
-        ) or raw_chat
-        if chat_id:
-            effective_result = (
-                final_task_result
-                or load_task_result(ctx.DRIVE_ROOT, str(task_id or ""))
-                or {}
-            )
+        effective_result = (
+            final_task_result
+            or load_task_result(ctx.DRIVE_ROOT, str(task_id or ""))
+            or {}
+        )
+        from supervisor.message_bus import notification_chat_route
+        from supervisor.subagent_task_truth import enrich_task_done_event
+
+        _envelope = enrich_task_done_event(task_done_event, effective_result)
+        # Membership, not truthiness (C4): chat 0 real, negative A2A.
+        chat_id = notification_chat_route(
+            _bound_project_chat_id(
+                ctx, task_id, task.get("parent_task_id"), task.get("root_task_id")
+            ) or None,
+            task.get("chat_id"),
+        )
+        if chat_id is not None:
             status = str(
                 effective_result.get("status")
                 or evt.get("status")
@@ -1692,11 +1696,9 @@ def _finish_task_done_dispatch(
                 # upgrades from the neutral "dispatched" decision to what actually ran.
                 "executor_route": str(effective_result.get("executor_route") or ""),
             }
-            _envelope = effective_result.get("subagent_envelope")
-            if isinstance(_envelope, dict) and isinstance(_envelope.get("execution_evidence"), dict):
+            if isinstance(_envelope.get("execution_evidence"), dict):
                 progress_meta["execution_evidence"] = _envelope["execution_evidence"]
-            if isinstance(_envelope, dict) and _envelope.get("actual_substrate"):
-                # The FACT beside the plan (Q1A): harness_used / harness_attempted / native_only.
+            if _envelope.get("actual_substrate"):
                 progress_meta["actual_substrate"] = str(_envelope["actual_substrate"])
             if isinstance(task_done_event.get("outcome_axes"), dict):
                 progress_meta["outcome_axes"] = task_done_event["outcome_axes"]

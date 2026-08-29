@@ -326,6 +326,7 @@ def test_terminal_frame_field_rides_the_history_replay_allowlist():
 
     assert "execution_evidence" in _PROGRESS_META_FIELDS
     assert "executor_route" in _PROGRESS_META_FIELDS
+    assert "actual_substrate" in _PROGRESS_META_FIELDS
 
 
 def test_run_timing_reads_the_started_row(tmp_path):
@@ -375,3 +376,102 @@ class TestEvidenceReadHonesty:
             {"reasoning_notes": [], "tool_calls": []}, "done", msgs, lambda *_: None,
         ) is False
         assert not any("NANNY" in m.get("content", "") for m in msgs)
+
+
+class TestTerminalFrameDelivery:
+    """The supervisor seam that DELIVERS the evidence to the card.
+
+    ``_finish_task_done_dispatch`` is the one producer of the subagent terminal
+    chat frame the executor chip upgrades from, and of the log-channel
+    ``task_done`` the client falls back to. Routing is MEMBERSHIP, not
+    truthiness (``notification_chat_route``): chat 0 is the Skill Review panel
+    — a real destination the old ``if chat_id:`` guard silently dropped, so a
+    panel-bound card kept its dispatch-only chip forever — and a negative id is
+    A2A traffic that must never enter a human stream.
+    """
+
+    @staticmethod
+    def _ctx(tmp_path, sent):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            DRIVE_ROOT=tmp_path, RUNNING={}, PENDING=[], WORKERS={},
+            send_with_budget=lambda cid, _text, **kw: sent.append(
+                (cid, kw.get("progress_meta") or {})),
+            persist_queue_snapshot=lambda **_k: True,
+            bridge=SimpleNamespace(push_log=lambda _e: None),
+        )
+
+    @staticmethod
+    def _result():
+        return {
+            "status": "completed",
+            "executor_route": "codex=gpt-5.6-sol",
+            "subagent_envelope": {
+                "execution_evidence": {
+                    "delegated_runs_started": 1, "delegated_runs_settled": 1,
+                    "delegated_runs_succeeded": 1, "delegated_runs_failed": 0,
+                },
+                "actual_substrate": "harness_used",
+            },
+        }
+
+    def _dispatch(self, tmp_path, sent, chat_id, monkeypatch, bound=0):
+        from supervisor import events as events_mod
+
+        monkeypatch.setattr(
+            events_mod, "_bound_project_chat_id", lambda *_a, **_k: bound)
+        task = {
+            "id": "child-1", "chat_id": chat_id, "parent_task_id": "root-1",
+            "root_task_id": "root-1", "delegation_role": "subagent",
+            "role": "researcher",
+        }
+        task_done_event = {
+            "type": "task_done", "task_id": "child-1", "status": "completed",
+        }
+        events_mod._finish_task_done_dispatch(
+            {}, self._ctx(tmp_path, sent), task_id="child-1", worker_id=0,
+            task=task, final_task_result=self._result(),
+            task_done_event=task_done_event,
+        )
+        return task_done_event
+
+    def test_panel_chat_zero_receives_the_terminal_evidence_frame(
+            self, tmp_path, monkeypatch):
+        sent: list = []
+        self._dispatch(tmp_path, sent, chat_id=0, monkeypatch=monkeypatch)
+        assert [cid for cid, _m in sent] == [0]
+        meta = sent[0][1]
+        assert meta["executor_route"] == "codex=gpt-5.6-sol"
+        assert meta["execution_evidence"]["delegated_runs_settled"] == 1
+        assert meta["actual_substrate"] == "harness_used"
+
+    def test_project_binding_precedes_the_task_chat(self, tmp_path, monkeypatch):
+        # The binding's own 0 means "no binding" (never the panel) and falls
+        # through; a real binding wins over the task's chat.
+        sent: list = []
+        self._dispatch(tmp_path, sent, chat_id=0, monkeypatch=monkeypatch,
+                       bound=4242)
+        assert [cid for cid, _m in sent] == [4242]
+
+    def test_a2a_chat_never_receives_a_human_frame(self, tmp_path, monkeypatch):
+        sent: list = []
+        self._dispatch(tmp_path, sent, chat_id=-1001, monkeypatch=monkeypatch)
+        assert sent == []
+
+    def test_unbound_task_sends_no_frame(self, tmp_path, monkeypatch):
+        sent: list = []
+        self._dispatch(tmp_path, sent, chat_id=None, monkeypatch=monkeypatch)
+        assert sent == []
+
+    def test_log_channel_task_done_carries_the_delegation_truth(
+            self, tmp_path, monkeypatch):
+        # routeSubagentTerminalToCard upgrades a log-channel-only card, so the
+        # pushed task_done must carry the same delegation keys as the chat
+        # frame (additive; stamped after the durable events.jsonl append).
+        sent: list = []
+        evt = self._dispatch(tmp_path, sent, chat_id=None,
+                             monkeypatch=monkeypatch)
+        assert evt["executor_route"] == "codex=gpt-5.6-sol"
+        assert evt["execution_evidence"]["delegated_runs_succeeded"] == 1
+        assert evt["actual_substrate"] == "harness_used"

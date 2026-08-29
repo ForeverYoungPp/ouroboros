@@ -20,6 +20,7 @@ from ouroboros._outcome_receipts import (
     CHECK_RENDERING_DECLARED_TEXT,
     CHECK_RENDERING_SHLEX_JOIN,
 )
+from ouroboros.outcome_receipt_store import ZERO_RUN_WRITE_DECISIONS
 from ouroboros.outcomes import append_verification_receipt
 from ouroboros.platform_layer import bootstrap_process_path
 from ouroboros.shell_parse import normalize_check_argv
@@ -67,7 +68,9 @@ _CONTRACT_KINDS = (
     "delegation_zero_run",
 )
 _RUN_KINDS = frozenset({"visible_verifier", "explicit_command", "explicit_metric"})
-_ZERO_RUN_DECISIONS = ("complete", "incomplete", "unknown")
+# WRITE vocabulary only — hydration reads keep historical "complete" valid
+# through ZERO_RUN_READ_DECISIONS in the same SSOT module.
+_ZERO_RUN_DECISIONS = ZERO_RUN_WRITE_DECISIONS
 # How `expected` is matched against the check output. `substring` is the DEFAULT
 # and keeps the historical behavior byte-identical when the param is omitted.
 # `bytes_equal` (v6.60.0) compares TWO FILES byte-for-byte (artifact_paths[0] vs
@@ -790,7 +793,7 @@ def get_tools() -> List[ToolEntry]:
                 "(run `check`, pass when the `expected` metric string appears) · artifact_observation (the host "
                 "confirms the declared artifact_paths exist) · no_visible_machine_contract (honest escape hatch: "
                 "no machine check exists; your best proxy + risk is recorded for review) · delegation_zero_run "
-                "(configured actor-first only: record a typed complete/incomplete/unknown decision when no "
+                "(configured session actors only: record a typed incomplete/unknown decision when no "
                 "physical leaf was started, with zero_run_decision and zero_run_basis). Recording a receipt "
                 "suppresses the receipt_absent transparency flag on a clean turn. ANTI-CHEAT: verify ONLY against "
                 "PUBLIC task info — the instruction text, examples embedded in it, installed oracles, and your own "

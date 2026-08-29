@@ -4458,14 +4458,10 @@ def test_finalize_run_manifest_records_a_typed_outcome_on_every_exit_path(tmp_pa
     assert _extra()["exit_code"] == 1
 
 
-# --------------------------------------------------------------------------- #
-# The structural launcher gate (devtools/benchmarks/common/launcher_audit.py)
-#
-# The guard used to live here as test-local `ast` helpers, and that is why it only ever knew
-# about ONE launcher shape and ONE hop of LOCAL helpers. It is now a module: the same entry
-# point audits the real launchers and a SYNTHETIC violating one, which is the only way to
-# tell "the gate works" from "today's code happens to be clean".
-# --------------------------------------------------------------------------- #
+# The structural launcher gate (devtools/benchmarks/common/launcher_audit.py).
+# Formerly test-local `ast` helpers knowing ONE launcher shape and ONE hop of
+# LOCAL helpers; now a module auditing the real launchers plus a SYNTHETIC
+# violating one — the only way to tell "the gate works" from "clean today".
 
 # A synthetic launcher-shaped module for pinning the pre-admission resolver itself.
 # Deliberately not a real launcher: the gate's BEHAVIOUR is what must not regress.
