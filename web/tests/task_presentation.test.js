@@ -68,6 +68,17 @@ test('live task_done and replay/log task truth have phase and headline parity', 
     );
 });
 
+test('typed terminal status drives an error phase on live and replay cards', () => {
+    const failed = { task_terminal_status: 'failed' };
+    assert.equal(taskTerminalPhase(failed), 'error');
+    assert.equal(taskDoneIsTerminal(failed), true);
+    assert.match(
+        chatSource,
+        /finishLiveCard\(taskId, msg\.task_terminal_status \? taskTerminalPhase\(msg\) : replayTerminalPhase\(taskState, record\)\);/,
+    );
+    assert.match(chatSource, /finishLiveCard\(explicitTaskId, taskTerminalPhase\(msg\)\);/);
+});
+
 test('interrupted task_done remains retryable and cannot finish a root card', () => {
     const evt = {
         type: 'task_done', status: 'interrupted',
@@ -90,6 +101,19 @@ test('interrupted task_done remains retryable and cannot finish a root card', ()
         status: 'completed',
         root_phase_checkpoint: { post_task_synthesis: 'running' },
     }), false);
+});
+
+test('review lifecycle timeout and error are terminal lifecycle errors', () => {
+    for (const status of ['timeout', 'error']) {
+        const view = summarizeChatLiveEvent({
+            type: 'send_message',
+            is_progress: true,
+            task_id: 'review-task',
+            lifecycle: { kind: 'review', status, target: 'alpha', error: 'transport failed' },
+        });
+        assert.equal(view.phase, 'lifecycle_error', status);
+        assert.equal(view.terminal, true, status);
+    }
 });
 
 test('owner soft-stop is factual Done and keeps its marker in details', () => {
@@ -239,7 +263,7 @@ test('history replay keeps open summaries live and terminal fallbacks factual', 
     } }), 'error');
     assert.equal(replayTerminalPhase({ completedPhase: 'warn' }, {}), 'warn');
     assert.equal(
-        [...chatSource.matchAll(/finishLiveCard\(taskId, replayTerminalPhase\(taskState, record\)\)/g)].length,
+        [...chatSource.matchAll(/finishLiveCard\(taskId, msg\.task_terminal_status \? taskTerminalPhase\(msg\) : replayTerminalPhase\(taskState, record\)\);/g)].length,
         2,
     );
     assert.doesNotMatch(

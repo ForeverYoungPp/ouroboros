@@ -31,6 +31,11 @@ SETTINGS_PATH = pathlib.Path(os.environ.get("OUROBOROS_SETTINGS_PATH", DATA_DIR 
 PID_FILE = pathlib.Path(os.environ.get("OUROBOROS_PID_FILE", APP_ROOT / "ouroboros.pid"))
 PORT_FILE = pathlib.Path(os.environ.get("OUROBOROS_PORT_FILE", DATA_DIR / "state" / "server_port"))
 
+# Settings pin + write guards: SSOT settings_integrity; re-exported for config.X imports.
+from ouroboros import settings_integrity as _settings_integrity  # noqa: E402
+SETTINGS_INTEGRITY_ENV = _settings_integrity.SETTINGS_INTEGRITY_ENV
+SettingsIntegrityError = _settings_integrity.SettingsIntegrityError
+
 RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 AGENT_SERVER_PORT = 8765
@@ -50,20 +55,7 @@ SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC = 90
 
 
 def _guard_live_settings_write() -> None:
-    if os.environ.get("OUROBOROS_ALLOW_LIVE_DATA_TESTS") == "1":
-        return
-    try:
-        live_settings = SETTINGS_PATH.resolve(strict=False) == (
-            HOME / "Ouroboros" / "data" / "settings.json"
-        ).resolve(strict=False)
-    except OSError:
-        live_settings = False
-    if ("PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules) and live_settings:
-        raise RuntimeError(
-            "Refusing to write live Ouroboros settings.json from pytest. "
-            "Set OUROBOROS_SETTINGS_PATH/OUROBOROS_DATA_DIR to a temp path, "
-            "or OUROBOROS_ALLOW_LIVE_DATA_TESTS=1 for an explicit live-data test."
-        )
+    _settings_integrity.guard_live_settings_write(SETTINGS_PATH, HOME)
 
 
 # Settings defaults
@@ -779,8 +771,8 @@ def _bounded_positive_int_setting(key: str, *, default: int, hard_max: int, min_
     return max(min_value, min(parsed, hard_max))
 
 
-# ONE per-root subagent ceiling (v6.82: 50->500): clamp below, supervisor/events.py, wait_tasks; ARCHITECTURE §7.
-MAX_ACTIVE_SUBAGENTS_HARD_CAP = 500
+# Per-root active-child ceiling (v6.82: 50->500) and absolute host-visible nesting ceiling, used by supervisor gates and ARCHITECTURE §7.
+MAX_ACTIVE_SUBAGENTS_HARD_CAP, MAX_SUBAGENT_DEPTH_HARD_CAP = 500, 10
 
 
 def get_max_active_subagents_per_root() -> int:
@@ -797,7 +789,7 @@ def get_max_subagent_depth() -> int:
     return _bounded_positive_int_setting(
         "OUROBOROS_MAX_SUBAGENT_DEPTH",
         default=int(SETTINGS_DEFAULTS["OUROBOROS_MAX_SUBAGENT_DEPTH"]),
-        hard_max=10,
+        hard_max=MAX_SUBAGENT_DEPTH_HARD_CAP,
         min_value=0,
     )
 
@@ -907,10 +899,11 @@ def _settings_flag_enabled(key: str) -> bool:
     applies without a restart, while env still seeds a key the file never mentions."""
     raw = None
     try:
-        if SETTINGS_PATH.exists():
-            disk = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-            if isinstance(disk, dict) and key in disk:
-                raw = disk.get(key)
+        disk = _settings_integrity.read_settings_json_verified(SETTINGS_PATH)
+        if isinstance(disk, dict) and key in disk:
+            raw = disk.get(key)
+    except SettingsIntegrityError:
+        raise
     except Exception:
         raw = None
     if raw is None:
@@ -1300,6 +1293,11 @@ def _coerce_setting_value(key: str, value):
     return str(value or "")
 
 
+def verify_settings_integrity() -> str | None:
+    """Verify the strict child pin, returning the observed digest when present."""
+    return _settings_integrity.verify_settings_integrity(SETTINGS_PATH)
+
+
 # Load / Save
 # Setting keys a release DELETED. `load_settings` keeps unrecognized keys so a rename never destroys
 # an owner customization — which would otherwise leave a removed key living in data/settings.json
@@ -1346,22 +1344,24 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
     compatibility migration is persisted only while that lock is held; the write contains
     the raw mapping plus the normalized pair, never a defaults-merged settings document."""
     loaded: dict = {}
-    if SETTINGS_PATH.exists():
-        try:
-            raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                raw = normalize_and_persist_context_mode_compat(
-                    raw,
-                    settings_path=SETTINGS_PATH,
-                    lock_held=_settings_lock_held,
-                    guard_live_write=_guard_live_settings_write,
-                )
-                loaded = {
-                    key: _coerce_setting_value(key, value) if key in SETTINGS_DEFAULTS else value
-                    for key, value in raw.items()
-                }
-        except Exception:
-            pass
+    try:
+        raw = _settings_integrity.read_settings_json_verified(SETTINGS_PATH)
+    except SettingsIntegrityError:
+        raise
+    except Exception:
+        raw = None
+    if raw is not None:
+        if isinstance(raw, dict):
+            raw = normalize_and_persist_context_mode_compat(
+                raw,
+                settings_path=SETTINGS_PATH,
+                lock_held=_settings_lock_held,
+                guard_live_write=_guard_live_settings_write,
+            )
+            loaded = {
+                key: _coerce_setting_value(key, value) if key in SETTINGS_DEFAULTS else value
+                for key, value in raw.items()
+            }
     # Rename-alias migration: fold deprecated per-subsystem retention keys into the unified
     # OUROBOROS_GC_RETENTION_DAYS, then drop the legacy keys. Prefer a CUSTOMIZED legacy value
     # so a rename never orphans it; an all-defaults file collapses to the unified default.

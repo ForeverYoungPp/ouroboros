@@ -313,13 +313,15 @@ def test_cancelable_marker_is_lineage_gated_at_emission(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_cancellation_globals_endpoint(monkeypatch):
+def _isolate_cancellation_globals_endpoint(monkeypatch, tmp_path):
     """Same module-global rule as tests/test_cancel_cascade_v664.py: these tests
     drive the real cascade path, so the process-global fence registries must be
     reset around each one or a later test enqueuing a task with a common id is
     refused with root_cancelled."""
+    import supervisor.queue as queue
     import supervisor.task_lifecycle as tl
 
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(tl, "CANCELLED_ROOT_FENCES", {}, raising=False)
 
 
@@ -417,6 +419,63 @@ def test_cascade_ingress_mints_the_cascade_scope_itself(tmp_path, monkeypatch):
         "the ingress-minted intent must already carry the cascade scope"
     )
     assert seen.get("source") == "http_cascade"
+
+
+def test_plain_stop_now_executes_an_existing_durable_cascade(tmp_path, monkeypatch):
+    """The raw body is only an ingress request; durable scope is authoritative.
+
+    Omitting ``cascade=true`` while hardening a graceful cascade must execute
+    the existing cascade immediately, never replay it as a narrower single
+    cancellation.
+    """
+    import ouroboros.gateway.tasks as tasks_mod
+    import supervisor.queue as queue
+
+    from ouroboros import cancel_intents as ci
+
+    _isolate_queue(monkeypatch, tmp_path, [
+        {"id": "root", "chat_id": 0, "root_task_id": "root"},
+        {
+            "id": "kid",
+            "chat_id": 0,
+            "root_task_id": "root",
+            "parent_task_id": "root",
+        },
+    ])
+    graceful = ci.request_cancel(
+        tmp_path,
+        "root",
+        reason="finish before stopping the tree",
+        source="http_cascade",
+        scope=ci.SCOPE_CASCADE,
+        requested_stop_policy=ci.STOP_POLICY_FINALIZE,
+    )
+    cascades: list[str] = []
+    monkeypatch.setattr(
+        tasks_mod,
+        "_run_cascade_cancel",
+        lambda task_id: cascades.append(task_id) or True,
+    )
+    monkeypatch.setattr(
+        queue,
+        "cancel_task_custody",
+        lambda *_args, **_kwargs: pytest.fail(
+            "durable cascade scope must not enter single-task custody"
+        ),
+    )
+
+    with _client(tmp_path) as client:
+        response = client.post("/api/tasks/root/cancel")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "task_id": "root", "cascade": True}
+    assert cascades == ["root"]
+    hardened = ci.active_intent(tmp_path, "root")
+    assert hardened is not None
+    assert hardened["request_id"] == graceful["request_id"]
+    assert hardened["scope"] == ci.SCOPE_CASCADE
+    assert ci.stop_policy(hardened) == ci.STOP_POLICY_IMMEDIATE
+    assert set(ci.active_intents(tmp_path)) == {"root"}
 
 
 def test_cascade_over_a_settled_root_leaves_a_replayable_intent_on_crash(tmp_path, monkeypatch):

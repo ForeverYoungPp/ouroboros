@@ -290,6 +290,292 @@ def _kill_and_confirm_worker_dead(proc: Any, worker_id: int, task_id: str) -> bo
         return False
 
 
+def _retain_reaper_terminalization_custody(
+    q: Any,
+    rows: list[tuple[Dict[str, Any], str]],
+    *,
+    reason: str,
+) -> list[str]:
+    """Keep failed terminal writes in the existing non-dispatchable custody."""
+    from supervisor import workers
+
+    retained_ids: list[str] = []
+    with q._queue_lock:
+        for source_task, raw_task_id in rows:
+            target_id = str(raw_task_id or "").strip()
+            if not target_id or target_id in q.RUNNING:
+                continue
+            if any(
+                isinstance(row, dict)
+                and str(row.get("id") or "") == target_id
+                and isinstance(row.get("_terminalization_retry"), dict)
+                for row in q.PENDING
+            ):
+                retained_ids.append(target_id)
+                continue
+            marker = workers._retain_terminalization_retry_task(
+                source_task,
+                target_id,
+                reason=reason,
+                status="failed",
+                trigger="reaper_retry_terminal_persistence",
+            )
+            q.PENDING.append(marker)
+            retained_ids.append(target_id)
+        if retained_ids:
+            q.sort_pending()
+    if retained_ids:
+        try:
+            q.persist_queue_snapshot(reason="reaper_terminalization_retry")
+        except Exception:
+            log.warning(
+                "Reaper: failed to persist terminalization custody for %s",
+                retained_ids,
+                exc_info=True,
+            )
+    return retained_ids
+
+
+def _run_retry_admission_transaction(
+    q: Any,
+    task: Dict[str, Any],
+    retried: Dict[str, Any],
+    *,
+    task_id: str,
+    retry_task_id: str,
+    terminal_reason: str,
+    recon_fields: Dict[str, Any],
+    runtime_sec: float,
+    unreconciled_runs: Optional[list],
+    salvage_note: str,
+) -> tuple[Dict[str, str], str]:
+    """Publish one retry admission under the queue -> cancel lock order."""
+    from ouroboros.task_results import (
+        STATUS_CANCELLED,
+        STATUS_FAILED,
+        STATUS_INTERRUPTED,
+        STATUS_SCHEDULED,
+        _TRULY_TERMINAL_STATUSES,
+        load_task_result,
+        write_task_result,
+    )
+
+    admitted: Dict[str, Any] = {}
+    admission_selected = False
+    suppression: Dict[str, str] = {}
+    admission_block = ""
+    try:
+        from ouroboros.cancel_intents import (
+            _validated_retry_root_cancel_key,
+            active_intents,
+            cancellation_projection_lock,
+        )
+
+        # Match assignment's lock order (queue -> cancel projection). Holding
+        # only the projection lock while enqueue_task takes the queue lock would
+        # invert _drop_cancelled_pending and deadlock with ordinary dispatch.
+        with q._queue_lock:
+            with cancellation_projection_lock(q.DRIVE_ROOT):
+                intents = active_intents(q.DRIVE_ROOT, strict=True)
+                if not isinstance(intents, dict):
+                    raise TypeError(
+                        "cancel-intent authority returned a non-object projection"
+                    )
+                current = load_task_result(q.DRIVE_ROOT, task_id, strict=True) or {}
+                current_status = str(current.get("status") or "")
+                if current_status in _TRULY_TERMINAL_STATUSES:
+                    suppression = {
+                        "kind": "terminal_result",
+                        "target": task_id,
+                        "status": current_status,
+                    }
+                else:
+                    retry_root = _validated_retry_root_cancel_key(
+                        q.DRIVE_ROOT, task_id, task_hint=task,
+                    )
+                    cancel_target = next(
+                        (
+                            candidate
+                            for candidate in dict.fromkeys(
+                                (task_id, retry_task_id, retry_root)
+                            )
+                            if candidate and candidate in intents
+                        ),
+                        "",
+                    )
+                    if cancel_target:
+                        # The worker was already kill+join confirmed before
+                        # this final boundary.  Cancellation arrived after the
+                        # timeout decision but before retry publication: the
+                        # physical attempt therefore keeps its honest timeout
+                        # failure, while the owner's intent wins admission of
+                        # the successor.  Terminalize NOW, under the same
+                        # queue->cancel lock pair, so a concurrent cascade can
+                        # never settle the logical intent over a non-live row
+                        # still claiming RUNNING.
+                        stored_current = write_task_result(
+                            q.DRIVE_ROOT,
+                            task_id,
+                            STATUS_FAILED,
+                            strict_existing_dict=True,
+                            reason_code=terminal_reason,
+                            outcome_axes=terminal_outcome_axes(
+                                lifecycle=STATUS_FAILED,
+                                execution=EXECUTION_INFRA_FAILED,
+                                reason_code=terminal_reason,
+                                review_trigger="supervisor_terminal",
+                            ),
+                            **(
+                                {"delegated_runs_unreconciled": unreconciled_runs}
+                                if unreconciled_runs else {}
+                            ),
+                            **recon_fields,
+                            result=(
+                                f"Task killed by {terminal_reason} after "
+                                f"{int(runtime_sec)}s. Retry suppressed because "
+                                "cancellation won the admission boundary."
+                                + str(salvage_note or "")
+                            ),
+                        )
+                        stored_status = str(stored_current.get("status") or "")
+                        if stored_status not in _TRULY_TERMINAL_STATUSES:
+                            raise RuntimeError(
+                                "cancel-suppressed physical retry did not settle"
+                            )
+                        suppression = {
+                            "kind": "cancel_intent",
+                            "target": cancel_target,
+                        }
+                    else:
+                        admission_selected = True
+                        admitted = q.enqueue_task(retried, front=True)
+                if admission_selected:
+                    admission_block = (
+                        str(admitted.get("_admission_blocked") or "")
+                        if isinstance(admitted, dict) else ""
+                    )
+                    if not admission_block:
+                        try:
+                            if retry_task_id and retry_task_id != task_id:
+                                write_task_result(
+                                    q.DRIVE_ROOT,
+                                    retry_task_id,
+                                    STATUS_SCHEDULED,
+                                    strict_existing_dict=True,
+                                    reason_code=f"{terminal_reason}_retry_scheduled",
+                                    outcome_axes=terminal_outcome_axes(
+                                        lifecycle=STATUS_SCHEDULED,
+                                        execution="pending",
+                                        reason_code=f"{terminal_reason}_retry_scheduled",
+                                        review_trigger="supervisor_terminal",
+                                    ),
+                                    supersedes_task_id=task_id,
+                                    original_task_id=task_id,
+                                    result=f"Retry scheduled after {terminal_reason}.",
+                                    parent_task_id=task.get("parent_task_id"),
+                                    root_task_id=task.get("root_task_id") or task_id,
+                                    delegation_role=task.get("delegation_role"),
+                                    timeout_retry_from=task_id,
+                                    timeout_retry_at=utc_now_iso(),
+                                    description=task.get("description"),
+                                    context=task.get("context"),
+                                    workspace_root=task.get("workspace_root"),
+                                    workspace_mode=task.get("workspace_mode"),
+                                    memory_mode=task.get("memory_mode"),
+                                    metadata=(
+                                        task.get("metadata")
+                                        if isinstance(task.get("metadata"), dict) else {}
+                                    ),
+                                )
+                            stored_old = write_task_result(
+                                q.DRIVE_ROOT,
+                                task_id,
+                                STATUS_INTERRUPTED,
+                                strict_existing_dict=True,
+                                reason_code=f"{terminal_reason}_retry",
+                                outcome_axes=terminal_outcome_axes(
+                                    lifecycle=STATUS_INTERRUPTED,
+                                    execution=EXECUTION_INFRA_FAILED,
+                                    reason_code=f"{terminal_reason}_retry",
+                                    review_trigger="supervisor_terminal",
+                                ),
+                                superseded_by=(
+                                    retry_task_id
+                                    if retry_task_id and retry_task_id != task_id else ""
+                                ),
+                                retry_task_id=retry_task_id or task_id,
+                                **(
+                                    {"delegated_runs_unreconciled": unreconciled_runs}
+                                    if unreconciled_runs else {}
+                                ),
+                                **recon_fields,
+                                result=(
+                                    f"Task killed by {terminal_reason} after "
+                                    f"{int(runtime_sec)}s. Retrying."
+                                    + str(salvage_note or "")
+                                ),
+                            )
+                            stored_status = str(stored_old.get("status") or "")
+                            if stored_status in _TRULY_TERMINAL_STATUSES:
+                                suppression = {
+                                    "kind": "terminal_result",
+                                    "target": task_id,
+                                    "status": stored_status,
+                                }
+                                admission_block = "terminal_result_race"
+                            elif stored_status != STATUS_INTERRUPTED:
+                                raise RuntimeError(
+                                    "historical retry result did not become interrupted"
+                                )
+                        except Exception:
+                            admission_block = "retry_result_persistence_failed"
+                            log.error(
+                                "Reaper: retry result publication failed for %s -> %s",
+                                task_id,
+                                retry_task_id,
+                                exc_info=True,
+                            )
+                        if admission_block:
+                            for index, row in enumerate(list(q.PENDING)):
+                                if row is admitted:
+                                    q.PENDING.pop(index)
+                                    break
+                            if suppression and retry_task_id and retry_task_id != task_id:
+                                retry_terminal = write_task_result(
+                                    q.DRIVE_ROOT,
+                                    retry_task_id,
+                                    STATUS_CANCELLED,
+                                    strict_existing_dict=True,
+                                    reason_code="terminal_result_retry_suppressed",
+                                    outcome_axes=terminal_outcome_axes(
+                                        lifecycle=STATUS_CANCELLED,
+                                        execution=STATUS_CANCELLED,
+                                        reason_code="terminal_result_retry_suppressed",
+                                        review_trigger="supervisor_terminal",
+                                    ),
+                                    supersedes_task_id=task_id,
+                                    original_task_id=task_id,
+                                    timeout_retry_from=task_id,
+                                    result=(
+                                        "Retry was cancelled before admission because "
+                                        "the original attempt had already settled."
+                                    ),
+                                )
+                                suppression["retry_status"] = str(
+                                    retry_terminal.get("status") or ""
+                                )
+    except Exception:
+        admission_block = "cancel_intent_authority_unreadable"
+        log.error(
+            "Reaper: retry admission could not prove cancel-intent authority "
+            "for %s -> %s",
+            task_id,
+            retry_task_id,
+            exc_info=True,
+        )
+    return suppression, admission_block
+
+
 def _enqueue_retry(
     q: Any,
     task: Dict[str, Any],
@@ -299,9 +585,23 @@ def _enqueue_retry(
     attempt: int,
     terminal_reason: str,
     recon_fields: Dict[str, Any],
-) -> tuple[bool, int, str]:
-    """Enqueue a dead task's retry or terminalize a typed fence refusal."""
-    from ouroboros.task_results import STATUS_FAILED, write_task_result
+    runtime_sec: float = 0.0,
+    unreconciled_runs: Optional[list] = None,
+    salvage_note: str = "",
+) -> tuple[bool, int, str, Dict[str, str]]:
+    """Atomically admit a dead task's retry or suppress it.
+
+    The queue row and reciprocal result lineage are published only inside the
+    final queue->cancel locked transition.  If cancellation/terminal truth wins
+    the boundary, no successor result or historical link is created.  If retry
+    admission wins, a later SINGLE cancel resolves the complete durable chain
+    under the same projection lock and targets the physical leaf.
+    """
+    from ouroboros.task_results import (
+        STATUS_FAILED,
+        load_task_result,
+        write_task_result,
+    )
 
     retried = dict(task)
     retried["original_task_id"] = task_id
@@ -329,6 +629,7 @@ def _enqueue_retry(
             message = (
                 "Retry refused because durable task inputs could not be carried "
                 "to the new physical task id."
+                + str(salvage_note or "")
             )
             log.error(
                 "Reaper: %s handoff failed for retry %s -> %s: %s",
@@ -363,14 +664,37 @@ def _enqueue_retry(
                 original_task_id=task_id,
                 result=message,
             )
-            return False, attempt, blocked_reason
-    admitted = q.enqueue_task(retried, front=True)
-    admission_block = (
-        str(admitted.get("_admission_blocked") or "")
-        if isinstance(admitted, dict) else ""
+            return False, attempt, blocked_reason, {}
+    suppression, admission_block = _run_retry_admission_transaction(
+        q,
+        task,
+        retried,
+        task_id=task_id,
+        retry_task_id=retry_task_id,
+        terminal_reason=terminal_reason,
+        recon_fields=recon_fields,
+        runtime_sec=runtime_sec,
+        unreconciled_runs=unreconciled_runs,
+        salvage_note=salvage_note,
     )
+
+    if suppression:
+        if retry_task_id and retry_task_id != task_id:
+            cleanup_task_mailbox(q._task_drive_for_task(task, task_id), retry_task_id)
+            shutil.rmtree(
+                task_artifact_dir_path(
+                    q._task_drive_for_task(task, task_id), retry_task_id,
+                ),
+                ignore_errors=True,
+            )
+        reason = (
+            "cancel_pending_retry_suppressed"
+            if suppression.get("kind") == "cancel_intent"
+            else "terminal_result_retry_suppressed"
+        )
+        return False, attempt, reason, suppression
     if not admission_block:
-        return True, attempt + 1, terminal_reason
+        return True, attempt + 1, terminal_reason, {}
     if retry_task_id and retry_task_id != task_id:
         cleanup_task_mailbox(q._task_drive_for_task(task, task_id), retry_task_id)
         shutil.rmtree(
@@ -387,28 +711,198 @@ def _enqueue_retry(
         reason_code=blocked_reason,
         review_trigger="supervisor_terminal",
     )
-    message = f"Retry blocked by the active {admission_block} admission fence."
-    write_task_result(
-        q.DRIVE_ROOT,
-        task_id,
-        STATUS_FAILED,
-        reason_code=blocked_reason,
-        outcome_axes=outcome,
-        **recon_fields,
-        result=message,
+    message = (
+        f"Retry blocked by the active {admission_block} admission fence."
+        + str(salvage_note or "")
     )
-    if retry_task_id and retry_task_id != task_id:
+    terminalization_rows: list[tuple[Dict[str, Any], str]] = []
+    try:
         write_task_result(
             q.DRIVE_ROOT,
-            retry_task_id,
+            task_id,
             STATUS_FAILED,
             reason_code=blocked_reason,
             outcome_axes=outcome,
-            supersedes_task_id=task_id,
-            original_task_id=task_id,
+            **recon_fields,
             result=message,
         )
-    return False, attempt, blocked_reason
+    except Exception:
+        terminalization_rows.append((task, task_id))
+        log.error(
+            "Reaper: terminal retry-suppression write failed for %s",
+            task_id,
+            exc_info=True,
+        )
+    if retry_task_id and retry_task_id != task_id:
+        try:
+            retry_exists = isinstance(
+                load_task_result(q.DRIVE_ROOT, retry_task_id, strict=True), dict,
+            )
+        except Exception:
+            retry_exists = False
+        if retry_exists:
+            try:
+                write_task_result(
+                    q.DRIVE_ROOT,
+                    retry_task_id,
+                    STATUS_FAILED,
+                    reason_code=blocked_reason,
+                    outcome_axes=outcome,
+                    supersedes_task_id=task_id,
+                    original_task_id=task_id,
+                    result=message,
+                )
+            except Exception:
+                terminalization_rows.append((retried, retry_task_id))
+                log.error(
+                    "Reaper: retry-leaf terminal suppression write failed for %s",
+                    retry_task_id,
+                    exc_info=True,
+                )
+    if terminalization_rows:
+        try:
+            retained = _retain_reaper_terminalization_custody(
+                q,
+                terminalization_rows,
+                reason=message,
+            )
+        except Exception:
+            # A second failure must not collapse this into the ordinary
+            # no-retry path: that path publishes task_done even though no
+            # terminal row exists.  Keep a typed suppression result so the
+            # caller withholds the event; any marker appended before the
+            # exception remains available to the existing assignment-time
+            # terminalization retry.
+            retained = []
+            log.error(
+                "Reaper: failed to retain terminalization custody for %s",
+                [target_id for _task, target_id in terminalization_rows],
+                exc_info=True,
+            )
+        return False, attempt, blocked_reason, {
+            "kind": "terminal_persistence_failed",
+            "targets": ",".join(
+                retained
+                or [target_id for _task, target_id in terminalization_rows]
+            ),
+        }
+    return False, attempt, blocked_reason, {}
+
+
+def _settle_retry_cancel_handoff(
+    q: Any, task_id: str, retry_task_id: str, cancel_target: str,
+) -> Dict[str, str]:
+    """Give a cancel that won retry admission custody of every physical id.
+
+    Retry admission was suppressed before successor publication.  Route the
+    winning intent through its existing policy owner: cascade keeps the subtree
+    postcondition, graceful stop gets its policy-aware hold, and an immediate
+    single request uses ordinary custody.  No second intent is minted.
+    """
+    outcomes: Dict[str, str] = {}
+    if not cancel_target:
+        return outcomes
+    try:
+        from ouroboros.cancel_intents import (
+            SCOPE_CASCADE,
+            active_intent,
+        )
+        from supervisor.owner_stop import (
+            OWNER_STOP_HOLDING,
+            sweep_owner_stop_hold,
+        )
+        import time as _time
+
+        intent = active_intent(q.DRIVE_ROOT, cancel_target) or {}
+        if str(intent.get("scope") or "") == SCOPE_CASCADE:
+            outcomes[cancel_target] = (
+                q.CANCEL_CANCELLED
+                if q.cancel_task_by_id(cancel_target, cascade=True)
+                else q.CANCEL_FAILED
+            )
+        elif sweep_owner_stop_hold(
+            q, cancel_target, intent, now=_time.time(),
+        ):
+            outcomes[cancel_target] = OWNER_STOP_HOLDING
+        else:
+            outcomes[cancel_target] = str(q.cancel_task_custody(cancel_target))
+    except Exception:
+        outcomes[cancel_target] = "failed"
+        log.error(
+            "Reaper: cancellation custody failed for suppressed retry id %s",
+            cancel_target,
+            exc_info=True,
+        )
+    return outcomes
+
+
+def _emit_cancel_suppressed_retry_task_done(
+    q: Any,
+    workers_mod: Any,
+    task: Dict[str, Any],
+    task_id: str,
+    task_type: str,
+    cancel_target: str,
+    handoff_outcomes: Dict[str, str],
+    terminal_metadata: Any,
+) -> bool:
+    """Publish only the physical terminal event after cancel handoff is durable.
+
+    The cascade owns the one owner-facing summary, so this deliberately does
+    not call the self-finalized delivery helper.  The fast-path card event is
+    safe only after the winning intent has left the active projection (which
+    proves its answer/summary was durably owed) and the physical retry row is
+    settled.
+    """
+    outcome = str(handoff_outcomes.get(cancel_target) or "")
+    if outcome not in {q.CANCEL_CANCELLED, q.CANCEL_ALREADY_SETTLED}:
+        return False
+    try:
+        from ouroboros.cancel_intents import active_intent
+        from ouroboros.cost_projection import carry_cost_meta
+        from ouroboros.task_results import load_task_result
+        from ouroboros.task_status import SETTLED_STATUSES
+
+        if active_intent(q.DRIVE_ROOT, cancel_target, strict=True) is not None:
+            return False
+        stored = load_task_result(q.DRIVE_ROOT, task_id, strict=True) or {}
+        status = str(stored.get("status") or "")
+        if status not in SETTLED_STATUSES:
+            return False
+        cost_fields = carry_cost_meta(stored)
+        if not cost_fields:
+            cost_fields = q.reconstruct_task_cost(task_id, fields=True)
+        workers_mod.get_event_q().put({
+            "type": "task_done",
+            "task_id": task_id,
+            "task_type": task_type,
+            "chat_id": (
+                int(task.get("chat_id") or 0)
+                if isinstance(task, dict) else 0
+            ),
+            "status": status,
+            "reason_code": str(stored.get("reason_code") or ""),
+            "outcome_axes": (
+                dict(stored["outcome_axes"])
+                if isinstance(stored.get("outcome_axes"), dict)
+                else terminal_outcome_axes(
+                    lifecycle=status,
+                    execution=EXECUTION_INFRA_FAILED,
+                    reason_code=str(stored.get("reason_code") or status),
+                    review_trigger="supervisor_terminal",
+                )
+            ),
+            **cost_fields,
+            "metadata": terminal_metadata,
+        })
+        return True
+    except Exception:
+        log.warning(
+            "Reaper: failed to publish cancel-suppressed task_done for %s",
+            task_id,
+            exc_info=True,
+        )
+        return False
 
 
 def _incident_chat_id(task: Any, owner_chat_id: int) -> Optional[int]:
@@ -621,6 +1115,62 @@ def _finish_self_finalized_task(
         log.debug("Reaper: failed to emit task_done for self-finalized %s", task_id, exc_info=True)
 
 
+def _load_post_kill_terminal_result(
+    q: Any, task: Dict[str, Any], task_id: str,
+) -> tuple[str, Optional[Dict[str, Any]]]:
+    """Return terminal truth that won the worker-death boundary, if any."""
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+
+    self_status = ""
+    existing: Optional[Dict[str, Any]] = None
+    try:
+        existing = load_task_result(q.DRIVE_ROOT, task_id)
+        if existing and str(existing.get("status") or "") in _TRULY_TERMINAL_STATUSES:
+            self_status = str(existing.get("status") or "")
+    except Exception:
+        log.debug("Reaper: post-kill terminal re-check failed for %s", task_id, exc_info=True)
+    # Forked/workspace/subagent tasks self-finalize on the CHILD drive and are copied back
+    # only on task_done; a worker that died after writing its child result but before
+    # copy-back would be missed by the parent-drive check above. Mirror the child result
+    # back and honor it (no interrupted/failed clobber, no duplicate retry).
+    if not self_status:
+        try:
+            from ouroboros.headless import copy_child_task_result
+
+            child = copy_child_task_result(pathlib.Path(q.DRIVE_ROOT), task)
+            if child and str(child.get("status") or "") in _TRULY_TERMINAL_STATUSES:
+                existing = child
+                self_status = str(child.get("status") or "")
+        except Exception:
+            log.debug("Reaper: child-drive terminal re-check failed for %s", task_id, exc_info=True)
+    return self_status, existing
+
+
+def _respawn_after_reap(q: Any, workers_mod: Any, worker_id: int) -> None:
+    """Reopen a reaped slot, leaving crash recovery available on failure."""
+    # respawn_worker owns the lifecycle race with shutdown and starts the child
+    # outside _queue_lock, so a fork can never inherit the RLock from this thread.
+    try:
+        workers_mod.respawn_worker(worker_id)
+    except Exception:
+        log.warning(
+            "Reaper: respawn failed for worker %d; clearing reaping for recovery",
+            worker_id,
+            exc_info=True,
+        )
+        try:
+            with q._queue_lock:
+                worker = workers_mod.WORKERS.get(worker_id)
+                if worker is not None:
+                    worker.reaping = False
+        except Exception:
+            pass
+    try:
+        q.persist_queue_snapshot(reason="worker_respawn_after_reap")
+    except Exception:
+        log.debug("Reaper: failed to persist queue snapshot after respawn", exc_info=True)
+
+
 def reap_timed_out_task(job: Dict[str, Any]) -> None:
     """Full teardown for a timed-out task, run OFF the supervisor loop (Variant A).
 
@@ -696,37 +1246,13 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
 
     from ouroboros.task_results import (
         STATUS_FAILED,
-        STATUS_INTERRUPTED,
-        STATUS_SCHEDULED,
-        _TRULY_TERMINAL_STATUSES,
         load_task_result,
         write_task_result,
     )
 
     # 2. POST-KILL already-terminal re-check: the worker may have self-finalized right at
     #    the boundary. The process is dead now, so this decision is final.
-    self_status = ""
-    _existing = None
-    try:
-        _existing = load_task_result(_q.DRIVE_ROOT, task_id)
-        if _existing and str(_existing.get("status") or "") in _TRULY_TERMINAL_STATUSES:
-            self_status = str(_existing.get("status") or "")
-    except Exception:
-        log.debug("Reaper: post-kill terminal re-check failed for %s", task_id, exc_info=True)
-    # Forked/workspace/subagent tasks self-finalize on the CHILD drive and are copied back
-    # only on task_done; a worker that died after writing its child result but before
-    # copy-back would be missed by the parent-drive check above. Mirror the child result
-    # back and honor it (no interrupted/failed clobber, no duplicate retry).
-    if not self_status:
-        try:
-            from ouroboros.headless import copy_child_task_result
-
-            _child = copy_child_task_result(pathlib.Path(_q.DRIVE_ROOT), task)
-            if _child and str(_child.get("status") or "") in _TRULY_TERMINAL_STATUSES:
-                _existing = _child
-                self_status = str(_child.get("status") or "")
-        except Exception:
-            log.debug("Reaper: child-drive terminal re-check failed for %s", task_id, exc_info=True)
+    self_status, _existing = _load_post_kill_terminal_result(_q, task, task_id)
 
     if self_status:
         _finish_self_finalized_task(
@@ -771,59 +1297,43 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
         except Exception:
             log.debug("Reaper: retry reset failed for killed task %s", task_id, exc_info=True)
 
-        try:
-            write_task_result(
-                _q.DRIVE_ROOT, task_id,
-                STATUS_INTERRUPTED if will_retry else STATUS_FAILED,
-                reason_code=f"{terminal_reason}_retry" if will_retry else terminal_reason,
-                outcome_axes=terminal_outcome_axes(
-                    lifecycle=STATUS_INTERRUPTED if will_retry else STATUS_FAILED,
-                    execution=EXECUTION_INFRA_FAILED,
-                    reason_code=f"{terminal_reason}_retry" if will_retry else terminal_reason,
-                    review_trigger="supervisor_terminal",
-                ),
-                superseded_by=retry_task_id if retry_task_id and retry_task_id != task_id else "",
-                retry_task_id=retry_task_id if retry_task_id else "",
-                # GR5-2: the reap outcome discloses the delegated runs the
-                # custody reconcile above could not settle.
-                **({"delegated_runs_unreconciled": unreconciled} if unreconciled else {}),
-                **recon_fields,
-                result=(
-                    f"Task killed by {terminal_reason} after {int(runtime_sec)}s. Retrying."
-                    if will_retry
-                    else f"Task killed by {terminal_reason} after {int(runtime_sec)}s.{salvage_note}"
-                ),
-            )
-            if will_retry and retry_task_id and retry_task_id != task_id:
+        if not will_retry:
+            try:
                 write_task_result(
-                    _q.DRIVE_ROOT, retry_task_id, STATUS_SCHEDULED,
-                    reason_code=f"{terminal_reason}_retry_scheduled",
+                    _q.DRIVE_ROOT, task_id,
+                    STATUS_FAILED,
+                    reason_code=terminal_reason,
                     outcome_axes=terminal_outcome_axes(
-                        lifecycle=STATUS_SCHEDULED, execution="pending",
-                        reason_code=f"{terminal_reason}_retry_scheduled",
+                        lifecycle=STATUS_FAILED,
+                        execution=EXECUTION_INFRA_FAILED,
+                        reason_code=terminal_reason,
                         review_trigger="supervisor_terminal",
                     ),
-                    supersedes_task_id=task_id, original_task_id=task_id,
-                    result=f"Retry scheduled after {terminal_reason}.",
-                    parent_task_id=task.get("parent_task_id"), root_task_id=task.get("root_task_id") or task_id,
-                    delegation_role=task.get("delegation_role"), timeout_retry_from=task_id,
-                    timeout_retry_at=utc_now_iso(),
-                    description=task.get("description"), context=task.get("context"),
-                    workspace_root=task.get("workspace_root"), workspace_mode=task.get("workspace_mode"),
-                    memory_mode=task.get("memory_mode"),
-                    metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
+                    # GR5-2: the reap outcome discloses the delegated runs the
+                    # custody reconcile above could not settle.
+                    **({"delegated_runs_unreconciled": unreconciled} if unreconciled else {}),
+                    **recon_fields,
+                    result=(
+                        f"Task killed by {terminal_reason} after "
+                        f"{int(runtime_sec)}s.{salvage_note}"
+                    ),
                 )
-        except Exception:
-            log.error("Reaper: failed to write terminal result for %s; retry suppressed", task_id, exc_info=True)
-            will_retry = False
+            except Exception:
+                log.error(
+                    "Reaper: failed to write terminal result for %s",
+                    task_id,
+                    exc_info=True,
+                )
 
         # 4. Enqueue the retry ONLY now (original is dead) — no concurrent execution.
         #    Guarded so an enqueue failure cannot abort the reaper before respawn.
         requeued = False
         new_attempt = attempt
+        retry_suppression: Dict[str, str] = {}
+        cancel_handoff_outcomes: Dict[str, str] = {}
         if will_retry:
             try:
-                requeued, new_attempt, terminal_reason = _enqueue_retry(
+                requeued, new_attempt, terminal_reason, retry_suppression = _enqueue_retry(
                     _q,
                     task,
                     task_id=task_id,
@@ -831,10 +1341,60 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                     attempt=attempt,
                     terminal_reason=terminal_reason,
                     recon_fields=recon_fields,
+                    runtime_sec=runtime_sec,
+                    unreconciled_runs=unreconciled,
+                    salvage_note=salvage_note,
                 )
                 will_retry = requeued
             except Exception:
                 log.warning("Reaper: failed to enqueue retry for %s", task_id, exc_info=True)
+        if retry_suppression.get("kind") == "cancel_intent":
+            cancel_target = str(retry_suppression.get("target") or "")
+            cancel_handoff_outcomes = _settle_retry_cancel_handoff(
+                _q,
+                task_id,
+                retry_task_id,
+                cancel_target,
+            )
+            _emit_cancel_suppressed_retry_task_done(
+                _q,
+                workers_mod,
+                task,
+                task_id,
+                task_type,
+                cancel_target,
+                cancel_handoff_outcomes,
+                terminal_metadata,
+            )
+        elif retry_suppression.get("kind") == "terminal_result":
+            try:
+                terminal_target = str(
+                    retry_suppression.get("target") or task_id
+                )
+                terminal_row = load_task_result(
+                    _q.DRIVE_ROOT, terminal_target,
+                ) or {}
+                _finish_self_finalized_task(
+                    _q,
+                    workers_mod,
+                    task,
+                    task_id,
+                    task_type,
+                    str(
+                        terminal_row.get("status")
+                        or retry_suppression.get("status")
+                        or ""
+                    ),
+                    terminal_row,
+                    terminal_metadata,
+                    unreconciled,
+                )
+            except Exception:
+                log.warning(
+                    "Reaper: final retry-admission terminal recovery failed for %s",
+                    task_id,
+                    exc_info=True,
+                )
 
         try:
             append_jsonl(
@@ -846,6 +1406,11 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                     "heartbeat_lag_sec": round(hb_lag_sec, 2), "heartbeat_stale": hb_stale,
                     "attempt": attempt, "requeued": requeued, "new_attempt": new_attempt,
                     "max_retries": _q.QUEUE_MAX_RETRIES, "reaped_off_loop": True,
+                    **({"retry_suppression": retry_suppression} if retry_suppression else {}),
+                    **(
+                        {"cancel_handoff_outcomes": cancel_handoff_outcomes}
+                        if cancel_handoff_outcomes else {}
+                    ),
                 },
             )
         except Exception:
@@ -865,7 +1430,20 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                         is_progress=True, task_id=task_id,
                         progress_meta={"task_incident": "task_reaper_retry", "toast_once": incident_toast_once},
                     )
-                else:
+                elif retry_suppression.get("kind") == "cancel_intent":
+                    send_with_budget(
+                        incident_chat_id,
+                        f"🛑 {terminal_reason}: task {task_id} killed after {int(runtime_sec)}s.\n"
+                        "Its retry was suppressed because cancellation won the "
+                        "admission race; cancellation custody is settling the task.",
+                        is_progress=True,
+                        task_id=task_id,
+                        progress_meta={
+                            "task_incident": "task_reaper_cancel_suppressed_retry",
+                            "toast_once": incident_toast_once,
+                        },
+                    )
+                elif not retry_suppression:
                     stop_detail = _stop_detail(ceiling_reached, deadline_reached, orchestrator)
                     send_with_budget(
                         incident_chat_id,
@@ -877,7 +1455,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
             except Exception:
                 log.debug("Reaper: failed to send owner notification for %s", task_id, exc_info=True)
 
-        if not requeued:
+        if not requeued and not retry_suppression:
             # AR2-5a ordering: salvage first (it registers the answer as OWED in
             # the durable outbox), only then task_done — see _emit_reap_task_done.
             _deliver_reap_salvage(_q, task, task_id, terminal_reason, unreconciled)
@@ -886,22 +1464,6 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                 recon_fields, terminal_metadata,
             )
 
-    # 5. Respawn a fresh worker for the slot; on failure, CLEAR reaping so the crash detector
-    #    can recover the slot on a later tick instead of stranding it permanently.
-    #    respawn_worker owns the lifecycle race with shutdown and starts the child
-    #    outside _queue_lock, so a fork can never inherit the RLock from this thread.
-    try:
-        workers_mod.respawn_worker(worker_id)
-    except Exception:
-        log.warning("Reaper: respawn failed for worker %d; clearing reaping for recovery", worker_id, exc_info=True)
-        try:
-            with _q._queue_lock:
-                _w = workers_mod.WORKERS.get(worker_id)
-                if _w is not None:
-                    _w.reaping = False
-        except Exception:
-            pass
-    try:
-        _q.persist_queue_snapshot(reason="worker_respawn_after_reap")
-    except Exception:
-        log.debug("Reaper: failed to persist queue snapshot after respawn", exc_info=True)
+    # 5. Respawn a fresh worker for the slot; on failure, clear reaping so the
+    # crash detector can recover it instead of leaving a permanently held slot.
+    _respawn_after_reap(_q, workers_mod, worker_id)

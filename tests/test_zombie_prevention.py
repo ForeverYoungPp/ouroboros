@@ -8,6 +8,8 @@ Covers:
 import json
 from unittest import mock
 
+import pytest
+
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +76,37 @@ def test_write_failure_result_none_task_id(tmp_path):
     results_dir = tmp_path / "task_results"
     if results_dir.exists():
         assert list(results_dir.iterdir()) == [], "Files created for None/empty task_id"
+
+
+def test_write_failure_result_rejects_a_writer_identity_mismatch(tmp_path, monkeypatch):
+    """A terminal writer must return the same task identity it was asked to store."""
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        "ouroboros.task_results.write_task_result",
+        lambda *_args, **_kwargs: {"task_id": "another-task", "status": "completed"},
+    )
+
+    with pytest.raises(ValueError, match="invalid durable identity"):
+        workers._write_failure_result("identity-victim")
+
+
+def test_write_failure_result_returns_status_won_by_a_concurrent_terminal_writer(
+    tmp_path, monkeypatch,
+):
+    """A completion that wins during the pre-read must drive the emitted status."""
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        "ouroboros.task_results.write_task_result",
+        lambda *_args, **_kwargs: {
+            "task_id": "race-victim", "status": "completed", "result": "done",
+        },
+    )
+
+    assert workers._write_failure_result("race-victim") == "completed"
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +186,266 @@ def test_kill_workers_writes_failure_for_running_and_pending(tmp_path):
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["status"] == "failed"
         assert data["task_id"] == tid
+
+
+def test_kill_workers_retains_pending_when_failure_result_is_not_durable(
+    tmp_path, monkeypatch,
+):
+    import supervisor.workers as workers
+    import supervisor.queue as queue
+
+    task = {"id": "bad/id", "type": "task", "depth": -1}
+    pending = [task]
+    snapshots = []
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(
+        queue,
+        "persist_queue_snapshot",
+        lambda reason="": snapshots.append((reason, [dict(row) for row in queue.PENDING])),
+    )
+    monkeypatch.setattr(
+        workers,
+        "_write_failure_result",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    workers.kill_workers(reconcile_delegate_custody=False)
+
+    assert [row["id"] for row in pending] == [task["id"]]
+    retry = pending[0]["_terminalization_retry"]
+    assert retry["status"] == "failed"
+    assert retry["trigger"] == "pending_pool_kill"
+    assert pending[0]["depth"] == -1
+    assert snapshots[0][0] == "kill_workers"
+    assert snapshots[0][1][0]["_terminalization_retry"] == retry
+
+
+def test_kill_workers_keeps_pending_cancel_custody_when_claim_release_fails(
+    tmp_path, monkeypatch,
+):
+    """Shutdown cannot discard a marker while its cancellation claim is live."""
+    from ouroboros import cancel_intents as ci
+    from ouroboros.task_results import STATUS_CANCELLED, write_task_result
+    import supervisor.workers as workers
+    import supervisor.queue as queue
+
+    pending = []
+    task_id = "kill-cancel-claim"
+    task = {"id": task_id, "chat_id": 0}
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(queue, "RUNNING", {})
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda **_kw: True)
+    write_task_result(tmp_path, task_id, "scheduled")
+    ci.request_cancel(tmp_path, task_id)
+    claim = ci.claim_intent(tmp_path, task_id, owner="pending_drop")
+    task["_terminalization_retry"] = {
+        "status": STATUS_CANCELLED,
+        "reason": "event retry",
+        "trigger": "pending_cancel_event",
+        "reconcile_delegate_custody": False,
+        "claim_request_id": claim["request_id"],
+        "claim_owner": "pending_drop",
+        "claim_generation": claim["generation"],
+        "claim_pid": claim["claim_pid"],
+    }
+    pending.append(task)
+    emitted = []
+    monkeypatch.setattr(workers, "_write_failure_result", lambda *_a, **_k: STATUS_CANCELLED)
+    monkeypatch.setattr(
+        workers, "_emit_task_done_terminal", lambda *a, **_k: emitted.append(a) or True,
+    )
+    real_release = ci.release_claim
+    monkeypatch.setattr(ci, "release_claim", lambda *_a, **_k: False)
+
+    workers.kill_workers(
+        preserve_pending=True,
+        archive_service_logs=False,
+        reconcile_delegate_custody=False,
+    )
+    assert [row["id"] for row in pending] == [task_id]
+    assert pending[0]["_terminalization_retry"]["event_published"] is True
+    assert ci.active_intent(tmp_path, task_id)["state"] == ci.INTENT_CLAIMED
+    assert len(emitted) == 1
+
+    monkeypatch.setattr(ci, "release_claim", real_release)
+    assert workers._retry_terminalization_pending() == ([task_id], [])
+    assert pending == []
+    assert ci.active_intent(tmp_path, task_id)["state"] == ci.INTENT_REQUESTED
+    assert len(emitted) == 1, "the durable event marker suppresses a duplicate"
+
+
+def test_kill_workers_retains_running_custody_when_failure_result_is_not_durable(
+    tmp_path, monkeypatch,
+):
+    import supervisor.workers as workers
+    import supervisor.queue as queue
+
+    task = {"id": "running-write-fails", "type": "task", "depth": 0}
+    pending = []
+    running = {
+        task["id"]: {"task": task, "worker_id": 0},
+    }
+    snapshots = []
+    emitted = []
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "RUNNING", running)
+    monkeypatch.setattr(queue, "RUNNING", running)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(
+        queue,
+        "persist_queue_snapshot",
+        lambda reason="": snapshots.append(
+            (reason, [dict(row) for row in queue.PENDING], dict(queue.RUNNING))
+        ),
+    )
+    monkeypatch.setattr(
+        workers,
+        "_write_failure_result",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(
+        workers,
+        "_emit_task_done_terminal",
+        lambda *args, **kwargs: emitted.append((args, kwargs)) or True,
+    )
+
+    workers.kill_workers(reconcile_delegate_custody=False)
+
+    assert running == {}
+    assert [row["id"] for row in pending] == [task["id"]]
+    retry = pending[0]["_terminalization_retry"]
+    assert retry["status"] == "failed"
+    assert retry["trigger"] == "worker_pool_kill"
+    assert "disk full" not in retry["reason"]
+    assert emitted == []
+    assert snapshots[-1][0] == "kill_workers"
+    assert snapshots[-1][1][0]["_terminalization_retry"] == retry
+    assert snapshots[-1][2] == {}
+
+    writes = []
+    monkeypatch.setattr(
+        workers,
+        "_audit_delegate_terminal_custody",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        workers,
+        "_write_failure_result",
+        lambda task_id, **kwargs: writes.append((task_id, kwargs)) or "failed",
+    )
+    monkeypatch.setattr(
+        workers,
+        "_emit_task_done_terminal",
+        lambda task_row, task_id, status: emitted.append((task_id, status)) or True,
+    )
+    assert workers._retry_terminalization_pending() == ([task["id"]], [])
+    assert pending == []
+    assert writes[0][0] == task["id"]
+    assert emitted == [(task["id"], "failed")]
+
+
+def test_kill_workers_retains_pending_when_status_is_not_terminal(
+    tmp_path, monkeypatch,
+):
+    import supervisor.workers as workers
+    import supervisor.queue as queue
+
+    task = {"id": "interrupted-pending", "type": "task"}
+    pending = [task]
+    snapshots = []
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(
+        queue,
+        "persist_queue_snapshot",
+        lambda reason="": snapshots.append((reason, [dict(row) for row in queue.PENDING])),
+    )
+    monkeypatch.setattr(workers, "_write_failure_result", lambda *_args, **_kwargs: "interrupted")
+    monkeypatch.setattr(workers, "_emit_task_done_terminal", lambda *_args, **_kwargs: True)
+
+    workers.kill_workers(
+        terminal_status="interrupted",
+        reconcile_delegate_custody=False,
+    )
+
+    assert [row["id"] for row in pending] == [task["id"]]
+    retry = pending[0]["_terminalization_retry"]
+    assert retry["status"] == "interrupted"
+    assert retry["trigger"] == "pending_pool_kill"
+    assert snapshots[0][0] == "kill_workers"
+    assert snapshots[0][1][0]["_terminalization_retry"] == retry
+
+
+def test_kill_workers_preserves_interrupted_pending_when_terminal_event_fails(
+    tmp_path, monkeypatch,
+):
+    import supervisor.workers as workers
+    import supervisor.queue as queue
+
+    parent_id = "interrupted-parent"
+    child = {
+        "id": "interrupted-child",
+        "type": "task",
+        "parent_task_id": parent_id,
+        "root_task_id": parent_id,
+        "depth": 0,
+    }
+    pending = [child]
+    running = {
+        parent_id: {
+            "task": {"id": parent_id, "root_task_id": parent_id, "type": "task"},
+            "worker_id": 0,
+        },
+    }
+    snapshots = []
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "RUNNING", running)
+    monkeypatch.setattr(queue, "RUNNING", running)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(
+        queue,
+        "persist_queue_snapshot",
+        lambda reason="": snapshots.append((reason, [dict(row) for row in queue.PENDING])),
+    )
+    monkeypatch.setattr(workers, "_write_failure_result", lambda *_args, **_kwargs: "cancelled")
+    monkeypatch.setattr(
+        workers,
+        "_emit_task_done_terminal",
+        lambda _task, task_id, *_args, **_kwargs: task_id == parent_id,
+    )
+
+    workers.kill_workers(
+        preserve_pending=True,
+        archive_service_logs=False,
+        reconcile_delegate_custody=False,
+    )
+
+    assert [row["id"] for row in pending] == [child["id"]]
+    retry = pending[0]["_terminalization_retry"]
+    assert retry["status"] == "cancelled"
+    assert retry["trigger"] == "pending_parent_interrupted"
+    assert snapshots[0][0] == "kill_workers"
+    assert snapshots[0][1][0]["_terminalization_retry"] == retry
 
 
 def test_kill_workers_can_record_owner_restart_cancellation(tmp_path):

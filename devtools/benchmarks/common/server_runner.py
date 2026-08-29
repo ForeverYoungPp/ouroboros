@@ -16,6 +16,7 @@ devtools/benchmarks/terminal_bench/harbor_installed_agent.py.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -34,15 +35,15 @@ if __package__ in {None, ""}:
 from devtools.benchmarks.common.manifests import runtime_attestation
 from devtools.benchmarks.common.secrets import isolated_credential_grants  # noqa: F401 (re-export)
 from ouroboros.context_mode_compat import normalize_context_mode_compat
-from ouroboros.provider_models import (
-    ALL_PROVIDER_CREDENTIAL_KEYS,
-    LEGACY_MODEL_SETTING_KEYS,
-    provider_credential_plan,
-)
 from ouroboros.platform_layer import (
     kill_pid_tree,
     subprocess_new_group_kwargs,
     terminate_process_tree,
+)
+from ouroboros.provider_models import (
+    ALL_PROVIDER_CREDENTIAL_KEYS,
+    LEGACY_MODEL_SETTING_KEYS,
+    provider_credential_plan,
 )
 
 _FINAL_STATUSES = {"completed", "failed", "cancelled", "rejected_duplicate"}
@@ -56,6 +57,7 @@ STALE_INHERITED_ENV_KEYS = (
     "OUROBOROS_SERVER_HOST", "OUROBOROS_SERVER_PORT", "OUROBOROS_HOST_SERVICE_PORT",
     "OUROBOROS_APP_ROOT", "OUROBOROS_REPO_DIR", "OUROBOROS_DATA_DIR", "OUROBOROS_SETTINGS_PATH",
     "OUROBOROS_URL", "OUROBOROS_MANAGED_BY_LAUNCHER",
+    "OUROBOROS_SETTINGS_SHA256",
     # The launcher-exported presentation posture describes the OPERATOR's desktop
     # process; an isolated benchmark server is a headless web process and must
     # not inherit "desktop_window".
@@ -113,6 +115,56 @@ _PROVIDER_ENV_KEYS = frozenset({
     "GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD",
 })
 
+# In the CyberGym wrapper the applied settings snapshot is the authority.  A
+# parent process can still carry compatibility aliases and newer runtime knobs
+# that are not present in ``SETTINGS_DEFAULTS``; retaining any of those would
+# make an otherwise identical run depend on the operator shell.  Keep only the
+# path/port values that this lifecycle writes back explicitly.  This is scoped
+# to ``settings_authoritative_env`` below; older env-first benchmark drivers
+# retain their historical inheritance contract.
+_AUTHORITATIVE_ENV_KEEP = frozenset({
+    "OUROBOROS_APP_ROOT",
+    "OUROBOROS_REPO_DIR",
+    "OUROBOROS_DATA_DIR",
+    "OUROBOROS_SETTINGS_PATH",
+    "OUROBOROS_SERVER_HOST",
+    "OUROBOROS_SERVER_PORT",
+    "OUROBOROS_HOST_SERVICE_PORT",
+})
+_AUTHORITATIVE_ENV_PREFIXES = (
+    "OUROBOROS_",
+    "OPENROUTER_",
+    "OPENAI_",
+    "ANTHROPIC_",
+    "MINIMAX_",
+    "CLOUDRU_",
+    "GIGACHAT_",
+    "CLAUDE_",
+    "MCP_",
+    "USE_LOCAL_",
+    "LOCAL_MODEL_",
+    "HOST_SERVICE_",
+)
+_AUTHORITATIVE_ENV_EXACT = frozenset({
+    # Legacy model/local aliases that predate the current settings registry.
+    "OUROBOROS_MODEL_CODE",
+    "OUROBOROS_VISION_MODEL",
+    "OUROBOROS_MODEL_FALLBACK",
+    "USE_LOCAL_CODE",
+    "TOTAL_BUDGET",
+})
+
+# A strict isolated server receives the digest of the post-port-patch settings
+# bytes in its child environment. The child verifies the same open-file bytes
+# before applying defaults, so a replacement between parent preflight and child
+# import cannot silently fall back to product defaults.
+SETTINGS_INTEGRITY_ENV = "OUROBOROS_SETTINGS_SHA256"
+
+
+def _settings_json_bytes(config: dict) -> bytes:
+    """Serialize a settings snapshot exactly as it is written to disk."""
+    return json.dumps(config, ensure_ascii=False, indent=2).encode("utf-8")
+
 
 def _is_secret_env_key(key: str) -> bool:
     """A non-provider secret-shaped env var (token/secret/password/api-key/credentials)."""
@@ -125,7 +177,12 @@ def _is_secret_env_key(key: str) -> bool:
     )
 
 
-def build_isolated_settings(live_cfg: dict, **overrides) -> dict:
+def build_isolated_settings(
+    live_cfg: dict,
+    *,
+    include_claude_sdk_defaults: bool = True,
+    **overrides,
+) -> dict:
     """Build an isolated benchmark settings.json from live settings: copy the non-credential
     model/effort/budget/review allowlist above, apply the explicit isolated overrides, and
     then grant ONLY the provider credentials the resulting run's DECLARED model slots need.
@@ -158,7 +215,10 @@ def build_isolated_settings(live_cfg: dict, **overrides) -> dict:
         # A benchmark override is an explicit operator choice, not ambiguous legacy disk state.
         out["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
     out = normalize_context_mode_compat(out)
-    for key in provider_credential_plan(out)["planned_keys"]:
+    for key in provider_credential_plan(
+        out,
+        include_claude_sdk_defaults=include_claude_sdk_defaults,
+    )["planned_keys"]:
         if key in (overrides or {}):
             continue
         value = (live_cfg or {}).get(key)
@@ -222,7 +282,8 @@ def absorbed_cycles_done(data_root: pathlib.Path) -> int:
 
 
 def patch_settings_ports(settings_path: pathlib.Path, *, host: str, port: int,
-                         host_service_port: int) -> dict:
+                         host_service_port: int, require_existing_object: bool = False,
+                         expected_sha256: str | None = None) -> dict:
     """Write the chosen ports INTO a settings.json, returning the merged config.
 
     THE reason this exists rather than exporting the ports in the environment: the server
@@ -234,18 +295,31 @@ def patch_settings_ports(settings_path: pathlib.Path, *, host: str, port: int,
     """
     settings_path = pathlib.Path(settings_path)
     cfg: dict = {}
+    raw: bytes | None = None
     try:
-        if settings_path.exists():
-            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                cfg = loaded
-    except (OSError, ValueError):
-        cfg = {}
+        raw = settings_path.read_bytes()
+        if expected_sha256 is not None:
+            observed_sha256 = hashlib.sha256(raw).hexdigest()
+            if observed_sha256 != expected_sha256:
+                raise RuntimeError("isolated settings snapshot changed")
+        loaded = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if require_existing_object:
+            # Do not fall through to the legacy ports-only write after a strict
+            # snapshot disappears or becomes malformed between reads.
+            raise RuntimeError("isolated settings snapshot is unreadable") from exc
+    else:
+        if isinstance(loaded, dict):
+            cfg = loaded
+        elif require_existing_object:
+            raise RuntimeError("isolated settings snapshot must be a JSON object")
     cfg["OUROBOROS_SERVER_HOST"] = host
     cfg["OUROBOROS_SERVER_PORT"] = int(port)
     cfg["OUROBOROS_HOST_SERVICE_PORT"] = int(host_service_port)
+    if expected_sha256 is not None and raw is None:  # pragma: no cover - defensive invariant
+        raise RuntimeError("isolated settings snapshot is unreadable")
     settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    settings_path.write_bytes(_settings_json_bytes(cfg))
     return cfg
 
 
@@ -265,15 +339,33 @@ class IsolatedServer:
     """A throwaway Ouroboros server bound to an isolated clone + data root + port."""
 
     def __init__(self, clone: pathlib.Path, data_root: pathlib.Path, settings_path: pathlib.Path,
-                 *, host: str = "127.0.0.1") -> None:
+                 *, host: str = "127.0.0.1", settings_authoritative_env: bool = False,
+                 expected_settings_sha256: str | None = None) -> None:
         self.clone = pathlib.Path(clone)
         self.data_root = pathlib.Path(data_root)
         self.settings_path = pathlib.Path(settings_path)
         self.host = host
+        # Some adapters inject one deliberately selected credential after this base
+        # environment is built. Those adapters opt into settings-authoritative mode so
+        # ambient provider/model settings cannot shadow the applied snapshot. The default
+        # stays compatible with older env-first drivers (for example CLB's host path).
+        self.settings_authoritative_env = bool(settings_authoritative_env)
         self.port = free_port()
         self.host_service_port = free_port()
         self.base_url = f"http://{host}:{self.port}"
         self.proc: subprocess.Popen | None = None
+        # Digest of the exact settings snapshot admitted by a strict adapter.  It
+        # is carried across the port patch and checked again immediately before
+        # spawn, so a valid replacement cannot silently alter the applied run.
+        expected = str(expected_settings_sha256 or "").strip().lower()
+        if expected and (
+            len(expected) != 64
+            or any(char not in "0123456789abcdef" for char in expected)
+        ):
+            raise ValueError("expected_settings_sha256 must be a lowercase SHA-256 digest")
+        if expected and not self.settings_authoritative_env:
+            raise ValueError("expected_settings_sha256 requires settings_authoritative_env")
+        self._authoritative_settings_sha256: str | None = expected or None
         # Filled by _wait_ready: the HTTP runtime_version + the clone's HEAD/VERSION that
         # produced it, so a driver can record WHICH agent identity its numbers came from.
         self.attestation: dict = {}
@@ -291,6 +383,18 @@ class IsolatedServer:
         for key in list(env):
             if _is_secret_env_key(key):
                 env.pop(key, None)
+        if self.settings_authoritative_env:
+            # The applied settings file is the source of truth for this adapter.  Do
+            # not merely clear today's known slots: remove the complete Ouroboros
+            # namespace plus provider/SDK families, including legacy aliases and
+            # future settings keys.  The file is read strictly; a malformed or
+            # vanished snapshot must stop before a child can boot on defaults.
+            self._read_authoritative_settings()
+            for key in list(env):
+                if key in _AUTHORITATIVE_ENV_KEEP:
+                    continue
+                if key in _AUTHORITATIVE_ENV_EXACT or key.startswith(_AUTHORITATIVE_ENV_PREFIXES):
+                    env.pop(key, None)
         # Then apply the isolated overrides explicitly (these win over anything inherited).
         env.update({
             "OUROBOROS_APP_ROOT": str(self.clone.parent),
@@ -301,14 +405,73 @@ class IsolatedServer:
             "OUROBOROS_SERVER_PORT": str(self.port),
             "OUROBOROS_HOST_SERVICE_PORT": str(self.host_service_port),
         })
+        if self.settings_authoritative_env:
+            # _read_authoritative_settings above has just verified the exact
+            # post-port-patch bytes. Carry that digest into the child; the
+            # child repeats the open/read/hash check before defaults are applied.
+            if not self._authoritative_settings_sha256:
+                raise RuntimeError("isolated settings snapshot has no integrity digest")
+            env[SETTINGS_INTEGRITY_ENV] = self._authoritative_settings_sha256
+            # A headless benchmark task may still resolve the logical
+            # user_files/deliverables roots.  Keep those roots inside the
+            # throwaway data root instead of letting the runtime fall back to
+            # the operator's real home when the ambient variables were scrubbed.
+            user_files = self.data_root / "user_files"
+            deliverables = user_files / "Deliverables"
+            user_files.mkdir(parents=True, exist_ok=True)
+            deliverables.mkdir(parents=True, exist_ok=True)
+            env.update({
+                "OUROBOROS_USER_FILES_ROOT": str(user_files),
+                "OUROBOROS_DELIVERABLES_ROOT": str(deliverables),
+            })
         return env
+
+    def _read_authoritative_settings(self) -> dict:
+        """Read the applied snapshot or fail closed before spawning the server."""
+        try:
+            raw = self.settings_path.read_bytes()
+            observed_sha256 = hashlib.sha256(raw).hexdigest()
+            if (
+                self._authoritative_settings_sha256 is not None
+                and observed_sha256 != self._authoritative_settings_sha256
+            ):
+                raise RuntimeError("isolated settings snapshot changed")
+            loaded = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("isolated settings snapshot is unreadable") from exc
+        if not isinstance(loaded, dict):
+            raise RuntimeError("isolated settings snapshot must be a JSON object")
+        self._authoritative_settings_sha256 = observed_sha256
+        return loaded
 
     def _patch_settings_ports(self) -> None:
         """Write the chosen free ports INTO settings.json (see `patch_settings_ports`)."""
-        patch_settings_ports(self.settings_path, host=self.host, port=self.port,
-                             host_service_port=self.host_service_port)
+        _patched_settings = patch_settings_ports(
+            self.settings_path,
+            host=self.host,
+            port=self.port,
+            host_service_port=self.host_service_port,
+            require_existing_object=self.settings_authoritative_env,
+            expected_sha256=(
+                self._authoritative_settings_sha256
+                if self.settings_authoritative_env
+                else None
+            ),
+        )
+        if self.settings_authoritative_env:
+            # Derive the digest from the exact bytes handed to the writer,
+            # rather than accepting an independently replaced file as the next
+            # baseline during a second read.
+            self._authoritative_settings_sha256 = hashlib.sha256(
+                _settings_json_bytes(_patched_settings)
+            ).hexdigest()
 
     def start(self, ready_timeout: float = 180) -> "IsolatedServer":
+        if self.settings_authoritative_env:
+            # Validate before ``patch_settings_ports``: that helper is deliberately
+            # permissive for legacy drivers and would otherwise turn malformed JSON
+            # into a defaults-only file, defeating the authority contract.
+            self._read_authoritative_settings()
         self._patch_settings_ports()
         # Own process group/session so a hung server + its worker children can be
         # killed as a tree (platform_layer), not orphaned past graceful SIGTERM.

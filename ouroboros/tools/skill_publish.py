@@ -520,6 +520,7 @@ def _record_llm_usage(ctx: ToolContext, model: str, usage: Mapping[str, Any]) ->
     ctx.pending_events.append(
         {
             "type": "llm_usage",
+            "task_id": str(getattr(ctx, "task_id", "") or ""),
             "provider": "skill_publish",
             "model": model,
             "usage": dict(usage),

@@ -75,13 +75,15 @@ def test_history_marks_bg_consciousness_terminal_on_replay(tmp_path):
     assert not bg[0].get("task_terminal_status")
 
 
-def test_reusable_live_card_preserves_explicit_expansion_across_cycles():
+def test_live_card_disclosure_is_explicit_user_owned_state():
     src = _read("web/modules/chat.js")
-    assert "const stickyExpandedSlots = new Set();" in src
-    assert "stickyExpandedSlots.has(normalizedGroupId)" in src
-    assert "stickyExpandedSlots.add(record.groupId)" in src
-    assert "stickyExpandedSlots.delete(record.groupId)" in src
-    assert "if (!stickyExpandedSlots.has(record.groupId))" in src
+    assert "const explicitCardExpansion = new Map();" in src
+    assert "explicitCardExpansion.set(record.groupId, nowExpanded);" in src
+    assert "explicitCardExpansion.has(normalizedGroupId)" in src
+    assert "explicitCardExpansion.get(normalizedGroupId)" in src
+    assert "if (existing && !explicitCardExpansion.has(childId))" in src
+    assert "setLiveCardExpanded(record, nestedSubagentsExpanded);" in src
+    assert "stickyExpandedSlots" not in src
 
 
 def test_live_card_timeline_only_follows_when_pinned():

@@ -523,6 +523,41 @@ def reconcile_orphaned_running_tasks(drive_root: Any) -> int:
     return healed
 
 
+def _apply_cancel_state_projection(
+    drive_root: pathlib.Path,
+    requested_task_id: str,
+    merged: Dict[str, Any],
+) -> None:
+    """Overlay durable cancel intent on one effective, non-authoritative view.
+
+    The stable historical handle wins (cascade intents intentionally stay on
+    that logical root); a canonical SINGLE intent may instead live on the
+    physical timeout-retry leaf.  Both the ordinary path and the early
+    retry-follow return must use this same ordering.
+    """
+    try:
+        eff_status = str(merged.get("status") or "").strip().lower()
+        if eff_status == STATUS_CANCEL_REQUESTED:
+            merged.setdefault("cancel_state", "pending")
+            return
+        if eff_status in SETTLED_STATUSES:
+            return
+        from ouroboros.cancel_intents import cancel_state_fields
+
+        cancel_fields = cancel_state_fields(
+            pathlib.Path(drive_root), requested_task_id,
+        )
+        if not cancel_fields:
+            physical_task_id = str(merged.get("task_id") or "").strip()
+            if physical_task_id and physical_task_id != requested_task_id:
+                cancel_fields = cancel_state_fields(
+                    pathlib.Path(drive_root), physical_task_id,
+                )
+        merged.update(cancel_fields)
+    except Exception:
+        pass
+
+
 def effective_task_result(
     drive_root: pathlib.Path,
     result: Dict[str, Any],
@@ -596,6 +631,9 @@ def effective_task_result(
                     merged_retry["delegated_runs_unreconciled"] = own + [
                         rid for rid in inherited if rid not in own
                     ]
+                _apply_cancel_state_projection(
+                    pathlib.Path(drive_root), task_id, merged_retry,
+                )
                 return merged_retry
 
     merged = dict(result)
@@ -713,16 +751,7 @@ def effective_task_result(
     # stays honest (running/scheduled) until the supervisor settles the teardown.
     # A legacy ``cancel_requested`` status (old files awaiting boot migration)
     # projects the same pending state.
-    try:
-        eff_status = str(merged.get("status") or "").strip().lower()
-        if eff_status == STATUS_CANCEL_REQUESTED:
-            merged.setdefault("cancel_state", "pending")
-        elif eff_status not in SETTLED_STATUSES:
-            from ouroboros.cancel_intents import cancel_state_fields
-
-            merged.update(cancel_state_fields(pathlib.Path(drive_root), task_id))
-    except Exception:
-        pass
+    _apply_cancel_state_projection(pathlib.Path(drive_root), task_id, merged)
 
     if not materialize_artifacts:
         # Status/cost projection only: skip the whole artifact block (incl. the

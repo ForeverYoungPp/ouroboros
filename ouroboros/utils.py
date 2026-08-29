@@ -589,7 +589,18 @@ def append_jsonl(
             except Exception:
                 log.debug("Failed to unlink lock file after jsonl append", exc_info=True)
                 pass
-        if _written and _log_sink is not None:
+        # Live-stream only runtime LOG files. chat.jsonl has its own live
+        # channel (the chat frame family), and state/memory/receipt jsonl
+        # stores are durable data, not a log feed — streaming them made every
+        # ledger append a raw WS "log" frame (noise the Logs panel's backfill
+        # never mirrors: it requests events/tools/progress/supervisor only).
+        if (
+            _written
+            and _log_sink is not None
+            and path.parent.name == "logs"
+            and path.suffix == ".jsonl"
+            and path.name != "chat.jsonl"
+        ):
             try:
                 _log_sink(obj)
             except Exception:
@@ -619,7 +630,18 @@ def iter_jsonl_objects(
                     handle.seek(start - 1)
                     if handle.read(1) != b"\n":
                         handle.readline()
-            lines = deque(handle, maxlen=max_entries) if max_entries else handle
+            if max_entries:
+                # Keep one raw sentinel so callers can distinguish an exact
+                # bounded tail from a suffix. Parsed-object counts cannot prove
+                # that: blank, malformed, non-dict, or undecodable raw rows are
+                # deliberately skipped below.
+                lines = deque(handle, maxlen=max_entries + 1)
+                if len(lines) > max_entries:
+                    if gap_reasons is not None:
+                        gap_reasons.add("max_entries_truncated")
+                    lines.popleft()
+            else:
+                lines = handle
             for raw in lines:
                 try:
                     line = raw.decode("utf-8")

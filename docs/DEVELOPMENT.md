@@ -560,6 +560,67 @@ distrust — profile, route, parser, window — is metadata on that evidence: it
 may lower authority to DEGRADED/SKIPPED/NOT_RUN, but it must not blank,
 rewrite, or relabel the artifact or its original cause.
 
+#### Review presentation adapters
+
+`web/modules/review_presentation.js` is the frontend SSOT for adapting bounded
+domain projections into review groups and attempts. It owns validation, stable
+identity, ordering, labels, summary fallback, grouping, and typed presentation
+state/tone. It does not author, mutate, or feed back canonical domain verdict,
+lifecycle, routing, attention, or enforcement authority. Admission is
+source-complete: require a stable group/attempt identity, an exact real
+presentation-owner task, typed state/verdict (or explicit unavailable), an
+exact detail reference when detail is offered, and exact task/candidate binding
+for repository review. Omit an incomplete row; never guess from current chat,
+repository, timestamps, model, tool name, or activity.
+
+Legacy Plan Review is normalized once by `task_results.legacy_plan_review_projection`:
+`public_task_result` adds that derived field only to its copied v1 state, and the
+frontend adapter never reparses the nested legacy schema. A task-bound review may
+create an inert owner anchor when no task activity survived the history window;
+the anchor renders `Reviews` but contributes no task phase or liveness until a
+typed task status, cancel state, progress/typing frame, or terminal detail proves it.
+
+`ouroboros/review_execution_projection.py` owns the tiny cross-domain
+`executions[]` wire. It admits only returned API usage or an actually resolved
+delegated harness route plus model, and strips money, profile, raw output, and
+requested-only intent. Skill history, Plan waves, and task-acceptance actors
+reuse that projection. `web/modules/review_dom_patch.js` is the keyed DOM leaf:
+routine review updates reconcile stable group/attempt/detail nodes in place so
+lazy state, focused descendants, and detail scroll survive without adding a UI
+state authority.
+
+`web/modules/harness_presentation.js` is the vector-and-label SSOT for harness
+identity. It owns the known labels, monochrome SVG geometry, generic unknown and
+neutral direct-API fallbacks, escaping, and compact mark-plus-text helpers.
+Marks use `currentColor`, visible text is always retained, and the surrounding
+component owns status tone and execution wording. The helper must never infer
+that a requested route executed or turn native selects into custom controls.
+
+Both modules are pure read-side presentation. Reuse the existing Chat-history,
+task-detail, exact domain-detail, and canonical physical-attempt readers; do not
+add a review ledger, endpoint, persisted UI state, cost copy, or enforcement
+layer. Compact review rows carry no dollars. Exact Skill attempt money appears
+only inside the existing lazy detail when the history row declares
+`physical_attempt_v1`; that detail joins the canonical ledger by exact wave and
+slot, persists no totals, and leaves legacy attribution unavailable. A Plan
+state write also appends one empty typed `review_reference` to the existing
+bounded progress-history rail before publishing its live invalidation; the task
+result remains the only Plan authority. Reconnect retains the latest reference
+per owner, then independently limits references to the requested progress
+window without consuming visible telemetry quota. Folded Skill groups likewise
+retain every group and attempt for only the newest distinct owners within that
+window, so one history rebuild cannot fan out unbounded task-detail reads.
+Omitted review overlays use the existing `quota` truncation reason and Load
+older expansion. Duplicate Skill
+lifecycle acknowledgements remain typed `lifecycle_pointer` rows with no task
+id, so they can never become lineage. They
+enrich an existing exact owner card, or render once as subdued non-task progress
+in the duplicate caller's chat when that owner card is absent.
+Pin these contracts in `web/tests/review_presentation.test.js` and
+`web/tests/harness_presentation.test.js`; keep grouping/reconnect/disclosure and
+requested/effective/executed truth covered by the existing Skill Review,
+render-batch, and review-truth suites.
+
 #### Context and growth matrix
 
 | Store / surface | Complete producer and source | Interactive projection / consumer | Growth and retention proof |
@@ -1208,7 +1269,12 @@ Before every commit, verify the following:
   `depth_provenance` facts (`requested_depth`,
   `permitted_depth`, `attempted_depth`, and host-visible `achieved_depth`), where
   an absent explicit root request remains unknown rather than being inferred from
-  prose or a vendor's internal children.
+  prose or a vendor's internal children. Persisted permission remains monotonic
+  across ordinary Settings changes, while the explicit global depth value `0`
+  still refuses every new descendant and the immutable hard ceiling bounds any
+  malformed persisted projection. External task ingress and supervisor queue
+  admission accept only non-negative typed depths; malformed or negative persisted
+  rows are terminalized before assignment rather than clamped.
 - `subagent_id` selects one complete row from the canonical enabled
   `OUROBOROS_SUBAGENTS` list. At schedule time, freeze the normalized row and list
   fingerprint into the task; dispatch/restart must use that snapshot rather than
@@ -1658,6 +1724,12 @@ Before every commit, verify the following:
   ONE shared `owner_hurry.retry_reset`. UI surfaces share
   `web/modules/task_control_menu.js`; the `owner_hurry` event family is
   non-chat (`log_events.js` hides it with `visible=false`).
+- Cancellation keeps one public queue/lifecycle surface while its code owners
+  stay narrow: retry-aware physical-target and subtree-liveness resolution live
+  in `supervisor/queue_transitions.py`, capture-miss terminalization/publication
+  lives in `supervisor/cancel_publication.py`, and owner-stop control delivery,
+  stale-control validation, and deadline narrowing live in
+  `supervisor/owner_stop.py` with compatibility re-exports from the loop.
 - `forward_to_worker` may write only to validated running tasks whose lineage
   belongs to the current task/root, and must route forked/empty child subagents
   to the child-drive mailbox.

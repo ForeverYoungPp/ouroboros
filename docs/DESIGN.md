@@ -128,6 +128,11 @@ Status, owner action, and urgent notification are separate product concepts:
   product's explicit incident/notification seam, not a red status or a failed
   task as a proxy.
 
+A task-bound `Reviews` history row may be the only retained fact for its owner.
+That row keeps a neutral owner anchor visible, but hides task status and typing
+until a real task status or activity arrives; review presence alone never means
+`Working`, `Done`, or owner attention.
+
 Local diagnostic failures remain inspectable in details and Logs, but do not
 relabel the whole still-working task. A failed child keeps a compact factual
 `Failed` marker inside its parent while the root continues under its own
@@ -167,6 +172,36 @@ not compact headlines.
   that floats equidistant between two groups belongs to neither.
 - Spacing comes from the 8pt tokens (`--space-*`); a new visual dimension
   becomes a CSS variable before it becomes a page-local literal.
+
+### Reviews inside task cards
+
+Real tasks and real subagents are cards. Reviews are a subsection of the
+exact real task that owns their presentation. Harness and neutral API marks
+identify the delivery channel alongside explicit execution evidence; they are
+not child-task cards and never prove execution by themselves.
+
+- A collapsed task card shows only a quiet `Reviews N` line, optionally with an
+  active count. It has no aggregate pass/fail alert, no synthesized verdict, and
+  no review dollars.
+- Expanding `Reviews` reveals one row per currently admitted review group
+  (`Skill review`, `Plan review`, or `Task acceptance`). Expanding a group
+  reveals its ordered attempt rows. Group state and verdict remain
+  domain-specific; one blocker never recolours the whole task card.
+- Disclosure is user-owned. Review results, retries, failures, terminal task
+  state, reconnect, and lazy-detail loading update content in place but never
+  open or close the task, Reviews section, or group.
+- Stable keyed rows are reconciled in place. A routine update preserves the
+  exact lazy-detail node, focused descendant, and its reading position. Expanded
+  groups state exact aggregate accounting when projected and otherwise say
+  `Cost unavailable`; attempt detail states exact accounting when the domain can
+  prove it and otherwise says `Cost unavailable`. Collapsed rows never show dollars.
+- Harness marks are monochrome `currentColor` vectors with adjacent visible
+  text. They carry identity only, remain neutral across status states, and use a
+  generic text-preserving fallback for unknown harnesses; direct API is shown
+  neutrally as `API`.
+- Vector provenance: Claude, Cursor, and OpenCode paths come from Simple Icons;
+  Codex/OpenAI comes from SVGL. Product names and marks remain the property of
+  their owners.
 
 ## 6. Account group / row anatomy
 

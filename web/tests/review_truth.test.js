@@ -112,7 +112,7 @@ test('mixed panel renders quorum participation separately from pass support and 
     assert.match(text, /slot_3.*verdict=FAIL.*quorum=contributes.*enforcement=veto/);
 });
 
-test('subagent terminal projection keeps review complete without using it as activity', () => {
+test('subagent terminal projection leaves review rendering to the Reviews section', () => {
     const summary = summarizeChatLiveEvent({
         type: 'send_message',
         is_progress: true,
@@ -141,10 +141,9 @@ test('subagent terminal projection keeps review complete without using it as act
     });
     assert.equal(summary.terminal, true);
     assert.equal(summary.phase, 'warn');
-    assert.equal(summary.expandByDefault, true);
     assert.equal(summary.activityPreview, 'Concrete child result');
-    assert.match(summary.body, /panel_child/);
-    assert.match(summary.fullBody, /^\[REVIEW\][\s\S]*panel_child/);
+    assert.equal(summary.body, 'Concrete child result');
+    assert.doesNotMatch(summary.fullBody, /panel_child|\[REVIEW\]/);
     assert.match(summary.fullBody, /\[RESULT\]\nConcrete child result/);
     assert.deepEqual(summary.meta, ['write=none', 'status=completed']);
 });
@@ -166,7 +165,7 @@ test('terminal subagent activity prefers the authoritative result over emitter b
     assert.match(summary.fullBody, /\[RESULT\]\nThe evidence-backed conclusion/);
 });
 
-test('review-only subagent projection explicitly has no collapsed activity', () => {
+test('review-only subagent projection has no activity and no auto-disclosure flag', () => {
     const summary = summarizeChatLiveEvent({
         type: 'send_message',
         is_progress: true,
@@ -182,8 +181,8 @@ test('review-only subagent projection explicitly has no collapsed activity', () 
         }] },
     });
     assert.equal(summary.activityPreview, '');
-    assert.match(summary.body, /panel_review_only/);
-    assert.equal(summary.expandByDefault, true);
+    assert.equal(summary.body, '');
+    assert.equal('expandByDefault' in summary, false);
 });
 
 // ---------------------------------------------------------------------------
@@ -196,22 +195,23 @@ test('a delegated frame yields a small harness chip; an ordinary frame yields no
     assert.equal(chip.harness, 'codex');
     // ONE honest label — `{harness} · {state}` — never a bare product name: a
     // hover-only caveat is invisible on touch, to AT, and in copies, so the
-    // run-state qualifier lives in the label itself.
+    // run-state qualifier lives in the label itself. Identity (branded name,
+    // mark geometry) comes from the harness_presentation SSOT.
     // A live frame carries no evidence either way — the label states the
     // dispatch-plan fact, never an evidence-grade negative (under the
     // pre-start charter the leaf usually IS running by round 1).
-    assert.equal(chip.label, 'codex · dispatched');
-    assert.ok(chip.icon);                        // icon, Claudexor-style
-    assert.match(chip.title, /codex/);
+    assert.equal(chip.label, 'Codex · dispatched');
+    assert.equal('icon' in chip, false, 'mark geometry belongs to harness_presentation');
+    assert.match(chip.title, /Codex/);
     // WHERE it ran is all the chip can see. It has no access to the run's spend, so
     // it must not describe the billing: "on your codex subscription" told the owner
     // the work was covered, which the ledger alone can say (and only when the harness
     // says it — a zero there may mean unknown pricing, never "free").
     assert.ok(!/subscription/i.test(chip.title), chip.title);
     // The opaque `harness=model` spelling prints the HARNESS part only.
-    assert.equal(executorChip({ executor_route: 'codex=gpt-5.6-sol' }).label, 'codex · dispatched');
+    assert.equal(executorChip({ executor_route: 'codex=gpt-5.6-sol' }).label, 'Codex · dispatched');
     // An unknown harness still gets a chip (a generic mark), never a crash.
-    assert.equal(executorChip({ executor_route: 'opencode' }).label, 'opencode · dispatched');
+    assert.equal(executorChip({ executor_route: 'opencode' }).label, 'OpenCode · dispatched');
     // ABSENT FACT -> no chip at all: no placeholder, no "api" noise on every
     // ordinary bubble (the native path is the unremarkable case).
     assert.equal(executorChip({}), null);
@@ -256,7 +256,7 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
             subscription_cost_usd: null, harness_models: [],
         },
     });
-    assert.equal(allFailed.label, 'codex · 0 ok, 2 failed');
+    assert.equal(allFailed.label, 'Codex · 0 ok, 2 failed');
     assert.match(allFailed.title, /2 failed/);
 
     // STARTED but none settled: as far as the durable rows know, the run is
@@ -272,7 +272,7 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
     // Evidence is terminal-frame material: started-but-unsettled means the
     // run(s) never settled — a present-tense "running" on a finished card
     // would be a lie (adversarial wave B-ADV-4).
-    assert.equal(inFlight.label, 'codex · 1 started, none settled');
+    assert.equal(inFlight.label, 'Codex · 1 started, none settled');
     assert.match(inFlight.title, /1 run\(s\) started, none settled/);
 
     // EVIDENCE with zero runs: the route was assigned and no delegated run left
@@ -358,7 +358,7 @@ test('the terminal substrate FACT rides the tooltip beside the counts', () => {
             subscription_cost_usd: null, harness_models: [],
         },
     });
-    assert.equal(nativeOnly.label, 'codex · no run yet');
+    assert.equal(nativeOnly.label, 'Codex · no run yet');
     assert.match(nativeOnly.title, /no harness run recorded/);
 
     const used = executorChip({
@@ -425,7 +425,7 @@ test('historical frames without the failed counter reconstruct it from succeeded
             delegated_runs_succeeded: 0, subscription_cost_usd: null,
         },
     });
-    assert.equal(historical.label, 'codex · 0 ok, 2 failed');
+    assert.equal(historical.label, 'Codex · 0 ok, 2 failed');
     // A frame with NEITHER counter stays plain — exactly as wide as disclosed.
     const bare = executorChip({
         executor_route: 'codex',
@@ -434,7 +434,7 @@ test('historical frames without the failed counter reconstruct it from succeeded
             subscription_cost_usd: null,
         },
     });
-    assert.equal(bare.label, 'codex · 1 run');
+    assert.equal(bare.label, 'Codex · 1 run');
 });
 
 test('an evidence-bearing chip is marked so sticky rendering can refuse downgrades', () => {

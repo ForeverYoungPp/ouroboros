@@ -7,6 +7,51 @@ from typing import Any, Dict, Iterable
 from ouroboros.contracts.task_contract import normalize_depth_provenance
 
 
+class TaskDepthError(ValueError):
+    """Typed failure for a task-depth value that cannot cross an ingress."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        self.code = str(code or "invalid_task_depth")
+        super().__init__(message)
+
+
+def parse_task_depth(value: Any, *, default: int = 0) -> int:
+    """Parse task lineage depth while preserving legacy integer coercion."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        try:
+            fallback = int(default)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise TaskDepthError(
+                "task depth default must be a non-negative integer",
+                code="negative_task_depth",
+            ) from exc
+        if fallback < 0:
+            raise TaskDepthError(
+                "task depth default must be a non-negative integer",
+                code="negative_task_depth",
+            )
+        return fallback
+    try:
+        # ``int(-0.5)`` is zero, but the source value is still a negative depth
+        # request and must not cross an ingress that promises non-negative data.
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value < 0:
+            raise TaskDepthError(
+                "task depth must be a non-negative integer",
+                code="negative_task_depth",
+            )
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        if isinstance(exc, TaskDepthError):
+            raise
+        raise TaskDepthError("task depth must be an integer", code="invalid_task_depth") from exc
+    if parsed < 0:
+        raise TaskDepthError(
+            "task depth must be a non-negative integer",
+            code="negative_task_depth",
+        )
+    return parsed
+
+
 def task_depth_provenance(row: Any) -> Dict[str, Any]:
     """Read one task row's normalized depth facts from either preserved projection."""
 

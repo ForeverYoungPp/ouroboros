@@ -3,15 +3,17 @@
 Extracted from ``supervisor/task_lifecycle.py`` for the module-size gate (the
 same boundary that produced ``terminal_delivery.py`` and
 ``delegate_containment.py``): custody grew when the Poltergeist cancel redesign
-landed, and the three clusters here never touch it. They share one property —
-each is a queue-owned transition of a task's ADMISSION or QUIESCENCE state,
-driven entirely through the queue module:
+landed, and the clusters here never touch it. They share one property — each
+is a queue-owned transition or read-side view of a task's ADMISSION or
+QUIESCENCE state, driven entirely through the queue module:
 
 - the acceptance FENCE (open/inspect/seal a root so no new subtask is admitted
   while its acceptance review runs),
 - explicit BUDGET resume of a zero-dispatch task and its root latch,
 - fenced PROJECT deletion: cancel the project's tree, then tombstone only after
-  the tree is provably quiescent.
+  the tree is provably quiescent,
+- shared live-subtree and timeout-retry lineage views used by cancellation and
+  admission without creating a second queue authority.
 
 The dependency runs one way: this module reaches the queue lazily and imports
 nothing from ``task_lifecycle``, which re-exports these names so
@@ -23,7 +25,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.utils import utc_now_iso
 
@@ -457,7 +459,7 @@ def stop_evolution_tasks(reason: str = "evolution stopped") -> Dict[str, List[st
             # evolution task whose worker is still winding down (post-task
             # cognition) must still be fenced and killed — ``already_settled``
             # is only terminal when no live ownership remains.
-            request_cancel(
+            intent = request_cancel(
                 q.DRIVE_ROOT, task_id, reason=reason, source="evolution_stop",
                 allow_settled_target=task_has_live_ownership(task_id),
             )
@@ -470,7 +472,9 @@ def stop_evolution_tasks(reason: str = "evolution stopped") -> Dict[str, List[st
             outcomes["intent_write_failed"].append(task_id)
             continue
         try:
-            outcome = q.cancel_task_custody(task_id)
+            outcome = q.drive_cancel_intent_scope(
+                str(intent.get("task_id") or task_id),
+            )
         except Exception:
             q.log.warning(
                 "Failed to cancel evolution task %s (%s)", task_id, reason, exc_info=True
@@ -532,6 +536,226 @@ def _settled_status(drive_root: object, task_id: str) -> str:
         return ""
 
 
+def task_subtree_is_live(task_id: str, *, ignore_intents: bool = False) -> bool:
+    """Cheap liveness pre-check for the HTTP cascade-cancel path (v6.82).
+
+    True when the task itself is queued/running, when it still has live
+    descendants in the queue, or when it holds an ACTIVE durable cancel intent
+    (or the legacy ``cancel_requested`` status latch of pre-redesign files) —
+    the intent's settle still has honest work to do. Everything else is
+    inactive and must keep today's 404 contract.
+
+    ``ignore_intents=True`` is the PHYSICAL variant for the cascade
+    postcondition (GR2-1e): the root's own cascade intent now survives until
+    that postcondition passes, so the postcondition must judge queue/durable
+    liveness only — counting the coordination intent itself would make the
+    check circular and the cascade unable to ever report success.
+    """
+    q = _queue_module()
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return False
+    with q._queue_lock:
+        self_running = task_id in q.RUNNING
+        self_pending = any(
+            isinstance(task, dict) and str(task.get("id") or "") == task_id
+            for task in q.PENDING
+        )
+        descendants = [
+            str(row.get("task_id") or "")
+            for row in _live_descendants_locked(q, task_id, exclude_task_id=task_id)
+        ]
+    if self_pending:
+        return True
+    # A row whose DURABLE result already settled is a worker winding down, not
+    # live work: its own finalizer owns the removal, and counting it as live would
+    # make a cascade fail its postcondition and answer 503 for the documented
+    # natural-completion race. The durable reads happen OUTSIDE the queue lock.
+    if self_running and not _settled_status(q.DRIVE_ROOT, task_id):
+        return True
+    if any(tid and not _settled_status(q.DRIVE_ROOT, tid) for tid in descendants):
+        return True
+    if ignore_intents:
+        return False
+    try:
+        from ouroboros.cancel_intents import has_active_intent
+        from ouroboros.task_results import STATUS_CANCEL_REQUESTED, load_task_result
+
+        if has_active_intent(q.DRIVE_ROOT, task_id):
+            return True
+        existing = load_task_result(q.DRIVE_ROOT, task_id) or {}
+        return str(existing.get("status") or "") == STATUS_CANCEL_REQUESTED
+    except Exception:
+        return False
+
+
+def _live_retry_target_locked(q: Any, task_id: str) -> Tuple[str, str]:
+    """Resolve an old root id to its one validated live retry leaf.
+
+    A live row is not lineage authority by itself: ingress fields can be stale
+    or malformed, and choosing one of several candidates would let a cancel
+    intent settle against the wrong physical task. Follow the reciprocal
+    host-written result chain (old points to new; new points back to old), then
+    require the live task row to satisfy the existing root-retry contract.
+    Corrupt, overlong, cyclic, or ambiguous chains raise so custody leaves the
+    intent open and fails closed.
+    """
+    requested = str(task_id or "").strip()
+    if not requested:
+        return requested, ""
+    live_rows: list[Dict[str, Any]] = [
+        row for row in q.PENDING if isinstance(row, dict)
+    ]
+    live_rows.extend(
+        meta["task"]
+        for meta in q.RUNNING.values()
+        if isinstance(meta, dict) and isinstance(meta.get("task"), dict)
+    )
+    live_by_id = {
+        str(row.get("id") or ""): row
+        for row in live_rows
+        if str(row.get("id") or "")
+    }
+
+    from ouroboros.task_results import load_task_result, resolve_task_lineage
+
+    requested_result = load_task_result(q.DRIVE_ROOT, requested, strict=True)
+    requested_shape = (
+        requested_result
+        if isinstance(requested_result, dict)
+        else live_by_id.get(requested, {})
+    )
+    requested_lineage = resolve_task_lineage(
+        requested,
+        metadata=requested_shape.get("metadata"),
+        root_task_id=requested_shape.get("root_task_id"),
+        parent_task_id=requested_shape.get("parent_task_id"),
+        delegation_role=requested_shape.get("delegation_role"),
+        original_task_id=requested_shape.get("original_task_id"),
+        timeout_retry_from=requested_shape.get("timeout_retry_from"),
+    )
+    if not requested_lineage.get("is_root_task"):
+        # Retry aliases exist only for top-level root attempts. A subagent or
+        # other descendant is already a physical id; scanning root-shaped rows
+        # from its wider tree would misclassify an unrelated root retry as this
+        # child's successor and block cascade custody.
+        return requested, ""
+
+    chain_predecessor: Dict[str, str] = {}
+    current_id = requested
+    seen = {requested}
+    try:
+        max_edges = max(0, int(getattr(q, "QUEUE_MAX_RETRIES", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        max_edges = 0
+    logical_root = requested
+    while True:
+        current = load_task_result(q.DRIVE_ROOT, current_id, strict=True) or {}
+        if current_id == requested:
+            logical_root = str(current.get("root_task_id") or requested)
+        superseded_by = str(current.get("superseded_by") or "").strip()
+        retry_task_id = str(current.get("retry_task_id") or "").strip()
+        # Subagent/evolution timeout retries intentionally reuse the exact id.
+        # Their result carries retry_task_id=self as attempt metadata, not as a
+        # physical lineage edge.
+        if not superseded_by and retry_task_id == current_id:
+            break
+        if not superseded_by and not retry_task_id:
+            break
+        if not superseded_by or superseded_by != retry_task_id:
+            raise RuntimeError(
+                f"timeout retry lineage from {current_id} is not reciprocal"
+            )
+        if len(chain_predecessor) >= max_edges:
+            raise RuntimeError(
+                f"timeout retry lineage from {requested} exceeds retry authority"
+            )
+        successor_id = superseded_by
+        if successor_id in seen:
+            raise RuntimeError(
+                f"timeout retry lineage from {requested} contains a cycle"
+            )
+        successor = load_task_result(q.DRIVE_ROOT, successor_id, strict=True) or {}
+        if (
+            str(successor.get("supersedes_task_id") or "") != current_id
+            or str(successor.get("original_task_id") or "") != current_id
+            or str(successor.get("timeout_retry_from") or "") != current_id
+        ):
+            raise RuntimeError(
+                f"timeout retry lineage {current_id} -> {successor_id} is incomplete"
+            )
+        chain_predecessor[successor_id] = current_id
+        seen.add(successor_id)
+        current_id = successor_id
+
+    relevant_live: list[str] = []
+    if requested in live_by_id:
+        relevant_live.append(requested)
+    for candidate_id, predecessor_id in chain_predecessor.items():
+        row = live_by_id.get(candidate_id)
+        if row is None:
+            continue
+        lineage = resolve_task_lineage(
+            candidate_id,
+            metadata=row.get("metadata"),
+            root_task_id=row.get("root_task_id"),
+            parent_task_id=row.get("parent_task_id"),
+            delegation_role=row.get("delegation_role"),
+            original_task_id=row.get("original_task_id"),
+            timeout_retry_from=row.get("timeout_retry_from"),
+        )
+        if (
+            not lineage.get("is_retry_root_attempt")
+            or str(lineage.get("root_task_id") or "") != logical_root
+            or str(lineage.get("original_task_id") or "") != predecessor_id
+            or str(lineage.get("timeout_retry_from") or "") != predecessor_id
+        ):
+            raise RuntimeError(
+                f"live timeout retry {candidate_id} fails root-lineage validation"
+            )
+        relevant_live.append(candidate_id)
+
+    # A root-shaped live retry under the same logical root but outside the
+    # reciprocal chain is authority corruption, not an ignorable bystander.
+    for candidate_id, row in live_by_id.items():
+        if candidate_id == requested or candidate_id in chain_predecessor:
+            continue
+        lineage = resolve_task_lineage(
+            candidate_id,
+            metadata=row.get("metadata"),
+            root_task_id=row.get("root_task_id"),
+            parent_task_id=row.get("parent_task_id"),
+            delegation_role=row.get("delegation_role"),
+            original_task_id=row.get("original_task_id"),
+            timeout_retry_from=row.get("timeout_retry_from"),
+        )
+        if (
+            lineage.get("is_retry_root_attempt")
+            and str(lineage.get("root_task_id") or "") == logical_root
+        ):
+            raise RuntimeError(
+                f"live timeout retry {candidate_id} is outside the durable chain"
+            )
+
+    if len(relevant_live) > 1:
+        raise RuntimeError(
+            f"multiple live timeout attempts resolve from {requested}: "
+            f"{', '.join(relevant_live)}"
+        )
+    if relevant_live:
+        return relevant_live[0], ""
+    if chain_predecessor:
+        from ouroboros.task_status import SETTLED_STATUSES
+
+        leaf_status = str(
+            (load_task_result(q.DRIVE_ROOT, current_id, strict=True) or {}).get("status")
+            or ""
+        )
+        if leaf_status in SETTLED_STATUSES:
+            return current_id, leaf_status
+    return requested, ""
+
+
 def task_has_live_ownership(task_id: str) -> bool:
     """Whether live PHYSICAL ownership remains for this task: a RUNNING row or
     a busy worker slot (GR6-1, the one predicate behind the class rule).
@@ -556,8 +780,26 @@ def task_has_live_ownership(task_id: str) -> bool:
     with q._queue_lock:
         if task_id in q.RUNNING:
             return True
-        return any(
+        if any(
             worker.busy_task_id == task_id for worker in workers.WORKERS.values()
+        ):
+            return True
+        try:
+            retry_target, _retry_settled_status = _live_retry_target_locked(q, task_id)
+        except Exception:
+            # An indeterminate chain cannot prove that physical ownership is
+            # absent.  Fail open toward liveness so intent minting, which does
+            # the authoritative locked validation, decides the request.
+            return True
+        return bool(
+            retry_target != task_id
+            and (
+                retry_target in q.RUNNING
+                or any(
+                    worker.busy_task_id == retry_target
+                    for worker in workers.WORKERS.values()
+                )
+            )
         )
 
 

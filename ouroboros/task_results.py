@@ -724,7 +724,9 @@ def write_task_result(
     results_drive_root: Any,
     task_id: str,
     status: str,
-    *, _field_projector: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = None,
+    *,
+    _field_projector: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = None,
+    strict_existing_dict: bool = False,
     **fields: Any,
 ) -> Dict[str, Any]:
     """Merge-write a task result under a per-file lock.
@@ -738,11 +740,24 @@ def write_task_result(
     replace an already-completed result (discarding a result is a separate
     explicit parent action, ``discard_child_result``). ``_field_projector`` is the narrow
     custody seam for fields and status that depend on CURRENT; it runs under this same lock.
+    ``strict_existing_dict`` is reserved for authority-preserving callers:
+    when true, an existing malformed/non-object or wrong-schema result raises
+    instead of being treated as an empty row and overwritten.  The check
+    happens inside the same file lock as the merge, so a malformed authority
+    cannot slip in between a caller's probe and its terminal write.
     """
     path = task_result_path(results_drive_root, task_id)
     explicit_ts = str(fields.pop("ts", "") or "")
 
     def _merge(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if strict_existing_dict and existing and (
+            str(existing.get("task_id") or "") != str(task_id)
+            or not isinstance(existing.get("status"), str)
+            or not str(existing.get("status") or "").strip()
+        ):
+            raise ValueError(
+                f"task result authority is unreadable or invalid: {path}"
+            )
         projected_fields = _field_projector(existing, {**fields, "status": status}) if _field_projector else dict(fields)
         projected_status = str(projected_fields.pop("status", status))
         # Monotonic lifecycle: no stale mirror may overwrite a terminal outcome.
@@ -767,7 +782,12 @@ def write_task_result(
     # lifecycle authority; accepting stale state here makes the winner of a
     # completed-vs-cancelled race depend on timing rather than the monotonic
     # reducer above. Callers may retry or fail their transition explicitly.
-    return update_json_locked(path, _merge)
+    return update_json_locked(
+        path,
+        _merge,
+        strict_existing_dict=bool(strict_existing_dict),
+        reject_existing_empty_dict=bool(strict_existing_dict),
+    )
 
 
 # --------------------------------------------------------------------------- plan review state
@@ -802,7 +822,7 @@ def _empty_plan_review_state() -> Dict[str, Any]:
     }
 
 
-def _legacy_v1_projection(value: Dict[str, Any]) -> Dict[str, Any]:
+def legacy_plan_review_projection(value: Dict[str, Any]) -> Dict[str, Any]:
     """Read-only projection of a v1 record: ``{fingerprint, status, outcome, closed,
     acceptance_claims}`` where status ∈ closed | rail_degraded | open (every non-closed
     v1 ATTEMPT: open review, unavailable) | pending (a wave without any attempt) | absent."""
@@ -846,7 +866,7 @@ def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
     if value.get("schema_version") == 1:
         state = _empty_plan_review_state()
         state["legacy_v1"] = copy.deepcopy(value)
-        state["legacy_v1_projection"] = _legacy_v1_projection(value)
+        state["legacy_v1_projection"] = legacy_plan_review_projection(value)
         return state
     if value.get("schema_version") != _PLAN_REVIEW_STATE_VERSION:
         raise ValueError("PLAN_REVIEW_STATE_INVALID: unsupported or malformed schema")
@@ -933,7 +953,7 @@ def _legacy_projection_of(state: Any) -> Dict[str, Any]:
     if not isinstance(state, dict):
         return {}
     if state.get("schema_version") == 1:
-        return _legacy_v1_projection(state)
+        return legacy_plan_review_projection(state)
     projection = state.get("legacy_v1_projection")
     return projection if isinstance(projection, dict) else {}
 
@@ -1215,6 +1235,7 @@ def _compact_plan_review_wave(wave: Dict[str, Any]) -> Dict[str, Any]:
         "closed": bool(wave.get("closed")),
         "paid": bool(wave.get("paid")),
         "wave_artifact": copy.deepcopy(wave.get("wave_artifact") or {}),
+        **({"reviewed_at": str(wave["reviewed_at"])} if wave.get("reviewed_at") else {}),
     }
 
 

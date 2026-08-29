@@ -303,7 +303,11 @@ def set_root_post_task_checkpoint(
 
                 bridge = try_get_bridge()
                 if bridge is not None:
-                    bridge.push_log(finalized_event)
+                    # A bridge exists only in the server process, where the
+                    # live RUNNING table is available for addressing.
+                    from supervisor.log_addressing import address_handler_push
+
+                    bridge.push_log(address_handler_push(authority_root, dict(finalized_event)))
             except Exception:
                 log.debug("Live push of finalized task cost skipped for %s", task_id, exc_info=True)
     pending_projection = (

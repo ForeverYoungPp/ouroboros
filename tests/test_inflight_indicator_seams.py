@@ -158,6 +158,7 @@ def test_run_chat_task_unregisters_and_keys_error_final_when_agent_raises(tmp_pa
     args, kwargs = sent[0]
     assert args[0] == 5
     assert kwargs.get("task_id") == str(agent.task["id"])
+    assert kwargs.get("progress_meta") == {"task_terminal_status": "failed"}
     # The failed turn re-announces the activity<->client_message_id link right
     # before the keyed final, so the client retires the `Sending...` submission
     # even when the start announce never reached it.

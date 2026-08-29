@@ -5,8 +5,198 @@ import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import {
     accountedUpperBound,
     accountedUpperBoundWithChildren,
+    escapeHtmlAttr,
+    escapeHtmlText as escapeHtml,
     formatUsdWhole,
+    renderMarkdown,
 } from './utils.js';
+
+export function withTaskCostMeta(summary, payload, { replace = false, rawTs = '' } = {}) {
+    const projection = taskCostProjection(payload, rawTs);
+    // `replace` frames (task_done/task_cost_finalized) never keep the
+    // summarizer's own meta strings. Cost renders ONLY from the card's sticky
+    // record.costMeta (applyLiveCardState); summarizer-built `cost=` strings
+    // are dropped UNCONDITIONALLY — a frame without task-scope accounting
+    // evidence must show no money at all, not a bare per-call number.
+    const base = replace ? { ...summary, meta: [] } : summary;
+    const out = projection ? { ...base, costProjection: projection } : { ...base };
+    if (Array.isArray(out.meta) && out.meta.length) {
+        out.meta = out.meta.filter((entry) => !String(entry || '').startsWith('cost='));
+    }
+    return out;
+}
+
+export function senderLabel(role, isProgress = false, systemType = '', opts = {}, chatSessionId = '') {
+    if (role === 'user') {
+        if (opts.source === 'telegram') return opts.senderLabel || 'Telegram';
+        if (opts.senderSessionId && opts.senderSessionId !== chatSessionId) {
+            return `WebUI (${opts.senderSessionId.slice(0, 8)})`;
+        }
+        return opts.senderLabel || 'You';
+    }
+    if (role === 'system') {
+        if (systemType === 'task_summary') return '📋 Task Summary';
+        if (systemType === 'skill_review') return '📋 Skill Review';
+        return '📋 System';
+    }
+    if (isProgress) return '💬 Thought';
+    return 'Ouroboros';
+}
+
+export function isLiveLineExpandable(item) {
+    return Boolean(
+        (item.fullHeadline && item.fullHeadline !== item.headline)
+        || (item.fullBody && item.fullBody !== item.body)
+        // P3: even when the preview equals the capped body, a server-truncated line
+        // with a fetch ref has MORE to show (the genuinely-full output on demand).
+        || (item.truncated && item.fullRef)
+    );
+}
+
+export function buildTimelineItemHtml(item, record) {
+    const expandable = isLiveLineExpandable(item);
+    const expanded = expandable && record.expandedLineKeys.has(item.lineKey);
+    const displayHeadline = expanded && item.fullHeadline ? item.fullHeadline : item.headline;
+    // P3: when expanded, prefer the genuinely-full fetched output, then the capped
+    // fullBody, then the preview body. A server-truncated line shows the fetched full
+    // text in a bounded-scroll box so a huge research output never grows the chat.
+    const displayBody = expanded ? (item.fetchedFull || item.fullBody || item.body) : item.body;
+    const showingFetched = expanded && Boolean(item.fetchedFull);
+    const loadingFull = expanded && Boolean(item.truncated && item.fullRef && !item.fetchedFull);
+    const isProgressLine = item.phase === 'working' || item.phase === 'thinking';
+    const bodyId = `chat-live-line-body-${String(record.groupId || 'task').replace(/[^A-Za-z0-9_-]/g, '-')}-${String(item.lineKey || '').replace(/[^A-Za-z0-9_-]/g, '-')}`;
+    const headContent = `
+        <span class="chat-live-line-title">${isProgressLine ? renderMarkdown(displayHeadline) : escapeHtml(displayHeadline)}</span>
+        <span class="chat-live-line-repeat" ${item.count > 1 ? '' : 'hidden'}>${item.count > 1 ? `${item.count}x` : ''}</span>
+        ${item.ts ? `<span class="chat-live-line-time">${escapeHtml(item.ts)}</span>` : ''}
+    `;
+    const headHtml = expandable
+        ? `
+            <button
+                type="button"
+                class="chat-live-line-toggle"
+                data-live-line-toggle="${escapeHtmlAttr(item.lineKey)}"
+                aria-expanded="${expanded ? 'true' : 'false'}"
+                ${displayBody ? `aria-controls="${escapeHtmlAttr(bodyId)}"` : ''}
+            >
+                <span class="chat-live-line-head">${headContent}</span>
+                <span class="chat-live-line-expand-label">${expanded ? 'Collapse' : ((item.truncated && item.fullRef) ? 'Show full' : 'Expand')}</span>
+            </button>
+        `
+        : `<div class="chat-live-line-head">${headContent}</div>`;
+    return `
+        <div
+            class="chat-live-line ${item.phase || 'working'}${expandable ? ' expandable' : ''}"
+            data-live-line-key="${escapeHtmlAttr(item.lineKey || '')}"
+            data-expanded="${expanded ? '1' : '0'}"
+        >
+            ${headHtml}
+            ${displayBody ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}" id="${escapeHtmlAttr(bodyId)}">${renderMarkdown(displayBody)}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
+        </div>
+    `;
+}
+
+export function durableChatMediaUrl(value) {
+    const url = String(value || '');
+    return /^\/api\/tasks\/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\/artifacts\/chat-media-[0-9a-f]{64}\.(png|jpg|gif|webp|mp4|webm)$/.test(url) ? url : '';
+}
+
+export function chatMediaMessageKey(msg) {
+    return [msg.msg_type || msg.type, String(msg.ts || ''), String(msg.caption || ''), String(msg.mime || '')].join('|');
+}
+
+export function documentMessageKey(msg) {
+    return [
+        'document',
+        String(msg.ts || ''),
+        String(msg.download_url || ''),
+        String(msg.filename || ''),
+        String(msg.caption || ''),
+    ].join('|');
+}
+
+export function pendingAttachmentBytes(items = []) {
+    return items.reduce((total, item) => total + Number(item.file?.size || 0), 0);
+}
+
+export function isFileDrag(event) {
+    return Array.from(event.dataTransfer?.types || []).includes('Files');
+}
+
+export function isNonTerminalMediaHistoryRow(msg) {
+    return msg.system_type === 'photo' || msg.system_type === 'video';
+}
+
+export function isBackgroundTaskId(taskId = '') {
+    return taskId === 'bg-consciousness';
+}
+
+export function shouldAlwaysShowTaskCard(taskId = '') {
+    return isBackgroundTaskId(taskId);
+}
+
+export function isForegroundLiveCard(record) {
+    return Boolean(
+        record?.root?.isConnected && !record.finished && !record.reviewAnchor
+        && !isBackgroundTaskId(record.groupId)
+    );
+}
+
+export function shouldFirePanic(dialogResult) {
+    return dialogResult === true;
+}
+
+export async function confirmAndSendPanic(deps) {
+    const decision = await deps.openConfirmDialog({
+        title: 'Panic — stop all workers',
+        body: 'Kill all workers immediately?',
+        confirmLabel: 'Kill all workers',
+        cancelLabel: 'Keep running',
+        danger: true,
+    });
+    if (shouldFirePanic(decision)) {
+        deps.ws.send({ type: 'command', cmd: '/panic' });
+        return true;
+    }
+    return false;
+}
+
+export function getOrCreateChatSessionId(storage, cryptoImpl, now = Date.now, random = Math.random) {
+    try {
+        const existing = storage.getItem('ouro_chat_session_id');
+        if (existing) return existing;
+        const created = cryptoImpl && typeof cryptoImpl.randomUUID === 'function'
+            ? cryptoImpl.randomUUID()
+            : `chat-${now()}-${random().toString(16).slice(2)}`;
+        storage.setItem('ouro_chat_session_id', created);
+        return created;
+    } catch {
+        return `chat-${now()}-${random().toString(16).slice(2)}`;
+    }
+}
+
+export function projectIdFromTask(taskId = '', now = Date.now) {
+    const seed = String(taskId || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9_.-]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+    return (seed ? `task-${seed}` : `task-${now().toString(36)}`).slice(0, 64);
+}
+
+export function loadChatInputHistory(storage, key) {
+    try {
+        const raw = JSON.parse(storage.getItem(key) || '[]');
+        return Array.isArray(raw) ? raw.filter(Boolean).slice(-50) : [];
+    } catch {
+        return [];
+    }
+}
+
+export function saveChatInputHistory(storage, key, entries) {
+    try {
+        storage.setItem(key, JSON.stringify(entries.slice(-50)));
+    } catch {}
+}
 
 // Row-surface disclosure guard (v6.71.0), pure for node tests: returns the
 // lineKey to toggle for a click landing on `target`, or '' when the click must
@@ -262,13 +452,74 @@ export function createStateSnapshotSequencer(onApply, now = () => Date.now()) {
  * the registry) closes the race where a fresh project's frames arrive before
  * `projectChatIds` learns the project — previously Main adopted them and
  * minted an empty "Working..." card. Frames without the stamp (main, legacy
- * cid 0/missing, external transports such as Telegram) route exactly as
- * before; no numeric-range heuristic is involved.
+ * missing, external transports such as Telegram) route exactly as before;
+ * explicit chat_id=0 remains the internal Skill Review partition. No
+ * numeric-range heuristic is involved.
  */
 export function mainThreadAccepts(msg, projectChatIds) {
     if (msg && msg.project_thread) return false;
     const cid = Number(msg?.chat_id ?? 1);
+    // chat_id=0 is the internal Skill Review/panel partition. An explicit zero
+    // is never a Main conversation. Legacy LOG frames whose inner payload did
+    // not carry chat_id are handled separately by mainLogFrameAccepts().
+    // Negative ids are reserved for synthetic A2A traffic and never enter a
+    // human-facing browser stream.
+    if (cid <= 0) return false;
     return !(projectChatIds instanceof Set && projectChatIds.has(cid));
+}
+
+/** Main routing for the legacy LocalChatBridge log envelope. */
+export function mainLogFrameAccepts(msg, projectChatIds) {
+    const data = msg?.data;
+    if (data && typeof data === 'object' && Object.prototype.hasOwnProperty.call(data, 'chat_id')) {
+        return mainThreadAccepts({ ...data, ...msg, chat_id: data.chat_id }, projectChatIds);
+    }
+    // Older bridges stamped absent inner identity as outer zero. This is the
+    // one compatibility case; a real inner zero above remains panel-only.
+    if (Number(msg?.chat_id) === 0) return !msg?.project_thread;
+    return mainThreadAccepts(msg, projectChatIds);
+}
+
+/** Route one ordinary Chat frame to the current Main or Project instance. */
+export function chatThreadAccepts(msg, isMain, chatId, projectChatIds) {
+    if (isMain) return mainThreadAccepts(msg, projectChatIds);
+    return Number(msg?.chat_id ?? 1) === chatId;
+}
+
+/**
+ * Route one LocalChatBridge log envelope to the current Chat instance while
+ * keeping an explicit inner chat_id=0 in the hidden panel partition.
+ */
+export function chatLogThreadAccepts(msg, isMain, chatId, projectChatIds) {
+    if (isMain) return mainLogFrameAccepts(msg, projectChatIds);
+    const data = msg?.data;
+    if (data && typeof data === 'object' && Object.prototype.hasOwnProperty.call(data, 'chat_id')) {
+        return chatThreadAccepts({ ...msg, ...data, chat_id: data.chat_id }, false, chatId, projectChatIds);
+    }
+    // An absent inner identity historically arrives as outer zero. Project
+    // instances do not adopt that unowned compatibility frame.
+    if (Number(msg?.chat_id) === 0) return false;
+    return chatThreadAccepts(msg, false, chatId, projectChatIds);
+}
+
+const TERMINAL_TASK_STATUSES = new Set([
+    'completed', 'failed', 'cancelled', 'rejected_duplicate',
+]);
+const TERMINAL_SUBAGENT_EVENTS = new Set([
+    'completed', 'completed_warn', 'failed', 'cancelled', 'rejected',
+]);
+
+/**
+ * Positive typed task-terminal truth shared by history and live Chat rows.
+ * Role + task_id is deliberately insufficient: review references, lifecycle
+ * receipts, annotations and media can all carry a real task id mid-run.
+ */
+export function positiveTaskTerminalFact(row) {
+    if (!row || typeof row !== 'object') return false;
+    if (String(row.system_type || '') === 'task_summary') return true;
+    if (TERMINAL_TASK_STATUSES.has(String(row.task_terminal_status || '').toLowerCase())) return true;
+    return String(row.delegation_role || '').toLowerCase() === 'subagent'
+        && TERMINAL_SUBAGENT_EVENTS.has(String(row.subagent_event || '').toLowerCase());
 }
 
 /**

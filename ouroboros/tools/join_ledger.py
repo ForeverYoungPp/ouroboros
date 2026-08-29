@@ -615,10 +615,19 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     # the ownership projection (the live maps belong to the supervisor).
     live_ownership = False
     try:
+        from ouroboros.cancel_intents import _validated_single_cancel_target
         from ouroboros.task_status import task_has_live_queue_ownership
 
         live_ownership = task_has_live_queue_ownership(status_drive_root, tid)
+        # This pre-read is only a fail-open liveness hint. request_cancel
+        # resolves the target again under the projection lock before minting.
+        retry_hint = _validated_single_cancel_target(status_drive_root, tid)
+        if retry_hint != tid:
+            live_ownership = live_ownership or task_has_live_queue_ownership(
+                status_drive_root, retry_hint,
+            )
     except Exception:
+        live_ownership = True
         log.debug("cancel_task live-ownership read failed for %s", tid, exc_info=True)
     try:
         from ouroboros.cancel_intents import CancelIntentProjectionCorrupt, request_cancel
@@ -667,7 +676,14 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     # the durable intent survives a lost event (the supervisor watchdog re-feeds it).
     from ouroboros.tools.control import _emit_control_event
 
-    emitted = _emit_control_event(ctx, {"type": "cancel_task", "task_id": tid, "reason": reason_text, "ts": utc_now_iso()})
+    physical_task_id = str(intent.get("task_id") or tid)
+    emitted = _emit_control_event(ctx, {
+        "type": "cancel_task",
+        "task_id": physical_task_id,
+        "requested_task_id": tid,
+        "reason": reason_text,
+        "ts": utc_now_iso(),
+    })
     note = " (live)" if emitted == "live" else " (deferred to round end)"
     already = " (already requested earlier — idempotent)" if intent.get("already_requested") else ""
     return (

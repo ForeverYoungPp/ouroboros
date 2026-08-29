@@ -351,6 +351,31 @@ def project_chat_for_task(drive_root: Any, task_id: str) -> int:
         return 0
 
 
+_BINDINGS_LENS_CACHE: Dict[str, tuple] = {}
+
+
+def _bindings_lens(drive_root: Any) -> Dict[str, Any]:
+    """mtime/size-cached read of the bindings store for per-frame routing.
+
+    The live-log addressing seam resolves lineage on every forwarded event
+    (DEVELOPMENT "projection over replay": a per-interaction reader must not
+    reparse a growing store), so the parse is keyed to the file identity the
+    same way ``project_thread_chat_ids`` caches the registry."""
+    path = _bindings_path(drive_root)
+    try:
+        st = path.stat()
+        stamp: Any = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    key = str(path)
+    cached = _BINDINGS_LENS_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    bindings = _load_bindings(drive_root)["bindings"]
+    _BINDINGS_LENS_CACHE[key] = (stamp, bindings)
+    return bindings
+
+
 def project_chat_for_task_tree(
     drive_root: Any, task_id: Any, parent_task_id: Any = "", root_task_id: Any = ""
 ) -> int:
@@ -360,11 +385,23 @@ def project_chat_for_task_tree(
     its root's project and route to the project thread instead of staying in the main
     chat (the cyber-racing "subagents vanished from the project" gap). Membership is
     DERIVED from lineage — no per-child binding store, one SSOT."""
+    # One cached bindings view for all three probes (runs per live log event).
+    try:
+        bindings = _bindings_lens(drive_root)
+    except Exception:
+        log.debug("project_chat_for_task_tree bindings read failed", exc_info=True)
+        return 0
     for tid in (task_id, parent_task_id, root_task_id):
         tid = str(tid or "").strip()
         if not tid:
             continue
-        chat = project_chat_for_task(drive_root, tid)
+        row = bindings.get(tid)
+        if not isinstance(row, dict):
+            continue
+        try:
+            chat = int(row.get("project_chat_id") or 0)
+        except (TypeError, ValueError):
+            chat = 0
         if chat:
             return chat
     return 0

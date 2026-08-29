@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 
@@ -405,28 +405,54 @@ def model_slot_snapshot(settings_path: pathlib.Path | None = None, *,
     return slots
 
 
-def provider_credential_disclosure(settings_path: pathlib.Path | None = None) -> dict[str, Any]:
+def provider_credential_disclosure(
+    settings_path: pathlib.Path | None = None,
+    *,
+    runtime_credentials: Mapping[str, Any] | None = None,
+    include_claude_sdk_defaults: bool = True,
+) -> dict[str, Any]:
     """Record WHICH provider credentials the described server can reach — by fingerprint.
 
     ``model_slots`` already says which models a run declared; this says which providers it
     could actually have spent on, which is not the same fact and is the one a routing
-    fallback can falsify. Reads the settings FILE only: an isolated benchmark server loads
-    its provider credentials from the sanitized settings.json (see
-    ``server_runner.build_isolated_settings``), not from the launcher's own environment.
+    fallback can falsify. The settings-file grant and an explicitly injected runtime grant
+    are reported as separate fingerprint maps: a benchmark may keep a long-lived key out of
+    its persisted settings while passing it to one server process. Values are never returned.
     An absent/unreadable settings path yields ``{"available": False}`` — a stated gap, never
     a silently empty grant list."""
-    from devtools.benchmarks.common.secrets import isolated_credential_grants
+    from devtools.benchmarks.common.secrets import credential_disclosure, isolated_credential_grants
+    from ouroboros.provider_models import ALL_PROVIDER_CREDENTIAL_KEYS
+
+    runtime_granted: dict[str, dict[str, Any]] = {}
+    if runtime_credentials is not None:
+        selected = {
+            str(key): value
+            for key, value in runtime_credentials.items()
+            if str(key) in ALL_PROVIDER_CREDENTIAL_KEYS
+        }
+        runtime_granted = credential_disclosure(selected, sorted(selected))
+
+    def with_runtime(payload: dict[str, Any]) -> dict[str, Any]:
+        if runtime_credentials is not None:
+            payload["runtime_granted"] = runtime_granted
+        return payload
 
     path = pathlib.Path(settings_path) if settings_path else None
     if not path or not path.exists():
-        return {"available": False, "reason": "settings_path_absent"}
+        return with_runtime({"available": False, "reason": "settings_path_absent"})
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {"available": False, "reason": "settings_unreadable"}
+        return with_runtime({"available": False, "reason": "settings_unreadable"})
     if not isinstance(loaded, dict):
-        return {"available": False, "reason": "settings_not_an_object"}
-    return {"available": True, **isolated_credential_grants(loaded)}
+        return with_runtime({"available": False, "reason": "settings_not_an_object"})
+    return with_runtime({
+        "available": True,
+        **isolated_credential_grants(
+            loaded,
+            include_claude_sdk_defaults=include_claude_sdk_defaults,
+        ),
+    })
 
 
 class BenchmarkAdmissionRefused(RuntimeError):
@@ -593,6 +619,16 @@ def benchmark_run_manifest(
     meta_settings_path = meta.get("settings_path")
     if meta_settings_path is not None:
         meta_settings_path = pathlib.Path(meta_settings_path)
+    include_claude_sdk_defaults = meta.get("include_claude_sdk_defaults", True)
+    if not isinstance(include_claude_sdk_defaults, bool):
+        raise ValueError("include_claude_sdk_defaults metadata must be a boolean")
+    # Some adapters hand a settings file plus a fresh child environment to a
+    # container.  Their initial/refusal manifest must describe that file, not
+    # ambient model/effort values from the operator process.  Keep the
+    # historical env-first default for all other benchmark drivers.
+    settings_authoritative_env = meta.get("settings_authoritative_env", False)
+    if not isinstance(settings_authoritative_env, bool):
+        raise ValueError("settings_authoritative_env metadata must be a boolean")
     source = repo_provenance(repo_dir)
     gate = _seed_gate(source, require_clean=require_clean, expect=str(expect or ""))
     manifest: dict[str, Any] = {
@@ -609,8 +645,14 @@ def benchmark_run_manifest(
         "timeout_sec": meta.get("timeout_sec"),
         "isolated_data_root": str(meta.get("isolated_data_root") or ""),
         "output_paths": meta.get("output_paths") or {},
-        "model_slots": model_slot_snapshot(meta_settings_path),
-        "provider_credentials": provider_credential_disclosure(meta_settings_path),
+        "model_slots": model_slot_snapshot(
+            meta_settings_path,
+            env_overrides=not settings_authoritative_env,
+        ),
+        "provider_credentials": provider_credential_disclosure(
+            meta_settings_path,
+            include_claude_sdk_defaults=include_claude_sdk_defaults,
+        ),
         "source": source,
         "seed_gate": gate,
         "extra": meta.get("extra") or {},
