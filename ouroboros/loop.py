@@ -51,6 +51,15 @@ from ouroboros.loop_tool_execution import (
     reclaim_trace_refs,
 )
 from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event, forced_response_is_incomplete, forced_response_parts
+from ouroboros.loop_transport import (
+    fallback_chain_allowed as _fallback_chain_allowed,
+    last_assistant_text as _last_assistant_text,
+    provider_failure_hint as _provider_failure_hint,
+    provider_recovery_hint as _provider_recovery_hint,
+    reconcile_transport_wait as _reconcile_transport_wait,
+    task_deadline_epoch as _task_deadline_epoch,
+    transport_wait_step as _transport_wait_step,
+)
 from ouroboros.pricing import estimate_cost_optional
 
 # Backward-compat alias for source-inspecting/monkeypatched tests.
@@ -83,52 +92,6 @@ class _CompactionRoundContext:
     round_idx: int
     event_queue: Optional[queue.Queue]
     emit_progress: Callable[[str], None]
-
-
-def _provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
-    detail = " ".join(str(accumulated_usage.get("_last_llm_error") or "").split()).strip()
-    if not detail:
-        return ""
-    return f" Last provider error: {detail}"
-
-
-def _provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
-    """Explain whether retrying later is likely to help."""
-    kind = str(accumulated_usage.get("_last_llm_error_kind") or "").strip()
-    if kind == "provider_outcome_unknown":
-        return (
-            " The dispatched request has no terminal provider outcome, so no "
-            "retry or paid fallback was sent; either could duplicate live work."
-        )
-    if kind == "subscription_window_exhausted":
-        reset_at = str(accumulated_usage.get("_last_llm_reset_at") or "").strip()
-        when = f" It resets at {reset_at}." if reset_at else ""
-        return (
-            " The subscription window for the delegated route is spent. This is "
-            f"TRANSIENT, not a billing refusal — waiting cures it.{when} Retrying is "
-            "scheduled against that reset time, not the ordinary short backoff."
-        )
-    if kind in {"quota_exhausted", "auth_error", "request_too_large", "bad_request", "context_overflow"}:
-        guidance = {
-            "quota_exhausted": "The provider rejected the request for quota/billing reasons; retrying the same request will not help until the key/account limit changes.",
-            "auth_error": "The provider rejected authentication/authorization; retrying the same request will not help until the configured key or provider access is fixed.",
-            "request_too_large": "The provider rejected the request size/output-token shape; retrying the same request will not help without reducing context/output demand or changing model capacity.",
-            "bad_request": "The provider rejected the request shape; retrying the same request will not help until the transcript/tool payload is fixed.",
-            "context_overflow": "The context overflowed the model window; retrying the same request will not help without reducing context or changing model capacity.",
-        }.get(kind, "Retrying the same provider request will not help until the underlying request/account issue changes.")
-        return f" {guidance}"
-    detail = str(accumulated_usage.get("_last_llm_error") or "").lower()
-    if "prefill" in detail or "conversation must end with a user message" in detail:
-        return (
-            " This looks like a client-side transcript-shape error, not a "
-            "provider outage; retrying the same input will not help."
-        )
-    if "provider returned incomplete response" in detail or "finish_reason=null" in detail:
-        return (
-            " The provider returned incomplete responses repeatedly; this may "
-            "be transient, but it can also indicate malformed client input."
-        )
-    return " If background consciousness is running, it will retry when the provider recovers."
 
 
 def _handle_text_response(
@@ -2536,7 +2499,7 @@ def _run_cross_model_fallback_chain(
         tools._ctx.messages = messages
         tools._ctx.active_context_mode = active_context_mode
         _restore_context_fit_usage(accumulated_usage, primary_context_usage)
-        if str(accumulated_usage.get("_last_llm_error_kind") or "") in ("provider_outcome_unknown", "deadline_exhausted"):
+        if str(accumulated_usage.get("_last_llm_error_kind") or "") in ("provider_outcome_unknown", "deadline_exhausted", "transport_unavailable"):
             break
         _cooled(fallback_model, fallback_use_local)
     return (
@@ -2645,6 +2608,10 @@ def _maybe_inject_self_check(
     REMINDER_INTERVAL = 15
     if round_idx <= 1 or round_idx % REMINDER_INTERVAL != 0 or round_idx >= max_rounds:
         return False
+    # Free transport-wait redials re-enter the SAME round: one self-check per round.
+    if accumulated_usage.get("_self_check_round") == round_idx:
+        return False
+    accumulated_usage["_self_check_round"] = round_idx
 
     ctx_tokens = sum(
         estimate_tokens(_extract_plain_text_from_content(m.get("content")))
@@ -2901,28 +2868,6 @@ def _inject_round_checkpoints(
         event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
     )
     return bool(checkpoint or time_budget or cost_budget or nanny_economics)
-
-
-def _last_assistant_text(messages: List[Dict[str, Any]]) -> str:
-    """Last real assistant text already produced this task — salvaged into the
-    terminal answer when provider-death prevents a fresh final response, so
-    useful work is never silently discarded (workspace files persist on disk
-    regardless)."""
-    for m in reversed(messages or []):
-        if isinstance(m, dict) and m.get("role") == "assistant":
-            content = m.get("content")
-            if isinstance(content, str) and content.strip():
-                return content.strip()
-    return ""
-
-
-def _task_deadline_epoch(tools: ToolRegistry) -> Optional[float]:
-    """Return the task deadline for retry backoff."""
-    meta = getattr(tools._ctx, "task_metadata", {})
-    if not isinstance(meta, dict):
-        return None
-    deadline = parse_deadline_ts(meta.get("deadline_at"))
-    return deadline.timestamp() if deadline is not None else None
 
 
 def seal_task_transcript(
@@ -3371,10 +3316,17 @@ def _handle_owner_stop_finalization(
 
 def _handle_provider_unavailable(
     ctx: _RoundLimitContext, *, error_kind: str = "provider_unavailable",
+    wait_cause: str = "",
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Salvage provider failure without an unsafe retry."""
+    """Salvage provider failure without an unsafe retry.
+
+    ``wait_cause`` is the transport-wait episode's latched cause: it selects the
+    deterministic no-resend terminal even when a later refusal (e.g. the
+    deadline admission gate) overwrote the mutable ``_last_llm_error_kind``.
+    """
     kind = str(error_kind or "")
     is_context_overflow = kind == "context_overflow"
+    is_transport_wait = str(wait_cause or "") == "transport_unavailable"
     is_deadline_exhausted = kind == "deadline_exhausted" or str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "deadline_exhausted"
     forced_reason = "deadline_local" if is_deadline_exhausted else "provider_unavailable"
     llm_trace = getattr(ctx, "llm_trace", None)
@@ -3394,6 +3346,10 @@ def _handle_provider_unavailable(
             "⚠️ The context exceeded the selected model window; no further provider call was made. "
             "Any files written so far are preserved in the workspace."
             if is_context_overflow else
+            "⚠️ Could not establish a provider connection; the task waited and redialed "
+            "until its own limits ran out and was INTERRUPTED, not completed. Any files "
+            "written so far are preserved in the workspace. Retry when connectivity returns."
+            if is_transport_wait else
             "⚠️ The owner deadline ended primary model work; any files written so far are preserved."
             if is_deadline_exhausted else
             "⚠️ The model provider returned no usable response after retries and same-model reroute."
@@ -3409,6 +3365,20 @@ def _handle_provider_unavailable(
             execution_status=RESULT_INFRA_FAILED,
             reason_code="llm_api_error",
             _last_llm_error_kind="context_overflow",
+        )
+        return text, usage, llm_trace
+    if is_transport_wait:
+        # Deterministic waited-out-outage terminal: salvage, no forced-final
+        # provider call over a proven-dead egress (same no-resend shape as the
+        # provider_outcome_unknown branch below, explicit terminal stamp).
+        live_trace = getattr(ctx, "llm_trace", None)
+        llm_trace = live_trace if isinstance(live_trace, dict) else {}
+        text, usage, llm_trace = _forced_fallback_result(
+            ctx, llm_trace, fallback, reason_code="provider_unavailable",
+            source="transport_unavailable_no_resend",
+        )
+        usage.update(
+            execution_status=RESULT_INFRA_FAILED, reason_code="provider_unavailable",
         )
         return text, usage, llm_trace
     if str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown":
@@ -3470,7 +3440,8 @@ def _maybe_deadline_local_finalize(
 
 
 def _maybe_early_finalize(
-    limit_ctx: _RoundLimitContext, tools: ToolRegistry, controls: Dict[str, Any]
+    limit_ctx: _RoundLimitContext, tools: ToolRegistry, controls: Dict[str, Any],
+    *, allow_deadline_local: bool = True,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
     """Consume supervisor grace first, then a local deadline."""
     if controls.get("finalize_now"):
@@ -3479,6 +3450,12 @@ def _maybe_early_finalize(
                 limit_ctx, controls["finalize_deadline_ts"],
             )
         return _handle_forced_finalization(limit_ctx, str(controls["finalize_now"]))
+    if not allow_deadline_local:
+        # An active transport-wait episode owns the deadline sliver: its last
+        # free redial + no-resend terminal replace the paid graceful finalize
+        # call, which cannot succeed over a proven-dead egress and would fork
+        # the terminal story (deadline_local vs transport no-resend).
+        return None
     return _maybe_deadline_local_finalize(limit_ctx, tools)
 
 
@@ -6785,10 +6762,17 @@ def run_llm_loop(
     MAX_ROUNDS = _resolve_loop_max_rounds()
     MAX_ROUNDS = min(MAX_ROUNDS, int(getattr(ctx, "inline_max_rounds", MAX_ROUNDS)))
     round_idx = 0
+    free_redial = False
+    transport_wait = None
     limit_ctx: Optional[_RoundLimitContext] = None
     try:
         while True:
-            round_idx += 1
+            if free_redial:
+                # A transport-wait redial re-enters the SAME logical round: the
+                # outage must not burn the round budget.
+                free_redial = False
+            else:
+                round_idx += 1
 
             ctx = tools._ctx
             _prev_active_route = (active_model, active_use_local)
@@ -6843,7 +6827,8 @@ def run_llm_loop(
             # Early-exit per round: supervisor finalize_now, else loop-local real-
             # deadline finalize (headless runs that get no finalize_now) — finalize
             # best-effort rather than be killed mid-step with nothing.
-            _early_final = _maybe_early_finalize(limit_ctx, tools, _controls)
+            _early_final = _maybe_early_finalize(
+                limit_ctx, tools, _controls, allow_deadline_local=transport_wait is None)
             if _early_final is not None:
                 text, accumulated_usage, forced_trace = _early_final
                 _merge_finalization_trace(llm_trace, forced_trace)
@@ -6906,11 +6891,11 @@ def run_llm_loop(
             tools._ctx._current_llm_call_meta = dict(accumulated_usage.get("_last_llm_call_meta") or {})
 
             last_error_kind = str(accumulated_usage.get("_last_llm_error_kind") or "")
-            if (
-                msg is None
-                and not bool(getattr(ctx, "exact_model_route", False))
-                and last_error_kind not in ("context_overflow", "provider_outcome_unknown", "deadline_exhausted")
-            ):
+            transport_wait = _reconcile_transport_wait(
+                transport_wait, ctx, msg_present=msg is not None,
+                error_kind=last_error_kind, drive_logs=drive_logs, task_id=task_id,
+                model=active_model, emit_progress=emit_progress)
+            if msg is None and _fallback_chain_allowed(ctx, last_error_kind, transport_wait):
                 (
                     msg,
                     active_model,
@@ -6924,11 +6909,25 @@ def run_llm_loop(
                     event_queue=event_queue, accumulated_usage=accumulated_usage, task_type=task_type,
                     emit_progress=emit_progress, context_fit_plan=context_fit_plan,
                     active_context_mode=active_context_mode)
+                if transport_wait is not None:
+                    transport_wait = _reconcile_transport_wait(
+                        transport_wait, ctx, msg_present=msg is not None,
+                        error_kind=last_error_kind, drive_logs=drive_logs, task_id=task_id,
+                        model=active_model, emit_progress=emit_progress, after_local_pass=True)
+            if msg is None and transport_wait is not None and _transport_wait_step(
+                transport_wait, tools=tools,
+                error_kind=str(accumulated_usage.get("_last_llm_error_kind") or ""),
+                drive_root=drive_root, drive_logs=drive_logs, task_id=task_id,
+                model=active_model, emit_progress=emit_progress,
+                incoming_messages=incoming_messages, owner_msg_seen=_owner_msg_seen):
+                free_redial = True
+                continue
             if msg is None:
                 # Exact actor routes skip generic substitution and fail as infrastructure.
                 text, accumulated_usage, forced_trace = _handle_provider_unavailable(
                     limit_ctx,
                     error_kind=str(accumulated_usage.get("_last_llm_error_kind") or "provider_unavailable"),
+                    wait_cause=transport_wait.wait_cause if transport_wait is not None else "",
                 )
                 _merge_finalization_trace(llm_trace, forced_trace)
                 return text, accumulated_usage, llm_trace

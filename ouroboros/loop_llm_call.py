@@ -30,6 +30,7 @@ from ouroboros.llm import LLMClient, LocalContextTooLargeError, add_usage
 from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
 from ouroboros.provider_models import provider_for_model
+from ouroboros.transport_custody import is_pre_dispatch_transport_failure
 from ouroboros.usage_accounting import (
     PhysicalAttemptContext,
     UsageAccountingError,
@@ -797,6 +798,21 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
         return LlmErrorClassification(
             "provider_outcome_unknown", False, status_code, provider_code,
         )
+    if (
+        capture is not None
+        and str(getattr(capture, "state", "") or "") == "released"
+        and str(getattr(capture, "provider", "") or "") != "local"
+        and is_pre_dispatch_transport_failure(exc)
+    ):
+        # Typed $0 fact: the request never left this host toward a REMOTE
+        # provider (released custody + typed pre-dispatch transport failure).
+        # Retrying the same request is free and safe; pacing/waiting is owned
+        # by the round-level episode in loop.py, never by this helper. A local
+        # provider's connect failure stays on the generic path — a stopped
+        # local server is not a network outage worth waiting out.
+        return LlmErrorClassification(
+            "transport_unavailable", True, status_code, provider_code,
+        )
     if any(marker in low for marker in _RETRYABLE_PROVIDER_MARKERS):
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
     return LlmErrorClassification("provider_error", True, status_code, provider_code)
@@ -1154,6 +1170,11 @@ def _handle_main_llm_call_exception(
     if _record_llm_call_error(error, ctx):
         return True
     error_kind = str(ctx.accumulated_usage.get("_last_llm_error_kind") or "")
+    if error_kind == "transport_unavailable":
+        # Exactly ONE physical attempt per invocation: a proven pre-dispatch
+        # transport failure is free ($0 released) and an in-helper burst cannot
+        # cure a dead egress — the round-level wait episode owns redial pacing.
+        return True
     is_transient = error_kind in _TRANSIENT_RETRY_KINDS
     attempt_budget = transient_budget if is_transient else min(max_retries, transient_budget)
     if ctx.attempt >= attempt_budget - 1:
@@ -1230,6 +1251,9 @@ def _handle_llm_call_exception(error: Exception, ctx: _LlmErrorContext) -> bool:
     if _record_llm_call_error(error, ctx):
         return True
     kind = str(ctx.accumulated_usage.get("_last_llm_error_kind") or "")
+    if kind == "transport_unavailable":
+        # One physical attempt per invocation — see _handle_main_llm_call_exception.
+        return True
     transient = kind in _TRANSIENT_RETRY_KINDS
     budget = ctx.transient_budget if transient else min(ctx.max_retries, ctx.transient_budget)
     if ctx.attempt >= budget - 1:
