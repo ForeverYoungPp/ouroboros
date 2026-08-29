@@ -960,13 +960,10 @@ def _delegating_ctx(tmp_path, *, acting: bool, task_id: str = "t-nanny"):
 
     repo = tmp_path / "repo"
     repo.mkdir(exist_ok=True)
-    # An acting child's WRITE ROOT is its own worktree, and the run root must equal the
-    # write_root the constraint granted — not whatever `active_repo_dir` happens to
-    # resolve to. Before v6.87.30 this fixture had no workspace at all and asserted
-    # `scope.root == repo_dir`, i.e. it pinned "hand an external shell the live Ouroboros
-    # tree" as the correct shape.
-    # The worktree must live OUTSIDE the data drive: an overlap is exactly what
-    # `workspace_mode_block_reason` refuses, and the refusal is correct.
+    # An acting child's run root must equal the granted write_root (its own
+    # worktree, OUTSIDE the data drive - the overlap is what
+    # workspace_mode_block_reason refuses). Pre-v6.87.30 this pinned
+    # "hand the shell the live tree" as correct.
     worktree = tmp_path.parent / f"wt-{tmp_path.name}"
     worktree.mkdir(exist_ok=True)
     if acting and not (worktree / ".git").exists():
@@ -4544,18 +4541,12 @@ def test_the_progress_payload_survives_a_verbose_harness_too(tmp_path, monkeypat
     assert all("OMISSION NOTE" in row["title"] and "original length 20000" in row["title"]
                for row in payload["timeline_tail"])
     assert all(len(row["title"]) < 500 for row in payload["timeline_tail"])
-    # The advance list carries the same verbose labels through the same bound. Whether
-    # this stub's payload also needs SHEDDING depends on the budget policy (it no longer
-    # does, now that the list is sized against what the rest of the payload leaves), so
-    # the shedding regime is pinned where a budget can be named:
-    # test_label_shedding_is_disclosed_on_the_row_that_gave_them_up. What must hold HERE,
-    # in either regime: every advance accounts for its labels — kept plus disclosed-shed
-    # equals what the harness ACTUALLY PUBLISHED — and no kept label escaped the bound.
-    #
-    # It used to read `== _TIMELINE_TAIL`, which pinned the defect instead of the rule:
-    # against this same 30-row stub, kept(12) + shed(0) satisfied it while the eighteen
-    # rows the batch dropped at observation went undisclosed and unnoticed. The display
-    # tail is how many rows a row may SHOW; it was never how many arrived.
+    # Every advance accounts for its labels: kept + disclosed-shed == what the
+    # harness ACTUALLY PUBLISHED, no kept label past the bound (shedding regime
+    # itself is pinned in test_label_shedding_is_disclosed_...). The old
+    # `== _TIMELINE_TAIL` pinned the defect: kept(12)+shed(0) passed while 18
+    # observation-dropped rows went undisclosed — the tail is display width,
+    # never arrival count.
     advances = payload["advances"]
     assert advances, payload
     for row in advances:
@@ -4962,20 +4953,13 @@ def test_the_wait_window_never_outlives_the_nannys_own_deadline(tmp_path, monkey
     # after it.
     assert out["status"] == "no_progress", out
     assert 1 < out["waited_sec"] <= 5, out
-    # Margins are deliberately coarse (the strict-poll margin redesign): the contract
-    # is DISCRIMINATION — a clamped wait returns near its ~5s granted window, an
-    # unclamped one holds the full 30s ask — not stopwatch accuracy.  The previous
-    # 8s ask with `< 6.0` gave the ~5s wait one second of headroom; windows-latest
-    # measured 6.922s (≈1.9s of scheduler/IO noise) on a run whose clamp arithmetic
-    # (the waited_sec line above) was correct.
+    # Coarse discrimination margin (strict-poll redesign): clamped ~5s vs the
+    # full 30s ask; windows-latest measured 6.922s of honest noise under the
+    # old 6.0 bound while the clamp arithmetic above was correct.
     assert elapsed < 15.0, elapsed
-    # The clamp's ARITHMETIC is the `waited_sec <= 5` line above: the granted window
-    # never targets the grace. This wall-clock line is the smoke over it, with a
-    # tolerance sized ABOVE the observed runner noise: between stamping the deadline
-    # and returning, the runner itself spends time (imports, stub spawn, polls) —
-    # windows-latest first measured 10.6ms past the exact boundary, then 1.92s on a
-    # loaded rerun whose clamp arithmetic was correct, so 1.0s of tolerance was still
-    # racing runner speed, not pinning the clamp.  4.0s discriminates all the same:
+    # Arithmetic pin = the waited_sec line above; this wall line is its smoke.
+    # Tolerance sits ABOVE observed runner noise (10.6ms, then 1.92s on a
+    # loaded rerun with correct arithmetic); 4.0s still discriminates:
     # an unclamped 30s hold lands ~25s past the grace.
     assert deadline_remaining_sec(ctx) > reserve - 4.0,         "the wait blew past the finalization grace by more than runner overhead"
 
@@ -5027,12 +5011,9 @@ def test_the_wait_leaves_the_grace_it_needs_to_answer_at_all(tmp_path, monkeypat
 
     out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=30)
 
-    # Without the reserve it would have held min(ask, remaining) = 30s and come back
-    # with only the grace period left; with it, the window is what remains ABOVE the
-    # grace.  The wall bound is coarse on purpose (the strict-poll margin redesign):
-    # the honest ~4s wait plus the observed ~2s runner noise stays far inside 12s,
-    # while both failure shapes (the 30s ask held, or the reserve forgotten and the
-    # whole ~2min remainder held) land far outside it.
+    # Without the reserve it would hold min(ask, remaining)=30s into the grace;
+    # with it the window is what remains ABOVE the grace. Coarse wall bound:
+    # honest ~4s+noise « 12s « either failure shape (30s ask / ~2min remainder).
     assert out["waited_sec"] <= 4, out
     assert elapsed < 12.0, elapsed
 
@@ -5080,12 +5061,9 @@ def test_the_clamp_keys_on_whether_a_deadline_exists_not_on_int_of_what_is_left(
 
     assert out["status"] == "no_progress", out
     assert out["waited_sec"] == expected_window, out
-    # `waited_sec` is what the payload CLAIMS; the wall clock is what the task actually
-    # spent, and the seconds held past a spent deadline are what the caller pays for.
-    # The 5s tolerance sits ABOVE the observed ~2s runner noise (2.0s left the 1s
-    # floor waits a 0.1s margin) and still discriminates the failure shape: a skipped
-    # clamp holds the full 8s ask on the spent-deadline cases, landing past
-    # expected_window + 5.
+    # waited_sec = the payload's CLAIM; wall clock = what the task paid. 5s
+    # tolerance sits above the ~2s observed noise yet a skipped clamp (full 8s
+    # ask on spent-deadline cases) still lands past expected_window + 5.
     assert elapsed < expected_window + 5.0, elapsed
 
 
@@ -5347,11 +5325,9 @@ def test_every_poll_is_bounded_by_what_the_window_has_left(tmp_path, monkeypatch
     assert all(value is not None for value in asked), \
         "an unbounded poll is the client's 60s default, which outlives any window"
 
-    # The other direction, which a floor alone got backwards: a long window has MORE
-    # than the client's own read default left, and `max()` handed that surplus to the
-    # transport as the ask (measured: 1797.0 for a 1800s window). A hung daemon then
-    # stopped failing at sixty seconds and held the whole window — reported afterwards
-    # as a wait that saw nothing. A bound NARROWS in both directions or it is decoration.
+    # The direction a floor alone got backwards: max() handed a long window's
+    # surplus to the transport ask (1797.0 for a 1800s window), so a hung daemon
+    # held the whole window. A bound NARROWS both directions or it is decoration.
     asked.clear()
     bounded_poll(gateway, "run-1", 1797.0)
     bounded_poll(gateway, "run-1", 61.0)
@@ -5702,12 +5678,9 @@ def test_the_advance_list_yields_entirely_rather_than_pushing_the_payload_over()
     marker, = payload["advances"]
     assert marker["advances_omitted"] == len(seen.advances) == 12, marker
     assert marker["omitted_through_seq"] == 12, marker
-    # ...and the note points at where the omitted rows ACTUALLY are. It used to say they
-    # "were streamed live and are in the event log": the first half is untrue of a batch
-    # bigger than the display tail (those rows never reached the live line at all) and
-    # the second of all of them (Ouroboros persists no timeline; the daemon's own run
-    # directory holds it). A recovery instruction that sends the reader to a log that
-    # never had the rows is worse than no instruction.
+    # ...and the note points at where omitted rows ACTUALLY are (the daemon's
+    # run directory). The old "streamed live / in the event log" was untrue on
+    # both halves - a pointer to a log that never had the rows is worse than none.
     assert "Claudexor's own timeline" in marker["note"], marker
     assert "event log" not in marker["note"], marker
 
@@ -5777,11 +5750,8 @@ def test_a_batch_bigger_than_the_display_tail_says_how_much_it_is_not_showing():
 
 
 def test_a_long_busy_windows_advance_list_is_measured_not_estimated():
-    """The sibling of the verbose-harness case, from the other direction: not a handful
-    of enormous labels but HIGH CARDINALITY — 601 advances of twelve ordinary titles,
-    which is simply what a healthy run looks like when it is watched for a long window.
-    It is not an exotic shape either: the 1800s ceiling divided by the 3s poll interval
-    is 600, so this is the WORST case the wait can actually produce, not a synthetic one.
+    """The high-cardinality sibling of the verbose-harness case: 601 advances of
+    ordinary titles - the realistic worst case (1800s ceiling / 3s poll = 600).
 
     The bound used to be ESTIMATED: a running total decremented by each shed row, and
     then a survivor count of `budget // 40` on the assumption that a bare spine row
@@ -5825,11 +5795,9 @@ def test_a_long_busy_windows_advance_list_is_measured_not_estimated():
     assert delivered == raw, "the generic truncator had to cut this payload"
     assert json.loads(delivered) == payload, "the model received unparseable JSON"
     rows = payload["advances"]
-    # The list is sized against what is LEFT of the budget, not a fixed share: a share
-    # bounds only itself, and `timeline_tail` (harness-authored text) can eat most of
-    # the limit on its own — which is how a sub-block that fitted its third still
-    # overflowed the result. So the invariant is the WHOLE payload above, and here that
-    # the list did take a real share of it rather than being emptied to make room.
+    # Sized against what is LEFT of the budget, not a fixed share (a share
+    # bounds only itself; timeline_tail alone once overflowed the result): the
+    # invariant is the WHOLE payload above, and the list keeps a real share.
     assert len(json.dumps(rows, ensure_ascii=False, indent=2)) < len(raw)
 
     # It shed from the HEAD and it SAYS so, with the accounting adding up: a payload that
@@ -5838,12 +5806,9 @@ def test_a_long_busy_windows_advance_list_is_measured_not_estimated():
     assert kept, rows
     assert marker["advances_omitted"] == advances - len(kept), (marker, len(kept))
     assert marker["omitted_through_seq"] == kept[0]["seq"] - 1, (marker, kept[0])
-    # ...and the note points at where the omitted rows ACTUALLY are. It used to say they
-    # "were streamed live and are in the event log": the first half is untrue of a batch
-    # bigger than the display tail (those rows never reached the live line at all) and
-    # the second of all of them (Ouroboros persists no timeline; the daemon's own run
-    # directory holds it). A recovery instruction that sends the reader to a log that
-    # never had the rows is worse than no instruction.
+    # ...and the note points at where omitted rows ACTUALLY are (the daemon's
+    # run directory). The old "streamed live / in the event log" was untrue on
+    # both halves - a pointer to a log that never had the rows is worse than none.
     assert "Claudexor's own timeline" in marker["note"], marker
     assert "event log" not in marker["note"], marker
     assert [row["seq"] for row in kept] == list(range(kept[0]["seq"], advances + 1))
