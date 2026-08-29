@@ -8,6 +8,11 @@ optional advisory reviewer. Each row is::
                                     "target_id": "<model id | harness[=model]>"},
      "effort": "high"}
 
+or, mutually exclusively, a reference to a configured subagent
+(``OUROBOROS_SUBAGENTS`` row)::
+
+    {"slot_id": "t_9f3a", "subagent_id": "<roster id>", "effort": "high"}
+
 ``slot_id`` is a STABLE owner-assigned identity, never an array index: a row's
 receipts must keep lining up with its own history when the owner reorders or
 edits rows (see ``review_substrate.slot_id_for_row`` for why a model is not an
@@ -16,6 +21,13 @@ an OPAQUE Claudexor route spec (``harness[=model]`` — Claudexor's own
 reviewer-panel spelling, no ``::`` syntax) on ``agent_session``. Effort is a
 per-row property on the existing ``EFFORT_SCALE`` — the same mechanism the
 model lanes use, deliberately not a new one.
+
+An actor reference never duplicates route/model/effort knobs: the roster row is
+their SSOT, resolved ONCE at load/admission into the same frozen slot fields a
+direct row carries (route drift after admission changes later waves only). An
+``agent_session`` actor delivers through the existing session executor; an
+``api_model`` actor delivers as bounded native tool rounds — retrieval, never
+the assembled ``api_chat`` packet.
 
 MIGRATION (D15: "старый читается, если новых нет"): when the structured key is
 absent, the legacy comma-lists (``OUROBOROS_REVIEW_MODELS`` /
@@ -84,10 +96,34 @@ class ConfiguredReviewerSlot:
     # Optional manual credential pin (Q2-в): '' = the daemon's rotation policy
     # (D28 default). Meaningful on agent_session rows only.
     profile_id: str = ""
+    # Optional configured-subagent reference (OUROBOROS_SUBAGENTS row id).
+    # Mutually exclusive with an inline route in the STORED form; when set, the
+    # execution fields above were resolved from the frozen roster row at load
+    # time and the roster stays their SSOT. '' = ordinary direct row.
+    subagent_id: str = ""
 
     @property
     def is_session(self) -> bool:
         return self.kind == ROUTE_KIND_SESSION
+
+    @property
+    def native_retrieval(self) -> bool:
+        """An ``api_model`` configured-subagent row: bounded native tool rounds.
+
+        Kept OFF the closed public route vocabulary (``api_chat`` stays the
+        wire kind); executor selection and admission read this derived fact.
+        """
+        return bool(self.subagent_id) and self.kind == ROUTE_KIND_API
+
+    @property
+    def retrieves(self) -> bool:
+        """Delivery class: the reviewer reads the subject with its own tools.
+
+        THE predicate admission/fit/authority callers must use instead of
+        route-name comparisons — a session row and a native-retrieval actor
+        row are one class here, and neither receives an assembled packet.
+        """
+        return self.is_session or self.native_retrieval
 
 
 @dataclass(frozen=True)
@@ -168,10 +204,66 @@ def _validate_concrete_session_target(route: RouteSpec, where: str) -> None:
         )
 
 
+def _resolve_actor_slot(
+    slot_id: str, subagent_id: str, effort: str, where: str,
+) -> ConfiguredReviewerSlot:
+    """Materialize a configured-subagent reference into one frozen reviewer row.
+
+    Resolution happens at load/admission time: the wave that materialized this
+    row carries the resolved facts, and a later roster edit changes later
+    loads only (the #285 freeze-at-admission class). An unknown, disabled, or
+    invalid roster reference is a malformed reviewer configuration — the same
+    typed ValueError authority every consumer of this parser already treats as
+    fail-closed (save-time 400, review-time typed block), never a silent
+    fallback to another route or model.
+    """
+    from ouroboros.config import load_settings
+    from ouroboros.subagent_runtime import (
+        SubagentSelectionError,
+        effective_runtime_subagent_settings,
+        select_subagent_snapshot,
+    )
+
+    try:
+        snapshot, _legacy = select_subagent_snapshot(
+            effective_runtime_subagent_settings(load_settings()),
+            subagent_id=subagent_id,
+        )
+    except SubagentSelectionError as exc:
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} subagent_id {subagent_id!r} does "
+            f"not resolve: {exc.code}: {exc.detail}"
+        ) from exc
+    route = dict(snapshot.get("route") or {})
+    target = str(route.get("target_id") or "")
+    pin = str(route.get("credential_profile_id") or "")
+    # Explicit row effort wins; otherwise the roster row's own effort; an empty
+    # result falls through to the surface default via row_effort, as always.
+    chosen_effort = effort or _valid_effort(snapshot.get("effort"), where)
+    if str(route.get("kind") or "") == SHARED_ROUTE_KIND_SESSION:
+        shared = RouteSpec(
+            kind=SHARED_ROUTE_KIND_SESSION, target_id=target,
+            credential_profile_id=pin,
+        )
+        _validate_concrete_session_target(shared, where)
+        validate_compound_session_effort(
+            shared, chosen_effort, setting=REVIEWER_SLOTS_ENV, where=where,
+        )
+        return ConfiguredReviewerSlot(
+            slot_id=slot_id, kind=ROUTE_KIND_SESSION, target_id=target,
+            effort=chosen_effort, session_target=target, profile_id=pin,
+            subagent_id=subagent_id,
+        )
+    return ConfiguredReviewerSlot(
+        slot_id=slot_id, kind=ROUTE_KIND_API, target_id=target,
+        effort=chosen_effort, subagent_id=subagent_id,
+    )
+
+
 def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
     if not isinstance(row, dict):
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: {where} is not an object")
-    unknown = sorted(set(row) - {"slot_id", "route", "effort"})
+    unknown = sorted(set(row) - {"slot_id", "route", "subagent_id", "effort"})
     if unknown:
         raise ValueError(
             f"{REVIEWER_SLOTS_ENV}: {where} has unknown keys: {unknown}"
@@ -508,6 +600,7 @@ def structured_scope_review_slots() -> Optional[list]:
                    else ReviewRouteKind.API_CHAT),
             session_target=row.session_target,
             session_profile=row.profile_id,
+            subagent_id=row.subagent_id,
         )
         for row in commit_scope_rows()
     ]
@@ -536,6 +629,7 @@ def commit_triad_delivery() -> Dict[str, Any]:
         "session_targets": [row.session_target for row in rows],
         "session_profiles": [row.profile_id for row in rows],
         "slot_ids": [row.slot_id for row in rows],
+        "subagent_ids": [row.subagent_id for row in rows],
         "legacy_skill_fingerprint": (
             config.source == "legacy" and all(not row.is_session for row in rows)
         ),
@@ -587,7 +681,12 @@ def api_fallback_disclosure(config: "ReviewerSlotConfig") -> Dict[str, Any]:
     from ouroboros.config import SETTINGS_DEFAULTS
 
     out: Dict[str, Any] = {}
-    if config.triad and not any(not r.is_session for r in config.triad):
+    # An actor row never feeds the API-only acceptance projection (its api form
+    # is retrieval delivery, not an api_chat packet model), so a triad of
+    # sessions and actors falls back exactly like an all-session one.
+    if config.triad and not any(
+        not r.is_session and not r.subagent_id for r in config.triad
+    ):
         out["triad"] = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"]).split(",")
     return out
 
@@ -690,8 +789,19 @@ def project_reviewer_slots_into_env() -> None:
                 REVIEWER_SLOTS_ENV, exc_info=True,
             )
         else:
-            api_triad = [r.target_id for r in config.triad if not r.is_session]
-            api_scope = [r.target_id for r in config.scope if not r.is_session]
+            # D15: only DIRECT api_chat rows project into the legacy comma keys
+            # API-only task acceptance reads. A configured-subagent api row is
+            # retrieval delivery — projecting its model here would silently
+            # hand acceptance a packet reviewer the owner configured as an
+            # actor (and its model id may not even be an api_chat catalog id).
+            api_triad = [
+                r.target_id for r in config.triad
+                if not r.is_session and not r.subagent_id
+            ]
+            api_scope = [
+                r.target_id for r in config.scope
+                if not r.is_session and not r.subagent_id
+            ]
             if api_triad:
                 os.environ["OUROBOROS_REVIEW_MODELS"] = ",".join(api_triad)
             else:
@@ -812,6 +922,9 @@ def record_reviewer_slot_executions(surface: str, actors: Any, slots_by_id: Dict
                     "effort": str(getattr(slot, "effort", "") or ""),
                     "session_target": str(getattr(slot, "session_target", "") or ""),
                     "profile_id": str(getattr(slot, "session_profile", "") or ""),
+                    # Actor binding, when the row is a configured-subagent
+                    # reference ('' = direct row) — disclosure, never routing.
+                    "subagent_id": str(getattr(slot, "subagent_id", "") or ""),
                 },
                 "effective": effective,
                 "capability_delta": usage.get("capability_delta") or [],

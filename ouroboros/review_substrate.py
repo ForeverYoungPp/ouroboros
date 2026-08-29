@@ -127,6 +127,26 @@ class ReviewSlot:
     # Optional manual credential pin (Q2-в); '' = the daemon's rotation (D28).
     session_profile: str = ""
     transport_timeout_sec: Optional[float] = None
+    # Optional configured-subagent binding (resolved by reviewer_slot_config at
+    # admission; '' = ordinary direct row). The binding is identity/provenance:
+    # route/model/effort above already carry the resolved execution facts.
+    subagent_id: str = ""
+
+    @property
+    def native_retrieval(self) -> bool:
+        """An api-route slot bound to a configured subagent delivers as bounded
+        native tool rounds — retrieval, never the assembled api_chat packet.
+        Kept off the closed public route vocabulary; the executor seam and
+        admission read this derived fact."""
+        return bool(self.subagent_id) and self.route is ReviewRouteKind.API_CHAT
+
+    @property
+    def retrieves(self) -> bool:
+        """Delivery class: this slot reads the subject with its own tools.
+        THE predicate for admission/fit/authority callers — a session row and a
+        native-retrieval actor row are one class here; transport facts (custody
+        tokens, threads, daemon health) still test the route itself."""
+        return self.route is ReviewRouteKind.AGENT_SESSION or self.native_retrieval
 
 
 @dataclass

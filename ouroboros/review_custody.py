@@ -662,6 +662,9 @@ def _attempt_key(request: Any, slot: Any) -> str:
         key: getattr(slot, key, None) for key in (
             "slot_id", "model", "effort", "max_tokens", "temperature", "role_hint",
             "use_local", "route", "session_target", "session_profile",
+            # Actor binding is operation identity: a changed configured-subagent
+            # reference mints a new attempt key, exactly like a changed route.
+            "subagent_id",
         )
     }
     identity = {

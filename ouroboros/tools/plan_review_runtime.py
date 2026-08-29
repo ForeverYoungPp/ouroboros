@@ -231,6 +231,7 @@ def plan_review_slots() -> list:
             route=ReviewRouteKind.AGENT_SESSION if row.is_session else ReviewRouteKind.API_CHAT,
             session_target=row.session_target,
             session_profile=row.profile_id,
+            subagent_id=row.subagent_id,
         )
         for row in load_reviewer_slot_config().triad
     ]
