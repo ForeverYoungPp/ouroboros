@@ -41,6 +41,7 @@ def _with_coordination_context(ctx: Any, raw: str) -> str:
 # spirit; the set errs toward the episode, never toward the terminal).
 _DEFINITE_UNRUN_REASONS = frozenset({
     "route_not_in_capability_catalog",
+    "route_disabled",
     "engine_rejects_delegated_marker",
     "subscription_window_exhausted",
     "credential_pool_exhausted",
@@ -164,7 +165,18 @@ def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -
         if fenced:
             # A fence (recorded receipt / unreadable receipt store) may hide a
             # prior physical run: the model must reconcile it, so the blocked
-            # fact rides the episode instead of fabricating an unrun terminal.
+            # fact rides the episode instead of fabricating an unrun terminal —
+            # and it rides VISIBLY: the receipt carries the typed route_blocked
+            # facts, not just a durable custody row the model never sees.
+            try:
+                payload = json.loads(actor_ready)
+                payload["route_blocked"] = {
+                    "reason": reason,
+                    **({"reset_at": reset_at} if reset_at else {}),
+                }
+                actor_ready = json.dumps(payload, ensure_ascii=False, indent=2)
+            except (TypeError, ValueError):
+                pass
             return _with_coordination_context(ctx, actor_ready)
         _record_startup_refusal(ctx, task, reason=reason, reset_at=reset_at)
         return ""

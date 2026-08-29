@@ -414,12 +414,16 @@ def route_health(
     names no reset instant still reports ``subscription_window_exhausted`` — as the
     REASON with an empty ``reset_at``, since an unknown healing time is not health.
 
-    The harness row's aggregate ``status``/``enabled`` pair is deliberately NOT
-    a refusal here (cx-delegation sprint, owner decisions 2026-08-28 «статус
-    обманывает, игнорируй его и всё равно пробуй запустить» + 7=A). That pair
-    describes the DEFAULT credential store, while real accounts live in the
-    engine's credential-profile pool — a pool-only harness read ``unavailable``
-    FOREVER (agy, INV-135) and blocked routes the engine itself would admit.
+    The harness row's aggregate doctor ``status`` is deliberately NOT a refusal
+    here (cx-delegation sprint, owner decisions 2026-08-28 «статус обманывает,
+    игнорируй его и всё равно пробуй запустить» + 7=A): it describes the
+    DEFAULT credential store, while real accounts live in the engine's
+    credential-profile pool — a pool-only harness read ``unavailable`` FOREVER
+    (agy, INV-135) and blocked routes the engine itself would admit. The row's
+    ``enabled`` field is different and IS honored for unpinned routes
+    (``route_disabled``): the engine schema defines it as the OWNER's settings
+    toggle — "routing excludes it regardless of doctor status" — an explicit
+    owner decision, not an observation.
     Admission belongs to the engine: a genuinely empty or exhausted pool answers
     the start POST with its own typed refusal (INV-135
     ``credential_pool_exhausted`` + earliest reset), which under the pre-start

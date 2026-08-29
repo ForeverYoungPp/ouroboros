@@ -207,8 +207,10 @@ def test_the_baseline_advances_on_delegate_verbs_only():
     assert cost == pytest.approx(2.7)
 
     # Supervision verbs (answer/cancel) share the wait semantics under the
-    # charter (owner 2026-08-28): the round axis re-baselines, dollars stay
-    # cumulative — supervising a run is not a new act of delegation.
+    # sprint plan's D6 ("only delegate_start/schedule_subagent reset"; the
+    # answer/cancel treatment is the operator's disclosed reading of that
+    # plan): the round axis re-baselines, dollars stay cumulative —
+    # supervising a run is not a new act of delegation.
     _note_nanny_delegate_activity(ctx, 8, {"cost": 3.4}, [_delegate_call("delegate_answer")])
     rounds, cost = _nanny_metered_since_delegate_activity(ctx)
     assert rounds == 0
@@ -405,11 +407,14 @@ def test_the_rearm_is_dual_axis_a_continuing_dollar_burn_refires_before_8_rounds
     assert _maybe_inject_nanny_economics_reminder(4, [], tools, lambda *_: None) is False
 
 
-def test_delegate_activity_resets_the_fire_cursor():
-    """F1 (gemini): a cooldown earned BEFORE delegate activity must not mute the
-    reminder for burn that happens AFTER it — the fire cursor is cleared on the
-    delegate verb, so the first post-activity threshold crossing fires with no
-    spacing gate."""
+def test_only_a_real_act_of_delegation_resets_the_fire_cursor():
+    """F1 (gemini), charter-refined (adversarial ECON-1): a cooldown earned
+    BEFORE a real act of delegation must not mute the reminder for burn AFTER
+    it — delegate_start re-zeroes the baseline AND clears the fire cursor. A
+    supervision verb (delegate_wait) deliberately KEEPS the cursor: the dollar
+    axis never resets across supervision, so clearing the cursor there would
+    re-fire the reminder on every post-threshold supervision round (the
+    reminder storm)."""
     from ouroboros.task_pacing import NANNY_REMINDER_USD
     from ouroboros.loop import (
         _maybe_inject_nanny_economics_reminder,
@@ -422,13 +427,15 @@ def test_delegate_activity_resets_the_fire_cursor():
     _note_nanny_delegate_activity(ctx, 2, {"cost": NANNY_REMINDER_USD}, [])
     assert _maybe_inject_nanny_economics_reminder(2, [], tools, lambda *_: None) is True
     assert isinstance(ctx._nanny_reminder_mark, dict)
-    # Delegate activity: baseline re-zeroes AND the fire cursor clears.
+    # A supervision verb keeps the cursor — no storm.
     _note_nanny_delegate_activity(ctx, 3, {"cost": NANNY_REMINDER_USD}, [_delegate_call("delegate_wait")])
+    assert isinstance(ctx._nanny_reminder_mark, dict)
+    # A REAL act of delegation re-zeroes the baseline and clears the cursor,
+    # so the first post-activity threshold crossing fires with no spacing gate.
+    _note_nanny_delegate_activity(ctx, 4, {"cost": NANNY_REMINDER_USD}, [_delegate_call()])
     assert ctx._nanny_reminder_mark is None
-    # Immediately after, one more expensive round crosses the cost threshold
-    # again — and fires as a FIRST firing (no spacing gate), round 4 < 8.
-    _note_nanny_delegate_activity(ctx, 4, {"cost": 2 * NANNY_REMINDER_USD}, [])
-    assert _maybe_inject_nanny_economics_reminder(4, [], tools, lambda *_: None) is True
+    _note_nanny_delegate_activity(ctx, 5, {"cost": 2 * NANNY_REMINDER_USD}, [])
+    assert _maybe_inject_nanny_economics_reminder(5, [], tools, lambda *_: None) is True
 
 
 def test_a_ritual_wait_cannot_rebaseline_the_cost_axis():
@@ -456,7 +463,7 @@ def test_a_ritual_wait_cannot_rebaseline_the_cost_axis():
         if _maybe_inject_nanny_economics_reminder(round_idx, msgs, tools, lambda *_: None):
             fired.append(round_idx)
             joined = "\n".join(m.get("content", "") for m in msgs)
-            assert "since your last delegated-run activity" in joined
+            assert "since your last act of delegation" in joined
     assert fired, "the ritual wait must not silence the dollar axis"
     # $2 threshold crossed at round 9 ($2.16) despite the wait at round 7.
     assert fired[0] == 9
@@ -895,3 +902,41 @@ def test_normalized_contract_rebuild_keeps_workspace_lineage_and_predecessor():
     })
 
     assert build_task_contract({"task_contract": normalized}) == normalized
+
+
+def test_supervision_rounds_do_not_storm_the_reminder(tmp_path):
+    # Adversarial-wave ECON-1: once lifetime metered cost crosses the dollar
+    # threshold, honest supervision (wait/answer/cancel) must NOT wipe the
+    # reminder cursor — otherwise the reminder re-fires on every round after
+    # every supervision verb, bypassing the threshold-width re-arm and
+    # punishing waiting harder than co-building.
+    from types import SimpleNamespace
+
+    from ouroboros.loop import (
+        _maybe_inject_nanny_economics_reminder,
+        _note_nanny_delegate_activity,
+    )
+    from ouroboros.task_pacing import NANNY_REMINDER_USD
+
+    ctx = SimpleNamespace(_nanny_route_dispatched=True)
+    tools = SimpleNamespace(_ctx=ctx)
+    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
+    fired = 0
+    for round_idx in range(2, 22):
+        cost = NANNY_REMINDER_USD + 0.05 * round_idx
+        _note_nanny_delegate_activity(ctx, round_idx, {"cost": cost}, [
+            _delegate_call("delegate_wait"),
+        ])
+        if _maybe_inject_nanny_economics_reminder(round_idx, [], tools, lambda *_: None):
+            fired += 1
+    # One threshold crossing plus at most a couple of proportional re-arms —
+    # never one reminder per round (the storm repro measured 14/20).
+    assert fired <= 3, f"reminder stormed: fired {fired} times in 20 supervision rounds"
+
+
+def test_burn_phrase_never_claims_zero_rounds_with_real_dollars():
+    from ouroboros.loop import _nanny_burn_phrase
+
+    assert "0 of your own metered LLM rounds" not in _nanny_burn_phrase(0, 2.45)
+    assert "$2.45" in _nanny_burn_phrase(0, 2.45)
+    assert "3 of your own metered LLM rounds" in _nanny_burn_phrase(3, 2.45)

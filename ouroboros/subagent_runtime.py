@@ -697,12 +697,13 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
             _work_order_source_request=work_order_source_request,
             _coordination_context=coordination_context,
         )
-        # Actor-first configured sessions keep the physical leaf pending until the
-        # ordinary host episode chooses ``delegate_start``.  Mark that choice from
-        # the host-owned typed result, including the uncustodied branch: a run may
-        # already be live even when its durable custody row could not be written.
-        # Without this marker the same episode could mint a false zero-run receipt
-        # after a successful start and nanny economics would miss real activity.
+        # Every configured-session start lands here — the host's pre-start
+        # (charter, owner 2026-08-28/29) and any model-issued retry/replacement
+        # alike. Mark the physical start from the host-owned typed result,
+        # including the uncustodied branch: a run may already be live even when
+        # its durable custody row could not be written. Without this marker the
+        # episode could mint a false zero-run receipt after a successful start
+        # and nanny economics would miss real activity.
         _mark_actor_physical_start(ctx, result)
         try:
             payload = json.loads(result)

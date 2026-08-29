@@ -862,17 +862,24 @@ def _accept_substrate_execution(ctx: Any, task_id: str) -> Dict[str, Any]:
 
         evidence = task_execution_evidence(custody_root(ctx), str(task_id or ""))
         evidence = evidence if isinstance(evidence, dict) else {}
-        out["actual_substrate"] = actual_substrate(evidence)
-        for key in (
-            "delegated_runs_started", "delegated_runs_settled",
-            "delegated_runs_succeeded", "delegated_runs_failed",
-            "delegated_runs_source_unresolved",
-        ):
-            out[key] = int(evidence.get(key) or 0)
         if evidence.get("evidence_read_failed"):
-            # Unreadable custody must not read as a proven-empty substrate.
+            # Unreadable custody must not read as a proven-empty substrate —
+            # neither the enum NOR the zero-valued counters (which would be
+            # exactly the proven-empty reading beside the flag).
             out["evidence_read_failed"] = True
-            out.pop("actual_substrate", None)
+        else:
+            out["actual_substrate"] = actual_substrate(evidence)
+            for key in (
+                "delegated_runs_started", "delegated_runs_settled",
+                "delegated_runs_succeeded", "delegated_runs_failed",
+                "delegated_runs_source_unresolved",
+            ):
+                out[key] = int(evidence.get(key) or 0)
+            if evidence.get("delegate_start_attempted"):
+                # Durable start-blocked/requested rows: an ATTEMPT is evidence
+                # of obedience even when nothing started (plan D8: start-blocked
+                # facts ride the packet, not only the run counters).
+                out["delegate_start_attempted"] = True
         failure_states = [
             str(s) for s in (evidence.get("delegated_run_failure_states") or [])
         ]

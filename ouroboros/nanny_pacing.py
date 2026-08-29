@@ -10,16 +10,14 @@ DELEGATE_ACTIVITY_TOOLS = frozenset({
 })
 
 # Only genuine ACTS of delegation reset the burn baseline: starting a physical
-# run or spawning an explicit child (charter, owner 2026-08-28). Supervision
-# verbs advance the round baseline while dollars keep accumulating; every
-# other coordination verb is observed for nudge phrasing but never buys
-# metered silence — the poltergeist pattern was tens of metered rounds each
-# "paid for" by a cheap tree_read/verify_and_record baseline reset.
+# run or spawning an explicit child (sprint plan D6, owner-approved 2026-08-28;
+# the wait-style treatment of answer/cancel below is the operator's disclosed
+# reading of that plan — "only start/schedule reset" — not a separate owner
+# decision). Supervision verbs advance the round baseline while dollars keep
+# accumulating; every other coordination verb is observed for nudge phrasing
+# but never buys metered silence — the poltergeist pattern was tens of metered
+# rounds each "paid for" by a cheap tree_read/verify_and_record baseline reset.
 BASELINE_RESET_TOOLS = frozenset({"delegate_start", "schedule_subagent"})
-
-SUPERVISION_ACTIVITY_TOOLS = frozenset({
-    "delegate_wait", "delegate_cancel", "delegate_answer",
-})
 
 HOST_COORDINATION_ACTIVITY_TOOLS = frozenset({
     "schedule_subagent", "wait_task", "wait_tasks", "get_task_result", "peek_task",
@@ -62,13 +60,20 @@ def note_nanny_delegate_activity(
         return
     if verbs & BASELINE_RESET_TOOLS:
         ctx._nanny_delegate_baseline = dict(mark)
+        # Only a real act of delegation re-arms the reminder from scratch.
+        ctx._nanny_reminder_mark = None
     else:
         # Supervision (wait/answer/cancel) advances the round baseline but
-        # preserves cumulative dollar burn.
+        # preserves cumulative dollar burn — and deliberately KEEPS the
+        # reminder cursor: with dollars accumulating across supervision,
+        # wiping the cursor on every wait/answer would re-fire the reminder
+        # each following round once lifetime burn crosses the threshold
+        # (the adversarial-wave "reminder storm"), bypassing the
+        # threshold-width re-arm and punishing honest waiting harder than
+        # co-building.
         prior = getattr(ctx, "_nanny_delegate_baseline", None)
         prior_cost = float(prior.get("cost") or 0.0) if isinstance(prior, dict) else 0.0
         ctx._nanny_delegate_baseline = {"round": mark["round"], "cost": prior_cost}
-    ctx._nanny_reminder_mark = None
 
 
 def nanny_metered_since_delegate_activity(ctx: Any) -> Tuple[int, float]:
@@ -132,6 +137,10 @@ def nanny_reminder_due(ctx: Any, round_idx: int) -> Tuple[int, float, bool]:
 
 
 def nanny_burn_phrase(rounds: int, cost: float) -> str:
+    if rounds <= 0 and cost > 0:
+        # Supervision advances the round baseline while dollars accumulate, so
+        # "0 rounds (~$2.45)" would be an absurd self-contradiction.
+        return f"~${cost:.2f} of your own metered spend"
     if cost > 0:
         return f"{rounds} of your own metered LLM rounds (~${cost:.2f})"
     return f"{rounds} of your own metered LLM rounds"

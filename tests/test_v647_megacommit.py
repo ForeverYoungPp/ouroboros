@@ -1546,3 +1546,54 @@ def test_finalize_schedule_emission_surfaces_coop_tree_path():
         "emitted_modes": ["live"],
     })
     assert "shared coop tree" not in out2
+
+
+def test_zero_run_complete_is_no_longer_writable(tmp_path):
+    # Owner N3=A (2026-08-28): a zero-run "complete" is unverifiable self-report
+    # and stopped being writable; the write enum is incomplete|unknown.
+    from ouroboros.tools.verify import _verify_and_record
+
+    ctx = _verify_ctx(tmp_path)
+    ctx._configured_actor_bootstrap = {
+        "route_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+        "physical_started": False,
+    }
+    refused = _verify_and_record(
+        ctx,
+        contract_kind="delegation_zero_run",
+        zero_run_decision="complete",
+        zero_run_basis="claims to be done without a run",
+    )
+    assert "TOOL_ARG_ERROR" in refused
+    assert "incomplete, unknown" in refused
+    from ouroboros.outcomes import read_verification_receipts
+
+    assert read_verification_receipts(tmp_path, ctx.task_id) == []
+
+
+def test_historical_zero_run_complete_projects_unknown_with_disclosure():
+    # Owner R4=A (2026-08-28): a historical "complete" receipt still fences a
+    # second start on read, but the terminal projection degrades it to UNKNOWN
+    # with disclosure — never a clean terminal.
+    from ouroboros.subagent_bootstrap import actor_first_terminal_projection
+
+    ctx = types.SimpleNamespace(
+        task_id="actor-historical",
+        _configured_actor_bootstrap={
+            "zero_run_receipt_recorded": True,
+            "zero_run_decision": "complete",
+            "zero_run_basis": "pre-charter self-report",
+            "route_available": True,
+            "physical_started": False,
+        },
+    )
+    fact, usage, trace = actor_first_terminal_projection(
+        ctx, {"id": "actor-historical"}, {}, {}, None,
+    )
+    assert fact is not None
+    assert fact["status"] == "unknown"
+    assert fact["reason"] == "historical_zero_run_complete"
+    assert fact["zero_run_decision"] == "complete"
+    assert usage["actor_first_terminal"]["reason"] == "historical_zero_run_complete"
+    assert trace["actor_first_terminal"]["status"] == "unknown"

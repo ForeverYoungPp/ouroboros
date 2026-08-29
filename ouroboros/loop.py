@@ -2822,14 +2822,17 @@ def _maybe_inject_nanny_economics_reminder(
     # activity" — the burn is measured from the task's start, and the wording
     # says so instead of implying an activity that never happened.
     _baseline_known = isinstance(getattr(ctx, "_nanny_delegate_baseline", None), dict)
-    coordination = bool(getattr(ctx, "_nanny_coordination_activity", False))
     if _baseline_known:
+        # Charter wording: supervision and coordination rounds COUNT toward
+        # this burn (they no longer reset the dollar axis), so the honest
+        # anchor is the last ACT of delegation, not "activity" in general.
         since_phrase = (
-            "since your last delegated-run or host-coordination activity"
-            if coordination else "since your last delegated-run activity"
+            "since your last act of delegation (delegate_start / "
+            "schedule_subagent) — supervision and coordination rounds count "
+            "toward this burn"
         )
     else:
-        since_phrase = "since this task started (no delegated-run activity yet)"
+        since_phrase = "since this task started (no act of delegation yet)"
     # BR1-3: never an unconditional "$0" claim — the owner's wording law is
     # typed cost classes: known-zero only on a settled $0 spend, never "free"
     # unqualified (estimated/undisclosed spend is never zero).
@@ -5741,8 +5744,9 @@ def _nanny_finalization_message(
             return ""
         return (
             "⚠️ NANNY_METERED_OVERRUN: your delegated run(s) succeeded, but you have "
-            f"since spent {_nanny_burn_phrase(rounds, cost)} with no delegated-run "
-            "activity. A successful run is verified and integrated, not rebuilt. If "
+            f"since spent {_nanny_burn_phrase(rounds, cost)} beyond your last act of "
+            "delegation (supervision and integration rounds count toward this burn). "
+            "A successful run is verified and integrated, not rebuilt. If "
             "the remaining work is substantive, delegate it (a new delegate_start); "
             "if you are wrapping up, keep the wrap-up short and account for the "
             "metered spend honestly in your result."
@@ -5815,6 +5819,18 @@ def _nanny_finalization_message(
             "CONFIGURED_ACTOR_INCOMPLETE"
             if _status == "incomplete" else "CONFIGURED_ACTOR_UNKNOWN"
         )
+        if str(actor_fact.get("reason") or "") == "zero_run_evidence_unavailable":
+            # A fence state: exact_start structurally REFUSES here, so telling
+            # the model to delegate_start would send it into a wall.
+            return (
+                f"⚠️ {_code}: this configured session child is finalizing over "
+                "unreadable/ambiguous zero-run receipt evidence — a physical "
+                "start is fenced. Reconcile the durable evidence, then record "
+                "the typed terminal via verify_and_record(contract_kind="
+                f"delegation_zero_run, zero_run_decision={_status!r}, "
+                "zero_run_basis=...). A plain prose answer cannot close this "
+                "evidence gap."
+            )
         return (
             f"⚠️ {_code}: this configured session child is finalizing with no "
             "physical leaf run and no durable typed zero-run decision. Start "
