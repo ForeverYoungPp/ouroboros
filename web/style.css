@@ -373,17 +373,14 @@ body.resizing-panels { user-select: none; }
 }
 
 /* S3 (Q2/HQ1): the three-action task stop/hurry dropdown (Chat + Activity). */
-.chat-live-actions,
-.activity-row-actions {
-    position: relative;
-}
-
 .task-control-menu {
-    position: absolute;
-    top: calc(100% + var(--space-1));
-    right: 0;
-    z-index: 90;
-    min-width: 220px;
+    position: fixed;
+    top: var(--tcm-top, 0);
+    left: var(--tcm-left, 0);
+    z-index: 120;
+    width: min(220px, calc(100vw - 16px));
+    max-height: var(--tcm-max-height, calc(100vh - 16px));
+    overflow-y: auto;
     padding: var(--space-2);
     border: 1px solid var(--surface-border);
     border-radius: var(--radius-md);
