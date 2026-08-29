@@ -19,7 +19,7 @@ from typing import Tuple, Dict, Any, List, Optional
 
 from ouroboros.config import get_light_model, get_safety_call_timeout_sec, get_safety_max_tokens, get_safety_mode
 from ouroboros.llm import LLMClient
-from ouroboros.loop_llm_call import _is_rate_limit_text, classify_llm_exception
+from ouroboros.loop_llm_call import classify_llm_exception, is_rate_limit_text
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_provider_from_model
 from ouroboros.utils import sanitize_tool_result_for_log, utc_now_iso
 from supervisor.state import update_budget_from_usage
@@ -680,7 +680,7 @@ _UNCHECKED_WARNING_SUFFIX = (
 # 408, 5xx and timeouts included — into `provider_transient`, and those are outages, not
 # throttling: they keep today's blocking SAFETY_VIOLATION path. A `provider_transient`
 # therefore qualifies only when the provider actually said 429, by status code or by the
-# shared rate-limit text vocabulary (`_is_rate_limit_text` — imported rather than copied,
+# shared rate-limit text vocabulary (`is_rate_limit_text` — imported rather than copied,
 # so the two lanes cannot fork). Permanent classes are already excluded upstream: a
 # structured `insufficient_quota` wins over a 429 status inside that helper and still
 # blocks. On the HTTP-200 body lane (`llm._normalize_remote_response`) the qualifying
@@ -692,18 +692,49 @@ _SAFETY_BODY_RATE_LIMIT_KIND = "rate_limit"
 
 
 def _body_is_quota_refusal(body: Dict[str, Any]) -> bool:
-    """A body-shaped 429 whose text names a QUOTA/BILLING refusal is permanent, not
-    throttling — mirror the exception lane's quota-over-429 precedence (the markers
-    are loop_llm_call's non-retryable quota vocabulary, imported as the SSOT)."""
-    from ouroboros.loop_llm_call import _NON_RETRYABLE_PROVIDER_MARKERS
+    """A body-shaped 429 whose STRUCTURED fields name a QUOTA/BILLING refusal is
+    permanent, not throttling — mirror the exception lane's quota-over-429 precedence
+    (the markers are loop_llm_call's non-retryable quota vocabulary, imported as the
+    SSOT). Only `code`/`type` are scanned and numeric markers are skipped: the shared
+    markers are substrings, and free-form `message` text carries request ids and
+    hostnames where `402`/`billing` occur incidentally ("request id: req_402ab19",
+    "billing-tier throughput cap") — a false quota match here would keep reporting a
+    plain throttle as a verdict, the exact bug this lane exists to remove."""
+    from ouroboros.loop_llm_call import NON_RETRYABLE_PROVIDER_MARKERS
 
-    text = f"{body.get('code') or ''} {body.get('type') or ''} {body.get('message') or ''}".lower()
-    return any(m in text for m in _NON_RETRYABLE_PROVIDER_MARKERS["quota_exhausted"])
+    text = f"{body.get('code') or ''} {body.get('type') or ''}".lower()
+    return any(
+        m in text for m in NON_RETRYABLE_PROVIDER_MARKERS["quota_exhausted"] if not m.isdigit()
+    )
+
+
 _SAFETY_RATE_LIMIT_BACKOFF_SEC = 2.0
+
+# Process-local storm latch: after a NON-fallback-lane check (remote, or a local
+# PRIMARY whose vLLM/proxy 429s) exhausted both attempts on a provider rate limit, every
+# safety check in this process short-circuits to the same blocked SAFETY_UNAVAILABLE
+# answer for this window WITHOUT a provider call (the mark/is-cooling shape of
+# ouroboros/fallback_cooldown.py, inlined because this lane needs one timestamp, not a
+# per-model map). The safety lane is the highest-frequency LIGHT consumer — every guarded
+# tool call on every in-process subagent thread — so re-probing a storming route on each
+# call would amplify the very storm it reports.
+_SAFETY_STORM_COOLDOWN_SEC = 30.0
+_SAFETY_STORM_UNTIL = 0.0
 
 
 class _SafetyRateLimited(Exception):
-    """Both safety attempts hit a provider rate limit; the caller fails OPEN."""
+    """Both safety attempts hit a provider rate limit; the caller BLOCKS this one call
+    with the typed SAFETY_UNAVAILABLE outcome (infrastructure fact, not a verdict).
+    ``latched`` marks the storm-window short-circuit shape: it carries no NEW storm
+    evidence, so the outcome must not extend the window (else the advised retry would
+    keep re-arming it forever). ``attempts`` is the PHYSICAL call count behind this
+    outcome (0 latched, 1 deadline-expired-before-retry, 2 full), so the durable audit
+    row can name what actually happened instead of always claiming a retry."""
+
+    def __init__(self, message: str, *, latched: bool = False, attempts: int = 2) -> None:
+        super().__init__(message)
+        self.latched = latched
+        self.attempts = 0 if latched else attempts
 
 
 def _is_throughput_rate_limit(kind: str, status_code: Optional[int], safe_error: str) -> bool:
@@ -720,7 +751,7 @@ def _is_throughput_rate_limit(kind: str, status_code: Optional[int], safe_error:
         return True
     if kind != "provider_transient":
         return False
-    return status_code == 429 or (status_code is None and _is_rate_limit_text(safe_error))
+    return status_code == 429 or (status_code is None and is_rate_limit_text(safe_error))
 
 
 def _safety_rate_limit_reason(
@@ -754,20 +785,72 @@ def _safety_rate_limit_backoff(ctx: Optional[Any]) -> None:
         time.sleep(delay)
 
 
-def _safety_fail_open(ctx: Optional[Any], tool_name: str, error: str) -> Tuple[bool, str]:
-    """Rate-limited safety lane: ALLOW with a warning plus a durable audit row. A 429 is
-    an infrastructure fact about the supervisor, not a verdict about the tool call —
-    reporting it as SAFETY_VIOLATION told the agent its own command was unsafe. The
-    wave-through is disclosed twice: the warning the agent reads, and the durable event
-    an owner can find later (BIBLE P3: never silent)."""
-    log.error("Safety check rate-limited for %s after one retry; failing open: %s", tool_name, error)
+def _rate_limited_outcome(
+    ctx: Optional[Any], tool_name: str, error: str, *, local_fallback: bool, arm_latch: bool,
+    attempts: int = 2,
+) -> Tuple[bool, str]:
+    """Terminal outcome of a rate-limited safety check, split by lane. The local-FALLBACK
+    lane keeps its documented fail-open contract (SYSTEM.md case (c): a broken
+    chosen-as-fallback local runtime warns instead of blocking every unknown tool) — a
+    429 there must not be stricter than the RuntimeError beside it. Every other lane
+    blocks with the typed non-verdict outcome below."""
+    if local_fallback:
+        log.warning(
+            "Safety local-fallback rate-limited for %s; proceeding with warning: %s",
+            tool_name, error,
+        )
+        _emit_durable_safety_event(ctx, {
+            "type": "safety_check_rate_limited", "tool": tool_name,
+            "action": "fail_open_local_fallback", "error": error,
+        })
+        return True, (
+            f"⚠️ SAFETY_WARNING: The local fallback Safety Supervisor was rate-limited "
+            f"and could not check this call ({error}). {_UNCHECKED_WARNING_SUFFIX}"
+        )
+    return _safety_unavailable_blocked(ctx, tool_name, error, arm_latch=arm_latch, attempts=attempts)
+
+
+def _safety_unavailable_blocked(
+    ctx: Optional[Any], tool_name: str, error: str, *, arm_latch: bool = True, attempts: int = 2,
+) -> Tuple[bool, str]:
+    """Rate-limited safety lane: BLOCK this one call with a typed non-verdict outcome.
+
+    A 429 is an infrastructure fact about the supervisor, not a verdict about the tool
+    call — reporting it as SAFETY_VIOLATION told the agent its own command was unsafe,
+    sending it hunting for a "safer" rewording of a benign command. The honest outcome
+    keeps `full` mode's owner contract (an unchecked guarded call never executes; the
+    existing fail-open cases stay exactly the SYSTEM.md-documented no-backend three) while
+    removing the false accusation: the ⚠️ *_UNAVAILABLE prefix classifies as a plain
+    tool ERROR downstream, never as `safety_violation`, and the message itself carries
+    the retry contract (P5: the instruction lives with the fact). Disclosed twice: the
+    result the agent reads, and the durable event an owner can find later (BIBLE P3)."""
+    if arm_latch and attempts >= 2:
+        # The latch's documented trigger is a CONFIRMED storm: both attempts 429ed.
+        # A deadline-expired single 429 is one data point, not a storm - later
+        # checks in this process keep their own probe.
+        global _SAFETY_STORM_UNTIL
+        _SAFETY_STORM_UNTIL = time.time() + _SAFETY_STORM_COOLDOWN_SEC
+    shape = (
+        "storm latch, no attempt" if not arm_latch
+        else "deadline expired before the retry" if attempts < 2
+        else "after one retry"
+    )
+    action = (
+        "blocked_unchecked_storm_latched" if not arm_latch
+        else "blocked_unchecked_deadline_expired" if attempts < 2
+        else "blocked_unchecked_after_retry"
+    )
+    log.error("Safety check rate-limited for %s (%s); blocking unchecked: %s", tool_name, shape, error)
     _emit_durable_safety_event(ctx, {
-        "type": "safety_check_rate_limited", "tool": tool_name,
-        "action": "fail_open_after_retry", "error": error,
+        "type": "safety_check_rate_limited", "tool": tool_name, "action": action, "error": error,
     })
-    return True, (
-        f"⚠️ SAFETY_WARNING: The Safety Supervisor was rate-limited and could not check "
-        f"this call ({error}). {_UNCHECKED_WARNING_SUFFIX}"
+    # The provider error goes on its own line: downstream status classification scans
+    # only the FIRST line for outcome markers, and a raw error body could carry one.
+    return False, (
+        "⚠️ SAFETY_UNAVAILABLE: The Safety Supervisor is rate-limited and could not check "
+        "this call. This is infrastructure back-pressure, NOT a verdict about your "
+        "command — the call was not executed. Retry the same call shortly; do not "
+        f"reword it as if it had been judged unsafe.\n(provider error: {error})"
     )
 
 
@@ -790,10 +873,20 @@ def _safety_model_call(
     from ouroboros.llm_observability import chat_observed
     from ouroboros.tools.review_helpers import cached_prompt_blocks
 
+    if time.time() < _SAFETY_STORM_UNTIL:
+        raise _SafetyRateLimited(
+            "safety lane cooling down after a recent rate-limit storm; no attempt made",
+            latched=True,
+        )
     reason = ""
     for attempt in range(2):
         if attempt:
+            deadline = _safety_deadline_epoch(ctx)
+            if deadline is not None and time.time() >= deadline:
+                break  # the task deadline is spent: the retry would be a paid call past it
             _safety_rate_limit_backoff(ctx)
+            if deadline is not None and time.time() >= deadline:
+                break  # the backoff sleep itself consumed the deadline
         exc: Optional[Exception] = None
         msg: Dict[str, Any] = {}
         usage: Optional[Dict[str, Any]] = None
@@ -838,10 +931,11 @@ def _safety_model_call(
                 raise exc
             return msg, usage
         reason = rate_limited
+        attempts = attempt + 1
         log.warning(
-            "Safety check rate-limited for %s (attempt %d/2): %s", tool_name, attempt + 1, reason,
+            "Safety check rate-limited for %s (attempt %d/2): %s", tool_name, attempts, reason,
         )
-    raise _SafetyRateLimited(reason)
+    raise _SafetyRateLimited(reason, attempts=attempts)
 
 
 def _run_llm_check(
@@ -922,7 +1016,12 @@ def _run_llm_check(
             user_prompt=prompt, on_usage=_emit_safety_usage,
         )
     except _SafetyRateLimited as e:
-        return _safety_fail_open(ctx, tool_name, str(e))
+        return _rate_limited_outcome(
+            ctx, tool_name, str(e),
+            local_fallback=_use_local_light and _is_local_fallback,
+            arm_latch=not getattr(e, "latched", False),
+            attempts=getattr(e, "attempts", 2),
+        )
     except Exception as e:
         safe_error = sanitize_tool_result_for_log(f"{type(e).__name__}: {e}")
         # Fallback local outage warns instead of blocking all unknown tools.
@@ -968,7 +1067,12 @@ def _run_llm_check(
             if result is None:
                 failure_class = _classify_safety_parse_failure(repair_msg, repair_usage)
         except _SafetyRateLimited as e:
-            return _safety_fail_open(ctx, tool_name, str(e))
+            return _rate_limited_outcome(
+                ctx, tool_name, str(e),
+                local_fallback=_use_local_light and _is_local_fallback,
+                arm_latch=not getattr(e, "latched", False),
+                attempts=getattr(e, "attempts", 2),
+            )
         except Exception as exc:
             log.warning("Safety repair retry failed for %s: %s", tool_name, exc, exc_info=True)
         if result is None:
@@ -1025,8 +1129,15 @@ def _emit_durable_safety_event(ctx: Optional[Any], event: Dict[str, Any]) -> Non
         if callable(drive_logs):
             from ouroboros.utils import append_jsonl
 
-            append_jsonl(drive_logs() / "events.jsonl", payload)
-            return
+            if append_jsonl(drive_logs() / "events.jsonl", payload):
+                return
+            # append_jsonl answers whether the row landed (its documented contract for
+            # important events); a False here means the durable half of the disclosure
+            # is missing, so fall through to the queue rather than returning silently.
+            log.error(
+                "durable safety event %s not persisted; falling back to event queue",
+                event.get("type") or "?",
+            )
         eq = getattr(ctx, "event_queue", None) if ctx is not None else None
         if eq is not None:
             eq.put_nowait(payload)
