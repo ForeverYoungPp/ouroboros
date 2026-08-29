@@ -47,6 +47,7 @@ from ouroboros.tools.control_delegation import (
 from supervisor.task_dispatch import (
     build_scheduled_task_payload as _build_scheduled_task_payload,
 )
+from supervisor.task_admission import reject_if_no_chat_target as _reject_if_no_chat_target
 
 log = logging.getLogger(__name__)
 
@@ -3302,30 +3303,6 @@ from supervisor.steering import (  # noqa: E402 -- intentional re-import
 )
 
 
-def _reject_if_no_chat_target(
-    ctx: Any, *, desc: str, chat_id: int, delegation_role: str, tid: str, role: str,
-    parent_id: Any, root_task_id: str, result_fields: Dict[str, Any],
-) -> bool:
-    """Chat-target gate. A non-subagent task needs a live chat to schedule to; a
-    subagent returns its result to its PARENT, not a UI thread, so headless roots
-    (created via /api/tasks with no chat_id and owner_chat_id=None — CLI/Terminal-
-    Bench) schedule it without a chat target (the chat-only notification later is
-    skipped when chat_id is 0). Returns True when rejected (caller must return)."""
-    if not (desc and not chat_id):
-        return False
-    if delegation_role != "subagent":
-        log.warning("Rejected scheduled task without chat target: task_id=%s desc=%s", tid, desc[:100])
-        _reject_schedule_task(
-            ctx, tid=tid, chat_id=chat_id, delegation_role=delegation_role,
-            parent_id=parent_id, root_task_id=root_task_id, role=role,
-            result_fields=result_fields,
-            detail="Subagent rejected: no chat target is available for live scheduling.",
-        )
-        return True
-    log.info("Scheduled headless subagent without live chat target: task_id=%s role=%s", tid, role)
-    return False
-
-
 def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     st = ctx.load_state()
     owner_chat_id = st.get("owner_chat_id")
@@ -3344,16 +3321,38 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     constraints = str(evt.get("constraints") or "").strip()
     role = str(evt.get("role") or "researcher").strip() or "researcher"
     task_context = str(evt.get("context") or "").strip()
-    depth = int(evt.get("depth", 0))
     parent_id = evt.get("parent_task_id")
     root_task_id = str(evt.get("root_task_id") or parent_id or tid)
     session_id = str(evt.get("session_id") or "")
     actor_id = str(evt.get("actor_id") or "ouroboros")
     delegation_role = str(evt.get("delegation_role") or "subagent")
-    if delegation_role == "subagent":
-        from supervisor.task_admission import subagent_schedule_preflight
-        if subagent_schedule_preflight(ctx, evt, chat_id):
-            return
+    # Idempotency/ownership is checked before parsing for every scheduling role
+    # so a malformed replay cannot terminalize an already-owned task id. Fresh
+    # events still reach the typed depth rejection below before provisioning or
+    # enqueue; events without an explicit id use the normal fresh-id path.
+    from supervisor.task_admission import subagent_schedule_preflight
+    if subagent_schedule_preflight(
+        ctx, evt, chat_id, delegation_role=delegation_role,
+    ):
+        return
+    from supervisor.task_admission import parse_schedule_task_depth
+
+    depth, depth_rejected = parse_schedule_task_depth(
+        ctx,
+        evt,
+        tid=tid,
+        chat_id=chat_id,
+        delegation_role=delegation_role,
+        parent_id=parent_id,
+        root_task_id=root_task_id,
+        role=role,
+        desc=desc,
+        expected_output=expected_output,
+        constraints=constraints,
+        task_context=task_context,
+    )
+    if depth_rejected:
+        return
     memory_mode = str(evt.get("memory_mode") or "").strip()
     drive_root = str(evt.get("drive_root") or "").strip()
     child_drive_root = str(evt.get("child_drive_root") or drive_root).strip()
@@ -3854,19 +3853,24 @@ def _handle_cancel_task(evt: Dict[str, Any], ctx: Any) -> None:
     acknowledgement, and ✅ is sent only after a CONFIRMED teardown + durable
     settled write."""
     task_id = str(evt.get("task_id") or "").strip()
+    requested_task_id = str(evt.get("requested_task_id") or "").strip()
+    display_task_id = requested_task_id or task_id
     st = ctx.load_state()
     owner_chat_id = st.get("owner_chat_id")
     from supervisor.queue import (
-        CANCEL_ALREADY_SETTLED, CANCEL_CANCELLED, CANCEL_NOT_FOUND, cancel_task_custody,
+        CANCEL_ALREADY_SETTLED,
+        CANCEL_CANCELLED,
+        CANCEL_NOT_FOUND,
+        drive_cancel_intent_scope,
     )
 
-    outcome = cancel_task_custody(task_id) if task_id else CANCEL_NOT_FOUND
+    outcome = drive_cancel_intent_scope(task_id) if task_id else CANCEL_NOT_FOUND
     if not owner_chat_id:
         return
     if outcome == CANCEL_CANCELLED:
         ctx.send_with_budget(
             int(owner_chat_id),
-            f"✅ cancel {task_id or '?'}: teardown confirmed, outcome settled (event)",
+            f"✅ cancel {display_task_id or '?'}: teardown confirmed, outcome settled (event)",
         )
     elif outcome == CANCEL_ALREADY_SETTLED:
         settled_status = str(
@@ -3874,25 +3878,28 @@ def _handle_cancel_task(evt: Dict[str, Any], ctx: Any) -> None:
         )
         ctx.send_with_budget(
             int(owner_chat_id),
-            f"ℹ️ cancel {task_id or '?'}: the task had already finished "
+            f"ℹ️ cancel {display_task_id or '?'}: the task had already finished "
             f"({settled_status}) — its result is preserved, nothing was torn down (event)",
         )
     elif outcome == CANCEL_NOT_FOUND:
         ctx.send_with_budget(
             int(owner_chat_id),
-            f"⚠️ cancel {task_id or '?'}: no such live task (event)",
+            f"⚠️ cancel {display_task_id or '?'}: no such live task (event)",
         )
     else:
+        incident_meta = {
+            "task_incident": "cancellation_fault",
+            "toast_once": f"{display_task_id or 'unknown'}:cancellation_fault",
+        }
+        if task_id and display_task_id != task_id:
+            incident_meta["cancel_physical_task_id"] = task_id
         ctx.send_with_budget(
             int(owner_chat_id),
-            f"❌ cancel {task_id or '?'} did not settle — the task is still live; "
+            f"❌ cancel {display_task_id or '?'} did not settle — the task is still live; "
             "the durable cancel intent stays open and the supervisor watchdog retries (event)",
             is_progress=True,
-            task_id=task_id,
-            progress_meta={
-                "task_incident": "cancellation_fault",
-                "toast_once": f"{task_id or 'unknown'}:cancellation_fault",
-            },
+            task_id=display_task_id,
+            progress_meta=incident_meta,
         )
 
 

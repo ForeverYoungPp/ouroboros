@@ -726,3 +726,66 @@ def test_review_retry_rail_honors_durable_cancel_for_format_and_empty_paths(
 
     assert calls == [1]
     assert result.actors[0]["raw_text"] == raw_text
+
+
+@pytest.mark.parametrize(
+    ("surface", "raw_text"),
+    [("task_acceptance", "malformed reviewer output"), ("multi_model_review", "")],
+)
+def test_review_retry_rail_honors_logical_root_cancel_from_physical_retry_leaf(
+    tmp_path, monkeypatch, surface, raw_text,
+):
+    """A proven root-retry leaf cannot escape its logical cascade stop."""
+    from types import SimpleNamespace
+
+    from ouroboros.cancel_intents import (
+        SCOPE_CASCADE,
+        STOP_POLICY_FINALIZE,
+        request_cancel,
+    )
+    from ouroboros.review_execution import ReviewAttemptResult, ReviewRouteKind
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+    from ouroboros.task_results import write_task_result
+
+    root_id = f"logical-cancel-{surface.replace('_', '-')}"
+    leaf_id = f"physical-retry-{surface.replace('_', '-')}"
+    write_task_result(
+        tmp_path, root_id, "interrupted", root_task_id=root_id,
+        delegation_role="root", superseded_by=leaf_id, retry_task_id=leaf_id,
+    )
+    write_task_result(
+        tmp_path, leaf_id, "running", root_task_id=root_id, parent_task_id="",
+        delegation_role="root", supersedes_task_id=root_id,
+        original_task_id=root_id, timeout_retry_from=root_id,
+    )
+    calls = []
+
+    def attempt(_assignment, **_kwargs):
+        calls.append(1)
+        request_cancel(
+            tmp_path, root_id, reason="owner stopped logical retry tree",
+            source="test", scope=SCOPE_CASCADE,
+            requested_stop_policy=STOP_POLICY_FINALIZE,
+        )
+        return ReviewAttemptResult(
+            message={"content": raw_text}, usage={}, raw_text=raw_text,
+        )
+
+    monkeypatch.setattr("ouroboros.review_substrate._execute_slot_attempt", attempt)
+    ctx = SimpleNamespace(
+        task_id=leaf_id, drive_root=tmp_path,
+        task_metadata={"root_task_id": root_id},
+    )
+    result = run_review_request(
+        ReviewRequest(
+            surface=surface, goal="review", task_id=leaf_id,
+            evidence={}, call_type=f"{surface}_review",
+        ),
+        slots=[ReviewSlot(
+            slot_id="slot-1", model="test/model", route=ReviewRouteKind.API_CHAT,
+        )],
+        drive_root=tmp_path, usage_ctx=ctx,
+    )
+
+    assert calls == [1]
+    assert result.actors[0]["raw_text"] == raw_text

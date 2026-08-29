@@ -22,6 +22,8 @@ from ouroboros.contracts.task_contract import (
     normalize_bool,
     normalize_depth_provenance,
 )
+from ouroboros.config import MAX_SUBAGENT_DEPTH_HARD_CAP
+from ouroboros.depth_evidence import parse_task_depth
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import utc_now_iso
 
@@ -164,13 +166,20 @@ def durable_direct_child_count(
     )
 
 
-def admitted_depth_cap(parent_contract: Any, live_max_depth: Any) -> int:
-    """Return the cap that was admitted for this lineage, when it is known.
+def _bounded_permitted_depth(value: Any) -> int | None:
+    """Keep persisted admission authority within the immutable host ceiling."""
+    try:
+        return min(MAX_SUBAGENT_DEPTH_HARD_CAP, max(0, int(value)))
+    except (TypeError, ValueError):
+        return None
 
-    A task's persisted ``permitted_depth`` is an admission fact.  Once present,
-    a later Settings edit may not silently revoke or widen that task's already
-    admitted continuation.  Fresh and legacy contracts without a valid
-    persisted cap continue to use the current configured limit.
+
+def admitted_depth_cap(parent_contract: Any, live_max_depth: Any) -> int:
+    """Return the admitted lineage cap, bounded by current global controls.
+
+    A persisted permitted depth is an admission fact and survives ordinary
+    Settings changes. The explicit global zero remains an owner kill-switch,
+    and the immutable host ceiling always applies.
     """
     budget = (
         parent_contract.get("delegation_budget", parent_contract)
@@ -179,21 +188,19 @@ def admitted_depth_cap(parent_contract: Any, live_max_depth: Any) -> int:
     )
     budget = budget if isinstance(budget, dict) else {}
     try:
-        live_cap = max(0, int(live_max_depth))
+        live_cap = min(MAX_SUBAGENT_DEPTH_HARD_CAP, max(0, int(live_max_depth)))
     except (TypeError, ValueError):
         live_cap = 0
+    # The explicit global zero is an owner kill-switch and applies even to a
+    # lineage admitted under an earlier non-zero setting.
     if live_cap == 0:
         return 0
     provenance = normalize_depth_provenance(budget.get("depth_provenance"))
-    permitted = provenance.get("permitted_depth")
+    permitted = _bounded_permitted_depth(provenance.get("permitted_depth"))
     if permitted is not None:
-        try:
-            return max(0, int(permitted))
-        except (TypeError, ValueError):
-            # An incomplete/malformed projection is not an admission fact.
-            # Preserve the legacy live-limit behavior until a typed contract
-            # can supply a valid persisted cap.
-            pass
+        return permitted
+    # An incomplete/malformed projection is not an admission fact. Preserve the
+    # legacy live-limit behavior until a typed contract can supply a valid cap.
     return live_cap
 
 
@@ -220,7 +227,7 @@ def depth_provenance_for_schedule(
         except (TypeError, ValueError):
             requested = None
     try:
-        cap = max(0, int(max_depth))
+        cap = min(MAX_SUBAGENT_DEPTH_HARD_CAP, max(0, int(max_depth)))
     except (TypeError, ValueError):
         cap = 0
     current_permitted = cap if requested is None else min(cap, max(0, int(requested)))
@@ -237,18 +244,13 @@ def depth_provenance_for_schedule(
             current_permitted,
             max(0, int(new_depth) - 1) + max(0, remaining),
         )
-    inherited_permitted = inherited.get("permitted_depth")
+    inherited_permitted = _bounded_permitted_depth(inherited.get("permitted_depth"))
     if inherited_permitted is None:
         permitted = current_permitted
     else:
-        # ``permitted_depth`` is a persisted admission fact, not a fresh
-        # Settings-derived suggestion.  Do not intersect it with a later live
-        # max: a decrease must not revoke an already admitted lineage, and an
-        # increase must not widen it.
-        try:
-            permitted = max(0, int(inherited_permitted))
-        except (TypeError, ValueError):
-            permitted = current_permitted
+        # A persisted admission fact survives ordinary Settings changes, but
+        # never exceeds the immutable host ceiling.
+        permitted = inherited_permitted
     try:
         attempted = max(0, int(new_depth))
     except (TypeError, ValueError):
@@ -285,9 +287,11 @@ def stamp_depth_provenance(
         if isinstance(remaining, int) and not isinstance(remaining, bool):
             if max(0, int(attempted_depth)) == 0:
                 requested = max(0, remaining)
-            permitted = min(
-                max(0, int(max_depth)),
-                max(0, int(attempted_depth)) + max(0, remaining),
+            permitted = _bounded_permitted_depth(
+                min(
+                    min(MAX_SUBAGENT_DEPTH_HARD_CAP, max(0, int(max_depth))),
+                    max(0, int(attempted_depth)) + max(0, remaining),
+                )
             )
         provenance = {
             "requested_depth": requested,
@@ -325,16 +329,19 @@ def stamp_task_assignment_depth(
     contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
     if not contract:
         return {}
-    depth = int(task.get("depth", 0) or 0)
+    depth = parse_task_depth(task.get("depth"), default=0)
+    task["depth"] = depth
     budget = dict(contract.get("delegation_budget") or {})
     admitted = normalize_depth_provenance(budget.get("depth_provenance"))
     if admitted:
         requested = admitted.get("requested_depth")
-        permitted = admitted.get("permitted_depth")
+        permitted = _bounded_permitted_depth(admitted.get("permitted_depth"))
         if permitted is None:
             permitted = min(
-                max(0, int(max_depth)),
-                max(0, int(requested)) if requested is not None else max(0, int(max_depth)),
+                min(MAX_SUBAGENT_DEPTH_HARD_CAP, max(0, int(max_depth))),
+                min(MAX_SUBAGENT_DEPTH_HARD_CAP, max(0, int(requested)))
+                if requested is not None
+                else min(MAX_SUBAGENT_DEPTH_HARD_CAP, max(0, int(max_depth))),
             )
         provenance = {
             "requested_depth": requested,

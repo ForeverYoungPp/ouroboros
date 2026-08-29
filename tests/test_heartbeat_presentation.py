@@ -231,3 +231,44 @@ def test_cancel_failure_is_progress_incident_not_chat_bubble(monkeypatch) -> Non
             "toast_once": "cancel-me:cancellation_fault",
         },
     }
+
+
+def test_cancel_event_keeps_requested_retry_id_for_owner_presentation(monkeypatch) -> None:
+    import supervisor.queue as q
+    from supervisor.events import _handle_cancel_task
+
+    captured = []
+    monkeypatch.setattr(
+        q,
+        "cancel_task_custody",
+        lambda task_id, **_kwargs: (
+            captured.append(("custody", task_id)) or q.CANCEL_FAILED
+        ),
+    )
+
+    class _Ctx:
+        DRIVE_ROOT = pathlib.Path("/unused")
+
+        @staticmethod
+        def load_state():
+            return {"owner_chat_id": 9}
+
+        @staticmethod
+        def send_with_budget(*args, **kwargs):
+            captured.append((args, kwargs))
+
+    _handle_cancel_task(
+        {"task_id": "physical-retry-7f3a", "requested_task_id": "stable-root"},
+        _Ctx(),
+    )
+
+    assert captured[0] == ("custody", "physical-retry-7f3a")
+    args, kwargs = captured[1]
+    assert args[1].startswith("❌ cancel stable-root")
+    assert "physical-retry-7f3a" not in args[1]
+    assert kwargs["task_id"] == "stable-root"
+    assert kwargs["progress_meta"] == {
+        "task_incident": "cancellation_fault",
+        "toast_once": "stable-root:cancellation_fault",
+        "cancel_physical_task_id": "physical-retry-7f3a",
+    }

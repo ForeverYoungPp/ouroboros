@@ -594,9 +594,15 @@ def review_retry_cancelled(usage_ctx: Any) -> bool:
         drive_root = getattr(usage_ctx, "drive_root", None)
         if task_id and drive_root:
             try:
-                from ouroboros.cancel_intents import cancel_pending
+                from ouroboros.cancel_intents import (
+                    _validated_retry_root_cancel_key,
+                    cancel_pending,
+                )
 
                 if cancel_pending(drive_root, task_id, strict=True):
+                    return True
+                retry_root = _validated_retry_root_cancel_key(drive_root, task_id)
+                if retry_root and cancel_pending(drive_root, retry_root, strict=True):
                     return True
             except Exception:
                 # An unreadable cancel projection must not authorize another

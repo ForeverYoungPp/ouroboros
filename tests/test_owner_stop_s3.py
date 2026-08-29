@@ -26,6 +26,8 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+import pytest
+
 import ouroboros.cancel_intents as ci
 import supervisor.owner_stop as ostop
 from ouroboros.config import OWNER_STOP_OUTER_CAP_SEC
@@ -200,6 +202,29 @@ def _graceful_intent(tmp_path, task_id, **kw):
     )
 
 
+def _write_root_retry_pair(tmp_path, root_id, leaf_id, *, leaf_status="running"):
+    write_task_result(
+        tmp_path,
+        root_id,
+        "interrupted",
+        root_task_id=root_id,
+        delegation_role="root",
+        superseded_by=leaf_id,
+        retry_task_id=leaf_id,
+    )
+    write_task_result(
+        tmp_path,
+        leaf_id,
+        leaf_status,
+        root_task_id=root_id,
+        parent_task_id="",
+        delegation_role="root",
+        supersedes_task_id=root_id,
+        original_task_id=root_id,
+        timeout_retry_from=root_id,
+    )
+
+
 def test_owner_stop_active_matrix(tmp_path):
     intent = _graceful_intent(tmp_path, "t-act")
     now = time.time()
@@ -241,31 +266,89 @@ def test_running_owner_stop_tasks_reads_the_durable_projection(tmp_path):
     assert ostop.running_owner_stop_tasks(tmp_path, grace_sec=0.0) == set()
 
 
-def test_timeout_enforcement_bypasses_a_held_task_whole(tmp_path, monkeypatch):
-    """§12.2 item 8: a hard-over-timeout RUNNING task inside an owner-stop
-    episode is skipped by the generic enforcement loop — not withdrawn, killed,
-    reaped, or retried this tick — INCLUDING past the grace deadline (MAJOR-B:
-    the hold covers the whole open-intent window; custody is the sole killer
-    at expiry)."""
+@pytest.mark.parametrize(
+    ("hard_axis", "expected_reason"),
+    [
+        ("deadline", "deadline"),
+        ("absolute_ceiling", "absolute_ceiling"),
+    ],
+)
+def test_owner_stop_hold_never_bypasses_hard_task_axes(
+    tmp_path, monkeypatch, hard_axis, expected_reason,
+):
+    """Owner stop replaces idle/grace, never an earlier hard task boundary."""
     from supervisor import queue as q
 
-    _graceful_intent(tmp_path, "t-timeout")
+    task_id = f"t-{hard_axis}"
+    _graceful_intent(tmp_path, task_id)
+    now = time.time()
+    task = {"id": task_id, "chat_id": 0, "type": "task"}
+    started_at = now - 10.0
+    absolute_ceiling = 10_000_000.0
+    if hard_axis == "deadline":
+        task["deadline_at"] = datetime.fromtimestamp(
+            now - 1.0, tz=timezone.utc,
+        ).isoformat()
+    else:
+        started_at = now - 1000.0
+        absolute_ceiling = 60.0
     meta = {
-        "task": {"id": "t-timeout", "chat_id": 0, "type": "task"},
-        "started_at": time.time() - 10_000_000,       # absurdly over every rail
-        "last_heartbeat_at": time.time() - 10_000_000,
+        "task": task,
+        "started_at": started_at,
+        "last_heartbeat_at": now,
+        "last_progress_at": now,
         "attempt": 1,
     }
-    q_isolated = _isolate_queue(monkeypatch, tmp_path, running={"t-timeout": meta})
+    q_isolated = _isolate_queue(
+        monkeypatch, tmp_path, running={task_id: meta},
+    )
     monkeypatch.setattr(q, "FINALIZATION_GRACE_SEC", 120.0, raising=False)
-    q_isolated._enforce_task_timeouts_locked(None, time.time(), 0, {})
-    assert "t-timeout" in q_isolated.RUNNING          # untouched, no kill path ran
-    assert q_isolated.RUNNING["t-timeout"] is meta
-    # PAST the deadline boundary (requested_at + 120s long gone): the task is
-    # still bypassed whole — no reap, no retry clone, meta untouched.
-    q_isolated._enforce_task_timeouts_locked(None, time.time() + 100_000.0, 0, {})
-    assert q_isolated.RUNNING["t-timeout"] is meta
-    assert q_isolated.PENDING == []
+    monkeypatch.setattr(q, "get_task_abs_ceiling_sec", lambda: absolute_ceiling)
+    requested = []
+    monkeypatch.setattr(
+        q,
+        "_request_finalization_grace",
+        lambda _drive, tid, reason, **_kwargs: requested.append((tid, reason))
+        or f"hard:{tid}",
+    )
+
+    intent = ci.active_intent(tmp_path, task_id)
+    assert intent is not None
+    assert ostop.sweep_owner_stop_hold(
+        q_isolated, task_id, intent, now=now,
+    ) is False
+
+    q_isolated._enforce_task_timeouts_locked(None, now, 0, {})
+
+    assert requested == [(task_id, expected_reason)]
+    assert meta["finalization_reason"] == expected_reason
+    assert meta["finalization_control_msg_id"] == f"hard:{task_id}"
+
+
+def test_owner_stop_loop_deadline_can_only_narrow_an_explicit_task_deadline(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.loop as loop_mod
+
+    task_id = "t-loop-hard-deadline"
+    intent = _graceful_intent(tmp_path, task_id)
+    task_deadline = time.time() + 5.0
+    owner_deadline = ostop.owner_stop_deadline_ts(intent, 120.0)
+    assert owner_deadline > task_deadline
+    ctx = SimpleNamespace(
+        status_drive_root=tmp_path,
+        drive_root=tmp_path,
+        task_id=task_id,
+        deadline_ts=task_deadline,
+    )
+    monkeypatch.setattr(
+        loop_mod.task_pacing, "get_finalization_grace_sec", lambda: 120.0,
+    )
+    monkeypatch.setattr(loop_mod.time, "time", lambda: task_deadline + 1.0)
+
+    assert loop_mod._owner_stop_window_elapsed(ctx) is True
+    assert ctx.deadline_ts == task_deadline
+    assert loop_mod._narrow_round_deadline(ctx, owner_deadline) == task_deadline
 
 
 def _expiry_enforcement_queue(monkeypatch, tmp_path, task_id, meta):
@@ -378,11 +461,8 @@ def test_non_progressing_task_at_expiry_is_not_reaped_or_cloned(tmp_path, monkey
     assert ci.stop_policy(live) == ci.STOP_POLICY_FINALIZE
 
 
-def test_reap_retry_is_guarded_for_intent_covered_tasks(tmp_path, monkeypatch):
-    """Grok's guard: a task whose intent is ACTIVE but not held (custody already
-    CLAIMED the finalize intent) can still reach the generic reap branch — the
-    frozen reap job must then carry will_retry=False so no new-uuid clone
-    escapes the intent and CANCELLED_ROOT_FENCES."""
+def test_active_intent_keeps_timeout_reaper_from_cloning_task(tmp_path, monkeypatch):
+    """Cancellation custody, not the generic timeout reaper, owns the task."""
     intent = _graceful_intent(tmp_path, "t-claimed")
     assert ci.claim_intent(tmp_path, "t-claimed", owner="custody-test")
     now = time.time()
@@ -400,13 +480,9 @@ def test_reap_retry_is_guarded_for_intent_covered_tasks(tmp_path, monkeypatch):
         monkeypatch, tmp_path, "t-claimed", meta,
     )
     q_isolated._enforce_task_timeouts_locked(workers_mod, now, 0, {})
-    # The claimed intent released the hold, so the reap branch DID run —
-    # but the retry was refused by the active-intent guard.
-    assert len(jobs) == 1
-    assert jobs[0]["task_id"] == "t-claimed"
-    assert jobs[0]["will_retry"] is False
-    assert jobs[0]["retry_task_id"] == ""
-    assert "t-claimed" not in q_isolated.RUNNING
+    assert jobs == []
+    assert q_isolated.RUNNING["t-claimed"] is meta
+    assert q_isolated.PENDING == []
 
 
 def _fake_queue(tmp_path, running):
@@ -417,6 +493,8 @@ def _fake_queue(tmp_path, running):
         DRIVE_ROOT=tmp_path,
         FINALIZATION_GRACE_SEC=120.0,
         _task_drive_for_task=lambda task, tid: tmp_path,
+        _task_deadline_ts=lambda task: 0.0,
+        get_task_abs_ceiling_sec=lambda: 10_000_000.0,
     )
 
 
@@ -449,6 +527,413 @@ def test_sweep_hold_arms_the_episode_idempotently(tmp_path, monkeypatch):
     assert ostop.sweep_owner_stop_hold(q, "t-arm", intent, now=time.time()) is True
     assert len(_finalize_rows(tmp_path, "t-arm")) == 1
     assert len(toasts) == 1
+
+
+def test_stop_now_revokes_the_queued_owner_finalization_control(
+    tmp_path, monkeypatch,
+):
+    from ouroboros.owner_mailbox import (
+        KIND_CONTROL_REVOKED,
+        drain_owner_entries,
+    )
+    from supervisor import task_lifecycle as lifecycle
+    from supervisor import workers
+
+    task_id = "t-hardened-control"
+    meta = {
+        "task": {"id": task_id, "chat_id": 0, "type": "task"},
+        "started_at": time.time(),
+    }
+    q = _isolate_queue(monkeypatch, tmp_path, running={task_id: meta})
+    monkeypatch.setattr(q, "FINALIZATION_GRACE_SEC", 120.0, raising=False)
+    monkeypatch.setattr(
+        workers, "get_event_q", lambda: SimpleNamespace(put=lambda _event: None),
+    )
+    graceful = _graceful_intent(tmp_path, task_id)
+    assert ostop.sweep_owner_stop_hold(q, task_id, graceful, now=time.time()) is True
+    control_id = ostop.owner_stop_control_id(graceful)
+    assert meta["finalization_control_msg_id"] == control_id
+
+    hardened = ci.request_cancel(
+        tmp_path,
+        task_id,
+        requested_stop_policy=ci.STOP_POLICY_IMMEDIATE,
+    )
+    assert hardened["request_id"] == graceful["request_id"]
+    monkeypatch.setattr(
+        q,
+        "cancel_task_custody",
+        lambda _task_id, **_kwargs: q.CANCEL_CANCELLED,
+    )
+
+    assert lifecycle.drive_cancel_intent_scope(task_id) == q.CANCEL_CANCELLED
+    assert "finalization_requested_at" not in meta
+    assert "finalization_reason" not in meta
+    assert "finalization_control_msg_id" not in meta
+    assert drain_owner_entries(tmp_path, task_id) == []
+    mailbox_rows = [
+        json.loads(line)
+        for line in _mailbox_path(tmp_path, task_id).read_text(
+            encoding="utf-8",
+        ).splitlines()
+        if line.strip()
+    ]
+    assert [
+        row["text"]
+        for row in mailbox_rows
+        if row.get("kind") == KIND_CONTROL_REVOKED
+    ] == [control_id]
+
+
+def test_graceful_cascade_arms_and_drains_the_physical_retry_leaf(
+    tmp_path, monkeypatch,
+):
+    """A logical cascade intent owns its current physical root retry attempt."""
+    from supervisor import workers
+
+    root_id, leaf_id, child_id = "retry-root", "retry-leaf", "retry-child"
+    _write_root_retry_pair(tmp_path, root_id, leaf_id)
+    write_task_result(
+        tmp_path,
+        child_id,
+        "scheduled",
+        root_task_id=root_id,
+        parent_task_id=leaf_id,
+        delegation_role="subagent",
+    )
+    running = {
+        leaf_id: {
+            "task": {
+                "id": leaf_id,
+                "chat_id": 0,
+                "type": "task",
+                "root_task_id": root_id,
+                "parent_task_id": "",
+                "delegation_role": "root",
+                "original_task_id": root_id,
+                "timeout_retry_from": root_id,
+            },
+            "worker_id": -1,
+            "attempt": 2,
+        },
+    }
+    q = _isolate_queue(
+        monkeypatch,
+        tmp_path,
+        pending=[{
+            "id": child_id,
+            "chat_id": 0,
+            "type": "task",
+            "root_task_id": root_id,
+            "parent_task_id": leaf_id,
+            "delegation_role": "subagent",
+        }],
+        running=running,
+    )
+    monkeypatch.setattr(q, "FINALIZATION_GRACE_SEC", 120.0, raising=False)
+    monkeypatch.setattr(
+        workers, "get_event_q", lambda: SimpleNamespace(put=lambda _event: None),
+    )
+    intent = _graceful_intent(
+        tmp_path,
+        root_id,
+        scope=ci.SCOPE_CASCADE,
+    )
+
+    assert ostop.sweep_owner_stop_hold(q, root_id, intent, now=time.time()) is True
+
+    assert ci.active_intent(tmp_path, root_id)["request_id"] == intent["request_id"]
+    assert ci.active_intent(tmp_path, leaf_id) is None
+    assert ostop.running_owner_stop_tasks(tmp_path, grace_sec=120.0) == {
+        root_id,
+        leaf_id,
+    }
+    assert leaf_id in q.RUNNING
+    assert q.PENDING == []
+    assert load_task_result(tmp_path, child_id)["status"] == "cancelled"
+    control_id = ostop.owner_stop_control_id(intent)
+    assert q.RUNNING[leaf_id]["finalization_control_msg_id"] == control_id
+    assert [row["msg_id"] for row in _finalize_rows(tmp_path, leaf_id)] == [control_id]
+
+    # The production mailbox drain runs under the PHYSICAL id, but stamps the
+    # durable intent under the logical root. The worker deadline lookup uses
+    # the same reverse resolution.
+    controls = _production_drain(tmp_path, leaf_id)
+    assert controls["finalize_now"].startswith(REASON_OWNER_REQUESTED_FINALIZATION)
+    updated = ci.active_intent(tmp_path, root_id)
+    assert updated["control_drained_at"]
+    import ouroboros.loop as loop_mod
+
+    deadline = ostop.owner_stop_deadline_ts(updated, 120.0)
+    limit_ctx = SimpleNamespace(
+        status_drive_root=tmp_path,
+        drive_root=tmp_path,
+        task_id=leaf_id,
+        deadline_ts=None,
+    )
+    monkeypatch.setattr(loop_mod.task_pacing, "get_finalization_grace_sec", lambda: 120.0)
+    monkeypatch.setattr(loop_mod.time, "time", lambda: deadline + 1.0)
+    assert loop_mod._owner_stop_window_elapsed(limit_ctx) is True
+    assert limit_ctx.deadline_ts == deadline
+
+
+def test_descendant_custody_failure_never_arms_the_root_final_turn(
+    tmp_path, monkeypatch,
+):
+    root_id, child_id = "blocked-root", "blocked-child"
+    root_meta = {
+        "task": {"id": root_id, "chat_id": 0, "type": "task"},
+        "started_at": time.time(),
+    }
+    child = {
+        "id": child_id,
+        "chat_id": 0,
+        "type": "task",
+        "root_task_id": root_id,
+        "parent_task_id": root_id,
+        "delegation_role": "subagent",
+    }
+    q = _isolate_queue(
+        monkeypatch,
+        tmp_path,
+        pending=[child],
+        running={root_id: root_meta},
+    )
+    monkeypatch.setattr(q, "FINALIZATION_GRACE_SEC", 120.0, raising=False)
+    custody_calls = []
+
+    def _refuse_child(task_id, **_kwargs):
+        custody_calls.append(task_id)
+        return q.CANCEL_FAILED
+
+    monkeypatch.setattr(q, "cancel_task_custody", _refuse_child)
+    intent = _graceful_intent(tmp_path, root_id, scope=ci.SCOPE_CASCADE)
+
+    assert ostop.sweep_owner_stop_hold(q, root_id, intent, now=time.time()) is True
+
+    assert custody_calls and set(custody_calls) == {child_id}
+    assert [task["id"] for task in q.PENDING] == [child_id]
+    assert "finalization_control_msg_id" not in root_meta
+    assert _finalize_rows(tmp_path, root_id) == []
+    forensic = (tmp_path / "logs" / "supervisor.jsonl").read_text(
+        encoding="utf-8",
+    )
+    assert "owner_stop_descendants_pending" in forensic
+
+
+def test_late_descendant_is_reswept_before_exactly_one_root_control(
+    tmp_path, monkeypatch,
+):
+    from supervisor import workers
+
+    root_id = "resweep-root"
+    first_id, late_id = "resweep-first", "resweep-late"
+    root_meta = {
+        "task": {"id": root_id, "chat_id": 0, "type": "task"},
+        "started_at": time.time(),
+    }
+
+    def _child(task_id):
+        return {
+            "id": task_id,
+            "chat_id": 0,
+            "type": "task",
+            "root_task_id": root_id,
+            "parent_task_id": root_id,
+            "delegation_role": "subagent",
+        }
+
+    q = _isolate_queue(
+        monkeypatch,
+        tmp_path,
+        pending=[_child(first_id)],
+        running={root_id: root_meta},
+    )
+    monkeypatch.setattr(q, "FINALIZATION_GRACE_SEC", 120.0, raising=False)
+    monkeypatch.setattr(
+        workers, "get_event_q", lambda: SimpleNamespace(put=lambda _event: None),
+    )
+    real_custody = q.cancel_task_custody
+    custody_calls = []
+    late_injected = []
+
+    def _custody(task_id, **kwargs):
+        custody_calls.append(task_id)
+        outcome = real_custody(task_id, **kwargs)
+        if task_id == first_id and not late_injected:
+            with q._queue_lock:
+                q.PENDING.append(_child(late_id))
+            late_injected.append(late_id)
+        return outcome
+
+    monkeypatch.setattr(q, "cancel_task_custody", _custody)
+    intent = _graceful_intent(tmp_path, root_id, scope=ci.SCOPE_CASCADE)
+
+    assert ostop.sweep_owner_stop_hold(q, root_id, intent, now=time.time()) is True
+
+    assert custody_calls == [first_id, late_id]
+    assert q.PENDING == []
+    assert load_task_result(tmp_path, first_id)["status"] == "cancelled"
+    assert load_task_result(tmp_path, late_id)["status"] == "cancelled"
+    control_id = ostop.owner_stop_control_id(intent)
+    assert root_meta["finalization_control_msg_id"] == control_id
+    assert [row["msg_id"] for row in _finalize_rows(tmp_path, root_id)] == [
+        control_id,
+    ]
+    assert ostop.sweep_owner_stop_hold(q, root_id, intent, now=time.time()) is True
+    assert len(_finalize_rows(tmp_path, root_id)) == 1
+
+
+def test_completed_retry_leaf_settles_logical_cascade_without_duplicate_summary(
+    tmp_path, monkeypatch,
+):
+    from supervisor import task_lifecycle as lifecycle
+
+    root_id, leaf_id = "complete-root", "complete-leaf"
+    _write_root_retry_pair(tmp_path, root_id, leaf_id)
+    _isolate_queue(monkeypatch, tmp_path)
+    intent = _graceful_intent(tmp_path, root_id, scope=ci.SCOPE_CASCADE)
+    write_task_result(tmp_path, leaf_id, "completed", result="final answer")
+    summaries = []
+    monkeypatch.setattr(
+        "supervisor.terminal_delivery.deliver_cascade_summary",
+        lambda *_args, **_kwargs: summaries.append(1) or True,
+    )
+
+    outcomes = lifecycle.sweep_cancel_intents(
+        now=ostop._requested_ts(intent) + 11.0,
+    )
+
+    assert outcomes == {root_id: lifecycle.CANCEL_CANCELLED}
+    assert summaries == []
+    assert ci.active_intent(tmp_path, root_id) is None
+    assert load_task_result(tmp_path, leaf_id)["status"] == "completed"
+    assert not lifecycle.task_subtree_is_live(root_id, ignore_intents=True)
+    forensic = (tmp_path / "logs" / "supervisor.jsonl").read_text(encoding="utf-8")
+    assert "owner_stop_summary_suppressed" in forensic
+
+
+def test_stop_now_hardens_logical_cascade_and_cancels_retry_leaf_once(
+    tmp_path, monkeypatch,
+):
+    from supervisor import task_lifecycle as lifecycle
+
+    root_id, leaf_id = "harden-root", "harden-leaf"
+    _write_root_retry_pair(tmp_path, root_id, leaf_id, leaf_status="scheduled")
+    q = _isolate_queue(
+        monkeypatch,
+        tmp_path,
+        pending=[{
+            "id": leaf_id,
+            "chat_id": 0,
+            "type": "task",
+            "root_task_id": root_id,
+            "parent_task_id": "",
+            "delegation_role": "root",
+            "original_task_id": root_id,
+            "timeout_retry_from": root_id,
+        }],
+    )
+    graceful = _graceful_intent(tmp_path, root_id, scope=ci.SCOPE_CASCADE)
+    hardened = ci.request_cancel(
+        tmp_path,
+        root_id,
+        scope=ci.SCOPE_CASCADE,
+        requested_stop_policy=ci.STOP_POLICY_IMMEDIATE,
+    )
+    assert hardened["request_id"] == graceful["request_id"]
+    calls = []
+    real_custody = q.cancel_task_custody
+
+    def _custody(task_id, **kwargs):
+        calls.append(task_id)
+        return real_custody(task_id, **kwargs)
+
+    monkeypatch.setattr(q, "cancel_task_custody", _custody)
+    summaries = []
+    monkeypatch.setattr(
+        "supervisor.terminal_delivery.deliver_cascade_summary",
+        lambda *_args, **_kwargs: summaries.append(1) or True,
+    )
+
+    outcomes = lifecycle.sweep_cancel_intents(
+        now=ostop._requested_ts(hardened) + 11.0,
+    )
+
+    assert outcomes == {root_id: lifecycle.CANCEL_CANCELLED}
+    assert calls.count(leaf_id) == 1
+    assert summaries == [1]
+    assert q.PENDING == []
+    assert load_task_result(tmp_path, leaf_id)["status"] == "cancelled"
+    assert ci.active_intent(tmp_path, root_id) is None
+
+
+def test_corrupt_retry_lineage_holds_until_grace_deadline_then_releases_hard_path(
+    tmp_path, monkeypatch,
+):
+    from supervisor import task_lifecycle as lifecycle
+
+    root_id, leaf_id = "corrupt-root", "corrupt-leaf"
+    write_task_result(tmp_path, root_id, "running", root_task_id=root_id)
+    intent = _graceful_intent(tmp_path, root_id, scope=ci.SCOPE_CASCADE)
+    # Corrupt the lineage only after the owner will is durable: predecessor
+    # names the leaf, but the leaf is bound to a foreign logical root.
+    write_task_result(
+        tmp_path,
+        root_id,
+        "interrupted",
+        root_task_id=root_id,
+        superseded_by=leaf_id,
+        retry_task_id=leaf_id,
+    )
+    write_task_result(
+        tmp_path,
+        leaf_id,
+        "running",
+        root_task_id="foreign-root",
+        parent_task_id="",
+        delegation_role="root",
+        supersedes_task_id=root_id,
+        original_task_id=root_id,
+        timeout_retry_from=root_id,
+    )
+    q = _isolate_queue(
+        monkeypatch,
+        tmp_path,
+        running={
+            leaf_id: {
+                "task": {
+                    "id": leaf_id,
+                    "root_task_id": root_id,
+                    "parent_task_id": "",
+                    "delegation_role": "root",
+                },
+                "worker_id": -1,
+            },
+        },
+    )
+    monkeypatch.setattr(q, "FINALIZATION_GRACE_SEC", 120.0, raising=False)
+    hard_calls = []
+    monkeypatch.setattr(
+        q,
+        "cancel_task_by_id",
+        lambda task_id, **kwargs: hard_calls.append((task_id, kwargs)) or True,
+    )
+
+    before = lifecycle.sweep_cancel_intents(
+        now=ostop._requested_ts(intent) + 11.0,
+    )
+
+    assert before == {root_id: ostop.OWNER_STOP_HOLDING}
+    assert hard_calls == []
+    assert leaf_id in q.RUNNING
+    assert leaf_id in ostop.running_owner_stop_tasks(tmp_path, grace_sec=120.0)
+
+    after = lifecycle.sweep_cancel_intents(
+        now=ostop._requested_ts(intent) + OWNER_STOP_OUTER_CAP_SEC + 1.0,
+    )
+    assert after == {root_id: lifecycle.CANCEL_CANCELLED}
+    assert hard_calls == [(root_id, {"cascade": True})]
 
 
 def test_sweep_feeds_custody_for_settled_pending_or_expired_roots(tmp_path, monkeypatch):
@@ -580,6 +1065,67 @@ def _production_drain(tmp_path, task_id):
     )
 
 
+def test_loop_drain_discards_hardened_owner_control_before_and_during_stamp(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.loop as loop_mod
+
+    stale_root = tmp_path / "already-hardened"
+    stale_root.mkdir()
+    stale_task = "t-stale-control"
+    stale_intent = _graceful_intent(stale_root, stale_task)
+    assert write_owner_message(
+        stale_root,
+        REASON_OWNER_REQUESTED_FINALIZATION,
+        stale_task,
+        msg_id=ostop.owner_stop_control_id(stale_intent),
+        kind=KIND_FINALIZE_NOW,
+    )
+    ci.request_cancel(
+        stale_root,
+        stale_task,
+        requested_stop_policy=ci.STOP_POLICY_IMMEDIATE,
+    )
+    assert _production_drain(stale_root, stale_task) == {}
+
+    race_root = tmp_path / "hardening-race"
+    race_root.mkdir()
+    race_task = "t-raced-control"
+    race_intent = _graceful_intent(race_root, race_task)
+    assert write_owner_message(
+        race_root,
+        REASON_OWNER_REQUESTED_FINALIZATION,
+        race_task,
+        msg_id=ostop.owner_stop_control_id(race_intent),
+        kind=KIND_FINALIZE_NOW,
+    )
+
+    def _harden_during_stamp(_owner_ctx, _drive_root, task_id):
+        assert task_id == race_task
+        ci.request_cancel(
+            race_root,
+            race_task,
+            requested_stop_policy=ci.STOP_POLICY_IMMEDIATE,
+        )
+        return True
+
+    monkeypatch.setattr(
+        loop_mod,
+        "_mark_owner_stop_control_drained",
+        _harden_during_stamp,
+    )
+
+    assert _production_drain(race_root, race_task) == {}
+    assert ci.stop_policy(ci.active_intent(race_root, race_task)) == (
+        ci.STOP_POLICY_IMMEDIATE
+    )
+    for root in (stale_root, race_root):
+        event_path = root / "logs" / "events.jsonl"
+        assert not event_path.exists() or "owner_stop_stamp_failed" not in (
+            event_path.read_text(encoding="utf-8")
+        )
+
+
 def test_late_drain_starts_the_episode_budget_at_delivery(tmp_path):
     """(a) The control is drained LONG after the request (a blocking tool call
     held the round boundary, the live 39e0f183 defect): the grace budget starts
@@ -694,11 +1240,10 @@ def test_zero_grace_is_feature_off_pre_drain_and_post_drain(tmp_path):
     assert ostop.owner_stop_deadline_ts(intent, 120.0) > 0
 
 
-def test_failed_drain_stamp_retries_once_then_stays_conservative(tmp_path, monkeypatch):
-    """M3: a failing durable drain stamp is retried exactly once; still
-    unconfirmed, the worker emits a typed forensic event and NO extended
-    budget appears anywhere — the undrained intent keeps the conservative
-    request+outer-cap deadline the sweep budgets from."""
+def test_failed_drain_stamp_blocks_control_and_keeps_conservative_deadline(
+    tmp_path, monkeypatch,
+):
+    """An unconfirmed drain never buys a turn or extends the durable window."""
     intent = _graceful_intent(tmp_path, "t-stamp")
     attempts = []
 
@@ -713,7 +1258,7 @@ def test_failed_drain_stamp_retries_once_then_stays_conservative(tmp_path, monke
         msg_id=control_id, kind=KIND_FINALIZE_NOW,
     )
     controls = _production_drain(tmp_path, "t-stamp")
-    assert controls["finalize_now"] == REASON_OWNER_REQUESTED_FINALIZATION
+    assert controls == {}
     assert len(attempts) == 2                       # one retry, then stop
     updated = ci.active_intent(tmp_path, "t-stamp")
     assert not str(updated.get("control_drained_at") or "")

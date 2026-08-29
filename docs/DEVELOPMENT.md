@@ -1208,7 +1208,12 @@ Before every commit, verify the following:
   `depth_provenance` facts (`requested_depth`,
   `permitted_depth`, `attempted_depth`, and host-visible `achieved_depth`), where
   an absent explicit root request remains unknown rather than being inferred from
-  prose or a vendor's internal children.
+  prose or a vendor's internal children. Persisted permission remains monotonic
+  across ordinary Settings changes, while the explicit global depth value `0`
+  still refuses every new descendant and the immutable hard ceiling bounds any
+  malformed persisted projection. External task ingress and supervisor queue
+  admission accept only non-negative typed depths; malformed or negative persisted
+  rows are terminalized before assignment rather than clamped.
 - `subagent_id` selects one complete row from the canonical enabled
   `OUROBOROS_SUBAGENTS` list. At schedule time, freeze the normalized row and list
   fingerprint into the task; dispatch/restart must use that snapshot rather than
@@ -1581,6 +1586,12 @@ Before every commit, verify the following:
   ONE shared `owner_hurry.retry_reset`. UI surfaces share
   `web/modules/task_control_menu.js`; the `owner_hurry` event family is
   non-chat (`log_events.js` hides it with `visible=false`).
+- Cancellation keeps one public queue/lifecycle surface while its code owners
+  stay narrow: retry-aware physical-target and subtree-liveness resolution live
+  in `supervisor/queue_transitions.py`, capture-miss terminalization/publication
+  lives in `supervisor/cancel_publication.py`, and owner-stop control delivery,
+  stale-control validation, and deadline narrowing live in
+  `supervisor/owner_stop.py` with compatibility re-exports from the loop.
 - `forward_to_worker` may write only to validated running tasks whose lineage
   belongs to the current task/root, and must route forked/empty child subagents
   to the child-drive mailbox.

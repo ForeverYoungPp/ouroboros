@@ -18,6 +18,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 
 from ouroboros.gateway._helpers import coerce_int, json_error, json_exception, request_drive_root, request_json_or, request_repo_dir, stage_initial_task_attachments
+from ouroboros.depth_evidence import parse_task_depth
 # Re-exported SSE surface (split out by the 1600-line module gate): route
 # wiring, the CLI, and long-standing monkeypatch pins address these names on
 # gateway.tasks; task_events resolves its patched collaborators back through
@@ -186,6 +187,8 @@ def _admission_rejection_response(
     if not (isinstance(admitted, dict) and admitted.get("_admission_blocked")):
         return None
     reason_code = str(admitted.get("_admission_blocked") or "admission_fence")
+    if reason_code == "invalid_task_depth":
+        detail, status_code = str(admitted.get("_admission_detail") or "Task was not scheduled: depth must be a non-negative integer."), 400
     if reason_code == "task_id_lookup_failed":
         return JSONResponse(
             {
@@ -470,9 +473,14 @@ async def api_tasks_create(request: Request) -> JSONResponse:
         return json_error("external workspace tasks must use type='task'", 400)
     try:
         chat_id = int(body.get("chat_id") if body.get("chat_id") is not None else 0)
-        depth = int(body.get("depth") or 0)
-    except (TypeError, ValueError):
-        return json_error("chat_id and depth must be integers", 400)
+        depth = parse_task_depth(body.get("depth"), default=0)
+    except (TypeError, ValueError) as exc:
+        return json_error(
+            "depth must be a non-negative integer"
+            if str(getattr(exc, "code", "")) == "negative_task_depth"
+            else "chat_id and depth must be integers",
+            400,
+        )
 
     raw_metadata = dict(body.get("metadata") or {}) if isinstance(body.get("metadata"), dict) else {}
     if _external_subagent_label(body, raw_metadata):
@@ -992,9 +1000,9 @@ def _run_cascade_cancel(task_id: str) -> bool:
     durable and owner-visible as incidents either way.
     """
     try:
-        from supervisor.queue import cancel_task_by_id
+        from supervisor.queue import CANCEL_CANCELLED, drive_cancel_intent_scope
 
-        if not cancel_task_by_id(task_id, cascade=True):
+        if drive_cancel_intent_scope(task_id) != CANCEL_CANCELLED:
             # A cascade that cancelled nothing is only an incident when the subtree
             # is STILL live: the ordinary completion-wins race (the task reached
             # terminal between the pre-check and this call) is the benign case the
@@ -1068,9 +1076,10 @@ async def _graceful_stop_acknowledgement(task_id: str, *, cascade: bool) -> JSON
     try:
         from supervisor.owner_stop import begin_graceful_stop
 
+        physical_task_id = str(intent.get("task_id") or task_id)
         threading.Thread(
-            target=begin_graceful_stop, args=(task_id,),
-            name=f"owner-stop-{task_id[:8]}", daemon=True,
+            target=begin_graceful_stop, args=(physical_task_id,),
+            name=f"owner-stop-{physical_task_id[:8]}", daemon=True,
         ).start()
     except Exception:
         log.debug("owner-stop ingress thread failed for %s", task_id, exc_info=True)
@@ -1132,6 +1141,8 @@ async def api_task_cancel(request: Request) -> JSONResponse:
         # synchronous teardown contract below stays hard/legacy-only.
         return await _graceful_stop_acknowledgement(task_id, cascade=cascade)
 
+    intent_target = {"task_id": task_id, "scope": ""}
+
     def _record_http_intent(
         source: str, *, cascade_scope: bool = False, allow_settled: bool = False,
     ) -> bool:
@@ -1173,7 +1184,7 @@ async def api_task_cancel(request: Request) -> JSONResponse:
                         exc_info=True)
             return "write_failed"
         try:
-            request_cancel(
+            intent = request_cancel(
                 _drive_root, task_id, source=source,
                 **({"scope": SCOPE_CASCADE} if cascade_scope else {}),
                 allow_settled_target=bool(cascade_scope or allow_settled),
@@ -1183,6 +1194,8 @@ async def api_task_cancel(request: Request) -> JSONResponse:
                 # byte-identical legacy row when no intent exists.
                 requested_stop_policy=STOP_POLICY_IMMEDIATE,
             )
+            intent_target["task_id"] = str(intent.get("task_id") or task_id)
+            intent_target["scope"] = str(intent.get("scope") or "")
             return ""
         except CancelIntentProjectionCorrupt:
             log.error("HTTP cancel refused for %s: intent projection corrupt", task_id)
@@ -1232,10 +1245,31 @@ async def api_task_cancel(request: Request) -> JSONResponse:
                 ))
                 if refused:
                     return _intent_write_refused(refused)
+            if intent_target["scope"] == "cascade":
+                # Scope is widen-only durable authority.  Stop-now over an
+                # existing graceful cascade must execute that cascade now even
+                # when the new HTTP body omitted ``cascade``; replaying the raw
+                # single shape can kill only the root or fail on a retry leaf.
+                settled = await asyncio.to_thread(
+                    _run_cascade_cancel, intent_target["task_id"],
+                )
+                if not settled:
+                    return json_error(
+                        "subtree cancellation did not settle; the tree is still live",
+                        503,
+                        task_id=task_id,
+                    )
+                return JSONResponse({
+                    "ok": True,
+                    "task_id": task_id,
+                    "cascade": True,
+                })
             # The TYPED outcome, not a boolean: a task whose worker refused to die
             # is neither cancelled nor absent, and answering 404 for it would tell
             # the caller the task is gone while it keeps running.
-            outcome = await asyncio.to_thread(cancel_task_custody, task_id)
+            outcome = await asyncio.to_thread(
+                cancel_task_custody, intent_target["task_id"],
+            )
         except Exception as exc:
             return json_exception(exc, 503)
         if outcome == CANCEL_FAILED:
