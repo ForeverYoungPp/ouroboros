@@ -16,9 +16,9 @@ from devtools.benchmarks.common.model_slots import (
     fixed_model_actor_snapshot,
     pin_single_model,
     runtime_actor_snapshot,
+    single_model_reviewer_slots_setting,
     single_model_slot_snapshot,
     single_model_subagents_setting,
-    single_model_reviewer_slots_setting,
 )
 from devtools.benchmarks.common.server_runner import (
     STALE_INHERITED_ENV_KEYS,
@@ -32,13 +32,13 @@ from ouroboros.configured_subagents import (
 from ouroboros.provider_models import provider_for_model, review_model_uses_local
 from ouroboros.reviewer_slot_config import REVIEWER_SLOTS_ENV, parse_reviewer_slots
 
-
 REPO = pathlib.Path(__file__).resolve().parents[1]
 PROFILE_TARGETS = {
     "devtools/benchmarks/gaia/settings_base.json": "google/gemini-2.5-pro",
     "devtools/benchmarks/osworld/settings_base.json": "anthropic/claude-sonnet-4.6",
     "devtools/benchmarks/programbench/settings_base.json": "openai/gpt-5.5",
     "devtools/benchmarks/continual_learning/settings_base.json": "anthropic/claude-sonnet-4.6",
+    "devtools/benchmarks/cybergym/settings_base.json": "deepseek/deepseek-v4-flash-0731",
     "devtools/benchmarks/swe_bench_pro/e1v2/settings_base.json": "anthropic/claude-sonnet-4.5",
     "devtools/benchmarks/swe_bench_pro/e1v2/settings_sonnet46_probe.json":
         "anthropic/claude-sonnet-4.6",

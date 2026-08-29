@@ -146,7 +146,9 @@ def _restart_current_process(host: str, port: int) -> None:
 
 from ouroboros.config import (
     SETTINGS_DEFAULTS,
-    load_settings, save_settings, apply_settings_to_env as _apply_settings_to_env,
+    SettingsIntegrityError,
+    load_settings, save_settings, verify_settings_integrity,
+    apply_settings_to_env as _apply_settings_to_env,
 )
 from ouroboros.server_runtime import (
     apply_runtime_provider_defaults,
@@ -3067,6 +3069,14 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
         pass
 
 def main() -> int:
+    # A benchmark-owned child may receive an integrity pin from its parent.
+    # Verify the exact bytes before even resolving the saved bind host; a
+    # malformed/replaced snapshot must not be converted into product defaults.
+    try:
+        verify_settings_integrity()
+    except SettingsIntegrityError:
+        log.error("isolated settings integrity verification failed")
+        return 2
     try:
         saved_host = str(load_settings().get("OUROBOROS_SERVER_HOST") or "").strip()
     except Exception:

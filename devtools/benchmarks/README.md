@@ -27,6 +27,10 @@ runtime core and are not packaged as app runtime code.
   continual-learning runs against a live Ouroboros agent (evolution off).
   Use `run_clb.py`; the runner repo + its `src/systems/ouroboros/` adapter
   are obtained separately (see its README).
+- `cybergym/` — Level-1 CyberGym adapter for the pinned
+  `sunblaze-ucb/cybergym` source.  Use `run_cybergym.py` for the
+  binary-only, private-sidecar protocol; see its README and METHODOLOGY for
+  the exact model, provider, final-PoC, and denominator contract.
 - `harness_bench_fast/` — Ouroboros CLI wrapper and methodology notes for the
   public `ai-forever/harness-bench-fast` runner.
 - `common/` — shared manifests, result ledgers, safe run roots, secret hygiene,
