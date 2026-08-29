@@ -423,6 +423,52 @@ class TestRunReadonlyEffortParam:
             f"expected effort='high' forwarded to ClaudeAgentOptions, got: {captured}"
         )
 
+    def test_above_ceiling_effort_is_clamped_at_the_gateway_boundary(self):
+        """`ultra` reaches ClaudeAgentOptions as `max`; an in-surface tier is untouched."""
+        captured: dict = {}
+
+        class FakeOptions:
+            def __init__(self, effort=None, **kwargs):
+                if effort is not None:
+                    kwargs["effort"] = effort
+                captured.update(kwargs)
+
+        import asyncio
+        from unittest.mock import patch
+
+        class FakeSDKClient:
+            def __init__(self, options=None):
+                self.options = options
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def query(self, prompt):
+                return None
+
+            async def receive_response(self):
+                if False:
+                    yield None
+
+        gateway = __import__(
+            "ouroboros.gateways.claude_code", fromlist=["_run_readonly_async"]
+        )
+        for requested, expected in (("ultra", "max"), ("high", "high")):
+            captured.clear()
+            with patch("ouroboros.gateways.claude_code.ClaudeAgentOptions", FakeOptions), \
+                 patch("ouroboros.gateways.claude_code.ClaudeSDKClient", FakeSDKClient):
+                asyncio.get_event_loop().run_until_complete(
+                    gateway._run_readonly_async(
+                        "test", cwd="/tmp", effort=requested, max_budget_usd=1.0,
+                    )
+                )
+            assert captured.get("effort") == expected, (
+                f"effort={requested!r} must reach the SDK as {expected!r}, got: {captured}"
+            )
+
     def test_effort_omitted_gracefully_when_sdk_lacks_support(self):
         """When SDK's ClaudeAgentOptions does not accept effort, it is silently dropped."""
         captured: dict = {}

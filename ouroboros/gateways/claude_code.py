@@ -518,14 +518,21 @@ async def _run_readonly_async(
         **_tool_surface_kwargs(READONLY_TOOLS),
     )
     if effort is not None:
+        # `ultra` is a codex-family tier; this surface tops out at `max`. The SDK fallback
+        # below only strips the keyword on old SDKs, it never adapts an above-ceiling value.
+        from ouroboros.config import clamp_effort_to
+
+        applied = clamp_effort_to(effort, "max")
+        if applied != effort:
+            log.info("Claude readonly effort clamped: requested=%s applied=%s", effort, applied)
         # Older SDKs may lack effort; omit it rather than failing advisory.
         import inspect as _inspect
         try:
             _sig = _inspect.signature(ClaudeAgentOptions.__init__)
             if "effort" in _sig.parameters:
-                options_kwargs["effort"] = effort
+                options_kwargs["effort"] = applied
         except (ValueError, TypeError):
-            options_kwargs["effort"] = effort
+            options_kwargs["effort"] = applied
 
     try:
         options = ClaudeAgentOptions(**options_kwargs)
