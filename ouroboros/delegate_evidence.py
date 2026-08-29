@@ -34,6 +34,13 @@ NANNY_NUDGE_STAMP = "delegate_run_nanny_nudge_injected"
 # two together answer "did the nanny TRY?" without a new scan.
 START_BLOCKED = "delegate_run_start_blocked"
 
+# The host's pre-start found the dispatch BLOCKED (charter D2): a typed,
+# task-scoped attempt row. The ``delegate_run`` prefix is LOAD-BEARING —
+# ``delegate_custody._iter_rows`` prefilters rows to that prefix, so an
+# unprefixed spelling is invisible to every evidence reader (delta finding D1:
+# the first spelling of this row was exactly that dead letter).
+STARTUP_FAULT = "delegate_run_configured_startup_fault"
+
 
 def record_start_blocked(ctx: Any, task_id: str, reason: str) -> None:
     """Durably record "delegate_start was attempted and refused typed".
@@ -111,8 +118,7 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
             nudge_recorded = True
             continue
         if str(row.get("type") or "") in (
-            START_BLOCKED, custody.START_REQUESTED,
-            "configured_subagent_startup_fault",
+            START_BLOCKED, STARTUP_FAULT, custody.START_REQUESTED,
         ):
             # An ATTEMPT is evidence of obedience even when nothing started:
             # a typed pre-mint refusal (START_BLOCKED) or a durable request

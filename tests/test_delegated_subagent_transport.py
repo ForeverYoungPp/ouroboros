@@ -1461,6 +1461,8 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
     monkeypatch.setattr(_gw, "ClaudexorGateway", lambda *a, **k: _NeverReached())
     refused = json.loads(delegate._delegate_start(expired, "start something new"))
     assert refused["status"] == "refused" and refused["reason"] == "task_deadline_expired"
+    # Producer verdict (charter D2): a pre-daemon refusal proves no run exists.
+    assert refused["definitely_unrun"] is True
     assert reached == [], "an expired nanny must not even reach the daemon"
 
 
@@ -2908,6 +2910,9 @@ def test_a_retry_testifies_about_the_stored_invocation_not_the_current_config(
     unwritable = json.loads(delegate._delegate_start(_ctx(root_b), "the intended work",
                                                      retry_of=token))
     assert unwritable["reason"] == "start_request_row_unwritable"
+    # A RETRY's unwritable row keeps the original run's fate unknown: the
+    # producer must NOT claim definitely_unrun here (charter D2 ambiguity).
+    assert "definitely_unrun" not in unwritable
     assert removals == [], "an unknown original outcome must keep its project"
     monkeypatch.undo()
     monkeypatch.setattr(gw, "ClaudexorGateway", _fresh)
@@ -4211,6 +4216,8 @@ def test_no_post_fires_when_the_start_request_row_did_not_land(tmp_path, monkeyp
     delegate._CUSTODY.clear()
     assert out["status"] == "refused"
     assert out["reason"] == "start_request_row_unwritable"
+    # Fresh start, POST never sent: the producer's own no-run verdict rides.
+    assert out["definitely_unrun"] is True
     assert posts == [], "the POST must be conditional on the durable request row"
     assert "delegate_run_started" not in _event_types(tmp_path)
 

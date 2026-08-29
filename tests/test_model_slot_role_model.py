@@ -1087,7 +1087,7 @@ def test_blocked_configured_session_terminals_unrun_without_a_model_round(tmp_pa
         if line.strip()
     ]
     assert any(
-        evt.get("type") == "configured_subagent_startup_fault"
+        evt.get("type") == "delegate_run_configured_startup_fault"
         and evt.get("host_fallback") is False
         for evt in custody_events
     )

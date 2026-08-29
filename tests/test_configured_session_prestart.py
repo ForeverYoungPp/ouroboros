@@ -161,7 +161,7 @@ def test_blocked_session_bootstrap_terminals_unrun_with_alternatives(monkeypatch
     assert bootstrap["selected_subagent_id"] == "session-builder"
     assert len(bootstrap["work_order_fingerprint"]) == 64
     rows = [json.loads(line) for line in custody.event_log_path(tmp_path).read_text().splitlines()]
-    assert rows[-1]["type"] == "configured_subagent_startup_fault"
+    assert rows[-1]["type"] == "delegate_run_configured_startup_fault"
     assert rows[-1]["reason"] == "subscription_window_exhausted"
     assert rows[-1]["host_fallback"] is False
 
@@ -246,3 +246,32 @@ def test_definite_refusal_reaches_the_zero_dollar_terminal_without_a_model_round
     record = _json.loads((drive / "task_results" / "pinned-refused.json").read_text())
     assert float(record.get("cost_usd") or 0.0) == 0.0
     assert "NOT run on metered API tokens" in str(record.get("result") or "")
+
+
+def test_blocked_fault_row_is_visible_attempt_evidence(monkeypatch, tmp_path):
+    # Delta finding D1: the fault row must carry the delegate_run prefix or
+    # delegate_custody._iter_rows prefilters it into a dead letter — a
+    # fenced-blocked child would then be falsely accused of never attempting.
+    import ouroboros.subagent_runtime as runtime
+    from ouroboros.delegate_evidence import task_execution_evidence
+    from ouroboros.subagent_bootstrap import bootstrap_before_context
+
+    monkeypatch.setattr(
+        runtime, "current_subagent_alternatives", lambda _exclude: [],
+    )
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    ctx = SimpleNamespace(
+        task_id="child-fault-evidence", drive_root=tmp_path,
+        budget_drive_root=str(tmp_path), task_metadata={},
+    )
+    dispatch = SimpleNamespace(
+        blocked=True,
+        executor_resolution=SimpleNamespace(
+            reason="subscription_window_exhausted", reset_at="",
+        ),
+    )
+    task = {"id": "child-fault-evidence", "configured_subagent": snapshot,
+            "task_contract": {"objective": "Build"}}
+    assert bootstrap_before_context(ctx, task, dispatch) == ""
+    evidence = task_execution_evidence(tmp_path, "child-fault-evidence")
+    assert evidence["delegate_start_attempted"] is True

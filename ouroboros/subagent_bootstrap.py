@@ -159,8 +159,9 @@ def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -
             getattr(resolution, "reset_at", "") or availability.get("reset_at") or ""
         )
         from ouroboros import delegate_custody as custody
+        from ouroboros.delegate_evidence import STARTUP_FAULT
 
-        custody.emit(custody.custody_root(ctx), "configured_subagent_startup_fault", {
+        custody.emit(custody.custody_root(ctx), STARTUP_FAULT, {
             "task_id": str(getattr(ctx, "task_id", "") or ""),
             "status": "temporarily_unavailable",
             "reason": reason,

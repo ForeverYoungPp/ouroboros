@@ -1357,7 +1357,7 @@ Before every commit, verify the following:
 - The acceptance packet carries a host-attested `substrate_execution` section —
   `actual_substrate`, `delegated_runs_*` counters, zero-run facts — read from
   durable custody rows at packet-build time
-  (`review_evidence._accept_substrate_execution`). VISIBILITY ONLY: zero typed
+  (`delegate_evidence.acceptance_substrate_facts`). VISIBILITY ONLY: zero typed
   rules tie substrate to the verdict — acceptance judges quality, never the
   execution route. An unreadable custody log reads `evidence_read_failed`,
   never a proven-empty substrate.
