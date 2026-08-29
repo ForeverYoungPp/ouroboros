@@ -77,16 +77,20 @@ def keepalive_http_client(async_client: bool = False):
     """
     if env_proxies_configured():
         return None
-    if async_client:
-        from openai import DefaultAsyncHttpxClient
+    import openai
 
-        return DefaultAsyncHttpxClient(
-            transport=remote_httpx_transport(True, limits=_sdk_pool_limits())
-        )
-    from openai import DefaultHttpxClient
-
-    return DefaultHttpxClient(
-        transport=remote_httpx_transport(limits=_sdk_pool_limits())
+    cls = getattr(
+        openai,
+        "DefaultAsyncHttpxClient" if async_client else "DefaultHttpxClient",
+        None,
+    )
+    if cls is None:
+        # An SDK build without the Default client classes falls back to SDK
+        # default construction (no keepalive tuning) rather than failing the
+        # LLM client construction over a tuning concern.
+        return None
+    return cls(
+        transport=remote_httpx_transport(async_client, limits=_sdk_pool_limits())
     )
 
 
