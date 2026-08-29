@@ -41,6 +41,31 @@ def test_chat_history_preserves_subagent_lane_group_metadata(tmp_path):
     assert rec["task_group_id"] == "group1"
 
 
+def test_chat_history_replays_typed_direct_error_terminal_status(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-08-27T00:00:00Z",
+            "direction": "out",
+            "chat_id": 1,
+            "user_id": 7,
+            "text": "error",
+            "task_id": "failed-task",
+            "task_terminal_status": "failed",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    rec = next(item for item in payload if item.get("task_id") == "failed-task")
+    assert rec["task_terminal_status"] == "failed"
+
+
 def test_chat_history_replays_delivered_document_row(tmp_path):
     """A persisted document chat row is replayed as a msg_type=document record so
     the frontend rebuilds the file bubble on reload from the durable URL."""

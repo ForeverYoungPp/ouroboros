@@ -69,7 +69,12 @@ from ouroboros.outcome_receipt_store import (  # noqa: F401 - public compatibili
     read_verification_receipts_from_roots,
     verification_receipts_path,
 )
-from ouroboros.task_results import STATUS_CANCEL_REQUESTED, STATUS_REJECTED_DUPLICATE, validate_task_id
+from ouroboros.task_results import (
+    STATUS_CANCEL_REQUESTED,
+    STATUS_REJECTED_DUPLICATE,
+    legacy_plan_review_projection,
+    validate_task_id,
+)
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -866,6 +871,9 @@ def public_task_result(result: Dict[str, Any], *, include_outcome_axes: bool = T
                     stack.append((child_value, clone, child_key))
     if not isinstance(public, dict):
         return {}
+    plan_state = public.get("plan_review_state")
+    if isinstance(plan_state, dict) and plan_state.get("schema_version") == 1:
+        plan_state["legacy_v1_projection"] = legacy_plan_review_projection(plan_state)
     if include_outcome_axes:
         public["outcome_axes"] = normalize_outcome_axes(result)
     return public

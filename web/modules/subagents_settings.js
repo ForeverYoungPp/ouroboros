@@ -11,8 +11,10 @@ import {
     bindStatusSurface,
     boundedStatusRefresh,
     claudexorStatus,
+    familyLabel,
 } from './claudexor_status_store.js';
 import { renderSegmentedField } from './page_header.js';
+import { harnessIdentityMarkup } from './harness_presentation.js';
 import {
     EFFORT_CHOICES,
     ROUTE_KIND_AGENT_SESSION,
@@ -364,9 +366,25 @@ export function availableSubagentRowMarkup(row, state, index = 0) {
     const gap = session ? modelsGapNote(harnesses[split.harness], state.catalogKnown) : '';
     const meta = [savedIntentStatus(row, state), gap, evidence ? `Last actual run: ${evidence}` : '']
         .filter(Boolean).join(' · ');
+    const routeIdentity = session
+        ? harnessIdentityMarkup(split.harness, {
+            // A retained snapshot is useful for preserving the controls, but
+            // its daemon-provided product name is evidence only while the
+            // current catalog read is known. During a read gap the shared
+            // presentation catalog supplies the safe, stable fallback.
+            label: familyLabel(split.harness, state.snapshot, {
+                catalogKnown: state.catalogKnown,
+            }),
+            className: 'available-subagent-route-identity',
+        })
+        : harnessIdentityMarkup('api', {
+            channel: 'api',
+            className: 'available-subagent-route-identity',
+        });
     return `
         <article class="available-subagent-row" data-subagent-row="${escapeHtml(rowKey)}" aria-labelledby="${escapeHtml(headingId)}">
             <h4 class="available-subagent-heading" id="${escapeHtml(headingId)}">Subagent ${ordinal}</h4>
+            <div class="available-subagent-route-identity-wrap">${routeIdentity}</div>
             <label class="available-subagent-purpose">Description
                 <textarea data-subagent-field="recommended_use" rows="2" aria-label="Description for Subagent ${ordinal}" placeholder="When should Ouroboros choose this subagent?">${escapeHtml(row.recommended_use)}</textarea>
             </label>

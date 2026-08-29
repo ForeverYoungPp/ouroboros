@@ -1167,9 +1167,11 @@ def test_the_review_step_spells_a_family_the_way_the_agents_step_did():
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
     summary = source.split("function agentsSummaryValue", 1)[1].split("\n    }", 1)[0]
 
-    assert "familyLabels(state.agentsConnected, agentsStep?.snapshot)" in summary
+    assert "familyLabels(state.agentsConnected, agentsStep?.snapshot, {" in summary
+    assert "catalogKnown: Boolean(agentsStep?.catalogKnown)" in summary
 
     # ...and the step really exposes that payload, rather than the wizard
     # reading a name the step never published.
     step = (REPO / "web/modules/onboarding_agents_step.js").read_text(encoding="utf-8")
     assert "get snapshot()" in step
+    assert "get catalogKnown()" in step

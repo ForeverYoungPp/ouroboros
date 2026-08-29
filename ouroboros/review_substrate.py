@@ -24,6 +24,7 @@ from ouroboros.config import get_review_models, review_model_uses_local
 from ouroboros.llm import LLMClient
 from ouroboros.observability import new_call_id, persist_call, redact_projection
 from ouroboros.provider_models import provider_for_model
+from ouroboros.review_execution_projection import review_executions_from_actor_usage
 from ouroboros.task_results import review_binding_hash
 # Everything below the seam. Re-exported here because the substrate is the
 # historical import site for the api_chat prompt renderers; `review_execution`
@@ -205,7 +206,6 @@ class ReviewActorRecord:
 # B1 typed failure facts, ONE shared key tuple (row/wave/last-execution projections).
 TYPED_FAILURE_FACT_KEYS = ("failure_code", "reset_at", "http_status", "transport_status")
 
-
 @dataclass
 class ReviewRunResult:
     request: Dict[str, Any]
@@ -356,6 +356,7 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
         "operation_id": str(row.get("operation_id") or ""),
         "operation_state": str(row.get("operation_state") or "settled"),
         "late_result_pending": bool(row.get("late_result_pending")),
+        "executions": review_executions_from_actor_usage([row]),
         # Flat, redacted pointer to the private full response artifact.
         "response_ref": _response_ref_projection(row.get("response_ref")),
     }

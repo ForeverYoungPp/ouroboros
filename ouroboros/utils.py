@@ -630,7 +630,18 @@ def iter_jsonl_objects(
                     handle.seek(start - 1)
                     if handle.read(1) != b"\n":
                         handle.readline()
-            lines = deque(handle, maxlen=max_entries) if max_entries else handle
+            if max_entries:
+                # Keep one raw sentinel so callers can distinguish an exact
+                # bounded tail from a suffix. Parsed-object counts cannot prove
+                # that: blank, malformed, non-dict, or undecodable raw rows are
+                # deliberately skipped below.
+                lines = deque(handle, maxlen=max_entries + 1)
+                if len(lines) > max_entries:
+                    if gap_reasons is not None:
+                        gap_reasons.add("max_entries_truncated")
+                    lines.popleft()
+            else:
+                lines = handle
             for raw in lines:
                 try:
                     line = raw.decode("utf-8")

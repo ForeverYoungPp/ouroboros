@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import {
     loadSkillReviewDetail,
+    nestedSkillReviewRef,
     renderSkillReviewDisclosure,
     summarizeSkillReviewMessage,
     wireSkillReviewDisclosure,
@@ -12,7 +13,10 @@ import {
 const REFERENCE_TEXT = 'Skill review round 2 — snapshot abc123def456 (attempt 1): `alpha` — status=clean, source=skills';
 
 function makeFull() {
-    return { dataset: {}, innerHTML: '' };
+    return {
+        dataset: {}, innerHTML: '', attrs: {},
+        setAttribute(key, value) { this.attrs[key] = value; },
+    };
 }
 
 function okResponse(markdown) {
@@ -75,16 +79,34 @@ test('loadSkillReviewDetail encodes skill and job id in the route', async () => 
     assert.deepEqual(calls, ['/api/skills/a%20b/review-history/j%2F1']);
 });
 
-test('loadSkillReviewDetail failure degrades honestly with a Retry control', async () => {
+test('permanent bounded 404 parses the server error and offers no fake Retry', async () => {
     const full = makeFull();
     const state = await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'skill-job-1' }, {
-        fetchImpl: async () => ({ ok: false, status: 404, json: async () => ({ error: 'review record not found' }) }),
+        fetchImpl: async () => ({
+            ok: false, status: 404,
+            json: async () => ({ error: 'review record unavailable outside the bounded history window' }),
+        }),
         render: () => { throw new Error('must not render on failure'); },
     });
     assert.equal(state, 'error');
     assert.equal(full.dataset.state, 'error');
     assert.match(full.innerHTML, /Review details unavailable/);
     assert.match(full.innerHTML, /HTTP 404/);
+    assert.match(full.innerHTML, /unavailable outside the bounded history window/);
+    assert.match(full.innerHTML, /Cost unavailable/);
+    assert.doesNotMatch(full.innerHTML, /data-skill-review-retry/);
+});
+
+test('transient non-OK detail parses JSON and retains Retry', async () => {
+    const full = makeFull();
+    const state = await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'skill-job-1' }, {
+        fetchImpl: async () => ({
+            ok: false, status: 503,
+            json: async () => ({ error: 'temporary ledger read failure' }),
+        }),
+    });
+    assert.equal(state, 'error');
+    assert.match(full.innerHTML, /HTTP 503: temporary ledger read failure/);
     assert.match(full.innerHTML, /data-skill-review-retry/);
 });
 
@@ -122,6 +144,96 @@ test('loaded and in-flight containers are never refetched', async () => {
     assert.equal(attempts, 1);
 });
 
+test('nested attempts reuse the instance exact-job store after DOM rebuild', async () => {
+    const store = new Map();
+    let fetches = 0;
+    const deps = {
+        store,
+        fetchImpl: async () => { fetches += 1; return okResponse('cached exact detail'); },
+        render: (markdown) => markdown,
+    };
+    await loadSkillReviewDetail(makeFull(), { skill: 'alpha', jobId: 'nested-job' }, deps);
+    const rebuilt = makeFull();
+    await loadSkillReviewDetail(rebuilt, { skill: 'alpha', jobId: 'nested-job' }, deps);
+    assert.equal(fetches, 1);
+    assert.match(rebuilt.innerHTML, /cached exact detail/);
+    assert.deepEqual(nestedSkillReviewRef({ dataset: {
+        skillReviewSkill: 'alpha', skillReviewJob: 'nested-job',
+    } }), { skill: 'alpha', jobId: 'nested-job' });
+});
+
+test('cached loaded detail does not repaint an already-loaded live node', async () => {
+    const store = new Map();
+    const full = makeFull();
+    let fetches = 0;
+    let renders = 0;
+    const deps = {
+        store,
+        fetchImpl: async () => {
+            fetches += 1;
+            return okResponse('cached body');
+        },
+        render: (markdown) => {
+            renders += 1;
+            return '<p>' + markdown + '</p>';
+        },
+    };
+    await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'reader-job' }, deps);
+    const readerOwnedMarkup = '<p>cached body</p><span data-selection-anchor>keep</span>';
+    full.innerHTML = readerOwnedMarkup;
+    await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'reader-job' }, deps);
+    assert.equal(fetches, 1);
+    assert.equal(renders, 1);
+    assert.equal(full.innerHTML, readerOwnedMarkup);
+});
+
+test('same exact detail shares one in-flight read across a DOM rebuild', async () => {
+    const store = new Map();
+    let resolve;
+    let fetches = 0;
+    const gate = new Promise((done) => { resolve = done; });
+    const deps = {
+        store,
+        fetchImpl: async () => { fetches += 1; await gate; return okResponse('settled detail'); },
+        render: (markdown) => markdown,
+    };
+    const first = makeFull();
+    const second = makeFull();
+    const one = loadSkillReviewDetail(first, { skill: 'alpha', jobId: 'shared-job' }, deps);
+    await Promise.resolve();
+    const two = loadSkillReviewDetail(second, { skill: 'alpha', jobId: 'shared-job' }, deps);
+    assert.equal(fetches, 1);
+    assert.equal(second.dataset.state, 'loading');
+    assert.equal(second.attrs['aria-busy'], 'true');
+    assert.match(second.innerHTML, /role="status" aria-live="polite"/);
+    resolve();
+    await Promise.all([one, two]);
+    assert.equal(second.dataset.state, 'loaded');
+    assert.equal(second.attrs['aria-busy'], 'false');
+    assert.match(second.innerHTML, /settled detail/);
+});
+
+test('retry resets the shared error and exposes accessible busy state', async () => {
+    const store = new Map();
+    const full = makeFull();
+    let attempts = 0;
+    const deps = {
+        store,
+        fetchImpl: async () => {
+            attempts += 1;
+            if (attempts === 1) throw new Error('offline');
+            return okResponse('recovered');
+        },
+        render: (markdown) => markdown,
+    };
+    await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'retry-job' }, deps);
+    assert.match(full.innerHTML, /role="status" aria-live="polite"/);
+    await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'retry-job' }, { ...deps, retry: true });
+    assert.equal(attempts, 2);
+    assert.equal(full.attrs['aria-busy'], 'false');
+    assert.match(full.innerHTML, /recovered/);
+});
+
 test('empty markdown from the route is treated as an error, not a blank card', async () => {
     const full = makeFull();
     const state = await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'j1' }, {
@@ -130,6 +242,16 @@ test('empty markdown from the route is treated as an error, not a blank card', a
     });
     assert.equal(state, 'error');
     assert.match(full.innerHTML, /Review details unavailable/);
+});
+
+test('exact server accounting renders without a client-authored cost fallback', async () => {
+    const full = makeFull();
+    await loadSkillReviewDetail(full, { skill: 'alpha', jobId: 'j1' }, {
+        fetchImpl: async () => okResponse('## Findings\n\n### Review accounting\n\n- Cash: settled $0.10.'),
+        render: (markdown) => `<rendered>${markdown}</rendered>`,
+    });
+    assert.match(full.innerHTML, /Review accounting/);
+    assert.doesNotMatch(full.innerHTML, /skill-review-cost-unavailable/);
 });
 
 test('a missing reference is a no-op (defensive)', async () => {
