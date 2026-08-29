@@ -160,7 +160,7 @@ def test_blocked_session_bootstrap_terminals_unrun_with_alternatives(monkeypatch
     bootstrap = ctx._configured_actor_bootstrap
     assert bootstrap["selected_subagent_id"] == "session-builder"
     assert len(bootstrap["work_order_fingerprint"]) == 64
-    rows = [json.loads(line) for line in custody.event_log_path(tmp_path).read_text().splitlines()]
+    rows = [json.loads(line) for line in custody.event_log_path(tmp_path).read_text(encoding="utf-8").splitlines()]
     assert rows[-1]["type"] == "delegate_run_configured_startup_fault"
     assert rows[-1]["reason"] == "subscription_window_exhausted"
     assert rows[-1]["host_fallback"] is False
@@ -243,7 +243,7 @@ def test_definite_refusal_reaches_the_zero_dollar_terminal_without_a_model_round
     agent._handle_task_scoped(dict(pinned))
 
     assert calls == [], "a definite pre-start refusal must never reach the model"
-    record = _json.loads((drive / "task_results" / "pinned-refused.json").read_text())
+    record = _json.loads((drive / "task_results" / "pinned-refused.json").read_text(encoding="utf-8"))
     assert float(record.get("cost_usd") or 0.0) == 0.0
     assert "NOT run on metered API tokens" in str(record.get("result") or "")
 

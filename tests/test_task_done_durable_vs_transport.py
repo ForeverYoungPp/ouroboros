@@ -98,7 +98,7 @@ def _run(tmp_path, task_id, chat_id, delegation_role="subagent"):
     }
     _handle_task_done(evt, ctx)
     events_file = tmp_path / "logs" / "events.jsonl"
-    rows = [json.loads(l) for l in events_file.read_text().splitlines() if l.strip()]
+    rows = [json.loads(l) for l in events_file.read_text(encoding="utf-8").splitlines() if l.strip()]
     done_rows = [r for r in rows if r.get("type") == "task_done" and r.get("task_id") == task_id]
     return sent, pushed, done_rows
 
