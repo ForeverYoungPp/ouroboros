@@ -275,3 +275,84 @@ def test_blocked_fault_row_is_visible_attempt_evidence(monkeypatch, tmp_path):
     assert bootstrap_before_context(ctx, task, dispatch) == ""
     evidence = task_execution_evidence(tmp_path, "child-fault-evidence")
     assert evidence["delegate_start_attempted"] is True
+
+
+def _started_actor_ctx(tmp_path):
+    return SimpleNamespace(
+        task_id="actor-started",
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        _configured_actor_bootstrap={
+            "physical_started": True,
+            "exact_start_pending": False,
+            "route_available": True,
+            "selected_subagent_id": "session-a",
+            "work_order_fingerprint": "a" * 64,
+        },
+    )
+
+
+@pytest.mark.parametrize("failure", ["marker", "raise"])
+def test_unreadable_custody_projects_unknown_not_clean(tmp_path, monkeypatch, failure):
+    # Final-gate finding (sol+fable converged): unreadable custody evidence on
+    # a STARTED actor must project typed unknown — never None, which every
+    # consumer (finalization nudge, terminal projection) reads as clean.
+    import ouroboros.delegate_evidence as evidence_mod
+    from ouroboros.subagent_bootstrap import (
+        actor_first_terminal_projection,
+        actor_first_unresolved_fact,
+        configured_actor_finalization_message,
+    )
+
+    if failure == "marker":
+        monkeypatch.setattr(
+            evidence_mod, "task_execution_evidence",
+            lambda _root, _tid: {"evidence_read_failed": True},
+        )
+    else:
+        def _boom(_root, _tid):
+            raise OSError("custody log unreadable")
+        monkeypatch.setattr(evidence_mod, "task_execution_evidence", _boom)
+
+    ctx = _started_actor_ctx(tmp_path)
+    fact = actor_first_unresolved_fact(ctx, drive_root=tmp_path)
+    assert fact == {
+        "status": "unknown",
+        "reason": "evidence_read_failed",
+        "route_available": True,
+    }
+    # No invented counts: unknown means the log may hold a settled run.
+    assert "delegated_runs_started" not in fact
+
+    message = configured_actor_finalization_message(
+        ctx, task_id="actor-started", fallback_root=tmp_path,
+    )
+    assert "CONFIGURED_ACTOR_UNKNOWN" in message
+
+    projected, usage_out, _trace = actor_first_terminal_projection(
+        ctx, {"id": "actor-started"}, {}, {}, tmp_path,
+    )
+    assert projected is not None and projected["status"] == "unknown"
+    assert usage_out["actor_first_terminal"]["reason"] == "evidence_read_failed"
+
+
+def test_failure_state_truncation_is_disclosed(tmp_path, monkeypatch):
+    # Final-gate finding (sol): the terminal fact bounds failure states at 12
+    # like the acceptance projection — bounded but DISCLOSED, never silent.
+    import ouroboros.delegate_evidence as evidence_mod
+    from ouroboros.subagent_bootstrap import actor_first_unresolved_fact
+
+    monkeypatch.setattr(
+        evidence_mod, "task_execution_evidence",
+        lambda _root, _tid: {
+            "delegated_runs_started": 13,
+            "delegated_runs_settled": 13,
+            "delegated_runs_succeeded": 0,
+            "delegated_runs_failed": 13,
+            "delegated_run_failure_states": [f"state_{i:02d}" for i in range(13)],
+        },
+    )
+    fact = actor_first_unresolved_fact(_started_actor_ctx(tmp_path), drive_root=tmp_path)
+    assert fact["status"] == "incomplete"
+    assert len(fact["delegated_run_failure_states"]) == 12
+    assert fact["failure_states_omitted"] == 1

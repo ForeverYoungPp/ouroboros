@@ -39,6 +39,12 @@ def _with_coordination_context(ctx: Any, raw: str) -> str:
 # a false "spent nothing" terminal over a possibly-live run is the one
 # direction this classification must never fail toward (f9356572 B4 in
 # spirit; the set errs toward the episode, never toward the terminal).
+# LOAD-BEARING COUPLING: "malformed_response"/"daemon_unreachable" can also be
+# raised post-POST (a run may be live) — they are safe here ONLY because the
+# ClaudexorUnavailable handler in tools/delegate attaches the pending
+# invocation handle to every non-4xx fault, and the custody-handle guard
+# below then forces the wake. Refactors of that error path must keep
+# post-POST refusals carrying a handle.
 _DEFINITE_UNRUN_REASONS = frozenset({
     "route_not_in_capability_catalog",
     "route_disabled",
@@ -335,9 +341,16 @@ def actor_first_unresolved_fact(
                 custody_root(ctx), str(task_id or getattr(ctx, "task_id", "") or ""),
             )
         except Exception:
-            return None
+            evidence = None
         if not isinstance(evidence, dict) or evidence.get("evidence_read_failed"):
-            return None
+            # Unreadable custody is UNKNOWN, never permission to finalize
+            # cleanly (docstring contract; plan D3): no counts are invented —
+            # the log may hold a settled run this reader simply could not see.
+            return {
+                "status": "unknown",
+                "reason": "evidence_read_failed",
+                "route_available": bootstrap.get("route_available"),
+            }
         succeeded = int(evidence.get("delegated_runs_succeeded") or 0)
         if succeeded:
             return None
@@ -353,16 +366,22 @@ def actor_first_unresolved_fact(
                 "delegated_runs_settled": settled,
                 "route_available": bootstrap.get("route_available"),
             }
-        return {
+        failure_states = [
+            str(s) for s in (evidence.get("delegated_run_failure_states") or [])
+        ]
+        fact = {
             "status": "incomplete",
             "reason": "delegated_runs_failed_without_success",
             "delegated_runs_started": started,
             "delegated_runs_failed": int(evidence.get("delegated_runs_failed") or 0),
-            "delegated_run_failure_states": [
-                str(s) for s in (evidence.get("delegated_run_failure_states") or [])
-            ][:12],
+            "delegated_run_failure_states": failure_states[:12],
             "route_available": bootstrap.get("route_available"),
         }
+        if len(failure_states) > 12:
+            # Bounded but DISCLOSED (P1), same contract as the acceptance
+            # projection in delegate_evidence: never a silent truncation.
+            fact["failure_states_omitted"] = len(failure_states) - 12
+        return fact
     if str(bootstrap.get("zero_run_evidence_status") or "") == "unknown":
         return {
             "status": "unknown",
