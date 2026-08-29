@@ -1794,9 +1794,13 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                         raise
                 self._rounds_used = round_idx
                 tool_calls = (msg.get("tool_calls") or []) if isinstance(msg, dict) else []
-                wire_validation = pop_custom_validation_receipts(dict(usage or {}), tool_calls)
+                usage = dict(usage or {})
+                # Pop the wire-validation sidecar BEFORE accumulation, exactly
+                # like the existing bounded loops — receipts are per-round
+                # execution facts, not usage numbers.
+                wire_validation = pop_custom_validation_receipts(usage, tool_calls)
                 validation_by_id = custom_validation_by_call_id(wire_validation)
-                add_usage(total_usage, dict(usage or {}))
+                add_usage(total_usage, usage)
                 content = str(msg.get("content") or "") if isinstance(msg, dict) else ""
                 transcript_chars += len(content)
                 if content and not tool_calls:

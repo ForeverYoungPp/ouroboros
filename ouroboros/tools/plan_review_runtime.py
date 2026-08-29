@@ -44,9 +44,12 @@ PLAN_REVIEW_EFFORT = "high"
 PLAN_REVIEW_SLOT_TIMEOUT_SEC = None
 # Per-slot provenance of what the reviewer read (BIBLE P3, retrieving reviewers):
 # an api_chat slot read exactly the host-assembled packet; an agent_session slot
-# retrieved with its own tools and the host did not observe what it opened.
+# retrieved with its own tools and the host did not observe what it opened; a
+# native tool-round slot retrieved with HOST tools, so its reads are observed —
+# a stronger disclosure that is still never a claim of full-surface coverage.
 HOST_FILE_READ_ASSEMBLED = "host_assembled_packet"
 HOST_FILE_READ_UNOBSERVED = "unobserved"
+HOST_FILE_READ_OBSERVED = "host_observed"
 
 log = logging.getLogger(__name__)
 
@@ -238,9 +241,18 @@ def plan_review_slots() -> list:
 
 
 def slot_is_session(slot: Any) -> bool:
+    """TRANSPORT fact: this slot runs a delegated Claudexor session (daemon
+    health, threads, invocation custody). Never use it for delivery class."""
     from ouroboros.review_execution import ReviewRouteKind
 
     return getattr(slot, "route", None) is ReviewRouteKind.AGENT_SESSION
+
+
+def slot_retrieves(slot: Any) -> bool:
+    """DELIVERY class: this slot reads the subject with its own tools — a
+    session row or a configured-subagent native row. Packet sizing, fit and
+    retrieval semantics test THIS, not the route name."""
+    return bool(getattr(slot, "retrieves", slot_is_session(slot)))
 
 
 async def run_plan_review_slots(
@@ -349,7 +361,13 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         "model": str(usage.get("resolved_model") or actor.get("model") or getattr(slot, "model", "") or ""),
         "request_model": str(getattr(slot, "model", "") or actor.get("model") or ""),
         "route": "agent_session" if session else "api_chat",
-        "host_file_read_attestation": HOST_FILE_READ_UNOBSERVED if session else HOST_FILE_READ_ASSEMBLED,
+        # Delivery-truthful provenance: a native tool-round actor discloses its
+        # HOST-OBSERVED reads through its usage; session stays unobserved and a
+        # packet row stays host-assembled.
+        "host_file_read_attestation": (
+            str(usage.get("host_file_read_attestation") or "")
+            or (HOST_FILE_READ_UNOBSERVED if session else HOST_FILE_READ_ASSEMBLED)
+        ),
         "text": text,
         "error": error or None,
         "prompt_ref": actor.get("prompt_ref") or {},
@@ -1060,14 +1078,14 @@ def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int) -> tuple[list,
     # harness target, not a provider route (`reviewer_window.reviewer_route(session=True)`), and
     # the review organ's convention (triad: "session rows are not constrained by this pack")
     # is that such a row is never fit-excluded — it retrieves with its own tools.
-    api_models = [str(getattr(slot, "model", "") or "") for slot in slots if not slot_is_session(slot)]
+    api_models = [str(getattr(slot, "model", "") or "") for slot in slots if not slot_retrieves(slot)]
     limits = per_slot_input_token_limits(
         api_models, output_reserve=PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000)
     estimated = max(1, (max(0, int(prompt_chars)) + 3) // 4)  # utils.estimate_tokens on the packet
     callable_slots, oversize = [], []
     for slot in slots:
         cap = int(limits.get(str(getattr(slot, "model", "") or ""), 0) or 0)
-        if slot_is_session(slot) or estimated <= cap:
+        if slot_retrieves(slot) or estimated <= cap:
             callable_slots.append(slot)
             continue
         oversize.append({

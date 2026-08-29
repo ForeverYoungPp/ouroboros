@@ -1272,7 +1272,15 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
         ), True
     models, row_routes = row_plan["models"], row_plan["routes"]
     ctx._last_triad_models = list(models)  # forensic: actual resolved model IDs
-    api_models = [m for m, r in zip(models, row_routes) if r is ReviewRouteKind.API_CHAT]
+    _row_actors = list(row_plan.get("subagent_ids") or [])
+    # Packet rows only: a configured-subagent api row is the RETRIEVES class —
+    # it neither constrains the fit ladder nor counts as an api seat for the
+    # Q28-A yield arithmetic below.
+    api_models = [
+        m for i, (m, r) in enumerate(zip(models, row_routes))
+        if r is ReviewRouteKind.API_CHAT
+        and not (i < len(_row_actors) and _row_actors[i])
+    ]
 
     goal_section = build_goal_section(goal, scope, commit_message)
     scope_section = build_scope_section(scope)

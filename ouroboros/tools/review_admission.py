@@ -163,10 +163,14 @@ def triad_not_dispatched_records(
     models = list(row_plan.get("models") or [])
     routes = list(row_plan.get("routes") or [])
     slot_ids = list(row_plan.get("slot_ids") or [])
+    actors = list(row_plan.get("subagent_ids") or [])
     records = []
     for index, model in enumerate(models):
         if only_api and (
             index >= len(routes) or routes[index] is not ReviewRouteKind.API_CHAT
+            # A configured-subagent api row retrieves; the packet drop is not
+            # its withholding and it keeps its live seat.
+            or (index < len(actors) and actors[index])
         ):
             continue
         records.append({
