@@ -345,6 +345,32 @@ def test_prescribed_lower_effort_tier_wins_over_the_one_rung_walk(evidence_root)
     assert upward is not None and payload_effort(upward) == "medium"
 
 
+def test_prescribed_jump_needs_a_quoted_tier_inside_the_retry_floor(evidence_root):
+    target = _target(provider="openai")
+
+    with request_wire_call_scope():
+        prepare_wire_payload_for_send(target, _payload(effort="ultra"), api_surface="chat.completions")
+        prose = plan_wire_retry_from_exception(_Rejected(
+            "reasoning_effort value 'ultra' is not supported: too high for this model"
+        ))
+    assert prose is not None and payload_effort(prose) == "max"
+
+    with request_wire_call_scope():
+        prepare_wire_payload_for_send(target, _payload(effort="medium"), api_surface="chat.completions")
+        english_word = plan_wire_retry_from_exception(_Rejected(
+            "reasoning_effort value 'medium' is not supported; "
+            "none of the selected endpoints accept it"
+        ))
+    assert english_word is not None and payload_effort(english_word) == "low"
+
+    with request_wire_call_scope():
+        prepare_wire_payload_for_send(target, _payload(effort="high"), api_surface="chat.completions")
+        sub_low = plan_wire_retry_from_exception(_Rejected(
+            "reasoning_effort value 'high' is not supported; use 'minimal' instead"
+        ))
+    assert sub_low is not None and payload_effort(sub_low) == "medium"
+
+
 def test_failed_invalid_and_phase2a_finalized_attempts_never_poison(evidence_root):
     target = _target()
     source = _payload(effort="medium")
