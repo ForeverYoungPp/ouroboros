@@ -190,8 +190,42 @@ def test_notifier_ignores_ambient_chat_id(monkeypatch):
     assert nt._pinned_chat_id({}) == 0
 
 
-def test_permanent_notification_rejection_reaches_supervisor(tmp_path, monkeypatch):
-    nt = _load(); api, _data = _api(tmp_path)
+def test_permanent_notification_rejection_skips_and_persists(tmp_path, monkeypatch):
+    """A permanent send rejection consumes the notification (state advances)
+    instead of raising into the supervised-restart budget and replaying the
+    same dead send forever."""
+    nt = _load(); api, data = _api(tmp_path)
+
+    class Rejected:
+        attempts = 0
+        def __init__(self, _token): pass
+        async def send_message(self, *_args, **_kwargs):
+            Rejected.attempts += 1
+            raise nt.TelegramRequestRejected("rejected", status_code=401)
+
+    monkeypatch.setattr(nt, "TelegramClient", Rejected)
+
+    async def runtime_state(_api):
+        return {"spent_usd": 850, "budget_limit": 1000, "budget_pct": 85}
+
+    monkeypatch.setattr(nt, "_load_runtime_state", runtime_state)
+    settings = {"TELEGRAM_NOTIFY_BUDGET": "on"}; state = {}
+    asyncio.run(nt._check_budget_notify(api, settings, 42, state, "en"))
+    assert state["budget_threshold"] == 80
+    asyncio.run(nt._check_budget_notify(api, settings, 42, state, "en"))
+    assert Rejected.attempts == 1  # consumed: the dead send is not replayed
+
+    (data / "logs" / "chat.jsonl").write_text(
+        json.dumps({"type": "task_summary", "task_id": "dead1", "outcome_axes": {"lifecycle": "completed"}}) + "\n",
+        encoding="utf-8",
+    )
+    task_state = {"notified_task_ids": []}
+    asyncio.run(nt._check_tasks_notify(api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, task_state, "en"))
+    assert task_state["notified_task_ids"] == ["dead1"]
+
+
+def test_notifier_loop_survives_permanent_rejection_and_saves_state(tmp_path, monkeypatch):
+    nt = _load(); api, data = _api(tmp_path)
 
     class Rejected:
         def __init__(self, _token): pass
@@ -199,8 +233,89 @@ def test_permanent_notification_rejection_reaches_supervisor(tmp_path, monkeypat
             raise nt.TelegramRequestRejected("rejected", status_code=401)
 
     monkeypatch.setattr(nt, "TelegramClient", Rejected)
-    with pytest.raises(nt.TelegramRequestRejected):
-        asyncio.run(nt._push_notification(api, 42, "notice"))
+
+    async def runtime_state(_api):
+        return {"spent_usd": 850, "budget_limit": 1000, "budget_pct": 85}
+
+    monkeypatch.setattr(nt, "_load_runtime_state", runtime_state)
+    monkeypatch.setattr(
+        nt,
+        "_load_settings",
+        lambda _api: {"TELEGRAM_NOTIFY_BUDGET": "on", "TELEGRAM_CHAT_ID": "42"},
+    )
+
+    async def stop_sleep(_delay):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(nt.asyncio, "sleep", stop_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(nt._make_notifier(api)())
+
+    sd = Path(api.get_state_dir())
+    saved = json.loads((sd / "notif_state.json").read_text(encoding="utf-8"))
+    assert saved["budget_threshold"] == 80
+
+
+def test_notifier_transient_backoff_grows_and_resets_with_transition_logs(tmp_path, monkeypatch):
+    nt = _load(); _api_obj, data = _api(tmp_path)
+
+    logs = []
+
+    class LoggingApi:
+        def __init__(self, inner): self._inner = inner
+        def get_state_dir(self): return self._inner.get_state_dir()
+        def get_settings(self, k): return self._inner.get_settings(k)
+        def log(self, level, message, **fields): logs.append((level, message))
+
+    api = LoggingApi(_api_obj)
+    outcomes = iter([
+        nt.TelegramTransportError("offline one"),
+        nt.TelegramTransportError("offline two"),
+        1,  # delivered → backoff resets
+        nt.TelegramTransportError("offline again"),
+    ])
+
+    class Flapping:
+        def __init__(self, _token): pass
+        async def send_message(self, *_args, **_kwargs):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(nt, "TelegramClient", Flapping)
+    budgets = iter([85, 85, 85, 92, 100])
+
+    async def runtime_state(_api):
+        pct = next(budgets)
+        return {"spent_usd": 10 * pct, "budget_limit": 1000, "budget_pct": pct}
+
+    monkeypatch.setattr(nt, "_load_runtime_state", runtime_state)
+    monkeypatch.setattr(
+        nt,
+        "_load_settings",
+        lambda _api: {"TELEGRAM_NOTIFY_BUDGET": "on", "TELEGRAM_CHAT_ID": "42"},
+    )
+    sleeps = []
+
+    async def record_sleep(delay):
+        sleeps.append(delay)
+        if len(sleeps) >= 4:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(nt.asyncio, "sleep", record_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(nt._make_notifier(api)())
+
+    # transient backoff, grown backoff, healthy pacing sleep, reset backoff
+    assert sleeps[0] == 5
+    assert sleeps[1] > sleeps[0]
+    assert sleeps[2] == 30
+    assert sleeps[3] == 5
+    degraded = [m for _lvl, m in logs if "degraded" in m]
+    recovered = [m for _lvl, m in logs if "recovered" in m]
+    assert len(degraded) == 2 and "TelegramTransportError" in degraded[0]
+    assert len(recovered) == 1
 
 
 def test_notifier_local_failure_reaches_supervisor(tmp_path, monkeypatch):

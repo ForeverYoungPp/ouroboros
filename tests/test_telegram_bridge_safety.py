@@ -320,7 +320,9 @@ def test_poller_surfaces_permanent_telegram_rejection_and_records_failure(tmp_pa
     assert any(message == "Telegram polling was permanently rejected." for _, message, _ in api.logs)
 
 
-def test_poller_retries_only_typed_transport_failure(tmp_path, monkeypatch):
+def test_poller_backoff_grows_monotonically_to_cap_on_typed_transport_failure(tmp_path, monkeypatch):
+    """Typed transient failures keep the poller alive with monotone backoff up
+    to the cap; a cancellation during the backoff sleep still stops it."""
     plugin = _load_plugin(tmp_path)
 
     class OfflineClient(FakeTelegramClient):
@@ -330,21 +332,130 @@ def test_poller_retries_only_typed_transport_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(plugin, "TelegramClient", OfflineClient)
     sleeps = []
 
-    async def stop_after_backoff(delay):
+    async def record_sleep(delay):
         sleeps.append(delay)
-        raise asyncio.CancelledError
+        if len(sleeps) >= 8:
+            raise asyncio.CancelledError
 
-    monkeypatch.setattr(plugin.asyncio, "sleep", stop_after_backoff)
+    monkeypatch.setattr(plugin.asyncio, "sleep", record_sleep)
     try:
         asyncio.run(plugin._make_poller(FakeApi(tmp_path))())
     except asyncio.CancelledError:
         pass
 
-    assert sleeps == [5]
+    assert sleeps[0] == 5
+    assert all(later >= earlier for earlier, later in zip(sleeps, sleeps[1:]))
+    assert max(sleeps) == 60
+    assert sleeps[-2:] == [60, 60]
     assert json.loads((tmp_path / "bridge_status.json").read_text(encoding="utf-8")) == {
         "state": "ready",
         "reason_code": "",
     }
+
+
+def test_poller_backoff_resets_after_any_successful_poll_and_logs_transitions(tmp_path, monkeypatch):
+    plugin = _load_plugin(tmp_path)
+    outcomes = iter([
+        plugin.TelegramTransportError("offline one"),
+        plugin.TelegramTransportError("offline two"),
+        [],  # empty batch still counts as success and resets the backoff
+        plugin.TelegramTransportError("offline again"),
+    ])
+
+    class FlappingClient(FakeTelegramClient):
+        async def get_updates(self, _offset):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(plugin, "TelegramClient", FlappingClient)
+    sleeps = []
+
+    async def record_sleep(delay):
+        sleeps.append(delay)
+        if len(sleeps) >= 4:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(plugin.asyncio, "sleep", record_sleep)
+    api = FakeApi(tmp_path)
+    try:
+        asyncio.run(plugin._make_poller(api)())
+    except asyncio.CancelledError:
+        pass
+
+    # backoff, grown backoff, healthy pacing sleep, then backoff reset to base
+    assert sleeps[0] == 5
+    assert sleeps[1] > sleeps[0]
+    assert sleeps[3] == 5
+    degraded = [m for _lvl, m, _f in api.logs if "degraded" in m]
+    recovered = [m for _lvl, m, _f in api.logs if "recovered" in m]
+    assert len(degraded) == 2, degraded
+    assert "TelegramTransportError" in degraded[0]
+    assert len(recovered) == 1, recovered
+
+
+def test_startup_transient_getme_does_not_kill_poller(tmp_path, monkeypatch):
+    """A dead network during startup validation must not raise into the
+    supervised-restart budget; validation is retried from the polling loop."""
+    plugin = _load_plugin(tmp_path)
+    failures = {"count": 0}
+
+    class LateStartClient(FakeTelegramClient):
+        updates = []
+
+        async def call(self, method, **kwargs):
+            if method == "getMe" and failures["count"] < 1:
+                failures["count"] += 1
+                raise plugin.TelegramTransportError("Telegram API timed out during getMe.")
+            return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(plugin, "TelegramClient", LateStartClient)
+
+    async def stop_sleep(_delay):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(plugin.asyncio, "sleep", stop_sleep)
+    api = FakeApi(tmp_path)
+    try:
+        asyncio.run(plugin._make_poller(api)())
+    except asyncio.CancelledError:
+        pass
+
+    assert failures["count"] == 1
+    assert json.loads((tmp_path / "bridge_status.json").read_text(encoding="utf-8")) == {
+        "state": "ready",
+        "reason_code": "",
+    }
+    assert any("Telegram poller started" in m for _lvl, m, _f in api.logs)
+
+
+def test_startup_permanent_rejection_keeps_raise_semantics(tmp_path, monkeypatch):
+    plugin = _load_plugin(tmp_path)
+
+    class RejectedStartClient(FakeTelegramClient):
+        async def call(self, method, **kwargs):
+            if method == "getMe":
+                raise plugin.TelegramRequestRejected(
+                    "Telegram API getMe returned HTTP 401.", status_code=401,
+                )
+            return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(plugin, "TelegramClient", RejectedStartClient)
+    api = FakeApi(tmp_path)
+
+    try:
+        asyncio.run(plugin._make_poller(api)())
+    except plugin.TelegramRequestRejected as exc:
+        assert exc.status_code == 401
+    else:
+        raise AssertionError("permanent startup rejection must stop the poller")
+
+    assert json.loads((tmp_path / "bridge_status.json").read_text(encoding="utf-8")) == {
+        "state": "error",
+        "reason_code": "telegram_startup_failed",
+    }
+    assert any("Telegram token validation failed" in m for _lvl, m, _f in api.logs)
 
 
 def test_poller_surfaces_local_failure_to_supervisor(tmp_path, monkeypatch):
