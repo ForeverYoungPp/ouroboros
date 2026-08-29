@@ -14,6 +14,7 @@ import unittest.mock as mock
 
 import pytest
 
+import ouroboros.tools.claude_advisory_review as advisory
 from ouroboros.tools.claude_advisory_review import (
     _syntax_preflight_staged_py_files,
 )
@@ -166,7 +167,7 @@ class TestPreflightGatesBeforeSDK:
         repo = _make_agent_repo(tmp_path)
         (repo / "broken.py").write_text("def foo(:\n")
 
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-fake")
 
         monkeypatch.setattr(
             adv, "_get_staged_diff",
@@ -188,18 +189,11 @@ class TestPreflightGatesBeforeSDK:
             sdk_called["n"] += 1
             raise AssertionError("SDK should NOT be called when preflight blocks")
 
-        def _fake_resolve_model():
-            return "claude-opus-4-6[1m]"
-
         monkeypatch.setattr(
-            "ouroboros.gateways.claude_code.run_readonly",
-            _fake_run_readonly,
-            raising=False,
-        )
-        monkeypatch.setattr(
-            "ouroboros.gateways.claude_code.resolve_claude_code_model",
-            _fake_resolve_model,
-            raising=False,
+            advisory, "_run_advisory_native",
+            lambda prompt, repo_dir, ctx_, slot, model: (
+                _fake_run_readonly(), model,
+            ),
         )
 
         fake_ctx = mock.MagicMock()
@@ -227,7 +221,7 @@ class TestPreflightGatesBeforeSDK:
         repo = _make_agent_repo(tmp_path)
         (repo / "good.py").write_text("def foo():\n    return 1\n")
 
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-fake")
 
         monkeypatch.setattr(
             adv, "_get_staged_diff",
@@ -264,20 +258,13 @@ class TestPreflightGatesBeforeSDK:
             sdk_called["n"] += 1
             return _Result()
 
-        def _fake_resolve_model():
-            return "claude-opus-4-6[1m]"
-
         # run_readonly is imported INSIDE _run_claude_advisory, not at module top,
         # so patch the source symbol.
         monkeypatch.setattr(
-            "ouroboros.gateways.claude_code.run_readonly",
-            _fake_run_readonly,
-            raising=False,
-        )
-        monkeypatch.setattr(
-            "ouroboros.gateways.claude_code.resolve_claude_code_model",
-            _fake_resolve_model,
-            raising=False,
+            advisory, "_run_advisory_native",
+            lambda prompt, repo_dir, ctx_, slot, model: (
+                _fake_run_readonly(), model,
+            ),
         )
 
         fake_ctx = mock.MagicMock()

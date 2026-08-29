@@ -695,10 +695,26 @@ def advisory_review_route() -> str:
 
 
 def _advisory_default_model() -> str:
-    """The shipped routed advisory default (provider_models SSOT)."""
-    from ouroboros.provider_models import OPENROUTER_REVIEW_DEFAULTS
+    """The shipped advisory default on a route this install can actually pay.
 
-    return str(OPENROUTER_REVIEW_DEFAULTS["advisory"])
+    The routed catalog id when its provider has credentials; otherwise the
+    SAME model through its direct-provider spelling (the direct-install
+    class); otherwise the routed id — the credentials gate then records its
+    loud audited bypass instead of a silent one.
+    """
+    from ouroboros.provider_models import (
+        OPENROUTER_REVIEW_DEFAULTS,
+        model_has_credentials,
+    )
+
+    routed = str(OPENROUTER_REVIEW_DEFAULTS["advisory"])
+    if model_has_credentials(routed):
+        return routed
+    provider, _, name = routed.partition("/")
+    direct = f"{provider}::{name}" if name else ""
+    if direct and model_has_credentials(direct):
+        return direct
+    return routed
 
 
 def _advisory_native_model() -> str:

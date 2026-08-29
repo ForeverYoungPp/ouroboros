@@ -46,55 +46,51 @@ def test_resolve_claude_code_model(monkeypatch, case_id, env_value, expected):
     assert gw.resolve_claude_code_model() == expected
 
 
-def test_advisory_uses_resolve_claude_code_model_helper():
-    """_run_claude_advisory must call resolve_claude_code_model() — no hardcoded 'opus'."""
+def test_advisory_uses_the_shipped_default_model_helper():
+    """_run_claude_advisory resolves its model through _advisory_default_model()
+    (routed catalog id with a same-model direct-provider fallback) — never a
+    hardcoded model and never the retired Claude-SDK resolver."""
     import inspect
     adv_mod = _get_advisory_module()
     source = inspect.getsource(adv_mod._run_claude_advisory)
-    assert "resolve_claude_code_model" in source
+    assert "_advisory_default_model" in source
+    assert "resolve_claude_code_model" not in source
 
 
-def test_advisory_passes_scope_review_effort_to_claude_code(monkeypatch, tmp_path):
+def test_advisory_row_effort_reaches_the_native_slot(monkeypatch, tmp_path):
+    """D-5b survivor: the ADVISORY row's own effort rides the native episode —
+    the scope reviewer's configured effort never leaks in. (The retired
+    Claude-SDK effort plumbing test this replaces asserted the same contract
+    on the removed transport.)"""
     adv_mod = _get_advisory_module()
-    from types import SimpleNamespace
-    from ouroboros.gateways.claude_code import ClaudeCodeResult
-    import ouroboros.gateways.claude_code as gw
-    from ouroboros.usage_accounting import UsageScope, usage_scope
 
     captured = {}
 
-    def fake_run_readonly(**kwargs):
-        captured.update(kwargs)
-        return ClaudeCodeResult(
+    def _capture(prompt, repo_dir, ctx_, slot, model):
+        from types import SimpleNamespace
+
+        captured["effort"] = slot.effort or "low"
+        return SimpleNamespace(
             success=True,
             result_text='[{"item":"bible_compliance","verdict":"PASS","reason":"ok","severity":"critical"}]',
-            session_id="sess-effort",
-            cost_usd=0,
-            usage={},
-        )
+            session_id="", cost_usd=0.0, usage={}, error="", stderr_tail="",
+        ), model
 
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.setenv("OUROBOROS_EFFORT_SCOPE_REVIEW", "low")
-    monkeypatch.setattr(gw, "run_readonly", fake_run_readonly)
-    monkeypatch.setattr(adv_mod, "_get_staged_diff", lambda *a, **kw: "diff")
-    monkeypatch.setattr(adv_mod, "_get_changed_file_list", lambda *a, **kw: "M file.py")
-    monkeypatch.setattr(adv_mod, "build_advisory_changed_context", lambda *a, **kw: (["file.py"], "pack", []))
-    monkeypatch.setattr(adv_mod, "_build_advisory_prompt", lambda *a, **kw: "prompt")
-    ctx = SimpleNamespace(
-        repo_dir=tmp_path, drive_root=tmp_path, budget_drive_root=str(tmp_path),
-        task_id="review-root", task_metadata={"root_task_id": "review-root"},
-        pending_events=[], emit_progress_fn=lambda *_: None,
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("OUROBOROS_EFFORT_SCOPE_REVIEW", "xhigh")
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.setattr(adv_mod, "_run_advisory_native", _capture)
+    from ouroboros.tools.registry import ToolContext
+
+    repo = tmp_path / "repo"; repo.mkdir()
+    drive = tmp_path / "data"; drive.mkdir()
+    ctx = ToolContext(repo_dir=repo, drive_root=drive)
+    _items, raw, _model, _chars = adv_mod._run_claude_advisory(
+        repo, "msg", ctx, options={"include_repo_diff": False},
     )
-
-    with usage_scope(UsageScope(
-        drive_root=tmp_path, task_id="review-root", root_task_id="review-root",
-        global_limit_usd=10.0, root_limit_usd=3.0,
-    )):
-        adv_mod._run_claude_advisory(tmp_path, "msg", ctx)
-
+    assert not raw.startswith("⚠️ ADVISORY_ERROR"), raw
+    # The legacy default row carries effort "low"; scope xhigh never leaks in.
     assert captured["effort"] == "low"
-    assert captured["max_budget_usd"] == 3.0
-
 
 def test_paid_empty_advisory_result_is_error(monkeypatch, tmp_path):
     adv_mod = _get_advisory_module()
@@ -112,7 +108,10 @@ def test_paid_empty_advisory_result_is_error(monkeypatch, tmp_path):
         )
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.setattr(gw, "run_readonly", fake_run_readonly)
+    monkeypatch.setattr(_get_advisory_module(), "_run_advisory_native",
+                        lambda prompt, repo_dir, ctx_, slot, model: (
+                            fake_run_readonly(), model,
+                        ))
     monkeypatch.setattr(adv_mod, "_get_staged_diff", lambda *a, **kw: "diff")
     monkeypatch.setattr(adv_mod, "_get_changed_file_list", lambda *a, **kw: "M file.py")
     monkeypatch.setattr(adv_mod, "build_advisory_changed_context", lambda *a, **kw: (["file.py"], "pack", []))
@@ -180,7 +179,10 @@ def test_skill_advisory_duplicate_expected_items_warn_not_error(monkeypatch, tmp
         )
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.setattr(gw, "run_readonly", fake_run_readonly)
+    monkeypatch.setattr(_get_advisory_module(), "_run_advisory_native",
+                        lambda prompt, repo_dir, ctx_, slot, model: (
+                            fake_run_readonly(), model,
+                        ))
     monkeypatch.setattr(adv_mod, "_build_advisory_prompt", lambda *a, **kw: "prompt")
     ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, pending_events=[], emit_progress_fn=lambda *_: None)
 
@@ -226,7 +228,10 @@ def test_skill_advisory_repeated_bug_hunting_no_contract_warning(monkeypatch, tm
         )
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.setattr(gw, "run_readonly", fake_run_readonly)
+    monkeypatch.setattr(_get_advisory_module(), "_run_advisory_native",
+                        lambda prompt, repo_dir, ctx_, slot, model: (
+                            fake_run_readonly(), model,
+                        ))
     monkeypatch.setattr(adv_mod, "_build_advisory_prompt", lambda *a, **kw: "prompt")
     ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, pending_events=[], emit_progress_fn=lambda *_: None)
 
@@ -264,7 +269,10 @@ def test_skill_advisory_missing_expected_items_still_errors(monkeypatch, tmp_pat
         )
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.setattr(gw, "run_readonly", fake_run_readonly)
+    monkeypatch.setattr(_get_advisory_module(), "_run_advisory_native",
+                        lambda prompt, repo_dir, ctx_, slot, model: (
+                            fake_run_readonly(), model,
+                        ))
     monkeypatch.setattr(adv_mod, "_build_advisory_prompt", lambda *a, **kw: "prompt")
     ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, pending_events=[], emit_progress_fn=lambda *_: None)
 
@@ -1230,7 +1238,10 @@ class TestLLMFallbackExtraction:
             )
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-        monkeypatch.setattr(gw, "run_readonly", fake_run_readonly)
+        monkeypatch.setattr(_get_advisory_module(), "_run_advisory_native",
+                        lambda prompt, repo_dir, ctx_, slot, model: (
+                            fake_run_readonly(), model,
+                        ))
         monkeypatch.setattr(self.mod, "build_advisory_changed_context",
                             lambda *a, **kw: ([], "", set()))
         monkeypatch.setattr(self.mod, "_get_staged_diff",
