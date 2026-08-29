@@ -573,17 +573,31 @@ def test_typed_payment_required_maps_to_no_credits():
 
 def test_ephemeral_openai_client_disables_sdk_retries(monkeypatch):
     captured = {}
+    http_clients = []
 
     class FakeOpenAI:
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
+    class FakeDefaultHttpxClient:
+        def __init__(self, **kwargs):
+            http_clients.append(kwargs)
+
     import sys
 
-    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
+    monkeypatch.setitem(
+        sys.modules,
+        "openai",
+        types.SimpleNamespace(
+            OpenAI=FakeOpenAI, DefaultHttpxClient=FakeDefaultHttpxClient,
+        ),
+    )
     LLMClient._new_remote_client({
         "api_key": "key", "base_url": "https://example.test/v1", "default_headers": {"X": "Y"},
     })
+    http_client = captured.pop("http_client")
+    assert isinstance(http_client, FakeDefaultHttpxClient)
+    assert len(http_clients) == 1 and http_clients[0].get("transport") is not None
     assert captured == {
         "api_key": "key", "base_url": "https://example.test/v1",
         "default_headers": {"X": "Y"}, "max_retries": 0,

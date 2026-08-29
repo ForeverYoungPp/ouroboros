@@ -52,6 +52,13 @@ PACING_INTERVAL_DEFAULT_SEC = 600
 # supervisor loop STALLED if it has not ticked within this many seconds (healthy tick
 # ~0.5s), so it only fires on a real wedge. 0 disables.
 SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC = 90
+# TCP keepalive tuning for long-lived remote LLM connections: a NAT/VPN mapping
+# silently dropped during a long silent reasoning stretch is detected by kernel
+# probes (idle threshold, probe interval, probe count) instead of hanging until
+# the transport read timeout. Consumed by platform_layer's socket-option builder.
+TCP_KEEPALIVE_IDLE_SEC = 60
+TCP_KEEPALIVE_INTERVAL_SEC = 60
+TCP_KEEPALIVE_PROBE_COUNT = 5
 
 
 def _guard_live_settings_write() -> None:

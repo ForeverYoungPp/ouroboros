@@ -1447,12 +1447,35 @@ class LLMClient:
         return self._get_remote_client(target)
 
     @staticmethod
+    def _remote_transport(async_client: bool = False):
+        """One transport factory for every remote httpx client.
+
+        TCP keepalive probes let the kernel detect a NAT/VPN mapping silently
+        dropped during a long silent reasoning stretch, instead of the socket
+        hanging until the transport read timeout. Options live on the
+        transport (httpx ignores ``socket_options`` on the Client itself).
+        """
+        import httpx
+
+        from ouroboros.platform_layer import tcp_keepalive_socket_options
+
+        options = tcp_keepalive_socket_options()
+        if async_client:
+            return httpx.AsyncHTTPTransport(socket_options=options)
+        return httpx.HTTPTransport(socket_options=options)
+
+    @staticmethod
     def _new_remote_client(target: Dict[str, Any]):
-        from openai import OpenAI
+        # DefaultHttpxClient keeps the SDK's own timeout/limits defaults while
+        # letting the shared keepalive transport carry the socket options.
+        from openai import DefaultHttpxClient, OpenAI
 
         kwargs: Dict[str, Any] = {
             "api_key": str(target.get("api_key") or ""),
             "max_retries": 0,
+            "http_client": DefaultHttpxClient(
+                transport=LLMClient._remote_transport()
+            ),
         }
         base_url = str(target.get("base_url") or "")
         headers = dict(target.get("default_headers") or {})
@@ -1517,11 +1540,14 @@ class LLMClient:
 
         client = self._async_remote_clients.get(cache_key)
         if client is None:
-            from openai import AsyncOpenAI
+            from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
             kwargs: Dict[str, Any] = {
                 "api_key": api_key,
                 "max_retries": 0,
+                "http_client": DefaultAsyncHttpxClient(
+                    transport=self._remote_transport(async_client=True)
+                ),
             }
             if base_url:
                 kwargs["base_url"] = base_url
@@ -1551,6 +1577,7 @@ class LLMClient:
             trust_env=False,
             mounts={},
             timeout=cls._no_proxy_timeout(timeout),
+            transport=cls._remote_transport(),
         )
         oa_client = OpenAI(
             api_key=str(target.get("api_key") or ""),
@@ -1570,6 +1597,7 @@ class LLMClient:
             trust_env=False,
             mounts={},
             timeout=cls._no_proxy_timeout(timeout),
+            transport=cls._remote_transport(async_client=True),
         )
         oa_client = AsyncOpenAI(
             api_key=str(target.get("api_key") or ""),

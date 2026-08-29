@@ -1501,6 +1501,14 @@ detector, while explicit task deadline, budget, cancellation and the absolute ce
 remain independent hard axes. A stale terminal from an earlier retry or task attempt
 cannot clear the current row.
 
+Every remote httpx LLM client (the cached OpenAI-compatible clients and the
+no-proxy per-call clients) is built on one shared transport factory that sets
+platform-guarded TCP keepalive socket options, so a NAT/VPN mapping silently
+dropped during a long silent reasoning stretch is detected by kernel probes
+within minutes instead of hanging until the read timeout. Disclosed residual:
+the native Anthropic `requests` session (and the GigaChat library client) do
+not carry these socket options.
+
 The configured-session startup/recovery receipt and every newly minted meaningful wake
 also carry one host-rendered `coordination_context`: the complete parent-authored advisory
 `delegation_budget.intent_note`, explicit-deadline time remaining, known/partial/unknown

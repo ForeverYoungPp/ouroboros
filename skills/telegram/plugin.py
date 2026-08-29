@@ -15,10 +15,13 @@ from starlette.responses import JSONResponse
 from ouroboros.utils import truncate_review_artifact
 
 from .lib.telegram_api import (
+    TELEGRAM_RETRY_INITIAL_SEC,
     TelegramClient,
     TelegramRequestRejected,
     TelegramTransportError,
+    is_transient_telegram_error,
     markdown_to_telegram_html,
+    next_telegram_retry_delay,
     _LOCALIZED_TEXTS,
 )
 from .lib.telegram_state import (
@@ -563,25 +566,39 @@ async def _edit_panel(api, client, chat_id: int, message_id: int, text: str, key
     await client.send_message_with_inline_keyboard(chat_id, text, keyboard)
 
 
+async def _validate_bot(api, client, command_mode: str, lang: str) -> None:
+    """Validate the token (getMe) and finish bridge startup bookkeeping."""
+    await client.call("getMe")
+    # The owner-control commands (evolve/bg/review/restart/panic) only
+    # appear in full_access — they already forward via the raw-command
+    # path; listing them here just makes them discoverable/tappable.
+    try:
+        await client.call("setMyCommands", data={"commands": json.dumps(_bot_commands(command_mode))})
+        api.log("info", "Telegram bot commands configured successfully")
+    except Exception as exc:
+        api.log("warning", f"Failed to set Telegram bot commands: {exc}")
+
+    _save_bridge_status(api, "ready")
+    api.log("info", f"Telegram poller started (command_mode={command_mode}, lang={lang})")
+
+
 async def _start_poller(api):
     try:
         protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
         _settings, pinned_chat, max_updates, command_mode, lang = _poller_preferences(api)
         client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""))
         offset = _load_offset(api)
-        await client.call("getMe")
-        # The owner-control commands (evolve/bg/review/restart/panic) only
-        # appear in full_access — they already forward via the raw-command
-        # path; listing them here just makes them discoverable/tappable.
         try:
-            await client.call("setMyCommands", data={"commands": json.dumps(_bot_commands(command_mode))})
-            api.log("info", "Telegram bot commands configured successfully")
+            await _validate_bot(api, client, command_mode, lang)
+            validated = True
         except Exception as exc:
-            api.log("warning", f"Failed to set Telegram bot commands: {exc}")
-
-        _save_bridge_status(api, "ready")
-        api.log("info", f"Telegram poller started (command_mode={command_mode}, lang={lang})")
-        return client, offset, pinned_chat, max_updates, command_mode, lang
+            if not is_transient_telegram_error(exc):
+                raise
+            # A dead network at startup must not burn the supervised-restart
+            # budget: stay alive and revalidate from the polling loop once
+            # transport returns. Permanent rejections still raise below.
+            validated = False
+        return client, offset, pinned_chat, max_updates, command_mode, lang, validated
     except TelegramSettingsError:
         _save_bridge_status(api, "error", "settings_invalid")
         api.log("error", "Telegram settings are invalid; owner binding is closed.")
@@ -593,11 +610,20 @@ async def _start_poller(api):
 
 
 async def _poller(api) -> None:
-    client, offset, pinned_chat, max_updates, command_mode, lang = await _start_poller(api)
+    client, offset, pinned_chat, max_updates, command_mode, lang, validated = await _start_poller(api)
 
+    retry_delay = TELEGRAM_RETRY_INITIAL_SEC
+    degraded_cause = ""
     while True:
         try:
+            if not validated:
+                await _validate_bot(api, client, command_mode, lang)
+                validated = True
             updates = await client.get_updates(offset)
+            if degraded_cause:
+                api.log("info", f"Telegram poller recovered after {degraded_cause}; polling resumed.")
+                degraded_cause = ""
+            retry_delay = TELEGRAM_RETRY_INITIAL_SEC
             if updates:
                 local_settings, pinned_chat, max_updates, command_mode, lang = _poller_preferences(api)
 
@@ -857,16 +883,19 @@ async def _poller(api) -> None:
             if updates:
                 _save_offset(api, offset)
             await asyncio.sleep(0.1)
-        except TelegramRequestRejected as exc:
-            if not exc.transient:
+        except (TelegramRequestRejected, TelegramTransportError) as exc:
+            if isinstance(exc, TelegramRequestRejected) and not exc.transient:
                 _save_bridge_status(api, "error", "telegram_rejected")
                 api.log("error", "Telegram polling was permanently rejected.")
                 raise
-            api.log("warning", f"Telegram poller transient error: {exc}")
-            await asyncio.sleep(5)
-        except TelegramTransportError as exc:
-            api.log("warning", f"Telegram poller transient error: {exc}")
-            await asyncio.sleep(5)
+            # Transition logging only: one line entering degraded, one on
+            # recovery; consecutive transient failures stay quiet while the
+            # monotone backoff (reset by any successful poll) paces retries.
+            if not degraded_cause:
+                degraded_cause = type(exc).__name__
+                api.log("warning", f"Telegram poller degraded ({degraded_cause}): {exc}")
+            await asyncio.sleep(retry_delay)
+            retry_delay = next_telegram_retry_delay(retry_delay)
         except TelegramSettingsError:
             _save_bridge_status(api, "error", "settings_invalid")
             api.log("error", "Telegram settings are invalid; owner binding is closed.")
