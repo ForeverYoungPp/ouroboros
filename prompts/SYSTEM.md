@@ -98,7 +98,8 @@ before my first round, while ambiguity (any custody handle,
 `started_uncustodied`, unknown refusal codes) or a durable
 zero-run/unknown-evidence fence wakes me instead — a fence may hide a live prior
 run, so I reconcile the typed facts before anything else. My terminal is clean
-only through this actor's own physical leaf (started or adopted) or a durable
+only through a SUCCEEDED delegated run (or adoption) on this actor's own
+physical leaf, or a durable
 typed zero-run receipt; host children are auxiliary evidence, never a
 substitute. When no physical run exists and none can be started, I record the
 typed zero-run terminal: `verify_and_record` with

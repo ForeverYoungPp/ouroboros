@@ -659,12 +659,12 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     if selector_refusal:
         return selector_refusal
     if _deadline_expired(ctx):
-        # An EXPIRED nanny cannot honestly bound anything; refused pre-daemon.
+        # EXPIRED pre-daemon; definitely_unrun = the producer's own no-run verdict (P2).
         return _fail(
             "delegate_start", "task_deadline_expired",
             "This task's deadline has already passed, so a delegated run started now "
             "would outlive it by design. Finalize with what you have — do not start "
-            "new work a deadline has already closed.",
+            "new work a deadline has already closed.", definitely_unrun=True,
         )
 
     drive = custody.custody_root(ctx)
@@ -758,7 +758,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 "The delegated route cannot run now. This is a typed blocker: do NOT "
                 "silently fall back onto metered API spend — decide explicitly "
                 "(wait for the reset, deliver partial work, or ask the parent).",
-                executor="blocked", reset_at=resolution.reset_at, route=route.route_id,
+                executor="blocked", reset_at=resolution.reset_at, route=route.route_id, definitely_unrun=True,
             )
 
         if not recovering:
@@ -859,7 +859,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 "The durable start-request row could not be written, so the run was "
                 "NOT started: a run launched without its custody trail would be "
                 "unfindable if this worker died. Fix the drive/event log and retry.",
-                **_retire_orphaned_registration(ctx, gateway, owned_project_id,
+                **({"definitely_unrun": True} if not recovering else {}), **_retire_orphaned_registration(ctx, gateway, owned_project_id,
                                                 definite_refusal=not recovering,
                                                 reason="start_request_row_unwritable",
                                                 invocation_id=invocation_id,

@@ -1273,8 +1273,10 @@ Before every commit, verify the following:
   decision, and child copy-back must preserve rather than rewrite away the
   corrupt evidence. A valid terminal row still wins over an unrelated malformed
   row.
-  A session actor's terminal is CLEAN only through its own physical leaf
-  (started or adopted) or a durable typed zero-run receipt. "Completed direct
+  A session actor's terminal is CLEAN only through a SUCCEEDED delegated run
+  (or adoption) on its own physical leaf, or a durable typed zero-run receipt —
+  a start merely ACCEPTED is not clean: all-failed runs project an incomplete
+  execution axis, unsettled/uncustodied runs project unknown. "Completed direct
   child ⇒ clean" is DELETED: host children are auxiliary evidence — the
   unresolved fact carries `reason=physical_leaf_not_started` plus
   `direct_child_statuses`, and the `CONFIGURED_ACTOR_INCOMPLETE`/

@@ -7,7 +7,9 @@ credential store only. 2026-08-28 (cx-delegation sprint, «статус обма
 игнорируй его и всё равно пробуй запустить» + 7=A): the same is true for
 UNPINNED routes — a pool-only harness (agy, INV-135) read "unavailable"
 FOREVER while its real accounts lived in the engine's credential-profile pool,
-so the aggregate status/enabled pair stopped being a refusal entirely.
+so the aggregate doctor STATUS stopped being a refusal entirely. The row's
+`enabled` field is different: it is the owner's settings toggle and still
+refuses unpinned routes as `route_disabled`.
 Admission belongs to the engine: an empty or exhausted pool answers the start
 POST with its own typed refusal (INV-135 ``credential_pool_exhausted``), which
 under the pre-start charter costs zero model rounds. The engine's belt

@@ -61,12 +61,20 @@ _CUSTODY_HANDLE_KEYS = (
 
 
 def _startup_refusal_definite(payload: Mapping[str, Any]) -> bool:
-    """True only for a refusal that provably left no run behind."""
+    """True only for a refusal that provably left no run behind.
+
+    The custody-handle guard always wins: a handle means a run may exist,
+    whatever the producer claims. Past it, the PRODUCER's own
+    ``definitely_unrun`` verdict (stamped at the pre-POST refusal sites in
+    ``tools/delegate``) is authoritative — the frozenset covers the
+    engine-originated reason codes that arrive without the marker."""
 
     if str(payload.get("status") or "") != "refused":
         return False
     if any(str(payload.get(key) or "").strip() for key in _CUSTODY_HANDLE_KEYS):
         return False
+    if payload.get("definitely_unrun") is True:
+        return True
     reason = str(payload.get("reason") or "")
     return (
         reason in _DEFINITE_UNRUN_REASONS
@@ -296,10 +304,13 @@ def actor_first_unresolved_fact(
 ) -> dict[str, Any] | None:
     """Return a typed terminal fact when a session actor has no completion path.
 
-    Under the charter (owner 2026-08-28) an ``agent_session`` child is clean
-    only through its own physical leaf: a started/adopted run, or a durable
-    typed zero-run receipt (whose incomplete/unknown decisions the terminal
-    projection separately degrades). Host children are auxiliary evidence and
+    Under the charter (owner 2026-08-28, plan D3) an ``agent_session`` child is
+    clean only through a SUCCEEDED delegated run (or adoption) on its own
+    physical leaf, or a durable typed zero-run receipt (whose
+    incomplete/unknown decisions the terminal projection separately degrades).
+    A start that was merely ACCEPTED is not clean: all-failed runs project an
+    incomplete execution axis, unsettled/uncustodied runs project unknown —
+    facts, never gates. Host children are auxiliary evidence and
     can no longer substitute for the leaf — a substrate swap onto host API
     children is disclosed as an incomplete execution, never a clean one
     (children remain visible in the fact's evidence fields). Unreadable
@@ -309,8 +320,48 @@ def actor_first_unresolved_fact(
     bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
     if not isinstance(bootstrap, dict):
         return None
-    if bool(bootstrap.get("physical_started")) or bool(bootstrap.get("zero_run_receipt_recorded")):
+    if bool(bootstrap.get("zero_run_receipt_recorded")):
         return None
+    if bool(bootstrap.get("physical_started")):
+        # A start ACCEPTED is not yet a clean execution axis (plan D3: clean
+        # needs a SUCCEEDED delegated run or an adoption). Judge the durable
+        # custody evidence; an unreadable log never accuses a started actor.
+        try:
+            from ouroboros.delegate_custody import custody_root
+            from ouroboros.delegate_evidence import task_execution_evidence
+
+            evidence = task_execution_evidence(
+                custody_root(ctx), str(task_id or getattr(ctx, "task_id", "") or ""),
+            )
+        except Exception:
+            return None
+        if not isinstance(evidence, dict) or evidence.get("evidence_read_failed"):
+            return None
+        succeeded = int(evidence.get("delegated_runs_succeeded") or 0)
+        if succeeded:
+            return None
+        started = int(evidence.get("delegated_runs_started") or 0)
+        settled = int(evidence.get("delegated_runs_settled") or 0)
+        if started > settled or not started:
+            # In-flight or uncustodied: a run may still succeed — UNKNOWN,
+            # never an accusation and never clean.
+            return {
+                "status": "unknown",
+                "reason": "delegated_run_unsettled" if started else "physical_start_uncustodied",
+                "delegated_runs_started": started,
+                "delegated_runs_settled": settled,
+                "route_available": bootstrap.get("route_available"),
+            }
+        return {
+            "status": "incomplete",
+            "reason": "delegated_runs_failed_without_success",
+            "delegated_runs_started": started,
+            "delegated_runs_failed": int(evidence.get("delegated_runs_failed") or 0),
+            "delegated_run_failure_states": [
+                str(s) for s in (evidence.get("delegated_run_failure_states") or [])
+            ][:12],
+            "route_available": bootstrap.get("route_available"),
+        }
     if str(bootstrap.get("zero_run_evidence_status") or "") == "unknown":
         return {
             "status": "unknown",
@@ -359,6 +410,70 @@ def actor_first_unresolved_fact(
            if direct_child_statuses else {}),
         **({"child_evidence_error": child_evidence} if child_evidence else {}),
     }
+
+
+def configured_actor_finalization_message(
+    ctx: Any, *, task_id: str, fallback_root: Any,
+) -> str | None:
+    """The charter finalization fact for a configured session actor.
+
+    ``None`` = not a configured actor (the legacy nanny message applies);
+    ``""`` = clean (succeeded leaf, adoption, or a typed zero-run receipt);
+    otherwise the one structural reminder. Host children and coordination
+    activity are auxiliary evidence and never silence it (owner 2026-08-28).
+    """
+    if not isinstance(getattr(ctx, "_configured_actor_bootstrap", None), dict):
+        return None
+    meta = getattr(ctx, "task_metadata", {})
+    meta = meta if isinstance(meta, dict) else {}
+    status_root = Path(str(
+        meta.get("budget_drive_root")
+        or getattr(ctx, "budget_drive_root", "")
+        or fallback_root
+    ))
+    try:
+        actor_fact = actor_first_unresolved_fact(
+            ctx, task_id=str(task_id or ""), drive_root=status_root,
+        )
+    except Exception:
+        actor_fact = None
+    if not actor_fact:
+        return ""
+    status = str(actor_fact.get("status") or "unknown")
+    code = (
+        "CONFIGURED_ACTOR_INCOMPLETE"
+        if status == "incomplete" else "CONFIGURED_ACTOR_UNKNOWN"
+    )
+    close_clause = (
+        "record the typed terminal via verify_and_record(contract_kind="
+        f"delegation_zero_run, zero_run_decision={status!r}, zero_run_basis=...) "
+        "when no run ever started. A plain prose answer cannot close this "
+        "evidence gap."
+    )
+    reason = str(actor_fact.get("reason") or "")
+    if reason == "zero_run_evidence_unavailable":
+        # A fence state: exact_start structurally REFUSES here, so telling the
+        # model to delegate_start would send it into a wall.
+        return (
+            f"⚠️ {code}: this configured session child is finalizing over "
+            "unreadable/ambiguous zero-run receipt evidence — a physical start "
+            f"is fenced. Reconcile the durable evidence, then {close_clause}"
+        )
+    if reason in {"delegated_runs_failed_without_success", "delegated_run_unsettled",
+                  "physical_start_uncustodied"}:
+        return (
+            f"⚠️ {code}: this configured session child is finalizing without a "
+            f"SUCCEEDED delegated run ({reason}). Retry or replace the run "
+            "(delegate_start after verified settlement), wait on it "
+            "(delegate_wait), or finalize with the failure disclosed honestly "
+            "in your result — the execution axis stays "
+            f"{status} either way."
+        )
+    return (
+        f"⚠️ {code}: this configured session child is finalizing with no "
+        "physical leaf run and no durable typed zero-run decision. Start the "
+        f"exact assigned session now (delegate_start), or {close_clause}"
+    )
 
 
 def _durable_zero_run_receipt(
@@ -642,4 +757,5 @@ __all__ = [
     "actor_first_unresolved_fact",
     "append_startup_receipt",
     "bootstrap_before_context",
+    "configured_actor_finalization_message",
 ]

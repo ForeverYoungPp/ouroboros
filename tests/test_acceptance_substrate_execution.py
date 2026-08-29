@@ -10,7 +10,7 @@ noise-free)."""
 from types import SimpleNamespace
 
 from ouroboros import delegate_custody as custody
-from ouroboros.review_evidence import _accept_substrate_execution
+from ouroboros.delegate_evidence import acceptance_substrate_facts
 
 
 def _ctx(tmp_path, **extra):
@@ -34,7 +34,7 @@ def _emit_started(drive, run_id, task_id):
 
 def test_non_harness_task_gets_no_section(tmp_path):
     ctx = _ctx(tmp_path, _nanny_route_dispatched=False)
-    assert _accept_substrate_execution(ctx, "sub-1") == {}
+    assert acceptance_substrate_facts(ctx, "sub-1") == {}
 
 
 def test_harness_task_carries_counts_and_substrate(tmp_path):
@@ -44,7 +44,7 @@ def test_harness_task_carries_counts_and_substrate(tmp_path):
         "run_id": "run-1", "task_id": "sub-1", "state": "succeeded",
         "spend_disclosed": True, "cost_usd": 0.0,
     })
-    out = _accept_substrate_execution(ctx, "sub-1")
+    out = acceptance_substrate_facts(ctx, "sub-1")
     assert out["actual_substrate"] == "harness_used"
     assert out["delegated_runs_started"] == 1
     assert out["delegated_runs_settled"] == 1
@@ -59,7 +59,7 @@ def test_start_blocked_attempt_is_visible_without_any_run(tmp_path):
 
     ctx = _ctx(tmp_path)
     record_start_blocked(ctx, "sub-1", "route_disabled")
-    out = _accept_substrate_execution(ctx, "sub-1")
+    out = acceptance_substrate_facts(ctx, "sub-1")
     assert out["actual_substrate"] == "native_only"
     assert out["delegated_runs_started"] == 0
     assert out["delegate_start_attempted"] is True
@@ -73,7 +73,7 @@ def test_unreadable_custody_never_reads_as_proven_empty(tmp_path, monkeypatch):
         delegate_evidence, "task_execution_evidence",
         lambda _root, _tid: {"evidence_read_failed": True},
     )
-    out = _accept_substrate_execution(ctx, "sub-1")
+    out = acceptance_substrate_facts(ctx, "sub-1")
     assert out["evidence_read_failed"] is True
     assert "actual_substrate" not in out
     assert "delegated_runs_started" not in out
@@ -89,7 +89,7 @@ def test_configured_session_zero_run_facts_ride_the_section(tmp_path):
             "route_available": False,
         },
     )
-    out = _accept_substrate_execution(ctx, "sub-1")
+    out = acceptance_substrate_facts(ctx, "sub-1")
     assert out["configured_session"] is True
     assert out["zero_run_decision"] == "incomplete"
     assert out["zero_run_basis"] == "route down at start"
@@ -106,7 +106,7 @@ def test_the_section_is_facts_only_no_acceptance_consumer_gates_on_it():
     hits = []
     for path in (repo / "ouroboros").rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        if "substrate_execution" in text and path.name != "review_evidence.py":
+        if "substrate_execution" in text and path.name not in {"review_evidence.py", "delegate_evidence.py"}:
             hits.append(path.name)
     assert hits == [], f"unexpected typed consumers of substrate_execution: {hits}"
     source = (repo / "ouroboros" / "review_evidence.py").read_text(encoding="utf-8")

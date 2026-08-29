@@ -2823,13 +2823,10 @@ def _maybe_inject_nanny_economics_reminder(
     # says so instead of implying an activity that never happened.
     _baseline_known = isinstance(getattr(ctx, "_nanny_delegate_baseline", None), dict)
     if _baseline_known:
-        # Charter wording: supervision and coordination rounds COUNT toward
-        # this burn (they no longer reset the dollar axis), so the honest
-        # anchor is the last ACT of delegation, not "activity" in general.
+        # Supervision/coordination rounds COUNT toward this burn (charter).
         since_phrase = (
             "since your last act of delegation (delegate_start / "
-            "schedule_subagent) — supervision and coordination rounds count "
-            "toward this burn"
+            "schedule_subagent); supervision rounds count toward it"
         )
     else:
         since_phrase = "since this task started (no act of delegation yet)"
@@ -5745,7 +5742,7 @@ def _nanny_finalization_message(
         return (
             "⚠️ NANNY_METERED_OVERRUN: your delegated run(s) succeeded, but you have "
             f"since spent {_nanny_burn_phrase(rounds, cost)} beyond your last act of "
-            "delegation (supervision and integration rounds count toward this burn). "
+            "delegation (supervision rounds count toward it). "
             "A successful run is verified and integrated, not rebuilt. If "
             "the remaining work is substantive, delegate it (a new delegate_start); "
             "if you are wrapping up, keep the wrap-up short and account for the "
@@ -5791,55 +5788,12 @@ def _nanny_finalization_message(
             "or state in your final answer that the delegated run failed and why "
             "the remaining work ran on metered API tokens."
         )
-    bootstrap = getattr(tools._ctx, "_configured_actor_bootstrap", None)
-    if isinstance(bootstrap, dict):
-        # Charter (owner 2026-08-28): a configured agent_session child is
-        # clean only through its own physical leaf or a durable typed
-        # zero-run receipt. Host children and coordination activity are
-        # auxiliary evidence and no longer silence this fact.
-        _meta = getattr(tools._ctx, "task_metadata", {})
-        _meta = _meta if isinstance(_meta, dict) else {}
-        status_root = pathlib.Path(str(
-            _meta.get("budget_drive_root")
-            or getattr(tools._ctx, "budget_drive_root", "")
-            or drive_root
-        ))
-        try:
-            from ouroboros.subagent_bootstrap import actor_first_unresolved_fact
+    from ouroboros.subagent_bootstrap import configured_actor_finalization_message
 
-            actor_fact = actor_first_unresolved_fact(
-                tools._ctx, task_id=str(task_id or ""), drive_root=status_root,
-            )
-        except Exception:
-            actor_fact = None
-        if not actor_fact:
-            return ""  # leaf started/adopted, or a typed zero-run receipt closed it
-        _status = str(actor_fact.get("status") or "unknown")
-        _code = (
-            "CONFIGURED_ACTOR_INCOMPLETE"
-            if _status == "incomplete" else "CONFIGURED_ACTOR_UNKNOWN"
-        )
-        if str(actor_fact.get("reason") or "") == "zero_run_evidence_unavailable":
-            # A fence state: exact_start structurally REFUSES here, so telling
-            # the model to delegate_start would send it into a wall.
-            return (
-                f"⚠️ {_code}: this configured session child is finalizing over "
-                "unreadable/ambiguous zero-run receipt evidence — a physical "
-                "start is fenced. Reconcile the durable evidence, then record "
-                "the typed terminal via verify_and_record(contract_kind="
-                f"delegation_zero_run, zero_run_decision={_status!r}, "
-                "zero_run_basis=...). A plain prose answer cannot close this "
-                "evidence gap."
-            )
-        return (
-            f"⚠️ {_code}: this configured session child is finalizing with no "
-            "physical leaf run and no durable typed zero-run decision. Start "
-            "the exact assigned session now (delegate_start), or record the "
-            "typed terminal via verify_and_record(contract_kind="
-            f"delegation_zero_run, zero_run_decision={_status!r}, "
-            "zero_run_basis=...). A plain prose answer cannot close this "
-            "evidence gap."
-        )
+    _actor = configured_actor_finalization_message(
+        tools._ctx, task_id=str(task_id or ""), fallback_root=drive_root)
+    if _actor is not None:
+        return _actor
     return (
         "⚠️ NANNY_DID_NOT_DELEGATE: this task was dispatched onto the delegated "
         "substrate (executor=harness), but you are finalizing with ZERO "
