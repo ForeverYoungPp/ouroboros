@@ -1615,19 +1615,42 @@ def _finish_task_done_dispatch(
     )
 
     if task_id and str(task.get("delegation_role") or "") == "subagent":
-        try:
-            raw_chat = int(task.get("chat_id") or 0)
-        except (TypeError, ValueError):
-            raw_chat = 0
-        chat_id = _bound_project_chat_id(
-            ctx, task_id, task.get("parent_task_id"), task.get("root_task_id")
-        ) or raw_chat
-        if chat_id:
-            effective_result = (
-                final_task_result
-                or load_task_result(ctx.DRIVE_ROOT, str(task_id or ""))
-                or {}
-            )
+        effective_result = (
+            final_task_result
+            or load_task_result(ctx.DRIVE_ROOT, str(task_id or ""))
+            or {}
+        )
+        _envelope = effective_result.get("subagent_envelope")
+        _envelope = _envelope if isinstance(_envelope, dict) else {}
+        # The LOG-channel terminal (push_log below) carries the same delegation
+        # truth as the chat frame — additive keys, stamped after the durable
+        # events.jsonl append (transport enrichment, not a log-shape change) —
+        # so a card whose chat frame never arrives still upgrades its executor
+        # chip from the task_done log event instead of staying at "no run yet".
+        if str(effective_result.get("executor_route") or ""):
+            task_done_event.setdefault(
+                "executor_route", str(effective_result["executor_route"]))
+        if isinstance(_envelope.get("execution_evidence"), dict):
+            task_done_event.setdefault(
+                "execution_evidence", _envelope["execution_evidence"])
+        if _envelope.get("actual_substrate"):
+            task_done_event.setdefault(
+                "actual_substrate", str(_envelope["actual_substrate"]))
+        from supervisor.message_bus import notification_chat_route
+
+        # Membership decides, not truthiness (C4): chat 0 is the Skill Review
+        # panel — a real destination whose terminal evidence frame the old
+        # `if chat_id:` silently dropped (the card kept its dispatch-only chip
+        # forever) — while a negative id is A2A traffic that must never enter a
+        # human stream. The project binding keeps precedence; ITS 0 means "no
+        # binding" (never the panel) and falls through to the task's own chat.
+        chat_id = notification_chat_route(
+            _bound_project_chat_id(
+                ctx, task_id, task.get("parent_task_id"), task.get("root_task_id")
+            ) or None,
+            task.get("chat_id"),
+        )
+        if chat_id is not None:
             status = str(
                 effective_result.get("status")
                 or evt.get("status")
@@ -1691,10 +1714,9 @@ def _finish_task_done_dispatch(
                 # upgrades from the neutral "dispatched" decision to what actually ran.
                 "executor_route": str(effective_result.get("executor_route") or ""),
             }
-            _envelope = effective_result.get("subagent_envelope")
-            if isinstance(_envelope, dict) and isinstance(_envelope.get("execution_evidence"), dict):
+            if isinstance(_envelope.get("execution_evidence"), dict):
                 progress_meta["execution_evidence"] = _envelope["execution_evidence"]
-            if isinstance(_envelope, dict) and _envelope.get("actual_substrate"):
+            if _envelope.get("actual_substrate"):
                 # The FACT beside the plan (Q1A): harness_used / harness_attempted / native_only.
                 progress_meta["actual_substrate"] = str(_envelope["actual_substrate"])
             if isinstance(task_done_event.get("outcome_axes"), dict):
