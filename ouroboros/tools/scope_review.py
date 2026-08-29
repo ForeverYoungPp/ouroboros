@@ -983,8 +983,7 @@ def _call_scope_llm(
     session_root: str = "",
     slot_effort: str = "",
     session_target: str = "",
-    session_profile: str = "", retry_key: str = "",
-    subagent_id: str = "",
+    session_profile: str = "", retry_key: str = "", subagent_id: str = "",
 ) -> tuple:
     """Execute the scope review call synchronously — api pack or agent session.
 
@@ -1005,9 +1004,7 @@ def _call_scope_llm(
     # 6.1/6.3: the row's own effort wins; the global key stays the default.
     scope_effort = slot_effort or _resolve_effort("scope_review")
     delegated = str(getattr(route, "value", route) or "") == "agent_session"
-    # RETRIEVES class: session rows and configured-subagent api rows deliver by
-    # retrieval — neither receives the assembled pack below.
-    retrieves = delegated or bool(subagent_id)
+    retrieves = delegated or bool(subagent_id)  # RETRIEVES class: no pack below
     # Output budget scales with the reviewer window: requesting the absolute
     # 100K reserve on a small-window model would 400 on input+max_tokens.
     _scope_output_tokens, _ = _window_scaled_reserves(
@@ -1076,8 +1073,7 @@ def _call_scope_llm(
             route=ReviewRouteKind.AGENT_SESSION if delegated else ReviewRouteKind.API_CHAT,
             # Empty keeps the shared session-route fallback.
             session_target=session_target if delegated else "",
-            session_profile=session_profile if delegated else "",
-            subagent_id=str(subagent_id or ""),
+            session_profile=session_profile if delegated else "", subagent_id=str(subagent_id or ""),
         )
         result = run_review_request(
             request,
@@ -1390,9 +1386,8 @@ def run_scope_review(
     route: Any = None,  # the row's configured delivery (ReviewRouteKind); None/api_chat = api
     slot_effort: str = "",  # the row's own effort (6.1); "" = global scope_review effort
     session_target: str = "",  # the row's own harness[=model] target; "" = shared route
-    session_profile: str = "",  # optional credential pin (Q2-в); "" = rotation
-    subagent_id: str = "",  # configured-subagent binding; "" = direct row
-    prepared: Optional[dict] = None, retry_key: str = "",  # assembled packet + immutable cycle identity
+    session_profile: str = "",  # credential pin (Q2-в); "" = rotation
+    subagent_id: str = "",  prepared: Optional[dict] = None, retry_key: str = "",  # assembled packet + immutable cycle identity
 ) -> ScopeReviewResult:
     """Run blocking scope review from a prepared packet or a direct call."""
     if prepared is None:
@@ -1403,8 +1398,7 @@ def run_scope_review(
             review_rebuttal=review_rebuttal, review_history=review_history,
             scope_review_history=scope_review_history, scope_model=scope_model,
             slot_id=slot_id, route=route, slot_effort=slot_effort,
-            session_target=session_target, session_profile=session_profile,
-            subagent_id=subagent_id,
+            session_target=session_target, session_profile=session_profile, subagent_id=subagent_id,
         )
         if final is not None:
             return final
@@ -1413,10 +1407,8 @@ def run_scope_review(
     prompt, session_task = prepared["prompt"], prepared["session_task"]
     repo_dir, scope_model_id = prepared["repo_dir"], prepared["scope_model_id"]
     slot_id, route = prepared["slot_id"], prepared["route"]
-    slot_effort = prepared["slot_effort"]
-    session_target = prepared["session_target"]
-    session_profile = prepared["session_profile"]
-    delegated = bool(prepared["delegated"])
+    slot_effort, session_target = prepared["slot_effort"], prepared["session_target"]
+    session_profile, delegated = prepared["session_profile"], bool(prepared["delegated"])
     subagent_id = str(prepared.get("subagent_id") or "")
 
     _prompt_chars = len(prompt)  # type: ignore[arg-type]
@@ -1425,8 +1417,7 @@ def run_scope_review(
         prompt, scope_model=scope_model_id, ctx=ctx, slot_id=slot_id,
         route=route, session_task=session_task, session_root=str(repo_dir),
         slot_effort=slot_effort, session_target=session_target,
-        session_profile=session_profile, retry_key=retry_key,
-        subagent_id=subagent_id,
+        session_profile=session_profile, retry_key=retry_key, subagent_id=subagent_id,
     )  # type: ignore[arg-type]
     _usage = dict(usage or {})
     _review_refs = dict(_usage.pop("_review_refs", {}) or {})

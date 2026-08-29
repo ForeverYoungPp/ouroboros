@@ -625,6 +625,41 @@ def structured_scope_review_slots() -> Optional[list]:
     ]
 
 
+def reviewer_slots(
+    models: List[str] | None = None,
+    *,
+    effort: str = "medium",
+    role_hint: str = "",
+    id_prefix: str = "",
+    route_env_key: str = "",
+) -> List[Any]:
+    """The configured reviewer rows, each carrying its DELIVERY route.
+
+    Moved here from ``review_substrate`` for module altitude (P7); the
+    substrate re-exports it. ``route_env_key`` names the surface's per-row
+    route list (plan 5.1): the commit triad and scope pass theirs, so a row
+    can be an api_chat call or a delegated agent session. Surfaces that stay
+    on the API by owner decision (task acceptance — D15) pass NOTHING, which
+    pins every row to ``api_chat`` explicitly rather than by accident.
+    """
+    from ouroboros.config import get_review_models, review_model_uses_local
+    from ouroboros.review_execution import ReviewRouteKind, configured_review_routes
+    from ouroboros.review_substrate import SLOT_ID_PREFIX, ReviewSlot, slot_id_for_row
+
+    id_prefix = id_prefix or SLOT_ID_PREFIX
+    raw_models = models if models is not None else get_review_models()
+    named = [str(model) for model in (raw_models or []) if str(model or "").strip()]
+    routes = configured_review_routes(route_env_key, len(named)) if route_env_key else [
+        ReviewRouteKind.API_CHAT
+    ] * len(named)
+    return [
+        ReviewSlot(slot_id=slot_id_for_row(idx + 1, prefix=id_prefix), model=model, effort=effort,
+                   role_hint=role_hint, use_local=review_model_uses_local(model),
+                   route=routes[idx])
+        for idx, model in enumerate(named)
+    ]
+
+
 def commit_triad_delivery() -> Dict[str, Any]:
     """Aligned per-row delivery vectors for the commit triad, one call.
 

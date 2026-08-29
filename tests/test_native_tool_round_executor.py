@@ -8,17 +8,16 @@ disclosure, never a full-coverage claim.
 """
 
 import json
-import pathlib
 
 import pytest
 
 from ouroboros.review_execution import (
-    NativeToolRoundReviewExecutor,
     ReviewAssignment,
     ReviewRouteKind,
     ReviewRouteUnavailable,
     _review_route_executor,
 )
+from ouroboros.review_native_episode import NativeToolRoundReviewExecutor
 from ouroboros.review_substrate import ReviewRequest, ReviewSlot
 
 _VERDICT = '[{"severity": "advisory", "item": "x", "evidence": "e", "recommendation": "r"}]'

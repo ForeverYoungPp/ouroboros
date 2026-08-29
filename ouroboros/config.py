@@ -205,10 +205,8 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_ONBOARDING_COMPLETED_AT": "",
     # Pre-commit review enforcement: advisory | blocking
     "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
-    # Native tool-round reviewer episodes (configured-subagent api rows): the
-    # bounded inspection loop's hard caps. One episode = ONE logical review
-    # attempt made of at most MAX_ROUNDS provider calls; the transcript bound
-    # fails CLOSED (typed refusal, never mid-episode compaction/resume).
+    # Native tool-round reviewer episode caps (review_native_episode.py owns
+    # the getters); both fail CLOSED — typed refusal, never compaction/resume.
     "OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS": "16",
     "OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS": "400000",
     # Auto-grant reviewed-skill requests by default; grants stay bound to the
@@ -655,27 +653,6 @@ def get_review_enforcement() -> str:
     return raw if raw in {"advisory", "blocking"} else default_val
 
 
-def _bounded_int_setting(key: str, *, floor: int, ceiling: int) -> int:
-    default_val = int(str(SETTINGS_DEFAULTS[key]))
-    try:
-        raw = int(str(os.environ.get(key, "") or default_val))
-    except (TypeError, ValueError):
-        raw = default_val
-    return max(floor, min(raw, ceiling))
-
-
-def review_native_max_rounds() -> int:
-    """Provider-call cap of one native tool-round reviewer episode (fail closed)."""
-    return _bounded_int_setting("OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS", floor=2, ceiling=64)
-
-
-def review_native_max_transcript_chars() -> int:
-    """Episode transcript bound; exceeding it is a typed refusal, never compaction."""
-    return _bounded_int_setting(
-        "OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS", floor=50_000, ceiling=2_000_000,
-    )
-
-
 def get_scope_review_models() -> list[str]:
     """Return configured scope reviewer slots, preserving duplicate model IDs."""
     default_str = str(SETTINGS_DEFAULTS["OUROBOROS_SCOPE_REVIEW_MODELS"])
@@ -895,12 +872,7 @@ def get_search_code_wall_sec() -> float:
     """Total wall-clock budget (seconds) for ONE search_code call — bounds both the rg
     directory walk and the batched rg loop so a scan over a very large root cannot run
     unbounded. Env/setting: ``OUROBOROS_SEARCH_CODE_WALL_SEC`` (floored at 5s)."""
-    raw = (os.environ.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "")
-           or str(SETTINGS_DEFAULTS.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "45")))
-    try:
-        return max(5.0, float(raw))
-    except (TypeError, ValueError):
-        return 45.0
+    return _clamped_number_setting("OUROBOROS_SEARCH_CODE_WALL_SEC", low=5.0)
 
 
 def get_deliverables_root() -> str:
