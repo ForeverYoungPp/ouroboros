@@ -523,8 +523,6 @@ async def _run_readonly_async(
         from ouroboros.config import clamp_effort_to
 
         applied = clamp_effort_to(effort, "max")
-        if applied != effort:
-            log.info("Claude readonly effort clamped: requested=%s applied=%s", effort, applied)
         # Older SDKs may lack effort; omit it rather than failing advisory.
         import inspect as _inspect
         try:
@@ -539,6 +537,12 @@ async def _run_readonly_async(
     except TypeError:
         options_kwargs.pop("effort", None)
         options = ClaudeAgentOptions(**options_kwargs)
+    # Disclose adaptation only once the value actually survived into the options.
+    forwarded = options_kwargs.get("effort")
+    if effort is not None and forwarded is None:
+        log.debug("Claude readonly effort omitted: requested=%s (SDK has no such parameter)", effort)
+    elif forwarded is not None and forwarded != effort:
+        log.info("Claude readonly effort clamped: requested=%s applied=%s", effort, forwarded)
 
     result = ClaudeCodeResult(success=True)
     text_parts: List[str] = []
@@ -711,12 +715,19 @@ def _run_readonly_out_of_process(
         )
     except (TypeError, ValueError, OverflowError):
         child_timeout = _READONLY_CHILD_TIMEOUT_SEC
+    from ouroboros.config import clamp_effort_to
+
+    # Value adaptation is deterministic here; the child's own clamp stays defense in depth,
+    # and only this side can surface the disclosure (the child returns JSON, not logs).
+    applied_effort = clamp_effort_to(effort, "max") if effort is not None else None
+    if effort is not None and applied_effort != effort:
+        log.info("Claude readonly effort clamped: requested=%s applied=%s", effort, applied_effort)
     payload = {
         "prompt": prompt,
         "cwd": cwd,
         "model": model,
         "max_turns": max_turns,
-        "effort": effort,
+        "effort": applied_effort,
         "max_budget_usd": max_budget_usd,
     }
     active_scope = current_usage_scope()

@@ -512,6 +512,92 @@ class TestRunReadonlyEffortParam:
 
         assert "effort" not in captured, "effort must be omitted when SDK lacks support"
 
+    def test_clamp_disclosure_tracks_what_actually_reached_the_options(self, caplog):
+        """The info line fires only when the adapted value survives into the options."""
+        import asyncio
+        import logging
+        from unittest.mock import patch
+
+        captured: dict = {}
+
+        class FakeOptionsNoEffort:
+            def __init__(self, **kwargs):
+                if "effort" in kwargs:
+                    raise TypeError("__init__() got an unexpected keyword argument 'effort'")
+                captured.update(kwargs)
+
+        class FakeOptions:
+            def __init__(self, effort=None, **kwargs):
+                if effort is not None:
+                    kwargs["effort"] = effort
+                captured.update(kwargs)
+
+        class FakeSDKClient:
+            def __init__(self, options=None):
+                self.options = options
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def query(self, prompt):
+                return None
+
+            async def receive_response(self):
+                if False:
+                    yield None
+
+        gateway = __import__(
+            "ouroboros.gateways.claude_code", fromlist=["_run_readonly_async"]
+        )
+        for options_class, expected in ((FakeOptionsNoEffort, None), (FakeOptions, "max")):
+            captured.clear()
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger=gateway.__name__), \
+                 patch("ouroboros.gateways.claude_code.ClaudeAgentOptions", options_class), \
+                 patch("ouroboros.gateways.claude_code.ClaudeSDKClient", FakeSDKClient):
+                asyncio.get_event_loop().run_until_complete(
+                    gateway._run_readonly_async(
+                        "test", cwd="/tmp", effort="ultra", max_budget_usd=1.0,
+                    )
+                )
+            disclosures = [
+                record for record in caplog.records
+                if "effort clamped" in record.getMessage()
+            ]
+            assert captured.get("effort") == expected, (
+                f"{options_class.__name__} must produce effort={expected!r}, got: {captured}"
+            )
+            assert len(disclosures) == (0 if expected is None else 1), (
+                f"{options_class.__name__} disclosures: {[r.getMessage() for r in disclosures]}"
+            )
+
+    def test_out_of_process_payload_carries_the_clamped_effort(self, monkeypatch, tmp_path, caplog):
+        """The parent clamps before handing effort to the child, and says so."""
+        import logging
+
+        import ouroboros.gateways.claude_code as gw
+
+        sent: dict = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                sent.update(json.loads(input))
+                return json.dumps({"success": True, "result_text": "ok"}), ""
+
+        monkeypatch.delenv("OUROBOROS_CLAUDE_READONLY_CHILD", raising=False)
+        monkeypatch.setattr(gw.subprocess, "Popen", lambda *args, **kwargs: FakeProc())
+        with caplog.at_level(logging.INFO, logger=gw.__name__):
+            result = gw.run_readonly("review this", cwd=str(tmp_path), effort="ultra")
+
+        assert result.success is True
+        assert sent["effort"] == "max"
+        assert any("effort clamped" in record.getMessage() for record in caplog.records)
+
     def test_normalize_sdk_usage_maps_anthropic_keys(self):
         usage = _normalize_sdk_usage({
             "input_tokens": 100,
