@@ -1,4 +1,16 @@
 import { accountedUpperBound, accountedUpperBoundWithChildren, formatUsd4 } from './utils.js';
+import { harnessPresentation } from './harness_presentation.js';
+import {
+    classifyReviewLifecycle,
+    classifyReviewLifecyclePointer,
+    formatReviewProjection,
+} from './review_presentation.js';
+
+const REVIEW_LIFECYCLE_ERROR_STATUSES = new Set([
+    'failed', 'interrupted', 'timeout', 'error',
+]);
+
+export { formatReviewProjection } from './review_presentation.js';
 
 export const LOG_CATEGORIES = {
     tools: { label: 'Tools', color: 'var(--blue)' },
@@ -87,19 +99,6 @@ export function compactModel(model = '') {
 // Only a DELEGATED route is a fact worth a chip: the native API path is the
 // ordinary case and prints nothing, so the lane never fills with "api" noise on
 // every ordinary bubble. Absent fact -> null -> no chip element at all.
-const HARNESS_CHIP_ICON = {
-    codex: '◇',
-    claude: '✳',
-    cursor: '▸',
-};
-
-// Presentation names only, never behavior: the route id stays the opaque
-// Claudexor spelling; the owner knows the `claude` harness as the Claude Code
-// product, so that is what the chip prints.
-const HARNESS_CHIP_NAME = {
-    claude: 'Claude Code',
-};
-
 export function executorChip(evt) {
     const route = String(evt?.executor_route || '').trim();
     if (!route) return null;
@@ -107,8 +106,8 @@ export function executorChip(evt) {
     // part only, never interpreted beyond splitting the spelling Claudexor uses.
     const harness = route.split('=')[0].trim().toLowerCase();
     if (!harness) return null;
-    const name = HARNESS_CHIP_NAME[harness] || harness;
-    const base = { harness, icon: HARNESS_CHIP_ICON[harness] || '◆', label: name };
+    const name = harnessPresentation(harness).label;
+    const base = { harness, label: name };
     // LAYERED TRUTH. The route is a DISPATCH decision; whether a delegated run
     // actually happened is EVIDENCE, reconciled once at the completion seam
     // (subagents.envelope_from_task -> execution_evidence) and carried on the
@@ -272,8 +271,15 @@ export function ownerHurryProjection(evt) {
     };
 }
 
+function normalizeTaskTerminalRecord(evt) {
+    if (!evt || typeof evt !== 'object') return evt || {};
+    const terminalStatus = String(evt.task_terminal_status || '').trim();
+    return terminalStatus ? { ...evt, status: terminalStatus } : evt;
+}
+
 export function taskOutcomeSeverity(evt) {
-    const lifecycle = String(evt.outcome_axes?.lifecycle?.status || evt.status || '').toLowerCase();
+    const record = normalizeTaskTerminalRecord(evt);
+    const lifecycle = String(record.outcome_axes?.lifecycle?.status || record.status || '').toLowerCase();
     // v6.82 (P5): a cancelled task is neither Done nor Failed — it is honestly
     // Cancelled. Checked first: forced teardown routinely leaves failure-shaped
     // side facts (e.g. artifacts missing on a cancelled workspace task) that must
@@ -284,11 +290,11 @@ export function taskOutcomeSeverity(evt) {
     if (lifecycle === 'cancelled' || lifecycle === 'cancel_requested') {
         return 'cancelled';
     }
-    const execution = String(evt.outcome_axes?.execution?.status || '').toLowerCase();
-    const objective = String(evt.outcome_axes?.objective?.status || '').toLowerCase();
-    const review = String(evt.outcome_axes?.review?.status || evt.review_status?.status || '').toLowerCase();
-    const artifacts = String(evt.outcome_axes?.artifacts?.status || evt.artifact_bundle?.status || evt.artifact_status || '').toLowerCase();
-    const artifactStatus = String(evt.artifact_bundle?.status || evt.artifact_status || '').toLowerCase();
+    const execution = String(record.outcome_axes?.execution?.status || '').toLowerCase();
+    const objective = String(record.outcome_axes?.objective?.status || '').toLowerCase();
+    const review = String(record.outcome_axes?.review?.status || record.review_status?.status || '').toLowerCase();
+    const artifacts = String(record.outcome_axes?.artifacts?.status || record.artifact_bundle?.status || record.artifact_status || '').toLowerCase();
+    const artifactStatus = String(record.artifact_bundle?.status || record.artifact_status || '').toLowerCase();
     if (
         lifecycle === 'failed'
         || ['failed', 'infra_failed'].includes(execution)
@@ -309,7 +315,7 @@ export function taskOutcomeSeverity(evt) {
         || ['degraded', 'best_effort'].includes(execution)
         || ['degraded', 'best_effort'].includes(objective)
         || review === 'degraded'
-        || Boolean(evt.outcome_axes?.objective?.warning)
+        || Boolean(record.outcome_axes?.objective?.warning)
     ) {
         return 'warn';
     }
@@ -348,8 +354,9 @@ export function isTerminalTaskDetail(record) {
 // frames, not in durable detail (`done`, and the pre-cancel-redesign settled
 // `cancel_requested` event spelling).
 export function taskDoneIsTerminal(evt) {
-    const status = String(evt?.status || '').toLowerCase();
-    return isTerminalTaskDetail(evt) || status === 'done' || status === 'cancel_requested';
+    const record = normalizeTaskTerminalRecord(evt);
+    const status = String(record?.status || '').toLowerCase();
+    return isTerminalTaskDetail(record) || status === 'done' || status === 'cancel_requested';
 }
 
 // One factual phase -> presentation vocabulary for task chips and terminal
@@ -372,47 +379,6 @@ function taskOutcomeMeta(evt) {
         axes.execution?.status ? `execution ${axes.execution.status}` : '',
         axes.objective?.status ? `objective ${axes.objective.status}` : '',
     ].filter(Boolean);
-}
-
-function compactCoverage(coverage) {
-    if (!coverage || typeof coverage !== 'object') return '';
-    return Object.entries(coverage)
-        .filter(([, value]) => value !== '' && value !== null && value !== undefined)
-        .map(([key, value]) => `${key}=${String(value)}`)
-        .join(', ');
-}
-
-export function formatReviewProjection(projection) {
-    const panels = Array.isArray(projection?.panels) ? projection.panels : [];
-    const lines = [];
-    panels.forEach((panel, panelIndex) => {
-        if (!panel || typeof panel !== 'object') return;
-        const quorum = panel.quorum && typeof panel.quorum === 'object' ? panel.quorum : {};
-        const panelId = String(panel.panel_id || `panel-${panelIndex + 1}`);
-        lines.push(
-            `Review panel ${panelId}: ${String(panel.surface || 'review')} · authority=${String(panel.authority || 'unspecified')} · verdict=${String(panel.aggregate_signal || 'UNKNOWN')} · transport=${String(panel.transport_status || 'unknown')} · parse=${String(panel.parse_status || 'unknown')} · quorum=${String(quorum.contributed ?? 0)}/${String(quorum.configured ?? 0)} (required ${String(quorum.required ?? 0)}) · enforcement=${String(panel.enforcement_impact || 'unknown')}${panel.single_reviewer_no_diversity ? ' · single-reviewer (no diversity)' : ''}${panel.dialogue && panel.dialogue.status ? ` · dialogue=${String(panel.dialogue.status)}` : ''}${panel.superseded ? ' · superseded' : ''}`,
-        );
-        if (panel.reason) lines.push(`Panel reason: ${String(panel.reason)}`);
-        const coverage = compactCoverage(panel.coverage);
-        if (coverage) lines.push(`Panel coverage: ${coverage}`);
-        const binding = [
-            panel.candidate_hash ? `candidate_hash=${String(panel.candidate_hash)}` : '',
-            panel.evidence_revision ? `evidence_revision=${String(panel.evidence_revision)}` : '',
-            panel.fence_hash ? `fence_hash=${String(panel.fence_hash)}` : '',
-            panel.binding_hash ? `binding_hash=${String(panel.binding_hash)}` : '',
-        ].filter(Boolean);
-        if (binding.length) lines.push(`Panel binding: ${binding.join(' · ')}`);
-        (Array.isArray(panel.actors) ? panel.actors : []).forEach((actor) => {
-            if (!actor || typeof actor !== 'object') return;
-            lines.push(
-                `Reviewer ${String(actor.slot_id || '?')}: role=${String(actor.actor_role || 'reviewer')} · provider=${String(actor.provider || 'unknown')} · model=${String(actor.model || 'unknown')} · transport=${String(actor.transport_status || 'unknown')} · parse=${String(actor.parse_status || 'unknown')} · verdict=${String(actor.semantic_verdict || 'none')}${actor.outcome_tier ? ` · outcome_tier=${String(actor.outcome_tier)}` : ''}${actor.dialogue_status ? ` · dialogue=${String(actor.dialogue_status)}` : ''} · quorum=${actor.quorum_contribution ? 'contributes' : 'abstains'} · enforcement=${String(actor.enforcement_impact || 'unknown')}`,
-            );
-            const actorCoverage = compactCoverage(actor.coverage);
-            if (actorCoverage) lines.push(`Reviewer ${String(actor.slot_id || '?')} coverage: ${actorCoverage}`);
-            if (actor.reason) lines.push(`Reviewer ${String(actor.slot_id || '?')} reason: ${String(actor.reason)}`);
-        });
-    });
-    return lines.join('\n');
 }
 
 export function summarizeLogEvent(evt) {
@@ -734,7 +700,6 @@ function chatView({
     meta = [],
     fullRef = '',
     truncated = false,
-    expandByDefault = false,
     chip = null,
 } = {}) {
     const out = {
@@ -758,7 +723,6 @@ function chatView({
     // genuinely-full output on demand instead of showing only the capped preview.
     if (fullRef) out.fullRef = String(fullRef);
     if (truncated) out.truncated = true;
-    if (expandByDefault) out.expandByDefault = true;
     // Phase 6: the executor chip rides the projection so live and replay routes
     // paint the same fact; absent stays absent (no placeholder chip).
     if (chip) out.executorChip = chip;
@@ -786,7 +750,7 @@ export function summarizeChatLiveEvent(evt) {
         const stale = Boolean(lifecycle.stale);
         const phase = status === 'succeeded' ? 'done'
             : status === 'cancelled' ? 'cancelled'
-                : ['failed', 'interrupted'].includes(status) ? 'lifecycle_error'
+                : REVIEW_LIFECYCLE_ERROR_STATUSES.has(status) ? 'lifecycle_error'
                     : stale ? 'warn'
                         : 'working';
         const label = lifecycle.phase || status || 'working';
@@ -819,10 +783,7 @@ export function summarizeChatLiveEvent(evt) {
         const traceText = describeText(evt.trace_summary || '', 320);
         const errorText = describeText(evt.error || '', 220);
         const reasonDetail = evt.reason_code ? `Reason: ${String(evt.reason_code)}` : '';
-        const reviewDetails = formatReviewProjection(evt.review_projection);
-        const reviewText = describeText(reviewDetails, 240);
         const detailParts = [
-            reviewText.full ? `[REVIEW]\n${reviewText.full}` : '',
             progressText.full,
             resultText.full ? `[RESULT]\n${resultText.full}` : '',
             traceText.full ? `[TRACE]\n${traceText.full}` : '',
@@ -852,8 +813,8 @@ export function summarizeChatLiveEvent(evt) {
         const label = terminal
             ? taskPresentation(phase).headline
             : (SUBAGENT_CARD_LABEL[event] || 'Working');
-        // The compact activity line describes the child's work/result, never the
-        // reviewer rationale. Review remains complete and auto-expanded below.
+        // The compact activity line describes the child's work/result; review
+        // evidence is rendered separately by the owning card's Reviews section.
         const activity = terminal
             ? (phase === 'error' && errorText.full ? errorText
                 : resultText.full ? resultText
@@ -867,17 +828,13 @@ export function summarizeChatLiveEvent(evt) {
         return chatView({
             phase,
             headline: subagentHeadline(sid, role, label, evt.model),
-            // Review evidence keeps its established immediately-visible body
-            // when the card auto-expands. The compact card activity is a
-            // separate projection and therefore still describes work/result.
-            body: reviewText.full || activity.preview || '',
+            body: activity.preview || '',
             fullBody: detailParts.join('\n\n'),
             activityPreview: activity.preview || '',
             visible: true,
             promote: true,
             human: true,
             terminal,
-            expandByDefault: Boolean(reviewText.full),
             // P3: the WS result/trace were capped at 4000 server-side; expose the
             // subagent task id so "show full" can fetch the genuinely-full output.
             fullRef: sid,
@@ -1021,7 +978,6 @@ export function summarizeChatLiveEvent(evt) {
     if (t === 'task_done') {
         const terminal = taskDoneIsTerminal(evt);
         const presentation = taskPresentation(terminal ? taskTerminalPhase(evt) : 'working');
-        const reviewDetails = formatReviewProjection(evt.review_projection);
         const unavailable = evt.cost_accounting_status === 'unavailable';
         // C13: the SHARED accessor and its null policy — same alias precedence as
         // chat.js and the Python seams, and a REAL $0 prints instead of vanishing.
@@ -1040,11 +996,10 @@ export function summarizeChatLiveEvent(evt) {
         return chatView({
             phase: presentation.phase,
             headline: presentation.headline,
-            body: [reasonDetail, reviewDetails].filter(Boolean).join('\n'),
+            body: reasonDetail,
             visible: true,
             promote: true,
             terminal,
-            expandByDefault: Boolean(reviewDetails),
             meta: [softStopped ? OWNER_STOP_DETAIL_MARKER : '', ownCost, childrenCost].filter(Boolean),
             dedupeKey: key(
                 JSON.stringify(evt.outcome_axes || {}),
@@ -1094,6 +1049,16 @@ export function prettyLogEvent(evt) {
 }
 
 export function getLogTaskGroupId(evt) {
+    const pointer = classifyReviewLifecyclePointer(evt);
+    // A duplicate lifecycle pointer is an acknowledgement for an existing
+    // owner card, never task lineage. Logs may show it as a compact standalone
+    // row, but must not create a synthetic task group from its outer task_id.
+    if (pointer.classification !== 'not_pointer') return '';
+    const review = classifyReviewLifecycle(evt);
+    if (review.classification === 'source_complete') {
+        return String(review.group.presentationOwnerTaskId || '');
+    }
+    if (review.classification === 'source_incomplete') return '';
     if (evt.subagent_task_id) return String(evt.subagent_task_id);
     if (evt.task_id) return String(evt.task_id);
     const task = evt.task;

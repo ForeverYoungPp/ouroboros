@@ -100,7 +100,8 @@ test('the controller drives create → poll → Connected, and holds the status 
     });
 
     await ctl.start('codex', '');
-    assert.ok(host.innerHTML.includes('Connect codex'), 'the card rendered');
+    assert.ok(host.innerHTML.includes('data-harness-identity="codex"'), 'the card rendered');
+    assert.ok(host.innerHTML.includes('>Codex</span>'), 'the readable product name rendered');
     assert.ok(host.innerHTML.includes('data-login-state'), 'a live job shows the progress line');
     assert.equal(store.polling, true, 'a live login holds the shared status poll open');
 
@@ -266,7 +267,8 @@ test('dispose CANCELS the live job before releasing custody, and clears the card
     });
     await ctl.start('codex', '');
     assert.equal(store.polling, true);
-    assert.ok(host.innerHTML.includes('Connect codex'), 'the card is on screen before the disposer');
+    assert.ok(host.innerHTML.includes('data-harness-identity="codex"'),
+        'the card is on screen before the disposer');
 
     const released = await ctl.dispose();
     assert.ok(calls.includes('DELETE /api/claudexor/login/job-4'),

@@ -58,6 +58,7 @@
   --status-neutral-fg: var(--text-meta);
   --status-neutral-bg: rgba(255, 255, 255, 0.08);
   --radius-sm: 8px;
+  --space-1: 4px;
   --button-padding-y: 8px;
   --button-padding-x: 16px;
   --button-font-size: 13px;
@@ -980,6 +981,38 @@ textarea:focus {
   color: var(--text);
   font-size: var(--type-body);
   font-weight: 600;
+}
+
+/* Standalone mirror of style.css: onboarding does not load the app sheet. */
+.harness-identity {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  max-width: 100%;
+  vertical-align: middle;
+}
+
+.harness-identity-mark {
+  inline-size: 1em;
+  block-size: 1em;
+  flex: 0 0 1em;
+  color: currentColor;
+  fill: currentColor;
+}
+
+.harness-identity-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.available-subagent-route-identity-wrap {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  color: var(--text-meta);
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
 }
 
 .available-subagent-purpose {

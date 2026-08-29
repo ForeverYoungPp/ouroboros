@@ -580,7 +580,9 @@ import { installAltMenuSuppression } from './ui_helpers.js';
         // Through the step's own snapshot, so this line and the Agents step one
         // screen earlier spell a family the same way. Without it the summary
         // fell back to the bootstrap names and quietly undid an engine rename.
-        const labels = familyLabels(state.agentsConnected, agentsStep?.snapshot);
+        const labels = familyLabels(state.agentsConnected, agentsStep?.snapshot, {
+            catalogKnown: Boolean(agentsStep?.catalogKnown),
+        });
         const actorCount = (agentsStep?.availableSubagents?.items
             || state.availableSubagents?.items || []).length;
         const actors = `${actorCount} Available subagent${actorCount === 1 ? '' : 's'}`;

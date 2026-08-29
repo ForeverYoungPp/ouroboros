@@ -916,6 +916,8 @@ def log_chat(
             for key in ("project_id", "project_name", "target_label", "status"):
                 if key in meta:
                     record[key] = meta[key]
+        if "task_terminal_status" in meta:
+            record["task_terminal_status"] = str(meta.get("task_terminal_status") or "")
         if filename:
             record["filename"] = filename
         if mime:

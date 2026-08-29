@@ -21,10 +21,36 @@ import {
     pinnedAccountWarning,
     profileOptionsFor,
     renderReviewerSlotsSection,
+    reviewerRouteIdentityMarkup,
     routeChoiceGroups,
     sessionModelOptions,
     splitSessionTarget,
 } from '../modules/reviewer_slots.js';
+
+test('reviewer routes reuse the shared visible harness identity without claiming execution', () => {
+    const harnesses = {
+        claude: { id: 'claude', display_name: 'Claude Code Max' },
+    };
+    const known = reviewerRouteIdentityMarkup({
+        kind: ROUTE_KIND_SESSION,
+        target_id: 'claude=claude-fable-5',
+    }, harnesses, { catalogKnown: true });
+    assert.match(known, /data-harness-identity="claude"/);
+    assert.match(known, /Claude Code Max/);
+    assert.match(known, /fill="currentColor"/);
+    assert.doesNotMatch(known, /executed|status|available/i);
+
+    const unread = reviewerRouteIdentityMarkup({
+        kind: ROUTE_KIND_SESSION,
+        target_id: 'claude=claude-fable-5',
+    }, harnesses, { catalogKnown: false });
+    assert.match(unread, /Claude Code/);
+    assert.doesNotMatch(unread, /Claude Code Max/);
+
+    const api = reviewerRouteIdentityMarkup({ kind: ROUTE_KIND_API, target_id: 'openai/gpt' });
+    assert.match(api, /data-presentation-kind="channel"/);
+    assert.match(api, />API</);
+});
 
 
 test('the standing note states the POLICY, never the current routing', () => {

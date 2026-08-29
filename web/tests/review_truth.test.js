@@ -112,7 +112,7 @@ test('mixed panel renders quorum participation separately from pass support and 
     assert.match(text, /slot_3.*verdict=FAIL.*quorum=contributes.*enforcement=veto/);
 });
 
-test('subagent terminal projection keeps review complete without using it as activity', () => {
+test('subagent terminal projection leaves review rendering to the Reviews section', () => {
     const summary = summarizeChatLiveEvent({
         type: 'send_message',
         is_progress: true,
@@ -141,10 +141,9 @@ test('subagent terminal projection keeps review complete without using it as act
     });
     assert.equal(summary.terminal, true);
     assert.equal(summary.phase, 'warn');
-    assert.equal(summary.expandByDefault, true);
     assert.equal(summary.activityPreview, 'Concrete child result');
-    assert.match(summary.body, /panel_child/);
-    assert.match(summary.fullBody, /^\[REVIEW\][\s\S]*panel_child/);
+    assert.equal(summary.body, 'Concrete child result');
+    assert.doesNotMatch(summary.fullBody, /panel_child|\[REVIEW\]/);
     assert.match(summary.fullBody, /\[RESULT\]\nConcrete child result/);
     assert.deepEqual(summary.meta, ['write=none', 'status=completed']);
 });
@@ -166,7 +165,7 @@ test('terminal subagent activity prefers the authoritative result over emitter b
     assert.match(summary.fullBody, /\[RESULT\]\nThe evidence-backed conclusion/);
 });
 
-test('review-only subagent projection explicitly has no collapsed activity', () => {
+test('review-only subagent projection has no activity and no auto-disclosure flag', () => {
     const summary = summarizeChatLiveEvent({
         type: 'send_message',
         is_progress: true,
@@ -182,8 +181,8 @@ test('review-only subagent projection explicitly has no collapsed activity', () 
         }] },
     });
     assert.equal(summary.activityPreview, '');
-    assert.match(summary.body, /panel_review_only/);
-    assert.equal(summary.expandByDefault, true);
+    assert.equal(summary.body, '');
+    assert.equal('expandByDefault' in summary, false);
 });
 
 // ---------------------------------------------------------------------------
@@ -194,18 +193,18 @@ test('review-only subagent projection explicitly has no collapsed activity', () 
 test('a delegated frame yields a small harness chip; an ordinary frame yields none', () => {
     const chip = executorChip({ executor_route: 'codex' });
     assert.equal(chip.harness, 'codex');
-    assert.equal(chip.label, 'codex');           // short harness name, not a slogan
-    assert.ok(chip.icon);                        // icon, Claudexor-style
-    assert.match(chip.title, /codex/);
+    assert.equal(chip.label, 'Codex');
+    assert.equal('icon' in chip, false, 'mark geometry belongs to harness_presentation');
+    assert.match(chip.title, /Codex/);
     // WHERE it ran is all the chip can see. It has no access to the run's spend, so
     // it must not describe the billing: "on your codex subscription" told the owner
     // the work was covered, which the ledger alone can say (and only when the harness
     // says it — a zero there may mean unknown pricing, never "free").
     assert.ok(!/subscription/i.test(chip.title), chip.title);
     // The opaque `harness=model` spelling prints the HARNESS part only.
-    assert.equal(executorChip({ executor_route: 'codex=gpt-5.6-sol' }).label, 'codex');
+    assert.equal(executorChip({ executor_route: 'codex=gpt-5.6-sol' }).label, 'Codex');
     // An unknown harness still gets a chip (a generic mark), never a crash.
-    assert.equal(executorChip({ executor_route: 'opencode' }).label, 'opencode');
+    assert.equal(executorChip({ executor_route: 'opencode' }).label, 'OpenCode');
     // ABSENT FACT -> no chip at all: no placeholder, no "api" noise on every
     // ordinary bubble (the native path is the unremarkable case).
     assert.equal(executorChip({}), null);

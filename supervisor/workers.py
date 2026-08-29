@@ -1495,7 +1495,12 @@ def _run_chat_task(
                     )
                 except Exception:
                     log.debug("Failed-turn typing announce failed", exc_info=True)
-            send_with_budget(chat_id, err_msg, task_id=failed_task_id)
+            send_with_budget(
+                chat_id,
+                err_msg,
+                task_id=failed_task_id,
+                progress_meta={"task_terminal_status": "failed"},
+            )
         except Exception:
             log.debug("Suppressed exception", exc_info=True)
 
