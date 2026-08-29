@@ -458,6 +458,48 @@ def test_startup_permanent_rejection_keeps_raise_semantics(tmp_path, monkeypatch
     assert any("Telegram token validation failed" in m for _lvl, m, _f in api.logs)
 
 
+def test_inloop_revalidation_permanent_rejection_uses_startup_labeling(tmp_path, monkeypatch):
+    """A permanent getMe rejection during in-loop revalidation is the startup
+    token-validation failure deferred by a dead network: it must route through
+    the startup labeling (telegram_startup_failed + token-validation log), not
+    'telegram_rejected'."""
+    plugin = _load_plugin(tmp_path)
+    calls = {"getme": 0}
+
+    class DeferredRejectClient(FakeTelegramClient):
+        updates = []
+
+        async def call(self, method, **kwargs):
+            if method == "getMe":
+                calls["getme"] += 1
+                if calls["getme"] == 1:
+                    raise plugin.TelegramTransportError("network down during startup getMe.")
+                raise plugin.TelegramRequestRejected(
+                    "Telegram API getMe returned HTTP 401.", status_code=401,
+                )
+            return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(plugin, "TelegramClient", DeferredRejectClient)
+    api = FakeApi(tmp_path)
+
+    try:
+        asyncio.run(plugin._make_poller(api)())
+    except plugin.TelegramRequestRejected as exc:
+        assert exc.status_code == 401
+    else:
+        raise AssertionError("permanent revalidation rejection must stop the poller")
+
+    assert calls["getme"] == 2
+    assert json.loads((tmp_path / "bridge_status.json").read_text(encoding="utf-8")) == {
+        "state": "error",
+        "reason_code": "telegram_startup_failed",
+    }
+    assert any("Telegram token validation failed" in m for _lvl, m, _f in api.logs)
+    assert all(
+        m != "Telegram polling was permanently rejected." for _lvl, m, _f in api.logs
+    )
+
+
 def test_poller_surfaces_local_failure_to_supervisor(tmp_path, monkeypatch):
     plugin = _load_plugin(tmp_path)
 

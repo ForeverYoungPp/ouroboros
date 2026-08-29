@@ -318,6 +318,94 @@ def test_notifier_transient_backoff_grows_and_resets_with_transition_logs(tmp_pa
     assert len(recovered) == 1
 
 
+def test_notifier_clears_degraded_silently_when_pending_work_evaporates(tmp_path, monkeypatch):
+    """'recovered' is declared only when a send was actually delivered. When
+    the pending work merely evaporates (here: the toggle flips off) the
+    degraded episode ends WITHOUT the recovered line, and a later new failure
+    opens a fresh episode with its own transition warning."""
+    nt = _load(); _api_obj, data = _api(tmp_path)
+
+    logs = []
+
+    class LoggingApi:
+        def __init__(self, inner): self._inner = inner
+        def get_state_dir(self): return self._inner.get_state_dir()
+        def get_settings(self, k): return self._inner.get_settings(k)
+        def log(self, level, message, **fields): logs.append((level, message))
+
+    api = LoggingApi(_api_obj)
+
+    class AlwaysOffline:
+        def __init__(self, _token): pass
+        async def send_message(self, *_args, **_kwargs):
+            raise nt.TelegramTransportError("offline")
+
+    monkeypatch.setattr(nt, "TelegramClient", AlwaysOffline)
+
+    async def runtime_state(_api):
+        return {"spent_usd": 850, "budget_limit": 1000, "budget_pct": 85}
+
+    monkeypatch.setattr(nt, "_load_runtime_state", runtime_state)
+    settings_cycles = iter([
+        {"TELEGRAM_NOTIFY_BUDGET": "on", "TELEGRAM_CHAT_ID": "42"},
+        {"TELEGRAM_NOTIFY_BUDGET": "off", "TELEGRAM_CHAT_ID": "42"},
+        {"TELEGRAM_NOTIFY_BUDGET": "on", "TELEGRAM_CHAT_ID": "42"},
+    ])
+    monkeypatch.setattr(nt, "_load_settings", lambda _api: next(settings_cycles))
+    sleeps = []
+
+    async def record_sleep(delay):
+        sleeps.append(delay)
+        if len(sleeps) >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(nt.asyncio, "sleep", record_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(nt._make_notifier(api)())
+
+    # degraded backoff, silent episode end (healthy pacing), fresh episode
+    assert sleeps == [5, 30, 5]
+    degraded = [m for _lvl, m in logs if "degraded" in m]
+    recovered = [m for _lvl, m in logs if "recovered" in m]
+    assert len(degraded) == 2, degraded
+    assert recovered == [], recovered
+
+
+def test_notifier_transient_send_failures_log_at_debug_only(tmp_path, monkeypatch):
+    """Per-attempt transient failures stay at debug; the degraded transition
+    warning is the one owner-visible line of the episode."""
+    nt = _load(); _api_obj, data = _api(tmp_path)
+
+    logs = []
+
+    class LoggingApi:
+        def __init__(self, inner): self._inner = inner
+        def get_state_dir(self): return self._inner.get_state_dir()
+        def get_settings(self, k): return self._inner.get_settings(k)
+        def log(self, level, message, **fields): logs.append((level, message))
+
+    api = LoggingApi(_api_obj)
+
+    class AlwaysOffline:
+        def __init__(self, _token): pass
+        async def send_message(self, *_args, **_kwargs):
+            raise nt.TelegramTransportError("offline")
+
+    monkeypatch.setattr(nt, "TelegramClient", AlwaysOffline)
+
+    async def runtime_state(_api):
+        return {"spent_usd": 850, "budget_limit": 1000, "budget_pct": 85}
+
+    monkeypatch.setattr(nt, "_load_runtime_state", runtime_state)
+    transient, delivered = asyncio.run(
+        nt._check_budget_notify(api, {"TELEGRAM_NOTIFY_BUDGET": "on"}, 42, {}, "en")
+    )
+
+    assert transient is not None and delivered is False
+    attempt_logs = [(lvl, m) for lvl, m in logs if "Telegram notify failed" in m]
+    assert attempt_logs and all(lvl == "debug" for lvl, _m in attempt_logs)
+
+
 def test_notifier_local_failure_reaches_supervisor(tmp_path, monkeypatch):
     nt = _load(); api, _data = _api(tmp_path)
 

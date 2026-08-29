@@ -1501,13 +1501,21 @@ detector, while explicit task deadline, budget, cancellation and the absolute ce
 remain independent hard axes. A stale terminal from an earlier retry or task attempt
 cannot clear the current row.
 
-Every remote httpx LLM client (the cached OpenAI-compatible clients and the
-no-proxy per-call clients) is built on one shared transport factory that sets
-platform-guarded TCP keepalive socket options, so a NAT/VPN mapping silently
-dropped during a long silent reasoning stretch is detected by kernel probes
-within minutes instead of hanging until the read timeout. Disclosed residual:
-the native Anthropic `requests` session (and the GigaChat library client) do
-not carry these socket options.
+The cached OpenAI-compatible clients, the no-proxy per-call clients, and the
+web-search OpenAI clients are built on one shared transport factory
+(`net_transport.py`) that sets platform-guarded TCP keepalive socket options,
+so a NAT/VPN mapping silently dropped during a long silent reasoning stretch
+is detected by kernel probes instead of hanging until the read timeout: on
+Linux/macOS the probe timing is tuned to detect within minutes, other
+platforms get `SO_KEEPALIVE` with OS-default timing. The cached-client
+transports also carry SDK-equivalent pool limits (an explicit transport
+ignores Client-level limits). When HTTP(S)_PROXY/ALL_PROXY env proxies are
+configured, the cached and web-search clients skip the explicit transport
+(httpx env-proxy mounts require it absent) — disclosed residual: proxy-routed
+installs run without keepalive tuning. Further residuals without these socket
+options: the native Anthropic `requests` session and the anthropic web-search
+client, the GigaChat library client, and the short-lived `llm_probe`
+ephemeral probe clients.
 
 The configured-session startup/recovery receipt and every newly minted meaningful wake
 also carry one host-rendered `coordination_context`: the complete parent-authored advisory

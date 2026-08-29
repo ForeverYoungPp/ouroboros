@@ -82,8 +82,20 @@ def test_git_network_bounded_rejects_missing_cwd(tmp_path):
 
 def test_git_network_bounded_timeout_kills_process_tree(tmp_path, monkeypatch):
     """A hung network git is killed together with its children and returns the
-    typed timeout shape; nothing keeps holding the repository afterwards."""
-    repo = _seed_repo(tmp_path / "repo")
+    typed timeout shape; nothing keeps holding the repository afterwards — a
+    real follow-up network git command in the same clone must succeed (this
+    passing follow-up IS the lock-release contract; no extra cleanup exists)."""
+    upstream = _seed_repo(tmp_path / "upstream")
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", str(upstream), str(clone)],
+        capture_output=True, text=True, check=True,
+    )
+    (upstream / "seed.txt").write_text("advanced\n", encoding="utf-8")
+    _git(upstream, "commit", "-qam", "advance")
+    new_tip = _git(upstream, "rev-parse", "HEAD")
+
+    original_path = os.environ.get("PATH", "")
     shim_dir = tmp_path / "bin"
     shim_dir.mkdir()
     pid_dir = tmp_path / "pids"
@@ -98,11 +110,11 @@ def test_git_network_bounded_timeout_kills_process_tree(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     fake_git.chmod(fake_git.stat().st_mode | stat.S_IXUSR)
-    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{original_path}")
     monkeypatch.setenv("NETRES_PID_DIR", str(pid_dir))
 
     rc, out, err = update_source._git_network_bounded(
-        ["fetch", "origin"], cwd=repo, timeout=1.0,
+        ["fetch", "origin"], cwd=clone, timeout=1.0,
     )
 
     assert rc == update_source.FETCH_TIMEOUT_RC
@@ -124,6 +136,15 @@ def test_git_network_bounded_timeout_kills_process_tree(tmp_path, monkeypatch):
             time.sleep(0.05)
         else:
             raise AssertionError(f"process {pid} survived the bounded timeout kill")
+
+    # Contract: the killed fetch left nothing behind that breaks a real
+    # follow-up network git command in the same clone.
+    monkeypatch.setenv("PATH", original_path)
+    rc2, _out2, err2 = update_source._git_network_bounded(
+        ["fetch", "origin"], cwd=clone, timeout=60,
+    )
+    assert rc2 == 0, err2
+    assert _git(clone, "rev-parse", "origin/main") == new_tip
 
 
 def test_push_to_remote_timeout_surfaces_as_todays_failure_shape(monkeypatch):

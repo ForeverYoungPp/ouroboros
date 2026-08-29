@@ -55,6 +55,10 @@ async def _push_notification(
     failure is worth retrying next cycle, and ``("skipped", exc)`` on a
     permanent rejection: the notification is consumed so one dead send cannot
     replay forever and exhaust the supervised-restart budget.
+
+    Transient failures log at debug only: the notifier loop's degraded/
+    recovered transition warning (which carries the exception) is the one
+    owner-visible line per episode.
     """
     protected = api.get_settings(["TELEGRAM_BOT_TOKEN"])
     client = TelegramClient(protected.get("TELEGRAM_BOT_TOKEN", ""))
@@ -62,11 +66,11 @@ async def _push_notification(
         await client.send_message(int(chat_id), text, parse_mode="")
         return "sent", None
     except TelegramTransportError as exc:
-        api.log("error", f"Telegram notify failed: {exc}")
+        api.log("debug", f"Telegram notify failed: {exc}")
         return "transient", exc
     except TelegramRequestRejected as exc:
         if exc.transient:
-            api.log("error", f"Telegram notify failed: {exc}")
+            api.log("debug", f"Telegram notify failed: {exc}")
             return "transient", exc
         api.log("error", f"Telegram notification permanently rejected; skipping it: {exc}")
         return "skipped", exc
@@ -77,37 +81,39 @@ _BUDGET_THRESHOLDS = (100, 90, 80)  # checked high → low
 
 async def _check_budget_notify(
     api, settings: Dict[str, Any], chat_id: int, state: Dict[str, Any], lang: str,
-) -> Optional[BaseException]:
-    """Returns the transient send failure, if one occurred, for loop pacing."""
+) -> Tuple[Optional[BaseException], bool]:
+    """Returns (transient send failure if any, whether a send was delivered)."""
     if not _notify_enabled(settings, "TELEGRAM_NOTIFY_BUDGET"):
-        return None
+        return None, False
     snapshot = await _load_runtime_state(api)
     try:
         spent = float(snapshot["spent_usd"])
         total = float(snapshot["budget_limit"])
         pct = float(snapshot["budget_pct"])
     except (KeyError, TypeError, ValueError):
-        return None
+        return None, False
     if total <= 0:
-        return None
+        return None, False
     crossed = 0
     for thr in _BUDGET_THRESHOLDS:
         if pct >= thr:
             crossed = thr
             break
     notified = int(state.get("budget_threshold") or 0)
+    delivered = False
     if crossed > notified:
         msg = (f"⚠️ Бюджет: {pct:.0f}% (${spent:.2f} / ${total:.2f})" if lang == "ru"
                else f"⚠️ Budget: {pct:.0f}% (${spent:.2f} / ${total:.2f})")
         outcome, exc = await _push_notification(api, chat_id, msg)
         if outcome == "transient":
-            return exc
+            return exc, False
         # "sent" delivered it; "skipped" consumes it (permanent rejection) so
         # the same send does not replay every cycle forever.
+        delivered = outcome == "sent"
         state["budget_threshold"] = crossed
     elif crossed < notified:
         state["budget_threshold"] = crossed  # budget raised / spend reset → re-arm
-    return None
+    return None, delivered
 
 
 def _summary_ids_in_tail(api, limit: int = 200) -> list:
@@ -125,17 +131,18 @@ def _summary_ids_in_tail(api, limit: int = 200) -> list:
 
 async def _check_tasks_notify(
     api, settings: Dict[str, Any], chat_id: int, state: Dict[str, Any], lang: str,
-) -> Optional[BaseException]:
-    """Returns the last transient send failure, if any, for loop pacing."""
+) -> Tuple[Optional[BaseException], bool]:
+    """Returns (last transient send failure if any, whether a send was delivered)."""
     if not _notify_enabled(settings, "TELEGRAM_NOTIFY_TASKS"):
-        return None
+        return None, False
     summaries = _summary_ids_in_tail(api)
     if "notified_task_ids" not in state:
         # First run with task notifications on → treat the existing backlog as seen
         # so enabling the toggle doesn't blast a notification for every old task.
         state["notified_task_ids"] = [tid for tid, _ in summaries][-300:]
-        return None
+        return None, False
     transient: Optional[BaseException] = None
+    delivered = False
     seen = list(state.get("notified_task_ids") or [])
     seen_set = set(seen)
     for tid, e in summaries:
@@ -163,10 +170,11 @@ async def _check_tasks_notify(
             transient = exc
             continue
         # "sent" or permanent "skipped": either way this notification is done.
+        delivered = delivered or send_outcome == "sent"
         seen.append(tid)
         seen_set.add(tid)
     state["notified_task_ids"] = seen[-300:]
-    return transient
+    return transient, delivered
 
 
 def _make_notifier(api):
@@ -183,15 +191,21 @@ def _make_notifier(api):
                 "TELEGRAM_NOTIFY_BUDGET",
             )
             transient: Optional[BaseException] = None
+            delivered = False
             if chat_id and want:
                 lang = str(settings.get("TELEGRAM_LANGUAGE") or "en").strip().lower()
                 state = _load_notif_state(api)
-                transient = await _check_budget_notify(api, settings, chat_id, state, lang)
-                transient = await _check_tasks_notify(api, settings, chat_id, state, lang) or transient
+                transient, delivered = await _check_budget_notify(api, settings, chat_id, state, lang)
+                tasks_transient, tasks_delivered = await _check_tasks_notify(
+                    api, settings, chat_id, state, lang,
+                )
+                transient = tasks_transient or transient
+                delivered = delivered or tasks_delivered
                 _save_notif_state(api, state)
             if transient is not None:
-                # Transition logging only: one line entering degraded, one on
-                # recovery; the monotone backoff paces retries meanwhile.
+                # Transition logging: one warning entering degraded, one info
+                # on recovery; per-attempt failures stay at debug while the
+                # monotone backoff paces retries.
                 if not degraded_cause:
                     degraded_cause = type(transient).__name__
                     api.log("warning", f"Telegram notifier degraded ({degraded_cause}): {transient}")
@@ -199,7 +213,11 @@ def _make_notifier(api):
                 retry_delay = next_telegram_retry_delay(retry_delay)
                 continue
             if degraded_cause:
-                api.log("info", f"Telegram notifier recovered after {degraded_cause}.")
+                # Declare recovery only on an actual delivery; when the pending
+                # work merely evaporated (threshold re-armed, task id rolled out
+                # of the tail, toggle flipped) end the episode silently.
+                if delivered:
+                    api.log("info", f"Telegram notifier recovered after {degraded_cause}.")
                 degraded_cause = ""
             retry_delay = TELEGRAM_RETRY_INITIAL_SEC
             await asyncio.sleep(30)
