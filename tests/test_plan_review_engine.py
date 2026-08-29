@@ -1060,6 +1060,7 @@ def test_fingerprint_history_survives_a_b_a_and_charges_once(harness, monkeypatc
 
     compact = tr._compact_plan_review_wave(state["waves"][0])
     assert "spec" not in compact and compact.get("compact") is True
+    assert compact["reviewed_at"] == state["waves"][0]["reviewed_at"]
 
 
 def test_unreadable_state_holds_a_self_opened_blocking_plan(harness, monkeypatch):

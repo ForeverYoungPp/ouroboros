@@ -262,6 +262,34 @@ test('an unmatched open Plan attempt restores liveness before its first wave lan
     assert.equal(next.attempts.at(-1).label, 'current attempt');
 });
 
+test('Plan waves retain the canonical reviewed timestamp through full and compact projections', () => {
+    const fingerprint = 'a'.repeat(64);
+    const reviewedAt = '2026-08-29T01:02:03+00:00';
+    const project = (compact) => planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            schema_version: 2,
+            current_attempt: compact ? {} : { fingerprint, status: 'closed' },
+            waves: [{
+                compact,
+                request_fingerprint: fingerprint,
+                cycle_index: 1,
+                aggregate: 'GREEN',
+                closed: true,
+                reviewed_at: reviewedAt,
+            }],
+            waves_omitted: 0,
+        },
+    });
+
+    assert.equal(project(false).attempts[0].timestamp, reviewedAt);
+    assert.equal(project(true).attempts[0].timestamp, reviewedAt);
+    assert.match(renderReviewsSection([project(false)], {
+        sectionExpanded: true,
+        expandedGroups: new Set(['plan:root']),
+    }), new RegExp(reviewedAt.replaceAll('+', '\\+')));
+});
+
 test('a fresh Plan attempt replaces matching compact history until its full wave lands', () => {
     const firstFingerprint = 'a'.repeat(64);
     const secondFingerprint = 'b'.repeat(64);

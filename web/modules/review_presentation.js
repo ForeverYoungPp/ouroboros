@@ -412,7 +412,7 @@ function planAttempt(wave, index, isCurrent) {
         state,
         tone: statusTone(state, verdict),
         verdict,
-        timestamp: text(wave.ts || wave.timestamp || wave.closed_at),
+        timestamp: text(wave.reviewed_at || wave.ts || wave.timestamp || wave.closed_at),
         ordinal: index,
         label: wave.cycle_index != null ? `wave ${wave.cycle_index}` : `wave ${index + 1}`,
         summary: text(wave.reason || wave.summary),
