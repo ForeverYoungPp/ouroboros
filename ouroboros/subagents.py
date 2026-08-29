@@ -448,6 +448,14 @@ def route_health(
             break
     if entry is None:
         return "route_not_in_capability_catalog", ""
+    if not pinned_profile and entry.get("enabled") is False:
+        # `enabled` is NOT the doctor's aggregate status: the engine schema
+        # defines it as the OWNER's settings toggle (harnesses.<id>.enabled=
+        # false — "routing excludes it regardless of doctor status"). Honoring
+        # an explicit owner switch is not health-guessing, so it survives the
+        # status-refusal removal above. A pinned profile keeps its historical
+        # skip (2026-08-18 precedent: the pin is itself an explicit owner row).
+        return "route_disabled", ""
     supported = [str(v) for v in entry.get("accessProfilesSupported") or []]
     # A DELEGATED run is externally confined, and the engine rewrites its access to
     # `external_sandbox_full` before admitting it (`RequestRequirementsResolver.adapterAccess`)

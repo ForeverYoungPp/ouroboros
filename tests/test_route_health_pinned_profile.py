@@ -26,11 +26,15 @@ from ouroboros.subagents import delegated_run_shape, route_health
 
 
 class _Gateway:
-    """agy-shaped catalog row: default store dead forever, pool-only accounts."""
+    """agy-shaped catalog row: default store dead forever, pool-only accounts.
+
+    ``enabled`` defaults True — the field is the OWNER's settings toggle, and
+    the INV-135 case is a harness the owner did NOT disable whose doctor
+    status still reads unavailable forever."""
 
     engine_version = "9.9.9"
 
-    def __init__(self, *, status="unavailable", enabled=False, delegation=None):
+    def __init__(self, *, status="unavailable", enabled=True, delegation=None):
         self._row = {
             "id": "agy-like", "enabled": enabled, "status": status,
             "accessProfilesSupported": ["readonly", "workspace_write"],
@@ -60,6 +64,18 @@ def test_aggregate_row_status_is_not_a_refusal_pinned_or_not():
     assert route_health(
         _Gateway(status="ok", enabled=True), "agy-like", shape,
     ) == ("", "")
+
+
+def test_owner_disabled_toggle_still_refuses_unpinned():
+    # `enabled` is not the doctor's status: the engine schema defines it as the
+    # owner's settings switch ("routing excludes it regardless of doctor
+    # status"). An explicit owner "no" survives the status-refusal removal; a
+    # pinned profile keeps its historical skip (the pin is itself an explicit
+    # owner row).
+    shape = delegated_run_shape(False)
+    disabled = _Gateway(status="ok", enabled=False)
+    assert route_health(disabled, "agy-like", shape) == ("route_disabled", "")
+    assert route_health(disabled, "agy-like", shape, pinned_profile="acct-1") == ("", "")
 
 
 def test_catalog_absence_still_refuses_pinned_or_not():
