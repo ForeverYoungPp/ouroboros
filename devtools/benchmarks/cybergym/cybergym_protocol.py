@@ -744,14 +744,21 @@ def directory_tree_digest(
                 target_info = resolved_target.stat()
             except (OSError, RuntimeError, ValueError) as exc:
                 target_text = target.as_posix() if target is not None else ""
+                # Declared virtual targets are container-side POSIX paths by
+                # contract (``/src/...`` exists only inside the nested verifier
+                # container), so classify them with pure POSIX semantics.  A
+                # host ``Path`` on Windows treats the rooted ``/src/...``
+                # spelling as non-absolute and would misfile the declared
+                # virtual link as external.  Identical behaviour on POSIX.
+                virtual_target = pathlib.PurePosixPath(target_text)
                 prefixes = tuple(
                     str(prefix) for prefix in allowed_virtual_symlink_prefixes if str(prefix)
                 )
-                if target is None or not target.is_absolute() or not any(target_text.startswith(prefix) for prefix in prefixes):
+                if target is None or not virtual_target.is_absolute() or not any(target_text.startswith(prefix) for prefix in prefixes):
                     raise CyberGymPinRefused(
                         f"directory contains a broken or external link: {relative}"
                     ) from exc
-                if ".." in target.parts or "\x00" in target_text:
+                if ".." in virtual_target.parts or "\x00" in target_text:
                     raise CyberGymPinRefused(f"directory contains an unsafe virtual link: {relative}") from exc
                 virtual = True
                 target_info = None

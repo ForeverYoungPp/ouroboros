@@ -984,12 +984,21 @@ def _prepare_applied_settings(
     output_path = out_root / "settings_applied.json"
     write_json(output_path, applied)
     # Hash the exact producer serialization, then verify the atomic writer
-    # left those bytes in place. The expected digest is passed downstream;
-    # a replacement after this point is rejected instead of becoming a new
-    # baseline during isolated-server setup.
+    # left those bytes in place. The expected digest is passed downstream and
+    # compared against file bytes again before the isolated copy, so it must
+    # bind the on-disk form; a replacement after this point is rejected
+    # instead of becoming a new baseline during isolated-server setup.
+    # ``write_json`` persists through the atomic text writer, which applies
+    # platform newline semantics — the on-disk bytes carry ``os.linesep``
+    # (CRLF on Windows). JSON escapes newlines inside strings, so only the
+    # structural indent newlines are translated.
     serialized_settings = (
         json.dumps(applied, ensure_ascii=False, indent=2) + "\n"
     ).encode("utf-8")
+    if os.linesep != "\n":
+        serialized_settings = serialized_settings.replace(
+            b"\n", os.linesep.encode("ascii")
+        )
     try:
         if output_path.read_bytes() != serialized_settings:
             raise CyberGymIntegrationUnavailable(

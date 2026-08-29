@@ -6,6 +6,7 @@ import hashlib
 import json
 import pathlib
 import subprocess
+import sys
 
 import pytest
 
@@ -62,7 +63,8 @@ def test_prepare_clones_pinned_seed_and_copies_settings(tmp_path):
     assert wrapper.clone_root.is_dir()
     assert wrapper.settings_path.read_bytes() == settings.read_bytes()
     assert wrapper.settings_path.read_text(encoding="utf-8").startswith("{")
-    assert wrapper.settings_path.stat().st_mode & 0o777 == 0o600
+    if sys.platform != "win32":  # owner-only mode bits are a POSIX concept; Windows chmod carries only the read-only flag
+        assert wrapper.settings_path.stat().st_mode & 0o777 == 0o600
     assert (wrapper.data_root / ".ouroboros_isolated_benchmark").is_file()
     assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=wrapper.clone_root, text=True).strip() == commit
     assert subprocess.run(["git", "config", "--get", "remote.origin.url"], cwd=wrapper.clone_root, check=False, stdout=subprocess.DEVNULL).returncode != 0

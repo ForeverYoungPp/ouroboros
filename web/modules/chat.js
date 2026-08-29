@@ -2991,13 +2991,11 @@ export function createChatInstance({
                 // [GPT#17] rebuild fully too.
                 const rebuildAll = !historyLoaded || fromReconnect || forceRebuild
                     || offlineBootstrapPainted;
-                // On a soft reconnect the module (and its dedupe set) survives, so a
-                // plain re-sync would skip user messages and dedupe-drop every
-                // assistant bubble — the conversation would vanish. Restore user text
-                // and rebuild from durable history whenever we rebuild. The
-                // offline-bootstrap rebuild clears the fallback-painted bubbles
-                // too, so it must restore user rows even when the trigger came
-                // with includeUser=false (first clean open / 700ms resync).
+                // On a soft reconnect the module (and its dedupe set)
+                // survives: a plain re-sync would dedupe-drop every bubble.
+                // Restore user text and rebuild from durable history on every
+                // rebuild — incl. includeUser=false triggers (clean open /
+                // 700ms resync), since offline-bootstrap cleared those too.
                 const renderUser = includeUser || fromReconnect || offlineBootstrapPainted;
                 if (!historyLoaded || fromReconnect) retiredTaskIds.clear();
                 // The extra rebuild causes (Load-older / offline bootstrap)
@@ -3135,10 +3133,15 @@ export function createChatInstance({
                         else appendMediaBubble(msg);
                         continue;
                     }
+                    // Replay conclusion: a typed terminal fact OR a plain
+                    // untyped final (replay has no later task_done frame, so
+                    // the bare final is the task's last word; marked rows —
+                    // system_type/msg_type — still never conclude).
+                    const plainUntypedFinal = !msg.system_type && !msg.msg_type;
                     if (
                         taskId
                         && (msg.role === 'assistant' || msg.role === 'system')
-                        && positiveTaskTerminalFact(msg)
+                        && (positiveTaskTerminalFact(msg) || plainUntypedFinal)
                         && !isNonTerminalMediaHistoryRow(msg)
                     ) {
                         if (subagentChildParents.has(taskId)) {
@@ -3248,14 +3251,12 @@ export function createChatInstance({
                 _historyReplayActive = true;
                 try {
                     if (rebuildAll) {
-                        // perf2 P4.3 [GPT#14]: one outer withStableViewport for the
-                        // whole rebuild — inner per-row wrappers collapse on the
-                        // existing _viewportMutationDepth gate, killing the
-                        // per-frame isInstanceVisible/anchor layout storm. One
-                        // stable sort, one fragment mount before typing, then the
-                        // per-card finals and ONE persist. The whole section is
-                        // synchronous: live frames can never observe "records
-                        // cleared, fragment not yet mounted".
+                        // perf2 P4.3 [GPT#14]: one outer withStableViewport for
+                        // the whole rebuild (inner wrappers collapse on the
+                        // _viewportMutationDepth gate — no per-frame layout
+                        // storm); one stable sort, one fragment mount, ONE
+                        // persist, all synchronous: live frames never observe
+                        // "records cleared, fragment not yet mounted".
                         _rebuildBatch = createRebuildBatch();
                         try {
                             withStableViewport(() => {
@@ -3875,14 +3876,10 @@ export function createChatInstance({
     typingEl.innerHTML = `<div class="typing-dots"><span></span><span></span><span></span></div>`;
     messagesDiv.appendChild(typingEl);
 
-    // perf2 P4.5: "Load older" control at the very top of the feed. Server
-    // truth (window.complete / truncated_by from P3.2) decides between a
-    // quota-escalating refetch button and the honest boundary notice; the
-    // container class is excluded from viewport anchoring like .typing-bubble.
-    // The control is mounted ONLY while it has something to show: a
-    // permanently-present (even hidden) node would be an extra top-level feed
-    // child, breaking child-order consumers (ui-smoke chronology pattern) and
-    // diverging from the pre-P4 feed layout on complete windows.
+    // perf2 P4.5: "Load older" atop the feed. Server truth (window.complete /
+    // truncated_by, P3.2) picks refetch button vs honest boundary notice;
+    // excluded from viewport anchoring; mounted ONLY with content — a hidden
+    // permanent node would break child-order consumers (ui-smoke chronology).
     const loadOlderEl = document.createElement('div');
     loadOlderEl.className = 'chat-load-older';
     const loadOlderBtn = document.createElement('button');

@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import tarfile
 import threading
 
@@ -33,6 +34,26 @@ from devtools.benchmarks.cybergym.cybergym_executor import (
 from devtools.benchmarks.cybergym.cybergym_sidecar import required_resource_labels
 from ouroboros.headless import write_workspace_patch_artifacts
 from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+# ``_safe_extract`` refuses wholesale — by design, before validating or
+# touching anything — on platforms without descriptor-safe publish/cleanup
+# primitives (Windows: ``os.supports_dir_fd`` is empty).  Tests that need the
+# extraction/validation pass to run are guarded on the exact refusal
+# predicate, mirroring the in-file capability skips below.
+_DESCRIPTOR_SAFE_EXTRACT = bool(
+    executor_module._ARCHIVE_RENAME_DIR_FD and executor_module._ARCHIVE_CLEANUP_DIR_FD
+)
+
+# The CyberGym sidecar mount contract requires POSIX host paths: the rootless
+# Docker daemon is a unix socket and the server/workspace host directories are
+# bind-mounted at the *identical* absolute path inside Linux containers
+# (see ``ExecutorConfig`` docstring and ``SidecarCommandSpec.__post_init__``).
+# A ``C:\`` drive path cannot satisfy that contract, so these flows are
+# Linux/POSIX-exclusive rather than portable.
+_requires_posix_mount_paths = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="CyberGym mounts POSIX host paths at identical absolute container paths (rootless Linux Docker contract)",
+)
 
 
 def _config(tmp_path: pathlib.Path, **overrides):
@@ -92,6 +113,8 @@ def _write_archive(path: pathlib.Path, entries: list[tuple[str, str, str]]) -> N
 
 
 def test_safe_extract_preserves_confined_relative_symlinks(tmp_path):
+    if not _DESCRIPTOR_SAFE_EXTRACT:
+        pytest.skip("platform has no descriptor-safe archive primitives")
     archive = tmp_path / "repo-vul.tar.gz"
     _write_archive(
         archive,
@@ -117,6 +140,8 @@ def test_safe_extract_preserves_confined_relative_symlinks(tmp_path):
 
 
 def test_safe_extract_resolves_symlink_components(tmp_path):
+    if not _DESCRIPTOR_SAFE_EXTRACT:
+        pytest.skip("platform has no descriptor-safe archive primitives")
     archive = tmp_path / "component-links.tar.gz"
     _write_archive(
         archive,
@@ -135,6 +160,8 @@ def test_safe_extract_resolves_symlink_components(tmp_path):
 
 
 def test_safe_extract_rolls_back_staging_on_extraction_error(tmp_path, monkeypatch):
+    if not _DESCRIPTOR_SAFE_EXTRACT:
+        pytest.skip("platform has no descriptor-safe archive primitives")
     archive = tmp_path / "partial.tar.gz"
     _write_archive(archive, [("root", "dir", ""), ("root/file", "file", "payload")])
     destination = tmp_path / "workspace"
@@ -512,6 +539,8 @@ def test_safe_extract_requires_descriptor_cleanup_capability(tmp_path, monkeypat
     ],
 )
 def test_safe_extract_rejects_absolute_escaping_and_broken_links(tmp_path, linkname, message):
+    if not _DESCRIPTOR_SAFE_EXTRACT:
+        pytest.skip("platform has no descriptor-safe archive primitives")
     archive = tmp_path / "bad.tar.gz"
     _write_archive(archive, [("root", "dir", ""), ("root/link", "symlink", linkname)])
     destination = tmp_path / "workspace"
@@ -525,6 +554,8 @@ def test_safe_extract_rejects_absolute_escaping_and_broken_links(tmp_path, linkn
 
 @pytest.mark.parametrize("kind", ["hardlink", "fifo"])
 def test_safe_extract_rejects_special_link_members(tmp_path, kind):
+    if not _DESCRIPTOR_SAFE_EXTRACT:
+        pytest.skip("platform has no descriptor-safe archive primitives")
     archive = tmp_path / "special.tar.gz"
     _write_archive(archive, [("root", "dir", ""), ("root/member", kind, "root/target")])
     with pytest.raises(ExecutorFailure, match="special member"):
@@ -532,6 +563,8 @@ def test_safe_extract_rejects_special_link_members(tmp_path, kind):
 
 
 def test_safe_extract_rejects_link_parent_conflict_and_destination_symlink(tmp_path):
+    if not _DESCRIPTOR_SAFE_EXTRACT:
+        pytest.skip("platform has no descriptor-safe archive primitives")
     archive = tmp_path / "conflict.tar.gz"
     _write_archive(
         archive,
@@ -980,6 +1013,7 @@ def test_task_body_requires_immutable_workspace_id(tmp_path):
         )
 
 
+@_requires_posix_mount_paths
 def test_start_uses_same_absolute_server_root_and_docs_probe(tmp_path, monkeypatch):
     config = _config(tmp_path)
     monkeypatch.setenv("CYBERGYM_API_KEY", "test-secret-value")
@@ -1017,6 +1051,7 @@ def test_start_uses_same_absolute_server_root_and_docs_probe(tmp_path, monkeypat
     assert seen_http == [("GET", "http://127.0.0.1:8667/openapi.json")]
 
 
+@_requires_posix_mount_paths
 def test_readiness_rejects_openapi_without_private_submit_fix(tmp_path, monkeypatch):
     config = _config(tmp_path)
     monkeypatch.setenv("CYBERGYM_API_KEY", "test-secret-value")
@@ -1180,6 +1215,7 @@ def test_runtime_attestation_reinspects_immutable_ids_before_gateway_boundary(tm
         )
 
 
+@_requires_posix_mount_paths
 def test_workspace_registration_and_attestation_share_registry_lock(tmp_path, monkeypatch):
     """An attached workspace is registered before another lane snapshots Docker."""
     import devtools.benchmarks.cybergym.cybergym_executor as executor_module
@@ -1322,6 +1358,7 @@ def test_workspace_registration_and_attestation_share_registry_lock(tmp_path, mo
     assert network_snapshots and all(network_snapshots)
 
 
+@_requires_posix_mount_paths
 def test_workspace_start_error_recovers_name_custody_by_inspect(tmp_path):
     config = _config(tmp_path)
     executor = CyberGymExecutor(config)
@@ -1366,6 +1403,7 @@ def test_workspace_start_error_recovers_name_custody_by_inspect(tmp_path):
     assert not executor._workspace_starting
 
 
+@_requires_posix_mount_paths
 def test_workspace_starts_remain_concurrent_while_registry_publishes_atomically(tmp_path):
     config = _config(tmp_path)
     executor = CyberGymExecutor(config)

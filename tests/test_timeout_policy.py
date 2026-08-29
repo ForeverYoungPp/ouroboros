@@ -815,28 +815,42 @@ def test_strict_poll_splits_http_phase_budget_and_recomputes_retry():
 
 def test_strict_poll_phase_budget_is_bounded_in_wall_time():
     import pytest
+    import threading
     import time
     from ouroboros.delegate_progress import bounded_poll
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
+    # Margins are deliberately coarse: the previous 0.06s-sleep-inside-a-0.08s
+    # budget with a <0.1s wall assertion measured OS scheduler precision, not
+    # the poll contract, and flaked on loaded CI hosts (observed 0.207s). The
+    # contract under test is discrimination, not stopwatch accuracy: a phase
+    # answering within the budget returns as soon as it answers (seconds, not
+    # the 30s budget), and a stalled phase is cut at the small budget (seconds,
+    # not the 30s stall).
+
     class OneSlowPhase:
         def get_run(self, _run_id, *, timeout_sec=None):
-            time.sleep(0.06)
+            time.sleep(0.05)
             return {"summary": {"state": "succeeded"}}
 
     started = time.monotonic()
-    bounded_poll(OneSlowPhase(), "run-1", 0.08, strict=True)
-    assert time.monotonic() - started < 0.1
+    detail = bounded_poll(OneSlowPhase(), "run-1", 30.0, strict=True)
+    assert detail == {"summary": {"state": "succeeded"}}
+    assert time.monotonic() - started < 5.0
 
-    class MultiPhaseStall:
+    stall_release = threading.Event()
+
+    class StalledPhase:
         def get_run(self, _run_id, *, timeout_sec=None):
-            time.sleep(timeout_sec * 4)
+            stall_release.wait(30.0)
             return {"summary": {"state": "succeeded"}}
 
     started = time.monotonic()
     with pytest.raises(ClaudexorUnavailable, match="wall-clock bound"):
-        bounded_poll(MultiPhaseStall(), "run-2", 0.08, strict=True)
-    assert time.monotonic() - started < 0.1
+        bounded_poll(StalledPhase(), "run-2", 0.25, strict=True)
+    assert time.monotonic() - started < 5.0
+    # Let the abandoned daemon poll thread exit now instead of in 30s.
+    stall_release.set()
 
 
 def test_claudexor_bound_applies_to_connect_phase_too():
@@ -927,7 +941,13 @@ def test_finalize_control_carries_original_grace_deadline(monkeypatch, tmp_path)
         owner_ctx=SimpleNamespace(task_attempt=1),
     )
     assert controls["finalize_now"] == "deadline"
-    assert before + 3 <= controls["finalize_deadline_ts"] <= time.time() + 3
+    # The deadline derives from the mailbox entry's ``ts`` — stamped via
+    # datetime.now().isoformat(), i.e. truncated to WHOLE microseconds — while
+    # ``before`` keeps time.time()'s full float precision. On Windows the
+    # coarse system clock hands both reads the same instant, so the stamp can
+    # sit up to 1us BELOW ``before`` (observed −3.4e-7s on the CI shard).
+    # Compare against the microsecond-truncated lower bound.
+    assert before - 1e-6 + 3 <= controls["finalize_deadline_ts"] <= time.time() + 3
 
 
 def test_forced_finalization_does_not_rebase_existing_grace(monkeypatch, tmp_path):

@@ -3153,7 +3153,15 @@ def test_clock_crossing_between_timeout_checks_still_cancels_the_running_session
     from ouroboros import review_execution as rx
 
     ticks = iter([0.0, 0.0, 0.5, 1.1, 1.2])
-    monkeypatch.setattr(rx.time, "monotonic", lambda: next(ticks))
+    # Replace the module reference, not attributes on the process-global
+    # ``time`` module: pytest itself calls monotonic on Windows and would
+    # exhaust the finite tick iterator (same scoping precedent as
+    # tests/test_external_unmetered_dispatch.py).
+    monkeypatch.setattr(
+        rx,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda _seconds: None),
+    )
     monkeypatch.setattr(
         rx,
         "_poll_detail",

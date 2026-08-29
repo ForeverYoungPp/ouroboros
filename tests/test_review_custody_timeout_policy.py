@@ -59,7 +59,11 @@ def test_spent_deadline_restart_reconciliation_gets_only_a_settlement_window(
     operation_id, retry_state, remaining = calls[0]
     assert operation_id == "op-existing"
     assert retry_state == {"pending_invocation_id": "inv-existing"}
-    assert 0 < remaining <= 0.2
+    # The deadline is monotonic_now + 0.2 and ``remaining`` re-reads the same
+    # clock, so it can only shrink — but on Windows the coarse monotonic clock
+    # returns the identical reading twice, leaving pure float rounding noise
+    # above 0.2 (observed +4.5e-13 on the CI shard). Tolerate one epsilon.
+    assert 0 < remaining <= 0.2 + 1e-9
     assert paid == []
     assert actor.operation_id == "op-existing"
     assert actor.operation_state == "settled"
@@ -411,7 +415,12 @@ def test_coordinator_keeps_fresh_empty_session_custody_cell_shared(
             self.state["delegated_run_id"] = "run-shared"
             if self.checkpoint is not None:
                 self.checkpoint("inv-shared")
-            release.wait(1.0)
+            # Hang-escape only, NOT a deadline the test body must beat: with a
+            # 1.0s cap a slow CI runner (Windows shard) let the wait expire
+            # between the two run_review_request calls, so the run settled
+            # naturally with empty usage and the join replayed "late_settled"
+            # instead of sharing the in-flight custody cell.
+            release.wait(30.0)
             settled.set()
             return ReviewAttemptResult(
                 message={"content": "[]"}, usage={}, raw_text="[]",
