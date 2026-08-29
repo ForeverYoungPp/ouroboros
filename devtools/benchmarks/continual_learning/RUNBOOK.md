@@ -25,9 +25,12 @@ Field-tested configuration and operational hazards from the 2026-07-20 full 1-se
   short blips and multi-hour outages.
   Disclosure (net-resilience sprint): `OUROBOROS_TRANSIENT_RETRY_MAX` no longer bounds a
   REMOTE pre-dispatch transport outage. That class (`transport_unavailable`, $0 released
-  attempts) now waits and redials at the round level until the task's own deadline/budget
-  rails, so a dead egress holds the task instead of failing it after the burst; the wait is
-  visible as durable `network_wait` events in the isolated server's `events.jsonl`.
+  attempts) now waits and redials at the round level. CLB solve tasks carry no
+  `deadline_at` and the waiting itself spends $0, so the binding rail here is the
+  supervisor's absolute per-attempt ceiling (`OUROBOROS_TASK_ABS_CEILING_SEC`, default 6h),
+  not a deadline or budget rail: a dead egress holds the task up to that ceiling instead of
+  failing it after the burst. The wait is visible as durable `network_wait` events in the
+  isolated server's `events.jsonl`.
 - `OUROBOROS_TOTAL_BUDGET=200` per domain-seed (measured 1-seed domain costs:
   poker $117 · bsm $60 · cohort $58 · code $33 · sales $26 · db $25 — a $60 cap silently
   truncates poker mid-rollout).

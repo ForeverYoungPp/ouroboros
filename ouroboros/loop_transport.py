@@ -133,11 +133,17 @@ def reconcile_transport_wait(
 
     Enters a new episode on a fresh ``transport_unavailable`` failure (durable
     ``entered`` event; the first owner note fires immediately for wait-eligible
-    turns). On a redial outcome: a response ends the episode as ``recovered``
-    (mandatory owner note), a NON-transport failure ends it as evidence the
-    transport is passable again, while ``transport_unavailable`` and a
-    pre-dispatch deadline refusal keep the latch for the wait/terminal step.
-    A failed local fallback pass never clears the latched remote cause.
+    turns). The round gate reconciles twice per failed dispatch: once with the
+    pre-chain kind, and once after the fallback chain with the FRESH kind — so
+    an outage first observed MID-chain (a remote candidate dying pre-dispatch
+    while the primary failed generically) still latches an episode instead of
+    falling through to a generic terminal that would dial a forced-final call
+    over the proven-dead egress. On a redial outcome: a response ends the
+    episode as ``recovered`` (mandatory owner note), a NON-transport failure
+    ends it as evidence the transport is passable again, while
+    ``transport_unavailable`` and a pre-dispatch deadline refusal keep the
+    latch for the wait/terminal step. A failed local fallback pass
+    (``after_local_pass``) never clears the latched remote cause.
     """
     if episode is None:
         if msg_present or error_kind != "transport_unavailable":
@@ -312,7 +318,9 @@ def transport_wait_step(
         sleep_sec,
         lambda: _owner_signal_pending(
             incoming_messages, drive_root, task_id, owner_msg_seen,
-            getattr(getattr(tools, "_ctx", None), "task_attempt", None),
+            # Same attempt key as the round-top drain (task_attempt or 1), so
+            # the peek never sees acks under a different namespace.
+            getattr(getattr(tools, "_ctx", None), "task_attempt", None) or 1,
         ),
     )
     episode.redials += 1
@@ -339,6 +347,46 @@ def last_assistant_text(messages: List[Dict[str, Any]]) -> str:
             if isinstance(content, str) and content.strip():
                 return content.strip()
     return ""
+
+
+def provider_terminal_fallback_text(
+    accumulated_usage: Dict[str, Any],
+    *,
+    is_context_overflow: bool,
+    is_transport_wait: bool,
+    waited: bool,
+    is_deadline_exhausted: bool,
+) -> str:
+    """Owner-facing terminal text when provider death left nothing to salvage.
+
+    ``waited`` is the episode's wait fact (iterations or redials happened): a
+    wait-ineligible direct/ephemeral turn fails fast and must not claim it
+    "waited and redialed until its own limits ran out".
+    """
+    if is_context_overflow:
+        return (
+            "⚠️ The context exceeded the selected model window; no further provider call was made. "
+            "Any files written so far are preserved in the workspace."
+        )
+    if is_transport_wait:
+        if waited:
+            return (
+                "⚠️ Could not establish a provider connection; the task waited and redialed "
+                "until its own limits ran out and was INTERRUPTED, not completed. Any files "
+                "written so far are preserved in the workspace. Retry when connectivity returns."
+            )
+        return (
+            "⚠️ Could not establish a provider connection; this interactive turn fails fast "
+            "— retry when connectivity returns. Any files written so far are preserved in "
+            "the workspace."
+        )
+    if is_deadline_exhausted:
+        return "⚠️ The owner deadline ended primary model work; any files written so far are preserved."
+    return (
+        "⚠️ The model provider returned no usable response after retries and same-model reroute."
+        f"{provider_failure_hint(accumulated_usage)}{provider_recovery_hint(accumulated_usage)} "
+        "Any files written so far are preserved in the workspace."
+    )
 
 
 def provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:

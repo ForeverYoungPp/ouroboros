@@ -54,8 +54,7 @@ from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event, f
 from ouroboros.loop_transport import (
     fallback_chain_allowed as _fallback_chain_allowed,
     last_assistant_text as _last_assistant_text,
-    provider_failure_hint as _provider_failure_hint,
-    provider_recovery_hint as _provider_recovery_hint,
+    provider_terminal_fallback_text as _provider_terminal_fallback_text,
     reconcile_transport_wait as _reconcile_transport_wait,
     task_deadline_epoch as _task_deadline_epoch,
     transport_wait_step as _transport_wait_step,
@@ -3316,13 +3315,14 @@ def _handle_owner_stop_finalization(
 
 def _handle_provider_unavailable(
     ctx: _RoundLimitContext, *, error_kind: str = "provider_unavailable",
-    wait_cause: str = "",
+    wait_cause: str = "", waited: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Salvage provider failure without an unsafe retry.
 
     ``wait_cause`` is the transport-wait episode's latched cause: it selects the
     deterministic no-resend terminal even when a later refusal (e.g. the
     deadline admission gate) overwrote the mutable ``_last_llm_error_kind``.
+    ``waited`` keeps the terminal text honest for zero-wait turns.
     """
     kind = str(error_kind or "")
     is_context_overflow = kind == "context_overflow"
@@ -3342,19 +3342,10 @@ def _handle_provider_unavailable(
     if salvaged:
         fallback = salvaged
     else:
-        fallback = (
-            "⚠️ The context exceeded the selected model window; no further provider call was made. "
-            "Any files written so far are preserved in the workspace."
-            if is_context_overflow else
-            "⚠️ Could not establish a provider connection; the task waited and redialed "
-            "until its own limits ran out and was INTERRUPTED, not completed. Any files "
-            "written so far are preserved in the workspace. Retry when connectivity returns."
-            if is_transport_wait else
-            "⚠️ The owner deadline ended primary model work; any files written so far are preserved."
-            if is_deadline_exhausted else
-            "⚠️ The model provider returned no usable response after retries and same-model reroute."
-            f"{_provider_failure_hint(ctx.accumulated_usage)}{_provider_recovery_hint(ctx.accumulated_usage)} "
-            "Any files written so far are preserved in the workspace."
+        fallback = _provider_terminal_fallback_text(
+            ctx.accumulated_usage, is_context_overflow=is_context_overflow,
+            is_transport_wait=is_transport_wait, waited=waited,
+            is_deadline_exhausted=is_deadline_exhausted,
         )
     if is_context_overflow:
         text, usage, llm_trace = _forced_fallback_result(
@@ -3368,18 +3359,20 @@ def _handle_provider_unavailable(
         )
         return text, usage, llm_trace
     if is_transport_wait:
-        # Deterministic waited-out-outage terminal: salvage, no forced-final
-        # provider call over a proven-dead egress (same no-resend shape as the
-        # provider_outcome_unknown branch below, explicit terminal stamp).
+        # No-resend terminal: salvage, no forced-final call over a dead egress.
+        # Stamp BEFORE the composer (_handle_owner_stop_finalization pattern):
+        # a SCHEDULED swarm-router handoff deliberately clears it and stays
+        # truthful; the guard mirrors the sibling no-resend branch below.
         live_trace = getattr(ctx, "llm_trace", None)
         llm_trace = live_trace if isinstance(live_trace, dict) else {}
+        ctx.accumulated_usage["execution_status"] = RESULT_INFRA_FAILED
+        ctx.accumulated_usage["reason_code"] = "provider_unavailable"
         text, usage, llm_trace = _forced_fallback_result(
             ctx, llm_trace, fallback, reason_code="provider_unavailable",
             source="transport_unavailable_no_resend",
         )
-        usage.update(
-            execution_status=RESULT_INFRA_FAILED, reason_code="provider_unavailable",
-        )
+        if str(usage.get("reason_code") or "") == "provider_unavailable":
+            usage["execution_status"] = RESULT_INFRA_FAILED
         return text, usage, llm_trace
     if str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown":
         live_trace = getattr(ctx, "llm_trace", None)
@@ -6896,6 +6889,7 @@ def run_llm_loop(
                 error_kind=last_error_kind, drive_logs=drive_logs, task_id=task_id,
                 model=active_model, emit_progress=emit_progress)
             if msg is None and _fallback_chain_allowed(ctx, last_error_kind, transport_wait):
+                _episode_before_chain = transport_wait is not None
                 (
                     msg,
                     active_model,
@@ -6909,11 +6903,15 @@ def run_llm_loop(
                     event_queue=event_queue, accumulated_usage=accumulated_usage, task_type=task_type,
                     emit_progress=emit_progress, context_fit_plan=context_fit_plan,
                     active_context_mode=active_context_mode)
-                if transport_wait is not None:
-                    transport_wait = _reconcile_transport_wait(
-                        transport_wait, ctx, msg_present=msg is not None,
-                        error_kind=last_error_kind, drive_logs=drive_logs, task_id=task_id,
-                        model=active_model, emit_progress=emit_progress, after_local_pass=True)
+                # Post-chain reconcile with the FRESH kind: a MID-chain outage
+                # latches an episode too, so no forced-final call dials a dead
+                # egress (rationale in reconcile_transport_wait's docstring).
+                transport_wait = _reconcile_transport_wait(
+                    transport_wait, ctx, msg_present=msg is not None,
+                    error_kind=str(accumulated_usage.get("_last_llm_error_kind") or ""),
+                    drive_logs=drive_logs, task_id=task_id,
+                    model=active_model, emit_progress=emit_progress,
+                    after_local_pass=_episode_before_chain)
             if msg is None and transport_wait is not None and _transport_wait_step(
                 transport_wait, tools=tools,
                 error_kind=str(accumulated_usage.get("_last_llm_error_kind") or ""),
@@ -6928,6 +6926,8 @@ def run_llm_loop(
                     limit_ctx,
                     error_kind=str(accumulated_usage.get("_last_llm_error_kind") or "provider_unavailable"),
                     wait_cause=transport_wait.wait_cause if transport_wait is not None else "",
+                    waited=transport_wait is not None and (
+                        transport_wait.wait_iterations > 0 or transport_wait.redials > 0),
                 )
                 _merge_finalization_trace(llm_trace, forced_trace)
                 return text, accumulated_usage, llm_trace
