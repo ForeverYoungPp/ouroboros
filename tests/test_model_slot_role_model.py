@@ -1046,8 +1046,10 @@ def test_an_explicit_harness_pin_is_a_typed_blocker_not_a_paid_reroute(tmp_path,
     assert "blocked" not in sub.SUBAGENT_EXECUTORS
 
 
-def test_configured_session_startup_fault_wakes_nanny_without_api_substitution(tmp_path, monkeypatch):
-    """A failed exact session start becomes nanny evidence, never host API fallback."""
+def test_blocked_configured_session_terminals_unrun_without_a_model_round(tmp_path, monkeypatch):
+    """Charter D2 (owner 2026-08-28, N2=A): a blocked configured session ends the
+    task UNRUN and typed at $0 — never a model episode, never host API fallback.
+    The dc4c0204 wake-the-nanny behavior this test used to pin is retired."""
     from ouroboros import agent as agent_module
     from ouroboros.agent import Env, OuroborosAgent
 
@@ -1074,9 +1076,7 @@ def test_configured_session_startup_fault_wakes_nanny_without_api_substitution(t
     agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
     agent._handle_task_scoped(dict(pinned))
 
-    assert len(calls) == 1, "the startup fault must wake the recursive nanny once"
-    rendered = json.dumps(calls[0]["messages"])
-    assert "configured_session_route_unavailable" in rendered
+    assert calls == [], "a blocked pin must terminal unrun with zero model rounds"
     from ouroboros import delegate_custody as custody
 
     custody_events = [
@@ -1100,6 +1100,7 @@ def test_configured_session_startup_fault_wakes_nanny_without_api_substitution(t
     assert record["configured_subagent"]["selected_subagent_id"] == "session-actor"
     assert record["capability_delta"]["reason"] == "configured_session_route_unavailable"
     assert float(record.get("cost_usd") or 0.0) == 0.0
+    assert "NOT run on metered API tokens" in str(record.get("result") or "")
 
 
 def test_legacy_heavy_migration_selects_an_exact_api_model(tmp_path, monkeypatch):
