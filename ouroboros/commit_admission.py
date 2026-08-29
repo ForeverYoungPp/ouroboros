@@ -197,7 +197,7 @@ def syntax_preflight_staged_py_files(
     return (
         "⚠️ PREFLIGHT_BLOCKED: syntax errors:\n"
         + "\n".join(f"- {err}" for err in errors)
-        + "\n\nFix the syntax error(s) above and re-run advisory_review. "
+        + "\n\nFix the syntax error(s) above and re-run preflight_review. "
         "The paid advisory episode was skipped to save budget."
     )
 

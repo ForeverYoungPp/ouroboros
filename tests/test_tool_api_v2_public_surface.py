@@ -1493,3 +1493,32 @@ def test_service_cwd_failure_emits_canonical_cwd_message(tmp_path, monkeypatch):
     assert "SHELL_CWD_BLOCKED" in result
     assert "SERVICE_CWD_ERROR" not in result
     assert "task_drive=" in result
+
+
+def test_preflight_review_rename_keeps_a_callable_unadvertised_alias(tmp_path):
+    """Q1 rename: `preflight_review` is the advertised organ; `advisory_review`
+    stays CALLABLE as a compat alias (saved prompts/memories/configs keep
+    working) but never appears on the public schema surface, and a contract
+    that withholds either spelling silences both."""
+    from ouroboros.safety import POLICY_SKIP, TOOL_POLICY
+    from ouroboros.contracts.task_contract import build_task_contract
+
+    registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    names = {schema["function"]["name"] for schema in registry.schemas()}
+    assert "preflight_review" in names
+    assert "advisory_review" not in names
+    assert "advisory_review" not in registry.available_tools()
+    # The alias dispatches to the same organ (a refusal about tool identity
+    # would start with "Unknown tool").
+    assert not registry.execute("advisory_review", {}).startswith("⚠️ Unknown tool")
+    # Policy rows exist for BOTH spellings (the alias call is policy-skipped
+    # exactly like the canonical one).
+    assert TOOL_POLICY.get("preflight_review") is POLICY_SKIP
+    assert TOOL_POLICY.get("advisory_review") is POLICY_SKIP
+    # disabled_tools compat: either spelling withholds both.
+    for withheld in ("advisory_review", "preflight_review"):
+        contract = build_task_contract({"description": "x", "disabled_tools": [withheld]})
+        reg = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+        reg._ctx.task_metadata = {"task_contract": contract}
+        listed = {schema["function"]["name"] for schema in reg.schemas()}
+        assert "preflight_review" not in listed

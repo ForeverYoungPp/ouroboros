@@ -982,7 +982,7 @@ def test_advisory_choice_guidance_is_shared_across_model_facing_schemas():
     advisory_tools = {tool.name: tool for tool in adv_mod.get_tools()}
     git_tools = {tool.name: tool for tool in git_mod.get_tools()}
 
-    advisory_tool = advisory_tools["advisory_review"]
+    advisory_tool = advisory_tools["preflight_review"]
     status_tool = advisory_tools["review_status"]
     commit_tool = git_tools["commit_reviewed"]
     alias_tool = git_tools["vcs_commit_reviewed"]

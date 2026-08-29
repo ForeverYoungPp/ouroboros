@@ -1677,7 +1677,7 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             parts.append(f"{len(open_debts)} commit-readiness debt item(s) surfaced by review_status")
         return (" ".join(parts) + ". ") if parts else ""
 
-    regroup = "After the first blocked review, stop patching one finding at a time: re-read the full diff, group obligations by root cause, rewrite the plan, finish all remaining edits, then run advisory_review(commit_message='...')."
+    regroup = "After the first blocked review, stop patching one finding at a time: re-read the full diff, group obligations by root cause, rewrite the plan, finish all remaining edits, then run preflight_review(commit_message='...')."
 
     def _with_choices(message: str) -> str:
         return f"{message.rstrip()} {ADVISORY_REVIEW_CHOICE_GUIDANCE}"
@@ -1687,10 +1687,10 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
         if latest and status in {"tests_preflight_blocked", "preflight_blocked"} and not stale_from_edit:
             if status == "tests_preflight_blocked":
                 problem = "test preflight: pytest failed before the Claude SDK call"
-                fix = "Fix the failing tests and re-run advisory_review. Use advisory_review(skip_tests=True) only for intentional WIP code."
+                fix = "Fix the failing tests and re-run preflight_review. Use preflight_review(skip_tests=True) only for intentional WIP code."
             else:
                 problem = "syntax preflight: a staged .py file has a SyntaxError"
-                fix = "See raw_result for file:line:msg, fix it, and re-run advisory_review."
+                fix = "See raw_result for file:line:msg, fix it, and re-run preflight_review."
             return _with_choices(
                 f"Last advisory run was blocked by {problem}. {fix} {_debt_hint()}".strip()
             )
@@ -1698,7 +1698,7 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             suffix = (
                 regroup + " Or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
                 if (open_obs or open_debts)
-                else "Re-run: advisory_review(commit_message='...'), or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
+                else "Re-run: preflight_review(commit_message='...'), or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
             )
             return _with_choices(
                 f"Last advisory run produced unparseable output (parse_failure). {_debt_hint()}{suffix}"
@@ -1708,20 +1708,20 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             return _with_choices(prefix + _debt_hint() + regroup)
         if stale_from_edit:
             return _with_choices(
-                f"Advisory was invalidated by a worktree edit at {stale_from_edit_ts}. Complete ALL remaining edits, then run: advisory_review(commit_message='...')"
+                f"Advisory was invalidated by a worktree edit at {stale_from_edit_ts}. Complete ALL remaining edits, then run: preflight_review(commit_message='...')"
             )
         if not state.advisory_runs:
-            return _with_choices("No advisory run yet. Run: advisory_review(commit_message='...')")
-        return _with_choices("Advisory is stale (snapshot changed). Run: advisory_review(commit_message='...')")
+            return _with_choices("No advisory run yet. Run: preflight_review(commit_message='...')")
+        return _with_choices("Advisory is stale (snapshot changed). Run: preflight_review(commit_message='...')")
 
     # Advisory is effectively fresh — check obligations and findings
     if open_obs or open_debts:
         if enforcement == "blocking":
             return _with_choices(
-                f"Advisory is current but unresolved review debt remains. {_debt_hint()}commit_reviewed will be blocked until that debt is cleared. Re-read the full diff, group obligations by root cause, and rewrite the plan. Fix the issues, re-run advisory_review so it marks them PASS, or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
+                f"Advisory is current but unresolved review debt remains. {_debt_hint()}commit_reviewed will be blocked until that debt is cleared. Re-read the full diff, group obligations by root cause, and rewrite the plan. Fix the issues, re-run preflight_review so it marks them PASS, or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
             )
         return _with_choices(
-            f"Advisory is current and unresolved review debt remains recorded durably. {_debt_hint()}Enforcement is advisory: you decide which findings to apply — commit_reviewed is available. Re-read the full diff, group obligations by root cause, and rewrite the plan; re-run advisory_review so addressed items are marked PASS."
+            f"Advisory is current and unresolved review debt remains recorded durably. {_debt_hint()}Enforcement is advisory: you decide which findings to apply — commit_reviewed is available. Re-read the full diff, group obligations by root cause, and rewrite the plan; re-run preflight_review so addressed items are marked PASS."
         )
 
     if latest and latest.status == "skipped":
@@ -1759,10 +1759,10 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             # can still block. The audited skip bypasses only the advisory
             # freshness/debt checks, never these findings.
             return _with_choices(
-                f"Advisory found {len(fresh_critical)} critical issue(s). This fresh advisory already satisfies the commit gate's advisory-freshness requirement; the findings are recorded durably on the advisory run record, and commit_reviewed is available — the blocking triad and scope reviews are the gate that can still block. Fix the critical findings and re-run advisory_review so they are marked PASS; skip_advisory_review=True (audited) bypasses only the freshness/debt checks, not these findings."
+                f"Advisory found {len(fresh_critical)} critical issue(s). This fresh advisory already satisfies the commit gate's advisory-freshness requirement; the findings are recorded durably on the advisory run record, and commit_reviewed is available — the blocking triad and scope reviews are the gate that can still block. Fix the critical findings and re-run preflight_review so they are marked PASS; skip_advisory_review=True (audited) bypasses only the freshness/debt checks, not these findings."
             )
         return _with_choices(
-            f"Advisory found {len(fresh_critical)} critical issue(s). Findings are recorded durably; enforcement is advisory — you decide which to apply, and commit_reviewed is available. Re-run advisory_review after fixes, or deliberately choose the audited advisory skip."
+            f"Advisory found {len(fresh_critical)} critical issue(s). Findings are recorded durably; enforcement is advisory — you decide which to apply, and commit_reviewed is available. Re-run preflight_review after fixes, or deliberately choose the audited advisory skip."
         )
     return "Advisory is fresh with no critical findings. Proceed with: commit_reviewed(commit_message='...'). ⚠️ Do NOT make any further edits — any edit will make advisory stale."
 
@@ -1907,7 +1907,7 @@ def _advisory_pre_sdk_gate(
         if test_err:
             msg = (
                 "⚠️ TESTS_PREFLIGHT_BLOCKED: Tests must pass before advisory review.\n"
-                "Fix the failures below, then re-run advisory_review.\n"
+                "Fix the failures below, then re-run preflight_review.\n"
                 "Use skip_tests=True if this is intentionally incomplete WIP code.\n\n"
                 f"{test_err}"
             )
@@ -2114,7 +2114,7 @@ def _handle_advisory_pre_review(
             "readiness_warnings": readiness_warnings,
             "message": (
                 "Advisory SDK was skipped: a staged .py file has a SyntaxError. "
-                "Fix the syntax error listed above and re-run advisory_review."
+                "Fix the syntax error listed above and re-run preflight_review."
             ),
         })
 
@@ -2186,7 +2186,7 @@ def _handle_advisory_pre_review(
             "session_id": advisory_session_id,
             "readiness_warnings": readiness_warnings,
             "message": (
-                "Advisory output could not be parsed. Re-run advisory_review, "
+                "Advisory output could not be parsed. Re-run preflight_review, "
                 "or use skip_advisory_review=True to bypass (will be audited)."
             ),
         })
@@ -2265,36 +2265,57 @@ def _handle_review_status(
 _schema_param = lambda param_type, description, **extra: {"type": param_type, "description": description, **extra}
 
 
+def _preflight_review_params() -> dict:
+    """The preflight_review tool's parameter schema (shared with its alias)."""
+    return {
+        "type": "object",
+        "properties": {
+            "commit_message": _schema_param("string", "Intended commit message. Used to bind the advisory run to this specific commit."),
+            "skip_advisory_review": _schema_param(
+                "boolean",
+                "Choose the audited advisory-only skip for this call. "
+                f"{ADVISORY_REVIEW_CHOICE_GUIDANCE} Default: False.",
+                default=False,
+            ),
+            "goal": _schema_param("string", "High-level goal of this change. Used to judge completeness."),
+            "scope": _schema_param("string", "Declared scope boundary. Issues outside scope are advisory-only."),
+            "paths": _schema_param("array", "Explicit list of changed file paths. Auto-detected from git status if omitted.", items={"type": "string"}),
+            "skip_tests": _schema_param("boolean", "Skip the preflight pytest run. Default: False (tests run by default). Use True only for intentionally incomplete WIP code where test failures are expected. Tests are run before the paid critic call — in a hermetic worktree, as the same two passes CI runs (parallel 'not serial' then serial) — to catch broken code early and avoid wasting review budget.", default=False),
+        },
+        "required": ["commit_message"],
+    }
+
+
 def get_tools() -> list:
     return [
         ToolEntry(
-            name="advisory_review",
+            name="preflight_review",
             timeout_sec=1200,
             schema={
-                "name": "advisory_review",
+                "name": "preflight_review",
                 "description": (
-                    "Run an advisory pre-commit review through the configured read-only route. "
+                    "Run the preflight pre-commit review (formerly `advisory_review`) "
+                    "through the configured read-only route. "
                     "Returns structured JSON findings; any edit afterward makes the result stale. "
                     f"{ADVISORY_REVIEW_CHOICE_GUIDANCE} "
                     f"{_identical_diff_cap_note()}"
                 ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "commit_message": _schema_param("string", "Intended commit message. Used to bind the advisory run to this specific commit."),
-                        "skip_advisory_review": _schema_param(
-                            "boolean",
-                            "Choose the audited advisory-only skip for this call. "
-                            f"{ADVISORY_REVIEW_CHOICE_GUIDANCE} Default: False.",
-                            default=False,
-                        ),
-                        "goal": _schema_param("string", "High-level goal of this change. Used to judge completeness."),
-                        "scope": _schema_param("string", "Declared scope boundary. Issues outside scope are advisory-only."),
-                        "paths": _schema_param("array", "Explicit list of changed file paths. Auto-detected from git status if omitted.", items={"type": "string"}),
-                        "skip_tests": _schema_param("boolean", "Skip the pre-advisory pytest run. Default: False (tests run by default). Use True only for intentionally incomplete WIP code where test failures are expected. Tests are run before the SDK call — in a hermetic worktree, as the same two passes CI runs (parallel 'not serial' then serial) — to catch broken code early and avoid wasting advisory budget.", default=False),
-                    },
-                    "required": ["commit_message"],
-                },
+                "parameters": _preflight_review_params(),
+            },
+            handler=_handle_advisory_pre_review,
+        ),
+        # Q1 rename compatibility: the organ's old public name stays CALLABLE
+        # (saved prompts/memories/configs keep working) but is never
+        # advertised — schemas()/available_tools() skip alias entries. Same
+        # parameters as the canonical entry so old calls keep their args.
+        ToolEntry(
+            name="advisory_review",
+            timeout_sec=1200,
+            alias_for="preflight_review",
+            schema={
+                "name": "advisory_review",
+                "description": "Compatibility alias for `preflight_review`.",
+                "parameters": _preflight_review_params(),
             },
             handler=_handle_advisory_pre_review,
         ),

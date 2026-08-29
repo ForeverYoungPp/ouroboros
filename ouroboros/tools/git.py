@@ -2096,7 +2096,7 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
         result = (
             f"✅ Written {len(written)} file(s): {summary}\n"
             "Files are on disk but NOT committed. Run commit_reviewed when ready.\n"
-            "⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
+            "⚠️ Advisory pre-review is now stale — run preflight_review before commit_reviewed."
         )
     result += f"\nResolved root: {binding_items[0].base_path}"
     if syntax_bypass_notes:
@@ -2293,7 +2293,7 @@ def _str_replace_editor(
     if data_skill_target is None and ctx.is_workspace_mode() and not system_target:
         result += "\nDo not commit; the headless runner will emit a patch artifact."
     elif data_skill_target is None:
-        result += "\nRun commit_reviewed when ready.\n⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
+        result += "\nRun commit_reviewed when ready.\n⚠️ Advisory pre-review is now stale — run preflight_review before commit_reviewed."
     else:
         result += "\nRun skill_review for this skill before enabling or declaring it ready."
     if system_target and pathlib.PurePosixPath(rel_path).parts[:1] == ("skills",):

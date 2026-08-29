@@ -1686,7 +1686,7 @@ def format_status_section(state: AdvisoryReviewState, repo_dir: Optional[pathlib
         lines.append(f"\n⚠️ Advisory marked stale after worktree edit at {state.last_stale_from_edit_ts}.")  # full ts — no [:16]
         if state.last_stale_reason:
             lines.append(f"   Reason: {state.last_stale_reason}")
-        lines.append("   Run advisory_review again before commit_reviewed.")
+        lines.append("   Run preflight_review again before commit_reviewed.")
 
     if open_debts:
         lines.append(f"\n### Commit-readiness debt ({len(open_debts)})")

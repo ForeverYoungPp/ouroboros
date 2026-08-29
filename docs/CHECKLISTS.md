@@ -14,7 +14,7 @@ When a new reviewable concern appears, add it here — not in prompts or docs.
 
 ```
 1. Finish ALL edits first (`edit_text` / `edit_batch` / `apply_patch` / `write_file`)
-2. advisory_review(commit_message="...")       ← run AFTER all edits, ONCE
+2. preflight_review(commit_message="...")      ← run AFTER all edits, ONCE
 3. commit_reviewed(commit_message="...")       ← run IMMEDIATELY after advisory
 ```
 
@@ -75,7 +75,7 @@ When a new reviewable concern appears, add it here — not in prompts or docs.
   Multiple obligations describing the same root cause (from reviewer rephrasing across attempts) are
   expected — address them together and explain this in `review_rebuttal`.
 - **Note:** conservative false-stale is acceptable. If you are unsure whether a mutating path
-  changed the relevant repo snapshot, re-run `advisory_review` explicitly.
+  changed the relevant repo snapshot, re-run `preflight_review` explicitly.
 
 ---
 
