@@ -1405,11 +1405,20 @@ class ReviewCoordinator:
             actor_attempts = 2 if (p3_actor or acceptance_actor) else 1
             # Acceptance and P3 share one two-send rail: transport/empty retry
             # or same-route format repair. The prompt, slot and model stay fixed.
-            attempt_rail = (
-                physical_attempt_limit(2)
-                if acceptance_actor or p3_actor
-                else contextlib.nullcontext()
-            )
+            # A native tool-round slot is ONE logical episode of many bounded
+            # physical sends: its rail is the episode's own config-owned send
+            # cap (the second actor attempt repairs format locally, spending no
+            # send), never the two-send packet rail that would kill round 3.
+            if bool(getattr(slot, "native_retrieval", False)) and (
+                acceptance_actor or p3_actor
+            ):
+                from ouroboros.review_execution import native_episode_physical_send_cap
+
+                attempt_rail = physical_attempt_limit(native_episode_physical_send_cap())
+            elif acceptance_actor or p3_actor:
+                attempt_rail = physical_attempt_limit(2)
+            else:
+                attempt_rail = contextlib.nullcontext()
             with attempt_rail:
                 _prior_msg, _prior_usage, _prior_text = None, None, ""
                 _last_msg, _last_usage, _last_text, _has_prior = None, None, "", False

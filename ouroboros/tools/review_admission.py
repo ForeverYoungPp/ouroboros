@@ -196,10 +196,16 @@ def drop_api_rows(row_plan: dict) -> dict:
     from ouroboros.review_execution import ReviewRouteKind
 
     routes = list(row_plan.get("routes") or [])
-    keep = [i for i, r in enumerate(routes) if r is not ReviewRouteKind.API_CHAT]
+    actors = list(row_plan.get("subagent_ids") or [])
+    # The RETRIEVES class survives the drop: a configured-subagent api row never
+    # received the oversized packet, so packet overflow is not its failure.
+    keep = [
+        i for i, r in enumerate(routes)
+        if r is not ReviewRouteKind.API_CHAT or (i < len(actors) and actors[i])
+    ]
     filtered = dict(row_plan)
     for key in ("models", "routes", "efforts", "session_targets",
-                "session_profiles", "slot_ids"):
+                "session_profiles", "slot_ids", "subagent_ids"):
         rows = list(row_plan.get(key) or [])
         filtered[key] = [rows[i] for i in keep if i < len(rows)]
     return filtered
@@ -219,6 +225,7 @@ def prepare_scope_review(
     slot_effort: str = "",
     session_target: str = "",
     session_profile: str = "",
+    subagent_id: str = "",
 ) -> Tuple[Optional[dict], Optional[Any]]:
     """Assemble ONE scope row's packet without dispatching anything.
 
@@ -242,13 +249,16 @@ def prepare_scope_review(
         )
     scope_model_id = scope_model or sr._get_scope_model()
     delegated = str(getattr(route, "value", route) or "") == "agent_session"
+    # RETRIEVES class: a session row and a configured-subagent api row deliver
+    # by retrieval — neither assembles the packet/atlas below.
+    retrieves = delegated or bool(subagent_id)
 
     from ouroboros.tools.review_binary_context import StagedDiffUnavailable
     from ouroboros.tools.review_subject import managed_review_subject
 
     try:
         subject = managed_review_subject(ctx, repo_dir)
-        if delegated:
+        if retrieves:
             # Session delivery (5.2): same task/checklist/contract, no assembled
             # pack — the session retrieves with its own tools in the repo root.
             # For a managed resolution the authoritative delta is inlined.
@@ -337,6 +347,7 @@ def prepare_scope_review(
         "slot_effort": slot_effort,
         "session_target": session_target,
         "session_profile": session_profile,
+        "subagent_id": subagent_id,
         "context_manifest": sr._current_scope_context_manifest(),
         "stable_prefix_len": int(sr._SCOPE_STABLE_PREFIX_LEN.get() or 0),
     }, None

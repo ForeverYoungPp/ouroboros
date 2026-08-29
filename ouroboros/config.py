@@ -205,6 +205,12 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_ONBOARDING_COMPLETED_AT": "",
     # Pre-commit review enforcement: advisory | blocking
     "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
+    # Native tool-round reviewer episodes (configured-subagent api rows): the
+    # bounded inspection loop's hard caps. One episode = ONE logical review
+    # attempt made of at most MAX_ROUNDS provider calls; the transcript bound
+    # fails CLOSED (typed refusal, never mid-episode compaction/resume).
+    "OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS": "16",
+    "OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS": "400000",
     # Auto-grant reviewed-skill requests by default; grants stay bound to the
     # reviewed content hash and editing a skill still invalidates them.
     "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS": "true",
@@ -647,6 +653,27 @@ def get_review_enforcement() -> str:
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_ENFORCEMENT"])
     raw = (os.environ.get("OUROBOROS_REVIEW_ENFORCEMENT", default_val) or default_val).strip().lower()
     return raw if raw in {"advisory", "blocking"} else default_val
+
+
+def _bounded_int_setting(key: str, *, floor: int, ceiling: int) -> int:
+    default_val = int(str(SETTINGS_DEFAULTS[key]))
+    try:
+        raw = int(str(os.environ.get(key, "") or default_val))
+    except (TypeError, ValueError):
+        raw = default_val
+    return max(floor, min(raw, ceiling))
+
+
+def review_native_max_rounds() -> int:
+    """Provider-call cap of one native tool-round reviewer episode (fail closed)."""
+    return _bounded_int_setting("OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS", floor=2, ceiling=64)
+
+
+def review_native_max_transcript_chars() -> int:
+    """Episode transcript bound; exceeding it is a typed refusal, never compaction."""
+    return _bounded_int_setting(
+        "OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS", floor=50_000, ceiling=2_000_000,
+    )
 
 
 def get_scope_review_models() -> list[str]:
