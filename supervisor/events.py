@@ -38,6 +38,12 @@ from ouroboros.subagent_messages import subagent_message_meta
 from ouroboros.task_finalization import send_provider_death_notice
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
 from supervisor.cognitive_operations import EVENT_HANDLERS as _CEH, _handle_cognitive_operation  # noqa: F401
+from supervisor.log_addressing import (  # re-export: one events surface
+    address_ctx_event as _address_ctx,
+    address_task_event as _address_task_event,  # noqa: F401  (tests pin it here)
+    bound_project_chat_id as _bound_project_chat_id,
+    make_server_log_sink,  # noqa: F401  (server.py installs it)
+)
 from ouroboros.tools.control_delegation import (
     admitted_depth_cap,
     check_delegation_admission,
@@ -194,21 +200,6 @@ def _publish_routing_ack(
             )
     except Exception:
         log.debug("Routing typed ack failed", exc_info=True)
-
-
-def _bound_project_chat_id(ctx: Any, task_id: Any, parent_task_id: Any = "", root_task_id: Any = "") -> int:
-    """Resolve project chat for a task by LINEAGE (own binding -> parent -> root), so a
-    subagent of a project task routes to the project thread, not the main chat — only
-    the root is bound (post-hoc via UI or ensure_project_scope), children inherit."""
-    tid = str(task_id or "").strip()
-    if not tid:
-        return 0
-    try:
-        from ouroboros.projects_registry import project_chat_for_task_tree
-
-        return int(project_chat_for_task_tree(ctx.DRIVE_ROOT, tid, parent_task_id, root_task_id) or 0)
-    except Exception:
-        return 0
 
 
 def _is_active_subagent_task(task: Dict[str, Any], root_task_id: str) -> bool:
@@ -667,39 +658,46 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
     # provider side and never appears in tools.jsonl.
     web_search_sources = usage.get("web_search_sources")
 
+    usage_event = {
+        "ts": evt.get("ts", utc_now_iso()),
+        "type": "llm_usage",
+        "task_id": evt.get("task_id", ""),
+        "root_task_id": evt.get("root_task_id", ""),
+        "parent_task_id": evt.get("parent_task_id", ""),
+        "delegation_role": evt.get("delegation_role", ""),
+        "task_group_id": evt.get("task_group_id", ""),
+        "requested_model_lane": evt.get("requested_model_lane", evt.get("model_lane", "")),
+        "effective_model_lane": evt.get("effective_model_lane", ""),
+        "category": evt.get("category", "other"),
+        "model": evt.get("model", ""),
+        "api_key_type": evt.get("api_key_type", ""),
+        "model_category": evt.get("model_category", "other"),
+        "provider": evt.get("provider", ""),
+        "source": evt.get("source", ""),
+        "cost_estimated": bool(evt.get("cost_estimated", False)),
+        "cost": resolved_cost,
+        "cost_known": cost_known,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cached_tokens": cached_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "prompt_cache_ttl": prompt_cache_ttl,
+        "accounting_authority": "physical_attempt_ledger",
+        "projection_update_status": projection_update_status,
+        "ledger_attempt_ids": ledger_attempt_ids,
+        **({"chat_id": evt["chat_id"]} if evt.get("chat_id") is not None else {}),
+        **({"web_search_sources": web_search_sources} if isinstance(web_search_sources, list) and web_search_sources else {}),
+    }
+    _address_ctx(ctx, usage_event)
     try:
-        append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", {
-            "ts": evt.get("ts", utc_now_iso()),
-            "type": "llm_usage",
-            "task_id": evt.get("task_id", ""),
-            "root_task_id": evt.get("root_task_id", ""),
-            "parent_task_id": evt.get("parent_task_id", ""),
-            "delegation_role": evt.get("delegation_role", ""),
-            "task_group_id": evt.get("task_group_id", ""),
-            "requested_model_lane": evt.get("requested_model_lane", evt.get("model_lane", "")),
-            "effective_model_lane": evt.get("effective_model_lane", ""),
-            "category": evt.get("category", "other"),
-            "model": evt.get("model", ""),
-            "api_key_type": evt.get("api_key_type", ""),
-            "model_category": evt.get("model_category", "other"),
-            "provider": evt.get("provider", ""),
-            "source": evt.get("source", ""),
-            "cost_estimated": bool(evt.get("cost_estimated", False)),
-            "cost": resolved_cost,
-            "cost_known": cost_known,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "cached_tokens": cached_tokens,
-            "cache_write_tokens": cache_write_tokens,
-            "prompt_cache_ttl": prompt_cache_ttl,
-            "accounting_authority": "physical_attempt_ledger",
-            "projection_update_status": projection_update_status,
-            "ledger_attempt_ids": ledger_attempt_ids,
-            **({"web_search_sources": web_search_sources} if isinstance(web_search_sources, list) and web_search_sources else {}),
-        })
+        append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", usage_event)
     except Exception:
         log.warning("Failed to log llm_usage event to events.jsonl", exc_info=True)
-        pass
+    # ONE live frame (sink copy suppressed).
+    try:
+        ctx.bridge.push_log(usage_event)
+    except Exception:
+        log.debug("Failed to forward llm_usage to live logs", exc_info=True)
 
 
 def _set_root_budget_pause_locked(root_task_id: str, pause: Dict[str, Any]) -> Dict[str, Any]:
@@ -787,6 +785,7 @@ def _handle_budget_pause(evt: Dict[str, Any], ctx: Any) -> None:
         "toast_once": f"{task_id}:budget-paused:{pause.get('scope') or 'global'}",
         **pause,
     }
+    _address_task_event({task_id: meta} if isinstance(meta, dict) else None, ctx.DRIVE_ROOT, event)
     append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", event)
     ctx.persist_queue_snapshot(reason="budget_pause_before_dispatch")
     try:
@@ -816,6 +815,7 @@ def _handle_budget_root_fence(evt: Dict[str, Any], ctx: Any) -> None:
         "toast_once": f"{root_task_id}:budget-paused:root",
         **fence,
     }
+    _address_ctx(ctx, event)
     append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", event)
     try:
         ctx.bridge.push_log(event)
@@ -1905,7 +1905,10 @@ def _resolve_lifecycle_fault(
         "task_id": task_id,
         "task_type": task_type,
         "chat_id": int(
-            evt.get("chat_id") or task_row.get("chat_id") or stored.get("chat_id") or 0
+            _bound_project_chat_id(
+                ctx, task_id, task_row.get("parent_task_id"), task_row.get("root_task_id")
+            )
+            or evt.get("chat_id") or task_row.get("chat_id") or stored.get("chat_id") or 0
         ),
         "status": status,
         "reason_code": str(stored.get("reason_code") or "task_done_lifecycle_fault"),
@@ -2253,6 +2256,9 @@ def _handle_task_metrics(evt: Dict[str, Any], ctx: Any) -> None:
     }
     if bool(evt.get("ephemeral_decision")):
         payload["ephemeral_decision"] = True
+    if evt.get("chat_id") is not None:
+        payload["chat_id"] = evt["chat_id"]
+    _address_ctx(ctx, payload)
     ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl", payload)
     try:
         ctx.bridge.push_log(payload)
@@ -4202,11 +4208,7 @@ def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
         "ts": data.get("ts", utc_now_iso()),
         **data,
     }
-    bound_chat = _bound_project_chat_id(
-        ctx, payload.get("task_id"), payload.get("parent_task_id"), payload.get("root_task_id")
-    )
-    if bound_chat:
-        payload["chat_id"] = bound_chat
+    _address_ctx(ctx, payload)
     try:
         ctx.bridge.push_log(payload)
     except Exception:
@@ -4221,6 +4223,7 @@ def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
 def _handle_skill_lifecycle(evt: Dict[str, Any], ctx: Any) -> None:
     payload = dict(evt)
     payload.setdefault("ts", utc_now_iso())
+    _address_ctx(ctx, payload)
     try:
         ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", payload)
     except Exception:

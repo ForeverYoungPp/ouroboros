@@ -1279,6 +1279,9 @@ def _broadcast_task_named(msg: dict) -> None:
         log.debug("task_named broadcast failed", exc_info=True)
 
 
+from supervisor.log_addressing import TurnEventQueue as _TurnEventQueue  # noqa: E402
+
+
 def _run_chat_task(
     agent: Any,
     chat_id: int,
@@ -1303,16 +1306,16 @@ def _run_chat_task(
         if not client_msg_id:
             client_msg_id = str(task_metadata.get("client_message_id") or "")
     kind = "ephemeral_decision" if ephemeral else "direct_chat"
+    task: Dict[str, Any] = {
+        "id": uuid.uuid4().hex[:8],
+        "type": "task",
+        "chat_id": chat_id,
+        "text": text,
+        "_is_direct_chat": True,
+    }
     try:
         from ouroboros.contracts.task_contract import attach_task_contract
 
-        task = {
-            "id": uuid.uuid4().hex[:8],
-            "type": "task",
-            "chat_id": chat_id,
-            "text": text,
-            "_is_direct_chat": True,
-        }
         if ephemeral:
             task["_ephemeral_turn"] = True
         if task_constraint:
@@ -1442,9 +1445,19 @@ def _run_chat_task(
                 )
             except Exception:
                 log.debug("Direct-turn start typing announce failed", exc_info=True)
-            events = agent.handle_task(task)
+            # The turn's live emits (loop_llm_call and friends publish
+            # straight to the agent's event queue DURING handle_task) and its
+            # returned events are both drained after the registry entry is
+            # gone: route them through the turn-scoped addressing proxy.
+            turn_queue = _TurnEventQueue(get_event_q(), task["id"], chat_id)
+            prev_queue = getattr(agent, "_event_queue", None)
+            agent._event_queue = turn_queue
+            try:
+                events = agent.handle_task(task)
+            finally:
+                agent._event_queue = prev_queue
             for e in events:
-                get_event_q().put(e)
+                get_event_q().put(turn_queue.stamp(e))
     except Exception as e:
         import traceback
         err_msg = f"⚠️ Error: {type(e).__name__}: {e}"
@@ -1453,6 +1466,8 @@ def _run_chat_task(
             {
                 "ts": utc_now_iso(),
                 "type": "direct_chat_error",
+                "task_id": str(task.get("id") or ""),
+                "chat_id": int(chat_id or 0),
                 "error": repr(e),
                 "traceback": str(traceback.format_exc())[:2000],
             },
@@ -1619,8 +1634,27 @@ def auto_resume_after_restart() -> None:
 # live via a dedicated EVENT_Q sibling/handler, so forwarding the worker's
 # append_jsonl copy too would double-broadcast (and task_checkpoint would also be
 # re-persisted to events.jsonl by _handle_log_event, a double file write).
+# The second group publishes the SAME type twice at the producer (a durable
+# append plus an emit_log_event live sibling of the identical type): the live
+# copy is kept and the forwarded append copy is dropped.
 WORKER_LOG_SINK_SUPPRESSED_TYPES = frozenset({
     "tool_call", "llm_round", "task_checkpoint", "task_done", "llm_usage",
+    "provider_incomplete_response", "llm_empty_response", "provider_body_error",
+    "review_cycles_exhausted", "plan_review_advisory_open",
+})
+
+# The server process runs the same suppression discipline over its raw
+# append_jsonl->sink broadcasts (server.py installs the wrapper): every type
+# here has a dedicated ctx.bridge.push_log at its supervisor handler, so the
+# sink copy would be the second delivery of the same event. This is the
+# exactly-once contract test_log_forwarding pins with the production sink
+# installed. The set is a superset of the worker list because the direct-chat
+# agent and Background Consciousness run inside the server process and append
+# the same worker-shaped rows there.
+SERVER_LOG_SINK_SUPPRESSED_TYPES = WORKER_LOG_SINK_SUPPRESSED_TYPES | frozenset({
+    "budget_scope_paused", "task_metrics_event", "review_late_result",
+    "task_cost_finalized", "skill_exec_finished", "skill_exec_failed",
+    "task_cancel_cascade_noop", "task_cancel_cascade_error",
 })
 
 
@@ -1702,10 +1736,9 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     # The WS log sink lives only in the main process, so without this every
     # worker-task log line (queued/evolution/review/subagent) is written to file
     # but never broadcast live — the "not all logs arrive" gap. Forward over the
-    # existing EVENT_Q -> _handle_log_event -> push_log path. Suppress types that
-    # already arrive live via a dedicated sibling event (tool_call/llm_round/
-    # task_checkpoint) or are appended in the main process (task_done/llm_usage)
-    # to avoid double broadcast and (for task_checkpoint) a double file write.
+    # existing EVENT_Q -> _handle_log_event -> push_log path, suppressing
+    # WORKER_LOG_SINK_SUPPRESSED_TYPES (see the constant's comment for the
+    # exactly-once rationale per group).
     try:
         from ouroboros.utils import emit_log_event, set_log_sink
 

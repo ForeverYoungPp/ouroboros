@@ -2031,7 +2031,9 @@ def _run_supervisor(settings: dict) -> None:
         bridge._broadcast_fn = broadcast_ws_sync
 
         from ouroboros.utils import set_log_sink
-        set_log_sink(bridge.push_log)
+        from supervisor.events import make_server_log_sink
+
+        set_log_sink(make_server_log_sink(bridge, pathlib.Path(DATA_DIR)))
 
         bus_init(
             drive_root=DATA_DIR,
