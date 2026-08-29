@@ -420,21 +420,35 @@ def test_owner_restart_cleans_flags_when_worker_shutdown_fails(tmp_path, monkeyp
     assert "⚠️ Restart cancelled: failed to stop workers." in messages
 
 
-def test_ws_reloads_when_sha_unknown_after_reconnect():
-    """ws.js must reload the page when _lastSha is null after reconnect (PyWebView loses JS state).
+def test_ws_sha_reload_decision_is_single_sourced():
+    """Both the post-open refresh and the recovery probe must route through the
+    one exported SHA decision helper (keep / reload_changed / reload_unknown).
 
-    Previously the guard was: `previouslyConnected && this._lastSha && d.sha && d.sha !== this._lastSha`
-    which silently skipped the reload when _lastSha was null.
-    Now: any reconnect with previouslyConnected=true where SHA is unknown or changed triggers reload.
+    The behavioral contract — same/changed/missing/empty/malformed SHA, the
+    first-ever connection, the probe-vs-open race bail, the healthy-probe fuse,
+    and outbound-queue survival — is executable in
+    web/tests/ws_recovery.test.js (node --test). These are wiring pins only.
     """
     source = _read("web/modules/ws.js")
-    # New guard: reload if lastSha unknown OR sha changed
-    assert "!this._lastSha || this._lastSha !== newSha" in source, (
-        "_refreshStateAfterOpen must reload when _lastSha is null or SHA changed"
+    assert "export function decide(" in source
+    assert "RECOVERY_HEALTHY_PROBE_LIMIT = 4" in source
+    recovery_body = source.split("_scheduleUiRecovery(reason, delay = 15000) {", 1)[1].split(
+        "_startWatchdog(socket) {", 1
+    )[0]
+    assert "_applyShaDecision(" in recovery_body, (
+        "the recovery probe must consult the shared SHA decision"
     )
-    # Must still be guarded by previouslyConnected to avoid spurious reload on first connect
-    assert "previouslyConnected && newSha" in source, (
-        "Reload must only fire when previouslyConnected=true and server returns a non-empty SHA"
+    refresh_body = source.split("_refreshStateAfterOpen(previouslyConnected) {", 1)[1].split(
+        "_flushPendingMessages() {", 1
+    )[0]
+    assert "_applyShaDecision(" in refresh_body, (
+        "the post-open refresh must consult the shared SHA decision"
+    )
+    apply_body = source.split("_applyShaDecision(servedSha, previouslyConnected) {", 1)[1].split(
+        "_reloadForShaDecision(decision) {", 1
+    )[0]
+    assert "decide(this._lastSha, servedSha, previouslyConnected)" in apply_body, (
+        "the shared applier must delegate to the exported SSOT decide()"
     )
 
 

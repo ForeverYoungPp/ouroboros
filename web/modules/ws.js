@@ -1,6 +1,35 @@
 import { apiFetch } from './api_client.js';
 /** WebSocket manager; connect after modules register listeners. */
 
+// Consecutive healthy /api/state probes tolerated while the socket stays down
+// before recovery forces a reload (at most one per disconnect episode) — the
+// fuse for a browser runtime whose WebSocket stack froze.
+export const RECOVERY_HEALTHY_PROBE_LIMIT = 4;
+
+/**
+ * SSOT for the served-SHA reload decision, shared by the post-open state
+ * refresh and the socket-down recovery probe.
+ *
+ * A client that never connected has nothing to reconcile: keep the page (the
+ * caller remembers the served SHA). After a connection existed, an equal SHA
+ * keeps the page; a different SHA means the server now serves other assets
+ * (reload); a missing, empty, or malformed SHA on either side means the page
+ * can no longer be proven current (reload).
+ *
+ * @param {*} prevSha last remembered served SHA (may be null/empty)
+ * @param {*} servedSha SHA reported by /api/state (may be absent/malformed)
+ * @param {boolean} previouslyConnected whether this client ever had an open socket
+ * @returns {'keep'|'reload_changed'|'reload_unknown'}
+ */
+export function decide(prevSha, servedSha, previouslyConnected) {
+    const served = typeof servedSha === 'string' ? servedSha.trim() : '';
+    if (!previouslyConnected) return 'keep';
+    if (!served) return 'reload_unknown';
+    const prev = typeof prevSha === 'string' ? prevSha.trim() : '';
+    if (!prev) return 'reload_unknown';
+    return prev === served ? 'keep' : 'reload_changed';
+}
+
 export class WS {
     constructor(url) {
         this.url = url;
@@ -14,6 +43,8 @@ export class WS {
         this._reconnectTimer = null;
         this._uiRecoveryTimer = null;
         this._watchdogTimer = null;
+        this._recoveryHealthyProbes = 0;
+        this._recoveryReloadFired = false;
         this._pendingMessages = [];
         this._nextClientMessageId = 1;
     }
@@ -54,20 +85,61 @@ export class WS {
         window.location.replace(this._freshWindowUrl(reason));
     }
 
+    _applyShaDecision(servedSha, previouslyConnected) {
+        const decision = decide(this._lastSha, servedSha, previouslyConnected);
+        if (decision === 'keep' && typeof servedSha === 'string' && servedSha.trim()) {
+            this._lastSha = servedSha.trim();
+        }
+        return decision;
+    }
+
+    _reloadForShaDecision(decision) {
+        // Reload on SHA change so PyWebView picks up new JS/CSS after restart;
+        // an unproveable SHA after a reconnect is treated the same way.
+        this._refreshWindow(decision === 'reload_changed' ? 'sha-change' : 'sha-unknown');
+    }
+
     _scheduleUiRecovery(reason, delay = 15000) {
         if (this._uiRecoveryTimer) return;
         this._uiRecoveryTimer = setTimeout(async () => {
             this._uiRecoveryTimer = null;
+            let healthy = false;
+            let servedSha;
             try {
                 const resp = await apiFetch('/api/state', { cache: 'no-store' });
                 if (resp.ok) {
+                    healthy = true;
+                    try {
+                        const body = await resp.json();
+                        servedSha = body ? body.sha : undefined;
+                    } catch {}
+                }
+            } catch {}
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                // The reconnect won the race while the probe was in flight;
+                // the post-open refresh owns the SHA decision now.
+                return;
+            }
+            if (healthy) {
+                const decision = this._applyShaDecision(servedSha, this._wasConnected);
+                if (decision !== 'keep') {
+                    this._reloadForShaDecision(decision);
+                    return;
+                }
+                this._recoveryHealthyProbes += 1;
+                if (this._recoveryHealthyProbes >= RECOVERY_HEALTHY_PROBE_LIMIT
+                        && !this._recoveryReloadFired) {
+                    // The server is reachable and serves the same page, yet the
+                    // socket never reopens: force one reload per disconnect
+                    // episode instead of reconnecting in place forever.
+                    this._recoveryReloadFired = true;
                     this._refreshWindow(reason);
                     return;
                 }
-            } catch {}
-            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-                this._scheduleUiRecovery(reason, Math.min(Math.round(delay * 1.5), 30000));
+            } else {
+                this._recoveryHealthyProbes = 0;
             }
+            this._scheduleUiRecovery(reason, Math.min(Math.round(delay * 1.5), 30000));
         }, delay);
     }
 
@@ -94,16 +166,14 @@ export class WS {
     }
 
     _refreshStateAfterOpen(previouslyConnected) {
-        apiFetch('/api/state', { cache: 'no-store' }).then(r => r.json()).then(d => {
-            const newSha = d.sha || '';
-            if (previouslyConnected && newSha) {
-                if (!this._lastSha || this._lastSha !== newSha) {
-                    // Reload on SHA change so PyWebView picks up new JS/CSS after restart.
-                    this._refreshWindow('sha-change');
-                    return;
-                }
-            }
-            this._lastSha = newSha || this._lastSha;
+        apiFetch('/api/state', { cache: 'no-store' }).then(async (resp) => {
+            if (!resp.ok) return;
+            let servedSha;
+            try {
+                servedSha = (await resp.json())?.sha;
+            } catch {}
+            const decision = this._applyShaDecision(servedSha, previouslyConnected);
+            if (decision !== 'keep') this._reloadForShaDecision(decision);
         }).catch(() => {});
     }
 
@@ -153,6 +223,8 @@ export class WS {
             this._lastMessageAt = Date.now();
             this._clearReconnectTimer();
             this._clearUiRecoveryTimer();
+            this._recoveryHealthyProbes = 0;
+            this._recoveryReloadFired = false;
             this.reconnectDelay = 1000;
             this._startWatchdog(socket);
             // perf2 P4 [Gemini#3]: the CLIENT owns reconnect truth. A chat
