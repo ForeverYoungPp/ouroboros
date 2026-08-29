@@ -1016,7 +1016,9 @@ def test_advisory_choice_guidance_is_shared_across_model_facing_schemas():
 
 
 def test_advisory_auto_bypass_on_missing_key(tmp_path, monkeypatch):
-    """advisory_pre_review must auto-bypass with audit when ANTHROPIC_API_KEY is absent."""
+    """advisory_pre_review auto-bypasses with audit when the advisory model's
+    provider credentials are absent (the retired ANTHROPIC_API_KEY probe's
+    successor: availability follows the routed model)."""
     import json
     import subprocess
     adv_mod = _get_advisory_module()
@@ -1031,7 +1033,9 @@ def test_advisory_auto_bypass_on_missing_key(tmp_path, monkeypatch):
 
     monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
     monkeypatch.delenv(adv_mod.ADVISORY_REVIEW_ROUTE_ENV, raising=False)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    for _key in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                 "MINIMAX_API_KEY", "GIGACHAT_AUTH_KEY", "CLOUD_RU_API_KEY"):
+        monkeypatch.delenv(_key, raising=False)
     progress_calls = []
 
     class FakeCtx:
@@ -1048,7 +1052,7 @@ def test_advisory_auto_bypass_on_missing_key(tmp_path, monkeypatch):
 
     # Must be bypassed, not errored
     assert result["status"] == "bypassed"
-    assert "ANTHROPIC_API_KEY" in result["bypass_reason"]
+    assert "no provider credentials" in result["bypass_reason"]
 
     # Must create a fresh advisory state (bypassed counts as fresh for gate)
     state = rs_mod.load_state(drive_root)
@@ -1061,7 +1065,7 @@ def test_advisory_auto_bypass_on_missing_key(tmp_path, monkeypatch):
     events = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
     bypass_events = [e for e in events if e.get("type") == "advisory_review_bypassed"]
     assert len(bypass_events) == 1
-    assert "ANTHROPIC_API_KEY" in bypass_events[0]["bypass_reason"]
+    assert "no provider credentials" in bypass_events[0]["bypass_reason"]
 
 
 def test_advisory_prompt_contains_blocking_history_when_blocked(tmp_path):
