@@ -166,6 +166,9 @@ export function clearStickyCardState(record) {
     if (!record) return record;
     record.collapsedActivity = '';
     record.costMeta = null;
+    // The executor chip is cycle state like the cost projection: a recycled
+    // slot must not claim the previous cycle's delegated route as its own.
+    record.executorChip = null;
     // A recycled slot must not inherit the previous cycle's finalizing hold.
     record.finalizingHold = false;
     // The activity clock is cycle state too: a

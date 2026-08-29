@@ -2084,7 +2084,7 @@ export function createChatInstance({
     function renderLiveCardMeta(record) {
         if (!record?.metaEl) return;
         const executorChipHtml = record.executorChip
-            ? `<span class="harness-chip chat-live-executor-chip" title="${escapeHtml(record.executorChip.title || '')}">`
+            ? `<span class="harness-chip chat-live-executor-chip" title="${escapeHtmlAttr(record.executorChip.title || '')}">`
               + `<span aria-hidden="true">${escapeHtml(record.executorChip.icon || '')}</span> `
               + `${escapeHtml(record.executorChip.label || '')}</span>`
             : '';
@@ -2488,6 +2488,11 @@ export function createChatInstance({
             // The resolved delegated route; without it a LIVE progress bubble drops
             // the executor chip that the same bubble regains on reload.
             executor_route: msg?.executor_route || '',
+            // The completion-seam receipt beside the route: an enumerated list is
+            // a whitelist, and a whitelist that forgets the delegation keys keeps
+            // the chip at "no run yet" forever (wire_contract.test.js class).
+            execution_evidence: msg?.execution_evidence,
+            actual_substrate: msg?.actual_substrate || '',
             status: msg?.status || '',
             cost_usd: msg?.cost_usd,
             accounted_upper_bound_usd: msg?.accounted_upper_bound_usd,
@@ -2666,6 +2671,12 @@ export function createChatInstance({
             subagent_role: info.role,
             subagent_event: event,
             model: info.model || '',
+            // Delegation truth must survive this second whitelist too: a
+            // log-channel-only terminal still upgrades the executor chip from
+            // "no run yet" to the evidence/substrate receipt.
+            executor_route: evt.executor_route || '',
+            execution_evidence: evt.execution_evidence,
+            actual_substrate: evt.actual_substrate || '',
             review_projection: evt.review_projection,
             result: evt.result || '',
             error: evt.error || '',
