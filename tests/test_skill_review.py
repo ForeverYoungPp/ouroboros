@@ -62,9 +62,9 @@ def test_skill_advisory_notes_are_inert_before_output_contract(tmp_path):
     # Anti-injection boundary: untrusted advisory/payload text must sit in the
     # DYNAMIC tail (after the cache-stable governance prefix), and the output
     # contract must stay after the payload.
-    assert prompt.index("Optional Claude Code Advisory Pre-Review") >= stable_len
+    assert prompt.index("Optional Advisory Pre-Review") >= stable_len
 
-    advisory_idx = prompt.index("Optional Claude Code Advisory Pre-Review")
+    advisory_idx = prompt.index("Optional Advisory Pre-Review")
     output_idx = prompt.rindex("## Output contract")
     assert advisory_idx < output_idx
     assert "For every FAIL, include a concrete proposed fix" in prompt
@@ -175,7 +175,7 @@ def test_skill_advisory_keyless_api_route_skips_and_malformed_route_skips(tmp_pa
     warning = rows[-1]
     assert warning["type"] == "skill_advisory_pre_review_warning"
     assert warning["status"] == "unavailable"
-    assert warning["error"] == "anthropic_api_key_missing"
+    assert warning["error"] == "advisory_model_credentials_missing"
 
     # Malformed route token: unavailable → skip (fail-open), no exception.
     malformed_value = "cursor-secret-payload"
@@ -222,8 +222,7 @@ def test_skill_advisory_unroutable_session_warns_and_fails_open(tmp_path, monkey
     assert warning["error"] == "agent_session_route_unavailable"
 
 
-@pytest.mark.parametrize("guard", ["pytest", "private_runner"])
-def test_skill_advisory_private_guards_precede_availability(tmp_path, monkeypatch, guard):
+def test_skill_advisory_pytest_guard_precedes_availability(tmp_path, monkeypatch):
     import ouroboros.skill_review as skill_review
     from ouroboros.tools import claude_advisory_review as advisory
 
@@ -232,17 +231,33 @@ def test_skill_advisory_private_guards_precede_availability(tmp_path, monkeypatc
         "advisory_gate_unavailability_reason",
         lambda: (_ for _ in ()).throw(AssertionError("availability must not be evaluated")),
     )
-    if guard == "pytest":
-        monkeypatch.setenv("PYTEST_CURRENT_TEST", "sentinel")
-    else:
-        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-        monkeypatch.delattr(advisory, "_run_claude_advisory")
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "sentinel")
 
     ctx = _make_ctx(tmp_path)
     assert skill_review._run_skill_advisory_pre_review(
         ctx, skill_name="weather", file_pack="pack"
     ) == {}
     assert not (ctx.drive_root / "logs" / "events.jsonl").exists()
+
+
+def test_skill_advisory_missing_internal_symbol_is_loud_not_silent(tmp_path, monkeypatch):
+    """The retired hasattr probe made a renamed internal silently no-op the
+    skill advisory forever. The typed public entry (run_advisory_critic) makes
+    that state a VISIBLE fail-open error with a durable warning event."""
+    import ouroboros.skill_review as skill_review
+    from ouroboros.tools import claude_advisory_review as advisory
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(advisory, "advisory_gate_unavailability_reason", lambda: None)
+    monkeypatch.delattr(advisory, "_run_claude_advisory")
+
+    ctx = _make_ctx(tmp_path)
+    result = skill_review._run_skill_advisory_pre_review(
+        ctx, skill_name="weather", file_pack="pack"
+    )
+    assert result.get("status") == "error"
+    events_path = ctx.drive_root / "logs" / "events.jsonl"
+    assert "skill_advisory_pre_review_warning" in events_path.read_text(encoding="utf-8")
 
 
 _NEW_SKILL_REVIEW_PASS_ITEMS = [

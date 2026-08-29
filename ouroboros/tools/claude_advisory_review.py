@@ -1126,6 +1126,17 @@ def _note_meta_error(ctx: ToolContext, meta: dict, err_msg: str) -> None:
         pass
 
 
+def run_advisory_critic(*args, **kwargs):
+    """Public cross-module entry for one advisory critic run (skill review).
+
+    A thin typed alias for the module-internal ``_run_claude_advisory`` so
+    other surfaces never probe private names with ``hasattr`` (a rename would
+    silently no-op their advisory forever). Same signature and return shape:
+    ``(items, raw_result, model, prompt_chars)``.
+    """
+    return _run_claude_advisory(*args, **kwargs)
+
+
 def _run_claude_advisory(
     repo_dir: pathlib.Path,
     commit_message: str,
