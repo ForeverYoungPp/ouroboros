@@ -4954,30 +4954,45 @@ def test_the_wait_window_never_outlives_the_nannys_own_deadline(tmp_path, monkey
         datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(seconds=reserve + 5)).isoformat()
 
-    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=8)
+    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=30)
 
     # It waited the DEADLINE (minus the reserve), not the asked-for window: strictly
-    # under the 8s asked for AND strictly over the 1s floor, so this measures the clamp
-    # itself. It also came back BEFORE the deadline rather than being killed after it.
+    # under the 30s asked for AND strictly over the 1s floor, so this measures the
+    # clamp itself. It also came back BEFORE the deadline rather than being killed
+    # after it.
     assert out["status"] == "no_progress", out
     assert 1 < out["waited_sec"] <= 5, out
-    assert elapsed < 6.0, elapsed
+    # Margins are deliberately coarse (the strict-poll margin redesign): the contract
+    # is DISCRIMINATION — a clamped wait returns near its ~5s granted window, an
+    # unclamped one holds the full 30s ask — not stopwatch accuracy.  The previous
+    # 8s ask with `< 6.0` gave the ~5s wait one second of headroom; windows-latest
+    # measured 6.922s (≈1.9s of scheduler/IO noise) on a run whose clamp arithmetic
+    # (the waited_sec line above) was correct.
+    assert elapsed < 15.0, elapsed
     # The clamp's ARITHMETIC is the `waited_sec <= 5` line above: the granted window
-    # never targets the grace. This wall-clock line is the smoke over it, and it gets
-    # one second of tolerance: between stamping the deadline and returning, the runner
-    # itself spends time (imports, stub spawn, polls) — windows-latest measured 10.6ms
-    # PAST the exact boundary on a run whose twin had passed, i.e. the strict `>` was
-    # racing runner speed, not pinning the clamp.
-    assert deadline_remaining_sec(ctx) > reserve - 1.0,         "the wait blew past the finalization grace by more than runner overhead"
+    # never targets the grace. This wall-clock line is the smoke over it, with a
+    # tolerance sized ABOVE the observed runner noise: between stamping the deadline
+    # and returning, the runner itself spends time (imports, stub spawn, polls) —
+    # windows-latest first measured 10.6ms past the exact boundary, then 1.92s on a
+    # loaded rerun whose clamp arithmetic was correct, so 1.0s of tolerance was still
+    # racing runner speed, not pinning the clamp.  4.0s discriminates all the same:
+    # an unclamped 30s hold lands ~25s past the grace.
+    assert deadline_remaining_sec(ctx) > reserve - 4.0,         "the wait blew past the finalization grace by more than runner overhead"
 
     # The floor, kept from the original scenario: a deadline SHORTER than the reserve
     # still yields a positive window and a graceful typed return, never 0 or negative.
+    # The deadline sits at 10s (was 3s): anything under the reserve exercises the
+    # floor, while the `> 0` line below must survive the 1s floor wait PLUS the
+    # observed ~2s runner noise, which 3s did not.
     ctx.task_metadata["deadline_at"] = (
         datetime.datetime.now(datetime.timezone.utc)
-        + datetime.timedelta(seconds=3)).isoformat()
-    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=8)
+        + datetime.timedelta(seconds=10)).isoformat()
+    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=30)
     assert out["status"] == "no_progress" and out["waited_sec"] == 1, out
-    assert elapsed < 3.0, elapsed
+    # Bounded UNDER the 10s deadline: a clamp that forgot the reserve would grant
+    # min(30, 10) = 10s and land past this line, while the honest 1s floor wait
+    # plus noise stays far inside it.
+    assert elapsed < 8.0, elapsed
     assert deadline_remaining_sec(ctx) > 0, "the wait ate the whole remaining deadline"
 
 
@@ -5010,12 +5025,16 @@ def test_the_wait_leaves_the_grace_it_needs_to_answer_at_all(tmp_path, monkeypat
         datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(seconds=grace + 4)).isoformat()
 
-    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=8)
+    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=30)
 
-    # Without the reserve it would have held the asked-for 8s and come back with only
-    # the grace period left; with it, the window is what remains ABOVE the grace.
+    # Without the reserve it would have held min(ask, remaining) = 30s and come back
+    # with only the grace period left; with it, the window is what remains ABOVE the
+    # grace.  The wall bound is coarse on purpose (the strict-poll margin redesign):
+    # the honest ~4s wait plus the observed ~2s runner noise stays far inside 12s,
+    # while both failure shapes (the 30s ask held, or the reserve forgotten and the
+    # whole ~2min remainder held) land far outside it.
     assert out["waited_sec"] <= 4, out
-    assert elapsed < 6.0, elapsed
+    assert elapsed < 12.0, elapsed
 
 
 @pytest.mark.parametrize("seconds_left, ask, expected_window", [
@@ -5063,7 +5082,11 @@ def test_the_clamp_keys_on_whether_a_deadline_exists_not_on_int_of_what_is_left(
     assert out["waited_sec"] == expected_window, out
     # `waited_sec` is what the payload CLAIMS; the wall clock is what the task actually
     # spent, and the seconds held past a spent deadline are what the caller pays for.
-    assert elapsed < expected_window + 2.0, elapsed
+    # The 5s tolerance sits ABOVE the observed ~2s runner noise (2.0s left the 1s
+    # floor waits a 0.1s margin) and still discriminates the failure shape: a skipped
+    # clamp holds the full 8s ask on the spent-deadline cases, landing past
+    # expected_window + 5.
+    assert elapsed < expected_window + 5.0, elapsed
 
 
 # -- the window is a WINDOW: the timer waits, the human's stream does not ------
@@ -5171,7 +5194,11 @@ def test_the_human_keeps_the_live_stream_while_the_model_waits(tmp_path, monkeyp
     returned = time.monotonic()
 
     assert len(emitted) == len(out["advances"]), (emitted, out["advances"])
-    assert emitted[0][1] < started + 1.0, "the first advance must not wait for the window"
+    # 2.5s, not 1.0s: the discrimination is emit-at-observation vs emit-at-expiry
+    # (the 4s window), so the bound only has to sit clearly under 4s while giving
+    # the pre-emit path (handshake, first poll, custody reads) room above the
+    # observed ~2s loaded-runner noise.
+    assert emitted[0][1] < started + 2.5, "the first advance must not wait for the window"
     # <=, not <: Windows's monotonic clock ticks at ~15.6ms, so an emit and the
     # return inside one tick read EQUAL — the invariant is observed-by-return.
     assert all(at <= returned for _, at in emitted)
@@ -5271,6 +5298,7 @@ class _SlowPollStub(_StreamingStub):
 
         super().__init__(**kwargs)
         self.read_sec, self.reads, self._clock = read_sec, [], time.monotonic
+        self.read_spans = []
 
     def get_run(self, rid, *, timeout_sec=None):
         import time
@@ -5280,6 +5308,10 @@ class _SlowPollStub(_StreamingStub):
         self.reads.append(self._clock())
         bound = self.read_sec if timeout_sec is None else min(self.read_sec, float(timeout_sec))
         time.sleep(bound)
+        # The span is recorded STUB-side so "the bound is what ended this read" is
+        # judged on the read's own clock, deterministically — not reconstructed
+        # through the caller's noisy end-to-end wall clock.
+        self.read_spans.append(self._clock() - self.reads[-1])
         if bound < self.read_sec:
             raise ClaudexorUnavailable("daemon_unreachable",
                                        "Claudexor daemon unreachable: ReadTimeout")
@@ -5507,8 +5539,9 @@ def test_the_last_poll_of_a_spent_window_is_bounded_not_skipped(tmp_path, monkey
     assert calls == ["run-1"], calls
     assert len(stub.reads) == 2, stub.reads
     # ...and the wall clock the TASK pays stays within the BOUND of that deadline, rather
-    # than within a 60s read of it.
-    assert elapsed < window + gw.SHORT_POLL_TIMEOUT_SEC + 0.6, elapsed
+    # than within a 60s read of it.  3.0s of tolerance sits above the observed ~2s
+    # loaded-runner noise (0.6s did not); the 60s-default failure shape lands at ~63s.
+    assert elapsed < window + gw.SHORT_POLL_TIMEOUT_SEC + 3.0, elapsed
 
     # A daemon slower than the bound: the read is cut AT the bound, and an expiry is what
     # the caller gets — never a transport refusal raised out of a tool holding a live run.
@@ -5520,11 +5553,16 @@ def test_the_last_poll_of_a_spent_window_is_bounded_not_skipped(tmp_path, monkey
     assert out["status"] == "progress" and out["waited_sec"] == window, out
     assert calls == ["run-1", "run-1"], calls
     assert len(slower.reads) == 2, slower.reads
-    assert elapsed < window + 0.4 + 0.6, elapsed
-    # The BOUND is what ended that read, not the daemon: it cost the bound, not the 1.2s
-    # the daemon wanted — which is the whole of what a per-request timeout buys here.
-    last_read_sec = (slower.reads[0] + elapsed) - slower.reads[1]
-    assert last_read_sec < 0.4 + 0.3, last_read_sec
+    # Coarse wall smoke only: cut-at-the-bound is pinned deterministically below
+    # (the stub's own read span, and the expiring_poll recorder above — an unbounded
+    # final read would answer instead of raising and never pass through it twice).
+    assert elapsed < window + 0.4 + 3.0, elapsed
+    # The BOUND is what ended that read, not the daemon: it cost the 0.4s bound, not
+    # the 1.2s the daemon wanted — judged on the stub's own span, so caller-side
+    # scheduler noise cannot inflate it (the previous reconstruction through
+    # `elapsed` could).
+    last_read_sec = slower.read_spans[-1]
+    assert last_read_sec < 0.4 + 0.4, last_read_sec
 
 
 def test_a_run_that_finishes_during_the_last_sleep_is_reported_terminal(tmp_path, monkeypatch):
@@ -5547,7 +5585,10 @@ def test_a_run_that_finishes_during_the_last_sleep_is_reported_terminal(tmp_path
     assert out["status"] == "terminal", out
     assert out["state"] == "succeeded", out
     assert out["settlement"]["settled"] is True, out["settlement"]
-    assert elapsed < 6.0, elapsed
+    # Promptness smoke only — the terminal facts above are the contract.  10s keeps
+    # the honest ~1.5s path clear of the observed ~2s loaded-runner noise (6s left
+    # ~2.5s of headroom over it).
+    assert elapsed < 10.0, elapsed
 
 
 def test_the_advance_list_is_a_list_not_a_count(tmp_path, monkeypatch):
