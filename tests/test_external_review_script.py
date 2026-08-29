@@ -48,6 +48,7 @@ def test_contributor_trust_boundary_covers_functional_review_dependencies():
         "ouroboros/delegate_output.py",
         "ouroboros/gateways/claudexor.py",
         "ouroboros/outcomes.py",
+        "ouroboros/openrouter_attribution.py",
         "ouroboros/platform_layer.py",
         "ouroboros/pricing.py",
         # The v6.87.21 seam split moved route vocabulary, transport dispatch and

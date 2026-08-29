@@ -59,6 +59,7 @@ from devtools.benchmarks.cybergym.cybergym_wire import (
     _unwrap_http_json,
     _unwrap_http_payload,
 )
+from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
 from devtools.benchmarks.cybergym.cybergym_docker import (
     _EXPECTED_MODEL,
     _GATEWAY_TASK_ID,
@@ -442,7 +443,8 @@ class _LifecycleMixin:
         }
         response = self.config.http_runner(
             "POST", self.config.provider_url, body=body,
-            headers={"Authorization": f"Bearer {key}"}, timeout=60,
+            headers={"Authorization": f"Bearer {key}", **OPENROUTER_APP_HEADERS},
+            timeout=60,
         )
         response = _unwrap_http_json(response, operation="provider probe")
         observed = str(response.get("model") or "").strip()

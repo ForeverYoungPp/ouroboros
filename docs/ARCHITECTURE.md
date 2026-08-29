@@ -2629,6 +2629,12 @@ never classified as a mask; `prepare_settings_for_persist()` applies the same
 top-level repair at the common writer boundary. Password, token, and MCP masks
 remain context-specific rather than sharing a suffix heuristic.
 
+`ouroboros/openrouter_attribution.py` is the application-identity SSOT for every
+first-party paid OpenRouter request, including runtime, review probes, and benchmark
+diagnostics. Its canonical public URL is the primary OpenRouter application id and
+`X-OpenRouter-Title` supplies the display name. A fork or another product must use
+its own URL rather than sharing this identity and competing to rename one app record.
+
 ### LLM output token budgets
 
 Ouroboros uses provider-specific names for the same output-token budget:
