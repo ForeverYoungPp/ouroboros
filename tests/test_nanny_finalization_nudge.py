@@ -332,9 +332,9 @@ def test_a_delegating_nanny_and_a_native_child_are_not_nudged():
     assert _run(native, [], []) is False
 
 
-def test_actor_first_host_coordination_suppresses_zero_leaf_accusation(tmp_path):
-    # Scheduling or inspecting a host child is a valid actor-first outcome. It
-    # must not be reported as if the nanny silently chose metered inline work.
+def test_host_coordination_no_longer_suppresses_zero_leaf_accusation(tmp_path):
+    # Charter (owner 2026-08-28): coordination and host children are auxiliary
+    # evidence — they no longer buy silence over a zero-leaf finalization.
     from ouroboros.loop import _nanny_finalization_message
 
     drive = _custody_drive(tmp_path)
@@ -345,10 +345,35 @@ def test_actor_first_host_coordination_suppresses_zero_leaf_accusation(tmp_path)
         task_metadata={"budget_drive_root": str(drive)},
     )
     tools = _tools(ctx, ["delegate_start", "delegate_wait", "schedule_subagent"])
-    assert _nanny_finalization_message(tools, drive, "child-1") == ""
+    message = _nanny_finalization_message(tools, drive, "child-1")
+    assert "NANNY_DID_NOT_DELEGATE" in message
 
     undispatched = SimpleNamespace()  # a ctx that never saw a dispatch at all
     assert _run(undispatched, [], []) is False
+
+
+def test_configured_actor_typed_zero_run_receipt_finalizes_in_silence(tmp_path):
+    # The typed terminal decision is the ONE legitimate zero-leaf ending for a
+    # configured session actor: once it is durably recorded, no nudge fires.
+    from ouroboros.loop import _nanny_finalization_message
+
+    drive = _custody_drive(tmp_path)
+    ctx = SimpleNamespace(
+        _nanny_route_dispatched=True,
+        _nanny_finalization_injected=False,
+        task_id="actor-zr",
+        task_metadata={"budget_drive_root": str(drive)},
+        _configured_actor_bootstrap={
+            "route_available": False,
+            "exact_start_pending": False,
+            "physical_started": False,
+            "zero_run_receipt_recorded": True,
+            "zero_run_decision": "incomplete",
+            "zero_run_basis": "route down at start",
+        },
+    )
+    tools = _tools(ctx, ["delegate_start", "verify_and_record"])
+    assert _nanny_finalization_message(tools, drive, "actor-zr") == ""
 
 
 def test_actor_first_plain_finalization_requires_typed_zero_run_or_leaf(tmp_path):

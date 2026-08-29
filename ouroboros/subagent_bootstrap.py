@@ -189,6 +189,10 @@ def _pre_start_leaf(
         payload = {}
     payload = payload if isinstance(payload, dict) else {}
     status = str(payload.get("status") or "")
+    if status in {"started", "started_uncustodied"}:
+        # Idempotent beside the start wrapper's own marker: the host episode
+        # must never treat a started (possibly uncustodied) run as a zero-run.
+        _mark_physical_activity(ctx)
     if status == "started":
         run_id = str(payload.get("run_id") or "")
         if run_id:

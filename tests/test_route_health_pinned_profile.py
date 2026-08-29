@@ -1,16 +1,24 @@
-"""Phase D: route_health pinned-profile pass-through + structural disclosure.
+"""route_health admission contract: the engine, not the default store, decides.
 
-The live incident (2026-08-18): reviewer slots pinned a verified credential
-profile on a route whose harness row reads status="unavailable" FOREVER by
-design (agy has no default credential store — engine INV-135; only named
-profiles work). `route_health` refused on the row status BEFORE the pinned
-credentialProfileId ever reached the engine, so a working pin could never be
-used. Owner decision (batch 2, 1A/2): when a profile is pinned, the row-status
-refusal is SKIPPED and the ENGINE's typed refusal is authoritative. Everything
-else — catalog absence, access-profile fit, the delegated-marker version
-floor, quota windows — still applies unchanged.
+Two owner decisions shaped this surface. 2026-08-18 (reviewer-slot incident):
+a pinned credential profile must reach the engine even when the harness row's
+aggregate status reads "unavailable" — that status describes the DEFAULT
+credential store only. 2026-08-28 (cx-delegation sprint, «статус обманывает,
+игнорируй его и всё равно пробуй запустить» + 7=A): the same is true for
+UNPINNED routes — a pool-only harness (agy, INV-135) read "unavailable"
+FOREVER while its real accounts lived in the engine's credential-profile pool,
+so the aggregate status/enabled pair stopped being a refusal entirely.
+Admission belongs to the engine: an empty or exhausted pool answers the start
+POST with its own typed refusal (INV-135 ``credential_pool_exhausted``), which
+under the pre-start charter costs zero model rounds. The engine's belt
+capability row (``delegation.available``) is likewise not consulted: Ouroboros
+runs never request the belt (no ``extra_mcp_servers``).
 
-Offline unit fixtures only: a duck-typed gateway answering the two manifest
+What still refuses, pinned or not: catalog absence, access-profile fit for the
+shape, the delegated-marker version floor, and positively-known quota
+exhaustion for the route's model.
+
+Offline unit fixtures only: a duck-typed gateway answering the manifest
 questions route_health asks. No daemon, no network.
 """
 
@@ -18,7 +26,7 @@ from ouroboros.subagents import delegated_run_shape, route_health
 
 
 class _Gateway:
-    """agy-shaped catalog row: unavailable forever, structurally non-delegable."""
+    """agy-shaped catalog row: default store dead forever, pool-only accounts."""
 
     engine_version = "9.9.9"
 
@@ -37,26 +45,34 @@ class _Gateway:
         return []
 
 
-def test_a_pinned_profile_skips_only_the_row_status_refusal():
+def test_aggregate_row_status_is_not_a_refusal_pinned_or_not():
     shape = delegated_run_shape(False)
     gw = _Gateway()
-    # Unpinned: today's typed refusal is byte-identical (probe_subagent_executor
-    # and tools/delegate.py pass no profile — their behavior must not move).
-    assert route_health(gw, "agy-like", shape) == ("route_status_unavailable", "")
-    # Pinned: the row-status refusal is skipped; the shape checks still pass, so
-    # the request proceeds and the ENGINE's typed answer is authoritative.
+    # Unpinned: the dead default-store status no longer blocks the dispatch —
+    # the engine's own typed answer (e.g. credential_pool_exhausted) is the
+    # authority, and under the pre-start charter it costs zero model rounds.
+    assert route_health(gw, "agy-like", shape) == ("", "")
+    # Pinned: identical admission (the 2026-08-18 pinned precedent, now the
+    # general rule).
     assert route_health(gw, "agy-like", shape, pinned_profile="acct-1") == ("", "")
+    # Even an enabled+ok row answers the same way: the pair carries no signal
+    # this reader consumes.
+    assert route_health(
+        _Gateway(status="ok", enabled=True), "agy-like", shape,
+    ) == ("", "")
 
 
-def test_a_pinned_profile_does_not_skip_the_catalog_absence_refusal():
+def test_catalog_absence_still_refuses_pinned_or_not():
     shape = delegated_run_shape(False)
     # A route the catalog does not carry at all has no engine row to be
     # authoritative about: still refused, pinned or not.
+    assert route_health(_Gateway(), "missing-route", shape) == (
+        "route_not_in_capability_catalog", "")
     assert route_health(_Gateway(), "missing-route", shape, pinned_profile="acct-1") == (
         "route_not_in_capability_catalog", "")
 
 
-def test_a_pinned_profile_does_not_skip_the_shape_checks():
+def test_shape_checks_still_refuse_pinned_or_not():
     # The access-profile check judges the SHAPE, not the credentials: a pin
     # cannot make a read-only route writable.
     class _ReadOnly(_Gateway):
@@ -67,6 +83,8 @@ def test_a_pinned_profile_does_not_skip_the_shape_checks():
     acting = delegated_run_shape(True)
     unavailable, _ = route_health(_ReadOnly(), "agy-like", acting, pinned_profile="acct-1")
     assert unavailable == "access_profile_unsupported:workspace_write"
+    unavailable, _ = route_health(_ReadOnly(), "agy-like", acting)
+    assert unavailable == "access_profile_unsupported:workspace_write"
     # And the delegated-marker version floor stays: an engine that would 400 the
     # marker is refused before a token is spent, pinned or not.
     old = _Gateway(status="ok", enabled=True)
@@ -75,47 +93,31 @@ def test_a_pinned_profile_does_not_skip_the_shape_checks():
     assert unavailable == "engine_rejects_delegated_marker"
 
 
-def test_the_status_refusal_code_carries_the_structural_delegation_fact():
-    """Phase D3 (disclosure only): the catalog row carries typed delegation facts
-    (`delegation: {available, reason, ...}` — verified live on engine 3.5.0; agy
-    reports available=false, reason="manifest_unsupported"). When a DELEGATED
-    shape is refused on row status and the row says it structurally cannot run
-    delegated work, the refusal code carries that fact — same refusal, refined
-    code, no new gate."""
+def test_the_belt_capability_row_is_not_consulted():
+    """The catalog row's ``delegation`` object describes the engine's OWN
+    delegate strategy (MCP belt injection) — a capability Ouroboros runs never
+    request. Refusing (or decorating a refusal) on it manufactured a
+    "structurally cannot delegate" verdict the engine never gave and blocked
+    routes that admit marker-based delegated runs (cursor acting runs under a
+    pinned profile). It is ignored for every shape."""
     structural = _Gateway(
         delegation={"available": False, "reason": "manifest_unsupported"})
-    acting = delegated_run_shape(True)
-    unavailable, _ = route_health(structural, "agy-like", acting)
-    assert unavailable == "route_status_unavailable:delegation_manifest_unsupported"
-    # A non-delegated shape does not consult the delegation facts: they describe
-    # delegated (MCP-injected) work only.
-    assert route_health(structural, "agy-like", delegated_run_shape(False)) == (
-        "route_status_unavailable", "")
-    # A row without the delegation object (older engines, plain outage) keeps
-    # today's code byte-identically.
-    assert route_health(_Gateway(), "agy-like", acting) == ("route_status_unavailable", "")
-    # And a delegation object that is merely absent-of-detail is not structural:
-    # only an EXPLICIT available=false speaks.
-    vague = _Gateway(delegation={})
-    assert route_health(vague, "agy-like", acting) == ("route_status_unavailable", "")
+    assert route_health(structural, "agy-like", delegated_run_shape(True)) == ("", "")
+    assert route_health(structural, "agy-like", delegated_run_shape(False)) == ("", "")
+    assert route_health(_Gateway(delegation={}), "agy-like", delegated_run_shape(True)) == ("", "")
 
 
-def test_blocked_pin_wording_is_structural_when_the_manifest_cannot_delegate():
-    """Phase D3: the blocked-pin terminal must not tell the parent to
-    «Reschedule once the route recovers» when the incapability is structural —
-    on agy that honestly means «wait forever»."""
+def test_blocked_pin_wording_is_uniform_without_the_structural_verdict():
+    """The ``:delegation_`` wording branch retired with the belt refusal: the
+    host no longer manufactures a "waiting will not heal it" verdict the engine
+    did not give. Every blocked pin gets the honest generic terminal."""
     from ouroboros.agent import executor_blocked_outcome
     from ouroboros.subagents import SubagentExecutorResolution
 
-    structural, usage = executor_blocked_outcome(SubagentExecutorResolution(
+    text, usage = executor_blocked_outcome(SubagentExecutorResolution(
         requested="harness", executor="blocked",
-        reason="route_status_unavailable:delegation_manifest_unsupported"))
-    assert "Reschedule once the route recovers" not in structural
-    assert "structurally cannot run delegated work" in structural
-    assert "NOT run on metered API tokens" in structural  # the pin still spent nothing
+        reason="route_status_degraded"))
+    assert "Reschedule once the route recovers" in text
+    assert "NOT run on metered API tokens" in text  # the pin still spent nothing
     assert usage == {"execution_status": "infra_failed",
                      "reason_code": "subagent_executor_unavailable"}
-    # A plain (possibly transient) outage keeps today's wording unchanged.
-    transient, _ = executor_blocked_outcome(SubagentExecutorResolution(
-        requested="harness", executor="blocked", reason="route_status_degraded"))
-    assert "Reschedule once the route recovers" in transient

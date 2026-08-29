@@ -261,15 +261,23 @@ def test_selected_session_visibility_failure_blocks_without_native_substitution(
     assert amended.executor_resolution.reason == "delegate_tools_invisible"
 
 
-def test_blocked_session_bootstrap_wakes_first_turn_with_alternatives(monkeypatch, tmp_path):
+def test_blocked_session_bootstrap_terminals_unrun_with_alternatives(monkeypatch, tmp_path):
+    # Charter D2 (owner 2026-08-28, N2=A): a route that is blocked AT DISPATCH
+    # ends the child unrun and typed at $0 — no model episode, no metered
+    # fallback. The bootstrap returns an empty wake and stashes the typed
+    # refusal; agent._prepare_task_context turns it into the existing
+    # executor-blocked terminal. The dc4c0204 non-empty wake retired with this.
     from ouroboros import delegate_custody as custody
     import ouroboros.subagent_runtime as runtime
     from ouroboros.subagent_bootstrap import bootstrap_before_context
     snapshot = _snapshot(_settings(_session_row()), "session-builder")
-    monkeypatch.setattr(runtime, "current_subagent_alternatives", lambda _exclude: [{
+    alternatives = [{
         "subagent_id": "api-scout", "route_kind": "api_model",
         "target_id": "google/gemini-3.7-flash", "availability": "check_at_dispatch",
-    }])
+    }]
+    monkeypatch.setattr(
+        runtime, "current_subagent_alternatives", lambda _exclude: list(alternatives),
+    )
     ctx = SimpleNamespace(
         task_id="child1",
         drive_root=tmp_path,
@@ -287,35 +295,33 @@ def test_blocked_session_bootstrap_wakes_first_turn_with_alternatives(monkeypatc
             reason="subscription_window_exhausted", reset_at="2030-01-01T00:00:00Z",
         ),
     )
-    out = json.loads(bootstrap_before_context(
-        ctx, {"id": "child1", "configured_subagent": snapshot}, dispatch,
-    ))
-    assert out["status"] == "configured_session_actor_ready"
-    assert out["coordination_context"]["parent_intent"]["state"] == "absent"
-    assert out["coordination_context"]["review_capacity"]["state"] == "unknown"
-    startup = out["startup"]
-    assert {key: startup[key] for key in (
-        "status", "reason", "reset_at", "selected_subagent_id", "alternatives",
-        "host_fallback", "actor_first", "exact_start_pending",
-    )} == {
-        "status": "temporarily_unavailable",
+    task = {"id": "child1", "configured_subagent": snapshot}
+    assert bootstrap_before_context(ctx, task, dispatch) == ""
+    assert ctx._configured_startup_refusal == {
         "reason": "subscription_window_exhausted",
         "reset_at": "2030-01-01T00:00:00Z",
-        "selected_subagent_id": "session-builder",
-        "alternatives": [{
-            "subagent_id": "api-scout", "route_kind": "api_model",
-            "target_id": "google/gemini-3.7-flash", "availability": "check_at_dispatch",
-        }],
-        "host_fallback": False,
-        "actor_first": True,
-        "exact_start_pending": True,
+        "requested": "harness",
     }
-    assert startup["route"] == "codex=gpt-5.6-sol"
-    assert len(startup["work_order_fingerprint"]) == 64
-    assert startup["work_order_chars"] > 0
-    assert startup["work_order_complete"] is True
+    availability = task["subagent_availability"]
+    assert {key: availability[key] for key in (
+        "status", "reason", "reset_at", "alternatives", "host_fallback", "route_kind",
+    )} == {
+        "status": "unavailable",
+        "reason": "subscription_window_exhausted",
+        "reset_at": "2030-01-01T00:00:00Z",
+        "alternatives": alternatives,
+        "host_fallback": False,
+        "route_kind": "agent_session",
+    }
+    # The frozen route/work-order authority still exists (recovery/economics
+    # readers consume it), and the blocked fact is durable custody evidence.
+    bootstrap = ctx._configured_actor_bootstrap
+    assert bootstrap["selected_subagent_id"] == "session-builder"
+    assert len(bootstrap["work_order_fingerprint"]) == 64
     rows = [json.loads(line) for line in custody.event_log_path(tmp_path).read_text().splitlines()]
     assert rows[-1]["type"] == "configured_subagent_startup_fault"
+    assert rows[-1]["reason"] == "subscription_window_exhausted"
+    assert rows[-1]["host_fallback"] is False
 
 
 @pytest.mark.parametrize(
@@ -350,9 +356,15 @@ def test_over_budget_bootstrap_uses_only_a_live_interaction_channel(
         calls.append((prompt, spec))
         or json.dumps({"status": "started", "run_id": "run-source", "custody_durable": True})
     ))
+    import ouroboros.delegate_supervision as supervision
+
+    monkeypatch.setattr(
+        supervision, "supervised_wait",
+        lambda _ctx, run_id, **_kw: json.dumps({"status": "leaf_terminal", "run_id": run_id}),
+    )
     snapshot = _snapshot(_settings(_session_row(target="codex=gpt-5.6-sol")), "session-builder")
     dispatch = SimpleNamespace(
-        executor="harness",
+        executor="harness", blocked=False,
         executor_resolution=SimpleNamespace(route=SimpleNamespace(route_id="codex")),
     )
     ctx = SimpleNamespace(
@@ -366,18 +378,22 @@ def test_over_budget_bootstrap_uses_only_a_live_interaction_channel(
         "task_contract": {"objective": "THIS MUST NOT BE SENT AS A PREFIX " + ("x" * 250_100)},
     }
     full_sha = work_order_fingerprint(task)
-    out = json.loads(bootstrap.bootstrap_before_context(ctx, task, dispatch))
-    assert out["status"] == "configured_session_actor_ready"
-    assert out["startup"]["exact_start_pending"] is True
-    assert calls == []
-    started = json.loads(runtime.delegate_start_entry(ctx, ""))
+    # Charter D1: the host pre-starts the leaf during bootstrap, through the
+    # same wrapper the model's delegate_start(prompt="") uses. With a live
+    # interactive channel the oversized order rides the source-request lens;
+    # without one, the definite refusal ends the child unrun and typed at $0.
+    raw = bootstrap.bootstrap_before_context(ctx, task, dispatch)
     custody_rows = [
         json.loads(line)
         for line in custody.event_log_path(tmp_path).read_text().splitlines()
     ]
 
     if interactive:
-        assert started["status"] == "started"
+        out = json.loads(raw)
+        assert out["status"] == "configured_session_wake"
+        assert out["startup"]["status"] == "started"
+        assert out["startup"]["run_id"] == "run-source"
+        assert out["wake"]["status"] == "leaf_terminal"
         assert len(calls) == 1
         prompt, spec = calls[0]
         assert "WORK ORDER SOURCE REQUEST" in prompt
@@ -393,9 +409,8 @@ def test_over_budget_bootstrap_uses_only_a_live_interaction_channel(
             "route": "codex",
         }
     else:
-        assert started["status"] == "refused"
-        assert started["reason"] == expected_reason
-        assert started["work_order_fingerprint"] == full_sha
+        assert raw == ""
+        assert ctx._configured_startup_refusal["reason"] == expected_reason
         assert calls == []
         assert custody_rows[-1]["type"] == "configured_subagent_work_order_refused"
         assert custody_rows[-1]["reason"] == expected_reason
@@ -441,12 +456,18 @@ def test_over_budget_start_reprobes_live_interaction_capability(
         starts.append((prompt, spec))
         or json.dumps({"status": "started", "run_id": "run-live-probe"})
     ))
+    import ouroboros.delegate_supervision as supervision
+
+    monkeypatch.setattr(
+        supervision, "supervised_wait",
+        lambda _ctx, run_id, **_kw: json.dumps({"status": "leaf_terminal", "run_id": run_id}),
+    )
     snapshot = _snapshot(
         _settings(_session_row(target="codex=gpt-5.6-sol")),
         "session-builder",
     )
     dispatch = SimpleNamespace(
-        executor="harness",
+        executor="harness", blocked=False,
         executor_resolution=SimpleNamespace(route=SimpleNamespace(route_id="codex")),
     )
     ctx = SimpleNamespace(
@@ -462,22 +483,23 @@ def test_over_budget_start_reprobes_live_interaction_capability(
         "task_contract": {"objective": "x" * 250_100},
     }
 
-    bootstrap.bootstrap_before_context(ctx, task, dispatch)
-    # A cached observation is context only, never route authority.  Poison it
-    # to prove the live probe is derived from the immutable selected snapshot.
-    ctx._configured_actor_bootstrap["source_channel"]["route"] = "cursor"
-    outcome = json.loads(runtime.delegate_start_entry(ctx, ""))
+    # Charter D1: both observations happen inside the bootstrap now — the
+    # cached channel probe at authority-freeze time, then the LIVE re-probe
+    # inside the pre-start's delegate_start_entry. The (True→False) row proves
+    # the cached "available" observation is context only, never start
+    # authority: the live probe overrides it into a typed $0 refusal.
+    raw = bootstrap.bootstrap_before_context(ctx, task, dispatch)
     custody_rows = [
         json.loads(line)
         for line in custody.event_log_path(tmp_path).read_text().splitlines()
     ]
 
-    assert outcome["status"] == expected_status
     assert len(closed) == 2
     assert ctx._configured_actor_bootstrap["source_channel"]["route"] == "codex"
     assert custody_rows[-1]["route"] == "codex"
     if expected_reason:
-        assert outcome["reason"] == expected_reason
+        assert raw == ""
+        assert ctx._configured_startup_refusal["reason"] == expected_reason
         assert starts == []
         assert custody_rows[-1]["type"] == "configured_subagent_work_order_refused"
         assert custody_rows[-1]["reason"] == expected_reason
@@ -487,6 +509,9 @@ def test_over_budget_start_reprobes_live_interaction_capability(
             else "interactive_capability_missing"
         )
     else:
+        out = json.loads(raw)
+        assert out["status"] == "configured_session_wake"
+        assert out["startup"]["status"] == expected_status
         assert len(starts) == 1
         assert "WORK ORDER SOURCE REQUEST" in starts[0][0]
         assert custody_rows[-1]["type"] == "configured_subagent_work_order_source_request"
@@ -587,6 +612,8 @@ def test_pending_over_budget_recovery_replays_compact_body_and_full_fingerprint(
 def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tmp_path):
     from ouroboros import agent as agent_module
     import ouroboros.claudexor_daemon as daemon
+    import ouroboros.delegate_supervision as supervision
+    import ouroboros.subagent_runtime as runtime
     import ouroboros.subagents as subagents
     from ouroboros.agent import Env, OuroborosAgent
 
@@ -605,6 +632,19 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
         lambda *_a, **_k: ("", ""),
     )
     monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
+    # Charter D1: the host pre-starts the exact leaf during bootstrap, before
+    # the context build and any model call.
+    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: (
+        order.append("physical_start")
+        or json.dumps({"status": "started", "run_id": "run-pre-start"})
+    ))
+    monkeypatch.setattr(
+        supervision, "supervised_wait",
+        lambda _ctx, run_id, **_kw: (
+            order.append("supervised_wait")
+            or json.dumps({"status": "leaf_terminal", "run_id": run_id})
+        ),
+    )
     def build_context(**_kwargs):
         order.append("context_build")
         return [], {}
@@ -626,15 +666,17 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
         "task_contract": {"objective": "Build", "expected_output": "Patch"},
         "drive_root": str(drive), "budget_drive_root": str(drive),
     })
-    assert order == ["context_build"]
+    assert order == ["physical_start", "supervised_wait", "context_build"]
     assert any("CONFIGURED SESSION STARTUP / WAKE RECEIPT" in item["content"] for item in messages)
     receipt = next(item["content"] for item in messages if "CONFIGURED SESSION STARTUP / WAKE RECEIPT" in item["content"])
-    assert "exact_start_pending" in receipt
+    assert "configured_session_wake" in receipt
+    assert "run-pre-start" in receipt
     assert _ctx._configured_actor_bootstrap["selected_subagent_id"] == "session-builder"
     assert _ctx._configured_actor_bootstrap["canonical_work_order"]
-    # No physical run exists yet, so the pacing baseline must not pretend a
-    # delegated activity already happened.
-    assert _ctx._nanny_delegate_baseline is None
+    assert _ctx._configured_actor_bootstrap["physical_started"] is True
+    # The physical run exists before the first round, so the pacing baseline
+    # starts seeded — burn is measured from the live delegated activity.
+    assert _ctx._nanny_delegate_baseline == {"round": 0, "cost": 0.0}
 
 
 def test_actor_first_delegate_start_binds_snapshot_and_canonical_work_order(monkeypatch, tmp_path):
@@ -1596,3 +1638,87 @@ def test_only_approved_restart_causes_reserve_and_abrupt_gap_vetoes(monkeypatch,
     monkeypatch.setattr(custody, "reconcile_task_runs", lambda *_a, **_k: [])
     assert recovery.pre_adopt_planned_handoffs(tmp_path, []) == set()
     assert recovery._read(tmp_path, "child1")["veto_reason"] == "restart_transaction_missing"
+
+
+@pytest.mark.parametrize("reason", [
+    "credential_pool_exhausted",
+    "subscription_window_exhausted",
+    "daemon_unreachable",
+    "access_profile_unsupported:workspace_write",
+])
+def test_definite_configured_session_start_refusal_terminalizes_before_llm(
+    monkeypatch, tmp_path, reason,
+):
+    # Ported f9356572 contract (rewritten for the pre-start seam): a typed
+    # refusal that provably left no run behind ends the child unrun and typed
+    # at $0 — bootstrap returns an empty wake and the agent's terminal gate
+    # takes over, so no model round ever exists.
+    import ouroboros.subagent_runtime as runtime
+    from ouroboros.subagent_bootstrap import bootstrap_before_context
+
+    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: json.dumps({
+        "status": "refused", "reason": reason, "reset_at": "2030-01-01T00:00:00Z",
+    }))
+    monkeypatch.setattr(
+        runtime, "current_subagent_alternatives", lambda _exclude: [],
+    )
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    ctx = SimpleNamespace(
+        task_id="child-refused", drive_root=tmp_path,
+        budget_drive_root=str(tmp_path), task_metadata={},
+    )
+    dispatch = SimpleNamespace(
+        executor="harness", blocked=False,
+        executor_resolution=SimpleNamespace(route=SimpleNamespace(route_id="codex")),
+    )
+    task = {"id": "child-refused", "configured_subagent": snapshot,
+            "task_contract": {"objective": "Build"}}
+    assert bootstrap_before_context(ctx, task, dispatch) == ""
+    assert ctx._configured_startup_refusal["reason"] == reason
+    assert ctx._configured_startup_refusal["reset_at"] == "2030-01-01T00:00:00Z"
+    assert task["subagent_availability"]["route_kind"] == "agent_session"
+    assert task["subagent_availability"]["host_fallback"] is False
+
+
+@pytest.mark.parametrize("payload", [
+    # A custody handle means a run may exist: never a $0 terminal.
+    {"status": "refused", "reason": "credential_pool_exhausted", "run_id": "run-x"},
+    {"status": "refused", "reason": "daemon_unreachable",
+     "pending_invocation_id": "inv-1"},
+    # An unknown refusal code errs toward the episode, not the terminal.
+    {"status": "refused", "reason": "some_future_code"},
+    # An uncustodied start IS a live run somewhere.
+    {"status": "started_uncustodied", "run_id": ""},
+    # Unparseable output proves nothing about the run's absence.
+    "not-json-at-all",
+])
+def test_startup_refusal_classifier_preserves_ambiguous_wakes(
+    monkeypatch, tmp_path, payload,
+):
+    # Ported f9356572 B4 contract (in spirit): a false "spent nothing" terminal
+    # over a possibly-live run is the one direction the classification must
+    # never fail toward — everything ambiguous wakes the model instead.
+    import ouroboros.subagent_runtime as runtime
+    from ouroboros.subagent_bootstrap import bootstrap_before_context
+
+    raw = payload if isinstance(payload, str) else json.dumps(payload)
+    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: raw)
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    ctx = SimpleNamespace(
+        task_id="child-ambiguous", drive_root=tmp_path,
+        budget_drive_root=str(tmp_path), task_metadata={},
+    )
+    dispatch = SimpleNamespace(
+        executor="harness", blocked=False,
+        executor_resolution=SimpleNamespace(route=SimpleNamespace(route_id="codex")),
+    )
+    task = {"id": "child-ambiguous", "configured_subagent": snapshot,
+            "task_contract": {"objective": "Build"}}
+    out = bootstrap_before_context(ctx, task, dispatch)
+    assert out != ""
+    parsed = json.loads(out)
+    assert parsed["status"] == "configured_session_startup_fault"
+    assert getattr(ctx, "_configured_startup_refusal", None) is None
+    if isinstance(payload, dict) and payload.get("status") == "started_uncustodied":
+        # A possibly-live run must also fence a false zero-run claim.
+        assert ctx._configured_actor_bootstrap["physical_started"] is True

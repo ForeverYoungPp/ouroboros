@@ -1082,7 +1082,7 @@ def test_zero_run_refuses_ambiguous_physical_start_custody(tmp_path):
     refused = _verify_and_record(
         ctx,
         contract_kind="delegation_zero_run",
-        zero_run_decision="complete",
+        zero_run_decision="unknown",
         zero_run_basis="the POST answer was lost",
     )
     assert "zero_run_requires_settlement" in refused
@@ -1114,7 +1114,7 @@ def test_zero_run_refuses_unreadable_custody_without_fail_soft_scan(
     refused = _verify_and_record(
         ctx,
         contract_kind="delegation_zero_run",
-        zero_run_decision="complete",
+        zero_run_decision="unknown",
         zero_run_basis="no visible run",
     )
     assert "zero_run_custody_unknown" in refused
@@ -1164,8 +1164,8 @@ def test_zero_run_and_fresh_start_share_one_atomic_actor_decision(tmp_path):
         return _verify_and_record(
             ctx,
             contract_kind="delegation_zero_run",
-            zero_run_decision="complete",
-            zero_run_basis="host-visible work completed without a physical leaf",
+            zero_run_decision="incomplete",
+            zero_run_basis="host-visible work stopped without a physical leaf",
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -1214,9 +1214,12 @@ def test_failed_direct_child_does_not_make_actor_first_terminal_clean(tmp_path):
         delegation_role="subagent",
         result="provider failed before producing a result",
     )
+    # Charter (owner 2026-08-28): children are evidence, never a completion
+    # path — the typed reason names the missing leaf, the child statuses ride
+    # beside it as evidence.
     fact = actor_first_unresolved_fact(ctx, drive_root=tmp_path)
     assert fact["status"] == "incomplete"
-    assert fact["reason"] == "direct_children_without_completed_result"
+    assert fact["reason"] == "physical_leaf_not_started"
     assert fact["direct_child_statuses"] == [STATUS_FAILED]
 
 
@@ -1254,7 +1257,7 @@ def test_discarded_completed_child_does_not_make_actor_first_terminal_clean(tmp_
 
     fact = actor_first_unresolved_fact(ctx, drive_root=tmp_path)
     assert fact["status"] == "incomplete"
-    assert fact["reason"] == "direct_children_without_completed_result"
+    assert fact["reason"] == "physical_leaf_not_started"
 
 
 def test_zero_run_receipt_write_failure_does_not_claim_terminal_truth(tmp_path, monkeypatch):
@@ -1349,11 +1352,11 @@ def test_acting_zero_run_keeps_generic_verification_nudge(tmp_path, monkeypatch)
         "work_order_fingerprint": "a" * 64,
         "physical_started": False,
     }
-    assert "COMPLETE" in _verify_and_record(
+    assert "INCOMPLETE" in _verify_and_record(
         ctx,
         contract_kind="delegation_zero_run",
-        zero_run_decision="complete",
-        zero_run_basis="host-side integration completed without a physical leaf",
+        zero_run_decision="incomplete",
+        zero_run_basis="host-side integration proceeded without a physical leaf",
     )
     monkeypatch.setattr(loop_module, "_skill_finalization_message", lambda *_a, **_k: "")
     messages = []

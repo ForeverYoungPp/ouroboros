@@ -206,8 +206,17 @@ def test_the_baseline_advances_on_delegate_verbs_only():
     assert rounds == 0
     assert cost == pytest.approx(2.7)
 
-    # A real delegate verb (start/answer/cancel) resets BOTH axes.
+    # Supervision verbs (answer/cancel) share the wait semantics under the
+    # charter (owner 2026-08-28): the round axis re-baselines, dollars stay
+    # cumulative — supervising a run is not a new act of delegation.
     _note_nanny_delegate_activity(ctx, 8, {"cost": 3.4}, [_delegate_call("delegate_answer")])
+    rounds, cost = _nanny_metered_since_delegate_activity(ctx)
+    assert rounds == 0
+    assert cost == pytest.approx(2.9)
+
+    # Only a genuine act of delegation (delegate_start / schedule_subagent)
+    # resets BOTH axes.
+    _note_nanny_delegate_activity(ctx, 9, {"cost": 3.6}, [_delegate_call()])
     assert _nanny_metered_since_delegate_activity(ctx) == (0, 0.0)
 
 
