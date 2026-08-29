@@ -100,6 +100,15 @@ const HARNESS_CHIP_NAME = {
     claude: 'Claude Code',
 };
 
+// The completion seam's typed substrate claim (subagents.actual_substrate),
+// carried on the terminal frame beside the counts. Surfaced as a tooltip
+// clause — the counts own the label; the enum never travels bare.
+const SUBSTRATE_NOTE = {
+    harness_used: 'custody evidence confirms a harness run',
+    harness_attempted: 'harness attempted, no delegated run succeeded',
+    native_only: 'no harness run recorded',
+};
+
 export function executorChip(evt) {
     const route = String(evt?.executor_route || '').trim();
     if (!route) return null;
@@ -109,40 +118,54 @@ export function executorChip(evt) {
     if (!harness) return null;
     const name = HARNESS_CHIP_NAME[harness] || harness;
     const base = { harness, icon: HARNESS_CHIP_ICON[harness] || '◆', label: name };
-    // LAYERED TRUTH. The route is a DISPATCH decision; whether a delegated run
-    // actually happened is EVIDENCE, reconciled once at the completion seam
-    // (subagents.envelope_from_task -> execution_evidence) and carried on the
-    // terminal frame. Before evidence exists the chip states only the decision —
-    // never "ran on", which is a receipt nothing has issued yet.
+    // LAYERED TRUTH, label-level. The route is a DISPATCH decision; whether a
+    // delegated run actually happened is EVIDENCE, reconciled once at the
+    // completion seam (subagents.envelope_from_task -> execution_evidence) and
+    // carried on the terminal frame. The chip label always states the run FACT
+    // beside the harness name (`{harness} · {state}`) — a bare product name
+    // reads as "ran on codex", a receipt nothing may have issued, and the
+    // hover-only tooltip is invisible on touch, to AT, and in copies.
     const evidence = (evt && typeof evt.execution_evidence === 'object' && evt.execution_evidence)
         ? evt.execution_evidence : null;
+    const substrateNote = SUBSTRATE_NOTE[String(evt?.actual_substrate || '')] || '';
+    const withSubstrate = (title) => (substrateNote ? `${title} — ${substrateNote}` : title);
     if (!evidence) {
-        return { ...base, title: `Dispatched to ${name} — this subagent itself runs on the API` };
+        return {
+            ...base,
+            label: `${name} · no run yet`,
+            title: withSubstrate(`Dispatched to ${name} — no delegated-run receipt yet; this subagent itself runs on the API`),
+        };
     }
     const started = Number(evidence.delegated_runs_started || 0);
     const settled = Number(evidence.delegated_runs_settled || 0);
-    if (!started && evidence.evidence_read_failed) {
-        // The custody log EXISTS but could not be read: the zero counts above
-        // are UNKNOWN, not an established fact — rendering them as "no run
-        // recorded" would issue a receipt nothing verified (sol finding,
-        // b49f8192 wave).
+    const failed = Number(evidence.delegated_runs_failed || 0);
+    if (evidence.evidence_read_failed) {
+        // The custody log EXISTS but could not be (fully) read: the counts are
+        // UNKNOWN, not an established fact (sol finding, b49f8192 wave). This
+        // holds past recorded starts too — the partial work-order replay sets
+        // the flag with started>0, and a confident settled/spend receipt over
+        // admittedly incomplete evidence would be a lie. No substrate clause:
+        // the seam never claims a substrate over unreadable evidence.
         return {
             ...base,
             label: `${name} (evidence unavailable)`,
-            title: `The ${name} route was assigned, but the delegated-run evidence could not be read — whether a run happened is unknown, not "none"`,
+            title: started
+                ? `The ${name} route was assigned and at least ${started} delegated run(s) started, but the evidence could not be fully read — final counts are unknown`
+                : `The ${name} route was assigned, but the delegated-run evidence could not be read — whether a run happened is unknown, not "none"`,
         };
     }
     if (!started) {
         return {
             ...base,
-            label: `${name} (no run recorded)`,
-            title: `The ${name} route was assigned, but there is no durable record of a delegated run for this subagent`,
+            label: `${name} · no run yet`,
+            title: withSubstrate(`The ${name} route was assigned, but there is no durable record of a delegated run for this subagent`),
         };
     }
     if (!settled) {
         return {
             ...base,
-            title: `Delegated to your ${name} account — ${started} run(s) started, none settled`,
+            label: `${name} · running`,
+            title: withSubstrate(`Delegated to your ${name} account — ${started} run(s) started, none settled`),
         };
     }
     const cost = evidence.subscription_cost_usd;
@@ -150,9 +173,15 @@ export function executorChip(evt) {
     const costPart = (cost === null || cost === undefined)
         ? 'subscription spend undisclosed'
         : `${approx}$${Number(cost).toFixed(2)} subscription`;
+    const runsPart = `${settled} run${settled === 1 ? '' : 's'}`;
+    // `delegated_runs_failed` = settled − succeeded from the evidence SSOT
+    // (delegate_evidence.task_execution_evidence): all-failed runs must never
+    // read as a clean receipt. A historical frame without the counter renders
+    // plain, exactly as wide as what it disclosed.
     return {
         ...base,
-        title: `Delegated to your ${name} account — ${settled} run(s), ${costPart}`,
+        label: failed ? `${name} · ${runsPart}, ${failed} failed` : `${name} · ${runsPart}`,
+        title: withSubstrate(`Delegated to your ${name} account — ${runsPart} settled${failed ? `, ${failed} failed` : ''}, ${costPart}`),
     };
 }
 
