@@ -67,6 +67,10 @@ def test_runtime_policy_blocks_are_semantic_tool_failures():
         ("run_command", "⚠️ SHELL_CWD_BLOCKED: cwd escapes allowed roots.", "cwd_blocked"),
         ("run_script", "⚠️ RUN_SCRIPT_BLOCKED: interpreter must be one of ['python3'].", "run_script_blocked"),
         ("run_command", "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths.", "workspace_blocked"),
+        # The path/route-naming message shape production emits since the mode-aware
+        # write-shape fix (guard B names the resolved offending path and the route).
+        ("run_command", "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths. Blocked path: /x/data/y. Use the gated read_file/write_file tools for runtime data.", "workspace_blocked"),
+        ("run_command", "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands may not target paths outside the selected process root. Blocked path: /outside/z. Selected process root: /app.", "workspace_blocked"),
         ("run_command", "⚠️ ELEVATION_BLOCKED: shell command pattern looks like an elevation attempt.", "elevation_blocked"),
         ("run_command", "⚠️ SKILL_STATE_WRITE_BLOCKED: skill trust state is owner controlled.", "skill_state_blocked"),
         ("run_command", "⚠️ ARTIFACT_OUTPUT_ERROR: command succeeded but declared output registration failed.", "artifact_output_error"),
