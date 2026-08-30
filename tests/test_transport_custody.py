@@ -143,3 +143,65 @@ def test_is_loopback_base_url(url, expected):
     from ouroboros.transport_custody import is_loopback_base_url
 
     assert is_loopback_base_url(url) is expected
+
+
+def test_attempt_custody_event_fields_bind_ledger_and_cause():
+    """Nanny-leaf S3: durable error events carry the attempt-ledger join key,
+    the custody state, and the bounded transport cause TYPE (never raw text)."""
+    import httpx
+
+    from ouroboros import usage_accounting as ua
+    from ouroboros.transport_custody import attempt_custody_event_fields
+
+    capture = ua.PhysicalAttemptCapture(
+        attempt_id="pa-s3", model="m", provider="openrouter", state="unresolved",
+        candidate_measurement_kind="opaque",
+    )
+    cause = httpx.RemoteProtocolError("peer closed connection")
+    try:
+        raise RuntimeError("Connection error.") from cause
+    except RuntimeError as exc:
+        exc.physical_attempt_capture = capture
+        fields = attempt_custody_event_fields(exc)
+    assert fields["physical_attempt_id"] == "pa-s3"
+    assert fields["attempt_custody_state"] == "unresolved"
+    assert fields["transport_cause_type"] == "RemoteProtocolError"
+
+
+def test_attempt_custody_event_fields_absent_safe():
+    from ouroboros.transport_custody import attempt_custody_event_fields
+
+    assert attempt_custody_event_fields(RuntimeError("plain")) == {}
+
+
+def test_attempt_custody_capture_found_on_explicit_cause():
+    """Sol lane B #2: wrappers (LocalContextTooLargeError, recovery RuntimeError)
+    can carry the capture only on their explicit cause — the join key must
+    survive the wrapping."""
+    from ouroboros import usage_accounting as ua
+    from ouroboros.transport_custody import attempt_custody_event_fields
+
+    capture = ua.PhysicalAttemptCapture(
+        attempt_id="pa-wrapped", model="m", provider="openrouter", state="unresolved",
+        candidate_measurement_kind="opaque", provider_error_type="overflow",
+    )
+    inner = RuntimeError("provider said no")
+    inner.physical_attempt_capture = capture
+    try:
+        raise ValueError("wrapper without capture") from inner
+    except ValueError as exc:
+        fields = attempt_custody_event_fields(exc)
+    assert fields["physical_attempt_id"] == "pa-wrapped"
+    assert fields["provider_error_type"] == "overflow"
+
+
+def test_attempt_custody_cause_walk_matches_bare_builtin_transport_errors():
+    """Fable lane B F5: a bare builtins ConnectionResetError/TimeoutError cause
+    (no httpx wrapper) still yields a transport cause type."""
+    from ouroboros.transport_custody import attempt_custody_event_fields
+
+    try:
+        raise RuntimeError("wrapped") from ConnectionResetError("peer reset")
+    except RuntimeError as exc:
+        fields = attempt_custody_event_fields(exc)
+    assert fields["transport_cause_type"] == "ConnectionResetError"

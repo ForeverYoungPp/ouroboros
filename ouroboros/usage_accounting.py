@@ -1,14 +1,11 @@
 """Durable physical-model-attempt accounting.
 
-The append-only JSONL ledger is the monetary authority.  Existing
-``llm_usage`` events and ``state.json`` remain compatibility projections and
-carry ledger attempt ids, so they can never become a second charge source.
-
-The implementation is deliberately small: no hash chain, fanout reservation,
-epoch/reconcile platform, or per-attempt snapshot database.  A projection is
-replayed from validated records under the same short cross-process lock used
-for budget check + append + fsync; network I/O always happens outside that lock.
-"""
+The append-only JSONL ledger is the monetary authority; ``llm_usage`` events and
+``state.json`` remain compatibility projections carrying ledger attempt ids, so
+they can never become a second charge source. Deliberately small: no hash chain,
+fanout reservation, epoch/reconcile platform, or per-attempt snapshot database —
+a projection is replayed from validated records under the same short
+cross-process lock as budget check + append + fsync; network I/O stays outside."""
 
 from __future__ import annotations
 
@@ -235,8 +232,7 @@ class AttemptRequest:
     candidate_context_size_bytes: Optional[int] = None
     candidate_measurement_kind: Literal["canonical_json_v1", "opaque"] = "opaque"
     physical_context: Optional[PhysicalAttemptContext] = None
-    # Route-locality fact (additive): the base_url host is localhost/127.0.0.1/::1
-    # (loopback OpenAI-compatible installs — Ollama / LM Studio / vLLM).
+    # Route-locality fact (additive): base_url host is localhost/127.0.0.1/::1 (loopback OpenAI-compatible installs — Ollama / LM Studio / vLLM).
     route_is_loopback: bool = False
 @dataclass(frozen=True)
 class AttemptReservation:
@@ -485,9 +481,9 @@ def usage_breakdown(
             "by_category": by_category,
             "by_task": by_task,
             "by_root": by_root,
-            # Execution-axis filter (v6.91): delegated (subscription-harness) rows only —
-            # a VIEW over the same rows for "where did the money go" readers, never a third
-            # monetary sum or authority. Disclosed-free settles $0; undisclosed stays `unknown`.
+            # Execution-axis filter (v6.91): delegated (subscription-harness) rows only — a
+            # VIEW for "where did the money go" readers, never a third monetary sum or
+            # authority; disclosed-free settles $0, undisclosed stays `unknown`.
             "delegated": _with_integrity(
                 _breakdown_bucket([row for row in rows if str(row.get("kind") or "") == "subscription_session"]),
                 integrity_degraded,
@@ -1139,7 +1135,11 @@ def _terminalize_failed_attempt(reservation: AttemptReservation, exc: BaseExcept
         )
         return "settled"
     else:
-        mark_unresolved(reservation, f"{type(exc).__name__}: {exc}")
+        from ouroboros.transport_custody import attempt_custody_event_fields
+        cause = attempt_custody_event_fields(exc).get("transport_cause_type")
+        suffix = f" [cause: {cause}]" if cause else ""
+        # Suffix leads: a verbose provider body must not truncate it away (mark_unresolved keeps 500 chars).
+        mark_unresolved(reservation, f"{type(exc).__name__}{suffix}: {exc}")
         return "unresolved"
 
 

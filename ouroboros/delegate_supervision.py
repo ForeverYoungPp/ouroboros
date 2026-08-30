@@ -41,7 +41,15 @@ def _load_state(ctx: Any, run_id: str) -> dict[str, Any]:
     if not isinstance(data, dict) or (
         str(run_id) and str(data.get("run_id") or "") != str(run_id)
     ):
+        # The unknown-provider hold is CROSS-RUN durable state (nanny-leaf): a
+        # state rebuild for a newer/first run id must not erase the latch —
+        # supervised_wait's own entry persisted the reset, so a worker crash
+        # during the (hours-long) wait lost the hold and the recovered
+        # successor dispatched the unknown transcript again (final-pair F2).
+        hold = data.get("unknown_provider_hold") if isinstance(data, dict) else None
         data = {"schema": 1, "run_id": str(run_id), "journal_cursor": 0}
+        if isinstance(hold, dict):
+            data["unknown_provider_hold"] = hold
     return data
 
 
@@ -877,6 +885,53 @@ def supervised_wait(
                 "journal_cursor": int(state.get("journal_cursor") or 0),
                 "event_only": True,
             })
+        _save_state(ctx, state)
+
+
+def read_unknown_hold(ctx: Any) -> dict[str, Any]:
+    """Durable unknown-provider hold latch (nanny-leaf D1-min).
+
+    Written when a nanny round dies ``provider_outcome_unknown`` with exactly one
+    live delegated leaf; the successor generation (worker-crash adoption) must
+    re-enter the hold BEFORE any LLM call, so the latch lives in this durable
+    supervision record that ``prepare_handoff`` already snapshots.
+
+    An EXISTING-but-unreadable state file raises ``UnknownHoldUnreadable``,
+    never an empty dict: "no latch" and "cannot know whether a latch exists"
+    must not look alike — the caller fails closed to a no-call terminal
+    instead of dispatching a possible resend (final-pair sol #2).
+    """
+    path = _state_path(ctx)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise UnknownHoldUnreadable(str(exc)) from exc
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise UnknownHoldUnreadable(str(exc)) from exc
+    hold = data.get("unknown_provider_hold") if isinstance(data, dict) else None
+    return dict(hold) if isinstance(hold, dict) else {}
+
+
+class UnknownHoldUnreadable(Exception):
+    """The durable hold latch exists but cannot be read (fail closed)."""
+
+
+def write_unknown_hold(ctx: Any, run_id: str, hold: dict[str, Any]) -> None:
+    # run_id is deliberately unused: loaded with the reset-proof empty run_id,
+    # so latching for a NEWER leaf cannot rebuild the state and wipe the
+    # journal cursor or an unacked wake; the run id travels inside ``hold``.
+    state = _load_state(ctx, "")
+    state["unknown_provider_hold"] = dict(hold)
+    _save_state(ctx, state)
+
+
+def clear_unknown_hold(ctx: Any) -> None:
+    state = _load_state(ctx, "")
+    if state.pop("unknown_provider_hold", None) is not None:
         _save_state(ctx, state)
 
 

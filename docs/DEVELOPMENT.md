@@ -2134,8 +2134,12 @@ Before every commit, verify the following:
   binds the token to the recorded delegated surface, slot, and operation; an API
   row has no durable-token recovery authority without process-local custody.
   A dispatched request whose socket or stream ends without terminal
-  provider evidence is `provider_outcome_unknown`: no same-model, fallback,
-  provider, local-server, or forced-final resend until custody settles.
+  provider evidence is `provider_outcome_unknown`: THAT request is never
+  resent by any route (same-model, fallback, provider, local-server, or
+  forced-final) — its `unresolved` ledger row is terminal and never settles.
+  A NEW logical request is legal only when it carries a unique host-attested
+  input absent from the unknown request (e.g. a delegated-leaf wake receipt,
+  the nanny-leaf hold contract in `ouroboros/delegate_hold.py`).
 - [ ] A reviewed mutative wrapper must retain foreground custody until the
   workflow settles. Inner phase bounds and the task/supervisor absolute deadline
   are the stop axes; never use the global 600s tool default or a separately

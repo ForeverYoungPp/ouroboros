@@ -1123,6 +1123,20 @@ def _reconcile_delegated_runs(running_task_ids: set) -> None:
         )
         if outcomes:
             log.info("Delegated-run reconciliation handled %d orphan(s): %s", len(outcomes), outcomes)
+            # A run settled by this sweep may belong to a task that already wrote
+            # its terminal result with a non-empty unreconciled disclosure — the
+            # stored projection then lies forever (nanny-leaf S1). Audit-only
+            # refresh; never cancels.
+            from ouroboros.delegate_terminal import refresh_terminal_reconciliation
+
+            for tid in {str(o.get("task_id") or "") for o in outcomes
+                        if o.get("task_id") and (o.get("settled") or str(
+                            o.get("action") or "") in (
+                                "absent", "cancelled", "invocation_retired"))}:
+                try:
+                    refresh_terminal_reconciliation(DATA_DIR, tid)
+                except Exception:
+                    log.debug("Sweep terminal-result refresh failed for %s", tid, exc_info=True)
     except Exception:
         log.debug("Delegated-run reconciliation failed", exc_info=True)
 
