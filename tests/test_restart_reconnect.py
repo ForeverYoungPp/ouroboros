@@ -56,7 +56,8 @@ def test_final_answer_marker_uses_ordinary_message_presentation():
 
     assert "renderAssistantWithAnswerChip" not in source
     assert "final-answer-chip" not in css
-    assert ": renderMarkdown(text));" in source
+    # The rich renderer is reached through the byte-frozen chat module's short alias.
+    assert ":m(text)" in source
     # Both live and history assistant/system paths feed the same addMessage renderer;
     # reconnect notices do too, so marker-shaped text never gets a separate capsule.
     assert "addMessage(msg.content, msg.role" in source

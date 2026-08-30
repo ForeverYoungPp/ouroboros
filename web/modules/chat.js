@@ -1,8 +1,5 @@
-import {
-    escapeHtmlAttr,
-    escapeHtmlText as escapeHtml,
-    renderMarkdown,
-} from './utils.js';
+import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
+import { d,e,m } from './chat_markdown.js';
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
@@ -2789,11 +2786,7 @@ export function createChatInstance({
         const sender = senderLabel(role, isProgress, systemType, {
             source, senderLabel: senderLabelOverride, senderSessionId,
         }, chatSessionId);
-        const rendered = role === 'user'
-            ? escapeHtml(text)
-            : (role === 'system' && systemType === 'skill_review'
-                ? renderSkillReviewDisclosure(text, opts.skillReview || null)
-                : renderMarkdown(text));
+        const rendered=role==='user'?escapeHtml(text):role==='system'&&systemType==='skill_review'?renderSkillReviewDisclosure(text,opts.skillReview||null):m(text);
         const timeFmt = formatMsgTime(ts);
         const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
         const pendingHtml = pending ? `<div class="msg-pending">Queued until reconnect</div>` : '';
@@ -2817,6 +2810,7 @@ export function createChatInstance({
         wireSkillReviewDisclosure(bubble, () => requestAnimationFrame(() => !destroyed && updateMessagesPadding({ preserveStickiness: true })));
         stampNodeTimestamp(bubble, ts);
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
+        if(role!=='user'&&systemType!=='skill_review')e(bubble);
         renderRoutingAnnotation(bubble, opts.chatAnnotation);
         rememberMessageKey(messageKey);
         if (pending && clientMessageId) pendingUserBubbles.set(clientMessageId, bubble);
@@ -3047,7 +3041,7 @@ export function createChatInstance({
                     // state so the rebuild below cannot produce duplicates even if
                     // stale bubbles lingered in the DOM. Keep the typing indicator.
                     for (const bubble of Array.from(messagesDiv.querySelectorAll('.chat-bubble'))) {
-                        if (!bubble.classList.contains('typing-bubble')) bubble.remove();
+                        if(!bubble.classList.contains('typing-bubble')){d(bubble);bubble.remove()}
                     }
                     seenMessageKeys.clear();
                     messageKeyOrder.length = 0;
@@ -4625,7 +4619,7 @@ export function createChatInstance({
             seenMessageKeys.clear();
             messageKeyOrder.length = 0;
             persistedHistory.length = 0;
-            try { page.remove(); } catch {}
+            try{d(page);page.remove()}catch{}
         },
     };
 }
