@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createChatMedia, safeHttpUrl } from '../modules/chat_media.js';
+import { createRebuildBatch } from '../modules/chat_render_batch.js';
 
 class Classes {
     constructor(node) { this.node = node; this.values = new Set(); }
@@ -127,7 +128,7 @@ class NodeStub {
     load() {}
 }
 
-function fixture() {
+function fixture({ insertNode = null } = {}) {
     const tracker = { adds: 0, removes: 0, created: [] };
     const body = new NodeStub('body', tracker);
     const inserted = [];
@@ -139,6 +140,7 @@ function fixture() {
             tracker.created.push(node);
             return node;
         },
+        createDocumentFragment: () => new NodeStub('#fragment', tracker),
         execCommand: () => true,
     };
     globalThis.window = { open() {} };
@@ -150,7 +152,11 @@ function fixture() {
         chatSessionId: 'session',
         durableChatMediaUrl: (value) => String(value || ''),
         formatMsgTime: () => null,
-        insertMessageNode(node) { body.appendChild(node); inserted.push(node); },
+        insertMessageNode(node) {
+            if (insertNode) insertNode(node);
+            else body.appendChild(node);
+            inserted.push(node);
+        },
         senderLabel: () => 'Owner',
         stampNodeTimestamp(node, raw) { node.dataset.ts = String(raw || ''); },
     });
@@ -200,6 +206,122 @@ test('photos with an empty task id remain separate bubbles', () => {
         assert.equal(fx.inserted.length, 2);
         assert.equal(fx.inserted[0].querySelectorAll('.chat-gallery-item').length, 1);
         assert.equal(fx.inserted[1].querySelectorAll('.chat-gallery-item').length, 1);
+    } finally {
+        fx.controller.destroy();
+        fx.restore();
+    }
+});
+
+test('an intervening message breaks photo adjacency: same key starts a new gallery in feed order', () => {
+    const fx = fixture();
+    try {
+        const photo = (ts) => ({
+            type: 'photo', role: 'assistant', task_id: 'task-a',
+            image_base64: 'aGVsbG8=', mime: 'image/png', ts,
+        });
+        let msg = photo('2026-08-30T00:00:00Z');
+        assert.equal(fx.controller.buildGallery('photos', msg, fx.controller.buildMediaBubble(msg)), true);
+        // A plain text bubble lands below the gallery (inserted by chat.js,
+        // outside chat_media) — the wrapper is no longer the feed tail.
+        const text = new NodeStub('div', fx.tracker);
+        text.className = 'chat-bubble';
+        globalThis.document.body.appendChild(text);
+        msg = photo('2026-08-30T00:00:02Z');
+        assert.equal(fx.controller.buildGallery('photos', msg, fx.controller.buildMediaBubble(msg)), true);
+
+        assert.equal(fx.inserted.length, 2, 'a second wrapper starts instead of teleporting up');
+        assert.equal(fx.inserted[0].querySelectorAll('.chat-gallery-item').length, 1);
+        assert.equal(fx.inserted[1].querySelectorAll('.chat-gallery-item').length, 1);
+        assert.deepEqual(
+            globalThis.document.body.children,
+            [fx.inserted[0], text, fx.inserted[1]],
+            'timeline order is preserved: gallery, text, gallery',
+        );
+        // The map keeps the LATEST wrapper: the next contiguous photo joins it.
+        msg = photo('2026-08-30T00:00:03Z');
+        assert.equal(fx.controller.buildGallery('photos', msg, fx.controller.buildMediaBubble(msg)), true);
+        assert.equal(fx.inserted.length, 2);
+        assert.equal(fx.inserted[1].querySelectorAll('.chat-gallery-item').length, 2);
+        assert.equal(fx.inserted[0].querySelectorAll('.chat-gallery-item').length, 1);
+    } finally {
+        fx.controller.destroy();
+        fx.restore();
+    }
+});
+
+test('a trailing typing indicator does not break photo grouping', () => {
+    const fx = fixture();
+    try {
+        const photo = (ts) => ({
+            type: 'photo', role: 'assistant', task_id: 'task-a',
+            image_base64: 'aGVsbG8=', mime: 'image/png', ts,
+        });
+        let msg = photo('2026-08-30T00:00:00Z');
+        assert.equal(fx.controller.buildGallery('photos', msg, fx.controller.buildMediaBubble(msg)), true);
+        const typing = new NodeStub('div', fx.tracker);
+        typing.className = 'chat-bubble typing-bubble';
+        globalThis.document.body.appendChild(typing);
+        msg = photo('2026-08-30T00:00:01Z');
+        assert.equal(fx.controller.buildGallery('photos', msg, fx.controller.buildMediaBubble(msg)), true);
+        assert.equal(fx.inserted.length, 1, 'typing indicator does not split the gallery');
+        assert.equal(fx.inserted[0].querySelectorAll('.chat-gallery-item').length, 2);
+    } finally {
+        fx.controller.destroy();
+        fx.restore();
+    }
+});
+
+test('an intervening message breaks file-card adjacency the same way', () => {
+    const fx = fixture();
+    try {
+        const doc = (ts, filename) => ({
+            type: 'document', role: 'assistant', task_id: 'task-a', filename,
+            mime: 'application/pdf', file_base64: 'aGVsbG8=', size_bytes: 5, ts,
+        });
+        let msg = doc('2026-08-30T00:00:00Z', 'one.pdf');
+        assert.equal(fx.controller.buildGallery('files', msg, fx.controller.buildDocumentBubble(msg)), true);
+        const text = new NodeStub('div', fx.tracker);
+        text.className = 'chat-bubble';
+        globalThis.document.body.appendChild(text);
+        msg = doc('2026-08-30T00:00:02Z', 'two.pdf');
+        assert.equal(fx.controller.buildGallery('files', msg, fx.controller.buildDocumentBubble(msg)), true);
+
+        assert.equal(fx.inserted.length, 2);
+        assert.equal(fx.inserted[0].querySelectorAll('.chat-file-item').length, 1);
+        assert.equal(fx.inserted[1].querySelectorAll('.chat-file-item').length, 1);
+        assert.deepEqual(globalThis.document.body.children, [fx.inserted[0], text, fx.inserted[1]]);
+    } finally {
+        fx.controller.destroy();
+        fx.restore();
+    }
+});
+
+test('rebuild replay keeps gallery adjacency via the batch holding fragment', () => {
+    let batch = null;
+    const fx = fixture({ insertNode: (node) => batch.collect(node) });
+    try {
+        batch = createRebuildBatch(globalThis.document);
+        const photo = (ts) => ({
+            type: 'photo', role: 'assistant', task_id: 'task-a',
+            image_base64: 'aGVsbG8=', mime: 'image/png', ts,
+        });
+        // Contiguous photos merge even while detached inside the batch.
+        let msg = photo('2026-08-30T00:00:00Z');
+        assert.equal(fx.controller.buildGallery('photos', msg, fx.controller.buildMediaBubble(msg)), true);
+        msg = photo('2026-08-30T00:00:01Z');
+        assert.equal(fx.controller.buildGallery('photos', msg, fx.controller.buildMediaBubble(msg)), true);
+        assert.equal(fx.inserted.length, 1);
+        assert.equal(fx.inserted[0].querySelectorAll('.chat-gallery-item').length, 2);
+        // A text bubble collected between photos breaks adjacency during replay too.
+        const text = new NodeStub('div', fx.tracker);
+        text.className = 'chat-bubble';
+        batch.collect(text);
+        msg = photo('2026-08-30T00:00:03Z');
+        assert.equal(fx.controller.buildGallery('photos', msg, fx.controller.buildMediaBubble(msg)), true);
+        assert.equal(fx.inserted.length, 2, 'replay starts a new gallery after the text bubble');
+        assert.equal(fx.inserted[1].querySelectorAll('.chat-gallery-item').length, 1);
+        // The holding fragment preserves arrival (chronological) order.
+        assert.deepEqual(text.parentNode.children, [fx.inserted[0], text, fx.inserted[1]]);
     } finally {
         fx.controller.destroy();
         fx.restore();

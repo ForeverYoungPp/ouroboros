@@ -517,6 +517,26 @@ export function createChatMedia({
         </div>`);
     }
 
+    function isFeedTailWrapper(wrapper) {
+        // Timeline contract (ARCHITECTURE: messages ordered by raw numeric
+        // timestamps): media may join an existing gallery only while its
+        // wrapper is still the LAST message node of its feed — only typing
+        // indicators may trail it. Once any other message lands below the
+        // wrapper, appending there would teleport newer media above older
+        // messages, so the same key starts a fresh group instead. Works for
+        // the mounted live feed and for the rebuild-replay holding fragment
+        // (chat_render_batch parents collected nodes in arrival order).
+        const parent = wrapper?.parentNode;
+        if (!parent) return false;
+        const siblings = Array.from(parent.children || []);
+        const index = siblings.indexOf(wrapper);
+        if (index < 0) return false;
+        for (let i = index + 1; i < siblings.length; i += 1) {
+            if (!siblings[i]?.classList?.contains?.('typing-bubble')) return false;
+        }
+        return true;
+    }
+
     function buildGallery(kind, msg, bubble) {
         if (!bubble) return false;
         const role = msg.role === 'user' ? 'user' : 'assistant';
@@ -530,25 +550,28 @@ export function createChatMedia({
         }
         const key = `${role}:${kind}:${taskId}`;
         const existing = map.get(key);
-        if (!existing) {
-            bubble.dataset.mediaGroup = key;
-            map.set(key, bubble);
-            groupingWrappers.add(bubble);
-            insertMessageNode(bubble);
+        if (existing && isFeedTailWrapper(existing)) {
+            const item = bubble.querySelector(selector);
+            const grid = existing.querySelector(gridSelector);
+            if (!item || !grid) return false;
+            grid.appendChild(item);
+            existing.classList.add('is-multiple');
+            if (!existing.querySelector('.chat-group-title')) {
+                const title = document.createElement('div');
+                title.className = 'chat-group-title';
+                title.textContent = kind === 'photos' ? 'Multiple images' : 'Multiple files';
+                grid.before(title);
+            }
+            stampNodeTimestamp(existing, msg.ts || '', { anchor: true });
             return true;
         }
-        const item = bubble.querySelector(selector);
-        const grid = existing.querySelector(gridSelector);
-        if (!item || !grid) return false;
-        grid.appendChild(item);
-        existing.classList.add('is-multiple');
-        if (!existing.querySelector('.chat-group-title')) {
-            const title = document.createElement('div');
-            title.className = 'chat-group-title';
-            title.textContent = kind === 'photos' ? 'Multiple images' : 'Multiple files';
-            grid.before(title);
-        }
-        stampNodeTimestamp(existing, msg.ts || '', { anchor: true });
+        // First bubble for this key, or adjacency broken by an intervening
+        // message: start a new group under the same key. The map keeps the
+        // LATEST wrapper so the next contiguous item groups with this one.
+        bubble.dataset.mediaGroup = key;
+        map.set(key, bubble);
+        groupingWrappers.add(bubble);
+        insertMessageNode(bubble);
         return true;
     }
 
