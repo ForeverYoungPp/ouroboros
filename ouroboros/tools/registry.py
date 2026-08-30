@@ -2064,6 +2064,10 @@ class ToolRegistry:
             return "outside this presence task's positive capability ceiling"
         if requested not in self._entries:
             return None
+        if self._entries[requested].alias_for:
+            # Mirrors get_schema_by_name: a compat alias is callable but never
+            # advertised — discovery answers as for any non-public name.
+            return None
         available, reason, _detail = _builtin_tool_availability(requested, self._ctx)
         if not available:
             return f"unavailable ({reason})"
@@ -2089,6 +2093,10 @@ class ToolRegistry:
         if not _presence_tool_allowed(self._ctx, requested):
             return None
         entry = self._entries.get(requested)
+        if entry and entry.alias_for:
+            # Compat aliases are callable, never advertised — discovery answers
+            # as it does for any non-public name.
+            return None
         if entry:
             available, reason, detail = _builtin_tool_availability(requested, self._ctx)
             if not available:

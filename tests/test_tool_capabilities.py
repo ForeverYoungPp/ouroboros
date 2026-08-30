@@ -885,7 +885,7 @@ def test_local_readonly_subagent_execute_blocks_forbidden_tools(tmp_path, monkey
         "update_scratchpad",
         "update_identity",
         "commit_reviewed",
-        "advisory_review",
+        "preflight_review",
         "task_acceptance_review",
         "skill_review",
         "request_restart",
@@ -1905,6 +1905,12 @@ def test_policy_hidden_reason_pins_get_schema_by_name(tmp_path):
         registry.set_context(ctx)
         drift = []
         for name in list(registry._entries):
+            if registry._entries[name].alias_for:
+                # A compat alias is a non-public name by design: both methods
+                # answer as for an unknown name (no schema, no reason).
+                assert registry.get_schema_by_name(name) is None
+                assert registry.policy_hidden_reason(name) is None
+                continue
             schema = registry.get_schema_by_name(name)
             reason = registry.policy_hidden_reason(name)
             if (schema is None) != (reason is not None):
