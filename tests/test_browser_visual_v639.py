@@ -61,12 +61,17 @@ def test_wait_for_page_paint_never_raises():
 def test_evaluate_retries_statement_snippet_in_iife(monkeypatch):
     # A statement-style snippet (top-level `return`) is a SyntaxError as a raw evaluate
     # expression; the action must retry it wrapped in an IIFE before surfacing a parse error.
+    # Both attempts arrive inside the _evaluate_bounded Promise.race deadline wrapper
+    # (the "})()" suffix is the IIFE retry marker; the raw attempt lacks it).
     seen = []
 
     class _Page:
+        def set_default_timeout(self, ms):
+            pass
+
         def evaluate(self, js):
             seen.append(js)
-            if not js.lstrip().startswith("(()"):
+            if "})()" not in js:
                 raise RuntimeError("SyntaxError: Illegal return statement")
             return "iife-ok"
 
@@ -85,15 +90,20 @@ def test_evaluate_retries_statement_snippet_in_iife(monkeypatch):
 
     out = browser._browser_action(_Ctx(), "evaluate", value="return 1 + 1;")
     assert "iife-ok" in out
-    assert len(seen) == 2 and seen[1].lstrip().startswith("(()")  # raw then IIFE-wrapped
+    assert len(seen) == 2  # raw then IIFE-wrapped
+    assert "})()" not in seen[0] and "})()" in seen[1]
+    assert all("Promise.race" in js for js in seen)  # both attempts stay bounded
 
 
 def test_evaluate_runtime_error_not_misreported_as_syntax(monkeypatch):
     # raw SyntaxError -> IIFE retry -> the wrapped code throws a RUNTIME error: it must
     # surface as that runtime error, NOT be misreported as a syntax parse failure.
     class _Page:
+        def set_default_timeout(self, ms):
+            pass
+
         def evaluate(self, js):
-            if not js.lstrip().startswith("(()"):
+            if "})()" not in js:
                 raise RuntimeError("SyntaxError: Illegal return statement")
             raise RuntimeError("ReferenceError: missingFn is not defined")
 
@@ -113,3 +123,98 @@ def test_evaluate_runtime_error_not_misreported_as_syntax(monkeypatch):
         browser._browser_action(_Ctx(), "evaluate", value="return missingFn();")
     assert "ReferenceError" in str(exc.value)
     assert "BROWSER_EVALUATE_SYNTAX_ERROR" not in str(exc.value)
+
+
+class _RecordingPage:
+    """Fake page: records evaluate payloads and the session default timeout."""
+
+    def __init__(self, result="ok"):
+        self.evaluated = []
+        self.default_ms = None
+        self.url = "http://example.test/"
+        self._result = result
+
+    def set_default_timeout(self, ms):
+        self.default_ms = ms
+
+    def evaluate(self, js):
+        self.evaluated.append(js)
+        return self._result
+
+    def title(self):
+        return "t"
+
+    def inner_text(self, _selector):
+        return "body text"
+
+    def goto(self, url, timeout=None, wait_until=None):
+        self.evaluated.append(("goto", url, timeout))
+
+
+def _action_ctx():
+    class _BrowserState:
+        last_screenshot_b64 = ""
+        _browser_engine = "chromium"
+        _browser_device = ""
+
+    class _Ctx:
+        browser_state = _BrowserState()
+
+    return _Ctx()
+
+
+def test_evaluate_bounded_wraps_in_promise_race_with_deadline():
+    page = _RecordingPage()
+    browser._evaluate_bounded(page, "1 + 1", 7000)
+    assert len(page.evaluated) == 1
+    js = page.evaluated[0]
+    # The in-page race carries the expression and a setTimeout rejection at the deadline.
+    assert "Promise.race" in js and "setTimeout" in js
+    assert "1 + 1" in js and "7000ms" in js
+    # Function-valued expressions are invoked (Playwright-parity), others returned.
+    assert "typeof __obo_result === 'function'" in js
+
+
+def test_action_evaluate_and_scroll_route_through_bounded_wrapper(monkeypatch):
+    page = _RecordingPage()
+    monkeypatch.setattr(browser, "_ensure_browser", lambda *a, **k: page)
+    monkeypatch.setattr(browser, "_readonly_subagent", lambda ctx: False)
+
+    out = browser._browser_action(_action_ctx(), "evaluate", value="document.title")
+    assert "ok" in out
+    assert "Promise.race" in page.evaluated[-1] and "document.title" in page.evaluated[-1]
+    # The 5s action default cannot strangle default-honoring capture calls.
+    assert page.default_ms == 30000
+
+    browser._browser_action(_action_ctx(), "scroll", value="bottom")
+    assert "Promise.race" in page.evaluated[-1]
+    assert "document.body.scrollHeight" in page.evaluated[-1]
+
+    # An explicitly larger caller timeout widens the session default and the
+    # in-page evaluate deadline alike.
+    browser._browser_action(_action_ctx(), "evaluate", value="1 + 1", timeout=120000)
+    assert page.default_ms == 120000
+    assert "120000ms" in page.evaluated[-1]
+
+
+def test_health_snapshot_and_markdown_extraction_use_bounded_evaluate():
+    page = _RecordingPage()
+    browser._page_health_snapshot(page)
+    health_js = [js for js in page.evaluated if isinstance(js, str)]
+    assert any("querySelectorAll('canvas')" in js and "Promise.race" in js for js in health_js)
+
+    page2 = _RecordingPage(result="# markdown")
+    out = browser._extract_page_output(page2, "markdown", _action_ctx())
+    assert out.startswith("# markdown")
+    assert any("Promise.race" in js for js in page2.evaluated if isinstance(js, str))
+
+
+def test_browse_page_sets_session_default_timeout_from_caller(monkeypatch):
+    page = _RecordingPage(result="text out")
+    monkeypatch.setattr(browser, "_ensure_browser", lambda *a, **k: page)
+    monkeypatch.setattr(browser, "_readonly_subagent", lambda ctx: False)
+
+    out = browser._browse_page(_action_ctx(), "http://example.test/", output="text", timeout=45000)
+    assert "body text" in out
+    assert page.default_ms == 45000
+    assert ("goto", "http://example.test/", 45000) in page.evaluated

@@ -876,6 +876,52 @@ def test_latest_llm_response_text_salvages_newest_assistant_text(tmp_path):
     assert latest_llm_response_text(tmp_path, "t-salvage") == "newest real progress"
 
 
+def test_latest_llm_response_text_strips_trailing_protocol_object(tmp_path):
+    """Salvage lockstep with the loop's trailing-object parse: a body of prose
+    plus a trailing delivery-control object salvages the PROSE only; a body
+    that is entirely the protocol object stays suppressed (skipped); an object
+    quoted mid-prose passes through untouched."""
+    import time as _time
+
+    from ouroboros.observability import latest_llm_response_text, persist_call
+
+    persist_call(
+        tmp_path, task_id="t-strip", call_id="llm_a_response", call_type="llm_response",
+        payload={"message": {"content": "older real text"}, "usage": {}},
+    )
+    _time.sleep(0.02)
+    persist_call(
+        tmp_path, task_id="t-strip", call_id="llm_b_response", call_type="llm_response",
+        payload={
+            "message": {
+                "content": 'Final summary for the owner.\n\n{"delivery_control": "keep"}',
+            },
+            "usage": {},
+        },
+    )
+    assert latest_llm_response_text(tmp_path, "t-strip") == "Final summary for the owner."
+
+    # Entirely-protocol body: suppressed, salvage reaches the older real text.
+    persist_call(
+        tmp_path, task_id="t-whole", call_id="llm_a_response", call_type="llm_response",
+        payload={"message": {"content": "older real text"}, "usage": {}},
+    )
+    _time.sleep(0.02)
+    persist_call(
+        tmp_path, task_id="t-whole", call_id="llm_b_response", call_type="llm_response",
+        payload={"message": {"content": '{"delivery_control": "keep"}'}, "usage": {}},
+    )
+    assert latest_llm_response_text(tmp_path, "t-whole") == "older real text"
+
+    # Object with prose AFTER it is quoted material, not a directive.
+    quoted = 'the contract wants {"delivery_control": "keep"} as the reply'
+    persist_call(
+        tmp_path, task_id="t-quoted", call_id="llm_a_response", call_type="llm_response",
+        payload={"message": {"content": quoted}, "usage": {}},
+    )
+    assert latest_llm_response_text(tmp_path, "t-quoted") == quoted
+
+
 def test_latest_llm_response_text_scans_past_many_empty_tool_rounds(tmp_path):
     """Long tool-driven tasks have dozens of newest empty-content responses;
     the salvage must scan past ALL of them to the older real text."""

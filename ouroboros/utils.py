@@ -732,6 +732,65 @@ def estimate_tokens(text: str) -> int:
     return max(1, (len(str(text or "")) + 3) // 4)
 
 
+def extract_trailing_json_object(
+    text: str,
+    *,
+    duplicate_flag_keys: tuple = (),
+) -> tuple[str, Optional[Dict[str, Any]], bool]:
+    """Split ``text`` into ``(prose_prefix, trailing_dict_or_None, duplicate_flag)``.
+
+    Decodes the last complete JSON object via ``raw_decode`` anchored at a
+    ``{`` scanned from the end. The object counts as TRAILING only when
+    nothing but whitespace and/or one closing markdown fence follows it — an
+    object with prose after it is quoted material, never a directive, and the
+    whole call returns ``(text, None, False)``. Whole-text JSON yields an
+    empty prefix; a dangling opening fence is trimmed off the prefix so a
+    fenced object behaves like a bare one. Any duplicate key invalidates the
+    object (``None``, mirroring the loop's strict parser) while the boolean
+    reports whether a key from ``duplicate_flag_keys`` was the duplicate, so
+    protocol-repair intent survives the failed parse. Deliberately does NOT
+    scan for any specific key: key-scanning extraction has misfired on
+    answers that merely quote a protocol example (see
+    review_verdict_extraction's whole-text rationale).
+    """
+    raw = str(text or "")
+    decoder = json.JSONDecoder()
+    idx = raw.rfind("{")
+    while idx != -1:
+        try:
+            value, end = decoder.raw_decode(raw, idx)
+        except ValueError:
+            value, end = None, -1
+        # A decode that succeeds but is not a trailing dict (e.g. the last
+        # "{" was a nested object) falls through to the previous "{".
+        if end != -1 and isinstance(value, dict) and raw[end:].strip() in ("", "```"):
+            prefix = raw[:idx]
+            trimmed = prefix.rstrip()
+            cut = trimmed.rfind("\n")
+            if trimmed[cut + 1:].startswith("```"):
+                prefix = trimmed[:cut] if cut != -1 else ""
+            duplicate_flagged = False
+
+            def _unique_object(pairs: List[tuple]) -> Dict[str, Any]:
+                nonlocal duplicate_flagged
+                result: Dict[str, Any] = {}
+                for key, item in pairs:
+                    if key in result:
+                        if key in duplicate_flag_keys:
+                            duplicate_flagged = True
+                        raise ValueError(f"duplicate key: {key}")
+                    result[key] = item
+                return result
+
+            try:
+                parsed = json.loads(raw[idx:end], object_pairs_hook=_unique_object)
+            except ValueError:
+                parsed = None
+            return prefix, parsed, duplicate_flagged
+        idx = raw.rfind("{", 0, idx)
+    return raw, None, False
+
+
 def run_cmd(cmd: List[str], cwd: Optional[pathlib.Path] = None) -> str:
     # Tool output is PARSED (git error signatures, porcelain text), so it must not
     # depend on the operator's locale: a Russian-locale git answers «метка … уже

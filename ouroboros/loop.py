@@ -26,7 +26,7 @@ from ouroboros.context import build_user_content
 from ouroboros.context_budget import ContextReclaimRequest
 from ouroboros.context_compaction import compact_tool_history_llm, context_reclaim_transcript_sha256
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
-from ouroboros.utils import estimate_tokens, sanitize_tool_result_for_log, truncate_review_artifact
+from ouroboros.utils import estimate_tokens, extract_trailing_json_object, sanitize_tool_result_for_log, truncate_review_artifact
 from ouroboros.usage_accounting import (
     BudgetExceeded,
     PhysicalAttemptContext,
@@ -4131,33 +4131,19 @@ def _hold_delivery_for_skill_action(
 
 def _parse_delivery_control_object(
     raw: str,
-) -> tuple[Optional[Dict[str, Any]], bool]:
-    """Parse a delivery-control object while rejecting duplicate JSON keys.
+) -> tuple[str, Optional[Dict[str, Any]], bool]:
+    """Parse a whole-text OR trailing delivery-control object, duplicate-key strict.
 
-    The boolean preserves protocol intent for the repair path when a duplicate
-    ``delivery_control`` or ``full_answer`` key made the object invalid.
+    Returns ``(prose_prefix, parsed, duplicate_protocol_key)``. An object with
+    prose AFTER it is quoted material and parses as None; prose BEFORE a
+    trailing object parses (whole-text-only parsing leaked that raw JSON to
+    the owner AND dropped the directive). The boolean preserves repair-path
+    protocol intent on a duplicated protocol key.
     """
 
-    duplicate_protocol_key = False
-
-    def _unique_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-        nonlocal duplicate_protocol_key
-        result: Dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                if key in {"delivery_control", "full_answer"}:
-                    duplicate_protocol_key = True
-                raise ValueError(f"duplicate key: {key}")
-            result[key] = value
-        return result
-
-    try:
-        payload = json.loads(raw, object_pairs_hook=_unique_object)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None, duplicate_protocol_key
-    if not isinstance(payload, dict):
-        return None, False
-    return payload, False
+    return extract_trailing_json_object(
+        raw, duplicate_flag_keys=("delivery_control", "full_answer"),
+    )
 
 
 def _resolve_delivery_control(
@@ -4173,13 +4159,16 @@ def _resolve_delivery_control(
     if not isinstance(candidate, DeliveryCandidate):
         return "fresh", _extract_plain_text_from_content(content)
     raw = _extract_plain_text_from_content(content).strip()
-    parsed, duplicate_protocol_key = _parse_delivery_control_object(raw)
+    prose, parsed, duplicate_protocol_key = _parse_delivery_control_object(raw)
     # ANY parsed object carrying the protocol key is control intent,
     # regardless of verb/value — an unknown verb is a mangled protocol
     # attempt, never prose (raw JSON leaked to chat); validity judged below.
     is_control_intent = duplicate_protocol_key or (
         isinstance(parsed, dict) and "delivery_control" in parsed
     )
+    # Unarmed gates below: prose with a TRAILING control object ships as prose
+    # only — a fresh answer, never the protocol JSON.
+    stripped_prose = prose.rstrip() if is_control_intent and prose.strip() else ""
     if not required:
         if _delivery_replace_required(candidate):
             # A writer/skill action cannot silently turn a short acknowledgement
@@ -4193,8 +4182,8 @@ def _resolve_delivery_control(
             # typed keep cannot acknowledge the gate. No delivery JSON prompt
             # before the action — it would conflict with the instruction to
             # call the skill lifecycle tool.
-            if not is_control_intent:
-                return "fresh", _extract_plain_text_from_content(content)
+            if not is_control_intent or stripped_prose:
+                return "fresh", stripped_prose or _extract_plain_text_from_content(content)
             candidate.finalization_control = "skill_revision_required"
             required = True
             tools._ctx._delivery_control_required = True
@@ -4203,11 +4192,11 @@ def _resolve_delivery_control(
             # If the model still follows the prior typed instruction, honor
             # that control structurally; service/effect/skill rounds are
             # handled by the replace-required branch above.
-            if not (
+            if stripped_prose or not (
                 candidate.finalization_control == "owner_revision_required"
                 and is_control_intent
             ):
-                return "fresh", _extract_plain_text_from_content(content)
+                return "fresh", stripped_prose or _extract_plain_text_from_content(content)
             tools._ctx._delivery_control_required = True
     evidence_revision, evidence_fingerprint = _delivery_evidence_state(tools, ctx, llm_trace)
     error = "control must be one exact JSON object"
@@ -5253,9 +5242,10 @@ def _resolve_forced_delivery_control(
     if not armed:
         return extracted, ""
     tools_ctx._delivery_control_required = False
-    parsed, duplicate_protocol_key = _parse_delivery_control_object(extracted)
-    # Protocol intent: any parsed object with the protocol key (unknown verb =
-    # broken control, never prose), or JSON-looking text that fails to parse (a
+    _prose, parsed, duplicate_protocol_key = _parse_delivery_control_object(extracted)
+    # Protocol intent: any parsed object with the protocol key — whole-text or
+    # trailing after prose, whose prefix never ships (unknown verb = broken
+    # control, never prose) — or JSON-looking text that fails to parse (a
     # mangled protocol attempt under the armed latch — the candidate is the answer).
     protocol_intent = duplicate_protocol_key or (
         ("delivery_control" in parsed)

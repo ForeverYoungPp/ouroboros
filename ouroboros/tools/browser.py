@@ -936,11 +936,12 @@ def _page_health_snapshot(page: Any) -> str:
     except Exception:
         pass
     try:
-        counts = page.evaluate(
+        counts = _evaluate_bounded(
+            page,
             "() => ({canvas: document.querySelectorAll('canvas').length,"
             " img: document.querySelectorAll('img').length,"
             " scripts: document.querySelectorAll('script').length,"
-            " bodyChars: (document.body && document.body.innerText || '').length})"
+            " bodyChars: (document.body && document.body.innerText || '').length})",
         )
         if isinstance(counts, dict):
             parts.append("elements=" + ",".join(f"{k}:{v}" for k, v in counts.items()))
@@ -978,6 +979,28 @@ def _wait_for_page_paint(page: Any, timeout_ms: int = 3000) -> None:
         pass
 
 
+def _evaluate_bounded(page: Any, expression: str, timeout_ms: int = 30000) -> Any:
+    """``page.evaluate`` with an in-page deadline.
+
+    Playwright's ``evaluate`` accepts no timeout kwarg and ignores
+    ``set_default_timeout``, so an awaited never-resolving promise used to hang
+    until the outer tool timeout. Racing the expression against an in-page
+    ``setTimeout`` rejection bounds those ASYNC hangs; it CANNOT interrupt a
+    synchronous event-loop block (``while(true){}``) — the outer tool timeout
+    remains the backstop for that. A function-valued expression is invoked,
+    matching Playwright's own function/expression handling of the raw string.
+    """
+    ms = max(int(timeout_ms or 0), 1)
+    wrapped = (
+        "() => Promise.race([Promise.resolve().then(() => {\n"
+        "const __obo_result = (" + expression + "\n);\n"
+        "return typeof __obo_result === 'function' ? __obo_result() : __obo_result;\n"
+        "}), new Promise((_, reject) => setTimeout(() => reject(new Error("
+        "'evaluate timed out after " + str(ms) + "ms')), " + str(ms) + "))])"
+    )
+    return page.evaluate(wrapped)
+
+
 def _extract_page_output(page: Any, output: str, ctx: ToolContext) -> str:
     """Extract page content in the requested format."""
     if output == "screenshot":
@@ -1004,7 +1027,7 @@ def _extract_page_output(page: Any, output: str, ctx: ToolContext) -> str:
         html = page.content()
         return html[:50000] + ("... [truncated]" if len(html) > 50000 else "")
     elif output == "markdown":
-        text = page.evaluate(_MARKDOWN_JS)
+        text = _evaluate_bounded(page, _MARKDOWN_JS)
         return text[:30000] + ("... [truncated]" if len(text) > 30000 else "")
     else:  # text
         text = page.inner_text("body")
@@ -1019,6 +1042,10 @@ def _browse_page(ctx: ToolContext, url: str, output: str = "text",
         return "⚠️ BROWSER_LOCAL_READONLY_BLOCKED: subagents may browse external HTTP(S), localhost (non-Ouroboros ports), and file:// under their workspace — not the Ouroboros API ports, private/link-local IPs, or other schemes."
     try:
         page = _ensure_browser(ctx, engine=engine, device=device)
+        # The caller's page-load timeout is also the session default so the
+        # extraction calls that honor the default (screenshot, inner_text,
+        # content) share the same bound instead of a stale prior value.
+        page.set_default_timeout(int(timeout) if timeout else 30000)
         if viewport:
             _apply_viewport(page, viewport)
         page.goto(url, timeout=timeout, wait_until="domcontentloaded")
@@ -1032,6 +1059,7 @@ def _browse_page(ctx: ToolContext, url: str, output: str = "text",
             log.warning("Browser infrastructure error: %s. Cleaning up and retrying...", e)
             cleanup_browser(ctx)
             page = _ensure_browser(ctx, engine=engine, device=device)
+            page.set_default_timeout(int(timeout) if timeout else 30000)
             if viewport:
                 _apply_viewport(page, viewport)
             page.goto(url, timeout=timeout, wait_until="domcontentloaded")
@@ -1079,6 +1107,12 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
             engine=engine or getattr(ctx.browser_state, "_browser_engine", "chromium") or "chromium",
             device=device or getattr(ctx.browser_state, "_browser_device", "") or "",
         )
+        # The caller timeout (default 5000) keeps its explicit click/fill/select
+        # wait semantics below, but as the SESSION default it is floored at
+        # 30000 so the 5s action default cannot strangle the default-honoring
+        # capture calls (screenshot); an explicitly larger timeout widens them.
+        effective_default_ms = max(int(timeout or 0), 30000)
+        page.set_default_timeout(effective_default_ms)
         if readonly_subagent and _is_subagent_blocked_browser_url(str(getattr(page, "url", "") or ""), ctx):
             return "⚠️ BROWSER_LOCAL_READONLY_BLOCKED: subagents may act on external HTTP(S), localhost (non-Ouroboros ports), and file:// under their workspace — not the Ouroboros API ports or private/link-local pages."
 
@@ -1155,7 +1189,7 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
                     "the LLM skill review and is owner-only — the agent must not self-attest its own skill."
                 )
             try:
-                result = page.evaluate(value)
+                result = _evaluate_bounded(page, value, effective_default_ms)
             except Exception as eval_err:  # noqa: BLE001
                 msg = str(eval_err)
                 if "SyntaxError" not in msg:
@@ -1164,7 +1198,9 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
                 # statements) is a SyntaxError for a raw evaluate EXPRESSION; retry the same
                 # code wrapped in an IIFE function body before surfacing a real parse error.
                 try:
-                    result = page.evaluate("(() => {\n" + value + "\n})()")
+                    result = _evaluate_bounded(
+                        page, "(() => {\n" + value + "\n})()", effective_default_ms,
+                    )
                 except Exception as iife_err:  # noqa: BLE001
                     # The IIFE PARSED but threw a RUNTIME error (e.g. ReferenceError) -> that
                     # is the real result; surface it like the raw path, not as a parse error.
@@ -1182,13 +1218,13 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
         elif normalized_action == "scroll":
             direction = value or "down"
             if direction == "down":
-                page.evaluate("window.scrollBy(0, 600)")
+                _evaluate_bounded(page, "window.scrollBy(0, 600)", effective_default_ms)
             elif direction == "up":
-                page.evaluate("window.scrollBy(0, -600)")
+                _evaluate_bounded(page, "window.scrollBy(0, -600)", effective_default_ms)
             elif direction == "top":
-                page.evaluate("window.scrollTo(0, 0)")
+                _evaluate_bounded(page, "window.scrollTo(0, 0)", effective_default_ms)
             elif direction == "bottom":
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                _evaluate_bounded(page, "window.scrollTo(0, document.body.scrollHeight)", effective_default_ms)
             return f"Scrolled {direction}"
         else:
             return f"Unknown action: {action}. Use: click, fill, select, screenshot, evaluate, scroll"

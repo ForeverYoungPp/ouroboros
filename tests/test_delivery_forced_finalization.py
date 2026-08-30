@@ -1655,6 +1655,90 @@ def test_nonforced_resolver_treats_unknown_verb_object_as_protocol_not_prose(tmp
     assert "delivery_control" not in text2
 
 
+def test_forced_finalization_honors_trailing_replace_after_prose(tmp_path, monkeypatch):
+    """Prose + trailing control object under the armed forced rail: the raw
+    protocol JSON must not ship AND the replace directive must be honored (the
+    historical whole-text-only parse both leaked the JSON and dropped the
+    directive, silently discarding full_answer)."""
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    content = "Here is the summary.\n\n" + json.dumps({
+        "delivery_control": "replace",
+        "full_answer": "THE REAL ANSWER",
+    })
+    monkeypatch.setattr(
+        loop, "call_llm_with_retry",
+        lambda *_a, **_k: ({"role": "assistant", "content": content}, 0.0),
+    )
+
+    text, _usage, _returned_trace = loop._forced_final_answer(
+        limit_ctx, prompt="finalize", fallback_text="fallback", reason_code="round_limit",
+    )
+
+    assert "delivery_control" not in text
+    assert text.startswith("THE REAL ANSWER")
+    # The prose prefix is not the answer in armed control resolution.
+    assert "Here is the summary." not in text
+    assert registry._ctx._delivery_control_required is False
+
+
+def test_forced_finalization_honors_trailing_keep_after_prose(tmp_path, monkeypatch):
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    content = "Acknowledged; keeping the answer.\n" + json.dumps({"delivery_control": "keep"})
+    monkeypatch.setattr(
+        loop, "call_llm_with_retry",
+        lambda *_a, **_k: ({"role": "assistant", "content": content}, 0.0),
+    )
+
+    text, _usage, _returned_trace = loop._forced_final_answer(
+        limit_ctx, prompt="finalize", fallback_text="fallback", reason_code="round_limit",
+    )
+
+    assert text.startswith("Retained complete answer.")
+    assert "delivery_control" not in text
+
+
+def test_unarmed_skill_gate_ships_prose_without_trailing_control(tmp_path):
+    """Unarmed skill gate: prose with a trailing control object is a fresh
+    prose answer — the prose ships, the protocol JSON is stripped."""
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    candidate = loop._replace_delivery_candidate(
+        registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
+    )
+    candidate.finalization_control = "skill_action_or_revision_required"
+    registry._ctx._delivery_control_required = False
+    content = "Here is the reconsidered full answer.\n\n" + json.dumps(
+        {"delivery_control": "keep"},
+    )
+
+    status, text = loop._resolve_delivery_control(content, registry, limit_ctx, trace)
+
+    assert status == "fresh"
+    assert text == "Here is the reconsidered full answer."
+    assert "delivery_control" not in text
+    # Control flow unchanged: the gate stays armed for a real action/revision.
+    assert candidate.finalization_control == "skill_action_or_revision_required"
+
+
+def test_unarmed_owner_revision_ships_prose_without_trailing_control(tmp_path):
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    candidate = loop._replace_delivery_candidate(
+        registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
+    )
+    candidate.finalization_control = "owner_revision_required"
+    registry._ctx._delivery_control_required = False
+    content = "Fresh substantive answer for the owner.\n" + json.dumps(
+        {"delivery_control": "replace", "full_answer": "stale directive"},
+    )
+
+    status, text = loop._resolve_delivery_control(content, registry, limit_ctx, trace)
+
+    assert status == "fresh"
+    assert text == "Fresh substantive answer for the owner."
+    assert "delivery_control" not in text
+
+
 def test_children_unabsorbed_forced_path_never_leaks_protocol_json(tmp_path, monkeypatch):
     """The saga leak: children_unabsorbed fired while the latch was armed and the
     model's protocol JSON went RAW into the owner's chat and the durable result."""

@@ -19,7 +19,12 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ouroboros.utils import atomic_write_json, replace_atomic, utc_now_iso
+from ouroboros.utils import (
+    atomic_write_json,
+    extract_trailing_json_object,
+    replace_atomic,
+    utc_now_iso,
+)
 
 
 OBSERVABILITY_DIR = "observability"
@@ -1221,8 +1226,21 @@ def latest_llm_response_text(drive_root: pathlib.Path, task_id: str) -> str:
             message = payload.get("message") if isinstance(payload, dict) else None
             content = message.get("content") if isinstance(message, dict) else None
             text = str(content or "").strip()
-            if text and not _is_delivery_control_payload(text):
-                return text
+            if not text or _is_delivery_control_payload(text):
+                continue
+            # Lockstep with the loop's trailing-object parse: a body of prose
+            # plus one TRAILING protocol object salvages the prose only — the
+            # machine directive must never reach the owner's terminal result.
+            # (A whole-body protocol object stays suppressed above; an object
+            # with prose AFTER it is quoted material and passes through.)
+            prose, parsed, duplicate_key = extract_trailing_json_object(
+                text, duplicate_flag_keys=("delivery_control", "full_answer"),
+            )
+            if duplicate_key or (isinstance(parsed, dict) and "delivery_control" in parsed):
+                if prose.strip():
+                    return prose.rstrip()
+                continue
+            return text
         except Exception:
             continue
     return ""
