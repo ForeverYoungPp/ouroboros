@@ -170,8 +170,15 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
             # from the STARTED row's granted shape. Projected so the chip and
             # acceptance readers can answer asked-vs-applied without joining
             # the ledger. Empty when telemetry predates the receipt.
-            applied_access = str(row.get("access_profile") or "")
-            if applied_access and applied_access not in applied_access_profiles:
+            # Bounded to the known access-profile vocabulary and a short cap:
+            # the value rides a durable evidence row and the chip tooltip, so a
+            # garbage/oversized engine string must not reach either verbatim.
+            applied_access = str(row.get("access_profile") or "")[:32]
+            if (
+                applied_access
+                and applied_access not in applied_access_profiles
+                and len(applied_access_profiles) < 8
+            ):
                 applied_access_profiles.append(applied_access)
     # A partial work-order run is not a successful delegated substrate until the
     # durable verified-range union covers the complete canonical brief. Reuse the

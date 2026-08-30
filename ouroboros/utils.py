@@ -754,41 +754,87 @@ def extract_trailing_json_object(
     review_verdict_extraction's whole-text rationale).
     """
     raw = str(text or "")
-    decoder = json.JSONDecoder()
-    idx = raw.rfind("{")
-    while idx != -1:
-        try:
-            value, end = decoder.raw_decode(raw, idx)
-        except ValueError:
-            value, end = None, -1
-        # A decode that succeeds but is not a trailing dict (e.g. the last
-        # "{" was a nested object) falls through to the previous "{".
-        if end != -1 and isinstance(value, dict) and raw[end:].strip() in ("", "```"):
-            prefix = raw[:idx]
-            trimmed = prefix.rstrip()
-            cut = trimmed.rfind("\n")
-            if trimmed[cut + 1:].startswith("```"):
-                prefix = trimmed[:cut] if cut != -1 else ""
-            duplicate_flagged = False
+    # The trailing object, if any, ends at the last non-whitespace/non-fence
+    # character, which must be ``}``. Establishing that up front is O(tail) and
+    # keeps every ordinary code-bearing answer (prose, a trailing ``;``, a run
+    # of ``{``) off the expensive path entirely — the earlier per-``{``
+    # raw_decode walk was O(n * braces) and hit ~10s on a forced-finalization
+    # rail carrying a large code answer.
+    end_limit = len(raw)
+    while True:
+        stripped_end = len(raw[:end_limit].rstrip())
+        # Peel one trailing markdown fence (``` optionally on its own line) and
+        # loop, so a `{...}` closed by ``` or ```\n``` is still trailing.
+        fence = raw[:stripped_end].rstrip()
+        if fence.endswith("```"):
+            end_limit = len(fence) - 3
+            continue
+        end_limit = stripped_end
+        break
+    if end_limit <= 0 or raw[end_limit - 1] != "}":
+        return raw, None, False
 
-            def _unique_object(pairs: List[tuple]) -> Dict[str, Any]:
-                nonlocal duplicate_flagged
-                result: Dict[str, Any] = {}
-                for key, item in pairs:
-                    if key in result:
-                        if key in duplicate_flag_keys:
-                            duplicate_flagged = True
-                        raise ValueError(f"duplicate key: {key}")
-                    result[key] = item
-                return result
+    # ONE forward, string-aware pass to locate the outermost object whose close
+    # sits at end_limit. Prose braces/quotes before a well-formed tail object
+    # are handled; a pathological prose prefix with an unbalanced quote right
+    # before the object degrades to "no object" (the answer ships as prose, the
+    # armed-latch degrade path), never to a slow scan.
+    depth = 0
+    in_str = False
+    esc = False
+    cand_start = -1
+    obj_start = -1
+    for i in range(end_limit):
+        c = raw[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            if depth == 0:
+                cand_start = i
+            depth += 1
+        elif c == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and i == end_limit - 1:
+                    obj_start = cand_start
+    if obj_start < 0:
+        return raw, None, False
 
-            try:
-                parsed = json.loads(raw[idx:end], object_pairs_hook=_unique_object)
-            except ValueError:
-                parsed = None
-            return prefix, parsed, duplicate_flagged
-        idx = raw.rfind("{", 0, idx)
-    return raw, None, False
+    prefix = raw[:obj_start]
+    trimmed = prefix.rstrip()
+    cut = trimmed.rfind("\n")
+    if trimmed[cut + 1:].startswith("```"):
+        prefix = trimmed[:cut] if cut != -1 else ""
+    duplicate_flagged = False
+
+    def _unique_object(pairs: List[tuple]) -> Dict[str, Any]:
+        nonlocal duplicate_flagged
+        result: Dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                if key in duplicate_flag_keys:
+                    duplicate_flagged = True
+                raise ValueError(f"duplicate key: {key}")
+            result[key] = item
+        return result
+
+    try:
+        parsed = json.loads(raw[obj_start:end_limit], object_pairs_hook=_unique_object)
+    except (ValueError, RecursionError):
+        # A deeply nested body raises RecursionError out of the C decoder; on
+        # the last-resort finalization rail that must degrade, not propagate.
+        parsed = None
+    if not isinstance(parsed, dict):
+        parsed = None
+    return prefix, parsed, duplicate_flagged
 
 
 def run_cmd(cmd: List[str], cwd: Optional[pathlib.Path] = None) -> str:

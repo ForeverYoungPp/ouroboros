@@ -367,6 +367,8 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                 assistant.setdefault("role", "assistant")
                 messages.append(assistant)
                 for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue  # a non-dict tool_call is malformed provider output, not a crash
                     call_id = str(tc.get("id") or "")
                     function = tc.get("function") if isinstance(tc, dict) else {}
                     name = str((function or {}).get("name") or "")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import json
 import logging
 import os
 import pathlib
@@ -987,15 +988,24 @@ def _evaluate_bounded(page: Any, expression: str, timeout_ms: int = 30000) -> An
     until the outer tool timeout. Racing the expression against an in-page
     ``setTimeout`` rejection bounds those ASYNC hangs; it CANNOT interrupt a
     synchronous event-loop block (``while(true){}``) — the outer tool timeout
-    remains the backstop for that. A function-valued expression is invoked,
-    matching Playwright's own function/expression handling of the raw string.
+    remains the backstop for that.
+
+    The expression is evaluated through ``eval(<string>)``, exactly as
+    Playwright evaluates a raw-string argument (``UtilityScript`` runs
+    ``global.eval(expression)``), so statement lists, a trailing ``;``, and
+    completion-value semantics behave identically to an un-bounded evaluate. A
+    parenthesised ``const __x = (expr)`` wrapper does NOT — it is a SyntaxError
+    for those forms and silently returned ``undefined`` after the IIFE retry.
+    ``eval`` returns a function VALUE unchanged (Playwright would too); only a
+    literal function-declaration string would differ, which the evaluate tool
+    never receives.
     """
     ms = max(int(timeout_ms or 0), 1)
+    src = json.dumps(str(expression))
     wrapped = (
-        "() => Promise.race([Promise.resolve().then(() => {\n"
-        "const __obo_result = (" + expression + "\n);\n"
-        "return typeof __obo_result === 'function' ? __obo_result() : __obo_result;\n"
-        "}), new Promise((_, reject) => setTimeout(() => reject(new Error("
+        "() => Promise.race(["
+        "Promise.resolve().then(() => eval(" + src + ")), "
+        "new Promise((_, reject) => setTimeout(() => reject(new Error("
         "'evaluate timed out after " + str(ms) + "ms')), " + str(ms) + "))])"
     )
     return page.evaluate(wrapped)

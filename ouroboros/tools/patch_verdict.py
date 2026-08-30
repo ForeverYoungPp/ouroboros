@@ -65,7 +65,10 @@ def write_patch_verdict(
     try:
         from ouroboros import delegate_custody as custody
 
-        custody.emit(getattr(ctx, "drive_root", "."), "delegate_run_patch_verdict", {
+        # The canonical (budget) custody root, like every other custody write —
+        # a row on a child's drive_root cannot outlive a pruned child drive, and
+        # the acceptance-packet reader replays the canonical log.
+        custody.emit(custody.custody_root(ctx), "delegate_run_patch_verdict", {
             "run_id": "",
             "task_id": parent_task_id,
             "child_task_id": child_task_id,

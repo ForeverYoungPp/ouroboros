@@ -142,10 +142,20 @@ def _stored_evidence_stale(existing: Mapping[str, Any], live: Mapping[str, Any])
     if live.get("evidence_read_failed"):
         # Unreadable custody proves nothing; never rewrite over it.
         return False
+    def _as_int(value: Any) -> int:
+        # A garbage stored counter (str/None) must not raise out into the
+        # caller's blanket except and disable healing forever — treat it as a
+        # mismatch so the row is REWRITTEN to the clean live value.
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return -1
+
+    live_counts = {key: _as_int(live.get(key)) for key in _EVIDENCE_COUNTER_KEYS}
     for key in _EVIDENCE_COUNTER_KEYS:
-        if has_top and int(existing.get(key) or 0) != int(live.get(key) or 0):
+        if has_top and _as_int(existing.get(key)) != live_counts[key]:
             return True
-        if isinstance(stored_ev, Mapping) and int(stored_ev.get(key) or 0) != int(live.get(key) or 0):
+        if isinstance(stored_ev, Mapping) and _as_int(stored_ev.get(key)) != live_counts[key]:
             return True
     if isinstance(stored_ev, Mapping):
         if stored_ev.get("subscription_cost_usd") != live.get("subscription_cost_usd"):
@@ -235,7 +245,6 @@ def refresh_recently_settled_terminals(drive_root: Any) -> int:
     shrunken/rotated log resets the cursor; the one-time historical pass is
     paced by the per-tick byte cap. Returns the number of refreshed tasks.
     """
-    import json as _json
     import pathlib as _pathlib
 
     from ouroboros.utils import atomic_write_json, read_json_dict
@@ -251,39 +260,68 @@ def refresh_recently_settled_terminals(drive_root: Any) -> int:
         offset = 0  # rotated/truncated log: re-ground once
     if offset >= size:
         return 0
-    task_ids: set = set()
+    # ``first_offset`` is the byte offset BEFORE a task's earliest settled row
+    # in this batch. A settled run whose OWNING TASK has not yet written its
+    # terminal result cannot be healed now (refresh no-ops on a non-terminal
+    # task); advancing the cursor past its row would lose the healing trigger
+    # forever — the exact class this pass exists to catch. So the cursor stops
+    # at the earliest deferred row and re-reads it next tick.
+    first_offset: Dict[str, int] = {}
     end_offset = offset
     try:
         with log_path.open("rb") as fh:
             fh.seek(offset)
             read_bytes = 0
+            row_start = offset
             for raw in fh:
                 if not raw.endswith(b"\n") or read_bytes > _REFRESH_SCAN_CAP_BYTES:
                     break  # incomplete tail line stays for the next tick
                 read_bytes += len(raw)
                 end_offset += len(raw)
-                try:
-                    row = _json.loads(raw)
-                except Exception:
-                    continue
-                if str(row.get("type") or "") in (custody.SETTLED, custody.CLOSED_ABSENT):
-                    tid = str(row.get("task_id") or "")
-                    if tid:
-                        task_ids.add(tid)
+                if str((_json_row(raw)).get("type") or "") in (custody.SETTLED, custody.CLOSED_ABSENT):
+                    tid = str(_json_row(raw).get("task_id") or "")
+                    if tid and tid not in first_offset:
+                        first_offset[tid] = row_start
+                row_start += len(raw)
     except OSError:
         return 0
     refreshed = 0
-    for tid in sorted(task_ids):
+    deferred_floor = end_offset
+    for tid in sorted(first_offset):
         try:
-            if refresh_terminal_reconciliation(drive_root, tid):
-                refreshed += 1
+            if _task_is_terminal(drive_root, tid):
+                if refresh_terminal_reconciliation(drive_root, tid):
+                    refreshed += 1
+            else:
+                deferred_floor = min(deferred_floor, first_offset[tid])
         except Exception:
             log.debug("Cursor refresh failed for %s", tid, exc_info=True)
     try:
-        atomic_write_json(cursor_path, {"offset": end_offset})
+        atomic_write_json(cursor_path, {"offset": deferred_floor})
     except Exception:
         log.debug("Refresh cursor write failed", exc_info=True)
     return refreshed
+
+
+def _json_row(raw: bytes) -> Dict[str, Any]:
+    import json as _json
+
+    try:
+        row = _json.loads(raw)
+        return row if isinstance(row, dict) else {}
+    except Exception:
+        return {}
+
+
+def _task_is_terminal(drive_root: Any, task_id: str) -> bool:
+    """Whether the task already wrote a truly-terminal result (heal-eligible)."""
+    try:
+        from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+
+        existing = load_task_result(drive_root, str(task_id or "")) or {}
+        return str(existing.get("status") or "") in _TRULY_TERMINAL_STATUSES
+    except Exception:
+        return False
 
 
 def record_terminal_reconciliation(

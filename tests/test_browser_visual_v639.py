@@ -171,8 +171,11 @@ def test_evaluate_bounded_wraps_in_promise_race_with_deadline():
     # The in-page race carries the expression and a setTimeout rejection at the deadline.
     assert "Promise.race" in js and "setTimeout" in js
     assert "1 + 1" in js and "7000ms" in js
-    # Function-valued expressions are invoked (Playwright-parity), others returned.
-    assert "typeof __obo_result === 'function'" in js
+    # The expression rides through eval(<json-string>) — statement-list and
+    # completion-value semantics identical to an un-bounded evaluate (the
+    # parenthesised const-wrapper silently returned undefined for those).
+    assert "eval(" in js
+    assert '"1 + 1"' in js
 
 
 def test_action_evaluate_and_scroll_route_through_bounded_wrapper(monkeypatch):

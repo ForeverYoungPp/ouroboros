@@ -482,7 +482,13 @@ def _apply_task_acceptance_result(
         ),
         ctx=ctx.tools._ctx,
     )
-    if dialogue_terminal:
+    # A DEGRADED panel (no valid verdict quorum) cannot "judge" the dialogue:
+    # a lone terminal vote from the one contributing slot must NOT shadow the
+    # review_degraded path below, which is the only surface carrying the
+    # per-slot causes and degraded_reasons the v6.70.0 honesty invariant (P1)
+    # requires. Letting the dialogue-terminal branch fire here recorded a false
+    # "reviewer quorum judged" rationale and silently dropped those causes.
+    if dialogue_terminal and str(result.aggregate_signal or "DEGRADED").upper() != "DEGRADED":
         # v6.74.0 (A5): a reviewer quorum judged the dialogue no longer
         # actionable (unreachable_here / stable_disagreement). Finalize via
         # the EXISTING honest path recording BOTH positions in one

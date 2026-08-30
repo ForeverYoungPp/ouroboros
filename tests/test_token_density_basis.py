@@ -112,3 +112,24 @@ def test_reservation_keeps_the_raw_conservative_basis():
     assert "prompt_tokens_estimate" in source
     assert "prompt_tokens_bounded_estimate" not in source
     assert request.prompt_tokens_estimate > request.prompt_tokens_bounded_estimate
+
+
+def test_bounded_estimate_matches_the_fit_estimator_on_tool_heavy_payloads():
+    """MAJOR 5: the witness must calibrate on estimate_context_prompt_tokens —
+    the exact quantity measure_main_fit multiplies — not a message-chars sum
+    that drops tool_call objects (which made density ~1.4x high and fit
+    over-predict by ~40% on the main loop's dominant shape)."""
+    from ouroboros.context_fit import estimate_context_prompt_tokens
+
+    msgs = [{"role": "user", "content": "do it"}]
+    for i in range(40):
+        msgs.append({"role": "assistant", "content": None, "tool_calls": [
+            {"id": f"c{i}", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path":"/x/file_%d.py"}' % i}}]})
+        msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "x" * 80})
+    tools = [{"type": "function", "function": {"name": f"t{i}", "description": "d" * 40,
+              "parameters": {"type": "object"}}} for i in range(20)]
+    req = _attempt_request({"provider": "openrouter"},
+                           {"model": "openai/gpt-test", "messages": msgs, "tools": tools, "max_tokens": 10})
+    fit = estimate_context_prompt_tokens(msgs, tools)
+    assert req.prompt_tokens_bounded_estimate == fit, (req.prompt_tokens_bounded_estimate, fit)

@@ -81,9 +81,12 @@ def _emitted_types():
                 receiver = _receiver_name(node.func).lower()
                 if attr == "append" and "pending_events" in receiver:
                     candidates = node.args
-                elif attr in ("put", "put_nowait") and any(
-                    hint in receiver for hint in _QUEUE_HINTS
-                ):
+                elif attr in ("put", "put_nowait"):
+                    # Receiver-AGNOSTIC (the narrow name hints missed a real
+                    # registered emitter, `q.put_nowait` in delegate_progress):
+                    # any `.put`/`.put_nowait` whose argument is a dict with a
+                    # literal string `type` is scanned. A non-supervisor queue
+                    # that happens to match falls to the reasoned allowlist.
                     candidates = node.args
             if _call_name(node.func) in _WRAPPER_FUNCS:
                 candidates = node.args

@@ -1024,7 +1024,27 @@ def find_child_tasks(
             row["status"] = status
             existing = rows.get(tid, {})
             if not existing:
-                rows[tid] = row
+                # The raw prefilter skips a disk row with no lineage of its own;
+                # the queue snapshot re-identifies it as a child here, but its
+                # thin queue row lacks the disk row's cost, result, artifacts and
+                # ts. Materialize the disk row now (bounded — this runs only for
+                # the handful of actual queue children) so a live lineage-less
+                # child keeps its content, not just its id.
+                disk = load_effective_task_result(
+                    pathlib.Path(drive_root), tid, materialize_artifacts=materialize_artifacts
+                )
+                if disk:
+                    combined = dict(disk)
+                    for key, value in row.items():
+                        if key == "status":
+                            combined["status"] = _merge_queue_status(
+                                str(disk.get("status") or ""), str(value or "")
+                            )
+                        elif not combined.get(key) and value:
+                            combined[key] = value
+                    rows[tid] = combined
+                else:
+                    rows[tid] = row
                 continue
             combined = dict(existing)
             for key, value in row.items():

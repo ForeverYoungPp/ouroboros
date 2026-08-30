@@ -229,6 +229,35 @@ def test_junk_continue_abstains_so_a_single_terminal_vote_terminalizes(
     assert trace["acceptance_decision"]["reason"] == "dialogue_terminal"
 
 
+def test_degraded_panel_lone_terminal_vote_does_not_shadow_the_degraded_causes(
+    monkeypatch, tmp_path,
+):
+    """MAJOR 6: a DEGRADED panel (no valid verdict quorum) cannot 'judge' the
+    dialogue — a lone terminal vote from the one contributing slot must fall to
+    review_degraded, which is the only surface carrying per-slot causes and
+    degraded_reasons (the v6.70.0 honesty invariant, P1)."""
+    result = ReviewRunResult(
+        request={"surface": "task_acceptance", "policy": {"min_successful_slots": 2}},
+        actors=[
+            {"slot_id": "s0", "parse_status": "malformed", "parsed": None},
+            {"slot_id": "s1", "parse_status": "malformed", "parsed": None},
+            _actor("s2", "FAIL", {"verdict": "FAIL", "outcome_tier": "best_effort",
+                                  "completion_coach": "n/a",
+                                  "dialogue_status": "unreachable_here"}),
+        ],
+        parsed_findings=[],
+        aggregate_signal="DEGRADED",
+    )
+    setattr(result, "degraded_reasons", ["slot_0 transport_failed: 502 from provider"])
+    _no_fence(monkeypatch)
+    trace: dict = {"tool_calls": [], "review_runs": []}
+    ctx = _ctx(tmp_path, trace=trace)
+    assert _apply_task_acceptance_result(ctx, result, record_run=False) is False
+    decision = trace["acceptance_decision"]
+    assert decision["reason"] == "review_degraded"
+    assert decision["degraded_reasons"] == ["slot_0 transport_failed: 502 from provider"]
+
+
 # ---------------------------------------------------------------------------
 # (d) a new nonempty rebuttal buys exactly ONE paid panel; an empty one buys none
 

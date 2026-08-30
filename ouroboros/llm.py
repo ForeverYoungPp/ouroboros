@@ -235,17 +235,9 @@ def _attempt_request(
         prompt_chars = len(json.dumps(prompt_payload, ensure_ascii=False, default=str))
     except Exception:
         prompt_chars = len(str(prompt_payload or ""))
-    # Bounded-proxy basis (images at the billing proxy, not base64): what the
-    # fit estimator measures — the density witness must calibrate on it.
-    try:
-        msgs = prompt_payload.get("messages")
-        rest = {k: v for k, v in prompt_payload.items() if k != "messages"}
-        bounded_chars = (
-            len(json.dumps(rest, ensure_ascii=False, default=str))
-            + _estimate_message_chars(msgs)
-        ) if isinstance(msgs, list) else prompt_chars
-    except Exception:
-        bounded_chars = prompt_chars
+    from ouroboros.context_fit import bounded_prompt_tokens_for_payload
+
+    bounded_tokens = bounded_prompt_tokens_for_payload(prompt_payload, prompt_chars)
     request_source = source
     if request_source is None:
         bound_scope = current_usage_scope()
@@ -272,7 +264,7 @@ def _attempt_request(
         candidate_measurement_kind="canonical_json_v1",
         physical_context=current_physical_attempt_context(),
         route_is_loopback=is_loopback_base_url(target.get("base_url")),
-        prompt_tokens_bounded_estimate=max(0, bounded_chars // 4),
+        prompt_tokens_bounded_estimate=bounded_tokens,
     )
 
 

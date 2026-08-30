@@ -234,11 +234,13 @@ class AttemptRequest:
     physical_context: Optional[PhysicalAttemptContext] = None
     # Route-locality fact (additive): base_url host is localhost/127.0.0.1/::1 (loopback OpenAI-compatible installs — Ollama / LM Studio / vLLM).
     route_is_loopback: bool = False
-    # Bounded-proxy token estimate (additive, LAST — frozen dataclass): image
-    # blocks measured at the provider-billing proxy (IMAGE_BLOCK_CHAR_EQUIVALENT)
-    # instead of raw base64 bytes. 0 = producer predates the field. The density
-    # observer MUST use this basis; `prompt_tokens_estimate` above deliberately
-    # keeps the raw basis because budget reservation wants the conservative
+    # The fit estimator's own token count for this request
+    # (context_fit.estimate_context_prompt_tokens: full projected context, tool
+    # objects and schemas included, images at the billing proxy) — additive,
+    # LAST (frozen dataclass), 0 = producer predates the field. The density
+    # observer MUST calibrate on THIS, the exact quantity measure_main_fit
+    # multiplies, so density lands ≈1.0; `prompt_tokens_estimate` above keeps
+    # the raw base64 basis because budget reservation wants the conservative
     # over-count (owner decision 3=A: the two consumers intentionally split).
     prompt_tokens_bounded_estimate: int = 0
 @dataclass(frozen=True)
