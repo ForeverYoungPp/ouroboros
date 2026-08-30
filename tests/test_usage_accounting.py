@@ -370,6 +370,33 @@ def test_torn_final_row_is_quarantined_but_midstream_corruption_fails(data_root)
     assert b'{"seq":' not in repaired
 
 
+def test_newline_less_torn_tail_does_not_glue_the_next_append(data_root):
+    """razzant/ouroboros#138: a crashed writer can leave a newline-less partial
+    row. The next append must not weld its first row onto that partial — the
+    torn partial is quarantined alone and every subsequent row stays parseable.
+    """
+    r1 = ua.reserve_attempt(_request(data_root))
+    ua.release_attempt(r1)
+    ledger = data_root / ua.LEDGER_REL
+    # Simulate a torn append: valid rows, then a partial row with NO trailing \n.
+    with ledger.open("ab") as handle:
+        handle.write(b'{"seq":999,"attempt_id":"torn","state":"reserved"')  # no newline
+
+    # A fresh, fully-legitimate attempt appends after the torn partial.
+    r2 = ua.reserve_attempt(_request(data_root))
+    ua.release_attempt(r2)
+
+    rows = _ledger(data_root)
+    # The torn partial was quarantined, not merged with r2's rows.
+    assert (data_root / ua.QUARANTINE_REL).is_file()
+    assert all(isinstance(row, dict) and "seq" in row for row in rows)
+    assert not any(row.get("attempt_id") == "torn" for row in rows)
+    # r2's reserve+release survived intact.
+    projection = ua.usage_projection(data_root)
+    assert projection["attempt_counts"]["released"] == 2
+    assert projection["integrity_degraded"] is True  # the quarantine is disclosed
+
+
 @pytest.mark.parametrize(
     "field,value",
     (("seq", "not-a-number"), ("prompt_tokens", "not-a-number")),
