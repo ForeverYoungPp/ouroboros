@@ -131,3 +131,41 @@ def test_automatic_authority_rides_whole_or_pointer(tmp_path):
             assert automatic["result"]["kind"] == "bounded_field_preview"
             assert automatic["result"]["full_chars"] == len(full_result)
             assert "OMISSION NOTE" in automatic["result"]["preview"]
+
+
+def test_legacy_collapse_fires_only_on_growth_carriers_and_is_idempotent():
+    """build_task_contract collapses a legacy predecessor body only when it
+    carries growth - a nested recursion carrier or an oversized string.
+    Bounded bodies ride byte-identical (exact strings are authority), and a
+    collapsed envelope survives a rebuild untouched."""
+    from ouroboros.contracts.task_contract import build_task_contract
+
+    bounded = {
+        "source": {"kind": "task_result", "task_id": "flat"},
+        "result": "small durable answer",
+        "task_contract": {"objective": "carry on"},
+    }
+    contract = build_task_contract({"objective": "next", "predecessor_authority": bounded})
+    assert contract["predecessor_authority"] == bounded, "no growth - no re-dressing"
+
+    fat = {
+        "source": {"kind": "task_result", "task_id": "deep"},
+        "result": "r" * 25_000,
+        "capability_delta": {"granted": ["net"]},
+        "task_contract": {
+            "objective": "grandparent objective",
+            "predecessor_authority": {"result": "grandparent body"},
+        },
+    }
+    contract = build_task_contract({"objective": "next", "predecessor_authority": fat})
+    envelope = contract["predecessor_authority"]
+    assert envelope["kind"] == "bounded_continuation_envelope"
+    assert envelope["collapsed_from"] == "legacy_full_body"
+    assert "predecessor_authority" not in envelope["task_contract"], "recursion carrier dropped"
+    assert envelope["task_contract"]["objective"] == "grandparent objective"
+    assert envelope["capability_delta"] == {"granted": ["net"]}, "compact facts inherit"
+    assert len(envelope["result"]) < 25_000 and "OMISSION NOTE" in envelope["result"]
+    assert envelope["source"] == fat["source"], "the pull route survives"
+
+    again = build_task_contract({"objective": "next-hop", "predecessor_authority": envelope})
+    assert again["predecessor_authority"] == envelope, "envelope rebuild is a no-op"

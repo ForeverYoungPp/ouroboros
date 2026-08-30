@@ -608,30 +608,34 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
 def _bounded_predecessor_authority(mapping: Dict[str, Any]) -> Dict[str, Any]:
     """Collapse a legacy full-body predecessor to the bounded envelope rule.
 
-    Same floor as the startup projection: every compact terminal fact passes
-    through, oversized string bodies become bounded previews, and the nested
-    ``task_contract.predecessor_authority`` (the recursion carrier) is
-    dropped - the durable task_results bodies stay the untouched SSOT.
+    Only the two growth carriers trigger a rewrite - a nested
+    ``task_contract.predecessor_authority`` (the recursion) or an oversized
+    string body. A body already free of both passes through byte-identical:
+    exact strings are authority, and a bounded legacy mapping needs no
+    re-dressing. When the rewrite fires, every compact terminal fact still
+    passes through, oversized strings become disclosed truncations (utils
+    SSOT), and the durable task_results bodies stay the untouched source.
     """
     if str(mapping.get("kind") or "") == "bounded_continuation_envelope":
+        return copy.deepcopy(mapping)
+    contract = mapping.get("task_contract") if isinstance(mapping.get("task_contract"), Mapping) else {}
+    oversized = any(isinstance(v, str) and len(v) > 20_000 for v in mapping.values())
+    if "predecessor_authority" not in contract and not oversized:
         return copy.deepcopy(mapping)
     try:
         serialized = json.dumps(mapping, ensure_ascii=False, sort_keys=True, default=str)
     except (TypeError, ValueError):
         serialized = repr(mapping)
+    from ouroboros.utils import truncate_review_artifact
+
     envelope: Dict[str, Any] = {}
     for key, value in mapping.items():
         if key == "task_contract":
             continue
         if isinstance(value, str) and len(value) > 20_000:
-            envelope[key] = (
-                value[:20_000]
-                + "\n⚠️ OMISSION NOTE: legacy predecessor body collapsed; pull "
-                "the complete authority through the named source."
-            )
+            envelope[key] = truncate_review_artifact(value, limit=20_000)
         else:
             envelope[key] = copy.deepcopy(value)
-    contract = mapping.get("task_contract") if isinstance(mapping.get("task_contract"), Mapping) else {}
     core = {key: copy.deepcopy(value) for key, value in contract.items()
             if key != "predecessor_authority"}
     if core:
