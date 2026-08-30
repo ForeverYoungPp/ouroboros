@@ -60,14 +60,15 @@ def _build_model_catalog_entry(
 ) -> dict[str, str]:
     raw_id = str(model_id or "").strip()
     name = str(display_name or "").strip() or raw_id
+    source_label = source or provider_label
     return {
         "provider_id": provider_id,
         "provider": provider_label,
-        "source": source or provider_label,
+        "source": source_label,
         "id": raw_id,
         "name": name,
         "value": _tagged_model_value(provider_id, raw_id),
-        "label": f"{provider_label} · {name}",
+        "label": f"{source_label} · {name}",
     }
 
 
@@ -394,7 +395,7 @@ async def api_model_catalog(_request: Request) -> JSONResponse:
             seen_values.add(value)
             items.append(item)
 
-    items.sort(key=lambda item: (item.get("provider", "").lower(), item.get("label", "").lower()))
+    items.sort(key=lambda item: (item.get("provider", "").lower(), item.get("name", "").lower()))
     return JSONResponse({
         "items": items,
         "errors": errors,

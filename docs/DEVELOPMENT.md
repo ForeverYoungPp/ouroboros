@@ -1421,6 +1421,11 @@ Before every commit, verify the following:
   refusals are `route_not_in_capability_catalog`, `route_disabled` (unpinned),
   access-profile mismatch, `engine_rejects_delegated_marker`, and positive
   quota exhaustion for the route's own model.
+- Any reader that needs quota snapshots plus typed absences must call
+  `ClaudexorGateway.quota_state()` once and project both from that envelope.
+  The list helpers are compatibility projections, not permission to perform
+  two `/v2/quota` reads and mix evidence epochs. Optional absence metadata
+  from older engines fails to an empty neutral value.
 - The acceptance packet carries a host-attested `substrate_execution` section —
   `actual_substrate`, `delegated_runs_*` counters, zero-run facts — read from
   durable custody rows at packet-build time

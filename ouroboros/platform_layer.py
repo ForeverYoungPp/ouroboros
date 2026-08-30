@@ -970,9 +970,11 @@ def node_distribution_platform() -> str:
 
 def probe_node_version(node_path: str) -> str:
     """Return a normalized bundled-Node version, or ``""`` on probe failure."""
-    # An inherited NODE_OPTIONS carrying test-mode flags (--test-name-pattern,
-    # --test-only) makes `node --version` itself exit non-zero, so a healthy
-    # runtime read as missing. The probe scrubs it exactly as the suite run does.
+    # A metadata probe must not inherit runtime/test hooks. In particular,
+    # NODE_OPTIONS can contain test filters or preload modules that either make
+    # `node --version` fail before the hermetic lane gets a chance to scrub the
+    # variable or execute arbitrary operator code during a supposedly inert
+    # version check.
     probe_env = dict(os.environ)
     probe_env.pop("NODE_OPTIONS", None)
     try:

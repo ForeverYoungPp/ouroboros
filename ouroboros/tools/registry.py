@@ -38,13 +38,13 @@ from ouroboros.shell_parse import (
     unwrap_env_argv,
 )
 from ouroboros.tools.shell_guards import (
-    LIGHT_SHELL_WRITER_COMMANDS,
     PROTECTED_RUNTIME_PATHS_LOWER,
     interpreter_family,
+    interpreter_write_shape,
     light_shell_repo_mutation,
+    non_interpreter_write_shape,
     parse_porcelain_paths,
     process_shell_guard_args,
-    shell_has_write_indicator,
     runtime_data_guard_targets,
     shell_writer_targets_protected,
     workspace_executor_state_write_block,
@@ -164,12 +164,34 @@ def _executor_backend_candidate_path(ctx: Any, candidate: str) -> pathlib.Path |
         return None
 
 
-def _detect_runtime_mode_elevation(text_lower: str) -> bool:
+def _owner_control_mention_blocks(text_lower: str, detected: bool, writeish: bool) -> bool:
+    """Shared read-carve for the owner-control mention detectors.
+
+    The scope-floor guard adjudicated this contract at v6.80.0
+    (``_detect_scope_review_floor_self_lowering``): naming an owner key/endpoint
+    blocks UNLESS the whole command line is demonstrably read-only inspection —
+    ``grep OUROBOROS_RUNTIME_MODE data/settings.json`` and
+    ``rg /api/owner/safety-mode ouroboros/gateway`` read and do not act, and the
+    product's own reuse-first duty (grep callers of ``save_settings``) depends on
+    them. The other six family members stayed read-blind, blocking those exact
+    inspections in every runtime mode — the same hazard class at a different
+    strictness. Fail-closed like the precedent: ``writeish`` (any write shape)
+    disqualifies the exemption, ``_is_pure_read_inspection`` is a HEAD allowlist
+    where any interpreter, HTTP client, wrapper-with-flags, or nested execution
+    is NOT an inspection, and the default ``writeish=True`` keeps a caller that
+    cannot supply the fact fail-closed."""
+    if not detected:
+        return False
+    return writeish or not _is_pure_read_inspection(text_lower)
+
+
+def _detect_runtime_mode_elevation(text_lower: str, *, writeish: bool = True) -> bool:
     """Detect shell/script attempts to change ``OUROBOROS_RUNTIME_MODE``."""
     has_save = "save_settings" in text_lower
     has_mode_key = "ouroboros_runtime_mode" in text_lower
     has_dotted_path = "ouroboros.config.save_settings" in text_lower
-    return (has_save and has_mode_key) or has_dotted_path
+    detected = (has_save and has_mode_key) or has_dotted_path
+    return _owner_control_mention_blocks(text_lower, detected, writeish)
 
 
 _SUBAGENT_SHELL_SECRET_MARKERS = (
@@ -229,6 +251,36 @@ def _command_mentions_protected_root(cmd_path_lower: str, root_text: str) -> boo
         start = end
 
 
+def _workspace_write_block_runtime_message(path_text: Any = "") -> str:
+    """Guard-B block for a write-shaped command reaching a protected runtime root.
+
+    Names the resolved offending path and the sanctioned route (the light-lane
+    message at the runtime_data guard is the in-repo exemplar): five return sites
+    used to emit one byte-identical reasonless string, so the log could not even
+    say WHICH path fired, and the agent had no route to self-correct.
+    """
+    path_note = f" Blocked path: {path_text}." if str(path_text or "").strip() else ""
+    return (
+        "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths."
+        + path_note
+        + " Use the gated read_file/write_file tools for runtime data (installed skill"
+        " payloads: root=skill_payload with bucket/skill_name, or run the command with"
+        " cwd=skill_payload), and keep shell writes inside the selected process root."
+    )
+
+
+def _workspace_write_block_outside_root_message(path_text: Any = "", work_dir: Any = "") -> str:
+    """Guard-B block for a write-shaped command targeting outside the process root."""
+    path_note = f" Blocked path: {path_text}." if str(path_text or "").strip() else ""
+    root_note = f" Selected process root: {work_dir}." if str(work_dir or "").strip() else ""
+    return (
+        "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands may not target paths"
+        " outside the selected process root." + path_note + root_note
+        + " Write inside the process root, or use the file tools with an explicit root"
+        " (user_files / task_drive / artifact_store)."
+    )
+
+
 def _stray_skill_payload_failsoft(root_arg: str, workspace_mode: bool, task_constraint: Any) -> bool:
     """Whether stray bucket/skill_name on a write tool should be DROPPED rather than
     surfaced as SKILL_PAYLOAD_ARG_ERROR. Fail-soft ONLY for a WORKSPACE edit that is
@@ -242,7 +294,7 @@ def _stray_skill_payload_failsoft(root_arg: str, workspace_mode: bool, task_cons
     return bool(workspace_mode and not skill_payload_intent)
 
 
-def _detect_mutative_toggle_self_change(text_lower: str) -> bool:
+def _detect_mutative_toggle_self_change(text_lower: str, *, writeish: bool = True) -> bool:
     """Detect shell/script/CLI attempts to change the owner-only mutative-subagents toggle."""
     has_key = "ouroboros_allow_mutative_subagents" in text_lower
     has_write = (
@@ -252,7 +304,7 @@ def _detect_mutative_toggle_self_change(text_lower: str) -> bool:
         or "settings set" in text_lower  # `ouroboros settings set <key> <value>` CLI path
         or "ouroboros.cli" in text_lower
     )
-    return has_key and has_write
+    return _owner_control_mention_blocks(text_lower, has_key and has_write, writeish)
 
 
 def _managed_update_code_tool_block(ctx: Any, name: str) -> str:
@@ -322,7 +374,7 @@ def _authorized_managed_update_resolver(ctx: Any) -> bool:
         return False
 
 
-def _detect_evolution_owner_control_self_change(text_lower: str) -> bool:
+def _detect_evolution_owner_control_self_change(text_lower: str, *, writeish: bool = True) -> bool:
     """Detect shell/script/CLI attempts to set the owner-only self-evolution controls:
     the post-task evolution toggle OR the persistent evolution-objective steer (which
     biases every evolution campaign, so it is owner-only like the toggle)."""
@@ -337,10 +389,10 @@ def _detect_evolution_owner_control_self_change(text_lower: str) -> bool:
         or "settings set" in text_lower
         or "ouroboros.cli" in text_lower
     )
-    return has_key and has_write
+    return _owner_control_mention_blocks(text_lower, has_key and has_write, writeish)
 
 
-def _detect_context_mode_self_lowering(text_lower: str) -> bool:
+def _detect_context_mode_self_lowering(text_lower: str, *, writeish: bool = True) -> bool:
     """Detect shell/script attempts to lower the owner-controlled context mode."""
     mentions_context_key = "ouroboros_context_mode" in text_lower
     mentions_owner_endpoint = "/api/owner/context-mode" in text_lower
@@ -351,13 +403,14 @@ def _detect_context_mode_self_lowering(text_lower: str) -> bool:
     )
     mentions_save = "save_settings" in text_lower or "settings.json" in text_lower
     mentions_owner_lowering_flag = "allow_context_lowering" in text_lower
-    return (
+    detected = (
         mentions_owner_endpoint
         or mentions_context_endpoint
         or mentions_context_cli
         or mentions_owner_lowering_flag
         or (mentions_context_key and mentions_save)
     )
+    return _owner_control_mention_blocks(text_lower, detected, writeish)
 
 
 # Commands that can only READ. This is an ALLOWLIST on purpose: an unrecognised
@@ -397,6 +450,10 @@ _DENIED_READ_OPTIONS: dict = {
     "ripgrep": _SEARCH_TOOL_EXEC_OPTIONS,
     "ag": _SEARCH_TOOL_EXEC_OPTIONS,
     "ack": _SEARCH_TOOL_EXEC_OPTIONS,
+    # yq edits the named file in place with -i/--inplace; without this the family
+    # read-carve exempted `yq -i '.OUROBOROS_SAFETY_MODE="off"' settings.json` as
+    # "pure inspection" (jq has no in-place edit and stays a stdout-only read).
+    "yq": frozenset({"-i", "--inplace"}),
     "sort": frozenset({"-o", "--output", "--compress-program"}),
     "less": frozenset({"-o", "--log-file", "-k", "--lesskey-file"}),
     "more": frozenset({"-o"}),
@@ -501,6 +558,10 @@ def _is_pure_read_inspection(text_lower: str) -> bool:
         denied = _DENIED_READ_OPTIONS.get(head)
         if denied and any(_denied_read_option(token, denied) for token in tokens[1:]):
             return False
+        if head == "uniq" and sum(1 for t in tokens[1:] if t == "-" or not t.startswith("-")) >= 2:
+            # uniq's SECOND positional operand is its output file ('-' is the
+            # stdin operand, not a flag): `... | uniq - settings.json` writes.
+            return False
     return True
 
 
@@ -564,7 +625,7 @@ def _compose_execute_result(result: str, route_note: str, safety_msg: str) -> st
     return result
 
 
-def _detect_safety_mode_self_lowering(text_lower: str) -> bool:
+def _detect_safety_mode_self_lowering(text_lower: str, *, writeish: bool = True) -> bool:
     """Detect shell/script attempts to lower the owner-controlled LLM-safety coverage
     (v6.54.3). OUROBOROS_SAFETY_MODE gates the LLM safety supervisor layer; the agent
     must not switch it to ``light``/``off`` to remove its own supervision friction
@@ -574,24 +635,25 @@ def _detect_safety_mode_self_lowering(text_lower: str) -> bool:
     # URL-decode so a percent-encoded endpoint (curl .../safety%2Dmode) cannot
     # slip the literal scan (review round 6; mirrors the attest-endpoint guard).
     decoded = urllib.parse.unquote(urllib.parse.unquote(text_lower)).lower()
-    text_lower = f"{text_lower} {decoded}"
-    mentions_mode_key = "ouroboros_safety_mode" in text_lower
-    mentions_owner_endpoint = "/api/owner/safety-mode" in text_lower
-    mentions_mode_endpoint = "safety-mode" in text_lower and "/api/owner" in text_lower
-    mentions_mode_cli = "safety-mode" in text_lower and (
-        "ouroboros settings" in text_lower
-        or "ouroboros.cli" in text_lower
+    text = f"{text_lower} {decoded}"
+    mentions_mode_key = "ouroboros_safety_mode" in text
+    mentions_owner_endpoint = "/api/owner/safety-mode" in text
+    mentions_mode_endpoint = "safety-mode" in text and "/api/owner" in text
+    mentions_mode_cli = "safety-mode" in text and (
+        "ouroboros settings" in text
+        or "ouroboros.cli" in text
     )
-    mentions_save = "save_settings" in text_lower or "settings.json" in text_lower or "/api/settings" in text_lower
-    return (
+    mentions_save = "save_settings" in text or "settings.json" in text or "/api/settings" in text
+    detected = (
         mentions_owner_endpoint
         or mentions_mode_endpoint
         or mentions_mode_cli
         or (mentions_mode_key and mentions_save)
     )
+    return _owner_control_mention_blocks(text_lower, detected, writeish)
 
 
-def _detect_owner_skill_attest_self_call(text_lower: str) -> bool:
+def _detect_owner_skill_attest_self_call(text_lower: str, *, writeish: bool = True) -> bool:
     """Detect agent attempts to loopback-call the OWNER-ONLY skill owner-attestation endpoint
     (C1, v6.39). Owner-attestation skips the expensive LLM skill review; it MUST be
     owner-issued, never agent self-callable — otherwise the agent could self-bypass the
@@ -603,7 +665,8 @@ def _detect_owner_skill_attest_self_call(text_lower: str) -> bool:
     import urllib.parse
     decoded = urllib.parse.unquote(urllib.parse.unquote(text_lower)).lower()
     text = f"{text_lower} {decoded}"
-    return "/api/owner/skills/" in text and "attest-review" in text
+    detected = "/api/owner/skills/" in text and "attest-review" in text
+    return _owner_control_mention_blocks(text_lower, detected, writeish)
 
 
 def _task_constraint_path_allowed(path_text: str, constraint: Optional[TaskConstraint], drive_root: pathlib.Path) -> bool:
@@ -2269,7 +2332,11 @@ class ToolRegistry:
             )
         if targets_system:
             for cf in PROTECTED_RUNTIME_PATHS_LOWER:
-                if cf in cmd_path_lower and shell_has_write_indicator(raw_cmd):
+                # The MODE-AWARE composition fact, not the coarse legacy scan: a
+                # pure read that merely mentions a protected name (`grep -n delete
+                # ouroboros/safety.py`, `sed -n 1,40p BIBLE.md`, a python open('r'))
+                # is not a modification; every write shape still blocks here.
+                if cf in cmd_path_lower and writeish:
                     return (
                         "⚠️ CRITICAL SAFETY_VIOLATION: Shell command would modify "
                         "a protected core/contract/release file. Protected: "
@@ -2658,7 +2725,7 @@ class ToolRegistry:
                 _command_mentions_protected_root(cmd_path_lower, text)
                 for text in allowed_texts
             ):
-                return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths."
+                return _workspace_write_block_runtime_message(root_path)
         path_tokens = list(shell_argv_with_path_tokens(raw_cmd))
         path_tokens.extend(
             token
@@ -2702,7 +2769,7 @@ class ToolRegistry:
                         for protected_path in protected_paths:
                             try:
                                 mapped_executor.relative_to(protected_path)
-                                return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths."
+                                return _workspace_write_block_runtime_message(mapped_executor)
                             except Exception:
                                 pass
                     if _executor_backend_candidate_allowed(
@@ -2742,11 +2809,11 @@ class ToolRegistry:
                         for protected_path in protected_paths:
                             try:
                                 resolved.relative_to(protected_path)
-                                return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths."
+                                return _workspace_write_block_runtime_message(resolved)
                             except Exception:
                                 pass
                         if not pro_workspace_passthrough:
-                            return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands may not target paths outside the selected process root."
+                            return _workspace_write_block_outside_root_message(resolved, work_dir)
                         continue
                     deliverables_decision = _deliverables_target_decision(pathlib.Path(candidate))
                     if deliverables_decision is not None:
@@ -2759,9 +2826,9 @@ class ToolRegistry:
                         continue
                     for protected_path in protected_paths:
                         if path_text_is_inside(candidate, protected_path):
-                            return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths."
+                            return _workspace_write_block_runtime_message(candidate)
                     if not pro_workspace_passthrough:
-                        return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands may not target paths outside the selected process root."
+                        return _workspace_write_block_outside_root_message(candidate, work_dir)
                     continue
                 resolved = (work_dir / pathlib.Path(candidate)).resolve(strict=False)
                 # The lexical relative spelling is authoritative for detecting
@@ -2781,11 +2848,11 @@ class ToolRegistry:
                 for protected_path in protected_paths:
                     try:
                         resolved.relative_to(protected_path)
-                        return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths."
+                        return _workspace_write_block_runtime_message(resolved)
                     except Exception:
                         pass
                 if not pro_workspace_passthrough:
-                    return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands may not target paths outside the selected process root."
+                    return _workspace_write_block_outside_root_message(resolved, work_dir)
         return None
 
     def _run_shell_safety_check(
@@ -2839,6 +2906,7 @@ class ToolRegistry:
         argv_for_write = argv
         argv_executable = pathlib.PurePath(argv_for_write[0]).name.lower().removesuffix(".exe") if argv_for_write else ""
         write_target_argvs = [argv_for_write] if argv_for_write else []
+        inline_argv: list = []
         if argv_executable in {"sh", "bash", "zsh"}:
             inline_cmd = next((str(argv_for_write[idx + 1] or "") for idx, token in enumerate(argv_for_write[1:], start=1) if str(token or "") in {"-c", "--command"} and idx + 1 < len(argv_for_write)), "")
             if not inline_cmd:
@@ -2860,12 +2928,52 @@ class ToolRegistry:
                 explicit_write_targets.append(
                     destination.rstrip("/\\") + "/" + source_name
                 )
+        # A located -e/-E/-c inline CODE BODY is not a write target of the command
+        # line: writer_target_tokens' generic fallback reports every non-flag operand
+        # of a LIGHT_SHELL_WRITER_COMMANDS member (ruby/perl) — including the code
+        # string itself — which made every one-liner write-shaped here. The light
+        # fence and the protected lane keep consuming the unfiltered SSOT (their
+        # pinned XG-7B3.1 contracts rely on the body operand); only THIS lane's
+        # write-shape/target set drops the bodies. FILE operands stay write-suspect
+        # (`perl -pi -e s/a/b/ file` rewrites `file`), and literal in-code targets
+        # still arrive via the dedicated inline extraction.
+        from ouroboros.tools.shell_guards import interpreter_inline_code as _interp_inline_code
+        inline_code_bodies: set = set()
+        for target_argv in write_target_argvs:
+            inline_code_bodies.update(_interp_inline_code([str(t) for t in target_argv]))
+        if inline_code_bodies:
+            explicit_write_targets = [t for t in explicit_write_targets if t not in inline_code_bodies]
         explicit_write_targets = list(dict.fromkeys(explicit_write_targets))
         executable_path_tokens = {str(target_argv[0]) for target_argv in write_target_argvs if target_argv}
         # Writer-command membership canonicalizes versioned interpreter spellings to
         # their family (`ruby3.2` is `ruby`), so a versioned basename is exactly as
         # write-suspect as the unversioned one (XG-2R.2).
-        writeish = shell_has_write_indicator(raw_cmd) or (bool(argv_for_write) and (interpreter_family(argv_executable) or argv_executable) in LIGHT_SHELL_WRITER_COMMANDS) or bool(explicit_write_targets)
+        # Interpreter argv (a direct interpreter, or one inside an sh -c wrap) takes the
+        # MODE-AWARE write-shape classifier: the coarse bare `open(` token classified a
+        # read-only `open(p, 'rb')` as a write and fed pure reads into the workspace
+        # write guard — the same class the light-mode runtime_data lane already
+        # re-judges ("the original GAIA class"). Write-mode opens, pathlib `.open('w')`,
+        # save-APIs, opaque subprocess escapes, and every shell-level indicator still
+        # classify as writes; `writer_target_tokens` keeps covering literal write
+        # targets via `explicit_write_targets` below.
+        write_shape_interpreter = bool(interpreter_family(argv_executable)) or (
+            bool(inline_argv)
+            and bool(interpreter_family(pathlib.PurePath(str(inline_argv[0])).name.lower().removesuffix(".exe")))
+        )
+        # ONE mode-aware write-shape seam (write_shape.py) for BOTH halves:
+        # interpreter argv takes interpreter_write_shape; everything else takes
+        # non_interpreter_write_shape, where unconditional writers keep the
+        # membership floor, pure-filter utilities (sort/uniq/sed/tar/gzip) need a
+        # real write channel, and prose words yield to the same read-carve the
+        # owner-control detectors use. No guard below consumes a coarser fact.
+        coarse_write_shape = (
+            interpreter_write_shape(raw_cmd)
+            if write_shape_interpreter
+            else non_interpreter_write_shape(
+                raw_cmd, argv_for_write, argv_executable, is_pure_read=_is_pure_read_inspection,
+            )
+        )
+        writeish = coarse_write_shape or bool(explicit_write_targets)
         work_dir = self._resolved_shell_cwd(args, binding)
         if isinstance(work_dir, str):
             return work_dir
@@ -2899,20 +3007,23 @@ class ToolRegistry:
             if workspace_write_block:
                 return workspace_write_block
 
-        # Elevation pattern: blocked in all modes.
-        if _detect_runtime_mode_elevation(cmd_lower):
+        # Elevation pattern: blocked in all modes. Every owner-control mention
+        # detector takes the shared read-carve (pure read-only inspection of the
+        # key/endpoint names is allowed; the write shape or any non-inspection
+        # head still blocks) — the scope-floor precedent applied family-wide.
+        if _detect_runtime_mode_elevation(cmd_lower, writeish=writeish):
             return "⚠️ ELEVATION_BLOCKED: shell command pattern looks like an OUROBOROS_RUNTIME_MODE elevation attempt (mentions ``save_settings`` together with ``OUROBOROS_RUNTIME_MODE``, or invokes ``ouroboros.config.save_settings`` directly). Runtime mode is owner-controlled — change it by stopping the agent and editing settings.json directly, then restart."
-        if _detect_context_mode_self_lowering(cmd_lower):
+        if _detect_context_mode_self_lowering(cmd_lower, writeish=writeish):
             return "⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to lower OUROBOROS_CONTEXT_MODE to low through settings.json or /api/owner/context-mode. Context mode is owner-controlled — ask the owner to change the Low/Max toggle or edit settings while the agent is stopped."
         if _detect_scope_review_floor_self_lowering(cmd_lower, writeish=writeish):
             return "⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: shell command pattern reaches OUROBOROS_SCOPE_REVIEW_FLOOR through settings.json, /api/settings, or /api/owner/scope-review-floor from something other than a pure read. The floor is a deprecated, enforcement-inert owner setting (BIBLE P3 scope-review applicability follows the owner context mode) — it stays owner-only, and the agent must not write owner settings through any channel. Ask the owner to change it via the dedicated /api/owner/scope-review-floor endpoint, or stop the agent and edit settings.json directly. Pure source inspection (grep/rg/cat/jq/git grep) is allowed; an interpreter or HTTP client naming the endpoint is not, whatever verb it spells."
-        if _detect_safety_mode_self_lowering(cmd_lower):
+        if _detect_safety_mode_self_lowering(cmd_lower, writeish=writeish):
             return "⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to change OUROBOROS_SAFETY_MODE (e.g. to ``light``/``off``) through settings.json, /api/settings, or /api/owner/safety-mode. LLM-safety coverage is owner-controlled (BIBLE P3) — the agent must not reduce its own supervision. Ask the owner to change it via the dedicated /api/owner/safety-mode endpoint, or stop the agent and edit settings.json directly."
-        if _detect_owner_skill_attest_self_call(cmd_lower):
+        if _detect_owner_skill_attest_self_call(cmd_lower, writeish=writeish):
             return "⚠️ OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED: shell command pattern looks like an attempt to loopback-POST /api/owner/skills/<skill>/attest-review. Owner-attestation skips the expensive LLM skill review and is OWNER-ONLY — the agent must not self-attest its own skill to bypass the immune system's review. Ask the owner to attest it from the Skills UI."
-        if _detect_mutative_toggle_self_change(cmd_lower):
+        if _detect_mutative_toggle_self_change(cmd_lower, writeish=writeish):
             return "⚠️ ELEVATION_BLOCKED: OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is owner-controlled (it grants subagents write power against the live body). Change it by stopping the agent and editing settings.json directly, then restart — the agent must not self-enable mutative subagents."
-        if _detect_evolution_owner_control_self_change(cmd_lower):
+        if _detect_evolution_owner_control_self_change(cmd_lower, writeish=writeish):
             return "⚠️ ELEVATION_BLOCKED: the self-evolution controls (OUROBOROS_POST_TASK_EVOLUTION and OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE) are owner-controlled — they enable or steer self-modification cycles. Change them via the owner Settings UI, or stop the agent and edit settings.json directly — the agent must not self-set evolution controls."
         if _mentions_skill_owner_state(cmd_lower):
             return (

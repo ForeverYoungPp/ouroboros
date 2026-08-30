@@ -53,6 +53,8 @@ DATA = pathlib.Path(
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS  # noqa: E402
+
 # Release diffs touch protected core paths; only pro mode may stage them for
 # review. An explicit operator env value still wins.
 os.environ.setdefault("OUROBOROS_RUNTIME_MODE", "pro")
@@ -81,6 +83,7 @@ _REVIEW_SUBSTRATE_PATHS = frozenset({
     "ouroboros/context_budget.py",
     "ouroboros/deadline_utils.py",
     "ouroboros/llm.py",
+    "ouroboros/openrouter_attribution.py",
     "ouroboros/outcomes.py",
     "ouroboros/platform_layer.py",
     "ouroboros/pricing.py",
@@ -380,7 +383,7 @@ def _probe_model_for_key(token: str, model: str) -> tuple[bool, str]:
 
         response = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {token}", **OPENROUTER_APP_HEADERS},
             json={
                 "model": model,
                 "max_tokens": 1,

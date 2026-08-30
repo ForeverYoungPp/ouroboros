@@ -290,7 +290,9 @@ def test_open_based_pure_read_not_blocked_despite_coarse_writeish(tmp_path):
     and let the pure read through (the original GAIA class)."""
     outside = tmp_path / "data" / "logs" / "events.jsonl"
     cmd = f"python3 -c \"print(open('{outside}').read())\""
-    # Registry computes writeish=True for this command (the `open(` token).
+    # The registry's workspace composition now computes writeish=False for this
+    # shape (interpreter_write_shape is mode-aware); this lane must keep letting
+    # the pure read through even when a caller still hands it the coarse fact.
     assert _guard(tmp_path, cmd, writeish=True) == []
 
 
