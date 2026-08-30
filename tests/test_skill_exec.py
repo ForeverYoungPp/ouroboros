@@ -205,7 +205,11 @@ def test_skill_preflight_missing_validator_runtime_is_tolerated(tmp_path, monkey
     (skill_dir / "scripts" / "check.js").write_text("console.log('ok')\n", encoding="utf-8")
 
     from ouroboros.tools import skill_preflight as sp
-    monkeypatch.setattr(sp, "_resolve_runtime", lambda runtime: None if runtime == "node" else "/bin/echo")
+    monkeypatch.setattr(
+        sp,
+        "_resolve_runtime",
+        lambda runtime: (None, "bundled:absent; path:missing:not_on_path") if runtime == "node" else ("/bin/echo", ""),
+    )
 
     result = json.loads(sp._handle_skill_preflight(ctx, skill="alpha", paths=["scripts/check.js"]))
 
@@ -610,6 +614,63 @@ def test_skill_exec_rejects_runtime_outside_allowlist(tmp_path, monkeypatch):
     )
     assert "SKILL_EXEC_ERROR" in result
     assert "allowlist" in result
+
+
+def test_skill_exec_node_unavailable_reports_health_reason(tmp_path, monkeypatch):
+    """When neither the bundled nor the PATH node is usable, the existing
+    SKILL_EXEC_ERROR shape now also carries the health probe verdicts."""
+    from ouroboros import platform_layer
+
+    skills_root = tmp_path / "skills"
+    skill_dir = _build_skill(
+        skills_root,
+        "hello",
+        manifest=_valid_script_manifest("hello", runtime="node"),
+    )
+    ctx = _make_ctx(tmp_path)
+    _mark_reviewed_and_enabled(ctx.drive_root, skill_dir, "hello")
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    monkeypatch.setattr(
+        platform_layer,
+        "select_skill_node_runtime",
+        lambda timeout_sec=10: ("", "bundled:broken:signal:SIGKILL; path:missing:not_on_path"),
+    )
+
+    result = skill_exec_mod._handle_skill_exec(
+        ctx, skill="hello", script="scripts/hello.py"
+    )
+    assert "SKILL_EXEC_ERROR" in result
+    assert "bundled:broken:signal:SIGKILL" in result
+    assert "path:missing:not_on_path" in result
+
+
+def test_skill_preflight_node_unavailable_detail_carries_health_reason(tmp_path, monkeypatch):
+    """The preflight finding keeps skip_reason=runtime_unavailable but its
+    detail now discloses WHY the runtime was rejected (health verdicts)."""
+    from ouroboros import platform_layer
+
+    ctx = _make_ctx(tmp_path)
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    skill_dir = _build_skill(skills_root, "alpha")
+    (skill_dir / "scripts" / "check.js").write_text("console.log('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(
+        platform_layer,
+        "select_skill_node_runtime",
+        lambda timeout_sec=10: ("", "bundled:absent; path:broken:signal:SIGKILL"),
+    )
+
+    from ouroboros.tools import skill_preflight as sp
+
+    result = json.loads(sp._handle_skill_preflight(ctx, skill="alpha", paths=["scripts/check.js"]))
+
+    assert result["ok"] is True
+    js = next(f for f in result["files"] if f["path"].endswith("check.js"))
+    assert js.get("skipped") is True
+    assert js.get("skip_reason") == "runtime_unavailable"
+    assert "path:broken:signal:SIGKILL" in js["detail"]
 
 
 # ---------------------------------------------------------------------------

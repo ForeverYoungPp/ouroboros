@@ -84,6 +84,21 @@ def _installer_env(env_root: pathlib.Path, *, ecosystem: str = "") -> Dict[str, 
         "npm_config_cache": str(cache_dir / "npm"), "npm_config_userconfig": str(env_root / "npmrc"),
         "CARGO_HOME": str(env_root / "cargo" / "home"), "CARGO_TARGET_DIR": str(env_root / "cargo" / "target"),
     })
+    if ecosystem == "node":
+        # Emergency-only: when the PATH node is missing/execution-probed broken
+        # and the healthy bundled node was selected (skill-family precedence in
+        # platform_layer), npm's `#!/usr/bin/env node` shebang must resolve the
+        # working runtime, so the curated PATH gains the bundled-node dir. On
+        # healthy systems the env stays byte-identical. npm itself is not
+        # bundled: an absent npm still fails honestly upstream, and an npm
+        # launcher with an ABSOLUTE node shebang ignoring PATH is a disclosed
+        # residual.
+        from ouroboros.platform_layer import skill_node_emergency_path_dir
+
+        prepend_dir = skill_node_emergency_path_dir()
+        if prepend_dir:
+            current = env.get("PATH", "")
+            env["PATH"] = os.pathsep.join([prepend_dir, current]) if current else prepend_dir
     return env
 
 
@@ -178,6 +193,11 @@ def _install_python_packages(packages: List[str], env_root: pathlib.Path, timeou
 
 
 def _install_node_package(package: str, env_root: pathlib.Path, timeout_sec: int) -> List[Dict[str, Any]]:
+    from ouroboros.platform_layer import bootstrap_process_path
+
+    # A GUI-launched macOS process starts with a truncated PATH; enrich it the
+    # same way the process tools do BEFORE deciding npm is absent (T13).
+    bootstrap_process_path()
     npm = shutil.which("npm")
     if not npm:
         raise RuntimeError("npm is not available on PATH")

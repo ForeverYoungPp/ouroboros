@@ -245,6 +245,111 @@ def test_spawn_out_of_process_companions_host_spawns_declared_name(tmp_path: pat
         init_server_process_pid()
 
 
+def _node_companion_api(tmp_path: pathlib.Path, monkeypatch, *, runtime: str, command: list[str], captured: dict) -> PluginAPIImpl:
+    init_server_process_pid()
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir(exist_ok=True)
+
+    class FakeSupervisor:
+        def start(self, descriptor):
+            captured["descriptor"] = descriptor
+            return True
+
+    monkeypatch.setattr(extension_loader, "get_global_supervisor", lambda: FakeSupervisor())
+    return PluginAPIImpl(_PluginAPIConfig(
+        skill_name="demo",
+        permissions=["companion_process"],
+        env_allowlist=[],
+        state_dir=tmp_path / "state",
+        settings_reader=lambda: {},
+        companion_processes=[{
+            "name": "daemon",
+            "command": command,
+            "runtime": runtime,
+        }],
+        skill_dir=skill_dir,
+    ))
+
+
+def test_companion_node_command_rewritten_via_policy_helper(tmp_path: pathlib.Path, monkeypatch) -> None:
+    """Node symmetry with the python->sys.executable rewrite: the policy helper
+    (bundled-first + health rollback) owns the choice; a healthy PATH means no
+    emergency, so the child env stays byte-identical."""
+    import os
+
+    from ouroboros import platform_layer
+
+    selected = str(tmp_path / "bundle" / "bin" / "node")
+    monkeypatch.setattr(
+        platform_layer, "select_skill_node_runtime", lambda timeout_sec=10: (selected, "bundled")
+    )
+    monkeypatch.setattr(platform_layer, "skill_node_emergency_path_dir", lambda timeout_sec=10: "")
+    captured: dict = {}
+    api = _node_companion_api(
+        tmp_path, monkeypatch, runtime="node", command=["node", "server.js"], captured=captured
+    )
+
+    api.register_companion_process("daemon")
+
+    descriptor = captured["descriptor"]
+    assert descriptor.command == [selected, "server.js"]
+    assert descriptor.env["PATH"] == os.environ["PATH"]
+
+
+def test_companion_npm_not_rewritten_but_emergency_path_prepended(tmp_path: pathlib.Path, monkeypatch) -> None:
+    """npm is NOT bundled: argv stays npm; in the emergency state (PATH node
+    dead, bundled selected) the child PATH gains the bundled-node dir so npm's
+    `#!/usr/bin/env node` shebang finds the working runtime."""
+    import os
+
+    from ouroboros import platform_layer
+
+    bundle_bin = str(tmp_path / "bundle" / "bin")
+    monkeypatch.setattr(
+        platform_layer,
+        "select_skill_node_runtime",
+        lambda timeout_sec=10: (str(pathlib.Path(bundle_bin) / "node"), "bundled"),
+    )
+    monkeypatch.setattr(
+        platform_layer, "skill_node_emergency_path_dir", lambda timeout_sec=10: bundle_bin
+    )
+    captured: dict = {}
+    api = _node_companion_api(
+        tmp_path, monkeypatch, runtime="npm", command=["npm", "run", "start"], captured=captured
+    )
+
+    api.register_companion_process("daemon")
+
+    descriptor = captured["descriptor"]
+    assert descriptor.command == ["npm", "run", "start"]
+    assert descriptor.env["PATH"].split(os.pathsep)[0] == bundle_bin
+    assert descriptor.env["PATH"].endswith(os.environ["PATH"])
+
+
+def test_companion_node_unusable_leaves_command_and_env_untouched(tmp_path: pathlib.Path, monkeypatch) -> None:
+    """Nothing usable -> honest failure at spawn time, no rewrite, no env edit."""
+    import os
+
+    from ouroboros import platform_layer
+
+    monkeypatch.setattr(
+        platform_layer,
+        "select_skill_node_runtime",
+        lambda timeout_sec=10: ("", "bundled:absent; path:broken:signal:SIGKILL"),
+    )
+    monkeypatch.setattr(platform_layer, "skill_node_emergency_path_dir", lambda timeout_sec=10: "")
+    captured: dict = {}
+    api = _node_companion_api(
+        tmp_path, monkeypatch, runtime="node", command=["node", "server.js"], captured=captured
+    )
+
+    api.register_companion_process("daemon")
+
+    descriptor = captured["descriptor"]
+    assert descriptor.command == ["node", "server.js"]
+    assert descriptor.env["PATH"] == os.environ["PATH"]
+
+
 def test_windows_companion_start_does_not_request_console_process_group(tmp_path: pathlib.Path, monkeypatch) -> None:
     init_server_process_pid()
     captured = {}

@@ -106,11 +106,39 @@ _POLICY_DENIAL_STATUSES = frozenset({
 # DELIBERATELY demotes them to a non-degrading "cosmetic" bucket (still recorded
 # on the execution axis for monitoring) because the owner accepted that an
 # ignored shell failure belongs on the LLM-review/objective axis, not the
-# execution axis. `timeout` is intentionally EXCLUDED — a stuck/aborted command
-# is a real failure. Structural status/tool-name partition, never content
-# matching (Bible P5).
+# execution axis. TWO exclusions keep the demotion honest, symmetric in intent:
+# `timeout` (never in the set — a stuck/aborted command is a real failure) and
+# SIGNAL DEATH (D7, node-runtime sprint: a process killed by a signal —
+# `_is_signal_death` below — is excluded at the branch, because a kernel
+# CODESIGNING kill, an OOM kill, or an external `kill -9` is an
+# execution-degrading fact, not an ignorable probe exit; the 43-SIGKILL macOS
+# incident hid exactly here as "cosmetic"). Structural status/tool-name/typed-
+# meta partition, never content matching (Bible P5).
 _NON_BLOCKING_RECOVERABLE_STATUSES = frozenset({"non_zero_exit", "shell_error"})
 _COSMETIC_TOOL_NAMES = frozenset({"run_command", "run_script"})
+
+
+def _is_signal_death(item: Dict[str, Any]) -> bool:
+    """TYPED signal-death test for one tool-call record (D7): the child died to
+    a signal when the record's meta shows a NEGATIVE exit code or a signal name.
+
+    Reads the typed ``exit_code``/``signal`` fields that the process-tool
+    handler publishes structurally (loop_tool_execution merges them into
+    result_meta); for LEGACY records the same keys were regex-harvested from
+    the rendered text, so the read covers both generations. A record carrying
+    NEITHER key cannot prove signal death and stays in the cosmetic bucket.
+
+    POSIX semantics — declared residual, not faked portability: on Windows a
+    killed process reports a large POSITIVE exit code (e.g. 0xC0000005) and no
+    signal, so this partition cannot see a Windows kill; such a record remains
+    cosmetic."""
+    if str(item.get("signal") or "").strip():
+        return True
+    exit_code = item.get("exit_code")
+    try:
+        return exit_code is not None and int(exit_code) < 0
+    except (TypeError, ValueError):
+        return False
 # A2: an UNRECOVERED access-policy block (resource_policy_blocked /
 # resource_constraint_blocked) on a READ-ONLY exploratory tool — e.g. a
 # read_file/search_code/query_code refused by the resource policy — is honest
@@ -182,6 +210,12 @@ def _tool_error_record(item: Dict[str, Any], *, recovered_by: int | None = None)
         "signal": item.get("signal"),
         "result": str(item.get("result") or "")[:500],
     }
+    # T11: forensic disclosure for the signal-death class - a millisecond
+    # lifetime names a kernel kill, and the attested runtime separates a broken
+    # PATH node from the bundled substitute. Absent keys stay absent.
+    for extra in ("duration_ms", "resolved_runtime"):
+        if item.get(extra) is not None:
+            record[extra] = item.get(extra)
     if recovered_by is not None:
         record["recovered_by_call_index"] = recovered_by
     return record
@@ -279,8 +313,15 @@ def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str,
         if recovered_by is not None:
             recovered_items.append(_tool_error_record(item, recovered_by=recovered_by))
             continue
-        if status in _NON_BLOCKING_RECOVERABLE_STATUSES and tool in _COSMETIC_TOOL_NAMES:
-            # Unrecovered run_command/run_script non-zero exit: cosmetic, not degrading.
+        if (
+            status in _NON_BLOCKING_RECOVERABLE_STATUSES
+            and tool in _COSMETIC_TOOL_NAMES
+            and not _is_signal_death(item)
+        ):
+            # Unrecovered run_command/run_script non-zero exit: cosmetic, not
+            # degrading. Signal death (negative exit_code / signal name in the
+            # typed meta) falls THROUGH to the unresolved bucket — symmetric
+            # with the timeout exclusion above (D7).
             cosmetic_items.append(_tool_error_record(item))
             continue
         if status in _POLICY_DENIAL_STATUSES:

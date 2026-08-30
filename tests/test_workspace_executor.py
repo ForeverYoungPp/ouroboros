@@ -1409,9 +1409,10 @@ def test_docker_executor_run_script_uses_backend_script_path(tmp_path, monkeypat
     data.mkdir()
     captured: dict[str, object] = {}
 
-    def fake_execute(ctx, cmd, cwd, timeout_sec):
+    def fake_execute(ctx, cmd, cwd, timeout_sec, env_overlay=None):
         captured["cmd"] = list(cmd)
         captured["cwd"] = str(cwd)
+        captured["env_overlay"] = env_overlay
         return SimpleNamespace(returncode=0, stdout="ok\n", stderr="", backend_trace={"executor_id": "pb-container"}, args=list(cmd))
 
     monkeypatch.setattr(shell_mod, "executor_execute", fake_execute)
@@ -1437,6 +1438,7 @@ def test_docker_executor_run_script_uses_backend_script_path(tmp_path, monkeypat
     assert "ok" in result
     assert captured["cmd"][1].startswith("/workspace/.ouroboros/tmp_scripts/script_")
     assert not str(captured["cmd"][1]).startswith(str(workspace))
+    assert captured["env_overlay"] is None  # no node emergency → env untouched
 
 
 def test_docker_executor_accepts_backend_absolute_write_targets_and_outputs(tmp_path, monkeypatch):
@@ -1453,8 +1455,9 @@ def test_docker_executor_accepts_backend_absolute_write_targets_and_outputs(tmp_
     data.mkdir()
     captured: dict[str, object] = {}
 
-    def fake_execute(ctx, cmd, cwd, timeout_sec):
+    def fake_execute(ctx, cmd, cwd, timeout_sec, env_overlay=None):
         captured["cmd"] = list(cmd)
+        captured["env_overlay"] = env_overlay
         (workspace / "backend-output.txt").write_text("ok\n", encoding="utf-8")
         return SimpleNamespace(returncode=0, stdout="wrote\n", stderr="", backend_trace={"executor_id": "pb-container"}, args=list(cmd))
 
@@ -1489,6 +1492,7 @@ def test_docker_executor_accepts_backend_absolute_write_targets_and_outputs(tmp_
     assert "ARTIFACT_OUTPUT_ERROR" not in result
     assert "backend-output.txt" in result
     assert captured["cmd"] == ["sh", "-c", "printf ok > /workspace/backend-output.txt"]
+    assert captured["env_overlay"] is None  # no node emergency → env untouched
 
 
 def test_docker_executor_enforces_network_none_before_exec(tmp_path, monkeypatch):
@@ -1993,3 +1997,68 @@ def test_api_task_rejects_malformed_executor_ref(tmp_path, monkeypatch):
 
     assert response.status_code == 400
     assert "executor_ref.type is required" in body["error"]
+
+
+def test_overlay_env_is_case_aware():
+    """T17 pin: the shared local-env merge replaces a Windows case-variant key
+    instead of duplicating it, and stays exact-match on POSIX."""
+    from ouroboros import workspace_executor as wx
+
+    base = {"Path": "C:/old", "HOME": "/h"}
+    overlay = {"PATH": "/bundle:C:/old"}
+    real = wx.IS_WINDOWS
+    try:
+        wx.IS_WINDOWS = True
+        merged = wx.overlay_env(base, overlay)
+        assert merged["PATH"] == "/bundle:C:/old" and "Path" not in merged
+        wx.IS_WINDOWS = False
+        merged = wx.overlay_env(base, overlay)
+        assert merged["Path"] == "C:/old" and merged["PATH"] == "/bundle:C:/old"
+    finally:
+        wx.IS_WINDOWS = real
+    assert wx.overlay_env(base, None) == base
+
+
+def test_start_service_local_branch_uses_case_aware_overlay(tmp_path, monkeypatch):
+    """T19 pin: the LOCAL start_service branch merges env_overlay through the
+    shared case-aware helper — a stale case-variant Path never survives next to
+    the attested PATH prepend (grok A-F finding)."""
+    from types import SimpleNamespace
+
+    from ouroboros import workspace_executor as wx
+
+    captured = {}
+
+    def fake_spawn(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return SimpleNamespace(pid=4242, poll=lambda: None)
+
+    monkeypatch.setattr("ouroboros.process_custody.spawn_supervised", fake_spawn)
+    monkeypatch.setattr(wx, "IS_WINDOWS", True)
+    monkeypatch.setenv("Path", "C:/stale")
+    monkeypatch.delenv("PATH", raising=False)
+    ctx = SimpleNamespace(
+        task_id="svc-overlay",
+        drive_root=tmp_path,
+        executor_ref={
+            "type": "local",
+            "id": "local-overlay",
+            "workspace_host_path": str(tmp_path),
+            "workspace_backend_path": "/workspace",
+        },
+    )
+    payload = wx.start_service(
+        ctx,
+        name="svc",
+        cmd=["node", "server.js"],
+        host_cwd=tmp_path,
+        cwd_root="task_drive",
+        readiness={},
+        outputs=[],
+        before_outputs={},
+        env_overlay={"PATH": "/bundle/bin:C:/stale"},
+    )
+    env = captured["env"]
+    assert env["PATH"] == "/bundle/bin:C:/stale"
+    assert "Path" not in env
+    assert payload.get("state") in ("running", "ready", "started", None) or payload

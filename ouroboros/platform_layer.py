@@ -1038,32 +1038,6 @@ def node_distribution_platform() -> str:
     return ""
 
 
-def probe_node_version(node_path: str) -> str:
-    """Return a normalized bundled-Node version, or ``""`` on probe failure."""
-    # A metadata probe must not inherit runtime/test hooks. In particular,
-    # NODE_OPTIONS can contain test filters or preload modules that either make
-    # `node --version` fail before the hermetic lane gets a chance to scrub the
-    # variable or execute arbitrary operator code during a supposedly inert
-    # version check.
-    probe_env = dict(os.environ)
-    probe_env.pop("NODE_OPTIONS", None)
-    try:
-        result = _hidden_run(
-            [str(node_path), "--version"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=10,
-            check=False,
-            env=probe_env,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if result.returncode != 0:
-        return ""
-    return str(result.stdout or "").strip().removeprefix("v")
-
-
 def embedded_ripgrep_candidates(base_dir: pathlib.Path) -> List[pathlib.Path]:
     """Return candidate bundled ripgrep paths."""
     if IS_WINDOWS:
@@ -1449,3 +1423,30 @@ def resume_process(pid: int) -> bool:
     except Exception as exc:
         log.warning("resume_process failed: %s", exc)
         return False
+
+
+# Node runtime health/policy moved to ouroboros/node_runtime.py (its own module:
+# the policy grew past what a cross-platform primitives file should hold, and
+# the 1600-line module gate agrees). The re-export is a PEP 562 module
+# __getattr__ rather than an eager from-import: node_runtime itself imports
+# this module at module level, and an eager import back from HERE re-entered a
+# partially initialized node_runtime whenever node_runtime was imported first
+# (triad finding, all three phase-C reviewers). Lazy resolution keeps both
+# import orders sound while every existing importer (preflight_node, skill
+# surfaces, the interpreter resolver, claudexor_runtime) keeps its
+# `from ouroboros.platform_layer import <name>` spelling unchanged.
+_NODE_RUNTIME_REEXPORTS = (
+    "NodeRuntimeHealth",
+    "node_runtime_health",
+    "probe_node_version",
+    "select_skill_node_runtime",
+    "skill_node_emergency_path_dir",
+)
+
+
+def __getattr__(name: str):
+    if name in _NODE_RUNTIME_REEXPORTS:
+        from ouroboros import node_runtime
+
+        return getattr(node_runtime, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
