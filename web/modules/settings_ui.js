@@ -395,18 +395,19 @@ export function renderSettingsPage() {
 
                 <section class="settings-panel" data-settings-panel="agents">
                     <div class="settings-section-copy">
-                        The agents Ouroboros delegates to, and what each of them is allowed to do:
-                        the subscription accounts, who reviews commits, and the complete execution
-                        choices available to child tasks. API keys stay in Providers; global model
-                        lanes stay in Models, while each Available subagent owns its route here.
+                        The agents Ouroboros delegates to, in dependency order: the subscription
+                        accounts they run on, the Available subagents built from those accounts
+                        and API routes, and the review lanes that reference those subagents.
+                        API keys stay in Providers; global model lanes stay in Models, while
+                        each Available subagent owns its route here.
                     </div>
                     <!-- ONE service banner for the whole tab: the single place a
                          daemon or runtime problem is explained, instead of the
                          scattering of "(not in discovery)" the owner reported. -->
                     ${renderAgentsServiceBanner()}
                     ${renderAgentAccountsSection()}
-                    ${renderReviewerSlotsSection()}
                     ${renderSubagentsSection()}
+                    ${renderReviewerSlotsSection()}
                 </section>
 
                 <section class="settings-panel" data-settings-panel="behavior">

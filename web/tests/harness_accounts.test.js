@@ -27,6 +27,7 @@ import {
     serviceBannerLine,
     startLogin,
     unreadFacets,
+    harnessFamilyMarkup,
     verificationBadge,
     wakeDaemon,
 } from '../modules/harness_accounts.js';
@@ -436,6 +437,23 @@ test('a model-scoped window never paints the whole account exhausted — it is a
 // Add account: pywebview's WKWebView implements no window.prompt (it answers
 // null silently), so the flow runs on the in-house input dialog.
 // ---------------------------------------------------------------------------
+
+test('the groups rebuild wraps in preserveCardFocus so a family-mounted login card keeps its caret', () => {
+    // REGRESSION guard (fable review, roster-identity sprint): the login card
+    // mounts INSIDE #harness-accounts-groups now, so the poll-tick innerHTML
+    // rebuild destroys a focused paste-code/name input BEFORE the card's own
+    // render can capture it. The capture must wrap the whole rebuild — the
+    // innerHTML assignment and the card repaint both inside ONE
+    // preserveCardFocus callback.
+    const source = readFileSync(new URL('../modules/harness_accounts.js', import.meta.url), 'utf8');
+    const wrap = source.indexOf('preserveCardFocus(host, () => {');
+    assert.ok(wrap >= 0, 'renderRows must wrap its rebuild in preserveCardFocus');
+    const rebuild = source.indexOf('host.innerHTML = accountGroups(');
+    const repaint = source.indexOf('state.loginCard?.render();');
+    const close = source.indexOf('\n    });', wrap);
+    assert.ok(wrap < rebuild && rebuild < repaint && repaint < close,
+        'both the innerHTML rebuild and the card repaint live inside the capture');
+});
 
 test('Add account never touches window.prompt and asks through the in-house dialog', async () => {
     // REGRESSION guard for the dead desktop button: the module must not call
@@ -2104,4 +2122,18 @@ test('a login seen online is not un-seen by the re-check running out', () => {
         'a positive confirmation no longer wins on its own');
     assert.match(body, /active\.verdict = confirmed/,
         'the monotone predicate does not decide the verdict');
+});
+
+test('the family markup mounts a per-family login host under its header (3=A)', () => {
+    const html = harnessFamilyMarkup(
+        { harness: 'codex', label: 'Codex CLI', rows: [], status: { tone: 'muted', label: 'x' } },
+        {}, { accountsRead: 1 },
+    );
+    const headIdx = html.indexOf('agent-family-head');
+    const loginIdx = html.indexOf('data-family-login="codex"');
+    const rowsIdx = html.indexOf('agent-family-rows');
+    assert.ok(headIdx > -1 && loginIdx > -1 && rowsIdx > -1);
+    // The login card appears where the owner clicked: directly under the
+    // family header, above the account rows — not after every family.
+    assert.ok(headIdx < loginIdx && loginIdx < rowsIdx);
 });

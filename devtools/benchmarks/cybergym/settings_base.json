@@ -1,7 +1,7 @@
 {
   "OPENROUTER_API_KEY": "",
   "OUROBOROS_MODEL": "deepseek/deepseek-v4-flash-0731",
-  "OUROBOROS_SUBAGENTS": "{\"enabled\":true,\"items\":[{\"subagent_id\":\"benchmark-model\",\"name\":\"Benchmark model\",\"recommended_use\":\"Use for substantial implementation, difficult debugging, research synthesis, and end-to-end ownership. Prefer when overall quality and continuity matter more than speed.\",\"route\":{\"kind\":\"api_model\",\"target_id\":\"deepseek/deepseek-v4-flash-0731\"}}]}",
+  "OUROBOROS_SUBAGENTS": "{\"enabled\":true,\"items\":[{\"subagent_id\":\"benchmark-model\",\"recommended_use\":\"Use for substantial implementation, difficult debugging, research synthesis, and end-to-end ownership. Prefer when overall quality and continuity matter more than speed.\",\"route\":{\"kind\":\"api_model\",\"target_id\":\"deepseek/deepseek-v4-flash-0731\"}}]}",
   "OUROBOROS_MODEL_LIGHT": "deepseek/deepseek-v4-flash-0731",
   "OUROBOROS_MODEL_VISION": "deepseek/deepseek-v4-flash-0731",
   "OUROBOROS_MODEL_CONSCIOUSNESS": "deepseek/deepseek-v4-flash-0731",

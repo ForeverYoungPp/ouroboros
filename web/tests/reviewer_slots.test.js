@@ -27,6 +27,10 @@ import {
     sessionModelOptions,
     splitSessionTarget,
     subagentOptionsFor,
+    SUBAGENT_CHOICE_PREFIX,
+    advisoryReferenceTransition,
+    encodeReviewerChoice,
+    reviewerChoiceGroups,
 } from '../modules/reviewer_slots.js';
 
 test('reviewer routes reuse the shared visible harness identity without claiming execution', () => {
@@ -395,13 +399,16 @@ test('the roster select survives a saved reference the roster no longer lists', 
     // and the next Save really rewires the reviewer. The absence claim follows
     // provenance: only a roster that was READ may say "not in the roster".
     const roster = [
-        { subagent_id: 'deep', name: 'Deep Reviewer', recommended_use: 'Long reasoning over big diffs' },
-        { subagent_id: 'fast', name: 'Fast Reviewer', recommended_use: '' },
+        { subagent_id: 'deep', recommended_use: 'Long reasoning over big diffs',
+          route: { kind: 'api_model', target_id: 'openai/gpt-5.6-sol' }, effort: 'high' },
+        { subagent_id: 'fast', recommended_use: '',
+          route: { kind: 'agent_session', target_id: 'cursor=grok-4.6' } },
     ];
     const listed = subagentOptionsFor(roster, 'deep');
     assert.deepEqual(listed.map((o) => o.value), ['deep', 'fast']);
-    assert.match(listed[0].label, /Deep Reviewer — Long reasoning/);
-    assert.equal(listed[1].label, 'Fast Reviewer');
+    // 2=A label contract: FACTS lead (channel first), description is a caption.
+    assert.equal(listed[0].label, '#deep · API · openai/gpt-5.6-sol · high — Long reasoning over big diffs');
+    assert.equal(listed[1].label, '#fast · cursor · grok-4.6');
 
     const missing = subagentOptionsFor(roster, 'gone');
     assert.deepEqual(missing.map((o) => o.value), ['deep', 'fast', 'gone']);
@@ -409,6 +416,79 @@ test('the roster select survives a saved reference the roster no longer lists', 
     // An unreadable roster licenses no absence claim.
     assert.match(subagentOptionsFor([], 'gone', { rosterKnown: false })[0].label, /not checked/);
     assert.doesNotMatch(subagentOptionsFor([], 'gone', { rosterKnown: false })[0].label, /not in the roster/);
+});
+
+test('the one flat reviewer picker leads with roster references, then the inline channels (1=B)', () => {
+    const roster = [
+        { subagent_id: 'deep', recommended_use: 'Long reasoning',
+          route: { kind: 'api_model', target_id: 'openai/gpt-5.6-sol' }, effort: 'high' },
+    ];
+    const harnesses = [{ id: 'claude', display_name: 'Claude Code' }];
+
+    // A reference row: its select value is the prefixed id, the roster group
+    // leads, and the stashed inline route adds NO undiscovered session entry.
+    const refRow = { subagent_id: 'deep', route: { kind: ROUTE_KIND_SESSION, target_id: 'gone=old' } };
+    assert.equal(encodeReviewerChoice(refRow), `${SUBAGENT_CHOICE_PREFIX}deep`);
+    const refGroups = reviewerChoiceGroups({ roster, row: refRow, harnesses });
+    assert.equal(refGroups[0].label, 'Available subagents');
+    assert.deepEqual(refGroups[0].options.map((o) => o.value), [`${SUBAGENT_CHOICE_PREFIX}deep`]);
+    assert.match(refGroups[0].options[0].label, /^#deep · API/);
+    assert.deepEqual(refGroups.slice(1).map((g) => g.label), ['API', 'Agents — subscriptions']);
+    assert.ok(!refGroups.slice(1).flatMap((g) => g.options).some((o) => o.value === 'session:gone'));
+
+    // An inline row: its own choice threads down so an undiscovered harness
+    // keeps its option (the survive-the-save rule).
+    const inlineRow = { subagent_id: '', route: { kind: ROUTE_KIND_SESSION, target_id: 'gone=old' } };
+    assert.equal(encodeReviewerChoice(inlineRow), 'session:gone');
+    const inlineGroups = reviewerChoiceGroups({ roster, row: inlineRow, harnesses });
+    assert.ok(inlineGroups.at(-1).options.some((o) => o.value === 'session:gone'));
+
+    // A saved reference missing from the roster survives as a prefixed option;
+    // an empty roster contributes no group at all.
+    const missingGroups = reviewerChoiceGroups({ roster, row: { subagent_id: 'gone' }, harnesses });
+    assert.ok(missingGroups[0].options.some(
+        (o) => o.value === `${SUBAGENT_CHOICE_PREFIX}gone` && /not in the roster/.test(o.label)));
+    const emptyGroups = reviewerChoiceGroups({ roster: [], row: { subagent_id: '' }, harnesses });
+    assert.notEqual(emptyGroups[0].label, 'Available subagents');
+
+    // The advisory api label rides through.
+    const advisory = reviewerChoiceGroups({ roster: [], row: { subagent_id: '' }, harnesses, apiLabel: 'API model (inspection episode)' });
+    assert.equal(advisory[0].options[0].label, 'API model (inspection episode)');
+});
+
+test('an advisory reference switch keeps an explicit effort override; crossing from inline clears it', () => {
+    // Sol delta-review finding: the merged picker unconditionally cleared the
+    // advisory effort on ANY reference pick, silently erasing a saved
+    // {subagent_id, effort: 'xhigh'} override on a reference-to-reference
+    // switch. Inline branches still shed their effort ('' = the roster row's
+    // own effort decides).
+    assert.deepEqual(
+        advisoryReferenceTransition({ subagent_id: 'deep', effort: 'xhigh' }, 'fast'),
+        { subagent_id: 'fast', effort: 'xhigh' });
+    assert.deepEqual(
+        advisoryReferenceTransition({ subagent_id: '', effort: 'low', route: { kind: ROUTE_KIND_API } }, 'deep'),
+        { subagent_id: 'deep', effort: '' });
+    assert.deepEqual(
+        advisoryReferenceTransition({ subagent_id: '', effort: 'high', route: { kind: ROUTE_KIND_SESSION, target_id: 'codex=x' } }, 'deep'),
+        { subagent_id: 'deep', effort: '' });
+});
+
+test('picker captions strip directional marks and never split a surrogate pair', () => {
+    const marked = subagentOptionsFor([{
+        subagent_id: 'row',
+        recommended_use: '\u200Efast\u200F \u061Ccheap\u202Eevil',
+        route: { kind: 'api_model', target_id: 'openai/gpt-5.6-luna' },
+    }], '')[0].label;
+    assert.equal(marked, '#row · API · openai/gpt-5.6-luna — fast cheap' + 'evil');
+
+    const emoji = '\u{1F9EA}'.repeat(60); // 60 code points, 120 UTF-16 units
+    const long = subagentOptionsFor([{
+        subagent_id: 'row',
+        recommended_use: emoji,
+        route: { kind: 'api_model', target_id: 'x' },
+    }], '')[0].label;
+    const caption = long.split(' — ')[1];
+    assert.equal(caption, '\u{1F9EA}'.repeat(45) + '…');
 });
 
 test('the derived disclosure reports the roster row facts read-only, with honest absence', () => {

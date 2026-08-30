@@ -62,7 +62,12 @@ strengths fit the work; prefer suitable Agent session choices often when they fi
 so subscription capacity replaces incremental API spend, while choosing API
 model rows when their described strengths fit better. The catalog is saved intent,
 not a fresh liveness promise: dispatch is authoritative. The host does not rank
-rows, interpret the objective, or substitute another actor.
+rows, interpret the objective, or substitute another actor. A row's identity is
+its `subagent_id` plus the saved route FACTS; `recommended_use` is owner intent
+riding beside them, never an identity claim — when facts and description
+disagree, the facts are true. When YOU edit the roster in settings, rewrite
+that row's `recommended_use` in the same change whenever you change its route:
+a description that predates the route misleads every later selection.
 If the block is absent, do not invent an id or resurrect legacy lanes; no
 model-visible configured actor is currently available.
 

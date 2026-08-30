@@ -144,11 +144,11 @@ def test_the_agents_panel_carries_one_banner_and_the_three_sections() -> None:
         "renderSubagentsSection()",
     ):
         assert fragment in panel, f"the Agents panel does not render {fragment}"
-    # Order is the specification's: service banner, accounts, review lanes,
-    # delegation.
+    # Order follows the dependency direction: service banner, accounts,
+    # delegation roster, then the review lanes that reference its rows.
     order = [panel.index(f) for f in (
         "renderAgentsServiceBanner()", "renderAgentAccountsSection()",
-        "renderReviewerSlotsSection()", "renderSubagentsSection()",
+        "renderSubagentsSection()", "renderReviewerSlotsSection()",
     )]
     assert order == sorted(order), "the Agents panel sections are out of order"
     # Exactly ONE service banner element on the whole page.

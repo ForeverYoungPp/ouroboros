@@ -178,15 +178,21 @@ def test_fresh_install_applies_the_preset_in_one_write(onboarding):
     assert saved[PRESET_MARKER_KEY] == "3"
     assert saved["OUROBOROS_SUBAGENT_HARNESS"] == ""
     available = json.loads(saved[SUBAGENTS_SETTING])
+    # 4=A: the advisory seat's session route matches no task actor, so the
+    # preset mints a roster row for it and every reviewer slot is a
+    # subagent_id REFERENCE into the roster the preset ships.
+    roster = {row["subagent_id"]: row["route"]["target_id"] for row in available["items"]}
     assert [row["route"]["target_id"] for row in available["items"]] == [
         "claude=claude-opus-5", "codex=gpt-5.6-sol", "openai/gpt-5.6-luna",
+        "claude=claude-sonnet-5",
     ]
+    assert all("name" not in row for row in available["items"])  # retired (1=A)
     assert json.loads(saved[SUBAGENTS_RECEIPT_KEY])["available_subagents_fingerprint"]
     slots = json.loads(saved["OUROBOROS_REVIEWER_SLOTS"])
-    assert [row["route"]["target_id"] for row in slots["triad"]] == [
+    assert [roster[row["subagent_id"]] for row in slots["triad"]] == [
         "claude=claude-opus-5", "codex=gpt-5.6-sol"]
-    assert slots["scope"][0]["route"]["target_id"] == "codex=gpt-5.6-sol"
-    assert slots["advisory"]["route"]["target_id"] == "claude=claude-sonnet-5"
+    assert roster[slots["scope"][0]["subagent_id"]] == "codex=gpt-5.6-sol"
+    assert roster[slots["advisory"]["subagent_id"]] == "claude=claude-sonnet-5"
     # Everything else of the transaction landed in the SAME file.
     assert saved["OUROBOROS_RUNTIME_MODE"] == "advanced"
     assert saved["OPENROUTER_API_KEY"] == WIZARD_PAYLOAD["OPENROUTER_API_KEY"]
@@ -406,7 +412,11 @@ def test_completion_validates_but_never_replaces_owner_edited_actor_rows(onboard
     )
     assert preview.status_code == 200, preview.text
     assert preview.json()["source"] == "configured"
-    assert preview.json()["available_subagents"] == owner
+    expected = {
+        "enabled": True,
+        "items": [{k: v for k, v in owner["items"][0].items() if k != "name"}],
+    }
+    assert preview.json()["available_subagents"] == expected
     assert not onboarding.settings_path.exists()
 
     response = onboarding.client.post(
@@ -415,7 +425,7 @@ def test_completion_validates_but_never_replaces_owner_edited_actor_rows(onboard
               SUBAGENTS_SETTING: owner},
     )
     assert response.status_code == 200, response.text
-    assert json.loads(onboarding.saved()[SUBAGENTS_SETTING]) == owner
+    assert json.loads(onboarding.saved()[SUBAGENTS_SETTING]) == expected
     assert response.json()["preset"]["receipt"]["source"] == "configured"
     assert onboarding.calls["snapshot"] == 2  # one independently verified snapshot per request
 
@@ -523,7 +533,11 @@ def test_nonfresh_recovery_completion_still_saves_an_explicit_owner_draft(onboar
     assert response.json()["preset"]["applied"] is True
     assert onboarding.calls["snapshot"] == 0
     saved = onboarding.saved()
-    assert json.loads(saved[SUBAGENTS_SETTING]) == owner
+    expected = {
+        "enabled": True,
+        "items": [{k: v for k, v in owner["items"][0].items() if k != "name"}],
+    }
+    assert json.loads(saved[SUBAGENTS_SETTING]) == expected
     assert saved["OUROBOROS_REVIEWER_SLOTS"] == "owner-reviewer-bytes"
     assert not saved.get(PRESET_MARKER_KEY)
 
@@ -1393,7 +1407,16 @@ def test_a_connected_agy_account_composes_with_core_reviewers(onboarding):
     ]
     assert "agy=gemini-3.7-flash-high" in actor_targets
     reviewer = json.loads(saved["OUROBOROS_REVIEWER_SLOTS"])
-    assert all("agy=" not in row["route"]["target_id"] for row in reviewer["triad"])
+    roster = {
+        row["subagent_id"]: row["route"]["target_id"]
+        for row in json.loads(saved[SUBAGENTS_SETTING])["items"]
+    }
+    triad_targets = [
+        roster[row["subagent_id"]] if "subagent_id" in row
+        else row["route"]["target_id"]
+        for row in reviewer["triad"]
+    ]
+    assert all("agy=" not in target for target in triad_targets)
     assert onboarding.calls["supervisor"] == 1
 
 
