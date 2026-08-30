@@ -180,7 +180,10 @@ def refresh_terminal_reconciliation(
     ``snapshot`` shares one ``custody_audit_snapshot`` across a batch. An audit
     that MATCHES the stored disclosure performs no write and no emit — a
     permanently-unreconcilable row (e.g. an undisposed patch) must not grow
-    events.jsonl on every boot. Returns True only when the row was refreshed.
+    events.jsonl on every boot. Returns True only when the row was really
+    refreshed: the audit evidence is emitted AFTER — and only after — the
+    recorder confirms a changed persisted row, so a lock timeout or a refused
+    write leaves no phantom "refreshed" event behind (R3).
     """
     mine = str(task_id or "")
     if not mine:
@@ -203,8 +206,9 @@ def refresh_terminal_reconciliation(
     _audit_task_custody(drive_root, mine, result, snapshot=snapshot, emit_evidence=False)
     if _stored_disclosure_matches(existing, result):
         return False
+    if not record_terminal_reconciliation(drive_root, mine, result):
+        return False
     _emit_audit_evidence(drive_root, result)
-    record_terminal_reconciliation(drive_root, mine, result)
     return True
 
 
@@ -246,30 +250,61 @@ def backfill_terminal_reconciliations(drive_root: Any) -> List[str]:
     return refreshed
 
 
+# The envelope fields whose values change WHAT a reader can conclude about the
+# task's delegated custody — compared by the no-churn gate below. Provenance
+# (trigger/outcomes/audit_status) is deliberately excluded: it differs between
+# otherwise identical audits and would defeat the gate.
+_ENVELOPE_DISCLOSURE_FIELDS = (
+    "open_run_ids",
+    "pending_invocation_ids",
+    "undisposed_patch_run_ids",
+    "deferred_project_retirements",
+)
+
+
 def _stored_disclosure_matches(
     existing: Mapping[str, Any], result: Mapping[str, Any],
 ) -> bool:
     """Whether the stored row already carries exactly this audit's disclosure.
 
-    Compared on the behavior-bearing surfaces the recorder writes — the
-    unreconciled list and the deferred-retirement disclosure — never on the
-    envelope's provenance (trigger/outcomes), which differs between otherwise
-    identical audits and would defeat the no-churn gate.
+    Compared on the behavior-bearing surfaces (R2): the flat unreconciled list
+    AND every ``_ENVELOPE_DISCLOSURE_FIELDS`` entry of the stored envelope,
+    plus envelope PRESENCE — a kill-written row carrying only the flat list
+    must NOT match, so the next boot adds the envelope once and then becomes a
+    byte-level no-op. The one exception is a row with nothing to disclose at
+    all (no list, no envelope fields): rewriting such a row — or minting one
+    for a task that never delegated — just to attach an empty envelope would
+    be churn, so an absent envelope over an all-empty audit still matches.
     """
     stored_envelope = existing.get("delegate_terminal_reconciliation")
+    has_envelope = isinstance(stored_envelope, dict) and bool(stored_envelope)
     stored_envelope = stored_envelope if isinstance(stored_envelope, dict) else {}
-    return (
-        list(existing.get("delegated_runs_unreconciled") or [])
-        == list(result.get("unreconciled") or [])
-        and list(stored_envelope.get("deferred_project_retirements") or [])
-        == list(result.get("deferred_project_retirements") or [])
+    if list(existing.get("delegated_runs_unreconciled") or []) != list(
+            result.get("unreconciled") or []):
+        return False
+    if any(
+        list(stored_envelope.get(field) or []) != list(result.get(field) or [])
+        for field in _ENVELOPE_DISCLOSURE_FIELDS
+    ):
+        return False
+    if has_envelope:
+        return True
+    return not (
+        list(result.get("unreconciled") or [])
+        or any(list(result.get(field) or []) for field in _ENVELOPE_DISCLOSURE_FIELDS)
     )
 
 
 def record_terminal_reconciliation(
     drive_root: Any, task_id: str, result: Mapping[str, Any],
-) -> None:
-    """Attach the audit to the task record without choosing lifecycle policy."""
+) -> bool:
+    """Attach the audit to the task record without choosing lifecycle policy.
+
+    Returns True only when the row was actually persisted AND now carries this
+    audit's disclosure (R3) — a lock timeout, a raising store, or a write the
+    monotonic guard refused all report False, so callers (the guarded refresh,
+    the boot backfill) cannot claim a heal that never landed.
+    """
 
     try:
         from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
@@ -281,16 +316,20 @@ def record_terminal_reconciliation(
         # loop-exit row, never for inventing one), and an already-current
         # disclosure is not rewritten on every kill or boot.
         if _stored_disclosure_matches(existing, result):
-            return
-        write_task_result(
+            return False
+        stored = write_task_result(
             drive_root,
             str(task_id or ""),
             str(existing.get("status") or STATUS_RUNNING),
             delegate_terminal_reconciliation=dict(result),
             delegated_runs_unreconciled=list(result.get("unreconciled") or []),
         )
+        return _stored_disclosure_matches(
+            stored if isinstance(stored, dict) else {}, result,
+        )
     except Exception:
         log.warning("Failed to persist terminal custody audit for %s", task_id, exc_info=True)
+        return False
 
 
 __all__ = [

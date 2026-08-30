@@ -29,8 +29,10 @@ from supervisor.cancel_publication import (  # noqa: F401 -- intentional public 
     CANCEL_FAILED,
     CANCEL_NOT_FOUND,
     _CANCEL_TERMINALIZED,
+    _audit_delegated_runs_on_kill,
     _cancel_result_fields,
     _cascade_delivery_row_locked,
+    _custody_disclosure_fields,
     _deliver_on_miss,
     _intent_outcome_fields,
     _is_workspace_task_record,
@@ -1126,7 +1128,8 @@ def _finish_captured_running(
 
     _reconcile_dead_review_owner(q.DRIVE_ROOT, int(getattr(worker.proc, "pid", 0) or 0))
 
-    unreconciled = _reconcile_delegated_runs_on_kill(q, task_id)
+    custody_audit = _audit_delegated_runs_on_kill(q, task_id)
+    unreconciled = list(custody_audit.get("unreconciled") or [])
 
     if settled_status:
         # GR6-1b short-circuit, hoisted ABOVE every mutating step (GR7-2): the
@@ -1302,8 +1305,9 @@ def _finish_captured_running(
                 **_intent_outcome_fields(intent or {}),
                 # UNCONDITIONAL (D1b): a clean audit writes [] so a stale
                 # non-empty list from an earlier terminal write is cleared by
-                # this same merge-write, never left lying beside a fresh kill.
-                delegated_runs_unreconciled=unreconciled,
+                # this same merge-write; the audit envelope rides the same
+                # single write (R2) so list and envelope stay coherent.
+                **_custody_disclosure_fields(custody_audit),
                 result="Running task cancelled and worker terminated." + salvage_note,
             ),
         )

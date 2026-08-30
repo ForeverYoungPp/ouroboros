@@ -146,6 +146,57 @@ def test_second_boot_is_a_byte_level_noop_for_a_permanently_stale_row(tmp_path):
     assert events_path.read_bytes() == events_before
 
 
+def test_boot_backfill_adds_the_envelope_to_a_flat_only_kill_row(tmp_path):
+    """R2: a kill-written row carrying only the flat list (no envelope) is NOT
+    current — the next boot attaches the envelope once, and the boot after
+    that is a byte-level no-op."""
+    _emit_started(tmp_path, "run-6", "t-flat")
+    write_task_result(
+        tmp_path, "t-flat", STATUS_FAILED,
+        delegated_runs_unreconciled=["run-6"],
+    )
+
+    assert delegate_terminal.backfill_terminal_reconciliations(tmp_path) == ["t-flat"]
+    result = load_task_result(tmp_path, "t-flat")
+    assert result["delegated_runs_unreconciled"] == ["run-6"]
+    envelope = result["delegate_terminal_reconciliation"]
+    assert envelope["trigger"] == "boot_backfill"
+    assert envelope["open_run_ids"] == ["run-6"]
+
+    row_path = tmp_path / "task_results" / "t-flat.json"
+    events_path = tmp_path / "logs" / "events.jsonl"
+    row_before, events_before = row_path.read_bytes(), events_path.read_bytes()
+    assert delegate_terminal.backfill_terminal_reconciliations(tmp_path) == []
+    assert row_path.read_bytes() == row_before
+    assert events_path.read_bytes() == events_before
+
+
+def test_lock_timeout_refresh_is_false_and_emits_no_evidence(tmp_path, monkeypatch):
+    """R3 honesty: a refresh whose write never landed returns False and emits
+    NO custody evidence — the event may not claim a heal the store refused —
+    and the row heals on the next boot."""
+    import ouroboros.task_results as task_results_mod
+
+    _emit_started(tmp_path, "run-7", "t-lock2")
+    _emit_settled(tmp_path, "run-7", "t-lock2")
+    _stale_terminal_result(tmp_path, "t-lock2",
+                           delegated_runs_unreconciled=["run-7"])
+    events_path = tmp_path / "logs" / "events.jsonl"
+    events_before = events_path.read_bytes()
+
+    def _timeout(*_args, **_kwargs):
+        raise TimeoutError("lock held elsewhere")
+
+    monkeypatch.setattr(task_results_mod, "update_json_locked", _timeout)
+    assert delegate_terminal.refresh_terminal_reconciliation(tmp_path, "t-lock2") is False
+    assert events_path.read_bytes() == events_before
+    assert load_task_result(tmp_path, "t-lock2")["delegated_runs_unreconciled"] == ["run-7"]
+
+    monkeypatch.undo()
+    assert delegate_terminal.refresh_terminal_reconciliation(tmp_path, "t-lock2") is True
+    assert load_task_result(tmp_path, "t-lock2")["delegated_runs_unreconciled"] == []
+
+
 def test_boot_backfill_shares_one_custody_replay_snapshot(tmp_path, monkeypatch):
     """Auditing N stored rows must not rescan the unbounded event log 4·N
     times: the whole backfill pays exactly one ``replay()`` pass."""
@@ -293,6 +344,101 @@ def test_kill_fast_lane_adds_no_write_when_nothing_is_stale(tmp_path, monkeypatc
     )
     assert env.tl.cancel_task_custody(
         "t-clean-kill", deliver=False) == env.tl.CANCEL_ALREADY_SETTLED
+    assert writes == []
+    assert row_path.read_bytes() == row_before
+
+
+def test_miss_lane_already_settled_clears_stale_disclosure(tmp_path, monkeypatch):
+    """R4: the finalize-on-miss already-settled branch performs no terminal
+    write of its own; the guarded kill-path refresh clears a stale stored
+    disclosure there, and a fresh row stays byte-identical (never minted)."""
+    from supervisor import cancel_publication as cp
+    from supervisor import terminal_delivery as td
+
+    env = _kill_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(td, "deliver_miss_lane_outcome", lambda *a, **kw: True)
+    monkeypatch.setattr(env.tl, "_settle_intent", lambda *a, **kw: None)
+
+    # The incident ordering: the intent was captured while the task still
+    # looked live, and the row settled before finalize-on-miss re-checked.
+    intent = {"task_id": "t-miss-stale", "request_id": "r1", "generation": 1}
+    write_task_result(
+        env.drive, "t-miss-stale", STATUS_FAILED, result="settled elsewhere",
+        delegated_runs_unreconciled=["run-stale"],
+    )
+    assert cp._finalize_cancel_intent_on_miss(
+        env.q, "t-miss-stale", intent=intent) == cp.CANCEL_ALREADY_SETTLED
+    stored = load_task_result(env.drive, "t-miss-stale")
+    assert stored["status"] == STATUS_FAILED
+    assert stored["delegated_runs_unreconciled"] == []
+    assert stored["delegate_terminal_reconciliation"]["trigger"] == "kill_path_clear"
+
+    # Fresh variant: nothing stale — zero task-result writes, byte-identical.
+    import ouroboros.task_results as task_results_mod
+
+    write_task_result(env.drive, "t-miss-clean", STATUS_FAILED, result="settled")
+    row_path = tmp_path / "task_results" / "t-miss-clean.json"
+    row_before = row_path.read_bytes()
+    writes: list = []
+    real_write = task_results_mod.write_task_result
+    monkeypatch.setattr(
+        task_results_mod, "write_task_result",
+        lambda *args, **kwargs: writes.append(args) or real_write(*args, **kwargs),
+    )
+    assert cp._finalize_cancel_intent_on_miss(
+        env.q, "t-miss-clean",
+        intent={"task_id": "t-miss-clean", "request_id": "r2", "generation": 1},
+    ) == cp.CANCEL_ALREADY_SETTLED
+    assert writes == []
+    assert row_path.read_bytes() == row_before
+
+
+def test_reaper_self_finalized_branch_clears_stale_disclosure(tmp_path, monkeypatch):
+    """R4: a reap that finds the worker's OWN terminal result (self-finalized)
+    keeps that write untouched but clears a stale stored disclosure through
+    the guarded kill-path refresh; a fresh row stays byte-identical."""
+    from supervisor import task_reaper, workers
+    from supervisor import terminal_delivery as td
+
+    env = _kill_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(workers, "get_event_q",
+                        lambda: types.SimpleNamespace(put=lambda evt: None),
+                        raising=False)
+    monkeypatch.setattr(td, "deliver_miss_lane_outcome", lambda *a, **kw: True)
+    monkeypatch.setattr("ouroboros.delegate_custody.reconcile_task_runs",
+                        lambda *a, **kw: [])
+
+    def _reap(task_id):
+        task_reaper.reap_timed_out_task({
+            "worker_id": 1, "proc": None, "task_id": task_id,
+            "task": {"id": task_id, "chat_id": 3}, "task_type": "chat",
+            "terminal_reason": "idle_timeout", "attempt": 1, "owner_chat_id": 3,
+            "runtime_sec": 10.0, "will_retry": False, "retry_task_id": "",
+        })
+
+    write_task_result(
+        env.drive, "t-self-stale", STATUS_FAILED, result="self-finalized",
+        delegated_runs_unreconciled=["run-stale"],
+    )
+    _reap("t-self-stale")
+    stored = load_task_result(env.drive, "t-self-stale")
+    assert stored["status"] == STATUS_FAILED
+    assert stored["delegated_runs_unreconciled"] == []
+    assert stored["delegate_terminal_reconciliation"]["trigger"] == "kill_path_clear"
+
+    # Fresh variant: nothing stale — zero task-result writes, byte-identical.
+    import ouroboros.task_results as task_results_mod
+
+    write_task_result(env.drive, "t-self-clean", STATUS_FAILED, result="self-finalized")
+    row_path = tmp_path / "task_results" / "t-self-clean.json"
+    row_before = row_path.read_bytes()
+    writes: list = []
+    real_write = task_results_mod.write_task_result
+    monkeypatch.setattr(
+        task_results_mod, "write_task_result",
+        lambda *args, **kwargs: writes.append(args) or real_write(*args, **kwargs),
+    )
+    _reap("t-self-clean")
     assert writes == []
     assert row_path.read_bytes() == row_before
 

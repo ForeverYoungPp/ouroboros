@@ -2709,9 +2709,13 @@ def test_unreconciled_delegated_runs_are_disclosed_on_the_cancelled_result(
 
 @pytest.mark.serial
 def test_kill_path_clean_audit_clears_a_stale_unreconciled_list(qenv, monkeypatch):
-    """D1b: the running-kill terminal write carries the fresh audit
+    """D1b + R2: the running-kill terminal write carries the fresh audit
     UNCONDITIONALLY, so a clean audit clears a stale non-empty list left by an
-    earlier terminal write instead of letting it lie beside the kill."""
+    earlier terminal write instead of letting it lie beside the kill — and the
+    audit ENVELOPE rides the SAME single write (no flat-only row, no second
+    disclosure write)."""
+    import ouroboros.task_results as task_results_mod
+
     task_id = "delegating-clean"
     task, child_drive, proc = _live_split_drive_task(qenv, task_id)
     write_task_result(qenv.drive, task_id, STATUS_RUNNING, result="working",
@@ -2722,6 +2726,18 @@ def test_kill_path_clean_audit_clears_a_stale_unreconciled_list(qenv, monkeypatc
         "supervisor.terminal_delivery.deliver_unreviewed_salvage",
         lambda *_a, **_kw: None,
     )
+    disclosure_writes: list = []
+    real_write = task_results_mod.write_task_result
+
+    def _counting_write(root, tid, status, **kwargs):
+        if str(tid) == task_id and (
+            "delegated_runs_unreconciled" in kwargs
+            or "delegate_terminal_reconciliation" in kwargs
+        ):
+            disclosure_writes.append(dict(kwargs))
+        return real_write(root, tid, status, **kwargs)
+
+    monkeypatch.setattr(task_results_mod, "write_task_result", _counting_write)
 
     try:
         assert qenv.tl.cancel_task_custody(task_id) == qenv.tl.CANCEL_CANCELLED
@@ -2731,6 +2747,12 @@ def test_kill_path_clean_audit_clears_a_stale_unreconciled_list(qenv, monkeypatc
     stored = load_task_result(qenv.drive, task_id)
     assert stored["status"] == STATUS_CANCELLED
     assert stored["delegated_runs_unreconciled"] == []
+    envelope = stored["delegate_terminal_reconciliation"]
+    assert envelope["trigger"] == "cancel_publication"
+    assert envelope["open_run_ids"] == []
+    (only_write,) = disclosure_writes
+    assert only_write["delegated_runs_unreconciled"] == []
+    assert only_write["delegate_terminal_reconciliation"]["trigger"] == "cancel_publication"
 
 
 def test_nested_scoped_home_is_disclosed_even_with_an_os_boundary(tmp_path, monkeypatch):

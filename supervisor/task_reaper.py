@@ -348,8 +348,11 @@ def _run_retry_admission_transaction(
     runtime_sec: float,
     unreconciled_runs: Optional[list],
     salvage_note: str,
+    custody_audit: Optional[Dict[str, Any]] = None,
 ) -> tuple[Dict[str, str], str]:
     """Publish one retry admission under the queue -> cancel lock order."""
+    from supervisor.cancel_publication import _custody_disclosure_fields
+
     from ouroboros.task_results import (
         STATUS_CANCELLED,
         STATUS_FAILED,
@@ -428,8 +431,9 @@ def _run_retry_admission_transaction(
                             # D1b: an AUDITED list — clean [] included — is
                             # written unconditionally so a clean audit clears a
                             # stale stored list; None means no audit ran and
-                            # must not mint an unaudited clean claim.
-                            **({"delegated_runs_unreconciled": list(unreconciled_runs)}
+                            # must not mint an unaudited clean claim. The audit
+                            # envelope rides the same single write (R2).
+                            **(_custody_disclosure_fields(custody_audit, unreconciled_runs)
                                if unreconciled_runs is not None else {}),
                             **recon_fields,
                             result=(
@@ -507,7 +511,7 @@ def _run_retry_admission_transaction(
                                 ),
                                 retry_task_id=retry_task_id or task_id,
                                 # D1b: mirror of the audited-or-absent write above.
-                                **({"delegated_runs_unreconciled": list(unreconciled_runs)}
+                                **(_custody_disclosure_fields(custody_audit, unreconciled_runs)
                                    if unreconciled_runs is not None else {}),
                                 **recon_fields,
                                 result=(
@@ -589,6 +593,7 @@ def _enqueue_retry(
     runtime_sec: float = 0.0,
     unreconciled_runs: Optional[list] = None,
     salvage_note: str = "",
+    custody_audit: Optional[Dict[str, Any]] = None,
 ) -> tuple[bool, int, str, Dict[str, str]]:
     """Atomically admit a dead task's retry or suppress it.
 
@@ -677,6 +682,7 @@ def _enqueue_retry(
         runtime_sec=runtime_sec,
         unreconciled_runs=unreconciled_runs,
         salvage_note=salvage_note,
+        custody_audit=custody_audit,
     )
 
     if suppression:
@@ -1065,6 +1071,19 @@ def _finish_self_finalized_task(
     regress it to FAILED (e.g. the workspace was cleaned up). Readonly
     subagents have no durable artifacts and are skipped (shared gate).
     """
+    # D1b (R4): the self-finalized row keeps its own terminal write untouched;
+    # a stale non-empty stored disclosure is cleared by the same guarded
+    # stale-only refresh the fast already-settled cancel lane runs — it never
+    # mints a row and never rewrites a current one.
+    try:
+        from ouroboros.delegate_terminal import refresh_terminal_reconciliation
+
+        refresh_terminal_reconciliation(
+            pathlib.Path(_q.DRIVE_ROOT), task_id, trigger="kill_path_clear",
+        )
+    except Exception:
+        log.debug("Reaper: kill-path custody-disclosure refresh failed for %s",
+                  task_id, exc_info=True)
     try:
         from ouroboros.headless import (
             ARTIFACT_STATUS_FINALIZING,
@@ -1241,9 +1260,15 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
     # outcome (result field + the typed ``delegated_runs_unreconciled`` event
     # the shared helper emits). Custody reconciliation only — the reaper mints
     # no cancel intents (owner-declined). Fail-soft: the helper never raises.
-    from supervisor.cancel_publication import _reconcile_delegated_runs_on_kill
+    from supervisor.cancel_publication import (
+        _audit_delegated_runs_on_kill,
+        _custody_disclosure_fields,
+    )
 
-    unreconciled = _reconcile_delegated_runs_on_kill(_q, task_id)
+    custody_audit = _audit_delegated_runs_on_kill(
+        _q, task_id, trigger=f"reaper_{terminal_reason}",
+    )
+    unreconciled = list(custody_audit.get("unreconciled") or [])
 
     from ouroboros.task_results import (
         STATUS_FAILED,
@@ -1313,8 +1338,9 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                     # GR5-2: the reap outcome discloses the delegated runs the
                     # custody reconcile above could not settle. UNCONDITIONAL
                     # (D1b): a clean audit writes [] so a stale stored list is
-                    # cleared by this same terminal write.
-                    delegated_runs_unreconciled=list(unreconciled or []),
+                    # cleared by this same terminal write; the audit envelope
+                    # rides the same single write (R2).
+                    **_custody_disclosure_fields(custody_audit),
                     **recon_fields,
                     result=(
                         f"Task killed by {terminal_reason} after "
@@ -1347,6 +1373,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                     runtime_sec=runtime_sec,
                     unreconciled_runs=unreconciled,
                     salvage_note=salvage_note,
+                    custody_audit=custody_audit,
                 )
                 will_retry = requeued
             except Exception:
