@@ -4,15 +4,14 @@
 // not — D-10 moved these rows out of the Models tab and renamed them).
 //
 // Shape rules are the owner's:
-//  * Each row first picks its SOURCE (decision 5A): «Direct model» — an inline
-//    route the row owns — or «Configured subagent», a reference to one
-//    OUROBOROS_SUBAGENTS roster row. A referenced row's route/model/effort/
-//    account are shown as READ-ONLY derived facts (the roster stays their
-//    SSOT); the stored forms are mutually exclusive:
-//    {slot_id, route, effort} XOR {slot_id, subagent_id, effort}.
-//  * The ROUTE select carries routes only: "API model" plus one entry per
+//  * ONE flat picker per row (decision 1=B replaced the earlier two-level
+//    source+route pair): the roster rows from Available subagents lead as
+//    references, then the inline channels — "API model" plus one entry per
 //    login-capable harness — never the full flat model catalog (hundreds of
-//    options made the list unusable, finding #6).
+//    options made the list unusable, finding #6). A referenced row's route/
+//    model/effort/account are shown as READ-ONLY derived facts (the roster
+//    stays their SSOT); the stored forms are mutually exclusive:
+//    {slot_id, route, effort} XOR {slot_id, subagent_id, effort}.
 //  * On the API route the model id is a FREE-TEXT input with a datalist of
 //    catalog suggestions — the same catalog-assisted entry the model cards
 //    use. On a harness route the MODEL is a dropdown fed by Claudexor
@@ -39,10 +38,9 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 export const ROUTE_KIND_API = 'api_chat';
 export const ROUTE_KIND_SESSION = routeEditor.ROUTE_KIND_AGENT_SESSION;
 
-// Per-row source choice (decision 5A): an inline route the row owns, or a
-// reference to a configured OUROBOROS_SUBAGENTS roster row.
-export const ROW_SOURCE_DIRECT = 'direct';
-export const ROW_SOURCE_SUBAGENT = 'subagent';
+// Select-value prefix marking a configured-subagent reference in the one
+// flat reviewer picker (decision 1=B); everything else is a route choice.
+export const SUBAGENT_CHOICE_PREFIX = 'subagent:';
 // The route select's single API entry. The target model id never lives in
 // the select — display always matches the stored target (finding #6c: a
 // fresh row used to DISPLAY the first catalog model while storing '').
@@ -166,8 +164,31 @@ export function buildReviewerSlotsSetting(state) {
 // section uses — never a second schema.
 // ---------------------------------------------------------------------------
 
-export function rowSource(row) {
-    return row?.subagent_id ? ROW_SOURCE_SUBAGENT : ROW_SOURCE_DIRECT;
+export function encodeReviewerChoice(row) {
+    return row?.subagent_id
+        ? SUBAGENT_CHOICE_PREFIX + String(row.subagent_id)
+        : encodeRouteChoice(row);
+}
+
+export function reviewerChoiceGroups({
+    roster = [], rosterKnown = true, row = {}, harnesses = [],
+    catalogKnown = true, apiLabel,
+} = {}) {
+    // Decision 1=B: ONE flat picker — the Available-subagents references lead
+    // (facts-first labels, decision 2=A), then the inline channels. A saved
+    // reference that fell out of the roster keeps its option (the same
+    // survive-the-save rule the roster select carried); an inline row passes
+    // its own choice down so an undiscovered harness stays displayable too.
+    const groups = [];
+    const savedId = String(row?.subagent_id || '');
+    const rosterOptions = subagentOptionsFor(roster, savedId, { rosterKnown })
+        .map((option) => ({ ...option, value: SUBAGENT_CHOICE_PREFIX + option.value }));
+    if (rosterOptions.length) {
+        groups.push({ label: 'Available subagents', options: rosterOptions });
+    }
+    const currentChoice = savedId ? '' : encodeRouteChoice(row);
+    groups.push(...routeChoiceGroups({ harnesses, currentChoice, catalogKnown, apiLabel }));
+    return groups;
 }
 
 export function subagentOptionLabel(row) {
@@ -186,10 +207,12 @@ export function subagentOptionLabel(row) {
     // characters that could visually reorder or break the facts stripped
     // (bidi controls, newlines).
     const use = String(row?.recommended_use || '')
-        .replace(/[\u202A-\u202E\u2066-\u2069]/g, '')
+        .replace(/[\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C]/g, '')
         .replace(/\s+/g, ' ')
         .trim();
-    const hint = use.length > 48 ? `${use.slice(0, 45)}…` : use;
+    // Code POINTS, not UTF-16 units: a slice must never split a surrogate pair.
+    const points = Array.from(use);
+    const hint = points.length > 48 ? `${points.slice(0, 45).join('')}…` : use;
     return parts.join(' · ') + (hint ? ` — ${hint}` : '');
 }
 
@@ -444,9 +467,9 @@ export function renderReviewerSlotsSection() {
             <h3>Review lanes</h3>
             <div class="settings-section-copy">
                 Who reviews each commit: the triad rows, the scope rows, and one optional advisory
-                pre-reviewer. Each row runs a direct model — an API model, or an agent on your
-                subscription — or references one of your configured subagents, plus its own
-                reasoning effort.
+                pre-reviewer. Each row picks its reviewer from one list — a configured subagent
+                from Available subagents above, an API model, or an agent on your subscription —
+                plus its own reasoning effort.
             </div>
             <div class="settings-inline-note">
                 Rows routed to a subscription never fall back to API spend: if every eligible window
@@ -515,32 +538,18 @@ export function reviewerRouteIdentityMarkup(route, harnesses = {}, {
     });
 }
 
-function sourceSelectHtml(attrs, row) {
-    // The top-level per-row source choice (decision 5A). «Configured
-    // subagent» is offered only when the roster has rows to reference — or
-    // when the SAVED row already references one, which must stay displayable
-    // either way.
-    return selectHtml(attrs, [{
-        label: '',
-        options: [
-            { value: ROW_SOURCE_DIRECT, label: 'Direct model' },
-            {
-                value: ROW_SOURCE_SUBAGENT,
-                label: 'Configured subagent',
-                disabled: !state.roster.length && !row.subagent_id,
-            },
-        ],
-    }], rowSource(row));
-}
-
-function subagentControlsHtml(row, dataPrefix) {
-    // The reference branch: roster select + effort. The derived route/model/
-    // account/effort are DISCLOSED in the meta line, never editable here.
-    const options = subagentOptionsFor(state.roster, row.subagent_id, { rosterKnown: state.rosterKnown });
-    return `
-        ${selectHtml(`${dataPrefix}-subagent aria-label="Configured subagent"`, [{ label: '', options }], String(row.subagent_id || ''))}
-        ${effortSelectHtml(`${dataPrefix}-effort aria-label="Reasoning effort"`, row.effort || '', 'subagent default')}
-    `;
+function reviewerPickerHtml(attrs, row, { apiLabel } = {}) {
+    // The one flat reviewer picker (decision 1=B): roster references first,
+    // then the inline channels.
+    const groups = reviewerChoiceGroups({
+        roster: state.roster,
+        rosterKnown: state.rosterKnown,
+        row,
+        harnesses: state.harnesses,
+        catalogKnown: state.catalogKnown,
+        apiLabel,
+    });
+    return selectHtml(attrs, groups, encodeReviewerChoice(row));
 }
 
 function subagentIdentityMarkup(row) {
@@ -565,16 +574,14 @@ function rowHtml(row, group) {
         <div class="reviewer-slot-row" data-slot-group="${group}" data-slot-id="${escapeHtml(row.slot_id)}">
             ${subagentIdentityMarkup(row)}
             <div class="reviewer-slot-controls">
-                ${sourceSelectHtml('data-slot-source aria-label="Reviewer source"', row)}
-                ${subagentControlsHtml(row, 'data-slot')}
+                ${reviewerPickerHtml('data-slot-route aria-label="Reviewer"', row)}
+                ${effortSelectHtml('data-slot-effort aria-label="Reasoning effort"', row.effort || '', 'subagent default')}
                 <button type="button" class="btn btn-default" data-slot-remove title="Remove this slot">Remove</button>
             </div>
             <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
         </div>
     `;
     }
-    const choice = encodeRouteChoice(row);
-    const groups = routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice, catalogKnown });
     const session = row.route.kind === ROUTE_KIND_SESSION;
     const split = session ? splitSessionTarget(row.route.target_id) : { harness: '', model: '' };
     const harness = session ? harnessesById()[split.harness] : null;
@@ -595,8 +602,7 @@ function rowHtml(row, group) {
         <div class="reviewer-slot-row" data-slot-group="${group}" data-slot-id="${escapeHtml(row.slot_id)}">
             ${reviewerRouteIdentityMarkup(row.route, harnessesById(), { catalogKnown })}
             <div class="reviewer-slot-controls">
-                ${sourceSelectHtml('data-slot-source aria-label="Reviewer source"', row)}
-                ${selectHtml(`data-slot-route aria-label="Reviewer route"`, groups, choice)}
+                ${reviewerPickerHtml('data-slot-route aria-label="Reviewer"', row)}
                 ${session ? '' : `<input data-slot-custom-api list="reviewer-api-model-catalog" placeholder="provider/model-id" value="${escapeHtml(row.route.target_id || '')}" spellcheck="false" aria-label="API model id">`}
                 ${session ? selectHtml('data-slot-model aria-label="Harness model"', [{ label: '', options: modelOptions }], split.model) : ''}
                 ${session && profileOptions.length > 1 ? selectHtml('data-slot-profile aria-label="Credential account"', [{ label: '', options: profileOptions }], row.route.profile_id || '') : ''}
@@ -621,8 +627,8 @@ function advisoryHtml() {
             ${subagentIdentityMarkup(advisory)}
             <div class="reviewer-slot-controls">
                 <label class="local-toggle"><input type="checkbox" data-advisory-enabled ${advisory.enabled !== false ? 'checked' : ''}> Enabled</label>
-                ${sourceSelectHtml('data-advisory-source aria-label="Advisory source"', advisory)}
-                ${subagentControlsHtml(advisory, 'data-advisory')}
+                ${reviewerPickerHtml('data-advisory-route aria-label="Advisory reviewer"', advisory)}
+                ${effortSelectHtml('data-advisory-effort aria-label="Advisory effort"', advisory.effort || '', 'subagent default')}
             </div>
             <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
         </div>
@@ -635,13 +641,6 @@ function advisoryHtml() {
     const session = advisory.route?.kind === ROUTE_KIND_SESSION;
     const split = session ? splitSessionTarget(advisory.route.target_id)
         : { harness: '', model: '' };
-    const choice = session ? `session:${split.harness}` : API_ROUTE_CHOICE;
-    const groups = routeChoiceGroups({
-        harnesses: state.harnesses,
-        currentChoice: choice,
-        catalogKnown,
-        apiLabel: 'Direct model (inspection episode)',
-    });
     // Session branch: the SAME model-options fragment the triad rows use —
     // rewriting it here would lose the "(not in discovery)" guard and let a
     // Save with the daemon down erase the owner's model. Api branch: the same
@@ -661,8 +660,7 @@ function advisoryHtml() {
             ${reviewerRouteIdentityMarkup(advisory.route, harnessesById(), { catalogKnown })}
             <div class="reviewer-slot-controls">
                 <label class="local-toggle"><input type="checkbox" data-advisory-enabled ${advisory.enabled !== false ? 'checked' : ''}> Enabled</label>
-                ${sourceSelectHtml('data-advisory-source aria-label="Advisory source"', advisory)}
-                ${selectHtml('data-advisory-route aria-label="Advisory route"', groups, choice)}
+                ${reviewerPickerHtml('data-advisory-route aria-label="Advisory reviewer"', advisory, { apiLabel: 'API model (inspection episode)' })}
                 ${session
                     ? selectHtml('data-advisory-model aria-label="Advisory harness model"', [{ label: '', options: modelOptions }], split.model)
                     : `<input data-advisory-api-model list="reviewer-api-model-catalog" placeholder="provider/model-id — empty = default" value="${escapeHtml(advisory.route?.target_id || '')}" spellcheck="false" aria-label="Advisory model id">`}
@@ -738,27 +736,19 @@ function bindRowEvents() {
         const group = rowEl.dataset.slotGroup;
         const row = findRow(group, rowEl.dataset.slotId);
         if (!row) return;
-        rowEl.querySelector('[data-slot-source]')?.addEventListener('change', (event) => {
-            if (event.target.value === ROW_SOURCE_SUBAGENT) {
-                // The select must display what the row stores (finding #6c),
-                // so the first roster row becomes the visible draft pick. The
-                // inline route is kept as a stash — flipping back restores it.
-                row.subagent_id = row.subagent_id
-                    || String(state.roster[0]?.subagent_id || '');
-            } else {
-                row.subagent_id = '';
-                if (!row.route?.kind) row.route = { kind: ROUTE_KIND_API, target_id: '' };
-            }
-            renderRows();
-            state.onChange();
-        });
-        rowEl.querySelector('[data-slot-subagent]')?.addEventListener('change', (event) => {
-            row.subagent_id = String(event.target.value || '');
-            renderRows();
-            state.onChange();
-        });
         rowEl.querySelector('[data-slot-route]')?.addEventListener('change', (event) => {
-            const decoded = decodeRouteChoice(event.target.value);
+            const value = String(event.target.value || '');
+            if (value.startsWith(SUBAGENT_CHOICE_PREFIX)) {
+                // A reference pick. The inline route stays stashed on the row
+                // object — picking a channel again restores it.
+                row.subagent_id = value.slice(SUBAGENT_CHOICE_PREFIX.length);
+                renderRows();
+                state.onChange();
+                return;
+            }
+            row.subagent_id = '';
+            if (!row.route?.kind) row.route = { kind: ROUTE_KIND_API, target_id: '' };
+            const decoded = decodeRouteChoice(value);
             if (decoded.kind === ROUTE_KIND_SESSION) {
                 const prevHarness = row.route.kind === ROUTE_KIND_SESSION
                     ? splitSessionTarget(row.route.target_id).harness : '';
@@ -804,35 +794,28 @@ function bindRowEvents() {
             state.advisory.enabled = Boolean(event.target.checked);
             state.onChange();
         });
-        advisoryEl.querySelector('[data-advisory-source]')?.addEventListener('change', (event) => {
-            if (event.target.value === ROW_SOURCE_SUBAGENT) {
-                state.advisory.subagent_id = state.advisory.subagent_id
-                    || String(state.roster[0]?.subagent_id || '');
+        advisoryEl.querySelector('[data-advisory-route]')?.addEventListener('change', (event) => {
+            const value = String(event.target.value || '');
+            if (value.startsWith(SUBAGENT_CHOICE_PREFIX)) {
+                state.advisory.subagent_id = value.slice(SUBAGENT_CHOICE_PREFIX.length);
                 // '' effort = the roster row's own effort decides; the api
                 // default 'low' must not silently override the reference.
                 state.advisory.effort = '';
-            } else {
-                state.advisory.subagent_id = '';
-                if (!state.advisory.route?.kind) {
-                    state.advisory.route = { kind: ROUTE_KIND_API, target_id: '' };
-                }
-                if (state.advisory.route.kind !== ROUTE_KIND_SESSION && !state.advisory.effort) {
-                    state.advisory.effort = 'low';
-                }
+                renderRows();
+                state.onChange();
+                return;
             }
-            renderRows();
-            state.onChange();
-        });
-        advisoryEl.querySelector('[data-advisory-subagent]')?.addEventListener('change', (event) => {
-            state.advisory.subagent_id = String(event.target.value || '');
-            renderRows();
-            state.onChange();
-        });
-        advisoryEl.querySelector('[data-advisory-route]')?.addEventListener('change', (event) => {
+            state.advisory.subagent_id = '';
+            if (!state.advisory.route?.kind) {
+                state.advisory.route = { kind: ROUTE_KIND_API, target_id: '' };
+            }
             const result = advisoryRouteTransition(
-                state.advisory.route, decodeRouteChoice(event.target.value), advisoryRouteMemory);
+                state.advisory.route, decodeRouteChoice(value), advisoryRouteMemory);
             state.advisory.route = result.route;
             Object.assign(advisoryRouteMemory, result.memory);
+            if (state.advisory.route.kind !== ROUTE_KIND_SESSION && !state.advisory.effort) {
+                state.advisory.effort = 'low';
+            }
             renderRows();
             state.onChange();
         });
