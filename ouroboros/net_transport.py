@@ -161,7 +161,8 @@ def make_no_proxy_async_client(target: Dict[str, Any], timeout: Any) -> Tuple[An
 
 
 def web_search_openai_client(
-    *, api_key: str, base_url: Optional[str], timeout: Optional[float] = None
+    *, api_key: str, base_url: Optional[str], timeout: Optional[float] = None,
+    default_headers: Optional[Dict[str, str]] = None,
 ):
     """Web-search OpenAI client (Q16 coverage) on the keepalive transport."""
     from openai import OpenAI
@@ -171,6 +172,8 @@ def web_search_openai_client(
         kwargs["base_url"] = base_url
     if timeout is not None:
         kwargs["timeout"] = float(timeout)
+    if default_headers:
+        kwargs["default_headers"] = dict(default_headers)
     http_client = keepalive_http_client()
     if http_client is not None:
         kwargs["http_client"] = http_client

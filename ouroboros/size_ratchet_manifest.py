@@ -157,7 +157,6 @@ BAND_PATHS = {
     "ouroboros/task_status.py": None,
     "ouroboros/tools/browser.py": None,
     "ouroboros/tools/plan_review_runtime.py": "Entered the band from 986 lines: timeout custody synthesis joined the existing plan-review runtime owner while preserving profile-continuity disclosures and typed health facts during target integration.",
-    "ouroboros/tools/shell_guards.py": None,
     "ouroboros/tools/skill_exec.py": None,
     "ouroboros/tools/skill_publish.py": "Entered the band from 952 lines: publish now writes the OuroborosHub publication receipt at pr_opened through the shared locked-update seam and maps the receipt from the validated serialized form (hubflow sprint, receipt-as-only-stored-fact design).",
     "ouroboros/utils.py": None,
@@ -223,7 +222,7 @@ BYTE_BASELINE_DEBT = {
 
 BYTE_DEBT = {
     "ouroboros/loop.py": 312794,
-    "tests/test_delegated_subagent_transport.py": 320568,
+    "tests/test_delegated_subagent_transport.py": 320408,
     "tests/test_devtools_benchmarks.py": 328116,
     "web/modules/chat.js": 224315,
 }

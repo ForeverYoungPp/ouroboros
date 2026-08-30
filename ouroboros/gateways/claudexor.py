@@ -423,20 +423,24 @@ class ClaudexorGateway:
         rows = body.get("harnesses") if isinstance(body, dict) else None
         return [row for row in (rows or []) if isinstance(row, dict)]
 
-    def quota_snapshots(self) -> List[Dict[str, Any]]:
+    def quota_state(self) -> Dict[str, Any]:
+        """GET /v2/quota once, retaining its one-epoch evidence envelope."""
         body = self._request("GET", "/v2/quota")
+        return body if isinstance(body, dict) else {}
+
+    def quota_snapshots(self) -> List[Dict[str, Any]]:
+        body = self.quota_state()
         snapshots = body.get("snapshots") if isinstance(body, dict) else None
         return [row for row in (snapshots or []) if isinstance(row, dict)]
 
     def quota_absences(self) -> List[Dict[str, Any]]:
         """Profiles whose quota could NOT be read (a 429/failed refresh, no login).
 
-        A separate reader on purpose: exhaustion needs POSITIVE evidence, and an
-        absence is the typed record that evidence is missing for a profile — the
-        route-health predicate treats any absence on a route as "unknown, so
-        usable" rather than letting the readable minority speak for the whole route.
+        Legacy compatibility projection of the same one-epoch quota envelope.
+        An absence is typed evidence that quota could not be read for a profile;
+        route health treats that state as unknown and therefore fail-open.
         """
-        body = self._request("GET", "/v2/quota")
+        body = self.quota_state()
         absences = body.get("absences") if isinstance(body, dict) else None
         return [row for row in (absences or []) if isinstance(row, dict)]
 

@@ -3680,7 +3680,7 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
                 assert "cancelled" in (gone_phase.get_attribute("class") or "")
                 # Dropdown wiring (S3 Q2): open, then dismiss = keep running.
                 cancel_btn.click()
-                menu = live.locator('.task-control-menu')
+                menu = page.locator('body > .task-control-menu')
                 menu.wait_for(state="visible", timeout=10_000)
                 assert "Wrap up" in menu.inner_text()
                 page.keyboard.press("Escape")

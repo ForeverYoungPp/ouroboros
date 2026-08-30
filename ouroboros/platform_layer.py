@@ -1014,6 +1014,13 @@ def node_distribution_platform() -> str:
 
 def probe_node_version(node_path: str) -> str:
     """Return a normalized bundled-Node version, or ``""`` on probe failure."""
+    # A metadata probe must not inherit runtime/test hooks. In particular,
+    # NODE_OPTIONS can contain test filters or preload modules that either make
+    # `node --version` fail before the hermetic lane gets a chance to scrub the
+    # variable or execute arbitrary operator code during a supposedly inert
+    # version check.
+    probe_env = dict(os.environ)
+    probe_env.pop("NODE_OPTIONS", None)
     try:
         result = _hidden_run(
             [str(node_path), "--version"],
@@ -1022,6 +1029,7 @@ def probe_node_version(node_path: str) -> str:
             encoding="utf-8",
             timeout=10,
             check=False,
+            env=probe_env,
         )
     except (OSError, subprocess.SubprocessError):
         return ""

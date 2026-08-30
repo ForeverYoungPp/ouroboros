@@ -803,13 +803,24 @@ def test_strict_poll_splits_http_phase_budget_and_recomputes_retry():
         def get_run(self, _run_id, *, timeout_sec=None):
             self.timeouts.append(timeout_sec)
             if len(self.timeouts) == 1:
+                # Guarantees monotonic advances between the two poll_bound
+                # computations, so the retry ask is measurably below the first.
                 time.sleep(0.01)
                 raise AtomicRace("/.git/objects/ab/tmp_obj_123")
             return {"summary": {"state": "succeeded"}}
 
     gateway = Gateway()
-    bounded_poll(gateway, "run-1", 0.08, strict=True)
-    assert 0 < gateway.timeouts[0] <= 0.08
+    # A coarse budget below the 60s read default: the contract under test is
+    # the SPLIT (first ask bounded by the whole budget, retry ask recomputed
+    # from the remainder), not stopwatch accuracy.  The previous 0.08s budget
+    # required the first phase (thread spawn + 0.01s sleep + raise) to finish
+    # with window remaining inside 80ms of wall clock; on a loaded CI host the
+    # budget was already spent by the catch, so the injected AtomicRace
+    # escaped instead of earning its one re-read (same margin redesign as
+    # test_strict_poll_phase_budget_is_bounded_in_wall_time).
+    detail = bounded_poll(gateway, "run-1", 30.0, strict=True)
+    assert detail == {"summary": {"state": "succeeded"}}
+    assert 0 < gateway.timeouts[0] <= 30.0
     assert 0 < gateway.timeouts[1] < gateway.timeouts[0]
 
 

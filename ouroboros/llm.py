@@ -14,7 +14,6 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ouroboros.provider_models import OPENROUTER_DEFAULTS, PROVIDER_PREFIXES, normalize_anthropic_model_id, normalize_model_identity, resolve_minimax_base_url
 from ouroboros.anthropic_native_custody import (
     anthropic_replay_scoped,
     custody_private_key,
@@ -24,6 +23,8 @@ from ouroboros.anthropic_native_custody import (
     retain_native_assistant_content,
     scrub_native_custody,
 )
+from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
+from ouroboros.provider_models import OPENROUTER_DEFAULTS, PROVIDER_PREFIXES, normalize_anthropic_model_id, normalize_model_identity, resolve_minimax_base_url
 from ouroboros.request_wire_recovery import (
     finalize_wire_response,
     note_provider_metadata_drop_fields,
@@ -1435,10 +1436,7 @@ class LLMClient:
             "usage_model": usage_model,
             "api_key": current_api_key,
             "base_url": "https://openrouter.ai/api/v1" if explicit_settings else self._base_url,
-            "default_headers": {
-                "HTTP-Referer": "https://ouroboros.local/",
-                "X-Title": "Ouroboros",
-            },
+            "default_headers": dict(OPENROUTER_APP_HEADERS),
             "supports_openrouter_extensions": True,
             "supports_generation_cost": True,
         }
@@ -4347,6 +4345,7 @@ def openrouter_web_search_server_tool(
         api_key=api_key,
         base_url="https://openrouter.ai/api/v1",
         timeout=timeout,
+        default_headers=dict(OPENROUTER_APP_HEADERS),
     )
     payload = dict(
         model=model,

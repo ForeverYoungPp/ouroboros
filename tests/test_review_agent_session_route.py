@@ -1915,7 +1915,11 @@ def test_late_worker_uses_its_captured_stamp_after_caller_restores_context(
 
     def delayed_find(self, root):
         entered.set()
-        assert release.wait(2)
+        # 10s, not 2s: this gate opens only after the caller's run_review_request
+        # returns, and on a loaded CI runner that return itself exceeded 2s — the
+        # worker then died here, never stamped, and leaked a live _ACTIVE entry
+        # into the next (equal-key) test.  Drain/gate bounds are coarse on purpose.
+        assert release.wait(10)
         return original(self, root)
 
     def observed_close(self):
@@ -1932,8 +1936,13 @@ def test_late_worker_uses_its_captured_stamp_after_caller_restores_context(
     assert entered.is_set() and result.actors[0]["status"] == "error"
     ctx._review_paid_stamp = None  # mirrors review_skill's finally restoration
     release.set()
-    assert stamped.wait(2), "the late physical start must retain its original wave stamp"
-    assert finished.wait(2), "the delayed worker must not leak into the next test"
+    # 10s bounds (were 2s): these are drain waits on the released worker, not
+    # discrimination margins — on a loaded CI runner the 2s bound tripped while
+    # the worker was healthily mid-flight, and the still-live worker then
+    # poisoned the next equal-key test (its run joined this _ACTIVE entry and
+    # posted zero starts of its own).
+    assert stamped.wait(10), "the late physical start must retain its original wave stamp"
+    assert finished.wait(10), "the delayed worker must not leak into the next test"
     # Gateway close precedes the substrate's final actor publication by a few
     # instructions. Wait for process-local custody too, otherwise the following
     # equal-content test can legitimately join this late actor.
@@ -1942,7 +1951,7 @@ def test_late_worker_uses_its_captured_stamp_after_caller_restores_context(
     from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
 
     key = _attempt_key(_agent_request(), _agent_slot(timeout_sec=0.02))
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         with _ACTIVE_LOCK:
             if key not in _ACTIVE:

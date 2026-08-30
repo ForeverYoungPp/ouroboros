@@ -1660,13 +1660,28 @@ def test_p3_scope_actor_retries_empty_same_slot_model_once_then_blocks(tmp_path,
 
 
 def test_review_substrate_persists_timeout_actor_refs(tmp_path):
-    hanging_llm = SimpleNamespace(chat=lambda **_kwargs: (
-        time.sleep(0.2),
-        ({"content": "{\"verdict\":\"PASS\",\"findings\":[],\"summary\":\"late\"}"}, {}),
-    )[1])
+    import threading
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
+
+    release = threading.Event()
+
+    def gated_chat(**_kwargs):
+        # Holds the call open until the test releases it, so the 0.01s window
+        # is GUARANTEED to expire and the timeout actor is the one persisted.
+        # The previous 0.2s-sleep-vs-0.01s-window margin was NOT discriminating
+        # on a loaded CI host (the heal wave measured a 0.207s poll oversleep):
+        # a pre-window settle replaced the asserted timeout actor with PASS
+        # (same event gate as
+        # test_replayed_late_review_does_not_charge_same_context_twice).
+        assert release.wait(10), "test never released the gated review call"
+        return {"content": "{\"verdict\":\"PASS\",\"findings\":[],\"summary\":\"late\"}"}, {}
+
+    hanging_llm = SimpleNamespace(chat=gated_chat)
+    request = ReviewRequest(surface="scope", goal="review diff", task_id="task-timeout")
+    slot = ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.01)
     result = run_review_request(
-        ReviewRequest(surface="scope", goal="review diff", task_id="task-timeout"),
-        slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.01)],
+        request,
+        slots=[slot],
         drive_root=tmp_path,
         llm=hanging_llm,
     )
@@ -1676,6 +1691,19 @@ def test_review_substrate_persists_timeout_actor_refs(tmp_path):
     assert "Timeout after" in actor["error"]
     assert actor["prompt_ref"]["manifest_ref"]["path"]
     assert actor["response_ref"]["manifest_ref"]["path"]
+    release.set()
+    # Drain the released worker before teardown (same drain as
+    # test_explicit_retry_key_joins_worker_after_prompt_history_changes).
+    key = _attempt_key(request, slot)
+    deadline = time.monotonic() + 5.0
+    active = True
+    while time.monotonic() < deadline:
+        with _ACTIVE_LOCK:
+            active = key in _ACTIVE
+        if not active:
+            break
+        time.sleep(0.01)
+    assert not active
 
 
 def test_spent_owner_deadline_does_not_dispatch_a_review_worker(tmp_path):
@@ -1903,12 +1931,22 @@ def test_explicit_retry_key_replays_normally_settled_actor_without_second_dispat
 
 
 def test_late_plan_api_error_replays_same_terminal_attempt(tmp_path):
-    calls = []
+    import threading
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
 
-    class SlowAPIError:
+    calls = []
+    release = threading.Event()
+
+    class GatedAPIError:
+        """Holds the paid call open until the test releases it, so the poll
+        window is GUARANTEED to expire while the call is still in flight.  The
+        previous 0.05s-sleep-vs-0.01s-window race flaked the in_flight
+        assertion on slow CI hosts (same event gate as
+        test_replayed_late_review_does_not_charge_same_context_twice)."""
+
         def chat(self, **kwargs):
             calls.append(kwargs)
-            time.sleep(0.05)
+            assert release.wait(10), "test never released the gated review call"
             raise RuntimeError("provider ended the paid request")
 
     ctx = SimpleNamespace(task_id="late-plan-error", event_queue=None, pending_events=[])
@@ -1921,22 +1959,29 @@ def test_late_plan_api_error_replays_same_terminal_attempt(tmp_path):
         transport_timeout_sec=10,
     )
     first = run_review_request(
-        request, slots=[slot], drive_root=tmp_path, llm=SlowAPIError(), usage_ctx=ctx,
+        request, slots=[slot], drive_root=tmp_path, llm=GatedAPIError(), usage_ctx=ctx,
     )
     assert first.actors[0]["operation_state"] == "in_flight"
     operation_id = first.actors[0]["operation_id"]
-
-    deadline = time.monotonic() + 1.0
+    release.set()
+    # The settled-attempt cache is written in the same critical section that
+    # retires the active attempt, so draining BOTH facts under _ACTIVE_LOCK is
+    # the event that makes the replay below deterministic (same wait as
+    # test_replayed_late_review_does_not_charge_same_context_twice).
+    key = _attempt_key(request, slot)
+    deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
-        settled = getattr(ctx, "_review_settled_attempts", {})
-        if settled:
+        with _ACTIVE_LOCK:
+            settled = key in getattr(ctx, "_review_settled_attempts", {})
+            active = key in _ACTIVE
+        if settled and not active:
             break
         time.sleep(0.01)
     else:
         raise AssertionError("late plan API error was not retained for reconciliation")
 
     second = run_review_request(
-        request, slots=[slot], drive_root=tmp_path, llm=SlowAPIError(), usage_ctx=ctx,
+        request, slots=[slot], drive_root=tmp_path, llm=GatedAPIError(), usage_ctx=ctx,
     )
     assert len(calls) == 1
     assert second.actors[0]["status"] == "error"
@@ -1946,39 +1991,75 @@ def test_late_plan_api_error_replays_same_terminal_attempt(tmp_path):
 
 
 def test_review_paid_stamp_is_write_ahead_of_a_slow_worker(tmp_path):
+    import threading
     from types import SimpleNamespace
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
 
     order = []
+    release = threading.Event()
 
-    class SlowLLM:
+    class GatedLLM:
+        """Holds the transport call open until the test releases it, so the
+        poll window is GUARANTEED to expire while the worker is in flight.
+        The previous 0.08s-sleep-vs-0.02s-window race flaked the in_flight
+        assertion on slow CI hosts (same event gate as
+        test_replayed_late_review_does_not_charge_same_context_twice)."""
+
         def chat(self, **_kwargs):
             order.append("transport")
-            time.sleep(0.08)
+            assert release.wait(10), "test never released the gated review call"
             return {"content": '{"verdict":"PASS","findings":[],"summary":"ok"}'}, {}
 
     ctx = SimpleNamespace(
         task_id="paid-before-worker", event_queue=None, pending_events=[],
         _review_paid_stamp=lambda: order.append("paid"),
     )
+    request = ReviewRequest(surface="scope", goal="review", task_id="paid-before-worker")
+    slot = ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.02)
     result = run_review_request(
-        ReviewRequest(surface="scope", goal="review", task_id="paid-before-worker"),
-        slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.02)],
-        drive_root=tmp_path, llm=SlowLLM(), usage_ctx=ctx,
+        request, slots=[slot], drive_root=tmp_path, llm=GatedLLM(), usage_ctx=ctx,
     )
     assert result.actors[0]["operation_state"] == "in_flight"
+    release.set()
+    # Drain the released worker before judging the order: the caller can
+    # return in_flight before the worker thread has entered chat at all, so
+    # order[1] raced an IndexError; the drain proves the transport entry
+    # exists.  ``order`` is append-only, so the paid-before-transport contract
+    # is judged unchanged (same drain as
+    # test_explicit_retry_key_joins_worker_after_prompt_history_changes).
+    key = _attempt_key(request, slot)
+    deadline = time.monotonic() + 5.0
+    active = True
+    while time.monotonic() < deadline:
+        with _ACTIVE_LOCK:
+            active = key in _ACTIVE
+        if not active:
+            break
+        time.sleep(0.01)
+    assert not active
     assert order[0] == "paid"
     assert order[1] == "transport"
 
 
 def test_replayed_late_review_does_not_charge_same_context_twice(tmp_path):
+    import threading
     from types import SimpleNamespace
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
 
     calls = []
+    release = threading.Event()
 
-    class SlowLLM:
+    class GatedLLM:
+        """Holds the paid call open until the test releases it, so the first
+        poll window is GUARANTEED to expire while the call is still in flight.
+        The previous 0.06s-sleep-vs-0.02s-window race flaked on slow CI hosts:
+        an oversleeping poll wait could observe the settled result and return
+        'settled' instead of 'in_flight' (same event gate as
+        test_late_review_result_is_replayed_without_a_second_paid_dispatch)."""
+
         def chat(self, **_kwargs):
             calls.append(1)
-            time.sleep(0.06)
+            assert release.wait(10), "test never released the gated review call"
             return {"content": '{"verdict":"PASS","findings":[],"summary":"late"}'}, {}
 
     ctx = SimpleNamespace(
@@ -1989,15 +2070,17 @@ def test_replayed_late_review_does_not_charge_same_context_twice(tmp_path):
     first = run_review_request(
         request,
         slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.02)],
-        drive_root=tmp_path, llm=SlowLLM(), usage_ctx=ctx,
+        drive_root=tmp_path, llm=GatedLLM(), usage_ctx=ctx,
     )
     assert first.actors[0]["operation_state"] == "in_flight"
-    # The late result is cached only after the worker has actually settled.  Do
-    # not race the worker's provider return with the replay assertion.
-    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
-
+    release.set()
+    # The late result is cached only after the worker has actually settled.  The
+    # settled-attempt cache is written in the same critical section that retires
+    # the active attempt, so this drain is the event that makes the replay below
+    # deterministic (same wait as
+    # test_review_worker_does_not_retry_after_its_logical_deadline).
     key = _attempt_key(request, ReviewSlot(slot_id="slot_a", model="same/model"))
-    deadline = time.monotonic() + 1.0
+    deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         with _ACTIVE_LOCK:
             settled = key in getattr(ctx, "_review_settled_attempts", {})
@@ -2010,7 +2093,7 @@ def test_replayed_late_review_does_not_charge_same_context_twice(tmp_path):
     second = run_review_request(
         request,
         slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.01)],
-        drive_root=tmp_path, llm=SlowLLM(), usage_ctx=ctx,
+        drive_root=tmp_path, llm=GatedLLM(), usage_ctx=ctx,
     )
     assert calls.count("paid") == 1
     assert sum(1 for item in calls if item == 1) == 1
@@ -2109,33 +2192,54 @@ def test_direct_anthropic_route_keeps_provider_default_transport(tmp_path):
 
 
 def test_late_error_is_not_cached_as_a_permanent_review_verdict(tmp_path):
+    import threading
     from types import SimpleNamespace
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
 
     calls = []
+    release = threading.Event()
 
     class ErrorThenSuccess:
         def chat(self, **_kwargs):
             calls.append(1)
-            time.sleep(0.03)
             if len(calls) == 1:
+                # Gated: the first poll window (0.005s) is GUARANTEED to
+                # expire while the call is still in flight.  The previous
+                # 0.03s-sleep-vs-0.005s-window race flaked the in_flight
+                # assertion on slow CI hosts (same event gate as
+                # test_late_agent_session_preflight_failure_can_retry).
+                assert release.wait(10), "test never released the gated review call"
                 raise RuntimeError("transient provider failure")
             return {"content": '{"verdict":"PASS","findings":[],"summary":"ok"}'}, {}
 
     ctx = SimpleNamespace(task_id="late-error", event_queue=None, pending_events=[])
     request = ReviewRequest(surface="plan_review", goal="review", task_id="late-error")
+    slot = ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.005)
     first = run_review_request(
         request,
-        slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.005)],
+        slots=[slot],
         drive_root=tmp_path,
         llm=ErrorThenSuccess(),
         usage_ctx=ctx,
     )
     assert first.actors[0]["operation_state"] == "in_flight"
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline and len(calls) < 1:
-        time.sleep(0.01)
+    release.set()
     # The first physical operation must settle before the retry is admitted.
-    time.sleep(0.05)
+    # A transient error is NOT retained for replay, so the deterministic
+    # signal that the retry may dispatch is the attempt leaving _ACTIVE.  The
+    # previous fixed 0.05s sleep raced the settle on slow CI hosts: the second
+    # run then JOINED the still-active attempt instead of retrying (same drain
+    # as test_late_agent_session_preflight_failure_can_retry).
+    key = _attempt_key(request, slot)
+    deadline = time.monotonic() + 5.0
+    active = True
+    while time.monotonic() < deadline:
+        with _ACTIVE_LOCK:
+            active = key in _ACTIVE
+        if not active:
+            break
+        time.sleep(0.01)
+    assert not active
     second = run_review_request(
         request,
         slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.5)],
@@ -2148,17 +2252,26 @@ def test_late_error_is_not_cached_as_a_permanent_review_verdict(tmp_path):
 
 
 def test_late_agent_session_failure_is_replayed_without_a_second_run(tmp_path, monkeypatch):
+    import threading
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
     from ouroboros.review_execution import ReviewRouteKind
     from ouroboros.review_substrate import ReviewCoordinator
 
     calls = []
+    release = threading.Event()
 
-    def slow_terminal_failure(
+    def gated_terminal_failure(
         self, request, slot, *, operation_id="", retry_state=None,
         logical_deadline_monotonic=None,
     ):
+        # Blocks until the test releases it, so the first poll window is
+        # GUARANTEED to expire while the delegated run is still in flight.
+        # The previous fixed 0.03s sleep raced the 0.005s poll window on slow
+        # CI hosts: an oversleeping poll wait could observe the settled result
+        # and surface 'settled' at the in_flight assertion below (same event
+        # gate as test_replayed_late_review_does_not_charge_same_context_twice).
         calls.append(operation_id)
-        time.sleep(0.03)
+        assert release.wait(10), "test never released the gated session run"
         actor = self._error_actor(
             request, slot, "delegated run settled failed",
             operation_id=operation_id,
@@ -2166,7 +2279,7 @@ def test_late_agent_session_failure_is_replayed_without_a_second_run(tmp_path, m
         actor.usage = {"delegated_run_started": True, "delegated_run_id": "run-1"}
         return actor
 
-    monkeypatch.setattr(ReviewCoordinator, "_run_slot", slow_terminal_failure)
+    monkeypatch.setattr(ReviewCoordinator, "_run_slot", gated_terminal_failure)
     ctx = SimpleNamespace(task_id="late-session-error", event_queue=None, pending_events=[])
     request = ReviewRequest(
         surface="plan_review", goal="review", task_id="late-session-error",
@@ -2180,9 +2293,22 @@ def test_late_agent_session_failure_is_replayed_without_a_second_run(tmp_path, m
         request, slots=[slot], drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
     )
     assert first.actors[0]["operation_state"] == "in_flight"
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline and not getattr(ctx, "_review_settled_attempts", {}):
+    release.set()
+    # The settled-attempt cache is written in the same critical section that
+    # retires the active attempt, so draining BOTH facts under _ACTIVE_LOCK is
+    # the event that makes the replay below deterministic (same wait as
+    # test_replayed_late_review_does_not_charge_same_context_twice).
+    key = _attempt_key(request, slot)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        with _ACTIVE_LOCK:
+            settled = key in getattr(ctx, "_review_settled_attempts", {})
+            active = key in _ACTIVE
+        if settled and not active:
+            break
         time.sleep(0.01)
+    else:
+        raise AssertionError("late session failure did not settle into custody")
     second = run_review_request(
         request, slots=[slot], drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
     )
@@ -2192,18 +2318,27 @@ def test_late_agent_session_failure_is_replayed_without_a_second_run(tmp_path, m
 
 
 def test_late_agent_session_preflight_failure_can_retry(tmp_path, monkeypatch):
+    import threading
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
     from ouroboros.review_execution import ReviewRouteKind
     from ouroboros.review_substrate import ReviewCoordinator
 
     calls = []
+    release = threading.Event()
 
     def preflight_then_success(
         self, request, slot, *, operation_id="", retry_state=None,
         logical_deadline_monotonic=None,
     ):
         calls.append(operation_id)
-        time.sleep(0.02)
         if len(calls) == 1:
+            # Gated: the first poll window (0.005s) is GUARANTEED to expire
+            # while the preflight attempt is still in flight.  The previous
+            # fixed 0.02s sleep raced that window on slow CI hosts and could
+            # surface 'settled' at the in_flight assertion below (same event
+            # gate as
+            # test_explicit_retry_key_joins_worker_after_prompt_history_changes).
+            assert release.wait(10), "test never released the gated preflight"
             return self._error_actor(
                 request, slot, "route unavailable before dispatch",
                 operation_id=operation_id,
@@ -2226,7 +2361,24 @@ def test_late_agent_session_preflight_failure_can_retry(tmp_path, monkeypatch):
         request, slots=[slot], drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
     )
     assert first.actors[0]["operation_state"] == "in_flight"
-    time.sleep(0.04)
+    release.set()
+    # A plain preflight error is retryable, so it leaves NOTHING in the settled
+    # cache; the deterministic signal that the retry may dispatch is the
+    # attempt leaving _ACTIVE (retired under _ACTIVE_LOCK in
+    # _settle_review_attempt).  The previous fixed 0.04s sleep raced that
+    # settle on slow CI hosts: the second run then JOINED the still-active
+    # attempt instead of dispatching the retry (same drain as
+    # test_late_unknown_session_start_restores_exact_pending_invocation).
+    key = _attempt_key(request, slot)
+    deadline = time.monotonic() + 5.0
+    active = True
+    while time.monotonic() < deadline:
+        with _ACTIVE_LOCK:
+            active = key in _ACTIVE
+        if not active:
+            break
+        time.sleep(0.01)
+    assert not active
     second = run_review_request(
         request, slots=[ReviewSlot(
             slot_id="slot_a", model="same/model", timeout_sec=0.5,
@@ -2238,6 +2390,7 @@ def test_late_agent_session_preflight_failure_can_retry(tmp_path, monkeypatch):
 
 
 def test_late_unknown_session_start_restores_exact_pending_invocation(tmp_path, monkeypatch):
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
     from ouroboros.review_execution import ReviewRouteKind
     from ouroboros.review_substrate import ReviewCoordinator
 
@@ -2275,7 +2428,23 @@ def test_late_unknown_session_start_restores_exact_pending_invocation(tmp_path, 
         request, slots=[first_slot], drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
     )
     assert first.actors[0]["operation_state"] == "in_flight"
-    time.sleep(0.04)
+    # The pending-invocation row is persisted inside the same _ACTIVE_LOCK
+    # critical section that retires the active attempt, so draining the key out
+    # of _ACTIVE is the deterministic signal that the restored invocation is
+    # durably recorded.  The previous fixed 0.04s sleep raced the worker's
+    # settle on slow CI hosts: the second run then JOINED the still-active
+    # attempt instead of dispatching the restored pending retry (same drain as
+    # test_review_worker_does_not_retry_after_its_logical_deadline).
+    key = _attempt_key(request, first_slot)
+    deadline = time.monotonic() + 5.0
+    active = True
+    while time.monotonic() < deadline:
+        with _ACTIVE_LOCK:
+            active = key in _ACTIVE
+        if not active:
+            break
+        time.sleep(0.01)
+    assert not active
     second = run_review_request(
         request, slots=[ReviewSlot(
             slot_id="slot_a", model="same/model", timeout_sec=0.5,
@@ -2288,23 +2457,52 @@ def test_late_unknown_session_start_restores_exact_pending_invocation(tmp_path, 
 
 
 def test_review_slots_keep_independent_logical_windows(tmp_path):
-    class SlowLLM:
+    import threading
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
+
+    short_release = threading.Event()
+
+    class GatedShortLLM:
+        """The short slot's call stays open until the test releases it, so its
+        0.05s window is GUARANTEED to expire (in_flight) while the long slot
+        answers inside its own independent window.  The previous 0.25s-sleep-
+        vs-0.05s-window margin was NOT discriminating on a loaded CI host: the
+        heal wave measured a 0.207s poll oversleep there, which eats the whole
+        0.2s absolute margin (same event gate as
+        test_replayed_late_review_does_not_charge_same_context_twice)."""
+
         def chat(self, **kwargs):
-            time.sleep(0.25 if kwargs.get("model") == "short/model" else 0.1)
+            if kwargs.get("model") == "short/model":
+                assert short_release.wait(10), "test never released the short slot"
             return {"content": '{"verdict":"PASS","findings":[],"summary":"ok"}'}, {}
 
+    request = ReviewRequest(surface="scope", goal="review", task_id="independent-windows")
+    short_slot = ReviewSlot(slot_id="short", model="short/model", timeout_sec=0.05)
     result = run_review_request(
-        ReviewRequest(surface="scope", goal="review", task_id="independent-windows"),
+        request,
         slots=[
-            ReviewSlot(slot_id="short", model="short/model", timeout_sec=0.05),
+            short_slot,
             ReviewSlot(slot_id="long", model="long/model", timeout_sec=0.5),
         ],
         drive_root=tmp_path,
-        llm=SlowLLM(),
+        llm=GatedShortLLM(),
     )
     rows = {actor["slot_id"]: actor for actor in result.actors}
     assert rows["short"]["operation_state"] == "in_flight"
     assert rows["long"]["status"] == "ok"
+    short_release.set()
+    # Drain the released short worker before teardown (same drain as
+    # test_explicit_retry_key_joins_worker_after_prompt_history_changes).
+    key = _attempt_key(request, short_slot)
+    deadline = time.monotonic() + 5.0
+    active = True
+    while time.monotonic() < deadline:
+        with _ACTIVE_LOCK:
+            active = key in _ACTIVE
+        if not active:
+            break
+        time.sleep(0.01)
+    assert not active
 
 
 def test_review_substrate_preserves_explicit_zero_budget_rails(tmp_path):
