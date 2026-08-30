@@ -1060,52 +1060,12 @@ def settle_attempt(
     )
 
 
-# Cache-inclusive prompt totals are measurable; GigaChat's semantics remain unknown.
-_CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS = frozenset({
-    "openrouter", "openai", "openai-compatible", "cloudru", "local", "anthropic",
-})
-
-
 def _observe_token_density(request: AttemptRequest, usage: Optional[Dict[str, Any]]) -> None:
-    """Learn density after settlement; unknown cache semantics produce no witness."""
-    try:
-        normalized = dict(usage or {})
-        cache_bearing = bool(
-            int(normalized.get("cached_tokens") or 0)
-            or int(normalized.get("cache_write_tokens") or 0)
-        )
-        provider = str(request.provider or "").strip().lower()
-        if cache_bearing and provider not in _CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS:
-            return
-        real = int(normalized.get("prompt_tokens") or normalized.get("input_tokens") or 0)
-        # The witness MUST calibrate the basis the fit estimator measures on
-        # (bounded image proxy) — the raw-base64 basis fed a self-consistent
-        # ~27% under-prediction: measure_main_fit multiplied a BOUNDED
-        # estimate by a RAW-basis density. `prompt_tokens_estimate` stays raw
-        # on purpose — `_reservation_cost` reads it and budget reservation
-        # wants the conservative over-count (owner decision 3=A); do NOT
-        # unify the two consumers onto one basis.
-        estimate = int(request.prompt_tokens_bounded_estimate or 0)
-        basis = "bounded_proxy"
-        if estimate <= 0:
-            estimate = int(request.prompt_tokens_estimate or 0)
-            basis = "raw"
-        if real <= 0 or estimate <= 0:
-            return
-        from ouroboros.capability_evidence import record_token_density
-        from ouroboros.provider_models import normalize_model_identity
+    # Lives beside the density store (capability_evidence) since this module's
+    # size ceiling; the settlement paths keep this historical seam name.
+    from ouroboros.capability_evidence import observe_token_density
 
-        record_token_density(
-            _drive_root(request.drive_root),
-            normalize_model_identity(str(request.model or "")),
-            prompt_chars=estimate * 4,
-            prompt_tokens=real,
-            source="dispatch_usage",
-            route_fp=str(request.physical_context.route_fp if request.physical_context else ""),
-            basis=basis,
-        )
-    except Exception:
-        log.debug("token-density observation skipped", exc_info=True)
+    observe_token_density(request, usage, drive_root_resolver=_drive_root)
 
 
 def _is_pre_routing_rejection(exc: BaseException) -> bool:

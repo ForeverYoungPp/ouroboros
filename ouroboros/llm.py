@@ -190,23 +190,8 @@ class LocalContextTooLargeError(RuntimeError):
     """Raised when a local model cannot fit context without silent truncation."""
 
 
-def _estimate_message_chars(messages: List[Dict[str, Any]]) -> int:
-    from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
-
-    total = 0
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                if str(block.get("type") or "") in ("image_url", "image"):
-                    total += IMAGE_BLOCK_CHAR_EQUIVALENT
-                    continue
-                total += len(str(block.get("text", "")))
-        else:
-            total += len(str(content or ""))
-    return total
+# Lives beside its proxy constant; the historical private name stays importable.
+from ouroboros.context_budget import estimate_message_chars as _estimate_message_chars
 
 
 def _applied_payload_cache_ttl(payload: Dict[str, Any]) -> Optional[str]:
@@ -250,23 +235,15 @@ def _attempt_request(
         prompt_chars = len(json.dumps(prompt_payload, ensure_ascii=False, default=str))
     except Exception:
         prompt_chars = len(str(prompt_payload or ""))
-    # Bounded-proxy basis: identical to prompt_chars except image blocks count
-    # at the provider-billing proxy instead of their raw base64 bytes. This is
-    # the basis context_fit's estimator measures on, so the density witness
-    # derived from it calibrates the SAME quantity the fit predicts — the raw
-    # basis poisoned the per-route density for 14 days per witness (a live
-    # image cost hundreds of KB of "chars" that providers bill as ~1.1K
-    # tokens, driving a systematic ~27% context under-prediction).
+    # Bounded-proxy basis (images at the billing proxy, not base64): what the
+    # fit estimator measures — the density witness must calibrate on it.
     try:
-        messages = prompt_payload.get("messages")
-        if isinstance(messages, list):
-            non_message = {k: v for k, v in prompt_payload.items() if k != "messages"}
-            bounded_chars = (
-                len(json.dumps(non_message, ensure_ascii=False, default=str))
-                + _estimate_message_chars(messages)
-            )
-        else:
-            bounded_chars = prompt_chars
+        msgs = prompt_payload.get("messages")
+        rest = {k: v for k, v in prompt_payload.items() if k != "messages"}
+        bounded_chars = (
+            len(json.dumps(rest, ensure_ascii=False, default=str))
+            + _estimate_message_chars(msgs)
+        ) if isinstance(msgs, list) else prompt_chars
     except Exception:
         bounded_chars = prompt_chars
     request_source = source
