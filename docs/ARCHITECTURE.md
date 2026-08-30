@@ -1503,6 +1503,25 @@ detector, while explicit task deadline, budget, cancellation and the absolute ce
 remain independent hard axes. A stale terminal from an earlier retry or task attempt
 cannot clear the current row.
 
+The cached OpenAI-compatible clients, the no-proxy per-call clients, and the
+web-search OpenAI clients are built on one shared transport factory
+(`net_transport.py`) that sets platform-guarded TCP keepalive socket options,
+so a NAT/VPN mapping silently dropped during a long silent reasoning stretch
+is detected by kernel probes instead of hanging until the read timeout: on
+Linux/macOS the probe timing is tuned to detect within minutes, other
+platforms get `SO_KEEPALIVE` with OS-default timing. The cached-client
+transports also carry SDK-equivalent pool limits (an explicit transport
+ignores Client-level limits). When any proxy httpx would honor is configured
+(HTTP(S)_PROXY/ALL_PROXY env vars, macOS SystemConfiguration, the Windows
+registry — mirrored via `urllib.request.getproxies()`), the cached and
+web-search clients skip the explicit transport (httpx env-proxy mounts
+require it absent) — disclosed residual: proxy-routed installs run without
+keepalive tuning, as do httpx builds predating the transport
+`socket_options` parameter (< 0.25). Further residuals without these socket
+options: the native Anthropic `requests` session and the anthropic web-search
+client, the GigaChat library client, and the short-lived `llm_probe`
+ephemeral probe clients.
+
 The configured-session startup/recovery receipt and every newly minted meaningful wake
 also carry one host-rendered `coordination_context`: the complete parent-authored advisory
 `delegation_budget.intent_note`, explicit-deadline time remaining, known/partial/unknown
