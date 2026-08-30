@@ -1692,3 +1692,35 @@ def test_switch_model_never_rewrites_the_dispatch_lane_record(monkeypatch, tmp_p
     # The durable dispatch record is untouched — acceptance-round provenance is
     # read from llm_usage (each round carries the REAL model), not from here.
     assert {k: ctx.task_metadata[k] for k in record} == record
+
+
+def test_switch_model_refuses_an_unknown_effort_instead_of_coercing(monkeypatch, tmp_path):
+    """`effort` is validated like `model`: an unknown tier is refused rather than
+    silently coerced to `medium`, and the refusal takes the whole call with it —
+    a model switch requested in the same call is NOT applied."""
+    from ouroboros.config import EFFORT_SCALE
+    from ouroboros.tools.control import _switch_model
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setattr(
+        "ouroboros.llm.LLMClient.available_models",
+        lambda self: ["provider::main"],
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+
+    out = _switch_model(ctx, model="provider::main", effort="enormous")
+    assert out.startswith("⚠️ Unknown effort: enormous")
+    assert ", ".join(EFFORT_SCALE) in out
+    assert ctx.active_effort_override is None
+    assert ctx.active_model_override is None
+
+    # The new top tier is accepted, case/whitespace normalized like before.
+    assert "OK: switching" in _switch_model(ctx, effort=" ULTRA ")
+    assert ctx.active_effort_override == "ultra"
+
+    # Whitespace-only effort is neither refused nor applied: it stays an empty
+    # request and falls through to the listing, leaving no override behind.
+    blank = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    assert _switch_model(blank, effort="   ").startswith("Current available models:")
+    assert blank.active_effort_override is None
+    assert blank.active_model_override is None

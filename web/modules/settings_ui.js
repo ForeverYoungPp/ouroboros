@@ -204,10 +204,11 @@ function modelCard({ title, copy, inputId, toggleId, defaultValue }) {
 // The owner-facing subset of ouroboros/config.py EFFORT_SCALE: `minimal` is a
 // valid runtime tier (bench adapters / agent-side switch_model use it) but is
 // deliberately NOT offered as an owner slot default — sub-`low` thinking is a
-// per-call tactical choice, not a standing configuration. xhigh/max are clamped
-// to each model's real ceiling at the provider boundary (llm.py), so selecting
-// them never errors on a model that tops out lower — it clamps down with a
-// disclosed usage note.
+// per-call tactical choice, not a standing configuration. xhigh/max/ultra adapt
+// down to each route's real ceiling (exact-route request-wire recovery on API
+// routes, per-model resolution on delegated ones); the adaptation is disclosed
+// in usage, and a cold route whose provider rejects without naming supported
+// tiers remains the PR-disclosed limit of the two-send recovery rail.
 const EFFORT_OPTIONS = [
     { value: 'none', label: 'None' },
     { value: 'low', label: 'Low' },
@@ -215,6 +216,7 @@ const EFFORT_OPTIONS = [
     { value: 'high', label: 'High' },
     { value: 'xhigh', label: 'X-High' },
     { value: 'max', label: 'Max' },
+    { value: 'ultra', label: 'Ultra' },
 ];
 
 function effortField({ id, label, defaultValue }) {

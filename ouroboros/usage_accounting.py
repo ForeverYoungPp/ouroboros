@@ -363,11 +363,8 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
         request = replace(request, global_limit_usd=scope.global_limit_usd)
     return request, scope
 from ouroboros._usage_rows_memo import (  # noqa: F401,E402  (re-exported seam)
-    _LedgerRowsMemo,
-    _ROWS_MEMO,
-    _ROWS_MEMO_LOCK,
-    _memoized_final_rows,
-    _render_cached,
+    _LedgerRowsMemo, _ROWS_MEMO, _ROWS_MEMO_LOCK,
+    _memoized_final_rows, _read_records_locked_cached, _render_cached,
 )
 
 
@@ -688,7 +685,7 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
     pricing_known = bound is not None
     attempt_id = uuid.uuid4().hex
     with _locked(root):
-        records = _read_records_locked(root)
+        records = _read_records_locked_cached(root)
         finals = list(_final_rows(records).values())
         global_summary = _summary(finals)
         global_limit = _global_limit(request)
@@ -817,7 +814,7 @@ def _append_single_settled_row(
     is a conflict, never a silent overwrite. Shared by every single-row kind."""
     attempt_id = str(row["attempt_id"])
     with _locked(root):
-        records = _read_records_locked(root)
+        records = _read_records_locked_cached(root)
         existing = _final_rows(records).get(attempt_id)
         if existing is not None:
             def identity_value(source: Dict[str, Any], key: str) -> Any:
@@ -895,7 +892,7 @@ def record_subscription_session(
     ))
 def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> Dict[str, Any]:
     with _locked(reservation.drive_root):
-        records = _read_records_locked(reservation.drive_root)
+        records = _read_records_locked_cached(reservation.drive_root)
         current = _final_rows(records).get(reservation.attempt_id)
         if current is None:
             raise UsageAccountingError(f"unknown usage attempt {reservation.attempt_id}")
@@ -983,7 +980,7 @@ def terminalize_abandoned_attempt(
 ) -> str:
     """Close a dead owner attempt from measured usage, else unresolved/released."""
     with _locked(reservation.drive_root):
-        current = _final_rows(_read_records_locked(reservation.drive_root)).get(
+        current = _final_rows(_read_records_locked_cached(reservation.drive_root)).get(
             reservation.attempt_id
         )
     if current is None:
@@ -1573,7 +1570,7 @@ def _ensure_legacy_imported_locked(
         current_watermark = _completed_import_watermark(root)
         if current_watermark is not None:
             return current_watermark
-        records = _read_records_locked(root)
+        records = _read_records_locked_cached(root)
         existing_ids = {str(row.get("attempt_id") or "") for row in records}
         missing = [row for row in candidates if row["attempt_id"] not in existing_ids]
         _append_rows_locked(root, records, missing)

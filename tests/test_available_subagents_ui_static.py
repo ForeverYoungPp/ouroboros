@@ -113,3 +113,22 @@ def test_new_frontend_modules_stay_within_the_context_target() -> None:
     ):
         lines = _read(MODULES / name).count("\n") + 1
         assert lines <= 1000, f"{name} grew to {lines} lines"
+
+
+def test_effort_choice_mirrors_track_the_python_scale() -> None:
+    """The JS effort lists are hand-maintained mirrors of config.EFFORT_SCALE;
+    this guard makes the next tier addition fail loudly when a mirror is missed."""
+    import re
+
+    from ouroboros.config import EFFORT_SCALE
+
+    primitives = _read(MODULES / "route_editor_primitives.js")
+    expected = "export const EFFORT_CHOICES = [" + ", ".join(f"'{tier}'" for tier in EFFORT_SCALE) + "];"
+    assert expected in primitives
+
+    settings = _read(MODULES / "settings_ui.js")
+    block = re.search(r"const EFFORT_OPTIONS = \[(.*?)\];", settings, re.DOTALL)
+    assert block, "EFFORT_OPTIONS block not found in settings_ui.js"
+    values = re.findall(r"value: '([a-z]+)'", block.group(1))
+    # `minimal` is deliberately not an owner-facing standing default (see EFFORT_OPTIONS).
+    assert values == [tier for tier in EFFORT_SCALE if tier != "minimal"]
