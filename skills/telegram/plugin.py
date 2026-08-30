@@ -1069,7 +1069,13 @@ def _make_document(api):
                             caption=caption,
                             mime=mime,
                         )
-                    except TelegramRequestRejected:
+                    except TelegramRequestRejected as exc:
+                        # Fall back to a plain document only on a definitive
+                        # format rejection (HTTP 400). Auth failures and
+                        # transient errors (429/5xx) re-raise: retrying the
+                        # upload there risks a duplicate delivery.
+                        if exc.status_code != 400 or exc.transient:
+                            raise
                         await client.send_document(
                             chat_id,
                             file_bytes,

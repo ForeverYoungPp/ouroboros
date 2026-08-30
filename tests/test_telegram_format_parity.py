@@ -446,6 +446,29 @@ def test_send_audio_rejection_falls_back_to_document_once(tmp_path, monkeypatch)
     assert len(client.documents) == 1
 
 
+@pytest.mark.parametrize("status_code", [401, 429, 500])
+def test_send_audio_non_format_rejection_never_double_sends(tmp_path, monkeypatch, status_code):
+    """Auth (401) and transient (429/5xx) rejections re-raise without the
+    document fallback: the upload may have been throttled mid-flight, and a
+    second sendDocument would risk a duplicate delivery."""
+    plugin, _telegram_api = _load_skill()
+    client = _Client(
+        audio_error=plugin.TelegramRequestRejected("rejected", status_code=status_code)
+    )
+    monkeypatch.setattr(plugin, "TelegramClient", lambda _token: client)
+    api = _configured_api(tmp_path)
+    event = {
+        "chat_id": 42,
+        "file_base64": base64.b64encode(b"audio").decode("ascii"),
+        "filename": "track.mp3",
+        "mime": "audio/mpeg",
+    }
+    asyncio.run(plugin._make_document(api)(event))
+    assert len(client.audio) == 1
+    assert client.documents == []
+    assert any(level == "error" for level, _message in api.logs)
+
+
 def test_links_event_renders_at_most_twelve_url_buttons(tmp_path, monkeypatch):
     plugin, _telegram_api = _load_skill()
     client = _Client()
