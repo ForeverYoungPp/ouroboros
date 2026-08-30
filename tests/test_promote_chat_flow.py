@@ -371,8 +371,14 @@ def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_pa
         "parent_contract": event["task_contract"],
         "attachment_manifest": event["task_contract"]["attachment_manifest"],
     })
-    for key in ("capability_ceiling", "context", "predecessor_authority", "attachment_manifest"):
+    for key in ("capability_ceiling", "context", "attachment_manifest"):
         assert child[key] == contract[key]
+    # Envelope contract (2026-08-30): a legacy full-body predecessor collapses
+    # to its bounded reference on any contract rebuild - identity preserved,
+    # bodies stay in task_results.
+    collapsed = child["predecessor_authority"]
+    assert collapsed["kind"] == "bounded_continuation_envelope"
+    assert collapsed["collapsed_from"] == "legacy_full_body"
 
 
 def test_real_presence_promotion_rebases_root_and_materializes_all_attachments(

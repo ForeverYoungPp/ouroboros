@@ -3092,13 +3092,9 @@ def test_durable_truncation_is_disclosed_never_a_bare_slice(tmp_path):
 
 
 def test_an_absent_run_closes_now_and_its_registration_survives_for_the_sweep(tmp_path):
-    """P34R.4, decoupled (delegation-usefulness campaign, owner 2026-08-30): the
-    absent-run FACT and the registration obligation are two different durable facts
-    recorded INDEPENDENTLY. CLOSED_ABSENT lands immediately (holding the run "open"
-    as a proxy for cleanup debt converted infra debt into task-outcome corruption);
-    the registration survives replay on `project_owned` — CLOSED_ABSENT no longer
-    clears ownership wholesale — and the registration sweep retries the retirement
-    until the daemon accepts (a 404 on the REMOVE counts as discharged)."""
+    """P34R.4 decoupled (owner 2026-08-30): CLOSED_ABSENT lands immediately;
+    the registration survives replay on project_owned (no wholesale clear) and
+    the registration sweep retries until the daemon accepts (404 = discharged)."""
     import ouroboros.delegate_custody as dc
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
@@ -3120,18 +3116,17 @@ def test_an_absent_run_closes_now_and_its_registration_survives_for_the_sweep(tm
         project_id="prj-owned", project_owned=True, ledger_root=str(tmp_path)))
     dc._CUSTODY.clear()
 
-    # 1. Retirement unreachable: the run-level FACT lands now; the debt survives.
+    # 1. Retire unreachable: the run FACT lands now; the debt survives.
     out = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: gateway)
     assert [o["action"] for o in out] == ["absent"]
     kinds = _event_types(tmp_path)
     assert "delegate_run_project_retire_failed" in kinds, "the failure is disclosed"
-    assert "delegate_run_closed_absent" in kinds, \
-        "the absent-run fact is recorded independently of the registration"
+    assert "delegate_run_closed_absent" in kinds, "fact lands independently"
     assert dc.open_runs(tmp_path) == [], "run custody is over"
     owned = dc.owned_project_registrations(tmp_path)
     assert [c.run_id for c in owned] == ["run-gone"] and owned[0].project_owned is True
 
-    # 2. The daemon recovers: the registration sweep discharges the obligation.
+    # 2. Daemon recovers: the sweep discharges the obligation.
     gateway.remove_fails = False
     dc._CUSTODY.clear()
     dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: gateway)
@@ -3700,12 +3695,10 @@ def _health_invariants(tmp_path):
 
 
 def test_settlement_follows_the_ledger_and_the_registration_debt_survives(tmp_path, monkeypatch):
-    """Decoupled contract (delegation-usefulness, owner 2026-08-30): settlement is a
-    RUN-level fact and follows the ledger row alone — a sibling holding the shared
-    project must not convert a SUCCEEDED run into an unsettled one (the old coupling
-    corrupted the whole task outcome to infra_failed). The registration obligation
-    survives independently on ``project_owned`` for the registration sweep, and the
-    idempotent ledger row must still never be written twice."""
+    """Decoupled (owner 2026-08-30): settlement follows the ledger row alone —
+    a sibling holding the shared project must not turn a SUCCEEDED run into an
+    unsettled one; the registration debt survives on project_owned for the
+    sweep, and the idempotent ledger row is never written twice."""
     import ouroboros.delegate_custody as dc
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gw
@@ -3729,8 +3722,7 @@ def test_settlement_follows_the_ledger_and_the_registration_debt_survives(tmp_pa
     ctx = _nanny_ctx(tmp_path)
 
     first = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
-    assert first["settlement"]["settled"] is True, \
-        "the run settles on its ledger row; retirement is separate debt"
+    assert first["settlement"]["settled"] is True, "settles on the ledger row"
     assert first["settlement"]["project_retired"] is False, "the debt is disclosed"
     assert entry.settled is True and entry.project_owned is True
     assert "delegate_run_settled" in _event_types(tmp_path)
@@ -4482,9 +4474,8 @@ def test_a_reconciled_run_with_an_unread_artifact_is_visible_as_uncollected(
 
     stub = _Stub()
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: stub)
-    # Settlement now follows the LEDGER row alone (decoupled contract), so the
-    # run is held open for the sweep by an honest ledger failure, not by a busy
-    # project retirement.
+    # Decoupled: the run is held open for the sweep by an honest ledger
+    # failure, not by a busy project retirement.
     import ouroboros.usage_accounting as ua
     ledger_blocked = {"now": True}
     real_record = ua.record_subscription_session
@@ -4500,8 +4491,8 @@ def test_a_reconciled_run_with_an_unread_artifact_is_visible_as_uncollected(
         run_id="run-1", task_id="t-gone", route_id="r", model="m",
         project_id="prj", project_owned=True, root_task_id="t-gone", ledger_root=str(tmp_path)))
 
-    # The nanny sees the terminal preview (artifact staged) but the settlement cannot
-    # finish, and the task dies without ever reading the artifact to EOF.
+    # Nanny sees the staged preview; settlement cannot finish; the task dies
+    # without reading the artifact to EOF.
     out = json.loads(delegate._delegate_wait(_nanny_ctx(tmp_path, "t-gone"), "run-1", wait_sec=1))
     assert out["output_delivery"]["artifact"], "this scenario is about a staged artifact"
     assert out["settlement"]["settled"] is False

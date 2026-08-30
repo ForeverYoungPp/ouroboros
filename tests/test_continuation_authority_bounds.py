@@ -76,7 +76,8 @@ def test_host_salvage_automatic_authority_is_bounded_but_explicit_read_is_full(
     assert automatic["status"] == "failed"
     assert automatic["reason_code"] == "provider_unavailable"
     assert automatic["outcome_axes"] == row["outcome_axes"]
-    assert "task_contract" not in automatic, "no nested contract - no recursion"
+    nested_contract = automatic.get("task_contract") or {}
+    assert "predecessor_authority" not in nested_contract, "no recursion carrier"
 
     # The shared projection and the explicit tool remain full. Only startup's
     # automatic predecessor injection is narrowed.
@@ -127,6 +128,6 @@ def test_automatic_authority_rides_whole_or_pointer(tmp_path):
         if full_result is small_result:
             assert automatic["result"] == full_result, "small hops ride whole"
         else:
-            assert automatic["result"]["kind"] == "bounded_result_preview"
+            assert automatic["result"]["kind"] == "bounded_field_preview"
             assert automatic["result"]["full_chars"] == len(full_result)
             assert "OMISSION NOTE" in automatic["result"]["preview"]

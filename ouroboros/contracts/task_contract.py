@@ -606,46 +606,44 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
 
 
 def _bounded_predecessor_authority(mapping: Dict[str, Any]) -> Dict[str, Any]:
-    """Collapse a legacy full-body predecessor into its bounded envelope.
+    """Collapse a legacy full-body predecessor to the bounded envelope rule.
 
-    An envelope-shaped mapping passes through by copy.  A fat legacy mapping
-    (complete result/contract bodies, recursively nesting every prior hop) is
-    reduced to identity + named pull source + observed size facts: the bodies
-    remain exactly where they always were - task_results/<id>.json - and the
-    contract stops re-broadcasting them into every child and work order.
+    Same floor as the startup projection: every compact terminal fact passes
+    through, oversized string bodies become bounded previews, and the nested
+    ``task_contract.predecessor_authority`` (the recursion carrier) is
+    dropped - the durable task_results bodies stay the untouched SSOT.
     """
     if str(mapping.get("kind") or "") == "bounded_continuation_envelope":
         return copy.deepcopy(mapping)
-    source = mapping.get("source") if isinstance(mapping.get("source"), Mapping) else {}
-    contract = mapping.get("task_contract") if isinstance(mapping.get("task_contract"), Mapping) else {}
     try:
         serialized = json.dumps(mapping, ensure_ascii=False, sort_keys=True, default=str)
     except (TypeError, ValueError):
         serialized = repr(mapping)
-    result = mapping.get("result")
-    envelope: Dict[str, Any] = {
+    envelope: Dict[str, Any] = {}
+    for key, value in mapping.items():
+        if key == "task_contract":
+            continue
+        if isinstance(value, str) and len(value) > 20_000:
+            envelope[key] = (
+                value[:20_000]
+                + "\n⚠️ OMISSION NOTE: legacy predecessor body collapsed; pull "
+                "the complete authority through the named source."
+            )
+        else:
+            envelope[key] = copy.deepcopy(value)
+    contract = mapping.get("task_contract") if isinstance(mapping.get("task_contract"), Mapping) else {}
+    core = {key: copy.deepcopy(value) for key, value in contract.items()
+            if key != "predecessor_authority"}
+    if core:
+        envelope["task_contract"] = core
+    envelope.update({
         "kind": "bounded_continuation_envelope",
-        "task_id": str(
-            mapping.get("task_id") or mapping.get("id")
-            or (source.get("task_id") if isinstance(source, Mapping) else "") or ""
-        ),
-        "status": str(mapping.get("status") or ""),
-        "objective": str(contract.get("objective") or mapping.get("title") or "")[:500],
         "authority_sha256": sha256(serialized.encode("utf-8")).hexdigest(),
         "authority_chars": len(serialized),
         "digest_semantics": "observed_at_collapse",
         "collapsed_from": "legacy_full_body",
-    }
-    if isinstance(source, Mapping) and source:
-        envelope["source"] = copy.deepcopy(dict(source))
-    if isinstance(result, str) and result:
-        envelope["result"] = (
-            result if len(result) <= 20_000
-            else result[:20_000] + "\n⚠️ OMISSION NOTE: legacy predecessor body "
-            "collapsed; pull the complete authority through the named source."
-        )
+    })
     return envelope
-
 
 def attach_task_contract(task: Dict[str, Any]) -> Dict[str, Any]:
     contract = build_task_contract(task)

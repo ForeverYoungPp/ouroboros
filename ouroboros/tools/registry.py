@@ -1040,6 +1040,22 @@ _VERIFY_RUN_KINDS = frozenset({
 })
 
 
+def _configured_delegate_selector(ctx: Any, name: str, args: dict[str, Any]) -> bool:
+    """Configured-actor validation PRECEDES generic target binding.
+
+    A configured session child passing any exact-resource selector gets the
+    handler's precise configured_actor_resource_mismatch (which also records
+    the START_BLOCKED attempt row), not the generic payload-binding
+    TOOL_ACCESS_BLOCKED that twice read as "workspace authority lost" and
+    pushed the nanny into native rebuilds."""
+    return (
+        name == "delegate_start"
+        and isinstance(getattr(ctx, "_configured_actor_bootstrap", None), dict)
+        and any(str(args.get(key) or "").strip()
+                for key in ("root", "bucket", "skill_name"))
+    )
+
+
 def _target_binding_operation(name: str, args: dict[str, Any]) -> str | None:
     operation = _TARGET_BINDING_OPERATIONS.get(name)
     if operation is not None:
@@ -3562,19 +3578,8 @@ class ToolRegistry:
             if heal_block:
                 return heal_block
         workspace_mode = bool(getattr(self._ctx, "is_workspace_mode", lambda: False)())
-        # Configured-actor validation PRECEDES generic target binding: a
-        # configured session child passing any exact-resource selector gets the
-        # handler's precise configured_actor_resource_mismatch, not the generic
-        # payload-binding TOOL_ACCESS_BLOCKED that twice read as "workspace
-        # authority lost" and pushed the nanny into native rebuilds.
-        configured_delegate_selector = (
-            name == "delegate_start"
-            and isinstance(getattr(self._ctx, "_configured_actor_bootstrap", None), dict)
-            and any(str(args.get(key) or "").strip()
-                    for key in ("root", "bucket", "skill_name"))
-        )
         effective_constraint = task_constraint
-        if entry is not None and not configured_delegate_selector:
+        if entry is not None and not (skip_binding := _configured_delegate_selector(self._ctx, name, args)):
             effective_constraint, payload_error = _payload_dispatch_constraint(
                 self._ctx,
                 name=name,
@@ -3585,8 +3590,7 @@ class ToolRegistry:
             if payload_error:
                 return payload_error
         resolved_binding = None
-        if (entry is not None and not configured_delegate_selector
-                and _target_binding_operation(name, args) is not None):
+        if entry is not None and not skip_binding and _target_binding_operation(name, args) is not None:
             try:
                 resolved_binding = _build_builtin_target_binding(self._ctx, name, args)
             except Exception as exc:

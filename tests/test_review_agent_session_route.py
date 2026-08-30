@@ -1289,7 +1289,7 @@ def test_restart_reconciliation_settles_review_spend_to_the_recorded_root(
     outcomes = custody.reconcile_orphaned_runs(
         tmp_path, running_task_ids=set(), gateway_factory=lambda: FakeGateway(),
     )
-    assert [o["action"] for o in outcomes] == ["settled"]
+    assert [o["action"] for o in outcomes] == ["settle_attempted"]
 
     ledger = [json.loads(line) for line in
               (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()

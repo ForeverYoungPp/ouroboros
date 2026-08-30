@@ -125,19 +125,20 @@ def valid_task_result_authority_source(source: Any, task_id: Any) -> bool:
 def _automatic_predecessor_authority_projection(
     row: Dict[str, Any], source: Dict[str, Any], *, drive_root: Any,
 ) -> Dict[str, Any]:
-    """Bounded continuation ENVELOPE - identity, digest, authored conclusion.
+    """Bounded continuation envelope: every terminal fact, no body recursion.
 
-    The recursive deep-copy this replaces embedded every predecessor's complete
-    body (its contract nesting the hop before, and so on) into each successor's
-    contract: chains of ordinary tasks compiled 300K+ work orders, blew the
-    parent's per-round authority projection past 800K prompt tokens, and killed
-    delegation on every non-interactive route. The complete canonical authority
-    LIVES in task_results/<id>.json (the SSOT this projection reads); the
-    contract carries what orients a successor plus the named pull source - a
-    stronger mind pulls exactly the ranges it needs (whole-or-pointer, the same
-    shape the absorption path already uses). Digest facts are observed at
-    binding: authority that advances later (late receipts) yields an honest
-    mismatch disclosure on pull, never a silent substitution.
+    The recursion that compiled 300K+ work orders and 800K-token parent
+    prompts lived in exactly two carriers: the nested ``task_contract``
+    (which embedded the hop before, recursively) and unbounded string bodies
+    (``result``/``final_answer`` and friends). Every OTHER top-level terminal
+    fact - artifact/custody/verification/capability facts, fields this reader
+    predates - keeps inheriting whole, so authority cannot silently vanish.
+    The two carriers are bounded structurally: the contract inherits its
+    OPERATIVE core minus the nested predecessor, and any oversized string
+    field rides as a bounded preview beside the named pull source (the same
+    whole-or-pointer rule main_context_authority already applies to Main).
+    Digest facts are observed at binding; the complete canonical authority
+    stays in task_results/<id>.json, pullable whole or by exact range.
     """
 
     authority = task_result_authority_projection(row, drive_root=drive_root)
@@ -145,67 +146,45 @@ def _automatic_predecessor_authority_projection(
     contract = authority.get("task_contract") if isinstance(authority.get("task_contract"), dict) else {}
     nested = contract.get("predecessor_authority") if isinstance(contract.get("predecessor_authority"), dict) else {}
     nested_source = nested.get("source") if isinstance(nested.get("source"), dict) else {}
-    # The predecessor's own OPERATIVE contract core rides whole-ish: these are
-    # owner/parent-authored requirements a successor must honor without knowing
-    # to pull them, and they are O(contract text) per hop - the recursion lived
-    # in the NESTED predecessor_authority and the full field copy, both of
-    # which stay out of this envelope.
-    contract_core: Dict[str, Any] = {}
-    for field in ("objective", "context", "constraints", "expected_output",
-                  "success_criteria", "delegation_budget", "answer_protocol"):
-        value = contract.get(field)
-        if value in (None, "", [], {}):
+    salvage = str(row.get("terminal_origin") or "") == TERMINAL_ORIGIN_HOST_SALVAGE
+
+    envelope: Dict[str, Any] = {}
+    for key, value in authority.items():
+        if key == "task_contract":
             continue
-        contract_core[field] = (
-            truncate_within_limit(value, limit=8_000)
-            if isinstance(value, str) else copy.deepcopy(value)
-        )
-    envelope: Dict[str, Any] = {
+        force_pointer = salvage and key == "result"
+        if isinstance(value, str) and (
+            force_pointer or len(value) > _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS
+        ):
+            envelope[key] = {
+                "kind": "unreviewed_host_salvage" if force_pointer else "bounded_field_preview",
+                "preview": truncate_within_limit(
+                    value, limit=_AUTOMATIC_HOST_SALVAGE_RESULT_CHARS,
+                ),
+                "full_chars": len(value),
+                "source_ref": {**copy.deepcopy(source), "field": f"authority.{key}"},
+            }
+        else:
+            envelope[key] = value
+    # The contract inherits its operative core; the nested predecessor (the
+    # recursion carrier) is dropped - the chain stays walkable by cursor.
+    core = {
+        key: value for key, value in contract.items()
+        if key != "predecessor_authority"
+    }
+    if core:
+        envelope["task_contract"] = core
+    envelope.update({
         "kind": "bounded_continuation_envelope",
-        "task_id": str(row.get("task_id") or row.get("id") or ""),
-        "status": str(row.get("status") or ""),
-        "contract_core": contract_core,
         "authority_sha256": sha256(serialized.encode("utf-8")).hexdigest(),
         "authority_chars": len(serialized),
         "digest_semantics": "observed_at_binding",
-        # Chain cursor: the predecessor's own predecessor, walkable without
-        # carrying any prior body (works for both envelope and legacy shapes).
         "previous_task_id": str(
-            nested.get("task_id") or nested_source.get("task_id") or ""
+            nested.get("task_id") or nested.get("previous_task_id")
+            or nested_source.get("task_id") or ""
         ),
-    }
-    # Compact terminal facts ride whole: they are the orientation a successor
-    # needs before deciding what (if anything) to pull.
-    for fact in ("reason_code", "outcome_axes"):
-        if row.get(fact) is not None:
-            envelope[fact] = copy.deepcopy(row.get(fact))
-    narrative = row.get("continuation_narrative")
-    if isinstance(narrative, str) and narrative.strip():
-        envelope["continuation_narrative"] = truncate_within_limit(
-            narrative, limit=_AUTOMATIC_HOST_SALVAGE_RESULT_CHARS,
-        )
-    full_result = authority.get("result")
-    if isinstance(full_result, str) and full_result:
-        full_chars = len(full_result)
-        salvage = str(row.get("terminal_origin") or "") == TERMINAL_ORIGIN_HOST_SALVAGE
-        if full_chars <= _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS and not salvage:
-            # Whole-or-pointer: a result that fits one ordinary tool-result
-            # budget rides complete - no pull round needed for small hops.
-            envelope["result"] = full_result
-        else:
-            envelope["result"] = {
-                "kind": "unreviewed_host_salvage" if salvage else "bounded_result_preview",
-                "preview": truncate_within_limit(
-                    full_result, limit=_AUTOMATIC_HOST_SALVAGE_RESULT_CHARS,
-                ),
-                "full_chars": full_chars,
-                "source_ref": {
-                    **copy.deepcopy(source),
-                    "field": "authority.result",
-                },
-            }
+    })
     return envelope
-
 
 def validate_task_authority_sources(env: Any, task: Dict[str, Any]) -> Dict[str, Any]:
     """Materialize named authority sources or return one typed startup refusal."""
