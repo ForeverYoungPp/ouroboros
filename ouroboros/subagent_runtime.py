@@ -884,10 +884,21 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
     bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
     retry_of = str(params.get("retry_of") or "").strip()
     from ouroboros.delegate_shared import _fail
+
+    def _blocked(reason: str) -> None:
+        # A pre-custody refusal is still a durable ATTEMPT fact: without the
+        # START_BLOCKED row, the evidence read "delegate_start never called"
+        # over a call the registry provably saw (D5 evidence collapse). One
+        # emitter for the whole refusal class, not per-branch.
+        from ouroboros.delegate_evidence import record_start_blocked
+
+        record_start_blocked(ctx, str(getattr(ctx, "task_id", "") or ""), reason)
+
     if isinstance(bootstrap, dict) and not retry_of:
         expected_id = str(bootstrap.get("selected_subagent_id") or "")
         requested_id = str(params.get("subagent_id") or "").strip()
         if requested_id and requested_id != expected_id:
+            _blocked("configured_actor_route_mismatch")
             return _fail(
                 "delegate_start", "configured_actor_route_mismatch",
                 "This actor-first turn is bound to its scheduled configured session; "
@@ -897,15 +908,7 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
                 host_fallback=False,
             )
         if any(str(params.get(key) or "").strip() for key in ("root", "bucket", "skill_name")):
-            # A pre-custody refusal is still a durable ATTEMPT fact: without the
-            # START_BLOCKED row, the evidence read "delegate_start never called"
-            # over a call the registry provably saw (D5 evidence collapse).
-            from ouroboros.delegate_evidence import record_start_blocked
-
-            record_start_blocked(
-                ctx, str(getattr(ctx, "task_id", "") or ""),
-                "configured_actor_resource_mismatch",
-            )
+            _blocked("configured_actor_resource_mismatch")
             return _fail(
                 "delegate_start", "configured_actor_resource_mismatch",
                 "An actor-first configured session may start only its assigned route, "
@@ -920,6 +923,7 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
             return source_refusal
         source_request = bootstrap.get("source_request")
         if not canonical_work_order:
+            _blocked("configured_work_order_unavailable")
             return _fail(
                 "delegate_start", "configured_work_order_unavailable",
                 "The canonical work order is unavailable; do not start a physical leaf "
@@ -952,6 +956,7 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
         if source_refusal:
             return source_refusal
         if not canonical_work_order:
+            _blocked("configured_work_order_unavailable")
             return _fail(
                 "delegate_start", "configured_work_order_unavailable",
                 "The retry has no complete canonical work order or verified source "

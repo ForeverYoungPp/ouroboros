@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy
 import json
 from hashlib import sha256
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional
 
 
 _BOOLEAN_RESOURCE_NAMES = frozenset({
@@ -605,49 +605,121 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
     return contract
 
 
-def _bounded_predecessor_authority(mapping: Dict[str, Any]) -> Dict[str, Any]:
-    """Collapse a legacy full-body predecessor to the bounded envelope rule.
+def bounded_continuation_envelope(
+    mapping: Dict[str, Any], *, digest_semantics: str,
+    source_ref: Optional[Dict[str, Any]] = None, salvage: bool = False,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """The ONE bounded-envelope producer (startup binding and legacy collapse).
 
-    Only the two growth carriers trigger a rewrite - a nested
-    ``task_contract.predecessor_authority`` (the recursion) or an oversized
-    string body. A body already free of both passes through byte-identical:
-    exact strings are authority, and a bounded legacy mapping needs no
-    re-dressing. When the rewrite fires, every compact terminal fact still
-    passes through, oversized strings become disclosed truncations (utils
-    SSOT), and the durable task_results bodies stay the untouched source.
+    Every compact terminal fact inherits by copy - fields this reader predates
+    included - so authority cannot silently vanish. Only the growth carriers
+    are bounded structurally: the nested ``task_contract`` inherits its
+    operative core minus ``predecessor_authority`` (the recursion), and any
+    field whose body outgrows the tool-result budget rides as a typed preview
+    (measured on its JSON serialization, so lists and dicts are bounded too).
+    Core contract strings stay strings under disclosed truncation. Row fields
+    that collide with envelope metadata names ride under
+    ``shadowed_authority_fields`` instead of being clobbered. The digest names
+    when it was observed; the durable task_results body stays the SSOT.
     """
-    if str(mapping.get("kind") or "") == "bounded_continuation_envelope":
-        return copy.deepcopy(mapping)
-    contract = mapping.get("task_contract") if isinstance(mapping.get("task_contract"), Mapping) else {}
-    oversized = any(isinstance(v, str) and len(v) > 20_000 for v in mapping.values())
-    if "predecessor_authority" not in contract and not oversized:
-        return copy.deepcopy(mapping)
+    from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
+    from ouroboros.utils import truncate_within_limit
+
+    limit = DEFAULT_TOOL_RESULT_LIMIT
     try:
         serialized = json.dumps(mapping, ensure_ascii=False, sort_keys=True, default=str)
     except (TypeError, ValueError):
         serialized = repr(mapping)
-    from ouroboros.utils import truncate_review_artifact
-
+    contract = mapping.get("task_contract") if isinstance(mapping.get("task_contract"), Mapping) else {}
+    reserved = {"kind", "authority_sha256", "authority_chars", "digest_semantics",
+                "previous_task_id", "collapsed_from", "shadowed_authority_fields"}
     envelope: Dict[str, Any] = {}
+    shadowed: Dict[str, Any] = {}
     for key, value in mapping.items():
         if key == "task_contract":
             continue
-        if isinstance(value, str) and len(value) > 20_000:
-            envelope[key] = truncate_review_artifact(value, limit=20_000)
+        if key in reserved:
+            shadowed[key] = copy.deepcopy(value)
+            continue
+        force_pointer = salvage and key == "result"
+        if isinstance(value, str):
+            text, oversized = value, len(value) > limit
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+            except (TypeError, ValueError):
+                text = repr(value)
+            oversized = len(text) > limit
+        if force_pointer or oversized:
+            entry: Dict[str, Any] = {
+                "kind": "unreviewed_host_salvage" if force_pointer else "bounded_field_preview",
+                "preview": truncate_within_limit(text, limit=limit),
+                "full_chars": len(text),
+            }
+            if source_ref:
+                entry["source_ref"] = {**copy.deepcopy(source_ref), "field": f"authority.{key}"}
+            envelope[key] = entry
         else:
             envelope[key] = copy.deepcopy(value)
-    core = {key: copy.deepcopy(value) for key, value in contract.items()
-            if key != "predecessor_authority"}
+    core: Dict[str, Any] = {}
+    for key, value in contract.items():
+        if key == "predecessor_authority":
+            continue
+        if isinstance(value, str) and len(value) > limit:
+            core[key] = truncate_within_limit(value, limit=limit)
+        else:
+            core[key] = copy.deepcopy(value)
     if core:
         envelope["task_contract"] = core
+    if shadowed:
+        envelope["shadowed_authority_fields"] = shadowed
     envelope.update({
         "kind": "bounded_continuation_envelope",
         "authority_sha256": sha256(serialized.encode("utf-8")).hexdigest(),
         "authority_chars": len(serialized),
-        "digest_semantics": "observed_at_collapse",
-        "collapsed_from": "legacy_full_body",
+        "digest_semantics": digest_semantics,
+        **(extra or {}),
     })
     return envelope
+
+
+def _bounded_predecessor_authority(mapping: Dict[str, Any]) -> Dict[str, Any]:
+    """Collapse a legacy full-body predecessor on a growth carrier.
+
+    A body free of both carriers - no nested recursion, every field within
+    the tool-result budget on its serialized form - passes through
+    byte-identical: exact strings are authority. Otherwise the shared
+    envelope producer rewrites it once, and the minted envelope passes
+    rebuilds untouched.
+    """
+    if str(mapping.get("kind") or "") == "bounded_continuation_envelope":
+        return copy.deepcopy(mapping)
+    from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
+
+    def _field_chars(value: Any) -> int:
+        if isinstance(value, str):
+            return len(value)
+        try:
+            return len(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
+        except (TypeError, ValueError):
+            return len(repr(value))
+
+    contract = mapping.get("task_contract") if isinstance(mapping.get("task_contract"), Mapping) else {}
+    oversized = any(_field_chars(v) > DEFAULT_TOOL_RESULT_LIMIT for k, v in mapping.items()
+                    if k != "task_contract")
+    if "predecessor_authority" not in contract and not oversized:
+        return copy.deepcopy(mapping)
+    source = mapping.get("source") if isinstance(mapping.get("source"), Mapping) else {}
+    return bounded_continuation_envelope(
+        mapping,
+        digest_semantics="observed_at_collapse",
+        source_ref=dict(source) or None,
+        extra={
+            "collapsed_from": "legacy_full_body",
+            "previous_task_id": str(source.get("task_id") or mapping.get("task_id") or ""),
+        },
+    )
 
 def attach_task_contract(task: Dict[str, Any]) -> Dict[str, Any]:
     contract = build_task_contract(task)

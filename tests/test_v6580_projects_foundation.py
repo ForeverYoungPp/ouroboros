@@ -318,7 +318,7 @@ def test_checkpoint_ignores_readonly_children_and_bare_workspace_roots(tmp_path,
         data, "child-ro", "completed",
         delegation_role="subagent", parent_task_id="root-ro", root_task_id="root-ro",
         workspace_root=str(tree),
-        task_constraint={"mode": "local_readonly", "surface": "external_workspace"},
+        task_constraint={"mode": "local_readonly_subagent", "surface": "external_workspace"},
     )
     assert checkpoint_commit_coop_roots(data, "root-ro") == []
     status = subprocess.run(["git", "status", "--porcelain"], cwd=str(tree),
@@ -334,6 +334,32 @@ def test_checkpoint_ignores_readonly_children_and_bare_workspace_roots(tmp_path,
         task_constraint={"mode": "acting_subagent", "surface": "external_workspace"},
     )
     assert checkpoint_commit_coop_roots(data, "root-ro") == []
+
+    # 3) The readonly PREDICATE itself must skip: a readonly child whose
+    #    constraint somehow carries a write_root still never qualifies.
+    write_task_result(
+        data, "child-ro-wr", "completed",
+        delegation_role="subagent", parent_task_id="root-ro", root_task_id="root-ro",
+        workspace_root=str(tree),
+        task_constraint={"mode": "local_readonly_subagent",
+                         "surface": "external_workspace", "write_root": str(tree)},
+    )
+    assert checkpoint_commit_coop_roots(data, "root-ro") == []
+
+    # 4) Positive control: a MUTATIVE child granted write_root still gets its
+    #    coop tree checkpointed - the fix narrows attribution, not capability.
+    write_task_result(
+        data, "child-mut", "completed",
+        delegation_role="subagent", parent_task_id="root-ro", root_task_id="root-ro",
+        workspace_root=str(tree),
+        task_constraint={"mode": "acting_subagent",
+                         "surface": "external_workspace", "write_root": str(tree)},
+    )
+    committed = checkpoint_commit_coop_roots(data, "root-ro")
+    assert [row["root"] for row in committed] == [str(tree)]
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=str(tree),
+                            capture_output=True, text=True).stdout
+    assert "owner_wip.txt" not in status, "the granted tree got its checkpoint commit"
 
 
 def test_checkpoint_never_touches_attached_folders(tmp_path, monkeypatch):

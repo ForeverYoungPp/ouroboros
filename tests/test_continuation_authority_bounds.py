@@ -63,7 +63,12 @@ def test_host_salvage_automatic_authority_is_bounded_but_explicit_read_is_full(
     assert len(result["preview"]) <= _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS
     assert result["full_chars"] == len(full_result)
     assert result["source_ref"] == {**source, "field": "authority.result"}
-    assert result["preview"].startswith(full_result[:200])
+    # The carried prefix is byte-exact and SUBSTANTIAL - a preview carrying a
+    # token prefix plus a marker would pass a startswith(200) check while
+    # discarding the budget it promises.
+    carried = len(result["preview"].split("\n\u26a0", 1)[0])
+    assert carried > _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS - 1_000
+    assert result["preview"].startswith(full_result[:carried])
     assert "OMISSION NOTE" in result["preview"]
     assert tail not in json.dumps(automatic)
     assert len(json.dumps(automatic)) < 40_000
@@ -130,7 +135,11 @@ def test_automatic_authority_rides_whole_or_pointer(tmp_path):
         else:
             assert automatic["result"]["kind"] == "bounded_field_preview"
             assert automatic["result"]["full_chars"] == len(full_result)
-            assert "OMISSION NOTE" in automatic["result"]["preview"]
+            preview = automatic["result"]["preview"]
+            carried = len(preview.split("\n\u26a0", 1)[0])
+            assert carried > _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS - 1_000
+            assert preview.startswith(full_result[:carried])
+            assert "OMISSION NOTE" in preview
 
 
 def test_legacy_collapse_fires_only_on_growth_carriers_and_is_idempotent():
@@ -164,8 +173,12 @@ def test_legacy_collapse_fires_only_on_growth_carriers_and_is_idempotent():
     assert "predecessor_authority" not in envelope["task_contract"], "recursion carrier dropped"
     assert envelope["task_contract"]["objective"] == "grandparent objective"
     assert envelope["capability_delta"] == {"granted": ["net"]}, "compact facts inherit"
-    assert len(envelope["result"]) < 25_000 and "OMISSION NOTE" in envelope["result"]
+    preview = envelope["result"]
+    assert preview["kind"] == "bounded_field_preview"
+    assert preview["full_chars"] == 25_000 and "OMISSION NOTE" in preview["preview"]
+    assert preview["source_ref"]["task_id"] == "deep", "the pull route is named"
     assert envelope["source"] == fat["source"], "the pull route survives"
+    assert envelope["previous_task_id"] == "deep", "the chain cursor is minted"
 
     again = build_task_contract({"objective": "next-hop", "predecessor_authority": envelope})
     assert again["predecessor_authority"] == envelope, "envelope rebuild is a no-op"

@@ -817,13 +817,19 @@ def retire_project(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
     if not (custody.project_owned and custody.project_id):
         return
     try:
-        # Keyed on the REGISTRATION, not settlement: keying on ``not settled``
-        # made settled sharers invisible - nobody carried the retry lane.
-        sharers = sorted(
-            run.run_id
-            for run in replay(drive_root).values()
-            if run.project_id == custody.project_id and run.run_id and run.project_owned
-        )
+        # Sharers = EVERY run in the project, owned or not (only the creator
+        # carries project_owned, but the daemon refuses removal while ANY
+        # sibling lives). The retry lane is keyed on the REGISTRATION, not
+        # settlement: keying on ``not settled`` made settled sharers
+        # invisible - nobody carried the retry lane.
+        rows = [run for run in replay(drive_root).values()
+                if run.project_id == custody.project_id and run.run_id]
+        # The caller is mid-settlement (its own SETTLED emit follows this
+        # call), so its replayed row still reads unsettled - only OTHER
+        # unsettled sharers defer the attempt: the daemon would refuse.
+        if any(not run.settled and run.run_id != custody.run_id for run in rows):
+            return
+        sharers = sorted(run.run_id for run in rows if run.project_owned)
     except Exception:
         sharers = []
     if sharers and custody.run_id and custody.run_id != sharers[0]:
@@ -1232,16 +1238,19 @@ def owned_project_registrations(drive_root: Any) -> List[RunCustody]:
 
 def retire_settled_registrations(drive_root: Any, gateway: Any) -> None:
     """Retire projects every sharer has settled; a LIVE sharer defers the
-    attempt (the daemon would refuse anyway). Idempotent, fail-soft."""
-    registrations = owned_project_registrations(drive_root)
+    attempt (the daemon would refuse anyway). Sharers are ALL runs in the
+    project, owned or not - only the creator carries the registration, but
+    any live sibling makes the daemon refuse. Idempotent, fail-soft."""
     by_project: Dict[str, List[RunCustody]] = {}
-    for row in registrations:
-        by_project.setdefault(row.project_id, []).append(row)
+    for row in replay(drive_root).values():
+        if row.project_id and row.run_id:
+            by_project.setdefault(row.project_id, []).append(row)
     for rows in by_project.values():
-        if any(not row.settled for row in rows):
+        owned = [row for row in rows if row.project_owned]
+        if not owned or any(not row.settled for row in rows):
             continue
         try:
-            retire_project(drive_root, gateway, min(rows, key=lambda row: row.run_id))
+            retire_project(drive_root, gateway, min(owned, key=lambda row: row.run_id))
         except Exception:
             log.warning("Registration sweep failed for project %s",
                         rows[0].project_id, exc_info=True)
@@ -1333,10 +1342,19 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
     (P34R.2). The in-process twin ``release_task_runs`` never passes it — its memo is
     run-keyed and cannot name an unbound invocation — so that class is covered by the
     startup/periodic sweep, within its cadence. The registration pass at the end is
-    the third duty: settlement no longer discharges project ownership, so this is
-    where settled-but-owned registrations get their retry lane.
+    the third duty: settlement no longer discharges project ownership, and the
+    startup/periodic sweep surface is where settled-but-owned registrations get
+    their retry lane (the task-scoped surface can exit early with none open).
     """
-    registrations = owned_project_registrations(drive_root)
+    # Registration duty counts as real work only when a project is actually
+    # retire-ELIGIBLE (every sharer settled): a registration deferred behind a
+    # live sibling must not spin the owned daemon up on every sweep tick.
+    snapshot = replay(drive_root).values()
+    unsettled_projects = {row.project_id for row in snapshot
+                          if row.project_id and row.run_id and not row.settled}
+    registrations = [row for row in snapshot
+                     if row.project_owned and row.project_id
+                     and row.project_id not in unsettled_projects]
     if not runs and not pending and not registrations:
         return []
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
@@ -1364,7 +1382,9 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
             outcomes.append(_reconcile_one(drive_root, gateway, custody))
         for record in pending or []:
             outcomes.append(_recover_pending_invocation(drive_root, gateway, record))
-        if registrations:
+        # Recomputed inside: a run this very pass just settled may have made
+        # its project eligible, so the pre-pass gate is not the last word.
+        if registrations or runs:
             retire_settled_registrations(drive_root, gateway)
     finally:
         try:

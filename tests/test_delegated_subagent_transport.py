@@ -6121,13 +6121,11 @@ def test_subscription_window_exhausted_beacon_wakes_the_waiting_parent(tmp_path,
 
 
 def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_path):
-    """W3 adjacent (d): a project registration is shared by every run delegated
-    into it — while siblings are unsettled, only the LOWEST-run_id sharer keeps
-    attempting the removal (one honest, disclosed retry lane; the deterministic
-    tie-break means some sharer always attempts, so deferral cannot deadlock);
-    the rest defer QUIETLY: no doomed daemon call, no PROJECT_RETIRE_FAILED
-    spam (the submarine wave-2 retire loop). The daemon's refusal text rides
-    the failure row as `reason`."""
+    """W3 adjacent (d): a registration is shared by every run in the project.
+    While ANY sibling is unsettled every sharer defers QUIETLY (the daemon
+    would refuse: no doomed call, no PROJECT_RETIRE_FAILED spam); once all
+    settle, the LOWEST-run_id sharer carries the one honest retry lane, and
+    the daemon's refusal text rides the failure row as `reason`."""
     import json as _json
 
     import ouroboros.delegate_custody as dc
@@ -6157,7 +6155,14 @@ def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_
     assert "delegate_run_project_retire_failed" not in _event_types(tmp_path)
     assert custody_b.project_owned is True
 
-    # Canonical sharer (lowest run_id): attempts, and the refusal text is typed.
+    # The canonical sharer too defers while a sibling is unsettled.
+    custody_a = dc.replay(tmp_path)["run-aa"]
+    dc.retire_project(tmp_path, gateway, custody_a)
+    assert gateway.removals == []
+
+    # Sibling settles: canonical attempts; refusal text is typed.
+    dc.emit(tmp_path, dc.SETTLED, {"run_id": "run-bb", "task_id": "t-2", "route": "r"})
+    dc._CUSTODY.clear()
     custody_a = dc.replay(tmp_path)["run-aa"]
     dc.retire_project(tmp_path, gateway, custody_a)
     assert gateway.removals == ["prj-shared"]
