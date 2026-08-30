@@ -19,7 +19,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from ouroboros.contracts.chat_id_policy import A2A_CHAT_ID_MAX, A2A_CHAT_ID_MIN
+from ouroboros.contracts.chat_id_policy import A2A_CHAT_ID_MAX, A2A_CHAT_ID_MIN, is_a2a_chat_id
 from ouroboros.event_bus import get_global_event_bus
 from ouroboros.skill_loader import (
     find_skill,
@@ -309,6 +309,16 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
         bridge = ctx.bridge_getter()
         chat_id = int(payload.get("chat_id") or 0)
         wait_for_response = bool(payload.get("wait_for_response", False))
+        if wait_for_response and not is_a2a_chat_id(chat_id):
+            # A response subscription resolves on the FIRST non-progress frame
+            # in the chat. On a human/project chat that frame can be any
+            # concurrent task's answer — and, now that owner sends deliver
+            # live mid-task, any proactive frame. Only A2A-allocated chats
+            # (see /chat/allocate) have single-conversation semantics.
+            return _json_error(
+                "wait_for_response requires an A2A-allocated chat_id "
+                "(allocate one via /chat/allocate-internal)", 400,
+            )
         response_event: asyncio.Event = asyncio.Event()
         response_holder: dict[str, str] = {}
         if wait_for_response:

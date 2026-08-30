@@ -175,22 +175,27 @@ class TestLiveFinalAnswerDelivery:
         self, tmp_path, monkeypatch,
     ):
         """Regression (review CRITICAL, reproduced live): send_user_message
-        (tools/control.py) appends proactive send_message events into the SAME
-        pending_events buffer mid-task, and they carry no task_id. The live
-        shortcut used to ship the FIRST buffered send_message — the proactive
-        text left early under a degenerate 'final::<digest>' delivery_id while
-        the owner's FINAL answer stayed hostage to blocking post-task. The
-        final event is selected by the finalizing task's id."""
+        (tools/control.py) can fall back into the SAME pending_events buffer
+        mid-task. Since the live-first seam its deferred frames carry the
+        SAME task_id as the final (plus the proactive_message discriminator),
+        so the selector's contract is last-match: the host appends the FINAL
+        after all tool-time frames, and only that last row ships live. The
+        proactive text must never leave early under a degenerate
+        'final:<tid>:<digest>' delivery_id while the owner's answer stays
+        hostage to blocking post-task."""
         drive_root, logs = _make_drive(tmp_path)
         env, memory, ctx = _make_fake_env(drive_root)
 
         import ouroboros.agent_task_pipeline as atp
 
         event_queue = queue.Queue()
-        # Exact shape _send_user_message queues: same buffer, no task_id.
+        # Exact deferred shape _send_user_message buffers via the seam: same
+        # buffer, SAME task_id as the finalizing task, typed discriminator.
         proactive = {
             "type": "send_message", "chat_id": 1, "text": "Proactive mid-task ping",
-            "format": "markdown", "is_progress": False, "ts": "2026-08-10T00:00:00Z",
+            "format": "markdown", "is_progress": False,
+            "system_type": "proactive_message", "ts": "2026-08-10T00:00:00Z",
+            "task_id": "proact1", "parent_task_id": "", "root_task_id": "",
         }
         pending_events = [proactive]
         monkeypatch.setattr(atp, "_run_chat_consolidation", lambda *a, **kw: None)
@@ -208,16 +213,18 @@ class TestLiveFinalAnswerDelivery:
         assert live[0]["task_id"] == "proact1"
         # The delivery_id carries the real task id (never 'final::<digest>').
         assert live[0]["delivery_id"].startswith("final:proact1:")
-        # The proactive message stays buffered and untagged: it flows through
-        # the ordinary post-return drain and is never suppressed as the
-        # final's duplicate.
+        # The proactive frame stays buffered without a delivery_id: it flows
+        # through the ordinary post-return drain and is never suppressed as
+        # the final's duplicate. Both rows carry the task id now; only the
+        # FINAL — appended last by the host — is minted and shipped.
         assert "delivery_id" not in proactive
-        buffered_finals = [
+        tagged = [
             e for e in pending_events
             if e.get("type") == "send_message" and e.get("task_id") == "proact1"
         ]
-        assert len(buffered_finals) == 1
-        assert buffered_finals[0]["delivery_id"] == live[0]["delivery_id"]
+        assert len(tagged) == 2
+        assert tagged[0] is proactive
+        assert tagged[-1]["delivery_id"] == live[0]["delivery_id"]
 
     def test_live_delivery_falls_back_to_last_send_message(self):
         """Defensive fallback: with no task_id match in the buffer, the LAST

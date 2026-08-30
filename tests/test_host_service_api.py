@@ -736,11 +736,23 @@ def test_chat_inject_wait_for_response_unsubscribes(tmp_path: pathlib.Path) -> N
     response = client.post(
         "/chat/inject",
         headers={"X-Skill-Token": "token"},
-        json={"text": "hello", "chat_id": 1234, "wait_for_response": True, "timeout_sec": 5},
+        json={"text": "hello", "chat_id": -1234, "wait_for_response": True, "timeout_sec": 5},
     )
 
     assert response.status_code == 200
     assert response.json()["response"] == "reply from host"
+    assert bridge._subs == {}
+
+    # A wait on a human/project chat is refused: the subscription resolves on
+    # the FIRST non-progress frame, which on a shared chat can be any
+    # concurrent task's (or live proactive) frame, never reliably "the reply".
+    refused = client.post(
+        "/chat/inject",
+        headers={"X-Skill-Token": "token"},
+        json={"text": "hello", "chat_id": 1234, "wait_for_response": True, "timeout_sec": 5},
+    )
+    assert refused.status_code == 400
+    assert "A2A-allocated" in refused.json()["error"]
     assert bridge._subs == {}
 
 
