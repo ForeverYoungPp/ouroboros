@@ -298,7 +298,7 @@ def test_api_v1_declares_core_ws_message_types():
     """api_v1 must declare the core chat/media/status WS envelopes."""
     from ouroboros.contracts import api_v1
 
-    for name in ("ChatInbound", "ChatOutbound", "PhotoOutbound", "VideoOutbound", "DocumentOutbound", "LinkAction", "LinksOutbound", "TypingOutbound", "LogOutbound"):
+    for name in ("ChatInbound", "ChatOutbound", "PhotoOutbound", "VideoOutbound", "DocumentOutbound", "LinkAction", "LinksOutbound", "QuizOption", "QuizOutbound", "TypingOutbound", "LogOutbound"):
         assert hasattr(api_v1, name), f"api_v1 missing {name}"
 
 
@@ -418,6 +418,7 @@ _PHOTO_OUTBOUND_REQUIRED = frozenset({"type", "role", "image_base64", "mime", "t
 _VIDEO_OUTBOUND_REQUIRED = frozenset({"type", "role", "video_base64", "mime", "ts"})
 _DOCUMENT_OUTBOUND_REQUIRED = frozenset({"type", "role", "file_base64", "mime", "filename", "ts"})
 _LINKS_OUTBOUND_REQUIRED = frozenset({"type", "role", "actions", "ts"})
+_QUIZ_OUTBOUND_REQUIRED = frozenset({"type", "role", "quiz_id", "question", "options", "stake", "assumption", "state", "ts"})
 _TYPING_OUTBOUND_REQUIRED = frozenset({"type", "action"})
 _LOG_OUTBOUND_REQUIRED = frozenset({"type", "data"})
 
@@ -609,6 +610,21 @@ def test_links_outbound_matches_message_bus_sends():
         declared_keys=declared,
         required_keys=_LINKS_OUTBOUND_REQUIRED,
         envelope_name="LinksOutbound",
+    )
+
+
+def test_quiz_outbound_matches_message_bus_sends():
+    """QuizOutbound covers the structured frame emitted by the message bus."""
+    from ouroboros.gateway.contracts import QuizOutbound
+
+    declared = set(QuizOutbound.__annotations__)
+    assert _QUIZ_OUTBOUND_REQUIRED <= declared
+    _assert_envelope_parity(
+        REPO_ROOT / "supervisor" / "message_bus.py",
+        discriminator="quiz",
+        declared_keys=declared,
+        required_keys=_QUIZ_OUTBOUND_REQUIRED,
+        envelope_name="QuizOutbound",
     )
 
 

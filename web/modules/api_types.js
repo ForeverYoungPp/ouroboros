@@ -411,6 +411,29 @@
  */
 
 /**
+ * @typedef {Object} QuizOption
+ * @property {string} label
+ * @property {string=} detail
+ */
+
+/**
+ * @typedef {Object} QuizOutbound
+ * @property {"quiz"} type
+ * @property {"assistant"} role
+ * @property {string} quiz_id
+ * @property {string} question
+ * @property {QuizOption[]} options
+ * @property {string} stake
+ * @property {string} assumption
+ * @property {string} state
+ * @property {string} ts
+ * @property {number=} chat_id
+ * @property {string=} task_id
+ * @property {boolean=} project_thread
+ * @property {Object=} transport
+ */
+
+/**
  * @typedef {Object} DocumentOutbound
  * @property {"document"} type
  * @property {"user"|"assistant"} role
@@ -1121,4 +1144,5 @@
  */
 
 export const MAX_LINK_ACTIONS = 12;
+export const MAX_QUIZ_OPTIONS = 6;
 export const GATEWAY_CONTRACT_VERSION = '6.113.4';

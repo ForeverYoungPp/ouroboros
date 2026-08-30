@@ -5,9 +5,9 @@ import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { createSystemMessageAction } from './ui_helpers.js';
 import { createChatMedia } from './chat_media.js';
+import { createChatDecision } from './chat_decision.js';
 import { clientSurfaceField } from './client_surface.js';
 import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
-import { MAX_LINK_ACTIONS } from './api_types.js';
 import {
     OWNER_STOP_DETAIL_MARKER,
     getLogTaskGroupId,
@@ -290,6 +290,13 @@ export function createChatInstance({
         insertMessageNode,
         senderLabel,
         stampNodeTimestamp,
+    });
+    const chatDecision = createChatDecision({
+        apiFetch,
+        frameNode: (msg, node) => chatMedia.bubbleFrameNode(msg, node),
+        renderMarkdown: renderChatMarkdown,
+        enhanceMarkdown: enhanceChatMarkdown,
+        showToast,
     });
 
     async function loadUiPreferences() {
@@ -3148,9 +3155,10 @@ export function createChatInstance({
                     // message — render it BEFORE the taskId/finishLiveCard block so
                     // a mid-task delivery replayed while its task is still
                     // running does not falsely finalize that task's live card.
-                    if (msg.msg_type === 'document' || msg.msg_type === 'photo' || msg.msg_type === 'video' || msg.msg_type === 'links') {
+                    if (msg.msg_type === 'document' || msg.msg_type === 'photo' || msg.msg_type === 'video' || msg.msg_type === 'links' || msg.msg_type === 'quiz') {
                         if (msg.msg_type === 'document') appendDocumentBubble(msg);
                         else if (msg.msg_type === 'links') appendLinksMessage(msg);
+                        else if (msg.msg_type === 'quiz') appendQuizMessage(msg);
                         else appendMediaBubble(msg);
                         continue;
                     }
@@ -4355,64 +4363,19 @@ export function createChatInstance({
         }
     });
 
-    const buildMediaBubble = (msg) => chatMedia.buildMediaBubble(msg);
-
-    function appendMediaBubble(msg) {
-        const key = chatMediaMessageKey(msg);
-        if (key && seenMessageKeys.has(key)) return false;
-        const bubble = buildMediaBubble(msg);
-        if (!bubble) return false;
-        rememberMessageKey(key);
-        if ((msg.msg_type || msg.type) === 'photo') chatMedia.buildGallery('photos', msg, bubble);
-        else insertMessageNode(bubble);
-        return true;
-    }
-
-    for (const type of ['photo', 'video']) onWs(type, (msg) => {
-        if (!isMyThread(msg)) return;
-        // Media frames carry no activity identity: hide the dots row but leave
-        // the authoritative active set intact; sync derives the header from it.
-        hideTypingIndicatorOnly();
-        syncChatStatus();
-        if (appendMediaBubble(msg)) incrementUnreadIfNeeded(msg);
-    });
-
-    const buildDocumentBubble = (msg) => chatMedia.buildDocumentBubble(msg);
-
-    function appendDocumentBubble(msg) {
-        const key = documentMessageKey(msg);
-        if (key && seenMessageKeys.has(key)) return false;
-        const bubble = buildDocumentBubble(msg);
-        if (!bubble) return false;
-        rememberMessageKey(key);
-        chatMedia.buildGallery('files', msg, bubble);
-        return true;
-    }
-
-    onWs('document', (msg) => {
-        if (!isMyThread(msg)) return;
-        hideTypingIndicatorOnly();
-        syncChatStatus();
-        if (appendDocumentBubble(msg)) incrementUnreadIfNeeded(msg);
-    });
-
-    function appendLinksMessage(msg) {
-        const actions = Array.isArray(msg.actions) ? msg.actions.slice(0, MAX_LINK_ACTIONS) : [];
-        const key = `links:${msg.task_id || ''}:${msg.ts || ''}:${JSON.stringify(actions)}:${msg.title || ''}`;
-        if (seenMessageKeys.has(key)) return false;
-        const bubble = chatMedia.buildLinksMessage(msg);
-        if (!bubble) return false;
-        rememberMessageKey(key);
-        insertMessageNode(bubble);
-        return true;
-    }
-
-    onWs('links', (msg) => {
-        if (!isMyThread(msg)) return;
-        hideTypingIndicatorOnly();
-        syncChatStatus();
-        if (appendLinksMessage(msg)) incrementUnreadIfNeeded(msg);
-    });
+    const { appendMediaBubble, appendDocumentBubble, appendLinksMessage, appendQuizMessage } =
+        chatMedia.wireDeliveries({
+            onWs,
+            isMyThread,
+            hideTypingIndicatorOnly,
+            syncChatStatus,
+            incrementUnreadIfNeeded,
+            seenMessageKeys,
+            rememberMessageKey,
+            chatMediaMessageKey,
+            documentMessageKey,
+            buildQuizCard: (msg) => chatDecision.buildQuizCard(msg),
+        });
 
     let wsHasConnectedOnce = false;
 
