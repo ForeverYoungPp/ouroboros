@@ -95,9 +95,10 @@ def task_result_authority_projection(
     else:
         from ouroboros.contracts.task_contract import build_task_contract
 
-        if contract not in (None, ""):
+        if contract not in (None, "") and "task_contract_malformed" not in authority:
             # The malformed original is still a terminal fact: it rides (the
-            # envelope bounds it), never silently replaced by the rebuild.
+            # envelope bounds it), never silently replaced by the rebuild -
+            # and never clobbering a row's own field of this name.
             authority["task_contract_malformed"] = copy.deepcopy(contract)
         authority["task_contract"] = build_task_contract(row)
     receipts = _authority_verification_receipts(row, drive_root)

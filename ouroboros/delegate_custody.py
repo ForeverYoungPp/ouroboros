@@ -806,11 +806,11 @@ def retire_project(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
         # Sharers = EVERY run in the project (only the creator carries
         # project_owned, but the daemon refuses removal while ANY sibling
         # lives); the caller is mid-settlement, so only OTHERS defer.
-        # Removal is an AUTHORITY decision: it needs the COMPLETE view (the
-        # lenient reader can hide a sibling) with the caller's own row in it.
+        # Removal is an AUTHORITY decision: complete view, caller row in it.
         from ouroboros.delegate_custody_usage import complete_custody_rows
 
-        rows_raw = complete_custody_rows(event_log_path(drive_root), _ROW_MARKER)
+        rows_raw = complete_custody_rows(
+            event_log_path(drive_root), _ROW_MARKER, started_type=STARTED)
         if rows_raw is None:
             log.warning("Retirement deferred: custody log view incomplete")
             return

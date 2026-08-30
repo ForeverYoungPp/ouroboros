@@ -43,25 +43,33 @@ def is_terminal(detail: Dict[str, Any], terminal_states: frozenset[str]) -> bool
     return str(summary_of(detail).get("state") or "") in terminal_states
 
 
-def complete_custody_rows(path, marker: str):
+def complete_custody_rows(path, marker: str, *, started_type: str = ""):
     """Every custody row, or ``None`` when the log's view is INCOMPLETE.
 
     The lenient reader skips unreadable lines to keep liveness surfaces
     working; an authority decision (removing a shared project) must instead
-    fail closed: a marker-bearing line that cannot parse means a sibling's
-    state may be invisible, so no complete view exists."""
+    fail closed: a marker-bearing line that cannot decode as strict UTF-8 or
+    parse as a row, or a STARTED row missing its run identity, means a
+    sibling's state may be invisible - no complete view exists. Streamed
+    line-by-line (event logs grow to hundreds of MB)."""
     import json
 
     rows = []
     try:
-        for raw in path.read_bytes().splitlines():
-            if marker.encode("ascii") not in raw:
-                continue
-            try:
-                row = json.loads(raw.decode("utf-8", errors="replace"))
-            except ValueError:
-                return None
-            if isinstance(row, dict) and str(row.get("type") or "").startswith(marker):
+        with path.open("rb") as handle:
+            for raw in handle:
+                if marker.encode("ascii") not in raw:
+                    continue
+                try:
+                    row = json.loads(raw.decode("utf-8", errors="strict"))
+                except (ValueError, UnicodeDecodeError):
+                    return None
+                if not isinstance(row, dict):
+                    return None
+                if not str(row.get("type") or "").startswith(marker):
+                    continue  # a valid row of another event family
+                if started_type and row.get("type") == started_type and not str(row.get("run_id") or ""):
+                    return None
                 rows.append(row)
     except FileNotFoundError:
         return rows
