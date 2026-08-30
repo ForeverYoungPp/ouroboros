@@ -75,28 +75,44 @@ _ALWAYS_FORWARDED_ENV = frozenset({
 _FORBIDDEN_ENV_FORWARD_KEYS = FORBIDDEN_SKILL_SETTINGS
 
 
-def _resolve_runtime_binary(runtime: str) -> Optional[str]:
+def _resolve_runtime_binary(runtime: str) -> Tuple[Optional[str], str]:
+    """Resolve a skill runtime binary: ``(path, "")`` or ``(None, reason)``.
+
+    The reason (when known) carries the node health verdicts verbatim so the
+    surface error can say WHY nothing was usable, not just that it was not.
+    """
     import sys
     if runtime == "node":
-        # Prefer the bundled, signed node over a PATH (Homebrew) node that macOS
-        # code-signing enforcement may SIGKILL inside the packaged app.
+        # Skill-family node precedence is owned by
+        # platform_layer.select_skill_node_runtime: bundled-first (the signed
+        # runtime macOS code-signing enforcement cannot SIGKILL inside the
+        # packaged app), with a health ROLLBACK to a working PATH node when the
+        # bundled one is absent or execution-probed broken. A provably dead
+        # candidate is never selected while a usable neighbour exists.
         try:
-            from ouroboros.platform_layer import resolve_bundled_node
-            bundled = resolve_bundled_node()
-            if bundled:
-                return bundled
-        except Exception:
-            log.debug("resolve_bundled_node failed", exc_info=True)
+            from ouroboros.platform_layer import select_skill_node_runtime
+            selected, info = select_skill_node_runtime()
+            if selected:
+                return selected, ""
+            return None, info
+        except Exception as exc:
+            # An unexpected selector failure must not be invisible: the PATH
+            # scan below still runs, but the operator sees WHY the skill-family
+            # precedence was skipped (T16).
+            log.warning(
+                "select_skill_node_runtime failed (%s: %s); falling back to a plain PATH scan",
+                type(exc).__name__, exc, exc_info=True,
+            )
     candidates = _ALLOWED_RUNTIMES.get(runtime or "", ())
     for candidate in candidates:
         resolved = shutil.which(candidate)
         if resolved:
-            return resolved
+            return resolved, ""
     if runtime in ("python", "python3") and sys.executable:
         resolved = pathlib.Path(sys.executable)
         if resolved.is_file():
-            return str(resolved)
-    return None
+            return str(resolved), ""
+    return None, ""
 
 
 def _scrub_env(
@@ -679,21 +695,20 @@ def _handle_skill_exec(
         return deps_block
 
     runtime = (loaded.manifest.runtime or "").strip().lower()
-    runtime_binary = _resolve_runtime_binary(runtime)
+    runtime_binary, runtime_unavailable_reason = _resolve_runtime_binary(runtime)
     try:
         from ouroboros.marketplace.isolated_deps import python_runtime_binary
-
         if runtime in {"python", "python3"}:
-            isolated_python = python_runtime_binary(loaded.skill_dir)
-            if isolated_python is not None:
-                runtime_binary = str(isolated_python)
+            isolated = python_runtime_binary(loaded.skill_dir)
+            runtime_binary = str(isolated) if isolated is not None else runtime_binary
     except Exception:
         log.debug("Could not resolve isolated Python runtime", exc_info=True)
     if runtime_binary is None:
         return (
             f"⚠️ SKILL_EXEC_ERROR: skill {skill_name!r} declared runtime "
             f"{runtime!r} is not in the allowlist {sorted(set(_ALLOWED_RUNTIMES))} "
-            "or the matching binary is not on PATH."
+            f"or the matching binary is not on PATH."
+            + (f" ({runtime_unavailable_reason})" if runtime_unavailable_reason else "")
         )
 
     def _canonical_declared_path(declared_name: str) -> Optional[pathlib.Path]:

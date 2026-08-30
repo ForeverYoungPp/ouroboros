@@ -278,7 +278,7 @@ def _normalize_resolved_python_subject(raw_cmd: Any, python_resolution: Any) -> 
     literal ``python`` token for the existing module allowlist decision.
     """
 
-    from ouroboros.python_interpreter import PythonResolutionTrace
+    from ouroboros.process_interpreters import PythonResolutionTrace
 
     if not isinstance(python_resolution, PythonResolutionTrace) or not python_resolution.verified:
         return ""

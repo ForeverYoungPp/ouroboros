@@ -2280,6 +2280,24 @@ Before every commit, verify the following:
   Guard and handler must receive identical argv. Do not rewrite explicit paths,
   versioned interpreters, shell bodies, or remote execution, and never install a
   dependency in response to `ModuleNotFoundError`.
+- Resolve bare Node (`node`/`nodejs`; Windows launcher suffixes normalize for
+  matching) for the same four surfaces, but once AFTER the dispatch gates: the
+  node health check is an execution probe of an argv[0]-steered candidate, and
+  pre-guard it would run a planted `PATH` shim before the fences refuse the
+  call. The ladder is PATH-first with the probe — a healthy `PATH` node is a
+  byte-identical no-op in argv and child env — and the bundled runtime
+  substitutes only when the `PATH` candidate is missing or probe-dead: rewrite
+  only `node`/`nodejs` argv[0]; npm/npx/pnpm/yarn/corepack and `sh`/`bash`
+  bodies naming a family token get only the attested child-env `PATH` prepend
+  (a formula with a rewritten absolute shebang is a disclosed residual). Guards
+  inspect the original argv; the substitution stays in the same interpreter
+  family and reaches the handler through the per-call attestation, which
+  `verify_and_record` uses to execute the resolved argv while `check` keeps the
+  original receipt-identity text. A non-local executor backend is never touched
+  (no host path leaks into a container; a local executor continues the ladder),
+  explicit paths and versioned names are never rewritten, and node never
+  pre-blocks: with no usable runtime the argv runs as written and fails
+  honestly with the probe facts disclosed.
 - Skill Review ordinals and provenance stay in `review_job.json` and the
   append-only `review_history.jsonl`: allocate under the lifecycle lock, consume
   a round only after actual start, write one terminal row per `job_id`, and

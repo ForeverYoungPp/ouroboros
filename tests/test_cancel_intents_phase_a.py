@@ -1782,6 +1782,89 @@ def _reap_spawned_live_procs():
             pass
 
 
+@pytest.mark.serial
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the os.kill(pid, 0) liveness probe is not non-mutating on Windows "
+    "(TerminateProcess); the outcomes-level pin still covers the contract there",
+)
+def test_e2e_cancel_of_inflight_run_command_child_never_reads_as_tool_failure(
+    qenv, monkeypatch, tmp_path,
+):
+    """T7 / Q2-2=A EXECUTED-path pin (triad round 1, G-B2): custody cancels a
+    worker whose REAL in-flight run_command child (a live grandchild process)
+    dies WITH the worker via kill_pid_tree, and the stored verdict's execution
+    axis is ``cancelled`` — never a red ``tool_failure`` derived from the -9
+    the child would have rendered. This executes the claim the outcomes-level
+    pin (tests/test_observability_outcomes_v2.py) previously argued from code
+    reading; while it stays green, the narrow active-cancel-intent classifier
+    filter of Q2-2=A remains deliberately unimplemented.
+    """
+    import os
+    import time
+
+    from ouroboros.outcomes import normalize_outcome_axes
+
+    task_id = "e2e-cancel-tree"
+    pid_file = tmp_path / "child.pid"
+    # A worker double whose REAL process spawns a REAL long-lived grandchild
+    # (the in-flight run_command stand-in) and parks — a two-level tree.
+    tree = _LiveProc.__new__(_LiveProc)
+    tree._proc = subprocess.Popen([
+        sys.executable, "-c",
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        "open(sys.argv[1], 'w').write(str(child.pid))\n"
+        "time.sleep(120)",
+        str(pid_file),
+    ])
+    tree.pid = tree._proc.pid
+    _LiveProc._SPAWNED.append(tree._proc)
+    deadline = time.time() + 10
+    while not pid_file.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    child_pid = int(pid_file.read_text())
+
+    worker = types.SimpleNamespace(wid=0, proc=tree, busy_task_id=task_id, reaping=False)
+    qenv.workers.WORKERS[0] = worker
+    qenv.q.RUNNING[task_id] = {"task": {"id": task_id, "chat_id": 1}, "worker_id": 0}
+    write_task_result(qenv.drive, task_id, STATUS_RUNNING, result="working")
+    monkeypatch.setattr(
+        qenv.q, "_emit_cancel_task_done",
+        lambda *a, **kw: None,
+    )
+    ci.request_cancel(qenv.drive, task_id, reason="operator stop")
+
+    try:
+        outcome = qenv.tl.cancel_task_custody(task_id)
+
+        assert outcome == qenv.tl.CANCEL_CANCELLED
+        assert not tree.is_alive(), "custody must kill the live worker"
+        child_deadline = time.time() + 5
+        child_alive = True
+        while time.time() < child_deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                child_alive = False
+                break
+            time.sleep(0.1)
+        assert not child_alive, "the in-flight run_command child must die with the worker"
+
+        stored = load_task_result(qenv.drive, task_id)
+        assert stored["status"] == STATUS_CANCELLED
+        axes = normalize_outcome_axes(stored)
+        assert axes["execution"]["status"] == "cancelled"
+        assert "tool_failure" not in json.dumps(stored)
+        assert ci.active_intent(qenv.drive, task_id) is None
+    finally:
+        for pid in (child_pid, tree.pid):
+            try:
+                os.kill(pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
 def _seed_llm_response(drive: pathlib.Path, task_id: str, text: str) -> None:
     from ouroboros import observability
 

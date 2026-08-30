@@ -10,7 +10,7 @@ import pytest
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 from ouroboros.outcomes import verification_receipts_path
 from ouroboros.protected_artifacts import shell_block_reason
-from ouroboros.python_interpreter import resolve_process_python
+from ouroboros.process_interpreters import resolve_process_python
 from ouroboros.tool_access import (
     _side_effect_free_process_roots,
     build_resolved_resource_binding,

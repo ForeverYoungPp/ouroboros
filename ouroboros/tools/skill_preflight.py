@@ -54,20 +54,26 @@ _VALIDATORS: Dict[str, Tuple[List[str], str]] = {
 }
 
 
-def _resolve_runtime(runtime: str) -> Optional[str]:
+def _resolve_runtime(runtime: str) -> Tuple[Optional[str], str]:
+    """Resolve a validator runtime: ``(path, "")`` or ``(None, reason)``."""
     if runtime == "python3":
-        return shutil.which("python3") or shutil.which("python")
+        return (shutil.which("python3") or shutil.which("python")), ""
     if runtime == "node":
-        # Prefer the bundled, signed node over a PATH (Homebrew) node that macOS
-        # code-signing enforcement may SIGKILL inside the packaged app.
+        # Skill-family node precedence is owned by
+        # platform_layer.select_skill_node_runtime: bundled-first (the signed
+        # runtime macOS code-signing enforcement cannot SIGKILL inside the
+        # packaged app), with a health ROLLBACK to a working PATH node when the
+        # bundled one is absent or execution-probed broken. A provably dead
+        # candidate is never selected while a usable neighbour exists.
         try:
-            from ouroboros.platform_layer import resolve_bundled_node
-            bundled = resolve_bundled_node()
-            if bundled:
-                return bundled
+            from ouroboros.platform_layer import select_skill_node_runtime
+            selected, info = select_skill_node_runtime()
+            if selected:
+                return selected, ""
+            return None, info
         except Exception:
-            log.debug("resolve_bundled_node failed", exc_info=True)
-    return shutil.which(runtime)
+            log.debug("select_skill_node_runtime failed", exc_info=True)
+    return shutil.which(runtime), ""
 
 
 def _run_check(cmd: List[str], cwd: pathlib.Path) -> Dict[str, Any]:
@@ -688,19 +694,23 @@ def _handle_skill_preflight(
         if validator is None:
             continue
         argv_template, runtime = validator
-        runtime_path = _resolve_runtime(runtime)
+        runtime_path, runtime_reason = _resolve_runtime(runtime)
         rel_path = str(path.relative_to(skill_dir))
         if runtime_path is None:
-            # Missing external runtime is an environment gap, not a syntax
-            # verdict. Skip it (do not block); tri-model review still reads the
-            # file in full.
+            # Missing/unusable external runtime is an environment gap, not a
+            # syntax verdict. Skip it (do not block) and disclose the health
+            # reason; tri-model review still reads the file in full.
+            reason_note = f" ({runtime_reason})" if runtime_reason else ""
             file_findings.append({
                 "path": rel_path,
                 "runtime": runtime,
                 "ok": True,
                 "skipped": True,
                 "skip_reason": "runtime_unavailable",
-                "detail": f"{runtime} not on PATH — syntax not verified; relying on tri-model review",
+                "detail": (
+                    f"{runtime} not usable{reason_note} — syntax not verified; "
+                    "relying on tri-model review"
+                ),
             })
             continue
         cmd = [runtime_path] + [str(path) if part == "{path}" else part for part in argv_template[1:]]

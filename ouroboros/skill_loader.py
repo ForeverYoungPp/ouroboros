@@ -137,7 +137,7 @@ class LoadedSkill:
         from ouroboros.tools.skill_exec import _resolve_runtime_binary, _resolve_script_path
 
         runtime = (self.manifest.runtime or "").strip().lower()
-        if _resolve_runtime_binary(runtime) is None:
+        if _resolve_runtime_binary(runtime)[0] is None:
             return False
         for entry in self.manifest.scripts or []:
             if not isinstance(entry, dict):
