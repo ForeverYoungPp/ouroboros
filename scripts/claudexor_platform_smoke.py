@@ -252,6 +252,10 @@ def build_request(lane: str, harness: str, model: str, effort: str,
         "maxSeconds": int(max_seconds),
     }
     if lane == "live":
+        # Production binds a fresh delegated mutating run to the caller-owned
+        # execution tree. The smoke owns ``root`` too, so exercise that same
+        # admission contract instead of relying on the project scope as a shim.
+        request["execution"]["workspaceRoot"] = str(root)
         # Production sends "subscription". CI cannot authenticate one, so it asks
         # for the substrate it actually has. This is THE difference between what
         # this gate exercises and what production does.
