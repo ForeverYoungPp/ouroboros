@@ -19,7 +19,7 @@ from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
 from ouroboros.review_cycles import REASON_REVIEW_CYCLES_EXHAUSTED
 from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, REASON_OWNER_REQUESTED_FINALIZATION, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
-from ouroboros.observability import new_execution_id
+from ouroboros.observability import new_execution_id, strip_protocol_fence
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context import build_user_content
@@ -4179,6 +4179,44 @@ def _parse_delivery_control_object(
     return payload, False
 
 
+def _parse_delivery_control_body(
+    raw: str,
+) -> tuple[Optional[Dict[str, Any]], bool, bool]:
+    """Normalize a response body and locate its delivery-control object.
+
+    Returns ``(parsed, duplicate_protocol_key, embedded)``. Normalization
+    strips one whole-body markdown fence (shared with
+    ``observability._is_delivery_control_payload``). ``embedded`` is True only
+    when the protocol object sits as a balanced trailing JSON object carrying
+    the ``delivery_control`` key at the very END of surrounding prose — a
+    protocol attempt mixed with text, never a valid control. A control object
+    quoted MID-prose is NOT matched and stays prose: Ouroboros legitimately
+    quotes the literal in its own PR bodies and docs (disclosed residual).
+    """
+
+    body = strip_protocol_fence(raw)
+    parsed, duplicate_protocol_key = _parse_delivery_control_object(body)
+    if duplicate_protocol_key or isinstance(parsed, dict):
+        return parsed, duplicate_protocol_key, False
+    tail = body.rstrip()
+    if not tail.endswith("}"):
+        return None, False, False
+    start = tail.rfind("{")
+    while start > 0:
+        fragment = tail[start:]
+        parsed, duplicate_protocol_key = _parse_delivery_control_object(fragment)
+        if duplicate_protocol_key or (
+            isinstance(parsed, dict) and "delivery_control" in parsed
+        ):
+            return parsed, duplicate_protocol_key, True
+        if isinstance(parsed, dict):
+            # The trailing object is ordinary JSON content (no protocol key
+            # at its top level): the whole body stays prose.
+            return None, False, False
+        start = tail.rfind("{", 0, start)
+    return None, False, False
+
+
 def _resolve_delivery_control(
     content: Any,
     tools: ToolRegistry,
@@ -4192,10 +4230,11 @@ def _resolve_delivery_control(
     if not isinstance(candidate, DeliveryCandidate):
         return "fresh", _extract_plain_text_from_content(content)
     raw = _extract_plain_text_from_content(content).strip()
-    parsed, duplicate_protocol_key = _parse_delivery_control_object(raw)
+    parsed, duplicate_protocol_key, embedded_protocol = _parse_delivery_control_body(raw)
     # ANY parsed object carrying the protocol key is control intent,
-    # regardless of verb/value — an unknown verb is a mangled protocol
-    # attempt, never prose (raw JSON leaked to chat); validity judged below.
+    # regardless of verb/value or trailing-object placement — an unknown verb
+    # or a prose-embedded object is a mangled protocol attempt, never prose
+    # (raw JSON leaked to chat); validity judged below.
     is_control_intent = duplicate_protocol_key or (
         isinstance(parsed, dict) and "delivery_control" in parsed
     )
@@ -4237,7 +4276,13 @@ def _resolve_delivery_control(
     selected = str(parsed.get("delivery_control") or "") if isinstance(parsed, dict) else ""
     valid = False
     replacement = ""
-    if selected == "keep" and set(parsed) == {"delivery_control"}:
+    if embedded_protocol:
+        # A protocol object embedded at the end of prose is a protocol
+        # ATTEMPT, never a valid control: honoring it would either leak the
+        # raw object or silently drop the prose half of a contradictory
+        # answer. The default error text already states the exact-object rule.
+        pass
+    elif selected == "keep" and set(parsed) == {"delivery_control"}:
         valid = _delivery_keep_allowed(
             candidate, evidence_revision, evidence_fingerprint,
         )
@@ -5296,27 +5341,32 @@ def _resolve_forced_delivery_control(
     if not armed:
         return extracted, ""
     tools_ctx._delivery_control_required = False
-    parsed, duplicate_protocol_key = _parse_delivery_control_object(extracted)
+    parsed, duplicate_protocol_key, embedded_protocol = _parse_delivery_control_body(extracted)
     # Protocol intent: any parsed object with the protocol key (unknown verb =
-    # broken control, never prose), or JSON-looking text that fails to parse (a
-    # mangled protocol attempt under the armed latch — the candidate is the answer).
+    # broken control, never prose; a trailing prose-embedded object counts),
+    # or JSON-looking text — after the shared fence-strip — that fails to
+    # parse (a mangled protocol attempt under the armed latch — the candidate
+    # is the answer).
     protocol_intent = duplicate_protocol_key or (
         ("delivery_control" in parsed)
         if isinstance(parsed, dict)
-        else extracted.lstrip().startswith("{")
+        else strip_protocol_fence(extracted).startswith("{")
     )
     if not protocol_intent:
-        # An ordinary prose answer under an armed latch: the fresh text stands.
+        # An ordinary prose answer under an armed latch: the fresh text stands
+        # (a control object quoted MID-prose is the disclosed residual).
         return extracted, ""
-    selected = str(parsed.get("delivery_control") or "") if isinstance(parsed, dict) else ""
-    if selected == "replace" and set(parsed) == {"delivery_control", "full_answer"}:
-        replacement = parsed.get("full_answer")
-        if isinstance(replacement, str) and replacement.strip():
-            return replacement, ""
-    elif selected == "keep" and set(parsed) == {"delivery_control"} and candidate is not None:
-        return candidate.full_text, ""
-    # Malformed/duplicate/invalid control: preserve the retained candidate (or,
-    # with none retained, let the caller's fallback text stand) and say so.
+    if not embedded_protocol:
+        selected = str(parsed.get("delivery_control") or "") if isinstance(parsed, dict) else ""
+        if selected == "replace" and set(parsed) == {"delivery_control", "full_answer"}:
+            replacement = parsed.get("full_answer")
+            if isinstance(replacement, str) and replacement.strip():
+                return replacement, ""
+        elif selected == "keep" and set(parsed) == {"delivery_control"} and candidate is not None:
+            return candidate.full_text, ""
+    # Malformed/duplicate/prose-embedded/invalid control: preserve the retained
+    # candidate (or, with none retained, let the caller's fallback text stand)
+    # and say so.
     return (
         candidate.full_text if candidate is not None else "",
         REASON_DELIVERY_CONTROL_DEGRADED,
