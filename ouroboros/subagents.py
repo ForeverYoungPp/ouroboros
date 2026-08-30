@@ -571,10 +571,30 @@ def _exhausted_window(gateway: Any, route_id: str, route_model: str = "",
             return False
         return not pinned or str(subject.get("subject_id") or "") == pinned
 
+    quota_state = getattr(gateway, "quota_state", None)
+    if callable(quota_state):
+        envelope = quota_state()
+        snapshots = envelope.get("snapshots") if isinstance(envelope, dict) else []
+        absences = envelope.get("absences") if isinstance(envelope, dict) else []
+    else:
+        # Compatibility for older gateway doubles/embedders. Production
+        # ClaudexorGateway owns quota_state and therefore performs one GET.
+        snapshots = gateway.quota_snapshots()
+        absence_reader = getattr(gateway, "quota_absences", None)
+        absences = absence_reader() if callable(absence_reader) else []
+
+    # The current daemon schema guarantees arrays, but route health also supports
+    # older embedders and test doubles. A malformed mandatory snapshot collection
+    # is unknown (fail-open); malformed optional absences add no evidence.
+    snapshots = snapshots if isinstance(snapshots, list) else []
+    absences = absences if isinstance(absences, list) else []
+
     resets: List[str] = []
     any_live = False
     any_spent = False
-    for snapshot in gateway.quota_snapshots():
+    for snapshot in snapshots or []:
+        if not isinstance(snapshot, dict):
+            continue
         subject = snapshot.get("subject") if isinstance(snapshot.get("subject"), dict) else {}
         if not _subject_matches(subject):
             continue
@@ -596,12 +616,16 @@ def _exhausted_window(gateway: Any, route_id: str, route_model: str = "",
             any_live = True
     if any_live or not any_spent:
         return False, ""
-    absences = getattr(gateway, "quota_absences", None)
-    if callable(absences):
-        for row in absences() or []:
-            subject = row.get("subject") if isinstance(row, dict) else None
-            if isinstance(subject, dict) and _subject_matches(subject):
-                return False, ""
+    for row in absences or []:
+        subject = row.get("subject") if isinstance(row, dict) else None
+        if not isinstance(subject, dict) or not _subject_matches(subject):
+            continue
+        # Any explicit gap keeps a spent-looking route fail-open. The shipped
+        # producer already removes absences covered by a snapshot for the same
+        # quota subject; retaining the conservative check here also keeps old
+        # gateway doubles and malformed future envelopes from authorizing a
+        # fallback on contradictory evidence.
+        return False, ""
     return True, min(resets) if resets else ""
 
 

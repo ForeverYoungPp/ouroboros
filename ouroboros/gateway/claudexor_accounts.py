@@ -261,6 +261,7 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
         "harnesses": [],
         "profiles": {},
         "quota": [],
+        "quota_absences": [],
         # PROVENANCE, per independent facet (BIBLE P1: missing data is a GAP,
         # never a value). `[]`/`{}` alone cannot say WHETHER the daemon was
         # asked: the owner's panel printed "no account connected" for three
@@ -299,6 +300,15 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
         with ClaudexorGateway(endpoint) as gateway:
             gateway.handshake()
             payload["daemon"]["engine_version"] = gateway.engine_version
+
+            def _quota_state() -> Dict[str, Any]:
+                reader = getattr(gateway, "quota_state", None)
+                if callable(reader):
+                    return reader()
+                # Compatibility for old embedded gateway doubles. The shipped
+                # gateway has quota_state, so the live status path always uses
+                # one physical GET and one evidence epoch.
+                return {"snapshots": gateway.quota_snapshots(), "absences": []}
             # The catalog, manifest, profile and quota reads are INDEPENDENT GETs
             # over one thread-safe httpx client, and each costs SECONDS daemon-side
             # (it probes the real coding-agent CLIs on every read: binary, version,
@@ -312,7 +322,7 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                 catalog_call = pool.submit(gateway.agent_capabilities)
                 manifests_call = pool.submit(gateway.harnesses)
                 profiles_call = pool.submit(gateway.credential_profiles)
-                quota_call = pool.submit(gateway.quota_snapshots)
+                quota_call = pool.submit(_quota_state)
                 # Deferred lookup on purpose: the failure of THIS read (or a
                 # transport double that lacks the method) must land inside the
                 # future, where the absorbed fail-closed handling below owns it.
@@ -325,7 +335,11 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
             catalog_outcome = _facet_outcome(catalog_call, envelope=("harnesses",))
             profiles_outcome = _facet_outcome(
                 profiles_call, envelope=("profiles", "harnessAccounts"))
-            quota_outcome = _facet_outcome(quota_call)
+            quota_outcome = _facet_outcome(
+                quota_call,
+                envelope=("snapshots",),
+                list_fields=("snapshots",),
+            )
             payload["reads"] = {
                 "catalog": catalog_outcome[0],
                 "accounts": profiles_outcome[0],
@@ -413,7 +427,17 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                     and str(w["profile"].get("harness_id") or "") in (capable | vouched)
                 ]
             payload["profiles"] = profiles
-            payload["quota"] = quota_outcome[1] if quota_outcome[0] == READ_OK else []
+            quota = quota_outcome[1] if quota_outcome[0] == READ_OK else {}
+            raw_snapshots = quota.get("snapshots") if isinstance(quota, dict) else None
+            raw_absences = quota.get("absences") if isinstance(quota, dict) else None
+            payload["quota"] = [
+                row for row in (raw_snapshots if isinstance(raw_snapshots, list) else [])
+                if isinstance(row, dict)
+            ]
+            payload["quota_absences"] = [
+                row for row in (raw_absences if isinstance(raw_absences, list) else [])
+                if isinstance(row, dict)
+            ]
             if first_error is not None:
                 # At least one facet refused while others landed. The daemon is
                 # disclosed as unreachable AND the surviving facets keep their
@@ -429,7 +453,9 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
     return payload
 
 
-def _facet_outcome(call: "Future", *, envelope: tuple = ()) -> tuple:
+def _facet_outcome(
+    call: "Future", *, envelope: tuple = (), list_fields: tuple = (),
+) -> tuple:
     """Classify ONE fanned-out read: (state, value, error).
 
     Independent by construction — a sibling's exception can never downgrade a
@@ -450,9 +476,9 @@ def _facet_outcome(call: "Future", *, envelope: tuple = ()) -> tuple:
     transport and arrives intact. Either would otherwise be published as an
     AUTHORITATIVE empty — exactly the lie the read block exists to stop — and
     both land on the same verdict here. An envelope carrying none of its keys is
-    a read that did not answer, not an account store that is empty. Quota passes
-    ``()``: its reader already filters to a list of rows, and an empty quota
-    renders as a neutral absence rather than a verdict.
+    a read that did not answer, not an account store that is empty. Quota requires
+    its canonical ``snapshots`` member as an array while retaining the typed
+    absences from that same evidence envelope.
     """
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
@@ -463,6 +489,8 @@ def _facet_outcome(call: "Future", *, envelope: tuple = ()) -> tuple:
     if not isinstance(value, (dict, list)):
         return (READ_FAILED, None, None)
     if envelope and not (isinstance(value, dict) and all(key in value for key in envelope)):
+        return (READ_FAILED, None, None)
+    if list_fields and not all(isinstance(value.get(key), list) for key in list_fields):
         return (READ_FAILED, None, None)
     return (READ_OK, value, None)
 

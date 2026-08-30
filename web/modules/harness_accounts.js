@@ -135,7 +135,7 @@ export function humanizeResetAt(resetsAt, nowMs = Date.now()) {
 
 export function quotaSummary(snapshots, harnessId, subjectId = '',
                              { quotaRead = READ_OK, nowMs = Date.now(),
-                               fallbackSubjectIds = [] } = {}) {
+                               fallbackSubjectIds = [], absences = [] } = {}) {
     // The exhausted window is SHOWN with its reset time, never hidden (Q2-б):
     // hiding it would make the D28 fallback to API money unexplainable. What
     // CHANGED is only the wording — the owner asked for the limit text to be
@@ -189,7 +189,8 @@ export function quotaSummary(snapshots, harnessId, subjectId = '',
     for (const snap of rows) {
         for (const constraint of snap.constraints || []) {
             const used = Number(constraint.used_ratio);
-            const spent = Boolean(constraint.cooldown_until) || (Number.isFinite(used) && used >= 1.0);
+            const spent = Boolean(constraint.cooldown_until)
+                || (Number.isFinite(used) && used >= 1.0);
             const models = Array.isArray(constraint.applies_to_models)
                 ? constraint.applies_to_models.filter(Boolean) : [];
             if (models.length) {
@@ -220,14 +221,47 @@ export function quotaSummary(snapshots, harnessId, subjectId = '',
     else if (worst) {
         base = `${Math.min(100, Math.round(worst.used * 100))}% used${resets ? ` · resets ${resets}` : ''}`;
     }
-    // Read, and nothing to report about THIS account: say the usage is
-    // unavailable rather than implying an empty window.
-    if (!base && !note) return { label: 'Usage unavailable', exhausted: false, resetsAt: '', tone: 'muted' };
+    // Match typed gaps by the exact current subject only: the legacy default
+    // alias belongs to retained snapshots, never to another subject's
+    // credential verdict. Claudexor suppresses snapshot-covered absences at
+    // its response boundary; a contradictory future body stays visible here
+    // rather than authorizing a stronger consumer-side interpretation.
+    const absence = (Array.isArray(absences) ? absences : []).find((row) => {
+            const subject = row?.subject;
+            if (!subject || typeof subject !== 'object') return false;
+            if (typeof subject.harness !== 'string') return false;
+            if (subject.subject_id !== null && typeof subject.subject_id !== 'string') return false;
+            return subject.harness === String(harnessId)
+                && String(subject.subject_id || '') === String(subjectId);
+        }) || null;
+    const reason = typeof absence?.reason === 'string' ? absence.reason : '';
+    const labels = {
+        refresh_failed: 'Usage refresh failed',
+        rate_limited: 'Usage check rate-limited',
+        probe_skipped_rate_limited: 'Usage check paused after a rate limit',
+        poll_paced: 'Usage check paced',
+        not_logged_in: 'Usage unavailable · not signed in',
+        auth_revoked: 'Usage unavailable · sign-in revoked',
+    };
+    const absenceLabel = reason ? (labels[reason] || 'Usage unavailable') : '';
+    // Claudexor's absence detail is already redacted at the producer. Display
+    // it as text only; it never chooses reason, tone, login action, or routing.
+    const absenceDetail = reason && typeof absence?.detail === 'string'
+        ? absence.detail.trim() : '';
+    const gap = [absenceLabel, absenceDetail].filter(Boolean).join(' · ');
+    if (!base && !note) {
+        return {
+            label: gap || 'Usage unavailable',
+            exhausted: false,
+            resetsAt: '',
+            tone: 'muted',
+        };
+    }
     return {
         exhausted,
         resetsAt,
         tone: exhausted ? 'warn' : 'muted',
-        label: [base, note].filter(Boolean).join(' · '),
+        label: [base, note, gap].filter(Boolean).join(' · '),
     };
 }
 
@@ -598,7 +632,8 @@ export function accountMetaLine(row, payload, { quotaRead = READ_OK, nowMs = Dat
         parts.push('disabled — excluded from rotation');
     }
     parts.push(quotaSummary(payload?.quota || [], row.harness, row.profile_id,
-        { quotaRead, nowMs, fallbackSubjectIds: quotaSubjectAliases(row, payload) }).label);
+        { quotaRead, nowMs, fallbackSubjectIds: quotaSubjectAliases(row, payload),
+          absences: payload?.quota_absences || [] }).label);
     const identity = row.identity || {};
     if (identity.plan) parts.push(String(identity.plan));
     // The email is metadata only while it is not already the row's name.
@@ -947,7 +982,8 @@ export function accountRowFacts(row, payload,
     return {
         badge: verificationBadge(row, { known: accountsRead === READ_OK }),
         quota: quotaSummary(payload?.quota || [], row.harness, row.profile_id,
-            { quotaRead, nowMs, fallbackSubjectIds: quotaSubjectAliases(row, payload) }),
+            { quotaRead, nowMs, fallbackSubjectIds: quotaSubjectAliases(row, payload),
+              absences: payload?.quota_absences || [] }),
         name: accountName(row),
         meta: accountMetaLine(row, payload, { quotaRead, nowMs }),
     };

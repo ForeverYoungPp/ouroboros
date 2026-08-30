@@ -856,6 +856,7 @@
  * @property {Array<Object>=} harnesses
  * @property {Object=} profiles
  * @property {Array<Object>=} quota
+ * @property {Array<Object>=} quota_absences
  * @property {ClaudexorStatusReads=} reads
  * @property {boolean=} unified_accounts
  * @property {SubagentLastDelegation=} subagent_last_delegation
