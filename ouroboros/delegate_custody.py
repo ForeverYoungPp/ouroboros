@@ -808,8 +808,7 @@ def retire_project(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
         # project_owned, but the daemon refuses removal while ANY sibling
         # lives); the caller is mid-settlement, so only OTHERS defer.
         # Removal is an AUTHORITY decision: it needs the COMPLETE view (the
-        # lenient reader skips unreadable lines - a sibling could be
-        # invisible) with the caller's own row in it.
+        # lenient reader can hide a sibling) with the caller's own row in it.
         from ouroboros.delegate_custody_usage import complete_custody_rows
 
         rows_raw = complete_custody_rows(event_log_path(drive_root), _ROW_MARKER)
@@ -830,7 +829,7 @@ def retire_project(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
                     custody.run_id, exc_info=True)
         return
     if sharers and custody.run_id and custody.run_id != sharers[0]:
-        return  # deferred quietly: the canonical sharer carries the retry lane
+        return  # deferred quietly: the canonical sharer carries the lane
     try:
         gateway.remove_project(custody.project_id)
     except Exception as exc:
@@ -1341,8 +1340,8 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
     startup/periodic sweep surface is where settled-but-owned registrations get
     their retry lane (the task-scoped surface can exit early with none open).
     """
-    # Registration duty is real work only for a retire-ELIGIBLE project
-    # (every sharer settled): a deferred one must not spin the daemon up.
+    # Registration duty is real work only for a retire-ELIGIBLE project:
+    # a deferred one must not spin the daemon up.
     snapshot = replay(drive_root).values()
     unsettled_projects = {row.project_id for row in snapshot
                           if row.project_id and row.run_id and not row.settled}
