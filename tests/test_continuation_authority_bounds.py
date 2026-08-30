@@ -71,7 +71,7 @@ def test_host_salvage_automatic_authority_is_bounded_but_explicit_read_is_full(
     assert result["preview"].startswith(full_result[:carried])
     assert "OMISSION NOTE" in result["preview"]
     assert tail not in json.dumps(automatic)
-    assert len(json.dumps(automatic)) < 40_000
+    assert len(json.dumps(automatic)) < 25_000
     # The bounded continuation envelope (delegation-usefulness, owner
     # 2026-08-30): identity + digest + pull source instead of the recursive
     # full-body copy that compiled 300K+ work orders.
@@ -163,7 +163,10 @@ def test_legacy_collapse_fires_only_on_growth_carriers_and_is_idempotent():
         "capability_delta": {"granted": ["net"]},
         "task_contract": {
             "objective": "grandparent objective",
-            "predecessor_authority": {"result": "grandparent body"},
+            "predecessor_authority": {
+                "result": "grandparent body",
+                "source": {"kind": "task_result", "task_id": "grandpa"},
+            },
         },
     }
     contract = build_task_contract({"objective": "next", "predecessor_authority": fat})
@@ -178,7 +181,9 @@ def test_legacy_collapse_fires_only_on_growth_carriers_and_is_idempotent():
     assert preview["full_chars"] == 25_000 and "OMISSION NOTE" in preview["preview"]
     assert preview["source_ref"]["task_id"] == "deep", "the pull route is named"
     assert envelope["source"] == fat["source"], "the pull route survives"
-    assert envelope["previous_task_id"] == "deep", "the chain cursor is minted"
+    assert envelope["previous_task_id"] == "grandpa", (
+        "the cursor names the hop BEFORE this body's subject - the binding "
+        "rule - never the subject's own id (a self-loop)")
 
     again = build_task_contract({"objective": "next-hop", "predecessor_authority": envelope})
     assert again["predecessor_authority"] == envelope, "envelope rebuild is a no-op"

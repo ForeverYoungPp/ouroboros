@@ -1592,4 +1592,3 @@ class TestRootMutationAuthority:
         ctx.task_metadata = {}
         record, err = _mutation_authority(ctx, delegated_run_shape(True))
         assert record == {} and "workspace_not_active" in err
-

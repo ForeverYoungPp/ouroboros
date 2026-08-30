@@ -804,12 +804,10 @@ def retire_project(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
     """Discharge the registration obligation. Absence IS discharge (a 404 on
     the project is the asked-for outcome, never a failure).
 
-    REFCOUNT DEFERRAL: the daemon refuses to remove a project with live runs,
-    so only the LOWEST-run_id sharer keeps attempting (one honest retry lane);
-    the rest defer quietly. The deterministic tie-break makes deferral safe -
-    some sharer always attempts, and once the canonical one removes the
-    project the others discharge on the daemon's 404.
-    """
+    REFCOUNT DEFERRAL: the daemon refuses removal while runs live, so only the
+    LOWEST-run_id sharer keeps attempting (one honest retry lane); the rest
+    defer quietly. The deterministic tie-break makes deferral safe: some
+    sharer always attempts, and the rest discharge on the daemon's 404."""
     if not (custody.project_owned and custody.project_id):
         return
     try:
@@ -847,16 +845,14 @@ def close_absent_run(drive_root: Any, gateway: Any, custody: RunCustody, reason:
     """Close custody over a run the daemon says it does not have.
 
     "Absent" is a fact about the daemon that answered, not the run: across the
-    D30 provisioning boundary a 404 can mean a DIFFERENT daemon than the one
-    that accepted the run, whose child may still be writing. Closing custody is
-    a deliberate trade - an unreachable run cannot be cancelled, verified or
-    settled, and holding it open re-faults it forever; no terminal detail
-    exists, so no settlement (that would invent tokens/spend). The absent-run
-    FACT and the registration obligation are recorded INDEPENDENTLY (P34R.4):
+    D30 provisioning boundary a 404 can mean a DIFFERENT daemon whose child may
+    still be writing. Closing is a deliberate trade - an unreachable run cannot
+    be cancelled/verified/settled, and holding it open re-faults it forever; no
+    terminal detail, so no settlement (that would invent tokens/spend). The
+    absent-run FACT and the registration are recorded INDEPENDENTLY (P34R.4):
     CLOSED_ABSENT closes custody now, the registration survives on
     ``project_owned`` until PROJECT_RETIRED - retried by later sharers and the
-    sweep; a 404 on the PROJECT counts as discharged.
-    """
+    sweep; a 404 on the PROJECT counts as discharged."""
     retire_project(drive_root, gateway, custody)
     # The absent-run FACT lands regardless of the registration (holding the
     # run open as cleanup-debt proxy was the same category error).
@@ -872,12 +868,9 @@ def close_absent_run(drive_root: Any, gateway: Any, custody: RunCustody, reason:
 
 
 def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[str, Any]) -> Dict[str, Any]:
-    """Settle a TERMINAL run. The terminal claim follows the DURABLE FACT, not the call.
-
-    The ledger row and the registration are independent idempotent duties; an
-    unfinished settlement is retried. ``settled`` means the durable fact
-    exists, not that the call returned.
-    """
+    """Settle a TERMINAL run: the claim follows the DURABLE FACT, not the call.
+    Ledger row and registration are independent idempotent duties; unfinished
+    settlement is retried; ``settled`` means the durable fact exists."""
     if custody.settled:
         return {"settled": True, "ledger_recorded": True,
                 "project_retired": not custody.project_owned, "retried": False}
@@ -958,12 +951,11 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
         })
     if custody.settled:
         resolve_containment_fault(drive_root, custody, "settled_terminal")
-    # CONSUMPTION BEFORE SETTLEMENT is the owner's directive - a LOUD FACT, not
-    # a gate, and NOT recorded here: this runs BEFORE staging (delegate_wait
-    # settles, then stages), so asking now would answer "no omission" for every
-    # first settlement - the render-unknown-as-a-fact shape this module refuses.
-    # ``record_settled_unread`` records it at the two places that DO know: the
-    # wait path after staging, and reconciliation (custody replays staged).
+    # CONSUMPTION BEFORE SETTLEMENT is the owner's directive - a LOUD FACT,
+    # not a gate, and NOT recorded here: this runs BEFORE staging, so asking
+    # now would answer "no omission" for every first settlement (the render-
+    # unknown-as-a-fact shape this module refuses). ``record_settled_unread``
+    # records it where staging IS known: the wait path and reconciliation.
     return {
         "settled": custody.settled,
         "ledger_recorded": custody.ledger_recorded,
@@ -1288,7 +1280,17 @@ def reconcile_task_runs(drive_root: Any, task_id: str, *,
     held = [c for c in open_runs(drive_root) if c.task_id == mine]
     stray = [record for record in pending_invocations(drive_root)
              if record["task_id"] == mine]
-    if not held and not stray:
+    # This path also carries the registration retry lane for the task's OWN
+    # settled-but-owned runs in retire-eligible projects (a one-shot process
+    # may never see another sweep tick); deferred-behind-a-live-sibling
+    # registrations stay with the periodic sweep - no daemon spin-up here.
+    snapshot = replay(drive_root).values()
+    live = {r.project_id for r in snapshot
+            if r.project_id and r.run_id and not r.settled}
+    owed = [r for r in snapshot
+            if r.task_id == mine and r.project_owned and r.project_id
+            and r.settled and r.project_id not in live]
+    if not held and not stray and not owed:
         return []
     return _reconcile_each(drive_root, held, gateway_factory, pending=stray)
 
@@ -1513,13 +1515,11 @@ def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[s
         return result
     if is_terminal(detail):
         settled = settle_run(drive_root, gateway, custody, detail)
-        # The sweep's custody REPLAYS with the staged fields on it, so unlike the wait
-        # path this is a place the omission is already knowable — and a run whose owner
-        # is gone is exactly the one nobody will ever come back to read.
+        # Sweep custody REPLAYS with staged fields, so unlike the wait path
+        # the omission is already knowable here - and an ownerless run is the
+        # one nobody will come back to read (the D7 launched-never-collected
+        # half becomes durable in this row instead of inferred).
         record_settled_unread(drive_root, custody)
-        # The D7 half of the disposition: a reconciled run whose staged artifact was
-        # never acknowledged is the "launched and never collected" shape, and this row
-        # is where that fact becomes durable instead of inferred.
         # The action names the ATTEMPT; the facts ride separately (the old
         # shape wrote action="settled" even when the returned flag was false).
         result = {"run_id": custody.run_id, "task_id": custody.task_id,

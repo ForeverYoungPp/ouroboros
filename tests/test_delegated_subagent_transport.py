@@ -3133,7 +3133,8 @@ def test_an_absent_run_closes_now_and_its_registration_survives_for_the_sweep(tm
     kinds = _event_types(tmp_path)
     assert "delegate_run_project_retired" in kinds
     assert dc.owned_project_registrations(tmp_path) == []
-    assert gateway.removals.count("prj-owned") >= 2, "the retirement was RETRIED"
+    # Lanes: close-absent, same-pass sweep, next sweep.
+    assert gateway.removals == ["prj-owned"] * 3
 
     # 3. Absence is discharge: a 404 on the remove itself closes the run.
     class _AllGone(_AbsentRunGateway):
@@ -6122,8 +6123,8 @@ def test_subscription_window_exhausted_beacon_wakes_the_waiting_parent(tmp_path,
 
 def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_path):
     """W3 adjacent (d): every run in the project shares the registration.
-    Any unsettled sibling defers every sharer QUIETLY; once all settle,
-    the LOWEST-run_id sharer carries the one retry lane."""
+    Any unsettled sibling defers every sharer QUIETLY; once all settle
+    the LOWEST-run_id sharer carries the retry lane."""
     import json as _json
 
     import ouroboros.delegate_custody as dc
@@ -6146,7 +6147,7 @@ def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_
             project_id="prj-shared", project_owned=True, ledger_root=str(tmp_path)))
     dc._CUSTODY.clear()
 
-    # Non-canonical sharer: quiet deferral — no call, no row.
+    # Non-canonical sharer: quiet deferral.
     custody_b = dc.replay(tmp_path)["run-bb"]
     dc.retire_project(tmp_path, gateway, custody_b)
     assert gateway.removals == []

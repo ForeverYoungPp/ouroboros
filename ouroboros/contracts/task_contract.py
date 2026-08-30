@@ -608,7 +608,7 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
 def bounded_continuation_envelope(
     mapping: Dict[str, Any], *, digest_semantics: str,
     source_ref: Optional[Dict[str, Any]] = None, salvage: bool = False,
-    extra: Optional[Dict[str, Any]] = None,
+    extra: Optional[Dict[str, Any]] = None, reserve_source: bool = False,
 ) -> Dict[str, Any]:
     """The ONE bounded-envelope producer (startup binding and legacy collapse).
 
@@ -634,6 +634,10 @@ def bounded_continuation_envelope(
     contract = mapping.get("task_contract") if isinstance(mapping.get("task_contract"), Mapping) else {}
     reserved = {"kind", "authority_sha256", "authority_chars", "digest_semantics",
                 "previous_task_id", "collapsed_from", "shadowed_authority_fields"}
+    if reserve_source:
+        # The startup binding writes the pull pointer under ``source`` LAST; a
+        # projected row field with that name must shadow, not clobber or vanish.
+        reserved.add("source")
     envelope: Dict[str, Any] = {}
     shadowed: Dict[str, Any] = {}
     for key, value in mapping.items():
@@ -666,8 +670,22 @@ def bounded_continuation_envelope(
     for key, value in contract.items():
         if key == "predecessor_authority":
             continue
-        if isinstance(value, str) and len(value) > limit:
-            core[key] = truncate_within_limit(value, limit=limit)
+        if isinstance(value, str):
+            core[key] = (truncate_within_limit(value, limit=limit)
+                         if len(value) > limit else value)
+            continue
+        try:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            text = repr(value)
+        if len(text) > limit:
+            entry = {"kind": "bounded_field_preview",
+                     "preview": truncate_within_limit(text, limit=limit),
+                     "full_chars": len(text)}
+            if source_ref:
+                entry["source_ref"] = {**copy.deepcopy(source_ref),
+                                       "field": f"authority.task_contract.{key}"}
+            core[key] = entry
         else:
             core[key] = copy.deepcopy(value)
     if core:
@@ -706,18 +724,30 @@ def _bounded_predecessor_authority(mapping: Dict[str, Any]) -> Dict[str, Any]:
             return len(repr(value))
 
     contract = mapping.get("task_contract") if isinstance(mapping.get("task_contract"), Mapping) else {}
-    oversized = any(_field_chars(v) > DEFAULT_TOOL_RESULT_LIMIT for k, v in mapping.items()
-                    if k != "task_contract")
+    oversized = (
+        any(_field_chars(v) > DEFAULT_TOOL_RESULT_LIMIT for k, v in mapping.items()
+            if k != "task_contract")
+        or any(k != "predecessor_authority"
+               and _field_chars(v) > DEFAULT_TOOL_RESULT_LIMIT
+               for k, v in contract.items())
+    )
     if "predecessor_authority" not in contract and not oversized:
         return copy.deepcopy(mapping)
     source = mapping.get("source") if isinstance(mapping.get("source"), Mapping) else {}
+    # The chain cursor names the hop BEFORE this body's subject - the same rule
+    # the startup binding mints - never the subject's own id (a self-loop).
+    nested = contract.get("predecessor_authority") if isinstance(contract.get("predecessor_authority"), Mapping) else {}
+    nested_source = nested.get("source") if isinstance(nested.get("source"), Mapping) else {}
     return bounded_continuation_envelope(
         mapping,
         digest_semantics="observed_at_collapse",
         source_ref=dict(source) or None,
         extra={
             "collapsed_from": "legacy_full_body",
-            "previous_task_id": str(source.get("task_id") or mapping.get("task_id") or ""),
+            "previous_task_id": str(
+                nested.get("task_id") or nested.get("previous_task_id")
+                or nested_source.get("task_id") or ""
+            ),
         },
     )
 

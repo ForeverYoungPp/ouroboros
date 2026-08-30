@@ -920,6 +920,7 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
             ctx, bootstrap,
         )
         if source_refusal:
+            _blocked("configured_work_order_source_refused")
             return source_refusal
         source_request = bootstrap.get("source_request")
         if not canonical_work_order:
@@ -954,6 +955,7 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
             ctx, bootstrap, retry=True,
         )
         if source_refusal:
+            _blocked("configured_work_order_source_refused")
             return source_refusal
         if not canonical_work_order:
             _blocked("configured_work_order_unavailable")

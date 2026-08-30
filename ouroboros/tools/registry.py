@@ -1051,6 +1051,7 @@ def _configured_delegate_selector(ctx: Any, name: str, args: dict[str, Any]) -> 
     return (
         name == "delegate_start"
         and isinstance(getattr(ctx, "_configured_actor_bootstrap", None), dict)
+        and not str(args.get("retry_of") or "").strip()
         and any(str(args.get(key) or "").strip()
                 for key in ("root", "bucket", "skill_name"))
     )
@@ -1878,6 +1879,13 @@ class ToolRegistry:
                 schema = copy.deepcopy(schema)
                 props = schema.get("parameters", {}).get("properties", {})
                 for field in ("write_surface", "write_root", "protected_paths_grant", "external_tool_grants"):
+                    props.pop(field, None)
+            elif entry.name == "delegate_start":
+                # Same selector trap the acting branch hides: a readonly child
+                # can never start a skill-payload resource either.
+                schema = copy.deepcopy(schema)
+                props = schema.get("parameters", {}).get("properties", {})
+                for field in ("root", "bucket", "skill_name"):
                     props.pop(field, None)
         elif self._is_acting_subagent():
             # Advertise only what the acting profile can actually execute: writes go
