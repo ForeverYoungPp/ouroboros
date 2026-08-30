@@ -650,7 +650,27 @@ predecessor, and thresholds only the closed raw keys `result` and
 Oversized values resolve as persisted narrative, bounded exact-key legacy
 authored lookup, or an explicit source-resolvable gap. They never use a raw
 head/tail slice, invent a summary, or mutate the canonical result. Exact task
-reads and external work-order consumers retain the full source.
+reads retain the full source.
+
+The automatic startup injection (2026-08-30) is a bounded continuation
+ENVELOPE, not a body copy - minted by ONE producer
+(`contracts.task_contract.bounded_continuation_envelope`) for both the
+startup binding and the legacy collapse on contract rebuilds. Every compact
+terminal fact inherits by copy; the predecessor's operative contract core
+inherits without its nested `predecessor_authority` (the recursion that
+compiled 300K+ work orders); every field is whole-or-pointer against one
+strict tool-result budget measured on its serialized form (lists and dicts
+count, previews carry `full_chars` plus a named `source_ref`);
+sha256/chars ride with their observation moment, and `previous_task_id`
+keeps the chain walkable. A legacy body already free of growth carriers
+passes rebuilds byte-identical - exact strings are authority. Durable
+`task_results` bodies are the untouched SSOT, pulled whole through the
+named `get_task_result(include_authority=True)` source (exact ranges apply
+to the canonical work-order source, not to authority). The bound is
+per-field: a pathological row of many near-limit fields can still exceed
+the wire budget, where the refusal is typed and loud rather than a silent
+$0 - no aggregate cap is imposed. No hop cap exists anywhere - depth
+belongs to the mind, the floor only keeps bodies off the wire.
 
 Provider context overflow is a typed recovery fact. The existing useful reclaim
 and one strictly-smaller same-route retry retain their route order; a final

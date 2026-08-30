@@ -1110,6 +1110,23 @@ _VERIFY_RUN_KINDS = frozenset({
 })
 
 
+def _configured_delegate_selector(ctx: Any, name: str, args: dict[str, Any]) -> bool:
+    """Configured-actor validation PRECEDES generic target binding.
+
+    A configured session child passing any exact-resource selector gets the
+    handler's precise configured_actor_resource_mismatch (which also records
+    the START_BLOCKED attempt row), not the generic payload-binding
+    TOOL_ACCESS_BLOCKED that twice read as "workspace authority lost" and
+    pushed the nanny into native rebuilds."""
+    return (
+        name == "delegate_start"
+        and isinstance(getattr(ctx, "_configured_actor_bootstrap", None), dict)
+        and not str(args.get("retry_of") or "").strip()
+        and any(str(args.get(key) or "").strip()
+                for key in ("root", "bucket", "skill_name"))
+    )
+
+
 def _target_binding_operation(name: str, args: dict[str, Any]) -> str | None:
     operation = _TARGET_BINDING_OPERATIONS.get(name)
     if operation is not None:
@@ -1528,25 +1545,20 @@ class BrowserState:
     last_screenshot_b64: Optional[str] = None
 
 
-# CW3 (v6.34.0): tools a SHORT-LIVED ephemeral same-route decision turn must NOT
-# call — durable cognitive memory, evolution/consciousness, model/timeout/settings
-# control, and the release/restart control-plane. The ephemeral turn may still
-# answer / steer_task / promote_chat_to_task / route_to_project and read freely;
-# An ephemeral decision turn DECIDES (answer / route / spawn / steer); it does NOT do
-# durable work — that is what the task it spawns is for. CW3 (v6.34.0) enforces this with
-# a DEFAULT-DENY ALLOWLIST, not a denylist: a denylist is whack-a-mole (it kept missing
-# review/skill/publish/control mutators — advisory_review, skill_review, submit_skill_to_hub,
-# skill_exec, toggle_skill, cancel_task, task_acceptance_review, ...). The decision turn may
-# only call the read-only INSPECTION tools (the LOCAL_READONLY_SUBAGENT_TOOL_NAMES SSOT —
-# read_file/query_code/search_code/web_search/vcs_diff/...) plus the route/spawn/steer/reply
-# tools below. Everything else — every repo/git/cognitive/control/review/skill/publish
-# mutator, run_command (shell is durable-capable), and all extension/MCP tools (blocked
-# separately) — is hidden from schemas()/get_schema_by_name() and fails closed in execute().
-# EXPLICIT curated allowlist (not derived from another set — deriving from
-# LOCAL_READONLY_SUBAGENT_TOOL_NAMES leaked subagent-only tools: schedule_subagent spawns
-# durable child tasks, wait_task/wait_tasks BLOCK a short turn, browser_action INTERACTS
-# with pages). A decision turn may only READ/INSPECT (no mutation, no spawning, no blocking
-# wait, no page interaction) and answer/route/spawn-owner-task/steer/reply.
+# CW3 (v6.34.0): an ephemeral decision turn DECIDES (answer / route / spawn /
+# steer) — it does NOT do durable work; that is the spawned task's job.
+# Enforced as a DEFAULT-DENY ALLOWLIST, not a denylist (a denylist is
+# whack-a-mole: it kept missing review/skill/publish/control mutators —
+# advisory_review, skill_review, submit_skill_to_hub, skill_exec,
+# toggle_skill, cancel_task, task_acceptance_review, ...). The turn may call
+# only the read-only INSPECTION tools plus the route/spawn/steer/reply tools
+# below; everything else — repo/git/cognitive/control/review/skill/publish
+# mutators, run_command (shell is durable-capable), extension/MCP tools —
+# is hidden from schemas() and fails closed in execute(). The allowlist is
+# EXPLICITLY curated, not derived (deriving from
+# LOCAL_READONLY_SUBAGENT_TOOL_NAMES leaked subagent-only tools:
+# schedule_subagent spawns durable children, wait_task/wait_tasks BLOCK a
+# short turn, browser_action INTERACTS with pages).
 _EPHEMERAL_ALLOWED_TOOLS = frozenset({
     # read / inspect
     "read_file", "query_code", "search_code", "list_files", "web_search", "browse_page",
@@ -1940,12 +1952,32 @@ class ToolRegistry:
                 props = schema.get("parameters", {}).get("properties", {})
                 for field in ("write_surface", "write_root", "protected_paths_grant", "external_tool_grants"):
                     props.pop(field, None)
+            elif entry.name == "delegate_start":
+                # Same selector trap the acting branch hides: a readonly child
+                # can never start a skill-payload resource either.
+                schema = copy.deepcopy(schema)
+                props = schema.get("parameters", {}).get("properties", {})
+                for field in ("root", "bucket", "skill_name"):
+                    props.pop(field, None)
         elif self._is_acting_subagent():
             # Advertise only what the acting profile can actually execute: writes go
             # ONLY to the isolated surface (active_workspace); reads use the read roots;
             # browser evaluate remains available on the current page; the browser
             # handler retains its owner/self-lowering checks.
-            if entry.name in _ROOT_ARG_REPO_WRITE_TOOLS or entry.name in _GENERIC_VCS_TARGET_TOOLS:
+            if entry.name == "delegate_start":
+                # The exact-resource selector is a TRAP here: an acting child
+                # can never write root=skill_payload, yet the schema advertised
+                # it as root's only enum value - twice a nanny took the bait,
+                # was refused by generic binding before the precise
+                # configured_actor_resource_mismatch could answer, and rebuilt
+                # the work natively (the two Minecraft-widget incidents). Hide
+                # the selector triple; bound starts and retry_of need none of
+                # it; the top-level principal's schema is untouched.
+                schema = copy.deepcopy(schema)
+                props = schema.get("parameters", {}).get("properties", {})
+                for field in ("root", "bucket", "skill_name"):
+                    props.pop(field, None)
+            elif entry.name in _ROOT_ARG_REPO_WRITE_TOOLS or entry.name in _GENERIC_VCS_TARGET_TOOLS:
                 schema = copy.deepcopy(schema)
                 root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
                 if isinstance(root_schema.get("enum"), list):
@@ -2928,15 +2960,13 @@ class ToolRegistry:
                 explicit_write_targets.append(
                     destination.rstrip("/\\") + "/" + source_name
                 )
-        # A located -e/-E/-c inline CODE BODY is not a write target of the command
-        # line: writer_target_tokens' generic fallback reports every non-flag operand
-        # of a LIGHT_SHELL_WRITER_COMMANDS member (ruby/perl) — including the code
-        # string itself — which made every one-liner write-shaped here. The light
-        # fence and the protected lane keep consuming the unfiltered SSOT (their
-        # pinned XG-7B3.1 contracts rely on the body operand); only THIS lane's
-        # write-shape/target set drops the bodies. FILE operands stay write-suspect
-        # (`perl -pi -e s/a/b/ file` rewrites `file`), and literal in-code targets
-        # still arrive via the dedicated inline extraction.
+        # A located -e/-E/-c inline CODE BODY is not a write target: the
+        # generic fallback reported every non-flag operand of a writer command
+        # (ruby/perl) - code string included - making every one-liner
+        # write-shaped. The light fence and protected lane keep the unfiltered
+        # SSOT (pinned XG-7B3.1); only THIS lane drops the bodies. FILE
+        # operands stay write-suspect (`perl -pi -e s/a/b/ file` rewrites
+        # `file`); literal in-code targets still arrive via inline extraction.
         from ouroboros.tools.shell_guards import interpreter_inline_code as _interp_inline_code
         inline_code_bodies: set = set()
         for target_argv in write_target_argvs:
@@ -2948,14 +2978,12 @@ class ToolRegistry:
         # Writer-command membership canonicalizes versioned interpreter spellings to
         # their family (`ruby3.2` is `ruby`), so a versioned basename is exactly as
         # write-suspect as the unversioned one (XG-2R.2).
-        # Interpreter argv (a direct interpreter, or one inside an sh -c wrap) takes the
-        # MODE-AWARE write-shape classifier: the coarse bare `open(` token classified a
-        # read-only `open(p, 'rb')` as a write and fed pure reads into the workspace
-        # write guard — the same class the light-mode runtime_data lane already
-        # re-judges ("the original GAIA class"). Write-mode opens, pathlib `.open('w')`,
-        # save-APIs, opaque subprocess escapes, and every shell-level indicator still
-        # classify as writes; `writer_target_tokens` keeps covering literal write
-        # targets via `explicit_write_targets` below.
+        # Interpreter argv (direct or inside sh -c) takes the MODE-AWARE
+        # write-shape classifier: the bare `open(` token classified read-only
+        # `open(p, 'rb')` as a write ("the original GAIA class"). Write-mode
+        # opens, pathlib `.open('w')`, save-APIs, opaque subprocess escapes
+        # and shell-level indicators still classify as writes;
+        # `writer_target_tokens` keeps covering literal targets below.
         write_shape_interpreter = bool(interpreter_family(argv_executable)) or (
             bool(inline_argv)
             and bool(interpreter_family(pathlib.PurePath(str(inline_argv[0])).name.lower().removesuffix(".exe")))
@@ -3140,24 +3168,18 @@ class ToolRegistry:
                 return work_dir
             if git_block := self._external_workspace_git_block(raw_cmd, work_dir):
                 return git_block
-            # Even READ-only, non-git shell (cat/head/grep/python -c open(...)) must
-            # not reach the runtime or secrets — close the raw-shell bypass of the
-            # user_files path guard (scoped to top-level external tasks).
-            #
-            # READ-ONLY GIT IS EXEMPT (owner contract, Q4=A: "read-only everywhere",
-            # and the f14baf8f false-block class). `git -C <system repo> status|log|
-            # diff|show|rev-parse` is the vcs_status-equivalent inspection lane; the
-            # runtime-read guard was catching it by path token and refusing it with a
-            # WORKSPACE_SHELL_BLOCKED that named the wrong reason. The marginal
-            # escalation is nil — the same history is already readable through the
-            # gated read_file this very message points the agent at — while the
-            # SECRET/credential surface stays closed because the exemption is
-            # ALL-or-nothing per segment (`git status && cat <data>/settings.json`
-            # is not exempt; every non-git shell still meets the full guard) AND
-            # write-aware: `is_readonly_git_command` refuses the key to a read-only
-            # subcommand carrying the file-truncating `--output=<file>` diff option
-            # or `--no-index` (which reads arbitrary host files), so neither a
-            # runtime write nor a settings.json dump can ride "read-only git".
+            # Even READ-only, non-git shell (cat/head/grep/python) must not
+            # reach the runtime or secrets — the raw-shell bypass of the
+            # user_files path guard stays closed (top-level external tasks).
+            # READ-ONLY GIT IS EXEMPT (owner Q4=A "read-only everywhere"; the
+            # f14baf8f false-block class): `git -C <system repo>
+            # status|log|diff|show|rev-parse` is the vcs_status-equivalent
+            # lane, already readable via gated read_file. The secret surface
+            # stays closed: the exemption is ALL-or-nothing per segment
+            # (`git status && cat <data>/settings.json` is not exempt) and
+            # write-aware — `is_readonly_git_command` refuses `--output=` and
+            # `--no-index`, so neither a runtime write nor a settings dump
+            # can ride "read-only git".
             if is_external_workspace(self._ctx) and not is_readonly_git_command(raw_cmd):
                 if ext_block := self._external_shell_runtime_or_secret_block(
                     raw_cmd, cmd_path_lower, args, work_dir=work_dir,
@@ -3210,22 +3232,18 @@ class ToolRegistry:
                     "log/show/diff/status/rev-list/show-ref/for-each-ref/listing branch-tag forms."
                 )
             return None
-        # DEFAULT (non-workspace) lane — direct chat, light mode, self_modification-
-        # profile tasks. Q4=A (owner, 2026-08-08): mutating git is free EVERYWHERE
-        # outside the Ouroboros runtime, in every runtime mode and lane. The
-        # argv-text blanket (blocked ANY mutating git with a commit_reviewed remedy
-        # that is false for non-repo trees) is replaced by the SAME target-aware
-        # resolver the external lane has run since v6.27: read-only git stays
-        # allowed even at a runtime target, mutating git is blocked only when it
-        # TARGETS the runtime (bidirectional/casefold/symlink-resolved containment),
-        # and the contract network fence rides along. The cwd resolves EXACTLY ONCE
-        # through the shared resolver and is passed as a canonical path — never
-        # re-join a raw label onto a root (the v6.74.0 D1 regression class).
-        # Disclosed residual (proportionality; no shell-parser arms race): git via
-        # a transparent wrapper (nice/xargs) or interpreter code is not classified
-        # here — the pre-flip text classifier never saw the interpreter form either,
-        # and the LLM safety layer still reviews intent. The light-mode post-exec
-        # system-repo dirtiness tripwire stays as the backstop.
+        # DEFAULT (non-workspace) lane. Q4=A (owner 2026-08-08): mutating git
+        # is free EVERYWHERE outside the Ouroboros runtime. The argv-text
+        # blanket is replaced by the SAME target-aware resolver the external
+        # lane runs since v6.27: read-only git allowed even at a runtime
+        # target; mutating git blocked only when it TARGETS the runtime
+        # (bidirectional/casefold/symlink-resolved); the contract network
+        # fence rides along. The cwd resolves EXACTLY ONCE via the shared
+        # resolver, passed canonical — never re-join a raw label onto a root
+        # (the v6.74.0 D1 class). Disclosed residual (no shell-parser arms
+        # race): git via wrapper (nice/xargs) or interpreter code is not
+        # classified here; the LLM safety layer still reviews intent, and the
+        # light-mode post-exec dirtiness tripwire backstops.
         if "git" not in cmd_path_lower:
             return None
         work_dir = self._resolved_shell_cwd(args, binding)
@@ -3685,7 +3703,7 @@ class ToolRegistry:
                 return heal_block
         workspace_mode = bool(getattr(self._ctx, "is_workspace_mode", lambda: False)())
         effective_constraint = task_constraint
-        if entry is not None:
+        if entry is not None and not (skip_binding := _configured_delegate_selector(self._ctx, name, args)):
             effective_constraint, payload_error = _payload_dispatch_constraint(
                 self._ctx,
                 name=name,
@@ -3696,7 +3714,7 @@ class ToolRegistry:
             if payload_error:
                 return payload_error
         resolved_binding = None
-        if entry is not None and _target_binding_operation(name, args) is not None:
+        if entry is not None and not skip_binding and _target_binding_operation(name, args) is not None:
             try:
                 resolved_binding = _build_builtin_target_binding(self._ctx, name, args)
             except Exception as exc:

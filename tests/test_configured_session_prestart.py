@@ -359,3 +359,40 @@ def test_failure_state_truncation_is_disclosed(tmp_path, monkeypatch):
     assert fact["status"] == "incomplete"
     assert len(fact["delegated_run_failure_states"]) == 12
     assert fact["failure_states_omitted"] == 1
+
+
+def test_precustody_refusals_leave_a_durable_start_blocked_row(tmp_path):
+    """D5 evidence collapse fix (owner 2026-08-30): every pre-custody refusal
+    class in delegate_start_entry lands a START_BLOCKED row - without it the
+    terminal evidence read "delegate_start never called" over a call the
+    registry provably saw."""
+    import ouroboros.subagent_runtime as runtime
+    from ouroboros import delegate_custody as custody
+
+    def _rows(root):
+        custody._CUSTODY.clear()
+        path = custody.event_log_path(root)
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+                if '"delegate_run_start_blocked"' in line]
+
+    ctx = SimpleNamespace(
+        task_id="cfg-child", drive_root=tmp_path, budget_drive_root=str(tmp_path),
+        task_metadata={},
+        _configured_actor_bootstrap={"selected_subagent_id": "session-builder"},
+    )
+    out = runtime.delegate_start_entry(ctx, "do work", root="skill_payload")
+    assert "configured_actor_resource_mismatch" in out
+    reasons = [row["reason"] for row in _rows(tmp_path)]
+    assert reasons == ["configured_actor_resource_mismatch"]
+
+    out = runtime.delegate_start_entry(ctx, "do work", subagent_id="someone-else")
+    assert "configured_actor_route_mismatch" in out
+    reasons = [row["reason"] for row in _rows(tmp_path)]
+    assert reasons[-1] == "configured_actor_route_mismatch"
+
+    out = runtime.delegate_start_entry(ctx, "do work")
+    assert "configured_work_order_unavailable" in out
+    reasons = [row["reason"] for row in _rows(tmp_path)]
+    assert reasons[-1] == "configured_work_order_unavailable"

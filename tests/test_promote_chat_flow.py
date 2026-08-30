@@ -371,8 +371,12 @@ def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_pa
         "parent_contract": event["task_contract"],
         "attachment_manifest": event["task_contract"]["attachment_manifest"],
     })
-    for key in ("capability_ceiling", "context", "predecessor_authority", "attachment_manifest"):
+    for key in ("capability_ceiling", "context", "attachment_manifest"):
         assert child[key] == contract[key]
+    # Envelope contract (2026-08-30): a bounded legacy body - no nested
+    # recursion carrier, no oversized string - passes through byte-identical
+    # (exact strings are authority); only the growth carriers get collapsed.
+    assert child["predecessor_authority"] == contract["predecessor_authority"]
 
 
 def test_real_presence_promotion_rebases_root_and_materializes_all_attachments(

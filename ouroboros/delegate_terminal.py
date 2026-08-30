@@ -65,11 +65,27 @@ def terminal_reconcile_task(
         )
     except Exception:
         patch_ids, audit_failure = [], "undisposed_patch_audit_failed"
+    deferred_retirements: list = []
+    try:
+        if not audit_failure:
+            deferred_retirements = [
+                row.run_id
+                for row in custody.owned_project_registrations(drive_root)
+                if row.task_id == mine and row.settled
+            ]
+    except Exception:
+        # Fail-closed like the audits above: an unreadable registration state
+        # must not read as "no deferred retirements".
+        audit_failure = audit_failure or "registration_audit_failed"
     if not audit_failure:
         result.update({
             "open_run_ids": open_ids,
             "pending_invocation_ids": invocation_ids,
             "undisposed_patch_run_ids": patch_ids,
+            # DISCLOSED, never unreconciled: a settled run's project registration
+            # awaiting retirement is cleanup debt with its own retry lane - it
+            # must not convert the task's outcome (the old coupling did).
+            "deferred_project_retirements": deferred_retirements,
             "unreconciled": [
                 *open_ids,
                 *(f"invocation:{item}" for item in invocation_ids),
@@ -109,7 +125,9 @@ def record_terminal_reconciliation(
 
         existing = load_task_result(drive_root, str(task_id or "")) or {}
         unreconciled = list(result.get("unreconciled") or [])
-        if not unreconciled and not existing.get("delegated_runs_unreconciled"):
+        deferred = list(result.get("deferred_project_retirements") or [])
+        if (not unreconciled and not deferred
+                and not existing.get("delegated_runs_unreconciled")):
             return
         write_task_result(
             drive_root,

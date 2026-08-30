@@ -884,10 +884,21 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
     bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
     retry_of = str(params.get("retry_of") or "").strip()
     from ouroboros.delegate_shared import _fail
+
+    def _blocked(reason: str) -> None:
+        # A pre-custody refusal is still a durable ATTEMPT fact: without the
+        # START_BLOCKED row, the evidence read "delegate_start never called"
+        # over a call the registry provably saw (D5 evidence collapse). One
+        # emitter for the whole refusal class, not per-branch.
+        from ouroboros.delegate_evidence import record_start_blocked
+
+        record_start_blocked(ctx, str(getattr(ctx, "task_id", "") or ""), reason)
+
     if isinstance(bootstrap, dict) and not retry_of:
         expected_id = str(bootstrap.get("selected_subagent_id") or "")
         requested_id = str(params.get("subagent_id") or "").strip()
         if requested_id and requested_id != expected_id:
+            _blocked("configured_actor_route_mismatch")
             return _fail(
                 "delegate_start", "configured_actor_route_mismatch",
                 "This actor-first turn is bound to its scheduled configured session; "
@@ -897,6 +908,7 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
                 host_fallback=False,
             )
         if any(str(params.get(key) or "").strip() for key in ("root", "bucket", "skill_name")):
+            _blocked("configured_actor_resource_mismatch")
             return _fail(
                 "delegate_start", "configured_actor_resource_mismatch",
                 "An actor-first configured session may start only its assigned route, "
@@ -908,9 +920,11 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
             ctx, bootstrap,
         )
         if source_refusal:
+            _blocked("configured_work_order_source_refused")
             return source_refusal
         source_request = bootstrap.get("source_request")
         if not canonical_work_order:
+            _blocked("configured_work_order_unavailable")
             return _fail(
                 "delegate_start", "configured_work_order_unavailable",
                 "The canonical work order is unavailable; do not start a physical leaf "
@@ -934,15 +948,38 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
             _record_actor_work_order_source(ctx, bootstrap)
         return exact_start(ctx, canonical_work_order, bound)
     if retry_of and isinstance(bootstrap, dict):
-        # Retry replays the stored canonical request byte-for-byte; do not let a
-        # new coordination sentence become a prefix when the original order was
-        # over the host wire budget.
+        # Retry replays the stored canonical request byte-for-byte - so an
+        # argument the replay cannot honor is refused typed, never silently
+        # discarded (the fresh-start refusals, mirrored).
+        expected_id = str(bootstrap.get("selected_subagent_id") or "")
+        requested_id = str(params.get("subagent_id") or "").strip()
+        if requested_id and requested_id != expected_id:
+            _blocked("configured_actor_route_mismatch")
+            return _fail(
+                "delegate_start", "configured_actor_route_mismatch",
+                "A configured retry replays its own scheduled session; it cannot "
+                "be redirected to another actor.",
+                selected_subagent_id=expected_id,
+                requested_subagent_id=requested_id,
+                host_fallback=False,
+            )
+        if any(str(params.get(key) or "").strip() for key in ("root", "bucket", "skill_name")):
+            _blocked("configured_actor_resource_mismatch")
+            return _fail(
+                "delegate_start", "configured_actor_resource_mismatch",
+                "A configured retry replays its assigned route, not a "
+                "skill-payload resource.",
+                selected_subagent_id=expected_id,
+                host_fallback=False,
+            )
         canonical_work_order, source_refusal = _actor_work_order_for_start(
             ctx, bootstrap, retry=True,
         )
         if source_refusal:
+            _blocked("configured_work_order_source_refused")
             return source_refusal
         if not canonical_work_order:
+            _blocked("configured_work_order_unavailable")
             return _fail(
                 "delegate_start", "configured_work_order_unavailable",
                 "The retry has no complete canonical work order or verified source "

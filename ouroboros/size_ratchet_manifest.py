@@ -135,7 +135,7 @@ BAND_PATHS = {
     "devtools/benchmarks/terminal_bench/harbor_installed_agent.py": None,
     "devtools/benchmarks/terminal_bench/run_tb.py": None,
     "ouroboros/agent.py": "Subagent message identity now lives in a shared helper; keep agent.py below the giant-file threshold rather than re-expanding it.",
-    "ouroboros/agent_startup_checks.py": None,
+    "ouroboros/agent_startup_checks.py": "Shrank below 1500 by moving the envelope producer to the contracts SSOT; band re-entry is the reduction's artifact.",
     "ouroboros/artifacts.py": "Exact task-source persistence and repository-diff materialization now share the actor-readable artifact seam for acceptance evidence.",
     "ouroboros/cancel_intents.py": "Entered the band from 929 lines: reciprocal timeout-retry lineage validation and physical-leaf/logical-root aliasing stay with the durable cancel-intent mutation authority so Stop-now hardens the same request across retry races.",
     "ouroboros/capability_evidence.py": "Grew INTO the band by the #284 fix: a fresh exact-model density witness may honestly undercut the cold floor \u2014 evidence logic belongs beside the witness store it reads.",
@@ -156,6 +156,7 @@ BAND_PATHS = {
     "ouroboros/review_execution.py": "Verdict extraction and the native tool-round executor moved to their own modules (generic reviewer-actor sprint); the transport seam re-enters the band smaller and more cohesive.",
     "ouroboros/reviewer_slot_config.py": "Absorbed the reviewer_slots() builder from review_substrate (altitude) and configured-subagent row resolution for the generic reviewer-actor bridge.",
     "ouroboros/skill_review_runner.py": None,
+    "ouroboros/subagent_runtime.py": "Configured-retry refusals mirrored typed (triad 2026-08-30) push the module just over 1000; no new subsystem, same seam.",
     "ouroboros/task_results.py": "Authority reads need an explicit strict mode so malformed child records cannot become a false zero count.",
     "ouroboros/task_status.py": None,
     "ouroboros/tools/browser.py": None,
@@ -228,7 +229,7 @@ BYTE_BASELINE_DEBT = {
 
 BYTE_DEBT = {
     "ouroboros/loop.py": 312794,
-    "tests/test_delegated_subagent_transport.py": 320408,
+    "tests/test_delegated_subagent_transport.py": 320340,
     "tests/test_devtools_benchmarks.py": 328116,
     "web/modules/chat.js": 224315,
 }

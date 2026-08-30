@@ -292,6 +292,76 @@ def test_checkpoint_commit_coop_roots_commits_dirty_tree_and_skips_secrets(tmp_p
     assert checkpoint_commit_coop_roots(data, "root1", has_live_tree_tasks=True) == []
 
 
+def test_checkpoint_ignores_readonly_children_and_bare_workspace_roots(tmp_path, monkeypatch):
+    """Delegation-usefulness fix (owner 2026-08-30): a READ-ONLY child's
+    workspace_root must never qualify a coop tree for the checkpoint commit -
+    a research task auto-committed the owner's pre-existing dirty tree it never
+    wrote to. Mutative authority (constraint write_root, non-readonly mode) is
+    the only qualifier."""
+    from ouroboros.coop_checkpoint import checkpoint_commit_coop_roots
+    from ouroboros.task_results import write_task_result
+
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROJECTS_ROOT", str(projects_root))
+    data = tmp_path / "data"
+    data.mkdir()
+
+    tree = projects_root / "coop_ro"
+    _init_git_repo(tree)
+    # Pre-existing dirt the readonly child had nothing to do with.
+    (tree / "owner_wip.txt").write_text("uncommitted owner work\n", encoding="utf-8")
+
+    # 1) A readonly child that merely OBSERVED the tree (workspace_root, no
+    #    write_root, local_readonly mode) never qualifies it.
+    write_task_result(
+        data, "child-ro", "completed",
+        delegation_role="subagent", parent_task_id="root-ro", root_task_id="root-ro",
+        workspace_root=str(tree),
+        task_constraint={"mode": "local_readonly_subagent", "surface": "external_workspace"},
+    )
+    assert checkpoint_commit_coop_roots(data, "root-ro") == []
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=str(tree),
+                            capture_output=True, text=True).stdout
+    assert "owner_wip.txt" in status, "the dirty tree stays exactly as the owner left it"
+
+    # 2) A mutative child qualifying via bare workspace_root only (no granted
+    #    write_root) does not qualify either: authority, not presence.
+    write_task_result(
+        data, "child-ws", "completed",
+        delegation_role="subagent", parent_task_id="root-ro", root_task_id="root-ro",
+        workspace_root=str(tree),
+        task_constraint={"mode": "acting_subagent", "surface": "external_workspace"},
+    )
+    assert checkpoint_commit_coop_roots(data, "root-ro") == []
+
+    # 3) The readonly PREDICATE itself must skip: a readonly child whose
+    #    constraint somehow carries a write_root still never qualifies.
+    write_task_result(
+        data, "child-ro-wr", "completed",
+        delegation_role="subagent", parent_task_id="root-ro", root_task_id="root-ro",
+        workspace_root=str(tree),
+        task_constraint={"mode": "local_readonly_subagent",
+                         "surface": "external_workspace", "write_root": str(tree)},
+    )
+    assert checkpoint_commit_coop_roots(data, "root-ro") == []
+
+    # 4) Positive control: a MUTATIVE child granted write_root still gets its
+    #    coop tree checkpointed - the fix narrows attribution, not capability.
+    write_task_result(
+        data, "child-mut", "completed",
+        delegation_role="subagent", parent_task_id="root-ro", root_task_id="root-ro",
+        workspace_root=str(tree),
+        task_constraint={"mode": "acting_subagent",
+                         "surface": "external_workspace", "write_root": str(tree)},
+    )
+    committed = checkpoint_commit_coop_roots(data, "root-ro")
+    assert [row["root"] for row in committed] == [str(tree)]
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=str(tree),
+                            capture_output=True, text=True).stdout
+    assert "owner_wip.txt" not in status, "the granted tree got its checkpoint commit"
+
+
 def test_checkpoint_never_touches_attached_folders(tmp_path, monkeypatch):
     """An owner-attached folder (outside the subagent-projects root) is NEVER
     auto-committed, even when a child recorded it as write_root."""

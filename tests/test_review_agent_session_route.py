@@ -1289,7 +1289,7 @@ def test_restart_reconciliation_settles_review_spend_to_the_recorded_root(
     outcomes = custody.reconcile_orphaned_runs(
         tmp_path, running_task_ids=set(), gateway_factory=lambda: FakeGateway(),
     )
-    assert [o["action"] for o in outcomes] == ["settled"]
+    assert [o["action"] for o in outcomes] == ["settle_attempted"]
 
     ledger = [json.loads(line) for line in
               (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()
@@ -1338,7 +1338,7 @@ def test_pending_invocation_recovery_replays_the_recorded_lineage(tmp_path, fake
     # The sweep recovers the invocation with NO ambient scope: the stored
     # record is the single source of the replay's facts, lineage included.
     result = custody._recover_pending_invocation(tmp_path, FakeGateway(), record)
-    assert result["action"] == "settled"
+    assert result["action"] == "settle_attempted"
     recovered = [r for r in _custody_rows(tmp_path)
                  if r["type"] == custody.STARTED
                  and r.get("recovered_from_pending_invocation")]

@@ -349,8 +349,9 @@ def test_over_budget_bootstrap_uses_only_a_live_interaction_channel(
         assert raw == ""
         assert ctx._configured_startup_refusal["reason"] == expected_reason
         assert calls == []
-        assert custody_rows[-1]["type"] == "configured_subagent_work_order_refused"
-        assert custody_rows[-1]["reason"] == expected_reason
+        assert custody_rows[-1]["type"] == "delegate_run_start_blocked"
+        assert custody_rows[-2]["type"] == "configured_subagent_work_order_refused"
+        assert custody_rows[-2]["reason"] == expected_reason
 
 
 @pytest.mark.parametrize(
@@ -433,14 +434,19 @@ def test_over_budget_start_reprobes_live_interaction_capability(
 
     assert len(closed) == 2
     assert ctx._configured_actor_bootstrap["source_channel"]["route"] == "codex"
-    assert custody_rows[-1]["route"] == "codex"
     if expected_reason:
         assert raw == ""
         assert ctx._configured_startup_refusal["reason"] == expected_reason
         assert starts == []
-        assert custody_rows[-1]["type"] == "configured_subagent_work_order_refused"
-        assert custody_rows[-1]["reason"] == expected_reason
-        assert custody_rows[-1]["source_channel"]["reason"] == (
+        # The refusal row plus the D5 attempt fact: a pre-custody refusal is
+        # still a durable delegate_start ATTEMPT (triad 2026-08-30).
+        assert custody_rows[-1]["type"] == "delegate_run_start_blocked"
+        assert custody_rows[-1]["reason"] == "configured_work_order_source_refused"
+        refused = custody_rows[-2]
+        assert refused["route"] == "codex"
+        assert refused["type"] == "configured_subagent_work_order_refused"
+        assert refused["reason"] == expected_reason
+        assert refused["source_channel"]["reason"] == (
             "interactive_unsupported"
             if start_interactive is False
             else "interactive_capability_missing"
@@ -451,6 +457,7 @@ def test_over_budget_start_reprobes_live_interaction_capability(
         assert out["startup"]["status"] == expected_status
         assert len(starts) == 1
         assert "WORK ORDER SOURCE REQUEST" in starts[0][0]
+        assert custody_rows[-1]["route"] == "codex"
         assert custody_rows[-1]["type"] == "configured_subagent_work_order_source_request"
         assert custody_rows[-1]["status"] == "attempted"
         assert custody_rows[-1]["source_channel"] == {

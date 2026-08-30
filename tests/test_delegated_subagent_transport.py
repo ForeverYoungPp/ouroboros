@@ -9,7 +9,7 @@ import pathlib
 import httpx
 import pytest
 
-from ouroboros import subagents, usage_accounting as ua
+from ouroboros import delegate_custody as dcust, subagents, usage_accounting as ua
 from ouroboros.config import (
     CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION,
     CLAUDEXOR_MIN_VERSION,
@@ -1528,8 +1528,10 @@ def test_settlement_reads_the_harnesss_own_spend_field(tmp_path, monkeypatch):
 
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
-    delegate._CUSTODY["run-1"] = delegate._RunCustody(
-        task_id="t-a", route_id="r", model="m", project_id="prj-ours", project_owned=True)
+    row = delegate._RunCustody(run_id="run-1", task_id="t-a", route_id="r",
+        model="m", project_id="prj-ours", project_owned=True)
+    dcust.record_started(tmp_path, row)
+    delegate._CUSTODY["run-1"] = row
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "t-a"
     ctx.task_metadata = {"root_task_id": "t-a"}
@@ -1961,8 +1963,9 @@ def test_a_failed_ledger_write_leaves_the_session_retryable(tmp_path, monkeypatc
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     monkeypatch.setattr(ua, "record_subscription_session", _boom)
     delegate._CUSTODY.clear()
-    custody = delegate._RunCustody(task_id="t-a", route_id="r", model="m",
-                                   project_id="prj-ours", project_owned=True)
+    custody = delegate._RunCustody(run_id="run-1", task_id="t-a", route_id="r",
+        model="m", project_id="prj-ours", project_owned=True)
+    dcust.record_started(tmp_path, custody)
     delegate._CUSTODY["run-1"] = custody
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "t-a"
@@ -1970,10 +1973,10 @@ def test_a_failed_ledger_write_leaves_the_session_retryable(tmp_path, monkeypatc
 
     json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
     assert custody.settled is False, "a lost write must stay retryable"
-    # Retirement is INDEPENDENT of whether the ledger write landed. The round-2 commit
-    # claimed this and the fixture owned no project, so deleting the call left the suite
+    # Retirement is INDEPENDENT of the ledger write: the round-2 commit claimed
+    # this while the fixture owned no project, so deleting the call stayed
     # green — a leak per failed settle, and a halted run never settles again.
-    assert retired == ["prj-ours"], "an owned registration must be retired even on failure"
+    assert retired == ["prj-ours"], "owned registration retired even on failure"
     delegate._CUSTODY.clear()
 
 
@@ -3091,14 +3094,10 @@ def test_durable_truncation_is_disclosed_never_a_bare_slice(tmp_path):
     assert "OMISSION NOTE" in disclosure["reason"] and "original length" in disclosure["reason"]
 
 
-def test_an_absent_run_closes_only_after_its_registration_is_discharged(tmp_path):
-    """P34R.4: `close_absent_run` emitted CLOSED_ABSENT even when `retire_project`
-    failed and left `project_owned=True`; replay then cleared ownership wholesale, so
-    the failed retirement was never retried and the owned daemon registration leaked
-    PERMANENTLY. The absent-run fact and the registration obligation are two different
-    things: custody now closes only once the obligation is discharged, the deferred
-    close stays in open_runs (disclosed by PROJECT_RETIRE_FAILED), and the next sweep
-    retries. A 404 on the REMOVE counts as discharged — absence is discharge."""
+def test_an_absent_run_closes_now_and_its_registration_survives_for_the_sweep(tmp_path):
+    """P34R.4 decoupled (owner 2026-08-30): CLOSED_ABSENT lands immediately;
+    the registration survives replay on project_owned (no wholesale clear) and
+    the registration sweep retries until the daemon accepts (404 = discharged)."""
     import ouroboros.delegate_custody as dc
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
@@ -3120,25 +3119,24 @@ def test_an_absent_run_closes_only_after_its_registration_is_discharged(tmp_path
         project_id="prj-owned", project_owned=True, ledger_root=str(tmp_path)))
     dc._CUSTODY.clear()
 
-    # 1. Retirement unreachable: the close is DEFERRED, not faked.
+    # 1. Retire unreachable: the run FACT lands now; the debt survives.
     out = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: gateway)
     assert [o["action"] for o in out] == ["absent"]
     kinds = _event_types(tmp_path)
     assert "delegate_run_project_retire_failed" in kinds, "the failure is disclosed"
-    assert "delegate_run_closed_absent" not in kinds, \
-        "custody must not close over an undischarged registration"
-    open_now = dc.open_runs(tmp_path)
-    assert [c.run_id for c in open_now] == ["run-gone"] and open_now[0].project_owned is True
+    assert "delegate_run_closed_absent" in kinds, "fact lands independently"
+    assert dc.open_runs(tmp_path) == [], "run custody is over"
+    owned = dc.owned_project_registrations(tmp_path)
+    assert [c.run_id for c in owned] == ["run-gone"] and owned[0].project_owned is True
 
-    # 2. The daemon recovers: the retry discharges the obligation and ONLY THEN closes.
+    # 2. Daemon recovers: the sweep discharges the obligation.
     gateway.remove_fails = False
     dc._CUSTODY.clear()
-    out = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: gateway)
-    assert [o["action"] for o in out] == ["absent"]
+    dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: gateway)
     kinds = _event_types(tmp_path)
-    assert "delegate_run_closed_absent" in kinds and "delegate_run_project_retired" in kinds
-    assert dc.open_runs(tmp_path) == []
-    assert gateway.removals == ["prj-owned", "prj-owned"], "the retirement was RETRIED"
+    assert "delegate_run_project_retired" in kinds
+    assert dc.owned_project_registrations(tmp_path) == []
+    assert gateway.removals == ["prj-owned"] * 3  # 3 lanes: close, 2 sweeps
 
     # 3. Absence is discharge: a 404 on the remove itself closes the run.
     class _AllGone(_AbsentRunGateway):
@@ -3334,7 +3332,7 @@ def test_reconciliation_recovers_a_pending_invocation_whose_worker_died(tmp_path
         def close(self): pass
 
     outcomes = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: _TerminalRecovery())
-    assert [o["action"] for o in outcomes] == ["settled"] and outcomes[0]["settled"] is True
+    assert [o["action"] for o in outcomes] == ["settle_attempted"] and outcomes[0]["settled"] is True
     key, body = posted[-1]
     assert key == token, "recovery must present the invocation's own wire key"
     assert body == posted[0][1], "recovery must replay the RECORDED canonical body"
@@ -3699,11 +3697,11 @@ def _health_invariants(tmp_path):
 # -- 3.10 settlement is atomic --------------------------------------------------
 
 
-def test_settlement_claims_terminal_only_when_the_durable_facts_landed(tmp_path, monkeypatch):
-    """A failed project retirement was suppressed and `settled=True` written anyway, so
-    the retry that would have released it could never happen. Both obligations are
-    idempotent, so an unfinished settlement is simply retried — and the retry must not
-    double-write the ledger row."""
+def test_settlement_follows_the_ledger_and_the_registration_debt_survives(tmp_path, monkeypatch):
+    """Decoupled (owner 2026-08-30): settlement follows the ledger row alone —
+    a sibling holding the shared project must not turn a SUCCEEDED run into an
+    unsettled one; the registration debt survives on project_owned for the
+    sweep, and the idempotent ledger row is never written twice."""
     import ouroboros.delegate_custody as dc
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gw
@@ -3727,15 +3725,16 @@ def test_settlement_claims_terminal_only_when_the_durable_facts_landed(tmp_path,
     ctx = _nanny_ctx(tmp_path)
 
     first = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
-    assert first["settlement"]["settled"] is False, "a failed retirement is not a settlement"
-    assert entry.settled is False and entry.project_owned is True
-    assert "delegate_run_settled" not in _event_types(tmp_path)
+    assert first["settlement"]["settled"] is True, "settles on the ledger row"
+    assert first["settlement"]["project_retired"] is False, "the debt is disclosed"
+    assert entry.settled is True and entry.project_owned is True
+    assert "delegate_run_settled" in _event_types(tmp_path)
+    assert [c.run_id for c in dc.owned_project_registrations(tmp_path)] == ["run-1"]
 
     failing["now"] = False
     second = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
     delegate._CUSTODY.clear()
-    assert second["settlement"]["settled"] is True, "the retry must be able to finish"
-    assert "delegate_run_settled" in _event_types(tmp_path)
+    assert second["settlement"]["settled"] is True
     rows = [json.loads(l) for l
             in (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()]
     sessions = [r for r in rows if r.get("kind") == "subscription_session"]
@@ -4471,31 +4470,38 @@ def test_a_reconciled_run_with_an_unread_artifact_is_visible_as_uncollected(
     from ouroboros.gateways import claudexor as gw
 
     class _Stub(_LiveRunStub):
-        def __init__(self):
-            super().__init__()
-            self.retire_ok = False
         def get_run(self, rid, **_kw):
             return {"lastSeq": 9, "primaryOutput": "V" * 120_000,
                     "summary": {"state": "succeeded", "spendUsd": 0.0}}
-        def remove_project(self, pid):
-            if not self.retire_ok:
-                raise RuntimeError("daemon busy")
+        def remove_project(self, pid): pass
 
     stub = _Stub()
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: stub)
+    # Decoupled: the run is held open for the sweep by an honest ledger
+    # failure, not by a busy project retirement.
+    import ouroboros.usage_accounting as ua
+    ledger_blocked = {"now": True}
+    real_record = ua.record_subscription_session
+
+    def _flaky_ledger(*args, **kwargs):
+        if ledger_blocked["now"]:
+            raise ua.UsageAccountingError("usage accounting lock unavailable")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(ua, "record_subscription_session", _flaky_ledger)
     delegate._CUSTODY.clear()
     dc.record_started(tmp_path, delegate._RunCustody(
         run_id="run-1", task_id="t-gone", route_id="r", model="m",
         project_id="prj", project_owned=True, root_task_id="t-gone", ledger_root=str(tmp_path)))
 
-    # The nanny sees the terminal preview (artifact staged) but the settlement cannot
-    # finish, and the task dies without ever reading the artifact to EOF.
+    # Nanny sees the staged preview; settlement cannot finish; the task dies
+    # without reading the artifact to EOF.
     out = json.loads(delegate._delegate_wait(_nanny_ctx(tmp_path, "t-gone"), "run-1", wait_sec=1))
     assert out["output_delivery"]["artifact"], "this scenario is about a staged artifact"
     assert out["settlement"]["settled"] is False
     delegate._CUSTODY.clear()          # the worker is gone
 
-    stub.retire_ok = True
+    ledger_blocked["now"] = False
     results = dc.reconcile_orphaned_runs(tmp_path, {"t-alive"}, gateway_factory=lambda: stub)
     assert [r["run_id"] for r in results] == ["run-1"]
     assert results[0]["staged_output_consumed"] is False
@@ -4593,7 +4599,7 @@ def test_an_orphaned_delegated_run_is_reconciled_when_its_owner_is_gone(tmp_path
     assert set(by_run) == {"run-orphan", "run-done"}, "a live owner's run must be left alone"
     assert by_run["run-orphan"]["action"] == "cancelled"
     assert live.cancels == [("run-orphan", "owner_task_gone")]
-    assert by_run["run-done"]["action"] == "settled" and by_run["run-done"]["settled"] is True
+    assert by_run["run-done"]["action"] == "settle_attempted" and by_run["run-done"]["settled"] is True
 
     # Unknown liveness reconciles nothing: never mass-cancel on missing information.
     live.cancels.clear()
@@ -4639,7 +4645,7 @@ def test_what_the_daemon_says_is_absent_is_closed_not_faulted_forever(tmp_path):
     for _ in range(3):
         passes.append(dc.reconcile_orphaned_runs(tmp_path, {"t-live"}, gateway_factory=_Router))
         dc._CUSTODY.clear()
-    assert [row["action"] for row in passes[0]] == ["absent", "settled"], passes[0]
+    assert [row["action"] for row in passes[0]] == ["absent", "settle_attempted"], passes[0]
     assert passes[1] == [] and passes[2] == [], "a closed run must not be reconciled again"
     assert dc.open_runs(tmp_path) == [], "neither run may stay open"
     assert dc.open_containment_faults(tmp_path) == []
@@ -6118,13 +6124,8 @@ def test_subscription_window_exhausted_beacon_wakes_the_waiting_parent(tmp_path,
 
 
 def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_path):
-    """W3 adjacent (d): a project registration is shared by every run delegated
-    into it — while siblings are unsettled, only the LOWEST-run_id sharer keeps
-    attempting the removal (one honest, disclosed retry lane; the deterministic
-    tie-break means some sharer always attempts, so deferral cannot deadlock);
-    the rest defer QUIETLY: no doomed daemon call, no PROJECT_RETIRE_FAILED
-    spam (the submarine wave-2 retire loop). The daemon's refusal text rides
-    the failure row as `reason`."""
+    """Any unsettled sibling defers every sharer QUIETLY; once all settle
+    the LOWEST-run_id sharer carries the retry lane."""
     import json as _json
 
     import ouroboros.delegate_custody as dc
@@ -6147,14 +6148,20 @@ def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_
             project_id="prj-shared", project_owned=True, ledger_root=str(tmp_path)))
     dc._CUSTODY.clear()
 
-    # Non-canonical sharer (higher run_id): quiet deferral — no call, no row.
+    # Non-canonical sharer: quiet deferral.
     custody_b = dc.replay(tmp_path)["run-bb"]
     dc.retire_project(tmp_path, gateway, custody_b)
     assert gateway.removals == []
     assert "delegate_run_project_retire_failed" not in _event_types(tmp_path)
     assert custody_b.project_owned is True
 
-    # Canonical sharer (lowest run_id): attempts, and the refusal text is typed.
+    # Canonical too defers while a sibling is unsettled.
+    custody_a = dc.replay(tmp_path)["run-aa"]
+    dc.retire_project(tmp_path, gateway, custody_a)
+    assert gateway.removals == []
+    # Sibling settles: canonical attempts; refusal is typed.
+    dc.emit(tmp_path, dc.SETTLED, {"run_id": "run-bb", "task_id": "t-2", "route": "r"})
+    dc._CUSTODY.clear()
     custody_a = dc.replay(tmp_path)["run-aa"]
     dc.retire_project(tmp_path, gateway, custody_a)
     assert gateway.removals == ["prj-shared"]

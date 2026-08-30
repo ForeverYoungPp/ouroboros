@@ -627,7 +627,8 @@ class TestOrphanReconciliation:
         outcomes = custody.reconcile_orphaned_runs(
             data, set(), gateway_factory=lambda: _TerminalSweepGateway("run-rec"))
         custody._CUSTODY.clear()
-        assert [o["action"] for o in outcomes] == ["settled"]
+        assert [o["action"] for o in outcomes] == ["settle_attempted"]
+        assert outcomes[0]["settled"] is True
 
         replayed = custody.replay(data)["run-rec"]
         assert replayed.snapshot_id == "inv-lost"
@@ -661,7 +662,7 @@ class TestOrphanReconciliation:
             data, set(), gateway_factory=lambda: _TerminalSweepGateway("run-inv-orphan"))
         custody._CUSTODY.clear()
         row = outcomes[0]
-        assert row["action"] == "settled" and row["settled"] is True
+        assert row["action"] == "settle_attempted" and row["settled"] is True
         assert row["patch_capture"] == "ready_with_changes"
         assert row["patch_disposition"] == "pending"
         cap_dir = custody.delegated_capture_dir(data, "t-dead2", "inv-orphan")
