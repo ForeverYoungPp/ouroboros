@@ -2011,16 +2011,20 @@ kill lane, which performs no terminal write of its own, runs the same guarded
 refresh (`trigger=kill_path_clear`; it touches only a row that exists with a
 non-empty stored list, so a fresh-task kill can never mint a row or pay a
 second write). The finalize-on-miss cancel write threads the audit into its
-delivery only, never onto the row — a stale settled row raced into that lane
-heals on the next boot's backfill. Every refresh is audit-only
+delivery only, never onto the row — and the GR6-1b settled-before-capture
+short-circuit likewise leaves the stored row byte-identical by mandate — a
+stale settled row raced into either lane heals on the next boot's backfill.
+Every refresh is audit-only
 (never cancels), never rewrites `reason_code` (owner Q5=A), and never
 recomputes the frozen `delegated_runs_started/settled/succeeded/failed`
 counters — those remain a HISTORICAL SNAPSHOT taken at the original terminal
 write (owner decision Q2=B, custody-absorption sprint), so a healed row may
 honestly read `unreconciled: []` beside `settled: 0`; current liveness lives in
-the `delegate_terminal_reconciliation` envelope (`trigger` —
-`loop_exit`/`cancel_publication`/`sweep_refresh`/`boot_backfill`/`kill_path_clear`
-— plus `open_run_ids`/`pending_invocation_ids`/`undisposed_patch_run_ids`). An
+the `delegate_terminal_reconciliation` envelope (`trigger` — the refresh
+triggers are `sweep_refresh`/`boot_backfill`/`kill_path_clear`; other recorder
+callers stamp their own, e.g. `loop_exit`, `cancel_publication`, the workers'
+kill/terminalization triggers — plus
+`open_run_ids`/`pending_invocation_ids`/`undisposed_patch_run_ids`). An
 audit that MATCHES the stored disclosure performs no write and emits no custody
 event, so a permanently-unreconcilable row (an undisposed patch awaiting its
 owner) does not churn the row or events.jsonl on every boot — and patch debt

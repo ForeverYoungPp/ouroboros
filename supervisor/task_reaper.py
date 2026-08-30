@@ -425,9 +425,12 @@ def _run_retry_admission_transaction(
                                 reason_code=terminal_reason,
                                 review_trigger="supervisor_terminal",
                             ),
-                            # UNCONDITIONAL (D1b): a clean audit clears a stale
-                            # stored list in this same terminal write.
-                            delegated_runs_unreconciled=list(unreconciled_runs or []),
+                            # D1b: an AUDITED list — clean [] included — is
+                            # written unconditionally so a clean audit clears a
+                            # stale stored list; None means no audit ran and
+                            # must not mint an unaudited clean claim.
+                            **({"delegated_runs_unreconciled": list(unreconciled_runs)}
+                               if unreconciled_runs is not None else {}),
                             **recon_fields,
                             result=(
                                 f"Task killed by {terminal_reason} after "
@@ -503,8 +506,9 @@ def _run_retry_admission_transaction(
                                     if retry_task_id and retry_task_id != task_id else ""
                                 ),
                                 retry_task_id=retry_task_id or task_id,
-                                # UNCONDITIONAL (D1b): mirror of the write above.
-                                delegated_runs_unreconciled=list(unreconciled_runs or []),
+                                # D1b: mirror of the audited-or-absent write above.
+                                **({"delegated_runs_unreconciled": list(unreconciled_runs)}
+                                   if unreconciled_runs is not None else {}),
                                 **recon_fields,
                                 result=(
                                     f"Task killed by {terminal_reason} after "
