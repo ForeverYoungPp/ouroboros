@@ -296,12 +296,10 @@ def build_review_pack(
             )
         )
 
-    atlas = _compile(False)
-    if atlas_assembly_failed(atlas):
-        # Graceful compact retry (mirrors scope review): the durable manifest
-        # keeps full per-file coverage while the visible prompt switches to the
-        # compact coverage index, freeing manifest tokens for required files.
-        atlas = _compile(True)
+    # Compact coverage is the atlas default (the durable manifest keeps full
+    # per-file coverage either way), so there is no fuller form to fall back
+    # from and no compact retry rung anymore.
+    atlas = _compile(True)
     if atlas_assembly_failed(atlas):
         # No pack: a review that could not assemble a required artifact does not
         # run on the remainder (BIBLE P3). The manifest carries the disclosure.
