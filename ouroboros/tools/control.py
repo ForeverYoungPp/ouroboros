@@ -2290,9 +2290,16 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
 
     Stored in ToolContext, applied on the next LLM call in the loop.
     """
-    from ouroboros.llm import LLMClient, normalize_reasoning_effort
+    from ouroboros.config import EFFORT_SCALE
+    from ouroboros.llm import LLMClient
     available = LLMClient().available_models()
     changes = []
+
+    # Validated before anything is applied: an unknown effort refuses the WHOLE call,
+    # so a same-call model switch is not half-applied behind a rejected tier.
+    requested_effort = str(effort or "").strip().lower()
+    if requested_effort and requested_effort not in EFFORT_SCALE:
+        return f"⚠️ Unknown effort: {effort}. Valid: {', '.join(EFFORT_SCALE)}"
 
     if model:
         if model not in available:
@@ -2313,10 +2320,9 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
         ctx.active_use_local_override = use_local
         changes.append(f"model={model}{' (local)' if use_local else ''}")
 
-    if effort:
-        normalized = normalize_reasoning_effort(effort, default="medium")
-        ctx.active_effort_override = normalized
-        changes.append(f"effort={normalized}")
+    if requested_effort:
+        ctx.active_effort_override = requested_effort
+        changes.append(f"effort={requested_effort}")
 
     if not changes:
         return f"Current available models: {', '.join(available)}. Pass model and/or effort to switch."
@@ -2954,6 +2960,8 @@ _PROMOTE_CHAT_DESCRIPTION = (
 
 
 def get_tools() -> List[ToolEntry]:
+    from ouroboros.config import EFFORT_SCALE
+
     return [
         ToolEntry("set_tool_timeout", {
             "name": "set_tool_timeout",
@@ -3188,8 +3196,8 @@ def get_tools() -> List[ToolEntry]:
                            "or want to save budget (simple tasks). Takes effect on next round.",
             "parameters": {"type": "object", "properties": {
                 "model": {"type": "string", "description": "Model name (e.g. anthropic/claude-sonnet-4). Leave empty to keep current."},
-                "effort": {"type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-                           "description": "Reasoning effort level (clamped to the model's real ceiling). Leave empty to keep current."},
+                "effort": {"type": "string", "enum": list(EFFORT_SCALE),
+                           "description": "Reasoning effort level (adapted down per route when a model tops out lower). Leave empty to keep current."},
             }, "required": []},
         }, _switch_model),
         ToolEntry("get_task_result", {

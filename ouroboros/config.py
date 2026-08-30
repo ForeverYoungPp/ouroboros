@@ -286,7 +286,7 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # writes at the documented 2x-vs-1.25x ratio). Non-Anthropic wire formats are a NO-OP by construction
     # (Gemini documents no ttl field — the v5.30.0 outage class).
     "OUROBOROS_PROMPT_CACHE_TTL": "1h",
-    # Reasoning effort per task type: none | low | medium | high
+    # Reasoning effort per task type: any EFFORT_SCALE tier (the ordered SSOT below)
     "OUROBOROS_EFFORT_TASK": "medium",
     "OUROBOROS_EFFORT_EVOLUTION": "high",
     "OUROBOROS_EFFORT_REVIEW": "high",
@@ -446,10 +446,10 @@ def get_consciousness_model() -> str:
     """Return the high-horizon background-consciousness model slot."""
     return str(os.environ.get("OUROBOROS_MODEL_CONSCIOUSNESS", "") or "").strip() or _main_model()
 
-# v6.57.0 — EFFORT_SCALE: ORDERED reasoning-effort SSOT (low→high), the single place a tier
-# is defined (settings, llm.py builder, switch_model enum, subagent lanes). Exact-route
-# request-wire recovery, not legacy model-global evidence, owns provider adaptation.
-EFFORT_SCALE: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# v6.57.0 — EFFORT_SCALE: ORDERED reasoning-effort SSOT (low→high), the single place a tier is
+# defined (settings, llm.py builder, switch_model enum, subagent lanes). `ultra` = the codex
+# vendor tier above `max`; above-ceiling tiers adapt per route (API wire recovery / delegated).
+EFFORT_SCALE: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
 
 def effort_rank(value: str) -> int:

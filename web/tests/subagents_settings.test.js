@@ -199,8 +199,11 @@ test('validation protects stable unique IDs, route shape, effort and ten-row lim
         apiRow({ route: { kind: 'api_chat', target_id: 'x' } }),
     ])).join(' '), /API model or Agent session/);
     assert.match(validateAvailableSubagentsSetting(setting([
-        apiRow({ effort: 'ultra' }),
+        apiRow({ effort: 'enormous' }),
     ])).join(' '), /unsupported reasoning effort/);
+    assert.deepEqual(validateAvailableSubagentsSetting(setting([
+        apiRow({ effort: 'ultra' }),
+    ])), []);
     assert.deepEqual(validateAvailableSubagentsSetting(setting([
         apiRow({ subagent_id: 'owner.scout' }),
     ])), []);

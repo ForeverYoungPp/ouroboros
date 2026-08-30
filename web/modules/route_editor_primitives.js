@@ -9,7 +9,7 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 export const ROUTE_KIND_API_MODEL = 'api_model';
 export const ROUTE_KIND_AGENT_SESSION = 'agent_session';
 export const API_ROUTE_CHOICE = 'api';
-export const EFFORT_CHOICES = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+export const EFFORT_CHOICES = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 
 export function mintStableId(prefix, takenIds) {
     const taken = new Set(takenIds || []);
