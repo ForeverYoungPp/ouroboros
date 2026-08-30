@@ -971,7 +971,7 @@ def _check_advisory_freshness(ctx: ToolContext, commit_message: str,
     if open_obs:
         lines = [f"\nOpen obligations ({len(open_obs)}):"]
         lines += _render_obligations()
-        lines.append("  → advisory_review will verify each obligation is resolved.")
+        lines.append("  → preflight_review will verify each obligation is resolved.")
         obs_section = "\n".join(lines)
     debt_section = ""
     if open_debts:

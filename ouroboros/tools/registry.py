@@ -2013,6 +2013,8 @@ class ToolRegistry:
         # Core tools plus meta-tools for enabling extended tools.
         result = []
         for e in self._entries.values():
+            if e.alias_for:  # compat aliases are callable, never advertised
+                continue
             if e.name in disabled_tools:  # declarative tool policy (task_contract.disabled_tools)
                 continue
             if not _presence_tool_allowed(self._ctx, e.name):
@@ -3637,7 +3639,8 @@ class ToolRegistry:
         if entry is None:
             if ext_tool and callable(ext_tool.get("handler")):
                 return self._dispatch_extension_tool(name, ext_tool, args)
-            return f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(self._entries.keys()))}"
+            return (f"⚠️ Unknown tool: {name}. Available: "
+                    + ', '.join(sorted(n for n, e in self._entries.items() if not e.alias_for)))
         args, python_resolution, python_block = self._resolve_python_predispatch(
             name, args, _runtime_mode, effective_constraint, resolved_binding,
         )

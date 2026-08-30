@@ -736,7 +736,7 @@ Concrete requirements:
 | Triad review (`tools/review.py`) | ✅ via preamble | ✅ via `load_governance_doc` | ✅ via `load_governance_doc` |
 | ↳ Anti-thrashing (v4.35.1) | — | — | Open obligations loaded from `review_state` via `load_state(drive_root)` + `make_repo_key(repo_dir)`, injected unconditionally into `_build_review_history_section` prompt context. Same mechanism in `scope_review.py::_build_scope_prompt` (best-effort when `drive_root` available). |
 | Background consciousness (`consciousness.py`) | ✅ full | ✅ full (max) / navigation map (low) | — (not yet required) |
-| Advisory pre-review (`tools/claude_advisory_review.py`) | Two delivery forms: an `api` row receives the full doc inline via `load_governance_doc`; an `agent_session` row receives a resolvable pointer marked MANDATORY FULL READ and the session reads the full doc itself — retrieval is disclosed and non-certifying (the mirror of plan review's `agent_session` delivery form) | same two delivery forms (`api` inline / `agent_session` pointer) | same two delivery forms (`api` inline / `agent_session` pointer) |
+| Advisory pre-review (`tools/claude_advisory_review.py`) | Two delivery classes: an `api_chat` row runs the bounded NATIVE inspection episode (governance docs reached through its read-only tools); an `agent_session` row receives a resolvable pointer marked MANDATORY FULL READ and the session reads the full doc itself — retrieval is disclosed (native reads are host-observed; vendor-session reads are not) | same two delivery classes | same two delivery classes |
 | Scope review (`tools/scope_review.py`) | full canonical doc + Atlas accounting | full canonical doc + Atlas accounting | full canonical doc + Atlas accounting |
 | Skill review (`skill_review.py`) | full inline (`api_chat`) / mandatory full source-root read (`agent_session`) | full inline (`api_chat`) / mandatory full source-root read (`agent_session`) | full inline (`api_chat`) / mandatory full source-root read (`agent_session`) |
 | Plan review (`tools/plan_review.py`) | full for a SELF-MODIFICATION plan (structural path fact: a declared target resolves under the system repo); otherwise a heading-derived navigation map of BIBLE.md generated at runtime (never a copy) | inline, in full, for a self-modification plan; otherwise the lossless navigation map + a resolvable pointer (W3) | named on-demand pointer; a reviewer that needs it returns `need_evidence` and the host attaches it on the next cycle |
@@ -960,7 +960,7 @@ engineering standards, you MUST:
 Reviewed commits separate cheap improvement evidence from authoritative
 candidate-bound authority.
 
-1. **Cheap advisory preflight.** After edits, `advisory_review` may find
+1. **Cheap advisory preflight.** After edits, `preflight_review` may find
    omissions before the expensive gate. Without an explicit skip,
    `commit_reviewed` requires fresh advisory coverage and no open advisory
    obligations or commit-readiness debt; any edit makes that coverage stale.

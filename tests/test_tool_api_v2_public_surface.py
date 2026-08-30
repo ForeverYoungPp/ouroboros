@@ -116,7 +116,7 @@ def test_runtime_prompts_do_not_advertise_legacy_public_tool_names():
         "read_file",
         "run_command",
         "commit_reviewed",
-        "advisory_review",
+        "preflight_review",
         "schedule_subagent",
         "task_acceptance_review",
     ):
@@ -1508,9 +1508,18 @@ def test_preflight_review_rename_keeps_a_callable_unadvertised_alias(tmp_path):
     assert "preflight_review" in names
     assert "advisory_review" not in names
     assert "advisory_review" not in registry.available_tools()
+    # The core/heal envelope (schemas(core_only=True)) must not advertise the
+    # alias either — B1 class: the default path filtered it, the core path
+    # leaked it into heal-mode prompts.
+    core_names = {schema["function"]["name"] for schema in registry.schemas(core_only=True)}
+    assert "preflight_review" in core_names
+    assert "advisory_review" not in core_names
     # The alias dispatches to the same organ (a refusal about tool identity
     # would start with "Unknown tool").
     assert not registry.execute("advisory_review", {}).startswith("⚠️ Unknown tool")
+    # And the unknown-tool refusal's Available listing never advertises it.
+    listing = registry.execute("definitely_not_a_tool", {})
+    assert "advisory_review" not in listing
     # Policy rows exist for BOTH spellings (the alias call is policy-skipped
     # exactly like the canonical one).
     assert TOOL_POLICY.get("preflight_review") is POLICY_SKIP

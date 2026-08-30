@@ -143,20 +143,10 @@ class TestSyntaxPreflightHelper:
         assert "PREFLIGHT_BLOCKED" in out
 
 
-def _sdk_available() -> bool:
-    """The Claude Agent SDK is an optional dependency — skip SDK-integration
-    tests cleanly when it is not installed (e.g. minimal test venvs)."""
-    try:
-        import claude_agent_sdk  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-@pytest.mark.skipif(not _sdk_available(), reason="claude_agent_sdk not installed")
 class TestPreflightGatesBeforeSDK:
-    """Verify the preflight short-circuit fires BEFORE the Claude SDK call,
-    saving the SDK cost when staged `.py` files cannot compile."""
+    """Verify the preflight short-circuit fires BEFORE the paid critic call
+    (native episode), saving the spend when staged `.py` files cannot compile.
+    (The retired Claude-SDK skipif is gone: the successor path needs no SDK.)"""
 
     def test_syntax_error_returns_before_sdk(self, tmp_path, monkeypatch):
         """End-to-end: a staged syntactically broken .py file returns

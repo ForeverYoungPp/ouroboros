@@ -1372,7 +1372,7 @@ def _run_claude_advisory(
         if skip is not None:
             return skip
         err_msg = _format_advisory_error(
-            prefix=f"SDK call raised {type(e).__name__}",
+            prefix=f"Advisory delivery raised {type(e).__name__}",
             result_error=str(e),
             stderr_tail="",
             session_id="",
@@ -1686,7 +1686,7 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
         status = str(getattr(latest, "status", "") or "")
         if latest and status in {"tests_preflight_blocked", "preflight_blocked"} and not stale_from_edit:
             if status == "tests_preflight_blocked":
-                problem = "test preflight: pytest failed before the Claude SDK call"
+                problem = "test preflight: pytest failed before the paid critic call"
                 fix = "Fix the failing tests and re-run preflight_review. Use preflight_review(skip_tests=True) only for intentional WIP code."
             else:
                 problem = "syntax preflight: a staged .py file has a SyntaxError"
@@ -1784,7 +1784,7 @@ def _persist_preflight_record(
             pre_state.add_run(_advisory_run_record(
                 snapshot_hash, commit_message, str(record.get("status") or "error"),
                 repo_key=repo_key, task_id=task_id,
-                snapshot_summary=("advisory SDK error" if record.get("session_id") else "preflight block — SDK not called"),
+                snapshot_summary=("advisory delivery error" if record.get("session_id") else "preflight block — critic not called"),
                 raw_result=record.get("raw_result"),
                 snapshot_paths=record.get("paths"),
                 readiness_warnings=record.get("readiness_warnings"),
@@ -1887,7 +1887,7 @@ def _advisory_pre_sdk_gate(
             "error": release_preflight_err,
             "readiness_warnings": readiness_warnings,
             "message": (
-                "Advisory SDK was skipped: deterministic release metadata preflight "
+                "Advisory delivery was skipped: deterministic release metadata preflight "
                 "failed before provider budget was spent."
             ),
         })
@@ -2113,7 +2113,7 @@ def _handle_advisory_pre_review(
             "error": raw_result,
             "readiness_warnings": readiness_warnings,
             "message": (
-                "Advisory SDK was skipped: a staged .py file has a SyntaxError. "
+                "Advisory delivery was skipped: a staged .py file has a SyntaxError. "
                 "Fix the syntax error listed above and re-run preflight_review."
             ),
         })
