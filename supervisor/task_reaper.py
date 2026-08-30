@@ -425,10 +425,9 @@ def _run_retry_admission_transaction(
                                 reason_code=terminal_reason,
                                 review_trigger="supervisor_terminal",
                             ),
-                            **(
-                                {"delegated_runs_unreconciled": unreconciled_runs}
-                                if unreconciled_runs else {}
-                            ),
+                            # UNCONDITIONAL (D1b): a clean audit clears a stale
+                            # stored list in this same terminal write.
+                            delegated_runs_unreconciled=list(unreconciled_runs or []),
                             **recon_fields,
                             result=(
                                 f"Task killed by {terminal_reason} after "
@@ -504,10 +503,8 @@ def _run_retry_admission_transaction(
                                     if retry_task_id and retry_task_id != task_id else ""
                                 ),
                                 retry_task_id=retry_task_id or task_id,
-                                **(
-                                    {"delegated_runs_unreconciled": unreconciled_runs}
-                                    if unreconciled_runs else {}
-                                ),
+                                # UNCONDITIONAL (D1b): mirror of the write above.
+                                delegated_runs_unreconciled=list(unreconciled_runs or []),
                                 **recon_fields,
                                 result=(
                                     f"Task killed by {terminal_reason} after "
@@ -1310,8 +1307,10 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                         review_trigger="supervisor_terminal",
                     ),
                     # GR5-2: the reap outcome discloses the delegated runs the
-                    # custody reconcile above could not settle.
-                    **({"delegated_runs_unreconciled": unreconciled} if unreconciled else {}),
+                    # custody reconcile above could not settle. UNCONDITIONAL
+                    # (D1b): a clean audit writes [] so a stale stored list is
+                    # cleared by this same terminal write.
+                    delegated_runs_unreconciled=list(unreconciled or []),
                     **recon_fields,
                     result=(
                         f"Task killed by {terminal_reason} after "

@@ -664,6 +664,21 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
         # already-settled path audits custody exactly like the kill path and
         # threads the disclosure into the miss-lane delivery.
         unreconciled = _reconcile_delegated_runs_on_kill(q, task_id)
+        # D1b: this lane performs no terminal write of its own, so a stale
+        # non-empty stored disclosure would survive the kill forever. The
+        # guarded refresh clears it only when the settled row already carries a
+        # non-empty list AND the fresh audit differs — an ordinary fast-lane
+        # kill (nothing stored, or already current) performs no extra write,
+        # and a task with no stored row can never be minted here.
+        try:
+            from ouroboros.delegate_terminal import refresh_terminal_reconciliation
+
+            refresh_terminal_reconciliation(
+                pathlib.Path(q.DRIVE_ROOT), task_id, trigger="kill_path_clear",
+            )
+        except Exception:
+            log.debug("Kill-path custody-disclosure refresh failed for %s",
+                      task_id, exc_info=True)
         owed_ok = True
         if intent and deliver:
             # GR2-4 (fast already-settled re-entry): the settled answer is
@@ -1285,7 +1300,10 @@ def _finish_captured_running(
             **_cancel_result_fields(
                 task, existing=existing, artifact_capture=captured, **cost_fields,
                 **_intent_outcome_fields(intent or {}),
-                **({"delegated_runs_unreconciled": unreconciled} if unreconciled else {}),
+                # UNCONDITIONAL (D1b): a clean audit writes [] so a stale
+                # non-empty list from an earlier terminal write is cleared by
+                # this same merge-write, never left lying beside a fresh kill.
+                delegated_runs_unreconciled=unreconciled,
                 result="Running task cancelled and worker terminated." + salvage_note,
             ),
         )

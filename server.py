@@ -1157,6 +1157,21 @@ def _startup_custody_sweep() -> None:
         log.debug("Process custody startup reap failed", exc_info=True)
     _reconcile_delegated_runs(set())
     try:
+        # D1a boot backfill, ONCE per generation and AFTER the orphan reconcile
+        # (so this generation's settlements are already visible to the audit):
+        # a run settled in a PREVIOUS generation never appears in any current
+        # pass's outcomes, so the sweep-side refresh above can never reach its
+        # task's stored disclosure — the backfill joins from the stored terminal
+        # results instead and heals every generation-crossing stale row.
+        from ouroboros.delegate_terminal import backfill_terminal_reconciliations
+
+        refreshed = backfill_terminal_reconciliations(DATA_DIR)
+        if refreshed:
+            log.info("Boot custody backfill refreshed %d stored disclosure(s): %s",
+                     len(refreshed), refreshed)
+    except Exception:
+        log.debug("Boot custody-disclosure backfill failed", exc_info=True)
+    try:
         # Phase A boot migration: legacy ``cancel_requested`` status latches
         # become ordinary durable cancel intents; the supervisor watchdog then
         # drives each through custody to a real settled outcome.

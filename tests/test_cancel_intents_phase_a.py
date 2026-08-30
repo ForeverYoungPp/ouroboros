@@ -2707,6 +2707,32 @@ def test_unreconciled_delegated_runs_are_disclosed_on_the_cancelled_result(
     assert [r for r in rows if r.get("type") == "delegated_runs_unreconciled"]
 
 
+@pytest.mark.serial
+def test_kill_path_clean_audit_clears_a_stale_unreconciled_list(qenv, monkeypatch):
+    """D1b: the running-kill terminal write carries the fresh audit
+    UNCONDITIONALLY, so a clean audit clears a stale non-empty list left by an
+    earlier terminal write instead of letting it lie beside the kill."""
+    task_id = "delegating-clean"
+    task, child_drive, proc = _live_split_drive_task(qenv, task_id)
+    write_task_result(qenv.drive, task_id, STATUS_RUNNING, result="working",
+                      delegated_runs_unreconciled=["run-ghost"])
+    ci.request_cancel(qenv.drive, task_id)
+    monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        "supervisor.terminal_delivery.deliver_unreviewed_salvage",
+        lambda *_a, **_kw: None,
+    )
+
+    try:
+        assert qenv.tl.cancel_task_custody(task_id) == qenv.tl.CANCEL_CANCELLED
+    finally:
+        proc.terminate()
+
+    stored = load_task_result(qenv.drive, task_id)
+    assert stored["status"] == STATUS_CANCELLED
+    assert stored["delegated_runs_unreconciled"] == []
+
+
 def test_nested_scoped_home_is_disclosed_even_with_an_os_boundary(tmp_path, monkeypatch):
     """A-F13: a nested home + recorded boundary was promoted to verified=true and
     its durable unconfined row was suppressed."""
