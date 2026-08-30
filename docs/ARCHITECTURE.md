@@ -155,7 +155,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── delegate_start_instructions.py ← Stable harness host instructions plus the bounded, separately hashed coordination appendix; canonical work-order authority remains a separate immutable field. The host's pre-start sends no appendix (`prompt=""`); a model-issued start may attach one, and an appendix over the instruction budget refuses before provisioning rather than truncating.
       ├── delegate_recovery.py ← Narrow exact-leaf recovery for a proven non-signal worker crash and an explicit planned-self-restart handoff; validates task/config/worktree/authority/run/cursor bindings before adoption and vetoes every no-resume cause.
       ├── delegate_pending.py  ← Durable pending-invocation replay helpers: preserve the original idempotency key and canonical start body when a start response/custody write is uncertain.
-      ├── delegate_terminal.py ← Task-scoped delegated-run reconciliation and terminal custody audit persistence used by the agent's settlement path.
+      ├── delegate_terminal.py ← Task-scoped delegated-run reconciliation and terminal custody audit persistence used by the agent's settlement path; also the write-side refresh of a TERMINAL task's stored custody disclosure (sweep refresh, once-per-generation boot backfill over the stored results with one shared custody snapshot, kill-path clear) — change-gated so an unchanged audit performs no write and no emit; run counters stay a historical snapshot (owner Q2=B), the `delegate_terminal_reconciliation` envelope is the current-liveness surface.
       ├── subagent_dispatch_notes.py ← Child-facing compatibility dispatch notes and typed blocked outcome. A configured session nanny's note states the charter: the host starts the exact configured leaf before its first metered round, the startup/wake receipt is the truth about that run, waiting on it is the nanny's own call, and its rounds are for judgment — never for co-building beside a paid run; the non-configured harness branch keeps the "decide your delegation plan first" mandate. `agent` keeps the historical re-exports.
       ├── subagent_messages.py ← Bounded durable child-message identity shared by final-frame production, supervisor recovery, compact chat persistence, and history replay.
       ├── subagents.py         ← Structured lineage/usage envelopes and bounded legacy lane/executor compatibility. Tasks carrying a `configured_subagent` snapshot dispatch through `subagent_runtime`; old durable records and explicitly compatible legacy calls retain their historical interpretation without becoming the active selector.
@@ -1009,7 +1009,7 @@ No retry or new assignment may occupy a timed-out slot until the original proces
 
 Unexpected worker death follows a separate three-way decision. An already-terminal durable result wins and is projected idempotently; a negative process exit code is terminal for every task because replaying the same infrastructure or platform signal usually repeats the failure and burns budget; only an otherwise eligible non-signal crash retries within `QUEUE_MAX_RETRIES`. Repeated busy-worker or all-workers-dead failures trip the crash-storm fence, disable pooled admission, and surface recovery instead of cycling workers indefinitely. Direct chat remains available because it is not owned by the pooled scheduler.
 
-Startup and throttled maintenance reconcile three distinct residue classes. Process custody checks strict PID, start-time, command fingerprint, owner task, session, and generation evidence before reaping an owned process. Delegated-run reconciliation applies the same owner-gone reasoning to external harness rows. Task, review, and project reconciliation repairs durable records whose producer no longer exists. These are not command-line-class kill sweeps, and one development or runtime instance must never reap another. The dedicated watchdog separately observes supervisor-loop liveness and a stuck in-process direct turn; it alerts and requests restart, but cannot safely unlock another thread's lock or kill work whose custody it does not own. Ephemeral owner turns remain a separate responsive lane, not a second scheduler.
+Startup and throttled maintenance reconcile three distinct residue classes. Process custody checks strict PID, start-time, command fingerprint, owner task, session, and generation evidence before reaping an owned process. Delegated-run reconciliation applies the same owner-gone reasoning to external harness rows; directly after the startup orphan reconcile, a once-per-generation backfill re-audits every stored terminal result still disclosing unreconciled delegated runs — a settlement from a previous generation appears in no current pass's outcomes, so only this reverse join from the stored rows can heal the stale projection — sharing one custody snapshot across all audits, writing and emitting nothing for a row whose audit is unchanged. The refreshed row keeps its `delegated_runs_*` counters as a historical snapshot from the original terminal write (owner decision); the `delegate_terminal_reconciliation` envelope (`trigger` + `open_run_ids`) is the current-liveness surface. Task, review, and project reconciliation repairs durable records whose producer no longer exists. These are not command-line-class kill sweeps, and one development or runtime instance must never reap another. The dedicated watchdog separately observes supervisor-loop liveness and a stuck in-process direct turn; it alerts and requests restart, but cannot safely unlock another thread's lock or kill work whose custody it does not own. Ephemeral owner turns remain a separate responsive lane, not a second scheduler.
 
 Cooperative project checkpointing has two equivalent quiescence triggers. A host-minted genesis or cooperative tree is checked when its root settles with no live descendants, and again when the last child settles beneath a root that is already terminal. The second trigger is essential because a root-scope budget stop terminalizes the root before its children reach their own dispatch boundaries; the old root-only trigger saw a live tree once and never returned. Event dispatch only detects the condition after removing the finishing task from RUNNING. The bounded git chain runs on a daemon thread, revalidates quiescence under the queue lock immediately before mutation, and uses a per-root latch that remembers and replays a trigger arriving during an in-flight check. Only host-minted project roots are eligible; owner-attached folders are never auto-committed, credential-shaped files remain excluded and disclosed, and every material success, skip, or error receives a durable receipt.
 
@@ -1993,6 +1993,42 @@ returned as the failed block but leaves the row uncaptured, so every retry point
 manifest is re-checked and re-captured on replay rather than trusted, and the
 reject branch re-checks the manifest before releasing the snapshot (rejecting a
 READY_NO_CHANGES capture stays legitimate — nothing to lose).
+
+**The stored `delegated_runs_unreconciled` projection is healed only from the
+write side, at three seams.** Readers (`get_task_result`, task details, the
+retry-lineage merge) serve the stored projection — projection-over-replay, no
+live custody join — so a run settled AFTER its task's terminal write leaves the
+stored row lying until a write-side refresh: the periodic sweep refreshes the
+tasks named in its own reconcile outcomes (nanny-leaf S1); the boot backfill
+(`delegate_terminal.backfill_terminal_reconciliations`, once per server
+generation, after the startup orphan reconcile) re-audits every stored TERMINAL
+row still carrying a non-empty disclosure under one shared custody snapshot —
+the generation-crossing residual no outcome-driven refresh can reach; and the
+kill paths clear a stale list — the running-kill cancel write and the reaper's
+terminal/retry writes carry the fresh audit UNCONDITIONALLY (a clean audit
+writes `[]` in the caller's own terminal write), while the fast already-settled
+kill lane, which performs no terminal write of its own, runs the same guarded
+refresh (`trigger=kill_path_clear`; it touches only a row that exists with a
+non-empty stored list, so a fresh-task kill can never mint a row or pay a
+second write). The finalize-on-miss cancel write threads the audit into its
+delivery only, never onto the row — and the GR6-1b settled-before-capture
+short-circuit likewise leaves the stored row byte-identical by mandate — a
+stale settled row raced into either lane heals on the next boot's backfill.
+Every refresh is audit-only
+(never cancels), never rewrites `reason_code` (owner Q5=A), and never
+recomputes the frozen `delegated_runs_started/settled/succeeded/failed`
+counters — those remain a HISTORICAL SNAPSHOT taken at the original terminal
+write (owner decision Q2=B, custody-absorption sprint), so a healed row may
+honestly read `unreconciled: []` beside `settled: 0`; current liveness lives in
+the `delegate_terminal_reconciliation` envelope (`trigger` — the refresh
+triggers are `sweep_refresh`/`boot_backfill`/`kill_path_clear`; other recorder
+callers stamp their own, e.g. `loop_exit`, `cancel_publication`, the workers'
+kill/terminalization triggers — plus
+`open_run_ids`/`pending_invocation_ids`/`undisposed_patch_run_ids`). An
+audit that MATCHES the stored disclosure performs no write and emits no custody
+event, so a permanently-unreconcilable row (an undisposed patch awaiting its
+owner) does not churn the row or events.jsonl on every boot — and patch debt
+itself always survives a refresh as `patch:<run_id>`, never a blind clear.
 
 Disclosed delegated-isolation residuals (phase C landing, deliberately not fixed):
 disposition requires the OWNING task identity (`integrate_delegated_patch` refuses
