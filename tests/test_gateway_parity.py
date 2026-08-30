@@ -534,3 +534,17 @@ def test_task_detail_cost_breakdown_emission_matches_contract(monkeypatch, tmp_p
     detail_hints = get_type_hints(TaskDetailResponse, include_extras=True)
     assert detail_hints["cost_breakdown"] is TaskCostBreakdown
     assert TaskDetailResponse.__required_keys__ == frozenset()
+
+
+def test_max_link_actions_pinned_across_python_and_js():
+    """The links-action cap is one number in both languages: the tool gate
+    (ouroboros.tools.core._MAX_LINK_ACTIONS) and the UI contract mirror
+    (web/modules/api_types.js MAX_LINK_ACTIONS) must never drift apart."""
+    from ouroboros.tools.core import _MAX_LINK_ACTIONS
+
+    text = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_types.js").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"^export const MAX_LINK_ACTIONS = (\d+);", text, flags=re.MULTILINE)
+    assert match, "api_types.js missing MAX_LINK_ACTIONS"
+    assert int(match.group(1)) == _MAX_LINK_ACTIONS
