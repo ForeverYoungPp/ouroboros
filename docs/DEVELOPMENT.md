@@ -650,7 +650,20 @@ predecessor, and thresholds only the closed raw keys `result` and
 Oversized values resolve as persisted narrative, bounded exact-key legacy
 authored lookup, or an explicit source-resolvable gap. They never use a raw
 head/tail slice, invent a summary, or mutate the canonical result. Exact task
-reads and external work-order consumers retain the full source.
+reads retain the full source.
+
+The automatic startup injection (2026-08-30) is a bounded continuation
+ENVELOPE, not a body copy: identity, compact terminal facts, the
+predecessor's own operative contract core (never its nested
+`predecessor_authority` - the recursion that compiled 300K+ work orders),
+an authored narrative when present, the result whole-or-pointer against one
+tool-result budget, sha256/chars observed at binding, and a walkable
+`previous_task_id` cursor. Contract rebuilds collapse legacy full-body
+predecessors to the same envelope; durable `task_results` bodies are the
+untouched SSOT, pullable whole or by exact range through the named
+`get_task_result(include_authority=True)` source. No hop cap exists
+anywhere - depth belongs to the mind, the floor only keeps bodies off the
+wire.
 
 Provider context overflow is a typed recovery fact. The existing useful reclaim
 and one strictly-smaller same-route retry retain their route order; a final
