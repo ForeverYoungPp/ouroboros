@@ -40,6 +40,7 @@ test('a full Plan wave renders findings, mapped dispositions, degraded reviewers
                 ],
                 dispositions: [
                     { finding_id: 'slot_1:f1', decision: 'reject', rationale: 'stash is restored by boot finalize' },
+                    { finding_id: 'slot_1:f1', decision: 'accept', rationale: 'second thoughts after re-reading' },
                     { finding_id: 'slot_9:gone', decision: 'accept', rationale: 'will fold into phase 2' },
                 ],
                 actors: [
@@ -60,6 +61,10 @@ test('a full Plan wave renders findings, mapped dispositions, degraded reviewers
     assert.match(detail, /\[blocking\] The rollback path loses the stash — breaks invariant_2 — at supervisor\/update_merge\.py — slot_1 · anthropic\/claude-opus-5/);
     assert.match(detail, /  fix: Restore the stash before reset/);
     assert.match(detail, /  agent: reject — stash is restored by boot finalize/);
+    // Contradictory duplicate dispositions both render: the backend refuses
+    // the pair and keeps the finding open, so hiding one would present the
+    // other as operative.
+    assert.match(detail, /  agent: accept — second thoughts after re-reading/);
     assert.match(detail, /\[note\] Naming could be clearer — slot_2/);
     assert.match(detail, /General dispositions:\n  slot_9:gone: accept — will fold into phase 2/);
     assert.match(detail, /Reviewer unavailable: slot_3 · openai\/gpt-5\.6-sol — window_exhausted/);
@@ -181,6 +186,17 @@ test('the section renders hydration truth and the controller retries through onH
     assert.deepEqual(hydrated, [[]]);
     assert.equal(statusNode.tabindex, '-1');
     assert.equal(statusNode.focused, true);
+});
+
+test('a failed first hydration renders the section shell with no groups', () => {
+    assert.equal(renderReviewsSection([], {}), '');
+    assert.equal(renderReviewsSection([], { hydrateStatus: 'loading' }), '',
+        'a quiet zero-group loading pass stays invisible (every card expand hydrates)');
+    const errorShell = renderReviewsSection([], { sectionExpanded: true, hydrateStatus: 'error' });
+    assert.match(errorShell, /data-review-section/);
+    assert.match(errorShell, /Review details failed to refresh/);
+    assert.match(errorShell, /data-review-hydrate-retry/);
+    assert.match(errorShell, /chat-review-section-count">—</);
 });
 
 test('the hydrate status node swaps its message text across the loading→error patch', () => {

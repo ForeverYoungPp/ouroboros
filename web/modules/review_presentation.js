@@ -466,10 +466,15 @@ function planFindingLines(wave) {
         .filter((item) => item && typeof item === 'object');
     const dispositions = (Array.isArray(wave.dispositions) ? wave.dispositions : [])
         .filter((item) => item && typeof item === 'object');
-    const dispositionByFinding = new Map();
+    // EVERY disposition row renders: the backend refuses duplicate rows for
+    // one finding as contradictory intent and keeps the finding open, so
+    // showing only the first would present a refused decision as operative.
+    const dispositionsByFinding = new Map();
     for (const disposition of dispositions) {
         const key = text(disposition.finding_id);
-        if (key && !dispositionByFinding.has(key)) dispositionByFinding.set(key, disposition);
+        const bucket = dispositionsByFinding.get(key) || [];
+        bucket.push(disposition);
+        dispositionsByFinding.set(key, bucket);
     }
     const dispositionLine = (disposition, prefix) => (
         `${prefix}${text(disposition.decision) || 'disposition'}${text(disposition.rationale) ? ` — ${text(disposition.rationale)}` : ''}`
@@ -485,16 +490,19 @@ function planFindingLines(wave) {
         lines.push(source ? `${head} — ${source}` : head);
         if (text(finding.recommendation)) lines.push(`  fix: ${text(finding.recommendation)}`);
         const findingId = text(finding.finding_id);
-        const disposition = dispositionByFinding.get(findingId);
-        if (disposition) {
-            dispositionByFinding.delete(findingId);
-            lines.push(dispositionLine(disposition, '  agent: '));
+        if (findingId) {
+            for (const disposition of dispositionsByFinding.get(findingId) || []) {
+                lines.push(dispositionLine(disposition, '  agent: '));
+            }
+            dispositionsByFinding.delete(findingId);
         }
     }
-    if (dispositionByFinding.size) {
+    if (dispositionsByFinding.size) {
         lines.push('General dispositions:');
-        for (const [findingId, disposition] of dispositionByFinding) {
-            lines.push(dispositionLine(disposition, `  ${findingId}: `));
+        for (const [findingId, bucket] of dispositionsByFinding) {
+            for (const disposition of bucket) {
+                lines.push(dispositionLine(disposition, `  ${findingId || '(no finding id)'}: `));
+            }
         }
     }
     return lines;
@@ -732,8 +740,11 @@ export function formatReviewProjection(projection) {
             if (Array.isArray(actor.findings)) {
                 for (const finding of actor.findings) {
                     if (!finding || typeof finding !== 'object') continue;
+                    const label = [text(finding.severity), text(finding.verdict)]
+                        .filter(Boolean).join(' ') || 'finding';
                     const body = [
-                        `[${text(finding.severity) || 'finding'}] ${text(finding.item) || '(no item)'}`,
+                        `[${label}] ${text(finding.item) || text(finding.summary) || '(no item)'}`,
+                        text(finding.reason) ? `reason: ${text(finding.reason)}` : '',
                         text(finding.evidence) ? `evidence: ${text(finding.evidence)}` : '',
                         text(finding.recommendation) ? `fix: ${text(finding.recommendation)}` : '',
                     ].filter(Boolean).join(' — ');
@@ -742,14 +753,11 @@ export function formatReviewProjection(projection) {
                 const omitted = finiteCount(actor.findings_omitted);
                 if (omitted) lines.push(`Reviewer ${slotId} findings omitted: ${omitted}`);
             }
-            // P1: a bounded or hole-shaped projection names the durable source
-            // the owner can actually resolve. Rows absent while the count says
-            // findings existed = a pre-findings-era or unparsed projection.
-            const coverageFindings = finiteCount(actor.coverage?.findings);
-            const needsPointer = Boolean(finiteCount(actor.findings_omitted))
-                || (!Array.isArray(actor.findings) && Boolean(coverageFindings));
+            // P1: name the durable full copy unconditionally — bounded rows,
+            // per-string truncation markers and pre-findings-era projections
+            // all resolve through the same observability call.
             const callId = text(actor.response_ref?.call_id);
-            if (needsPointer && callId) {
+            if (callId) {
                 lines.push(`Reviewer ${slotId} full response: observability call ${callId}`);
             }
         });
@@ -1232,12 +1240,18 @@ export function reviewReferenceFromRow(row) {
 
 export function renderReviewsSection(groupsInput, disclosure = {}) {
     const groups = orderedReviewGroups(groupsInput);
-    if (!groups.length) return '';
+    // A failed FIRST hydration has no groups to hang the error on; the shell
+    // still renders so the failure and its Retry stay visible instead of the
+    // whole section silently not existing. A quiet zero-group loading pass
+    // stays invisible (every card expand hydrates, most tasks have no reviews).
+    if (!groups.length && text(disclosure.hydrateStatus) !== 'error') return '';
     const expandedGroups = disclosure.expandedGroups instanceof Set ? disclosure.expandedGroups : new Set();
     const expandedAttempts = disclosure.expandedAttempts instanceof Set ? disclosure.expandedAttempts : new Set();
     const sectionExpanded = disclosure.sectionExpanded === true;
     const { groupCount, activeCount } = reviewGroupCounts(groups);
-    const countText = `${groupCount}${activeCount ? ` · ${activeCount} active` : ''}`;
+    const countText = groupCount
+        ? `${groupCount}${activeCount ? ` · ${activeCount} active` : ''}`
+        : '—';
     const groupHtml = groups.map((group) => {
         const groupExpanded = expandedGroups.has(group.id);
         const shown = group.countIsAuthoritative ? `${group.attemptCount}` : `${group.attempts.length} shown`;
@@ -1370,10 +1384,11 @@ export function createReviewPresentationController({
         if (!host || !summary) return;
         const focused = focusedControl();
         const { groupCount, activeCount } = reviewGroupCounts(groups);
-        summary.hidden = groupCount === 0;
+        const failedEmpty = groupCount === 0 && state.hydrateStatus === 'error';
+        summary.hidden = groupCount === 0 && !failedEmpty;
         summary.textContent = groupCount
             ? `Reviews ${groupCount}${activeCount ? ` · ${activeCount} active` : ''}`
-            : '';
+            : (failedEmpty ? 'Reviews' : '');
         const reconciled = reconcileReviewMarkup(host, renderReviewsSection(groups, state));
         const active = host?.ownerDocument?.activeElement;
         if (!reconciled || !active || !host.contains?.(active)) restoreFocus(focused);

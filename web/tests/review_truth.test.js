@@ -459,7 +459,7 @@ test('actor findings rows, omitted counts and the durable pointer ride the share
                 coverage: { criteria_total: 3, findings: 10 },
                 findings: [
                     { severity: 'critical', item: 'Preflop sizing is wrong', evidence: 'raises 2bb from UTG', recommendation: 'raise 2.5bb' },
-                    { severity: 'low', item: 'Style nit' },
+                    { severity: 'low', verdict: 'FAIL', item: 'Style nit', reason: 'inconsistent spacing' },
                 ],
                 findings_omitted: 8,
                 response_ref: { call_id: 'review_task_acceptance_slot_1_resp', sha256: 'a'.repeat(64) },
@@ -481,11 +481,13 @@ test('actor findings rows, omitted counts and the durable pointer ride the share
     }] });
 
     assert.match(text, /Reviewer slot_1 finding: \[critical\] Preflop sizing is wrong — evidence: raises 2bb from UTG — fix: raise 2\.5bb/);
-    assert.match(text, /Reviewer slot_1 finding: \[low\] Style nit/);
+    assert.match(text, /Reviewer slot_1 finding: \[low FAIL\] Style nit — reason: inconsistent spacing/);
     assert.match(text, /Reviewer slot_1 findings omitted: 8/);
     assert.match(text, /Reviewer slot_1 full response: observability call review_task_acceptance_slot_1_resp/);
     assert.doesNotMatch(text, /Reviewer slot_2 finding:/);
-    assert.doesNotMatch(text, /Reviewer slot_2 full response/);
+    // The durable pointer is unconditional: bounded rows, per-string
+    // truncation markers and pre-findings-era projections all resolve there.
+    assert.match(text, /Reviewer slot_2 full response: observability call c2/);
     assert.match(text, /Reviewer slot_3 full response: observability call c3/);
     assert.doesNotMatch(text, /Reviewer slot_3 finding:/);
 });
