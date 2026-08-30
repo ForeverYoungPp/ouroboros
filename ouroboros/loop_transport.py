@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import (
+    NETWORK_WAIT_BACKOFF_START_SEC,
     NETWORK_WAIT_NOTE_INTERVAL_SEC,
     get_finalization_grace_sec,
     get_task_idle_timeout_sec,
@@ -37,9 +38,11 @@ from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
 
-# First free-redial pause; doubles per wait iteration up to the existing
-# transient backoff cap (Q10: the 60s cap is an existing bound, not a new knob).
-_WAIT_BACKOFF_START_SEC = 4.0
+# Reserve for the final free redial near the owner deadline (Q14): round-top
+# overhead (message drain, checkpoints, transcript seal, token measurement)
+# routinely eats about a second on long transcripts, and a granted redial that
+# the admission gate then refuses is a wasted grant.
+_FINAL_REDIAL_MARGIN_SEC = 3.0
 
 
 @dataclass
@@ -289,7 +292,7 @@ def transport_wait_step(
     if remaining is not None and remaining <= 0:
         return _ended("deadline_exhausted")
     backoff = min(
-        _WAIT_BACKOFF_START_SEC * (2.0 ** min(episode.wait_iterations, 4)),
+        NETWORK_WAIT_BACKOFF_START_SEC * (2.0 ** min(episode.wait_iterations, 4)),
         _TRANSIENT_BACKOFF_CAP_SEC,
     )
     note_interval = max(
@@ -299,9 +302,9 @@ def transport_wait_step(
     # The sleep never exceeds the note interval, so waiting notes keep the idle
     # rail alive even on owner-lowered idle timeouts.
     sleep_sec = min(backoff, note_interval)
-    if remaining is not None and remaining < sleep_sec + 1.0:
+    if remaining is not None and remaining < sleep_sec + _FINAL_REDIAL_MARGIN_SEC:
         # One last free redial just before the admission window closes (Q14).
-        sleep_sec = max(0.0, remaining - 1.0)
+        sleep_sec = max(0.0, remaining - _FINAL_REDIAL_MARGIN_SEC)
         episode.final_redial_done = True
     if time.monotonic() - episode.last_note_monotonic >= note_interval:
         episode.last_note_monotonic = time.monotonic()
@@ -325,6 +328,37 @@ def transport_wait_step(
     )
     episode.redials += 1
     return True
+
+
+def finalize_now_transport_terminal(
+    episode: TransportWaitEpisode,
+    *,
+    drive_logs: pathlib.Path,
+    task_id: str,
+    model: str,
+    handle_provider_unavailable: Callable[..., Any],
+) -> Any:
+    """Route a finalize_now that lands during an active episode to the honest
+    transport no-resend terminal.
+
+    Every finalize_now flavor (supervisor deadline, cost ceiling, owner stop)
+    normally dispatches one forced summarize call — but over a proven-dead
+    egress that paid path can only fail at $0 with identical salvage, so the
+    deterministic no-resend terminal wins. The episode's durable evidence is
+    closed with an ``ended`` row first; the caller passes a partial of its
+    ``_handle_provider_unavailable`` so terminal composition stays in loop.py.
+    """
+    emit_network_wait_event(
+        drive_logs, task_id=task_id, phase="ended",
+        elapsed_sec=time.monotonic() - episode.started_monotonic,
+        redials=episode.redials, model=model, detail="finalize_now",
+    )
+    return handle_provider_unavailable(
+        error_kind="transport_unavailable",
+        wait_cause=episode.wait_cause,
+        waited=episode.wait_iterations > 0 or episode.redials > 0,
+        wait_eligible=episode.wait_eligible,
+    )
 
 
 def task_deadline_epoch(tools: Any) -> Optional[float]:
@@ -355,13 +389,17 @@ def provider_terminal_fallback_text(
     is_context_overflow: bool,
     is_transport_wait: bool,
     waited: bool,
+    wait_eligible: bool = True,
     is_deadline_exhausted: bool,
 ) -> str:
     """Owner-facing terminal text when provider death left nothing to salvage.
 
-    ``waited`` is the episode's wait fact (iterations or redials happened): a
-    wait-ineligible direct/ephemeral turn fails fast and must not claim it
-    "waited and redialed until its own limits ran out".
+    ``wait_eligible`` is the episode's turn-class fact and ``waited`` its wait
+    fact (iterations or redials happened). The fast-fail wording is keyed on
+    NOT wait_eligible: a managed task whose admission window was already spent
+    before the first wait iteration is not "this interactive turn". The
+    waited-out wording deliberately avoids the supervisor's lifecycle term
+    INTERRUPTED (STATUS_INTERRUPTED means pre-requeue, not terminal).
     """
     if is_context_overflow:
         return (
@@ -369,16 +407,23 @@ def provider_terminal_fallback_text(
             "Any files written so far are preserved in the workspace."
         )
     if is_transport_wait:
+        if not wait_eligible:
+            return (
+                "⚠️ Could not establish a provider connection; this interactive turn fails fast "
+                "— retry when connectivity returns. Any files written so far are preserved in "
+                "the workspace."
+            )
         if waited:
             return (
                 "⚠️ Could not establish a provider connection; the task waited and redialed "
-                "until its own limits ran out and was INTERRUPTED, not completed. Any files "
-                "written so far are preserved in the workspace. Retry when connectivity returns."
+                "until its own limits ran out and ended as a provider outage, not completed. "
+                "Any files written so far are preserved in the workspace. Retry when "
+                "connectivity returns."
             )
         return (
-            "⚠️ Could not establish a provider connection; this interactive turn fails fast "
-            "— retry when connectivity returns. Any files written so far are preserved in "
-            "the workspace."
+            "⚠️ Could not establish a provider connection, and the owner deadline left no "
+            "time to wait; the task ended as a provider outage, not completed. Any files "
+            "written so far are preserved in the workspace. Retry when connectivity returns."
         )
     if is_deadline_exhausted:
         return "⚠️ The owner deadline ended primary model work; any files written so far are preserved."

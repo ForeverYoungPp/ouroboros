@@ -46,11 +46,11 @@ OWNER_STOP_OUTER_CAP_SEC = 600
 NESTED_SETTLEMENT_MARGIN_SEC = 30  # Structural ordering margin, not a cognition timeout.
 # Owner-note cadence while a task waits out a provider-connection outage; the effective interval is min(this, idle_timeout/2) so the notes also keep the idle rail alive.
 NETWORK_WAIT_NOTE_INTERVAL_SEC = 300
-# Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at (headless
-# benchmark runs). Advisory only — surfaces elapsed/rounds/cost for self-pacing; 0 disables.
+# First free-redial pause of a transport-wait episode; doubles per wait iteration up to the existing 60s transient backoff cap (Q10: an existing bound, not a new knob).
+NETWORK_WAIT_BACKOFF_START_SEC = 4.0
+# Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at (headless benchmark runs). Advisory only — surfaces elapsed/rounds/cost for self-pacing; 0 disables.
 PACING_INTERVAL_DEFAULT_SEC = 600
-# Supervisor-loop liveness deadline (WS3, v6.34.0): a watchdog thread flags the main supervisor
-# loop STALLED if it has not ticked within this many seconds (healthy tick ~0.5s, real wedges only). 0 disables.
+# Supervisor-loop liveness deadline (WS3, v6.34.0): a watchdog thread flags the main supervisor loop STALLED if it has not ticked within this many seconds (healthy tick ~0.5s, real wedges only). 0 disables.
 SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC = 90
 
 

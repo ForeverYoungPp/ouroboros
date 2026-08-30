@@ -670,3 +670,288 @@ def test_wait_step_caps_sleep_at_note_interval_for_low_idle_timeouts(tmp_path, m
     assert redial is True
     assert sleeps == [30.0]  # min(60s backoff cap, 60/2 note interval)
     assert len(notes) == 1  # the periodic note fired for the lowered interval
+
+
+# ------------------------------------------------- route locality (A9, loopback)
+
+def test_released_loopback_route_failure_stays_generic():
+    """A loopback OPENAI_COMPATIBLE_BASE_URL install (Ollama / LM Studio /
+    vLLM) stamps a remote-shaped provider name, but a stopped LOCAL server is
+    not a network outage worth waiting out."""
+    exc = httpx.ConnectError("connection refused")
+    exc.physical_attempt_capture = ua.PhysicalAttemptCapture(
+        attempt_id="pa-lb", model="m", provider="openai-compatible",
+        state="released", candidate_measurement_kind="opaque",
+        route_is_loopback=True,
+    )
+    assert classify_llm_exception(exc).kind != "transport_unavailable"
+
+
+def test_released_remote_compatible_route_still_classifies_transport_unavailable():
+    """The additive default keeps every remote route on the wait path."""
+    exc = httpx.ConnectError("connection refused")
+    exc.physical_attempt_capture = ua.PhysicalAttemptCapture(
+        attempt_id="pa-rc", model="m", provider="openai-compatible",
+        state="released", candidate_measurement_kind="opaque",
+    )
+    assert classify_llm_exception(exc).kind == "transport_unavailable"
+
+
+def test_attempt_request_carries_route_locality_from_target():
+    from ouroboros.llm import _attempt_request
+
+    loopback = _attempt_request(
+        {"provider": "openai-compatible", "usage_model": "m",
+         "base_url": "http://localhost:11434/v1"},
+        {"model": "m", "messages": []},
+    )
+    assert loopback.route_is_loopback is True
+    remote = _attempt_request(
+        {"provider": "openrouter", "usage_model": "m",
+         "base_url": "https://openrouter.ai/api/v1"},
+        {"model": "m", "messages": []},
+    )
+    assert remote.route_is_loopback is False
+
+
+def test_attempt_capture_propagates_route_locality(tmp_path):
+    reservation = ua.AttemptReservation(
+        attempt_id="pa-cap", drive_root=tmp_path, model="m",
+        provider="openai-compatible", reservation_upper_bound_usd=None,
+    )
+    request = ua.AttemptRequest(
+        model="m", provider="openai-compatible", route_is_loopback=True,
+    )
+    capture = ua._record_attempt_capture(reservation, request, "released")
+    assert capture.route_is_loopback is True
+
+
+# ------------------------------------------ finalize_now during an episode (A7)
+
+def test_finalize_now_during_episode_takes_no_resend_terminal_via_mailbox(tmp_path, monkeypatch):
+    """finalize_now (deadline / ceiling / owner stop flavors share this exit)
+    arriving MID-SLEEP through the REAL owner mailbox: the interruptible sleep
+    wakes within a slice and the terminal is the transport no-resend — zero
+    further provider dials, never a forced-final paid call over the dead
+    egress."""
+    from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
+
+    fake_call, calls = _transport_failing_call(fail_times=99)
+    monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    notes = []
+    timer = threading.Timer(0.3, lambda: write_owner_message(
+        tmp_path, "budget ceiling reached", "t-wait", kind=KIND_FINALIZE_NOW,
+    ))
+    timer.start()
+    start = time.monotonic()
+    try:
+        result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, registry, notes))
+    finally:
+        timer.cancel()
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 10.0  # woke within a sleep slice, not the full backoff ladder
+    assert calls["n"] == 1  # the woken redial exited at the round top: zero further dials
+    assert usage.get("execution_status") == "infra_failed"
+    assert usage.get("reason_code") == "provider_unavailable"
+    assert trace.get("forced_finalization", {}).get("source") == "transport_unavailable_no_resend"
+    assert "ended as a provider outage" in result
+    events = _read_network_wait_events(tmp_path)
+    assert events[-1]["phase"] == "ended"
+    assert events[-1].get("detail") == "finalize_now"
+
+
+# --------------------------------------------------- episode exit contracts (A12)
+
+def test_redial_failing_with_different_kind_ends_episode_and_resumes_fallback(tmp_path, monkeypatch):
+    """A redial that gets past the connect phase but fails differently proves
+    the transport passable: the episode ends and the ORDINARY fallback chain
+    resumes for the fresh kind."""
+    calls = {"n": 0}
+
+    def fake_call(_llm, _messages, _model, _tools, _effort, _max_retries, _drive_logs,
+                  _task_id, _round_idx, _event_queue, accumulated_usage, *_a, **_k):
+        calls["n"] += 1
+        accumulated_usage["_last_llm_error_kind"] = (
+            "transport_unavailable" if calls["n"] == 1 else "provider_transient"
+        )
+        return None, 0.0
+
+    chain_calls = {"n": 0}
+
+    def fake_chain(**kwargs):
+        chain_calls["n"] += 1
+        kwargs["accumulated_usage"].pop("_last_llm_error_kind", None)
+        return (
+            {"role": "assistant", "content": "fallback-ok"}, "other/model", False,
+            kwargs["context_fit_plan"], kwargs["active_context_mode"],
+        )
+
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", lambda _sec, _wake: False)
+    monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
+    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", fake_chain)
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
+    notes = []
+    result, usage, _trace = run_llm_loop(**_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), notes))
+
+    assert result == "fallback-ok"
+    assert calls["n"] == 2  # primary, then the one free redial
+    assert chain_calls["n"] == 1  # ordinary policy resumed after the episode ended
+    assert usage.get("reason_code") is None
+    events = _read_network_wait_events(tmp_path)
+    assert events[-1]["phase"] == "ended"
+    assert events[-1].get("detail") == "error_kind_changed:provider_transient"
+
+
+def test_redial_with_unknown_outcome_takes_unknown_no_resend_terminal(tmp_path, monkeypatch):
+    """A main-dispatch redial whose socket outcome is unknown ends the episode
+    AND the round: provider_outcome_unknown keeps its own no-resend terminal —
+    zero further dials of any kind."""
+    calls = {"n": 0}
+
+    def fake_call(_llm, _messages, _model, _tools, _effort, _max_retries, _drive_logs,
+                  _task_id, _round_idx, _event_queue, accumulated_usage, *_a, **_k):
+        calls["n"] += 1
+        accumulated_usage["_last_llm_error_kind"] = (
+            "transport_unavailable" if calls["n"] == 1 else "provider_outcome_unknown"
+        )
+        # Mirror _record_llm_call_error's stamps (the real failure path).
+        accumulated_usage.update(execution_status="infra_failed", reason_code="llm_api_error")
+        return None, 0.0
+
+    def _chain_must_not_run(**_kwargs):
+        raise AssertionError("no fallback chain after an unknown-outcome redial")
+
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", lambda _sec, _wake: False)
+    monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
+    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _chain_must_not_run)
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
+    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
+    notes = []
+    _result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), notes))
+
+    assert calls["n"] == 2  # zero dials after the unknown outcome
+    assert usage.get("execution_status") == "infra_failed"
+    assert trace.get("forced_finalization", {}).get("source") == "provider_outcome_unknown_no_resend"
+    events = _read_network_wait_events(tmp_path)
+    assert events[-1]["phase"] == "ended"
+    assert events[-1].get("detail") == "error_kind_changed:provider_outcome_unknown"
+
+
+def test_episode_ledger_evidence_has_zero_dispatched_paid_attempts(tmp_path, monkeypatch):
+    """Between episode entry and the last wait, every durable failure row is
+    the typed $0 transport kind and no usage row records a dispatched paid
+    attempt (released rows are the legitimate evidence)."""
+    sleeps = []
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep",
+                        lambda sec, _wake: (sleeps.append(sec), False)[1])
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
+    llm = _FlakyChatLLM(fail_times=3)
+    notes = []
+    result, _usage, _trace = run_llm_loop(
+        **_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), notes, llm=llm))
+
+    assert result == "done"
+    rows = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines() if line.strip()]
+    entered_idx = next(i for i, r in enumerate(rows) if r.get("type") == "network_wait" and r.get("phase") == "entered")
+    last_wait_idx = max(i for i, r in enumerate(rows) if r.get("type") == "network_wait" and r.get("phase") == "waiting")
+    window = rows[entered_idx:last_wait_idx + 1]
+    api_errors = [r for r in window if r.get("type") == "llm_api_error"]
+    assert api_errors, "the episode's failures must leave durable evidence"
+    assert all(r.get("error_kind") == "transport_unavailable" for r in api_errors)
+    assert not any(r.get("type") == "llm_usage" for r in window)
+
+
+def test_nonstandard_transient_retry_max_keeps_one_attempt_transport_contract(tmp_path, monkeypatch):
+    """OUROBOROS_TRANSIENT_RETRY_MAX tunes the transient burst, never the
+    one-physical-attempt transport contract."""
+    monkeypatch.setenv("OUROBOROS_TRANSIENT_RETRY_MAX", "12")
+    llm = _RaisingLLM(_typed_transport_exc)
+    usage = {}
+    msg, _cost = call_llm_with_retry(
+        llm, [{"role": "user", "content": "hi"}], "test-model", None, "low", 3,
+        tmp_path, "t-max", 1, None, usage,
+    )
+    assert msg is None
+    assert llm.calls == 1
+    assert usage.get("_last_llm_error_kind") == "transport_unavailable"
+
+
+def test_review_actor_physical_send_rail_stays_bounded_at_two():
+    """Review actors (P3 / scope / acceptance) dispatch under
+    physical_attempt_limit(2) — the review_substrate contract — so a transport
+    outage can never turn a review slot into an unbounded redial loop."""
+    from ouroboros.usage_accounting import (
+        PhysicalAttemptLimitExceeded,
+        _claim_physical_dispatch,
+        physical_attempt_limit,
+    )
+
+    with physical_attempt_limit(2):
+        _claim_physical_dispatch()
+        _claim_physical_dispatch()
+        with pytest.raises(PhysicalAttemptLimitExceeded):
+            _claim_physical_dispatch()
+
+
+# ------------------------------------------------ terminal wordings + Q14 margin
+
+def test_terminal_wordings_cover_three_wait_outcomes():
+    """Three honest terminal texts: fail-fast is keyed on NOT wait_eligible; a
+    managed zero-wait task names the spent window; the waited-out wording says
+    outage without the supervisor's lifecycle term INTERRUPTED."""
+    kwargs = dict(is_context_overflow=False, is_transport_wait=True, is_deadline_exhausted=False)
+    fast = loop_transport.provider_terminal_fallback_text(
+        {}, waited=False, wait_eligible=False, **kwargs)
+    assert "fails fast" in fast
+    waited = loop_transport.provider_terminal_fallback_text(
+        {}, waited=True, wait_eligible=True, **kwargs)
+    assert "ended as a provider outage, not completed" in waited
+    assert "INTERRUPTED" not in waited
+    zero_wait = loop_transport.provider_terminal_fallback_text(
+        {}, waited=False, wait_eligible=True, **kwargs)
+    assert "left no time to wait" in zero_wait
+    assert "fails fast" not in zero_wait
+
+
+def test_final_redial_reserves_named_margin_before_admission_close(tmp_path, monkeypatch):
+    """Q14/A11: the last free redial sleeps to remaining minus the named 3s
+    margin (round-top overhead routinely eats ~1s), then the next step
+    terminalizes deterministically."""
+    from ouroboros.config import get_finalization_grace_sec
+    from ouroboros.deadline_utils import dispatch_window_remaining_sec
+
+    assert loop_transport._FINAL_REDIAL_MARGIN_SEC == 3.0
+    sleeps = []
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep",
+                        lambda sec, _wake: (sleeps.append(sec), False)[1])
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=get_finalization_grace_sec() + 40)
+    tools = SimpleNamespace(_ctx=SimpleNamespace(
+        task_metadata={"deadline_at": deadline.isoformat()}, task_attempt=None,
+    ))
+    episode = loop_transport.TransportWaitEpisode(
+        started_monotonic=time.monotonic(), wait_iterations=10,  # backoff at the 60s cap
+    )
+    remaining = dispatch_window_remaining_sec(
+        deadline_ts=deadline.timestamp(), reserve_sec=get_finalization_grace_sec(),
+    )
+    redial = loop_transport.transport_wait_step(
+        episode, tools=tools, error_kind="transport_unavailable",
+        drive_root=None, drive_logs=tmp_path, task_id="t-margin", model="m",
+        emit_progress=lambda _n: None, incoming_messages=None, owner_msg_seen=set(),
+    )
+    assert redial is True
+    assert episode.final_redial_done is True
+    assert sleeps[0] == pytest.approx(
+        remaining - loop_transport._FINAL_REDIAL_MARGIN_SEC, abs=1.0)
+    assert loop_transport.transport_wait_step(
+        episode, tools=tools, error_kind="transport_unavailable",
+        drive_root=None, drive_logs=tmp_path, task_id="t-margin", model="m",
+        emit_progress=lambda _n: None, incoming_messages=None, owner_msg_seen=set(),
+    ) is False  # deadline_after_final_redial

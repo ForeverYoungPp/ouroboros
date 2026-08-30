@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import hashlib
 import os
@@ -52,7 +53,9 @@ from ouroboros.loop_tool_execution import (
 )
 from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event, forced_response_is_incomplete, forced_response_parts
 from ouroboros.loop_transport import (
+    TransportWaitEpisode,
     fallback_chain_allowed as _fallback_chain_allowed,
+    finalize_now_transport_terminal as _finalize_now_transport_terminal,
     last_assistant_text as _last_assistant_text,
     provider_terminal_fallback_text as _provider_terminal_fallback_text,
     reconcile_transport_wait as _reconcile_transport_wait,
@@ -361,10 +364,9 @@ def _resolve_task_cost_ceiling(
 
 
 # Bounded staleness for the two DECIDING cost surfaces (ceiling check and
-# milestone note). The free stash is refreshed by every dispatch under this
-# root — at most one round old, zero reads — but ONE round can block 900s in
-# wait_tasks while children spend (the shape both dead waves had), and the
-# pacing refresh only covers deadline-less tasks, so a round outliving this
+# milestone note). The free stash refreshes on every dispatch under this root,
+# but ONE round can block 900s in wait_tasks while children spend, and the
+# pacing refresh only covers deadline-less tasks — so a round outliving this
 # bound pays for exactly one real projection read. Never per-round (see the
 # usage_accounting telemetry note and the e4a87344 contention class).
 _TREE_ACCOUNTING_MAX_STALE_SEC = 120.0
@@ -1591,8 +1593,7 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
     # cannot fit the remaining root budget is declined up front as a terminal
     # DEGRADED (no-quorum semantics) instead of dying mid-wave. The estimate
     # renders the REAL per-slot message pair; the rare second physical attempt
-    # is deliberately not multiplied in — a fail-open coarse filter, not a
-    # hard reservation.
+    # is not multiplied in — a fail-open coarse filter, not a reservation.
     from ouroboros.tools.review_helpers import review_wave_budget_gate
 
     try:
@@ -1795,8 +1796,7 @@ def _apply_task_acceptance_result(
     if dialogue_terminal:
         # v6.74.0 (A5): a reviewer quorum judged the dialogue no longer
         # actionable (unreachable_here / stable_disagreement). Finalize through
-        # the EXISTING honest path, recording BOTH positions (findings in the
-        # run record, dispositions on the obligation rows) with one owner-
+        # the EXISTING honest path, recording BOTH positions with one owner-
         # visible line. Reviewer authorship — not a host timer or a
         # unilateral agent give-up.
         ctx.tools._ctx._task_acceptance_reviewed = True
@@ -2576,9 +2576,8 @@ def _compute_subagent_handoff(tools: Any, drive_root: Any, task_id: str, content
         # P5: the reminder is suppressed ONLY by structured signals — a child
         # discarded/cancelled (filtered above) or absorbed (unchanged
         # signature). NEVER by parsing final PROSE for status words. Fires once
-        # per CHANGE, not every round; if the agent still finalizes with
-        # unhandled children, the no-tool / forced finalization paths append a
-        # loud orphan note via _forced_orphan_note (P1).
+        # per CHANGE, not every round; finalizing with unhandled children still
+        # appends a loud orphan note via _forced_orphan_note (P1).
         _ = nonterminal_children  # (kept for readability; trigger is change-based)
         if children and signature and signature != previous:
             tools._ctx._subagent_handoff_signature = signature
@@ -2607,7 +2606,7 @@ def _maybe_inject_self_check(
     REMINDER_INTERVAL = 15
     if round_idx <= 1 or round_idx % REMINDER_INTERVAL != 0 or round_idx >= max_rounds:
         return False
-    # Free transport-wait redials re-enter the SAME round: one self-check per round.
+    # Non-incrementing round re-entries (e.g. free redials): one self-check per round.
     if accumulated_usage.get("_self_check_round") == round_idx:
         return False
     accumulated_usage["_self_check_round"] = round_idx
@@ -3315,14 +3314,15 @@ def _handle_owner_stop_finalization(
 
 def _handle_provider_unavailable(
     ctx: _RoundLimitContext, *, error_kind: str = "provider_unavailable",
-    wait_cause: str = "", waited: bool = False,
+    wait_cause: str = "", waited: bool = False, wait_eligible: bool = True,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Salvage provider failure without an unsafe retry.
 
     ``wait_cause`` is the transport-wait episode's latched cause: it selects the
     deterministic no-resend terminal even when a later refusal (e.g. the
     deadline admission gate) overwrote the mutable ``_last_llm_error_kind``.
-    ``waited`` keeps the terminal text honest for zero-wait turns.
+    ``waited``/``wait_eligible`` keep the terminal text honest for zero-wait
+    turns (fail-fast vs a managed task whose window left no time to wait).
     """
     kind = str(error_kind or "")
     is_context_overflow = kind == "context_overflow"
@@ -3345,6 +3345,7 @@ def _handle_provider_unavailable(
         fallback = _provider_terminal_fallback_text(
             ctx.accumulated_usage, is_context_overflow=is_context_overflow,
             is_transport_wait=is_transport_wait, waited=waited,
+            wait_eligible=wait_eligible,
             is_deadline_exhausted=is_deadline_exhausted,
         )
     if is_context_overflow:
@@ -3360,9 +3361,8 @@ def _handle_provider_unavailable(
         return text, usage, llm_trace
     if is_transport_wait:
         # No-resend terminal: salvage, no forced-final call over a dead egress.
-        # Stamp BEFORE the composer (_handle_owner_stop_finalization pattern):
-        # a SCHEDULED swarm-router handoff deliberately clears it and stays
-        # truthful; the guard mirrors the sibling no-resend branch below.
+        # Stamp BEFORE the composer (owner-stop pattern): a SCHEDULED swarm
+        # handoff deliberately clears it; guard mirrors the sibling below.
         live_trace = getattr(ctx, "llm_trace", None)
         llm_trace = live_trace if isinstance(live_trace, dict) else {}
         ctx.accumulated_usage["execution_status"] = RESULT_INFRA_FAILED
@@ -3434,20 +3434,28 @@ def _maybe_deadline_local_finalize(
 
 def _maybe_early_finalize(
     limit_ctx: _RoundLimitContext, tools: ToolRegistry, controls: Dict[str, Any],
-    *, allow_deadline_local: bool = True,
+    *, transport_episode: Optional[TransportWaitEpisode] = None,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
     """Consume supervisor grace first, then a local deadline."""
     if controls.get("finalize_now"):
+        if transport_episode is not None:
+            # Every finalize_now flavor during an active outage takes the
+            # honest no-resend terminal (rationale in the helper); control
+            # bookkeeping was done by the drain, terminalization is prompt.
+            return _finalize_now_transport_terminal(
+                transport_episode, drive_logs=limit_ctx.drive_logs,
+                task_id=limit_ctx.task_id, model=limit_ctx.active_model,
+                handle_provider_unavailable=functools.partial(
+                    _handle_provider_unavailable, limit_ctx),
+            )
         if controls.get("finalize_deadline_ts") is not None:
             _narrow_round_deadline(
                 limit_ctx, controls["finalize_deadline_ts"],
             )
         return _handle_forced_finalization(limit_ctx, str(controls["finalize_now"]))
-    if not allow_deadline_local:
-        # An active transport-wait episode owns the deadline sliver: its last
-        # free redial + no-resend terminal replace the paid graceful finalize
-        # call, which cannot succeed over a proven-dead egress and would fork
-        # the terminal story (deadline_local vs transport no-resend).
+    if transport_episode is not None:
+        # An active episode owns the deadline sliver: its last free redial +
+        # no-resend terminal replace the paid deadline_local finalize call.
         return None
     return _maybe_deadline_local_finalize(limit_ctx, tools)
 
@@ -5965,18 +5973,14 @@ def _maybe_inject_finalization_nudges(
         emit_progress("No-op attempt nudge injected before final response.")
         llm_trace["reasoning_notes"].append("No-op attempt nudge injected before final response.")
         return True
-    # P2 one-shot final-answer-marker nudge: the turn produced REAL work AND
-    # visible prose but no FINAL ANSWER marker — the typed extractor would drop
-    # it and a forced/deadline finalization would score empty. Strengthen the
-    # BEHAVIOR (ask the agent to mark its OWN answer), never mine prose into a
-    # claimed answer (Bible P5). Own latch, ordered AFTER verify/red/A3
-    # (grounding outranks formatting); mutually exclusive with the A3 no-op
-    # nudge; forced paths return earlier. Structural facts only. The protocol
-    # gate alone suffices: answer_protocol="final_answer_line" itself declares
-    # a machine-extracted deliverable, so the nudge must not ALSO require a
-    # declared expected_output — GAIA-shaped contracts keep expected_output
-    # empty, and that extra gate once suppressed the only salvage surface
-    # (a v6.56.0 run finalized a last-round refusal empty despite 24 calls).
+    # P2 one-shot final-answer-marker nudge: REAL work + visible prose but no
+    # FINAL ANSWER marker — the typed extractor would drop it and a forced
+    # finalization would score empty. Strengthen the BEHAVIOR (agent marks its
+    # OWN answer), never mine prose into a claimed answer (Bible P5). Own
+    # latch, ordered AFTER verify/red/A3; forced paths return earlier. The
+    # protocol gate alone suffices: it must not ALSO require expected_output —
+    # GAIA-shaped contracts keep it empty, and that extra gate once suppressed
+    # the only salvage surface (v6.56.0: last-round refusal finalized empty).
     if (
         not getattr(tools._ctx, "_final_marker_nudged", False)
         and _answer_protocol_active(tools._ctx)  # v6.60.0: marker nudge is protocol-gated
@@ -6761,8 +6765,7 @@ def run_llm_loop(
     try:
         while True:
             if free_redial:
-                # A transport-wait redial re-enters the SAME logical round: the
-                # outage must not burn the round budget.
+                # A transport-wait redial re-enters the SAME logical round.
                 free_redial = False
             else:
                 round_idx += 1
@@ -6817,11 +6820,10 @@ def run_llm_loop(
                 _owner_msg_seen,
                 owner_ctx=ctx,
             )
-            # Early-exit per round: supervisor finalize_now, else loop-local real-
-            # deadline finalize (headless runs that get no finalize_now) — finalize
-            # best-effort rather than be killed mid-step with nothing.
+            # Early-exit per round: supervisor finalize_now, else loop-local
+            # real-deadline finalize (headless runs with no finalize_now).
             _early_final = _maybe_early_finalize(
-                limit_ctx, tools, _controls, allow_deadline_local=transport_wait is None)
+                limit_ctx, tools, _controls, transport_episode=transport_wait)
             if _early_final is not None:
                 text, accumulated_usage, forced_trace = _early_final
                 _merge_finalization_trace(llm_trace, forced_trace)
@@ -6904,8 +6906,7 @@ def run_llm_loop(
                     emit_progress=emit_progress, context_fit_plan=context_fit_plan,
                     active_context_mode=active_context_mode)
                 # Post-chain reconcile with the FRESH kind: a MID-chain outage
-                # latches an episode too, so no forced-final call dials a dead
-                # egress (rationale in reconcile_transport_wait's docstring).
+                # latches too (see reconcile_transport_wait's docstring).
                 transport_wait = _reconcile_transport_wait(
                     transport_wait, ctx, msg_present=msg is not None,
                     error_kind=str(accumulated_usage.get("_last_llm_error_kind") or ""),
@@ -6928,6 +6929,8 @@ def run_llm_loop(
                     wait_cause=transport_wait.wait_cause if transport_wait is not None else "",
                     waited=transport_wait is not None and (
                         transport_wait.wait_iterations > 0 or transport_wait.redials > 0),
+                    wait_eligible=(
+                        transport_wait.wait_eligible if transport_wait is not None else True),
                 )
                 _merge_finalization_trace(llm_trace, forced_trace)
                 return text, accumulated_usage, llm_trace

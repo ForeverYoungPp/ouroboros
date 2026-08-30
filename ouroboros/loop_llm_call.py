@@ -799,9 +799,9 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
             "provider_outcome_unknown", False, status_code, provider_code,
         )
     if (
-        capture is not None
-        and str(getattr(capture, "state", "") or "") == "released"
+        str(getattr(capture, "state", "") or "") == "released"
         and str(getattr(capture, "provider", "") or "") != "local"
+        and not bool(getattr(capture, "route_is_loopback", False))
         and is_pre_dispatch_transport_failure(exc)
     ):
         # Typed $0 fact: the request never left this host toward a REMOTE
@@ -809,7 +809,9 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
         # Retrying the same request is free and safe; pacing/waiting is owned
         # by the round-level episode in loop.py, never by this helper. A local
         # provider's connect failure stays on the generic path — a stopped
-        # local server is not a network outage worth waiting out.
+        # local server is not a network outage worth waiting out — and so does
+        # a loopback OpenAI-compatible route (Ollama / LM Studio / vLLM): its
+        # provider stamp is remote-shaped but the server is on this host.
         return LlmErrorClassification(
             "transport_unavailable", True, status_code, provider_code,
         )

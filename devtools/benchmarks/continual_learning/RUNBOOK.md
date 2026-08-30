@@ -30,7 +30,9 @@ Field-tested configuration and operational hazards from the 2026-07-20 full 1-se
   supervisor's absolute per-attempt ceiling (`OUROBOROS_TASK_ABS_CEILING_SEC`, default 6h),
   not a deadline or budget rail: a dead egress holds the task up to that ceiling instead of
   failing it after the burst. The wait is visible as durable `network_wait` events in the
-  isolated server's `events.jsonl`.
+  isolated server's `events.jsonl`. Note: idle-rail survival via waiting progress notes
+  requires a real chat thread; headless tasks without a `chat_id` keep the idle rail
+  (reaper) as an additional bound on the wait.
 - `OUROBOROS_TOTAL_BUDGET=200` per domain-seed (measured 1-seed domain costs:
   poker $117 · bsm $60 · cohort $58 · code $33 · sales $26 · db $25 — a $60 cap silently
   truncates poker mid-rollout).
