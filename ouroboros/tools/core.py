@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import fnmatch
+import ipaddress
 import json
 import logging
 import os
@@ -1716,6 +1717,84 @@ def _send_video(ctx: ToolContext, file_path: str = "", caption: str = "") -> str
 
 
 _MAX_DOCUMENT_FILE_BYTES = 50 * 1024 * 1024  # 50 MB (Telegram bot sendDocument limit)
+_MAX_LINK_ACTIONS = 12
+
+
+class LinkActionsValidationError(ValueError):
+    """Typed atomic refusal from the shared link-action validator."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def validate_link_actions(actions: Any) -> List[Dict[str, str]]:
+    """Return one cleaned HTTP(S) action batch, or refuse the entire batch."""
+    from urllib.parse import urlparse
+
+    if not isinstance(actions, list) or not actions:
+        raise LinkActionsValidationError(
+            "SEND_LINKS_ARG_ERROR", "provide a non-empty links array."
+        )
+    if len(actions) > _MAX_LINK_ACTIONS:
+        raise LinkActionsValidationError(
+            "SEND_LINKS_TOO_MANY", f"maximum {_MAX_LINK_ACTIONS} links."
+        )
+    cleaned: List[Dict[str, str]] = []
+    for item in actions:
+        if not isinstance(item, dict):
+            raise LinkActionsValidationError(
+                "SEND_LINKS_ARG_ERROR", "each link must contain label and url."
+            )
+        label = str(item.get("label") or "")
+        url = str(item.get("url") or "")
+        invalid_url_char = any(
+            ord(char) < 0x20 or ord(char) == 0x7F or char.isspace() for char in url
+        )
+        invalid_label_char = any(
+            ord(char) < 0x20 or ord(char) == 0x7F
+            or (char.isspace() and char != " ") for char in label
+        )
+        label = label.strip()
+        if len(url) > 2048 or invalid_url_char:
+            raise LinkActionsValidationError(
+                "SEND_LINKS_URL_BLOCKED",
+                "URL contains disallowed characters or exceeds 2048 characters.",
+            )
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.hostname
+            port = parsed.port
+            if "[" in parsed.netloc:
+                ipaddress.ip_address(hostname or "")
+        except ValueError as exc:
+            raise LinkActionsValidationError(
+                "SEND_LINKS_URL_BLOCKED", "URL has an invalid authority."
+            ) from exc
+        if parsed.scheme not in {"http", "https"}:
+            raise LinkActionsValidationError(
+                "SEND_LINKS_URL_BLOCKED", "only http:// and https:// URLs are allowed."
+            )
+        if not hostname or (port is not None and not 0 <= port <= 65535):
+            raise LinkActionsValidationError(
+                "SEND_LINKS_URL_BLOCKED", "URL has an invalid authority."
+            )
+        if "\\" in parsed.netloc:
+            raise LinkActionsValidationError("SEND_LINKS_URL_BLOCKED", "URL has an invalid authority.")
+        invalid_reg_name = "[" not in parsed.netloc and any(
+            not ((char.isascii() and (char.isalnum() or char in "._~-")) or
+                 (not char.isascii() and char.isalpha())) for char in hostname
+        )
+        if "%" in hostname or invalid_reg_name:
+            raise LinkActionsValidationError(
+                "SEND_LINKS_URL_BLOCKED", "URL has an invalid authority."
+            )
+        if not label or invalid_label_char:
+            raise LinkActionsValidationError(
+                "SEND_LINKS_ARG_ERROR", "each link requires a label and absolute URL."
+            )
+        cleaned.append({"label": label[:120], "url": url})
+    return cleaned
 
 
 def _detect_document_mime(file_path: str) -> str:
@@ -1775,6 +1854,34 @@ def _send_file(ctx: ToolContext, file_path: str = "", caption: str = "") -> str:
         "download_url": download_url,
     })
     return f"OK: file '{fp.name}' queued for delivery to owner."
+
+
+def _send_links(
+    ctx: ToolContext,
+    links: list | None = None,
+    title: str = "",
+) -> str:
+    """Queue validated HTTP(S) links as first-class chat actions."""
+    chat_id = getattr(ctx, "current_chat_id", None)
+    if chat_id is None or chat_id == "":
+        return "⚠️ SEND_LINKS_NO_CHAT: no active chat."
+    try:
+        actions = validate_link_actions(links)
+    except LinkActionsValidationError as exc:
+        return f"⚠️ {exc.code}: {exc}"
+    task_meta = getattr(ctx, "task_metadata", {})
+    task_meta = task_meta if isinstance(task_meta, dict) else {}
+    ctx.pending_events.append({
+        "type": "send_links",
+        "chat_id": chat_id,
+        "task_id": str(getattr(ctx, "task_id", "") or ""),
+        "parent_task_id": str(task_meta.get("parent_task_id") or ""),
+        "root_task_id": str(task_meta.get("root_task_id") or ""),
+        "title": str(title or "")[:240],
+        "actions": actions,
+    })
+    return "OK: link buttons queued for delivery to owner."
+
 
 _MAX_SEARCH_RESULTS = 200
 # Search file-skip helper and caps live in ouroboros.code_search_rg (the search
@@ -2243,6 +2350,18 @@ def get_tools() -> List[ToolEntry]:
                 "caption": {"type": "string", "description": "Optional caption for the file"},
             }, "required": ["file_path"]},
         }, _send_file),
+        ToolEntry("send_links", {
+            "name": "send_links",
+            "description": "Send one or more HTTP(S) links as prominent clickable buttons in the owner's chat.",
+            "parameters": {"type": "object", "properties": {
+                "title": {"type": "string", "description": "Optional heading above the buttons"},
+                "links": {"type": "array", "minItems": 1, "maxItems": _MAX_LINK_ACTIONS, "items": {
+                    "type": "object", "properties": {
+                        "label": {"type": "string"},
+                        "url": {"type": "string"},
+                    }, "required": ["label", "url"]}},
+            }, "required": ["links"]},
+        }, _send_links),
         ToolEntry("search_code", {
             "name": "search_code",
             "description": (

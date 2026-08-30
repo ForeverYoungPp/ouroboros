@@ -105,9 +105,12 @@ def test_project_rows_use_slots_not_generic_spans():
 def test_project_panel_composer_and_welcome_contracts():
     chat_js = _read("web/modules/chat.js")
     css = _read("web/style.css")
+    send_group_css = css.split(".chat-send-group {", 1)[1].split(
+        ".chat-send-group[data-busy", 1
+    )[0]
     assert "if (!isMain) return;" in chat_js  # ensureWelcomeMessage is main-only
     assert "padding: 10px 292px" not in css
-    assert "right: 8px;\n    bottom: 6px" not in css
+    assert "right: 8px;\n    bottom: 6px" not in send_group_css
     assert ".chat-text-row:focus-within" in css
     assert ".chat-toolbar-row {\n    order: 1;" in css
     assert ".chat-text-row {\n    order: 2;" in css

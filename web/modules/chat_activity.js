@@ -102,12 +102,19 @@ export function durableChatMediaUrl(value) {
 }
 
 export function chatMediaMessageKey(msg) {
-    return [msg.msg_type || msg.type, String(msg.ts || ''), String(msg.caption || ''), String(msg.mime || '')].join('|');
+    return [
+        msg.msg_type || msg.type,
+        String(msg.task_id || ''),
+        String(msg.ts || ''),
+        String(msg.caption || ''),
+        String(msg.mime || ''),
+    ].join('|');
 }
 
 export function documentMessageKey(msg) {
     return [
         'document',
+        String(msg.task_id || ''),
         String(msg.ts || ''),
         String(msg.download_url || ''),
         String(msg.filename || ''),

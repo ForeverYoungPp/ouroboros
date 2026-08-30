@@ -19,12 +19,14 @@ def test_core_surface_includes_user_message_and_media():
     assert "send_photo" in CORE_TOOL_NAMES
     assert "send_video" in CORE_TOOL_NAMES
     assert "send_user_message" in CORE_TOOL_NAMES
+    assert "send_links" in CORE_TOOL_NAMES
 
 
 def test_initial_tool_schemas_include_media_and_meta_tools():
     registry = _build_registry()
     names = {schema["function"]["name"] for schema in initial_tool_schemas(registry)}
     assert "send_photo" in names
+    assert "send_links" in names
     assert "list_available_tools" in names
     assert "enable_tools" in names
 
@@ -33,6 +35,7 @@ def test_non_core_listing_excludes_core_media_tools():
     registry = _build_registry()
     names = {entry["name"] for entry in list_non_core_tools(registry)}
     assert "send_photo" not in names
+    assert "send_links" not in names
     assert "plan_task" not in names
 
 

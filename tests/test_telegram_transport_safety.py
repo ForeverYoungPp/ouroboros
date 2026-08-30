@@ -164,7 +164,7 @@ def test_telegram_call_hides_token_bearing_description(monkeypatch):
 def test_send_message_retries_only_rejected_current_html_chunk_as_plain_text():
     _plugin, telegram_api = _load_skill()
     client = telegram_api.TelegramClient("token")
-    first_chunk = "a" * 3500
+    first_chunk = "a" * 4085
     second_chunk = "**later**"
     calls = []
 
@@ -179,13 +179,13 @@ def test_send_message_retries_only_rejected_current_html_chunk_as_plain_text():
         return {"result": {"message_id": len(calls)}}
 
     client.call = call
-    message_id = asyncio.run(client.send_message(42, f"{first_chunk}\n{second_chunk}"))
+    message_id = asyncio.run(client.send_message(42, f"{first_chunk}\n\n{second_chunk}"))
 
     assert message_id == 3
     assert calls == [
-        {"chat_id": "42", "text": first_chunk, "parse_mode": "HTML"},
+        {"chat_id": "42", "text": first_chunk + "\n\n", "parse_mode": "HTML"},
         {"chat_id": "42", "text": "<b>later</b>", "parse_mode": "HTML"},
-        {"chat_id": "42", "text": second_chunk},
+        {"chat_id": "42", "text": "later"},
     ]
 
 

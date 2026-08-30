@@ -128,10 +128,11 @@ test('durable chat media accepts only the closed task-artifact URL shape', () =>
 });
 
 test('media replay dedup key is stable across live base64 and durable history URL', () => {
-    const common = { type: 'photo', ts: '2026-08-21T00:00:00Z', caption: 'shot', mime: 'image/png' };
+    const common = { type: 'photo', task_id: 'task-photo', ts: '2026-08-21T00:00:00Z', caption: 'shot', mime: 'image/png' };
     const live = { ...common, image_base64: 'aGVsbG8=' };
     const replay = { ...common, msg_type: 'photo', download_url: `/api/tasks/t/artifacts/chat-media-${'b'.repeat(64)}.png` };
     assert.equal(chatMediaMessageKey(live), chatMediaMessageKey(replay));
+    assert.notEqual(chatMediaMessageKey(live), chatMediaMessageKey({ ...live, task_id: 'parallel-task' }));
 });
 
 test('URL-less media history rows cannot finalize a live task card', () => {

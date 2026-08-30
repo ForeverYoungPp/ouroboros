@@ -876,11 +876,15 @@ def _collect_chat_rows(
                 rec["mime"] = str(entry.get("mime") or "application/octet-stream")
                 rec["download_url"] = str(entry.get("download_url") or "")
                 rec["caption"] = str(entry.get("caption") or "")
+                if "size_bytes" in entry:
+                    rec["size_bytes"] = coerce_int(entry.get("size_bytes"), 0)
             elif entry.get("type") in {"photo", "video"} and entry.get("download_url"):
                 rec["msg_type"] = str(entry["type"])
                 rec["mime"] = str(entry.get("mime") or "")
                 rec["download_url"] = str(entry["download_url"])
                 rec["caption"] = str(entry.get("caption") or "")
+            elif entry.get("type") == "links":
+                rec.update(msg_type="links", actions=list(entry.get("actions") or []), title=str(entry.get("title") or ""))
             if "task_terminal_status" in entry:
                 rec["task_terminal_status"] = str(entry.get("task_terminal_status") or "")
             _copy_task_summary_metadata(rec, entry)

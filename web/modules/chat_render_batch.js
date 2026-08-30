@@ -127,6 +127,7 @@ export function createRebuildBatch(doc = null) {
     const nodes = [];
     const seen = new Set();
     const touched = new Set();
+    let holding = null;
     return {
         touched,
         typingHidden: false,
@@ -134,6 +135,15 @@ export function createRebuildBatch(doc = null) {
             if (!node || seen.has(node)) return;
             seen.add(node);
             nodes.push(node);
+            // Parent collected nodes in arrival (chronological) order inside a
+            // detached holding fragment so adjacency-sensitive consumers
+            // (chat_media gallery grouping) observe the same feed shape during
+            // a rebuild replay as on the live feed. mount() reparents them.
+            const ownerDoc = doc || node.ownerDocument || globalThis.document;
+            if (ownerDoc?.createDocumentFragment) {
+                holding = holding || ownerDoc.createDocumentFragment();
+                holding.appendChild(node);
+            }
         },
         touch(record) {
             if (record) touched.add(record);
