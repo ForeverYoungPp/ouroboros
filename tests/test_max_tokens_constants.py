@@ -103,7 +103,7 @@ def test_native_review_episode_caps_are_ssot():
     )
 
     assert SETTINGS_DEFAULTS["OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS"] == "16"
-    assert SETTINGS_DEFAULTS["OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS"] == "400000"
+    assert SETTINGS_DEFAULTS["OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS"] == "900000"
     assert review_native_max_rounds() >= 1
     assert review_native_max_transcript_chars() >= 10_000
 

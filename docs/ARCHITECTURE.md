@@ -2712,7 +2712,7 @@ Runtime floors:
 | OUROBOROS_FALLBACK_COOLDOWN_SEC | 120 | Cooldown window length (seconds) for a transiently-failed model |
 | OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL | 1 | Per-fallback-candidate transient-retry cap (1–2); does not touch the primary model's same-model transient-retry budget |
 | OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS | 16 | Round cap for the bounded native review inspection episode (one `chat(tools=…)` call per round); exhaustion is a typed fail-closed refusal, never a silent truncation |
-| OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS | 400000 | Transcript-size cap for the native review inspection episode; exceeding it is a typed fail-closed refusal |
+| OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS | 900000 | Transcript-size cap for the native review inspection episode; exceeding it is a typed fail-closed refusal |
 | OUROBOROS_MODEL_DEEP_SELF_REVIEW | openai/gpt-5.6-sol-pro | Dedicated deep self-review model slot |
 | OUROBOROS_MAX_WORKERS | 10 | Worker process pool size |
 | OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT | 6 | Active subagent cap per root task — readonly or acting (hard max 500 = `config.MAX_ACTIVE_SUBAGENTS_HARD_CAP`, shared with the supervisor reject/reservation gates and the `wait_tasks` id cap; decided trade-off: at ~500 children the `wait_tasks` compact projection can hit the disclosed 15K tool-result truncation — chunked waits + `get_task_result` are the follow-up path, and the O(n²) active-tree scans are accepted with no perf work) |

@@ -1305,6 +1305,7 @@ def _apply_scope_authority(
     scope_model_id: str,
     result_kwargs: dict,
     delegated: bool = False,
+    native_retrieval: bool = False,
 ) -> tuple[List[dict], List[dict], Optional[ScopeReviewResult]]:
     """One-pass P3 authority for THIS row's delivery: is the reviewer's window ESTABLISHED
     enough for its verdict to gate a commit? ``api_chat`` must fit the whole assembled pack
@@ -1329,7 +1330,12 @@ def _apply_scope_authority(
     ``session_route_resolves_its_own_model`` — which is where a landing below the ask
     belongs, not in the window predicate."""
     resolved = _scope_window(scope_model_id, session=delegated)
-    if delegated:
+    if delegated or native_retrieval:
+        # A native-retrieving actor row is the SAME retrieving delivery class
+        # (BIBLE P3 alternate authoritative mode, sourced >=200K floor) with
+        # STRONGER provenance — its reads are host-executed and host-observed.
+        # The window is resolved for the row's routed MODEL (native rows have
+        # no harness route); the authority decision is the shared one.
         from ouroboros.tools.scope_review_session import session_scope_authority
 
         # EVIDENCE, never the sizing fallback: the session floor is gated on SOURCED
@@ -1566,6 +1572,7 @@ def run_scope_review(
     critical_findings, advisory_findings, authority_block = _apply_scope_authority(
         critical_findings, advisory_findings, scope_model_id=scope_model_id,
         result_kwargs=result_kwargs, delegated=delegated,
+        native_retrieval=bool(subagent_id) and not delegated,
     )
     if authority_block is not None:
         return authority_block

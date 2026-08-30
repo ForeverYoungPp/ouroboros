@@ -207,7 +207,7 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # Native tool-round reviewer episode caps (review_native_episode.py owns
     # the getters); both fail CLOSED — typed refusal, never compaction/resume.
     "OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS": "16",
-    "OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS": "400000",
+    "OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS": "900000",
     # Auto-grant reviewed-skill requests by default; grants stay bound to the
     # reviewed content hash and editing a skill still invalidates them.
     "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS": "true",

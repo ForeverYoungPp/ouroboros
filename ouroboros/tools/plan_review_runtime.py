@@ -921,6 +921,12 @@ def plan_reviewer_config_fingerprint(slots: list) -> str:
          str(getattr(s, "effort", "") or "")]
         for s in slots or []
     ]
+    # Actor binding is delivery identity; column added only when some row
+    # carries one, so unchanged legacy rosters keep their exact bytes.
+    actor_ids = [str(getattr(s, "subagent_id", "") or "") for s in slots or []]
+    if any(actor_ids):
+        for row, actor in zip(rows, actor_ids):
+            row.append(actor)
     return sha256(json.dumps(rows, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 

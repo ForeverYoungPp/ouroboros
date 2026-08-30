@@ -812,7 +812,7 @@ def api_fallback_disclosure(config: "ReviewerSlotConfig") -> Dict[str, Any]:
     # is retrieval delivery, not an api_chat packet model), so a triad of
     # sessions and actors falls back exactly like an all-session one.
     if config.triad and not any(
-        not r.is_session and not r.subagent_id for r in config.triad
+        not r.retrieves for r in config.triad
     ):
         out["triad"] = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"]).split(",")
     return out
@@ -922,12 +922,10 @@ def project_reviewer_slots_into_env() -> None:
             # hand acceptance a packet reviewer the owner configured as an
             # actor (and its model id may not even be an api_chat catalog id).
             api_triad = [
-                r.target_id for r in config.triad
-                if not r.is_session and not r.subagent_id
+                r.target_id for r in config.triad if not r.retrieves
             ]
             api_scope = [
-                r.target_id for r in config.scope
-                if not r.is_session and not r.subagent_id
+                r.target_id for r in config.scope if not r.retrieves
             ]
             if api_triad:
                 os.environ["OUROBOROS_REVIEW_MODELS"] = ",".join(api_triad)

@@ -234,6 +234,17 @@ def commit_review_contract_fingerprint() -> str:
                 row_plan["slot_ids"],
             )
         ]
+        # Actor binding is contract identity: a configured-subagent reference
+        # changes the row's DELIVERY (native retrieval vs packet), so replay/
+        # refusal authority must lapse when it changes. The column is added
+        # only when some row carries one, so untouched legacy configs keep
+        # their exact historical bytes (conservative in the paid direction
+        # only where the contract actually changed).
+        triad_actor_ids = [str(a or "") for a in (row_plan.get("subagent_ids") or [])]
+        if any(triad_actor_ids):
+            for row, actor in zip(triad_rows, triad_actor_ids):
+                row.append(actor)
+        scope_slots = list(scope_reviewer_slots())
         scope_rows = [
             [
                 str(getattr(slot, "slot_id", "") or ""),
@@ -243,8 +254,12 @@ def commit_review_contract_fingerprint() -> str:
                 str(getattr(slot, "session_profile", "") or ""),
                 str(getattr(slot, "effort", "") or ""),
             ]
-            for slot in scope_reviewer_slots()
+            for slot in scope_slots
         ]
+        scope_actor_ids = [str(getattr(slot, "subagent_id", "") or "") for slot in scope_slots]
+        if any(scope_actor_ids):
+            for row, actor in zip(scope_rows, scope_actor_ids):
+                row.append(actor)
         prompt_contract = hashlib.sha256(
             "\n".join([REVIEW_PREAMBLE, CRITICAL_FINDING_CALIBRATION, REVIEW_JSON_ARRAY_CONTRACT]).encode("utf-8")
         ).hexdigest()

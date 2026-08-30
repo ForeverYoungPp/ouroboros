@@ -207,3 +207,115 @@ def test_endpoint_round_trips_the_actor_reference(roster_env):
     assert "route" not in row  # the reference IS the stored form
     assert row["resolved_route"]["kind"] == "api_chat"
     assert row["resolved_route"]["target_id"] == "openai/gpt-5.6-terra"
+
+
+def test_legacy_sdk_advisory_target_migration_branches(roster_env):
+    """The three non-trivial branches of the retired Claude-SDK target
+    migration (owner decision 2026-08-29): same-model translation, [1m]
+    strip, and the fail-closed unmapped target that force-disables the row
+    with a typed reason — never a silently swapped reviewer model."""
+    import json as _json
+
+    from ouroboros.reviewer_slot_config import parse_reviewer_slots
+
+    def _advisory(kind, target, enabled=True):
+        return parse_reviewer_slots(_json.dumps({
+            "triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "openai/m"}}],
+            "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "openai/m"}}],
+            "advisory": {"enabled": enabled, "route": {"kind": kind, "target_id": target}},
+        })).advisory
+
+    # claude-* bare name → routed catalog id of the SAME model.
+    migrated = _advisory("api", "claude-opus-4.6")
+    assert migrated.kind == "api_chat"
+    assert migrated.target_id == "anthropic/claude-opus-4.6"
+    assert migrated.enabled is True and not migrated.disabled_reason
+
+    # The [1m] Claude-SDK selector is stripped before translation.
+    stripped = _advisory("api", "claude-opus-4.6[1m]")
+    assert stripped.target_id == "anthropic/claude-opus-4.6"
+
+    # An unmapped legacy spelling ('opus') force-disables with the typed
+    # reason — the row is never silently pointed at a different model.
+    unmapped = _advisory("api", "opus")
+    assert unmapped.enabled is False
+    assert unmapped.disabled_reason == "legacy_claude_sdk_target_unmapped"
+
+
+def test_migration_disable_reason_reaches_the_gate_diagnostic(roster_env):
+    """advisory_gate_unavailability_reason distinguishes the migration
+    force-disable from a standing owner disable (F2: the typed reason must
+    not dead-end in a parse-time log line)."""
+    import json as _json
+
+    roster_env.setenv(REVIEWER_SLOTS_ENV, _json.dumps({
+        "triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "openai/m"}}],
+        "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "openai/m"}}],
+        "advisory": {"enabled": True, "route": {"kind": "api", "target_id": "opus"}},
+    }))
+    from ouroboros.tools.claude_advisory_review import advisory_gate_unavailability_reason
+    assert advisory_gate_unavailability_reason() == (
+        "advisory_slot_disabled:legacy_claude_sdk_target_unmapped"
+    )
+
+
+def test_settings_save_validates_actor_refs_against_the_incoming_roster(roster_env, tmp_path, monkeypatch):
+    """S4 atomicity: one save may add a roster row AND reference it (validated
+    against the incoming roster, not the stale env); a roster-only save that
+    removes a still-referenced actor is refused instead of stranding every
+    strict review surface post-save."""
+    import asyncio
+    import json as _json
+
+    from starlette.requests import Request
+
+    import ouroboros.gateway.settings as gws
+
+    saved = {}
+
+    def _fake_load():
+        from ouroboros.config import SETTINGS_DEFAULTS
+        out = dict(SETTINGS_DEFAULTS)
+        out.update(saved)
+        return out
+
+    def _fake_write(payload, *, allow_elevation=False, allow_context_lowering=False,
+                    authored_keys=(), boundary=None):
+        saved.clear(); saved.update(payload)
+        if boundary is not None:
+            boundary.commit()
+        return payload
+
+    monkeypatch.setattr(gws, "load_settings", _fake_load)
+    monkeypatch.setattr(gws, "_owner_write_settings", _fake_write)
+    # A successful save exports settings into os.environ; keep this test
+    # hermetic (the exported reviewer slots would leak into later tests).
+    monkeypatch.setattr(gws, "_apply_settings_to_env", lambda *a, **k: None)
+
+    def _post(body):
+        async def _receive():
+            return {"type": "http.request", "body": _json.dumps(body).encode()}
+        request = Request({"type": "http", "method": "POST", "path": "/api/settings",
+                           "headers": [("content-type", "application/json")],
+                           "query_string": b"", "app": None}, receive=_receive)
+        return asyncio.run(gws.api_settings_post(request))
+
+    roster_env.delenv("OUROBOROS_SUBAGENTS", raising=False)
+    new_roster = _json.dumps({"enabled": True, "items": [{
+        "subagent_id": "fresh-critic", "name": "Fresh", "recommended_use": "x",
+        "route": {"kind": "api_model", "target_id": "openai/gpt-5.5"}, "effort": "low"}]})
+    slots = _json.dumps({
+        "triad": [{"slot_id": "t1", "subagent_id": "fresh-critic"}],
+        "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "openai/m"}}],
+        "advisory": {"enabled": False},
+    })
+    resp = _post({"OUROBOROS_SUBAGENTS": new_roster, "OUROBOROS_REVIEWER_SLOTS": slots})
+    assert resp.status_code == 200, resp.body[:300]
+
+    # Roster-only save dropping the still-referenced actor: refused.
+    saved["OUROBOROS_REVIEWER_SLOTS"] = slots
+    empty_roster = _json.dumps({"enabled": True, "items": [{
+        "subagent_id": "other", "name": "Other", "recommended_use": "x",
+        "route": {"kind": "api_model", "target_id": "openai/gpt-5.5"}, "effort": "low"}]})
+    resp2 = _post({"OUROBOROS_SUBAGENTS": empty_roster})
+    assert resp2.status_code == 400, resp2.body[:300]

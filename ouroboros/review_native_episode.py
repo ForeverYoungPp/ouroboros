@@ -84,13 +84,22 @@ _INSPECTION_TOOL_NAMES = (
 _NATIVE_REVIEW_INSTRUCTIONS = (
     "You are an independent Ouroboros reviewer running a bounded read-only "
     "inspection episode. Retrieve the evidence yourself with the tools you are "
-    "given inside the repository root: read files, list, search, query code "
-    "structure, and read-only git status/diff. You cannot modify anything and "
-    "have no shell. Work within a hard round budget: read what the checklist "
-    "requires, then answer. Your FINAL message must contain no tool calls and "
-    "must follow the output contract in the task EXACTLY; your host parses it "
+    "given inside the repository root — read_file, list_files, search_code, "
+    "query_code, vcs_status, vcs_diff; no other tools exist here. You cannot "
+    "modify anything and have no shell. Read LARGE files in bounded chunks "
+    "(read_file supports offset/limit) instead of requesting a whole large "
+    "document at once: the episode has hard round and transcript budgets, and "
+    "an oversized read spends both. Read what the checklist requires, then "
+    "answer. Your FINAL message must contain no tool calls and must follow "
+    "the output contract in the task EXACTLY; your host parses it "
     "structurally, and prose around the verdict is a non-response."
 )
+
+# Per-tool-result bound inside the episode: one greedy full read of a giant
+# artifact must not consume the whole transcript budget in a single round.
+# Disclosed truncation with an offset/limit continuation handle is honest —
+# unlike compaction, nothing unseen is summarized into the record.
+_EPISODE_TOOL_RESULT_CHAR_CAP = 120_000
 
 # Physical-send headroom per provider call: llm.py may spend one internal
 # one-shot recovery send per chat() (param-drop/wire-recovery/reroute), and the
@@ -120,6 +129,7 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         self._raw_transcript: Optional[str] = None
         self._episode_usage: Dict[str, Any] = {}
         self._tool_receipts: List[Dict[str, Any]] = []
+        self._tool_calls_total = 0
         self._rounds_used = 0
         self._settled_failure: Optional[BaseException] = None
 
@@ -266,6 +276,16 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                 ):
                     raise _deadline_exhausted_error(
                         "owner deadline exhausted mid native review episode")
+                # The bound is enforced BEFORE every send — the transcript IS
+                # the growing provider context, so an oversized initial prompt
+                # and mid-episode growth fail closed at the same rail (a check
+                # only after tool results let a final round exceed the bound).
+                if transcript_chars > transcript_cap:
+                    raise ReviewRouteUnavailable(
+                        f"native review episode transcript ({transcript_chars} chars) "
+                        f"exceeded its bound ({transcript_cap}); the episode fails "
+                        "closed — compaction would review a fabricated cut",
+                        code="native_transcript_cap_exceeded")
                 chat_kwargs: Dict[str, Any] = {
                     "messages": messages,
                     "model": slot.model,
@@ -304,6 +324,15 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                 wire_validation = pop_custom_validation_receipts(usage, tool_calls)
                 validation_by_id = custom_validation_by_call_id(wire_validation)
                 add_usage(total_usage, usage)
+                # add_usage accumulates only token/cost keys: carry the ledger
+                # linkage and provenance facts the substrate's actor records
+                # consume, or the episode rollup would echo the REQUESTED model
+                # dressed as resolved and lose its physical attempt ids.
+                for _attempt_id in (usage.get("ledger_attempt_ids") or []):
+                    total_usage.setdefault("ledger_attempt_ids", []).append(_attempt_id)
+                for _fact in ("resolved_model", "provider"):
+                    if usage.get(_fact):
+                        total_usage[_fact] = usage[_fact]
                 content = str(msg.get("content") or "") if isinstance(msg, dict) else ""
                 transcript_chars += len(content)
                 if content and not tool_calls:
@@ -343,9 +372,21 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                                 result = str(registry.execute(name, args))
                             except Exception as exc:  # tool errors feed the model, not the rail
                                 result = f"⚠️ {type(exc).__name__}: {exc}"
+                            if len(result) > _EPISODE_TOOL_RESULT_CHAR_CAP:
+                                # Disclosed bound with a continuation handle — the
+                                # reader keeps reading in chunks (read_file supports
+                                # offset/limit), so nothing is silently cut.
+                                kept = result[:_EPISODE_TOOL_RESULT_CHAR_CAP]
+                                result = (
+                                    kept
+                                    + f"\n⚠️ RESULT TRUNCATED: showed {_EPISODE_TOOL_RESULT_CHAR_CAP}"
+                                    f" of {len(result)} chars. Continue reading the remainder"
+                                    " in bounded chunks (read_file supports offset/limit)."
+                                )
                     # Host-observed evidence (bounded): which artifacts THIS
                     # episode actually opened — disclosure, never a claim of
                     # full-surface coverage.
+                    self._tool_calls_total += 1
                     if len(self._tool_receipts) < 200:
                         receipt: Dict[str, Any] = {"round": round_idx, "tool": name}
                         if isinstance(args, dict):
@@ -353,6 +394,10 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                                 if args.get(key):
                                     receipt[key] = str(args[key])[:300]
                         receipt["result_chars"] = len(result)
+                        # Honesty: a refused call must not read as an executed one.
+                        receipt["outcome"] = (
+                            "refused" if result.startswith("⚠️") else "executed"
+                        )
                         self._tool_receipts.append(receipt)
                     transcript_chars += len(result)
                     messages.append({
@@ -377,7 +422,7 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
             "provider": str(total_usage.get("provider") or ""),
             "resolved_model": str(total_usage.get("resolved_model") or slot.model),
             "native_rounds": self._rounds_used,
-            "native_tool_calls": len(self._tool_receipts),
+            "native_tool_calls": self._tool_calls_total,
             "native_tool_receipts": list(self._tool_receipts),
             # Provenance class of this delivery: the host SAW these reads.
             "host_file_read_attestation": "host_observed",

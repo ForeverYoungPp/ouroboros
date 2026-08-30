@@ -303,7 +303,7 @@ def _build_advisory_prompt(
         role_title = "You are performing an advisory SKILL review for Ouroboros."
         role_requirements = (
             "- Review the supplied skill payload using the Skill Review Checklist.\n"
-            "- Use ONLY Read, Grep, Glob tools. Do NOT edit or execute any files.\n"
+            "- Use ONLY the read-only inspection tools you are given (read_file, list_files, search_code, query_code, vcs_status, vcs_diff). Do NOT edit or execute any files. Read LARGE files in bounded chunks (read_file supports offset/limit).\n"
             "- The payload pack is already included below; use tools only for host-code cross-checks.\n"
             "- Return ONLY a JSON array. No prose, no markdown fences — only the JSON array."
         )
@@ -317,12 +317,12 @@ def _build_advisory_prompt(
         role_title = "You are performing a pre-commit review of an Ouroboros self-modifying AI agent codebase."
         role_requirements = (
             "- Review the current working tree changes with the SAME RIGOR as the downstream blocking reviewers.\n  A false PASS here wastes an entire blocking review cycle ($10+).\n"
-            "- Use ONLY Read, Grep, Glob tools. Do NOT edit or execute any files.\n"
-            "- Read the FULL CONTENT of every changed file listed below using the Read tool.\n  Do NOT evaluate security, bible compliance, or code quality from path listings or diff hunks alone.\n"
+            "- Use ONLY the read-only inspection tools you are given (read_file, list_files, search_code, query_code, vcs_status, vcs_diff). Do NOT edit or execute any files. Read LARGE files in bounded chunks (read_file supports offset/limit).\n"
+            "- Read the FULL CONTENT of every changed file listed below with read_file.\n  Do NOT evaluate security, bible compliance, or code quality from path listings or diff hunks alone.\n"
             "- Return ONLY a JSON array. No prose, no markdown fences — only the JSON array."
         )
         step_instructions = (
-            "1. Read the FULL content of every changed file using the Read tool. Do not skip any file.\n"
+            "1. Read the FULL content of every changed file with read_file. Do not skip any file.\n"
             "2. Check EVERY item from the \"Repo Commit Checklist\" — do not stop after the first issue.\n"
             "3. Pay equal attention to EVERY checklist item listed below — do not favour early items.\n   bible_compliance and security_issues must be evaluated at the same strictness as the\n   downstream blocking reviewers.\n"
             "4. Look for ALL bugs, logic errors, regressions, race conditions, and violations of BIBLE.md or DEVELOPMENT.md.\n"
@@ -367,7 +367,7 @@ def _build_advisory_prompt(
         f"{arch_doc}\n\n{skill_host_context}\n\n{blocking_history}\n\n"
         f"## Commit message\n\n{commit_message}\n\n"
         f"## Changed files (git status --porcelain)\n\n{changed_files}\n\n"
-        "## Current touched files (full content — read these with the Read tool for deeper inspection)\n\n"
+        "## Current touched files (full content — read these with read_file for deeper inspection)\n\n"
         f"{touched_pack}\n{omitted_note}\n\n"
         f"## Staged diff\n\n{diff}\n\n"
         f"## Step-by-step instructions\n{step_instructions}\n"
@@ -611,7 +611,14 @@ def advisory_gate_unavailability_reason() -> str | None:
     authority over its own fail direction.
     """
     if not advisory_slot_enabled():
-        return "advisory_slot_disabled"
+        # A migration force-disable is NOT a standing owner choice: surface
+        # the parser's typed reason so the two states never conflate (a
+        # legacy Claude-SDK target that could not be mapped reads as exactly
+        # that, not as "the owner switched advisory off").
+        from ouroboros.reviewer_slot_config import advisory_slot_config
+
+        _reason = str(getattr(advisory_slot_config(), "disabled_reason", "") or "")
+        return f"advisory_slot_disabled:{_reason}" if _reason else "advisory_slot_disabled"
     if advisory_review_route() == "api_chat":
         from ouroboros.provider_models import model_has_credentials
 
@@ -1378,7 +1385,7 @@ def _run_claude_advisory(
             session_id="",
             diag=diag,
         )
-        log.error("Advisory SDK exception:\n%s", err_msg)
+        log.error("Advisory delivery exception:\n%s", err_msg)
         return [], err_msg, model, prompt_chars
 
 
