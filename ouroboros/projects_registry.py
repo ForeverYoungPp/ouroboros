@@ -745,6 +745,15 @@ def complete_project_deletion(drive_root: Any, project_id: str) -> Optional[Dict
             entry["tombstoned_at"] = utc_now_iso()
             entry["delete_error"] = ""
             _save(drive_root, data)
+            try:
+                # The store's `.project.json` is REGISTRY-AUTHORED recovery metadata,
+                # not the owner's memory: leaving it would let a later loss of
+                # projects.json (rows AND tombstones live in that one file) resurrect
+                # the deleted room as active through marker recovery.
+                (pathlib.Path(drive_root) / "projects" / pid / _PROJECT_MARKER_NAME).unlink(
+                    missing_ok=True)
+            except OSError:
+                log.warning("could not remove %s marker of tombstoned %s", _PROJECT_MARKER_NAME, pid)
             log.info(
                 "Project tombstoned: %s (history, bindings, folder and memory preserved)",
                 pid,
@@ -804,11 +813,28 @@ def touch_project(drive_root: Any, project_id: str) -> None:
         log.debug("touch_project failed for %s", project_id, exc_info=True)
 
 
+_PROJECT_MARKER_NAME = ".project.json"
+
+
+def _read_store_marker(store_dir: pathlib.Path) -> Dict[str, Any]:
+    """Registry-authored provenance echo inside a project store ({} when absent or
+    malformed). Never authoritative over a live registry row — it exists so reconcile
+    can tell a REAL room's store from a workspace-task facts store in the one scenario
+    the registry row itself is what was lost (the two are byte-shape identical on disk,
+    and a non-ASCII display name hashes to the same ``proj_<hash>`` id namespace)."""
+    marker = read_json_dict(store_dir / _PROJECT_MARKER_NAME)
+    if not isinstance(marker, dict) or not isinstance(marker.get("id"), str):
+        return {}
+    return marker
+
+
 def reconcile_projects(drive_root: Any) -> int:
-    """Boot reconcile: register projects whose memory store exists but whose
-    registry row is missing (e.g. created before the registry shipped, or a
-    workspace-derived ``proj_<hash>`` store). NEVER prunes — durable project
-    dirs outlive any registry accident.
+    """Register projects whose memory store exists but whose registry row is
+    missing (e.g. created before the registry shipped). Runs at boot AND on the
+    periodic supervisor reconcile tick. A workspace-derived ``proj_<hash>``
+    store registers only when a durable task binding OR the store's own
+    registry-authored ``.project.json`` marker proves a real room. NEVER
+    prunes — durable project dirs outlive any registry accident.
     """
     added = 0
     try:
@@ -817,19 +843,88 @@ def reconcile_projects(drive_root: Any) -> int:
             with _file_write_lock(_registry_path(drive_root)):
                 data = _load(drive_root)
                 known = {p.get("id") for p in data["projects"]}
+                # Keep the store-side marker current for every ACTIVE owner-originated
+                # row whose store already exists. Maintained HERE — by the same organ
+                # that consumes it — so there is no second producer seam and no mkdir:
+                # a file-less room gets its marker on the first tick after its store
+                # materializes, and reconcile-originated rows are deliberately
+                # excluded so a pre-guard ghost row can never mint recovery evidence
+                # for itself.
+                for row in data["projects"]:
+                    store = projects_root / str(row.get("id") or "")
+                    if row.get("lifecycle") == PROJECT_TOMBSTONED:
+                        # Convergence for deletion: a marker whose unlink failed at
+                        # tombstone time (or predates this line) is retried every
+                        # tick, so a stale marker can never outlive its tombstone
+                        # into a later registry-loss recovery.
+                        try:
+                            (store / _PROJECT_MARKER_NAME).unlink(missing_ok=True)
+                        except OSError:
+                            log.warning("stale marker removal failed for %s", row.get("id"))
+                        continue
+                    if row.get("lifecycle") != PROJECT_ACTIVE or row.get("origin") == "reconcile":
+                        continue
+                    if not store.is_dir():
+                        continue
+                    marker = _read_store_marker(store)
+                    if marker.get("id") != row.get("id") or marker.get("name") != row.get("name"):
+                        try:
+                            atomic_write_json(store / _PROJECT_MARKER_NAME, {
+                                "id": row.get("id"),
+                                "name": row.get("name"),
+                                "origin": row.get("origin"),
+                                "created_at": row.get("created_at"),
+                            })
+                        except OSError:
+                            # One unwritable store must not abort the whole reconcile:
+                            # the marker retries next tick, registrations still run.
+                            log.warning("project marker write failed for %s", row.get("id"),
+                                        exc_info=True)
+                # A workspace-derived ``proj_<hash>`` store is minted by
+                # project_facts for ANY task carrying a workspace path; the
+                # directory alone is not evidence that the owner ever created a
+                # project room. A durable task binding proves it, and so does the
+                # marker above (written only for rows that once really existed).
+                # Read the bindings through the cached lens ONCE here — this
+                # function also runs on the 300s supervisor reconcile tick, not
+                # just at boot. An unreadable bindings file fail-closes to an
+                # empty set (every unbound proj_ dir is skipped this pass,
+                # idempotently retried on the next tick), and a malformed legacy
+                # row — including a non-string ``project_id``, whose str() form
+                # could otherwise sanitize into a valid-looking id — is skipped
+                # per row rather than coerced or aborting the whole reconcile.
+                bound = {
+                    sanitize_project_id(row["project_id"])
+                    for row in _bindings_lens(drive_root).values()
+                    if isinstance(row, dict) and isinstance(row.get("project_id"), str)
+                }
                 for entry in sorted(projects_root.iterdir()):
                     if not entry.is_dir() or entry.name.startswith("."):
                         continue
                     pid = sanitize_project_id(entry.name)
                     if not pid or pid in known:
                         continue
+                    # Named stores register as before. A legitimately created
+                    # proj_*-named project passed through create_project and is
+                    # already in ``known``, so it never reaches this guard.
+                    row_name, row_origin, row_created = pid, "reconcile", ""
+                    if pid.startswith("proj_") and pid not in bound:
+                        marker = _read_store_marker(entry)
+                        if marker.get("id") != pid:
+                            continue  # unbound, unmarked: a workspace facts store
+                        # Recovery with the room's REAL identity: the pre-guard
+                        # behavior resurrected it under the machine name; the
+                        # marker restores display name, origin and created_at.
+                        row_name = str(marker.get("name") or pid)[:80] or pid
+                        row_origin = str(marker.get("origin") or "reconcile") or "reconcile"
+                        row_created = str(marker.get("created_at") or "")
                     data["projects"].append({
                         "id": pid,
-                        "name": pid,
+                        "name": row_name,
                         "chat_id": project_chat_id(pid),
                         "working_dir": "",
-                        "origin": "reconcile",
-                        "created_at": utc_now_iso(),
+                        "origin": row_origin,
+                        "created_at": row_created or utc_now_iso(),
                         "last_active_at": utc_now_iso(),
                         "lifecycle": PROJECT_ACTIVE,
                         "routing_generation": 0,
