@@ -49,11 +49,6 @@ function ownUnknownKeys(value, allowed) {
     return Object.keys(value || {}).filter((key) => !allowed.has(key));
 }
 
-function readableName(subagentId) {
-    const words = String(subagentId || '').replace(/[_-]+/g, ' ').trim();
-    return words ? words.replace(/\b\w/g, (letter) => letter.toUpperCase()) : 'Subagent';
-}
-
 function canonicalRow(row) {
     const route = serializeRouteSpec(row?.route || {}, {
         apiKind: ROUTE_KIND_API_MODEL,
@@ -64,9 +59,11 @@ function canonicalRow(row) {
         route.credential_profile_id = String(route.credential_profile_id || '').trim();
         if (!route.credential_profile_id) delete route.credential_profile_id;
     }
+    // `name` is retired (owner decision 1=A): a legacy value parses and is
+    // DROPPED — identity is the neutral subagent_id plus derived route facts,
+    // and recommended_use is the one semantic field.
     return {
         subagent_id: String(row?.subagent_id || '').trim(),
-        name: String(row?.name || '').trim(),
         recommended_use: String(row?.recommended_use || ''),
         route,
         ...(row?.effort ? { effort: String(row.effort).trim().toLowerCase() } : {}),
@@ -234,7 +231,6 @@ export function buildAvailableSubagentsSetting(setting) {
                 out.route.credential_profile_id = out.route.credential_profile_id.trim();
             }
             if (out.effort) out.effort = out.effort.trim();
-            if (!out.name.trim()) out.name = readableName(out.subagent_id);
             return out;
         }),
     };
@@ -561,7 +557,6 @@ export function createAvailableSubagentsEditor({
                 const copy = canonicalRow(row);
                 copy.subagent_id = mintStableId(`${row.subagent_id || 'subagent'}_copy`,
                     state.setting.items.map((item) => item.subagent_id));
-                copy.name = `${row.name || readableName(row.subagent_id)} copy`;
                 copy._uiKey = mintStableId('actor_row',
                     state.setting.items.map((item) => item._uiKey));
                 state.setting.items.splice(state.setting.items.indexOf(row) + 1, 0, copy);
@@ -620,7 +615,6 @@ export function createAvailableSubagentsEditor({
             const id = mintStableId('subagent', state.setting.items.map((row) => row.subagent_id));
             state.setting.items.push({
                 subagent_id: id,
-                name: readableName(id),
                 recommended_use: '',
                 route: { kind: ROUTE_KIND_API_MODEL, target_id: '' },
                 _uiKey: mintStableId('actor_row',

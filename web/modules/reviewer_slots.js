@@ -170,20 +170,43 @@ export function rowSource(row) {
     return row?.subagent_id ? ROW_SOURCE_SUBAGENT : ROW_SOURCE_DIRECT;
 }
 
+export function subagentOptionLabel(row) {
+    const route = row?.route || {};
+    const parts = [`#${String(row?.subagent_id || '')}`];
+    if (route.kind === ROUTE_KIND_SESSION) {
+        const split = splitSessionTarget(route.target_id);
+        parts.push(split.harness || 'agent session');
+        if (split.model) parts.push(split.model);
+    } else {
+        parts.push('API');
+        if (route.target_id) parts.push(route.target_id);
+    }
+    if (row?.effort) parts.push(row.effort);
+    // Free text is a caption, never identity: one line, bounded, with the
+    // characters that could visually reorder or break the facts stripped
+    // (bidi controls, newlines).
+    const use = String(row?.recommended_use || '')
+        .replace(/[\u202A-\u202E\u2066-\u2069]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const hint = use.length > 48 ? `${use.slice(0, 45)}…` : use;
+    return parts.join(' · ') + (hint ? ` — ${hint}` : '');
+}
+
 export function subagentOptionsFor(roster, savedId, { rosterKnown = true } = {}) {
     // Same survive-the-save rule as profileOptionsFor: the select's value must
     // EXIST as an option, or the browser silently redraws the row as the first
     // roster entry and the next Save really rewires the reviewer. And the
     // absence claim follows provenance: only a roster that was actually READ
     // may say a saved reference is not in it.
-    const options = (roster || []).map((row) => {
-        const use = String(row.recommended_use || '').trim();
-        const hint = use.length > 60 ? `${use.slice(0, 57)}…` : use;
-        return {
-            value: String(row.subagent_id || ''),
-            label: `${row.name || row.subagent_id}${hint ? ` — ${hint}` : ''}`,
-        };
-    });
+    // Label contract (owner decision 2=A): DERIVED FACTS lead — channel first,
+    // then target and effort — so the delivery is visible BEFORE selection and
+    // free-text intent can never disguise it; the description is a trimmed,
+    // sanitized single-line caption after the facts.
+    const options = (roster || []).map((row) => ({
+        value: String(row.subagent_id || ''),
+        label: subagentOptionLabel(row),
+    }));
     const saved = String(savedId || '');
     if (saved && !options.some((option) => option.value === saved)) {
         options.push({

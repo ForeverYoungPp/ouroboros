@@ -395,13 +395,16 @@ test('the roster select survives a saved reference the roster no longer lists', 
     // and the next Save really rewires the reviewer. The absence claim follows
     // provenance: only a roster that was READ may say "not in the roster".
     const roster = [
-        { subagent_id: 'deep', name: 'Deep Reviewer', recommended_use: 'Long reasoning over big diffs' },
-        { subagent_id: 'fast', name: 'Fast Reviewer', recommended_use: '' },
+        { subagent_id: 'deep', recommended_use: 'Long reasoning over big diffs',
+          route: { kind: 'api_model', target_id: 'openai/gpt-5.6-sol' }, effort: 'high' },
+        { subagent_id: 'fast', recommended_use: '',
+          route: { kind: 'agent_session', target_id: 'cursor=grok-4.6' } },
     ];
     const listed = subagentOptionsFor(roster, 'deep');
     assert.deepEqual(listed.map((o) => o.value), ['deep', 'fast']);
-    assert.match(listed[0].label, /Deep Reviewer — Long reasoning/);
-    assert.equal(listed[1].label, 'Fast Reviewer');
+    // 2=A label contract: FACTS lead (channel first), description is a caption.
+    assert.equal(listed[0].label, '#deep · API · openai/gpt-5.6-sol · high — Long reasoning over big diffs');
+    assert.equal(listed[1].label, '#fast · cursor · grok-4.6');
 
     const missing = subagentOptionsFor(roster, 'gone');
     assert.deepEqual(missing.map((o) => o.value), ['deep', 'fast', 'gone']);
