@@ -403,12 +403,20 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
                 custody["open_run_ids_omitted"] = len(open_ids) - 10
                 omitted_any = True
         if omitted_any:
-            # A bound must name a source the actor can resolve (BIBLE P1):
-            # the complete lists live on the stored row itself.
-            custody["full_source"] = (
-                "read_file(root='runtime_data', "
-                f"path='task_results/{str(data.get('task_id') or '')}.json')"
+            # A bound must name a source the actor can resolve (BIBLE P1).
+            # Retry lineage unions the ORIGINAL row's disclosure into this
+            # projection, so the omitted identifiers may live on either row —
+            # name both when the lineage exists.
+            tid = str(data.get("task_id") or "")
+            origin = str(
+                data.get("original_task_id") or data.get("timeout_retry_from") or ""
             )
+            paths = [f"task_results/{tid}.json"]
+            if origin and origin != tid:
+                paths.append(f"task_results/{origin}.json")
+            custody["full_source"] = [
+                f"read_file(root='runtime_data', path='{p}')" for p in paths
+            ]
         summary["delegated_custody"] = custody
     if isinstance(data.get("task_contract"), dict):
         summary["task_contract"] = data.get("task_contract")

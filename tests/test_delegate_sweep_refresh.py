@@ -128,6 +128,29 @@ def test_boot_backfill_fixes_row_settled_in_a_previous_generation(tmp_path):
     }
 
 
+def test_truncated_custody_disclosure_names_both_retry_lineage_rows(tmp_path):
+    """When the full-handoff custody disclosure truncates AND the row carries
+    retry lineage, the resolvable full source names BOTH rows — the union may
+    have inherited identifiers from the original row (final-gate sol#1)."""
+    import json
+
+    from ouroboros.tools.control import _subtask_outcome_summary
+
+    row = {
+        "task_id": "t-retry",
+        "original_task_id": "t-orig",
+        "status": STATUS_FAILED,
+        "delegated_runs_unreconciled": [f"run-{i}" for i in range(12)],
+    }
+    summary = json.loads(_subtask_outcome_summary(row))
+    custody = summary["delegated_custody"]
+    assert custody["unreconciled_omitted"] == 2
+    assert custody["full_source"] == [
+        "read_file(root='runtime_data', path='task_results/t-retry.json')",
+        "read_file(root='runtime_data', path='task_results/t-orig.json')",
+    ]
+
+
 def test_stale_child_replica_cannot_reshadow_healed_custody_fields(tmp_path):
     """Split-drive shape: the boot backfill heals only the CANONICAL row, but
     effective reads overlay a retained child replica. The custody disclosure

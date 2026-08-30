@@ -1933,6 +1933,38 @@ def test_nonforced_resolver_passes_mixed_prose_json_when_latch_not_armed(tmp_pat
     assert text == mixed
 
 
+def test_forced_rail_truncated_trailing_fragment_is_a_disclosed_residual(
+    tmp_path, monkeypatch,
+):
+    """Pin the THIRD disclosed containment residual: an armed forced rail
+    publishes prose ending with a TRUNCATED (unbalanced) protocol fragment as
+    prose — a fragment is not a parseable object, and containing it would need
+    the substring scanning the containment rule deliberately rejects
+    (ARCHITECTURE ~1024 / DEVELOPMENT ~2196)."""
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    truncated = (
+        "Here is my summary before the cut.\n"
+        '{"delivery_control": "replace", "full_answer": "cut'
+    )
+    monkeypatch.setattr(
+        loop, "call_llm_with_retry",
+        lambda *_a, **_k: ({"role": "assistant", "content": truncated}, 0.0),
+    )
+
+    text, _usage, _trace = loop._forced_final_answer(
+        limit_ctx, prompt="finalize", fallback_text="fallback", reason_code="round_limit",
+    )
+
+    assert text.startswith("Here is my summary before the cut.")
+    assert '"delivery_control"' in text  # the documented residual, not a leak fix
+    candidate = registry._ctx._delivery_candidate
+    # The fragment rode the rail's ORDINARY forced packaging (degraded by the
+    # rail reason), never the protocol-containment path.
+    assert candidate.degraded_reason == "round_limit"
+    assert candidate.finalization_control == "forced_replace:round_limit"
+
+
 def test_salvage_predicate_keeps_mixed_answers_and_skips_pure_protocol():
     """observability's salvage predicate keeps its latch-free whole-object
     semantics after the fence-strip sharing: a MIXED prose+object answer
