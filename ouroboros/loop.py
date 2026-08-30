@@ -4172,7 +4172,9 @@ def _parse_delivery_control_object(
 
     try:
         payload = json.loads(raw, object_pairs_hook=_unique_object)
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+        # RecursionError: a degenerate deeply-nested blob (repetition-loop
+        # model output) must classify as not-a-control, not crash the round.
         return None, duplicate_protocol_key
     if not isinstance(payload, dict):
         return None, False
@@ -4199,6 +4201,19 @@ def _parse_delivery_control_body(
     if duplicate_protocol_key or isinstance(parsed, dict):
         return parsed, duplicate_protocol_key, False
     tail = body.rstrip()
+    if tail.endswith("```"):
+        # Prose ending with a FENCED block: models fence JSON by default, so a
+        # trailing fenced protocol object is the same protocol attempt as a
+        # bare trailing one. Drop the closing fence line and its matching
+        # opener, then run the ordinary trailing scan on what the fence held.
+        # This containment stays inside the latch-gated resolvers; the shared
+        # whole-body fence-strip (observability salvage) is untouched.
+        lines = tail.splitlines()
+        if lines and lines[-1].strip() == "```":
+            for i in range(len(lines) - 2, -1, -1):
+                if lines[i].lstrip().startswith("```"):
+                    tail = "\n".join(lines[:i] + lines[i + 1:-1]).rstrip()
+                    break
     if not tail.endswith("}"):
         return None, False, False
     start = tail.rfind("{")

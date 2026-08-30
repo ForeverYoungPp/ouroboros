@@ -1799,6 +1799,67 @@ def test_nonforced_resolver_contains_trailing_protocol_object_in_prose(tmp_path)
     assert candidate.degraded_reason == "invalid_delivery_control_after_repair"
 
 
+def test_forced_finalization_contains_trailing_fenced_protocol_object(
+    tmp_path, monkeypatch,
+):
+    """Armed latch + prose ending with a FENCED protocol object (models fence
+    JSON by default): the same protocol attempt as a bare trailing object —
+    never honored, never published raw."""
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    mixed = (
+        "Here is my final summary of the run.\n```json\n"
+        + json.dumps({"delivery_control": "replace", "full_answer": "smuggled"})
+        + "\n```"
+    )
+    monkeypatch.setattr(
+        loop, "call_llm_with_retry",
+        lambda *_a, **_k: ({"role": "assistant", "content": mixed}, 0.0),
+    )
+
+    text, _usage, _trace = loop._forced_final_answer(
+        limit_ctx, prompt="finalize", fallback_text="fallback", reason_code="round_limit",
+    )
+
+    assert text.startswith("Retained complete answer.")
+    assert '{"delivery_control"' not in text
+    assert "smuggled" not in text
+    candidate = registry._ctx._delivery_candidate
+    assert candidate.degraded is True
+    assert candidate.degraded_reason == "delivery_control_degraded"
+
+
+def test_nonforced_resolver_contains_trailing_fenced_protocol_object(tmp_path):
+    """Ordinary resolver, armed latch: prose + trailing FENCED protocol object
+    is a protocol attempt — repair round, then degraded-preserve, protocol
+    JSON never published."""
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    candidate = _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    mixed = (
+        "Prose half of a contradictory answer.\n```json\n"
+        + json.dumps({"delivery_control": "keep"})
+        + "\n```"
+    )
+
+    status, _text = loop._resolve_delivery_control(mixed, registry, limit_ctx, trace)
+    assert status == "retry"
+
+    status2, text2 = loop._resolve_delivery_control(mixed, registry, limit_ctx, trace)
+    assert status2 == "degraded"
+    assert text2 == candidate.full_text
+    assert '{"delivery_control"' not in text2
+
+
+def test_parse_body_survives_degenerate_nested_trailing_blob(tmp_path):
+    """A repetition-loop blob (deeply nested braces) after prose must classify
+    as not-a-control instead of escaping RecursionError into the round loop."""
+    from ouroboros import loop
+
+    blob = "prose answer text\n" + '{"a":' * 2000 + "1" + "}" * 2000
+    parsed, duplicate, embedded = loop._parse_delivery_control_body(blob)
+    assert parsed is None and duplicate is False and embedded is False
+
+
 def test_nonforced_resolver_accepts_fenced_control_object(tmp_path):
     """Ordinary resolver, armed latch: a valid FENCED keep resolves cleanly
     after the shared fence-strip normalization."""
@@ -2043,8 +2104,11 @@ def test_forced_rail_reads_current_child_state_across_the_forced_call(
     def flip_and_answer(_llm, request_messages, *_a, **_k):
         seen_requests.append([dict(m) for m in request_messages])
         _write_child(tmp_path, status="completed")
+        # The mocked answer deliberately does NOT name the child: the final
+        # "child1 in text" assertion below is satisfiable only by the host
+        # orphan note, so the note's presence is genuinely verified.
         return (
-            {"role": "assistant", "content": "Best-effort final answer naming child1."},
+            {"role": "assistant", "content": "Best-effort final answer."},
             0.0,
         )
 

@@ -1772,8 +1772,10 @@ Before every commit, verify the following:
   gate is open the delivery candidate is HELD
   (`child_absorption_or_revision_required`), never armed: the JSON-only
   delivery-control instruction must not ride the same round as the absorption
-  reminder — or a post-tool evidence change with undispositioned children still
-  present — because it would contradict the required disposition tool call.
+  reminder — nor a post-tool evidence change while that hold is active —
+  because it would contradict the required disposition tool call. Before the
+  first reminder places the hold, no disposition instruction exists yet, so
+  the ordinary evidence-change arm still applies there.
 
 #### Page Header Layout
 - Top-level page chrome (`renderPageHeader`, tab strips, primary actions) must sit outside the scrolling content region.
