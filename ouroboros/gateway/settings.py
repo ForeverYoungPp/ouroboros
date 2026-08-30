@@ -1095,39 +1095,32 @@ def _check_reviewer_slots_against_incoming_roster(body: dict) -> str:
     """Validate reviewer slots under the POST-SAVE Available-subagents roster.
 
     S4 atomicity: adding a roster row plus its reviewer reference in ONE save
-    must validate against the incoming roster (not the stale process env), and
-    a roster-only save re-validates the STORED slots so a still-referenced
-    actor cannot be removed out from under them. Returns the D4 fallback
-    warning ('' when none); raises ValueError on a malformed/unresolvable
-    value (the caller turns it into a 400)."""
-    import contextlib
-    import os as _os
-
+    validates against the incoming roster (context-local override — never a
+    process-env mutation a concurrent dispatch could observe), and a
+    roster-only save re-validates the STORED slots so a still-referenced
+    actor cannot be removed out from under them. An EXPLICITLY cleared slots
+    value ('' present in the body) is a clear, not a fallback to the stored
+    value — presence and emptiness are tracked separately. Returns the D4
+    fallback warning ('' when none); raises ValueError on malformed."""
     subagents_key = "OUROBOROS_SUBAGENTS"
-    slots_to_check = str(body.get("OUROBOROS_REVIEWER_SLOTS") or "").strip()
+    slots_key = "OUROBOROS_REVIEWER_SLOTS"
     roster_changed = subagents_key in body
-    if not slots_to_check and roster_changed:
-        slots_to_check = str((load_settings() or {}).get("OUROBOROS_REVIEWER_SLOTS") or "").strip()
-    if not slots_to_check:
+    if slots_key in body:
+        slots_to_check = str(body.get(slots_key) or "").strip()
+        if not slots_to_check:
+            return ""  # explicit clear: nothing to validate
+    elif roster_changed:
+        slots_to_check = str((load_settings() or {}).get(slots_key) or "").strip()
+        if not slots_to_check:
+            return ""
+    else:
         return ""
     from ouroboros.reviewer_slot_config import reviewer_slot_save_check
 
-    @contextlib.contextmanager
-    def _roster_overlay():
-        if not roster_changed:
-            yield; return
-        prior = _os.environ.get(subagents_key)
-        _os.environ[subagents_key] = str(body.get(subagents_key) or "")
-        try:
-            yield
-        finally:
-            if prior is None:
-                _os.environ.pop(subagents_key, None)
-            else:
-                _os.environ[subagents_key] = prior
-
-    with _roster_overlay():
-        return reviewer_slot_save_check(slots_to_check)
+    return reviewer_slot_save_check(
+        slots_to_check,
+        subagents_raw=(str(body.get(subagents_key) or "") if roster_changed else None),
+    )
 
 
 def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:

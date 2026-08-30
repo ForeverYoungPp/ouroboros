@@ -218,6 +218,11 @@ def _validate_concrete_session_target(route: RouteSpec, where: str) -> None:
         )
 
 
+import contextvars as _contextvars
+_ROSTER_ENV_OVERRIDE: "_contextvars.ContextVar[Optional[dict]]" = _contextvars.ContextVar(
+    "reviewer_roster_env_override", default=None)
+
+
 def _resolve_actor_slot(
     slot_id: str, subagent_id: str, effort: str, where: str,
 ) -> ConfiguredReviewerSlot:
@@ -240,8 +245,13 @@ def _resolve_actor_slot(
         # The roster is read from the APPLIED env, the same plane this module's
         # own key lives on — a saved-but-unapplied roster edit is invisible
         # here exactly as a saved-but-unapplied reviewer-slot edit would be.
+        # Save-time validation threads the INCOMING roster through the
+        # context-local override (S4 atomicity) — never by mutating the
+        # process env, which concurrent review dispatch could observe.
+        _override = _ROSTER_ENV_OVERRIDE.get()
         snapshot, _legacy = select_subagent_snapshot(
-            os.environ, subagent_id=subagent_id,
+            _override if _override is not None else os.environ,
+            subagent_id=subagent_id,
         )
     except SubagentSelectionError as exc:
         raise ValueError(
@@ -855,13 +865,24 @@ def _fallback_warning_text(disclosure: Dict[str, Any]) -> str:
     )
 
 
-def reviewer_slot_save_check(raw: str) -> str:
+def reviewer_slot_save_check(raw: str, *, subagents_raw: Optional[str] = None) -> str:
     """Validate an incoming structured value and return the fallback warning.
 
     Raises ValueError (row-precise) on a malformed value so the save handler
     turns it into a 400; returns the all-delegated API-fallback warning ('' when
-    none) otherwise. One call keeps the handler at its size gate."""
-    disclosure = api_fallback_disclosure(parse_reviewer_slots(raw))  # raises on malformed
+    none) otherwise. ``subagents_raw`` threads the roster the SAME save
+    produces (S4 atomicity) through a context-local override — actor
+    references validate against it without any process-env mutation."""
+    if subagents_raw is None:
+        disclosure = api_fallback_disclosure(parse_reviewer_slots(raw))
+        return _fallback_warning_text(disclosure)
+    overlay = dict(os.environ)
+    overlay["OUROBOROS_SUBAGENTS"] = str(subagents_raw)
+    token = _ROSTER_ENV_OVERRIDE.set(overlay)
+    try:
+        disclosure = api_fallback_disclosure(parse_reviewer_slots(raw))
+    finally:
+        _ROSTER_ENV_OVERRIDE.reset(token)
     return _fallback_warning_text(disclosure)
 
 

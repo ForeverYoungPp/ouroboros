@@ -276,10 +276,12 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                 ):
                     raise _deadline_exhausted_error(
                         "owner deadline exhausted mid native review episode")
-                # The bound is enforced BEFORE every send — the transcript IS
-                # the growing provider context, so an oversized initial prompt
-                # and mid-episode growth fail closed at the same rail (a check
-                # only after tool results let a final round exceed the bound).
+                # The bound is a SEND bound: it is enforced BEFORE every
+                # provider call, because the transcript IS the growing context
+                # the next send would carry. A final content-only answer that
+                # lands past the number is accepted — no further send exists
+                # for it to poison, and refusing a completed verdict would
+                # protect nothing.
                 if transcript_chars > transcript_cap:
                     raise ReviewRouteUnavailable(
                         f"native review episode transcript ({transcript_chars} chars) "
@@ -352,10 +354,13 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                     name = str((function or {}).get("name") or "")
                     raw_args = (function or {}).get("arguments")
                     args: Optional[Dict[str, Any]] = None
+                    outcome = "executed"  # provenance from CONTROL FLOW, never string-sniffing
                     verdict = validation_by_id.get(call_id)
                     if verdict is not None and not getattr(verdict, "allows_execution", True):
+                        outcome = "refused"
                         result = f"⚠️ TOOL_ARG_ERROR: {getattr(verdict, 'error', 'invalid arguments')}"
                     elif name not in _INSPECTION_TOOL_NAMES:
+                        outcome = "refused"
                         result = (
                             f"⚠️ tool {name!r} is not available in this read-only "
                             "inspection episode"
@@ -366,11 +371,13 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                             if not isinstance(args, dict):
                                 raise ValueError("arguments must be a JSON object")
                         except (TypeError, ValueError) as exc:
+                            outcome = "refused"
                             args, result = None, f"⚠️ TOOL_ARG_ERROR: {exc}"
                         if isinstance(args, dict):
                             try:
                                 result = str(registry.execute(name, args))
                             except Exception as exc:  # tool errors feed the model, not the rail
+                                outcome = "error"
                                 result = f"⚠️ {type(exc).__name__}: {exc}"
                             if len(result) > _EPISODE_TOOL_RESULT_CHAR_CAP:
                                 # Disclosed bound with a continuation handle — the
@@ -395,9 +402,7 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                                     receipt[key] = str(args[key])[:300]
                         receipt["result_chars"] = len(result)
                         # Honesty: a refused call must not read as an executed one.
-                        receipt["outcome"] = (
-                            "refused" if result.startswith("⚠️") else "executed"
-                        )
+                        receipt["outcome"] = outcome
                         self._tool_receipts.append(receipt)
                     transcript_chars += len(result)
                     messages.append({
