@@ -1054,6 +1054,150 @@ def test_compact_review_projection_redacts_public_reasons_before_truncation():
     assert "***REDACTED***" in panel["reason"]
 
 
+def test_actor_projection_carries_bounded_disclosed_finding_rows():
+    from ouroboros.review_substrate import (
+        MAX_PROJECTED_ACTOR_FINDINGS, compact_review_projection,
+    )
+
+    secret = "sk-or-" + ("FindingSecret456" * 4)
+    long_recommendation = "Re-run the verifier with the fixed seed. " * 120
+    findings = [
+        {
+            "severity": "critical",
+            "item": f"finding {index}",
+            "evidence": f"evidence {index}",
+            "recommendation": f"fix {index}",
+        }
+        for index in range(MAX_PROJECTED_ACTOR_FINDINGS + 2)
+    ]
+    findings[0]["evidence"] = "credential=" + secret
+    findings[1]["recommendation"] = long_recommendation
+    run = {
+        "request": {"surface": "task_acceptance", "policy": {"min_successful_slots": 1}},
+        "aggregate_signal": "FAIL",
+        "actors": [
+            {
+                "slot_id": "with-findings",
+                "model": "model-a",
+                "status": "ok",
+                "signal": "FAIL",
+                "parsed": {"verdict": "FAIL", "summary": "s", "findings": findings},
+                "quorum_contribution": True,
+            },
+            {
+                "slot_id": "clean",
+                "model": "model-b",
+                "status": "ok",
+                "signal": "PASS",
+                "parsed": {"verdict": "PASS", "summary": "ok", "findings": []},
+                "quorum_contribution": True,
+            },
+            {
+                "slot_id": "transport-hole",
+                "model": "model-c",
+                "status": "error",
+                "error": "timed out",
+                "parsed": None,
+            },
+            {
+                "slot_id": "odd-shape",
+                "model": "model-d",
+                "status": "ok",
+                "signal": "FAIL",
+                "parsed": {
+                    "verdict": "FAIL",
+                    "summary": "s",
+                    "findings": [{
+                        "weird_key": "the only copy of this evidence",
+                        "password": "hunter2-odd-shape",
+                    }],
+                },
+            },
+            {
+                # A non-string value under a KNOWN key keeps structural
+                # key-based masking: str() first would flatten the nested
+                # secret past the key-name redactor.
+                "slot_id": "nested-evidence",
+                "model": "model-f",
+                "status": "ok",
+                "signal": "FAIL",
+                "parsed": {
+                    "verdict": "FAIL",
+                    "summary": "s",
+                    "findings": [{
+                        "severity": "high",
+                        "item": "nested shape",
+                        "evidence": {"password": "hunter2-nested-shape"},
+                    }],
+                },
+            },
+            {
+                # The array-ladder reviewer contract shapes findings as
+                # {item, verdict, severity, reason}: the substantive `reason`
+                # text must survive projection.
+                "slot_id": "triad-shape",
+                "model": "model-e",
+                "status": "ok",
+                "signal": "FAIL",
+                "parsed": [{
+                    "item": "missing rollback test",
+                    "verdict": "FAIL",
+                    "severity": "high",
+                    "reason": "the new path has no failure-injection coverage",
+                }],
+            },
+        ],
+    }
+
+    panel = compact_review_projection([run])["panels"][0]
+    actors = {actor["slot_id"]: actor for actor in panel["actors"]}
+    rendered = json.dumps(panel, ensure_ascii=False)
+
+    rows = actors["with-findings"]["findings"]
+    assert len(rows) == MAX_PROJECTED_ACTOR_FINDINGS
+    assert actors["with-findings"]["findings_omitted"] == 2
+    assert rows[2] == {
+        "severity": "critical", "item": "finding 2",
+        "evidence": "evidence 2", "recommendation": "fix 2",
+    }
+    # The count stays beside the rows: coverage keeps the full total.
+    assert actors["with-findings"]["coverage"]["findings"] == len(findings)
+    # Redaction covers finding bodies exactly like reasons.
+    assert secret not in rendered
+    assert "***REDACTED***" in rows[0]["evidence"]
+    # A clipped string discloses its own cut instead of clipping silently.
+    assert "OMISSION NOTE" in rows[1]["recommendation"]
+    assert len(rows[1]["recommendation"]) < len(long_recommendation)
+
+    # A reviewer that reported no findings states that as an empty disclosed
+    # list; a reviewer with no parsed response leaves a hole, not a zero.
+    assert actors["clean"]["findings"] == []
+    assert actors["clean"]["findings_omitted"] == 0
+    assert "findings" not in actors["transport-hole"]
+    assert "findings_omitted" not in actors["transport-hole"]
+
+    # An unknown finding shape still ships its evidence as a bounded row, and
+    # structural key-based secret masking applies BEFORE serialization.
+    odd_rows = actors["odd-shape"]["findings"]
+    assert odd_rows and "the only copy of this evidence" in odd_rows[0]["item"]
+    assert "hunter2-odd-shape" not in rendered
+    assert "***REDACTED***" in odd_rows[0]["item"]
+
+    nested_rows = actors["nested-evidence"]["findings"]
+    assert "hunter2-nested-shape" not in rendered
+    assert "***REDACTED***" in nested_rows[0]["evidence"]
+    assert nested_rows[0]["item"] == "nested shape"
+
+    # A list-shaped parsed response (array reviewer contract) projects its
+    # rows too, and the substantive `reason`/`verdict` fields survive.
+    triad_rows = actors["triad-shape"]["findings"]
+    assert triad_rows == [{
+        "severity": "high", "verdict": "FAIL", "item": "missing rollback test",
+        "reason": "the new path has no failure-injection coverage",
+    }]
+    assert actors["triad-shape"]["findings_omitted"] == 0
+
+
 class _MixedPassPassFailLLM:
     def chat(self, **kwargs):
         if str(kwargs.get("model") or "").endswith("-2"):

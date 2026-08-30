@@ -2,6 +2,7 @@ function reviewNodeKey(node) {
     const dataset = node?.dataset || {};
     if (Object.hasOwn(dataset, 'reviewSection')) return 'section';
     if (Object.hasOwn(dataset, 'reviewSectionToggle')) return 'section-toggle';
+    if (Object.hasOwn(dataset, 'reviewHydrateStatus')) return 'hydrate-status';
     if (dataset.reviewGroup) return `group:${dataset.reviewGroup}`;
     if (dataset.reviewGroupToggle) return `group-toggle:${dataset.reviewGroupToggle}`;
     if (dataset.reviewAttempt) return `attempt:${dataset.reviewAttempt}`;

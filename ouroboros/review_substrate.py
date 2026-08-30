@@ -22,7 +22,10 @@ log = logging.getLogger("review_substrate")
 from ouroboros.llm import LLMClient
 from ouroboros.observability import new_call_id, persist_call, redact_projection
 from ouroboros.provider_models import provider_for_model
-from ouroboros.review_execution_projection import review_executions_from_actor_usage
+from ouroboros.review_execution_projection import (
+    MAX_PROJECTED_ACTOR_FINDINGS, projected_finding_row,
+    review_executions_from_actor_usage,
+)
 from ouroboros.task_results import review_binding_hash
 # Everything below the seam. Re-exported here because the substrate is the
 # historical import site for the api_chat prompt renderers; `review_execution`
@@ -60,6 +63,7 @@ from ouroboros.usage_accounting import (
     usage_scope,
 )
 from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact
+from ouroboros._outcome_receipts import disclosed_list_projection
 
 
 class _CustodyUsageContext:
@@ -346,7 +350,7 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
     )
     if dialogue_vote not in DIALOGUE_STATUS_VALUES:
         dialogue_vote = ""
-    return {
+    projection = {
         "slot_id": str(row.get("slot_id") or ""), "model": model, "provider": provider,
         "actor_role": str(row.get("actor_role") or f"{surface} reviewer"),
         "transport_status": transport,
@@ -369,6 +373,16 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
         # Flat, redacted pointer to the private full response artifact.
         "response_ref": _response_ref_projection(row.get("response_ref")),
     }
+    # Structured rows ride only where a parsed response exists: an absent
+    # `findings` key is a hole, never the claim "zero findings reported".
+    if parsed is not None:
+        projection.update(disclosed_list_projection(
+            parsed_findings,
+            key="findings",
+            limit=MAX_PROJECTED_ACTOR_FINDINGS,
+            item=projected_finding_row,
+        ))
+    return projection
 
 
 def _response_ref_projection(ref: Any) -> Dict[str, str]:

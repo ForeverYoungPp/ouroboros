@@ -30,7 +30,7 @@ from ouroboros.llm import LLMClient, LocalContextTooLargeError, add_usage
 from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
 from ouroboros.provider_models import provider_for_model
-from ouroboros.transport_custody import is_pre_dispatch_transport_failure
+from ouroboros.transport_custody import attempt_custody_event_fields, is_pre_dispatch_transport_failure
 from ouroboros._usage_response import provider_cost_value as _provider_cost_value
 from ouroboros.usage_accounting import (
     PhysicalAttemptContext,
@@ -74,10 +74,9 @@ def _main_transport_timeout(
 # Retrieval transparency (v6.78.0, owner Q20/Q22): native provider web search happens
 # INSIDE the solve model's own request, so `usage["web_search_sources"]` /
 # `usage["server_tool_use"]` are the only host-attested evidence that the answer was
-# grounded in fetched pages. `add_usage` accumulates numeric token keys only, so
-# without this fold the fact dies at the per-call boundary and the acceptance reviewer
-# never learns whether an answer came from retrieval or from the model's own knowledge.
-# Counts plus capped URLs only — no titles, no snippets (leak-safe, bounded).
+# grounded in fetched pages. `add_usage` accumulates numeric token keys only, so without
+# this fold the fact dies at the per-call boundary and the acceptance reviewer never
+# learns retrieval-vs-own-knowledge. Counts plus capped URLs only — no titles/snippets.
 _RETRIEVAL_URL_CAP = 20
 _RETRIEVAL_URL_CHARS = 200
 
@@ -113,13 +112,12 @@ def fold_retrieval_usage(accumulated_usage: Dict[str, Any], usage: Dict[str, Any
     record["source_count"] = int(record.get("source_count") or 0) + len(sources)
     urls = record.get("urls")
     urls = list(urls) if isinstance(urls, list) else []
-    # Dedup keys over the FULL RAW url, one per RETAINED entry (so this stays O(cap)
-    # memory like the rest of the accumulator). Round 3: deduping on the RENDERED value
-    # silently lost evidence — two DISTINCT long URLs sharing the retained prefix and
-    # length render byte-identically, so the second was skipped while `urls_omitted`
-    # still reported 0, i.e. a fetched URL vanished from evidence that promises an exact
-    # omission count (BIBLE P1). Raw keys make a repeat a true repeat and every distinct
-    # URL either carried or counted.
+    # Dedup keys over the FULL RAW url, one per RETAINED entry (stays O(cap) memory).
+    # Round 3: deduping on the RENDERED value silently lost evidence — two DISTINCT
+    # long URLs sharing the retained prefix and length render byte-identically, so the
+    # second was skipped while `urls_omitted` reported 0, i.e. a fetched URL vanished
+    # from evidence promising an exact omission count (BIBLE P1). Raw keys make a
+    # repeat a true repeat and every distinct URL either carried or counted.
     seen = record.get("urls_dedup_sha256")
     seen = list(seen) if isinstance(seen, list) else []
     omitted = int(record.get("urls_omitted") or 0)
@@ -920,6 +918,7 @@ def _record_llm_call_error(
     safe_error = sanitize_tool_result_for_log(repr(error))
     classification = classify_llm_exception(error, safe_error)
     provider_message = _exception_provider_message(error, safe_error)
+    custody_fields = attempt_custody_event_fields(error)
     _emit_live_log(ctx.event_queue, {
         "type": "llm_round_error",
         "task_id": ctx.task_id,
@@ -948,6 +947,7 @@ def _record_llm_call_error(
         "status_code": classification.status_code,
         "provider_code": classification.provider_code,
         "provider_message": provider_message,
+        **custody_fields,
         **(ctx.context_fit_event_fields or {}),
         "request_ref": ctx.request_ref.get("manifest_ref") if ctx.request_ref else None,
     })

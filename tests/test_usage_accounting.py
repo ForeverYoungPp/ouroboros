@@ -1538,3 +1538,20 @@ def test_review_wave_admission_override_compares_against_the_given_remaining(mon
         remaining_usd_override=3.0,
     )
     assert roomy["fits"] is True and roomy["estimated_wave_usd"] == 2.5
+
+
+def test_unresolved_reason_cause_suffix_leads_and_survives_truncation(data_root):
+    """Nanny-leaf S3 + fable F4: the transport-cause suffix rides BEFORE the raw
+    provider text, so a verbose body cannot truncate away the one datum the
+    enrichment adds."""
+    import httpx
+
+    reservation = ua.reserve_attempt(_request(data_root, task_id="cause"))
+    ua.mark_dispatched(reservation)
+    cause = httpx.RemoteProtocolError("peer closed connection without response")
+    try:
+        raise RuntimeError("Connection error. " + "x" * 600) from cause
+    except RuntimeError as exc:
+        assert ua._terminalize_failed_attempt(reservation, exc) == "unresolved"
+    reason = _ledger(data_root)[-1]["reason"]
+    assert reason.startswith("RuntimeError [cause: RemoteProtocolError]:")
