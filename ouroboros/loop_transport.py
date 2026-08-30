@@ -361,6 +361,23 @@ def finalize_now_transport_terminal(
     )
 
 
+def end_episode_budget(
+    episode: TransportWaitEpisode, drive_logs: pathlib.Path, task_id: str, model: str,
+) -> None:
+    """Close an active episode when the budget rail fires mid-wait.
+
+    A free redial spends $0 itself, but a concurrent consumer (a child, another
+    root) can exhaust the shared budget between redials; the budget terminal
+    then owns the exit and the episode must not be left without its durable
+    ``ended`` row.
+    """
+    emit_network_wait_event(
+        drive_logs, task_id=task_id, phase="ended",
+        elapsed_sec=time.monotonic() - episode.started_monotonic,
+        redials=episode.redials, model=model, detail="budget_exhausted",
+    )
+
+
 def task_deadline_epoch(tools: Any) -> Optional[float]:
     """Return the task deadline for retry backoff."""
     meta = getattr(tools._ctx, "task_metadata", {})

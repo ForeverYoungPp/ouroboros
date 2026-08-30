@@ -955,3 +955,73 @@ def test_final_redial_reserves_named_margin_before_admission_close(tmp_path, mon
         drive_root=None, drive_logs=tmp_path, task_id="t-margin", model="m",
         emit_progress=lambda _n: None, incoming_messages=None, owner_msg_seen=set(),
     ) is False  # deadline_after_final_redial
+
+
+# ------------------------------------------------ final-review regression pins
+
+def test_released_httpx_proxy_error_classifies_transport_unavailable():
+    """A CONNECT/SOCKS tunnel failure (httpx.ProxyError) happens before any
+    provider request exists — typed pre-dispatch, same wait entry as connects."""
+    from ouroboros.transport_custody import is_pre_dispatch_transport_failure
+
+    assert is_pre_dispatch_transport_failure(httpx.ProxyError("503 from proxy"))
+    result = classify_llm_exception(_typed_transport_exc(exc_cls=httpx.ProxyError))
+    assert result.kind == "transport_unavailable"
+
+
+def test_proxy_error_outage_enters_wait_and_recovers(tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep",
+                        lambda sec, _wake: (sleeps.append(sec), False)[1])
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
+
+    class ProxyFlakyLLM(_FlakyChatLLM):
+        def chat(self, **kwargs):
+            self.calls += 1
+            if self.calls <= self.fail_times:
+                raise _typed_transport_exc(exc_cls=httpx.ProxyError)
+            return (
+                {"role": "assistant", "content": "done"},
+                {"prompt_tokens": 1, "completion_tokens": 1},
+            )
+
+    llm = ProxyFlakyLLM(fail_times=2)
+    notes = []
+    result, _usage, _trace = run_llm_loop(
+        **_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), notes, llm=llm))
+    assert result == "done"
+    assert llm.calls == 3
+    phases = [row["phase"] for row in _read_network_wait_events(tmp_path)]
+    assert phases == ["entered", "waiting", "waiting", "recovered"]
+
+
+def test_budget_exceeded_mid_wait_closes_episode_with_ended_event(tmp_path, monkeypatch):
+    """The budget rail firing between free redials must not leave the episode's
+    durable story open: entered/waiting rows get their ended(budget_exhausted)."""
+    calls = {"n": 0}
+
+    def fake_call(_llm, _messages, _model, _tools, _effort, _max_retries, _drive_logs,
+                  _task_id, _round_idx, _event_queue, accumulated_usage, *_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            accumulated_usage["_last_llm_error_kind"] = "transport_unavailable"
+            return None, 0.0
+        raise ua.BudgetExceeded("root budget exhausted by a concurrent consumer")
+
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", lambda _s, _w: False)
+    monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
+    notes = []
+    # replay_safe budget exits re-raise to the supervisor (base pause-and-retry
+    # semantics) — the episode's durable story must still be closed first.
+    with pytest.raises(ua.BudgetExceeded):
+        run_llm_loop(
+            **_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), notes))
+
+    assert calls["n"] == 2
+    events = _read_network_wait_events(tmp_path)
+    assert [row["phase"] for row in events][0] == "entered"
+    assert events[-1]["phase"] == "ended"
+    assert events[-1].get("detail") == "budget_exhausted"

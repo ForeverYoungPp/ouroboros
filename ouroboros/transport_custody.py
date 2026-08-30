@@ -35,7 +35,12 @@ def is_pre_dispatch_transport_failure(exc: BaseException) -> bool:
     try:
         import httpx
 
-        safe_types = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+        # ProxyError is tunnel establishment (CONNECT/SOCKS) failing before any
+        # provider request exists — pre-dispatch by construction, like connects.
+        safe_types = (
+            httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
+            httpx.ProxyError,
+        )
     except Exception:  # pragma: no cover - httpx ships with the runtime
         return False
     seen: set[int] = set()

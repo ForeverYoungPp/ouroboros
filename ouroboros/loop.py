@@ -54,6 +54,7 @@ from ouroboros.loop_tool_execution import (
 from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event, forced_response_is_incomplete, forced_response_parts
 from ouroboros.loop_transport import (
     TransportWaitEpisode,
+    end_episode_budget as _end_episode_budget,
     fallback_chain_allowed as _fallback_chain_allowed,
     finalize_now_transport_terminal as _finalize_now_transport_terminal,
     last_assistant_text as _last_assistant_text,
@@ -256,11 +257,10 @@ def _check_budget_limits(
                 _force_plan_disclosure(tool_ctx, trace, forced_reason="budget_exhausted")
                 if tool_ctx is not None else ""
             )
-            # This early rejection is a forced sink like every other: nothing
-            # was produced, but a queued/headless root still OWED a panel, and
-            # returning without the record left `not_eligible / run_count=0` —
-            # indistinguishable from "no panel was warranted". Pure ledger
-            # write: no panel, no model round, no fence.
+            # This early rejection is a forced sink like every other: a queued/
+            # headless root still OWED a panel, and returning without the record
+            # left `not_eligible / run_count=0` — indistinguishable from "no
+            # panel was warranted". Pure ledger write: no panel, round, or fence.
             _record_forced_finalization(
                 ctx,
                 trace,
@@ -363,12 +363,11 @@ def _resolve_task_cost_ceiling(
     )
 
 
-# Bounded staleness for the two DECIDING cost surfaces (ceiling check and
-# milestone note). The free stash refreshes on every dispatch under this root,
-# but ONE round can block 900s in wait_tasks while children spend, and the
-# pacing refresh only covers deadline-less tasks — so a round outliving this
-# bound pays for exactly one real projection read. Never per-round (see the
-# usage_accounting telemetry note and the e4a87344 contention class).
+# Bounded staleness for the two DECIDING cost surfaces (ceiling check, milestone
+# note). The free stash refreshes on every dispatch under this root, but ONE round
+# can block 900s in wait_tasks while children spend, and the pacing refresh only
+# covers deadline-less tasks — so a round outliving this bound pays for exactly one
+# real projection read. Never per-round (usage_accounting telemetry note; e4a87344).
 _TREE_ACCOUNTING_MAX_STALE_SEC = 120.0
 
 
@@ -1100,11 +1099,10 @@ def _latch_final_answer_marker(
     existing stale-answer invariant: later grounding invalidates this fallback
     unless the model emits a newer marker.
     """
-    # Opt-in CANDIDATES latch (v6.54.4): when the model enumerates candidate
-    # interpretations/answers with an explicit block ("CANDIDATES:" on its own
-    # line, one "- " item per line), latch them alongside the final answer so the
-    # acceptance reviewer can adjudicate ambiguity. Marker-only, like FINAL
-    # ANSWER — never prose mining; absent block leaves behavior unchanged.
+    # Opt-in CANDIDATES latch (v6.54.4): an explicit block ("CANDIDATES:" on its
+    # own line, one "- " item per line) latches candidate interpretations beside
+    # the final answer so the acceptance reviewer can adjudicate ambiguity.
+    # Marker-only, like FINAL ANSWER — never prose mining; absent block = unchanged.
     text = content or ""
     try:
         lines = text.splitlines()
@@ -1114,9 +1112,8 @@ def _latch_final_answer_marker(
         )
         if marker_idx is not None:
             # Marker-only, like FINAL ANSWER (adversarial review r2 #4): the block
-            # is the "- " items IMMEDIATELY following the marker line; the first
-            # non-item line ends it. No substring-anywhere trigger, no harvesting
-            # of a distant bullet list after intervening prose.
+            # is the "- " items IMMEDIATELY after the marker line; the first non-
+            # item line ends it. No substring trigger, no distant-bullet harvest.
             candidates: list = []
             for line in lines[marker_idx + 1:]:
                 if line.strip().startswith("- "):
@@ -1143,10 +1140,9 @@ def _server_web_allowed_by_task(ctx: Any) -> bool:
 
 
 ACCEPTANCE_REASON_UNSPECIFIED = "unspecified"
-# Closed set of typed acceptance reasons (v6.78.0). Every value is either a fact the
-# host already computed for another purpose or the name of the exit branch; nothing
-# here is derived from model prose. `unspecified` is only the fail-closed fallback of
-# `_set_acceptance_decision` for a future writer that forgets its reason.
+# Closed set of typed acceptance reasons (v6.78.0). Every value is a fact the host
+# already computed for another purpose or the exit branch's name; none derives from
+# model prose. `unspecified` is only the fail-closed fallback for a forgotten reason.
 ACCEPTANCE_DECISION_REASONS = (
     "clean_pass",
     "clean_pass_obligations_closed",
@@ -1220,10 +1216,10 @@ def _collect_acceptance_obligations(llm_trace: Dict[str, Any], result: Any) -> N
     obligations = llm_trace.setdefault("acceptance_obligations", [])
     by_id = {str(o.get("id")): o for o in obligations if isinstance(o, dict)}
     # No contributing actors (all parse-degraded / no quorum) => no authoritative
-    # verdict, so manufacture NO blocking obligations — otherwise a single
-    # parse-degraded slot's critical finding would gate finalization, the same
-    # class the improvement capsule already refuses to let a degraded slot inject
-    # (adversarial review r1). A blocking obligation must ride a CONTRIBUTING slot.
+    # verdict, so manufacture NO blocking obligations — else one parse-degraded
+    # slot's critical finding would gate finalization, the class the improvement
+    # capsule already refuses (adversarial review r1). A blocking obligation must
+    # ride a CONTRIBUTING slot.
     if not contributing:
         return
     _agg_failing = (
@@ -1233,9 +1229,9 @@ def _collect_acceptance_obligations(llm_trace: Dict[str, Any], result: Any) -> N
     _obligation_severities = {"critical", "high"} if _agg_failing else {"critical"}
     # Ids already created or reopened by THIS panel pass. Multiple slots of one
     # panel routinely raise the same finding (typed re_raise copies the exact
-    # catalog id); without this, the second slot's duplicate would falsely
-    # increment reopened_count on the very pass that first presented the
-    # finding and overwrite reviewer_rebuttal_response (fable review r1 #1).
+    # catalog id); without this the second slot's duplicate would falsely bump
+    # reopened_count on the presenting pass and overwrite
+    # reviewer_rebuttal_response (fable review r1 #1).
     touched_this_pass: set[str] = set()
     for finding in (getattr(result, "parsed_findings", None) or []):
         if not isinstance(finding, dict):
@@ -1248,11 +1244,10 @@ def _collect_acceptance_obligations(llm_trace: Dict[str, Any], result: Any) -> N
         if not recommendation:
             continue
         item = str(finding.get("item") or "finding").strip()
-        # v6.74.0 (A3): obligation identity is reviewer-authored. A finding with
-        # disposition_kind="re_raise" MUST name an existing catalog id; the host
-        # only validates it exists. A re_raise with a missing/unknown id fails
-        # closed to `new` with a disclosed note, so a reworded re-raise can no
-        # longer silently mint a fresh hash id.
+        # v6.74.0 (A3): obligation identity is reviewer-authored. A re_raise MUST
+        # name an existing catalog id (the host only validates existence); a
+        # missing/unknown id fails closed to `new` with a disclosed note, so a
+        # reworded re-raise cannot silently mint a fresh hash id.
         kind = str(finding.get("disposition_kind") or "").strip().lower()
         claimed_id = str(finding.get("obligation_id") or "").strip()
         unbound_note = ""
@@ -6366,8 +6361,14 @@ def _handle_budget_exceeded(
     ctx: _LoopExitContext,
     *,
     limit_ctx: Optional[_RoundLimitContext] = None,
+    episode: Optional[TransportWaitEpisode] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Apply the physical-attempt dispatch rail without spending a wrap-up call."""
+    if episode is not None:
+        # Budget rail fired mid transport-wait: close the episode's durable story.
+        _end_episode_budget(
+            episode, ctx.drive_logs, ctx.task_id,
+            limit_ctx.active_model if limit_ctx is not None else "")
     physical_calls: Optional[int] = None
     try:
         from ouroboros.usage_accounting import usage_breakdown
@@ -6989,6 +6990,7 @@ def run_llm_loop(
                 return text, accumulated_usage, llm_trace
 
     except BudgetExceeded as exc:
-        return _handle_budget_exceeded(exc, exit_ctx, limit_ctx=limit_ctx)
+        return _handle_budget_exceeded(
+            exc, exit_ctx, limit_ctx=limit_ctx, episode=transport_wait)
     finally:
         _cleanup_loop_resources(stateful_executor, exit_ctx)
