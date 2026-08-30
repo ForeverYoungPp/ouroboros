@@ -1260,14 +1260,9 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
     # outcome (result field + the typed ``delegated_runs_unreconciled`` event
     # the shared helper emits). Custody reconciliation only — the reaper mints
     # no cancel intents (owner-declined). Fail-soft: the helper never raises.
-    from supervisor.cancel_publication import (
-        _audit_delegated_runs_on_kill,
-        _custody_disclosure_fields,
-    )
+    from supervisor.cancel_publication import _audit_delegated_runs_on_kill, _custody_disclosure_fields
 
-    custody_audit = _audit_delegated_runs_on_kill(
-        _q, task_id, trigger=f"reaper_{terminal_reason}",
-    )
+    custody_audit = _audit_delegated_runs_on_kill(_q, task_id, trigger=f"reaper_{terminal_reason}")
     unreconciled = list(custody_audit.get("unreconciled") or [])
 
     from ouroboros.task_results import (
@@ -1337,9 +1332,8 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                     ),
                     # GR5-2: the reap outcome discloses the delegated runs the
                     # custody reconcile above could not settle. UNCONDITIONAL
-                    # (D1b): a clean audit writes [] so a stale stored list is
-                    # cleared by this same terminal write; the audit envelope
-                    # rides the same single write (R2).
+                    # (D1b): a clean audit writes [] to clear a stale stored
+                    # list; the audit envelope rides the same single write (R2).
                     **_custody_disclosure_fields(custody_audit),
                     **recon_fields,
                     result=(

@@ -20,6 +20,18 @@ from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model,
 from ouroboros.review_cycles import REASON_REVIEW_CYCLES_EXHAUSTED
 from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, REASON_OWNER_REQUESTED_FINALIZATION, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_execution_id, strip_protocol_fence
+# Extracted at this module's size ceiling; historical names stay importable.
+from ouroboros.delivery_protocol import (
+    CHILD_ABSORPTION_HOLD_CONTROL as _CHILD_ABSORPTION_HOLD_CONTROL,
+    DELIVERY_HOLD_CONTROLS as _DELIVERY_HOLD_CONTROLS,
+    SKILL_ACTION_HOLD_CONTROL as _SKILL_ACTION_HOLD_CONTROL,
+    DeliveryCandidate,
+    delivery_control_prompt as _delivery_control_prompt,
+    delivery_keep_allowed as _delivery_keep_allowed,
+    delivery_replace_required as _delivery_replace_required,
+    parse_delivery_control_body as _parse_delivery_control_body,
+    parse_delivery_control_object as _parse_delivery_control_object,  # noqa: F401
+)
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context import build_user_content
@@ -74,22 +86,6 @@ from ouroboros.pricing import estimate_cost_optional
 _call_llm_with_retry = call_llm_with_retry
 
 log = logging.getLogger(__name__)
-
-@dataclass
-class DeliveryCandidate:
-    """Loop-local complete answer retained across service/finalization rounds."""
-
-    full_text: str
-    content_sha256: str
-    revision: int
-    evidence_revision: int
-    evidence_fingerprint: str
-    acceptance_binding: Dict[str, Any]
-    finalization_control: str = "candidate"
-    repair_attempted: bool = False
-    degraded: bool = False
-    degraded_reason: str = ""
-    model_text: str = ""
 
 @dataclass
 class _CompactionRoundContext:
@@ -4050,44 +4046,6 @@ def _merge_finalization_trace(
     return llm_trace
 
 
-def _delivery_control_prompt(candidate: DeliveryCandidate, *, keep_allowed: bool) -> str:
-    keep_line = (
-        "keep is allowed because no answer-invalidating evidence changed."
-        if keep_allowed
-        else "keep is NOT allowed because owner/tool/child/verification evidence changed."
-    )
-    return (
-        "[DELIVERY_FINALIZATION_CONTROL]\n"
-        f"A complete answer candidate (revision {candidate.revision}, sha256 "
-        f"{candidate.content_sha256[:12]}) is retained by the loop; do not replace it with a "
-        f"service notice. {keep_line}\n"
-        "Return exactly one JSON object and no other text:\n"
-        '{"delivery_control":"keep"}\n'
-        "or\n"
-        '{"delivery_control":"replace","full_answer":"<the complete user-facing answer>"}'
-    )
-
-
-def _delivery_replace_required(candidate: DeliveryCandidate) -> bool:
-    """Return whether a typed full replacement is mandatory for this control round."""
-
-    return candidate.finalization_control.startswith(
-        ("effect_revision_required", "skill_revision_required")
-    )
-
-
-def _delivery_keep_allowed(
-    candidate: DeliveryCandidate,
-    evidence_revision: int,
-    evidence_fingerprint: str,
-) -> bool:
-    return (
-        not _delivery_replace_required(candidate)
-        and candidate.evidence_revision == evidence_revision
-        and candidate.evidence_fingerprint == evidence_fingerprint
-    )
-
-
 def _arm_delivery_control(
     tools: ToolRegistry,
     ctx: _RoundLimitContext,
@@ -4114,18 +4072,6 @@ def _arm_delivery_control(
     _publish_delivery_candidate(tools, candidate, llm_trace)
 
 
-# Action-gate holds: a gate closable ONLY by a tool call (skill lifecycle
-# action, child-result disposition) retains the candidate WITHOUT arming the
-# JSON-only control instruction — the instruction would conflict with the
-# required tool call. Gates closable by a reconsidered answer arm normally.
-_SKILL_ACTION_HOLD_CONTROL = "skill_action_or_revision_required"
-_CHILD_ABSORPTION_HOLD_CONTROL = "child_absorption_or_revision_required"
-_DELIVERY_HOLD_CONTROLS = frozenset({
-    _SKILL_ACTION_HOLD_CONTROL,
-    _CHILD_ABSORPTION_HOLD_CONTROL,
-})
-
-
 def _hold_delivery_for_skill_action(
     tools: ToolRegistry,
     llm_trace: Dict[str, Any],
@@ -4134,8 +4080,7 @@ def _hold_delivery_for_skill_action(
 ) -> None:
     """Retain the answer while an unresolved action gate requires a tool call.
 
-    ``control`` names the open gate (skill lifecycle by default, child
-    absorption at the absorption site); it must stay within
+    ``control`` names the open gate; it must stay within
     ``_DELIVERY_HOLD_CONTROLS`` so both hold readers recognize the state.
     """
 
@@ -4146,90 +4091,6 @@ def _hold_delivery_for_skill_action(
     candidate.repair_attempted = False
     tools._ctx._delivery_control_required = False
     _publish_delivery_candidate(tools, candidate, llm_trace)
-
-
-def _parse_delivery_control_object(
-    raw: str,
-) -> tuple[Optional[Dict[str, Any]], bool]:
-    """Parse a delivery-control object while rejecting duplicate JSON keys.
-
-    The boolean preserves protocol intent for the repair path when a duplicate
-    ``delivery_control`` or ``full_answer`` key made the object invalid.
-    """
-
-    duplicate_protocol_key = False
-
-    def _unique_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-        nonlocal duplicate_protocol_key
-        result: Dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                if key in {"delivery_control", "full_answer"}:
-                    duplicate_protocol_key = True
-                raise ValueError(f"duplicate key: {key}")
-            result[key] = value
-        return result
-
-    try:
-        payload = json.loads(raw, object_pairs_hook=_unique_object)
-    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
-        # RecursionError: a degenerate deeply-nested blob (repetition-loop
-        # model output) must classify as not-a-control, not crash the round.
-        return None, duplicate_protocol_key
-    if not isinstance(payload, dict):
-        return None, False
-    return payload, False
-
-
-def _parse_delivery_control_body(
-    raw: str,
-) -> tuple[Optional[Dict[str, Any]], bool, bool]:
-    """Normalize a response body and locate its delivery-control object.
-
-    Returns ``(parsed, duplicate_protocol_key, embedded)``. Normalization
-    strips one whole-body markdown fence (shared with
-    ``observability._is_delivery_control_payload``). ``embedded`` is True only
-    when the protocol object sits as a balanced trailing JSON object carrying
-    the ``delivery_control`` key at the very END of surrounding prose — a
-    protocol attempt mixed with text, never a valid control. A control object
-    quoted MID-prose is NOT matched and stays prose: Ouroboros legitimately
-    quotes the literal in its own PR bodies and docs (disclosed residual).
-    """
-
-    body = strip_protocol_fence(raw)
-    parsed, duplicate_protocol_key = _parse_delivery_control_object(body)
-    if duplicate_protocol_key or isinstance(parsed, dict):
-        return parsed, duplicate_protocol_key, False
-    tail = body.rstrip()
-    if tail.endswith("```"):
-        # Prose ending with a FENCED block: models fence JSON by default, so a
-        # trailing fenced protocol object is the same protocol attempt as a
-        # bare trailing one. Drop the closing fence line and its matching
-        # opener, then run the ordinary trailing scan on what the fence held.
-        # This containment stays inside the latch-gated resolvers; the shared
-        # whole-body fence-strip (observability salvage) is untouched.
-        lines = tail.splitlines()
-        if lines and lines[-1].strip() == "```":
-            for i in range(len(lines) - 2, -1, -1):
-                if lines[i].lstrip().startswith("```"):
-                    tail = "\n".join(lines[:i] + lines[i + 1:-1]).rstrip()
-                    break
-    if not tail.endswith("}"):
-        return None, False, False
-    start = tail.rfind("{")
-    while start > 0:
-        fragment = tail[start:]
-        parsed, duplicate_protocol_key = _parse_delivery_control_object(fragment)
-        if duplicate_protocol_key or (
-            isinstance(parsed, dict) and "delivery_control" in parsed
-        ):
-            return parsed, duplicate_protocol_key, True
-        if isinstance(parsed, dict):
-            # The trailing object is ordinary JSON content (no protocol key
-            # at its top level): the whole body stays prose.
-            return None, False, False
-        start = tail.rfind("{", 0, start)
-    return None, False, False
 
 
 def _resolve_delivery_control(
@@ -4246,10 +4107,9 @@ def _resolve_delivery_control(
         return "fresh", _extract_plain_text_from_content(content)
     raw = _extract_plain_text_from_content(content).strip()
     parsed, duplicate_protocol_key, embedded_protocol = _parse_delivery_control_body(raw)
-    # ANY parsed object carrying the protocol key is control intent,
-    # regardless of verb/value or trailing-object placement — an unknown verb
-    # or a prose-embedded object is a mangled protocol attempt, never prose
-    # (raw JSON leaked to chat); validity judged below.
+    # ANY parsed object carrying the protocol key is control intent, whatever
+    # the verb or placement — a mangled protocol attempt is never prose (raw
+    # JSON leaked to chat); validity judged below.
     is_control_intent = duplicate_protocol_key or (
         isinstance(parsed, dict) and "delivery_control" in parsed
     )
@@ -4261,15 +4121,11 @@ def _resolve_delivery_control(
             required = True
             tools._ctx._delivery_control_required = True
         elif candidate.finalization_control in _DELIVERY_HOLD_CONTROLS:
-            # Preserve the bounded action gates (skill lifecycle, child
-            # absorption): an actual tool action or a reconsidered full prose
-            # answer may proceed, but a typed keep cannot acknowledge the
-            # gate. No delivery JSON prompt before the action — it would
-            # conflict with the instruction to call the gate's tool. A typed
-            # control attempt escalates to the existing replace-required
-            # literal for BOTH holds (an absorption-specific literal would
-            # widen `_delivery_replace_required`; rejected by the plan —
-            # the absorption gate itself still forces best_effort downstream).
+            # Bounded action gates (skill lifecycle, child absorption): a tool
+            # action or a reconsidered full prose answer may proceed; a typed
+            # keep cannot acknowledge the gate and no JSON prompt rides the
+            # action round. A typed control attempt escalates to the ONE
+            # replace-required literal for BOTH holds (plan-rejected widening).
             if not is_control_intent:
                 return "fresh", _extract_plain_text_from_content(content)
             candidate.finalization_control = "skill_revision_required"
@@ -4292,10 +4148,9 @@ def _resolve_delivery_control(
     valid = False
     replacement = ""
     if embedded_protocol:
-        # A protocol object embedded at the end of prose is a protocol
-        # ATTEMPT, never a valid control: honoring it would either leak the
-        # raw object or silently drop the prose half of a contradictory
-        # answer. The default error text already states the exact-object rule.
+        # A trailing prose-embedded object is a protocol ATTEMPT, never a
+        # valid control: honoring it would leak the raw object or drop the
+        # prose half (the default error states the exact-object rule).
         pass
     elif selected == "keep" and set(parsed) == {"delivery_control"}:
         valid = _delivery_keep_allowed(
@@ -4557,8 +4412,7 @@ def _maybe_enforce_child_absorption_gate(
         llm_trace["reasoning_notes"].append("Child absorption reminder injected before final response.")
         return "continue"
     # Fresh snapshot for the forced prompt: child statuses may have flipped
-    # (e.g. running -> completed) since the reminder round, and the model must
-    # state CURRENT statuses instead of guessing from the stale listing.
+    # since the reminder round; the model must state CURRENT statuses.
     undecided = _undispositioned_children(limit_ctx)
     text, usage, forced_trace = _forced_final_answer(
         limit_ctx,
@@ -4603,9 +4457,8 @@ def _run_forced_children_acceptance(
     try:
         from ouroboros.tools.join_ledger import _child_result_sha256
 
-        # Fresh debt adjacent to the panel's own fresh subtree read: the
-        # forced model call above takes real time, and a child may settle
-        # across it — one packet, one moment.
+        # Fresh debt adjacent to the panel's own fresh subtree read: a child
+        # may settle across the forced call — one packet, one moment.
         undecided = _undispositioned_children(limit_ctx)
         debt = [
             {
@@ -4739,9 +4592,8 @@ def _no_tool_final_answer(
         tools, limit_ctx, content, messages, emit_progress, llm_trace,
     )
     if absorption_result == "continue":
-        # Child absorption is an action gate closable only by disposition
-        # tool calls: hold the candidate instead of arming the JSON-only
-        # instruction, which would contradict the reminder in the same round.
+        # Child absorption is closable only by disposition tool calls: hold —
+        # arming the JSON-only instruction would contradict the reminder.
         _hold_delivery_for_skill_action(
             tools, llm_trace, control=_CHILD_ABSORPTION_HOLD_CONTROL,
         )
@@ -5358,18 +5210,16 @@ def _resolve_forced_delivery_control(
     tools_ctx._delivery_control_required = False
     parsed, duplicate_protocol_key, embedded_protocol = _parse_delivery_control_body(extracted)
     # Protocol intent: any parsed object with the protocol key (unknown verb =
-    # broken control, never prose; a trailing prose-embedded object counts),
-    # or JSON-looking text — after the shared fence-strip — that fails to
-    # parse (a mangled protocol attempt under the armed latch — the candidate
-    # is the answer).
+    # broken control; a trailing prose-embedded object counts), or JSON-looking
+    # text after the shared fence-strip that fails to parse under the latch.
     protocol_intent = duplicate_protocol_key or (
         ("delivery_control" in parsed)
         if isinstance(parsed, dict)
         else strip_protocol_fence(extracted).startswith("{")
     )
     if not protocol_intent:
-        # An ordinary prose answer under an armed latch: the fresh text stands
-        # (a control object quoted MID-prose is the disclosed residual).
+        # Ordinary prose under an armed latch stands (a control object quoted
+        # MID-prose is the disclosed residual).
         return extracted, ""
     if not embedded_protocol:
         selected = str(parsed.get("delivery_control") or "") if isinstance(parsed, dict) else ""
@@ -5380,8 +5230,7 @@ def _resolve_forced_delivery_control(
         elif selected == "keep" and set(parsed) == {"delivery_control"} and candidate is not None:
             return candidate.full_text, ""
     # Malformed/duplicate/prose-embedded/invalid control: preserve the retained
-    # candidate (or, with none retained, let the caller's fallback text stand)
-    # and say so.
+    # candidate (with none retained, the caller's fallback stands) and say so.
     return (
         candidate.full_text if candidate is not None else "",
         REASON_DELIVERY_CONTROL_DEGRADED,
@@ -6776,9 +6625,8 @@ def _prepare_post_tool_budget_context(
             if candidate.finalization_control in _DELIVERY_HOLD_CONTROLS
             else ""
         )
-        # The absorption action gate stays open while undispositioned children
-        # remain: arming the JSON-only instruction there would recreate the
-        # conflicting-instruction round the absorption hold exists to prevent.
+        # The absorption gate stays open while undispositioned children remain:
+        # arming JSON there would recreate the conflicting-instruction round.
         absorption_gate_open = (
             hold_control == _CHILD_ABSORPTION_HOLD_CONTROL
             and bool(_undispositioned_children(limit_ctx))
@@ -6808,8 +6656,8 @@ def _prepare_post_tool_budget_context(
                 llm_trace,
                 control="skill_revision_required",
             )
-        # An absorption hold with unchanged evidence keeps holding: the gate
-        # is closed only by dispositions, and a disposition changes evidence.
+        # An absorption hold with unchanged evidence keeps holding: only
+        # dispositions close the gate, and a disposition changes evidence.
     # Cross-model fallback can adopt a different route during this round.
     limit_ctx.active_model = active_model
     limit_ctx.active_use_local = active_use_local
