@@ -144,8 +144,7 @@ class RunCustody:
     authority_fingerprint: str = ""
     ledger_recorded: bool = False
     settled: bool = False
-    # Written once (a re-polling nanny must not read as repeated findings).
-    containment_disclosed: bool = False
+    containment_disclosed: bool = False  # written once; a re-poll must not re-find
     unread_disclosed: bool = False  # settled-never-read omission named durably
     # Staged-output half of the terminal story (D7). ``output_artifact``:
     # task-drive-relative staging path (empty when inline). ``output_complete``:
