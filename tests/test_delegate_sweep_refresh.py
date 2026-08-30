@@ -128,6 +128,51 @@ def test_boot_backfill_fixes_row_settled_in_a_previous_generation(tmp_path):
     }
 
 
+def test_stale_child_replica_cannot_reshadow_healed_custody_fields(tmp_path):
+    """Split-drive shape: the boot backfill heals only the CANONICAL row, but
+    effective reads overlay a retained child replica. The custody disclosure
+    pair is canonical-authoritative once present, so a stale replica must not
+    re-shadow the healed row (it may still fill a canonical row that lacks the
+    fields — the pre-copy-back window)."""
+    from ouroboros.task_status import effective_task_result
+
+    child_drive = tmp_path / "child"
+    (child_drive / "task_results").mkdir(parents=True)
+    write_task_result(
+        child_drive, "t-split", STATUS_FAILED,
+        reason_code="delegated_custody_unreconciled",
+        delegated_runs_unreconciled=["run-9"],
+    )
+    write_task_result(
+        tmp_path, "t-split", STATUS_FAILED,
+        reason_code="delegated_custody_unreconciled",
+        delegated_runs_unreconciled=[],
+        delegate_terminal_reconciliation={
+            "task_id": "t-split", "trigger": "boot_backfill", "outcomes": [],
+            "unreconciled": [], "audit_status": "ok", "open_run_ids": [],
+        },
+        child_drive_root=str(child_drive),
+    )
+
+    merged = effective_task_result(tmp_path, load_task_result(tmp_path, "t-split"))
+
+    assert merged["delegated_runs_unreconciled"] == []
+    assert merged["delegate_terminal_reconciliation"]["trigger"] == "boot_backfill"
+
+    # The pre-copy-back window still fills from the replica when the canonical
+    # row carries no custody fields at all.
+    write_task_result(
+        tmp_path, "t-fill", STATUS_FAILED, reason_code="x",
+        child_drive_root=str(child_drive),
+    )
+    write_task_result(
+        child_drive, "t-fill", STATUS_FAILED, reason_code="x",
+        delegated_runs_unreconciled=["run-fill"],
+    )
+    filled = effective_task_result(tmp_path, load_task_result(tmp_path, "t-fill"))
+    assert filled["delegated_runs_unreconciled"] == ["run-fill"]
+
+
 def test_boot_backfill_preserves_undisposed_patch_debt(tmp_path):
     """The incident shape: settled mutating run whose captured patch awaits its
     owner's disposition. The backfill rewrites the honest CURRENT audit —

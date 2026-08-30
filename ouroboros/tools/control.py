@@ -390,8 +390,10 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
     envelope = envelope if isinstance(envelope, dict) else {}
     if unreconciled or envelope:
         custody: Dict[str, Any] = {"unreconciled": unreconciled[:10]}
+        omitted_any = False
         if len(unreconciled) > 10:
             custody["unreconciled_omitted"] = len(unreconciled) - 10
+            omitted_any = True
         if envelope:
             open_ids = envelope.get("open_run_ids")
             open_ids = [str(item) for item in open_ids] if isinstance(open_ids, list) else []
@@ -399,6 +401,14 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
             custody["open_run_ids"] = open_ids[:10]
             if len(open_ids) > 10:
                 custody["open_run_ids_omitted"] = len(open_ids) - 10
+                omitted_any = True
+        if omitted_any:
+            # A bound must name a source the actor can resolve (BIBLE P1):
+            # the complete lists live on the stored row itself.
+            custody["full_source"] = (
+                "read_file(root='runtime_data', "
+                f"path='task_results/{str(data.get('task_id') or '')}.json')"
+            )
         summary["delegated_custody"] = custody
     if isinstance(data.get("task_contract"), dict):
         summary["task_contract"] = data.get("task_contract")

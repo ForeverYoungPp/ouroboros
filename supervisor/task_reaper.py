@@ -608,6 +608,7 @@ def _enqueue_retry(
         load_task_result,
         write_task_result,
     )
+    from supervisor.cancel_publication import _custody_disclosure_fields
 
     retried = dict(task)
     retried["original_task_id"] = task_id
@@ -657,6 +658,10 @@ def _enqueue_retry(
                 STATUS_FAILED,
                 reason_code=blocked_reason,
                 outcome_axes=outcome,
+                # The audited custody disclosure rides EVERY reaped terminal
+                # write of the original task (R2), this failure branch included.
+                **(_custody_disclosure_fields(custody_audit, unreconciled_runs)
+                   if unreconciled_runs is not None else {}),
                 **recon_fields,
                 result=message,
             )
@@ -730,6 +735,10 @@ def _enqueue_retry(
             STATUS_FAILED,
             reason_code=blocked_reason,
             outcome_axes=outcome,
+            # The audited custody disclosure rides EVERY reaped terminal
+            # write of the original task (R2), this fallback included.
+            **(_custody_disclosure_fields(custody_audit, unreconciled_runs)
+               if unreconciled_runs is not None else {}),
             **recon_fields,
             result=message,
         )

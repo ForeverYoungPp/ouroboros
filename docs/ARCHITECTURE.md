@@ -2011,10 +2011,13 @@ writes `[]` in the caller's own terminal write), while the fast already-settled
 kill lane, which performs no terminal write of its own, runs the same guarded
 refresh (`trigger=kill_path_clear`; it touches only a row that exists with a
 non-empty stored list, so a fresh-task kill can never mint a row or pay a
-second write). The finalize-on-miss cancel write threads the audit into its
-delivery only, never onto the row — and the GR6-1b settled-before-capture
-short-circuit likewise leaves the stored row byte-identical by mandate — a
-stale settled row raced into either lane heals on the next boot's backfill.
+second write). Finalize-on-miss has two branches: the newly-cancelled branch
+stores the audited list AND the reconciliation envelope in its one terminal
+write, while the already-settled branch — like the reaper's self-finalized
+branch — runs the same guarded `kill_path_clear` refresh. Only the GR6-1b
+settled-before-capture short-circuit and the natural-completion re-check leave
+the stored row byte-identical by mandate (GR7-2); a stale settled row raced
+into those two lanes heals on the next boot's backfill.
 Every refresh is audit-only
 (never cancels), never rewrites `reason_code` (owner Q5=A), and never
 recomputes the frozen `delegated_runs_started/settled/succeeded/failed`

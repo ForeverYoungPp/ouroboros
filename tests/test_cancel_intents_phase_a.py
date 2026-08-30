@@ -699,6 +699,82 @@ def test_retry_admission_before_cancel_canonicalizes_and_stops_leaf(qenv, monkey
     assert ci.active_intents(qenv.drive) == {}
 
 
+def _reaper_kill_audit(runs: list) -> dict:
+    return {
+        "task_id": "audited", "trigger": "reaper_idle_timeout", "outcomes": [],
+        "unreconciled": list(runs), "audit_status": "ok",
+        "open_run_ids": list(runs), "pending_invocation_ids": [],
+        "undisposed_patch_run_ids": [], "deferred_project_retirements": [],
+    }
+
+
+def test_retry_handoff_failure_write_carries_custody_disclosure(qenv, monkeypatch):
+    """R2 coverage of the handoff-failure fallback: the original task's
+    terminal write on a failed input handoff still carries the audited
+    custody list AND the reconciliation envelope (previously omitted, so an
+    open run went undisclosed and a stale list stayed uncleared)."""
+    from supervisor import task_reaper as tr
+
+    monkeypatch.setattr(
+        "ouroboros.artifacts.handoff_task_attachments_for_retry",
+        lambda *_a, **_k: ({}, "attachment boom"),
+    )
+    monkeypatch.setattr(
+        "ouroboros.owner_mailbox.copy_owner_mailbox_for_retry",
+        lambda *_a, **_k: False,
+    )
+    old_id, new_id = "handoff-fail-old", "handoff-fail-new"
+    task = _root_retry_task(old_id)
+    write_task_result(
+        qenv.drive, old_id, STATUS_RUNNING, result="working",
+        delegated_runs_unreconciled=["stale-run"],
+    )
+
+    requeued, _attempt, reason, _suppression = tr._enqueue_retry(
+        qenv.q, task, task_id=old_id, retry_task_id=new_id, attempt=1,
+        terminal_reason="idle_timeout", recon_fields={},
+        unreconciled_runs=["run-live"],
+        custody_audit=_reaper_kill_audit(["run-live"]),
+    )
+
+    assert requeued is False
+    assert reason.endswith("handoff_failed")
+    row = load_task_result(qenv.drive, old_id)
+    assert row["delegated_runs_unreconciled"] == ["run-live"]
+    assert row["delegate_terminal_reconciliation"]["trigger"] == "reaper_idle_timeout"
+
+
+def test_retry_admission_block_write_carries_custody_disclosure(qenv, monkeypatch):
+    """R2 coverage of the admission-fence fallback: a clean audited list on
+    the blocked-retry terminal write clears a stale stored disclosure."""
+    from supervisor import task_reaper as tr
+
+    _patch_retry_input_handoff(monkeypatch)
+    monkeypatch.setattr(
+        tr, "_run_retry_admission_transaction",
+        lambda *_a, **_k: ({}, "root_budget"),
+    )
+    old_id, new_id = "admission-block-old", "admission-block-new"
+    task = _root_retry_task(old_id)
+    write_task_result(
+        qenv.drive, old_id, STATUS_RUNNING, result="working",
+        delegated_runs_unreconciled=["stale-run"],
+    )
+
+    requeued, _attempt, reason, _suppression = tr._enqueue_retry(
+        qenv.q, task, task_id=old_id, retry_task_id=new_id, attempt=1,
+        terminal_reason="idle_timeout", recon_fields={},
+        unreconciled_runs=[],
+        custody_audit=_reaper_kill_audit([]),
+    )
+
+    assert requeued is False
+    assert reason.endswith("admission_blocked")
+    row = load_task_result(qenv.drive, old_id)
+    assert row["delegated_runs_unreconciled"] == []
+    assert row["delegate_terminal_reconciliation"]["trigger"] == "reaper_idle_timeout"
+
+
 @pytest.mark.parametrize(
     "stop_policy",
     [ci.STOP_POLICY_IMMEDIATE, ci.STOP_POLICY_FINALIZE],

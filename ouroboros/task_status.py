@@ -679,6 +679,14 @@ def effective_task_result(
                 continue
             if key == "artifacts":
                 continue
+            if key in {"delegated_runs_unreconciled", "delegate_terminal_reconciliation"} and key in result:
+                # Custody disclosure is CANONICAL-authoritative once the
+                # canonical row carries it: write-side heals (kill-clear,
+                # boot backfill) land only there, and a retained stale child
+                # replica must not re-shadow a healed row. A canonical row
+                # that lacks the field still takes the replica's copy
+                # (the pre-copy-back window).
+                continue
             merged[key] = value
         merged.setdefault("child_drive_root", child_text)
         merged.setdefault("headless_child_drive_root", child_text)
