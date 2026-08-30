@@ -97,7 +97,8 @@ def _file_stamp(path: pathlib.Path) -> tuple:
 def skill_review_ui_projection(
     drive_root: pathlib.Path, skill_name: str,
 ) -> Dict[str, Any]:
-    """Sanitized current run and the last ten rows in its review group."""
+    """Sanitized current run, the last ten rows in its review group, and the
+    exact count of older group rows that ten-row window leaves out."""
     cache_key = (str(drive_root), str(skill_name))
     stamp = (
         _file_stamp(review_job_state_path(drive_root, skill_name)),
@@ -111,7 +112,8 @@ def skill_review_ui_projection(
     group_id = str(current.get("group_id") or "")
     if not group_id and all_history:
         group_id = str(all_history[-1].get("group_id") or "")
-    history = [row for row in all_history if not group_id or row.get("group_id") == group_id][-10:]
+    group_rows = [row for row in all_history if not group_id or row.get("group_id") == group_id]
+    history = group_rows[-10:]
     projection: Dict[str, Any]
     if not current and not history:
         projection = {}
@@ -119,6 +121,9 @@ def skill_review_ui_projection(
         projection = {
             "current": _review_ui_row(current) if current else {},
             "history": [_review_ui_row(row) for row in history],
+            # Group-scoped disclosed bound (BIBLE P1): the exact number of
+            # older rows the ten-row window left out, 0 included.
+            "history_omitted": max(0, len(group_rows) - len(history)),
         }
     _UI_PROJECTION_CACHE[cache_key] = (stamp, projection)
     return projection

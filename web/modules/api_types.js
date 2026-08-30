@@ -317,6 +317,12 @@
  *   v6.74.0 additive keys: panels[].dialogue ({status, votes} — the reviewer-authored
  *   dialogue-status reduction), panels[].single_reviewer_no_diversity (boolean label),
  *   and actors[].dialogue_status ("continue_actionable"|"unreachable_here"|"stable_disagreement"|"").
+ *   Additive bounded-findings keys: actors[].findings (disclosed rows
+ *   {id?, severity?, item?, evidence?, recommendation?} — redacted, each string
+ *   bounded with an explicit omission marker, at most 8 rows per actor) and
+ *   actors[].findings_omitted (exact count, 0 included). Both are emitted only
+ *   when that reviewer produced a parsed response; their absence is a
+ *   transport/parse hole, never "zero findings".
  * @property {boolean=} worker_saturation_warning
  * @property {string=} source
  * @property {string=} sender_label
