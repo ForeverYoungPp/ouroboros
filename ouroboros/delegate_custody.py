@@ -474,14 +474,19 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
             # A recorded disposition completes the apply-intent story too.
             custody.patch_apply_pending = False
     elif kind == SETTLED:
+        # Settlement is a RUN-level fact (terminal + accounted). It no longer
+        # clears the registration obligation: the project may still be owned
+        # (a sibling holds it live) and PROJECT_RETIRED is the only row that
+        # discharges it. Historical logs are unaffected - the old coupling
+        # emitted PROJECT_RETIRED before every SETTLED it wrote.
         custody.ledger_recorded = True
-        custody.project_owned = False
         custody.settled = True
     elif kind == CLOSED_ABSENT:
         # Closed, not settled: no ledger row was written and none ever will be. What
         # matters to every reader of this replay is that custody is over, so the run
         # leaves ``open_runs`` and stops being reconciled and re-faulted forever.
-        custody.project_owned = False
+        # The registration obligation survives independently (PROJECT_RETIRED
+        # discharges it); clearing it here was the wholesale-leak shape.
         custody.settled = True
 
 
@@ -826,10 +831,15 @@ def retire_project(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
     if not (custody.project_owned and custody.project_id):
         return
     try:
+        # The sharer set is keyed on the REGISTRATION obligation, not on run
+        # settlement: a settled run still owns its registration until
+        # PROJECT_RETIRED lands, and keying on ``not settled`` made settled
+        # sharers invisible - nobody carried the retry lane (the leak the old
+        # settled/retirement coupling was masking).
         sharers = sorted(
             run.run_id
-            for run in open_runs(drive_root)
-            if run.project_id == custody.project_id and run.run_id and not run.settled
+            for run in replay(drive_root).values()
+            if run.project_id == custody.project_id and run.run_id and run.project_owned
         )
     except Exception:
         sharers = []
@@ -863,20 +873,20 @@ def close_absent_run(drive_root: Any, gateway: Any, custody: RunCustody, reason:
     honest reading is that the run is unreachable and its state unknowable from here,
     not that nothing is mutating. Custody closing anyway is a deliberate trade — an
     unreachable run cannot be cancelled, verified or settled, and holding it open
-    re-faults it forever — and the registration obligation below is what still has to
-    be discharged. There is no terminal detail either, so this is not a settlement:
-    ``settle_run`` would have to invent the tokens and the spend. The registration we created is the one obligation that survives
-    the run, so custody closes ONLY once it is discharged: the absent-run FACT and the
-    completion of the registration obligation are two different things (P34R.4). Closing
-    over a failed retirement replayed as ``project_owned=False`` — the CLOSED_ABSENT row
-    clears ownership wholesale — so the retirement was never retried and the owned daemon
-    registration leaked permanently. A deferred close stays in ``open_runs``, disclosed
-    by ``PROJECT_RETIRE_FAILED``, and the next sweep retries; the daemon answering 404
-    for the PROJECT counts as discharged (``retire_project``'s absence-is-discharge).
+    re-faults it forever. There is no terminal detail either, so this is not a
+    settlement: ``settle_run`` would have to invent the tokens and the spend.
+    The absent-run FACT and the registration obligation are two different things
+    (P34R.4) recorded INDEPENDENTLY: CLOSED_ABSENT closes run custody now, while
+    the registration survives on ``project_owned`` (its replay no longer clears
+    ownership wholesale) until PROJECT_RETIRED lands - retried by later sharers
+    and the registration sweep; the daemon answering 404 for the PROJECT counts
+    as discharged (``retire_project``'s absence-is-discharge).
     """
     retire_project(drive_root, gateway, custody)
-    if custody.project_owned:
-        return
+    # The absent-run FACT is recorded whether or not the registration obligation
+    # is discharged yet: holding the run "open" as a proxy for cleanup debt was
+    # the same category error as the settled/retirement coupling. The obligation
+    # itself survives on ``project_owned`` for the registration sweep.
     custody.settled = emit(drive_root, CLOSED_ABSENT, {
         "run_id": custody.run_id, "task_id": custody.task_id,
         "route": custody.route_id, "project_id": custody.project_id, "reason": reason,
@@ -899,7 +909,8 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
     call returned.
     """
     if custody.settled:
-        return {"settled": True, "ledger_recorded": True, "project_retired": True, "retried": False}
+        return {"settled": True, "ledger_recorded": True,
+                "project_retired": not custody.project_owned, "retried": False}
     summary = summary_of(detail)
     # Claudexor reports CASH in `spendUsd` and its EXACTNESS in `spendEstimated`. A
     # delegated run is only free when the amount is really zero AND really settled: an
@@ -948,10 +959,14 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
             emit(drive_root, LEDGER_RECORDED, {"run_id": custody.run_id, "task_id": custody.task_id,
                                                "route": custody.route_id})
     retire_project(drive_root, gateway, custody)
-    if custody.ledger_recorded and not custody.project_owned:
+    if custody.ledger_recorded:
         # The claim follows the row, not the call: if the settlement row did not land,
         # a restart replays this run as open and retries — which is the correct answer,
         # and the only one that keeps ``settled`` meaning "the durable fact exists".
+        # Settlement is DECOUPLED from project retirement: a sibling holding the
+        # shared project must not convert a SUCCEEDED run into an unreconciled
+        # failure. The registration debt stays disclosed on ``project_owned``
+        # and is retried by the registration sweep and by later sharers.
         custody.settled = emit(drive_root, SETTLED, {
             "run_id": custody.run_id,
             "task_id": custody.task_id,
@@ -1238,6 +1253,38 @@ def open_runs(drive_root: Any) -> List[RunCustody]:
     return [custody for custody in replay(drive_root).values() if not custody.settled]
 
 
+def owned_project_registrations(drive_root: Any) -> List[RunCustody]:
+    """Runs whose project registration is still owned - settled or not.
+
+    Settlement no longer discharges the registration, so the retry lane must
+    see registrations that outlive their runs; ``open_runs`` cannot (it is
+    keyed on settlement)."""
+    return [
+        custody for custody in replay(drive_root).values()
+        if custody.project_owned and custody.project_id
+    ]
+
+
+def retire_settled_registrations(drive_root: Any, gateway: Any) -> None:
+    """One registration-sweep pass: retire projects every sharer has settled.
+
+    A project with a LIVE (unsettled) sharer is left alone - the daemon would
+    refuse the removal anyway (live runs), and that sharer's own settlement
+    path carries the next attempt. Idempotent and fail-soft like the run pass."""
+    registrations = owned_project_registrations(drive_root)
+    by_project: Dict[str, List[RunCustody]] = {}
+    for row in registrations:
+        by_project.setdefault(row.project_id, []).append(row)
+    for rows in by_project.values():
+        if any(not row.settled for row in rows):
+            continue
+        try:
+            retire_project(drive_root, gateway, min(rows, key=lambda row: row.run_id))
+        except Exception:
+            log.warning("Registration sweep failed for project %s",
+                        rows[0].project_id, exc_info=True)
+
+
 def pending_invocations(drive_root: Any,
                         rows: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """Invocations with a durable request row, no bound run, no definite refusal.
@@ -1323,9 +1370,12 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
     ``pending`` is the durable sweep's extra duty: START_REQUESTED-only invocations
     (P34R.2). The in-process twin ``release_task_runs`` never passes it — its memo is
     run-keyed and cannot name an unbound invocation — so that class is covered by the
-    startup/periodic sweep, within its cadence.
+    startup/periodic sweep, within its cadence. The registration pass at the end is
+    the third duty: settlement no longer discharges project ownership, so this is
+    where settled-but-owned registrations get their retry lane.
     """
-    if not runs and not pending:
+    registrations = owned_project_registrations(drive_root)
+    if not runs and not pending and not registrations:
         return []
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
@@ -1352,6 +1402,8 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
             outcomes.append(_reconcile_one(drive_root, gateway, custody))
         for record in pending or []:
             outcomes.append(_recover_pending_invocation(drive_root, gateway, record))
+        if registrations:
+            retire_settled_registrations(drive_root, gateway)
     finally:
         try:
             gateway.close()
@@ -1502,8 +1554,13 @@ def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[s
         # The D7 half of the disposition: a reconciled run whose staged artifact was
         # never acknowledged is the "launched and never collected" shape, and this row
         # is where that fact becomes durable instead of inferred.
-        result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "settled",
-                  "settled": settled["settled"], **output_disposition(custody)}
+        # The action names the ATTEMPT; the facts ride separately (the old
+        # shape wrote action="settled" even when the returned flag was false).
+        result = {"run_id": custody.run_id, "task_id": custody.task_id,
+                  "action": "settle_attempted",
+                  "settled": settled["settled"],
+                  "project_retired": settled.get("project_retired"),
+                  **output_disposition(custody)}
         # The C1 half: a TERMINAL DETAIL proves the run is over, so the sweep — its
         # last terminal observer — captures the diff eagerly here.
         result.update(capture_stranded_patch(drive_root, custody))
