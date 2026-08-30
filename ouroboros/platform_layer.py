@@ -674,17 +674,44 @@ def current_process_group_id() -> int:
         return 0
 
 
+_BOOT_ID = ""  # full hex of the /proc boot id; empty until a successful read, then latched
+
+
 def process_start_time(pid: int) -> str:
     """Best-effort stable start-time token for (pid, start_time) fingerprints.
 
-    A bare pid is not an identity — the kernel reuses it. ``(pid, start_time)`` is, which is what
-    lets a caller refuse to signal a pid it merely used to own. POSIX uses ``ps -o lstart=``,
-    falling back to the same /proc field the containment scan dates candidates by, so the
-    fingerprint stays real on an image with no usable ``ps``. Windows returns "" (callers degrade
-    to pid liveness), as does a pid that is already gone."""
-    if pid <= 0:
+    A bare pid is not an identity (kernels reuse pids) and boot-relative ticks RECUR across
+    reboots, so a bare tick + a recycled pid + the same command line is a real collision;
+    refusing that kill is the job. Linux mints IN THIS ORDER: ``"<ticks>.<boot_hex>"`` when the
+    boot id is readable (no subprocess); else the ``ps`` wall-clock token, which does not recur
+    across boots in practice; and only once ``ps`` has ALSO failed, ``"<ticks>."`` as a
+    disclosed last resort — two of THOSE from different boots do string-match, hence last, not
+    first. No ``/proc``: legacy throughout; Windows and a dead pid return "". Disclosed: the
+    FORM changes if the boot id starts or stops being readable mid-generation, so a row
+    recorded across it can mismatch its own live process — safe: it prunes, never kills, and
+    the cheap reap path skips live rows."""
+    global _BOOT_ID
+    if pid <= 0 or os.name == "nt":
         return ""
-    if os.name == "nt":
+    if not (ticks := _proc_start_ticks(pid)):
+        return process_start_time_legacy(pid)  # no /proc here (macOS, BSD): ps is the only source
+    if not _BOOT_ID:  # a failed read is transient: retry next call, never downgrade the generation
+        try:
+            _BOOT_ID = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip().replace("-", "")
+        except (OSError, ValueError):  # matches _proc_start_ticks; an escapee would abort a custody sweep
+            pass
+    if _BOOT_ID:
+        return f"{ticks}.{_BOOT_ID}"
+    # legacy degrades to str(ticks) when ps ALSO failed; only then is the separator form the best we have.
+    return legacy if (legacy := process_start_time_legacy(pid)) and legacy != str(ticks) else f"{ticks}."
+
+
+def process_start_time_legacy(pid: int) -> str:
+    """The historical ``ps -o lstart=`` token (bare ``/proc`` ticks when ``ps`` fails). Two jobs:
+    the DOWNGRADE-SAFE spelling the custody ledger keeps writing into ``fingerprint.start_time``
+    (an N−1 reader understands it), and the compatibility comparison a boot-qualified current
+    token falls back to (see ``process_custody._legacy_start_matches``)."""
+    if pid <= 0 or os.name == "nt":
         return ""
     try:
         out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],

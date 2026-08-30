@@ -347,6 +347,42 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       the reaper (server startup + 10-min supervisor tick) kills entries whose
       generation/task owner is gone, matching by STRICT fingerprint only —
       never by command-line class, so dev and packaged instances can coexist.
+      The fingerprint's start time is a DOWNGRADE-SAFE pair: the unversioned
+      `start_time` field keeps the legacy `ps -o lstart=` spelling an N−1
+      reader still compares correctly (a rollback that met an unknown token
+      here would mismatch every row and prune it WITHOUT a kill, orphaning the
+      process forever), while the versioned `start_time_boot` sibling — which
+      the current reader prefers — carries the Linux `/proc` boot-qualified
+      token `"<ticks>.<boot_hex>"` (boot-relative ticks recur across reboots,
+      and a bare tick plus a recycled pid is a real collision). The mint order
+      for the boot sibling is boot-qualified first; then, when the boot id is
+      unreadable, the `ps` wall-clock token (identical to the legacy field, so
+      the sibling is omitted); and only once `ps` has ALSO failed, `"<ticks>."`
+      as a disclosed last resort (two of THOSE from different boots do
+      string-match, which is why they are last, not first). One `ps` is paid
+      per SPAWN for the legacy field (a host without `/proc`, or with an
+      unreadable boot id, pays it twice — the preferred-token mint re-derives
+      the same spelling); the sweep's hot
+      path stays subprocess-free, and a SIBLING-FREE mismatched row falls back
+      to one `ps` comparison of the legacy spelling before pruning, so a
+      mid-generation boot-id readability change never prunes a live owned row.
+      A row that DOES carry a boot sibling is judged by boot evidence alone: a
+      mismatched sibling is positive proof of another boot and prunes without
+      consulting the legacy spelling (whose `ps`-less degradation to bare
+      ticks would otherwise re-qualify a cross-boot recycled pid). A recorded
+      BARE tick (the pre-change ps-failed fallback) never authorizes a kill
+      when any boot evidence contradicts it: on a `ps`-capable host it
+      compares against the `ps` spelling, fails, and is pruned — the safe
+      direction — while the one host class that ever mints bare ticks (no
+      usable `ps`) still resolves PRE-UPGRADE sibling-free rows through the
+      legacy helper's own tick fallback (the disclosed one-migration-window
+      residual on that class, alongside the `"<ticks>."` cross-boot twin).
+      Current-generation session processes take a cheap liveness check instead
+      (the cheap path only ever keeps: an alive-but-recycled same-session pid is
+      retained one generation and pruned by the next generation's full
+      fingerprint check, never killed); full fingerprints remain for
+      stale/foreign records, and a DEAD pid still falls through to the
+      service-group evidence rather than being pruned on the spot.
       Genuine `daemon` entries are kept; skill companions (daemon scope,
       `purpose companion:<skill>:<name>`) are the exception (v6.36.2) — reaped on
       owner-uninstall or a foreign generation, **log-only by default**
