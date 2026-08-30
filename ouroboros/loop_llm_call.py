@@ -566,6 +566,10 @@ def _is_rate_limit_text(text: str) -> bool:
     return any(marker in low for marker in _RATE_LIMIT_TEXT_MARKERS)
 
 
+is_rate_limit_text = _is_rate_limit_text  # public SSOT aliases for the safety lane
+NON_RETRYABLE_PROVIDER_MARKERS = _NON_RETRYABLE_PROVIDER_MARKERS
+
+
 def _is_context_overflow_error(exc: Exception, safe_error: str) -> bool:
     """Classify untyped local/remote context-window overflow.
 
@@ -1004,19 +1008,16 @@ def _stop_after_llm_error(
     deadline_ts: Optional[float],
 ) -> bool:
     """Retry decision for the exception path: ``True`` stops the attempt loop, and
-    every stop except the transport shape stamps the OB-01 marker — permanent
-    classes stopped earlier in ``_record_llm_call_error``, so every kind here is
-    retry-same-request and a stop means "the same-model wall is spent"."""
+    every stop except the transport shape stamps the OB-01 marker — permanent classes
+    stopped earlier, so a stop here means "the same-model wall is spent"."""
     accumulated_usage = ctx.accumulated_usage
     error_kind = str(accumulated_usage.get("_last_llm_error_kind") or "")
     if error_kind == "transport_unavailable":
-        # One physical attempt per invocation: a pre-dispatch transport failure
-        # is free ($0) and the round-level wait episode owns redial pacing. NOT
-        # a spent wall — the transport-wait terminal owns this shape.
+        # One free ($0) pre-dispatch attempt; the round-level wait episode owns
+        # redial pacing. NOT a spent wall — the transport-wait terminal owns this.
         return True
     is_transient = error_kind in _TRANSIENT_RETRY_KINDS
-    # Non-transient retryable classes keep max_retries but never exceed the loop
-    # ceiling, so an attempt_cap'd fallback wastes no backoff sleep (primary: no-op).
+    # Non-transient retryables: max_retries capped by the loop ceiling (primary: no-op).
     attempt_budget = transient_budget if is_transient else min(max_retries, transient_budget)
     if ctx.attempt < attempt_budget - 1:
         backoff = _retry_backoff_sec(accumulated_usage, error_kind, ctx.attempt, is_transient)
@@ -1040,10 +1041,9 @@ def _empty_response_wall_spent(is_provider_glitch: bool, permanent_body_error: b
 
 def provider_no_call_source(accumulated_usage: Dict[str, Any], deadline_exhausted: bool) -> Tuple[str, bool]:
     """The provider-unavailable rail's no-call decision → (typed source, wall_spent).
-    Unknown in-flight outcome forbids a RESEND (outranks the wall); a SPENT
-    same-model wall makes one more forced call a second full retry window; the
-    deadline_local rail keeps its grace call (provider not proven dead), which is
-    why ``deadline_exhausted`` suppresses the wall answer."""
+    Unknown in-flight outcome forbids a RESEND (outranks the wall); a SPENT same-model
+    wall makes one more forced call a second full retry window; the deadline_local
+    rail keeps its grace call, so ``deadline_exhausted`` suppresses the wall."""
     if str(accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown":
         return "provider_outcome_unknown_no_resend", False
     if not deadline_exhausted and bool(accumulated_usage.get(RETRY_WALL_EXHAUSTED_KEY)):

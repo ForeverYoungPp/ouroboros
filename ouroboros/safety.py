@@ -9,16 +9,19 @@ path revert guards, and commit review remains separate.
 import ast
 import json
 import logging
+import math
 import os
 import pathlib
 import re
 import shlex
+import time
 from typing import Tuple, Dict, Any, List, Optional
 
 from ouroboros.config import get_light_model, get_safety_call_timeout_sec, get_safety_max_tokens, get_safety_mode
 from ouroboros.llm import LLMClient
+from ouroboros.loop_llm_call import classify_llm_exception, is_rate_limit_text
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_provider_from_model
-from ouroboros.utils import utc_now_iso
+from ouroboros.utils import sanitize_tool_result_for_log, utc_now_iso
 from supervisor.state import update_budget_from_usage
 
 log = logging.getLogger(__name__)
@@ -411,9 +414,24 @@ def _redact_secrets_in_text(text: str) -> str:
     return redacted
 
 
+# Character budget for the CONVERSATION section of the safety prompt. It was
+# unbounded: every retained round of a long task rode into every light-model safety
+# call, so the prompt grew with the task until the provider rate-limited the safety
+# lane. The tool proposal is the SUBJECT of the check and stays outside this budget.
+_SAFETY_CONTEXT_CHAR_BUDGET = 4000
+_SAFETY_OMISSION_MARKER = "[… {n} older messages omitted]"
+
+
 def _format_messages_for_safety(messages: List[Dict[str, Any]]) -> str:
-    """Format compact safety context, redacting before truncation."""
-    parts = []
+    """Format compact safety context, redacting before truncation.
+
+    Bounded by ``_SAFETY_CONTEXT_CHAR_BUDGET``, selected NEWEST-FIRST (the rounds that
+    produced the proposed call are the ones that explain it) and rendered back in
+    chronological order. The marker carries the exact count of dropped messages and its
+    own space is RESERVED INSIDE the budget, so a bounded transcript is never a silent
+    one (BIBLE P1). The per-message 500-char clip keeps its own inline note.
+    """
+    rendered: List[str] = []
     for m in messages:
         role = m.get("role", "?")
         content = m.get("content", "")
@@ -427,8 +445,22 @@ def _format_messages_for_safety(messages: List[Dict[str, Any]]) -> str:
         if len(text) > 500:
             omitted = len(text) - 500
             text = text[:500] + f" [...{omitted} chars omitted]"
-        parts.append(f"[{role}] {text}")
-    return "\n".join(parts)
+        rendered.append(f"[{role}] {text}")
+    kept: List[str] = []
+    used = 0
+    for idx in range(len(rendered) - 1, -1, -1):
+        # Worst case if this is the last line taken: exactly ``idx`` older ones dropped.
+        reserve = (len(_SAFETY_OMISSION_MARKER.format(n=idx)) + 1) if idx else 0
+        cost = len(rendered[idx]) + (1 if kept else 0)
+        if kept and used + cost + reserve > _SAFETY_CONTEXT_CHAR_BUDGET:
+            break
+        used += cost
+        kept.append(rendered[idx])
+    kept.reverse()
+    dropped = len(rendered) - len(kept)
+    if dropped:
+        kept.insert(0, _SAFETY_OMISSION_MARKER.format(n=dropped))
+    return "\n".join(kept)
 
 
 def _build_check_prompt(
@@ -643,6 +675,268 @@ _UNCHECKED_WARNING_SUFFIX = (
     "via shell, gh repo/auth) still applies to every tool."
 )
 
+# Only a genuine THROUGHPUT signal may wave a safety check through, so the predicate is
+# narrower than "retryable". `classify_llm_exception` folds every transient class —
+# 408, 5xx and timeouts included — into `provider_transient`, and those are outages, not
+# throttling: they keep today's blocking SAFETY_VIOLATION path. A `provider_transient`
+# therefore qualifies only when the provider actually said 429, by status code or by the
+# shared rate-limit text vocabulary (`is_rate_limit_text` — imported rather than copied,
+# so the two lanes cannot fork). Permanent classes are already excluded upstream: a
+# structured `insufficient_quota` wins over a 429 status inside that helper and still
+# blocks. On the HTTP-200 body lane (`llm._normalize_remote_response`) the qualifying
+# kind is exactly `rate_limit`, which that module assigns only to a transient body error
+# whose code IS 429; its other body transients stay blocking too.
+# Backoff: one 2.0s sleep, inside the range the loop's own transient pattern
+# (`2.0 ** attempt`) spans; no new setting, because this lane has exactly one retry.
+_SAFETY_BODY_RATE_LIMIT_KIND = "rate_limit"
+
+
+def _body_is_quota_refusal(body: Dict[str, Any]) -> bool:
+    """A body-shaped 429 whose STRUCTURED fields name a QUOTA/BILLING refusal is
+    permanent, not throttling — mirror the exception lane's quota-over-429 precedence
+    (the markers are loop_llm_call's non-retryable quota vocabulary, imported as the
+    SSOT). Only `code`/`type` are scanned and numeric markers are skipped: the shared
+    markers are substrings, and free-form `message` text carries request ids and
+    hostnames where `402`/`billing` occur incidentally ("request id: req_402ab19",
+    "billing-tier throughput cap") — a false quota match here would keep reporting a
+    plain throttle as a verdict, the exact bug this lane exists to remove."""
+    from ouroboros.loop_llm_call import NON_RETRYABLE_PROVIDER_MARKERS
+
+    text = f"{body.get('code') or ''} {body.get('type') or ''}".lower()
+    return any(
+        m in text for m in NON_RETRYABLE_PROVIDER_MARKERS["quota_exhausted"] if not m.isdigit()
+    )
+
+
+_SAFETY_RATE_LIMIT_BACKOFF_SEC = 2.0
+
+# Process-local storm latch: after a NON-fallback-lane check (remote, or a local
+# PRIMARY whose vLLM/proxy 429s) exhausted both attempts on a provider rate limit, every
+# safety check in this process short-circuits to the same blocked SAFETY_UNAVAILABLE
+# answer for this window WITHOUT a provider call (the mark/is-cooling shape of
+# ouroboros/fallback_cooldown.py, inlined because this lane needs one timestamp, not a
+# per-model map). The safety lane is the highest-frequency LIGHT consumer — every guarded
+# tool call on every in-process subagent thread — so re-probing a storming route on each
+# call would amplify the very storm it reports.
+_SAFETY_STORM_COOLDOWN_SEC = 30.0
+_SAFETY_STORM_UNTIL = 0.0
+
+
+class _SafetyRateLimited(Exception):
+    """Both safety attempts hit a provider rate limit; the caller BLOCKS this one call
+    with the typed SAFETY_UNAVAILABLE outcome (infrastructure fact, not a verdict).
+    ``latched`` marks the storm-window short-circuit shape: it carries no NEW storm
+    evidence, so the outcome must not extend the window (else the advised retry would
+    keep re-arming it forever). ``attempts`` is the PHYSICAL call count behind this
+    outcome (0 latched, 1 deadline-expired-before-retry, 2 full), so the durable audit
+    row can name what actually happened instead of always claiming a retry."""
+
+    def __init__(self, message: str, *, latched: bool = False, attempts: int = 2) -> None:
+        super().__init__(message)
+        self.latched = latched
+        self.attempts = 0 if latched else attempts
+
+
+def _is_throughput_rate_limit(kind: str, status_code: Optional[int], safe_error: str) -> bool:
+    """True only for provider THROTTLING, never for a plain outage (408/5xx/timeout).
+
+    A KNOWN status code is the authority and the text is never consulted beside it: the
+    shared markers are substrings, so `429`, `rpm` and `tpm` occur inside the request
+    ids, trace ids and hostnames real outages carry ("503 ... (request id: req_1f429ab0)",
+    "504 Gateway Timeout ... rpm-edge-proxy-3"). The text branch therefore runs ONLY when
+    no status code was recoverable at all, which is the case it exists for — a transport
+    that raised a bare throttling message.
+    """
+    if kind == _SAFETY_BODY_RATE_LIMIT_KIND:
+        return True
+    if kind != "provider_transient":
+        return False
+    return status_code == 429 or (status_code is None and is_rate_limit_text(safe_error))
+
+
+def _safety_rate_limit_reason(
+    exc: Optional[Exception], usage: Optional[Dict[str, Any]], safe_error: str,
+) -> Optional[str]:
+    """Sanitized bounded description when THIS attempt was rate-limited, else None."""
+    if exc is not None:
+        found = classify_llm_exception(exc, safe_error)
+        if not _is_throughput_rate_limit(found.kind, found.status_code, safe_error):
+            return None
+        return f"{found.kind}: {safe_error}"[:300]
+    body = usage.get("provider_error") if isinstance(usage, dict) else None
+    if isinstance(body, dict) and _body_is_quota_refusal(body):
+        return None  # structured insufficient-quota is PERMANENT: keep today's blocking path
+    if not isinstance(body, dict) or str(body.get("kind") or "") != _SAFETY_BODY_RATE_LIMIT_KIND:
+        return None
+    return sanitize_tool_result_for_log(
+        f"{body.get('kind')} (code={body.get('code')}): {body.get('message')}"
+    )[:300]
+
+
+def _safety_rate_limit_backoff(ctx: Optional[Any]) -> None:
+    """One bounded backoff, capped by the task deadline. Called BETWEEN `model_call_slot`
+    contexts: that primitive caps CONCURRENT calls, so sleeping inside a held slot would
+    park the route for every other thread."""
+    delay = _SAFETY_RATE_LIMIT_BACKOFF_SEC
+    deadline = _safety_deadline_epoch(ctx)
+    if deadline is not None:
+        delay = min(delay, max(0.0, float(deadline) - time.time()))
+    if delay > 0:
+        time.sleep(delay)
+
+
+def _rate_limited_outcome(
+    ctx: Optional[Any], tool_name: str, error: str, *, local_fallback: bool, arm_latch: bool,
+    attempts: int = 2,
+) -> Tuple[bool, str]:
+    """Terminal outcome of a rate-limited safety check, split by lane. The local-FALLBACK
+    lane keeps its documented fail-open contract (SYSTEM.md case (c): a broken
+    chosen-as-fallback local runtime warns instead of blocking every unknown tool) — a
+    429 there must not be stricter than the RuntimeError beside it. Every other lane
+    blocks with the typed non-verdict outcome below."""
+    if local_fallback:
+        log.warning(
+            "Safety local-fallback rate-limited for %s; proceeding with warning: %s",
+            tool_name, error,
+        )
+        _emit_durable_safety_event(ctx, {
+            "type": "safety_check_rate_limited", "tool": tool_name,
+            "action": "fail_open_local_fallback", "error": error,
+        })
+        return True, (
+            f"⚠️ SAFETY_WARNING: The local fallback Safety Supervisor was rate-limited "
+            f"and could not check this call ({error}). {_UNCHECKED_WARNING_SUFFIX}"
+        )
+    return _safety_unavailable_blocked(ctx, tool_name, error, arm_latch=arm_latch, attempts=attempts)
+
+
+def _safety_unavailable_blocked(
+    ctx: Optional[Any], tool_name: str, error: str, *, arm_latch: bool = True, attempts: int = 2,
+) -> Tuple[bool, str]:
+    """Rate-limited safety lane: BLOCK this one call with a typed non-verdict outcome.
+
+    A 429 is an infrastructure fact about the supervisor, not a verdict about the tool
+    call — reporting it as SAFETY_VIOLATION told the agent its own command was unsafe,
+    sending it hunting for a "safer" rewording of a benign command. The honest outcome
+    keeps `full` mode's owner contract (an unchecked guarded call never executes; the
+    existing fail-open cases stay exactly the SYSTEM.md-documented no-backend three) while
+    removing the false accusation: the ⚠️ *_UNAVAILABLE prefix classifies as a plain
+    tool ERROR downstream, never as `safety_violation`, and the message itself carries
+    the retry contract (P5: the instruction lives with the fact). Disclosed twice: the
+    result the agent reads, and the durable event an owner can find later (BIBLE P3)."""
+    if arm_latch and attempts >= 2:
+        # The latch's documented trigger is a CONFIRMED storm: both attempts 429ed.
+        # A deadline-expired single 429 is one data point, not a storm - later
+        # checks in this process keep their own probe.
+        global _SAFETY_STORM_UNTIL
+        _SAFETY_STORM_UNTIL = time.time() + _SAFETY_STORM_COOLDOWN_SEC
+    shape = (
+        "storm latch, no attempt" if not arm_latch
+        else "deadline expired before the retry" if attempts < 2
+        else "after one retry"
+    )
+    action = (
+        "blocked_unchecked_storm_latched" if not arm_latch
+        else "blocked_unchecked_deadline_expired" if attempts < 2
+        else "blocked_unchecked_after_retry"
+    )
+    log.error("Safety check rate-limited for %s (%s); blocking unchecked: %s", tool_name, shape, error)
+    _emit_durable_safety_event(ctx, {
+        "type": "safety_check_rate_limited", "tool": tool_name, "action": action, "error": error,
+    })
+    # The provider error goes on its own line: downstream status classification scans
+    # only the FIRST line for outcome markers, and a raw error body could carry one.
+    return False, (
+        "⚠️ SAFETY_UNAVAILABLE: The Safety Supervisor is rate-limited and could not check "
+        "this call. This is infrastructure back-pressure, NOT a verdict about your "
+        "command — the call was not executed. Retry the same call shortly; do not "
+        f"reword it as if it had been judged unsafe.\n(provider error: {error})"
+    )
+
+
+def _safety_model_call(
+    *, client: Any, ctx: Optional[Any], tool_name: str, light_model: str,
+    use_local: bool, call_type: str, user_prompt: str, on_usage: Any,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """ONE safety model call, with ONE bounded retry when the provider rate-limits it.
+
+    Both wire shapes reach here: a RAISED provider error, and an HTTP-200 whose body
+    carried it (`usage["provider_error"]`) — the production shape, which never raises,
+    so an exception-only check would miss it. A non-rate-limit exception is re-raised
+    unchanged so every existing lane stays byte-identical; two rate-limited attempts
+    raise `_SafetyRateLimited`. A rate-limited attempt's usage is still accounted: the
+    call was physical. The v6.40 per-model self-DoS slot is taken PER ATTEMPT (this is
+    the highest-frequency LIGHT consumer — every tool call on every in-process subagent
+    thread) with the backoff outside it.
+    """
+    from ouroboros import model_concurrency
+    from ouroboros.llm_observability import chat_observed
+    from ouroboros.tools.review_helpers import cached_prompt_blocks
+
+    if time.time() < _SAFETY_STORM_UNTIL:
+        raise _SafetyRateLimited(
+            "safety lane cooling down after a recent rate-limit storm; no attempt made",
+            latched=True,
+        )
+    reason = ""
+    for attempt in range(2):
+        if attempt:
+            deadline = _safety_deadline_epoch(ctx)
+            if deadline is not None and time.time() >= deadline:
+                break  # the task deadline is spent: the retry would be a paid call past it
+            _safety_rate_limit_backoff(ctx)
+            if deadline is not None and time.time() >= deadline:
+                break  # the backoff sleep itself consumed the deadline
+        exc: Optional[Exception] = None
+        msg: Dict[str, Any] = {}
+        usage: Optional[Dict[str, Any]] = None
+        try:
+            with model_concurrency.model_call_slot(
+                light_model, use_local, _safety_deadline_epoch(ctx)
+            ):
+                msg, usage = chat_observed(
+                    client,
+                    drive_root=pathlib.Path(getattr(ctx, "drive_root", "../data")) if ctx is not None else pathlib.Path("../data"),
+                    task_id=str(getattr(ctx, "task_id", "") or "safety"),
+                    call_type=call_type,
+                    # This payload is TOOL-FREE and the send-time cache finalizer may only
+                    # mark a tool schema, so the lane is cacheable only because the CALLER
+                    # declares its own stable prefix, as every review surface does: the
+                    # byte-stable SAFETY.md prompt is the whole prefix (the repair call
+                    # reuses it and reads the cache the first attempt wrote) and the tool
+                    # proposal stays in the unmarked user turn. Transport shape only — text,
+                    # model slot, parsing and fail-closed semantics unchanged; a route that
+                    # cannot carry markers has them stripped back to the identical single
+                    # block. Disclosed residual: on OpenAI-compatible lanes the system
+                    # content goes over the wire as a ONE-ELEMENT block list, so a strict
+                    # self-hosted LIGHT endpoint rejecting array content surfaces as
+                    # SAFETY_VIOLATION (this lane fails CLOSED there), never as a bypass.
+                    messages=[
+                        {"role": "system", "content": cached_prompt_blocks(
+                            _get_safety_prompt(), ttl=_SAFETY_CACHE_TTL)},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    model=light_model, use_local=use_local,
+                    max_tokens=get_safety_max_tokens(), reasoning_effort="low",
+                    timeout=get_safety_call_timeout_sec(),
+                    response_format={"type": "json_object"},
+                )
+        except Exception as e:
+            exc = e
+        safe_error = sanitize_tool_result_for_log(f"{type(exc).__name__}: {exc}") if exc else ""
+        rate_limited = _safety_rate_limit_reason(exc, usage, safe_error)
+        on_usage(usage)
+        if rate_limited is None:
+            if exc is not None:
+                raise exc
+            return msg, usage
+        reason = rate_limited
+        attempts = attempt + 1
+        log.warning(
+            "Safety check rate-limited for %s (attempt %d/2): %s", tool_name, attempts, reason,
+        )
+    raise _SafetyRateLimited(reason, attempts=attempts)
+
 
 def _run_llm_check(
     tool_name: str,
@@ -661,25 +955,6 @@ def _run_llm_check(
 
     prompt = _build_check_prompt(tool_name, arguments, messages)
     client = LLMClient()
-
-    # The safety supervisor sends a TOOL-FREE payload, and the send-time cache finalizer
-    # (llm._normalize_payload_cache_ttl) is only allowed to add a marker to a tool schema
-    # — so this lane can only be cached if the CALLER declares its own stable prefix, the
-    # way every review surface does. The SAFETY.md system prompt is byte-stable across
-    # every check, so it is the whole cacheable prefix; the per-call tool proposal stays
-    # in the unmarked user turn. Transport shape only: the assembled prompt TEXT, the
-    # model slot, the verdict parsing and the fail-closed semantics are unchanged. On a
-    # route that cannot carry markers the marker is STRIPPED and the single text block is
-    # preserved (`llm._copy_messages_with_cache_policy`); the local and GigaChat lanes
-    # additionally flatten it back to the identical string. So the prompt text is
-    # byte-identical everywhere, while on the OpenAI-compatible lanes (direct OpenAI,
-    # openai-compatible, Cloud.ru, non-cache OpenRouter families) the system `content`
-    # goes over the wire as a ONE-ELEMENT block list instead of a bare string — accepted
-    # by OpenAI-compatible servers, and the disclosed residual of this change is a strict
-    # self-hosted LIGHT endpoint that rejects array system content (this lane fails
-    # CLOSED, so such a rejection would surface as SAFETY_VIOLATION, not as a bypass).
-    from ouroboros.tools.review_helpers import cached_prompt_blocks
-
     light_model = get_light_model()
     log.info(f"Running safety check on {tool_name} using {light_model} (local={_use_local_light})")
 
@@ -694,7 +969,19 @@ def _run_llm_check(
         else:
             provider = str(usage_payload.get("provider") or infer_provider_from_model(light_model))
             model_name = resolved_model
-        cost = float(usage_payload["cost"]) if usage_payload.get("cost") is not None else None
+        raw_cost = usage_payload.get("cost")
+        cost = None
+        if raw_cost is not None and not isinstance(raw_cost, bool):
+            try:
+                cost = float(raw_cost)
+            except (TypeError, ValueError):
+                cost = None
+            if cost is not None and not (math.isfinite(cost) and cost >= 0):
+                cost = None
+        if raw_cost is not None and cost is None:
+            log.warning("safety usage carried an invalid reported cost (%s); treating as unknown",
+                        type(raw_cost).__name__)
+            usage_payload["cost"] = None
         if _use_local_light:
             cost = 0.0
         elif cost is None:
@@ -723,37 +1010,19 @@ def _run_llm_check(
             update_budget_from_usage(usage_payload)
 
     try:
-        from ouroboros import model_concurrency
-        from ouroboros.llm_observability import chat_observed
-
-        # The safety supervisor runs the LIGHT model per tool call on every in-process
-        # subagent thread — the highest-frequency LIGHT consumer. Share the v6.40 per-model
-        # self-DoS slot (like project_naming) so a burst of concurrent safety checks can't
-        # storm the same light route. Fail-soft + deadline-bounded; never blocks past it.
-        with model_concurrency.model_call_slot(
-            light_model, _use_local_light, _safety_deadline_epoch(ctx)
-        ):
-            msg, usage = chat_observed(
-                client,
-                drive_root=pathlib.Path(getattr(ctx, "drive_root", "../data")) if ctx is not None else pathlib.Path("../data"),
-                task_id=str(getattr(ctx, "task_id", "") or "safety"),
-                call_type="safety_supervisor",
-                messages=[
-                    {"role": "system", "content": cached_prompt_blocks(
-                        _get_safety_prompt(), ttl=_SAFETY_CACHE_TTL,
-                    )},
-                    {"role": "user", "content": prompt},
-                ],
-                model=light_model,
-                use_local=_use_local_light,
-                max_tokens=get_safety_max_tokens(),
-                reasoning_effort="low",
-                timeout=get_safety_call_timeout_sec(),
-                response_format={"type": "json_object"},
-            )
+        msg, usage = _safety_model_call(
+            client=client, ctx=ctx, tool_name=tool_name, light_model=light_model,
+            use_local=_use_local_light, call_type="safety_supervisor",
+            user_prompt=prompt, on_usage=_emit_safety_usage,
+        )
+    except _SafetyRateLimited as e:
+        return _rate_limited_outcome(
+            ctx, tool_name, str(e),
+            local_fallback=_use_local_light and _is_local_fallback,
+            arm_latch=not getattr(e, "latched", False),
+            attempts=getattr(e, "attempts", 2),
+        )
     except Exception as e:
-        from ouroboros.utils import sanitize_tool_result_for_log
-
         safe_error = sanitize_tool_result_for_log(f"{type(e).__name__}: {e}")
         # Fallback local outage warns instead of blocking all unknown tools.
         if _use_local_light and _is_local_fallback:
@@ -767,8 +1036,6 @@ def _run_llm_check(
             )
         log.error("Safety check LLM call failed for %s: %s", tool_name, safe_error)
         return False, f"⚠️ SAFETY_VIOLATION: Safety check failed with error: {safe_error}"
-
-    _emit_safety_usage(usage)
 
     result = _parse_safety_response(msg.get("content") or "")
     if result is None:
@@ -791,35 +1058,21 @@ def _run_llm_check(
                 "Original proposed tool call follows again.\n\n"
                 f"{prompt}"
             )
-            from ouroboros import model_concurrency
-
-            with model_concurrency.model_call_slot(
-                light_model, _use_local_light, _safety_deadline_epoch(ctx)
-            ):
-                repair_msg, repair_usage = chat_observed(
-                    client,
-                    drive_root=pathlib.Path(getattr(ctx, "drive_root", "../data")) if ctx is not None else pathlib.Path("../data"),
-                    task_id=str(getattr(ctx, "task_id", "") or "safety"),
-                    call_type="safety_supervisor_repair",
-                    messages=[
-                        # Same declared prefix as the first attempt, so the repair call
-                        # reads the cache the first one wrote instead of paying again.
-                        {"role": "system", "content": cached_prompt_blocks(
-                            _get_safety_prompt(), ttl=_SAFETY_CACHE_TTL,
-                        )},
-                        {"role": "user", "content": repair_prompt},
-                    ],
-                    model=light_model,
-                    use_local=_use_local_light,
-                    max_tokens=get_safety_max_tokens(),
-                    reasoning_effort="low",
-                    timeout=get_safety_call_timeout_sec(),
-                    response_format={"type": "json_object"},
-                )
-            _emit_safety_usage(repair_usage)
+            repair_msg, repair_usage = _safety_model_call(
+                client=client, ctx=ctx, tool_name=tool_name, light_model=light_model,
+                use_local=_use_local_light, call_type="safety_supervisor_repair",
+                user_prompt=repair_prompt, on_usage=_emit_safety_usage,
+            )
             result = _parse_safety_response(repair_msg.get("content") or "")
             if result is None:
                 failure_class = _classify_safety_parse_failure(repair_msg, repair_usage)
+        except _SafetyRateLimited as e:
+            return _rate_limited_outcome(
+                ctx, tool_name, str(e),
+                local_fallback=_use_local_light and _is_local_fallback,
+                arm_latch=not getattr(e, "latched", False),
+                attempts=getattr(e, "attempts", 2),
+            )
         except Exception as exc:
             log.warning("Safety repair retry failed for %s: %s", tool_name, exc, exc_info=True)
         if result is None:
@@ -876,8 +1129,15 @@ def _emit_durable_safety_event(ctx: Optional[Any], event: Dict[str, Any]) -> Non
         if callable(drive_logs):
             from ouroboros.utils import append_jsonl
 
-            append_jsonl(drive_logs() / "events.jsonl", payload)
-            return
+            if append_jsonl(drive_logs() / "events.jsonl", payload):
+                return
+            # append_jsonl answers whether the row landed (its documented contract for
+            # important events); a False here means the durable half of the disclosure
+            # is missing, so fall through to the queue rather than returning silently.
+            log.error(
+                "durable safety event %s not persisted; falling back to event queue",
+                event.get("type") or "?",
+            )
         eq = getattr(ctx, "event_queue", None) if ctx is not None else None
         if eq is not None:
             eq.put_nowait(payload)
