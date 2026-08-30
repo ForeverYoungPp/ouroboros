@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import pathlib
 import re
 import subprocess
 import time
+from hashlib import sha256
 from typing import Any, Dict, Tuple
 
 from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_SALVAGE
@@ -123,40 +125,86 @@ def valid_task_result_authority_source(source: Any, task_id: Any) -> bool:
 def _automatic_predecessor_authority_projection(
     row: Dict[str, Any], source: Dict[str, Any], *, drive_root: Any,
 ) -> Dict[str, Any]:
-    """Bound only unreviewed host salvage injected automatically at startup."""
+    """Bounded continuation ENVELOPE - identity, digest, authored conclusion.
+
+    The recursive deep-copy this replaces embedded every predecessor's complete
+    body (its contract nesting the hop before, and so on) into each successor's
+    contract: chains of ordinary tasks compiled 300K+ work orders, blew the
+    parent's per-round authority projection past 800K prompt tokens, and killed
+    delegation on every non-interactive route. The complete canonical authority
+    LIVES in task_results/<id>.json (the SSOT this projection reads); the
+    contract carries what orients a successor plus the named pull source - a
+    stronger mind pulls exactly the ranges it needs (whole-or-pointer, the same
+    shape the absorption path already uses). Digest facts are observed at
+    binding: authority that advances later (late receipts) yields an honest
+    mismatch disclosure on pull, never a silent substitution.
+    """
 
     authority = task_result_authority_projection(row, drive_root=drive_root)
-    if str(row.get("terminal_origin") or "") != TERMINAL_ORIGIN_HOST_SALVAGE:
-        return authority
-    full_result = authority.get("result")
-    if not isinstance(full_result, str):
-        return authority
-
-    full_chars = len(full_result)
-    if full_chars <= _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS:
-        carried_chars = full_chars
-    else:
-        omission_note = (
-            "\n⚠️ OMISSION NOTE: truncated at "
-            f"{_AUTOMATIC_HOST_SALVAGE_RESULT_CHARS} chars; original length {full_chars}"
+    serialized = json.dumps(authority, ensure_ascii=False, sort_keys=True, default=str)
+    contract = authority.get("task_contract") if isinstance(authority.get("task_contract"), dict) else {}
+    nested = contract.get("predecessor_authority") if isinstance(contract.get("predecessor_authority"), dict) else {}
+    nested_source = nested.get("source") if isinstance(nested.get("source"), dict) else {}
+    # The predecessor's own OPERATIVE contract core rides whole-ish: these are
+    # owner/parent-authored requirements a successor must honor without knowing
+    # to pull them, and they are O(contract text) per hop - the recursion lived
+    # in the NESTED predecessor_authority and the full field copy, both of
+    # which stay out of this envelope.
+    contract_core: Dict[str, Any] = {}
+    for field in ("objective", "context", "constraints", "expected_output",
+                  "success_criteria", "delegation_budget", "answer_protocol"):
+        value = contract.get(field)
+        if value in (None, "", [], {}):
+            continue
+        contract_core[field] = (
+            truncate_within_limit(value, limit=8_000)
+            if isinstance(value, str) else copy.deepcopy(value)
         )
-        carried_chars = max(
-            0, _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS - len(omission_note),
-        )
-    authority["result"] = {
-        "kind": "unreviewed_host_salvage",
-        "preview": truncate_within_limit(
-            full_result, limit=_AUTOMATIC_HOST_SALVAGE_RESULT_CHARS,
+    envelope: Dict[str, Any] = {
+        "kind": "bounded_continuation_envelope",
+        "task_id": str(row.get("task_id") or row.get("id") or ""),
+        "status": str(row.get("status") or ""),
+        "contract_core": contract_core,
+        "authority_sha256": sha256(serialized.encode("utf-8")).hexdigest(),
+        "authority_chars": len(serialized),
+        "digest_semantics": "observed_at_binding",
+        # Chain cursor: the predecessor's own predecessor, walkable without
+        # carrying any prior body (works for both envelope and legacy shapes).
+        "previous_task_id": str(
+            nested.get("task_id") or nested_source.get("task_id") or ""
         ),
-        "carried_chars": carried_chars,
-        "omitted_chars": full_chars - carried_chars,
-        "full_chars": full_chars,
-        "source_ref": {
-            **copy.deepcopy(source),
-            "field": "authority.result",
-        },
     }
-    return authority
+    # Compact terminal facts ride whole: they are the orientation a successor
+    # needs before deciding what (if anything) to pull.
+    for fact in ("reason_code", "outcome_axes"):
+        if row.get(fact) is not None:
+            envelope[fact] = copy.deepcopy(row.get(fact))
+    narrative = row.get("continuation_narrative")
+    if isinstance(narrative, str) and narrative.strip():
+        envelope["continuation_narrative"] = truncate_within_limit(
+            narrative, limit=_AUTOMATIC_HOST_SALVAGE_RESULT_CHARS,
+        )
+    full_result = authority.get("result")
+    if isinstance(full_result, str) and full_result:
+        full_chars = len(full_result)
+        salvage = str(row.get("terminal_origin") or "") == TERMINAL_ORIGIN_HOST_SALVAGE
+        if full_chars <= _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS and not salvage:
+            # Whole-or-pointer: a result that fits one ordinary tool-result
+            # budget rides complete - no pull round needed for small hops.
+            envelope["result"] = full_result
+        else:
+            envelope["result"] = {
+                "kind": "unreviewed_host_salvage" if salvage else "bounded_result_preview",
+                "preview": truncate_within_limit(
+                    full_result, limit=_AUTOMATIC_HOST_SALVAGE_RESULT_CHARS,
+                ),
+                "full_chars": full_chars,
+                "source_ref": {
+                    **copy.deepcopy(source),
+                    "field": "authority.result",
+                },
+            }
+    return envelope
 
 
 def validate_task_authority_sources(env: Any, task: Dict[str, Any]) -> Dict[str, Any]:

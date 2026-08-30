@@ -9,6 +9,8 @@ interprets whether the objective was met.
 from __future__ import annotations
 
 import copy
+import json
+from hashlib import sha256
 from typing import Any, Dict, Mapping
 
 
@@ -588,13 +590,61 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         # The predecessor is additive authority, not prose to merge into the new
         # objective.  Preserve its materialized envelope so the ordinary parent
         # contract spread carries it through direct starts and nested work orders.
-        contract["predecessor_authority"] = copy.deepcopy(dict(predecessor_authority))
+        # A legacy FAT body (pre-envelope: full result + nested contract chains)
+        # is collapsed here to its bounded reference shape - the in-flight
+        # migration point: rebuilding any contract sheds the recursion while
+        # the durable task_results (the SSOT bodies) stay untouched.
+        contract["predecessor_authority"] = _bounded_predecessor_authority(
+            dict(predecessor_authority)
+        )
     for key in ("notes", "review_notes"):
         if merged.get(key):
             contract[key] = merged.get(key)
     if capability_ceiling is not None:
         contract["capability_ceiling"] = capability_ceiling
     return contract
+
+
+def _bounded_predecessor_authority(mapping: Dict[str, Any]) -> Dict[str, Any]:
+    """Collapse a legacy full-body predecessor into its bounded envelope.
+
+    An envelope-shaped mapping passes through by copy.  A fat legacy mapping
+    (complete result/contract bodies, recursively nesting every prior hop) is
+    reduced to identity + named pull source + observed size facts: the bodies
+    remain exactly where they always were - task_results/<id>.json - and the
+    contract stops re-broadcasting them into every child and work order.
+    """
+    if str(mapping.get("kind") or "") == "bounded_continuation_envelope":
+        return copy.deepcopy(mapping)
+    source = mapping.get("source") if isinstance(mapping.get("source"), Mapping) else {}
+    contract = mapping.get("task_contract") if isinstance(mapping.get("task_contract"), Mapping) else {}
+    try:
+        serialized = json.dumps(mapping, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        serialized = repr(mapping)
+    result = mapping.get("result")
+    envelope: Dict[str, Any] = {
+        "kind": "bounded_continuation_envelope",
+        "task_id": str(
+            mapping.get("task_id") or mapping.get("id")
+            or (source.get("task_id") if isinstance(source, Mapping) else "") or ""
+        ),
+        "status": str(mapping.get("status") or ""),
+        "objective": str(contract.get("objective") or mapping.get("title") or "")[:500],
+        "authority_sha256": sha256(serialized.encode("utf-8")).hexdigest(),
+        "authority_chars": len(serialized),
+        "digest_semantics": "observed_at_collapse",
+        "collapsed_from": "legacy_full_body",
+    }
+    if isinstance(source, Mapping) and source:
+        envelope["source"] = copy.deepcopy(dict(source))
+    if isinstance(result, str) and result:
+        envelope["result"] = (
+            result if len(result) <= 20_000
+            else result[:20_000] + "\n⚠️ OMISSION NOTE: legacy predecessor body "
+            "collapsed; pull the complete authority through the named source."
+        )
+    return envelope
 
 
 def attach_task_contract(task: Dict[str, Any]) -> Dict[str, Any]:
