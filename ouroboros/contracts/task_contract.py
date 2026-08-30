@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy
 import json
 from hashlib import sha256
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 _BOOLEAN_RESOURCE_NAMES = frozenset({
@@ -605,6 +605,27 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
     return contract
 
 
+def _serialized_chars(value: Any) -> Tuple[str, int]:
+    """A value's wire text and size - the SERIALIZED form is what rides.
+
+    Strings are measured serialized too (control characters escape to many
+    wire bytes: 15K of NULs serializes to 90K). A body too deep to serialize
+    (a recursive legacy chain) is oversized by definition, never a crash.
+    """
+    if isinstance(value, str):
+        try:
+            return value, len(json.dumps(value, ensure_ascii=False)) - 2
+        except (TypeError, ValueError, RecursionError):
+            return value, len(value)
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except RecursionError:
+        return "<authority body too deep to serialize>", 2 ** 31
+    except (TypeError, ValueError):
+        text = repr(value)
+    return text, len(text)
+
+
 def bounded_continuation_envelope(
     mapping: Dict[str, Any], *, digest_semantics: str,
     source_ref: Optional[Dict[str, Any]] = None, salvage: bool = False,
@@ -616,22 +637,56 @@ def bounded_continuation_envelope(
     included - so authority cannot silently vanish. Only the growth carriers
     are bounded structurally: the nested ``task_contract`` inherits its
     operative core minus ``predecessor_authority`` (the recursion), and any
-    field whose body outgrows the tool-result budget rides as a typed preview
-    (measured on its JSON serialization, so lists and dicts are bounded too).
-    Core contract strings stay strings under disclosed truncation. Row fields
-    that collide with envelope metadata names ride under
-    ``shadowed_authority_fields`` instead of being clobbered. The digest names
+    field whose body outgrows the tool-result budget rides as a typed preview,
+    measured on its SERIALIZED form - lists, dicts and escape-heavy strings
+    all count, previews shrink until they fit the wire. Core contract strings
+    stay strings under disclosed truncation. Row fields colliding with
+    envelope metadata names ride BOUNDED under ``shadowed_authority_fields``
+    instead of being clobbered; a malformed non-mapping ``task_contract``
+    rides as a bounded plain field rather than vanishing. The digest names
     when it was observed; the durable task_results body stays the SSOT.
     """
     from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
     from ouroboros.utils import truncate_within_limit
 
     limit = DEFAULT_TOOL_RESULT_LIMIT
+
+    def _fit(raw: str) -> str:
+        preview = truncate_within_limit(raw, limit=limit)
+        while len(preview) > 100:
+            try:
+                over = len(json.dumps(preview, ensure_ascii=False)) - 2 - limit
+            except (TypeError, ValueError, RecursionError):
+                break
+            if over <= 0:
+                break
+            # Shave exactly the escape overshoot (at least one char) - a
+            # 1-char overshoot must not halve the carried budget.
+            preview = truncate_within_limit(
+                preview, limit=max(100, len(preview) - max(over, 1)))
+        return preview
+
+    def _bounded(key: str, value: Any, *, field: str, force_pointer: bool = False) -> Any:
+        text, chars = _serialized_chars(value)
+        if not force_pointer and chars <= limit:
+            return copy.deepcopy(value)
+        entry: Dict[str, Any] = {
+            "kind": "unreviewed_host_salvage" if force_pointer else "bounded_field_preview",
+            "preview": _fit(text),
+            "full_chars": chars,
+        }
+        if source_ref:
+            entry["source_ref"] = {**copy.deepcopy(source_ref), "field": field}
+        return entry
+
     try:
         serialized = json.dumps(mapping, ensure_ascii=False, sort_keys=True, default=str)
+    except RecursionError:
+        serialized = "<authority body too deep to serialize>"
     except (TypeError, ValueError):
         serialized = repr(mapping)
-    contract = mapping.get("task_contract") if isinstance(mapping.get("task_contract"), Mapping) else {}
+    raw_contract = mapping.get("task_contract")
+    contract = raw_contract if isinstance(raw_contract, Mapping) else {}
     reserved = {"kind", "authority_sha256", "authority_chars", "digest_semantics",
                 "previous_task_id", "collapsed_from", "shadowed_authority_fields"}
     if reserve_source:
@@ -641,53 +696,24 @@ def bounded_continuation_envelope(
     envelope: Dict[str, Any] = {}
     shadowed: Dict[str, Any] = {}
     for key, value in mapping.items():
-        if key == "task_contract":
+        if key == "task_contract" and isinstance(raw_contract, Mapping):
             continue
         if key in reserved:
-            shadowed[key] = copy.deepcopy(value)
+            shadowed[key] = _bounded(key, value, field=f"authority.{key}")
             continue
-        force_pointer = salvage and key == "result"
-        if isinstance(value, str):
-            text, oversized = value, len(value) > limit
-        else:
-            try:
-                text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-            except (TypeError, ValueError):
-                text = repr(value)
-            oversized = len(text) > limit
-        if force_pointer or oversized:
-            entry: Dict[str, Any] = {
-                "kind": "unreviewed_host_salvage" if force_pointer else "bounded_field_preview",
-                "preview": truncate_within_limit(text, limit=limit),
-                "full_chars": len(text),
-            }
-            if source_ref:
-                entry["source_ref"] = {**copy.deepcopy(source_ref), "field": f"authority.{key}"}
-            envelope[key] = entry
-        else:
-            envelope[key] = copy.deepcopy(value)
+        envelope[key] = _bounded(
+            key, value, field=f"authority.{key}",
+            force_pointer=salvage and key == "result",
+        )
     core: Dict[str, Any] = {}
     for key, value in contract.items():
         if key == "predecessor_authority":
             continue
         if isinstance(value, str):
-            core[key] = (truncate_within_limit(value, limit=limit)
-                         if len(value) > limit else value)
+            _text, chars = _serialized_chars(value)
+            core[key] = _fit(value) if chars > limit else value
             continue
-        try:
-            text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-        except (TypeError, ValueError):
-            text = repr(value)
-        if len(text) > limit:
-            entry = {"kind": "bounded_field_preview",
-                     "preview": truncate_within_limit(text, limit=limit),
-                     "full_chars": len(text)}
-            if source_ref:
-                entry["source_ref"] = {**copy.deepcopy(source_ref),
-                                       "field": f"authority.task_contract.{key}"}
-            core[key] = entry
-        else:
-            core[key] = copy.deepcopy(value)
+        core[key] = _bounded(key, value, field=f"authority.task_contract.{key}")
     if core:
         envelope["task_contract"] = core
     if shadowed:
@@ -700,7 +726,6 @@ def bounded_continuation_envelope(
         **(extra or {}),
     })
     return envelope
-
 
 def _bounded_predecessor_authority(mapping: Dict[str, Any]) -> Dict[str, Any]:
     """Collapse a legacy full-body predecessor on a growth carrier.
@@ -715,20 +740,14 @@ def _bounded_predecessor_authority(mapping: Dict[str, Any]) -> Dict[str, Any]:
         return copy.deepcopy(mapping)
     from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
 
-    def _field_chars(value: Any) -> int:
-        if isinstance(value, str):
-            return len(value)
-        try:
-            return len(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
-        except (TypeError, ValueError):
-            return len(repr(value))
-
-    contract = mapping.get("task_contract") if isinstance(mapping.get("task_contract"), Mapping) else {}
+    raw_contract = mapping.get("task_contract")
+    contract = raw_contract if isinstance(raw_contract, Mapping) else {}
     oversized = (
-        any(_field_chars(v) > DEFAULT_TOOL_RESULT_LIMIT for k, v in mapping.items()
-            if k != "task_contract")
+        any(_serialized_chars(v)[1] > DEFAULT_TOOL_RESULT_LIMIT
+            for k, v in mapping.items()
+            if k != "task_contract" or not isinstance(raw_contract, Mapping))
         or any(k != "predecessor_authority"
-               and _field_chars(v) > DEFAULT_TOOL_RESULT_LIMIT
+               and _serialized_chars(v)[1] > DEFAULT_TOOL_RESULT_LIMIT
                for k, v in contract.items())
     )
     if "predecessor_authority" not in contract and not oversized:

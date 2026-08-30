@@ -948,9 +948,30 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
             _record_actor_work_order_source(ctx, bootstrap)
         return exact_start(ctx, canonical_work_order, bound)
     if retry_of and isinstance(bootstrap, dict):
-        # Retry replays the stored canonical request byte-for-byte; do not let a
-        # new coordination sentence become a prefix when the original order was
-        # over the host wire budget.
+        # Retry replays the stored canonical request byte-for-byte - so an
+        # argument the replay cannot honor is refused typed, never silently
+        # discarded (the fresh-start refusals, mirrored).
+        expected_id = str(bootstrap.get("selected_subagent_id") or "")
+        requested_id = str(params.get("subagent_id") or "").strip()
+        if requested_id and requested_id != expected_id:
+            _blocked("configured_actor_route_mismatch")
+            return _fail(
+                "delegate_start", "configured_actor_route_mismatch",
+                "A configured retry replays its own scheduled session; it cannot "
+                "be redirected to another actor.",
+                selected_subagent_id=expected_id,
+                requested_subagent_id=requested_id,
+                host_fallback=False,
+            )
+        if any(str(params.get(key) or "").strip() for key in ("root", "bucket", "skill_name")):
+            _blocked("configured_actor_resource_mismatch")
+            return _fail(
+                "delegate_start", "configured_actor_resource_mismatch",
+                "A configured retry replays its assigned route, not a "
+                "skill-payload resource.",
+                selected_subagent_id=expected_id,
+                host_fallback=False,
+            )
         canonical_work_order, source_refusal = _actor_work_order_for_start(
             ctx, bootstrap, retry=True,
         )

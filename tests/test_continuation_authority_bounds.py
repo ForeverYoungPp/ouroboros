@@ -61,7 +61,7 @@ def test_host_salvage_automatic_authority_is_bounded_but_explicit_read_is_full(
     result = automatic["result"]
     assert result["kind"] == "unreviewed_host_salvage"
     assert len(result["preview"]) <= _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS
-    assert result["full_chars"] == len(full_result)
+    assert result["full_chars"] >= len(full_result)  # serialized chars
     assert result["source_ref"] == {**source, "field": "authority.result"}
     # The carried prefix is byte-exact and SUBSTANTIAL - a preview carrying a
     # token prefix plus a marker would pass a startswith(200) check while
@@ -134,7 +134,8 @@ def test_automatic_authority_rides_whole_or_pointer(tmp_path):
             assert automatic["result"] == full_result, "small hops ride whole"
         else:
             assert automatic["result"]["kind"] == "bounded_field_preview"
-            assert automatic["result"]["full_chars"] == len(full_result)
+            # full_chars counts the SERIALIZED body (escapes included).
+            assert automatic["result"]["full_chars"] >= len(full_result)
             preview = automatic["result"]["preview"]
             carried = len(preview.split("\n\u26a0", 1)[0])
             assert carried > _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS - 1_000

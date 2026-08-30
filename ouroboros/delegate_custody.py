@@ -62,11 +62,10 @@ CONTAINMENT_RESOLVED = "delegate_run_containment_resolved"
 RECONCILED = "delegate_run_reconciled"
 OUTPUT_SPILLED = "delegate_run_output_spilled"
 # Owner doctrine D7: a result is OBTAINED only after the artifact is read to
-# EOF - the ack is written when read windows covered the staged artifact
-# CONTINUOUSLY start-to-EOF, hash-bound, and only over verified FULL content
-# (`full_content`), never the bounded 256 KiB preview. Owner directive
-# (2026-08-03): consumption is LOAD-BEARING before settlement; its ABSENCE is
-# ``SETTLED_UNREAD`` below, and it does not BLOCK settlement (``settle_run``).
+# EOF - the ack covers the staged artifact CONTINUOUSLY start-to-EOF,
+# hash-bound, over verified FULL content only (never the 256 KiB preview).
+# Owner directive 2026-08-03: consumption is LOAD-BEARING before settlement;
+# its ABSENCE is ``SETTLED_UNREAD``; it does not BLOCK settling (settle_run).
 OUTPUT_CONSUMED = "delegate_run_output_consumed"
 # A run whose VERIFIED FULL output was staged, paid for, and settled without ever being
 # read to EOF: the "launched and never collected" class, named at the moment it becomes
@@ -145,21 +144,16 @@ class RunCustody:
     authority_fingerprint: str = ""
     ledger_recorded: bool = False
     settled: bool = False
-    # The containment disclosure is a FACT about the run, written once (a nanny
-    # re-polling a terminal run must not read as repeated findings); replayed
-    # durably, so a restarted worker does not re-disclose.
+    # Written once (a re-polling nanny must not read as repeated findings).
     containment_disclosed: bool = False
-    # Whether the settled-but-never-read omission has already been named durably.
-    unread_disclosed: bool = False
-    # The staged-output half of the terminal story (D7). ``output_artifact``: the
+    unread_disclosed: bool = False  # settled-never-read omission named durably
+    # Staged-output half of the terminal story (D7). ``output_artifact``:
     # task-drive-relative staging path (empty when inline). ``output_complete``:
-    # whether the staged body matches the run's OWN report - served size or the
-    # carried preview prefix (`_resolve_full_primary_output`); the engine
-    # publishes no content hash, so equal length binds to the run's CLAIM, and
-    # an artifact matching neither stages incomplete and can never be
-    # acknowledged. ``output_sha``: hash of what is CURRENTLY staged;
-    # ``output_consumed``: whether the canonical ack exists FOR THAT HASH (an
-    # ack names bytes, not a path). All replayed across worker restarts.
+    # staged body matches the run's OWN report - served size or carried preview
+    # prefix (no engine content hash, so equal length binds to the CLAIM; an
+    # artifact matching neither stages incomplete, never acknowledgeable).
+    # ``output_sha``: hash of what is staged NOW; ``output_consumed``: the
+    # canonical ack exists FOR THAT HASH (an ack names bytes, not a path).
     output_artifact: str = ""
     output_complete: bool = False
     output_sha: str = ""
@@ -813,16 +807,24 @@ def retire_project(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
     try:
         # Sharers = EVERY run in the project, owned or not: only the creator
         # carries project_owned, but the daemon refuses removal while ANY
-        # sibling lives. The caller is mid-settlement (its SETTLED emit
-        # follows this call), so only OTHER unsettled sharers defer the
-        # attempt - the daemon would refuse it anyway.
-        rows = [run for run in replay(drive_root).values()
+        # sibling lives; the caller is mid-settlement (its SETTLED emit
+        # follows), so only OTHER unsettled sharers defer.
+        state = replay(drive_root)
+        if custody.run_id and custody.run_id not in state:
+            # An unreadable/empty log replays as NO runs - removal under
+            # unknown sibling authority is the fail-open this deferral exists
+            # to prevent. Defer to a sweep that can see.
+            log.warning("Retirement deferred: run %s not in replay", custody.run_id)
+            return
+        rows = [run for run in state.values()
                 if run.project_id == custody.project_id and run.run_id]
         if any(not run.settled and run.run_id != custody.run_id for run in rows):
             return
         sharers = sorted(run.run_id for run in rows if run.project_owned)
     except Exception:
-        sharers = []
+        log.warning("Retirement deferred: replay failed for %s",
+                    custody.run_id, exc_info=True)
+        return
     if sharers and custody.run_id and custody.run_id != sharers[0]:
         return  # deferred quietly: the canonical sharer carries the retry lane
     try:
@@ -1350,12 +1352,11 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
     if gateway_factory is None:
-        # The startup sweep REAPS the previous generation's owned daemon just
-        # before calling here, so a bare discovery-only gateway always found a
-        # corpse and reconciliation silently no-opped on every restart. The
-        # ensure path starts our own daemon when there is real work to
-        # reconcile (never on the empty early-return above), activating a
-        # staged runtime update the old always-running daemon could never adopt.
+        # The startup sweep REAPS the prior generation's owned daemon just
+        # before this, so a discovery-only gateway always found a corpse and
+        # reconciliation silently no-opped on every restart. The ensure path
+        # starts our own daemon when there is real work (never on the empty
+        # early-return above), activating any staged runtime update.
         from ouroboros.claudexor_daemon import ensure_owned_gateway
 
         gateway_factory = ensure_owned_gateway
@@ -1505,12 +1506,11 @@ def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[s
         else:
             record_containment_fault(drive_root, custody, "reconcile_unreadable", f"{exc.code}: {exc}")
             result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "unreadable"}
-        # NO capture here (C1-R2): across the D30 provisioning boundary an
-        # absent run may still be WRITING its snapshot, and an eager capture
-        # would freeze an incomplete patch the idempotent core then serves
-        # forever. Custody closes, the snapshot survives (undisposed - GC keeps
-        # it), the duty surfaces via ``undisposed_patches()``, and capture
-        # happens at disposition (``integrate_delegated_patch``).
+        # NO capture here (C1-R2): across the D30 boundary an absent run may
+        # still be WRITING its snapshot; an eager capture would freeze an
+        # incomplete patch the idempotent core then serves forever. Custody
+        # closes, the snapshot survives (undisposed - GC keeps it), the duty
+        # surfaces via undisposed_patches(); capture happens at disposition.
         emit(drive_root, RECONCILED, result)
         return result
     if is_terminal(detail):

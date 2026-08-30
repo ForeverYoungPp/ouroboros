@@ -9,7 +9,7 @@ import pathlib
 import httpx
 import pytest
 
-from ouroboros import subagents, usage_accounting as ua
+from ouroboros import delegate_custody as dcust, subagents, usage_accounting as ua
 from ouroboros.config import (
     CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION,
     CLAUDEXOR_MIN_VERSION,
@@ -1528,8 +1528,10 @@ def test_settlement_reads_the_harnesss_own_spend_field(tmp_path, monkeypatch):
 
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
-    delegate._CUSTODY["run-1"] = delegate._RunCustody(
-        task_id="t-a", route_id="r", model="m", project_id="prj-ours", project_owned=True)
+    row = delegate._RunCustody(run_id="run-1", task_id="t-a", route_id="r",
+        model="m", project_id="prj-ours", project_owned=True)
+    dcust.record_started(tmp_path, row)
+    delegate._CUSTODY["run-1"] = row
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "t-a"
     ctx.task_metadata = {"root_task_id": "t-a"}
@@ -1961,8 +1963,9 @@ def test_a_failed_ledger_write_leaves_the_session_retryable(tmp_path, monkeypatc
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     monkeypatch.setattr(ua, "record_subscription_session", _boom)
     delegate._CUSTODY.clear()
-    custody = delegate._RunCustody(task_id="t-a", route_id="r", model="m",
-                                   project_id="prj-ours", project_owned=True)
+    custody = delegate._RunCustody(run_id="run-1", task_id="t-a", route_id="r",
+        model="m", project_id="prj-ours", project_owned=True)
+    dcust.record_started(tmp_path, custody)
     delegate._CUSTODY["run-1"] = custody
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "t-a"
@@ -1970,10 +1973,10 @@ def test_a_failed_ledger_write_leaves_the_session_retryable(tmp_path, monkeypatc
 
     json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
     assert custody.settled is False, "a lost write must stay retryable"
-    # Retirement is INDEPENDENT of whether the ledger write landed. The round-2 commit
-    # claimed this and the fixture owned no project, so deleting the call left the suite
+    # Retirement is INDEPENDENT of the ledger write: the round-2 commit claimed
+    # this while the fixture owned no project, so deleting the call stayed
     # green — a leak per failed settle, and a halted run never settles again.
-    assert retired == ["prj-ours"], "an owned registration must be retired even on failure"
+    assert retired == ["prj-ours"], "owned registration retired even on failure"
     delegate._CUSTODY.clear()
 
 
@@ -3133,8 +3136,7 @@ def test_an_absent_run_closes_now_and_its_registration_survives_for_the_sweep(tm
     kinds = _event_types(tmp_path)
     assert "delegate_run_project_retired" in kinds
     assert dc.owned_project_registrations(tmp_path) == []
-    # Lanes: close-absent, same-pass sweep, next sweep.
-    assert gateway.removals == ["prj-owned"] * 3
+    assert gateway.removals == ["prj-owned"] * 3  # 3 lanes: close, 2 sweeps
 
     # 3. Absence is discharge: a 404 on the remove itself closes the run.
     class _AllGone(_AbsentRunGateway):
@@ -6122,8 +6124,7 @@ def test_subscription_window_exhausted_beacon_wakes_the_waiting_parent(tmp_path,
 
 
 def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_path):
-    """W3 adjacent (d): every run in the project shares the registration.
-    Any unsettled sibling defers every sharer QUIETLY; once all settle
+    """Any unsettled sibling defers every sharer QUIETLY; once all settle
     the LOWEST-run_id sharer carries the retry lane."""
     import json as _json
 
