@@ -177,7 +177,10 @@ function reviewRunTitle(run) {
 function reviewHistory(skill) {
     const review = skill.skill_review && typeof skill.skill_review === 'object'
         ? skill.skill_review : {};
-    const history = Array.isArray(review.history) ? review.history.slice(-10) : [];
+    // The backend projection already bounds history to its ten-row window and
+    // discloses the exact omitted count; a second client-side slice would be
+    // an undisclosed bound on top of a disclosed one.
+    const history = Array.isArray(review.history) ? review.history : [];
     const current = review.current && Object.keys(review.current).length
         ? review.current : history[history.length - 1];
     if (!current) return '';
@@ -186,9 +189,13 @@ function reviewHistory(skill) {
         const source = run.source ? ` · ${run.source}` : '';
         return `<li>${escapeHtml(reviewRunTitle(run))} · ${escapeHtml(status)}${escapeHtml(source)}</li>`;
     }).join('');
+    const omitted = Number(review.history_omitted);
+    const historyLabel = Number.isFinite(omitted) && omitted > 0
+        ? `${history.length} of ${history.length + omitted}`
+        : `${history.length}`;
     const currentStatus = current.review_status || current.status || current.job_status || 'unknown';
     return `<div class="skills-review-current"><strong>${escapeHtml(reviewRunTitle(current))}</strong> · ${escapeHtml(currentStatus)}</div>
-        ${rows ? `<details class="skills-review-history ui-rich-content"><summary class="muted">Skill Review history (${history.length})</summary><ol>${rows}</ol></details>` : ''}`;
+        ${rows ? `<details class="skills-review-history ui-rich-content"><summary class="muted">Skill Review history (${historyLabel})</summary><ol>${rows}</ol></details>` : ''}`;
 }
 
 function grantBlock(skill) {

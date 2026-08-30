@@ -38,3 +38,34 @@ test('skill card shows current review round and collapses only the last ten grou
     assert.match(html, /Skill Review history \(10\)/);
     assert.doesNotMatch(html, /must stay private/);
 });
+
+test('a bounded history window names the exact omitted remainder in its label', () => {
+    const history = Array.from({ length: 10 }, (_, idx) => ({
+        status: 'clean',
+        content_hash: `snapshot-${idx}`,
+        group_id: 'manual:alpha',
+        review_round: idx + 15,
+        snapshot_attempt: 1,
+    }));
+    const skill = {
+        name: 'alpha',
+        type: 'instruction',
+        version: '1.0.0',
+        description: 'test',
+        source: 'external',
+        enabled: false,
+        review_status: 'clean',
+        review_gate: { executable_review: true },
+        review_findings: [],
+        permissions: [],
+        grants: {},
+        skill_review: {
+            current: history[history.length - 1],
+            history,
+            history_omitted: 14,
+        },
+    };
+
+    const html = renderInstalledSkillCard(skill);
+    assert.match(html, /Skill Review history \(10 of 24\)/);
+});

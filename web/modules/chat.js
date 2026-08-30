@@ -509,6 +509,11 @@ export function createChatInstance({
     const reviewHydrator = createReviewHydrator({
         fetchDetail: (taskId) => fetchTaskDetail(taskId),
         applyDetail: (taskId, detail) => !destroyed && attachTaskDetailReviews(taskId, detail),
+        onState: (taskId, status) => {
+            if (destroyed) return;
+            liveCardRecords.get(String(taskId || '').trim())
+                ?.reviewController?.setHydrateStatus?.(status);
+        },
     });
     // Cluster B: a proactively-coined name (task_named) can arrive BEFORE the card's
     // liveCardRecords entry exists (the namer broadcasts as the task starts). Buffer it
@@ -1599,7 +1604,12 @@ export function createChatInstance({
             host: record.reviewsHostEl,
             summary: record.reviewSummaryEl,
             disclosure: reviewDisclosure,
-            onHydrate: () => hydrateCardReviews(normalizedGroupId),
+            onHydrate: (hydrateOptions = {}) => {
+                // An explicit Retry must not be deduplicated away by the
+                // applied-revision receipt of the failed pass.
+                if (hydrateOptions.retry === true) reviewHydrator.invalidateApplied(normalizedGroupId);
+                return hydrateCardReviews(normalizedGroupId);
+            },
             onLoadSkillDetail: (detail, detailOptions = {}) => loadSkillReviewDetail(
                 detail,
                 nestedSkillReviewRef(detail),

@@ -1425,3 +1425,153 @@ test('history and live chat intercept owner-bound lifecycle before generic progr
     assert.ok(live.indexOf('attachReviewFromRow(msg') >= 0);
     assert.ok(live.indexOf('attachReviewFromRow(msg') < live.indexOf('if (msg.is_progress)'));
 });
+
+test('a full Plan wave renders findings, mapped dispositions, degraded reviewers and honesty stamps', () => {
+    const fingerprint = 'd'.repeat(64);
+    const group = planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            schema_version: 2,
+            current_attempt: { fingerprint, status: 'open' },
+            waves: [{
+                request_fingerprint: fingerprint,
+                cycle_index: 2,
+                aggregate: 'REVISE_PLAN',
+                closed: false,
+                paid: true,
+                reason: 'blocking_slots_at_quorum:2/3',
+                counts: { blocking: 1, note: 1, need_evidence: 0 },
+                findings: [
+                    {
+                        finding_id: 'slot_1:f1', id: 'f1', class: 'blocking',
+                        summary: 'The rollback path loses the stash', breaks: 'invariant_2',
+                        locator: 'supervisor/update_merge.py',
+                        recommendation: 'Restore the stash before reset',
+                        slot: 'slot_1', model: 'anthropic/claude-opus-5',
+                    },
+                    {
+                        finding_id: 'slot_2:f1', id: 'f1', class: 'note',
+                        summary: 'Naming could be clearer', slot: 'slot_2',
+                    },
+                ],
+                dispositions: [
+                    { finding_id: 'slot_1:f1', decision: 'reject', rationale: 'stash is restored by boot finalize' },
+                    { finding_id: 'slot_9:gone', decision: 'accept', rationale: 'will fold into phase 2' },
+                ],
+                actors: [
+                    { slot_id: 'slot_1', model: 'anthropic/claude-opus-5', ok: true },
+                    { slot_id: 'slot_3', model: 'openai/gpt-5.6-sol', ok: false, failure_code: 'window_exhausted' },
+                ],
+                findings_paged: true,
+                findings_total: 40,
+                findings_texts_truncated: true,
+                spec_body_truncated: true,
+            }],
+            waves_omitted: 0,
+        },
+    });
+
+    const detail = group.attempts[0].detailText;
+    assert.match(detail, /Findings: 1 blocking · 1 note · 0 need_evidence/);
+    assert.match(detail, /\[blocking\] The rollback path loses the stash — breaks invariant_2 — at supervisor\/update_merge\.py — slot_1 · anthropic\/claude-opus-5/);
+    assert.match(detail, /  fix: Restore the stash before reset/);
+    assert.match(detail, /  agent: reject — stash is restored by boot finalize/);
+    assert.match(detail, /\[note\] Naming could be clearer — slot_2/);
+    assert.match(detail, /General dispositions:\n  slot_9:gone: accept — will fold into phase 2/);
+    assert.match(detail, /Reviewer unavailable: slot_3 · openai\/gpt-5\.6-sol — window_exhausted/);
+    assert.match(detail, /Showing 2 of 40 findings \(per-slot page cap\)/);
+    assert.match(detail, /Some finding texts were truncated at capture\./);
+    assert.match(detail, /Spec body was truncated at capture\./);
+    assert.match(detail, /Cost unavailable/);
+    // The rendered section carries the finding text to the reader.
+    const html = renderReviewsSection([group], {
+        sectionExpanded: true,
+        expandedGroups: new Set(['plan:root']),
+        expandedAttempts: new Set([`plan:root:${group.attempts[0].id}`]),
+    });
+    assert.match(html, /The rollback path loses the stash/);
+});
+
+test('a compact Plan wave names its recorded counts and the immutable artifact remainder', () => {
+    const fingerprint = 'e'.repeat(64);
+    const group = planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            schema_version: 2,
+            current_attempt: {},
+            waves: [{
+                compact: true,
+                request_fingerprint: fingerprint,
+                cycle_index: 1,
+                aggregate: 'GREEN',
+                closed: true,
+                counts: { findings: 5, dispositions: 3, blocking: 2 },
+                wave_artifact: { root: 'artifact_store', path: 'w.json', sha256: 'abc123def4567890', bytes: 321 },
+            }],
+            waves_omitted: 0,
+        },
+    });
+    const detail = group.attempts[0].detailText;
+    assert.match(detail, /Recorded: 5 findings · 2 blocking · 3 dispositions/);
+    assert.match(detail, /Finding bodies compacted · artifact sha256=abc123def456… \(321 bytes\)/);
+    assert.doesNotMatch(detail, /w\.json/);
+});
+
+test('the hydrator announces first load, failure and retry without narrating background refreshes', async () => {
+    const events = [];
+    let mode = 'ok';
+    const hydrator = createReviewHydrator({
+        fetchDetail: async () => (mode === 'ok' ? { ok: true } : null),
+        applyDetail: () => true,
+        onState: (taskId, status) => events.push(`${taskId}:${status}`),
+    });
+
+    mode = 'null';
+    assert.equal(await hydrator.hydrate('root', 'a'.repeat(64)), false);
+    assert.deepEqual(events, ['root:loading', 'root:error']);
+
+    events.length = 0;
+    mode = 'ok';
+    hydrator.invalidateApplied('root');
+    await hydrator.hydrate('root', 'a'.repeat(64));
+    assert.deepEqual(events, ['root:loading', 'root:idle'], 'a retry after failure announces itself');
+
+    events.length = 0;
+    await hydrator.hydrate('root', 'b'.repeat(64));
+    assert.deepEqual(events, ['root:idle'], 'a background refresh over applied content stays silent');
+});
+
+test('the section renders hydration truth and the controller retries through onHydrate', () => {
+    const errorHtml = renderReviewsSection([
+        taskAcceptanceGroupFromTaskDetail({
+            task_id: 'root',
+            review_projection: { panels: [{ surface: 'task_acceptance', panel_id: 'p1', aggregate_signal: 'PASS' }] },
+        }, 'root'),
+    ], { sectionExpanded: true, hydrateStatus: 'error' });
+    assert.match(errorHtml, /data-review-hydrate-status/);
+    assert.match(errorHtml, /Review details failed to refresh/);
+    assert.match(errorHtml, /data-review-hydrate-retry/);
+
+    const loadingHtml = renderReviewsSection([
+        taskAcceptanceGroupFromTaskDetail({
+            task_id: 'root',
+            review_projection: { panels: [{ surface: 'task_acceptance', panel_id: 'p1', aggregate_signal: 'PASS' }] },
+        }, 'root'),
+    ], { sectionExpanded: true, hydrateStatus: 'loading' });
+    assert.match(loadingHtml, /Loading review details…/);
+
+    const hydrated = [];
+    let clickHandler = null;
+    const controller = createReviewPresentationController({
+        host: { addEventListener: (_type, handler) => { clickHandler = handler; } },
+        summary: null,
+        onHydrate: (options) => hydrated.push(options),
+    });
+    controller.setHydrateStatus('error');
+    clickHandler({
+        target: {
+            closest: (selector) => (selector === '[data-review-hydrate-retry]' ? {} : null),
+        },
+    });
+    assert.deepEqual(hydrated, [{ retry: true }]);
+});

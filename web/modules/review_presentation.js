@@ -461,6 +461,58 @@ function currentPlanAttempt(current, index) {
     };
 }
 
+function planFindingLines(wave) {
+    const findings = (Array.isArray(wave.findings) ? wave.findings : [])
+        .filter((item) => item && typeof item === 'object');
+    const dispositions = (Array.isArray(wave.dispositions) ? wave.dispositions : [])
+        .filter((item) => item && typeof item === 'object');
+    const dispositionByFinding = new Map();
+    for (const disposition of dispositions) {
+        const key = text(disposition.finding_id);
+        if (key && !dispositionByFinding.has(key)) dispositionByFinding.set(key, disposition);
+    }
+    const dispositionLine = (disposition, prefix) => (
+        `${prefix}${text(disposition.decision) || 'disposition'}${text(disposition.rationale) ? ` — ${text(disposition.rationale)}` : ''}`
+    );
+    const lines = [];
+    for (const finding of findings) {
+        const head = [
+            `[${text(finding.class) || 'finding'}] ${text(finding.summary) || '(no summary)'}`,
+            text(finding.breaks) ? `breaks ${text(finding.breaks)}` : '',
+            text(finding.locator) ? `at ${text(finding.locator)}` : '',
+        ].filter(Boolean).join(' — ');
+        const source = [text(finding.slot), text(finding.model)].filter(Boolean).join(' · ');
+        lines.push(source ? `${head} — ${source}` : head);
+        if (text(finding.recommendation)) lines.push(`  fix: ${text(finding.recommendation)}`);
+        const findingId = text(finding.finding_id);
+        const disposition = dispositionByFinding.get(findingId);
+        if (disposition) {
+            dispositionByFinding.delete(findingId);
+            lines.push(dispositionLine(disposition, '  agent: '));
+        }
+    }
+    if (dispositionByFinding.size) {
+        lines.push('General dispositions:');
+        for (const [findingId, disposition] of dispositionByFinding) {
+            lines.push(dispositionLine(disposition, `  ${findingId}: `));
+        }
+    }
+    return lines;
+}
+
+function planActorAvailabilityLines(wave) {
+    // The bug report's own bar: a result that was never received must say so
+    // explicitly instead of contributing silently-zero findings.
+    const lines = [];
+    for (const actor of (Array.isArray(wave.actors) ? wave.actors : [])) {
+        if (!actor || typeof actor !== 'object' || actor.ok !== false) continue;
+        const identity = [text(actor.slot_id), text(actor.model)].filter(Boolean).join(' · ') || 'reviewer';
+        const cause = text(actor.failure_code) || text(actor.error) || 'no parseable verdict';
+        lines.push(`Reviewer unavailable: ${identity} — ${cause}`);
+    }
+    return lines;
+}
+
 function planWaveDetail(wave) {
     const lines = [
         wave.aggregate ? `Verdict: ${wave.aggregate}` : '',
@@ -470,6 +522,34 @@ function planWaveDetail(wave) {
         wave.cycles_exhausted ? 'Review cycles exhausted' : '',
         wave.reason ? `Reason: ${wave.reason}` : '',
     ];
+    const counts = wave.counts && typeof wave.counts === 'object' ? wave.counts : {};
+    if (wave.compact) {
+        // A compacted wave keeps counts while its finding bodies moved to the
+        // immutable wave artifact; name that remainder instead of rendering a
+        // bound that looks like the whole record.
+        const recorded = [
+            finiteCount(counts.findings) != null ? `${finiteCount(counts.findings)} findings` : '',
+            finiteCount(counts.blocking) != null ? `${finiteCount(counts.blocking)} blocking` : '',
+            finiteCount(counts.dispositions) != null ? `${finiteCount(counts.dispositions)} dispositions` : '',
+        ].filter(Boolean).join(' · ');
+        if (recorded) lines.push(`Recorded: ${recorded}`);
+        const artifact = wave.wave_artifact && typeof wave.wave_artifact === 'object' ? wave.wave_artifact : {};
+        const sha = text(artifact.sha256);
+        lines.push(`Finding bodies compacted${sha ? ` · artifact sha256=${sha.slice(0, 12)}…` : ''}${finiteCount(artifact.bytes) != null ? ` (${finiteCount(artifact.bytes)} bytes)` : ''}`);
+        return lines.filter(Boolean).join('\n');
+    }
+    const countParts = ['blocking', 'note', 'need_evidence']
+        .filter((key) => finiteCount(counts[key]) != null)
+        .map((key) => `${finiteCount(counts[key])} ${key}`);
+    if (countParts.length) lines.push(`Findings: ${countParts.join(' · ')}`);
+    lines.push(...planFindingLines(wave));
+    lines.push(...planActorAvailabilityLines(wave));
+    const findingsShown = (Array.isArray(wave.findings) ? wave.findings : []).length;
+    if (wave.findings_paged && finiteCount(wave.findings_total) != null) {
+        lines.push(`Showing ${findingsShown} of ${finiteCount(wave.findings_total)} findings (per-slot page cap)`);
+    }
+    if (wave.findings_texts_truncated) lines.push('Some finding texts were truncated at capture.');
+    if (wave.spec_body_truncated) lines.push('Spec body was truncated at capture.');
     return lines.filter(Boolean).join('\n');
 }
 
@@ -642,12 +722,36 @@ export function formatReviewProjection(projection) {
         if (binding.length) lines.push(`Panel binding: ${binding.join(' · ')}`);
         (Array.isArray(panel.actors) ? panel.actors : []).forEach((actor) => {
             if (!actor || typeof actor !== 'object') return;
+            const slotId = String(actor.slot_id || '?');
             lines.push(
-                `Reviewer ${String(actor.slot_id || '?')}: role=${String(actor.actor_role || 'reviewer')} · provider=${String(actor.provider || 'unknown')} · model=${String(actor.model || 'unknown')} · transport=${String(actor.transport_status || 'unknown')} · parse=${String(actor.parse_status || 'unknown')} · verdict=${String(actor.semantic_verdict || 'none')}${actor.outcome_tier ? ` · outcome_tier=${String(actor.outcome_tier)}` : ''}${actor.dialogue_status ? ` · dialogue=${String(actor.dialogue_status)}` : ''} · quorum=${actor.quorum_contribution ? 'contributes' : 'abstains'} · enforcement=${String(actor.enforcement_impact || 'unknown')}`,
+                `Reviewer ${slotId}: role=${String(actor.actor_role || 'reviewer')} · provider=${String(actor.provider || 'unknown')} · model=${String(actor.model || 'unknown')} · transport=${String(actor.transport_status || 'unknown')} · parse=${String(actor.parse_status || 'unknown')} · verdict=${String(actor.semantic_verdict || 'none')}${actor.outcome_tier ? ` · outcome_tier=${String(actor.outcome_tier)}` : ''}${actor.dialogue_status ? ` · dialogue=${String(actor.dialogue_status)}` : ''} · quorum=${actor.quorum_contribution ? 'contributes' : 'abstains'} · enforcement=${String(actor.enforcement_impact || 'unknown')}`,
             );
             const actorCoverage = compactCoverage(actor.coverage);
-            if (actorCoverage) lines.push(`Reviewer ${String(actor.slot_id || '?')} coverage: ${actorCoverage}`);
-            if (actor.reason) lines.push(`Reviewer ${String(actor.slot_id || '?')} reason: ${String(actor.reason)}`);
+            if (actorCoverage) lines.push(`Reviewer ${slotId} coverage: ${actorCoverage}`);
+            if (actor.reason) lines.push(`Reviewer ${slotId} reason: ${String(actor.reason)}`);
+            if (Array.isArray(actor.findings)) {
+                for (const finding of actor.findings) {
+                    if (!finding || typeof finding !== 'object') continue;
+                    const body = [
+                        `[${text(finding.severity) || 'finding'}] ${text(finding.item) || '(no item)'}`,
+                        text(finding.evidence) ? `evidence: ${text(finding.evidence)}` : '',
+                        text(finding.recommendation) ? `fix: ${text(finding.recommendation)}` : '',
+                    ].filter(Boolean).join(' — ');
+                    lines.push(`Reviewer ${slotId} finding: ${body}`);
+                }
+                const omitted = finiteCount(actor.findings_omitted);
+                if (omitted) lines.push(`Reviewer ${slotId} findings omitted: ${omitted}`);
+            }
+            // P1: a bounded or hole-shaped projection names the durable source
+            // the owner can actually resolve. Rows absent while the count says
+            // findings existed = a pre-findings-era or unparsed projection.
+            const coverageFindings = finiteCount(actor.coverage?.findings);
+            const needsPointer = Boolean(finiteCount(actor.findings_omitted))
+                || (!Array.isArray(actor.findings) && Boolean(coverageFindings));
+            const callId = text(actor.response_ref?.call_id);
+            if (needsPointer && callId) {
+                lines.push(`Reviewer ${slotId} full response: observability call ${callId}`);
+            }
         });
     });
     return lines.join('\n');
@@ -954,20 +1058,40 @@ function reviewRevision(value) {
  * not counters. A distinct token arriving during a GET schedules one trailing
  * read; an identical applied/in-flight/pending token is a no-op/same flight.
  */
-export function createReviewHydrator({ fetchDetail, applyDetail } = {}) {
+export function createReviewHydrator({ fetchDetail, applyDetail, onState = () => {} } = {}) {
     const states = new Map();
 
     const start = (taskId, state, revision) => {
         const generation = ++state.generation;
         state.inFlightRevision = revision;
+        // Status is typed presentation state, not a per-attempt DOM FSM: a
+        // first load (or a retry after a failure) announces itself; routine
+        // background refreshes over already-applied content stay silent.
+        const notify = (status) => {
+            state.lastStatus = status;
+            onState(taskId, status);
+        };
+        if (!state.everApplied || state.lastStatus === 'error') notify('loading');
         const request = Promise.resolve()
             .then(() => fetchDetail(taskId))
-            .then((detail) => applyDetail(taskId, detail))
+            .then((detail) => {
+                if (detail === null || detail === undefined) {
+                    // The fetch seam reports transport failure as an empty
+                    // detail; swallowing it here was the silent-error bug.
+                    throw new Error('task detail unavailable');
+                }
+                return applyDetail(taskId, detail);
+            })
             .then((applied) => {
                 if (applied !== false && revision !== null) state.appliedRevision = revision;
+                state.everApplied = true;
+                notify('idle');
                 return applied;
             })
-            .catch(() => false)
+            .catch(() => {
+                notify('error');
+                return false;
+            })
             .finally(() => {
                 if (state.inFlight !== request || state.generation !== generation) return;
                 state.inFlight = null;
@@ -993,6 +1117,8 @@ export function createReviewHydrator({ fetchDetail, applyDetail } = {}) {
                     pendingRevision: null,
                     inFlight: null,
                     generation: 0,
+                    everApplied: false,
+                    lastStatus: 'idle',
                 };
                 states.set(taskId, state);
             }
@@ -1174,12 +1300,21 @@ export function renderReviewsSection(groupsInput, disclosure = {}) {
                 </div>
             </div>`;
     }).join('');
+    // Section-level hydration truth (typed controller state, no per-attempt
+    // FSM): a first load announces itself, a failed refresh names itself and
+    // offers Retry instead of silently presenting stale-or-missing detail.
+    const hydrateStatus = text(disclosure.hydrateStatus);
+    const hydrateHtml = hydrateStatus === 'loading'
+        ? '<div class="skill-review-loading" data-review-hydrate-status role="status" aria-live="polite">Loading review details…</div>'
+        : (hydrateStatus === 'error'
+            ? '<div class="skill-review-error" data-review-hydrate-status>Review details failed to refresh — shown data may be incomplete. <button type="button" class="skill-review-retry" data-review-hydrate-retry>Retry</button></div>'
+            : '');
     return `
         <section class="chat-live-reviews" data-review-section data-expanded="${sectionExpanded ? '1' : '0'}">
             <button type="button" class="chat-review-section-toggle" data-review-section-toggle aria-expanded="${sectionExpanded ? 'true' : 'false'}">
                 <span>Reviews</span><span class="chat-review-section-count">${escapeHtmlText(countText)}</span>
             </button>
-            <div class="chat-review-groups"${sectionExpanded ? '' : ' hidden'}>${groupHtml}</div>
+            <div class="chat-review-groups"${sectionExpanded ? '' : ' hidden'}>${hydrateHtml}${groupHtml}</div>
         </section>`;
 }
 
@@ -1250,6 +1385,12 @@ export function createReviewPresentationController({
     };
 
     host?.addEventListener('click', (event) => {
+        const hydrateRetry = event.target?.closest?.('[data-review-hydrate-retry]');
+        if (hydrateRetry) {
+            onHydrate({ retry: true });
+            onLayout();
+            return;
+        }
         const retry = event.target?.closest?.('[data-skill-review-retry]');
         if (retry) {
             const detail = retry.closest?.('[data-review-attempt-detail]');
@@ -1306,6 +1447,12 @@ export function createReviewPresentationController({
             }
             if (changed) render();
             return changed;
+        },
+        setHydrateStatus(statusValue) {
+            const status = text(statusValue);
+            if (state.hydrateStatus === status) return;
+            state.hydrateStatus = status;
+            render();
         },
     };
 }
