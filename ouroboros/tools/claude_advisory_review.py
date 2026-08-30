@@ -1852,7 +1852,7 @@ def _advisory_pre_sdk_gate(
             "message": "A fresh advisory run already exists for this snapshot. Proceed with commit_reviewed.",
         })
 
-    ctx.emit_progress_fn("Running advisory pre-review (Claude Code, read-only)...")
+    ctx.emit_progress_fn("Running preflight pre-review (read-only critic)...")
     changed_files = _get_changed_file_list(repo_dir, paths=paths)
 
     if changed_files.startswith("⚠️ ADVISORY_ERROR"):
