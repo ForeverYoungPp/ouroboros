@@ -607,7 +607,7 @@
  * @property {boolean=} official_hub_verified
  * @property {boolean=} owner_attestable
  * @property {{visible: boolean, publication_ready: boolean, task_start_allowed: boolean, disabled: boolean, state: "ready"|"warnings"|"needs_attention"|"repairable"|"hard_block", reason: string}=} submit_hub
- * @property {{current: Object, history: Object[]}=} skill_review
+ * @property {{current: Object, history: Object[], history_omitted: number=}=} skill_review
  * @property {boolean=} is_self_authored
  * @property {Object=} grants
  * @property {string[]=} permissions

@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { renderInstalledSkillCard } from '../modules/skill_card_renderer.js';
 
-test('skill card shows current review round and collapses only the last ten group rows', () => {
+test('skill card shows the current review round over the runner-bounded ten-row window', () => {
     const history = Array.from({ length: 10 }, (_, idx) => ({
         status: 'clean',
         content_hash: `snapshot-${idx}`,

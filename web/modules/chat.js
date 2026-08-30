@@ -8,7 +8,7 @@ import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { createSystemMessageAction, downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
 import { clientSurfaceField } from './client_surface.js';
-import { apiClient, apiFetch, fetchTaskDetail } from './api_client.js';
+import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
 import {
     OWNER_STOP_DETAIL_MARKER,
     getLogTaskGroupId,
@@ -507,17 +507,13 @@ export function createChatInstance({
     const reviewDisclosureByTask = new Map();
     const skillReviewDetailStore = new Map();
     const reviewHydrator = createReviewHydrator({
-        fetchDetail: (taskId) => fetchTaskDetail(taskId),
-        applyDetail: (taskId, detail) => !destroyed && attachTaskDetailReviews(taskId, detail),
-        onState: (taskId, status) => {
-            if (destroyed) return;
-            liveCardRecords.get(String(taskId || '').trim())
-                ?.reviewController?.setHydrateStatus?.(status);
-        },
+        fetchDetail: fetchTaskDetailStrict,
+        applyDetail: (id, detail) => !destroyed && attachTaskDetailReviews(id, detail),
+        onState: (id, status) => !destroyed
+            && liveCardRecords.get(id)?.reviewController?.setHydrateStatus?.(status),
     });
-    // Cluster B: a proactively-coined name (task_named) can arrive BEFORE the card's
-    // liveCardRecords entry exists (the namer broadcasts as the task starts). Buffer it
-    // here so createLiveCardRecord can apply it when the card appears (no lost title).
+    // A proactively-coined name (task_named) can arrive BEFORE the card's
+    // record exists (the namer broadcasts at task start); buffer it here.
     const pendingSuggestedNames = new Map();
     const taskUiStates = new Map();
     // Busy-chat decision turns reuse the normal agent/event path for ordering and
@@ -1451,9 +1447,7 @@ export function createChatInstance({
     }
 
     function hydrateCardReviews(taskId, revision = null) {
-        const id = String(taskId || '').trim();
-        if (!id || destroyed) return Promise.resolve(false);
-        return reviewHydrator.hydrate(id, revision);
+        return destroyed ? Promise.resolve(false) : reviewHydrator.hydrate(taskId, revision);
     }
 
     function attachReviewFromRow(row, rawTs = '', showPointerAck = false) {
@@ -1604,12 +1598,7 @@ export function createChatInstance({
             host: record.reviewsHostEl,
             summary: record.reviewSummaryEl,
             disclosure: reviewDisclosure,
-            onHydrate: (hydrateOptions = {}) => {
-                // An explicit Retry must not be deduplicated away by the
-                // applied-revision receipt of the failed pass.
-                if (hydrateOptions.retry === true) reviewHydrator.invalidateApplied(normalizedGroupId);
-                return hydrateCardReviews(normalizedGroupId);
-            },
+            onHydrate: () => hydrateCardReviews(normalizedGroupId),
             onLoadSkillDetail: (detail, detailOptions = {}) => loadSkillReviewDetail(
                 detail,
                 nestedSkillReviewRef(detail),

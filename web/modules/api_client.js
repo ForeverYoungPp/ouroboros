@@ -106,6 +106,23 @@ export async function fetchTaskDetail(taskId) {
     return (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null;
 }
 
+/**
+ * Strict task-detail read for consumers that must tell a genuinely absent
+ * record (404 → null) apart from a failed read (rejects). The lenient
+ * fetchTaskDetail above keeps its every-failure→null contract for reconcile
+ * flows that treat all misses alike.
+ * @param {string} taskId
+ * @returns {Promise<import('./api_types.js').TaskDetailResponse|null>}
+ */
+export async function fetchTaskDetailStrict(taskId) {
+    const resp = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+    if (resp && typeof resp.json === 'function') {
+        if (resp.ok !== false) return resp.json();
+        if (resp.status === 404) return null;
+    }
+    throw new Error(`task detail read failed (HTTP ${resp?.status ?? 'no response'})`);
+}
+
 export function cleanExtensionRoute(value) {
     const route = String(value || '').trim().replace(/^\/+/, '');
     const parts = route.split('/').filter(Boolean);

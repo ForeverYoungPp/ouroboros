@@ -1110,6 +1110,21 @@ def test_actor_projection_carries_bounded_disclosed_finding_rows():
                     "findings": [{"weird_key": "the only copy of this evidence"}],
                 },
             },
+            {
+                # The array-ladder reviewer contract shapes findings as
+                # {item, verdict, severity, reason}: the substantive `reason`
+                # text must survive projection.
+                "slot_id": "triad-shape",
+                "model": "model-e",
+                "status": "ok",
+                "signal": "FAIL",
+                "parsed": [{
+                    "item": "missing rollback test",
+                    "verdict": "FAIL",
+                    "severity": "high",
+                    "reason": "the new path has no failure-injection coverage",
+                }],
+            },
         ],
     }
 
@@ -1143,6 +1158,15 @@ def test_actor_projection_carries_bounded_disclosed_finding_rows():
     # An unknown finding shape still ships its evidence as a bounded row.
     odd_rows = actors["odd-shape"]["findings"]
     assert odd_rows and "the only copy of this evidence" in odd_rows[0]["item"]
+
+    # A list-shaped parsed response (array reviewer contract) projects its
+    # rows too, and the substantive `reason`/`verdict` fields survive.
+    triad_rows = actors["triad-shape"]["findings"]
+    assert triad_rows == [{
+        "severity": "high", "verdict": "FAIL", "item": "missing rollback test",
+        "reason": "the new path has no failure-injection coverage",
+    }]
+    assert actors["triad-shape"]["findings_omitted"] == 0
 
 
 class _MixedPassPassFailLLM:

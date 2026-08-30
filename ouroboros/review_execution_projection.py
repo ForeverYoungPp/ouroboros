@@ -1,13 +1,52 @@
-"""Tiny public execution receipts projected from review actor usage.
+"""Tiny public read-side projections from review actor records.
 
-This leaf owns the cross-surface presentation wire. It deliberately imports no
-review engine: callers pass returned actor usage, and only actual receipt facts
-can become an API or harness execution badge.
+This leaf owns the cross-surface presentation wire: execution receipts and the
+bounded finding rows. It deliberately imports no review engine: callers pass
+returned actor facts, and only actual receipt/finding content is projected.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
+
+from ouroboros.observability import redact_projection
+from ouroboros.utils import truncate_review_artifact
+
+# Bounded structured findings on the public actor projection: the bound is the
+# ROW COUNT, never a second aggressive cut of the finding bodies — capping the
+# only owner-reachable copy of reviewer text is the class v6.70.0 removed. The
+# per-string bound mirrors plan review's MAX_FINDING_TEXT_CHARS (2000), not the
+# 200-char path-list default; the durable remainder stays addressable through
+# the actor's existing response_ref, so no full-set hash is needed.
+MAX_PROJECTED_ACTOR_FINDINGS = 8
+PROJECTED_FINDING_TEXT_CHARS = 2000
+_PROJECTED_FINDING_KEYS = (
+    "id", "severity", "verdict", "item", "summary", "evidence", "reason",
+    "recommendation",
+)
+
+
+def projected_finding_row(item: Any) -> Dict[str, str]:
+    """One bounded, redacted finding row for the public actor projection."""
+    row: Dict[str, str] = {}
+    if not isinstance(item, dict):
+        return row
+    for key in _PROJECTED_FINDING_KEYS:
+        value = str(item.get(key) or "")
+        if not value:
+            continue
+        row[key] = truncate_review_artifact(
+            str(redact_projection(value).value), PROJECTED_FINDING_TEXT_CHARS,
+        )
+    if not row:
+        # An unknown finding shape still carries evidence; a silently empty row
+        # would destroy it without a trace.
+        row["item"] = truncate_review_artifact(
+            str(redact_projection(json.dumps(item, ensure_ascii=False, default=str)).value),
+            PROJECTED_FINDING_TEXT_CHARS,
+        )
+    return row
 
 
 _API_EXECUTION_RECEIPT_KEYS = frozenset({
@@ -78,4 +117,10 @@ def review_executions_from_actor_usage(actors: Any) -> List[Dict[str, str]]:
     return normalize_review_executions(executions)
 
 
-__all__ = ["normalize_review_executions", "review_executions_from_actor_usage"]
+__all__ = [
+    "MAX_PROJECTED_ACTOR_FINDINGS",
+    "PROJECTED_FINDING_TEXT_CHARS",
+    "normalize_review_executions",
+    "projected_finding_row",
+    "review_executions_from_actor_usage",
+]

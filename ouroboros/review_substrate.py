@@ -22,7 +22,10 @@ log = logging.getLogger("review_substrate")
 from ouroboros.llm import LLMClient
 from ouroboros.observability import new_call_id, persist_call, redact_projection
 from ouroboros.provider_models import provider_for_model
-from ouroboros.review_execution_projection import review_executions_from_actor_usage
+from ouroboros.review_execution_projection import (
+    MAX_PROJECTED_ACTOR_FINDINGS, projected_finding_row,
+    review_executions_from_actor_usage,
+)
 from ouroboros.task_results import review_binding_hash
 # Everything below the seam. Re-exported here because the substrate is the
 # historical import site for the api_chat prompt renderers; `review_execution`
@@ -276,38 +279,6 @@ def _public_review_reason(value: Any) -> str:
     return str(redact_projection(text).value)
 
 
-# Bounded structured findings on the public actor projection: the bound is the
-# ROW COUNT, never a second aggressive cut of the finding bodies — capping the
-# only owner-reachable copy of reviewer text is the class v6.70.0 removed. The
-# per-string bound mirrors plan review's MAX_FINDING_TEXT_CHARS (2000), not the
-# helper's 200-char path-list default; the durable remainder stays addressable
-# through the actor's existing response_ref, so no full-set hash is needed.
-MAX_PROJECTED_ACTOR_FINDINGS = 8
-_PROJECTED_FINDING_TEXT_CHARS = 2000
-_PROJECTED_FINDING_KEYS = ("id", "severity", "item", "evidence", "recommendation")
-
-
-def _projected_finding_row(item: Any) -> Dict[str, str]:
-    row: Dict[str, str] = {}
-    if not isinstance(item, dict):
-        return row
-    for key in _PROJECTED_FINDING_KEYS:
-        value = str(item.get(key) or "")
-        if not value:
-            continue
-        row[key] = truncate_review_artifact(
-            str(redact_projection(value).value), _PROJECTED_FINDING_TEXT_CHARS,
-        )
-    if not row:
-        # An unknown finding shape still carries evidence; a silently empty row
-        # would destroy it without a trace.
-        row["item"] = truncate_review_artifact(
-            str(redact_projection(json.dumps(item, ensure_ascii=False, default=str)).value),
-            _PROJECTED_FINDING_TEXT_CHARS,
-        )
-    return row
-
-
 def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
     row = actor if isinstance(actor, dict) else asdict(actor)
     parsed = row.get("parsed") if isinstance(row.get("parsed"), (dict, list)) else None
@@ -402,15 +373,14 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
         # Flat, redacted pointer to the private full response artifact.
         "response_ref": _response_ref_projection(row.get("response_ref")),
     }
-    # Structured finding rows ride only where a parsed response exists: an
-    # absent `findings` key is a hole (transport/parse failure), never the
-    # claim "this reviewer reported zero findings".
+    # Structured rows ride only where a parsed response exists: an absent
+    # `findings` key is a hole, never the claim "zero findings reported".
     if parsed is not None:
         projection.update(disclosed_list_projection(
             parsed_findings,
             key="findings",
             limit=MAX_PROJECTED_ACTOR_FINDINGS,
-            item=_projected_finding_row,
+            item=projected_finding_row,
         ))
     return projection
 

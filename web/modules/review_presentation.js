@@ -1075,11 +1075,9 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
         const request = Promise.resolve()
             .then(() => fetchDetail(taskId))
             .then((detail) => {
-                if (detail === null || detail === undefined) {
-                    // The fetch seam reports transport failure as an empty
-                    // detail; swallowing it here was the silent-error bug.
-                    throw new Error('task detail unavailable');
-                }
+                // A strict fetch seam REJECTS on a failed read; a null detail
+                // means the record is genuinely absent (404) — not an error.
+                if (detail === null || detail === undefined) return false;
                 return applyDetail(taskId, detail);
             })
             .then((applied) => {
@@ -1303,11 +1301,15 @@ export function renderReviewsSection(groupsInput, disclosure = {}) {
     // Section-level hydration truth (typed controller state, no per-attempt
     // FSM): a first load announces itself, a failed refresh names itself and
     // offers Retry instead of silently presenting stale-or-missing detail.
+    // The message rides inside a <span>: the keyed status node is patched in
+    // place across loading↔error, and the DOM patcher syncs text only through
+    // childless-element innerHTML — a bare text node beside the Retry button
+    // would survive the transition stale.
     const hydrateStatus = text(disclosure.hydrateStatus);
     const hydrateHtml = hydrateStatus === 'loading'
-        ? '<div class="skill-review-loading" data-review-hydrate-status role="status" aria-live="polite">Loading review details…</div>'
+        ? '<div class="skill-review-loading" data-review-hydrate-status role="status" aria-live="polite"><span>Loading review details…</span></div>'
         : (hydrateStatus === 'error'
-            ? '<div class="skill-review-error" data-review-hydrate-status>Review details failed to refresh — shown data may be incomplete. <button type="button" class="skill-review-retry" data-review-hydrate-retry>Retry</button></div>'
+            ? '<div class="skill-review-error" data-review-hydrate-status role="alert"><span>Review details failed to refresh — shown data may be incomplete. </span><button type="button" class="skill-review-retry" data-review-hydrate-retry>Retry</button></div>'
             : '');
     return `
         <section class="chat-live-reviews" data-review-section data-expanded="${sectionExpanded ? '1' : '0'}">
@@ -1387,7 +1389,14 @@ export function createReviewPresentationController({
     host?.addEventListener('click', (event) => {
         const hydrateRetry = event.target?.closest?.('[data-review-hydrate-retry]');
         if (hydrateRetry) {
-            onHydrate({ retry: true });
+            // A failed pass never records an applied revision, so a plain
+            // revision-less re-hydrate always re-issues the physical GET.
+            onHydrate();
+            const status = host.querySelector?.('[data-review-hydrate-status]');
+            if (status) {
+                status.setAttribute?.('tabindex', '-1');
+                status.focus?.();
+            }
             onLayout();
             return;
         }
