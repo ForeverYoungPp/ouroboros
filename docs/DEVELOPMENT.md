@@ -1884,7 +1884,10 @@ Before every commit, verify the following:
   Cursor, Agy) plus truthful API/local Main/Light actors. Agy's generated row is
   unpinned `gemini-3.7-flash-high`. Reviewer defaults independently consume only
   ratified Claude/Codex/Cursor policies; Agy-only emits no structured reviewer
-  override, and mixed reviewer bytes must equal the core subset alone. API-only
+  override, and mixed reviewer bytes must equal the core subset alone. On the
+  fresh-install path reviewer slots are `subagent_id` references into the
+  roster the preset ships (unmatched seats mint `review-<harness>` rows);
+  an owner-configured roster is validate-only and its seats stay inline. API-only
   and local-only actor compilation performs zero Claudexor reads. With one session
   and credentials, emit the Light-derived Fast scout and a distinct Main
   Independent perspective when real; never fabricate diversity or build a
