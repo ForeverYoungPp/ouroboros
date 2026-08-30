@@ -81,8 +81,11 @@ def test_isolated_settings_grant_only_the_declared_providers_credentials():
     out = build_isolated_settings(_LIVE, OUROBOROS_RUNTIME_MODE="advanced")
 
     assert out["OPENROUTER_API_KEY"] == "or-value"  # every declared slot routes here
-    assert out["ANTHROPIC_API_KEY"] == "an-value"  # CLAUDE_CODE_MODEL's SDK transport
+    # `anthropic/...` spellings are OpenRouter CATALOG ids: no declared slot routes to the
+    # DIRECT anthropic provider, and the retired Claude-SDK default no longer smuggles its
+    # credential in.
     for never in (
+        "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "OPENAI_COMPATIBLE_API_KEY",
@@ -97,68 +100,37 @@ def test_isolated_settings_grant_only_the_declared_providers_credentials():
         assert owner_secret not in out
 
 
-def test_disabled_claude_transport_does_not_resurrect_anthropic_defaults():
-    """An explicit empty Claude transport in a disabled advisory profile is not a grant.
-
-    The generic planner must keep its historical default-fallback behavior, but a benchmark
-    that has typed the Claude SDK route off needs a truthful provider projection as well as an
-    empty credential value.
-    """
-    out = build_isolated_settings(
-        {
-            "OUROBOROS_MODEL": "openrouter/model",
-            "CLAUDE_CODE_MODEL": "",
-            "CLAUDE_AGENT_SDK_MODEL": "",
-            "OPENROUTER_API_KEY": "or-value",
-            "ANTHROPIC_API_KEY": "an-value",
-        },
-        include_claude_sdk_defaults=False,
-        OUROBOROS_MODEL="openrouter/model",
-        CLAUDE_CODE_MODEL="",
-        CLAUDE_AGENT_SDK_MODEL="",
-    )
+def test_legacy_claude_sdk_settings_are_inert_state():
+    """The Claude-SDK transport is retired: CLAUDE_CODE_MODEL / CLAUDE_AGENT_SDK_MODEL
+    in an accumulated live settings file are stale bytes, never a model slot. They must not
+    declare anthropic, plan its credential, or surface in declared_model_slots — with or
+    without the retired ``include_claude_sdk_defaults`` compatibility switch (kept so old
+    manifests replay; it is a documented no-op)."""
+    live = {
+        "OUROBOROS_MODEL": "openrouter/model",
+        "CLAUDE_CODE_MODEL": "claude-explicit",
+        "CLAUDE_AGENT_SDK_MODEL": "opus",
+        "OPENROUTER_API_KEY": "or-value",
+        "ANTHROPIC_API_KEY": "an-value",
+    }
+    out = build_isolated_settings(live, OUROBOROS_MODEL="openrouter/model")
     assert out["OPENROUTER_API_KEY"] == "or-value"
     assert "ANTHROPIC_API_KEY" not in out
-    grants = isolated_credential_grants(out, include_claude_sdk_defaults=False)
-    assert "openrouter/model" in grants["providers"]["openrouter"]
-    assert "anthropic" not in grants["providers"]
-    assert grants["planned_keys"] == ["OPENROUTER_API_KEY"]
-    assert "CLAUDE_CODE_MODEL" not in grants["declared_model_slots"]
-    assert grants["granted"]["OPENROUTER_API_KEY"]["present"] is True
-    assert grants["granted"]["OPENROUTER_API_KEY"]["fingerprint"].startswith("sha256:")
+    for flag in (True, False):
+        grants = isolated_credential_grants(out, include_claude_sdk_defaults=flag)
+        assert "anthropic" not in grants["providers"]
+        assert grants["planned_keys"] == ["OPENROUTER_API_KEY"]
+        assert not any(key.startswith("CLAUDE_") for key in grants["declared_model_slots"])
 
 
-def test_explicit_claude_transport_still_declares_anthropic_when_opt_out_is_used():
-    """The opt-out suppresses only empty defaults; an explicit Claude route remains visible."""
-    grants = isolated_credential_grants(
-        {
-            "OUROBOROS_MODEL": "openrouter/model",
-            "CLAUDE_CODE_MODEL": "claude-explicit",
-            "ANTHROPIC_API_KEY": "an-value",
-        },
-        include_claude_sdk_defaults=False,
-    )
-    assert grants["providers"]["anthropic"] == ["claude-explicit"]
-    assert "ANTHROPIC_API_KEY" in grants["planned_keys"]
-    assert grants["granted"]["ANTHROPIC_API_KEY"]["present"] is True
-
-
-def test_claude_opt_out_preserves_non_claude_runtime_defaults():
-    """Disabling the SDK must not disable ordinary model-slot fallback semantics."""
-    generic = provider_credential_plan({})
-    opt_out = provider_credential_plan({}, include_claude_sdk_defaults=False)
-    for key, value in generic["declared_model_slots"].items():
-        if not key.startswith("CLAUDE_"):
-            assert opt_out["declared_model_slots"].get(key) == value
-    assert not any(key.startswith("CLAUDE_") for key in opt_out["declared_model_slots"])
-    assert opt_out["fail_open"] is False
-
-
-def test_generic_provider_planner_keeps_claude_default_compatibility():
-    """Callers that do not opt out retain the runtime's legacy Claude default projection."""
-    plan = provider_credential_plan({"OUROBOROS_MODEL": "openrouter/model", "CLAUDE_CODE_MODEL": ""})
-    assert plan["declared_model_slots"]["CLAUDE_CODE_MODEL"] == "claude-sonnet-5"
-    assert "anthropic" in plan["providers"]
+def test_retired_claude_opt_out_switch_is_a_no_op():
+    """Both values of the retired switch produce byte-identical plans, and no
+    CLAUDE_-prefixed slot is ever declared (the slot keys died with the transport)."""
+    for settings in ({}, {"OUROBOROS_MODEL": "openrouter/model", "CLAUDE_CODE_MODEL": ""}):
+        generic = provider_credential_plan(settings)
+        opt_out = provider_credential_plan(settings, include_claude_sdk_defaults=False)
+        assert generic == opt_out
+        assert not any(key.startswith("CLAUDE_") for key in generic["declared_model_slots"])
 
 
 def test_isolated_settings_forward_explicit_context_intent_and_normalize_legacy_state():
@@ -257,7 +229,7 @@ def test_manifest_discloses_granted_credentials_by_fingerprint_never_by_value(tm
 
     disclosure = provider_credential_disclosure(settings_path)
     assert disclosure["available"] is True
-    assert sorted(disclosure["granted"]) == ["ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"]
+    assert sorted(disclosure["granted"]) == ["OPENROUTER_API_KEY"]
     assert disclosure["granted"]["OPENROUTER_API_KEY"]["present"] is True
     assert disclosure["granted"]["OPENROUTER_API_KEY"]["fingerprint"].startswith("sha256:")
     assert disclosure["fail_open"] is False

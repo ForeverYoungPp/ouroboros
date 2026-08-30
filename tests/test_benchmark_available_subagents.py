@@ -120,7 +120,9 @@ def test_pin_single_model_replaces_legacy_heavy_and_prior_actor_list():
         "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
         "USE_LOCAL_CONSCIOUSNESS",
     ))
-    assert target["CLAUDE_CODE_MODEL"] == ""
+    # Retired Claude-SDK setting: stale bytes, not execution authority — the
+    # pin no longer rewrites it (nothing reads it).
+    assert target["CLAUDE_CODE_MODEL"] == "foreign-sdk-model"
     reviewers = parse_reviewer_slots(target[REVIEWER_SLOTS_ENV])
     assert [row.target_id for row in reviewers.triad] == ["openai/gpt-5.5"]
     assert [row.target_id for row in reviewers.scope] == ["openai/gpt-5.5"]
@@ -333,7 +335,7 @@ def test_target_attached_profiles_override_foreign_runtime_defaults(relative, ex
         review_effort=payload["OUROBOROS_EFFORT_REVIEW"],
         scope_effort=payload["OUROBOROS_EFFORT_SCOPE_REVIEW"],
     )
-    assert payload["CLAUDE_CODE_MODEL"] == ""
+    assert "CLAUDE_CODE_MODEL" not in payload  # retired setting: dropped from templates
     assert all(payload[key] is False for key in (
         "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
         "USE_LOCAL_CONSCIOUSNESS",

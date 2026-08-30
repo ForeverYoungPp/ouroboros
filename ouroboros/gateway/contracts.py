@@ -1400,8 +1400,6 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/onboarding",
     "POST /api/onboarding/subagents/preview",
     "POST /api/onboarding/complete",
-    "GET /api/claude-code/status",
-    "POST /api/claude-code/install",
     "GET /api/files/list",
     "GET /api/files/read",
     "GET /api/files/content",

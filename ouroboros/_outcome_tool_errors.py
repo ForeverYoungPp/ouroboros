@@ -20,7 +20,7 @@ _BLOCKING_TOOL_STATUSES = frozenset({
     "artifact_output_error",
     "artifact_output_undeclared",
     "blocked",
-    "claude_code_error",
+    "claude_code_error",  # historical records only (retired Claude-SDK transport)
     "cwd_blocked",
     "data_blocked",
     "edit_ops_blocked",

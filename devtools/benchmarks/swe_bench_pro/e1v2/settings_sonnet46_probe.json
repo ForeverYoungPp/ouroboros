@@ -15,7 +15,6 @@
   "OUROBOROS_MODEL_LIGHT": "anthropic/claude-sonnet-4.6",
   "OUROBOROS_MODEL_FALLBACKS": "anthropic/claude-sonnet-4.6",
   "OUROBOROS_OR_PROVIDER": "resilience",
-  "CLAUDE_CODE_MODEL": "anthropic/claude-sonnet-4.6",
   "OUROBOROS_MAX_WORKERS": 4,
   "TOTAL_BUDGET": 300.0,
   "OUROBOROS_PER_TASK_COST_USD": 15.0,

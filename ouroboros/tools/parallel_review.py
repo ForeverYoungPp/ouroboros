@@ -223,15 +223,21 @@ def _prepare_scope_rows(ctx, commit_message, *, goal, scope, review_rebuttal,
             slot_effort=slot.effort,
             session_target=slot.session_target,
             session_profile=getattr(slot, "session_profile", ""),
+            subagent_id=getattr(slot, "subagent_id", ""),
         )
         rows.append({"slot": slot, "prepared": prepared, "final": final})
-    # Only a LIVE session row (prepared, still to be dispatched) can supply the
-    # verdict the yield leans on: a session row that already terminated at
-    # assembly (final is not None) is a dead seat and must not count.
+    # Only a LIVE retrieving row (prepared, still to be dispatched) can supply
+    # the verdict the yield leans on: one that already terminated at assembly
+    # (final is not None) is a dead seat and must not count. RETRIEVES class:
+    # session rows and configured-subagent api rows both retrieve (Q28-A).
     session_rows = sum(
         1 for row in rows
         if row["final"] is None
-        and str(getattr(row["slot"].route, "value", row["slot"].route) or "") == "agent_session"
+        and bool(getattr(
+            row["slot"], "retrieves",
+            str(getattr(row["slot"].route, "value", row["slot"].route) or "")
+            == "agent_session",
+        ))
     )
     if session_rows >= adaptive_quorum(len(rows)):
         for row in rows:

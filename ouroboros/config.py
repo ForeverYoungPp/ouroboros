@@ -96,7 +96,6 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # real default, unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
     "OUROBOROS_MODEL_FALLBACKS": OPENROUTER_DEFAULTS["fallback"],
     "OUROBOROS_MODEL_DEEP_SELF_REVIEW": OPENROUTER_DEFAULTS["deep_self_review"],
-    "CLAUDE_CODE_MODEL": OPENROUTER_REVIEW_DEFAULTS["advisory"],
     "OUROBOROS_MAX_WORKERS": 10, "OUROBOROS_PRESENCE_MAX_ACTIVE": 2,
     "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT": 6,
     "OUROBOROS_MAX_SUBAGENT_DEPTH": 3,
@@ -207,6 +206,10 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_ONBOARDING_COMPLETED_AT": "",
     # Pre-commit review enforcement: advisory | blocking
     "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
+    # Native tool-round reviewer episode caps (review_native_episode.py owns
+    # the getters); both fail CLOSED — typed refusal, never compaction/resume.
+    "OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS": "16",
+    "OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS": "900000",
     # Auto-grant reviewed-skill requests by default; grants stay bound to the
     # reviewed content hash and editing a skill still invalidates them.
     "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS": "true",
@@ -869,12 +872,7 @@ def get_search_code_wall_sec() -> float:
     """Total wall-clock budget (seconds) for ONE search_code call — bounds both the rg
     directory walk and the batched rg loop so a scan over a very large root cannot run
     unbounded. Env/setting: ``OUROBOROS_SEARCH_CODE_WALL_SEC`` (floored at 5s)."""
-    raw = (os.environ.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "")
-           or str(SETTINGS_DEFAULTS.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "45")))
-    try:
-        return max(5.0, float(raw))
-    except (TypeError, ValueError):
-        return 45.0
+    return _clamped_number_setting("OUROBOROS_SEARCH_CODE_WALL_SEC", low=5.0)
 
 
 def get_deliverables_root() -> str:

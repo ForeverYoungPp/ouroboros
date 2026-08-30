@@ -8,7 +8,6 @@
   "OUROBOROS_MODEL_FALLBACKS": "deepseek/deepseek-v4-flash-0731",
   "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "deepseek/deepseek-v4-flash-0731",
   "OUROBOROS_WEBSEARCH_MODEL": "deepseek/deepseek-v4-flash-0731",
-  "CLAUDE_CODE_MODEL": "",
   "OUROBOROS_REVIEW_MODELS": "deepseek/deepseek-v4-flash-0731",
   "OUROBOROS_SCOPE_REVIEW_MODELS": "deepseek/deepseek-v4-flash-0731",
   "OUROBOROS_SCOPE_REVIEW_MODEL": "deepseek/deepseek-v4-flash-0731",

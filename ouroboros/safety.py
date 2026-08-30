@@ -138,7 +138,8 @@ TOOL_POLICY: Dict[str, str] = {
     "forward_to_worker": POLICY_SKIP,
     "compact_context": POLICY_SKIP,
     "enable_tools": POLICY_SKIP,
-    "advisory_review": POLICY_SKIP,
+    "preflight_review": POLICY_SKIP,
+    "advisory_review": POLICY_SKIP,  # compat alias of preflight_review
     "start_service": POLICY_CHECK_CONDITIONAL,
     "stop_service": POLICY_SKIP,
 

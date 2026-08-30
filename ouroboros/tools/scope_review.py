@@ -980,7 +980,7 @@ def _call_scope_llm(
     session_root: str = "",
     slot_effort: str = "",
     session_target: str = "",
-    session_profile: str = "", retry_key: str = "",
+    session_profile: str = "", retry_key: str = "", subagent_id: str = "",
 ) -> tuple:
     """Execute the scope review call synchronously — api pack or agent session.
 
@@ -1001,12 +1001,13 @@ def _call_scope_llm(
     # 6.1/6.3: the row's own effort wins; the global key stays the default.
     scope_effort = slot_effort or _resolve_effort("scope_review")
     delegated = str(getattr(route, "value", route) or "") == "agent_session"
+    retrieves = delegated or bool(subagent_id)  # RETRIEVES class: no pack
     # Output budget scales with the reviewer window: requesting the absolute
     # 100K reserve on a small-window model would 400 on input+max_tokens.
     _scope_output_tokens, _ = _window_scaled_reserves(
         _scope_window(scope_model).sizing_window(_SCOPE_FAILCLOSED_WINDOW)
     )
-    if delegated:
+    if retrieves:
         messages: Any = []
     else:
         # Split at the recorded stable/dynamic boundary: the byte-stable prefix
@@ -1041,8 +1042,8 @@ def _call_scope_llm(
             max_tokens=_scope_output_tokens,
             temperature=0.2,
             no_proxy=True,
-            session_task=session_task if delegated else "",
-            session_root=session_root if delegated else "",
+            session_task=session_task if retrieves else "",
+            session_root=session_root if retrieves else "",
             reconcile_only=bool(getattr(ctx, "_review_reconcile_only", False)),
             # The extraction fallback canonicalizes to the SCOPE contract: required-
             # matrix shape, eight verbatim item ids (D19 — never a looser contract).
@@ -1054,7 +1055,7 @@ def _call_scope_llm(
                         + ", ".join(sorted(SCOPE_REQUIRED_ITEMS))
                     ),
                 }
-                if delegated
+                if retrieves
                 else {}
             ),
         )
@@ -1069,7 +1070,7 @@ def _call_scope_llm(
             route=ReviewRouteKind.AGENT_SESSION if delegated else ReviewRouteKind.API_CHAT,
             # Empty keeps the shared session-route fallback.
             session_target=session_target if delegated else "",
-            session_profile=session_profile if delegated else "",
+            session_profile=session_profile if delegated else "", subagent_id=str(subagent_id or ""),
         )
         result = run_review_request(
             request,
@@ -1300,7 +1301,7 @@ def _apply_scope_authority(
     *,
     scope_model_id: str,
     result_kwargs: dict,
-    delegated: bool = False,
+    delegated: bool = False, native_retrieval: bool = False,
 ) -> tuple[List[dict], List[dict], Optional[ScopeReviewResult]]:
     """One-pass P3 authority for THIS row's delivery: is the reviewer's window ESTABLISHED
     enough for its verdict to gate a commit? ``api_chat`` must fit the whole assembled pack
@@ -1325,7 +1326,8 @@ def _apply_scope_authority(
     ``session_route_resolves_its_own_model`` — which is where a landing below the ask
     belongs, not in the window predicate."""
     resolved = _scope_window(scope_model_id, session=delegated)
-    if delegated:
+    if delegated or native_retrieval:
+        # Native actor rows = the same retrieving class (P3 alternate mode, sourced >=200K floor).
         from ouroboros.tools.scope_review_session import session_scope_authority
 
         # EVIDENCE, never the sizing fallback: the session floor is gated on SOURCED
@@ -1336,8 +1338,7 @@ def _apply_scope_authority(
             critical_findings, advisory_findings, scope_model=scope_model_id,
             window=int(resolved.window_tokens or 0),
             provenance="" if resolved.stale else str(resolved.status or ""),
-            result_kwargs=result_kwargs,
-            phrase=_window_provenance_phrase(
+            result_kwargs=result_kwargs, phrase=_window_provenance_phrase(
                 resolved.sizing_window(_SCOPE_FAILCLOSED_WINDOW),
                 _scope_window_provenance(resolved), resolved.observed_at),
         )
@@ -1382,8 +1383,8 @@ def run_scope_review(
     route: Any = None,  # the row's configured delivery (ReviewRouteKind); None/api_chat = api
     slot_effort: str = "",  # the row's own effort (6.1); "" = global scope_review effort
     session_target: str = "",  # the row's own harness[=model] target; "" = shared route
-    session_profile: str = "",  # optional credential pin (Q2-в); "" = rotation
-    prepared: Optional[dict] = None, retry_key: str = "",  # assembled packet + immutable cycle identity
+    session_profile: str = "",  # credential pin (Q2-в); "" = rotation
+    subagent_id: str = "",  prepared: Optional[dict] = None, retry_key: str = "",  # assembled packet + immutable cycle identity
 ) -> ScopeReviewResult:
     """Run blocking scope review from a prepared packet or a direct call."""
     if prepared is None:
@@ -1394,7 +1395,7 @@ def run_scope_review(
             review_rebuttal=review_rebuttal, review_history=review_history,
             scope_review_history=scope_review_history, scope_model=scope_model,
             slot_id=slot_id, route=route, slot_effort=slot_effort,
-            session_target=session_target, session_profile=session_profile,
+            session_target=session_target, session_profile=session_profile, subagent_id=subagent_id,
         )
         if final is not None:
             return final
@@ -1403,10 +1404,9 @@ def run_scope_review(
     prompt, session_task = prepared["prompt"], prepared["session_task"]
     repo_dir, scope_model_id = prepared["repo_dir"], prepared["scope_model_id"]
     slot_id, route = prepared["slot_id"], prepared["route"]
-    slot_effort = prepared["slot_effort"]
-    session_target = prepared["session_target"]
-    session_profile = prepared["session_profile"]
-    delegated = bool(prepared["delegated"])
+    slot_effort, session_target = prepared["slot_effort"], prepared["session_target"]
+    session_profile, delegated = prepared["session_profile"], bool(prepared["delegated"])
+    subagent_id = str(prepared.get("subagent_id") or "")
 
     _prompt_chars = len(prompt)  # type: ignore[arg-type]
     _prompt_tokens_est = estimate_tokens(prompt)  # type: ignore[arg-type]
@@ -1414,7 +1414,7 @@ def run_scope_review(
         prompt, scope_model=scope_model_id, ctx=ctx, slot_id=slot_id,
         route=route, session_task=session_task, session_root=str(repo_dir),
         slot_effort=slot_effort, session_target=session_target,
-        session_profile=session_profile, retry_key=retry_key,
+        session_profile=session_profile, retry_key=retry_key, subagent_id=subagent_id,
     )  # type: ignore[arg-type]
     _usage = dict(usage or {})
     _review_refs = dict(_usage.pop("_review_refs", {}) or {})
@@ -1563,7 +1563,7 @@ def run_scope_review(
     critical_findings, advisory_findings, authority_block = _apply_scope_authority(
         critical_findings, advisory_findings, scope_model_id=scope_model_id,
         result_kwargs=result_kwargs, delegated=delegated,
-    )
+        native_retrieval=bool(subagent_id) and not delegated)
     if authority_block is not None:
         return authority_block
     _log_scope_result(

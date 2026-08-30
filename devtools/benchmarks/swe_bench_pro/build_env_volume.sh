@@ -104,7 +104,7 @@ echo "[build-env] verifying core runtime deps import in the env"
 docker run --rm -v "$VOLUME:$PREFIX:ro" --platform "$PLATFORM" --entrypoint "$PREFIX/bin/python" \
   "$BASE_IMAGE" -c '
 import importlib.util, sys
-mods = ["httpx","starlette","uvicorn","websockets","openai","yaml","dulwich","PIL","huggingface_hub","claude_agent_sdk"]
+mods = ["httpx","starlette","uvicorn","websockets","openai","yaml","dulwich","PIL","huggingface_hub"]
 optional = ["tree_sitter","tree_sitter_language_pack","mcp","playwright"]
 missing=[m for m in mods if importlib.util.find_spec(m) is None]
 opt_missing=[m for m in optional if importlib.util.find_spec(m) is None]

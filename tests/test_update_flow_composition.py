@@ -944,11 +944,16 @@ def test_ctx_proof_survives_the_advisory_to_commit_boundary(tmp_path, monkeypatc
     # The advisory-side site records through the shared process-held helper...
     tree = update_merge.record_managed_tests_proof(ctx)
     assert tree and tree in ctx._managed_tests_proof_trees
+    # Both gates run their pytest preflight through the commit-admission SSOT,
+    # whose helper owns the green-run -> proof binding (Q3=A extraction).
     for site_src in (
         inspect.getsource(adv_mod._advisory_pre_sdk_gate),
         inspect.getsource(git_mod._advisory_and_tests_gate),
     ):
-        assert "record_managed_tests_proof(ctx)" in site_src
+        assert "run_tests_preflight_with_proof" in site_src
+    from ouroboros.commit_admission import run_tests_preflight_with_proof
+    assert "record_managed_tests_proof(ctx)" in inspect.getsource(
+        run_tests_preflight_with_proof)
 
     # ...and the commit-side consumers see it on the SAME ctx.
     assert git_mod._managed_candidate_needs_proof(ctx) is False

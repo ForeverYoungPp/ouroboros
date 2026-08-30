@@ -4,6 +4,12 @@
 // not — D-10 moved these rows out of the Models tab and renamed them).
 //
 // Shape rules are the owner's:
+//  * Each row first picks its SOURCE (decision 5A): «Direct model» — an inline
+//    route the row owns — or «Configured subagent», a reference to one
+//    OUROBOROS_SUBAGENTS roster row. A referenced row's route/model/effort/
+//    account are shown as READ-ONLY derived facts (the roster stays their
+//    SSOT); the stored forms are mutually exclusive:
+//    {slot_id, route, effort} XOR {slot_id, subagent_id, effort}.
 //  * The ROUTE select carries routes only: "API model" plus one entry per
 //    login-capable harness — never the full flat model catalog (hundreds of
 //    options made the list unusable, finding #6).
@@ -24,10 +30,19 @@ import { bindStatusSurface, boundedStatusRefresh, claudexorStatus } from './clau
 import { harnessIdentityMarkup } from './harness_presentation.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import * as routeEditor from './route_editor_primitives.js';
+import {
+    availableSubagentsLoadValue,
+    parseAvailableSubagentsSetting,
+} from './subagents_settings.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
 export const ROUTE_KIND_API = 'api_chat';
 export const ROUTE_KIND_SESSION = routeEditor.ROUTE_KIND_AGENT_SESSION;
+
+// Per-row source choice (decision 5A): an inline route the row owns, or a
+// reference to a configured OUROBOROS_SUBAGENTS roster row.
+export const ROW_SOURCE_DIRECT = 'direct';
+export const ROW_SOURCE_SUBAGENT = 'subagent';
 // The route select's single API entry. The target model id never lives in
 // the select — display always matches the stored target (finding #6c: a
 // fresh row used to DISPLAY the first catalog model while storing '').
@@ -74,8 +89,8 @@ export function splitSessionTarget(target) {
 // owner's saved value is almost certainly still there. The two facets are
 // INDEPENDENT: a failed account read must not silence the catalog's own honest
 // verdict.
-export function routeChoiceGroups({ harnesses = [], currentChoice = '', catalogKnown = true } = {}) {
-    return routeEditor.routeChoiceGroups({ harnesses, currentChoice, catalogKnown });
+export function routeChoiceGroups({ harnesses = [], currentChoice = '', catalogKnown = true, apiLabel } = {}) {
+    return routeEditor.routeChoiceGroups({ harnesses, currentChoice, catalogKnown, apiLabel });
 }
 
 export function indexProfilesByHarness(payload) {
@@ -91,6 +106,18 @@ function profileEntry(entry) {
 
 export function buildReviewerSlotsSetting(state) {
     const rowOut = (row) => {
+        // The two stored forms are mutually exclusive: a configured-subagent
+        // reference never duplicates route knobs (the roster row is their
+        // SSOT), and an empty explicit effort is OMITTED so the roster row's
+        // own effort keeps deciding.
+        if (row.subagent_id) {
+            const out = {
+                slot_id: String(row.slot_id || ''),
+                subagent_id: String(row.subagent_id),
+            };
+            if (row.effort) out.effort = String(row.effort);
+            return out;
+        }
         const out = {
             slot_id: String(row.slot_id || ''),
             route: routeEditor.serializeRouteSpec(row.route, {
@@ -102,21 +129,94 @@ export function buildReviewerSlotsSetting(state) {
         return out;
     };
     const advisory = state.advisory || {};
-    const advisoryOut = {
-        enabled: advisory.enabled !== false,
-        route: { kind: advisory.route?.kind === ROUTE_KIND_SESSION ? ROUTE_KIND_SESSION : 'api',
-                 target_id: String(advisory.route?.target_id || '') },
-        effort: advisory.route?.kind === ROUTE_KIND_SESSION
-            ? String(advisory.effort || '') : (advisory.effort || 'low'),
-    };
-    if (advisoryOut.route.kind === ROUTE_KIND_SESSION && advisory.route?.profile_id) {
-        advisoryOut.route.profile_id = String(advisory.route.profile_id);
+    let advisoryOut;
+    if (advisory.subagent_id) {
+        advisoryOut = {
+            enabled: advisory.enabled !== false,
+            subagent_id: String(advisory.subagent_id),
+        };
+        if (advisory.effort) advisoryOut.effort = String(advisory.effort);
+    } else {
+        // The advisory row is on the SHARED closed route vocabulary now:
+        // api_chat (routed catalog model, bounded native inspection episode)
+        // or agent_session. The retired legacy kind 'api' (Claude-SDK
+        // spellings) still parses server-side but is never WRITTEN again.
+        advisoryOut = {
+            enabled: advisory.enabled !== false,
+            route: { kind: advisory.route?.kind === ROUTE_KIND_SESSION ? ROUTE_KIND_SESSION : ROUTE_KIND_API,
+                     target_id: String(advisory.route?.target_id || '') },
+            effort: advisory.route?.kind === ROUTE_KIND_SESSION
+                ? String(advisory.effort || '') : (advisory.effort || 'low'),
+        };
+        if (advisoryOut.route.kind === ROUTE_KIND_SESSION && advisory.route?.profile_id) {
+            advisoryOut.route.profile_id = String(advisory.route.profile_id);
+        }
     }
     return JSON.stringify({
         triad: (state.triad || []).map(rowOut),
         scope: (state.scope || []).map(rowOut),
         advisory: advisoryOut,
     });
+}
+
+// ---------------------------------------------------------------------------
+// Configured-subagent references (decision 5A). The roster list reuses the
+// Available-subagents data source: settings.js hands the loaded settings
+// document to adoptSubagentRoster below, parsed by the SAME parser that
+// section uses — never a second schema.
+// ---------------------------------------------------------------------------
+
+export function rowSource(row) {
+    return row?.subagent_id ? ROW_SOURCE_SUBAGENT : ROW_SOURCE_DIRECT;
+}
+
+export function subagentOptionsFor(roster, savedId, { rosterKnown = true } = {}) {
+    // Same survive-the-save rule as profileOptionsFor: the select's value must
+    // EXIST as an option, or the browser silently redraws the row as the first
+    // roster entry and the next Save really rewires the reviewer. And the
+    // absence claim follows provenance: only a roster that was actually READ
+    // may say a saved reference is not in it.
+    const options = (roster || []).map((row) => {
+        const use = String(row.recommended_use || '').trim();
+        const hint = use.length > 60 ? `${use.slice(0, 57)}…` : use;
+        return {
+            value: String(row.subagent_id || ''),
+            label: `${row.name || row.subagent_id}${hint ? ` — ${hint}` : ''}`,
+        };
+    });
+    const saved = String(savedId || '');
+    if (saved && !options.some((option) => option.value === saved)) {
+        options.push({
+            value: saved,
+            label: `${saved} (${rosterKnown ? 'not in the roster' : 'not checked'})`,
+        });
+    }
+    return options;
+}
+
+export function describeSubagentReference(subagentId, roster, { rosterKnown = true } = {}) {
+    // The DERIVED facts, disclosed read-only (never editable knobs): the
+    // roster row is the SSOT for a referenced reviewer's route/model/effort/
+    // account, so this line only reports what that row says.
+    const row = (roster || []).find(
+        (item) => String(item.subagent_id || '') === String(subagentId || ''));
+    if (!row) {
+        return rosterKnown
+            ? 'Configured subagent — no roster row with this ID exists; the saved reference is kept and the review will refuse rather than reroute'
+            : 'Configured subagent — the roster could not be read, so its route is not shown; the saved reference is unchanged';
+    }
+    const route = row.route || {};
+    const parts = [];
+    if (route.kind === ROUTE_KIND_SESSION) {
+        const split = splitSessionTarget(route.target_id);
+        parts.push(split.harness ? `${split.harness} session` : 'agent session');
+        if (split.model) parts.push(split.model);
+        if (route.credential_profile_id) parts.push(`account ${route.credential_profile_id}`);
+    } else {
+        parts.push(route.target_id ? `API model ${route.target_id}` : 'API model (unset)');
+    }
+    if (row.effort) parts.push(`effort ${row.effort}`);
+    return `Runs as ${parts.join(' · ')} — from its roster row under Available subagents`;
 }
 
 export function describeLastExecution(entry) {
@@ -214,6 +314,9 @@ export function pinnedAccountWarning({ triad = [], scope = [], advisory = null,
     const missing = [];
     const rows = [...triad, ...scope, ...(advisory ? [{ ...advisory, slot_id: 'advisory' }] : [])];
     for (const row of rows) {
+        // A configured-subagent reference carries no pin of its own — the
+        // roster row is that route's SSOT, checked on its own surface.
+        if (row?.subagent_id) continue;
         const route = row?.route || {};
         if (route.kind !== ROUTE_KIND_SESSION) continue;
         const pin = String(route.profile_id || '');
@@ -252,7 +355,7 @@ export function advisoryRouteTransition(prev, decoded, memory = {}) {
     // route it held; a kind the user returns to is restored, and the stored
     // route only changes when the user actually picks something else.
     const current = (prev && typeof prev === 'object' && prev.kind)
-        ? prev : { kind: 'api', target_id: '' };
+        ? prev : { kind: ROUTE_KIND_API, target_id: '' };
     const next = { ...memory };
     if (decoded.kind === ROUTE_KIND_SESSION) {
         const prevHarness = current.kind === ROUTE_KIND_SESSION
@@ -269,7 +372,7 @@ export function advisoryRouteTransition(prev, decoded, memory = {}) {
     if (current.kind !== ROUTE_KIND_SESSION) return { route: current, memory: next };
     next.session = { ...current };
     return {
-        route: next.api ? { ...next.api } : { kind: 'api', target_id: '' },
+        route: next.api ? { ...next.api } : { kind: ROUTE_KIND_API, target_id: '' },
         memory: next,
     };
 }
@@ -285,12 +388,18 @@ const state = {
     source: '',
     triad: [],
     scope: [],
-    advisory: { enabled: true, route: { kind: 'api', target_id: '' }, effort: 'low' },
+    advisory: { enabled: true, route: { kind: ROUTE_KIND_API, target_id: '' }, effort: 'low', subagent_id: '' },
     limits: { triad: 10, scope: 4, advisory: 1 },
     lastExecutions: {},
     catalogModels: [],
     harnesses: [],
     profilesByHarness: {},
+    // The configured-subagent roster (OUROBOROS_SUBAGENTS items) the reference
+    // selects offer. Display-only here; the Available-subagents section owns
+    // editing. rosterKnown follows the same provenance rule as the facets: an
+    // unreadable roster licenses no absence claim about a saved reference.
+    roster: [],
+    rosterKnown: false,
     // PER-FACET provenance: the route/model lists come from the CATALOG facet,
     // the account pins from the ACCOUNTS facet, and one can be authoritative
     // while the other was never read. Only an `ok` facet may license a row-level
@@ -312,8 +421,9 @@ export function renderReviewerSlotsSection() {
             <h3>Review lanes</h3>
             <div class="settings-section-copy">
                 Who reviews each commit: the triad rows, the scope rows, and one optional advisory
-                pre-reviewer. Each row picks its delivery — an API model, or an agent on your
-                subscription — plus its own reasoning effort.
+                pre-reviewer. Each row runs a direct model — an API model, or an agent on your
+                subscription — or references one of your configured subagents, plus its own
+                reasoning effort.
             </div>
             <div class="settings-inline-note">
                 Rows routed to a subscription never fall back to API spend: if every eligible window
@@ -382,8 +492,64 @@ export function reviewerRouteIdentityMarkup(route, harnesses = {}, {
     });
 }
 
+function sourceSelectHtml(attrs, row) {
+    // The top-level per-row source choice (decision 5A). «Configured
+    // subagent» is offered only when the roster has rows to reference — or
+    // when the SAVED row already references one, which must stay displayable
+    // either way.
+    return selectHtml(attrs, [{
+        label: '',
+        options: [
+            { value: ROW_SOURCE_DIRECT, label: 'Direct model' },
+            {
+                value: ROW_SOURCE_SUBAGENT,
+                label: 'Configured subagent',
+                disabled: !state.roster.length && !row.subagent_id,
+            },
+        ],
+    }], rowSource(row));
+}
+
+function subagentControlsHtml(row, dataPrefix) {
+    // The reference branch: roster select + effort. The derived route/model/
+    // account/effort are DISCLOSED in the meta line, never editable here.
+    const options = subagentOptionsFor(state.roster, row.subagent_id, { rosterKnown: state.rosterKnown });
+    return `
+        ${selectHtml(`${dataPrefix}-subagent aria-label="Configured subagent"`, [{ label: '', options }], String(row.subagent_id || ''))}
+        ${effortSelectHtml(`${dataPrefix}-effort aria-label="Reasoning effort"`, row.effort || '', 'subagent default')}
+    `;
+}
+
+function subagentIdentityMarkup(row) {
+    // Identity follows the DERIVED roster route: a session reference shows its
+    // harness, anything else the API channel — same shared markup direct rows use.
+    const rosterRow = (state.roster || []).find(
+        (item) => String(item.subagent_id || '') === String(row.subagent_id || ''));
+    const route = rosterRow?.route?.kind === ROUTE_KIND_SESSION
+        ? { kind: ROUTE_KIND_SESSION, target_id: rosterRow.route.target_id }
+        : { kind: ROUTE_KIND_API, target_id: '' };
+    return reviewerRouteIdentityMarkup(route, harnessesById(), { catalogKnown: state.catalogKnown });
+}
+
 function rowHtml(row, group) {
     const { catalogKnown, accountsKnown } = state;
+    if (row.subagent_id) {
+        const last = state.lastExecutions[row.slot_id];
+        const lastText = last ? describeLastExecution(last) : '';
+        const metaParts = [describeSubagentReference(row.subagent_id, state.roster, { rosterKnown: state.rosterKnown })];
+        if (lastText) metaParts.push(`Last run: ${lastText}`);
+        return `
+        <div class="reviewer-slot-row" data-slot-group="${group}" data-slot-id="${escapeHtml(row.slot_id)}">
+            ${subagentIdentityMarkup(row)}
+            <div class="reviewer-slot-controls">
+                ${sourceSelectHtml('data-slot-source aria-label="Reviewer source"', row)}
+                ${subagentControlsHtml(row, 'data-slot')}
+                <button type="button" class="btn btn-default" data-slot-remove title="Remove this slot">Remove</button>
+            </div>
+            <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
+        </div>
+    `;
+    }
     const choice = encodeRouteChoice(row);
     const groups = routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice, catalogKnown });
     const session = row.route.kind === ROUTE_KIND_SESSION;
@@ -406,6 +572,7 @@ function rowHtml(row, group) {
         <div class="reviewer-slot-row" data-slot-group="${group}" data-slot-id="${escapeHtml(row.slot_id)}">
             ${reviewerRouteIdentityMarkup(row.route, harnessesById(), { catalogKnown })}
             <div class="reviewer-slot-controls">
+                ${sourceSelectHtml('data-slot-source aria-label="Reviewer source"', row)}
                 ${selectHtml(`data-slot-route aria-label="Reviewer route"`, groups, choice)}
                 ${session ? '' : `<input data-slot-custom-api list="reviewer-api-model-catalog" placeholder="provider/model-id" value="${escapeHtml(row.route.target_id || '')}" spellcheck="false" aria-label="API model id">`}
                 ${session ? selectHtml('data-slot-model aria-label="Harness model"', [{ label: '', options: modelOptions }], split.model) : ''}
@@ -421,32 +588,47 @@ function rowHtml(row, group) {
 function advisoryHtml() {
     const advisory = state.advisory;
     const { catalogKnown, accountsKnown } = state;
-    // TRAP: the advisory state carries kind='api' while ROUTE_KIND_API is
-    // 'api_chat', so every branch here tests `!== ROUTE_KIND_SESSION` — a
-    // naive `=== ROUTE_KIND_API` silently never matches.
+    const last = state.lastExecutions.advisory_slot_1;
+    const lastText = last ? describeLastExecution(last) : '';
+    if (advisory.subagent_id) {
+        const metaParts = [describeSubagentReference(advisory.subagent_id, state.roster, { rosterKnown: state.rosterKnown })];
+        if (lastText) metaParts.push(`Last run: ${lastText}`);
+        return `
+        <div class="reviewer-slot-row" data-advisory-row>
+            ${subagentIdentityMarkup(advisory)}
+            <div class="reviewer-slot-controls">
+                <label class="local-toggle"><input type="checkbox" data-advisory-enabled ${advisory.enabled !== false ? 'checked' : ''}> Enabled</label>
+                ${sourceSelectHtml('data-advisory-source aria-label="Advisory source"', advisory)}
+                ${subagentControlsHtml(advisory, 'data-advisory')}
+            </div>
+            <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
+        </div>
+    `;
+    }
+    // The advisory row shares the closed route vocabulary (api_chat |
+    // agent_session): its api_chat entry is a routed catalog model running a
+    // bounded native inspection episode — labeled neutrally, never a vendor
+    // name (the retired Claude-SDK 'api' kind is parse-only migration now).
     const session = advisory.route?.kind === ROUTE_KIND_SESSION;
     const split = session ? splitSessionTarget(advisory.route.target_id)
         : { harness: '', model: '' };
     const choice = session ? `session:${split.harness}` : API_ROUTE_CHOICE;
-    // Both optgroups are labeled (finding #7): an unlabeled first group made
-    // the API entry read as stray next to the labeled subscriptions group.
-    const groups = [
-        { label: 'API', options: [{ value: API_ROUTE_CHOICE, label: 'Claude (Anthropic API key)' }] },
-        ...routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice, catalogKnown }).slice(1),
-    ];
+    const groups = routeChoiceGroups({
+        harnesses: state.harnesses,
+        currentChoice: choice,
+        catalogKnown,
+        apiLabel: 'Direct model (inspection episode)',
+    });
     // Session branch: the SAME model-options fragment the triad rows use —
     // rewriting it here would lose the "(not in discovery)" guard and let a
-    // Save with the daemon down erase the owner's model. Api branch: free-text
-    // WITHOUT the catalog datalist — the advisory api route is the Claude
-    // Agent SDK, whose model spellings (sonnet, opus[1m], claude-…) are not
-    // the OpenRouter catalog ids the datalist suggests.
+    // Save with the daemon down erase the owner's model. Api branch: the same
+    // catalog-assisted free-text entry the triad rows use (the advisory
+    // api_chat target IS a routed catalog model id now).
     const modelOptions = session
         ? sessionModelOptions(harnessesById()[split.harness], split.model, { catalogKnown }) : [];
     const profiles = session ? (state.profilesByHarness[split.harness] || []) : [];
     const profileOptions = session
         ? profileOptionsFor(profiles, advisory.route?.profile_id, { accountsKnown }) : [];
-    const last = state.lastExecutions.advisory_slot_1;
-    const lastText = last ? describeLastExecution(last) : '';
     const metaParts = [capabilityBadge({ route: advisory.route || {} }, harnessesById(), { catalogKnown })];
     const modelsGap = session ? modelsGapNote(harnessesById()[split.harness], catalogKnown) : '';
     if (modelsGap) metaParts.push(modelsGap);
@@ -456,10 +638,11 @@ function advisoryHtml() {
             ${reviewerRouteIdentityMarkup(advisory.route, harnessesById(), { catalogKnown })}
             <div class="reviewer-slot-controls">
                 <label class="local-toggle"><input type="checkbox" data-advisory-enabled ${advisory.enabled !== false ? 'checked' : ''}> Enabled</label>
+                ${sourceSelectHtml('data-advisory-source aria-label="Advisory source"', advisory)}
                 ${selectHtml('data-advisory-route aria-label="Advisory route"', groups, choice)}
                 ${session
                     ? selectHtml('data-advisory-model aria-label="Advisory harness model"', [{ label: '', options: modelOptions }], split.model)
-                    : `<input data-advisory-api-model placeholder="Claude model — empty = default" value="${escapeHtml(advisory.route?.target_id || '')}" spellcheck="false" aria-label="Advisory Claude model">`}
+                    : `<input data-advisory-api-model list="reviewer-api-model-catalog" placeholder="provider/model-id — empty = default" value="${escapeHtml(advisory.route?.target_id || '')}" spellcheck="false" aria-label="Advisory model id">`}
                 ${session && profileOptions.length > 1 ? selectHtml('data-advisory-profile aria-label="Advisory credential account"', [{ label: '', options: profileOptions }], advisory.route?.profile_id || '') : ''}
                 ${effortSelectHtml(
                     'data-advisory-effort aria-label="Advisory effort"',
@@ -532,6 +715,25 @@ function bindRowEvents() {
         const group = rowEl.dataset.slotGroup;
         const row = findRow(group, rowEl.dataset.slotId);
         if (!row) return;
+        rowEl.querySelector('[data-slot-source]')?.addEventListener('change', (event) => {
+            if (event.target.value === ROW_SOURCE_SUBAGENT) {
+                // The select must display what the row stores (finding #6c),
+                // so the first roster row becomes the visible draft pick. The
+                // inline route is kept as a stash — flipping back restores it.
+                row.subagent_id = row.subagent_id
+                    || String(state.roster[0]?.subagent_id || '');
+            } else {
+                row.subagent_id = '';
+                if (!row.route?.kind) row.route = { kind: ROUTE_KIND_API, target_id: '' };
+            }
+            renderRows();
+            state.onChange();
+        });
+        rowEl.querySelector('[data-slot-subagent]')?.addEventListener('change', (event) => {
+            row.subagent_id = String(event.target.value || '');
+            renderRows();
+            state.onChange();
+        });
         rowEl.querySelector('[data-slot-route]')?.addEventListener('change', (event) => {
             const decoded = decodeRouteChoice(event.target.value);
             if (decoded.kind === ROUTE_KIND_SESSION) {
@@ -579,6 +781,30 @@ function bindRowEvents() {
             state.advisory.enabled = Boolean(event.target.checked);
             state.onChange();
         });
+        advisoryEl.querySelector('[data-advisory-source]')?.addEventListener('change', (event) => {
+            if (event.target.value === ROW_SOURCE_SUBAGENT) {
+                state.advisory.subagent_id = state.advisory.subagent_id
+                    || String(state.roster[0]?.subagent_id || '');
+                // '' effort = the roster row's own effort decides; the api
+                // default 'low' must not silently override the reference.
+                state.advisory.effort = '';
+            } else {
+                state.advisory.subagent_id = '';
+                if (!state.advisory.route?.kind) {
+                    state.advisory.route = { kind: ROUTE_KIND_API, target_id: '' };
+                }
+                if (state.advisory.route.kind !== ROUTE_KIND_SESSION && !state.advisory.effort) {
+                    state.advisory.effort = 'low';
+                }
+            }
+            renderRows();
+            state.onChange();
+        });
+        advisoryEl.querySelector('[data-advisory-subagent]')?.addEventListener('change', (event) => {
+            state.advisory.subagent_id = String(event.target.value || '');
+            renderRows();
+            state.onChange();
+        });
         advisoryEl.querySelector('[data-advisory-route]')?.addEventListener('change', (event) => {
             const result = advisoryRouteTransition(
                 state.advisory.route, decodeRouteChoice(event.target.value), advisoryRouteMemory);
@@ -605,8 +831,11 @@ function bindRowEvents() {
         });
         advisoryEl.querySelector('[data-advisory-effort]')?.addEventListener('change', (event) => {
             const selected = String(event.target.value || '');
+            // Empty means "the surface's default": low on the api route, the
+            // route/roster-row default on a session or subagent reference.
             state.advisory.effort = selected
-                || (state.advisory.route?.kind === ROUTE_KIND_SESSION ? '' : 'low');
+                || (state.advisory.subagent_id || state.advisory.route?.kind === ROUTE_KIND_SESSION
+                    ? '' : 'low');
             state.onChange();
         });
     }
@@ -620,6 +849,7 @@ function addRow(group) {
     rows.push({
         slot_id: mintSlotId(group === 'scope' ? 'scope' : 'triad', taken),
         route: { kind: ROUTE_KIND_API, target_id: '' },
+        subagent_id: '',
         effort: '',
     });
     renderRows();
@@ -636,11 +866,18 @@ export async function reloadReviewerSlots() {
         state.source = String(data.source || '');
         state.limits = data.limits || state.limits;
         state.lastExecutions = data.last_executions || {};
-        state.triad = Array.isArray(data.triad) ? data.triad.map((row) => ({ ...row })) : [];
-        state.scope = Array.isArray(data.scope) ? data.scope.map((row) => ({ ...row })) : [];
-        state.advisory = data.advisory
-            ? { ...data.advisory, route: { ...(data.advisory.route || {}) } }
-            : state.advisory;
+        // Rows spread as-is so a subagent_id reference rides along; a direct
+        // route gets its own object. The advisory's non-session kind is
+        // normalized to the shared api_chat spelling here — the retired legacy
+        // 'api' (Claude-SDK) kind is parse-only server-side and this UI never
+        // writes it again.
+        const rowIn = (row) => ({ ...row, route: { ...(row.route || {}) } });
+        state.triad = Array.isArray(data.triad) ? data.triad.map(rowIn) : [];
+        state.scope = Array.isArray(data.scope) ? data.scope.map(rowIn) : [];
+        state.advisory = data.advisory ? rowIn(data.advisory) : state.advisory;
+        if (state.advisory.route?.kind !== ROUTE_KIND_SESSION) {
+            state.advisory.route = { ...(state.advisory.route || {}), kind: ROUTE_KIND_API };
+        }
         // Seed the per-kind route memory with the SAVED route, so switching
         // the advisory select away and back restores it (finding #7c).
         advisoryRouteMemory[state.advisory.route?.kind === ROUTE_KIND_SESSION ? 'session' : 'api']
@@ -681,6 +918,18 @@ function adoptStatusSnapshot() {
     const snapshot = state.store.snapshot || {};
     state.harnesses = state.catalogKnown && Array.isArray(snapshot.harnesses) ? snapshot.harnesses : [];
     state.profilesByHarness = state.accountsKnown ? indexProfilesByHarness(snapshot) : {};
+}
+
+// The roster the «Configured subagent» selects offer, adopted from the SAME
+// settings document (and parser) the Available-subagents section loads —
+// settings.js calls this from applySettings, right beside that section's own
+// load. A roster that could not be parsed licenses no absence claim about a
+// saved reference (rosterKnown=false), exactly like an unread status facet.
+export function adoptSubagentRoster(settings) {
+    const parsed = parseAvailableSubagentsSetting(availableSubagentsLoadValue(settings));
+    state.roster = parsed.setting ? parsed.setting.items : [];
+    state.rosterKnown = Boolean(parsed.setting);
+    renderRows();
 }
 
 export function initReviewerSlots({ onChange, store = claudexorStatus } = {}) {

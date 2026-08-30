@@ -98,7 +98,6 @@ _ISO_SETTINGS_ALLOW_EXACT = frozenset({
     # "unlimited" for methodology comparability; a live-settings pin must forward
     # into isolated bench servers the same way the other review knobs do.
     "OUROBOROS_REVIEW_MAX_CYCLES",
-    "CLAUDE_CODE_MODEL", "CLAUDE_AGENT_SDK_MODEL",
     # One-window false provenance tombstone: it travels with an explicit Low so
     # the isolated run keeps owner-Low/P3 semantics. Legacy true is normalized.
     "TOTAL_BUDGET", "OUROBOROS_PER_TASK_COST_USD", "OUROBOROS_CONTEXT_MODE",

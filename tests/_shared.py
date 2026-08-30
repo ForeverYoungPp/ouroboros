@@ -1,15 +1,13 @@
 """Shared helpers for the Ouroboros test suite.
 
 These functions are reused across multiple ``tests/test_*.py`` modules to
-avoid duplicated boilerplate (extension-loader cleanup, claude_agent_sdk
-mock installation). They are intentionally plain module-level callables,
-not fixtures — many callers need them at module import time.
+avoid duplicated boilerplate (extension-loader cleanup, mock contexts).
+They are intentionally plain module-level callables, not fixtures — many
+callers need them at module import time.
 """
 from __future__ import annotations
 
 import json
-import sys
-import types
 from unittest.mock import MagicMock
 
 
@@ -38,31 +36,6 @@ def clean_extension_runtime_state() -> None:
         extension_loader._ui_tabs.clear()
         extension_loader._settings_sections.clear()
         extension_loader.set_ws_broadcaster(None)
-
-
-def ensure_claude_agent_sdk_mock() -> None:
-    """Install a lightweight ``claude_agent_sdk`` mock when truly absent.
-
-    Uses ``importlib.util.find_spec`` so an installed-but-not-yet-imported
-    SDK is never masked. Idempotent — safe to call from multiple modules at
-    import time.
-    """
-    import importlib.util as _ilu
-    try:
-        spec = _ilu.find_spec("claude_agent_sdk")
-        sdk_available = spec is not None
-    except (ValueError, ModuleNotFoundError):
-        sdk_available = "claude_agent_sdk" in sys.modules
-    if sdk_available:
-        return
-    mock_sdk = types.ModuleType("claude_agent_sdk")
-    mock_sdk.ClaudeAgentOptions = type("ClaudeAgentOptions", (), {})
-    mock_sdk.ClaudeSDKClient = type("ClaudeSDKClient", (), {})
-    mock_sdk.HookMatcher = type("HookMatcher", (), {"__init__": lambda self, **kw: None})
-    mock_sdk.AssistantMessage = type("AssistantMessage", (), {})
-    mock_sdk.ResultMessage = type("ResultMessage", (), {})
-    mock_sdk.query = lambda **kw: None
-    sys.modules["claude_agent_sdk"] = mock_sdk
 
 
 def make_safe_mock_ctx(tmp_path, *, repo_dir=None):

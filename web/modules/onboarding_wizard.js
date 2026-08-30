@@ -65,13 +65,6 @@ import { installAltMenuSuppression } from './ui_helpers.js';
         localTestResult: '',
         localTestTone: 'muted',
         localRuntimeReady: false,
-        claudeCliInstalled: false,
-        claudeCliBusy: false,
-        claudeCliStatus: '',
-        claudeCliStatusText: 'Checking Claude runtime...',
-        claudeCliTone: 'muted',
-        claudeCliError: '',
-        claudeCliDismissed: false,
         // Agents step: what the step OBSERVED (never a guess), the owner's
         // explicit "finish without agent defaults" choice, and the typed reason
         // a completion attempt refused to write the preset.
@@ -85,7 +78,6 @@ import { installAltMenuSuppression } from './ui_helpers.js';
     }, INITIAL_STATE);
 
     let localStatusPollStarted = false;
-    let claudeCliPollStarted = false;
     let agentsStep = null;
 
     function trim(value) {
@@ -124,14 +116,6 @@ import { installAltMenuSuppression } from './ui_helpers.js';
         const text = trim(value);
         if (!text) return false;
         return text === SECRET_PLACEHOLDER || text.length >= 10;
-    }
-
-    function hasAnthropicKeyConfigured() {
-        return isConfiguredCredential(state.anthropicKey);
-    }
-
-    function shouldShowClaudeCliCta() {
-        return hasAnthropicKeyConfigured() && !state.claudeCliDismissed;
     }
 
         function isLocalFilesystemSource(value) {
@@ -362,97 +346,6 @@ import { installAltMenuSuppression } from './ui_helpers.js';
 
     const apiRequest = fetchJson;
 
-    function applyClaudeCliStatus(payload = {}) {
-        const ready = Boolean(payload.ready);
-        const installed = Boolean(payload.installed);
-        const busy = Boolean(payload.busy);
-        const errorText = trim(payload.error);
-        const status = trim(payload.status) || (ready ? 'ready' : (installed ? 'installed' : 'missing'));
-        const pendingUnsavedAnthropicKey = status === 'no_api_key' && hasAnthropicKeyConfigured();
-        const message = trim(payload.message)
-            || (ready ? 'Claude runtime ready.' : (installed ? 'Claude runtime available but not ready.' : 'Claude runtime not available.'));
-        state.claudeCliInstalled = installed || ready;
-        state.claudeCliBusy = busy;
-        state.claudeCliStatus = status;
-        state.claudeCliError = pendingUnsavedAnthropicKey ? '' : errorText;
-        state.claudeCliTone = ready ? 'ok' : (pendingUnsavedAnthropicKey ? 'muted' : (errorText ? 'error' : (installed ? 'muted' : 'error')));
-        state.claudeCliStatusText = pendingUnsavedAnthropicKey
-            ? 'Claude runtime will use the Anthropic key after setup is saved.'
-            : message;
-        renderClaudeCliStatus();
-    }
-
-    async function claudeCliRequestStatus() {
-        if (HOST_MODE === 'web') {
-            return apiRequest('/api/claude-code/status', { cache: 'no-store' });
-        }
-        if (!window.pywebview?.api?.claude_code_status) {
-            throw new Error('Desktop Claude Code bridge is unavailable.');
-        }
-        return window.pywebview.api.claude_code_status();
-    }
-
-    async function claudeCliStartInstall() {
-        if (HOST_MODE === 'web') {
-            return apiRequest('/api/claude-code/install', { method: 'POST' });
-        }
-        if (!window.pywebview?.api?.install_claude_code) {
-            throw new Error('Desktop Claude Code install bridge is unavailable.');
-        }
-        return window.pywebview.api.install_claude_code();
-    }
-
-    async function updateClaudeCliStatus() {
-        if (!shouldShowClaudeCliCta()) return;
-        try {
-            applyClaudeCliStatus(await claudeCliRequestStatus());
-        } catch (error) {
-            state.claudeCliInstalled = false;
-            state.claudeCliBusy = false;
-            state.claudeCliStatus = 'error';
-            state.claudeCliError = String(error?.message || error || '');
-            state.claudeCliTone = 'error';
-            state.claudeCliStatusText = `Claude runtime status failed: ${state.claudeCliError}`;
-            renderClaudeCliStatus();
-        }
-    }
-
-    function startClaudeCliStatusPolling() {
-        if (claudeCliPollStarted) return;
-        claudeCliPollStarted = true;
-        updateClaudeCliStatus();
-        setInterval(() => {
-            if (shouldShowClaudeCliCta()) updateClaudeCliStatus();
-        }, 3000);
-    }
-
-    function syncClaudeCliVisibility() {
-        const card = document.getElementById('wizard-claude-card');
-        if (card) card.hidden = !shouldShowClaudeCliCta();
-        renderClaudeCliStatus();
-    }
-
-    function renderClaudeCliStatus() {
-        const card = document.getElementById('wizard-claude-card');
-        const statusEl = document.getElementById('wizard-claude-status');
-        const installButton = document.getElementById('wizard-claude-install');
-        const skipButton = document.getElementById('wizard-claude-skip');
-        if (card) card.hidden = !shouldShowClaudeCliCta();
-        if (statusEl) {
-            statusEl.textContent = state.claudeCliStatusText || 'Checking Claude runtime...';
-            statusEl.dataset.tone = state.claudeCliTone || 'muted';
-        }
-        if (installButton) {
-            installButton.disabled = state.claudeCliBusy;
-            installButton.textContent = state.claudeCliBusy
-                ? 'Repairing...'
-                : (state.claudeCliInstalled ? 'Runtime OK' : 'Repair Runtime');
-        }
-        if (skipButton) {
-            skipButton.hidden = state.claudeCliBusy || state.claudeCliInstalled;
-        }
-    }
-
     function renderLocalStatus() {
         const statusEl = document.getElementById('wizard-local-status');
         const stopButton = document.getElementById('wizard-local-stop');
@@ -526,22 +419,6 @@ import { installAltMenuSuppression } from './ui_helpers.js';
                 <span id="wizard-local-status" class="wizard-runtime-status">Status: Offline</span>
             </div>
             <div id="wizard-local-test-result" class="wizard-test-result"></div>
-        `;
-    }
-
-    function renderClaudeCliControls() {
-        return `
-            <div class="panel-card" id="wizard-claude-card"${shouldShowClaudeCliCta() ? '' : ' hidden'}>
-                <h3>Claude Runtime</h3>
-                <p>Claude runtime powers the advisory pre-review on the API route. It is managed automatically by the app.</p>
-                <div class="wizard-runtime-strip">
-                    <button type="button" class="btn btn-ghost" id="wizard-claude-install" ${state.claudeCliBusy || state.claudeCliInstalled ? 'disabled' : ''}>
-                        ${escapeHtml(state.claudeCliBusy ? 'Repairing...' : (state.claudeCliInstalled ? 'Runtime OK' : 'Repair Runtime'))}
-                    </button>
-                    <button type="button" class="btn btn-secondary" id="wizard-claude-skip" ${state.claudeCliBusy || state.claudeCliInstalled ? 'hidden' : ''}>Skip for now</button>
-                    <span id="wizard-claude-status" class="wizard-runtime-status" data-tone="${escapeHtml(state.claudeCliTone || 'muted')}">${escapeHtml(state.claudeCliStatusText || 'Checking Claude runtime...')}</span>
-                </div>
-            </div>
         `;
     }
 
@@ -663,7 +540,6 @@ import { installAltMenuSuppression } from './ui_helpers.js';
                     </div>
                 </div>
             </details>
-            ${renderClaudeCliControls()}
             <details class="wizard-collapse" data-collapse="local-model" ${localSourceOpen ? 'open' : ''}>
                 <summary>
                     <span>Local model settings</span>
@@ -1016,23 +892,7 @@ import { installAltMenuSuppression } from './ui_helpers.js';
         }
 
             PROVIDER_FIELDS.forEach((field) => {
-                const input = document.getElementById(field.id);
-                if (field.settingKey !== 'ANTHROPIC_API_KEY') {
-                    bindStateInput(input, field.stateKey);
-                    return;
-                }
-                if (!input) return;
-                input.addEventListener('input', () => {
-                    const wasConfigured = hasAnthropicKeyConfigured();
-                    state[field.stateKey] = input.value;
-                    if (!wasConfigured && hasAnthropicKeyConfigured()) {
-                        state.claudeCliDismissed = false;
-                        startClaudeCliStatusPolling();
-                        updateClaudeCliStatus();
-                    }
-                    syncClaudeCliVisibility();
-                    markStepEdited();
-                });
+                bindStateInput(document.getElementById(field.id), field.stateKey);
             });
         if (localPreset) localPreset.addEventListener('change', () => {
             applyPresetSelection(localPreset.value);
@@ -1118,33 +978,6 @@ import { installAltMenuSuppression } from './ui_helpers.js';
                     setLocalTestResult(`Test failed: ${error.message}`, 'error');
                 }
             });
-        }
-        document.getElementById('wizard-claude-install')?.addEventListener('click', async () => {
-            state.claudeCliBusy = true;
-            state.claudeCliTone = 'muted';
-            state.claudeCliStatusText = 'Repairing Claude runtime...';
-            renderClaudeCliStatus();
-            try {
-                applyClaudeCliStatus(await claudeCliStartInstall());
-                if (state.claudeCliBusy) updateClaudeCliStatus();
-            } catch (error) {
-                state.claudeCliBusy = false;
-                state.claudeCliStatus = 'error';
-                state.claudeCliError = String(error?.message || error || '');
-                state.claudeCliTone = 'error';
-                state.claudeCliStatusText = `Claude runtime repair failed: ${state.claudeCliError}`;
-                renderClaudeCliStatus();
-            }
-        });
-        document.getElementById('wizard-claude-skip')?.addEventListener('click', () => {
-            state.claudeCliDismissed = true;
-            syncClaudeCliVisibility();
-        });
-        if (shouldShowClaudeCliCta()) {
-            startClaudeCliStatusPolling();
-            updateClaudeCliStatus();
-        } else {
-            renderClaudeCliStatus();
         }
         syncCurrentStepActionState();
     }

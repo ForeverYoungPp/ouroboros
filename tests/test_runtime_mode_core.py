@@ -51,7 +51,6 @@ def test_settings_defaults_include_phase2_keys():
         SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]
         == "openai/gpt-5.6-sol-pro"
     )
-    assert SETTINGS_DEFAULTS["CLAUDE_CODE_MODEL"] == "claude-sonnet-5"
     assert SETTINGS_DEFAULTS["TOTAL_BUDGET"] == 200.0
     assert SETTINGS_DEFAULTS["OUROBOROS_PER_TASK_COST_USD"] == 50.0
 

@@ -1005,6 +1005,13 @@ def _disabled_tools(ctx: Any) -> frozenset:
     # too (harmless: nothing registers it), so old contracts round-trip as-is.
     if "claude_code_edit" in names:
         names.add("delegate_start")
+    # Q1 rename compatibility: contracts that withheld `advisory_review` keep
+    # withholding the SAME organ under its new name, and vice versa (a new
+    # contract naming only the new spelling must also silence the alias).
+    if "advisory_review" in names:
+        names.add("preflight_review")
+    if "preflight_review" in names:
+        names.add("advisory_review")
     return frozenset(names)
 
 
@@ -1679,6 +1686,12 @@ class ToolEntry:
     # advisory freshness when the worktree ACTUALLY changed — covering error
     # and timeout paths uniformly, and never invalidating for read-only runs.
     mutates_worktree: bool = False
+    # Compatibility alias: a renamed tool's old public name. An alias entry is
+    # CALLABLE (execute dispatches it like any entry) but never advertised —
+    # schemas()/available_tools() skip it, so the public surface carries only
+    # the canonical name while saved prompts, memories, and configs that still
+    # use the old spelling keep working.
+    alias_for: str = ""
 
 
 class ToolRegistry:
@@ -1867,6 +1880,7 @@ class ToolRegistry:
         return [
             e.name
             for e in self._entries.values()
+            if not e.alias_for  # compat aliases are callable, never advertised
             if e.name not in disabled  # declarative tool policy (task_contract.disabled_tools)
             if _presence_tool_allowed(self._ctx, e.name)
             if _builtin_tool_availability(e.name, self._ctx)[0]
@@ -1965,6 +1979,7 @@ class ToolRegistry:
         built_in = [
             schema
             for entry in self._entries.values()
+            if not entry.alias_for  # compat aliases are callable, never advertised
             if entry.name not in disabled_tools  # declarative tool policy (task_contract.disabled_tools)
             if _presence_tool_allowed(self._ctx, entry.name)
             if entry.name not in unavailable_tools
@@ -2061,6 +2076,8 @@ class ToolRegistry:
         # Core tools plus meta-tools for enabling extended tools.
         result = []
         for e in self._entries.values():
+            if e.alias_for:  # compat aliases are callable, never advertised
+                continue
             if e.name in disabled_tools:  # declarative tool policy (task_contract.disabled_tools)
                 continue
             if not _presence_tool_allowed(self._ctx, e.name):
@@ -2112,6 +2129,10 @@ class ToolRegistry:
             return "outside this presence task's positive capability ceiling"
         if requested not in self._entries:
             return None
+        if self._entries[requested].alias_for:
+            # Mirrors get_schema_by_name: a compat alias is callable but never
+            # advertised — discovery answers as for any non-public name.
+            return None
         available, reason, _detail = _builtin_tool_availability(requested, self._ctx)
         if not available:
             return f"unavailable ({reason})"
@@ -2137,6 +2158,10 @@ class ToolRegistry:
         if not _presence_tool_allowed(self._ctx, requested):
             return None
         entry = self._entries.get(requested)
+        if entry and entry.alias_for:
+            # Compat aliases are callable, never advertised — discovery answers
+            # as it does for any non-public name.
+            return None
         if entry:
             available, reason, detail = _builtin_tool_availability(requested, self._ctx)
             if not available:
@@ -3725,7 +3750,7 @@ class ToolRegistry:
         if entry is None:
             if ext_tool and callable(ext_tool.get("handler")):
                 return self._dispatch_extension_tool(name, ext_tool, args)
-            return f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(self._entries.keys()))}"
+            return f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(n for n, e in self._entries.items() if not e.alias_for))}"
         args, python_resolution, python_block = self._resolve_python_predispatch(
             name, args, _runtime_mode, effective_constraint, resolved_binding,
         )

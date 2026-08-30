@@ -101,7 +101,6 @@ MODEL_SETTING_KEYS = ACTIVE_MODEL_SETTING_KEYS
 # mis-route them to OpenRouter.  Their transport is the Anthropic SDK subprocess, which
 # authenticates with ANTHROPIC_API_KEY (the Claude runtime gateways:
 # tools/claude_advisory_review.py), so a non-empty value DECLARES the anthropic provider.
-CLAUDE_SDK_MODEL_SETTING_KEYS: tuple[str, ...] = ("CLAUDE_CODE_MODEL", "CLAUDE_AGENT_SDK_MODEL")
 
 
 def provider_for_model(model: str) -> str:
@@ -219,21 +218,15 @@ def declared_model_settings(
 
     An absent or empty slot is not "unused": the server falls back to
     ``config.SETTINGS_DEFAULTS`` for it, so the default's provider is genuinely reachable and
-    must be declared.  Benchmark profiles that explicitly disable the Claude SDK transport may
-    set ``include_claude_sdk_defaults=False``; explicit non-empty Claude SDK values remain
-    declared, while an empty disabled slot does not resurrect the global Claude default.
-    Lazy config import (config imports this module)."""
+    must be declared.  ``include_claude_sdk_defaults`` is a RETIRED no-op kept for caller
+    compatibility: the Claude-SDK transport and its dedicated model slots are gone, so both
+    values declare the same set. Lazy config import (config imports this module)."""
     from ouroboros.config import SETTINGS_DEFAULTS
 
     declared: dict[str, str] = {}
-    for key in (*MODEL_SETTING_KEYS, *CLAUDE_SDK_MODEL_SETTING_KEYS):
+    for key in MODEL_SETTING_KEYS:
         value = str((settings or {}).get(key) or "").strip()
-        # The opt-out is scoped to the Claude SDK transport only.  Ordinary
-        # model slots still inherit their runtime defaults; otherwise a
-        # benchmark that merely disables the SDK would silently change the
-        # generic provider plan (or fall open to every credential when all
-        # slots happen to be sparse).
-        if not value and (include_claude_sdk_defaults or key not in CLAUDE_SDK_MODEL_SETTING_KEYS):
+        if not value:
             value = str(SETTINGS_DEFAULTS.get(key) or "").strip()
         if value:
             declared[key] = value
@@ -249,9 +242,6 @@ def providers_for_declared_models(declared: dict) -> dict[str, list[str]]:
     for key, raw in (declared or {}).items():
         text = str(raw or "").strip()
         if not text:
-            continue
-        if str(key) in CLAUDE_SDK_MODEL_SETTING_KEYS:
-            found.setdefault("anthropic", set()).add(text)
             continue
         for part in text.split(","):
             model = part.strip()
@@ -291,17 +281,9 @@ def provider_credential_plan(
     the disclosed escape hatch: when nothing resolves (a settings mapping with no model slot
     at all) the plan is the FULL credential universe, because a benchmark that dies on a
     missing key at hour six is worse than one that carries a spare.  The optional
-    ``include_claude_sdk_defaults`` switch is for an explicit profile that has disabled that
-    transport; the default remains backward-compatible with runtime fallback semantics."""
-    if include_claude_sdk_defaults:
-        # Keep the historical call shape for embedders that monkeypatch this
-        # pure helper (and preserve the default-runtime contract byte-for-byte).
-        declared = declared_model_settings(settings)
-    else:
-        declared = declared_model_settings(
-            settings,
-            include_claude_sdk_defaults=False,
-        )
+    ``include_claude_sdk_defaults`` switch is RETIRED (no-op): the Claude-SDK transport and
+    its dedicated model slots are gone, so both values produce the same plan."""
+    declared = declared_model_settings(settings)
     providers = providers_for_declared_models(declared)
     planned = credential_keys_for_providers(providers)
     fail_open = not planned
@@ -335,9 +317,9 @@ OPENROUTER_REVIEW_DEFAULTS = {
         "anthropic/claude-opus-5",
     ),
     "scope": ("openai/gpt-5.6-terra",),
-    # Claude Agent SDK spelling, not an OpenRouter model id. With no direct
-    # Anthropic key the existing advisory gate records an audited bypass.
-    "advisory": "claude-sonnet-5",
+    # Routed catalog id (the retired Claude-SDK spelling migrated same-model);
+    # without provider credentials the advisory gate records an audited bypass.
+    "advisory": "anthropic/claude-sonnet-5",
 }
 
 

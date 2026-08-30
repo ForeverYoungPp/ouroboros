@@ -14,6 +14,7 @@ import {
     composeSessionTarget,
     decodeRouteChoice,
     describeLastExecution,
+    describeSubagentReference,
     encodeRouteChoice,
     harnessModelsKnown,
     mintSlotId,
@@ -25,6 +26,7 @@ import {
     routeChoiceGroups,
     sessionModelOptions,
     splitSessionTarget,
+    subagentOptionsFor,
 } from '../modules/reviewer_slots.js';
 
 test('reviewer routes reuse the shared visible harness identity without claiming execution', () => {
@@ -175,7 +177,7 @@ test('route choice round-trips through encode/decode', () => {
 test('advisory route switching never wipes a stored target (finding #7c)', () => {
     // Saved: api with an explicit target. Flip to a session and back: the
     // saved api target is restored, not written to ''.
-    const savedApi = { kind: 'api', target_id: 'anthropic/claude-opus-5' };
+    const savedApi = { kind: ROUTE_KIND_API, target_id: 'anthropic/claude-opus-5' };
     let memory = { api: { ...savedApi }, session: null };
     const toSession = advisoryRouteTransition(savedApi, { kind: ROUTE_KIND_SESSION, harness: 'codex' }, memory);
     assert.deepEqual(toSession.route, { kind: ROUTE_KIND_SESSION, target_id: 'codex' });
@@ -187,7 +189,7 @@ test('advisory route switching never wipes a stored target (finding #7c)', () =>
     const savedSession = { kind: ROUTE_KIND_SESSION, target_id: 'claude=claude-opus-5' };
     memory = { api: null, session: { ...savedSession } };
     const toApi = advisoryRouteTransition(savedSession, { kind: ROUTE_KIND_API }, memory);
-    assert.deepEqual(toApi.route, { kind: 'api', target_id: '' });
+    assert.deepEqual(toApi.route, { kind: ROUTE_KIND_API, target_id: '' });
     const restored = advisoryRouteTransition(toApi.route, { kind: ROUTE_KIND_SESSION, harness: 'claude' }, toApi.memory);
     assert.deepEqual(restored.route, savedSession);
 
@@ -234,8 +236,9 @@ test('an advisory session preserves route-default effort instead of inventing lo
     const api = JSON.parse(buildReviewerSlotsSetting({
         triad: setting.triad,
         scope: setting.scope,
-        advisory: { enabled: true, route: { kind: 'api', target_id: '' }, effort: '' },
+        advisory: { enabled: true, route: { kind: ROUTE_KIND_API, target_id: '' }, effort: '' },
     }));
+    assert.equal(api.advisory.route.kind, ROUTE_KIND_API);
     assert.equal(api.advisory.effort, 'low');
 });
 
@@ -350,18 +353,89 @@ test('switching the advisory harness resets the model to the bare harness', () =
     assert.deepEqual(out.route, { kind: ROUTE_KIND_SESSION, target_id: 'codex' });
 });
 
-test('the advisory api-route model input round-trips as the raw target', () => {
-    // kind stays the advisory's own 'api' (NOT api_chat — the branch trap),
-    // and the free-text SDK spelling rides target_id verbatim; no profile pin
-    // is emitted on the api kind.
+test('the advisory api route writes the shared api_chat kind, never the retired api alias', () => {
+    // Successor pin for the retired Claude-SDK 'api' kind: the advisory row is
+    // on the SHARED vocabulary now. A stale 'api' kind in a loaded draft still
+    // normalizes to api_chat on save, the routed target rides verbatim, and no
+    // profile pin is emitted on the api kind.
     const setting = JSON.parse(buildReviewerSlotsSetting({
         triad: [{ slot_id: 't1', route: { kind: ROUTE_KIND_API, target_id: 'openai/x' }, effort: '' }],
         scope: [{ slot_id: 's1', route: { kind: ROUTE_KIND_API, target_id: 'openai/y' }, effort: '' }],
-        advisory: { enabled: true, route: { kind: 'api', target_id: 'sonnet', profile_id: 'koshak' }, effort: 'low' },
+        advisory: { enabled: true, route: { kind: 'api', target_id: 'anthropic/claude-sonnet-5', profile_id: 'koshak' }, effort: 'low' },
     }));
-    assert.equal(setting.advisory.route.kind, 'api');
-    assert.equal(setting.advisory.route.target_id, 'sonnet');
+    assert.equal(setting.advisory.route.kind, ROUTE_KIND_API);
+    assert.equal(setting.advisory.route.target_id, 'anthropic/claude-sonnet-5');
     assert.equal('profile_id' in setting.advisory.route, false);
+    // The retired spelling never appears anywhere in the composed bytes.
+    assert.doesNotMatch(JSON.stringify(setting), /"kind":"api"/);
+});
+
+test('a configured-subagent reference serializes without route knobs (decision 5A)', () => {
+    // The stored forms are mutually exclusive: a reference never duplicates
+    // route/model/account knobs (the roster row is their SSOT), and an empty
+    // explicit effort is OMITTED so the roster row's own effort keeps deciding.
+    const setting = JSON.parse(buildReviewerSlotsSetting({
+        triad: [
+            { slot_id: 't_ref', subagent_id: 'deep-reviewer', route: { kind: ROUTE_KIND_API, target_id: 'stash/kept' }, effort: 'high' },
+            { slot_id: 't_ref2', subagent_id: 'fast-reviewer', effort: '' },
+        ],
+        scope: [{ slot_id: 's_1', route: { kind: ROUTE_KIND_API, target_id: 'openai/y' }, effort: '' }],
+        advisory: { enabled: true, subagent_id: 'deep-reviewer', route: { kind: ROUTE_KIND_API, target_id: 'stash' }, effort: '' },
+    }));
+    assert.deepEqual(setting.triad[0], { slot_id: 't_ref', subagent_id: 'deep-reviewer', effort: 'high' });
+    assert.deepEqual(setting.triad[1], { slot_id: 't_ref2', subagent_id: 'fast-reviewer' });
+    assert.deepEqual(setting.advisory, { enabled: true, subagent_id: 'deep-reviewer' });
+    // A direct row in the same panel keeps its inline route untouched.
+    assert.equal(setting.scope[0].route.kind, ROUTE_KIND_API);
+});
+
+test('the roster select survives a saved reference the roster no longer lists', () => {
+    // Same rule as profileOptionsFor: the select's value must EXIST as an
+    // option or the browser silently redraws the row as the first roster entry
+    // and the next Save really rewires the reviewer. The absence claim follows
+    // provenance: only a roster that was READ may say "not in the roster".
+    const roster = [
+        { subagent_id: 'deep', name: 'Deep Reviewer', recommended_use: 'Long reasoning over big diffs' },
+        { subagent_id: 'fast', name: 'Fast Reviewer', recommended_use: '' },
+    ];
+    const listed = subagentOptionsFor(roster, 'deep');
+    assert.deepEqual(listed.map((o) => o.value), ['deep', 'fast']);
+    assert.match(listed[0].label, /Deep Reviewer — Long reasoning/);
+    assert.equal(listed[1].label, 'Fast Reviewer');
+
+    const missing = subagentOptionsFor(roster, 'gone');
+    assert.deepEqual(missing.map((o) => o.value), ['deep', 'fast', 'gone']);
+    assert.match(missing[2].label, /not in the roster/);
+    // An unreadable roster licenses no absence claim.
+    assert.match(subagentOptionsFor([], 'gone', { rosterKnown: false })[0].label, /not checked/);
+    assert.doesNotMatch(subagentOptionsFor([], 'gone', { rosterKnown: false })[0].label, /not in the roster/);
+});
+
+test('the derived disclosure reports the roster row facts read-only, with honest absence', () => {
+    const roster = [
+        {
+            subagent_id: 'sess',
+            name: 'Session Reviewer',
+            route: { kind: ROUTE_KIND_SESSION, target_id: 'codex=gpt-5.6-sol', credential_profile_id: 'koshak' },
+            effort: 'xhigh',
+        },
+        { subagent_id: 'apirow', name: 'Api Reviewer', route: { kind: 'api_model', target_id: 'openai/gpt-5.6-luna' } },
+    ];
+    const session = describeSubagentReference('sess', roster);
+    assert.ok(session.includes('codex session'));
+    assert.ok(session.includes('gpt-5.6-sol'));
+    assert.ok(session.includes('account koshak'));
+    assert.ok(session.includes('effort xhigh'));
+    assert.match(session, /roster row/);
+
+    const api = describeSubagentReference('apirow', roster);
+    assert.ok(api.includes('API model openai/gpt-5.6-luna'));
+
+    // A missing roster row is said plainly — kept, refusing, never rerouted —
+    // and an UNREAD roster never claims the row does not exist.
+    assert.match(describeSubagentReference('gone', roster), /no roster row with this ID exists/);
+    assert.match(describeSubagentReference('gone', roster), /refuse rather than reroute/);
+    assert.match(describeSubagentReference('gone', [], { rosterKnown: false }), /roster could not be read/);
 });
 
 test('the runs-as line shows APPLIED account/access and honest absence for an undisclosed model', () => {

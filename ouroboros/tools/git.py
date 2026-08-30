@@ -1029,7 +1029,10 @@ def _advisory_and_tests_gate(
             )
         except Exception:
             pass
-        test_err = _run_review_preflight_tests(ctx)
+        from ouroboros.commit_admission import run_tests_preflight_with_proof
+
+        test_err = run_tests_preflight_with_proof(
+            ctx, runner=lambda c: _run_review_preflight_tests(c))
         if test_err:
             msg = _tests_preflight_block_message(_managed_needs_proof, test_err)
             try:
@@ -1053,15 +1056,8 @@ def _advisory_and_tests_gate(
                 "message": msg,
                 "block_reason": "tests_preflight_blocked",
             }
-        # Q10 single-run: this green preflight IS the managed pre-commit proof.
-        # Process-held on ctx (the gates' authority, F2); the durable tx copy
-        # written alongside is forensic telemetry only.
-        try:
-            from supervisor.update_merge import record_managed_tests_proof
-
-            record_managed_tests_proof(ctx)
-        except Exception:
-            log.debug("managed tests evidence recording failed", exc_info=True)
+        # Q10 single-run: the green preflight IS the managed pre-commit proof —
+        # recorded by the shared admission helper (commit_admission SSOT).
     elif _advisory_bypassed:
         if skip_tests and _doc_only:
             _skip_reason = "skip_tests + doc_only"
@@ -2100,7 +2096,7 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
         result = (
             f"✅ Written {len(written)} file(s): {summary}\n"
             "Files are on disk but NOT committed. Run commit_reviewed when ready.\n"
-            "⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
+            "⚠️ Advisory pre-review is now stale — run preflight_review before commit_reviewed."
         )
     result += f"\nResolved root: {binding_items[0].base_path}"
     if syntax_bypass_notes:
@@ -2297,7 +2293,7 @@ def _str_replace_editor(
     if data_skill_target is None and ctx.is_workspace_mode() and not system_target:
         result += "\nDo not commit; the headless runner will emit a patch artifact."
     elif data_skill_target is None:
-        result += "\nRun commit_reviewed when ready.\n⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
+        result += "\nRun commit_reviewed when ready.\n⚠️ Advisory pre-review is now stale — run preflight_review before commit_reviewed."
     else:
         result += "\nRun skill_review for this skill before enabling or declaring it ready."
     if system_target and pathlib.PurePosixPath(rel_path).parts[:1] == ("skills",):
