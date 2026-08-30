@@ -19,12 +19,29 @@ def _plain(value: Any) -> Any:
     return value
 
 
-def _number(value: Any) -> Optional[float]:
+def provider_cost_value(value: Any) -> Optional[float]:
+    """Parse a provider-reported cost; ``None`` means the value cannot be trusted.
+
+    THE cost-trust predicate, defined once at the AUTHORITATIVE boundary (what
+    survives here is what the durable attempt ledger settles as final money) and
+    imported by the loop-side projection, so the two lanes cannot fork: ``bool``
+    is rejected FIRST (``float(True)`` is a plausible-looking 1.0 that would
+    settle as a FINAL $1.00 and eat real budget admission), then anything
+    unparseable, non-finite, or negative — ``OverflowError`` included, because
+    ``float(10**1000)`` raises rather than returning inf. A reported ``0.0``
+    stays a legitimate zero. Rejecting settles the attempt as unknown rather
+    than as a fabricated amount (BIBLE P1). Never raises.
+    """
+    if isinstance(value, bool):
+        return None
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
-    return number if math.isfinite(number) else None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+_number = provider_cost_value  # historical local name at this boundary
 
 
 def _reported_token_count(usage: Dict[str, Any], *keys: str) -> Optional[int]:

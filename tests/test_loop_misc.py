@@ -16,7 +16,10 @@ import queue
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 import ouroboros.loop as loop_mod
+from ouroboros.loop_llm_call import RETRY_WALL_EXHAUSTED_KEY
 from ouroboros.loop import (
     _drain_incoming_messages,
     _initialize_owner_directives,
@@ -1860,3 +1863,175 @@ def test_undecodable_image_fails_the_attach_not_the_provider_call():
         vision._downscale_image_for_vlm(corrupt, "image/png")
     out, mime = vision._downscale_image_for_vlm(good, "image/png")
     assert out == good and mime == "image/png"
+
+
+# ---------------------------------------------------------------------------
+# OB-01 — provider death does not re-burn the budget on a second forced call
+# ---------------------------------------------------------------------------
+
+
+def _provider_death_ctx(tmp_path, accumulated):
+    """A minimal forced-rail context. ``tools=None`` on purpose: every forced
+    helper then takes its documented tool-less path, so the test observes the
+    loop's own decisions instead of a registry stub's."""
+    return loop_mod._RoundLimitContext(
+        messages=[
+            {"role": "user", "content": "do the thing"},
+            {"role": "assistant", "content": "PARTIAL RESULT: step one is done."},
+        ],
+        llm=SimpleNamespace(),
+        active_model="openai/gpt-5.5",
+        active_effort="medium",
+        max_retries=3,
+        drive_logs=tmp_path,
+        task_id="task-provider-death",
+        round_idx=7,
+        event_queue=None,
+        accumulated_usage=accumulated,
+        task_type="task",
+        active_use_local=False,
+        max_rounds=200,
+        drive_root=tmp_path,
+    )
+
+
+def _count_forced_helpers(monkeypatch):
+    """Wrap the non-model work of the forced rail with call counters, keeping the
+    REAL implementations so "it still runs" is observed, not simulated."""
+    seen = {"model": [], "services": [], "drain": []}
+    real_services = loop_mod._finalize_forced_services
+    real_drain = loop_mod._drain_forced_owner_directives
+
+    def _model(ctx):
+        seen["model"].append(1)
+        return "FRESH FORCED ANSWER"
+
+    def _services(ctx, trace):
+        seen["services"].append(1)
+        return real_services(ctx, trace)
+
+    def _drain(ctx, trace):
+        seen["drain"].append(1)
+        return real_drain(ctx, trace)
+
+    monkeypatch.setattr(loop_mod, "_call_forced_model_once", _model)
+    monkeypatch.setattr(loop_mod, "_finalize_forced_services", _services)
+    monkeypatch.setattr(loop_mod, "_drain_forced_owner_directives", _drain)
+    return seen
+
+
+def test_provider_death_skips_the_forced_call_when_the_retry_wall_is_spent(tmp_path, monkeypatch):
+    """The whole point of OB-01: the transport already spent the same-model retry
+    wall, so the forced finalization must NOT re-burn the budget on a request that
+    cannot land. Everything the forced rail owns besides the call still runs."""
+    seen = _count_forced_helpers(monkeypatch)
+    accumulated = {  # realistic transport stamps of an exhausted transient wall
+        RETRY_WALL_EXHAUSTED_KEY: True,
+        "execution_status": "infra_failed",
+        "reason_code": "llm_api_error",
+        "_last_llm_error_kind": "provider_transient",
+    }
+    ctx = _provider_death_ctx(tmp_path, accumulated)
+    messages_before = [dict(m) for m in ctx.messages]
+
+    text, usage, trace = loop_mod._handle_provider_unavailable(ctx)
+
+    assert seen["model"] == []                    # ZERO llm calls from this rail
+    assert len(seen["services"]) == 1             # services still finalized
+    assert len(seen["drain"]) == 1                # exactly ONE directive drain
+    # Salvage still delivered, and the delivery candidate still packaged.
+    assert "PARTIAL RESULT: step one is done." in text
+    assert trace["forced_finalization"]["reason_code"] == "provider_unavailable"
+    # Replay durability: an unsent prompt must never reach the transcript, or a
+    # resume would read it as a request the model ignored.
+    assert [dict(m) for m in ctx.messages] == messages_before
+    assert not any(
+        "[PROVIDER_UNAVAILABLE]" in str(m.get("content") or "") for m in ctx.messages
+    )
+    # False completion: an outage is an INFRA FAILURE, and no model answer was
+    # extracted, so the best_effort gate must not be handed a typed success fact.
+    assert usage["reason_code"] == "provider_unavailable"
+    assert usage["execution_status"] == "infra_failed"
+    assert "_best_effort_extracted" not in usage
+
+
+def test_provider_death_still_makes_the_forced_call_when_the_wall_is_unspent(tmp_path, monkeypatch):
+    """The skip is not the new default. A PERMANENT refusal (auth/quota/bad
+    request) fails fast and leaves the wall unspent, so the forced rail keeps the
+    one chance its class is entitled to."""
+    seen = _count_forced_helpers(monkeypatch)
+    accumulated = {}  # no marker: the transport never exhausted its retries
+    ctx = _provider_death_ctx(tmp_path, accumulated)
+
+    text, usage, _trace = loop_mod._handle_provider_unavailable(ctx)
+
+    assert seen["model"] == [1]
+    assert "FRESH FORCED ANSWER" in text
+    assert usage["execution_status"] == "infra_failed"
+    assert any(
+        "[PROVIDER_UNAVAILABLE]" in str(m.get("content") or "") for m in ctx.messages
+    )
+
+
+@pytest.mark.parametrize(
+    "marker, expect_call",
+    [
+        ("unexpected-string", False),
+        (1, False),
+        ({"nested": "garbage"}, False),
+        (0, True),
+        ("", True),
+        (None, True),
+    ],
+    ids=["truthy_str", "truthy_int", "truthy_dict", "zero", "empty_str", "none"],
+)
+def test_malformed_retry_wall_marker_reads_as_a_plain_truth_value(
+    tmp_path, monkeypatch, marker, expect_call,
+):
+    """A shared usage dict can hold anything, so the read is `bool(...)` and
+    nothing else: any truthy value means the wall is spent, any falsy value means
+    it is not. No shape assumption, no crash, no silent third behaviour."""
+    seen = _count_forced_helpers(monkeypatch)
+    ctx = _provider_death_ctx(tmp_path, {
+        RETRY_WALL_EXHAUSTED_KEY: marker,
+        "execution_status": "infra_failed", "reason_code": "llm_api_error",
+    })
+
+    _text, usage, _trace = loop_mod._handle_provider_unavailable(ctx)
+
+    assert seen["model"] == ([1] if expect_call else [])
+    assert usage["execution_status"] == "infra_failed"
+
+
+@pytest.mark.parametrize(
+    "reason_code, marker",
+    [
+        ("round_limit", "[ROUND_LIMIT] wrap up"),
+        ("finalization_grace", "[FINALIZE_NOW] wrap up"),
+        ("deadline_local", "[DEADLINE] wrap up"),
+        ("owner_requested_finalization", "[OWNER_STOP] wrap up"),
+        ("budget_exhausted", "[BUDGET] wrap up"),
+        ("children_unabsorbed", "[CHILDREN] wrap up"),
+    ],
+)
+def test_other_forced_rails_never_skip_even_with_the_wall_marker_set(
+    tmp_path, monkeypatch, reason_code, marker,
+):
+    """The skip is gated on the provider-death rail SPECIFICALLY. Every OTHER
+    reason code `loop.py` passes to `_forced_final_answer` — round limit,
+    finalization grace, deadline, owner stop, budget exhaustion and unabsorbed
+    children — still makes its one forced call even when a transient wall was
+    spent earlier in the same task: those rails end for their own reasons, not
+    because the provider is unreachable. The list is exhaustive against the
+    `reason_code=` literals in loop.py, so a new rail cannot silently inherit
+    the skip."""
+    seen = _count_forced_helpers(monkeypatch)
+    ctx = _provider_death_ctx(tmp_path, {RETRY_WALL_EXHAUSTED_KEY: True})
+
+    text, _usage, _trace = loop_mod._forced_final_answer(
+        ctx, prompt=marker, fallback_text="fallback", reason_code=reason_code,
+    )
+
+    assert seen["model"] == [1]
+    assert "FRESH FORCED ANSWER" in text
+    assert any(marker in str(m.get("content") or "") for m in ctx.messages)

@@ -192,6 +192,7 @@ BAND_PATHS = {
     "tests/test_onboarding_wizard.py": None,
     "tests/test_owner_stop_s3.py": "Entered the band from 821 lines: the S3 contract suite now covers retry-root aliasing, graceful-to-immediate hardening, stale-control drain races, hard deadline preservation, descendant settlement failure, and late resweep exactly-once root finalization.",
     "tests/test_packaged_runtime_and_lifecycle.py": None,
+    "tests/test_provider_failure_reporting.py": "Entered the band from 938 lines: the provider-failure honesty rework added the retry-wall marker suites (entry-clear, all-retryable stamp, empty-response provider-failing gate, no-repay rail) beside the cost-validation suites (bool/NaN/inf/negative/huge-int at both boundaries) - one file per failure-reporting surface.",
     "tests/test_repo_health_smoke.py": "size-ratchet redesign: merge-aware previous, pairwise base-vs-tip, candidate-mode generator contract tests",
     "tests/test_review_cycles_dispatch.py": "Task acceptance wallet and paid-stamp dispatch regression matrix was integrated from the current managed target alongside the existing review-cycle tests.",
     "tests/test_review_fidelity.py": None,
@@ -228,7 +229,7 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/loop.py": 312794,
+    "ouroboros/loop.py": 312772,
     "tests/test_delegated_subagent_transport.py": 320340,
     "tests/test_devtools_benchmarks.py": 328116,
     "web/modules/chat.js": 224315,

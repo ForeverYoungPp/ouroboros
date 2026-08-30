@@ -31,6 +31,7 @@ from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
 from ouroboros.provider_models import provider_for_model
 from ouroboros.transport_custody import is_pre_dispatch_transport_failure
+from ouroboros._usage_response import provider_cost_value as _provider_cost_value
 from ouroboros.usage_accounting import (
     PhysicalAttemptContext,
     UsageAccountingError,
@@ -158,6 +159,9 @@ def fold_retrieval_usage(accumulated_usage: Dict[str, Any], usage: Dict[str, Any
 # large) keep failing fast. There is NO cross-model fallback here — the same
 # request is retried on the SAME model.
 _TRANSIENT_RETRY_KINDS = frozenset({"provider_transient", "provider_incomplete_response"})
+# OB-01: stamped when THIS invocation spent its same-model retry wall without a
+# usable response; entry-cleared per invocation; PERMANENT classes leave it unspent.
+RETRY_WALL_EXHAUSTED_KEY = "_llm_retry_wall_exhausted"
 # Error kinds that put a model on the F1 fallback cooldown. Superset of the same-model
 # retry kinds: a body-error 429 (HTTP 200 with an error in the body — the canonical
 # cloud.ru/OpenRouter rate-limit shape) is classified "rate_limit", which must cool the
@@ -856,13 +860,28 @@ def _normalize_usage_cost(
     model: str,
     use_local: bool,
 ) -> tuple[Optional[float], str, str, bool]:
-    provider_reported_cost = usage.get("cost") is not None
-    cost = float(usage["cost"]) if provider_reported_cost else None
+    raw_cost = usage.get("cost")
+    provider_reported_cost = raw_cost is not None
+    cost = _provider_cost_value(raw_cost) if provider_reported_cost else None
     display_model = str(usage.get("resolved_model") or model)
     provider = "local" if use_local else str(usage.get("provider") or "openrouter")
     if use_local:
         cost = 0.0
         display_model = f"{model} (local)"
+    elif provider_reported_cost and cost is None:
+        # MISSING falls through to the catalog estimate; a cost the provider DID
+        # send but that cannot be trusted is honestly unknown RIGHT HERE. Shared
+        # predicate: `_usage_response.provider_cost_value` — the lanes cannot fork.
+        log.warning(
+            "Provider reported an invalid cost (type=%s, value=%s) for %s; recording "
+            "cost as unknown and skipping estimation",
+            type(raw_cost).__name__,
+            truncate_review_artifact(repr(raw_cost), limit=120),
+            display_model,
+        )
+        usage["cost"] = None
+        usage["cost_final"] = False  # unknown cost is never a closed book
+        return None, display_model, provider, bool(usage.get("cost_estimated"))
     elif cost is None:
         cost = estimate_cost_optional(
             display_model,
@@ -978,6 +997,58 @@ def _record_llm_call_error(
         })
         return True
     return False
+
+
+def _stop_after_llm_error(
+    ctx: _LlmErrorContext, *, max_retries: int, transient_budget: int,
+    deadline_ts: Optional[float],
+) -> bool:
+    """Retry decision for the exception path: ``True`` stops the attempt loop, and
+    every stop except the transport shape stamps the OB-01 marker — permanent
+    classes stopped earlier in ``_record_llm_call_error``, so every kind here is
+    retry-same-request and a stop means "the same-model wall is spent"."""
+    accumulated_usage = ctx.accumulated_usage
+    error_kind = str(accumulated_usage.get("_last_llm_error_kind") or "")
+    if error_kind == "transport_unavailable":
+        # One physical attempt per invocation: a pre-dispatch transport failure
+        # is free ($0) and the round-level wait episode owns redial pacing. NOT
+        # a spent wall — the transport-wait terminal owns this shape.
+        return True
+    is_transient = error_kind in _TRANSIENT_RETRY_KINDS
+    # Non-transient retryable classes keep max_retries but never exceed the loop
+    # ceiling, so an attempt_cap'd fallback wastes no backoff sleep (primary: no-op).
+    attempt_budget = transient_budget if is_transient else min(max_retries, transient_budget)
+    if ctx.attempt < attempt_budget - 1:
+        backoff = _retry_backoff_sec(accumulated_usage, error_kind, ctx.attempt, is_transient)
+        if _sleep_within_deadline(backoff, deadline_ts):
+            return False
+        _emit_retry_deadline_exhausted(
+            ctx.drive_logs, task_id=ctx.task_id, execution_id=ctx.execution_id,
+            round_id=ctx.round_id, round_idx=ctx.round_idx, attempt=ctx.attempt,
+            model=ctx.model, error_kind=error_kind,
+        )
+    accumulated_usage[RETRY_WALL_EXHAUSTED_KEY] = True
+    return True
+
+
+def _empty_response_wall_spent(is_provider_glitch: bool, permanent_body_error: bool, usage: Dict[str, Any]) -> bool:
+    """Empty-response exit: spent only while the PROVIDER is failing (finish=None
+    glitch or transient body error); a permanent body error and a live provider
+    (finish="stop"/"length") both keep their one forced call."""
+    return not permanent_body_error and (is_provider_glitch or bool(usage.get("provider_error")))
+
+
+def provider_no_call_source(accumulated_usage: Dict[str, Any], deadline_exhausted: bool) -> Tuple[str, bool]:
+    """The provider-unavailable rail's no-call decision → (typed source, wall_spent).
+    Unknown in-flight outcome forbids a RESEND (outranks the wall); a SPENT
+    same-model wall makes one more forced call a second full retry window; the
+    deadline_local rail keeps its grace call (provider not proven dead), which is
+    why ``deadline_exhausted`` suppresses the wall answer."""
+    if str(accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown":
+        return "provider_outcome_unknown_no_resend", False
+    if not deadline_exhausted and bool(accumulated_usage.get(RETRY_WALL_EXHAUSTED_KEY)):
+        return "retry_wall_exhausted_no_repay", True
+    return "", False
 
 
 def _emit_empty_response_events(
@@ -1171,27 +1242,10 @@ def _handle_main_llm_call_exception(
     _clear_custom_receipts(ctx.accumulated_usage)
     if _record_llm_call_error(error, ctx):
         return True
-    error_kind = str(ctx.accumulated_usage.get("_last_llm_error_kind") or "")
-    if error_kind == "transport_unavailable":
-        # Exactly ONE physical attempt per invocation: a proven pre-dispatch
-        # transport failure is free ($0 released) and an in-helper burst cannot
-        # cure a dead egress — the round-level wait episode owns redial pacing.
-        return True
-    is_transient = error_kind in _TRANSIENT_RETRY_KINDS
-    attempt_budget = transient_budget if is_transient else min(max_retries, transient_budget)
-    if ctx.attempt >= attempt_budget - 1:
-        return True
-    backoff = _retry_backoff_sec(
-        ctx.accumulated_usage, error_kind, ctx.attempt, is_transient,
+    return _stop_after_llm_error(
+        ctx, max_retries=max_retries, transient_budget=transient_budget,
+        deadline_ts=deadline_ts,
     )
-    if _sleep_within_deadline(backoff, deadline_ts):
-        return False
-    _emit_retry_deadline_exhausted(
-        ctx.drive_logs, task_id=ctx.task_id, execution_id=ctx.execution_id,
-        round_id=ctx.round_id, round_idx=ctx.round_idx, attempt=ctx.attempt,
-        model=ctx.model, error_kind=error_kind,
-    )
-    return True
 
 
 def _replace_response_meta(
@@ -1244,33 +1298,6 @@ def _emit_llm_operation(
     )
 
 
-def _handle_llm_call_exception(error: Exception, ctx: _LlmErrorContext) -> bool:
-    _clear_custom_receipts(ctx.accumulated_usage)
-    _emit_llm_operation(
-        ctx.event_queue, ctx.task_id, ctx.llm_call_id, "failed", ctx.task_attempt,
-        ctx.execution_id, ctx.round_id,
-    )
-    if _record_llm_call_error(error, ctx):
-        return True
-    kind = str(ctx.accumulated_usage.get("_last_llm_error_kind") or "")
-    if kind == "transport_unavailable":
-        # One physical attempt per invocation — see _handle_main_llm_call_exception.
-        return True
-    transient = kind in _TRANSIENT_RETRY_KINDS
-    budget = ctx.transient_budget if transient else min(ctx.max_retries, ctx.transient_budget)
-    if ctx.attempt >= budget - 1:
-        return True
-    backoff = _retry_backoff_sec(ctx.accumulated_usage, kind, ctx.attempt, transient)
-    if _sleep_within_deadline(backoff, ctx.deadline_ts):
-        return False
-    _emit_retry_deadline_exhausted(
-        ctx.drive_logs, task_id=ctx.task_id, execution_id=ctx.execution_id,
-        round_id=ctx.round_id, round_idx=ctx.round_idx, attempt=ctx.attempt,
-        model=ctx.model, error_kind=kind,
-    )
-    return True
-
-
 def call_llm_with_retry(
     llm: LLMClient,
     messages: List[Dict[str, Any]],
@@ -1298,6 +1325,7 @@ def call_llm_with_retry(
     msg = None
     _replace_response_meta(response_meta_out)
     drive_root = pathlib.Path(drive_logs).parent
+    accumulated_usage.pop(RETRY_WALL_EXHAUSTED_KEY, None)  # last-invocation marker (see key)
     execution_id = str(accumulated_usage.setdefault("execution_id", new_execution_id()))
     round_id = f"{execution_id}:round:{round_idx}"
     context_fit_event_fields = _context_fit_event_fields(accumulated_usage) if physical_context is not None else {}
@@ -1313,7 +1341,6 @@ def call_llm_with_retry(
             task_id=task_id, model=model, round_idx=round_idx, reserve_sec=transport_reserve_sec,
         ):
             return None, None
-        accumulated_usage["_llm_attempts_used"] = attempt + 1
         llm_call_id = new_call_id("llm")
         call_identity = (task_id, task_attempt, llm_call_id, execution_id, round_id, attempt + 1)
         request_ref: Dict[str, Any] = {}
@@ -1485,10 +1512,11 @@ def call_llm_with_retry(
                         round_id=round_id, round_idx=round_idx, attempt=attempt,
                         model=model, error_kind=event_type,
                     )
+                if _empty_response_wall_spent(is_provider_glitch, permanent_body_error, usage):
+                    accumulated_usage[RETRY_WALL_EXHAUSTED_KEY] = True
                 return None, cost
-            accumulated_usage.pop("execution_status", None)
-            accumulated_usage.pop("result_status", None)
-            accumulated_usage.pop("reason_code", None)
+            for stale in ("execution_status", "result_status", "reason_code", RETRY_WALL_EXHAUSTED_KEY):
+                accumulated_usage.pop(stale, None)
             accumulated_usage["rounds"] = accumulated_usage.get("rounds", 0) + 1
             prompt_tokens = int(usage.get("prompt_tokens") or 0)
             completion_tokens = int(usage.get("completion_tokens") or 0)
