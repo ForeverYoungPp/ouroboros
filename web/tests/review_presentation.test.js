@@ -1425,4 +1425,3 @@ test('history and live chat intercept owner-bound lifecycle before generic progr
     assert.ok(live.indexOf('attachReviewFromRow(msg') >= 0);
     assert.ok(live.indexOf('attachReviewFromRow(msg') < live.indexOf('if (msg.is_progress)'));
 });
-

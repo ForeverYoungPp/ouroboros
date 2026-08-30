@@ -1114,6 +1114,24 @@ def test_actor_projection_carries_bounded_disclosed_finding_rows():
                 },
             },
             {
+                # A non-string value under a KNOWN key keeps structural
+                # key-based masking: str() first would flatten the nested
+                # secret past the key-name redactor.
+                "slot_id": "nested-evidence",
+                "model": "model-f",
+                "status": "ok",
+                "signal": "FAIL",
+                "parsed": {
+                    "verdict": "FAIL",
+                    "summary": "s",
+                    "findings": [{
+                        "severity": "high",
+                        "item": "nested shape",
+                        "evidence": {"password": "hunter2-nested-shape"},
+                    }],
+                },
+            },
+            {
                 # The array-ladder reviewer contract shapes findings as
                 # {item, verdict, severity, reason}: the substantive `reason`
                 # text must survive projection.
@@ -1164,6 +1182,11 @@ def test_actor_projection_carries_bounded_disclosed_finding_rows():
     assert odd_rows and "the only copy of this evidence" in odd_rows[0]["item"]
     assert "hunter2-odd-shape" not in rendered
     assert "***REDACTED***" in odd_rows[0]["item"]
+
+    nested_rows = actors["nested-evidence"]["findings"]
+    assert "hunter2-nested-shape" not in rendered
+    assert "***REDACTED***" in nested_rows[0]["evidence"]
+    assert nested_rows[0]["item"] == "nested shape"
 
     # A list-shaped parsed response (array reviewer contract) projects its
     # rows too, and the substantive `reason`/`verdict` fields survive.

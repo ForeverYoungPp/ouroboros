@@ -528,7 +528,7 @@ function planWaveDetail(wave) {
         wave.paid != null ? `Reviewer panel dispatched: ${wave.paid ? 'yes' : 'no'}` : '',
         wave.quorum_unreachable ? 'Quorum unavailable' : '',
         wave.cycles_exhausted ? 'Review cycles exhausted' : '',
-        wave.reason ? `Reason: ${wave.reason}` : '',
+        wave.reason ? `Reason: ${text(wave.reason)}` : '',
     ];
     const counts = wave.counts && typeof wave.counts === 'object' ? wave.counts : {};
     if (wave.compact) {

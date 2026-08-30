@@ -508,12 +508,11 @@ export function createChatInstance({
     const skillReviewDetailStore = new Map();
     const reviewHydrator = createReviewHydrator({
         fetchDetail: fetchTaskDetailStrict,
-        applyDetail: (id, detail) => !destroyed && attachTaskDetailReviews(id, detail),
+        applyDetail: (id, d) => !destroyed && attachTaskDetailReviews(id, d),
         onState: (id, status) => !destroyed
             && liveCardRecords.get(id)?.reviewController?.setHydrateStatus?.(status),
     });
-    // A proactively-coined name (task_named) can arrive BEFORE the card's
-    // record exists (the namer broadcasts at task start); buffer it here.
+    // A task_named frame can arrive before the card's record exists; buffer it.
     const pendingSuggestedNames = new Map();
     const taskUiStates = new Map();
     // Busy-chat decision turns reuse the normal agent/event path for ordering and
@@ -1480,7 +1479,10 @@ export function createChatInstance({
     function handleReviewReference(row) {
         const reference = reviewReferenceFromRow(row);
         if (!reference) return false;
-        hydrateCardReviews(reference.presentationOwnerTaskId, reference.stateRevision);
+        const owner = reference.presentationOwnerTaskId;
+        // A reference proves a review exists: mint the card so errors have a home.
+        forceTaskCard(owner, row?.ts || '');
+        hydrateCardReviews(owner, reference.stateRevision);
         return true;
     }
 
@@ -1579,8 +1581,7 @@ export function createChatInstance({
             // used to name a project on "turn into project" when the server has no
             // title/objective yet (P1, direct-chat conversion). One-shot handoff.
             objectiveHint: (isMain && !options.isSubagent) ? _pendingCardObjective : '',
-            // Cluster B: the proactively-coined LLM project name; when set it becomes
-            // the card title (the activity headline keeps rendering in the lines below).
+            // The proactively-coined LLM name; becomes the card title when set.
             suggestedName: '',
             // P1 (v6.82): last bounded activity projection (remembered even while
             // the collapsed line is suppressed on unnamed root cards) + sticky cost.

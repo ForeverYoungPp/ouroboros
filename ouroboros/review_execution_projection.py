@@ -33,12 +33,18 @@ def projected_finding_row(item: Any) -> Dict[str, str]:
     if not isinstance(item, dict):
         return row
     for key in _PROJECTED_FINDING_KEYS:
-        value = str(item.get(key) or "")
-        if not value:
+        value = item.get(key)
+        if value is None or value == "":
             continue
-        row[key] = truncate_review_artifact(
-            str(redact_projection(value).value), PROJECTED_FINDING_TEXT_CHARS,
-        )
+        if isinstance(value, str):
+            rendered = str(redact_projection(value).value)
+        else:
+            # A non-string value keeps structural key-based masking: str()
+            # first would flatten a nested secret past the key-name redactor.
+            rendered = json.dumps(
+                redact_projection(value).value, ensure_ascii=False, default=str,
+            )
+        row[key] = truncate_review_artifact(rendered, PROJECTED_FINDING_TEXT_CHARS)
     if not row:
         # An unknown finding shape still carries evidence; a silently empty row
         # would destroy it without a trace. Redact the OBJECT before
