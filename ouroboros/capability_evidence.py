@@ -666,14 +666,24 @@ def resolve_main_token_density(drive_root: Any, route_fp: str, model_id: str) ->
 
 
 def resolve_review_token_density(drive_root: Any, model_id: str) -> Tuple[float, str]:
-    """Densest fresh compatible witness, never below the conservative cold floor."""
+    """Densest fresh exact-model witness (authoritative, may undercut the cold
+    floor), else the cold floor over any fresh compatible witness.
+
+    A fresh exact-model witness measures THIS model's real tokenizer density, so
+    it is allowed to lower the effective density below ``COLD_START_TOKEN_DENSITY``
+    (issue #284: the floor otherwise shrinks a 1M-window reviewer to ~575K
+    estimated input tokens against a measured 0.86-1.01 density, and the managed
+    scope atlas can never assemble). The floor keeps governing when the only
+    evidence is stale (TTL-expired), absent, or from a different model."""
     try:
         store = _load(drive_root).get("token_density", {}) or {}
         exact = _fresh_density_pairs(store, _normalized_density_model(model_id))
-        witnessed = exact or _fresh_density_pairs(store)
+        if exact:
+            return max(item[1] for item in exact) * MEASURED_DENSITY_SAFETY_FACTOR, "measured"
+        witnessed = _fresh_density_pairs(store)
         if witnessed:
             density = max(item[1] for item in witnessed) * MEASURED_DENSITY_SAFETY_FACTOR
-            return max(COLD_START_TOKEN_DENSITY, density), "measured" if exact else "cold_conservative"
+            return max(COLD_START_TOKEN_DENSITY, density), "cold_conservative"
     except Exception:
         pass
     return COLD_START_TOKEN_DENSITY, "cold_conservative"

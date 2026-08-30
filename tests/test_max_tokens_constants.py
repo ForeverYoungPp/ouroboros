@@ -273,11 +273,14 @@ def test_calibrated_input_limit_shared_helper(tmp_path, monkeypatch):
     )
     assert limit("anthropic/claude-fable-5") == int(900_000 / 1.65)
 
-    # A lighter witness cannot loosen review sizing below the cold-conservative floor.
+    # #284 successor: a FRESH EXACT-MODEL witness is authoritative and may
+    # undercut the cold floor — the limit loosens to the density form, still
+    # bounded above by the historical absolute-margin form (745K here).
     record_token_density(
         tmp_path, "openai/gpt-5.5", prompt_chars=chars, prompt_tokens=int(1.0 * chars / 4),
     )
-    assert limit("openai/gpt-5.5") == int(900_000 / COLD_START_TOKEN_DENSITY)
+    assert limit("openai/gpt-5.5") == 1_000_000 - 100_000 - 155_000  # margin-bounded
+    assert limit("openai/gpt-5.5") > int(900_000 / COLD_START_TOKEN_DENSITY)
 
     # Deep self-review consumes the same helper for its model-aware gate.
     assert "calibrated_input_token_limit" in inspect.getsource(deep_self_review.run_deep_self_review)

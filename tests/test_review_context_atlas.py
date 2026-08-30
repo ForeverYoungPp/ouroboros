@@ -318,7 +318,13 @@ def test_atlas_required_overflow_is_an_assembly_failure_not_a_smaller_pack(tmp_p
     assert [row["path"] for row in atlas_unassembled_required(pack.manifest)] == ["BIBLE.md"]
     assert [row["path"] for row in pack.manifest["unassembled_required"]] == ["BIBLE.md"]
     assert not hasattr(pack, "unassembled_required")
-    assert "exceeded the atlas hard budget" in pack.manifest["unassembled_required"][0]["reason"]
+    # Successor pin: the reason states the honest arithmetic (remaining budget
+    # after higher-priority content and the measured manifest render), not the
+    # old ambiguous "file exceeded the hard budget" claim.
+    assert "does not fit the atlas hard budget" in pack.manifest["unassembled_required"][0]["reason"]
+    assert "remain after higher-priority content and the rendered manifest" in (
+        pack.manifest["unassembled_required"][0]["reason"]
+    )
     assert "BIBLE.md" in atlas_assembly_failure_reason(pack)
     assert coverage["BIBLE.md"]["disposition"] == "budget_omitted"
     assert coverage["small.py"]["disposition"] == "full"
@@ -328,25 +334,35 @@ def test_atlas_required_overflow_is_an_assembly_failure_not_a_smaller_pack(tmp_p
 def test_atlas_required_removed_by_shrink_wave_is_the_same_assembly_failure(tmp_path):
     """The twin branch: a required artifact that PASSED selection and was then
     dropped by the hard-budget shrink wave is the identical failure — one
-    branch fixed while its sibling degrades silently is the whole defect."""
-    for idx in range(6):
-        _write(tmp_path / "prompts" / f"p_{idx}.md", "prompt line\n" * 260)
+    branch fixed while its sibling degrades silently is the whole defect.
+
+    Successor construction: with the manifest render now MEASURED and charged
+    at admission, the wave fires only on residual estimator drift (the
+    selected-rows part of the manifest preview grows with each admission), so
+    the scenario uses many small required files whose per-admission row cost
+    accumulates past the greedy slack."""
+    tracked = []
+    for idx in range(30):
+        rel = f"prompts/section_{idx:02d}/prompt_body_file_{idx:02d}.md"
+        tracked.append(rel)
+        _write(tmp_path / rel, "prompt line\n" * 60)
 
     pack = compile_review_context_atlas(
         ReviewContextAtlasRequest(
             repo_dir=tmp_path,
-            tracked_paths=tuple(f"prompts/p_{idx}.md" for idx in range(6)),
+            tracked_paths=tuple(tracked),
             fixed_prompt_tokens=100,
-            target_total_tokens=4_000,
-            hard_total_tokens=8_000,
+            target_total_tokens=11_750,
+            hard_total_tokens=12_750,
         )
     )
 
     omitted_reasons = {row["path"]: row["reason"] for row in pack.manifest["unassembled_required"]}
     assert omitted_reasons, "shrink wave must have dropped at least one required prompt file"
-    assert any("removed to keep atlas below hard budget" in reason for reason in omitted_reasons.values()), (
-        f"expected the shrink-wave branch, got: {omitted_reasons}"
-    )
+    assert any(
+        "admitted, then removed because the rendered atlas exceeded the hard budget" in reason
+        for reason in omitted_reasons.values()
+    ), f"expected the shrink-wave branch, got: {omitted_reasons}"
     assert pack.status == "required_artifact_omitted"
     assert atlas_assembly_failed(pack)
 
@@ -647,3 +663,132 @@ def test_required_beyond_diff_is_one_public_definition_for_every_consumer():
     # a merely-touched ordinary file may legally degrade to diff-only
     assert not atlas_required_beyond_diff("module.py")
     assert not atlas_required_beyond_diff("tests/test_thing.py")
+
+
+def test_atlas_charges_the_measured_manifest_render_at_admission(tmp_path):
+    """Issue #284 pack arithmetic: the rendered manifest/index skeleton is part
+    of the pack, so admission charges it up front instead of reserving a blind
+    constant. Observable contract: the assembled pack respects the hard budget
+    WITHOUT wave-evicting content that was admitted against a budget the render
+    then consumed — for a comfortably-sized repo no coverage row may carry an
+    'admitted, then removed' reason, and the total honors the hard cap."""
+    tracked = []
+    for idx in range(12):
+        rel = f"pkg/module_{idx:02d}.py"
+        tracked.append(rel)
+        _write(tmp_path / rel, "def f():\n    return 'x'\n" * 80)
+
+    pack = compile_review_context_atlas(
+        ReviewContextAtlasRequest(
+            repo_dir=tmp_path,
+            tracked_paths=tuple(tracked),
+            fixed_prompt_tokens=100,
+            target_total_tokens=6_000,
+            hard_total_tokens=9_000,
+        )
+    )
+
+    assert pack.manifest["estimated_total_tokens"] <= 9_000
+    assert pack.status in {"budget_constrained", "ok", "under_target"}
+    reasons = [row["reason"] for row in pack.manifest["coverage"]]
+    assert not any("admitted, then removed" in reason for reason in reasons), reasons
+    # Files that did not fit were refused AT ADMISSION with the honest reason.
+    not_selected = [r for r in reasons if "not selected within atlas target budget" in r]
+    assert not_selected, "the target budget must have refused at least one candidate"
+
+
+def test_atlas_admission_reason_reports_remaining_capacity_not_a_file_claim(tmp_path):
+    """Honest per-file diagnostics: a required file refused at admission names
+    the REMAINDER it did not fit (after higher-priority content and the
+    rendered manifest), never the ambiguous claim that the file alone exceeded
+    the whole hard budget."""
+    _write(tmp_path / "prompts" / "big_a.md", "prompt line\n" * 900)
+    _write(tmp_path / "prompts" / "big_b.md", "prompt line\n" * 900)
+
+    pack = compile_review_context_atlas(
+        ReviewContextAtlasRequest(
+            repo_dir=tmp_path,
+            tracked_paths=("prompts/big_a.md", "prompts/big_b.md"),
+            fixed_prompt_tokens=100,
+            target_total_tokens=8_000,
+            hard_total_tokens=9_000,
+        )
+    )
+
+    rows = pack.manifest["unassembled_required"]
+    assert rows, "one of the two required prompts must not fit"
+    for row in rows:
+        assert "does not fit the atlas hard budget" in row["reason"]
+        assert "remain after higher-priority content and the rendered manifest" in row["reason"]
+
+
+def test_atlas_compact_manifest_is_the_default_and_collapses_excluded_rows(tmp_path):
+    """Approved with the #284 fixes: compact coverage is the default prompt
+    form, and policy-excluded classes collapse to per-directory count rows in
+    the compact index (the durable manifest keeps every per-path row)."""
+    assert ReviewContextAtlasRequest(repo_dir=tmp_path).compact_manifest is True
+
+    _write(tmp_path / "app.py", "import helper\n\nprint(helper.VALUE)\n")
+    _write(tmp_path / "helper.py", "VALUE = 42\n")
+    for idx in range(4):
+        _write(tmp_path / "tests" / f"test_mod_{idx}.py", "def test_ok():\n    assert True\n")
+    _write(tmp_path / "assets" / "logo.png", "not really a png")
+
+    pack = compile_review_context_atlas(
+        ReviewContextAtlasRequest(
+            repo_dir=tmp_path,
+            tracked_paths=(
+                "app.py",
+                "helper.py",
+                "tests/test_mod_0.py",
+                "tests/test_mod_1.py",
+                "tests/test_mod_2.py",
+                "tests/test_mod_3.py",
+                "assets/logo.png",
+            ),
+            anchors=("app.py",),
+            fixed_prompt_tokens=100,
+            target_total_tokens=20_000,
+            hard_total_tokens=25_000,
+        )
+    )
+
+    # Excluded classes are collapsed to one per-directory row in the index…
+    assert "excluded_test\ttests/ (4 files)" in pack.text
+    assert "excluded_dir\tassets/ (1 files)" in pack.text  # assets/ is a skip-dir class
+    assert "\ttests/test_mod_0.py" not in pack.text
+    # …reviewable rows keep their per-path lines…
+    assert "\tapp.py" in pack.text
+    assert "\thelper.py" in pack.text
+    # …and the durable manifest still carries every per-path coverage row.
+    assert {row["path"] for row in pack.manifest["coverage"]} == {
+        "app.py",
+        "helper.py",
+        "tests/test_mod_0.py",
+        "tests/test_mod_1.py",
+        "tests/test_mod_2.py",
+        "tests/test_mod_3.py",
+        "assets/logo.png",
+    }
+
+
+def test_scope_ladder_never_hands_required_beyond_diff_paths_to_diff_only(tmp_path):
+    """The self-defeating rung is removed: the atlas refuses a diff-only
+    required artifact by design, so `_degradable_diff_only_paths` must never
+    offer an atlas-required-beyond-diff path to the diff-only tier."""
+    from ouroboros.tools import scope_review as sr
+
+    _write(tmp_path / "prompts" / "SYSTEM.md", "system prompt\n")
+    _write(tmp_path / "ouroboros" / "mod.py", "x = 1\n")
+    _write(tmp_path / "docs" / "ARCHITECTURE.md", "arch\n")
+
+    degradable = sr._degradable_diff_only_paths(
+        tmp_path,
+        ["prompts/SYSTEM.md", "ouroboros/mod.py", "docs/ARCHITECTURE.md"],
+        [],
+        [],
+    )
+
+    assert "ouroboros/mod.py" in degradable
+    assert "prompts/SYSTEM.md" not in degradable
+    assert "docs/ARCHITECTURE.md" not in degradable

@@ -389,9 +389,12 @@ def _degradable_diff_only_paths(repo_dir: pathlib.Path, current: list,
                                 skipped: list, deleted: list,
                                 renamed: frozenset = frozenset(), *,
                                 m0_tree: str = "", staged_tree: str = "") -> list:
-    """Touched paths the ladder may hand to the diff-only tier. Current paths join
-    freely, exactly as before (atlas-required ones degrade only after -U0). Touched
-    TESTS — skipped-by-design current ones and deleted ones — join the free tier too,
+    """Touched paths the ladder may hand to the diff-only tier. Current paths
+    join freely EXCEPT atlas-required-beyond-diff ones: the atlas refuses a
+    diff-only required artifact by design (typed ``budget_omitted`` assembly
+    failure), so degrading one can only convert the pack into a refusal, never
+    into a fitting pack — a self-defeating rung, removed. Touched TESTS —
+    skipped-by-design current ones and deleted ones — join the free tier too,
     with cheap conservative guards: atlas-required tests never degrade; binary and
     RENAMED paths keep their snapshot/metadata (the staged text diff may not carry
     their change); an oversized/sensitive deletion keeps its suppression marker."""
@@ -416,7 +419,10 @@ def _degradable_diff_only_paths(repo_dir: pathlib.Path, current: list,
         return True
 
     return (
-        list(current)
+        [
+            p for p in current
+            if not atlas_required_beyond_diff(p.replace("\\", "/").lstrip("./"))
+        ]
         + [p for p in skipped if _degradable_test(p, False)]
         + [p for p in deleted if _degradable_test(p, True)]
     )
@@ -816,10 +822,12 @@ def _build_scope_prompt(
             except Exception:
                 return 0
 
-    # Guaranteed-fit ladder: full atlas; compact atlas; degrade degradable touched files
-    # to diff-only (largest first); drop unchanged diff context; artifacts last. Else CLOSED.
+    # Guaranteed-fit ladder: compact atlas (the default form); degrade degradable
+    # touched files to diff-only (largest first); drop unchanged diff context.
+    # Else CLOSED — atlas-required-beyond-diff artifacts never degrade to
+    # diff-only, because the atlas refuses such a pack by design.
     input_limit = _effective_scope_input_limit(scope_model=scope_model)
-    _atlas_min_allowance = 35_000  # manifest reserve + hard headroom, see review_context_atlas
+    _atlas_min_allowance = 35_000  # rendered-manifest + hard headroom allowance, see review_context_atlas
     diff_only_paths: list = []
     # FREE tier includes touched tests and eligible deletions (guards in the helper).
     degradable = sorted(
@@ -828,9 +836,9 @@ def _build_scope_prompt(
             renamed_paths,
             m0_tree=getattr(subject, "m0_tree", "") or "",
             staged_tree=getattr(subject, "staged_tree", "") or ""),
-        key=lambda path: (atlas_required_beyond_diff(path), -_touched_token_estimate(path)),
+        key=lambda path: -_touched_token_estimate(path),
     )
-    compact = False
+    compact = True
     compact_diff_attempted = False
     last_known_tokens = 0
     unassembled_required: list = []
@@ -843,31 +851,23 @@ def _build_scope_prompt(
         atlas_text = None
         try:
             atlas_text = _atlas_section(fixed_prompt_tokens, compact)
-        except _ScopeAtlasNotAssembled as exc:
-            refusal = exc
-            if not compact:
-                compact = True
-                try:
-                    atlas_text = _atlas_section(fixed_prompt_tokens, True)
-                except _ScopeAtlasNotAssembled as compact_exc:
-                    refusal = compact_exc
-            if atlas_text is None:
-                last_known_tokens = int(refusal.manifest.get("estimated_total_tokens") or 0)
-                # The atlas manifest is the ONE carrier of what did not assemble; a
-                # refusal is a ladder STEP (P1) that can carry TWO causes — capture both.
-                unassembled_required = [
-                    str(row.get("path") or "?") for row in atlas_unassembled_required(refusal.manifest)
-                ]
-                atlas_overflowed = atlas_hard_budget_overflowed(refusal.manifest)
-                ladder_steps.append({
-                    "step": "atlas_refused", "compact": compact, "reason": str(refusal),
-                    "unassembled_required": list(unassembled_required),
-                    "atlas_overflowed": atlas_overflowed,
-                    "tokens_after": last_known_tokens,
-                    "diff_only_files": len(diff_only_paths),
-                    "diff_only_paths": list(diff_only_paths),
-                    "zero_context_diff": compact_diff_attempted,
-                })
+        except _ScopeAtlasNotAssembled as refusal:
+            last_known_tokens = int(refusal.manifest.get("estimated_total_tokens") or 0)
+            # The atlas manifest is the ONE carrier of what did not assemble; a
+            # refusal is a ladder STEP (P1) that can carry TWO causes — capture both.
+            unassembled_required = [
+                str(row.get("path") or "?") for row in atlas_unassembled_required(refusal.manifest)
+            ]
+            atlas_overflowed = atlas_hard_budget_overflowed(refusal.manifest)
+            ladder_steps.append({
+                "step": "atlas_refused", "compact": compact, "reason": str(refusal),
+                "unassembled_required": list(unassembled_required),
+                "atlas_overflowed": atlas_overflowed,
+                "tokens_after": last_known_tokens,
+                "diff_only_files": len(diff_only_paths),
+                "diff_only_paths": list(diff_only_paths),
+                "zero_context_diff": compact_diff_attempted,
+            })
 
         deficit = 0
         if atlas_text is not None:
@@ -879,7 +879,7 @@ def _build_scope_prompt(
             unassembled_required = []  # assembled: no earlier refusal is the cause now
             atlas_overflowed = False
             ladder_steps.append({
-                "step": "compact_atlas" if compact else "full_atlas",
+                "step": "compact_atlas",
                 "tokens_before": last_known_tokens,
                 "tokens_after": prompt_tokens,
                 "diff_only_files": len(diff_only_paths),
@@ -891,17 +891,16 @@ def _build_scope_prompt(
             if prompt_tokens <= input_limit:
                 _record_ladder_steps(ladder_steps)
                 return prompt, None
-            if not compact:
-                # Retry the same touched set with the compact atlas first.
-                compact = True
-                continue
             deficit = prompt_tokens - input_limit
         else:
             # Even the manifest cannot fit beside the fixed part: shrink it for room.
             deficit = max(50_000, fixed_prompt_tokens + _atlas_min_allowance - input_limit)
 
-        def can_degrade() -> bool:  # required tier only after -U0
-            return bool(degradable) and (compact_diff_attempted or not atlas_required_beyond_diff(degradable[0]))
+        # Degradable never holds atlas-required-beyond-diff paths: the atlas
+        # refuses a diff-only required artifact by design, so that rung could
+        # only convert this pack into a typed refusal, never into a fit.
+        def can_degrade() -> bool:
+            return bool(degradable)
 
         if not can_degrade():
             if not compact_diff_attempted:  # every +/- line, no unchanged context
@@ -915,8 +914,6 @@ def _build_scope_prompt(
                     compact_diff = ""  # the full capture above stays the evidence
                 if compact_diff.strip() and compact_diff != diff_text:
                     diff_text = compact_diff
-                    continue
-                if can_degrade():  # -U0 gave nothing, but the required tier is open now
                     continue
             # Terminal pack status: >=1M authority is fixed_overflow; a sub-floor pack is
             # budget_exceeded (blocked unless owner advisory). CAUSE travels separately.

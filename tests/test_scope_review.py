@@ -525,7 +525,9 @@ class TestRunScopeReviewFailClosed:
         assert "DELETED" in prompt
 
     def test_build_scope_prompt_retries_compact_atlas_after_budget_overflow(self, tmp_path, monkeypatch):
-        """Atlas budget overflow should retry once with compact manifest mode."""
+        """#284 successor: compact coverage IS the atlas form — every gather is
+        compact from the first call and there is no fuller form to retry
+        from (the old full->compact retry rung is deleted by design)."""
         import subprocess
 
         subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
@@ -549,8 +551,6 @@ class TestRunScopeReviewFailClosed:
 
         def fake_gather(_repo_dir, _paths, **kwargs):
             calls.append(bool(kwargs.get("compact")))
-            if not kwargs.get("compact"):
-                raise mod._ScopeAtlasNotAssembled({"estimated_total_tokens": 900_000})
             return "COMPACT ATLAS"
 
         monkeypatch.setattr(mod, "_gather_scope_packs", fake_gather)
@@ -558,7 +558,7 @@ class TestRunScopeReviewFailClosed:
         prompt, omitted = mod._build_scope_prompt(tmp_path, "test commit")
 
         assert omitted is None
-        assert calls == [False, True]
+        assert calls and all(calls)  # compact-only, from the very first gather
         assert "COMPACT ATLAS" in prompt
 
     def test_build_scope_prompt_irreducible_overflow_fails_closed(self, tmp_path, monkeypatch):
@@ -588,9 +588,7 @@ class TestRunScopeReviewFailClosed:
 
         def fake_gather(_repo_dir, _paths, fixed_prompt_tokens=0, compact=False, **_kw):
             calls.append(compact)
-            if compact:
-                raise mod._ScopeAtlasNotAssembled({"estimated_total_tokens": 900_001})
-            return "OVERSIZED ATLAS"
+            raise mod._ScopeAtlasNotAssembled({"estimated_total_tokens": 900_001})
 
         monkeypatch.setattr(mod, "_gather_scope_packs", fake_gather)
         monkeypatch.setattr(mod, "estimate_tokens", lambda _text: 800_000)
@@ -600,9 +598,8 @@ class TestRunScopeReviewFailClosed:
         assert prompt is None
         assert status.status == "fixed_overflow"
         assert status.token_count > 0
-        # First pass full atlas, then compact retries while the ladder degrades.
-        assert calls[0] is False
-        assert all(calls[1:])
+        # Compact is the only atlas form: every ladder gather asked for it.
+        assert calls and all(calls)
 
     def test_build_scope_prompt_uses_zero_context_diff_before_overflow(self, tmp_path, monkeypatch):
         """The last fit step removes unchanged context, not changed lines or calls."""
@@ -2564,7 +2561,7 @@ def test_ladder_steps_are_recorded_once_aggregated(tmp_path, monkeypatch):
     manifest = sr._current_scope_context_manifest()
     steps = manifest.get("ladder_steps")
     assert isinstance(steps, list) and len(steps) == 1
-    assert steps[0]["step"] == "full_atlas"
+    assert steps[0]["step"] == "compact_atlas"  # compact is the only atlas form (#284)
     assert set(steps[0]) >= {"tokens_before", "tokens_after", "diff_only_files", "deficit"}
 
 
@@ -3304,13 +3301,12 @@ def test_unavailable_staged_diff_blocks_instead_of_reviewing_a_placeholder(tmp_p
 def test_ladder_cannot_degrade_a_required_beyond_diff_artifact_to_diff_only(
     tmp_path, monkeypatch,
 ):
-    """XR-4 end-to-end. The guaranteed-fit ladder degrades the LARGEST touched
-    files to diff-only; when that file is an artifact owed in full regardless of
-    the change (here a `prompts/` file), the atlas used to accept the declared
-    drop without a typed failure and scope review PROCEEDED with the prompt's
-    full snapshot in neither the fixed prompt nor the atlas. Now the atlas
-    refuses (BIBLE P3), the refusal is a recorded ladder step, and the terminal
-    names the artifact — review does not proceed on the remainder."""
+    """XR-4 end-to-end, #284 successor. An artifact owed in full regardless of
+    the change (here a `prompts/` file) NEVER enters the diff-only tier: the
+    self-defeating rung is gone, the artifact stays delivered whole (fixed
+    prompt context), ordinary files degrade and -U0 is attempted, and an
+    irreducible misfit closes with the typed fixed_overflow — with NOTHING
+    omitted, because refusing to degrade is exactly what kept it whole."""
     import subprocess
 
     from ouroboros.tools import scope_review as sr
@@ -3346,26 +3342,21 @@ def test_ladder_cannot_degrade_a_required_beyond_diff_artifact_to_diff_only(
 
     assert prompt is None
     assert status.status == "fixed_overflow"          # authority branch unchanged
-    assert status.unassembled_required == ["prompts/big_prompt.md"]
+    # #284 successor contract: the required-beyond-diff artifact is NEVER
+    # handed to the diff-only tier (the atlas would refuse such a pack by
+    # design, so that rung could only manufacture a refusal). It stays owed
+    # in full — here delivered via the fixed prompt context — and nothing is
+    # omitted: the typed overflow says the configured input limit is simply
+    # too small for the owed-in-full content.
+    assert status.unassembled_required == []
     steps = sr._current_scope_context_manifest().get("ladder_steps") or []
-    refused = [s for s in steps if s["step"] == "atlas_refused"]
-    assert refused, steps
-    # The refusal naming the artifact is a recorded ladder step (the FIRST
-    # refusal may be the pre-degradation hard-budget one with no named rows).
-    assert any(
-        s["unassembled_required"] == ["prompts/big_prompt.md"] for s in refused
-    ), refused
-    rows = {r["path"]: r for r in sr._current_scope_context_manifest()["coverage"]}
-    assert rows["prompts/big_prompt.md"]["disposition"] == "budget_omitted"
-    # An ORDINARY touched file may still ride the disclosed diff-only step
-    # (pinned by test_diff_only_degradation_is_not_reported_as_fully_included).
-    # ORDERING: the tier sort only reorders, so the pop loop must also refuse to cross
-    # into the required tier until the zero-context rung has been tried — degrading a
-    # required artifact provably cannot buy a fitting pack, while -U0 still might. Every
-    # recorded step that already shows the artifact degraded must show -U0 attempted.
     for step in steps:
-        if step.get("unassembled_required") and step.get("diff_only_files"):
-            assert step["zero_context_diff"] is True, step
+        assert "prompts/big_prompt.md" not in (step.get("diff_only_paths") or []), step
+    rows = {r["path"]: r for r in sr._current_scope_context_manifest()["coverage"]}
+    assert rows["prompts/big_prompt.md"]["disposition"] == "already_included"
+    # The ordinary file DID ride the disclosed diff-only rung, and -U0 was
+    # attempted before the ladder closed.
+    assert any(step.get("diff_only_files") for step in steps), steps
     assert any(step.get("zero_context_diff") for step in steps), steps
 
 
