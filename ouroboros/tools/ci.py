@@ -203,11 +203,10 @@ def _extract_os(job_name: str) -> str:
 
 
 def _emit_progress(ctx: ToolContext, text: str):
-    ctx.pending_events.append({
-        "type": "progress",
-        "text": text,
-        "ts": utc_now_iso(),
-    })
+    # Live narration rides the registered progress path; a bare
+    # {"type": "progress"} pending event has no supervisor handler and was
+    # silently dropped as unknown_worker_event.
+    ctx.emit_progress_fn(text)
 
 def _run_ci_tests(ctx: ToolContext, wait: bool = True, timeout_minutes: int = 15) -> str:
     try:

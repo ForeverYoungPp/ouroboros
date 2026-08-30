@@ -92,6 +92,7 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
     succeeded: set = set()
     failure_states: List[str] = []
     models: List[str] = []
+    applied_access_profiles: List[str] = []
     cost_total, cost_known, cost_estimated = 0.0, True, False
     # Scope finding (a5e59bdf gate): an UNREADABLE log must not collapse into
     # the same zero-count result as a proven empty one — a reader would then
@@ -164,6 +165,14 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
             model = str(row.get("model") or "")
             if model and model not in models:
                 models.append(model)
+            # D29 applied-access disclosure: the settlement row records the
+            # ACCESS the engine actually served (effectiveAccess), distinct
+            # from the STARTED row's granted shape. Projected so the chip and
+            # acceptance readers can answer asked-vs-applied without joining
+            # the ledger. Empty when telemetry predates the receipt.
+            applied_access = str(row.get("access_profile") or "")
+            if applied_access and applied_access not in applied_access_profiles:
+                applied_access_profiles.append(applied_access)
     # A partial work-order run is not a successful delegated substrate until the
     # durable verified-range union covers the complete canonical brief. Reuse the
     # custody replay (the same SSOT used by wait/apply) so a restart cannot turn a
@@ -214,6 +223,9 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
         # dropped: an estimated sum must never render as an exact receipt.
         "subscription_cost_estimated": bool(settled and cost_known and cost_estimated),
         "harness_models": models,
+        # Additive (D29 projection): the access the engine actually served,
+        # from SETTLED rows only. Empty list = no receipt disclosed it.
+        "applied_access_profiles": applied_access_profiles,
     }
 
 

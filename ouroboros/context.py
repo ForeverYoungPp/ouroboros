@@ -1429,7 +1429,9 @@ def _capture_context_core(
 
     semi_stable_text = "\n\n".join(semi_stable_parts)
 
-    health_section = build_health_invariants(context_env)
+    health_section = build_health_invariants(
+        context_env, task_id=str(task.get("id") or "")
+    )
     dynamic_parts = []
     if health_section:
         dynamic_parts.append(health_section)

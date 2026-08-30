@@ -38,6 +38,7 @@ from ouroboros.subagent_messages import subagent_message_meta
 from ouroboros.task_finalization import send_provider_death_notice
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
 from supervisor.cognitive_operations import EVENT_HANDLERS as _CEH, _handle_cognitive_operation  # noqa: F401
+from supervisor.telemetry_events import TELEMETRY_EVENT_HANDLERS as _TELEMETRY_EVENT_HANDLERS
 from supervisor.log_addressing import (  # re-export: one events surface
     address_ctx_event as _address_ctx,
     address_task_event as _address_task_event,  # noqa: F401  (tests pin it here)
@@ -4186,21 +4187,6 @@ def _handle_owner_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
         log.warning("Failed to log owner_message_injected event", exc_info=True)
 
 
-def _handle_review_wave_budget_insufficient(evt: Dict[str, Any], ctx: Any) -> None:
-    """Persist the typed review-wave admission refusal durably (v6.69.0).
-
-    Without a registered handler the worker event would land in
-    supervisor.jsonl as an unknown_worker_event repr instead of a typed
-    events.jsonl row that budget audits can aggregate."""
-    try:
-        append_jsonl(
-            ctx.DRIVE_ROOT / "logs" / "events.jsonl",
-            {"ts": evt.get("ts", utc_now_iso()), **{k: v for k, v in evt.items() if k != "ts"}},
-        )
-    except Exception:
-        log.debug("Failed to log review_wave_budget_insufficient event", exc_info=True)
-
-
 def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
     """Forward live events; persist durable task checkpoints."""
     data = evt.get("data")
@@ -4410,7 +4396,7 @@ EVENT_HANDLERS = {
     "toggle_consciousness": _handle_toggle_consciousness,
     "owner_message_injected": _handle_owner_message_injected,
     "log_event": _handle_log_event,
-    "review_wave_budget_insufficient": _handle_review_wave_budget_insufficient,
+    **_TELEMETRY_EVENT_HANDLERS,
     "skill_exec_finished": _handle_skill_lifecycle,
     "skill_exec_failed": _handle_skill_lifecycle,
     "acceptance_fence": _handle_acceptance_fence,

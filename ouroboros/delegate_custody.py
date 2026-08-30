@@ -144,6 +144,7 @@ class RunCustody:
     authority_fingerprint: str = ""
     ledger_recorded: bool = False
     settled: bool = False
+    terminal_state: str = ""  # SETTLED row's state, replayed (empty pre-existing/CLOSED_ABSENT)
     containment_disclosed: bool = False  # written once; a re-poll must not re-find
     unread_disclosed: bool = False  # settled-never-read omission named durably
     # Staged-output half of the terminal story (D7). ``output_artifact``:
@@ -460,14 +461,13 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
         disposition = str(row.get("disposition") or "")
         if disposition:
             custody.patch_disposed = disposition
-            # A recorded disposition completes the apply-intent story too.
-            custody.patch_apply_pending = False
+            custody.patch_apply_pending = False  # a recorded disposition completes the apply-intent story
     elif kind == SETTLED:
         # A RUN-level fact: it no longer clears the registration obligation -
         # PROJECT_RETIRED is the only discharging row (historical logs always
         # emitted it before SETTLED, so replay is unaffected).
-        custody.ledger_recorded = True
-        custody.settled = True
+        custody.ledger_recorded = custody.settled = True
+        custody.terminal_state = str(row.get("state") or "") or custody.terminal_state
     elif kind == CLOSED_ABSENT:
         # Closed, not settled: custody is over, the run leaves ``open_runs``.
         # The registration survives independently (wholesale clearing here was

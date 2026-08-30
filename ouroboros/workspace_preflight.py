@@ -127,8 +127,12 @@ def render_workspace_preflight_summary(summary: Dict[str, Any]) -> str:
         f"- git_dirty: {bool(git.get('dirty'))} ({int(git.get('status_count') or 0)} status entries)",
         "- manifests: "
         + (", ".join(str(item.get("path") or "") for item in manifests if isinstance(item, dict)) or "<none detected>"),
-        "- available_tools: " + (", ".join(tools.get("available") or []) or "<none detected>"),
-        "- missing_tools: " + (", ".join(tools.get("missing") or []) or "<none detected>"),
+        # "on PATH" is what shutil.which actually measured; "available" over-
+        # claimed executability (a broken binary on PATH counted as available).
+        # The structured summary keys stay unchanged — they ride durable
+        # task metadata and old rows must keep replaying.
+        "- tools_on_path: " + (", ".join(tools.get("available") or []) or "<none detected>"),
+        "- tools_missing_from_path: " + (", ".join(tools.get("missing") or []) or "<none detected>"),
     ]
     if summary.get("error"):
         lines.append(f"- preflight_error: {summary.get('error')}")

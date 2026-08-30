@@ -207,11 +207,30 @@ export function executorChip(evt) {
         || Number.isFinite(Number(evidence.delegated_runs_succeeded ?? NaN));
     const ok = Math.max(0, settled - failed);
     const okPart = `${ok} ok${failed ? `, ${failed} failed` : ''}`;
+    // Unverified work-order coverage is an honesty fact, not a style note:
+    // those runs were discounted from the ok-count, and the label must say
+    // why a "successful" delegation reads short. Access rides the tooltip —
+    // requested surface from the frame, applied access from the settlement
+    // receipts when the engine disclosed it (empty = predates the receipt).
+    const unresolved = Number(evidence.delegated_runs_source_unresolved || 0);
+    const unresolvedPart = unresolved
+        ? `, ${unresolved} unverified`
+        : '';
+    const accessClauses = [];
+    const surface = String(evt?.write_surface || '').trim();
+    if (surface) accessClauses.push(`write surface ${surface}`);
+    const applied = Array.isArray(evidence.applied_access_profiles)
+        ? evidence.applied_access_profiles.filter(Boolean) : [];
+    if (applied.length) accessClauses.push(`access applied: ${applied.join(', ')}`);
+    const accessPart = accessClauses.length ? ` — ${accessClauses.join('; ')}` : '';
+    const unresolvedTitle = unresolved
+        ? ` — ${unresolved} run(s) settled with unverified work-order coverage (not counted ok)`
+        : '';
     return {
         ...base,
         hasEvidence: true,
-        label: counted ? `${name} · ${okPart}` : `${name} · ${runsPart}`,
-        title: withSubstrate(`Delegated to your ${name} account — ${runsPart} settled${counted ? ` (${okPart})` : ''}, ${costPart}`),
+        label: counted ? `${name} · ${okPart}${unresolvedPart}` : `${name} · ${runsPart}${unresolvedPart}`,
+        title: withSubstrate(`Delegated to your ${name} account — ${runsPart} settled${counted ? ` (${okPart})` : ''}, ${costPart}`) + unresolvedTitle + accessPart,
     };
 }
 
