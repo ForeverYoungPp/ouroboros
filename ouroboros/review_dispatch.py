@@ -99,6 +99,9 @@ def task_acceptance_preclaim_refusal(ctx: Any) -> Any:
         ctx.tools._ctx,
         binding_hash=str((ctx.review_binding or {}).get("binding_hash") or ""),
         task_id=str(ctx.task_id or ""),
+        # A-material: refuse a PAID dispatch whose material the tree already
+        # bought, even when the binding hash moved (a cosmetic tool call moves it).
+        paid_identity=str((ctx.review_binding or {}).get("paid_identity") or ""),
     )
     if projection.get("state") == "available" and not projection.get("binding_seen"):
         return None

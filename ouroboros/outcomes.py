@@ -172,6 +172,24 @@ REASON_REVIEW_CYCLES_EXHAUSTED = "review_cycles_exhausted"
 # objective terminalizes BLOCKED exactly like the spent-cap case above.
 REASON_REVIEW_QUORUM_UNREACHABLE = "plan_review_quorum_unreachable"
 
+# A-material (owner ratification 2026-08-30): the agent resubmitted the SAME paid
+# acceptance identity — unchanged candidate answer AND no new obligation
+# disposition — so the recorded verdict was replayed for free instead of buying
+# another panel. The branch only fires when that recorded verdict was NOT a clean
+# PASS (a clean PASS replays as `accepted` on its own branch), so the objective
+# terminalizes BLOCKED exactly like the spent-cap case above: the deliverable was
+# never accepted and no further reviewer round will happen.
+REASON_IDENTICAL_ACCEPTANCE_REFUSED = "identical_acceptance_refused"
+
+# The acceptance-decision reasons whose (finalized_unaccepted, reason) PAIR
+# terminalizes the objective axis BLOCKED. Value-keyed readers of the acceptance
+# decision live here: adding a terminal reason without adding it to the right key
+# is the silent false green DEVELOPMENT.md warns about.
+_ACCEPTANCE_BLOCKED_TERMINAL_REASONS = frozenset({
+    REASON_REVIEW_CYCLES_EXHAUSTED,
+    REASON_IDENTICAL_ACCEPTANCE_REFUSED,
+})
+
 # CLOSED mapping: forced-finalization rail (the loop's typed reason_code) -> typed
 # acceptance-bypass reason, stamped by the loop's common forced-finalization recorder
 # when the panel was OWED (eligible) but a rail ended the task first. Both deadline
@@ -671,18 +689,22 @@ def _objective_axis(review: Dict[str, Any]) -> Dict[str, Any]:
     status = str(review.get("status") or "skipped")
     tier = str(review.get("outcome_tier") or "")
     decision = review.get("acceptance_decision") if isinstance(review.get("acceptance_decision"), dict) else {}
+    _decision_reason = str(decision.get("reason") or "")
     if (
         str(decision.get("status") or "") == ACCEPTANCE_FINALIZED_UNACCEPTED
-        and str(decision.get("reason") or "") == REASON_REVIEW_CYCLES_EXHAUSTED
+        and _decision_reason in _ACCEPTANCE_BLOCKED_TERMINAL_REASONS
     ):
         # D27: Required+Blocking acceptance whose shared cap is spent terminalizes
-        # BLOCKED, whatever tier the last (failed) review proposed.
+        # BLOCKED, whatever tier the last (failed) review proposed. A-material
+        # (2026-08-30) adds the identical-paid-identity refusal on the same key:
+        # the deliverable was never accepted and no further round will happen, so
+        # the last review's proposed tier must not read as a green objective.
         return {
             "status": OBJECTIVE_FAIL,
             "source": "task_acceptance_review",
             "review_status": status,
             "outcome_tier": OUTCOME_TIER_BLOCKED,
-            "reason": REASON_REVIEW_CYCLES_EXHAUSTED,
+            "reason": _decision_reason,
         }
     if tier:
         # Reviewer tier is the canonical objective lexicon (completion-coach):

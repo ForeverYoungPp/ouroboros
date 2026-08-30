@@ -144,6 +144,14 @@ def review_max_cycles() -> Optional[int]:
         return default_review_max_cycles()
 
 
+def review_max_cycles_source() -> str:
+    """Where the effective cap came from: ``owner_setting`` when the key is
+    present in the environment (``config.apply_settings_to_env`` projects saved
+    settings there, so an owner edit and an env override are the same fact),
+    else ``shipped_default``. Provenance only — never a second parse."""
+    return "owner_setting" if os.environ.get(REVIEW_MAX_CYCLES_KEY, "") else "shipped_default"
+
+
 def acceptance_max_improvement_passes_from_cycles() -> Optional[int]:
     """Pure formula: task-acceptance improvement passes = shared cycles - 1
     (2 cycles → 1 pass); ``None`` when the shared cap is unlimited."""

@@ -19,8 +19,11 @@ import ouroboros.loop as loop_mod
 from ouroboros import task_pacing
 from ouroboros.review_substrate import (
     DIALOGUE_CONTINUE,
+    DIALOGUE_INCONCLUSIVE,
     DIALOGUE_STABLE_DISAGREEMENT,
     DIALOGUE_UNREACHABLE,
+    DIALOGUE_VOTE_ABSTAIN_INVALID,
+    DIALOGUE_VOTE_CONTINUE_WITHOUT_FINDINGS,
     ReviewRequest,
     ReviewSlot,
     _render_prompt_parts,
@@ -55,23 +58,30 @@ def _result(actors, aggregate="FAIL", findings=None, degraded_reasons=None):
 # ── A5: dialogue-status reducer ─────────────────────────────────────────────
 
 
-def test_dialogue_default_is_continue_when_field_absent():
-    # Backward-compatible fail-safe: no reviewer emits the field -> continue.
+def test_dialogue_absent_field_abstains_instead_of_defaulting_to_continue():
+    # CHANGED (A-material, 2026-08-30): the old fail-safe made a MISSING field mean
+    # "keep going", so a panel where nobody voted bought another paid round forever.
+    # A missing vote now abstains, is disclosed as `abstain_invalid`, and the panel
+    # reduces to `inconclusive` -> the caller's non-dialogue terminals decide.
     res = _result([
         _actor("s1", "FAIL", {"verdict": "FAIL"}),
         _actor("s2", "FAIL", {"verdict": "FAIL"}),
     ])
     out = aggregate_dialogue_status(res, quorum=2)
-    assert out["status"] == DIALOGUE_CONTINUE
-    assert out["votes"] == {DIALOGUE_CONTINUE: ["s1", "s2"]}
+    assert out["status"] == DIALOGUE_INCONCLUSIVE
+    assert out["votes"] == {DIALOGUE_VOTE_ABSTAIN_INVALID: ["s1", "s2"]}
 
 
-def test_dialogue_malformed_vote_defaults_to_continue():
+def test_dialogue_malformed_vote_abstains_and_is_disclosed():
+    # CHANGED (A-material): an unknown token / non-string was silently rewritten to
+    # `continue_actionable`. It now abstains and stays visible in the distribution.
     res = _result([
         _actor("s1", "FAIL", {"verdict": "FAIL", "dialogue_status": "give_up_now"}),
         _actor("s2", "FAIL", {"verdict": "FAIL", "dialogue_status": 42}),
     ])
-    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_CONTINUE
+    out = aggregate_dialogue_status(res, quorum=2)
+    assert out["status"] == DIALOGUE_INCONCLUSIVE
+    assert sorted(out["votes"][DIALOGUE_VOTE_ABSTAIN_INVALID]) == ["s1", "s2"]
 
 
 def test_dialogue_quorum_of_terminal_votes_terminates():
@@ -85,37 +95,77 @@ def test_dialogue_quorum_of_terminal_votes_terminates():
     assert set(out["votes"][DIALOGUE_UNREACHABLE]) == {"s1", "s2"}
 
 
-def test_dialogue_contributing_continue_beats_terminal_votes():
-    # Precedence: any continue vote from a QUORUM-CONTRIBUTING actor keeps the loop.
+def test_dialogue_contributing_well_formed_continue_beats_terminal_votes():
+    # Precedence, unchanged: ONE contributing continue keeps the loop even against
+    # two terminal votes. CHANGED (A-material Rule 1): that continue must now carry
+    # material — a finding or a completion_coach — for the reducer to count it.
     res = _result([
-        _actor("s1", "FAIL", {"verdict": "FAIL", "dialogue_status": "continue_actionable"}),
+        _actor("s1", "FAIL", {"verdict": "FAIL", "dialogue_status": "continue_actionable",
+                              "completion_coach": "add the missing regression test"}),
         _actor("s2", "FAIL", {"verdict": "FAIL", "dialogue_status": "unreachable_here"}),
         _actor("s3", "FAIL", {"verdict": "FAIL", "dialogue_status": "unreachable_here"}),
     ])
     assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_CONTINUE
 
 
-def test_dialogue_degraded_slot_vote_counts_toward_terminal_quorum():
-    # sol finding #3: a DEGRADED (non-contributing) slot's deliberate terminal
-    # vote must count — the reducer runs over ALL contract-valid actors.
+def test_dialogue_junk_continue_without_material_abstains():
+    # Rule 1 (A-material): a bare "keep going" with neither findings nor a coach is
+    # not an actionable judgement. It abstains (disclosed), so the single terminal
+    # vote decides — this is the exact vote that pumped 21 paid panels.
+    res = _result([
+        _actor("s1", "FAIL", {"verdict": "FAIL", "dialogue_status": "continue_actionable"}),
+        _actor("s2", "FAIL", {"verdict": "FAIL", "dialogue_status": "unreachable_here"}),
+    ])
+    out = aggregate_dialogue_status(res, quorum=2)
+    assert out["votes"][DIALOGUE_VOTE_CONTINUE_WITHOUT_FINDINGS] == ["s1"]
+    assert out["status"] == DIALOGUE_UNREACHABLE
+
+
+def test_dialogue_empty_finding_rows_do_not_make_a_continue_well_formed():
+    # Rule 1 boundary: a `findings` list with no item/recommendation text is not
+    # material either — the well-formed predicate reads content, not the key.
+    res = _result([
+        _actor("s1", "FAIL", {"verdict": "FAIL", "dialogue_status": "continue_actionable",
+                              "findings": [{"severity": "high"}, "junk"]}),
+        _actor("s2", "FAIL", {"verdict": "FAIL", "dialogue_status": "stable_disagreement"}),
+    ])
+    out = aggregate_dialogue_status(res, quorum=2)
+    assert out["votes"][DIALOGUE_VOTE_CONTINUE_WITHOUT_FINDINGS] == ["s1"]
+    assert out["status"] == DIALOGUE_STABLE_DISAGREEMENT
+
+
+def test_dialogue_degraded_slot_is_not_contributing_and_does_not_vote():
+    # CHANGED (owner ratification 2026-08-30, replacing sol #3): votes are counted
+    # over `_contributing_actors`, so a DEGRADED slot that did not reach the
+    # aggregate verdict no longer steers the loop. Here only s2 (FAIL, matching the
+    # FAIL aggregate) contributes, and its single terminal vote decides.
     res = _result(
         [
             _actor("s1", "DEGRADED", {"verdict": "DEGRADED", "dialogue_status": "unreachable_here"}),
             _actor("s2", "FAIL", {"verdict": "FAIL", "dialogue_status": "stable_disagreement"}),
-            # transport-dead slot: no parsed object -> no vote at all
+            # transport-dead slot: no parsed object -> not contributing either
             _actor("s3", "", None, parse_status="malformed"),
         ],
         aggregate="FAIL",
     )
     out = aggregate_dialogue_status(res, quorum=2)
-    assert out["status"] == DIALOGUE_STABLE_DISAGREEMENT or out["status"] == DIALOGUE_UNREACHABLE
-    # tie 1:1 resolves to unreachable_here (>= comparison)
-    assert out["status"] == DIALOGUE_UNREACHABLE
+    assert out["votes"] == {DIALOGUE_STABLE_DISAGREEMENT: ["s2"]}
+    assert out["status"] == DIALOGUE_STABLE_DISAGREEMENT
+
+
+def test_dialogue_tie_between_terminal_kinds_resolves_to_unreachable():
+    # The unreachable-vs-disagreement tie-break survives A-material unchanged.
+    res = _result([
+        _actor("s1", "FAIL", {"verdict": "FAIL", "dialogue_status": "unreachable_here"}),
+        _actor("s2", "FAIL", {"verdict": "FAIL", "dialogue_status": "stable_disagreement"}),
+    ])
+    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_UNREACHABLE
 
 
 def test_dialogue_garbage_dict_without_verdict_cannot_vote_terminal():
     # ext review r2: a dict-shaped parsed object WITHOUT a recognizable verdict
     # is not a deliberate reviewer act — its terminal "vote" must not count.
+    # CHANGED: with no vote left the panel is `inconclusive`, not `continue`.
     res = _result(
         [
             _actor("s1", "", {"dialogue_status": "unreachable_here"}, parse_status="malformed"),
@@ -123,12 +173,14 @@ def test_dialogue_garbage_dict_without_verdict_cannot_vote_terminal():
         ],
         aggregate="DEGRADED",
     )
-    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_CONTINUE
+    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_INCONCLUSIVE
 
 
-def test_dialogue_transport_dead_panel_stays_continue():
-    # Pure transport failure (no parsed objects anywhere) must NOT terminate:
-    # no contract-valid votes exist, so the fail-safe default keeps the loop.
+def test_dialogue_transport_dead_panel_is_inconclusive_not_continue():
+    # CHANGED (A-material Rule 2): a pure transport failure produces ZERO
+    # well-formed votes. It must not terminate — and it must not mint another paid
+    # round either. `inconclusive` grants the dialogue no authority, so the
+    # existing DEGRADED terminal in the caller decides.
     res = _result(
         [
             _actor("s1", "", None, parse_status="malformed"),
@@ -136,7 +188,9 @@ def test_dialogue_transport_dead_panel_stays_continue():
         ],
         aggregate="DEGRADED",
     )
-    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_CONTINUE
+    out = aggregate_dialogue_status(res, quorum=2)
+    assert out["status"] == DIALOGUE_INCONCLUSIVE
+    assert out["votes"] == {}
 
 
 # ── A3: reviewer-authored obligation identity ───────────────────────────────
@@ -612,7 +666,8 @@ def test_dialogue_quorum_fallback_uses_adaptive_quorum():
 
 def test_contract_demoted_actor_cannot_vote_terminal():
     # commit triad sol #1: parse_status="malformed" (contract-demoted or garbage
-    # with a verdict-shaped dict) must not satisfy terminal quorum.
+    # with a verdict-shaped dict) must not vote terminal. CHANGED: with no vote
+    # left the panel is `inconclusive`, which is also not a terminal verdict.
     res = _result(
         [
             _actor("s1", "DEGRADED", {"verdict": "FAIL", "dialogue_status": "unreachable_here"},
@@ -622,7 +677,7 @@ def test_contract_demoted_actor_cannot_vote_terminal():
         ],
         aggregate="DEGRADED",
     )
-    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_CONTINUE
+    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_INCONCLUSIVE
 
 
 def test_typed_findings_cannot_resurrect_settled_row_via_content_match():
