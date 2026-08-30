@@ -419,11 +419,12 @@ def _effective_api_models(settings: Mapping[str, Any]) -> Tuple[str, str]:
 
 
 def _actor(
-    row_id: str, name: str, recommendation: str, route: RouteSpec, effort: str,
+    row_id: str, recommendation: str, route: RouteSpec, effort: str,
 ) -> ConfiguredSubagent:
+    # `name` is retired (owner decision 1=A): identity is the neutral id plus
+    # derived route facts; recommended_use is the one semantic field.
     return ConfiguredSubagent(
         subagent_id=row_id,
-        name=name,
         recommended_use=recommendation,
         route=route,
         effort=effort,
@@ -463,16 +464,14 @@ def compile_available_subagents(
         if identity in seen:
             continue
         if index == 0:
-            row_id, name, recommendation = "primary-builder", "Primary builder", PRIMARY_RECOMMENDATION
+            row_id, recommendation = "primary-builder", PRIMARY_RECOMMENDATION
         elif index == 1:
-            row_id, name, recommendation = (
-                "independent-perspective", "Independent perspective", INDEPENDENT_RECOMMENDATION,
-            )
+            row_id, recommendation = "independent-perspective", INDEPENDENT_RECOMMENDATION
         else:
-            row_id, name, recommendation = (
-                f"alternative-builder-{harness}", "Alternative builder", ALTERNATIVE_RECOMMENDATION,
+            row_id, recommendation = (
+                f"alternative-builder-{harness}", ALTERNATIVE_RECOMMENDATION,
             )
-        actors.append(_actor(row_id, name, recommendation, route, str(row["effort"])))
+        actors.append(_actor(row_id, recommendation, route, str(row["effort"])))
         seen.add(identity)
 
     main, light = _effective_api_models(settings)
@@ -481,7 +480,7 @@ def compile_available_subagents(
         primary_api = main or light
         route = RouteSpec(ROUTE_KIND_API_MODEL, primary_api)
         actors.append(_actor(
-            "primary-builder", "Primary builder", PRIMARY_RECOMMENDATION, route,
+            "primary-builder", PRIMARY_RECOMMENDATION, route,
             main_effort if main else "low",
         ))
         seen.add((route.kind, route.target_id, ""))
@@ -490,7 +489,7 @@ def compile_available_subagents(
         route = RouteSpec(ROUTE_KIND_API_MODEL, light)
         identity = (route.kind, route.target_id, "")
         if identity not in seen:
-            actors.append(_actor("fast-scout", "Fast scout", SCOUT_RECOMMENDATION, route, "low"))
+            actors.append(_actor("fast-scout", SCOUT_RECOMMENDATION, route, "low"))
             seen.add(identity)
 
     if len(session_rows) == 1 and main:
@@ -498,8 +497,7 @@ def compile_available_subagents(
         identity = (route.kind, route.target_id, "")
         if identity not in seen:
             actors.append(_actor(
-                "independent-perspective", "Independent perspective",
-                INDEPENDENT_RECOMMENDATION, route, main_effort,
+                "independent-perspective", INDEPENDENT_RECOMMENDATION, route, main_effort,
             ))
             seen.add(identity)
 

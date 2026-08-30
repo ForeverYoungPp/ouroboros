@@ -65,7 +65,6 @@ SINGLE_MODEL_SLOT_KEYS = (
 )
 
 BENCHMARK_SUBAGENT_ID = "benchmark-model"
-BENCHMARK_SUBAGENT_NAME = "Benchmark model"
 _ACTIVE_FIXED_MODEL_KEYS = tuple(key for key in ACTIVE_MODEL_SLOT_KEYS if "MODEL" in key)
 _ACTIVE_LOCAL_ROUTE_KEYS = (
     "USE_LOCAL_MAIN",
@@ -91,7 +90,6 @@ def _benchmark_actor(model: str) -> ConfiguredSubagent:
         raise ValueError("single-model benchmark subagent requires a model")
     return ConfiguredSubagent(
         subagent_id=BENCHMARK_SUBAGENT_ID,
-        name=BENCHMARK_SUBAGENT_NAME,
         recommended_use=PRIMARY_RECOMMENDATION,
         route=RouteSpec(ROUTE_KIND_API_MODEL, target),
     )

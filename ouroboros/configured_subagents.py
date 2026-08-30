@@ -60,9 +60,14 @@ ALTERNATIVE_RECOMMENDATION = (
 @dataclass(frozen=True)
 class ConfiguredSubagent:
     subagent_id: str
-    name: str
-    recommended_use: str
-    route: RouteSpec
+    # Retired semantic field (owner decision 1=A, 2026-08-30): a second
+    # human-facing label beside recommended_use rotted against route edits
+    # (the shipped "Fast scout" incident). The parser accepts legacy values
+    # and drops them; identity everywhere is the neutral subagent_id plus
+    # DERIVED route facts, and recommended_use is the ONE semantic field.
+    name: str = ""
+    recommended_use: str = ""
+    route: RouteSpec = None  # type: ignore[assignment]
     effort: str = ""
 
 
@@ -169,7 +174,8 @@ def parse_configured_subagents(raw: Any) -> ConfiguredSubagents:
             raise ValueError(f"{SUBAGENTS_SETTING}: {where}.name must be a string")
         if not isinstance(row.get("recommended_use"), str):
             raise ValueError(f"{SUBAGENTS_SETTING}: {where}.recommended_use must be a string")
-        name = raw_name.strip() or row_id.replace("-", " ").replace("_", " ").title()
+        # Legacy `name` values are accepted and DROPPED (retired field): the
+        # next serialize omits the key, which is the whole migration.
         route = parse_route_spec(
             row.get("route"),
             setting=SUBAGENTS_SETTING,
@@ -188,7 +194,6 @@ def parse_configured_subagents(raw: Any) -> ConfiguredSubagents:
         items.append(
             ConfiguredSubagent(
                 subagent_id=row_id,
-                name=name,
                 recommended_use=row["recommended_use"],
                 route=route,
                 effort=effort,
@@ -202,7 +207,6 @@ def configured_subagents_dict(config: ConfiguredSubagents) -> dict[str, Any]:
     for row in config.items:
         payload: dict[str, Any] = {
             "subagent_id": row.subagent_id,
-            "name": row.name,
             "recommended_use": row.recommended_use,
             "route": route_spec_dict(
                 row.route,
@@ -277,7 +281,6 @@ def _legacy_session(raw: str, profile_id: str) -> ConfiguredSubagent:
         raise ValueError("legacy session model is empty")
     return ConfiguredSubagent(
         subagent_id="legacy-session",
-        name="Primary builder",
         recommended_use=PRIMARY_RECOMMENDATION,
         route=RouteSpec(ROUTE_KIND_AGENT_SESSION, route_part, profile_id),
         effort=effort.lower(),
@@ -446,9 +449,9 @@ def _append_legacy_model_rows(
     if not str(settings.get(light_key) or "").strip():
         light_key, light_slot = "OUROBOROS_MODEL", "MAIN"
     light = _legacy_model_target(settings, light_slot, light_key)
-    for row_id, name, recommendation, model, effort in (
-        ("legacy-heavy", "Primary builder", PRIMARY_RECOMMENDATION, heavy, ""),
-        ("fast-scout", "Fast scout", SCOUT_RECOMMENDATION, light, "low"),
+    for row_id, recommendation, model, effort in (
+        ("legacy-heavy", PRIMARY_RECOMMENDATION, heavy, ""),
+        ("fast-scout", SCOUT_RECOMMENDATION, light, "low"),
     ):
         if include_ids is not None and row_id not in include_ids:
             continue
@@ -468,7 +471,6 @@ def _append_legacy_model_rows(
         items.append(
             ConfiguredSubagent(
                 subagent_id=safe_id,
-                name=name,
                 recommended_use=recommendation,
                 route=RouteSpec(ROUTE_KIND_API_MODEL, model),
                 effort=effort,
@@ -500,7 +502,6 @@ def _append_candidate_rows(
         items.append(
             ConfiguredSubagent(
                 subagent_id=row_id,
-                name=candidate.name,
                 recommended_use=candidate.recommended_use,
                 route=candidate.route,
                 effort=candidate.effort,

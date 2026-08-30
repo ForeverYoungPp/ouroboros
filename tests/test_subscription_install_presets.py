@@ -398,10 +398,12 @@ def test_api_only_compiles_main_and_distinct_light_without_daemon_inputs():
 
     assert preset.ok, preset.refusal
     items = json.loads(preset.available_subagents)["items"]
-    assert [(row["name"], row["route"]["target_id"]) for row in items] == [
-        ("Primary builder", "openai::gpt-5.6-sol"),
-        ("Fast scout", "openai::gpt-5.6-luna"),
+    # `name` is retired (1=A): identity is the neutral id + derived facts.
+    assert [(row["subagent_id"], row["route"]["target_id"]) for row in items] == [
+        ("primary-builder", "openai::gpt-5.6-sol"),
+        ("fast-scout", "openai::gpt-5.6-luna"),
     ]
+    assert all("name" not in row for row in items)
     assert preset.reviewer_slots == ""
 
 
@@ -454,9 +456,10 @@ def test_one_harness_plus_distinct_main_and_light_normally_yields_three_real_act
     })
 
     items = json.loads(preset.available_subagents)["items"]
-    assert [row["name"] for row in items] == [
-        "Primary builder", "Fast scout", "Independent perspective",
+    assert [row["subagent_id"] for row in items] == [
+        "primary-builder", "fast-scout", "independent-perspective",
     ]
+    assert all("name" not in row for row in items)  # retired field (1=A)
     assert [row["route"]["target_id"] for row in items] == [
         "claude=claude-opus-5", "openai/gpt-5.6-luna", "openai/gpt-5.6-sol",
     ]

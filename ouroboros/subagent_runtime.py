@@ -88,10 +88,11 @@ def model_visible_subagent_catalog(settings: Mapping[str, Any]) -> dict[str, Any
     rows: list[dict[str, Any]] = []
     for row in config.items:
         session = row.route.is_session
+        # FACTS lead (owner decision 1=A/2=A): the neutral id and the derived
+        # route facts are the identity; recommended_use is the one semantic
+        # field and rides LAST as bounded owner intent, never as a title.
         projected: dict[str, Any] = {
             "subagent_id": row.subagent_id,
-            "name": row.name,
-            "recommended_use": row.recommended_use,
             "route_class": "Agent session" if session else "API model",
             "requested_effort": row.effort or "(not explicitly set)",
         }
@@ -107,6 +108,7 @@ def model_visible_subagent_catalog(settings: Mapping[str, Any]) -> dict[str, Any
             projected["account_policy"] = (
                 "API provider credentials (session account selection does not apply)"
             )
+        projected["recommended_use"] = row.recommended_use
         rows.append(projected)
 
     return {
@@ -263,7 +265,6 @@ def select_subagent_snapshot(
         "schema": 1,
         "selected_subagent_id": row.subagent_id,
         "config_fingerprint": configured_subagents_fingerprint(config),
-        "name": row.name,
         "recommended_use": row.recommended_use,
         "source": resolution.source,
         "route": route_spec_dict(
@@ -466,7 +467,6 @@ def current_subagent_alternatives(exclude_id: str = "") -> list[dict[str, Any]]:
     return [
         {
             "subagent_id": row.subagent_id,
-            "name": row.name,
             "recommended_use": row.recommended_use,
             "route_kind": row.route.kind,
             "target_id": row.route.target_id,
