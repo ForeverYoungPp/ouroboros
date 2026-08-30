@@ -6425,7 +6425,7 @@ textarea.chat-input {
 /* Narrow viewports: the actions column would squeeze the account name to a
    couple of characters, so the row becomes one column and the buttons drop
    under the metadata they act on. */
-@media (max-width: 640px) {
+@media (max-width: 980px) {
     .harness-account-row {
         grid-template-columns: minmax(0, 1fr);
         grid-template-areas: "main" "meta" "actions";

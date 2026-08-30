@@ -54,6 +54,15 @@ import {
     submitLoginInput,
 } from '../modules/harness_login_cards.js';
 
+test('account actions stack at the app shell compact breakpoint', () => {
+    const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
+    assert.ok(css.includes(`@media (max-width: 980px) {
+    .harness-account-row {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "main" "meta" "actions";`),
+    'account actions must drop below status before the persistent sidebar squeezes the row');
+});
+
 test('managed runtime keeps one contextual Connect intent across install, repair, and update', () => {
     const payload = (runtime, daemon = {}) => ({ daemon: { state: 'not_provisioned', runtime, ...daemon } });
 
@@ -270,6 +279,105 @@ test('a named profile\'s exhausted window is never reported as the default accou
     const namedRow = quotaSummary(snapshots, 'codex', 'koshak');
     assert.equal(namedRow.exhausted, true);
     assert.equal(namedRow.resetsAt, '2026-08-04T00:00:00Z');
+});
+
+test('typed quota gaps are exact-subject, neutral, and distinct in words', () => {
+    const absences = [
+        { subject: { harness: 'claude', subject_id: 'proton4' }, reason: 'refresh_failed', detail: 'secret-like prose is not parsed' },
+        { subject: { harness: 'claude', subject_id: 'proton3' }, reason: 'rate_limited' },
+    ];
+    const waiting = quotaSummary([], 'claude', 'proton4', { absences });
+    assert.equal(waiting.label, 'Usage refresh failed · secret-like prose is not parsed');
+    assert.equal(waiting.tone, 'muted');
+    assert.equal(quotaSummary([], 'claude', 'proton3', { absences }).label,
+        'Usage check rate-limited');
+    for (const [reason, label] of [
+        ['probe_skipped_rate_limited', 'Usage check paused after a rate limit'],
+        ['poll_paced', 'Usage check paced'],
+        ['not_logged_in', 'Usage unavailable · not signed in'],
+    ]) {
+        assert.equal(quotaSummary([], 'claude', 'proton4', { absences: [{
+            subject: { harness: 'claude', subject_id: 'proton4' }, reason,
+        }] }).label, label, reason);
+    }
+    assert.equal(quotaSummary([], 'claude', 'proton2', { absences }).label,
+        'Usage unavailable', 'a sibling absence must not color this subject');
+    const future = quotaSummary([], 'claude', 'proton4', { absences: [
+        { subject: { harness: 'claude', subject_id: 'proton4' }, reason: 'future_reason', detail: 'auth_revoked' },
+    ] });
+    assert.equal(future.tone, 'muted', 'unknown reason and detail prose stay neutral');
+    assert.equal(future.label, 'Usage unavailable · auth_revoked',
+        'detail is displayed as text but cannot select the warning tone');
+    assert.equal(quotaSummary([], 'claude', 'proton4', { absences: [
+        { subject: { harness: 'claude', subject_id: 'proton4' }, reason: 'auth_revoked' },
+    ] }).tone, 'muted');
+
+    assert.deepEqual(quotaSummary([], 'claude', 'claude-default', {
+        fallbackSubjectIds: [''],
+        absences: [{
+            subject: { harness: 'claude', subject_id: '' }, reason: 'auth_revoked',
+        }],
+    }), { label: 'Usage unavailable', exhausted: false, resetsAt: '', tone: 'muted' },
+    'a legacy snapshot alias must never borrow another subject\'s auth absence');
+
+    const exactGapOverAlias = quotaSummary([{
+        subject: { harness: 'claude', subject_id: '' }, freshness: 'fresh',
+        constraints: [{ used_ratio: 0.5 }],
+    }], 'claude', 'claude-default', {
+        fallbackSubjectIds: [''],
+        absences: [{
+            subject: { harness: 'claude', subject_id: 'claude-default' },
+            reason: 'auth_revoked',
+        }],
+    });
+    assert.equal(exactGapOverAlias.label, '50% used · Usage unavailable · sign-in revoked');
+    assert.equal(exactGapOverAlias.tone, 'muted',
+        'the exact auth verdict remains explicit in words without a second warning state');
+
+    assert.equal(quotaSummary([], 'claude', 'proton4', { absences: [{
+        subject: { harness: 'claude', subject_id: 'proton4' },
+        reason: 'refresh_failed', detail: { nested: 'bad' },
+    }] }).label, 'Usage refresh failed', 'malformed detail is ignored');
+    assert.equal(quotaSummary([], 'claude', 'proton4', { absences: [{
+        subject: { harness: 'claude', subject_id: 'proton4' },
+        reason: { nested: 'bad' }, detail: 'must not survive a malformed reason',
+    }] }).label, 'Usage unavailable', 'malformed reason and its detail are ignored');
+});
+
+test('a contradictory same-subject absence stays visible and fail-open', () => {
+    const summary = quotaSummary([{
+        subject: { harness: 'claude', subject_id: 'proton4' }, freshness: 'fresh',
+        constraints: [{ used_ratio: 0.25 }],
+    }], 'claude', 'proton4', { absences: [{
+        subject: { harness: 'claude', subject_id: 'proton4' }, reason: 'auth_revoked',
+    }] });
+    assert.equal(summary.label, '25% used · Usage unavailable · sign-in revoked');
+    assert.equal(summary.tone, 'muted');
+
+    const emptyButFresh = quotaSummary([{
+        subject: { harness: 'claude', subject_id: 'proton4' }, freshness: 'fresh',
+        constraints: [],
+    }], 'claude', 'proton4', { absences: [{
+        subject: { harness: 'claude', subject_id: 'proton4' }, reason: 'auth_revoked',
+    }] });
+    assert.deepEqual(emptyButFresh,
+        { label: 'Usage unavailable · sign-in revoked', exhausted: false, resetsAt: '', tone: 'muted' });
+});
+
+test('stale quota does not become a current percentage beside its typed gap', () => {
+    const summary = quotaSummary([{
+        subject: { harness: 'claude', subject_id: 'proton4' }, freshness: 'stale',
+        constraints: [{ used_ratio: 0.65, resets_at: '2026-08-31T00:00:00Z' }],
+    }], 'claude', 'proton4', { absences: [{
+        subject: { harness: 'claude', subject_id: 'proton4' }, reason: 'poll_paced',
+        detail: 'next poll is paced',
+    }] });
+    assert.deepEqual(summary, {
+        label: 'Usage check paced · next poll is paced',
+        exhausted: false,
+        resetsAt: '',
+        tone: 'muted',
+    });
 });
 
 test('a model-scoped window never paints the whole account exhausted — it is a compact note', () => {
