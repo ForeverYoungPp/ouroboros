@@ -11,7 +11,7 @@ from tests.test_ui_smoke_playwright import direct_server_with_data  # noqa: F401
 
 
 @pytest.mark.ui_browser
-def test_ui_browser_marked_rich_markdown_and_security(direct_server_with_data):
+def test_ui_browser_marked_rich_markdown_and_security(direct_server_with_data):  # noqa: F811
     """Rich chat markdown renders every supported format without activating HTML."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
@@ -279,7 +279,7 @@ def test_ui_browser_marked_rich_markdown_and_security(direct_server_with_data):
 
 
 @pytest.mark.ui_browser
-def test_ui_browser_mermaid_load_failure_retries(direct_server_with_data):
+def test_ui_browser_mermaid_load_failure_retries(direct_server_with_data):  # noqa: F811
     """A failed Mermaid script is removed and a later diagram retries the load."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
