@@ -29,8 +29,10 @@ from supervisor.cancel_publication import (  # noqa: F401 -- intentional public 
     CANCEL_FAILED,
     CANCEL_NOT_FOUND,
     _CANCEL_TERMINALIZED,
+    _audit_delegated_runs_on_kill,
     _cancel_result_fields,
     _cascade_delivery_row_locked,
+    _custody_disclosure_fields,
     _deliver_on_miss,
     _intent_outcome_fields,
     _is_workspace_task_record,
@@ -664,6 +666,21 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
         # already-settled path audits custody exactly like the kill path and
         # threads the disclosure into the miss-lane delivery.
         unreconciled = _reconcile_delegated_runs_on_kill(q, task_id)
+        # D1b: this lane performs no terminal write of its own, so a stale
+        # non-empty stored disclosure would survive the kill forever. The
+        # guarded refresh clears it only when the settled row already carries a
+        # non-empty list AND the fresh audit differs — an ordinary fast-lane
+        # kill (nothing stored, or already current) performs no extra write,
+        # and a task with no stored row can never be minted here.
+        try:
+            from ouroboros.delegate_terminal import refresh_terminal_reconciliation
+
+            refresh_terminal_reconciliation(
+                pathlib.Path(q.DRIVE_ROOT), task_id, trigger="kill_path_clear",
+            )
+        except Exception:
+            log.debug("Kill-path custody-disclosure refresh failed for %s",
+                      task_id, exc_info=True)
         owed_ok = True
         if intent and deliver:
             # GR2-4 (fast already-settled re-entry): the settled answer is
@@ -1111,7 +1128,8 @@ def _finish_captured_running(
 
     _reconcile_dead_review_owner(q.DRIVE_ROOT, int(getattr(worker.proc, "pid", 0) or 0))
 
-    unreconciled = _reconcile_delegated_runs_on_kill(q, task_id)
+    custody_audit = _audit_delegated_runs_on_kill(q, task_id)
+    unreconciled = list(custody_audit.get("unreconciled") or [])
 
     if settled_status:
         # GR6-1b short-circuit, hoisted ABOVE every mutating step (GR7-2): the
@@ -1285,7 +1303,11 @@ def _finish_captured_running(
             **_cancel_result_fields(
                 task, existing=existing, artifact_capture=captured, **cost_fields,
                 **_intent_outcome_fields(intent or {}),
-                **({"delegated_runs_unreconciled": unreconciled} if unreconciled else {}),
+                # UNCONDITIONAL (D1b): a clean audit writes [] so a stale
+                # non-empty list from an earlier terminal write is cleared by
+                # this same merge-write; the audit envelope rides the same
+                # single write (R2) so list and envelope stay coherent.
+                **_custody_disclosure_fields(custody_audit),
                 result="Running task cancelled and worker terminated." + salvage_note,
             ),
         )

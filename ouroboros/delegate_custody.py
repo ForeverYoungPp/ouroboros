@@ -1057,7 +1057,7 @@ def settled_unread_outputs(drive_root: Any) -> List[RunCustody]:
             if settled_output_unread(custody)]
 
 
-def undisposed_patches(drive_root: Any) -> List[RunCustody]:
+def undisposed_patches(drive_root: Any, state: Optional[Dict[str, RunCustody]] = None) -> List[RunCustody]:
     """Settled mutating runs whose snapshot work awaits an explicit apply/reject.
 
     The C1 counterpart of ``settled_unread_outputs``: a run that executed in a
@@ -1069,7 +1069,7 @@ def undisposed_patches(drive_root: Any) -> List[RunCustody]:
     forever, preserved but findable by nobody. Self-clearing: the
     ``PATCH_DISPOSED`` row flips ``patch_disposed`` in the very replay this reads.
     """
-    return [custody for custody in replay(drive_root).values()
+    return [custody for custody in (state if state is not None else replay(drive_root)).values()
             if custody.snapshot_id and custody.settled and not custody.patch_disposed]
 
 
@@ -1207,18 +1207,18 @@ def _cancel_result(drive_root: Any, custody: RunCustody, outcome: str, *, accept
 # -- reconciliation ------------------------------------------------------------
 
 
-def open_runs(drive_root: Any) -> List[RunCustody]:
-    """Runs with a durable start and no durable settlement."""
-    return [custody for custody in replay(drive_root).values() if not custody.settled]
+def open_runs(drive_root: Any, state: Optional[Dict[str, RunCustody]] = None) -> List[RunCustody]:
+    """Runs with a durable start and no durable settlement (``state``: a shared
+    pre-replayed snapshot, so a batch of audits pays one log traversal)."""
+    return [custody for custody in (state if state is not None else replay(drive_root)).values()
+            if not custody.settled]
 
 
-def owned_project_registrations(drive_root: Any) -> List[RunCustody]:
+def owned_project_registrations(drive_root: Any, state: Optional[Dict[str, RunCustody]] = None) -> List[RunCustody]:
     """Runs whose registration is still owned - settled or not (``open_runs``
     cannot see registrations that outlive their runs)."""
-    return [
-        custody for custody in replay(drive_root).values()
-        if custody.project_owned and custody.project_id
-    ]
+    return [custody for custody in (state if state is not None else replay(drive_root)).values()
+            if custody.project_owned and custody.project_id]
 
 
 def retire_settled_registrations(drive_root: Any, gateway: Any) -> None:

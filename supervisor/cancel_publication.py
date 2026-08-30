@@ -383,9 +383,39 @@ def _deliver_on_miss(
         return False
 
 
-def _reconcile_delegated_runs_on_kill(q: Any, task_id: str) -> List[str]:
+def _custody_disclosure_fields(
+    audit: Optional[Dict[str, Any]], unreconciled: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Both halves of the kill-path custody disclosure for ONE terminal write.
+
+    The flat ``delegated_runs_unreconciled`` list (audited — a clean ``[]``
+    clears a stale stored list) rides together with the full audit envelope
+    (``delegate_terminal_reconciliation``, stamped with the killing caller's
+    own trigger), so a reader and the boot backfill's no-churn gate see one
+    coherent disclosure from one write (R2). ``audit=None`` with an explicit
+    list keeps the flat-only shape for a caller that ran no envelope-bearing
+    audit; both absent yields ``{}`` — no audit ran, and an unaudited clean
+    claim must never be minted.
+    """
+    if isinstance(audit, dict):
+        flat = [str(item) for item in (audit.get("unreconciled") or []) if str(item)]
+        return {
+            "delegated_runs_unreconciled": flat,
+            "delegate_terminal_reconciliation": dict(audit),
+        }
+    if unreconciled is None:
+        return {}
+    return {"delegated_runs_unreconciled": [str(item) for item in unreconciled if str(item)]}
+
+
+def _audit_delegated_runs_on_kill(
+    q: Any, task_id: str, *, trigger: str = "cancel_publication",
+) -> Dict[str, Any]:
     """Settle this task's open DELEGATED runs after its worker is dead; disclose
-    what stayed open.
+    what stayed open. Returns the FULL audit mapping (R2) — ``unreconciled``
+    holds the still-open ids for the delivery notes, and the whole mapping is
+    the ``delegate_terminal_reconciliation`` envelope the killing caller
+    persists in its own single terminal write.
 
     Task-scoped reconciliation (A1.9): the graceful ``release_task_runs`` lived
     inside the worker that is now dead (cancel kill, timeout reap, or an
@@ -418,25 +448,28 @@ def _reconcile_delegated_runs_on_kill(q: Any, task_id: str) -> List[str]:
     """
     from supervisor.terminal_delivery import RUN_STATE_UNKNOWN_PREFIX
 
-    still_open: List[str] = []
-    audit_failed = False
     try:
         from ouroboros.delegate_terminal import terminal_reconcile_task
 
         audit = terminal_reconcile_task(
-            pathlib.Path(q.DRIVE_ROOT), task_id, trigger="cancel_publication",
+            pathlib.Path(q.DRIVE_ROOT), task_id, trigger=trigger,
         )
-        still_open = [str(item) for item in (audit.get("unreconciled") or []) if str(item)]
-        audit_failed = str(audit.get("audit_status") or "") != "ok"
     except Exception:
         log.warning(
             "Delegated-run open-run audit failed for cancelled %s; run state is UNKNOWN",
             task_id, exc_info=True,
         )
-        audit_failed = True
-        still_open = [f"{RUN_STATE_UNKNOWN_PREFIX}:audit_failed"]
+        audit = {
+            "task_id": str(task_id or ""), "trigger": str(trigger or ""),
+            "outcomes": [],
+            "unreconciled": [f"{RUN_STATE_UNKNOWN_PREFIX}:audit_failed"],
+            "audit_status": "failed",
+        }
+    still_open = [str(item) for item in (audit.get("unreconciled") or []) if str(item)]
+    audit["unreconciled"] = still_open
+    audit_failed = str(audit.get("audit_status") or "") != "ok"
     if not still_open:
-        return []
+        return audit
     log.warning(
         "Cancelled task %s left %d delegated run(s) unreconciled: %s",
         task_id, len(still_open), still_open,
@@ -461,7 +494,13 @@ def _reconcile_delegated_runs_on_kill(q: Any, task_id: str) -> List[str]:
         )
     except Exception:
         log.debug("Unreconciled-run disclosure append failed for %s", task_id, exc_info=True)
-    return still_open
+    return audit
+
+
+def _reconcile_delegated_runs_on_kill(q: Any, task_id: str) -> List[str]:
+    """Back-compat list view of ``_audit_delegated_runs_on_kill``: the still-open
+    ids for callers that only thread the delivery-note disclosure."""
+    return list(_audit_delegated_runs_on_kill(q, task_id).get("unreconciled") or [])
 
 
 def _cascade_delivery_row_locked(q: Any, task_id: str) -> Dict[str, Any]:
@@ -556,10 +595,24 @@ def _finalize_cancel_intent_on_miss(
         # GR5-3: neither queued nor running — the worker is gone, but its
         # delegated runs may still be live; audit custody like the kill path
         # and thread the disclosure into every miss-lane delivery below.
-        unreconciled = _reconcile_delegated_runs_on_kill(q, task_id)
+        audit = _audit_delegated_runs_on_kill(q, task_id)
+        unreconciled = list(audit.get("unreconciled") or [])
         settled = _settled_status(q.DRIVE_ROOT, task_id)
         if settled:
             _recover_stranded_reaping_slot(q, task_id, active)
+            # D1b (R4): this branch performs no terminal write of its own, so
+            # the same guarded stale-only refresh the fast already-settled
+            # cancel lane runs clears a stale stored disclosure here — never
+            # minting a row and never rewriting a current one.
+            try:
+                from ouroboros.delegate_terminal import refresh_terminal_reconciliation
+
+                refresh_terminal_reconciliation(
+                    pathlib.Path(q.DRIVE_ROOT), task_id, trigger="kill_path_clear",
+                )
+            except Exception:
+                log.debug("Miss-lane custody-disclosure refresh failed for %s",
+                          task_id, exc_info=True)
             owed_ok = _deliver_on_miss(
                 q, task_id, load_task_result(q.DRIVE_ROOT, task_id) or existing, settled,
                 unreconciled_runs=unreconciled,
@@ -574,6 +627,9 @@ def _finalize_cancel_intent_on_miss(
             **_cancel_result_fields(
                 existing, existing=existing, **cost_fields,
                 **_intent_outcome_fields(active),
+                # R2/R4: the audited list AND its envelope ride this single
+                # cancelled write — a clean audit clears a stale stored list.
+                **_custody_disclosure_fields(audit),
                 result="Task cancelled (was neither queued nor running at supervisor teardown).",
             ),
         )

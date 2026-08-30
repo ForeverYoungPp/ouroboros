@@ -187,12 +187,25 @@ def test_gr5_1_server_evolve_start_failure_restores_the_captured_flag():
 
 
 def test_gr5_2_reap_reconciles_delegated_runs_and_discloses(qenv, monkeypatch):
+    import ouroboros.task_results as task_results_mod
     from supervisor import task_reaper, workers
 
     queue = _CaptureQueue()
     monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
     monkeypatch.setattr(task_reaper, "send_with_budget", lambda *a, **kw: None)
     calls = _patch_open_delegated_run(monkeypatch, "rp5")
+    disclosure_writes: list = []
+    real_write = task_results_mod.write_task_result
+
+    def _counting_write(root, tid, status, **kwargs):
+        if str(tid) == "rp5" and (
+            "delegated_runs_unreconciled" in kwargs
+            or "delegate_terminal_reconciliation" in kwargs
+        ):
+            disclosure_writes.append(dict(kwargs))
+        return real_write(root, tid, status, **kwargs)
+
+    monkeypatch.setattr(task_results_mod, "write_task_result", _counting_write)
 
     task_reaper.reap_timed_out_task({
         "worker_id": 1, "proc": None, "task_id": "rp5",
@@ -209,6 +222,14 @@ def test_gr5_2_reap_reconciles_delegated_runs_and_discloses(qenv, monkeypatch):
     assert row["delegated_runs_unreconciled"] == ["run-open"], (
         "GR5-2: the reap outcome discloses the still-open runs"
     )
+    # R2: the audit envelope rides the SAME single terminal write as the flat
+    # list, stamped with the reaper's own trigger.
+    envelope = row["delegate_terminal_reconciliation"]
+    assert envelope["trigger"] == "reaper_idle_timeout"
+    assert envelope["open_run_ids"] == ["run-open"]
+    (only_write,) = disclosure_writes
+    assert only_write["delegated_runs_unreconciled"] == ["run-open"]
+    assert only_write["delegate_terminal_reconciliation"]["trigger"] == "reaper_idle_timeout"
     assert any(
         r.get("type") == "delegated_runs_unreconciled" and r.get("task_id") == "rp5"
         for r in _event_rows(qenv.drive)

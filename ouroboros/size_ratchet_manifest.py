@@ -174,7 +174,6 @@ BAND_PATHS = {
     "skills/telegram/scripts/sidecar.py": None,
     "supervisor/evolution_lifecycle.py": None,
     "supervisor/message_bus.py": "push_log gained the A2A frame suppression and explicit-addressing contract comments in the live log routing fix (fix/main-chat-leak sprint); the module sat at exactly 1000 lines before it",
-    "supervisor/task_reaper.py": "Entered the band from 907 lines: timeout-retry admission now serializes queue publication, reciprocal result lineage, cancellation-wins handoff, and failed-terminal-write custody in the existing off-loop reaper owner.",
     "supervisor/terminal_delivery.py": None,
     "tests/test_acting_subagents.py": None,
     "tests/test_advisory_observability.py": None,
@@ -230,7 +229,7 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/loop.py": 312765,
+    "ouroboros/loop.py": 312731,
     "tests/test_delegated_subagent_transport.py": 320340,
     "tests/test_devtools_benchmarks.py": 328116,
     "web/modules/chat.js": 219170,

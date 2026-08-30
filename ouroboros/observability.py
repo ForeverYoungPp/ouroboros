@@ -1228,6 +1228,22 @@ def latest_llm_response_text(drive_root: pathlib.Path, task_id: str) -> str:
     return ""
 
 
+def strip_protocol_fence(text: str) -> str:
+    """Strip ONE whole-body markdown fence, returning the trimmed inner body.
+
+    Shared normalization for every delivery-control protocol reader (the loop
+    resolvers and the salvage predicate below): a fenced protocol object is
+    still the protocol object. Anything short of a single fence spanning the
+    whole body is returned stripped but otherwise unchanged.
+    """
+    body = str(text or "").strip()
+    if body.startswith("```"):
+        first_break = body.find("\n")
+        if first_break != -1 and body.endswith("```"):
+            return body[first_break + 1:-3].strip()
+    return body
+
+
 def _is_delivery_control_payload(text: str) -> bool:
     """Whether persisted assistant text is the delivery-control PROTOCOL object.
 
@@ -1237,14 +1253,13 @@ def _is_delivery_control_payload(text: str) -> bool:
     loop-side resolution used to let raw-salvage promote that JSON into the
     owner-facing terminal result. This is a STRUCTURAL typed-protocol check
     (exact JSON object carrying the protocol key, optionally in one markdown
-    fence) — never semantic prose classification. Matching payloads stay
-    forensic evidence in the observability store; they are simply not answers.
+    fence) — never semantic prose classification: a MIXED prose+object answer
+    stays salvageable here (this predicate has no latch knowledge; embedded-
+    object containment belongs to the loop's latch-gated resolvers). Matching
+    payloads stay forensic evidence in the observability store; they are
+    simply not answers.
     """
-    body = str(text or "").strip()
-    if body.startswith("```"):
-        first_break = body.find("\n")
-        if first_break != -1 and body.endswith("```"):
-            body = body[first_break + 1:-3].strip()
+    body = strip_protocol_fence(text)
     if not (body.startswith("{") and body.endswith("}")):
         return False
     try:
