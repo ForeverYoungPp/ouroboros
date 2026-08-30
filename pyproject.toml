@@ -135,6 +135,12 @@ web = [
     "providers/*.svg",
     "providers/*.png",
     "providers/*.ico",
+    "vendor/VENDOR-MANIFEST.md",
+    "vendor/katex/*.css",
+    "vendor/katex/*.js",
+    "vendor/katex/contrib/*.js",
+    "vendor/katex/fonts/*.woff2",
+    "vendor/licenses/*",
 ]
 [tool.ruff]
 line-length = 120
