@@ -27,6 +27,7 @@ import {
     serviceBannerLine,
     startLogin,
     unreadFacets,
+    harnessFamilyMarkup,
     verificationBadge,
     wakeDaemon,
 } from '../modules/harness_accounts.js';
@@ -53,6 +54,16 @@ import {
     preserveCardFocus,
     submitLoginInput,
 } from '../modules/harness_login_cards.js';
+
+test('account actions stack at the app shell compact breakpoint', () => {
+    const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8')
+        .replace(/\r\n?/g, '\n');
+    assert.ok(css.includes(`@media (max-width: 980px) {
+    .harness-account-row {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "main" "meta" "actions";`),
+    'account actions must drop below status before the persistent sidebar squeezes the row');
+});
 
 test('managed runtime keeps one contextual Connect intent across install, repair, and update', () => {
     const payload = (runtime, daemon = {}) => ({ daemon: { state: 'not_provisioned', runtime, ...daemon } });
@@ -272,6 +283,105 @@ test('a named profile\'s exhausted window is never reported as the default accou
     assert.equal(namedRow.resetsAt, '2026-08-04T00:00:00Z');
 });
 
+test('typed quota gaps are exact-subject, neutral, and distinct in words', () => {
+    const absences = [
+        { subject: { harness: 'claude', subject_id: 'proton4' }, reason: 'refresh_failed', detail: 'secret-like prose is not parsed' },
+        { subject: { harness: 'claude', subject_id: 'proton3' }, reason: 'rate_limited' },
+    ];
+    const waiting = quotaSummary([], 'claude', 'proton4', { absences });
+    assert.equal(waiting.label, 'Usage refresh failed · secret-like prose is not parsed');
+    assert.equal(waiting.tone, 'muted');
+    assert.equal(quotaSummary([], 'claude', 'proton3', { absences }).label,
+        'Usage check rate-limited');
+    for (const [reason, label] of [
+        ['probe_skipped_rate_limited', 'Usage check paused after a rate limit'],
+        ['poll_paced', 'Usage check paced'],
+        ['not_logged_in', 'Usage unavailable · not signed in'],
+    ]) {
+        assert.equal(quotaSummary([], 'claude', 'proton4', { absences: [{
+            subject: { harness: 'claude', subject_id: 'proton4' }, reason,
+        }] }).label, label, reason);
+    }
+    assert.equal(quotaSummary([], 'claude', 'proton2', { absences }).label,
+        'Usage unavailable', 'a sibling absence must not color this subject');
+    const future = quotaSummary([], 'claude', 'proton4', { absences: [
+        { subject: { harness: 'claude', subject_id: 'proton4' }, reason: 'future_reason', detail: 'auth_revoked' },
+    ] });
+    assert.equal(future.tone, 'muted', 'unknown reason and detail prose stay neutral');
+    assert.equal(future.label, 'Usage unavailable · auth_revoked',
+        'detail is displayed as text but cannot select the warning tone');
+    assert.equal(quotaSummary([], 'claude', 'proton4', { absences: [
+        { subject: { harness: 'claude', subject_id: 'proton4' }, reason: 'auth_revoked' },
+    ] }).tone, 'muted');
+
+    assert.deepEqual(quotaSummary([], 'claude', 'claude-default', {
+        fallbackSubjectIds: [''],
+        absences: [{
+            subject: { harness: 'claude', subject_id: '' }, reason: 'auth_revoked',
+        }],
+    }), { label: 'Usage unavailable', exhausted: false, resetsAt: '', tone: 'muted' },
+    'a legacy snapshot alias must never borrow another subject\'s auth absence');
+
+    const exactGapOverAlias = quotaSummary([{
+        subject: { harness: 'claude', subject_id: '' }, freshness: 'fresh',
+        constraints: [{ used_ratio: 0.5 }],
+    }], 'claude', 'claude-default', {
+        fallbackSubjectIds: [''],
+        absences: [{
+            subject: { harness: 'claude', subject_id: 'claude-default' },
+            reason: 'auth_revoked',
+        }],
+    });
+    assert.equal(exactGapOverAlias.label, '50% used · Usage unavailable · sign-in revoked');
+    assert.equal(exactGapOverAlias.tone, 'muted',
+        'the exact auth verdict remains explicit in words without a second warning state');
+
+    assert.equal(quotaSummary([], 'claude', 'proton4', { absences: [{
+        subject: { harness: 'claude', subject_id: 'proton4' },
+        reason: 'refresh_failed', detail: { nested: 'bad' },
+    }] }).label, 'Usage refresh failed', 'malformed detail is ignored');
+    assert.equal(quotaSummary([], 'claude', 'proton4', { absences: [{
+        subject: { harness: 'claude', subject_id: 'proton4' },
+        reason: { nested: 'bad' }, detail: 'must not survive a malformed reason',
+    }] }).label, 'Usage unavailable', 'malformed reason and its detail are ignored');
+});
+
+test('a contradictory same-subject absence stays visible and fail-open', () => {
+    const summary = quotaSummary([{
+        subject: { harness: 'claude', subject_id: 'proton4' }, freshness: 'fresh',
+        constraints: [{ used_ratio: 0.25 }],
+    }], 'claude', 'proton4', { absences: [{
+        subject: { harness: 'claude', subject_id: 'proton4' }, reason: 'auth_revoked',
+    }] });
+    assert.equal(summary.label, '25% used · Usage unavailable · sign-in revoked');
+    assert.equal(summary.tone, 'muted');
+
+    const emptyButFresh = quotaSummary([{
+        subject: { harness: 'claude', subject_id: 'proton4' }, freshness: 'fresh',
+        constraints: [],
+    }], 'claude', 'proton4', { absences: [{
+        subject: { harness: 'claude', subject_id: 'proton4' }, reason: 'auth_revoked',
+    }] });
+    assert.deepEqual(emptyButFresh,
+        { label: 'Usage unavailable · sign-in revoked', exhausted: false, resetsAt: '', tone: 'muted' });
+});
+
+test('stale quota does not become a current percentage beside its typed gap', () => {
+    const summary = quotaSummary([{
+        subject: { harness: 'claude', subject_id: 'proton4' }, freshness: 'stale',
+        constraints: [{ used_ratio: 0.65, resets_at: '2026-08-31T00:00:00Z' }],
+    }], 'claude', 'proton4', { absences: [{
+        subject: { harness: 'claude', subject_id: 'proton4' }, reason: 'poll_paced',
+        detail: 'next poll is paced',
+    }] });
+    assert.deepEqual(summary, {
+        label: 'Usage check paced · next poll is paced',
+        exhausted: false,
+        resetsAt: '',
+        tone: 'muted',
+    });
+});
+
 test('a model-scoped window never paints the whole account exhausted — it is a compact note', () => {
     // The daemon schema's own words (@claudexor/schema quota.ts): a non-null
     // applies_to_models is a per-model cap, and "a model-specific cap never
@@ -327,6 +437,23 @@ test('a model-scoped window never paints the whole account exhausted — it is a
 // Add account: pywebview's WKWebView implements no window.prompt (it answers
 // null silently), so the flow runs on the in-house input dialog.
 // ---------------------------------------------------------------------------
+
+test('the groups rebuild wraps in preserveCardFocus so a family-mounted login card keeps its caret', () => {
+    // REGRESSION guard (fable review, roster-identity sprint): the login card
+    // mounts INSIDE #harness-accounts-groups now, so the poll-tick innerHTML
+    // rebuild destroys a focused paste-code/name input BEFORE the card's own
+    // render can capture it. The capture must wrap the whole rebuild — the
+    // innerHTML assignment and the card repaint both inside ONE
+    // preserveCardFocus callback.
+    const source = readFileSync(new URL('../modules/harness_accounts.js', import.meta.url), 'utf8');
+    const wrap = source.indexOf('preserveCardFocus(host, () => {');
+    assert.ok(wrap >= 0, 'renderRows must wrap its rebuild in preserveCardFocus');
+    const rebuild = source.indexOf('host.innerHTML = accountGroups(');
+    const repaint = source.indexOf('state.loginCard?.render();');
+    const close = source.indexOf('\n    });', wrap);
+    assert.ok(wrap < rebuild && rebuild < repaint && repaint < close,
+        'both the innerHTML rebuild and the card repaint live inside the capture');
+});
 
 test('Add account never touches window.prompt and asks through the in-house dialog', async () => {
     // REGRESSION guard for the dead desktop button: the module must not call
@@ -1995,4 +2122,18 @@ test('a login seen online is not un-seen by the re-check running out', () => {
         'a positive confirmation no longer wins on its own');
     assert.match(body, /active\.verdict = confirmed/,
         'the monotone predicate does not decide the verdict');
+});
+
+test('the family markup mounts a per-family login host under its header (3=A)', () => {
+    const html = harnessFamilyMarkup(
+        { harness: 'codex', label: 'Codex CLI', rows: [], status: { tone: 'muted', label: 'x' } },
+        {}, { accountsRead: 1 },
+    );
+    const headIdx = html.indexOf('agent-family-head');
+    const loginIdx = html.indexOf('data-family-login="codex"');
+    const rowsIdx = html.indexOf('agent-family-rows');
+    assert.ok(headIdx > -1 && loginIdx > -1 && rowsIdx > -1);
+    // The login card appears where the owner clicked: directly under the
+    // family header, above the account rows — not after every family.
+    assert.ok(headIdx < loginIdx && loginIdx < rowsIdx);
 });

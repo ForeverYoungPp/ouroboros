@@ -66,9 +66,8 @@ FRONTIER_BENCH_DATASET = "frontier-bench/frontier-bench"
 # Only slots the in-container adapter actually forwards (harbor_installed_agent._container_env).
 # Deliberately omitted because the container already covers them: the internal Consciousness
 # role defaults to Main, the adapter pins both fallback spellings to Main, and child selection is
-# the explicit one-row Available-subagents value below. The Claude SDK advisory is explicitly
-# disabled by the structured fixed-model reviewer panel, so CLAUDE_CODE_MODEL stays empty rather
-# than receiving a provider-routed model id from a different namespace.
+# the explicit one-row Available-subagents value below. The advisory pre-review is explicitly
+# disabled by the structured fixed-model reviewer panel for comparability across runs.
 _ALL_MODEL_SLOT_KEYS = (
     "OUROBOROS_MODEL",
     "OUROBOROS_MODEL_LIGHT",
@@ -156,12 +155,6 @@ def _effective_helper_models(measured_model: str, light_model: str, *, disable_a
     # web_search role would misrepresent the submission.
     if websearch.strip() and not disable_agent_web:
         ordered.append((websearch.strip(), "web_search"))
-    # The adapter forwards CLAUDE_CODE_MODEL, so claude_code_edit can assist with that model;
-    # declare it for honesty. In a single-model (--all-model) run it equals the measured model and
-    # dedupes away, so this only adds a row when an operator runs a genuine multi-model ensemble.
-    claude_code = os.environ.get("CLAUDE_CODE_MODEL", "").strip()
-    if claude_code:
-        ordered.append((claude_code, "claude_code_edit"))
     deduped: dict[str, str] = {}
     for model_id, role in ordered:
         if model_id in deduped:

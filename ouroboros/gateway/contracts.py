@@ -320,8 +320,8 @@ class LogOutbound(TypedDict):
 
     type: Literal["log"]
     data: Dict[str, Any]
-    # Multi-project: surfaced at top level so live task progress routes to the
-    # owning project panel (and mirrors into main) by thread.
+    # Multi-project: surfaced at top level so live task progress routes to
+    # its own thread (Main admits only unstamped non-project frames).
     chat_id: NotRequired[int]
     # Server-stamped when chat_id is a reserved Project thread: Main never
     # adopts it, even before the browser has learned the project.
@@ -1042,6 +1042,7 @@ class ClaudexorStatusResponse(TypedDict, total=False):
     harnesses: List[Dict[str, Any]]
     profiles: Dict[str, Any]
     quota: List[Dict[str, Any]]
+    quota_absences: List[Dict[str, Any]]
     reads: ClaudexorStatusReads
     # UNIFIED ACCOUNT MODEL feature fact (additive-optional): True only when
     # the engine's own /v2/operations catalog was read and advertises
@@ -1399,8 +1400,6 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/onboarding",
     "POST /api/onboarding/subagents/preview",
     "POST /api/onboarding/complete",
-    "GET /api/claude-code/status",
-    "POST /api/claude-code/install",
     "GET /api/files/list",
     "GET /api/files/read",
     "GET /api/files/content",

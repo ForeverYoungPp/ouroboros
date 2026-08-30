@@ -129,8 +129,6 @@ def collect_routes(
     )
     from ouroboros.gateway.onboarding_host import onboarding_page
     from ouroboros.gateway.settings import (
-        api_claude_code_install,
-        api_claude_code_status,
         api_acknowledge_capability,
         api_onboarding,
         api_owner_auto_grant,
@@ -147,8 +145,6 @@ def collect_routes(
     settings_get = settings_handlers.get("api_settings_get", api_settings_get)
     settings_post = settings_handlers.get("api_settings_post", api_settings_post)
     onboarding = settings_handlers.get("api_onboarding", api_onboarding)
-    claude_status = settings_handlers.get("api_claude_code_status", api_claude_code_status)
-    claude_install = settings_handlers.get("api_claude_code_install", api_claude_code_install)
 
     routes: list[BaseRoute] = [
         Route("/api/health", endpoint=api_health),
@@ -217,12 +213,6 @@ def collect_routes(
         Route(
             "/api/onboarding/complete",
             endpoint=api_onboarding_complete,
-            methods=["POST"],
-        ),
-        Route("/api/claude-code/status", endpoint=claude_status),
-        Route(
-            "/api/claude-code/install",
-            endpoint=claude_install,
             methods=["POST"],
         ),
         Route("/api/settings", endpoint=settings_get, methods=["GET"]),

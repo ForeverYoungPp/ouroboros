@@ -8,7 +8,6 @@ reviewer slots.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import logging
@@ -20,10 +19,13 @@ from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("review_substrate")
 
-from ouroboros.config import get_review_models, review_model_uses_local
 from ouroboros.llm import LLMClient
 from ouroboros.observability import new_call_id, persist_call, redact_projection
 from ouroboros.provider_models import provider_for_model
+from ouroboros.review_execution_projection import (
+    MAX_PROJECTED_ACTOR_FINDINGS, projected_finding_row,
+    review_executions_from_actor_usage,
+)
 from ouroboros.task_results import review_binding_hash
 # Everything below the seam. Re-exported here because the substrate is the
 # historical import site for the api_chat prompt renderers; `review_execution`
@@ -45,19 +47,23 @@ from ouroboros.review_execution import (  # noqa: F401  (compat re-exports)
     assert_cache_breakpoint_cap,
     configured_review_routes,
 )
-from ouroboros.review_custody import review_retry_cancelled
+from ouroboros.review_custody import (
+    _ReviewAttemptHistory, _review_exception_projection,
+    review_retry_cancelled,
+)
 # Reviewer-output JSON extraction lives in ONE place beside the array
 # extractor it falls back to (the fenced-object and verdict parsers were
 # split across two modules for no reason).
 from ouroboros.triad_review import parse_review_findings
 from ouroboros.usage_accounting import (
+    PhysicalAttemptLimitExceeded,
     UsageAccountingError,
     UsageScope,
     current_usage_scope,
-    physical_attempt_limit,
     usage_scope,
 )
 from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact
+from ouroboros._outcome_receipts import disclosed_list_projection
 
 
 class _CustodyUsageContext:
@@ -122,6 +128,18 @@ class ReviewSlot:
     # Optional manual credential pin (Q2-в); '' = the daemon's rotation (D28).
     session_profile: str = ""
     transport_timeout_sec: Optional[float] = None
+    # Optional configured-subagent binding (resolved at admission; '' = direct).
+    subagent_id: str = ""
+
+    @property
+    def native_retrieval(self) -> bool:
+        # An api-route actor row: bounded native tool rounds, never the packet.
+        return bool(self.subagent_id) and self.route is ReviewRouteKind.API_CHAT
+
+    @property
+    def retrieves(self) -> bool:
+        # DELIVERY class for admission/fit/authority; transport tests the route.
+        return self.route is ReviewRouteKind.AGENT_SESSION or self.native_retrieval
 
 
 @dataclass
@@ -200,7 +218,6 @@ class ReviewActorRecord:
 
 # B1 typed failure facts, ONE shared key tuple (row/wave/last-execution projections).
 TYPED_FAILURE_FACT_KEYS = ("failure_code", "reset_at", "http_status", "transport_status")
-
 
 @dataclass
 class ReviewRunResult:
@@ -333,7 +350,7 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
     )
     if dialogue_vote not in DIALOGUE_STATUS_VALUES:
         dialogue_vote = ""
-    return {
+    projection = {
         "slot_id": str(row.get("slot_id") or ""), "model": model, "provider": provider,
         "actor_role": str(row.get("actor_role") or f"{surface} reviewer"),
         "transport_status": transport,
@@ -352,9 +369,20 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
         "operation_id": str(row.get("operation_id") or ""),
         "operation_state": str(row.get("operation_state") or "settled"),
         "late_result_pending": bool(row.get("late_result_pending")),
+        "executions": review_executions_from_actor_usage([row]),
         # Flat, redacted pointer to the private full response artifact.
         "response_ref": _response_ref_projection(row.get("response_ref")),
     }
+    # Structured rows ride only where a parsed response exists: an absent
+    # `findings` key is a hole, never the claim "zero findings reported".
+    if parsed is not None:
+        projection.update(disclosed_list_projection(
+            parsed_findings,
+            key="findings",
+            limit=MAX_PROJECTED_ACTOR_FINDINGS,
+            item=projected_finding_row,
+        ))
+    return projection
 
 
 def _response_ref_projection(ref: Any) -> Dict[str, str]:
@@ -937,33 +965,9 @@ from ouroboros.review_dispatch import (  # noqa: E402,F401 — re-exports
 )
 
 
-def reviewer_slots(
-    models: List[str] | None = None,
-    *,
-    effort: str = "medium",
-    role_hint: str = "",
-    id_prefix: str = SLOT_ID_PREFIX,
-    route_env_key: str = "",
-) -> List[ReviewSlot]:
-    """The configured reviewer rows, each carrying its DELIVERY route.
-
-    ``route_env_key`` names the surface's per-row route list (plan 5.1): the
-    commit triad and scope pass theirs, so a row can be an api_chat call or a
-    delegated agent session. Surfaces that stay on the API by owner decision
-    (task acceptance — D15) pass NOTHING, which pins every row to
-    ``api_chat`` explicitly rather than by accident.
-    """
-    raw_models = models if models is not None else get_review_models()
-    named = [str(model) for model in (raw_models or []) if str(model or "").strip()]
-    routes = configured_review_routes(route_env_key, len(named)) if route_env_key else [
-        ReviewRouteKind.API_CHAT
-    ] * len(named)
-    return [
-        ReviewSlot(slot_id=slot_id_for_row(idx + 1, prefix=id_prefix), model=model, effort=effort,
-                   role_hint=role_hint, use_local=review_model_uses_local(model),
-                   route=routes[idx])
-        for idx, model in enumerate(named)
-    ]
+# reviewer_slots() lives in reviewer_slot_config (altitude, P7); re-exported
+# because acceptance surfaces and tests import it from here.
+from ouroboros.reviewer_slot_config import reviewer_slots  # noqa: F401,E402
 
 
 def scope_reviewer_slots(
@@ -1303,6 +1307,7 @@ class ReviewCoordinator:
         prompt_ref: Dict[str, Any] = {}
         response_ref: Dict[str, Any] = {}
         start = time.time()
+        attempt_history = _ReviewAttemptHistory()
         try:
             prompt_ref = persist_call(
                 self.drive_root,
@@ -1352,7 +1357,18 @@ class ReviewCoordinator:
         owner_deadline = str(getattr(request, "deadline_at", "") or "")
         from ouroboros.config import get_finalization_grace_sec
         from ouroboros.deadline_utils import owner_deadline_exhausted
-        if owner_deadline_exhausted(
+        # An exact delegated recovery has already crossed the paid boundary and
+        # carries both the durable invocation token and its operation id.  It is
+        # a settlement join, not a fresh dispatch, so the small custody window
+        # selected by ``run_custodied_review_slots`` must remain usable after the
+        # owner deadline.  The executor still validates the token and refuses a
+        # missing/mismatched durable record before any new POST.
+        recovery_token = str(
+            (retry_state or {}).get("pending_invocation_id") or ""
+        ).strip()
+        exact_recovery = bool(recovery_token and str(operation_id or "").strip()
+            and str(getattr(slot.route, "value", slot.route) or "") == "agent_session")
+        if not exact_recovery and owner_deadline_exhausted(
             deadline_at=owner_deadline, reserve_sec=get_finalization_grace_sec(),
         ):
             return self._error_actor(
@@ -1367,12 +1383,13 @@ class ReviewCoordinator:
             acceptance_actor = request.surface == "task_acceptance"
             actor_attempts = 2 if (p3_actor or acceptance_actor) else 1
             # Acceptance and P3 share one two-send rail: transport/empty retry
-            # or same-route format repair. The prompt, slot and model stay fixed.
-            attempt_rail = (
-                physical_attempt_limit(2)
-                if acceptance_actor or p3_actor
-                else contextlib.nullcontext()
-            )
+            # or same-route format repair; a native tool-round slot instead
+            # gets its episode's own config-owned send cap (its second actor
+            # attempt repairs format locally, spending no send).
+            from ouroboros.review_native_episode import native_or_packet_attempt_rail
+
+            attempt_rail = native_or_packet_attempt_rail(
+                slot, acceptance_actor or p3_actor)
             with attempt_rail:
                 _prior_msg, _prior_usage, _prior_text = None, None, ""
                 _last_msg, _last_usage, _last_text, _has_prior = None, None, "", False
@@ -1402,16 +1419,27 @@ class ReviewCoordinator:
                             assignment, llm=self.llm, executor=executor,
                         )
                         msg, usage, raw_text = attempt.message, attempt.usage, attempt.raw_text
-                    except UsageAccountingError:
+                        attempt_history.observe()
+                    except UsageAccountingError as exc:
+                        attempt_history.observe(exc)
+                        if isinstance(exc, PhysicalAttemptLimitExceeded):
+                            # The rail raises only after its maximum claims have
+                            # already succeeded; the current reservation is the
+                            # released, unpaid one and must not erase those sends.
+                            attempt_history.dispatched = True
                         # Budget/ledger/rail failures never trigger another send;
-                        # retain a prior malformed answer as forensic evidence.
-                        if _prior_text:
+                        # retain a prior response, including an empty response,
+                        # as forensic evidence.
+                        if _has_prior:
                             msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
+                            if _prior_msg is None:
+                                msg, usage, raw_text = _last_msg, _last_usage, _last_text
                             break
                         raise
                     except Exception as exc:
+                        attempt_history.observe(exc)
                         from ouroboros.review_custody import retryable_review_exception
-                        if not retryable_review_exception(exc, self.usage_ctx):
+                        if not retryable_review_exception(exc, self.usage_ctx, attempt_history):
                             raise
                         if actor_attempt + 1 < actor_attempts:
                             if (
@@ -1420,10 +1448,10 @@ class ReviewCoordinator:
                             ):
                                 raise
                             continue
-                        if _prior_text:
+                        if _has_prior:
                             # The repair RESEND failed (transport, timeout): keep the
-                            # malformed-but-substantive first answer as forensics.
-                            msg, usage, raw_text = _prior_msg, _prior_usage, _prior_text
+                            # first answer, including an empty response, as forensics.
+                            msg, usage, raw_text = _last_msg, _last_usage, _last_text
                             break
                         raise
                     _last_msg, _last_usage, _last_text, _has_prior = msg, usage, raw_text, True
@@ -1502,20 +1530,26 @@ class ReviewCoordinator:
                 )
             except Exception:
                 response_ref = {}
-            http_status = getattr(exc, "status_code", None)
+            (
+                failure_custody, _capture_state, http_status,
+                operation_state, failure_code,
+            ) = _review_exception_projection(
+                exc, executor.failure_custody(), attempt_history, retry_state,
+            )
             return ReviewActorRecord(
                 slot_id=slot.slot_id,
                 model=slot.model,
                 status="error",
                 error=sanitize_tool_result_for_log(error_msg),
                 transport_status=_transport_error_status(exc),
-                failure_code=str(getattr(exc, "code", "") or ""),
+                failure_code=failure_code,
                 reset_at=str(getattr(exc, "reset_at", "") or ""),
                 http_status=http_status if isinstance(http_status, int) and http_status else None,
-                usage=executor.failure_custody(),
+                usage=failure_custody,
                 prompt_ref=prompt_ref,
                 response_ref=response_ref,
                 duration_sec=round(time.time() - start, 3),
+                operation_state=operation_state,
             )
 
     def _emit_usage(

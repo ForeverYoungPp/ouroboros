@@ -28,12 +28,11 @@ from ouroboros.review_slot_cancel import (  # noqa: F401 — re-exported seam su
     _slot_cancel_outcome,
 )
 from ouroboros.review_dispatch import bind_api_review_paid_stamp, invoke_review_paid_stamp
+from ouroboros.usage_accounting import POSITIVE_PHYSICAL_ATTEMPT_STATES
 from ouroboros.triad_review import (
     ACCEPTANCE_SURFACE_RULES,
     REVIEW_JSON_ARRAY_CONTRACT,
     TIER_CLASSIFICATION_RULES,
-    empty_array_is_verified_clean,
-    extract_json_array,
 )
 from ouroboros.deadline_utils import (
     bounded_seconds, owner_deadline_exhausted,
@@ -53,7 +52,6 @@ if TYPE_CHECKING:  # annotations only — importing the substrate here would cyc
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot
 
 log = logging.getLogger("review_execution")
-
 class ReviewRouteKind(str, Enum):
     """Closed set of review delivery routes.
 
@@ -402,7 +400,7 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
                 # The coordinator wraps raw stamps once-only, so this fallback
                 # cannot double-charge a route that already marked dispatch.
                 capture = getattr(exc, "physical_attempt_capture", None)
-                if str(getattr(capture, "state", "") or "") in {"dispatched", "settled", "unresolved"}:
+                if str(getattr(capture, "state", "") or "") in POSITIVE_PHYSICAL_ATTEMPT_STATES:
                     invoke_review_paid_stamp(self.assignment.dispatch_stamp)
                 raise
         # Null/non-object provider messages follow the caller's empty-response rail.
@@ -533,196 +531,16 @@ def review_session_output_schema(surface: str) -> Dict[str, Any]:
     shaped["properties"]["findings"]["minItems"] = 1
     return shaped
 
-_UNEXTRACTABLE = "UNEXTRACTABLE"
-
-# The light model canonicalizes NARRATIVE to the review's own output contract —
-# bare ``[]`` or a findings array — so a clean verdict from a session survives
-# exactly as a findings verdict does (D19 closed the asymmetry where a session
-# could BLOCK but never CLEAR). It is the ONE sanctioned second-model use (§8
-# item 6 exception): it extracts; it never judges, repairs, summarizes or
-# attests, and a transcript that is not a completed review comes back
-# UNEXTRACTABLE rather than as an invented verdict.
-_SESSION_EXTRACT_PROMPT = (
-    "The text below is the final answer of a delegated code-review session.\n"
-    "Canonicalize its verdict. Reply with EXACTLY ONE of:\n"
-    "1. [] — when the reviewer COMPLETED the review and explicitly reports no findings\n"
-    "   (a clean verdict). Never reply [] for a refusal, an error, or an unfinished review.\n"
-    "2. ONLY the JSON array of the findings the reviewer reported, copied faithfully\n"
-    "   into the review's own output contract (below). Never invent, merge or drop findings.\n"
-    f"3. The single word {_UNEXTRACTABLE} — when the text is not a completed review\n"
-    "   (a refusal, an error dump, an unfinished session, or anything you cannot map\n"
-    "   faithfully onto the contract).\n"
-    "No prose, no markdown fences.\n\n"
-    "The review's output contract was:\n{contract}\n\n"
-    "Session answer to canonicalize:\n{raw_text}\n"
+# Verdict canonicalization lives in its own module (altitude, P7): both the
+# session route and the native tool-round route consume it.
+from ouroboros.review_verdict_extraction import (  # noqa: F401 — re-exported seam surface
+    _EXTRACT_MAX_CHARS,
+    _UNEXTRACTABLE,
+    _extract_verdict_via_light_model,
+    _findings_array,
+    _strictly_parseable,
+    canonicalize_session_verdict,
 )
-
-# The extraction rail reads the session answer WHOLE — no head/tail window.
-# A windowed read is not a smaller extraction, it is a different (fabricated)
-# verdict: findings reported mid-transcript vanish, and the light model
-# faithfully canonicalizes the cut it was shown into a clean/partial verdict.
-# The single physical send still has one hard bound, because a light model's
-# context is finite: the engine caps a text artifact at 4 MiB while common
-# light-model windows hold ~100k tokens, so past this bound extraction REFUSES
-# with the typed ``extraction_incomplete`` disposition — the raw transcript
-# survives for forensics and can never read as clean — instead of silently
-# shrinking the artifact.
-_EXTRACT_MAX_CHARS = 400_000
-
-
-def _findings_array(payload: Any) -> Optional[List[Dict[str, Any]]]:
-    """The findings list inside a structured payload, or None when it has none."""
-    if isinstance(payload, dict):
-        payload = payload.get("findings")
-    if isinstance(payload, list) and all(isinstance(item, dict) for item in payload):
-        return payload
-    return None
-
-
-def _strictly_parseable(text: str) -> bool:
-    """Would the surfaces' own strict parsers accept this text as a verdict?
-
-    The strict path comes FIRST (D19): a session that already obeyed the output
-    contract is passed through byte-identical, and the constitutional
-    ``empty_array_is_verified_clean`` predicate stays untouched — its strictness
-    is the reason extraction exists, not a defect extraction papers over.
-
-    The WHOLE answer must BE the payload. This used to SCAN with
-    ``extract_json_array``, so any JSON array of objects appearing anywhere in a
-    transcript made it "strict" — a refusal that quoted the contract's own
-    example ("I reviewed NOTHING. The contract asked for entries like
-    [{"item": ..., "verdict": "PASS", ...}]") was passed through byte-identical
-    as a TRUSTED verdict, and the extraction rail that exists precisely to
-    canonicalize a non-verdict never ran. Requiring the whole text removes that
-    leniency; it matches the discipline ``empty_array_is_verified_clean``
-    already applies, and a narrative falls through to extraction, which is what
-    extraction is for.
-    """
-    body = str(text or "")
-    if empty_array_is_verified_clean(body):
-        return True
-    try:
-        parsed = json.loads(body.strip())
-    except (TypeError, ValueError):
-        return False
-    return bool(parsed) and isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed)
-
-
-def canonicalize_session_verdict(
-    raw_text: str, *, conformance_passed: bool, contract: str = "", llm: Any = None,
-    deadline_at: Any = None, transport_timeout_sec: Any = None,
-) -> tuple[str, str, Dict[str, Any]]:
-    """Return ``(canonical_text, method, extraction_usage)`` for a session answer.
-
-    Order is the owner's (D19): trusted structured output first (gated on the
-    run's ``outputConformance == "passed"``, never on run success), then the
-    strict parser, then LIGHT-MODEL extraction over the WHOLE answer.
-    Extraction is not a review call: it runs under its OWN one-send physical
-    rail so it can never consume the reviewing actor's permitted sends, and it
-    spends no reviewer slot. An answer too large for the one-send rail is the
-    typed ``extraction_incomplete`` — never a windowed read, whose canonical
-    form would be a verdict fabricated from the visible cut. ``method`` is one
-    of ``schema | strict | light_model_extraction | extraction_incomplete |
-    unparsed``.
-    """
-    text = str(raw_text or "")
-    if conformance_passed:
-        try:
-            payload = json.loads(text.strip())
-        except (TypeError, ValueError):
-            payload = None
-        findings = _findings_array(payload)
-        if findings is not None:
-            return ("[]" if not findings else json.dumps(findings, ensure_ascii=False)), "schema", {}
-        # The engine claimed conformance over a payload that does not carry the
-        # contract's shape: fall through to the honest branches, and the caller
-        # discloses the delta.
-    if _strictly_parseable(text):
-        return text, "strict", {}
-    if len(text) > _EXTRACT_MAX_CHARS:
-        return text, "extraction_incomplete", {}
-    canonical, usage = _extract_verdict_via_light_model(
-        text, contract=contract, llm=llm, deadline_at=deadline_at,
-        transport_timeout_sec=transport_timeout_sec)
-    if canonical is not None:
-        return canonical, "light_model_extraction", usage
-    # `unparsed` is the honest end of THIS layer's knowledge. The coordinator's
-    # own fenced scanner may still parse the text downstream; labeling that
-    # here would need either a duplicate parser (drift) or a backward import
-    # of the coordinator (the one-way seam ARCHITECTURE pins) — both cost more
-    # than the telemetry cosmetics are worth. Disclosed residual: a fenced
-    # verdict that lands downstream is telemetered `unparsed` at this layer.
-    return text, "unparsed", usage
-
-def _extract_verdict_via_light_model(
-    raw_text: str, *, contract: str = "", llm: Any = None, deadline_at: Any = None,
-    transport_timeout_sec: Any = None) -> tuple[Optional[str], Dict[str, Any]]:
-    """One bounded light-model call canonicalizing narrative to the contract."""
-    from ouroboros.config import get_light_model
-    from ouroboros.usage_accounting import physical_attempt_limit
-
-    if not str(raw_text or "").strip():
-        return None, {}
-    model = get_light_model()
-    from ouroboros.config import get_finalization_grace_sec
-    if owner_deadline_exhausted(deadline_at=deadline_at, reserve_sec=get_finalization_grace_sec()):
-        return None, {"model": model, "reason_code": "deadline_exhausted", "dispatch": "not_dispatched"}
-    prompt = _SESSION_EXTRACT_PROMPT.format(
-        contract=contract or REVIEW_JSON_ARRAY_CONTRACT,
-        raw_text=raw_text,  # WHOLE — the caller already bounded the one send
-    )
-    # Formatting the extraction prompt can itself be expensive. Re-check at
-    # the physical light-model boundary rather than letting an expired owner
-    # window reach the transport helper's positive floor.
-    if owner_deadline_exhausted(deadline_at=deadline_at, reserve_sec=get_finalization_grace_sec()):
-        return None, {"model": model, "reason_code": "deadline_exhausted", "dispatch": "not_dispatched"}
-    try:
-        if llm is None:
-            from ouroboros.llm import LLMClient
-
-            llm = LLMClient()
-        from dataclasses import replace as _replace
-
-        from ouroboros.usage_accounting import UsageScope, current_usage_scope, usage_scope
-
-        # A FRESH one-send rail: the extraction must not claim a send from the
-        # reviewing actor's two-physical-send rail (D19 — not a review call).
-        # The ledger row keeps the actor's task/category attribution but is
-        # sub-labeled `review_substrate.extraction`, so the small light-model
-        # rows beside the $0.00 subscription settlements read as what they are —
-        # verdict extraction, not review-slot spend.
-        _scope = _replace(current_usage_scope() or UsageScope(), source="review_substrate.extraction")
-        chat_kwargs = dict(
-            messages=[{"role": "user", "content": prompt}], model=model,
-            max_tokens=8192, reasoning_effort="low", no_proxy=True,
-        )
-        transport = review_transport_timeout(model, transport_timeout_sec, deadline_at)
-        if transport is not None:
-            chat_kwargs["timeout"] = transport
-        with physical_attempt_limit(1), usage_scope(_scope):
-            message, usage = llm.chat(**chat_kwargs)
-    except Exception as exc:
-        log.warning("Review session verdict extraction failed: %s", exc)
-        return None, {}
-    content = message.get("content") if isinstance(message, dict) else ""
-    if isinstance(content, list):
-        content = " ".join(str(b.get("text", "")) for b in content if isinstance(b, dict))
-    body = str(content or "").strip()
-    usage = dict(usage or {})
-    usage["model"] = model
-    if not body or _UNEXTRACTABLE in body.upper()[:80]:
-        return None, usage
-    if empty_array_is_verified_clean(body):
-        return "[]", usage
-    findings = _findings_array(extract_json_array(body))
-    if findings is None:
-        try:
-            findings = _findings_array(json.loads(body))
-        except (TypeError, ValueError):
-            findings = None
-    if findings is None:
-        return None, usage
-    return ("[]" if not findings else json.dumps(findings, ensure_ascii=False)), usage
 
 
 # ---------------------------------------------------------------------------
@@ -785,8 +603,6 @@ def _retire_orphaned_review_registration(
         ),
     })
     return retired
-
-
 @dataclass(frozen=True)
 class SessionInvocation:
     """WHO is asking and HOW it should be delivered, as one immutable value.
@@ -852,7 +668,6 @@ def run_delegated_review_session(
     state = retry_state if retry_state is not None else {}
     run_id, run_request, invocation_id = "", None, ""
     started_custody = None
-    # Read retry custody before daemon calls; its stored route/request are authoritative.
     retry_token = str(state.get("pending_invocation_id") or "")
     record = custody.invocation_record(custody_drive, retry_token) if retry_token else None
     if record is not None and record["state"] == "started" and record["run_id"]:
@@ -863,11 +678,18 @@ def run_delegated_review_session(
           and isinstance(record.get("request"), dict) and record["request"]):
         run_request, invocation_id = record["request"], retry_token
     recovering = bool(run_id) or run_request is not None
+    if retry_token and not recovering and surface != "skill_review":
+        raise ReviewRouteUnavailable(
+            "delegated retry token has no durable invocation; refusing a second paid run",
+            code="review_custody_lost",
+        )
     if recovering:
         route, project_id, existing_project, key, schema_asked = (
             review_recovery_facts(
                 record, run_request, started_custody, prompt=prompt, root=root,
-                claimant_task_id=task_id)
+                claimant_task_id=task_id, claimant_surface=surface,
+                claimant_slot_id=slot_id,
+                claimant_operation_id=str(invocation.operation_id or ""))
         )
         thread_id = str(run_request.get("_thread_id") or thread_id)
         use_thread = bool(thread_id or run_request.get("_use_thread"))
@@ -976,9 +798,6 @@ def run_delegated_review_session(
                 raise ReviewRouteUnavailable(
                     "the durable start-request row could not be written; the "
                     "delegated review session was NOT started", code="start_request_row_unwritable")
-            # Share the durable token with the logical caller before POST/poll.
-            # If its wait window closes while this worker is still alive, the
-            # synthetic in-flight actor can persist an exact restart handle.
             state["pending_invocation_id"] = invocation_id
             checkpoint_pending_invocation(
                 checkpoint=invocation.pending_invocation_checkpoint, invocation_id=invocation_id,
@@ -1059,7 +878,6 @@ def run_delegated_review_session(
         summary = custody.summary_of(detail)
         run_state = str(summary.get("state") or "")
         if run_state != "succeeded":
-            # Preserve typed RunFailure code/resetAt instead of flattening it into prose.
             failure = summary.get("failure") if isinstance(summary.get("failure"), dict) else {}
             message = (f"delegated review session {run_id} ended {run_state or 'unknown'}"
                        + (f": {json.dumps(failure, ensure_ascii=False)}" if failure else ""))
@@ -1577,6 +1395,15 @@ def _review_route_executor(assignment: ReviewAssignment, *, llm: Any = None) -> 
         route = ReviewRouteKind(assignment.route)
     except ValueError:
         raise ReviewRouteUnavailable(f"unknown review route: {assignment.slot.route!r}", code="unknown_review_route") from None
+    if route is ReviewRouteKind.API_CHAT and bool(
+        getattr(assignment.slot, "native_retrieval", False)
+    ):
+        # A configured-subagent api row is the RETRIEVES class: same wire kind,
+        # different delivery — bounded native tool rounds, never the packet.
+        # Imported lazily: the native module subclasses this module's seam.
+        from ouroboros.review_native_episode import NativeToolRoundReviewExecutor
+
+        return NativeToolRoundReviewExecutor(assignment, llm=llm)
     executor_cls = _REVIEW_ROUTE_EXECUTORS.get(route)
     if executor_cls is None:
         raise ReviewRouteUnavailable(f"review route not implemented in this build: {route.value}",

@@ -22,13 +22,18 @@ from typing import Any, Dict, List, Optional
 from ouroboros.config import review_model_uses_local
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.llm import LLMClient
+from ouroboros.review_execution_projection import review_executions_from_actor_usage
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for
+from ouroboros.usage_accounting import (
+    PHYSICAL_ATTEMPT_STATES, POSITIVE_PHYSICAL_ATTEMPT_STATES,
+)
 from ouroboros.utils import utc_now_iso
 
 
 PLAN_REVIEW_MAX_TOKENS = 65536
 PLAN_RAW_TEXT_PREVIEW_CHARS = 2_000
 from ouroboros.tools.plan_review_artifacts import (  # noqa: E402, F401 - compatibility imports
+    _row_has_physical_dispatch,
     persist_wave as persist_plan_review_wave_artifact,
     read_wave as read_plan_review_wave_artifact,
 )
@@ -39,9 +44,12 @@ PLAN_REVIEW_EFFORT = "high"
 PLAN_REVIEW_SLOT_TIMEOUT_SEC = None
 # Per-slot provenance of what the reviewer read (BIBLE P3, retrieving reviewers):
 # an api_chat slot read exactly the host-assembled packet; an agent_session slot
-# retrieved with its own tools and the host did not observe what it opened.
+# retrieved with its own tools and the host did not observe what it opened; a
+# native tool-round slot retrieved with HOST tools, so its reads are observed —
+# a stronger disclosure that is still never a claim of full-surface coverage.
 HOST_FILE_READ_ASSEMBLED = "host_assembled_packet"
 HOST_FILE_READ_UNOBSERVED = "unobserved"
+HOST_FILE_READ_OBSERVED = "host_observed"
 
 log = logging.getLogger(__name__)
 
@@ -226,15 +234,25 @@ def plan_review_slots() -> list:
             route=ReviewRouteKind.AGENT_SESSION if row.is_session else ReviewRouteKind.API_CHAT,
             session_target=row.session_target,
             session_profile=row.profile_id,
+            subagent_id=row.subagent_id,
         )
         for row in load_reviewer_slot_config().triad
     ]
 
 
 def slot_is_session(slot: Any) -> bool:
+    """TRANSPORT fact: this slot runs a delegated Claudexor session (daemon
+    health, threads, invocation custody). Never use it for delivery class."""
     from ouroboros.review_execution import ReviewRouteKind
 
     return getattr(slot, "route", None) is ReviewRouteKind.AGENT_SESSION
+
+
+def slot_retrieves(slot: Any) -> bool:
+    """DELIVERY class: this slot reads the subject with its own tools — a
+    session row or a configured-subagent native row. Packet sizing, fit and
+    retrieval semantics test THIS, not the route name."""
+    return bool(getattr(slot, "retrieves", slot_is_session(slot)))
 
 
 async def run_plan_review_slots(
@@ -296,7 +314,10 @@ async def run_plan_review_slots(
     for slot in slots:  # a slot the substrate never answered for is still a configured row
         if str(slot.slot_id) not in answered:
             rows.append(_plan_row_from_actor({"slot_id": slot.slot_id, "model": slot.model,
-                                              "status": "error", "error": "no actor record"}, slot))
+                                              "status": "error", "error": "no actor record",
+                                              "failure_code": "review_custody_lost",
+                                              "operation_state": "custody_lost",
+                                              "late_result_pending": True}, slot))
     return rows
 
 
@@ -318,6 +339,21 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
     if actor.get("status") not in {"ok", "empty"} and not error:
         error = str(actor.get("status") or "review failed")
     session = slot_is_session(slot) if slot is not None else False
+    physical_attempt_state = str(
+        usage.get("physical_attempt_state")
+        or actor.get("physical_attempt_state")
+        or ""
+    )
+    provider_status_code = usage.get("provider_status_code")
+    if provider_status_code is None:
+        provider_status_code = actor.get("provider_status_code")
+    if isinstance(provider_status_code, bool):
+        provider_status_code = None
+    elif provider_status_code is not None:
+        try:
+            provider_status_code = int(provider_status_code)
+        except (TypeError, ValueError, OverflowError):
+            provider_status_code = None
     return {
         # Identity is CARRIED, never re-derived: the row keeps the slot_id the
         # substrate ran, so duplicate-model plan rows stay distinguishable.
@@ -325,7 +361,13 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         "model": str(usage.get("resolved_model") or actor.get("model") or getattr(slot, "model", "") or ""),
         "request_model": str(getattr(slot, "model", "") or actor.get("model") or ""),
         "route": "agent_session" if session else "api_chat",
-        "host_file_read_attestation": HOST_FILE_READ_UNOBSERVED if session else HOST_FILE_READ_ASSEMBLED,
+        # Delivery-truthful provenance: a native tool-round actor discloses its
+        # HOST-OBSERVED reads through its usage; session stays unobserved and a
+        # packet row stays host-assembled.
+        "host_file_read_attestation": (
+            str(usage.get("host_file_read_attestation") or "")
+            or (HOST_FILE_READ_UNOBSERVED if session else HOST_FILE_READ_ASSEMBLED)
+        ),
         "text": text,
         "error": error or None,
         "prompt_ref": actor.get("prompt_ref") or {},
@@ -333,10 +375,15 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         "tokens_in": usage.get("prompt_tokens", 0),
         "tokens_out": usage.get("completion_tokens", 0),
         "cost": float(usage["cost"]) if usage.get("cost") is not None else None,
+        # Presentation-only receipt from the actor's RETURNED usage. Requested
+        # slot route/model, money, profile and raw telemetry never enter it.
+        "executions": review_executions_from_actor_usage([actor]),
         # B1 typed failure facts, forwarded VERBATIM from the actor record (empty on
         # success and on pre-typed engines) so downstream never regresses to matching
         # the error prose for the code or the reset instant.
         **_typed_facts_from(actor, lambda source, key: source.get(key)),
+        "physical_attempt_state": physical_attempt_state,
+        "provider_status_code": provider_status_code,
         "capability_delta": usage.get("capability_delta") or [],
         "review_thread_id": str(usage.get("review_thread_id") or ""),
         "review_turn_id": str(usage.get("review_turn_id") or ""),
@@ -367,6 +414,13 @@ def plan_row_typed_facts(row: Dict[str, Any]) -> Dict[str, Any]:
         **_typed_facts_from(row, lambda source, key: source.get(key)),
         "capability_delta": row.get("capability_delta") or [],
     }
+    physical_attempt_state = str(row.get("physical_attempt_state") or "")
+    provider_status_code = row.get("provider_status_code")
+    if physical_attempt_state or provider_status_code is not None:
+        facts.update({
+            "physical_attempt_state": physical_attempt_state,
+            "provider_status_code": provider_status_code,
+        })
     pending_invocation_id = str(row.get("pending_invocation_id") or "")
     delegated_run_id = str(row.get("delegated_run_id") or "")
     if row.get("operation_id") or row.get("late_result_pending") \
@@ -387,11 +441,10 @@ def synthesize_plan_review_wave(
     fingerprint: str, previous: Optional[dict], manifest: dict, manifest_hash: str,
     constitutional: bool, constitutional_note: str, cycle_index: int, retry_key: str,
     enforcement: str, cap: Any, quorum: int, configured_slots: list,
-    callable_slots: list, health_evidence: Any,
+    health_evidence: Any,
 ) -> tuple[dict, set[str], dict]:
     """Validate raw actor rows and build one durable plan-review wave."""
     from ouroboros.tools import plan_spec
-    from ouroboros.utils import truncate_review_artifact
 
     ids = plan_spec.spec_ids(spec)
     seen_before = {str(s) for s in state.get("need_evidence_seen") or []}
@@ -414,24 +467,10 @@ def synthesize_plan_review_wave(
                 seen_after |= set(slot_seen)
         slot_results.append({"slot": row.get("slot_id"), "model": row.get("model"),
                              "ok": ok, "findings": findings, "error": error or None})
-        slot_records.append({
-            "slot_id": row.get("slot_id"), "model": row.get("model"), "route": row.get("route"),
-            "host_file_read_attestation": row.get("host_file_read_attestation"),
-            "ok": ok, "error": error or None, "disclosures": disclosures,
-            **plan_row_typed_facts(row),
-            "prompt_ref": row.get("prompt_ref") or {}, "response_ref": row.get("response_ref") or {},
-            "tokens_in": row.get("tokens_in"), "tokens_out": row.get("tokens_out"),
-            "cost": row.get("cost"),
-            "raw_text_preview": truncate_review_artifact(
-                str(row.get("text") or ""), limit=PLAN_RAW_TEXT_PREVIEW_CHARS,
-            ) if not ok else "",
-            "review_thread_id": str(row.get("review_thread_id") or ""),
-            "review_turn_id": str(row.get("review_turn_id") or ""),
-            "review_thread_receipt": row.get("review_thread_receipt") or {},
-            "auth_route_receipt": row.get("auth_route_receipt") or {},
-            "profile_continuity_receipt": row.get("profile_continuity_receipt") or {},
-            "applied_profile": str(row.get("applied_profile") or ""),
-        })
+        slot_records.append(plan_wave_actor_record(
+            row, ok=ok, error=error, disclosures=disclosures,
+            raw_text_preview_chars=PLAN_RAW_TEXT_PREVIEW_CHARS,
+        ))
     agg = plan_spec.aggregate(slot_results, quorum=quorum)
     aggregate = str(agg["aggregate"])
     wave = {
@@ -456,7 +495,8 @@ def synthesize_plan_review_wave(
         "closed": aggregate == "GREEN", "dispositions": [], "actors": slot_records,
         "custody_pending": False,
         "actors_degraded": [str(r["slot_id"]) for r in slot_records if not r["ok"]],
-        "enforcement": enforcement, "cycle_cap": cap, "paid": bool(callable_slots),
+        "enforcement": enforcement, "cycle_cap": cap,
+        "paid": any(_row_has_physical_dispatch(row) for row in slot_records),
         "health_epoch": plan_health_epoch(health_evidence),
         "reviewer_config_fingerprint": plan_reviewer_config_fingerprint(configured_slots),
         **plan_quorum_unreachable_facts(slot_records, quorum=quorum), "reviewed_at": utc_now_iso(),
@@ -478,6 +518,37 @@ def synthesize_plan_review_wave(
         wave["reasons"].append("review_late_result_pending")
         seen_after = seen_before
     return wave, seen_after, agg
+
+
+def plan_wave_actor_record(
+    row: Dict[str, Any], *, ok: bool, error: str,
+    disclosures: List[str], raw_text_preview_chars: int,
+) -> Dict[str, Any]:
+    """Build the durable Plan actor projection outside the orchestration loop."""
+    from ouroboros.utils import truncate_review_artifact
+
+    return {
+        "slot_id": row.get("slot_id"), "model": row.get("model"),
+        "route": row.get("route"), "executions": list(row.get("executions") or []),
+        "host_file_read_attestation": row.get("host_file_read_attestation"),
+        "ok": ok, "error": error or None, "disclosures": disclosures,
+        **plan_row_typed_facts(row),
+        "prompt_ref": row.get("prompt_ref") or {},
+        "response_ref": row.get("response_ref") or {},
+        "tokens_in": row.get("tokens_in"), "tokens_out": row.get("tokens_out"),
+        "cost": row.get("cost"),
+        "raw_text_preview": (
+            truncate_review_artifact(
+                str(row.get("text") or ""), limit=raw_text_preview_chars,
+            ) if not ok else ""
+        ),
+        "review_thread_id": str(row.get("review_thread_id") or ""),
+        "review_turn_id": str(row.get("review_turn_id") or ""),
+        "review_thread_receipt": row.get("review_thread_receipt") or {},
+        "auth_route_receipt": row.get("auth_route_receipt") or {},
+        "profile_continuity_receipt": row.get("profile_continuity_receipt") or {},
+        "applied_profile": str(row.get("applied_profile") or ""),
+    }
 
 
 def plan_row_disclosures(row: Dict[str, Any]) -> List[str]:
@@ -714,7 +785,7 @@ def _slot_session_route(slot: Any) -> Any:
 def _structural_skip_code(reason: str, reset_at: str) -> str:
     """POSITIVE structural evidence only: a dated window exhaustion whose reset is
     still ahead, or a typed dead-pool code. An UNDATED exhaustion, a stale reset and
-    every other reason (route_status_*, transient daemon states, unknown) dispatch —
+    every other reason (route_disabled, transient daemon states, unknown) dispatch —
     the pre-dispatch admission and the run itself refuse typed downstream at ~$0."""
     from ouroboros.gateways.claudexor import WINDOW_EXHAUSTED_CODES
 
@@ -814,6 +885,7 @@ def plan_health_skip_rows(slots: list, evidence: Optional[Dict[str, Dict[str, st
             ),
             "failure_code": code, "reset_at": reset,
             "prompt_ref": {}, "response_ref": {}, "tokens_in": 0, "tokens_out": 0, "cost": 0.0,
+            "status": "not_dispatched", "operation_state": "not_dispatched",
         })
     return live, rows
 
@@ -849,6 +921,12 @@ def plan_reviewer_config_fingerprint(slots: list) -> str:
          str(getattr(s, "effort", "") or "")]
         for s in slots or []
     ]
+    # Actor binding is delivery identity; column added only when some row
+    # carries one, so unchanged legacy rosters keep their exact bytes.
+    actor_ids = [str(getattr(s, "subagent_id", "") or "") for s in slots or []]
+    if any(actor_ids):
+        for row, actor in zip(rows, actor_ids):
+            row.append(actor)
     return sha256(json.dumps(rows, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -904,11 +982,39 @@ def plan_wave_replay_decision(slots_fn: Any, existing: Dict[str, Any]) -> tuple:
 
 
 def plan_wave_has_in_flight(wave: Dict[str, Any]) -> bool:
+    """Whether a paid wave must re-enter exact custody reconciliation.
+
+    The durable summary and malformed physical facts are conservative ingress
+    signals: they must reach ``in_flight_resume_inputs`` so its exact-roster
+    validator can fail closed instead of falling through to a fresh paid cycle.
+    """
+    if bool(wave.get("custody_pending")):
+        return True
+    actors = wave.get("actors")
+    malformed_roster = (
+        not isinstance(actors, list)
+        or not actors
+        or any(not isinstance(actor, dict) for actor in actors)
+    )
+    if malformed_roster:
+        return bool(wave.get("paid"))
+    for actor in actors or []:
+        physical_state = str(actor.get("physical_attempt_state") or "").strip().lower()
+        if not physical_state and isinstance(actor.get("usage"), dict):
+            physical_state = str(
+                actor["usage"].get("physical_attempt_state") or ""
+            ).strip().lower()
+        if physical_state and physical_state not in PHYSICAL_ATTEMPT_STATES:
+            return True
+        if physical_state in POSITIVE_PHYSICAL_ATTEMPT_STATES and (
+            str(actor.get("operation_state") or "").strip().lower() == "not_dispatched"
+            or str(actor.get("status") or "").strip().lower() == "not_dispatched"
+        ):
+            return True
     return any(
         str(actor.get("operation_state") or "") == "in_flight"
         or bool(actor.get("late_result_pending"))
-        for actor in (wave.get("actors") or [])
-        if isinstance(actor, dict)
+        for actor in actors or []
     )
 
 
@@ -978,14 +1084,14 @@ def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int) -> tuple[list,
     # harness target, not a provider route (`reviewer_window.reviewer_route(session=True)`), and
     # the review organ's convention (triad: "session rows are not constrained by this pack")
     # is that such a row is never fit-excluded — it retrieves with its own tools.
-    api_models = [str(getattr(slot, "model", "") or "") for slot in slots if not slot_is_session(slot)]
+    api_models = [str(getattr(slot, "model", "") or "") for slot in slots if not slot_retrieves(slot)]
     limits = per_slot_input_token_limits(
         api_models, output_reserve=PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000)
     estimated = max(1, (max(0, int(prompt_chars)) + 3) // 4)  # utils.estimate_tokens on the packet
     callable_slots, oversize = [], []
     for slot in slots:
         cap = int(limits.get(str(getattr(slot, "model", "") or ""), 0) or 0)
-        if slot_is_session(slot) or estimated <= cap:
+        if slot_retrieves(slot) or estimated <= cap:
             callable_slots.append(slot)
             continue
         oversize.append({
@@ -996,6 +1102,7 @@ def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int) -> tuple[list,
             "error": (f"preflight_oversize: assembled packet ~{estimated:,} estimated tokens exceeds "
                       f"this slot's calibrated input cap {cap:,}"),
             "prompt_ref": {}, "response_ref": {}, "tokens_in": 0, "tokens_out": 0, "cost": 0.0,
+            "status": "not_dispatched", "operation_state": "not_dispatched",
         })
     error = ""
     if slots and len(callable_slots) < int(quorum):

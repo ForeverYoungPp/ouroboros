@@ -225,3 +225,103 @@ def test_project_completion_host_salvage_uses_neutral_details_copy(tmp_path, mon
     assert len(queued) == 1
     assert raw not in queued[0]["text"]
     assert queued[0]["text"].endswith("Open the Project for details.")
+
+
+def test_provider_death_arms_always_carry_terminal_origin(monkeypatch):
+    """Class contract (nanny-leaf sprint S2): every arm of the provider-death
+    rail — including no-call early returns (context_overflow salvage,
+    transport_unavailable_no_resend, provider_outcome_unknown_no_resend) —
+    stamps a terminal provenance, so host salvage can never publish as a
+    model-authored final. Explicit stamps (retained MODEL_FINAL under the
+    retry wall) stay authoritative via setdefault."""
+    import pathlib
+    from types import SimpleNamespace
+
+    import ouroboros.loop as L
+
+    def _ctx(kind):
+        return SimpleNamespace(
+            messages=[{"role": "user", "content": "do"}],
+            llm=None, active_model="m", active_effort="low", max_retries=1,
+            drive_logs=pathlib.Path("/tmp"), task_id="t-origin", round_idx=1,
+            event_queue=None, accumulated_usage={
+                # The round gate always leaves the failing round's typed facts
+                # on the usage record before the rail is entered.
+                "_last_llm_error_kind": kind,
+                "execution_status": "infra_failed", "reason_code": "llm_api_error",
+            },
+            task_type="", active_use_local=False, max_rounds=10, deadline_ts=None,
+            drive_root=None, budget_drive_root=None, root_task_id="", tools=None,
+            llm_trace={},
+        )
+
+    monkeypatch.setattr(L, "call_llm_with_retry", lambda *a, **k: (None, 0.0))
+
+    # provider_outcome_unknown no-resend arm (the incident arm).
+    _t, usage, _tr = L._handle_provider_unavailable(
+        _ctx("provider_outcome_unknown"), error_kind="provider_outcome_unknown")
+    assert usage.get("terminal_origin") == L.TERMINAL_ORIGIN_HOST_SALVAGE
+
+    # transport-wait no-resend arm.
+    _t, usage, _tr = L._handle_provider_unavailable(
+        _ctx("transport_unavailable"), wait_cause="transport_unavailable")
+    assert usage.get("terminal_origin") == L.TERMINAL_ORIGIN_HOST_SALVAGE
+
+    # context-overflow salvage arm.
+    _t, usage, _tr = L._handle_provider_unavailable(
+        _ctx("context_overflow"), error_kind="context_overflow")
+    assert usage.get("terminal_origin") == L.TERMINAL_ORIGIN_HOST_SALVAGE
+
+
+def test_deadline_grace_final_is_never_stamped_host_salvage(monkeypatch):
+    """Panel blocker (sol/grok/fable, lane B F1): the deadline grace arm can
+    return a MODEL-AUTHORED final (``deadline_local``, provider_terminal=False).
+    The wrapper must not stamp it HOST_SALVAGE — delivery would replace the
+    model's answer with the generic outage receipt."""
+    import pathlib
+    from types import SimpleNamespace
+
+    import ouroboros.loop as L
+
+    ctx = SimpleNamespace(
+        messages=[{"role": "user", "content": "do"}],
+        llm=None, active_model="m", active_effort="low", max_retries=1,
+        drive_logs=pathlib.Path("/tmp"), task_id="t-deadline", round_idx=1,
+        event_queue=None,
+        accumulated_usage={"_last_llm_error_kind": "deadline_exhausted"},
+        task_type="", active_use_local=False, max_rounds=10, deadline_ts=None,
+        drive_root=None, budget_drive_root=None, root_task_id="", tools=None,
+        llm_trace={},
+    )
+    monkeypatch.setattr(
+        L, "call_llm_with_retry",
+        lambda *a, **k: ({"role": "assistant", "content": "Best answer before deadline."}, 0.0),
+    )
+    text, usage, _tr = L._handle_provider_unavailable(
+        ctx, error_kind="deadline_exhausted")
+    assert "Best answer before deadline." in text
+    assert usage.get("reason_code") == "deadline_local"
+    assert usage.get("terminal_origin") != L.TERMINAL_ORIGIN_HOST_SALVAGE
+
+
+def test_budget_and_round_limit_rails_keep_legacy_missing_origin(monkeypatch):
+    """The wrapper deviation's whole point (fable lane B gap #2): budget and
+    round-limit rails never enter the wrapper, so their terminals still carry
+    NO terminal_origin (missing = legacy shape)."""
+    import pathlib
+    from types import SimpleNamespace
+
+    import ouroboros.loop as L
+
+    ctx = SimpleNamespace(
+        messages=[{"role": "user", "content": "do"}],
+        llm=None, active_model="m", active_effort="low", max_retries=1,
+        drive_logs=pathlib.Path("/tmp"), task_id="t-rails", round_idx=11,
+        event_queue=None, accumulated_usage={},
+        task_type="", active_use_local=False, max_rounds=10, deadline_ts=None,
+        drive_root=None, budget_drive_root=None, root_task_id="", tools=None,
+        llm_trace={},
+    )
+    monkeypatch.setattr(L, "call_llm_with_retry", lambda *a, **k: (None, 0.0))
+    _t, usage, _tr = L._handle_round_limit(ctx)
+    assert "terminal_origin" not in usage

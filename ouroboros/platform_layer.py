@@ -11,7 +11,6 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
 
 log = logging.getLogger(__name__)
@@ -675,17 +674,44 @@ def current_process_group_id() -> int:
         return 0
 
 
+_BOOT_ID = ""  # full hex of the /proc boot id; empty until a successful read, then latched
+
+
 def process_start_time(pid: int) -> str:
     """Best-effort stable start-time token for (pid, start_time) fingerprints.
 
-    A bare pid is not an identity — the kernel reuses it. ``(pid, start_time)`` is, which is what
-    lets a caller refuse to signal a pid it merely used to own. POSIX uses ``ps -o lstart=``,
-    falling back to the same /proc field the containment scan dates candidates by, so the
-    fingerprint stays real on an image with no usable ``ps``. Windows returns "" (callers degrade
-    to pid liveness), as does a pid that is already gone."""
-    if pid <= 0:
+    A bare pid is not an identity (kernels reuse pids) and boot-relative ticks RECUR across
+    reboots, so a bare tick + a recycled pid + the same command line is a real collision;
+    refusing that kill is the job. Linux mints IN THIS ORDER: ``"<ticks>.<boot_hex>"`` when the
+    boot id is readable (no subprocess); else the ``ps`` wall-clock token, which does not recur
+    across boots in practice; and only once ``ps`` has ALSO failed, ``"<ticks>."`` as a
+    disclosed last resort — two of THOSE from different boots do string-match, hence last, not
+    first. No ``/proc``: legacy throughout; Windows and a dead pid return "". Disclosed: the
+    FORM changes if the boot id starts or stops being readable mid-generation, so a row
+    recorded across it can mismatch its own live process — safe: it prunes, never kills, and
+    the cheap reap path skips live rows."""
+    global _BOOT_ID
+    if pid <= 0 or os.name == "nt":
         return ""
-    if os.name == "nt":
+    if not (ticks := _proc_start_ticks(pid)):
+        return process_start_time_legacy(pid)  # no /proc here (macOS, BSD): ps is the only source
+    if not _BOOT_ID:  # a failed read is transient: retry next call, never downgrade the generation
+        try:
+            _BOOT_ID = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip().replace("-", "")
+        except (OSError, ValueError):  # matches _proc_start_ticks; an escapee would abort a custody sweep
+            pass
+    if _BOOT_ID:
+        return f"{ticks}.{_BOOT_ID}"
+    # legacy degrades to str(ticks) when ps ALSO failed; only then is the separator form the best we have.
+    return legacy if (legacy := process_start_time_legacy(pid)) and legacy != str(ticks) else f"{ticks}."
+
+
+def process_start_time_legacy(pid: int) -> str:
+    """The historical ``ps -o lstart=`` token (bare ``/proc`` ticks when ``ps`` fails). Two jobs:
+    the DOWNGRADE-SAFE spelling the custody ledger keeps writing into ``fingerprint.start_time``
+    (an N−1 reader understands it), and the compatibility comparison a boot-qualified current
+    token falls back to (see ``process_custody._legacy_start_matches``)."""
+    if pid <= 0 or os.name == "nt":
         return ""
     try:
         out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
@@ -837,6 +863,49 @@ def kill_processes_referencing(marker: str) -> None:
         force_kill_pid(pid)
 
 
+def tcp_keepalive_socket_options() -> List[tuple]:
+    """Cross-platform TCP keepalive options for long-lived remote sockets.
+
+    A NAT/VPN gateway that silently drops an idle connection's mapping leaves
+    the local socket half-open: without keepalive probes the process only
+    learns at the (deliberately long) transport read timeout. Kernel probes
+    detect the dead peer within minutes instead.
+
+    Every platform gets ``SO_KEEPALIVE``; the probe-tuning constants are set
+    only where the platform exposes them (Linux spells the idle threshold
+    ``TCP_KEEPIDLE``, Darwin spells it ``TCP_KEEPALIVE``), each behind a
+    ``hasattr`` guard so an older interpreter still gets the safe minimum.
+    """
+    import socket
+
+    from ouroboros.config import (
+        TCP_KEEPALIVE_IDLE_SEC,
+        TCP_KEEPALIVE_INTERVAL_SEC,
+        TCP_KEEPALIVE_PROBE_COUNT,
+    )
+
+    options: List[tuple] = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    if IS_LINUX:
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            options.append(
+                (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE_SEC)
+            )
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            options.append(
+                (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL_SEC)
+            )
+        if hasattr(socket, "TCP_KEEPCNT"):
+            options.append(
+                (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_PROBE_COUNT)
+            )
+    elif IS_MACOS:
+        if hasattr(socket, "TCP_KEEPALIVE"):
+            options.append(
+                (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, TCP_KEEPALIVE_IDLE_SEC)
+            )
+    return options
+
+
 def kill_process_on_port(port: int) -> None:
     """Kill any process listening on the given TCP port."""
     try:
@@ -971,6 +1040,13 @@ def node_distribution_platform() -> str:
 
 def probe_node_version(node_path: str) -> str:
     """Return a normalized bundled-Node version, or ``""`` on probe failure."""
+    # A metadata probe must not inherit runtime/test hooks. In particular,
+    # NODE_OPTIONS can contain test filters or preload modules that either make
+    # `node --version` fail before the hermetic lane gets a chance to scrub the
+    # variable or execute arbitrary operator code during a supposedly inert
+    # version check.
+    probe_env = dict(os.environ)
+    probe_env.pop("NODE_OPTIONS", None)
     try:
         result = _hidden_run(
             [str(node_path), "--version"],
@@ -979,6 +1055,7 @@ def probe_node_version(node_path: str) -> str:
             encoding="utf-8",
             timeout=10,
             check=False,
+            env=probe_env,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -1090,150 +1167,6 @@ def resolve_bundled_ripgrep() -> Optional[str]:
     """Return the bundled rg path if present."""
     return _resolve_bundled_payload(embedded_ripgrep_candidates)
 
-
-# Claude runtime resolution.
-
-@dataclass
-class ClaudeRuntimeState:
-    """Structured Claude SDK/CLI availability snapshot."""
-    # App-managed runtime: bundled SDK and CLI.
-    app_managed: bool = False
-    sdk_version: str = ""
-    sdk_path: str = ""
-    cli_path: str = ""
-    cli_version: str = ""
-    interpreter_path: str = ""
-    # Legacy user-site runtime.
-    legacy_detected: bool = False
-    legacy_sdk_path: str = ""
-    legacy_sdk_version: str = ""
-    # Operational state.
-    ready: bool = False
-    api_key_set: bool = False
-    error: str = ""
-    last_stderr: str = ""
-
-    def status_label(self) -> str:
-        if not self.sdk_version:
-            return "missing"
-        # Version errors must not be shadowed by a missing API key.
-        if self.error:
-            return "error"
-        if not self.api_key_set:
-            return "no_api_key"
-        if not self.ready:
-            return "degraded"
-        return "ready"
-
-
-def _find_sdk_package_path() -> Optional[str]:
-    """Return the filesystem path to the installed claude_agent_sdk package."""
-    try:
-        import claude_agent_sdk
-        pkg_file = getattr(claude_agent_sdk, "__file__", None)
-        if pkg_file:
-            return str(pathlib.Path(pkg_file).parent)
-    except ImportError:
-        pass
-    return None
-
-
-def _find_bundled_cli(sdk_path: str) -> Optional[str]:
-    """Locate the bundled CLI binary inside the SDK package."""
-    cli_name = "claude.exe" if IS_WINDOWS else "claude"
-    bundled = pathlib.Path(sdk_path) / "_bundled" / cli_name
-    return str(bundled) if bundled.is_file() else None
-
-
-def _probe_cli_version(cli_path: str) -> str:
-    """Run ``claude -v`` and return the version string, or empty on failure."""
-    try:
-        result = subprocess.run(
-            [cli_path, "-v"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            m = re.match(r"([0-9]+\.[0-9]+\.[0-9]+)", result.stdout.strip())
-            if m:
-                return m.group(1)
-    except Exception:
-        pass
-    return ""
-
-
-def _detect_legacy_user_site_sdk() -> tuple[bool, str, str]:
-    """Detect an SDK installed outside the app-managed python-standalone."""
-    sdk_path = _find_sdk_package_path()
-    if not sdk_path:
-        return False, "", ""
-    if "python-standalone" in [p.lower() for p in pathlib.Path(sdk_path).resolve().parts]:
-        return False, "", ""
-    try:
-        import importlib.metadata
-        ver = importlib.metadata.version("claude-agent-sdk")
-    except Exception:
-        ver = ""
-    return True, sdk_path, ver
-
-
-def resolve_claude_runtime() -> ClaudeRuntimeState:
-    """Build a deterministic, non-persistent Claude runtime snapshot."""
-    state = ClaudeRuntimeState()
-    state.interpreter_path = sys.executable
-
-    # SDK availability.
-    try:
-        import importlib.metadata
-        state.sdk_version = importlib.metadata.version("claude-agent-sdk")
-    except Exception:
-        pass
-
-    sdk_path = _find_sdk_package_path()
-    if sdk_path:
-        state.sdk_path = sdk_path
-        # App-managed SDK lives inside python-standalone.
-        parts_lower = [p.lower() for p in pathlib.Path(sdk_path).resolve().parts]
-        state.app_managed = "python-standalone" in parts_lower
-        cli = _find_bundled_cli(sdk_path)
-        if cli:
-            state.cli_path = cli
-            state.cli_version = _probe_cli_version(cli)
-
-    # Legacy detection.
-    legacy_detected, legacy_path, legacy_ver = _detect_legacy_user_site_sdk()
-    state.legacy_detected = legacy_detected
-    state.legacy_sdk_path = legacy_path
-    state.legacy_sdk_version = legacy_ver
-
-    # API key.
-    state.api_key_set = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
-
-    # Baseline gate avoids false-ready older SDKs with bundled CLI.
-    sdk_version_ok = False
-    if state.sdk_version:
-        try:
-            from ouroboros.launcher_bootstrap import _CLAUDE_SDK_MIN_VERSION, _version_tuple
-            sdk_version_ok = _version_tuple(state.sdk_version) >= _version_tuple(_CLAUDE_SDK_MIN_VERSION)
-        except Exception:
-            # Unknown baseline means not-ready so UI offers Repair.
-            sdk_version_ok = False
-    state.ready = bool(
-        state.sdk_version and sdk_version_ok and state.cli_path and state.api_key_set
-    )
-    if state.sdk_version and not sdk_version_ok and not state.error:
-        try:
-            from ouroboros.launcher_bootstrap import _CLAUDE_SDK_MIN_VERSION
-            state.error = (
-                f"Claude SDK {state.sdk_version} is below baseline {_CLAUDE_SDK_MIN_VERSION}. "
-                "Run Repair to upgrade."
-            )
-        except Exception:
-            state.error = f"Claude SDK {state.sdk_version} is below the required baseline."
-
-    return state
-
-
-# System profiling helpers.
 
 def get_system_memory() -> str:
     """Return total system memory as a human-readable string."""

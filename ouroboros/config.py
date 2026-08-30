@@ -1,8 +1,5 @@
-"""
-Ouroboros — Shared configuration (single source of truth).
-
-Paths, settings defaults, load/save with file locking and cycle-free setting metadata.
-"""
+"""Ouroboros — Shared configuration (single source of truth): paths, settings
+defaults, load/save with file locking and cycle-free setting metadata."""
 
 from __future__ import annotations
 
@@ -31,6 +28,11 @@ SETTINGS_PATH = pathlib.Path(os.environ.get("OUROBOROS_SETTINGS_PATH", DATA_DIR 
 PID_FILE = pathlib.Path(os.environ.get("OUROBOROS_PID_FILE", APP_ROOT / "ouroboros.pid"))
 PORT_FILE = pathlib.Path(os.environ.get("OUROBOROS_PORT_FILE", DATA_DIR / "state" / "server_port"))
 
+# Settings pin + write guards: SSOT settings_integrity; re-exported for config.X imports.
+from ouroboros import settings_integrity as _settings_integrity  # noqa: E402
+SETTINGS_INTEGRITY_ENV = _settings_integrity.SETTINGS_INTEGRITY_ENV
+SettingsIntegrityError = _settings_integrity.SettingsIntegrityError
+
 RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 AGENT_SERVER_PORT = 8765
@@ -39,31 +41,23 @@ FINALIZATION_GRACE_DEFAULT_SEC = 120
 # (the loop's mailbox drain). No summary by this cap -> honest custody cancel.
 OWNER_STOP_OUTER_CAP_SEC = 600
 NESTED_SETTLEMENT_MARGIN_SEC = 30  # Structural ordering margin, not a cognition timeout.
-# Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at
-# (e.g. headless benchmark runs). Advisory only — surfaces elapsed/rounds/cost so
-# the model can self-pace; it is not a stop gate. 0 disables.
+# Owner-note cadence while a task waits out a provider-connection outage; the effective interval is min(this, idle_timeout/2) so the notes also keep the idle rail alive.
+NETWORK_WAIT_NOTE_INTERVAL_SEC = 300
+# First free-redial pause of a transport-wait episode; doubles per wait iteration up to the existing 60s transient backoff cap (Q10: an existing bound, not a new knob).
+NETWORK_WAIT_BACKOFF_START_SEC = 4.0
+# Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at (headless benchmark runs). Advisory only — surfaces elapsed/rounds/cost for self-pacing; 0 disables.
 PACING_INTERVAL_DEFAULT_SEC = 600
-# Supervisor-loop liveness deadline (WS3, v6.34.0): a watchdog thread flags the main
-# supervisor loop STALLED if it has not ticked within this many seconds (healthy tick
-# ~0.5s), so it only fires on a real wedge. 0 disables.
+# Supervisor-loop liveness deadline (WS3, v6.34.0): a watchdog thread flags the main supervisor loop STALLED if it has not ticked within this many seconds (healthy tick ~0.5s, real wedges only). 0 disables.
 SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC = 90
+# TCP keepalive for long-lived remote LLM sockets (idle threshold, probe interval, probe count): kernel probes
+# detect a silently dropped NAT/VPN mapping instead of hanging to the read timeout; platform_layer builds the options.
+TCP_KEEPALIVE_IDLE_SEC = 60
+TCP_KEEPALIVE_INTERVAL_SEC = 60
+TCP_KEEPALIVE_PROBE_COUNT = 5
 
 
 def _guard_live_settings_write() -> None:
-    if os.environ.get("OUROBOROS_ALLOW_LIVE_DATA_TESTS") == "1":
-        return
-    try:
-        live_settings = SETTINGS_PATH.resolve(strict=False) == (
-            HOME / "Ouroboros" / "data" / "settings.json"
-        ).resolve(strict=False)
-    except OSError:
-        live_settings = False
-    if ("PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules) and live_settings:
-        raise RuntimeError(
-            "Refusing to write live Ouroboros settings.json from pytest. "
-            "Set OUROBOROS_SETTINGS_PATH/OUROBOROS_DATA_DIR to a temp path, "
-            "or OUROBOROS_ALLOW_LIVE_DATA_TESTS=1 for an explicit live-data test."
-        )
+    _settings_integrity.guard_live_settings_write(SETTINGS_PATH, HOME)
 
 
 # Settings defaults
@@ -102,7 +96,6 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # real default, unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
     "OUROBOROS_MODEL_FALLBACKS": OPENROUTER_DEFAULTS["fallback"],
     "OUROBOROS_MODEL_DEEP_SELF_REVIEW": OPENROUTER_DEFAULTS["deep_self_review"],
-    "CLAUDE_CODE_MODEL": OPENROUTER_REVIEW_DEFAULTS["advisory"],
     "OUROBOROS_MAX_WORKERS": 10, "OUROBOROS_PRESENCE_MAX_ACTIVE": 2,
     "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT": 6,
     "OUROBOROS_MAX_SUBAGENT_DEPTH": 3,
@@ -213,6 +206,10 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_ONBOARDING_COMPLETED_AT": "",
     # Pre-commit review enforcement: advisory | blocking
     "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
+    # Native tool-round reviewer episode caps (review_native_episode.py owns
+    # the getters); both fail CLOSED — typed refusal, never compaction/resume.
+    "OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS": "16",
+    "OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS": "900000",
     # Auto-grant reviewed-skill requests by default; grants stay bound to the
     # reviewed content hash and editing a skill still invalidates them.
     "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS": "true",
@@ -579,9 +576,8 @@ def resolve_effort(task_type: str) -> str:
     return raw if raw in EFFORT_SCALE else default
 
 
-# Prompt-cache TTL scale (owner decision 2026-08-08): 'default' = bare markers (provider default tier),
-# '5m'/'1h' = the two documented Anthropic ephemeral tiers. Deliberately NO 'auto' (a dead value until an
-# adaptive design exists) and NO '24h' (Anthropic would clamp it — a value that mostly lies).
+# Prompt-cache TTL scale (owner decision 2026-08-08): 'default' = bare markers (provider default tier), '5m'/'1h' =
+# the two documented Anthropic ephemeral tiers. Deliberately NO 'auto' (dead until an adaptive design exists) and NO '24h' (Anthropic would clamp it — a value that mostly lies).
 PROMPT_CACHE_TTL_SCALE: tuple[str, ...] = ("default", "5m", "1h")
 
 
@@ -779,8 +775,8 @@ def _bounded_positive_int_setting(key: str, *, default: int, hard_max: int, min_
     return max(min_value, min(parsed, hard_max))
 
 
-# ONE per-root subagent ceiling (v6.82: 50->500): clamp below, supervisor/events.py, wait_tasks; ARCHITECTURE §7.
-MAX_ACTIVE_SUBAGENTS_HARD_CAP = 500
+# Per-root active-child ceiling (v6.82: 50->500) and absolute host-visible nesting ceiling, used by supervisor gates and ARCHITECTURE §7.
+MAX_ACTIVE_SUBAGENTS_HARD_CAP, MAX_SUBAGENT_DEPTH_HARD_CAP = 500, 10
 
 
 def get_max_active_subagents_per_root() -> int:
@@ -797,7 +793,7 @@ def get_max_subagent_depth() -> int:
     return _bounded_positive_int_setting(
         "OUROBOROS_MAX_SUBAGENT_DEPTH",
         default=int(SETTINGS_DEFAULTS["OUROBOROS_MAX_SUBAGENT_DEPTH"]),
-        hard_max=10,
+        hard_max=MAX_SUBAGENT_DEPTH_HARD_CAP,
         min_value=0,
     )
 
@@ -876,12 +872,7 @@ def get_search_code_wall_sec() -> float:
     """Total wall-clock budget (seconds) for ONE search_code call — bounds both the rg
     directory walk and the batched rg loop so a scan over a very large root cannot run
     unbounded. Env/setting: ``OUROBOROS_SEARCH_CODE_WALL_SEC`` (floored at 5s)."""
-    raw = (os.environ.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "")
-           or str(SETTINGS_DEFAULTS.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "45")))
-    try:
-        return max(5.0, float(raw))
-    except (TypeError, ValueError):
-        return 45.0
+    return _clamped_number_setting("OUROBOROS_SEARCH_CODE_WALL_SEC", low=5.0)
 
 
 def get_deliverables_root() -> str:
@@ -907,10 +898,11 @@ def _settings_flag_enabled(key: str) -> bool:
     applies without a restart, while env still seeds a key the file never mentions."""
     raw = None
     try:
-        if SETTINGS_PATH.exists():
-            disk = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-            if isinstance(disk, dict) and key in disk:
-                raw = disk.get(key)
+        disk = _settings_integrity.read_settings_json_verified(SETTINGS_PATH)
+        if isinstance(disk, dict) and key in disk:
+            raw = disk.get(key)
+    except SettingsIntegrityError:
+        raise
     except Exception:
         raw = None
     if raw is None:
@@ -1059,9 +1051,8 @@ def _settings_file_value(key: str, default: str) -> str:
 # write BOTH disk and env, so the owner path is unaffected.
 _DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SAFETY_MODE")
 
-# ENDPOINT-AUTHORED, DISK-ONLY: install-time facts POST /api/onboarding/complete alone writes. The ratchets above
-# are disk-authored yet DO project once the file carries them; these never leave disk in EITHER direction — an env
-# timestamp alone closed the onboarding window on a fresh install, and an env marker was then persisted by a save.
+# ENDPOINT-AUTHORED, DISK-ONLY: install-time facts POST /api/onboarding/complete alone writes. The ratchets above are
+# disk-authored yet DO project once the file carries them; these never leave disk in EITHER direction — an env timestamp alone closed the onboarding window on a fresh install, and an env marker was then persisted by a save.
 ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_SUBAGENT_PRESET_RECEIPT", "OUROBOROS_ONBOARDING_COMPLETED_AT"})
 
 
@@ -1300,6 +1291,11 @@ def _coerce_setting_value(key: str, value):
     return str(value or "")
 
 
+def verify_settings_integrity() -> str | None:
+    """Verify the strict child pin, returning the observed digest when present."""
+    return _settings_integrity.verify_settings_integrity(SETTINGS_PATH)
+
+
 # Load / Save
 # Setting keys a release DELETED. `load_settings` keeps unrecognized keys so a rename never destroys
 # an owner customization — which would otherwise leave a removed key living in data/settings.json
@@ -1346,22 +1342,24 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
     compatibility migration is persisted only while that lock is held; the write contains
     the raw mapping plus the normalized pair, never a defaults-merged settings document."""
     loaded: dict = {}
-    if SETTINGS_PATH.exists():
-        try:
-            raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                raw = normalize_and_persist_context_mode_compat(
-                    raw,
-                    settings_path=SETTINGS_PATH,
-                    lock_held=_settings_lock_held,
-                    guard_live_write=_guard_live_settings_write,
-                )
-                loaded = {
-                    key: _coerce_setting_value(key, value) if key in SETTINGS_DEFAULTS else value
-                    for key, value in raw.items()
-                }
-        except Exception:
-            pass
+    try:
+        raw = _settings_integrity.read_settings_json_verified(SETTINGS_PATH)
+    except SettingsIntegrityError:
+        raise
+    except Exception:
+        raw = None
+    if raw is not None:
+        if isinstance(raw, dict):
+            raw = normalize_and_persist_context_mode_compat(
+                raw,
+                settings_path=SETTINGS_PATH,
+                lock_held=_settings_lock_held,
+                guard_live_write=_guard_live_settings_write,
+            )
+            loaded = {
+                key: _coerce_setting_value(key, value) if key in SETTINGS_DEFAULTS else value
+                for key, value in raw.items()
+            }
     # Rename-alias migration: fold deprecated per-subsystem retention keys into the unified
     # OUROBOROS_GC_RETENTION_DAYS, then drop the legacy keys. Prefer a CUSTOMIZED legacy value
     # so a rename never orphans it; an all-defaults file collapses to the unified default.

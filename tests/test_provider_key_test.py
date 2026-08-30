@@ -572,18 +572,41 @@ def test_typed_payment_required_maps_to_no_credits():
 
 
 def test_ephemeral_openai_client_disables_sdk_retries(monkeypatch):
+    # Hermetic against proxied runners: with any proxy httpx would honor the
+    # keepalive helper deliberately returns None (SDK default construction),
+    # which would drop the http_client kwarg this test asserts on.
+    for name in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("urllib.request.getproxies", lambda: {})
     captured = {}
+    http_clients = []
 
     class FakeOpenAI:
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
+    class FakeDefaultHttpxClient:
+        def __init__(self, **kwargs):
+            http_clients.append(kwargs)
+
     import sys
 
-    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
+    monkeypatch.setitem(
+        sys.modules,
+        "openai",
+        types.SimpleNamespace(
+            OpenAI=FakeOpenAI, DefaultHttpxClient=FakeDefaultHttpxClient,
+        ),
+    )
     LLMClient._new_remote_client({
         "api_key": "key", "base_url": "https://example.test/v1", "default_headers": {"X": "Y"},
     })
+    http_client = captured.pop("http_client")
+    assert isinstance(http_client, FakeDefaultHttpxClient)
+    assert len(http_clients) == 1 and http_clients[0].get("transport") is not None
     assert captured == {
         "api_key": "key", "base_url": "https://example.test/v1",
         "default_headers": {"X": "Y"}, "max_retries": 0,

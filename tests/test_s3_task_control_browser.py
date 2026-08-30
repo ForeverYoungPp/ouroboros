@@ -98,6 +98,56 @@ def _chat_bubble_count(page) -> int:
     return page.locator(".chat-bubble").count()
 
 
+def _menu_metrics(page, menu, trigger) -> dict:
+    return page.evaluate(
+        """
+        ([menu, trigger]) => {
+            const menuRect = menu.getBoundingClientRect();
+            const triggerRect = trigger.getBoundingClientRect();
+            const hitItems = Array.from(menu.querySelectorAll('.task-control-item')).map((item) => {
+                const rect = item.getBoundingClientRect();
+                const hit = document.elementFromPoint(
+                    rect.left + rect.width / 2,
+                    rect.top + rect.height / 2,
+                );
+                return Boolean(hit && item.contains(hit));
+            });
+            return {
+                parentIsBody: menu.parentElement === document.body,
+                position: getComputedStyle(menu).position,
+                viewport: { width: window.innerWidth, height: window.innerHeight },
+                menu: {
+                    top: menuRect.top, right: menuRect.right,
+                    bottom: menuRect.bottom, left: menuRect.left,
+                },
+                trigger: {
+                    top: triggerRect.top, right: triggerRect.right,
+                    bottom: triggerRect.bottom, left: triggerRect.left,
+                },
+                hitItems,
+            };
+        }
+        """,
+        [menu.element_handle(), trigger.element_handle()],
+    )
+
+
+def _assert_menu_geometry(metrics: dict, *, placement: str | None = None) -> None:
+    assert metrics["parentIsBody"] is True
+    assert metrics["position"] == "fixed"
+    assert all(metrics["hitItems"]), metrics
+    rect = metrics["menu"]
+    viewport = metrics["viewport"]
+    assert rect["left"] >= 7.5, metrics
+    assert rect["right"] <= viewport["width"] - 7.5, metrics
+    assert rect["top"] >= 7.5, metrics
+    assert rect["bottom"] <= viewport["height"] - 7.5, metrics
+    if placement == "below":
+        assert rect["top"] >= metrics["trigger"]["bottom"] + 3, metrics
+    elif placement == "above":
+        assert rect["bottom"] <= metrics["trigger"]["top"] - 3, metrics
+
+
 @pytest.mark.ui_browser
 def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
     """Chat surface: frozen dropdown, no-chat hurry with idempotent request_id
@@ -124,6 +174,28 @@ def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
             browser = pw.chromium.launch(headless=True)
             page = browser.new_page(viewport={"width": 1440, "height": 1000})
             try:
+                # Retain each observer callback so the singleton-generation
+                # guard can be tested against a late delivery from a closed
+                # predecessor. Native observation still drives the page.
+                page.add_init_script(
+                    """
+                    (() => {
+                        const NativeIntersectionObserver = window.IntersectionObserver;
+                        window.__s3IntersectionObservers = [];
+                        window.IntersectionObserver = class {
+                            constructor(callback, options) {
+                                this.callback = callback;
+                                this.native = new NativeIntersectionObserver(callback, options);
+                                window.__s3IntersectionObservers.push(this);
+                            }
+                            observe(target) { return this.native.observe(target); }
+                            unobserve(target) { return this.native.unobserve(target); }
+                            disconnect() { return this.native.disconnect(); }
+                            takeRecords() { return this.native.takeRecords(); }
+                        };
+                    })();
+                    """,
+                )
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 live = page.locator('.chat-live-card[data-task-id="live-root"]')
                 live.wait_for(state="attached", timeout=30_000)
@@ -136,13 +208,219 @@ def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
                 # 1) The dropdown offers EXACTLY the three frozen actions, in
                 #    order and verbatim; Escape dismisses = the run continues.
                 trigger.click()
-                menu = live.locator(".task-control-menu")
+                menu = page.locator("body > .task-control-menu")
                 menu.wait_for(state="visible", timeout=10_000)
                 assert _menu_labels(menu) == EXPECTED_ACTIONS
+                _assert_menu_geometry(_menu_metrics(page, menu, trigger), placement="below")
+                page.screenshot(
+                    path=str(data_dir.parent / "s3-chat-control-open.png"), full_page=False,
+                )
                 page.keyboard.press("Escape")
                 menu.wait_for(state="detached", timeout=10_000)
                 assert trigger.is_enabled()
+                assert trigger.get_attribute("aria-expanded") == "false"
+                assert trigger.evaluate("(node) => document.activeElement === node") is True
                 assert page.evaluate("() => window.__s3Calls.length") == 0
+
+                # Owner decision 2A survives the browser's default pointer
+                # focus without cancelling the outside element's actual click.
+                page.evaluate(
+                    """
+                    () => {
+                        const outside = document.createElement('button');
+                        outside.id = 's3-outside-focus-target';
+                        outside.textContent = 'Outside';
+                        Object.assign(outside.style, {
+                            position: 'fixed', left: '8px', top: '8px', zIndex: '200',
+                        });
+                        window.__s3OutsideClicks = 0;
+                        outside.addEventListener('click', () => { window.__s3OutsideClicks += 1; });
+                        document.body.appendChild(outside);
+                    }
+                    """,
+                )
+                trigger.click()
+                menu.wait_for(state="visible", timeout=10_000)
+                page.locator("#s3-outside-focus-target").click()
+                menu.wait_for(state="detached", timeout=10_000)
+                page.wait_for_function(
+                    "() => document.activeElement?.matches('[data-cancel-run]')",
+                    timeout=10_000,
+                )
+                assert page.evaluate("() => window.__s3OutsideClicks") == 1
+                assert page.evaluate("() => window.__s3Calls.length") == 0
+                page.locator("#s3-outside-focus-target").evaluate("node => node.remove()")
+
+                # A queued callback from observer A must not close successor B.
+                observer_count = page.evaluate("() => window.__s3IntersectionObservers.length")
+                trigger.click()
+                menu.wait_for(state="visible", timeout=10_000)
+                page.keyboard.press("Escape")
+                menu.wait_for(state="detached", timeout=10_000)
+                trigger.click()
+                menu.wait_for(state="visible", timeout=10_000)
+                page.evaluate(
+                    """
+                    ([index, trigger]) => {
+                        window.__s3IntersectionObservers[index].callback([{
+                            target: trigger, isIntersecting: false,
+                        }]);
+                    }
+                    """,
+                    [observer_count, trigger.element_handle()],
+                )
+                page.wait_for_timeout(50)
+                assert menu.count() == 1
+                assert trigger.get_attribute("aria-expanded") == "true"
+                page.keyboard.press("Escape")
+                menu.wait_for(state="detached", timeout=10_000)
+
+                # The stable Chat DOM owns the deterministic viewport-flip proof.
+                page.evaluate(
+                    """
+                    () => {
+                        const live = document.querySelector(
+                            '.chat-live-card[data-task-id="live-root"]',
+                        );
+                        window.__s3OriginalLiveStyle = live.getAttribute('style');
+                        Object.assign(live.style, {
+                            position: 'fixed', left: '16px', right: 'auto',
+                            bottom: '8px', top: 'auto', margin: '0', zIndex: '6',
+                        });
+                    }
+                    """,
+                )
+                trigger.click()
+                menu.wait_for(state="visible", timeout=10_000)
+                _assert_menu_geometry(_menu_metrics(page, menu, trigger), placement="above")
+                page.screenshot(
+                    path=str(data_dir.parent / "s3-chat-control-flipped.png"), full_page=False,
+                )
+                page.keyboard.press("Escape")
+                menu.wait_for(state="detached", timeout=10_000)
+                page.evaluate(
+                    """
+                    () => {
+                        const live = document.querySelector(
+                            '.chat-live-card[data-task-id="live-root"]',
+                        );
+                        if (window.__s3OriginalLiveStyle === null) live.removeAttribute('style');
+                        else live.setAttribute('style', window.__s3OriginalLiveStyle);
+                    }
+                    """,
+                )
+
+                # Owner decision 1D: any nested scroll or resize dismisses
+                # without issuing a task-control action.
+                trigger.click()
+                menu.wait_for(state="visible", timeout=10_000)
+                page.locator("#chat-messages").dispatch_event("scroll")
+                menu.wait_for(state="detached", timeout=10_000)
+                assert trigger.get_attribute("aria-expanded") == "false"
+                assert trigger.evaluate("(node) => document.activeElement === node") is True
+                assert page.evaluate("() => window.__s3Calls.length") == 0
+
+                trigger.click()
+                menu.wait_for(state="visible", timeout=10_000)
+                page.set_viewport_size({"width": 1360, "height": 920})
+                menu.wait_for(state="detached", timeout=10_000)
+                assert trigger.get_attribute("aria-expanded") == "false"
+                assert trigger.evaluate("(node) => document.activeElement === node") is True
+                assert page.evaluate("() => window.__s3Calls.length") == 0
+
+                # Narrow viewports must shrink the menu instead of allowing the
+                # historical 220px minimum to overflow the page.
+                page.set_viewport_size({"width": 320, "height": 700})
+                trigger.click()
+                menu.wait_for(state="visible", timeout=10_000)
+                _assert_menu_geometry(_menu_metrics(page, menu, trigger))
+                page.screenshot(
+                    path=str(data_dir.parent / "s3-chat-control-narrow.png"), full_page=False,
+                )
+                page.keyboard.press("Escape")
+                menu.wait_for(state="detached", timeout=10_000)
+
+                # A genuinely short viewport height-clamps the portal. Its own
+                # scroll must keep it open so every action remains reachable;
+                # only scroll that can stale anchor geometry invokes 1D close.
+                page.set_viewport_size({"width": 320, "height": 150})
+                page.evaluate(
+                    """
+                    () => {
+                        const live = document.querySelector(
+                            '.chat-live-card[data-task-id="live-root"]',
+                        );
+                        window.__s3ShortLiveStyle = live.getAttribute('style');
+                        Object.assign(live.style, {
+                            position: 'fixed', left: '8px', right: 'auto',
+                            top: '0px', bottom: 'auto', width: '304px',
+                            margin: '0', zIndex: '6',
+                        });
+                        const trigger = live.querySelector('[data-cancel-run]');
+                        live.style.top = `${70 - trigger.getBoundingClientRect().top}px`;
+                    }
+                    """,
+                )
+                trigger.click()
+                menu.wait_for(state="visible", timeout=10_000)
+                short_metrics = menu.evaluate(
+                    """
+                    node => ({
+                        clientHeight: node.clientHeight,
+                        scrollHeight: node.scrollHeight,
+                        top: node.getBoundingClientRect().top,
+                        bottom: node.getBoundingClientRect().bottom,
+                    })
+                    """,
+                )
+                assert short_metrics["scrollHeight"] > short_metrics["clientHeight"], short_metrics
+                assert short_metrics["top"] >= 7.5, short_metrics
+                assert short_metrics["bottom"] <= 142.5, short_metrics
+                items = menu.locator(".task-control-item")
+                for index in range(items.count()):
+                    menu.evaluate(
+                        """
+                        (node, itemIndex) => {
+                            node.scrollTop = node.querySelectorAll('.task-control-item')[itemIndex]
+                                .offsetTop;
+                        }
+                        """,
+                        index,
+                    )
+                    page.wait_for_timeout(50)
+                    assert menu.count() == 1
+                    assert trigger.get_attribute("aria-expanded") == "true"
+                    assert items.nth(index).evaluate(
+                        """
+                        item => {
+                            const rect = item.getBoundingClientRect();
+                            const hit = document.elementFromPoint(
+                                rect.left + rect.width / 2,
+                                rect.top + rect.height / 2,
+                            );
+                            return Boolean(hit && item.contains(hit));
+                        }
+                        """,
+                    ) is True
+                assert menu.evaluate("node => node.scrollTop") > 0
+                page.screenshot(
+                    path=str(data_dir.parent / "s3-chat-control-short-scroll.png"),
+                    full_page=False,
+                )
+                page.keyboard.press("Escape")
+                menu.wait_for(state="detached", timeout=10_000)
+                page.evaluate(
+                    """
+                    () => {
+                        const live = document.querySelector(
+                            '.chat-live-card[data-task-id="live-root"]',
+                        );
+                        if (window.__s3ShortLiveStyle === null) live.removeAttribute('style');
+                        else live.setAttribute('style', window.__s3ShortLiveStyle);
+                    }
+                    """,
+                )
+                page.set_viewport_size({"width": 1440, "height": 1000})
 
                 # 2) "Hurry up": typed control + LOCAL toast; the chat DOM
                 #    gains ZERO bubbles (HQ1's no-chat contract, live DOM).
@@ -272,14 +550,34 @@ def test_s3_activity_tab_dropdown_parity_and_no_chat_hurry(direct_server_with_da
 
                 # Parity: the same shared menu with the exact frozen actions.
                 row_btn.click()
-                menu = page.locator("#dashboard-panel-activity .task-control-menu")
+                menu = page.locator("body > .task-control-menu")
                 menu.wait_for(state="visible", timeout=10_000)
                 assert _menu_labels(menu) == EXPECTED_ACTIONS
+                assert menu.evaluate("(node) => node.parentElement === document.body") is True
+                assert menu.evaluate("(node) => getComputedStyle(node).position") == "fixed"
+                page.screenshot(
+                    path=str(data_dir.parent / "s3-activity-control-open.png"), full_page=True,
+                )
+
+                # Activity refresh replaces its subtree before awaiting network
+                # reads. The trigger observer must dispose the body portal.
+                page.evaluate(
+                    """
+                    () => window.dispatchEvent(new CustomEvent(
+                        'ouro:dashboard-subtab-shown', { detail: { tab: 'activity' } },
+                    ))
+                    """,
+                )
+                menu.wait_for(state="detached", timeout=10_000)
+                assert page.evaluate("() => window.__s3Calls.length") == 0
+                row_btn.wait_for(state="visible", timeout=30_000)
 
                 # "Hurry up" from Activity: local toast only, no chat bubble.
                 # Baseline captured HERE (post-navigation) so async startup
                 # bubbles (awaken banner, history replay) are already settled.
                 bubbles_before = _chat_bubble_count(page)
+                row_btn.click()
+                menu.wait_for(state="visible", timeout=10_000)
                 menu.locator('[data-task-control="hurry"]').click()
                 page.locator(".toast", has_text="Hurry up: accepted").wait_for(
                     state="visible", timeout=10_000,

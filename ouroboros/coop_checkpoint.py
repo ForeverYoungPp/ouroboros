@@ -30,11 +30,20 @@ def _run_git(cmd: Sequence[str], cwd: pathlib.Path) -> "subprocess.CompletedProc
 
 
 def _task_tree_coop_roots(drive_root: pathlib.Path, root_task_id: str) -> List[pathlib.Path]:
-    """Unique host-minted genesis/coop tree roots this task tree's children wrote to —
-    read from the children's durable results (write_root/workspace_root under the
-    subagent-projects root). NEVER an owner-attached folder: only paths inside
-    ``get_subagent_projects_root()`` qualify (the checkpoint-commit boundary)."""
+    """Unique host-minted genesis/coop tree roots this task tree's children were
+    GRANTED WRITE to - read from the children's durable results (the constraint's
+    ``write_root`` under the subagent-projects root). NEVER an owner-attached
+    folder: only paths inside ``get_subagent_projects_root()`` qualify (the
+    checkpoint-commit boundary).
+
+    A child qualifies a tree only through mutative authority: a readonly child
+    carries a ``workspace_root`` too, and qualifying on it made a read-only
+    research task auto-commit a pre-existing dirty tree it never wrote to
+    (observed live 2026-08-30) - misattributed provenance over the owner's own
+    uncommitted work. Bare ``workspace_root`` therefore never qualifies, and a
+    readonly-mode child never qualifies regardless of fields."""
     from ouroboros.config import get_subagent_projects_root
+    from ouroboros.headless import task_is_readonly_subagent
     from ouroboros.task_status import find_child_tasks
     from ouroboros.tool_access import path_is_relative_to
 
@@ -47,19 +56,20 @@ def _task_tree_coop_roots(drive_root: pathlib.Path, root_task_id: str) -> List[p
     except Exception:
         return out
     for child in children:
+        if task_is_readonly_subagent(child):
+            continue
         constraint = child.get("task_constraint") if isinstance(child.get("task_constraint"), dict) else {}
-        for value in (constraint.get("write_root"), child.get("workspace_root")):
-            text = str(value or "").strip()
-            if not text:
-                continue
-            try:
-                candidate = pathlib.Path(text).expanduser().resolve(strict=False)
-            except (OSError, ValueError):
-                continue
-            if not path_is_relative_to(candidate, projects_root):
-                continue
-            if candidate not in out and (candidate / ".git").exists():
-                out.append(candidate)
+        text = str(constraint.get("write_root") or "").strip()
+        if not text:
+            continue
+        try:
+            candidate = pathlib.Path(text).expanduser().resolve(strict=False)
+        except (OSError, ValueError):
+            continue
+        if not path_is_relative_to(candidate, projects_root):
+            continue
+        if candidate not in out and (candidate / ".git").exists():
+            out.append(candidate)
     return out
 
 

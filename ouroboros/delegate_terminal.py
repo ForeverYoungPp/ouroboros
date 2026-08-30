@@ -36,6 +36,12 @@ def terminal_reconcile_task(
         )
     except Exception:
         log.warning("Terminal delegated custody reconciliation failed for %s", mine, exc_info=True)
+    _audit_task_custody(drive_root, mine, result)
+    return result
+
+
+def _audit_task_custody(drive_root: Any, mine: str, result: Dict[str, Any]) -> None:
+    """Read-only custody audit: fills unreconciled/audit fields and emits evidence."""
     audit_failure = ""
     if custody.custody_log_unreadable(drive_root):
         audit_failure = "custody_log_unreadable"
@@ -65,11 +71,27 @@ def terminal_reconcile_task(
         )
     except Exception:
         patch_ids, audit_failure = [], "undisposed_patch_audit_failed"
+    deferred_retirements: list = []
+    try:
+        if not audit_failure:
+            deferred_retirements = [
+                row.run_id
+                for row in custody.owned_project_registrations(drive_root)
+                if row.task_id == mine and row.settled
+            ]
+    except Exception:
+        # Fail-closed like the audits above: an unreadable registration state
+        # must not read as "no deferred retirements".
+        audit_failure = audit_failure or "registration_audit_failed"
     if not audit_failure:
         result.update({
             "open_run_ids": open_ids,
             "pending_invocation_ids": invocation_ids,
             "undisposed_patch_run_ids": patch_ids,
+            # DISCLOSED, never unreconciled: a settled run's project registration
+            # awaiting retirement is cleanup debt with its own retry lane - it
+            # must not convert the task's outcome (the old coupling did).
+            "deferred_project_retirements": deferred_retirements,
             "unreconciled": [
                 *open_ids,
                 *(f"invocation:{item}" for item in invocation_ids),
@@ -96,7 +118,43 @@ def terminal_reconcile_task(
             "task_id": mine, "trigger": result["trigger"],
             "outcome_count": len(result["outcomes"]),
         })
-    return result
+
+
+def refresh_terminal_reconciliation(drive_root: Any, task_id: str) -> bool:
+    """Audit-only refresh of a TERMINAL task's stored custody disclosure.
+
+    The periodic sweep can settle a run AFTER its owning task already wrote its
+    terminal result with a non-empty ``delegated_runs_unreconciled`` — the
+    custody ledger then knows the truth while the stored projection keeps
+    lying (nanny-leaf S1). This re-runs ONLY the read-side audit (never
+    ``reconcile_task_runs`` — a refresh must not cancel anything) and rewrites
+    the disclosure through the same recorder, whose guard permits clearing a
+    stale non-empty list. The primary ``reason_code`` is deliberately left
+    untouched (owner Q5=A), and already-rendered chat frames are out of scope —
+    the fixed surfaces are the stored result, task details, and the API view
+    (including retry-lineage projections, which read this row live).
+    """
+    mine = str(task_id or "")
+    if not mine:
+        return False
+    try:
+        from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+
+        existing = load_task_result(drive_root, mine) or {}
+        if not existing.get("delegated_runs_unreconciled"):
+            return False
+        if str(existing.get("status") or "") not in _TRULY_TERMINAL_STATUSES:
+            return False
+    except Exception:
+        log.debug("Sweep refresh skipped: task result unreadable for %s", mine, exc_info=True)
+        return False
+    result: Dict[str, Any] = {
+        "task_id": mine, "trigger": "sweep_refresh",
+        "outcomes": [], "unreconciled": [], "audit_status": "ok",
+    }
+    _audit_task_custody(drive_root, mine, result)
+    record_terminal_reconciliation(drive_root, mine, result)
+    return True
 
 
 def record_terminal_reconciliation(
@@ -109,7 +167,9 @@ def record_terminal_reconciliation(
 
         existing = load_task_result(drive_root, str(task_id or "")) or {}
         unreconciled = list(result.get("unreconciled") or [])
-        if not unreconciled and not existing.get("delegated_runs_unreconciled"):
+        deferred = list(result.get("deferred_project_retirements") or [])
+        if (not unreconciled and not deferred
+                and not existing.get("delegated_runs_unreconciled")):
             return
         write_task_result(
             drive_root,
@@ -122,4 +182,8 @@ def record_terminal_reconciliation(
         log.warning("Failed to persist terminal custody audit for %s", task_id, exc_info=True)
 
 
-__all__ = ["record_terminal_reconciliation", "terminal_reconcile_task"]
+__all__ = [
+    "record_terminal_reconciliation",
+    "refresh_terminal_reconciliation",
+    "terminal_reconcile_task",
+]

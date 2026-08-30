@@ -1,14 +1,11 @@
 """Durable physical-model-attempt accounting.
 
-The append-only JSONL ledger is the monetary authority.  Existing
-``llm_usage`` events and ``state.json`` remain compatibility projections and
-carry ledger attempt ids, so they can never become a second charge source.
-
-The implementation is deliberately small: no hash chain, fanout reservation,
-epoch/reconcile platform, or per-attempt snapshot database.  A projection is
-replayed from validated records under the same short cross-process lock used
-for budget check + append + fsync; network I/O always happens outside that lock.
-"""
+The append-only JSONL ledger is the monetary authority; ``llm_usage`` events and
+``state.json`` remain compatibility projections carrying ledger attempt ids, so
+they can never become a second charge source. Deliberately small: no hash chain,
+fanout reservation, epoch/reconcile platform, or per-attempt snapshot database —
+a projection is replayed from validated records under the same short
+cross-process lock as budget check + append + fsync; network I/O stays outside."""
 
 from __future__ import annotations
 
@@ -23,7 +20,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Callable, Dict, Iterator, Literal, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, Literal, Optional, Sequence, Tuple, get_args
 
 from ouroboros.pricing import estimate_cost_optional
 from ouroboros._usage_response import _reported_token_count, usage_from_response
@@ -65,6 +62,7 @@ __all__ = (
     "AttemptRequest", "AttemptReservation", "BudgetExceeded", "PhysicalAttemptCapture",
     "PhysicalAttemptContext", "PhysicalAttemptLimitExceeded", "PhysicalAttemptPreconditionFailed",
     "PhysicalAttemptPreparationFailed",
+    "PhysicalAttemptState", "PHYSICAL_ATTEMPT_STATES", "POSITIVE_PHYSICAL_ATTEMPT_STATES",
     "UsageAccountingError", "UsageLedgerCorrupt", "UsageScope", "capture_attempt_ids",
     "bind_physical_attempt_context", "current_physical_attempt_context",
     "current_physical_attempt_predicate", "current_usage_scope",
@@ -234,8 +232,8 @@ class AttemptRequest:
     candidate_context_size_bytes: Optional[int] = None
     candidate_measurement_kind: Literal["canonical_json_v1", "opaque"] = "opaque"
     physical_context: Optional[PhysicalAttemptContext] = None
-
-
+    # Route-locality fact (additive): base_url host is localhost/127.0.0.1/::1 (loopback OpenAI-compatible installs — Ollama / LM Studio / vLLM).
+    route_is_loopback: bool = False
 @dataclass(frozen=True)
 class AttemptReservation:
     attempt_id: str
@@ -243,14 +241,15 @@ class AttemptReservation:
     model: str
     provider: str
     reservation_upper_bound_usd: Optional[float]
-
-
+PhysicalAttemptState = Literal["reserved", "released", "dispatched", "settled", "unresolved"]
+PHYSICAL_ATTEMPT_STATES = frozenset(get_args(PhysicalAttemptState))
+POSITIVE_PHYSICAL_ATTEMPT_STATES = frozenset({"settled", "dispatched", "unresolved"})
 @dataclass(frozen=True)
 class PhysicalAttemptCapture:
     attempt_id: str
     model: str
     provider: str
-    state: Literal["reserved", "released", "dispatched", "settled", "unresolved"]
+    state: PhysicalAttemptState
     candidate_measurement_kind: Literal["canonical_json_v1", "opaque"]
     max_completion_tokens: int = 0
     candidate_raw_sha256: Optional[str] = None
@@ -263,6 +262,7 @@ class PhysicalAttemptCapture:
     provider_code: str = ""
     provider_error_type: str = ""
     provider_error: str = ""
+    route_is_loopback: bool = False  # see AttemptRequest.route_is_loopback
 
 
 @contextlib.contextmanager
@@ -481,10 +481,9 @@ def usage_breakdown(
             "by_category": by_category,
             "by_task": by_task,
             "by_root": by_root,
-            # Execution-axis filter (v6.91): the delegated (subscription-harness) rows
-            # only — a VIEW over the same rows for "where did the money go" readers,
-            # never a third monetary sum or authority. Disclosed-free sessions settle
-            # at $0 here; undisclosed spend stays in `unknown`.
+            # Execution-axis filter (v6.91): delegated (subscription-harness) rows only — a
+            # VIEW for "where did the money go" readers, never a third monetary sum or
+            # authority; disclosed-free settles $0, undisclosed stays `unknown`.
             "delegated": _with_integrity(
                 _breakdown_bucket([row for row in rows if str(row.get("kind") or "") == "subscription_session"]),
                 integrity_degraded,
@@ -539,10 +538,9 @@ def _reservation_cost(request: AttemptRequest) -> Optional[float]:
 
         prompt_cache_ttl = str(request.prompt_cache_ttl or "").strip().lower()
         if prompt_cache_ttl not in PROMPT_CACHE_TTL_SCALE:
-            # An inspectable marker-free candidate writes no cache at all. Keep
-            # the historical conservative base-tier reservation without
-            # misreporting a TTL on the eventual physical settlement. Opaque
-            # construction sites still fall back to the owner setting.
+            # An inspectable marker-free candidate writes no cache at all. Keep the
+            # historical conservative base-tier reservation without misreporting a TTL on
+            # the physical settlement; opaque sites still fall back to the owner setting.
             prompt_cache_ttl = (
                 "default"
                 if request.candidate_measurement_kind == "canonical_json_v1"
@@ -685,8 +683,7 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
             root_task_id=scope.root_task_id,
         )
     ensure_legacy_imported(root)
-    # IMPORTANT: live catalog I/O belongs before ``with _locked(root)`` below.
-    # The lock protects only the atomic budget read/check/append transaction.
+    # IMPORTANT: live catalog I/O belongs before ``with _locked(root)`` below — the lock protects only the atomic budget read/check/append transaction.
     bound = _reservation_cost(request)
     pricing_known = bound is not None
     attempt_id = uuid.uuid4().hex
@@ -824,9 +821,8 @@ def _append_single_settled_row(
         existing = _final_rows(records).get(attempt_id)
         if existing is not None:
             def identity_value(source: Dict[str, Any], key: str) -> Any:
-                # Rows written before physical_attempt_v1 omitted these optional
-                # keys. Missing and explicit empty are the same legacy identity;
-                # a non-empty wave/slot still conflicts with either one.
+                # Rows written before physical_attempt_v1 omitted these optional keys:
+                # missing == explicit empty; a non-empty wave/slot conflicts with either.
                 return str(source.get(key) or "") if key in REVIEW_ATTRIBUTION_KEYS else source.get(key)
 
             if any(identity_value(existing, key) != identity_value(row, key) for key in comparable):
@@ -1139,7 +1135,11 @@ def _terminalize_failed_attempt(reservation: AttemptReservation, exc: BaseExcept
         )
         return "settled"
     else:
-        mark_unresolved(reservation, f"{type(exc).__name__}: {exc}")
+        from ouroboros.transport_custody import attempt_custody_event_fields
+        cause = attempt_custody_event_fields(exc).get("transport_cause_type")
+        suffix = f" [cause: {cause}]" if cause else ""
+        # Suffix leads: a verbose provider body must not truncate it away (mark_unresolved keeps 500 chars).
+        mark_unresolved(reservation, f"{type(exc).__name__}{suffix}: {exc}")
         return "unresolved"
 
 
@@ -1199,6 +1199,7 @@ def _record_attempt_capture(
         provider_code=code,
         provider_error_type=error_type,
         provider_error=error,
+        route_is_loopback=bool(request.route_is_loopback),
     )
     _LAST_PHYSICAL_ATTEMPT.set(capture)
     if exc is not None:
@@ -1384,8 +1385,7 @@ def _legacy_snapshot(root: pathlib.Path) -> Tuple[list[Dict[str, Any]], Dict[str
         except OSError as exc:
             raise UsageAccountingError(f"cannot snapshot legacy usage source {path}: {exc}") from exc
     hashes = {name: hashlib.sha256(snapshots[name]).hexdigest() if name in snapshots else "" for name in sources}
-    # Settings are owner-secret state: prove non-mutation by hash, but never copy
-    # their contents into the usage archive.
+    # Settings are owner-secret state: prove non-mutation by hash, never copy contents.
     try:
         hashes["settings.json"] = hashlib.sha256(settings_path.read_bytes()).hexdigest()
     except FileNotFoundError:

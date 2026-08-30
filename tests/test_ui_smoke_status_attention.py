@@ -356,11 +356,26 @@ def test_task_status_stays_factual_in_main_and_project_chat(
             page = browser.new_page(viewport={"width": width, "height": height})
             try:
                 page.add_init_script(f"({capture_socket})()")
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                # The initial rebuildAll replay wipes and rebuilds the feed
+                # from durable history (chat.js syncHistory). Frames emitted
+                # on the test socket exist nowhere durable, so one emitted
+                # before that replay applies is destroyed with the wipe. Gate
+                # the flow on the hydration fetch itself (body finished), then
+                # settle one page task: the apply is synchronous after
+                # resp.json(), so the next macrotask observes it.
+                with page.expect_response(
+                    lambda response: "/api/chat/history" in response.url,
+                    timeout=30_000,
+                ) as history_hydration:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                history_hydration.value.finished()
                 page.wait_for_function(
                     "() => window.__statusAttentionTestSockets"
                     "?.some(socket => socket.readyState === WebSocket.OPEN)",
                     timeout=30_000,
+                )
+                page.evaluate(
+                    "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
                 )
 
                 run_thread_flow(
@@ -379,15 +394,27 @@ def test_task_status_stays_factual_in_main_and_project_chat(
                     page.locator("#page-chat [data-mobile-nav-toggle]").click()
                     project_row.wait_for(state="visible", timeout=5_000)
                 project_row.scroll_into_view_if_needed()
+                # Same hydration gate for the Project instance: its chat
+                # column mints on open and replays its own durable history;
+                # emits must not race that rebuild (see the Main gate above).
                 with page.expect_response(
-                    lambda response: response.url.endswith("/api/ui/preferences")
-                    and response.request.method == "POST",
+                    lambda response: f"/api/chat/history?chat_id={project_chat_id}"
+                    in response.url,
                     timeout=30_000,
-                ):
-                    project_row.click()
+                ) as project_hydration:
+                    with page.expect_response(
+                        lambda response: response.url.endswith("/api/ui/preferences")
+                        and response.request.method == "POST",
+                        timeout=30_000,
+                    ):
+                        project_row.click()
+                project_hydration.value.finished()
                 page.wait_for_selector("#project-panel:not([hidden])", timeout=30_000)
                 project_scope = page.locator("#project-panel .chat-instance-panel")
                 project_scope.wait_for(state="visible", timeout=30_000)
+                page.evaluate(
+                    "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+                )
                 run_thread_flow(
                     page,
                     project_scope,

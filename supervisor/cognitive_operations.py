@@ -111,6 +111,12 @@ def _handle_review_late_result(evt: Dict[str, Any], ctx: Any) -> None:
         key: value for key, value in evt.items() if key != "ts"
     }}
     try:
+        from supervisor.log_addressing import address_task_event
+
+        address_task_event(getattr(ctx, "RUNNING", None), ctx.DRIVE_ROOT, payload)
+    except Exception:
+        log.debug("late review result addressing failed", exc_info=True)
+    try:
         append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", payload)
     except Exception:
         log.debug("late review result persistence failed", exc_info=True)

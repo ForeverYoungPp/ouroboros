@@ -293,8 +293,11 @@ def test_token_density_is_measured_throttled_and_bounded(tmp_path, monkeypatch):
     assert abs(get_token_density(tmp_path, "m/one") - 1.5) < 1e-6
     density, source = resolve_token_density(tmp_path, "m/one")
     assert source == "measured"
-    # Review sizing never becomes looser than its existing cold floor.
-    assert density == COLD_START_TOKEN_DENSITY
+    # Successor pin (issue #284): a fresh exact-model witness is authoritative
+    # and MAY lower the effective review density below the cold floor; the
+    # floor keeps governing only stale/absent/cross-model evidence.
+    assert density == 1.5 * MEASURED_DENSITY_SAFETY_FACTOR
+    assert density < COLD_START_TOKEN_DENSITY
 
     # Above the floor, the measured value (with the safety factor) is what applies.
     _DENSITY_MEMO.clear()
@@ -472,7 +475,7 @@ def test_density_retention_preserves_fresh_high_witness_without_refreshing_its_t
 
     from ouroboros.capability_evidence import (
         _DENSITY_MEMO,
-        COLD_START_TOKEN_DENSITY,
+        MEASURED_DENSITY_SAFETY_FACTOR,
         _TOKEN_DENSITY_MAX_PAIRS,
         _TOKEN_DENSITY_TTL_SEC,
         record_token_density,
@@ -511,8 +514,11 @@ def test_density_retention_preserves_fresh_high_witness_without_refreshing_its_t
     assert resolve_main_token_density(tmp_path, "route-high", "m/one") == (
         1.5, "fresh_model_usage",
     )
+    # Successor pin (issue #284): the densest FRESH exact-model witness (1.5,
+    # with the safety factor) undercuts the cold floor and is honored; the
+    # stale 2.5 witness no longer counts toward review sizing.
     assert resolve_review_token_density(tmp_path, "m/one") == (
-        COLD_START_TOKEN_DENSITY, "measured",
+        1.5 * MEASURED_DENSITY_SAFETY_FACTOR, "measured",
     )
     _DENSITY_MEMO.clear()
     record_token_density(

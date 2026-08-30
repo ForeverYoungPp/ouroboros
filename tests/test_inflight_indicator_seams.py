@@ -47,12 +47,22 @@ class _RegistryProbeAgent:
 
 
 def _patch_workers(monkeypatch, tmp_path):
+    import queue
+
     import supervisor.message_bus as message_bus
     import supervisor.workers as workers
 
     drive = tmp_path / "drive"
     (drive / "logs").mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(workers, "DRIVE_ROOT", drive)
+    # These tests pin the registry/bridge seams, not the process-lifetime event
+    # bus. Use a local queue so the turn never touches get_event_q(): a prior
+    # TestClient lifespan in the same xdist worker leaves _EVENT_Q_SHUTDOWN
+    # latched (server shutdown calls shutdown_event_q()), and the real
+    # get_event_q() then raises before agent.handle_task ever runs (seen on the
+    # Windows CI shard; same isolation precedent as
+    # tests/test_promote_event_transport.py::_isolate_event_bus_shutdown_latch).
+    monkeypatch.setattr(workers, "get_event_q", lambda: queue.Queue())
     import ouroboros.project_naming as project_naming
 
     monkeypatch.setattr(project_naming, "spawn_proactive_namer", lambda *a, **k: None)
@@ -158,6 +168,7 @@ def test_run_chat_task_unregisters_and_keys_error_final_when_agent_raises(tmp_pa
     args, kwargs = sent[0]
     assert args[0] == 5
     assert kwargs.get("task_id") == str(agent.task["id"])
+    assert kwargs.get("progress_meta") == {"task_terminal_status": "failed"}
     # The failed turn re-announces the activity<->client_message_id link right
     # before the keyed final, so the client retires the `Sending...` submission
     # even when the start announce never reached it.

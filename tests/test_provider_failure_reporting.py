@@ -1,10 +1,16 @@
+import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-from ouroboros.loop import _provider_failure_hint
-from ouroboros.loop_llm_call import call_llm_with_retry, classify_llm_exception
+from ouroboros.loop_transport import provider_failure_hint as _provider_failure_hint
+from ouroboros.loop_llm_call import (
+    RETRY_WALL_EXHAUSTED_KEY,
+    _normalize_usage_cost,
+    call_llm_with_retry,
+    classify_llm_exception,
+)
 from ouroboros.usage_accounting import PhysicalAttemptContext, UsageAccountingError
 
 
@@ -910,3 +916,311 @@ def test_main_llm_call_state_reads_the_loop_attempt_carrier(tmp_path):
     )
     state_events = _main_llm_state_events(events)
     assert [event["task_attempt"] for event in state_events] == [7, 7]
+# ---------------------------------------------------------------------------
+# OB-10 — provider-reported cost validation (`_normalize_usage_cost`)
+# ---------------------------------------------------------------------------
+
+
+class _ReportedCostLLM:
+    """One successful round carrying whatever ``usage["cost"]`` the test supplies.
+
+    ``sent_usage`` retains the exact per-call dict the loop normalizes IN PLACE, so
+    a test can assert what was recorded for that round rather than only what the
+    accumulator folded afterwards.
+    """
+
+    def __init__(self, cost=None, *, include_cost: bool = True, cost_final=None):
+        self.cost = cost
+        self.include_cost = include_cost
+        self.cost_final = cost_final
+        self.sent_usage = None
+
+    def chat(self, **kwargs):
+        usage = {
+            "provider": "openrouter",
+            "resolved_model": "openai/gpt-5.5",
+            "prompt_tokens": 1000,
+            "completion_tokens": 100,
+        }
+        if self.include_cost:
+            usage["cost"] = self.cost
+        if self.cost_final is not None:
+            usage["cost_final"] = self.cost_final
+        self.sent_usage = usage
+        return {"content": "ok"}, usage
+
+
+def _run_cost_round(llm, tmp_path, accumulated):
+    return call_llm_with_retry(
+        llm, [{"role": "user", "content": "hi"}], "openai/gpt-5.5", None,
+        "medium", 1, tmp_path, "task-cost", 1, None, accumulated, "task", False,
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_cost",
+    [True, float("nan"), float("inf"), float("-inf"), -5, "abc", object()],
+    ids=["bool", "nan", "inf", "neg_inf", "negative", "unparseable", "foreign_type"],
+)
+def test_invalid_provider_cost_is_unknown_and_never_estimated(tmp_path, caplog, bad_cost):
+    """A cost the provider DID send but that cannot be trusted is honestly unknown.
+
+    Never a fabricated tariff (``float(True)`` is a plausible-looking ``1.0``),
+    never ``0.0``, never a raise that kills the whole round, and never a catalog
+    estimate standing in for a figure the provider actually reported.
+    ``estimate_cost_optional`` is patched to a NONZERO value precisely so that a
+    silent fall-through to estimation could not hide behind a ``None`` estimate.
+    """
+    accumulated = {}
+    llm = _ReportedCostLLM(bad_cost)
+    with caplog.at_level(logging.WARNING, logger="ouroboros.loop_llm_call"), patch(
+        "ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99,
+    ) as estimate:
+        msg, cost = _run_cost_round(llm, tmp_path, accumulated)
+
+    assert msg == {"content": "ok"}            # the round SURVIVES an invalid cost
+    assert cost is None                        # unknown — neither 0.0 nor 0.99
+    assert llm.sent_usage["cost"] is None      # recorded honestly for the round
+    assert llm.sent_usage["cost_final"] is False   # unknown cost is never a closed book
+    estimate.assert_not_called()               # estimation is SKIPPED, not consulted
+    assert accumulated.get("cost") is None     # nothing folded into the total
+    assert accumulated["cost_final"] is False  # the total is openly non-final
+    assert "cost_estimated" not in accumulated
+    warnings = [r for r in caplog.records if "invalid cost" in r.getMessage()]
+    assert len(warnings) == 1
+    assert f"type={type(bad_cost).__name__}" in warnings[0].getMessage()
+
+
+def test_invalid_cost_clears_a_stale_cost_final_from_the_wire(tmp_path):
+    """A provider that sends an invalid amount AND `cost_final: true` would leave an
+    internally contradictory record: no trusted cost, yet the book declared closed.
+    The pair must move together."""
+    accumulated = {}
+    llm = _ReportedCostLLM(True, cost_final=True)
+    with patch("ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99):
+        _msg, cost = _run_cost_round(llm, tmp_path, accumulated)
+
+    assert cost is None
+    assert llm.sent_usage["cost"] is None
+    assert llm.sent_usage["cost_final"] is False
+    assert accumulated["cost_final"] is False
+
+
+def test_normalize_usage_cost_invalid_does_not_claim_an_estimate():
+    """The tuple's 4th element is ``cost_estimated``: an UNKNOWN cost is not an
+    ESTIMATED one, so the invalid path must leave that flag untouched."""
+    usage = {"cost": "abc", "resolved_model": "openai/gpt-5.5", "provider": "openrouter"}
+    with patch("ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99):
+        cost, display_model, provider, cost_estimated = _normalize_usage_cost(
+            usage, model="openai/gpt-5.5", use_local=False,
+        )
+    assert cost is None
+    assert cost_estimated is False
+    assert usage["cost"] is None
+    assert display_model == "openai/gpt-5.5"
+    assert provider == "openrouter"
+
+
+def test_reported_zero_cost_is_a_legitimate_provider_zero(tmp_path):
+    """A reported ``0.0`` (free tier, fully cached round) is DATA, not absence: it
+    is neither re-estimated nor rejected as invalid."""
+    accumulated = {}
+    llm = _ReportedCostLLM(0.0)
+    with patch(
+        "ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99,
+    ) as estimate:
+        _msg, cost = _run_cost_round(llm, tmp_path, accumulated)
+
+    assert cost == 0.0
+    assert llm.sent_usage["cost"] == 0.0
+    estimate.assert_not_called()
+    assert accumulated["cost"] == 0.0
+
+
+def test_valid_provider_cost_passes_through(tmp_path):
+    """An ordinary reported amount reaches the accumulator unchanged."""
+    accumulated = {}
+    llm = _ReportedCostLLM(1.23)
+    with patch(
+        "ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99,
+    ) as estimate:
+        _msg, cost = _run_cost_round(llm, tmp_path, accumulated)
+
+    assert cost == 1.23
+    assert llm.sent_usage["cost"] == 1.23
+    estimate.assert_not_called()
+    assert accumulated["cost"] == 1.23
+
+
+@pytest.mark.parametrize("include_cost", [False, True], ids=["absent", "explicit_none"])
+def test_missing_provider_cost_still_uses_the_catalog_estimate(tmp_path, include_cost):
+    """MISSING is not INVALID: with no provider cost the catalog-estimate path is
+    unchanged — this is the case validation must NOT capture."""
+    accumulated = {}
+    llm = _ReportedCostLLM(None, include_cost=include_cost)
+    with patch(
+        "ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99,
+    ) as estimate:
+        _msg, cost = _run_cost_round(llm, tmp_path, accumulated)
+
+    assert cost == 0.99
+    estimate.assert_called_once()
+    assert accumulated["cost"] == 0.99
+
+
+# ---------------------------------------------------------------------------
+# OB-01 — the transient retry-wall marker (`RETRY_WALL_EXHAUSTED_KEY`)
+# ---------------------------------------------------------------------------
+
+
+def _no_sleep(monkeypatch):
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda _s: None)
+
+
+def test_transient_exhaustion_marks_the_retry_wall(tmp_path, monkeypatch):
+    """The attempt budget running out on a TRANSIENT class is exactly what the
+    marker means: more attempts on this model are pointless."""
+    _no_sleep(monkeypatch)
+    accumulated = {}
+
+    msg, _cost = call_llm_with_retry(
+        _TransientFailingLLM(), [{"role": "user", "content": "hi"}],
+        "openai/gpt-5.5", None, "medium", 3, tmp_path, "task-wall", 1, None,
+        accumulated, "task", False,
+    )
+
+    assert msg is None
+    assert accumulated["_last_llm_error_kind"] == "provider_transient"
+    assert accumulated[RETRY_WALL_EXHAUSTED_KEY] is True
+
+
+def test_transient_deadline_stop_marks_the_retry_wall(tmp_path, monkeypatch):
+    """The other half of the wall: the deadline refuses the next backoff."""
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda _s: None)
+    accumulated = {}
+
+    msg, _cost = call_llm_with_retry(
+        _TransientFailingLLM(), [{"role": "user", "content": "hi"}],
+        "openai/gpt-5.5", None, "medium", 3, tmp_path, "task-wall-deadline", 1,
+        None, accumulated, "task", False, deadline_ts=_time.time() + 1.0,
+    )
+
+    assert msg is None
+    assert accumulated[RETRY_WALL_EXHAUSTED_KEY] is True
+
+
+def test_empty_response_exhaustion_marks_the_retry_wall(tmp_path, monkeypatch):
+    """The response-shaped exit marks too: a finish_reason=null glitch that never
+    recovered spent the same wall as a raised transient error."""
+    _no_sleep(monkeypatch)
+    accumulated = {}
+
+    msg, _cost = call_llm_with_retry(
+        _GlitchThenOkLLM(glitches=99), [{"role": "user", "content": "hi"}],
+        "openai/gpt-5.5", None, "medium", 3, tmp_path, "task-wall-empty", 1,
+        None, accumulated, "task", False,
+    )
+
+    assert msg is None
+    assert accumulated[RETRY_WALL_EXHAUSTED_KEY] is True
+
+
+def test_permanent_failure_leaves_the_retry_wall_unspent(tmp_path, monkeypatch):
+    """A permanent class fails FAST — the wall is never spent, so the forced
+    finalization keeps the one chance that class is entitled to."""
+    _no_sleep(monkeypatch)
+    accumulated = {}
+
+    msg, _cost = call_llm_with_retry(
+        _FailingLLM(), [{"role": "user", "content": "hi"}], "openai/gpt-5.5",
+        None, "medium", 3, tmp_path, "task-auth-wall", 1, None, accumulated,
+        "task", False,
+    )
+
+    assert msg is None
+    assert accumulated["_last_llm_error_kind"] == "auth_error"
+    assert RETRY_WALL_EXHAUSTED_KEY not in accumulated
+
+
+def test_permanent_body_error_leaves_the_retry_wall_unspent(tmp_path):
+    """Same rule on the response-shaped exit: a PERMANENT body error stopped
+    without spending the wall."""
+    accumulated = {}
+    llm = _EmptyBodyErrorLLM(
+        {"kind": "provider_error", "code": 400, "message": "bad request"},
+    )
+
+    msg, _cost = call_llm_with_retry(
+        llm, [{"role": "user", "content": "hi"}], "openai/gpt-5.5", None,
+        "medium", 3, tmp_path, "task-body-wall", 1, None, accumulated, "task",
+        False, attempt_cap=1,
+    )
+
+    assert msg is None
+    assert llm.calls == 1
+    assert RETRY_WALL_EXHAUSTED_KEY not in accumulated
+
+
+def test_retry_wall_marker_is_cleared_at_entry_of_every_invocation(tmp_path, monkeypatch):
+    """REGRESSION: the primary and every fallback candidate SHARE one
+    ``accumulated_usage``. A transient-exhausted primary followed by a
+    permanent-failed fallback must NOT leave the marker standing — otherwise the
+    permanent failure inherits "the wall is spent" and silently loses the one
+    forced call its class is entitled to."""
+    _no_sleep(monkeypatch)
+    shared = {}
+
+    call_llm_with_retry(
+        _TransientFailingLLM(), [{"role": "user", "content": "hi"}],
+        "openai/gpt-5.5", None, "medium", 3, tmp_path, "task-chain", 1, None,
+        shared, "task", False,
+    )
+    assert shared[RETRY_WALL_EXHAUSTED_KEY] is True  # the primary spent its wall
+
+    call_llm_with_retry(
+        _FailingLLM(), [{"role": "user", "content": "hi"}],
+        "anthropic/claude-opus-5", None, "medium", 3, tmp_path, "task-chain", 1,
+        None, shared, "task", False, attempt_cap=2,
+    )
+
+    assert shared["_last_llm_error_kind"] == "auth_error"
+    assert RETRY_WALL_EXHAUSTED_KEY not in shared
+
+
+class _MarkerSeedingLLM:
+    """Sets the wall marker DURING the call, i.e. AFTER `call_llm_with_retry`'s
+    entry-clear has already run.
+
+    Seeding it before the call instead would be vacuous: the entry-clear alone
+    would satisfy the assertion and the successful-round pop could be deleted
+    without any test noticing.
+    """
+
+    def __init__(self, accumulated):
+        self.accumulated = accumulated
+
+    def chat(self, **kwargs):
+        self.accumulated[RETRY_WALL_EXHAUSTED_KEY] = True
+        return (
+            {"content": "ok"},
+            {"provider": "anthropic", "resolved_model": "anthropic/claude-sonnet-4-6"},
+        )
+
+
+def test_successful_round_pops_the_retry_wall_marker(tmp_path):
+    """A round that succeeds retires the marker beside the other stale per-round
+    bookkeeping — the wall is no longer spent. Only the success-path pop can
+    clear a marker set after entry, which is what makes this test load-bearing."""
+    accumulated = {"execution_status": "infra_failed"}
+
+    msg, _cost = call_llm_with_retry(
+        _MarkerSeedingLLM(accumulated), [{"role": "user", "content": "hi"}],
+        "anthropic::claude-sonnet-4-6", None, "medium", 1, tmp_path,
+        "task-wall-ok", 1, None, accumulated, "task", False,
+    )
+
+    assert msg == {"content": "ok"}
+    assert RETRY_WALL_EXHAUSTED_KEY not in accumulated
+    assert "execution_status" not in accumulated

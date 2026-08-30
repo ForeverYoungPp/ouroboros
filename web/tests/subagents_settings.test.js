@@ -35,7 +35,6 @@ const CONTRACT_FIXTURE = JSON.parse(fs.readFileSync(
 function apiRow(overrides = {}) {
     return {
         subagent_id: 'api_scout',
-        name: 'API scout',
         recommended_use: 'Fast independent research and verification.',
         route: { kind: ROUTE_KIND_API_MODEL, target_id: 'openai/gpt-5.6-luna' },
         effort: 'high',
@@ -46,7 +45,6 @@ function apiRow(overrides = {}) {
 function sessionRow(overrides = {}) {
     return {
         subagent_id: 'codex_builder',
-        name: 'Codex builder',
         recommended_use: 'Implementation in a real workspace.',
         route: {
             kind: ROUTE_KIND_AGENT_SESSION,
@@ -68,6 +66,14 @@ test('canonical parser accepts object or JSON and refuses unknown saved fields',
 
     const textResult = parseAvailableSubagentsSetting(JSON.stringify(setting([apiRow()])));
     assert.equal(textResult.setting.items[0].subagent_id, 'api_scout');
+
+    // Legacy `name` parses and is DROPPED (retired field, 1=A) — the next
+    // serialize omits the key, which is the whole migration.
+    const legacyNamed = parseAvailableSubagentsSetting(setting([
+        apiRow({ name: 'Fast scout' }),
+    ]));
+    assert.equal(legacyNamed.error, '');
+    assert.equal('name' in legacyNamed.setting.items[0], false);
 
     const unknown = parseAvailableSubagentsSetting({ ...setting(), surprise: true });
     assert.equal(unknown.setting, null);
@@ -339,12 +345,12 @@ test('a late generated preview cannot replace a newly loaded configured document
     assert.equal(editor.setting.items[0].subagent_id, 'codex_builder');
 });
 
-test('save materializes a readable name but never rewrites stable identity or purpose', () => {
+test('save never fabricates or carries a name — the field is retired (1=A)', () => {
     const built = buildAvailableSubagentsSetting(setting([
-        apiRow({ subagent_id: 'fast_research', name: '', recommended_use: '  owner text  ' }),
+        apiRow({ subagent_id: 'fast_research', name: 'Legacy Label', recommended_use: '  owner text  ' }),
     ]));
     assert.equal(built.items[0].subagent_id, 'fast_research');
-    assert.equal(built.items[0].name, 'Fast Research');
+    assert.equal('name' in built.items[0], false);
     assert.equal(built.items[0].recommended_use, '  owner text  ');
 });
 
@@ -638,7 +644,7 @@ test('reviewer structured bytes keep api_chat and profile_id after extraction', 
             slot_id: 'scope_1',
             route: { kind: 'api_chat', target_id: 'openai/gpt-5.6-sol' },
         }],
-        advisory: { enabled: true, route: { kind: 'api', target_id: '' }, effort: 'low' },
+        advisory: { enabled: true, route: { kind: 'api_chat', target_id: '' }, effort: 'low' },
     });
     const parsed = JSON.parse(reviewer);
     assert.equal(parsed.triad[0].route.profile_id, 'koshak');

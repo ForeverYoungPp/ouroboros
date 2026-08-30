@@ -414,18 +414,32 @@ def route_health(
     names no reset instant still reports ``subscription_window_exhausted`` — as the
     REASON with an empty ``reset_at``, since an unknown healing time is not health.
 
-    ``pinned_profile`` is the route's pinned ACCOUNT (``DelegationRoute.profile_id``;
-    authors: reviewer-slot rows and the Delegation account pin, unified-accounts
-    D-U5). It does two things at once. It SKIPS the harness-row status refusal AND
-    the ``enabled`` flag beside it: a no-default-credential row reads ``unavailable``
-    FOREVER by design (agy, INV-135) and commonly ships disabled too — the ENGINE's
-    typed refusal is authoritative for a pinned run (owner 2026-08-18; one wasted
-    round trip on a really-disabled harness). Catalog absence, access-profile fit,
-    version floor and quota still apply — and the quota judgement narrows to THAT
-    subject exactly (§K.7): a pin is strict (D-U6), so a healthy sibling account
-    must not mask a spent pinned one into a dispatch the engine is certain to
-    refuse. Empty (automatic rotation) keeps the harness-wide judgement: WHICH
-    profile an unpinned run lands on stays Claudexor's business.
+    The harness row's aggregate doctor ``status`` is deliberately NOT a refusal
+    here (cx-delegation sprint, owner decisions 2026-08-28 «статус обманывает,
+    игнорируй его и всё равно пробуй запустить» + 7=A): it describes the
+    DEFAULT credential store, while real accounts live in the engine's
+    credential-profile pool — a pool-only harness read ``unavailable`` FOREVER
+    (agy, INV-135) and blocked routes the engine itself would admit. The row's
+    ``enabled`` field is different and IS honored for unpinned routes
+    (``route_disabled``): the engine schema defines it as the OWNER's settings
+    toggle — "routing excludes it regardless of doctor status" — an explicit
+    owner decision, not an observation.
+    Admission belongs to the engine: a genuinely empty or exhausted pool answers
+    the start POST with its own typed refusal (INV-135
+    ``credential_pool_exhausted`` + earliest reset), which under the pre-start
+    charter costs zero model rounds. The engine's belt capability row
+    (``delegation.available`` — MCP-injection for Claudexor's own delegate
+    strategy) is likewise not consulted: Ouroboros runs never request the belt
+    (no ``extra_mcp_servers``), and the only structural engine gate for a
+    mutating run is the ``execution.delegated`` marker floor checked below.
+
+    ``pinned_profile`` (``DelegationRoute.profile_id``; authors: reviewer-slot
+    rows and the Delegation account pin, unified-accounts D-U5) narrows the
+    QUOTA judgement to that subject exactly (§K.7): a pin is strict (D-U6), so
+    a healthy sibling account must not mask a spent pinned one into a dispatch
+    the engine is certain to refuse. Empty (automatic rotation) keeps the
+    harness-wide judgement: WHICH profile an unpinned run lands on stays
+    Claudexor's business.
     """
     from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
     from ouroboros.gateways.claudexor import engine_at_least
@@ -438,16 +452,14 @@ def route_health(
             break
     if entry is None:
         return "route_not_in_capability_catalog", ""
-    if not pinned_profile and (
-            not entry.get("enabled") or str(entry.get("status") or "") != "ok"):
-        status = f"route_status_{entry.get('status') or 'disabled'}"
-        delegation = entry.get("delegation")
-        if (shape.delegated and isinstance(delegation, dict)
-                and delegation.get("available") is False):
-            # SAME refusal, refined (disclosure, never a new gate): the code carries
-            # the row's structural cannot-delegate fact for downstream wording.
-            return f"{status}:delegation_{delegation.get('reason') or 'unsupported'}", ""
-        return status, ""
+    if not pinned_profile and entry.get("enabled") is False:
+        # `enabled` is NOT the doctor's aggregate status: the engine schema
+        # defines it as the OWNER's settings toggle (harnesses.<id>.enabled=
+        # false — "routing excludes it regardless of doctor status"). Honoring
+        # an explicit owner switch is not health-guessing, so it survives the
+        # status-refusal removal above. A pinned profile keeps its historical
+        # skip (2026-08-18 precedent: the pin is itself an explicit owner row).
+        return "route_disabled", ""
     supported = [str(v) for v in entry.get("accessProfilesSupported") or []]
     # A DELEGATED run is externally confined, and the engine rewrites its access to
     # `external_sandbox_full` before admitting it (`RequestRequirementsResolver.adapterAccess`)
@@ -559,10 +571,30 @@ def _exhausted_window(gateway: Any, route_id: str, route_model: str = "",
             return False
         return not pinned or str(subject.get("subject_id") or "") == pinned
 
+    quota_state = getattr(gateway, "quota_state", None)
+    if callable(quota_state):
+        envelope = quota_state()
+        snapshots = envelope.get("snapshots") if isinstance(envelope, dict) else []
+        absences = envelope.get("absences") if isinstance(envelope, dict) else []
+    else:
+        # Compatibility for older gateway doubles/embedders. Production
+        # ClaudexorGateway owns quota_state and therefore performs one GET.
+        snapshots = gateway.quota_snapshots()
+        absence_reader = getattr(gateway, "quota_absences", None)
+        absences = absence_reader() if callable(absence_reader) else []
+
+    # The current daemon schema guarantees arrays, but route health also supports
+    # older embedders and test doubles. A malformed mandatory snapshot collection
+    # is unknown (fail-open); malformed optional absences add no evidence.
+    snapshots = snapshots if isinstance(snapshots, list) else []
+    absences = absences if isinstance(absences, list) else []
+
     resets: List[str] = []
     any_live = False
     any_spent = False
-    for snapshot in gateway.quota_snapshots():
+    for snapshot in snapshots or []:
+        if not isinstance(snapshot, dict):
+            continue
         subject = snapshot.get("subject") if isinstance(snapshot.get("subject"), dict) else {}
         if not _subject_matches(subject):
             continue
@@ -584,12 +616,16 @@ def _exhausted_window(gateway: Any, route_id: str, route_model: str = "",
             any_live = True
     if any_live or not any_spent:
         return False, ""
-    absences = getattr(gateway, "quota_absences", None)
-    if callable(absences):
-        for row in absences() or []:
-            subject = row.get("subject") if isinstance(row, dict) else None
-            if isinstance(subject, dict) and _subject_matches(subject):
-                return False, ""
+    for row in absences or []:
+        subject = row.get("subject") if isinstance(row, dict) else None
+        if not isinstance(subject, dict) or not _subject_matches(subject):
+            continue
+        # Any explicit gap keeps a spent-looking route fail-open. The shipped
+        # producer already removes absences covered by a snapshot for the same
+        # quota subject; retaining the conservative check here also keeps old
+        # gateway doubles and malformed future envelopes from authorizing a
+        # fallback on contradictory evidence.
+        return False, ""
     return True, min(resets) if resets else ""
 
 

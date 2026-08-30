@@ -368,119 +368,29 @@ class TestSupervisorDedupCostTracking:
                 ev_mod._find_duplicate_task("new task", "", pending, {})
 
 
-class TestAdvisoryCallSiteCostTracking:
-    """emit_review_usage is called with real cost from the SDK result."""
+class TestAdvisoryCostAccounting:
+    """Advisory spend is accounted inside the review substrate: the native
+    episode executor stamps every paid send into the usage ledger under
+    usage_scope(category="advisory_review"), and the session route accounts
+    through the same substrate. A second call-site emit (the retired
+    Claude-SDK transport re-emitted source="advisory_sdk") would now
+    double-count that spend, so its absence is the contract.
+    """
 
-    def test_emit_called_when_cost_nonzero(self):
-        """emit_review_usage is called with cost_usd when cost_usd > 0."""
+    def test_call_site_no_longer_re_emits_transport_usage(self):
+        import inspect
         mod = importlib.import_module("ouroboros.tools.claude_advisory_review")
+        source = inspect.getsource(mod._run_claude_advisory)
+        assert "advisory_sdk" not in source
+        assert "emit_review_usage" not in source
 
-        # Directly verify the conditional gate: cost_usd > 0 triggers the emit call.
-        ctx = _FakeCtx()
-        with patch.object(mod, "emit_review_usage") as mock_emit:
-            # Simulate the inline condition from _run_claude_advisory:
-            #   if result.cost_usd > 0:
-            #       emit_review_usage(ctx, model=model, cost_usd=result.cost_usd, ...)
-            cost_usd = 2.50
-            usage = {"prompt_tokens": 500, "completion_tokens": 200}
-            if cost_usd > 0:
-                mod.emit_review_usage(
-                    ctx,
-                    model="model-x",
-                    cost_usd=cost_usd,
-                    usage=usage,
-                    source="advisory_sdk",
-                )
-            mock_emit.assert_called_once()
-            call_kwargs = mock_emit.call_args.kwargs
-            assert call_kwargs["cost_usd"] == 2.50
-            assert call_kwargs["source"] == "advisory_sdk"
-
-    def test_emit_not_called_when_cost_zero(self):
-        """emit_review_usage is NOT called when SDK reports zero cost."""
+    def test_native_dispatch_scopes_usage_to_advisory_review(self):
+        import inspect
         mod = importlib.import_module("ouroboros.tools.claude_advisory_review")
-        ctx = _FakeCtx()
-        with patch.object(mod, "emit_review_usage") as mock_emit:
-            cost_usd = 0.0
-            if cost_usd > 0:
-                mod.emit_review_usage(
-                    ctx,
-                    model="model-x",
-                    cost_usd=cost_usd,
-                    usage={},
-                    source="advisory_sdk",
-                )
-            mock_emit.assert_not_called()
+        source = inspect.getsource(mod._run_advisory_native)
+        assert 'category="advisory_review"' in source
+        assert 'source="advisory_native"' in source
 
-    def test_run_claude_advisory_emits_cost_via_patched_import(self, tmp_path):
-        """_run_claude_advisory calls emit_review_usage when SDK result has cost_usd > 0.
-
-        claude_agent_sdk is not installed in the test environment, so we pre-register
-        a stub in sys.modules before importing the gateway module.
-        """
-        import os
-        import sys
-        import pathlib
-
-        fake_result = MagicMock()
-        fake_result.success = True
-        fake_result.result_text = '[{"item":"bible_compliance","verdict":"PASS","reason":"ok","severity":"critical"}]'
-        fake_result.cost_usd = 1.75
-        fake_result.usage = {"input_tokens": 400, "output_tokens": 150}
-        fake_result.error = None
-        fake_result.stderr_tail = ""
-        fake_result.session_id = "test-session"
-
-        ctx = _FakeCtx()
-        ctx.repo_dir = str(tmp_path)
-
-        # Pre-register claude_agent_sdk stub so the gateway module can be imported.
-        sdk_stub = MagicMock()
-        sdk_stub.__version__ = "0.0.test"
-        sdk_stub.ClaudeSDKClient = MagicMock
-        sdk_stub.ClaudeAgentOptions = MagicMock
-        sdk_stub.AssistantMessage = MagicMock
-        sdk_stub.ResultMessage = MagicMock
-
-        # Build a fake gateway module that resolves run_readonly and friends.
-        fake_gw_mod = MagicMock()
-        fake_gw_mod.run_readonly = MagicMock(return_value=fake_result)
-        fake_gw_mod.DEFAULT_CLAUDE_CODE_MAX_TURNS = 30
-        fake_gw_mod.resolve_claude_code_model = MagicMock(return_value="claude-opus-4")
-
-        original_sdk = sys.modules.get("claude_agent_sdk")
-        original_gw = sys.modules.get("ouroboros.gateways.claude_code")
-        sys.modules["claude_agent_sdk"] = sdk_stub
-        sys.modules["ouroboros.gateways.claude_code"] = fake_gw_mod
-
-        mod = importlib.import_module("ouroboros.tools.claude_advisory_review")
-        original_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        os.environ["ANTHROPIC_API_KEY"] = "test-key-abc"
-        try:
-            with patch.object(mod, "_get_staged_diff", return_value="diff text here"), \
-                 patch.object(mod, "_get_changed_file_list",
-                              return_value="M ouroboros/loop.py"), \
-                 patch.object(mod, "build_advisory_changed_context",
-                              return_value=(["ouroboros/loop.py"], "pack text", [])), \
-                 patch.object(mod, "_build_advisory_prompt", return_value="mock_prompt"), \
-                 patch.object(mod, "check_worktree_readiness", return_value=[]), \
-                 patch.object(mod, "emit_review_usage") as mock_emit:
-                mod._run_claude_advisory(pathlib.Path(tmp_path), "test commit", ctx)
-                mock_emit.assert_called()
-                assert mock_emit.call_args.kwargs["cost_usd"] == 1.75
-        finally:
-            if original_key:
-                os.environ["ANTHROPIC_API_KEY"] = original_key
-            else:
-                os.environ.pop("ANTHROPIC_API_KEY", None)
-            if original_sdk is not None:
-                sys.modules["claude_agent_sdk"] = original_sdk
-            else:
-                sys.modules.pop("claude_agent_sdk", None)
-            if original_gw is not None:
-                sys.modules["ouroboros.gateways.claude_code"] = original_gw
-            else:
-                sys.modules.pop("ouroboros.gateways.claude_code", None)
 
 
 class TestAdvisoryFallbackCostTracking:

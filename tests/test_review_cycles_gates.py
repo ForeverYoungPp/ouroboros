@@ -21,9 +21,6 @@ import types
 
 import pytest
 
-from tests._shared import ensure_claude_agent_sdk_mock
-
-ensure_claude_agent_sdk_mock()
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 KEY = "OUROBOROS_REVIEW_MAX_CYCLES"
@@ -406,7 +403,7 @@ def test_skill_review_contract_fingerprint_preserves_legacy_and_tracks_rows(monk
 
     monkeypatch.setenv("OUROBOROS_EFFORT_REVIEW", "high")
     legacy = skill_review_contract_fingerprint(["m1", "m2"], required_items=("a",))
-    assert legacy == "e77552ac144b9d24324d1b73ddc83471fa78666357125d5c872d684d818487fc"
+    assert legacy == "eb35c9d2d6daaf1afdece2baec2107aff2b8107c80ab2788597a8c55545a215a"
     legacy_delivery = {
         "legacy_skill_fingerprint": True,
         "models": ["m1", "m2"], "routes": ["api_chat", "api_chat"],

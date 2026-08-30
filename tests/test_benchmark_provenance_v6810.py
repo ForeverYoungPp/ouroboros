@@ -18,7 +18,10 @@ import json
 import pathlib
 import re
 
-from devtools.benchmarks.common.manifests import provider_credential_disclosure
+from devtools.benchmarks.common.manifests import (
+    benchmark_run_manifest,
+    provider_credential_disclosure,
+)
 from devtools.benchmarks.common.result_index import (
     RUNTIME_TRUNCATION_REASON_CODES,
     runtime_terminal_disclosure,
@@ -78,8 +81,11 @@ def test_isolated_settings_grant_only_the_declared_providers_credentials():
     out = build_isolated_settings(_LIVE, OUROBOROS_RUNTIME_MODE="advanced")
 
     assert out["OPENROUTER_API_KEY"] == "or-value"  # every declared slot routes here
-    assert out["ANTHROPIC_API_KEY"] == "an-value"  # CLAUDE_CODE_MODEL's SDK transport
+    # `anthropic/...` spellings are OpenRouter CATALOG ids: no declared slot routes to the
+    # DIRECT anthropic provider, and the retired Claude-SDK default no longer smuggles its
+    # credential in.
     for never in (
+        "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "OPENAI_COMPATIBLE_API_KEY",
@@ -92,6 +98,39 @@ def test_isolated_settings_grant_only_the_declared_providers_credentials():
     # Unchanged: owner/control and transport secrets were never copied and must stay out.
     for owner_secret in ("GITHUB_TOKEN", "OUROBOROS_NETWORK_PASSWORD", "TELEGRAM_BOT_TOKEN"):
         assert owner_secret not in out
+
+
+def test_legacy_claude_sdk_settings_are_inert_state():
+    """The Claude-SDK transport is retired: CLAUDE_CODE_MODEL / CLAUDE_AGENT_SDK_MODEL
+    in an accumulated live settings file are stale bytes, never a model slot. They must not
+    declare anthropic, plan its credential, or surface in declared_model_slots — with or
+    without the retired ``include_claude_sdk_defaults`` compatibility switch (kept so old
+    manifests replay; it is a documented no-op)."""
+    live = {
+        "OUROBOROS_MODEL": "openrouter/model",
+        "CLAUDE_CODE_MODEL": "claude-explicit",
+        "CLAUDE_AGENT_SDK_MODEL": "opus",
+        "OPENROUTER_API_KEY": "or-value",
+        "ANTHROPIC_API_KEY": "an-value",
+    }
+    out = build_isolated_settings(live, OUROBOROS_MODEL="openrouter/model")
+    assert out["OPENROUTER_API_KEY"] == "or-value"
+    assert "ANTHROPIC_API_KEY" not in out
+    for flag in (True, False):
+        grants = isolated_credential_grants(out, include_claude_sdk_defaults=flag)
+        assert "anthropic" not in grants["providers"]
+        assert grants["planned_keys"] == ["OPENROUTER_API_KEY"]
+        assert not any(key.startswith("CLAUDE_") for key in grants["declared_model_slots"])
+
+
+def test_retired_claude_opt_out_switch_is_a_no_op():
+    """Both values of the retired switch produce byte-identical plans, and no
+    CLAUDE_-prefixed slot is ever declared (the slot keys died with the transport)."""
+    for settings in ({}, {"OUROBOROS_MODEL": "openrouter/model", "CLAUDE_CODE_MODEL": ""}):
+        generic = provider_credential_plan(settings)
+        opt_out = provider_credential_plan(settings, include_claude_sdk_defaults=False)
+        assert generic == opt_out
+        assert not any(key.startswith("CLAUDE_") for key in generic["declared_model_slots"])
 
 
 def test_isolated_settings_forward_explicit_context_intent_and_normalize_legacy_state():
@@ -190,7 +229,7 @@ def test_manifest_discloses_granted_credentials_by_fingerprint_never_by_value(tm
 
     disclosure = provider_credential_disclosure(settings_path)
     assert disclosure["available"] is True
-    assert sorted(disclosure["granted"]) == ["ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"]
+    assert sorted(disclosure["granted"]) == ["OPENROUTER_API_KEY"]
     assert disclosure["granted"]["OPENROUTER_API_KEY"]["present"] is True
     assert disclosure["granted"]["OPENROUTER_API_KEY"]["fingerprint"].startswith("sha256:")
     assert disclosure["fail_open"] is False
@@ -210,6 +249,109 @@ def test_manifest_discloses_granted_credentials_by_fingerprint_never_by_value(tm
         "available": False,
         "reason": "settings_path_absent",
     }
+
+
+def test_manifest_discloses_runtime_injected_credentials_separately(tmp_path):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps({"OUROBOROS_MODEL": "openrouter/model"}), encoding="utf-8")
+    disclosure = provider_credential_disclosure(
+        settings_path,
+        runtime_credentials={
+            "OPENROUTER_API_KEY": "runtime-router-value",
+            "OPENAI_API_KEY": "runtime-openai-value",
+        },
+    )
+    assert disclosure["runtime_granted"]["OPENROUTER_API_KEY"]["present"] is True
+    assert disclosure["runtime_granted"]["OPENAI_API_KEY"]["present"] is True
+    assert disclosure["runtime_granted"]["OPENROUTER_API_KEY"]["fingerprint"].startswith("sha256:")
+    blob = json.dumps(disclosure)
+    assert "runtime-router-value" not in blob
+    assert "runtime-openai-value" not in blob
+
+
+def test_initial_manifest_uses_disabled_claude_projection(tmp_path, monkeypatch):
+    """A pre-application/refusal manifest must not reintroduce the Claude default projection."""
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps({
+            "OUROBOROS_MODEL": "openrouter/model",
+            "CLAUDE_CODE_MODEL": "",
+            "CLAUDE_AGENT_SDK_MODEL": "",
+            "OPENROUTER_API_KEY": "",
+        }),
+        encoding="utf-8",
+    )
+    import devtools.benchmarks.common.manifests as manifests
+
+    monkeypatch.setattr(
+        manifests,
+        "repo_provenance",
+        lambda _path: {
+            "repo_dir": str(tmp_path / "repo"),
+            "git_available": True,
+            "status_available": True,
+            "dirty": False,
+            "head": "a" * 40,
+            "version": "",
+            "describe": "a" * 40,
+        },
+    )
+    manifest = benchmark_run_manifest(
+        benchmark="cybergym",
+        run_root=tmp_path / "run",
+        repo_dir=tmp_path / "repo",
+        requested_task_ids=["arvo:1"],
+        metadata={
+            "settings_path": settings_path,
+            "include_claude_sdk_defaults": False,
+        },
+    )
+    disclosure = manifest["provider_credentials"]
+    assert "openrouter/model" in disclosure["providers"]["openrouter"]
+    assert "anthropic" not in disclosure["providers"]
+    assert disclosure["planned_keys"] == ["OPENROUTER_API_KEY"]
+    assert "CLAUDE_CODE_MODEL" not in disclosure["declared_model_slots"]
+
+
+def test_initial_manifest_uses_file_model_slots_when_settings_are_authoritative(tmp_path, monkeypatch):
+    """A refusal-stage manifest must not report ambient model settings."""
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps({
+            "OUROBOROS_MODEL": "file/model",
+            "OUROBOROS_EFFORT_TASK": "high",
+        }),
+        encoding="utf-8",
+    )
+    import devtools.benchmarks.common.manifests as manifests
+
+    monkeypatch.setattr(
+        manifests,
+        "repo_provenance",
+        lambda _path: {
+            "repo_dir": str(tmp_path / "repo"),
+            "git_available": True,
+            "status_available": True,
+            "dirty": False,
+            "head": "b" * 40,
+            "version": "",
+            "describe": "b" * 40,
+        },
+    )
+    monkeypatch.setenv("OUROBOROS_MODEL", "ambient/wrong")
+    manifest = benchmark_run_manifest(
+        benchmark="cybergym",
+        run_root=tmp_path / "run",
+        repo_dir=tmp_path / "repo",
+        requested_task_ids=["arvo:1"],
+        metadata={
+            "settings_path": settings_path,
+            "include_claude_sdk_defaults": False,
+            "settings_authoritative_env": True,
+        },
+    )
+    assert manifest["model_slots"]["OUROBOROS_MODEL"] == "file/model"
+    assert manifest["model_slots"]["OUROBOROS_MODEL"] != "ambient/wrong"
 
 
 def test_isolated_credential_grants_reports_the_file_not_the_intent():

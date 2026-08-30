@@ -632,6 +632,13 @@ def _start_assisted_merge_fenced(plan: dict, tx: dict) -> JSONResponse:
         from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET
         from ouroboros.usage_accounting import review_wave_admission
 
+        # Native-retrieving actor rows (subagent_id + api route) are priced at
+        # the SAME one-pack-call convention as packet rows: their true worst
+        # case is bounded by the episode's own rails (round cap x transcript
+        # cap) and can exceed this estimate, but the typical episode is
+        # pack-sized or smaller, and this floor is an explicitly fail-open
+        # affordability heuristic — over-refusing assisted updates on a
+        # theoretical ceiling would cost more than it protects.
         triad_models = [
             row.target_id for row in commit_triad_rows()
             if not row.is_session and row.target_id

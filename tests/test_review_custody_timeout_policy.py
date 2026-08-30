@@ -59,7 +59,11 @@ def test_spent_deadline_restart_reconciliation_gets_only_a_settlement_window(
     operation_id, retry_state, remaining = calls[0]
     assert operation_id == "op-existing"
     assert retry_state == {"pending_invocation_id": "inv-existing"}
-    assert 0 < remaining <= 0.2
+    # The deadline is monotonic_now + 0.2 and ``remaining`` re-reads the same
+    # clock, so it can only shrink — but on Windows the coarse monotonic clock
+    # returns the identical reading twice, leaving pure float rounding noise
+    # above 0.2 (observed +4.5e-13 on the CI shard). Tolerate one epsilon.
+    assert 0 < remaining <= 0.2 + 1e-9
     assert paid == []
     assert actor.operation_id == "op-existing"
     assert actor.operation_state == "settled"
@@ -411,7 +415,12 @@ def test_coordinator_keeps_fresh_empty_session_custody_cell_shared(
             self.state["delegated_run_id"] = "run-shared"
             if self.checkpoint is not None:
                 self.checkpoint("inv-shared")
-            release.wait(1.0)
+            # Hang-escape only, NOT a deadline the test body must beat: with a
+            # 1.0s cap a slow CI runner (Windows shard) let the wait expire
+            # between the two run_review_request calls, so the run settled
+            # naturally with empty usage and the join replayed "late_settled"
+            # instead of sharing the in-flight custody cell.
+            release.wait(30.0)
             settled.set()
             return ReviewAttemptResult(
                 message={"content": "[]"}, usage={}, raw_text="[]",
@@ -517,6 +526,89 @@ def test_review_owner_deadline_rechecked_after_prompt_persistence(
     assert llm.calls == 0
     assert actor["operation_state"] == "not_dispatched"
     assert actor["status"] == "not_dispatched"
+
+
+def test_coordinator_rejoins_exact_recovery_after_spent_owner_deadline(
+    tmp_path, monkeypatch,
+):
+    """The public coordinator must not launder a paid recovery as $0 dispatch."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import (
+        merge_frozen_review_reconciliation, prepare_frozen_review_reconciliation,
+    )
+    from ouroboros.review_execution import ReviewAttemptResult
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+
+    class RecoveringExecutor:
+        def __init__(self):
+            self.state = None
+            self.execute_calls = 0
+
+        def restore_custody(self, state):
+            self.state = state
+
+        def set_pending_invocation_checkpoint(self, _checkpoint):
+            return None
+
+        def prompt_payload(self):
+            return {"session_prompt": "review"}
+
+        def prompt_chars(self):
+            return 6
+
+        def execute(self):
+            self.execute_calls += 1
+            return ReviewAttemptResult(
+                message={"content": "[]"}, usage={}, raw_text="[]",
+            )
+
+        def failure_custody(self):
+            return dict(self.state or {})
+
+    executor = RecoveringExecutor()
+    monkeypatch.setattr(
+        "ouroboros.review_substrate._review_route_executor",
+        lambda *_args, **_kwargs: executor,
+    )
+    ctx = SimpleNamespace(
+        task_id="spent-recovery",
+        drive_root=tmp_path,
+        task_metadata={"deadline_at": "2000-01-01T00:00:00Z"},
+    )
+    prepare_frozen_review_reconciliation(ctx, SimpleNamespace(
+        triad_raw_results=[{
+            "slot_id": "slot-1", "model_id": "test/model", "status": "error",
+            "operation_id": "op-existing", "operation_state": "in_flight",
+            "late_result_pending": True, "pending_invocation_id": "inv-existing",
+        }],
+        scope_raw_result={},
+    ))
+    request = ReviewRequest(
+        surface="multi_model_review", goal="review", task_id="spent-recovery",
+        retry_key="commit_review:spent-recovery", reconcile_only=True,
+        deadline_at="2000-01-01T00:00:00Z",
+    )
+    result = run_review_request(
+        request,
+        slots=[ReviewSlot(
+            slot_id="slot-1", model="test/model",
+            route="agent_session",
+        )],
+        drive_root=tmp_path,
+        usage_ctx=ctx,
+    )
+
+    actor = result.actors[0]
+    assert executor.execute_calls == 1
+    assert actor["operation_id"] == "op-existing"
+    assert actor["operation_state"] == "settled"
+    assert actor["status"] == "ok"
+    ctx._last_triad_raw_results = result.actors
+    merge_frozen_review_reconciliation(ctx)
+    row = ctx._last_triad_raw_results[0]
+    assert row["operation_state"] == "settled"
+    assert row.get("pending_invocation_id", "") == ""
 
 
 def test_durable_triad_and_scope_rows_carry_delegated_restart_identity():
@@ -633,6 +725,69 @@ def test_review_retry_rail_honors_durable_cancel_for_format_and_empty_paths(
     result = run_review_request(
         ReviewRequest(
             surface=surface, goal="review", task_id=task_id,
+            evidence={}, call_type=f"{surface}_review",
+        ),
+        slots=[ReviewSlot(
+            slot_id="slot-1", model="test/model", route=ReviewRouteKind.API_CHAT,
+        )],
+        drive_root=tmp_path, usage_ctx=ctx,
+    )
+
+    assert calls == [1]
+    assert result.actors[0]["raw_text"] == raw_text
+
+
+@pytest.mark.parametrize(
+    ("surface", "raw_text"),
+    [("task_acceptance", "malformed reviewer output"), ("multi_model_review", "")],
+)
+def test_review_retry_rail_honors_logical_root_cancel_from_physical_retry_leaf(
+    tmp_path, monkeypatch, surface, raw_text,
+):
+    """A proven root-retry leaf cannot escape its logical cascade stop."""
+    from types import SimpleNamespace
+
+    from ouroboros.cancel_intents import (
+        SCOPE_CASCADE,
+        STOP_POLICY_FINALIZE,
+        request_cancel,
+    )
+    from ouroboros.review_execution import ReviewAttemptResult, ReviewRouteKind
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+    from ouroboros.task_results import write_task_result
+
+    root_id = f"logical-cancel-{surface.replace('_', '-')}"
+    leaf_id = f"physical-retry-{surface.replace('_', '-')}"
+    write_task_result(
+        tmp_path, root_id, "interrupted", root_task_id=root_id,
+        delegation_role="root", superseded_by=leaf_id, retry_task_id=leaf_id,
+    )
+    write_task_result(
+        tmp_path, leaf_id, "running", root_task_id=root_id, parent_task_id="",
+        delegation_role="root", supersedes_task_id=root_id,
+        original_task_id=root_id, timeout_retry_from=root_id,
+    )
+    calls = []
+
+    def attempt(_assignment, **_kwargs):
+        calls.append(1)
+        request_cancel(
+            tmp_path, root_id, reason="owner stopped logical retry tree",
+            source="test", scope=SCOPE_CASCADE,
+            requested_stop_policy=STOP_POLICY_FINALIZE,
+        )
+        return ReviewAttemptResult(
+            message={"content": raw_text}, usage={}, raw_text=raw_text,
+        )
+
+    monkeypatch.setattr("ouroboros.review_substrate._execute_slot_attempt", attempt)
+    ctx = SimpleNamespace(
+        task_id=leaf_id, drive_root=tmp_path,
+        task_metadata={"root_task_id": root_id},
+    )
+    result = run_review_request(
+        ReviewRequest(
+            surface=surface, goal="review", task_id=leaf_id,
             evidence={}, call_type=f"{surface}_review",
         ),
         slots=[ReviewSlot(

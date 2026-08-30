@@ -20,6 +20,7 @@ from ouroboros.config import (
     load_settings,
     save_settings,
 )
+from ouroboros.depth_evidence import parse_task_depth
 from ouroboros.headless import prepare_task_drive, task_state_dir
 from ouroboros.contracts.task_contract import (
     build_task_contract,
@@ -1786,6 +1787,13 @@ RETIRED_SCHEDULE_PARAMS: Dict[str, str] = {"effort": "reasoning_effort"}
 HIDDEN_LEGACY_SCHEDULE_PARAMS: frozenset[str] = frozenset({"model_lane", "executor"})
 
 
+def _context_task_depth(ctx: ToolContext) -> tuple[int, str]:
+    try:
+        return parse_task_depth(getattr(ctx, "task_depth", 0), default=0), ""
+    except (TypeError, ValueError) as exc:
+        return 0, str(exc)
+
+
 def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, **params: Any) -> str:
     allowed_params = schedule_subagent_param_names() | HIDDEN_LEGACY_SCHEDULE_PARAMS
     retired = sorted(str(key) for key in params if key in RETIRED_SCHEDULE_PARAMS)
@@ -1834,10 +1842,12 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     requested_model_lane = "auto"  # bounded historical projection only
     requested_executor = "harness" if route.get("kind") == "agent_session" else "native"
 
-    try:
-        current_depth = int(getattr(ctx, 'task_depth', 0) or 0)
-    except (TypeError, ValueError):
-        current_depth = 0
+    current_depth, depth_error = _context_task_depth(ctx)
+    if depth_error:
+        return (
+            "⚠️ TOOL_ERROR (schedule_subagent): invalid_task_depth: "
+            f"{depth_error}"
+        )
     new_depth = current_depth + 1
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     parent_contract = metadata.get("task_contract") if isinstance(metadata.get("task_contract"), dict) else {}
@@ -1861,7 +1871,6 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
             })
         except Exception:
             pass
-
     # EMPTINESS decides, not type. `ToolContext.task_contract` defaults to `{}`, so testing
     # only `isinstance(..., dict)` let that empty default win over a contract that really is
     # in `task_metadata` — and the parent's `deadline_at` lives in the contract, so the miss

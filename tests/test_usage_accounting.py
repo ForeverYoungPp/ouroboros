@@ -1228,44 +1228,6 @@ def test_explicit_zero_root_limit_blocks_only_that_root(data_root, monkeypatch):
     assert exc_info.value.root_task_id == "root-a"
 
 
-def test_claude_sdk_reserves_max_budget_and_settles_actual(data_root, monkeypatch):
-    from ouroboros.gateways import claude_code as cc
-
-    class Result:
-        session_id = "session"
-        total_cost_usd = 0.12
-        usage = {"input_tokens": 20, "output_tokens": 4}
-        subtype = "success"
-
-    class Client:
-        def __init__(self, options):
-            self.options = options
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def query(self, prompt):
-            return None
-
-        async def receive_response(self):
-            yield Result()
-
-    monkeypatch.setattr(cc, "ClaudeAgentOptions", lambda **kwargs: kwargs)
-    monkeypatch.setattr(cc, "ClaudeSDKClient", Client)
-    monkeypatch.setattr(cc, "ResultMessage", Result)
-
-    result = asyncio.run(cc._run_readonly_async("do work", str(data_root), max_budget_usd=2.0))
-    assert result.success is True
-    assert result.usage["ledger_attempt_ids"]
-    projection = ua.usage_projection(data_root)
-    assert projection["confirmed_usd"] == 0.12
-    rows = _ledger(data_root)
-    assert rows[0]["reservation_upper_bound_usd"] == 2.0
-
-
 def test_body_error_zero_usage_settles_confirmed_zero():
     # A top-level provider body-error (OpenRouter passes 429/5xx through the body
     # of an HTTP-200) that billed zero tokens is a request rejected before
@@ -1495,3 +1457,20 @@ def test_review_wave_admission_override_compares_against_the_given_remaining(mon
         remaining_usd_override=3.0,
     )
     assert roomy["fits"] is True and roomy["estimated_wave_usd"] == 2.5
+
+
+def test_unresolved_reason_cause_suffix_leads_and_survives_truncation(data_root):
+    """Nanny-leaf S3 + fable F4: the transport-cause suffix rides BEFORE the raw
+    provider text, so a verbose body cannot truncate away the one datum the
+    enrichment adds."""
+    import httpx
+
+    reservation = ua.reserve_attempt(_request(data_root, task_id="cause"))
+    ua.mark_dispatched(reservation)
+    cause = httpx.RemoteProtocolError("peer closed connection without response")
+    try:
+        raise RuntimeError("Connection error. " + "x" * 600) from cause
+    except RuntimeError as exc:
+        assert ua._terminalize_failed_attempt(reservation, exc) == "unresolved"
+    reason = _ledger(data_root)[-1]["reason"]
+    assert reason.startswith("RuntimeError [cause: RemoteProtocolError]:")

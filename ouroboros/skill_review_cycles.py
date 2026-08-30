@@ -136,6 +136,12 @@ def skill_review_contract_fingerprint(
                 delivery.get("session_profiles") or [], delivery.get("slot_ids") or [],
             )
         ]
+        # Actor binding is delivery identity (native retrieval vs packet);
+        # added only when present so unchanged rosters keep their exact bytes.
+        actor_ids = [str(a or "") for a in (delivery.get("subagent_ids") or [])]
+        if any(actor_ids):
+            for row, actor in zip(rows, actor_ids):
+                row["subagent_id"] = actor
         identity = {"reviewer_rows": sorted(rows, key=lambda row: row["slot_id"])}
         if any(row["route"] == "agent_session" for row in rows):
             from ouroboros.skill_review_passes import skill_review_session_contract_hash

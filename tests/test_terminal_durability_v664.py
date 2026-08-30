@@ -124,14 +124,26 @@ def _patch_reaper(tmp_path, monkeypatch):
 
     events = []
     enqueued = []
+    pending = []
+    running = {}
     monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
-    monkeypatch.setattr(queue, "PENDING", [])
-    monkeypatch.setattr(queue, "RUNNING", {})
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(queue, "RUNNING", running)
     monkeypatch.setattr(queue, "QUEUE_MAX_RETRIES", 1)
     monkeypatch.setattr(queue, "reconstruct_task_cost", lambda *_a, **_k: _available_cost_fields())
-    monkeypatch.setattr(queue, "enqueue_task", lambda task, front=False: enqueued.append((dict(task), front)))
+
+    def _enqueue_task(task, front=False):
+        admitted = dict(task)
+        pending.append(admitted)
+        enqueued.append((admitted, front))
+        return admitted
+
+    monkeypatch.setattr(queue, "enqueue_task", _enqueue_task)
     monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
     monkeypatch.setattr(queue, "_kept_service_pids", lambda: set(), raising=False)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", running)
     monkeypatch.setattr(workers, "WORKERS", {})
     monkeypatch.setattr(workers, "get_event_q", lambda: SimpleNamespace(put=events.append))
     monkeypatch.setattr("ouroboros.tools.services.archive_task_service_logs", lambda *_a, **_k: None)
@@ -545,6 +557,10 @@ def test_reaper_admission_block_terminalizes_retry(tmp_path, monkeypatch):
         "enqueue_task",
         lambda *_args, **_kwargs: {"_admission_blocked": "task_acceptance_fence"},
     )
+    monkeypatch.setattr(
+        "ouroboros.observability.salvaged_output_note",
+        lambda *_args, **_kwargs: "\n\nPreserved admission-block answer.",
+    )
     source = tmp_path / "fenced.txt"
     source.write_text("fenced", encoding="utf-8")
     manifest = stage_task_attachments(
@@ -571,6 +587,7 @@ def test_reaper_admission_block_terminalizes_retry(tmp_path, monkeypatch):
     result = load_task_result(tmp_path, "fenced-retry")
     assert result["status"] == STATUS_FAILED
     assert result["reason_code"] == "idle_timeout_retry_admission_blocked"
+    assert "Preserved admission-block answer." in result["result"]
     assert not _mailbox_path(tmp_path, "fenced-retry-new").exists()
     assert not (
         tmp_path / "task_results" / "artifacts" / "fenced-retry-new"
@@ -667,12 +684,18 @@ def test_corrupt_or_integrity_degraded_ledger_never_permits_budget_resume(
     assert "_budget_pause" in queue.PENDING[0]
 
 
-def test_reaper_suppresses_retry_when_terminal_result_write_fails(tmp_path, monkeypatch):
+def test_reaper_rolls_back_retry_and_retains_terminalization_custody(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import task_results
+    from supervisor import queue, workers
     from supervisor.task_reaper import reap_timed_out_task
 
     events, enqueued = _patch_reaper(tmp_path, monkeypatch)
+    real_write_task_result = task_results.write_task_result
     monkeypatch.setattr(
-        "ouroboros.task_results.write_task_result",
+        task_results,
+        "write_task_result",
         lambda *_a, **_k: (_ for _ in ()).throw(OSError("durable write failed")),
     )
 
@@ -689,11 +712,44 @@ def test_reaper_suppresses_retry_when_terminal_result_write_fails(tmp_path, monk
         "retry_task_id": "retry-needs-terminal",
     })
 
-    assert enqueued == []
+    # Production admission was attempted, then rolled back by identity when the
+    # reciprocal durable result could not be published.  What remains is the
+    # existing non-dispatchable terminalization custody, never a business retry.
+    assert len(enqueued) == 1
+    attempted, front = enqueued[0]
+    assert front is True
+    assert attempted["id"] == "retry-needs-terminal"
+    assert "_terminalization_retry" not in attempted
+    assert len(queue.PENDING) == 1
+    retained = queue.PENDING[0]
+    assert retained["id"] == "retry-needs-terminal"
+    assert retained["_terminalization_retry"]["status"] == "failed"
+    assert retained["_terminalization_retry"]["trigger"] == (
+        "reaper_retry_terminal_persistence"
+    )
+    assert task_results.load_task_result(tmp_path, "retry-needs-terminal") is None
+    assert not any(event.get("type") == "task_done" for event in events)
+
+    # Once durable storage recovers, the retained custody writes the terminal
+    # row and publishes exactly one card-resolution event.  Replaying an empty
+    # custody queue cannot duplicate it.
+    monkeypatch.setattr(task_results, "write_task_result", real_write_task_result)
+    monkeypatch.setattr(
+        workers, "_audit_delegate_terminal_custody", lambda *_a, **_k: None,
+    )
+    assert workers._retry_terminalization_pending() == (
+        ["retry-needs-terminal"], []
+    )
+    assert queue.PENDING == []
+    stored = task_results.load_task_result(tmp_path, "retry-needs-terminal")
+    assert stored["status"] == "failed"
     terminal = [event for event in events if event.get("type") == "task_done"]
     assert len(terminal) == 1
     assert terminal[0]["task_id"] == "retry-needs-terminal"
     assert terminal[0]["status"] == "failed"
+
+    assert workers._retry_terminalization_pending() == ([], [])
+    assert len([event for event in events if event.get("type") == "task_done"]) == 1
 
 
 # ---------------------------------------------------------------------------

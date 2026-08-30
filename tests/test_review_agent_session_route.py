@@ -992,6 +992,25 @@ def _run_session_directly(tmp_path, **overrides):
     return run_delegated_review_session(invocation=SessionInvocation(**invocation), **kwargs)
 
 
+def test_stale_retry_token_cannot_be_reinterpreted_as_fresh_review(
+    tmp_path, fake_route,
+):
+    """A missing durable invocation is custody loss, even with time left."""
+    from ouroboros.review_execution import ReviewRouteUnavailable
+
+    state = {"pending_invocation_id": "stale-token"}
+    with pytest.raises(ReviewRouteUnavailable) as raised:
+        _run_session_directly(
+            tmp_path, retry_state=state, operation_id="op-stale",
+        )
+
+    assert raised.value.code == "review_custody_lost"
+    gateway = fake_route.instances[-1] if fake_route.instances else None
+    if gateway is not None:
+        assert gateway.start_requests == []
+        assert gateway.registrations == []
+
+
 def test_pending_invocation_checkpoint_precedes_provider_post(
     tmp_path, fake_route, monkeypatch,
 ):
@@ -1270,7 +1289,7 @@ def test_restart_reconciliation_settles_review_spend_to_the_recorded_root(
     outcomes = custody.reconcile_orphaned_runs(
         tmp_path, running_task_ids=set(), gateway_factory=lambda: FakeGateway(),
     )
-    assert [o["action"] for o in outcomes] == ["settled"]
+    assert [o["action"] for o in outcomes] == ["settle_attempted"]
 
     ledger = [json.loads(line) for line in
               (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()
@@ -1319,7 +1338,7 @@ def test_pending_invocation_recovery_replays_the_recorded_lineage(tmp_path, fake
     # The sweep recovers the invocation with NO ambient scope: the stored
     # record is the single source of the replay's facts, lineage included.
     result = custody._recover_pending_invocation(tmp_path, FakeGateway(), record)
-    assert result["action"] == "settled"
+    assert result["action"] == "settle_attempted"
     recovered = [r for r in _custody_rows(tmp_path)
                  if r["type"] == custody.STARTED
                  and r.get("recovered_from_pending_invocation")]
@@ -1896,7 +1915,11 @@ def test_late_worker_uses_its_captured_stamp_after_caller_restores_context(
 
     def delayed_find(self, root):
         entered.set()
-        assert release.wait(2)
+        # 10s, not 2s: this gate opens only after the caller's run_review_request
+        # returns, and on a loaded CI runner that return itself exceeded 2s — the
+        # worker then died here, never stamped, and leaked a live _ACTIVE entry
+        # into the next (equal-key) test.  Drain/gate bounds are coarse on purpose.
+        assert release.wait(10)
         return original(self, root)
 
     def observed_close(self):
@@ -1913,8 +1936,13 @@ def test_late_worker_uses_its_captured_stamp_after_caller_restores_context(
     assert entered.is_set() and result.actors[0]["status"] == "error"
     ctx._review_paid_stamp = None  # mirrors review_skill's finally restoration
     release.set()
-    assert stamped.wait(2), "the late physical start must retain its original wave stamp"
-    assert finished.wait(2), "the delayed worker must not leak into the next test"
+    # 10s bounds (were 2s): these are drain waits on the released worker, not
+    # discrimination margins — on a loaded CI runner the 2s bound tripped while
+    # the worker was healthily mid-flight, and the still-live worker then
+    # poisoned the next equal-key test (its run joined this _ACTIVE entry and
+    # posted zero starts of its own).
+    assert stamped.wait(10), "the late physical start must retain its original wave stamp"
+    assert finished.wait(10), "the delayed worker must not leak into the next test"
     # Gateway close precedes the substrate's final actor publication by a few
     # instructions. Wait for process-local custody too, otherwise the following
     # equal-content test can legitimately join this late actor.
@@ -1923,7 +1951,7 @@ def test_late_worker_uses_its_captured_stamp_after_caller_restores_context(
     from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK, _attempt_key
 
     key = _attempt_key(_agent_request(), _agent_slot(timeout_sec=0.02))
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         with _ACTIVE_LOCK:
             if key not in _ACTIVE:
@@ -1933,16 +1961,27 @@ def test_late_worker_uses_its_captured_stamp_after_caller_restores_context(
         raise AssertionError("the delayed review worker did not settle its custody")
 
 
-def test_unhealthy_route_refuses_typed_never_falls_back(tmp_path, fake_route):
+def test_degraded_row_status_reaches_the_engine_whose_refusal_stays_typed(tmp_path, fake_route):
+    """cx-delegation sprint (owner 7=A, «статус обманывает»): the doctor's
+    aggregate row status is no longer a pre-POST refusal — for review slots
+    too, since route_health is deliberately ONE reader. The request reaches
+    the engine; the ENGINE's typed refusal rides the slot, and there is still
+    never a silent fallback onto the api route."""
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
     fake_route.catalog_entry["status"] = "degraded"
+    fake_route.start_error = ClaudexorUnavailable(
+        "credential_pool_exhausted", "engine typed refusal: pool exhausted",
+        status_code=422)
     llm = FakeLLM()
     result = run_review_request(_agent_request(), slots=[_agent_slot()],
                                 drive_root=tmp_path, llm=llm)
+    starts = [r for inst in fake_route.instances for r in inst.start_requests]
+    assert len(starts) == 1  # the start attempt was actually posted
     actor = result.actors[0]
     assert actor["status"] == "error"
-    assert "route_status_degraded" in actor["error"]
-    assert llm.calls == []
-    assert not any(inst.start_requests for inst in fake_route.instances)
+    assert "engine typed refusal: pool exhausted" in actor["error"]
+    assert llm.calls == []  # never a silent fallback onto the api route
 
 
 def test_pinned_profile_passes_row_status_through_to_the_engine(tmp_path, fake_route):
@@ -1973,17 +2012,20 @@ def test_pinned_profile_passes_row_status_through_to_the_engine(tmp_path, fake_r
     assert llm.calls == []  # never a silent fallback onto the api route
 
 
-def test_route_status_refusal_carries_its_typed_code(tmp_path, fake_route):
-    """Phase D2: the route_health refusal rides ReviewRouteUnavailable with a
-    machine-readable `.code` (the rotation sprint's quorum classification keys
-    on failure codes; a bare RuntimeError is invisible to it)."""
+def test_owner_disabled_route_refusal_carries_its_typed_code(tmp_path, fake_route):
+    """The remaining pre-POST row refusal is the OWNER's settings toggle
+    (`enabled=false` — routing excludes it regardless of doctor status), and it
+    still rides ReviewRouteUnavailable with a machine-readable `.code` (the
+    rotation sprint's quorum classification keys on failure codes; a bare
+    RuntimeError is invisible to it). The aggregate doctor status alone no
+    longer refuses (owner 7=A)."""
     from ouroboros.review_execution import ReviewRouteUnavailable
 
     fake_route.catalog_entry["status"] = "unavailable"
     fake_route.catalog_entry["enabled"] = False
     with pytest.raises(ReviewRouteUnavailable) as excinfo:
         _run_session_directly(tmp_path)
-    assert excinfo.value.code == "route_status_unavailable"
+    assert excinfo.value.code == "route_disabled"
     assert not any(inst.start_requests for inst in fake_route.instances)
 
 
@@ -2183,7 +2225,7 @@ def test_agent_slot_without_session_task_refuses_the_api_pack(tmp_path, fake_rou
     result = run_review_request(request, slots=[_agent_slot()],
                                 drive_root=tmp_path, llm=llm)
     actor = result.actors[0]
-    assert actor["status"] == "error"
+    assert actor["status"] == "not_dispatched"
     assert "no session task" in actor["error"]
     assert llm.calls == []
     assert not any(inst.start_requests for inst in fake_route.instances)
@@ -3120,7 +3162,15 @@ def test_clock_crossing_between_timeout_checks_still_cancels_the_running_session
     from ouroboros import review_execution as rx
 
     ticks = iter([0.0, 0.0, 0.5, 1.1, 1.2])
-    monkeypatch.setattr(rx.time, "monotonic", lambda: next(ticks))
+    # Replace the module reference, not attributes on the process-global
+    # ``time`` module: pytest itself calls monotonic on Windows and would
+    # exhaust the finite tick iterator (same scoping precedent as
+    # tests/test_external_unmetered_dispatch.py).
+    monkeypatch.setattr(
+        rx,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda _seconds: None),
+    )
     monkeypatch.setattr(
         rx,
         "_poll_detail",

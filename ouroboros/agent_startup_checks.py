@@ -18,7 +18,6 @@ from ouroboros.utils import (
     atomic_write_json,
     read_json_dict,
     read_text,
-    truncate_within_limit,
     update_json_locked,
     utc_now_iso,
 )
@@ -96,6 +95,11 @@ def task_result_authority_projection(
     else:
         from ouroboros.contracts.task_contract import build_task_contract
 
+        if contract not in (None, "") and "task_contract_malformed" not in authority:
+            # The malformed original is still a terminal fact: it rides (the
+            # envelope bounds it), never silently replaced by the rebuild -
+            # and never clobbering a row's own field of this name.
+            authority["task_contract_malformed"] = copy.deepcopy(contract)
         authority["task_contract"] = build_task_contract(row)
     receipts = _authority_verification_receipts(row, drive_root)
     if receipts:
@@ -123,41 +127,44 @@ def valid_task_result_authority_source(source: Any, task_id: Any) -> bool:
 def _automatic_predecessor_authority_projection(
     row: Dict[str, Any], source: Dict[str, Any], *, drive_root: Any,
 ) -> Dict[str, Any]:
-    """Bound only unreviewed host salvage injected automatically at startup."""
+    """Bounded continuation envelope: every terminal fact, no body recursion.
+
+    The recursion that compiled 300K+ work orders and 800K-token parent
+    prompts lived in exactly two carriers: the nested ``task_contract``
+    (which embedded the hop before, recursively) and unbounded string bodies
+    (``result``/``final_answer`` and friends). Every OTHER top-level terminal
+    fact - artifact/custody/verification/capability facts, fields this reader
+    predates - keeps inheriting whole, so authority cannot silently vanish.
+    The carriers are bounded structurally by the shared envelope producer
+    (contracts SSOT): the contract inherits its OPERATIVE core minus the
+    nested predecessor, and any field whose body outgrows the tool-result
+    budget - measured on its serialized form, so lists and dicts count -
+    rides as a typed preview beside the named pull source (the same
+    whole-or-pointer rule main_context_authority already applies to Main).
+    Digest facts are observed at binding; the complete canonical authority
+    stays in task_results/<id>.json, pullable whole via the named source.
+    """
+
+    from ouroboros.contracts.task_contract import bounded_continuation_envelope
 
     authority = task_result_authority_projection(row, drive_root=drive_root)
-    if str(row.get("terminal_origin") or "") != TERMINAL_ORIGIN_HOST_SALVAGE:
-        return authority
-    full_result = authority.get("result")
-    if not isinstance(full_result, str):
-        return authority
-
-    full_chars = len(full_result)
-    if full_chars <= _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS:
-        carried_chars = full_chars
-    else:
-        omission_note = (
-            "\n⚠️ OMISSION NOTE: truncated at "
-            f"{_AUTOMATIC_HOST_SALVAGE_RESULT_CHARS} chars; original length {full_chars}"
-        )
-        carried_chars = max(
-            0, _AUTOMATIC_HOST_SALVAGE_RESULT_CHARS - len(omission_note),
-        )
-    authority["result"] = {
-        "kind": "unreviewed_host_salvage",
-        "preview": truncate_within_limit(
-            full_result, limit=_AUTOMATIC_HOST_SALVAGE_RESULT_CHARS,
-        ),
-        "carried_chars": carried_chars,
-        "omitted_chars": full_chars - carried_chars,
-        "full_chars": full_chars,
-        "source_ref": {
-            **copy.deepcopy(source),
-            "field": "authority.result",
+    contract = authority.get("task_contract") if isinstance(authority.get("task_contract"), dict) else {}
+    nested = contract.get("predecessor_authority") if isinstance(contract.get("predecessor_authority"), dict) else {}
+    nested_source = nested.get("source") if isinstance(nested.get("source"), dict) else {}
+    salvage = str(row.get("terminal_origin") or "") == TERMINAL_ORIGIN_HOST_SALVAGE
+    return bounded_continuation_envelope(
+        authority,
+        digest_semantics="observed_at_binding",
+        source_ref=source,
+        salvage=salvage,
+        reserve_source=True,
+        extra={
+            "previous_task_id": str(
+                nested.get("task_id") or nested.get("previous_task_id")
+                or nested_source.get("task_id") or ""
+            ),
         },
-    }
-    return authority
-
+    )
 
 def validate_task_authority_sources(env: Any, task: Dict[str, Any]) -> Dict[str, Any]:
     """Materialize named authority sources or return one typed startup refusal."""
@@ -229,11 +236,14 @@ def validate_task_authority_sources(env: Any, task: Dict[str, Any]) -> Dict[str,
         )
         if not isinstance(predecessor_row, dict):
             return _unavailable(predecessor, "named predecessor task result is missing or unreadable")
+        # The pull pointer is written LAST: a projected row field named
+        # ``source`` must not clobber the authority route the pull flow and
+        # identity checks depend on.
         task["predecessor_authority"] = {
-            "source": dict(predecessor),
             **_automatic_predecessor_authority_projection(
                 predecessor_row, predecessor, drive_root=root,
             ),
+            "source": dict(predecessor),
         }
     else:
         metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}

@@ -332,23 +332,47 @@ def test_a_delegating_nanny_and_a_native_child_are_not_nudged():
     assert _run(native, [], []) is False
 
 
-def test_actor_first_host_coordination_suppresses_zero_leaf_accusation(tmp_path):
-    # Scheduling or inspecting a host child is a valid actor-first outcome. It
-    # must not be reported as if the nanny silently chose metered inline work.
+def test_host_coordination_no_longer_suppresses_zero_leaf_accusation(tmp_path):
+    # Charter (owner 2026-08-28): coordination and host children are auxiliary
+    # evidence — they no longer buy silence over a zero-leaf finalization.
     from ouroboros.loop import _nanny_finalization_message
 
     drive = _custody_drive(tmp_path)
     ctx = SimpleNamespace(
         _nanny_route_dispatched=True,
         _nanny_finalization_injected=False,
-        _nanny_coordination_activity=True,
         task_metadata={"budget_drive_root": str(drive)},
     )
     tools = _tools(ctx, ["delegate_start", "delegate_wait", "schedule_subagent"])
-    assert _nanny_finalization_message(tools, drive, "child-1") == ""
+    message = _nanny_finalization_message(tools, drive, "child-1")
+    assert "NANNY_DID_NOT_DELEGATE" in message
 
     undispatched = SimpleNamespace()  # a ctx that never saw a dispatch at all
     assert _run(undispatched, [], []) is False
+
+
+def test_configured_actor_typed_zero_run_receipt_finalizes_in_silence(tmp_path):
+    # The typed terminal decision is the ONE legitimate zero-leaf ending for a
+    # configured session actor: once it is durably recorded, no nudge fires.
+    from ouroboros.loop import _nanny_finalization_message
+
+    drive = _custody_drive(tmp_path)
+    ctx = SimpleNamespace(
+        _nanny_route_dispatched=True,
+        _nanny_finalization_injected=False,
+        task_id="actor-zr",
+        task_metadata={"budget_drive_root": str(drive)},
+        _configured_actor_bootstrap={
+            "route_available": False,
+            "exact_start_pending": False,
+            "physical_started": False,
+            "zero_run_receipt_recorded": True,
+            "zero_run_decision": "incomplete",
+            "zero_run_basis": "route down at start",
+        },
+    )
+    tools = _tools(ctx, ["delegate_start", "verify_and_record"])
+    assert _nanny_finalization_message(tools, drive, "actor-zr") == ""
 
 
 def test_actor_first_plain_finalization_requires_typed_zero_run_or_leaf(tmp_path):
@@ -358,7 +382,6 @@ def test_actor_first_plain_finalization_requires_typed_zero_run_or_leaf(tmp_path
     ctx = SimpleNamespace(
         _nanny_route_dispatched=True,
         _nanny_finalization_injected=False,
-        _nanny_coordination_activity=True,
         task_id="actor-1",
         task_metadata={"budget_drive_root": str(drive)},
         _configured_actor_bootstrap={
@@ -473,3 +496,80 @@ def test_forced_note_never_accuses_over_unreadable_evidence(tmp_path):
         assert "NOTE:" not in _forced_run(tmp_path, True, [])
     finally:
         os.chmod(log_path, 0o644)
+
+
+def _configured_started_ctx(parent, child):
+    ctx = _split_root_ctx(parent, child)
+    ctx._configured_actor_bootstrap = {
+        "physical_started": True,
+        "exact_start_pending": False,
+        "route_available": True,
+        "selected_subagent_id": "session-a",
+        "work_order_fingerprint": "a" * 64,
+    }
+    return ctx
+
+
+def test_unreadable_custody_surfaces_the_configured_unknown_nudge(tmp_path):
+    # Final-gate delta finding (sol): the early "unreadable proves nothing"
+    # return silenced the PRODUCTION nudge for configured actors, and the
+    # fallback guidance prescribed a fresh delegate_start over custody that
+    # may hide a live or settled leaf. Both shapes ride the real read: a
+    # custody log made unreadable on disk.
+    import os
+    import platform
+
+    import pytest
+
+    from ouroboros import delegate_custody as custody
+    from ouroboros.loop import _nanny_finalization_message
+
+    if platform.system() == "Windows":
+        pytest.skip("chmod-based permission test not portable to Windows")
+    if os.geteuid() == 0:  # pragma: no cover — only hit in root CI
+        pytest.skip("root user bypasses 0o000 chmod, cannot trigger OSError")
+    parent, child = tmp_path / "parent", tmp_path / "child"
+    for root in (parent, child):
+        (root / "logs").mkdir(parents=True)
+    ctx = _configured_started_ctx(parent, child)
+    root = custody.custody_root(ctx)
+    assert custody.emit(root, custody.STARTED, {
+        "run_id": "run-x", "task_id": "child-x", "route": "claude", "max_seconds": 300,
+    })
+    log_path = custody.event_log_path(root)
+    os.chmod(log_path, 0)
+    try:
+        message = _nanny_finalization_message(
+            _tools(ctx, ["delegate_start", "delegate_wait"]), child, "child-x",
+        )
+    finally:
+        os.chmod(log_path, 0o600)
+    assert "CONFIGURED_ACTOR_UNKNOWN" in message
+    assert "UNREADABLE" in message
+    # Never a fresh-start recipe over a possibly-live leaf, never an accusation.
+    assert "Start the exact assigned session now" not in message
+    assert "NANNY_DID_NOT_DELEGATE" not in message
+
+
+def test_evidence_reader_crash_surfaces_the_configured_unknown_nudge(tmp_path, monkeypatch):
+    from ouroboros import delegate_evidence as evidence_mod
+    from ouroboros.loop import _nanny_finalization_message
+
+    parent, child = tmp_path / "parent", tmp_path / "child"
+    for root in (parent, child):
+        (root / "logs").mkdir(parents=True)
+
+    def _boom(_root, _tid):
+        raise OSError("custody log unreadable")
+
+    # One reader, re-exported by delegate_custody: patch the defining module.
+    monkeypatch.setattr(evidence_mod, "task_execution_evidence", _boom)
+    monkeypatch.setattr(
+        "ouroboros.delegate_custody.task_execution_evidence", _boom,
+    )
+    ctx = _configured_started_ctx(parent, child)
+    message = _nanny_finalization_message(
+        _tools(ctx, ["delegate_start", "delegate_wait"]), child, "child-x",
+    )
+    assert "CONFIGURED_ACTOR_UNKNOWN" in message
+    assert "Start the exact assigned session now" not in message

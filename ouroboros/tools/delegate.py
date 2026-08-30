@@ -659,12 +659,12 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     if selector_refusal:
         return selector_refusal
     if _deadline_expired(ctx):
-        # An EXPIRED nanny cannot honestly bound anything; refused pre-daemon.
+        # EXPIRED pre-daemon; definitely_unrun = the producer's own no-run verdict (P2).
         return _fail(
             "delegate_start", "task_deadline_expired",
             "This task's deadline has already passed, so a delegated run started now "
             "would outlive it by design. Finalize with what you have — do not start "
-            "new work a deadline has already closed.",
+            "new work a deadline has already closed.", definitely_unrun=True,
         )
 
     drive = custody.custody_root(ctx)
@@ -758,7 +758,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 "The delegated route cannot run now. This is a typed blocker: do NOT "
                 "silently fall back onto metered API spend — decide explicitly "
                 "(wait for the reset, deliver partial work, or ask the parent).",
-                executor="blocked", reset_at=resolution.reset_at, route=route.route_id,
+                executor="blocked", reset_at=resolution.reset_at, route=route.route_id, definitely_unrun=True,
             )
 
         if not recovering:
@@ -859,7 +859,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 "The durable start-request row could not be written, so the run was "
                 "NOT started: a run launched without its custody trail would be "
                 "unfindable if this worker died. Fix the drive/event log and retry.",
-                **_retire_orphaned_registration(ctx, gateway, owned_project_id,
+                **({"definitely_unrun": True} if not recovering else {}), **_retire_orphaned_registration(ctx, gateway, owned_project_id,
                                                 definite_refusal=not recovering,
                                                 reason="start_request_row_unwritable",
                                                 invocation_id=invocation_id,
@@ -1456,20 +1456,21 @@ def get_tools() -> List[ToolEntry]:
                 "host, so verification receipts are still yours to write. If no route is "
                 "configured or it is unavailable you get a typed refusal: choose an "
                 "explicit configured alternative, wait, narrow, or report blocked. A direct "
-                "fresh start requires subagent_id. In an actor-first configured session the "
-                "host already froze the route and canonical work order: call delegate_start(prompt='') or "
-                "put only optional advisory coordination context in prompt; do not copy the canonical brief. Recovery retries use retry_of without a new selector."
+                "fresh start requires subagent_id. In a configured session the host already STARTED the exact "
+                "leaf before your first round (the startup receipt carries its run id): never start a duplicate — "
+                "supervise it; a replacement delegate_start(prompt='') is legal only after verified cancellation/"
+                "terminal settlement or a typed refusal proving no run exists. Recovery retries use retry_of without a new selector."
             ),
             "parameters": {
                 "type": "object",
                 "required": ["prompt"],
                 "properties": {
                 "prompt": {"type": "string", "description":
-                    "Complete task for a direct start; for an actor-first snapshotted session, "
-                    "only optional advisory coordination context (the host supplies the canonical work order)."},
+                    "Complete task for a direct start; for the configured snapshotted session (retry/"
+                    "replacement), only optional advisory coordination context — the host supplies the canonical work order."},
                 "subagent_id": {"type": "string", "description":
                     "Required for a fresh start made directly: exact agent_session actor id from Available "
-                    "subagents. Omit for the current actor-first snapshotted route and for retry_of. API actor ids are refused here "
+                    "subagents. Omit for the current configured snapshotted route and for retry_of. API actor ids are refused here "
                     "and must be scheduled as recursive children."},
                 "root": {"type": "string", "enum": ["skill_payload"], "description":
                     "Optional exact-resource selector: 'skill_payload' delegates ONE "

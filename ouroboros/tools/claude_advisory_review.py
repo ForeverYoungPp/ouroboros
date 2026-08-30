@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import pathlib
-import re
 import subprocess
 from typing import List, Optional
 
@@ -49,12 +47,11 @@ from ouroboros.tools.review_helpers import (
     build_scope_section,
     check_worktree_readiness,
     check_worktree_version_sync as _check_worktree_version_sync_shared,
-    parse_changed_paths_from_porcelain,
     CRITICAL_FINDING_CALIBRATION,
     REVIEW_SEVERITY_THRESHOLDS,
     REVIEW_THOROUGHNESS_BLOCK,
     get_advisory_runtime_diagnostics as _get_runtime_diagnostics,
-    format_advisory_sdk_error as _format_advisory_error,
+    format_advisory_error as _format_advisory_error,
     load_governance_doc,
     normalize_reviewer_obligation_id,
     strip_obligation_suffix,
@@ -165,126 +162,14 @@ def _get_changed_file_list(
         return f"⚠️ ADVISORY_ERROR: git status error: {exc}"
 
 
-def _changed_paths(repo_dir: pathlib.Path, paths: list[str] | None = None) -> list[str]:
-    status_text = _get_changed_file_list(repo_dir, paths=paths)
-    if status_text.startswith("⚠️ ADVISORY_ERROR"):
-        return []
-    return parse_changed_paths_from_porcelain(status_text)
-
-
-def _auto_sync_release_metadata_if_needed(
-    ctx: ToolContext,
-    repo_dir: pathlib.Path,
-    drive_root: pathlib.Path,
-    paths: list[str] | None,
-) -> list[str]:
-    """Sync VERSION-derived carriers before advisory snapshot hashing."""
-    selected = set(str(p) for p in (paths or []) if str(p).strip())
-    touched = set(_changed_paths(repo_dir))
-    if "VERSION" not in selected and "VERSION" not in touched:
-        return []
-    try:
-        from ouroboros.tools.release_sync import sync_release_metadata
-        changed = list(sync_release_metadata(str(repo_dir)) or [])
-        if changed:
-            subprocess.run(
-                ["git", "add", "--", *changed],
-                cwd=str(repo_dir),
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-            append_jsonl(drive_root / "logs" / "events.jsonl", {
-                "ts": utc_now_iso(),
-                "type": "release_metadata_auto_synced",
-                "changed_files": changed,
-                "task_id": str(getattr(ctx, "task_id", "") or ""),
-            })
-        return changed
-    except Exception as exc:
-        log.debug("release metadata auto-sync failed (non-fatal): %s", exc, exc_info=True)
-        return []
-
-
-def _release_metadata_preflight(
-    repo_dir: pathlib.Path,
-    commit_message: str,
-    paths: list[str] | None,
-) -> Optional[str]:
-    """Cheap P9/release checks over the current worktree before advisory SDK."""
-    touched = set(str(p) for p in (paths or []) if str(p).strip()) | set(_changed_paths(repo_dir, paths=paths))
-    version_in_scope = "VERSION" in touched
-    if touched and not version_in_scope:
-        return (
-            "⚠️ PREFLIGHT_BLOCKED: Changed files are present but VERSION is not in scope.\n"
-            "  BIBLE.md P9 requires every commit to bump VERSION and sync release artifacts.\n"
-            "  Stage or include VERSION plus pyproject.toml, web/package.json, README.md, and docs/ARCHITECTURE.md before advisory review.\n"
-            f"  Currently changed/in-scope: {', '.join(sorted(touched)) or '(none)'}"
-        )
-    if not version_in_scope:
-        return None
-    try:
-        from ouroboros.tools.release_sync import (
-            check_history_limit,
-            is_release_version,
-            version_carrier_desyncs,
-        )
-        version_path = repo_dir / "VERSION"
-        readme_path = repo_dir / "README.md"
-        pyproject_path = repo_dir / "pyproject.toml"
-        uv_lock_path = repo_dir / "uv.lock"
-        web_package_path = repo_dir / "web" / "package.json"
-        arch_path = repo_dir / "docs" / "ARCHITECTURE.md"
-        api_types_path = repo_dir / "web" / "modules" / "api_types.js"
-        site_install_path = repo_dir / "site" / "install" / "index.html"
-        docs_install_path = repo_dir / "docs" / "install" / "index.html"
-        version_str = version_path.read_text(encoding="utf-8").strip()
-        if not is_release_version(version_str):
-            return None
-        pyproject_text = pyproject_path.read_text(encoding="utf-8") if pyproject_path.exists() else ""
-        uv_lock_text = uv_lock_path.read_text(encoding="utf-8") if uv_lock_path.exists() else ""
-        web_package_text = web_package_path.read_text(encoding="utf-8") if web_package_path.exists() else ""
-        readme_text = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
-        arch_text = arch_path.read_text(encoding="utf-8") if arch_path.exists() else ""
-        api_types_text = api_types_path.read_text(encoding="utf-8") if api_types_path.exists() else ""
-        desync = version_carrier_desyncs(
-            version_str,
-            pyproject_text=pyproject_text,
-            uv_lock_text=uv_lock_text,
-            web_package_text=web_package_text,
-            readme_text=readme_text,
-            arch_text=arch_text,
-            api_types_text=api_types_text,
-            download_readme_text=readme_text,
-            site_install_text=(site_install_path.read_text(encoding="utf-8") if site_install_path.exists() else ""),
-            docs_install_text=(docs_install_path.read_text(encoding="utf-8") if docs_install_path.exists() else ""),
-            detailed=True,
-        )
-        if readme_text:
-            if not re.search(r'\|\s*' + re.escape(version_str) + r'\s*\|', readme_text):
-                return (
-                    f"⚠️ PREFLIGHT_BLOCKED: VERSION is {version_str} but README.md "
-                    "changelog has no table row for this version.\n"
-                    "  Add a changelog entry in the Version History table in README.md before advisory review."
-                )
-            limit_warnings = check_history_limit(readme_text)
-            if limit_warnings:
-                return (
-                    "⚠️ PREFLIGHT_BLOCKED: README.md Version History exceeds BIBLE.md P9 limits.\n"
-                    + "".join(f"  - {w}\n" for w in limit_warnings)
-                    + "  Trim the oldest entry in the over-limit category before advisory review."
-                )
-        if desync:
-            return (
-                f"⚠️ PREFLIGHT_BLOCKED: VERSION file says {version_str} but "
-                "the following worktree files have a different version value:\n"
-                + "".join(f"  - {d}\n" for d in desync)
-                + "Run release metadata sync before advisory review."
-            )
-    except Exception:
-        return None
-    return None
+# Deterministic admission preflights moved to ouroboros/commit_admission.py
+# (Q3=A SSOT). The module-level aliases below are this gate's monkeypatch
+# seams — the gate calls them through these names.
+from ouroboros.commit_admission import (  # noqa: E402
+    auto_sync_release_metadata_if_needed as _auto_sync_release_metadata_if_needed,
+    release_metadata_preflight as _release_metadata_preflight,
+    syntax_preflight_staged_py_files as _syntax_preflight_staged_py_files,
+)
 
 
 def _build_blocking_history_section(drive_root: pathlib.Path, repo_key: str = "") -> str:
@@ -418,7 +303,7 @@ def _build_advisory_prompt(
         role_title = "You are performing an advisory SKILL review for Ouroboros."
         role_requirements = (
             "- Review the supplied skill payload using the Skill Review Checklist.\n"
-            "- Use ONLY Read, Grep, Glob tools. Do NOT edit or execute any files.\n"
+            "- Use ONLY the read-only inspection tools you are given (read_file, list_files, search_code, query_code, vcs_status, vcs_diff). Do NOT edit or execute any files. Read LARGE files in bounded chunks (read_file supports offset/limit).\n"
             "- The payload pack is already included below; use tools only for host-code cross-checks.\n"
             "- Return ONLY a JSON array. No prose, no markdown fences — only the JSON array."
         )
@@ -432,12 +317,12 @@ def _build_advisory_prompt(
         role_title = "You are performing a pre-commit review of an Ouroboros self-modifying AI agent codebase."
         role_requirements = (
             "- Review the current working tree changes with the SAME RIGOR as the downstream blocking reviewers.\n  A false PASS here wastes an entire blocking review cycle ($10+).\n"
-            "- Use ONLY Read, Grep, Glob tools. Do NOT edit or execute any files.\n"
-            "- Read the FULL CONTENT of every changed file listed below using the Read tool.\n  Do NOT evaluate security, bible compliance, or code quality from path listings or diff hunks alone.\n"
+            "- Use ONLY the read-only inspection tools you are given (read_file, list_files, search_code, query_code, vcs_status, vcs_diff). Do NOT edit or execute any files. Read LARGE files in bounded chunks (read_file supports offset/limit).\n"
+            "- Read the FULL CONTENT of every changed file listed below with read_file.\n  Do NOT evaluate security, bible compliance, or code quality from path listings or diff hunks alone.\n"
             "- Return ONLY a JSON array. No prose, no markdown fences — only the JSON array."
         )
         step_instructions = (
-            "1. Read the FULL content of every changed file using the Read tool. Do not skip any file.\n"
+            "1. Read the FULL content of every changed file with read_file. Do not skip any file.\n"
             "2. Check EVERY item from the \"Repo Commit Checklist\" — do not stop after the first issue.\n"
             "3. Pay equal attention to EVERY checklist item listed below — do not favour early items.\n   bible_compliance and security_issues must be evaluated at the same strictness as the\n   downstream blocking reviewers.\n"
             "4. Look for ALL bugs, logic errors, regressions, race conditions, and violations of BIBLE.md or DEVELOPMENT.md.\n"
@@ -482,7 +367,7 @@ def _build_advisory_prompt(
         f"{arch_doc}\n\n{skill_host_context}\n\n{blocking_history}\n\n"
         f"## Commit message\n\n{commit_message}\n\n"
         f"## Changed files (git status --porcelain)\n\n{changed_files}\n\n"
-        "## Current touched files (full content — read these with the Read tool for deeper inspection)\n\n"
+        "## Current touched files (full content — read these with read_file for deeper inspection)\n\n"
         f"{touched_pack}\n{omitted_note}\n\n"
         f"## Staged diff\n\n{diff}\n\n"
         f"## Step-by-step instructions\n{step_instructions}\n"
@@ -596,7 +481,7 @@ def _check_expected_items(items: list, expected_items: Optional[List[str]]) -> t
     # occurrence BEFORE the contract comparison. Single-row items keep their
     # multiplicity, so a genuine duplicate of e.g. permissions_honesty still warns.
     # Without this, a valid multi-bug advisory falsely triggered duplicates=/count=
-    # contract warnings and got marked advisory_sdk_suspect_result.
+    # contract warnings and got marked advisory_suspect_result.
     collapsed: List[str] = []
     seen_severity: set[str] = set()
     for item in actual:
@@ -631,61 +516,66 @@ def _check_expected_items(items: list, expected_items: Optional[List[str]]) -> t
     )
 
 
-def _syntax_preflight_staged_py_files(
-    repo_dir: pathlib.Path,
-    resolved_paths: List[str],
-) -> Optional[str]:
-    """Compile staged repo Python files before the expensive advisory SDK call."""
-    if not (repo_dir / "ouroboros" / "__init__.py").exists():
-        return None
-
-    errors: List[str] = []
-    for rel in resolved_paths:
-        if not rel.endswith(".py"):
-            continue
-        file_path = repo_dir / rel
-        try:
-            source = file_path.read_text(encoding="utf-8", errors="replace")
-        except FileNotFoundError:
-            continue
-        except OSError:
-            continue
-        try:
-            compile(source, rel, "exec", dont_inherit=True)
-        except SyntaxError as exc:
-            line = getattr(exc, "lineno", None) or "?"
-            msg = getattr(exc, "msg", None) or str(exc)
-            errors.append(f"{rel}:{line}: {msg}")
-        except ValueError as exc:
-            # Null bytes and tokenizer rejects are syntax preflight blockers too.
-            errors.append(f"{rel}:?: {exc}")
-
-    if not errors:
-        return None
-
-    return (
-        "⚠️ PREFLIGHT_BLOCKED: syntax errors:\n"
-        + "\n".join(f"- {err}" for err in errors)
-        + "\n\nFix the syntax error(s) above and re-run advisory_review. "
-        "Claude SDK advisory was skipped to save budget."
-    )
-
-
 ADVISORY_REVIEW_ROUTE_ENV = "OUROBOROS_ADVISORY_REVIEW_ROUTE"
 _ADVISORY_SESSION_MAX_SECONDS = 900  # the nanny's time cap replaces the SDK budget kill
 
 
 def advisory_review_route() -> str:
-    """The advisory delivery route: ``api`` (Claude Agent SDK, needs the key)
-    or ``agent_session`` (a delegated Claudexor run, needs no key). An unknown
-    token raises — a typo must fail loudly, never silently pick a transport.
+    """The advisory delivery kind on the shared closed vocabulary: ``api_chat``
+    (the bounded NATIVE inspection episode on a routed model — the retired
+    Claude-SDK transport's successor; advisory never receives an assembled
+    packet) or ``agent_session`` (a delegated Claudexor run). An unknown token
+    raises — a typo must fail loudly, never silently pick a transport.
 
     Reads the reviewer-slot SSOT (6.1): the structured advisory row when the
     owner saved one, the legacy ``OUROBOROS_ADVISORY_REVIEW_ROUTE`` env
     otherwise (the SSOT's own migration read)."""
+    from ouroboros.reviewer_slot_config import ROUTE_KIND_SESSION, advisory_slot_config
+
+    return (
+        "agent_session"
+        if advisory_slot_config().kind == ROUTE_KIND_SESSION
+        else "api_chat"
+    )
+
+
+def _same_model_payable_spelling(model: str) -> str:
+    """``model`` on a spelling this install can actually pay.
+
+    The given id when its provider has credentials; otherwise the SAME model
+    through its direct-provider spelling (``provider/name`` →
+    ``provider::name`` — the direct-install class, e.g. an Anthropic-key-only
+    install with an OpenRouter catalog id); otherwise the id unchanged — the
+    credentials gate then records its loud audited bypass instead of a silent
+    one. Never a different model: an unpayable row is bypassed, not swapped.
+    """
+    from ouroboros.provider_models import model_has_credentials
+
+    model = str(model or "").strip()
+    if not model or model_has_credentials(model):
+        return model
+    provider, _, name = model.partition("/")
+    direct = f"{provider}::{name}" if name else ""
+    if direct and model_has_credentials(direct):
+        return direct
+    return model
+
+
+def _advisory_default_model() -> str:
+    """The shipped advisory default on a route this install can actually pay."""
+    from ouroboros.provider_models import OPENROUTER_REVIEW_DEFAULTS
+
+    return _same_model_payable_spelling(str(OPENROUTER_REVIEW_DEFAULTS["advisory"]))
+
+
+def _advisory_native_model() -> str:
+    """The routed model the native advisory episode will run on."""
     from ouroboros.reviewer_slot_config import advisory_slot_config
 
-    return "api" if advisory_slot_config().kind == "api" else "agent_session"
+    configured = (advisory_slot_config().target_id or "").strip()
+    if configured:
+        return _same_model_payable_spelling(configured)
+    return _advisory_default_model()
 
 
 def advisory_slot_enabled() -> bool:
@@ -708,13 +598,6 @@ def _advisory_child_timeout(ctx: object) -> Optional[float]:
     )
 
 
-def advisory_route_requires_api_key() -> bool:
-    """Whether THIS advisory route needs ANTHROPIC_API_KEY (plan 5.8: the four
-    key checks are route-dependent — an api route requires the key exactly as
-    before; the delegated route runs without it)."""
-    return advisory_review_route() == "api"
-
-
 def advisory_gate_unavailability_reason() -> str | None:
     """Why the advisory cannot run, or ``None`` when it is available.
 
@@ -728,9 +611,21 @@ def advisory_gate_unavailability_reason() -> str | None:
     authority over its own fail direction.
     """
     if not advisory_slot_enabled():
-        return "advisory_slot_disabled"
-    if advisory_route_requires_api_key():
-        return None if os.environ.get("ANTHROPIC_API_KEY", "") else "anthropic_api_key_missing"
+        # A migration force-disable is NOT a standing owner choice: surface
+        # the parser's typed reason so the two states never conflate (a
+        # legacy Claude-SDK target that could not be mapped reads as exactly
+        # that, not as "the owner switched advisory off").
+        from ouroboros.reviewer_slot_config import advisory_slot_config
+
+        _reason = str(getattr(advisory_slot_config(), "disabled_reason", "") or "")
+        return f"advisory_slot_disabled:{_reason}" if _reason else "advisory_slot_disabled"
+    if advisory_review_route() == "api_chat":
+        from ouroboros.provider_models import model_has_credentials
+
+        return (
+            None if model_has_credentials(_advisory_native_model())
+            else "advisory_model_credentials_missing"
+        )
     # Delegated route: mirror the runner's resolution order — the slot's own
     # target when it parses, else the shared session route; None there is a
     # typed refusal at run time, so None here is UNAVAILABLE at gate time.
@@ -754,185 +649,154 @@ def advisory_gate_unavailable() -> bool:
     return advisory_gate_unavailability_reason() is not None
 
 
-def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContext):
-    """The advisory as a delegated Claudexor session, rehydrated into the same
-    result structure the SDK path produces (5.8: only the transport changes).
+def _run_advisory_native(
+    prompt: str, repo_dir: pathlib.Path, ctx: ToolContext, slot, model: str,
+):
+    """The advisory as a bounded native inspection episode, rehydrated into the
+    same result structure the retired SDK path produced (only the transport
+    changes). Cost: every provider call already rode the usage ledger inside
+    the rebound scope, so ``cost_usd`` stays 0.0 here — the ledger is the one
+    charge source; the disclosed total rides ``usage`` for forensics."""
+    from dataclasses import replace as _dc_replace
+    from types import SimpleNamespace
 
-    Runs through the ONE shared delegated-session runner (no second nanny
-    loop). The SDK-side budget kill is lost by construction; the runner's time
-    cap is the nanny-enforced bound. The narrative fallback is unchanged: the
-    existing advisory extractor already canonicalizes non-JSON output (D19).
-    Cost: the run settles through delegate_custody (the subscription-session
-    ledger row); ``cost_usd`` stays 0.0 here so the SDK-path usage emit cannot
-    double-count, and the disclosed spend rides ``usage`` for forensics."""
+    from ouroboros.llm import LLMClient
+    from ouroboros.review_execution import ReviewAssignment, ReviewRouteKind
+    from ouroboros.review_native_episode import NativeToolRoundReviewExecutor
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope, current_usage_scope, usage_scope
+
+    _task_metadata = getattr(ctx, "task_metadata", {}) or {}
+    deadline_at = (
+        str(_task_metadata.get("deadline_at") or "")
+        if isinstance(_task_metadata, dict) else ""
+    )
+    request = ReviewRequest(
+        surface="advisory_review",
+        goal="Advisory pre-review of the live worktree.",
+        task_id=str(getattr(ctx, "task_id", "") or ""),
+        session_root=str(repo_dir),
+        session_task=prompt,
+        policy={"output_contract": (
+            "A JSON array of checklist entries: "
+            '[{"item": str, "verdict": "PASS"|"FAIL", "severity": '
+            '"critical"|"advisory", "reason": str, "obligation_id"?: str}]'
+        )},
+        no_proxy=True,
+        deadline_at=deadline_at,
+    )
+    rslot = ReviewSlot(
+        slot_id="advisory_slot_1", model=model, effort=slot.effort or "low",
+        role_hint="advisory pre-reviewer", route=ReviewRouteKind.API_CHAT,
+        subagent_id=str(getattr(slot, "subagent_id", "") or ""),
+    )
+    assignment = ReviewAssignment(
+        request=request, slot=rslot,
+        call_id=f"advisory:{request.task_id or 'manual'}",
+    )
+    executor = NativeToolRoundReviewExecutor(assignment, llm=LLMClient())
+    _scope = _dc_replace(
+        current_usage_scope() or UsageScope(),
+        category="advisory_review", source="advisory_native",
+    )
+    try:
+        with usage_scope(_scope):
+            attempt = executor.execute()
+    except Exception as exc:
+        return SimpleNamespace(
+            success=False, result_text="(no output)", session_id="", cost_usd=0.0,
+            usage={}, error=f"{type(exc).__name__}: {exc}", stderr_tail="",
+        ), model
+    usage = dict(attempt.usage or {})
+    usage["cost_disclosed_usd"] = usage.get("cost")
+    return SimpleNamespace(
+        success=True,
+        result_text=str(attempt.raw_text or ""),
+        session_id="",
+        cost_usd=0.0,  # ledger rows are the charge source; never re-emitted
+        usage=usage,
+        error="",
+        stderr_tail="",
+    ), str(usage.get("resolved_model") or model)
+
+
+def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContext):
+    """The advisory as a delegated agent session on the SHARED executor seam.
+
+    One substrate executor (``AgentSessionReviewExecutor``) owns the session:
+    route resolution, the pre-POST durable invocation checkpoint and retry
+    custody, D19 verdict canonicalization, and the capability-delta
+    disclosure vocabulary — the advisory adds NOTHING transport-shaped of its
+    own (phase C unification, owner decision 2=B, 2026-08-30). Cost: the run
+    settles through delegate_custody (the subscription-session ledger row);
+    ``cost_usd`` stays 0.0 here so nothing double-counts, and the disclosed
+    spend rides ``usage`` for forensics."""
     from types import SimpleNamespace
 
     from ouroboros.delegate_custody import custody_root
+    from ouroboros.llm import LLMClient
     from ouroboros.review_execution import (
-        SessionInvocation,
-        review_session_output_schema,
-        run_delegated_review_session,
+        AgentSessionReviewExecutor,
+        ReviewAssignment,
+        ReviewRouteKind,
     )
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
+    from ouroboros.reviewer_slot_config import advisory_slot_config
 
+    _slot = advisory_slot_config()
+    _task_metadata = getattr(ctx, "task_metadata", {}) or {}
+    deadline_at = (
+        str(_task_metadata.get("deadline_at") or "")
+        if isinstance(_task_metadata, dict) else ""
+    )
+    request = ReviewRequest(
+        surface="advisory_review",
+        goal="Advisory pre-review of the live worktree.",
+        task_id=str(getattr(ctx, "task_id", "") or ""),
+        session_root=str(repo_dir),
+        session_task=prompt,
+        policy={"output_contract": (
+            "A JSON array of checklist entries: "
+            '[{"item": str, "verdict": "PASS"|"FAIL", "severity": '
+            '"critical"|"advisory", "reason": str, "obligation_id"?: str}]'
+        )},
+        no_proxy=True,
+        deadline_at=deadline_at,
+    )
+    rslot = ReviewSlot(
+        slot_id="advisory_slot_1", model=_slot.target_id or "",
+        effort=str(_slot.effort or ""), role_hint="advisory pre-reviewer",
+        route=ReviewRouteKind.AGENT_SESSION,
+        session_target=str(_slot.target_id or ""),
+        session_profile=str(getattr(_slot, "profile_id", "") or ""),
+        timeout_sec=_ADVISORY_SESSION_MAX_SECONDS,
+        subagent_id=str(getattr(_slot, "subagent_id", "") or ""),
+    )
+    drive = custody_root(ctx) if getattr(ctx, "drive_root", None) else pathlib.Path(repo_dir)
+    assignment = ReviewAssignment(
+        request=request, slot=rslot,
+        call_id=f"advisory:{request.task_id or 'manual'}",
+        custody_root=drive,
+    )
+    executor = AgentSessionReviewExecutor(assignment, llm=LLMClient())
     try:
-        # The advisory row's own target/effort (6.1); None keeps the shared
-        # session-route fallback inside the runner.
-        import dataclasses as _dc
-
-        from ouroboros.reviewer_slot_config import advisory_slot_config
-        from ouroboros.subagents import parse_subagent_harness
-        from ouroboros.config import get_finalization_grace_sec
-        from ouroboros.deadline_utils import review_operation_timeout_sec
-
-        _slot = advisory_slot_config()
-        _session_route = parse_subagent_harness(_slot.target_id) if _slot.target_id else None
-        _task_metadata = getattr(ctx, "task_metadata", {}) or {}
-        _owner_deadline_at = str(_task_metadata.get("deadline_at") or "") if isinstance(
-            _task_metadata, dict
-        ) else ""
-        # D1/6.3: the effort field is the ONE source; any effort embedded in the
-        # target identity is dropped so it can never override the field.
-        if _session_route is not None:
-            _session_route = _dc.replace(_session_route, effort=str(_slot.effort or ""))
-        if _session_route is not None and getattr(_slot, "profile_id", ""):
-            _session_route = _dc.replace(_session_route, profile_id=_slot.profile_id)
-        drive = custody_root(ctx) if getattr(ctx, "drive_root", None) else pathlib.Path(repo_dir)
-        facts = run_delegated_review_session(
-            prompt=prompt,
-            root=str(repo_dir),
-            custody_drive=drive,
-            invocation=SessionInvocation(
-                task_id=str(getattr(ctx, "task_id", "") or ""),
-                surface="advisory_review",
-                slot_id="advisory_slot_1",
-                timeout_sec=review_operation_timeout_sec(
-                    _ADVISORY_SESSION_MAX_SECONDS,
-                    route="agent_session",
-                    deadline_at=_owner_deadline_at,
-                    reserve_sec=get_finalization_grace_sec(),
-                ),
-                owner_deadline_at=_owner_deadline_at,
-                # The owner's configured advisory slot route (6.1 SSOT) rides the
-                # invocation — the one identity+delivery value — not a parallel kwarg.
-                session_route=_session_route,
-                # The structured verdict is ASKED here exactly as the substrate's
-                # session slots ask for it (D19): a review surface that never asks can
-                # only reach its verdict through extraction, paying a light-model call
-                # and a capability delta for what the route may support natively.
-                output_schema=review_session_output_schema("advisory_review"),
-            ),
-        )
+        attempt = executor.execute()
     except Exception as exc:
         return SimpleNamespace(
             success=False, result_text="(no output)", session_id="", cost_usd=0.0,
             usage={}, error=f"{type(exc).__name__}: {exc}", stderr_tail="",
         ), ""
-    spend_final = facts["spend"] if (facts["spend"] is not None and not facts["spend_estimated"]) else None
-    result_text = str(facts["text"] or "")
-    if facts.get("conformance") == "passed":
-        # A schema-conformant session answers with the SESSION envelope
-        # ({"findings": [...]}) while every advisory consumer downstream — the
-        # strict parser, the clean-verdict sentinel, the fallback gate — reads the
-        # advisory's own ARRAY contract. Unwrap the trusted envelope here (D19's
-        # schema-first ordering), so a clean {"findings": []} lands as the bare
-        # "[]" the contract calls clean instead of as a paid extraction and a
-        # parse_failure. Non-conformant output keeps its narrative path unchanged.
-        from ouroboros.review_execution import _findings_array
-
-        try:
-            payload = json.loads(result_text.strip())
-        except (TypeError, ValueError):
-            payload = None
-        findings = _findings_array(payload)
-        if findings is not None:
-            result_text = "[]" if not findings else json.dumps(findings, ensure_ascii=False)
+    usage = dict(attempt.usage or {})
+    resolved_model = str(usage.get("resolved_model") or usage.get("delegated_route") or "")
     return SimpleNamespace(
         success=True,
-        result_text=result_text,
-        session_id=facts["run_id"],
+        result_text=str(attempt.raw_text or ""),
+        session_id=str(usage.get("delegated_run_id") or ""),
         cost_usd=0.0,  # settled by delegate_custody; never re-emitted here
-        usage={
-            "delegated_run_id": facts["run_id"],
-            "delegated_route": facts["route_id"],
-            "cost_disclosed_usd": facts["spend"],
-            "cost_estimated": facts["spend_estimated"],
-            "cost_final_usd": spend_final,
-            "settlement": facts["settlement"],
-            # The structured-verdict facts the substrate's slots also carry: whether
-            # the schema was asked at all, what the run reported, and which route(s)
-            # actually served it. Conformance is TRUSTED only on "passed" — never on
-            # run success (D19).
-            "schema_asked": bool(facts.get("schema_asked")),
-            "output_conformance": facts.get("conformance") or "",
-            "conformance_trusted": (facts.get("conformance") == "passed"),
-            "effective_route_ids": list(facts.get("effective_route_ids") or []),
-            "capability_delta": _advisory_session_deltas(facts),
-        },
+        usage=usage,
         error="",
         stderr_tail="",
-    ), str(facts["model"] or facts["route_id"])
-
-
-def _advisory_session_deltas(facts: dict) -> List[dict]:
-    """The same three landings-below-the-ask the substrate discloses (D4).
-
-    Same vocabulary as ``AgentSessionReviewExecutor``, so one disclosure contract
-    covers every delegated review surface instead of two dialects."""
-    route_id = str(facts.get("route_id") or "")
-    conformance = str(facts.get("conformance") or "")
-    deltas: List[dict] = []
-    if not facts.get("schema_asked"):
-        deltas.append({
-            "kind": "capability_delta",
-            "requested": "outputSchema (structured verdict)",
-            "effective": f"no structured output on effective route {route_id}",
-            "reason": "schema_unavailable_on_effective_route",
-        })
-    elif conformance != "passed":
-        deltas.append({
-            "kind": "capability_delta",
-            "requested": "outputSchema (structured verdict)",
-            "effective": f"outputConformance={conformance or 'absent'}",
-            "reason": "schema_not_conformed_on_effective_route",
-        })
-    effective = [str(r) for r in (facts.get("effective_route_ids") or [])]
-    if effective and set(effective) != {route_id}:
-        deltas.append({
-            "kind": "capability_delta",
-            "requested": f"route {route_id} (pinned pool)",
-            "effective": "route(s) " + ", ".join(effective),
-            "reason": "session_ran_off_pinned_route",
-        })
-    return deltas
-
-
-def _advisory_sdk_budget(ctx: ToolContext, active_scope, drive_root, repo_dir) -> Optional[float]:
-    """Remaining budget headroom for the SDK route's hard kill (api route only;
-    the delegated route's bound is the nanny's time cap)."""
-    from ouroboros.usage_accounting import usage_projection
-
-    budget_root = pathlib.Path(
-        drive_root
-        or getattr(ctx, "budget_drive_root", "")
-        or getattr(active_scope, "drive_root", "")
-        or getattr(ctx, "drive_root", "") or repo_dir
-    )
-    root_id = str(
-        (getattr(ctx, "task_metadata", {}) or {}).get("root_task_id")
-        or getattr(active_scope, "root_task_id", "")
-        or getattr(ctx, "task_id", "")
-        or ""
-    )
-    caps: List[float] = []
-    global_limit = getattr(active_scope, "global_limit_usd", None)
-    root_limit = getattr(active_scope, "root_limit_usd", None)
-    if global_limit is not None:
-        global_projection = usage_projection(budget_root, global_limit_usd=float(global_limit))
-        caps.append(max(0.0, float(global_limit) - float(global_projection.get("accounted_usd") or 0.0)))
-    if root_id and root_limit is not None:
-        root_projection = usage_projection(budget_root, root_task_id=root_id)
-        caps.append(max(0.0, float(root_limit) - float(root_projection.get("accounted_usd") or 0.0)))
-    return min(caps) if caps else None
+    ), resolved_model
 
 
 def _advisory_review_diff(
@@ -1177,7 +1041,7 @@ def _maybe_overflow_skip(
     exception (``verb="raised"``)."""
     if not _overflow_failure_text(failure, stderr_tail):
         return None
-    route_name = "agent_session" if delegated_route else "api"
+    route_name = "agent_session" if delegated_route else "native"
     log.warning(
         "Advisory skipped — %s route %s context overflow (%d chars)",
         route_name, verb, prompt_chars,
@@ -1196,6 +1060,17 @@ def _note_meta_error(ctx: ToolContext, meta: dict, err_msg: str) -> None:
         pass
 
 
+def run_advisory_critic(*args, **kwargs):
+    """Public cross-module entry for one advisory critic run (skill review).
+
+    A thin typed alias for the module-internal ``_run_claude_advisory`` so
+    other surfaces never probe private names with ``hasattr`` (a rename would
+    silently no-op their advisory forever). Same signature and return shape:
+    ``(items, raw_result, model, prompt_chars)``.
+    """
+    return _run_claude_advisory(*args, **kwargs)
+
+
 def _run_claude_advisory(
     repo_dir: pathlib.Path,
     commit_message: str,
@@ -1210,23 +1085,26 @@ def _run_claude_advisory(
         delegated_route = advisory_review_route() == "agent_session"
     except ValueError as exc:
         return [], f"⚠️ ADVISORY_ERROR: {exc}", "", 0
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    # Route-dependent (plan 5.8 site 1): the api route requires the key exactly
-    # as before; the delegated route runs on the subscription and needs none.
-    if not api_key and not delegated_route:
-        return [], "⚠️ ADVISORY_ERROR: ANTHROPIC_API_KEY not set (advisory route=api).", "", 0
+    from ouroboros.reviewer_slot_config import advisory_slot_config
+
+    _slot = advisory_slot_config()
     if delegated_route:
         model = ""  # the session route resolves its own model; reported after the run
-        _slot = None
     else:
-        from ouroboros.gateways.claude_code import resolve_claude_code_model
-        from ouroboros.reviewer_slot_config import advisory_slot_config
+        # The native episode runs on the row's routed catalog model (6.1);
+        # '' keeps the shipped routed default; either resolves through the
+        # same-model payable-spelling fallback. No provider credentials is a
+        # loud typed error here — the commit gate pre-bypasses this state
+        # (advisory_model_credentials_missing) before ever calling in.
+        from ouroboros.provider_models import model_has_credentials
 
-        # The advisory row's own target applies on the api kind too (6.1): here
-        # target_id is a Claude-SDK model spelling (sonnet, opus[1m], claude-…),
-        # NOT an OpenRouter catalog id; '' keeps today's environment default.
-        _slot = advisory_slot_config()
-        model = (_slot.target_id or "").strip() or resolve_claude_code_model()
+        model = _advisory_native_model()
+        if not model_has_credentials(model):
+            return [], (
+                f"⚠️ ADVISORY_ERROR: no provider credentials for advisory model "
+                f"{model}; add the provider key or point the advisory row at a "
+                "configured subagent / another routed model."
+            ), "", 0
     options = dict(options or {})
     drive_root = options.get("drive_root")
     include_repo_diff = bool(options.get("include_repo_diff", True))
@@ -1281,8 +1159,11 @@ def _run_claude_advisory(
                 "review_surface": review_surface,
                 "expected_items": expected_items,
             },
-            # Route-aware pack: agent_session retrieves governance docs via pointers; api inlines them.
-            governance_by_retrieval=delegated_route,
+            # Both deliveries RETRIEVE governance docs via mandatory-read
+            # pointers (the session with its own tools, the native episode with
+            # host inspection tools): the inlined multi-hundred-KB governance
+            # pack died with the Claude-SDK transport.
+            governance_by_retrieval=True,
         )
     except RuntimeError as exc:
         return [], f"⚠️ ADVISORY_ERROR: failed to build advisory prompt: {exc}", "", 0
@@ -1296,9 +1177,8 @@ def _run_claude_advisory(
         return size_skip
 
     log.info(
-        "Advisory SDK call: model=%s prompt_chars=%d touched=%s sdk=%s cli=%s",
+        "Advisory dispatch: model=%s prompt_chars=%d touched=%s",
         diag["model"], diag["prompt_chars"], diag["touched_paths"],
-        diag["sdk_version"], diag["cli_version"],
     )
 
     try:
@@ -1310,43 +1190,15 @@ def _run_claude_advisory(
             scope_effort = ""  # the session route carries its own effort
             result, model = _run_advisory_delegated(prompt, repo_dir, ctx)
         else:
-            from ouroboros.gateways.claude_code import (
-                DEFAULT_CLAUDE_CODE_MAX_TURNS,
-                run_readonly,
-            )
-            from ouroboros.config import resolve_effort
-            from ouroboros.usage_accounting import current_usage_scope
-
-            # D-5b fix: the api route runs at the ADVISORY row's own effort, the
-            # same field the delegated branch already honors — never the scope
-            # reviewer's. The parser guarantees a non-empty effort ("low"
-            # default, legacy config included), so the fallback is dead but honest.
-            scope_effort = _slot.effort or resolve_effort("scope_review")
-            active_scope = current_usage_scope()
-            max_budget_usd = options.get("max_budget_usd")
-            if max_budget_usd is None:
-                max_budget_usd = _advisory_sdk_budget(ctx, active_scope, drive_root, repo_dir)
+            # The native inspection episode (the retired Claude-SDK
+            # transport's successor): same prompt, same repo root, same result
+            # structure. The SDK budget kill is replaced by the executor's
+            # config-owned round/transcript caps; every provider call rides
+            # the ordinary usage ledger under category=advisory_review.
+            scope_effort = _slot.effort or "low"
             if owner_deadline_exhausted_for_context(ctx, reserve_sec=get_finalization_grace_sec()):
                 raise TimeoutError("owner deadline leaves no dispatch window for advisory review")
-            child_timeout_sec = _advisory_child_timeout(ctx)
-            if active_scope is not None:
-                from dataclasses import replace
-                from ouroboros.usage_accounting import usage_scope
-
-                with usage_scope(replace(
-                    active_scope, category="advisory_review", source="claude_advisory_review",
-                )):
-                    result = run_readonly(
-                        prompt=prompt, cwd=str(repo_dir), model=model,
-                        max_turns=DEFAULT_CLAUDE_CODE_MAX_TURNS,
-                        effort=scope_effort, max_budget_usd=max_budget_usd, timeout_sec=child_timeout_sec,
-                    )
-            else:
-                result = run_readonly(
-                    prompt=prompt, cwd=str(repo_dir), model=model,
-                    max_turns=DEFAULT_CLAUDE_CODE_MAX_TURNS,
-                    effort=scope_effort, max_budget_usd=max_budget_usd, timeout_sec=child_timeout_sec,
-                )
+            result, model = _run_advisory_native(prompt, repo_dir, ctx, _slot, model)
 
         meta = {
             "model": model,
@@ -1370,62 +1222,33 @@ def _run_claude_advisory(
             if skip is not None:
                 return skip
             err_msg = _format_advisory_error(
-                prefix="SDK/CLI returned failure",
+                prefix="Advisory delivery returned failure",
                 result_error=result.error,
                 stderr_tail=result.stderr_tail,
                 session_id=result.session_id,
                 diag=diag,
             )
-            log.error("Advisory SDK failure:\n%s", err_msg)
+            log.error("Advisory delivery failure:\n%s", err_msg)
             _note_meta_error(ctx, meta, err_msg)
             return [], err_msg, model, prompt_chars
 
         raw_text = str(result.result_text or "")
 
-        if result.cost_usd > 0:
-            emit_review_usage(
-                ctx,
-                model=model,
-                cost_usd=result.cost_usd,
-                usage=result.usage or {},
-                source="advisory_sdk",
-                provider="anthropic",
-                session_id=meta.get("session_id", ""),
-                prompt_chars=prompt_chars,
-            )
-
-        prompt_tokens = int((result.usage or {}).get("prompt_tokens", 0) or 0)
-        completion_tokens = int((result.usage or {}).get("completion_tokens", 0) or 0)
-        cached_tokens = int((result.usage or {}).get("cached_tokens", 0) or 0)
-        cache_write_tokens = int((result.usage or {}).get("cache_write_tokens", 0) or 0)
-        if result.cost_usd > 0 and not any((
-            prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens,
-        )):
-            emit_review_event(ctx, {
-                "type": "advisory_sdk_suspect_result",
-                "model": model,
-                "session_id": meta.get("session_id", ""),
-                "prompt_chars": prompt_chars,
-                "cost_usd": float(result.cost_usd or 0),
-                "reason": "paid advisory SDK result had zero normalized token usage",
-                "review_surface": review_surface,
-            })
-
-        if raw_text.strip() in {"", "(no output)"} and result.cost_usd > 0:
+        if raw_text.strip() in {"", "(no output)"}:
             err_msg = _format_advisory_error(
-                prefix="SDK returned paid empty output",
+                prefix="Advisory returned empty output",
                 result_error="success=True but result_text was empty",
                 stderr_tail=getattr(result, "stderr_tail", "") or "",
                 session_id=meta.get("session_id", ""),
                 diag=diag,
             )
             emit_review_event(ctx, {
-                "type": "advisory_sdk_suspect_result",
+                "type": "advisory_suspect_result",
                 "model": model,
                 "session_id": meta.get("session_id", ""),
                 "prompt_chars": prompt_chars,
                 "cost_usd": float(result.cost_usd or 0),
-                "reason": "paid advisory SDK result had empty output",
+                "reason": "advisory result had empty output",
                 "review_surface": review_surface,
             })
             _note_meta_error(ctx, meta, err_msg)
@@ -1441,14 +1264,14 @@ def _run_claude_advisory(
         contract_error, contract_warning = _check_expected_items(items, expected_items)
         if contract_error:
             err_msg = _format_advisory_error(
-                prefix="SDK returned malformed checklist",
+                prefix="Advisory returned malformed checklist",
                 result_error=contract_error,
                 stderr_tail=getattr(result, "stderr_tail", "") or "",
                 session_id=meta.get("session_id", ""),
                 diag=diag,
             )
             emit_review_event(ctx, {
-                "type": "advisory_sdk_suspect_result",
+                "type": "advisory_suspect_result",
                 "model": model,
                 "session_id": meta.get("session_id", ""),
                 "prompt_chars": prompt_chars,
@@ -1478,23 +1301,18 @@ def _run_claude_advisory(
 
         return items, raw_text, model, prompt_chars
 
-    except ImportError:
-        return [], (
-            "⚠️ ADVISORY_ERROR: claude-agent-sdk not installed. "
-            "Install: pip install 'ouroboros[claude-sdk]'"
-        ), "", 0
     except Exception as e:
         skip = _maybe_overflow_skip(ctx, delegated_route, prompt_chars, model, None, str(e), verb="raised")
         if skip is not None:
             return skip
         err_msg = _format_advisory_error(
-            prefix=f"SDK call raised {type(e).__name__}",
+            prefix=f"Advisory delivery raised {type(e).__name__}",
             result_error=str(e),
             stderr_tail="",
             session_id="",
             diag=diag,
         )
-        log.error("Advisory SDK exception:\n%s", err_msg)
+        log.error("Advisory delivery exception:\n%s", err_msg)
         return [], err_msg, model, prompt_chars
 
 
@@ -1793,7 +1611,7 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             parts.append(f"{len(open_debts)} commit-readiness debt item(s) surfaced by review_status")
         return (" ".join(parts) + ". ") if parts else ""
 
-    regroup = "After the first blocked review, stop patching one finding at a time: re-read the full diff, group obligations by root cause, rewrite the plan, finish all remaining edits, then run advisory_review(commit_message='...')."
+    regroup = "After the first blocked review, stop patching one finding at a time: re-read the full diff, group obligations by root cause, rewrite the plan, finish all remaining edits, then run preflight_review(commit_message='...')."
 
     def _with_choices(message: str) -> str:
         return f"{message.rstrip()} {ADVISORY_REVIEW_CHOICE_GUIDANCE}"
@@ -1802,11 +1620,11 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
         status = str(getattr(latest, "status", "") or "")
         if latest and status in {"tests_preflight_blocked", "preflight_blocked"} and not stale_from_edit:
             if status == "tests_preflight_blocked":
-                problem = "test preflight: pytest failed before the Claude SDK call"
-                fix = "Fix the failing tests and re-run advisory_review. Use advisory_review(skip_tests=True) only for intentional WIP code."
+                problem = "test preflight: pytest failed before the paid critic call"
+                fix = "Fix the failing tests and re-run preflight_review. Use preflight_review(skip_tests=True) only for intentional WIP code."
             else:
                 problem = "syntax preflight: a staged .py file has a SyntaxError"
-                fix = "See raw_result for file:line:msg, fix it, and re-run advisory_review."
+                fix = "See raw_result for file:line:msg, fix it, and re-run preflight_review."
             return _with_choices(
                 f"Last advisory run was blocked by {problem}. {fix} {_debt_hint()}".strip()
             )
@@ -1814,7 +1632,7 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             suffix = (
                 regroup + " Or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
                 if (open_obs or open_debts)
-                else "Re-run: advisory_review(commit_message='...'), or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
+                else "Re-run: preflight_review(commit_message='...'), or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
             )
             return _with_choices(
                 f"Last advisory run produced unparseable output (parse_failure). {_debt_hint()}{suffix}"
@@ -1824,20 +1642,20 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             return _with_choices(prefix + _debt_hint() + regroup)
         if stale_from_edit:
             return _with_choices(
-                f"Advisory was invalidated by a worktree edit at {stale_from_edit_ts}. Complete ALL remaining edits, then run: advisory_review(commit_message='...')"
+                f"Advisory was invalidated by a worktree edit at {stale_from_edit_ts}. Complete ALL remaining edits, then run: preflight_review(commit_message='...')"
             )
         if not state.advisory_runs:
-            return _with_choices("No advisory run yet. Run: advisory_review(commit_message='...')")
-        return _with_choices("Advisory is stale (snapshot changed). Run: advisory_review(commit_message='...')")
+            return _with_choices("No advisory run yet. Run: preflight_review(commit_message='...')")
+        return _with_choices("Advisory is stale (snapshot changed). Run: preflight_review(commit_message='...')")
 
     # Advisory is effectively fresh — check obligations and findings
     if open_obs or open_debts:
         if enforcement == "blocking":
             return _with_choices(
-                f"Advisory is current but unresolved review debt remains. {_debt_hint()}commit_reviewed will be blocked until that debt is cleared. Re-read the full diff, group obligations by root cause, and rewrite the plan. Fix the issues, re-run advisory_review so it marks them PASS, or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
+                f"Advisory is current but unresolved review debt remains. {_debt_hint()}commit_reviewed will be blocked until that debt is cleared. Re-read the full diff, group obligations by root cause, and rewrite the plan. Fix the issues, re-run preflight_review so it marks them PASS, or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
             )
         return _with_choices(
-            f"Advisory is current and unresolved review debt remains recorded durably. {_debt_hint()}Enforcement is advisory: you decide which findings to apply — commit_reviewed is available. Re-read the full diff, group obligations by root cause, and rewrite the plan; re-run advisory_review so addressed items are marked PASS."
+            f"Advisory is current and unresolved review debt remains recorded durably. {_debt_hint()}Enforcement is advisory: you decide which findings to apply — commit_reviewed is available. Re-read the full diff, group obligations by root cause, and rewrite the plan; re-run preflight_review so addressed items are marked PASS."
         )
 
     if latest and latest.status == "skipped":
@@ -1875,10 +1693,10 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             # can still block. The audited skip bypasses only the advisory
             # freshness/debt checks, never these findings.
             return _with_choices(
-                f"Advisory found {len(fresh_critical)} critical issue(s). This fresh advisory already satisfies the commit gate's advisory-freshness requirement; the findings are recorded durably on the advisory run record, and commit_reviewed is available — the blocking triad and scope reviews are the gate that can still block. Fix the critical findings and re-run advisory_review so they are marked PASS; skip_advisory_review=True (audited) bypasses only the freshness/debt checks, not these findings."
+                f"Advisory found {len(fresh_critical)} critical issue(s). This fresh advisory already satisfies the commit gate's advisory-freshness requirement; the findings are recorded durably on the advisory run record, and commit_reviewed is available — the blocking triad and scope reviews are the gate that can still block. Fix the critical findings and re-run preflight_review so they are marked PASS; skip_advisory_review=True (audited) bypasses only the freshness/debt checks, not these findings."
             )
         return _with_choices(
-            f"Advisory found {len(fresh_critical)} critical issue(s). Findings are recorded durably; enforcement is advisory — you decide which to apply, and commit_reviewed is available. Re-run advisory_review after fixes, or deliberately choose the audited advisory skip."
+            f"Advisory found {len(fresh_critical)} critical issue(s). Findings are recorded durably; enforcement is advisory — you decide which to apply, and commit_reviewed is available. Re-run preflight_review after fixes, or deliberately choose the audited advisory skip."
         )
     return "Advisory is fresh with no critical findings. Proceed with: commit_reviewed(commit_message='...'). ⚠️ Do NOT make any further edits — any edit will make advisory stale."
 
@@ -1900,7 +1718,7 @@ def _persist_preflight_record(
             pre_state.add_run(_advisory_run_record(
                 snapshot_hash, commit_message, str(record.get("status") or "error"),
                 repo_key=repo_key, task_id=task_id,
-                snapshot_summary=("advisory SDK error" if record.get("session_id") else "preflight block — SDK not called"),
+                snapshot_summary=("advisory delivery error" if record.get("session_id") else "preflight block — critic not called"),
                 raw_result=record.get("raw_result"),
                 snapshot_paths=record.get("paths"),
                 readiness_warnings=record.get("readiness_warnings"),
@@ -1968,7 +1786,7 @@ def _advisory_pre_sdk_gate(
             "message": "A fresh advisory run already exists for this snapshot. Proceed with commit_reviewed.",
         })
 
-    ctx.emit_progress_fn("Running advisory pre-review (Claude Code, read-only)...")
+    ctx.emit_progress_fn("Running preflight pre-review (read-only critic)...")
     changed_files = _get_changed_file_list(repo_dir, paths=paths)
 
     if changed_files.startswith("⚠️ ADVISORY_ERROR"):
@@ -2003,7 +1821,7 @@ def _advisory_pre_sdk_gate(
             "error": release_preflight_err,
             "readiness_warnings": readiness_warnings,
             "message": (
-                "Advisory SDK was skipped: deterministic release metadata preflight "
+                "Advisory delivery was skipped: deterministic release metadata preflight "
                 "failed before provider budget was spent."
             ),
         })
@@ -2013,14 +1831,17 @@ def _advisory_pre_sdk_gate(
     if version_sync_warning:
         ctx.emit_progress_fn(f"⚠️ Advisory preflight: {version_sync_warning}")
 
-    # Test preflight before the expensive SDK call.
+    # Test preflight before the expensive delivery call.
     if not skip_tests:
-        ctx.emit_progress_fn("Running tests before advisory SDK call...")
-        test_err = _run_advisory_tests(ctx)
+        ctx.emit_progress_fn("Running tests before the advisory delivery call...")
+        from ouroboros.commit_admission import run_tests_preflight_with_proof
+
+        test_err = run_tests_preflight_with_proof(
+            ctx, runner=lambda c: _run_advisory_tests(c))
         if test_err:
             msg = (
                 "⚠️ TESTS_PREFLIGHT_BLOCKED: Tests must pass before advisory review.\n"
-                "Fix the failures below, then re-run advisory_review.\n"
+                "Fix the failures below, then re-run preflight_review.\n"
                 "Use skip_tests=True if this is intentionally incomplete WIP code.\n\n"
                 f"{test_err}"
             )
@@ -2044,18 +1865,9 @@ def _advisory_pre_sdk_gate(
                 "message": msg,
                 "readiness_warnings": readiness_warnings,
             })
-        ctx.emit_progress_fn("Tests passed ✓ — proceeding with advisory SDK call.")
-        # Single-run contract for managed-update resolutions (Q10): a green full
-        # hermetic run here is the proof for the exact candidate tree; the
-        # managed commit gate reuses it instead of paying a second full run.
-        # The gates' authority is the PROCESS-HELD ctx record (F2); the durable
-        # tx copy written alongside is forensic telemetry only.
-        try:
-            from supervisor.update_merge import record_managed_tests_proof
-
-            record_managed_tests_proof(ctx)
-        except Exception:
-            log.debug("managed tests evidence recording failed", exc_info=True)
+        # A green run already carries the Q10 managed proof: the shared
+        # admission helper records it (commit_admission SSOT).
+        ctx.emit_progress_fn("Tests passed ✓ — proceeding with the advisory delivery call.")
 
     return readiness_warnings, changed_files, None
 
@@ -2101,7 +1913,7 @@ def _handle_advisory_pre_review(
     # routine-looking "auto-bypassed" over a commit the free route could have
     # reviewed. A misconfigured route token is a loud error, not a bypass.
     try:
-        _requires_key = advisory_route_requires_api_key()
+        _native_route = advisory_review_route() == "api_chat"
         _advisory_enabled = advisory_slot_enabled()
     except ValueError as exc:
         return _json_response({
@@ -2112,18 +1924,28 @@ def _handle_advisory_pre_review(
                        "(OUROBOROS_REVIEWER_SLOTS / OUROBOROS_ADVISORY_REVIEW_ROUTE) and retry.",
         })
     if not _advisory_enabled:
-        # The owner switched the advisory slot off (6.2). The constitutional
-        # gate still runs — as an AUDITED BYPASS on this exact snapshot, the
-        # same durable record an explicit per-call skip produces.
+        # The owner switched the advisory slot off (6.2) — or the legacy
+        # Claude-SDK target migration force-disabled the row with a typed
+        # reason. The constitutional gate still runs — as an AUDITED BYPASS on
+        # this exact snapshot, the same durable record an explicit skip makes.
+        from ouroboros.reviewer_slot_config import advisory_slot_config as _asc
+
+        _dis = str(getattr(_asc(), "disabled_reason", "") or "")
         return _record_bypass(ctx, state, snapshot_hash, commit_message,
-                               "advisory reviewer disabled in settings — audited bypass",
+                               "advisory reviewer disabled in settings — audited bypass"
+                               + (f" ({_dis})" if _dis else ""),
                                task_id, drive_root,
                                snapshot_paths=paths)
-    if _requires_key and not os.environ.get("ANTHROPIC_API_KEY", ""):
-        return _record_bypass(ctx, state, snapshot_hash, commit_message,
-                               "ANTHROPIC_API_KEY not set — auto-bypassed (advisory route=api)",
-                               task_id, drive_root,
-                               snapshot_paths=paths)
+    if _native_route:
+        from ouroboros.provider_models import model_has_credentials
+
+        _m = _advisory_native_model()
+        if not model_has_credentials(_m):
+            return _record_bypass(ctx, state, snapshot_hash, commit_message,
+                                   f"no provider credentials for advisory model {_m} "
+                                   "— auto-bypassed (audited)",
+                                   task_id, drive_root,
+                                   snapshot_paths=paths)
 
     # Explicit audited bypass.
     if skip_advisory_pre_review:
@@ -2176,7 +1998,7 @@ def _handle_advisory_pre_review(
     advisory_meta = dict(getattr(ctx, "_last_claude_advisory_meta", {}) or {})
     advisory_session_id = str(advisory_meta.get("session_id") or "")
 
-    # SDK/CLI errors.
+    # Delivery errors.
     if raw_result.startswith("⚠️ ADVISORY_ERROR"):
         _persist_preflight_record(
             ctx=ctx,
@@ -2225,8 +2047,8 @@ def _handle_advisory_pre_review(
             "error": raw_result,
             "readiness_warnings": readiness_warnings,
             "message": (
-                "Advisory SDK was skipped: a staged .py file has a SyntaxError. "
-                "Fix the syntax error listed above and re-run advisory_review."
+                "Advisory delivery was skipped: a staged .py file has a SyntaxError. "
+                "Fix the syntax error listed above and re-run preflight_review."
             ),
         })
 
@@ -2298,7 +2120,7 @@ def _handle_advisory_pre_review(
             "session_id": advisory_session_id,
             "readiness_warnings": readiness_warnings,
             "message": (
-                "Advisory output could not be parsed. Re-run advisory_review, "
+                "Advisory output could not be parsed. Re-run preflight_review, "
                 "or use skip_advisory_review=True to bypass (will be audited)."
             ),
         })
@@ -2377,36 +2199,57 @@ def _handle_review_status(
 _schema_param = lambda param_type, description, **extra: {"type": param_type, "description": description, **extra}
 
 
+def _preflight_review_params() -> dict:
+    """The preflight_review tool's parameter schema (shared with its alias)."""
+    return {
+        "type": "object",
+        "properties": {
+            "commit_message": _schema_param("string", "Intended commit message. Used to bind the advisory run to this specific commit."),
+            "skip_advisory_review": _schema_param(
+                "boolean",
+                "Choose the audited advisory-only skip for this call. "
+                f"{ADVISORY_REVIEW_CHOICE_GUIDANCE} Default: False.",
+                default=False,
+            ),
+            "goal": _schema_param("string", "High-level goal of this change. Used to judge completeness."),
+            "scope": _schema_param("string", "Declared scope boundary. Issues outside scope are advisory-only."),
+            "paths": _schema_param("array", "Explicit list of changed file paths. Auto-detected from git status if omitted.", items={"type": "string"}),
+            "skip_tests": _schema_param("boolean", "Skip the preflight pytest run. Default: False (tests run by default). Use True only for intentionally incomplete WIP code where test failures are expected. Tests are run before the paid critic call — in a hermetic worktree, as the same two passes CI runs (parallel 'not serial' then serial) — to catch broken code early and avoid wasting review budget.", default=False),
+        },
+        "required": ["commit_message"],
+    }
+
+
 def get_tools() -> list:
     return [
         ToolEntry(
-            name="advisory_review",
+            name="preflight_review",
             timeout_sec=1200,
             schema={
-                "name": "advisory_review",
+                "name": "preflight_review",
                 "description": (
-                    "Run an advisory pre-commit review through the configured read-only route. "
+                    "Run the preflight pre-commit review (formerly `advisory_review`) "
+                    "through the configured read-only route. "
                     "Returns structured JSON findings; any edit afterward makes the result stale. "
                     f"{ADVISORY_REVIEW_CHOICE_GUIDANCE} "
                     f"{_identical_diff_cap_note()}"
                 ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "commit_message": _schema_param("string", "Intended commit message. Used to bind the advisory run to this specific commit."),
-                        "skip_advisory_review": _schema_param(
-                            "boolean",
-                            "Choose the audited advisory-only skip for this call. "
-                            f"{ADVISORY_REVIEW_CHOICE_GUIDANCE} Default: False.",
-                            default=False,
-                        ),
-                        "goal": _schema_param("string", "High-level goal of this change. Used to judge completeness."),
-                        "scope": _schema_param("string", "Declared scope boundary. Issues outside scope are advisory-only."),
-                        "paths": _schema_param("array", "Explicit list of changed file paths. Auto-detected from git status if omitted.", items={"type": "string"}),
-                        "skip_tests": _schema_param("boolean", "Skip the pre-advisory pytest run. Default: False (tests run by default). Use True only for intentionally incomplete WIP code where test failures are expected. Tests are run before the SDK call — in a hermetic worktree, as the same two passes CI runs (parallel 'not serial' then serial) — to catch broken code early and avoid wasting advisory budget.", default=False),
-                    },
-                    "required": ["commit_message"],
-                },
+                "parameters": _preflight_review_params(),
+            },
+            handler=_handle_advisory_pre_review,
+        ),
+        # Q1 rename compatibility: the organ's old public name stays CALLABLE
+        # (saved prompts/memories/configs keep working) but is never
+        # advertised — schemas()/available_tools() skip alias entries. Same
+        # parameters as the canonical entry so old calls keep their args.
+        ToolEntry(
+            name="advisory_review",
+            timeout_sec=1200,
+            alias_for="preflight_review",
+            schema={
+                "name": "advisory_review",
+                "description": "Compatibility alias for `preflight_review`.",
+                "parameters": _preflight_review_params(),
             },
             handler=_handle_advisory_pre_review,
         ),

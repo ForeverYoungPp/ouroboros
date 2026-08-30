@@ -5,7 +5,6 @@ gate; the repo fixtures are shared from that suite."""
 
 import supervisor.git_ops as git_ops
 import supervisor.update_merge as update_merge
-from tests._shared import ensure_claude_agent_sdk_mock
 from tests.test_update_merge_assisted import (
     _authority_metadata,
     _conflict_repo,
@@ -16,7 +15,6 @@ from tests.test_update_merge_assisted import (
     _supervisor_events,
 )
 
-ensure_claude_agent_sdk_mock()
 # ---------------------------------------------------------------------------
 # Hardening round (C1-C3): bounded git plumbing, batched marker scan, and the
 # merge-write tests-evidence record.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ouroboros"
-version = "6.110.1"
+version = "6.113.4"
 description = "Self-creating AI agent with constitution, background consciousness, and persistent identity"
 readme = "README.md"
 license = {text = "MIT"}
@@ -52,7 +52,6 @@ dependencies = [
     # dependencies because the packaged hermetic commit gate invokes them.
     "pytest-xdist>=3.5",
     "pytest-timeout>=2.1",
-    "claude-agent-sdk>=0.1.60",
     "mcp>=1.6,<2.0",
     "PyYAML>=6.0",
     "croniter",
@@ -78,7 +77,6 @@ Issues = "https://github.com/razzant/ouroboros/issues"
 "Previous Version (Colab)" = "https://github.com/razzant/ouroboros/tree/legacy-google-colab"
 
 [project.optional-dependencies]
-claude-sdk = ["claude-agent-sdk>=0.1.60"]
 browser = ["playwright", "playwright-stealth"]
 desktop = [
     "pywebview==5.4",
@@ -88,7 +86,6 @@ desktop = [
 local-model = ["llama-cpp-python"]
 build = ["pyinstaller>=6.0"]
 all = [
-    "claude-agent-sdk>=0.1.60",
     "playwright",
     "playwright-stealth",
     "pywebview==5.4",

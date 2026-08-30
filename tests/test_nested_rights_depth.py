@@ -3,9 +3,16 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.depth_evidence import build_depth_summary
-from ouroboros.task_results import STATUS_FAILED, STATUS_RUNNING, write_task_result
+from ouroboros.task_results import (
+    STATUS_FAILED,
+    STATUS_RUNNING,
+    STATUS_SCHEDULED,
+    write_task_result,
+)
 from ouroboros.tools.control_delegation import (
     admitted_depth_cap,
     check_delegation_admission,
@@ -15,6 +22,49 @@ from ouroboros.tools.control_delegation import (
     stamp_depth_provenance,
     stamp_task_assignment_depth,
 )
+
+
+def test_task_depth_parser_rejects_negative_values_before_int_truncation():
+    from ouroboros.depth_evidence import TaskDepthError, parse_task_depth
+
+    assert parse_task_depth(None) == 0
+    assert parse_task_depth("2") == 2
+    # Preserve the historical coercion contract for non-negative legacy values.
+    assert parse_task_depth(True) == 1
+    assert parse_task_depth(1.5) == 1
+    for raw in (-1, -0.5, "-1"):
+        with pytest.raises(TaskDepthError) as raised:
+            parse_task_depth(raw)
+        assert raised.value.code == "negative_task_depth"
+    with pytest.raises(TaskDepthError) as raised:
+        parse_task_depth("not-a-depth")
+    assert raised.value.code == "invalid_task_depth"
+
+
+def test_persisted_depth_provenance_cannot_exceed_immutable_host_ceiling():
+    contract = build_task_contract({
+        "delegation_budget": {
+            "depth_provenance": {
+                "requested_depth": 99,
+                "permitted_depth": 99,
+                "attempted_depth": 1,
+            },
+        },
+    })
+
+    assert admitted_depth_cap(contract, 7) == 10
+    assert admitted_depth_cap(contract, 99) == 10
+    child = child_budget_for_schedule(
+        contract,
+        current_depth=1,
+        new_depth=2,
+        max_depth=99,
+        may_mutate=False,
+        may_fan_out=True,
+        max_children=0,
+        intent_note="",
+    )
+    assert child["depth_provenance"]["permitted_depth"] == 10
 
 
 def test_explicit_rights_are_typed_and_legacy_omission_stays_permissive():
@@ -382,6 +432,18 @@ def test_assignment_does_not_reconstruct_legacy_depth_authority_from_live_settin
     }
 
 
+def test_legacy_depth_provenance_branch_respects_host_ceiling():
+    contract = build_task_contract({
+        "delegation_budget": {"depth_remaining": 20},
+    })
+
+    _stamped, provenance = stamp_depth_provenance(
+        contract, attempted_depth=1, max_depth=99, achieved_depth=None,
+    )
+
+    assert provenance["permitted_depth"] == 10
+
+
 def test_supervisor_ingress_bounds_legacy_permission_by_admitted_remaining_envelope():
     contract = build_task_contract({
         "delegation_budget": {"depth_remaining": 2},
@@ -532,6 +594,23 @@ def test_supervisor_admission_enforces_parent_rights_and_allows_one_non_fanout_c
     rejected = json.loads((tmp_path / "task_results" / "child-2.json").read_text(encoding="utf-8"))
     assert len(enqueued) == 1
     assert rejected["reason_code"] == "delegation_rights_may_fan_out"
+
+
+def test_supervisor_rejects_invalid_depth_before_provisioning_or_enqueue(tmp_path, monkeypatch):
+    from supervisor import events
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    for index, raw_depth in enumerate((-1, -0.5, "-1", "not-a-depth")):
+        task_id = f"invalid-depth-{index}"
+        enqueued = []
+        events._handle_schedule_task(
+            _schedule_event(task_id, "parent", depth=raw_depth, drive_root=tmp_path),
+            _fake_ctx(tmp_path, enqueued),
+        )
+        result = json.loads((tmp_path / "task_results" / f"{task_id}.json").read_text())
+        assert enqueued == []
+        assert result["status"] == STATUS_FAILED
+        assert result["reason_code"] == "invalid_task_depth"
 
 
 def test_supervisor_rolls_back_subagent_when_scheduled_result_write_fails(
@@ -728,6 +807,271 @@ def test_replayed_schedule_event_keeps_one_physical_task_and_transition(
     assert [task["id"] for task in delivered] == ["same-child"]
     assert sum(worker.busy_task_id == "same-child" for worker in worker_map.values()) == 1
     assert ctx.RUNNING["same-child"]["worker_id"] in worker_map
+
+
+def test_assignment_quarantines_bypassed_invalid_depth_and_normalizes_legacy_rows(
+    tmp_path, monkeypatch,
+):
+    from supervisor import queue, state, workers
+    from ouroboros.task_results import load_task_result
+
+    delivered = []
+    terminal_events = []
+
+    class FakeWorkerQueue:
+        def put(self, task):
+            delivered.append(dict(task))
+
+    worker = SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())
+    pending = [{
+        "id": "invalid-pending-depth",
+        "type": "task",
+        "chat_id": 1,
+        "description": "invalid depth",
+        "depth": -1,
+        "budget_drive_root": str(tmp_path),
+    }]
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "WORKERS", {1: worker})
+    monkeypatch.setattr(workers, "load_state", lambda: {})
+    monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 100.0)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(
+        workers,
+        "_emit_task_done_terminal",
+        lambda task, task_id, status="failed", **kwargs: terminal_events.append(
+            (task_id, status, kwargs)
+        ) or True,
+    )
+    queue.BUDGET_ROOT_FENCES.clear()
+
+    workers.assign_tasks()
+
+    rejected = load_task_result(tmp_path, "invalid-pending-depth")
+    assert pending == []
+    assert delivered == []
+    assert worker.busy_task_id is None
+    assert rejected["status"] == STATUS_FAILED
+    assert rejected["reason_code"] == "invalid_task_depth"
+    assert rejected["depth"] == 0
+    assert rejected["raw_task_depth"] == -1
+    assert terminal_events and terminal_events[0][0] == "invalid-pending-depth"
+
+    pending.append({
+        "id": "legacy-pending-depth",
+        "type": "task",
+        "chat_id": 1,
+        "description": "legacy missing depth",
+        "depth": None,
+        "budget_drive_root": str(tmp_path),
+    })
+    workers.assign_tasks()
+    assert delivered and delivered[-1]["id"] == "legacy-pending-depth"
+    assert delivered[-1]["depth"] == 0
+
+
+def test_assignment_quarantines_invalid_depth_before_budget_pause(tmp_path, monkeypatch):
+    from supervisor import queue, state, workers
+    from ouroboros.task_results import load_task_result
+
+    delivered = []
+    worker = SimpleNamespace(
+        wid=1,
+        busy_task_id=None,
+        in_q=SimpleNamespace(put=lambda task: delivered.append(dict(task))),
+    )
+    pending = [{
+        "id": "invalid-before-budget",
+        "type": "task",
+        "chat_id": 1,
+        "description": "invalid depth must not become a pause",
+        "depth": -0.5,
+        "budget_drive_root": str(tmp_path),
+    }]
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "WORKERS", {1: worker})
+    monkeypatch.setattr(workers, "load_state", lambda: {"owner_chat_id": 0})
+    monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    queue.BUDGET_ROOT_FENCES.clear()
+
+    workers.assign_tasks()
+
+    rejected = load_task_result(tmp_path, "invalid-before-budget")
+    assert pending == []
+    assert delivered == []
+    assert rejected["status"] == STATUS_FAILED
+    assert rejected["reason_code"] == "invalid_task_depth"
+    assert rejected["raw_task_depth"] == -0.5
+    assert "_budget_pause" not in rejected
+
+
+def test_restore_failed_depth_terminalization_mutates_pending_under_queue_lock(
+    tmp_path, monkeypatch,
+):
+    from supervisor import queue, task_admission
+    from ouroboros.utils import utc_now_iso
+
+    pending, running = [], {}
+    queue.init_queue_refs(pending, running, {"value": 0})
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    snapshot_path = tmp_path / "state" / "queue_snapshot.json"
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snapshot_path)
+    queue.ACCEPTANCE_FENCES.clear()
+    queue.ADMISSION_RESERVATIONS.clear()
+    task = {
+        "id": "restore-retry-invalid-depth",
+        "type": "task",
+        "chat_id": 1,
+        "description": "retry terminal custody",
+        "depth": -1,
+        "priority": "not-an-integer",
+        "_queue_seq": "not-a-sequence",
+    }
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text(
+        json.dumps({
+            "ts": utc_now_iso(),
+            "pending": [{"task": task}],
+            "running": [],
+            "acceptance_fences": [],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        task_admission,
+        "terminalize_invalid_depth_restore",
+        lambda *_args, **_kwargs: False,
+    )
+    lock_observations = []
+    original_restore = queue.restore_invalid_depth_admission
+
+    def checked_restore(*args, **kwargs):
+        lock_observations.append(queue._queue_lock._is_owned())
+        return original_restore(*args, **kwargs)
+
+    monkeypatch.setattr(queue, "restore_invalid_depth_admission", checked_restore)
+
+    assert queue.restore_pending_from_snapshot() == 0
+    assert lock_observations == [True]
+    assert len(pending) == 1
+    assert pending[0]["id"] == task["id"]
+    assert pending[0]["depth"] == -1
+    assert "priority" not in pending[0]
+    assert pending[0]["_queue_seq"] == 1
+
+    admitted = queue.enqueue_task({"id": "healthy-after-bad-order", "type": "task", "depth": 0})
+    assert admitted["id"] == "healthy-after-bad-order"
+    assert [row["id"] for row in pending] == [
+        "restore-retry-invalid-depth", "healthy-after-bad-order",
+    ]
+
+
+@pytest.mark.parametrize("raw_value", [float("inf"), float("-inf")])
+def test_restore_failed_depth_terminalization_sanitizes_nonfinite_queue_metadata(
+    raw_value, tmp_path, monkeypatch,
+):
+    from supervisor import queue, task_admission
+    from ouroboros.utils import utc_now_iso
+
+    pending, running = [], {}
+    queue.init_queue_refs(pending, running, {"value": 0})
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    snapshot_path = tmp_path / "state" / "queue_snapshot.json"
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snapshot_path)
+    queue.ACCEPTANCE_FENCES.clear()
+    queue.ADMISSION_RESERVATIONS.clear()
+    task = {
+        "id": "restore-retry-nonfinite-order",
+        "type": "task",
+        "chat_id": 1,
+        "description": "retain malformed depth",
+        "depth": -1,
+        "priority": raw_value,
+        "_queue_seq": raw_value,
+    }
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text(
+        json.dumps({
+            "ts": utc_now_iso(),
+            "pending": [{"task": task}],
+            "running": [],
+            "acceptance_fences": [],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        task_admission,
+        "terminalize_invalid_depth_restore",
+        lambda *_args, **_kwargs: False,
+    )
+
+    assert queue.restore_pending_from_snapshot() == 0
+    assert len(pending) == 1
+    assert pending[0]["id"] == task["id"]
+    assert pending[0]["depth"] == -1
+    assert "priority" not in pending[0]
+    assert pending[0]["_queue_seq"] == 1
+    admitted = queue.enqueue_task({"id": "healthy-after-nonfinite-order", "type": "task", "depth": 0})
+    assert admitted["id"] == "healthy-after-nonfinite-order"
+
+
+def test_budget_pause_leaves_unresolved_invalid_depth_in_retry_custody(
+    tmp_path, monkeypatch,
+):
+    from supervisor import queue, state, workers
+    from ouroboros.task_results import load_task_result
+
+    pending = [
+        {
+            "id": "unresolved-before-budget",
+            "type": "task",
+            "chat_id": 1,
+            "description": "retry terminal custody",
+            "depth": -1,
+            "budget_drive_root": str(tmp_path),
+        },
+        {
+            "id": "healthy-before-budget",
+            "type": "task",
+            "chat_id": 1,
+            "description": "pause this task",
+            "depth": 0,
+            "budget_drive_root": str(tmp_path),
+        },
+    ]
+    worker = SimpleNamespace(wid=1, busy_task_id=None, reaping=False, in_q=SimpleNamespace(put=lambda _task: None))
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "WORKERS", {1: worker})
+    monkeypatch.setattr(workers, "load_state", lambda: {"owner_chat_id": 0})
+    monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    original_terminalize = workers._terminalize_invalid_pending_depth
+    monkeypatch.setattr(
+        workers,
+        "_terminalize_invalid_pending_depth",
+        lambda task, detail: (
+            False
+            if task.get("id") == "unresolved-before-budget"
+            else original_terminalize(task, detail)
+        ),
+    )
+    queue.BUDGET_ROOT_FENCES.clear()
+
+    workers.assign_tasks()
+
+    unresolved = next(task for task in pending if task["id"] == "unresolved-before-budget")
+    healthy = next(task for task in pending if task["id"] == "healthy-before-budget")
+    assert "_budget_pause" not in unresolved
+    assert healthy.get("_budget_pause", {}).get("status") == "paused_before_dispatch"
+    assert load_task_result(tmp_path, "healthy-before-budget")["status"] == STATUS_SCHEDULED
+    assert worker.busy_task_id is None
 
 
 def test_supervisor_keeps_admission_when_scheduled_write_raises_after_commit(
@@ -954,6 +1298,135 @@ def test_generic_schedule_replay_preserves_valid_exact_result(tmp_path, monkeypa
 
     assert pending == []
     assert result_path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    ("status", "location"),
+    [(STATUS_SCHEDULED, "pending"), (STATUS_RUNNING, "running")],
+)
+def test_generic_malformed_replay_preserves_live_exact_result(
+    tmp_path, monkeypatch, status, location,
+):
+    from supervisor import events, queue
+
+    monkeypatch.setattr(events, "_find_duplicate_task", lambda *args, **kwargs: None)
+    tid = f"generic-live-{location}"
+    write_task_result(
+        tmp_path,
+        tid,
+        status,
+        root_task_id=tid,
+        delegation_role="root",
+        result="keep live work",
+    )
+    result_path = tmp_path / "task_results" / f"{tid}.json"
+    original = result_path.read_bytes()
+    pending = []
+    running = {}
+    if location == "pending":
+        pending.append({"id": tid, "depth": 0, "delegation_role": "root"})
+    else:
+        running[tid] = {"task": {"id": tid, "delegation_role": "root"}}
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(queue, "RUNNING", running)
+    monkeypatch.setattr(queue, "ADMISSION_RESERVATIONS", {})
+    enqueued = []
+    ctx = _fake_ctx(tmp_path, enqueued)
+    ctx.PENDING = pending
+    ctx.RUNNING = running
+    ctx.enqueue_task = queue.enqueue_task
+    event = _schedule_event(tid, "parent", depth=-1, drive_root=tmp_path)
+    event["delegation_role"] = "root"
+    event["chat_id"] = 7
+
+    events._handle_schedule_task(event, ctx)
+
+    assert result_path.read_bytes() == original
+    assert pending == (
+        [{"id": tid, "depth": 0, "delegation_role": "root"}]
+        if location == "pending" else []
+    )
+    assert set(running) == ({tid} if location == "running" else set())
+    assert not enqueued
+
+
+@pytest.mark.parametrize("delegation_role", ["root", "subagent"])
+def test_malformed_replay_preserves_preexisting_admission_reservation(
+    tmp_path, monkeypatch, delegation_role,
+):
+    from supervisor import events, queue
+
+    tid = f"reserved-{delegation_role}"
+    pending, running = [], {}
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(queue, "RUNNING", running)
+    monkeypatch.setattr(queue, "ADMISSION_RESERVATIONS", {tid: "owner-token"})
+    enqueued = []
+    ctx = _fake_ctx(tmp_path, enqueued)
+    ctx.PENDING, ctx.RUNNING = pending, running
+    ctx.enqueue_task = queue.enqueue_task
+    event = _schedule_event(tid, "parent", depth=-1, drive_root=tmp_path)
+    event["delegation_role"], event["chat_id"] = delegation_role, 7
+
+    events._handle_schedule_task(event, ctx)
+
+    assert not (tmp_path / "task_results" / f"{tid}.json").exists()
+    assert queue.ADMISSION_RESERVATIONS == {tid: "owner-token"}
+    assert pending == []
+    assert running == {}
+    assert enqueued == []
+
+
+@pytest.mark.parametrize("delegation_role", ["root", "subagent"])
+@pytest.mark.parametrize("late_custody", ["reservation", "pending"])
+def test_malformed_replay_rechecks_identity_after_initial_preflight(
+    tmp_path, monkeypatch, delegation_role, late_custody,
+):
+    from supervisor import events, queue, task_admission
+
+    tid = f"late-{delegation_role}-{late_custody}"
+    pending, running = [], {}
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(queue, "RUNNING", running)
+    monkeypatch.setattr(queue, "ADMISSION_RESERVATIONS", {})
+    calls = 0
+
+    def raced_owned(_ctx, _task_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if late_custody == "reservation":
+                queue.ADMISSION_RESERVATIONS[tid] = "late-token"
+            else:
+                pending.append({"id": tid, "delegation_role": delegation_role})
+            return False
+        return bool(
+            queue.ADMISSION_RESERVATIONS.get(tid)
+            or any(str(row.get("id") or "") == tid for row in pending)
+        )
+
+    monkeypatch.setattr(task_admission, "subagent_schedule_owned", raced_owned)
+    enqueued = []
+    ctx = _fake_ctx(tmp_path, enqueued)
+    ctx.PENDING, ctx.RUNNING = pending, running
+    ctx.enqueue_task = queue.enqueue_task
+    event = _schedule_event(tid, "parent", depth=-1, drive_root=tmp_path)
+    event["delegation_role"], event["chat_id"] = delegation_role, 7
+
+    events._handle_schedule_task(event, ctx)
+
+    assert calls == 2
+    assert not (tmp_path / "task_results" / f"{tid}.json").exists()
+    assert enqueued == []
+    if late_custody == "reservation":
+        assert queue.ADMISSION_RESERVATIONS == {tid: "late-token"}
+        assert pending == []
+    else:
+        assert queue.ADMISSION_RESERVATIONS == {}
+        assert pending == [{"id": tid, "delegation_role": delegation_role}]
 
 
 def test_supervisor_rejects_count_bounded_child_when_count_scan_fails(

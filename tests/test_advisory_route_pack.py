@@ -67,8 +67,8 @@ _DOC_MARKERS = (
 
 @pytest.fixture()
 def api_env(monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.setenv("CLAUDE_CODE_MODEL", "opus")
+    # Native (routed) advisory delivery: credentials follow the routed model.
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     monkeypatch.delenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, raising=False)
     monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
 
@@ -84,10 +84,11 @@ def _fake_window(monkeypatch, tokens: int):
 def _no_dispatch(monkeypatch):
     def _boom(*args, **kwargs):  # pragma: no cover - failure signal only
         raise AssertionError("provider dispatch must not happen")
-    monkeypatch.setattr("ouroboros.gateways.claude_code.run_readonly", _boom)
+    monkeypatch.setattr(advisory, "_run_advisory_native", _boom)
 
 
 def _stub_run_readonly(monkeypatch, **overrides):
+    """Stub the NATIVE episode runner with the shared rehydrated result shape."""
     result = SimpleNamespace(
         success=True, result_text=_ADVISORY_ITEMS, session_id="sess-1",
         cost_usd=0.0, usage={}, error="", stderr_tail="",
@@ -95,8 +96,8 @@ def _stub_run_readonly(monkeypatch, **overrides):
     for key, value in overrides.items():
         setattr(result, key, value)
     monkeypatch.setattr(
-        "ouroboros.gateways.claude_code.run_readonly",
-        lambda *a, **k: result,
+        advisory, "_run_advisory_native",
+        lambda prompt, repo_dir, ctx_, slot, model: (result, model),
     )
     return result
 
@@ -123,7 +124,7 @@ def test_api_admission_small_window_skips_before_dispatch(tmp_path, monkeypatch,
     assert "1,000-token window" in raw
     assert f"{chars:,} chars" in raw
     assert chars < advisory._ADVISORY_PROMPT_MAX_CHARS  # constant did not decide
-    assert model == "opus"
+    assert model == advisory._advisory_default_model()
     # The pre-dispatch window skip stamps the meta snapshot like every skip.
     meta = dict(getattr(ctx, "_last_claude_advisory_meta", {}) or {})
     assert meta.get("status") == "skipped"
@@ -140,7 +141,7 @@ def test_api_admission_big_window_proceeds(tmp_path, monkeypatch, api_env):
     assert not raw.startswith("⚠️ ADVISORY_SKIPPED"), raw
     assert not raw.startswith("⚠️ ADVISORY_ERROR"), raw
     assert [i["item"] for i in items] == ["correctness"]
-    assert model == "opus"
+    assert model == advisory._advisory_default_model()
 
 
 def test_api_window_skip_is_the_existing_typed_skip_status(tmp_path, monkeypatch, api_env):
@@ -265,7 +266,7 @@ def test_api_overflow_failure_becomes_typed_skip(tmp_path, monkeypatch, api_env)
     )
     assert items == []
     assert raw.startswith("⚠️ ADVISORY_SKIPPED: context_window_exceeded"), raw
-    assert "api route" in raw
+    assert "native route" in raw
     meta = dict(getattr(ctx, "_last_claude_advisory_meta", {}) or {})
     assert meta.get("status") == "skipped"
     assert meta.get("skip_reason") == "context_window_exceeded"
@@ -299,7 +300,7 @@ def test_raised_overflow_exception_becomes_typed_skip(tmp_path, monkeypatch, api
     def _raise(*a, **k):
         raise RuntimeError("provider rejected: context_length_exceeded")
 
-    monkeypatch.setattr("ouroboros.gateways.claude_code.run_readonly", _raise)
+    monkeypatch.setattr(advisory, "_run_advisory_native", _raise)
     ctx = _ctx(tmp_path)
     items, raw, _model, _chars = advisory._run_claude_advisory(
         ctx.repo_dir, "msg", ctx, options={"include_repo_diff": False},

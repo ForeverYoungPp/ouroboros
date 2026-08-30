@@ -268,9 +268,10 @@ test('chat.js wires the replay flag around the replay and keeps live callsites i
     assert.doesNotMatch(replaySection, /await /);
     // The LIVE path is untouched: both finished-transition callsites (the
     // task_done frame in applyLiveCardStateMutation and finishLiveCardMutation)
-    // still call scheduleHistorySync() unconditionally — the replay decision
-    // lives ONLY behind the scheduler's gate.
-    assert.equal((chatSource.match(/scheduleHistorySync\(\);/g) || []).length, 2);
+    // plus a terminal task-bound review lifecycle call scheduleHistorySync()
+    // unconditionally — the replay decision lives ONLY behind the scheduler's
+    // gate.
+    assert.equal((chatSource.match(/scheduleHistorySync\(\);/g) || []).length, 3);
     assert.doesNotMatch(chatSource, /_historyReplayActive[^\n]*scheduleHistorySync/);
 });
 

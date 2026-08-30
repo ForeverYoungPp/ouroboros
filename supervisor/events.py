@@ -38,6 +38,12 @@ from ouroboros.subagent_messages import subagent_message_meta
 from ouroboros.task_finalization import send_provider_death_notice
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
 from supervisor.cognitive_operations import EVENT_HANDLERS as _CEH, _handle_cognitive_operation  # noqa: F401
+from supervisor.log_addressing import (  # re-export: one events surface
+    address_ctx_event as _address_ctx,
+    address_task_event as _address_task_event,  # noqa: F401  (tests pin it here)
+    bound_project_chat_id as _bound_project_chat_id,
+    make_server_log_sink,  # noqa: F401  (server.py installs it)
+)
 from ouroboros.tools.control_delegation import (
     admitted_depth_cap,
     check_delegation_admission,
@@ -47,6 +53,7 @@ from ouroboros.tools.control_delegation import (
 from supervisor.task_dispatch import (
     build_scheduled_task_payload as _build_scheduled_task_payload,
 )
+from supervisor.task_admission import reject_if_no_chat_target as _reject_if_no_chat_target
 
 log = logging.getLogger(__name__)
 
@@ -193,21 +200,6 @@ def _publish_routing_ack(
             )
     except Exception:
         log.debug("Routing typed ack failed", exc_info=True)
-
-
-def _bound_project_chat_id(ctx: Any, task_id: Any, parent_task_id: Any = "", root_task_id: Any = "") -> int:
-    """Resolve project chat for a task by LINEAGE (own binding -> parent -> root), so a
-    subagent of a project task routes to the project thread, not the main chat — only
-    the root is bound (post-hoc via UI or ensure_project_scope), children inherit."""
-    tid = str(task_id or "").strip()
-    if not tid:
-        return 0
-    try:
-        from ouroboros.projects_registry import project_chat_for_task_tree
-
-        return int(project_chat_for_task_tree(ctx.DRIVE_ROOT, tid, parent_task_id, root_task_id) or 0)
-    except Exception:
-        return 0
 
 
 def _is_active_subagent_task(task: Dict[str, Any], root_task_id: str) -> bool:
@@ -666,39 +658,46 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
     # provider side and never appears in tools.jsonl.
     web_search_sources = usage.get("web_search_sources")
 
+    usage_event = {
+        "ts": evt.get("ts", utc_now_iso()),
+        "type": "llm_usage",
+        "task_id": evt.get("task_id", ""),
+        "root_task_id": evt.get("root_task_id", ""),
+        "parent_task_id": evt.get("parent_task_id", ""),
+        "delegation_role": evt.get("delegation_role", ""),
+        "task_group_id": evt.get("task_group_id", ""),
+        "requested_model_lane": evt.get("requested_model_lane", evt.get("model_lane", "")),
+        "effective_model_lane": evt.get("effective_model_lane", ""),
+        "category": evt.get("category", "other"),
+        "model": evt.get("model", ""),
+        "api_key_type": evt.get("api_key_type", ""),
+        "model_category": evt.get("model_category", "other"),
+        "provider": evt.get("provider", ""),
+        "source": evt.get("source", ""),
+        "cost_estimated": bool(evt.get("cost_estimated", False)),
+        "cost": resolved_cost,
+        "cost_known": cost_known,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cached_tokens": cached_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "prompt_cache_ttl": prompt_cache_ttl,
+        "accounting_authority": "physical_attempt_ledger",
+        "projection_update_status": projection_update_status,
+        "ledger_attempt_ids": ledger_attempt_ids,
+        **({"chat_id": evt["chat_id"]} if evt.get("chat_id") is not None else {}),
+        **({"web_search_sources": web_search_sources} if isinstance(web_search_sources, list) and web_search_sources else {}),
+    }
+    _address_ctx(ctx, usage_event)
     try:
-        append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", {
-            "ts": evt.get("ts", utc_now_iso()),
-            "type": "llm_usage",
-            "task_id": evt.get("task_id", ""),
-            "root_task_id": evt.get("root_task_id", ""),
-            "parent_task_id": evt.get("parent_task_id", ""),
-            "delegation_role": evt.get("delegation_role", ""),
-            "task_group_id": evt.get("task_group_id", ""),
-            "requested_model_lane": evt.get("requested_model_lane", evt.get("model_lane", "")),
-            "effective_model_lane": evt.get("effective_model_lane", ""),
-            "category": evt.get("category", "other"),
-            "model": evt.get("model", ""),
-            "api_key_type": evt.get("api_key_type", ""),
-            "model_category": evt.get("model_category", "other"),
-            "provider": evt.get("provider", ""),
-            "source": evt.get("source", ""),
-            "cost_estimated": bool(evt.get("cost_estimated", False)),
-            "cost": resolved_cost,
-            "cost_known": cost_known,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "cached_tokens": cached_tokens,
-            "cache_write_tokens": cache_write_tokens,
-            "prompt_cache_ttl": prompt_cache_ttl,
-            "accounting_authority": "physical_attempt_ledger",
-            "projection_update_status": projection_update_status,
-            "ledger_attempt_ids": ledger_attempt_ids,
-            **({"web_search_sources": web_search_sources} if isinstance(web_search_sources, list) and web_search_sources else {}),
-        })
+        append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", usage_event)
     except Exception:
         log.warning("Failed to log llm_usage event to events.jsonl", exc_info=True)
-        pass
+    # ONE live frame (sink copy suppressed).
+    try:
+        ctx.bridge.push_log(usage_event)
+    except Exception:
+        log.debug("Failed to forward llm_usage to live logs", exc_info=True)
 
 
 def _set_root_budget_pause_locked(root_task_id: str, pause: Dict[str, Any]) -> Dict[str, Any]:
@@ -786,6 +785,7 @@ def _handle_budget_pause(evt: Dict[str, Any], ctx: Any) -> None:
         "toast_once": f"{task_id}:budget-paused:{pause.get('scope') or 'global'}",
         **pause,
     }
+    _address_task_event({task_id: meta} if isinstance(meta, dict) else None, ctx.DRIVE_ROOT, event)
     append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", event)
     ctx.persist_queue_snapshot(reason="budget_pause_before_dispatch")
     try:
@@ -815,6 +815,7 @@ def _handle_budget_root_fence(evt: Dict[str, Any], ctx: Any) -> None:
         "toast_once": f"{root_task_id}:budget-paused:root",
         **fence,
     }
+    _address_ctx(ctx, event)
     append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", event)
     try:
         ctx.bridge.push_log(event)
@@ -1615,19 +1616,23 @@ def _finish_task_done_dispatch(
     )
 
     if task_id and str(task.get("delegation_role") or "") == "subagent":
-        try:
-            raw_chat = int(task.get("chat_id") or 0)
-        except (TypeError, ValueError):
-            raw_chat = 0
-        chat_id = _bound_project_chat_id(
-            ctx, task_id, task.get("parent_task_id"), task.get("root_task_id")
-        ) or raw_chat
-        if chat_id:
-            effective_result = (
-                final_task_result
-                or load_task_result(ctx.DRIVE_ROOT, str(task_id or ""))
-                or {}
-            )
+        effective_result = (
+            final_task_result
+            or load_task_result(ctx.DRIVE_ROOT, str(task_id or ""))
+            or {}
+        )
+        from supervisor.message_bus import notification_chat_route
+        from supervisor.subagent_task_truth import enrich_task_done_event
+
+        _envelope = enrich_task_done_event(task_done_event, effective_result)
+        # Membership, not truthiness (C4): chat 0 real, negative A2A.
+        chat_id = notification_chat_route(
+            _bound_project_chat_id(
+                ctx, task_id, task.get("parent_task_id"), task.get("root_task_id")
+            ) or None,
+            task.get("chat_id"),
+        )
+        if chat_id is not None:
             status = str(
                 effective_result.get("status")
                 or evt.get("status")
@@ -1691,11 +1696,9 @@ def _finish_task_done_dispatch(
                 # upgrades from the neutral "dispatched" decision to what actually ran.
                 "executor_route": str(effective_result.get("executor_route") or ""),
             }
-            _envelope = effective_result.get("subagent_envelope")
-            if isinstance(_envelope, dict) and isinstance(_envelope.get("execution_evidence"), dict):
+            if isinstance(_envelope.get("execution_evidence"), dict):
                 progress_meta["execution_evidence"] = _envelope["execution_evidence"]
-            if isinstance(_envelope, dict) and _envelope.get("actual_substrate"):
-                # The FACT beside the plan (Q1A): harness_used / harness_attempted / native_only.
+            if _envelope.get("actual_substrate"):
                 progress_meta["actual_substrate"] = str(_envelope["actual_substrate"])
             if isinstance(task_done_event.get("outcome_axes"), dict):
                 progress_meta["outcome_axes"] = task_done_event["outcome_axes"]
@@ -1904,7 +1907,10 @@ def _resolve_lifecycle_fault(
         "task_id": task_id,
         "task_type": task_type,
         "chat_id": int(
-            evt.get("chat_id") or task_row.get("chat_id") or stored.get("chat_id") or 0
+            _bound_project_chat_id(
+                ctx, task_id, task_row.get("parent_task_id"), task_row.get("root_task_id")
+            )
+            or evt.get("chat_id") or task_row.get("chat_id") or stored.get("chat_id") or 0
         ),
         "status": status,
         "reason_code": str(stored.get("reason_code") or "task_done_lifecycle_fault"),
@@ -2252,6 +2258,9 @@ def _handle_task_metrics(evt: Dict[str, Any], ctx: Any) -> None:
     }
     if bool(evt.get("ephemeral_decision")):
         payload["ephemeral_decision"] = True
+    if evt.get("chat_id") is not None:
+        payload["chat_id"] = evt["chat_id"]
+    _address_ctx(ctx, payload)
     ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl", payload)
     try:
         ctx.bridge.push_log(payload)
@@ -3302,30 +3311,6 @@ from supervisor.steering import (  # noqa: E402 -- intentional re-import
 )
 
 
-def _reject_if_no_chat_target(
-    ctx: Any, *, desc: str, chat_id: int, delegation_role: str, tid: str, role: str,
-    parent_id: Any, root_task_id: str, result_fields: Dict[str, Any],
-) -> bool:
-    """Chat-target gate. A non-subagent task needs a live chat to schedule to; a
-    subagent returns its result to its PARENT, not a UI thread, so headless roots
-    (created via /api/tasks with no chat_id and owner_chat_id=None — CLI/Terminal-
-    Bench) schedule it without a chat target (the chat-only notification later is
-    skipped when chat_id is 0). Returns True when rejected (caller must return)."""
-    if not (desc and not chat_id):
-        return False
-    if delegation_role != "subagent":
-        log.warning("Rejected scheduled task without chat target: task_id=%s desc=%s", tid, desc[:100])
-        _reject_schedule_task(
-            ctx, tid=tid, chat_id=chat_id, delegation_role=delegation_role,
-            parent_id=parent_id, root_task_id=root_task_id, role=role,
-            result_fields=result_fields,
-            detail="Subagent rejected: no chat target is available for live scheduling.",
-        )
-        return True
-    log.info("Scheduled headless subagent without live chat target: task_id=%s role=%s", tid, role)
-    return False
-
-
 def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     st = ctx.load_state()
     owner_chat_id = st.get("owner_chat_id")
@@ -3344,16 +3329,38 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     constraints = str(evt.get("constraints") or "").strip()
     role = str(evt.get("role") or "researcher").strip() or "researcher"
     task_context = str(evt.get("context") or "").strip()
-    depth = int(evt.get("depth", 0))
     parent_id = evt.get("parent_task_id")
     root_task_id = str(evt.get("root_task_id") or parent_id or tid)
     session_id = str(evt.get("session_id") or "")
     actor_id = str(evt.get("actor_id") or "ouroboros")
     delegation_role = str(evt.get("delegation_role") or "subagent")
-    if delegation_role == "subagent":
-        from supervisor.task_admission import subagent_schedule_preflight
-        if subagent_schedule_preflight(ctx, evt, chat_id):
-            return
+    # Idempotency/ownership is checked before parsing for every scheduling role
+    # so a malformed replay cannot terminalize an already-owned task id. Fresh
+    # events still reach the typed depth rejection below before provisioning or
+    # enqueue; events without an explicit id use the normal fresh-id path.
+    from supervisor.task_admission import subagent_schedule_preflight
+    if subagent_schedule_preflight(
+        ctx, evt, chat_id, delegation_role=delegation_role,
+    ):
+        return
+    from supervisor.task_admission import parse_schedule_task_depth
+
+    depth, depth_rejected = parse_schedule_task_depth(
+        ctx,
+        evt,
+        tid=tid,
+        chat_id=chat_id,
+        delegation_role=delegation_role,
+        parent_id=parent_id,
+        root_task_id=root_task_id,
+        role=role,
+        desc=desc,
+        expected_output=expected_output,
+        constraints=constraints,
+        task_context=task_context,
+    )
+    if depth_rejected:
+        return
     memory_mode = str(evt.get("memory_mode") or "").strip()
     drive_root = str(evt.get("drive_root") or "").strip()
     child_drive_root = str(evt.get("child_drive_root") or drive_root).strip()
@@ -3854,19 +3861,24 @@ def _handle_cancel_task(evt: Dict[str, Any], ctx: Any) -> None:
     acknowledgement, and ✅ is sent only after a CONFIRMED teardown + durable
     settled write."""
     task_id = str(evt.get("task_id") or "").strip()
+    requested_task_id = str(evt.get("requested_task_id") or "").strip()
+    display_task_id = requested_task_id or task_id
     st = ctx.load_state()
     owner_chat_id = st.get("owner_chat_id")
     from supervisor.queue import (
-        CANCEL_ALREADY_SETTLED, CANCEL_CANCELLED, CANCEL_NOT_FOUND, cancel_task_custody,
+        CANCEL_ALREADY_SETTLED,
+        CANCEL_CANCELLED,
+        CANCEL_NOT_FOUND,
+        drive_cancel_intent_scope,
     )
 
-    outcome = cancel_task_custody(task_id) if task_id else CANCEL_NOT_FOUND
+    outcome = drive_cancel_intent_scope(task_id) if task_id else CANCEL_NOT_FOUND
     if not owner_chat_id:
         return
     if outcome == CANCEL_CANCELLED:
         ctx.send_with_budget(
             int(owner_chat_id),
-            f"✅ cancel {task_id or '?'}: teardown confirmed, outcome settled (event)",
+            f"✅ cancel {display_task_id or '?'}: teardown confirmed, outcome settled (event)",
         )
     elif outcome == CANCEL_ALREADY_SETTLED:
         settled_status = str(
@@ -3874,25 +3886,28 @@ def _handle_cancel_task(evt: Dict[str, Any], ctx: Any) -> None:
         )
         ctx.send_with_budget(
             int(owner_chat_id),
-            f"ℹ️ cancel {task_id or '?'}: the task had already finished "
+            f"ℹ️ cancel {display_task_id or '?'}: the task had already finished "
             f"({settled_status}) — its result is preserved, nothing was torn down (event)",
         )
     elif outcome == CANCEL_NOT_FOUND:
         ctx.send_with_budget(
             int(owner_chat_id),
-            f"⚠️ cancel {task_id or '?'}: no such live task (event)",
+            f"⚠️ cancel {display_task_id or '?'}: no such live task (event)",
         )
     else:
+        incident_meta = {
+            "task_incident": "cancellation_fault",
+            "toast_once": f"{display_task_id or 'unknown'}:cancellation_fault",
+        }
+        if task_id and display_task_id != task_id:
+            incident_meta["cancel_physical_task_id"] = task_id
         ctx.send_with_budget(
             int(owner_chat_id),
-            f"❌ cancel {task_id or '?'} did not settle — the task is still live; "
+            f"❌ cancel {display_task_id or '?'} did not settle — the task is still live; "
             "the durable cancel intent stays open and the supervisor watchdog retries (event)",
             is_progress=True,
-            task_id=task_id,
-            progress_meta={
-                "task_incident": "cancellation_fault",
-                "toast_once": f"{task_id or 'unknown'}:cancellation_fault",
-            },
+            task_id=display_task_id,
+            progress_meta=incident_meta,
         )
 
 
@@ -4195,11 +4210,7 @@ def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
         "ts": data.get("ts", utc_now_iso()),
         **data,
     }
-    bound_chat = _bound_project_chat_id(
-        ctx, payload.get("task_id"), payload.get("parent_task_id"), payload.get("root_task_id")
-    )
-    if bound_chat:
-        payload["chat_id"] = bound_chat
+    _address_ctx(ctx, payload)
     try:
         ctx.bridge.push_log(payload)
     except Exception:
@@ -4214,6 +4225,7 @@ def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
 def _handle_skill_lifecycle(evt: Dict[str, Any], ctx: Any) -> None:
     payload = dict(evt)
     payload.setdefault("ts", utc_now_iso())
+    _address_ctx(ctx, payload)
     try:
         ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", payload)
     except Exception:

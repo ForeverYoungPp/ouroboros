@@ -41,6 +41,26 @@ class TelegramTransportError(RuntimeError):
     """Telegram could not return a trustworthy API response yet."""
 
 
+# Shared degraded-transport pacing contract for the poller and notifier loops:
+# the first retry waits TELEGRAM_RETRY_INITIAL_SEC and each further consecutive
+# failure doubles the wait monotonically up to TELEGRAM_RETRY_MAX_SEC; any
+# successful API round resets the wait to the initial value.
+TELEGRAM_RETRY_INITIAL_SEC = 5
+TELEGRAM_RETRY_MAX_SEC = 60
+
+
+def next_telegram_retry_delay(current: float) -> float:
+    """Next monotone backoff step after one more consecutive transient failure."""
+    return min(max(float(current), TELEGRAM_RETRY_INITIAL_SEC) * 2, TELEGRAM_RETRY_MAX_SEC)
+
+
+def is_transient_telegram_error(exc: BaseException) -> bool:
+    """Whether *exc* is a typed transient Telegram failure worth retrying."""
+    if isinstance(exc, TelegramTransportError):
+        return True
+    return isinstance(exc, TelegramRequestRejected) and exc.transient
+
+
 def _chunk_raw_text(text: str, limit: int = _TELEGRAM_CHUNK_RAW) -> list[str]:
     """Split raw text into <=limit-char pieces on line, then space, boundaries."""
     if len(text) <= limit:

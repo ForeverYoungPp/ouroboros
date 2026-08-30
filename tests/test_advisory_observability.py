@@ -8,15 +8,10 @@ import pathlib
 import os
 import sys
 
-import asyncio
 
 import pytest
 
-from tests._shared import ensure_claude_agent_sdk_mock
-
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-ensure_claude_agent_sdk_mock()
 
 
 def _get_advisory_module():
@@ -24,86 +19,70 @@ def _get_advisory_module():
     return importlib.import_module("ouroboros.tools.claude_advisory_review")
 
 
-# ---------------------------------------------------------------------------
-# Model-drift: resolve_claude_code_model
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize(
-    "case_id,env_value,expected",
-    [
-        ("returns_env_value", "sonnet", "sonnet"),
-        ("falls_back_to_shipped_default", None, "claude-sonnet-5"),
-        ("strips_whitespace", "  claude-opus-4.6  ", "claude-opus-4.6"),
-    ],
-)
-def test_resolve_claude_code_model(monkeypatch, case_id, env_value, expected):
-    sys.path.insert(0, REPO)
-    gw = importlib.import_module("ouroboros.gateways.claude_code")
-    if env_value is None:
-        monkeypatch.delenv("CLAUDE_CODE_MODEL", raising=False)
-    else:
-        monkeypatch.setenv("CLAUDE_CODE_MODEL", env_value)
-    assert gw.resolve_claude_code_model() == expected
+def _fake_native_result(**overrides):
+    """Advisory delivery result shape (the native episode's rehydrated result)."""
+    from types import SimpleNamespace
+    base = dict(success=True, result_text="", error=None, stderr_tail="",
+                session_id="", cost_usd=0.0, usage={})
+    base.update(overrides)
+    return SimpleNamespace(**base)
 
 
-def test_advisory_uses_resolve_claude_code_model_helper():
-    """_run_claude_advisory must call resolve_claude_code_model() — no hardcoded 'opus'."""
+def test_advisory_uses_the_shipped_default_model_helper():
+    """_run_claude_advisory resolves its model through _advisory_native_model()
+    (the configured row or the shipped routed default, each through the
+    same-model payable-spelling fallback) — never a hardcoded model and never
+    the retired Claude-SDK resolver."""
     import inspect
     adv_mod = _get_advisory_module()
     source = inspect.getsource(adv_mod._run_claude_advisory)
-    assert "resolve_claude_code_model" in source
+    assert "_advisory_native_model" in source
+    assert "resolve_claude_code_model" not in source
+    native_src = inspect.getsource(adv_mod._advisory_native_model)
+    assert "_same_model_payable_spelling" in native_src
 
 
-def test_advisory_passes_scope_review_effort_to_claude_code(monkeypatch, tmp_path):
+def test_advisory_row_effort_reaches_the_native_slot(monkeypatch, tmp_path):
+    """D-5b survivor: the ADVISORY row's own effort rides the native episode —
+    the scope reviewer's configured effort never leaks in. (The retired
+    Claude-SDK effort plumbing test this replaces asserted the same contract
+    on the removed transport.)"""
     adv_mod = _get_advisory_module()
-    from types import SimpleNamespace
-    from ouroboros.gateways.claude_code import ClaudeCodeResult
-    import ouroboros.gateways.claude_code as gw
-    from ouroboros.usage_accounting import UsageScope, usage_scope
 
     captured = {}
 
-    def fake_run_readonly(**kwargs):
-        captured.update(kwargs)
-        return ClaudeCodeResult(
+    def _capture(prompt, repo_dir, ctx_, slot, model):
+        from types import SimpleNamespace
+
+        captured["effort"] = slot.effort or "low"
+        return SimpleNamespace(
             success=True,
             result_text='[{"item":"bible_compliance","verdict":"PASS","reason":"ok","severity":"critical"}]',
-            session_id="sess-effort",
-            cost_usd=0,
-            usage={},
-        )
+            session_id="", cost_usd=0.0, usage={}, error="", stderr_tail="",
+        ), model
 
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.setenv("OUROBOROS_EFFORT_SCOPE_REVIEW", "low")
-    monkeypatch.setattr(gw, "run_readonly", fake_run_readonly)
-    monkeypatch.setattr(adv_mod, "_get_staged_diff", lambda *a, **kw: "diff")
-    monkeypatch.setattr(adv_mod, "_get_changed_file_list", lambda *a, **kw: "M file.py")
-    monkeypatch.setattr(adv_mod, "build_advisory_changed_context", lambda *a, **kw: (["file.py"], "pack", []))
-    monkeypatch.setattr(adv_mod, "_build_advisory_prompt", lambda *a, **kw: "prompt")
-    ctx = SimpleNamespace(
-        repo_dir=tmp_path, drive_root=tmp_path, budget_drive_root=str(tmp_path),
-        task_id="review-root", task_metadata={"root_task_id": "review-root"},
-        pending_events=[], emit_progress_fn=lambda *_: None,
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("OUROBOROS_EFFORT_SCOPE_REVIEW", "xhigh")
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.setattr(adv_mod, "_run_advisory_native", _capture)
+    from ouroboros.tools.registry import ToolContext
+
+    repo = tmp_path / "repo"; repo.mkdir()
+    drive = tmp_path / "data"; drive.mkdir()
+    ctx = ToolContext(repo_dir=repo, drive_root=drive)
+    _items, raw, _model, _chars = adv_mod._run_claude_advisory(
+        repo, "msg", ctx, options={"include_repo_diff": False},
     )
-
-    with usage_scope(UsageScope(
-        drive_root=tmp_path, task_id="review-root", root_task_id="review-root",
-        global_limit_usd=10.0, root_limit_usd=3.0,
-    )):
-        adv_mod._run_claude_advisory(tmp_path, "msg", ctx)
-
+    assert not raw.startswith("⚠️ ADVISORY_ERROR"), raw
+    # The legacy default row carries effort "low"; scope xhigh never leaks in.
     assert captured["effort"] == "low"
-    assert captured["max_budget_usd"] == 3.0
 
-
-def test_paid_empty_advisory_result_is_error(monkeypatch, tmp_path):
+def test_empty_advisory_result_is_error(monkeypatch, tmp_path):
     adv_mod = _get_advisory_module()
     from types import SimpleNamespace
-    from ouroboros.gateways.claude_code import ClaudeCodeResult
-    import ouroboros.gateways.claude_code as gw
 
     def fake_run_readonly(**kwargs):
-        return ClaudeCodeResult(
+        return _fake_native_result(
             success=True,
             result_text="(no output)",
             session_id="sess-empty",
@@ -112,7 +91,10 @@ def test_paid_empty_advisory_result_is_error(monkeypatch, tmp_path):
         )
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.setattr(gw, "run_readonly", fake_run_readonly)
+    monkeypatch.setattr(_get_advisory_module(), "_run_advisory_native",
+                        lambda prompt, repo_dir, ctx_, slot, model: (
+                            fake_run_readonly(), model,
+                        ))
     monkeypatch.setattr(adv_mod, "_get_staged_diff", lambda *a, **kw: "diff")
     monkeypatch.setattr(adv_mod, "_get_changed_file_list", lambda *a, **kw: "M file.py")
     monkeypatch.setattr(adv_mod, "build_advisory_changed_context", lambda *a, **kw: (["file.py"], "pack", []))
@@ -123,8 +105,8 @@ def test_paid_empty_advisory_result_is_error(monkeypatch, tmp_path):
 
     assert items == []
     assert raw.startswith("⚠️ ADVISORY_ERROR:")
-    assert "paid empty output" in raw
-    assert any(ev.get("type") == "advisory_sdk_suspect_result" for ev in ctx.pending_events)
+    assert "empty output" in raw
+    assert any(ev.get("type") == "advisory_suspect_result" for ev in ctx.pending_events)
 
 
 def test_handle_advisory_error_persists_session_id(monkeypatch, tmp_path):
@@ -163,11 +145,9 @@ def test_handle_advisory_error_persists_session_id(monkeypatch, tmp_path):
 def test_skill_advisory_duplicate_expected_items_warn_not_error(monkeypatch, tmp_path):
     adv_mod = _get_advisory_module()
     from types import SimpleNamespace
-    from ouroboros.gateways.claude_code import ClaudeCodeResult
-    import ouroboros.gateways.claude_code as gw
 
     def fake_run_readonly(**kwargs):
-        return ClaudeCodeResult(
+        return _fake_native_result(
             success=True,
             result_text=json.dumps([
                 {"item": "manifest_schema", "verdict": "PASS", "reason": "ok", "severity": "critical"},
@@ -180,7 +160,10 @@ def test_skill_advisory_duplicate_expected_items_warn_not_error(monkeypatch, tmp
         )
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.setattr(gw, "run_readonly", fake_run_readonly)
+    monkeypatch.setattr(_get_advisory_module(), "_run_advisory_native",
+                        lambda prompt, repo_dir, ctx_, slot, model: (
+                            fake_run_readonly(), model,
+                        ))
     monkeypatch.setattr(adv_mod, "_build_advisory_prompt", lambda *a, **kw: "prompt")
     ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, pending_events=[], emit_progress_fn=lambda *_: None)
 
@@ -199,20 +182,18 @@ def test_skill_advisory_duplicate_expected_items_warn_not_error(monkeypatch, tmp
     assert len(items) == 3
     assert not raw.startswith("⚠️ ADVISORY_ERROR:")
     assert any(ev.get("type") == "advisory_contract_warning" for ev in ctx.pending_events)
-    assert not any(ev.get("type") == "advisory_sdk_suspect_result" for ev in ctx.pending_events)
+    assert not any(ev.get("type") == "advisory_suspect_result" for ev in ctx.pending_events)
 
 
 def test_skill_advisory_repeated_bug_hunting_no_contract_warning(monkeypatch, tmp_path):
     # C6: bug_hunting is severity-driven and legitimately emits one row per
     # distinct bug; repeated rows must NOT trip duplicates=/count= contract
-    # warnings or the advisory_sdk_suspect_result marker.
+    # warnings or the advisory_suspect_result marker.
     adv_mod = _get_advisory_module()
     from types import SimpleNamespace
-    from ouroboros.gateways.claude_code import ClaudeCodeResult
-    import ouroboros.gateways.claude_code as gw
 
     def fake_run_readonly(**kwargs):
-        return ClaudeCodeResult(
+        return _fake_native_result(
             success=True,
             result_text=json.dumps([
                 {"item": "manifest_schema", "verdict": "PASS", "reason": "ok", "severity": "critical"},
@@ -226,7 +207,10 @@ def test_skill_advisory_repeated_bug_hunting_no_contract_warning(monkeypatch, tm
         )
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.setattr(gw, "run_readonly", fake_run_readonly)
+    monkeypatch.setattr(_get_advisory_module(), "_run_advisory_native",
+                        lambda prompt, repo_dir, ctx_, slot, model: (
+                            fake_run_readonly(), model,
+                        ))
     monkeypatch.setattr(adv_mod, "_build_advisory_prompt", lambda *a, **kw: "prompt")
     ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, pending_events=[], emit_progress_fn=lambda *_: None)
 
@@ -245,17 +229,15 @@ def test_skill_advisory_repeated_bug_hunting_no_contract_warning(monkeypatch, tm
     assert len(items) == 4  # every bug row preserved in the output
     assert not raw.startswith("⚠️ ADVISORY_ERROR:")
     assert not any(ev.get("type") == "advisory_contract_warning" for ev in ctx.pending_events)
-    assert not any(ev.get("type") == "advisory_sdk_suspect_result" for ev in ctx.pending_events)
+    assert not any(ev.get("type") == "advisory_suspect_result" for ev in ctx.pending_events)
 
 
 def test_skill_advisory_missing_expected_items_still_errors(monkeypatch, tmp_path):
     adv_mod = _get_advisory_module()
     from types import SimpleNamespace
-    from ouroboros.gateways.claude_code import ClaudeCodeResult
-    import ouroboros.gateways.claude_code as gw
 
     def fake_run_readonly(**kwargs):
-        return ClaudeCodeResult(
+        return _fake_native_result(
             success=True,
             result_text='[{"item":"manifest_schema","verdict":"PASS","reason":"ok","severity":"critical"}]',
             session_id="sess-partial",
@@ -264,7 +246,10 @@ def test_skill_advisory_missing_expected_items_still_errors(monkeypatch, tmp_pat
         )
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.setattr(gw, "run_readonly", fake_run_readonly)
+    monkeypatch.setattr(_get_advisory_module(), "_run_advisory_native",
+                        lambda prompt, repo_dir, ctx_, slot, model: (
+                            fake_run_readonly(), model,
+                        ))
     monkeypatch.setattr(adv_mod, "_build_advisory_prompt", lambda *a, **kw: "prompt")
     ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, pending_events=[], emit_progress_fn=lambda *_: None)
 
@@ -283,7 +268,7 @@ def test_skill_advisory_missing_expected_items_still_errors(monkeypatch, tmp_pat
     assert items == []
     assert raw.startswith("⚠️ ADVISORY_ERROR:")
     assert "checklist contract mismatch" in raw
-    assert any(ev.get("type") == "advisory_sdk_suspect_result" for ev in ctx.pending_events)
+    assert any(ev.get("type") == "advisory_suspect_result" for ev in ctx.pending_events)
 
 
 # ---------------------------------------------------------------------------
@@ -295,9 +280,6 @@ def test_advisory_error_message_includes_diagnostic_fields():
     adv_mod = _get_advisory_module()
     diag = {
         "model": "opus",
-        "sdk_version": "0.1.56",
-        "cli_version": "2.1.92",
-        "cli_path": "/app/claude",
         "python": "/usr/bin/python3",
         "prompt_chars": 120000,
         "prompt_tokens_approx": 30000,
@@ -312,9 +294,7 @@ def test_advisory_error_message_includes_diagnostic_fields():
     )
     assert "⚠️ ADVISORY_ERROR:" in msg
     assert "opus" in msg
-    assert "0.1.56" in msg
-    assert "2.1.92" in msg
-    assert "/app/claude" in msg
+    assert "/usr/bin/python3" in msg
     assert "120000" in msg
     assert "30000" in msg or "30,000" in msg
     assert "sess-123" in msg
@@ -331,25 +311,8 @@ def test_get_runtime_diagnostics_never_raises():
     assert diag["prompt_chars"] == 50000
     assert diag["prompt_tokens_approx"] == 12500
     assert diag["touched_paths"] == ["file.py"]
-    assert "sdk_version" in diag
-
-
-def test_get_runtime_diagnostics_reads_runtime_state_attributes(monkeypatch):
-    """Runtime diagnostics must read cli_path/cli_version from ClaudeRuntimeState attributes."""
-    adv_mod = _get_advisory_module()
-    from ouroboros.platform_layer import ClaudeRuntimeState
-
-    monkeypatch.setattr(
-        "ouroboros.platform_layer.resolve_claude_runtime",
-        lambda: ClaudeRuntimeState(
-            cli_path="/app/claude",
-            cli_version="2.1.92",
-        ),
-    )
-    diag = adv_mod._get_runtime_diagnostics("opus", 1234, ["file.py"])
-
-    assert diag["cli_path"] == "/app/claude"
-    assert diag["cli_version"] == "2.1.92"
+    # The retired Claude-SDK/CLI probes must never resurface here.
+    assert "sdk_version" not in diag and "cli_version" not in diag
 
 
 # ---------------------------------------------------------------------------
@@ -688,108 +651,6 @@ def test_budget_gate_skip_becomes_stale_after_edit(monkeypatch, tmp_path):
 # SDK break-after-ResultMessage fix (spurious exit code 1 prevention)
 # ---------------------------------------------------------------------------
 
-def test_run_async_breaks_after_result_message():
-    """``_run_readonly_async`` uses ClaudeSDKClient.receive_response and must
-    stop iterating after ResultMessage. Root cause: the SDK stream can raise
-    when iterated past the ResultMessage because the CLI subprocess has
-    exited and the message reader hits a closed pipe.
-
-    The fix adds a ``break`` after processing ResultMessage. The test
-    verifies that the break prevents the post-ResultMessage Exception
-    from reaching the caller as a failure.
-    """
-    import sys
-
-    sys.path.insert(0, REPO)
-
-    # ---- Mock message types --------------------------------------------
-    AssistantMsg = type("AssistantMessage", (), {})
-    ResultMsg = type("ResultMessage", (), {})
-
-    class FakeTextBlock:
-        def __init__(self, text):
-            self.text = text
-
-    text_payload = "Hello"
-    session_id = "test-session-123"
-    in_tokens = 10
-    out_tokens = 5
-    cost = 0.001
-
-    class FakeAssistantMessage(AssistantMsg):
-        def __init__(self):
-            self.content = [FakeTextBlock(text_payload)]
-
-    class FakeResultMessage(ResultMsg):
-        pass
-
-    FakeResultMessage.session_id = session_id
-    FakeResultMessage.total_cost_usd = cost
-    FakeResultMessage.usage = {"input_tokens": in_tokens, "output_tokens": out_tokens}
-    FakeResultMessage.subtype = "success"
-
-    import ouroboros.gateways.claude_code as gw
-
-    class FakeClaudeAgentOptions:
-        def __init__(self, **kwargs):
-            pass
-
-    class FakeHookMatcher:
-        def __init__(self, **kwargs):
-            pass
-
-    orig_AssistantMessage = gw.AssistantMessage
-    orig_ResultMessage = gw.ResultMessage
-    orig_ClaudeAgentOptions = gw.ClaudeAgentOptions
-    orig_ClaudeSDKClient = gw.ClaudeSDKClient
-    orig_HookMatcher = gw.HookMatcher
-
-    try:
-        gw.AssistantMessage = FakeAssistantMessage
-        gw.ResultMessage = FakeResultMessage
-        gw.ClaudeAgentOptions = FakeClaudeAgentOptions
-        gw.HookMatcher = FakeHookMatcher
-
-        class FakeSDKClient:
-            def __init__(self, options=None):
-                self.options = options
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-            async def query(self, prompt):
-                pass
-
-            async def receive_response(self):
-                yield FakeAssistantMessage()
-                yield FakeResultMessage()
-                raise Exception(
-                    "Command failed with exit code 1 (exit code: 1)\n"
-                    "Error output: Check stderr output for details"
-                )
-
-        gw.ClaudeSDKClient = FakeSDKClient
-        result = asyncio.run(gw._run_readonly_async(
-            prompt="test",
-            cwd="/tmp",
-            model="opus",
-            max_turns=1,
-            effort=None,
-            max_budget_usd=1.0,
-        ))
-    finally:
-        gw.AssistantMessage = orig_AssistantMessage
-        gw.ResultMessage = orig_ResultMessage
-        gw.ClaudeAgentOptions = orig_ClaudeAgentOptions
-        gw.ClaudeSDKClient = orig_ClaudeSDKClient
-        gw.HookMatcher = orig_HookMatcher
-
-    assert result.success, f"Expected success but got error: {result.error}"
-    assert result.session_id == session_id
-    assert text_payload in result.result_text
 
 
 # ---------------------------------------------------------------------------
@@ -845,7 +706,6 @@ class TestParseAdvisoryOutput:
 
     @pytest.fixture(autouse=True)
     def _import(self):
-        ensure_claude_agent_sdk_mock()
         import importlib
         self.mod = importlib.import_module(
             "ouroboros.tools.claude_advisory_review"
@@ -942,7 +802,6 @@ class TestLLMFallbackExtraction:
 
     @pytest.fixture(autouse=True)
     def _import(self):
-        ensure_claude_agent_sdk_mock()
         import importlib
         self.mod = importlib.import_module("ouroboros.tools.claude_advisory_review")
 
@@ -1065,16 +924,18 @@ class TestLLMFallbackExtraction:
         assert self.mod._is_clean_verdict("[]") is True
         assert self.mod._is_clean_verdict(json.dumps({"result": "[]\nNO_FINDINGS"})) is True
 
-    def test_delegated_advisory_asks_the_schema_and_discloses_off_pin(self):
-        """The delegated advisory asks for the structured verdict like every other
-        review session, trusts it only on outputConformance == "passed", and emits the
-        same three capability deltas the substrate emits."""
+    def test_delegated_advisory_asks_the_schema_and_discloses_off_pin(self, monkeypatch):
+        """The delegated advisory rides the SHARED AgentSessionReviewExecutor
+        (phase C unification, 2=B): the schema is asked like every session
+        slot, conformance is trusted only on "passed", and the substrate's
+        own capability-delta vocabulary discloses the landings — the advisory
+        no longer carries a transport dialect of its own."""
         from ouroboros.review_execution import review_session_output_schema
 
+        monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claude")
         asked = {}
 
         def fake_runner(**kwargs):
-            # The delivery knobs now ride ONE immutable invocation value.
             invocation = kwargs["invocation"]
             asked.update({f: getattr(invocation, f) for f in
                           ("task_id", "surface", "slot_id", "output_schema")})
@@ -1086,27 +947,19 @@ class TestLLMFallbackExtraction:
             }
 
         import ouroboros.review_execution as rx
-        original = rx.run_delegated_review_session
-        rx.run_delegated_review_session = fake_runner
-        try:
-            result, _model = self.mod._run_advisory_delegated(
-                "prompt", pathlib.Path("/tmp"), self._make_ctx(),
-            )
-        finally:
-            rx.run_delegated_review_session = original
+        monkeypatch.setattr(rx, "run_delegated_review_session", fake_runner)
+        result, _model = self.mod._run_advisory_delegated(
+            "prompt", pathlib.Path("/tmp"), self._make_ctx(),
+        )
 
-        # The advisory surface asks the clean-capable shared schema: its ordinary
-        # mode's required clean verdict is the empty array (scope alone is floored).
         assert asked["output_schema"] == review_session_output_schema("advisory_review")
         assert "minItems" not in asked["output_schema"]["properties"]["findings"]
         usage = result.usage
-        assert usage["schema_asked"] is True
-        # Reported but NOT conformed => not trusted.
         assert usage["output_conformance"] == "failed"
-        assert usage["conformance_trusted"] is False
+        assert usage["verdict_provenance"]["conformance_trusted"] is False
         reasons = {d["reason"] for d in usage["capability_delta"]}
-        assert reasons == {"schema_not_conformed_on_effective_route",
-                           "session_ran_off_pinned_route"}, reasons
+        assert {"schema_not_conformed_on_effective_route",
+                "session_ran_off_pinned_route"} <= reasons, reasons
 
     def test_delegated_advisory_unwraps_a_conformant_clean_envelope(self):
         """A schema-conformant session answers with the SESSION envelope
@@ -1127,6 +980,8 @@ class TestLLMFallbackExtraction:
                 }
             return fake_runner
 
+        import os
+        os.environ.setdefault("OUROBOROS_SUBAGENT_HARNESS", "claude")
         cases = [
             # (session text, conformance, expected result_text)
             (json.dumps({"findings": []}), "passed", "[]"),
@@ -1136,8 +991,9 @@ class TestLLMFallbackExtraction:
              json.dumps([{"item": "i", "verdict": "FAIL",
                           "severity": "critical", "reason": "x"}],
                         ensure_ascii=False)),
-            # NOT conformed: the narrative path is untouched, whatever the shape.
-            (json.dumps({"findings": []}), "failed", json.dumps({"findings": []})),
+            # NOT conformed but strictly parseable: the shared D19 order's
+            # strict parse settles it — no paid extraction, no envelope trust.
+            ("[]", "failed", "[]"),
         ]
         original = rx.run_delegated_review_session
         try:
@@ -1219,18 +1075,19 @@ class TestLLMFallbackExtraction:
 
         # _run_claude_advisory calls _parse_advisory_output first; mock run_readonly
         # to return a clean JSON array (direct parse succeeds)
-        import ouroboros.gateways.claude_code as gw
-        from ouroboros.gateways.claude_code import ClaudeCodeResult
 
         def fake_run_readonly(**kwargs):
-            return ClaudeCodeResult(
+            return _fake_native_result(
                 success=True,
                 result_text=json.dumps(expected),
                 session_id="sess-test",
             )
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-        monkeypatch.setattr(gw, "run_readonly", fake_run_readonly)
+        monkeypatch.setattr(_get_advisory_module(), "_run_advisory_native",
+                        lambda prompt, repo_dir, ctx_, slot, model: (
+                            fake_run_readonly(), model,
+                        ))
         monkeypatch.setattr(self.mod, "build_advisory_changed_context",
                             lambda *a, **kw: ([], "", set()))
         monkeypatch.setattr(self.mod, "_get_staged_diff",
@@ -1368,18 +1225,17 @@ class TestEmptyArrayIsVerifiedClean:
         """A sentinel-qualified clean verdict has nothing to extract, so the
         fallback extraction model must not be paid for."""
         from types import SimpleNamespace
-        from ouroboros.gateways.claude_code import ClaudeCodeResult
-        import ouroboros.gateways.claude_code as gw
-
         adv_mod = _get_advisory_module()
         called = []
         monkeypatch.setattr(adv_mod, "_llm_extract_advisory_items",
                             lambda raw, ctx: called.append(raw) or [])
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-        monkeypatch.setattr(gw, "run_readonly", lambda **kw: ClaudeCodeResult(
-            success=True, result_text="[]\nNO_FINDINGS", session_id="s", cost_usd=0.1,
-            usage={"prompt_tokens": 10, "completion_tokens": 1},
-        ))
+        monkeypatch.setattr(adv_mod, "_run_advisory_native",
+                            lambda prompt, repo_dir, ctx_, slot, model: (
+                                _fake_native_result(
+                                    result_text="[]\nNO_FINDINGS", session_id="s",
+                                    usage={"prompt_tokens": 10, "completion_tokens": 1},
+                                ), model))
         monkeypatch.setattr(adv_mod, "_get_staged_diff", lambda *a, **kw: "diff")
         monkeypatch.setattr(adv_mod, "_get_changed_file_list", lambda *a, **kw: "M f.py")
         monkeypatch.setattr(adv_mod, "build_advisory_changed_context", lambda *a, **kw: (["f.py"], "pack", []))

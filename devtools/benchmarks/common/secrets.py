@@ -58,7 +58,11 @@ def credential_fingerprint(value: Any) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-def isolated_credential_grants(cfg: dict) -> dict:
+def isolated_credential_grants(
+    cfg: dict,
+    *,
+    include_claude_sdk_defaults: bool = True,
+) -> dict:
     """Describe, by FINGERPRINT and never by value, which provider credentials a benchmark
     settings mapping actually carries — and which its declared model slots called for.
 
@@ -70,7 +74,10 @@ def isolated_credential_grants(cfg: dict) -> dict:
     from ouroboros.provider_models import ALL_PROVIDER_CREDENTIAL_KEYS, provider_credential_plan
 
     settings = cfg or {}
-    plan = provider_credential_plan(settings)
+    plan = provider_credential_plan(
+        settings,
+        include_claude_sdk_defaults=include_claude_sdk_defaults,
+    )
     present = {
         key: settings.get(key)
         for key in sorted(ALL_PROVIDER_CREDENTIAL_KEYS)

@@ -788,54 +788,6 @@ def _accept_owner_directives(ctx: Any, drive_root: Any, task_id: str) -> List[Di
     return rows
 
 
-_ACCEPT_DELTA_CHILD_CAP = 20  # reduced-children rows in the finalizer aggregate
-
-
-def _accept_capability_deltas(drive_root: Any, task_id: str, root_task_id: str) -> Dict[str, Any]:
-    """Typed aggregate of capability reductions for the FINALIZER (one section).
-
-    The task's own dispatch delta plus every DIRECT child that ran below what
-    was asked for (lane served on Main, executor fallback to metered tokens,
-    profile reduction). Each delta is disclosed at absorption — but absorption
-    happens mid-flight, dozens of rounds before the final claim is written, and
-    nothing carried the accumulated picture to finalization: a result built on
-    degraded runs was judged as if everything ran as scheduled. One bounded,
-    host-attested section; ``disclosable_capability_delta`` is the SAME predicate
-    the absorption surfaces use, so this cannot disagree with what the parent
-    was told. Empty dict when nothing was reduced (noise-free by construction).
-    """
-    from ouroboros.task_results import load_task_result
-    from ouroboros.task_status import find_child_tasks
-    from ouroboros.tools.control import disclosable_capability_delta
-
-    out: Dict[str, Any] = {}
-    try:
-        own = disclosable_capability_delta(load_task_result(drive_root, task_id) or {})
-        if own:
-            out["own"] = own
-        children: List[Dict[str, Any]] = []
-        for row in find_child_tasks(
-            drive_root,
-            parent_task_id=task_id,
-            root_task_id=root_task_id or task_id,
-            scope="direct",
-        ):
-            delta = disclosable_capability_delta(row)
-            if delta:
-                children.append({
-                    "task_id": str(row.get("task_id") or ""),
-                    "status": str(row.get("status") or ""),
-                    "capability_delta": delta,
-                })
-        if children:
-            out["children_reduced_count"] = len(children)
-            if len(children) > _ACCEPT_DELTA_CHILD_CAP:
-                out["children_omitted"] = len(children) - _ACCEPT_DELTA_CHILD_CAP
-                children = children[:_ACCEPT_DELTA_CHILD_CAP]
-            out["children"] = children
-    except Exception:
-        log.debug("Failed to aggregate capability deltas for acceptance evidence", exc_info=True)
-    return out
 
 
 def build_task_acceptance_evidence(
@@ -929,10 +881,17 @@ def build_task_acceptance_evidence(
         if mutation_projection:
             ev["mutation_attribution"] = mutation_projection
             prov["mutation_attribution"] = "host_attested"
-        delta_aggregate = _accept_capability_deltas(drive_root, task_id, root_task_id)
-        if delta_aggregate:
+        from ouroboros.delegate_evidence import (
+            acceptance_capability_deltas,
+            acceptance_substrate_facts,
+        )
+
+        if delta_aggregate := acceptance_capability_deltas(drive_root, task_id, root_task_id):
             ev["capability_deltas"] = redact_projection(delta_aggregate).value
             prov["capability_deltas"] = "host_attested"
+        if substrate_facts := acceptance_substrate_facts(ctx, task_id):
+            ev["substrate_execution"] = redact_projection(substrate_facts).value
+            prov["substrate_execution"] = "host_attested"
     repo_diff = collect_turn_diff(ctx, include_recent_commit=include_recent_commit)
     diff_meta: Dict[str, Any] = {}
     if "OMISSION NOTE: truncated at " in str(repo_diff or "") or "... (truncated from " in str(repo_diff or ""):
@@ -1465,7 +1424,7 @@ def _review_status_message(projection: Dict[str, Any]) -> str:
     current = f"Current advisory: {projection['effective_status']}"
     if ca and ca.status in ("blocked", "failed"):
         reason_map = {
-            "no_advisory": "No fresh advisory review found. Run advisory_review first.",
+            "no_advisory": "No fresh advisory review found. Run preflight_review first.",
             "critical_findings": "Reviewers found critical issues. Fix all issues listed, then re-run advisory.",
             "review_quorum": "Not enough review models responded. Retry — usually transient.",
             "parse_failure": "Review models could not produce parseable output. Retry the commit.",

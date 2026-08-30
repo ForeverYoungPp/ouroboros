@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import pathlib
+import queue
 
 import pytest
 
@@ -495,6 +496,15 @@ class TestDesktopChatFullSetStaging:
 
         drive = _drive(tmp_path)
         monkeypatch.setattr(workers, "DRIVE_ROOT", drive)
+        # This test pins the attachment-staging seam, not the process-lifetime
+        # event bus. Use a local queue so the turn never touches get_event_q():
+        # a prior TestClient lifespan in the same xdist worker leaves
+        # _EVENT_Q_SHUTDOWN latched (server shutdown calls shutdown_event_q()),
+        # and the real get_event_q() then raises before agent.handle_task ever
+        # runs, leaving agent.task None (seen on the ubuntu CI shard; same
+        # isolation precedent as tests/test_inflight_indicator_seams.py::
+        # _patch_workers).
+        monkeypatch.setattr(workers, "get_event_q", lambda: queue.Queue())
         # Avoid the proactive namer spinning a real thread/LLM in this unit test
         # (it is a local `from ouroboros.project_naming import ...`, so patch source).
         import ouroboros.project_naming as project_naming
@@ -547,6 +557,11 @@ class TestDesktopChatFullSetStaging:
 
         drive = _drive(tmp_path)
         monkeypatch.setattr(workers, "DRIVE_ROOT", drive)
+        # Same event-bus isolation as test_image_plus_pdf_both_staged_and_
+        # manifest_rendered: a latched _EVENT_Q_SHUTDOWN from a prior TestClient
+        # lifespan in this xdist worker must not abort the turn before
+        # handle_task.
+        monkeypatch.setattr(workers, "get_event_q", lambda: queue.Queue())
         import ouroboros.project_naming as project_naming
         monkeypatch.setattr(project_naming, "spawn_proactive_namer", lambda *a, **k: None)
 

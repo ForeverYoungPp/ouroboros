@@ -87,6 +87,143 @@ def deliver_pending_owner_report(notify: Any = None) -> None:
         log.debug("failed to deliver pending owner report", exc_info=True)
 
 
+def _deliver_pending_owner_report() -> None:
+    """Queue-compatibility wrapper for the server-process owner report."""
+    from supervisor import queue as q
+
+    q.deliver_pending_owner_report(q.notify_owner_cycle_outcome)
+
+
+def enqueue_evolution_task_if_needed() -> None:
+    """Queue evolution only when idle, enabled, within budget, and not failure-paused."""
+    from supervisor import queue as q
+
+    q._deliver_pending_owner_report()
+    if q.PENDING or q.RUNNING:
+        return
+    st = q.load_state()
+    if not bool(st.get("evolution_mode_enabled")):
+        return
+    owner_chat_id = st.get("owner_chat_id")
+    if not owner_chat_id:
+        return
+    campaign = q._read_evolution_campaign()
+    from supervisor.state import update_state
+    has_authority = all(str(campaign.get(key) or "").strip() for key in ("id", "source"))
+    if campaign.get("status") != "active" or not has_authority:
+        q.disable_evolution_authority(
+            "bare_flag_disabled", campaign_id=str(campaign.get("id") or ""),
+        )
+        q.send_with_budget(
+            int(owner_chat_id),
+            "🧬 Evolution stayed off: the enable flag had no active campaign authority. Use /evolve start to begin a fresh campaign.",
+        )
+        return
+    active_tx = campaign.get("active_transaction") if isinstance(campaign.get("active_transaction"), dict) else {}
+    if active_tx and (
+        str(active_tx.get("commit_sha") or "").strip()
+        or str(active_tx.get("dispatch_status") or "") == "reaping"
+    ):
+        return
+
+    # Defensive net: light mode must never run evolution even if the flag was
+    # left enabled (e.g. carried across a restart into light mode). Disable and
+    # pause once; entry points already refuse new starts up front.
+    block = q.evolution_block_reason()
+    if block:
+        q.pause_evolution_campaign("blocked in light runtime mode")
+        q.disable_evolution_projection()
+        q.send_with_budget(int(owner_chat_id), block)
+        return
+
+    consecutive_failures = int(st.get("evolution_consecutive_failures") or 0)
+    if consecutive_failures >= 3:
+        q.pause_evolution_campaign("paused after consecutive failures")
+        q.disable_evolution_projection()
+        q.send_with_budget(
+            int(owner_chat_id),
+            f"🧬⚠️ Evolution paused: {consecutive_failures} consecutive failures. "
+            f"Use /evolve start to resume after investigating the issue."
+        )
+        return
+
+    # BUG3: pause if the SAME objective has been re-proposed and no-op'd
+    # OBJECTIVE_REPEAT_CAP times without ever absorbing. This is a SEPARATE
+    # breaker from consecutive_failures above: that counter is reset to 0 by
+    # ANY non-failing cycle (events.py), so it cannot catch a self-maintenance
+    # loop where a blocked objective is re-proposed NON-consecutively
+    # (interleaved with other no_op work). The per-objective count is keyed on
+    # the same canonical fingerprint the transaction stamps, accumulates across
+    # non-consecutive recurrence, and is cleared only on a genuine absorb.
+    objective_repeat_counts = campaign.get("objective_repeat_counts") or {}
+    active_objective_fp = canonical_objective_fingerprint(
+        str(campaign.get("objective") or ""),
+    )
+    objective_repeats = (
+        int(objective_repeat_counts.get(active_objective_fp, 0))
+        if active_objective_fp else 0
+    )
+    if objective_repeats >= q.OBJECTIVE_REPEAT_CAP:
+        q.pause_evolution_campaign(
+            "paused: objective re-proposed without ever absorbing",
+        )
+        q.disable_evolution_projection()
+        q.send_with_budget(
+            int(owner_chat_id),
+            f"🧬⚠️ Evolution paused: the current objective ran {objective_repeats} reviewed "
+            f"cycles WITHOUT ever being absorbed — it keeps getting re-proposed and never lands "
+            f"(a self-maintenance loop, not progress). A plain resume won't help; use "
+            f"/evolve start with a DIFFERENT objective."
+        )
+        return
+
+    try:
+        remaining = q.budget_remaining(st, strict=True)
+    except Exception:
+        log.error("Evolution scheduling deferred: cost accounting unavailable", exc_info=True)
+        q.append_jsonl(q.DRIVE_ROOT / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(), "type": "evolution_accounting_unavailable",
+            "action": "dispatch_deferred", "owner_visible": True,
+        })
+        return
+    if remaining < q.EVOLUTION_BUDGET_RESERVE:
+        q.pause_evolution_campaign("budget reserve reached")
+        q.disable_evolution_projection()
+        q.send_with_budget(
+            int(owner_chat_id),
+            f"💸 Evolution stopped: ${remaining:.2f} remaining "
+            f"(reserve ${q.EVOLUTION_BUDGET_RESERVE:.0f} for conversations).",
+        )
+        return
+    cycle = int(st.get("evolution_cycle") or 0) + 1
+    tid = uuid.uuid4().hex[:8]
+    transaction = q.begin_evolution_transaction(tid, cycle=cycle, campaign=campaign)
+    if not transaction:
+        q.disable_evolution_authority(
+            "transaction_attach_failed",
+            campaign_id=str(campaign.get("id") or ""), task_id=tid,
+        )
+        q.send_with_budget(
+            int(owner_chat_id),
+            "🧬 Evolution stayed off: the campaign changed before its next task could be attached. Start it again when ready.",
+        )
+        return
+    task = {
+        "id": tid, "type": "evolution",
+        "chat_id": int(owner_chat_id),
+        "text": q.build_evolution_task_text(cycle),
+        "metadata": {"evolution_transaction": transaction},
+    }
+    q.attach_task_contract(task)
+    q.enqueue_task(task)
+
+    def _record_cycle(live: Dict[str, Any]) -> None:
+        live["evolution_cycle"] = cycle
+        live["last_evolution_task_at"] = utc_now_iso()
+
+    update_state(_record_cycle)
+
+
 def _write_evolution_campaign(
     data: Dict[str, Any], *, expected_campaign_id: Optional[str] = None,
     expected_active_transaction: Optional[Dict[str, Any]] = None,

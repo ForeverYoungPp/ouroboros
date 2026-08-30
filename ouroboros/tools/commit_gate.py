@@ -234,6 +234,17 @@ def commit_review_contract_fingerprint() -> str:
                 row_plan["slot_ids"],
             )
         ]
+        # Actor binding is contract identity: a configured-subagent reference
+        # changes the row's DELIVERY (native retrieval vs packet), so replay/
+        # refusal authority must lapse when it changes. The column is added
+        # only when some row carries one, so untouched legacy configs keep
+        # their exact historical bytes (conservative in the paid direction
+        # only where the contract actually changed).
+        triad_actor_ids = [str(a or "") for a in (row_plan.get("subagent_ids") or [])]
+        if any(triad_actor_ids):
+            for row, actor in zip(triad_rows, triad_actor_ids):
+                row.append(actor)
+        scope_slots = list(scope_reviewer_slots())
         scope_rows = [
             [
                 str(getattr(slot, "slot_id", "") or ""),
@@ -243,8 +254,12 @@ def commit_review_contract_fingerprint() -> str:
                 str(getattr(slot, "session_profile", "") or ""),
                 str(getattr(slot, "effort", "") or ""),
             ]
-            for slot in scope_reviewer_slots()
+            for slot in scope_slots
         ]
+        scope_actor_ids = [str(getattr(slot, "subagent_id", "") or "") for slot in scope_slots]
+        if any(scope_actor_ids):
+            for row, actor in zip(scope_rows, scope_actor_ids):
+                row.append(actor)
         prompt_contract = hashlib.sha256(
             "\n".join([REVIEW_PREAMBLE, CRITICAL_FINDING_CALIBRATION, REVIEW_JSON_ARRAY_CONTRACT]).encode("utf-8")
         ).hexdigest()
@@ -923,7 +938,7 @@ def _check_advisory_freshness(ctx: ToolContext, commit_message: str,
         if open_debts:
             lines.append("\nCommit-readiness debt:")
             lines += _render_debts()
-        lines.append("\nFix the flagged issues and re-run advisory_review so it can verify them PASS.")
+        lines.append("\nFix the flagged issues and re-run preflight_review so it can verify them PASS.")
         lines.append("Or bypass: commit_reviewed(commit_message='...', skip_advisory_review=True) (audited).")
         return "\n".join(lines)
 
@@ -943,7 +958,7 @@ def _check_advisory_freshness(ctx: ToolContext, commit_message: str,
             f"⚠️ ADVISORY_PRE_REVIEW_REQUIRED: Last advisory run for this snapshot returned "
             f"parse_failure (hash={snapshot_hash[:12]}, ts={matching_run.ts}). "
             f"The advisory ran but its output could not be parsed — re-run it.{obs_section}\n"
-            "Re-run: advisory_review(commit_message='...')\n"
+            "Re-run: preflight_review(commit_message='...')\n"
             "Or bypass: commit_reviewed(commit_message='...', skip_advisory_review=True) (audited)."
         )
 
@@ -955,7 +970,7 @@ def _check_advisory_freshness(ctx: ToolContext, commit_message: str,
             f"ts={matching_run.ts}). The Claude SDK advisory was skipped because a "
             f"staged `.py` file has a SyntaxError.\n\n"
             f"{preflight_detail}\n\n"
-            "Re-run after fixing: advisory_review(commit_message='...')"
+            "Re-run after fixing: preflight_review(commit_message='...')"
         )
 
     if latest and latest.status == "stale" and state.last_stale_from_edit_ts:
@@ -971,7 +986,7 @@ def _check_advisory_freshness(ctx: ToolContext, commit_message: str,
     if open_obs:
         lines = [f"\nOpen obligations ({len(open_obs)}):"]
         lines += _render_obligations()
-        lines.append("  → advisory_review will verify each obligation is resolved.")
+        lines.append("  → preflight_review will verify each obligation is resolved.")
         obs_section = "\n".join(lines)
     debt_section = ""
     if open_debts:
@@ -987,7 +1002,7 @@ def _check_advisory_freshness(ctx: ToolContext, commit_message: str,
         f"{obs_section}{debt_section}\n\n"
         "Correct workflow:\n"
         "  1. Finish ALL edits first\n"
-        "  2. advisory_review(commit_message='your message')       ← run AFTER all edits\n"
+        "  2. preflight_review(commit_message='your message')       ← run AFTER all edits\n"
         "  3. commit_reviewed(commit_message='your message')       ← run IMMEDIATELY after advisory\n\n"
         "⚠️ Any edit after step 2 makes the advisory stale and requires re-running it.\n\n"
         "To bypass (will be durably audited):\n"

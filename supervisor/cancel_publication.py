@@ -12,7 +12,7 @@ Owns the pieces of a cancel that happen AFTER custody decided the outcome:
 the typed outcome vocabulary, the artifact-honest cancelled result fields,
 the cost reconstruction adapter, the salvage adapter, the owed-before-settle
 outbox registration (GR2-4), the publication of the stored terminal truth,
-and the miss-lane delivery adapter.
+and the miss-lane terminalization/delivery adapter.
 """
 
 from __future__ import annotations
@@ -128,6 +128,18 @@ def _cancel_result_fields(
     except Exception:
         log.debug("Failed to build cancelled artifact fields for task %s", (task or existing or {}).get("id") or (task or existing or {}).get("task_id"), exc_info=True)
     return payload
+
+
+def _intent_outcome_fields(intent: Dict[str, Any]) -> Dict[str, Any]:
+    """``parent_decision`` written only at OUTCOME (phase A): a parent-requested
+    cancel stamps its decision on the SETTLED cancelled result, never at intent
+    time — so a child that finished first keeps a decision-free completed record."""
+    if not isinstance(intent, dict) or not intent.get("requested_by"):
+        return {}
+    fields: Dict[str, Any] = {"parent_decision": "cancelled"}
+    if intent.get("reason"):
+        fields["parent_decision_reason"] = str(intent.get("reason") or "")
+    return fields
 
 
 def _reconstructed_cost_fields(q: Any, task_id: str, task: Dict[str, Any]) -> Dict[str, Any]:
@@ -467,3 +479,125 @@ def _cascade_delivery_row_locked(q: Any, task_id: str) -> Dict[str, Any]:
         if isinstance(task, dict) and q._is_descendant_of(task, task_id) and task.get("chat_id"):
             return dict(task)
     return {}
+
+
+def _finalize_cancel_intent_on_miss(
+    q: Any, task_id: str, *, intent: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Neither queued nor running: settle an open cancel intent (or a legacy
+    ``cancel_requested`` latch file) as cancelled with reconstructed cost.
+
+    Two things this lane must NOT do. It must not invent a task: an intent for an
+    id that has no durable result at all names a task that never existed, and
+    fabricating a ``cancelled`` row with $0 for it would put a phantom task in the
+    ledger — it settles as ``not_found`` instead. And it must not bury a child
+    that finished: when the row names a child drive, the child's own result is
+    copied back BEFORE the cancelled write, so a crash of the split-drive
+    copy-back window cannot cost a completed answer.
+    """
+    from supervisor.queue_transitions import _settled_status
+    from supervisor.task_lifecycle import (
+        SETTLED_ALREADY,
+        _active_intent,
+        _recover_stranded_reaping_slot,
+        _release_intent_claim,
+        _settle_intent,
+    )
+
+    from ouroboros.task_results import (
+        STATUS_CANCEL_REQUESTED, STATUS_CANCELLED, load_task_result,
+        write_task_result,
+    )
+
+    try:
+        active = dict(intent or {})
+        if not active:
+            active = _active_intent(q, task_id)
+        existing = load_task_result(q.DRIVE_ROOT, task_id) or {}
+        legacy_latch = str(existing.get("status") or "") == STATUS_CANCEL_REQUESTED
+        if not active and not legacy_latch:
+            return CANCEL_NOT_FOUND
+        if not existing:
+            # No durable row ANYWHERE for this id: nothing was ever scheduled
+            # under it (a mistyped/stale id reaching the cancel ingress). Settle
+            # the intent honestly rather than minting a cancelled task.
+            _settle_intent(q, task_id, outcome="not_found",
+                           detail="no durable task result for this id", intent=intent)
+            return CANCEL_NOT_FOUND
+        # A concurrent custody attempt may have captured this task between our
+        # own capture miss and here (the pending double-settle probe). If the
+        # live claim is no longer ours, it owns the settle — refuse and let it,
+        # or the watchdog, finish.
+        current = _active_intent(q, task_id)
+        if (
+            intent
+            and current
+            and str(current.get("request_id") or "") == str(intent.get("request_id") or "")
+            and int(current.get("generation") or 0) != int(intent.get("generation") or 0)
+        ):
+            log.warning(
+                "Cancel finalize-on-miss for %s yielded to a newer custody claim", task_id,
+            )
+            return CANCEL_FAILED
+        # A4/completion-wins on the split-drive lane: promote the child's own
+        # terminal result first when the row names a child drive.
+        try:
+            from ouroboros.headless import copy_child_task_result
+
+            if str(existing.get("child_drive_root") or "").strip():
+                copy_child_task_result(pathlib.Path(q.DRIVE_ROOT), {
+                    "id": task_id,
+                    "drive_root": str(existing.get("child_drive_root") or ""),
+                    "child_drive_root": str(existing.get("child_drive_root") or ""),
+                    "delegation_role": str(existing.get("delegation_role") or ""),
+                })
+        except Exception:
+            log.debug("Finalize-on-miss child copy-back failed for %s", task_id, exc_info=True)
+        # GR5-3: neither queued nor running — the worker is gone, but its
+        # delegated runs may still be live; audit custody like the kill path
+        # and thread the disclosure into every miss-lane delivery below.
+        unreconciled = _reconcile_delegated_runs_on_kill(q, task_id)
+        settled = _settled_status(q.DRIVE_ROOT, task_id)
+        if settled:
+            _recover_stranded_reaping_slot(q, task_id, active)
+            owed_ok = _deliver_on_miss(
+                q, task_id, load_task_result(q.DRIVE_ROOT, task_id) or existing, settled,
+                unreconciled_runs=unreconciled,
+            )
+            _settle_or_reopen_intent(q, task_id, owed_ok=owed_ok, intent=intent,
+                                     outcome=SETTLED_ALREADY, detail=settled)
+            return CANCEL_ALREADY_SETTLED
+        existing = load_task_result(q.DRIVE_ROOT, task_id) or existing
+        cost_fields = _reconstructed_cost_fields(q, task_id, existing)
+        stored = write_task_result(
+            q.DRIVE_ROOT, task_id, STATUS_CANCELLED,
+            **_cancel_result_fields(
+                existing, existing=existing, **cost_fields,
+                **_intent_outcome_fields(active),
+                result="Task cancelled (was neither queued nor running at supervisor teardown).",
+            ),
+        )
+        stored_status = str((stored or {}).get("status") or "")
+        if stored_status != STATUS_CANCELLED:
+            # The monotonic guard refused: something settled it while we worked.
+            owed_ok = _deliver_on_miss(q, task_id, stored or existing, stored_status,
+                                       unreconciled_runs=unreconciled)
+            _settle_or_reopen_intent(q, task_id, owed_ok=owed_ok, intent=intent,
+                                     outcome=SETTLED_ALREADY, detail=stored_status)
+            return CANCEL_ALREADY_SETTLED
+        # GR2-4 ordering: the delivery seam registers the answer as OWED before
+        # the intent settles — a crash between the two replays instead of losing
+        # both the watchdog trigger and the answer. GR4-1: an unowed answer
+        # reopens the intent; the publication below still proceeds — the
+        # terminal truth is on disk.
+        owed_ok = _deliver_on_miss(q, task_id, stored or existing, STATUS_CANCELLED,
+                                   unreconciled_runs=unreconciled)
+        _settle_or_reopen_intent(q, task_id, owed_ok=owed_ok, intent=intent,
+                                 outcome="cancelled", detail="finalized on miss")
+        q._emit_cancel_task_done(existing, task_id, cost_fields=cost_fields)
+        q.persist_queue_snapshot(reason="cancel_finalize")
+        return CANCEL_CANCELLED
+    except Exception:
+        log.debug("Cancel finalize-on-miss failed for %s", task_id, exc_info=True)
+        _release_intent_claim(q, task_id, error="finalize-on-miss failed", intent=intent)
+        return CANCEL_FAILED

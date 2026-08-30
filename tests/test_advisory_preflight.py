@@ -14,6 +14,7 @@ import unittest.mock as mock
 
 import pytest
 
+import ouroboros.tools.claude_advisory_review as advisory
 from ouroboros.tools.claude_advisory_review import (
     _syntax_preflight_staged_py_files,
 )
@@ -142,20 +143,10 @@ class TestSyntaxPreflightHelper:
         assert "PREFLIGHT_BLOCKED" in out
 
 
-def _sdk_available() -> bool:
-    """The Claude Agent SDK is an optional dependency — skip SDK-integration
-    tests cleanly when it is not installed (e.g. minimal test venvs)."""
-    try:
-        import claude_agent_sdk  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-@pytest.mark.skipif(not _sdk_available(), reason="claude_agent_sdk not installed")
 class TestPreflightGatesBeforeSDK:
-    """Verify the preflight short-circuit fires BEFORE the Claude SDK call,
-    saving the SDK cost when staged `.py` files cannot compile."""
+    """Verify the preflight short-circuit fires BEFORE the paid critic call
+    (native episode), saving the spend when staged `.py` files cannot compile.
+    (The retired Claude-SDK skipif is gone: the successor path needs no SDK.)"""
 
     def test_syntax_error_returns_before_sdk(self, tmp_path, monkeypatch):
         """End-to-end: a staged syntactically broken .py file returns
@@ -166,7 +157,7 @@ class TestPreflightGatesBeforeSDK:
         repo = _make_agent_repo(tmp_path)
         (repo / "broken.py").write_text("def foo(:\n")
 
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-fake")
 
         monkeypatch.setattr(
             adv, "_get_staged_diff",
@@ -188,18 +179,11 @@ class TestPreflightGatesBeforeSDK:
             sdk_called["n"] += 1
             raise AssertionError("SDK should NOT be called when preflight blocks")
 
-        def _fake_resolve_model():
-            return "claude-opus-4-6[1m]"
-
         monkeypatch.setattr(
-            "ouroboros.gateways.claude_code.run_readonly",
-            _fake_run_readonly,
-            raising=False,
-        )
-        monkeypatch.setattr(
-            "ouroboros.gateways.claude_code.resolve_claude_code_model",
-            _fake_resolve_model,
-            raising=False,
+            advisory, "_run_advisory_native",
+            lambda prompt, repo_dir, ctx_, slot, model: (
+                _fake_run_readonly(), model,
+            ),
         )
 
         fake_ctx = mock.MagicMock()
@@ -227,7 +211,7 @@ class TestPreflightGatesBeforeSDK:
         repo = _make_agent_repo(tmp_path)
         (repo / "good.py").write_text("def foo():\n    return 1\n")
 
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-fake")
 
         monkeypatch.setattr(
             adv, "_get_staged_diff",
@@ -264,20 +248,13 @@ class TestPreflightGatesBeforeSDK:
             sdk_called["n"] += 1
             return _Result()
 
-        def _fake_resolve_model():
-            return "claude-opus-4-6[1m]"
-
         # run_readonly is imported INSIDE _run_claude_advisory, not at module top,
         # so patch the source symbol.
         monkeypatch.setattr(
-            "ouroboros.gateways.claude_code.run_readonly",
-            _fake_run_readonly,
-            raising=False,
-        )
-        monkeypatch.setattr(
-            "ouroboros.gateways.claude_code.resolve_claude_code_model",
-            _fake_resolve_model,
-            raising=False,
+            advisory, "_run_advisory_native",
+            lambda prompt, repo_dir, ctx_, slot, model: (
+                _fake_run_readonly(), model,
+            ),
         )
 
         fake_ctx = mock.MagicMock()
@@ -612,3 +589,36 @@ class TestPreflightBlockedPersistence:
             "A preflight_blocked record must NOT count as fresh — that would "
             "let repo_commit proceed without the SDK ever seeing the code."
         )
+
+
+class TestTestsPreflightProofBinding:
+    """The commit-admission SSOT owns the green-run -> Q10 proof coupling:
+    a green preflight ALWAYS records the managed proof (else the managed gate
+    pays a second identical full run), and the proof is only ever recorded off
+    a green run (else it forges admission evidence)."""
+
+    def _ctx(self, tmp_path):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            task_id="t", task_metadata={}, repo_dir=str(tmp_path),
+            emit_progress_fn=lambda *_a, **_k: None,
+        )
+
+    def test_red_run_returns_error_and_records_no_proof(self, tmp_path):
+        from ouroboros.commit_admission import run_tests_preflight_with_proof
+
+        ctx = self._ctx(tmp_path)
+        err = run_tests_preflight_with_proof(ctx, runner=lambda c: "FAILED: 2 failed")
+        assert err == "FAILED: 2 failed"
+        assert not getattr(ctx, "_managed_tests_proof_trees", None)
+
+    def test_green_run_records_the_managed_proof(self, tmp_path, monkeypatch):
+        from ouroboros.commit_admission import run_tests_preflight_with_proof
+        import supervisor.update_merge as um
+
+        ctx = self._ctx(tmp_path)
+        recorded = []
+        monkeypatch.setattr(um, "record_managed_tests_proof",
+                            lambda c: recorded.append(c) or "tree-sha")
+        assert run_tests_preflight_with_proof(ctx, runner=lambda c: None) is None
+        assert recorded == [ctx]

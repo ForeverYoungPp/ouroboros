@@ -146,7 +146,9 @@ def _restart_current_process(host: str, port: int) -> None:
 
 from ouroboros.config import (
     SETTINGS_DEFAULTS,
-    load_settings, save_settings, apply_settings_to_env as _apply_settings_to_env,
+    SettingsIntegrityError,
+    load_settings, save_settings, verify_settings_integrity,
+    apply_settings_to_env as _apply_settings_to_env,
 )
 from ouroboros.server_runtime import (
     apply_runtime_provider_defaults,
@@ -988,7 +990,12 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
         wedged_task = None
         while not _restart_requested.is_set() and not (stop_event is not None and stop_event.is_set()):
             time.sleep(interval)
-            now = time.time()
+            # ONE clock: both halves measure an ELAPSED GAP against stamps taken on
+            # the monotonic clock (the loop-liveness tick here, and the chat-turn
+            # heartbeat in agent.py), so a wall-clock jump — NTP step, DST/timezone
+            # change, manual set, VM resume — can neither fabricate a stall/wedge
+            # nor mask a real one on either half.
+            now = time.monotonic()
             # (1) Supervisor loop stall — new-message intake starvation.
             if _supervisor_loop_stalled(liveness[0], now, deadline):
                 if not loop_alerted:
@@ -1014,7 +1021,10 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
                                 is_progress=True,
                                 progress_meta={
                                     "task_incident": "supervisor_loop_stall",
-                                    "toast_once": f"supervisor-loop-stall:{int(liveness[0])}",
+                                    # pid disambiguates server GENERATIONS: the monotonic stamp alone can
+                                    # repeat at a similar uptime offset across restarts, and the browser's
+                                    # toast-dedupe set outlives this process while the page stays open.
+                                    "toast_once": f"supervisor-loop-stall:{os.getpid()}:{int(liveness[0])}",
                                 },
                             )
                     except Exception:
@@ -1113,6 +1123,20 @@ def _reconcile_delegated_runs(running_task_ids: set) -> None:
         )
         if outcomes:
             log.info("Delegated-run reconciliation handled %d orphan(s): %s", len(outcomes), outcomes)
+            # A run settled by this sweep may belong to a task that already wrote
+            # its terminal result with a non-empty unreconciled disclosure — the
+            # stored projection then lies forever (nanny-leaf S1). Audit-only
+            # refresh; never cancels.
+            from ouroboros.delegate_terminal import refresh_terminal_reconciliation
+
+            for tid in {str(o.get("task_id") or "") for o in outcomes
+                        if o.get("task_id") and (o.get("settled") or str(
+                            o.get("action") or "") in (
+                                "absent", "cancelled", "invocation_retired"))}:
+                try:
+                    refresh_terminal_reconciliation(DATA_DIR, tid)
+                except Exception:
+                    log.debug("Sweep terminal-result refresh failed for %s", tid, exc_info=True)
     except Exception:
         log.debug("Delegated-run reconciliation failed", exc_info=True)
 
@@ -2029,7 +2053,9 @@ def _run_supervisor(settings: dict) -> None:
         bridge._broadcast_fn = broadcast_ws_sync
 
         from ouroboros.utils import set_log_sink
-        set_log_sink(bridge.push_log)
+        from supervisor.events import make_server_log_sink
+
+        set_log_sink(make_server_log_sink(bridge, pathlib.Path(DATA_DIR)))
 
         bus_init(
             drive_root=DATA_DIR,
@@ -2183,13 +2209,15 @@ def _run_supervisor(settings: dict) -> None:
     _last_review_job_reconcile = [time.time()]
     # WS3: a dedicated watchdog thread (outside this loop, so it fires even if the
     # loop stalls) surfaces a wedge as an observable signal + owner alert instead
-    # of silent hours; the loop publishes a liveness tick each iteration.
-    _loop_liveness = [time.time()]
+    # of silent hours; the loop publishes a liveness tick each iteration. The tick
+    # is MONOTONIC: it is only ever read as an elapsed gap, so a wall-clock jump
+    # must not turn a healthy loop into a phantom stall (nor hide a real one).
+    _loop_liveness = [time.monotonic()]
     _watchdog_stop = threading.Event()  # per-generation: stops the watchdog when THIS loop exits
     _start_supervisor_liveness_watchdog(_loop_liveness, _watchdog_stop)
     while not _restart_requested.is_set():
         try:
-            _loop_liveness[0] = time.time()
+            _loop_liveness[0] = time.monotonic()
             rotate_chat_log_if_needed(DATA_DIR)
             # progress.jsonl rotates on the same supervisor tick (v6.90.x P2); its
             # readers (history backfill, SSE replay, api_logs_tail, TB ATIF) are
@@ -2664,8 +2692,6 @@ routes = [
         data_dir=DATA_DIR,
         settings_handlers={
             "api_onboarding": _gateway_settings.api_onboarding,
-            "api_claude_code_status": _gateway_settings.api_claude_code_status,
-            "api_claude_code_install": _gateway_settings.api_claude_code_install,
             "api_settings_get": api_settings_get,
             "api_settings_post": api_settings_post,
         },
@@ -3067,6 +3093,14 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
         pass
 
 def main() -> int:
+    # A benchmark-owned child may receive an integrity pin from its parent.
+    # Verify the exact bytes before even resolving the saved bind host; a
+    # malformed/replaced snapshot must not be converted into product defaults.
+    try:
+        verify_settings_integrity()
+    except SettingsIntegrityError:
+        log.error("isolated settings integrity verification failed")
+        return 2
     try:
         saved_host = str(load_settings().get("OUROBOROS_SERVER_HOST") or "").strip()
     except Exception:

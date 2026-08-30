@@ -33,8 +33,17 @@ from ouroboros.utils import estimate_tokens
 ATLAS_SCHEMA_VERSION = 1
 DEFAULT_ATLAS_TARGET_TOTAL_TOKENS = 850_000
 DEFAULT_ATLAS_HARD_TOTAL_TOKENS = 920_000
-_ATLAS_MANIFEST_RESERVE_TOKENS = 30_000
 _ATLAS_HARD_HEADROOM_TOKENS = 5_000
+
+# Dispositions whose per-path rows carry no review-relevant detail: the compact
+# coverage index collapses them to one `disposition<TAB>directory/ (N files)`
+# row per directory (the durable manifest keeps every per-path row regardless).
+_COLLAPSED_INDEX_DISPOSITIONS = frozenset({
+    "excluded_test",
+    "excluded_dir",
+    "binary_media",
+    "vendored_minified",
+})
 
 _CANONICAL_CONTEXT_DOCS = frozenset({
     "BIBLE.md",
@@ -197,7 +206,11 @@ class ReviewContextAtlasRequest:
     include_tests: bool = False
     title: str = "Generated Scope Atlas"
     drive_root: pathlib.Path | None = None
-    compact_manifest: bool = False
+    # Compact coverage is the DEFAULT prompt form (approved with issue #284's
+    # pack-arithmetic fixes): the durable manifest keeps full per-file coverage
+    # either way, and the full JSON coverage array in the prompt was pure
+    # render overhead (~121K chars observed) charged against review content.
+    compact_manifest: bool = True
     # Optional additive per-path score bonus (rel_path -> bonus), e.g. import-graph
     # centrality. Default empty = selection identical to the heuristic baseline;
     # scope/plan review never pass it (deep self-review is the only producer).
@@ -273,17 +286,10 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
     diff_only_included = frozenset(
         _normalize_path(path) for path in req.diff_only_included if _normalize_path(path)
     )
-    manifest_reserve_tokens = min(
-        _ATLAS_MANIFEST_RESERVE_TOKENS,
-        max(1_000, int(req.target_total_tokens) // 10),
-    )
-    target_context_tokens = max(
-        0,
-        int(req.target_total_tokens)
-        - max(0, int(req.fixed_prompt_tokens))
-        - manifest_reserve_tokens,
-    )
-    hard_context_tokens = max(
+    # Budget for the RENDERED atlas text (manifest render included); the
+    # content-only selection budgets are derived below, after the measured
+    # render overhead is known.
+    hard_text_tokens = max(
         0,
         int(req.hard_total_tokens)
         - max(0, int(req.fixed_prompt_tokens))
@@ -341,6 +347,30 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
     selected_paths: list[str] = []
     used_tokens = 0
 
+    # The rendered manifest/index skeleton is part of the pack, so it is
+    # MEASURED and charged against the selection budgets up front. The old
+    # blind 30K reserve let a real render (observed ~121K chars on this
+    # repository) dwarf it, so the greedy loop admitted content it could not
+    # keep and the shrink waves then evicted already-charged (even required)
+    # content — an admit-then-evict failure the arithmetic itself caused.
+    base_render_tokens = estimate_tokens(
+        _render_atlas_text(req, facts_by_path, [], status_hint="")
+    )
+    hard_context_tokens = max(0, hard_text_tokens - base_render_tokens)
+    # The target admission budget can never exceed what the hard rail will
+    # keep: when target-vs-hard gap is smaller than the hard headroom (small
+    # configured budgets), an uncapped target admits content the shrink waves
+    # must then evict — the same admit-then-evict failure by another route.
+    target_context_tokens = min(
+        hard_context_tokens,
+        max(
+            0,
+            int(req.target_total_tokens)
+            - max(0, int(req.fixed_prompt_tokens))
+            - base_render_tokens,
+        ),
+    )
+
     candidates = [
         facts
         for facts in facts_by_path.values()
@@ -357,18 +387,35 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
 
     for facts in candidates:
         limit = hard_context_tokens if facts.required else target_context_tokens
-        if used_tokens + facts.token_count <= limit:
+        # The admission cost is the EXACT bytes selection adds to the render:
+        # the file section (header + metadata + fenced content) PLUS this
+        # file's JSON row in the manifest preview's `selected` array — the
+        # bare content estimate undercounted both, which was the second half
+        # of the admit-then-evict arithmetic failure.
+        # The preview pretty-prints the row (indent=2 inside the `selected`
+        # array); charging the same form (plus a small list-punctuation pad)
+        # keeps admission a slight OVERcharge, never an undercharge.
+        row_cost = estimate_tokens(_render_file_content(facts)) + estimate_tokens(
+            json.dumps(_manifest_row(facts), ensure_ascii=False, indent=2)
+        ) + 4
+        if used_tokens + row_cost <= limit:
             facts.disposition = "full"
             facts.reason = ", ".join(facts.reasons) or "selected"
             selected_paths.append(facts.rel_path)
-            used_tokens += facts.token_count
+            used_tokens += row_cost
             continue
         if facts.required:
             # BIBLE P3 scope floor: a REQUIRED artifact that does not fit is a
             # failure to ASSEMBLE, not a smaller pack. The row records artifact +
-            # reason (disclosure, P1); the pack status refuses the review.
+            # reason (disclosure, P1); the pack status refuses the review. The
+            # reason states what actually happened: the REMAINDER was too small,
+            # not necessarily the file alone against the whole budget.
             facts.disposition = "budget_omitted"
-            facts.reason = "required file exceeded the atlas hard budget"
+            facts.reason = (
+                "required file does not fit the atlas hard budget: needs "
+                f"{row_cost:,} tokens rendered, {max(0, limit - used_tokens):,} remain "
+                "after higher-priority content and the rendered manifest"
+            )
         else:
             facts.disposition = "manifest_only"
             facts.reason = "not selected within atlas target budget"
@@ -376,12 +423,16 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
     text = _render_atlas_text(req, facts_by_path, selected_paths, status_hint="")
     token_count = estimate_tokens(text)
 
-    if token_count > hard_context_tokens:
-        # Shrink waves: non-required content first, then required content
-        # (largest first) — the atlas always converges to at worst a
-        # manifest-only pack instead of giving up with budget_exceeded. Dropping
-        # a REQUIRED artifact here is the same assembly failure as above, not a
-        # legal degradation: identical disposition, identical refusal.
+    if token_count > hard_text_tokens:
+        # Backstop shrink waves for residual estimator drift (per-file estimates
+        # vs the joined render; the selected-rows part of the manifest preview):
+        # non-required content first, then required content (largest first) — the
+        # atlas always converges to at worst a manifest-only pack instead of
+        # giving up with budget_exceeded. Dropping a REQUIRED artifact here is
+        # the same assembly failure as above, not a legal degradation: identical
+        # disposition, identical refusal. The reasons say what actually
+        # happened — admitted, then evicted because the RENDER overflowed — so
+        # the row cannot be read as "this file alone exceeded the budget".
         removable = [path for path in reversed(selected_paths) if not facts_by_path[path].required]
         removable += sorted(
             (path for path in selected_paths if facts_by_path[path].required),
@@ -391,14 +442,20 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
             facts = facts_by_path[path]
             if facts.required:
                 facts.disposition = "budget_omitted"
-                facts.reason = "required file removed to keep atlas below hard budget"
+                facts.reason = (
+                    "required file admitted, then removed because the rendered "
+                    "atlas exceeded the hard budget"
+                )
             else:
                 facts.disposition = "manifest_only"
-                facts.reason = "removed to keep atlas below hard budget"
+                facts.reason = (
+                    "admitted, then removed because the rendered atlas exceeded "
+                    "the hard budget"
+                )
             selected_paths.remove(path)
             text = _render_atlas_text(req, facts_by_path, selected_paths, status_hint="")
             token_count = estimate_tokens(text)
-            if token_count <= hard_context_tokens:
+            if token_count <= hard_text_tokens:
                 break
 
     target_text_tokens = max(0, int(req.target_total_tokens) - max(0, int(req.fixed_prompt_tokens)))
@@ -407,7 +464,10 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
         for path in removable:
             facts = facts_by_path[path]
             facts.disposition = "manifest_only"
-            facts.reason = "removed to keep assembled prompt near atlas target"
+            facts.reason = (
+                "admitted, then removed to keep the assembled prompt within "
+                "the atlas target"
+            )
             selected_paths.remove(path)
             text = _render_atlas_text(req, facts_by_path, selected_paths, status_hint="")
             token_count = estimate_tokens(text)
@@ -424,7 +484,7 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
     # atlas_hard_budget_overflowed. The status ranks the overflow first only
     # because a pack that cannot even render is the harder failure.
     unassembled = _unassembled_required(facts_by_path)
-    if token_count > hard_context_tokens:
+    if token_count > hard_text_tokens:
         status: AtlasStatus = "budget_exceeded"
     elif unassembled:
         status = "required_artifact_omitted"
@@ -859,10 +919,10 @@ def _render_atlas_text(
         "",
         "This is a generated, deterministic, bounded repository atlas. It replaces the raw full-repo pack for this review flow. Summaries here are structural facts only; they are not LLM-generated claims.",
         (
-            "WARNING: The atlas prompt is using compact coverage mode because the "
-            "initial scope atlas or assembled prompt was too large for the "
-            "configured scope-review input budget. Full per-file coverage remains "
-            "available in the durable scope-review context_manifest."
+            "NOTE: The atlas prompt uses compact coverage mode (the default): a "
+            "full path/disposition index with collapsed excluded groups plus "
+            "bounded per-disposition samples. Full per-file coverage remains "
+            "available in the durable review context_manifest."
             if req.compact_manifest else ""
         ),
         "",
@@ -880,26 +940,34 @@ def _render_atlas_text(
         "",
     ]
     if req.compact_manifest:
-        coverage_index = sorted(
-            (
-                str(row.get("disposition") or "unknown"),
-                str(row.get("path") or ""),
-            )
-            for row in coverage_rows
-        )
+        detailed_rows: list[tuple[str, str]] = []
+        collapsed_groups: Counter[tuple[str, str]] = Counter()
+        for row in coverage_rows:
+            disposition = str(row.get("disposition") or "unknown")
+            path = str(row.get("path") or "")
+            if disposition in _COLLAPSED_INDEX_DISPOSITIONS:
+                parent = str(pathlib.PurePosixPath(path).parent)
+                collapsed_groups[(disposition, "" if parent == "." else parent)] += 1
+            else:
+                detailed_rows.append((disposition, path))
+        index_lines = [f"{disposition}\t{path}" for disposition, path in sorted(detailed_rows)]
+        index_lines += [
+            f"{disposition}\t{directory}/ ({count} files)"
+            for (disposition, directory), count in sorted(collapsed_groups.items())
+        ]
         parts.extend([
             "### Compact full coverage index",
             "",
             (
-                "Every tracked path appears below as `disposition<TAB>path`. "
+                "Every tracked path appears below as `disposition<TAB>path`; "
+                "policy-excluded classes (excluded_test, excluded_dir, "
+                "binary_media, vendored_minified) are collapsed to one "
+                "`disposition<TAB>directory/ (N files)` row per directory. "
                 "Detailed hashes, sizes, symbols, and imports remain in the "
                 "durable context_manifest."
             ),
             "",
-            format_prompt_code_block(
-                "\n".join(f"{disposition}\t{path}" for disposition, path in coverage_index),
-                "text",
-            ),
+            format_prompt_code_block("\n".join(index_lines), "text"),
             "",
         ])
     parts.extend([

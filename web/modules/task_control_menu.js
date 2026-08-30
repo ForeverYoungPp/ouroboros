@@ -158,37 +158,144 @@ export async function requestStop(taskId, action) {
 
 let openMenu = null;
 let openTrigger = null;
+let stopMenuWatcher = null;
+let focusReturnTimer = null;
+
+const MENU_MARGIN = 8;
+const MENU_GAP = 4;
+
+function clamp(value, minimum, maximum) {
+    return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
+}
+
+function positionTaskControlMenu(anchor, menu) {
+    if (!anchor?.isConnected || !menu?.isConnected) {
+        closeTaskControlMenu();
+        return false;
+    }
+
+    const anchorRect = anchor.getBoundingClientRect();
+    if (anchorRect.width <= 0 || anchorRect.height <= 0) {
+        closeTaskControlMenu();
+        return false;
+    }
+
+    const menuRect = menu.getBoundingClientRect();
+    // scrollHeight preserves the intrinsic item height if the viewport-level
+    // fallback max-height has already constrained the rendered border box.
+    const borderHeight = Math.max(0, menuRect.height - menu.clientHeight);
+    const naturalHeight = Math.max(menuRect.height, menu.scrollHeight + borderHeight);
+    const spaceAbove = Math.max(0, anchorRect.top - MENU_GAP - MENU_MARGIN);
+    const spaceBelow = Math.max(
+        0,
+        window.innerHeight - MENU_MARGIN - anchorRect.bottom - MENU_GAP,
+    );
+    const openUpwards = spaceBelow < naturalHeight && spaceAbove > spaceBelow;
+    const availableHeight = openUpwards ? spaceAbove : spaceBelow;
+    const effectiveHeight = Math.min(naturalHeight, availableHeight);
+    const top = openUpwards
+        ? Math.max(MENU_MARGIN, anchorRect.top - MENU_GAP - effectiveHeight)
+        : anchorRect.bottom + MENU_GAP;
+    const left = clamp(
+        anchorRect.right - menuRect.width,
+        MENU_MARGIN,
+        window.innerWidth - menuRect.width - MENU_MARGIN,
+    );
+
+    menu.style.setProperty('--tcm-top', `${Math.round(top)}px`);
+    menu.style.setProperty('--tcm-left', `${Math.round(left)}px`);
+    menu.style.setProperty('--tcm-max-height', `${Math.floor(availableHeight)}px`);
+    return true;
+}
+
+function watchTaskControlMenu(anchor, menu) {
+    const isCurrentMenu = () => openMenu === menu && openTrigger === anchor;
+    const closeForViewportChange = (event) => {
+        // A height-clamped portal is its own scrollport. Scrolling it does not
+        // move the trigger, so keep it open; ancestor/page scroll still closes.
+        if (event.type === 'scroll' && event.target === menu) return;
+        if (isCurrentMenu()) closeTaskControlMenu();
+    };
+    document.addEventListener('scroll', closeForViewportChange, true);
+    window.addEventListener('resize', closeForViewportChange);
+
+    const observer = new IntersectionObserver((entries) => {
+        if (!isCurrentMenu()) return;
+        const entry = entries.find((candidate) => candidate.target === anchor);
+        if (!anchor.isConnected || (entry && !entry.isIntersecting)) {
+            closeTaskControlMenu();
+        }
+    }, { threshold: 0 });
+    observer.observe(anchor);
+
+    return () => {
+        observer.takeRecords();
+        observer.disconnect();
+        document.removeEventListener('scroll', closeForViewportChange, true);
+        window.removeEventListener('resize', closeForViewportChange);
+    };
+}
+
+function clearPendingFocusReturn() {
+    if (focusReturnTimer !== null) window.clearTimeout(focusReturnTimer);
+    focusReturnTimer = null;
+}
+
+function finishOutsidePointerFocusReturn(trigger) {
+    clearPendingFocusReturn();
+    focusReturnTimer = window.setTimeout(() => {
+        focusReturnTimer = null;
+        if (!openMenu && trigger?.isConnected) trigger.focus();
+    }, 0);
+}
 
 export function closeTaskControlMenu() {
-    if (!openMenu) return;
-    openMenu.remove();
+    clearPendingFocusReturn();
+    const menu = openMenu;
+    const trigger = openTrigger;
+    const restoreFocus = Boolean(menu?.contains(document.activeElement));
+    const stopWatching = stopMenuWatcher;
+    stopMenuWatcher = null;
+    stopWatching?.();
+    menu?.remove();
     openMenu = null;
-    openTrigger?.setAttribute?.('aria-expanded', 'false');
+    trigger?.setAttribute?.('aria-expanded', 'false');
     openTrigger = null;
     document.removeEventListener('pointerdown', onOutsidePointer, true);
     document.removeEventListener('keydown', onMenuKeydown, true);
+    if (restoreFocus && trigger?.isConnected) trigger.focus();
 }
 
 function onOutsidePointer(event) {
-    if (openMenu && !openMenu.contains(event.target)) closeTaskControlMenu();
+    if (!openMenu || openMenu.contains(event.target)) return;
+    const trigger = openTrigger;
+    const restoreFocus = openMenu.contains(document.activeElement);
+    closeTaskControlMenu();
+    // The pointerdown default focuses the clicked element after capture-phase
+    // listeners run. Restore once more in the next task without cancelling the
+    // outside element's click; a successor task menu cancels this stale timer.
+    if (restoreFocus && trigger?.isConnected) finishOutsidePointerFocusReturn(trigger);
 }
 
 function onMenuKeydown(event) {
     // Dismiss = continue the run (Q2: the dismiss affordance replaced the old
     // explicit "keep running" item).
-    if (event.key === 'Escape') closeTaskControlMenu();
+    if (event.key === 'Escape') {
+        event.preventDefault();
+        closeTaskControlMenu();
+    }
 }
 
 /**
- * Open the three-action dropdown anchored inside `anchor`'s positioned parent.
+ * Open the three-action dropdown in a viewport-level portal anchored to `anchor`.
  * Dismissing (outside click / Escape) continues the run. Selecting an item
  * closes the menu and invokes `onAction(actionId)`.
- * @param {HTMLElement} anchor trigger element; the menu mounts next to it
+ * @param {HTMLElement} anchor trigger element
  * @param {{cancelPending?: boolean, busy?: boolean, onAction: (action: string) => void}} opts
  */
 export function openTaskControlMenu(anchor, { cancelPending = false, busy = false, onAction } = {}) {
     closeTaskControlMenu();
-    if (!anchor || !anchor.parentElement) return null;
+    if (!anchor?.isConnected || !document.body) return null;
     // A11y: the trigger owns a popup menu; expanded tracks the open state.
     anchor.setAttribute('aria-haspopup', 'menu');
     anchor.setAttribute('aria-expanded', 'true');
@@ -210,9 +317,11 @@ export function openTaskControlMenu(anchor, { cancelPending = false, busy = fals
         });
         menu.appendChild(item);
     }
-    anchor.parentElement.appendChild(menu);
+    document.body.appendChild(menu);
     openMenu = menu;
     openTrigger = anchor;
+    stopMenuWatcher = watchTaskControlMenu(anchor, menu);
+    if (!positionTaskControlMenu(anchor, menu)) return null;
     // A11y: keyboard users land on the first actionable item on open.
     menu.querySelector('button:not(:disabled)')?.focus?.();
     document.addEventListener('pointerdown', onOutsidePointer, true);

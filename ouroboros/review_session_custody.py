@@ -42,6 +42,9 @@ def review_recovery_facts(
     prompt: str,
     root: str,
     claimant_task_id: str,
+    claimant_surface: str,
+    claimant_slot_id: str,
+    claimant_operation_id: str,
 ) -> tuple[Any, str, str, str, bool]:
     """Validate one stored request and restore immutable delivery facts."""
     from ouroboros.review_execution import ReviewRouteUnavailable
@@ -60,6 +63,20 @@ def review_recovery_facts(
             f"ownership (claimant={claimant_task_id!r}, "
             f"invocation_owner={invocation_owner!r})",
             code="review_recovery_ownership_unverified",
+        )
+    stored_binding = (
+        str(record.get("surface") or ""), str(record.get("slot_id") or ""),
+        str(record.get("operation_id") or ""),
+    )
+    claimant_binding = (
+        str(claimant_surface or ""), str(claimant_slot_id or ""),
+        str(claimant_operation_id or ""),
+    )
+    if stored_binding != claimant_binding:
+        raise ReviewRouteUnavailable(
+            "delegated review retry token belongs to a different surface, slot, "
+            "or physical operation; the recorded invocation is not replayed",
+            code="review_recovery_request_mismatch",
         )
     scope = run_request.get("scope")
     route_id = str(run_request.get("primaryHarness") or "")

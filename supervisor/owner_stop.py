@@ -30,7 +30,7 @@ import logging
 import pathlib
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ouroboros.utils import append_jsonl, utc_now_iso
 
@@ -105,10 +105,11 @@ def owner_stop_open(intent: Any) -> bool:
     Open means: the durable intent carries the explicit finalize policy and no
     custody claim holds it (a claim means the kill already started). This is
     the HOLD predicate for the generic timeout rails (§12.2 item 8): a running
-    task stays held for the WHOLE open-intent window — the deadline gates only
-    the sweep's arm-vs-feed-custody decision (``sweep_owner_stop_hold``), so
-    custody remains the sole killer at expiry and the generic rail can never
-    withdraw, reap, or retry an intent-covered task in the expiry window.
+    task stays held against the generic idle/finalization-grace machinery while
+    the deadline gates the sweep's arm-vs-feed-custody decision
+    (``sweep_owner_stop_hold``).  A task's earlier explicit deadline and
+    absolute safety ceiling remain independent hard axes; neither the hold nor
+    the final model turn may widen them.
     """
     if not isinstance(intent, dict):
         return False
@@ -127,7 +128,8 @@ def owner_stop_active(intent: Any, *, now: float, grace_sec: float) -> bool:
     ``min(drain + grace, request + outer cap)`` after) has not passed.
     Own/descendant progress NEVER extends either anchor (§12.2 item 8).
     Consulted by the SWEEP only (arm vs feed custody); the enforcement hold
-    deliberately uses the deadline-free ``owner_stop_open`` instead.
+    uses the deadline-free ``owner_stop_open`` but still yields to the task's
+    explicit deadline and absolute ceiling.
     """
     if not owner_stop_open(intent):
         return False
@@ -144,16 +146,16 @@ def queue_grace_sec(q: Any) -> float:
 
 
 def running_owner_stop_tasks(drive_root: Any, *, grace_sec: float) -> set:
-    """Task ids whose OPEN owner-stop intent must bypass generic timeout rails.
+    """Task ids whose OPEN owner-stop intent bypasses generic idle/grace rails.
 
     Read once per enforcement pass (one small locked projection read), then
     checked per RUNNING row — the typed predicate ``supervisor/queue.py``
-    consults before every spare-withdraw, spare-reset, second-grace,
-    timeout-kill, reaping, and retry branch (§12.2 item 8). The hold covers
-    the WHOLE open-intent window, deliberately including the expiry window
-    past the grace deadline: the custody sweep (20s cadence) is the sole
-    killer there, and the faster enforcement tick must not withdraw the
-    episode, falsify the terminal reason, or clone a retry meanwhile.
+    consults before generic spare-withdraw, spare-reset, second-grace,
+    idle-kill, reaping, and retry branches (§12.2 item 8). The task's explicit
+    deadline and absolute safety ceiling are checked separately by the queue
+    and never inherit this hold.  Within those hard bounds the hold covers the
+    whole open-intent window, including the short expiry window before custody
+    consumes the intent, so the generic idle rail cannot clone a retry.
     ``grace_sec<=0`` means the graceful-stop feature is off (the sweep feeds
     custody immediately), so no hold is needed.
     """
@@ -166,7 +168,39 @@ def running_owner_stop_tasks(drive_root: Any, *, grace_sec: float) -> set:
     except Exception:
         log.debug("owner-stop enforcement read failed", exc_info=True)
         return set()
-    return {tid for tid, intent in intents.items() if owner_stop_open(intent)}
+    held: set[str] = set()
+    for task_id, intent in intents.items():
+        if not owner_stop_open(intent):
+            continue
+        held.add(task_id)
+        try:
+            from ouroboros.cancel_intents import _validated_single_cancel_target
+
+            held.add(_validated_single_cancel_target(drive_root, task_id))
+        except Exception:
+            # A corrupt chain must not let the generic timeout rail kill a
+            # possible graceful root attempt. Include every live root-shaped
+            # row that still names the logical id; the intent sweep will expose
+            # the authority failure instead of silently bypassing the hold.
+            try:
+                from supervisor import queue as q
+
+                with q._queue_lock:
+                    for running_id, meta in q.RUNNING.items():
+                        task = meta.get("task") if isinstance(meta, dict) else None
+                        if (
+                            isinstance(task, dict)
+                            and str(task.get("root_task_id") or "") == task_id
+                            and str(task.get("delegation_role") or "") == "root"
+                        ):
+                            held.add(str(running_id))
+            except Exception:
+                log.debug(
+                    "owner-stop retry hold resolution failed for %s",
+                    task_id,
+                    exc_info=True,
+                )
+    return held
 
 
 def sweep_owner_stop_hold(q: Any, task_id: str, intent: Dict[str, Any], *, now: float) -> bool:
@@ -183,19 +217,59 @@ def sweep_owner_stop_hold(q: Any, task_id: str, intent: Dict[str, Any], *, now: 
     if not owner_stop_active(intent, now=now, grace_sec=grace):
         return False
     try:
-        from ouroboros.cancel_intents import settled_status
+        from ouroboros.cancel_intents import (
+            _validated_single_cancel_target,
+            settled_status,
+        )
 
-        if settled_status(q.DRIVE_ROOT, task_id):
+        physical_task_id = _validated_single_cancel_target(q.DRIVE_ROOT, task_id)
+        if _task_hard_bound_reached(q, physical_task_id, now=now):
+            # A later graceful-stop request cannot buy a final turn beyond a
+            # caller-supplied deadline or the global absolute safety ceiling.
+            # Feed the existing cancellation custody instead.
+            return False
+        if settled_status(q.DRIVE_ROOT, physical_task_id):
             # Natural completion won (or an earlier terminal landed): feed
             # custody so completion-wins settles the intent honestly.
             return False
     except Exception:
-        log.debug("owner-stop settled read failed for %s", task_id, exc_info=True)
+        # Unknown lineage/result authority is not permission to bypass the
+        # active grace window and feed hard custody.  Hold until the existing
+        # durable deadline expires; the outer predicate then releases the
+        # generic hard path without extending owner authority indefinitely.
+        log.warning("owner-stop settled read failed for %s", task_id, exc_info=True)
+        return True
     try:
         return orchestrate_graceful_stop(q, task_id, intent, now=now)
     except Exception:
         log.warning("owner-stop orchestration failed for %s", task_id, exc_info=True)
+        return True
+
+
+def _task_hard_bound_reached(q: Any, task_id: str, *, now: float) -> bool:
+    """Mirror the queue's two hard time axes without introducing a new SSOT."""
+    try:
+        with q._queue_lock:
+            meta = q.RUNNING.get(task_id) if isinstance(q.RUNNING, dict) else None
+            if not isinstance(meta, dict):
+                return False
+            task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
+            started_at = float(meta.get("started_at") or 0.0)
+        deadline_ts = float(q._task_deadline_ts(task) or 0.0)
+        if deadline_ts and now >= deadline_ts:
+            return True
+        if started_at > 0:
+            absolute_ceiling = float(q.get_task_abs_ceiling_sec())
+            return max(0.0, now - started_at) >= absolute_ceiling
         return False
+    except Exception:
+        # Unreadable hard-bound authority is not permission to extend a task.
+        log.warning(
+            "owner-stop hard-bound read failed for %s",
+            task_id,
+            exc_info=True,
+        )
+        return True
 
 
 def begin_graceful_stop(task_id: str) -> None:
@@ -225,21 +299,50 @@ def orchestrate_graceful_stop(q: Any, task_id: str, intent: Dict[str, Any], *, n
     that is pending/missing returns False so custody settles it immediately
     (zero model turns — §13.1).
     """
-    from ouroboros.cancel_intents import SCOPE_CASCADE
+    from ouroboros.cancel_intents import (
+        SCOPE_CASCADE,
+        _validated_single_cancel_target,
+    )
 
     cascade = str(intent.get("scope") or "") == SCOPE_CASCADE
+    physical_task_id = _validated_single_cancel_target(q.DRIVE_ROOT, task_id)
+    descendants_settled = True
     if cascade:
-        _settle_descendants_hard(q, task_id)
+        descendants_settled = _settle_descendants_hard(
+            q,
+            task_id,
+            exclude_task_ids={task_id, physical_task_id},
+        )
     with q._queue_lock:
-        running_meta = q.RUNNING.get(task_id) if isinstance(q.RUNNING, dict) else None
+        running_meta = (
+            q.RUNNING.get(physical_task_id)
+            if isinstance(q.RUNNING, dict) else None
+        )
         if not isinstance(running_meta, dict):
             # PENDING (never started -> zero turns) or gone (miss lane): feed
             # custody. The sweep's generic path settles both shapes.
             return False
-    return _arm_owner_stop_episode(q, task_id, intent, running_meta, now=now, cascade=cascade)
+    if not descendants_settled:
+        # The cascade root never receives its paid final turn while a child is
+        # still live.  Keep the owner-stop intent open and retry the bounded
+        # descendant sweep on the next watchdog tick; expiry still releases
+        # the ordinary hard-custody path.
+        _forensic(q, task_id, "owner_stop_descendants_pending", intent)
+        return True
+    return _arm_owner_stop_episode(
+        q,
+        physical_task_id,
+        intent,
+        running_meta,
+        now=now,
+        cascade=cascade,
+        logical_task_id=task_id,
+    )
 
 
-def _settle_descendants_hard(q: Any, task_id: str) -> None:
+def _settle_descendants_hard(
+    q: Any, task_id: str, *, exclude_task_ids: set[str] | None = None,
+) -> bool:
     """Q6=A: live descendants are hard-stopped deepest-first, zero paid turns.
 
     Reuses the existing cascade subtree sweep with the ROOT excluded — each
@@ -250,16 +353,49 @@ def _settle_descendants_hard(q: Any, task_id: str) -> None:
     refused while the root finalizes (§12.2 item 3).
     """
     from supervisor.task_lifecycle import (
-        CANCELLED_ROOT_FENCES, _cancel_subtree_sweep, _prune_cancellation_fences,
+        CANCELLED_ROOT_FENCES,
+        _cancel_subtree_sweep,
+        _live_descendants_locked,
+        _prune_cancellation_fences,
     )
 
+    excluded = set(exclude_task_ids or {task_id})
     with q._queue_lock:
         CANCELLED_ROOT_FENCES[task_id] = utc_now_iso()
         _prune_cancellation_fences(protected={task_id})
     try:
-        _cancel_subtree_sweep(q, task_id, {task_id})
+        settled = set(excluded)
+        # Reuse the ordinary cascade's bounded re-sweep shape.  The root and
+        # its physical retry leaf are pre-settled only for this descendant
+        # pass, so every other live node is hard-stopped deepest-first.
+        for _sweep in range(4):
+            _cancelled, outcomes = _cancel_subtree_sweep(
+                q, task_id, settled,
+            )
+            settled.update(
+                child_id
+                for child_id, outcome in outcomes.items()
+                if outcome in q._CANCEL_TERMINALIZED
+            )
+            if not outcomes:
+                break
+        with q._queue_lock:
+            remaining = {
+                str(row.get("task_id") or "")
+                for row in _live_descendants_locked(q, task_id)
+                if str(row.get("task_id") or "") not in excluded
+            }
+        if remaining:
+            log.warning(
+                "owner-stop descendants remain live for %s: %s",
+                task_id,
+                sorted(remaining),
+            )
+            return False
+        return True
     except Exception:
         log.warning("owner-stop descendant sweep failed for %s", task_id, exc_info=True)
+        return False
 
 
 def owner_stop_control_id(intent: Dict[str, Any]) -> str:
@@ -267,9 +403,195 @@ def owner_stop_control_id(intent: Dict[str, Any]) -> str:
     return f"ownerstop:{str(intent.get('request_id') or '')}"
 
 
+def _mark_owner_stop_control_drained(
+    owner_ctx: Any, drive_root: Optional[pathlib.Path], task_id: str,
+) -> bool:
+    """Stamp the owner-stop finalize control's DELIVERY on the durable intent.
+
+    The intent lives on the CANONICAL data root (``budget_drive_root`` first;
+    a forked task's mailbox drive differs). Idempotent (first drain wins). A
+    failed stamp is retried ONCE; still unconfirmed, a typed forensic event
+    is appended and no extended budget is assumed: the sweep keeps the
+    request+outer-cap deadline, and ``_owner_stop_window_elapsed`` reads the
+    same unstamped intent, bounding the worker by that anchor."""
+    try:
+        from ouroboros.cancel_intents import (
+            mark_finalize_control_drained,
+            resolve_owner_stop_intent,
+        )
+
+        root = (
+            str(getattr(owner_ctx, "budget_drive_root", "") or "")
+            or (str(drive_root) if drive_root is not None else "")
+        )
+        if not (root and task_id):
+            return False
+        root_path = pathlib.Path(root)
+        for _ in range(2):
+            if mark_finalize_control_drained(root_path, task_id):
+                return True
+            _intent_task_id, row = resolve_owner_stop_intent(root_path, task_id)
+            if isinstance(row, dict) and str(row.get("control_drained_at") or ""):
+                return True  # already stamped: the durable anchor is confirmed
+            if not isinstance(row, dict) or not row:
+                # The same stop request was hardened/settled while this
+                # mailbox row was being drained.  It is a stale control, not a
+                # persistence failure and must not buy a final model turn.
+                return False
+
+        append_jsonl(root_path / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(), "type": "owner_stop_stamp_failed",
+            "task_id": task_id,
+        })
+        return False
+    except Exception:
+        log.debug("owner-stop drain stamp failed for %s", task_id, exc_info=True)
+        return False
+
+
+def _owner_stop_control_is_current(
+    owner_ctx: Any,
+    drive_root: Optional[pathlib.Path],
+    task_id: str,
+    control_msg_id: str,
+) -> bool:
+    """Whether this deterministic mailbox control still names the live policy."""
+    try:
+        from ouroboros.cancel_intents import resolve_owner_stop_intent
+
+        root = (
+            str(getattr(owner_ctx, "budget_drive_root", "") or "")
+            or (str(drive_root) if drive_root is not None else "")
+        )
+        if not (root and task_id and control_msg_id):
+            return False
+        _intent_task_id, intent = resolve_owner_stop_intent(
+            pathlib.Path(root), task_id,
+        )
+        return bool(intent) and owner_stop_control_id(intent) == str(control_msg_id)
+    except Exception:
+        log.debug(
+            "owner-stop control validation failed for %s",
+            task_id,
+            exc_info=True,
+        )
+        return False
+
+
+def _narrow_round_deadline(ctx: Any, candidate: Any) -> Optional[float]:
+    """Apply a later control deadline without ever widening task authority."""
+    try:
+        deadline = float(candidate)
+    except (TypeError, ValueError, OverflowError):
+        return ctx.deadline_ts
+    current = ctx.deadline_ts
+    if current is None:
+        ctx.deadline_ts = deadline
+    else:
+        try:
+            ctx.deadline_ts = min(float(current), deadline)
+        except (TypeError, ValueError, OverflowError):
+            ctx.deadline_ts = deadline
+    return ctx.deadline_ts
+
+
+def _owner_stop_window_elapsed(ctx: Any) -> bool:
+    """Bind and check the owner-stop deadline."""
+    try:
+        from ouroboros import task_pacing
+        from ouroboros.cancel_intents import (
+            STOP_POLICY_FINALIZE,
+            resolve_owner_stop_intent,
+            stop_policy,
+        )
+
+        root = getattr(ctx, "status_drive_root", None) or ctx.drive_root
+        if root is None or not ctx.task_id:
+            return False
+        _intent_task_id, intent = resolve_owner_stop_intent(
+            pathlib.Path(root), ctx.task_id,
+        )
+        if not isinstance(intent, dict) or stop_policy(intent) != STOP_POLICY_FINALIZE:
+            return False
+        deadline = owner_stop_deadline_ts(
+            intent, float(task_pacing.get_finalization_grace_sec()),
+        )
+        if deadline:
+            effective_deadline = _narrow_round_deadline(ctx, deadline)
+            return time.time() >= float(effective_deadline)
+        return True
+    except Exception:
+        log.debug("owner-stop window check failed for %s", ctx.task_id, exc_info=True)
+        return False
+
+
+def revoke_hardened_owner_stop_control(
+    q: Any, task_id: str, intent: Dict[str, Any],
+) -> bool:
+    """Best-effort retract an unread graceful control after Stop-now hardens it.
+
+    The durable immediate policy is the authority and cancellation proceeds
+    even if mailbox cleanup fails.  This helper removes the ordinary queued
+    case through the existing append-only revocation protocol and clears the
+    paired RUNNING latch without emitting the unrelated "task resumed" toast.
+    The loop independently validates the current durable policy at drain time,
+    closing the race where the control was already read.
+    """
+    try:
+        from ouroboros.cancel_intents import (
+            STOP_POLICY_IMMEDIATE,
+            _validated_single_cancel_target,
+            stop_policy,
+        )
+
+        if (
+            stop_policy(intent) != STOP_POLICY_IMMEDIATE
+            or not str(intent.get("hardened_at") or "")
+        ):
+            return False
+        physical_task_id = _validated_single_cancel_target(
+            q.DRIVE_ROOT, task_id,
+        )
+        control_id = owner_stop_control_id(intent)
+        with q._queue_lock:
+            meta = q.RUNNING.get(physical_task_id)
+            if not isinstance(meta, dict):
+                return False
+            if str(meta.get("finalization_control_msg_id") or "") != control_id:
+                return False
+            task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
+            task_drive = q._task_drive_for_task(task, physical_task_id)
+        from ouroboros.owner_mailbox import revoke_owner_control
+
+        if not revoke_owner_control(
+            pathlib.Path(task_drive), physical_task_id, control_id,
+        ):
+            return False
+        with q._queue_lock:
+            current = q.RUNNING.get(physical_task_id)
+            if (
+                isinstance(current, dict)
+                and str(current.get("finalization_control_msg_id") or "")
+                == control_id
+            ):
+                current.pop("finalization_requested_at", None)
+                current.pop("finalization_reason", None)
+                current.pop("finalization_control_msg_id", None)
+                q.RUNNING[physical_task_id] = current
+        _forensic(q, task_id, "owner_stop_control_revoked_on_hardening", intent)
+        return True
+    except Exception:
+        log.warning(
+            "owner-stop hardened-control revocation failed for %s",
+            task_id,
+            exc_info=True,
+        )
+        return False
+
+
 def _arm_owner_stop_episode(
     q: Any, task_id: str, intent: Dict[str, Any], running_meta: Dict[str, Any],
-    *, now: float, cascade: bool,
+    *, now: float, cascade: bool, logical_task_id: str = "",
 ) -> bool:
     """Idempotently arm the coupled finalize_now control + RUNNING latch."""
     from supervisor.task_reaper import request_finalization_grace
@@ -287,7 +609,7 @@ def _arm_owner_stop_episode(
         task_drive = q._task_drive_for_task(task, task_id)
     control_text = REASON_OWNER_REQUESTED_FINALIZATION
     if cascade:
-        projection = _child_result_projection(q, task_id)
+        projection = _child_result_projection(q, logical_task_id or task_id)
         if projection:
             control_text = f"{control_text}\n{projection}"
     grace_deadline = owner_stop_deadline_ts(intent, queue_grace_sec(q))
@@ -332,14 +654,21 @@ def graceful_summary_suppressed(q: Any, task_id: str) -> bool:
     """
     try:
         from ouroboros.cancel_intents import (
-            STOP_POLICY_FINALIZE, active_intent, stop_policy,
+            STOP_POLICY_FINALIZE,
+            _validated_single_cancel_target,
+            active_intent,
+            stop_policy,
         )
         from ouroboros.task_results import STATUS_COMPLETED, load_task_result
 
         intent = active_intent(q.DRIVE_ROOT, task_id) or {}
         if stop_policy(intent) != STOP_POLICY_FINALIZE:
             return False
-        status = str((load_task_result(q.DRIVE_ROOT, task_id) or {}).get("status") or "")
+        physical_task_id = _validated_single_cancel_target(q.DRIVE_ROOT, task_id)
+        status = str(
+            (load_task_result(q.DRIVE_ROOT, physical_task_id) or {}).get("status")
+            or ""
+        )
         if status != STATUS_COMPLETED:
             return False
         _forensic(q, task_id, "owner_stop_summary_suppressed", intent)

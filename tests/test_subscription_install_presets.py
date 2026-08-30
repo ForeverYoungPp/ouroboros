@@ -8,6 +8,23 @@ from itertools import combinations
 import pytest
 
 from ouroboros.reviewer_slot_config import parse_reviewer_slots
+
+
+def _parse_preset_slots(preset):
+    """Parse emitted slots WITH the roster the same preset ships: reviewer
+    rows are subagent_id references now (4=A), and references resolve against
+    the Available-subagents value — exactly as the applied install would."""
+    import os
+
+    prior = os.environ.get("OUROBOROS_SUBAGENTS")
+    os.environ["OUROBOROS_SUBAGENTS"] = preset.available_subagents
+    try:
+        return parse_reviewer_slots(preset.reviewer_slots)
+    finally:
+        if prior is None:
+            os.environ.pop("OUROBOROS_SUBAGENTS", None)
+        else:
+            os.environ["OUROBOROS_SUBAGENTS"] = prior
 from ouroboros.subscription_install_presets import (
     PRESET_MARKER_KEY,
     REVIEWER_SLOTS_KEY,
@@ -107,7 +124,7 @@ def test_every_combination_follows_the_declarative_policy(connected):
     assert first_actor["route"]["target_id"] == subagent_target
     assert first_actor["effort"] == subagent_effort
 
-    config = parse_reviewer_slots(preset.reviewer_slots)
+    config = _parse_preset_slots(preset)
     assert [(row.target_id, row.effort) for row in config.triad] == [
         _target(harness, "triad") for harness in _triad_harnesses(connected)
     ]
@@ -128,7 +145,7 @@ def test_only_exact_discovery_ids_are_ever_written(connected):
     """No owner shorthand (``opus-5``, ``terra``, ``grok-4.6``) may survive
     into the saved value — every model must exist in that harness's live list."""
     preset = compile_install_preset(_discoveries(*connected))
-    config = parse_reviewer_slots(preset.reviewer_slots)
+    config = _parse_preset_slots(preset)
 
     targets = [row.target_id for row in config.triad + config.scope]
     targets.append(config.advisory.target_id)
@@ -148,16 +165,14 @@ def test_credential_profile_is_never_pinned(connected):
     preset = compile_install_preset(_discoveries(*connected))
 
     assert "profile_id" not in preset.reviewer_slots
-    config = parse_reviewer_slots(preset.reviewer_slots)
+    config = _parse_preset_slots(preset)
     assert all(row.profile_id == "" for row in config.triad + config.scope)
     assert config.advisory.profile_id == ""
 
 
 @pytest.mark.parametrize("harness", CORE_HARNESSES)
 def test_single_core_harness_runs_three_independent_same_model_slots(harness):
-    config = parse_reviewer_slots(
-        compile_install_preset(_discoveries(harness)).reviewer_slots
-    )
+    config = _parse_preset_slots(compile_install_preset(_discoveries(harness)))
 
     expected_target, _ = _target(harness, "triad")
     assert [row.target_id for row in config.triad] == [expected_target] * 3
@@ -212,7 +227,7 @@ def test_cursor_without_grok_refuses_instead_of_using_a_costlier_model():
 
 def test_cursor_effort_rides_the_slug_and_the_row_field_together():
     preset = compile_install_preset(_discoveries("cursor"))
-    config = parse_reviewer_slots(preset.reviewer_slots)
+    config = _parse_preset_slots(preset)
 
     # scope is the high-effort cursor seat: the slug tail and the field agree,
     # so nothing downstream can materialize a DIFFERENT effort by default.
@@ -241,7 +256,7 @@ def test_antigravity_compiles_task_actor_without_changing_core_reviewer_bytes(co
 
 def test_claude_and_codex_rows_carry_effort_only_in_the_field():
     preset = compile_install_preset(_discoveries("claude", "codex"))
-    config = parse_reviewer_slots(preset.reviewer_slots)
+    config = _parse_preset_slots(preset)
 
     for row in config.triad + config.scope:
         model = row.target_id.partition("=")[2]
@@ -398,10 +413,12 @@ def test_api_only_compiles_main_and_distinct_light_without_daemon_inputs():
 
     assert preset.ok, preset.refusal
     items = json.loads(preset.available_subagents)["items"]
-    assert [(row["name"], row["route"]["target_id"]) for row in items] == [
-        ("Primary builder", "openai::gpt-5.6-sol"),
-        ("Fast scout", "openai::gpt-5.6-luna"),
+    # `name` is retired (1=A): identity is the neutral id + derived facts.
+    assert [(row["subagent_id"], row["route"]["target_id"]) for row in items] == [
+        ("primary-builder", "openai::gpt-5.6-sol"),
+        ("fast-scout", "openai::gpt-5.6-luna"),
     ]
+    assert all("name" not in row for row in items)
     assert preset.reviewer_slots == ""
 
 
@@ -454,12 +471,60 @@ def test_one_harness_plus_distinct_main_and_light_normally_yields_three_real_act
     })
 
     items = json.loads(preset.available_subagents)["items"]
-    assert [row["name"] for row in items] == [
-        "Primary builder", "Fast scout", "Independent perspective",
+    # 4=A: the reviewer seat whose session route matches no task actor is
+    # MINTED into the roster and referenced — one SSOT from the first boot.
+    assert [row["subagent_id"] for row in items] == [
+        "primary-builder", "fast-scout", "independent-perspective", "review-claude",
     ]
+    assert all("name" not in row for row in items)  # retired field (1=A)
+    slots = json.loads(preset.reviewer_slots)
+    referenced = {row.get("subagent_id") for row in slots["triad"] + slots["scope"]}
+    referenced.add(slots["advisory"].get("subagent_id"))
+    assert referenced <= {row["subagent_id"] for row in items} | {None}
+    assert "review-claude" in referenced
     assert [row["route"]["target_id"] for row in items] == [
         "claude=claude-opus-5", "openai/gpt-5.6-luna", "openai/gpt-5.6-sol",
+        "claude=claude-sonnet-5",  # the minted review seat's own session route
     ]
+
+
+def test_roster_cap_overflow_falls_back_to_inline_seats_with_a_diagnostic():
+    """The 10-row cap leaves no room to mint: the seat stays an INLINE route
+    and says so in diagnostics — honest fallback, never a silent drop."""
+    from ouroboros.configured_subagents import (
+        ROUTE_KIND_API_MODEL,
+        ConfiguredSubagent,
+        RouteSpec,
+        make_configured_subagents,
+    )
+    from ouroboros.subscription_install_presets import _reference_reviewer_rows
+
+    full = make_configured_subagents([
+        ConfiguredSubagent(
+            subagent_id=f"row-{i}",
+            recommended_use="Use for owner-selected work.",
+            route=RouteSpec(ROUTE_KIND_API_MODEL, f"openai/model-{i}"),
+        )
+        for i in range(10)
+    ])
+    extended, slots_json, diagnostics = _reference_reviewer_rows(
+        full,
+        [{"position": 1, "target_id": "claude=claude-opus-5", "effort": "medium"}],
+        [],
+        {"target_id": "claude=claude-sonnet-5", "effort": "low"},
+    )
+
+    assert len(extended.items) == 10  # nothing minted past the cap
+    slots = json.loads(slots_json)
+    triad_row = slots["triad"][0]
+    assert "subagent_id" not in triad_row
+    assert triad_row["route"] == {"kind": "agent_session", "target_id": "claude=claude-opus-5"}
+    assert triad_row["effort"] == "medium"
+    advisory_row = slots["advisory"]
+    assert advisory_row["enabled"] is True
+    assert advisory_row["route"] == {"kind": "agent_session", "target_id": "claude=claude-sonnet-5"}
+    codes = [row["code"] for row in diagnostics]
+    assert codes.count("reviewer_seat_inline_roster_full") == 2
 
 
 def test_missing_exact_agy_flash_refuses_without_partial_actor_or_reviewer_output():

@@ -317,6 +317,13 @@
  *   v6.74.0 additive keys: panels[].dialogue ({status, votes} — the reviewer-authored
  *   dialogue-status reduction), panels[].single_reviewer_no_diversity (boolean label),
  *   and actors[].dialogue_status ("continue_actionable"|"unreachable_here"|"stable_disagreement"|"").
+ *   Additive bounded-findings keys: actors[].findings (disclosed rows
+ *   {id?, severity?, verdict?, item?, summary?, evidence?, reason?,
+ *   recommendation?} — redacted, each string
+ *   bounded with an explicit omission marker, at most 8 rows per actor) and
+ *   actors[].findings_omitted (exact count, 0 included). Both are emitted only
+ *   when that reviewer produced a parsed response; their absence is a
+ *   transport/parse hole, never "zero findings".
  * @property {boolean=} worker_saturation_warning
  * @property {string=} source
  * @property {string=} sender_label
@@ -601,7 +608,7 @@
  * @property {boolean=} official_hub_verified
  * @property {boolean=} owner_attestable
  * @property {{visible: boolean, publication_ready: boolean, task_start_allowed: boolean, disabled: boolean, state: "ready"|"warnings"|"needs_attention"|"repairable"|"hard_block", reason: string}=} submit_hub
- * @property {{current: Object, history: Object[]}=} skill_review
+ * @property {{current: Object, history: Object[], history_omitted: number=}=} skill_review
  * @property {boolean=} is_self_authored
  * @property {Object=} grants
  * @property {string[]=} permissions
@@ -856,6 +863,7 @@
  * @property {Array<Object>=} harnesses
  * @property {Object=} profiles
  * @property {Array<Object>=} quota
+ * @property {Array<Object>=} quota_absences
  * @property {ClaudexorStatusReads=} reads
  * @property {boolean=} unified_accounts
  * @property {SubagentLastDelegation=} subagent_last_delegation
@@ -1089,4 +1097,4 @@
  * @property {?boolean} check_ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.110.1';
+export const GATEWAY_CONTRACT_VERSION = '6.113.4';

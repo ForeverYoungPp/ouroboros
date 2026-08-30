@@ -67,6 +67,7 @@ test('clearStickyCardState resets the recycled record activity + cost (reusable 
     const record = {
         collapsedActivity: 'Old cycle activity',
         costMeta: { meta: ['cost=$1.00'], ts: 1, final: true },
+        executorChip: { harness: 'codex', icon: '◇', label: 'codex · no run yet' },
         // Models the real element closely enough for attribute handling.
         activityEl: {
             textContent: 'Old cycle activity',
@@ -79,6 +80,9 @@ test('clearStickyCardState resets the recycled record activity + cost (reusable 
     clearStickyCardState(record);
     assert.equal(record.collapsedActivity, '');
     assert.equal(record.costMeta, null);
+    // The sticky executor chip is cycle state: a recycled slot must not claim
+    // the previous cycle's delegated route as its own.
+    assert.equal(record.executorChip, null);
     assert.equal(record.activityEl.textContent, '');
     // The activity clock is cycle state too.
     assert.equal(record.latestActivityTs, '');

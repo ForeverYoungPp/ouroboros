@@ -520,14 +520,6 @@ def _extract_result_metadata(fn_name: str, result: Any, is_error: bool) -> Dict[
         status = "shell_error"
     elif text.startswith("⚠️ RUN_SCRIPT_BLOCKED"):
         status = "run_script_blocked"
-    elif text.startswith("⚠️ CLAUDE_CODE_TIMEOUT"):
-        status = "timeout"
-    elif text.startswith("⚠️ CLAUDE_CODE_INSTALL_ERROR"):
-        status = "install_error"
-    elif text.startswith("⚠️ CLAUDE_CODE_UNAVAILABLE"):
-        status = "unavailable"
-    elif text.startswith("⚠️ CLAUDE_CODE_"):
-        status = "claude_code_error"
     elif text.startswith("⚠️ VLM_"):
         status = "vlm_error"
     elif text.startswith("⚠️ CORE_PROTECTION_BLOCKED"):

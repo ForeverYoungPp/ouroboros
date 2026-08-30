@@ -87,6 +87,7 @@ MIGRATED_LAUNCHERS: tuple[str, ...] = (
     "swe_bench_pro/e1v2/run_pro.py",
     "swe_bench_pro/e1v2/auto_run.py",
     "continual_learning/run_clb.py",
+    "cybergym/run_cybergym.py",
     "osworld/run_step_agent.py",
     "osworld/run_cu_bridge_agent.py",
     "osworld/osworld_adapter_skeleton.py",

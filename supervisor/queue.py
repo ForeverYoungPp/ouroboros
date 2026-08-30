@@ -32,13 +32,15 @@ from ouroboros.schedule_contract import RESERVED_TEMPLATE_FIELDS, schedule_slug
 from ouroboros.skill_loader import skill_identity_collision_names
 from ouroboros.outcomes import terminal_outcome_axes
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
-from supervisor.evolution_lifecycle import (
+from supervisor.evolution_lifecycle import (  # noqa: F401 -- public queue API and lazy scheduler dependencies
+    _deliver_pending_owner_report,
     _read_evolution_campaign,
     begin_evolution_transaction,
     build_evolution_task_text,
     disable_evolution_authority,
     disable_evolution_projection,
     deliver_pending_owner_report,
+    enqueue_evolution_task_if_needed,
     evolution_block_reason,
     notify_owner_cycle_outcome,
     pause_evolution_campaign,
@@ -46,7 +48,7 @@ from supervisor.evolution_lifecycle import (
 )
 from supervisor.task_lifecycle import (  # noqa: F401 -- public queue API re-exports
     BUDGET_ROOT_FENCES, apply_budget_root_admission_fence, cancel_task_by_id,
-    clear_acceptance_fence_for_root, record_scheduled_admission,
+    clear_acceptance_fence_for_root,
     resume_budget_paused_task, restore_queue_fences, transition_acceptance_fence,
 )
 from supervisor.cognitive_operations import _active_operation_progressing
@@ -140,12 +142,12 @@ ADMISSION_RESERVATIONS: Dict[str, str] = {}
 _queue_lock = threading.RLock()
 _last_skill_schedule_sync: float = 0.0
 _SKILL_SCHEDULE_SYNC_INTERVAL_SEC: float = 60.0
-
 from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
-    release_task_admission,
+    coerce_queue_order, prefer_terminalization_retry_rows, record_scheduled_admission,
+    reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission,
+    restore_terminalization_retry, restore_terminalization_retry_rows,
     reserve_task_admission,
 )
-
 # Variant A off-loop worker reaper lives in supervisor/task_reaper.py (module size); re-export
 # the thin names the enforce path and tests use — monkeypatching these queue names still works.
 from supervisor.task_reaper import (  # noqa: E402,F401 — re-exported for enforce path + tests
@@ -177,10 +179,8 @@ def _task_priority(task_type: str) -> int:
 
 
 def _queue_sort_key(task: Dict[str, Any]) -> Tuple[int, int]:
-    _pr = task.get("priority")
-    pr = int(_pr) if _pr is not None else _task_priority(str(task.get("type") or ""))
-    _seq = task.get("_queue_seq")
-    seq = int(_seq) if _seq is not None else 0
+    pr = coerce_queue_order(task.get("priority"), _task_priority(str(task.get("type") or "")))
+    seq = coerce_queue_order(task.get("_queue_seq"))
     return pr, seq
 
 
@@ -189,11 +189,12 @@ def sort_pending() -> None:
     PENDING.sort(key=_queue_sort_key)
 
 
-def drain_all_pending() -> list:
-    """Drain pending tasks during crash-storm cleanup; caller holds _queue_lock."""
+def drain_all_pending(*, persist: bool = True) -> list:
+    """Drain pending tasks; optionally defer snapshot persistence until custody settles."""
     drained = list(PENDING)
     PENDING.clear()
-    persist_queue_snapshot(reason="drain_all_pending")
+    if persist:
+        persist_queue_snapshot(reason="drain_all_pending")
     return drained
 
 
@@ -215,6 +216,35 @@ def enqueue_task(
             # Tokenless internal callers and competing ingress must not consume/collide with it.
             t["_admission_blocked"] = "admission_reservation_owned"
             return t
+        if require_unique_id and task_id:
+            # Exact-id ownership wins over malformed-depth replay.
+            live_duplicate = task_id in RUNNING or any(
+                isinstance(row, dict) and str(row.get("id") or "") == task_id
+                for row in PENDING
+            )
+            if live_duplicate:
+                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                    ADMISSION_RESERVATIONS.pop(task_id, None)
+                t["_admission_blocked"] = "duplicate_task_id"
+                return t
+            try:
+                from ouroboros.task_results import load_task_result
+                if load_task_result(DRIVE_ROOT, task_id, strict=True):
+                    if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                        ADMISSION_RESERVATIONS.pop(task_id, None)
+                    t["_admission_blocked"] = "duplicate_task_id"
+                    return t
+            except Exception:
+                log.warning("Fresh task-id lookup failed for %s", task_id, exc_info=True)
+                t["_admission_blocked"] = "task_id_lookup_failed"
+                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                    ADMISSION_RESERVATIONS.pop(task_id, None)
+                return t
+        retry = restore_terminalization_retry(t, pending=PENDING, running=RUNNING, queue_seq_counter_ref=QUEUE_SEQ_COUNTER_REF, sort_pending=sort_pending) if restoring_snapshot else None
+        if retry:
+            return retry
+        if reject_invalid_task_depth(t, reservations=ADMISSION_RESERVATIONS, admission_token=admission_token):
+            return t
         if require_worker_pool:
             try:
                 from supervisor import workers
@@ -233,30 +263,6 @@ def enqueue_task(
         if admission_token and reserved_token != admission_token:
             t["_admission_blocked"] = "admission_reservation_lost"
             return t
-        if require_unique_id and task_id:
-            live_duplicate = task_id in RUNNING or any(
-                isinstance(row, dict) and str(row.get("id") or "") == task_id
-                for row in PENDING
-            )
-            if live_duplicate:
-                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
-                    ADMISSION_RESERVATIONS.pop(task_id, None)
-                t["_admission_blocked"] = "duplicate_task_id"
-                return t
-            try:
-                from ouroboros.task_results import load_task_result
-
-                if load_task_result(DRIVE_ROOT, task_id, strict=True):
-                    if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
-                        ADMISSION_RESERVATIONS.pop(task_id, None)
-                    t["_admission_blocked"] = "duplicate_task_id"
-                    return t
-            except Exception:
-                log.warning("Fresh task-id lookup failed for %s", task_id, exc_info=True)
-                t["_admission_blocked"] = "task_id_lookup_failed"
-                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
-                    ADMISSION_RESERVATIONS.pop(task_id, None)
-                return t
         project_id = str(t.get("project_id") or "").strip()
         if project_id:
             try:
@@ -293,7 +299,7 @@ def enqueue_task(
             return t
         QUEUE_SEQ_COUNTER_REF["value"] += 1
         seq = QUEUE_SEQ_COUNTER_REF["value"]
-        t.setdefault("priority", _task_priority(str(t.get("type") or "")))
+        t["priority"] = coerce_queue_order(t.get("priority"), _task_priority(str(t.get("type") or "")))
         _att = t.get("_attempt")
         t.setdefault("_attempt", int(_att) if _att is not None else 1)
         t["_queue_seq"] = -seq if front else seq
@@ -773,8 +779,8 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 "metadata": t.get("metadata"), "origin_message_ref": t.get("origin_message_ref"),
                 "origin_message_text": t.get("origin_message_text"), "_attempt": t.get("_attempt"),
                 "review_reason": t.get("review_reason"), "review_source_task_id": t.get("review_source_task_id"),
-                "_budget_pause": t.get("_budget_pause"),
-                "budget_resumed_at": t.get("budget_resumed_at"),
+                "_budget_pause": t.get("_budget_pause"), "budget_resumed_at": t.get("budget_resumed_at"), "_terminalization_retry": t.get("_terminalization_retry"),
+                "_cancel_intent_authority_hold": t.get("_cancel_intent_authority_hold"),
             },
         })
     running_rows = []
@@ -849,6 +855,10 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
             for row in (snap.get("pending") or [])
             if isinstance(row, dict) and isinstance(row.get("task"), dict)
         ]
+        snapshot_pending, pending_by_id, restored = restore_terminalization_retry_rows(
+            snapshot_pending, pending=PENDING, running=RUNNING,
+            queue_seq_counter_ref=QUEUE_SEQ_COUNTER_REF, sort_pending=sort_pending,
+        )
         fenced_roots, malformed_fences, malformed_budget_fences = restore_queue_fences(raw_fences, raw_budget_fences)
         if malformed_budget_fences:
             append_jsonl(
@@ -856,7 +866,7 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                 {"ts": utc_now_iso(), "type": "queue_restore_invalid_budget_root_fences",
                  "action": "fail_closed_no_restore"},
             )
-            return 0
+            return restored
         if malformed_fences:
             affected = [str(task.get("id") or "") for task in snapshot_pending if task.get("id")]
             append_jsonl(
@@ -885,15 +895,11 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                         )
             except Exception:
                 log.warning("Failed to terminalize tasks from invalid acceptance-fence snapshot", exc_info=True)
-            return 0
+            return restored
 
-        pending_by_id = {
-            str(task.get("id") or ""): task for task in snapshot_pending if str(task.get("id") or "")
-        }
-        restored = 0
-        skipped_terminal = 0
-        skipped_fenced: list[str] = []
-        blocked_restore: list[str] = []
+        skipped_terminal, invalid_depth_restore = 0, []
+        cancel_authority_holds: list[str] = []
+        skipped_fenced, blocked_restore = [], []
         for task in snapshot_pending:
             chat_id = task.get("chat_id")
             if not task.get("id") or chat_id is None or chat_id == "":
@@ -934,39 +940,94 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                 except Exception:
                     log.warning("Failed to terminalize fenced snapshot task %s", task_id, exc_info=True)
                 continue
-            # Never resurrect a terminal/cancelled task as a ghost pending entry.
-            # AR2-10 (§8-A1): the intent projection is consulted UNDER the queue lock at
-            # restore — the "no active intent" read and the enqueue form one serialized step
-            # against assignment/drop (same invariant as the pre-assignment consult). Boot-time
-            # and contention-free; _queue_lock is an RLock, so enqueue_task stays re-entrant.
+            # AR2-10 (§8-A1): restore and the intent check share the queue lock.
             with _queue_lock:
                 skip_revival = False
                 try:
-                    existing = load_task_result(DRIVE_ROOT, str(task.get("id")))
+                    existing = load_task_result(DRIVE_ROOT, str(task.get("id")), strict=True)
                     existing_status = str(existing.get("status") or "") if existing else ""
+                except Exception:
+                    # Result-authority loss already has terminal custody: once
+                    # its retry can prove a writable result, the task is failed
+                    # rather than replayed over an unknown exact-id lifecycle.
+                    task["_terminalization_retry"] = {
+                        "reason": "Pending task result authority is unreadable; dispatch is blocked.",
+                        "status": "failed",
+                        "trigger": "pending_result_authority",
+                        "reconcile_delegate_custody": False,
+                    }
+                    restore_terminalization_retry(
+                        task, pending=PENDING, running=RUNNING,
+                        queue_seq_counter_ref=QUEUE_SEQ_COUNTER_REF,
+                        sort_pending=sort_pending,
+                    )
+                    skipped_terminal += 1
+                    log.debug(
+                        "Snapshot restore result-authority check failed for %s",
+                        task.get("id"),
+                        exc_info=True,
+                    )
+                    continue
+                else:
                     # Terminal OR cancel-intent — both must not be resurrected as
                     # pending. Intent lives in the durable projection (phase A);
                     # the status check covers legacy latch files.
-                    if existing_status in _TRULY_TERMINAL_STATUSES or existing_status == STATUS_CANCEL_REQUESTED:
+                    if not isinstance(task.get("_terminalization_retry"), dict) and (existing_status in _TRULY_TERMINAL_STATUSES or existing_status == STATUS_CANCEL_REQUESTED):
                         skip_revival = True
-                    else:
-                        from ouroboros.cancel_intents import has_active_intent
+                    elif not isinstance(task.get("_terminalization_retry"), dict):
+                        try:
+                            from ouroboros.cancel_intents import has_active_intent
 
-                        if has_active_intent(DRIVE_ROOT, str(task.get("id"))):
-                            # Left for cancellation custody/watchdog to settle —
-                            # never a pending revival racing its own teardown.
-                            skip_revival = True
-                except Exception:
-                    log.debug("Snapshot restore terminal-status check failed for %s", task.get("id"), exc_info=True)
+                            if has_active_intent(
+                                DRIVE_ROOT, str(task.get("id")), strict=True,
+                            ):
+                                # Cancellation custody owns it; never revive a pending row.
+                                skip_revival = True
+                        except Exception:
+                            # This is an UNKNOWN cancel fact, not a terminal
+                            # outcome. Restore the ordinary row under a durable,
+                            # non-dispatchable hold; the pre-dispatch SSOT later
+                            # resolves it after both authorities are readable.
+                            task = dict(task)
+                            task["_cancel_intent_authority_hold"] = {
+                                "reason": "Cancel-intent authority is unreadable; dispatch is blocked.",
+                                "held_at": utc_now_iso(),
+                            }
+                            admitted = enqueue_task(task, restoring_snapshot=True)
+                            if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
+                                restore_invalid_depth_admission(
+                                    task, admitted, drive_root=DRIVE_ROOT,
+                                    pending=PENDING, blocked=blocked_restore,
+                                    terminalized=invalid_depth_restore,
+                                    queue_seq_counter_ref=QUEUE_SEQ_COUNTER_REF,
+                                )
+                                try:
+                                    sort_pending()
+                                except (TypeError, ValueError, OverflowError):
+                                    log.warning(
+                                        "Deferred snapshot sort failed; custody retained",
+                                        exc_info=True,
+                                    )
+                            else:
+                                restored += 1
+                                cancel_authority_holds.append(str(task.get("id") or ""))
+                            log.debug(
+                                "Snapshot restore cancel-intent authority check failed for %s",
+                                task.get("id"),
+                                exc_info=True,
+                            )
+                            continue
                 if skip_revival:
                     skipped_terminal += 1
                     continue
-                # These tasks already existed when the root pause was snapshotted.
-                # Restore them behind the root marker; only new admission is fenced.
                 admitted = enqueue_task(task, restoring_snapshot=True)
-            if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
-                blocked_restore.append(str(task.get("id") or ""))
-                continue
+                if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
+                    restore_invalid_depth_admission(task, admitted, drive_root=DRIVE_ROOT, pending=PENDING, blocked=blocked_restore, terminalized=invalid_depth_restore, queue_seq_counter_ref=QUEUE_SEQ_COUNTER_REF)
+                    try:
+                        sort_pending()
+                    except (TypeError, ValueError, OverflowError):
+                        log.warning("Deferred snapshot sort failed; custody retained", exc_info=True)
+                    continue
             restored += 1
         if skipped_fenced:
             append_jsonl(
@@ -986,10 +1047,11 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                     "type": "queue_restored_from_snapshot",
                     "restored_pending": restored,
                     "skipped_terminal": skipped_terminal,
-                    "blocked_admission": blocked_restore,
+                    "cancel_authority_holds": cancel_authority_holds,
+                    "blocked_admission": blocked_restore, "invalid_task_depth": invalid_depth_restore,
                 },
             )
-        if restored > 0:
+        if restored > 0 or skipped_terminal > 0 or invalid_depth_restore:
             persist_queue_snapshot(reason="queue_restored")
         return restored
     except Exception:
@@ -1047,6 +1109,7 @@ from supervisor.task_lifecycle import (  # noqa: E402, F401 -- intentional publi
     _CANCEL_TERMINALIZED,
     _cancel_result_fields,
     cancel_task_custody,
+    drive_cancel_intent_scope,
     task_has_live_ownership,
     task_subtree_is_live,
 )
@@ -1174,13 +1237,12 @@ def _has_pending_descendant(task_id: str) -> bool:
 def _enforce_task_timeouts_locked(
     workers: Any, now: float, owner_chat_id: int, st: Dict[str, Any]
 ) -> None:
-    # ONE typed owner-stop predicate before every generic timeout-grace consumer (S3
-    # §12.2 item 8): a task whose owner-requested finalization intent is still OPEN is
-    # bypassed whole — no spare-withdraw, no spare-clock reset, no second grace episode,
-    # no expiry kill, no RUNNING.pop, no reaper enqueue, no retry scheduling. The hold
-    # deliberately outlives the grace deadline (the expiry window): the deadline gates only
-    # the sweep's arm-vs-feed-custody decision in supervisor/owner_stop.py +
-    # sweep_cancel_intents; the intent stays the one owner will and custody stays the only killer.
+    # ONE typed owner-stop predicate before the generic idle/grace consumers (S3
+    # §12.2 item 8): an OPEN owner-requested finalization intent suppresses the
+    # ordinary spare-withdraw/second-grace/retry path only while the task remains
+    # inside its independent explicit deadline and absolute safety ceiling. The
+    # intent stays the one owner will and cancellation custody stays the killer;
+    # a later graceful request can never extend either hard axis.
     from supervisor.owner_stop import running_owner_stop_tasks
 
     owner_stop_held = running_owner_stop_tasks(
@@ -1188,8 +1250,6 @@ def _enforce_task_timeouts_locked(
     )
     for task_id, meta in list(RUNNING.items()):
         if not isinstance(meta, dict):
-            continue
-        if str(task_id) in owner_stop_held:
             continue
         task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
         started_at = float(meta.get("started_at") or 0.0)
@@ -1235,6 +1295,17 @@ def _enforce_task_timeouts_locked(
                        or llm_call_in_flight
                        or _active_operation_progressing(meta, now))
         ceiling_reached = runtime_sec >= abs_ceiling
+
+        if (
+            str(task_id) in owner_stop_held
+            and not deadline_reached
+            and not ceiling_reached
+        ):
+            # The owner-stop episode replaces only the generic idle/grace
+            # machinery.  Explicit task deadline and the absolute safety
+            # ceiling remain independent hard axes and may never be extended
+            # by a later graceful-stop request.
+            continue
 
         # Hard axes (deadline_at, abs ceiling) stop the task regardless of activity; the
         # idle/subtree gate only spares a still-progressing task with NO explicit deadline —
@@ -1285,6 +1356,44 @@ def _enforce_task_timeouts_locked(
         # stays fast and the terminal write + retry enqueue happen only AFTER kill/join
         # (no race with a concurrently-assigned retry; a subagent retry reuses id/drive).
         # Live-RUNNING decisions (orchestrator -> no blind retry; retry id) freeze HERE.
+        # Linearize the timeout decision against cancellation before withdrawing
+        # RUNNING.  When an intent already owns either this physical attempt or
+        # its proven logical retry root, yield the whole rail: cancellation
+        # custody remains the sole killer and preserves the owner's outcome and
+        # reason instead of racing a generic timeout FAILED write.
+        cancel_authority_unreadable = False
+        try:
+            from ouroboros.cancel_intents import (
+                _validated_retry_root_cancel_key,
+                active_intents,
+                cancellation_projection_lock,
+            )
+
+            with cancellation_projection_lock(DRIVE_ROOT):
+                retry_root = _validated_retry_root_cancel_key(
+                    DRIVE_ROOT, str(task_id), task_hint=task,
+                )
+                intents = active_intents(DRIVE_ROOT, strict=True)
+                cancel_target = next(
+                    (
+                        candidate
+                        for candidate in dict.fromkeys((str(task_id), retry_root))
+                        if candidate and candidate in intents
+                    ),
+                    "",
+                )
+                if cancel_target:
+                    continue
+        except Exception:
+            # Preserve the prior absolute/deadline timeout behavior when
+            # cancellation authority itself is damaged, but never let that
+            # uncertainty mint a fresh retry authority below.
+            cancel_authority_unreadable = True
+            log.error(
+                "Task timeout could not prove cancel-intent authority for %s",
+                task_id,
+                exc_info=True,
+            )
         if task_type == "evolution":
             from supervisor.evolution_lifecycle import update_evolution_transaction
             if not update_evolution_transaction(task_id, dispatch_status="reaping"):
@@ -1318,15 +1427,10 @@ def _enforce_task_timeouts_locked(
         # loaded this tick, so this reflects the current owner decision.
         if will_retry and task_type == "evolution" and not bool(st.get("evolution_mode_enabled")):
             will_retry = False
-        # An ACTIVE cancel intent (immediate policy, or a finalize intent already
-        # CLAIMED by custody — open finalize intents never reach here, the hold
-        # above skips them) must never spawn a retry clone: a new-uuid retry
-        # escapes the intent (keyed by the old id) and CANCELLED_ROOT_FENCES,
-        # restarting work the owner stopped.
-        if will_retry:
-            from ouroboros.cancel_intents import has_active_intent
-
-            will_retry = not has_active_intent(DRIVE_ROOT, str(task_id))
+        # An unreadable projection/lineage cannot authorize a new dispatch.
+        # Readable active intents already yielded the timeout rail above.
+        if will_retry and cancel_authority_unreadable:
+            will_retry = False
         retry_task_id = ""
         if will_retry:
             same_id = task_type == "evolution" or str(task.get("delegation_role") or "") == "subagent"
@@ -1481,120 +1585,3 @@ def get_evolution_status_snapshot(*, budget_projection: Optional[Dict[str, Any]]
         "queued_task_id": str((queued_task or {}).get("id") or ""),
         "running_task_id": str((running_task or {}).get("id") or ""),
     }
-
-
-def _deliver_pending_owner_report() -> None:
-    deliver_pending_owner_report(notify_owner_cycle_outcome)
-
-
-def enqueue_evolution_task_if_needed() -> None:
-    """Queue evolution only when idle, enabled, within budget, and not failure-paused."""
-    _deliver_pending_owner_report()
-    if PENDING or RUNNING:
-        return
-    st = load_state()
-    if not bool(st.get("evolution_mode_enabled")):
-        return
-    owner_chat_id = st.get("owner_chat_id")
-    if not owner_chat_id:
-        return
-    campaign = _read_evolution_campaign()
-    from supervisor.state import update_state
-    has_authority = all(str(campaign.get(key) or "").strip() for key in ("id", "source"))
-    if campaign.get("status") != "active" or not has_authority:
-        disable_evolution_authority("bare_flag_disabled", campaign_id=str(campaign.get("id") or ""))
-        send_with_budget(
-            int(owner_chat_id),
-            "🧬 Evolution stayed off: the enable flag had no active campaign authority. Use /evolve start to begin a fresh campaign.",
-        )
-        return
-    active_tx = campaign.get("active_transaction") if isinstance(campaign.get("active_transaction"), dict) else {}
-    if active_tx and (
-        str(active_tx.get("commit_sha") or "").strip()
-        or str(active_tx.get("dispatch_status") or "") == "reaping"
-    ):
-        return
-
-    # Defensive net: light mode must never run evolution even if the flag was
-    # left enabled (e.g. carried across a restart into light mode). Disable and
-    # pause once; entry points already refuse new starts up front.
-    block = evolution_block_reason()
-    if block:
-        pause_evolution_campaign("blocked in light runtime mode")
-        disable_evolution_projection()
-        send_with_budget(int(owner_chat_id), block)
-        return
-
-    consecutive_failures = int(st.get("evolution_consecutive_failures") or 0)
-    if consecutive_failures >= 3:
-        pause_evolution_campaign("paused after consecutive failures")
-        disable_evolution_projection()
-        send_with_budget(
-            int(owner_chat_id),
-            f"🧬⚠️ Evolution paused: {consecutive_failures} consecutive failures. "
-            f"Use /evolve start to resume after investigating the issue."
-        )
-        return
-
-    # BUG3: pause if the SAME objective has been re-proposed and no-op'd OBJECTIVE_REPEAT_CAP
-    # times without ever absorbing. This is a SEPARATE breaker from consecutive_failures
-    # above: that counter is reset to 0 by ANY non-failing cycle (events.py), so it cannot
-    # catch a self-maintenance loop where a blocked objective is re-proposed NON-consecutively
-    # (interleaved with other no_op work). The per-objective count is keyed on the same
-    # canonical fingerprint the transaction stamps, accumulates across non-consecutive
-    # recurrence, and is cleared only on a genuine absorb.
-    from ouroboros.evolution_fingerprint import canonical_objective_fingerprint
-
-    _objective_repeat_counts = campaign.get("objective_repeat_counts") or {}
-    _active_objective_fp = canonical_objective_fingerprint(str(campaign.get("objective") or ""))
-    _objective_repeats = int(_objective_repeat_counts.get(_active_objective_fp, 0)) if _active_objective_fp else 0
-    if _objective_repeats >= OBJECTIVE_REPEAT_CAP:
-        pause_evolution_campaign("paused: objective re-proposed without ever absorbing")
-        disable_evolution_projection()
-        send_with_budget(
-            int(owner_chat_id),
-            f"🧬⚠️ Evolution paused: the current objective ran {_objective_repeats} reviewed "
-            f"cycles WITHOUT ever being absorbed — it keeps getting re-proposed and never lands "
-            f"(a self-maintenance loop, not progress). A plain resume won't help; use "
-            f"/evolve start with a DIFFERENT objective."
-        )
-        return
-
-    try:
-        remaining = budget_remaining(st, strict=True)
-    except Exception:
-        log.error("Evolution scheduling deferred: cost accounting unavailable", exc_info=True)
-        append_jsonl(DRIVE_ROOT / "logs" / "events.jsonl", {
-            "ts": utc_now_iso(), "type": "evolution_accounting_unavailable",
-            "action": "dispatch_deferred", "owner_visible": True,
-        })
-        return
-    if remaining < EVOLUTION_BUDGET_RESERVE:
-        pause_evolution_campaign("budget reserve reached")
-        disable_evolution_projection()
-        send_with_budget(int(owner_chat_id), f"💸 Evolution stopped: ${remaining:.2f} remaining (reserve ${EVOLUTION_BUDGET_RESERVE:.0f} for conversations).")
-        return
-    cycle = int(st.get("evolution_cycle") or 0) + 1
-    tid = uuid.uuid4().hex[:8]
-    transaction = begin_evolution_transaction(tid, cycle=cycle, campaign=campaign)
-    if not transaction:
-        disable_evolution_authority("transaction_attach_failed", campaign_id=str(campaign.get("id") or ""), task_id=tid)
-        send_with_budget(
-            int(owner_chat_id),
-            "🧬 Evolution stayed off: the campaign changed before its next task could be attached. Start it again when ready.",
-        )
-        return
-    task = {
-        "id": tid, "type": "evolution",
-        "chat_id": int(owner_chat_id),
-        "text": build_evolution_task_text(cycle),
-        "metadata": {"evolution_transaction": transaction},
-    }
-    attach_task_contract(task)
-    enqueue_task(task)
-
-    def _record_cycle(live: Dict[str, Any]) -> None:
-        live["evolution_cycle"] = cycle
-        live["last_evolution_task_at"] = utc_now_iso()
-
-    update_state(_record_cycle)

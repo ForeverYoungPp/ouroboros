@@ -389,9 +389,12 @@ def _degradable_diff_only_paths(repo_dir: pathlib.Path, current: list,
                                 skipped: list, deleted: list,
                                 renamed: frozenset = frozenset(), *,
                                 m0_tree: str = "", staged_tree: str = "") -> list:
-    """Touched paths the ladder may hand to the diff-only tier. Current paths join
-    freely, exactly as before (atlas-required ones degrade only after -U0). Touched
-    TESTS — skipped-by-design current ones and deleted ones — join the free tier too,
+    """Touched paths the ladder may hand to the diff-only tier. Current paths
+    join freely EXCEPT atlas-required-beyond-diff ones: the atlas refuses a
+    diff-only required artifact by design (typed ``budget_omitted`` assembly
+    failure), so degrading one can only convert the pack into a refusal, never
+    into a fitting pack — a self-defeating rung, removed. Touched TESTS —
+    skipped-by-design current ones and deleted ones — join the free tier too,
     with cheap conservative guards: atlas-required tests never degrade; binary and
     RENAMED paths keep their snapshot/metadata (the staged text diff may not carry
     their change); an oversized/sensitive deletion keeps its suppression marker."""
@@ -416,7 +419,10 @@ def _degradable_diff_only_paths(repo_dir: pathlib.Path, current: list,
         return True
 
     return (
-        list(current)
+        [
+            p for p in current
+            if not atlas_required_beyond_diff(p.replace("\\", "/").lstrip("./"))
+        ]
         + [p for p in skipped if _degradable_test(p, False)]
         + [p for p in deleted if _degradable_test(p, True)]
     )
@@ -816,10 +822,12 @@ def _build_scope_prompt(
             except Exception:
                 return 0
 
-    # Guaranteed-fit ladder: full atlas; compact atlas; degrade degradable touched files
-    # to diff-only (largest first); drop unchanged diff context; artifacts last. Else CLOSED.
+    # Guaranteed-fit ladder: compact atlas (the default form); degrade degradable
+    # touched files to diff-only (largest first); drop unchanged diff context.
+    # Else CLOSED — atlas-required-beyond-diff artifacts never degrade to
+    # diff-only, because the atlas refuses such a pack by design.
     input_limit = _effective_scope_input_limit(scope_model=scope_model)
-    _atlas_min_allowance = 35_000  # manifest reserve + hard headroom, see review_context_atlas
+    _atlas_min_allowance = 35_000  # rendered-manifest + hard headroom allowance, see review_context_atlas
     diff_only_paths: list = []
     # FREE tier includes touched tests and eligible deletions (guards in the helper).
     degradable = sorted(
@@ -828,9 +836,9 @@ def _build_scope_prompt(
             renamed_paths,
             m0_tree=getattr(subject, "m0_tree", "") or "",
             staged_tree=getattr(subject, "staged_tree", "") or ""),
-        key=lambda path: (atlas_required_beyond_diff(path), -_touched_token_estimate(path)),
+        key=lambda path: -_touched_token_estimate(path),
     )
-    compact = False
+    compact = True
     compact_diff_attempted = False
     last_known_tokens = 0
     unassembled_required: list = []
@@ -843,31 +851,23 @@ def _build_scope_prompt(
         atlas_text = None
         try:
             atlas_text = _atlas_section(fixed_prompt_tokens, compact)
-        except _ScopeAtlasNotAssembled as exc:
-            refusal = exc
-            if not compact:
-                compact = True
-                try:
-                    atlas_text = _atlas_section(fixed_prompt_tokens, True)
-                except _ScopeAtlasNotAssembled as compact_exc:
-                    refusal = compact_exc
-            if atlas_text is None:
-                last_known_tokens = int(refusal.manifest.get("estimated_total_tokens") or 0)
-                # The atlas manifest is the ONE carrier of what did not assemble; a
-                # refusal is a ladder STEP (P1) that can carry TWO causes — capture both.
-                unassembled_required = [
-                    str(row.get("path") or "?") for row in atlas_unassembled_required(refusal.manifest)
-                ]
-                atlas_overflowed = atlas_hard_budget_overflowed(refusal.manifest)
-                ladder_steps.append({
-                    "step": "atlas_refused", "compact": compact, "reason": str(refusal),
-                    "unassembled_required": list(unassembled_required),
-                    "atlas_overflowed": atlas_overflowed,
-                    "tokens_after": last_known_tokens,
-                    "diff_only_files": len(diff_only_paths),
-                    "diff_only_paths": list(diff_only_paths),
-                    "zero_context_diff": compact_diff_attempted,
-                })
+        except _ScopeAtlasNotAssembled as refusal:
+            last_known_tokens = int(refusal.manifest.get("estimated_total_tokens") or 0)
+            # The atlas manifest is the ONE carrier of what did not assemble; a
+            # refusal is a ladder STEP (P1) that can carry TWO causes — capture both.
+            unassembled_required = [
+                str(row.get("path") or "?") for row in atlas_unassembled_required(refusal.manifest)
+            ]
+            atlas_overflowed = atlas_hard_budget_overflowed(refusal.manifest)
+            ladder_steps.append({
+                "step": "atlas_refused", "compact": compact, "reason": str(refusal),
+                "unassembled_required": list(unassembled_required),
+                "atlas_overflowed": atlas_overflowed,
+                "tokens_after": last_known_tokens,
+                "diff_only_files": len(diff_only_paths),
+                "diff_only_paths": list(diff_only_paths),
+                "zero_context_diff": compact_diff_attempted,
+            })
 
         deficit = 0
         if atlas_text is not None:
@@ -879,7 +879,7 @@ def _build_scope_prompt(
             unassembled_required = []  # assembled: no earlier refusal is the cause now
             atlas_overflowed = False
             ladder_steps.append({
-                "step": "compact_atlas" if compact else "full_atlas",
+                "step": "compact_atlas",
                 "tokens_before": last_known_tokens,
                 "tokens_after": prompt_tokens,
                 "diff_only_files": len(diff_only_paths),
@@ -891,17 +891,16 @@ def _build_scope_prompt(
             if prompt_tokens <= input_limit:
                 _record_ladder_steps(ladder_steps)
                 return prompt, None
-            if not compact:
-                # Retry the same touched set with the compact atlas first.
-                compact = True
-                continue
             deficit = prompt_tokens - input_limit
         else:
             # Even the manifest cannot fit beside the fixed part: shrink it for room.
             deficit = max(50_000, fixed_prompt_tokens + _atlas_min_allowance - input_limit)
 
-        def can_degrade() -> bool:  # required tier only after -U0
-            return bool(degradable) and (compact_diff_attempted or not atlas_required_beyond_diff(degradable[0]))
+        # Degradable never holds atlas-required-beyond-diff paths: the atlas
+        # refuses a diff-only required artifact by design, so that rung could
+        # only convert this pack into a typed refusal, never into a fit.
+        def can_degrade() -> bool:
+            return bool(degradable)
 
         if not can_degrade():
             if not compact_diff_attempted:  # every +/- line, no unchanged context
@@ -915,8 +914,6 @@ def _build_scope_prompt(
                     compact_diff = ""  # the full capture above stays the evidence
                 if compact_diff.strip() and compact_diff != diff_text:
                     diff_text = compact_diff
-                    continue
-                if can_degrade():  # -U0 gave nothing, but the required tier is open now
                     continue
             # Terminal pack status: >=1M authority is fixed_overflow; a sub-floor pack is
             # budget_exceeded (blocked unless owner advisory). CAUSE travels separately.
@@ -983,7 +980,7 @@ def _call_scope_llm(
     session_root: str = "",
     slot_effort: str = "",
     session_target: str = "",
-    session_profile: str = "", retry_key: str = "",
+    session_profile: str = "", retry_key: str = "", subagent_id: str = "",
 ) -> tuple:
     """Execute the scope review call synchronously — api pack or agent session.
 
@@ -1004,12 +1001,13 @@ def _call_scope_llm(
     # 6.1/6.3: the row's own effort wins; the global key stays the default.
     scope_effort = slot_effort or _resolve_effort("scope_review")
     delegated = str(getattr(route, "value", route) or "") == "agent_session"
+    retrieves = delegated or bool(subagent_id)  # RETRIEVES class: no pack
     # Output budget scales with the reviewer window: requesting the absolute
     # 100K reserve on a small-window model would 400 on input+max_tokens.
     _scope_output_tokens, _ = _window_scaled_reserves(
         _scope_window(scope_model).sizing_window(_SCOPE_FAILCLOSED_WINDOW)
     )
-    if delegated:
+    if retrieves:
         messages: Any = []
     else:
         # Split at the recorded stable/dynamic boundary: the byte-stable prefix
@@ -1044,8 +1042,8 @@ def _call_scope_llm(
             max_tokens=_scope_output_tokens,
             temperature=0.2,
             no_proxy=True,
-            session_task=session_task if delegated else "",
-            session_root=session_root if delegated else "",
+            session_task=session_task if retrieves else "",
+            session_root=session_root if retrieves else "",
             reconcile_only=bool(getattr(ctx, "_review_reconcile_only", False)),
             # The extraction fallback canonicalizes to the SCOPE contract: required-
             # matrix shape, eight verbatim item ids (D19 — never a looser contract).
@@ -1057,7 +1055,7 @@ def _call_scope_llm(
                         + ", ".join(sorted(SCOPE_REQUIRED_ITEMS))
                     ),
                 }
-                if delegated
+                if retrieves
                 else {}
             ),
         )
@@ -1072,7 +1070,7 @@ def _call_scope_llm(
             route=ReviewRouteKind.AGENT_SESSION if delegated else ReviewRouteKind.API_CHAT,
             # Empty keeps the shared session-route fallback.
             session_target=session_target if delegated else "",
-            session_profile=session_profile if delegated else "",
+            session_profile=session_profile if delegated else "", subagent_id=str(subagent_id or ""),
         )
         result = run_review_request(
             request,
@@ -1303,7 +1301,7 @@ def _apply_scope_authority(
     *,
     scope_model_id: str,
     result_kwargs: dict,
-    delegated: bool = False,
+    delegated: bool = False, native_retrieval: bool = False,
 ) -> tuple[List[dict], List[dict], Optional[ScopeReviewResult]]:
     """One-pass P3 authority for THIS row's delivery: is the reviewer's window ESTABLISHED
     enough for its verdict to gate a commit? ``api_chat`` must fit the whole assembled pack
@@ -1328,7 +1326,8 @@ def _apply_scope_authority(
     ``session_route_resolves_its_own_model`` — which is where a landing below the ask
     belongs, not in the window predicate."""
     resolved = _scope_window(scope_model_id, session=delegated)
-    if delegated:
+    if delegated or native_retrieval:
+        # Native actor rows = the same retrieving class (P3 alternate mode, sourced >=200K floor).
         from ouroboros.tools.scope_review_session import session_scope_authority
 
         # EVIDENCE, never the sizing fallback: the session floor is gated on SOURCED
@@ -1339,8 +1338,7 @@ def _apply_scope_authority(
             critical_findings, advisory_findings, scope_model=scope_model_id,
             window=int(resolved.window_tokens or 0),
             provenance="" if resolved.stale else str(resolved.status or ""),
-            result_kwargs=result_kwargs,
-            phrase=_window_provenance_phrase(
+            result_kwargs=result_kwargs, phrase=_window_provenance_phrase(
                 resolved.sizing_window(_SCOPE_FAILCLOSED_WINDOW),
                 _scope_window_provenance(resolved), resolved.observed_at),
         )
@@ -1385,8 +1383,8 @@ def run_scope_review(
     route: Any = None,  # the row's configured delivery (ReviewRouteKind); None/api_chat = api
     slot_effort: str = "",  # the row's own effort (6.1); "" = global scope_review effort
     session_target: str = "",  # the row's own harness[=model] target; "" = shared route
-    session_profile: str = "",  # optional credential pin (Q2-в); "" = rotation
-    prepared: Optional[dict] = None, retry_key: str = "",  # assembled packet + immutable cycle identity
+    session_profile: str = "",  # credential pin (Q2-в); "" = rotation
+    subagent_id: str = "",  prepared: Optional[dict] = None, retry_key: str = "",  # assembled packet + immutable cycle identity
 ) -> ScopeReviewResult:
     """Run blocking scope review from a prepared packet or a direct call."""
     if prepared is None:
@@ -1397,7 +1395,7 @@ def run_scope_review(
             review_rebuttal=review_rebuttal, review_history=review_history,
             scope_review_history=scope_review_history, scope_model=scope_model,
             slot_id=slot_id, route=route, slot_effort=slot_effort,
-            session_target=session_target, session_profile=session_profile,
+            session_target=session_target, session_profile=session_profile, subagent_id=subagent_id,
         )
         if final is not None:
             return final
@@ -1406,10 +1404,9 @@ def run_scope_review(
     prompt, session_task = prepared["prompt"], prepared["session_task"]
     repo_dir, scope_model_id = prepared["repo_dir"], prepared["scope_model_id"]
     slot_id, route = prepared["slot_id"], prepared["route"]
-    slot_effort = prepared["slot_effort"]
-    session_target = prepared["session_target"]
-    session_profile = prepared["session_profile"]
-    delegated = bool(prepared["delegated"])
+    slot_effort, session_target = prepared["slot_effort"], prepared["session_target"]
+    session_profile, delegated = prepared["session_profile"], bool(prepared["delegated"])
+    subagent_id = str(prepared.get("subagent_id") or "")
 
     _prompt_chars = len(prompt)  # type: ignore[arg-type]
     _prompt_tokens_est = estimate_tokens(prompt)  # type: ignore[arg-type]
@@ -1417,7 +1414,7 @@ def run_scope_review(
         prompt, scope_model=scope_model_id, ctx=ctx, slot_id=slot_id,
         route=route, session_task=session_task, session_root=str(repo_dir),
         slot_effort=slot_effort, session_target=session_target,
-        session_profile=session_profile, retry_key=retry_key,
+        session_profile=session_profile, retry_key=retry_key, subagent_id=subagent_id,
     )  # type: ignore[arg-type]
     _usage = dict(usage or {})
     _review_refs = dict(_usage.pop("_review_refs", {}) or {})
@@ -1566,7 +1563,7 @@ def run_scope_review(
     critical_findings, advisory_findings, authority_block = _apply_scope_authority(
         critical_findings, advisory_findings, scope_model_id=scope_model_id,
         result_kwargs=result_kwargs, delegated=delegated,
-    )
+        native_retrieval=bool(subagent_id) and not delegated)
     if authority_block is not None:
         return authority_block
     _log_scope_result(

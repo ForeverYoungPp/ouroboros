@@ -261,6 +261,7 @@ def test_executable_devtools_entrypoints_support_direct_help():
         "devtools/benchmarks/osworld/normalize_logs.py",
         "devtools/benchmarks/osworld/osworld_adapter_skeleton.py",
         "devtools/benchmarks/osworld/run_step_agent.py",
+        "devtools/benchmarks/cybergym/run_cybergym.py",
     ]
     for rel in scripts:
         proc = subprocess.run(
@@ -4457,14 +4458,10 @@ def test_finalize_run_manifest_records_a_typed_outcome_on_every_exit_path(tmp_pa
     assert _extra()["exit_code"] == 1
 
 
-# --------------------------------------------------------------------------- #
-# The structural launcher gate (devtools/benchmarks/common/launcher_audit.py)
-#
-# The guard used to live here as test-local `ast` helpers, and that is why it only ever knew
-# about ONE launcher shape and ONE hop of LOCAL helpers. It is now a module: the same entry
-# point audits the real launchers and a SYNTHETIC violating one, which is the only way to
-# tell "the gate works" from "today's code happens to be clean".
-# --------------------------------------------------------------------------- #
+# The structural launcher gate (devtools/benchmarks/common/launcher_audit.py).
+# Formerly test-local `ast` helpers knowing ONE launcher shape and ONE hop of
+# LOCAL helpers; now a module auditing the real launchers plus a SYNTHETIC
+# violating one — the only way to tell "the gate works" from "clean today".
 
 # A synthetic launcher-shaped module for pinning the pre-admission resolver itself.
 # Deliberately not a real launcher: the gate's BEHAVIOUR is what must not regress.
@@ -4626,6 +4623,7 @@ def test_every_migrated_launcher_routes_through_both_manifest_seams():
         bench / "terminal_bench" / "run_tb.py",
         bench / "terminal_bench" / "run_harbor_smoke.py",
         bench / "continual_learning" / "run_clb.py",
+        bench / "cybergym" / "run_cybergym.py",
         bench / "osworld" / "run_step_agent.py",
         bench / "osworld" / "run_cu_bridge_agent.py",
         bench / "osworld" / "osworld_adapter_skeleton.py",

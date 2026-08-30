@@ -9,7 +9,7 @@ import pathlib
 import httpx
 import pytest
 
-from ouroboros import subagents, usage_accounting as ua
+from ouroboros import delegate_custody as dcust, subagents, usage_accounting as ua
 from ouroboros.config import (
     CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION,
     CLAUDEXOR_MIN_VERSION,
@@ -960,13 +960,10 @@ def _delegating_ctx(tmp_path, *, acting: bool, task_id: str = "t-nanny"):
 
     repo = tmp_path / "repo"
     repo.mkdir(exist_ok=True)
-    # An acting child's WRITE ROOT is its own worktree, and the run root must equal the
-    # write_root the constraint granted — not whatever `active_repo_dir` happens to
-    # resolve to. Before v6.87.30 this fixture had no workspace at all and asserted
-    # `scope.root == repo_dir`, i.e. it pinned "hand an external shell the live Ouroboros
-    # tree" as the correct shape.
-    # The worktree must live OUTSIDE the data drive: an overlap is exactly what
-    # `workspace_mode_block_reason` refuses, and the refusal is correct.
+    # An acting child's run root must equal the granted write_root (its own
+    # worktree, OUTSIDE the data drive - the overlap is what
+    # workspace_mode_block_reason refuses). Pre-v6.87.30 this pinned
+    # "hand the shell the live tree" as correct.
     worktree = tmp_path.parent / f"wt-{tmp_path.name}"
     worktree.mkdir(exist_ok=True)
     if acting and not (worktree / ".git").exists():
@@ -1461,7 +1458,8 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
     monkeypatch.setattr(_gw, "ClaudexorGateway", lambda *a, **k: _NeverReached())
     refused = json.loads(delegate._delegate_start(expired, "start something new"))
     assert refused["status"] == "refused" and refused["reason"] == "task_deadline_expired"
-    assert reached == [], "an expired nanny must not even reach the daemon"
+    assert refused["definitely_unrun"] is True
+    assert reached == [], "expired nanny never reaches daemon"
 
 
 def test_the_agent_facing_cost_tells_the_same_story_as_the_ledger(tmp_path, monkeypatch):
@@ -1530,8 +1528,10 @@ def test_settlement_reads_the_harnesss_own_spend_field(tmp_path, monkeypatch):
 
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
-    delegate._CUSTODY["run-1"] = delegate._RunCustody(
-        task_id="t-a", route_id="r", model="m", project_id="prj-ours", project_owned=True)
+    row = delegate._RunCustody(run_id="run-1", task_id="t-a", route_id="r",
+        model="m", project_id="prj-ours", project_owned=True)
+    dcust.record_started(tmp_path, row)
+    delegate._CUSTODY["run-1"] = row
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "t-a"
     ctx.task_metadata = {"root_task_id": "t-a"}
@@ -1963,8 +1963,9 @@ def test_a_failed_ledger_write_leaves_the_session_retryable(tmp_path, monkeypatc
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     monkeypatch.setattr(ua, "record_subscription_session", _boom)
     delegate._CUSTODY.clear()
-    custody = delegate._RunCustody(task_id="t-a", route_id="r", model="m",
-                                   project_id="prj-ours", project_owned=True)
+    custody = delegate._RunCustody(run_id="run-1", task_id="t-a", route_id="r",
+        model="m", project_id="prj-ours", project_owned=True)
+    dcust.record_started(tmp_path, custody)
     delegate._CUSTODY["run-1"] = custody
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "t-a"
@@ -1972,10 +1973,10 @@ def test_a_failed_ledger_write_leaves_the_session_retryable(tmp_path, monkeypatc
 
     json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
     assert custody.settled is False, "a lost write must stay retryable"
-    # Retirement is INDEPENDENT of whether the ledger write landed. The round-2 commit
-    # claimed this and the fixture owned no project, so deleting the call left the suite
+    # Retirement is INDEPENDENT of the ledger write: the round-2 commit claimed
+    # this while the fixture owned no project, so deleting the call stayed
     # green — a leak per failed settle, and a halted run never settles again.
-    assert retired == ["prj-ours"], "an owned registration must be retired even on failure"
+    assert retired == ["prj-ours"], "owned registration retired even on failure"
     delegate._CUSTODY.clear()
 
 
@@ -2894,21 +2895,21 @@ def test_a_retry_testifies_about_the_stored_invocation_not_the_current_config(
     # 2. EVERYTHING drifts before the retry: route id, model, effort and active root.
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "route-b=model-new:high")
 
-    # 2a. A refused token performs no daemon work at all — the old branch registered
-    #     a project for the CURRENT root before even reading the record.
+    # 2a. A refused token performs no daemon work (old branch registered a
+    #     project for the CURRENT root before reading the record).
     ghost = json.loads(delegate._delegate_start(_ctx(root_b), "the intended work",
                                                 retry_of="no-such-invocation"))
     assert ghost["reason"] == "unknown_invocation"
-    assert str(root_b) not in projects, "a refused retry must not register projects"
+    assert str(root_b) not in projects, "refused retry registers no projects"
 
-    # 2b. A retry whose attempt row cannot land keeps the ORIGINAL attempt's facts
-    #     alive: the owned project is NOT retired (a run may exist behind the lost
-    #     POST) and the invocation stays pending, so a later retry still works.
+    # 2b. An unwritable retry row keeps the ORIGINAL attempt's facts alive:
+    #     project kept, invocation pending (a run may exist behind the lost POST).
     monkeypatch.setattr(dc, "record_start_requested", lambda *a, **k: False)
     unwritable = json.loads(delegate._delegate_start(_ctx(root_b), "the intended work",
                                                      retry_of=token))
     assert unwritable["reason"] == "start_request_row_unwritable"
-    assert removals == [], "an unknown original outcome must keep its project"
+    assert "definitely_unrun" not in unwritable
+    assert removals == [], "unknown original outcome keeps its project"
     monkeypatch.undo()
     monkeypatch.setattr(gw, "ClaudexorGateway", _fresh)
     from ouroboros import claudexor_daemon
@@ -3093,14 +3094,10 @@ def test_durable_truncation_is_disclosed_never_a_bare_slice(tmp_path):
     assert "OMISSION NOTE" in disclosure["reason"] and "original length" in disclosure["reason"]
 
 
-def test_an_absent_run_closes_only_after_its_registration_is_discharged(tmp_path):
-    """P34R.4: `close_absent_run` emitted CLOSED_ABSENT even when `retire_project`
-    failed and left `project_owned=True`; replay then cleared ownership wholesale, so
-    the failed retirement was never retried and the owned daemon registration leaked
-    PERMANENTLY. The absent-run fact and the registration obligation are two different
-    things: custody now closes only once the obligation is discharged, the deferred
-    close stays in open_runs (disclosed by PROJECT_RETIRE_FAILED), and the next sweep
-    retries. A 404 on the REMOVE counts as discharged — absence is discharge."""
+def test_an_absent_run_closes_now_and_its_registration_survives_for_the_sweep(tmp_path):
+    """P34R.4 decoupled (owner 2026-08-30): CLOSED_ABSENT lands immediately;
+    the registration survives replay on project_owned (no wholesale clear) and
+    the registration sweep retries until the daemon accepts (404 = discharged)."""
     import ouroboros.delegate_custody as dc
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
@@ -3122,25 +3119,24 @@ def test_an_absent_run_closes_only_after_its_registration_is_discharged(tmp_path
         project_id="prj-owned", project_owned=True, ledger_root=str(tmp_path)))
     dc._CUSTODY.clear()
 
-    # 1. Retirement unreachable: the close is DEFERRED, not faked.
+    # 1. Retire unreachable: the run FACT lands now; the debt survives.
     out = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: gateway)
     assert [o["action"] for o in out] == ["absent"]
     kinds = _event_types(tmp_path)
     assert "delegate_run_project_retire_failed" in kinds, "the failure is disclosed"
-    assert "delegate_run_closed_absent" not in kinds, \
-        "custody must not close over an undischarged registration"
-    open_now = dc.open_runs(tmp_path)
-    assert [c.run_id for c in open_now] == ["run-gone"] and open_now[0].project_owned is True
+    assert "delegate_run_closed_absent" in kinds, "fact lands independently"
+    assert dc.open_runs(tmp_path) == [], "run custody is over"
+    owned = dc.owned_project_registrations(tmp_path)
+    assert [c.run_id for c in owned] == ["run-gone"] and owned[0].project_owned is True
 
-    # 2. The daemon recovers: the retry discharges the obligation and ONLY THEN closes.
+    # 2. Daemon recovers: the sweep discharges the obligation.
     gateway.remove_fails = False
     dc._CUSTODY.clear()
-    out = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: gateway)
-    assert [o["action"] for o in out] == ["absent"]
+    dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: gateway)
     kinds = _event_types(tmp_path)
-    assert "delegate_run_closed_absent" in kinds and "delegate_run_project_retired" in kinds
-    assert dc.open_runs(tmp_path) == []
-    assert gateway.removals == ["prj-owned", "prj-owned"], "the retirement was RETRIED"
+    assert "delegate_run_project_retired" in kinds
+    assert dc.owned_project_registrations(tmp_path) == []
+    assert gateway.removals == ["prj-owned"] * 3  # 3 lanes: close, 2 sweeps
 
     # 3. Absence is discharge: a 404 on the remove itself closes the run.
     class _AllGone(_AbsentRunGateway):
@@ -3336,7 +3332,7 @@ def test_reconciliation_recovers_a_pending_invocation_whose_worker_died(tmp_path
         def close(self): pass
 
     outcomes = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: _TerminalRecovery())
-    assert [o["action"] for o in outcomes] == ["settled"] and outcomes[0]["settled"] is True
+    assert [o["action"] for o in outcomes] == ["settle_attempted"] and outcomes[0]["settled"] is True
     key, body = posted[-1]
     assert key == token, "recovery must present the invocation's own wire key"
     assert body == posted[0][1], "recovery must replay the RECORDED canonical body"
@@ -3701,11 +3697,11 @@ def _health_invariants(tmp_path):
 # -- 3.10 settlement is atomic --------------------------------------------------
 
 
-def test_settlement_claims_terminal_only_when_the_durable_facts_landed(tmp_path, monkeypatch):
-    """A failed project retirement was suppressed and `settled=True` written anyway, so
-    the retry that would have released it could never happen. Both obligations are
-    idempotent, so an unfinished settlement is simply retried — and the retry must not
-    double-write the ledger row."""
+def test_settlement_follows_the_ledger_and_the_registration_debt_survives(tmp_path, monkeypatch):
+    """Decoupled (owner 2026-08-30): settlement follows the ledger row alone —
+    a sibling holding the shared project must not turn a SUCCEEDED run into an
+    unsettled one; the registration debt survives on project_owned for the
+    sweep, and the idempotent ledger row is never written twice."""
     import ouroboros.delegate_custody as dc
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gw
@@ -3729,15 +3725,16 @@ def test_settlement_claims_terminal_only_when_the_durable_facts_landed(tmp_path,
     ctx = _nanny_ctx(tmp_path)
 
     first = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
-    assert first["settlement"]["settled"] is False, "a failed retirement is not a settlement"
-    assert entry.settled is False and entry.project_owned is True
-    assert "delegate_run_settled" not in _event_types(tmp_path)
+    assert first["settlement"]["settled"] is True, "settles on the ledger row"
+    assert first["settlement"]["project_retired"] is False, "the debt is disclosed"
+    assert entry.settled is True and entry.project_owned is True
+    assert "delegate_run_settled" in _event_types(tmp_path)
+    assert [c.run_id for c in dc.owned_project_registrations(tmp_path)] == ["run-1"]
 
     failing["now"] = False
     second = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
     delegate._CUSTODY.clear()
-    assert second["settlement"]["settled"] is True, "the retry must be able to finish"
-    assert "delegate_run_settled" in _event_types(tmp_path)
+    assert second["settlement"]["settled"] is True
     rows = [json.loads(l) for l
             in (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()]
     sessions = [r for r in rows if r.get("kind") == "subscription_session"]
@@ -4211,7 +4208,8 @@ def test_no_post_fires_when_the_start_request_row_did_not_land(tmp_path, monkeyp
     delegate._CUSTODY.clear()
     assert out["status"] == "refused"
     assert out["reason"] == "start_request_row_unwritable"
-    assert posts == [], "the POST must be conditional on the durable request row"
+    assert out["definitely_unrun"] is True
+    assert posts == [], "POST is conditional on the durable request row"
     assert "delegate_run_started" not in _event_types(tmp_path)
 
 
@@ -4472,31 +4470,38 @@ def test_a_reconciled_run_with_an_unread_artifact_is_visible_as_uncollected(
     from ouroboros.gateways import claudexor as gw
 
     class _Stub(_LiveRunStub):
-        def __init__(self):
-            super().__init__()
-            self.retire_ok = False
         def get_run(self, rid, **_kw):
             return {"lastSeq": 9, "primaryOutput": "V" * 120_000,
                     "summary": {"state": "succeeded", "spendUsd": 0.0}}
-        def remove_project(self, pid):
-            if not self.retire_ok:
-                raise RuntimeError("daemon busy")
+        def remove_project(self, pid): pass
 
     stub = _Stub()
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: stub)
+    # Decoupled: the run is held open for the sweep by an honest ledger
+    # failure, not by a busy project retirement.
+    import ouroboros.usage_accounting as ua
+    ledger_blocked = {"now": True}
+    real_record = ua.record_subscription_session
+
+    def _flaky_ledger(*args, **kwargs):
+        if ledger_blocked["now"]:
+            raise ua.UsageAccountingError("usage accounting lock unavailable")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(ua, "record_subscription_session", _flaky_ledger)
     delegate._CUSTODY.clear()
     dc.record_started(tmp_path, delegate._RunCustody(
         run_id="run-1", task_id="t-gone", route_id="r", model="m",
         project_id="prj", project_owned=True, root_task_id="t-gone", ledger_root=str(tmp_path)))
 
-    # The nanny sees the terminal preview (artifact staged) but the settlement cannot
-    # finish, and the task dies without ever reading the artifact to EOF.
+    # Nanny sees the staged preview; settlement cannot finish; the task dies
+    # without reading the artifact to EOF.
     out = json.loads(delegate._delegate_wait(_nanny_ctx(tmp_path, "t-gone"), "run-1", wait_sec=1))
     assert out["output_delivery"]["artifact"], "this scenario is about a staged artifact"
     assert out["settlement"]["settled"] is False
     delegate._CUSTODY.clear()          # the worker is gone
 
-    stub.retire_ok = True
+    ledger_blocked["now"] = False
     results = dc.reconcile_orphaned_runs(tmp_path, {"t-alive"}, gateway_factory=lambda: stub)
     assert [r["run_id"] for r in results] == ["run-1"]
     assert results[0]["staged_output_consumed"] is False
@@ -4542,18 +4547,12 @@ def test_the_progress_payload_survives_a_verbose_harness_too(tmp_path, monkeypat
     assert all("OMISSION NOTE" in row["title"] and "original length 20000" in row["title"]
                for row in payload["timeline_tail"])
     assert all(len(row["title"]) < 500 for row in payload["timeline_tail"])
-    # The advance list carries the same verbose labels through the same bound. Whether
-    # this stub's payload also needs SHEDDING depends on the budget policy (it no longer
-    # does, now that the list is sized against what the rest of the payload leaves), so
-    # the shedding regime is pinned where a budget can be named:
-    # test_label_shedding_is_disclosed_on_the_row_that_gave_them_up. What must hold HERE,
-    # in either regime: every advance accounts for its labels — kept plus disclosed-shed
-    # equals what the harness ACTUALLY PUBLISHED — and no kept label escaped the bound.
-    #
-    # It used to read `== _TIMELINE_TAIL`, which pinned the defect instead of the rule:
-    # against this same 30-row stub, kept(12) + shed(0) satisfied it while the eighteen
-    # rows the batch dropped at observation went undisclosed and unnoticed. The display
-    # tail is how many rows a row may SHOW; it was never how many arrived.
+    # Every advance accounts for its labels: kept + disclosed-shed == what the
+    # harness ACTUALLY PUBLISHED, no kept label past the bound (shedding regime
+    # itself is pinned in test_label_shedding_is_disclosed_...). The old
+    # `== _TIMELINE_TAIL` pinned the defect: kept(12)+shed(0) passed while 18
+    # observation-dropped rows went undisclosed — the tail is display width,
+    # never arrival count.
     advances = payload["advances"]
     assert advances, payload
     for row in advances:
@@ -4600,7 +4599,7 @@ def test_an_orphaned_delegated_run_is_reconciled_when_its_owner_is_gone(tmp_path
     assert set(by_run) == {"run-orphan", "run-done"}, "a live owner's run must be left alone"
     assert by_run["run-orphan"]["action"] == "cancelled"
     assert live.cancels == [("run-orphan", "owner_task_gone")]
-    assert by_run["run-done"]["action"] == "settled" and by_run["run-done"]["settled"] is True
+    assert by_run["run-done"]["action"] == "settle_attempted" and by_run["run-done"]["settled"] is True
 
     # Unknown liveness reconciles nothing: never mass-cancel on missing information.
     live.cancels.clear()
@@ -4646,7 +4645,7 @@ def test_what_the_daemon_says_is_absent_is_closed_not_faulted_forever(tmp_path):
     for _ in range(3):
         passes.append(dc.reconcile_orphaned_runs(tmp_path, {"t-live"}, gateway_factory=_Router))
         dc._CUSTODY.clear()
-    assert [row["action"] for row in passes[0]] == ["absent", "settled"], passes[0]
+    assert [row["action"] for row in passes[0]] == ["absent", "settle_attempted"], passes[0]
     assert passes[1] == [] and passes[2] == [], "a closed run must not be reconciled again"
     assert dc.open_runs(tmp_path) == [], "neither run may stay open"
     assert dc.open_containment_faults(tmp_path) == []
@@ -4952,30 +4951,38 @@ def test_the_wait_window_never_outlives_the_nannys_own_deadline(tmp_path, monkey
         datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(seconds=reserve + 5)).isoformat()
 
-    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=8)
+    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=30)
 
     # It waited the DEADLINE (minus the reserve), not the asked-for window: strictly
-    # under the 8s asked for AND strictly over the 1s floor, so this measures the clamp
-    # itself. It also came back BEFORE the deadline rather than being killed after it.
+    # under the 30s asked for AND strictly over the 1s floor, so this measures the
+    # clamp itself. It also came back BEFORE the deadline rather than being killed
+    # after it.
     assert out["status"] == "no_progress", out
     assert 1 < out["waited_sec"] <= 5, out
-    assert elapsed < 6.0, elapsed
-    # The clamp's ARITHMETIC is the `waited_sec <= 5` line above: the granted window
-    # never targets the grace. This wall-clock line is the smoke over it, and it gets
-    # one second of tolerance: between stamping the deadline and returning, the runner
-    # itself spends time (imports, stub spawn, polls) — windows-latest measured 10.6ms
-    # PAST the exact boundary on a run whose twin had passed, i.e. the strict `>` was
-    # racing runner speed, not pinning the clamp.
-    assert deadline_remaining_sec(ctx) > reserve - 1.0,         "the wait blew past the finalization grace by more than runner overhead"
+    # Coarse discrimination margin (strict-poll redesign): clamped ~5s vs the
+    # full 30s ask; windows-latest measured 6.922s of honest noise under the
+    # old 6.0 bound while the clamp arithmetic above was correct.
+    assert elapsed < 15.0, elapsed
+    # Arithmetic pin = the waited_sec line above; this wall line is its smoke.
+    # Tolerance sits ABOVE observed runner noise (10.6ms, then 1.92s on a
+    # loaded rerun with correct arithmetic); 4.0s still discriminates:
+    # an unclamped 30s hold lands ~25s past the grace.
+    assert deadline_remaining_sec(ctx) > reserve - 4.0,         "the wait blew past the finalization grace by more than runner overhead"
 
     # The floor, kept from the original scenario: a deadline SHORTER than the reserve
     # still yields a positive window and a graceful typed return, never 0 or negative.
+    # The deadline sits at 10s (was 3s): anything under the reserve exercises the
+    # floor, while the `> 0` line below must survive the 1s floor wait PLUS the
+    # observed ~2s runner noise, which 3s did not.
     ctx.task_metadata["deadline_at"] = (
         datetime.datetime.now(datetime.timezone.utc)
-        + datetime.timedelta(seconds=3)).isoformat()
-    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=8)
+        + datetime.timedelta(seconds=10)).isoformat()
+    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=30)
     assert out["status"] == "no_progress" and out["waited_sec"] == 1, out
-    assert elapsed < 3.0, elapsed
+    # Bounded UNDER the 10s deadline: a clamp that forgot the reserve would grant
+    # min(30, 10) = 10s and land past this line, while the honest 1s floor wait
+    # plus noise stays far inside it.
+    assert elapsed < 8.0, elapsed
     assert deadline_remaining_sec(ctx) > 0, "the wait ate the whole remaining deadline"
 
 
@@ -5008,12 +5015,13 @@ def test_the_wait_leaves_the_grace_it_needs_to_answer_at_all(tmp_path, monkeypat
         datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(seconds=grace + 4)).isoformat()
 
-    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=8)
+    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=30)
 
-    # Without the reserve it would have held the asked-for 8s and come back with only
-    # the grace period left; with it, the window is what remains ABOVE the grace.
+    # Without the reserve it would hold min(ask, remaining)=30s into the grace;
+    # with it the window is what remains ABOVE the grace. Coarse wall bound:
+    # honest ~4s+noise « 12s « either failure shape (30s ask / ~2min remainder).
     assert out["waited_sec"] <= 4, out
-    assert elapsed < 6.0, elapsed
+    assert elapsed < 12.0, elapsed
 
 
 @pytest.mark.parametrize("seconds_left, ask, expected_window", [
@@ -5059,9 +5067,10 @@ def test_the_clamp_keys_on_whether_a_deadline_exists_not_on_int_of_what_is_left(
 
     assert out["status"] == "no_progress", out
     assert out["waited_sec"] == expected_window, out
-    # `waited_sec` is what the payload CLAIMS; the wall clock is what the task actually
-    # spent, and the seconds held past a spent deadline are what the caller pays for.
-    assert elapsed < expected_window + 2.0, elapsed
+    # waited_sec = the payload's CLAIM; wall clock = what the task paid. 5s
+    # tolerance sits above the ~2s observed noise yet a skipped clamp (full 8s
+    # ask on spent-deadline cases) still lands past expected_window + 5.
+    assert elapsed < expected_window + 5.0, elapsed
 
 
 # -- the window is a WINDOW: the timer waits, the human's stream does not ------
@@ -5169,7 +5178,11 @@ def test_the_human_keeps_the_live_stream_while_the_model_waits(tmp_path, monkeyp
     returned = time.monotonic()
 
     assert len(emitted) == len(out["advances"]), (emitted, out["advances"])
-    assert emitted[0][1] < started + 1.0, "the first advance must not wait for the window"
+    # 2.5s, not 1.0s: the discrimination is emit-at-observation vs emit-at-expiry
+    # (the 4s window), so the bound only has to sit clearly under 4s while giving
+    # the pre-emit path (handshake, first poll, custody reads) room above the
+    # observed ~2s loaded-runner noise.
+    assert emitted[0][1] < started + 2.5, "the first advance must not wait for the window"
     # <=, not <: Windows's monotonic clock ticks at ~15.6ms, so an emit and the
     # return inside one tick read EQUAL — the invariant is observed-by-return.
     assert all(at <= returned for _, at in emitted)
@@ -5269,6 +5282,7 @@ class _SlowPollStub(_StreamingStub):
 
         super().__init__(**kwargs)
         self.read_sec, self.reads, self._clock = read_sec, [], time.monotonic
+        self.read_spans = []
 
     def get_run(self, rid, *, timeout_sec=None):
         import time
@@ -5278,6 +5292,10 @@ class _SlowPollStub(_StreamingStub):
         self.reads.append(self._clock())
         bound = self.read_sec if timeout_sec is None else min(self.read_sec, float(timeout_sec))
         time.sleep(bound)
+        # The span is recorded STUB-side so "the bound is what ended this read" is
+        # judged on the read's own clock, deterministically — not reconstructed
+        # through the caller's noisy end-to-end wall clock.
+        self.read_spans.append(self._clock() - self.reads[-1])
         if bound < self.read_sec:
             raise ClaudexorUnavailable("daemon_unreachable",
                                        "Claudexor daemon unreachable: ReadTimeout")
@@ -5313,11 +5331,9 @@ def test_every_poll_is_bounded_by_what_the_window_has_left(tmp_path, monkeypatch
     assert all(value is not None for value in asked), \
         "an unbounded poll is the client's 60s default, which outlives any window"
 
-    # The other direction, which a floor alone got backwards: a long window has MORE
-    # than the client's own read default left, and `max()` handed that surplus to the
-    # transport as the ask (measured: 1797.0 for a 1800s window). A hung daemon then
-    # stopped failing at sixty seconds and held the whole window — reported afterwards
-    # as a wait that saw nothing. A bound NARROWS in both directions or it is decoration.
+    # The direction a floor alone got backwards: max() handed a long window's
+    # surplus to the transport ask (1797.0 for a 1800s window), so a hung daemon
+    # held the whole window. A bound NARROWS both directions or it is decoration.
     asked.clear()
     bounded_poll(gateway, "run-1", 1797.0)
     bounded_poll(gateway, "run-1", 61.0)
@@ -5505,8 +5521,9 @@ def test_the_last_poll_of_a_spent_window_is_bounded_not_skipped(tmp_path, monkey
     assert calls == ["run-1"], calls
     assert len(stub.reads) == 2, stub.reads
     # ...and the wall clock the TASK pays stays within the BOUND of that deadline, rather
-    # than within a 60s read of it.
-    assert elapsed < window + gw.SHORT_POLL_TIMEOUT_SEC + 0.6, elapsed
+    # than within a 60s read of it.  3.0s of tolerance sits above the observed ~2s
+    # loaded-runner noise (0.6s did not); the 60s-default failure shape lands at ~63s.
+    assert elapsed < window + gw.SHORT_POLL_TIMEOUT_SEC + 3.0, elapsed
 
     # A daemon slower than the bound: the read is cut AT the bound, and an expiry is what
     # the caller gets — never a transport refusal raised out of a tool holding a live run.
@@ -5518,11 +5535,16 @@ def test_the_last_poll_of_a_spent_window_is_bounded_not_skipped(tmp_path, monkey
     assert out["status"] == "progress" and out["waited_sec"] == window, out
     assert calls == ["run-1", "run-1"], calls
     assert len(slower.reads) == 2, slower.reads
-    assert elapsed < window + 0.4 + 0.6, elapsed
-    # The BOUND is what ended that read, not the daemon: it cost the bound, not the 1.2s
-    # the daemon wanted — which is the whole of what a per-request timeout buys here.
-    last_read_sec = (slower.reads[0] + elapsed) - slower.reads[1]
-    assert last_read_sec < 0.4 + 0.3, last_read_sec
+    # Coarse wall smoke only: cut-at-the-bound is pinned deterministically below
+    # (the stub's own read span, and the expiring_poll recorder above — an unbounded
+    # final read would answer instead of raising and never pass through it twice).
+    assert elapsed < window + 0.4 + 3.0, elapsed
+    # The BOUND is what ended that read, not the daemon: it cost the 0.4s bound, not
+    # the 1.2s the daemon wanted — judged on the stub's own span, so caller-side
+    # scheduler noise cannot inflate it (the previous reconstruction through
+    # `elapsed` could).
+    last_read_sec = slower.read_spans[-1]
+    assert last_read_sec < 0.4 + 0.4, last_read_sec
 
 
 def test_a_run_that_finishes_during_the_last_sleep_is_reported_terminal(tmp_path, monkeypatch):
@@ -5545,7 +5567,10 @@ def test_a_run_that_finishes_during_the_last_sleep_is_reported_terminal(tmp_path
     assert out["status"] == "terminal", out
     assert out["state"] == "succeeded", out
     assert out["settlement"]["settled"] is True, out["settlement"]
-    assert elapsed < 6.0, elapsed
+    # Promptness smoke only — the terminal facts above are the contract.  10s keeps
+    # the honest ~1.5s path clear of the observed ~2s loaded-runner noise (6s left
+    # ~2.5s of headroom over it).
+    assert elapsed < 10.0, elapsed
 
 
 def test_the_advance_list_is_a_list_not_a_count(tmp_path, monkeypatch):
@@ -5659,12 +5684,9 @@ def test_the_advance_list_yields_entirely_rather_than_pushing_the_payload_over()
     marker, = payload["advances"]
     assert marker["advances_omitted"] == len(seen.advances) == 12, marker
     assert marker["omitted_through_seq"] == 12, marker
-    # ...and the note points at where the omitted rows ACTUALLY are. It used to say they
-    # "were streamed live and are in the event log": the first half is untrue of a batch
-    # bigger than the display tail (those rows never reached the live line at all) and
-    # the second of all of them (Ouroboros persists no timeline; the daemon's own run
-    # directory holds it). A recovery instruction that sends the reader to a log that
-    # never had the rows is worse than no instruction.
+    # ...and the note points at where omitted rows ACTUALLY are (the daemon's
+    # run directory). The old "streamed live / in the event log" was untrue on
+    # both halves - a pointer to a log that never had the rows is worse than none.
     assert "Claudexor's own timeline" in marker["note"], marker
     assert "event log" not in marker["note"], marker
 
@@ -5734,11 +5756,8 @@ def test_a_batch_bigger_than_the_display_tail_says_how_much_it_is_not_showing():
 
 
 def test_a_long_busy_windows_advance_list_is_measured_not_estimated():
-    """The sibling of the verbose-harness case, from the other direction: not a handful
-    of enormous labels but HIGH CARDINALITY — 601 advances of twelve ordinary titles,
-    which is simply what a healthy run looks like when it is watched for a long window.
-    It is not an exotic shape either: the 1800s ceiling divided by the 3s poll interval
-    is 600, so this is the WORST case the wait can actually produce, not a synthetic one.
+    """The high-cardinality sibling of the verbose-harness case: 601 advances of
+    ordinary titles - the realistic worst case (1800s ceiling / 3s poll = 600).
 
     The bound used to be ESTIMATED: a running total decremented by each shed row, and
     then a survivor count of `budget // 40` on the assumption that a bare spine row
@@ -5782,11 +5801,9 @@ def test_a_long_busy_windows_advance_list_is_measured_not_estimated():
     assert delivered == raw, "the generic truncator had to cut this payload"
     assert json.loads(delivered) == payload, "the model received unparseable JSON"
     rows = payload["advances"]
-    # The list is sized against what is LEFT of the budget, not a fixed share: a share
-    # bounds only itself, and `timeline_tail` (harness-authored text) can eat most of
-    # the limit on its own — which is how a sub-block that fitted its third still
-    # overflowed the result. So the invariant is the WHOLE payload above, and here that
-    # the list did take a real share of it rather than being emptied to make room.
+    # Sized against what is LEFT of the budget, not a fixed share (a share
+    # bounds only itself; timeline_tail alone once overflowed the result): the
+    # invariant is the WHOLE payload above, and the list keeps a real share.
     assert len(json.dumps(rows, ensure_ascii=False, indent=2)) < len(raw)
 
     # It shed from the HEAD and it SAYS so, with the accounting adding up: a payload that
@@ -5795,12 +5812,9 @@ def test_a_long_busy_windows_advance_list_is_measured_not_estimated():
     assert kept, rows
     assert marker["advances_omitted"] == advances - len(kept), (marker, len(kept))
     assert marker["omitted_through_seq"] == kept[0]["seq"] - 1, (marker, kept[0])
-    # ...and the note points at where the omitted rows ACTUALLY are. It used to say they
-    # "were streamed live and are in the event log": the first half is untrue of a batch
-    # bigger than the display tail (those rows never reached the live line at all) and
-    # the second of all of them (Ouroboros persists no timeline; the daemon's own run
-    # directory holds it). A recovery instruction that sends the reader to a log that
-    # never had the rows is worse than no instruction.
+    # ...and the note points at where omitted rows ACTUALLY are (the daemon's
+    # run directory). The old "streamed live / in the event log" was untrue on
+    # both halves - a pointer to a log that never had the rows is worse than none.
     assert "Claudexor's own timeline" in marker["note"], marker
     assert "event log" not in marker["note"], marker
     assert [row["seq"] for row in kept] == list(range(kept[0]["seq"], advances + 1))
@@ -6110,13 +6124,8 @@ def test_subscription_window_exhausted_beacon_wakes_the_waiting_parent(tmp_path,
 
 
 def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_path):
-    """W3 adjacent (d): a project registration is shared by every run delegated
-    into it — while siblings are unsettled, only the LOWEST-run_id sharer keeps
-    attempting the removal (one honest, disclosed retry lane; the deterministic
-    tie-break means some sharer always attempts, so deferral cannot deadlock);
-    the rest defer QUIETLY: no doomed daemon call, no PROJECT_RETIRE_FAILED
-    spam (the submarine wave-2 retire loop). The daemon's refusal text rides
-    the failure row as `reason`."""
+    """Any unsettled sibling defers every sharer QUIETLY; once all settle
+    the LOWEST-run_id sharer carries the retry lane."""
     import json as _json
 
     import ouroboros.delegate_custody as dc
@@ -6139,14 +6148,20 @@ def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_
             project_id="prj-shared", project_owned=True, ledger_root=str(tmp_path)))
     dc._CUSTODY.clear()
 
-    # Non-canonical sharer (higher run_id): quiet deferral — no call, no row.
+    # Non-canonical sharer: quiet deferral.
     custody_b = dc.replay(tmp_path)["run-bb"]
     dc.retire_project(tmp_path, gateway, custody_b)
     assert gateway.removals == []
     assert "delegate_run_project_retire_failed" not in _event_types(tmp_path)
     assert custody_b.project_owned is True
 
-    # Canonical sharer (lowest run_id): attempts, and the refusal text is typed.
+    # Canonical too defers while a sibling is unsettled.
+    custody_a = dc.replay(tmp_path)["run-aa"]
+    dc.retire_project(tmp_path, gateway, custody_a)
+    assert gateway.removals == []
+    # Sibling settles: canonical attempts; refusal is typed.
+    dc.emit(tmp_path, dc.SETTLED, {"run_id": "run-bb", "task_id": "t-2", "route": "r"})
+    dc._CUSTODY.clear()
     custody_a = dc.replay(tmp_path)["run-aa"]
     dc.retire_project(tmp_path, gateway, custody_a)
     assert gateway.removals == ["prj-shared"]

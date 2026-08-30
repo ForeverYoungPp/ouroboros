@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pathlib
 import re
 import time
 import urllib.error
@@ -60,8 +61,14 @@ def _gh_api(method: str, path: str, token: str, body: Optional[dict] = None,
 
 
 def _push_branch(repo_dir: str, branch: str) -> Tuple[bool, str]:
+    # Bounded network push: a hung remote returns the ordinary (False, message)
+    # shape instead of blocking the CI tool on an unbounded subprocess wait.
+    from ouroboros.tools.git import _run_git_network_cmd
+
     try:
-        result = run_cmd(["git", "push", "-u", "origin", branch], cwd=repo_dir)
+        result = _run_git_network_cmd(
+            ["git", "push", "-u", "origin", branch], cwd=pathlib.Path(repo_dir),
+        )
         return True, result
     except Exception as e:
         return False, str(e)

@@ -257,9 +257,15 @@ def test_malformed_named_authority_shapes_refuse_before_model_or_tool_work(monke
     assert tool_context_calls == []
 
 
-def test_context_build_exception_propagates_before_actor_first_leaf_start(monkeypatch, tmp_path):
+def test_context_build_exception_after_pre_start_still_propagates(monkeypatch, tmp_path):
+    # Charter (owner 2026-08-28): the leaf pre-starts BEFORE the context build,
+    # so a context-assembly failure now happens with a LIVE run behind it.
+    # The failure must still propagate loudly (the durable custody rows let the
+    # retry adopt the running leaf instead of starting a duplicate).
     from ouroboros import agent as agent_module
     import ouroboros.claudexor_daemon as daemon
+    import ouroboros.delegate_supervision as supervision
+    import ouroboros.subagent_runtime as runtime
     import ouroboros.subagents as subagents
     from ouroboros.agent import Env, OuroborosAgent
 
@@ -270,15 +276,23 @@ def test_context_build_exception_propagates_before_actor_first_leaf_start(monkey
     monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(subagents, "route_health", lambda *_a, **_k: ("", ""))
     monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
+    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: (
+        order.append("physical_start")
+        or json.dumps({"status": "started", "run_id": "run-pre"})
+    ))
+    monkeypatch.setattr(
+        supervision, "supervised_wait",
+        lambda *_a, **_kw: pytest.fail("the host must not wait inside bootstrap (owner 1=A)"),
+    )
     def fail_context(**_kwargs):
         order.append("context_build_failed")
-        raise RuntimeError("context assembly failed before exact leaf start")
+        raise RuntimeError("context assembly failed after the exact leaf start")
 
     monkeypatch.setattr(agent_module, "build_llm_messages", fail_context)
     snapshot = _snapshot(_settings(_session_row()), "session-builder")
     agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
     agent.tools.available_tools = lambda: ["delegate_start", "delegate_wait", "delegate_cancel"]
-    with pytest.raises(RuntimeError, match="before exact leaf start"):
+    with pytest.raises(RuntimeError, match="after the exact leaf start"):
         agent._prepare_task_context({
             "id": "child1", "type": "task", "chat_id": 1, "text": "Build",
             "delegation_role": "subagent", "configured_subagent": snapshot,
@@ -289,7 +303,7 @@ def test_context_build_exception_propagates_before_actor_first_leaf_start(monkey
             "task_contract": {"objective": "Build", "expected_output": "Patch"},
             "drive_root": str(drive), "budget_drive_root": str(drive),
         })
-    assert order == ["context_build_failed"]
+    assert order == ["physical_start", "context_build_failed"]
 
 
 @pytest.mark.parametrize("message_kind", ["owner", "task"])
@@ -394,7 +408,27 @@ def test_sleeping_control_wakes_then_loop_routes_without_supervision_ack(tmp_pat
 
     kind = KIND_FINALIZE_NOW if control_kind == "finalize_now" else KIND_HURRY
     text = "owner_requested_finalization" if kind == KIND_FINALIZE_NOW else "owner_hurry"
-    assert write_owner_message(tmp_path, text, "child1", msg_id="control-1", kind=kind)
+    control_msg_id = "control-1"
+    if kind == KIND_FINALIZE_NOW:
+        from ouroboros.cancel_intents import (
+            STOP_POLICY_FINALIZE,
+            request_cancel,
+        )
+        from supervisor.owner_stop import owner_stop_control_id
+
+        intent = request_cancel(
+            tmp_path,
+            "child1",
+            requested_stop_policy=STOP_POLICY_FINALIZE,
+        )
+        control_msg_id = owner_stop_control_id(intent)
+    assert write_owner_message(
+        tmp_path,
+        text,
+        "child1",
+        msg_id=control_msg_id,
+        kind=kind,
+    )
     ctx = SimpleNamespace(
         task_id="child1", drive_root=tmp_path, budget_drive_root=str(tmp_path),
         task_metadata={}, task_attempt=1,
@@ -438,9 +472,9 @@ def test_refused_bootstrap_receipt_never_claims_a_live_leaf(monkeypatch):
         }),
     )
     receipt = messages[0]["content"]
-    assert "physical leaf may still be pending" in receipt
-    assert "external start already happened" not in receipt
-    assert "canonical work-order authority" in receipt
+    assert "Physical custody is unresolved" in receipt
+    assert "proves a physical run" not in receipt
+    assert "never authorizes native/API fallback" in receipt
 
 
 def test_crash_handoff_does_not_replay_attempt_local_loop_controls(tmp_path):

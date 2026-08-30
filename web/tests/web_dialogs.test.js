@@ -8,7 +8,7 @@ import test from 'node:test';
 
 import { promptUpdateVersion } from '../modules/marketplace.js';
 import { promptCampaignObjective } from '../modules/evolution.js';
-import { confirmAndSendPanic, shouldFirePanic } from '../modules/chat.js';
+import { confirmAndSendPanic, shouldFirePanic } from '../modules/chat_activity.js';
 import { shouldPollStatus } from '../modules/claudexor_status_store.js';
 import {
     JOB_POLL_GIVE_UP_FAILURES,
@@ -197,7 +197,7 @@ test('a LOADED empty set SENDS the key, so the backend 400 surfaces instead of a
     // validation — the backend stays the SSOT.
     const payload = reviewerSlotsSavePayload({
         loaded: true, loadError: '', triad: [], scope: [],
-        advisory: { enabled: true, route: { kind: 'api', target_id: '' }, effort: 'low' },
+        advisory: { enabled: true, route: { kind: 'api_chat', target_id: '' }, effort: 'low' },
     });
     assert.ok('OUROBOROS_REVIEWER_SLOTS' in payload);
     const parsed = JSON.parse(payload.OUROBOROS_REVIEWER_SLOTS);
@@ -212,7 +212,7 @@ test('a loaded populated set serializes exactly as the setting builder emits it'
         loadError: '',
         triad: [{ slot_id: 't_1', route: { kind: 'api_chat', target_id: 'openai/gpt-5.6-sol' }, effort: 'high' }],
         scope: [{ slot_id: 's_1', route: { kind: 'agent_session', target_id: 'codex=gpt-5.6-sol', profile_id: 'koshak' }, effort: '' }],
-        advisory: { enabled: false, route: { kind: 'api', target_id: 'sonnet' }, effort: 'low' },
+        advisory: { enabled: false, route: { kind: 'api_chat', target_id: 'anthropic/claude-sonnet-5' }, effort: 'low' },
     });
     const parsed = JSON.parse(payload.OUROBOROS_REVIEWER_SLOTS);
     assert.deepEqual(parsed.triad, [{
