@@ -1518,6 +1518,12 @@ timeout or unrelated earlier resolution remains `cannot_verify`. A terminal run
 whose intervals do not cover the complete brief is typed `cannot_verify`; its
 captured patch may be rejected but the existing integration seam refuses apply.
 
+Live progress uses Claudexor's additive `textKind`/`textDelta` facts to join adjacent
+text fragments of the same kind, attempt and harness without inserting punctuation
+or changing whitespace. Complete messages, tools, statuses and legacy rows retain
+event boundaries. The bounded preview uses the text body, with its existing omission
+disclosure; cursor, wake and terminal-result semantics are unchanged.
+
 `delegate_wait` is model-visible as an **event-only sleep**, not a caller-sized poll.
 `delegate_supervision.supervised_wait` renews its low-level bounded transport windows
 inside host code. Journal cursor advances continue streaming to the human and update
