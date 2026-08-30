@@ -27,6 +27,7 @@ import {
     serviceBannerLine,
     startLogin,
     unreadFacets,
+    harnessFamilyMarkup,
     verificationBadge,
     wakeDaemon,
 } from '../modules/harness_accounts.js';
@@ -2104,4 +2105,18 @@ test('a login seen online is not un-seen by the re-check running out', () => {
         'a positive confirmation no longer wins on its own');
     assert.match(body, /active\.verdict = confirmed/,
         'the monotone predicate does not decide the verdict');
+});
+
+test('the family markup mounts a per-family login host under its header (3=A)', () => {
+    const html = harnessFamilyMarkup(
+        { harness: 'codex', label: 'Codex CLI', rows: [], status: { tone: 'muted', label: 'x' } },
+        {}, { accountsRead: 1 },
+    );
+    const headIdx = html.indexOf('agent-family-head');
+    const loginIdx = html.indexOf('data-family-login="codex"');
+    const rowsIdx = html.indexOf('agent-family-rows');
+    assert.ok(headIdx > -1 && loginIdx > -1 && rowsIdx > -1);
+    // The login card appears where the owner clicked: directly under the
+    // family header, above the account rows — not after every family.
+    assert.ok(headIdx < loginIdx && loginIdx < rowsIdx);
 });

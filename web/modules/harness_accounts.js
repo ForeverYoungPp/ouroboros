@@ -925,6 +925,7 @@ export function vendorCredentialRetainedNotice(receipt, name, family) {
 const state = {
     store: claudexorStatus,
     loginCard: null,
+    loginFamily: '',
     disposers: [],
     removeError: '',
     removeNotice: '',
@@ -1031,6 +1032,7 @@ export function harnessFamilyMarkup(group, payload, facets) {
                 </div>
                 <button type="button" class="btn btn-default" data-family-add>${escapeHtml(familyActionLabel(group, payload))}</button>
             </div>
+            <div class="agent-family-login" data-family-login="${escapeHtml(group.harness)}"></div>
             <div class="agent-family-rows">${body}</div>
         </section>
     `;
@@ -1215,6 +1217,12 @@ export async function wakeDaemon() {
     renderRows();
 }
 
+// Harness ids are conservative tokens; escape defensively for the attribute
+// selector without depending on the browser-only CSS.escape (node tests).
+function familyLoginSelector(harness) {
+    return `[data-family-login="${String(harness).replace(/["\\]/g, '\\$&')}"]`;
+}
+
 function ensureLoginCard() {
     if (state.loginCard && !state.loginCard.disposed) return state.loginCard;
     // `detach()` permanently fences one controller. Explicit Connect after a
@@ -1222,7 +1230,11 @@ function ensureLoginCard() {
     // reusing a cached disposed object whose start() correctly does nothing.
     state.loginCard = null;
     state.loginCard = createLoginCardController({
-        host: () => document.getElementById('harness-login-card'),
+        host: () => (
+            (state.loginFamily
+                && document.querySelector?.(familyLoginSelector(state.loginFamily)))
+            || document.getElementById('harness-login-card')
+        ),
         store: state.store,
         // The Settings face is the FULL card: paste-code entry, engine detail,
         // the collapsed Advanced terminal fallback, Close.
@@ -1238,7 +1250,13 @@ function ensureLoginCard() {
  */
 export async function startLogin(harness, profile) {
     if (!harness || !state.initialized) return;
-    await ensureLoginCard().start(harness, profile);
+    state.loginFamily = String(harness);
+    const card = ensureLoginCard();
+    await card.start(harness, profile);
+    // The card mounts inside the clicked family's block; make sure a long
+    // account list has not left it above/below the viewport.
+    document.querySelector?.(familyLoginSelector(state.loginFamily))
+        ?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
 }
 
 /** Read the shared status once (the Refresh button, and the first paint). */
