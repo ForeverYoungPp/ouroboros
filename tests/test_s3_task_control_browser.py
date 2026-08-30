@@ -110,7 +110,7 @@ def _menu_metrics(page, menu, trigger) -> dict:
                     rect.left + rect.width / 2,
                     rect.top + rect.height / 2,
                 );
-                return Boolean(hit && menu.contains(hit));
+                return Boolean(hit && item.contains(hit));
             });
             return {
                 parentIsBody: menu.parentElement === document.body,
@@ -213,7 +213,7 @@ def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
                 assert _menu_labels(menu) == EXPECTED_ACTIONS
                 _assert_menu_geometry(_menu_metrics(page, menu, trigger), placement="below")
                 page.screenshot(
-                    path=str(data_dir.parent / "s3-chat-control-open.png"), full_page=True,
+                    path=str(data_dir.parent / "s3-chat-control-open.png"), full_page=False,
                 )
                 page.keyboard.press("Escape")
                 menu.wait_for(state="detached", timeout=10_000)
@@ -294,7 +294,7 @@ def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
                 menu.wait_for(state="visible", timeout=10_000)
                 _assert_menu_geometry(_menu_metrics(page, menu, trigger), placement="above")
                 page.screenshot(
-                    path=str(data_dir.parent / "s3-chat-control-flipped.png"), full_page=True,
+                    path=str(data_dir.parent / "s3-chat-control-flipped.png"), full_page=False,
                 )
                 page.keyboard.press("Escape")
                 menu.wait_for(state="detached", timeout=10_000)
@@ -335,7 +335,7 @@ def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
                 menu.wait_for(state="visible", timeout=10_000)
                 _assert_menu_geometry(_menu_metrics(page, menu, trigger))
                 page.screenshot(
-                    path=str(data_dir.parent / "s3-chat-control-narrow.png"), full_page=True,
+                    path=str(data_dir.parent / "s3-chat-control-narrow.png"), full_page=False,
                 )
                 page.keyboard.press("Escape")
                 menu.wait_for(state="detached", timeout=10_000)
@@ -398,7 +398,7 @@ def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
                                 rect.left + rect.width / 2,
                                 rect.top + rect.height / 2,
                             );
-                            return Boolean(hit && item.closest('.task-control-menu').contains(hit));
+                            return Boolean(hit && item.contains(hit));
                         }
                         """,
                     ) is True
