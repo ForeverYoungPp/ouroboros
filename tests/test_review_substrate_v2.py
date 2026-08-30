@@ -1107,7 +1107,10 @@ def test_actor_projection_carries_bounded_disclosed_finding_rows():
                 "parsed": {
                     "verdict": "FAIL",
                     "summary": "s",
-                    "findings": [{"weird_key": "the only copy of this evidence"}],
+                    "findings": [{
+                        "weird_key": "the only copy of this evidence",
+                        "password": "hunter2-odd-shape",
+                    }],
                 },
             },
             {
@@ -1155,9 +1158,12 @@ def test_actor_projection_carries_bounded_disclosed_finding_rows():
     assert "findings" not in actors["transport-hole"]
     assert "findings_omitted" not in actors["transport-hole"]
 
-    # An unknown finding shape still ships its evidence as a bounded row.
+    # An unknown finding shape still ships its evidence as a bounded row, and
+    # structural key-based secret masking applies BEFORE serialization.
     odd_rows = actors["odd-shape"]["findings"]
     assert odd_rows and "the only copy of this evidence" in odd_rows[0]["item"]
+    assert "hunter2-odd-shape" not in rendered
+    assert "***REDACTED***" in odd_rows[0]["item"]
 
     # A list-shaped parsed response (array reviewer contract) projects its
     # rows too, and the substantive `reason`/`verdict` fields survive.

@@ -41,9 +41,11 @@ def projected_finding_row(item: Any) -> Dict[str, str]:
         )
     if not row:
         # An unknown finding shape still carries evidence; a silently empty row
-        # would destroy it without a trace.
+        # would destroy it without a trace. Redact the OBJECT before
+        # serializing: structural key-based secret masking does not survive a
+        # pre-serialized string.
         row["item"] = truncate_review_artifact(
-            str(redact_projection(json.dumps(item, ensure_ascii=False, default=str)).value),
+            json.dumps(redact_projection(item).value, ensure_ascii=False, default=str),
             PROJECTED_FINDING_TEXT_CHARS,
         )
     return row
