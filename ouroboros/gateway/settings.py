@@ -1091,6 +1091,45 @@ def _api_settings_post_sync(request: Request, body: Any) -> JSONResponse:
         return _api_settings_post_locked(request, body)
 
 
+def _check_reviewer_slots_against_incoming_roster(body: dict) -> str:
+    """Validate reviewer slots under the POST-SAVE Available-subagents roster.
+
+    S4 atomicity: adding a roster row plus its reviewer reference in ONE save
+    must validate against the incoming roster (not the stale process env), and
+    a roster-only save re-validates the STORED slots so a still-referenced
+    actor cannot be removed out from under them. Returns the D4 fallback
+    warning ('' when none); raises ValueError on a malformed/unresolvable
+    value (the caller turns it into a 400)."""
+    import contextlib
+    import os as _os
+
+    subagents_key = "OUROBOROS_SUBAGENTS"
+    slots_to_check = str(body.get("OUROBOROS_REVIEWER_SLOTS") or "").strip()
+    roster_changed = subagents_key in body
+    if not slots_to_check and roster_changed:
+        slots_to_check = str((load_settings() or {}).get("OUROBOROS_REVIEWER_SLOTS") or "").strip()
+    if not slots_to_check:
+        return ""
+    from ouroboros.reviewer_slot_config import reviewer_slot_save_check
+
+    @contextlib.contextmanager
+    def _roster_overlay():
+        if not roster_changed:
+            yield; return
+        prior = _os.environ.get(subagents_key)
+        _os.environ[subagents_key] = str(body.get(subagents_key) or "")
+        try:
+            yield
+        finally:
+            if prior is None:
+                _os.environ.pop(subagents_key, None)
+            else:
+                _os.environ[subagents_key] = prior
+
+    with _roster_overlay():
+        return reviewer_slot_save_check(slots_to_check)
+
+
 def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
     # Everything below the write is a POST-commit step. The broad handler at the
     # bottom used to answer a failure there with "400, nothing saved" while the
@@ -1134,11 +1173,9 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
             if raw_cycles:
                 body = dict(body)
                 body[REVIEW_MAX_CYCLES_KEY] = normalize_review_max_cycles(raw_cycles)
-        # Available-subagents roster first (S4 atomicity): reviewer references
-        # must validate against the roster THIS save produces, not the stale
-        # process env — else adding a row plus its reference in one save is
-        # refused, while removing a still-referenced row is accepted and
-        # leaves every strict review surface refusing after the save.
+        # Available-subagents roster first (S4 atomicity): reviewer
+        # references must validate against the roster THIS save produces —
+        # not the stale process env (see the check helper below).
         subagents_key = "OUROBOROS_SUBAGENTS"
         if subagents_key in body and body.get(subagents_key) not in (None, ""):
             from ouroboros.configured_subagents import normalize_configured_subagents
@@ -1150,41 +1187,12 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
                 return unsaved_error(str(exc), 400)
             body = dict(body)
             body[subagents_key] = canonical_subagents
-        # Reviewer-slot SSOT (6.1): refuse a malformed structured value with 400;
-        # disclose (never block, recommendation A) the all-delegated API fallback
-        # (D4) from the INCOMING value. Both live in reviewer_slot_save_check.
-        # The check runs under the POST-SAVE roster overlay, and a roster-only
-        # save re-validates the STORED slots so a still-referenced actor cannot
-        # be removed out from under them.
-        _reviewer_fallback_warning = ""
-        _slots_to_check = str(body.get("OUROBOROS_REVIEWER_SLOTS") or "").strip()
-        _roster_changed = subagents_key in body
-        if not _slots_to_check and _roster_changed:
-            _slots_to_check = str((load_settings() or {}).get("OUROBOROS_REVIEWER_SLOTS") or "").strip()
-        if _slots_to_check:
-            import contextlib
-            import os as _os
-
-            from ouroboros.reviewer_slot_config import reviewer_slot_save_check
-
-            @contextlib.contextmanager
-            def _roster_overlay():
-                if not _roster_changed:
-                    yield; return
-                prior = _os.environ.get(subagents_key)
-                _os.environ[subagents_key] = str(body.get(subagents_key) or "")
-                try:
-                    yield
-                finally:
-                    if prior is None:
-                        _os.environ.pop(subagents_key, None)
-                    else:
-                        _os.environ[subagents_key] = prior
-            try:
-                with _roster_overlay():
-                    _reviewer_fallback_warning = reviewer_slot_save_check(_slots_to_check)
-            except ValueError as exc:
-                return unsaved_error(str(exc), 400)
+        # Reviewer-slot SSOT (6.1): 400 on malformed; D4 fallback disclosed;
+        # validated against the roster THIS save produces (S4 — see helper).
+        try:
+            _reviewer_fallback_warning = _check_reviewer_slots_against_incoming_roster(body)
+        except ValueError as exc:
+            return unsaved_error(str(exc), 400)
         parsed_budget: dict[str, float] = {}
         for budget_key in BUDGET_SETTING_KEYS:
             if budget_key not in body:
