@@ -12,6 +12,7 @@ for budget check + append + fsync; network I/O always happens outside that lock.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import contextvars
 import hashlib
@@ -99,6 +100,60 @@ _LAST_PHYSICAL_ATTEMPT: contextvars.ContextVar[Optional["PhysicalAttemptCapture"
 _ROOT_ACCOUNTING_TELEMETRY: Dict[str, Dict[str, Any]] = {}
 _ROOT_ACCOUNTING_TELEMETRY_LOCK = threading.Lock()
 _ROOT_ACCOUNTING_TELEMETRY_CAP = 64
+
+# razzant/ouroboros#129: the in-lock write paths (reserve/settle/_transition/
+# release/legacy-import) each did a full parse+validate of the whole
+# state/usage_attempts.jsonl under the 45s monetary flock — ~1s at 40MB, and it
+# grows unboundedly. This is a per-process warm cache of the last validated read
+# per drive root: the next in-lock read reuses it and only parses+validates the
+# bytes appended since (``_read_new_records_locked``, which already re-stats the
+# file under the held lock and returns None on ANY doubt — inode change, shrink,
+# in-place rewrite, torn/invalid tail — so a stale cache can never be served;
+# the full ``_read_records_locked`` stays the authority and the fallback). It
+# touches only READ cost; the money math sees byte-identical rows.
+_LEDGER_READ_CACHE: "collections.OrderedDict[str, Tuple[LedgerResumeState, list]]" = (
+    collections.OrderedDict()
+)
+_LEDGER_READ_CACHE_LOCK = threading.Lock()
+_LEDGER_READ_CACHE_MAX_ROOTS = 8
+
+
+def _ledger_cache_put(key: str, value: "Tuple[LedgerResumeState, list]") -> None:
+    with _LEDGER_READ_CACHE_LOCK:
+        _LEDGER_READ_CACHE[key] = value
+        _LEDGER_READ_CACHE.move_to_end(key)
+        while len(_LEDGER_READ_CACHE) > _LEDGER_READ_CACHE_MAX_ROOTS:
+            _LEDGER_READ_CACHE.popitem(last=False)
+
+
+def _read_records_locked_cached(root: pathlib.Path) -> list:
+    """``_read_records_locked`` with an incremental warm path. Call under the
+    held ledger lock (same contract as ``_read_records_locked``)."""
+    key = str(root)
+    with _LEDGER_READ_CACHE_LOCK:
+        cached = _LEDGER_READ_CACHE.get(key)
+    if cached is not None:
+        resume, rows = cached
+        try:
+            delta = _read_new_records_locked(root, resume)
+        except Exception:  # noqa: BLE001 — any doubt = fall back to the full read
+            delta = None
+        if delta is not None:
+            new_rows, new_resume = delta
+            merged = rows if not new_rows else [*rows, *new_rows]
+            _ledger_cache_put(key, (new_resume, merged))
+            return list(merged)
+    records = _read_records_locked(root)
+    try:
+        resume = _ledger_resume_state(root, records)
+        _ledger_cache_put(key, (resume, list(records)))
+    except Exception:  # noqa: BLE001 — caching is best-effort; correctness is the full read
+        log.debug("ledger read-cache seed failed for %s", key, exc_info=True)
+        with _LEDGER_READ_CACHE_LOCK:
+            _LEDGER_READ_CACHE.pop(key, None)
+    return records
+
+
 def _stash_root_accounting(
     root_task_id: str,
     accounted_usd: Optional[float],
@@ -692,7 +747,7 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
     pricing_known = bound is not None
     attempt_id = uuid.uuid4().hex
     with _locked(root):
-        records = _read_records_locked(root)
+        records = _read_records_locked_cached(root)
         finals = list(_final_rows(records).values())
         global_summary = _summary(finals)
         global_limit = _global_limit(request)
@@ -821,7 +876,7 @@ def _append_single_settled_row(
     is a conflict, never a silent overwrite. Shared by every single-row kind."""
     attempt_id = str(row["attempt_id"])
     with _locked(root):
-        records = _read_records_locked(root)
+        records = _read_records_locked_cached(root)
         existing = _final_rows(records).get(attempt_id)
         if existing is not None:
             def identity_value(source: Dict[str, Any], key: str) -> Any:
@@ -899,7 +954,7 @@ def record_subscription_session(
     ))
 def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> Dict[str, Any]:
     with _locked(reservation.drive_root):
-        records = _read_records_locked(reservation.drive_root)
+        records = _read_records_locked_cached(reservation.drive_root)
         current = _final_rows(records).get(reservation.attempt_id)
         if current is None:
             raise UsageAccountingError(f"unknown usage attempt {reservation.attempt_id}")
@@ -987,7 +1042,7 @@ def terminalize_abandoned_attempt(
 ) -> str:
     """Close a dead owner attempt from measured usage, else unresolved/released."""
     with _locked(reservation.drive_root):
-        current = _final_rows(_read_records_locked(reservation.drive_root)).get(
+        current = _final_rows(_read_records_locked_cached(reservation.drive_root)).get(
             reservation.attempt_id
         )
     if current is None:
@@ -1573,7 +1628,7 @@ def _ensure_legacy_imported_locked(
         current_watermark = _completed_import_watermark(root)
         if current_watermark is not None:
             return current_watermark
-        records = _read_records_locked(root)
+        records = _read_records_locked_cached(root)
         existing_ids = {str(row.get("attempt_id") or "") for row in records}
         missing = [row for row in candidates if row["attempt_id"] not in existing_ids]
         _append_rows_locked(root, records, missing)

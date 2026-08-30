@@ -397,6 +397,60 @@ def test_newline_less_torn_tail_does_not_glue_the_next_append(data_root):
     assert projection["integrity_degraded"] is True  # the quarantine is disclosed
 
 
+def test_ledger_read_cache_matches_the_full_read_cold_and_warm(data_root, monkeypatch):
+    """razzant/ouroboros#129: the in-lock read is served from a warm incremental
+    cache. It must return exactly what the full validated read returns, both on
+    a cold miss and after appends grow the file."""
+    ua._LEDGER_READ_CACHE.clear()
+    from ouroboros import usage_ledger as ul
+
+    r1 = ua.reserve_attempt(_request(data_root))
+    ua.release_attempt(r1)
+    with ul._locked(data_root):
+        cold = ua._read_records_locked_cached(data_root)
+        raw = ul._read_records_locked(data_root)
+    assert cold == raw
+
+    # Grow the ledger; the next cached read must pick up the delta incrementally.
+    r2 = ua.reserve_attempt(_request(data_root))
+    ua.mark_dispatched(r2)
+    ua.settle_attempt(r2, usage={"prompt_tokens": 5, "completion_tokens": 2, "cost": 0.01})
+    with ul._locked(data_root):
+        warm = ua._read_records_locked_cached(data_root)
+        raw2 = ul._read_records_locked(data_root)
+    assert warm == raw2
+    assert len(warm) > len(cold)
+
+    # A projection computed with the cache warm equals one from a cold process.
+    warm_projection = ua.usage_projection(data_root)
+    ua._LEDGER_READ_CACHE.clear()
+    assert ua.usage_projection(data_root) == warm_projection
+
+
+def test_ledger_read_cache_falls_back_when_the_file_is_rewritten(data_root):
+    """A same-size in-place rewrite (mtime changes) or a shrink must force a full
+    re-read — the resume fingerprint check owns this, not the caller."""
+    ua._LEDGER_READ_CACHE.clear()
+    from ouroboros import usage_ledger as ul
+
+    r1 = ua.reserve_attempt(_request(data_root))
+    ua.release_attempt(r1)
+    with ul._locked(data_root):
+        ua._read_records_locked_cached(data_root)  # seed
+
+    ledger = data_root / ua.LEDGER_REL
+    original = ledger.read_bytes()
+    # Rewrite with identical bytes but a fresh mtime + inode (atomic replace).
+    tmp = ledger.with_suffix(".rewrite")
+    tmp.write_bytes(original)
+    tmp.replace(ledger)
+
+    with ul._locked(data_root):
+        after = ua._read_records_locked_cached(data_root)
+        raw = ul._read_records_locked(data_root)
+    assert after == raw
+
+
 @pytest.mark.parametrize(
     "field,value",
     (("seq", "not-a-number"), ("prompt_tokens", "not-a-number")),
