@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ouroboros.configured_subagents import (
     ALTERNATIVE_RECOMMENDATION,
+    MAX_CONFIGURED_SUBAGENTS,
     INDEPENDENT_RECOMMENDATION,
     PRIMARY_RECOMMENDATION,
     SCOUT_RECOMMENDATION,
@@ -409,7 +410,7 @@ def _reference_reviewer_rows(
             if (row.route.kind, row.route.target_id,
                     row.route.credential_profile_id) == identity:
                 return row.subagent_id, row.effort
-        if len(items) >= 10:
+        if len(items) >= MAX_CONFIGURED_SUBAGENTS:
             return None
         used = {row.subagent_id for row in items}
         harness = target_id.partition("=")[0] or "session"
@@ -450,7 +451,7 @@ def _reference_reviewer_rows(
     adv = _slot(SURFACE_ADVISORY, dict(advisory) | {"position": 1})
     adv.pop("slot_id", None)
     payload["advisory"] = {"enabled": True, **adv}
-    extended = ConfiguredSubagents(enabled=available.enabled, items=tuple(items))
+    extended = make_configured_subagents(items, enabled=available.enabled)
     return extended, json.dumps(payload, ensure_ascii=False, sort_keys=False), diagnostics
 
 

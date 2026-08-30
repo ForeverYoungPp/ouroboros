@@ -62,7 +62,7 @@ import {
 } from './claudexor_status_store.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
-import { createLoginCardController, normalizeProfileName } from './harness_login_cards.js';
+import { createLoginCardController, normalizeProfileName, preserveCardFocus } from './harness_login_cards.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -1078,62 +1078,68 @@ function renderRows() {
     const payload = state.store.snapshot || {};
     const accountsRead = state.store.facet(FACET_ACCOUNTS);
     const quotaRead = state.store.facet(FACET_QUOTA);
-    host.innerHTML = accountGroups(payload, {
-        accountsRead,
-        catalogKnown: state.store.catalogKnown,
-    })
-        .map((group) => harnessFamilyMarkup(group, payload, { accountsRead, quotaRead })).join('');
-    host.querySelectorAll('[data-harness-login]').forEach((button) => {
-        button.addEventListener('click', () => {
-            if (!state.initialized) return;
-            const row = button.closest('[data-harness]');
-            const rowData = row?.dataset || {};
-            const rowModel = accountRows(payload).find((candidate) =>
-                String(candidate?.harness || '') === String(rowData.harness || '')
-                && String(candidate?.profile_id || '') === String(rowData.profile || '')
-            );
-            const action = rowLoginAction(rowModel, payload);
-            if (action.refresh) {
-                state.store.refresh();
-                return;
-            }
-            startLogin(rowData.harness, rowData.profile);
-        });
-    });
-    host.querySelectorAll('[data-harness-remove]').forEach((button) => {
-        button.addEventListener('click', () => {
-            const row = button.closest('[data-harness]');
-            confirmRemoveAccount(row?.dataset.harness, row?.dataset.profile);
-        });
-    });
-    host.querySelectorAll('[data-harness-toggle]').forEach((button) => {
-        button.addEventListener('click', () => {
-            const row = button.closest('[data-harness]');
-            // The button carries the state it RENDERED for, so a click flips
-            // exactly what the owner saw — never a re-read of a row the poll
-            // may have replaced mid-click.
-            toggleAccountEnabled(row?.dataset.harness, row?.dataset.profile,
-                button.dataset.enabled === '0');
-        });
-    });
-    host.querySelectorAll('[data-family-add]').forEach((button) => {
-        button.addEventListener('click', async () => {
-            if (!state.initialized) return;
-            // Captured before the await: the status poll replaces the cards
-            // while the dialog is open, detaching this button's section.
-            const card = button.closest('[data-family]');
-            const harness = card?.dataset.family;
-            const hasRows = Boolean(card?.querySelector('[data-harness]'));
-            if (!hasRows) { startLogin(harness, ''); return; }
-            const profile = await promptProfileName({
-                family: familyLabel(harness, state.store.snapshot || {}, {
-                    catalogKnown: state.store.catalogKnown,
-                }),
+    // The family-mounted login card lives INSIDE this container, so the
+    // innerHTML rebuild destroys a focused paste-code/name input before the
+    // card's own render can see it. The capture must therefore wrap the
+    // whole rebuild: same SSOT helper, one level up.
+    preserveCardFocus(host, () => {
+        host.innerHTML = accountGroups(payload, {
+            accountsRead,
+            catalogKnown: state.store.catalogKnown,
+        })
+            .map((group) => harnessFamilyMarkup(group, payload, { accountsRead, quotaRead })).join('');
+        host.querySelectorAll('[data-harness-login]').forEach((button) => {
+            button.addEventListener('click', () => {
+                if (!state.initialized) return;
+                const row = button.closest('[data-harness]');
+                const rowData = row?.dataset || {};
+                const rowModel = accountRows(payload).find((candidate) =>
+                    String(candidate?.harness || '') === String(rowData.harness || '')
+                    && String(candidate?.profile_id || '') === String(rowData.profile || '')
+                );
+                const action = rowLoginAction(rowModel, payload);
+                if (action.refresh) {
+                    state.store.refresh();
+                    return;
+                }
+                startLogin(rowData.harness, rowData.profile);
             });
-            if (profile) startLogin(harness, profile);
         });
+        host.querySelectorAll('[data-harness-remove]').forEach((button) => {
+            button.addEventListener('click', () => {
+                const row = button.closest('[data-harness]');
+                confirmRemoveAccount(row?.dataset.harness, row?.dataset.profile);
+            });
+        });
+        host.querySelectorAll('[data-harness-toggle]').forEach((button) => {
+            button.addEventListener('click', () => {
+                const row = button.closest('[data-harness]');
+                // The button carries the state it RENDERED for, so a click flips
+                // exactly what the owner saw — never a re-read of a row the poll
+                // may have replaced mid-click.
+                toggleAccountEnabled(row?.dataset.harness, row?.dataset.profile,
+                    button.dataset.enabled === '0');
+            });
+        });
+        host.querySelectorAll('[data-family-add]').forEach((button) => {
+            button.addEventListener('click', async () => {
+                if (!state.initialized) return;
+                // Captured before the await: the status poll replaces the cards
+                // while the dialog is open, detaching this button's section.
+                const card = button.closest('[data-family]');
+                const harness = card?.dataset.family;
+                const hasRows = Boolean(card?.querySelector('[data-harness]'));
+                if (!hasRows) { startLogin(harness, ''); return; }
+                const profile = await promptProfileName({
+                    family: familyLabel(harness, state.store.snapshot || {}, {
+                        catalogKnown: state.store.catalogKnown,
+                    }),
+                });
+                if (profile) startLogin(harness, profile);
+            });
+        });
+        state.loginCard?.render();
     });
-    state.loginCard?.render();
 }
 
 async function toggleAccountEnabled(harness, profileId, enabled) {

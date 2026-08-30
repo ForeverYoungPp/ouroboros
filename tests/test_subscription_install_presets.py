@@ -488,6 +488,45 @@ def test_one_harness_plus_distinct_main_and_light_normally_yields_three_real_act
     ]
 
 
+def test_roster_cap_overflow_falls_back_to_inline_seats_with_a_diagnostic():
+    """The 10-row cap leaves no room to mint: the seat stays an INLINE route
+    and says so in diagnostics — honest fallback, never a silent drop."""
+    from ouroboros.configured_subagents import (
+        ROUTE_KIND_API_MODEL,
+        ConfiguredSubagent,
+        RouteSpec,
+        make_configured_subagents,
+    )
+    from ouroboros.subscription_install_presets import _reference_reviewer_rows
+
+    full = make_configured_subagents([
+        ConfiguredSubagent(
+            subagent_id=f"row-{i}",
+            recommended_use="Use for owner-selected work.",
+            route=RouteSpec(ROUTE_KIND_API_MODEL, f"openai/model-{i}"),
+        )
+        for i in range(10)
+    ])
+    extended, slots_json, diagnostics = _reference_reviewer_rows(
+        full,
+        [{"position": 1, "target_id": "claude=claude-opus-5", "effort": "medium"}],
+        [],
+        {"target_id": "claude=claude-sonnet-5", "effort": "low"},
+    )
+
+    assert len(extended.items) == 10  # nothing minted past the cap
+    slots = json.loads(slots_json)
+    triad_row = slots["triad"][0]
+    assert "subagent_id" not in triad_row
+    assert triad_row["route"] == {"kind": "agent_session", "target_id": "claude=claude-opus-5"}
+    assert triad_row["effort"] == "medium"
+    advisory_row = slots["advisory"]
+    assert advisory_row["enabled"] is True
+    assert advisory_row["route"] == {"kind": "agent_session", "target_id": "claude=claude-sonnet-5"}
+    codes = [row["code"] for row in diagnostics]
+    assert codes.count("reviewer_seat_inline_roster_full") == 2
+
+
 def test_missing_exact_agy_flash_refuses_without_partial_actor_or_reviewer_output():
     preset = compile_install_preset([
         HarnessDiscovery("agy", ("gemini-3.7-flash-medium", "gemini-3.1-pro-high")),

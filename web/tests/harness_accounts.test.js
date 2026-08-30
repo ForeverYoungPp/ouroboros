@@ -438,6 +438,23 @@ test('a model-scoped window never paints the whole account exhausted — it is a
 // null silently), so the flow runs on the in-house input dialog.
 // ---------------------------------------------------------------------------
 
+test('the groups rebuild wraps in preserveCardFocus so a family-mounted login card keeps its caret', () => {
+    // REGRESSION guard (fable review, roster-identity sprint): the login card
+    // mounts INSIDE #harness-accounts-groups now, so the poll-tick innerHTML
+    // rebuild destroys a focused paste-code/name input BEFORE the card's own
+    // render can capture it. The capture must wrap the whole rebuild — the
+    // innerHTML assignment and the card repaint both inside ONE
+    // preserveCardFocus callback.
+    const source = readFileSync(new URL('../modules/harness_accounts.js', import.meta.url), 'utf8');
+    const wrap = source.indexOf('preserveCardFocus(host, () => {');
+    assert.ok(wrap >= 0, 'renderRows must wrap its rebuild in preserveCardFocus');
+    const rebuild = source.indexOf('host.innerHTML = accountGroups(');
+    const repaint = source.indexOf('state.loginCard?.render();');
+    const close = source.indexOf('\n    });', wrap);
+    assert.ok(wrap < rebuild && rebuild < repaint && repaint < close,
+        'both the innerHTML rebuild and the card repaint live inside the capture');
+});
+
 test('Add account never touches window.prompt and asks through the in-house dialog', async () => {
     // REGRESSION guard for the dead desktop button: the module must not call
     // window.prompt at all — under pywebview it is a silent no-op. (The call

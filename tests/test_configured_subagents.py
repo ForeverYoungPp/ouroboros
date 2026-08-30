@@ -192,6 +192,39 @@ def test_exact_preset_receipt_preserves_source_until_owner_edits_the_rows(source
     assert configured.source == SOURCE_CONFIGURED
 
 
+def test_preset_receipt_survives_the_name_retirement_via_its_embedded_rows():
+    """A receipt written before `name` retired hashed a serialization that
+    carried that key; those bytes are unrecoverable after parse. Provenance
+    must survive on an UNTOUCHED install through the receipt's own embedded
+    rows — while any owner edit still downgrades, and a receipt with neither
+    a matching fingerprint nor embedded rows never relabels anything."""
+    raw = _config(_row("generated"))
+    receipt = {
+        "source": SOURCE_ONBOARDING_DEFAULT,
+        "available_subagents_fingerprint": "sha-of-a-serialization-that-carried-name",
+        "available_subagents": _config(_row("generated")),
+    }
+    settings = {
+        SUBAGENTS_SETTING: json.dumps(raw),
+        SUBAGENTS_RECEIPT_KEY: json.dumps(receipt),
+    }
+    assert resolve_configured_subagents(settings).source == SOURCE_ONBOARDING_DEFAULT
+
+    edited = _config(_row("generated", recommended_use="Owner edited."))
+    settings[SUBAGENTS_SETTING] = json.dumps(edited)
+    assert resolve_configured_subagents(settings).source == SOURCE_CONFIGURED
+
+    bare = {
+        "source": SOURCE_ONBOARDING_DEFAULT,
+        "available_subagents_fingerprint": "stale",
+    }
+    settings = {
+        SUBAGENTS_SETTING: json.dumps(raw),
+        SUBAGENTS_RECEIPT_KEY: json.dumps(bare),
+    }
+    assert resolve_configured_subagents(settings).source == SOURCE_CONFIGURED
+
+
 @pytest.mark.parametrize("receipt", [
     "not-json",
     {"source": SOURCE_ONBOARDING_DEFAULT, "available_subagents_fingerprint": "wrong"},

@@ -258,10 +258,24 @@ def _materialized_source(
     source = str(receipt.get("source") or "")
     if source not in {SOURCE_ONBOARDING_DEFAULT, SOURCE_LEGACY_MIGRATED}:
         return SOURCE_CONFIGURED
-    if str(receipt.get("available_subagents_fingerprint") or "") != (
-        configured_subagents_fingerprint(config)
-    ):
-        return SOURCE_CONFIGURED
+    current = configured_subagents_fingerprint(config)
+    if str(receipt.get("available_subagents_fingerprint") or "") != current:
+        # Receipts written before the `name` retirement fingerprinted a
+        # serialization that still carried that key; those exact bytes are
+        # unrecoverable after parse (names are dropped), so the stored hash
+        # can never match again on an UNTOUCHED install. The receipt also
+        # embeds the rows it shipped: re-read them through the CURRENT parser
+        # and compare canonical forms — provenance survives the migration,
+        # while any owner edit still downgrades to configured intent.
+        embedded = receipt.get("available_subagents")
+        if not isinstance(embedded, Mapping):
+            return SOURCE_CONFIGURED
+        try:
+            embedded_config = parse_configured_subagents(dict(embedded))
+        except (TypeError, ValueError):
+            return SOURCE_CONFIGURED
+        if configured_subagents_fingerprint(embedded_config) != current:
+            return SOURCE_CONFIGURED
     return source
 
 
