@@ -164,6 +164,17 @@ export function buildReviewerSlotsSetting(state) {
 // section uses — never a second schema.
 // ---------------------------------------------------------------------------
 
+export function advisoryReferenceTransition(advisory, subagentId) {
+    // Crossing from an inline branch drops the inline effort ('' = the roster
+    // row's own effort decides — the api default 'low' must not silently
+    // override the reference); a reference-to-reference switch keeps an
+    // explicit owner override (sol delta-review finding).
+    return {
+        subagent_id: String(subagentId || ''),
+        effort: advisory?.subagent_id ? String(advisory.effort || '') : '',
+    };
+}
+
 export function encodeReviewerChoice(row) {
     return row?.subagent_id
         ? SUBAGENT_CHOICE_PREFIX + String(row.subagent_id)
@@ -797,10 +808,10 @@ function bindRowEvents() {
         advisoryEl.querySelector('[data-advisory-route]')?.addEventListener('change', (event) => {
             const value = String(event.target.value || '');
             if (value.startsWith(SUBAGENT_CHOICE_PREFIX)) {
-                state.advisory.subagent_id = value.slice(SUBAGENT_CHOICE_PREFIX.length);
-                // '' effort = the roster row's own effort decides; the api
-                // default 'low' must not silently override the reference.
-                state.advisory.effort = '';
+                const next = advisoryReferenceTransition(
+                    state.advisory, value.slice(SUBAGENT_CHOICE_PREFIX.length));
+                state.advisory.subagent_id = next.subagent_id;
+                state.advisory.effort = next.effort;
                 renderRows();
                 state.onChange();
                 return;

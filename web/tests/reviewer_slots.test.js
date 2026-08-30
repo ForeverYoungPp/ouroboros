@@ -28,6 +28,7 @@ import {
     splitSessionTarget,
     subagentOptionsFor,
     SUBAGENT_CHOICE_PREFIX,
+    advisoryReferenceTransition,
     encodeReviewerChoice,
     reviewerChoiceGroups,
 } from '../modules/reviewer_slots.js';
@@ -453,6 +454,23 @@ test('the one flat reviewer picker leads with roster references, then the inline
     // The advisory api label rides through.
     const advisory = reviewerChoiceGroups({ roster: [], row: { subagent_id: '' }, harnesses, apiLabel: 'API model (inspection episode)' });
     assert.equal(advisory[0].options[0].label, 'API model (inspection episode)');
+});
+
+test('an advisory reference switch keeps an explicit effort override; crossing from inline clears it', () => {
+    // Sol delta-review finding: the merged picker unconditionally cleared the
+    // advisory effort on ANY reference pick, silently erasing a saved
+    // {subagent_id, effort: 'xhigh'} override on a reference-to-reference
+    // switch. Inline branches still shed their effort ('' = the roster row's
+    // own effort decides).
+    assert.deepEqual(
+        advisoryReferenceTransition({ subagent_id: 'deep', effort: 'xhigh' }, 'fast'),
+        { subagent_id: 'fast', effort: 'xhigh' });
+    assert.deepEqual(
+        advisoryReferenceTransition({ subagent_id: '', effort: 'low', route: { kind: ROUTE_KIND_API } }, 'deep'),
+        { subagent_id: 'deep', effort: '' });
+    assert.deepEqual(
+        advisoryReferenceTransition({ subagent_id: '', effort: 'high', route: { kind: ROUTE_KIND_SESSION, target_id: 'codex=x' } }, 'deep'),
+        { subagent_id: 'deep', effort: '' });
 });
 
 test('picker captions strip directional marks and never split a surrogate pair', () => {
