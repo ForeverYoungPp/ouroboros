@@ -232,7 +232,7 @@ def test_workspace_focus_exposes_but_does_not_retarget_system_review_lifecycle(t
     from ouroboros.tools import claude_advisory_review, git as git_tools
 
     registry, _ctx, _system, _project = _registry(tmp_path)
-    assert registry.get_schema_by_name("advisory_review") is not None
+    assert registry.get_schema_by_name("preflight_review") is not None
     assert registry.get_schema_by_name("commit_reviewed") is not None
     assert "repo_dir = pathlib.Path(ctx.repo_dir)" in inspect.getsource(
         claude_advisory_review._handle_advisory_pre_review

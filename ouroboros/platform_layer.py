@@ -970,6 +970,11 @@ def node_distribution_platform() -> str:
 
 def probe_node_version(node_path: str) -> str:
     """Return a normalized bundled-Node version, or ``""`` on probe failure."""
+    # An inherited NODE_OPTIONS carrying test-mode flags (--test-name-pattern,
+    # --test-only) makes `node --version` itself exit non-zero, so a healthy
+    # runtime read as missing. The probe scrubs it exactly as the suite run does.
+    probe_env = dict(os.environ)
+    probe_env.pop("NODE_OPTIONS", None)
     try:
         result = _hidden_run(
             [str(node_path), "--version"],
@@ -978,6 +983,7 @@ def probe_node_version(node_path: str) -> str:
             encoding="utf-8",
             timeout=10,
             check=False,
+            env=probe_env,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
