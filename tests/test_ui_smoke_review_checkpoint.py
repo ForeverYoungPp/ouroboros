@@ -45,6 +45,18 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                     "quorum_contribution": True,
                     "enforcement_impact": "supports_pass",
                     "reason": "The browser evidence is incomplete.",
+                    "coverage": {"criteria_total": 3, "findings": 3},
+                    "findings": [
+                        {
+                            "severity": "high",
+                            "item": "Browser evidence missing for the checkout flow",
+                            "evidence": "no screenshot covers step 3",
+                            "recommendation": "Capture the payment page state",
+                        },
+                        {"severity": "low", "item": "Trace summary is terse"},
+                    ],
+                    "findings_omitted": 1,
+                    "response_ref": {"call_id": "call-fable-1", "sha256": "a" * 64},
                 },
                 {
                     "slot_id": "sol",
@@ -110,12 +122,46 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
     }) + "\n", encoding="utf-8")
     task_results = data_dir / "task_results"
     task_results.mkdir(parents=True, exist_ok=True)
+    plan_state = {
+        "schema_version": 2,
+        "current_attempt": {"fingerprint": "f" * 64, "status": "open"},
+        "waves": [{
+            "request_fingerprint": "f" * 64,
+            "cycle_index": 1,
+            "aggregate": "REVISE_PLAN",
+            "closed": False,
+            "paid": True,
+            "counts": {"blocking": 1, "note": 0, "need_evidence": 0},
+            "findings": [{
+                "finding_id": "slot_1:f1",
+                "id": "f1",
+                "class": "blocking",
+                "summary": "The migration step drops the audit ledger",
+                "breaks": "invariant_1",
+                "locator": "ouroboros/usage_accounting.py",
+                "recommendation": "Keep the ledger append-only through the migration",
+                "slot": "slot_1",
+                "model": "anthropic/claude-fable-5",
+            }],
+            "dispositions": [{
+                "finding_id": "slot_1:f1",
+                "decision": "accept",
+                "rationale": "will rework the migration",
+            }],
+            "actors": [
+                {"slot_id": "slot_1", "model": "anthropic/claude-fable-5", "ok": True},
+            ],
+            "reviewed_at": "2026-07-15T09:59:58+00:00",
+        }],
+        "waves_omitted": 0,
+    }
     (task_results / "review-no-summary.json").write_text(json.dumps({
         "task_id": "review-no-summary",
         "status": "completed",
         "reason_code": "acceptance_degraded",
         "outcome_axes": axes,
         "review_projection": projection,
+        "plan_review_state": plan_state,
     }) + "\n", encoding="utf-8")
 
     try:
@@ -135,11 +181,30 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                 assert "Review panel panel_visual_truth" in chat_text
                 assert "Reviewer fable" in chat_text
                 assert "Reviewer sol" in chat_text
+                # The reviewer's actual findings are readable, not just counted.
+                assert "Browser evidence missing for the checkout flow" in chat_text
+                assert "fix: Capture the payment page state" in chat_text
+                assert "Reviewer fable findings omitted: 1" in chat_text
+                assert "observability call call-fable-1" in chat_text
                 no_summary = page.locator('.chat-live-card[data-task-id="review-no-summary"]')
                 no_summary.wait_for(state="attached", timeout=30_000)
                 assert no_summary.get_attribute("data-expanded") == "0"
+                # This card carries BOTH groups; the helper opens the first
+                # (Plan review), whose finding text must be readable.
                 _open_review_checkpoint(no_summary)
                 assert no_summary.locator('[data-live-phase]').first.get_attribute("data-phase") == "warn"
+                plan_text = no_summary.inner_text()
+                assert "The migration step drops the audit ledger" in plan_text
+                assert "breaks invariant_1" in plan_text
+                assert "agent: accept — will rework the migration" in plan_text
+                acceptance_toggle = no_summary.locator(
+                    '[data-review-group-toggle="task_acceptance:review-no-summary"]',
+                )
+                acceptance_toggle.click()
+                no_summary.locator(
+                    '[data-review-group="task_acceptance:review-no-summary"]'
+                    ' [data-review-attempt-toggle]',
+                ).first.click()
                 assert "Review panel panel_visual_truth" in no_summary.inner_text()
                 page.wait_for_timeout(900)  # cover the routine background history sync
                 assert no_summary.locator('.chat-live-line-repeat:not([hidden])').count() == 0
@@ -157,6 +222,9 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                 assert "Review panel panel_visual_truth" in log_text
                 assert "Reviewer fable" in log_text
                 assert "Reviewer sol" in log_text
+                # The same formatter serves Logs: finding bodies ride along.
+                assert "Browser evidence missing for the checkout flow" in log_text
+                assert "Reviewer fable findings omitted: 1" in log_text
                 assert log_card.locator('[data-task-phase]').inner_text() == "warn"
                 review.scroll_into_view_if_needed()
                 review.screenshot(path=str(data_dir.parent / "review-truth-logs.png"))
