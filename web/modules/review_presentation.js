@@ -742,8 +742,11 @@ export function formatReviewProjection(projection) {
                     if (!finding || typeof finding !== 'object') continue;
                     const label = [text(finding.severity), text(finding.verdict)]
                         .filter(Boolean).join(' ') || 'finding';
+                    const title = text(finding.item) || text(finding.summary) || '(no item)';
+                    const summaryText = text(finding.summary);
                     const body = [
-                        `[${label}] ${text(finding.item) || text(finding.summary) || '(no item)'}`,
+                        `[${label}]${text(finding.id) ? ` ${text(finding.id)}` : ''} ${title}`,
+                        summaryText && summaryText !== title ? `summary: ${summaryText}` : '',
                         text(finding.reason) ? `reason: ${text(finding.reason)}` : '',
                         text(finding.evidence) ? `evidence: ${text(finding.evidence)}` : '',
                         text(finding.recommendation) ? `fix: ${text(finding.recommendation)}` : '',
@@ -1240,11 +1243,17 @@ export function reviewReferenceFromRow(row) {
 
 export function renderReviewsSection(groupsInput, disclosure = {}) {
     const groups = orderedReviewGroups(groupsInput);
-    // A failed FIRST hydration has no groups to hang the error on; the shell
-    // still renders so the failure and its Retry stay visible instead of the
-    // whole section silently not existing. A quiet zero-group loading pass
-    // stays invisible (every card expand hydrates, most tasks have no reviews).
-    if (!groups.length && text(disclosure.hydrateStatus) !== 'error') return '';
+    // A failed FIRST hydration has no groups to hang the error on: the shell
+    // renders anyway and stays mounted through the retry's own loading pass
+    // (hadHydrateError) so the recovery control cannot unmount mid-flight. A
+    // quiet first-load zero-group loading pass stays invisible (every card
+    // expand hydrates, most tasks have no reviews).
+    const hydrateStatus = text(disclosure.hydrateStatus);
+    const emptyShell = !groups.length && (
+        hydrateStatus === 'error'
+        || (hydrateStatus === 'loading' && disclosure.hadHydrateError === true)
+    );
+    if (!groups.length && !emptyShell) return '';
     const expandedGroups = disclosure.expandedGroups instanceof Set ? disclosure.expandedGroups : new Set();
     const expandedAttempts = disclosure.expandedAttempts instanceof Set ? disclosure.expandedAttempts : new Set();
     const sectionExpanded = disclosure.sectionExpanded === true;
@@ -1319,18 +1328,20 @@ export function renderReviewsSection(groupsInput, disclosure = {}) {
     // place across loading↔error, and the DOM patcher syncs text only through
     // childless-element innerHTML — a bare text node beside the Retry button
     // would survive the transition stale.
-    const hydrateStatus = text(disclosure.hydrateStatus);
     const hydrateHtml = hydrateStatus === 'loading'
         ? '<div class="skill-review-loading" data-review-hydrate-status role="status" aria-live="polite"><span>Loading review details…</span></div>'
         : (hydrateStatus === 'error'
             ? '<div class="skill-review-error" data-review-hydrate-status role="alert"><span>Review details failed to refresh — shown data may be incomplete. </span><button type="button" class="skill-review-retry" data-review-hydrate-retry>Retry</button></div>'
             : '');
+    // The status node sits OUTSIDE the collapsible groups container: a failed
+    // refresh stays visible on a collapsed section and the keyed node survives
+    // loading↔error transitions. Disclosure stays user-owned — nothing expands.
     return `
         <section class="chat-live-reviews" data-review-section data-expanded="${sectionExpanded ? '1' : '0'}">
             <button type="button" class="chat-review-section-toggle" data-review-section-toggle aria-expanded="${sectionExpanded ? 'true' : 'false'}">
                 <span>Reviews</span><span class="chat-review-section-count">${escapeHtmlText(countText)}</span>
             </button>
-            <div class="chat-review-groups"${sectionExpanded ? '' : ' hidden'}>${hydrateHtml}${groupHtml}</div>
+            ${hydrateHtml}<div class="chat-review-groups"${sectionExpanded ? '' : ' hidden'}>${groupHtml}</div>
         </section>`;
 }
 
@@ -1384,7 +1395,10 @@ export function createReviewPresentationController({
         if (!host || !summary) return;
         const focused = focusedControl();
         const { groupCount, activeCount } = reviewGroupCounts(groups);
-        const failedEmpty = groupCount === 0 && state.hydrateStatus === 'error';
+        const failedEmpty = groupCount === 0 && (
+            state.hydrateStatus === 'error'
+            || (state.hydrateStatus === 'loading' && state.hadHydrateError === true)
+        );
         summary.hidden = groupCount === 0 && !failedEmpty;
         summary.textContent = groupCount
             ? `Reviews ${groupCount}${activeCount ? ` · ${activeCount} active` : ''}`
@@ -1475,6 +1489,10 @@ export function createReviewPresentationController({
         setHydrateStatus(statusValue) {
             const status = text(statusValue);
             if (state.hydrateStatus === status) return;
+            // Remember a failure across the retry's loading pass so the
+            // zero-group shell stays mounted until the retry settles.
+            if (status === 'error') state.hadHydrateError = true;
+            else if (status === 'idle') state.hadHydrateError = false;
             state.hydrateStatus = status;
             render();
         },

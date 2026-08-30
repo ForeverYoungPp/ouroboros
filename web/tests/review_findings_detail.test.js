@@ -191,12 +191,28 @@ test('the section renders hydration truth and the controller retries through onH
 test('a failed first hydration renders the section shell with no groups', () => {
     assert.equal(renderReviewsSection([], {}), '');
     assert.equal(renderReviewsSection([], { hydrateStatus: 'loading' }), '',
-        'a quiet zero-group loading pass stays invisible (every card expand hydrates)');
+        'a quiet first-load zero-group loading pass stays invisible (every card expand hydrates)');
     const errorShell = renderReviewsSection([], { sectionExpanded: true, hydrateStatus: 'error' });
     assert.match(errorShell, /data-review-section/);
     assert.match(errorShell, /Review details failed to refresh/);
     assert.match(errorShell, /data-review-hydrate-retry/);
     assert.match(errorShell, /chat-review-section-count">—</);
+
+    // The error must be readable on a COLLAPSED section too: the status node
+    // sits outside the hidden groups container.
+    const collapsedShell = renderReviewsSection([], { hydrateStatus: 'error' });
+    assert.match(collapsedShell, /data-expanded="0"/);
+    const statusIndex = collapsedShell.indexOf('data-review-hydrate-status');
+    const groupsIndex = collapsedShell.indexOf('chat-review-groups');
+    assert.ok(statusIndex >= 0 && statusIndex < groupsIndex,
+        'status node renders before (outside) the collapsible groups container');
+    assert.match(collapsedShell, /Review details failed to refresh/);
+
+    // A retry's own loading pass keeps the shell mounted (hadHydrateError),
+    // so the recovery control cannot unmount mid-flight.
+    const retryLoading = renderReviewsSection([], { hydrateStatus: 'loading', hadHydrateError: true });
+    assert.match(retryLoading, /Loading review details…/);
+    assert.equal(renderReviewsSection([], { hydrateStatus: 'loading', hadHydrateError: false }), '');
 });
 
 test('the hydrate status node swaps its message text across the loading→error patch', () => {

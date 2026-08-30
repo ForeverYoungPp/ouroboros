@@ -458,7 +458,11 @@ test('actor findings rows, omitted counts and the durable pointer ride the share
                 slot_id: 'slot_1', model: 'm1', reason: 'summary text',
                 coverage: { criteria_total: 3, findings: 10 },
                 findings: [
-                    { severity: 'critical', item: 'Preflop sizing is wrong', evidence: 'raises 2bb from UTG', recommendation: 'raise 2.5bb' },
+                    {
+                        id: 'f1', severity: 'critical', item: 'Preflop sizing is wrong',
+                        summary: 'Sizing deviates from the baseline in early position',
+                        evidence: 'raises 2bb from UTG', recommendation: 'raise 2.5bb',
+                    },
                     { severity: 'low', verdict: 'FAIL', item: 'Style nit', reason: 'inconsistent spacing' },
                 ],
                 findings_omitted: 8,
@@ -480,7 +484,7 @@ test('actor findings rows, omitted counts and the durable pointer ride the share
         ],
     }] });
 
-    assert.match(text, /Reviewer slot_1 finding: \[critical\] Preflop sizing is wrong — evidence: raises 2bb from UTG — fix: raise 2\.5bb/);
+    assert.match(text, /Reviewer slot_1 finding: \[critical\] f1 Preflop sizing is wrong — summary: Sizing deviates from the baseline in early position — evidence: raises 2bb from UTG — fix: raise 2\.5bb/);
     assert.match(text, /Reviewer slot_1 finding: \[low FAIL\] Style nit — reason: inconsistent spacing/);
     assert.match(text, /Reviewer slot_1 findings omitted: 8/);
     assert.match(text, /Reviewer slot_1 full response: observability call review_task_acceptance_slot_1_resp/);
