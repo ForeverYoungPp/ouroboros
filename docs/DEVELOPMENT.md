@@ -1768,7 +1768,12 @@ Before every commit, verify the following:
 - A delegating parent must not produce a clean no-tool final answer while direct
   children are still running and undecided. One bounded absorption reminder is
   allowed; after that, finalization is best-effort (`children_unabsorbed`) rather
-  than clean. This is an outcome-honesty rule, not a new wait loop.
+  than clean. This is an outcome-honesty rule, not a new wait loop. While the
+  gate is open the delivery candidate is HELD
+  (`child_absorption_or_revision_required`), never armed: the JSON-only
+  delivery-control instruction must not ride the same round as the absorption
+  reminder — or a post-tool evidence change with undispositioned children still
+  present — because it would contradict the required disposition tool call.
 
 #### Page Header Layout
 - Top-level page chrome (`renderPageHeader`, tab strips, primary actions) must sit outside the scrolling content region.

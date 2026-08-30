@@ -1779,6 +1779,121 @@ def test_forced_children_unabsorbed_rail_runs_acceptance_with_debt_evidence(
     assert outcome["outcome_axes"]["execution"]["reason_code"] == "children_unabsorbed"
 
 
+def test_forced_rail_reads_current_child_state_across_the_forced_call(
+    tmp_path, monkeypatch,
+):
+    """D2b: a child flips running->completed ACROSS the forced model call.
+    The forced prompt lists the fresh pre-call truth (running), while the
+    acceptance debt is recomputed adjacent to the panel's own subtree read
+    (completed) — one packet, one moment, no two-status child — and the host
+    orphan note still names the undecided child."""
+    _write_child(tmp_path, status="running")
+    panel = _acceptance_panel_result(
+        aggregate="PASS",
+        actors=[{
+            "slot_id": "s0", "signal": "PASS",
+            "parsed": {
+                "verdict": "PASS", "outcome_tier": "solved",
+                "criteria_used": [{
+                    "criterion": "owner request", "status": "supported",
+                    "evidence_refs": ["artifact:1"],
+                }],
+            },
+        }],
+    )
+    loop, registry, limit_ctx, trace, seen_evidence, panel_calls = (
+        _forced_absorption_acceptance_context(tmp_path, monkeypatch, panel)
+    )
+    seen_requests = []
+
+    def flip_and_answer(_llm, request_messages, *_a, **_k):
+        seen_requests.append([dict(m) for m in request_messages])
+        _write_child(tmp_path, status="completed")
+        return (
+            {"role": "assistant", "content": "Best-effort final answer naming child1."},
+            0.0,
+        )
+
+    monkeypatch.setattr(loop, "call_llm_with_retry", flip_and_answer)
+
+    result = loop._maybe_enforce_child_absorption_gate(
+        registry, limit_ctx, "", limit_ctx.messages, lambda _t: None, trace,
+    )
+
+    assert result is not None and result != "continue"
+    text, usage, _returned_trace = result
+    assert usage["reason_code"] == "children_unabsorbed"
+    assert panel_calls["count"] == 1
+    forced_prompt = "\n".join(
+        str(m.get("content") or "") for m in seen_requests[0]
+    )
+    assert "child1 [running]" in forced_prompt
+    debt = seen_evidence["undispositioned_children"]
+    assert [row["task_id"] for row in debt] == ["child1"]
+    assert debt[0]["status"] == "completed"
+    subtree = {
+        str(row.get("task_id")): str(row.get("status"))
+        for row in seen_evidence.get("terminal_subtree_statuses", [])
+    }
+    assert subtree.get("child1") == "completed"
+    assert "child1" in text
+
+
+def test_post_tool_evidence_change_holds_while_absorption_gate_open(tmp_path):
+    """grok #9: a post-tool evidence change while undispositioned children
+    remain must HOLD the candidate again, not arm — arming would reintroduce
+    the conflicting-instruction round the absorption hold exists to prevent."""
+    _write_child(tmp_path, status="running")
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    candidate = loop._replace_delivery_candidate(
+        registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
+    )
+    loop._hold_delivery_for_skill_action(
+        registry, trace, control="child_absorption_or_revision_required",
+    )
+    registry._ctx._owner_directives = ["fresh owner directive"]
+    before = len(limit_ctx.messages)
+
+    loop._prepare_post_tool_budget_context(
+        registry, limit_ctx, trace, "test-model", False, "medium",
+    )
+
+    assert registry._ctx._delivery_control_required is False
+    assert candidate.finalization_control == "child_absorption_or_revision_required"
+    assert all(
+        "[DELIVERY_FINALIZATION_CONTROL]" not in str(m.get("content") or "")
+        for m in limit_ctx.messages[before:]
+    )
+
+
+def test_post_tool_evidence_change_arms_after_children_dispositioned(tmp_path):
+    """Once every child is dispositioned the absorption gate is closed: the
+    same evidence-change seam escalates through the ordinary arm (the free
+    post-action escalation path)."""
+    _write_child(tmp_path)
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    candidate = loop._replace_delivery_candidate(
+        registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
+    )
+    loop._hold_delivery_for_skill_action(
+        registry, trace, control="child_absorption_or_revision_required",
+    )
+    _write_confirmed_disposition(
+        tmp_path, disposition="integrated", rationale="absorbed the child result",
+    )
+
+    loop._prepare_post_tool_budget_context(
+        registry, limit_ctx, trace, "test-model", False, "medium",
+    )
+
+    assert registry._ctx._delivery_control_required is True
+    assert candidate.finalization_control == "effect_revision_required"
+    assert any(
+        "[DELIVERY_FINALIZATION_CONTROL]" in str(m.get("content") or "")
+        for m in limit_ctx.messages
+    )
+
+
 def test_forced_rail_terminalizes_a_requested_improvement_pass(tmp_path, monkeypatch):
     """The panel asks for a revision pass, but the forced rail can never take
     another model round: the dangling `revision_requested` is downgraded to the

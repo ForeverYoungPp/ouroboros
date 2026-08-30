@@ -4114,16 +4114,35 @@ def _arm_delivery_control(
     _publish_delivery_candidate(tools, candidate, llm_trace)
 
 
+# Action-gate holds: a gate closable ONLY by a tool call (skill lifecycle
+# action, child-result disposition) retains the candidate WITHOUT arming the
+# JSON-only control instruction — the instruction would conflict with the
+# required tool call. Gates closable by a reconsidered answer arm normally.
+_SKILL_ACTION_HOLD_CONTROL = "skill_action_or_revision_required"
+_CHILD_ABSORPTION_HOLD_CONTROL = "child_absorption_or_revision_required"
+_DELIVERY_HOLD_CONTROLS = frozenset({
+    _SKILL_ACTION_HOLD_CONTROL,
+    _CHILD_ABSORPTION_HOLD_CONTROL,
+})
+
+
 def _hold_delivery_for_skill_action(
     tools: ToolRegistry,
     llm_trace: Dict[str, Any],
+    *,
+    control: str = _SKILL_ACTION_HOLD_CONTROL,
 ) -> None:
-    """Retain the answer while an unresolved skill lifecycle gate requires action."""
+    """Retain the answer while an unresolved action gate requires a tool call.
+
+    ``control`` names the open gate (skill lifecycle by default, child
+    absorption at the absorption site); it must stay within
+    ``_DELIVERY_HOLD_CONTROLS`` so both hold readers recognize the state.
+    """
 
     candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if not isinstance(candidate, DeliveryCandidate):
         return
-    candidate.finalization_control = "skill_action_or_revision_required"
+    candidate.finalization_control = control
     candidate.repair_attempted = False
     tools._ctx._delivery_control_required = False
     _publish_delivery_candidate(tools, candidate, llm_trace)
@@ -4187,12 +4206,16 @@ def _resolve_delivery_control(
             # required latch. The candidate's typed control state is authoritative.
             required = True
             tools._ctx._delivery_control_required = True
-        elif candidate.finalization_control == "skill_action_or_revision_required":
-            # Preserve the historical bounded skill gate: an actual tool
-            # action or a reconsidered full prose answer may proceed, but a
-            # typed keep cannot acknowledge the gate. No delivery JSON prompt
-            # before the action — it would conflict with the instruction to
-            # call the skill lifecycle tool.
+        elif candidate.finalization_control in _DELIVERY_HOLD_CONTROLS:
+            # Preserve the bounded action gates (skill lifecycle, child
+            # absorption): an actual tool action or a reconsidered full prose
+            # answer may proceed, but a typed keep cannot acknowledge the
+            # gate. No delivery JSON prompt before the action — it would
+            # conflict with the instruction to call the gate's tool. A typed
+            # control attempt escalates to the existing replace-required
+            # literal for BOTH holds (an absorption-specific literal would
+            # widen `_delivery_replace_required`; rejected by the plan —
+            # the absorption gate itself still forces best_effort downstream).
             if not is_control_intent:
                 return "fresh", _extract_plain_text_from_content(content)
             candidate.finalization_control = "skill_revision_required"
@@ -4428,6 +4451,19 @@ def _undispositioned_children(ctx: _RoundLimitContext) -> list[Dict[str, Any]]:
         return []
 
 
+def _undecided_children_listing(undecided: list[Dict[str, Any]]) -> str:
+    """Bounded ``id [status] sha256`` listing shared by the absorption
+    reminder and the forced-finalization prompt."""
+
+    from ouroboros.tools.join_ledger import _child_result_sha256
+
+    return "; ".join(
+        f"{c.get('task_id') or c.get('id') or '?'} [{c.get('status') or 'unknown'}] "
+        f"sha256={_child_result_sha256(c)}"
+        for c in undecided[:10]
+    )
+
+
 def _maybe_enforce_child_absorption_gate(
     tools: ToolRegistry,
     limit_ctx: _RoundLimitContext,
@@ -4443,13 +4479,7 @@ def _maybe_enforce_child_absorption_gate(
         tools._ctx._child_absorption_reminded = True
         if content and str(content).strip():
             messages.append({"role": "assistant", "content": content})
-        from ouroboros.tools.join_ledger import _child_result_sha256
-
-        listed = "; ".join(
-            f"{c.get('task_id') or c.get('id') or '?'} [{c.get('status') or 'unknown'}] "
-            f"sha256={_child_result_sha256(c)}"
-            for c in undecided[:10]
-        )
+        listed = _undecided_children_listing(undecided)
         reminder = (
             "[CHILD_ABSORPTION_REQUIRED]\n"
             "You have child result(s) without a current exact-hash disposition: "
@@ -4466,20 +4496,25 @@ def _maybe_enforce_child_absorption_gate(
         emit_progress("Child absorption reminder injected before final response.")
         llm_trace["reasoning_notes"].append("Child absorption reminder injected before final response.")
         return "continue"
+    # Fresh snapshot for the forced prompt: child statuses may have flipped
+    # (e.g. running -> completed) since the reminder round, and the model must
+    # state CURRENT statuses instead of guessing from the stale listing.
+    undecided = _undispositioned_children(limit_ctx)
     text, usage, forced_trace = _forced_final_answer(
         limit_ctx,
         prompt=(
             "[FINALIZE_WITH_UNABSORBED_CHILDREN]\n"
             "You still have child results without exact dispositions and already received one "
             "child-absorption reminder. Produce an honest best-effort final answer now; name the "
-            "unabsorbed or unfinished children explicitly."
+            "unabsorbed or unfinished children explicitly. Current child state: "
+            f"{_undecided_children_listing(undecided)}."
         ),
         fallback_text="⚠️ Finalized best-effort with undispositioned child results.",
         reason_code="children_unabsorbed",
     )
     _merge_finalization_trace(llm_trace, forced_trace)
     _run_forced_children_acceptance(
-        tools, limit_ctx, undecided, text, messages, emit_progress, llm_trace,
+        tools, limit_ctx, text, messages, emit_progress, llm_trace,
     )
     return text, usage, llm_trace
 
@@ -4487,7 +4522,6 @@ def _maybe_enforce_child_absorption_gate(
 def _run_forced_children_acceptance(
     tools: ToolRegistry,
     limit_ctx: _RoundLimitContext,
-    undecided: list[Dict[str, Any]],
     text: str,
     messages: List[Dict[str, Any]],
     emit_progress: Callable[[str], None],
@@ -4509,6 +4543,10 @@ def _run_forced_children_acceptance(
     try:
         from ouroboros.tools.join_ledger import _child_result_sha256
 
+        # Fresh debt adjacent to the panel's own fresh subtree read: the
+        # forced model call above takes real time, and a child may settle
+        # across it — one packet, one moment.
+        undecided = _undispositioned_children(limit_ctx)
         debt = [
             {
                 "task_id": str(c.get("task_id") or c.get("id") or ""),
@@ -4641,7 +4679,12 @@ def _no_tool_final_answer(
         tools, limit_ctx, content, messages, emit_progress, llm_trace,
     )
     if absorption_result == "continue":
-        _arm_delivery_control(tools, limit_ctx, llm_trace)
+        # Child absorption is an action gate closable only by disposition
+        # tool calls: hold the candidate instead of arming the JSON-only
+        # instruction, which would contradict the reminder in the same round.
+        _hold_delivery_for_skill_action(
+            tools, llm_trace, control=_CHILD_ABSORPTION_HOLD_CONTROL,
+        )
         return None
     if absorption_result is not None:
         return absorption_result
@@ -6663,8 +6706,17 @@ def _prepare_post_tool_budget_context(
 
     candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if isinstance(candidate, DeliveryCandidate):
-        skill_action_pending = (
-            candidate.finalization_control == "skill_action_or_revision_required"
+        hold_control = (
+            candidate.finalization_control
+            if candidate.finalization_control in _DELIVERY_HOLD_CONTROLS
+            else ""
+        )
+        # The absorption action gate stays open while undispositioned children
+        # remain: arming the JSON-only instruction there would recreate the
+        # conflicting-instruction round the absorption hold exists to prevent.
+        absorption_gate_open = (
+            hold_control == _CHILD_ABSORPTION_HOLD_CONTROL
+            and bool(_undispositioned_children(limit_ctx))
         )
         evidence_revision, evidence_fingerprint = _delivery_evidence_state(
             tools, limit_ctx, llm_trace,
@@ -6673,19 +6725,26 @@ def _prepare_post_tool_budget_context(
             candidate.evidence_revision != evidence_revision
             or candidate.evidence_fingerprint != evidence_fingerprint
         ):
-            _arm_delivery_control(
-                tools,
-                limit_ctx,
-                llm_trace,
-                control="effect_revision_required",
-            )
-        elif skill_action_pending:
+            if absorption_gate_open:
+                _hold_delivery_for_skill_action(
+                    tools, llm_trace, control=_CHILD_ABSORPTION_HOLD_CONTROL,
+                )
+            else:
+                _arm_delivery_control(
+                    tools,
+                    limit_ctx,
+                    llm_trace,
+                    control="effect_revision_required",
+                )
+        elif hold_control == _SKILL_ACTION_HOLD_CONTROL:
             _arm_delivery_control(
                 tools,
                 limit_ctx,
                 llm_trace,
                 control="skill_revision_required",
             )
+        # An absorption hold with unchanged evidence keeps holding: the gate
+        # is closed only by dispositions, and a disposition changes evidence.
     # Cross-model fallback can adopt a different route during this round.
     limit_ctx.active_model = active_model
     limit_ctx.active_use_local = active_use_local
