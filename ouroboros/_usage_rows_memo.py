@@ -201,7 +201,7 @@ def _read_records_locked_cached(root: pathlib.Path) -> list:
     """``_read_records_locked`` with an incremental warm path. Call under the
     held ledger lock (same contract as ``_read_records_locked``)."""
     ua = _ua()
-    key = str(root)
+    key = str(pathlib.Path(root).resolve(strict=False))  # one slot per physical root
     with _LEDGER_READ_CACHE_LOCK:
         cached = _LEDGER_READ_CACHE.get(key)
     if cached is not None:

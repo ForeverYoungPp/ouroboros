@@ -209,11 +209,12 @@ def test_warm_display_reads_do_zero_full_replays_cold_exactly_one(data_root, mon
         ua.usage_projection(data_root, root_task_id="root")
     assert calls["full"] == 1, "warm repeat display reads must do zero full replays"
 
-    # A same-process append advances the memo incrementally on the next read:
-    # the write path's own full locked reads are counted, but the display read
-    # after it must not add another full replay.
+    # A same-process append advances the memo incrementally on the next read,
+    # and the write path itself reads through its warm in-lock cache (#129):
+    # neither the write nor the display read after it adds a full replay.
     ua.release_attempt(ua.reserve_attempt(_request(data_root, task_id="next")))
     after_write = calls["full"]
+    assert after_write == 1, "warm write-path reads must not full-replay the ledger"
     projection = ua.usage_projection(data_root)
     assert calls["full"] == after_write, "post-append display read must resume, not replay"
     assert projection["attempt_counts"]["released"] == 1
@@ -330,7 +331,7 @@ def test_newline_less_crash_tail_never_lets_warm_reads_diverge(data_root):
 
     warm = ua.usage_projection(data_root)
     fresh = _fresh_result(data_root, ua.usage_projection, data_root)
-    assert warm == fresh, "warm read after a glued append must match a fresh replay"
+    assert warm == fresh, "warm read after an append onto the torn tail must match a fresh replay"
     breakdown = ua.usage_breakdown(data_root)
     assert breakdown == _fresh_result(data_root, ua.usage_breakdown, data_root)
 

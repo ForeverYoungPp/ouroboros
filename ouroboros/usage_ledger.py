@@ -397,10 +397,11 @@ def _ledger_resume_state(
             terminated = False
         if not terminated:
             # A crash-torn final line that is still valid JSON parses in the full
-            # read, but its end is NOT a row boundary: a later append glues onto
-            # the unterminated line, so an incremental resume from this offset
-            # would accept the glued-on row while a fresh replay quarantines the
-            # whole glued line. Refuse to resume until the tail is repaired.
+            # read, but its end is NOT a row boundary: an append landing directly
+            # onto it welds rows into one unparseable line (the #138 guard in
+            # _append_rows_locked repairs the boundary before writing, but reads
+            # before any repair — or after a foreign blind append — must not
+            # resume from a mid-line offset). Refuse until the tail is row-aligned.
             return LedgerResumeState(-2, -2, stat.st_size, -1, len(records), states)
     return LedgerResumeState(
         stat.st_ino, stat.st_dev, stat.st_size, stat.st_mtime_ns, len(records), states
