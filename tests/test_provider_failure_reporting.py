@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
-from ouroboros.loop import _provider_failure_hint
+from ouroboros.loop_transport import provider_failure_hint as _provider_failure_hint
 from ouroboros.loop_llm_call import call_llm_with_retry, classify_llm_exception
 from ouroboros.usage_accounting import PhysicalAttemptContext, UsageAccountingError
 

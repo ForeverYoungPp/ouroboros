@@ -49,6 +49,7 @@ from ouroboros.usage_accounting import (
     last_physical_attempt_capture,
     usage_scope,
 )
+from ouroboros.transport_custody import is_loopback_base_url
 from ouroboros.utils import in_worker_process, sanitize_tool_result_for_log
 
 log = logging.getLogger(__name__)
@@ -273,6 +274,7 @@ def _attempt_request(
         candidate_context_size_bytes=len(context),
         candidate_measurement_kind="canonical_json_v1",
         physical_context=current_physical_attempt_context(),
+        route_is_loopback=is_loopback_base_url(target.get("base_url")),
     )
 
 
@@ -689,8 +691,8 @@ class LLMClient:
     _SUPPORTED_PARAMS_CACHE: Dict[str, set] = {}
     _SUPPORTED_PARAMS_FETCHED: bool = False
     # Did the one-shot /models fetch actually reach OpenRouter (HTTP 200 + parse)?
-    # Distinguishes a provider OUTAGE from a route with no metadata, so Capability
-    # Evidence can mark STATUS_FAILED (transient) vs STATUS_UNPROBEABLE (v6.33.0 P4).
+    # Splits provider OUTAGE from a route with no metadata, so Capability Evidence
+    # can mark STATUS_FAILED (transient) vs STATUS_UNPROBEABLE (v6.33.0 P4).
     _CAPABILITIES_FETCH_OK: bool = False
     # OpenRouter-reported context window per model id (provider_metadata evidence).
     _CONTEXT_LENGTH_CACHE: Dict[str, int] = {}
@@ -721,10 +723,9 @@ class LLMClient:
         cls._CAPABILITIES_FETCH_OK = False  # set True only on a clean 200 + parse
         try:
             import requests
-            # 5s, not 15s: this fetch is on the synchronous capability-probe path
-            # behind the max-context-mode gate (settings save / max toggle). A slow
-            # probe must fail-closed quickly (-> window unknown -> max blocked with
-            # the owner-ack escape), never hang the save (v6.33.0 WS4 timing budget).
+            # 5s, not 15s: this fetch sits on the synchronous capability-probe path
+            # behind the max-context-mode gate (settings save / max toggle); a slow
+            # probe must fail-closed quickly, never hang the save (v6.33.0 WS4).
             resp = requests.get(
                 "https://openrouter.ai/api/v1/models",
                 timeout=5,
