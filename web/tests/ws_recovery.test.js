@@ -118,14 +118,24 @@ test('decide reloads as unknown when a previously-known SHA disappears or garble
     assert.equal(decide('', 'abc', true), 'reload_unknown');
 });
 
-test('decide keeps when no SHA was ever provable on either side (run-from-source installs)', () => {
-    // Owner-flagged default (netres Q19): source installs serve sha="" forever;
-    // nothing was ever remembered, nothing changed — reconnects must not reload.
+test('decide keeps ONLY on an exact empty-string served SHA with nothing remembered (Q19)', () => {
+    // Owner-selected default under uncertainty (netres Q19), narrowed: the
+    // server explicitly serves sha="" (unversioned /api/state while
+    // current_sha is unset) and no non-empty SHA was ever remembered.
     assert.equal(decide(null, '', true), 'keep');
-    assert.equal(decide(null, undefined, true), 'keep');
     assert.equal(decide('', '', true), 'keep');
-    assert.equal(decide('', '   ', true), 'keep');
-    assert.equal(decide(undefined, null, true), 'keep');
+    assert.equal(decide(undefined, '', true), 'keep');
+});
+
+test('decide reloads as unknown for absent/malformed served values even with nothing remembered', () => {
+    // Only the exact empty string is the unversioned-install fact; a missing
+    // field, parse failure, non-string or whitespace-only value after a
+    // previous connection cannot prove the page current.
+    assert.equal(decide(null, undefined, true), 'reload_unknown');
+    assert.equal(decide(null, null, true), 'reload_unknown');
+    assert.equal(decide('', '   ', true), 'reload_unknown');
+    assert.equal(decide(undefined, null, true), 'reload_unknown');
+    assert.equal(decide(null, 12345, true), 'reload_unknown');
 });
 
 // ---------------------------------------------------------------------------
@@ -325,10 +335,18 @@ test('the fuse fires at most once per disconnect episode and resets on reconnect
         await settle();
         assert.equal(env.replaced.length, 1, 'a same-SHA reconnect must not reload');
 
-        // Episode 2 after a fresh disconnect: the fuse is armed again.
+        // Episode 2 after a fresh disconnect: the fuse is armed again AND the
+        // healthy counter restarted from zero — the episode must consume a
+        // full run of healthy probes before its own fuse (pins the onopen
+        // counter reset).
+        const episode2Base = env.fetchCalls();
         ws.ws = null;
         ws._scheduleUiRecovery('socket-disconnect', 0);
         await waitFor(() => env.replaced.length === 2, 'second-episode fuse');
+        assert.ok(
+            env.fetchCalls() - episode2Base >= RECOVERY_HEALTHY_PROBE_LIMIT,
+            'episode 2 fired its fuse without a full run of healthy probes',
+        );
     } finally {
         await teardown(ws);
     }
@@ -525,6 +543,159 @@ test('keep-recovery preserves the outbound queue and the reconnect flush deliver
         assert.deepEqual(outbound[0], ['queued', result.clientMessageId]);
         assert.deepEqual(outbound[1], ['sent', result.clientMessageId, true]);
     } finally {
+        await teardown(ws);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Disconnect-episode generations: a probe belongs to the episode it was armed
+// in; a reconnect ends the episode and stale resolutions are discarded.
+// ---------------------------------------------------------------------------
+
+test('a probe hung across reconnect + second disconnect neither disarms the new episode nor acts stale', async () => {
+    const env = installEnv([]);
+    const releases = [];
+    env.setFetch(() => new Promise((resolve) => { releases.push(resolve); }));
+    const ws = new WS('ws://unused');
+    try {
+        ws._wasConnected = true;
+        ws._lastSha = 'abc';
+
+        // Episode 1: probe A dispatches and hangs.
+        ws._scheduleUiRecovery('socket-disconnect', 0);
+        await waitFor(() => env.fetchCalls() === 1, 'probe A dispatched');
+
+        // Reconnect while A is still in flight (its post-open refresh fetch
+        // also hangs — call 2).
+        ws.connect();
+        const sock = FakeSocket.instances.at(-1);
+        sock.readyState = FakeSocket.OPEN;
+        sock.onopen();
+        await settle();
+
+        // Second disconnect: the NEW episode must be able to arm its own
+        // probe (with a global in-flight flag it would stay disarmed forever
+        // while A hangs).
+        ws.ws = null;
+        ws._scheduleUiRecovery('socket-disconnect', 0);
+        await waitFor(() => env.fetchCalls() === 3, 'new episode armed its own probe');
+
+        // Late resolution of stale probe A: a changed SHA that would reload
+        // were the generation guard missing, with the healthy counter one
+        // short of the fuse so a stale healthy count would fire it.
+        ws._recoveryHealthyProbes = RECOVERY_HEALTHY_PROBE_LIMIT - 1;
+        releases[0]({ ok: true, json: async () => ({ sha: 'zzz' }) });
+        await settle(6);
+        assert.equal(env.replaced.length, 0, 'a stale probe must not reload or fire the fuse');
+        assert.equal(ws._recoveryHealthyProbes, RECOVERY_HEALTHY_PROBE_LIMIT - 1,
+            'a stale probe must not touch the new episode\'s counters');
+        assert.equal(ws._uiRecoveryProbeInFlight, true,
+            'a stale probe must not clear the newer episode\'s in-flight flag');
+
+        // The stale resolution must not have re-armed a second chain either.
+        ws._scheduleUiRecovery('socket-disconnect', 0);
+        await settle(4);
+        assert.equal(env.fetchCalls(), 3, 'no extra probe after the stale resolution');
+
+        // The live probe B still owns the episode: releasing it healthy
+        // same-SHA reaches the fuse threshold set above.
+        releases[2]({ ok: true, json: async () => ({ sha: 'abc' }) });
+        await waitFor(() => env.replaced.length === 1, 'live probe reaches the fuse');
+        assert.match(env.replaced[0], /_ouro_reason=socket-disconnect/);
+    } finally {
+        releases.forEach((release) => release({ ok: false, json: async () => ({}) }));
+        await teardown(ws);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Captive-portal probe responses: 200 without a parseable object body is a
+// FAILED probe, never health.
+// ---------------------------------------------------------------------------
+
+test('a 200 non-JSON probe body counts as a failed probe: reset and re-arm, no reload', async () => {
+    // A captive portal / interposed proxy answers 200 HTML for a remote
+    // browser: with a remembered SHA the old code reloaded straight into the
+    // portal, destroying queued outbound messages.
+    const env = installEnv([
+        { body: { sha: 'abc' } },
+        { body: { sha: 'abc' } },
+        { badJson: true },
+        { body: { sha: 'abc' } },
+    ]);
+    const ws = new WS('ws://unused');
+    try {
+        ws._wasConnected = true;
+        ws._lastSha = 'abc';
+        ws._scheduleUiRecovery('socket-disconnect', 0);
+        await waitFor(() => env.replaced.length === 1, 'fuse reload after the portal reset');
+        // Two healthy, the portal response (failed → counter reset), then a
+        // fresh full run of healthy probes before the fuse. Had the portal
+        // response counted as healthy, the reload would have come earlier and
+        // with a sha-unknown reason.
+        assert.equal(env.fetchCalls(), 3 + RECOVERY_HEALTHY_PROBE_LIMIT);
+        assert.match(env.replaced[0], /_ouro_reason=socket-disconnect/,
+            'the only reload is the runtime fuse, never a portal-driven SHA decision');
+    } finally {
+        await teardown(ws);
+    }
+});
+
+test('a 200 probe whose JSON body is not an object is equally a failed probe', async () => {
+    const env = installEnv([]);
+    env.setFetch(async () => ({ ok: true, json: async () => 'signin required' }));
+    const ws = new WS('ws://unused');
+    try {
+        ws._wasConnected = true;
+        ws._lastSha = 'abc';
+        ws._scheduleUiRecovery('socket-disconnect', 0);
+        await waitFor(() => env.fetchCalls() >= RECOVERY_HEALTHY_PROBE_LIMIT + 2,
+            'probe chain keeps re-arming');
+        assert.equal(env.replaced.length, 0, 'non-object bodies must never reload');
+        assert.equal(ws._recoveryHealthyProbes, 0, 'failed probes keep the counter at zero');
+    } finally {
+        await teardown(ws);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Post-open refresh socket scoping: a stale fetch must not overwrite _lastSha
+// or reload after the connection cycled (mirror of the probe's OPEN bail).
+// ---------------------------------------------------------------------------
+
+test('a post-open refresh resolving after the connection cycled neither stores nor reloads', async () => {
+    const env = installEnv([]);
+    const releases = [];
+    env.setFetch(() => new Promise((resolve) => { releases.push(resolve); }));
+    const ws = new WS('ws://unused');
+    try {
+        // First-open refresh dispatches against socket 1 and hangs.
+        const socket1 = { readyState: FakeSocket.OPEN };
+        ws.ws = socket1;
+        ws._refreshStateAfterOpen(false);
+        await waitFor(() => env.fetchCalls() === 1, 'refresh dispatched');
+
+        // The connection cycles: a newer socket owns reconciliation now.
+        ws.ws = { readyState: FakeSocket.OPEN };
+        releases[0]({ ok: true, json: async () => ({ sha: 'stale' }) });
+        await settle();
+        assert.equal(ws._lastSha, null, 'a stale refresh must not adopt the served SHA');
+        assert.equal(env.replaced.length, 0);
+
+        // Same for a reconnect refresh that would otherwise reload.
+        ws._wasConnected = true;
+        ws._lastSha = 'abc';
+        const socket3 = ws.ws;
+        ws._refreshStateAfterOpen(true);
+        await waitFor(() => env.fetchCalls() === 2, 'reconnect refresh dispatched');
+        assert.equal(ws.ws, socket3);
+        ws.ws = { readyState: FakeSocket.OPEN };
+        releases[1]({ ok: true, json: async () => ({ sha: 'zzz' }) });
+        await settle();
+        assert.equal(env.replaced.length, 0, 'a stale refresh must not reload the page');
+        assert.equal(ws._lastSha, 'abc');
+    } finally {
+        releases.forEach((release) => release({ ok: false, json: async () => ({}) }));
         await teardown(ws);
     }
 });

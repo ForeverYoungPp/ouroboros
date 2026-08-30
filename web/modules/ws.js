@@ -14,9 +14,13 @@ export const RECOVERY_HEALTHY_PROBE_LIMIT = 4;
  * After a connection existed, an equal SHA keeps the page; a different SHA
  * means the server now serves other assets (reload); a previously-known SHA
  * that disappears or garbles means the page can no longer be proven current
- * (reload). When no non-empty SHA was ever remembered AND the server serves
- * none either — run-from-source installs never expose one — nothing was ever
- * provable and nothing changed: keep (owner-flagged default, netres Q19).
+ * (reload). One narrow exception (owner-selected default under uncertainty,
+ * netres Q19): a served SHA that is EXACTLY the empty string — the
+ * unversioned /api/state fact the server actually sends (sha stays "" while
+ * current_sha is unset) — keeps the page when no non-empty SHA was ever
+ * remembered, accepting possibly-stale assets as the disclosed tradeoff.
+ * Non-string, whitespace-only, missing-field and parse-failure values after
+ * a previous connection are NOT that fact and reload as unknown.
  *
  * @param {*} prevSha last remembered served SHA (may be null/empty)
  * @param {*} servedSha SHA reported by /api/state (may be absent/malformed)
@@ -24,10 +28,10 @@ export const RECOVERY_HEALTHY_PROBE_LIMIT = 4;
  * @returns {'keep'|'reload_changed'|'reload_unknown'}
  */
 export function decide(prevSha, servedSha, previouslyConnected) {
-    const served = typeof servedSha === 'string' ? servedSha.trim() : '';
     const prev = typeof prevSha === 'string' ? prevSha.trim() : '';
     if (!previouslyConnected) return 'keep';
-    if (!prev && !served) return 'keep';
+    if (servedSha === '' && !prev) return 'keep';
+    const served = typeof servedSha === 'string' ? servedSha.trim() : '';
     if (!served || !prev) return 'reload_unknown';
     return prev === served ? 'keep' : 'reload_changed';
 }
@@ -45,6 +49,10 @@ export class WS {
         this._reconnectTimer = null;
         this._uiRecoveryTimer = null;
         this._uiRecoveryProbeInFlight = false;
+        // Disconnect-episode generation: bumped on every successful open so a
+        // probe armed during an earlier disconnect episode can recognize that
+        // its late resolution belongs to a dead episode and discard itself.
+        this._recoveryEpisode = 0;
         this._watchdogTimer = null;
         this._recoveryHealthyProbes = 0;
         this._recoveryReloadFired = false;
@@ -115,8 +123,13 @@ export class WS {
         // toward the healthy fuse at once and could force a reload exactly
         // when connectivity returns, destroying queued outbound messages.
         if (this._uiRecoveryTimer || this._uiRecoveryProbeInFlight) return;
+        // Scope the probe to THIS disconnect episode: a probe that hangs across
+        // a reconnect and a second disconnect must neither mutate the new
+        // episode's decision/fuse nor clear the new episode's in-flight flag.
+        const episode = this._recoveryEpisode;
         this._uiRecoveryTimer = setTimeout(async () => {
             this._uiRecoveryTimer = null;
+            if (this._recoveryEpisode !== episode) return;
             this._uiRecoveryProbeInFlight = true;
             let rearm = false;
             try {
@@ -125,13 +138,25 @@ export class WS {
                 try {
                     const resp = await apiFetch('/api/state', { cache: 'no-store' });
                     if (resp.ok) {
-                        healthy = true;
+                        // Healthy requires an OK status AND a parseable object
+                        // body: a captive portal / interposed proxy answering
+                        // 200 HTML must count as a FAILED probe, or a
+                        // remembered SHA would reload straight into the portal
+                        // and destroy queued outbound messages.
                         try {
                             const body = await resp.json();
-                            servedSha = body ? body.sha : undefined;
+                            if (body && typeof body === 'object') {
+                                healthy = true;
+                                servedSha = body.sha;
+                            }
                         } catch {}
                     }
                 } catch {}
+                if (this._recoveryEpisode !== episode) {
+                    // Stale probe from a previous disconnect episode: discard
+                    // the result entirely (no decision, no fuse, no re-arm).
+                    return;
+                }
                 if (this.ws && this.ws.readyState === WebSocket.OPEN) {
                     // The reconnect won the race while the probe was in flight;
                     // the post-open refresh owns the SHA decision now.
@@ -160,8 +185,12 @@ export class WS {
             } finally {
                 // Cleared before the re-arm below so the next arm attempt is
                 // not self-blocked; cleared on every exit so a bail or reload
-                // never leaves recovery permanently disarmed.
-                this._uiRecoveryProbeInFlight = false;
+                // never leaves recovery permanently disarmed. A STALE probe
+                // must not clear the flag: a newer episode may have armed its
+                // own probe, whose in-flight marker this one does not own.
+                if (this._recoveryEpisode === episode) {
+                    this._uiRecoveryProbeInFlight = false;
+                }
             }
             if (rearm) {
                 this._scheduleUiRecovery(reason, Math.min(Math.round(delay * 1.5), 30000));
@@ -192,12 +221,18 @@ export class WS {
     }
 
     _refreshStateAfterOpen(previouslyConnected) {
+        // Capture the socket this refresh belongs to: if the connection cycles
+        // while the fetch is in flight, the NEWER open's refresh owns the SHA
+        // decision — a stale response must not overwrite _lastSha or reload
+        // (mirror of the recovery probe's OPEN bail).
+        const socket = this.ws;
         apiFetch('/api/state', { cache: 'no-store' }).then(async (resp) => {
             if (!resp.ok) return;
             let servedSha;
             try {
                 servedSha = (await resp.json())?.sha;
             } catch {}
+            if (this.ws !== socket) return;
             const decision = this._applyShaDecision(servedSha, previouslyConnected, true);
             if (decision !== 'keep') this._reloadForShaDecision(decision);
         }).catch(() => {});
@@ -249,6 +284,11 @@ export class WS {
             this._lastMessageAt = Date.now();
             this._clearReconnectTimer();
             this._clearUiRecoveryTimer();
+            // End the disconnect episode: any probe still in flight is now
+            // stale (it captured the old generation and will discard itself),
+            // and the next disconnect must be able to arm its own probe.
+            this._recoveryEpisode += 1;
+            this._uiRecoveryProbeInFlight = false;
             this._recoveryHealthyProbes = 0;
             this._recoveryReloadFired = false;
             this.reconnectDelay = 1000;
