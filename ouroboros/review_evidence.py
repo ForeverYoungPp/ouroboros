@@ -883,6 +883,7 @@ def build_task_acceptance_evidence(
             prov["mutation_attribution"] = "host_attested"
         from ouroboros.delegate_evidence import (
             acceptance_capability_deltas,
+            acceptance_patch_dispositions,
             acceptance_substrate_facts,
         )
 
@@ -892,6 +893,12 @@ def build_task_acceptance_evidence(
         if substrate_facts := acceptance_substrate_facts(ctx, task_id):
             ev["substrate_execution"] = redact_projection(substrate_facts).value
             prov["substrate_execution"] = "host_attested"
+        # D-trace (owner 4=A): the parent's patch apply/reject attestations —
+        # visibility for the panel, never a gate on apply. Absence = no
+        # disposition recorded, not "reviewed clean".
+        if patch_dispositions := acceptance_patch_dispositions(drive_root, task_id):
+            ev["delegated_patch_dispositions"] = redact_projection(patch_dispositions).value
+            prov["delegated_patch_dispositions"] = "host_attested"
     repo_diff = collect_turn_diff(ctx, include_recent_commit=include_recent_commit)
     diff_meta: Dict[str, Any] = {}
     if "OMISSION NOTE: truncated at " in str(repo_diff or "") or "... (truncated from " in str(repo_diff or ""):

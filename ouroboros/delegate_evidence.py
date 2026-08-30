@@ -301,6 +301,65 @@ def acceptance_substrate_facts(ctx: Any, task_id: str) -> Dict[str, Any]:
 
 
 _ACCEPT_DELTA_CHILD_CAP = 20  # reduced-children rows in the finalizer aggregate
+_ACCEPT_PATCH_DISPOSITION_CAP = 20  # disposition rows in the acceptance section
+
+
+def acceptance_patch_dispositions(drive_root: Any, task_id: str) -> Dict[str, Any]:
+    """Typed aggregate of this parent's patch apply/reject decisions (D-trace).
+
+    ``integrate_delegated_patch`` applied a child's diff on FIVE mechanical
+    manifest fields with zero review facts anywhere on the path; the owner
+    decision (4=A) is to ATTEST the apply rather than invent a review: every
+    verdict now also lands as a ``subagent_patch_verdict`` custody row, and
+    this section projects those rows host-attested into the acceptance packet
+    (the ``capability_deltas`` shape — bounded, first-class, never squeezed
+    through the 4KB artifact-preview cliff). ABSENCE of the section means "no
+    disposition recorded", never "reviewed clean"; an unreadable log is the
+    typed ``evidence_read_failed`` marker, never an empty-therefore-clean
+    section (the ``task_execution_evidence`` rule, GR6-4).
+    """
+    from ouroboros import delegate_custody as custody
+    from ouroboros.utils import truncate_review_artifact
+
+    tid = str(task_id or "")
+    out: Dict[str, Any] = {}
+    log_path = custody.event_log_path(drive_root)
+    try:
+        if log_path.exists():
+            with log_path.open("rb"):
+                pass
+        else:
+            return out
+    except OSError:
+        return {"evidence_read_failed": True}
+    rows: List[Dict[str, Any]] = []
+    for row in custody._iter_rows(log_path):
+        if str(row.get("type") or "") != "delegate_run_patch_verdict":
+            continue
+        if str(row.get("task_id") or "") != tid:
+            continue
+        rows.append({
+            "child": str(row.get("child_task_id") or ""),
+            "pipeline": str(row.get("pipeline") or ""),
+            "disposition": str(row.get("disposition") or ""),
+            "applied": bool(row.get("applied")),
+            "reason": truncate_review_artifact(str(row.get("reason") or ""), limit=600),
+            "patch_sha256": str(row.get("patch_sha256") or ""),
+            **({"verdict_artifact_write_failed": True}
+               if row.get("verdict_artifact_write_failed") else {}),
+        })
+    if not rows:
+        return out
+    out["total"] = len(rows)
+    if len(rows) > _ACCEPT_PATCH_DISPOSITION_CAP:
+        out["omitted"] = len(rows) - _ACCEPT_PATCH_DISPOSITION_CAP
+        rows = rows[-_ACCEPT_PATCH_DISPOSITION_CAP:]
+    out["rows"] = rows
+    if any(r["applied"] and r.get("pipeline") == "delegated" for r in rows):
+        # The honest headline the panel weighs: a delegated patch landed with
+        # no host-side review of its bytes (there is none on this path).
+        out["unreviewed_delegated_apply"] = True
+    return out
 
 
 def acceptance_capability_deltas(drive_root: Any, task_id: str, root_task_id: str) -> Dict[str, Any]:

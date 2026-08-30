@@ -160,11 +160,38 @@ def _write_verdict(
         "diffstat": str((manifest or {}).get("diffstat") or ""),
     }
     path = art_dir / f"subagent_patch_verdict_{child_task_id}.json"
+    artifact_write_failed = False
     try:
         atomic_write_json(path, verdict, trailing_newline=True)
     except Exception:
-        return ""
-    return str(path)
+        artifact_write_failed = True
+    # D-trace: the apply/reject decision also lands as a typed row in the
+    # custody event log, so the acceptance packet builds the disposition
+    # section from ONE replayable store for both patch pipelines (the
+    # delegated pipeline's run-keyed PATCH_DISPOSED row rides beside it; the
+    # scanner splits by `tool`, so nothing double-counts). A failed artifact
+    # write is disclosed on the row rather than dying as a silent "".
+    try:
+        from ouroboros import delegate_custody as custody
+
+        custody.emit(getattr(ctx, "drive_root", "."), "delegate_run_patch_verdict", {
+            "run_id": "",
+            "task_id": parent_task_id,
+            "child_task_id": child_task_id,
+            # The delegated pipeline mints its verdict subject as run_<rid>
+            # (every _integrate_delegated_patch call site); classifying at
+            # the ONE writer keeps that convention local instead of leaking
+            # prefix-matching into readers.
+            "pipeline": "delegated" if child_task_id.startswith("run_") else "subagent",
+            "disposition": outcome,
+            "applied": bool(applied),
+            "reason": str(reason or "")[:600],
+            "patch_sha256": str(verdict.get("patch_sha256") or ""),
+            "verdict_artifact_write_failed": artifact_write_failed,
+        })
+    except Exception:
+        log.debug("subagent patch verdict custody row failed", exc_info=True)
+    return "" if artifact_write_failed else str(path)
 
 
 def _child_write_root(child_result: Dict[str, Any]) -> str:
