@@ -837,6 +837,49 @@ def kill_processes_referencing(marker: str) -> None:
         force_kill_pid(pid)
 
 
+def tcp_keepalive_socket_options() -> List[tuple]:
+    """Cross-platform TCP keepalive options for long-lived remote sockets.
+
+    A NAT/VPN gateway that silently drops an idle connection's mapping leaves
+    the local socket half-open: without keepalive probes the process only
+    learns at the (deliberately long) transport read timeout. Kernel probes
+    detect the dead peer within minutes instead.
+
+    Every platform gets ``SO_KEEPALIVE``; the probe-tuning constants are set
+    only where the platform exposes them (Linux spells the idle threshold
+    ``TCP_KEEPIDLE``, Darwin spells it ``TCP_KEEPALIVE``), each behind a
+    ``hasattr`` guard so an older interpreter still gets the safe minimum.
+    """
+    import socket
+
+    from ouroboros.config import (
+        TCP_KEEPALIVE_IDLE_SEC,
+        TCP_KEEPALIVE_INTERVAL_SEC,
+        TCP_KEEPALIVE_PROBE_COUNT,
+    )
+
+    options: List[tuple] = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    if IS_LINUX:
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            options.append(
+                (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE_SEC)
+            )
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            options.append(
+                (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL_SEC)
+            )
+        if hasattr(socket, "TCP_KEEPCNT"):
+            options.append(
+                (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_PROBE_COUNT)
+            )
+    elif IS_MACOS:
+        if hasattr(socket, "TCP_KEEPALIVE"):
+            options.append(
+                (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, TCP_KEEPALIVE_IDLE_SEC)
+            )
+    return options
+
+
 def kill_process_on_port(port: int) -> None:
     """Kill any process listening on the given TCP port."""
     try:

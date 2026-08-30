@@ -80,3 +80,66 @@ def test_requests_read_timeout_connection_error_does_not_prove_pre_dispatch(data
         urllib3.exceptions.MaxRetryError(None, "/messages", reason=reason)
     )
     assert not is_pre_dispatch_transport_failure(wrapped)
+
+
+def test_requests_proxy_error_with_nested_connect_evidence_proves_pre_dispatch(data_root):
+    """The standard unreachable-proxy chain (native Anthropic behind a dead
+    proxy): requests.exceptions.ProxyError -> MaxRetryError -> urllib3
+    ProxyError -> NewConnectionError is typed pre-dispatch evidence."""
+    import requests
+    import urllib3
+    from ouroboros.transport_custody import is_pre_dispatch_transport_failure
+
+    nested = urllib3.exceptions.NewConnectionError(
+        None, "Failed to establish a new connection: [Errno 111] Connection refused"
+    )
+    proxy = urllib3.exceptions.ProxyError("Cannot connect to proxy.", nested)
+    wrapped = requests.exceptions.ProxyError(
+        urllib3.exceptions.MaxRetryError(None, "/messages", reason=proxy)
+    )
+    assert is_pre_dispatch_transport_failure(wrapped)
+
+
+def test_requests_proxy_error_with_connect_timeout_evidence_proves_pre_dispatch(data_root):
+    import requests
+    import urllib3
+    from ouroboros.transport_custody import is_pre_dispatch_transport_failure
+
+    nested = urllib3.exceptions.ConnectTimeoutError("timed out connecting to proxy")
+    proxy = urllib3.exceptions.ProxyError("Cannot connect to proxy.", nested)
+    wrapped = requests.exceptions.ProxyError(
+        urllib3.exceptions.MaxRetryError(None, "/messages", reason=proxy)
+    )
+    assert is_pre_dispatch_transport_failure(wrapped)
+
+
+def test_requests_proxy_error_without_connect_evidence_stays_untyped(data_root):
+    """A proxy failure that is NOT connect-time (a proxy HTTP response, a
+    post-dispatch read failure) must never release custody."""
+    import requests
+    import urllib3
+    from ouroboros.transport_custody import is_pre_dispatch_transport_failure
+
+    proxy = urllib3.exceptions.ProxyError(
+        "Your proxy appears to only use HTTP and not HTTPS",
+        urllib3.exceptions.HTTPError("bad proxy response"),
+    )
+    wrapped = requests.exceptions.ProxyError(
+        urllib3.exceptions.MaxRetryError(None, "/messages", reason=proxy)
+    )
+    assert not is_pre_dispatch_transport_failure(wrapped)
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("http://localhost:11434/v1", True),
+    ("http://127.0.0.1:1234/v1", True),
+    ("http://[::1]:8000/v1", True),
+    ("https://openrouter.ai/api/v1", False),
+    ("https://api.anthropic.com/v1", False),
+    ("", False),
+    ("not a url", False),
+])
+def test_is_loopback_base_url(url, expected):
+    from ouroboros.transport_custody import is_loopback_base_url
+
+    assert is_loopback_base_url(url) is expected

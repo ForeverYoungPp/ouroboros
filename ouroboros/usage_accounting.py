@@ -235,6 +235,9 @@ class AttemptRequest:
     candidate_context_size_bytes: Optional[int] = None
     candidate_measurement_kind: Literal["canonical_json_v1", "opaque"] = "opaque"
     physical_context: Optional[PhysicalAttemptContext] = None
+    # Route-locality fact (additive): the base_url host is localhost/127.0.0.1/::1
+    # (loopback OpenAI-compatible installs — Ollama / LM Studio / vLLM).
+    route_is_loopback: bool = False
 @dataclass(frozen=True)
 class AttemptReservation:
     attempt_id: str
@@ -263,6 +266,7 @@ class PhysicalAttemptCapture:
     provider_code: str = ""
     provider_error_type: str = ""
     provider_error: str = ""
+    route_is_loopback: bool = False  # see AttemptRequest.route_is_loopback
 
 
 @contextlib.contextmanager
@@ -481,10 +485,9 @@ def usage_breakdown(
             "by_category": by_category,
             "by_task": by_task,
             "by_root": by_root,
-            # Execution-axis filter (v6.91): the delegated (subscription-harness) rows
-            # only — a VIEW over the same rows for "where did the money go" readers,
-            # never a third monetary sum or authority. Disclosed-free sessions settle
-            # at $0 here; undisclosed spend stays in `unknown`.
+            # Execution-axis filter (v6.91): delegated (subscription-harness) rows only —
+            # a VIEW over the same rows for "where did the money go" readers, never a third
+            # monetary sum or authority. Disclosed-free settles $0; undisclosed stays `unknown`.
             "delegated": _with_integrity(
                 _breakdown_bucket([row for row in rows if str(row.get("kind") or "") == "subscription_session"]),
                 integrity_degraded,
@@ -539,10 +542,9 @@ def _reservation_cost(request: AttemptRequest) -> Optional[float]:
 
         prompt_cache_ttl = str(request.prompt_cache_ttl or "").strip().lower()
         if prompt_cache_ttl not in PROMPT_CACHE_TTL_SCALE:
-            # An inspectable marker-free candidate writes no cache at all. Keep
-            # the historical conservative base-tier reservation without
-            # misreporting a TTL on the eventual physical settlement. Opaque
-            # construction sites still fall back to the owner setting.
+            # An inspectable marker-free candidate writes no cache at all. Keep the
+            # historical conservative base-tier reservation without misreporting a TTL on
+            # the physical settlement; opaque sites still fall back to the owner setting.
             prompt_cache_ttl = (
                 "default"
                 if request.candidate_measurement_kind == "canonical_json_v1"
@@ -685,8 +687,7 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
             root_task_id=scope.root_task_id,
         )
     ensure_legacy_imported(root)
-    # IMPORTANT: live catalog I/O belongs before ``with _locked(root)`` below.
-    # The lock protects only the atomic budget read/check/append transaction.
+    # IMPORTANT: live catalog I/O belongs before ``with _locked(root)`` below — the lock protects only the atomic budget read/check/append transaction.
     bound = _reservation_cost(request)
     pricing_known = bound is not None
     attempt_id = uuid.uuid4().hex
@@ -824,9 +825,8 @@ def _append_single_settled_row(
         existing = _final_rows(records).get(attempt_id)
         if existing is not None:
             def identity_value(source: Dict[str, Any], key: str) -> Any:
-                # Rows written before physical_attempt_v1 omitted these optional
-                # keys. Missing and explicit empty are the same legacy identity;
-                # a non-empty wave/slot still conflicts with either one.
+                # Rows written before physical_attempt_v1 omitted these optional keys:
+                # missing == explicit empty; a non-empty wave/slot conflicts with either.
                 return str(source.get(key) or "") if key in REVIEW_ATTRIBUTION_KEYS else source.get(key)
 
             if any(identity_value(existing, key) != identity_value(row, key) for key in comparable):
@@ -1199,6 +1199,7 @@ def _record_attempt_capture(
         provider_code=code,
         provider_error_type=error_type,
         provider_error=error,
+        route_is_loopback=bool(request.route_is_loopback),
     )
     _LAST_PHYSICAL_ATTEMPT.set(capture)
     if exc is not None:
@@ -1384,8 +1385,7 @@ def _legacy_snapshot(root: pathlib.Path) -> Tuple[list[Dict[str, Any]], Dict[str
         except OSError as exc:
             raise UsageAccountingError(f"cannot snapshot legacy usage source {path}: {exc}") from exc
     hashes = {name: hashlib.sha256(snapshots[name]).hexdigest() if name in snapshots else "" for name in sources}
-    # Settings are owner-secret state: prove non-mutation by hash, but never copy
-    # their contents into the usage archive.
+    # Settings are owner-secret state: prove non-mutation by hash, never copy contents.
     try:
         hashes["settings.json"] = hashlib.sha256(settings_path.read_bytes()).hexdigest()
     except FileNotFoundError:

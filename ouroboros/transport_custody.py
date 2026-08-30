@@ -4,8 +4,30 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlsplit
 
 log = logging.getLogger(__name__)
+
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def is_loopback_base_url(base_url: Any) -> bool:
+    """True when the configured route targets this very host.
+
+    A loopback OPENAI_COMPATIBLE_BASE_URL (the documented Ollama / LM Studio /
+    vLLM setups) is a LOCAL server even though its provider name is not
+    "local": its connect failure means that server is down, not that the
+    network egress is — so such routes must never classify as a remote
+    transport outage worth waiting out.
+    """
+    text = str(base_url or "").strip()
+    if not text:
+        return False
+    try:
+        host = urlsplit(text).hostname or ""
+    except ValueError:
+        return False
+    return host.lower() in _LOOPBACK_HOSTS
 
 
 def is_pre_dispatch_transport_failure(exc: BaseException) -> bool:
@@ -13,7 +35,12 @@ def is_pre_dispatch_transport_failure(exc: BaseException) -> bool:
     try:
         import httpx
 
-        safe_types = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+        # ProxyError is tunnel establishment (CONNECT/SOCKS) failing before any
+        # provider request exists — pre-dispatch by construction, like connects.
+        safe_types = (
+            httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
+            httpx.ProxyError,
+        )
     except Exception:  # pragma: no cover - httpx ships with the runtime
         return False
     seen: set[int] = set()
@@ -35,11 +62,24 @@ def is_pre_dispatch_transport_failure(exc: BaseException) -> bool:
             return True
         if not isinstance(exc, requests.exceptions.ConnectionError):
             return False
+        # requests.exceptions.ProxyError subclasses ConnectionError; both the
+        # direct and the proxied connect failure arrive as MaxRetryError args.
         for value in getattr(exc, "args", ()):
             if isinstance(value, urllib3.exceptions.MaxRetryError):
                 reason = getattr(value, "reason", None)
                 if isinstance(reason, urllib3.exceptions.ConnectTimeoutError):
                     return True
+                if isinstance(reason, urllib3.exceptions.ProxyError):
+                    # An unreachable proxy is a pre-dispatch fact only with
+                    # nested connect-time evidence (NewConnectionError is a
+                    # ConnectTimeoutError subclass); a proxy HTTP response or
+                    # a post-dispatch read failure never matches.
+                    nested = getattr(reason, "original_error", None)
+                    if isinstance(nested, (
+                        urllib3.exceptions.ConnectTimeoutError,
+                        urllib3.exceptions.NewConnectionError,
+                    )):
+                        return True
     except Exception:  # pragma: no cover - optional transport dependency
         pass
     return False

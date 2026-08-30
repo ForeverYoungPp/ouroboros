@@ -179,6 +179,7 @@ BAND_PATHS = {
     "tests/test_delegated_skill_payload.py": "Sol scope-review fix batch: P1 trust probes (forged index, symlinked git metadata), P2 golden-E2E review close and schema/docs pins joined the existing R1+gate-fix payload suite.",
     "tests/test_evolution_redesign.py": None,
     "tests/test_external_workspace_access.py": "Deliverables custody matrix covers nested roots, executor aliases, Presence ceilings, and direct shell target semantics.",
+    "tests/test_loop_transport_wait.py": "Contract suite for the transport-wait episode: classification, custody, round-level wait, terminals, and the final-review regression pins live together as one coherent surface.",
     "tests/test_managed_review_subject.py": "Lane L-review contract suite: the managed resolution-delta subject (gate/advisory surfaces, M0 fallback), Q25-A admission, Q28-A yield outcomes and enforcement-honest advisory texts grew past 1000 across the adversarial fix round; one subject, one suite.",
     "tests/test_nested_rights_depth.py": "Nested delegation depth authority regression coverage",
     "tests/test_observability_outcomes_v2.py": None,
@@ -220,7 +221,7 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/loop.py": 312847,
+    "ouroboros/loop.py": 312794,
     "tests/test_delegated_subagent_transport.py": 320408,
     "tests/test_devtools_benchmarks.py": 328116,
     "web/modules/chat.js": 224315,

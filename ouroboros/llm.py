@@ -50,6 +50,7 @@ from ouroboros.usage_accounting import (
     last_physical_attempt_capture,
     usage_scope,
 )
+from ouroboros.transport_custody import is_loopback_base_url
 from ouroboros.utils import in_worker_process, sanitize_tool_result_for_log
 
 log = logging.getLogger(__name__)
@@ -274,6 +275,7 @@ def _attempt_request(
         candidate_context_size_bytes=len(context),
         candidate_measurement_kind="canonical_json_v1",
         physical_context=current_physical_attempt_context(),
+        route_is_loopback=is_loopback_base_url(target.get("base_url")),
     )
 
 
@@ -690,8 +692,8 @@ class LLMClient:
     _SUPPORTED_PARAMS_CACHE: Dict[str, set] = {}
     _SUPPORTED_PARAMS_FETCHED: bool = False
     # Did the one-shot /models fetch actually reach OpenRouter (HTTP 200 + parse)?
-    # Distinguishes a provider OUTAGE from a route with no metadata, so Capability
-    # Evidence can mark STATUS_FAILED (transient) vs STATUS_UNPROBEABLE (v6.33.0 P4).
+    # Splits provider OUTAGE from a route with no metadata, so Capability Evidence
+    # can mark STATUS_FAILED (transient) vs STATUS_UNPROBEABLE (v6.33.0 P4).
     _CAPABILITIES_FETCH_OK: bool = False
     # OpenRouter-reported context window per model id (provider_metadata evidence).
     _CONTEXT_LENGTH_CACHE: Dict[str, int] = {}
@@ -722,10 +724,9 @@ class LLMClient:
         cls._CAPABILITIES_FETCH_OK = False  # set True only on a clean 200 + parse
         try:
             import requests
-            # 5s, not 15s: this fetch is on the synchronous capability-probe path
-            # behind the max-context-mode gate (settings save / max toggle). A slow
-            # probe must fail-closed quickly (-> window unknown -> max blocked with
-            # the owner-ack escape), never hang the save (v6.33.0 WS4 timing budget).
+            # 5s, not 15s: this fetch sits on the synchronous capability-probe path
+            # behind the max-context-mode gate (settings save / max toggle); a slow
+            # probe must fail-closed quickly, never hang the save (v6.33.0 WS4).
             resp = requests.get(
                 "https://openrouter.ai/api/v1/models",
                 timeout=5,
@@ -1446,12 +1447,20 @@ class LLMClient:
 
     @staticmethod
     def _new_remote_client(target: Dict[str, Any]):
+        # The keepalive transport carries SDK-equivalent pool limits (an
+        # explicit transport ignores the Client-level limits); on proxy-routed
+        # installs the helper returns None and SDK defaults keep proxy mounts.
         from openai import OpenAI
+
+        from ouroboros.net_transport import keepalive_http_client
 
         kwargs: Dict[str, Any] = {
             "api_key": str(target.get("api_key") or ""),
             "max_retries": 0,
         }
+        http_client = keepalive_http_client()
+        if http_client is not None:
+            kwargs["http_client"] = http_client
         base_url = str(target.get("base_url") or "")
         headers = dict(target.get("default_headers") or {})
         if base_url:
@@ -1517,10 +1526,15 @@ class LLMClient:
         if client is None:
             from openai import AsyncOpenAI
 
+            from ouroboros.net_transport import keepalive_http_client
+
             kwargs: Dict[str, Any] = {
                 "api_key": api_key,
                 "max_retries": 0,
             }
+            http_client = keepalive_http_client(async_client=True)
+            if http_client is not None:
+                kwargs["http_client"] = http_client
             if base_url:
                 kwargs["base_url"] = base_url
             if headers_dict:
@@ -1542,41 +1556,15 @@ class LLMClient:
 
     @classmethod
     def _make_no_proxy_client(cls, target: Dict[str, Any], timeout: Optional[float] = None):
-        import httpx
-        from openai import OpenAI
+        from ouroboros.net_transport import make_no_proxy_client
 
-        http_client = httpx.Client(
-            trust_env=False,
-            mounts={},
-            timeout=cls._no_proxy_timeout(timeout),
-        )
-        oa_client = OpenAI(
-            api_key=str(target.get("api_key") or ""),
-            base_url=str(target.get("base_url") or ""),
-            default_headers=dict(target.get("default_headers") or {}),
-            http_client=http_client,
-            max_retries=0,
-        )
-        return oa_client, http_client
+        return make_no_proxy_client(target, cls._no_proxy_timeout(timeout))
 
     @classmethod
     def _make_no_proxy_async_client(cls, target: Dict[str, Any], timeout: Optional[float] = None):
-        import httpx
-        from openai import AsyncOpenAI
+        from ouroboros.net_transport import make_no_proxy_async_client
 
-        http_client = httpx.AsyncClient(
-            trust_env=False,
-            mounts={},
-            timeout=cls._no_proxy_timeout(timeout),
-        )
-        oa_client = AsyncOpenAI(
-            api_key=str(target.get("api_key") or ""),
-            base_url=str(target.get("base_url") or ""),
-            default_headers=dict(target.get("default_headers") or {}),
-            http_client=http_client,
-            max_retries=0,
-        )
-        return oa_client, http_client
+        return make_no_proxy_async_client(target, cls._no_proxy_timeout(timeout))
 
     @classmethod
     def _copy_messages_with_cache_policy(
@@ -4351,17 +4339,14 @@ def openrouter_web_search_server_tool(
 ) -> Any:
     """Run OpenRouter's provider-owned web_search server tool."""
 
-    from openai import OpenAI
+    from ouroboros.net_transport import web_search_openai_client
 
-    client_kwargs: Dict[str, Any] = dict(
+    client = web_search_openai_client(
         api_key=api_key,
         base_url="https://openrouter.ai/api/v1",
+        timeout=timeout,
         default_headers=dict(OPENROUTER_APP_HEADERS),
-        max_retries=0,
     )
-    if timeout is not None:
-        client_kwargs["timeout"] = float(timeout)
-    client = OpenAI(**client_kwargs)
     payload = dict(
         model=model,
         messages=[{"role": "user", "content": query}],
