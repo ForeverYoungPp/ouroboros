@@ -3750,8 +3750,7 @@ class ToolRegistry:
         if entry is None:
             if ext_tool and callable(ext_tool.get("handler")):
                 return self._dispatch_extension_tool(name, ext_tool, args)
-            return (f"⚠️ Unknown tool: {name}. Available: "
-                    + ', '.join(sorted(n for n, e in self._entries.items() if not e.alias_for)))
+            return f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(n for n, e in self._entries.items() if not e.alias_for))}"
         args, python_resolution, python_block = self._resolve_python_predispatch(
             name, args, _runtime_mode, effective_constraint, resolved_binding,
         )
