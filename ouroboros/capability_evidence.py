@@ -525,8 +525,15 @@ def record_token_density(
     prompt_tokens: Any,
     source: str = "dispatch_usage",
     route_fp: str = "",
+    basis: str = "raw",
 ) -> None:
-    """Persist one timestamped raw witness, best-effort and write-throttled."""
+    """Persist one timestamped raw witness, best-effort and write-throttled.
+
+    ``basis`` names how ``prompt_chars`` measured image blocks — "raw"
+    (base64 bytes, pre-fix rows) vs "bounded_proxy" (the provider-billing
+    proxy the fit estimator measures on). The row carries it so the two
+    bases can never be silently mixed again by a later "unification".
+    """
     fp = str(fingerprint or "").strip()
     route = str(route_fp or "").strip()
     density = _density_of(prompt_chars, prompt_tokens)
@@ -577,6 +584,7 @@ def record_token_density(
                 "observation_seq": observation_seq,
                 "source": str(source or "dispatch_usage"),
                 "route_fp": route,
+                "basis": str(basis or "raw"),
             })
             indexed_pairs = list(enumerate(pairs))
             densest_index, densest = max(

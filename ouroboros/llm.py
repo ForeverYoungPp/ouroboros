@@ -250,6 +250,25 @@ def _attempt_request(
         prompt_chars = len(json.dumps(prompt_payload, ensure_ascii=False, default=str))
     except Exception:
         prompt_chars = len(str(prompt_payload or ""))
+    # Bounded-proxy basis: identical to prompt_chars except image blocks count
+    # at the provider-billing proxy instead of their raw base64 bytes. This is
+    # the basis context_fit's estimator measures on, so the density witness
+    # derived from it calibrates the SAME quantity the fit predicts — the raw
+    # basis poisoned the per-route density for 14 days per witness (a live
+    # image cost hundreds of KB of "chars" that providers bill as ~1.1K
+    # tokens, driving a systematic ~27% context under-prediction).
+    try:
+        messages = prompt_payload.get("messages")
+        if isinstance(messages, list):
+            non_message = {k: v for k, v in prompt_payload.items() if k != "messages"}
+            bounded_chars = (
+                len(json.dumps(non_message, ensure_ascii=False, default=str))
+                + _estimate_message_chars(messages)
+            )
+        else:
+            bounded_chars = prompt_chars
+    except Exception:
+        bounded_chars = prompt_chars
     request_source = source
     if request_source is None:
         bound_scope = current_usage_scope()
@@ -276,6 +295,7 @@ def _attempt_request(
         candidate_measurement_kind="canonical_json_v1",
         physical_context=current_physical_attempt_context(),
         route_is_loopback=is_loopback_base_url(target.get("base_url")),
+        prompt_tokens_bounded_estimate=max(0, bounded_chars // 4),
     )
 
 

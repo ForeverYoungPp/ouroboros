@@ -234,6 +234,13 @@ class AttemptRequest:
     physical_context: Optional[PhysicalAttemptContext] = None
     # Route-locality fact (additive): base_url host is localhost/127.0.0.1/::1 (loopback OpenAI-compatible installs — Ollama / LM Studio / vLLM).
     route_is_loopback: bool = False
+    # Bounded-proxy token estimate (additive, LAST — frozen dataclass): image
+    # blocks measured at the provider-billing proxy (IMAGE_BLOCK_CHAR_EQUIVALENT)
+    # instead of raw base64 bytes. 0 = producer predates the field. The density
+    # observer MUST use this basis; `prompt_tokens_estimate` above deliberately
+    # keeps the raw basis because budget reservation wants the conservative
+    # over-count (owner decision 3=A: the two consumers intentionally split).
+    prompt_tokens_bounded_estimate: int = 0
 @dataclass(frozen=True)
 class AttemptReservation:
     attempt_id: str
@@ -518,6 +525,10 @@ def _reservation_cost(request: AttemptRequest) -> Optional[float]:
         return None
     if str(request.provider or "").lower() == "local":
         return 0.0
+    # Deliberately the RAW estimate (base64-inclusive), NOT the bounded proxy:
+    # for money reservation an over-count on image rounds is the safe
+    # direction, while density calibration needs the bounded basis (owner
+    # decision 3=A). Unifying the two silently lowers image-round reserves.
     prompt_tokens = max(0, int(request.prompt_tokens_estimate or 0))
     # OpenAI-family chars/4 estimates keep the measured 1.10 reservation envelope.
     from ouroboros.provider_models import normalize_model_identity
@@ -1067,7 +1078,18 @@ def _observe_token_density(request: AttemptRequest, usage: Optional[Dict[str, An
         if cache_bearing and provider not in _CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS:
             return
         real = int(normalized.get("prompt_tokens") or normalized.get("input_tokens") or 0)
-        estimate = int(request.prompt_tokens_estimate or 0)
+        # The witness MUST calibrate the basis the fit estimator measures on
+        # (bounded image proxy) — the raw-base64 basis fed a self-consistent
+        # ~27% under-prediction: measure_main_fit multiplied a BOUNDED
+        # estimate by a RAW-basis density. `prompt_tokens_estimate` stays raw
+        # on purpose — `_reservation_cost` reads it and budget reservation
+        # wants the conservative over-count (owner decision 3=A); do NOT
+        # unify the two consumers onto one basis.
+        estimate = int(request.prompt_tokens_bounded_estimate or 0)
+        basis = "bounded_proxy"
+        if estimate <= 0:
+            estimate = int(request.prompt_tokens_estimate or 0)
+            basis = "raw"
         if real <= 0 or estimate <= 0:
             return
         from ouroboros.capability_evidence import record_token_density
@@ -1080,6 +1102,7 @@ def _observe_token_density(request: AttemptRequest, usage: Optional[Dict[str, An
             prompt_tokens=real,
             source="dispatch_usage",
             route_fp=str(request.physical_context.route_fp if request.physical_context else ""),
+            basis=basis,
         )
     except Exception:
         log.debug("token-density observation skipped", exc_info=True)
