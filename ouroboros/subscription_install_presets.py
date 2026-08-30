@@ -347,41 +347,94 @@ def _resolve_surface(seats: Sequence[PresetSeat],
     return rows, None
 
 
-def _slot_rows(resolved: Sequence[Mapping[str, Any]], surface: str) -> List[Dict[str, Any]]:
-    return [
-        {
-            "slot_id": _slot_id(surface, int(row["position"])),
-            "route": {"kind": "agent_session", "target_id": str(row["target_id"])},
-            "effort": str(row["effort"]),
-        }
-        for row in resolved
-    ]
+_REVIEW_SEAT_RECOMMENDATION = (
+    "Review-lane seat minted at onboarding; also selectable for delegated "
+    "child work when its strengths fit."
+)
 
 
-def _reviewer_slots_json(triad: Sequence[Mapping[str, Any]],
-                         scope: Sequence[Mapping[str, Any]],
-                         advisory: Mapping[str, Any]) -> str:
-    payload = {
-        "triad": _slot_rows(triad, SURFACE_TRIAD),
-        "scope": _slot_rows(scope, SURFACE_SCOPE),
-        "advisory": {
-            "enabled": True,
-            "route": {"kind": "agent_session", "target_id": str(advisory["target_id"])},
-            "effort": str(advisory["effort"]),
-        },
+def _reference_reviewer_rows(
+    available: ConfiguredSubagents,
+    triad: Sequence[Mapping[str, Any]],
+    scope: Sequence[Mapping[str, Any]],
+    advisory: Mapping[str, Any],
+) -> tuple[ConfiguredSubagents, str, List[Dict[str, Any]]]:
+    """Compile reviewer slots as ``subagent_id`` REFERENCES into the roster.
+
+    One SSOT from the first boot (owner decision 4=A): a seat whose session
+    route already exists as a roster row references it; otherwise a roster
+    row is minted for it (no ``name`` — the field is retired) and referenced.
+    A per-slot ``effort`` override rides the slot only when it differs from
+    the referenced row's own effort. If the 10-row roster cap leaves no room,
+    the seat falls back to an inline route and says so in diagnostics —
+    honest fallback, never a silent drop.
+    """
+    items = list(available.items)
+    diagnostics: List[Dict[str, Any]] = []
+
+    def _row_for(target_id: str, effort: str) -> tuple[str, str] | None:
+        identity = (ROUTE_KIND_AGENT_SESSION, target_id, "")
+        for row in items:
+            if (row.route.kind, row.route.target_id,
+                    row.route.credential_profile_id) == identity:
+                return row.subagent_id, row.effort
+        if len(items) >= 10:
+            return None
+        used = {row.subagent_id for row in items}
+        harness = target_id.partition("=")[0] or "session"
+        base = f"review-{harness}"
+        row_id, suffix = base, 2
+        while row_id in used:
+            row_id, suffix = f"{base}-{suffix}", suffix + 1
+        items.append(ConfiguredSubagent(
+            subagent_id=row_id,
+            recommended_use=_REVIEW_SEAT_RECOMMENDATION,
+            route=RouteSpec(ROUTE_KIND_AGENT_SESSION, target_id),
+            effort=effort,
+        ))
+        return row_id, effort
+
+    def _slot(surface: str, row: Mapping[str, Any]) -> Dict[str, Any]:
+        target, effort = str(row["target_id"]), str(row["effort"])
+        ref = _row_for(target, effort)
+        slot: Dict[str, Any] = {"slot_id": _slot_id(surface, int(row["position"]))}
+        if ref is None:
+            diagnostics.append({
+                "code": "reviewer_seat_inline_roster_full",
+                "surface": surface, "target_id": target,
+            })
+            slot["route"] = {"kind": "agent_session", "target_id": target}
+            slot["effort"] = effort
+            return slot
+        row_id, row_effort = ref
+        slot["subagent_id"] = row_id
+        if effort and effort != row_effort:
+            slot["effort"] = effort
+        return slot
+
+    payload: Dict[str, Any] = {
+        "triad": [_slot(SURFACE_TRIAD, row) for row in triad],
+        "scope": [_slot(SURFACE_SCOPE, row) for row in scope],
     }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=False)
+    adv = _slot(SURFACE_ADVISORY, dict(advisory) | {"position": 1})
+    adv.pop("slot_id", None)
+    payload["advisory"] = {"enabled": True, **adv}
+    extended = ConfiguredSubagents(enabled=available.enabled, items=tuple(items))
+    return extended, json.dumps(payload, ensure_ascii=False, sort_keys=False), diagnostics
 
 
-def _validate_against_parser(raw: str) -> Optional[PresetRefusal]:
+def _validate_against_parser(raw: str, subagents_raw: str = "") -> Optional[PresetRefusal]:
     """Feed our own output through the reviewer-slot SSOT parser.
 
     The compiler does not maintain a second schema: if the ONE strict parser
-    every consumer uses refuses this value, the preset is not applied."""
-    from ouroboros.reviewer_slot_config import parse_reviewer_slots
+    every consumer uses refuses this value, the preset is not applied.
+    ``subagents_raw`` threads the roster THIS preset ships, so actor
+    references validate against it (context-local override; the process env
+    does not carry the not-yet-applied roster)."""
+    from ouroboros.reviewer_slot_config import reviewer_slot_save_check
 
     try:
-        parse_reviewer_slots(raw)
+        reviewer_slot_save_check(raw, subagents_raw=subagents_raw or None)
     except ValueError as exc:
         return PresetRefusal(
             code="preset_failed_slot_validation", seat=None, candidates=(),
@@ -597,9 +650,13 @@ def compile_install_preset(
             if refusal is not None:
                 return SubscriptionInstallPreset(connected=connected, refusal=refusal)
             resolved[surface] = rows
-        reviewer_slots = _reviewer_slots_json(
-            resolved[SURFACE_TRIAD], resolved[SURFACE_SCOPE], resolved[SURFACE_ADVISORY][0])
-        invalid = _validate_against_parser(reviewer_slots)
+        available, reviewer_slots, ref_diagnostics = _reference_reviewer_rows(
+            available, resolved[SURFACE_TRIAD], resolved[SURFACE_SCOPE],
+            resolved[SURFACE_ADVISORY][0])
+        if ref_diagnostics:
+            diagnostics = tuple(diagnostics) + tuple(ref_diagnostics)
+        invalid = _validate_against_parser(
+            reviewer_slots, serialize_configured_subagents(available))
         if invalid is not None:
             return SubscriptionInstallPreset(connected=connected, refusal=invalid)
 
