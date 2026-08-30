@@ -55,7 +55,8 @@ import {
 } from '../modules/harness_login_cards.js';
 
 test('account actions stack at the app shell compact breakpoint', () => {
-    const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8')
+        .replace(/\r\n?/g, '\n');
     assert.ok(css.includes(`@media (max-width: 980px) {
     .harness-account-row {
         grid-template-columns: minmax(0, 1fr);

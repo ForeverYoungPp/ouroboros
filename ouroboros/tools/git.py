@@ -3179,6 +3179,25 @@ def _git_diff(
         return f"⚠️ GIT_ERROR: {_sanitize_git_error(str(e))}"
 
 
+def _run_git_network_cmd(cmd: List[str], cwd: pathlib.Path) -> str:
+    """``run_cmd``-shaped adapter for network git commands (fetch/push).
+
+    Routes through the shared bounded git runner (wall-clock ceiling, process
+    tree kill, ``GIT_TERMINAL_PROMPT=0``, low-speed abort) with the caller's
+    repository as the explicit cwd, so a dead network cannot hang the tool
+    forever. Keeps ``run_cmd``'s contract: stdout on success, ``RuntimeError``
+    with the same message shape on failure.
+    """
+    from supervisor.update_source import _git_network_bounded
+
+    rc, out, err = _git_network_bounded(list(cmd[1:]), cwd=cwd)
+    if rc != 0:
+        raise RuntimeError(
+            f"Command failed: {' '.join(cmd)}\n\nSTDOUT:\n{out}\n\nSTDERR:\n{err}"
+        )
+    return out
+
+
 def _ff_pull(repo_dir: pathlib.Path) -> str:
     try:
         branch = run_cmd(
@@ -3189,7 +3208,7 @@ def _ff_pull(repo_dir: pathlib.Path) -> str:
     if not branch or branch == "HEAD":
         return "⚠️ PULL_ERROR: Not on a named branch (detached HEAD). Cannot pull."
     try:
-        run_cmd(["git", "fetch", "origin"], cwd=repo_dir)
+        _run_git_network_cmd(["git", "fetch", "origin"], cwd=repo_dir)
     except Exception as e:
         return f"⚠️ PULL_ERROR: git fetch failed: {_sanitize_git_error(str(e))}"
     try:

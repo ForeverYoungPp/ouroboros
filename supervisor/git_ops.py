@@ -1975,18 +1975,23 @@ def _configure_credential_helper(repo_slug: str, token: str) -> None:
 
 
 def push_to_remote(branch: Optional[str] = None, push_tags: bool = True) -> Tuple[bool, str]:
-    """Push current branch (and optionally tags) to origin."""
+    """Push current branch (and optionally tags) to origin.
+
+    Network pushes ride the shared bounded git runner: a hung remote surfaces
+    as the ordinary ``(False, "git push failed: ...")`` result instead of
+    pinning the worker forever on an unbounded subprocess wait.
+    """
     if not _has_remote("origin"):
         return False, "No remote configured"
 
     target = branch or BRANCH_DEV
-    rc, out, err = git_capture(["git", "push", "-u", "origin", target])
+    rc, out, err = _git_network_bounded(["push", "-u", "origin", target])
     if rc != 0:
         return False, f"git push failed: {err}"
 
     result = f"Pushed {target} to origin"
     if push_tags:
-        rc_t, _, err_t = git_capture(["git", "push", "origin", "--tags"])
+        rc_t, _, err_t = _git_network_bounded(["push", "origin", "--tags"])
         if rc_t != 0:
             result += f" (tags push failed: {err_t})"
         else:

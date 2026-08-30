@@ -575,16 +575,15 @@ def _web_search(
     dispatched = False
     explicit_provider_failure = False
     try:
-        from openai import OpenAI
         from ouroboros.config import get_finalization_grace_sec
+        from ouroboros.net_transport import web_search_openai_client
         transport_timeout = _web_search_transport_timeout(ctx)
         # Explicit per-attempt transport bound; the outer ToolEntry covers the
         # configured paid cascade rather than acting as the socket timeout.
-        client = OpenAI(
+        client = web_search_openai_client(
             api_key=api_key,
             base_url=base_url,
             timeout=transport_timeout,
-            max_retries=0,
         )
         # Reserve before dispatch; settle only after the terminal stream event.
         scope = _accounting_scope(ctx, "web_search.openai_responses")
