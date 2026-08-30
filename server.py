@@ -1137,6 +1137,18 @@ def _reconcile_delegated_runs(running_task_ids: set) -> None:
                     refresh_terminal_reconciliation(DATA_DIR, tid)
                 except Exception:
                     log.debug("Sweep terminal-result refresh failed for %s", tid, exc_info=True)
+        # Cursor-driven pass: runs settled OUTSIDE this generation's outcomes
+        # (terminal-boundary settlements, earlier generations) never reappear
+        # in the orphan sweep, so their tasks' stored evidence would stay
+        # stale forever. Bounded to newly appended custody rows per tick.
+        try:
+            from ouroboros.delegate_terminal import refresh_recently_settled_terminals
+
+            refreshed = refresh_recently_settled_terminals(DATA_DIR)
+            if refreshed:
+                log.info("Cursor refresh healed %d stale terminal result(s)", refreshed)
+        except Exception:
+            log.debug("Cursor terminal-refresh pass failed", exc_info=True)
     except Exception:
         log.debug("Delegated-run reconciliation failed", exc_info=True)
 

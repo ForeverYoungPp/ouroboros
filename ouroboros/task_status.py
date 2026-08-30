@@ -868,7 +868,18 @@ def wait_for_effective_tasks(
     timed_out = False
     early: Any = None
     while True:
-        results = {tid: load_effective_task_result(pathlib.Path(drive_root), tid) for tid in ids}
+        # Poll reads are status/cancel_state projections only: the
+        # materializing default performed real cross-tree writes (artifact
+        # copy2 + manifest rewrites) every 2s tick — a 600s wait over 5
+        # children was ~1500 spurious materializations. The one materializing
+        # read happens after the loop, on every exit path, so wait/get
+        # consumers keep their place in the child-result sha economy.
+        results = {
+            tid: load_effective_task_result(
+                pathlib.Path(drive_root), tid, materialize_artifacts=False
+            )
+            for tid in ids
+        }
         terminal = {tid: str(data.get("status") or "").strip().lower() in SETTLED_STATUSES for tid, data in results.items()}
         # Sliced wait hook: a child->parent attention beacon (including review_requested)
         # gets one preflight even when the child already terminalized, so a beacon
@@ -889,6 +900,9 @@ def wait_for_effective_tasks(
             timed_out = True
             break
         time.sleep(max(0.05, min(2.0, float(poll_interval_sec or 0.5))))
+    # The single materializing read, on EVERY exit path (terminal, timeout,
+    # early beacon): the returned rows re-enter the sha/artifact economy.
+    results = {tid: load_effective_task_result(pathlib.Path(drive_root), tid) for tid in ids}
     out: Dict[str, Any] = {
         "mode": mode,
         "timeout_sec": float(timeout_sec or 0),
@@ -948,12 +962,36 @@ def find_child_tasks(
     root = str(root_task_id or "").strip()
     excluded = str(exclude_task_id or "").strip()
     direct_only = str(scope or "subtree").strip().lower() == "direct"
+
+    def _raw_row_may_match(item: Dict[str, Any]) -> bool:
+        # Prefilter on the RAW disk row before paying for the effective
+        # projection: with the materializing default that projection is not a
+        # read — it copies files, rewrites artifact manifests and re-hashes
+        # every artifact of UNRELATED tasks (one finalization ran it 4-5x over
+        # the whole store). The lineage fields the filter needs are already on
+        # the raw row. Two classes must still materialize despite not matching
+        # raw: a row with a retry pointer (the retry chain projects the
+        # RETRY's lineage, which may match where the raw row does not), and a
+        # lineage-less row is safe to skip — a LIVE one is re-discovered by
+        # the queue overlay below with the snapshot's lineage.
+        if str(item.get("superseded_by") or item.get("retry_task_id") or "").strip():
+            return True
+        if str(item.get("delegation_role") or "") != "subagent":
+            return False
+        if parent and str(item.get("parent_task_id") or "") == parent:
+            return True
+        return bool(not direct_only and root and str(item.get("root_task_id") or "") == root)
+
+    events_index = _EventsTailIndex(pathlib.Path(drive_root))
     rows: Dict[str, Dict[str, Any]] = {}
     for row in (
         effective_task_result(
-            pathlib.Path(drive_root), item, materialize_artifacts=materialize_artifacts
+            pathlib.Path(drive_root), item,
+            materialize_artifacts=materialize_artifacts,
+            _events_index=events_index,
         )
         for item in list_task_results(pathlib.Path(drive_root))
+        if _raw_row_may_match(item)
     ):
         tid = str(row.get("task_id") or "")
         if not tid or tid == excluded:
