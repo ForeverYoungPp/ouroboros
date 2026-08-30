@@ -796,24 +796,28 @@ def is_terminal(detail: Dict[str, Any]) -> bool:
 
 def retire_project(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
     """Discharge the registration obligation. Absence IS discharge (a 404 on
-    the project is the asked-for outcome, never a failure).
-
-    REFCOUNT DEFERRAL: the daemon refuses removal while runs live, so only the
-    LOWEST-run_id sharer keeps attempting (one honest retry lane); the rest
-    defer quietly. The deterministic tie-break makes deferral safe: some
-    sharer always attempts, and the rest discharge on the daemon's 404."""
+    the project is the asked-for outcome, never a failure). REFCOUNT
+    DEFERRAL: the daemon refuses removal while runs live, so only the
+    LOWEST-run_id sharer keeps attempting; the rest defer quietly and
+    discharge on the daemon's 404 (deterministic tie-break: someone always
+    attempts)."""
     if not (custody.project_owned and custody.project_id):
         return
     try:
-        # Sharers = EVERY run in the project, owned or not: only the creator
-        # carries project_owned, but the daemon refuses removal while ANY
-        # sibling lives; the caller is mid-settlement (its SETTLED emit
-        # follows), so only OTHER unsettled sharers defer.
-        state = replay(drive_root)
+        # Sharers = EVERY run in the project (only the creator carries
+        # project_owned, but the daemon refuses removal while ANY sibling
+        # lives); the caller is mid-settlement, so only OTHERS defer.
+        # Removal is an AUTHORITY decision: it needs the COMPLETE view (the
+        # lenient reader skips unreadable lines - a sibling could be
+        # invisible) with the caller's own row in it.
+        from ouroboros.delegate_custody_usage import complete_custody_rows
+
+        rows_raw = complete_custody_rows(event_log_path(drive_root), _ROW_MARKER)
+        if rows_raw is None:
+            log.warning("Retirement deferred: custody log view incomplete")
+            return
+        state = replay(drive_root, rows=rows_raw)
         if custody.run_id and custody.run_id not in state:
-            # An unreadable/empty log replays as NO runs - removal under
-            # unknown sibling authority is the fail-open this deferral exists
-            # to prevent. Defer to a sweep that can see.
             log.warning("Retirement deferred: run %s not in replay", custody.run_id)
             return
         rows = [run for run in state.values()
@@ -1282,10 +1286,9 @@ def reconcile_task_runs(drive_root: Any, task_id: str, *,
     held = [c for c in open_runs(drive_root) if c.task_id == mine]
     stray = [record for record in pending_invocations(drive_root)
              if record["task_id"] == mine]
-    # This path also carries the registration retry lane for the task's OWN
-    # settled-but-owned runs in retire-eligible projects (a one-shot process
-    # may never see another sweep tick); deferred-behind-a-live-sibling
-    # registrations stay with the periodic sweep - no daemon spin-up here.
+    # Also the registration retry lane for the task's OWN settled-but-owned
+    # runs in retire-eligible projects (a one-shot process may never see a
+    # sweep tick); deferred registrations stay with the periodic sweep.
     snapshot = replay(drive_root).values()
     live = {r.project_id for r in snapshot
             if r.project_id and r.run_id and not r.settled}
@@ -1338,9 +1341,8 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
     startup/periodic sweep surface is where settled-but-owned registrations get
     their retry lane (the task-scoped surface can exit early with none open).
     """
-    # Registration duty is real work only when a project is retire-ELIGIBLE
-    # (every sharer settled): a registration deferred behind a live sibling
-    # must not spin the owned daemon up on every sweep tick.
+    # Registration duty is real work only for a retire-ELIGIBLE project
+    # (every sharer settled): a deferred one must not spin the daemon up.
     snapshot = replay(drive_root).values()
     unsettled_projects = {row.project_id for row in snapshot
                           if row.project_id and row.run_id and not row.settled}

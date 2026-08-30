@@ -652,18 +652,21 @@ def bounded_continuation_envelope(
     limit = DEFAULT_TOOL_RESULT_LIMIT
 
     def _fit(raw: str) -> str:
-        preview = truncate_within_limit(raw, limit=limit)
-        while len(preview) > 100:
+        # Every cut is taken from the ORIGINAL text, so the omission marker
+        # always discloses the true original length; the allowance shrinks
+        # proportionally to the observed escape factor (a 1-char overshoot
+        # costs 1 char, a 6x-escaping body converges near limit/6).
+        allowed = limit
+        preview = truncate_within_limit(raw, limit=allowed)
+        while allowed > 100:
             try:
                 over = len(json.dumps(preview, ensure_ascii=False)) - 2 - limit
             except (TypeError, ValueError, RecursionError):
                 break
             if over <= 0:
                 break
-            # Shave exactly the escape overshoot (at least one char) - a
-            # 1-char overshoot must not halve the carried budget.
-            preview = truncate_within_limit(
-                preview, limit=max(100, len(preview) - max(over, 1)))
+            allowed = max(100, min(allowed - 1, allowed * limit // (limit + over)))
+            preview = truncate_within_limit(raw, limit=allowed)
         return preview
 
     def _bounded(key: str, value: Any, *, field: str, force_pointer: bool = False) -> Any:
@@ -679,10 +682,14 @@ def bounded_continuation_envelope(
             entry["source_ref"] = {**copy.deepcopy(source_ref), "field": field}
         return entry
 
+    digest_note = digest_semantics
     try:
         serialized = json.dumps(mapping, ensure_ascii=False, sort_keys=True, default=str)
     except RecursionError:
-        serialized = "<authority body too deep to serialize>"
+        # No identity can be computed over a body too deep to serialize -
+        # disclose that instead of presenting a placeholder digest as exact.
+        serialized = ""
+        digest_note = f"{digest_semantics}_unserializable"
     except (TypeError, ValueError):
         serialized = repr(mapping)
     raw_contract = mapping.get("task_contract")
@@ -720,9 +727,9 @@ def bounded_continuation_envelope(
         envelope["shadowed_authority_fields"] = shadowed
     envelope.update({
         "kind": "bounded_continuation_envelope",
-        "authority_sha256": sha256(serialized.encode("utf-8")).hexdigest(),
+        "authority_sha256": sha256(serialized.encode("utf-8")).hexdigest() if serialized else "",
         "authority_chars": len(serialized),
-        "digest_semantics": digest_semantics,
+        "digest_semantics": digest_note,
         **(extra or {}),
     })
     return envelope
