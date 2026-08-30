@@ -102,3 +102,45 @@ def release_pre_dispatch_attempt(reservation: Any, exc: BaseException) -> bool:
         log.exception("Failed to release pre-dispatch physical attempt")
         return False
     return True
+
+
+def attempt_custody_event_fields(error: BaseException) -> dict:
+    """Additive custody binding for durable error events (nanny-leaf S3).
+
+    The physical-attempt capture already rides the exception; without these
+    fields the durable ``llm_api_error`` row cannot be joined to the attempt
+    ledger, and the transport class of a wrapped cause (ConnectError vs
+    RemoteProtocolError) is unrecoverable after the fact. Bounded type names
+    only — never raw cause text.
+    """
+    # Deliberately read off the exception chain, NOT the contextvar helper
+    # (physical_attempt_capture_from_exception's fallback): a durable join key
+    # must never bind a stale attempt from an unrelated call.
+    capture = getattr(error, "physical_attempt_capture", None)
+    seen: set = set()
+    walker = getattr(error, "__cause__", None)
+    while capture is None and isinstance(walker, BaseException) and id(walker) not in seen:
+        # Wrappers (LocalContextTooLargeError, recovery RuntimeError) carry the
+        # capture only on their explicit cause — walk it the same way.
+        seen.add(id(walker))
+        capture = getattr(walker, "physical_attempt_capture", None)
+        walker = walker.__cause__
+    fields: dict = {}
+    if capture is not None:
+        fields["physical_attempt_id"] = str(getattr(capture, "attempt_id", "") or "")
+        fields["attempt_custody_state"] = str(getattr(capture, "state", "") or "")
+        provider_error_type = str(getattr(capture, "provider_error_type", "") or "")
+        if provider_error_type:
+            fields["provider_error_type"] = provider_error_type
+    seen = set()
+    current = getattr(error, "__cause__", None)
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        module = type(current).__module__ or ""
+        if module.split(".")[0] in (
+            "httpx", "httpcore", "requests", "urllib3", "ssl", "socket", "anyio",
+        ) or (module == "builtins" and isinstance(current, (ConnectionError, TimeoutError))):
+            fields["transport_cause_type"] = type(current).__name__
+            break
+        current = current.__cause__
+    return fields
