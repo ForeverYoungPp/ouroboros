@@ -110,6 +110,23 @@ def test_boot_backfill_fixes_row_settled_in_a_previous_generation(tmp_path):
     assert result["reason_code"] == "delegated_custody_unreconciled"
     assert result["status"] == STATUS_FAILED
 
+    # R5: the healed CURRENT state is agent-visible on the full-handoff
+    # surface — get_task_result shows the empty list and the envelope's
+    # trigger + open_run_ids next to the historical axes.
+    import json
+
+    from ouroboros.tools.control import _get_task_result
+    from ouroboros.tools.registry import ToolContext
+
+    output = _get_task_result(
+        ToolContext(repo_dir=tmp_path, drive_root=tmp_path), "t-gen",
+    )
+    payload = output.split("[SUBTASK_OUTCOME]\n", 1)[1].split("\n[/SUBTASK_OUTCOME]", 1)[0]
+    custody = json.loads(payload)["delegated_custody"]
+    assert custody == {
+        "unreconciled": [], "trigger": "boot_backfill", "open_run_ids": [],
+    }
+
 
 def test_boot_backfill_preserves_undisposed_patch_debt(tmp_path):
     """The incident shape: settled mutating run whose captured patch awaits its
