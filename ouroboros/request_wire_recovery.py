@@ -680,7 +680,7 @@ def _classify_action(
         })
     if effort_implicated and named_effort_value:
         from ouroboros.config import EFFORT_SCALE, effort_one_step_down, effort_rank
-        # A tier is prescribed only when QUOTED inside [low, current): prose and never-retryable tiers are out.
+        # QUOTED tiers inside [low, current) prescribe — even a negatively-quoted one (accepted FP); prose walks one rung.
         prescribed = [t for t in EFFORT_SCALE[effort_rank("low"):max(effort_rank(current_effort), 0)]
                       if f"'{t}'" in low or f'"{t}"' in low]
         next_effort = prescribed[-1] if prescribed else effort_one_step_down(current_effort)

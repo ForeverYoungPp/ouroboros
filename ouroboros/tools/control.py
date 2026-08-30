@@ -3197,7 +3197,7 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "model": {"type": "string", "description": "Model name (e.g. anthropic/claude-sonnet-4). Leave empty to keep current."},
                 "effort": {"type": "string", "enum": list(EFFORT_SCALE),
-                           "description": "Reasoning effort level (clamped to the model's real ceiling). Leave empty to keep current."},
+                           "description": "Reasoning effort level (adapted down per route when a model tops out lower). Leave empty to keep current."},
             }, "required": []},
         }, _switch_model),
         ToolEntry("get_task_result", {

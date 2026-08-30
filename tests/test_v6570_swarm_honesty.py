@@ -152,7 +152,7 @@ def test_effort_one_step_down():
     assert effort_one_step_down("none") == "none"       # floor
 
 
-def test_resolve_effort_accepts_xhigh_and_max(monkeypatch):
+def test_resolve_effort_accepts_the_top_tiers(monkeypatch):
     monkeypatch.setenv("OUROBOROS_EFFORT_TASK", "xhigh")
     assert resolve_effort("task") == "xhigh"
     monkeypatch.setenv("OUROBOROS_EFFORT_TASK", "max")
