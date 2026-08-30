@@ -99,7 +99,8 @@ export function topReviewFinding(entity) {
     const label = first.item || first.check || first.title || 'finding';
     const verdict = first.verdict || first.severity || '';
     const reason = first.reason || first.message || '';
-    return `${verdict ? `${verdict} ` : ''}${label}: ${reason}`.trim();
+    const more = findings.length > 1 ? ` (+${findings.length - 1} more)` : '';
+    return `${`${verdict ? `${verdict} ` : ''}${label}: ${reason}`.trim()}${more}`;
 }
 
 export function renderHubCard(item, {

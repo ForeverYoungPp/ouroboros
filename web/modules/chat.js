@@ -8,7 +8,7 @@ import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { createSystemMessageAction, downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
 import { clientSurfaceField } from './client_surface.js';
-import { apiClient, apiFetch, fetchTaskDetail } from './api_client.js';
+import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
 import {
     OWNER_STOP_DETAIL_MARKER,
     getLogTaskGroupId,
@@ -147,7 +147,7 @@ const MAX_PENDING_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 const shownIncidentToastKeys = new Set();
 
 function showTaskIncidentToast(msg) {
-    const incident = String(msg?.task_incident || '').trim();
+    const incident = taskKey(msg?.task_incident);
     if (!incident) return;
     const key = String(msg?.toast_once || `${msg?.task_id || ''}:${incident}`).trim();
     if (!key || shownIncidentToastKeys.has(key)) return;
@@ -163,6 +163,8 @@ export function initChat(ctx) {
     // Back-compat main-chat entry: one full-page instance bound to chat 1.
     return createChatInstance(ctx);
 }
+
+const taskKey = (value) => String(value || '').trim();
 
 export function createChatInstance({
     ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab,
@@ -507,12 +509,12 @@ export function createChatInstance({
     const reviewDisclosureByTask = new Map();
     const skillReviewDetailStore = new Map();
     const reviewHydrator = createReviewHydrator({
-        fetchDetail: (taskId) => fetchTaskDetail(taskId),
-        applyDetail: (taskId, detail) => !destroyed && attachTaskDetailReviews(taskId, detail),
+        fetchDetail: fetchTaskDetailStrict,
+        applyDetail: (id, d) => !destroyed && attachTaskDetailReviews(id, d),
+        onState: (id, status) => !destroyed
+            && liveCardRecords.get(id)?.reviewController?.setHydrateStatus?.(status),
     });
-    // Cluster B: a proactively-coined name (task_named) can arrive BEFORE the card's
-    // liveCardRecords entry exists (the namer broadcasts as the task starts). Buffer it
-    // here so createLiveCardRecord can apply it when the card appears (no lost title).
+    // A task_named frame can arrive before the card's record exists; buffer it.
     const pendingSuggestedNames = new Map();
     const taskUiStates = new Map();
     // Busy-chat decision turns reuse the normal agent/event path for ordering and
@@ -545,7 +547,7 @@ export function createChatInstance({
     }
 
     function recordConcludedActivity(activityId) {
-        const aid = String(activityId || '').trim();
+        const aid = taskKey(activityId);
         if (!aid) return;
         missingManagedTaskIds.delete(aid);
         concludedDirectActivities.delete(aid);
@@ -556,7 +558,7 @@ export function createChatInstance({
         }
     }
     function recordTerminalActivity(taskId) {
-        const id = String(taskId || '').trim();
+        const id = taskKey(taskId);
         if (!id) return;
         activeDirectActivities.delete(id);
         missingManagedTaskIds.delete(id);
@@ -577,7 +579,7 @@ export function createChatInstance({
     }
 
     function registerEphemeralDecisionFrameMutation(frame) {
-        const taskId = String(frame?.task_id || '').trim();
+        const taskId = taskKey(frame?.task_id);
         if (!taskId) return false;
         if (frame?.ephemeral_decision) {
             ephemeralDecisionTaskIds.add(taskId);
@@ -1136,7 +1138,7 @@ export function createChatInstance({
 
     async function turnTaskIntoProject(record) {
         if (!record || record.root?.dataset?.projectCreating === '1' || record.root?.dataset?.projectCreated === '1') return;
-        const taskId = String(record.groupId || '').trim();
+        const taskId = taskKey(record.groupId);
         const projectId = projectIdFromTask(taskId);
         record.root.dataset.projectCreating = '1';
         const actions = record.turnProjectBtn?.parentElement || record.root.querySelector('.chat-live-actions');
@@ -1250,7 +1252,7 @@ export function createChatInstance({
 
     // Pending intent stays live until settled; soft stop shows Finalizing….
     function markLiveCardCancelPending(taskId = '', soft = false) {
-        const record = liveCardRecords.get(String(taskId || '').trim());
+        const record = liveCardRecords.get(taskKey(taskId));
         if (!record || record.finished || !record.phaseEl) return;
         record.cancelPendingPolicy = soft ? 'finalize' : 'immediate';
         record.finalizingHold = false;  // owner cancel outranks the hold
@@ -1262,7 +1264,7 @@ export function createChatInstance({
 
     // Early final stays live while post-task synthesis runs.
     function markLiveCardFinalizing(taskId = '') {
-        const record = liveCardRecords.get(String(taskId || '').trim());
+        const record = liveCardRecords.get(taskKey(taskId));
         if (!record || record.finished || !record.phaseEl) return;
         markReviewAnchor(record);
         if (record.cancelPendingPolicy) return;
@@ -1294,7 +1296,7 @@ export function createChatInstance({
     }
 
     async function cancelRunFromCard(record, action = '') {
-        const taskId = String(record?.groupId || '').trim();
+        const taskId = taskKey(record?.groupId);
         if (!taskId || record.finished) return;
         // Q2: the dropdown itself is the confirmation surface — dismissing it
         // continued the run, so a selected action executes immediately.
@@ -1352,7 +1354,7 @@ export function createChatInstance({
     }
 
     function markTaskCancelable(taskId = '') {
-        const id = String(taskId || '').trim();
+        const id = taskKey(taskId);
         if (!id || cancelableTaskIds.has(id)) return;
         cancelableTaskIds.add(id);
         const record = liveCardRecords.get(id);
@@ -1411,12 +1413,14 @@ export function createChatInstance({
         _chatFreedTimer = setTimeout(() => row.classList.remove('chat-freed'), 900);
     }
 
+    const reviewAnchorEligible = (id) => !liveCardRecords.has(id)
+        && !taskUiStates.has(id) && !activeDirectActivities.has(id);
+
     function attachReviewGroup(group, rawTs = '') {
-        const ownerTaskId = String(group?.presentationOwnerTaskId || '').trim();
+        const ownerTaskId = taskKey(group?.presentationOwnerTaskId);
         if (!ownerTaskId) return false;
         if (retiredTaskIds.has(ownerTaskId) && !liveCardRecords.has(ownerTaskId)) return true;
-        const reviewAnchor = !liveCardRecords.has(ownerTaskId)
-            && !taskUiStates.has(ownerTaskId) && !activeDirectActivities.has(ownerTaskId);
+        const reviewAnchor = reviewAnchorEligible(ownerTaskId);
         const ownerState = forceTaskCard(ownerTaskId, rawTs);
         if (!ownerState?.cardVisible) return false;
         const record = liveCardRecords.get(ownerTaskId);
@@ -1434,7 +1438,7 @@ export function createChatInstance({
     }
 
     function attachTaskDetailReviews(taskId, detail) {
-        const id = String(taskId || '').trim();
+        const id = taskKey(taskId);
         const groups = reviewGroupsFromTaskDetail(detail, id);
         if (!id || groups.length === 0) return false;
         if (!liveCardRecords.has(id)) forceTaskCard(id, detail?.ts || detail?.timestamp || '');
@@ -1446,9 +1450,7 @@ export function createChatInstance({
     }
 
     function hydrateCardReviews(taskId, revision = null) {
-        const id = String(taskId || '').trim();
-        if (!id || destroyed) return Promise.resolve(false);
-        return reviewHydrator.hydrate(id, revision);
+        return destroyed ? Promise.resolve(false) : reviewHydrator.hydrate(taskId, revision);
     }
 
     function attachReviewFromRow(row, rawTs = '', showPointerAck = false) {
@@ -1481,7 +1483,13 @@ export function createChatInstance({
     function handleReviewReference(row) {
         const reference = reviewReferenceFromRow(row);
         if (!reference) return false;
-        hydrateCardReviews(reference.presentationOwnerTaskId, reference.stateRevision);
+        const owner = reference.presentationOwnerTaskId;
+        // A reference proves a review exists: mint an anchored card so a
+        // failed hydrate has a home, not fake task activity.
+        const anchor = reviewAnchorEligible(owner);
+        forceTaskCard(owner, row?.ts);
+        if (anchor) markReviewAnchor(liveCardRecords.get(owner), true);
+        hydrateCardReviews(owner, reference.stateRevision);
         return true;
     }
 
@@ -1580,8 +1588,7 @@ export function createChatInstance({
             // used to name a project on "turn into project" when the server has no
             // title/objective yet (P1, direct-chat conversion). One-shot handoff.
             objectiveHint: (isMain && !options.isSubagent) ? _pendingCardObjective : '',
-            // Cluster B: the proactively-coined LLM project name; when set it becomes
-            // the card title (the activity headline keeps rendering in the lines below).
+            // The proactively-coined LLM name; becomes the card title when set.
             suggestedName: '',
             // P1 (v6.82): last bounded activity projection (remembered even while
             // the collapsed line is suppressed on unnamed root cards) + sticky cost.
@@ -1674,8 +1681,8 @@ export function createChatInstance({
     }
 
     function applySuggestedNameMutation(taskId, name) {
-        const tid = String(taskId || '').trim();
-        const nm = String(name || '').trim();
+        const tid = taskKey(taskId);
+        const nm = taskKey(name);
         if (!tid || !nm) return;
         const record = liveCardRecords.get(tid);
         if (!record) {
@@ -2380,17 +2387,17 @@ export function createChatInstance({
         subagentChildParents.set(childId, {
             parentId: parentId || prev.parentId || '',
             role: role || prev.role || '',
-            model: String(model || '').trim() || prev.model || '',
+            model: taskKey(model) || prev.model || '',
         });
     }
 
     function learnSubagentLineage(msg) {
         if (String(msg?.delegation_role || '').toLowerCase() !== 'subagent') return '';
-        const parentId = String(msg.parent_task_id || '').trim();
+        const parentId = taskKey(msg.parent_task_id);
         const childId = String(msg.subagent_task_id || msg.task_id || '').trim();
         if (!parentId || !childId || parentId === childId) return '';
         setSubagentParent(childId, {
-            parentId, role: String(msg.subagent_role || '').trim(), model: msg.model,
+            parentId, role: taskKey(msg.subagent_role), model: msg.model,
         });
         const event = String(msg.subagent_event || '').toLowerCase();
         const replayTerminal = msg.task_terminal_status
@@ -2424,7 +2431,7 @@ export function createChatInstance({
             markTaskCancelable(String(msg.task_id));
         }
         // Child lifecycle pings must not update the parent's terminal state.
-        const lifecycleParent = String(msg?.parent_task_id || '').trim();
+        const lifecycleParent = taskKey(msg?.parent_task_id);
         if (
             msg?.subagent_event
             && lifecycleParent
@@ -2489,11 +2496,11 @@ export function createChatInstance({
 
     function updateSubagentCardFromEvent(evt, tsValue) {
         if (!evt || String(evt.delegation_role || '').toLowerCase() !== 'subagent') return false;
-        const parentId = String(evt.parent_task_id || '').trim();
+        const parentId = taskKey(evt.parent_task_id);
         const childId = String(evt.subagent_task_id || evt.task_id || '').trim();
         if (!parentId || !childId || parentId === childId) return false;
         const event = String(evt.subagent_event || '').toLowerCase();
-        const role = String(evt.subagent_role || '').trim();
+        const role = taskKey(evt.subagent_role);
         setSubagentParent(childId, { parentId, role, model: evt.model });
         // Worker narration carries subagent_event="progress" too. It is activity,
         // not a lifecycle row: route it through the progress key so the later
@@ -2571,7 +2578,7 @@ export function createChatInstance({
     }
 
     function routeSubagentFinalMessageToCard(taskId, msg) {
-        const childId = String(taskId || '').trim();
+        const childId = taskKey(taskId);
         const info = subagentChildParents.get(childId);
         if (!childId || !info) return false;
         const { parentId, role, model } = info;
@@ -3984,7 +3991,7 @@ export function createChatInstance({
     }
 
     function showTyping(activityId = '', meta = {}) {
-        const actId = String(activityId || '').trim() || ('direct-' + chatId);
+        const actId = taskKey(activityId) || ('direct-' + chatId);
         // A typing frame after its turn's keyed final must not resurrect the
         // concluded turn — but it still carries the activity<->cmid link, so
         // it settles the linked submission (broadcasts are not ordered).
@@ -4050,7 +4057,7 @@ export function createChatInstance({
             if (!currentRecord || currentRecord.isSubagent || subagentChildParents.has(taskId)) return;
             attachTaskDetailReviews(taskId, detail);
             const cancelPending = taskCancelPending(detail);
-            if (cancelPending || String(detail?.status || '').trim()) {
+            if (cancelPending || taskKey(detail?.status)) {
                 markReviewAnchor(currentRecord);
             }
             if (cancelPending) {
@@ -4075,7 +4082,7 @@ export function createChatInstance({
     }
 
     function observeMissingManagedTask(taskId) {
-        const id = String(taskId || '').trim();
+        const id = taskKey(taskId);
         if (!id || concludedDirectActivities.has(id)) return;
         const record = liveCardRecords.get(id);
         if (subagentChildParents.has(id) || record?.isSubagent) return;

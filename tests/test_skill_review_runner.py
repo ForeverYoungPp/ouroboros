@@ -929,6 +929,9 @@ def test_skill_review_ui_projection_is_group_scoped_bounded_and_sanitized(tmp_pa
     assert projection["history"][0]["review_round"] == 3
     assert all(row["group_id"] == "manual:alpha" for row in projection["history"])
     assert all("raw_actor_records" not in row for row in projection["history"])
+    # The ten-row window is a disclosed bound: 12 group rows minus 10 shown.
+    # The foreign-group row must not count into the omitted number.
+    assert projection["history_omitted"] == 2
 
 
 def test_cancel_and_timeout_each_write_one_idempotent_terminal_row(tmp_path):
