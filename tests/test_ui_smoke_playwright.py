@@ -3195,12 +3195,14 @@ def test_ui_smoke_login_recovery_reconcile_detach_and_retry_are_explicit(direct_
                 setup_result = page.evaluate(
                     """
                     async () => {
-                        const host = document.getElementById('harness-login-card');
-                        if (!host) return 'NO-HOST';
+                        const loginHost = () =>
+                            document.querySelector('[data-family-login="codex"]')
+                            || document.getElementById('harness-login-card');
+                        if (!loginHost()) return 'NO-HOST';
                         const m = await import('/static/modules/harness_accounts.js');
                         const wait = async (sel) => {
                             for (let i = 0; i < 100; i++) {
-                                const b = host.querySelector(sel);
+                                const b = loginHost()?.querySelector(sel);
                                 if (b && !b.disabled) return b;
                                 await new Promise((r) => setTimeout(r, 20));
                             }
@@ -3208,7 +3210,7 @@ def test_ui_smoke_login_recovery_reconcile_detach_and_retry_are_explicit(direct_
                         const p1 = m.startLogin('codex', 'race-a');
                         const p2 = m.startLogin('codex', 'race-a');
                         await Promise.all([p1, p2]);
-                        host.querySelector('[data-login-dismiss]')?.click();
+                        loginHost()?.querySelector('[data-login-dismiss]')?.click();
                         (await wait('[data-login-reconcile]'))?.click();
                         return 'RECONCILE-CLICKED';
                     }
@@ -3221,14 +3223,16 @@ def test_ui_smoke_login_recovery_reconcile_detach_and_retry_are_explicit(direct_
                 # recovery face: the outcome detail note exists (it is absent
                 # before the click) and "Check again" is enabled again.
                 page.wait_for_function(
-                    "() => { const host = document.getElementById('harness-login-card');"
+                    "() => { const host = document.querySelector('[data-family-login=\"codex\"]')"
+                    " || document.getElementById('harness-login-card');"
                     " const btn = host?.querySelector('[data-login-reconcile]');"
                     " return Boolean(host?.querySelector('[data-login-detail]'))"
                     " && Boolean(btn) && !btn.disabled; }",
                     timeout=30_000,
                 )
                 recovery_html = page.evaluate(
-                    "() => document.getElementById('harness-login-card').innerHTML"
+                    "() => (document.querySelector('[data-family-login=\"codex\"]')"
+                    " || document.getElementById('harness-login-card')).innerHTML"
                 )
                 assert len(posts) == 1
                 assert len(deletes) == 1
@@ -3238,10 +3242,12 @@ def test_ui_smoke_login_recovery_reconcile_detach_and_retry_are_explicit(direct_
                 before_detach = (len(posts), len(deletes), len(reconciles))
                 detached_html = page.evaluate(
                     """async () => {
-                        const h = document.getElementById('harness-login-card');
-                        h.querySelector('[data-login-dismiss]')?.click();
+                        const loginHost = () =>
+                            document.querySelector('[data-family-login="codex"]')
+                            || document.getElementById('harness-login-card');
+                        loginHost()?.querySelector('[data-login-dismiss]')?.click();
                         await new Promise((r) => setTimeout(r, 50));
-                        return h.innerHTML;
+                        return loginHost()?.innerHTML || '';
                     }"""
                 )
                 assert detached_html == ""
@@ -3249,15 +3255,18 @@ def test_ui_smoke_login_recovery_reconcile_detach_and_retry_are_explicit(direct_
 
                 final_html = page.evaluate(
                     """async () => {
-                        const h = document.getElementById('harness-login-card');
+                        const loginHost = () =>
+                            document.querySelector('[data-family-login="codex"]')
+                            || document.getElementById('harness-login-card');
                         const m = await import('/static/modules/harness_accounts.js');
                         await m.startLogin('codex', 'race-a');
-                        h.querySelector('[data-login-reconcile]')?.click();
-                        for (let i = 0; i < 100 && !h.querySelector('[data-login-retry]'); i++)
+                        loginHost()?.querySelector('[data-login-reconcile]')?.click();
+                        for (let i = 0; i < 100
+                            && !loginHost()?.querySelector('[data-login-retry]'); i++)
                             await new Promise((r) => setTimeout(r, 20));
-                        h.querySelector('[data-login-retry]')?.click();
+                        loginHost()?.querySelector('[data-login-retry]')?.click();
                         await new Promise((r) => setTimeout(r, 100));
-                        return h.innerHTML;
+                        return loginHost()?.innerHTML || '';
                     }"""
                 )
                 assert len(posts) == 3
@@ -3312,18 +3321,20 @@ def test_ui_smoke_dismiss_overlapping_start_cannot_drop_a_live_job(direct_server
                 result = page.evaluate(
                     """
                     async () => {
-                        const host = document.getElementById('harness-login-card');
-                        if (!host) return { error: 'NO-HOST' };
+                        const loginHost = () =>
+                            document.querySelector('[data-family-login="codex"]')
+                            || document.getElementById('harness-login-card');
+                        if (!loginHost()) return { error: 'NO-HOST' };
                         const m = await import('/static/modules/harness_accounts.js');
                         await m.startLogin('codex', 'ov-a');
-                        host.querySelector('[data-login-dismiss]')?.click();
+                        loginHost()?.querySelector('[data-login-dismiss]')?.click();
                         await m.startLogin('codex', 'ov-b');
                         await new Promise((r) => setTimeout(r, 600));
-                        const cardAfterQueuedStart = host.innerHTML.length > 0;
+                        const cardAfterQueuedStart = (loginHost()?.innerHTML || '').length > 0;
                         await m.startLogin('codex', 'ov-c');
                         return {
                             cardAfterQueuedStart,
-                            finalHasCard: host.innerHTML.length > 0,
+                            finalHasCard: (loginHost()?.innerHTML || '').length > 0,
                         };
                     }
                     """
@@ -3418,22 +3429,24 @@ def test_ui_smoke_stale_get_cannot_overwrite_login_terminal_faces(
                             }
                             return realFetch(input, init);
                         };
-                        const host = document.getElementById('harness-login-card');
+                        const loginHost = () =>
+                            document.querySelector('[data-family-login="codex"]')
+                            || document.getElementById('harness-login-card');
                         const m = await import('/static/modules/harness_accounts.js');
                         await m.startLogin('codex', 'stale-' + face);
                         await new Promise((r) => setTimeout(r, 3200));
-                        host.querySelector('[data-login-dismiss]')?.click();
+                        loginHost()?.querySelector('[data-login-dismiss]')?.click();
                         await new Promise((r) => setTimeout(r, 100));
                         if (face === 'reconciled') {
-                            host.querySelector('[data-login-reconcile]')?.click();
+                            loginHost()?.querySelector('[data-login-reconcile]')?.click();
                             await new Promise((r) => setTimeout(r, 100));
                         }
-                        const before = host.innerHTML;
+                        const before = loginHost()?.innerHTML || '';
                         releaseStale(new Response('{"job":{"state":"running"}}', {
                             status: 200, headers: { 'Content-Type': 'application/json' },
                         }));
                         await new Promise((r) => setTimeout(r, 3400));
-                        return { before, after: host.innerHTML, gets };
+                        return { before, after: loginHost()?.innerHTML || '', gets };
                     }
                     """, face,
                 )
@@ -3579,14 +3592,17 @@ def test_ui_smoke_dismiss_overlapping_settle_never_freezes_the_card(direct_serve
                             }
                             return realFetch(input, init);
                         };
-                        const host = document.getElementById('harness-login-card');
+                        const loginHost = () =>
+                            document.querySelector('[data-family-login="codex"]')
+                            || document.getElementById('harness-login-card');
                         const m = await import('/static/modules/harness_accounts.js');
                         await m.startLogin('codex', 'os-a');
-                        host.querySelector('[data-login-dismiss]')?.click();
+                        loginHost()?.querySelector('[data-login-dismiss]')?.click();
                         await new Promise((r) => setTimeout(r, 5200));
-                        return { html: host.innerHTML, deletes,
-                            cardCount: host.querySelectorAll('[data-login-card]').length,
-                            verdict: host.querySelector('[data-login-verdict]')?.textContent.trim() };
+                        const host = loginHost();
+                        return { html: host?.innerHTML || '', deletes,
+                            cardCount: host?.querySelectorAll('[data-login-card]').length || 0,
+                            verdict: host?.querySelector('[data-login-verdict]')?.textContent.trim() };
                     }
                     """
                 )
