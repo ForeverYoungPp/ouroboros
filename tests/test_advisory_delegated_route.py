@@ -592,3 +592,19 @@ def test_advisory_route_reader_vocabulary(monkeypatch):
     monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "cursor")
     with pytest.raises(ValueError):
         advisory.advisory_review_route()
+
+
+def test_delegated_advisory_rides_the_shared_executor_seam():
+    """Phase C unification (owner decision 2=B, 2026-08-30): the delegated
+    advisory is one AgentSessionReviewExecutor — retry/invocation custody,
+    D19 verdict order, and delta disclosure all come from the substrate; the
+    advisory's own transport dialect (_advisory_session_deltas and a direct
+    runner call) is gone."""
+    import inspect
+
+    from ouroboros.tools import claude_advisory_review as adv
+
+    source = inspect.getsource(adv._run_advisory_delegated)
+    assert "AgentSessionReviewExecutor" in source
+    assert "run_delegated_review_session" not in source
+    assert not hasattr(adv, "_advisory_session_deltas")

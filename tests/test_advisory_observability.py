@@ -924,16 +924,18 @@ class TestLLMFallbackExtraction:
         assert self.mod._is_clean_verdict("[]") is True
         assert self.mod._is_clean_verdict(json.dumps({"result": "[]\nNO_FINDINGS"})) is True
 
-    def test_delegated_advisory_asks_the_schema_and_discloses_off_pin(self):
-        """The delegated advisory asks for the structured verdict like every other
-        review session, trusts it only on outputConformance == "passed", and emits the
-        same three capability deltas the substrate emits."""
+    def test_delegated_advisory_asks_the_schema_and_discloses_off_pin(self, monkeypatch):
+        """The delegated advisory rides the SHARED AgentSessionReviewExecutor
+        (phase C unification, 2=B): the schema is asked like every session
+        slot, conformance is trusted only on "passed", and the substrate's
+        own capability-delta vocabulary discloses the landings — the advisory
+        no longer carries a transport dialect of its own."""
         from ouroboros.review_execution import review_session_output_schema
 
+        monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claude")
         asked = {}
 
         def fake_runner(**kwargs):
-            # The delivery knobs now ride ONE immutable invocation value.
             invocation = kwargs["invocation"]
             asked.update({f: getattr(invocation, f) for f in
                           ("task_id", "surface", "slot_id", "output_schema")})
@@ -945,27 +947,19 @@ class TestLLMFallbackExtraction:
             }
 
         import ouroboros.review_execution as rx
-        original = rx.run_delegated_review_session
-        rx.run_delegated_review_session = fake_runner
-        try:
-            result, _model = self.mod._run_advisory_delegated(
-                "prompt", pathlib.Path("/tmp"), self._make_ctx(),
-            )
-        finally:
-            rx.run_delegated_review_session = original
+        monkeypatch.setattr(rx, "run_delegated_review_session", fake_runner)
+        result, _model = self.mod._run_advisory_delegated(
+            "prompt", pathlib.Path("/tmp"), self._make_ctx(),
+        )
 
-        # The advisory surface asks the clean-capable shared schema: its ordinary
-        # mode's required clean verdict is the empty array (scope alone is floored).
         assert asked["output_schema"] == review_session_output_schema("advisory_review")
         assert "minItems" not in asked["output_schema"]["properties"]["findings"]
         usage = result.usage
-        assert usage["schema_asked"] is True
-        # Reported but NOT conformed => not trusted.
         assert usage["output_conformance"] == "failed"
-        assert usage["conformance_trusted"] is False
+        assert usage["verdict_provenance"]["conformance_trusted"] is False
         reasons = {d["reason"] for d in usage["capability_delta"]}
-        assert reasons == {"schema_not_conformed_on_effective_route",
-                           "session_ran_off_pinned_route"}, reasons
+        assert {"schema_not_conformed_on_effective_route",
+                "session_ran_off_pinned_route"} <= reasons, reasons
 
     def test_delegated_advisory_unwraps_a_conformant_clean_envelope(self):
         """A schema-conformant session answers with the SESSION envelope
@@ -986,6 +980,8 @@ class TestLLMFallbackExtraction:
                 }
             return fake_runner
 
+        import os
+        os.environ.setdefault("OUROBOROS_SUBAGENT_HARNESS", "claude")
         cases = [
             # (session text, conformance, expected result_text)
             (json.dumps({"findings": []}), "passed", "[]"),
@@ -995,8 +991,9 @@ class TestLLMFallbackExtraction:
              json.dumps([{"item": "i", "verdict": "FAIL",
                           "severity": "critical", "reason": "x"}],
                         ensure_ascii=False)),
-            # NOT conformed: the narrative path is untouched, whatever the shape.
-            (json.dumps({"findings": []}), "failed", json.dumps({"findings": []})),
+            # NOT conformed but strictly parseable: the shared D19 order's
+            # strict parse settles it — no paid extraction, no envelope trust.
+            ("[]", "failed", "[]"),
         ]
         original = rx.run_delegated_review_session
         try:

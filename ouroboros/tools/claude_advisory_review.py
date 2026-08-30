@@ -721,155 +721,82 @@ def _run_advisory_native(
 
 
 def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContext):
-    """The advisory as a delegated Claudexor session, rehydrated into the same
-    result structure the SDK path produces (5.8: only the transport changes).
+    """The advisory as a delegated agent session on the SHARED executor seam.
 
-    Runs through the ONE shared delegated-session runner (no second nanny
-    loop). The SDK-side budget kill is lost by construction; the runner's time
-    cap is the nanny-enforced bound. The narrative fallback is unchanged: the
-    existing advisory extractor already canonicalizes non-JSON output (D19).
-    Cost: the run settles through delegate_custody (the subscription-session
-    ledger row); ``cost_usd`` stays 0.0 here so the SDK-path usage emit cannot
-    double-count, and the disclosed spend rides ``usage`` for forensics."""
+    One substrate executor (``AgentSessionReviewExecutor``) owns the session:
+    route resolution, the pre-POST durable invocation checkpoint and retry
+    custody, D19 verdict canonicalization, and the capability-delta
+    disclosure vocabulary — the advisory adds NOTHING transport-shaped of its
+    own (phase C unification, owner decision 2=B, 2026-08-30). Cost: the run
+    settles through delegate_custody (the subscription-session ledger row);
+    ``cost_usd`` stays 0.0 here so nothing double-counts, and the disclosed
+    spend rides ``usage`` for forensics."""
     from types import SimpleNamespace
 
     from ouroboros.delegate_custody import custody_root
+    from ouroboros.llm import LLMClient
     from ouroboros.review_execution import (
-        SessionInvocation,
-        review_session_output_schema,
-        run_delegated_review_session,
+        AgentSessionReviewExecutor,
+        ReviewAssignment,
+        ReviewRouteKind,
     )
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
+    from ouroboros.reviewer_slot_config import advisory_slot_config
 
+    _slot = advisory_slot_config()
+    _task_metadata = getattr(ctx, "task_metadata", {}) or {}
+    deadline_at = (
+        str(_task_metadata.get("deadline_at") or "")
+        if isinstance(_task_metadata, dict) else ""
+    )
+    request = ReviewRequest(
+        surface="advisory_review",
+        goal="Advisory pre-review of the live worktree.",
+        task_id=str(getattr(ctx, "task_id", "") or ""),
+        session_root=str(repo_dir),
+        session_task=prompt,
+        policy={"output_contract": (
+            "A JSON array of checklist entries: "
+            '[{"item": str, "verdict": "PASS"|"FAIL", "severity": '
+            '"critical"|"advisory", "reason": str, "obligation_id"?: str}]'
+        )},
+        no_proxy=True,
+        deadline_at=deadline_at,
+    )
+    rslot = ReviewSlot(
+        slot_id="advisory_slot_1", model=_slot.target_id or "",
+        effort=str(_slot.effort or ""), role_hint="advisory pre-reviewer",
+        route=ReviewRouteKind.AGENT_SESSION,
+        session_target=str(_slot.target_id or ""),
+        session_profile=str(getattr(_slot, "profile_id", "") or ""),
+        timeout_sec=_ADVISORY_SESSION_MAX_SECONDS,
+        subagent_id=str(getattr(_slot, "subagent_id", "") or ""),
+    )
+    drive = custody_root(ctx) if getattr(ctx, "drive_root", None) else pathlib.Path(repo_dir)
+    assignment = ReviewAssignment(
+        request=request, slot=rslot,
+        call_id=f"advisory:{request.task_id or 'manual'}",
+        custody_root=drive,
+    )
+    executor = AgentSessionReviewExecutor(assignment, llm=LLMClient())
     try:
-        # The advisory row's own target/effort (6.1); None keeps the shared
-        # session-route fallback inside the runner.
-        import dataclasses as _dc
-
-        from ouroboros.reviewer_slot_config import advisory_slot_config
-        from ouroboros.subagents import parse_subagent_harness
-        from ouroboros.config import get_finalization_grace_sec
-        from ouroboros.deadline_utils import review_operation_timeout_sec
-
-        _slot = advisory_slot_config()
-        _session_route = parse_subagent_harness(_slot.target_id) if _slot.target_id else None
-        _task_metadata = getattr(ctx, "task_metadata", {}) or {}
-        _owner_deadline_at = str(_task_metadata.get("deadline_at") or "") if isinstance(
-            _task_metadata, dict
-        ) else ""
-        # D1/6.3: the effort field is the ONE source; any effort embedded in the
-        # target identity is dropped so it can never override the field.
-        if _session_route is not None:
-            _session_route = _dc.replace(_session_route, effort=str(_slot.effort or ""))
-        if _session_route is not None and getattr(_slot, "profile_id", ""):
-            _session_route = _dc.replace(_session_route, profile_id=_slot.profile_id)
-        drive = custody_root(ctx) if getattr(ctx, "drive_root", None) else pathlib.Path(repo_dir)
-        facts = run_delegated_review_session(
-            prompt=prompt,
-            root=str(repo_dir),
-            custody_drive=drive,
-            invocation=SessionInvocation(
-                task_id=str(getattr(ctx, "task_id", "") or ""),
-                surface="advisory_review",
-                slot_id="advisory_slot_1",
-                timeout_sec=review_operation_timeout_sec(
-                    _ADVISORY_SESSION_MAX_SECONDS,
-                    route="agent_session",
-                    deadline_at=_owner_deadline_at,
-                    reserve_sec=get_finalization_grace_sec(),
-                ),
-                owner_deadline_at=_owner_deadline_at,
-                # The owner's configured advisory slot route (6.1 SSOT) rides the
-                # invocation — the one identity+delivery value — not a parallel kwarg.
-                session_route=_session_route,
-                # The structured verdict is ASKED here exactly as the substrate's
-                # session slots ask for it (D19): a review surface that never asks can
-                # only reach its verdict through extraction, paying a light-model call
-                # and a capability delta for what the route may support natively.
-                output_schema=review_session_output_schema("advisory_review"),
-            ),
-        )
+        attempt = executor.execute()
     except Exception as exc:
         return SimpleNamespace(
             success=False, result_text="(no output)", session_id="", cost_usd=0.0,
             usage={}, error=f"{type(exc).__name__}: {exc}", stderr_tail="",
         ), ""
-    spend_final = facts["spend"] if (facts["spend"] is not None and not facts["spend_estimated"]) else None
-    result_text = str(facts["text"] or "")
-    if facts.get("conformance") == "passed":
-        # A schema-conformant session answers with the SESSION envelope
-        # ({"findings": [...]}) while every advisory consumer downstream — the
-        # strict parser, the clean-verdict sentinel, the fallback gate — reads the
-        # advisory's own ARRAY contract. Unwrap the trusted envelope here (D19's
-        # schema-first ordering), so a clean {"findings": []} lands as the bare
-        # "[]" the contract calls clean instead of as a paid extraction and a
-        # parse_failure. Non-conformant output keeps its narrative path unchanged.
-        from ouroboros.review_execution import _findings_array
-
-        try:
-            payload = json.loads(result_text.strip())
-        except (TypeError, ValueError):
-            payload = None
-        findings = _findings_array(payload)
-        if findings is not None:
-            result_text = "[]" if not findings else json.dumps(findings, ensure_ascii=False)
+    usage = dict(attempt.usage or {})
+    resolved_model = str(usage.get("resolved_model") or usage.get("delegated_route") or "")
     return SimpleNamespace(
         success=True,
-        result_text=result_text,
-        session_id=facts["run_id"],
+        result_text=str(attempt.raw_text or ""),
+        session_id=str(usage.get("delegated_run_id") or ""),
         cost_usd=0.0,  # settled by delegate_custody; never re-emitted here
-        usage={
-            "delegated_run_id": facts["run_id"],
-            "delegated_route": facts["route_id"],
-            "cost_disclosed_usd": facts["spend"],
-            "cost_estimated": facts["spend_estimated"],
-            "cost_final_usd": spend_final,
-            "settlement": facts["settlement"],
-            # The structured-verdict facts the substrate's slots also carry: whether
-            # the schema was asked at all, what the run reported, and which route(s)
-            # actually served it. Conformance is TRUSTED only on "passed" — never on
-            # run success (D19).
-            "schema_asked": bool(facts.get("schema_asked")),
-            "output_conformance": facts.get("conformance") or "",
-            "conformance_trusted": (facts.get("conformance") == "passed"),
-            "effective_route_ids": list(facts.get("effective_route_ids") or []),
-            "capability_delta": _advisory_session_deltas(facts),
-        },
+        usage=usage,
         error="",
         stderr_tail="",
-    ), str(facts["model"] or facts["route_id"])
-
-
-def _advisory_session_deltas(facts: dict) -> List[dict]:
-    """The same three landings-below-the-ask the substrate discloses (D4).
-
-    Same vocabulary as ``AgentSessionReviewExecutor``, so one disclosure contract
-    covers every delegated review surface instead of two dialects."""
-    route_id = str(facts.get("route_id") or "")
-    conformance = str(facts.get("conformance") or "")
-    deltas: List[dict] = []
-    if not facts.get("schema_asked"):
-        deltas.append({
-            "kind": "capability_delta",
-            "requested": "outputSchema (structured verdict)",
-            "effective": f"no structured output on effective route {route_id}",
-            "reason": "schema_unavailable_on_effective_route",
-        })
-    elif conformance != "passed":
-        deltas.append({
-            "kind": "capability_delta",
-            "requested": "outputSchema (structured verdict)",
-            "effective": f"outputConformance={conformance or 'absent'}",
-            "reason": "schema_not_conformed_on_effective_route",
-        })
-    effective = [str(r) for r in (facts.get("effective_route_ids") or [])]
-    if effective and set(effective) != {route_id}:
-        deltas.append({
-            "kind": "capability_delta",
-            "requested": f"route {route_id} (pinned pool)",
-            "effective": "route(s) " + ", ".join(effective),
-            "reason": "session_ran_off_pinned_route",
-        })
-    return deltas
+    ), resolved_model
 
 
 def _advisory_review_diff(
