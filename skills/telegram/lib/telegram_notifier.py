@@ -167,8 +167,13 @@ async def _check_tasks_notify(
         msg = (f"{icon} Задача {tid[:8]} готова{tail}" if lang == "ru" else f"{icon} Task {tid[:8]} done{tail}")
         send_outcome, exc = await _push_notification(api, chat_id, msg)
         if send_outcome == "transient":
+            # Stop the batch on the first transient failure: every further
+            # send would burn its full transport timeout against the same dead
+            # network (a long backlog could stall one cycle for minutes before
+            # the backoff even starts). State is already preserved — the
+            # unsent summaries stay unseen and retry next cycle.
             transient = exc
-            continue
+            break
         # "sent" or permanent "skipped": either way this notification is done.
         delivered = delivered or send_outcome == "sent"
         seen.append(tid)
@@ -196,11 +201,15 @@ def _make_notifier(api):
                 lang = str(settings.get("TELEGRAM_LANGUAGE") or "en").strip().lower()
                 state = _load_notif_state(api)
                 transient, delivered = await _check_budget_notify(api, settings, chat_id, state, lang)
-                tasks_transient, tasks_delivered = await _check_tasks_notify(
-                    api, settings, chat_id, state, lang,
-                )
-                transient = tasks_transient or transient
-                delivered = delivered or tasks_delivered
+                if transient is None:
+                    # A transient budget-send failure means the transport is
+                    # down right now: skip the tasks batch entirely instead of
+                    # burning more transport timeouts, and let the backoff
+                    # below pace the retry.
+                    transient, tasks_delivered = await _check_tasks_notify(
+                        api, settings, chat_id, state, lang,
+                    )
+                    delivered = delivered or tasks_delivered
                 _save_notif_state(api, state)
             if transient is not None:
                 # Transition logging: one warning entering degraded, one info

@@ -609,6 +609,19 @@ async def _start_poller(api):
         raise
 
 
+def _fail_permanent_poll_rejection(api, exc, revalidating: bool) -> None:
+    """Persist bridge status + log for a permanent polling rejection."""
+    if revalidating:
+        # A permanent getMe rejection during in-loop revalidation
+        # is the startup token-validation failure, merely deferred
+        # by a dead network at startup — label it the same way.
+        _save_bridge_status(api, "error", "telegram_startup_failed")
+        api.log("error", f"Telegram token validation failed: {exc}")
+    else:
+        _save_bridge_status(api, "error", "telegram_rejected")
+        api.log("error", "Telegram polling was permanently rejected.")
+
+
 async def _poller(api) -> None:
     client, offset, pinned_chat, max_updates, command_mode, lang, validated = await _start_poller(api)
 
@@ -888,15 +901,7 @@ async def _poller(api) -> None:
             await asyncio.sleep(0.1)
         except (TelegramRequestRejected, TelegramTransportError) as exc:
             if isinstance(exc, TelegramRequestRejected) and not exc.transient:
-                if revalidating:
-                    # A permanent getMe rejection during in-loop revalidation
-                    # is the startup token-validation failure, merely deferred
-                    # by a dead network at startup — label it the same way.
-                    _save_bridge_status(api, "error", "telegram_startup_failed")
-                    api.log("error", f"Telegram token validation failed: {exc}")
-                else:
-                    _save_bridge_status(api, "error", "telegram_rejected")
-                    api.log("error", "Telegram polling was permanently rejected.")
+                _fail_permanent_poll_rejection(api, exc, revalidating)
                 raise
             # Transition logging only: one line entering degraded, one on
             # recovery; consecutive transient failures stay quiet while the

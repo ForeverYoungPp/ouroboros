@@ -430,6 +430,44 @@ def test_startup_transient_getme_does_not_kill_poller(tmp_path, monkeypatch):
     assert any("Telegram poller started" in m for _lvl, m, _f in api.logs)
 
 
+def test_startup_deferred_validation_with_network_still_down_paces_with_backoff(tmp_path, monkeypatch):
+    """After a deferred (transient) startup getMe, a network that STAYS down
+    keeps the poller alive: every in-loop revalidation failure paces with the
+    monotone 5→60 backoff instead of hot-looping or raising."""
+    plugin = _load_plugin(tmp_path)
+    failures = {"count": 0}
+
+    class StillDownClient(FakeTelegramClient):
+        async def call(self, method, **kwargs):
+            if method == "getMe":
+                failures["count"] += 1
+                raise plugin.TelegramTransportError("Telegram API timed out during getMe.")
+            return {"ok": True, "result": {}}
+
+        async def get_updates(self, _offset):
+            raise AssertionError("polling must not start before validation succeeds")
+
+    monkeypatch.setattr(plugin, "TelegramClient", StillDownClient)
+    sleeps = []
+
+    async def record_sleep(delay):
+        sleeps.append(delay)
+        if len(sleeps) >= 8:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(plugin.asyncio, "sleep", record_sleep)
+    try:
+        asyncio.run(plugin._make_poller(FakeApi(tmp_path))())
+    except asyncio.CancelledError:
+        pass
+
+    assert failures["count"] >= 8  # startup + one revalidation per backoff sleep
+    assert sleeps[0] == 5
+    assert all(later >= earlier for earlier, later in zip(sleeps, sleeps[1:]))
+    assert max(sleeps) == 60
+    assert sleeps[-2:] == [60, 60]
+
+
 def test_startup_permanent_rejection_keeps_raise_semantics(tmp_path, monkeypatch):
     plugin = _load_plugin(tmp_path)
 

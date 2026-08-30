@@ -35,12 +35,17 @@ def _target():
 
 
 def _clear_proxy_env(monkeypatch):
-    """Keep transport-construction tests hermetic against ambient env proxies."""
+    """Keep transport-construction tests hermetic against ambient proxies.
+
+    Clears the env vars AND stubs ``urllib.request.getproxies`` (the source
+    the detection mirrors) so system proxies on a macOS/Windows runner cannot
+    flip these tests either."""
     for name in (
         "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
         "http_proxy", "https_proxy", "all_proxy",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("urllib.request.getproxies", lambda: {})
 
 
 def test_keepalive_socket_options_enable_keepalive_everywhere():
@@ -279,8 +284,9 @@ def test_cached_clients_keep_env_proxy_mounts_on_proxied_installs(monkeypatch):
     """With HTTP(S)_PROXY configured the cached clients are built WITHOUT an
     explicit transport: httpx enables env-proxy mounts only when no transport
     is passed, so the keepalive transport would break proxy routing."""
-    _clear_proxy_env(monkeypatch)
-    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
+    monkeypatch.setattr(
+        "urllib.request.getproxies", lambda: {"https": "http://127.0.0.1:3128"}
+    )
     sync_captured = {}
     async_captured = {}
 
@@ -315,11 +321,100 @@ def test_cached_clients_keep_env_proxy_mounts_on_proxied_installs(monkeypatch):
 
 
 def test_env_proxies_detection_ignores_no_proxy_alone(monkeypatch):
-    _clear_proxy_env(monkeypatch)
-    monkeypatch.setenv("no_proxy", "localhost")
+    monkeypatch.setattr("urllib.request.getproxies", lambda: {"no": "localhost"})
     assert net_transport.env_proxies_configured() is False
-    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
+    monkeypatch.setattr(
+        "urllib.request.getproxies",
+        lambda: {"no": "localhost", "https": "http://127.0.0.1:3128"},
+    )
     assert net_transport.env_proxies_configured() is True
+
+
+def test_system_only_proxy_with_empty_env_disables_keepalive_client(monkeypatch):
+    """A system-proxy install (macOS SystemConfiguration / Windows registry —
+    surfaced by urllib.request.getproxies() with NO proxy env vars) must keep
+    SDK default construction: the detection mirrors httpx, so the explicit
+    transport is skipped and the install keeps its only working egress."""
+    for name in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        "urllib.request.getproxies", lambda: {"http": "http://sysproxy.local:8080"}
+    )
+    assert net_transport.env_proxies_configured() is True
+    assert net_transport.keepalive_http_client() is None
+    assert net_transport.keepalive_http_client(async_client=True) is None
+
+
+def test_transport_factory_survives_httpx_without_socket_options(monkeypatch):
+    """httpx < 0.25 has no socket_options parameter (the dependency pin is a
+    bare httpx): the factory retries without it — keepalive tuning silently
+    absent — instead of raising TypeError at every remote client build."""
+    built = []
+
+    class OldTransport:
+        def __init__(self, **kwargs):
+            if "socket_options" in kwargs:
+                raise TypeError(
+                    "__init__() got an unexpected keyword argument 'socket_options'"
+                )
+            built.append(kwargs)
+
+    monkeypatch.setattr(httpx, "HTTPTransport", OldTransport)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", OldTransport)
+
+    transport = net_transport.remote_httpx_transport(trust_env=False)
+    async_transport = net_transport.remote_httpx_transport(True)
+
+    assert isinstance(transport, OldTransport)
+    assert isinstance(async_transport, OldTransport)
+    assert len(built) == 2
+    assert all("socket_options" not in kwargs for kwargs in built)
+    assert built[0]["trust_env"] is False
+
+
+def test_keepalive_client_falls_back_to_none_when_default_client_rejects_transport(monkeypatch):
+    """A Default client class that rejects the transport kwarg (a future SDK
+    generation) degrades to SDK default construction (None) instead of
+    failing the LLM client build."""
+    _clear_proxy_env(monkeypatch)
+
+    def rejecting_default_client(**_kwargs):
+        raise TypeError("unexpected keyword argument 'transport'")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "openai",
+        types.SimpleNamespace(
+            DefaultHttpxClient=rejecting_default_client,
+            DefaultAsyncHttpxClient=rejecting_default_client,
+        ),
+    )
+    assert net_transport.keepalive_http_client() is None
+    assert net_transport.keepalive_http_client(async_client=True) is None
+
+
+def test_cached_client_without_default_classes_still_builds(monkeypatch):
+    """An openai SDK build without the Default client classes: the cached
+    client is still constructed (max_retries=0), just without an explicit
+    http_client — keepalive tuning absent, construction never fails."""
+    _clear_proxy_env(monkeypatch)
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI),
+    )
+    client = LLMClient._new_remote_client(_target())
+
+    assert isinstance(client, FakeOpenAI)
+    assert captured.get("max_retries") == 0
+    assert "http_client" not in captured
 
 
 def test_web_search_openai_client_carries_keepalive_transport(monkeypatch):
@@ -353,3 +448,65 @@ def test_web_search_openai_client_carries_keepalive_transport(monkeypatch):
     assert isinstance(captured["http_client"], FakeDefaultHttpxClient)
     assert len(built_clients) == 1
     assert isinstance(built_clients[0].get("transport"), httpx.HTTPTransport)
+
+
+def test_llm_openrouter_web_search_routes_through_net_transport_seam(monkeypatch):
+    """Call-site wiring: llm.py's openrouter web-search server tool builds its
+    client through net_transport.web_search_openai_client (seam assertion —
+    no private httpx internals)."""
+    from ouroboros import llm as llm_mod
+    from ouroboros import net_transport as nt_mod
+
+    recorded = {}
+
+    def seam(**kwargs):
+        recorded.update(kwargs)
+        raise RuntimeError("seam sentinel")
+
+    monkeypatch.setattr(nt_mod, "web_search_openai_client", seam)
+    with patch.object(llm_mod, "_physical_candidate", side_effect=AssertionError):
+        try:
+            llm_mod.openrouter_web_search_server_tool(
+                api_key="k", model="openai/gpt-5.5", query="q",
+                search_context_size="low", timeout=12.0,
+            )
+        except RuntimeError as exc:
+            assert "seam sentinel" in str(exc)
+        else:
+            raise AssertionError("client construction seam was not reached")
+
+    assert recorded["api_key"] == "k"
+    assert recorded["base_url"] == "https://openrouter.ai/api/v1"
+    assert recorded["timeout"] == 12.0
+
+
+def test_tools_web_search_routes_through_net_transport_seam(monkeypatch):
+    """Call-site wiring: tools/search.py's OpenAI web-search leg builds its
+    client through net_transport.web_search_openai_client. The backend pin
+    'openai' keeps the failure path hermetic (no cascade to ddgs)."""
+    from types import SimpleNamespace
+
+    from ouroboros import net_transport as nt_mod
+    from ouroboros.tools import search as search_mod
+
+    recorded = {}
+
+    def seam(**kwargs):
+        recorded.update(kwargs)
+        raise RuntimeError("seam sentinel")
+
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_BACKEND", "openai")
+    monkeypatch.setattr(nt_mod, "web_search_openai_client", seam)
+    monkeypatch.setattr(
+        search_mod,
+        "_resolve_openai_client_settings",
+        lambda: ("key", "https://api.test/v1", "openai", "official"),
+    )
+    ctx = SimpleNamespace(task_metadata={}, pending_events=[], task_id="")
+
+    result = search_mod._web_search(ctx, "seam query")
+
+    assert recorded["api_key"] == "key"
+    assert recorded["base_url"] == "https://api.test/v1"
+    assert isinstance(recorded["timeout"], float)
+    assert "seam sentinel" in result

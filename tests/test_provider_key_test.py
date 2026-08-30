@@ -572,6 +572,15 @@ def test_typed_payment_required_maps_to_no_credits():
 
 
 def test_ephemeral_openai_client_disables_sdk_retries(monkeypatch):
+    # Hermetic against proxied runners: with any proxy httpx would honor the
+    # keepalive helper deliberately returns None (SDK default construction),
+    # which would drop the http_client kwarg this test asserts on.
+    for name in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("urllib.request.getproxies", lambda: {})
     captured = {}
     http_clients = []
 

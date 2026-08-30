@@ -8,8 +8,19 @@ import pathlib
 import stat
 import subprocess
 import time
+from types import SimpleNamespace
+
+import pytest
 
 from supervisor import git_ops, update_source
+
+# The hung-git tests fake `git` with a #!/bin/sh PATH shim; that shim is not
+# executable on Windows (the real git would run and the assertions would
+# lie), so they are POSIX-only. The pure-monkeypatch shape tests below stay
+# cross-platform.
+_posix_shim = pytest.mark.skipif(
+    os.name == "nt", reason="uses a #!/bin/sh PATH shim; POSIX-only"
+)
 
 
 def _git(repo: pathlib.Path, *args: str) -> str:
@@ -80,11 +91,15 @@ def test_git_network_bounded_rejects_missing_cwd(tmp_path):
     assert "cwd" in err
 
 
-def test_git_network_bounded_timeout_kills_process_tree(tmp_path, monkeypatch):
-    """A hung network git is killed together with its children and returns the
-    typed timeout shape; nothing keeps holding the repository afterwards — a
-    real follow-up network git command in the same clone must succeed (this
-    passing follow-up IS the lock-release contract; no extra cleanup exists)."""
+@_posix_shim
+def test_git_network_bounded_timeout_kills_tree_and_repo_stays_operable(tmp_path, monkeypatch):
+    """A hung network git is killed together with its children (kill + reap)
+    and returns the typed timeout shape. The shim drops a lockfile under the
+    clone's ``.git`` before sleeping: SIGKILL leaves such stale lockfiles
+    behind — the runner does no cleanup, and clearing them is left to git's
+    own per-file tolerance. The contract asserted here is that the repository
+    stays operable: a real follow-up ``git fetch origin`` in the same clone
+    succeeds."""
     upstream = _seed_repo(tmp_path / "upstream")
     clone = tmp_path / "clone"
     subprocess.run(
@@ -100,10 +115,12 @@ def test_git_network_bounded_timeout_kills_process_tree(tmp_path, monkeypatch):
     shim_dir.mkdir()
     pid_dir = tmp_path / "pids"
     pid_dir.mkdir()
+    stale_lock = clone / ".git" / "config.lock"
     fake_git = shim_dir / "git"
     fake_git.write_text(
         "#!/bin/sh\n"
         'echo $$ > "$NETRES_PID_DIR/parent.pid"\n'
+        'touch "$NETRES_STALE_LOCK"\n'
         "sleep 300 &\n"
         'echo $! > "$NETRES_PID_DIR/child.pid"\n'
         "wait\n",
@@ -112,6 +129,7 @@ def test_git_network_bounded_timeout_kills_process_tree(tmp_path, monkeypatch):
     fake_git.chmod(fake_git.stat().st_mode | stat.S_IXUSR)
     monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{original_path}")
     monkeypatch.setenv("NETRES_PID_DIR", str(pid_dir))
+    monkeypatch.setenv("NETRES_STALE_LOCK", str(stale_lock))
 
     rc, out, err = update_source._git_network_bounded(
         ["fetch", "origin"], cwd=clone, timeout=1.0,
@@ -137,8 +155,12 @@ def test_git_network_bounded_timeout_kills_process_tree(tmp_path, monkeypatch):
         else:
             raise AssertionError(f"process {pid} survived the bounded timeout kill")
 
-    # Contract: the killed fetch left nothing behind that breaks a real
-    # follow-up network git command in the same clone.
+    # SIGKILL leaves the stale lockfile behind — honesty pin: the runner does
+    # NOT clean it up.
+    assert stale_lock.exists()
+
+    # Contract: the repository stays operable — a real follow-up network git
+    # command in the same clone succeeds despite the stale lockfile.
     monkeypatch.setenv("PATH", original_path)
     rc2, _out2, err2 = update_source._git_network_bounded(
         ["fetch", "origin"], cwd=clone, timeout=60,
@@ -232,3 +254,88 @@ def test_ci_push_branch_is_bounded_with_repo_cwd_and_keeps_shape(tmp_path, monke
     ok, message = ci._push_branch(str(repo), "feature")
     assert ok is False
     assert "exceeded" in message
+
+
+def test_run_git_network_cmd_failure_reports_stdout_when_stderr_is_empty(tmp_path, monkeypatch):
+    """Some git failures report only on stdout; the run_cmd-shaped error must
+    carry that text instead of an empty STDERR-only message."""
+    from ouroboros.tools import git as git_tools
+
+    monkeypatch.setattr(
+        update_source,
+        "_git_network_bounded",
+        lambda args, **_kw: (1, "remote: rejected by hook", ""),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        git_tools._run_git_network_cmd(["git", "fetch", "origin"], cwd=tmp_path)
+    message = str(excinfo.value)
+    assert "Command failed: git fetch origin" in message
+    assert "remote: rejected by hook" in message
+
+
+def test_commit_path_auto_push_timeout_is_best_effort_warning(tmp_path, monkeypatch):
+    """Through the commit path: a push timeout in the real ``_auto_push`` →
+    real ``push_to_remote`` → bounded-runner chain leaves the commit itself
+    successful, with the push-failed warning carried in the result."""
+    from ouroboros.tools import git as git_module
+
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_dev="ouroboros",
+        current_task_type="task",
+        task_id="t1",
+        task_metadata={},
+        last_push_succeeded=True,
+        pending_events=[],
+    )
+
+    def fake_run(cmd, cwd=None, **_kw):
+        if cmd[:2] == ["git", "commit"]:
+            return ""
+        if cmd[:2] == ["git", "rev-parse"]:
+            return "a" * 40 + "\n"
+        return ""
+
+    def fake_stage_cycle(_ctx, _msg, _start, **_kw):
+        return {
+            "status": "passed", "message": "",
+            "pre_fingerprint": {"fingerprint": "x"},
+            "post_fingerprint": {"fingerprint": "x", "binding": {}},
+        }
+
+    monkeypatch.setattr(git_module, "run_cmd", fake_run)
+    monkeypatch.setattr(git_module, "_run_reviewed_stage_cycle", fake_stage_cycle)
+    monkeypatch.setattr(git_module, "_task_attributed_commit_paths",
+                        lambda _ctx, paths: (paths, None, "", None))
+    monkeypatch.setattr(git_module, "_check_overlapping_review_attempt", lambda _ctx: "")
+    monkeypatch.setattr(git_module, "_prepare_review_commit_worktree",
+                        lambda _ctx, _tx: (False, ""))
+    monkeypatch.setattr(git_module, "_verify_reviewed_commit_binding",
+                        lambda *_a, **_kw: (True, ""))
+    monkeypatch.setattr(git_module, "_managed_post_commit_tests_gate",
+                        lambda *_a, **_kw: "")
+    monkeypatch.setattr(git_module, "_auto_tag_on_version_bump", lambda *_a, **_kw: "")
+    monkeypatch.setattr(git_module, "_post_commit_result", lambda *_a, **_kw: None)
+    monkeypatch.setattr(git_module, "_record_commit_attempt", lambda *_a, **_kw: None)
+    monkeypatch.setattr(git_module, "_acquire_git_lock", lambda _ctx: tmp_path / "git.lock")
+    monkeypatch.setattr(git_module, "_release_git_lock", lambda _path: None)
+
+    from supervisor import update_merge
+
+    monkeypatch.setattr(update_merge, "managed_assisted_tx_for",
+                        lambda _task_id, _meta: (None, ""))
+
+    # The push leg stays REAL: _auto_push → push_to_remote → bounded runner.
+    monkeypatch.setattr(git_ops, "_has_remote", lambda _name: True)
+    monkeypatch.setattr(
+        git_ops,
+        "_git_network_bounded",
+        lambda _cmd, **_kw: (git_ops.FETCH_TIMEOUT_RC, "", "git push exceeded 300s and was terminated"),
+    )
+
+    result = git_module._repo_commit_push(ctx, "netres: best-effort push test")
+
+    assert result.startswith("OK: committed to ouroboros:")
+    assert "[push skipped: git push failed:" in result
+    assert "exceeded" in result
+    assert ctx.last_push_succeeded is False

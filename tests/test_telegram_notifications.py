@@ -184,6 +184,89 @@ def test_task_notification_retries_before_advancing_ledger(tmp_path, monkeypatch
     assert Flaky.attempts == 2 and state["notified_task_ids"] == ["retry1"]
 
 
+def test_tasks_notify_stops_batch_on_first_transient_failure(tmp_path, monkeypatch):
+    """A transient send failure ends the batch: with three pending summaries
+    exactly ONE send is attempted in the cycle (each further send would burn
+    its full transport timeout against the same dead network) and no summary
+    is marked seen, so all three retry next cycle."""
+    nt = _load(); api, data = _api(tmp_path)
+
+    class AlwaysOffline:
+        attempts = 0
+        def __init__(self, _token): pass
+        async def send_message(self, *_args, **_kwargs):
+            AlwaysOffline.attempts += 1
+            raise nt.TelegramTransportError("offline")
+
+    monkeypatch.setattr(nt, "TelegramClient", AlwaysOffline)
+    with open(data / "logs" / "chat.jsonl", "w", encoding="utf-8") as f:
+        for tid in ("t1", "t2", "t3"):
+            f.write(json.dumps({"type": "task_summary", "task_id": tid,
+                                "outcome_axes": {"lifecycle": "completed"}}) + "\n")
+    state = {"notified_task_ids": []}
+    transient, delivered = asyncio.run(
+        nt._check_tasks_notify(api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, state, "en")
+    )
+
+    assert AlwaysOffline.attempts == 1
+    assert transient is not None and delivered is False
+    assert state["notified_task_ids"] == []
+
+
+def test_notifier_cycle_makes_one_send_attempt_when_transport_is_down(tmp_path, monkeypatch):
+    """One dead-network cycle = exactly one send attempt, then backoff: a
+    transient budget-send failure skips the tasks batch entirely."""
+    nt = _load(); api, data = _api(tmp_path)
+
+    class AlwaysOffline:
+        attempts = 0
+        def __init__(self, _token): pass
+        async def send_message(self, *_args, **_kwargs):
+            AlwaysOffline.attempts += 1
+            raise nt.TelegramTransportError("offline")
+
+    monkeypatch.setattr(nt, "TelegramClient", AlwaysOffline)
+
+    async def runtime_state(_api):
+        return {"spent_usd": 850, "budget_limit": 1000, "budget_pct": 85}
+
+    monkeypatch.setattr(nt, "_load_runtime_state", runtime_state)
+    with open(data / "logs" / "chat.jsonl", "w", encoding="utf-8") as f:
+        for tid in ("t1", "t2", "t3"):
+            f.write(json.dumps({"type": "task_summary", "task_id": tid,
+                                "outcome_axes": {"lifecycle": "completed"}}) + "\n")
+    tasks_checks = []
+    real_tasks_check = nt._check_tasks_notify
+
+    async def counting_tasks_check(*args, **kwargs):
+        tasks_checks.append(True)
+        return await real_tasks_check(*args, **kwargs)
+
+    monkeypatch.setattr(nt, "_check_tasks_notify", counting_tasks_check)
+    monkeypatch.setattr(
+        nt,
+        "_load_settings",
+        lambda _api: {
+            "TELEGRAM_NOTIFY_BUDGET": "on",
+            "TELEGRAM_NOTIFY_TASKS": "on",
+            "TELEGRAM_CHAT_ID": "42",
+        },
+    )
+    sleeps = []
+
+    async def record_sleep(delay):
+        sleeps.append(delay)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(nt.asyncio, "sleep", record_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(nt._make_notifier(api)())
+
+    assert AlwaysOffline.attempts == 1  # budget send only; tasks batch skipped
+    assert tasks_checks == []
+    assert sleeps == [5]  # backoff, not the healthy 30s pacing sleep
+
+
 def test_notifier_ignores_ambient_chat_id(monkeypatch):
     nt = _load()
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")

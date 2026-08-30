@@ -1509,10 +1509,13 @@ is detected by kernel probes instead of hanging until the read timeout: on
 Linux/macOS the probe timing is tuned to detect within minutes, other
 platforms get `SO_KEEPALIVE` with OS-default timing. The cached-client
 transports also carry SDK-equivalent pool limits (an explicit transport
-ignores Client-level limits). When HTTP(S)_PROXY/ALL_PROXY env proxies are
-configured, the cached and web-search clients skip the explicit transport
-(httpx env-proxy mounts require it absent) — disclosed residual: proxy-routed
-installs run without keepalive tuning. Further residuals without these socket
+ignores Client-level limits). When any proxy httpx would honor is configured
+(HTTP(S)_PROXY/ALL_PROXY env vars, macOS SystemConfiguration, the Windows
+registry — mirrored via `urllib.request.getproxies()`), the cached and
+web-search clients skip the explicit transport (httpx env-proxy mounts
+require it absent) — disclosed residual: proxy-routed installs run without
+keepalive tuning, as do httpx builds predating the transport
+`socket_options` parameter (< 0.25). Further residuals without these socket
 options: the native Anthropic `requests` session and the anthropic web-search
 client, the GigaChat library client, and the short-lived `llm_probe`
 ephemeral probe clients.

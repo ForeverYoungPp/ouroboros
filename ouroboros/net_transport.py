@@ -35,9 +35,17 @@ def remote_httpx_transport(
     }
     if limits is not None:
         kwargs["limits"] = limits
-    if async_client:
-        return httpx.AsyncHTTPTransport(**kwargs)
-    return httpx.HTTPTransport(**kwargs)
+    transport_cls = httpx.AsyncHTTPTransport if async_client else httpx.HTTPTransport
+    try:
+        return transport_cls(**kwargs)
+    except TypeError:
+        # httpx < 0.25 has no ``socket_options`` parameter; the dependency pin
+        # is a bare ``httpx``, so such a venv is legal. Rebuild without the
+        # keepalive tuning (silently absent) rather than killing every remote
+        # call at client construction — same guard shape as the openai
+        # Default-client getattr fallback below.
+        kwargs.pop("socket_options", None)
+        return transport_cls(**kwargs)
 
 
 def _sdk_pool_limits():
@@ -55,17 +63,21 @@ def _sdk_pool_limits():
 
 
 def env_proxies_configured() -> bool:
-    """True when HTTP(S)_PROXY/ALL_PROXY-style env proxies are configured.
+    """True when any proxy httpx would honor is configured.
 
-    httpx honors env proxies only when no explicit transport is passed
-    (``allow_env_proxies = trust_env and transport is None``), so attaching
-    the keepalive transport on a proxy-routed install would silently break
-    proxy routing. ``no_proxy`` alone does not count.
+    Mirrors httpx (``get_environment_proxies`` builds its mounts from
+    ``urllib.request.getproxies()``): that includes not only the
+    HTTP(S)_PROXY/ALL_PROXY env vars but also macOS SystemConfiguration and
+    the Windows registry, so a system-proxy install (no env vars; a typical
+    GUI-launched macOS app) is detected too. httpx honors those proxies only
+    when no explicit transport is passed, so attaching the keepalive
+    transport there would silently break the install's only working egress.
+    A lone ``no``/NO_PROXY entry does not count.
     """
     import urllib.request
 
-    proxies = urllib.request.getproxies_environment()
-    return any(scheme != "no" for scheme in proxies)
+    proxies = urllib.request.getproxies()
+    return any(scheme in ("http", "https", "all") for scheme in proxies)
 
 
 def keepalive_http_client(async_client: bool = False):
@@ -89,13 +101,22 @@ def keepalive_http_client(async_client: bool = False):
         # default construction (no keepalive tuning) rather than failing the
         # LLM client construction over a tuning concern.
         return None
-    return cls(
-        transport=remote_httpx_transport(async_client, limits=_sdk_pool_limits())
-    )
+    try:
+        return cls(
+            transport=remote_httpx_transport(async_client, limits=_sdk_pool_limits())
+        )
+    except TypeError:
+        # A future SDK generation whose Default client rejects the transport
+        # object falls back to SDK default construction the same way.
+        return None
 
 
 def make_no_proxy_client(target: Dict[str, Any], timeout: Any) -> Tuple[Any, Any]:
-    """Per-call OpenAI client fully isolated from proxy/SSL environment."""
+    """Per-call OpenAI client fully isolated from proxy/SSL environment.
+
+    ``timeout`` is the caller's explicit per-call bound (an ``httpx.Timeout``
+    or a float); no default is applied here.
+    """
     import httpx
     from openai import OpenAI
 
@@ -116,7 +137,10 @@ def make_no_proxy_client(target: Dict[str, Any], timeout: Any) -> Tuple[Any, Any
 
 
 def make_no_proxy_async_client(target: Dict[str, Any], timeout: Any) -> Tuple[Any, Any]:
-    """Async variant of :func:`make_no_proxy_client`."""
+    """Async variant of :func:`make_no_proxy_client`.
+
+    ``timeout`` is the caller's explicit per-call bound, as above.
+    """
     import httpx
     from openai import AsyncOpenAI
 
