@@ -897,6 +897,15 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
                 host_fallback=False,
             )
         if any(str(params.get(key) or "").strip() for key in ("root", "bucket", "skill_name")):
+            # A pre-custody refusal is still a durable ATTEMPT fact: without the
+            # START_BLOCKED row, the evidence read "delegate_start never called"
+            # over a call the registry provably saw (D5 evidence collapse).
+            from ouroboros.delegate_evidence import record_start_blocked
+
+            record_start_blocked(
+                ctx, str(getattr(ctx, "task_id", "") or ""),
+                "configured_actor_resource_mismatch",
+            )
             return _fail(
                 "delegate_start", "configured_actor_resource_mismatch",
                 "An actor-first configured session may start only its assigned route, "

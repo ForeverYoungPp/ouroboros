@@ -1868,7 +1868,21 @@ class ToolRegistry:
             # ONLY to the isolated surface (active_workspace); reads use the read roots;
             # browser evaluate remains available on the current page; the browser
             # handler retains its owner/self-lowering checks.
-            if entry.name in _ROOT_ARG_REPO_WRITE_TOOLS or entry.name in _GENERIC_VCS_TARGET_TOOLS:
+            if entry.name == "delegate_start":
+                # The exact-resource payload selector is a TRAP here: an acting
+                # child can never write root=skill_payload, yet the schema
+                # advertised it as root's only enum value - and twice a nanny
+                # took the bait, was refused by generic target binding before
+                # the precise configured_actor_resource_mismatch could answer,
+                # and rebuilt the work natively (the two historical
+                # Minecraft-widget incidents). Hide the whole selector triple;
+                # ordinary bound starts and retry_of need none of it, and the
+                # top-level principal's schema is untouched.
+                schema = copy.deepcopy(schema)
+                props = schema.get("parameters", {}).get("properties", {})
+                for field in ("root", "bucket", "skill_name"):
+                    props.pop(field, None)
+            elif entry.name in _ROOT_ARG_REPO_WRITE_TOOLS or entry.name in _GENERIC_VCS_TARGET_TOOLS:
                 schema = copy.deepcopy(schema)
                 root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
                 if isinstance(root_schema.get("enum"), list):
@@ -3548,8 +3562,19 @@ class ToolRegistry:
             if heal_block:
                 return heal_block
         workspace_mode = bool(getattr(self._ctx, "is_workspace_mode", lambda: False)())
+        # Configured-actor validation PRECEDES generic target binding: a
+        # configured session child passing any exact-resource selector gets the
+        # handler's precise configured_actor_resource_mismatch, not the generic
+        # payload-binding TOOL_ACCESS_BLOCKED that twice read as "workspace
+        # authority lost" and pushed the nanny into native rebuilds.
+        configured_delegate_selector = (
+            name == "delegate_start"
+            and isinstance(getattr(self._ctx, "_configured_actor_bootstrap", None), dict)
+            and any(str(args.get(key) or "").strip()
+                    for key in ("root", "bucket", "skill_name"))
+        )
         effective_constraint = task_constraint
-        if entry is not None:
+        if entry is not None and not configured_delegate_selector:
             effective_constraint, payload_error = _payload_dispatch_constraint(
                 self._ctx,
                 name=name,
@@ -3560,7 +3585,8 @@ class ToolRegistry:
             if payload_error:
                 return payload_error
         resolved_binding = None
-        if entry is not None and _target_binding_operation(name, args) is not None:
+        if (entry is not None and not configured_delegate_selector
+                and _target_binding_operation(name, args) is not None):
             try:
                 resolved_binding = _build_builtin_target_binding(self._ctx, name, args)
             except Exception as exc:
