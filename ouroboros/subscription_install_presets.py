@@ -347,6 +347,37 @@ def _resolve_surface(seats: Sequence[PresetSeat],
     return rows, None
 
 
+def _inline_reviewer_slots_json(triad: Sequence[Mapping[str, Any]],
+                                scope: Sequence[Mapping[str, Any]],
+                                advisory: Mapping[str, Any]) -> str:
+    """Inline reviewer routes for the owner-configured path.
+
+    An owner draft is validate-only: the preset never extends or edits the
+    owner's roster, so its reviewer seats cannot mint reference rows — they
+    stay self-contained inline routes (4=A references belong to the roster
+    the preset itself ships)."""
+    def _rows(resolved: Sequence[Mapping[str, Any]], surface: str) -> List[Dict[str, Any]]:
+        return [
+            {
+                "slot_id": _slot_id(surface, int(row["position"])),
+                "route": {"kind": "agent_session", "target_id": str(row["target_id"])},
+                "effort": str(row["effort"]),
+            }
+            for row in resolved
+        ]
+
+    payload = {
+        "triad": _rows(triad, SURFACE_TRIAD),
+        "scope": _rows(scope, SURFACE_SCOPE),
+        "advisory": {
+            "enabled": True,
+            "route": {"kind": "agent_session", "target_id": str(advisory["target_id"])},
+            "effort": str(advisory["effort"]),
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=False)
+
+
 _REVIEW_SEAT_RECOMMENDATION = (
     "Review-lane seat minted at onboarding; also selectable for delegated "
     "child work when its strengths fit."
@@ -650,11 +681,16 @@ def compile_install_preset(
             if refusal is not None:
                 return SubscriptionInstallPreset(connected=connected, refusal=refusal)
             resolved[surface] = rows
-        available, reviewer_slots, ref_diagnostics = _reference_reviewer_rows(
-            available, resolved[SURFACE_TRIAD], resolved[SURFACE_SCOPE],
-            resolved[SURFACE_ADVISORY][0])
-        if ref_diagnostics:
-            diagnostics = tuple(diagnostics) + tuple(ref_diagnostics)
+        if configured_subagents is None:
+            available, reviewer_slots, ref_diagnostics = _reference_reviewer_rows(
+                available, resolved[SURFACE_TRIAD], resolved[SURFACE_SCOPE],
+                resolved[SURFACE_ADVISORY][0])
+            if ref_diagnostics:
+                diagnostics = tuple(diagnostics) + tuple(ref_diagnostics)
+        else:
+            reviewer_slots = _inline_reviewer_slots_json(
+                resolved[SURFACE_TRIAD], resolved[SURFACE_SCOPE],
+                resolved[SURFACE_ADVISORY][0])
         invalid = _validate_against_parser(
             reviewer_slots, serialize_configured_subagents(available))
         if invalid is not None:

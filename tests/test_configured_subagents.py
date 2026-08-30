@@ -21,6 +21,7 @@ from ouroboros.configured_subagents import (
     configured_subagents_fingerprint,
     normalize_configured_subagents,
     parse_configured_subagents,
+    serialize_configured_subagents,
     resolve_configured_subagents,
     resolve_settings_subagent_candidate,
 )
@@ -62,7 +63,12 @@ def test_strict_config_round_trips_object_and_json_to_one_canonical_string():
     config_from_json = parse_configured_subagents(canonical)
 
     assert config_from_object == config_from_json
-    assert json.loads(canonical) == _config()
+    # `name` is retired (1=A): the canonical string is the fixture minus the
+    # legacy key — dropping it on serialize IS the migration.
+    expected = _config()
+    for item in expected["items"]:
+        item.pop("name", None)
+    assert json.loads(canonical) == expected
     assert canonical == normalize_configured_subagents(canonical)[1]
     assert configured_subagents_fingerprint(config_from_object) == (configured_subagents_fingerprint(config_from_json))
     assert LEGACY_SUBAGENT_COMPATIBILITY == "remove_after_next_minor_release"
@@ -126,11 +132,19 @@ def test_maximum_ten_is_real_and_row_precise():
         parse_configured_subagents(_config(*(_row(f"row-{i}") for i in range(11))))
 
 
-def test_optional_name_is_derived_but_an_explicit_non_string_is_rejected():
+def test_legacy_name_is_accepted_and_dropped_never_fabricated():
+    """1=A: identity is the neutral id + derived facts; a legacy `name`
+    parses and is dropped, nothing invents a title-cased label, and a
+    non-string value still refuses typed."""
     row = _row("owner_builder")
     row.pop("name")
     parsed = parse_configured_subagents(_config(row))
-    assert parsed.items[0].name == "Owner Builder"
+    assert parsed.items[0].name == ""
+
+    row["name"] = "Legacy Label"
+    parsed = parse_configured_subagents(_config(row))
+    assert parsed.items[0].name == ""
+    assert '"name"' not in serialize_configured_subagents(parsed)
 
     row["name"] = 7
     with pytest.raises(ValueError, match="name must be a string"):
@@ -170,7 +184,9 @@ def test_exact_preset_receipt_preserves_source_until_owner_edits_the_rows(source
     assert generated.source == source
 
     edited = json.loads(settings[SUBAGENTS_SETTING])
-    edited["items"][0]["name"] = "Owner edited"
+    # `name` is retired and dropped on parse, so editing it can no longer
+    # count as an owner edit; a semantic-field edit still flips the source.
+    edited["items"][0]["recommended_use"] = "Owner edited"
     settings[SUBAGENTS_SETTING] = json.dumps(edited)
     configured = resolve_configured_subagents(settings)
     assert configured.source == SOURCE_CONFIGURED
@@ -383,22 +399,17 @@ def test_settings_legacy_singleton_uses_the_canonical_linear_compiler(
     assert [
         (
             row.subagent_id,
-            row.name,
             row.route.target_id,
             row.route.credential_profile_id,
         )
         for row in resolution.config.items
     ] == [
-        ("primary-builder", "Primary builder", "claude=claude-opus-5", "owner-account"),
-        ("fast-scout", "Fast scout", "openai/gpt-5.6-luna", ""),
-        (
-            "independent-perspective",
-            "Independent perspective",
-            "openai/gpt-5.6-sol",
-            "",
-        ),
-        ("legacy-heavy", "Primary builder", "owner/custom-heavy", ""),
+        ("primary-builder", "claude=claude-opus-5", "owner-account"),
+        ("fast-scout", "openai/gpt-5.6-luna", ""),
+        ("independent-perspective", "openai/gpt-5.6-sol", ""),
+        ("legacy-heavy", "owner/custom-heavy", ""),
     ]
+    assert all(row.name == "" for row in resolution.config.items)
 
     duplicate_heavy = dict(settings)
     duplicate_heavy["OUROBOROS_MODEL_HEAVY"] = "openai/gpt-5.6-sol"

@@ -220,7 +220,8 @@ def test_generic_settings_save_validates_and_canonicalizes_available_subagents(
     canonical = saved[SUBAGENTS_SETTING]
     assert isinstance(canonical, str)
     parsed = parse_configured_subagents(canonical)
-    assert parsed.items[0].name == "Owner Row"
+    assert parsed.items[0].name == ""
+    assert '"name"' not in canonical
 
 
 def test_generic_settings_save_rejects_malformed_available_subagents_without_write(
