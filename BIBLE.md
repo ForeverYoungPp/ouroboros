@@ -247,8 +247,12 @@ may not weaken it.
    this is a declared review subject, not partial coverage (amendment
    proposed in the update-flow redesign contribution; effective through
    the standard reviewed release that lands it).
-2. **Advisory pre-review**: a cheap, staleness-aware preflight on the
-   staged snapshot. It catches omissions before authoritative review, but
+2. **Preflight pre-review** (historically "advisory pre-review"): a
+   cheap, staleness-aware preflight on the staged snapshot. Its critic is
+   whatever delivery the owner configured — a routed model running a
+   bounded read-only inspection episode, a delegated agent session, or a
+   configured-subagent reference; the delivery actor never changes these
+   semantics. It catches omissions before authoritative review, but
    Ouroboros may skip it by LLM judgment when it is slow, unhealthy,
    unavailable, or unlikely to add value. The skip is explicit and
    durably audited; it does not alter any other applicable deterministic
@@ -339,7 +343,12 @@ following bounds are constitutional:
     see what a vendor session read; recording it awaits an upstream
     Claudexor capability to report a session's read events. Until that
     exists, the coverage manifest states plainly that coverage is the
-    session's own retrieval and is not host-attested.
+    session's own retrieval and is not host-attested. A NATIVE retrieving
+    reviewer — an in-process bounded inspection episode whose read tools
+    the host itself executes — is the one delivery in this mode whose
+    reads ARE host-observed: its receipts record `host_observed`
+    provenance. This strengthens disclosure for that class; it changes no
+    bound for vendor sessions and grants no authority by itself.
 
   This bound applies ONLY where scope review applies; the diff-reviewer
   triad has no context floor of its own and gains none here.

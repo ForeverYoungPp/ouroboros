@@ -39,7 +39,7 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "send_user_message", "send_photo", "send_video", "send_file",
     "switch_model",
     "request_restart", "promote_to_stable",
-    "advisory_review", "review_status", "task_acceptance_review", "verify_and_record",
+    "preflight_review", "advisory_review", "review_status", "task_acceptance_review", "verify_and_record",
     # Heal mode blocks enable_tools, so repair/review tools must be core.
     "list_skills", "skill_review", "skill_preflight",
     "submit_skill_to_hub",
@@ -144,6 +144,7 @@ UNTRUNCATED_TOOL_RESULTS: frozenset[str] = frozenset({
     "vcs_commit_reviewed",
     "plan_task",
     "task_acceptance_review",
+    "preflight_review",
     "advisory_review",
     "skill_review",
     "review_status",

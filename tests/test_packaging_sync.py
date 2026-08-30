@@ -38,20 +38,20 @@ def test_push_to_remote_push_tags_compatibility(monkeypatch):
     monkeypatch.setattr(git_ops, "_has_remote", lambda _name: True)
     monkeypatch.setattr(
         git_ops,
-        "git_capture",
+        "_git_network_bounded",
         lambda command, **_kwargs: commands.append(list(command)) or (0, "", ""),
     )
 
     ok, _ = git_ops.push_to_remote("feature", push_tags=False)
     assert ok is True
-    assert commands == [["git", "push", "-u", "origin", "feature"]]
+    assert commands == [["push", "-u", "origin", "feature"]]
 
     commands.clear()
     ok, _ = git_ops.push_to_remote("feature", push_tags=True)
     assert ok is True
     assert commands == [
-        ["git", "push", "-u", "origin", "feature"],
-        ["git", "push", "origin", "--tags"],
+        ["push", "-u", "origin", "feature"],
+        ["push", "origin", "--tags"],
     ]
 
 

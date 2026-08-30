@@ -51,7 +51,6 @@ def test_settings_defaults_include_phase2_keys():
         SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]
         == "openai/gpt-5.6-sol-pro"
     )
-    assert SETTINGS_DEFAULTS["CLAUDE_CODE_MODEL"] == "claude-sonnet-5"
     assert SETTINGS_DEFAULTS["TOTAL_BUDGET"] == 200.0
     assert SETTINGS_DEFAULTS["OUROBOROS_PER_TASK_COST_USD"] == 50.0
 
@@ -1029,7 +1028,17 @@ def test_run_shell_blocks_sort_uniq_protected_output_paths(cmd, tmp_path, monkey
     assert "BIBLE.md" in result or "protected" in result.lower()
 
 
-@pytest.mark.parametrize("cmd", ["cat BIBLE.md", "git diff BIBLE.md", "du BIBLE.md"])
+@pytest.mark.parametrize("cmd", [
+    "cat BIBLE.md",
+    "git diff BIBLE.md",
+    "du BIBLE.md",
+    # Mode-aware write shape (write_shape.py): pure-filter reads and prose-word
+    # inspection lines are reads, not "modifications" of the mentioned file.
+    "sed -n '1,40p' BIBLE.md",
+    "grep -n delete ouroboros/safety.py",
+    "rg truncate ouroboros/runtime_mode_policy.py",
+    "python3 -c \"print(open('ouroboros/safety.py').read())\"",
+])
 def test_run_shell_allows_readonly_mentions_of_protected_paths(cmd, tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     reg = _registry(tmp_path)

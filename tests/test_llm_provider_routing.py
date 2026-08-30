@@ -1,5 +1,17 @@
 import pytest
+
 from ouroboros.llm import LLMClient
+from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
+
+
+def test_resolve_openrouter_target_uses_canonical_app_attribution():
+    target = LLMClient()._resolve_remote_target("openai/gpt-5.6-sol")
+
+    assert OPENROUTER_APP_HEADERS == {
+        "HTTP-Referer": "https://ouroboros-agent.ai/",
+        "X-OpenRouter-Title": "Ouroboros",
+    }
+    assert target["default_headers"] == OPENROUTER_APP_HEADERS
 
 
 def test_resolve_openai_target(monkeypatch):

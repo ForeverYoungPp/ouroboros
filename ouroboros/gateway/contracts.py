@@ -1042,6 +1042,7 @@ class ClaudexorStatusResponse(TypedDict, total=False):
     harnesses: List[Dict[str, Any]]
     profiles: Dict[str, Any]
     quota: List[Dict[str, Any]]
+    quota_absences: List[Dict[str, Any]]
     reads: ClaudexorStatusReads
     # UNIFIED ACCOUNT MODEL feature fact (additive-optional): True only when
     # the engine's own /v2/operations catalog was read and advertises
@@ -1399,8 +1400,6 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/onboarding",
     "POST /api/onboarding/subagents/preview",
     "POST /api/onboarding/complete",
-    "GET /api/claude-code/status",
-    "POST /api/claude-code/install",
     "GET /api/files/list",
     "GET /api/files/read",
     "GET /api/files/content",

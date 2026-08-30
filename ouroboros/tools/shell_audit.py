@@ -42,7 +42,6 @@ if TYPE_CHECKING:
 _UNDECLARED_OUTPUTS_MARKER = "⚠️ ARTIFACT_OUTPUT_UNDECLARED"
 _UNDECLARED_OUTPUT_SCAN_MAX_FILES = 5000
 _UNDECLARED_OUTPUT_METADATA_COMMANDS = frozenset({"chmod", "chown", "mkdir", "rm"})
-_UNDECLARED_OUTPUT_READ_ONLY_COMMANDS = frozenset({"sed"})
 _SHELL_WRAPPER_COMMANDS = frozenset({"sh", "bash", "zsh"})
 _SHELL_REDIRECT_TARGET_TOKENS = frozenset({
     ">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>",
@@ -83,16 +82,11 @@ def _writer_targets_for_output_audit(argv: list[str]) -> set[str]:
         segment_targets = set(writer_target_tokens(command_argv))
         if command in _UNDECLARED_OUTPUT_METADATA_COMMANDS:
             segment_targets = _redirect_targets_for_audit(segment)
-        elif command in _UNDECLARED_OUTPUT_READ_ONLY_COMMANDS:
-            in_place = any(
-                token == "--in-place"
-                or token.startswith("--in-place=")
-                or (token.startswith("-i") and token != "--ignore-case")
-                for token in command_argv[1:]
-            )
-            if not in_place:
-                segment_targets = _redirect_targets_for_audit(segment)
         else:
+            # sed's own second in-place matcher is gone: writer_target_tokens is
+            # now channel-aware itself (in-place in any spelling, in-script
+            # w/W/e, -f scripts), so the audit consumes the ONE parser and only
+            # adds syntactic redirects — a non-writing sed reports no targets.
             segment_targets.update(_redirect_targets_for_audit(segment))
         targets.update(str(target) for target in segment_targets if str(target).strip())
     return targets

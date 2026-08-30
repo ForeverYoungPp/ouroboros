@@ -2668,8 +2668,6 @@ routes = [
         data_dir=DATA_DIR,
         settings_handlers={
             "api_onboarding": _gateway_settings.api_onboarding,
-            "api_claude_code_status": _gateway_settings.api_claude_code_status,
-            "api_claude_code_install": _gateway_settings.api_claude_code_install,
             "api_settings_get": api_settings_get,
             "api_settings_post": api_settings_post,
         },

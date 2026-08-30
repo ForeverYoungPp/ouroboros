@@ -189,7 +189,9 @@ def test_advisory_keeps_recognized_legacy_shape_and_empty_api_target():
 
     payload["advisory"] = {"enabled": True, "route": {"kind": "api"}}
     advisory = parse_reviewer_slots(json.dumps(payload)).advisory
-    assert (advisory.kind, advisory.target_id, advisory.effort) == ("api", "", "low")
+    # The retired legacy "api" kind migrates to the shared api_chat vocabulary;
+    # an empty target keeps meaning the shipped routed default.
+    assert (advisory.kind, advisory.target_id, advisory.effort) == ("api_chat", "", "low")
 
     payload["advisory"] = {
         "enabled": False,
@@ -346,7 +348,7 @@ def test_legacy_comma_lists_read_as_api_slots(monkeypatch):
         ("slot_2", "api_chat", "m/two", "medium"),
     ]
     assert [(r.slot_id, r.effort) for r in config.scope] == [("scope_slot_1", "xhigh")]
-    assert config.advisory.enabled is True and config.advisory.kind == "api"
+    assert config.advisory.enabled is True and config.advisory.kind == "api_chat"
     assert commit_triad_delivery()["legacy_skill_fingerprint"] is True
 
 

@@ -92,29 +92,20 @@ def test_summary_and_background_token_budgets():
     assert context_compaction._summarizer_spec()["output_budget"] == 32_768
 
 
-def test_claude_code_advisory_sdk_max_turns():
-    """The advisory path must use the shared default Claude Code turn budget (50)."""
-    import ast
-    from pathlib import Path
+def test_native_review_episode_caps_are_ssot():
+    """The bounded native inspection episode (the advisory/actor-row successor
+    of the retired Claude-SDK max-turns budget) reads its caps from config
+    SSOT settings with shipped defaults, never a hardcoded literal."""
+    from ouroboros.config import SETTINGS_DEFAULTS
+    from ouroboros.review_native_episode import (
+        review_native_max_rounds,
+        review_native_max_transcript_chars,
+    )
 
-    # Verify the constant value via AST (works without claude_agent_sdk installed)
-    gw_src = Path("ouroboros/gateways/claude_code.py").read_text(encoding="utf-8")
-    tree = ast.parse(gw_src)
-    found = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "DEFAULT_CLAUDE_CODE_MAX_TURNS":
-                    assert isinstance(node.value, ast.Constant) and node.value.value == 50, (
-                        f"DEFAULT_CLAUDE_CODE_MAX_TURNS should be 50, got {getattr(node.value, 'value', '?')}"
-                    )
-                    found = True
-    assert found, "DEFAULT_CLAUDE_CODE_MAX_TURNS not found in claude_code.py"
-
-    # Verify the surviving caller references the shared constant
-    advisory_src = Path("ouroboros/tools/claude_advisory_review.py").read_text(encoding="utf-8")
-    assert "DEFAULT_CLAUDE_CODE_MAX_TURNS" in advisory_src
-    assert "max_turns=8" not in advisory_src
+    assert SETTINGS_DEFAULTS["OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS"] == "16"
+    assert SETTINGS_DEFAULTS["OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS"] == "900000"
+    assert review_native_max_rounds() >= 1
+    assert review_native_max_transcript_chars() >= 10_000
 
 
 def test_claude_code_sdk_only_no_cli_fallback():
@@ -282,11 +273,14 @@ def test_calibrated_input_limit_shared_helper(tmp_path, monkeypatch):
     )
     assert limit("anthropic/claude-fable-5") == int(900_000 / 1.65)
 
-    # A lighter witness cannot loosen review sizing below the cold-conservative floor.
+    # #284 successor: a FRESH EXACT-MODEL witness is authoritative and may
+    # undercut the cold floor — the limit loosens to the density form, still
+    # bounded above by the historical absolute-margin form (745K here).
     record_token_density(
         tmp_path, "openai/gpt-5.5", prompt_chars=chars, prompt_tokens=int(1.0 * chars / 4),
     )
-    assert limit("openai/gpt-5.5") == int(900_000 / COLD_START_TOKEN_DENSITY)
+    assert limit("openai/gpt-5.5") == 1_000_000 - 100_000 - 155_000  # margin-bounded
+    assert limit("openai/gpt-5.5") > int(900_000 / COLD_START_TOKEN_DENSITY)
 
     # Deep self-review consumes the same helper for its model-aware gate.
     assert "calibrated_input_token_limit" in inspect.getsource(deep_self_review.run_deep_self_review)

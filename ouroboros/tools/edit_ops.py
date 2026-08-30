@@ -194,7 +194,7 @@ def _finish_mutation(
         return "Files are on disk but NOT committed. Do not commit; the headless runner will emit a patch artifact."
     footer = (
         "Files are on disk but NOT committed. Run commit_reviewed when ready.\n"
-        "⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
+        "⚠️ Advisory pre-review is now stale — run preflight_review before commit_reviewed."
     )
     # A pro-mode edit of a protected surface announces itself here exactly as it
     # does from git._repo_write / _str_replace_editor (SYSTEM.md's protected-write

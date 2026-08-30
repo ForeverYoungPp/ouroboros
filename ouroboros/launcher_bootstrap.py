@@ -447,83 +447,6 @@ def install_deps(context: BootstrapContext) -> bool:
     return True
 
 
-_CLAUDE_SDK_BASELINE = "claude-agent-sdk>=0.1.60"
-_CLAUDE_SDK_MIN_VERSION = "0.1.60"
-
-
-def _version_tuple(v: str) -> tuple:
-    """Parse the numeric prefix of a PEP 440-ish version for comparison."""
-    if not v:
-        return (0,)
-    parts: list[int] = []
-    for p in v.split("."):
-        digits = ""
-        for ch in p:
-            if ch.isdigit():
-                digits += ch
-            else:
-                break
-        if not digits:
-            break
-        parts.append(int(digits))
-    return tuple(parts) if parts else (0,)
-
-
-def verify_claude_runtime(context: BootstrapContext) -> bool:
-    """Ensure the app-managed Claude SDK/CLI meets the baseline, repairing if needed."""
-    import sys as _sys
-    cli_name = "claude.exe" if _sys.platform == "win32" else "claude"
-    try:
-        result = context.hidden_run(
-            [context.embedded_python, "-c",
-             "import claude_agent_sdk; "
-             "import importlib.metadata as _m; "
-             "from pathlib import Path; "
-             f"cli = Path(claude_agent_sdk.__file__).parent / '_bundled' / '{cli_name}'; "
-             "ver = _m.version('claude-agent-sdk'); "
-             "print('ok|' + ver if cli.exists() else 'no_cli|' + ver)"],
-            env=embedded_python_env(context.data_dir),
-            capture_output=True, text=True, timeout=30,
-        )
-        stdout = (result.stdout or "").strip()
-        if result.returncode == 0 and stdout.startswith("ok|"):
-            installed = stdout.split("|", 1)[1]
-            if _version_tuple(installed) >= _version_tuple(_CLAUDE_SDK_MIN_VERSION):
-                context.log.info(
-                    "Claude runtime verified: SDK %s >= %s, bundled CLI present.",
-                    installed, _CLAUDE_SDK_MIN_VERSION,
-                )
-                return True
-            context.log.warning(
-                "Claude runtime SDK %s is below baseline %s — repairing.",
-                installed, _CLAUDE_SDK_MIN_VERSION,
-            )
-        else:
-            context.log.warning("Claude runtime check: %s (exit %d)", stdout, result.returncode)
-    except Exception as exc:
-        context.log.warning("Claude runtime probe failed: %s", exc)
-
-    context.log.info("Repairing Claude runtime baseline...")
-    from ouroboros.platform_layer import pip_install_target_args
-
-    try:
-        repair = context.hidden_run(
-            [context.embedded_python, "-m", "pip", "install",
-             *pip_install_target_args(context.embedded_python), "--upgrade", _CLAUDE_SDK_BASELINE],
-            env=embedded_python_env(context.data_dir),
-            timeout=120,
-            capture_output=True,
-        )
-        if repair.returncode != 0:
-            context.log.warning("Claude runtime repair pip returned exit %d", repair.returncode)
-            return False
-        context.log.info("Claude runtime repair install complete.")
-        return True
-    except Exception as exc:
-        context.log.warning("Claude runtime repair failed: %s", exc)
-        return False
-
-
 _SEED_COMPLETE_MARKER = ".bootstrap-seed-complete"
 _POST_BOOTSTRAP_NEW_NATIVE_SEEDS = frozenset({"telegram", "unix_computer_use"})
 
@@ -1002,6 +925,5 @@ def bootstrap_repo(context: BootstrapContext) -> bool:
                 "may be missing packages. See the pip output above for the cause.",
                 outcome,
             )
-    verify_claude_runtime(context)
     context.log.info("Bootstrap complete.")
     return deps_ok

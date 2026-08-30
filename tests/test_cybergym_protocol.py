@@ -899,8 +899,8 @@ def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):
     assert applied["OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS"] == 0
     assert applied["OUROBOROS_WEBSEARCH_BACKEND"] == "ddgs"
     assert applied["OUROBOROS_WEBSEARCH_MODEL"] == OFFICIAL_MODEL
-    assert applied["CLAUDE_CODE_MODEL"] == ""
-    assert applied["CLAUDE_AGENT_SDK_MODEL"] == ""
+    assert "CLAUDE_CODE_MODEL" not in applied  # retired transport setting
+    assert "CLAUDE_AGENT_SDK_MODEL" not in applied  # retired transport setting
     assert applied["OUROBOROS_EFFORT_TASK"] == "high"
     assert applied["OUROBOROS_EFFORT_REVIEW"] == "max"
     assert applied["OUROBOROS_EFFORT_SCOPE_REVIEW"] == "max"

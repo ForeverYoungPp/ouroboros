@@ -388,7 +388,6 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
             "OUROBOROS_SCOPE_REVIEW_MODELS",
             "OUROBOROS_SCOPE_REVIEW_MODEL",
             "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
-            "CLAUDE_CODE_MODEL",
             "OUROBOROS_EFFORT_TASK",
             "OUROBOROS_EFFORT_REVIEW",
             "OUROBOROS_EFFORT_SCOPE_REVIEW",

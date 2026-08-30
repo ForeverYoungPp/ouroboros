@@ -856,6 +856,7 @@
  * @property {Array<Object>=} harnesses
  * @property {Object=} profiles
  * @property {Array<Object>=} quota
+ * @property {Array<Object>=} quota_absences
  * @property {ClaudexorStatusReads=} reads
  * @property {boolean=} unified_accounts
  * @property {SubagentLastDelegation=} subagent_last_delegation
@@ -1089,4 +1090,4 @@
  * @property {?boolean} check_ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.113.1';
+export const GATEWAY_CONTRACT_VERSION = '6.113.2';

@@ -1,8 +1,5 @@
-"""
-Ouroboros — Shared configuration (single source of truth).
-
-Paths, settings defaults, load/save with file locking and cycle-free setting metadata.
-"""
+"""Ouroboros — Shared configuration (single source of truth): paths, settings
+defaults, load/save with file locking and cycle-free setting metadata."""
 
 from __future__ import annotations
 
@@ -44,14 +41,19 @@ FINALIZATION_GRACE_DEFAULT_SEC = 120
 # (the loop's mailbox drain). No summary by this cap -> honest custody cancel.
 OWNER_STOP_OUTER_CAP_SEC = 600
 NESTED_SETTLEMENT_MARGIN_SEC = 30  # Structural ordering margin, not a cognition timeout.
-# Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at
-# (e.g. headless benchmark runs). Advisory only — surfaces elapsed/rounds/cost so
-# the model can self-pace; it is not a stop gate. 0 disables.
+# Owner-note cadence while a task waits out a provider-connection outage; the effective interval is min(this, idle_timeout/2) so the notes also keep the idle rail alive.
+NETWORK_WAIT_NOTE_INTERVAL_SEC = 300
+# First free-redial pause of a transport-wait episode; doubles per wait iteration up to the existing 60s transient backoff cap (Q10: an existing bound, not a new knob).
+NETWORK_WAIT_BACKOFF_START_SEC = 4.0
+# Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at (headless benchmark runs). Advisory only — surfaces elapsed/rounds/cost for self-pacing; 0 disables.
 PACING_INTERVAL_DEFAULT_SEC = 600
-# Supervisor-loop liveness deadline (WS3, v6.34.0): a watchdog thread flags the main
-# supervisor loop STALLED if it has not ticked within this many seconds (healthy tick
-# ~0.5s), so it only fires on a real wedge. 0 disables.
+# Supervisor-loop liveness deadline (WS3, v6.34.0): a watchdog thread flags the main supervisor loop STALLED if it has not ticked within this many seconds (healthy tick ~0.5s, real wedges only). 0 disables.
 SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC = 90
+# TCP keepalive for long-lived remote LLM sockets (idle threshold, probe interval, probe count): kernel probes
+# detect a silently dropped NAT/VPN mapping instead of hanging to the read timeout; platform_layer builds the options.
+TCP_KEEPALIVE_IDLE_SEC = 60
+TCP_KEEPALIVE_INTERVAL_SEC = 60
+TCP_KEEPALIVE_PROBE_COUNT = 5
 
 
 def _guard_live_settings_write() -> None:
@@ -94,7 +96,6 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # real default, unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
     "OUROBOROS_MODEL_FALLBACKS": OPENROUTER_DEFAULTS["fallback"],
     "OUROBOROS_MODEL_DEEP_SELF_REVIEW": OPENROUTER_DEFAULTS["deep_self_review"],
-    "CLAUDE_CODE_MODEL": OPENROUTER_REVIEW_DEFAULTS["advisory"],
     "OUROBOROS_MAX_WORKERS": 10, "OUROBOROS_PRESENCE_MAX_ACTIVE": 2,
     "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT": 6,
     "OUROBOROS_MAX_SUBAGENT_DEPTH": 3,
@@ -205,6 +206,10 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_ONBOARDING_COMPLETED_AT": "",
     # Pre-commit review enforcement: advisory | blocking
     "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
+    # Native tool-round reviewer episode caps (review_native_episode.py owns
+    # the getters); both fail CLOSED — typed refusal, never compaction/resume.
+    "OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS": "16",
+    "OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS": "900000",
     # Auto-grant reviewed-skill requests by default; grants stay bound to the
     # reviewed content hash and editing a skill still invalidates them.
     "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS": "true",
@@ -571,9 +576,8 @@ def resolve_effort(task_type: str) -> str:
     return raw if raw in EFFORT_SCALE else default
 
 
-# Prompt-cache TTL scale (owner decision 2026-08-08): 'default' = bare markers (provider default tier),
-# '5m'/'1h' = the two documented Anthropic ephemeral tiers. Deliberately NO 'auto' (a dead value until an
-# adaptive design exists) and NO '24h' (Anthropic would clamp it — a value that mostly lies).
+# Prompt-cache TTL scale (owner decision 2026-08-08): 'default' = bare markers (provider default tier), '5m'/'1h' =
+# the two documented Anthropic ephemeral tiers. Deliberately NO 'auto' (dead until an adaptive design exists) and NO '24h' (Anthropic would clamp it — a value that mostly lies).
 PROMPT_CACHE_TTL_SCALE: tuple[str, ...] = ("default", "5m", "1h")
 
 
@@ -868,12 +872,7 @@ def get_search_code_wall_sec() -> float:
     """Total wall-clock budget (seconds) for ONE search_code call — bounds both the rg
     directory walk and the batched rg loop so a scan over a very large root cannot run
     unbounded. Env/setting: ``OUROBOROS_SEARCH_CODE_WALL_SEC`` (floored at 5s)."""
-    raw = (os.environ.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "")
-           or str(SETTINGS_DEFAULTS.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "45")))
-    try:
-        return max(5.0, float(raw))
-    except (TypeError, ValueError):
-        return 45.0
+    return _clamped_number_setting("OUROBOROS_SEARCH_CODE_WALL_SEC", low=5.0)
 
 
 def get_deliverables_root() -> str:
@@ -1052,9 +1051,8 @@ def _settings_file_value(key: str, default: str) -> str:
 # write BOTH disk and env, so the owner path is unaffected.
 _DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SAFETY_MODE")
 
-# ENDPOINT-AUTHORED, DISK-ONLY: install-time facts POST /api/onboarding/complete alone writes. The ratchets above
-# are disk-authored yet DO project once the file carries them; these never leave disk in EITHER direction — an env
-# timestamp alone closed the onboarding window on a fresh install, and an env marker was then persisted by a save.
+# ENDPOINT-AUTHORED, DISK-ONLY: install-time facts POST /api/onboarding/complete alone writes. The ratchets above are
+# disk-authored yet DO project once the file carries them; these never leave disk in EITHER direction — an env timestamp alone closed the onboarding window on a fresh install, and an env marker was then persisted by a save.
 ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_SUBAGENT_PRESET_RECEIPT", "OUROBOROS_ONBOARDING_COMPLETED_AT"})
 
 

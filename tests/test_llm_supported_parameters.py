@@ -353,6 +353,9 @@ class TestSupportedParametersFilter:
             "type": "openrouter:web_search",
             "parameters": {"search_context_size": "medium", "max_total_results": 10},
         }]
+        from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
+
+        assert captured["client"]["default_headers"] == OPENROUTER_APP_HEADERS
 
     def test_parameter_rejection_learns_sampling_strip_without_version_gate(self, monkeypatch):
         from ouroboros.llm import LLMClient

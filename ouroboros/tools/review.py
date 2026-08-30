@@ -397,7 +397,7 @@ async def _query_model(
     session_target: str = "",
     session_profile: str = "",
     surface: str = "multi_model_review", session_policy: dict = None, usage_attribution: dict = None,
-    retry_key: str = "",
+    retry_key: str = "", subagent_id: str = "",
 ):
     async with semaphore:
         slot = None
@@ -406,20 +406,25 @@ async def _query_model(
             from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
             slot_route = route if route is not None else ReviewRouteKind.API_CHAT
             delegated = slot_route is ReviewRouteKind.AGENT_SESSION
+            # RETRIEVES class (session row OR configured-subagent api row): the
+            # compact session task replaces the assembled pack for both.
+            retrieves = delegated or (
+                bool(subagent_id) and slot_route is ReviewRouteKind.API_CHAT
+            )
             _out_budget = _review_output_budget()
             request = ReviewRequest(
                 surface=surface,
                 goal="Run independent multi-model review over the supplied evidence.",
-                # 5.2: a session slot never receives the assembled api pack.
-                messages=[] if delegated else messages,
+                # 5.2: a retrieving slot never receives the assembled api pack.
+                messages=[] if retrieves else messages,
                 task_id=str(getattr(ctx, "task_id", "") or "multi_model_review") if ctx is not None else "multi_model_review",
                 call_type="multi_model_review",
                 max_tokens=_out_budget,
                 temperature=0.2,
                 no_proxy=True,
-                session_task=session_task if delegated else "",
-                session_root=session_root if delegated else "",
-                policy=(session_policy or {"output_contract": REVIEW_JSON_ARRAY_CONTRACT}) if delegated else {},
+                session_task=session_task if retrieves else "",
+                session_root=session_root if retrieves else "",
+                policy=(session_policy or {"output_contract": REVIEW_JSON_ARRAY_CONTRACT}) if retrieves else {},
                 usage_attribution=usage_attribution or {},
                 task_attempt=getattr(ctx, "task_attempt", None) if ctx is not None else None,
                 retry_key=str(retry_key or ""),
@@ -436,6 +441,7 @@ async def _query_model(
                 route=slot_route,
                 session_target=session_target if delegated else "",
                 session_profile=session_profile if delegated else "",
+                subagent_id=str(subagent_id or ""),
             )
             loop = asyncio.get_running_loop()
             run_result = await loop.run_in_executor(
@@ -502,7 +508,14 @@ async def _multi_model_review_async(content: str, prompt: str,
     row_targets = _row_vector("session_targets", lambda idx: "")
     row_profiles = _row_vector("session_profiles", lambda idx: "")
     row_ids = _row_vector("slot_ids", lambda idx: slot_id_for_row(idx + 1))
-    any_api_rows = any(route is ReviewRouteKind.API_CHAT for route in row_routes[:len(models)])
+    row_actors = _row_vector("subagent_ids", lambda idx: "")
+    # Pack assembly follows the RETRIEVES class, not the route name: an
+    # api-route row bound to a configured subagent retrieves with its own
+    # tools and must never trigger (or be counted into) the assembled pack.
+    any_api_rows = any(
+        route is ReviewRouteKind.API_CHAT and not row_actors[idx]
+        for idx, route in enumerate(row_routes[:len(models)])
+    )
     if not content:
         return {"error": "content is required"}
     if not prompt and any_api_rows:
@@ -556,7 +569,7 @@ async def _multi_model_review_async(content: str, prompt: str,
                      effort=row_efforts[idx], session_target=row_targets[idx],
                      session_profile=row_profiles[idx], surface=surface,
                      session_policy=session_policy, usage_attribution=usage_attribution,
-                     retry_key=retry_key)
+                     retry_key=retry_key, subagent_id=row_actors[idx])
         for idx, m in enumerate(models)
     ]
     results = await asyncio.gather(*tasks)
@@ -1259,7 +1272,15 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
         ), True
     models, row_routes = row_plan["models"], row_plan["routes"]
     ctx._last_triad_models = list(models)  # forensic: actual resolved model IDs
-    api_models = [m for m, r in zip(models, row_routes) if r is ReviewRouteKind.API_CHAT]
+    _row_actors = list(row_plan.get("subagent_ids") or [])
+    # Packet rows only: a configured-subagent api row is the RETRIEVES class —
+    # it neither constrains the fit ladder nor counts as an api seat for the
+    # Q28-A yield arithmetic below.
+    api_models = [
+        m for i, (m, r) in enumerate(zip(models, row_routes))
+        if r is ReviewRouteKind.API_CHAT
+        and not (i < len(_row_actors) and _row_actors[i])
+    ]
 
     goal_section = build_goal_section(goal, scope, commit_message)
     scope_section = build_scope_section(scope)

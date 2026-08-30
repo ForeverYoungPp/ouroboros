@@ -57,7 +57,6 @@ _POPEN_ALLOWLIST = {
     # so /panic's tracked-subprocess sweep can never observe it alive but
     # untracked (isolated_deps._run template).
     "ouroboros/claudexor_daemon.py",
-    "ouroboros/gateways/claude_code.py",  # waited readonly child (timeout-bound)
     "ouroboros/extension_process_runner.py",  # waited extension child
     "ouroboros/workspace_executor.py",    # custody write-through added at spawn
     "ouroboros/local_model.py",           # custody record added at spawn

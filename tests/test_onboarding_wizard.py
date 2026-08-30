@@ -813,15 +813,14 @@ def test_api_settings_exposes_setup_contract_without_secrets(tmp_path):
             item.stop()
 
 
-def test_onboarding_wizard_keeps_the_claude_runtime_cta_on_http_transports():
-    """The Claude-runtime card stays, but its status/repair calls are ordinary
-    endpoints on every host now — there is no parallel desktop bridge for them."""
+def test_onboarding_wizard_has_no_claude_runtime_surface():
+    """The Claude-runtime card (and its /api/claude-code/* endpoints) is
+    retired with the Claude-SDK advisory transport: onboarding must not
+    mention it or call the deleted endpoints."""
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
 
-    assert "Claude Runtime" in source or "Claude runtime" in source
-    assert "Skip for now" in source
-    assert "/api/claude-code/status" in source
-    assert "/api/claude-code/install" in source
+    assert "Claude Runtime" not in source and "Claude runtime" not in source
+    assert "/api/claude-code/" not in source
 
 
 def _launcher_hosts_onboarding_on_the_live_server() -> bool:

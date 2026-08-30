@@ -43,16 +43,20 @@ def test_loop_bootstraps_from_tool_policy():
 
 
 def test_advisory_tools_in_core_tool_names():
-    """advisory_review and review_status must be core tools."""
-    assert "advisory_review" in CORE_TOOL_NAMES
+    """preflight_review (and its callable advisory_review alias) and
+    review_status must be core tools."""
+    assert "preflight_review" in CORE_TOOL_NAMES
+    assert "advisory_review" in CORE_TOOL_NAMES  # compat alias stays core-callable
     assert "review_status" in CORE_TOOL_NAMES
 
 
 def test_advisory_tools_in_initial_schemas():
-    """advisory_review and review_status must appear in initial tool schemas."""
+    """preflight_review and review_status must appear in initial tool schemas;
+    the advisory_review compat alias is callable but never advertised."""
     registry = _build_registry()
     names = {schema["function"]["name"] for schema in initial_tool_schemas(registry)}
-    assert "advisory_review" in names
+    assert "preflight_review" in names
+    assert "advisory_review" not in names
     assert "review_status" in names
 
 
@@ -80,9 +84,9 @@ def test_enable_tools_does_not_duplicate_active_tool_schemas():
     assert any("[CAPABILITY_OMISSION_MANIFEST]" in str(message.get("content") or "") for message in messages)
     assert all(message.get("role") != "system" for message in messages)
 
-    core_result = registry.execute("enable_tools", {"tools": "advisory_review"})
+    core_result = registry.execute("enable_tools", {"tools": "preflight_review"})
     names_after_core = [schema["function"]["name"] for schema in tool_schemas]
-    assert names_after_core.count("advisory_review") == 1
+    assert names_after_core.count("preflight_review") == 1
     assert "already active" in core_result
 
     extra_result = registry.execute("enable_tools", {"tools": "plan_task"})

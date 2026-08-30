@@ -8,6 +8,11 @@ optional advisory reviewer. Each row is::
                                     "target_id": "<model id | harness[=model]>"},
      "effort": "high"}
 
+or, mutually exclusively, a reference to a configured subagent
+(``OUROBOROS_SUBAGENTS`` row)::
+
+    {"slot_id": "t_9f3a", "subagent_id": "<roster id>", "effort": "high"}
+
 ``slot_id`` is a STABLE owner-assigned identity, never an array index: a row's
 receipts must keep lining up with its own history when the owner reorders or
 edits rows (see ``review_substrate.slot_id_for_row`` for why a model is not an
@@ -16,6 +21,13 @@ an OPAQUE Claudexor route spec (``harness[=model]`` — Claudexor's own
 reviewer-panel spelling, no ``::`` syntax) on ``agent_session``. Effort is a
 per-row property on the existing ``EFFORT_SCALE`` — the same mechanism the
 model lanes use, deliberately not a new one.
+
+An actor reference never duplicates route/model/effort knobs: the roster row is
+their SSOT, resolved ONCE at load/admission into the same frozen slot fields a
+direct row carries (route drift after admission changes later waves only). An
+``agent_session`` actor delivers through the existing session executor; an
+``api_model`` actor delivers as bounded native tool rounds — retrieval, never
+the assembled ``api_chat`` packet.
 
 MIGRATION (D15: "старый читается, если новых нет"): when the structured key is
 absent, the legacy comma-lists (``OUROBOROS_REVIEW_MODELS`` /
@@ -84,32 +96,70 @@ class ConfiguredReviewerSlot:
     # Optional manual credential pin (Q2-в): '' = the daemon's rotation policy
     # (D28 default). Meaningful on agent_session rows only.
     profile_id: str = ""
+    # Optional configured-subagent reference (OUROBOROS_SUBAGENTS row id).
+    # Mutually exclusive with an inline route in the STORED form; when set, the
+    # execution fields above were resolved from the frozen roster row at load
+    # time and the roster stays their SSOT. '' = ordinary direct row.
+    subagent_id: str = ""
 
     @property
     def is_session(self) -> bool:
         return self.kind == ROUTE_KIND_SESSION
 
+    @property
+    def native_retrieval(self) -> bool:
+        """An ``api_model`` configured-subagent row: bounded native tool rounds.
+
+        Kept OFF the closed public route vocabulary (``api_chat`` stays the
+        wire kind); executor selection and admission read this derived fact.
+        """
+        return bool(self.subagent_id) and self.kind == ROUTE_KIND_API
+
+    @property
+    def retrieves(self) -> bool:
+        """Delivery class: the reviewer reads the subject with its own tools.
+
+        THE predicate admission/fit/authority callers must use instead of
+        route-name comparisons — a session row and a native-retrieval actor
+        row are one class here, and neither receives an assembled packet.
+        """
+        return self.is_session or self.native_retrieval
+
 
 @dataclass(frozen=True)
 class AdvisorySlotConfig:
-    """The ONE optional advisory reviewer (D14).
+    """The ONE optional advisory reviewer (D14) — on the shared row vocabulary.
 
     ``enabled=False`` is a standing owner decision with a constitutional
     consequence the UI must state: every reviewed commit then records an
     AUDITED BYPASS instead of an advisory verdict (never a silent skip).
+
+    Delivery follows the shared closed kinds: an ``api_chat`` advisory row is
+    a routed catalog model that runs the bounded NATIVE inspection episode
+    (advisory is an inspection critic by definition — it never receives an
+    assembled packet), ``agent_session`` is a delegated Claudexor run, and a
+    ``subagent_id`` reference resolves the configured roster row. The retired
+    legacy ``api`` kind (Claude-Agent-SDK spellings) is migrated at parse:
+    a translatable target becomes its routed id; an untranslatable one keeps
+    the row DISABLED with a loud typed reason, never a silently swapped model.
     """
 
     enabled: bool = True
-    kind: str = "api"  # api | agent_session
-    # agent_session: harness[=model] spec ('' = shared route). api: the
-    # Claude-SDK model spelling — sonnet, opus[1m], claude-… — NOT an
-    # OpenRouter catalog id ('' = resolve_claude_code_model() default).
+    kind: str = ROUTE_KIND_API  # api_chat | agent_session
+    # agent_session: harness[=model] spec ('' = shared route). api_chat: a
+    # routed catalog model id ('' = the shipped advisory default).
     target_id: str = ""
-    # API keeps the historical low default. Session ``""`` means the route's
-    # own default; an explicit/compound route effort is materialized on legacy
-    # migration so Settings round-trips one authority without lowering it.
+    # api_chat keeps the historical low default. Session ``""`` means the
+    # route's own default; an explicit/compound route effort is materialized on
+    # legacy migration so Settings round-trips one authority.
     effort: str = "low"
     profile_id: str = ""  # optional manual credential pin (Q2-в); '' = rotation
+    # Configured-subagent reference ('' = direct row); resolved at parse into
+    # the execution fields above, exactly like triad/scope actor rows.
+    subagent_id: str = ""
+    # Non-empty ⇒ the row was force-disabled at parse with this typed reason
+    # (currently only the unmapped legacy Claude-SDK target migration).
+    disabled_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -168,10 +218,76 @@ def _validate_concrete_session_target(route: RouteSpec, where: str) -> None:
         )
 
 
+import contextvars as _contextvars
+_ROSTER_ENV_OVERRIDE: "_contextvars.ContextVar[Optional[dict]]" = _contextvars.ContextVar(
+    "reviewer_roster_env_override", default=None)
+
+
+def _resolve_actor_slot(
+    slot_id: str, subagent_id: str, effort: str, where: str,
+) -> ConfiguredReviewerSlot:
+    """Materialize a configured-subagent reference into one frozen reviewer row.
+
+    Resolution happens at load/admission time: the wave that materialized this
+    row carries the resolved facts, and a later roster edit changes later
+    loads only (the #285 freeze-at-admission class). An unknown, disabled, or
+    invalid roster reference is a malformed reviewer configuration — the same
+    typed ValueError authority every consumer of this parser already treats as
+    fail-closed (save-time 400, review-time typed block), never a silent
+    fallback to another route or model.
+    """
+    from ouroboros.subagent_runtime import (
+        SubagentSelectionError,
+        select_subagent_snapshot,
+    )
+
+    try:
+        # The roster is read from the APPLIED env, the same plane this module's
+        # own key lives on — a saved-but-unapplied roster edit is invisible
+        # here exactly as a saved-but-unapplied reviewer-slot edit would be.
+        # Save-time validation threads the INCOMING roster through the
+        # context-local override (S4 atomicity) — never by mutating the
+        # process env, which concurrent review dispatch could observe.
+        _override = _ROSTER_ENV_OVERRIDE.get()
+        snapshot, _legacy = select_subagent_snapshot(
+            _override if _override is not None else os.environ,
+            subagent_id=subagent_id,
+        )
+    except SubagentSelectionError as exc:
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} subagent_id {subagent_id!r} does "
+            f"not resolve: {exc.code}: {exc.detail}"
+        ) from exc
+    route = dict(snapshot.get("route") or {})
+    target = str(route.get("target_id") or "")
+    pin = str(route.get("credential_profile_id") or "")
+    # Explicit row effort wins; otherwise the roster row's own effort; an empty
+    # result falls through to the surface default via row_effort, as always.
+    chosen_effort = effort or _valid_effort(snapshot.get("effort"), where)
+    if str(route.get("kind") or "") == SHARED_ROUTE_KIND_SESSION:
+        shared = RouteSpec(
+            kind=SHARED_ROUTE_KIND_SESSION, target_id=target,
+            credential_profile_id=pin,
+        )
+        _validate_concrete_session_target(shared, where)
+        validate_compound_session_effort(
+            shared, chosen_effort, setting=REVIEWER_SLOTS_ENV, where=where,
+        )
+        return ConfiguredReviewerSlot(
+            slot_id=slot_id, kind=ROUTE_KIND_SESSION, target_id=target,
+            effort=chosen_effort, session_target=target, profile_id=pin,
+            subagent_id=subagent_id,
+        )
+    return ConfiguredReviewerSlot(
+        slot_id=slot_id, kind=ROUTE_KIND_API, target_id=target,
+        effort=chosen_effort, subagent_id=subagent_id,
+    )
+
+
 def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
     if not isinstance(row, dict):
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: {where} is not an object")
-    unknown = sorted(set(row) - {"slot_id", "route", "effort"})
+    unknown = sorted(set(row) - {"slot_id", "route", "subagent_id", "effort"})
     if unknown:
         raise ValueError(
             f"{REVIEWER_SLOTS_ENV}: {where} has unknown keys: {unknown}"
@@ -193,6 +309,25 @@ def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
             "receipts can only line up with ONE history"
         )
     seen_ids.add(slot_id)
+    raw_ref = row.get("subagent_id")
+    if raw_ref is not None and not isinstance(raw_ref, str):
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} subagent_id must be a string"
+        )
+    actor_ref = str(raw_ref or "").strip()
+    if raw_ref is not None and not actor_ref:
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} subagent_id must not be empty"
+        )
+    if actor_ref and row.get("route") is not None:
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} must use either route or "
+            "subagent_id, not both — the roster row is the route's SSOT"
+        )
+    if actor_ref:
+        return _resolve_actor_slot(
+            slot_id, actor_ref, _valid_effort(row.get("effort"), where), where,
+        )
     route = parse_route_spec(
         row.get("route"), setting=REVIEWER_SLOTS_ENV, where=where,
         kind_aliases={
@@ -218,12 +353,43 @@ def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
     )
 
 
+def _migrate_sdk_advisory_target(raw_kind: str, target: str) -> tuple[str, str]:
+    """Translate a retired Claude-SDK ``api``-kind target to ``(routed, reason)``.
+
+    The Claude-Agent-SDK advisory transport is retired (owner decision,
+    2026-08-29): its rows migrate to the routed catalog. Only translations
+    that keep the SAME model are performed; anything else keeps the row
+    DISABLED with a typed reason — a silently swapped reviewer model is the
+    exact class this parser exists to refuse.
+    """
+    if raw_kind != "api":
+        return target, ""
+    base = target.replace("[1m]", "").strip()
+    if not base or base in {"sonnet", "claude-sonnet-5"}:
+        # '' and the shipped default spelling both meant claude-sonnet-5.
+        return "", ""
+    if "/" in base or "::" in base:
+        return target, ""  # already a routed/provider-tagged id
+    if base.startswith("claude-"):
+        return f"anthropic/{base}", ""
+    return target, "legacy_claude_sdk_target_unmapped"
+
+
+def _resolve_advisory_actor(subagent_id: str, effort: str, enabled: bool) -> AdvisorySlotConfig:
+    row = _resolve_actor_slot("advisory_slot_1", subagent_id, effort, "advisory")
+    return AdvisorySlotConfig(
+        enabled=enabled, kind=row.kind, target_id=row.target_id,
+        effort=row.effort or ("low" if not row.is_session else ""),
+        profile_id=row.profile_id, subagent_id=subagent_id,
+    )
+
+
 def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
     if raw is None:
         return AdvisorySlotConfig()
     if not isinstance(raw, dict):
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory must be an object")
-    unknown = sorted(set(raw) - {"enabled", "route", "kind", "target_id", "effort"})
+    unknown = sorted(set(raw) - {"enabled", "route", "kind", "target_id", "effort", "subagent_id"})
     if unknown:
         raise ValueError(
             f"{REVIEWER_SLOTS_ENV}: advisory has unknown keys: {unknown}"
@@ -231,11 +397,14 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory enabled must be a boolean")
-    for key in ("kind", "target_id"):
+    for key in ("kind", "target_id", "subagent_id"):
         if key in raw and not isinstance(raw[key], str):
             raise ValueError(
                 f"{REVIEWER_SLOTS_ENV}: advisory {key} must be a string"
             )
+    actor_ref = str(raw.get("subagent_id") or "").strip()
+    if "subagent_id" in raw and not actor_ref:
+        raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory subagent_id must not be empty")
     route = raw.get("route")
     if route is not None and not isinstance(route, dict):
         # Same typed refusal _parse_slot gives (:150). Without it a non-dict
@@ -245,6 +414,15 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
         # reviewer_slot_config_error's callers.
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory route must be an object "
                          "{kind, target_id}")
+    if actor_ref and (route is not None or ({"kind", "target_id"} & set(raw))):
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: advisory must use either subagent_id or a "
+            "route, not both — the roster row is the route's SSOT"
+        )
+    if actor_ref:
+        return _resolve_advisory_actor(
+            actor_ref, _valid_effort(raw.get("effort"), "advisory"), enabled,
+        )
     if route is not None and ({"kind", "target_id"} & set(raw)):
         raise ValueError(
             f"{REVIEWER_SLOTS_ENV}: advisory must use either route or legacy "
@@ -252,9 +430,10 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
         )
     route_payload = dict(route or {})
     if "kind" not in route_payload:
-        route_payload["kind"] = raw.get("kind") or "api"
+        route_payload["kind"] = raw.get("kind") or ROUTE_KIND_API
     if "target_id" not in route_payload:
         route_payload["target_id"] = raw.get("target_id") or ""
+    raw_kind = str(route_payload.get("kind") or "").strip().lower()
     shared_route = parse_route_spec(
         route_payload,
         setting=REVIEWER_SLOTS_ENV,
@@ -282,12 +461,25 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
     validate_compound_session_effort(
         shared_route, effort, setting=REVIEWER_SLOTS_ENV, where="advisory",
     )
+    target, disabled_reason = (
+        _migrate_sdk_advisory_target(raw_kind, shared_route.target_id)
+        if not shared_route.is_session else (shared_route.target_id, "")
+    )
+    if disabled_reason:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "advisory row disabled: legacy Claude-SDK target %r has no same-model "
+            "routed translation; pick a routed model or a configured subagent in "
+            "Settings → Review lanes", target,
+        )
     return AdvisorySlotConfig(
-        enabled=enabled,
-        kind=ROUTE_KIND_SESSION if shared_route.is_session else "api",
-        target_id=shared_route.target_id,
+        enabled=enabled and not disabled_reason,
+        kind=ROUTE_KIND_SESSION if shared_route.is_session else ROUTE_KIND_API,
+        target_id=target,
         effort=effort,
         profile_id=shared_route.credential_profile_id,
+        disabled_reason=disabled_reason,
     )
 
 
@@ -413,7 +605,9 @@ def _legacy_config() -> ReviewerSlotConfig:
     # and no per-row effort; the route token is the phase-5 env.
     raw_route = str(os.environ.get("OUROBOROS_ADVISORY_REVIEW_ROUTE", "") or "").strip().lower()
     if raw_route in ("", "api", "api_chat"):
-        advisory_kind = "api"
+        # Legacy 'api' meant the retired Claude-SDK transport; both now mean
+        # the routed native inspection episode on the shipped default model.
+        advisory_kind = ROUTE_KIND_API
     elif raw_route == ROUTE_KIND_SESSION:
         advisory_kind = ROUTE_KIND_SESSION
     else:
@@ -508,8 +702,44 @@ def structured_scope_review_slots() -> Optional[list]:
                    else ReviewRouteKind.API_CHAT),
             session_target=row.session_target,
             session_profile=row.profile_id,
+            subagent_id=row.subagent_id,
         )
         for row in commit_scope_rows()
+    ]
+
+
+def reviewer_slots(
+    models: List[str] | None = None,
+    *,
+    effort: str = "medium",
+    role_hint: str = "",
+    id_prefix: str = "",
+    route_env_key: str = "",
+) -> List[Any]:
+    """The configured reviewer rows, each carrying its DELIVERY route.
+
+    Moved here from ``review_substrate`` for module altitude (P7); the
+    substrate re-exports it. ``route_env_key`` names the surface's per-row
+    route list (plan 5.1): the commit triad and scope pass theirs, so a row
+    can be an api_chat call or a delegated agent session. Surfaces that stay
+    on the API by owner decision (task acceptance — D15) pass NOTHING, which
+    pins every row to ``api_chat`` explicitly rather than by accident.
+    """
+    from ouroboros.config import get_review_models, review_model_uses_local
+    from ouroboros.review_execution import ReviewRouteKind, configured_review_routes
+    from ouroboros.review_substrate import SLOT_ID_PREFIX, ReviewSlot, slot_id_for_row
+
+    id_prefix = id_prefix or SLOT_ID_PREFIX
+    raw_models = models if models is not None else get_review_models()
+    named = [str(model) for model in (raw_models or []) if str(model or "").strip()]
+    routes = configured_review_routes(route_env_key, len(named)) if route_env_key else [
+        ReviewRouteKind.API_CHAT
+    ] * len(named)
+    return [
+        ReviewSlot(slot_id=slot_id_for_row(idx + 1, prefix=id_prefix), model=model, effort=effort,
+                   role_hint=role_hint, use_local=review_model_uses_local(model),
+                   route=routes[idx])
+        for idx, model in enumerate(named)
     ]
 
 
@@ -536,6 +766,7 @@ def commit_triad_delivery() -> Dict[str, Any]:
         "session_targets": [row.session_target for row in rows],
         "session_profiles": [row.profile_id for row in rows],
         "slot_ids": [row.slot_id for row in rows],
+        "subagent_ids": [row.subagent_id for row in rows],
         "legacy_skill_fingerprint": (
             config.source == "legacy" and all(not row.is_session for row in rows)
         ),
@@ -587,7 +818,12 @@ def api_fallback_disclosure(config: "ReviewerSlotConfig") -> Dict[str, Any]:
     from ouroboros.config import SETTINGS_DEFAULTS
 
     out: Dict[str, Any] = {}
-    if config.triad and not any(not r.is_session for r in config.triad):
+    # An actor row never feeds the API-only acceptance projection (its api form
+    # is retrieval delivery, not an api_chat packet model), so a triad of
+    # sessions and actors falls back exactly like an all-session one.
+    if config.triad and not any(
+        not r.retrieves for r in config.triad
+    ):
         out["triad"] = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"]).split(",")
     return out
 
@@ -629,13 +865,24 @@ def _fallback_warning_text(disclosure: Dict[str, Any]) -> str:
     )
 
 
-def reviewer_slot_save_check(raw: str) -> str:
+def reviewer_slot_save_check(raw: str, *, subagents_raw: Optional[str] = None) -> str:
     """Validate an incoming structured value and return the fallback warning.
 
     Raises ValueError (row-precise) on a malformed value so the save handler
     turns it into a 400; returns the all-delegated API-fallback warning ('' when
-    none) otherwise. One call keeps the handler at its size gate."""
-    disclosure = api_fallback_disclosure(parse_reviewer_slots(raw))  # raises on malformed
+    none) otherwise. ``subagents_raw`` threads the roster the SAME save
+    produces (S4 atomicity) through a context-local override — actor
+    references validate against it without any process-env mutation."""
+    if subagents_raw is None:
+        disclosure = api_fallback_disclosure(parse_reviewer_slots(raw))
+        return _fallback_warning_text(disclosure)
+    overlay = dict(os.environ)
+    overlay["OUROBOROS_SUBAGENTS"] = str(subagents_raw)
+    token = _ROSTER_ENV_OVERRIDE.set(overlay)
+    try:
+        disclosure = api_fallback_disclosure(parse_reviewer_slots(raw))
+    finally:
+        _ROSTER_ENV_OVERRIDE.reset(token)
     return _fallback_warning_text(disclosure)
 
 
@@ -690,8 +937,17 @@ def project_reviewer_slots_into_env() -> None:
                 REVIEWER_SLOTS_ENV, exc_info=True,
             )
         else:
-            api_triad = [r.target_id for r in config.triad if not r.is_session]
-            api_scope = [r.target_id for r in config.scope if not r.is_session]
+            # D15: only DIRECT api_chat rows project into the legacy comma keys
+            # API-only task acceptance reads. A configured-subagent api row is
+            # retrieval delivery — projecting its model here would silently
+            # hand acceptance a packet reviewer the owner configured as an
+            # actor (and its model id may not even be an api_chat catalog id).
+            api_triad = [
+                r.target_id for r in config.triad if not r.retrieves
+            ]
+            api_scope = [
+                r.target_id for r in config.scope if not r.retrieves
+            ]
             if api_triad:
                 os.environ["OUROBOROS_REVIEW_MODELS"] = ",".join(api_triad)
             else:
@@ -812,6 +1068,9 @@ def record_reviewer_slot_executions(surface: str, actors: Any, slots_by_id: Dict
                     "effort": str(getattr(slot, "effort", "") or ""),
                     "session_target": str(getattr(slot, "session_target", "") or ""),
                     "profile_id": str(getattr(slot, "session_profile", "") or ""),
+                    # Actor binding, when the row is a configured-subagent
+                    # reference ('' = direct row) — disclosure, never routing.
+                    "subagent_id": str(getattr(slot, "subagent_id", "") or ""),
                 },
                 "effective": effective,
                 "capability_delta": usage.get("capability_delta") or [],

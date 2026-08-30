@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import re
 import subprocess
 from typing import Callable, List, Optional, Tuple
@@ -44,18 +45,33 @@ def official_ref_has_constitution(
 
 
 def _git_network_bounded(
-    args: List[str], *, timeout: Optional[float] = None
+    args: List[str],
+    *,
+    timeout: Optional[float] = None,
+    cwd: os.PathLike[str] | str | None = None,
 ) -> Tuple[int, str, str]:
-    """Run one non-interactive git network command under the shared ceiling."""
+    """Run one non-interactive git network command under the shared ceiling.
+
+    ``cwd`` selects the repository the command runs in; the default remains the
+    managed system repository. An explicit ``cwd`` must be an existing
+    directory — network commands against a caller-selected repository must
+    never silently fall back to the system repository.
+    """
     from ouroboros.update_channels import get_managed_update_fetch_timeout_sec
     from supervisor import git_ops as _g
 
+    if cwd is None:
+        repo_dir = _g.REPO_DIR
+    else:
+        repo_dir = pathlib.Path(cwd)
+        if not repo_dir.is_dir():
+            return 127, "", f"git cwd is not a directory: {repo_dir}"
     limit = float(timeout or get_managed_update_fetch_timeout_sec())
     env = {**os.environ, "LC_ALL": "C", "LANG": "C", "GIT_TERMINAL_PROMPT": "0"}
     rc, out, err = _g._run_git_process_bounded(
         ["git", "-c", "http.lowSpeedLimit=1024", "-c", "http.lowSpeedTime=30", *args],
         timeout=limit,
-        cwd=_g.REPO_DIR,
+        cwd=repo_dir,
         env=env,
         text=True,
     )

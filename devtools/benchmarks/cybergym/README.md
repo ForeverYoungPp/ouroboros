@@ -129,10 +129,10 @@ The template pins every model slot to
 `deepseek/deepseek-v4-flash-0731`, including the canonical Available-subagents
 row and API-only reviewer slots.  The applied measured cohort explicitly
 disables that actor list; the template keeps it available for review/copying.
-The Claude Agent SDK transport names are explicit empty/inactive fields rather
-than routed model slots: the optional advisory row is disabled, and the applied
-server strips ambient Claude/provider/model environment before adding only its
-selected OpenRouter key.  The manifest records settings-file grants and this
+The retired Claude-transport settings are no longer part of the template or
+the applied snapshot: the optional advisory row is disabled for comparability,
+and the applied server strips ambient provider/model environment before adding
+only its selected OpenRouter key.  The manifest records settings-file grants and this
 runtime-injected grant separately by fingerprint.
 The measured task reasoning effort is `high`; review, scope-review, and deep-self-review
 use the stronger supported `max` tier.  The structured reviewer panel has one

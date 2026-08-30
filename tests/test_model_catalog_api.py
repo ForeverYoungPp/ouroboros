@@ -31,7 +31,8 @@ def test_model_catalog_tags_provider_values(monkeypatch):
 
     async def fake_openrouter(_client, _api_key):
         return [model_catalog_api._build_model_catalog_entry(
-            "openrouter", "Anthropic", "anthropic/claude-opus", "Claude Opus", source="OpenRouter"
+            "openrouter", "Anthropic", "anthropic/claude-sonnet-4-6", "Claude Sonnet 4.6",
+            source="OpenRouter",
         )]
 
     async def fake_anthropic(_client, _api_key):
@@ -58,9 +59,10 @@ def test_model_catalog_tags_provider_values(monkeypatch):
 
     response = asyncio.run(model_catalog_api.api_model_catalog(None))
     payload = json.loads(response.body.decode("utf-8"))
-    values = {item["value"] for item in payload["items"]}
+    items_by_value = {item["value"]: item for item in payload["items"]}
+    values = set(items_by_value)
 
-    assert "anthropic/claude-opus" in values
+    assert "anthropic/claude-sonnet-4-6" in values
     assert "openai::gpt-4.1" in values
     assert "anthropic::claude-sonnet-4-6" in values
     assert "openai-compatible::compatible-pro" in values
@@ -70,6 +72,19 @@ def test_model_catalog_tags_provider_values(monkeypatch):
     # the region host), so the fake returns exactly one model for it.
     assert "minimax::MiniMax-M3" in values
     assert payload["errors"] == []
+
+    openrouter_item = items_by_value["anthropic/claude-sonnet-4-6"]
+    direct_item = items_by_value["anthropic::claude-sonnet-4-6"]
+    assert openrouter_item["source"] == "OpenRouter"
+    assert openrouter_item["label"] == "OpenRouter · Claude Sonnet 4.6"
+    assert direct_item["source"] == "Anthropic"
+    assert direct_item["label"] == "Anthropic · Claude Sonnet 4.6"
+    assert openrouter_item["label"] != direct_item["label"]
+    assert all(item["label"] == f'{item["source"]} · {item["name"]}' for item in payload["items"])
+    assert [
+        item["value"] for item in payload["items"]
+        if item["provider"] == "Anthropic" and item["name"] == "Claude Sonnet 4.6"
+    ] == ["anthropic/claude-sonnet-4-6", "anthropic::claude-sonnet-4-6"]
 
 
 def test_model_catalog_returns_errors_nonfatally(monkeypatch):

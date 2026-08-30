@@ -8,7 +8,6 @@ reviewer slots.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import logging
@@ -20,7 +19,6 @@ from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("review_substrate")
 
-from ouroboros.config import get_review_models, review_model_uses_local
 from ouroboros.llm import LLMClient
 from ouroboros.observability import new_call_id, persist_call, redact_projection
 from ouroboros.provider_models import provider_for_model
@@ -59,7 +57,6 @@ from ouroboros.usage_accounting import (
     UsageAccountingError,
     UsageScope,
     current_usage_scope,
-    physical_attempt_limit,
     usage_scope,
 )
 from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact
@@ -127,6 +124,18 @@ class ReviewSlot:
     # Optional manual credential pin (Q2-в); '' = the daemon's rotation (D28).
     session_profile: str = ""
     transport_timeout_sec: Optional[float] = None
+    # Optional configured-subagent binding (resolved at admission; '' = direct).
+    subagent_id: str = ""
+
+    @property
+    def native_retrieval(self) -> bool:
+        # An api-route actor row: bounded native tool rounds, never the packet.
+        return bool(self.subagent_id) and self.route is ReviewRouteKind.API_CHAT
+
+    @property
+    def retrieves(self) -> bool:
+        # DELIVERY class for admission/fit/authority; transport tests the route.
+        return self.route is ReviewRouteKind.AGENT_SESSION or self.native_retrieval
 
 
 @dataclass
@@ -942,33 +951,9 @@ from ouroboros.review_dispatch import (  # noqa: E402,F401 — re-exports
 )
 
 
-def reviewer_slots(
-    models: List[str] | None = None,
-    *,
-    effort: str = "medium",
-    role_hint: str = "",
-    id_prefix: str = SLOT_ID_PREFIX,
-    route_env_key: str = "",
-) -> List[ReviewSlot]:
-    """The configured reviewer rows, each carrying its DELIVERY route.
-
-    ``route_env_key`` names the surface's per-row route list (plan 5.1): the
-    commit triad and scope pass theirs, so a row can be an api_chat call or a
-    delegated agent session. Surfaces that stay on the API by owner decision
-    (task acceptance — D15) pass NOTHING, which pins every row to
-    ``api_chat`` explicitly rather than by accident.
-    """
-    raw_models = models if models is not None else get_review_models()
-    named = [str(model) for model in (raw_models or []) if str(model or "").strip()]
-    routes = configured_review_routes(route_env_key, len(named)) if route_env_key else [
-        ReviewRouteKind.API_CHAT
-    ] * len(named)
-    return [
-        ReviewSlot(slot_id=slot_id_for_row(idx + 1, prefix=id_prefix), model=model, effort=effort,
-                   role_hint=role_hint, use_local=review_model_uses_local(model),
-                   route=routes[idx])
-        for idx, model in enumerate(named)
-    ]
+# reviewer_slots() lives in reviewer_slot_config (altitude, P7); re-exported
+# because acceptance surfaces and tests import it from here.
+from ouroboros.reviewer_slot_config import reviewer_slots  # noqa: F401,E402
 
 
 def scope_reviewer_slots(
@@ -1384,12 +1369,13 @@ class ReviewCoordinator:
             acceptance_actor = request.surface == "task_acceptance"
             actor_attempts = 2 if (p3_actor or acceptance_actor) else 1
             # Acceptance and P3 share one two-send rail: transport/empty retry
-            # or same-route format repair. The prompt, slot and model stay fixed.
-            attempt_rail = (
-                physical_attempt_limit(2)
-                if acceptance_actor or p3_actor
-                else contextlib.nullcontext()
-            )
+            # or same-route format repair; a native tool-round slot instead
+            # gets its episode's own config-owned send cap (its second actor
+            # attempt repairs format locally, spending no send).
+            from ouroboros.review_native_episode import native_or_packet_attempt_rail
+
+            attempt_rail = native_or_packet_attempt_rail(
+                slot, acceptance_actor or p3_actor)
             with attempt_rail:
                 _prior_msg, _prior_usage, _prior_text = None, None, ""
                 _last_msg, _last_usage, _last_text, _has_prior = None, None, "", False

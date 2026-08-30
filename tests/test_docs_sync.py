@@ -38,10 +38,11 @@ def test_architecture_mentions_shared_log_grouping_and_direct_provider_review_fa
     # cross-provider free-text main model to silently miss the fallback.
     assert "migrate_model_value" in arch
     assert "already start with the exclusive provider prefix" in arch
-    # v4.34.0: Claude Runtime Status doc widened to cover both backend and
-    # browser-side `catch` block paths that set `claudeRuntimeHasError`.
-    assert "refreshClaudeCodeStatus" in arch
-    assert "transport failure" in arch
+    # The Claude Runtime Status surface is RETIRED with the Claude-SDK
+    # advisory transport (owner-consented, 2026-08-29): the doc must not
+    # resurrect its UI plumbing.
+    assert "refreshClaudeCodeStatus" not in arch
+    assert "claudeRuntimeHasError" not in arch
 
 
 def test_architecture_documents_skill_schedule_lifecycle_and_evolution_light_block():
