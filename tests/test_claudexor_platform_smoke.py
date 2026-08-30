@@ -414,7 +414,11 @@ def test_the_request_uses_the_seams_own_authority_shape(tmp_path):
     # The delegated marker rides the live lane only: a fake maps no
     # `external_sandbox_full`, so the engine refuses the delegated mutating shape
     # on a pinned fake lane wherever the host has a kernel boundary.
-    assert live["execution"] == {"isolation": shape.isolation, "delegated": shape.delegated}
+    assert live["execution"] == {
+        "isolation": shape.isolation,
+        "delegated": shape.delegated,
+        "workspaceRoot": str(tmp_path),
+    }
     assert fixture["execution"] == {"isolation": shape.isolation, "delegated": False}
     # Both lanes pin the pool: `primaryHarness` alone only reorders the auto-pool,
     # and the auto-pool excludes `fake-*` routes entirely.
@@ -467,7 +471,11 @@ def test_the_live_request_pins_the_pool_and_keeps_the_delegated_marker(
     request = smoke.build_request("live", "claude", "m", "low", tmp_path, "p", 300)
     assert request["harnesses"] == ["claude"]
     assert request["primaryHarness"] == "claude"
-    assert request["execution"] == {"isolation": "live", "delegated": True}
+    assert request["execution"] == {
+        "isolation": "live",
+        "delegated": True,
+        "workspaceRoot": str(tmp_path),
+    }
     assert request["authPreference"] == "api_key"
 
 
