@@ -9,7 +9,6 @@ cross-process lock as budget check + append + fsync; network I/O stays outside."
 
 from __future__ import annotations
 
-import collections
 import contextlib
 import contextvars
 import hashlib
@@ -97,60 +96,6 @@ _LAST_PHYSICAL_ATTEMPT: contextvars.ContextVar[Optional["PhysicalAttemptCapture"
 _ROOT_ACCOUNTING_TELEMETRY: Dict[str, Dict[str, Any]] = {}
 _ROOT_ACCOUNTING_TELEMETRY_LOCK = threading.Lock()
 _ROOT_ACCOUNTING_TELEMETRY_CAP = 64
-
-# razzant/ouroboros#129: the in-lock write paths (reserve/settle/_transition/
-# release/legacy-import) each did a full parse+validate of the whole
-# state/usage_attempts.jsonl under the 45s monetary flock — ~1s at 40MB, and it
-# grows unboundedly. This is a per-process warm cache of the last validated read
-# per drive root: the next in-lock read reuses it and only parses+validates the
-# bytes appended since (``_read_new_records_locked``, which already re-stats the
-# file under the held lock and returns None on ANY doubt — inode change, shrink,
-# in-place rewrite, torn/invalid tail — so a stale cache can never be served;
-# the full ``_read_records_locked`` stays the authority and the fallback). It
-# touches only READ cost; the money math sees byte-identical rows.
-_LEDGER_READ_CACHE: "collections.OrderedDict[str, Tuple[LedgerResumeState, list]]" = (
-    collections.OrderedDict()
-)
-_LEDGER_READ_CACHE_LOCK = threading.Lock()
-_LEDGER_READ_CACHE_MAX_ROOTS = 8
-
-
-def _ledger_cache_put(key: str, value: "Tuple[LedgerResumeState, list]") -> None:
-    with _LEDGER_READ_CACHE_LOCK:
-        _LEDGER_READ_CACHE[key] = value
-        _LEDGER_READ_CACHE.move_to_end(key)
-        while len(_LEDGER_READ_CACHE) > _LEDGER_READ_CACHE_MAX_ROOTS:
-            _LEDGER_READ_CACHE.popitem(last=False)
-
-
-def _read_records_locked_cached(root: pathlib.Path) -> list:
-    """``_read_records_locked`` with an incremental warm path. Call under the
-    held ledger lock (same contract as ``_read_records_locked``)."""
-    key = str(root)
-    with _LEDGER_READ_CACHE_LOCK:
-        cached = _LEDGER_READ_CACHE.get(key)
-    if cached is not None:
-        resume, rows = cached
-        try:
-            delta = _read_new_records_locked(root, resume)
-        except Exception:  # noqa: BLE001 — any doubt = fall back to the full read
-            delta = None
-        if delta is not None:
-            new_rows, new_resume = delta
-            merged = rows if not new_rows else [*rows, *new_rows]
-            _ledger_cache_put(key, (new_resume, merged))
-            return list(merged)
-    records = _read_records_locked(root)
-    try:
-        resume = _ledger_resume_state(root, records)
-        _ledger_cache_put(key, (resume, list(records)))
-    except Exception:  # noqa: BLE001 — caching is best-effort; correctness is the full read
-        log.debug("ledger read-cache seed failed for %s", key, exc_info=True)
-        with _LEDGER_READ_CACHE_LOCK:
-            _LEDGER_READ_CACHE.pop(key, None)
-    return records
-
-
 def _stash_root_accounting(
     root_task_id: str,
     accounted_usd: Optional[float],
@@ -418,11 +363,8 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
         request = replace(request, global_limit_usd=scope.global_limit_usd)
     return request, scope
 from ouroboros._usage_rows_memo import (  # noqa: F401,E402  (re-exported seam)
-    _LedgerRowsMemo,
-    _ROWS_MEMO,
-    _ROWS_MEMO_LOCK,
-    _memoized_final_rows,
-    _render_cached,
+    _LedgerRowsMemo, _ROWS_MEMO, _ROWS_MEMO_LOCK,
+    _memoized_final_rows, _read_records_locked_cached, _render_cached,
 )
 
 
