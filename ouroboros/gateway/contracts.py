@@ -237,6 +237,7 @@ class PhotoOutbound(TypedDict):
     client_message_id: NotRequired[str]
     transport: NotRequired[TransportMetadata]
     chat_id: NotRequired[int]
+    task_id: NotRequired[str]
     # Server-stamped when chat_id is a reserved Project thread: Main never
     # adopts it, even before the browser has learned the project.
     project_thread: NotRequired[bool]
@@ -260,6 +261,7 @@ class VideoOutbound(TypedDict):
     client_message_id: NotRequired[str]
     transport: NotRequired[TransportMetadata]
     chat_id: NotRequired[int]
+    task_id: NotRequired[str]
     # Server-stamped when chat_id is a reserved Project thread: Main never
     # adopts it, even before the browser has learned the project.
     project_thread: NotRequired[bool]
@@ -288,11 +290,34 @@ class DocumentOutbound(TypedDict):
     client_message_id: NotRequired[str]
     transport: NotRequired[TransportMetadata]
     chat_id: NotRequired[int]
+    task_id: NotRequired[str]
+    size_bytes: NotRequired[int]
     # Server-stamped when chat_id is a reserved Project thread: Main never
     # adopts it, even before the browser has learned the project.
     project_thread: NotRequired[bool]
     # Deprecated compatibility field: runtime emits ``transport`` instead.
     telegram_chat_id: NotRequired[int]
+
+
+class LinkAction(TypedDict):
+    """One validated HTTP(S) action in a structured links frame."""
+
+    label: str
+    url: str
+
+
+class LinksOutbound(TypedDict):
+    """Outbound group of first-class external link buttons."""
+
+    type: Literal["links"]
+    role: Literal["assistant"]
+    actions: list[LinkAction]
+    ts: str
+    title: NotRequired[str]
+    chat_id: NotRequired[int]
+    task_id: NotRequired[str]
+    project_thread: NotRequired[bool]
+    transport: NotRequired[TransportMetadata]
 
 
 class TypingOutbound(TypedDict):
@@ -1418,6 +1443,7 @@ WS_MESSAGE_TYPES: tuple[str, ...] = (
     "photo",
     "video",
     "document",
+    "links",
     "typing",
     "log",
     "heartbeat",
@@ -1439,6 +1465,8 @@ __all__ = [
     "PhotoOutbound",
     "VideoOutbound",
     "DocumentOutbound",
+    "LinkAction",
+    "LinksOutbound",
     "TypingOutbound",
     "LogOutbound",
     "HeartbeatOutbound",

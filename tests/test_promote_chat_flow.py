@@ -2168,7 +2168,7 @@ def test_bound_task_media_routes_to_project_panel(tmp_path):
     import base64
 
     from ouroboros.projects_registry import bind_task_to_project, create_project
-    from supervisor.events import _handle_send_photo, _handle_send_video
+    from supervisor.chat_delivery_events import _handle_send_photo, _handle_send_video
 
     project = create_project(tmp_path, "media-proj")
     project_chat = int(project["chat_id"])

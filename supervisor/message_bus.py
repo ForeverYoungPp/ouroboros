@@ -12,9 +12,10 @@ from urllib.parse import quote
 
 from ouroboros.artifacts import store_chat_media_bytes
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
-from ouroboros.event_bus import CHAT_DOCUMENT, CHAT_OUTBOUND, CHAT_PHOTO, CHAT_TYPING, CHAT_VIDEO, publish_event
+from ouroboros.event_bus import CHAT_DOCUMENT, CHAT_LINKS, CHAT_OUTBOUND, CHAT_PHOTO, CHAT_TYPING, CHAT_VIDEO, publish_event
 from supervisor.state import append_jsonl, load_state
 from ouroboros.projects_registry import stamp_project_thread
+from ouroboros.tools.core import LinkActionsValidationError, validate_link_actions
 from ouroboros.utils import utc_now_iso
 from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS
 
@@ -516,6 +517,7 @@ class LocalChatBridge:
             "caption": caption,
             "ts": utc_now_iso(),
             "chat_id": int(chat_id or 0),
+            "task_id": str(task_id or ""),
         }
         stamp_project_thread(DATA_DIR, msg)
         if self._broadcast_fn:
@@ -569,6 +571,7 @@ class LocalChatBridge:
             "caption": caption,
             "ts": utc_now_iso(),
             "chat_id": int(chat_id or 0),
+            "task_id": str(task_id or ""),
         }
         stamp_project_thread(DATA_DIR, msg)
         if self._broadcast_fn:
@@ -625,8 +628,10 @@ class LocalChatBridge:
             "filename": safe_name,
             "caption": caption,
             "download_url": str(download_url or ""),
+            "size_bytes": len(file_bytes),
             "ts": ts,
             "chat_id": int(chat_id or 0),
+            "task_id": str(task_id or ""),
         }
         stamp_project_thread(DATA_DIR, msg)
         if self._broadcast_fn:
@@ -660,6 +665,55 @@ class LocalChatBridge:
             mime=str(mime or ""),
             download_url=str(download_url or ""),
             caption=str(caption or ""),
+            size_bytes=len(file_bytes),
+        )
+        _advance_project_visible_revision(chat_id)
+        return True, "ok"
+
+    def send_links(
+        self,
+        chat_id: int,
+        actions: List[Dict[str, str]],
+        title: str = "",
+        task_id: str = "",
+    ) -> Tuple[bool, str]:
+        """Send validated HTTP(S) actions to UI and host event subscribers."""
+        safe_title = str(title or "")[:240]
+        if is_a2a_chat_id(chat_id):
+            return True, "ok"
+        try:
+            validated = validate_link_actions(actions)
+        except LinkActionsValidationError as exc:
+            return False, str(exc)
+        ts = utc_now_iso()
+        msg = {
+            "type": "links",
+            "role": "assistant",
+            "title": safe_title,
+            "actions": validated,
+            "ts": ts,
+            "chat_id": int(chat_id or 0),
+            "task_id": str(task_id or ""),
+        }
+        stamp_project_thread(DATA_DIR, msg)
+        if self._broadcast_fn:
+            self._broadcast_fn(msg)
+        links_transport = dict(self._chat_transports.get(int(chat_id or 0), {}) or {})
+        publish_event(CHAT_LINKS, {
+            "chat_id": int(chat_id or 0),
+            "transport": links_transport,
+            "title": safe_title,
+            "actions": validated,
+            "ts": ts,
+        })
+        try:
+            owner_id = int(load_state().get("owner_id") or 0)
+        except Exception:
+            owner_id = 0
+        log_chat(
+            "out", int(chat_id or 0), owner_id, safe_title, ts=ts,
+            task_id=str(task_id or ""), record_type="links",
+            actions=validated, title=safe_title,
         )
         _advance_project_visible_revision(chat_id)
         return True, "ok"
@@ -876,6 +930,9 @@ def log_chat(
     mime: str = "",
     download_url: str = "",
     caption: str = "",
+    actions: Optional[List[Dict[str, str]]] = None,
+    title: str = "",
+    size_bytes: Optional[int] = None,
     client_surface: Optional[Dict[str, Any]] = None,
     message_meta: Optional[Dict[str, Any]] = None,
 ) -> None:
@@ -926,6 +983,11 @@ def log_chat(
             record["download_url"] = download_url
         if caption:
             record["caption"] = caption
+        if actions:
+            record["actions"] = [dict(action) for action in actions]
+            record["title"] = str(title or "")
+        if size_bytes is not None:
+            record["size_bytes"] = int(size_bytes)
         append_jsonl(DATA_DIR / "logs" / "chat.jsonl", record)
 
 

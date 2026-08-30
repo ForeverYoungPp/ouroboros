@@ -90,6 +90,21 @@ def test_policy_skip_does_not_call_llm(monkeypatch):
     assert stub.calls == []
 
 
+def test_send_links_policy_skip_does_not_call_llm(monkeypatch):
+    from ouroboros.safety import check_safety
+
+    stub = _StubLLMClient('{"status":"DANGEROUS","reason":"should not be called"}')
+    _patch_llm_client(monkeypatch, stub)
+
+    ok, msg = check_safety(
+        "send_links", {"links": [{"label": "Docs", "url": "https://example.com"}]},
+    )
+
+    assert ok is True
+    assert msg == ""
+    assert stub.calls == []
+
+
 def test_policy_check_calls_llm(monkeypatch):
     """A tool marked POLICY_CHECK must always invoke the LLM."""
     from ouroboros.safety import check_safety

@@ -595,6 +595,14 @@ def test_required_media_subscription_failure_stops_skill_registration(tmp_path, 
             "chat.video",
             "chat.document",
         ],
+        "chat.links": [
+            "chat.outbound",
+            "chat.typing",
+            "chat.photo",
+            "chat.video",
+            "chat.document",
+            "chat.links",
+        ],
     }
 
     for topic, subscriptions in expected.items():

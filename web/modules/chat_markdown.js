@@ -542,5 +542,5 @@ export function destroyChatMarkdown(rootEl) {
     for (const root of new Set(roots)) cleanupState(root, ROOT_STATE.get(root));
 }
 
-// Short aliases keep the byte-frozen chat module's integration delta negative. Any future bubble-removal path in chat.js MUST call the destroy alias d() or Chart instances leak (Chart.js keeps a static registry).
-export { destroyChatMarkdown as d, enhanceChatMarkdown as e, renderChatMarkdown as m };
+// Any future bubble-removal path in chat.js MUST call destroyChatMarkdown() or Chart
+// instances leak (Chart.js keeps a static registry that only destroy() releases).

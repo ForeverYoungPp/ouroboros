@@ -85,6 +85,7 @@ def test_chat_history_replays_delivered_document_row(tmp_path):
                 "download_url": "/api/files/download?path=Desktop/report.pdf",
                 "caption": "quarterly numbers",
                 "task_id": "t-doc",
+                "size_bytes": 4096,
             }
         )
         + "\n",
@@ -102,6 +103,43 @@ def test_chat_history_replays_delivered_document_row(tmp_path):
     assert rec["mime"] == "application/pdf"
     assert rec["download_url"] == "/api/files/download?path=Desktop/report.pdf"
     assert rec["caption"] == "quarterly numbers"
+    assert rec["task_id"] == "t-doc"
+    assert rec["size_bytes"] == 4096
+
+
+def test_chat_history_replays_links_with_task_grouping_fields(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    actions = [
+        {"label": "Report", "url": "https://example.com/report"},
+        {"label": "Dashboard", "url": "http://example.com/dashboard"},
+    ]
+    (logs / "chat.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-08-30T00:00:00Z",
+            "direction": "out",
+            "chat_id": 1,
+            "user_id": 7,
+            "text": "References",
+            "type": "links",
+            "title": "References",
+            "actions": actions,
+            "task_id": "task-links",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(
+        query_params={"limit": "10"},
+    )))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    rec = next(item for item in payload if item.get("msg_type") == "links")
+    assert rec["role"] == "assistant"
+    assert rec["title"] == "References"
+    assert rec["actions"] == actions
+    assert rec["task_id"] == "task-links"
 
 
 def test_chat_history_replays_durable_photo_and_keeps_legacy_row_as_text(tmp_path):
@@ -138,8 +176,10 @@ def test_chat_history_replays_durable_photo_and_keeps_legacy_row_as_text(tmp_pat
     legacy = next(item for item in payload if item["text"] == "legacy shot")
     assert durable["msg_type"] == "photo"
     assert durable["download_url"].endswith(".png")
+    assert durable["task_id"] == "media-task"
     assert video["msg_type"] == "video"
     assert video["download_url"].endswith(".mp4")
+    assert video["task_id"] == "media-task"
     assert "msg_type" not in legacy
     assert legacy["task_id"] == "still-running"
 

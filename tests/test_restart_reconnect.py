@@ -56,8 +56,7 @@ def test_final_answer_marker_uses_ordinary_message_presentation():
 
     assert "renderAssistantWithAnswerChip" not in source
     assert "final-answer-chip" not in css
-    # The rich renderer is reached through the byte-frozen chat module's short alias.
-    assert ":m(text)" in source
+    assert ": renderChatMarkdown(text);" in source
     # Both live and history assistant/system paths feed the same addMessage renderer;
     # reconnect notices do too, so marker-shaped text never gets a separate capsule.
     assert "addMessage(msg.content, msg.role" in source
@@ -277,6 +276,7 @@ def test_chat_scrolls_to_bottom_after_first_history_load():
     """syncHistory must scroll to bottom on first load (restart/open) but
     respect user scroll position on subsequent reconnect syncs."""
     source = _read("web/modules/chat.js")
+    media_source = _read("web/modules/chat_media.js")
     # First-load guard: wasFirstLoad captures pre-call state
     assert "wasFirstLoad = !historyLoaded" in source, \
         "Missing first-load detection before setting historyLoaded"
@@ -305,16 +305,21 @@ def test_chat_scrolls_to_bottom_after_first_history_load():
         "insertMessageNode must route through chronological insertTimelineNode"
     # The shared photo/video builder and the separate document builder must
     # each stamp sortable data-ts from the raw source timestamp.
-    media_builder = source.split("function buildMediaBubble", 1)[1].split(
-        "function appendMediaBubble", 1
+    bubble_frame = media_source.split("function bubbleFrame", 1)[1].split(
+        "function mediaSource", 1
     )[0]
-    document_builder = source.split("function buildDocumentBubble", 1)[1].split(
-        "function documentMessageKey", 1
+    media_builder = media_source.split("function buildMediaBubble", 1)[1].split(
+        "function buildDocumentBubble", 1
     )[0]
-    assert "stampNodeTimestamp(bubble, rawTs);" in media_builder, \
-        "shared photo/video bubbles must carry raw-timestamp data-ts"
-    assert "stampNodeTimestamp(bubble, rawTs);" in document_builder, \
-        "document bubbles must carry raw-timestamp data-ts"
+    document_builder = media_source.split("function buildDocumentBubble", 1)[1].split(
+        "function buildLinksMessage", 1
+    )[0]
+    assert "const rawTs = msg.ts ||" in bubble_frame
+    assert "stampNodeTimestamp(bubble, rawTs);" in bubble_frame
+    assert "bubbleFrame(msg" in media_builder, \
+        "shared photo/video bubbles must use the raw-timestamp-stamped frame"
+    assert "bubbleFrame(msg" in document_builder, \
+        "document bubbles must use the raw-timestamp-stamped frame"
     assert "stampNodeTimestamp(bubble, ts);" in source, \
         "chat text bubbles must carry raw-timestamp data-ts"
 

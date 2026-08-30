@@ -134,6 +134,8 @@ TOOL_POLICY: Dict[str, str] = {
     "send_photo": POLICY_SKIP,
     "send_video": POLICY_SKIP,
     "send_file": POLICY_SKIP,
+    # Structured links cannot exceed the task's existing owner-chat delivery authority.
+    "send_links": POLICY_SKIP,
     "presence_finish": POLICY_SKIP,
     "presence_cancel_work": POLICY_SKIP,
     "configure_presence": POLICY_SKIP,

@@ -66,8 +66,8 @@ def test_files_pdf_preview_and_download_bridge_are_safe():
     assert "parsed.port != actual_port" in launcher
 
 
-def test_chat_document_bubble_opens_externally_and_downloads_separately():
-    chat = _read("web/modules/chat.js")
+def test_chat_document_card_uses_dialog_and_safe_download_fallbacks():
+    chat = _read("web/modules/chat_media.js")
     helper = _read("web/modules/ui_helpers.js")
     launcher = _read("launcher.py")
     css = _read("web/style.css")
@@ -79,21 +79,23 @@ def test_chat_document_bubble_opens_externally_and_downloads_separately():
     # Shared loopback guard reused by both bridge methods (DRY).
     assert "_resolve_bridge_file_url(url)" in launcher
 
-    # JS open helper prefers the native open bridge, degrades to the long-shipped
-    # download_file_to_downloads(open_external=true) bridge when a packaged
-    # launcher predates open_file_with_default_app (version skew), and only falls
-    # back to a new tab on true web.
     assert "export async function openViaHostBridge(url, filename = 'file')" in helper
     assert "api?.open_file_with_default_app" in helper
     assert "api?.download_file_to_downloads" in helper
     assert "await downloadBridge(url, filename, true)" in helper
 
-    # Bubble body click = open externally; separate ↓ button = download.
-    assert "import { createSystemMessageAction, downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';" in chat
-    assert "await openViaHostBridge(downloadUrl, filename);" in chat
-    assert "await downloadViaHostBridge(downloadUrl, filename);" in chat
-    assert 'class="chat-file-download"' in chat
-    assert ".chat-file-download {" in css
+    # A card opens the explicit action dialog. Download retains the native bridge
+    # for durable files and the object-URL anchor fallback for live base64 bytes.
+    assert "className = 'chat-file-dialog'" in chat
+    assert 'data-file-action="open"' in chat
+    assert "open.hidden = !file.source.durable;" in chat
+    assert "await openViaHostBridge(dialogFile.source.durable, dialogFile.filename);" in chat
+    assert 'data-file-action="download"' in chat
+    assert 'data-file-action="share"' in chat
+    assert "await downloadViaHostBridge(source.durable, filename);" in chat
+    assert "URL.createObjectURL(blob)" in chat
+    assert "navigator.canShare" in chat
+    assert ".chat-file-dialog {" in css
 
 
 def test_files_confirm_dialog_results_are_normalized():
