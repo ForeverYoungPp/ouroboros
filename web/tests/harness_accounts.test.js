@@ -54,6 +54,15 @@ import {
     submitLoginInput,
 } from '../modules/harness_login_cards.js';
 
+test('account actions stack at the app shell compact breakpoint', () => {
+    const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
+    assert.ok(css.includes(`@media (max-width: 980px) {
+    .harness-account-row {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "main" "meta" "actions";`),
+    'account actions must drop below status before the persistent sidebar squeezes the row');
+});
+
 test('managed runtime keeps one contextual Connect intent across install, repair, and update', () => {
     const payload = (runtime, daemon = {}) => ({ daemon: { state: 'not_provisioned', runtime, ...daemon } });
 
