@@ -46,8 +46,26 @@ def _runtime_branch_defaults(request: Request) -> tuple[str, str]:
 
 def _managed_update_payload(*, fetch: bool, include_tags: bool) -> dict[str, Any]:
     from supervisor.git_ops import compute_managed_update_status, git_capture
+    from supervisor.update_merge import active_update_tx
 
     status = compute_managed_update_status(fetch=fetch)
+    # Additive minimal public projection of an active managed-update
+    # transaction, so a re-opened panel can say "resolution in progress"
+    # instead of silently reading as ordinary state (a second apply 409s).
+    try:
+        tx = active_update_tx()
+    except Exception:
+        tx = {}
+    update_tx = (
+        {
+            "active": True,
+            "phase": str(tx.get("phase") or ""),
+            "task_id": str(tx.get("task_id") or ""),
+            "restart_required": bool(tx.get("restart_required")),
+        }
+        if tx
+        else {"active": False}
+    )
     latest_version = ""
     latest_sha = status.get("latest_sha") or ""
     if latest_sha:
@@ -63,6 +81,7 @@ def _managed_update_payload(*, fetch: bool, include_tags: bool) -> dict[str, Any
         "current_version": get_version(),
         "latest_version": latest_version,
         "official_tags": official_tags,
+        "update_tx": update_tx,
         **status,
     }
 

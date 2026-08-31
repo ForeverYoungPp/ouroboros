@@ -1180,6 +1180,8 @@ def test_compute_managed_update_status_passive_does_not_ensure_remote(monkeypatc
     )
 
     def fake_git_capture(cmd):
+        if cmd[:3] == ["git", "remote", "get-url"]:
+            return 0, "https://github.com/razzant/ouroboros", ""
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return 0, "ouroboros", ""
         if cmd == ["git", "rev-parse", "HEAD"]:
@@ -1362,6 +1364,8 @@ def test_prepare_managed_update_blocks_when_ahead_check_fails(monkeypatch, tmp_p
     )
 
     def fake_git_capture(cmd):
+        if cmd[:3] == ["git", "remote", "get-url"]:
+            return 0, "https://github.com/razzant/ouroboros", ""
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return 0, "ouroboros", ""
         if cmd == ["git", "rev-parse", "--verify", "HEAD"]:

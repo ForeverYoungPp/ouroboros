@@ -1594,6 +1594,7 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
         "remote": remote_name,
         "remote_branch": remote_branch,
         "target_ref": branch_ref,
+        "official_repo_url": "",
         "update_channel": update_channel,
         "current_branch": "unknown",
         "current_sha": "",
@@ -1611,6 +1612,11 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
         "available": False,
         "safe_to_apply": False,
     }
+    if remote_name:
+        url_rc, remote_url, _url_err = git_capture(["git", "remote", "get-url", remote_name])
+        state["official_repo_url"] = (
+            remote_url.strip() if url_rc == 0 and remote_url.strip() else OFFICIAL_UPDATE_REMOTE_URL
+        )
     if not official_remote_ok:
         state["warnings"].append(f"remote_config_error:{official_remote_err or 'unknown error'}")
         state["managed"] = False
@@ -1688,6 +1694,13 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
                 )
             except Exception:
                 counts_rc, cached_ahead, cached_behind = 1, 0, 0
+            if identity_matches and str(cache.get("checked_at") or ""):
+                # Additive truthfulness: the passive read discloses WHEN the
+                # official channel was last actually checked, even when the
+                # cached result is "no update". Deliberately NOT `from_cache`,
+                # which keeps its narrow meaning "availability came from the
+                # cache overlay" (a consumed target must not read as cached).
+                state["checked_at"] = str(cache.get("checked_at") or "")
             if (
                 identity_matches
                 and cache.get("available")
@@ -1754,6 +1767,7 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
             )
         }
         snapshot["checked_at"] = utc_now_iso()
+        state["checked_at"] = snapshot["checked_at"]
         update_state(lambda saved: saved.__setitem__("managed_update_cache", snapshot))
     except Exception:
         log.debug("managed update status cache save failed", exc_info=True)

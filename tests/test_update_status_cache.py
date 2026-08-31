@@ -42,6 +42,8 @@ def _wire(monkeypatch, *, cache_channel="stable", cache_ref="refs/ouroboros-mana
     )
 
     def fake_git_capture(cmd):
+        if cmd[:3] == ["git", "remote", "get-url"]:
+            return 0, "https://github.com/razzant/ouroboros", ""
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return 0, "ouroboros", ""
         if cmd == ["git", "rev-parse", "HEAD"]:
@@ -120,3 +122,42 @@ def test_failed_remote_check_is_typed_not_reported_as_current(monkeypatch):
     assert status["check_ok"] is False
     assert status["available"] is False
     assert any(item.startswith("fetch_error:") for item in status["warnings"])
+
+
+def test_passive_status_exposes_cache_checked_at_without_from_cache(monkeypatch):
+    """R9/R8 truthfulness: a passive read carries the last real check's
+    timestamp even when the cached target is consumed, and the timestamp alone
+    never claims cached AVAILABILITY (`from_cache` keeps its narrow meaning)."""
+    _wire(monkeypatch, ancestor=True)  # consumed target: overlay must not fire
+    state = git_ops.compute_managed_update_status(fetch=False)
+    assert state["checked_at"] == "2026-08-03T00:00:00Z"
+    assert not state.get("from_cache")
+    assert not state.get("available")
+
+
+def test_status_exposes_official_repo_url_from_remote(monkeypatch):
+    _wire(monkeypatch)
+    state = git_ops.compute_managed_update_status(fetch=False)
+    assert state["official_repo_url"] == "https://github.com/razzant/ouroboros"
+
+
+def test_payload_carries_minimal_update_tx_projection(monkeypatch):
+    """A re-opened panel can see an active assisted resolution instead of
+    reading as ordinary state while a second apply would 409."""
+    import supervisor.update_merge as update_merge
+
+    _wire(monkeypatch)
+    monkeypatch.setattr(control, "get_version", lambda: "6.87.5")
+    monkeypatch.setattr(git_ops, "list_official_update_tags", lambda: [])
+    monkeypatch.setattr(
+        update_merge, "active_update_tx",
+        lambda: {"phase": "assisted_running", "task_id": "task-77"},
+    )
+    payload = control._managed_update_payload(fetch=False, include_tags=False)
+    assert payload["update_tx"] == {
+        "active": True, "phase": "assisted_running",
+        "task_id": "task-77", "restart_required": False,
+    }
+    monkeypatch.setattr(update_merge, "active_update_tx", lambda: {})
+    payload = control._managed_update_payload(fetch=False, include_tags=False)
+    assert payload["update_tx"] == {"active": False}
