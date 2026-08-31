@@ -185,6 +185,7 @@ Used by `commit_reviewed` for all changes to the Ouroboros repository.
 | 27 | canonical_memory_fork | If the diff touches Project/fork/execution roots, summaries, memory, or GC, does it preserve one canonical identity and distinguish authority/biography from execution-local state? Are referenced canonical artifacts promoted or retained before a child/root is collected, with missing legacy bytes represented as gaps? | critical when applicable |
 | 28 | review_artifact_continuity | If the diff changes plan, triad, scope, advisory, or acceptance evidence, are exact artifact bodies, source selectors, candidate SHA, reviewer model/profile/thread/route continuity, and all omissions retained? Continuity, transport, and coverage discrepancies are retained as typed facts beside the exact artifact bodies; a bounded or partial reviewer view must remain DEGRADED/NOT_RUN rather than PASS, and must never be implemented by discarding, blanking, or relabeling the bodies or their original cause. | critical when applicable |
 | 29 | display_identity_replay | If the diff changes routing, steering, task cards, or history replay, does it preserve the event-time human `Project › Task` presentation snapshot in both live and replay paths while keeping opaque IDs as internal/debug facts? | advisory when applicable |
+| 30 | web_design_system | If the diff touches `web/` (modules, stylesheets, `index.html`, onboarding assets): does it conform to `docs/DESIGN.md` (type scale, foreground roles, status pairs, spacing tokens) and to the engineering rules in DEVELOPMENT.md "Design System" (no new inline visual styles, values live in `web/style.css` tokens, shared components over page-local copies)? When the diff ADDS a UI control, chip, card, dialog, or visual pattern, does it reuse an existing shared frontend primitive (name it — the registry is ARCHITECTURE.md §3 "Navigation and shared UI contracts") or state in one line why none covers the need? The authoritative definitions live in those documents — check against them, do not re-derive them here. (PASS with "Not applicable" if the diff touches nothing under `web/`.) | advisory |
 
 **Timeout-policy pointer for item 18 (2026-08-23):** cognitive/review waits must
 follow the layered policy in `DEVELOPMENT.md` and the timeout data-flow in
@@ -201,11 +202,12 @@ does not create another timeout constant or a second scheduler.
 - Items 6-10, 14-15, 18-20, 23, and 25-28 are conditionally critical: FAIL only when the condition applies.
   If the condition does not apply, write verdict PASS with a short reason
   (e.g. "Not applicable — no code logic change").
-- Items 11-12, 16-17, 22, 24, and 29 are advisory: FAIL produces a warning but does not
+- Items 11-12, 16-17, 22, 24, 29, and 30 are advisory: FAIL produces a warning but does not
   block. Item 22 (`cache_friendliness`) passes with "Not applicable" when the
   diff touches no prompt/context assembly. Item 24 (`perf_lifecycle`) passes with
   "Not applicable" when the diff adds/changes no endpoint, poller, subscription,
-  or timer and reads no growing store.
+  or timer and reads no growing store. Item 30 (`web_design_system`) passes with
+  "Not applicable" when the diff touches nothing under `web/`.
 - Item 13 (self_consistency) is conditionally critical: FAIL only when the
   mismatch falls in the `Critical surface whitelist` below AND a concrete
   stale artifact is named (specific file, line, or symbol). If no whitelisted

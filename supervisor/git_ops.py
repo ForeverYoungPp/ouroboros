@@ -1504,18 +1504,23 @@ def list_versions(max_count: int = 50) -> List[Dict[str, Any]]:
     """Return list of annotated git tags sorted newest-first."""
     rc, raw, _ = git_capture([
         "git", "tag", "-l", "--sort=-creatordate",
-        "--format=%(refname:short)\t%(creatordate:iso-strict)\t%(subject)",
+        "--format=%(refname:short)\t%(creatordate:iso-strict)\t"
+        "%(objectname)\t%(*objectname)\t%(subject)",
     ])
     if rc != 0 or not raw.strip():
         return []
     versions: List[Dict[str, Any]] = []
     for line in raw.splitlines()[:max_count]:
-        parts = line.split("\t", 2)
+        parts = line.split("\t", 4)
         if len(parts) >= 1:
+            # An annotated tag's commit is the peeled *objectname; a
+            # lightweight tag's objectname IS the commit already.
+            peeled = parts[3] if len(parts) > 3 else ""
             versions.append({
                 "tag": parts[0],
                 "date": parts[1] if len(parts) > 1 else "",
-                "message": parts[2] if len(parts) > 2 else "",
+                "sha": peeled or (parts[2] if len(parts) > 2 else ""),
+                "message": parts[4] if len(parts) > 4 else "",
             })
     return versions
 
@@ -1578,6 +1583,16 @@ def list_official_update_tags(max_count: int = 30) -> List[Dict[str, Any]]:
     return tags
 
 
+def _public_repo_url(url: str) -> str:
+    """Strip URL userinfo before the remote URL reaches a browser payload: an
+    HTTPS remote may carry ``user:token@host`` credentials (wave-2 review
+    finding). The scp-like ``git@host:path`` form drops its login the same way."""
+    cleaned = re.sub(r"^([a-z][a-z0-9+.-]*://)[^/@]*@", r"\1", url.strip())
+    if "://" not in cleaned:
+        cleaned = re.sub(r"^[^@/:]+@", "", cleaned)
+    return cleaned
+
+
 def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
     """Return current managed-remote divergence for the UI Update panel."""
     branch_dev, _branch_stable = managed_branch_defaults()
@@ -1594,6 +1609,7 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
         "remote": remote_name,
         "remote_branch": remote_branch,
         "target_ref": branch_ref,
+        "official_repo_url": "",
         "update_channel": update_channel,
         "current_branch": "unknown",
         "current_sha": "",
@@ -1611,6 +1627,11 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
         "available": False,
         "safe_to_apply": False,
     }
+    if remote_name:
+        url_rc, remote_url, _url_err = git_capture(["git", "remote", "get-url", remote_name])
+        state["official_repo_url"] = _public_repo_url(
+            remote_url.strip() if url_rc == 0 and remote_url.strip() else OFFICIAL_UPDATE_REMOTE_URL
+        )
     if not official_remote_ok:
         state["warnings"].append(f"remote_config_error:{official_remote_err or 'unknown error'}")
         state["managed"] = False
@@ -1688,9 +1709,25 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
                 )
             except Exception:
                 counts_rc, cached_ahead, cached_behind = 1, 0, 0
+            divergence_validated = not cached_sha or consumed or counts_rc == 0
+            if identity_matches and divergence_validated and str(cache.get("checked_at") or ""):
+                # Additive truthfulness: the passive read discloses WHEN the
+                # official channel was last actually checked, even when the
+                # cached result is "no update". Deliberately NOT `from_cache`,
+                # which keeps its narrow meaning "availability came from the
+                # cache overlay" (a consumed target must not read as cached).
+                # A cached tip that can no longer be resolved locally is NOT
+                # disclosed: the timestamp would let the panel claim "up to
+                # date, checked N ago" over a check whose availability can no
+                # longer be validated (final-review finding, 2026-08-31).
+                state["checked_at"] = str(cache.get("checked_at") or "")
+            # Availability is recomputed against the cached official tip on
+            # every passive read (NOT read off the cached "available" flag):
+            # a HEAD that moved after the check — e.g. a rollback below a
+            # tip that was "current" when checked — must not inherit the
+            # stale verdict (final-review finding, 2026-08-31).
             if (
                 identity_matches
-                and cache.get("available")
                 and cached_sha
                 and not consumed
                 and counts_rc == 0
@@ -1743,6 +1780,12 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
         state["safe_to_apply"] = behind > 0 and ahead == 0 and not state["dirty"]
     elif err:
         state["warnings"].append(f"divergence_error:{err}")
+    if not state["check_ok"]:
+        # A failed divergence read is NOT a completed check: minting checked_at
+        # here (or overwriting the last good cache) would let a later passive
+        # read present the failure as a verified "up to date" (wave-2 review
+        # finding, 2026-08-31).
+        return state
     try:
         from supervisor.state import update_state
         snapshot = {
@@ -1754,6 +1797,7 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
             )
         }
         snapshot["checked_at"] = utc_now_iso()
+        state["checked_at"] = snapshot["checked_at"]
         update_state(lambda saved: saved.__setitem__("managed_update_cache", snapshot))
     except Exception:
         log.debug("managed update status cache save failed", exc_info=True)

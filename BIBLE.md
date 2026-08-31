@@ -597,6 +597,9 @@ its code in a single session.
       file-size budgets)
     - [docs/CHECKLISTS.md](docs/CHECKLISTS.md) — review checklists and
       plan-review triggers (SSOT referenced by the immune system, P3)
+    - [docs/DESIGN.md](docs/DESIGN.md) — visual and interaction
+      semantics of the UI (engineering rules live in
+      docs/DEVELOPMENT.md § Design System)
     - [ouroboros/config.py](ouroboros/config.py) — runtime defaults
     - `memory/knowledge/patterns.md` (under the runtime data root;
       created on first write) — Pattern Register projection

@@ -40,9 +40,12 @@ test('ordinary update selects clean or assisted merge without recovery replaceme
     assert.doesNotMatch(ordinary, /['"]replace['"]/);
     assert.doesNotMatch(ordinary, /updateApply\(['"]stash['"]/);
 
-    const dialog = readFileSync(new URL('../modules/update_status.js', import.meta.url), 'utf8');
-    assert.match(dialog, /Git handles clean updates directly/);
-    assert.match(dialog, /real conflict/);
+    // The pill is a pointer, not a second apply surface (owner decision
+    // 2026-08-31): it must never call updateApply or preflight itself.
+    const pill = readFileSync(new URL('../modules/update_status.js', import.meta.url), 'utf8');
+    assert.doesNotMatch(pill, /updateApply\(/);
+    assert.doesNotMatch(pill, /updatePreflight\(/);
+    assert.match(pill, /openDashboardTab\?\.\('updates'\)/);
 });
 
 
@@ -77,8 +80,10 @@ test('update apply sends exact preflight pins and recovery confirmation only whe
 
 test('detailed Updates UI makes destructive replacement an explicit recovery action', () => {
     const source = readFileSync(new URL('../modules/updates.js', import.meta.url), 'utf8');
-    assert.match(source, />Promote to QA<\/button>/);
+    assert.match(source, />Save recovery point<\/button>/);
+    assert.doesNotMatch(source, />Promote to QA<\/button>/);
     assert.doesNotMatch(source, />Promote to Stable<\/button>/);
+    assert.match(source, /does not change the official QA feed/);
     assert.match(source, /<summary>Recovery<\/summary>/);
     assert.match(source, /Replace with Official Version \(Recovery\)/);
     assert.match(source, /apiClient\.updateApply\('replace', plan, \{ confirmRecovery: true \}\)/);
@@ -86,12 +91,14 @@ test('detailed Updates UI makes destructive replacement an explicit recovery act
     assert.match(source, /data\.check_ok === false/);
     assert.match(source, /!data\.from_cache.*official_status_requires_check/);
     assert.match(source, /restart_required/);
+    // Restart now is honest about refusals: apiFetch does not reject on 4xx/5xx.
+    assert.match(source, /async function restartNow\(\)/);
+    assert.match(source, /if \(!resp\.ok\) throw new Error/);
     assert.match(source, /Rollback completed:.*Restart Ouroboros to finish/s);
     assert.match(source, /Rollback failed:.*Runtime shutdown was incomplete/s);
 
     const pillSource = readFileSync(new URL('../modules/update_status.js', import.meta.url), 'utf8');
     assert.match(pillSource, /update_status_ready/);
-    assert.match(pillSource, /restart_required/);
 });
 
 
@@ -131,7 +138,35 @@ test('main update dialog never invents facts for an unverified preflight', () =>
         strategy: 'auto_merge',
     });
 
-    const source = readFileSync(new URL('../modules/update_status.js', import.meta.url), 'utf8');
-    assert.match(source, /The update could not be verified\. No files were changed\./);
-    assert.match(source, /data-retry/);
+    // The verification helper still guards the one apply surface: the panel
+    // imports it, and an unverified plan never reaches updateApply.
+    const panel = readFileSync(new URL('../modules/updates.js', import.meta.url), 'utf8');
+    assert.match(panel, /verifiedUpdatePlan\(preflight\)/);
+    assert.match(panel, /could not be verified\. No files were changed\./);
+});
+
+test('restart continuation and Replace gating are fail-closed in source', () => {
+    const src = readFileSync(new URL('../modules/updates.js', import.meta.url), 'utf8');
+    // The panel-lifetime flag re-applies restart_needed on every status refresh.
+    assert.match(src, /restartNeeded && !data\?\.update_tx\?\.active \? 'restart_needed' : ''/);
+    // A failed status read keeps the continuation too.
+    assert.match(src, /setPhase\(restartNeeded \? 'restart_needed' : ''\)/);
+    // render() alone owns the Replace gate, failing closed on unreadable status
+    // and on every busy/blocked state including restart_needed.
+    assert.match(src, /statusReadFailed \|\| \[\s*'loading', 'checking', 'updating', 'preflighting', 'restarting',\s*'restart_required', 'restart_needed', 'resolving', 'unmanaged',\s*\]/);
+    // The catches never assign replaceBtn.disabled themselves.
+    const catches = src.split('catch').slice(1);
+    for (const c of catches) {
+        assert.doesNotMatch(c.slice(0, 400), /replaceBtn\.disabled\s*=/);
+    }
+});
+
+test('Replace carries an in-flight latch that render respects across re-renders', () => {
+    const src = readFileSync(new URL('../modules/updates.js', import.meta.url), 'utf8');
+    assert.match(src, /replaceBtn\.disabled = replaceInFlight \|\| statusReadFailed/);
+    // The latch opens before the preflight request and closes in finally.
+    const fn = src.slice(src.indexOf('async function replaceWithOfficial'));
+    const body = fn.slice(0, fn.indexOf('async function', 10));
+    assert.match(body, /replaceInFlight = true;[\s\S]*updatePreflight/);
+    assert.match(body, /finally \{\s*replaceInFlight = false;\s*render\(\);/);
 });

@@ -350,6 +350,7 @@ def test_triad_review_prompt_includes_architecture_md(tmp_path):
         anti_pattern_lock_guard="LOCK",
         checklist_section="CHECKLIST",
         dev_guide_text="DEVGUIDE",
+        design_text="DESIGNGUIDE",
         architecture_section=arch_text,
     ) + _REVIEW_PROMPT_TEMPLATE_DYNAMIC.format(
         goal_section="GOAL",
@@ -364,6 +365,10 @@ def test_triad_review_prompt_includes_architecture_md(tmp_path):
         "ARCHITECTURE.md content must appear in the rendered triad review prompt"
     )
     assert "## ARCHITECTURE.md" in rendered
+    assert "DESIGNGUIDE" in rendered, (
+        "DESIGN.md content must appear in the rendered triad review prompt"
+    )
+    assert "## DESIGN.md" in rendered
 
 
 def test_governance_doc_load_emits_explicit_omission_marker_on_missing(tmp_path):

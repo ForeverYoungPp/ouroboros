@@ -295,7 +295,8 @@ def test_windows_python_download_checks_native_dependency_install_exits():
 
 def test_update_now_posts_the_merge_aware_strategy():
     """Update Now decides its strategy FROM THE MERGE PLAN (v6.88.0 flow:
-    preflight -> updateStrategyForPlan -> typed apply); the legacy
+    preflight -> verifiedUpdatePlan -> typed apply; the shared verifier wraps
+    updateStrategyForPlan since the 2026-08-31 redesign); the legacy
     'replace'/'stash' escape hatch must stay out of the normal path (it lives
     only behind the explicit Recovery confirmation)."""
     text = (REPO_ROOT / "web" / "modules" / "updates.js").read_text(encoding="utf-8")
@@ -304,7 +305,7 @@ def test_update_now_posts_the_merge_aware_strategy():
         line for line in apply_fn.splitlines() if not line.strip().startswith("//")
     )
     assert "updatePreflight" in code
-    assert "updateStrategyForPlan" in code
+    assert "verifiedUpdatePlan" in code
     for legacy in ("'replace'", "'stash'"):
         assert legacy not in code, f"Update Now still reaches for the legacy {legacy} path"
     assert "assisted_started" in code

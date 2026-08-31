@@ -291,7 +291,9 @@ The scale is applied surface by surface. Migrated today:
 - `web/settings.css` (settings shell, model/effort cards, MCP cards)
 - `web/onboarding.css` (the whole first-run wizard)
 - `web/style.css` between the `design-system:migrated-begin` and
-  `design-system:migrated-end` markers — harness accounts and reviewer slots
+  `design-system:migrated-end` markers — harness accounts, reviewer slots,
+  and the Dashboard → Updates tab (status card, one action row, collapsed
+  Recovery with a single restore list)
 - the global `.muted`, `.form-section h3` and shared `.ui-status` tone rules
 
 Not yet migrated: chat, skills, marketplace, widgets, logs, evolution. They are

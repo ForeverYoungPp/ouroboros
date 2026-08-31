@@ -792,3 +792,12 @@ def test_scope_ladder_never_hands_required_beyond_diff_paths_to_diff_only(tmp_pa
     assert "ouroboros/mod.py" in degradable
     assert "prompts/SYSTEM.md" not in degradable
     assert "docs/ARCHITECTURE.md" not in degradable
+
+
+def test_canonical_context_docs_membership_includes_design():
+    """Drift guard for the three synchronized canonical-doc lists: the atlas
+    copy must carry docs/DESIGN.md like scope_review's tuple and the external
+    substrate set (fable p0-review note, 2026-08-31)."""
+    from ouroboros.tools.review_context_atlas import _CANONICAL_CONTEXT_DOCS
+
+    assert "docs/DESIGN.md" in _CANONICAL_CONTEXT_DOCS
