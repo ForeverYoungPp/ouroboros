@@ -95,3 +95,25 @@ def test_brace_inside_string_value_does_not_break_the_scan():
     prose, parsed, _duplicate = extract_trailing_json_object("lead\n" + control)
     assert prose == "lead\n"
     assert parsed is not None and parsed["full_answer"] == "use {braces} here"
+
+
+def test_unbalanced_prose_prefix_still_finds_the_trailing_directive():
+    """sol M3 / fable m2: an unmatched brace or quote in the PROSE corrupts the
+    primary forward scan's state; the bounded line-anchor fallback must still
+    find the independent trailing object (leaking raw protocol JSON to the
+    owner was the original O4 defect)."""
+    prose_brace = "Example: const x = '{';\n{\"delivery_control\": \"keep\"}"
+    prefix, parsed, dup = extract_trailing_json_object(prose_brace)
+    assert parsed == {"delivery_control": "keep"}
+    assert prefix.rstrip().endswith("'{';")
+
+    prose_quote = 'He said "unterminated\n{"delivery_control": "replace", "full_answer": "y"}'
+    _, parsed2, _ = extract_trailing_json_object(prose_quote)
+    assert parsed2 == {"delivery_control": "replace", "full_answer": "y"}
+
+    # An inline object after the unbalanced prose (no line-start anchor) stays
+    # undetected — disclosed degrade: the answer ships as prose, never a leak
+    # of a DIFFERENT directive.
+    inline = "broken { prose {\"delivery_control\": \"keep\"}"
+    _, parsed3, _ = extract_trailing_json_object(inline)
+    assert parsed3 is None

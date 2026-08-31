@@ -30,6 +30,7 @@ from ouroboros.acceptance_dialogue import (  # noqa: F401 — re-export
     _format_obligations_clause,
     _mark_agent_acceptance_runs_advisory,
     _open_acceptance_obligations,
+    _prior_acceptance_run,
     _set_acceptance_decision,
     acceptance_dialogue_history,
     bind_acceptance_paid_identity,
@@ -1501,56 +1502,6 @@ def _record_acceptance_infra_failure(ctx: _TaskAcceptanceContext, exc: Exception
     })
     ctx.emit_progress("Task acceptance review: DEGRADED after host review infrastructure failure.")
     return False
-
-
-def _prior_acceptance_run(
-    tools_ctx: Any,
-    llm_trace: Dict[str, Any],
-    binding_hash: str,
-    *,
-    paid_identity: str = "",
-) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
-    """Locate the authoritative host run already recorded for this submission:
-    first the trace (survives requeue replay), then the process-local
-    ``_task_acceptance_seen_bindings`` cache. Returns (cache, prior_run).
-
-    EITHER identity replays for free: the same binding hash (byte-identical
-    submission, as before) OR the same A-material ``paid_identity`` — unchanged
-    candidate answer and no new obligation disposition — which is the identity the
-    tree's wallet actually bought."""
-    seen_bindings = getattr(tools_ctx, "_task_acceptance_seen_bindings", None)
-    if not isinstance(seen_bindings, dict):
-        seen_bindings = {}
-        tools_ctx._task_acceptance_seen_bindings = seen_bindings
-    identity = str(paid_identity or "")
-
-    def _matches(run: Any) -> bool:
-        return isinstance(run, dict) and (
-            str(run.get("binding_hash") or "") == binding_hash
-            or bool(identity and str(run.get("paid_identity") or "") == identity)
-        )
-
-    prior_run = next(
-        (
-            run for run in reversed(llm_trace.get("review_runs") or [])
-            if isinstance(run, dict)
-            and run.get("authority") == "host_root"
-            and not run.get("superseded_by_revision")
-            and _matches(run)
-        ),
-        None,
-    )
-    if prior_run is None:
-        prior_run = next(
-            (
-                run for run in reversed(list(seen_bindings.values()))
-                if isinstance(run, dict)
-                and not run.get("superseded_by_revision")
-                and _matches(run)
-            ),
-            None,
-        )
-    return seen_bindings, prior_run
 
 
 def _direct_context_fence_state(tools_ctx: Any, fence_token: Any) -> Any:

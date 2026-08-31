@@ -761,50 +761,68 @@ def extract_trailing_json_object(
     # raw_decode walk was O(n * braces) and hit ~10s on a forced-finalization
     # rail carrying a large code answer.
     end_limit = len(raw)
-    while True:
-        stripped_end = len(raw[:end_limit].rstrip())
-        # Peel one trailing markdown fence (``` optionally on its own line) and
-        # loop, so a `{...}` closed by ``` or ```\n``` is still trailing.
-        fence = raw[:stripped_end].rstrip()
-        if fence.endswith("```"):
-            end_limit = len(fence) - 3
+    for _ in range(4):
+        # Walk back over trailing whitespace WITHOUT slicing (a slice per
+        # fence iteration would be O(n * fences)), then peel one trailing
+        # markdown fence so a `{...}` closed by ``` or ```\n``` is still
+        # trailing. More than a few stacked fences is pathological output —
+        # degrade to prose rather than keep peeling.
+        while end_limit > 0 and raw[end_limit - 1] in " \t\r\n":
+            end_limit -= 1
+        if raw.endswith("```", 0, end_limit):
+            end_limit -= 3
             continue
-        end_limit = stripped_end
         break
     if end_limit <= 0 or raw[end_limit - 1] != "}":
         return raw, None, False
 
-    # ONE forward, string-aware pass to locate the outermost object whose close
-    # sits at end_limit. Prose braces/quotes before a well-formed tail object
-    # are handled; a pathological prose prefix with an unbalanced quote right
-    # before the object degrades to "no object" (the answer ships as prose, the
-    # armed-latch degrade path), never to a slow scan.
-    depth = 0
-    in_str = False
-    esc = False
-    cand_start = -1
-    obj_start = -1
-    for i in range(end_limit):
-        c = raw[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-            continue
-        if c == '"':
-            in_str = True
-        elif c == "{":
-            if depth == 0:
-                cand_start = i
-            depth += 1
-        elif c == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and i == end_limit - 1:
-                    obj_start = cand_start
+    # A forward, string-aware pass locating the outermost object whose close
+    # sits at end_limit. The primary pass starts at 0; an unmatched ``{`` or
+    # ``"`` in the PROSE prefix corrupts its state (prose is not JSON), so on
+    # failure the scan retries from a bounded set of later anchors — the last
+    # few line-starting ``{`` positions, where a real trailing directive
+    # begins. Each retry is O(tail-from-anchor); the anchor count is a small
+    # constant, so the pathological many-brace answer stays fast.
+    def _scan(start: int) -> int:
+        depth = 0
+        in_str = False
+        esc = False
+        cand_start = -1
+        found = -1
+        for i in range(start, end_limit):
+            c = raw[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                if depth == 0:
+                    cand_start = i
+                depth += 1
+            elif c == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and i == end_limit - 1:
+                        found = cand_start
+        return found
+
+    obj_start = _scan(0)
+    if obj_start < 0:
+        anchors: List[int] = []
+        pos = raw.rfind("\n{", 0, end_limit)
+        while pos != -1 and len(anchors) < 8:
+            anchors.append(pos + 1)
+            pos = raw.rfind("\n{", 0, pos)
+        for anchor in anchors:  # rightmost first: the innermost plausible start
+            obj_start = _scan(anchor)
+            if obj_start >= 0:
+                break
     if obj_start < 0:
         return raw, None, False
 

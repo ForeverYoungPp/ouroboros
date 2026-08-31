@@ -990,21 +990,23 @@ def _evaluate_bounded(page: Any, expression: str, timeout_ms: int = 30000) -> An
     synchronous event-loop block (``while(true){}``) — the outer tool timeout
     remains the backstop for that.
 
-    The expression is evaluated through ``eval(<string>)``, exactly as
-    Playwright evaluates a raw-string argument (``UtilityScript`` runs
-    ``global.eval(expression)``), so statement lists, a trailing ``;``, and
-    completion-value semantics behave identically to an un-bounded evaluate. A
-    parenthesised ``const __x = (expr)`` wrapper does NOT — it is a SyntaxError
-    for those forms and silently returned ``undefined`` after the IIFE retry.
-    ``eval`` returns a function VALUE unchanged (Playwright would too); only a
-    literal function-declaration string would differ, which the evaluate tool
-    never receives.
+    The expression is evaluated with the EXACT semantics of Playwright's
+    raw-string evaluate: the driver's ``UtilityScript`` runs
+    ``global.eval(expression)`` and — because the Python client leaves
+    ``isFunction`` unset for a string — INVOKES a function-valued result
+    (that is how ``page.evaluate("() => {...}")`` and ``_MARKDOWN_JS`` work).
+    So statement lists, a trailing ``;``, completion values AND
+    function-expression invocation all behave identically to an un-bounded
+    evaluate. A parenthesised ``const __x = (expr)`` wrapper broke the former
+    (SyntaxError → silent ``undefined``); a bare ``eval`` broke the latter
+    (function returned uninvoked → serialized ``undefined``).
     """
     ms = max(int(timeout_ms or 0), 1)
     src = json.dumps(str(expression))
     wrapped = (
         "() => Promise.race(["
-        "Promise.resolve().then(() => eval(" + src + ")), "
+        "Promise.resolve().then(() => { const __obo_result = eval(" + src + "); "
+        "return typeof __obo_result === 'function' ? __obo_result() : __obo_result; }), "
         "new Promise((_, reject) => setTimeout(() => reject(new Error("
         "'evaluate timed out after " + str(ms) + "ms')), " + str(ms) + "))])"
     )

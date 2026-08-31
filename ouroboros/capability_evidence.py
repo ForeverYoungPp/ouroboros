@@ -636,13 +636,24 @@ def _normalized_density_model(model_id: str) -> str:
         return str(model_id or "").strip()
 
 
-def _fresh_density_pairs(store: Dict[str, Any], model_id: str = "") -> List[Tuple[Dict[str, Any], float]]:
+def _fresh_density_pairs(
+    store: Dict[str, Any], model_id: str = "", *, basis: str = "",
+) -> List[Tuple[Dict[str, Any], float]]:
+    # ``basis`` filters to rows measured on one named basis. The MAIN fit
+    # resolver passes "bounded_proxy" — its multiplier must match the fit
+    # estimator's own measure: a pre-basis row (no stamp) or a legacy ``raw``
+    # row was measured against raw base64 chars and can sit at 0.05-0.65 on
+    # image routes, so letting it stay authoritative for its 14-day TTL after
+    # an upgrade re-poisons exactly what the basis fix cures (the cost is a
+    # brief cold start at 1.0). Review/aggregate resolvers pass no basis: their
+    # text-heavy witnesses measure the same on either basis.
     entries = [store.get(model_id) or {}] if model_id else list(store.values())
     return [
         (pair, density)
         for entry in entries if isinstance(entry, dict)
         for pair in (entry.get("pairs") or []) if isinstance(pair, dict)
         if _age_seconds(str(pair.get("observed_at") or "")) < _TOKEN_DENSITY_TTL_SEC
+        and (not basis or str(pair.get("basis") or "") == basis)
         for density in [_density_of(pair.get("prompt_chars"), pair.get("prompt_tokens"))]
         if density > 0
     ]
@@ -654,7 +665,7 @@ def resolve_main_token_density(drive_root: Any, route_fp: str, model_id: str) ->
         store = _load(drive_root).get("token_density", {}) or {}
         route = str(route_fp or "").strip()
         route_pairs = [
-            item for item in _fresh_density_pairs(store)
+            item for item in _fresh_density_pairs(store, basis="bounded_proxy")
             if route and str(item[0].get("route_fp") or "") == route
         ]
         if route_pairs:
@@ -662,7 +673,9 @@ def resolve_main_token_density(drive_root: Any, route_fp: str, model_id: str) ->
                 enumerate(route_pairs),
                 key=lambda item: (*_density_recency_key(item[1][0]), item[0]),
             )[1][1], "fresh_route_usage"
-        model_pairs = _fresh_density_pairs(store, _normalized_density_model(model_id))
+        model_pairs = _fresh_density_pairs(
+            store, _normalized_density_model(model_id), basis="bounded_proxy",
+        )
         if model_pairs:
             return max(
                 enumerate(model_pairs),

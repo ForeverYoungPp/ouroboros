@@ -166,3 +166,57 @@ def test_cursor_pass_heals_tasks_the_outcome_sweep_never_names(tmp_path):
     assert result["delegated_runs_succeeded"] == 1
     # Cursor advanced: the same rows are never reprocessed.
     assert delegate_terminal.refresh_recently_settled_terminals(tmp_path) == 0
+
+
+def test_cursor_defers_running_task_without_starving_later_settlements(tmp_path):
+    """The grok finding: a SETTLED row for a still-RUNNING parent must not pin
+    the byte offset — later settlements past the per-tick window would starve.
+    The offset always advances; the deferred task rides a durable map and is
+    healed on the tick after its result turns terminal."""
+    import json
+
+    _emit_started(tmp_path, "run-a", "t-longlived")
+    write_task_result(
+        tmp_path, "t-longlived", STATUS_RUNNING,
+        actual_substrate="harness_attempted",
+        delegated_runs_started=1, delegated_runs_settled=0,
+        delegated_runs_succeeded=0, delegated_runs_failed=0,
+        delegated_runs_source_unresolved=0,
+    )
+    _emit_settled(tmp_path, "run-a", "t-longlived")
+    assert delegate_terminal.refresh_recently_settled_terminals(tmp_path) == 0
+    cursor = json.loads(
+        (tmp_path / "state/delegate_terminal_refresh_cursor.json").read_text()
+    )
+    assert cursor["offset"] > 0  # never pinned on the deferred row
+    assert list(cursor["deferred"]) == ["t-longlived"]
+
+    # A LATER terminal-boundary settlement heals immediately — not starved
+    # behind the still-running parent.
+    _emit_started(tmp_path, "run-b", "t-later")
+    write_task_result(
+        tmp_path, "t-later", STATUS_FAILED,
+        actual_substrate="harness_attempted",
+        delegated_runs_started=1, delegated_runs_settled=0,
+        delegated_runs_succeeded=0, delegated_runs_failed=0,
+        delegated_runs_source_unresolved=0,
+    )
+    _emit_settled(tmp_path, "run-b", "t-later")
+    assert delegate_terminal.refresh_recently_settled_terminals(tmp_path) == 1
+    assert load_task_result(tmp_path, "t-later")["actual_substrate"] == "harness_used"
+
+    # The deferred parent heals from the map once terminal, long after its
+    # rows fell behind the offset.
+    write_task_result(
+        tmp_path, "t-longlived", STATUS_FAILED,
+        actual_substrate="harness_attempted",
+        delegated_runs_started=1, delegated_runs_settled=0,
+        delegated_runs_succeeded=0, delegated_runs_failed=0,
+        delegated_runs_source_unresolved=0,
+    )
+    assert delegate_terminal.refresh_recently_settled_terminals(tmp_path) == 1
+    assert load_task_result(tmp_path, "t-longlived")["actual_substrate"] == "harness_used"
+    cursor = json.loads(
+        (tmp_path / "state/delegate_terminal_refresh_cursor.json").read_text()
+    )
+    assert cursor["deferred"] == {}

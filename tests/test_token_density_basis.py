@@ -104,7 +104,10 @@ def test_density_observer_falls_back_to_raw_for_legacy_producers(monkeypatch):
 
 def test_reservation_keeps_the_raw_conservative_basis():
     """Owner decision 3=A: the money reservation deliberately over-counts
-    image rounds; the bounded field must not leak into it."""
+    image rounds; the bounded field must not leak into it. A cost-equality
+    behavioral pin is not testable offline (per-token pricing resolves from
+    the live provider route and honestly returns None here), so the pin is
+    on the function's read surface plus the field split itself."""
     request = _attempt_request({"provider": "openrouter"}, _image_payload())
     import inspect
 
@@ -133,3 +136,44 @@ def test_bounded_estimate_matches_the_fit_estimator_on_tool_heavy_payloads():
                            {"model": "openai/gpt-test", "messages": msgs, "tools": tools, "max_tokens": 10})
     fit = estimate_context_prompt_tokens(msgs, tools)
     assert req.prompt_tokens_bounded_estimate == fit, (req.prompt_tokens_bounded_estimate, fit)
+
+
+def test_legacy_and_raw_rows_never_calibrate_the_fit(tmp_path):
+    """sol M6: an upgraded install's pre-basis witness (e.g. 0.55 from raw
+    base64 on an image route) must not stay authoritative for its 14-day TTL —
+    only bounded_proxy rows calibrate; anything else falls back to the neutral
+    cold estimate until the new witness accumulates."""
+    import json as _json
+
+    from ouroboros.capability_evidence import (
+        record_token_density,
+        resolve_main_token_density,
+    )
+
+    # A raw-basis row (legacy producer path) — recorded but non-calibrating.
+    record_token_density(
+        tmp_path, "openai/gpt-test", prompt_chars=400_000, prompt_tokens=55_000,
+        route_fp="route-1", basis="raw",
+    )
+    assert (tmp_path / "state" / "capability_evidence.json").exists()
+    density, source = resolve_main_token_density(tmp_path, "route-1", "openai/gpt-test")
+    assert (density, source) == (1.0, "cold_estimate")
+
+    # A pre-upgrade row with NO basis stamp at all: strip the field on disk.
+    store_path = tmp_path / "state" / "capability_evidence.json"
+    data = _json.loads(store_path.read_text())
+    for entry in data.get("token_density", {}).values():
+        for pair in entry.get("pairs", []):
+            pair.pop("basis", None)
+    store_path.write_text(_json.dumps(data))
+    density, source = resolve_main_token_density(tmp_path, "route-1", "openai/gpt-test")
+    assert (density, source) == (1.0, "cold_estimate")
+
+    # A bounded_proxy row calibrates as before (above the 20K-char noise floor).
+    record_token_density(
+        tmp_path, "openai/gpt-test", prompt_chars=60_000, prompt_tokens=14_500,
+        route_fp="route-1", basis="bounded_proxy",
+    )
+    density, source = resolve_main_token_density(tmp_path, "route-1", "openai/gpt-test")
+    assert source == "fresh_route_usage"
+    assert abs(density - 14_500 / 15_000) < 0.01

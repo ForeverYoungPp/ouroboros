@@ -82,6 +82,8 @@ def test_queue_live_lineage_less_row_arrives_via_overlay(tmp_path):
         "task_id": "t-live", "delegation_role": "",
         "parent_task_id": "", "root_task_id": "",
         "status": "running", "ts": "2026-08-30T00:00:01+00:00",
+        "cost_usd": 1.75, "result": "partial work so far",
+        "artifacts": [{"path": "a.txt"}],
     })
     state = tmp_path / "state"
     state.mkdir(parents=True, exist_ok=True)
@@ -96,8 +98,15 @@ def test_queue_live_lineage_less_row_arrives_via_overlay(tmp_path):
         }],
     }))
     rows = find_child_tasks(tmp_path, parent_task_id="t-parent", scope="direct")
-    ids = {r["task_id"] for r in rows}
-    assert "t-live" in ids
+    by_id = {r["task_id"]: r for r in rows}
+    assert "t-live" in by_id
+    # The overlay must carry the DISK row's content, not a thin queue stub —
+    # a stub-only overlay zeroes the cost rollup and loses the partial result.
+    live = by_id["t-live"]
+    assert live["cost_usd"] == 1.75
+    assert live["result"] == "partial work so far"
+    assert live["artifacts"] == [{"path": "a.txt"}]
+    assert live["status"] == "running"
 
 
 def test_wait_polls_without_materializing_and_finishes_with_one_full_read(tmp_path, monkeypatch):

@@ -67,6 +67,21 @@ def test_bounded_with_exact_omitted_count(tmp_path):
     assert section["rows"][-1]["child"] == "run_r24"
 
 
+def test_headline_survives_when_the_only_delegated_apply_is_truncated(tmp_path):
+    """fable M1: the ONE delegated apply sits among the oldest rows past the
+    cap of 20; the headline must be computed over the complete set, or the
+    panel loses the exact fact the attest decision exists to surface."""
+    _emit_verdict(tmp_path, child="run_early", pipeline="delegated",
+                  disposition="applied", applied=True)
+    for i in range(24):
+        _emit_verdict(tmp_path, child=f"t-sub{i}", pipeline="subagent",
+                      disposition="rejected", applied=False)
+    section = acceptance_patch_dispositions(tmp_path, "t-parent")
+    assert section["omitted"] == 5
+    assert all(r["child"] != "run_early" for r in section["rows"])
+    assert section["unreviewed_delegated_apply"] is True
+
+
 def test_write_verdict_emits_the_custody_row(tmp_path):
     from types import SimpleNamespace
 

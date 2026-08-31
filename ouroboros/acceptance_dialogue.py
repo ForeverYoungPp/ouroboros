@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum
@@ -767,3 +767,75 @@ def acceptance_dialogue_history(llm_trace: Dict[str, Any], *, limit: int = 6) ->
             1 for row in obligations if int(row.get("reopened_count") or 0)
         )
     return rows[-max(1, int(limit)):]
+
+
+def _prior_acceptance_run(
+    tools_ctx: Any,
+    llm_trace: Dict[str, Any],
+    binding_hash: str,
+    *,
+    paid_identity: str = "",
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Locate the authoritative host run already recorded for this submission:
+    first the trace (survives requeue replay), then the process-local
+    ``_task_acceptance_seen_bindings`` cache. Returns (cache, prior_run).
+
+    EITHER identity replays for free: the same binding hash (byte-identical
+    submission, as before) OR the same A-material ``paid_identity`` — unchanged
+    candidate answer and no new obligation disposition — which is the identity the
+    tree's wallet actually bought."""
+    seen_bindings = getattr(tools_ctx, "_task_acceptance_seen_bindings", None)
+    if not isinstance(seen_bindings, dict):
+        seen_bindings = {}
+        tools_ctx._task_acceptance_seen_bindings = seen_bindings
+    identity = str(paid_identity or "")
+
+    def _matches(run: Any) -> bool:
+        return isinstance(run, dict) and (
+            str(run.get("binding_hash") or "") == binding_hash
+            or bool(identity and str(run.get("paid_identity") or "") == identity)
+        )
+
+    prior_run = next(
+        (
+            run for run in reversed(llm_trace.get("review_runs") or [])
+            if isinstance(run, dict)
+            and run.get("authority") == "host_root"
+            and not run.get("superseded_by_revision")
+            and _matches(run)
+        ),
+        None,
+    )
+    if prior_run is None:
+        prior_run = next(
+            (
+                run for run in reversed(list(seen_bindings.values()))
+                if isinstance(run, dict)
+                and not run.get("superseded_by_revision")
+                and _matches(run)
+            ),
+            None,
+        )
+    if prior_run is None and identity:
+        # A run superseded by an evidence revision is stale as a CURRENT
+        # acceptance, but the wallet already bought its A-material. When the
+        # resubmission carries the SAME paid identity (unchanged candidate, no
+        # new nonempty disposition), the recorded verdict replays for free —
+        # otherwise the dispatch claim refuses `binding_dispatch_already_claimed`
+        # and the loop records a synthetic DEGRADED panel instead of the typed
+        # identical-refusal terminal the contract requires. Evidence revision
+        # is stale-DETECTION, never a paid-cycle mint (owner decision 5=A).
+        superseded = next(
+            (
+                run for run in reversed(llm_trace.get("review_runs") or [])
+                if isinstance(run, dict)
+                and run.get("authority") == "host_root"
+                and run.get("superseded_by_revision")
+                and str(run.get("paid_identity") or "") == identity
+            ),
+            None,
+        )
+        if superseded is not None:
+            prior_run = dict(superseded)
+            prior_run["replayed_from_superseded"] = True
+    return seen_bindings, prior_run

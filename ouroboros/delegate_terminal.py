@@ -231,6 +231,7 @@ def refresh_terminal_reconciliation(drive_root: Any, task_id: str) -> bool:
 
 _REFRESH_CURSOR_REL = "state/delegate_terminal_refresh_cursor.json"
 _REFRESH_SCAN_CAP_BYTES = 5 * 1024 * 1024  # bounded work per sweep tick
+_REFRESH_DEFERRED_CAP = 500  # terminal-boundary tasks awaiting their result
 
 
 def refresh_recently_settled_terminals(drive_root: Any) -> int:
@@ -255,49 +256,67 @@ def refresh_recently_settled_terminals(drive_root: Any) -> int:
         size = log_path.stat().st_size if log_path.exists() else 0
     except OSError:
         return 0
-    offset = int((read_json_dict(cursor_path) or {}).get("offset") or 0)
+    stored = read_json_dict(cursor_path) or {}
+    offset = int(stored.get("offset") or 0)
     if offset > size:
         offset = 0  # rotated/truncated log: re-ground once
-    if offset >= size:
+    deferred: Dict[str, str] = {
+        str(k): str(v) for k, v in (stored.get("deferred") or {}).items() if k
+    }
+    if offset >= size and not deferred:
         return 0
-    # ``first_offset`` is the byte offset BEFORE a task's earliest settled row
-    # in this batch. A settled run whose OWNING TASK has not yet written its
-    # terminal result cannot be healed now (refresh no-ops on a non-terminal
-    # task); advancing the cursor past its row would lose the healing trigger
-    # forever — the exact class this pass exists to catch. So the cursor stops
-    # at the earliest deferred row and re-reads it next tick.
-    first_offset: Dict[str, int] = {}
+    # A settled run whose OWNING TASK has not yet written its terminal result
+    # cannot be healed now (refresh no-ops on a non-terminal task) — the run
+    # settled at the terminal boundary, the exact class this pass exists to
+    # catch. Its task_id goes into the durable ``deferred`` map (retried every
+    # tick) while the byte offset ALWAYS advances: pinning the offset on the
+    # earliest deferred row would re-read the same window forever behind one
+    # long-lived parent and starve every later settlement past the per-tick
+    # byte cap.
+    batch_ids: set = set()
     end_offset = offset
     try:
         with log_path.open("rb") as fh:
             fh.seek(offset)
             read_bytes = 0
-            row_start = offset
             for raw in fh:
                 if not raw.endswith(b"\n") or read_bytes > _REFRESH_SCAN_CAP_BYTES:
                     break  # incomplete tail line stays for the next tick
                 read_bytes += len(raw)
                 end_offset += len(raw)
-                if str((_json_row(raw)).get("type") or "") in (custody.SETTLED, custody.CLOSED_ABSENT):
-                    tid = str(_json_row(raw).get("task_id") or "")
-                    if tid and tid not in first_offset:
-                        first_offset[tid] = row_start
-                row_start += len(raw)
+                row = _json_row(raw)
+                if str(row.get("type") or "") in (custody.SETTLED, custody.CLOSED_ABSENT):
+                    tid = str(row.get("task_id") or "")
+                    if tid:
+                        batch_ids.add(tid)
     except OSError:
         return 0
+    from ouroboros.utils import utc_now_iso
+
+    now_iso = utc_now_iso()
     refreshed = 0
-    deferred_floor = end_offset
-    for tid in sorted(first_offset):
+    next_deferred: Dict[str, str] = {}
+    for tid in sorted(batch_ids | set(deferred)):
+        since = deferred.get(tid) or now_iso
         try:
             if _task_is_terminal(drive_root, tid):
                 if refresh_terminal_reconciliation(drive_root, tid):
                     refreshed += 1
             else:
-                deferred_floor = min(deferred_floor, first_offset[tid])
+                next_deferred[tid] = since
         except Exception:
             log.debug("Cursor refresh failed for %s", tid, exc_info=True)
+            next_deferred[tid] = since
+    if len(next_deferred) > _REFRESH_DEFERRED_CAP:
+        # Oldest-first eviction, disclosed: a task deferred this long with no
+        # terminal result is overwhelmingly abandoned; keeping the map bounded
+        # protects the cursor write from unbounded growth.
+        keep = sorted(next_deferred.items(), key=lambda kv: kv[1])[-_REFRESH_DEFERRED_CAP:]
+        dropped = len(next_deferred) - len(keep)
+        next_deferred = dict(keep)
+        log.info("Settled-refresh deferred map over cap; dropped %d oldest entries", dropped)
     try:
-        atomic_write_json(cursor_path, {"offset": deferred_floor})
+        atomic_write_json(cursor_path, {"offset": end_offset, "deferred": next_deferred})
     except Exception:
         log.debug("Refresh cursor write failed", exc_info=True)
     return refreshed

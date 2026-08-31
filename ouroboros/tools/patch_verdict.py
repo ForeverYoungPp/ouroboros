@@ -62,13 +62,14 @@ def write_patch_verdict(
     # delegated pipeline's run-keyed PATCH_DISPOSED row rides beside it; the
     # scanner splits by `tool`, so nothing double-counts). A failed artifact
     # write is disclosed on the row rather than dying as a silent "".
+    custody_row_landed = False
     try:
         from ouroboros import delegate_custody as custody
 
         # The canonical (budget) custody root, like every other custody write —
         # a row on a child's drive_root cannot outlive a pruned child drive, and
         # the acceptance-packet reader replays the canonical log.
-        custody.emit(custody.custody_root(ctx), "delegate_run_patch_verdict", {
+        custody_row_landed = custody.emit(custody.custody_root(ctx), "delegate_run_patch_verdict", {
             "run_id": "",
             "task_id": parent_task_id,
             "child_task_id": child_task_id,
@@ -84,5 +85,17 @@ def write_patch_verdict(
             "verdict_artifact_write_failed": artifact_write_failed,
         })
     except Exception:
-        log.debug("subagent patch verdict custody row failed", exc_info=True)
+        log.warning("subagent patch verdict custody row failed", exc_info=True)
+    if not custody_row_landed:
+        # `custody.emit` reports durable-append failure as a FALSE RETURN, not
+        # an exception (delegate_custody's own contract) — and the custody row
+        # IS the acceptance-packet source: without this, an empty dispositions
+        # section reads as "nothing recorded" when an attestation was made and
+        # silently lost. Disclose the miss on the artifact so the
+        # attested-not-gated contract stays honest (absence ≠ clean).
+        try:
+            verdict["custody_row_write_failed"] = True
+            atomic_write_json(path, verdict, trailing_newline=True)
+        except Exception:
+            log.debug("subagent patch verdict custody-miss disclosure failed", exc_info=True)
     return "" if artifact_write_failed else str(path)

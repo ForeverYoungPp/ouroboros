@@ -219,6 +219,7 @@ def test_round_fit_reads_density_from_canonical_store_not_child_drive(tmp_path, 
         prompt_tokens=180_000,  # density 1.8
         source="dispatch_usage",
         route_fp=plan.route_fp,
+        basis="bounded_proxy",
     )
 
     ctx = loop._RoundModelCallContext(

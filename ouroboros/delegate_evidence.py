@@ -358,14 +358,16 @@ def acceptance_patch_dispositions(drive_root: Any, task_id: str) -> Dict[str, An
     if not rows:
         return out
     out["total"] = len(rows)
+    # The honest headline the panel weighs — computed over the COMPLETE row
+    # set BEFORE bounding: a delegated apply among the omitted-oldest rows is
+    # exactly the fact the owner's attest decision (4=A) exists to surface,
+    # and deriving it from the truncated view false-negatives past the cap.
+    if any(r["applied"] and r.get("pipeline") == "delegated" for r in rows):
+        out["unreviewed_delegated_apply"] = True
     if len(rows) > _ACCEPT_PATCH_DISPOSITION_CAP:
         out["omitted"] = len(rows) - _ACCEPT_PATCH_DISPOSITION_CAP
         rows = rows[-_ACCEPT_PATCH_DISPOSITION_CAP:]
     out["rows"] = rows
-    if any(r["applied"] and r.get("pipeline") == "delegated" for r in rows):
-        # The honest headline the panel weighs: a delegated patch landed with
-        # no host-side review of its bytes (there is none on this path).
-        out["unreviewed_delegated_apply"] = True
     return out
 
 

@@ -176,6 +176,11 @@ def test_evaluate_bounded_wraps_in_promise_race_with_deadline():
     # parenthesised const-wrapper silently returned undefined for those).
     assert "eval(" in js
     assert '"1 + 1"' in js
+    # AND a function-valued result is invoked, exactly like the driver's
+    # UtilityScript does for a raw-string evaluate with isFunction unset —
+    # page.evaluate("() => {...}") / _MARKDOWN_JS depend on this branch
+    # (dropping it serialized the uninvoked function to undefined).
+    assert "typeof __obo_result === 'function' ? __obo_result() : __obo_result" in js
 
 
 def test_action_evaluate_and_scroll_route_through_bounded_wrapper(monkeypatch):

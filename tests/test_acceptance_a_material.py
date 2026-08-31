@@ -468,3 +468,35 @@ def test_paid_identity_claims_survive_a_reload_of_the_ledger(tmp_path):
         ctx, binding_hash=moved["binding_hash"], task_id="root-b", paid_identity=identity,
     )
     assert projection["binding_seen"] is True
+
+
+def test_superseded_paid_identity_still_replays_the_identical_refusal(tmp_path):
+    """sol M2: a panel paid for identity I, then superseded by an evidence
+    revision, then resubmitted with the SAME identity must free-replay to the
+    typed identical-refusal terminal — not fall through to the wallet's
+    binding_dispatch_already_claimed synthetic DEGRADED."""
+    from ouroboros.loop import _prior_acceptance_run
+    from types import SimpleNamespace
+
+    run = {
+        "authority": "host_root", "binding_hash": "bh-old",
+        "paid_identity": "pi-1", "panel_id": "p1",
+        "aggregate_signal": "FAIL", "superseded_by_revision": True,
+        "superseded_reason": "evidence_revision",
+    }
+    trace = {"review_runs": [run]}
+    ctx = SimpleNamespace()
+    # New binding hash (evidence moved) but the SAME paid identity.
+    seen, prior = _prior_acceptance_run(ctx, trace, "bh-new", paid_identity="pi-1")
+    assert prior is not None
+    assert prior["paid_identity"] == "pi-1"
+    assert prior["replayed_from_superseded"] is True
+    # A fresh (non-superseded) run still wins over the superseded fallback.
+    fresh = dict(run, superseded_by_revision=False, panel_id="p2", binding_hash="bh-mid")
+    trace2 = {"review_runs": [run, fresh]}
+    _, prior2 = _prior_acceptance_run(SimpleNamespace(), trace2, "bh-new", paid_identity="pi-1")
+    assert prior2 is not None and prior2["panel_id"] == "p2"
+    assert "replayed_from_superseded" not in prior2
+    # A DIFFERENT identity buys nothing from the superseded run.
+    _, prior3 = _prior_acceptance_run(SimpleNamespace(), trace, "bh-new", paid_identity="pi-2")
+    assert prior3 is None
