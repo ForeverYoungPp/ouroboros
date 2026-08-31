@@ -1755,6 +1755,23 @@ def _finish_task_done_dispatch(
                 task_id,
                 exc_info=True,
             )
+        try:
+            from supervisor.queue_transitions import clear_budget_root_fence_for_settled_tree
+
+            # Pending-cancel and reaper task_done arrive AFTER the row left
+            # PENDING/RUNNING, so `task` is {} here: the tree identity falls
+            # back to the event stamp, then the durable result.
+            clear_budget_root_fence_for_settled_tree({
+                "id": str(task_id or ""),
+                "root_task_id": str(
+                    (task if isinstance(task, dict) else {}).get("root_task_id")
+                    or (task_done_event or {}).get("root_task_id")
+                    or (final_task_result or {}).get("root_task_id")
+                    or ""
+                ),
+            })
+        except Exception:
+            log.warning("Failed to release budget root fence for %s", task_id, exc_info=True)
     ctx.persist_queue_snapshot(reason="task_done")
     try:
         ctx.bridge.push_log(task_done_event)

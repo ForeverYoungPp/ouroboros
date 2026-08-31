@@ -367,3 +367,20 @@ test('computeDerivedChatStatus: priority order is preserved (offline > live card
         pendingSubmissionsCount: 0,
     }).text, 'Online');
 });
+
+test('computeDerivedChatStatus: budget-paused work is not Working or Queued (#322)', () => {
+    assert.deepEqual(
+        computeDerivedChatStatus({ pausedManagedCount: 2 }),
+        { kind: 'online', text: 'Paused (budget)', showDots: false },
+    );
+    // Runnable queued work outranks the paused disclosure.
+    assert.equal(
+        computeDerivedChatStatus({ pausedManagedCount: 1, queuedManagedCount: 1 }).text,
+        'Queued...',
+    );
+    // Active work outranks both.
+    assert.equal(
+        computeDerivedChatStatus({ pausedManagedCount: 1, activeManagedCount: 1 }).text,
+        'Working...',
+    );
+});

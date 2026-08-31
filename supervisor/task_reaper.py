@@ -891,6 +891,7 @@ def _emit_cancel_suppressed_retry_task_done(
         workers_mod.get_event_q().put({
             "type": "task_done",
             "task_id": task_id,
+            "root_task_id": str(task.get("root_task_id") or "") if isinstance(task, dict) else "",
             "task_type": task_type,
             "chat_id": (
                 int(task.get("chat_id") or 0)

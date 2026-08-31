@@ -68,6 +68,22 @@ def send_provider_death_notice(
     return True
 
 
+def stamp_root_final_phase(send_event: Dict[str, Any], task: Dict[str, Any], *, post_task_open: bool) -> None:
+    """Type a root's final frame for the client's live conclusion gate.
+
+    With post-task synthesis still OPEN the owner's answer leaves early: the
+    typed phase marker (progress_meta merges into the WS chat payload) holds
+    the card on "Finalizing…" until the settled task_done, instead of the
+    early final reading as the task's terminal conclusion. With post-task
+    already settled a DIRECT turn's bare final IS the turn's terminal word
+    (#369) — managed roots keep their task_done conclusion untouched.
+    """
+    if post_task_open:
+        send_event.setdefault("progress_meta", {})["task_phase"] = "finalizing"
+    elif task.get("_is_direct_chat"):
+        send_event.setdefault("progress_meta", {})["task_terminal_status"] = "completed"
+
+
 def prepare_terminal_send_event(
     env_drive_root: Any, task: Dict[str, Any], text: str,
     usage: Dict[str, Any], send_event: Dict[str, Any],
@@ -75,6 +91,13 @@ def prepare_terminal_send_event(
 ) -> Dict[str, Any]:
     """Preserve raw host salvage, then build the one live/replay projection."""
     origin = str(usage.get("terminal_origin") or "")
+    if ephemeral and not presence:
+        # #369: an ephemeral decision's task_done frame is dropped at the
+        # client's log-event entry by design, so this final is the turn's
+        # ONLY conclusion vehicle. The typed fact mirrors the direct-error
+        # branch (supervisor/workers.py stamps task_terminal_status="failed")
+        # and lets the live concludesTurn gate settle the activity.
+        send_event.setdefault("progress_meta", {})["task_terminal_status"] = "completed"
     if ephemeral or presence or origin not in {
         TERMINAL_ORIGIN_MODEL_FINAL, TERMINAL_ORIGIN_HOST_SALVAGE,
     }:
