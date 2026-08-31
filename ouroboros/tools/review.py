@@ -650,6 +650,10 @@ Run the shared semantic-breadth guard before returning:
 
 {dev_guide_text}
 
+## DESIGN.md
+
+{design_text}
+
 ## ARCHITECTURE.md
 
 {architecture_section}
@@ -1218,6 +1222,7 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
         ), True
 
     dev_guide_text = load_governance_doc(pathlib.Path(ctx.repo_dir), "docs/DEVELOPMENT.md", on_missing="explicit")
+    design_text = load_governance_doc(pathlib.Path(ctx.repo_dir), "docs/DESIGN.md", on_missing="explicit")
     architecture_text = load_governance_doc(pathlib.Path(ctx.repo_dir), "docs/ARCHITECTURE.md", on_missing="explicit")
 
     # Durable open obligations reduce review thrashing across restarts.
@@ -1295,6 +1300,7 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
             anti_pattern_lock_guard=REPO_ANTI_PATTERN_LOCK_GUARD,
             checklist_section=checklist_section,
             dev_guide_text=dev_guide_text or "(DEVELOPMENT.md not found)",
+            design_text=design_text or "(DESIGN.md not found)",
             architecture_section=architecture_text or "(ARCHITECTURE.md not found)",
         )
         dynamic = _REVIEW_PROMPT_TEMPLATE_DYNAMIC.format(

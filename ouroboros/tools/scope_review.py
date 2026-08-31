@@ -303,6 +303,7 @@ def _get_scope_model() -> str:
 _CANONICAL_CONTEXT_DOCS = (
     "BIBLE.md",
     "docs/DEVELOPMENT.md",
+    "docs/DESIGN.md",
     "docs/ARCHITECTURE.md",
     "docs/CHECKLISTS.md",
 )

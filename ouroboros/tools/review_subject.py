@@ -576,7 +576,9 @@ def build_triad_session_task(*, goal_section: str, scope_section: str,
         review_history_section,
         _session_subject_section(subject),
         "## Governance context (navigation maps)\n"
-        "Read BIBLE.md in full from the repository root. The maps below index "
+        "Read BIBLE.md in full from the repository root; when the staged diff "
+        "touches `web/`, also read docs/DESIGN.md in full (it is short). The "
+        "maps below index "
         "the other governance docs by line range; the paths are relative to the "
         "repository root — read the sections you need with your own tools.",
         *nav_maps,

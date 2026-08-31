@@ -53,6 +53,8 @@ def _write_governance_docs(repo):
         "## Repo Commit Checklist\nCHECKLIST-BODY-MARKER-7Q\n", encoding="utf-8")
     (repo / "docs" / "DEVELOPMENT.md").write_text(
         "# DEV\nDEVELOPMENT-BODY-MARKER-7Q\n", encoding="utf-8")
+    (repo / "docs" / "DESIGN.md").write_text(
+        "# DESIGN\nDESIGN-BODY-MARKER-7Q\n", encoding="utf-8")
     (repo / "docs" / "ARCHITECTURE.md").write_text(
         "# ARCH\nARCHITECTURE-BODY-MARKER-7Q\n", encoding="utf-8")
 
@@ -61,6 +63,7 @@ _DOC_MARKERS = (
     "BIBLE-BODY-MARKER-7Q",
     "CHECKLIST-BODY-MARKER-7Q",
     "DEVELOPMENT-BODY-MARKER-7Q",
+    "DESIGN-BODY-MARKER-7Q",
     "ARCHITECTURE-BODY-MARKER-7Q",
 )
 
@@ -191,7 +194,7 @@ def test_agent_session_prompt_uses_pointers_not_bodies(tmp_path):
     # Resolvable absolute pointers + the mandatory-read instruction.
     assert "MANDATORY FULL READ" in prompt
     for rel in ("BIBLE.md", "docs/CHECKLISTS.md", "docs/DEVELOPMENT.md",
-                "docs/ARCHITECTURE.md"):
+                "docs/DESIGN.md", "docs/ARCHITECTURE.md"):
         assert str((repo / rel).resolve()) in prompt
     assert "'## Repo Commit Checklist' section" in prompt
     # The non-governance sections are unchanged.
@@ -213,6 +216,7 @@ def test_api_prompt_keeps_inlining_governance_bodies(tmp_path):
     # (load_checklist_section), so only the three repo-dir docs are asserted.
     assert "BIBLE-BODY-MARKER-7Q" in prompt
     assert "DEVELOPMENT-BODY-MARKER-7Q" in prompt
+    assert "DESIGN-BODY-MARKER-7Q" in prompt
     assert "ARCHITECTURE-BODY-MARKER-7Q" in prompt
     assert "MANDATORY FULL READ" not in prompt
 

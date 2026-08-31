@@ -38,6 +38,7 @@ def test_contributor_trust_boundary_covers_functional_review_dependencies():
     from ouroboros.tools.scope_review import _CANONICAL_CONTEXT_DOCS
 
     assert set(_CANONICAL_CONTEXT_DOCS).issubset(_REVIEW_SUBSTRATE_PATHS)
+    assert "docs/DESIGN.md" in _CANONICAL_CONTEXT_DOCS
     assert {
         "docs/ARCHITECTURE.md",
         "ouroboros/capability_evidence.py",

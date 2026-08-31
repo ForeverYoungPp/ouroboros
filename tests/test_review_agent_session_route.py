@@ -2703,6 +2703,7 @@ def test_triad_session_task_carries_criteria_and_nav_maps_not_evidence():
     assert "  - Child — lines 3-6" in task
     assert "    - Detail — lines 5-6" in task
     assert "Read BIBLE.md in full" in task
+    assert "also read docs/DESIGN.md in full" in task
 
 
 # ---------------------------------------------------------------------------

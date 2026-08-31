@@ -981,7 +981,7 @@ def test_triad_template_stable_part_has_no_dynamic_fields():
                           "{current_files_section}", "{review_history_section}"):
         assert dynamic_field not in stable
     dynamic = review_mod._REVIEW_PROMPT_TEMPLATE_DYNAMIC
-    for stable_field in ("{checklist_section}", "{dev_guide_text}", "{architecture_section}"):
+    for stable_field in ("{checklist_section}", "{dev_guide_text}", "{design_text}", "{architecture_section}"):
         assert stable_field not in dynamic
 
 

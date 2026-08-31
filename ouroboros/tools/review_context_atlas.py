@@ -48,6 +48,7 @@ _COLLAPSED_INDEX_DISPOSITIONS = frozenset({
 _CANONICAL_CONTEXT_DOCS = frozenset({
     "BIBLE.md",
     "docs/DEVELOPMENT.md",
+    "docs/DESIGN.md",
     "docs/ARCHITECTURE.md",
     "docs/CHECKLISTS.md",
 })

@@ -74,6 +74,7 @@ _REVIEW_SUBSTRATE_PATHS = frozenset({
     "BIBLE.md",
     "docs/ARCHITECTURE.md",
     "docs/CHECKLISTS.md",
+    "docs/DESIGN.md",
     "docs/DEVELOPMENT.md",
     "scripts/run_external_review.py",
     "scripts/contributor_review_evidence.py",
