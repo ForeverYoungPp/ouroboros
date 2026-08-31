@@ -2503,6 +2503,15 @@ body.resizing-panels { user-select: none; }
     margin: var(--space-3) 0 var(--space-2);
     line-height: var(--line-title);
 }
+/* Chat-scoped heading clamp: a markdown heading inside a chat bubble is a
+   section label, never a page title (--type-page stays for real page titles). */
+.chat-bubble .message .md-h1 {
+    font-size: var(--type-section);
+}
+.chat-bubble .message .md-h2,
+.chat-bubble .message .md-h3 {
+    font-size: var(--type-body);
+}
 .md-li {
     display: block;
     padding-left: 12px;

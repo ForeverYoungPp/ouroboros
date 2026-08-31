@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import logging
 import queue
-import re
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -21,6 +20,10 @@ from ouroboros.tools.core import (
     validate_link_actions,
     validate_quiz_payload,
 )
+# The live-send plain-text fallback moved to the shared utils SSOT so the
+# Project lifecycle producer and history read-side normalization reuse the
+# exact same stripper; the historical private name stays importable here.
+from ouroboros.utils import strip_markdown as _strip_markdown
 from ouroboros.utils import utc_now_iso
 from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS
 
@@ -931,23 +934,6 @@ class LocalChatBridge:
             task_metadata=task_metadata,
         )
 
-
-
-def _strip_markdown(text: str) -> str:
-    """Best-effort markdown-to-plain-text fallback."""
-    text = re.sub(r"```[^\n]*\n([\s\S]*?)```", r"\1", text)
-    text = re.sub(r"`([^`]+)`", r"\1", text)
-    text = re.sub(r"\*\*\*(.+?)\*\*\*", r"\1", text)
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text)
-    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)
-    text = re.sub(r"~~(.+?)~~", r"\1", text)
-    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^[\*\-]\s+", "• ", text, flags=re.MULTILINE)
-    text = text.replace("**", "").replace("__", "").replace("~~", "")
-    text = text.replace("`", "")
-    return text
 
 
 def _send_markdown(
