@@ -290,8 +290,23 @@ def append_chat_annotation(
     detail: str = "",
     options: Any = None,
     attachment_manifest: Any = None,
+    require_latest_status: Any = None,
+    require_latest_token: Any = None,
 ) -> bool:
-    """Append one compact UI annotation; no semantic routing state is stored."""
+    """Append one compact UI annotation.
+
+    Presentation-first with ONE named exception (#198): a routing refusal row
+    (status=needs_manual_target) is also the picker's durable decision-card
+    authority — its token+options validate the owner's click, and the
+    dispatch_pending/closing rows carry the click's first-wins/idempotency
+    facts. Routing STATE still lives in the supervisor receipts (task-result
+    admission, mailbox); the sidecar only arbitrates the card.
+
+    ``require_latest_status`` (a set of status strings) turns the append into
+    a compare-and-append under the annotations lock: the row is written only
+    while the message's CURRENT latest status is in the set — the first-wins
+    claim seam of the routing picker (#198). Absent/None keeps plain append.
+    """
     message_id = str(client_message_id or "").strip()
     if not message_id:
         return False
@@ -324,6 +339,15 @@ def append_chat_annotation(
     if lock_fd is None:
         return False
     try:
+        if require_latest_status is not None or require_latest_token is not None:
+            latest = _latest_annotations(path).get(message_id)
+            if latest is not None:
+                latest_status = str(latest.get("status") or "")
+                latest_token = str(latest.get("routing_token") or "")
+                if require_latest_status is not None and latest_status not in set(require_latest_status):
+                    return False  # lost the claim race — the caller reads the truth back
+                if require_latest_token is not None and latest_token not in set(require_latest_token):
+                    return False  # a NEWER routing attempt owns the card now
         data = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:
@@ -377,6 +401,21 @@ def routing_options_with_labels(drive_root: Any, options: Any) -> List[Dict[str,
             )
         rows.append(row)
     return rows
+
+
+def routing_option_label(option: Any) -> str:
+    """One human label per manual-routing option — the HOST SSOT (the durable
+    routing_options history row and the Telegram skill both render through it;
+    web mirrors it as chat_activity.routingOptionLabel)."""
+    if not isinstance(option, dict):
+        return ""
+    if str(option.get("label") or "").strip():
+        return str(option["label"]).strip()
+    if str(option.get("action") or "") == "new_task_in_project":
+        return f"New task in {str(option.get('project_name') or 'Project')}"
+    if option.get("title") or option.get("project_name"):
+        return str(option.get("title") or option.get("project_name"))
+    return "Project" if option.get("project_id") and not option.get("task_id") else "Task"
 
 
 def completion_status_label(result: Dict[str, Any], event: Dict[str, Any]) -> str:

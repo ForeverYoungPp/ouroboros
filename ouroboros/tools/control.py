@@ -593,40 +593,14 @@ def _wait_for_promotion_admission(
     client_message_id: str = "",
     timeout_sec: float = _PROMOTE_CONFIRM_TIMEOUT_SEC,
 ) -> Dict[str, Any]:
-    """Wait for matching-token admission in the canonical task-result SSOT."""
-    from ouroboros.task_results import load_task_result
+    """Wait for matching-token admission (SSOT moved to routing_wait, #198)."""
+    from ouroboros.routing_wait import wait_for_promotion_admission
 
-    root = _routing_status_root(ctx)
-    deadline = time.monotonic() + max(0.0, float(timeout_sec))
-    while True:
-        result = load_task_result(root, task_id) or {}
-        admission = result.get("promotion_admission")
-        if (
-            isinstance(admission, dict)
-            and str(admission.get("routing_token") or "") == routing_token
-        ):
-            status = str(admission.get("status") or "")
-            if status in {"scheduled", "rejected", "unconfirmed"}:
-                return {**admission, "task_status": str(result.get("status") or "")}
-        # A duplicate id must never overwrite the existing task_result merely
-        # to report the loser.  The exact-token chat annotation is therefore a
-        # negative-only fallback; positive scheduling authority stays solely in
-        # the task-result admission record.
-        if str(client_message_id or "").strip():
-            from ouroboros.project_dialogue import chat_annotation_receipt
-
-            receipt = chat_annotation_receipt(
-                root, str(client_message_id), routing_token
-            )
-            if str(receipt.get("status") or "") in {
-                "needs_manual_target",
-                "rejected",
-                "unconfirmed",
-            }:
-                return receipt
-        if time.monotonic() >= deadline:
-            return {"status": "unconfirmed", "reason": "confirmation_timeout"}
-        time.sleep(_PROMOTE_CONFIRM_POLL_SEC)
+    return wait_for_promotion_admission(
+        _routing_status_root(ctx), task_id, routing_token,
+        client_message_id=client_message_id, timeout_sec=timeout_sec,
+        poll_sec=_PROMOTE_CONFIRM_POLL_SEC,
+    )
 
 
 def _wait_for_routing_annotation(
@@ -636,21 +610,13 @@ def _wait_for_routing_annotation(
     *,
     timeout_sec: float = _PROMOTE_CONFIRM_TIMEOUT_SEC,
 ) -> Dict[str, Any]:
-    """Wait for an exact existing chat-annotation receipt (manual/steer)."""
-    from ouroboros.project_dialogue import chat_annotation_receipt
+    """Wait for an exact chat-annotation receipt (SSOT in routing_wait, #198)."""
+    from ouroboros.routing_wait import wait_for_routing_annotation
 
-    if not str(client_message_id or "").strip():
-        return {"status": "unconfirmed", "reason": "client_message_id_missing"}
-    root = _routing_status_root(ctx)
-    deadline = time.monotonic() + max(0.0, float(timeout_sec))
-    while True:
-        receipt = chat_annotation_receipt(root, client_message_id, routing_token)
-        status = str(receipt.get("status") or "")
-        if status in {"delivered", "needs_manual_target", "unconfirmed"}:
-            return receipt
-        if time.monotonic() >= deadline:
-            return {"status": "unconfirmed", "reason": "confirmation_timeout"}
-        time.sleep(_PROMOTE_CONFIRM_POLL_SEC)
+    return wait_for_routing_annotation(
+        _routing_status_root(ctx), client_message_id, routing_token,
+        timeout_sec=timeout_sec, poll_sec=_PROMOTE_CONFIRM_POLL_SEC,
+    )
 
 
 def _emit_and_wait_for_routing(
@@ -1179,6 +1145,7 @@ def _list_projects(ctx: ToolContext, limit: int = 50) -> str:
 def _route_to_project(
     ctx: ToolContext, project_id: str = "", message: str = "", reason: str = "",
     predecessor_task_id: Any = _MISSING_PREDECESSOR_SELECTOR,
+    candidates: Any = None,
 ) -> str:
     """Route a main-chat message to an EXISTING project so the work continues in
     that project's context (its memory/journal/thread), keeping the main chat free.
@@ -1234,6 +1201,23 @@ def _route_to_project(
             dict(row) for row in list(routing_contract.get("manual_options") or [])[:100]
             if isinstance(row, dict)
         ]
+        # Owner decision 2=B: the model may NARROW the picker by naming its
+        # plausible candidates — a host-validated reorder, never new options.
+        # Named ids that match host options move to the front; unknown ids are
+        # ignored (host truth wins), and every host option stays clickable.
+        candidate_ids = list(dict.fromkeys(
+            str(row).strip() for row in (candidates if isinstance(candidates, list) else [])
+            if str(row).strip()
+        ))
+        if candidate_ids:
+            def _option_id(row: Dict[str, Any]) -> str:
+                return str(row.get("task_id") or row.get("project_id") or "")
+
+            ranked = [
+                row for cid in candidate_ids for row in options if _option_id(row) == cid
+            ]
+            ranked_ids = {id(row) for row in ranked}
+            options = ranked + [row for row in options if id(row) not in ranked_ids]
         failure = (
             "target_unspecified" if not requested_pid
             else "invalid_project_id" if not pid
@@ -1248,6 +1232,10 @@ def _route_to_project(
             "requested_target": pid or requested_pid[:200],
             "reason": str(reason or "").strip() or failure,
             "options": options,
+            # The picker click dispatches AFTER this turn's metadata is gone,
+            # so the refusal annotation is the durable carrier of the original
+            # message's staged-attachment specs (#198).
+            "attachment_uploads": list(metadata.get("chat_attachment_uploads") or []),
             "ts": utc_now_iso(),
         }
         manual_event.update(predecessor_event)
@@ -3103,6 +3091,7 @@ def get_tools() -> List[ToolEntry]:
                 "message": {"type": "string", "description": "The owner message / work to route into the project."},
                 "reason": {"type": "string", "default": "", "description": "Optional short why-this-project note (provenance)."},
                 "predecessor_task_id": {"type": "string", "description": "Required explicit selector: pass an empty string for fresh work, or the completed result id listed by the Main host manifest to continue it."},
+                "candidates": {"type": "array", "items": {"type": "string"}, "description": "Optional, ONLY with project_id='': the task/project ids you consider plausible, in preference order. The typed picker shows them first; ids not in the host-built option list are ignored."},
             }, "required": ["message", "predecessor_task_id"]},
         }, _route_to_project),
         ToolEntry("steer_task", {

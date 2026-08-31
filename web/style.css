@@ -7061,6 +7061,15 @@ textarea.chat-input {
     color: var(--text-meta);
 }
 .chat-quiz-option:disabled .chat-quiz-option-detail { color: var(--text-disabled); }
+.chat-quiz-more {
+    align-self: flex-start;
+    padding: var(--space-1, 4px) 0;
+    border: none;
+    background: none;
+    color: var(--text-link, var(--text-meta));
+    font-size: var(--type-meta);
+    cursor: pointer;
+}
 .chat-quiz-assumption {
     padding-top: var(--space-1, 4px);
     border-top: 1px solid var(--ui-card-border);

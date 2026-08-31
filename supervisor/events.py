@@ -196,6 +196,8 @@ def _publish_routing_ack(
                 ack_kwargs["options"] = options
             if attachment_manifest is not None:
                 ack_kwargs["attachment_manifest"] = attachment_manifest
+            if str(evt.get("routing_token") or ""):
+                ack_kwargs["routing_token"] = str(evt.get("routing_token"))
             ack(
                 chat_id,
                 **ack_kwargs,
@@ -3320,6 +3322,9 @@ def _handle_routing_manual_target(evt: Dict[str, Any], ctx: Any) -> None:
         status="needs_manual_target",
         reason=str(evt.get("reason") or "target_unspecified"),
         options=options,
+        # Durable carrier: the picker click re-forwards these staged specs to
+        # the chosen destination long after the routing turn's metadata died.
+        attachment_manifest=_routing_attachments(evt.get("attachment_uploads")),
     )
 
 
