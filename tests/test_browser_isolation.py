@@ -103,7 +103,7 @@ class TestBrowserModuleState:
             )
         )
 
-        page = browser_mod._ensure_browser(ctx)
+        page, _generation = browser_mod._ensure_browser(ctx)
 
         assert page is fake_page
         assert contexts[-1].kwargs["viewport"] == {"width": 1920, "height": 1080}
@@ -124,7 +124,7 @@ class TestBrowserModuleState:
         # v6.26.0: the main agent gets a metadata-only SSRF route guard too.
         assert len(routes) == 6 and routes[5][0] == "**/*"
 
-        browser_mod._ensure_browser(ctx, engine="webkit", device="iphone 13")
+        browser_mod._ensure_browser(ctx, engine="webkit", device="iphone 13")[0]
         assert contexts[-1].kwargs["viewport"] == {"width": 390, "height": 844}
         assert contexts[-1].kwargs["is_mobile"] is True
         assert getattr(ctx.browser_state, "_browser_engine", None) == "webkit"
@@ -139,7 +139,7 @@ class TestBrowserModuleState:
                 last_screenshot_b64=None,
             )
         )
-        assert browser_mod._ensure_browser(subagent_ctx) is fake_page
+        assert browser_mod._ensure_browser(subagent_ctx)[0] is fake_page
         assert routes and routes[-1][0] == "**/*"
         events = []
         route = types.SimpleNamespace(
@@ -660,19 +660,17 @@ class TestSetPlaywrightBrowsersPathIfBundled:
 class TestCleanupBrowser:
     """cleanup_browser should null out all browser_state references."""
 
-    def test_cleanup_nulls_state(self):
-        ctx = types.SimpleNamespace(
-            browser_state=types.SimpleNamespace(
-                page=None,
-                browser=None,
-                pw_instance=None,
-                last_screenshot_b64=None,
-            )
-        )
+    def test_cleanup_replaces_the_generation_and_nulls_the_retired_one(self):
+        from ouroboros.tools.registry import BrowserState
+
+        retired = BrowserState()
+        ctx = types.SimpleNamespace(browser_state=retired)
         cleanup_browser(ctx)
+        # The shared slot holds a FRESH generation; the retired one is inert.
+        assert ctx.browser_state is not retired
         assert ctx.browser_state.page is None
-        assert ctx.browser_state.browser is None
-        assert ctx.browser_state.pw_instance is None
+        assert retired.page is None and retired.browser is None
+        assert retired.pw_instance is None
 
     def test_cleanup_detached_handles_closes_in_order_on_the_calling_thread(self):
         # Thread-affinity is the CALLER's contract (the settlement callback
@@ -689,16 +687,164 @@ class TestCleanupBrowser:
                 calls.append(name)
             return _inner
 
-        handles = (
-            types.SimpleNamespace(close=_mark("page")),
-            types.SimpleNamespace(close=_mark("context")),
-            types.SimpleNamespace(close=_mark("browser")),
-            types.SimpleNamespace(stop=_mark("playwright")),
-        )
-        worker = threading.Thread(target=cleanup_browser_handles, args=(handles,))
+        from ouroboros.tools.registry import BrowserState
+
+        retired = BrowserState()
+        retired.page = types.SimpleNamespace(close=_mark("page"))
+        retired._browser_context = types.SimpleNamespace(close=_mark("context"))
+        retired.browser = types.SimpleNamespace(close=_mark("browser"))
+        retired.pw_instance = types.SimpleNamespace(stop=_mark("playwright"))
+        worker = threading.Thread(target=cleanup_browser_handles, args=(retired,))
         worker.start()
         worker.join()
         assert calls == ["page", "context", "browser", "playwright"]
         # Every close ran on the SAME (calling) thread — never hopped back
         # to the main thread.
         assert threads == {worker.ident}
+        # Idempotence: the retired generation was nulled while closing, so a
+        # second sweep closes nothing twice.
+        cleanup_browser_handles(retired)
+        assert calls == ["page", "context", "browser", "playwright"]
+
+
+class TestRetiredGenerationBacklog:
+    def test_backlog_cap_refuses_a_new_session(self, monkeypatch):
+        """In-process bound (post-merge audit): with the cap's worth of
+        abandoned-but-unclosed generations, opening ANOTHER session is a typed
+        refusal instead of unbounded Chromium accumulation; closing one frees
+        capacity."""
+        from ouroboros.tools import browser as browser_mod
+        from ouroboros.tools.registry import BrowserState
+
+        monkeypatch.setattr(browser_mod, "_ensure_playwright_installed",
+                            lambda *a, **k: None)
+        hung = []
+        for _ in range(browser_mod._RETIRED_GENERATIONS_MAX):
+            g = BrowserState()
+            g.pw_instance = types.SimpleNamespace(stop=lambda: None)
+            hung.append(g)
+        ctx = types.SimpleNamespace(browser_state=BrowserState(),
+                                    _retired_browser_generations=list(hung))
+        with pytest.raises(RuntimeError) as err:
+            browser_mod._ensure_browser(ctx)
+        assert "BROWSER_BACKLOG_RETIRED_SESSIONS" in str(err.value)
+        # One hung generation SETTLES (cleanup stamps _cleanup_done after its
+        # closes ran): the prune frees capacity — asserted directly on the
+        # prune seam so this default-lane test never launches real Playwright.
+        browser_mod.cleanup_browser_handles(hung[0])
+        assert len(browser_mod._live_retired_generations(ctx)) \
+            == browser_mod._RETIRED_GENERATIONS_MAX - 1
+        # A close that HANGS mid-way keeps its generation counted: nulled
+        # fields alone are not settlement (sol MAJOR-3).
+        half = types.SimpleNamespace(pw_instance=None, _cleanup_done=False)
+        ctx._retired_browser_generations.append(half)
+        assert half in browser_mod._live_retired_generations(ctx)
+
+    def test_detach_registers_the_retired_generation(self):
+        from ouroboros.tools import browser as browser_mod
+        from ouroboros.tools.registry import BrowserState
+
+        first = BrowserState()
+        ctx = types.SimpleNamespace(browser_state=first)
+        retired, fresh = browser_mod._detach_browser(ctx)
+        assert retired is first
+        assert ctx.browser_state is fresh and fresh is not first
+        assert ctx._retired_browser_generations == [first]
+
+
+class TestReplacementGenerationGuard:
+    def test_late_exception_closes_only_the_call_generation(self, monkeypatch):
+        """sol MAJOR pin: a call whose generation was retired mid-flight closes
+        ITS OWN state on its own thread and never touches the replacement."""
+        from ouroboros.tools import browser as browser_mod
+        from ouroboros.tools.registry import BrowserState
+
+        closed = []
+        mine = BrowserState()
+        mine.pw_instance = types.SimpleNamespace(stop=lambda: closed.append("mine"))
+        replacement = BrowserState()
+        replacement.pw_instance = types.SimpleNamespace(
+            stop=lambda: closed.append("replacement"))
+        ctx = types.SimpleNamespace(browser_state=mine, task_constraint=None)
+
+        def _ensure_and_retire(c, engine="chromium", device=""):
+            # Simulate the timeout detach landing mid-call: the shared slot
+            # now holds the NEXT command's generation.
+            c.browser_state = replacement
+            raise RuntimeError("boom after retirement")
+
+        monkeypatch.setattr(browser_mod, "_ensure_browser", _ensure_and_retire)
+        monkeypatch.setattr(browser_mod, "_readonly_subagent", lambda c: False)
+        out = browser_mod._browse_page(ctx, "https://example.com")
+        assert "BROWSER_SESSION_RETIRED" in out
+        assert closed == ["mine"]
+        assert replacement.pw_instance is not None
+
+
+class TestMidEnsureRetirement:
+    def test_call_works_with_the_generation_that_owns_its_page(self, monkeypatch):
+        """sol delta finding: a timeout retirement DURING _ensure_browser must
+        not rebind the call onto the replacement — the call's generation is the
+        tuple _ensure_browser returns, and the screenshot lands there."""
+        from ouroboros.tools import browser as browser_mod
+        from ouroboros.tools.registry import BrowserState
+
+        own = BrowserState()
+        replacement = BrowserState()
+        page = types.SimpleNamespace(set_default_timeout=lambda ms: None,
+                                     goto=lambda *a, **k: None)
+        ctx = types.SimpleNamespace(browser_state=own, task_constraint=None)
+
+        def _ensure_and_retire(c, engine="chromium", device=""):
+            c.browser_state = replacement  # the mid-ensure timeout detach
+            return page, own               # the call's OWN generation
+
+        received = []
+        monkeypatch.setattr(browser_mod, "_ensure_browser", _ensure_and_retire)
+        monkeypatch.setattr(browser_mod, "_readonly_subagent", lambda c: False)
+        monkeypatch.setattr(
+            browser_mod, "_extract_page_output",
+            lambda p, output, c, bs=None: received.append(bs) or "ok")
+        out = browser_mod._browse_page(ctx, "https://example.com")
+        assert out == "ok"
+        assert received == [own]  # never the replacement
+
+
+class TestGenerationExpectation:
+    def test_ensure_refuses_when_the_pinned_generation_was_replaced(self):
+        """The check-then-run window (sol delta 3): _ensure_browser re-checks
+        the wrapper's pinned expectation at the exact capture point, so a call
+        whose timeout retired it during the pre-tool safety check refuses
+        instead of building a session in the replacement."""
+        from ouroboros.tools import browser as browser_mod
+        from ouroboros.tools.registry import BrowserState
+
+        pinned, replacement = BrowserState(), BrowserState()
+        ctx = types.SimpleNamespace(browser_state=replacement,
+                                    _active_browser_generation=pinned)
+        with pytest.raises(RuntimeError) as err:
+            browser_mod._ensure_browser(ctx)
+        assert "BROWSER_SESSION_RETIRED" in str(err.value)
+        assert replacement.pw_instance is None  # untouched
+
+    def test_legitimate_ensure_replacement_failure_is_not_a_false_retired(self, monkeypatch):
+        """sol delta 3: _ensure_browser legitimately replaced the generation
+        (engine change) and THEN failed — the guard sees the slot matching the
+        pinned expectation and treats it as an ordinary error, never RETIRED."""
+        from ouroboros.tools import browser as browser_mod
+        from ouroboros.tools.registry import BrowserState
+
+        own = BrowserState()
+        ctx = types.SimpleNamespace(browser_state=own, task_constraint=None)
+
+        def _replace_legitimately_and_fail(c, engine="chromium", device=""):
+            _retired, fresh = browser_mod._detach_browser(c)
+            setattr(c, "_active_browser_generation", fresh)
+            raise RuntimeError("recreate failed")
+
+        monkeypatch.setattr(browser_mod, "_ensure_browser", _replace_legitimately_and_fail)
+        monkeypatch.setattr(browser_mod, "_readonly_subagent", lambda c: False)
+        monkeypatch.setattr(browser_mod, "_is_infrastructure_error", lambda c: False)
+        with pytest.raises(RuntimeError) as err:
+            browser_mod._browse_page(ctx, "https://example.com")
+        assert "recreate failed" in str(err.value)

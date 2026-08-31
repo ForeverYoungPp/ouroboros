@@ -81,7 +81,7 @@ def test_evaluate_retries_statement_snippet_in_iife(monkeypatch):
     class _Ctx:
         browser_state = _BrowserState()
 
-    monkeypatch.setattr(browser, "_ensure_browser", lambda *a, **k: _Page())
+    monkeypatch.setattr(browser, "_ensure_browser", lambda ctx, *a, **k: (_Page(), ctx.browser_state))
     monkeypatch.setattr(browser, "_readonly_subagent", lambda ctx: False)
     monkeypatch.setattr(browser, "_blocks_context_mode_self_lowering_js", lambda v: False)
     monkeypatch.setattr(browser, "_blocks_scope_review_floor_self_lowering_js", lambda v: False)
@@ -113,7 +113,7 @@ def test_evaluate_runtime_error_not_misreported_as_syntax(monkeypatch):
     class _Ctx:
         browser_state = _BrowserState()
 
-    monkeypatch.setattr(browser, "_ensure_browser", lambda *a, **k: _Page())
+    monkeypatch.setattr(browser, "_ensure_browser", lambda ctx, *a, **k: (_Page(), ctx.browser_state))
     monkeypatch.setattr(browser, "_readonly_subagent", lambda ctx: False)
     for _g in ("_blocks_context_mode_self_lowering_js", "_blocks_scope_review_floor_self_lowering_js",
                "_blocks_mutative_toggle_js", "_blocks_post_task_evolution_js"):
@@ -188,7 +188,7 @@ def test_evaluate_bounded_wraps_in_promise_race_with_deadline():
 
 def test_action_evaluate_and_scroll_route_through_bounded_wrapper(monkeypatch):
     page = _RecordingPage()
-    monkeypatch.setattr(browser, "_ensure_browser", lambda *a, **k: page)
+    monkeypatch.setattr(browser, "_ensure_browser", lambda ctx, *a, **k: (page, ctx.browser_state))
     monkeypatch.setattr(browser, "_readonly_subagent", lambda ctx: False)
 
     out = browser._browser_action(_action_ctx(), "evaluate", value="document.title")
@@ -222,7 +222,7 @@ def test_health_snapshot_and_markdown_extraction_use_bounded_evaluate():
 
 def test_browse_page_sets_session_default_timeout_from_caller(monkeypatch):
     page = _RecordingPage(result="text out")
-    monkeypatch.setattr(browser, "_ensure_browser", lambda *a, **k: page)
+    monkeypatch.setattr(browser, "_ensure_browser", lambda ctx, *a, **k: (page, ctx.browser_state))
     monkeypatch.setattr(browser, "_readonly_subagent", lambda ctx: False)
 
     out = browser._browse_page(_action_ctx(), "http://example.test/", output="text", timeout=45000)

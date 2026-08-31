@@ -1215,7 +1215,7 @@ def test_acting_browser_evaluate_runs_and_keeps_owner_guards(tmp_path, monkeypat
             return 2
 
     page = FakePage()
-    monkeypatch.setattr(browser_mod, "_ensure_browser", lambda *_args, **_kwargs: page)
+    monkeypatch.setattr(browser_mod, "_ensure_browser", lambda ctx, *_args, **_kwargs: (page, ctx.browser_state))
     registry = ToolRegistry(repo_dir=repo, drive_root=drive)
     registry.set_context(ctx)
 
