@@ -160,3 +160,13 @@ test('restart continuation and Replace gating are fail-closed in source', () => 
         assert.doesNotMatch(c.slice(0, 400), /replaceBtn\.disabled\s*=/);
     }
 });
+
+test('Replace carries an in-flight latch that render respects across re-renders', () => {
+    const src = readFileSync(new URL('../modules/updates.js', import.meta.url), 'utf8');
+    assert.match(src, /replaceBtn\.disabled = replaceInFlight \|\| statusReadFailed/);
+    // The latch opens before the preflight request and closes in finally.
+    const fn = src.slice(src.indexOf('async function replaceWithOfficial'));
+    const body = fn.slice(0, fn.indexOf('async function', 10));
+    assert.match(body, /replaceInFlight = true;[\s\S]*updatePreflight/);
+    assert.match(body, /finally \{\s*replaceInFlight = false;\s*render\(\);/);
+});

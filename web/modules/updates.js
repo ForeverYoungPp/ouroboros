@@ -219,6 +219,7 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
 
     const primaryBtn = page.querySelector('#btn-update-primary');
     let restartNeeded = false;  // panel-lifetime restart continuation (no durable marker exists for fence/rollback refusals)
+    let replaceInFlight = false; // latch: a pending recovery request keeps Replace disabled across re-renders (tab reopen included)
     const replaceBtn = page.querySelector('#btn-update-replace');
     const dot = page.querySelector('#updates-dot');
     const summary = page.querySelector('#updates-summary');
@@ -265,7 +266,7 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
         // recovery action stays disabled until a successful re-read.
         const statusReadFailed = Array.isArray(latestStatus?.warnings)
             && latestStatus.warnings.some((w) => String(w).startsWith('status_error:'));
-        replaceBtn.disabled = statusReadFailed || [
+        replaceBtn.disabled = replaceInFlight || statusReadFailed || [
             'loading', 'checking', 'updating', 'preflighting', 'restarting',
             'restart_required', 'restart_needed', 'resolving', 'unmanaged',
         ].includes(verdict.state);
@@ -476,7 +477,12 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             danger: true,
         });
         if (!proceed) return;
-        replaceBtn.disabled = true;
+        // In-flight latch, not a bare .disabled: a tab reopen re-renders the
+        // panel mid-request, and render() would otherwise re-enable Replace
+        // while this destructive recovery is still pending (final-review
+        // finding, round 3).
+        replaceInFlight = true;
+        render();
         try {
             const preflight = await apiClient.updatePreflight();
             const plan = preflight?.merge_plan || {};
@@ -500,6 +506,9 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             // re-reads durable state, and render() alone owns the Replace
             // gate — the catch never re-enables it over stale/unknown state.
             await loadStatus();
+        } finally {
+            replaceInFlight = false;
+            render();
         }
     }
 
