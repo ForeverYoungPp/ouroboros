@@ -1022,6 +1022,22 @@ export function summarizeChatLiveEvent(evt) {
         });
     }
 
+    if (t === 'task_start_settings_reload_failed') {
+        // #285 loud disclosure: the task runs on the previously applied
+        // configuration — the owner must see that in the chat timeline, not
+        // only on the Logs tab.
+        const errorText = describeText(evt.error, 220);
+        return chatView({
+            phase: 'warn',
+            headline: 'Settings reload failed at task start',
+            body: 'This task runs on the previously applied configuration.'
+                + (errorText.preview ? ` (${errorText.preview})` : ''),
+            fullBody: errorText.full,
+            visible: true,
+            dedupeKey: key(),
+        });
+    }
+
     if (t === 'tool_call_timeout' || t === 'tool_timeout') {
         return chatView({
             phase: 'error',

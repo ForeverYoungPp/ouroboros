@@ -4093,7 +4093,9 @@ def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
         ctx.bridge.push_log(payload)
     except Exception:
         log.debug("Failed to forward live log event", exc_info=True)
-    if data.get("type") == "task_checkpoint":
+    # task_start_settings_reload_failed is a durable owner disclosure (#285):
+    # without persistence the fact evaporates on the next page load.
+    if data.get("type") in ("task_checkpoint", "task_start_settings_reload_failed"):
         try:
             ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", payload)
         except Exception:

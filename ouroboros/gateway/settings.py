@@ -181,32 +181,47 @@ def _rehydrate_mcp_servers_payload(incoming: Any, current: Any) -> list:
 
 _IMMEDIATE_KEYS = frozenset({
     "TOTAL_BUDGET",
-    "OUROBOROS_SOFT_TIMEOUT_SEC",
-    "OUROBOROS_HARD_TIMEOUT_SEC",
+    # The OUTER per-call tool cap reads settings.json BEFORE env on every tool
+    # call in every process (loop_tool_execution.py), so a saved change bites
+    # the currently running task's next tool call. The inner shell subprocess
+    # timeout still prefers the worker env (next task) — disclosed residual.
     "OUROBOROS_TOOL_TIMEOUT_SEC",
     "GITHUB_TOKEN",
     "GITHUB_REPO",
     "OUROBOROS_UPDATE_CHANNEL",
+    # The save handler hot-reconfigures MCP itself before responding
+    # (_apply_settings_save_side_effects), and worker processes re-check the
+    # settings mtime on their next tool-schema read; a reconfigure failure is
+    # surfaced as a save warning instead of silently keeping the claim.
+    "MCP_ENABLED",
+    "MCP_SERVERS",
+    "MCP_TOOL_TIMEOUT_SEC",
+})
+
+# Retired keys the settings document still carries: changing them has NO
+# effect at any point (supervisor/queue.py accepts them as typed no-ops).
+# Classifying them as immediate or next-task would both be lies; the save
+# reports them with an explicit "retired" warning instead.
+_RETIRED_NO_EFFECT_KEYS = frozenset({
+    "OUROBOROS_SOFT_TIMEOUT_SEC",
+    "OUROBOROS_HARD_TIMEOUT_SEC",
 })
 
 _RESTART_REQUIRED_KEYS = frozenset({
     "OUROBOROS_MAX_WORKERS",
     "OUROBOROS_SERVER_HOST",
+    # The host-service port is bound once at server startup.
+    "OUROBOROS_HOST_SERVICE_PORT",
+    # Pooled workers load the extension registry once at spawn and never
+    # reload it per task; the save-time server reload keeps the skills UI
+    # fresh, but agent tasks see the new repo only after a restart.
+    "OUROBOROS_SKILLS_REPO_PATH",
     "LOCAL_MODEL_SOURCE",
     "LOCAL_MODEL_FILENAME",
     "LOCAL_MODEL_PORT",
     "LOCAL_MODEL_N_GPU_LAYERS",
     "LOCAL_MODEL_CONTEXT_LENGTH",
     "LOCAL_MODEL_CHAT_FORMAT",
-    "OPENAI_BASE_URL",
-    "OPENAI_COMPATIBLE_BASE_URL",
-    "CLOUDRU_FOUNDATION_MODELS_BASE_URL",
-    # Region selects the MiniMax base URL (api.minimax.io vs api.minimaxi.com),
-    # so it changes routing exactly like the base-URL keys above it.
-    "MINIMAX_REGION",
-    "GIGACHAT_SCOPE",
-    "GIGACHAT_BASE_URL",
-    "GIGACHAT_VERIFY_SSL_CERTS",
     # Background cognition reads these at consciousness __init__, so a change
     # only takes effect after restart (Phase 4 Evolution settings group).
     "OUROBOROS_BG_WAKEUP_MIN",
@@ -224,6 +239,30 @@ def _classify_settings_changes(
         k for k in _RESTART_REQUIRED_KEYS
         if str(new.get(k, "") or "") != str(old.get(k, "") or "")
     ]
+
+
+def _effect_buckets(all_changed: list, warnings: list) -> tuple:
+    """Split changed keys into the honest effect buckets for the save response.
+
+    A retired key applies NEVER, so neither bucket may claim it — it is
+    reported through an explicit warning instead (#285).
+    """
+    retired_changed = sorted(k for k in all_changed if k in _RETIRED_NO_EFFECT_KEYS)
+    if retired_changed:
+        warnings.append(
+            "Retired setting(s) saved, but they no longer affect anything: "
+            + ", ".join(retired_changed)
+            + ". Task runtime is governed by OUROBOROS_TASK_IDLE_TIMEOUT_SEC "
+            "and OUROBOROS_TASK_ABS_CEILING_SEC."
+        )
+    immediate_changed = [k for k in all_changed if k in _IMMEDIATE_KEYS]
+    next_task_changed = [
+        k for k in all_changed
+        if k not in _IMMEDIATE_KEYS
+        and k not in _RESTART_REQUIRED_KEYS
+        and k not in _RETIRED_NO_EFFECT_KEYS
+    ]
+    return immediate_changed, next_task_changed
 
 
 def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1004,8 +1043,14 @@ def _apply_settings_save_side_effects(
     current: Dict[str, Any],
     old_effective_settings: Dict[str, Any],
     all_changed: list,
-) -> None:
-    """Post-save hot-reload side effects (MCP, extensions, supervisor budgets/timeouts)."""
+) -> list:
+    """Post-save hot-reload side effects (MCP, extensions, supervisor budgets/timeouts).
+
+    Returns warning strings for side effects that FAILED: an immediate-classed
+    key whose hot apply broke must not let the save report "took effect
+    immediately" without saying so (#285).
+    """
+    side_effect_warnings: list = []
     if any(k in all_changed for k in ("MCP_ENABLED", "MCP_SERVERS", "MCP_TOOL_TIMEOUT_SEC")):
         try:
             from ouroboros.mcp_client import (
@@ -1014,8 +1059,13 @@ def _apply_settings_save_side_effects(
             )
             _mcp_reconfigure(current)
             _mcp_refresh_background(reason="settings")
-        except Exception:
+        except Exception as exc:
             log.warning("MCP reconfigure after settings change failed", exc_info=True)
+            side_effect_warnings.append(
+                "MCP reconfigure failed in the server process: "
+                f"{type(exc).__name__}: {exc}. The saved values are on disk; "
+                "agent processes retry on their next tool-schema read."
+            )
 
     # Skills repo/runtime changes require extension loader reconciliation.
     try:
@@ -1044,8 +1094,13 @@ def _apply_settings_save_side_effects(
                     _load_settings,
                     repo_path=new_path or None,
                 )
-    except Exception:
+    except Exception as exc:
         log.error("Extension reload after settings change failed", exc_info=True)
+        side_effect_warnings.append(
+            "Skills repo reload failed in the server process: "
+            f"{type(exc).__name__}: {exc}. The saved path is on disk and "
+            "applies after a restart."
+        )
 
     try:
         from supervisor.state import refresh_budget_from_settings
@@ -1064,6 +1119,7 @@ def _apply_settings_save_side_effects(
         refresh_budget_limit(new_budget)
     except Exception:
         pass
+    return side_effect_warnings
 
 
 async def api_settings_post(request: Request) -> JSONResponse:
@@ -1302,10 +1358,12 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
         _start_supervisor_if_needed_for_request(request, current)
 
         boundary.at("hot-reload")
-        _apply_settings_save_side_effects(request, current, old_effective_settings, all_changed)
+        side_effect_warnings = _apply_settings_save_side_effects(
+            request, current, old_effective_settings, all_changed)
         boundary.at("post-save notices")
 
-        warnings = []
+        # Tolerate stubbed side effects returning None (test harnesses).
+        warnings = list(side_effect_warnings or [])
         if _reviewer_fallback_warning:
             warnings.append(_reviewer_fallback_warning)
         if provider_defaults_changed:
@@ -1356,11 +1414,7 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
                 settings_to_save["GITHUB_REPO"] = resolved_slug
                 _owner_write_settings(settings_to_save)
                 os.environ["GITHUB_REPO"] = resolved_slug
-        immediate_changed = [k for k in all_changed if k in _IMMEDIATE_KEYS]
-        next_task_changed = [
-            k for k in all_changed
-            if k not in _IMMEDIATE_KEYS and k not in _RESTART_REQUIRED_KEYS
-        ]
+        immediate_changed, next_task_changed = _effect_buckets(all_changed, warnings)
         agent_task_running = bool(next_task_changed) and started_before_save
         if agent_task_running:
             # Owner decision (2026-08-05): the task-start snapshot boundary STAYS —

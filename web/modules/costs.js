@@ -223,7 +223,7 @@ export function initCosts({ state, mount }) {
 
     document.getElementById('btn-refresh-costs').addEventListener('click', loadCosts);
 
-    document.getElementById('btn-save-budget').addEventListener('click', async () => {
+    document.getElementById('btn-save-budget').addEventListener('click', async (event) => {
         const statusEl = document.getElementById('budget-save-status');
         const budget = readPositiveBudget('s-budget');
         const perTask = readPositiveBudget('s-per-task-cost');
@@ -231,6 +231,11 @@ export function initCosts({ state, mount }) {
             statusEl.textContent = 'Budget values must be at least 0.01.';
             return;
         }
+        const saveButton = event.currentTarget;
+        saveButton.disabled = true;
+        saveButton.setAttribute('aria-busy', 'true');
+        statusEl.textContent = 'Saving…';
+        statusEl.dataset.tone = 'muted';
         try {
             const resp = await apiFetch('/api/settings', {
                 method: 'POST',
@@ -253,9 +258,14 @@ export function initCosts({ state, mount }) {
             }
             if (data.warnings && data.warnings.length) msg += ' ⚠️ ' + data.warnings.join(' | ');
             statusEl.textContent = msg;
+            statusEl.dataset.tone = (data.warnings?.length || data.restart_required) ? 'warn' : 'ok';
             window.dispatchEvent(new CustomEvent('ouro:settings-updated', { detail: { reason: 'budget saved', source: 'costs' } }));
         } catch (e) {
             statusEl.textContent = 'Error: ' + e.message;
+            statusEl.dataset.tone = 'error';
+        } finally {
+            saveButton.disabled = false;
+            saveButton.removeAttribute('aria-busy');
         }
         setTimeout(() => { statusEl.textContent = ''; }, 4000);
     });

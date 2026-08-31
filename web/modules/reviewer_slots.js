@@ -483,6 +483,10 @@ export function renderReviewerSlotsSection() {
                 plus its own reasoning effort.
             </div>
             <div class="settings-inline-note">
+                Saved lane changes apply from the next task: a task that is already running
+                keeps the reviewer configuration it started with.
+            </div>
+            <div class="settings-inline-note">
                 Rows routed to a subscription never fall back to API spend: if every eligible window
                 is exhausted, the review waits for capacity. Commit, plan, scope, advisory, and skill
                 review follow their configured rows. Task acceptance remains API-only: it uses

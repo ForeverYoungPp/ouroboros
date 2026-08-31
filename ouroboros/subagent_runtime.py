@@ -149,6 +149,45 @@ def apply_task_start_settings() -> None:
     apply_settings_to_env(effective)
 
 
+def apply_task_start_settings_or_disclose(task_id: str, emit_live_log: Any) -> None:
+    """Task-start settings reload with a LOUD failure path (#285).
+
+    A silent failure breaks the save-time promise "the saved changes apply
+    from the next task": the task would run on the previously applied
+    configuration with nobody told. The task itself stays runnable
+    (fail-open), but the breakage becomes a visible live-log fact.
+
+    The common corruption case is probed explicitly: ``load_settings`` falls
+    back to defaults+env on an unreadable or malformed settings.json instead
+    of raising, which would keep exactly the silence this wrapper exists to
+    break. A MISSING file is legitimate (defaults-only install), not a fault.
+    """
+    try:
+        from ouroboros import config as _config
+
+        try:
+            raw_settings_text = _config.SETTINGS_PATH.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raw_settings_text = None
+        if raw_settings_text is not None:
+            json.loads(raw_settings_text)
+        apply_task_start_settings()
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).error(
+            "Task-start settings reload failed; this task runs on the previously applied configuration",
+            exc_info=True,
+        )
+        emit_live_log(
+            "task_start_settings_reload_failed",
+            task_id=task_id,
+            error=f"{type(exc).__name__}: {exc}",
+            message=("Settings reload failed at task start: this task runs "
+                     "on the previously applied configuration."),
+        )
+
+
 def _resolution(
     settings: Mapping[str, Any], *, allow_undecided_legacy: bool,
 ) -> ConfiguredSubagentsResolution:
