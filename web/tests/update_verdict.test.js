@@ -95,3 +95,16 @@ test('unknown backend warning classes surface verbatim instead of vanishing (R7)
     }, '');
     assert.deepEqual(verdict.warnings, ['target_ref_error:no shared stable release']);
 });
+
+
+test('non-assisted and corrupt update transactions are named honestly, never "under review"', () => {
+    const rollback = updateVerdict({ managed: true, update_tx: { active: true, phase: 'rolling_back' } }, '');
+    assert.equal(rollback.state, 'resolving');
+    assert.match(rollback.headline, /transaction is still active/);
+    assert.match(rollback.hint, /Phase: rolling_back/);
+    const corrupt = updateVerdict({ managed: true, update_tx: { active: true, phase: 'corrupt' } }, '');
+    assert.equal(corrupt.tone, 'error');
+    assert.match(corrupt.headline, /corrupt/);
+    const assisted = updateVerdict({ managed: true, update_tx: { active: true, phase: 'assisted_resolution', task_id: 't1' } }, '');
+    assert.match(assisted.headline, /resolved under review/);
+});

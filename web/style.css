@@ -144,6 +144,9 @@
     --space-4: 16px;
     --space-5: 24px;
     --space-6: 32px;
+    /* Bounded scroll region for the Updates restore list (DESIGN section 5:
+       a new visual dimension becomes a variable before a page-local literal). */
+    --updates-list-max-height: 320px;
     --vvh: 100dvh;
 }
 
@@ -6552,18 +6555,23 @@ textarea.chat-input {
     gap: var(--space-2);
     margin-top: var(--space-3);
 }
+/* Local chip/dot primitives on purpose: the shared .ui-chip alias group
+   carries page palettes (skills/marketplace) and .ui-status recolors the
+   sentence itself — neither covers a label:value fact chip with a dot-status
+   sibling (checklist item 30 one-line statement). DESIGN section 2: label at
+   meta ink, the value is the primary thing. */
 .updates-chip {
     font-size: var(--type-meta);
     line-height: var(--line-meta);
-    color: var(--text-meta);
+    color: var(--text-primary);
     background: var(--ui-card-bg-soft);
     border: 1px solid var(--surface-border-soft);
     border-radius: var(--radius-sm);
     padding: 2px var(--space-2);
 }
 .updates-chip strong {
-    color: var(--text-primary);
-    font-weight: 600;
+    color: var(--text-meta);
+    font-weight: 500;
 }
 .updates-chip-link {
     cursor: pointer;
@@ -6618,7 +6626,7 @@ textarea.chat-input {
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
-    max-height: 320px;
+    max-height: var(--updates-list-max-height);
     overflow-y: auto;
 }
 .updates-restore-row {

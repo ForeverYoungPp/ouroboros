@@ -1583,6 +1583,16 @@ def list_official_update_tags(max_count: int = 30) -> List[Dict[str, Any]]:
     return tags
 
 
+def _public_repo_url(url: str) -> str:
+    """Strip URL userinfo before the remote URL reaches a browser payload: an
+    HTTPS remote may carry ``user:token@host`` credentials (wave-2 review
+    finding). The scp-like ``git@host:path`` form drops its login the same way."""
+    cleaned = re.sub(r"^([a-z][a-z0-9+.-]*://)[^/@]*@", r"\1", url.strip())
+    if "://" not in cleaned:
+        cleaned = re.sub(r"^[^@/:]+@", "", cleaned)
+    return cleaned
+
+
 def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
     """Return current managed-remote divergence for the UI Update panel."""
     branch_dev, _branch_stable = managed_branch_defaults()
@@ -1619,7 +1629,7 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
     }
     if remote_name:
         url_rc, remote_url, _url_err = git_capture(["git", "remote", "get-url", remote_name])
-        state["official_repo_url"] = (
+        state["official_repo_url"] = _public_repo_url(
             remote_url.strip() if url_rc == 0 and remote_url.strip() else OFFICIAL_UPDATE_REMOTE_URL
         )
     if not official_remote_ok:
@@ -1761,6 +1771,12 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
         state["safe_to_apply"] = behind > 0 and ahead == 0 and not state["dirty"]
     elif err:
         state["warnings"].append(f"divergence_error:{err}")
+    if not state["check_ok"]:
+        # A failed divergence read is NOT a completed check: minting checked_at
+        # here (or overwriting the last good cache) would let a later passive
+        # read present the failure as a verified "up to date" (wave-2 review
+        # finding, 2026-08-31).
+        return state
     try:
         from supervisor.state import update_state
         snapshot = {

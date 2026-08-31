@@ -30,8 +30,9 @@ function extraWarnings(data) {
         .filter((w) => !STATE_WARNINGS.has(String(w).split(':', 1)[0]) && !STATE_WARNINGS.has(w));
 }
 
-// Pure verdict: durable server state × transient client phase → one
-// presentation descriptor. The button is always a real next action; facts
+// Verdict function: durable server state × transient client phase → one
+// presentation descriptor (deterministic given status, phase, and the clock —
+// humanizeCheckedAt reads Date.now for the "checked N ago" age). The button is always a real next action; facts
 // travel as status line, hint, and chips (ARCHITECTURE §3: unavailable,
 // divergent, dirty, unsafe, failed-check, rollback, and restart-required
 // states stay visible — they are just not buttons).
@@ -54,7 +55,7 @@ export function updateVerdict(data = {}, phase = '') {
     if (phase === 'checking') return { ...base, state: 'checking', tone: 'neutral', headline: 'Checking the official channel…', hint: '', action: { id: 'check', label: 'Checking…', disabled: true } };
     if (phase === 'preflighting') return { ...base, state: 'preflighting', tone: 'neutral', headline: 'Preparing the update…', hint: '', action: { id: 'update', label: 'Preparing…', disabled: true } };
     if (phase === 'updating') return { ...base, state: 'updating', tone: 'neutral', headline: 'Applying the update…', hint: '', action: { id: 'update', label: 'Updating…', disabled: true } };
-    if (phase === 'restarting') return { ...base, state: 'restarting', tone: 'ok', headline: 'Update applied — restarting…', hint: 'The page reloads by itself when the server is back.', action: { id: 'restart', label: 'Restarting…', disabled: true } };
+    if (phase === 'restarting') return { ...base, state: 'restarting', tone: 'ok', headline: 'Restarting the server…', hint: 'The page reloads by itself when the server is back.', action: { id: 'restart', label: 'Restarting…', disabled: true } };
     if (phase === 'restart_required') return { ...base, state: 'restart_required', tone: 'warn', headline: 'The update landed, but the automatic restart failed.', hint: 'Restart Ouroboros to finish.', action: { id: 'restart', label: 'Restart now' } };
 
     const unmanaged = data.managed === false
@@ -69,12 +70,31 @@ export function updateVerdict(data = {}, phase = '') {
         };
     }
     if (data.update_tx?.active) {
+        const txPhase = String(data.update_tx.phase || '');
         const task = data.update_tx.task_id ? ` (task ${data.update_tx.task_id})` : '';
+        if (txPhase === 'corrupt') {
+            return {
+                ...base,
+                state: 'resolving', tone: 'error',
+                headline: 'The update transaction marker is corrupt.',
+                hint: 'Applying another update is blocked until it is recovered (a restart retries recovery; Replace with Official Version is the manual exit).',
+                action: null,
+            };
+        }
+        if (txPhase.includes('assisted')) {
+            return {
+                ...base,
+                state: 'resolving', tone: 'warn',
+                headline: 'A conflicting update is being resolved under review.',
+                hint: `Watch progress in chat${task}. Applying another update waits for this resolution.`,
+                action: null,
+            };
+        }
         return {
             ...base,
             state: 'resolving', tone: 'warn',
-            headline: 'A conflicting update is being resolved under review.',
-            hint: `Watch progress in chat${task}. Applying another update waits for this resolution.`,
+            headline: 'An update transaction is still active.',
+            hint: `Phase: ${txPhase || 'unknown'}. Another update waits until it settles.`,
             action: null,
         };
     }
@@ -135,7 +155,7 @@ export function updateVerdict(data = {}, phase = '') {
     };
 }
 
-export function initUpdates({ mount, state, ws, showPage }) {
+export function initUpdates({ mount, state, ws, openSettingsTab }) {
     const page = document.createElement('div');
     page.id = 'page-updates';
     page.className = 'settings-embedded-content';
@@ -269,15 +289,11 @@ export function initUpdates({ mount, state, ws, showPage }) {
             // listed commit become labels on that commit's row; tags whose
             // target is older than the listed window keep their own row.
             const tagsBySha = new Map();
-            const unmatchedTags = [];
             (data.tags || []).forEach((tag) => {
-                if (tag.sha) {
-                    const rows = tagsBySha.get(tag.sha) || [];
-                    rows.push(tag);
-                    tagsBySha.set(tag.sha, rows);
-                } else {
-                    unmatchedTags.push(tag);
-                }
+                if (!tag.sha) return;
+                const rows = tagsBySha.get(tag.sha) || [];
+                rows.push(tag);
+                tagsBySha.set(tag.sha, rows);
             });
             commitsDiv.innerHTML = '';
             const seenTagShas = new Set();
@@ -295,12 +311,6 @@ export function initUpdates({ mount, state, ws, showPage }) {
             });
             (data.tags || []).forEach((tag) => {
                 if (tag.sha && seenTagShas.has(tag.sha)) return;
-                commitsDiv.appendChild(renderRestoreRow({
-                    label: tag.tag, date: tag.date, message: tag.message,
-                    target: tag.tag, restorable: true,
-                }));
-            });
-            unmatchedTags.forEach((tag) => {
                 commitsDiv.appendChild(renderRestoreRow({
                     label: tag.tag, date: tag.date, message: tag.message,
                     target: tag.tag, restorable: true,
@@ -393,7 +403,7 @@ export function initUpdates({ mount, state, ws, showPage }) {
                 showToast('Ouroboros is resolving the update merge under review. Watch progress in chat.', 'success');
                 latestStatus = {
                     ...latestStatus,
-                    update_tx: { active: true, phase: 'assisted_running', task_id: data.task_id || '' },
+                    update_tx: { active: true, phase: 'assisted_resolution', task_id: data.task_id || '' },
                 };
                 setPhase('');
             } else if (data.status === 'restart_required') {
@@ -444,11 +454,12 @@ export function initUpdates({ mount, state, ws, showPage }) {
     async function restartNow() {
         primaryBtn.disabled = true;
         try {
-            await apiFetch('/api/command', {
+            const resp = await apiFetch('/api/command', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ cmd: '/restart' }),
             });
+            if (!resp.ok) throw new Error(`restart command refused (HTTP ${resp.status})`);
             showToast('Restart requested.', 'success');
             setPhase('restarting');
         } catch (err) {
@@ -471,8 +482,7 @@ export function initUpdates({ mount, state, ws, showPage }) {
     replaceBtn.addEventListener('click', replaceWithOfficial);
     meta.addEventListener('click', (event) => {
         if (event.target.closest?.('[data-open-settings-advanced]')) {
-            showPage?.('settings');
-            document.querySelector('[data-settings-tab="advanced"]')?.click();
+            openSettingsTab?.('advanced');
         }
     });
     page.querySelector('#updates-promote').addEventListener('click', async () => {

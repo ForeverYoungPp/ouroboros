@@ -91,6 +91,9 @@ test('detailed Updates UI makes destructive replacement an explicit recovery act
     assert.match(source, /data\.check_ok === false/);
     assert.match(source, /!data\.from_cache.*official_status_requires_check/);
     assert.match(source, /restart_required/);
+    // Restart now is honest about refusals: apiFetch does not reject on 4xx/5xx.
+    assert.match(source, /async function restartNow\(\)/);
+    assert.match(source, /if \(!resp\.ok\) throw new Error/);
     assert.match(source, /Rollback completed:.*Restart Ouroboros to finish/s);
     assert.match(source, /Rollback failed:.*Runtime shutdown was incomplete/s);
 

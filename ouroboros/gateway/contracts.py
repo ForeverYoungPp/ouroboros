@@ -826,7 +826,10 @@ class UiPreferencesResponse(TypedDict):
 
 class GitLogResponse(TypedDict):
     commits: list[Dict[str, Any]]
-    tags: list[str]
+    # Tag rows: {tag, date, sha (peeled commit), message} — the mirror said
+    # ``list[str]`` while ``list_versions`` has always emitted dicts; corrected
+    # (behavioural documentation) in the 2026-08-31 updates redesign.
+    tags: list[Dict[str, Any]]
     branch: str
     sha: str
 

@@ -161,3 +161,59 @@ def test_payload_carries_minimal_update_tx_projection(monkeypatch):
     monkeypatch.setattr(update_merge, "active_update_tx", lambda: {})
     payload = control._managed_update_payload(fetch=False, include_tags=False)
     assert payload["update_tx"] == {"active": False}
+
+
+def test_list_versions_emits_peeled_commit_sha(monkeypatch):
+    """Annotated tags peel %(*objectname) to the COMMIT (never the tag object),
+    lightweight tags fall back to %(objectname), and a tab-bearing subject
+    survives the maxsplit (wave-2 review finding: the restore-list merge joins
+    tags to commits by this sha)."""
+    raw = (
+        "v2.0.0\t2026-08-30T13:14:00+00:00\t" + "t" * 40 + "\t" + "c" * 40 + "\trelease\twith tab\n"
+        + "light\t2026-08-29T10:00:00+00:00\t" + "d" * 40 + "\t\tplain subject\n"
+    )
+    monkeypatch.setattr(git_ops, "git_capture", lambda cmd: (0, raw, ""))
+    rows = git_ops.list_versions()
+    assert rows[0]["sha"] == "c" * 40  # peeled commit, not the tag object
+    assert rows[0]["message"] == "release\twith tab"
+    assert rows[1]["sha"] == "d" * 40  # lightweight tag: objectname IS the commit
+    assert rows[1]["tag"] == "light"
+
+
+def test_failed_divergence_check_mints_no_checked_at(monkeypatch):
+    """A check whose rev-list read failed is NOT a completed check: it must not
+    stamp checked_at (or clobber the cache), or a later passive read would
+    present the failure as a verified up-to-date (wave-2 critical)."""
+    _wire(monkeypatch)
+    saved = {}
+    import supervisor.state as sup_state
+    monkeypatch.setattr(sup_state, "update_state", lambda fn: saved.setdefault("wrote", True))
+    monkeypatch.setattr(git_ops, "ensure_official_update_remote", lambda: (True, ""))
+
+    def fake_git_capture(cmd):
+        if cmd[:3] == ["git", "remote", "get-url"]:
+            return 0, "https://github.com/razzant/ouroboros", ""
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return 0, "ouroboros", ""
+        if cmd == ["git", "rev-parse", "HEAD"]:
+            return 0, CURRENT, ""
+        if cmd == ["git", "status", "--porcelain"]:
+            return 0, "", ""
+        if cmd[:2] == ["git", "log"]:
+            return 0, "msg", ""
+        if cmd[:4] == ["git", "rev-list", "--left-right", "--count"]:
+            return 1, "", "boom"
+        return 1, "", "unexpected"
+
+    monkeypatch.setattr(git_ops, "git_capture", fake_git_capture)
+    state = git_ops.compute_managed_update_status(fetch=True)
+    assert state["check_ok"] is False
+    assert "checked_at" not in state
+    assert "wrote" not in saved  # the last good cache is not clobbered
+
+
+def test_official_repo_url_strips_credentials():
+    assert git_ops._public_repo_url("https://user:tok@github.com/razzant/ouroboros") == "https://github.com/razzant/ouroboros"
+    assert git_ops._public_repo_url("https://x-access-token:abc@github.com/o/r.git") == "https://github.com/o/r.git"
+    assert git_ops._public_repo_url("git@github.com:razzant/ouroboros.git") == "github.com:razzant/ouroboros.git"
+    assert git_ops._public_repo_url("https://github.com/razzant/ouroboros") == "https://github.com/razzant/ouroboros"
