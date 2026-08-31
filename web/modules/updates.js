@@ -73,12 +73,34 @@ export function updateVerdict(data = {}, phase = '') {
         const txPhase = String(data.update_tx.phase || '');
         const task = data.update_tx.task_id ? ` (task ${data.update_tx.task_id})` : '';
         if (txPhase === 'corrupt') {
+            // Truthful dead-end disclosure: boot recovery deliberately leaves a
+            // corrupt marker for the owner, and apply (Replace included) 409s
+            // while any marker is active — so neither restart nor the Recovery
+            // panel clears this state (final-review finding, 2026-08-31).
             return {
                 ...base,
                 state: 'resolving', tone: 'error',
                 headline: 'The update transaction marker is corrupt.',
-                hint: 'Applying another update is blocked until it is recovered (a restart retries recovery; Replace with Official Version is the manual exit).',
+                hint: 'Updates are blocked and a restart will not clear this. Inspect and remove the marker file (ouroboros-update-tx.json in the repository .git directory) manually, then check again.',
                 action: null,
+            };
+        }
+        if (txPhase === 'pending_boot_smoke') {
+            return {
+                ...base,
+                state: 'resolving', tone: 'warn',
+                headline: 'An update landed and is waiting for a restart to finish.',
+                hint: 'Restart Ouroboros to run the post-update checks and complete it.',
+                action: { id: 'restart', label: 'Restart now' },
+            };
+        }
+        if (txPhase === 'gate_blocked' || txPhase === 'marker_cleanup_retry') {
+            return {
+                ...base,
+                state: 'resolving', tone: 'error',
+                headline: 'An update attempt stopped mid-flight and needs recovery.',
+                hint: `Phase: ${txPhase}. Restart Ouroboros — boot recovery retries the rollback/cleanup.`,
+                action: { id: 'restart', label: 'Restart now' },
             };
         }
         if (txPhase.includes('assisted')) {
@@ -415,7 +437,12 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             }
         } catch (err) {
             showToast('Update failed: ' + applyFailureText(err), 'error');
-            setPhase(err?.body?.restart_required ? 'restart_required' : '');
+            // An error carrying restart_required does NOT mean the update
+            // landed (a failed writer fence or a failed rollback also sets
+            // it): re-read the durable transaction state instead of claiming
+            // the landed-but-restart-failed headline (final-review finding).
+            setPhase('');
+            if (err?.body?.restart_required) await loadStatus();
         }
     }
 
@@ -446,7 +473,7 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             const restartRequired = Boolean(err?.body?.restart_required);
             const suffix = restartRequired ? ' Runtime shutdown was incomplete; restart Ouroboros before retrying.' : '';
             showToast('Recovery failed: ' + (err.message || err) + suffix, 'error');
-            if (restartRequired) setPhase('restart_required');
+            if (restartRequired) await loadStatus();
             replaceBtn.disabled = false;
         }
     }

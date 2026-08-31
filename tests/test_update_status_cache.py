@@ -217,3 +217,18 @@ def test_official_repo_url_strips_credentials():
     assert git_ops._public_repo_url("https://x-access-token:abc@github.com/o/r.git") == "https://github.com/o/r.git"
     assert git_ops._public_repo_url("git@github.com:razzant/ouroboros.git") == "github.com:razzant/ouroboros.git"
     assert git_ops._public_repo_url("https://github.com/razzant/ouroboros") == "https://github.com/razzant/ouroboros"
+
+
+def test_passive_overlay_recomputes_availability_after_head_rollback(monkeypatch):
+    """A cached "current" verdict must not certify a HEAD that later moved
+    below the checked official tip: availability is recomputed against the
+    cached sha on every passive read (final-review finding, 2026-08-31)."""
+    _wire(monkeypatch)
+    base_state = git_ops.load_state()
+    base_state["managed_update_cache"].update({"available": False, "behind": 0, "safe_to_apply": False})
+    monkeypatch.setattr(git_ops, "load_state", lambda: base_state)
+    state = git_ops.compute_managed_update_status(fetch=False)
+    assert state["available"] is True
+    assert state["from_cache"] is True
+    assert state["latest_sha"] == LATEST
+    assert state["behind"] == 1

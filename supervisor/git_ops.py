@@ -1716,9 +1716,13 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
                 # which keeps its narrow meaning "availability came from the
                 # cache overlay" (a consumed target must not read as cached).
                 state["checked_at"] = str(cache.get("checked_at") or "")
+            # Availability is recomputed against the cached official tip on
+            # every passive read (NOT read off the cached "available" flag):
+            # a HEAD that moved after the check — e.g. a rollback below a
+            # tip that was "current" when checked — must not inherit the
+            # stale verdict (final-review finding, 2026-08-31).
             if (
                 identity_matches
-                and cache.get("available")
                 and cached_sha
                 and not consumed
                 and counts_rc == 0

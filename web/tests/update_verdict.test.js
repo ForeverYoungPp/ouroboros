@@ -108,3 +108,23 @@ test('non-assisted and corrupt update transactions are named honestly, never "un
     const assisted = updateVerdict({ managed: true, update_tx: { active: true, phase: 'assisted_resolution', task_id: 't1' } }, '');
     assert.match(assisted.headline, /resolved under review/);
 });
+
+test('a corrupt marker discloses the true dead end: no restart promise, no Replace advertisement', () => {
+    const corrupt = updateVerdict({ managed: true, update_tx: { active: true, phase: 'corrupt' } }, '');
+    assert.equal(corrupt.action, null);
+    assert.match(corrupt.hint, /restart will not clear/);
+    assert.match(corrupt.hint, /ouroboros-update-tx\.json/);
+    assert.doesNotMatch(corrupt.hint, /Replace with Official/);
+});
+
+test('a landed-but-unrestarted transaction keeps the Restart continuation across reloads', () => {
+    const landed = updateVerdict({ managed: true, update_tx: { active: true, phase: 'pending_boot_smoke' } }, '');
+    assert.match(landed.headline, /waiting for a restart/);
+    assert.equal(landed.action?.id, 'restart');
+    const blocked = updateVerdict({ managed: true, update_tx: { active: true, phase: 'gate_blocked' } }, '');
+    assert.equal(blocked.tone, 'error');
+    assert.doesNotMatch(blocked.headline, /update landed/i);
+    assert.equal(blocked.action?.id, 'restart');
+    const cleanup = updateVerdict({ managed: true, update_tx: { active: true, phase: 'marker_cleanup_retry' } }, '');
+    assert.equal(cleanup.action?.id, 'restart');
+});
