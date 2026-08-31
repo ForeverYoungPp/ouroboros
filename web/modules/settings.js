@@ -362,6 +362,23 @@ export function providerTestResultIsCurrent({
     return sentGeneration === currentGeneration && sentFingerprint === currentFingerprint;
 }
 
+// Decision 16=A (#285): the settings "Restart now" action reuses the existing
+// owner command contract — the same WS `/restart` the chat header sends. The
+// whole confirm-and-send flow lives here (node-tested, panic-flow precedent):
+// the click handler only injects real deps. queue:false keeps a disconnected
+// page from silently queueing a destructive command for a later reconnect.
+export async function confirmAndSendRestart({ openConfirmDialog: confirmDialog, ws: socket }) {
+    const confirmed = await confirmDialog({
+        title: 'Restart agent',
+        body: 'All running and queued tasks stop, then the agent process restarts.\nSaved settings apply after the restart.',
+        confirmLabel: 'Restart',
+        danger: true,
+    });
+    if (!confirmed) return 'cancelled';
+    const result = socket?.send?.({ type: 'command', cmd: '/restart' }, { queue: false });
+    return result?.status === 'sent' ? 'sent' : 'not_connected';
+}
+
 export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const page = document.createElement('div');
     page.id = 'page-settings';
@@ -1180,6 +1197,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         await reloadSettingsWithFeedback();
     });
 
+    // #285: true from a restart-required save until the restart command is
+    // actually sent — keeps the Restart now affordance across later saves.
+    let restartPending = false;
+
     byId('btn-save-settings').addEventListener('click', async () => {
         if (!settingsLoaded) {
             setStatus('Reload current settings successfully before saving.', 'warn');
@@ -1201,6 +1222,15 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         const subagentsChanged = subagentSettingsFingerprint(body.OUROBOROS_SUBAGENTS)
             !== subagentSettingsFingerprint(currentSettings?.OUROBOROS_SUBAGENTS);
 
+        // Phase 1 of the save: the button goes busy and the status says so.
+        // Capability probes on review-route changes make a save take seconds;
+        // an idle "Save Settings" over that window reads as a dead click.
+        const saveButton = byId('btn-save-settings');
+        setButtonBusy(saveButton, true);
+        setStatus('Saving…', 'muted');
+        // A pending restart LATCHES: a later save that needs no restart must
+        // not hide the button while the process still runs the old config.
+        if (!restartPending) byId('btn-restart-now')?.setAttribute('hidden', '');
         try {
             const data = await apiClient.saveSettings(body);
             let runtimeModeResult = null;
@@ -1251,8 +1281,12 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 statusMsg = 'Settings saved. Some changes took effect immediately; others apply on the next task';
             } else if (data.immediate_changed) {
                 statusMsg = 'Settings saved. Changes took effect immediately';
-            } else {
+            } else if (data.next_task_changed) {
                 statusMsg = 'Settings saved. Changes take effect on the next task';
+            } else {
+                // Reachable when the only changed keys are retired no-ops:
+                // the warning below carries the honest story.
+                statusMsg = 'Settings saved';
             }
             if (subagentsChanged && data.agent_task_running) {
                 statusMsg += '. Available subagents take effect for new child tasks; '
@@ -1299,9 +1333,26 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 statusType = 'warn';
             }
             setStatus(statusMsg, statusType);
+            if (data.restart_required || runtimeModeResult?.restart_required) {
+                restartPending = true;
+            }
+            if (restartPending) byId('btn-restart-now')?.removeAttribute('hidden');
             window.dispatchEvent(new CustomEvent('ouro:settings-updated', { detail: { reason: 'settings saved', source: 'settings' } }));
         } catch (e) {
             setStatus('Failed to save: ' + e.message, 'warn');
+        } finally {
+            setButtonBusy(saveButton, false);
+        }
+    });
+
+    byId('btn-restart-now')?.addEventListener('click', async () => {
+        const outcome = await confirmAndSendRestart({ openConfirmDialog, ws });
+        if (outcome === 'sent') {
+            restartPending = false;
+            byId('btn-restart-now')?.setAttribute('hidden', '');
+            setStatus('Restart requested. If the agent refuses, the reason appears in the main chat.', 'muted');
+        } else if (outcome === 'not_connected') {
+            setStatus('Not connected — the restart command was not sent.', 'warn');
         }
     });
 

@@ -1052,11 +1052,15 @@ class OuroborosAgent:
 
     def handle_task(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Run one task under the root/subtree monetary attribution scope."""
-        # Hot-reload settings so UI changes affect the next task without restart.
-        try:
-            subagent_runtime.apply_task_start_settings()
-        except Exception:
-            pass
+        # A reused worker agent still carries the PREVIOUS task's chat binding;
+        # events emitted before _handle_task_scoped rebinds it would be
+        # addressed to the old thread. No binding lets the supervisor stamp
+        # the right chat from the RUNNING row by task_id (log_addressing).
+        self._current_chat_id = None
+        # Hot-reload settings so UI changes affect the next task without
+        # restart; a failed reload is disclosed loudly, not swallowed (#285).
+        subagent_runtime.apply_task_start_settings_or_disclose(
+            str(task.get("id") or ""), self._emit_live_log)
 
         from ouroboros.usage_accounting import UsageScope, usage_scope
 
