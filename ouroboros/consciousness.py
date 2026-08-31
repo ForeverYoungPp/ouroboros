@@ -1273,11 +1273,15 @@ class BackgroundConsciousness:
         self._registry._ctx.pending_events = []
         self._registry._ctx.event_queue = self._event_queue
         self._registry._ctx.task_id = "bg-consciousness"
+        from ouroboros.tool_capabilities import BACKGROUND_DELEGATION_ROLE
+
         self._registry._ctx.task_metadata = {
             "root_task_id": "bg-consciousness",
             "session_id": "background-consciousness",
             "actor_id": "background-consciousness",
-            "delegation_role": "background",
+            # Owner-delivery gating keys on this role: BG frames must stay
+            # cycle-end deferred (pause discipline), never live mid-cycle.
+            "delegation_role": BACKGROUND_DELEGATION_ROLE,
         }
 
         timeout_sec = self._registry.get_timeout(fn_name)

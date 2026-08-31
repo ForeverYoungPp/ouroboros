@@ -119,11 +119,13 @@ def deliver_final_message_live(
 ) -> bool:
     """Send the buffered FINAL ``send_message`` through the live worker queue.
 
-    The buffer can also hold proactive ``send_user_message`` events queued
-    mid-task (they carry no ``task_id``), so the final answer is selected by
-    the finalizing task's id — falling back to the LAST send_message — never
-    the first match, which would ship a proactive text early while the answer
-    stayed hostage to blocking post-task.
+    The buffer can also hold proactive ``send_user_message`` events that fell
+    back to deferred delivery mid-task (live-first frames stamp ``task_id``
+    too), so the final answer is selected as the LAST send_message matching
+    the finalizing task's id — the host appends the terminal frame after all
+    tool-time frames, so it wins the last-match scan — never the first match,
+    which would ship a proactive text early while the answer stayed hostage
+    to blocking post-task.
 
     Never lost, never doubled — without treating ``queue.put()`` as a delivery
     receipt: the buffered copy is KEPT (an event can still die between put and

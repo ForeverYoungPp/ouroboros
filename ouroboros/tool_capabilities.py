@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+# The delegation_role value background consciousness stamps on its shared tool
+# context before every tool call. Owner-delivery gating keys on it, so both
+# sides import this one name instead of repeating the literal.
+BACKGROUND_DELEGATION_ROLE: str = "background"
+
 CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file", "list_files", "write_file", "edit_text",
     "apply_patch", "edit_batch",

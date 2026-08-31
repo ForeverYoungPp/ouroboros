@@ -31,13 +31,12 @@ def _handle_send_photo(evt: Dict[str, Any], ctx: Any) -> None:
     try:
         # Binding precedence matches text delivery: post-hoc bound media stays
         # in the project panel even when the task retained its original chat id.
-        chat_id = _bound_project_chat_id(
-            ctx, evt.get("task_id"), evt.get("parent_task_id"), evt.get("root_task_id")
-        ) or int(evt.get("chat_id") or 0)
+        # chat 0 is a real hidden session (same contract as video/file/links).
+        chat_id = _delivery_chat_id(evt, ctx)
         image_b64 = str(evt.get("image_base64") or "")
         caption = str(evt.get("caption") or "")
         mime = str(evt.get("mime") or "image/png")
-        if not chat_id or not image_b64:
+        if chat_id is None or not image_b64:
             return
         photo_bytes = base64.b64decode(image_b64)
         ok, err = ctx.bridge.send_photo(
