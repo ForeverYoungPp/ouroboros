@@ -128,3 +128,10 @@ test('a landed-but-unrestarted transaction keeps the Restart continuation across
     const cleanup = updateVerdict({ managed: true, update_tx: { active: true, phase: 'marker_cleanup_retry' } }, '');
     assert.equal(cleanup.action?.id, 'restart');
 });
+
+test('restart_needed is honest: no "update landed" claim, restart continuation kept', () => {
+    const v = updateVerdict({ managed: true }, 'restart_needed');
+    assert.doesNotMatch(v.headline, /update landed/i);
+    assert.match(v.headline, /needs a restart/);
+    assert.equal(v.action?.id, 'restart');
+});

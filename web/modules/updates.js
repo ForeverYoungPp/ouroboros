@@ -57,6 +57,10 @@ export function updateVerdict(data = {}, phase = '') {
     if (phase === 'updating') return { ...base, state: 'updating', tone: 'neutral', headline: 'Applying the update…', hint: '', action: { id: 'update', label: 'Updating…', disabled: true } };
     if (phase === 'restarting') return { ...base, state: 'restarting', tone: 'ok', headline: 'Restarting the server…', hint: 'The page reloads by itself when the server is back.', action: { id: 'restart', label: 'Restarting…', disabled: true } };
     if (phase === 'restart_required') return { ...base, state: 'restart_required', tone: 'warn', headline: 'The update landed, but the automatic restart failed.', hint: 'Restart Ouroboros to finish.', action: { id: 'restart', label: 'Restart now' } };
+    // Distinct from restart_required ("the update landed"): the operation did
+    // NOT land — the runtime just cannot continue without a restart (failed
+    // writer fence, failed rollback, rollback landed without its restart).
+    if (phase === 'restart_needed') return { ...base, state: 'restart_needed', tone: 'warn', headline: 'Ouroboros needs a restart before updates can continue.', hint: 'The last operation could not complete cleanly; restart, then retry.', action: { id: 'restart', label: 'Restart now' } };
 
     const unmanaged = data.managed === false
         || (Array.isArray(data.warnings) && data.warnings.includes('managed_updates_unavailable'));
@@ -364,14 +368,16 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
                 showToast(`Rollback successful: ${data.message}. Server is restarting...`, 'success');
                 setPhase('restarting');
             } else if (data.status === 'restart_required') {
+                // A ROLLBACK landed, not an update: the update-specific
+                // restart_required headline would lie here.
                 showToast(`Rollback completed: ${data.message}. Restart Ouroboros to finish.`, 'error');
-                setPhase('restart_required');
+                setPhase('restart_needed');
             } else {
                 const suffix = data.restart_required
                     ? ' Runtime shutdown was incomplete; restart Ouroboros before retrying.'
                     : '';
                 showToast(`Rollback failed: ${data.error || 'unknown error'}${suffix}`, 'error');
-                if (data.restart_required) setPhase('restart_required');
+                if (data.restart_required) setPhase('restart_needed');
             }
         } catch (err) {
             showToast('Rollback failed: ' + (err.message || err), 'error');
@@ -439,10 +445,15 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             showToast('Update failed: ' + applyFailureText(err), 'error');
             // An error carrying restart_required does NOT mean the update
             // landed (a failed writer fence or a failed rollback also sets
-            // it): re-read the durable transaction state instead of claiming
-            // the landed-but-restart-failed headline (final-review finding).
-            setPhase('');
-            if (err?.body?.restart_required) await loadStatus();
+            // it): re-read the durable transaction state, and when no marker
+            // survived (writer-fence refusals leave none) keep an honest
+            // restart continuation instead of restoring the ordinary action.
+            if (err?.body?.restart_required) {
+                await loadStatus();
+                setPhase(latestStatus?.update_tx?.active ? '' : 'restart_needed');
+            } else {
+                setPhase('');
+            }
         }
     }
 
@@ -473,8 +484,13 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             const restartRequired = Boolean(err?.body?.restart_required);
             const suffix = restartRequired ? ' Runtime shutdown was incomplete; restart Ouroboros before retrying.' : '';
             showToast('Recovery failed: ' + (err.message || err) + suffix, 'error');
-            if (restartRequired) await loadStatus();
-            replaceBtn.disabled = false;
+            if (restartRequired) {
+                await loadStatus();
+                if (!latestStatus?.update_tx?.active) setPhase('restart_needed');
+            }
+            // Never re-enable Replace over a durable blocked transaction the
+            // re-render just disabled it for (final-review finding).
+            replaceBtn.disabled = Boolean(latestStatus?.update_tx?.active);
         }
     }
 

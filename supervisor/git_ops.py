@@ -1709,12 +1709,17 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
                 )
             except Exception:
                 counts_rc, cached_ahead, cached_behind = 1, 0, 0
-            if identity_matches and str(cache.get("checked_at") or ""):
+            divergence_validated = not cached_sha or consumed or counts_rc == 0
+            if identity_matches and divergence_validated and str(cache.get("checked_at") or ""):
                 # Additive truthfulness: the passive read discloses WHEN the
                 # official channel was last actually checked, even when the
                 # cached result is "no update". Deliberately NOT `from_cache`,
                 # which keeps its narrow meaning "availability came from the
                 # cache overlay" (a consumed target must not read as cached).
+                # A cached tip that can no longer be resolved locally is NOT
+                # disclosed: the timestamp would let the panel claim "up to
+                # date, checked N ago" over a check whose availability can no
+                # longer be validated (final-review finding, 2026-08-31).
                 state["checked_at"] = str(cache.get("checked_at") or "")
             # Availability is recomputed against the cached official tip on
             # every passive read (NOT read off the cached "available" flag):

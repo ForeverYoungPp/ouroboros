@@ -232,3 +232,21 @@ def test_passive_overlay_recomputes_availability_after_head_rollback(monkeypatch
     assert state["from_cache"] is True
     assert state["latest_sha"] == LATEST
     assert state["behind"] == 1
+
+
+def test_passive_read_hides_checked_at_when_cached_tip_is_unresolvable(monkeypatch):
+    """A timestamp over a cached tip that no longer resolves locally would let
+    the panel claim "up to date, checked N ago" over a check whose availability
+    cannot be validated any more (final-review finding, 2026-08-31)."""
+    _wire(monkeypatch)
+    real = git_ops.git_capture
+
+    def broken_divergence(cmd):
+        if cmd[:4] == ["git", "rev-list", "--left-right", "--count"]:
+            return 128, "", "bad revision"
+        return real(cmd)
+
+    monkeypatch.setattr(git_ops, "git_capture", broken_divergence)
+    state = git_ops.compute_managed_update_status(fetch=False)
+    assert "checked_at" not in state
+    assert not state.get("available")
