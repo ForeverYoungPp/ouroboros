@@ -365,6 +365,10 @@ def test_triad_review_prompt_includes_architecture_md(tmp_path):
         "ARCHITECTURE.md content must appear in the rendered triad review prompt"
     )
     assert "## ARCHITECTURE.md" in rendered
+    assert "DESIGNGUIDE" in rendered, (
+        "DESIGN.md content must appear in the rendered triad review prompt"
+    )
+    assert "## DESIGN.md" in rendered
 
 
 def test_governance_doc_load_emits_explicit_omission_marker_on_missing(tmp_path):

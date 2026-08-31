@@ -213,7 +213,7 @@ def test_api_prompt_keeps_inlining_governance_bodies(tmp_path):
         prompt_context={"diff": "DIFF-SENTINEL", "changed_files": "file-a"},
     )
     # The checklist section loads from the host repo's canonical CHECKLISTS.md
-    # (load_checklist_section), so only the three repo-dir docs are asserted.
+    # (load_checklist_section), so only the four repo-dir docs are asserted.
     assert "BIBLE-BODY-MARKER-7Q" in prompt
     assert "DEVELOPMENT-BODY-MARKER-7Q" in prompt
     assert "DESIGN-BODY-MARKER-7Q" in prompt
