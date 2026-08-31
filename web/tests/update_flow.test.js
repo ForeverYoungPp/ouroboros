@@ -144,3 +144,19 @@ test('main update dialog never invents facts for an unverified preflight', () =>
     assert.match(panel, /verifiedUpdatePlan\(preflight\)/);
     assert.match(panel, /could not be verified\. No files were changed\./);
 });
+
+test('restart continuation and Replace gating are fail-closed in source', () => {
+    const src = readFileSync(new URL('../modules/updates.js', import.meta.url), 'utf8');
+    // The panel-lifetime flag re-applies restart_needed on every status refresh.
+    assert.match(src, /restartNeeded && !data\?\.update_tx\?\.active \? 'restart_needed' : ''/);
+    // A failed status read keeps the continuation too.
+    assert.match(src, /setPhase\(restartNeeded \? 'restart_needed' : ''\)/);
+    // render() alone owns the Replace gate, failing closed on unreadable status
+    // and on every busy/blocked state including restart_needed.
+    assert.match(src, /statusReadFailed \|\| \[\s*'loading', 'checking', 'updating', 'preflighting', 'restarting',\s*'restart_required', 'restart_needed', 'resolving', 'unmanaged',\s*\]/);
+    // The catches never assign replaceBtn.disabled themselves.
+    const catches = src.split('catch').slice(1);
+    for (const c of catches) {
+        assert.doesNotMatch(c.slice(0, 400), /replaceBtn\.disabled\s*=/);
+    }
+});

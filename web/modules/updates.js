@@ -218,6 +218,7 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
     mount.appendChild(page);
 
     const primaryBtn = page.querySelector('#btn-update-primary');
+    let restartNeeded = false;  // panel-lifetime restart continuation (no durable marker exists for fence/rollback refusals)
     const replaceBtn = page.querySelector('#btn-update-replace');
     const dot = page.querySelector('#updates-dot');
     const summary = page.querySelector('#updates-summary');
@@ -259,7 +260,15 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             primaryBtn.hidden = true;
             primaryBtn.dataset.action = '';
         }
-        replaceBtn.disabled = ['updating', 'preflighting', 'restarting', 'resolving', 'unmanaged'].includes(verdict.state);
+        // Replace gating fails CLOSED: a status read that failed (synthesized
+        // status_error) proves nothing about the durable transaction, so the
+        // recovery action stays disabled until a successful re-read.
+        const statusReadFailed = Array.isArray(latestStatus?.warnings)
+            && latestStatus.warnings.some((w) => String(w).startsWith('status_error:'));
+        replaceBtn.disabled = statusReadFailed || [
+            'loading', 'checking', 'updating', 'preflighting', 'restarting',
+            'restart_required', 'restart_needed', 'resolving', 'unmanaged',
+        ].includes(verdict.state);
     }
 
     function setPhase(next) {
@@ -272,11 +281,16 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
         try {
             const data = await (fetchRemote ? apiClient.updateCheck() : apiClient.updateStatus());
             latestStatus = data;
-            setPhase('');
+            // A restart-required refusal (failed writer fence, failed rollback)
+            // leaves NO durable marker, so the continuation lives in this
+            // panel-lifetime flag: every refresh — tab reopen included —
+            // re-applies it until the restart actually happens. A full page
+            // reload honestly loses it (nothing durable exists server-side).
+            setPhase(restartNeeded && !data?.update_tx?.active ? 'restart_needed' : '');
             renderOfficialTags(data.official_tags || []);
         } catch (err) {
             latestStatus = { managed: true, warnings: [`status_error:${err.message || err}`], check_ok: false };
-            setPhase('');
+            setPhase(restartNeeded ? 'restart_needed' : '');
         }
     }
 
@@ -371,13 +385,14 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
                 // A ROLLBACK landed, not an update: the update-specific
                 // restart_required headline would lie here.
                 showToast(`Rollback completed: ${data.message}. Restart Ouroboros to finish.`, 'error');
+                restartNeeded = true;
                 setPhase('restart_needed');
             } else {
                 const suffix = data.restart_required
                     ? ' Runtime shutdown was incomplete; restart Ouroboros before retrying.'
                     : '';
                 showToast(`Rollback failed: ${data.error || 'unknown error'}${suffix}`, 'error');
-                if (data.restart_required) setPhase('restart_needed');
+                if (data.restart_required) { restartNeeded = true; setPhase('restart_needed'); }
             }
         } catch (err) {
             showToast('Rollback failed: ' + (err.message || err), 'error');
@@ -448,12 +463,8 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             // it): re-read the durable transaction state, and when no marker
             // survived (writer-fence refusals leave none) keep an honest
             // restart continuation instead of restoring the ordinary action.
-            if (err?.body?.restart_required) {
-                await loadStatus();
-                setPhase(latestStatus?.update_tx?.active ? '' : 'restart_needed');
-            } else {
-                setPhase('');
-            }
+            if (err?.body?.restart_required) restartNeeded = true;
+            await loadStatus();
         }
     }
 
@@ -484,13 +495,11 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             const restartRequired = Boolean(err?.body?.restart_required);
             const suffix = restartRequired ? ' Runtime shutdown was incomplete; restart Ouroboros before retrying.' : '';
             showToast('Recovery failed: ' + (err.message || err) + suffix, 'error');
-            if (restartRequired) {
-                await loadStatus();
-                if (!latestStatus?.update_tx?.active) setPhase('restart_needed');
-            }
-            // Never re-enable Replace over a durable blocked transaction the
-            // re-render just disabled it for (final-review finding).
-            replaceBtn.disabled = Boolean(latestStatus?.update_tx?.active);
+            if (restartRequired) restartNeeded = true;
+            // Fail-closed: ANY replace failure (the tx-active 409 included)
+            // re-reads durable state, and render() alone owns the Replace
+            // gate — the catch never re-enables it over stale/unknown state.
+            await loadStatus();
         }
     }
 
@@ -504,6 +513,7 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             });
             if (!resp.ok) throw new Error(`restart command refused (HTTP ${resp.status})`);
             showToast('Restart requested.', 'success');
+            restartNeeded = false;
             setPhase('restarting');
         } catch (err) {
             showToast('Restart failed: ' + (err.message || err), 'error');
