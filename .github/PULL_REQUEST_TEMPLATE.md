@@ -45,9 +45,10 @@ Evidence:
 
 ## Governance and documentation
 
-- [ ] I read `CONTRIBUTING.md`; for a substantive change I also read
-      `BIBLE.md`, `docs/ARCHITECTURE.md`, `docs/DEVELOPMENT.md`, and
-      `docs/CHECKLISTS.md` in full.
+- [ ] I read `CONTRIBUTING.md` and `docs/CHECKLISTS.md` in full; for a
+      substantive change I mapped `BIBLE.md`, `docs/ARCHITECTURE.md`,
+      `docs/DEVELOPMENT.md`, and `docs/DESIGN.md` by their headings and read
+      every section relevant to this change in full.
 - [ ] I updated tests and documentation where behavior or architecture changed.
 - [ ] I did not include secrets, local settings, runtime state, logs, caches, or
       generated build/review artifacts in the commit.
@@ -74,6 +75,29 @@ available, use NOT_RUN and say why.
 - Checks performed and coverage limitations:
 - Full review output or artifact link:
 - If not run, reason:
+
+Scope checklist coverage (from the reviewer's JSON; one row per item, extra
+rows for additional FAIL findings on the same item):
+
+| Item | Verdict | Evidence |
+| --- | --- | --- |
+| intent_alignment | | |
+| forgotten_touchpoints | | |
+| cross_surface_consistency | | |
+| regression_surface | | |
+| prompt_doc_sync | | |
+| architecture_fit | | |
+| cross_module_bugs | | |
+| implicit_contracts | | |
+
+<details>
+<summary>Reviewer checklist JSON (validate with scripts/validate_scope_receipt.py)</summary>
+
+```json
+
+```
+
+</details>
 
 ## Final checklist
 
