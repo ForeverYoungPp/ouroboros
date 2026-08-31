@@ -293,7 +293,7 @@ export function createChatInstance({
     });
     const chatDecision = createChatDecision({
         apiFetch,
-        frameNode: (msg, node) => chatMedia.bubbleFrameNode(msg, node),
+        frameNode: chatMedia.bubbleFrameNode,
         renderMarkdown: renderChatMarkdown,
         enhanceMarkdown: enhanceChatMarkdown,
         showToast,
@@ -3155,7 +3155,7 @@ export function createChatInstance({
                     // message — render it BEFORE the taskId/finishLiveCard block so
                     // a mid-task delivery replayed while its task is still
                     // running does not falsely finalize that task's live card.
-                    if (msg.msg_type === 'document' || msg.msg_type === 'photo' || msg.msg_type === 'video' || msg.msg_type === 'links' || msg.msg_type === 'quiz') {
+                    if (['document', 'photo', 'video', 'links', 'quiz'].includes(msg.msg_type)) {
                         if (msg.msg_type === 'document') appendDocumentBubble(msg);
                         else if (msg.msg_type === 'links') appendLinksMessage(msg);
                         else if (msg.msg_type === 'quiz') appendQuizMessage(msg);
@@ -4374,7 +4374,7 @@ export function createChatInstance({
             rememberMessageKey,
             chatMediaMessageKey,
             documentMessageKey,
-            buildQuizCard: (msg) => chatDecision.buildQuizCard(msg),
+            buildQuizCard: chatDecision.buildQuizCard,
         });
 
     let wsHasConnectedOnce = false;
