@@ -1925,3 +1925,52 @@ def test_tool_registry_execute_dispatches_ext_tool(tmp_path, monkeypatch):
         assert tmp_reg.get_timeout(tool_name) == 13
     finally:
         extension_loader.unload_extension("testskill")
+
+
+def test_extensions_index_carries_the_preflight_failed_fact(tmp_path, monkeypatch):
+    """#335: /api/extensions is the skill-card feed — a persisted deterministic
+    preflight FAIL must reach the card as review_gate.preflight_failed so the
+    renderer can offer Repair instead of a Review that fails the same way."""
+    from ouroboros.skill_loader import SkillReviewState, compute_content_hash, save_review_state
+
+    skills_root = tmp_path / "skills"
+    plugin = (
+        "def register(api):\n"
+        "    api.register_tool('t', lambda ctx: 'ok', description='', schema={})\n"
+    )
+    skill_dir = _write_ext(skills_root, "ext_preflight", permissions=["tool"], plugin=plugin)
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    try:
+        content_hash = compute_content_hash(skill_dir, manifest_entry="plugin.py")
+        save_review_state(
+            drive_root,
+            "ext_preflight",
+            SkillReviewState(
+                status="pending",
+                content_hash=content_hash,
+                findings=[{
+                    "item": "skill_preflight",
+                    "verdict": "FAIL",
+                    "severity": "critical",
+                    "reason": '{"manifest": [{"item": "manifest_entry_exists", "ok": false}], "ok": false}',
+                    "model": "deterministic_preflight",
+                }],
+            ),
+        )
+        rows = client.get("/api/extensions").json()["skills"]
+        row = next(item for item in rows if item["name"] == "ext_preflight")
+        assert row["review_gate"]["preflight_failed"] is True
+        assert row["review_gate"]["executable_review"] is False
+
+        # A plain pending skill (no persisted findings) carries the fact
+        # honestly as False — the producer KNOWS the findings here.
+        save_review_state(
+            drive_root, "ext_preflight",
+            SkillReviewState(status="pending", content_hash=content_hash),
+        )
+        rows = client.get("/api/extensions").json()["skills"]
+        row = next(item for item in rows if item["name"] == "ext_preflight")
+        assert row["review_gate"]["preflight_failed"] is False
+    finally:
+        _stop_patches(patches)

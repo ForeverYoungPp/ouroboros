@@ -2,6 +2,8 @@ import {
     escapeHtmlAttr as escapeHtml,
     grantReady,
     isRateLimitError,
+    preflightFailed,
+    preflightFindingText,
     reviewReady,
     safeExternalHrefAttr as safeExternalUrl,
 } from './utils.js';
@@ -32,9 +34,14 @@ function missingGrantLoadError(skill) {
 function repairReady(skill) {
     const source = (skill.source || 'native').toLowerCase();
     const payloadRoot = String(skill.payload_root || '');
-    return ['clawhub', 'ouroboroshub', 'external'].includes(source)
+    // self_authored payloads live under skills/external/ (config
+    // SKILL_SOURCE_SUBDIRS has no self_authored bucket), so the payload-root
+    // gate already matches them — only the source list kept them out (#335).
+    return ['clawhub', 'ouroboroshub', 'external', 'self_authored'].includes(source)
         && /^skills\/(external|clawhub|ouroboroshub)\//.test(payloadRoot)
-        && (skill.review_status === 'blockers' || (Boolean(skill.load_error) && !missingGrantLoadError(skill)));
+        && (skill.review_status === 'blockers'
+            || preflightFailed(skill)
+            || (Boolean(skill.load_error) && !missingGrantLoadError(skill)));
 }
 
 function skillConflictReason(skill) {
@@ -52,7 +59,12 @@ function primaryAction(skill, reviewInProgress, repairInProgress, live) {
     if (skill.lifecycle_virtual && (skill.load_error || isRateLimitError(skill.load_error)) && (skill.source || '').toLowerCase() === 'clawhub') {
         return { action: 'retry_install', label: isRateLimitError(skill.load_error) ? 'Retry later' : 'Retry install' };
     }
-    if ((skill.load_error && !missingGrantLoadError(skill)) || (skill.review_status === 'blockers' && !reviewReady(skill))) {
+    // A deterministic preflight FAIL persists as pending: Review/Re-review
+    // would deterministically fail again, so a repairable payload offers
+    // Repair first (#335). Non-repairable sources keep the Review CTA.
+    if ((skill.load_error && !missingGrantLoadError(skill))
+        || (skill.review_status === 'blockers' && !reviewReady(skill))
+        || (preflightFailed(skill) && repairReady(skill))) {
         return repairReady(skill) ? { action: 'repair', label: 'Repair' } : { label: '', disabled: true };
     }
     if (!reviewReady(skill)) return { action: skill.review_stale ? 'rereview' : 'review', label: skill.review_stale ? 'Re-review' : 'Review' };
@@ -105,6 +117,7 @@ function statusChip(skill, action, live) {
     else if (skill.lifecycle_virtual && isRateLimitError(skill.load_error)) status = { tone: 'warn', label: 'Rate limited' };
     else if (skill.load_error) status = { tone: 'danger', label: 'Failed to load' };
     else if (conflictReason) status = { tone: 'danger', label: conflictReason.charAt(0).toUpperCase() + conflictReason.slice(1) };
+    else if (preflightFailed(skill)) status = { tone: 'danger', label: 'Preflight failed' };
     else if (!reviewReady(skill)) status = { tone: 'warn', label: 'Needs review' };
     else if (skill.enabled && skill.type === 'extension') {
         status = skill.live_loaded && (skill.dispatch_live || hasSkillUiTab(skill, live))
@@ -162,7 +175,11 @@ function sourceChip(skill) {
 function reviewFindings(skill) {
     const findings = Array.isArray(skill.review_findings) ? skill.review_findings : [];
     if (!findings.length) return '';
-    const rows = findings.map((f) => `<li><strong>${escapeHtml(f.verdict || f.severity || '')}</strong> ${escapeHtml(f.item || f.check || f.title || 'finding')}: ${escapeHtml(f.reason || f.message || JSON.stringify(f))}</li>`).join('');
+    const rows = findings.map((f) => {
+        const preflight = preflightFindingText(f);
+        const reason = preflight || f.reason || f.message || JSON.stringify(f);
+        return `<li><strong>${escapeHtml(f.verdict || f.severity || '')}</strong> ${escapeHtml(f.item || f.check || f.title || 'finding')}: ${escapeHtml(reason)}</li>`;
+    }).join('');
     return `<details class="skills-review-findings ui-rich-content"><summary class="muted">${findings.length} review finding${findings.length === 1 ? '' : 's'}</summary><ul>${rows}</ul></details>`;
 }
 
@@ -276,7 +293,7 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
     // flips type instruction->script, then re-reviews). Offer it as a secondary
     // action so the normal review/grant/enable CTA stays primary.
     const makeRunnable = skill.type === 'instruction'
-        && ['clawhub', 'ouroboroshub', 'external'].includes(source)
+        && ['clawhub', 'ouroboroshub', 'external', 'self_authored'].includes(source)
         && /^skills\/(external|clawhub|ouroboroshub)\//.test(payloadRoot)
         && !repairInProgress;
     // Owner-attestation: let the owner SKIP the expensive LLM review for THEIR OWN skill,
@@ -296,11 +313,14 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
         && !thirdPartySource
         && !(skill.review_profile === 'owner_attested' && !skill.review_stale)
         && (officialHubHint || ownSourceHint)
+        // A deterministic preflight FAIL makes attestation a guaranteed 409
+        // (run_owner_attestation reruns the preflight); hide the dead end (#335).
+        && !preflightFailed(skill)
         && (!reviewReady(skill) || skill.review_stale);
     const menu = (market || localDelete || !reviewInProgress || submit.visible || makeRunnable || ownerAttestable)
         ? `<div class="skills-card-menu"><button type="button" class="skills-card-menu-trigger" aria-label="More actions" aria-haspopup="menu" aria-expanded="false" data-skill-menu-trigger>⋮</button><dialog class="skills-card-menu-dialog" role="menu">
             ${makeRunnable ? `<button type="button" role="menuitem" class="skills-menu-item skills-make-runnable" data-skill="${safeName}" data-skill-action="repair" title="Author a runnable script for this instruction skill via the repair agent">Make runnable</button>` : ''}
-            ${!reviewInProgress ? `<button type="button" role="menuitem" class="skills-menu-item skills-review" data-skill="${safeName}">${skill.review_status === 'pending' ? 'Review' : (skill.review_stale ? 'Re-review' : 'Review again')}</button>` : ''}
+            ${!reviewInProgress && !(preflightFailed(skill) && repairReady(skill)) ? `<button type="button" role="menuitem" class="skills-menu-item skills-review" data-skill="${safeName}">${skill.review_status === 'pending' ? 'Review' : (skill.review_stale ? 'Re-review' : 'Review again')}</button>` : ''}
             ${ownerAttestable ? `<button type="button" role="menuitem" class="skills-menu-item skills-attest-review skills-attest-warn" data-skill="${safeName}" title="Skip the expensive LLM review for your own or verified official-hub skill. The deterministic safety preflight still runs, and this is logged for audit.">⚠️ Skip review</button>` : ''}
             ${submit.visible ? `<button type="button" role="menuitem" class="skills-menu-item skills-submit-hub ${submit.disabled ? 'is-disabled' : ''}" data-skill="${safeName}" title="${escapeHtml(submit.reason)}" data-submit-disabled="${submit.disabled ? 'true' : 'false'}" data-submit-reason="${escapeHtml(submit.reason)}" data-submit-state="${escapeHtml(submit.state || '')}" data-publication-ready="${submit.publication_ready === true ? 'true' : 'false'}" aria-disabled="${submit.disabled ? 'true' : 'false'}">Publish to OuroborosHub</button>` : ''}
             ${market ? `<button type="button" role="menuitem" class="skills-menu-item skills-update" data-skill="${safeName}" data-source="${escapeHtml(source)}">Update</button><button type="button" role="menuitem" class="skills-menu-item skills-uninstall" data-skill="${safeName}" data-source="${escapeHtml(source)}">Uninstall</button>` : ''}

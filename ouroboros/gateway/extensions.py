@@ -125,7 +125,9 @@ def _review_fields(
     github_token_configured: bool | None = None,
 ) -> dict[str, Any]:
     stale = loaded.review.is_stale_for(loaded.content_hash) if stale is None else stale
-    gate = skill_review_gate(loaded.review.status, stale=stale) if gate is None else gate
+    gate = (skill_review_gate(loaded.review.status, stale=stale,
+                              findings=getattr(loaded.review, "findings", None))
+            if gate is None else gate)
     source = str(getattr(loaded, "source", "") or "")
     official_hub_verified = False
     if source == "ouroboroshub":
@@ -387,7 +389,7 @@ def _build_extensions_index(drive_root, repo_path):
         }
         if bool(getattr(s, "identity_collision", False)):
             stale = True
-            gate = skill_review_gate(s.review.status, stale=stale)
+            gate = skill_review_gate(s.review.status, stale=stale, findings=s.review.findings)
             # Serialize the collision fact itself: hub_sync must fail closed
             # (no-action conflict card) instead of first-wins joining one of
             # several same-name occupants (scope-review reproduction).
@@ -776,7 +778,7 @@ async def api_skill_toggle(request: Request) -> JSONResponse:
                 }
             stale = loaded.review.is_stale_for(loaded.content_hash)
             grants = grant_status_for_skill(drive_root, loaded)
-            gate = skill_review_gate(loaded.review.status, stale=stale)
+            gate = skill_review_gate(loaded.review.status, stale=stale, findings=loaded.review.findings)
             if not gate["executable_review"]:
                 return {
                     "error": "cannot enable until review status is a fresh executable review",
@@ -1245,7 +1247,7 @@ async def api_skill_grants(request: Request) -> JSONResponse:
                 "status_code": 400,
             }
         stale = loaded.review.is_stale_for(loaded.content_hash)
-        gate = skill_review_gate(loaded.review.status, stale=stale)
+        gate = skill_review_gate(loaded.review.status, stale=stale, findings=loaded.review.findings)
         if not review_status_allows_execution(loaded.review.status) or stale:
             return {
                 "error": "key and permission grants require a fresh executable review",

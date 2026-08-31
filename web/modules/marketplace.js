@@ -17,6 +17,7 @@ import {
     formatCompactNumber,
     grantReady,
     isRateLimitError,
+    preflightFailed,
     renderHubCard,
     renderSkillRepairPrompt,
     reviewReady,
@@ -98,7 +99,7 @@ function hasInstalledUiTab(installed) {
     return installed?.has_ui_tab === true;
 }
 
-function lifecycleFor(summary, installed, pending) {
+export function lifecycleFor(summary, installed, pending) {
     if (pending) {
         if (pending.failed === true) {
             return {
@@ -143,6 +144,18 @@ function lifecycleFor(summary, installed, pending) {
             tone: 'danger',
             label: 'Review blockers',
             hint: finding || 'Review has blocker findings; ask Ouroboros to repair the skill payload.',
+            action: 'fix',
+            button: 'Repair',
+        };
+    }
+    // #335: a deterministic preflight FAIL persists as pending — Re-review
+    // would fail the same way. The repair path fixes the payload instead.
+    if (preflightFailed(installed) && !reviewReady(installed, { requireFresh: true })) {
+        const finding = topReviewFinding(installed);
+        return {
+            tone: 'danger',
+            label: 'Preflight failed',
+            hint: finding || 'The deterministic preflight failed; ask Ouroboros to repair the skill payload.',
             action: 'fix',
             button: 'Repair',
         };

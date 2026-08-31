@@ -568,7 +568,7 @@ def _installed_skill_payload(skill: Any, drive_root: pathlib.Path, *, provenance
     except Exception:
         payload_root = ""
     stale = skill.review.is_stale_for(skill.content_hash)
-    gate = skill_review_gate(skill.review.status, stale=stale)
+    gate = skill_review_gate(skill.review.status, stale=stale, findings=skill.review.findings)
     payload = {
         "name": skill.name,
         "type": skill.manifest.type,
