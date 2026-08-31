@@ -271,6 +271,48 @@ test('a trailing typing indicator does not break photo grouping', () => {
     }
 });
 
+test('live media and quiz-state writes use the injected content boundary', () => {
+    const fx = fixture();
+    const handlers = new Map();
+    const seen = new Set();
+    let mutations = 0;
+    let unread = 0;
+    try {
+        fx.controller.wireDeliveries({
+            onWs(type, handler) { handlers.set(type, handler); },
+            isMyThread: () => true,
+            hideTypingIndicatorOnly() {},
+            syncChatStatus() {},
+            incrementUnreadIfNeeded() { unread += 1; },
+            seenMessageKeys: seen,
+            rememberMessageKey(key) { seen.add(key); },
+            chatMediaMessageKey: (msg) => `media:${msg.task_id}:${msg.ts}`,
+            documentMessageKey: (msg) => `doc:${msg.task_id}:${msg.ts}`,
+            buildQuizCard: () => null,
+            applyQuizStateFrame: (_root, msg) => msg.changed === true,
+            messagesRoot: () => ({}),
+            deliverContentMutation(mutate) { mutations += 1; return mutate(); },
+        });
+        handlers.get('photo')({
+            type: 'photo', role: 'assistant', task_id: 'task-a', ts: 'one',
+            image_base64: 'aGVsbG8=', mime: 'image/png',
+        });
+        handlers.get('photo')({
+            type: 'photo', role: 'assistant', task_id: 'task-a', ts: 'two',
+            image_base64: 'aGVsbG8=', mime: 'image/png',
+        });
+        handlers.get('quiz_state')({ quiz_id: 'q1', changed: false });
+        handlers.get('quiz_state')({ quiz_id: 'q1', changed: true });
+        assert.equal(mutations, 4);
+        assert.equal(unread, 2);
+        assert.equal(fx.inserted.length, 1);
+        assert.equal(fx.inserted[0].querySelectorAll('.chat-gallery-item').length, 2);
+    } finally {
+        fx.controller.destroy();
+        fx.restore();
+    }
+});
+
 test('an intervening message breaks file-card adjacency the same way', () => {
     const fx = fixture();
     try {

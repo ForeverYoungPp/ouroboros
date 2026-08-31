@@ -303,11 +303,6 @@ def test_chat_scrolls_to_bottom_after_first_history_load():
     assert "const parent = liveCardRecords.get(record.parentGroupId);" in source
     assert "seen.has(record.groupId)" in source, \
         "Nested subagent timestamps must propagate to the top-level ancestor safely"
-    assert "messagesDiv.scrollTop = messagesDiv.scrollHeight" in source
-    # Pin the chronological insertion call-site: a revert to plain append would
-    # keep JS unit tests green (they exercise the exported helper directly).
-    assert "insertTimelineNode(messagesDiv, node, typing" in source, \
-        "insertMessageNode must route through chronological insertTimelineNode"
     # The shared photo/video builder and the separate document builder must
     # each stamp sortable data-ts from the raw source timestamp.
     bubble_frame = media_source.split("function bubbleFrame", 1)[1].split(

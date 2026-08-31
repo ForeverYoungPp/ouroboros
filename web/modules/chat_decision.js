@@ -31,6 +31,7 @@ export function createChatDecision({
     renderMarkdown,
     enhanceMarkdown,
     showToast,
+    onDomWrite = (mutate) => mutate(),
 }) {
     function normalizeQuiz(msg) {
         const nested = msg && typeof msg.quiz === 'object' && msg.quiz ? msg.quiz : null;
@@ -113,14 +114,30 @@ export function createChatDecision({
     }
 
     function setCardState(card, state, answeredIndex) {
-        if (!card) return;
-        card.dataset.state = state;
-        const status = card.querySelector('.chat-quiz-status-text');
-        if (status) status.textContent = statusText(state);
-        const buttons = card.querySelectorAll('.chat-quiz-option');
-        buttons.forEach((btn, i) => {
-            btn.disabled = state !== 'open';
-            btn.classList.toggle('chosen', answeredIndex !== null && i === answeredIndex);
+        if (!card) return false;
+        return onDomWrite(() => {
+            let changed = card.dataset.state !== state;
+            if (changed) card.dataset.state = state;
+            const status = card.querySelector('.chat-quiz-status-text');
+            const nextStatus = statusText(state);
+            if (status && status.textContent !== nextStatus) {
+                status.textContent = nextStatus;
+                changed = true;
+            }
+            const buttons = card.querySelectorAll('.chat-quiz-option');
+            buttons.forEach((btn, i) => {
+                const disabled = state !== 'open';
+                const chosen = answeredIndex !== null && i === answeredIndex;
+                if (btn.disabled !== disabled) {
+                    btn.disabled = disabled;
+                    changed = true;
+                }
+                if (btn.classList.contains('chosen') !== chosen) {
+                    btn.classList.toggle('chosen', chosen);
+                    changed = true;
+                }
+            });
+            return changed;
         });
     }
 
@@ -206,13 +223,29 @@ export function createChatDecision({
     }
 
     function setRoutingCardState(card, state, chosenIndex) {
-        if (!card) return;
-        card.dataset.state = state;
-        const status = card.querySelector('.chat-quiz-status-text');
-        if (status) status.textContent = ROUTING_STATUS_TEXT[state] || 'Closed';
-        card.querySelectorAll('.chat-quiz-option').forEach((btn, i) => {
-            btn.disabled = state !== 'open';
-            btn.classList.toggle('chosen', chosenIndex !== null && i === chosenIndex);
+        if (!card) return false;
+        return onDomWrite(() => {
+            let changed = card.dataset.state !== state;
+            if (changed) card.dataset.state = state;
+            const status = card.querySelector('.chat-quiz-status-text');
+            const nextStatus = ROUTING_STATUS_TEXT[state] || 'Closed';
+            if (status && status.textContent !== nextStatus) {
+                status.textContent = nextStatus;
+                changed = true;
+            }
+            card.querySelectorAll('.chat-quiz-option').forEach((btn, i) => {
+                const disabled = state !== 'open';
+                const chosen = chosenIndex !== null && i === chosenIndex;
+                if (btn.disabled !== disabled) {
+                    btn.disabled = disabled;
+                    changed = true;
+                }
+                if (btn.classList.contains('chosen') !== chosen) {
+                    btn.classList.toggle('chosen', chosen);
+                    changed = true;
+                }
+            });
+            return changed;
         });
     }
 
@@ -308,11 +341,12 @@ export function createChatDecision({
             more.type = 'button';
             more.className = 'chat-quiz-more';
             more.textContent = `Show all ${options.length}`;
-            more.addEventListener('click', () => {
+            more.addEventListener('click', () => onDomWrite(() => {
                 optionsBox.querySelectorAll('.chat-quiz-option')
                     .forEach((btn) => { btn.hidden = false; });
                 more.remove();
-            });
+                return true;
+            }));
             card.append(more);
         }
         setRoutingCardState(card, 'open', null);
@@ -324,26 +358,30 @@ export function createChatDecision({
         // refusal renders the picker card; every other annotation state
         // settles back into the plain text ack line.
         if (!bubble) return false;
-        const cmid = String(bubble.dataset.clientMessageId || '');
-        const status = String((annotation && annotation.status) || '');
-        const token = String((annotation && annotation.routing_token) || '');
-        const options = Array.isArray(annotation && annotation.options) ? annotation.options : [];
-        const actionable = status === 'needs_manual_target' && cmid && token
-            && options.length > 0 && options.every((o) => o && typeof o === 'object');
-        if (!actionable) {
-            bubble.querySelector('.chat-routing-card')?.remove();
-            return renderRoutingAnnotation(bubble, annotation);
-        }
-        renderRoutingAnnotation(bubble, null); // the card replaces the text line
-        let card = bubble.querySelector('.chat-routing-card');
-        if (card && card.dataset.routingToken === token) return true; // same attempt
-        card?.remove();
-        card = buildRoutingCard(cmid, token, options);
-        const time = bubble.querySelector('.msg-time');
-        if (time) time.before(card);
-        else bubble.append(card);
-        bubble.dataset.chatAnnotationStatus = status;
-        return true;
+        return onDomWrite(() => {
+            const cmid = String(bubble.dataset.clientMessageId || '');
+            const status = String((annotation && annotation.status) || '');
+            const token = String((annotation && annotation.routing_token) || '');
+            const options = Array.isArray(annotation && annotation.options) ? annotation.options : [];
+            const actionable = status === 'needs_manual_target' && cmid && token
+                && options.length > 0 && options.every((o) => o && typeof o === 'object');
+            if (!actionable) {
+                const card = bubble.querySelector('.chat-routing-card');
+                card?.remove();
+                return renderRoutingAnnotation(bubble, annotation) || Boolean(card);
+            }
+            const annotationChanged = bubble.querySelector('.msg-routing-annotation')
+                ? renderRoutingAnnotation(bubble, null) : false;
+            let card = bubble.querySelector('.chat-routing-card');
+            if (card && card.dataset.routingToken === token) return annotationChanged;
+            card?.remove();
+            card = buildRoutingCard(cmid, token, options);
+            const time = bubble.querySelector('.msg-time');
+            if (time) time.before(card);
+            else bubble.append(card);
+            bubble.dataset.chatAnnotationStatus = status;
+            return true;
+        });
     }
 
     function applyQuizStateFrame(rootNode, frame) {
@@ -355,8 +393,7 @@ export function createChatDecision({
         const card = rootNode.querySelector(`.chat-quiz-card[data-quiz-id="${CSS.escape(quizId)}"]`);
         if (!card) return false;
         const index = Number.isInteger(frame.answered_index) ? frame.answered_index : null;
-        setCardState(card, String(frame.state || ''), index);
-        return true;
+        return setCardState(card, String(frame.state || ''), index);
     }
 
     return { buildQuizCard, setCardState, applyQuizStateFrame, renderRoutingDecision };

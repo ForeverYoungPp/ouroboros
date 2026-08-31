@@ -58,6 +58,11 @@ def run_media_delivery_smoke(direct_server_with_data):
         {"ts": "2026-08-30T00:00:06Z", "direction": "out", "chat_id": 1,
          "user_id": 7, "text": "raw **message** text"},
     ]
+    rows.extend({
+        "ts": f"2026-08-30T00:00:{10 + index:02d}Z",
+        "direction": "out", "chat_id": 1,
+        "text": f"Viewport filler {index} " * 18,
+    } for index in range(8))
     (logs / "chat.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8",
     )
@@ -86,6 +91,9 @@ def run_media_delivery_smoke(direct_server_with_data):
                     };
                 })()""")
                 page.goto(direct_server_with_data["url"], wait_until="domcontentloaded", timeout=30_000)
+                page.add_style_tag(
+                    content="#chat-messages, #chat-messages * { overflow-anchor: none !important; }"
+                )
                 page.wait_for_selector('.chat-media-player.is-audio', timeout=30_000)
                 page.wait_for_function(
                     "() => window.__mediaTestSockets?.some(socket => socket.readyState === 1)",
@@ -99,6 +107,11 @@ def run_media_delivery_smoke(direct_server_with_data):
                 assert page.locator('.chat-link-button').first.get_attribute("rel") == "noopener noreferrer"
                 assert page.locator('.chat-message-copy').count() >= 1
 
+                page.evaluate("""() => {
+                    const messages = document.querySelector('#chat-messages');
+                    messages.scrollTop = messages.scrollHeight;
+                    messages.dispatchEvent(new Event('scroll'));
+                }""")
                 page.evaluate("""frame => {
                     const socket = window.__mediaTestSockets
                         ?.find(candidate => candidate.readyState === 1);
@@ -118,6 +131,48 @@ def run_media_delivery_smoke(direct_server_with_data):
                 assert page.locator(
                     '[data-media-group="assistant:photos:live-ws-photo"] .chat-photo'
                 ).count() == 1
+                followed = page.evaluate("""() => {
+                    const messages = document.querySelector('#chat-messages');
+                    return messages.scrollHeight - messages.scrollTop - messages.clientHeight;
+                }""")
+                assert followed <= 6, followed
+
+                away = page.evaluate("""() => {
+                    const messages = document.querySelector('#chat-messages');
+                    messages.scrollTop = Math.max(0, messages.scrollHeight - messages.clientHeight - 300);
+                    messages.dispatchEvent(new Event('scroll'));
+                    const box = messages.getBoundingClientRect();
+                    const anchor = [...messages.children].find(node => {
+                        const rect = node.getBoundingClientRect();
+                        return rect.bottom > box.top && rect.top < box.bottom;
+                    });
+                    return {node: anchor.dataset.ts, top: anchor.getBoundingClientRect().top,
+                        remaining: messages.scrollHeight - messages.scrollTop - messages.clientHeight};
+                }""")
+                assert away["remaining"] >= 298, away
+                page.evaluate("""frame => {
+                    const socket = window.__mediaTestSockets.find(candidate => candidate.readyState === 1);
+                    socket.dispatchEvent(new MessageEvent('message', {data: JSON.stringify(frame)}));
+                }""", {
+                    "type": "photo", "role": "assistant", "chat_id": 1,
+                    "task_id": "live-ws-photo", "mime": "image/png",
+                    "image_base64": pixel_png, "ts": "2026-08-30T00:01:01Z",
+                })
+                page.wait_for_function(
+                    "() => document.querySelectorAll('[data-media-group=\"assistant:photos:live-ws-photo\"] .chat-photo').length === 2"
+                )
+                grouped = page.evaluate("""anchor => {
+                    const messages = document.querySelector('#chat-messages');
+                    const node = [...messages.children].find(candidate => candidate.dataset.ts === anchor.node);
+                    const button = document.querySelector('#chat-scroll-bottom');
+                    return {top: node.getBoundingClientRect().top,
+                        remaining: messages.scrollHeight - messages.scrollTop - messages.clientHeight,
+                        dotHidden: button.querySelector('.chat-scroll-activity-dot').hidden,
+                        dotCount: button.querySelectorAll('.chat-scroll-activity-dot').length};
+                }""", away)
+                assert abs(grouped["top"] - away["top"]) <= 6, (away, grouped)
+                assert grouped["remaining"] > 48, grouped
+                assert grouped["dotHidden"] is False and grouped["dotCount"] == 1, grouped
 
                 result = page.evaluate("""async () => {
                     const mod = await import('/static/modules/chat_media.js');

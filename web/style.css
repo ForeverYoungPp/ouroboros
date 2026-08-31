@@ -1458,50 +1458,57 @@ body.resizing-panels { user-select: none; }
     flex-shrink: 0;
 }
 
-/* Round glass "jump to newest" button — floats directly above the Send button
-   (right edges aligned), shown only when the user has scrolled up away from the
-   bottom. Anchored inside .chat-send-group (its positioning context) so it glues
-   to Send on desktop and mobile alike, regardless of textarea growth. */
+/* Quiet transcript navigation, centered above the complete two-row composer. */
 .chat-scroll-bottom-btn {
     position: absolute;
-    right: 0;
-    bottom: calc(100% + 12px);
+    left: 50%;
+    bottom: calc(100% + var(--space-2));
     z-index: 6;
-    width: 42px;
-    height: 42px;
+    width: var(--composer-control-height);
+    height: var(--composer-control-height);
     display: flex;
     align-items: center;
     justify-content: center;
     border-radius: 50%;
-    color: var(--accent-light);
-    background: rgba(26, 21, 32, 0.72);
-    border: 1px solid rgba(201, 53, 69, 0.42);
+    color: var(--text-secondary);
+    background: rgba(26, 21, 32, 0.84);
+    border: 1px solid var(--surface-border);
     backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
-    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    box-shadow: none;
     cursor: pointer;
     opacity: 0;
-    transform: translateY(8px) scale(0.9);
+    transform: translate(-50%, 8px);
     pointer-events: none;
     transition: opacity 0.18s ease, transform 0.18s ease, border-color 0.18s ease, background 0.18s ease, color 0.18s ease;
 }
 .chat-scroll-bottom-btn.visible {
     opacity: 1;
-    transform: translateY(0) scale(1);
+    transform: translate(-50%, 0);
     pointer-events: auto;
 }
 .chat-scroll-bottom-btn:hover {
-    color: #fff;
-    background: rgba(201, 53, 69, 0.16);
-    border-color: rgba(232, 93, 111, 0.6);
-    transform: translateY(0) scale(1.05);
+    color: var(--text-primary);
+    background: var(--bg-hover);
+    border-color: rgba(255, 255, 255, 0.16);
+    transform: translate(-50%, 0);
 }
 .chat-scroll-bottom-btn:focus-visible {
-    outline: none;
-    border-color: rgba(232, 93, 111, 0.6);
-    box-shadow: 0 0 0 3px rgba(201, 53, 69, 0.18);
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: 2px;
 }
 .chat-scroll-bottom-btn svg { display: block; }
+.chat-scroll-activity-dot {
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 2px var(--bg-primary);
+}
+.chat-scroll-activity-dot[hidden] { display: none; }
 
 .chat-bubble {
     padding: 10px 14px;
@@ -1928,11 +1935,16 @@ body.resizing-panels { user-select: none; }
     overflow: hidden;
 }
 
-/* P1 (v6.82): collapsed activity line under the title row. Root cards render
-   it only when a coined name holds the title (JS leaves it empty otherwise);
-   subagent cards always feed it from their routed progress. Empty ⇒ hidden, so
-   it reserves no space. Anywhere-wrap at ALL widths keeps the narrow-container
-   layout (card-local query below) safe for long URLs/paths. */
+.chat-live-card:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-title {
+    min-height: 2.9em;
+}
+
+.chat-live-card:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity {
+    min-height: 2.8em;
+}
+
+/* Root activity remains visually quiet until naming; collapsed cards still
+   reserve its two-line band. Anywhere-wrap protects narrow cards and URLs. */
 .chat-live-activity {
     color: var(--text-muted);
     font-size: 12px;
@@ -1946,7 +1958,8 @@ body.resizing-panels { user-select: none; }
 }
 
 .chat-live-card:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity:empty {
-    display: none;
+    display: -webkit-box;
+    visibility: hidden;
 }
 
 .chat-live-count {
@@ -1974,6 +1987,12 @@ body.resizing-panels { user-select: none; }
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+}
+
+.chat-live-card:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-meta {
+    min-height: 1.35em;
+    font-size: 12px;
+    line-height: 1.35;
 }
 
 .chat-live-meta-text {
@@ -2619,6 +2638,14 @@ body.resizing-panels { user-select: none; }
     color: var(--text-primary);
 }
 .md-mermaid { text-align: center; }
+.md-mermaid-stage {
+    position: fixed;
+    top: 0;
+    left: -10000px;
+    width: var(--md-mermaid-stage-width, 320px);
+    opacity: 0;
+    pointer-events: none;
+}
 .md-mermaid svg {
     display: block;
     width: auto;
@@ -3100,9 +3127,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     align-items: center;
     gap: 0;
     height: var(--composer-control-height);
-    /* Positioning context for the round "jump to newest" button, which floats
-       directly above the Send button (right edges aligned). */
-    position: relative;
 }
 
 .chat-send-group[data-busy="1"] {
@@ -6189,7 +6213,8 @@ textarea.chat-input {
 
 @media (prefers-reduced-motion: reduce) {
     .project-panel,
-    .project-panel-backdrop {
+    .project-panel-backdrop,
+    .chat-scroll-bottom-btn {
         transition: none;
     }
 }

@@ -870,10 +870,16 @@ export function renderRoutingAnnotation(bubble, annotation) {
     const text = routingAnnotationText(annotation);
     let note = bubble.querySelector('.msg-routing-annotation');
     if (!text) {
+        const hasStatus = bubble.dataset.chatAnnotationStatus !== undefined;
+        if (!note && !hasStatus) return false;
         note?.remove();
-        delete bubble.dataset.chatAnnotationStatus;
-        return false;
+        if (hasStatus) delete bubble.dataset.chatAnnotationStatus;
+        return true;
     }
+    const status = String(annotation.status || '');
+    const changed = !note || note.textContent !== text
+        || note.dataset.annotationStatus !== status
+        || bubble.dataset.chatAnnotationStatus !== status;
     if (!note) {
         note = document.createElement('div');
         note.className = 'msg-routing-annotation';
@@ -881,9 +887,8 @@ export function renderRoutingAnnotation(bubble, annotation) {
         if (time) time.before(note);
         else bubble.append(note);
     }
-    const status = String(annotation.status || '');
-    note.textContent = text;
-    note.dataset.annotationStatus = status;
-    bubble.dataset.chatAnnotationStatus = status;
-    return true;
+    if (note.textContent !== text) note.textContent = text;
+    if (note.dataset.annotationStatus !== status) note.dataset.annotationStatus = status;
+    if (bubble.dataset.chatAnnotationStatus !== status) bubble.dataset.chatAnnotationStatus = status;
+    return changed;
 }

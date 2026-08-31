@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -300,10 +299,11 @@ const flushAsync = () => new Promise((resolve) => setTimeout(resolve, 0));
 test('wiring: expanding a reference row fetches once; re-expand reuses the load', async () => {
     const stub = makeBubble({ skill: 'alpha', jobId: 'j1' });
     let fetches = 0;
-    let repaints = 0;
-    assert.equal(wireSkillReviewDisclosure(stub.bubble, () => { repaints += 1; }, {
+    let writes = 0;
+    assert.equal(wireSkillReviewDisclosure(stub.bubble, {
         fetchImpl: async () => { fetches += 1; return okResponse('full body'); },
         render: (markdown) => markdown,
+        onDomWrite(mutate) { writes += 1; return mutate(); },
     }), true);
     const click = stub.listeners.get('toggle:click');
     click();               // expand → lazy fetch
@@ -317,13 +317,13 @@ test('wiring: expanding a reference row fetches once; re-expand reuses the load'
     click();               // re-expand: no refetch
     await flushAsync();
     assert.equal(fetches, 1);
-    assert.ok(repaints >= 3);
+    assert.ok(writes >= 3, 'expand plus loading/final detail writes use the injected boundary');
 });
 
 test('wiring: legacy rows toggle locally and never fetch', async () => {
     const stub = makeBubble();
     let fetches = 0;
-    wireSkillReviewDisclosure(stub.bubble, () => {}, {
+    wireSkillReviewDisclosure(stub.bubble, {
         fetchImpl: async () => { fetches += 1; return okResponse('x'); },
     });
     stub.listeners.get('toggle:click')();
@@ -338,7 +338,7 @@ test('wiring: legacy rows toggle locally and never fetch', async () => {
 test('wiring: Retry click clears the error state and refetches', async () => {
     const stub = makeBubble({ skill: 'alpha', jobId: 'j1' });
     let attempts = 0;
-    wireSkillReviewDisclosure(stub.bubble, () => {}, {
+    wireSkillReviewDisclosure(stub.bubble, {
         fetchImpl: async () => {
             attempts += 1;
             if (attempts === 1) throw new Error('network down');
@@ -359,13 +359,5 @@ test('wiring: Retry click clears the error state and refetches', async () => {
 
 test('wiring: non-review bubbles are left untouched', () => {
     const bubble = { querySelector: () => null };
-    assert.equal(wireSkillReviewDisclosure(bubble, () => {}), false);
-});
-
-test('chat layout callback ignores late skill-review completion after destroy', () => {
-    const source = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    assert.match(
-        source,
-        /wireSkillReviewDisclosure\(bubble,[\s\S]*?requestAnimationFrame\(\s*\(\) => !destroyed && updateMessagesPadding/,
-    );
+    assert.equal(wireSkillReviewDisclosure(bubble), false);
 });

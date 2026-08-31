@@ -225,6 +225,6 @@ test('live structured delivery frames keep additive grouping and size fields', (
     assert.match(chat, /msg\.msg_type === 'quiz'\) appendQuizMessage\(msg\)/);
     // The card gets the SAME sanitizing markdown pipeline as assistant bubbles.
     assert.match(chat, /renderMarkdown: renderChatMarkdown/);
-    assert.match(chat, /enhanceMarkdown: enhanceChatMarkdown/);
+    assert.match(chat, /enhanceMarkdown: enhanceMountedMarkdown/);
     assert.match(contracts, /WS_MESSAGE_TYPES[\s\S]*?"links"/);
 });

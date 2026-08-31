@@ -2462,6 +2462,17 @@ commit.
 - Floating chrome combines gradient and masked backdrop blur so the blur edge
   does not become a visible seam. The chat composer intentionally keeps blur on
   the input surface and reserves measured message padding around the dock.
+- **Chat viewport invariant:** sample live-edge intent before an ordinary
+  transcript mutation; follow only inside the 48 CSS-pixel zone, otherwise
+  preserve the visible keyed message, nested-card, or Reviews anchor. Route late
+  application-controlled DOM writes through the existing stable-viewport seam,
+  but keep awaited Load-older, reconnect reconciliation, browser-visibility
+  return, and cross-instance restoration as explicit lifecycle transactions. Native scroll
+  anchoring is not proof of this contract: focused regressions disable it. Keep
+  local viewport preservation separate from the remote activity marker, and do
+  not add generic observers or competing `scrollTop` writers without a
+  reproduced gap. Browser coverage is chosen by risk; this WebKit-sensitive
+  contract requires the engines exercised by its marker-gated UI smoke.
 
 ### Responsive and accessible behavior
 

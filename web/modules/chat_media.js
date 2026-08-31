@@ -676,6 +676,7 @@ export function createChatMedia({
         buildQuizCard,
         applyQuizStateFrame,
         messagesRoot,
+        deliverContentMutation = (mutate) => mutate(),
     }) {
         function appendMediaBubble(msg) {
             const key = chatMediaMessageKey(msg);
@@ -683,9 +684,8 @@ export function createChatMedia({
             const bubble = buildMediaBubble(msg);
             if (!bubble) return false;
             rememberMessageKey(key);
-            if ((msg.msg_type || msg.type) === 'photo') buildGallery('photos', msg, bubble);
-            else insertMessageNode(bubble);
-            return true;
+            if ((msg.msg_type || msg.type) === 'photo') return buildGallery('photos', msg, bubble);
+            return insertMessageNode(bubble) !== false;
         }
         function appendDocumentBubble(msg) {
             const key = documentMessageKey(msg);
@@ -693,8 +693,7 @@ export function createChatMedia({
             const bubble = buildDocumentBubble(msg);
             if (!bubble) return false;
             rememberMessageKey(key);
-            buildGallery('files', msg, bubble);
-            return true;
+            return buildGallery('files', msg, bubble);
         }
         function appendLinksMessage(msg) {
             const actions = Array.isArray(msg.actions) ? msg.actions.slice(0, MAX_LINK_ACTIONS) : [];
@@ -703,8 +702,7 @@ export function createChatMedia({
             const bubble = buildLinksMessage(msg);
             if (!bubble) return false;
             rememberMessageKey(key);
-            insertMessageNode(bubble);
-            return true;
+            return insertMessageNode(bubble) !== false;
         }
         function appendQuizMessage(msg) {
             const quizId = String((msg.quiz && msg.quiz.quiz_id) || msg.quiz_id || '');
@@ -713,8 +711,7 @@ export function createChatMedia({
             const bubble = buildQuizCard ? buildQuizCard(msg) : null;
             if (!bubble) return false;
             rememberMessageKey(key);
-            insertMessageNode(bubble);
-            return true;
+            return insertMessageNode(bubble) !== false;
         }
         // Media frames carry no activity identity: hide the dots row but keep
         // the authoritative active set intact; sync derives the header from it.
@@ -722,7 +719,7 @@ export function createChatMedia({
             if (!isMyThread(msg)) return;
             hideTypingIndicatorOnly();
             syncChatStatus();
-            if (append(msg)) incrementUnreadIfNeeded(msg);
+            if (deliverContentMutation(() => append(msg))) incrementUnreadIfNeeded(msg);
         };
         for (const type of ['photo', 'video']) onWs(type, deliver(appendMediaBubble));
         onWs('document', deliver(appendDocumentBubble));
@@ -731,7 +728,9 @@ export function createChatMedia({
         if (applyQuizStateFrame && messagesRoot) {
             // Lifecycle updates address an EXISTING card by quiz_id — no
             // thread routing, no unread bump, never a new bubble.
-            onWs('quiz_state', (msg) => applyQuizStateFrame(messagesRoot(), msg));
+            onWs('quiz_state', (msg) => deliverContentMutation(
+                () => applyQuizStateFrame(messagesRoot(), msg),
+            ));
         }
         return { appendMediaBubble, appendDocumentBubble, appendLinksMessage, appendQuizMessage };
     }

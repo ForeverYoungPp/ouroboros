@@ -56,7 +56,18 @@ class NodeStub {
     querySelectorAll(selector) { return this.collect(selector.replace(/^\./, '')); }
 }
 
-function fixture({ fetchImpl, renderMarkdown } = {}) {
+function countPropertyWrites(target, key) {
+    let value = target[key];
+    let writes = 0;
+    Object.defineProperty(target, key, {
+        configurable: true,
+        get: () => value,
+        set: (next) => { writes += 1; value = next; },
+    });
+    return () => writes;
+}
+
+function fixture({ fetchImpl, renderMarkdown, onDomWrite } = {}) {
     const prior = { document: globalThis.document, crypto: globalThis.crypto };
     globalThis.document = { createElement: (tag) => new NodeStub(tag) };
     if (!globalThis.crypto || !globalThis.crypto.randomUUID) {
@@ -76,6 +87,7 @@ function fixture({ fetchImpl, renderMarkdown } = {}) {
         renderMarkdown,
         enhanceMarkdown: renderMarkdown ? () => {} : null,
         showToast: (text, tone) => toasts.push({ text, tone }),
+        onDomWrite,
     });
     return { decision, toasts, calls, restore: () => {
         globalThis.document = prior.document;
@@ -279,6 +291,19 @@ test('applyQuizStateFrame settles an existing card and ignores unknown ids', asy
         assert.ok(buttons.length >= 2);
         assert.ok(buttons.every((btn) => btn.disabled));
         assert.ok(buttons[0].classList.contains('chosen'));
+        const stateWrites = countPropertyWrites(quizCard.dataset, 'state');
+        const disabledWrites = buttons.map((btn) => countPropertyWrites(btn, 'disabled'));
+        let chosenWrites = 0;
+        for (const btn of buttons) {
+            const toggle = btn.classList.toggle.bind(btn.classList);
+            btn.classList.toggle = (...args) => { chosenWrites += 1; return toggle(...args); };
+        }
+        assert.equal(fx.decision.applyQuizStateFrame(root, {
+            quiz_id: 'qz-1', task_id: 't-1', state: 'answered', answered_index: 0,
+        }), false, 'an identical acknowledgement performs no DOM mutation');
+        assert.equal(stateWrites(), 0);
+        assert.ok(disabledWrites.every((writes) => writes() === 0));
+        assert.equal(chosenWrites, 0);
 
         // Unknown id: no card found, nothing thrown, honest false.
         assert.equal(fx.decision.applyQuizStateFrame(root, { quiz_id: 'other', state: 'answered' }), false);
@@ -308,6 +333,7 @@ test('an actionable refusal renders the picker card; other statuses fall back to
     try {
         const bubble = routingBubble();
         assert.equal(fx.decision.renderRoutingDecision(bubble, ROUTING_ANNOTATION), true);
+        assert.equal(fx.decision.renderRoutingDecision(bubble, ROUTING_ANNOTATION), false);
         const card = bubble.querySelector('.chat-routing-card');
         assert.ok(card);
         assert.equal(card.dataset.state, 'open');
@@ -317,11 +343,24 @@ test('an actionable refusal renders the picker card; other statuses fall back to
         assert.equal(buttons[1].querySelector('.chat-quiz-option-label').textContent, 'New task in Web');
         // A later settled annotation (the dispatch ack) REPLACES the card
         // with the plain text line — the card never lingers past its attempt.
-        fx.decision.renderRoutingDecision(bubble, {
+        const settled = {
             status: 'delivered', action: 'steer_task', target: 't1', target_label: 'Fix CI',
-        });
+        };
+        assert.equal(fx.decision.renderRoutingDecision(bubble, settled), true);
+        const note = bubble.querySelector('.msg-routing-annotation');
+        const textWrites = countPropertyWrites(note, 'textContent');
+        const noteStatusWrites = countPropertyWrites(note.dataset, 'annotationStatus');
+        const bubbleStatusWrites = countPropertyWrites(bubble.dataset, 'chatAnnotationStatus');
+        assert.equal(fx.decision.renderRoutingDecision(bubble, settled), false);
+        assert.deepEqual(
+            [textWrites(), noteStatusWrites(), bubbleStatusWrites()], [0, 0, 0],
+        );
         assert.equal(bubble.querySelector('.chat-routing-card'), null);
         assert.match(bubble.querySelector('.msg-routing-annotation').textContent, /Steered task/);
+        assert.equal(fx.decision.renderRoutingDecision(bubble, null), true);
+        assert.equal(bubble.querySelector('.msg-routing-annotation'), null);
+        assert.equal(bubble.dataset.chatAnnotationStatus, undefined);
+        assert.equal(fx.decision.renderRoutingDecision(bubble, null), false);
     } finally { fx.restore(); }
 });
 
@@ -363,7 +402,8 @@ test('a routing 409 settles the card from the body state, never a false expiry',
 });
 
 test('more than eight options hide behind a show-all control', () => {
-    const fx = fixture();
+    let writes = 0;
+    const fx = fixture({ onDomWrite: (mutate) => { writes += 1; return mutate(); } });
     try {
         const bubble = routingBubble('cm-4');
         const wide = {
@@ -378,7 +418,9 @@ test('more than eight options hide behind a show-all control', () => {
         assert.equal(buttons.filter((btn) => btn.hidden).length, 3);
         const more = card.querySelector('.chat-quiz-more');
         assert.match(more.textContent, /11/);
+        const beforeClick = writes;
         more.click();
+        assert.equal(writes, beforeClick + 1);
         assert.equal(buttons.filter((btn) => btn.hidden).length, 0);
         assert.equal(card.querySelector('.chat-quiz-more'), null);
     } finally { fx.restore(); }
