@@ -959,12 +959,20 @@ def _execute_with_timeout(
         except (TimeoutError, concurrent.futures.TimeoutError):
             detached_browser_handles = None
             on_settled: Optional[Callable[[], None]] = None
-            if use_stateful and tool_ctx is not None:
+            if tool_ctx is not None:  # stateful branch: use_stateful is already true here
                 from ouroboros.tools.browser import (
                     _detach_browser,
                     cleanup_browser_handles,
                 )
 
+                # CROSS-THREAD INVARIANT (#409): Playwright objects are bound
+                # to the worker thread that created them. This main-thread
+                # path may only DETACH the handles from the context — never
+                # call close()/stop() here (a cross-thread stop() kills the
+                # driver under the hung worker and turns its dispatcher wait
+                # into a CPU busy-loop). The close happens in the settlement
+                # callback below, which the executor runs on the worker
+                # thread that owns the handles.
                 detached_browser_handles = _detach_browser(tool_ctx)
                 def _cleanup_detached_browser() -> None:
                     if detached_browser_handles is not None:

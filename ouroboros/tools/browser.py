@@ -607,7 +607,12 @@ def _detach_browser(ctx: ToolContext) -> tuple[Any, Any, Any, Any]:
 
 
 def cleanup_browser_handles(handles: tuple[Any, Any, Any, Any]) -> None:
-    """Close detached Playwright handles on the thread that owns them."""
+    """Close detached Playwright handles.
+
+    Thread-affinity is the CALLER's contract: Playwright objects are bound to
+    the thread that created them, so call this from that owner thread (the
+    late-settlement callback runs on the worker that finished the call). A
+    cross-thread close is swallowed but leaks the browser process."""
     page, browser_context, browser, pw_instance = handles
     try:
         if page is not None:

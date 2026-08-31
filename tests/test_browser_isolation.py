@@ -674,13 +674,31 @@ class TestCleanupBrowser:
         assert ctx.browser_state.browser is None
         assert ctx.browser_state.pw_instance is None
 
-    def test_cleanup_detached_handles_runs_on_owner_thread(self):
+    def test_cleanup_detached_handles_closes_in_order_on_the_calling_thread(self):
+        # Thread-affinity is the CALLER's contract (the settlement callback
+        # runs on the worker thread that owns the handles); this test pins
+        # the close order and records the executing thread honestly.
+        import threading
+
         calls = []
+        threads = set()
+
+        def _mark(name):
+            def _inner():
+                threads.add(threading.get_ident())
+                calls.append(name)
+            return _inner
+
         handles = (
-            types.SimpleNamespace(close=lambda: calls.append("page")),
-            types.SimpleNamespace(close=lambda: calls.append("context")),
-            types.SimpleNamespace(close=lambda: calls.append("browser")),
-            types.SimpleNamespace(stop=lambda: calls.append("playwright")),
+            types.SimpleNamespace(close=_mark("page")),
+            types.SimpleNamespace(close=_mark("context")),
+            types.SimpleNamespace(close=_mark("browser")),
+            types.SimpleNamespace(stop=_mark("playwright")),
         )
-        cleanup_browser_handles(handles)
+        worker = threading.Thread(target=cleanup_browser_handles, args=(handles,))
+        worker.start()
+        worker.join()
         assert calls == ["page", "context", "browser", "playwright"]
+        # Every close ran on the SAME (calling) thread — never hopped back
+        # to the main thread.
+        assert threads == {worker.ident}
