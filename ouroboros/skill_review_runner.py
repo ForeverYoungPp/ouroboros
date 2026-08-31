@@ -847,7 +847,7 @@ def _outcome_payload(
     job_data: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     status = normalize_skill_review_status(outcome.status)
-    gate = skill_review_gate(status)
+    gate = skill_review_gate(status, findings=outcome.findings)
     payload: Dict[str, Any] = {
         "skill": outcome.skill_name,
         "status": status,
