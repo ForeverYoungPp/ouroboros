@@ -1621,11 +1621,13 @@ def test_run_llm_loop_appends_orphan_note_when_finalizing_with_unhandled_child(t
 
     def fake_call_llm_with_retry(_llm, _request_messages, *_args, **_kwargs):
         calls["count"] += 1
-        # The agent never absorbs/discards the child; after the service reminder it
-        # explicitly keeps the retained complete answer.
+        # The agent never absorbs/discards the child; it keeps through the
+        # handoff control round, then answers the absorption reminder with
+        # prose (the absorption round HOLDS the candidate — no JSON
+        # instruction rides that round, so a typed keep is not requested).
         if calls["count"] == 1:
             content = "child1 is still running; I will finalize now."
-        elif calls["count"] in {2, 3}:
+        elif calls["count"] == 2:
             content = '{"delivery_control":"keep"}'
         else:
             content = "Best effort: child1 is still running."
@@ -1668,6 +1670,7 @@ def test_run_llm_loop_forces_best_effort_after_child_absorption_reminder(tmp_pat
     )
     messages = [{"role": "user", "content": "inspect"}]
     calls = {"count": 0}
+    seen_requests = []
     progress = []
     tools = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     tools._ctx.task_contract = {"delegation_budget": {"may_delegate": True, "may_fan_out": True}}
@@ -1676,9 +1679,17 @@ def test_run_llm_loop_forces_best_effort_after_child_absorption_reminder(tmp_pat
         def default_model(self):
             return "test-model"
 
-    def fake_call_llm_with_retry(_llm, _request_messages, *_args, **_kwargs):
+    def fake_call_llm_with_retry(_llm, request_messages, *_args, **_kwargs):
         calls["count"] += 1
-        content = f"answer {calls['count']}" if calls["count"] in {1, 4} else '{"delivery_control":"keep"}'
+        seen_requests.append([dict(m) for m in request_messages])
+        # Call 2 answers the handoff control round with a typed keep; the
+        # absorption round HOLDS the candidate (no JSON instruction), so the
+        # reminder round is answered with prose like any ordinary round.
+        content = (
+            '{"delivery_control":"keep"}'
+            if calls["count"] == 2
+            else f"answer {calls['count']}"
+        )
         return {"role": "assistant", "content": content}, 0.0
 
     monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call_llm_with_retry)
@@ -1700,6 +1711,21 @@ def test_run_llm_loop_forces_best_effort_after_child_absorption_reminder(tmp_pat
     assert "Child absorption reminder injected" in "\n".join(trace["reasoning_notes"])
     assert "child task(s) not explicitly absorbed" in result
     assert calls["count"] == 4
+    # D2a: the absorption reminder round holds instead of arming — the new
+    # messages of that round carry the reminder and NOT the JSON instruction
+    # (the earlier handoff-armed instruction legitimately stays in history).
+    absorption_round_delta = seen_requests[2][len(seen_requests[1]):]
+    delta_text = "\n".join(
+        str(m.get("content") or "") for m in absorption_round_delta
+    )
+    assert "[CHILD_ABSORPTION_REQUIRED]" in delta_text
+    assert "[DELIVERY_FINALIZATION_CONTROL]" not in delta_text
+    # D2b: the forced prompt names the CURRENT child listing, not a guess.
+    forced_round_text = "\n".join(
+        str(m.get("content") or "") for m in seen_requests[3]
+    )
+    assert "[FINALIZE_WITH_UNABSORBED_CHILDREN]" in forced_round_text
+    assert "child1 [running]" in forced_round_text
 
 
 def test_run_llm_loop_does_not_include_current_subagent_in_own_handoff(tmp_path, monkeypatch):

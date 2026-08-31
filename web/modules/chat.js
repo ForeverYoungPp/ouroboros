@@ -1,14 +1,13 @@
-import {
-    escapeHtmlAttr,
-    escapeHtmlText as escapeHtml,
-    renderMarkdown,
-} from './utils.js';
+import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
+import { destroyChatMarkdown, enhanceChatMarkdown, renderChatMarkdown } from './chat_markdown.js';
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
-import { createSystemMessageAction, downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
+import { createSystemMessageAction } from './ui_helpers.js';
+import { createChatMedia } from './chat_media.js';
 import { clientSurfaceField } from './client_surface.js';
 import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
+import { MAX_LINK_ACTIONS } from './api_types.js';
 import {
     OWNER_STOP_DETAIL_MARKER,
     getLogTaskGroupId,
@@ -284,6 +283,14 @@ export function createChatInstance({
     // Every ws.on subscription's disposer, released together in destroy().
     const wsDisposers = [];
     const onWs = (event, fn) => wsDisposers.push(ws.on(event, fn));
+    const chatMedia = createChatMedia({
+        chatSessionId,
+        durableChatMediaUrl,
+        formatMsgTime,
+        insertMessageNode,
+        senderLabel,
+        stampNodeTimestamp,
+    });
 
     async function loadUiPreferences() {
         try {
@@ -2791,9 +2798,9 @@ export function createChatInstance({
         }, chatSessionId);
         const rendered = role === 'user'
             ? escapeHtml(text)
-            : (role === 'system' && systemType === 'skill_review'
+            : role === 'system' && systemType === 'skill_review'
                 ? renderSkillReviewDisclosure(text, opts.skillReview || null)
-                : renderMarkdown(text));
+                : renderChatMarkdown(text);
         const timeFmt = formatMsgTime(ts);
         const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
         const pendingHtml = pending ? `<div class="msg-pending">Queued until reconnect</div>` : '';
@@ -2803,6 +2810,7 @@ export function createChatInstance({
             ${pendingHtml}
             ${timeHtml}
         `;
+        if (!isProgress && text) chatMedia.attachCopyControl(bubble, String(text));
         if (PROJECT_ROW_TYPES.has(systemType) && projectId) {
             const actions = document.createElement('div');
             actions.className = 'system-message-actions';
@@ -2817,6 +2825,7 @@ export function createChatInstance({
         wireSkillReviewDisclosure(bubble, () => requestAnimationFrame(() => !destroyed && updateMessagesPadding({ preserveStickiness: true })));
         stampNodeTimestamp(bubble, ts);
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
+        if (role !== 'user' && systemType !== 'skill_review') enhanceChatMarkdown(bubble);
         renderRoutingAnnotation(bubble, opts.chatAnnotation);
         rememberMessageKey(messageKey);
         if (pending && clientMessageId) pendingUserBubbles.set(clientMessageId, bubble);
@@ -3026,6 +3035,7 @@ export function createChatInstance({
                     localEchoJournal.delete(entry.clientMessageId);
                 }
                 if (rebuildAll) {
+                    chatMedia.reset();
                     // The cards below are a new presentation generation. Keep
                     // hydrator single-flight/pending state, but let an already
                     // applied durable Plan revision attach to the rebuilt card.
@@ -3047,7 +3057,10 @@ export function createChatInstance({
                     // state so the rebuild below cannot produce duplicates even if
                     // stale bubbles lingered in the DOM. Keep the typing indicator.
                     for (const bubble of Array.from(messagesDiv.querySelectorAll('.chat-bubble'))) {
-                        if (!bubble.classList.contains('typing-bubble')) bubble.remove();
+                        if (!bubble.classList.contains('typing-bubble')) {
+                            destroyChatMarkdown(bubble);
+                            bubble.remove();
+                        }
                     }
                     seenMessageKeys.clear();
                     messageKeyOrder.length = 0;
@@ -3135,8 +3148,9 @@ export function createChatInstance({
                     // message — render it BEFORE the taskId/finishLiveCard block so
                     // a mid-task delivery replayed while its task is still
                     // running does not falsely finalize that task's live card.
-                    if (msg.msg_type === 'document' || msg.msg_type === 'photo' || msg.msg_type === 'video') {
+                    if (msg.msg_type === 'document' || msg.msg_type === 'photo' || msg.msg_type === 'video' || msg.msg_type === 'links') {
                         if (msg.msg_type === 'document') appendDocumentBubble(msg);
+                        else if (msg.msg_type === 'links') appendLinksMessage(msg);
                         else appendMediaBubble(msg);
                         continue;
                     }
@@ -4341,49 +4355,7 @@ export function createChatInstance({
         }
     });
 
-    function buildMediaBubble(msg) {
-        const type = msg.msg_type || msg.type;
-        if (type !== 'photo' && type !== 'video') return null;
-        const role = msg.role === 'user' ? 'user' : 'assistant';
-        const sender = role === 'user'
-            ? senderLabel('user', false, '', {
-                source: msg.source || '',
-                senderLabel: msg.sender_label || '',
-                senderSessionId: msg.sender_session_id || '',
-            }, chatSessionId)
-            : 'Ouroboros';
-        const bubble = document.createElement('div');
-        bubble.className = `chat-bubble ${role}`;
-        const rawTs = msg.ts || new Date().toISOString();
-        const timeFmt = formatMsgTime(rawTs);
-        const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
-        const captionHtml = msg.caption ? `<div class="message">${escapeHtml(msg.caption)}</div>` : '';
-        const fallbackMime = type === 'photo' ? 'image/png' : 'video/mp4';
-        const mimePattern = type === 'photo' ? /^image\/[a-z0-9.+-]+$/i : /^video\/[a-z0-9.+-]+$/i;
-        const mime = mimePattern.test(String(msg.mime || '')) ? String(msg.mime) : fallbackMime;
-        const base64Value = type === 'photo' ? msg.image_base64 : msg.video_base64;
-        const mediaBase64 = /^[A-Za-z0-9+/=\s]+$/.test(String(base64Value || ''))
-            ? String(base64Value || '').replace(/\s+/g, '')
-            : '';
-        const durableUrl = durableChatMediaUrl(msg.download_url);
-        const mediaUrl = mediaBase64 ? `data:${mime};base64,${mediaBase64}` : durableUrl;
-        if (!mediaUrl) return null;
-        const mediaHtml = type === 'photo'
-            ? `<img class="chat-photo" src="${escapeHtmlAttr(mediaUrl)}" alt="Photo attachment">`
-            : `<video class="chat-video" src="${escapeHtmlAttr(mediaUrl)}" controls></video>`;
-        bubble.innerHTML = `
-            <div class="sender">${escapeHtml(sender)}</div>
-            ${captionHtml}
-            <div class="message">${mediaHtml}</div>
-            ${timeHtml}
-        `;
-        const img = bubble.querySelector('.chat-photo');
-        if (img) {
-            img.addEventListener('click', () => window.open(mediaUrl, '_blank'));
-        }
-        stampNodeTimestamp(bubble, rawTs);
-        return bubble;
-    }
+    const buildMediaBubble = (msg) => chatMedia.buildMediaBubble(msg);
 
     function appendMediaBubble(msg) {
         const key = chatMediaMessageKey(msg);
@@ -4391,7 +4363,8 @@ export function createChatInstance({
         const bubble = buildMediaBubble(msg);
         if (!bubble) return false;
         rememberMessageKey(key);
-        insertMessageNode(bubble);
+        if ((msg.msg_type || msg.type) === 'photo') chatMedia.buildGallery('photos', msg, bubble);
+        else insertMessageNode(bubble);
         return true;
     }
 
@@ -4404,99 +4377,15 @@ export function createChatInstance({
         if (appendMediaBubble(msg)) incrementUnreadIfNeeded(msg);
     });
 
-    // Shared document-bubble builder for both live WS frames and history replay.
-    // Download priority: a durable server download_url routed through
-    // downloadViaHostBridge (desktop host-bridge saves to Downloads instead of
-    // navigating the WKWebView fullscreen; browser falls back to fetch+blob),
-    // else an in-memory base64 blob (live-only), else a disabled label.
-    function buildDocumentBubble(msg) {
-        const role = msg.role === 'user' ? 'user' : 'assistant';
-        const sender = role === 'user'
-            ? senderLabel('user', false, '', {
-                source: msg.source || '',
-                senderLabel: msg.sender_label || '',
-                senderSessionId: msg.sender_session_id || '',
-            }, chatSessionId)
-            : 'Ouroboros';
-        const bubble = document.createElement('div');
-        bubble.className = `chat-bubble ${role}`;
-        const rawTs = msg.ts || new Date().toISOString();
-        const timeFmt = formatMsgTime(rawTs);
-        const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
-        const captionHtml = msg.caption ? `<div class="message">${escapeHtml(msg.caption)}</div>` : '';
-        const mime = /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/.test(String(msg.mime || ''))
-            ? String(msg.mime)
-            : 'application/octet-stream';
-        const fileBase64 = /^[A-Za-z0-9+/=\s]+$/.test(String(msg.file_base64 || ''))
-            ? String(msg.file_base64 || '').replace(/\s+/g, '')
-            : '';
-        const downloadUrl = /^\/api\/files\/download\?/.test(String(msg.download_url || ''))
-            ? String(msg.download_url)
-            : '';
-        const filename = String(msg.filename || 'file').replace(/[\r\n]+/g, ' ').slice(0, 200);
-        const canDownload = Boolean(downloadUrl || fileBase64);
-        // Body click = open in default OS app (external window); a separate ↓
-        // button saves to ~/Downloads. Both degrade to a base64 blob when only
-        // the live payload is present (no durable server URL to hand the bridge).
-        const openHtml = canDownload
-            ? `<button type="button" class="chat-file" data-open="1">📎 ${escapeHtml(filename)}</button>`
-            : `<span class="chat-file chat-file-empty">📎 ${escapeHtml(filename)}</span>`;
-        const downloadHtml = canDownload
-            ? `<button type="button" class="chat-file-download" data-download="1" title="Download" aria-label="Download">↓</button>`
-            : '';
-        bubble.innerHTML = `
-            <div class="sender">${escapeHtml(sender)}</div>
-            ${captionHtml}
-            <div class="message"><div class="chat-file-row">${openHtml}${downloadHtml}</div></div>
-            ${timeHtml}
-        `;
-        const saveBlobFallback = () => {
-            const bytes = Uint8Array.from(atob(fileBase64), (c) => c.charCodeAt(0));
-            const blobUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
-            const tmp = document.createElement('a');
-            Object.assign(tmp, { href: blobUrl, download: filename, rel: 'noopener' });
-            document.body.appendChild(tmp);
-            tmp.click();
-            tmp.remove();
-            setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-        };
-        const openBtn = bubble.querySelector('.chat-file[data-open]');
-        if (openBtn && canDownload) {
-            openBtn.addEventListener('click', async () => {
-                try {
-                    if (downloadUrl) {
-                        await openViaHostBridge(downloadUrl, filename);
-                        return;
-                    }
-                    saveBlobFallback();
-                } catch (err) {
-                    showToast(`Could not open file: ${err && err.message ? err.message : err}`, 'error');
-                }
-            });
-        }
-        const dlBtn = bubble.querySelector('.chat-file-download[data-download]');
-        if (dlBtn && canDownload) {
-            dlBtn.addEventListener('click', async () => {
-                try {
-                    if (downloadUrl) {
-                        await downloadViaHostBridge(downloadUrl, filename);
-                        return;
-                    }
-                    saveBlobFallback();
-                } catch (err) {
-                    showToast(`Could not download file: ${err && err.message ? err.message : err}`, 'error');
-                }
-            });
-        }
-        stampNodeTimestamp(bubble, rawTs);
-        return bubble;
-    }
+    const buildDocumentBubble = (msg) => chatMedia.buildDocumentBubble(msg);
 
     function appendDocumentBubble(msg) {
         const key = documentMessageKey(msg);
         if (key && seenMessageKeys.has(key)) return false;
+        const bubble = buildDocumentBubble(msg);
+        if (!bubble) return false;
         rememberMessageKey(key);
-        insertMessageNode(buildDocumentBubble(msg));
+        chatMedia.buildGallery('files', msg, bubble);
         return true;
     }
 
@@ -4505,6 +4394,24 @@ export function createChatInstance({
         hideTypingIndicatorOnly();
         syncChatStatus();
         if (appendDocumentBubble(msg)) incrementUnreadIfNeeded(msg);
+    });
+
+    function appendLinksMessage(msg) {
+        const actions = Array.isArray(msg.actions) ? msg.actions.slice(0, MAX_LINK_ACTIONS) : [];
+        const key = `links:${msg.task_id || ''}:${msg.ts || ''}:${JSON.stringify(actions)}:${msg.title || ''}`;
+        if (seenMessageKeys.has(key)) return false;
+        const bubble = chatMedia.buildLinksMessage(msg);
+        if (!bubble) return false;
+        rememberMessageKey(key);
+        insertMessageNode(bubble);
+        return true;
+    }
+
+    onWs('links', (msg) => {
+        if (!isMyThread(msg)) return;
+        hideTypingIndicatorOnly();
+        syncChatStatus();
+        if (appendLinksMessage(msg)) incrementUnreadIfNeeded(msg);
     });
 
     let wsHasConnectedOnce = false;
@@ -4594,6 +4501,7 @@ export function createChatInstance({
                 try { dispose(); } catch {}
             }
             wsDisposers.length = 0;
+            chatMedia.destroy();
             window.removeEventListener('ouro:page-shown', handlePageShown);
             document.removeEventListener('visibilitychange', handleVisibilityChange);
             if (documentClickHandler) document.removeEventListener('click', documentClickHandler);
@@ -4625,7 +4533,7 @@ export function createChatInstance({
             seenMessageKeys.clear();
             messageKeyOrder.length = 0;
             persistedHistory.length = 0;
-            try { page.remove(); } catch {}
+            try { destroyChatMarkdown(page); page.remove(); } catch {}
         },
     };
 }

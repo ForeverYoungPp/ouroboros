@@ -375,6 +375,49 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
     summary: Dict[str, Any] = {
         "outcome_axes": normalize_outcome_axes(data),
     }
+    # R5: CURRENT delegated-custody reconciliation state next to the historical
+    # axes, on the full single-child handoff surfaces only (get_task_result /
+    # wait_task — wait_tasks' batch projection is a pinned compact contract).
+    # The frozen delegated_runs_* counters are a historical snapshot (owner
+    # Q2=B); the envelope's trigger + open_run_ids are the liveness surface a
+    # parent can trust after a refresh/backfill healed the row. One bounded
+    # entry: capped lists with an exact omitted count.
+    unreconciled = data.get("delegated_runs_unreconciled")
+    unreconciled = (
+        [str(item) for item in unreconciled] if isinstance(unreconciled, list) else []
+    )
+    envelope = data.get("delegate_terminal_reconciliation")
+    envelope = envelope if isinstance(envelope, dict) else {}
+    if unreconciled or envelope:
+        custody: Dict[str, Any] = {"unreconciled": unreconciled[:10]}
+        omitted_any = False
+        if len(unreconciled) > 10:
+            custody["unreconciled_omitted"] = len(unreconciled) - 10
+            omitted_any = True
+        if envelope:
+            open_ids = envelope.get("open_run_ids")
+            open_ids = [str(item) for item in open_ids] if isinstance(open_ids, list) else []
+            custody["trigger"] = str(envelope.get("trigger") or "")
+            custody["open_run_ids"] = open_ids[:10]
+            if len(open_ids) > 10:
+                custody["open_run_ids_omitted"] = len(open_ids) - 10
+                omitted_any = True
+        if omitted_any:
+            # A bound must name a source the actor can resolve (BIBLE P1).
+            # Retry lineage unions the ORIGINAL row's disclosure into this
+            # projection, so the omitted identifiers may live on either row —
+            # name both when the lineage exists.
+            tid = str(data.get("task_id") or "")
+            origin = str(
+                data.get("original_task_id") or data.get("timeout_retry_from") or ""
+            )
+            paths = [f"task_results/{tid}.json"]
+            if origin and origin != tid:
+                paths.append(f"task_results/{origin}.json")
+            custody["full_source"] = [
+                f"read_file(root='runtime_data', path='{p}')" for p in paths
+            ]
+        summary["delegated_custody"] = custody
     if isinstance(data.get("task_contract"), dict):
         summary["task_contract"] = data.get("task_contract")
     _delta = disclosable_capability_delta(data)
@@ -2290,9 +2333,16 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
 
     Stored in ToolContext, applied on the next LLM call in the loop.
     """
-    from ouroboros.llm import LLMClient, normalize_reasoning_effort
+    from ouroboros.config import EFFORT_SCALE
+    from ouroboros.llm import LLMClient
     available = LLMClient().available_models()
     changes = []
+
+    # Validated before anything is applied: an unknown effort refuses the WHOLE call,
+    # so a same-call model switch is not half-applied behind a rejected tier.
+    requested_effort = str(effort or "").strip().lower()
+    if requested_effort and requested_effort not in EFFORT_SCALE:
+        return f"⚠️ Unknown effort: {effort}. Valid: {', '.join(EFFORT_SCALE)}"
 
     if model:
         if model not in available:
@@ -2313,10 +2363,9 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
         ctx.active_use_local_override = use_local
         changes.append(f"model={model}{' (local)' if use_local else ''}")
 
-    if effort:
-        normalized = normalize_reasoning_effort(effort, default="medium")
-        ctx.active_effort_override = normalized
-        changes.append(f"effort={normalized}")
+    if requested_effort:
+        ctx.active_effort_override = requested_effort
+        changes.append(f"effort={requested_effort}")
 
     if not changes:
         return f"Current available models: {', '.join(available)}. Pass model and/or effort to switch."
@@ -2954,6 +3003,8 @@ _PROMOTE_CHAT_DESCRIPTION = (
 
 
 def get_tools() -> List[ToolEntry]:
+    from ouroboros.config import EFFORT_SCALE
+
     return [
         ToolEntry("set_tool_timeout", {
             "name": "set_tool_timeout",
@@ -3188,8 +3239,8 @@ def get_tools() -> List[ToolEntry]:
                            "or want to save budget (simple tasks). Takes effect on next round.",
             "parameters": {"type": "object", "properties": {
                 "model": {"type": "string", "description": "Model name (e.g. anthropic/claude-sonnet-4). Leave empty to keep current."},
-                "effort": {"type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-                           "description": "Reasoning effort level (clamped to the model's real ceiling). Leave empty to keep current."},
+                "effort": {"type": "string", "enum": list(EFFORT_SCALE),
+                           "description": "Reasoning effort level (adapted down per route when a model tops out lower). Leave empty to keep current."},
             }, "required": []},
         }, _switch_model),
         ToolEntry("get_task_result", {

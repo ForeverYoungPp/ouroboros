@@ -1,3 +1,5 @@
+import pytest
+
 import supervisor.message_bus as message_bus
 import ouroboros.event_bus as event_bus
 
@@ -205,13 +207,171 @@ def test_send_document_publishes_transport_event_with_payload(monkeypatch):
     assert payload["download_url"] == "/api/files/download?path=Desktop/report.csv"
 
 
+def test_send_links_broadcasts_publishes_and_persists_compact_row(monkeypatch, tmp_path):
+    import json
+
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    events = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"session_id": "s", "owner_id": 7})
+    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat_id: None)
+    monkeypatch.setattr(
+        message_bus, "publish_event", lambda topic, data: events.append((topic, data)),
+    )
+    prefix = "https://example.com/"
+    url = prefix + "a" * (2048 - len(prefix))
+    actions = [{"label": "Report", "url": url}]
+
+    ok, error = bridge.send_links(123, actions, title="Results", task_id="task-links")
+
+    assert (ok, error) == (True, "ok")
+    live = next(frame for frame in frames if frame.get("type") == "links")
+    assert live["actions"] == actions
+    assert live["title"] == "Results"
+    assert live["task_id"] == "task-links"
+    topic, payload = events[-1]
+    assert topic == event_bus.CHAT_LINKS
+    assert set(payload) == {"chat_id", "transport", "title", "actions", "ts"}
+    assert payload["actions"] == actions
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text().splitlines()[-1])
+    assert row["type"] == "links"
+    assert row["actions"] == actions
+    assert row["title"] == "Results"
+    assert row["task_id"] == "task-links"
+    assert "file_base64" not in row
+
+
+def test_send_links_caps_title_across_broadcast_event_and_persistence(monkeypatch, tmp_path):
+    import json
+
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    events = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
+    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat_id: None)
+    monkeypatch.setattr(
+        message_bus, "publish_event", lambda topic, data: events.append((topic, data)),
+    )
+
+    ok, error = bridge.send_links(
+        123,
+        [{"label": "Docs", "url": "https://example.com/docs"}],
+        title="X" * 300,
+    )
+
+    assert (ok, error) == (True, "ok")
+    live = next(frame for frame in frames if frame.get("type") == "links")
+    assert len(live["title"]) == 240
+    topic, payload = events[-1]
+    assert topic == event_bus.CHAT_LINKS
+    assert len(payload["title"]) == 240
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text().splitlines()[-1])
+    assert len(row["title"]) == 240
+
+
+@pytest.mark.parametrize(
+    ("label", "url"),
+    [
+        ("Valid", "https://[::1]:8080/x"),
+        ("Valid", "https://example.com:8443/x"),
+        ("Valid", "https://example.com/a%20b"),
+        ("Docs and specs", "https://example.com/x"),
+        ("Valid", "https://例え.jp/x"),
+        ("Valid", "https://my_server.example.com/docs"),
+        ("Valid", "https://host~tilde.example.com/x"),
+    ],
+    ids=[
+        "ipv6-port", "hostname-port", "encoded-path", "label-space",
+        "unicode-host", "underscore-host", "tilde-host",
+    ],
+)
+def test_send_links_accepts_valid_link_actions(monkeypatch, tmp_path, label, url):
+    import json
+
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    events = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
+    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat_id: None)
+    monkeypatch.setattr(
+        message_bus, "publish_event", lambda topic, data: events.append((topic, data)),
+    )
+    actions = [{"label": label, "url": url}]
+
+    ok, error = bridge.send_links(123, actions)
+
+    assert (ok, error) == (True, "ok")
+    assert frames[-1]["actions"] == actions
+    assert events[-1][1]["actions"] == actions
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text().splitlines()[-1])
+    assert row["actions"] == actions
+
+
+@pytest.mark.parametrize(
+    ("label", "url"),
+    [
+        ("Report", "https://exa mple.com/report"),
+        ("Report", "https://example.com/re\nport"),
+        ("Report", "https://example.com/re\0port"),
+        ("Report", "https://example.com/" + "a" * 2029),
+        ("Report", "https://[::1"),
+        ("Report", "https://example.com:99999/path"),
+        ("Report", "https://example.com:bad/path"),
+        ("Report", "https://:443/path"),
+        ("Report", "https://@/path"),
+        ("Report", "https://exa%20mple.com/x"),
+        ("Report", "https://%zz/x"),
+        ("Report", "https://[v1.foo]/x"),
+        ("Report", "https://[v1.fe80::1]/p"),
+        ("Report", "https://exa\u00a0mple.com/x"),
+        ("Report", "https://example.com/a\u2028b"),
+        ("Report", "https://example.com\\@evil.com/"),
+        ("Bad\nLabel", "https://example.com"),
+        ("Bad\u2028Label", "https://example.com"),
+    ],
+    ids=[
+        "space", "newline", "nul", "over-2048", "malformed-ipv6",
+        "port-out-of-range", "non-numeric-port", "empty-host-port", "userinfo-only",
+        "encoded-host", "invalid-percent-host", "ipvfuture", "ipvfuture-colons",
+        "no-break-space", "line-separator", "backslash-authority", "label-newline",
+        "label-line-separator",
+    ],
+)
+def test_send_links_refuses_dirty_action_without_side_effects(
+    monkeypatch, tmp_path, label, url,
+):
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    events = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat_id: None)
+    monkeypatch.setattr(
+        message_bus, "publish_event", lambda topic, data: events.append((topic, data)),
+    )
+
+    ok, _error = bridge.send_links(123, [{"label": label, "url": url}])
+
+    assert ok is False
+    assert frames == []
+    assert events == []
+    assert not (tmp_path / "logs" / "chat.jsonl").exists()
+
+
 def test_send_document_persists_compact_chat_row(monkeypatch, tmp_path):
     """A delivered document persists a base64-free chat.jsonl row so it can be
     rebuilt on reload (the durable download_url carries the bytes)."""
     import json
 
     bridge = _make_bridge(monkeypatch)
-    bridge._broadcast_fn = lambda *_a, **_k: None
+    frames = []
+    bridge._broadcast_fn = frames.append
     monkeypatch.setattr(event_bus, "publish_event", lambda *_a, **_k: None)
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
@@ -222,6 +382,9 @@ def test_send_document_persists_compact_chat_row(monkeypatch, tmp_path):
         download_url="/api/files/download?path=Desktop/report.csv", task_id="t-1",
     )
     assert ok is True
+    live = next(frame for frame in frames if frame.get("type") == "document")
+    assert live["task_id"] == "t-1"
+    assert live["size_bytes"] == len(b"filebytes")
 
     rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text().splitlines() if line.strip()]
     doc_rows = [r for r in rows if r.get("type") == "document"]
@@ -235,6 +398,7 @@ def test_send_document_persists_compact_chat_row(monkeypatch, tmp_path):
     assert row["task_id"] == "t-1"
     assert row["text"] == "q3"
     assert row["caption"] == "q3"  # explicit caption survives reload
+    assert row["size_bytes"] == len(b"filebytes")
     assert "file_base64" not in row  # no base64 bloat in chat.jsonl
 
 
@@ -243,7 +407,8 @@ def test_send_photo_and_video_persist_compact_rows_before_unread_revision(monkey
     import json
 
     bridge = _make_bridge(monkeypatch)
-    bridge._broadcast_fn = lambda *_a, **_k: None
+    frames = []
+    bridge._broadcast_fn = frames.append
     monkeypatch.setattr(event_bus, "publish_event", lambda *_a, **_k: None)
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
@@ -253,6 +418,9 @@ def test_send_photo_and_video_persist_compact_rows_before_unread_revision(monkey
 
     bridge.send_photo(123, b"image", caption="shot", mime="image/png", task_id="media-task")
     bridge.send_video(123, b"video", caption="clip", mime="video/mp4", task_id="media-task")
+
+    media_frames = [frame for frame in frames if frame.get("type") in {"photo", "video"}]
+    assert [frame["task_id"] for frame in media_frames] == ["media-task", "media-task"]
 
     rows = [
         json.loads(line)
@@ -472,10 +640,11 @@ def test_media_broadcasts_stamp_project_thread(monkeypatch, tmp_path):
     bridge.send_photo(project_chat, b"\x89PNG", caption="p")
     bridge.send_video(project_chat, b"\x00\x00", caption="v")
     bridge.send_document(project_chat, b"%PDF", filename="a.pdf", caption="d")
+    bridge.send_links(project_chat, [{"label": "L", "url": "https://example.com"}])
     bridge.send_photo(1, b"\x89PNG", caption="main")
 
-    media = [f for f in frames if f.get("type") in ("photo", "video", "document")]
-    assert [f.get("project_thread") for f in media] == [True, True, True, None]
+    media = [f for f in frames if f.get("type") in ("photo", "video", "document", "links")]
+    assert [f.get("project_thread") for f in media] == [True, True, True, True, None]
 
 
 def test_project_thread_lens_follows_registry_file(monkeypatch, tmp_path):

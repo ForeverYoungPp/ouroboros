@@ -20,6 +20,11 @@ from ouroboros.platform_layer import (
     kill_process_tree,
     process_group_id,
 )
+from ouroboros.process_interpreters import (
+    active_node_resolution,
+    apply_env_path_prepend,
+    interpreter_path_overlay,
+)
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
@@ -459,6 +464,7 @@ def _start_service(
                 outputs=declared_outputs,
                 before_outputs=before_outputs,
                 keep_alive=keep_alive,
+                env_overlay=interpreter_path_overlay(active_node_resolution(ctx)),
             )
             return json.dumps(payload, ensure_ascii=False, indent=2)
         except Exception as exc:
@@ -487,7 +493,10 @@ def _start_service(
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            env=_service_env(),
+            # The attested emergency bundled-node PATH prepend (post-gates
+            # node resolver) applies on top of the allowlisted service env;
+            # a healthy resolution leaves the env byte-identical.
+            env=apply_env_path_prepend(_service_env(), active_node_resolution(ctx)),
         )
         pgid = process_group_id(proc.pid)
         log_fh.close()

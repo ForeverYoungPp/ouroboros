@@ -80,7 +80,12 @@ from ouroboros.tool_access import (
     user_files_path_block_reason,
     workspace_mode_block_reason,
 )
-from ouroboros.python_interpreter import record_python_resolution, resolve_process_python
+from ouroboros.process_interpreters import (
+    interpreter_attestation,
+    record_interpreter_resolution,
+    resolve_node_postgates,
+    resolve_process_python,
+)
 from ouroboros.utils import safe_relpath
 from ouroboros.contracts.task_constraint import TaskConstraint, VALID_WRITE_SURFACES, normalize_task_constraint
 from ouroboros.contracts.skill_payload_policy import (
@@ -3529,6 +3534,7 @@ class ToolRegistry:
 
         Every downstream guard and the handler therefore see byte-identical
         argv; launchers must not select an interpreter after this boundary.
+        Python never EXECUTES a candidate; node probes post-gates instead.
         """
         args, python_resolution = resolve_process_python(
             self._ctx,
@@ -3538,7 +3544,7 @@ class ToolRegistry:
             effective_constraint=effective_constraint,
             resolved_binding=resolved_binding,
         )
-        record_python_resolution(self._ctx, python_resolution)
+        record_interpreter_resolution(self._ctx, python_resolution)
         if python_resolution is not None and python_resolution.error_reason:
             if python_resolution.error_reason == "cwd_resolution_failed":
                 # The failure is the CWD CONFINEMENT policy, not interpreter
@@ -3563,52 +3569,40 @@ class ToolRegistry:
             )
         return args, python_resolution, ""
 
+
     def _invoke_builtin_handler(
         self,
         name: str,
         entry: Any,
         args: Dict[str, Any],
         resolved_binding: Any,
-        python_resolution: Any,
+        interpreter_resolution: Any,
         worktree_before: Any,
     ) -> tuple[str | None, Any]:
-        """Run one builtin handler; returns (early_error_text, result).
-
-        The launcher attestation lives exactly as long as the handler call:
-        run_script consults it to accept the resolver-chosen interpreter.
-        """
-        missing = object()
-        prior = getattr(self._ctx, "_active_python_resolution", missing)
-        self._ctx._active_python_resolution = python_resolution
+        """Run one builtin handler under the scoped attestation."""
         try:
-            try:
-                handler_args = dict(args)
-                if resolved_binding is not None:
-                    parameters = inspect.signature(entry.handler).parameters
-                    if "_resolved_binding" not in parameters:
-                        return (
-                            f"⚠️ TOOL_INTERNAL_ERROR ({name}): target-sensitive handler "
-                            "does not declare the private _resolved_binding keyword.",
-                            None,
-                        )
-                    handler_args["_resolved_binding"] = resolved_binding
+            with interpreter_attestation(self._ctx, interpreter_resolution):
                 try:
-                    inspect.signature(entry.handler).bind(self._ctx, **handler_args)
-                except TypeError:
-                    return _format_tool_arg_error(entry), None
-                return None, entry.handler(self._ctx, **handler_args)
-            except TypeError as e:
-                return f"⚠️ TOOL_ERROR ({name}): {e}", None
-            except Exception as e:
-                return f"⚠️ TOOL_ERROR ({name}): {e}", None
+                    handler_args = dict(args)
+                    if resolved_binding is not None:
+                        parameters = inspect.signature(entry.handler).parameters
+                        if "_resolved_binding" not in parameters:
+                            return (
+                                f"⚠️ TOOL_INTERNAL_ERROR ({name}): target-sensitive handler "
+                                "does not declare the private _resolved_binding keyword.",
+                                None,
+                            )
+                        handler_args["_resolved_binding"] = resolved_binding
+                    try:
+                        inspect.signature(entry.handler).bind(self._ctx, **handler_args)
+                    except TypeError:
+                        return _format_tool_arg_error(entry), None
+                    return None, entry.handler(self._ctx, **handler_args)
+                except TypeError as e:
+                    return f"⚠️ TOOL_ERROR ({name}): {e}", None
+                except Exception as e:
+                    return f"⚠️ TOOL_ERROR ({name}): {e}", None
         finally:
-            if prior is missing:
-                try:
-                    delattr(self._ctx, "_active_python_resolution")
-                except AttributeError:
-                    pass
-            else:
-                self._ctx._active_python_resolution = prior
             # Central advisory invalidation by OBSERVED worktree diff: runs on
             # success, tool error, and exception paths alike (the per-tool
             # manual calls missed early-return/error paths), and skips
@@ -3769,11 +3763,11 @@ class ToolRegistry:
             if ext_tool and callable(ext_tool.get("handler")):
                 return self._dispatch_extension_tool(name, ext_tool, args)
             return f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(n for n, e in self._entries.items() if not e.alias_for))}"
-        args, python_resolution, python_block = self._resolve_python_predispatch(
+        args, interpreter_resolution, interpreter_block = self._resolve_python_predispatch(
             name, args, _runtime_mode, effective_constraint, resolved_binding,
         )
-        if python_block:
-            return python_block
+        if interpreter_block:
+            return interpreter_block
         allow_short_relative = bool(
             effective_constraint and effective_constraint.mode == "skill_repair"
         )
@@ -3865,7 +3859,6 @@ class ToolRegistry:
             )
             if block_msg:
                 return block_msg
-
         # LLM safety supervisor.
         from ouroboros.safety import check_safety
         is_safe, safety_msg = check_safety(
@@ -3873,7 +3866,7 @@ class ToolRegistry:
             args,
             messages=getattr(self._ctx, "messages", None),
             ctx=self._ctx,
-            python_resolution=python_resolution,
+            python_resolution=interpreter_resolution,
         )
         if not is_safe:
             return safety_msg
@@ -3900,8 +3893,10 @@ class ToolRegistry:
             else None
         )
         worktree_before = self._worktree_status_snapshot() if entry.mutates_worktree else None
+        if interpreter_resolution is None:  # node: post-gates (A-F4)
+            args, interpreter_resolution = resolve_node_postgates(self._ctx, name, args, runtime_mode=_runtime_mode, effective_constraint=effective_constraint, resolved_binding=resolved_binding)
         early_error, result = self._invoke_builtin_handler(
-            name, entry, args, resolved_binding, python_resolution, worktree_before,
+            name, entry, args, resolved_binding, interpreter_resolution, worktree_before,
         )
         if early_error is not None:
             return early_error
@@ -3914,7 +3909,6 @@ class ToolRegistry:
                 workspace_refs_before=workspace_refs_before,
                 tool_name=name,
             )
-
         return _compose_execute_result(result, _route_note, safety_msg)
 
     def _worktree_status_snapshot(self) -> str:

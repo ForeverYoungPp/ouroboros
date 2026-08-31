@@ -13,6 +13,7 @@ import sys
 import tempfile
 
 import pytest
+pytest.register_assert_rewrite("tests.ui_media_delivery_smoke")
 
 
 _PYTEST_DATA_DIR = None

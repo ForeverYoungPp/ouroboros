@@ -699,6 +699,82 @@ def test_retry_admission_before_cancel_canonicalizes_and_stops_leaf(qenv, monkey
     assert ci.active_intents(qenv.drive) == {}
 
 
+def _reaper_kill_audit(runs: list) -> dict:
+    return {
+        "task_id": "audited", "trigger": "reaper_idle_timeout", "outcomes": [],
+        "unreconciled": list(runs), "audit_status": "ok",
+        "open_run_ids": list(runs), "pending_invocation_ids": [],
+        "undisposed_patch_run_ids": [], "deferred_project_retirements": [],
+    }
+
+
+def test_retry_handoff_failure_write_carries_custody_disclosure(qenv, monkeypatch):
+    """R2 coverage of the handoff-failure fallback: the original task's
+    terminal write on a failed input handoff still carries the audited
+    custody list AND the reconciliation envelope (previously omitted, so an
+    open run went undisclosed and a stale list stayed uncleared)."""
+    from supervisor import task_reaper as tr
+
+    monkeypatch.setattr(
+        "ouroboros.artifacts.handoff_task_attachments_for_retry",
+        lambda *_a, **_k: ({}, "attachment boom"),
+    )
+    monkeypatch.setattr(
+        "ouroboros.owner_mailbox.copy_owner_mailbox_for_retry",
+        lambda *_a, **_k: False,
+    )
+    old_id, new_id = "handoff-fail-old", "handoff-fail-new"
+    task = _root_retry_task(old_id)
+    write_task_result(
+        qenv.drive, old_id, STATUS_RUNNING, result="working",
+        delegated_runs_unreconciled=["stale-run"],
+    )
+
+    requeued, _attempt, reason, _suppression = tr._enqueue_retry(
+        qenv.q, task, task_id=old_id, retry_task_id=new_id, attempt=1,
+        terminal_reason="idle_timeout", recon_fields={},
+        unreconciled_runs=["run-live"],
+        custody_audit=_reaper_kill_audit(["run-live"]),
+    )
+
+    assert requeued is False
+    assert reason.endswith("handoff_failed")
+    row = load_task_result(qenv.drive, old_id)
+    assert row["delegated_runs_unreconciled"] == ["run-live"]
+    assert row["delegate_terminal_reconciliation"]["trigger"] == "reaper_idle_timeout"
+
+
+def test_retry_admission_block_write_carries_custody_disclosure(qenv, monkeypatch):
+    """R2 coverage of the admission-fence fallback: a clean audited list on
+    the blocked-retry terminal write clears a stale stored disclosure."""
+    from supervisor import task_reaper as tr
+
+    _patch_retry_input_handoff(monkeypatch)
+    monkeypatch.setattr(
+        tr, "_run_retry_admission_transaction",
+        lambda *_a, **_k: ({}, "root_budget"),
+    )
+    old_id, new_id = "admission-block-old", "admission-block-new"
+    task = _root_retry_task(old_id)
+    write_task_result(
+        qenv.drive, old_id, STATUS_RUNNING, result="working",
+        delegated_runs_unreconciled=["stale-run"],
+    )
+
+    requeued, _attempt, reason, _suppression = tr._enqueue_retry(
+        qenv.q, task, task_id=old_id, retry_task_id=new_id, attempt=1,
+        terminal_reason="idle_timeout", recon_fields={},
+        unreconciled_runs=[],
+        custody_audit=_reaper_kill_audit([]),
+    )
+
+    assert requeued is False
+    assert reason.endswith("admission_blocked")
+    row = load_task_result(qenv.drive, old_id)
+    assert row["delegated_runs_unreconciled"] == []
+    assert row["delegate_terminal_reconciliation"]["trigger"] == "reaper_idle_timeout"
+
+
 @pytest.mark.parametrize(
     "stop_policy",
     [ci.STOP_POLICY_IMMEDIATE, ci.STOP_POLICY_FINALIZE],
@@ -1782,6 +1858,89 @@ def _reap_spawned_live_procs():
             pass
 
 
+@pytest.mark.serial
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the os.kill(pid, 0) liveness probe is not non-mutating on Windows "
+    "(TerminateProcess); the outcomes-level pin still covers the contract there",
+)
+def test_e2e_cancel_of_inflight_run_command_child_never_reads_as_tool_failure(
+    qenv, monkeypatch, tmp_path,
+):
+    """T7 / Q2-2=A EXECUTED-path pin (triad round 1, G-B2): custody cancels a
+    worker whose REAL in-flight run_command child (a live grandchild process)
+    dies WITH the worker via kill_pid_tree, and the stored verdict's execution
+    axis is ``cancelled`` — never a red ``tool_failure`` derived from the -9
+    the child would have rendered. This executes the claim the outcomes-level
+    pin (tests/test_observability_outcomes_v2.py) previously argued from code
+    reading; while it stays green, the narrow active-cancel-intent classifier
+    filter of Q2-2=A remains deliberately unimplemented.
+    """
+    import os
+    import time
+
+    from ouroboros.outcomes import normalize_outcome_axes
+
+    task_id = "e2e-cancel-tree"
+    pid_file = tmp_path / "child.pid"
+    # A worker double whose REAL process spawns a REAL long-lived grandchild
+    # (the in-flight run_command stand-in) and parks — a two-level tree.
+    tree = _LiveProc.__new__(_LiveProc)
+    tree._proc = subprocess.Popen([
+        sys.executable, "-c",
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        "open(sys.argv[1], 'w').write(str(child.pid))\n"
+        "time.sleep(120)",
+        str(pid_file),
+    ])
+    tree.pid = tree._proc.pid
+    _LiveProc._SPAWNED.append(tree._proc)
+    deadline = time.time() + 10
+    while not pid_file.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    child_pid = int(pid_file.read_text())
+
+    worker = types.SimpleNamespace(wid=0, proc=tree, busy_task_id=task_id, reaping=False)
+    qenv.workers.WORKERS[0] = worker
+    qenv.q.RUNNING[task_id] = {"task": {"id": task_id, "chat_id": 1}, "worker_id": 0}
+    write_task_result(qenv.drive, task_id, STATUS_RUNNING, result="working")
+    monkeypatch.setattr(
+        qenv.q, "_emit_cancel_task_done",
+        lambda *a, **kw: None,
+    )
+    ci.request_cancel(qenv.drive, task_id, reason="operator stop")
+
+    try:
+        outcome = qenv.tl.cancel_task_custody(task_id)
+
+        assert outcome == qenv.tl.CANCEL_CANCELLED
+        assert not tree.is_alive(), "custody must kill the live worker"
+        child_deadline = time.time() + 5
+        child_alive = True
+        while time.time() < child_deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                child_alive = False
+                break
+            time.sleep(0.1)
+        assert not child_alive, "the in-flight run_command child must die with the worker"
+
+        stored = load_task_result(qenv.drive, task_id)
+        assert stored["status"] == STATUS_CANCELLED
+        axes = normalize_outcome_axes(stored)
+        assert axes["execution"]["status"] == "cancelled"
+        assert "tool_failure" not in json.dumps(stored)
+        assert ci.active_intent(qenv.drive, task_id) is None
+    finally:
+        for pid in (child_pid, tree.pid):
+            try:
+                os.kill(pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
 def _seed_llm_response(drive: pathlib.Path, task_id: str, text: str) -> None:
     from ouroboros import observability
 
@@ -2705,6 +2864,54 @@ def test_unreconciled_delegated_runs_are_disclosed_on_the_cancelled_result(
         if line.strip()
     ]
     assert [r for r in rows if r.get("type") == "delegated_runs_unreconciled"]
+
+
+@pytest.mark.serial
+def test_kill_path_clean_audit_clears_a_stale_unreconciled_list(qenv, monkeypatch):
+    """D1b + R2: the running-kill terminal write carries the fresh audit
+    UNCONDITIONALLY, so a clean audit clears a stale non-empty list left by an
+    earlier terminal write instead of letting it lie beside the kill — and the
+    audit ENVELOPE rides the SAME single write (no flat-only row, no second
+    disclosure write)."""
+    import ouroboros.task_results as task_results_mod
+
+    task_id = "delegating-clean"
+    task, child_drive, proc = _live_split_drive_task(qenv, task_id)
+    write_task_result(qenv.drive, task_id, STATUS_RUNNING, result="working",
+                      delegated_runs_unreconciled=["run-ghost"])
+    ci.request_cancel(qenv.drive, task_id)
+    monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        "supervisor.terminal_delivery.deliver_unreviewed_salvage",
+        lambda *_a, **_kw: None,
+    )
+    disclosure_writes: list = []
+    real_write = task_results_mod.write_task_result
+
+    def _counting_write(root, tid, status, **kwargs):
+        if str(tid) == task_id and (
+            "delegated_runs_unreconciled" in kwargs
+            or "delegate_terminal_reconciliation" in kwargs
+        ):
+            disclosure_writes.append(dict(kwargs))
+        return real_write(root, tid, status, **kwargs)
+
+    monkeypatch.setattr(task_results_mod, "write_task_result", _counting_write)
+
+    try:
+        assert qenv.tl.cancel_task_custody(task_id) == qenv.tl.CANCEL_CANCELLED
+    finally:
+        proc.terminate()
+
+    stored = load_task_result(qenv.drive, task_id)
+    assert stored["status"] == STATUS_CANCELLED
+    assert stored["delegated_runs_unreconciled"] == []
+    envelope = stored["delegate_terminal_reconciliation"]
+    assert envelope["trigger"] == "cancel_publication"
+    assert envelope["open_run_ids"] == []
+    (only_write,) = disclosure_writes
+    assert only_write["delegated_runs_unreconciled"] == []
+    assert only_write["delegate_terminal_reconciliation"]["trigger"] == "cancel_publication"
 
 
 def test_nested_scoped_home_is_disclosed_even_with_an_os_boundary(tmp_path, monkeypatch):

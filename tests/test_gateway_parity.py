@@ -28,6 +28,8 @@ from ouroboros.gateway.contracts import (
     OwnerSkillPresenceRuntimeResponse,
     OwnerScopeReviewFloorResponse,
     DocumentOutbound,
+    LinkAction,
+    LinksOutbound,
     LogOutbound,
     PhotoOutbound,
     ProviderTestRequest,
@@ -72,7 +74,9 @@ def _js_typedef_fields(text: str, name: str) -> set[str]:
             if depth == 0:
                 identifier = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)", rest[idx + 1:])
                 if identifier:
-                    fields.add(identifier.group(1))
+                    field = identifier.group(1)
+                    assert field not in fields, f"{name} JSDoc declares duplicate property {field}"
+                    fields.add(field)
                 break
     return fields
 
@@ -176,6 +180,9 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "ChatOutbound",
         "PhotoOutbound",
         "VideoOutbound",
+        "DocumentOutbound",
+        "LinkAction",
+        "LinksOutbound",
         "MessageAnnotationOutbound",
         "UploadResponse",
         "TaskCreateResponse",
@@ -222,7 +229,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     # v6.80.0: the two contracts extended this release join the FIELD-level parity list. The name-level
     # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
     # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
-    for cls in (ChatInbound, ChatOutbound, PhotoOutbound, VideoOutbound,
+    for cls in (ChatInbound, ChatOutbound, PhotoOutbound, VideoOutbound, DocumentOutbound,
+                LinkAction, LinksOutbound,
                 ActiveDirectTurn, ActiveChatActivity, TypingOutbound,
                 StateResponse, OwnerScopeReviewFloorResponse, UpdateMergePlan,
                 UpdatePreflightRequest, UpdatePreflightResponse, UpdateApplyRequest,
@@ -376,7 +384,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     # Main-thread fan-out stamp: every card/bubble-MINTING outbound frame family
     # declares the same additive-optional boolean in both mirrors (message_annotation
     # is thread-routed but no-ops on unknown ids and stays unstamped by design).
-    for cls in (ChatOutbound, PhotoOutbound, VideoOutbound, DocumentOutbound, LogOutbound, TypingOutbound):
+    for cls in (ChatOutbound, PhotoOutbound, VideoOutbound, DocumentOutbound, LinksOutbound, LogOutbound, TypingOutbound):
         assert "project_thread" in get_type_hints(cls, include_extras=True), f"{cls.__name__} missing project_thread"
     assert len(re.findall(r"@property \{boolean=\} project_thread\b", text)) >= 6, "api_types.js missing project_thread mirrors"
     assert re.search(r"@property \{boolean=\} worker_saturation_warning\b", text), "ChatOutbound missing worker_saturation_warning"
@@ -384,7 +392,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     assert re.search(r"@property \{Object=\} review_projection\b", text)
     assert "setup_contract" in text
     assert re.search(r"@property \{string=\} error\b", text), "SkillDeleteResponse missing optional error"
-    assert {"chat", "command", "photo", "video", "typing", "log", "heartbeat", "extension_lifecycle"} <= set(WS_MESSAGE_TYPES)
+    assert {"chat", "command", "photo", "video", "links", "typing", "log", "heartbeat", "extension_lifecycle"} <= set(WS_MESSAGE_TYPES)
     assert "message_annotation" in WS_MESSAGE_TYPES
     assert "update_status_ready" in WS_MESSAGE_TYPES
     assert _js_typedef_fields(text, "MessageAnnotationOutbound") == {
@@ -526,3 +534,17 @@ def test_task_detail_cost_breakdown_emission_matches_contract(monkeypatch, tmp_p
     detail_hints = get_type_hints(TaskDetailResponse, include_extras=True)
     assert detail_hints["cost_breakdown"] is TaskCostBreakdown
     assert TaskDetailResponse.__required_keys__ == frozenset()
+
+
+def test_max_link_actions_pinned_across_python_and_js():
+    """The links-action cap is one number in both languages: the tool gate
+    (ouroboros.tools.core._MAX_LINK_ACTIONS) and the UI contract mirror
+    (web/modules/api_types.js MAX_LINK_ACTIONS) must never drift apart."""
+    from ouroboros.tools.core import _MAX_LINK_ACTIONS
+
+    text = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_types.js").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"^export const MAX_LINK_ACTIONS = (\d+);", text, flags=re.MULTILINE)
+    assert match, "api_types.js missing MAX_LINK_ACTIONS"
+    assert int(match.group(1)) == _MAX_LINK_ACTIONS

@@ -961,7 +961,7 @@ class TestLLMFallbackExtraction:
         assert {"schema_not_conformed_on_effective_route",
                 "session_ran_off_pinned_route"} <= reasons, reasons
 
-    def test_delegated_advisory_unwraps_a_conformant_clean_envelope(self):
+    def test_delegated_advisory_unwraps_a_conformant_clean_envelope(self, monkeypatch):
         """A schema-conformant session answers with the SESSION envelope
         ({"findings": [...]}) while every advisory consumer downstream reads the
         advisory's own ARRAY contract — so a clean {"findings": []} used to land as
@@ -980,8 +980,10 @@ class TestLLMFallbackExtraction:
                 }
             return fake_runner
 
-        import os
-        os.environ.setdefault("OUROBOROS_SUBAGENT_HARNESS", "claude")
+        # monkeypatch, not bare os.environ: a leaked OUROBOROS_SUBAGENT_HARNESS
+        # makes UNRELATED dispatch tests on the same xdist worker walk the
+        # delegation route-health path (parallel-safety rule, DEVELOPMENT.md).
+        monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claude")
         cases = [
             # (session text, conformance, expected result_text)
             (json.dumps({"findings": []}), "passed", "[]"),

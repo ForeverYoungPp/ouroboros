@@ -38,6 +38,7 @@ from ouroboros.subagent_messages import subagent_message_meta
 from ouroboros.task_finalization import send_provider_death_notice
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
 from supervisor.cognitive_operations import EVENT_HANDLERS as _CEH, _handle_cognitive_operation  # noqa: F401
+from supervisor.chat_delivery_events import EVENT_HANDLERS as _CDE
 from supervisor.telemetry_events import TELEMETRY_EVENT_HANDLERS as _TELEMETRY_EVENT_HANDLERS
 from supervisor.log_addressing import (  # re-export: one events surface
     address_ctx_event as _address_ctx,
@@ -4048,132 +4049,6 @@ def _handle_toggle_consciousness(evt: Dict[str, Any], ctx: Any) -> None:
         ctx.send_with_budget(int(st["owner_chat_id"]), f"🧠 {result}")
 
 
-def _handle_send_photo(evt: Dict[str, Any], ctx: Any) -> None:
-    """Send a photo to the owner's chat."""
-    import base64 as b64mod
-    try:
-        # Binding precedence (matches _handle_send_message/_handle_log_event): a
-        # post-hoc bound task keeps its original main chat_id, so its media must
-        # still route to the project panel.
-        chat_id = _bound_project_chat_id(
-            ctx, evt.get("task_id"), evt.get("parent_task_id"), evt.get("root_task_id")
-        ) or int(evt.get("chat_id") or 0)
-        image_b64 = str(evt.get("image_base64") or "")
-        caption = str(evt.get("caption") or "")
-        mime = str(evt.get("mime") or "image/png")
-        if not chat_id or not image_b64:
-            return
-        photo_bytes = b64mod.b64decode(image_b64)
-        ok, err = ctx.bridge.send_photo(
-            chat_id, photo_bytes, caption=caption, mime=mime,
-            task_id=str(evt.get("task_id") or ""),
-        )
-        if not ok:
-            ctx.append_jsonl(
-                ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
-                {
-                    "ts": utc_now_iso(),
-                    "type": "send_photo_error",
-                    "chat_id": chat_id, "error": err,
-                },
-            )
-    except Exception as e:
-        ctx.append_jsonl(
-            ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
-            {
-                "ts": utc_now_iso(),
-                "type": "send_photo_event_error", "error": repr(e),
-            },
-        )
-
-
-def _handle_send_video(evt: Dict[str, Any], ctx: Any) -> None:
-    """Send a video to the owner's chat."""
-    import base64 as b64mod
-    try:
-        # Binding precedence (matches the sibling handlers): a post-hoc bound
-        # task's media routes to its project panel, not the old main thread.
-        bound_chat = _bound_project_chat_id(
-            ctx, evt.get("task_id"), evt.get("parent_task_id"), evt.get("root_task_id")
-        )
-        raw_chat_id = evt.get("chat_id")
-        if not bound_chat and (raw_chat_id is None or raw_chat_id == ""):
-            return
-        chat_id = bound_chat or int(raw_chat_id)
-        video_b64 = str(evt.get("video_base64") or "")
-        caption = str(evt.get("caption") or "")
-        mime = str(evt.get("mime") or "video/mp4")
-        if not video_b64:
-            return
-        video_bytes = b64mod.b64decode(video_b64)
-        ok, err = ctx.bridge.send_video(
-            chat_id, video_bytes, caption=caption, mime=mime,
-            task_id=str(evt.get("task_id") or ""),
-        )
-        if not ok:
-            ctx.append_jsonl(
-                ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
-                {
-                    "ts": utc_now_iso(),
-                    "type": "send_video_error",
-                    "chat_id": chat_id, "error": err,
-                },
-            )
-    except Exception as e:
-        ctx.append_jsonl(
-            ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
-            {
-                "ts": utc_now_iso(),
-                "type": "send_video_event_error", "error": repr(e),
-            },
-        )
-
-
-def _handle_send_document(evt: Dict[str, Any], ctx: Any) -> None:
-    """Send an arbitrary document/file to the owner's chat."""
-    import base64 as b64mod
-    try:
-        # Binding precedence (matches the sibling media handlers): a post-hoc
-        # bound task's file routes to its project panel, not the old main thread.
-        bound_chat = _bound_project_chat_id(
-            ctx, evt.get("task_id"), evt.get("parent_task_id"), evt.get("root_task_id")
-        )
-        raw_chat_id = evt.get("chat_id")
-        if not bound_chat and (raw_chat_id is None or raw_chat_id == ""):
-            return
-        chat_id = bound_chat or int(raw_chat_id)
-        file_b64 = str(evt.get("file_base64") or "")
-        caption = str(evt.get("caption") or "")
-        filename = str(evt.get("filename") or "file")
-        mime = str(evt.get("mime") or "application/octet-stream")
-        download_url = str(evt.get("download_url") or "")
-        task_id = str(evt.get("task_id") or "")
-        if not file_b64:
-            return
-        file_bytes = b64mod.b64decode(file_b64)
-        ok, err = ctx.bridge.send_document(
-            chat_id, file_bytes, filename=filename, caption=caption, mime=mime,
-            download_url=download_url, task_id=task_id,
-        )
-        if not ok:
-            ctx.append_jsonl(
-                ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
-                {
-                    "ts": utc_now_iso(),
-                    "type": "send_document_error",
-                    "chat_id": chat_id, "error": err,
-                },
-            )
-    except Exception as e:
-        ctx.append_jsonl(
-            ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
-            {
-                "ts": utc_now_iso(),
-                "type": "send_document_event_error", "error": repr(e),
-            },
-        )
-
-
 def _handle_owner_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
     """Log owner injections so health checks can detect duplicate processing."""
     try:
@@ -4370,6 +4245,7 @@ EVENT_HANDLERS = {
     "llm_usage": _handle_llm_usage,
     "external_wait_lease": _handle_external_wait_lease,
     **_CEH,
+    **_CDE,
     "main_llm_call_state": _handle_main_llm_call_state,
     "budget_pause": _handle_budget_pause,
     "budget_root_fence": _handle_budget_root_fence,
@@ -4389,9 +4265,6 @@ EVENT_HANDLERS = {
     "steer_task": _handle_steer_task,
     "project_digest": _handle_project_digest,
     "cancel_task": _handle_cancel_task,
-    "send_photo": _handle_send_photo,
-    "send_video": _handle_send_video,
-    "send_document": _handle_send_document,
     "toggle_evolution": _handle_toggle_evolution,
     "toggle_consciousness": _handle_toggle_consciousness,
     "owner_message_injected": _handle_owner_message_injected,

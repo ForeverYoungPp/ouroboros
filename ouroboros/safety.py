@@ -134,6 +134,8 @@ TOOL_POLICY: Dict[str, str] = {
     "send_photo": POLICY_SKIP,
     "send_video": POLICY_SKIP,
     "send_file": POLICY_SKIP,
+    # Structured links cannot exceed the task's existing owner-chat delivery authority.
+    "send_links": POLICY_SKIP,
     "presence_finish": POLICY_SKIP,
     "presence_cancel_work": POLICY_SKIP,
     "configure_presence": POLICY_SKIP,
@@ -278,7 +280,7 @@ def _normalize_resolved_python_subject(raw_cmd: Any, python_resolution: Any) -> 
     literal ``python`` token for the existing module allowlist decision.
     """
 
-    from ouroboros.python_interpreter import PythonResolutionTrace
+    from ouroboros.process_interpreters import PythonResolutionTrace
 
     if not isinstance(python_resolution, PythonResolutionTrace) or not python_resolution.verified:
         return ""

@@ -626,6 +626,18 @@ def verification_receipt_ledger_row(receipt: Dict[str, Any]) -> Dict[str, Any]:
         "expected_match": str(receipt.get("expected_match") or "substring"),
         "matched": receipt.get("matched"),
         "returncode": receipt.get("returncode"),
+        # Disclosure keys (node-runtime sprint, D6/R4) — carried ONLY when the
+        # receipt has them, so historical rows and non-run kinds stay
+        # byte-identical. `duration_ms`: how long the check's process lived.
+        # `signal`: POSIX signal name of a killed check (returncode < 0) —
+        # a 9ms SIGKILL is distinguishable from an honest red. `resolved_runtime`:
+        # the physical executable that ran when the interpreter resolver
+        # substituted one; ABSENT means the recorded `check` argv executed as
+        # written. Disclosure only — receipt identity/reconciliation (the shared
+        # `receipt_identity_projection` above) reads none of these.
+        **({"duration_ms": receipt.get("duration_ms")} if receipt.get("duration_ms") is not None else {}),
+        **({"signal": str(receipt.get("signal") or "")} if receipt.get("signal") else {}),
+        **({"resolved_runtime": truncate_review_artifact(receipt.get("resolved_runtime"), limit=300)} if receipt.get("resolved_runtime") else {}),
         "summary": truncate_review_artifact(receipt.get("summary"), limit=300),
         # C: after-only artifact-lifecycle flag (a check that built then deleted a
         # declared deliverable). Bounded through the SHARED disclosed-list projection —

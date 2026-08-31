@@ -920,6 +920,34 @@ class PluginAPIImpl:
         supervisor = get_global_supervisor()
         if supervisor is None:
             raise ExtensionRegistrationError("companion supervisor is not initialized")
+        node_prepend_dir = ""
+        manifest_path_override = any(
+            str(key).upper() == "PATH" for key in (spec.get("env") or {})
+        )
+        if expected_runtime in {"node", "npm"} and not manifest_path_override:
+            # T14: an explicit PATH in the companion manifest means the author
+            # owns the runtime lookup — the host-side probe cannot see that
+            # child-only PATH, so neither the bundled rewrite nor the emergency
+            # prepend may shadow it.
+            # Node symmetry with the python->sys.executable rewrite above: the
+            # skill-family runtime precedence (bundled-first + health rollback
+            # to a working PATH node) is owned by
+            # platform_layer.select_skill_node_runtime. npm itself is NOT
+            # bundled and is never rewritten; only in the emergency state
+            # (PATH node missing/execution-probed broken, healthy bundled
+            # selected) does the companion child PATH gain the bundled-node
+            # dir so npm's `#!/usr/bin/env node` shebang finds a working
+            # runtime. On a healthy PATH the child env stays byte-identical.
+            # Disclosed residual: an npm launcher rewritten to an ABSOLUTE
+            # node shebang ignores PATH and keeps failing honestly.
+            from ouroboros.platform_layer import (
+                select_skill_node_runtime,
+                skill_node_emergency_path_dir,
+            )
+            selected_node, _node_provenance = select_skill_node_runtime()
+            if selected_node and cmd[0] == "node":
+                cmd = [selected_node, *cmd[1:]]
+            node_prepend_dir = skill_node_emergency_path_dir()
         base_env = _scrub_env(
             list(self._env_allow),
             self._state_dir,
@@ -927,11 +955,19 @@ class PluginAPIImpl:
             granted_keys=list(self._granted_upper),
         )
         reserved_env = {"HOST_SERVICE_TOKEN", "HOST_SERVICE_URL"}
-        for key, value in (spec.get("env") or {}).items():
-            key_text = str(key)
-            if key_text.upper() in FORBIDDEN_EXTENSION_SETTINGS or key_text.upper() in reserved_env:
-                continue
-            base_env[key_text] = str(value)
+        manifest_env = {
+            str(key): str(value)
+            for key, value in (spec.get("env") or {}).items()
+            if str(key).upper() not in FORBIDDEN_EXTENSION_SETTINGS
+            and str(key).upper() not in reserved_env
+        }
+        # Case-aware merge (delta finding D2-8): a manifest "Path" must REPLACE
+        # the allowlisted "PATH" on Windows, never sit next to it — duplicate
+        # case-variant env keys make CreateProcess-era spawns fail or pick an
+        # undefined winner. Same contract as the executor-local service lane.
+        from ouroboros.workspace_executor import overlay_env
+
+        base_env = overlay_env(base_env, manifest_env)
         token = self.get_skill_token()
         base_env["HOST_SERVICE_TOKEN"] = token.use_in_request()
         from ouroboros.gateway.host_service import DEFAULT_HOST_SERVICE_HOST, host_service_port
@@ -943,6 +979,16 @@ class PluginAPIImpl:
                 base_env["PYTHONPATH"] = os.pathsep.join(
                     [*site_dirs, existing_pythonpath] if existing_pythonpath else site_dirs
                 )
+        if node_prepend_dir:
+            # Emergency-only (see above): descriptor env keys win over the
+            # supervisor's `_companion_base_env` merge, so the prepended PATH
+            # reaches the child and survives supervisor restarts.
+            existing_path = base_env.get("PATH") or os.environ.get("PATH", "")
+            base_env["PATH"] = (
+                os.pathsep.join([node_prepend_dir, existing_path])
+                if existing_path
+                else node_prepend_dir
+            )
         workdir = self._runtime_skill_dir or self._skill_dir or self._state_dir
         descriptor = CompanionDescriptor(
             skill_name=self._skill,

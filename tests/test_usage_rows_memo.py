@@ -7,8 +7,10 @@ safe: (a) bit-exact equivalence with a fresh from-scratch replay after every
 kind of append, (b) zero full-ledger reads on warm repeat calls, and (c) every
 disclosed invalidation trigger (torn tail/quarantine, sequence discontinuity,
 inode change, size shrink, cross-process append) forces a refold instead of
-serving stale data. Write paths keep their own full locked reads and are
-deliberately not covered here — they are pinned by tests/test_usage_accounting.py.
+serving stale data. The write paths' own in-lock warm read cache
+(razzant/ouroboros#129) and the append newline guard (#138) are pinned at the
+end of this file; the monetary write SEMANTICS stay pinned by
+tests/test_usage_accounting.py.
 """
 from __future__ import annotations
 
@@ -207,11 +209,12 @@ def test_warm_display_reads_do_zero_full_replays_cold_exactly_one(data_root, mon
         ua.usage_projection(data_root, root_task_id="root")
     assert calls["full"] == 1, "warm repeat display reads must do zero full replays"
 
-    # A same-process append advances the memo incrementally on the next read:
-    # the write path's own full locked reads are counted, but the display read
-    # after it must not add another full replay.
+    # A same-process append advances the memo incrementally on the next read,
+    # and the write path itself reads through its warm in-lock cache (#129):
+    # neither the write nor the display read after it adds a full replay.
     ua.release_attempt(ua.reserve_attempt(_request(data_root, task_id="next")))
     after_write = calls["full"]
+    assert after_write == 1, "warm write-path reads must not full-replay the ledger"
     projection = ua.usage_projection(data_root)
     assert calls["full"] == after_write, "post-append display read must resume, not replay"
     assert projection["attempt_counts"]["released"] == 1
@@ -304,11 +307,12 @@ def test_size_shrink_forces_refold_not_stale_rows(data_root):
 
 def test_newline_less_crash_tail_never_lets_warm_reads_diverge(data_root):
     """Review-wave regression (GPT probe): a crash-torn final line that is still
-    VALID JSON parses in the full read, but its end is not a row boundary — a
-    later real-API append glues onto the unterminated line, and an incremental
-    resume from that offset would accept the glued-on row while a fresh replay
-    quarantines the whole glued line. The resume fingerprint must refuse a
-    non-row-aligned tail, keeping reads full replays until the tail is repaired.
+    VALID JSON parses in the full read, but its end is not a row boundary. The
+    resume fingerprint must refuse a non-row-aligned tail, keeping reads full
+    replays until the tail is repaired. (Since the razzant/ouroboros#138 append
+    guard, the next real append repairs the boundary with a leading newline
+    instead of gluing; the fingerprint refusal still protects every read that
+    happens before any append does.)
     """
     reservation = ua.reserve_attempt(_request(data_root))
     ua.release_attempt(reservation)
@@ -321,12 +325,13 @@ def test_newline_less_crash_tail_never_lets_warm_reads_diverge(data_root):
     warm = ua.usage_projection(data_root)
     assert warm == _fresh_result(data_root, ua.usage_projection, data_root)
 
-    # A real-API append now glues its first row onto the unterminated line.
+    # A real-API append lands after a repaired boundary (#138 guard): the torn
+    # row survives as a valid row and warm reads must still match a fresh replay.
     ua.reserve_attempt(_request(data_root, task_id="glued"))
 
     warm = ua.usage_projection(data_root)
     fresh = _fresh_result(data_root, ua.usage_projection, data_root)
-    assert warm == fresh, "warm read after a glued append must match a fresh replay"
+    assert warm == fresh, "warm read after an append onto the torn tail must match a fresh replay"
     breakdown = ua.usage_breakdown(data_root)
     assert breakdown == _fresh_result(data_root, ua.usage_breakdown, data_root)
 
@@ -358,3 +363,90 @@ def test_cross_process_append_is_seen_by_the_next_read(data_root):
     assert projection == _fresh_result(data_root, ua.usage_projection, data_root)
     breakdown = ua.usage_breakdown(data_root)
     assert breakdown["by_task"]["foreign"]["physical_calls"] == 1
+
+
+def _clear_ledger_read_cache() -> None:
+    from ouroboros import _usage_rows_memo as memo
+
+    with memo._LEDGER_READ_CACHE_LOCK:
+        memo._LEDGER_READ_CACHE.clear()
+
+
+def test_torn_newline_less_tail_costs_at_most_itself_on_the_next_append(data_root):
+    """razzant/ouroboros#138: a crashed writer can leave a JSON-complete row
+    with no trailing newline — the one shape the full read ACCEPTS as a row.
+    Before the append-boundary guard, the next append glued its first row onto
+    that tail and the following read quarantined BOTH rows, destroying a
+    previously validated row and orphaning the caller's live reservation. The
+    guard prepends the missing newline, so the torn row and every following
+    append survive with no quarantine at all.
+    """
+    r1 = ua.reserve_attempt(_request(data_root))
+    ua.release_attempt(r1)
+    ledger = data_root / ua.LEDGER_REL
+    raw = ledger.read_bytes()
+    assert raw.endswith(b"\n")
+    ledger.write_bytes(raw[:-1])  # crash-torn: final row valid JSON, no newline
+
+    r2 = ua.reserve_attempt(_request(data_root))
+    ua.mark_dispatched(r2)
+    ua.settle_attempt(r2, usage={"prompt_tokens": 5, "completion_tokens": 2, "cost": 0.01})
+
+    assert not (data_root / ua.QUARANTINE_REL).exists()
+    projection = _fresh_result(data_root, ua.usage_projection, data_root)
+    assert projection["attempt_counts"] == {"released": 1, "settled": 1}
+    assert projection["integrity_degraded"] is False
+
+
+def test_ledger_read_cache_matches_the_full_read_cold_and_warm(data_root):
+    """razzant/ouroboros#129: the in-lock write-path read is served from a warm
+    incremental cache. It must return exactly what the full validated read
+    returns — cold, and after appends grow the file."""
+    _clear_ledger_read_cache()
+    r1 = ua.reserve_attempt(_request(data_root))
+    ua.release_attempt(r1)
+    with ua._locked(data_root):
+        cold = ua._read_records_locked_cached(data_root)
+        raw = ua._read_records_locked(data_root)
+    assert cold == raw
+
+    # Grow the ledger; the next cached read must pick up the delta incrementally.
+    r2 = ua.reserve_attempt(_request(data_root))
+    ua.mark_dispatched(r2)
+    ua.settle_attempt(r2, usage={"prompt_tokens": 5, "completion_tokens": 2, "cost": 0.01})
+    with ua._locked(data_root):
+        warm = ua._read_records_locked_cached(data_root)
+        raw2 = ua._read_records_locked(data_root)
+    assert warm == raw2
+    assert len(warm) > len(cold)
+
+    # A projection computed with the cache warm equals one from a cold process.
+    warm_projection = ua.usage_projection(data_root)
+    _clear_ledger_read_cache()
+    assert ua.usage_projection(data_root) == warm_projection
+
+
+def test_ledger_read_cache_falls_back_when_the_file_is_rewritten(data_root):
+    """An atomic replace of the ledger (new inode — restore, future compaction)
+    must force a full re-read. The rewrite REMOVES rows, so serving the stale
+    cached state would be a visible wrong answer, not a lucky equality."""
+    _clear_ledger_read_cache()
+    r1 = ua.reserve_attempt(_request(data_root))
+    ua.release_attempt(r1)
+    r2 = ua.reserve_attempt(_request(data_root))
+    ua.release_attempt(r2)
+    with ua._locked(data_root):
+        seeded = ua._read_records_locked_cached(data_root)
+    assert len(seeded) == 4
+
+    ledger = data_root / ua.LEDGER_REL
+    lines = ledger.read_bytes().splitlines(keepends=True)
+    tmp = ledger.with_suffix(".rewrite")
+    tmp.write_bytes(b"".join(lines[:2]))  # keep only r1's reserve+release
+    tmp.replace(ledger)
+
+    with ua._locked(data_root):
+        after = ua._read_records_locked_cached(data_root)
+        raw = ua._read_records_locked(data_root)
+    assert after == raw
+    assert len(after) == 2  # the cached four-row state was not served

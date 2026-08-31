@@ -367,6 +367,7 @@
  * @property {string=} client_message_id
  * @property {Object=} transport
  * @property {number=} chat_id
+ * @property {string=} task_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
  * @property {number=} telegram_chat_id
  */
@@ -386,8 +387,28 @@
  * @property {string=} client_message_id
  * @property {Object=} transport
  * @property {number=} chat_id
+ * @property {string=} task_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
  * @property {number=} telegram_chat_id
+ */
+
+/**
+ * @typedef {Object} LinkAction
+ * @property {string} label
+ * @property {string} url
+ */
+
+/**
+ * @typedef {Object} LinksOutbound
+ * @property {"links"} type
+ * @property {"assistant"} role
+ * @property {LinkAction[]} actions
+ * @property {string} ts
+ * @property {string=} title
+ * @property {number=} chat_id
+ * @property {string=} task_id
+ * @property {boolean=} project_thread
+ * @property {Object=} transport
  */
 
 /**
@@ -407,6 +428,8 @@
  * @property {string=} client_message_id
  * @property {Object=} transport
  * @property {number=} chat_id
+ * @property {string=} task_id
+ * @property {number=} size_bytes
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
  * @property {number=} telegram_chat_id
  */
@@ -1098,4 +1121,5 @@
  * @property {?boolean} check_ok
  */
 
+export const MAX_LINK_ACTIONS = 12;
 export const GATEWAY_CONTRACT_VERSION = '6.113.4';

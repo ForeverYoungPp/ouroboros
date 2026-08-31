@@ -14,6 +14,7 @@ import json
 import pathlib
 import shlex
 import subprocess
+import time
 from typing import Any, List
 
 from ouroboros._outcome_receipts import (
@@ -23,6 +24,11 @@ from ouroboros._outcome_receipts import (
 from ouroboros.outcome_receipt_store import ZERO_RUN_WRITE_DECISIONS
 from ouroboros.outcomes import append_verification_receipt
 from ouroboros.platform_layer import bootstrap_process_path
+from ouroboros.process_interpreters import (
+    active_node_resolution,
+    apply_env_path_prepend,
+    interpreter_path_overlay,
+)
 from ouroboros.shell_parse import normalize_check_argv
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
@@ -639,6 +645,10 @@ def _verify_and_record(
                 "artifact_paths=[<file_a>, <file_b>] — exactly two files to compare byte-for-byte "
                 "after the check runs."
             )
+        from ouroboros.tools.process_facts import (
+            active_resolved_runtime as _active_resolved_runtime,
+            signal_name_for_returncode as _signal_name_for_returncode,
+        )
         from ouroboros.tools.shell import (
             _RUN_SHELL_DEFAULT_TIMEOUT_SEC,
             _executor_can_run_cwd,
@@ -669,17 +679,45 @@ def _verify_and_record(
         timeout = _resolve_effective_timeout(_RUN_SHELL_DEFAULT_TIMEOUT_SEC, ctx, override_sec=timeout_sec)
         bootstrap_process_path()  # mirror run_command: ensure the check sees the full PATH
         use_executor = _executor_can_run_cwd(ctx, pathlib.Path(work_dir))
+        # R4: the node resolver never rewrites args["check"] — the ORIGINAL argv
+        # stays the receipt's identity below — so the resolver-chosen runtime
+        # (bundled node when the PATH candidate is missing/probe-dead) reaches
+        # execution through the per-call attestation instead. The emergency
+        # PATH prepend rides the same attestation; both are None/no-op on every
+        # healthy path, keeping argv, env, and receipts byte-identical.
+        node_resolution = active_node_resolution(ctx)
+        exec_argv = list(argv)
+        if (
+            node_resolution is not None
+            and node_resolution.changed
+            and exec_argv
+            and exec_argv[0] == node_resolution.requested_interpreter
+        ):
+            exec_argv[0] = node_resolution.resolved_interpreter
+        # D6 disclosure facts (stream B): how long the check's process lived,
+        # and — when the resolver substituted the physical executable (the
+        # registry bridges the stream-A attestation into
+        # ``ctx._process_resolved_runtime``) — which runtime actually ran.
+        # Disclosure ONLY: receipt identity/reconciliation (`check` text) is
+        # untouched, and the agent-visible result text below is unchanged.
+        _check_started_ts = time.monotonic()
+        _resolved_runtime = _active_resolved_runtime(ctx)
         try:
             if use_executor:
                 # Route the check through the host-owned executor backend (e.g. docker_exec
                 # with NetworkMode=none) EXACTLY like run_command, so the verification runs
                 # in the SAME place + isolation as the agent's other commands — not on the
                 # host while the work lives in a container.
-                res = executor_execute(ctx, argv, pathlib.Path(work_dir), timeout)
+                res = executor_execute(
+                    ctx, exec_argv, pathlib.Path(work_dir), timeout,
+                    env_overlay=interpreter_path_overlay(node_resolution),
+                )
             else:
-                run_env = _shell_env_for_cwd(ctx, pathlib.Path(work_dir))
+                run_env = apply_env_path_prepend(
+                    _shell_env_for_cwd(ctx, pathlib.Path(work_dir)), node_resolution,
+                )
                 res = _tracked_subprocess_run(
-                    argv, cwd=str(work_dir),
+                    exec_argv, cwd=str(work_dir),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout,
                     **({"env": run_env} if run_env is not None else {}),
                 )
@@ -687,6 +725,9 @@ def _verify_and_record(
             # Same renderer as the completed-run receipt below, so it carries the same
             # stamp: a timeout red must be reconcilable by the later green of that argv.
             receipt.update({"status": "fail", "returncode": None, "matched": False, "check": shlex.join(argv), "check_rendering": CHECK_RENDERING_SHLEX_JOIN, "summary": f"check timed out after {timeout}s"})
+            receipt["duration_ms"] = max(0, int((time.monotonic() - _check_started_ts) * 1000))
+            if _resolved_runtime:
+                receipt["resolved_runtime"] = _resolved_runtime
             if not append_verification_receipt(drive_root, task_id, receipt):
                 return _receipt_custody_failure(
                     kind, f"check timed out after {timeout}s",
@@ -696,6 +737,7 @@ def _verify_and_record(
                 f"root={binding.root}, cwd={binding.target_path}. Receipt recorded."
             )
         # Full output captured in-handler BEFORE any transport truncation.
+        _check_duration_ms = max(0, int((time.monotonic() - _check_started_ts) * 1000))
         out = (res.stdout or "") + (("\n" + res.stderr) if res.stderr else "")
         rc = res.returncode
         if match_mode == "bytes_equal":
@@ -720,6 +762,23 @@ def _verify_and_record(
         # old space-joined `echo a b` and a new `shlex.join` of a different argv read the
         # same. The stamp makes the two incomparable instead of falsely equal.
         receipt.update({"status": "pass" if passed else "fail", "returncode": rc, "matched": bool(matched), "check": shlex.join(argv), "check_rendering": CHECK_RENDERING_SHLEX_JOIN, "summary": _bounded(out, _RECEIPT_OUTPUT_CAP)})
+        # D6/D7 disclosure keys (node-runtime sprint stream B). `duration_ms` —
+        # always, for every run-kind check: a 9ms SIGKILL and a 5-minute honest
+        # red are different facts. `signal` — the POSIX name of the signal that
+        # killed the check (returncode < 0), so a killed verification is
+        # distinguishable in the store (Windows reports large positive codes and
+        # gets no name — declared residual, see _signal_name_for_returncode).
+        # `resolved_runtime` — present ONLY when execution ran something other
+        # than the literal recorded check (Stream-A resolver seam); its absence
+        # means the recorded argv is exactly what executed. All three are
+        # disclosure-only: receipt IDENTITY (`check` text) and reconciliation
+        # read none of them.
+        receipt["duration_ms"] = _check_duration_ms
+        _signal_name = _signal_name_for_returncode(rc)
+        if _signal_name:
+            receipt["signal"] = _signal_name
+        if _resolved_runtime:
+            receipt["resolved_runtime"] = _resolved_runtime
         # C: after-only artifact-lifecycle FLAG (status unchanged — flag-only). If the agent
         # declared artifact_paths, record whether each still exists after the check, probed via
         # the SAME surface as the check, so a build-then-delete is visible to the advisory reviewer.

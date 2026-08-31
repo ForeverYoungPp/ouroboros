@@ -348,3 +348,25 @@ def test_read_version_returns_empty_for_missing_files(tmp_path):
     skill = tmp_path / "skill"
     skill.mkdir()
     assert _read_skill_manifest_version(skill) == ""
+
+
+def test_telegram_format_upgrade_reseeds_version_1_1_0(tmp_path, fake_log):
+    """The launcher-owned Telegram payload must resync for format parity."""
+    from ouroboros.launcher_bootstrap import _per_skill_version_resync
+
+    seed_dir = pathlib.Path(__file__).resolve().parents[1] / "skills"
+    drive_root = tmp_path / "data"
+    native_root = drive_root / "skills" / "native"
+    installed = _write_skill(native_root, "telegram", version="1.0.1")
+    (installed / ".seed-origin").write_text("seeded_from=test\n", encoding="utf-8")
+
+    upgraded = _per_skill_version_resync(
+        seed_dir,
+        native_root,
+        fake_log,
+        drive_root=drive_root,
+    )
+
+    assert upgraded == 1
+    assert "version: 1.1.0" in (installed / "SKILL.md").read_text(encoding="utf-8")
+    assert (installed / "plugin.py").is_file()

@@ -806,6 +806,112 @@ def test_t4_cosmetic_partition_guards():
     assert "warning" not in reviewed["outcome_axes"]["objective"]
 
 
+def test_signal_death_is_not_cosmetic_but_plain_exit_still_is():
+    """D7 (node-runtime sprint): the NEW contract for the cosmetic demotion.
+
+    A run_command/run_script child KILLED BY A SIGNAL (typed meta: exit_code<0
+    or a signal name — e.g. the macOS kernel-CODESIGNING SIGKILL of a broken
+    node, an OOM kill, an external `kill -9`) is a REAL execution-degrading
+    tool error, symmetric with the timeout exclusion. A plain non-zero exit
+    (exit_code=1 probe/teardown noise) REMAINS cosmetic — that half of the T4
+    contract is deliberately unchanged."""
+    killed = derive_loop_outcome(
+        "Done.",
+        {"rounds": 2},
+        {"tool_calls": [{
+            "tool": "run_command",
+            "args": {"cmd": ["node", "--version"]},
+            "is_error": True,
+            "status": "non_zero_exit",
+            "exit_code": -9,
+            "signal": "SIGKILL",
+            "result": "⚠️ SHELL_EXIT_ERROR: command exited with exit_code=-9 (signal=SIGKILL, cwd=/x).",
+        }]},
+    )
+    execution = killed["outcome_axes"]["execution"]
+    assert execution["status"] == EXECUTION_DEGRADED
+    assert execution["reason_code"] == "tool_failure"
+    assert execution["failure"]["tool_errors"][0]["signal"] == "SIGKILL"
+    assert not execution["cosmetic_tool_errors"]
+
+    plain = derive_loop_outcome(
+        "Done.",
+        {"rounds": 2},
+        {"tool_calls": [{
+            "tool": "run_command",
+            "args": {"cmd": ["find", "/nope"]},
+            "is_error": True,
+            "status": "non_zero_exit",
+            "exit_code": 1,
+            "result": "⚠️ SHELL_EXIT_ERROR: command exited with exit_code=1.",
+        }]},
+    )
+    assert plain["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert plain["outcome_axes"]["execution"]["cosmetic_tool_errors"]
+
+
+def test_cancel_panic_kill_never_reaches_user_verdict_as_tool_failure(tmp_path):
+    """Q2-2=A MANDATORY pin: our OWN cancel/panic SIGKILL of a run_command child
+    must never surface to the owner as a red `tool_failure` verdict.
+
+    Why no leak exists (read from supervisor/task_lifecycle.cancel_task_custody
+    + task_results._is_status_regression): cancellation custody claims the
+    durable cancel intent, kills and JOINS the worker's whole process TREE (the
+    run_command child dies WITH the worker, so the loop never observes the -9
+    and cannot finalize over it), and only then writes the terminal `cancelled`
+    result — which carries NO trace-derived axes. The panic sweep
+    (shell.kill_all_tracked_subprocesses) rides server-wide teardown where the
+    workers die too. The one remaining lane — a late worker write landing AFTER
+    custody's terminal write — is closed by the sticky-terminal monotonic
+    status guard. Both halves are pinned here at the outcomes level, and the
+    kill path itself is EXECUTED (not argued from code reading) by the serial
+    twin ``test_e2e_cancel_of_inflight_run_command_child_never_reads_as_tool_failure``
+    in tests/test_cancel_intents_phase_a.py — custody kills a real worker tree
+    with a live run_command stand-in child and the stored axis is cancelled.
+    Because no false red leaks, the narrow active-cancel-intent classifier
+    filter of Q2-2=A is deliberately NOT implemented (it is specified only IF
+    a leak exists), and no new public status is introduced."""
+    from ouroboros.task_results import load_task_result, write_task_result
+
+    sigkill_trace = {"tool_calls": [{
+        "tool": "run_command",
+        "args": {"cmd": ["python3", "train.py"]},
+        "is_error": True,
+        "status": "non_zero_exit",
+        "exit_code": -9,
+        "signal": "SIGKILL",
+        "result": "⚠️ SHELL_EXIT_ERROR: command exited with exit_code=-9 (signal=SIGKILL, cwd=/x).",
+    }]}
+
+    # 1) Custody's terminal write (shape mirrored from cancel_task_custody):
+    #    status=cancelled, plain result text, no trace-derived axes.
+    write_task_result(
+        tmp_path, "t-cancel", "cancelled",
+        result="Running task cancelled and worker terminated.",
+    )
+    stored = load_task_result(tmp_path, "t-cancel")
+    axes = normalize_outcome_axes(stored)
+    assert axes["execution"]["status"] == "cancelled"
+    assert axes["execution"]["reason_code"] == "cancelled"
+    assert "tool_failure" not in json.dumps(axes)
+
+    # 2) The honest OTHER half of the contract: had the SAME trace terminated
+    #    naturally (no cancel), the signal death IS a real degradation.
+    late = derive_loop_outcome("done", {}, sigkill_trace)
+    assert late["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
+    assert late["outcome_axes"]["execution"]["reason_code"] == "tool_failure"
+
+    # 3) A LATE worker write carrying that degraded outcome cannot clobber the
+    #    cancelled verdict: terminal statuses are sticky (monotonic guard).
+    write_task_result(
+        tmp_path, "t-cancel", "completed",
+        outcome_axes=late["outcome_axes"], result="late worker settle",
+    )
+    stored_after = load_task_result(tmp_path, "t-cancel")
+    assert stored_after["status"] == "cancelled"
+    assert "tool_failure" not in json.dumps(stored_after)
+
+
 def test_tool_arg_sanitizer_uses_value_pattern_redactor():
     args = {
         "cmd": "curl -H 'Authorization: Bearer verylongbearertokenvalue1234567890' https://x",

@@ -223,7 +223,21 @@ def map_backend_path_lexical(executor: ExecutorRef, path_text: str) -> pathlib.P
     raise ValueError(f"path is outside executor backend mappings: {path_text}")
 
 
-def execute(ctx: Any, cmd: list[str], cwd: pathlib.Path, timeout_sec: int) -> ExecutorResult:
+def execute(
+    ctx: Any,
+    cmd: list[str],
+    cwd: pathlib.Path,
+    timeout_sec: int,
+    *,
+    env_overlay: "dict[str, str] | None" = None,
+) -> ExecutorResult:
+    """Run one foreground command in the configured backend.
+
+    ``env_overlay`` (e.g. the interpreter resolver's attested emergency PATH
+    prepend) applies only to the LOCAL backend, which runs on this host; the
+    docker backend deliberately ignores it — host paths and host PATH must not
+    leak into a container environment.
+    """
     executor = executor_ref_from_ctx(ctx)
     if executor is None:
         raise ValueError("no executor_ref configured")
@@ -231,7 +245,11 @@ def execute(ctx: Any, cmd: list[str], cwd: pathlib.Path, timeout_sec: int) -> Ex
     cwd_path = pathlib.Path(cwd).resolve(strict=False)
     backend_cwd = map_host_path(executor, cwd_path)
     if executor.kind == "local":
-        return _execute_local(executor, cmd, cwd_path, timeout_sec, drive_root=_drive_root_from_ctx(ctx))
+        return _execute_local(
+            executor, cmd, cwd_path, timeout_sec,
+            drive_root=_drive_root_from_ctx(ctx),
+            env_overlay=env_overlay,
+        )
     return _execute_docker(executor, cmd, backend_cwd, timeout_sec, drive_root=_drive_root_from_ctx(ctx))
 
 
@@ -250,6 +268,29 @@ def _system_repo_dir() -> str | None:
         return None
 
 
+def overlay_env(base: "dict[str, str]", env_overlay: "dict[str, str] | None") -> dict[str, str]:
+    """Case-aware overlay merge for executor-local and companion child envs.
+
+    Windows env keys are case-insensitive, so an overlaid key replaces any
+    case-variant already present (``Path`` vs ``PATH``) instead of producing a
+    duplicate; POSIX keys stay case-sensitive and are replaced exactly.
+    (The plain-host PATH prepend keeps its own equivalent dedupe in
+    ``process_interpreters.apply_env_path_prepend``.)
+    """
+    env = dict(base)
+    for key, value in (env_overlay or {}).items():
+        if IS_WINDOWS:
+            for existing in [k for k in env if k.upper() == key.upper() and k != key]:
+                del env[existing]
+        env[key] = str(value)
+    return env
+
+
+def _env_with_overlay(env_overlay: "dict[str, str] | None") -> dict[str, str]:
+    """``os.environ`` copy with the caller's overlay applied on top."""
+    return overlay_env(dict(os.environ), env_overlay)
+
+
 def _execute_local(
     executor: ExecutorRef,
     cmd: list[str],
@@ -257,8 +298,9 @@ def _execute_local(
     timeout_sec: int,
     *,
     drive_root: pathlib.Path | None,
+    env_overlay: "dict[str, str] | None" = None,
 ) -> ExecutorResult:
-    started = time.time()
+    started = time.monotonic()
     proc = subprocess.Popen(
         [str(part) for part in cmd],
         cwd=str(cwd),
@@ -267,7 +309,7 @@ def _execute_local(
         stdin=subprocess.DEVNULL,
         text=True,
         errors="replace",
-        env=scrub_repo_from_pythonpath(dict(os.environ), _system_repo_dir()),
+        env=scrub_repo_from_pythonpath(_env_with_overlay(env_overlay), _system_repo_dir()),
         **subprocess_new_group_kwargs(),
     )
     record_path = _register_process(
@@ -334,7 +376,7 @@ def _execute_docker(
         "-lc",
         wrapper,
     ]
-    started = time.time()
+    started = time.monotonic()
     proc = subprocess.Popen(
         docker_cmd,
         stdout=subprocess.PIPE,
@@ -764,7 +806,7 @@ def _trace(executor: ExecutorRef, cwd: str, cmd: list[str], returncode: int | No
         "cwd": cwd,
         "cmd": _redacted_cmd(cmd),
         "returncode": returncode,
-        "elapsed_sec": round(max(0.0, time.time() - started), 3),
+        "elapsed_sec": round(max(0.0, time.monotonic() - started), 3),
         "ts": utc_now_iso(),
     }
 
@@ -793,6 +835,7 @@ def start_service(
     cwd_source: str = "",
     skill_name: str = "",
     keep_alive: bool = False,
+    env_overlay: "dict[str, str] | None" = None,
 ) -> dict[str, Any]:
     executor = executor_ref_from_ctx(ctx)
     if executor is None:
@@ -841,7 +884,11 @@ def start_service(
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            env=_executor_service_env(),
+            # The LOCAL executor is still this host: the attested emergency
+            # bundled-node PATH prepend applies here exactly as on the plain
+            # host lane (adversarial finding A-F2); the docker branch takes no
+            # overlay by design (host paths must not leak into the backend).
+            env=overlay_env(_executor_service_env(), env_overlay),
         )
         log_fh.close()
         record.local_proc = proc

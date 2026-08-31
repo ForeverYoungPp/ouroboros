@@ -583,7 +583,14 @@ export function summarizeLogEvent(evt) {
     }
 
     if (t === 'tool_call_finished') {
-        return view(evt.is_error ? 'error' : 'done', `${evt.tool || 'tool'} ${evt.is_error ? 'failed' : 'finished'}`, {
+        // A child killed by a signal (typed signal name / negative exit code)
+        // is a failure even when the handler rendered a normal result (T11).
+        const signalDeath = Boolean(evt.signal) || (typeof evt.exit_code === 'number' && evt.exit_code < 0);
+        const isError = Boolean(evt.is_error) || signalDeath;
+        const label = signalDeath ? `killed (${evt.signal || evt.exit_code})`
+            : evt.is_error ? 'failed'
+            : 'finished';
+        return view(isError ? 'error' : 'done', `${evt.tool || 'tool'} ${label}`, {
             body: shortText(evt.result_preview, 260),
             meta: taskMeta(formatLogDuration(evt.duration_sec)),
         });

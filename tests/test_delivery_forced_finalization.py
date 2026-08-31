@@ -1587,8 +1587,9 @@ def test_forced_finalization_degrades_broken_json_looking_text_to_retained_candi
 
 
 def test_forced_finalization_keeps_armed_prose_as_the_answer(tmp_path, monkeypatch):
-    """Armed latch + plain prose (not starting with '{'): the fresh text stands
-    — the disclosed residual is prose, never anything JSON-looking."""
+    """Armed latch + plain prose (no protocol object): the fresh text stands.
+    Trailing and fenced protocol objects are contained separately (tests
+    below); the disclosed residual is a control object quoted MID-prose."""
     loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
     _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
     prose = "A reconsidered complete prose answer for the owner."
@@ -1655,40 +1656,59 @@ def test_nonforced_resolver_treats_unknown_verb_object_as_protocol_not_prose(tmp
     assert "delivery_control" not in text2
 
 
-def test_forced_finalization_honors_trailing_replace_after_prose(tmp_path, monkeypatch):
-    """Prose + trailing control object under the armed forced rail: the raw
-    protocol JSON must not ship AND the replace directive must be honored (the
-    historical whole-text-only parse both leaked the JSON and dropped the
-    directive, silently discarding full_answer)."""
+# ---------------------------------------------------------------------------
+# D2c (custody-absorption sprint, owner Q4=A): protocol-intent containment.
+# Both latch-gated resolvers share one fence-strip normalization with
+# observability._is_delivery_control_payload and treat a balanced protocol
+# object at the very END of prose as a protocol attempt — never publishable
+# text. Disclosed residual: a control object quoted MID-prose stays prose.
+
+
+def test_forced_finalization_contains_trailing_protocol_object_in_prose(
+    tmp_path, monkeypatch,
+):
+    """Armed latch + prose ENDING with the protocol object (the incident
+    form): a protocol attempt mixed with text is never honored and never
+    published raw — the retained candidate stands with the typed degraded
+    reason, and the note discloses the preservation (the raw response itself
+    stays persisted by the observability layer; P1)."""
     loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
     _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
-    content = "Here is the summary.\n\n" + json.dumps({
-        "delivery_control": "replace",
-        "full_answer": "THE REAL ANSWER",
-    })
+    mixed = (
+        "Here is a summary of what happened during the run.\n"
+        + json.dumps({"delivery_control": "replace", "full_answer": "smuggled"})
+    )
     monkeypatch.setattr(
         loop, "call_llm_with_retry",
-        lambda *_a, **_k: ({"role": "assistant", "content": content}, 0.0),
+        lambda *_a, **_k: ({"role": "assistant", "content": mixed}, 0.0),
     )
 
-    text, _usage, _returned_trace = loop._forced_final_answer(
+    text, _usage, returned_trace = loop._forced_final_answer(
         limit_ctx, prompt="finalize", fallback_text="fallback", reason_code="round_limit",
     )
 
-    assert "delivery_control" not in text
-    assert text.startswith("THE REAL ANSWER")
-    # The prose prefix is not the answer in armed control resolution.
-    assert "Here is the summary." not in text
-    assert registry._ctx._delivery_control_required is False
+    assert text.startswith("Retained complete answer.")
+    assert '{"delivery_control"' not in text
+    assert "smuggled" not in text
+    candidate = registry._ctx._delivery_candidate
+    assert candidate.degraded is True
+    assert candidate.degraded_reason == "delivery_control_degraded"
+    assert any(
+        "invalid delivery-control object" in str(note)
+        for note in returned_trace.get("reasoning_notes", [])
+    )
 
 
-def test_forced_finalization_honors_trailing_keep_after_prose(tmp_path, monkeypatch):
+def test_forced_finalization_resolves_fenced_control_object(tmp_path, monkeypatch):
+    """A fenced protocol object is still the protocol object (shared
+    fence-strip normalization): a valid fenced keep resolves cleanly to the
+    retained candidate, no fence or raw JSON in the published text."""
     loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
     _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
-    content = "Acknowledged; keeping the answer.\n" + json.dumps({"delivery_control": "keep"})
+    fenced = '```json\n{"delivery_control": "keep"}\n```'
     monkeypatch.setattr(
         loop, "call_llm_with_retry",
-        lambda *_a, **_k: ({"role": "assistant", "content": content}, 0.0),
+        lambda *_a, **_k: ({"role": "assistant", "content": fenced}, 0.0),
     )
 
     text, _usage, _returned_trace = loop._forced_final_answer(
@@ -1697,46 +1717,269 @@ def test_forced_finalization_honors_trailing_keep_after_prose(tmp_path, monkeypa
 
     assert text.startswith("Retained complete answer.")
     assert "delivery_control" not in text
+    assert registry._ctx._delivery_control_required is False
 
 
-def test_unarmed_skill_gate_ships_prose_without_trailing_control(tmp_path):
-    """Unarmed skill gate: prose with a trailing control object is a fresh
-    prose answer — the prose ships, the protocol JSON is stripped."""
+def test_forced_finalization_degrades_fenced_broken_control_to_retained_candidate(
+    tmp_path, monkeypatch,
+):
+    """A fenced BROKEN protocol blob is a mangled protocol attempt after the
+    fence-strip (the leading-brace heuristic applies to the normalized body):
+    the retained candidate stands with the typed degraded reason."""
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    fenced_broken = '```json\n{"delivery_control": "replace", "full_answer": "truncated mid-\n```'
+    monkeypatch.setattr(
+        loop, "call_llm_with_retry",
+        lambda *_a, **_k: ({"role": "assistant", "content": fenced_broken}, 0.0),
+    )
+
+    text, _usage, _returned_trace = loop._forced_final_answer(
+        limit_ctx, prompt="finalize", fallback_text="fallback", reason_code="round_limit",
+    )
+
+    assert text.startswith("Retained complete answer.")
+    assert '{"delivery_control"' not in text
+    candidate = registry._ctx._delivery_candidate
+    assert candidate.degraded is True
+    assert candidate.degraded_reason == "delivery_control_degraded"
+
+
+def test_forced_finalization_keeps_midprose_quotation_as_prose(tmp_path, monkeypatch):
+    """A control object quoted MID-prose stays prose (the disclosed residual
+    of the trailing-object containment rule): Ouroboros legitimately quotes
+    the literal in its own PR bodies and docs."""
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    prose = (
+        'The loop emits {"delivery_control": "keep"} objects during control '
+        "rounds, and the documentation now says so explicitly."
+    )
+    monkeypatch.setattr(
+        loop, "call_llm_with_retry",
+        lambda *_a, **_k: ({"role": "assistant", "content": prose}, 0.0),
+    )
+
+    text, _usage, _returned_trace = loop._forced_final_answer(
+        limit_ctx, prompt="finalize", fallback_text="fallback", reason_code="round_limit",
+    )
+
+    assert text.startswith(prose)
+
+
+def test_nonforced_resolver_contains_trailing_protocol_object_in_prose(tmp_path):
+    """Ordinary resolver, armed latch: prose+trailing protocol object is a
+    protocol attempt — one repair round (the rejected mixed response is
+    retained in the transcript, never destroyed; P1), then degraded-preserve
+    with no protocol JSON in the published text."""
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    candidate = _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    mixed = (
+        "Prose half of a contradictory answer.\n"
+        + json.dumps({"delivery_control": "keep"})
+    )
+
+    status, text = loop._resolve_delivery_control(mixed, registry, limit_ctx, trace)
+
+    assert status == "retry"
+    assert text == ""
+    assert candidate.repair_attempted is True
+    assert any(
+        m.get("role") == "assistant" and m.get("content") == mixed
+        for m in limit_ctx.messages
+    )
+    assert "DELIVERY_CONTROL_REPAIR" in str(limit_ctx.messages[-1]["content"])
+
+    status2, text2 = loop._resolve_delivery_control(mixed, registry, limit_ctx, trace)
+
+    assert status2 == "degraded"
+    assert text2 == candidate.full_text
+    assert '{"delivery_control"' not in text2
+    assert candidate.finalization_control == "degraded_preserve"
+    assert candidate.degraded_reason == "invalid_delivery_control_after_repair"
+
+
+def test_forced_finalization_contains_trailing_fenced_protocol_object(
+    tmp_path, monkeypatch,
+):
+    """Armed latch + prose ending with a FENCED protocol object (models fence
+    JSON by default): the same protocol attempt as a bare trailing object —
+    never honored, never published raw."""
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    mixed = (
+        "Here is my final summary of the run.\n```json\n"
+        + json.dumps({"delivery_control": "replace", "full_answer": "smuggled"})
+        + "\n```"
+    )
+    monkeypatch.setattr(
+        loop, "call_llm_with_retry",
+        lambda *_a, **_k: ({"role": "assistant", "content": mixed}, 0.0),
+    )
+
+    text, _usage, _trace = loop._forced_final_answer(
+        limit_ctx, prompt="finalize", fallback_text="fallback", reason_code="round_limit",
+    )
+
+    assert text.startswith("Retained complete answer.")
+    assert '{"delivery_control"' not in text
+    assert "smuggled" not in text
+    candidate = registry._ctx._delivery_candidate
+    assert candidate.degraded is True
+    assert candidate.degraded_reason == "delivery_control_degraded"
+
+
+def test_nonforced_resolver_contains_trailing_fenced_protocol_object(tmp_path):
+    """Ordinary resolver, armed latch: prose + trailing FENCED protocol object
+    is a protocol attempt — repair round, then degraded-preserve, protocol
+    JSON never published."""
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    candidate = _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    mixed = (
+        "Prose half of a contradictory answer.\n```json\n"
+        + json.dumps({"delivery_control": "keep"})
+        + "\n```"
+    )
+
+    status, _text = loop._resolve_delivery_control(mixed, registry, limit_ctx, trace)
+    assert status == "retry"
+
+    status2, text2 = loop._resolve_delivery_control(mixed, registry, limit_ctx, trace)
+    assert status2 == "degraded"
+    assert text2 == candidate.full_text
+    assert '{"delivery_control"' not in text2
+
+
+def test_parse_body_survives_degenerate_nested_trailing_blob(tmp_path):
+    """A repetition-loop blob (deeply nested braces) after prose must classify
+    as not-a-control instead of escaping RecursionError into the round loop."""
+    from ouroboros import loop
+
+    blob = "prose answer text\n" + '{"a":' * 2000 + "1" + "}" * 2000
+    parsed, duplicate, embedded = loop._parse_delivery_control_body(blob)
+    assert parsed is None and duplicate is False and embedded is False
+
+
+def test_nonforced_resolver_accepts_fenced_control_object(tmp_path):
+    """Ordinary resolver, armed latch: a valid FENCED keep resolves cleanly
+    after the shared fence-strip normalization."""
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    candidate = _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    fenced = '```json\n{"delivery_control": "keep"}\n```'
+
+    status, text = loop._resolve_delivery_control(fenced, registry, limit_ctx, trace)
+
+    assert status == "resolved"
+    assert text == candidate.full_text
+    assert registry._ctx._delivery_control_required is False
+
+
+def test_nonforced_resolver_hold_treats_midprose_quotation_as_prose(tmp_path):
+    """Under the absorption HOLD a mid-prose quotation of the literal is NOT
+    control intent: the reconsidered prose answer proceeds as fresh."""
     loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
     candidate = loop._replace_delivery_candidate(
         registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
     )
-    candidate.finalization_control = "skill_action_or_revision_required"
+    candidate.finalization_control = "child_absorption_or_revision_required"
     registry._ctx._delivery_control_required = False
-    content = "Here is the reconsidered full answer.\n\n" + json.dumps(
-        {"delivery_control": "keep"},
+    prose = (
+        'As noted, the loop can emit {"delivery_control": "keep"} in control '
+        "rounds; my reconsidered final answer stands on its own."
     )
 
-    status, text = loop._resolve_delivery_control(content, registry, limit_ctx, trace)
+    status, text = loop._resolve_delivery_control(prose, registry, limit_ctx, trace)
 
     assert status == "fresh"
-    assert text == "Here is the reconsidered full answer."
-    assert "delivery_control" not in text
-    # Control flow unchanged: the gate stays armed for a real action/revision.
-    assert candidate.finalization_control == "skill_action_or_revision_required"
+    assert text == prose
 
 
-def test_unarmed_owner_revision_ships_prose_without_trailing_control(tmp_path):
+def test_nonforced_resolver_absorption_hold_escalates_typed_control(tmp_path):
+    """A typed keep cannot acknowledge the absorption action gate: parity
+    with the skill hold — the control attempt escalates to the existing
+    replace-required round (the absorption gate itself still forces
+    best_effort downstream regardless)."""
     loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
     candidate = loop._replace_delivery_candidate(
         registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
     )
-    candidate.finalization_control = "owner_revision_required"
+    candidate.finalization_control = "child_absorption_or_revision_required"
     registry._ctx._delivery_control_required = False
-    content = "Fresh substantive answer for the owner.\n" + json.dumps(
-        {"delivery_control": "replace", "full_answer": "stale directive"},
+
+    status, text = loop._resolve_delivery_control(
+        '{"delivery_control":"keep"}', registry, limit_ctx, trace,
     )
 
-    status, text = loop._resolve_delivery_control(content, registry, limit_ctx, trace)
+    assert status == "retry"
+    assert text == ""
+    assert candidate.finalization_control == "skill_revision_required_repair_requested"
+    assert registry._ctx._delivery_control_required is True
+    assert "keep is NOT allowed" in str(limit_ctx.messages[-1]["content"])
+
+
+def test_nonforced_resolver_passes_mixed_prose_json_when_latch_not_armed(tmp_path):
+    """Latch OFF: prose+JSON through the ORDINARY resolver passes untouched —
+    parity with the forced latch-off pin above."""
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    loop._replace_delivery_candidate(
+        registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
+    )
+    registry._ctx._delivery_control_required = False
+    mixed = "Final summary for the owner.\n" + json.dumps({"delivery_control": "keep"})
+
+    status, text = loop._resolve_delivery_control(mixed, registry, limit_ctx, trace)
 
     assert status == "fresh"
-    assert text == "Fresh substantive answer for the owner."
-    assert "delivery_control" not in text
+    assert text == mixed
+
+
+def test_forced_rail_truncated_trailing_fragment_is_a_disclosed_residual(
+    tmp_path, monkeypatch,
+):
+    """Pin the THIRD disclosed containment residual: an armed forced rail
+    publishes prose ending with a TRUNCATED (unbalanced) protocol fragment as
+    prose — a fragment is not a parseable object, and containing it would need
+    the substring scanning the containment rule deliberately rejects
+    (ARCHITECTURE ~1024 / DEVELOPMENT ~2196)."""
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    truncated = (
+        "Here is my summary before the cut.\n"
+        '{"delivery_control": "replace", "full_answer": "cut'
+    )
+    monkeypatch.setattr(
+        loop, "call_llm_with_retry",
+        lambda *_a, **_k: ({"role": "assistant", "content": truncated}, 0.0),
+    )
+
+    text, _usage, _trace = loop._forced_final_answer(
+        limit_ctx, prompt="finalize", fallback_text="fallback", reason_code="round_limit",
+    )
+
+    assert text.startswith("Here is my summary before the cut.")
+    assert '"delivery_control"' in text  # the documented residual, not a leak fix
+    candidate = registry._ctx._delivery_candidate
+    # The fragment rode the rail's ORDINARY forced packaging (degraded by the
+    # rail reason), never the protocol-containment path.
+    assert candidate.degraded_reason == "round_limit"
+    assert candidate.finalization_control == "forced_replace:round_limit"
+
+
+def test_salvage_predicate_keeps_mixed_answers_and_skips_pure_protocol():
+    """observability's salvage predicate keeps its latch-free whole-object
+    semantics after the fence-strip sharing: a MIXED prose+object answer
+    stays salvageable (never destroyed), while the pure — optionally fenced —
+    protocol object is skipped as a non-answer (it remains forensic evidence
+    in the observability store)."""
+    from ouroboros.observability import _is_delivery_control_payload
+
+    assert _is_delivery_control_payload('{"delivery_control": "keep"}') is True
+    assert _is_delivery_control_payload(
+        '```json\n{"delivery_control": "keep"}\n```'
+    ) is True
+    assert _is_delivery_control_payload(
+        'Real answer text.\n{"delivery_control": "keep"}'
+    ) is False
 
 
 def test_children_unabsorbed_forced_path_never_leaks_protocol_json(tmp_path, monkeypatch):
@@ -1861,6 +2104,124 @@ def test_forced_children_unabsorbed_rail_runs_acceptance_with_debt_evidence(
     outcome = derive_loop_outcome(text, usage, returned_trace)
     assert outcome["outcome_axes"]["execution"]["status"] == "best_effort"
     assert outcome["outcome_axes"]["execution"]["reason_code"] == "children_unabsorbed"
+
+
+def test_forced_rail_reads_current_child_state_across_the_forced_call(
+    tmp_path, monkeypatch,
+):
+    """D2b: a child flips running->completed ACROSS the forced model call.
+    The forced prompt lists the fresh pre-call truth (running), while the
+    acceptance debt is recomputed adjacent to the panel's own subtree read
+    (completed) — one packet, one moment, no two-status child — and the host
+    orphan note still names the undecided child."""
+    _write_child(tmp_path, status="running")
+    panel = _acceptance_panel_result(
+        aggregate="PASS",
+        actors=[{
+            "slot_id": "s0", "signal": "PASS",
+            "parsed": {
+                "verdict": "PASS", "outcome_tier": "solved",
+                "criteria_used": [{
+                    "criterion": "owner request", "status": "supported",
+                    "evidence_refs": ["artifact:1"],
+                }],
+            },
+        }],
+    )
+    loop, registry, limit_ctx, trace, seen_evidence, panel_calls = (
+        _forced_absorption_acceptance_context(tmp_path, monkeypatch, panel)
+    )
+    seen_requests = []
+
+    def flip_and_answer(_llm, request_messages, *_a, **_k):
+        seen_requests.append([dict(m) for m in request_messages])
+        _write_child(tmp_path, status="completed")
+        # The mocked answer deliberately does NOT name the child: the final
+        # "child1 in text" assertion below is satisfiable only by the host
+        # orphan note, so the note's presence is genuinely verified.
+        return (
+            {"role": "assistant", "content": "Best-effort final answer."},
+            0.0,
+        )
+
+    monkeypatch.setattr(loop, "call_llm_with_retry", flip_and_answer)
+
+    result = loop._maybe_enforce_child_absorption_gate(
+        registry, limit_ctx, "", limit_ctx.messages, lambda _t: None, trace,
+    )
+
+    assert result is not None and result != "continue"
+    text, usage, _returned_trace = result
+    assert usage["reason_code"] == "children_unabsorbed"
+    assert panel_calls["count"] == 1
+    forced_prompt = "\n".join(
+        str(m.get("content") or "") for m in seen_requests[0]
+    )
+    assert "child1 [running]" in forced_prompt
+    debt = seen_evidence["undispositioned_children"]
+    assert [row["task_id"] for row in debt] == ["child1"]
+    assert debt[0]["status"] == "completed"
+    subtree = {
+        str(row.get("task_id")): str(row.get("status"))
+        for row in seen_evidence.get("terminal_subtree_statuses", [])
+    }
+    assert subtree.get("child1") == "completed"
+    assert "child1" in text
+
+
+def test_post_tool_evidence_change_holds_while_absorption_gate_open(tmp_path):
+    """grok #9: a post-tool evidence change while undispositioned children
+    remain must HOLD the candidate again, not arm — arming would reintroduce
+    the conflicting-instruction round the absorption hold exists to prevent."""
+    _write_child(tmp_path, status="running")
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    candidate = loop._replace_delivery_candidate(
+        registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
+    )
+    loop._hold_delivery_for_skill_action(
+        registry, trace, control="child_absorption_or_revision_required",
+    )
+    registry._ctx._owner_directives = ["fresh owner directive"]
+    before = len(limit_ctx.messages)
+
+    loop._prepare_post_tool_budget_context(
+        registry, limit_ctx, trace, "test-model", False, "medium",
+    )
+
+    assert registry._ctx._delivery_control_required is False
+    assert candidate.finalization_control == "child_absorption_or_revision_required"
+    assert all(
+        "[DELIVERY_FINALIZATION_CONTROL]" not in str(m.get("content") or "")
+        for m in limit_ctx.messages[before:]
+    )
+
+
+def test_post_tool_evidence_change_arms_after_children_dispositioned(tmp_path):
+    """Once every child is dispositioned the absorption gate is closed: the
+    same evidence-change seam escalates through the ordinary arm (the free
+    post-action escalation path)."""
+    _write_child(tmp_path)
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    candidate = loop._replace_delivery_candidate(
+        registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
+    )
+    loop._hold_delivery_for_skill_action(
+        registry, trace, control="child_absorption_or_revision_required",
+    )
+    _write_confirmed_disposition(
+        tmp_path, disposition="integrated", rationale="absorbed the child result",
+    )
+
+    loop._prepare_post_tool_budget_context(
+        registry, limit_ctx, trace, "test-model", False, "medium",
+    )
+
+    assert registry._ctx._delivery_control_required is True
+    assert candidate.finalization_control == "effect_revision_required"
+    assert any(
+        "[DELIVERY_FINALIZATION_CONTROL]" in str(m.get("content") or "")
+        for m in limit_ctx.messages
+    )
 
 
 def test_forced_rail_terminalizes_a_requested_improvement_pass(tmp_path, monkeypatch):
@@ -2228,3 +2589,4 @@ def test_forced_bypass_probe_failure_records_unknown_eligibility(tmp_path, monke
         "trigger": "bypassed_round_limit",
     }
     assert "acceptance_decision" not in trace
+

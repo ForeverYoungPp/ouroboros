@@ -1,11 +1,16 @@
-"""In-process validated-rows memo and render cache for ledger display reads.
+"""In-process read acceleration for the usage ledger, beside the substrate.
 
 Extracted from ``usage_accounting.py`` at the perf2 P1 render-cache round for
 the same reason ``_usage_rows.py`` exists: the accounting module sits at the
-hard module-size gate and this layer is a self-contained seam. It is the READ
-acceleration for display projections only — write paths keep their own full
-locked reads — and it deliberately lives beside, not inside,
-``usage_ledger.py``: the substrate stays cache-ignorant.
+hard module-size gate and this layer is a self-contained seam. It carries the
+ledger's two in-process caches — the validated-rows memo + render cache for
+display projections, and the in-lock warm read cache the monetary write paths
+use (razzant/ouroboros#129) — and it deliberately lives beside, not inside,
+``usage_ledger.py``: the substrate stays cache-ignorant. In every case the
+full ``_read_records_locked`` replay remains the authority and the sole owner
+of quarantine; a cache can only ever change the COST of a read, never its
+result, because ``_read_new_records_locked`` re-stats the file under the held
+lock and refuses to resume on any doubt.
 
 ``usage_accounting`` re-binds every name here, and the implementation resolves
 the substrate (``_locked``, ``_read_records_locked``, ...) through the
@@ -15,13 +20,17 @@ exactly as when the code was inline.
 """
 from __future__ import annotations
 
+import collections
 import copy
+import logging
 import pathlib
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Tuple
 
 from ouroboros.usage_ledger import QUARANTINE_REL, LedgerResumeState
+
+log = logging.getLogger(__name__)
 
 
 def _ua():
@@ -54,10 +63,12 @@ class _LedgerRowsMemo:
 
 # Read-side memo per RESOLVED drive root. Populated and advanced only under the
 # cross-process ledger lock; the module lock guards the dict itself. Write paths
-# (reserve/_transition/settle/import) never touch it — their own full locked
-# reads stay the monetary authority, and the stat + seq-continuity check on the
-# next read is what makes a stale memo impossible to serve, so correctness never
-# depends on any writer remembering to invalidate.
+# (reserve/_transition/settle/import) never touch it — they read through their
+# own in-lock cache below (full ordered records, which seq assignment and
+# whole-history append validation need; this memo keeps only final rows), and
+# the stat + seq-continuity check on the next read is what makes a stale memo
+# impossible to serve, so correctness never depends on any writer remembering
+# to invalidate.
 _ROWS_MEMO: Dict[str, _LedgerRowsMemo] = {}
 _ROWS_MEMO_LOCK = threading.Lock()
 
@@ -161,3 +172,55 @@ def _render_cached(
             if _ROWS_MEMO.get(key) is memo and memo.generation == generation:
                 memo.renders[full_key] = copy.deepcopy(result)
     return result
+
+
+# razzant/ouroboros#129: the in-lock write paths (reserve/settle/_transition/
+# release/legacy-import) each did a full parse+validate of the whole ledger
+# under the 45s monetary flock, and the file grows unboundedly. This is their
+# per-process warm cache of the last validated read per drive root: the next
+# in-lock read parses only the bytes appended since. It is distinct from
+# ``_ROWS_MEMO`` because writers need the FULL ordered records list (seq
+# assignment + whole-history append validation), not just final rows. Rows are
+# shared read-only snapshots, same as the memo's.
+_LEDGER_READ_CACHE: "collections.OrderedDict[str, Tuple[LedgerResumeState, list]]" = (
+    collections.OrderedDict()
+)
+_LEDGER_READ_CACHE_LOCK = threading.Lock()
+_LEDGER_READ_CACHE_MAX_ROOTS = 8
+
+
+def _ledger_cache_put(key: str, value: "Tuple[LedgerResumeState, list]") -> None:
+    with _LEDGER_READ_CACHE_LOCK:
+        _LEDGER_READ_CACHE[key] = value
+        _LEDGER_READ_CACHE.move_to_end(key)
+        while len(_LEDGER_READ_CACHE) > _LEDGER_READ_CACHE_MAX_ROOTS:
+            _LEDGER_READ_CACHE.popitem(last=False)
+
+
+def _read_records_locked_cached(root: pathlib.Path) -> list:
+    """``_read_records_locked`` with an incremental warm path. Call under the
+    held ledger lock (same contract as ``_read_records_locked``)."""
+    ua = _ua()
+    key = str(pathlib.Path(root).resolve(strict=False))  # one slot per physical root
+    with _LEDGER_READ_CACHE_LOCK:
+        cached = _LEDGER_READ_CACHE.get(key)
+    if cached is not None:
+        resume, rows = cached
+        try:
+            delta = ua._read_new_records_locked(root, resume)
+        except Exception:  # noqa: BLE001 — any doubt = fall back to the full read
+            delta = None
+        if delta is not None:
+            new_rows, new_resume = delta
+            merged = rows if not new_rows else [*rows, *new_rows]
+            _ledger_cache_put(key, (new_resume, merged))
+            return list(merged)
+    records = ua._read_records_locked(root)
+    try:
+        resume = ua._ledger_resume_state(root, records)
+        _ledger_cache_put(key, (resume, list(records)))
+    except Exception:  # noqa: BLE001 — caching is best-effort; correctness is the full read
+        log.debug("ledger read-cache seed failed for %s", key, exc_info=True)
+        with _LEDGER_READ_CACHE_LOCK:
+            _LEDGER_READ_CACHE.pop(key, None)
+    return records

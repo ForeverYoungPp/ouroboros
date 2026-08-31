@@ -248,6 +248,13 @@ def _with_correlation(payload: Dict[str, Any], correlation: Dict[str, Any], *, t
 
 
 _PER_CALL_TIMEOUT_TOOLS = ("run_command", "run_script")
+# Process tools whose handler publishes TYPED process facts (exit_code, POSIX
+# signal name, duration_ms — plus resolved_runtime when the interpreter
+# resolver substituted the executable) through the thread-local channel in
+# ouroboros.tools.process_facts. Typed facts take PRECEDENCE over the regex harvest
+# below (_EXIT_CODE_RE/_SIGNAL_RE), which remains as the read-fallback for
+# records that lack typed meta (older traces, prose-only paths).
+_PROCESS_META_TOOLS = frozenset({"run_command", "run_script"})
 # Structural ordering margin: the outer cap sits this far above the requested
 # per-call timeout so the handler's own (cleanly-messaged) subprocess timeout
 # fires first, before the outer thread-kill. Not a wait duration — a race margin.
@@ -678,6 +685,15 @@ def _execute_single_tool(
 
     args_for_log = sanitize_tool_args_for_log(fn_name, args if isinstance(args, dict) else {})
 
+    typed_process_meta = fn_name in _PROCESS_META_TOOLS
+    if typed_process_meta:
+        # Defensive: drop any stale thread-local facts before dispatch so a
+        # process-tool path that runs NO process (arg errors, blocks) can never
+        # inherit a previous call's measurements.
+        from ouroboros.tools.process_facts import consume_last_process_facts
+
+        consume_last_process_facts()
+
     tool_ok = True
     try:
         result = tools.execute(fn_name, args)
@@ -694,6 +710,21 @@ def _execute_single_tool(
 
     is_error = _is_tool_execution_failure(tool_ok, result)
     result_meta = _extract_result_metadata(fn_name, result, is_error)
+    if typed_process_meta:
+        # R5 (node-runtime sprint): merge the handler's TYPED process facts into
+        # the call's result_meta. When a typed publication exists it owns the
+        # WHOLE fact family — including the ABSENCE of a member: a regex hit on
+        # the child's own stdout (e.g. `signal=SIGKILL` inside grepped log
+        # output) must not survive beside honest typed facts, or D7 would
+        # manufacture a false red from prose. The regex path above stays intact
+        # as the fallback for records that carry no typed meta.
+        from ouroboros.tools.process_facts import PROCESS_FACT_KEYS
+
+        process_facts = consume_last_process_facts()
+        if process_facts:
+            for stale_key in PROCESS_FACT_KEYS:
+                result_meta.pop(stale_key, None)
+            result_meta.update(process_facts)
 
     trace_ref = {}
     try:

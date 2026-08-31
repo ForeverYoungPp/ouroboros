@@ -123,8 +123,7 @@ def _accept_obligation_row(o: Dict[str, Any]) -> Dict[str, Any]:
             row["previous_agent_reason"] = _accept_redact_cap(
                 str(o.get("previous_reason")), 600,
             )
-    # The LAST counter-argument in the exchange: why the previous panel overruled
-    # the agent's rebuttal. Without it this panel re-adjudicates one side only and
+    # The LAST counter-argument in the exchange — without it this panel
     # cannot tell "already answered" from "never answered".
     if str(o.get("reviewer_rebuttal_response") or "").strip():
         row["previous_reviewer_response"] = _accept_redact_cap(
@@ -311,6 +310,18 @@ def _accept_verification_summary(receipts: list) -> Dict[str, Any]:
         "latest_identity": _latest_identity,
         "latest_check": _latest_identity["check"],
         "latest_returncode": latest.get("returncode"),
+        # Disclosure keys (node-runtime sprint, D6/R4), mirroring the fixed
+        # ledger projection (`verification_receipt_ledger_row`) — a receipt key
+        # missing from EITHER side is silently dropped, so both carry them.
+        # Present only when the latest receipt has them: `latest_duration_ms`
+        # (check process lifetime), `latest_signal` (POSIX signal name of a
+        # killed check — a 9ms SIGKILL is not an ordinary red), and
+        # `latest_resolved_runtime` (the substituted physical executable;
+        # absent = the recorded check argv ran as written). The path is raw
+        # host surface, so it goes through the redacting bound.
+        **({"latest_duration_ms": latest.get("duration_ms")} if latest.get("duration_ms") is not None else {}),
+        **({"latest_signal": str(latest.get("signal") or "")} if latest.get("signal") else {}),
+        **({"latest_resolved_runtime": _accept_redact_cap(str(latest.get("resolved_runtime") or ""), 300)} if latest.get("resolved_runtime") else {}),
         "latest_expected_match": str(latest.get("expected_match") or ""),
         "latest_summary": _accept_redact_cap(str(latest.get("summary") or ""), 2000),
         # C: aggregate the after-only artifact-lifecycle flag across ALL receipts (a deleted
