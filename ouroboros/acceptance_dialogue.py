@@ -445,6 +445,18 @@ def _apply_task_acceptance_result(
     )
     _attach_dialogue_to_host_run(ctx.llm_trace, dialogue)
     dialogue_terminal = dialogue["status"] in DIALOGUE_TERMINAL_STATUSES
+    if reused and getattr(result, "replayed_from_superseded", False):
+        # A run superseded by an evidence revision replays ONLY into the typed
+        # identical-refusal terminal — never into clean-PASS authorization: its
+        # verdict predates the evidence change, so re-accepting would stamp a
+        # stale PASS (and the trace's superseded rows would contradict the
+        # applied decision — the delivery binding could never match). The
+        # refusal is conservative and consistent: nothing new was bought,
+        # nothing stale is re-authorized.
+        return _refuse_identical_acceptance(
+            ctx, result,
+            dialogue=dialogue, dissent=bool(dissent), open_obligations=open_obligations,
+        )
     if task_acceptance_is_clean(result):
         ctx.tools._ctx._task_acceptance_reviewed = True
         loop._end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")

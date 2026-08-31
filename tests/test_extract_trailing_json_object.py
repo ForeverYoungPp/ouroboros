@@ -117,3 +117,13 @@ def test_unbalanced_prose_prefix_still_finds_the_trailing_directive():
     inline = "broken { prose {\"delivery_control\": \"keep\"}"
     _, parsed3, _ = extract_trailing_json_object(inline)
     assert parsed3 is None
+
+
+def test_unparseable_balanced_tail_returns_the_text_whole():
+    """final-lane fable finding: a structurally balanced tail that fails
+    json.loads (single-quoted pseudo-JSON) is PROSE — the caller gets the
+    whole text back, never a silently truncated prefix. Only the
+    duplicate-key case keeps the split (protocol-repair intent)."""
+    text = "some prose\n{'delivery_control': 'keep'}"
+    prefix, parsed, dup = extract_trailing_json_object(text)
+    assert (prefix, parsed, dup) == (text, None, False)

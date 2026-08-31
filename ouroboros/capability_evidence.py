@@ -539,7 +539,12 @@ def record_token_density(
     density = _density_of(prompt_chars, prompt_tokens)
     if not fp or density <= 0:
         return
-    memo_key = f"{fp}\0{route}"
+    # ``basis`` is part of the witness identity end-to-end: the main resolver
+    # accepts only bounded_proxy rows, so a fresh RAW row at the same numeric
+    # density must not throttle the FIRST bounded witness as "no drift" —
+    # that left the resolver cold for the whole freshness window on an
+    # upgraded store (final-lane finding, probe-reproduced).
+    memo_key = f"{fp}\0{route}\0{basis}"
     memo = _DENSITY_MEMO.get(memo_key)
     if (
         memo and _age_seconds(memo[1]) < _TOKEN_DENSITY_FRESH_SEC
@@ -557,7 +562,11 @@ def record_token_density(
                 and _age_seconds(str(pair.get("observed_at") or "")) < _TOKEN_DENSITY_TTL_SEC
                 and _density_of(pair.get("prompt_chars"), pair.get("prompt_tokens")) > 0
             ]
-            route_pairs = [pair for pair in pairs if str(pair.get("route_fp") or "") == route]
+            route_pairs = [
+                pair for pair in pairs
+                if str(pair.get("route_fp") or "") == route
+                and str(pair.get("basis") or "raw") == str(basis or "raw")
+            ]
             newest = max(
                 enumerate(route_pairs),
                 key=lambda item: (*_density_recency_key(item[1]), item[0]),

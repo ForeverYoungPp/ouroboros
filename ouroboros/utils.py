@@ -832,12 +832,14 @@ def extract_trailing_json_object(
     if trimmed[cut + 1:].startswith("```"):
         prefix = trimmed[:cut] if cut != -1 else ""
     duplicate_flagged = False
+    duplicate_any = False
 
     def _unique_object(pairs: List[tuple]) -> Dict[str, Any]:
-        nonlocal duplicate_flagged
+        nonlocal duplicate_flagged, duplicate_any
         result: Dict[str, Any] = {}
         for key, item in pairs:
             if key in result:
+                duplicate_any = True
                 if key in duplicate_flag_keys:
                     duplicate_flagged = True
                 raise ValueError(f"duplicate key: {key}")
@@ -852,6 +854,14 @@ def extract_trailing_json_object(
         parsed = None
     if not isinstance(parsed, dict):
         parsed = None
+    if parsed is None and not duplicate_any:
+        # Contract: non-directive text comes back WHOLE. A structurally
+        # balanced tail that fails to parse (single-quoted pseudo-JSON, a bare
+        # word) is prose, and returning the truncated prefix here would hand a
+        # future caller a silent tail loss. ANY duplicate-key rejection keeps
+        # the split: that tail IS a strict-parser-refused directive shape, and
+        # protocol-repair intent needs the prefix/tail boundary.
+        return raw, None, False
     return prefix, parsed, duplicate_flagged
 
 

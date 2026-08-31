@@ -500,3 +500,24 @@ def test_superseded_paid_identity_still_replays_the_identical_refusal(tmp_path):
     # A DIFFERENT identity buys nothing from the superseded run.
     _, prior3 = _prior_acceptance_run(SimpleNamespace(), trace, "bh-new", paid_identity="pi-2")
     assert prior3 is None
+
+
+def test_superseded_clean_pass_replays_into_refusal_never_reaccepts(monkeypatch, tmp_path):
+    """final-lane sol MAJOR: a clean-PASS panel superseded by an evidence
+    revision must NOT re-authorize on an identical resubmission — the verdict
+    predates the evidence change. The replay lands in the typed refusal
+    terminal (conservative and consistent with the superseded trace rows)."""
+    result = ReviewRunResult(
+        request={"surface": "task_acceptance", "policy": {"min_successful_slots": 1}},
+        actors=[_actor("s0", "PASS", {"verdict": "PASS", "outcome_tier": "solved",
+                                      "dialogue_status": "unreachable_here"})],
+        parsed_findings=[],
+        aggregate_signal="PASS",
+    )
+    setattr(result, "replayed_from_superseded", True)
+    _no_fence(monkeypatch)
+    trace: dict = {"tool_calls": [], "review_runs": []}
+    ctx = _ctx(tmp_path, trace=trace)
+    assert _apply_task_acceptance_result(ctx, result, reused=True, record_run=False) is False
+    decision = trace["acceptance_decision"]
+    assert decision["reason"] == "identical_acceptance_refused"

@@ -1003,9 +1003,14 @@ def _evaluate_bounded(page: Any, expression: str, timeout_ms: int = 30000) -> An
     """
     ms = max(int(timeout_ms or 0), 1)
     src = json.dumps(str(expression))
+    # INDIRECT eval ("(0, eval)") like the driver's global.eval: the snippet
+    # runs in GLOBAL scope, so `var`/function declarations persist across
+    # evaluate calls (cross-call parity) and the wrapper's own lexical
+    # `__obo_result` binding is invisible to user code (a direct eval exposed
+    # it as a TDZ ReferenceError).
     wrapped = (
         "() => Promise.race(["
-        "Promise.resolve().then(() => { const __obo_result = eval(" + src + "); "
+        "Promise.resolve().then(() => { const __obo_result = (0, eval)(" + src + "); "
         "return typeof __obo_result === 'function' ? __obo_result() : __obo_result; }), "
         "new Promise((_, reject) => setTimeout(() => reject(new Error("
         "'evaluate timed out after " + str(ms) + "ms')), " + str(ms) + "))])"

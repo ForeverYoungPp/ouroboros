@@ -177,3 +177,29 @@ def test_legacy_and_raw_rows_never_calibrate_the_fit(tmp_path):
     density, source = resolve_main_token_density(tmp_path, "route-1", "openai/gpt-test")
     assert source == "fresh_route_usage"
     assert abs(density - 14_500 / 15_000) < 0.01
+
+
+def test_raw_witness_never_throttles_the_first_bounded_witness(tmp_path):
+    """final-lane sol MAJOR: on an upgraded store a fresh RAW row at the same
+    numeric density must not suppress the FIRST bounded_proxy write as
+    'no drift' — that left the main resolver cold for the whole freshness
+    window. Throttle identity and newest-row comparison are basis-scoped."""
+    from ouroboros.capability_evidence import (
+        _DENSITY_MEMO,
+        record_token_density,
+        resolve_main_token_density,
+    )
+
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        tmp_path, "openai/gpt-test", prompt_chars=400_000, prompt_tokens=150_000,
+        route_fp="route-t", basis="raw",
+    )
+    # Same numeric density, DIFFERENT basis: must persist, not throttle away.
+    record_token_density(
+        tmp_path, "openai/gpt-test", prompt_chars=400_000, prompt_tokens=150_000,
+        route_fp="route-t", basis="bounded_proxy",
+    )
+    density, source = resolve_main_token_density(tmp_path, "route-t", "openai/gpt-test")
+    assert source == "fresh_route_usage"
+    assert abs(density - 1.5) < 0.01
