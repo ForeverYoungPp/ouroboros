@@ -430,3 +430,33 @@ def test_grounding_row_never_consumes_the_history_quota():
     assert counts({"direction": "out", "chat_id": 1, "text": "hi"})
     assert not counts({"direction": "out", "chat_id": 1,
                        "type": "routing_options", "text": "1. A"})
+
+
+def test_compare_and_append_refuses_under_the_lock(tmp_path):
+    """Delta-review follow-up: the CAS branches inside append_chat_annotation
+    — losing the status race and hitting a foreign token — refuse WITHOUT
+    writing, and an unconditional append still works."""
+    _seed_refusal(tmp_path, token="tok-1")
+    # Status mismatch: latest is needs_manual_target, caller requires closed.
+    assert not append_chat_annotation(
+        tmp_path, "cm-1", action="route_decision", status="dispatch_pending",
+        routing_token="tok-1", require_latest_status={"delivered"},
+    )
+    # Token mismatch: a newer attempt owns the card.
+    assert not append_chat_annotation(
+        tmp_path, "cm-1", action="route_decision", status="dispatch_pending",
+        routing_token="tok-0", require_latest_status={"needs_manual_target"},
+        require_latest_token={"tok-0"},
+    )
+    untouched = chat_annotation_receipt(tmp_path, "cm-1", "tok-1")
+    assert untouched["status"] == "needs_manual_target"
+    # Matching guards write; unconditional append never checks.
+    assert append_chat_annotation(
+        tmp_path, "cm-1", action="route_decision", status="dispatch_pending",
+        routing_token="tok-1", require_latest_status={"needs_manual_target"},
+        require_latest_token={"tok-1"},
+    )
+    assert append_chat_annotation(
+        tmp_path, "cm-1", action="route_decision", status="needs_manual_target",
+        routing_token="tok-1",
+    )
