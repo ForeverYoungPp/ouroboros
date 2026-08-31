@@ -157,6 +157,94 @@ def _emit_audit_evidence(drive_root: Any, result: Mapping[str, Any]) -> None:
         })
 
 
+_EVIDENCE_COUNTER_KEYS = (
+    "delegated_runs_started", "delegated_runs_settled",
+    "delegated_runs_succeeded", "delegated_runs_failed",
+    "delegated_runs_source_unresolved",
+)
+
+
+def _stored_evidence_stale(existing: Mapping[str, Any], live: Mapping[str, Any]) -> bool:
+    """True when the stored CURRENT-TRUTH substrate surfaces disagree with custody.
+
+    Only tasks that ever wrote the harness-dispatch mirror participate: a task
+    with neither top-level counters nor an envelope evidence block was not
+    delegated, and minting one here would fabricate a dispatch record.
+
+    Owner Q2=B x this sprint's 1=A, reconciled by SURFACE: the top-level
+    ``delegated_runs_*`` counters are a HISTORICAL SNAPSHOT at the original
+    terminal write and are deliberately NOT compared here — they may honestly
+    read ``settled: 0`` beside a later settlement forever. The current-truth
+    surfaces are what staleness means: the ``subagent_envelope`` evidence
+    mirror, ``actual_substrate``, and ``subscription_cost_usd`` — the fields
+    whose lie (``harness_attempted``/free after a paid successful run) the
+    audit reproduced.
+    """
+    envelope = existing.get("subagent_envelope")
+    stored_ev = (envelope or {}).get("execution_evidence") if isinstance(envelope, Mapping) else None
+    has_top = any(key in existing for key in _EVIDENCE_COUNTER_KEYS)
+    if not has_top and not isinstance(stored_ev, Mapping):
+        return False
+    if live.get("evidence_read_failed"):
+        # Unreadable custody proves nothing; never rewrite over it.
+        return False
+
+    def _as_int(value: Any) -> int:
+        # A garbage stored counter (str/None) must not raise out into the
+        # caller's blanket except and disable healing forever — treat it as a
+        # mismatch so the row is REWRITTEN to the clean live value.
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return -1
+
+    if isinstance(stored_ev, Mapping):
+        for key in _EVIDENCE_COUNTER_KEYS:
+            if _as_int(stored_ev.get(key)) != _as_int(live.get(key)):
+                return True
+        if stored_ev.get("subscription_cost_usd") != live.get("subscription_cost_usd"):
+            return True
+    try:
+        from ouroboros.subagents import actual_substrate
+
+        live_substrate = actual_substrate(live)
+    except Exception:
+        live_substrate = ""
+    if live_substrate and str(existing.get("actual_substrate") or "") not in ("", live_substrate):
+        return True
+    return False
+
+
+def _rewrite_execution_evidence(drive_root: Any, task_id: str, existing: Mapping[str, Any], live: Mapping[str, Any]) -> None:
+    """Rewrite the stored envelope evidence + current-truth substrate surfaces
+    from live custody, through the same producers the terminal write used.
+
+    Q2=B split: the top-level ``delegated_runs_*`` counters (and the derived
+    ``native_contribution``) stay the historical snapshot — they are filtered
+    OUT of the producer's mirror before the write; only ``actual_substrate``
+    and the envelope evidence (which is where every reader, the executor chip
+    included, takes ``subscription_cost_usd`` from) are healed.
+    """
+    from ouroboros.subagents import actual_substrate, substrate_result_fields
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+
+    envelope = dict(existing.get("subagent_envelope") or {})
+    envelope["execution_evidence"] = dict(live)
+    substrate = actual_substrate(live)
+    if substrate:
+        envelope["actual_substrate"] = substrate
+    mirror = {
+        key: value for key, value in substrate_result_fields(envelope).items()
+        if key not in _EVIDENCE_COUNTER_KEYS and key != "native_contribution"
+    }
+    write_task_result(
+        drive_root, str(task_id or ""),
+        str(existing.get("status") or STATUS_RUNNING),
+        subagent_envelope=envelope,
+        **mirror,
+    )
+
+
 def refresh_terminal_reconciliation(
     drive_root: Any, task_id: str, *,
     trigger: str = "sweep_refresh",
@@ -165,26 +253,29 @@ def refresh_terminal_reconciliation(
     """Audit-only refresh of a TERMINAL task's stored custody disclosure.
 
     The periodic sweep can settle a run AFTER its owning task already wrote its
-    terminal result with a non-empty ``delegated_runs_unreconciled`` — the
-    custody ledger then knows the truth while the stored projection keeps
-    lying (nanny-leaf S1). This re-runs ONLY the read-side audit (never
-    ``reconcile_task_runs`` — a refresh must not cancel anything) and rewrites
-    the disclosure through the same recorder, whose guard permits clearing a
-    stale non-empty list. The primary ``reason_code`` is deliberately left
-    untouched (owner Q5=A), and already-rendered chat frames are out of scope —
-    the fixed surfaces are the stored result, task details, and the API view
-    (including retry-lineage projections, which read this row live).
+    terminal result — the custody ledger then knows the truth while the stored
+    projection keeps lying (nanny-leaf S1). TWO independent stale classes are
+    healed: a stale ``delegated_runs_unreconciled`` disclosure (audited and
+    re-recorded below), and stored substrate counters/cost that disagree with
+    live custody (``_stored_evidence_stale`` — the PR #402 test pinned only the
+    first class, so ``actual_substrate='harness_attempted'`` and
+    ``subscription_cost_usd=None`` survived a successful refresh). This re-runs
+    ONLY the read-side audit (never ``reconcile_task_runs`` — a refresh must
+    not cancel anything) and rewrites through the same recorders. The primary
+    ``reason_code`` is deliberately left untouched (owner Q5=A), and
+    already-rendered chat frames are out of scope — the fixed surfaces are the
+    stored result, task details, and the API view (including retry-lineage
+    projections, which read this row live).
 
     ``trigger`` names the refreshing surface on the envelope and its evidence
     rows (``sweep_refresh`` | ``boot_backfill`` | ``kill_path_clear``);
     ``snapshot`` shares one ``custody_audit_snapshot`` across a batch. An audit
-    that MATCHES the stored disclosure performs no write and no emit — a
-    permanently-unreconcilable row (e.g. an undisposed patch) must not grow
-    events.jsonl on every boot. Returns True only when the row was really
+    that MATCHES the stored disclosure (and finds no stale evidence mirror)
+    performs no write and no emit — a permanently-unreconcilable row must not
+    grow events.jsonl on every boot. Returns True only when a row was really
     refreshed: the audit evidence is emitted AFTER — and only after — the
     recorder confirms a changed persisted row, so a lock timeout or a refused
-    write leaves no phantom "refreshed" event behind (R3).
-    """
+    write leaves no phantom "refreshed" event behind (R3).    """
     mine = str(task_id or "")
     if not mine:
         return False
@@ -192,9 +283,11 @@ def refresh_terminal_reconciliation(
         from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
 
         existing = load_task_result(drive_root, mine) or {}
-        if not existing.get("delegated_runs_unreconciled"):
-            return False
         if str(existing.get("status") or "") not in _TRULY_TERMINAL_STATUSES:
+            return False
+        live = custody.task_execution_evidence(drive_root, mine)
+        evidence_stale = _stored_evidence_stale(existing, live)
+        if not existing.get("delegated_runs_unreconciled") and not evidence_stale:
             return False
     except Exception:
         log.debug("Sweep refresh skipped: task result unreadable for %s", mine, exc_info=True)
@@ -204,12 +297,23 @@ def refresh_terminal_reconciliation(
         "outcomes": [], "unreconciled": [], "audit_status": "ok",
     }
     _audit_task_custody(drive_root, mine, result, snapshot=snapshot, emit_evidence=False)
-    if _stored_disclosure_matches(existing, result):
+    if _stored_disclosure_matches(existing, result) and not evidence_stale:
         return False
-    if not record_terminal_reconciliation(drive_root, mine, result):
-        return False
-    _emit_audit_evidence(drive_root, result)
-    return True
+    refreshed = False
+    # Disclosure class: the recorder itself re-checks the no-churn gate and the
+    # monotonic guard; evidence is emitted only after it confirms a landed row.
+    if record_terminal_reconciliation(drive_root, mine, result):
+        _emit_audit_evidence(drive_root, result)
+        refreshed = True
+    # Evidence-mirror class: substrate counters/cost rewritten from live
+    # custody through the same producers the terminal write used.
+    if evidence_stale:
+        try:
+            _rewrite_execution_evidence(drive_root, mine, existing, live)
+            refreshed = True
+        except Exception:
+            log.warning("Sweep evidence rewrite failed for %s", mine, exc_info=True)
+    return refreshed
 
 
 def backfill_terminal_reconciliations(drive_root: Any) -> List[str]:
@@ -295,6 +399,120 @@ def _stored_disclosure_matches(
     )
 
 
+_REFRESH_CURSOR_REL = "state/delegate_terminal_refresh_cursor.json"
+_REFRESH_SCAN_CAP_BYTES = 5 * 1024 * 1024  # bounded work per sweep tick
+_REFRESH_DEFERRED_CAP = 500  # terminal-boundary tasks awaiting their result
+
+
+def refresh_recently_settled_terminals(drive_root: Any) -> int:
+    """Refresh terminal results of tasks whose runs settled since the cursor.
+
+    The orphan sweep only revisits tasks named in THIS generation's reconcile
+    outcomes; a run settled at the terminal boundary (or by an earlier
+    generation) never reappears there, so its task's stored evidence stays
+    stale forever. A durable byte-offset cursor over the append-only custody
+    event log keeps each tick bounded to newly appended SETTLED rows (house
+    projection-beside-the-log pattern) — never a full replay per sweep. A
+    shrunken/rotated log resets the cursor; the one-time historical pass is
+    paced by the per-tick byte cap. Returns the number of refreshed tasks.
+    """
+    import pathlib as _pathlib
+
+    from ouroboros.utils import atomic_write_json, read_json_dict
+
+    log_path = custody.event_log_path(drive_root)
+    cursor_path = _pathlib.Path(drive_root) / _REFRESH_CURSOR_REL
+    try:
+        size = log_path.stat().st_size if log_path.exists() else 0
+    except OSError:
+        return 0
+    stored = read_json_dict(cursor_path) or {}
+    offset = int(stored.get("offset") or 0)
+    if offset > size:
+        offset = 0  # rotated/truncated log: re-ground once
+    deferred: Dict[str, str] = {
+        str(k): str(v) for k, v in (stored.get("deferred") or {}).items() if k
+    }
+    if offset >= size and not deferred:
+        return 0
+    # A settled run whose OWNING TASK has not yet written its terminal result
+    # cannot be healed now (refresh no-ops on a non-terminal task) — the run
+    # settled at the terminal boundary, the exact class this pass exists to
+    # catch. Its task_id goes into the durable ``deferred`` map (retried every
+    # tick) while the byte offset ALWAYS advances: pinning the offset on the
+    # earliest deferred row would re-read the same window forever behind one
+    # long-lived parent and starve every later settlement past the per-tick
+    # byte cap.
+    batch_ids: set = set()
+    end_offset = offset
+    try:
+        with log_path.open("rb") as fh:
+            fh.seek(offset)
+            read_bytes = 0
+            for raw in fh:
+                if not raw.endswith(b"\n") or read_bytes > _REFRESH_SCAN_CAP_BYTES:
+                    break  # incomplete tail line stays for the next tick
+                read_bytes += len(raw)
+                end_offset += len(raw)
+                row = _json_row(raw)
+                if str(row.get("type") or "") in (custody.SETTLED, custody.CLOSED_ABSENT):
+                    tid = str(row.get("task_id") or "")
+                    if tid:
+                        batch_ids.add(tid)
+    except OSError:
+        return 0
+    from ouroboros.utils import utc_now_iso
+
+    now_iso = utc_now_iso()
+    refreshed = 0
+    next_deferred: Dict[str, str] = {}
+    for tid in sorted(batch_ids | set(deferred)):
+        since = deferred.get(tid) or now_iso
+        try:
+            if _task_is_terminal(drive_root, tid):
+                if refresh_terminal_reconciliation(drive_root, tid):
+                    refreshed += 1
+            else:
+                next_deferred[tid] = since
+        except Exception:
+            log.debug("Cursor refresh failed for %s", tid, exc_info=True)
+            next_deferred[tid] = since
+    if len(next_deferred) > _REFRESH_DEFERRED_CAP:
+        # Oldest-first eviction, disclosed: a task deferred this long with no
+        # terminal result is overwhelmingly abandoned; keeping the map bounded
+        # protects the cursor write from unbounded growth.
+        keep = sorted(next_deferred.items(), key=lambda kv: kv[1])[-_REFRESH_DEFERRED_CAP:]
+        dropped = len(next_deferred) - len(keep)
+        next_deferred = dict(keep)
+        log.info("Settled-refresh deferred map over cap; dropped %d oldest entries", dropped)
+    try:
+        atomic_write_json(cursor_path, {"offset": end_offset, "deferred": next_deferred})
+    except Exception:
+        log.debug("Refresh cursor write failed", exc_info=True)
+    return refreshed
+
+
+def _json_row(raw: bytes) -> Dict[str, Any]:
+    import json as _json
+
+    try:
+        row = _json.loads(raw)
+        return row if isinstance(row, dict) else {}
+    except Exception:
+        return {}
+
+
+def _task_is_terminal(drive_root: Any, task_id: str) -> bool:
+    """Whether the task already wrote a truly-terminal result (heal-eligible)."""
+    try:
+        from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+
+        existing = load_task_result(drive_root, str(task_id or "")) or {}
+        return str(existing.get("status") or "") in _TRULY_TERMINAL_STATUSES
+    except Exception:
+        return False
+
+
 def record_terminal_reconciliation(
     drive_root: Any, task_id: str, result: Mapping[str, Any],
 ) -> bool:
@@ -336,6 +554,7 @@ __all__ = [
     "backfill_terminal_reconciliations",
     "custody_audit_snapshot",
     "record_terminal_reconciliation",
+    "refresh_recently_settled_terminals",
     "refresh_terminal_reconciliation",
     "terminal_reconcile_task",
 ]

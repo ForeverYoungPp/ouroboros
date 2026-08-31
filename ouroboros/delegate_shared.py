@@ -49,11 +49,22 @@ def _owned_run(ctx: ToolContext, tool: str, run_id: str) -> Tuple[Optional[str],
         return _fail(tool, "run_ownership_unknown",
                      "No durable record of that run id exists on this drive, so ownership "
                      "cannot be established. Unknown ownership is refused, not waved through.",
-                     run_id=run_id), None
+                     run_id=run_id,
+                     hint="The run may belong to a different drive or the id may be "
+                          "mistyped; get_task_result(<task_id>) is the ownership-free "
+                          "way to read another task's delegated-run outcome."), None
     if status == custody.FOREIGN:
+        # The refusal stays a refusal; the additive facts give the caller the
+        # two things it needs to stop being stuck — the run is over, and whom
+        # to ask (get_task_result(owner_task_id) is the legitimate cross-task
+        # read that already carries the delegated_runs_* counters).
         return _fail(tool, "run_not_owned",
                      "That run belongs to another task. A delegated run may only be "
-                     "waited on or cancelled by the task that started it.", run_id=run_id), None
+                     "waited on or cancelled by the task that started it.",
+                     run_id=run_id,
+                     owner_task_id=str(getattr(entry, "task_id", "") or ""),
+                     run_settled=bool(getattr(entry, "settled", False)),
+                     run_terminal_state=str(getattr(entry, "terminal_state", "") or "")), None
     return None, entry
 
 

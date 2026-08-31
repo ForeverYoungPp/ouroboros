@@ -525,14 +525,26 @@ def record_token_density(
     prompt_tokens: Any,
     source: str = "dispatch_usage",
     route_fp: str = "",
+    basis: str = "raw",
 ) -> None:
-    """Persist one timestamped raw witness, best-effort and write-throttled."""
+    """Persist one timestamped raw witness, best-effort and write-throttled.
+
+    ``basis`` names how ``prompt_chars`` measured image blocks — "raw"
+    (base64 bytes, pre-fix rows) vs "bounded_proxy" (the provider-billing
+    proxy the fit estimator measures on). The row carries it so the two
+    bases can never be silently mixed again by a later "unification".
+    """
     fp = str(fingerprint or "").strip()
     route = str(route_fp or "").strip()
     density = _density_of(prompt_chars, prompt_tokens)
     if not fp or density <= 0:
         return
-    memo_key = f"{fp}\0{route}"
+    # ``basis`` is part of the witness identity end-to-end: the main resolver
+    # accepts only bounded_proxy rows, so a fresh RAW row at the same numeric
+    # density must not throttle the FIRST bounded witness as "no drift" —
+    # that left the resolver cold for the whole freshness window on an
+    # upgraded store (final-lane finding, probe-reproduced).
+    memo_key = f"{fp}\0{route}\0{basis}"
     memo = _DENSITY_MEMO.get(memo_key)
     if (
         memo and _age_seconds(memo[1]) < _TOKEN_DENSITY_FRESH_SEC
@@ -550,7 +562,11 @@ def record_token_density(
                 and _age_seconds(str(pair.get("observed_at") or "")) < _TOKEN_DENSITY_TTL_SEC
                 and _density_of(pair.get("prompt_chars"), pair.get("prompt_tokens")) > 0
             ]
-            route_pairs = [pair for pair in pairs if str(pair.get("route_fp") or "") == route]
+            route_pairs = [
+                pair for pair in pairs
+                if str(pair.get("route_fp") or "") == route
+                and str(pair.get("basis") or "raw") == str(basis or "raw")
+            ]
             newest = max(
                 enumerate(route_pairs),
                 key=lambda item: (*_density_recency_key(item[1]), item[0]),
@@ -577,6 +593,7 @@ def record_token_density(
                 "observation_seq": observation_seq,
                 "source": str(source or "dispatch_usage"),
                 "route_fp": route,
+                "basis": str(basis or "raw"),
             })
             indexed_pairs = list(enumerate(pairs))
             densest_index, densest = max(
@@ -628,13 +645,24 @@ def _normalized_density_model(model_id: str) -> str:
         return str(model_id or "").strip()
 
 
-def _fresh_density_pairs(store: Dict[str, Any], model_id: str = "") -> List[Tuple[Dict[str, Any], float]]:
+def _fresh_density_pairs(
+    store: Dict[str, Any], model_id: str = "", *, basis: str = "",
+) -> List[Tuple[Dict[str, Any], float]]:
+    # ``basis`` filters to rows measured on one named basis. The MAIN fit
+    # resolver passes "bounded_proxy" — its multiplier must match the fit
+    # estimator's own measure: a pre-basis row (no stamp) or a legacy ``raw``
+    # row was measured against raw base64 chars and can sit at 0.05-0.65 on
+    # image routes, so letting it stay authoritative for its 14-day TTL after
+    # an upgrade re-poisons exactly what the basis fix cures (the cost is a
+    # brief cold start at 1.0). Review/aggregate resolvers pass no basis: their
+    # text-heavy witnesses measure the same on either basis.
     entries = [store.get(model_id) or {}] if model_id else list(store.values())
     return [
         (pair, density)
         for entry in entries if isinstance(entry, dict)
         for pair in (entry.get("pairs") or []) if isinstance(pair, dict)
         if _age_seconds(str(pair.get("observed_at") or "")) < _TOKEN_DENSITY_TTL_SEC
+        and (not basis or str(pair.get("basis") or "") == basis)
         for density in [_density_of(pair.get("prompt_chars"), pair.get("prompt_tokens"))]
         if density > 0
     ]
@@ -646,7 +674,7 @@ def resolve_main_token_density(drive_root: Any, route_fp: str, model_id: str) ->
         store = _load(drive_root).get("token_density", {}) or {}
         route = str(route_fp or "").strip()
         route_pairs = [
-            item for item in _fresh_density_pairs(store)
+            item for item in _fresh_density_pairs(store, basis="bounded_proxy")
             if route and str(item[0].get("route_fp") or "") == route
         ]
         if route_pairs:
@@ -654,7 +682,9 @@ def resolve_main_token_density(drive_root: Any, route_fp: str, model_id: str) ->
                 enumerate(route_pairs),
                 key=lambda item: (*_density_recency_key(item[1][0]), item[0]),
             )[1][1], "fresh_route_usage"
-        model_pairs = _fresh_density_pairs(store, _normalized_density_model(model_id))
+        model_pairs = _fresh_density_pairs(
+            store, _normalized_density_model(model_id), basis="bounded_proxy",
+        )
         if model_pairs:
             return max(
                 enumerate(model_pairs),
@@ -999,3 +1029,50 @@ def probe(
                                 detail="no provider metadata; owner-ack required for a >=1M gate")
     _store_evidence(drive_root, "probes", fp, ev.to_json())
     return ev
+
+
+# Cache-inclusive prompt totals are measurable; GigaChat's semantics remain unknown.
+_CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS = frozenset({
+    "openrouter", "openai", "openai-compatible", "cloudru", "local", "anthropic",
+})
+
+
+def observe_token_density(request: Any, usage: Optional[Dict[str, Any]], *, drive_root_resolver: Any) -> None:
+    """Learn density after settlement; unknown cache semantics produce no witness."""
+    try:
+        normalized = dict(usage or {})
+        cache_bearing = bool(
+            int(normalized.get("cached_tokens") or 0)
+            or int(normalized.get("cache_write_tokens") or 0)
+        )
+        provider = str(request.provider or "").strip().lower()
+        if cache_bearing and provider not in _CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS:
+            return
+        real = int(normalized.get("prompt_tokens") or normalized.get("input_tokens") or 0)
+        # The witness MUST calibrate the basis the fit estimator measures on
+        # (bounded image proxy) — the raw-base64 basis fed a self-consistent
+        # ~27% under-prediction: measure_main_fit multiplied a BOUNDED
+        # estimate by a RAW-basis density. `prompt_tokens_estimate` stays raw
+        # on purpose — `_reservation_cost` reads it and budget reservation
+        # wants the conservative over-count (owner decision 3=A); do NOT
+        # unify the two consumers onto one basis.
+        estimate = int(request.prompt_tokens_bounded_estimate or 0)
+        basis = "bounded_proxy"
+        if estimate <= 0:
+            estimate = int(request.prompt_tokens_estimate or 0)
+            basis = "raw"
+        if real <= 0 or estimate <= 0:
+            return
+        from ouroboros.provider_models import normalize_model_identity
+
+        record_token_density(
+            drive_root_resolver(request.drive_root),
+            normalize_model_identity(str(request.model or "")),
+            prompt_chars=estimate * 4,
+            prompt_tokens=real,
+            source="dispatch_usage",
+            route_fp=str(request.physical_context.route_fp if request.physical_context else ""),
+            basis=basis,
+        )
+    except Exception:
+        log.debug("token-density observation skipped", exc_info=True)

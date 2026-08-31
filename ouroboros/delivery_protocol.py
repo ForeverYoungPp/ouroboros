@@ -136,33 +136,35 @@ def parse_delivery_control_body(
     parsed, duplicate_protocol_key = parse_delivery_control_object(body)
     if duplicate_protocol_key or isinstance(parsed, dict):
         return parsed, duplicate_protocol_key, False
-    tail = body.rstrip()
-    if tail.endswith("```"):
-        # Prose ending with a FENCED block: models fence JSON by default, so a
-        # trailing fenced protocol object is the same protocol attempt as a
-        # bare trailing one. Drop the closing fence line and its matching
-        # opener, then run the ordinary trailing scan on what the fence held.
-        # This containment stays inside the latch-gated resolvers; the shared
-        # whole-body fence-strip (observability salvage) is untouched.
-        lines = tail.splitlines()
-        if lines and lines[-1].strip() == "```":
-            for i in range(len(lines) - 2, -1, -1):
-                if lines[i].lstrip().startswith("```"):
-                    tail = "\n".join(lines[:i] + lines[i + 1:-1]).rstrip()
-                    break
-    if not tail.endswith("}"):
-        return None, False, False
-    start = tail.rfind("{")
-    while start > 0:
-        fragment = tail[start:]
-        parsed, duplicate_protocol_key = parse_delivery_control_object(fragment)
-        if duplicate_protocol_key or (
-            isinstance(parsed, dict) and "delivery_control" in parsed
-        ):
-            return parsed, duplicate_protocol_key, True
-        if isinstance(parsed, dict):
-            # The trailing object is ordinary JSON content (no protocol key
-            # at its top level): the whole body stays prose.
-            return None, False, False
-        start = tail.rfind("{", 0, start)
+    # Trailing scan: ONE O(n) string-aware pass over the body (fenced and
+    # double-fenced tails peeled, duplicate keys flagged, RecursionError
+    # degraded, bounded line-anchor retries after an unbalanced prose brace
+    # or quote) — the per-`{` raw_decode walk this replaces was O(n*braces)
+    # and measured ~10s on a large code-bearing forced answer. The extractor
+    # is key-agnostic; the protocol judgment stays HERE: only a trailing
+    # object carrying `delivery_control` at its top level (or a duplicated
+    # protocol key) is an embedded protocol attempt — an ordinary trailing
+    # JSON object, and a protocol object NESTED inside one, is prose.
+    from ouroboros.utils import extract_trailing_json_object
+
+    _prefix, tail_parsed, tail_duplicate = extract_trailing_json_object(
+        body, duplicate_flag_keys=("delivery_control", "full_answer"),
+    )
+    if tail_duplicate:
+        return None, True, True
+    if isinstance(tail_parsed, dict) and "delivery_control" in tail_parsed:
+        return tail_parsed, False, True
     return None, False, False
+
+
+def extract_plain_text_from_content(content: Any) -> str:
+    """Extract text from strings or multipart content for transcript sealing."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(block.get("text", ""))
+        return "".join(parts)
+    return str(content) if content is not None else ""

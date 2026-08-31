@@ -262,7 +262,8 @@
  *   {delegated_runs_started, delegated_runs_settled, delegated_runs_succeeded,
  *   delegated_runs_failed, delegated_run_failure_states, evidence_read_failed,
  *   subscription_cost_usd, subscription_cost_estimated, harness_models,
- *   nanny_nudge_recorded, delegate_start_attempted}.
+ *   nanny_nudge_recorded, delegate_start_attempted,
+ *   applied_access_profiles}.
  *   Terminal frames only; absent = "no evidence yet", never "ran natively".
  *   `evidence_read_failed: true` = the custody log exists but could not be
  *   read — zero counts are then UNKNOWN, never a "no run" receipt.

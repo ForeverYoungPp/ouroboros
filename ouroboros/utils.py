@@ -732,6 +732,139 @@ def estimate_tokens(text: str) -> int:
     return max(1, (len(str(text or "")) + 3) // 4)
 
 
+def extract_trailing_json_object(
+    text: str,
+    *,
+    duplicate_flag_keys: tuple = (),
+) -> tuple[str, Optional[Dict[str, Any]], bool]:
+    """Split ``text`` into ``(prose_prefix, trailing_dict_or_None, duplicate_flag)``.
+
+    Decodes the last complete JSON object via ``raw_decode`` anchored at a
+    ``{`` scanned from the end. The object counts as TRAILING only when
+    nothing but whitespace and/or one closing markdown fence follows it — an
+    object with prose after it is quoted material, never a directive, and the
+    whole call returns ``(text, None, False)``. Whole-text JSON yields an
+    empty prefix; a dangling opening fence is trimmed off the prefix so a
+    fenced object behaves like a bare one. Any duplicate key invalidates the
+    object (``None``, mirroring the loop's strict parser) while the boolean
+    reports whether a key from ``duplicate_flag_keys`` was the duplicate, so
+    protocol-repair intent survives the failed parse. Deliberately does NOT
+    scan for any specific key: key-scanning extraction has misfired on
+    answers that merely quote a protocol example (see
+    review_verdict_extraction's whole-text rationale).
+    """
+    raw = str(text or "")
+    # The trailing object, if any, ends at the last non-whitespace/non-fence
+    # character, which must be ``}``. Establishing that up front is O(tail) and
+    # keeps every ordinary code-bearing answer (prose, a trailing ``;``, a run
+    # of ``{``) off the expensive path entirely — the earlier per-``{``
+    # raw_decode walk was O(n * braces) and hit ~10s on a forced-finalization
+    # rail carrying a large code answer.
+    end_limit = len(raw)
+    for _ in range(4):
+        # Walk back over trailing whitespace WITHOUT slicing (a slice per
+        # fence iteration would be O(n * fences)), then peel one trailing
+        # markdown fence so a `{...}` closed by ``` or ```\n``` is still
+        # trailing. More than a few stacked fences is pathological output —
+        # degrade to prose rather than keep peeling.
+        while end_limit > 0 and raw[end_limit - 1] in " \t\r\n":
+            end_limit -= 1
+        if raw.endswith("```", 0, end_limit):
+            end_limit -= 3
+            continue
+        break
+    if end_limit <= 0 or raw[end_limit - 1] != "}":
+        return raw, None, False
+
+    # A forward, string-aware pass locating the outermost object whose close
+    # sits at end_limit. The primary pass starts at 0; an unmatched ``{`` or
+    # ``"`` in the PROSE prefix corrupts its state (prose is not JSON), so on
+    # failure the scan retries from a bounded set of later anchors — the last
+    # few line-starting ``{`` positions, where a real trailing directive
+    # begins. Each retry is O(tail-from-anchor); the anchor count is a small
+    # constant, so the pathological many-brace answer stays fast.
+    def _scan(start: int) -> int:
+        depth = 0
+        in_str = False
+        esc = False
+        cand_start = -1
+        found = -1
+        for i in range(start, end_limit):
+            c = raw[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                if depth == 0:
+                    cand_start = i
+                depth += 1
+            elif c == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and i == end_limit - 1:
+                        found = cand_start
+        return found
+
+    obj_start = _scan(0)
+    if obj_start < 0:
+        anchors: List[int] = []
+        pos = raw.rfind("\n{", 0, end_limit)
+        while pos != -1 and len(anchors) < 8:
+            anchors.append(pos + 1)
+            pos = raw.rfind("\n{", 0, pos)
+        for anchor in anchors:  # rightmost first: the innermost plausible start
+            obj_start = _scan(anchor)
+            if obj_start >= 0:
+                break
+    if obj_start < 0:
+        return raw, None, False
+
+    prefix = raw[:obj_start]
+    trimmed = prefix.rstrip()
+    cut = trimmed.rfind("\n")
+    if trimmed[cut + 1:].startswith("```"):
+        prefix = trimmed[:cut] if cut != -1 else ""
+    duplicate_flagged = False
+    duplicate_any = False
+
+    def _unique_object(pairs: List[tuple]) -> Dict[str, Any]:
+        nonlocal duplicate_flagged, duplicate_any
+        result: Dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                duplicate_any = True
+                if key in duplicate_flag_keys:
+                    duplicate_flagged = True
+                raise ValueError(f"duplicate key: {key}")
+            result[key] = item
+        return result
+
+    try:
+        parsed = json.loads(raw[obj_start:end_limit], object_pairs_hook=_unique_object)
+    except (ValueError, RecursionError):
+        # A deeply nested body raises RecursionError out of the C decoder; on
+        # the last-resort finalization rail that must degrade, not propagate.
+        parsed = None
+    if not isinstance(parsed, dict):
+        parsed = None
+    if parsed is None and not duplicate_any:
+        # Contract: non-directive text comes back WHOLE. A structurally
+        # balanced tail that fails to parse (single-quoted pseudo-JSON, a bare
+        # word) is prose, and returning the truncated prefix here would hand a
+        # future caller a silent tail loss. ANY duplicate-key rejection keeps
+        # the split: that tail IS a strict-parser-refused directive shape, and
+        # protocol-repair intent needs the prefix/tail boundary.
+        return raw, None, False
+    return prefix, parsed, duplicate_flagged
+
+
 def run_cmd(cmd: List[str], cwd: Optional[pathlib.Path] = None) -> str:
     # Tool output is PARSED (git error signatures, porcelain text), so it must not
     # depend on the operator's locale: a Russian-locale git answers «метка … уже

@@ -158,7 +158,6 @@ BAND_PATHS = {
     "ouroboros/safety.py": "Entered the band from 954 lines with the safety-supervisor rate-limit fix: ONE shared model-call helper now serves both the primary and repair safety calls (it already deletes the duplicated call block), recognising a provider rate limit in BOTH wire shapes, taking one bounded deadline-capped backoff plus one retry, then blocking that one call with the typed non-verdict SAFETY_UNAVAILABLE outcome plus a durable audit row (a short storm latch answers further checks in the window without provider calls); the bounded newest-first conversation budget is the second half.",
     "ouroboros/skill_review_runner.py": None,
     "ouroboros/subagent_runtime.py": "Configured-retry refusals mirrored typed (triad 2026-08-30) push the module just over 1000; no new subsystem, same seam.",
-    "ouroboros/task_results.py": "Authority reads need an explicit strict mode so malformed child records cannot become a false zero count.",
     "ouroboros/task_status.py": None,
     "ouroboros/tools/browser.py": None,
     "ouroboros/tools/commit_gate.py": "Grew INTO the band by the review-wave fix binding the actor reference (delivery class) into the commit review contract fingerprint \u2014 same-module contract identity, splitting it would separate the fingerprint from its gate.",
@@ -229,7 +228,7 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/loop.py": 312731,
+    "ouroboros/loop.py": 286755,
     "tests/test_delegated_subagent_transport.py": 320340,
     "tests/test_devtools_benchmarks.py": 328116,
     "web/modules/chat.js": 219170,

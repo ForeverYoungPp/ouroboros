@@ -275,6 +275,29 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
     assert.equal(inFlight.label, 'Codex · 1 started, none settled');
     assert.match(inFlight.title, /1 run\(s\) started, none settled/);
 
+    // ACCESS + UNVERIFIED (harness-health O13): the requested write surface and
+    // the engine-disclosed applied access ride the tooltip; runs whose
+    // work-order coverage never verified are discounted from ok AND named in
+    // the label — a short ok-count with no visible cause reads as a bug.
+    const withAccess = executorChip({
+        executor_route: 'codex',
+        write_surface: 'external_workspace',
+        execution_evidence: {
+            delegated_runs_started: 2, delegated_runs_settled: 2,
+            delegated_runs_succeeded: 1, delegated_runs_failed: 1,
+            delegated_runs_source_unresolved: 1,
+            subscription_cost_usd: null, harness_models: [],
+            applied_access_profiles: ['workspace_write'],
+        },
+    });
+    assert.match(withAccess.label, /1 unverified/);
+    assert.match(withAccess.title, /unverified work-order coverage/);
+    assert.match(withAccess.title, /write surface external_workspace/);
+    assert.match(withAccess.title, /access applied: workspace_write/);
+    // Frames without the new facts render exactly as before (additive-only).
+    assert.ok(!/unverified/.test(allFailed.label), allFailed.label);
+    assert.ok(!/access applied/.test(allFailed.title), allFailed.title);
+
     // EVIDENCE with zero runs: the route was assigned and no delegated run left
     // a durable record — the chip points at the ledger instead of asserting
     // "ran natively" as a fact (a run started past a failed durable write is

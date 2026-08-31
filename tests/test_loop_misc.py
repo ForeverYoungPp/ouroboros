@@ -335,27 +335,44 @@ def test_set_acceptance_decision_collapses_unknown_status_fail_closed():
 
 def test_every_host_acceptance_writer_emits_a_canonical_status_and_typed_reason():
     """Table-driven guard over the WHOLE writer inventory (v6.78.0): every
-    `_set_acceptance_decision` call site in loop.py must pass a canonical status
-    constant and a reason from the closed set. Source-level so a new writer added
-    without a reason fails here instead of silently shipping an untyped decision."""
+    `_set_acceptance_decision` call site must pass a canonical status constant and
+    a reason from the closed set. Source-level so a new writer added without a
+    reason fails here instead of silently shipping an untyped decision.
+
+    Scans BOTH holders: the acceptance machinery moved into
+    `acceptance_dialogue.py` while loop.py kept the rail-side writers, so reading
+    only `loop_mod.__file__` would have gone quietly blind to most of them."""
     import pathlib
     import re
 
+    import ouroboros.acceptance_dialogue as accept_mod
     from ouroboros.loop import ACCEPTANCE_DECISION_REASONS
 
-    src = pathlib.Path(loop_mod.__file__).read_text(encoding="utf-8").splitlines()
+    src = []
+    for module in (loop_mod, accept_mod):
+        src.extend(pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines())
     starts = [
         i for i, line in enumerate(src)
         if "_set_acceptance_decision(" in line and not line.lstrip().startswith("def ")
     ]
-    # 17th writer: the forced-rail acceptance-bypass recorder (typed, closed-enum
-    # reason). 18th: the forced children_unabsorbed rail terminalizing a requested
-    # improvement pass it cannot grant (owner Q2A, revision_unavailable_on_forced_rail).
-    assert len(starts) == 18, f"writer inventory changed: {len(starts)} call sites"
+    # 7 rail-side writers in loop.py (owner follow-up, evidence refresh, delivery
+    # binding, launch reserve, forced bypass, forced-rail revision) + 12 in
+    # acceptance_dialogue.py (the terminal branches, the clean pass, the capsule,
+    # the fence-reopen failure and the A-material identical refusal).
+    assert len(starts) == 19, f"writer inventory changed: {len(starts)} call sites"
     allowed_status = {
         "ACCEPTANCE_ACCEPTED", "ACCEPTANCE_REVISION_REQUESTED",
         "ACCEPTANCE_FINALIZED_UNACCEPTED",
     }
+    # The reason may be a literal OR an expression (a constant, or a conditional
+    # picking between a constant and a literal). Both forms are checked: bare
+    # literals against the closed set, and REASON_*/ACCEPTANCE_* names resolved
+    # through the module that defines them.
+    reason_names = {
+        name: value for name, value in vars(accept_mod).items()
+        if name.startswith(("REASON_", "ACCEPTANCE_REASON_")) and isinstance(value, str)
+    }
+    seen_expression_reasons = 0
     for start in starts:
         block = "\n".join(src[start:start + 30])
         status = re.findall(r'"status": ([A-Z_]+)', block)
@@ -363,6 +380,15 @@ def test_every_host_acceptance_writer_emits_a_canonical_status_and_typed_reason(
         assert '"reason"' in block, f"line {start + 1} has no typed reason"
         for reason in re.findall(r'"reason": "([a-z_]+)"', block):
             assert reason in ACCEPTANCE_DECISION_REASONS, reason
+        for name in re.findall(r'\b(REASON_[A-Z_]+|ACCEPTANCE_REASON_[A-Z_]+)\b', block):
+            if name not in reason_names:
+                continue
+            seen_expression_reasons += 1
+            assert reason_names[name] in ACCEPTANCE_DECISION_REASONS, name
+    # The widened regex really does catch expression-valued reasons: the two
+    # `pass_reason if ... == REASON_REVIEW_CYCLES_EXHAUSTED` branches and the
+    # A-material `REASON_IDENTICAL_ACCEPTANCE_REFUSED` writer.
+    assert seen_expression_reasons >= 3, seen_expression_reasons
 
 
 def test_task_acceptance_review_tool_result_lifts_agent_decision_into_trace():
