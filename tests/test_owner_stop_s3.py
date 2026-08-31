@@ -1068,7 +1068,6 @@ def _production_drain(tmp_path, task_id):
 def test_loop_drain_discards_hardened_owner_control_before_and_during_stamp(
     tmp_path, monkeypatch,
 ):
-    import ouroboros.loop as loop_mod
 
     stale_root = tmp_path / "already-hardened"
     stale_root.mkdir()
@@ -1109,8 +1108,10 @@ def test_loop_drain_discards_hardened_owner_control_before_and_during_stamp(
         )
         return True
 
+    import supervisor.owner_stop as owner_stop_mod
+
     monkeypatch.setattr(
-        loop_mod,
+        owner_stop_mod,
         "_mark_owner_stop_control_drained",
         _harden_during_stamp,
     )

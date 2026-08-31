@@ -1609,6 +1609,18 @@ def _finish_task_done_dispatch(
         enqueue_project_completion_summary,
     )
 
+    # This seam is shared by the normal task_done path AND the lifecycle-fault
+    # resolver, so open owner-quiz/hurry projections settle on EVERY dispatched
+    # terminal transition (ingress lazy-heal covers producers that bypass it,
+    # e.g. orphaned-RUNNING reconciliation).
+    if not bool(evt.get("_ephemeral")):
+        try:
+            from supervisor.queue_transitions import reconcile_terminal_task_projections
+
+            reconcile_terminal_task_projections(ctx.DRIVE_ROOT, str(task_id))
+        except Exception:
+            log.debug("terminal projection reconcile failed for %s", task_id, exc_info=True)
+
     append_terminal_task_projection(
         ctx.DRIVE_ROOT, str(task_id or ""), task, final_task_result, task_done_event,
     )
@@ -2172,16 +2184,6 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
             final_task_result = load_task_result(ctx.DRIVE_ROOT, str(task_id)) or {}
         except Exception:
             final_task_result = {}
-        if not bool(evt.get("_ephemeral")):
-            try:
-                # §19.7.2 item 5: a hurry the worker never drained loses the
-                # terminal race honestly — not_applied_before_terminal.
-                from ouroboros.owner_hurry import reconcile_terminal
-
-                reconcile_terminal(ctx.DRIVE_ROOT, str(task_id))
-            except Exception:
-                log.debug("owner_hurry terminal reconcile failed for %s", task_id, exc_info=True)
-
     outcome_axes = normalize_outcome_axes({**evt, **(final_task_result if isinstance(final_task_result, dict) else {})})
     reason_code = final_task_result.get("reason_code") or evt.get("reason_code")
     artifact_status = final_task_result.get("artifact_status") or evt.get("artifact_status")

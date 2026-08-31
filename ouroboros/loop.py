@@ -69,10 +69,9 @@ from ouroboros.task_finalization import (
     TERMINAL_ORIGIN_MODEL_FINAL,
 )
 from supervisor.owner_stop import (
-    _mark_owner_stop_control_drained,
     _narrow_round_deadline,
-    _owner_stop_control_is_current,
     _owner_stop_window_elapsed,
+    handle_finalize_now_entry,
 )
 
 from ouroboros.loop_tool_execution import (
@@ -2484,7 +2483,7 @@ def _drain_incoming_messages(
             break
 
     if drive_root is not None and task_id:
-        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, KIND_TASK_MESSAGE, acknowledge_transcript_entry, deliver_task_message, drain_owner_entries
+        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_TASK_MESSAGE, acknowledge_transcript_entry, deliver_quiz_answer, deliver_task_message, drain_owner_entries
 
         if owner_ctx:
             owner_ctx._loop_mailbox_seen_ids = _owner_msg_seen
@@ -2492,36 +2491,7 @@ def _drain_incoming_messages(
         for entry in drain_owner_entries(drive_root, task_id, _owner_msg_seen, attempt):
             kind = entry.get("kind") or KIND_OWNER_TEXT
             if kind == KIND_FINALIZE_NOW:
-                text = str(entry.get("text") or "deadline")
-                first_line = text.splitlines()[0].strip() if text else ""
-                if first_line == REASON_OWNER_REQUESTED_FINALIZATION:
-                    if not _owner_stop_control_is_current(
-                        owner_ctx,
-                        drive_root,
-                        task_id,
-                        str(entry.get("msg_id") or ""),
-                    ):
-                        continue
-                    # Owner-stop budget starts at delivery; first drain wins.
-                    if not _mark_owner_stop_control_drained(
-                        owner_ctx, drive_root, task_id,
-                    ):
-                        continue
-                    if not _owner_stop_control_is_current(
-                        owner_ctx,
-                        drive_root,
-                        task_id,
-                        str(entry.get("msg_id") or ""),
-                    ):
-                        continue
-                else:
-                    opened = parse_deadline_ts(entry.get("ts"))
-                    if opened is not None:
-                        controls["finalize_deadline_ts"] = (
-                            opened.timestamp()
-                            + task_pacing.effective_finalization_reserve_sec(owner_ctx)
-                        )
-                controls["finalize_now"] = text
+                handle_finalize_now_entry(entry, owner_ctx, drive_root, task_id, controls)
                 continue
             if kind == KIND_HURRY:
                 # HQ1 no-chat contract (§19.7.2 item 6): a typed hurry
@@ -2536,6 +2506,10 @@ def _drain_incoming_messages(
             dmsg = entry.get("text") or ""
             if kind == KIND_TASK_MESSAGE:
                 deliver_task_message(entry, task_id, event_queue, lambda text: _append_or_merge_user_message(messages, text))
+                acknowledge_transcript_entry(drive_root, task_id, entry)
+                continue
+            if kind == KIND_QUIZ_ANSWER:
+                deliver_quiz_answer(entry, task_id, event_queue, lambda text: _append_or_merge_user_message(messages, text))
                 acknowledge_transcript_entry(drive_root, task_id, entry)
                 continue
             _record_owner_directive(

@@ -859,3 +859,28 @@ export function unconfirmedForegroundCardIds(cards, activeIds) {
     }
     return out;
 }
+
+// Extracted from chat.js (byte-ratchet payment): the DOM half of the routing
+// acknowledgement, kept beside its text builder above.
+export function renderRoutingAnnotation(bubble, annotation) {
+    if (!bubble) return false;
+    const text = routingAnnotationText(annotation);
+    let note = bubble.querySelector('.msg-routing-annotation');
+    if (!text) {
+        note?.remove();
+        delete bubble.dataset.chatAnnotationStatus;
+        return false;
+    }
+    if (!note) {
+        note = document.createElement('div');
+        note.className = 'msg-routing-annotation';
+        const time = bubble.querySelector('.msg-time');
+        if (time) time.before(note);
+        else bubble.append(note);
+    }
+    const status = String(annotation.status || '');
+    note.textContent = text;
+    note.dataset.annotationStatus = status;
+    bubble.dataset.chatAnnotationStatus = status;
+    return true;
+}

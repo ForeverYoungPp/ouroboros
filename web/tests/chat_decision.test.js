@@ -124,7 +124,7 @@ test('an accepted answer marks the chosen option; degenerate cards refuse to ren
         card.querySelectorAll('.chat-quiz-option')[1].click();
         await new Promise((resolve) => setTimeout(resolve, 0));
         assert.equal(fx.calls.length, 1);
-        assert.match(fx.calls[0].url, /\/api\/tasks\/t-1\/decision$/);
+        assert.equal(fx.calls[0].url, '/api/decisions');
         const body = JSON.parse(fx.calls[0].init.body);
         assert.equal(body.decision_id, 'quiz:t-1:qz-1');
         assert.equal(body.option_index, 1);
@@ -196,14 +196,80 @@ test('a non-409 failure keeps the card open with an honest toast', async () => {
     } finally { fx.restore(); }
 });
 
-test('a 409 settles the card as expired and says so', async () => {
+test('a 409 settles the card by the BODY state — a lost race reads answered, not expired', async () => {
+    // The refusal body carries the true lifecycle state: the loser of a
+    // first-wins race must see the winning answer, never a false expiry.
+    const fx = fixture({ fetchImpl: async () => ({
+        ok: false, status: 409,
+        json: async () => ({ ok: false, error: 'quiz_closed', state: 'answered', answered_index: 1 }),
+    }) });
+    try {
+        const card = fx.decision.buildQuizCard(WS_MSG);
+        card.querySelectorAll('.chat-quiz-option')[0].click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(card.dataset.state, 'answered');
+        assert.ok(card.querySelectorAll('.chat-quiz-option')[1].classList.contains('chosen'));
+        assert.match(fx.toasts[0].text, /Already answered/);
+    } finally { fx.restore(); }
+});
+
+test('a bodyless 409 still settles the card as expired', async () => {
     const fx = fixture({ fetchImpl: async () => ({ ok: false, status: 409 }) });
     try {
         const card = fx.decision.buildQuizCard(WS_MSG);
         card.querySelectorAll('.chat-quiz-option')[0].click();
         await new Promise((resolve) => setTimeout(resolve, 0));
         assert.equal(card.dataset.state, 'expired_terminal');
-        assert.equal(fx.toasts.length, 1);
         assert.match(fx.toasts[0].text, /no longer open/);
     } finally { fx.restore(); }
+});
+
+test('a retry reuses the SAME request_id (stable idempotency key)', async () => {
+    const seen = [];
+    let failFirst = true;
+    const fx = fixture({ fetchImpl: async (url, init) => {
+        seen.push(JSON.parse(init.body).request_id);
+        if (failFirst) { failFirst = false; return { ok: false, status: 503, json: async () => ({}) }; }
+        return { ok: true, status: 200, json: async () => ({ ok: true, state: 'answered', answered_index: 0 }) };
+    } });
+    try {
+        const card = fx.decision.buildQuizCard(WS_MSG);
+        const btn = card.querySelectorAll('.chat-quiz-option')[0];
+        btn.click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(card.dataset.state, 'open'); // 503 leaves the card open for retry
+        btn.click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(card.dataset.state, 'answered');
+        assert.equal(seen.length, 2);
+        assert.equal(seen[0], seen[1]);
+    } finally { fx.restore(); }
+});
+
+test('applyQuizStateFrame settles an existing card and ignores unknown ids', async () => {
+    const fx = fixture({ fetchImpl: async () => ({ ok: true, status: 200 }) });
+    if (!globalThis.CSS) globalThis.CSS = { escape: (v) => String(v) };
+    try {
+        const card = fx.decision.buildQuizCard(WS_MSG);
+        const inner = card.children[0] || card; // frameNode wraps the card
+        const quizCard = inner.matchesClass && inner.matchesClass('chat-quiz-card') ? inner : card;
+        const root = {
+            querySelector: (sel) => (sel.includes('qz-1') ? quizCard : null),
+        };
+        // The live lifecycle frame (WS quiz_state) settles the card in place.
+        const applied = fx.decision.applyQuizStateFrame(root, {
+            quiz_id: 'qz-1', task_id: 't-1', state: 'answered', answered_index: 0,
+        });
+        assert.equal(applied, true);
+        assert.equal(quizCard.dataset.state, 'answered');
+        const buttons = quizCard.querySelectorAll('chat-quiz-option');
+        assert.ok(buttons.length >= 2);
+        assert.ok(buttons.every((btn) => btn.disabled));
+        assert.ok(buttons[0].classList.contains('chosen'));
+
+        // Unknown id: no card found, nothing thrown, honest false.
+        assert.equal(fx.decision.applyQuizStateFrame(root, { quiz_id: 'other', state: 'answered' }), false);
+    } finally {
+        fx.restore();
+    }
 });

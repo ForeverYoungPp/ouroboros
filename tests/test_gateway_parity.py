@@ -31,7 +31,10 @@ from ouroboros.gateway.contracts import (
     LinkAction,
     LinksOutbound,
     QuizOption,
+    DecisionRequest,
+    DecisionResponse,
     QuizOutbound,
+    QuizStateOutbound,
     LogOutbound,
     PhotoOutbound,
     ProviderTestRequest,
@@ -187,6 +190,9 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "LinksOutbound",
         "QuizOption",
         "QuizOutbound",
+        "QuizStateOutbound",
+        "DecisionRequest",
+        "DecisionResponse",
         "MessageAnnotationOutbound",
         "UploadResponse",
         "TaskCreateResponse",
@@ -234,7 +240,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
     # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
     for cls in (ChatInbound, ChatOutbound, PhotoOutbound, VideoOutbound, DocumentOutbound,
-                LinkAction, LinksOutbound, QuizOption, QuizOutbound,
+                DecisionRequest, DecisionResponse, LinkAction, LinksOutbound, QuizOption, QuizOutbound, QuizStateOutbound,
                 ActiveDirectTurn, ActiveChatActivity, TypingOutbound,
                 StateResponse, OwnerScopeReviewFloorResponse, UpdateMergePlan,
                 UpdatePreflightRequest, UpdatePreflightResponse, UpdateApplyRequest,
@@ -396,7 +402,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     assert re.search(r"@property \{Object=\} review_projection\b", text)
     assert "setup_contract" in text
     assert re.search(r"@property \{string=\} error\b", text), "SkillDeleteResponse missing optional error"
-    assert {"chat", "command", "photo", "video", "links", "quiz", "typing", "log", "heartbeat", "extension_lifecycle"} <= set(WS_MESSAGE_TYPES)
+    assert {"chat", "command", "photo", "video", "links", "quiz", "quiz_state", "typing", "log", "heartbeat", "extension_lifecycle"} <= set(WS_MESSAGE_TYPES)
     assert "message_annotation" in WS_MESSAGE_TYPES
     assert "update_status_ready" in WS_MESSAGE_TYPES
     assert _js_typedef_fields(text, "MessageAnnotationOutbound") == {

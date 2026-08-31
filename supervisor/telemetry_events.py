@@ -64,4 +64,7 @@ TELEMETRY_EVENT_HANDLERS = {
     "advisory_contract_warning": _handle_typed_telemetry,
     "plan_task_deadline_skip": _handle_typed_telemetry,
     "task_message_injected": _handle_task_message_injected,
+    # #Q-2b: the owner's quiz answer landed in a worker round — same
+    # duplicate-detection telemetry as its task-message sibling.
+    "quiz_answer_injected": _handle_typed_telemetry,
 }

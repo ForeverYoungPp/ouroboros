@@ -623,7 +623,7 @@ def test_full_builtin_registry_fits_custom_description_contract(tmp_path):
     repo_dir = pathlib.Path(__file__).resolve().parents[1]
     registry = ToolRegistry(repo_dir=repo_dir, drive_root=tmp_path)
     schemas = registry.schemas()
-    assert len(schemas) == 112
+    assert len(schemas) == 113
     catalog = project_function_tools_to_openai_custom(schemas)
     assert len(catalog.tool_names) == len(schemas)
     assert all(

@@ -728,3 +728,40 @@ def _child_result_projection(q: Any, task_id: str) -> str:
             preview = preview[:_CHILD_PROJECTION_PREVIEW_CHARS] + "…"
         lines.append(f"- {tid} ({status or 'unknown'}): {preview or '(no result text)'}")
     return "\n".join(lines)
+
+
+def handle_finalize_now_entry(entry, owner_ctx, drive_root, task_id, controls) -> None:
+    """Apply a drained KIND_FINALIZE_NOW mailbox control (extracted verbatim
+    from the loop's drain dispatch; the stop-control currency/latch checks
+    belong beside the rest of the owner-stop semantics in this module).
+
+    Sets ``controls["finalize_now"]`` (and the deadline timestamp for the
+    non-owner-stop reason) unless the owner-stop control is stale or its
+    first-drain latch was already spent.
+    """
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.outcomes import REASON_OWNER_REQUESTED_FINALIZATION
+    from ouroboros import task_pacing
+
+    text = str(entry.get("text") or "deadline")
+    first_line = text.splitlines()[0].strip() if text else ""
+    if first_line == REASON_OWNER_REQUESTED_FINALIZATION:
+        if not _owner_stop_control_is_current(
+            owner_ctx, drive_root, task_id, str(entry.get("msg_id") or ""),
+        ):
+            return
+        # Owner-stop budget starts at delivery; first drain wins.
+        if not _mark_owner_stop_control_drained(owner_ctx, drive_root, task_id):
+            return
+        if not _owner_stop_control_is_current(
+            owner_ctx, drive_root, task_id, str(entry.get("msg_id") or ""),
+        ):
+            return
+    else:
+        opened = parse_deadline_ts(entry.get("ts"))
+        if opened is not None:
+            controls["finalize_deadline_ts"] = (
+                opened.timestamp()
+                + task_pacing.effective_finalization_reserve_sec(owner_ctx)
+            )
+    controls["finalize_now"] = text

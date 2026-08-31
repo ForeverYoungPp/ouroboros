@@ -32,6 +32,7 @@ from ouroboros.gateway.task_events import (  # noqa: F401
 # Re-exported hurry ingress (same module-size split as task_events): route
 # wiring and tests address gateway.tasks.api_task_hurry.
 from ouroboros.gateway.task_hurry import api_task_hurry  # noqa: F401
+from ouroboros.gateway.task_decision import api_decision_answer  # noqa: F401
 from ouroboros.headless import (
     ARTIFACTS_DIR,
     ARTIFACT_STATUS_FAILED,
@@ -1526,6 +1527,7 @@ def _supervisor_ready_error(request: Request) -> Optional[JSONResponse]:
 __all__ = [
     "api_task_artifact",
     "api_task_cancel",
+    "api_decision_answer",
     "api_task_hurry",
     "api_task_resume",
     "api_task_events",

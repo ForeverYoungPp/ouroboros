@@ -2282,6 +2282,137 @@ def _forward_to_worker(
         return f"⚠️ TASK_MESSAGE_UNWRITTEN: message to task {tid} was not persisted."
     return f"Message forwarded to task {tid}"
 
+def _escalate(
+    ctx: ToolContext,
+    question: str,
+    options: list | None = None,
+    stake: str = "",
+    assumption: str = "",
+) -> str:
+    """One escalation verb for the whole tree (owner decision 31 hierarchy).
+
+    A ROOT task addresses the OWNER: a typed quiz card in the chat
+    (fire-and-continue under the mandatory ``assumption`` — decision 27=A).
+    A SUBAGENT addresses its PARENT: a typed mailbox frame the parent answers
+    with ``forward_to_worker`` or raises higher by calling ``escalate``
+    itself, forwarding the payload verbatim. The owner only ever sees what no
+    ancestor was willing to answer. Expiry is structural only (decision
+    30=A): the question dies with its author; there is no host deadline.
+    """
+    from ouroboros.tool_capabilities import BACKGROUND_DELEGATION_ROLE
+
+    meta = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
+    if str(meta.get("delegation_role") or "") == BACKGROUND_DELEGATION_ROLE:
+        # Background cognition has no owner-interactive loop and no parent:
+        # a card it can never collect an answer for would be a zombie.
+        return ("⚠️ ESCALATE_UNAVAILABLE: background consciousness cannot escalate — "
+                "record the open question in memory or scratchpad instead.")
+    try:
+        payload = validate_quiz_payload(question, options, stake, assumption)
+    except QuizValidationError as exc:
+        return f"⚠️ {exc.code}: {exc}"
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    if not task_id:
+        return "⚠️ ESCALATE_UNAVAILABLE: escalate requires an active task context."
+    if bool(getattr(ctx, "is_direct_chat", False)):
+        # A direct chat turn IS the owner conversation: it is not a queue
+        # task the answer ingress can address, and a card would be a dead
+        # end — ask the question directly in the reply instead.
+        return ("⚠️ ESCALATE_UNAVAILABLE: this is a live owner conversation — "
+                "ask the question directly in your reply instead of a card.")
+    parent_task_id = str(meta.get("parent_task_id") or "").strip()
+    delegation_role = str(meta.get("delegation_role") or "").strip()
+    if delegation_role and not parent_task_id:
+        # Fail-closed on corrupted lineage: a delegated context without its
+        # parent id must never fall through to the OWNER card path (decision
+        # 31 — the owner sees only what no ancestor answered).
+        return ("⚠️ ESCALATE_UNAVAILABLE: delegated context without a parent "
+                "task id — record the open question in your result instead.")
+
+    if parent_task_id:
+        # Upward hop: descendant -> parent, the mirror of forward_to_worker.
+        from ouroboros.owner_mailbox import write_task_message
+        from ouroboros.task_status import FINAL_STATUSES, load_effective_task_result
+
+        status_drive_root = pathlib.Path(str(meta.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
+        from ouroboros.task_results import STATUS_RUNNING, STATUS_SCHEDULED
+
+        data = load_effective_task_result(status_drive_root, parent_task_id)
+        status = str(data.get("status") or "").lower()
+        # A scheduled parent is a legitimate addressee (its mailbox is
+        # drained when it starts); unknown/empty status is not.
+        if not data or status in FINAL_STATUSES or status not in {STATUS_RUNNING, STATUS_SCHEDULED}:
+            return (f"⚠️ ESCALATE_PARENT_SETTLED: parent task {parent_task_id} is "
+                    f"{status or 'unknown'} — nobody is left to answer; proceed "
+                    "under your stated assumption and record the open question "
+                    "in your result.")
+        try:
+            from ouroboros.cancel_intents import cancel_pending
+
+            if cancel_pending(status_drive_root, parent_task_id):
+                return (f"⚠️ ESCALATE_PARENT_SETTLED: parent task {parent_task_id} has a "
+                        "pending cancellation — proceed under your stated assumption.")
+        except Exception:
+            pass
+        lines = [f"ESCALATION (decision requested): {payload['question']}", "Options:"]
+        lines += [
+            f"{i + 1}. {row['label']}" + (f" — {row['detail']}" if row.get("detail") else "")
+            for i, row in enumerate(payload["options"])
+        ]
+        if payload["stake"]:
+            lines.append(f"At stake: {payload['stake']}")
+        lines.append(f"I continue meanwhile under the assumption: {payload['assumption']}")
+        lines.append(
+            f"Answer with forward_to_worker(task_id={task_id}, message=...), or "
+            "escalate this question yourself (verbatim) if it is above your authority."
+        )
+        parent_drive = str(data.get("child_drive_root") or data.get("headless_child_drive_root") or data.get("drive_root") or "").strip()
+        written = write_task_message(
+            pathlib.Path(parent_drive) if parent_drive else status_drive_root,
+            "\n".join(lines),
+            task_id=parent_task_id,
+            source_task_id=task_id,
+            provenance="descendant_task",
+        )
+        if not written:
+            return f"⚠️ ESCALATE_UNWRITTEN: the escalation to parent {parent_task_id} was not persisted."
+        return (f"OK: escalated to parent task {parent_task_id}; continuing under "
+                f"assumption: {payload['assumption']}")
+
+    # Root task: the owner gets a typed quiz card.
+    from ouroboros.owner_quiz import record_asked
+
+    quiz_id = uuid.uuid4().hex
+    canonical_root = pathlib.Path(str(meta.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
+    asked = record_asked(
+        canonical_root, task_id,
+        quiz_id=quiz_id, question=payload["question"],
+        options=[row["label"] for row in payload["options"]],
+        stake=payload["stake"], assumption=payload["assumption"],
+    )
+    if asked.get("refused"):
+        return ("⚠️ ESCALATE_UNAVAILABLE: this task already has the maximum "
+                "number of unanswered owner questions open; proceed under your "
+                f"stated assumption: {payload['assumption']}")
+    from ouroboros.tools.owner_delivery import deliver_owner_event
+
+    mode = deliver_owner_event(ctx, {
+        "type": "send_quiz",
+        "chat_id": getattr(ctx, "current_chat_id", None) or 0,
+        "quiz_id": quiz_id,
+        "question": payload["question"],
+        "options": payload["options"],
+        "stake": payload["stake"],
+        "assumption": payload["assumption"],
+        "state": "open",
+        "task_id": task_id,
+    })
+    delivered = "delivered to the owner" if mode == "live" else "queued for the owner"
+    return (f"OK: quiz {quiz_id} {delivered}; continuing under assumption: "
+            f"{payload['assumption']}. The answer (if any) arrives as an owner "
+            "quiz answer in a later round; the card expires when this task ends.")
+
+
 def get_tools() -> List[ToolEntry]:
     return [
         ToolEntry("read_file", {
@@ -2441,6 +2572,27 @@ def get_tools() -> List[ToolEntry]:
                 "include": {"type": "string", "default": "", "description": "Filter by glob pattern (e.g. '*.py')"},
             }, "required": ["query"]},
         }, _code_search),
+        ToolEntry("escalate", {
+            "name": "escalate",
+            "description": (
+                "Escalate a decision up the responsibility chain instead of guessing. "
+                "A root task asks the OWNER (a typed quiz card with option buttons); "
+                "a subagent asks its PARENT task (a typed mailbox frame the parent "
+                "answers with forward_to_worker or escalates higher, verbatim). "
+                "Fire-and-continue: state the assumption you keep working under — "
+                "the answer, if it comes, arrives in a later round, and the question "
+                "expires when your task ends."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "question": {"type": "string", "description": "The decision being escalated (markdown renders in chat)"},
+                "options": {"type": "array", "items": {"type": "object", "properties": {
+                    "label": {"type": "string", "description": "Short option label (button text, max 120)"},
+                    "detail": {"type": "string", "description": "Optional one-line consequence of this option (max 500)"},
+                }, "required": ["label"]}, "description": "2-6 mutually exclusive options"},
+                "stake": {"type": "string", "description": "What depends on this decision (optional, max 500)"},
+                "assumption": {"type": "string", "description": "REQUIRED: the assumption you continue under until answered (max 500)"},
+            }, "required": ["question", "options", "assumption"]},
+        }, _escalate),
         ToolEntry("forward_to_worker", {
             "name": "forward_to_worker",
             "description": (

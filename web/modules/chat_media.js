@@ -674,6 +674,8 @@ export function createChatMedia({
         chatMediaMessageKey,
         documentMessageKey,
         buildQuizCard,
+        applyQuizStateFrame,
+        messagesRoot,
     }) {
         function appendMediaBubble(msg) {
             const key = chatMediaMessageKey(msg);
@@ -726,6 +728,11 @@ export function createChatMedia({
         onWs('document', deliver(appendDocumentBubble));
         onWs('links', deliver(appendLinksMessage));
         onWs('quiz', deliver(appendQuizMessage));
+        if (applyQuizStateFrame && messagesRoot) {
+            // Lifecycle updates address an EXISTING card by quiz_id — no
+            // thread routing, no unread bump, never a new bubble.
+            onWs('quiz_state', (msg) => applyQuizStateFrame(messagesRoot(), msg));
+        }
         return { appendMediaBubble, appendDocumentBubble, appendLinksMessage, appendQuizMessage };
     }
 

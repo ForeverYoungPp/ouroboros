@@ -798,6 +798,11 @@ def _collect_chat_rows(
     Returns ``(rows, quota_row_count)`` — the transformed history records and
     how many read entries satisfied the reader's quota predicate (feeds the
     window-truncation metadata)."""
+    # Quiz lifecycle merge (#Q-2b): the chat row froze the card at ask time
+    # ("open"); the durable truth lives in the owner_quiz task-result
+    # projection. One projection read per distinct asking task, cached for
+    # this call.
+    quiz_projection_cache: Dict[str, Dict[str, Any]] = {}
     combined: list = []
     chat_quota_rows = 0
     stream_gaps: set[str] = set()
@@ -886,7 +891,19 @@ def _collect_chat_rows(
             elif entry.get("type") == "links":
                 rec.update(msg_type="links", actions=list(entry.get("actions") or []), title=str(entry.get("title") or ""))
             elif entry.get("type") == "quiz" and isinstance(entry.get("quiz"), dict):
-                rec.update(msg_type="quiz", quiz=dict(entry["quiz"]))
+                quiz = dict(entry["quiz"])
+                _qtid = str(entry.get("task_id") or "")
+                if _qtid:
+                    if _qtid not in quiz_projection_cache:
+                        from ouroboros.owner_quiz import quiz_states
+
+                        quiz_projection_cache[_qtid] = quiz_states(chat_path.parent.parent, _qtid)
+                    _live = quiz_projection_cache[_qtid].get(str(quiz.get("quiz_id") or ""))
+                    if isinstance(_live, dict):
+                        quiz["state"] = str(_live.get("state") or quiz.get("state") or "open")
+                        if "answered_index" in _live:
+                            quiz["answered_index"] = _live["answered_index"]
+                rec.update(msg_type="quiz", quiz=quiz)
             if "task_terminal_status" in entry:
                 rec["task_terminal_status"] = str(entry.get("task_terminal_status") or "")
             _copy_task_summary_metadata(rec, entry)
