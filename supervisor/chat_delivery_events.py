@@ -110,11 +110,40 @@ def _handle_send_links(evt: Dict[str, Any], ctx: Any) -> None:
         _log_error(ctx, "send_links_event_error", error=repr(exc))
 
 
+def _handle_send_quiz(evt: Dict[str, Any], ctx: Any) -> None:
+    """Send an owner quiz card to the owner's chat."""
+    try:
+        chat_id = _delivery_chat_id(evt, ctx)
+        options = evt.get("options")
+        if chat_id is None or not isinstance(options, list) or not options:
+            return
+        if chat_id == 0:
+            # Deliberate exception to the "0 is a real hidden session" policy:
+            # an interactive card in the hidden panel can never be seen or
+            # answered, so a headless author's quiz goes to Main.
+            chat_id = 1
+        ok, err = ctx.bridge.send_quiz(
+            chat_id,
+            quiz_id=str(evt.get("quiz_id") or ""),
+            question=str(evt.get("question") or ""),
+            options=options,
+            stake=str(evt.get("stake") or ""),
+            assumption=str(evt.get("assumption") or ""),
+            state=str(evt.get("state") or "open"),
+            task_id=str(evt.get("task_id") or ""),
+        )
+        if not ok:
+            _log_error(ctx, "send_quiz_error", chat_id=chat_id, error=err)
+    except Exception as exc:
+        _log_error(ctx, "send_quiz_event_error", error=repr(exc))
+
+
 EVENT_HANDLERS = {
     "send_photo": _handle_send_photo,
     "send_video": _handle_send_video,
     "send_document": _handle_send_document,
     "send_links": _handle_send_links,
+    "send_quiz": _handle_send_quiz,
 }
 
 

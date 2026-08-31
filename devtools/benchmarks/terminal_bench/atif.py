@@ -212,6 +212,11 @@ def _detect_version(events: list[dict[str, Any]]) -> str | None:
 def _final_answer(agent_dir: Path) -> str:
     chat = _read_jsonl_chain(agent_dir / "ouroboros-data", "chat.jsonl", "chat")
     for row in reversed(chat):
+        if row.get("type"):
+            # Typed structural rows (quiz/links/document/photo/video,
+            # proactive_message, project lifecycle) are deliveries, never the
+            # task's final answer.
+            continue
         if row.get("direction") == "out" and isinstance(row.get("text"), str):
             return row["text"]
     try:

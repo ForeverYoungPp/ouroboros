@@ -320,6 +320,37 @@ class LinksOutbound(TypedDict):
     transport: NotRequired[TransportMetadata]
 
 
+class QuizOption(TypedDict):
+    """One selectable option on an owner quiz card."""
+
+    label: str
+    detail: NotRequired[str]
+
+
+class QuizOutbound(TypedDict):
+    """Outbound owner quiz card: a typed question with option buttons.
+
+    Fire-and-continue: the asking task keeps working under ``assumption``
+    while the card is open. ``state`` is the card's lifecycle word
+    (``open`` in this display phase; answered/expired arrive with the
+    answer ingress).
+    """
+
+    type: Literal["quiz"]
+    role: Literal["assistant"]
+    quiz_id: str
+    question: str
+    options: list[QuizOption]
+    stake: str
+    assumption: str
+    state: str
+    ts: str
+    chat_id: NotRequired[int]
+    task_id: NotRequired[str]
+    project_thread: NotRequired[bool]
+    transport: NotRequired[TransportMetadata]
+
+
 class TypingOutbound(TypedDict):
     """Outbound WS typing indicator."""
 
@@ -1444,6 +1475,7 @@ WS_MESSAGE_TYPES: tuple[str, ...] = (
     "video",
     "document",
     "links",
+    "quiz",
     "typing",
     "log",
     "heartbeat",
@@ -1467,6 +1499,8 @@ __all__ = [
     "DocumentOutbound",
     "LinkAction",
     "LinksOutbound",
+    "QuizOption",
+    "QuizOutbound",
     "TypingOutbound",
     "LogOutbound",
     "HeartbeatOutbound",

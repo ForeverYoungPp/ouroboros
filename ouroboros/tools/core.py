@@ -1793,6 +1793,71 @@ def validate_link_actions(actions: Any) -> List[Dict[str, str]]:
     return cleaned
 
 
+_MAX_QUIZ_OPTIONS = 6
+_MAX_QUIZ_QUESTION_CHARS = 2000
+
+
+class QuizValidationError(ValueError):
+    """Typed atomic refusal from the shared quiz payload validator."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def validate_quiz_payload(
+    question: Any, options: Any, stake: Any, assumption: Any,
+) -> Dict[str, Any]:
+    """Return one cleaned quiz payload, or refuse the entire card.
+
+    Shared by the asking tool and the message bus (one validator, two
+    callers — the LinksOutbound pattern). ``assumption`` is REQUIRED by
+    owner decision 27=A: a quiz is fire-and-continue, so the card must name
+    what the task keeps doing while the owner has not answered.
+    """
+    q_text = str(question or "").strip()
+    if not q_text or len(q_text) > _MAX_QUIZ_QUESTION_CHARS:
+        raise QuizValidationError(
+            "QUIZ_QUESTION_INVALID",
+            f"question must be 1..{_MAX_QUIZ_QUESTION_CHARS} characters.",
+        )
+    if not isinstance(options, list) or not 2 <= len(options) <= _MAX_QUIZ_OPTIONS:
+        raise QuizValidationError(
+            "QUIZ_OPTIONS_INVALID",
+            f"provide 2..{_MAX_QUIZ_OPTIONS} options.",
+        )
+    cleaned: List[Dict[str, str]] = []
+    for item in options:
+        if isinstance(item, str):
+            item = {"label": item}
+        if not isinstance(item, dict):
+            raise QuizValidationError(
+                "QUIZ_OPTIONS_INVALID", "each option needs a label."
+            )
+        label = str(item.get("label") or "").strip()
+        detail = str(item.get("detail") or "").strip()
+        if not label:
+            raise QuizValidationError(
+                "QUIZ_OPTIONS_INVALID", "each option needs a non-empty label."
+            )
+        option: Dict[str, str] = {"label": label[:120]}
+        if detail:
+            option["detail"] = detail[:500]
+        cleaned.append(option)
+    assumption_text = str(assumption or "").strip()
+    if not assumption_text:
+        raise QuizValidationError(
+            "QUIZ_ASSUMPTION_REQUIRED",
+            "state the assumption you continue under until the owner answers.",
+        )
+    return {
+        "question": q_text,
+        "options": cleaned,
+        "stake": str(stake or "").strip()[:500],
+        "assumption": assumption_text[:500],
+    }
+
+
 def _detect_document_mime(file_path: str) -> str:
     """Best-effort MIME for an arbitrary document/file from its extension."""
     mime, _ = __import__("mimetypes").guess_type(file_path)

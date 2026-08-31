@@ -885,6 +885,8 @@ def _collect_chat_rows(
                 rec["caption"] = str(entry.get("caption") or "")
             elif entry.get("type") == "links":
                 rec.update(msg_type="links", actions=list(entry.get("actions") or []), title=str(entry.get("title") or ""))
+            elif entry.get("type") == "quiz" and isinstance(entry.get("quiz"), dict):
+                rec.update(msg_type="quiz", quiz=dict(entry["quiz"]))
             if "task_terminal_status" in entry:
                 rec["task_terminal_status"] = str(entry.get("task_terminal_status") or "")
             _copy_task_summary_metadata(rec, entry)
