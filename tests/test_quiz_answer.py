@@ -568,3 +568,18 @@ def test_escalate_refuses_unknown_parent_status(tmp_path, monkeypatch):
     ctx = _tool_ctx(tmp_path, task_id="child-9", parent="root-1")
     out = _escalate(ctx, question="?", options=["a", "b"], assumption="a")
     assert out.startswith("⚠️ ESCALATE_PARENT_SETTLED")
+
+
+def test_escalate_refuses_a_pending_cancel_parent(tmp_path, monkeypatch):
+    """A parent that still reads running but carries a pending cancellation
+    will never drain the mailbox — the hop is refused (mirrors forward_to_worker)."""
+    import ouroboros.cancel_intents as ci
+    import ouroboros.task_status as ts
+
+    monkeypatch.setattr(ts, "load_effective_task_result",
+                        lambda root, tid: {"status": "running"})
+    monkeypatch.setattr(ci, "cancel_pending", lambda root, tid: True)
+    ctx = _tool_ctx(tmp_path, task_id="child-9", parent="root-1")
+    out = _escalate(ctx, question="?", options=["a", "b"], assumption="a")
+    assert out.startswith("⚠️ ESCALATE_PARENT_SETTLED")
+    assert "pending cancellation" in out
