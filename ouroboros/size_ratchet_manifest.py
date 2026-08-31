@@ -144,7 +144,6 @@ BAND_PATHS = {
     "ouroboros/gateway/control.py": "Entered the band from 966 lines: the update-flow redesign added the shared stash-first prologue (_stash_local_work_fenced/_unwind_stashed_update) and the review-wave affordability floor to the update apply orchestration (update-flow-redesign sprint, Q9/Q10 owner decisions).",
     "ouroboros/gateway/history.py": None,
     "ouroboros/gateway/settings.py": "Retiring persistent auto-Low removed the former giant debt; the remaining owner and reviewer settings endpoints stay centralized while tracked in the shrinking band.",
-    "ouroboros/loop_tool_execution.py": None,
     "ouroboros/marketplace/ouroboroshub.py": "Entered the band from 373 lines: the hubflow sprint added the adopt transaction (eligibility prelude, CAS re-verification, move-aside + state-quintet snapshot, verified rollback with per-step error collection, retention finalize) beside the existing install/update flows (hubflow sprint, adopt-in-ouroboroshub owner decision D4).",
     "ouroboros/observability.py": "Entered the band from 820 lines: child task copy-back now promotes only promised observability CAS manifests/blobs and task-owned source handles into canonical storage before headless GC, with typed unavailable gaps and retry metadata.",
     "ouroboros/platform_layer.py": "Shrank INTO the band: the retired Claude-SDK runtime probes (resolve_claude_runtime, ClaudeRuntimeState) were deleted with the transport (owner-approved Q4 retirement); no new content was added.",

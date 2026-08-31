@@ -58,6 +58,10 @@ _FAILURE_PREFIXES = (
     "⚠️ RUN_SCRIPT_",
     "⚠️ CLAUDE_CODE_",
     "⚠️ VLM_",
+    # #440 fix-forward: an abandoned call's typed void result and the
+    # hung-session backlog refusal are failures, not content.
+    "⚠️ BROWSER_SESSION_RETIRED",
+    "⚠️ BROWSER_BACKLOG_RETIRED_SESSIONS",
     "⚠️ LIGHT_MODE_",
     "⚠️ WORKSPACE_",
     "⚠️ ELEVATION_",
@@ -634,6 +638,41 @@ def _extract_result_metadata(fn_name: str, result: Any, is_error: bool) -> Dict[
     return meta
 
 
+def _execute_browser_tool_bound(
+    tools: ToolRegistry,
+    tc: Dict[str, Any],
+    drive_logs: pathlib.Path,
+    task_id: str,
+    generation: Any,
+) -> Dict[str, Any]:
+    """The stateful (browser) submit wrapper: the call is BOUND to the browser
+    generation the main thread saw at submit time. A call that only STARTS
+    after its generation was retired (its own timeout fired before the worker
+    reached the tool body) must not touch the replacement — its result goes to
+    the settlement void anyway, so it refuses instead of executing."""
+    tool_ctx = getattr(tools, "_ctx", None)
+    current = getattr(tool_ctx, "browser_state", None) if tool_ctx is not None else None
+    if generation is not None and current is not None and current is not generation:
+        return {
+            "tool_call_id": tc.get("id"),
+            "fn_name": str(tc.get("function", {}).get("name") or ""),
+            "result": ("⚠️ BROWSER_SESSION_RETIRED: this call timed out before it "
+                       "started and its browser generation was retired; nothing ran."),
+            "is_error": True,
+            "args_for_log": {},
+            "is_code_tool": False,
+        }
+    if tool_ctx is not None and generation is not None:
+        # Pin the expectation for the tool body: _ensure_browser re-checks it
+        # at the exact moment it captures the generation, which closes the
+        # check-then-run window (safety checks between here and the handler
+        # can be long). _ensure_browser's own legitimate replacements update
+        # the pin, so a mid-call error after such a replacement is never
+        # mistaken for a timeout retirement.
+        setattr(tool_ctx, "_active_browser_generation", generation)
+    return _execute_single_tool(tools, tc, drive_logs, task_id)
+
+
 def _execute_single_tool(
     tools: ToolRegistry,
     tc: Dict[str, Any],
@@ -810,6 +849,16 @@ class StatefulToolExecutor:
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
 
+    def retire(self):
+        """Detach from the sticky thread WITHOUT cancelling queued work.
+
+        The timeout path queues the browser-generation cleanup BEHIND the
+        hung call on this same thread; reset()'s cancel_futures would cancel
+        exactly that cleanup and leak the browser."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=False)
+            self._executor = None
+
     def shutdown(self, wait=True, cancel_futures=False):
         """Shutdown the sticky executor."""
         if self._executor is not None:
@@ -937,7 +986,15 @@ def _execute_with_timeout(
 
     if use_stateful:
         assert stateful_executor is not None
-        future = stateful_executor.submit(_execute_single_tool, tools, tc, drive_logs, task_id)
+        # The generation this call is bound to, captured by the SUBMITTING
+        # thread: if the call's own timeout retires it before the worker even
+        # reaches the tool body, the wrapper refuses instead of letting the
+        # abandoned call build a session in the NEXT command's state.
+        submit_generation = getattr(tool_ctx, "browser_state", None)
+        future = stateful_executor.submit(
+            _execute_browser_tool_bound, tools, tc, drive_logs, task_id,
+            submit_generation,
+        )
         try:
             result = future.result(timeout=timeout_sec)
             result_meta = result.get("result_meta") or {}
@@ -957,7 +1014,7 @@ def _execute_with_timeout(
             }, correlation, tool_call_id=tool_call_id))
             return result
         except (TimeoutError, concurrent.futures.TimeoutError):
-            detached_browser_handles = None
+            settlement_target = future
             on_settled: Optional[Callable[[], None]] = None
             if tool_ctx is not None:  # stateful branch: use_stateful is already true here
                 from ouroboros.tools.browser import (
@@ -967,24 +1024,36 @@ def _execute_with_timeout(
 
                 # CROSS-THREAD INVARIANT (#409): Playwright objects are bound
                 # to the worker thread that created them. This main-thread
-                # path may only DETACH the handles from the context — never
-                # call close()/stop() here (a cross-thread stop() kills the
-                # driver under the hung worker and turns its dispatcher wait
-                # into a CPU busy-loop). The close happens in the settlement
-                # callback below, which the executor runs on the worker
-                # thread that owns the handles.
-                detached_browser_handles = _detach_browser(tool_ctx)
-                def _cleanup_detached_browser() -> None:
-                    if detached_browser_handles is not None:
-                        cleanup_browser_handles(detached_browser_handles)
-
-                on_settled = _cleanup_detached_browser
+                # path may only DETACH (retire) the generation — never call
+                # close()/stop() here (a cross-thread stop() kills the driver
+                # under the hung worker and turns its dispatcher wait into a
+                # CPU busy-loop). The close is QUEUED on the retiring
+                # executor behind the hung call, so it runs on the owning
+                # worker thread whenever that call settles — including the
+                # already-settled race, where the queued task runs at once on
+                # that same thread (a done-callback would have run HERE, on
+                # the main thread, exactly the cross-thread close this path
+                # exists to prevent).
+                retired_generation, _fresh = _detach_browser(tool_ctx)
+                try:
+                    settlement_target = stateful_executor.submit(
+                        cleanup_browser_handles, retired_generation,
+                    )
+                except Exception:
+                    # Degenerate fallback (executor already dead): settle on
+                    # the tool future and close best-effort in its callback.
+                    log.debug("cleanup submit failed; falling back to done-callback",
+                              exc_info=True)
+                    settlement_target = future
+                    on_settled = lambda: cleanup_browser_handles(retired_generation)  # noqa: E731
             _attach_late_tool_settlement(
-                tools, future, task_id=task_id, tool_call_id=tool_call_id,
+                tools, settlement_target, task_id=task_id, tool_call_id=tool_call_id,
                 correlation={**correlation, "tool": fn_name},
                 on_settled=on_settled,
             )
-            stateful_executor.reset()
+            # retire(), not reset(): cancel_futures would cancel exactly the
+            # queued cleanup task this path just submitted.
+            stateful_executor.retire()
             reset_msg = "Browser state has been reset. "
             timeout_result = _make_timeout_result(
                 fn_name, tool_call_id, is_code_tool, tc, drive_logs,

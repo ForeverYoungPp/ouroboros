@@ -1186,4 +1186,4 @@
 
 export const MAX_LINK_ACTIONS = 12;
 export const MAX_QUIZ_OPTIONS = 6;
-export const GATEWAY_CONTRACT_VERSION = '6.113.4';
+export const GATEWAY_CONTRACT_VERSION = '6.113.5';
