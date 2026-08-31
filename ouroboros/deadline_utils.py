@@ -311,3 +311,18 @@ def review_transport_timeout(model: Any, explicit: Any = None, deadline_at: Any 
         deadline_at=deadline or None,
         reserve_sec=get_finalization_grace_sec(),
     )
+
+
+def deadline_expired(ctx) -> bool:
+    """True when the task HAS a deadline and it has already passed.
+
+    The distinction ``deadline_remaining_sec`` alone cannot make: it answers
+    0.0 both for "no deadline" and for "the deadline is behind us", and
+    collapsing them let an EXPIRED nanny hand a fresh run the absolute task
+    ceiling.
+    """
+    meta = getattr(ctx, "task_metadata", {})
+    meta = meta if isinstance(meta, dict) else {}
+    if parse_deadline_ts(meta.get("deadline_at")) is None:
+        return False
+    return deadline_remaining_sec(ctx) <= 0

@@ -558,11 +558,17 @@ def prepare_delegate_start_actor(
         drive_root, str(getattr(ctx, "task_id", "") or "")
     )
     if any(blockers.values()):
+        live_ids = [str(v) for key in ("open_run_ids", "pending_invocation_ids",
+                                       "undisposed_patch_run_ids")
+                    for v in (blockers.get(key) or [])]
+        shown = ", ".join(live_ids[:4]) + (
+            f" (+{len(live_ids) - 4} more)" if len(live_ids) > 4 else "")
         return {}, _fail(
             "delegate_start", "replacement_requires_settlement",
             "This task still owns an unsettled run/start invocation or an undisposed "
-            "captured patch. Prove the predecessor absent or terminal and explicitly "
-            "dispose any captured patch before starting a replacement.",
+            f"captured patch ({shown}). Wait for or cancel an open run; replay a "
+            "pending invocation with retry_of=<invocation id>; dispose a captured "
+            "patch explicitly (#364).",
             **blockers,
         )
     return {

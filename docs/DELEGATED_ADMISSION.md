@@ -34,6 +34,25 @@ runs. Not assumed hostile — assumed uncontrolled.
 A delegated READ-ONLY child (`mode: ask`, `access: readonly`) is not this actor. It gets no
 shell that can mutate, and it stays inside Claudexor's ordinary envelope.
 
+## 2a. Stable project identity and the persistent registration (#362)
+
+Fresh mutating delegated starts on an engine satisfying the workspace-root release
+contract (`CLAUDEXOR_DELEGATED_WORKSPACE_ROOT_MIN_VERSION = "3.8.1"`, the next
+compatible release carrying Claudexor PR216 after the pinned 3.8.0) register and retain
+the user's actual target project in `scope.root`, while the child's writable filesystem
+rides separately as the private snapshot in `execution.workspaceRoot`. That registration
+is the USER'S identity, not a disposable snapshot: it is marked `project_persistent`
+(`delegate_registration_policy.persistent_registration` — stable execution workspace
+plus `workspace_write`), and every retire path honours the marker — settlement, the
+orphan sweep, recovered-invocation refusals, and the pre-run refusal path. The ownership
+duty is discharged durably (`PROJECT_RETIRED` with `project_kept: true`) without
+deleting the project, and any persistent sharer makes the shared project undeletable for
+its non-persistent siblings. Durable records written before the marker existed fall back
+to the immutable stored request (`execution.workspaceRoot` + `access`) at recovery time
+(`record_persistent`); rows that carry the key are authoritative and are never
+recomputed from a live engine. Older engines keep the legacy snapshot-in-`scope.root`
+shape and retire their one-shot registration as before.
+
 ## 3. What Ouroboros actually controls
 
 Only ADMISSION and REPORTING. Ouroboros is an HTTP client of a daemon it does not build, ship,

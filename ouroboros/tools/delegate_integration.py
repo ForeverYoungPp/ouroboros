@@ -20,6 +20,7 @@ from ouroboros import delegate_custody as custody
 from ouroboros.delegate_custody import RunCustody as _RunCustody
 # ONE refusal author for the whole delegate surface: the neutral leaf
 # `delegate_shared` (phase B's facade split), never a local twin that could drift.
+from ouroboros.delegate_registration_policy import record_persistent as _record_persistent
 from ouroboros.delegate_shared import _fail
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for
 from ouroboros.utils import resolve_path_allow_missing
@@ -223,6 +224,7 @@ class _RetryBinding(NamedTuple):
     key: str
     project_id: str
     owned_project_id: str
+    project_persistent: bool
     seconds: int
     snapshot_id: str
     target_root: str
@@ -329,6 +331,7 @@ def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token
         key=str(record.get("idempotency_key") or ""),
         project_id=project_id,
         owned_project_id=(project_id if record.get("project_owned") else ""),
+        project_persistent=_record_persistent(record),
         seconds=int(request_body.get("maxSeconds") or 0),
         snapshot_id=snapshot_id,
         target_root=target_root,

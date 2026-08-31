@@ -149,10 +149,11 @@ def delegated_execution_workspace_root(
     gateway: Any, shape: DelegatedRunShape, root: str,
 ) -> str:
     """Return the live-workspace field only when the engine's strict schema accepts it."""
+    from ouroboros.config import CLAUDEXOR_DELEGATED_WORKSPACE_ROOT_MIN_VERSION
     from ouroboros.gateways.claudexor import engine_at_least
 
     version = str(getattr(gateway, "engine_version", "") or "")
-    supported = engine_at_least(version, "3.8.1")
+    supported = engine_at_least(version, CLAUDEXOR_DELEGATED_WORKSPACE_ROOT_MIN_VERSION)
     return str(root) if supported and shape.delegated and shape.isolation == "live" else ""
 
 
