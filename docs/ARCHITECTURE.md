@@ -412,6 +412,7 @@ CITATION.cff                  ← Machine-readable software citation plus the pr
 docs/benchmarks/evidence.json ← Release-bound non-GAIA projection of public benchmark claims and immutable evidence links; README remains the claim SSOT
 site/paper/index.html         ← Canonical technical-report landing page with author/citation metadata, `ScholarlyArticle` JSON-LD, paper links, and evidence navigation
 scripts/claudexor_platform_smoke.py ← the platform gate's smoke runner (daemon boot, one delegated no-edit/edit task, containment report)
+scripts/validate_scope_receipt.py   ← contributor-facing shape validator for the CONTRIBUTING scope-checklist receipt; a thin CLI over `scope_review_contract.normalize_scope_items` (accepts bare/fenced/embedded JSON via the runtime `extract_json_array`)
 scripts/fetch_claudexor_runtime.py  ← release-build fetcher for the pinned managed Claudexor runtime archive (claudexor_runtime_pin.json is the SSOT)
 build.sh                      ← macOS build (PyInstaller → .dmg)
 build_linux.sh                ← Linux build (portable-Python PyInstaller → .AppImage + .tar.gz)

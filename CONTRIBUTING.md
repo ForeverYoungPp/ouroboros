@@ -19,8 +19,12 @@ this flow.
 
 ## 1. Read the Project Before Editing
 
-For a substantive change, read these files **in full** before designing or
-editing:
+For a substantive change, ground yourself in the project documents before
+designing or editing. Read [`docs/CHECKLISTS.md`](docs/CHECKLISTS.md) — the
+review checklist single source of truth — **in full**: your change will be
+judged against it. For the other four, build a navigation map from their
+headings first, then read every section relevant to your change **in full**
+(skimming a relevant section does not count):
 
 - [`BIBLE.md`](BIBLE.md) — constitutional principles and design priorities.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — structure, data flows, and
@@ -28,16 +32,18 @@ editing:
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — engineering, testing, and
   review conventions.
 - [`docs/DESIGN.md`](docs/DESIGN.md) — visual and interaction semantics.
-- [`docs/CHECKLISTS.md`](docs/CHECKLISTS.md) — the review checklist single
-  source of truth.
+
+When in doubt whether a section is relevant, read it. Reading everything in
+full remains the strongest preparation for a large or cross-cutting change.
 
 Reuse the modules, contracts, and authorities those documents name. Do not
 invent a parallel mechanism when the repository already has one. A useful
 first instruction for a coding agent is:
 
-> Read CONTRIBUTING.md, BIBLE.md, docs/ARCHITECTURE.md,
-> docs/DEVELOPMENT.md, docs/DESIGN.md, and docs/CHECKLISTS.md in full before
-> editing. Follow their current architecture and keep the requested change focused.
+> Read CONTRIBUTING.md and docs/CHECKLISTS.md in full. Map BIBLE.md,
+> docs/ARCHITECTURE.md, docs/DEVELOPMENT.md, and docs/DESIGN.md by their
+> headings and read every section relevant to the requested change in full.
+> Follow their current architecture and keep the requested change focused.
 
 These documents may themselves be improved, but constitutional changes must
 follow the semantic change process in `BIBLE.md`, and behavior, tests, and
@@ -124,6 +130,16 @@ Before opening a substantive PR, the authoring agent must hand the final
 committed diff to a **separate agent context**. Use a subagent, new task, or
 fresh agent session. Reviewing in the authoring conversation does not count.
 
+The main review path is an **agentic checklist review**: the reviewer reads
+the repository with its own tools and covers the "Intent / Scope Review
+Checklist" from [`docs/CHECKLISTS.md`](docs/CHECKLISTS.md) — every one of its
+eight items (`intent_alignment`, `forgotten_touchpoints`,
+`cross_surface_consistency`, `regression_surface`, `prompt_doc_sync`,
+`architecture_fit`, `cross_module_bugs`, `implicit_contracts`) — following
+that checklist's output contract: one JSON array covering all eight items,
+PASS rows mandatory and justified with a concrete artifact, FAIL rows with
+severity (a critical FAIL names an exact file/symbol).
+
 Give the reviewer the issue or goal, non-goals, exact base and head SHAs, and
 repository access. The reviewer must not edit the candidate. Use this compact
 instruction:
@@ -131,14 +147,31 @@ instruction:
 ```text
 Review the final pull request diff from <base SHA> to <head SHA>. Do not edit.
 
-Read CONTRIBUTING.md. For a substantive change, read BIBLE.md,
-docs/ARCHITECTURE.md, docs/DEVELOPMENT.md, docs/DESIGN.md, and
-docs/CHECKLISTS.md in full.
+Read CONTRIBUTING.md and docs/CHECKLISTS.md in full. Map BIBLE.md,
+docs/ARCHITECTURE.md, docs/DEVELOPMENT.md, and docs/DESIGN.md by their
+headings and read every section relevant to this change in full.
 Inspect the complete diff, touched files, relevant callers, tests, and docs.
 
-Return findings first with severity and exact file/line references, then checks
+Cover the Intent / Scope Review Checklist from docs/CHECKLISTS.md exactly:
+output a JSON array of objects with the keys "item", "verdict" (PASS/FAIL),
+"severity" (critical/advisory), and "reason", covering all eight checklist
+items per its output contract — PASS rows are mandatory and justified with a
+concrete artifact; a critical FAIL names an exact file/symbol. Then report
+any further findings with severity and file/line references, checks
 performed, coverage limitations, and one verdict: PASS, NEEDS_CHANGES, or
 INCOMPLETE. Do not report PASS when required material was unavailable.
+```
+
+Paste the reviewer's checklist JSON into the PR's review-evidence block and
+fill the checklist table from it. Validate the JSON locally before opening
+the PR — the schema validator reuses the runtime contract and accepts the
+array bare, inside a fenced `json` code block, or embedded in the
+reviewer's prose. It
+validates SHAPE, not truth: a passing receipt is well-formed coverage, not a
+review verdict.
+
+```bash
+python scripts/validate_scope_receipt.py path/to/receipt.json
 ```
 
 Reproduce material findings when possible. Fix confirmed problems, and briefly
@@ -150,11 +183,25 @@ loop.
 If no separate agent context is available, do not substitute same-context
 self-review. Mark the review `NOT_RUN` and explain why in the PR.
 
-### Optional project-native review command
+### Maintainer-grade project-native review command
 
-Ouroboros can produce the same evidence in a structured SHA-bound packet. Its
+Ouroboros can produce review evidence in a structured SHA-bound packet. Its
 contributor mode uses the reviewer slots actually configured on the machine:
 `api_chat`, `agent_session`, or a mixture.
+
+Treat this command as **maintainer / large-window tooling**, not the default
+contributor path. The scope reviewer's required-artifact pack (protected
+runtime paths, prompts, contracts, canonical docs, the review stack) is
+required regardless of how small the diff is, and on a default install it
+can exceed the configured scope slot's context window even after every
+degradation step — the run then fails closed with `SCOPE_REVIEW_BLOCKED`
+and still preserves the evidence packet (marked incomplete). The documented
+routes past that pack budget are: configure the scope row as an
+`agent_session` reviewer (a different delivery class — it reads the
+repository with its own tools instead of being handed one assembled pack,
+and needs its own confirmed 200K+ window), or configure an API scope slot
+whose confirmed context window fits the pack. The agentic checklist review
+above needs neither.
 
 Configured API slots need their provider credentials and a positive finite
 `TOTAL_BUDGET`. Agent-session slots need their configured agent route and
@@ -197,6 +244,7 @@ Complete the PR template with:
 - reviewed base SHA and head SHA;
 - verdict, findings, and their disposition;
 - checks, coverage limitations, and full output or artifact link;
+- the scope-checklist coverage table and the reviewer's checklist JSON;
 - `NOT_RUN` plus a reason for unavailable verification or review.
 
 Review output is public evidence. Inspect attachments for credentials, private
@@ -210,7 +258,8 @@ commit, push, merge, release, or publication.
 
 - [ ] The PR targets `ouroboros` and is current with its recorded base.
 - [ ] The PR has one coherent purpose and explicit non-goals.
-- [ ] The required project documents were read in full.
+- [ ] `docs/CHECKLISTS.md` was read in full and every relevant section of the
+      other project documents was read in full.
 - [ ] Relevant tests and UI evidence are recorded honestly.
 - [ ] No release-version carrier was changed.
 - [ ] No secret, runtime state, generated run, or build artifact is in the diff.

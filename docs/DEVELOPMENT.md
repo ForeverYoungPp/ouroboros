@@ -1104,8 +1104,10 @@ may supply that independent context; same-conversation self-review does not.
 Unavailable review is recorded as `NOT_RUN`, never silently presented as clean.
 `CONTRIBUTING.md` owns the public procedure and evidence fields.
 
-`scripts/run_external_review.py --contributor` is an optional structured
-producer for the same evidence. It preserves and freezes the machine's
+`scripts/run_external_review.py --contributor` is maintainer-grade
+large-window tooling that produces structured review evidence (its scope
+reviewer's required-artifact pack is independent of diff size and can exceed
+a default install's scope window — see CONTRIBUTING for the budget shape). It preserves and freezes the machine's
 configured `api_chat` and `agent_session` triad/scope rows, then binds each row
 to its dispatched prompt receipt and observed response receipt. The shareable
 packet records exact base/head/tree/diff hashes, route/model/profile facts,
