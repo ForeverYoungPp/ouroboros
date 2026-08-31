@@ -104,7 +104,7 @@ import {
     rawTimestampEpoch,
     reconcileHydratedDirectActivities,
     reconnectBannerText,
-    routingAnnotationText,
+    renderRoutingAnnotation,
     saveChatInputHistory,
     senderLabel,
     shouldAlwaysShowTaskCard,
@@ -2701,29 +2701,6 @@ export function createChatInstance({
         return bubble;
     }
 
-    function renderRoutingAnnotation(bubble, annotation) {
-        if (!bubble) return false;
-        const text = routingAnnotationText(annotation);
-        let note = bubble.querySelector('.msg-routing-annotation');
-        if (!text) {
-            note?.remove();
-            delete bubble.dataset.chatAnnotationStatus;
-            return false;
-        }
-        if (!note) {
-            note = document.createElement('div');
-            note.className = 'msg-routing-annotation';
-            const time = bubble.querySelector('.msg-time');
-            if (time) time.before(note);
-            else bubble.append(note);
-        }
-        const status = String(annotation.status || '');
-        note.textContent = text;
-        note.dataset.annotationStatus = status;
-        bubble.dataset.chatAnnotationStatus = status;
-        return true;
-    }
-
     function updateMessageAnnotation(clientMessageId, annotation) {
         const messageId = String(clientMessageId || '');
         if (!messageId) return false;
@@ -4248,6 +4225,8 @@ export function createChatInstance({
             chatMediaMessageKey,
             documentMessageKey,
             buildQuizCard: chatDecision.buildQuizCard,
+            applyQuizStateFrame: chatDecision.applyQuizStateFrame,
+            messagesRoot: () => messagesDiv,
         });
 
     let wsHasConnectedOnce = false;

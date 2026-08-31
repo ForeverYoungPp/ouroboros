@@ -438,6 +438,43 @@
  */
 
 /**
+ * Lifecycle update for an already-rendered quiz card (WS "quiz_state") —
+ * a separate discriminator so a state change never dedupes as (or spawns)
+ * a second card. answered_index rides only with state "answered".
+ * @typedef {Object} QuizStateOutbound
+ * @property {"quiz_state"} type
+ * @property {string} quiz_id
+ * @property {string} task_id
+ * @property {string} state
+ * @property {string} ts
+ * @property {number=} answered_index
+ * @property {number=} chat_id
+ */
+
+/**
+ * POST /api/decisions body — the ONE answer ingress for owner decision cards
+ * (decision families quiz:/routing:/interaction:). request_id is the
+ * idempotency key; a replay returns the recorded confirmation.
+ * @typedef {Object} DecisionRequest
+ * @property {string} request_id
+ * @property {string} decision_id
+ * @property {number} option_index
+ * @property {string=} comment
+ */
+
+/**
+ * Answer-ingress reply; 409 carries the card's truthful lifecycle state so a
+ * late click settles the card instead of inviting retries.
+ * @typedef {Object} DecisionResponse
+ * @property {boolean=} ok
+ * @property {string=} decision_id
+ * @property {string=} state
+ * @property {number=} answered_index
+ * @property {boolean=} duplicate
+ * @property {string=} error
+ */
+
+/**
  * @typedef {Object} DocumentOutbound
  * @property {"document"} type
  * @property {"user"|"assistant"} role

@@ -356,6 +356,24 @@ class QuizOutbound(TypedDict):
     transport: NotRequired[TransportMetadata]
 
 
+class QuizStateOutbound(TypedDict):
+    """Outbound WS lifecycle update for an already-rendered quiz card.
+
+    A separate discriminator (not a second ``quiz`` frame): the display path
+    dedupes quiz frames by ``quiz:{quiz_id}:{ts}``, so a state change must
+    never look like a new card. ``answered_index`` rides only with the
+    ``answered`` state.
+    """
+
+    type: Literal["quiz_state"]
+    quiz_id: str
+    task_id: str
+    state: str
+    ts: str
+    answered_index: NotRequired[int]
+    chat_id: NotRequired[int]
+
+
 class TypingOutbound(TypedDict):
     """Outbound WS typing indicator."""
 
@@ -1275,6 +1293,36 @@ class TaskHurryResponse(TypedDict, total=False):
     error: str
 
 
+class DecisionRequest(TypedDict):
+    """POST /api/decisions body — the ONE answer ingress for owner decision
+    cards (owner decision 1=A). ``decision_id`` is a composed family id:
+    ``quiz:{task_id}:{quiz_id}`` (this phase), ``routing:{client_message_id}:
+    {routing_token}`` (#198), ``interaction:{task_id}:{run_id}:
+    {interaction_id}`` (#204). ``request_id`` is the idempotency key; a
+    replayed request returns the recorded confirmation instead of acting
+    twice. ``comment`` is the owner's optional verbatim remark."""
+
+    request_id: str
+    decision_id: str
+    option_index: int
+    comment: NotRequired[str]
+
+
+class DecisionResponse(TypedDict, total=False):
+    """Answer-ingress reply. 2xx carries the card's new lifecycle ``state``
+    (``answered``; ``duplicate`` marks an idempotent replay). A late answer
+    to a settled task is 409 with ``state`` telling the truth
+    (``expired_terminal``/``answered``) so the card settles instead of
+    inviting retries."""
+
+    ok: bool
+    decision_id: str
+    state: str
+    answered_index: int
+    duplicate: bool
+    error: str
+
+
 class LogTailResponse(TypedDict, total=False):
     name: str
     entries: list[Dict[str, Any]]
@@ -1365,118 +1413,7 @@ class OnboardingPresetFailureResponse(TypedDict):
 
 
 # Human/test-visible contract index; routers own executable Route objects.
-HTTP_ENDPOINTS: tuple[str, ...] = (
-    "GET /api/health",
-    "GET /api/state",
-    "GET /api/settings",
-    "POST /api/settings",
-    "GET /api/ui/preferences",
-    "POST /api/ui/preferences",
-    "POST /api/owner/runtime-mode",
-    "POST /api/owner/auto-grant",
-    "POST /api/owner/context-mode",
-    "POST /api/owner/scope-review-floor",
-    "POST /api/owner/safety-mode",
-    "POST /api/owner/capability-ack",
-    "POST /api/owner/skills/{skill}/attest-review",
-    "POST /api/owner/skills/{skill}/presence-runtime",
-    "POST /api/skills/{skill}/publish-preflight",
-    "GET /api/model-catalog",
-    "POST /api/tasks",
-    "GET /api/tasks",
-    "GET /api/tasks/{task_id}",
-    "GET /api/tasks/{task_id}/artifacts/{name}",
-    "GET /api/tasks/{task_id}/events",
-    "POST /api/tasks/{task_id}/cancel",
-    "POST /api/tasks/{task_id}/hurry",
-    "POST /api/tasks/{task_id}/resume",
-    "GET /api/schedules",
-    "POST /api/schedules",
-    "DELETE /api/schedules/{schedule_id}",
-    "POST /api/command",
-    "POST /api/reset",
-    "GET /api/git/log",
-    "POST /api/git/rollback",
-    "POST /api/git/promote",
-    "GET /api/update/status",
-    "POST /api/update/check",
-    "POST /api/update/preflight",
-    "POST /api/update/apply",
-    "GET /api/cost-breakdown",
-    "GET /api/evolution-data",
-    "GET /api/projects",
-    "POST /api/projects",
-    "POST /api/projects/from-task",
-    "POST /api/projects/{project_id}/update",
-    "POST /api/projects/{project_id}/delete",
-    "GET /api/fs/dirs",
-    "GET /api/chat/history",
-    "GET /api/logs/{name}",
-    "POST /api/chat/upload",
-    "DELETE /api/chat/upload",
-    "POST /api/openai-compatible/models",
-    "POST /api/providers/test",
-    "GET /api/local-model/status",
-    "POST /api/local-model/start",
-    "POST /api/local-model/stop",
-    "POST /api/local-model/test",
-    "POST /api/local-model/install-runtime",
-    "GET /api/mcp/status",
-    "POST /api/mcp/refresh",
-    "POST /api/mcp/test",
-    "GET /api/reviewer-slots",
-    "GET /api/claudexor/status",
-    "POST /api/claudexor/wake",
-    "POST /api/claudexor/login",
-    "GET /api/claudexor/login/{job_id}",
-    "DELETE /api/claudexor/login/{job_id}",
-    "POST /api/claudexor/login/{job_id}/input",
-    "POST /api/claudexor/login/{job_id}/reconcile",
-    "DELETE /api/claudexor/credential-profiles/{harness}/{profile_id}",
-    "PATCH /api/claudexor/credential-profiles/{harness}/{profile_id}",
-    "GET /api/extensions",
-    "GET /api/extensions/{skill}/manifest",
-    "GET /api/extensions/{skill}/module/{entry}",
-    "GET /api/extensions/{skill}/settings_section",
-    "ANY /api/extensions/{skill}/{rest:path}",
-    "GET /api/skills/daemons",
-    "POST /api/skills/{skill}/toggle",
-    "POST /api/skills/{skill}/delete",
-    "GET /api/skills/lifecycle-queue",
-    "POST /api/skills/{skill}/review",
-    "GET /api/skills/{skill}/review-history/{job_id}",
-    "POST /api/skills/{skill}/grants",
-    "POST /api/skills/{skill}/reconcile",
-    "GET /api/marketplace/clawhub/search",
-    "GET /api/marketplace/clawhub/installed",
-    "GET /api/marketplace/clawhub/info/{slug:path}",
-    "GET /api/marketplace/clawhub/preview/{slug:path}",
-    "POST /api/marketplace/clawhub/install",
-    "POST /api/marketplace/clawhub/update/{name}",
-    "POST /api/marketplace/clawhub/uninstall/{name}",
-    "GET /api/marketplace/ouroboroshub/catalog",
-    "GET /api/marketplace/ouroboroshub/installed",
-    "GET /api/marketplace/ouroboroshub/preview/{slug:path}",
-    "POST /api/marketplace/ouroboroshub/install",
-    "POST /api/marketplace/ouroboroshub/update/{name}",
-    "POST /api/marketplace/ouroboroshub/uninstall/{name}",
-    # The wizard PAGE (one onboarding host: desktop setup window, blocking
-    # overlay frame, plain browser). /api/onboarding stays the readiness probe.
-    "GET /onboarding",
-    "GET /api/onboarding",
-    "POST /api/onboarding/subagents/preview",
-    "POST /api/onboarding/complete",
-    "GET /api/files/list",
-    "GET /api/files/read",
-    "GET /api/files/content",
-    "GET /api/files/download",
-    "POST /api/files/upload",
-    "POST /api/files/mkdir",
-    "POST /api/files/write",
-    "POST /api/files/delete",
-    "POST /api/files/transfer",
-    "WS /ws",
-)
+from ouroboros.gateway.endpoint_index import HTTP_ENDPOINTS
 
 WS_MESSAGE_TYPES: tuple[str, ...] = (
     "chat",
@@ -1486,6 +1423,7 @@ WS_MESSAGE_TYPES: tuple[str, ...] = (
     "document",
     "links",
     "quiz",
+    "quiz_state",
     "typing",
     "log",
     "heartbeat",
@@ -1511,6 +1449,9 @@ __all__ = [
     "LinksOutbound",
     "QuizOption",
     "QuizOutbound",
+    "QuizStateOutbound",
+    "DecisionRequest",
+    "DecisionResponse",
     "TypingOutbound",
     "LogOutbound",
     "HeartbeatOutbound",

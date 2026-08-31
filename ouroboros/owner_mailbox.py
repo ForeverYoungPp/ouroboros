@@ -23,6 +23,10 @@ KIND_FINALIZE_NOW = "finalize_now"
 # re-drain must restore the attempt latch; only terminal cleanup removes it).
 # Its ``text`` is the parser-required internal reason ("owner_hurry"), not prose.
 KIND_HURRY = "hurry"
+# Owner's verbatim quiz answer (#Q-2b): a typed control whose ``text`` is the
+# chosen option label (plus an optional owner comment) — delivered inside a
+# structural frame, never as forged free-form owner dialogue.
+KIND_QUIZ_ANSWER = "quiz_answer"
 # The mailbox is append-only, so a sender that changes its mind cannot delete the
 # control it already wrote — it appends this retraction naming the target msg_id.
 # Revocations are resolved by the READER over the whole mailbox, so a control that
@@ -194,7 +198,7 @@ def write_task_message(
 ) -> bool:
     """Write an addressed task-tree message without forging owner provenance."""
 
-    if provenance not in {"ancestor_task", "peer_via_ancestor", "system"}:
+    if provenance not in {"ancestor_task", "peer_via_ancestor", "system", "descendant_task"}:
         return False
     path = _mailbox_path(drive_root, task_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -256,6 +260,10 @@ def deliver_task_message(
         prefix = f"[Message from task {relayed}, relayed by ancestor {source}]"
     elif provenance == "system":
         prefix = "[System task message]"
+    elif provenance == "descendant_task":
+        # Escalation direction is upward: signing it "ancestor" would invert
+        # the sender's place in the tree (decision 31 hierarchy).
+        prefix = f"[Escalation from descendant task {source}]"
     else:
         prefix = f"[Message from ancestor task {source}]"
     append_message(f"{prefix}\n{entry.get('text') or ''}")
@@ -264,6 +272,27 @@ def deliver_task_message(
             event_queue.put_nowait({
                 "type": "task_message_injected", "task_id": task_id,
                 "source_task_id": source, "provenance": provenance,
+            })
+        except Exception:
+            pass
+
+
+def deliver_quiz_answer(
+    entry: Dict[str, Any], task_id: str, event_queue: Any, append_message: Any,
+) -> None:
+    """Inject a typed quiz answer (#Q-2b).
+
+    The entry's ``text`` is the complete host-authored frame (structural
+    header + the owner's VERBATIM chosen label and optional comment, composed
+    at ingress time where the projection block is in hand). The model judges
+    freshness itself from the asked/answered timestamps in the frame — no
+    host staleness verdict (owner decision 30=A)."""
+    append_message(str(entry.get("text") or ""))
+    if event_queue is not None:
+        try:
+            event_queue.put_nowait({
+                "type": "quiz_answer_injected", "task_id": task_id,
+                "msg_id": str(entry.get("msg_id") or ""),
             })
         except Exception:
             pass

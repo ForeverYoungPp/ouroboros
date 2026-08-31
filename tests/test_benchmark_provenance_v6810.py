@@ -525,6 +525,16 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
         "gateway/task_hurry.py hurry ingress refusal (400, text-free contract); never a task terminal",
     ),
     "task_not_live": (False, "gateway/task_hurry.py hurry ingress refusal (404); never a task terminal"),
+    # #Q-2b decision-ingress refusal codes — HTTP replies, never task terminals.
+    "unknown_decision_family": (False, "gateway/task_decision.py ingress refusal (400)"),
+    "decision_family_not_served": (False, "gateway/task_decision.py ingress refusal (501)"),
+    "malformed_decision_id": (False, "gateway/task_decision.py ingress refusal (400)"),
+    "comment_invalid": (False, "gateway/task_decision.py ingress refusal (400)"),
+    "comment_too_long": (
+        False,
+        "gateway/task_decision.py verbatim-comment refusal (400) — refuses instead of truncating",
+    ),
+    "option_index_invalid": (False, "gateway/task_decision.py ingress refusal (400)"),
     "mailbox_write_failed": (
         False,
         "gateway/task_hurry.py fail-closed hurry ingress refusal (503); never a task terminal",

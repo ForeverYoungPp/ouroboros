@@ -771,6 +771,7 @@ class LocalChatBridge:
             "chat_id": int(chat_id or 0),
             "transport": quiz_transport,
             "quiz_id": qid,
+            "task_id": str(task_id or ""),
             "question": payload["question"],
             "options": payload["options"],
             "stake": payload["stake"],
@@ -795,6 +796,40 @@ class LocalChatBridge:
         )
         _advance_project_visible_revision(chat_id)
         return True, "ok"
+
+    def send_quiz_state(
+        self,
+        quiz_id: str,
+        task_id: str,
+        state: str,
+        answered_index: Optional[int] = None,
+        chat_id: int = 0,
+    ) -> None:
+        """Broadcast a quiz lifecycle update to already-rendered cards.
+
+        A SEPARATE WS discriminator ("quiz_state", contracts mirror): the
+        display path dedupes "quiz" frames by quiz_id+ts, so a state change
+        must never masquerade as a new card. Durability lives in the
+        owner_quiz task-result projection (history replay merges it) — this
+        frame is the live half only, so a lost broadcast heals on reload.
+        """
+        if not self._broadcast_fn:
+            return
+        msg: Dict[str, Any] = {
+            "type": "quiz_state",
+            "quiz_id": str(quiz_id or ""),
+            "task_id": str(task_id or ""),
+            "state": str(state or ""),
+            "ts": utc_now_iso(),
+        }
+        if answered_index is not None:
+            msg["answered_index"] = int(answered_index)
+        if int(chat_id or 0):
+            msg["chat_id"] = int(chat_id or 0)
+        try:
+            self._broadcast_fn(msg)
+        except Exception:
+            log.debug("quiz_state broadcast failed", exc_info=True)
 
     def push_log(self, event: dict):
         """Stream append_jsonl events to UI."""

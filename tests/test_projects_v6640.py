@@ -409,7 +409,7 @@ def test_project_lifecycle_rows_render_design_system_action_static_contract():
     )
     render = chat[
         chat.index("if (PROJECT_ROW_TYPES.has(systemType) && projectId) {"):
-        chat.index("function renderRoutingAnnotation")
+        chat.index("function updateMessageAnnotation")
     ]
     assert "createSystemMessageAction({" in render
     assert "'system-message-actions'" in render

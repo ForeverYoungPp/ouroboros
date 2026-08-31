@@ -1041,3 +1041,38 @@ def resume_project_deletions(drive_root: object) -> int:
             project.get("chat_id"),
         ))
     return started
+
+
+def reconcile_terminal_task_projections(drive_root, task_id: str) -> None:
+    """One task-done seam for the per-task owner-control projections.
+
+    Each domain keeps its own ``reconcile_terminal`` in its own module
+    (owner_hurry, owner_quiz); this thin coordinator exists so
+    ``supervisor/events.py`` — far past the module size gate — carries one
+    call instead of one try/except block per domain. Every leg is fail-soft:
+    a projection that cannot reconcile never blocks the terminal dispatch.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+    try:
+        # §19.7.2 item 5: a hurry the worker never drained loses the terminal
+        # race honestly — not_applied_before_terminal.
+        from ouroboros.owner_hurry import reconcile_terminal
+
+        reconcile_terminal(drive_root, str(task_id))
+    except Exception:
+        log.debug("owner_hurry terminal reconcile failed for %s", task_id, exc_info=True)
+    try:
+        # #Q-2b structural expiry (owner decision 30=A): every still-open quiz
+        # dies with its author, and the already-rendered cards learn it live.
+        from ouroboros.owner_quiz import reconcile_terminal as quiz_reconcile
+
+        expired = quiz_reconcile(drive_root, str(task_id))
+        if expired:
+            from supervisor.message_bus import get_bridge
+
+            for quiz_id in expired:
+                get_bridge().send_quiz_state(quiz_id, str(task_id), "expired_terminal")
+    except Exception:
+        log.debug("owner_quiz terminal reconcile failed for %s", task_id, exc_info=True)

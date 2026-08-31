@@ -42,6 +42,7 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "browse_page", "browser_action", "analyze_screenshot", "view_image",
     "ocr_pdf", "youtube_transcript", "extract_video_frames",
     "send_user_message", "send_photo", "send_video", "send_file", "send_links",
+    "escalate",
     "switch_model",
     "request_restart", "promote_to_stable",
     "preflight_review", "advisory_review", "review_status", "task_acceptance_review", "verify_and_record",
@@ -68,6 +69,7 @@ LOCAL_READONLY_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file", "list_files", "search_code", "query_code",
     "vcs_status", "vcs_diff",
     "chat_history", "recent_tasks", "get_task_result", "wait_task", "wait_tasks",
+    "escalate",
     "forward_to_worker", "peek_task", "cancel_task", "discard_child_result",
     "schedule_subagent",
     # Task-tree coordination: a child reads the shared frame and raises beacons. tree_note
@@ -108,6 +110,7 @@ ACTING_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "start_service", "service_status", "service_logs", "stop_service",
     "integrate_subagent_patch", "compare_subagent_patches",
     "schedule_subagent", "wait_task", "wait_tasks", "get_task_result",
+    "escalate",
     "forward_to_worker", "peek_task", "cancel_task", "discard_child_result",
     "verify_and_record",
     "knowledge_read", "knowledge_list",

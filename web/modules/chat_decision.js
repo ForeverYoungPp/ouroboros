@@ -53,22 +53,40 @@ export function createChatDecision({
     async function submitAnswer(card, quiz, index) {
         if (card.dataset.pending === '1') return;
         card.dataset.pending = '1';
-        const requestId = (crypto.randomUUID && crypto.randomUUID()) || `q-${Date.now()}`;
+        // STABLE per-card idempotency key: a retry after a transient failure
+        // must replay the SAME request, or the server-side first-wins latch
+        // reads the retry as a competing second answer.
+        if (!card.dataset.requestId) {
+            card.dataset.requestId = (crypto.randomUUID && crypto.randomUUID()) || `q-${Date.now()}`;
+        }
         try {
-            const res = await apiFetch(`/api/tasks/${encodeURIComponent(quiz.taskId)}/decision`, {
+            const res = await apiFetch('/api/decisions', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    request_id: requestId,
+                    request_id: card.dataset.requestId,
                     decision_id: `quiz:${quiz.taskId}:${quiz.quizId}`,
                     option_index: index,
                 }),
             });
+            let body = null;
+            try { body = res && res.json ? await res.json() : null; } catch (parseErr) { body = null; }
             if (res && res.ok) {
-                setCardState(card, 'answered', index);
+                const answered = body && Number.isInteger(body.answered_index) ? body.answered_index : index;
+                setCardState(card, 'answered', answered);
                 return;
             }
             const status = res ? res.status : 0;
+            if (status === 409 && body && body.state) {
+                // The refusal body carries the card's TRUE lifecycle state —
+                // an already-answered quiz settles as answered (with the
+                // winning option when known), never as a false expiry.
+                const answered = Number.isInteger(body.answered_index) ? body.answered_index : null;
+                setCardState(card, body.state, answered);
+                showToast(body.state === 'answered'
+                    ? 'Already answered.' : 'This question is no longer open.', 'error');
+                return;
+            }
             if (status === 409 && card.dataset.state === 'open') {
                 setCardState(card, 'expired_terminal', null);
                 showToast('This question is no longer open.', 'error');
@@ -175,5 +193,18 @@ export function createChatDecision({
         return framed;
     }
 
-    return { buildQuizCard, setCardState };
+    function applyQuizStateFrame(rootNode, frame) {
+        // Live lifecycle update for an already-rendered card (WS "quiz_state").
+        // The card is found by identity, never appended: state changes must
+        // not create a second card (the quiz frame dedupe is id+ts keyed).
+        const quizId = String(frame && frame.quiz_id || '');
+        if (!quizId || !rootNode) return false;
+        const card = rootNode.querySelector(`.chat-quiz-card[data-quiz-id="${CSS.escape(quizId)}"]`);
+        if (!card) return false;
+        const index = Number.isInteger(frame.answered_index) ? frame.answered_index : null;
+        setCardState(card, String(frame.state || ''), index);
+        return true;
+    }
+
+    return { buildQuizCard, setCardState, applyQuizStateFrame };
 }
