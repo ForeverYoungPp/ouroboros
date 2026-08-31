@@ -8,8 +8,8 @@ and showed it at window expiry. A paused run therefore burned metered polling
 for up to the whole engine timeout. Phase B: the wait returns IMMEDIATELY with
 the typed question set, and the custody-gated ``delegate_answer`` delivers the
 nanny's answer (owner decision 7=A: the nanny answers from task context;
-above-authority questions go to the owner while the run waits out the engine
-timeout).
+above-authority questions ride the escalation verb up the task hierarchy
+while the run waits out the engine timeout).
 """
 
 import json
@@ -185,8 +185,8 @@ def test_a_new_question_returns_immediately_with_the_full_text(tmp_path, monkeyp
 
 
 def test_the_same_question_does_not_busy_loop_the_next_wait(tmp_path, monkeypatch):
-    """A nanny that escalated to its human and re-waits must HOLD its window, not
-    spin: the known question rides the expiry payload instead."""
+    """A nanny that escalated up the hierarchy and re-waits must HOLD its
+    window, not spin: the known question rides the expiry payload instead."""
     import ouroboros.tools.delegate as delegate
 
     _waiting_stub(monkeypatch, [_pending_row()])
@@ -967,3 +967,65 @@ def test_the_answer_verb_is_registered_on_every_contract_surface():
     assert "delegate_answer" in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
     assert "delegate_answer" in ACTING_SUBAGENT_TOOL_NAMES
     assert TOOL_POLICY.get("delegate_answer") == POLICY_SKIP
+
+
+def test_waiting_note_routes_above_authority_questions_to_escalate():
+    """#204 (owner batch 3, decision 31): a harness question above the nanny's
+    authority rides the escalation channel — the note names the escalate verb
+    and the parent-first hierarchy, never a dead-end progress message."""
+    from ouroboros.delegate_interactions import _waiting_on_user_note
+
+    note = _waiting_on_user_note([{"interaction_id": "i1", "timeout_at": None}])
+    assert "escalate(question, options, stake, assumption)" in note
+    assert "PARENT task" in note
+    assert "delegate_answer" in note and "delegate_wait" in note
+    assert "progress message" not in note
+
+
+def test_delegate_schemas_teach_the_escalation_verb():
+    """sol finding: the LLM-facing tool descriptions are decision points — they
+    must name the escalate verb, never the retired progress-message dead end."""
+    from ouroboros.tools.delegate import get_tools
+
+    schemas = {entry.schema["name"]: entry.schema["description"]
+               for entry in get_tools()}
+    for name in ("delegate_answer", "delegate_wait"):
+        assert "escalate" in schemas[name]
+        assert "surface it to your human via progress" not in schemas[name]
+        assert "escalate to your human" not in schemas[name]
+
+
+def test_expiry_notes_teach_the_escalation_verb():
+    """Delta finding: the REPEAT delegate_wait rides the expiry path, whose
+    notes are decision points too — both branches name the escalate verb and
+    never the retired progress/your-human dead ends."""
+    import inspect
+
+    import ouroboros.delegate_progress as dp
+
+    source = inspect.getsource(dp)
+    assert "escalate an above-authority question with the" in source
+    assert "raise it with the escalate verb (parent-first)" in source
+    assert "escalate to your human via a progress message" not in source
+    assert "escalate to your human," not in source
+    # The dispatch charter is an LLM-facing user message too (agent.py appends
+    # it): the same dead end must not survive there.
+    import ouroboros.subagent_dispatch_notes as dn
+
+    charter = inspect.getsource(dn)
+    assert "escalated with the escalate verb (parent-first" in charter
+    assert "goes to your human via progress" not in charter
+    # No delegated-question surface may teach direct-to-human ESCALATION: the
+    # hierarchy (parent-first) is the ONLY route (decision 31). Semantic
+    # variants of the escalation phrasing, not just the exact retired lines
+    # (the live progress STREAM legitimately mentions the human).
+    import ouroboros.tools.delegate as dtool
+
+    import ouroboros.delegate_interactions as di
+
+    for module in (dp, dn, di, dtool):
+        text = inspect.getsource(module)
+        for phrase in ("escalated to its human", "escalated to your human",
+                       "escalated a question to its human",
+                       "goes to your human", "surface it to your human"):
+            assert phrase not in text, (module.__name__, phrase)

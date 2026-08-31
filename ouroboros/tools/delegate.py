@@ -1311,8 +1311,8 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                 # waitingOnUser boolean and showed it at window expiry, so a paused
                 # run burned the rest of the window (up to the engine's whole
                 # answer timeout) in dead metered polling. A question the model
-                # ALREADY saw does not re-trigger — a nanny that escalated to its
-                # human keeps holding windows instead of busy-looping, and the
+                # ALREADY saw does not re-trigger — a nanny that escalated it
+                # up the hierarchy keeps holding windows instead of busy-looping, and the
                 # engine timeout stays the backstop.
                 return _waiting_on_user_payload(ctx, rid, state, last_seq, pending,
                                                 seen=seen,
@@ -1504,8 +1504,9 @@ def get_tools() -> List[ToolEntry]:
                 "wakes exactly once. A run that asks its "
                 "user a question returns IMMEDIATELY as status='waiting_on_user' with "
                 "the full question set (interaction/question ids ride WHOLE, never "
-                "truncated): answer it with delegate_answer, or escalate to your "
-                "human and keep waiting (a question with a timeout_at benign-declines "
+                "truncated): answer it with delegate_answer, or raise it with the "
+                "escalate verb (parent-first) and keep waiting (a question with a "
+                "timeout_at benign-declines "
                 "at the engine timeout; timeout_at=null waits until answered). A "
                 "large terminal result is delivered as a bounded preview plus an "
                 "artifact: read output_delivery and finish reading the artifact before "
@@ -1543,8 +1544,10 @@ def get_tools() -> List[ToolEntry]:
                 "interaction_id and its questions. Only the task that started the run "
                 "may answer. Policy: answer from the task context you already hold; a "
                 "question ABOVE your authority (spending money, changing scope, "
-                "external actions) is not yours to guess — surface it to your human "
-                "via progress and keep waiting; an unanswered question with a "
+                "external actions) is not yours to guess — escalate it with the "
+                "escalate verb (parent-first; the reply reaches your mailbox on a "
+                "later round and you relay it back here) and keep waiting; an "
+                "unanswered question with a "
                 "timeout_at benign-declines at the engine timeout (the run continues "
                 "on stated assumptions), while timeout_at=null waits until answered. "
                 "Typed outcomes: delivered; already_resolved (the run moved on — do "

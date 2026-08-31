@@ -578,7 +578,8 @@ def test_escalate_refuses_unknown_parent_status(tmp_path, monkeypatch):
 
 def test_escalate_refuses_a_pending_cancel_parent(tmp_path, monkeypatch):
     """A parent that still reads running but carries a pending cancellation
-    will never drain the mailbox — the hop is refused (mirrors forward_to_worker)."""
+    will never drain the mailbox — with every ancestor cancel-pending the walk
+    finds no live addressee and terminalizes (mirrors forward_to_worker)."""
     import ouroboros.cancel_intents as ci
     import ouroboros.task_status as ts
 
@@ -588,4 +589,32 @@ def test_escalate_refuses_a_pending_cancel_parent(tmp_path, monkeypatch):
     ctx = _tool_ctx(tmp_path, task_id="child-9", parent="root-1")
     out = _escalate(ctx, question="?", options=["a", "b"], assumption="a")
     assert out.startswith("⚠️ ESCALATE_PARENT_SETTLED")
-    assert "pending cancellation" in out
+    assert "no live ancestor" in out
+
+
+def test_escalate_walks_past_a_settled_parent_to_the_live_ancestor(tmp_path, monkeypatch):
+    """#204 (sol finding): a live subagent may OUTLIVE its direct parent — the
+    escalation walks up to the nearest LIVE ancestor instead of dead-ending."""
+    import ouroboros.owner_mailbox as om
+    import ouroboros.task_status as ts
+
+    rows = {
+        "mid-1": {"status": "completed", "parent_task_id": "root-1"},
+        "root-1": {"status": "running"},
+    }
+    monkeypatch.setattr(ts, "load_effective_task_result",
+                        lambda root, tid: dict(rows.get(tid) or {}))
+    written = []
+    monkeypatch.setattr(
+        om, "write_task_message",
+        lambda root, text, task_id="", source_task_id="", provenance="":
+            written.append((task_id, provenance)) or True)
+    ctx = _tool_ctx(tmp_path, task_id="child-9", parent="mid-1", role="subagent")
+    out = _escalate(ctx, question="?", options=["a", "b"], assumption="a")
+    assert out.startswith("OK: escalated to parent task root-1")
+    assert written == [("root-1", "descendant_task")]
+    # A fully settled chain is the honest typed terminal.
+    rows["root-1"] = {"status": "completed"}
+    out = _escalate(ctx, question="?", options=["a", "b"], assumption="a")
+    assert out.startswith("⚠️ ESCALATE_PARENT_SETTLED")
+    assert "no live ancestor" in out

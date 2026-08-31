@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 # `waiting_on_user` payload. Process-local by design: the durable fact is the
 # engine's own pending-interaction store, and the only cost of losing this memo
 # (worker restart) is one duplicate immediate return. Without it, a nanny that
-# deliberately escalated a question to its human and re-waited would busy-loop —
+# deliberately escalated a question up the task hierarchy and re-waited would busy-loop —
 # every delegate_wait would return instantly with the same known question.
 _REPORTED_INTERACTIONS: Dict[str, frozenset] = {}
 _REPORTED_INTERACTIONS_MAX_KEYS = 128
@@ -128,9 +128,12 @@ def _waiting_on_user_note(pending: List[Dict[str, Any]]) -> str:
         "delegate_answer(run_id, interaction_id, answers=[{question_id, "
         "selected_labels, free_text}]) — answer from the task context you "
         "already hold. A question ABOVE your authority (spending money, "
-        "changing scope, external actions) is not yours to guess: surface it "
-        "to your human via a progress message and keep waiting with "
-        "delegate_wait. If the question carries a source-request envelope, answer "
+        "changing scope, external actions) is not yours to guess: escalate it "
+        "with escalate(question, options, stake, assumption) — as a subagent "
+        "you escalate to your PARENT task (the owner sees only what no "
+        "ancestor answers), the reply reaches your mailbox on a later round, "
+        "and you relay it back with delegate_answer — meanwhile keep waiting "
+        "with delegate_wait. If the question carries a source-request envelope, answer "
         "with source_response={schema:1, kind:'source_response', complete_sha256, "
         "source, start_char, end_char, text}; the host verifies the exact canonical "
         "range before delivering it. Do not promote a partial preview to complete "

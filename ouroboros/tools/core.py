@@ -2330,30 +2330,54 @@ def _escalate(
                 "task id — record the open question in your result instead.")
 
     if parent_task_id:
-        # Upward hop: descendant -> parent, the mirror of forward_to_worker.
+        # Upward hop: descendant -> nearest LIVE ancestor (the mirror of
+        # forward_to_worker). A live subagent may legitimately OUTLIVE its
+        # direct parent (the queue keeps descendants running past a settled
+        # intermediate), so one settled/unknown/cancel-pending link is not a
+        # dead end — the walk continues toward the root; only a chain with NO
+        # live ancestor is the typed terminal (decision 31: the owner-facing
+        # card still belongs to the ROOT alone, so an orphaned subtree keeps
+        # the assumption path).
         from ouroboros.owner_mailbox import write_task_message
         from ouroboros.task_status import FINAL_STATUSES, load_effective_task_result
 
         status_drive_root = pathlib.Path(str(meta.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
         from ouroboros.task_results import STATUS_RUNNING, STATUS_SCHEDULED
 
-        data = load_effective_task_result(status_drive_root, parent_task_id)
-        status = str(data.get("status") or "").lower()
-        # A scheduled parent is a legitimate addressee (its mailbox is
-        # drained when it starts); unknown/empty status is not.
-        if not data or status in FINAL_STATUSES or status not in {STATUS_RUNNING, STATUS_SCHEDULED}:
-            return (f"⚠️ ESCALATE_PARENT_SETTLED: parent task {parent_task_id} is "
-                    f"{status or 'unknown'} — nobody is left to answer; proceed "
+        root_task_id = str(meta.get("root_task_id") or "").strip()
+        target_id, data = "", {}
+        candidate, seen = parent_task_id, set()
+        for _ in range(10):
+            if not candidate or candidate in seen or candidate == task_id:
+                break
+            seen.add(candidate)
+            row = load_effective_task_result(status_drive_root, candidate)
+            status = str(row.get("status") or "").lower()
+            # A scheduled ancestor is a legitimate addressee (its mailbox is
+            # drained when it starts); unknown/empty status is not.
+            alive = bool(row) and status not in FINAL_STATUSES \
+                and status in {STATUS_RUNNING, STATUS_SCHEDULED}
+            if alive:
+                try:
+                    from ouroboros.cancel_intents import cancel_pending
+
+                    if cancel_pending(status_drive_root, candidate):
+                        alive = False
+                except Exception:
+                    pass
+            if alive:
+                target_id, data = candidate, row
+                break
+            next_candidate = str(row.get("parent_task_id") or "").strip()
+            if not next_candidate and candidate != root_task_id:
+                next_candidate = root_task_id
+            candidate = next_candidate
+        if not target_id:
+            return ("⚠️ ESCALATE_PARENT_SETTLED: no live ancestor is left to "
+                    f"answer (walked up from parent {parent_task_id}) — proceed "
                     "under your stated assumption and record the open question "
                     "in your result.")
-        try:
-            from ouroboros.cancel_intents import cancel_pending
-
-            if cancel_pending(status_drive_root, parent_task_id):
-                return (f"⚠️ ESCALATE_PARENT_SETTLED: parent task {parent_task_id} has a "
-                        "pending cancellation — proceed under your stated assumption.")
-        except Exception:
-            pass
+        parent_task_id = target_id
         lines = [f"ESCALATION (decision requested): {payload['question']}", "Options:"]
         lines += [
             f"{i + 1}. {row['label']}" + (f" — {row['detail']}" if row.get("detail") else "")
