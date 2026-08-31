@@ -258,7 +258,7 @@ def _user_annotation(
         key: annotation.get(key)
         for key in (
             "action", "target", "target_label", "status", "detail", "options",
-            "attachment_manifest",
+            "attachment_manifest", "routing_token",
         )
         if key in annotation
     }
@@ -439,6 +439,11 @@ def _chat_quota_predicate(row_matches_thread):
         if not isinstance(e, dict):
             return False
         if str(e.get("direction", "")).lower() not in ("in", "out"):
+            return False
+        if e.get("type") == "routing_options":
+            # LLM-grounding rows (#198) are skipped by the render loop, so
+            # they must not consume the human-row quota either — a run of
+            # picker refusals would silently evict real messages.
             return False
         if is_a2a_chat_id(e.get("chat_id", 1)):
             return False
@@ -875,6 +880,11 @@ def _collect_chat_rows(
             # Delivered document rows carry lightweight media metadata (no
             # base64); surface a msg_type + download_url so the frontend
             # rebuilds the file bubble on reload instead of a bare text line.
+            if entry.get("type") == "routing_options":
+                # LLM-context grounding row (#198, decision 4=A): the web
+                # surface renders the richer picker card from the annotation,
+                # so the plain-text list never double-renders here.
+                continue
             if entry.get("type") == "document":
                 rec["msg_type"] = "document"
                 rec["filename"] = str(entry.get("filename") or "file")

@@ -413,6 +413,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "action",
         "target",
         "target_label",
+        "routing_token",
         "status",
         "options",
         "attachment_manifest",

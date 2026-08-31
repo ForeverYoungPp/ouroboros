@@ -213,10 +213,16 @@ def test_ingress_refusals_are_typed(tmp_path, monkeypatch):
     assert _post(app, {"decision_id": "quiz:t:q", "option_index": 0}).status_code == 400
     assert _post(app, {"request_id": "r", "decision_id": "bogus:t:q",
                        "option_index": 0}).status_code == 400
+    # #198: the routing family is SERVED — an unknown row settles as
+    # superseded through routing_decision.py, never a 501.
     routing = _post(app, {"request_id": "r",
                           "decision_id": "routing:msg-1:tok", "option_index": 0})
-    assert routing.status_code == 501
-    assert routing.json()["reason_code"] == "decision_family_not_served"
+    assert routing.status_code == 409
+    assert routing.json()["state"] == "superseded"
+    interaction = _post(app, {"request_id": "r",
+                              "decision_id": "interaction:t:r:i", "option_index": 0})
+    assert interaction.status_code == 501
+    assert interaction.json()["reason_code"] == "decision_family_not_served"
     assert _post(app, {"request_id": "r", "decision_id": "quiz:task-1:q1",
                        "option_index": 0,
                        "extra": "x"}).status_code == 400

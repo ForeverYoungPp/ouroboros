@@ -298,7 +298,7 @@ def test_api_v1_declares_core_ws_message_types():
     """api_v1 must declare the core chat/media/status WS envelopes."""
     from ouroboros.contracts import api_v1
 
-    for name in ("ChatInbound", "ChatOutbound", "PhotoOutbound", "VideoOutbound", "DocumentOutbound", "LinkAction", "LinksOutbound", "QuizOption", "QuizOutbound", "QuizStateOutbound", "DecisionRequest", "DecisionResponse", "TypingOutbound", "LogOutbound"):
+    for name in ("ChatInbound", "ChatOutbound", "PhotoOutbound", "VideoOutbound", "DocumentOutbound", "LinkAction", "LinksOutbound", "QuizOption", "QuizOutbound", "QuizStateOutbound", "DecisionRequest", "DecisionResponse", "MessageAnnotationOutbound", "TypingOutbound", "LogOutbound"):
         assert hasattr(api_v1, name), f"api_v1 missing {name}"
 
 

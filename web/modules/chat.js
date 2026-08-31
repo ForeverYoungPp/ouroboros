@@ -104,7 +104,6 @@ import {
     rawTimestampEpoch,
     reconcileHydratedDirectActivities,
     reconnectBannerText,
-    renderRoutingAnnotation,
     saveChatInputHistory,
     senderLabel,
     shouldAlwaysShowTaskCard,
@@ -2695,7 +2694,7 @@ export function createChatInstance({
         stampNodeTimestamp(bubble, ts);
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
         if (role !== 'user' && systemType !== 'skill_review') enhanceChatMarkdown(bubble);
-        renderRoutingAnnotation(bubble, opts.chatAnnotation);
+        chatDecision.renderRoutingDecision(bubble, opts.chatAnnotation);
         rememberMessageKey(messageKey);
         if (pending && clientMessageId) pendingUserBubbles.set(clientMessageId, bubble);
         return bubble;
@@ -2709,7 +2708,7 @@ export function createChatInstance({
         if (journalEntry) journalEntry.annotation = annotation || null;
         const bubble = Array.from(messagesDiv.querySelectorAll('.chat-bubble.user[data-client-message-id]'))
             .find((candidate) => candidate.dataset.clientMessageId === messageId);
-        return renderRoutingAnnotation(bubble, annotation);
+        return chatDecision.renderRoutingDecision(bubble, annotation);
     }
 
     function clearTransientRoutingAnnotations() {

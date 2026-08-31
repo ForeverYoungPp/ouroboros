@@ -417,6 +417,7 @@ class LocalChatBridge:
         status: str = "accepted",
         options: Optional[List[Dict[str, Any]]] = None,
         attachment_manifest: Optional[List[Dict[str, Any]]] = None,
+        routing_token: str = "",
     ) -> None:
         """Emit a typed routing receipt without creating an assistant bubble.
 
@@ -438,6 +439,10 @@ class LocalChatBridge:
         }
         if str(target_label or ""):
             payload["target_label"] = str(target_label)
+        if str(routing_token or ""):
+            # #198: the picker card's click identity; presentation-only frames
+            # without it stay text lines.
+            payload["routing_token"] = str(routing_token)
         if options is not None:
             payload["options"] = [dict(row) for row in options if isinstance(row, dict)]
         if attachment_manifest is not None:
@@ -452,6 +457,32 @@ class LocalChatBridge:
                 "text": "",
                 "transport": dict(self._chat_transports.get(int(chat_id or 0), {}) or {}),
             })
+        if (
+            str(status or "") == "needs_manual_target"
+            and isinstance(options, list) and options
+            and not is_a2a_chat_id(chat_id)
+        ):
+            # Owner decision 4=A (#198): the routing LLM must later ground a
+            # plain "2" reply against EXACTLY the list the owner was shown, so
+            # the rendered numbered list becomes a durable outbound history row
+            # (type="routing_options"; web history skips it — the picker card
+            # is its richer rendering there; Telegram renders its own copy).
+            from ouroboros.project_dialogue import routing_option_label
+
+            labels = [routing_option_label(row) for row in options]
+            labels = [label for label in labels if label]
+            if labels:
+                # Mirror the push-transport rendering exactly (top 8 + tail):
+                # a numbered Telegram reply grounds against THESE numbers.
+                shown = labels[:8]
+                lines = ["I couldn't pick a destination for the last message. Options:"]
+                lines.extend(f"{index}. {label}" for index, label in enumerate(shown, 1))
+                if len(labels) > len(shown):
+                    lines.append(f"…and {len(labels) - len(shown)} more in the web chat.")
+                log_chat(
+                    "out", int(chat_id or 0), 0, "\n".join(lines),
+                    source="routing_picker", record_type="routing_options",
+                )
 
     def send_chat_action(
         self,

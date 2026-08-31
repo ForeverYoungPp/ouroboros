@@ -6,9 +6,9 @@ EXISTING identities per family instead of minting a durable registry:
 
 - ``quiz:{task_id}:{quiz_id}`` — served here (#Q-2b);
 - ``routing:{client_message_id}:{routing_token}`` — the #198 picker family,
-  typed as not-served until that lane lands;
+  dispatched to ``gateway/routing_decision.py``;
 - ``interaction:{task_id}:{run_id}:{interaction_id}`` — the #204 family,
-  same.
+  typed as not-served until that lane lands.
 
 The quiz path mirrors the hurry ingress split (``gateway/task_hurry.py``):
 projection write first (request-id idempotent, first answer wins), then the
@@ -20,6 +20,7 @@ instead of inviting retries.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, Optional, Tuple
 
@@ -33,7 +34,7 @@ log = logging.getLogger(__name__)
 
 _REQUEST_ID_MAX = 128
 _COMMENT_MAX = 2000
-_SERVED_FAMILIES = {"quiz"}
+_SERVED_FAMILIES = {"quiz", "routing"}
 _KNOWN_FAMILIES = {"quiz", "routing", "interaction"}
 
 
@@ -144,11 +145,27 @@ async def api_decision_answer(request: Request) -> JSONResponse:
         )
     if family not in _SERVED_FAMILIES:
         # Typed, honest: the family exists in the contract but its server
-        # half has not landed (routing → #198, interaction → #204).
+        # half has not landed (interaction → #204).
         return json_error(
             f"the {family} decision family is not served yet",
             501, reason_code="decision_family_not_served",
         )
+    raw_index = body.get("option_index")
+    if not isinstance(raw_index, int) or isinstance(raw_index, bool) or raw_index < 0:
+        return json_error(
+            "option_index must be a non-negative integer",
+            400, reason_code="option_index_invalid",
+        )
+    drive_root = request_drive_root(request)
+    if family == "routing":
+        from ouroboros.gateway.routing_decision import handle_routing_decision
+
+        status_code, payload = await asyncio.to_thread(
+            handle_routing_decision, drive_root,
+            request_id=request_id, decision_id=decision_id,
+            option_index=raw_index, comment=comment,
+        )
+        return JSONResponse(payload, status_code=status_code)
     if not task_id or not quiz_id:
         return json_error(
             "malformed quiz decision_id (expected quiz:{task_id}:{quiz_id})",
@@ -158,13 +175,6 @@ async def api_decision_answer(request: Request) -> JSONResponse:
         task_id = validate_task_id(task_id)
     except ValueError as exc:
         return json_error(str(exc), 400)
-    raw_index = body.get("option_index")
-    if not isinstance(raw_index, int) or isinstance(raw_index, bool) or raw_index < 0:
-        return json_error(
-            "option_index must be a non-negative integer",
-            400, reason_code="option_index_invalid",
-        )
-    drive_root = request_drive_root(request)
     try:
         task, refusal = _live_root_task(task_id)
         if refusal == "not_a_root_task":

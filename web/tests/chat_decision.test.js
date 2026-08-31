@@ -30,7 +30,20 @@ class NodeStub {
     get className() { return [...this.classList.values].join(' '); }
     set textContent(value) { this._text = String(value ?? ''); }
     get textContent() { return this._text; }
-    append(...nodes) { nodes.forEach((node) => this.children.push(node)); }
+    append(...nodes) { nodes.forEach((node) => { node.parentNode = this; this.children.push(node); }); }
+    remove() {
+        const parent = this.parentNode;
+        if (!parent) return;
+        const i = parent.children.indexOf(this);
+        if (i >= 0) parent.children.splice(i, 1);
+        this.parentNode = null;
+    }
+    before(node) {
+        const parent = this.parentNode;
+        if (!parent) return;
+        node.parentNode = parent;
+        parent.children.splice(parent.children.indexOf(this), 0, node);
+    }
     addEventListener(type, handler) { this.listeners.set(type, handler); }
     click() { const handler = this.listeners.get('click'); if (handler) handler(); }
     matchesClass(name) { return this.classList.contains(name); }
@@ -272,4 +285,101 @@ test('applyQuizStateFrame settles an existing card and ignores unknown ids', asy
     } finally {
         fx.restore();
     }
+});
+
+// ---- routing picker (#198) ----
+
+function routingBubble(cmid = 'cm-1') {
+    const bubble = new NodeStub('div');
+    bubble.dataset.clientMessageId = cmid;
+    return bubble;
+}
+
+const ROUTING_ANNOTATION = {
+    status: 'needs_manual_target', routing_token: 'tok-1',
+    options: [
+        { action: 'steer_task', task_id: 't1', title: 'Fix CI' },
+        { action: 'new_task_in_project', project_id: 'p1', project_name: 'Web' },
+    ],
+};
+
+test('an actionable refusal renders the picker card; other statuses fall back to text', () => {
+    const fx = fixture();
+    try {
+        const bubble = routingBubble();
+        assert.equal(fx.decision.renderRoutingDecision(bubble, ROUTING_ANNOTATION), true);
+        const card = bubble.querySelector('.chat-routing-card');
+        assert.ok(card);
+        assert.equal(card.dataset.state, 'open');
+        const buttons = card.querySelectorAll('.chat-quiz-option');
+        assert.equal(buttons.length, 2);
+        assert.equal(buttons[0].querySelector('.chat-quiz-option-label').textContent, 'Fix CI');
+        assert.equal(buttons[1].querySelector('.chat-quiz-option-label').textContent, 'New task in Web');
+        // A later settled annotation (the dispatch ack) REPLACES the card
+        // with the plain text line — the card never lingers past its attempt.
+        fx.decision.renderRoutingDecision(bubble, {
+            status: 'delivered', action: 'steer_task', target: 't1', target_label: 'Fix CI',
+        });
+        assert.equal(bubble.querySelector('.chat-routing-card'), null);
+        assert.match(bubble.querySelector('.msg-routing-annotation').textContent, /Steered task/);
+    } finally { fx.restore(); }
+});
+
+test('a routing click posts the routing decision id with a STABLE request id', async () => {
+    const fx = fixture();
+    try {
+        const bubble = routingBubble('cm-2');
+        fx.decision.renderRoutingDecision(bubble, ROUTING_ANNOTATION);
+        const card = bubble.querySelector('.chat-routing-card');
+        card.querySelectorAll('.chat-quiz-option')[1].click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(fx.calls.length, 1);
+        const body = JSON.parse(fx.calls[0].init.body);
+        assert.equal(body.decision_id, 'routing:cm-2:tok-1');
+        assert.equal(body.option_index, 1);
+        assert.ok(body.request_id);
+        assert.equal(card.dataset.state, 'answered');
+        assert.ok(card.querySelectorAll('.chat-quiz-option')[1].classList.contains('chosen'));
+    } finally { fx.restore(); }
+});
+
+test('a routing 409 settles the card from the body state, never a false expiry', async () => {
+    const fx = fixture({
+        fetchImpl: async () => ({
+            ok: false, status: 409,
+            json: async () => ({ state: 'answered', answered_index: 0 }),
+        }),
+    });
+    try {
+        const bubble = routingBubble('cm-3');
+        fx.decision.renderRoutingDecision(bubble, ROUTING_ANNOTATION);
+        const card = bubble.querySelector('.chat-routing-card');
+        card.querySelectorAll('.chat-quiz-option')[1].click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(card.dataset.state, 'answered');
+        assert.ok(card.querySelectorAll('.chat-quiz-option')[0].classList.contains('chosen'));
+        assert.equal(fx.toasts.length, 1);
+    } finally { fx.restore(); }
+});
+
+test('more than eight options hide behind a show-all control', () => {
+    const fx = fixture();
+    try {
+        const bubble = routingBubble('cm-4');
+        const wide = {
+            ...ROUTING_ANNOTATION,
+            options: Array.from({ length: 11 }, (_, i) => (
+                { action: 'steer_task', task_id: `t${i}`, title: `Task ${i}` })),
+        };
+        fx.decision.renderRoutingDecision(bubble, wide);
+        const card = bubble.querySelector('.chat-routing-card');
+        const buttons = card.querySelectorAll('.chat-quiz-option');
+        assert.equal(buttons.length, 11);
+        assert.equal(buttons.filter((btn) => btn.hidden).length, 3);
+        const more = card.querySelector('.chat-quiz-more');
+        assert.match(more.textContent, /11/);
+        more.click();
+        assert.equal(buttons.filter((btn) => btn.hidden).length, 0);
+        assert.equal(card.querySelector('.chat-quiz-more'), null);
+    } finally { fx.restore(); }
 });

@@ -472,6 +472,11 @@
  * @property {number=} answered_index
  * @property {boolean=} duplicate
  * @property {string=} error
+ * @property {string=} dispatched
+ * @property {string=} task_id
+ * @property {string=} latest_status
+ * @property {string=} reason
+ * @property {string=} detail
  */
 
 /**
@@ -525,6 +530,7 @@
  * @property {string} status
  * @property {Array<Object>=} options
  * @property {AttachmentManifestEntry[]=} attachment_manifest
+ * @property {string=} routing_token
  * @property {boolean} suppress_bubble
  * @property {string=} ts
  */

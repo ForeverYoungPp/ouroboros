@@ -1,10 +1,12 @@
 // Owner decision cards: the typed quiz card (question + option buttons +
-// stake + assumption) and its lifecycle states. The card is fire-and-continue
-// UI: the asking task keeps working under the stated assumption, so the card
-// must read correctly both as "you can redirect me" (open) and as a record of
-// what happened (answered / expired). The routing picker (#198) joins this
-// module when it lands — one decision-card family, one answer contract.
+// stake + assumption) and the routing picker (#198) — one decision-card
+// family, one answer contract (POST /api/decisions). The quiz card is
+// fire-and-continue UI: the asking task keeps working under the stated
+// assumption, so it must read correctly both as "you can redirect me" (open)
+// and as a record of what happened (answered / expired). The routing picker
+// settles into the plain routing ack line once its dispatch is confirmed.
 import { MAX_QUIZ_OPTIONS } from './api_types.js';
+import { renderRoutingAnnotation, routingOptionLabel } from './chat_activity.js';
 
 const QUIZ_STATUS_TEXT = {
     open: 'Awaiting answer',
@@ -12,6 +14,16 @@ const QUIZ_STATUS_TEXT = {
     expired_terminal: 'Task finished — question expired',
     superseded: 'Superseded by a retry',
 };
+
+// Neutral, factual statuses (owner decision 15~A): the card never scolds the
+// router — it states what the click does and what happened.
+const ROUTING_STATUS_TEXT = {
+    open: 'Choose a destination',
+    pending: 'Routing…',
+    answered: 'Routed',
+    superseded: 'Superseded by a newer attempt',
+};
+const ROUTING_TOP_OPTIONS = 8;
 
 export function createChatDecision({
     apiFetch,
@@ -193,6 +205,147 @@ export function createChatDecision({
         return framed;
     }
 
+    function setRoutingCardState(card, state, chosenIndex) {
+        if (!card) return;
+        card.dataset.state = state;
+        const status = card.querySelector('.chat-quiz-status-text');
+        if (status) status.textContent = ROUTING_STATUS_TEXT[state] || 'Closed';
+        card.querySelectorAll('.chat-quiz-option').forEach((btn, i) => {
+            btn.disabled = state !== 'open';
+            btn.classList.toggle('chosen', chosenIndex !== null && i === chosenIndex);
+        });
+    }
+
+    async function submitRouting(card, cmid, token, index) {
+        if (card.dataset.pending === '1') return;
+        card.dataset.pending = '1';
+        // Same idempotency discipline as the quiz card: ONE stable id per
+        // card, replayed on retry, so the server latch never reads a retry
+        // as a competing second click.
+        if (!card.dataset.requestId) {
+            card.dataset.requestId = (crypto.randomUUID && crypto.randomUUID()) || `r-${Date.now()}`;
+        }
+        try {
+            const res = await apiFetch('/api/decisions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    request_id: card.dataset.requestId,
+                    decision_id: `routing:${cmid}:${token}`,
+                    option_index: index,
+                }),
+            });
+            let body = null;
+            try { body = res && res.json ? await res.json() : null; } catch (parseErr) { body = null; }
+            if (res && res.ok) {
+                const answered = body && Number.isInteger(body.answered_index) ? body.answered_index : index;
+                setRoutingCardState(card, 'answered', answered);
+                return;
+            }
+            const status = res ? res.status : 0;
+            if (status === 409 && body && body.state) {
+                // Honest settlement: the body carries the TRUE state (another
+                // click won, or a newer routing attempt superseded this card).
+                setRoutingCardState(card,
+                    body.state === 'open' ? 'open' : body.state,
+                    Number.isInteger(body.answered_index) ? body.answered_index : null);
+                showToast(body.state === 'open'
+                    ? `Not routed: ${body.reason || 'the destination refused this message'} — pick again.`
+                    : body.state === 'pending'
+                        ? 'Another choice is already being routed.'
+                        : 'This message was already routed.', 'error');
+                return;
+            }
+            showToast(`Could not route the message (${status || 'network error'}) — try again.`, 'error');
+        } catch (err) {
+            showToast('Could not route the message (network error) — try again.', 'error');
+        } finally {
+            delete card.dataset.pending;
+        }
+    }
+
+    function buildRoutingCard(cmid, token, options) {
+        const card = document.createElement('div');
+        card.className = 'chat-quiz-card chat-routing-card';
+        card.dataset.routingToken = token;
+
+        const head = document.createElement('div');
+        head.className = 'chat-quiz-head';
+        const chip = document.createElement('span');
+        chip.className = 'chat-quiz-chip';
+        chip.textContent = 'Route';
+        const status = document.createElement('span');
+        status.className = 'chat-quiz-status';
+        const dot = document.createElement('span');
+        dot.className = 'chat-quiz-dot';
+        const statusLabel = document.createElement('span');
+        statusLabel.className = 'chat-quiz-status-text';
+        status.append(dot, statusLabel);
+        head.append(chip, status);
+        card.append(head);
+
+        const optionsBox = document.createElement('div');
+        optionsBox.className = 'chat-quiz-options';
+        const overflow = options.length > ROUTING_TOP_OPTIONS;
+        options.forEach((option, index) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'chat-quiz-option';
+            if (overflow && index >= ROUTING_TOP_OPTIONS) btn.hidden = true;
+            const label = document.createElement('span');
+            label.className = 'chat-quiz-option-label';
+            label.textContent = routingOptionLabel(option) || `Option ${index + 1}`;
+            btn.append(label);
+            btn.addEventListener('click', () => {
+                if (card.dataset.state !== 'open') return;
+                submitRouting(card, cmid, token, index);
+            });
+            optionsBox.append(btn);
+        });
+        card.append(optionsBox);
+        if (overflow) {
+            const more = document.createElement('button');
+            more.type = 'button';
+            more.className = 'chat-quiz-more';
+            more.textContent = `Show all ${options.length}`;
+            more.addEventListener('click', () => {
+                optionsBox.querySelectorAll('.chat-quiz-option')
+                    .forEach((btn) => { btn.hidden = false; });
+                more.remove();
+            });
+            card.append(more);
+        }
+        setRoutingCardState(card, 'open', null);
+        return card;
+    }
+
+    function renderRoutingDecision(bubble, annotation) {
+        // ONE entry point for a user bubble's routing surface: an actionable
+        // refusal renders the picker card; every other annotation state
+        // settles back into the plain text ack line.
+        if (!bubble) return false;
+        const cmid = String(bubble.dataset.clientMessageId || '');
+        const status = String((annotation && annotation.status) || '');
+        const token = String((annotation && annotation.routing_token) || '');
+        const options = Array.isArray(annotation && annotation.options) ? annotation.options : [];
+        const actionable = status === 'needs_manual_target' && cmid && token
+            && options.length > 0 && options.every((o) => o && typeof o === 'object');
+        if (!actionable) {
+            bubble.querySelector('.chat-routing-card')?.remove();
+            return renderRoutingAnnotation(bubble, annotation);
+        }
+        renderRoutingAnnotation(bubble, null); // the card replaces the text line
+        let card = bubble.querySelector('.chat-routing-card');
+        if (card && card.dataset.routingToken === token) return true; // same attempt
+        card?.remove();
+        card = buildRoutingCard(cmid, token, options);
+        const time = bubble.querySelector('.msg-time');
+        if (time) time.before(card);
+        else bubble.append(card);
+        bubble.dataset.chatAnnotationStatus = status;
+        return true;
+    }
+
     function applyQuizStateFrame(rootNode, frame) {
         // Live lifecycle update for an already-rendered card (WS "quiz_state").
         // The card is found by identity, never appended: state changes must
@@ -206,5 +359,5 @@ export function createChatDecision({
         return true;
     }
 
-    return { buildQuizCard, setCardState, applyQuizStateFrame };
+    return { buildQuizCard, setCardState, applyQuizStateFrame, renderRoutingDecision };
 }

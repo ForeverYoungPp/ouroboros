@@ -658,6 +658,19 @@ export function formatMsgTime(isoStr) {
     }
 }
 
+/** Human label for ONE manual-routing option row (shared with the picker card). */
+export function routingOptionLabel(option) {
+    if (!option || typeof option !== 'object') return '';
+    if (option.label) return String(option.label);
+    if (option.action === 'new_task_in_project') {
+        return `New task in ${String(option.project_name || 'Project')}`;
+    }
+    if (option.title || option.project_name) {
+        return String(option.title || option.project_name);
+    }
+    return option.project_id && !option.task_id ? 'Project' : 'Task';
+}
+
 /** Human text for a typed routing annotation ('' hides the line). */
 export function routingAnnotationText(annotation) {
     if (!annotation || typeof annotation !== 'object') return '';
@@ -669,17 +682,7 @@ export function routingAnnotationText(annotation) {
     if (status === 'pending') return 'Choosing the right destination…';
     if (status === 'needs_manual_target') {
         const optionLabels = (Array.isArray(annotation.options) ? annotation.options : [])
-            .map(option => {
-                if (!option || typeof option !== 'object') return '';
-                if (option.label) return String(option.label);
-                if (option.action === 'new_task_in_project') {
-                    return `New task in ${String(option.project_name || 'Project')}`;
-                }
-                if (option.title || option.project_name) {
-                    return String(option.title || option.project_name);
-                }
-                return option.project_id && !option.task_id ? 'Project' : 'Task';
-            })
+            .map(routingOptionLabel)
             .filter(Boolean);
         if (optionLabels.length) return `Choose a target · ${optionLabels.join(' / ')}`;
         return targetLabel ? `Choose a target · ${targetLabel}` : 'Choose a target';

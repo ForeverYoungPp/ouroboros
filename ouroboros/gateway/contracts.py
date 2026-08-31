@@ -450,6 +450,10 @@ class MessageAnnotationOutbound(TypedDict):
     target_label: NotRequired[str]
     options: NotRequired[List[Dict[str, Any]]]
     attachment_manifest: NotRequired[List[AttachmentManifestEntry]]
+    # #198: the exact refusal-attempt identity — the picker card composes its
+    # decision_id (routing:{client_message_id}:{routing_token}) from it; a
+    # presentation frame without it renders text, never a clickable card.
+    routing_token: NotRequired[str]
     ts: NotRequired[str]
 
 
@@ -1313,7 +1317,10 @@ class DecisionResponse(TypedDict, total=False):
     (``answered``; ``duplicate`` marks an idempotent replay). A late answer
     to a settled task is 409 with ``state`` telling the truth
     (``expired_terminal``/``answered``) so the card settles instead of
-    inviting retries."""
+    inviting retries. The routing family (#198) adds: ``dispatched`` (the
+    confirmed durable receipt status), ``task_id`` (the derived id of a
+    promoted task), ``latest_status`` (the superseding row's status on a 409),
+    ``reason``/``detail`` (typed refusal/unconfirmed diagnostics)."""
 
     ok: bool
     decision_id: str
@@ -1321,6 +1328,11 @@ class DecisionResponse(TypedDict, total=False):
     answered_index: int
     duplicate: bool
     error: str
+    dispatched: str
+    task_id: str
+    latest_status: str
+    reason: str
+    detail: str
 
 
 class LogTailResponse(TypedDict, total=False):
