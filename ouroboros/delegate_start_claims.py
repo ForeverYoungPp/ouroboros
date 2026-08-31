@@ -80,11 +80,23 @@ def claimed_start_request(
                                 "Finish it before starting another assignment against the skill."
                             ),
                         }
+                live_ids = [
+                    str(v) for key in (
+                        "open_run_ids", "pending_invocation_ids",
+                        "undisposed_patch_run_ids",
+                    ) for v in (blockers.get(key) or [])
+                ]
+                shown = ", ".join(live_ids[:4]) + (
+                    f" (+{len(live_ids) - 4} more)" if len(live_ids) > 4 else "")
                 return False, {
                     "reason": "replacement_requires_settlement", **blockers,
                     "detail": (
-                        "The actor gained an unsettled start/run or undisposed patch "
-                        "before this fresh request could be claimed."
+                        "The actor already has an unsettled start/run or an "
+                        "undisposed patch"
+                        + (f" ({shown})" if live_ids else "")
+                        + ". Wait for or cancel an open run; replay a pending "
+                        "invocation with retry_of=<invocation id>; dispose a "
+                        "captured patch explicitly (#364)."
                     ),
                 }
             bootstrap = (

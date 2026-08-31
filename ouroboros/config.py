@@ -356,6 +356,8 @@ CLAUDEXOR_MIN_VERSION: str = "3.2.0"
 # not buy a lane-wide refusal (AGENTS.md "Disclose instead of forbid"). Two gates, two
 # questions, no overlap; bands: docs/DELEGATED_ADMISSION.md.
 CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION: str = "3.3.0"
+# Engine floor for the delegated ``workspaceRoot`` field (#362 stable-target routes).
+CLAUDEXOR_DELEGATED_WORKSPACE_ROOT_MIN_VERSION: str = "3.8.1"
 
 
 def _main_model() -> str:

@@ -207,7 +207,8 @@ def _source_range_receipt_valid(
 def record_started_custody(
     drive: Any, run_id: str, ctx: Any, route: Any, authority: Any, *,
     key: str, access: str, root: str, seconds: int, invocation_id: str,
-    project_id: str, project_owned: bool, selected_subagent_id: str,
+    project_id: str, project_owned: bool, project_persistent: bool,
+    selected_subagent_id: str,
     config_fingerprint: str, work_order_fingerprint: str, work_order_coverage: str,
     work_order_source_request: Dict[str, Any], authority_fingerprint: str,
     snapshot_id: str, target_root: str, baseline_sha: str, authority_source: str,
@@ -227,6 +228,7 @@ def record_started_custody(
         profile_id=route.profile_id,
         project_id=project_id,
         project_owned=project_owned,
+        project_persistent=project_persistent,
         root_task_id=str(metadata.get("root_task_id") or ""),
         parent_task_id=str(metadata.get("parent_task_id") or ""),
         ledger_root=str(drive),

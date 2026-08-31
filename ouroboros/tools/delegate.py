@@ -96,6 +96,8 @@ from ouroboros.delegate_interactions import (  # noqa: F401
 # delegate_interactions needs them, and an extracted module never imports the
 # facade back); re-exported here because sibling code, the tests and
 # monkeypatch targets name them on THIS surface.
+from ouroboros.deadline_utils import deadline_expired
+from ouroboros.delegate_registration_policy import resolve_registration
 from ouroboros.delegate_shared import (  # noqa: F401
     _emit,
     _fail,
@@ -658,7 +660,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     selector_refusal = _payload_selector_refusal(selector_root, retry_of, bucket, skill_name)
     if selector_refusal:
         return selector_refusal
-    if _deadline_expired(ctx):
+    if deadline_expired(ctx):
         # EXPIRED pre-daemon; definitely_unrun = the producer's own no-run verdict (P2).
         return _fail(
             "delegate_start", "task_deadline_expired",
@@ -668,7 +670,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         )
 
     drive = custody.custody_root(ctx)
-    owned_project_id = ""
+    owned_project_id, project_persistent = "", False
     invocation_id = ""
     snapshot_id = ""
     baseline_sha = ""
@@ -702,8 +704,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         if refusal:
             return refusal
         (request_body, route, authority, root, key, project_id, owned_project_id,
-         seconds, snapshot_id, target_root, baseline_sha, authority_source,
-         resource_ref) = binding
+         project_persistent, seconds, snapshot_id, target_root, baseline_sha,
+         authority_source, resource_ref) = binding
         invocation_id = retry_token
         payload_auth = None
     else:
@@ -792,9 +794,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 resource_ref = dict(record_auth.get("resource_ref") or {})
             execution_root = delegated_execution_workspace_root(gateway, authority, root)
             scope_root = target_root if execution_root else root
-            existing_project = gateway.find_project_id(scope_root)
-            project_id = existing_project or gateway.register_project(scope_root)
-            owned_project_id = "" if existing_project else project_id
+            (project_id, owned_project_id, project_persistent) = resolve_registration(
+                gateway, scope_root, execution_root, getattr(authority, "access", ""))
             # The canonical ASSIGNMENT — prompt plus host-authored instructions —
             # is digested together: two starts whose prompts agree but whose
             # contract blocks differ are two different logical starts. The digest
@@ -815,7 +816,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             run_id="", task_id=str(getattr(ctx, "task_id", "") or ""),
             idempotency_key=key, invocation_id=invocation_id,
             max_seconds=seconds, request=request_body, project_id=project_id,
-            project_owned=bool(owned_project_id), route=route.route_id,
+            project_owned=bool(owned_project_id), project_persistent=project_persistent, route=route.route_id,
             # Lineage rides the request row so a run RECOVERED from a pending
             # invocation (P34R.2) can still attribute its ledger row to the tree.
             root_task_id=str(lineage.get("root_task_id") or ""),
@@ -843,7 +844,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             return _fail(
                 "delegate_start", reason, detail,
                 **facts,
-                **_retire_orphaned_registration(ctx, gateway, owned_project_id,
+                **_retire_orphaned_registration(ctx, gateway, owned_project_id, project_persistent=project_persistent,
                     definite_refusal=True,
                     reason=reason, invocation_id=invocation_id, snapshot_id=snapshot_id,
                 ),
@@ -859,7 +860,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 "The durable start-request row could not be written, so the run was "
                 "NOT started: a run launched without its custody trail would be "
                 "unfindable if this worker died. Fix the drive/event log and retry.",
-                **({"definitely_unrun": True} if not recovering else {}), **_retire_orphaned_registration(ctx, gateway, owned_project_id,
+                **({"definitely_unrun": True} if not recovering else {}), **_retire_orphaned_registration(ctx, gateway, owned_project_id, project_persistent=project_persistent,
                                                 definite_refusal=not recovering,
                                                 reason="start_request_row_unwritable",
                                                 invocation_id=invocation_id,
@@ -878,7 +879,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                          retry_hint="to retry THIS start call use "
                                     "delegate_start(prompt=..., "
                                     "retry_of=pending_invocation_id); a plain call starts a NEW run",
-                         **_retire_orphaned_registration(ctx, gateway, owned_project_id,
+                         **_retire_orphaned_registration(ctx, gateway, owned_project_id, project_persistent=project_persistent,
                                                          definite_refusal=False,
                                                          reason="queued_without_run_id",
                                                          invocation_id=invocation_id))
@@ -898,7 +899,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                                   "retry_of=pending_invocation_id); a plain call starts a NEW run"})
         return _fail("delegate_start", exc.code, str(exc), executor="blocked",
                      reset_at=getattr(exc, "reset_at", ""), **pending,
-                     **_retire_orphaned_registration(ctx, gateway, owned_project_id,
+                     **_retire_orphaned_registration(ctx, gateway, owned_project_id, project_persistent=project_persistent,
                                                      definite_refusal=definite,
                                                      reason=str(getattr(exc, "code", "")),
                                                      invocation_id=invocation_id,
@@ -909,7 +910,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         # untyped exit says nothing about whether the POST reached the daemon, so a run
         # may be live against it. Named with a typed reason so the sweep's
         # pending-invocation recovery finds it, then re-raised — disclosure, not a swallow.
-        _retire_orphaned_registration(ctx, gateway, owned_project_id,
+        _retire_orphaned_registration(ctx, gateway, owned_project_id, project_persistent=project_persistent,
                                       definite_refusal=False,
                                       reason=f"pre_custody_exit_{type(exc).__name__}",
                                       invocation_id=invocation_id)
@@ -923,7 +924,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         drive, run_id, ctx, route, authority,
         key=key, access=access, root=root, seconds=seconds,
         invocation_id=invocation_id, project_id=project_id,
-        project_owned=bool(owned_project_id), selected_subagent_id=selected_subagent_id,
+        project_owned=bool(owned_project_id), project_persistent=project_persistent,
+        selected_subagent_id=selected_subagent_id,
         config_fingerprint=config_fingerprint, work_order_fingerprint=work_order_fingerprint,
         work_order_coverage=work_order_coverage,
         work_order_source_request=work_order_source_request,
@@ -1006,6 +1008,7 @@ def _started_payload(handle: Dict[str, Any], run_id: str, route: Any, access: st
 
 def _retire_orphaned_registration(ctx: ToolContext, gateway: Any, project_id: str, *,
                                   definite_refusal: bool, reason: str,
+                                  project_persistent: bool = False,
                                   invocation_id: str = "",
                                   snapshot_id: str = "") -> Dict[str, Any]:
     """Retire a registration this start created but never bound to a run.
@@ -1036,7 +1039,7 @@ def _retire_orphaned_registration(ctx: ToolContext, gateway: Any, project_id: st
             log.warning("Failed to retire delegated execution snapshot %s", snapshot_id,
                         exc_info=True)
     retired = False
-    if project_id and definite_refusal:
+    if project_id and definite_refusal and not project_persistent:
         try:
             gateway.remove_project(project_id)
             retired = True
@@ -1053,32 +1056,22 @@ def _retire_orphaned_registration(ctx: ToolContext, gateway: Any, project_id: st
                                           "definite": bool(definite_refusal)})
     if not project_id:
         return {"project_retired": False}
+    if project_persistent and definite_refusal:
+        # #362: a definite refusal still never deletes the user's stable
+        # project (the f9356572 skip) — but the invocation's fate row above
+        # has landed, so the lane cannot livelock on a forever-pending id.
+        return {"project_retired": False, "project_id": project_id,
+                "project_retention_reason": "persistent_registration"}
     if retired or definite_refusal:
         return {"project_retired": retired, "project_id": project_id}
     return {"project_retired": False, "project_id": project_id,
             "project_retention_reason": "start_outcome_unknown_run_may_exist"}
 
 
-def _deadline_expired(ctx: ToolContext) -> bool:
-    """True when the nanny HAS a deadline and it has already passed.
-
-    The distinction the bound below could not make: ``deadline_remaining_sec`` answers
-    0.0 both for "no deadline" and for "the deadline is behind us", and collapsing them
-    let an EXPIRED nanny hand a fresh run the absolute task ceiling.
-    """
-    from ouroboros.deadline_utils import deadline_remaining_sec, parse_deadline_ts
-
-    meta = getattr(ctx, "task_metadata", {})
-    meta = meta if isinstance(meta, dict) else {}
-    if parse_deadline_ts(meta.get("deadline_at")) is None:
-        return False
-    return deadline_remaining_sec(ctx) <= 0
-
-
 def _bounded_max_seconds(ctx: ToolContext, requested: Optional[int]) -> int:
     """Narrow-only: the delegated run may never outlive the nanny's own deadline.
 
-    A caller must ask ``_deadline_expired`` FIRST: an expired deadline cannot produce an
+    A caller must ask ``deadline_expired`` FIRST: an expired deadline cannot produce an
     honest bound at all, and this function's fallback is for a nanny that has NO
     deadline, never for one whose deadline is behind it.
     """

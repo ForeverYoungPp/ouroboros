@@ -1431,8 +1431,8 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
     expired = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     expired.task_id = "t-a"
     expired.task_metadata = {"root_task_id": "t-a", "deadline_at": "2020-01-01T00:00:00Z"}
-    assert delegate._deadline_expired(expired) is True
-    assert delegate._deadline_expired(bare) is False, "no deadline is not an expired one"
+    assert delegate.deadline_expired(expired) is True
+    assert delegate.deadline_expired(bare) is False, "no deadline is not an expired one"
 
     from ouroboros.deadline_utils import utc_now
 
@@ -1440,7 +1440,7 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
     live.task_id = "t-a"
     live.task_metadata = {"root_task_id": "t-a",
                           "deadline_at": (utc_now() + datetime.timedelta(hours=1)).isoformat()}
-    assert delegate._deadline_expired(live) is False
+    assert delegate.deadline_expired(live) is False
     # ...and the live deadline still NARROWS the bound, as it always did.
     assert 0 < delegate._bounded_max_seconds(live, None) <= 3600
 
