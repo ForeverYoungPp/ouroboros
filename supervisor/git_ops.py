@@ -1504,18 +1504,23 @@ def list_versions(max_count: int = 50) -> List[Dict[str, Any]]:
     """Return list of annotated git tags sorted newest-first."""
     rc, raw, _ = git_capture([
         "git", "tag", "-l", "--sort=-creatordate",
-        "--format=%(refname:short)\t%(creatordate:iso-strict)\t%(subject)",
+        "--format=%(refname:short)\t%(creatordate:iso-strict)\t"
+        "%(objectname)\t%(*objectname)\t%(subject)",
     ])
     if rc != 0 or not raw.strip():
         return []
     versions: List[Dict[str, Any]] = []
     for line in raw.splitlines()[:max_count]:
-        parts = line.split("\t", 2)
+        parts = line.split("\t", 4)
         if len(parts) >= 1:
+            # An annotated tag's commit is the peeled *objectname; a
+            # lightweight tag's objectname IS the commit already.
+            peeled = parts[3] if len(parts) > 3 else ""
             versions.append({
                 "tag": parts[0],
                 "date": parts[1] if len(parts) > 1 else "",
-                "message": parts[2] if len(parts) > 2 else "",
+                "sha": peeled or (parts[2] if len(parts) > 2 else ""),
+                "message": parts[4] if len(parts) > 4 else "",
             })
     return versions
 

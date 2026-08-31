@@ -40,9 +40,12 @@ test('ordinary update selects clean or assisted merge without recovery replaceme
     assert.doesNotMatch(ordinary, /['"]replace['"]/);
     assert.doesNotMatch(ordinary, /updateApply\(['"]stash['"]/);
 
-    const dialog = readFileSync(new URL('../modules/update_status.js', import.meta.url), 'utf8');
-    assert.match(dialog, /Git handles clean updates directly/);
-    assert.match(dialog, /real conflict/);
+    // The pill is a pointer, not a second apply surface (owner decision
+    // 2026-08-31): it must never call updateApply or preflight itself.
+    const pill = readFileSync(new URL('../modules/update_status.js', import.meta.url), 'utf8');
+    assert.doesNotMatch(pill, /updateApply\(/);
+    assert.doesNotMatch(pill, /updatePreflight\(/);
+    assert.match(pill, /openDashboardTab\?\.\('updates'\)/);
 });
 
 
@@ -77,8 +80,10 @@ test('update apply sends exact preflight pins and recovery confirmation only whe
 
 test('detailed Updates UI makes destructive replacement an explicit recovery action', () => {
     const source = readFileSync(new URL('../modules/updates.js', import.meta.url), 'utf8');
-    assert.match(source, />Promote to QA<\/button>/);
+    assert.match(source, />Save recovery point<\/button>/);
+    assert.doesNotMatch(source, />Promote to QA<\/button>/);
     assert.doesNotMatch(source, />Promote to Stable<\/button>/);
+    assert.match(source, /does not change the official QA feed/);
     assert.match(source, /<summary>Recovery<\/summary>/);
     assert.match(source, /Replace with Official Version \(Recovery\)/);
     assert.match(source, /apiClient\.updateApply\('replace', plan, \{ confirmRecovery: true \}\)/);
@@ -91,7 +96,6 @@ test('detailed Updates UI makes destructive replacement an explicit recovery act
 
     const pillSource = readFileSync(new URL('../modules/update_status.js', import.meta.url), 'utf8');
     assert.match(pillSource, /update_status_ready/);
-    assert.match(pillSource, /restart_required/);
 });
 
 
@@ -131,7 +135,9 @@ test('main update dialog never invents facts for an unverified preflight', () =>
         strategy: 'auto_merge',
     });
 
-    const source = readFileSync(new URL('../modules/update_status.js', import.meta.url), 'utf8');
-    assert.match(source, /The update could not be verified\. No files were changed\./);
-    assert.match(source, /data-retry/);
+    // The verification helper still guards the one apply surface: the panel
+    // imports it, and an unverified plan never reaches updateApply.
+    const panel = readFileSync(new URL('../modules/updates.js', import.meta.url), 'utf8');
+    assert.match(panel, /verifiedUpdatePlan\(preflight\)/);
+    assert.match(panel, /could not be verified\. No files were changed\./);
 });

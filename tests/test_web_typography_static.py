@@ -213,6 +213,10 @@ def test_migrated_region_markers_do_not_swallow_unmigrated_surfaces() -> None:
     region = _migrated_style_region(raw=True)
     assert ".reviewer-slots-heading" in region
     assert ".harness-account-row" in region
+    # The Dashboard -> Updates tab migrated on 2026-08-31; its rules must stay
+    # inside the guarded region so a later edit cannot drift them out of it.
+    assert ".updates-status" in region
+    assert ".updates-restore-row" in region
     assert ".chat-live-executor-chip" not in region
     css = _read("web/style.css")
     assert css.count(BEGIN_MARKER) == 1

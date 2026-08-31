@@ -1,17 +1,12 @@
-// Main-screen Update affordance (P2): a compact pill that appears when a managed update
-// is available (status is populated by the boot-time check-on-restart), opening a staged
-// choice dialog (Auto-update / Ouroboros-assisted / Manual) backed by a fresh merge
-// preflight. The full merge/smoke/rollback happens server-side; this is the thin,
-// transparent control surface. Non-invasive: the detailed Dashboard -> Updates panel
-// stays the place for recovery/details.
+// Main-screen Update affordance (P2): a compact pill that appears when a managed
+// update is available (status is populated by the boot-time check-on-restart).
+// The pill is a pointer, not a second apply surface: clicking it opens
+// Dashboard -> Updates, where the ONE apply flow (with its verified preflight
+// and typed outcomes) lives. The former pill-local staged dialog was removed
+// (owner decision 2026-08-31) so two hand-rolled apply controllers cannot
+// drift apart again.
 
 import { apiClient, updateStrategyForPlan } from './api_client.js';
-
-function escapeHtml(value) {
-    return String(value ?? '').replace(/[&<>"']/g, (c) => (
-        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-    ));
-}
 
 // Fail-soft wrapper around the api_client update helpers (the pill must never throw the app).
 async function safe(fn) {
@@ -37,6 +32,8 @@ export function updatePillText(status = {}) {
     return current && latest ? `Update ${current} → ${latest}` : 'Update available';
 }
 
+// Shared preflight verification for the ONE apply surface (consumed by
+// web/modules/updates.js): never lets an unverified plan reach updateApply.
 export function verifiedUpdatePlan(preflight) {
     const plan = preflight?.merge_plan;
     if (!plan || typeof plan !== 'object') return null;
@@ -60,7 +57,10 @@ export function initUpdateStatus({ showPage, openDashboardTab, ws } = {}) {
             pill.type = 'button';
             pill.className = 'update-pill';
             pill.hidden = true;
-            pill.addEventListener('click', openUpdateDialog);
+            pill.addEventListener('click', () => {
+                showPage?.('dashboard');
+                openDashboardTab?.('updates');
+            });
             const anchor = document.getElementById('nav-version');
             if (anchor && anchor.parentNode) {
                 anchor.parentNode.insertBefore(pill, anchor.nextSibling);
@@ -84,103 +84,6 @@ export function initUpdateStatus({ showPage, openDashboardTab, ws } = {}) {
 
     async function refresh() {
         renderPill(await safe(() => apiClient.updateStatus()));
-    }
-
-    async function openUpdateDialog() {
-        const overlay = document.createElement('div');
-        overlay.className = 'update-dialog-overlay';
-        overlay.innerHTML = '<div class="update-dialog"><div class="update-dialog-status">Checking update…</div></div>';
-        document.body.appendChild(overlay);
-
-        const pre = await safe(() => apiClient.updatePreflight());
-        const verified = verifiedUpdatePlan(pre);
-        if (!verified) {
-            overlay.querySelector('.update-dialog').innerHTML = `
-                <h3 class="update-dialog-title">Update plan unavailable</h3>
-                <div class="update-dialog-meta">The update could not be verified. No files were changed.</div>
-                <div class="update-dialog-actions">
-                    <button data-retry class="btn btn-primary">Retry</button>
-                    <button data-open-details class="btn btn-default">Open details</button>
-                    <button data-close class="btn btn-default">Cancel</button>
-                </div>`;
-            overlay.addEventListener('click', (event) => {
-                const t = event.target;
-                if (t === overlay || t.hasAttribute?.('data-close')) overlay.remove();
-                if (t.hasAttribute?.('data-retry')) {
-                    overlay.remove();
-                    openUpdateDialog();
-                }
-                if (t.hasAttribute?.('data-open-details')) {
-                    overlay.remove();
-                    showPage?.('dashboard');
-                    openDashboardTab?.('updates');
-                }
-            });
-            return;
-        }
-        const { plan, strategy } = verified;
-        const hot = new Set(plan.hot_code_paths || []);
-        const conflicts = [
-            ...((plan.code_conflict_paths || []).map((p) => (hot.has(p) ? `Code (hot): ${p}` : `Code: ${p}`))),
-            ...((plan.doc_conflict_paths || []).map((p) => `Docs: ${p}`)),
-        ];
-        const base = plan.base_sha ? String(plan.base_sha).slice(0, 8) : '';
-        const target = plan.target_sha ? String(plan.target_sha).slice(0, 8) : '';
-        const primary = strategy === 'auto_merge'
-            ? '<button data-strategy="auto_merge" class="btn btn-primary">Update now</button>'
-            : (strategy === 'assisted'
-                ? '<button data-strategy="assisted" class="btn btn-primary">Update with Ouroboros</button>'
-                : '<button class="btn btn-primary" disabled>Update unavailable</button>');
-
-        overlay.querySelector('.update-dialog').innerHTML = `
-            <h3 class="update-dialog-title">Update ${escapeHtml(base)} → ${escapeHtml(target)}</h3>
-            <div class="update-dialog-meta">${plan.local_dirty_count} local change(s)${conflicts.length ? ` · ${conflicts.length} conflict(s)` : (plan.merge_commit && plan.merge_commit !== plan.target_sha ? ' · automatic Git merge' : ' · direct fast-forward')}</div>
-            ${conflicts.length ? `<ul class="update-dialog-conflicts">${conflicts.map((r) => `<li>${escapeHtml(r)}</li>`).join('')}</ul>` : ''}
-            <div class="update-dialog-note">Git handles clean updates directly. Ouroboros joins only when Git reports a real conflict. A rescue snapshot and rollback protect the current checkout; uncommitted local edits are stashed and restored as uncommitted work after the update.</div>
-            <div class="update-dialog-actions">
-                ${primary}
-                <button data-open-details class="btn btn-default">Open details</button>
-                <button data-close class="btn btn-default">Cancel</button>
-            </div>
-            <div class="update-dialog-status" hidden></div>`;
-
-        const statusEl = overlay.querySelector('.update-dialog-status');
-        overlay.addEventListener('click', async (event) => {
-            const t = event.target;
-            if (t === overlay || t.hasAttribute?.('data-close')) {
-                overlay.remove();
-                return;
-            }
-            if (t.hasAttribute?.('data-open-details')) {
-                overlay.remove();
-                showPage?.('dashboard');
-                openDashboardTab?.('updates');
-                return;
-            }
-            const strat = t.dataset?.strategy;
-            if (!strat) return;
-            statusEl.hidden = false;
-            statusEl.textContent = 'Applying update…';
-            const data = await apiClient.updateApply(strat, plan).catch((e) => ({
-                error: String((e && e.message) || e),
-                restart_required: Boolean(e?.body?.restart_required),
-                stash_note: e?.body?.stash_note || '',
-            }));
-            if (data && data.status === 'ok' && data.restarting) {
-                statusEl.textContent = 'Update applied; smoke-test passed; restarting…';
-            } else if (data && data.status === 'assisted_started') {
-                statusEl.textContent = 'Ouroboros is resolving the merge under review — watch progress in chat.';
-            } else if (data && data.status === 'restart_required') {
-                statusEl.textContent = 'The update landed, but automatic restart failed. Restart Ouroboros to finish.';
-            } else if (data && data.restart_required) {
-                statusEl.textContent = `Did not complete: ${data.error}. Runtime shutdown was incomplete; restart Ouroboros before retrying.`;
-            } else {
-                statusEl.textContent = (data && data.error) ? `Did not complete: ${data.error}` : 'Update did not complete.';
-            }
-            if (data && data.stash_note) {
-                statusEl.textContent += ` (${data.stash_note})`;
-            }
-        });
     }
 
     refresh();
