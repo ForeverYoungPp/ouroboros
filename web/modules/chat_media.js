@@ -191,19 +191,6 @@ export function createChatMedia({
         downloadBlob(await sourceBlob(source, mime), filename);
     }
 
-    async function shareSource(source, filename, mime) {
-        if (typeof navigator.share !== 'function' || typeof navigator.canShare !== 'function') {
-            throw new Error('Sharing is not supported on this device');
-        }
-        const blob = await sourceBlob(source, mime);
-        const file = typeof File === 'function'
-            ? new File([blob], filename, { type: mime })
-            : blob;
-        const payload = { files: [file], title: filename };
-        if (!navigator.canShare(payload)) throw new Error('This file cannot be shared');
-        await navigator.share(payload);
-    }
-
     function ensureFileDialog() {
         if (fileDialog) return fileDialog;
         fileDialog = document.createElement('dialog');
@@ -214,7 +201,6 @@ export function createChatMedia({
                 <div class="chat-file-dialog-actions">
                     <button type="button" data-file-action="open">Open</button>
                     <button type="button" data-file-action="download">Download</button>
-                    <button type="button" data-file-action="share">Share</button>
                     <button type="button" data-file-action="close">Close</button>
                 </div>
             </form>`;
@@ -244,15 +230,6 @@ export function createChatMedia({
                 showToast(`Could not download file: ${error?.message || error}`, 'error');
             }
         });
-        listen(fileDialog.querySelector('[data-file-action="share"]'), 'click', async () => {
-            if (!dialogFile) return;
-            try {
-                await shareSource(dialogFile.source, dialogFile.filename, dialogFile.mime);
-                close();
-            } catch (error) {
-                showToast(`Could not share file: ${error?.message || error}`, 'error');
-            }
-        });
         return fileDialog;
     }
 
@@ -262,8 +239,6 @@ export function createChatMedia({
         dialog.querySelector('.chat-file-dialog-title').textContent = file.filename;
         const open = dialog.querySelector('[data-file-action="open"]');
         open.hidden = !file.source.durable;
-        const share = dialog.querySelector('[data-file-action="share"]');
-        share.disabled = typeof navigator.share !== 'function' || typeof navigator.canShare !== 'function';
         if (typeof dialog.showModal === 'function') dialog.showModal();
         else dialog.setAttribute('open', '');
     }
@@ -388,7 +363,6 @@ export function createChatMedia({
                 <button type="button" data-photo-action="open">Open in new tab</button>
                 <button type="button" data-photo-action="download">Download</button>
                 <button type="button" data-photo-action="copy">Copy to clipboard</button>
-                <button type="button" data-photo-action="share">Share</button>
             </div>
         </details>`;
     }
@@ -419,10 +393,6 @@ export function createChatMedia({
             } catch (error) {
                 showToast(`Could not copy image: ${error?.message || error}`, 'error');
             }
-        });
-        listen(action('share'), 'click', async () => {
-            try { await shareSource(sourceRef, filename, mime); }
-            catch (error) { showToast(`Could not share image: ${error?.message || error}`, 'error'); }
         });
     }
 

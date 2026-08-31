@@ -1,5 +1,9 @@
 import { apiFetch } from './api_client.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+// Cycle note: toast.js imports normalizeTone from this module. Both edges only
+// call the imported function inside function bodies (never at module eval), so
+// the ES-module cycle is benign.
+import { showToast } from './toast.js';
 
 const TONES = new Set(['ok', 'danger', 'warn', 'muted', 'info']);
 const TONE_ALIASES = Object.freeze({
@@ -176,6 +180,195 @@ export async function downloadViaHostBridge(url, filename = 'download', { openEx
     link.remove();
     setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
     return { ok: true, native: false };
+}
+
+// ---------------------------------------------------------------------------
+// Desktop-shell link interception (pywebview parity).
+//
+// The embedded WebView is created without new-window or download delegates, so
+// `window.open()`, `<a target="_blank">`, and `<a download>` are silent no-ops
+// in the desktop shell. ONE shell-only interceptor closes the whole class: a
+// delegated document click listener plus a `window.open` shim, installed only
+// once the pywebview bridge exists (the bridge appears asynchronously after
+// load, announced by the `pywebviewready` event). In an ordinary browser
+// nothing is installed — zero behavior change. Bridge METHODS are still
+// feature-detected per call: the packaged launcher only updates on reinstall
+// while this served frontend updates with the managed repo, so each class has
+// an explicit version-skew fallback (copy-link toast / honest "not available"
+// toast) instead of a silently dead control.
+
+const BRIDGE_ARTIFACTS_RE = /^\/api\/tasks\/[^/]+\/artifacts\//;
+
+/** Classify a URL for the desktop shell: file | external | bytes | default. */
+export function classifyShellUrl(rawUrl, baseHref = '') {
+    const raw = String(rawUrl || '').trim();
+    if (!raw) return { kind: 'default', url: '' };
+    if (/^(data|blob):/i.test(raw)) return { kind: 'bytes', url: raw };
+    let parsed;
+    try { parsed = new URL(raw, baseHref || undefined); } catch { return { kind: 'default', url: raw }; }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return { kind: 'default', url: raw };
+    let sameOrigin = false;
+    try { sameOrigin = Boolean(baseHref) && parsed.origin === new URL(baseHref).origin; } catch {}
+    if (sameOrigin && (parsed.pathname === '/api/files/download'
+        || parsed.pathname.startsWith('/api/extensions/')
+        || BRIDGE_ARTIFACTS_RE.test(parsed.pathname))) {
+        // Path-only form: the launcher guard re-joins it onto the loopback
+        // origin itself, exactly like the existing bridge callers pass it.
+        return { kind: 'file', url: parsed.pathname + parsed.search };
+    }
+    // Any other http(s) target ("leave the app" intent) belongs in the owner's
+    // real browser — including same-origin pages, which have no tab here.
+    return { kind: 'external', url: parsed.href };
+}
+
+function bridgeFilenameFromUrl(url, fallback = 'download') {
+    try {
+        const parsed = new URL(url, 'http://localhost');
+        const fromQuery = parsed.searchParams.get('path') || '';
+        const candidate = decodeURIComponent((fromQuery || parsed.pathname).split('/').pop() || '');
+        return candidate || fallback;
+    } catch { return fallback; }
+}
+
+function filenameForMime(mime) {
+    const ext = String(mime || '').split('/')[1]?.split(/[+;]/)[0]?.toLowerCase() || '';
+    return `download.${/^[a-z0-9]{1,10}$/.test(ext) ? ext : 'bin'}`;
+}
+
+function base64FromArrayBuffer(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(binary);
+}
+
+async function shellBytesPayload(url, filename, win) {
+    if (/^data:/i.test(url)) {
+        const comma = url.indexOf(',');
+        const meta = comma >= 0 ? url.slice(5, comma) : '';
+        if (/;base64$/i.test(meta)) {
+            return {
+                name: filename || filenameForMime(meta.split(';')[0]),
+                b64: url.slice(comma + 1).replace(/\s+/g, ''),
+            };
+        }
+    }
+    // blob: URLs and non-base64 data: URLs: let fetch decode them.
+    const fetcher = typeof win?.fetch === 'function' ? win.fetch.bind(win) : fetch;
+    const blob = await (await fetcher(url)).blob();
+    return {
+        name: filename || filenameForMime(blob.type),
+        b64: base64FromArrayBuffer(await blob.arrayBuffer()),
+    };
+}
+
+async function copyShellLink(url, win, doc) {
+    try {
+        if (!win.navigator?.clipboard?.writeText) throw new Error('no async clipboard');
+        await win.navigator.clipboard.writeText(url);
+    } catch {
+        const area = doc.createElement('textarea');
+        area.value = url;
+        area.setAttribute('readonly', '');
+        doc.body.appendChild(area);
+        try {
+            area.select();
+            const copied = typeof doc.execCommand === 'function' && doc.execCommand('copy') === true;
+            if (!copied) throw new Error('Clipboard access is unavailable');
+        } finally {
+            area.remove();
+        }
+    }
+}
+
+async function routeShellUrl(kind, url, deps) {
+    const { api, win, doc, toast, openFile, downloadFile, filename = '', wantsDownload = false } = deps;
+    try {
+        if (kind === 'file') {
+            const name = filename || bridgeFilenameFromUrl(url);
+            if (wantsDownload) await downloadFile(url, name);
+            else await openFile(url, name);
+        } else if (kind === 'external') {
+            if (api?.open_external_url) {
+                const result = await api.open_external_url(url);
+                if (!result?.ok) throw new Error(result?.error || 'open failed');
+            } else {
+                // Old packaged launcher without open_external_url: hand the
+                // owner the link instead of leaving a silently dead control.
+                await copyShellLink(url, win, doc);
+                toast('Link copied — open it in your browser.', 'info');
+            }
+        } else if (kind === 'bytes') {
+            if (!api?.save_bytes_to_downloads) {
+                toast("Saving isn't available in the app — open in a browser.", 'warn');
+                return;
+            }
+            const payload = await shellBytesPayload(url, filename, win);
+            const result = await api.save_bytes_to_downloads(payload.name, payload.b64);
+            if (!result?.ok) throw new Error(result?.error || 'save failed');
+            const saved = String(result.path || '').split(/[\\/]/).pop() || payload.name;
+            toast(`Saved to Downloads: ${saved}`, 'ok');
+        }
+    } catch (error) {
+        toast(`Could not ${kind === 'bytes' ? 'save file' : 'open link'}: ${error?.message || error}`, 'error');
+    }
+}
+
+/**
+ * Install the shell-only interceptor. Idempotence and browser neutrality:
+ * installs at most once per document/window pair, and only when the pywebview
+ * bridge is (or becomes) present.
+ */
+export function installDesktopShellLinkInterceptor({
+    win = window,
+    doc = document,
+    toast = showToast,
+    openFile = openViaHostBridge,
+    downloadFile = downloadViaHostBridge,
+} = {}) {
+    let installed = false;
+    const install = () => {
+        if (installed) return;
+        installed = true;
+        const nativeOpen = typeof win.open === 'function' ? win.open.bind(win) : () => null;
+        const deps = (extra) => ({
+            api: win.pywebview?.api, win, doc, toast, openFile, downloadFile, ...extra,
+        });
+        // With NO file-bridge method at all, openViaHostBridge/downloadViaHostBridge
+        // fall back to window.open / anchor clicks — which would re-enter this
+        // interceptor. Keep the native default for that (ancient-launcher) case.
+        const fileBridgeReady = (api) => Boolean(api?.open_file_with_default_app || api?.download_file_to_downloads);
+        doc.addEventListener('click', (event) => {
+            const api = win.pywebview?.api;
+            if (!api || event.defaultPrevented) return;
+            const anchor = typeof event.target?.closest === 'function' ? event.target.closest('a[href]') : null;
+            if (!anchor) return;
+            const wantsDownload = anchor.hasAttribute('download');
+            if (anchor.getAttribute('target') !== '_blank' && !wantsDownload) return;
+            const { kind, url } = classifyShellUrl(anchor.getAttribute('href'), win.location?.href);
+            if (kind === 'default' || (kind === 'file' && !fileBridgeReady(api))) return;
+            event.preventDefault();
+            void routeShellUrl(kind, url, deps({
+                wantsDownload,
+                filename: String(anchor.getAttribute('download') || ''),
+            }));
+        });
+        win.open = (url, target, features) => {
+            const api = win.pywebview?.api;
+            const { kind, url: routed } = api
+                ? classifyShellUrl(url, win.location?.href)
+                : { kind: 'default', url };
+            if (kind === 'default' || (kind === 'file' && !fileBridgeReady(api))) {
+                return nativeOpen(url, target, features);
+            }
+            void routeShellUrl(kind, routed, deps({}));
+            return null;
+        };
+    };
+    if (win.pywebview?.api) install();
+    else win.addEventListener?.('pywebviewready', install, { once: true });
 }
 
 /**

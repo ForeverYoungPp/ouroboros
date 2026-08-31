@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -1433,8 +1434,8 @@ def main():
             raise ValueError("desktop file access is limited to the local Ouroboros server")
         if parsed.port != actual_port:
             raise ValueError("file URL port must match the local Ouroboros server")
-        if parsed.path != "/api/files/download" and not parsed.path.startswith("/api/extensions/"):
-            raise ValueError("file URL path must be /api/files/download or /api/extensions/<skill>/...")
+        if parsed.path != "/api/files/download" and not parsed.path.startswith(("/api/extensions/", "/api/tasks/")):
+            raise ValueError("file URL path must be /api/files/download, /api/extensions/<skill>/... or /api/tasks/...")
         return full_url
 
     def _unique_bridge_target(directory: pathlib.Path, filename: str) -> pathlib.Path:
@@ -1504,6 +1505,22 @@ def main():
                 return {"ok": True, "path": str(target)}
             except Exception as exc:
                 log.warning("Desktop file download failed: %s", exc, exc_info=True)
+                return {"ok": False, "error": str(exc)}
+
+        def open_external_url(self, url: str) -> dict:
+            raw = str(url or "")
+            if not raw.lower().startswith(("http://", "https://")):
+                return {"ok": False, "error": "Only absolute http:// or https:// links can be opened."}
+            _open_browser_detached(raw)
+            return {"ok": True}
+
+        def save_bytes_to_downloads(self, filename: str, b64: str) -> dict:
+            try:
+                target = _unique_bridge_target(pathlib.Path.home() / "Downloads", filename)
+                target.write_bytes(base64.b64decode(str(b64 or ""), validate=True))
+                return {"ok": True, "path": str(target)}
+            except Exception as exc:
+                log.warning("Desktop save-to-Downloads failed: %s", exc, exc_info=True)
                 return {"ok": False, "error": str(exc)}
 
         def open_file_with_default_app(self, url: str, filename: str) -> dict:

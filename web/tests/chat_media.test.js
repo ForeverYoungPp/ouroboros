@@ -372,6 +372,31 @@ test('media and document builders render upgraded DOM shapes with type-anchored 
     }
 });
 
+test('file dialog and photo menu expose no Share action (owner removal)', async () => {
+    const fx = fixture();
+    try {
+        const bubble = fx.controller.buildDocumentBubble({
+            type: 'document', role: 'assistant', filename: 'notes.txt', mime: 'text/plain',
+            file_base64: 'aGVsbG8=', ts: '2026-08-30T00:00:00Z',
+        });
+        await bubble.querySelector('.chat-file-card').click();
+        const dialog = globalThis.document.body.querySelector('.chat-file-dialog');
+        assert.ok(dialog, 'card click creates the action dialog');
+        assert.ok(dialog.querySelector('[data-file-action="download"]'));
+        assert.ok(dialog.querySelector('[data-file-action="close"]'));
+        assert.equal(dialog.querySelector('[data-file-action="share"]'), null,
+            'Share was removed everywhere by owner decision');
+        const photo = fx.controller.buildMediaBubble({
+            type: 'photo', role: 'assistant', image_base64: 'aGVsbG8=', mime: 'image/png',
+        });
+        assert.ok(photo.querySelector('[data-photo-action="copy"]'));
+        assert.equal(photo.querySelector('[data-photo-action="share"]'), null);
+    } finally {
+        fx.controller.destroy();
+        fx.restore();
+    }
+});
+
 test('video download filename follows the validated MIME subtype', async () => {
     const fx = fixture();
     const originalCreateObjectURL = URL.createObjectURL;
