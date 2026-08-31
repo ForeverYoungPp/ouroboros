@@ -46,7 +46,7 @@ def _normalize_browser_engine(engine: str = "") -> str:
 # Subagent browse restrictions (no loopback/private/non-HTTP) apply to ALL
 # delegated subagents — read-only, acting, and fail-closed missing-constraint.
 # Same fail-closed predicate as secret/control READ denials (SSOT in tools.core).
-from ouroboros.tools.core import is_restricted_subagent_profile as _readonly_subagent
+from ouroboros.tools.core import is_restricted_subagent_profile as _readonly_subagent  # noqa: E402
 
 
 def _is_subagent_blocked_browser_url(url: str, ctx: Any = None) -> bool:
@@ -506,9 +506,9 @@ def _ensure_browser(ctx: ToolContext, *, engine: str = "chromium", device: str =
     stored_device = getattr(bs, "_browser_device", "")
 
     if stored_thread_id is not None and stored_thread_id != current_thread_id:
-        log.info("Thread switch detected (old=%s, new=%s). Tearing down browser for this context.",
+        log.info("Thread switch detected (old=%s, new=%s). Detaching browser for this context.",
                  stored_thread_id, current_thread_id)
-        cleanup_browser(ctx)
+        _detach_browser(ctx)
     elif bs.browser is not None and (
         stored_engine != engine
         or stored_device.lower() != requested_device.lower()
@@ -586,30 +586,15 @@ def _ensure_browser(ctx: ToolContext, *, engine: str = "chromium", device: str =
     return bs.page
 
 
-def cleanup_browser(ctx: ToolContext) -> None:
-    """Close page/browser and stop the Playwright instance."""
+def _detach_browser(ctx: ToolContext) -> tuple[Any, Any, Any, Any]:
+    """Remove browser handles from shared state without touching Playwright."""
     bs = ctx.browser_state
-    try:
-        if bs.page is not None:
-            bs.page.close()
-    except Exception:
-        log.debug("Failed to close browser page during cleanup", exc_info=True)
-    try:
-        browser_context = getattr(bs, "_browser_context", None)
-        if browser_context is not None:
-            browser_context.close()
-    except Exception:
-        log.debug("Failed to close browser context during cleanup", exc_info=True)
-    try:
-        if bs.browser is not None:
-            bs.browser.close()
-    except Exception:
-        log.debug("Failed to close browser during cleanup", exc_info=True)
-    try:
-        if bs.pw_instance is not None:
-            bs.pw_instance.stop()
-    except Exception:
-        log.debug("Failed to stop Playwright instance during cleanup", exc_info=True)
+    handles = (
+        bs.page,
+        getattr(bs, "_browser_context", None),
+        bs.browser,
+        bs.pw_instance,
+    )
     bs.page = None
     bs.browser = None
     bs.pw_instance = None
@@ -617,6 +602,37 @@ def cleanup_browser(ctx: ToolContext) -> None:
     setattr(bs, "_browser_context", None)
     setattr(bs, "_browser_engine", "")
     setattr(bs, "_browser_device", "")
+    return handles
+
+
+def cleanup_browser_handles(handles: tuple[Any, Any, Any, Any]) -> None:
+    """Close detached Playwright handles on the thread that owns them."""
+    page, browser_context, browser, pw_instance = handles
+    try:
+        if page is not None:
+            page.close()
+    except Exception:
+        log.debug("Failed to close browser page during cleanup", exc_info=True)
+    try:
+        if browser_context is not None:
+            browser_context.close()
+    except Exception:
+        log.debug("Failed to close browser context during cleanup", exc_info=True)
+    try:
+        if browser is not None:
+            browser.close()
+    except Exception:
+        log.debug("Failed to close browser during cleanup", exc_info=True)
+    try:
+        if pw_instance is not None:
+            pw_instance.stop()
+    except Exception:
+        log.debug("Failed to stop Playwright instance during cleanup", exc_info=True)
+
+
+def cleanup_browser(ctx: ToolContext) -> None:
+    """Detach and close the context's Playwright handles."""
+    cleanup_browser_handles(_detach_browser(ctx))
 
 
 def _is_infrastructure_error(obj: Any) -> bool:
