@@ -269,3 +269,27 @@ test('typed terminal status is the phase authority even without a legacy status 
     assert.equal(taskOutcomeSeverity({ task_terminal_status: 'cancelled' }), 'cancelled');
     assert.equal(taskTerminalPhase({ task_terminal_status: 'completed' }), 'done');
 });
+
+test('removed direct/ephemeral rows come back as conclusions of record (#369)', () => {
+    const existing = new Map([
+        ['direct-turn', { activityId: 'direct-turn', kind: 'direct_chat', phase: 'thinking', startedAt: 100, clientMessageId: 'cm-1' }],
+        ['eph-turn', { activityId: 'eph-turn', kind: 'ephemeral_decision', phase: 'thinking', startedAt: 100 }],
+        ['done-before', { activityId: 'done-before', kind: 'direct_chat', phase: 'thinking', startedAt: 100 }],
+        ['still-live', { activityId: 'still-live', kind: 'direct_chat', phase: 'thinking', startedAt: 100 }],
+    ]);
+    const snapshot = [
+        { activity_id: 'still-live', chat_id: 1, kind: 'direct_chat', phase: 'thinking', started_at: 0.1 },
+    ];
+    const concluded = new Set(['done-before']);
+    const result = reconcileHydratedDirectActivities(existing, snapshot, 1, 5_000, concluded);
+    assert.deepEqual(
+        result.concludedDirectActivities,
+        [
+            { activityId: 'direct-turn', clientMessageId: 'cm-1' },
+            { activityId: 'eph-turn', clientMessageId: '' },
+        ],
+    );
+    // Already-concluded and still-live rows are never re-concluded.
+    assert.ok(!result.concludedDirectActivities.some((r) => r.activityId === 'done-before'));
+    assert.ok(!result.concludedDirectActivities.some((r) => r.activityId === 'still-live'));
+});

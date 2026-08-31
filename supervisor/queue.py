@@ -1051,6 +1051,7 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                     "blocked_admission": blocked_restore, "invalid_task_depth": invalid_depth_restore,
                 },
             )
+        sweep_orphaned_budget_fences(PENDING, BUDGET_ROOT_FENCES, DRIVE_ROOT)
         if restored > 0 or skipped_terminal > 0 or invalid_depth_restore:
             persist_queue_snapshot(reason="queue_restored")
         return restored
@@ -1081,6 +1082,10 @@ def _emit_cancel_task_done(
         workers.get_event_q().put({
                 "type": "task_done",
                 "task_id": str(task_id),
+                # The tree identity survives even though the row already left
+                # PENDING/RUNNING: the fence-release seam resolves the root
+                # from the event when the queue no longer holds the task.
+                "root_task_id": str((task or {}).get("root_task_id") or "") if isinstance(task, dict) else "",
                 "task_type": str((task or {}).get("type") or ""),
                 "chat_id": chat_id,
                 "status": status,
@@ -1116,6 +1121,7 @@ from supervisor.task_lifecycle import (  # noqa: E402, F401 -- intentional publi
 from supervisor.queue_transitions import (  # noqa: E402, F401 -- intentional public re-exports
     evolution_stop_report,
     stop_evolution_tasks,
+    sweep_orphaned_budget_fences,
 )
 
 

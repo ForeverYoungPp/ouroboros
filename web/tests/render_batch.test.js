@@ -292,9 +292,12 @@ test('the Load-older control is mounted ONLY while it has something to show', ()
 
 test('the Load-older control is excluded from viewport anchoring like typing', () => {
     // [GPT#13] the anchor must land on the first visible TIMESTAMPED node.
-    const fn = chatSource.slice(
-        chatSource.indexOf('function captureVisibleTimelineAnchor('),
-        chatSource.indexOf('function restoreVisibleTimelineAnchor('),
+    // The anchor pair lives in chat_render_batch.js (extracted verbatim from
+    // chat.js at the byte ratchet); the contract is unchanged.
+    const anchorSource = readFileSync(new URL('../modules/chat_render_batch.js', import.meta.url), 'utf8');
+    const fn = anchorSource.slice(
+        anchorSource.indexOf('function captureVisibleTimelineAnchor('),
+        anchorSource.indexOf('function restoreVisibleTimelineAnchor('),
     );
     assert.match(fn, /!node\.classList\.contains\('typing-bubble'\)/);
     assert.match(fn, /!node\.classList\.contains\('chat-load-older'\)/);

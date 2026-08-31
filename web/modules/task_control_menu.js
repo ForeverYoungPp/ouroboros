@@ -12,11 +12,12 @@
 // product-wide parity), so eligibility gates differ per surface but the
 // actions, endpoint bindings, request-id retry, and refusals do not.
 
-import { cancelTask, hurryTask } from './api_client.js';
+import { cancelTask, hurryTask, resumeTask } from './api_client.js';
 import { showToast } from './toast.js';
 
 export const ACTION_FINALIZE = 'finalize';
 export const ACTION_HURRY = 'hurry';
+export const ACTION_RESUME = 'resume';
 export const ACTION_STOP_NOW = 'stop_now';
 
 // Logical slots that may host multiple independent cycles (v6.82: shared so
@@ -47,6 +48,7 @@ export function cancelRunEligibility({
 export const TASK_CONTROL_LABELS = Object.freeze({
     [ACTION_FINALIZE]: 'Wrap up',
     [ACTION_HURRY]: 'Hurry up',
+    [ACTION_RESUME]: 'Resume',
     [ACTION_STOP_NOW]: 'Stop now',
 });
 
@@ -55,11 +57,32 @@ export const TASK_CONTROL_LABELS = Object.freeze({
  * @param {{cancelPending?: boolean}} [state]
  * @returns {string[]} ordered action ids
  */
-export function taskControlActions({ cancelPending = false } = {}) {
+export function taskControlActions({ cancelPending = false, budgetPaused = false } = {}) {
     // A pending cancel refuses hurry (HQ1) and a second soft stop is a no-op:
     // the single offered action is the hard escalation of the same intent.
     if (cancelPending) return [ACTION_STOP_NOW];
+    // A budget-paused member is not running: nothing to wrap up or hurry.
+    // The host-attested pause fact gates the offer; the server re-validates
+    // (replay_unsafe and sibling checks answer 409 with the reason).
+    if (budgetPaused) return [ACTION_RESUME, ACTION_STOP_NOW];
     return [ACTION_FINALIZE, ACTION_HURRY, ACTION_STOP_NOW];
+}
+
+export async function resumeTaskAction(taskId) {
+    const id = String(taskId || '');
+    if (!id || inFlight.has(id)) return;
+    inFlight.add(id);
+    try {
+        await resumeTask(id);
+        showToast('Resuming: the task returns to the queue.', 'info');
+    } catch (exc) {
+        // The server names the refusal (replay_unsafe / fence missing /
+        // not budget-paused): show it verbatim instead of a generic failure.
+        // Handled here, never rethrown: the menu callback is fire-and-forget.
+        showToast(`Resume refused: ${exc?.message || exc}`, 'error');
+    } finally {
+        inFlight.delete(id);
+    }
 }
 
 /**
@@ -293,7 +316,7 @@ function onMenuKeydown(event) {
  * @param {HTMLElement} anchor trigger element
  * @param {{cancelPending?: boolean, busy?: boolean, onAction: (action: string) => void}} opts
  */
-export function openTaskControlMenu(anchor, { cancelPending = false, busy = false, onAction } = {}) {
+export function openTaskControlMenu(anchor, { cancelPending = false, budgetPaused = false, busy = false, onAction } = {}) {
     closeTaskControlMenu();
     if (!anchor?.isConnected || !document.body) return null;
     // A11y: the trigger owns a popup menu; expanded tracks the open state.
@@ -302,7 +325,7 @@ export function openTaskControlMenu(anchor, { cancelPending = false, busy = fals
     const menu = document.createElement('div');
     menu.className = 'task-control-menu';
     menu.setAttribute('role', 'menu');
-    for (const action of taskControlActions({ cancelPending })) {
+    for (const action of taskControlActions({ cancelPending, budgetPaused })) {
         const item = document.createElement('button');
         item.type = 'button';
         item.className = `task-control-item${action === ACTION_STOP_NOW ? ' danger' : ''}`;

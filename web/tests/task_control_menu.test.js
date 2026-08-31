@@ -9,6 +9,7 @@ import { readFileSync } from 'node:fs';
 import {
     ACTION_FINALIZE,
     ACTION_HURRY,
+    ACTION_RESUME,
     ACTION_STOP_NOW,
     TASK_CONTROL_LABELS,
     TASK_CONTROL_TRIGGER_LABEL,
@@ -118,4 +119,19 @@ test('the chat card re-offers the escalation during a pending soft stop', () => 
     // stop keeps the button disabled until the terminal frame.
     assert.match(chat, /record\.cancelPendingPolicy === 'finalize'/);
     assert.match(chat, /cancelPending: Boolean\(record\.cancelPendingPolicy\)/);
+});
+
+// --- budget-paused resume offer (#322) ---
+
+test('a budget-paused member offers Resume and the stop escalation only', () => {
+    assert.deepEqual(
+        taskControlActions({ budgetPaused: true }),
+        [ACTION_RESUME, ACTION_STOP_NOW],
+    );
+    // A pending cancel outranks the pause: only the hard escalation remains.
+    assert.deepEqual(
+        taskControlActions({ budgetPaused: true, cancelPending: true }),
+        [ACTION_STOP_NOW],
+    );
+    assert.equal(TASK_CONTROL_LABELS[ACTION_RESUME], 'Resume');
 });

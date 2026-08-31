@@ -545,6 +545,7 @@ export function computeDerivedChatStatus({
     activeDirectCount = 0,
     activeManagedCount = 0,
     queuedManagedCount = 0,
+    pausedManagedCount = 0,
     pendingSubmissionsCount = 0,
 } = {}) {
     if (!isConnected) {
@@ -564,6 +565,11 @@ export function computeDerivedChatStatus({
     }
     if (queuedManagedCount > 0) {
         return { kind: 'thinking', text: 'Queued...', showDots: true };
+    }
+    if (pausedManagedCount > 0) {
+        // Budget-paused work is NOT running and will not start by itself:
+        // never dress it up as Working or Queued.
+        return { kind: 'online', text: 'Paused (budget)', showDots: false };
     }
     return { kind: 'online', text: 'Online', showDots: false };
 }
@@ -769,7 +775,9 @@ export function computeHydratedDirectActivities(
  * that can wake durable task-detail convergence: a host-stamped managed root
  * observed before this request, now absent from the GLOBAL snapshot. A root
  * still listed under another chat merely departed locally. Direct/ephemeral
- * removals still update header status without task-detail/card authority.
+ * removals carry no task-detail/card authority, but they ARE conclusions
+ * (#369): the caller records them so a late frame cannot resurrect the
+ * turn, and clears the linked Sending... submission.
  */
 export function reconcileHydratedDirectActivities(
     existingMap,
@@ -789,10 +797,23 @@ export function reconcileHydratedDirectActivities(
     }
     const departedManagedTaskIds = [];
     const disappearedManagedTaskIds = [];
+    const concludedDirectActivities = [];
     for (const [activityId, entry] of existingMap || []) {
-        if (String(entry?.kind || '') !== 'managed_task') continue;
         if (activities.has(activityId)) continue;
         if (concludedIds?.has(activityId)) continue;
+        if (String(entry?.kind || '') !== 'managed_task') {
+            // A direct/ephemeral row the authoritative snapshot no longer
+            // lists is settled: its live final was missed (ephemeral
+            // task_done frames never reach the card layer), so the snapshot
+            // is the conclusion of record.
+            if (!globallyActiveActivityIds.has(activityId)) {
+                concludedDirectActivities.push({
+                    activityId,
+                    clientMessageId: String(entry?.clientMessageId || ''),
+                });
+            }
+            continue;
+        }
         departedManagedTaskIds.push(activityId);
         if (globallyActiveActivityIds.has(activityId)) continue;
         disappearedManagedTaskIds.push(activityId);
@@ -801,6 +822,7 @@ export function reconcileHydratedDirectActivities(
         activities,
         departedManagedTaskIds,
         disappearedManagedTaskIds,
+        concludedDirectActivities,
         globallyActiveActivityIds,
     };
 }

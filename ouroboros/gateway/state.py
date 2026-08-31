@@ -214,6 +214,11 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None) -
         bindings = task_bindings if isinstance(task_bindings, dict) else {}
         with queue_mod._queue_lock:
             pending_rows = [dict(task) for task in queue_mod.PENDING]
+            fence_rows = {
+                str(key): dict(value)
+                for key, value in queue_mod.BUDGET_ROOT_FENCES.items()
+                if isinstance(value, dict)
+            }
             running_rows = [
                 (
                     str(task_id),
@@ -249,10 +254,15 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None) -
                 "started_at": started_at,
             }
 
+        from supervisor.queue_transitions import budget_pause_fact
+
         for row in pending_rows:
             task_id = str(row.get("id") or "")
             if task_id and _is_root(task_id, row):
-                activities.append(_activity(task_id, row, "queued", _epoch_or_zero(row.get("queued_at"))))
+                # #322 (P1): a budget-paused member must not masquerade as
+                # "queued" — nothing will dispatch it until an explicit resume.
+                phase = "budget_paused" if budget_pause_fact(row, fence_rows) else "queued"
+                activities.append(_activity(task_id, row, phase, _epoch_or_zero(row.get("queued_at"))))
         for task_id, row, started_at in running_rows:
             if task_id and _is_root(task_id, row):
                 phase = "finalizing" if _managed_task_finalizing(drive_root, task_id) else "working"

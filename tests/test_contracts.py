@@ -385,12 +385,23 @@ def _collect_literal_progress_meta_keys(source_path: pathlib.Path) -> set[str]:
             for target in node.targets:
                 if (
                     isinstance(target, ast.Subscript)
-                    and isinstance(target.value, ast.Name)
-                    and target.value.id == "progress_meta"
                     and isinstance(target.slice, ast.Constant)
                     and isinstance(target.slice.value, str)
                 ):
-                    keys.add(target.slice.value)
+                    base = target.value
+                    if isinstance(base, ast.Name) and base.id == "progress_meta":
+                        keys.add(target.slice.value)
+                    # evt.setdefault("progress_meta", {})["key"] = ... — the
+                    # in-place producer idiom (task_finalization stamps).
+                    elif (
+                        isinstance(base, ast.Call)
+                        and isinstance(base.func, ast.Attribute)
+                        and base.func.attr == "setdefault"
+                        and base.args
+                        and isinstance(base.args[0], ast.Constant)
+                        and base.args[0].value == "progress_meta"
+                    ):
+                        keys.add(target.slice.value)
         elif isinstance(node, ast.Call):
             func = node.func
             if (
@@ -514,8 +525,10 @@ def test_chat_outbound_declares_progress_meta_keys_used_by_runtime():
     progress_keys: set[str] = set()
     for rel in (
         "supervisor/events.py",
+        "supervisor/workers.py",
         "ouroboros/agent.py",
         "ouroboros/skill_lifecycle_queue.py",
+        "ouroboros/task_finalization.py",
     ):
         progress_keys.update(_collect_literal_progress_meta_keys(REPO_ROOT / rel))
 
