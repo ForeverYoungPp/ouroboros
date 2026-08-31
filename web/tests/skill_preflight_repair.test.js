@@ -139,19 +139,41 @@ test('the diagnosis covers widget, permission, and presence failures too', () =>
     assert.match(text, /^Preflight failed — /);
 });
 
-test('a stale review falls back to Re-review with Skip review available', () => {
+test('a stale recorded FAIL keeps Re-review primary and offers Repair from the menu (D11)', () => {
     // The backend gate reports preflight_failed=false for a stale state (the
-    // persisted failure belongs to the previous payload bytes) — the card
-    // must offer the cheap Re-review and re-surface owner attestation.
+    // persisted failure belongs to the previous payload bytes) and carries the
+    // typed preflight_failed_stale companion — the card keeps the cheap
+    // Re-review primary, re-surfaces owner attestation, and additionally
+    // offers Repair based on the last recorded preflight.
     const html = renderInstalledSkillCard(preflightSkill({
         source: 'self_authored',
         is_self_authored: true,
         review_stale: true,
-        review_gate: { executable_review: false, preflight_failed: false, stale: true },
+        review_gate: {
+            executable_review: false, preflight_failed: false,
+            preflight_failed_stale: true, stale: true,
+        },
+    }));
+    assert.match(html, /skills-primary-action[^>]*data-skill-action="rereview"[^>]*>Re-review</);
+    assert.doesNotMatch(html, /skills-primary-action[^>]*>Repair</);
+    assert.match(html, /skills-menu-item skills-repair-stale[^>]*data-skill-action="repair"[^>]*>Repair</);
+    assert.match(html, /based on the last recorded preflight/);
+    assert.match(html, /Skip review/);
+});
+
+test('a stale review without a recorded FAIL offers no Repair anywhere', () => {
+    const html = renderInstalledSkillCard(preflightSkill({
+        source: 'self_authored',
+        is_self_authored: true,
+        review_stale: true,
+        review_gate: {
+            executable_review: false, preflight_failed: false,
+            preflight_failed_stale: false, stale: true,
+        },
+        review_findings: [],
     }));
     assert.match(html, />Re-review</);
     assert.doesNotMatch(html, /data-skill-action="repair"[^>]*>Repair</);
-    assert.match(html, /Skip review/);
 });
 
 test('self-authored instruction skill offers Make runnable in the menu', () => {

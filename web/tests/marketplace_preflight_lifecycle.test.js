@@ -41,3 +41,30 @@ test('plain pending install keeps the Review action', () => {
     assert.equal(lifecycle.action, 'review');
     assert.equal(lifecycle.button, 'Review');
 });
+
+test('a stale recorded FAIL keeps Re-review primary with the recorded diagnosis (D11)', () => {
+    const installed = installedWithPreflightFail();
+    installed.review_stale = true;
+    installed.review_gate = {
+        executable_review: false, preflight_failed: false, preflight_failed_stale: true,
+    };
+    const lifecycle = lifecycleFor({}, installed, null);
+    assert.equal(lifecycle.action, 'review');
+    assert.equal(lifecycle.button, 'Re-review');
+    assert.equal(lifecycle.label, 'Review stale');
+    assert.match(lifecycle.hint, /Last recorded preflight/);
+    assert.match(lifecycle.hint, /missing or escaping entry: plugin\.py/);
+});
+
+test('a stale review without a recorded FAIL keeps the generic stale branch', () => {
+    const installed = installedWithPreflightFail();
+    installed.review_stale = true;
+    installed.review_gate = {
+        executable_review: false, preflight_failed: false, preflight_failed_stale: false,
+    };
+    installed.review_findings = [];
+    const lifecycle = lifecycleFor({}, installed, null);
+    assert.equal(lifecycle.action, 'review');
+    assert.equal(lifecycle.button, 'Re-review');
+    assert.doesNotMatch(String(lifecycle.hint || ''), /Last recorded preflight/);
+});
