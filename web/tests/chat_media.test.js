@@ -459,6 +459,29 @@ test('copy fallback reports failure when execCommand is unavailable', async () =
     }
 });
 
+test('copy control is an always-visible icon button that marks the bubble (D12)', async () => {
+    const fx = fixture();
+    try {
+        const bubble = new NodeStub('div', fx.tracker);
+        const button = fx.controller.attachCopyControl(bubble, 'raw message');
+
+        assert.equal(button.type, 'button');
+        assert.equal(button.title, 'Copy');
+        assert.equal(button.attributes.get('aria-label'), 'Copy message');
+        assert.ok(button.querySelector('svg'), 'inline copy-icon SVG is present');
+        assert.match(button.innerHTML, /currentColor/);
+        assert.equal(bubble.classList.contains('has-copy'), true,
+            'bubble carries has-copy so CSS reserves the timestamp gutter');
+
+        await button.click();
+        assert.equal(button.textContent, '✓', 'success swaps the icon for a checkmark');
+        assert.equal(button.attributes.get('aria-label'), 'Message copied');
+    } finally {
+        fx.controller.destroy();
+        fx.restore();
+    }
+});
+
 test('reset disposes listeners, stops players, clears groups, and destroy is final', () => {
     const fx = fixture();
     try {
