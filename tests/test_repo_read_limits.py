@@ -350,6 +350,7 @@ def test_triad_review_prompt_includes_architecture_md(tmp_path):
         anti_pattern_lock_guard="LOCK",
         checklist_section="CHECKLIST",
         dev_guide_text="DEVGUIDE",
+        design_text="DESIGNGUIDE",
         architecture_section=arch_text,
     ) + _REVIEW_PROMPT_TEMPLATE_DYNAMIC.format(
         goal_section="GOAL",
