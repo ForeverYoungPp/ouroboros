@@ -6,9 +6,13 @@ import types
 
 import pytest
 
-from ouroboros.contracts.task_constraint import TaskConstraint
 import ouroboros.tools.browser as browser_mod
-from ouroboros.tools.browser import _is_infrastructure_error, cleanup_browser
+from ouroboros.contracts.task_constraint import TaskConstraint
+from ouroboros.tools.browser import (
+    _is_infrastructure_error,
+    cleanup_browser,
+    cleanup_browser_handles,
+)
 
 
 class TestInfrastructureErrorDetection:
@@ -424,6 +428,7 @@ class TestSetPlaywrightBrowsersPathIfBundled:
 
     def test_browser_install_uses_data_cache_when_zero_has_no_browser(self, monkeypatch, tmp_path):
         import os
+
         import ouroboros.tools.browser as bmod
 
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "0")
@@ -456,6 +461,7 @@ class TestSetPlaywrightBrowsersPathIfBundled:
 
     def test_webkit_install_uses_data_cache_when_zero_has_no_bundled_webkit(self, monkeypatch, tmp_path):
         import os
+
         import ouroboros.tools.browser as bmod
 
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "0")
@@ -488,6 +494,7 @@ class TestSetPlaywrightBrowsersPathIfBundled:
 
     def test_webkit_cache_fallback_does_not_strand_bundled_chromium(self, monkeypatch, tmp_path):
         import os
+
         import ouroboros.tools.browser as bmod
 
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "0")
@@ -534,6 +541,7 @@ class TestSetPlaywrightBrowsersPathIfBundled:
 
     def test_frozen_missing_bundled_engine_installs_with_embedded_python(self, monkeypatch, tmp_path):
         import os
+
         import ouroboros.tools.browser as bmod
 
         embedded_python_posix = tmp_path / "python-standalone" / "bin" / "python3"
@@ -576,6 +584,7 @@ class TestSetPlaywrightBrowsersPathIfBundled:
 
     def test_readonly_missing_bundled_engine_does_not_create_cache(self, monkeypatch, tmp_path):
         import os
+
         import ouroboros.tools.browser as bmod
 
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "0")
@@ -611,6 +620,7 @@ class TestSetPlaywrightBrowsersPathIfBundled:
 
     def test_readonly_existing_webkit_cache_is_reused_without_install(self, monkeypatch, tmp_path):
         import os
+
         import ouroboros.tools.browser as bmod
 
         cache = tmp_path / "data" / "playwright-browsers"
@@ -663,3 +673,32 @@ class TestCleanupBrowser:
         assert ctx.browser_state.page is None
         assert ctx.browser_state.browser is None
         assert ctx.browser_state.pw_instance is None
+
+    def test_cleanup_detached_handles_closes_in_order_on_the_calling_thread(self):
+        # Thread-affinity is the CALLER's contract (the settlement callback
+        # runs on the worker thread that owns the handles); this test pins
+        # the close order and records the executing thread honestly.
+        import threading
+
+        calls = []
+        threads = set()
+
+        def _mark(name):
+            def _inner():
+                threads.add(threading.get_ident())
+                calls.append(name)
+            return _inner
+
+        handles = (
+            types.SimpleNamespace(close=_mark("page")),
+            types.SimpleNamespace(close=_mark("context")),
+            types.SimpleNamespace(close=_mark("browser")),
+            types.SimpleNamespace(stop=_mark("playwright")),
+        )
+        worker = threading.Thread(target=cleanup_browser_handles, args=(handles,))
+        worker.start()
+        worker.join()
+        assert calls == ["page", "context", "browser", "playwright"]
+        # Every close ran on the SAME (calling) thread — never hopped back
+        # to the main thread.
+        assert threads == {worker.ident}

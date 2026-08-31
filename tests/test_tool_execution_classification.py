@@ -1,6 +1,34 @@
 from ouroboros.loop_tool_execution import _extract_result_metadata, _is_tool_execution_failure
 
 
+def test_late_tool_settlement_runs_owner_cleanup_before_lease_close(monkeypatch):
+    from types import SimpleNamespace
+
+    import ouroboros.loop_tool_execution as lte
+
+    class ImmediateFuture:
+        def add_done_callback(self, callback):
+            callback(self)
+
+    calls = []
+    monkeypatch.setattr(lte, "emit_cognitive_operation_event",
+                        lambda *args, **kwargs: calls.append("lease"))
+    tools = SimpleNamespace(_ctx=SimpleNamespace(event_queue=None, task_attempt=None))
+
+    lte._attach_late_tool_settlement(
+        tools,
+        ImmediateFuture(),
+        task_id="task",
+        tool_call_id="call",
+        correlation={},
+        on_settled=lambda: calls.append("cleanup"),
+    )
+
+    # The ORDER is the contract: the owner-thread cleanup runs before the
+    # cognitive lease closes, so a settled lease never precedes live handles.
+    assert calls == ["cleanup", "lease"]
+
+
 def test_get_tool_timeout_honors_per_call_override(monkeypatch):
     """T3 (v6.35.0): the OUTER tool-execution timeout must rise for a per-call
     run_command/run_script timeout_sec, else the static 360s entry cap would cut
@@ -226,6 +254,7 @@ def test_live_tool_log_payload_includes_structured_result_metadata(tmp_path, mon
     import pathlib
     import time
     from types import SimpleNamespace
+
     import ouroboros.loop_tool_execution as loop_tool_execution
     from ouroboros.loop_tool_execution import _execute_with_timeout
 
@@ -302,3 +331,79 @@ def test_reviewed_mutator_soft_timeout_keeps_foreground_custody(tmp_path, monkey
     started = next(payload for payload in payloads if payload.get("type") == "tool_call_started")
     assert started.get("terminal_wait") is True and started.get("timeout_sec") is None
     assert not any(payload.get("type") == "tool_call_timeout" for payload in payloads)
+
+
+
+def test_timed_out_stateful_tool_detaches_and_closes_once_at_settlement(monkeypatch):
+    """The #409 wiring: a stateful-tool timeout detaches the browser handles
+    from the context IMMEDIATELY (no cross-thread Playwright calls) and closes
+    them EXACTLY ONCE when the hung worker finally settles."""
+    from types import SimpleNamespace
+
+    import ouroboros.loop_tool_execution as lte
+
+    closed = []
+    page = SimpleNamespace(close=lambda: closed.append("page"))
+    context = SimpleNamespace(close=lambda: closed.append("context"))
+    chromium = SimpleNamespace(close=lambda: closed.append("browser"))
+    pw = SimpleNamespace(stop=lambda: closed.append("playwright"))
+
+    bs = SimpleNamespace(page=page, browser=chromium, pw_instance=pw)
+    setattr(bs, "_browser_context", context)
+    setattr(bs, "_thread_id", 1)
+    tool_ctx = SimpleNamespace(browser_state=bs)
+
+    class HungFuture:
+        def __init__(self):
+            self.callbacks = []
+
+        def result(self, timeout=None):
+            raise TimeoutError()
+
+        def add_done_callback(self, callback):
+            self.callbacks.append(callback)
+
+    future = HungFuture()
+
+    class FakeExecutor:
+        def submit(self, *args, **kwargs):
+            return future
+
+        def reset(self):
+            pass
+
+    monkeypatch.setattr(lte, "emit_cognitive_operation_event", lambda *a, **k: None)
+    monkeypatch.setattr(lte, "_emit_live_log", lambda *a, **k: None)
+    monkeypatch.setattr(
+        lte, "_make_timeout_result",
+        lambda *a, **k: {"tool_call_id": "call", "result": "timeout", "is_error": True},
+    )
+    tools = SimpleNamespace(
+        _ctx=SimpleNamespace(event_queue=None, task_attempt=None,
+                             browser_state=tool_ctx.browser_state),
+        get_timeout=lambda name: 1,
+        CODE_TOOLS=set(),
+    )
+    tools._ctx.browser_state = bs
+    tc = {"id": "call", "function": {"name": "browse_page", "arguments": "{}"}}
+    monkeypatch.setattr(lte, "load_settings", lambda: {})
+    monkeypatch.delenv("OUROBOROS_TOOL_TIMEOUT_SEC", raising=False)
+
+    import pathlib as _pl
+
+    result = lte._execute_with_timeout(
+        tools, tc, _pl.Path("."), 1, task_id="task",
+        stateful_executor=FakeExecutor(),
+    )
+    assert result["is_error"] is True
+    # Handles are DETACHED from the context immediately (no live session left
+    # for a new thread to trip over)...
+    assert tool_ctx.browser_state.page is None
+    assert tool_ctx.browser_state.pw_instance is None
+    # ...and nothing is closed until the hung worker settles.
+    assert closed == []
+    assert len(future.callbacks) == 1
+    future.callbacks[0](future)
+    assert closed == ["page", "context", "browser", "playwright"]
+    # Settling again must not double-close (the callback fires once per
+    # future by contract; the handles tuple is single-use).
