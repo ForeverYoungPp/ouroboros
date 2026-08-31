@@ -7,8 +7,12 @@ EXISTING identities per family instead of minting a durable registry:
 - ``quiz:{task_id}:{quiz_id}`` — served here (#Q-2b);
 - ``routing:{client_message_id}:{routing_token}`` — the #198 picker family,
   dispatched to ``gateway/routing_decision.py``;
-- ``interaction:{task_id}:{run_id}:{interaction_id}`` — the #204 family,
-  typed as not-served until that lane lands.
+- ``interaction:{task_id}:{run_id}:{interaction_id}`` — RESERVED. #204 is
+  served by the escalation hierarchy instead (owner decision 31): a delegated
+  run's question wakes its nanny, who answers from task context via
+  delegate_answer or escalates upward with the escalate verb — the owner sees
+  a quiz card only when no ancestor answers, so no direct interaction card
+  exists and this family stays a typed 501.
 
 The quiz path mirrors the hurry ingress split (``gateway/task_hurry.py``):
 projection write first (request-id idempotent, first answer wins), then the
@@ -144,8 +148,9 @@ async def api_decision_answer(request: Request) -> JSONResponse:
             400, reason_code="unknown_decision_family",
         )
     if family not in _SERVED_FAMILIES:
-        # Typed, honest: the family exists in the contract but its server
-        # half has not landed (interaction → #204).
+        # Typed, honest: the interaction family is RESERVED — #204 is served
+        # by the escalation hierarchy (see the module docstring), so no direct
+        # owner interaction card exists by design.
         return json_error(
             f"the {family} decision family is not served yet",
             501, reason_code="decision_family_not_served",

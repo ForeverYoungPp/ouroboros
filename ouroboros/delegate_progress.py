@@ -602,7 +602,7 @@ def window_payload(
 
     ``pending_interactions`` is the caller's BOUNDED question projection (B4): a
     known question the model chose not to answer keeps riding every expiry payload
-    beside the ``waiting_on_user`` boolean, so a nanny that escalated to its human
+    beside the ``waiting_on_user`` boolean, so a nanny that escalated up the hierarchy
     is re-shown what the run is paused on instead of a bare flag. MEASURED into
     the payload in BOTH branches (F2) — through ``_fitted_pending``'s shed
     discipline, before the advance list is sized — so it can never push the
@@ -628,7 +628,9 @@ def window_payload(
         payload["note"] = (
             ("The run is alive and PAUSED on the question(s) it already asked "
              "(waiting_on_user; see pending_interactions). Decide: answer with "
-             "delegate_answer, escalate to your human via a progress message, or "
+             "delegate_answer, escalate an above-authority question with the "
+             "escalate verb (parent-first; the reply reaches your mailbox on a "
+             "later round), or "
              f"keep waiting (call again) — {waiting_expiry_clause(pending_interactions)}. "
              "Do not cancel a run merely because it asked a question.")
             if waiting_on_user else
@@ -690,7 +692,8 @@ def window_payload(
         # The expiry claim is keyed on the rows' own timeout_at (R2-7e).
         payload["note"] += (
             " The run is PAUSED on a question: answer it (delegate_answer), "
-            f"escalate to your human, or keep waiting — "
+            "raise it with the escalate verb (parent-first) if it is above "
+            f"your authority, or keep waiting — "
             f"{waiting_expiry_clause(pending_interactions)}; do not cancel over it."
         )
     return payload
