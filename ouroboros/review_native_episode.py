@@ -262,10 +262,21 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         scratch = tempfile.mkdtemp(prefix="ouro-native-review-")
         registry = None
         total_usage: Dict[str, Any] = {}
-        transcript_chars = len(self.episode_prompt)
         final_answer: Optional[str] = None
         try:
             registry, schemas = self._inspection_registry(root, scratch)
+            # The counter measures what every send actually carries: the
+            # system instructions and the tool schemas ride EVERY provider
+            # call, and tool-call argument objects accumulate in `messages`
+            # exactly like results do. Counting only prompt+content+results
+            # understated each send by the fixed system/schema cost and let
+            # the argument tail drift past the promised bound unmeasured.
+            # Units are CHARS throughout — same as the cap.
+            transcript_chars = (
+                len(self.episode_prompt)
+                + len(_NATIVE_REVIEW_INSTRUCTIONS)
+                + len(json.dumps(schemas, ensure_ascii=False, default=str))
+            )
             messages: List[Dict[str, Any]] = [
                 {"role": "system", "content": _NATIVE_REVIEW_INSTRUCTIONS},
                 {"role": "user", "content": self.episode_prompt},
@@ -337,6 +348,13 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                         total_usage[_fact] = usage[_fact]
                 content = str(msg.get("content") or "") if isinstance(msg, dict) else ""
                 transcript_chars += len(content)
+                # Tool-call objects (names + argument JSON) join `messages`
+                # below and ride every later send — the cumulative half of
+                # the previous under-count.
+                transcript_chars += sum(
+                    len(json.dumps(tc, ensure_ascii=False, default=str))
+                    for tc in tool_calls if isinstance(tc, dict)
+                )
                 if content and not tool_calls:
                     final_answer = content
                     break
@@ -349,6 +367,8 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                 assistant.setdefault("role", "assistant")
                 messages.append(assistant)
                 for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue  # a non-dict tool_call is malformed provider output, not a crash
                     call_id = str(tc.get("id") or "")
                     function = tc.get("function") if isinstance(tc, dict) else {}
                     name = str((function or {}).get("name") or "")

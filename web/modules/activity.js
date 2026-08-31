@@ -10,10 +10,12 @@ import { openConfirmDialog } from './confirm_dialog.js';
 import { taskCancelPending } from './log_events.js';
 import {
     ACTION_HURRY,
+    ACTION_RESUME,
     TASK_CONTROL_TRIGGER_LABEL,
     hurryTaskAction,
     openTaskControlMenu,
     requestStop,
+    resumeTaskAction,
     taskControlBusy,
 } from './task_control_menu.js';
 import { showToast } from './toast.js';
@@ -50,19 +52,30 @@ export function initActivity({ mount, ws } = {}) {
     function renderQueue(queue) {
         const running = (queue && Array.isArray(queue.running)) ? queue.running : [];
         const pending = (queue && Array.isArray(queue.pending)) ? queue.pending : [];
+        // #322: the snapshot already carries the pause truth — a member's own
+        // _budget_pause row, or a root fence covering its tree.
+        const fencedRoots = new Set(
+            ((queue && queue.budget_root_fences) || [])
+                .filter((f) => f && ['active', 'paused'].includes(String(f.status || '')))
+                .map((f) => String(f.root_task_id || '')));
+        const rowBudgetPaused = (q, t, kind) => kind === 'pending' && Boolean(
+            (t && t._budget_pause)
+            || fencedRoots.has(String((t && (t.root_task_id || t.id)) || q.id || '')));
         const row = (q, kind) => {
             const t = (q && q.task) || {};
             const id = esc(q.id || t.id || '');
             const label = esc(t.title || t.objective || t.text || q.type || id || 'task');
             const rt = kind === 'running' && q.runtime_sec != null ? ` · ${Math.round(q.runtime_sec)}s` : '';
-            const meta = `${esc(kind)}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
+            const paused = rowBudgetPaused(q, t, kind);
+            const kindLabel = paused ? 'paused (budget)' : kind;
+            const meta = `${esc(kindLabel)}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
             return `<div class="activity-row">
                 <div class="activity-row-main">
                     <span class="activity-name">${label}</span>
                     <span class="activity-sub">${meta}</span>
                 </div>
                 <div class="activity-row-actions">
-                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}">${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
+                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}"${paused ? ' data-budget-paused="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
                 </div>
             </div>`;
         };
@@ -162,6 +175,7 @@ export function initActivity({ mount, ws } = {}) {
             const stored = await getJson(`/api/tasks/${encodeURIComponent(id)}`);
             openTaskControlMenu(btn, {
                 cancelPending: taskCancelPending(stored),
+                budgetPaused: btn.dataset.budgetPaused === '1',
                 busy: taskControlBusy(id),
                 onAction: async (action) => {
                     busy = true;
@@ -169,6 +183,10 @@ export function initActivity({ mount, ws } = {}) {
                         if (action === ACTION_HURRY) {
                             // Local toast acknowledgement only — never a chat message.
                             await hurryTaskAction(id);
+                            return;
+                        }
+                        if (action === ACTION_RESUME) {
+                            await resumeTaskAction(id);
                             return;
                         }
                         // Same declared semantics as the chat card (v6.82): the

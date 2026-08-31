@@ -51,7 +51,7 @@ from ouroboros.skill_publish_result import apply_skill_publish_receipt_veto
 from ouroboros.task_finalization import (
     build_sealed_final_package,
     build_swarm_efficiency as _build_swarm_efficiency,  # moved (module ceiling); tests import it here
-    deliver_final_message_live, prepare_terminal_send_event, register_final_answer_owed,
+    deliver_final_message_live, prepare_terminal_send_event, register_final_answer_owed, stamp_root_final_phase,
     sealed_final_prompt_section, terminal_result_fields,
 )
 from ouroboros.dialogue_provenance import is_presence_task, presence_provenance_fields
@@ -760,13 +760,10 @@ def emit_task_results(
         # used to buffer the send with no delivery_id and no owed registration
         # at all. Seam + dedup: ouroboros/task_finalization.py.
         if _is_root_post_task(task) and not _presence:
-            if not _root_post_task_already_completed(env, task):
-                # The owner's answer leaves BEFORE post-task synthesis: the
-                # typed phase marker rides the frame (progress_meta merges
-                # into the WS chat payload) so the client holds the card on
-                # "Finalizing…" until the settled task_done, instead of
-                # reading the early final as the task's terminal conclusion.
-                send_event.setdefault("progress_meta", {})["task_phase"] = "finalizing"
+            stamp_root_final_phase(
+                send_event, task,
+                post_task_open=not _root_post_task_already_completed(env, task),
+            )
             register_final_answer_owed(task, send_event, env_drive_root=env.drive_root)
         _store_task_result(
             env, task, text, usage, llm_trace, review_evidence=review_evidence,

@@ -250,3 +250,25 @@ BG_OBSERVATIONS_WARN_BYTES = 20_000_000
 # explicit full-history read becomes seconds-scale; this is observability, not
 # a retention gate and never shortens the memory horizon.
 CHAT_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
+
+
+def estimate_message_chars(messages: Any) -> int:
+    """Message chars with image blocks at the provider-billing proxy.
+
+    The bounded basis shared by the fit estimator, the density witness and
+    the compaction proxy — image base64 never counts as text here.
+    """
+    total = 0
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if str(block.get("type") or "") in ("image_url", "image"):
+                    total += IMAGE_BLOCK_CHAR_EQUIVALENT
+                    continue
+                total += len(str(block.get("text", "")))
+        else:
+            total += len(str(content or ""))
+    return total

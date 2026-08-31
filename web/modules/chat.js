@@ -5,9 +5,9 @@ import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { createSystemMessageAction } from './ui_helpers.js';
 import { createChatMedia } from './chat_media.js';
+import { createChatDecision } from './chat_decision.js';
 import { clientSurfaceField } from './client_surface.js';
 import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
-import { MAX_LINK_ACTIONS } from './api_types.js';
 import {
     OWNER_STOP_DETAIL_MARKER,
     getLogTaskGroupId,
@@ -29,11 +29,13 @@ import {
     ACTION_FINALIZE,
     ACTION_HURRY,
     REUSABLE_TASK_IDS,
+    ACTION_RESUME,
     TASK_CONTROL_TRIGGER_LABEL,
     cancelRunEligibility,
     hurryTaskAction,
     openTaskControlMenu,
     requestStop,
+    resumeTaskAction,
     taskControlBusy,
 } from './task_control_menu.js';
 import { openConfirmDialog } from './confirm_dialog.js';
@@ -64,6 +66,7 @@ import { harnessIdentityMarkup } from './harness_presentation.js';
 import {
     createHistoryResyncScheduler,
     createRebuildBatch,
+    createTimelineAnchors,
     insertTimelineNode,
     loadOlderControlState,
     nextQuotaEscalation,
@@ -290,6 +293,13 @@ export function createChatInstance({
         insertMessageNode,
         senderLabel,
         stampNodeTimestamp,
+    });
+    const chatDecision = createChatDecision({
+        apiFetch,
+        frameNode: chatMedia.bubbleFrameNode,
+        renderMarkdown: renderChatMarkdown,
+        enhanceMarkdown: enhanceChatMarkdown,
+        showToast,
     });
 
     async function loadUiPreferences() {
@@ -727,152 +737,8 @@ export function createChatInstance({
         return remaining <= threshold;
     }
 
-    function captureVisibleTimelineAnchor(excludeNode = null) {
-        // The Load-older control is excluded like .typing-bubble [GPT#13]:
-        // anchoring must land on the first visible TIMESTAMPED node, or a
-        // Load-older restore would pin the button itself and drift the view.
-        const nodes = Array.from(messagesDiv.children).filter(
-            (node) => node !== excludeNode
-                && !excludeNode?.contains?.(node)
-                && !node.classList.contains('typing-bubble')
-                && !node.classList.contains('chat-load-older')
-        );
-        const messagesRect = messagesDiv.getBoundingClientRect();
-        const topNode = nodes.find((item) => {
-            const rect = item.getBoundingClientRect();
-            return rect.bottom > messagesRect.top && rect.top < messagesRect.bottom;
-        }) || null;
-        if (!topNode) return null;
-
-        // A live-card can span several screens while the reader is inside a
-        // child summary or timeline line. Preserve that visible boundary, not
-        // merely the root card whose own top may be far above the viewport.
-        let node = topNode;
-        if (topNode.classList.contains('chat-live-card')) {
-            const selector = [
-                '.chat-live-card',
-                '[data-live-summary-button]',
-                '[data-live-title]',
-                '[data-live-activity]',
-                '[data-live-meta]',
-                '.chat-live-actions',
-                '.chat-live-line',
-                '.chat-live-project-card-btn',
-            ].join(',');
-            const candidates = [topNode, ...topNode.querySelectorAll(selector)]
-                .map((candidate) => {
-                    let depth = 0;
-                    let parent = candidate === topNode ? null : candidate.parentElement;
-                    while (parent && topNode.contains(parent) && parent !== topNode) {
-                        depth += 1;
-                        parent = parent.parentElement;
-                    }
-                    return { node: candidate, rect: candidate.getBoundingClientRect(), depth };
-                })
-                .filter(({ node: candidate, rect }) => candidate.getClientRects().length
-                    && rect.width > 0
-                    && rect.height > 0
-                    && rect.bottom > messagesRect.top
-                    && rect.top < messagesRect.bottom);
-            const belowTop = candidates
-                .filter(({ rect }) => rect.top >= messagesRect.top)
-                .sort((a, b) => (a.rect.top - b.rect.top) || (b.depth - a.depth));
-            const crossing = candidates
-                .filter(({ rect }) => rect.top <= messagesRect.top && rect.bottom > messagesRect.top)
-                .sort((a, b) => b.depth - a.depth);
-            node = belowTop[0]?.node || crossing[0]?.node || topNode;
-        }
-
-        const cardChain = [];
-        let card = node.classList.contains('chat-live-card')
-            ? node
-            : node.closest?.('.chat-live-card');
-        while (card && messagesDiv.contains(card)) {
-            cardChain.push({
-                node: card,
-                taskId: card.dataset?.taskId || '',
-                offset: card.getBoundingClientRect().top - messagesRect.top,
-            });
-            card = card.parentElement?.closest?.('.chat-live-card') || null;
-        }
-
-        const ts = topNode.dataset?.ts || '';
-        const anchorRole = [
-            '[data-live-summary-button]',
-            '[data-live-title]',
-            '[data-live-activity]',
-            '[data-live-meta]',
-            '.chat-live-actions',
-            '.chat-live-project-card-btn',
-        ].find((candidate) => node.matches?.(candidate)) || '';
-        return {
-            node,
-            cardChain,
-            lineKey: node.matches?.('.chat-live-line') ? (node.dataset?.liveLineKey || '') : '',
-            anchorRole,
-            topNode,
-            clientMessageId: topNode.dataset?.clientMessageId || '',
-            ts,
-            ordinal: ts ? nodes.filter((item) => item.dataset?.ts === ts).indexOf(topNode) : -1,
-            offset: node.getBoundingClientRect().top - messagesRect.top,
-            topOffset: topNode.getBoundingClientRect().top - messagesRect.top,
-        };
-    }
-
-    function restoreVisibleTimelineAnchor(anchor) {
-        if (!anchor) return false;
-        const isRendered = (node) => {
-            if (!node?.isConnected || !messagesDiv.contains(node)) return false;
-            const rect = node.getBoundingClientRect();
-            return node.getClientRects().length > 0 && rect.width > 0 && rect.height > 0;
-        };
-        const restoreNode = (node, offset) => {
-            if (!isRendered(node)) return false;
-            const currentOffset = node.getBoundingClientRect().top
-                - messagesDiv.getBoundingClientRect().top;
-            messagesDiv.scrollTop += currentOffset - offset;
-            return true;
-        };
-
-        if (restoreNode(anchor.node, anchor.offset)) return true;
-
-        const cardChain = Array.isArray(anchor.cardChain) && anchor.cardChain.length
-            ? anchor.cardChain
-            : [];
-        const resolveCard = (entry) => {
-            if (isRendered(entry?.node)) return entry.node;
-            if (!entry?.taskId) return null;
-            const record = liveCardRecords.get(entry.taskId);
-            return isRendered(record?.root) ? record.root : null;
-        };
-        const ownerCard = resolveCard(cardChain[0]);
-        if (ownerCard && anchor.lineKey) {
-            const line = Array.from(ownerCard.querySelectorAll('.chat-live-line'))
-                .find((candidate) => candidate.dataset?.liveLineKey === anchor.lineKey
-                    && candidate.closest('.chat-live-card') === ownerCard);
-            if (restoreNode(line, anchor.offset)) return true;
-        }
-        if (ownerCard && anchor.anchorRole) {
-            const roleNode = Array.from(ownerCard.querySelectorAll(anchor.anchorRole))
-                .find((candidate) => candidate.closest('.chat-live-card') === ownerCard);
-            if (restoreNode(roleNode, anchor.offset)) return true;
-        }
-        for (const entry of cardChain) {
-            if (restoreNode(resolveCard(entry), entry.offset)) return true;
-        }
-
-        let node = isRendered(anchor.topNode) ? anchor.topNode : null;
-        if (!node && anchor.clientMessageId) {
-            node = Array.from(messagesDiv.children).find(
-                (item) => item.dataset?.clientMessageId === anchor.clientMessageId
-            ) || null;
-        }
-        if (!node && anchor.ts) {
-            const matches = Array.from(messagesDiv.children).filter((item) => item.dataset?.ts === anchor.ts);
-            node = matches[anchor.ordinal] || matches[0] || null;
-        }
-        return restoreNode(node, anchor.topOffset ?? anchor.offset);
-    }
+    const { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor } =
+        createTimelineAnchors({ messagesDiv, liveCardRecords });
 
     function withStableViewport(mutate) {
         if (typeof mutate !== 'function') return undefined;
@@ -1247,10 +1113,13 @@ export function createChatInstance({
             event.stopPropagation();
             openTaskControlMenu(btn, {
                 cancelPending: Boolean(record.cancelPendingPolicy),
+                budgetPaused: activeDirectActivities.get(record.groupId)?.phase === 'budget_paused',
                 busy: taskControlBusy(record.groupId),
-                onAction: (action) => (action === ACTION_HURRY
-                    ? hurryTaskAction(record.groupId)
-                    : cancelRunFromCard(record, action)),
+                onAction: (action) => {
+                    if (action === ACTION_HURRY) return hurryTaskAction(record.groupId);
+                    if (action === ACTION_RESUME) return resumeTaskAction(record.groupId);
+                    return cancelRunFromCard(record, action);
+                },
             });
         });
         actions.appendChild(btn);
@@ -3148,9 +3017,10 @@ export function createChatInstance({
                     // message — render it BEFORE the taskId/finishLiveCard block so
                     // a mid-task delivery replayed while its task is still
                     // running does not falsely finalize that task's live card.
-                    if (msg.msg_type === 'document' || msg.msg_type === 'photo' || msg.msg_type === 'video' || msg.msg_type === 'links') {
+                    if (['document', 'photo', 'video', 'links', 'quiz'].includes(msg.msg_type)) {
                         if (msg.msg_type === 'document') appendDocumentBubble(msg);
                         else if (msg.msg_type === 'links') appendLinksMessage(msg);
+                        else if (msg.msg_type === 'quiz') appendQuizMessage(msg);
                         else appendMediaBubble(msg);
                         continue;
                     }
@@ -3977,10 +3847,11 @@ export function createChatInstance({
     }
 
     function deriveChatStatus() {
-        let directCount = 0, managedActive = 0, managedQueued = 0;
+        let directCount = 0, managedActive = 0, managedQueued = 0, managedPaused = 0;
         for (const entry of activeDirectActivities.values()) {
             if (String(entry?.kind || '') !== 'managed_task') directCount += 1;
             else if (String(entry?.phase || '') === 'queued') managedQueued += 1;
+            else if (String(entry?.phase || '') === 'budget_paused') managedPaused += 1;
             else managedActive += 1;
         }
         return computeDerivedChatStatus({
@@ -3989,6 +3860,7 @@ export function createChatInstance({
             activeDirectCount: directCount,
             activeManagedCount: managedActive,
             queuedManagedCount: managedQueued,
+            pausedManagedCount: managedPaused,
             pendingSubmissionsCount: pendingSubmissions.size,
         });
     }
@@ -4110,6 +3982,7 @@ export function createChatInstance({
             activities: nextMap,
             departedManagedTaskIds,
             disappearedManagedTaskIds,
+            concludedDirectActivities: settledDirectRows,
             globallyActiveActivityIds,
         } = reconcileHydratedDirectActivities(
             activeDirectActivities, turnsList, chatId, snapshotBarrierMs,
@@ -4125,6 +3998,11 @@ export function createChatInstance({
             }
         }
         for (const taskId of globallyActiveActivityIds) missingManagedTaskIds.delete(taskId);
+        for (const row of settledDirectRows) {
+            // Reusable slots host many cycles: never settle them into the ledger.
+            if (!REUSABLE_TASK_IDS.has(row.activityId)) recordConcludedActivity(row.activityId);
+            if (row.clientMessageId) pendingSubmissions.delete(row.clientMessageId);
+        }
         for (const taskId of departedManagedTaskIds) revokeManagedTaskCancelAuthority(taskId);
         for (const taskId of disappearedManagedTaskIds) observeMissingManagedTask(taskId);
         for (const taskId of unconfirmedForegroundCardIds(
@@ -4224,7 +4102,10 @@ export function createChatInstance({
             }
             learnSubagentLineage(msg);
             const ephemeralDecision = registerEphemeralDecisionFrame(msg);
-            if (ephemeralDecision && explicitTaskId) {
+            // A concluded turn stays concluded: a late progress/duplicate
+            // frame must not resurrect the activity after the snapshot (or a
+            // typed final) already settled it.
+            if (ephemeralDecision && explicitTaskId && !concludedDirectActivities.has(explicitTaskId)) {
                 const existing = activeDirectActivities.get(explicitTaskId) || {};
                 activeDirectActivities.set(explicitTaskId, {
                     activityId: explicitTaskId,
@@ -4264,7 +4145,7 @@ export function createChatInstance({
                     // concurrent turn's state (2A keeps later `Sending...`).
                     const finished = activeDirectActivities.get(explicitTaskId);
                     activeDirectActivities.delete(explicitTaskId);
-                    recordConcludedActivity(explicitTaskId);
+                    if (!REUSABLE_TASK_IDS.has(explicitTaskId)) recordConcludedActivity(explicitTaskId);
                     if (finished?.clientMessageId) {
                         pendingSubmissions.delete(finished.clientMessageId);
                     }
@@ -4355,64 +4236,19 @@ export function createChatInstance({
         }
     });
 
-    const buildMediaBubble = (msg) => chatMedia.buildMediaBubble(msg);
-
-    function appendMediaBubble(msg) {
-        const key = chatMediaMessageKey(msg);
-        if (key && seenMessageKeys.has(key)) return false;
-        const bubble = buildMediaBubble(msg);
-        if (!bubble) return false;
-        rememberMessageKey(key);
-        if ((msg.msg_type || msg.type) === 'photo') chatMedia.buildGallery('photos', msg, bubble);
-        else insertMessageNode(bubble);
-        return true;
-    }
-
-    for (const type of ['photo', 'video']) onWs(type, (msg) => {
-        if (!isMyThread(msg)) return;
-        // Media frames carry no activity identity: hide the dots row but leave
-        // the authoritative active set intact; sync derives the header from it.
-        hideTypingIndicatorOnly();
-        syncChatStatus();
-        if (appendMediaBubble(msg)) incrementUnreadIfNeeded(msg);
-    });
-
-    const buildDocumentBubble = (msg) => chatMedia.buildDocumentBubble(msg);
-
-    function appendDocumentBubble(msg) {
-        const key = documentMessageKey(msg);
-        if (key && seenMessageKeys.has(key)) return false;
-        const bubble = buildDocumentBubble(msg);
-        if (!bubble) return false;
-        rememberMessageKey(key);
-        chatMedia.buildGallery('files', msg, bubble);
-        return true;
-    }
-
-    onWs('document', (msg) => {
-        if (!isMyThread(msg)) return;
-        hideTypingIndicatorOnly();
-        syncChatStatus();
-        if (appendDocumentBubble(msg)) incrementUnreadIfNeeded(msg);
-    });
-
-    function appendLinksMessage(msg) {
-        const actions = Array.isArray(msg.actions) ? msg.actions.slice(0, MAX_LINK_ACTIONS) : [];
-        const key = `links:${msg.task_id || ''}:${msg.ts || ''}:${JSON.stringify(actions)}:${msg.title || ''}`;
-        if (seenMessageKeys.has(key)) return false;
-        const bubble = chatMedia.buildLinksMessage(msg);
-        if (!bubble) return false;
-        rememberMessageKey(key);
-        insertMessageNode(bubble);
-        return true;
-    }
-
-    onWs('links', (msg) => {
-        if (!isMyThread(msg)) return;
-        hideTypingIndicatorOnly();
-        syncChatStatus();
-        if (appendLinksMessage(msg)) incrementUnreadIfNeeded(msg);
-    });
+    const { appendMediaBubble, appendDocumentBubble, appendLinksMessage, appendQuizMessage } =
+        chatMedia.wireDeliveries({
+            onWs,
+            isMyThread,
+            hideTypingIndicatorOnly,
+            syncChatStatus,
+            incrementUnreadIfNeeded,
+            seenMessageKeys,
+            rememberMessageKey,
+            chatMediaMessageKey,
+            documentMessageKey,
+            buildQuizCard: chatDecision.buildQuizCard,
+        });
 
     let wsHasConnectedOnce = false;
 

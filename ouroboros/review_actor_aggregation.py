@@ -7,6 +7,55 @@ from typing import Any, Callable, Dict, List
 from ouroboros.triad_review import parse_review_findings
 
 
+def contract_valid_actors(result: Any) -> List[Dict[str, Any]]:
+    """Actors with a DELIBERATE, CONTRACT-VALID reviewer object: parsed dict,
+    recognizable verdict, parse_status not "malformed" — so a contract-DEMOTED or
+    garbage response never votes (commit triad #1).
+
+    Owner ratification 2026-08-30: the acceptance-dialogue reducer now counts
+    votes over ``_contributing_actors`` (a slot whose verdict did not reach the
+    aggregate must not steer the loop either), and applies THIS predicate as the
+    validity gate on top — the two are not the same test, and a hand-built or
+    legacy row carrying a PASS/FAIL signal beside a malformed parse must still be
+    unable to vote. It moved here from ``review_substrate`` with that change: this
+    module is where the reviewer-row contract is decided, and the substrate sits
+    exactly on its module-size cap."""
+    from dataclasses import asdict
+
+    out: List[Dict[str, Any]] = []
+    for actor in (getattr(result, "actors", None) or []):
+        row = actor if isinstance(actor, dict) else asdict(actor)
+        parsed = row.get("parsed")
+        if str(row.get("parse_status") or "") == "malformed":
+            continue
+        if isinstance(parsed, dict) and str(
+            parsed.get("verdict") or parsed.get("status") or ""
+        ).strip().upper() in {"PASS", "FAIL", "DEGRADED"}:
+            out.append(row)
+    return out
+
+
+def continue_vote_is_well_formed(parsed: Dict[str, Any]) -> bool:
+    """Whether a ``continue_actionable`` dialogue vote came with MATERIAL (owner
+    ratification 2026-08-30, Rule 1; consumed by
+    ``review_substrate.aggregate_dialogue_status``).
+
+    Majority voting was rejected: one strong reviewer may still hold the
+    acceptance loop open — but only while it can say what to do next. The same
+    response must carry a concrete finding OR a completion_coach line; the
+    correction-rail contract below already accepts coach-without-findings, so
+    both count here. A bare "keep going" with neither is not a judgement the
+    agent can act on: it bought one paid panel per round and never converged."""
+    findings = parsed.get("findings")
+    if isinstance(findings, list) and any(
+        isinstance(item, dict)
+        and str(item.get("item") or item.get("recommendation") or "").strip()
+        for item in findings
+    ):
+        return True
+    return bool(str(parsed.get("completion_coach") or "").strip())
+
+
 def aggregate_review_actors(
     *,
     request: Any,

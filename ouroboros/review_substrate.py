@@ -622,56 +622,55 @@ DIALOGUE_CONTINUE = "continue_actionable"
 DIALOGUE_UNREACHABLE = "unreachable_here"
 DIALOGUE_STABLE_DISAGREEMENT = "stable_disagreement"
 DIALOGUE_STATUS_VALUES = (DIALOGUE_CONTINUE, DIALOGUE_UNREACHABLE, DIALOGUE_STABLE_DISAGREEMENT)
-
-
-def _contract_valid_actors(result: Any) -> List[Dict[str, Any]]:
-    """Actors with a DELIBERATE, CONTRACT-VALID reviewer object: parsed dict,
-    recognizable verdict, parse_status not "malformed". Wider than
-    ``_contributing_actors`` (deliberate DEGRADED keeps its vote, sol #3) but a
-    contract-DEMOTED/garbage response never votes terminal (commit triad #1)."""
-    out: List[Dict[str, Any]] = []
-    for actor in (getattr(result, "actors", None) or []):
-        row = actor if isinstance(actor, dict) else asdict(actor)
-        parsed = row.get("parsed")
-        if str(row.get("parse_status") or "") == "malformed":
-            continue
-        if isinstance(parsed, dict) and str(
-            parsed.get("verdict") or parsed.get("status") or ""
-        ).strip().upper() in {"PASS", "FAIL", "DEGRADED"}:
-            out.append(row)
-    return out
+DIALOGUE_TERMINAL_STATUSES = (DIALOGUE_UNREACHABLE, DIALOGUE_STABLE_DISAGREEMENT)
+# Reducer OUTPUTS, deliberately outside DIALOGUE_STATUS_VALUES (reviewer vocabulary
+# unchanged): no well-formed vote at all — neither terminal nor a licence to
+# continue — plus the buckets that keep a REFUSED vote disclosed, not dropped.
+DIALOGUE_INCONCLUSIVE = "inconclusive"
+DIALOGUE_VOTE_CONTINUE_WITHOUT_FINDINGS = "continue_without_findings"
+DIALOGUE_VOTE_ABSTAIN_INVALID = "abstain_invalid"
 
 
 def aggregate_dialogue_status(result: Any, *, quorum: int) -> Dict[str, Any]:
-    """Pure reducer over the reviewers' typed ``dialogue_status`` votes (A5, P5):
-    the host validates the enum, applies the caller's quorum, and transports the
-    result. Precedence: any continue vote from a QUORUM-CONTRIBUTING actor keeps
-    the loop; else a quorum of terminal votes terminates. Missing/invalid votes
-    default to ``continue_actionable`` (fail-safe, backward-compatible).
-    Returns ``{"status", "votes"}`` with the full distribution for audit."""
-    contributing = {str(a.get("slot_id", "")) for a in _contributing_actors(result)}
+    """Pure reducer over the reviewers' typed ``dialogue_status`` votes (A5, P5).
+    Votes are counted over the CONTRIBUTING actors, gated by contract validity
+    (owner ratification 2026-08-30, replacing the sol #3 widening). Precedence,
+    over WELL-FORMED votes only: a continue keeps the loop; else >=1 terminal vote
+    ends it with the unreachable-vs-disagreement tie-break; else ``inconclusive``,
+    which grants the dialogue no authority either way. A continue WITHOUT material
+    and a missing/invalid vote both ABSTAIN and stay disclosed in the distribution;
+    neither may default the loop into another paid round — which is exactly what
+    the old fail-safe ``continue`` default did. ``quorum`` no longer gates the
+    terminal side (ending the dialogue is the cheap direction, and the two ends are
+    now symmetric); it rides the record so it stays auditable beside the votes."""
+    from ouroboros.review_actor_aggregation import contract_valid_actors, continue_vote_is_well_formed
+
+    valid_slots = {str(row.get("slot_id", "")) for row in contract_valid_actors(result)}
     votes: Dict[str, List[str]] = {}
-    for row in _contract_valid_actors(result):
+    for row in _contributing_actors(result):
+        slot_id = str(row.get("slot_id", ""))
+        if slot_id not in valid_slots:
+            continue  # a PASS/FAIL signal beside a malformed parse never votes
         parsed = row.get("parsed") if isinstance(row.get("parsed"), dict) else {}
         vote = str(parsed.get("dialogue_status") or "").strip().lower()
         if vote not in DIALOGUE_STATUS_VALUES:
-            vote = DIALOGUE_CONTINUE
-        votes.setdefault(vote, []).append(str(row.get("slot_id", "")))
-    continue_slots = votes.get(DIALOGUE_CONTINUE, [])
+            vote = DIALOGUE_VOTE_ABSTAIN_INVALID
+        elif vote == DIALOGUE_CONTINUE and not continue_vote_is_well_formed(parsed):
+            vote = DIALOGUE_VOTE_CONTINUE_WITHOUT_FINDINGS
+        votes.setdefault(vote, []).append(slot_id)
     unreachable = votes.get(DIALOGUE_UNREACHABLE, [])
     disagreement = votes.get(DIALOGUE_STABLE_DISAGREEMENT, [])
-    terminal = unreachable + disagreement
-    if any(slot in contributing for slot in continue_slots):
+    if votes.get(DIALOGUE_CONTINUE):
         status = DIALOGUE_CONTINUE
-    elif len(terminal) >= max(1, int(quorum)):
+    elif unreachable or disagreement:
         status = (
             DIALOGUE_UNREACHABLE
             if len(unreachable) >= len(disagreement)
             else DIALOGUE_STABLE_DISAGREEMENT
         )
     else:
-        status = DIALOGUE_CONTINUE
-    return {"status": status, "votes": votes}
+        status = DIALOGUE_INCONCLUSIVE
+    return {"status": status, "votes": votes, "quorum": max(1, int(quorum))}
 
 
 def _unresolved_evidence_ref_labels(run: Any) -> List[str]:

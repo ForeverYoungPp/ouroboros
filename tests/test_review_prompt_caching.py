@@ -1459,10 +1459,14 @@ def test_extended_ttl_scales_cache_write_estimate(monkeypatch):
 
 def test_supervisor_handles_review_wave_budget_event(monkeypatch):
     from supervisor import events as sup_events
+    from supervisor import telemetry_events as sup_telemetry
 
     assert "review_wave_budget_insufficient" in sup_events.EVENT_HANDLERS
     captured = {}
-    monkeypatch.setattr(sup_events, "append_jsonl", lambda path, row: captured.update(row))
+    # The durable passthrough lives in the telemetry module (split out of
+    # events.py at the 200K module-byte ceiling); the registry key is the
+    # contract, the append is the behavior.
+    monkeypatch.setattr(sup_telemetry, "append_jsonl", lambda path, row: captured.update(row))
 
     class _Ctx:
         DRIVE_ROOT = pathlib.Path("/tmp")

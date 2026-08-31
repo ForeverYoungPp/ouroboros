@@ -77,6 +77,10 @@ export function cancelTask(taskId, { cascade = false, stopPolicy = '' } = {}) {
     return Object.keys(body).length ? jsonPost(url, body) : fetchJson(url, { method: 'POST' });
 }
 
+export async function resumeTask(taskId) {
+    return fetchJson(`/api/tasks/${encodeURIComponent(taskId)}/resume`, { method: 'POST' });
+}
+
 /**
  * Owner hurry (S3, HQ1): the text-free typed task-local acceleration control.
  * The body carries ONLY the client-generated stable request_id (reuse the same

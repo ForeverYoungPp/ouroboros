@@ -113,8 +113,27 @@ def _root_task_acceptance_review_cap(
     )
 
 
+def _claim_for_paid_identity(claims: Any, paid_identity: str) -> Optional[Dict[str, Any]]:
+    """The claim row this tree already bought for one A-material paid identity.
+
+    ONE answer shared by the free-refusal projection and the atomic claim, so the
+    dispatch seam can never refuse what the wallet would have allowed (or vice
+    versa). An empty identity matches nothing: a pre-A-material row keys on its
+    binding hash alone."""
+    identity = str(paid_identity or "").strip().lower()
+    if not identity:
+        return None
+    return next(
+        (
+            row for row in (claims or {}).values()
+            if isinstance(row, dict) and str(row.get("paid_identity") or "") == identity
+        ),
+        None,
+    )
+
+
 def project_task_acceptance_review_capacity(
-    ctx: Any, *, binding_hash: str = "", task_id: str = "",
+    ctx: Any, *, binding_hash: str = "", task_id: str = "", paid_identity: str = "",
 ) -> Dict[str, Any]:
     """Read the canonical root's paid acceptance-wallet projection.
 
@@ -173,6 +192,12 @@ def project_task_acceptance_review_capacity(
         claimed = len(claims)
         remaining = None if cap is None else max(0, cap - claimed)
         requested_binding = str(binding_hash or "").strip().lower()
+        # Seen = this dispatch was already PAID for, under either identity: the
+        # exact binding (as before) or the A-material paid identity, so a resubmit
+        # that only moved the evidence revision cannot buy a second panel.
+        binding_seen = bool(requested_binding and requested_binding in claims) or (
+            _claim_for_paid_identity(claims, paid_identity) is not None
+        )
         projection = {
             **base,
             "state": "available",
@@ -180,7 +205,7 @@ def project_task_acceptance_review_capacity(
             "cap_cycles": cap,
             "claimed_cycles": claimed,
             "remaining_cycles": remaining,
-            "binding_seen": bool(requested_binding and requested_binding in claims),
+            "binding_seen": binding_seen,
         }
         try:
             from ouroboros.cancel_intents import cancel_pending
@@ -285,6 +310,11 @@ _TASK_ACCEPTANCE_REVIEW_CLAIM_FIELDS = frozenset({
     "binding_hash", "candidate_hash", "evidence_revision", "fence_hash",
     "claimed_at", "claimed_by_task_id",
 })
+# A-material (2026-08-30), additive: the identity the panel was actually PAID
+# for — candidate answer plus new obligation dispositions, evidence revision
+# deliberately excluded. Rows written before it carry no such key and stay valid;
+# new rows carry both, so the binding-keyed reads above never change meaning.
+_TASK_ACCEPTANCE_REVIEW_CLAIM_OPTIONAL_FIELDS = frozenset({"paid_identity"})
 
 
 def _empty_task_acceptance_review_state(root_task_id: str) -> Dict[str, Any]:
@@ -312,7 +342,11 @@ def _validated_task_acceptance_review_state(
     for binding_hash, claim in claims.items():
         if not _PLAN_REVIEW_HASH_RE.fullmatch(str(binding_hash or "")):
             raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: claim key is invalid")
-        if not isinstance(claim, dict) or set(claim) != _TASK_ACCEPTANCE_REVIEW_CLAIM_FIELDS:
+        if not isinstance(claim, dict) or not (
+            _TASK_ACCEPTANCE_REVIEW_CLAIM_FIELDS
+            <= set(claim)
+            <= (_TASK_ACCEPTANCE_REVIEW_CLAIM_FIELDS | _TASK_ACCEPTANCE_REVIEW_CLAIM_OPTIONAL_FIELDS)
+        ):
             raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: claim shape is invalid")
         if str(claim.get("binding_hash") or "") != str(binding_hash):
             raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: claim identity mismatch")
@@ -321,6 +355,12 @@ def _validated_task_acceptance_review_state(
                 raise ValueError(
                     f"TASK_ACCEPTANCE_REVIEW_STATE_INVALID: {key} is invalid"
                 )
+        if "paid_identity" in claim and not _PLAN_REVIEW_HASH_RE.fullmatch(
+            str(claim.get("paid_identity") or "")
+        ):
+            raise ValueError(
+                "TASK_ACCEPTANCE_REVIEW_STATE_INVALID: paid_identity is invalid"
+            )
         expected_binding = review_binding_hash(
             candidate_hash=str(claim["candidate_hash"]),
             evidence_revision=str(claim["evidence_revision"]),
@@ -464,6 +504,13 @@ def claim_task_acceptance_review_cycle(
     if binding_fields["binding_hash"] != expected_binding:
         raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: binding digest mismatch")
     binding = binding_fields["binding_hash"]
+    # A-material: the identity the panel is PAID for. Absent (a pre-A-material
+    # caller) => the binding hash keeps being the paid identity, i.e. exactly the
+    # old behaviour; present => it also refuses a second claim for the same
+    # material under a different binding.
+    paid_identity = str((review_binding or {}).get("paid_identity") or "").strip().lower()
+    if paid_identity and not _PLAN_REVIEW_HASH_RE.fullmatch(paid_identity):
+        raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: paid identity is invalid")
     claimant = str(claimed_by_task_id or "").strip()
     if not claimant:
         raise ValueError("TASK_ACCEPTANCE_REVIEW_STATE_INVALID: claimant is absent")
@@ -484,7 +531,7 @@ def claim_task_acceptance_review_cycle(
         cap = _root_task_acceptance_review_cap(root_result)
         resolved["cap"] = cap
         claims = dict(state.get("claims_by_binding") or {})
-        prior = claims.get(binding)
+        prior = claims.get(binding) or _claim_for_paid_identity(claims, paid_identity)
         if prior is not None:
             decision.update({
                 "status": "unknown",
@@ -496,6 +543,7 @@ def claim_task_acceptance_review_cycle(
             return None
         claims[binding] = {
             **binding_fields,
+            **({"paid_identity": paid_identity} if paid_identity else {}),
             "claimed_at": utc_now_iso(),
             "claimed_by_task_id": claimant,
         }
@@ -517,6 +565,7 @@ def claim_task_acceptance_review_cycle(
     return {
         **decision,
         "binding_hash": binding,
+        "paid_identity": paid_identity,
         "cycles_paid": paid,
         "max_cycles": cap,
         "remaining_cycles": None if cap is None else max(0, cap - paid),

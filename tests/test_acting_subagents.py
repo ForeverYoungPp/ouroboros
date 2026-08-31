@@ -1207,6 +1207,9 @@ def test_acting_browser_evaluate_runs_and_keeps_owner_guards(tmp_path, monkeypat
         # network DNS lookup (which can be unresolved or remapped in CI).
         url = "https://1.1.1.1/"
 
+        def set_default_timeout(self, ms):
+            calls.append(("default_timeout", ms))
+
         def evaluate(self, script):
             calls.append(script)
             return 2
@@ -1217,7 +1220,11 @@ def test_acting_browser_evaluate_runs_and_keeps_owner_guards(tmp_path, monkeypat
     registry.set_context(ctx)
 
     assert registry.execute("browser_action", {"action": "evaluate", "value": "1 + 1"}) == "2"
-    assert calls == ["1 + 1"]
+    # The requested expression executes (wrapped in the in-page Promise.race
+    # timeout bound — harness-health O5); the contract is the script REACHES
+    # the page and the result returns, not the exact wrapper bytes.
+    evaluated = [c for c in calls if isinstance(c, str)]
+    assert len(evaluated) == 1 and "1 + 1" in evaluated[0]
 
     blocked = registry.execute(
         "browser_action",

@@ -193,7 +193,18 @@ def _stray_server_note(env: Any) -> str:
     return note
 
 
-def build_health_invariants(env: Any) -> str:
+def build_health_invariants(env: Any, task_id: str = "") -> str:
+    """Render the health-invariant WARNING block for one reader's context.
+
+    ``task_id`` names the READING task so delegated-run obligations can shape
+    their instruction clause by ownership: the obligations stay globally
+    visible (owner doctrine — a preserved-and-invisible result is how work
+    rots on disk), but only the OWNER task receives the call-shaped
+    instruction. A non-owner told to call ``integrate_delegated_patch`` gets
+    a structural ``run_not_owned`` refusal and an obligation it can never
+    discharge. Empty ``task_id`` (Background Consciousness, legacy callers)
+    keeps the call-shaped wording — an unattributed reader may be the owner.
+    """
     import time as _time
 
     checks: List[str] = []
@@ -339,12 +350,25 @@ def build_health_invariants(env: Any) -> str:
             # nothing is live and nothing is mutating — but it stays visible until the
             # read happens, which is the whole difference between a disclosure and a fact
             # someone acts on. It clears itself the moment the acknowledgement lands.
+            # The instruction clause is ownership-aware: the staged artifact lives
+            # under the OWNER's task drive and the read acknowledgement only
+            # credits the owner, so telling a foreign task to read it mints an
+            # obligation it structurally cannot discharge.
+            if task_id and run.task_id and task_id != run.task_id:
+                action = (
+                    f"Only its owner task {run.task_id} can read and acknowledge it; "
+                    f"note the gap honestly instead of attempting the read here."
+                )
+            else:
+                action = (
+                    "Read it with read_file root='task_drive' until the artifact is "
+                    "covered end to end, or say plainly that the result was not "
+                    "collected."
+                )
             checks.append(
                 f"WARNING: DELEGATED RESULT NEVER READ — run {run.run_id or '?'} settled "
                 f"with its full output staged at {run.output_artifact} and never read to "
-                f"EOF (owner task {run.task_id or '?'}). Read it with read_file "
-                f"root='task_drive' until the artifact is covered end to end, or say "
-                f"plainly that the result was not collected."
+                f"EOF (owner task {run.task_id or '?'}). {action}"
             )
     except Exception:
         pass
@@ -376,11 +400,24 @@ def build_health_invariants(env: Any) -> str:
                     f"integrate_delegated_patch captures it at disposition)"
                 )
                 persist_clause = "The snapshot persists until that disposition."
+            # Ownership-aware instruction: integrate_delegated_patch refuses a
+            # non-owner with run_not_owned and only the owner can write the
+            # clearing PATCH_DISPOSED row, so a foreign reader is told WHO must
+            # act instead of being handed a call that structurally refuses.
+            if task_id and run.task_id and task_id != run.task_id:
+                decide_clause = (
+                    f"Only its owner task {run.task_id} can decide it (a foreign "
+                    f"integrate_delegated_patch call is refused as run_not_owned)."
+                )
+            else:
+                decide_clause = (
+                    f"decide with integrate_delegated_patch(run_id='{run.run_id}', "
+                    f"decision='apply'|'reject')."
+                )
             checks.append(
                 f"WARNING: DELEGATED PATCH AWAITS DISPOSITION — run {run.run_id or '?'} "
                 f"(owner task {run.task_id or '?'}) {state_clause} and no apply/reject "
-                f"recorded. Nothing reaches the shared tree by itself: decide with "
-                f"integrate_delegated_patch(run_id='{run.run_id}', decision='apply'|'reject'). "
+                f"recorded. Nothing reaches the shared tree by itself: {decide_clause} "
                 f"{persist_clause}"
             )
     except Exception:

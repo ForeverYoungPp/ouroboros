@@ -110,6 +110,9 @@ def test_root_acceptance_review_claims_share_one_atomic_exact_binding_wallet(tmp
         "status": "unavailable",
         "reason": "review_cycles_exhausted",
         "binding_hash": _acceptance_binding("a")["binding_hash"],
+        # A pre-A-material binding carries no paid identity: the receipt reports it
+        # empty and the binding hash keeps being the claim key, as before.
+        "paid_identity": "",
         "cycles_paid": 2,
         "max_cycles": 2,
         "remaining_cycles": 0,

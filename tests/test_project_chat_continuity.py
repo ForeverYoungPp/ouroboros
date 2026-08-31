@@ -341,7 +341,12 @@ def test_ephemeral_final_keeps_decision_meta_without_phase_marker(tmp_path, monk
     })
 
     send = next(evt for evt in events if evt["type"] == "send_message")
-    assert send["progress_meta"] == {"ephemeral_decision": True}
+    # #369: the ephemeral final carries its typed conclusion (its task_done is
+    # client-dropped by design) — but still NO finalizing phase marker.
+    assert send["progress_meta"] == {
+        "ephemeral_decision": True, "task_terminal_status": "completed",
+    }
+    assert "task_phase" not in send["progress_meta"]
 
 
 # ---------------------------------------------------------------------------

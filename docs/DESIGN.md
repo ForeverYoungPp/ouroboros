@@ -203,6 +203,40 @@ not child-task cards and never prove execution by themselves.
   Codex/OpenAI comes from SVGL. Product names and marks remain the property of
   their owners.
 
+### Quiz card
+
+The owner quiz card (`web/modules/chat_decision.js`, `.chat-quiz-*` in
+`web/style.css`) is a chat-delivered decision surface. It is fire-and-continue
+UI: the asking task keeps working under a stated assumption, so the card must
+read correctly both as an invitation ("you can redirect me") and, after it
+settles, as a record of the path taken. Anatomy, top to bottom:
+
+1. **Head** — neutral `Question` chip (`--type-meta`, neutral pair) and a
+   status as dot + text. The lifecycle word family is closed:
+   `Awaiting answer` (neutral dot), `Answered` (ok dot),
+   `Task finished — question expired` (disabled dot), `Superseded by a retry`
+   (disabled dot); an unknown state keeps a neutral dot but reads as settled
+   `Closed`, never as an open invitation. No timers, no countdowns: a quiz expires only with its
+   asking task.
+2. **Question** — the one primary thing: `--type-body` semibold,
+   `--text-primary`.
+3. **Stake** — optional one-liner (`At stake: …`), `--type-meta`, `--text-meta`.
+4. **Options** — real owner actions: buttons with `--text-primary` labels,
+   legible at rest; an optional per-option detail steps down to meta ink.
+   After settlement buttons drop to `--text-disabled`; the chosen option keeps
+   the ok pair. Options are capped by the shared Python↔JS constant
+   (`MAX_QUIZ_OPTIONS`).
+5. **Assumption** — the signature line (`Continuing meanwhile: …`),
+   `--type-meta`, `--text-meta`, separated by a hairline. While the card is
+   open it names the default path; once the card settles it is the durable
+   record of what the agent did without an answer. It is never dropped on
+   state change.
+
+The card is born on tokens even though the surrounding chat surface is not yet
+migrated: type sizes and every colour come from tokens (no new literals);
+component geometry (card min/max width, chip radius) keeps local literals like
+the rest of the chat surface until its migration pass.
+
 ## 6. Account group / row anatomy
 
 For a repeated identity row (a connected agent account, a reviewer slot,

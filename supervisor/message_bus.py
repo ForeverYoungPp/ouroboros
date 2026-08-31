@@ -12,10 +12,15 @@ from urllib.parse import quote
 
 from ouroboros.artifacts import store_chat_media_bytes
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
-from ouroboros.event_bus import CHAT_DOCUMENT, CHAT_LINKS, CHAT_OUTBOUND, CHAT_PHOTO, CHAT_TYPING, CHAT_VIDEO, publish_event
+from ouroboros.event_bus import CHAT_DOCUMENT, CHAT_LINKS, CHAT_OUTBOUND, CHAT_PHOTO, CHAT_QUIZ, CHAT_TYPING, CHAT_VIDEO, publish_event
 from supervisor.state import append_jsonl, load_state
 from ouroboros.projects_registry import stamp_project_thread
-from ouroboros.tools.core import LinkActionsValidationError, validate_link_actions
+from ouroboros.tools.core import (
+    LinkActionsValidationError,
+    QuizValidationError,
+    validate_link_actions,
+    validate_quiz_payload,
+)
 from ouroboros.utils import utc_now_iso
 from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS
 
@@ -718,6 +723,79 @@ class LocalChatBridge:
         _advance_project_visible_revision(chat_id)
         return True, "ok"
 
+    def send_quiz(
+        self,
+        chat_id: int,
+        quiz_id: str,
+        question: str,
+        options: List[Dict[str, str]],
+        stake: str = "",
+        assumption: str = "",
+        state: str = "open",
+        task_id: str = "",
+    ) -> Tuple[bool, str]:
+        """Send an owner quiz card to the UI and host event subscribers."""
+        if is_a2a_chat_id(chat_id):
+            return True, "ok"
+        qid = str(quiz_id or "").strip()
+        if not qid:
+            return False, "quiz_id is required"
+        if not str(task_id or "").strip():
+            # The card's answer path is task-addressed (decision_id
+            # "quiz:{task_id}:{quiz_id}"): an anonymous quiz would render
+            # buttons that cannot deliver anywhere.
+            return False, "task_id is required"
+        try:
+            payload = validate_quiz_payload(question, options, stake, assumption)
+        except QuizValidationError as exc:
+            return False, str(exc)
+        ts = utc_now_iso()
+        msg = {
+            "type": "quiz",
+            "role": "assistant",
+            "quiz_id": qid,
+            "question": payload["question"],
+            "options": payload["options"],
+            "stake": payload["stake"],
+            "assumption": payload["assumption"],
+            "state": str(state or "open"),
+            "ts": ts,
+            "chat_id": int(chat_id or 0),
+            "task_id": str(task_id or ""),
+        }
+        stamp_project_thread(DATA_DIR, msg)
+        if self._broadcast_fn:
+            self._broadcast_fn(msg)
+        quiz_transport = dict(self._chat_transports.get(int(chat_id or 0), {}) or {})
+        publish_event(CHAT_QUIZ, {
+            "chat_id": int(chat_id or 0),
+            "transport": quiz_transport,
+            "quiz_id": qid,
+            "question": payload["question"],
+            "options": payload["options"],
+            "stake": payload["stake"],
+            "assumption": payload["assumption"],
+            "state": str(state or "open"),
+            "ts": ts,
+        })
+        try:
+            owner_id = int(load_state().get("owner_id") or 0)
+        except Exception:
+            owner_id = 0
+        log_chat(
+            "out", int(chat_id or 0), owner_id, payload["question"], ts=ts,
+            task_id=str(task_id or ""), record_type="quiz",
+            quiz={
+                "quiz_id": qid,
+                "options": payload["options"],
+                "stake": payload["stake"],
+                "assumption": payload["assumption"],
+                "state": str(state or "open"),
+            },
+        )
+        _advance_project_visible_revision(chat_id)
+        return True, "ok"
+
     def push_log(self, event: dict):
         """Stream append_jsonl events to UI."""
         try:
@@ -932,6 +1010,7 @@ def log_chat(
     caption: str = "",
     actions: Optional[List[Dict[str, str]]] = None,
     title: str = "",
+    quiz: Optional[Dict[str, Any]] = None,
     size_bytes: Optional[int] = None,
     client_surface: Optional[Dict[str, Any]] = None,
     message_meta: Optional[Dict[str, Any]] = None,
@@ -986,6 +1065,10 @@ def log_chat(
         if actions:
             record["actions"] = [dict(action) for action in actions]
             record["title"] = str(title or "")
+        if quiz:
+            # Quiz rows persist the full card (no base64 anywhere) so history
+            # replay rebuilds it with its lifecycle state.
+            record["quiz"] = dict(quiz)
         if size_bytes is not None:
             record["size_bytes"] = int(size_bytes)
         append_jsonl(DATA_DIR / "logs" / "chat.jsonl", record)

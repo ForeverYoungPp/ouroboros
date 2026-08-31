@@ -1143,6 +1143,45 @@ def _make_links(api):
     return handle
 
 
+def _make_quiz(api):
+    async def handle(event: Dict[str, Any]) -> None:
+        try:
+            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
+            local_settings = _load_settings(api)
+            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""))
+            chat_id = _target_chat(local_settings, event)
+            if not chat_id:
+                return
+            question = str(event.get("question") or "").strip()
+            raw_options = event.get("options") if isinstance(event.get("options"), list) else []
+            labels = []
+            for option in raw_options:
+                if isinstance(option, dict):
+                    label = str(option.get("label") or "").strip()
+                    if label:
+                        labels.append(label)
+            # Shared quiz contract cap: ouroboros.tools.core._MAX_QUIZ_OPTIONS.
+            labels = labels[:6]
+            if not question or len(labels) < 2:
+                return
+            _clear_silent_msg(api, chat_id)
+            stake = str(event.get("stake") or "").strip()
+            assumption = str(event.get("assumption") or "").strip()
+            lines = [f"Question: {question}"]
+            if stake:
+                lines.append(f"At stake: {stake}")
+            lines.extend(f"{index}. {label}" for index, label in enumerate(labels, 1))
+            if assumption:
+                lines.append(f"Continuing meanwhile: {assumption}")
+            # Display-only for now: answering happens in the web UI. A tappable
+            # inline-keyboard answer flow is a planned follow-up of this skill.
+            lines.append("Answer from the Ouroboros web UI.")
+            await client.send_message(chat_id, "\n".join(lines), parse_mode="")
+        except Exception as exc:
+            api.log("error", f"Telegram quiz error: {exc}")
+    return handle
+
+
 def register(api):
     api.register_supervised_task("poller", _make_poller(api), restart_policy="on_failure", max_restarts=10)
     api.register_supervised_task("notifier", _make_notifier(api), restart_policy="on_failure", max_restarts=10)
@@ -1152,6 +1191,7 @@ def register(api):
     api.subscribe_event("chat.video", _make_video(api))
     api.subscribe_event("chat.document", _make_document(api))
     api.subscribe_event("chat.links", _make_links(api))
+    api.subscribe_event("chat.quiz", _make_quiz(api))
     api.register_route("settings/save", handler=_make_settings_save(api), methods=("POST",))
     api.register_route("miniapp/status", handler=_make_status(api), methods=("POST",))
     api.register_settings_section(

@@ -112,6 +112,11 @@ class ChatOutbound(TypedDict):
     # while post-task synthesis still runs, so the frame is NOT the task's
     # terminal conclusion — task_done settles the card/turn.
     task_phase: NotRequired[str]
+    # Typed terminal fact on a frame that IS the turn's conclusion: stamped on
+    # direct/ephemeral finals (and the direct error branch) so the client's
+    # live gate settles the activity without waiting for a snapshot. One of
+    # completed/failed/cancelled/rejected_duplicate.
+    task_terminal_status: NotRequired[str]
     ephemeral_decision: NotRequired[bool]
     task_incident: NotRequired[str]
     toast_once: NotRequired[str]
@@ -314,6 +319,37 @@ class LinksOutbound(TypedDict):
     actions: list[LinkAction]
     ts: str
     title: NotRequired[str]
+    chat_id: NotRequired[int]
+    task_id: NotRequired[str]
+    project_thread: NotRequired[bool]
+    transport: NotRequired[TransportMetadata]
+
+
+class QuizOption(TypedDict):
+    """One selectable option on an owner quiz card."""
+
+    label: str
+    detail: NotRequired[str]
+
+
+class QuizOutbound(TypedDict):
+    """Outbound owner quiz card: a typed question with option buttons.
+
+    Fire-and-continue: the asking task keeps working under ``assumption``
+    while the card is open. ``state`` is the card's lifecycle word
+    (``open`` in this display phase; answered/expired arrive with the
+    answer ingress).
+    """
+
+    type: Literal["quiz"]
+    role: Literal["assistant"]
+    quiz_id: str
+    question: str
+    options: list[QuizOption]
+    stake: str
+    assumption: str
+    state: str
+    ts: str
     chat_id: NotRequired[int]
     task_id: NotRequired[str]
     project_thread: NotRequired[bool]
@@ -603,8 +639,10 @@ class ActiveChatActivity(TypedDict):
 
     The combined snapshot: direct/ephemeral registry turns (same rows as
     ``active_direct_turns``) plus ROOT managed queue tasks projected as
-    ``kind="managed_task"`` with ``phase`` ``queued`` | ``working`` |
-    ``finalizing`` (final answer stored, post-task synthesis still open).
+    ``kind="managed_task"`` with ``phase`` ``queued`` | ``budget_paused``
+    (zero-dispatch member awaiting an explicit resume — never plain
+    "queued") | ``working`` | ``finalizing`` (final answer stored, post-task
+    synthesis still open).
     Field shape mirrors ``ActiveDirectTurn`` so one client reducer hydrates
     both; managed rows carry an empty ``client_message_id``.
     """
@@ -1444,6 +1482,7 @@ WS_MESSAGE_TYPES: tuple[str, ...] = (
     "video",
     "document",
     "links",
+    "quiz",
     "typing",
     "log",
     "heartbeat",
@@ -1467,6 +1506,8 @@ __all__ = [
     "DocumentOutbound",
     "LinkAction",
     "LinksOutbound",
+    "QuizOption",
+    "QuizOutbound",
     "TypingOutbound",
     "LogOutbound",
     "HeartbeatOutbound",

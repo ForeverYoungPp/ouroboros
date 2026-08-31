@@ -827,7 +827,10 @@ def test_merge_point_is_the_only_status_writer_outside_the_agent_stance_merge():
         if 'llm_trace["acceptance_decision"] =' in path.read_text(encoding="utf-8")
         or '["acceptance_decision"] = _dec' in path.read_text(encoding="utf-8")
     )
-    assert writers == ["loop.py", "loop_tool_execution.py"], writers
+    # `_set_acceptance_decision` moved WHOLE into acceptance_dialogue.py with the
+    # rest of the acceptance machinery; the contract (one merge point plus the
+    # agent STANCE merge) is unchanged, only the file that holds it.
+    assert writers == ["acceptance_dialogue.py", "loop_tool_execution.py"], writers
     trace: dict = {}
     _set_acceptance_decision(trace, {"status": ACCEPTANCE_ACCEPTED, "reason": "clean_pass"})
     assert trace["acceptance_decision"]["status"] == ACCEPTANCE_ACCEPTED

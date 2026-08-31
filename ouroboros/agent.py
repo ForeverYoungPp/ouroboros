@@ -447,6 +447,36 @@ class Env:
         return (self.drive_root / safe_relpath(rel)).resolve()
 
 
+def _emit_budget_pause_checkpoint(
+    event_queue: Any,
+    drive_logs: pathlib.Path | None,
+    task_id: str,
+    resource_limit: Dict[str, Any],
+) -> None:
+    """Publish the owner-visible budget-pause checkpoint on the registered path.
+
+    The enveloped log_event route is the ONE registered checkpoint channel
+    (_handle_log_event persists task_checkpoint rows and pushes them live);
+    a bare task_checkpoint on _pending_events has no handler and died as
+    unknown_worker_event, silently losing the owner-visible toast.
+    """
+    checkpoint = {
+        "type": "task_checkpoint",
+        "task_id": task_id,
+        "checkpoint_kind": "budget_scope_paused",
+        "owner_visible": True,
+        "toast_once": f"{task_id}:budget-paused:{resource_limit['scope']}",
+        **resource_limit,
+    }
+    if event_queue is not None:
+        emit_log_event(event_queue, checkpoint)
+    elif drive_logs:
+        try:
+            append_jsonl(drive_logs / "events.jsonl", {"ts": utc_now_iso(), **checkpoint})
+        except Exception:
+            log.debug("budget-pause checkpoint append failed", exc_info=True)
+
+
 class OuroborosAgent:
     """Per-worker agent instance; long-term state lives on Drive."""
 
@@ -1310,14 +1340,9 @@ class OuroborosAgent:
                 "tool_calls": [],
                 "resource_limit": resource_limit,
             }
-            self._pending_events.append({
-                "type": "task_checkpoint",
-                "task_id": task_id,
-                "checkpoint_kind": "budget_scope_paused",
-                "owner_visible": True,
-                "toast_once": f"{task_id}:budget-paused:{resource_limit['scope']}",
-                **resource_limit,
-            })
+            _emit_budget_pause_checkpoint(
+                self._event_queue, drive_logs, task_id, resource_limit
+            )
             emit_task_results(
                 self.env,
                 self.memory,

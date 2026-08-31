@@ -146,6 +146,35 @@ def test_transcript_cap_fails_closed(subject_repo, monkeypatch):
     assert exc.value.code == "native_transcript_cap_exceeded"
 
 
+def test_transcript_counter_includes_system_schemas_and_args(subject_repo, monkeypatch):
+    """The bound is a SEND bound, so it must measure what every send carries:
+    the system instructions and tool schemas ride each provider call, and
+    tool-call argument objects accumulate in the message list like results.
+    A cap sized to admit the bare prompt but not prompt+system+schemas must
+    therefore refuse BEFORE the first send (previously it passed — each send
+    was understated by the fixed ~9K system/schema cost plus the argument
+    tail). Units are chars on both sides.
+    """
+    llm = _ScriptedLLM([
+        {"content": _VERDICT},
+    ])
+    executor = NativeToolRoundReviewExecutor(_assignment(subject_repo, llm), llm=llm)
+    # Comfortably above the episode prompt alone, strictly below what the
+    # first send actually carries (prompt + instructions + tool schemas).
+    # The env knob clamps at a 50K floor, so the getter is patched directly —
+    # the subject is the COUNTER's coverage, not the knob's clamp.
+    import ouroboros.review_native_episode as native_episode
+
+    cap = len(executor.episode_prompt) + 100
+    monkeypatch.setattr(
+        native_episode, "review_native_max_transcript_chars", lambda: cap
+    )
+    with pytest.raises(ReviewRouteUnavailable) as exc:
+        executor.execute()
+    assert exc.value.code == "native_transcript_cap_exceeded"
+    assert not llm.calls, "the send bound must refuse before paying for a send"
+
+
 def test_uninspectable_tool_is_refused_in_episode(subject_repo):
     llm = _ScriptedLLM([
         {"tool_calls": [_tool_call("write_file", {"path": "greeting.txt", "content": "hacked"})]},

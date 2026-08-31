@@ -24,7 +24,7 @@ import tempfile
 from typing import Any, Dict, List, Tuple, Union
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
+from ouroboros.artifacts import task_artifact_dir_path
 from ouroboros.task_results import load_task_result
 from ouroboros.review_state import invalidate_advisory_after_mutation
 from ouroboros.runtime_mode_policy import (
@@ -39,7 +39,6 @@ from ouroboros.headless import (
     ARTIFACT_STATUS_READY_NO_CHANGES,
     ARTIFACT_STATUS_READY_WITH_CHANGES,
 )
-from ouroboros.utils import atomic_write_json, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -128,43 +127,9 @@ def _sha256_file(path: pathlib.Path) -> str:
     return hasher.hexdigest()
 
 
-def _write_verdict(
-    ctx: ToolContext,
-    child_task_id: str,
-    *,
-    outcome: str,
-    reason: str,
-    files: List[str],
-    manifest: Dict[str, Any],
-    applied: bool,
-    conflicts: List[str],
-    protected: List[str],
-    target: str = "",
-) -> str:
-    parent_task_id = task_id_for_artifacts(ctx)
-    art_dir = task_artifact_dir_path(getattr(ctx, "drive_root", "."), parent_task_id, create=True)
-    verdict = {
-        "schema_version": 1,
-        "created_at": utc_now_iso(),
-        "tool": "integrate_subagent_patch",
-        "parent_task_id": parent_task_id,
-        "child_task_id": child_task_id,
-        "outcome": outcome,
-        "applied": bool(applied),
-        "reason": str(reason or ""),
-        "target_root": str(target or ""),
-        "files": list(files or []),
-        "protected_matches": list(protected or []),
-        "conflicts": list(conflicts or []),
-        "patch_sha256": str((manifest or {}).get("sha256") or ""),
-        "diffstat": str((manifest or {}).get("diffstat") or ""),
-    }
-    path = art_dir / f"subagent_patch_verdict_{child_task_id}.json"
-    try:
-        atomic_write_json(path, verdict, trailing_newline=True)
-    except Exception:
-        return ""
-    return str(path)
+# Verdict writing lives in tools/patch_verdict.py (module-size ceiling);
+# the historical private name stays importable for callers and tests.
+from ouroboros.tools.patch_verdict import write_patch_verdict as _write_verdict  # noqa: E402
 
 
 def _child_write_root(child_result: Dict[str, Any]) -> str:

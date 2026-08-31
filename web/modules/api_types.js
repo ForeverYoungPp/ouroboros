@@ -228,6 +228,9 @@
  * @property {string=} task_phase
  *   "finalizing" on a root's early final answer: post-task synthesis still
  *   runs, so the frame is not the task's terminal conclusion.
+ * @property {string=} task_terminal_status
+ *   Typed terminal fact on a frame that IS the turn's conclusion (stamped on
+ *   direct/ephemeral finals and the direct error branch).
  * @property {string=} task_incident
  * @property {string=} toast_once
  * @property {boolean=} task_id_pending
@@ -262,7 +265,8 @@
  *   {delegated_runs_started, delegated_runs_settled, delegated_runs_succeeded,
  *   delegated_runs_failed, delegated_run_failure_states, evidence_read_failed,
  *   subscription_cost_usd, subscription_cost_estimated, harness_models,
- *   nanny_nudge_recorded, delegate_start_attempted}.
+ *   nanny_nudge_recorded, delegate_start_attempted,
+ *   applied_access_profiles}.
  *   Terminal frames only; absent = "no evidence yet", never "ran natively".
  *   `evidence_read_failed: true` = the custody log exists but could not be
  *   read — zero counts are then UNKNOWN, never a "no run" receipt.
@@ -404,6 +408,29 @@
  * @property {LinkAction[]} actions
  * @property {string} ts
  * @property {string=} title
+ * @property {number=} chat_id
+ * @property {string=} task_id
+ * @property {boolean=} project_thread
+ * @property {Object=} transport
+ */
+
+/**
+ * @typedef {Object} QuizOption
+ * @property {string} label
+ * @property {string=} detail
+ */
+
+/**
+ * @typedef {Object} QuizOutbound
+ * @property {"quiz"} type
+ * @property {"assistant"} role
+ * @property {string} quiz_id
+ * @property {string} question
+ * @property {QuizOption[]} options
+ * @property {string} stake
+ * @property {string} assumption
+ * @property {string} state
+ * @property {string} ts
  * @property {number=} chat_id
  * @property {string=} task_id
  * @property {boolean=} project_thread
@@ -1121,4 +1148,5 @@
  */
 
 export const MAX_LINK_ACTIONS = 12;
+export const MAX_QUIZ_OPTIONS = 6;
 export const GATEWAY_CONTRACT_VERSION = '6.113.4';

@@ -92,6 +92,7 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
     succeeded: set = set()
     failure_states: List[str] = []
     models: List[str] = []
+    applied_access_profiles: List[str] = []
     cost_total, cost_known, cost_estimated = 0.0, True, False
     # Scope finding (a5e59bdf gate): an UNREADABLE log must not collapse into
     # the same zero-count result as a proven empty one — a reader would then
@@ -164,6 +165,21 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
             model = str(row.get("model") or "")
             if model and model not in models:
                 models.append(model)
+            # D29 applied-access disclosure: the settlement row records the
+            # ACCESS the engine actually served (effectiveAccess), distinct
+            # from the STARTED row's granted shape. Projected so the chip and
+            # acceptance readers can answer asked-vs-applied without joining
+            # the ledger. Empty when telemetry predates the receipt.
+            # Bounded to the known access-profile vocabulary and a short cap:
+            # the value rides a durable evidence row and the chip tooltip, so a
+            # garbage/oversized engine string must not reach either verbatim.
+            applied_access = str(row.get("access_profile") or "")[:32]
+            if (
+                applied_access
+                and applied_access not in applied_access_profiles
+                and len(applied_access_profiles) < 8
+            ):
+                applied_access_profiles.append(applied_access)
     # A partial work-order run is not a successful delegated substrate until the
     # durable verified-range union covers the complete canonical brief. Reuse the
     # custody replay (the same SSOT used by wait/apply) so a restart cannot turn a
@@ -214,6 +230,9 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
         # dropped: an estimated sum must never render as an exact receipt.
         "subscription_cost_estimated": bool(settled and cost_known and cost_estimated),
         "harness_models": models,
+        # Additive (D29 projection): the access the engine actually served,
+        # from SETTLED rows only. Empty list = no receipt disclosed it.
+        "applied_access_profiles": applied_access_profiles,
     }
 
 
@@ -289,6 +308,67 @@ def acceptance_substrate_facts(ctx: Any, task_id: str) -> Dict[str, Any]:
 
 
 _ACCEPT_DELTA_CHILD_CAP = 20  # reduced-children rows in the finalizer aggregate
+_ACCEPT_PATCH_DISPOSITION_CAP = 20  # disposition rows in the acceptance section
+
+
+def acceptance_patch_dispositions(drive_root: Any, task_id: str) -> Dict[str, Any]:
+    """Typed aggregate of this parent's patch apply/reject decisions (D-trace).
+
+    ``integrate_delegated_patch`` applied a child's diff on FIVE mechanical
+    manifest fields with zero review facts anywhere on the path; the owner
+    decision (4=A) is to ATTEST the apply rather than invent a review: every
+    verdict now also lands as a ``subagent_patch_verdict`` custody row, and
+    this section projects those rows host-attested into the acceptance packet
+    (the ``capability_deltas`` shape — bounded, first-class, never squeezed
+    through the 4KB artifact-preview cliff). ABSENCE of the section means "no
+    disposition recorded", never "reviewed clean"; an unreadable log is the
+    typed ``evidence_read_failed`` marker, never an empty-therefore-clean
+    section (the ``task_execution_evidence`` rule, GR6-4).
+    """
+    from ouroboros import delegate_custody as custody
+    from ouroboros.utils import truncate_review_artifact
+
+    tid = str(task_id or "")
+    out: Dict[str, Any] = {}
+    log_path = custody.event_log_path(drive_root)
+    try:
+        if log_path.exists():
+            with log_path.open("rb"):
+                pass
+        else:
+            return out
+    except OSError:
+        return {"evidence_read_failed": True}
+    rows: List[Dict[str, Any]] = []
+    for row in custody._iter_rows(log_path):
+        if str(row.get("type") or "") != "delegate_run_patch_verdict":
+            continue
+        if str(row.get("task_id") or "") != tid:
+            continue
+        rows.append({
+            "child": str(row.get("child_task_id") or ""),
+            "pipeline": str(row.get("pipeline") or ""),
+            "disposition": str(row.get("disposition") or ""),
+            "applied": bool(row.get("applied")),
+            "reason": truncate_review_artifact(str(row.get("reason") or ""), limit=600),
+            "patch_sha256": str(row.get("patch_sha256") or ""),
+            **({"verdict_artifact_write_failed": True}
+               if row.get("verdict_artifact_write_failed") else {}),
+        })
+    if not rows:
+        return out
+    out["total"] = len(rows)
+    # The honest headline the panel weighs — computed over the COMPLETE row
+    # set BEFORE bounding: a delegated apply among the omitted-oldest rows is
+    # exactly the fact the owner's attest decision (4=A) exists to surface,
+    # and deriving it from the truncated view false-negatives past the cap.
+    if any(r["applied"] and r.get("pipeline") == "delegated" for r in rows):
+        out["unreviewed_delegated_apply"] = True
+    if len(rows) > _ACCEPT_PATCH_DISPOSITION_CAP:
+        out["omitted"] = len(rows) - _ACCEPT_PATCH_DISPOSITION_CAP
+        rows = rows[-_ACCEPT_PATCH_DISPOSITION_CAP:]
+    out["rows"] = rows
+    return out
 
 
 def acceptance_capability_deltas(drive_root: Any, task_id: str, root_task_id: str) -> Dict[str, Any]:

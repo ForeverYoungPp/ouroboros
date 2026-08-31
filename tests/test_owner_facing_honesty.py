@@ -551,9 +551,11 @@ def test_promote_chat_description_carries_ground_truth_probe():
 def test_degraded_owner_line_bounds_each_reason():
     import inspect
 
-    from ouroboros import loop as loop_mod
+    # The DEGRADED owner line lives with the rest of the acceptance machinery,
+    # which moved out of loop.py whole; the contract below is unchanged.
+    from ouroboros import acceptance_dialogue as accept_mod
 
-    src = inspect.getsource(loop_mod)
+    src = inspect.getsource(accept_mod)
     assert "more in the task result" in src  # overflow disclosure, not silence
     # Bounded preview per cause via the shared primitive; full causes live in
     # the structured decision record.

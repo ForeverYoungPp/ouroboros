@@ -190,23 +190,8 @@ class LocalContextTooLargeError(RuntimeError):
     """Raised when a local model cannot fit context without silent truncation."""
 
 
-def _estimate_message_chars(messages: List[Dict[str, Any]]) -> int:
-    from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
-
-    total = 0
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                if str(block.get("type") or "") in ("image_url", "image"):
-                    total += IMAGE_BLOCK_CHAR_EQUIVALENT
-                    continue
-                total += len(str(block.get("text", "")))
-        else:
-            total += len(str(content or ""))
-    return total
+# Lives beside its proxy constant; the historical private name stays importable.
+from ouroboros.context_budget import estimate_message_chars as _estimate_message_chars
 
 
 def _applied_payload_cache_ttl(payload: Dict[str, Any]) -> Optional[str]:
@@ -250,6 +235,9 @@ def _attempt_request(
         prompt_chars = len(json.dumps(prompt_payload, ensure_ascii=False, default=str))
     except Exception:
         prompt_chars = len(str(prompt_payload or ""))
+    from ouroboros.context_fit import bounded_prompt_tokens_for_payload
+
+    bounded_tokens = bounded_prompt_tokens_for_payload(prompt_payload, prompt_chars)
     request_source = source
     if request_source is None:
         bound_scope = current_usage_scope()
@@ -276,6 +264,7 @@ def _attempt_request(
         candidate_measurement_kind="canonical_json_v1",
         physical_context=current_physical_attempt_context(),
         route_is_loopback=is_loopback_base_url(target.get("base_url")),
+        prompt_tokens_bounded_estimate=bounded_tokens,
     )
 
 

@@ -54,6 +54,21 @@ def _emit_settled(drive, run_id="run-1", task_id="child-1", *,
 
 
 class TestCustodyAggregation:
+    def test_applied_access_rides_settled_rows(self, tmp_path):
+        """D29 projection: the engine-served access (effectiveAccess) on the
+        SETTLED row reaches the evidence so asked-vs-applied is answerable
+        without joining the ledger; absent receipts leave the list empty."""
+        drive = _drive(tmp_path)
+        _emit_started(drive, "run-1")
+        assert custody.emit(drive, custody.SETTLED, {
+            "run_id": "run-1", "task_id": "child-1", "route": "claude",
+            "model": "m", "state": "succeeded", "cost_usd": 0.0,
+            "cost_final": True, "spend_disclosed": True,
+            "spend_estimated": False, "access_profile": "workspace_write",
+        })
+        evidence = custody.task_execution_evidence(drive, "child-1")
+        assert evidence["applied_access_profiles"] == ["workspace_write"]
+
     def test_no_rows_is_zero_runs_not_an_error(self, tmp_path):
         drive = _drive(tmp_path)
         evidence = custody.task_execution_evidence(drive, "child-1")
@@ -70,6 +85,7 @@ class TestCustodyAggregation:
             "subscription_cost_usd": None,
             "subscription_cost_estimated": False,
             "harness_models": [],
+            "applied_access_profiles": [],
         }
 
     def test_started_and_settled_runs_aggregate_with_disclosed_spend(self, tmp_path):
@@ -166,6 +182,7 @@ class TestEnvelopeReconciliation:
             "subscription_cost_usd": None,
             "subscription_cost_estimated": False,
             "harness_models": [],
+            "applied_access_profiles": [],
         }
 
     def test_settled_delegate_rows_read_as_harness_evidence(self, tmp_path):

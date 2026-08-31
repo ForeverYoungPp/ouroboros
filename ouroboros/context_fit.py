@@ -212,6 +212,23 @@ def tool_schema_tokens(tools: Optional[List[Dict[str, Any]]]) -> int:
     return estimate_tokens(json.dumps(tools, ensure_ascii=False, sort_keys=True, default=str))
 
 
+def bounded_prompt_tokens_for_payload(prompt_payload: Dict[str, Any], fallback_chars: int) -> int:
+    """The density witness's basis: the fit estimator's own token count for a
+    request payload (messages + tools, images at the proxy), or ``fallback_chars
+    // 4`` when there is no message list. Kept beside the estimator so the two
+    can never diverge; ``estimate_message_chars`` dropped tool_call objects and
+    made density ~1.4x high on the tool-heavy shape (measure_main_fit multiplies
+    THIS quantity)."""
+    try:
+        messages = prompt_payload.get("messages")
+        if isinstance(messages, list):
+            return int(estimate_context_prompt_tokens(
+                messages, prompt_payload.get("tools") or prompt_payload.get("functions")))
+    except Exception:
+        pass
+    return max(0, int(fallback_chars) // 4)
+
+
 def estimate_context_prompt_tokens(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]] = None,

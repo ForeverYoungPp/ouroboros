@@ -2589,3 +2589,4 @@ def test_forced_bypass_probe_failure_records_unknown_eligibility(tmp_path, monke
         "trigger": "bypassed_round_limit",
     }
     assert "acceptance_decision" not in trace
+
