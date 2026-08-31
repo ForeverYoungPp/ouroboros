@@ -1,6 +1,31 @@
 from ouroboros.loop_tool_execution import _extract_result_metadata, _is_tool_execution_failure
 
 
+def test_late_tool_settlement_runs_owner_cleanup_before_lease_close(monkeypatch):
+    from types import SimpleNamespace
+
+    import ouroboros.loop_tool_execution as lte
+
+    class ImmediateFuture:
+        def add_done_callback(self, callback):
+            callback(self)
+
+    calls = []
+    monkeypatch.setattr(lte, "emit_cognitive_operation_event", lambda *args, **kwargs: None)
+    tools = SimpleNamespace(_ctx=SimpleNamespace(event_queue=None, task_attempt=None))
+
+    lte._attach_late_tool_settlement(
+        tools,
+        ImmediateFuture(),
+        task_id="task",
+        tool_call_id="call",
+        correlation={},
+        on_settled=lambda: calls.append("cleanup"),
+    )
+
+    assert calls == ["cleanup"]
+
+
 def test_get_tool_timeout_honors_per_call_override(monkeypatch):
     """T3 (v6.35.0): the OUTER tool-execution timeout must rise for a per-call
     run_command/run_script timeout_sec, else the static 360s entry cap would cut
@@ -226,6 +251,7 @@ def test_live_tool_log_payload_includes_structured_result_metadata(tmp_path, mon
     import pathlib
     import time
     from types import SimpleNamespace
+
     import ouroboros.loop_tool_execution as loop_tool_execution
     from ouroboros.loop_tool_execution import _execute_with_timeout
 

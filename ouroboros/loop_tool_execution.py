@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import contextvars
 import json
+import logging
 import os
 import pathlib
 import re
 import time
-import concurrent.futures
-import contextvars
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional
-
-import logging
 
 from ouroboros.config import (
     NESTED_SETTLEMENT_MARGIN_SEC,
@@ -22,13 +21,19 @@ from ouroboros.config import (
 from ouroboros.deadline_utils import deadline_remaining_sec
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.tool_capabilities import (
-    READ_ONLY_PARALLEL_TOOLS,
-    PARALLEL_SAFE_ENQUEUE_TOOLS,
     FOREGROUND_MUTATIVE_TOOLS,
+    PARALLEL_SAFE_ENQUEUE_TOOLS,
+    READ_ONLY_PARALLEL_TOOLS,
     REVIEWED_MUTATIVE_TOOLS,
     STATEFUL_BROWSER_TOOLS,
-    UNTRUNCATED_TOOL_RESULTS as _UNTRUNCATED_TOOL_RESULTS,
+)
+from ouroboros.tool_capabilities import (
     UNTRUNCATED_REPO_READ_PATHS as _UNTRUNCATED_REPO_READ_PATHS,
+)
+from ouroboros.tool_capabilities import (
+    UNTRUNCATED_TOOL_RESULTS as _UNTRUNCATED_TOOL_RESULTS,
+)
+from ouroboros.tool_capabilities import (
     tool_result_limit as _tool_result_limit,
 )
 from ouroboros.tools.registry import ToolRegistry
@@ -172,12 +177,18 @@ def _attach_late_tool_settlement(
     task_id: str,
     tool_call_id: str,
     correlation: Dict[str, Any],
+    on_settled: Optional[Callable[[], None]] = None,
 ) -> None:
     """Close the cognitive lease when a timed-out worker finally settles."""
     tool_ctx = getattr(tools, "_ctx", None)
     event_queue = getattr(tool_ctx, "event_queue", None)
 
     def _settled(_future: Any) -> None:
+        if on_settled is not None:
+            try:
+                on_settled()
+            except Exception:
+                log.debug("Late tool cleanup failed", exc_info=True)
         emit_cognitive_operation_event(
             event_queue,
             task_id=task_id,
@@ -907,6 +918,7 @@ def _execute_with_timeout(
     use_stateful = stateful_executor and fn_name in STATEFUL_BROWSER_TOOLS
     started_at = time.perf_counter()
     correlation = _tool_correlation(tools)
+    tool_ctx = getattr(tools, "_ctx", None)
     args_for_log = {}
     try:
         args = json.loads(tc["function"]["arguments"] or "{}")
@@ -924,6 +936,7 @@ def _execute_with_timeout(
     }, correlation, tool_call_id=tool_call_id))
 
     if use_stateful:
+        assert stateful_executor is not None
         future = stateful_executor.submit(_execute_single_tool, tools, tc, drive_logs, task_id)
         try:
             result = future.result(timeout=timeout_sec)
@@ -944,9 +957,24 @@ def _execute_with_timeout(
             }, correlation, tool_call_id=tool_call_id))
             return result
         except (TimeoutError, concurrent.futures.TimeoutError):
+            detached_browser_handles = None
+            on_settled: Optional[Callable[[], None]] = None
+            if use_stateful and tool_ctx is not None:
+                from ouroboros.tools.browser import (
+                    _detach_browser,
+                    cleanup_browser_handles,
+                )
+
+                detached_browser_handles = _detach_browser(tool_ctx)
+                def _cleanup_detached_browser() -> None:
+                    if detached_browser_handles is not None:
+                        cleanup_browser_handles(detached_browser_handles)
+
+                on_settled = _cleanup_detached_browser
             _attach_late_tool_settlement(
                 tools, future, task_id=task_id, tool_call_id=tool_call_id,
                 correlation={**correlation, "tool": fn_name},
+                on_settled=on_settled,
             )
             stateful_executor.reset()
             reset_msg = "Browser state has been reset. "
