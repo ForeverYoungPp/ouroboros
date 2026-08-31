@@ -32,7 +32,7 @@ test('up to date is claimed only over a real check result, with its age', () => 
         current_version: '1', current_short_sha: 'aaaa',
     }, '');
     assert.equal(cached.state, 'current');
-    assert.match(cached.hint, /checked 3 h ago/);
+    assert.equal(cached.checkedAgo, 'checked 3 h ago');
     const never = updateVerdict({
         managed: true, check_ok: null, available: false,
         warnings: ['official_status_requires_check'],

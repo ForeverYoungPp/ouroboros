@@ -110,10 +110,7 @@ export function updateVerdict(data = {}, phase = '') {
             state: unsafe ? 'available_unsafe' : 'available',
             tone: unsafe ? 'warn' : 'ok',
             headline: `Update available: ${currentVersion} (${currentSha}) -> ${latestVersion} (${latestSha})`,
-            hint: [
-                unsafe ? 'Local commits or uncommitted changes diverge from the official line; applying merges them.' : '',
-                checkedAgo,
-            ].filter(Boolean).join(' · '),
+            hint: unsafe ? 'Local commits or uncommitted changes diverge from the official line; applying merges them.' : '',
             action: { id: 'update', label: `Update to ${latestVersion}` },
         };
     }
@@ -124,7 +121,7 @@ export function updateVerdict(data = {}, phase = '') {
             ...base,
             state: 'current', tone: 'ok',
             headline: `Ouroboros is up to date at ${currentVersion} (${currentSha}).`,
-            hint: checkedAgo ? `As of the last check — ${checkedAgo}.` : '',
+            hint: '',
             action: { id: 'check', label: 'Check again' },
         };
     }
@@ -205,6 +202,8 @@ export function initUpdates({ mount, state, ws, showPage }) {
         hint.hidden = !hintText;
         meta.innerHTML = (verdict.chips || []).map(chipHtml).join('');
         actionNote.textContent = verdict.checkedAgo || '';
+        const actionRow = actionNote.parentElement;
+        actionRow.hidden = !verdict.action && !verdict.checkedAgo;
         if (verdict.action) {
             primaryBtn.hidden = false;
             primaryBtn.disabled = Boolean(verdict.action.disabled);

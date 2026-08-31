@@ -6567,7 +6567,7 @@ textarea.chat-input {
 }
 .updates-chip-link {
     cursor: pointer;
-    font: inherit;
+    font-family: inherit;
     text-align: left;
 }
 .updates-chip-link:hover {
