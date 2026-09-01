@@ -1112,6 +1112,12 @@ def _sealed(details=None, content=None, model="z-ai/glm-4.6", **extra):
     ({}, False),
     # --- sealed for a non-roster family ---
     ({"details": [{"type": "reasoning.text", "text": "t", "signature": "sig"}]}, True),
+    # A signed SUMMARY seals too: a signature is an endpoint binding wherever it
+    # rides on a readable entry (fail-closed; roast finding F6).
+    ({"details": [{"type": "reasoning.summary", "summary": "s", "signature": "sig"}]}, True),
+    # Non-string truthy flat reasoning fields are unrecognized shapes => fail-closed.
+    ({"reasoning": {"weird": "dict"}}, True),
+    ({"reasoning_content": ["weird", "list"]}, True),
     ({"details": [{"type": "reasoning.encrypted", "data": "blob"}]}, True),
     ({"details": [{"type": "reasoning.brand_new_shape"}]}, True),  # unknown => fail-closed
     ({"details": [{"no_type": 1}]}, True),
@@ -1128,7 +1134,8 @@ def test_sealed_classifier_single_forms(kwargs, expected):
 
 
 @pytest.mark.parametrize("model", ["anthropic/claude-sonnet-4.6", "google/gemini-3.5-flash",
-                                   "~google/gemini-3.5-flash", " anthropic/claude-opus-5 "])
+                                   "~google/gemini-3.5-flash", " anthropic/claude-opus-5 ",
+                                   "Anthropic/Claude-Opus-5"])
 @pytest.mark.parametrize("form", [
     {"details": [{"type": "reasoning.encrypted", "data": "blob"}]},
     {"details": [{"type": "reasoning.text", "text": "t", "signature": "sig"}]},

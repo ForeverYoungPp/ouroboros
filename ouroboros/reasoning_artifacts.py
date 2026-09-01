@@ -51,7 +51,7 @@ _THINKING_BLOCK_TYPES = frozenset({"thinking", "reasoning"})
 
 
 def _roster_vouched(model: Any) -> bool:
-    normalized = str(model or "").strip().lstrip("~")
+    normalized = str(model or "").strip().lstrip("~").lower()
     return normalized.startswith(SIGNED_PORTABLE)
 
 
@@ -73,7 +73,9 @@ def _sealing_detail_label(details: Any) -> Optional[str]:
             return "encrypted"
         if dtype not in _READABLE_DETAIL_TYPES:
             return "unknown_type"
-        if dtype == "reasoning.text" and _is_signed(entry.get("signature")):
+        if _is_signed(entry.get("signature")):
+            # Any signed readable entry seals, summary included: a signature is an
+            # endpoint binding wherever it rides (fail-closed, roast finding F6).
             return "signed_text"
     return None
 
@@ -99,13 +101,20 @@ def sealed_reasoning_artifact(messages: Iterable[Any], model: Any) -> Optional[s
 
     The label is a bounded host-owned vocabulary (``encrypted``, ``signed_text``,
     ``signed_block``, ``redacted_thinking``, ``unknown_type``,
-    ``reasoning_details_malformed``) safe to disclose in usage telemetry."""
+    ``reasoning_details_malformed``, ``reasoning_malformed``) safe to disclose in
+    usage telemetry."""
     if _roster_vouched(model):
         # The roster vouches every form for its families: nothing here can seal.
         return None
     for msg in messages or ():
         if not isinstance(msg, dict):
             continue
+        for flat_key in ("reasoning", "reasoning_content"):
+            flat = msg.get(flat_key)
+            if flat and not isinstance(flat, str):
+                # A non-string truthy flat reasoning field is a shape we do not
+                # recognize — fail-closed like the other malformed carriers.
+                return "reasoning_malformed"
         label = _sealing_detail_label(msg.get("reasoning_details"))
         if label:
             return label
