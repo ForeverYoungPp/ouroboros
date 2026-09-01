@@ -1475,10 +1475,16 @@ def _run_script(
             + ". Re-run with outputs=[...] or write the canonical deliverable via root=artifact_store."
         )
     if str(result).lstrip().startswith("⚠️"):
+        # The result already owns line 1 with its own typed marker, which is what
+        # the failure classifier reads — the nudge appends after it.
         tail = f"\n{audit_note}" if audit_note else ""
         return f"{result}{tail}\n# script_path={script_path}"
     if audit_note:
-        return f"{audit_note}\n# script_path={script_path}"
+        # The nudge used to REPLACE the whole _run_shell payload (a successful
+        # script's answer was gone; re-running was the sole recovery). Marker
+        # first — ARTIFACT_OUTPUT_UNDECLARED is a typed policy-denial surface the
+        # classifier reads off line 1 — payload appended, as in run_command.
+        return f"{audit_note}\n\n# script_path={script_path}\n{result}"
     return f"# script_path={script_path}\n{result}"
 
 

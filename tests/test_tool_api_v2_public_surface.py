@@ -1119,6 +1119,11 @@ def test_run_script_without_outputs_flags_absolute_user_file_writes(tmp_path, mo
     assert result.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"), result
     assert "run_script wrote user_files without declaring outputs" in result
     assert str(target) in result
+    # #447/D5: the nudge must not REPLACE the payload. It held line 1 (the typed
+    # policy-denial surface the classifier reads) and returned nothing else, so a
+    # successful script's own output was discarded. The script path and the run
+    # result now ride behind the marker.
+    assert "# script_path=" in result
     # The write happened (post-exec) but the file is NOT registered as an artifact.
     assert target.read_text(encoding="utf-8") == "<h1>ok</h1>"
     assert not (data / "task_results" / "artifacts" / "task1" / target.name).exists()
