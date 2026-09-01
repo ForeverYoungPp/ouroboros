@@ -2529,9 +2529,12 @@ def test_a_spawn_that_never_publishes_a_descriptor_does_not_leave_the_child_runn
 
 
 def test_first_spawn_loser_attaches_to_the_winners_endpoint(monkeypatch, tmp_path):
-    """A concurrent first-use winner is success, not a false spawn failure."""
+    """A delayed concurrent winner is success, not a false spawn failure."""
     from ouroboros import claudexor_runtime as runtime
-    from ouroboros.gateways.claudexor import DaemonEndpoint
+    from ouroboros.gateways.claudexor import (
+        SHORT_POLL_TIMEOUT_SEC,
+        DaemonEndpoint,
+    )
 
     data_dir = tmp_path / "data"
     config_dir = data_dir / "claudexor"
@@ -2563,11 +2566,123 @@ def test_first_spawn_loser_attaches_to_the_winners_endpoint(monkeypatch, tmp_pat
     endpoint = DaemonEndpoint(host="127.0.0.1", port=45681, token="winner-token")
     manager = owned.OwnedClaudexorDaemon()
     monkeypatch.setattr(manager, "_classify_liveness", lambda: (None, "not_provisioned", ""))
-    monkeypatch.setattr(manager, "_alive_endpoint", lambda: endpoint)
+    monkeypatch.setattr(owned, "_SPAWN_POLL_SEC", 0.0)
+    probe_bounds = []
+
+    def delayed_winner(*, timeout_sec=None):
+        probe_bounds.append(timeout_sec)
+        return endpoint if len(probe_bounds) == 3 else None
+
+    monkeypatch.setattr(manager, "_alive_endpoint", delayed_winner)
 
     assert manager.ensure_running() is endpoint
+    assert len(probe_bounds) == 3
+    assert all(0 < bound <= SHORT_POLL_TIMEOUT_SEC for bound in probe_bounds)
     assert manager._proc is None
     assert manager.stop() is False
+
+
+def test_exited_spawn_times_out_cleanly_with_bounded_liveness_probes(
+        monkeypatch, tmp_path):
+    """An exited child is forgotten only after the shared startup window."""
+    from ouroboros import claudexor_runtime as runtime
+    from ouroboros.gateways import claudexor as gateway_mod
+    from ouroboros.gateways.claudexor import (
+        SHORT_POLL_TIMEOUT_SEC,
+        ClaudexorUnavailable,
+        DaemonEndpoint,
+    )
+
+    data_dir = tmp_path / "data"
+    config_dir = data_dir / "claudexor"
+    _point_owned_home(monkeypatch, config_dir, data_dir)
+    monkeypatch.setattr(owned, "verify_owned_home", lambda: "")
+    monkeypatch.setattr(owned, "_SPAWN_WAIT_SEC", 0.03)
+    monkeypatch.setattr(owned, "_SPAWN_POLL_SEC", 0.01)
+
+    class Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = Clock()
+    monkeypatch.setattr(owned, "time", clock)
+
+    class ReadyRuntime:
+        def ensure(self):
+            return ["/fixture/node", "/fixture/claudexord.bundle.cjs"]
+
+        def status(self):
+            return {"source": "download"}
+
+    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: ReadyRuntime())
+
+    provisioned = {"value": False}
+    monkeypatch.setattr(owned, "owned_daemon_provisioned",
+                        lambda: provisioned["value"])
+    endpoint = DaemonEndpoint(host="127.0.0.1", port=45682, token="winner-token")
+    monkeypatch.setattr(gateway_mod, "discover_daemon_at", lambda _home: endpoint)
+    handshake_bounds = []
+
+    class UnreachableGateway:
+        def __init__(self, _endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            pass
+
+        def handshake(self, *, timeout_sec=None):
+            handshake_bounds.append((clock.monotonic(), timeout_sec))
+            raise ClaudexorUnavailable("daemon_unreachable", "not ready")
+
+    monkeypatch.setattr(gateway_mod, "ClaudexorGateway", UnreachableGateway)
+
+    class ExitedChild:
+        pid = 424244
+        terminated = 0
+
+        def poll(self):
+            return 1
+
+        def terminate(self):
+            self.terminated += 1
+
+    child = ExitedChild()
+    import ouroboros.process_custody as custody_mod
+
+    def spawn(*_args, **kwargs):
+        provisioned["value"] = True
+        kwargs["stdout"].write(b"writer lease lost\n")
+        kwargs["stdout"].flush()
+        return child
+
+    monkeypatch.setattr(custody_mod, "spawn_supervised", spawn)
+
+    manager = owned.OwnedClaudexorDaemon()
+    with pytest.raises(ClaudexorUnavailable) as err:
+        manager.ensure_running()
+
+    assert err.value.code == "daemon_spawn_failed"
+    assert "writer lease lost" in str(err.value)
+    assert handshake_bounds
+    assert clock.now == pytest.approx(owned._SPAWN_WAIT_SEC)
+    assert all(started < owned._SPAWN_WAIT_SEC for started, _bound in handshake_bounds)
+    assert all(
+        0 < bound <= min(owned._SPAWN_WAIT_SEC - started, SHORT_POLL_TIMEOUT_SEC)
+        for started, bound in handshake_bounds
+    )
+    assert child.terminated == 0
+    assert manager._proc is None
+
+    manager._classify_liveness()
+    assert handshake_bounds[-1] == (clock.now, None)
 
 
 def test_dead_owned_daemon_is_restarted_and_reconciled(monkeypatch, tmp_path):
@@ -2854,7 +2969,7 @@ def test_staged_update_activates_only_at_the_next_natural_start(monkeypatch, tmp
         "spawn_supervised",
         lambda command, **_kwargs: spawns.append(list(command)) or _LiveChild(),
     )
-    monkeypatch.setattr(daemon, "_alive_endpoint", lambda: new_endpoint)
+    monkeypatch.setattr(daemon, "_alive_endpoint", lambda **_kwargs: new_endpoint)
 
     # Phase 1: the OLD endpoint keeps serving; the new target is only staged.
     assert daemon.ensure_running() is old_endpoint
