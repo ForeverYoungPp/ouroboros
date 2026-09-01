@@ -703,7 +703,18 @@ def _git_show_staged(repo_dir, path: str) -> str:
 
 def _preflight_check(commit_message: str, staged_files: str,
                      repo_dir) -> Optional[str]:
-    """Fast deterministic review preflight for common incomplete staged diffs."""
+    """Fast deterministic review preflight for common incomplete staged diffs.
+
+    Only exact mechanical checks live here — ones that compare real staged
+    artifacts (version-carrier sync, README changelog row, P9 history limits,
+    conftest.py hygiene). Two lexical heuristics were deliberately removed
+    (issue #447): the commit-message version-reference guess (its "version"
+    substring test matched "conversion") and the ".py under ouroboros/ or
+    supervisor/ requires tests/ staged" predicate (it refused comment-only
+    diffs and accepted tests/README.md as coverage). Both duties now live in
+    the semantic checklist: docs/CHECKLISTS.md item 6 (tests_affected) and
+    item 8 (version_bump).
+    """
     import re
     import string as _string
 
@@ -733,50 +744,27 @@ def _preflight_check(commit_message: str, staged_files: str,
     active_staged = {path for status, path in file_status if status != "D"}
     # Added/Copied count as new modules; renames do not.
     new_files = {path for status, path in file_status if status in ("A", "C")}
-    has_version_ref = bool(re.search(r'v?\d+\.\d+\.\d+', commit_message)) or "version" in commit_message.lower()
     version_staged = "VERSION" in active_staged
-
-    missing = []
 
     # VERSION staged but README missing.
     if version_staged and "README.md" not in active_staged:
-        missing.append("README.md (badge + changelog)")
-
-    # Commit message references version but VERSION is not staged.
-    if has_version_ref and not version_staged:
-        if any(f.endswith(('.py', '.md')) and f != 'VERSION' for f in active_staged):
-            missing.append("VERSION")
-
-    if missing:
         return (
-            f"⚠️ PREFLIGHT_BLOCKED: Staged diff is incomplete — fix before review.\n"
-            f"  Missing from staged: {', '.join(missing)}\n"
+            "⚠️ PREFLIGHT_BLOCKED: Staged diff is incomplete — fix before review.\n"
+            "  Missing from staged: README.md (badge + changelog)\n"
             f"  Currently staged: {', '.join(sorted(staged_set)) or '(none)'}\n\n"
             "Stage all related files together. Use write_file for all files first,\n"
             "then commit_reviewed to stage and commit everything in one diff."
         )
 
-    # Python logic touched without active tests staged.
-    _LOGIC_DIRS = ("ouroboros/", "supervisor/")
-    logic_changed = any(
-        f.startswith(_LOGIC_DIRS) and f.endswith(".py")
-        for f in staged_set  # all statuses including D
-    )
-    tests_staged = any(f.startswith("tests/") for f in active_staged)
-    if logic_changed and not tests_staged:
-        return (
-            "⚠️ PREFLIGHT_BLOCKED: Python logic changed in ouroboros/ or supervisor/ "
-            "but no tests/ files are staged.\n"
-            "  Add or update tests to cover the changed behaviour, then re-stage.\n"
-            "  If this is a docs/config-only change that triggered a false positive, "
-            "check that no .py files from ouroboros/ or supervisor/ are in your staged set.\n"
-            f"  Currently staged: {', '.join(sorted(staged_set)) or '(none)'}"
-        )
+    # The version-reference and tests-required lexical heuristics were removed
+    # here (false blocks: a "conversion" commit told to bump VERSION; a
+    # comment-only .py diff refused for missing tests). See docstring —
+    # CHECKLISTS.md items 6/8 own these duties semantically.
 
     # New logic modules require active ARCHITECTURE.md update.
     new_logic_files = [
         f for f in new_files
-        if f.startswith(_LOGIC_DIRS) and f.endswith(".py")
+        if f.startswith(("ouroboros/", "supervisor/")) and f.endswith(".py")
     ]
     if new_logic_files and "docs/ARCHITECTURE.md" not in active_staged:
         return (
