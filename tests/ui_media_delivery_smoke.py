@@ -291,6 +291,45 @@ def run_media_delivery_smoke(direct_server_with_data):
                 assert geometry["dialogWidth"] > 0, geometry
                 assert abs(geometry["dx"]) <= 2 and abs(geometry["dy"]) <= 2, geometry
 
+                # The opt-out marker is selective, not a blanket disable: a
+                # markdown-rendered body resolves to `normal` while a body that
+                # still carries authored plain text keeps its line breaks. Read
+                # computed style so a later rule ordering or specificity change
+                # cannot silently re-inherit the bubble default.
+                computed = page.evaluate("""() => {
+                    const host = document.querySelector('#chat-messages');
+                    const probe = document.createElement('div');
+                    probe.className = 'chat-bubble assistant';
+                    probe.innerHTML = `<div class="message">
+                        <div class="chat-live-line">
+                          <span class="chat-live-line-title" data-chat-markdown-enhanced>t</span>
+                          <div class="chat-live-line-body">b</div>
+                        </div>
+                        <div class="skill-review-full" data-chat-markdown-enhanced>s</div>
+                        <div class="chat-review-attempt-detail" data-chat-markdown-enhanced>d</div>
+                        <div class="chat-review-attempt-detail">plain</div>
+                        <div class="chat-live-line-title">plain-title</div>
+                    </div>`;
+                    host.appendChild(probe);
+                    const ws = (node) => getComputedStyle(node).whiteSpace;
+                    const details = [...probe.querySelectorAll('.chat-review-attempt-detail')];
+                    const titles = [...probe.querySelectorAll('.chat-live-line-title')];
+                    const measured = {
+                        title: ws(titles[0]),
+                        body: ws(probe.querySelector('.chat-live-line-body')),
+                        full: ws(probe.querySelector('.skill-review-full')),
+                        detail: ws(details[0]),
+                        plainDetail: ws(details[1]),
+                        plainTitle: ws(titles[1]),
+                    };
+                    probe.remove();
+                    return measured;
+                }""")
+                assert computed == {
+                    "title": "normal", "body": "normal", "full": "normal", "detail": "normal",
+                    "plainDetail": "pre-wrap", "plainTitle": "pre-wrap",
+                }, computed
+
                 page.wait_for_timeout(100)
                 assert console_errors == []
             finally:

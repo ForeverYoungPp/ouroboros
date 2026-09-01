@@ -2402,7 +2402,8 @@ body.resizing-panels { user-select: none; }
 
 .chat-live-line-body {
     color: rgba(226, 232, 240, 0.64);
-    white-space: pre-wrap;
+    /* white-space is set with the other rendered-markdown surfaces, next to the
+       chat bubble's pre-wrap default this body has to opt out of. */
     word-break: break-word;
     font-size: 13px;
     line-height: 1.5;
@@ -6813,8 +6814,9 @@ textarea.chat-input {
 }
 
 /* The links bubble's own .message is a container (title + list), so the same
-   structural rule applies to it directly. */
-.chat-links-message {
+   structural rule applies to it directly — at the specificity of the
+   `.chat-bubble .message` pre-wrap default it has to beat. */
+.chat-bubble .message.chat-links-message {
     white-space: normal;
 }
 
