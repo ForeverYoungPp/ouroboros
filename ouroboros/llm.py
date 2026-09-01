@@ -3518,8 +3518,12 @@ class LLMClient:
         # direct branch (which returns early below) is covered too — mirrors the
         # local/GigaChat lanes; the VLM tool lane already routes vision to a capable
         # slot. supports_vision() is a no-op for vision-capable models.
+        # The lookup MUST use the qualified identity (usage_model): the stripped
+        # resolved_model has lost its "<provider>::" namespace, matched no
+        # normalized vision prefix, and blinded every direct-provider install —
+        # same identity contract as the browser-screenshot call site (E1).
         from ouroboros.provider_models import supports_vision
-        if not supports_vision(resolved_model):
+        if not supports_vision(str(target.get("usage_model") or resolved_model)):
             messages = self._replace_image_blocks_with_placeholder(messages)
         # Official direct OpenAI Chat uses the current completion-token carrier:
         # provider-wide; model names are not capability authority across routes.
