@@ -4695,6 +4695,9 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     -webkit-backdrop-filter: blur(14px);
     font-size: 13px;
     line-height: 1.45;
+    /* Error text can be a long unbroken token (a path, a URL, a serialized
+       body); without this it overflows the toast instead of wrapping. */
+    overflow-wrap: anywhere;
     pointer-events: auto;
     cursor: pointer;
     animation: toast-in 160ms ease-out;
