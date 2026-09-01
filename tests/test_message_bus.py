@@ -235,7 +235,7 @@ def test_send_links_broadcasts_publishes_and_persists_compact_row(monkeypatch, t
     assert topic == event_bus.CHAT_LINKS
     assert set(payload) == {"chat_id", "transport", "title", "actions", "ts"}
     assert payload["actions"] == actions
-    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text().splitlines()[-1])
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert row["type"] == "links"
     assert row["actions"] == actions
     assert row["title"] == "Results"
@@ -269,7 +269,7 @@ def test_send_links_caps_title_across_broadcast_event_and_persistence(monkeypatc
     topic, payload = events[-1]
     assert topic == event_bus.CHAT_LINKS
     assert len(payload["title"]) == 240
-    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text().splitlines()[-1])
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert len(row["title"]) == 240
 
 
@@ -309,7 +309,7 @@ def test_send_links_accepts_valid_link_actions(monkeypatch, tmp_path, label, url
     assert (ok, error) == (True, "ok")
     assert frames[-1]["actions"] == actions
     assert events[-1][1]["actions"] == actions
-    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text().splitlines()[-1])
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert row["actions"] == actions
 
 
@@ -386,7 +386,7 @@ def test_send_document_persists_compact_chat_row(monkeypatch, tmp_path):
     assert live["task_id"] == "t-1"
     assert live["size_bytes"] == len(b"filebytes")
 
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text().splitlines() if line.strip()]
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     doc_rows = [r for r in rows if r.get("type") == "document"]
     assert len(doc_rows) == 1
     row = doc_rows[0]
@@ -434,7 +434,7 @@ def test_send_photo_and_video_persist_compact_rows_before_unread_revision(monkey
 
     rows = [
         json.loads(line)
-        for line in (tmp_path / "logs" / "chat.jsonl").read_text().splitlines()
+        for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     assert [(row["type"], row["text"], row["mime"]) for row in rows] == [
@@ -465,7 +465,7 @@ def test_send_photo_keeps_live_delivery_when_media_persistence_fails(monkeypatch
     assert ok is True
     assert next(frame for frame in frames if frame.get("type") == "photo")["image_base64"]
     import json
-    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text().splitlines()[-1])
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert row.get("download_url", "") == ""
 
 

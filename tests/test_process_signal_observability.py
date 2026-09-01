@@ -35,8 +35,15 @@ from types import SimpleNamespace
 import pytest
 
 import ouroboros.tools.shell as shell
-from ouroboros.tools.process_facts import consume_last_process_facts
+from ouroboros.tools.process_facts import consume_last_process_facts, signal_name_for_returncode
 from ouroboros.tools.shell import _run_shell
+
+# The SSOT (``signal_name_for_returncode``) names -9 from the host signal table:
+# SIGKILL on POSIX; Windows has no such signal, so the name there is the
+# disclosed numeric fallback. The flow tests below pin that the typed meta
+# CARRIES the SSOT-derived name end to end; the POSIX vocabulary itself is
+# pinned by the posix-only real-process tests further down.
+_KILL_NAME = signal_name_for_returncode(-9)
 
 
 @pytest.fixture(autouse=True)
@@ -101,9 +108,9 @@ def test_run_shell_publishes_signal_death_facts(tmp_path, fake_subprocess):
     result = _run_shell(_ctx(tmp_path), ["node", "--version"])
     facts = consume_last_process_facts()
     assert facts["exit_code"] == -9
-    assert facts["signal"] == "SIGKILL"
+    assert facts["signal"] == _KILL_NAME
     # The existing rendered shape stays: signal named in prose as before.
-    assert "⚠️ SHELL_EXIT_ERROR" in result and "signal=SIGKILL" in result
+    assert "⚠️ SHELL_EXIT_ERROR" in result and f"signal={_KILL_NAME}" in result
     assert "duration_ms" not in result
 
 
@@ -185,7 +192,7 @@ def test_execute_single_tool_merges_typed_meta_with_precedence(tmp_path):
     meta = out["result_meta"]
     assert meta["status"] == "non_zero_exit"
     assert meta["exit_code"] == -9
-    assert meta["signal"] == "SIGKILL"
+    assert meta["signal"] == _KILL_NAME
     assert isinstance(meta["duration_ms"], int)
 
 
@@ -242,11 +249,11 @@ def test_typed_meta_flows_handler_to_trace_item_to_error_record(tmp_path):
     assert errors == 1
     item = llm_trace["tool_calls"][0]
     assert item["exit_code"] == -9
-    assert item["signal"] == "SIGKILL"
+    assert item["signal"] == _KILL_NAME
     assert isinstance(item["duration_ms"], int)
     buckets = _classify_tool_errors(llm_trace)
     assert buckets["unresolved"] and not buckets["cosmetic"]
-    assert buckets["unresolved"][0]["signal"] == "SIGKILL"
+    assert buckets["unresolved"][0]["signal"] == _KILL_NAME
 
 
 def test_typed_absence_beats_regex_signal_from_stdout(tmp_path):

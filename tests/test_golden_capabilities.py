@@ -23,6 +23,12 @@ from ouroboros.tools.core import _code_search, _list_files, _read_file, _write_f
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 
 
+def _posix(rendered: str) -> str:
+    """Listings and search hits spell paths with the host separator (JSON-escaped
+    in a listing); compare them separator-agnostically."""
+    return rendered.replace("\\\\", "/").replace("\\", "/")
+
+
 AWS_SECRET_LINE = "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
 
 
@@ -78,9 +84,9 @@ def test_root_reads_credential_named_user_file_masked_not_refused(user_files_ctx
 def test_root_lists_and_searches_credential_named_user_files(user_files_ctx):
     ctx, _home = user_files_ctx
     listing = _list_files(ctx, path=".aws", root="user_files")
-    assert ".aws/credentials" in listing                 # the name is not hidden
+    assert ".aws/credentials" in _posix(listing)         # the name is not hidden
     found = _code_search(ctx, "aws_secret_access_key", root="user_files", path=".aws")
-    assert ".aws/credentials" in found                   # search reaches the file
+    assert ".aws/credentials" in _posix(found)           # search reaches the file
     assert "wJalrXUtnFEMI" not in found                  # match lines are masked
     assert "SECRET_BYTES_MASKED" in found
 
