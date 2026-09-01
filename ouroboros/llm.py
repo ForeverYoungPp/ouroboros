@@ -148,9 +148,7 @@ def _route_normalizes_cache_breakpoints(target: Dict[str, Any]) -> bool:
     )
 
 
-# Sealed-reasoning pin disclosure slot. A ContextVar isolates threads AND
-# concurrent asyncio tasks (a thread-local let sibling coroutines clear or
-# consume each other's staged note on one loop).
+# Pin disclosure slot: a ContextVar isolates threads AND concurrent asyncio tasks.
 _REASONING_PIN_CVAR = contextvars.ContextVar("ouroboros_reasoning_pin_note", default=None)
 
 
@@ -1017,8 +1015,7 @@ class LLMClient:
 
     def _pop_thread_disclosure(self, slot: str) -> Optional[Dict[str, Any]]:
         """Take and clear the disclosure staged in thread-local ``slot`` for THIS
-        thread's in-flight call; every consumer of these slots stages before or
-        at send. (The reasoning-pin note lives in a ContextVar, not here.)"""
+        thread's call; these slots stage before or at send (pin note: ContextVar)."""
         tls = getattr(self, slot, None)
         pending = getattr(tls, "pending", None) if tls is not None else None
         if tls is not None:
@@ -2183,10 +2180,6 @@ class LLMClient:
             return "5m"
         return "default" if breakpoints else None
 
-    def _pop_cache_breakpoint_disclosure(self) -> Optional[Dict[str, Any]]:
-        """The pending ≤4-cap reduction record for THIS thread's in-flight call."""
-        return self._pop_thread_disclosure("_cache_breakpoint_tls")
-
     def _stage_reasoning_pin_disclosure(self, candidate: Dict[str, Any]) -> None:
         """Stage the pin fact on send SUCCESS so it describes the TERMINAL sent
         candidate (the recovery ladder can strip and unpin). Only a wire
@@ -3017,7 +3010,7 @@ class LLMClient:
         _clamp_note = self._pop_effort_clamp_disclosure()
         if _clamp_note:
             usage["reasoning_effort_clamped"] = _clamp_note
-        _cache_note = self._pop_cache_breakpoint_disclosure()
+        _cache_note = self._pop_thread_disclosure("_cache_breakpoint_tls")
         if _cache_note:
             usage["prompt_cache_breakpoints_reduced"] = _cache_note
 
@@ -3846,7 +3839,7 @@ class LLMClient:
         if _clamp_note:
             usage["reasoning_effort_clamped"] = _clamp_note
         # Same disclosure norm for a ≤4-cap cache-marker reduction (v6.77.0): never silent.
-        _cache_note = self._pop_cache_breakpoint_disclosure()
+        _cache_note = self._pop_thread_disclosure("_cache_breakpoint_tls")
         if _cache_note:
             usage["prompt_cache_breakpoints_reduced"] = _cache_note
         # Why same-model provider failover was withheld on THIS call (issue #468):
