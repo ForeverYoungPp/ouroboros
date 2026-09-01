@@ -256,8 +256,9 @@ def test_migrated_region_markers_do_not_swallow_unmigrated_surfaces() -> None:
     """Root cause #4's guard rail: the scoping must stay honest in BOTH
     directions. The region has to actually contain the migrated rules, and it
     must not creep over neighbours that still carry their historical literals —
-    `.chat-live-executor-chip` sits immediately after the end marker and keeps
-    its 10px chat sizing until Chat gets its own pass."""
+    `.chat-live-executor-chip` sits immediately after the end marker and stays
+    outside the region until Chat gets its own guard pass (its sizes already
+    moved to tokens with the chat typography decisions)."""
     region = _migrated_style_region(raw=True)
     assert ".reviewer-slots-heading" in region
     assert ".harness-account-row" in region

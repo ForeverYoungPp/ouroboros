@@ -1542,7 +1542,7 @@ body.resizing-panels { user-select: none; }
 }
 
 .chat-bubble .sender {
-    font-size: 11px;
+    font-size: var(--type-meta);
     font-weight: 600;
     margin-bottom: 4px;
 }
@@ -1551,8 +1551,8 @@ body.resizing-panels { user-select: none; }
 .chat-bubble.system .sender { color: var(--system-sender); }
 
 .chat-bubble .message {
-    font-size: 15.5px;
-    line-height: 1.5;
+    font-size: var(--type-section);
+    line-height: var(--line-body);
     color: var(--text-primary);
     white-space: pre-wrap;
 }
@@ -1744,8 +1744,8 @@ body.resizing-panels { user-select: none; }
 }
 
 .msg-time {
-    font-size: 0.65rem;
-    color: var(--text-secondary, #666);
+    font-size: var(--type-meta);
+    color: var(--text-secondary);
     opacity: 0.4;
     margin-top: 6px;
     text-align: right;
@@ -3070,7 +3070,7 @@ textarea.chat-input {
     background: transparent;
     box-shadow: none;
     color: var(--text-primary);
-    font-size: 15px;
+    font-size: var(--type-section);
     font-family: inherit;
     outline: none;
     resize: none;
@@ -6847,7 +6847,7 @@ textarea.chat-input {
    like Claudexor's, never a promotional badge). Reuses .harness-chip; keeps its
    own 10px chat sizing, so it sits outside the marked region above. */
 .chat-live-executor-chip {
-    font-size: 10px;
+    font-size: var(--type-meta);
     padding: 0 6px;
     margin-right: 6px;
     vertical-align: middle;
