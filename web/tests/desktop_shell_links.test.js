@@ -350,3 +350,89 @@ test('the parent pywebviewready listener is released when the framed document un
     pagehide();
     assert.equal(armed.options.signal.aborted, true, 'unloading the frame releases the parent listener');
 });
+
+// --- bridge refusal degrades to copy-link ---------------------------------
+
+// Minimal DOM the shared toast host needs; the copy path itself only needs
+// window.navigator.clipboard here.
+function toastDocument() {
+    const toasts = [];
+    const node = () => ({
+        classList: { add() {} },
+        setAttribute() {},
+        appendChild() {},
+        addEventListener() {},
+        remove() {},
+        set textContent(value) { toasts.push(value); },
+        get textContent() { return toasts.at(-1) || ''; },
+    });
+    return { toasts, doc: { getElementById: () => null, createElement: () => node(), body: { appendChild() {} } } };
+}
+
+function bridgeRefusalWindow(api, copied) {
+    return {
+        location: { href: BASE },
+        navigator: { clipboard: { writeText: async (text) => { copied.push(text); } } },
+        pywebview: { api },
+    };
+}
+
+test('a refused open degrades to the copy-link handoff instead of a dead control', async () => {
+    const prior = { window: globalThis.window, document: globalThis.document };
+    const copied = [];
+    try {
+        globalThis.window = bridgeRefusalWindow({
+            open_file_with_default_app: async () => ({ ok: false, error: 'unsupported path' }),
+        }, copied);
+        const host = toastDocument();
+        globalThis.document = host.doc;
+        const result = await openViaHostBridge('/api/tasks/t/artifacts/chat-media-aa.png', 'a.png');
+        assert.deepEqual(result, { ok: false, native: false, degraded: 'copy-link' });
+        assert.deepEqual(copied, [`${BASE}api/tasks/t/artifacts/chat-media-aa.png`]);
+        assert.deepEqual(host.toasts, ['Link copied — open it in your browser.']);
+    } finally {
+        globalThis.window = prior.window;
+        globalThis.document = prior.document;
+    }
+});
+
+test('a refused download degrades the same way', async () => {
+    const prior = { window: globalThis.window, document: globalThis.document };
+    const copied = [];
+    try {
+        globalThis.window = bridgeRefusalWindow({
+            download_file_to_downloads: async () => ({ ok: false, error: 'path not allowed' }),
+        }, copied);
+        const host = toastDocument();
+        globalThis.document = host.doc;
+        const result = await downloadViaHostBridge('/api/files/download?path=x.txt', 'x.txt');
+        assert.deepEqual(result, { ok: false, native: false, degraded: 'copy-link' });
+        assert.deepEqual(copied, [`${BASE}api/files/download?path=x.txt`]);
+        assert.deepEqual(host.toasts, ['Link copied — open it in your browser.']);
+    } finally {
+        globalThis.window = prior.window;
+        globalThis.document = prior.document;
+    }
+});
+
+test('a refusal the owner cannot even copy still surfaces as an error to the caller', async () => {
+    const prior = { window: globalThis.window, document: globalThis.document };
+    try {
+        globalThis.window = {
+            location: { href: BASE },
+            navigator: {},
+            pywebview: { api: { open_file_with_default_app: async () => ({ ok: false, error: 'gate refused' }) } },
+        };
+        globalThis.document = {
+            createElement: () => ({ setAttribute() {}, select() {}, remove() {} }),
+            body: { appendChild() {} },
+        };
+        await assert.rejects(
+            () => openViaHostBridge('/api/tasks/t/artifacts/chat-media-aa.png', 'a.png'),
+            /gate refused/,
+        );
+    } finally {
+        globalThis.window = prior.window;
+        globalThis.document = prior.document;
+    }
+});
