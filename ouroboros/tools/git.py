@@ -3351,20 +3351,22 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
                     binding,
                 )
         try:
-            tracked_hits = run_cmd(
-                ["git", "ls-files", "--"] + normalized_paths, cwd=repo_dir,
-            ).splitlines()
-            untracked_hits = run_cmd(
-                ["git", "ls-files", "--others", "--exclude-standard", "--"] + normalized_paths,
-                cwd=repo_dir,
-            ).splitlines()
+            # The SAME pathspec-scoped porcelain the dirty set came from — not
+            # `git ls-files`, which resolves against the index and so cannot see
+            # a STAGED deletion or rename-away of a protected file (the path is
+            # gone from the index but `checkout HEAD -- .` would resurrect it,
+            # discarding the protected staged change). Porcelain lists staged
+            # deletes, rename sources, and untracked files alike.
+            scoped_dirty = list_changed_paths_from_git_status(
+                pathlib.Path(repo_dir), normalized_paths,
+                include_sources_for_renames=True,
+            )
         except Exception as e:
             return _vcs_result(
                 f"⚠️ RESTORE_ERROR: could not resolve pathspec matches: {e}", binding,
             )
-        dirty_matches = set(dirty_files) & set(tracked_hits)
         damage_protected = sorted({
-            f for f in [*dirty_matches, *untracked_hits] if f and is_protected_runtime_path(f)
+            f for f in scoped_dirty if f and is_protected_runtime_path(f)
         })
         if damage_protected:
             return _vcs_result(

@@ -857,6 +857,28 @@ def test_restore_to_head_gate_judges_the_pathspec_damage_set(tmp_path, monkeypat
     assert safety.read_text(encoding="utf-8") == "REAL = 'uncommitted local edit'\n"
 
 
+def test_restore_to_head_pathspec_gate_sees_staged_deletion_and_rename(tmp_path, monkeypatch):
+    """D8, fourth form: `git ls-files` resolves against the INDEX, so a staged
+    deletion or rename-away of a protected file is invisible to it while
+    `checkout HEAD -- .` would resurrect the file and discard the protected
+    staged change. The damage set must come from pathspec-scoped porcelain."""
+    from ouroboros.tools import git as git_mod
+
+    for staging in ("rm", "mv"):
+        (tmp_path / staging).mkdir()
+        repo = _git_repo(tmp_path / staging)
+        ctx = _CommitCtx(repo, tmp_path / staging / "drive")
+        if staging == "rm":
+            subprocess.run(["git", "rm", "-q", "BIBLE.md"], cwd=repo, check=True)
+        else:
+            subprocess.run(["git", "mv", "BIBLE.md", "BIBLE2.md"], cwd=repo, check=True)
+
+        result = git_mod._restore_to_head(ctx, confirm=True, paths=["."])
+
+        assert "RESTORE_BLOCKED" in result, (staging, result[:200])
+        assert not (repo / "BIBLE.md").exists(), staging
+
+
 def test_restore_to_head_directory_pathspec_still_restores_unprotected_files(tmp_path, monkeypatch):
     """Capability preservation for the damage-set gate: a directory pathspec whose
     matches are all unprotected must still restore (the gate judges damage, not

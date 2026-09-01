@@ -3307,6 +3307,10 @@ class ToolRegistry:
         # them — the tripwire below makes that LOUD (typed first-line marker)
         # without re-introducing the unsound rollback. Disclosed residual: the
         # write itself is not reverted; owner-surface restore is the remedy.
+        # When several tripwires fire on one command, the LAST wrapper applied
+        # owns line 1 and the others remain in the body: the classifier reads
+        # one typed marker either way (documented trade-off, matches the
+        # pre-existing multi-tripwire behavior below).
         if settings_before is not None:
             settings_after = self._owner_settings_snapshot()
             if settings_after is not None and settings_after != settings_before:

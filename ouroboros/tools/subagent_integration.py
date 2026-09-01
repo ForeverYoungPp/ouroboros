@@ -572,7 +572,7 @@ def _handle_external_workspace_integration(
         return (
             f"✅ Verified external_workspace child {child_task_id}: {len(authoritative_touched)} file(s) are already "
             f"present in the shared workspace {target}. No patch was re-applied. "
-            f"Verdict: {verdict_path or '(unwritten)'}.{disposition_warning}"
+            f"Verdict: {verdict_path or '(unwritten)'}.{_format_patch_exclusions(manifest)}{disposition_warning}"
         )
     if missing:
         return (
@@ -651,7 +651,7 @@ def _integrate_subagent_patch(
         return (
             f"🚫 Rejected subagent patch from {child_task_id} ({len(touched)} file(s) not applied). "
             f"Verdict: {verdict_path or '(unwritten)'}. Reason: {reason or '(none)'}."
-            f"{disposition_warning}"
+            f"{_format_patch_exclusions(manifest)}{disposition_warning}"
         )
 
     status = str(manifest.get("status") or "")
@@ -659,6 +659,7 @@ def _integrate_subagent_patch(
         return (
             f"⚠️ INTEGRATE_NO_CHANGES: child {child_task_id} workspace patch status={status!r}; "
             "nothing to apply."
+            f"{_format_patch_exclusions(manifest)}"
         )
     if not patch_path.exists():
         return f"⚠️ INTEGRATE_PATCH_MISSING: workspace.patch for {child_task_id} not found at {patch_path}."
@@ -1207,7 +1208,7 @@ def _integrate_delegated_patch(
         return (
             f"🚫 Rejected delegated run {rid}'s captured patch ({len(touched)} file(s) not "
             f"applied); its execution snapshot is released. Verdict: {verdict_path or '(unwritten)'}. "
-            f"Reason: {reason or '(none)'}.{note}"
+            f"Reason: {reason or '(none)'}.{_format_patch_exclusions(manifest)}{note}"
         )
 
     if capture_status != ARTIFACT_STATUS_READY_WITH_CHANGES:
@@ -1217,7 +1218,8 @@ def _integrate_delegated_patch(
                 return _unwritten_disposition("applied", applied=False)
             return (
                 f"OK: delegated run {rid} changed NOTHING in its execution snapshot; "
-                f"there is no patch to apply and the snapshot is released.{note}"
+                f"there is no patch to apply and the snapshot is released."
+                f"{_format_patch_exclusions(manifest)}{note}"
             )
         return (
             f"⚠️ INTEGRATE_DELEGATED_NO_CAPTURE: run {rid}'s capture status is "
@@ -1490,8 +1492,9 @@ def _format_patch_exclusions(manifest) -> str:
     more = f" and {len(entries) - 8} more" if len(entries) > 8 else ""
     return (
         f"\n⚠️ {len(entries)} file(s) EXCLUDED from this patch by capture policy: "
-        f"{shown}{more}. If one is a real deliverable, recover it from the child "
-        "workspace before it is released."
+        f"{shown}{more}. Excluded content is NOT in this patch: if one is a real "
+        "deliverable, recover it from the child workspace/snapshot while that "
+        "still exists, or have it re-produced."
     )
 
 

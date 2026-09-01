@@ -145,10 +145,17 @@ def _update_index_entry(ctx: ToolContext, topic: str):
                 continue
             try:
                 seeded_topic = _sanitize_topic(f.stem)
+            except ValueError:
+                continue
+            try:
                 summary = _extract_summary(f.read_text(encoding="utf-8").strip())
-                seeded.append(f"- **{seeded_topic}**: {summary}")
             except Exception:
-                log.debug(f"Failed to seed index entry for: {f.stem}", exc_info=True)
+                # A transient read failure must not hide the topic from every
+                # later listing (the persisted index wins over the files): the
+                # NAME is known from the filename — keep the entry, mark it.
+                log.debug(f"Failed to seed index summary for: {f.stem}", exc_info=True)
+                summary = "(summary unavailable at index seed)"
+            seeded.append(f"- **{seeded_topic}**: {summary}")
         index_content = "# Knowledge Base Index\n\n" + ("\n".join(seeded) + "\n" if seeded else "")
 
     lines = index_content.split("\n")

@@ -421,10 +421,15 @@ def _query_code(
     shown = rows[offset:offset + limit]
     next_offset = offset + limit
     label = query or scoped_path or "."
-    # Collection stops at min(_MAX_LIMIT, offset+limit): a full collection means
-    # more matches MAY exist beyond it, so "No results" / "N of N" would be a
-    # success-shaped lie about completeness (#447 S3). Say what was truncated.
-    collection_capped = total >= min(_MAX_LIMIT, offset + limit)
+    # Collection stops at min(_MAX_LIMIT, offset+limit) for the ops that page a
+    # capped collector (structural, relevant_files): a full collection there
+    # means more matches MAY exist, so "No results" / "N of N" would be a
+    # success-shaped lie about completeness (#447 S3). Ops whose collectors
+    # return the complete set must NOT claim a cap they never applied.
+    collection_capped = (
+        op in ("structural", "relevant_files")
+        and total >= min(_MAX_LIMIT, offset + limit)
+    )
     if not shown:
         if collection_capped:
             return (
