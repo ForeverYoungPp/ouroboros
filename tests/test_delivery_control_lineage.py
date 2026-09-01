@@ -66,8 +66,12 @@ def test_post_episode_invalid_whole_body_preserves_without_repair(tmp_path, raw)
     assert registry._ctx._delivery_control_required is False
     assert raw not in text
 
-    forced, reason, retained = loop._resolve_forced_delivery_control(registry._ctx, raw)
-    assert (forced, reason, retained) == (candidate.full_text, "", True)
+    forced, reason, retained, replaced = loop._resolve_forced_delivery_control(
+        registry._ctx, raw,
+    )
+    assert (forced, reason, retained, replaced) == (
+        candidate.full_text, "", True, False,
+    )
     assert ctx.messages == before_messages
 
 
@@ -114,7 +118,7 @@ def test_forced_resolver_ignores_non_candidate_state(tmp_path):
 
     assert loop._resolve_forced_delivery_control(
         registry._ctx, "Plain complete answer.",
-    ) == ("Plain complete answer.", "", False)
+    ) == ("Plain complete answer.", "", False, False)
 
 
 @pytest.mark.parametrize(
@@ -138,7 +142,7 @@ def test_no_episode_protocol_json_is_byte_exact_passthrough(tmp_path, raw):
     assert candidate.control_episode_seen is False
     assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("fresh", raw)
     assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
-        raw, "", False,
+        raw, "", False, False,
     )
     assert (candidate.revision, candidate.content_sha256, candidate.acceptance_binding) == before
 
@@ -162,7 +166,7 @@ def test_post_episode_latch_off_residuals_stay_byte_exact(tmp_path, raw):
 
     assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("fresh", raw)
     assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
-        raw, "", False,
+        raw, "", False, False,
     )
     assert ctx.messages == before_messages
     assert (candidate.revision, candidate.content_sha256, candidate.acceptance_binding) == before
@@ -199,7 +203,7 @@ def test_duplicate_full_answer_without_verb_preserves_stronger_control_rails(
     loop, registry, _ctx, _trace, candidate = _start_control_episode(tmp_path)
     registry._ctx._delivery_control_required = True
     assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
-        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED, True,
+        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED, True, False,
     )
 
 
@@ -216,24 +220,25 @@ def test_arbitrary_duplicates_remain_prose_on_ordinary_unarmed_rails(tmp_path):
     loop, registry, _ctx, _trace, candidate = _start_control_episode(tmp_path)
     candidate.finalization_control = "skill_revision_required"
     assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
-        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED, True,
+        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED, True, False,
     )
 
 
 @pytest.mark.parametrize(
-    ("raw", "expected", "retained"),
+    ("raw", "expected", "retained", "replaced"),
     [
-        ('{"delivery_control":"keep"}', "Free-form improvement.", True),
+        ('{"delivery_control":"keep"}', "Free-form improvement.", True, False),
         (
             '```json\n{"delivery_control":"replace",'
             '"full_answer":"Forced **replacement**\\nline two"}\n```',
             "Forced **replacement**\nline two",
             False,
+            True,
         ),
     ],
 )
 def test_forced_latch_off_after_episode_resolves_stale_control(
-    tmp_path, raw, expected, retained,
+    tmp_path, raw, expected, retained, replaced,
 ):
     loop, registry, ctx, trace, _candidate = _start_control_episode(tmp_path)
     candidate = loop._replace_delivery_candidate(
@@ -243,9 +248,271 @@ def test_forced_latch_off_after_episode_resolves_stale_control(
     assert candidate.control_episode_seen is True
     assert registry._ctx._delivery_control_required is False
     assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
-        expected, "", retained,
+        expected, "", retained, replaced,
     )
     assert raw not in expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "response_meta", "replacement", "degraded_reason"),
+    [
+        (
+            '{"delivery_control":"replace","full_answer":"decoded answer"}',
+            {"finish_reason_present": True, "finish_reason": "length", "tool_call_count": 0},
+            "decoded answer",
+            "provider_terminal",
+        ),
+        (
+            '{"delivery_control":"keep"}',
+            {"finish_reason_present": True, "finish_reason": None, "tool_call_count": 0},
+            None,
+            "provider_terminal",
+        ),
+        (
+            '{"delivery_control":"publish"}',
+            {"finish_reason_present": False, "finish_reason": None, "tool_call_count": 1},
+            None,
+            "provider_terminal",
+        ),
+    ],
+)
+def test_provider_terminal_incomplete_control_resolves_before_fallback(
+    tmp_path, monkeypatch, raw, response_meta, replacement, degraded_reason,
+):
+    loop, registry, ctx, trace, retained = _start_control_episode(tmp_path)
+    trace["tool_calls"].append({
+        "tool": "write_file",
+        "status": "ok",
+        "result": "new evidence",
+        "is_error": False,
+    })
+    monkeypatch.setattr(
+        loop,
+        "_call_forced_model_once",
+        lambda _ctx: (raw, response_meta),
+    )
+
+    text, usage, returned_trace = loop._forced_final_answer(
+        ctx,
+        prompt="finalize",
+        fallback_text="fallback",
+        reason_code="provider_terminal",
+        provider_terminal=True,
+    )
+
+    published = registry._ctx._delivery_candidate
+    assert raw not in text
+    assert usage["execution_status"] == "failed"
+    assert usage["reason_code"] == "provider_terminal"
+    assert published.degraded_reason == degraded_reason
+    if replacement is not None:
+        assert text == replacement
+        assert published is not retained
+        assert "STALE-EVIDENCE NOTICE" not in text
+        assert returned_trace["delivery_candidate"]["evidence_current"] is True
+        assert returned_trace["forced_finalization"]["source"] == "model"
+    else:
+        assert text.startswith(retained.full_text)
+        assert "STALE-EVIDENCE NOTICE — RESUME REQUIRED (host)" in text
+        assert published.acceptance_binding["stale_evidence"] is True
+        assert returned_trace["delivery_candidate"]["evidence_current"] is False
+
+
+@pytest.mark.parametrize(
+    "response_meta",
+    [
+        {"finish_reason_present": True, "finish_reason": "length", "tool_call_count": 0},
+        {"finish_reason_present": True, "finish_reason": None, "tool_call_count": 0},
+        {"finish_reason_present": False, "finish_reason": None, "tool_call_count": 1},
+    ],
+)
+def test_provider_terminal_incomplete_replace_prefers_current_candidate(
+    tmp_path, monkeypatch, response_meta,
+):
+    loop, registry, ctx, trace, current = _start_control_episode(tmp_path)
+    loop._arm_delivery_control(registry, ctx, trace)
+    raw = json.dumps({
+        "delivery_control": "replace",
+        "full_answer": "decoded replacement",
+    })
+    monkeypatch.setattr(
+        loop,
+        "_call_forced_model_once",
+        lambda _ctx: (raw, response_meta),
+    )
+
+    text, usage, returned_trace = loop._forced_final_answer(
+        ctx,
+        prompt="finalize",
+        fallback_text="fallback",
+        reason_code="provider_terminal",
+        provider_terminal=True,
+    )
+
+    assert text == current.full_text
+    assert raw not in text
+    assert registry._ctx._delivery_candidate is current
+    assert registry._ctx._delivery_control_required is False
+    assert usage["execution_status"] == "failed"
+    assert usage["reason_code"] == "provider_terminal"
+    assert returned_trace["forced_finalization"]["source"] == "retained_candidate"
+
+
+def test_provider_terminal_incomplete_armed_invalid_keeps_typed_reason(
+    tmp_path, monkeypatch,
+):
+    loop, registry, ctx, trace, retained = _start_control_episode(tmp_path)
+    loop._arm_delivery_control(registry, ctx, trace)
+    raw = '{"delivery_control":"publish"}'
+    monkeypatch.setattr(
+        loop,
+        "_call_forced_model_once",
+        lambda _ctx: (
+            raw,
+            {"finish_reason_present": False, "finish_reason": None, "tool_call_count": 1},
+        ),
+    )
+
+    text, _usage, returned_trace = loop._forced_final_answer(
+        ctx,
+        prompt="finalize",
+        fallback_text="fallback",
+        reason_code="provider_terminal",
+        provider_terminal=True,
+    )
+
+    published = registry._ctx._delivery_candidate
+    assert text == retained.full_text
+    assert raw not in text
+    assert published.degraded_reason == loop.REASON_DELIVERY_CONTROL_DEGRADED
+    assert returned_trace["delivery_candidate"]["degraded_reason"] == (
+        loop.REASON_DELIVERY_CONTROL_DEGRADED
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"delivery_control":"publish"}',
+        '{"delivery_control":"keep","delivery_control":"replace"}',
+    ],
+)
+@pytest.mark.parametrize(
+    "response_meta",
+    [
+        {"finish_reason_present": True, "finish_reason": "length", "tool_call_count": 0},
+        {"finish_reason_present": True, "finish_reason": None, "tool_call_count": 0},
+        {"finish_reason_present": False, "finish_reason": None, "tool_call_count": 1},
+    ],
+)
+def test_provider_terminal_incomplete_armed_invalid_without_candidate_uses_fallback(
+    tmp_path, monkeypatch, raw, response_meta,
+):
+    loop, registry, ctx, _trace = _forced_test_context(tmp_path)
+    registry._ctx._delivery_control_required = True
+    fallback = "Provider returned no usable complete answer."
+    monkeypatch.setattr(
+        loop,
+        "_call_forced_model_once",
+        lambda _ctx: (raw, response_meta),
+    )
+
+    text, usage, returned_trace = loop._forced_final_answer(
+        ctx,
+        prompt="finalize",
+        fallback_text=fallback,
+        reason_code="provider_terminal",
+        provider_terminal=True,
+    )
+
+    assert text == fallback
+    assert text
+    assert raw not in text
+    assert registry._ctx._delivery_candidate.full_text == fallback
+    assert usage["execution_status"] == "failed"
+    assert usage["reason_code"] == "provider_terminal"
+    assert usage["terminal_origin"] == loop.TERMINAL_ORIGIN_HOST_SALVAGE
+    assert returned_trace["forced_finalization"]["source"] == "forced_model_incomplete"
+
+
+def test_provider_terminal_incomplete_equal_text_replace_is_fresh(
+    tmp_path, monkeypatch,
+):
+    loop, registry, ctx, trace, retained = _start_control_episode(tmp_path)
+    trace["tool_calls"].append({
+        "tool": "write_file",
+        "status": "ok",
+        "result": "new evidence",
+        "is_error": False,
+    })
+    raw = json.dumps({
+        "delivery_control": "replace",
+        "full_answer": retained.full_text,
+    })
+    monkeypatch.setattr(
+        loop,
+        "_call_forced_model_once",
+        lambda _ctx: (
+            raw,
+            {"finish_reason_present": True, "finish_reason": "length", "tool_call_count": 0},
+        ),
+    )
+
+    text, _usage, returned_trace = loop._forced_final_answer(
+        ctx,
+        prompt="finalize",
+        fallback_text="fallback",
+        reason_code="provider_terminal",
+        provider_terminal=True,
+    )
+
+    published = registry._ctx._delivery_candidate
+    assert text == retained.full_text
+    assert "STALE-EVIDENCE NOTICE" not in text
+    assert published is not retained
+    assert published.evidence_revision > retained.evidence_revision
+    assert returned_trace["delivery_candidate"]["evidence_current"] is True
+
+
+@pytest.mark.parametrize(
+    ("episode", "raw"),
+    [
+        (False, '{"delivery_control":"replace","full_answer":"JSON document"}'),
+        (True, 'Final prose.\n{"delivery_control":"keep"}'),
+    ],
+)
+def test_provider_terminal_incomplete_preserves_unbound_json_residuals(
+    tmp_path, monkeypatch, episode, raw,
+):
+    if episode:
+        loop, registry, ctx, trace, _candidate = _start_control_episode(tmp_path)
+        trace["tool_calls"].append({
+            "tool": "write_file",
+            "status": "ok",
+            "result": "new evidence",
+            "is_error": False,
+        })
+    else:
+        loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    monkeypatch.setattr(
+        loop,
+        "_call_forced_model_once",
+        lambda _ctx: (
+            raw,
+            {"finish_reason_present": True, "finish_reason": "length", "tool_call_count": 0},
+        ),
+    )
+
+    text, _usage, _returned_trace = loop._forced_final_answer(
+        ctx,
+        prompt="finalize",
+        fallback_text="fallback",
+        reason_code="provider_terminal",
+        provider_terminal=True,
+    )
+
+    assert text == raw
+    assert registry._ctx._delivery_candidate.full_text == raw
 
 
 @pytest.mark.parametrize(

@@ -4456,7 +4456,7 @@ def _forced_fallback_result(
     source: str = "host_fallback",
     retained_source: str = "",
     retained_control: str = "",
-    candidate_degraded_reason: str = "",
+    candidate_reason: str = "",
     provider_terminal: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Return a current or fallback candidate."""
@@ -4507,7 +4507,7 @@ def _forced_fallback_result(
             llm_trace,
             candidate,
             control=retained_control or f"forced_preserve:{reason_code}",
-            reason_code=reason_code,
+            reason_code=candidate_reason or reason_code,
         )
         ctx.accumulated_usage["_best_effort_extracted"] = True
         _record_forced_finalization(
@@ -4528,8 +4528,8 @@ def _forced_fallback_result(
             suffix,
         )
         if candidate is not None:
-            if candidate_degraded_reason:
-                candidate.degraded_reason = candidate_degraded_reason
+            if candidate_reason:
+                candidate.degraded_reason = candidate_reason
                 _publish_delivery_candidate(ctx.tools, candidate, llm_trace)
             if provider_terminal:
                 ctx.accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_HOST_SALVAGE
@@ -4617,20 +4617,19 @@ def _forced_swarm_router_result(
 def _resolve_forced_delivery_control(
     tools_ctx: Any,
     extracted: str,
-) -> Tuple[str, str, bool]:
-    """Resolve forced control to text, degradation reason, and retained provenance."""
+) -> Tuple[str, str, bool, bool]:
+    """Resolve forced control."""
     if tools_ctx is None or not extracted:
-        return extracted, "", False
+        return extracted, "", False, False
     candidate = getattr(tools_ctx, "_delivery_candidate", None)
     armed = bool(getattr(tools_ctx, "_delivery_control_required", False)) or (
         isinstance(candidate, DeliveryCandidate) and _delivery_replace_required(candidate)
     )
-    resolved, retained, degraded, consumed = _resolve_forced_delivery_control_body(
-        extracted, candidate, armed=armed,
-    )
+    resolved, retained, degraded, consumed, replaced = _resolve_forced_delivery_control_body(
+        extracted, candidate, armed=armed)
     if consumed:
         tools_ctx._delivery_control_required = False
-    return resolved, REASON_DELIVERY_CONTROL_DEGRADED if degraded else "", retained
+    return resolved, REASON_DELIVERY_CONTROL_DEGRADED if degraded else "", retained, replaced
 
 
 def _forced_delegation_note(tools_ctx: Any, llm_trace: Dict[str, Any]) -> str:
@@ -4766,24 +4765,20 @@ def _forced_final_answer(
             "[FORCED_OWNER_REFRESH] Answer all current directives; ignore the stale draft.",
         )
 
-    if provider_terminal and extracted and forced_response_is_incomplete(response_meta):
+    incomplete = provider_terminal and extracted and forced_response_is_incomplete(response_meta)
+    extracted, degraded, retained, replaced = _resolve_forced_delivery_control(
+        tools_ctx, extracted)
+    current = _current_delivery_candidate(ctx, llm_trace)
+    if retained and current is None:
         return _forced_fallback_result(
             ctx, llm_trace, extracted, reason_code,
-            source="forced_model_incomplete", provider_terminal=True,
-        )
-
-    extracted, control_degraded, retained_candidate = _resolve_forced_delivery_control(
-        tools_ctx, extracted,
-    )
-    if retained_candidate and _current_delivery_candidate(ctx, llm_trace) is None:
-        return _forced_fallback_result(
-            ctx,
-            llm_trace,
-            extracted,
-            reason_code,
-            source="model_control_retained",
-            candidate_degraded_reason=control_degraded,
+            source="model_control_retained", candidate_reason=degraded,
             provider_terminal=provider_terminal,
+        )
+    if incomplete and (current is not None or not replaced):
+        return _forced_fallback_result(
+            ctx, llm_trace, extracted or fallback_text, reason_code,
+            source="forced_model_incomplete", candidate_reason=degraded, provider_terminal=True,
         )
     if extracted:
         ctx.accumulated_usage["_best_effort_extracted"] = True
@@ -4801,8 +4796,8 @@ def _forced_final_answer(
         candidate = _publish_model_forced_candidate(
             ctx, llm_trace, full_text, reason_code,
         )
-        if control_degraded and candidate is not None:
-            candidate.degraded_reason = control_degraded
+        if degraded and candidate is not None:
+            candidate.degraded_reason = degraded
             llm_trace.setdefault("reasoning_notes", []).append(
                 "Forced finalization received an invalid delivery-control object; "
                 "preserved the retained complete answer."

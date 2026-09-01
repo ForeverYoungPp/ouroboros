@@ -209,8 +209,8 @@ def resolve_forced_delivery_control_body(
     candidate: Optional[DeliveryCandidate],
     *,
     armed: bool,
-) -> Tuple[str, bool, bool, bool]:
-    """Return text plus retained/degraded/consumed facts for a forced body."""
+) -> Tuple[str, bool, bool, bool, bool]:
+    """Return text plus retained/degraded/consumed/replaced facts."""
 
     if not isinstance(candidate, DeliveryCandidate):
         candidate = None
@@ -225,22 +225,22 @@ def resolve_forced_delivery_control_body(
         and control_kind in {"keep", "replace", "invalid"}
     )
     if not armed and not historical:
-        return raw, False, False, False
+        return raw, False, False, False, False
     if control_kind == "replace":
-        return replacement, False, False, True
+        return replacement, False, False, True, True
     if control_kind == "keep" and candidate is not None:
-        return candidate.full_text, True, False, True
+        return candidate.full_text, True, False, True, False
     if historical:
-        return candidate.full_text, True, False, True
+        return candidate.full_text, True, False, True, False
     protocol_intent = (
         control_kind != "none"
         or (parsed is None and strip_protocol_fence(raw).startswith("{"))
         or bool(getattr(parsed, "has_duplicate_keys", False))
     )
     if not protocol_intent:
-        return raw, False, False, True
+        return raw, False, False, True, False
     retained = candidate is not None
-    return candidate.full_text if retained else "", retained, True, True
+    return candidate.full_text if retained else "", retained, True, True, False
 
 
 def extract_plain_text_from_content(content: Any) -> str:
