@@ -303,6 +303,8 @@ def test_chat_scrolls_to_bottom_after_first_history_load():
     assert "const parent = liveCardRecords.get(record.parentGroupId);" in source
     assert "seen.has(record.groupId)" in source, \
         "Nested subagent timestamps must propagate to the top-level ancestor safely"
+    assert "if (wasFirstLoad) scrollToBottomAfterLayout();" in source, \
+        "First load must pin the fresh feed to the newest message explicitly"
     # The shared photo/video builder and the separate document builder must
     # each stamp sortable data-ts from the raw source timestamp.
     bubble_frame = media_source.split("function bubbleFrame", 1)[1].split(

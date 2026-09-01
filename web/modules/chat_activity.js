@@ -96,6 +96,22 @@ export function buildTimelineItemHtml(item, record) {
     `;
 }
 
+// Sortable data-ts stamping for timeline nodes; anchor mode only ever moves a
+// node's effective timestamp earlier so replay cannot teleport it downward.
+export function stampNodeTimestamp(node, raw, { anchor = false } = {}) {
+    if (!node) return false;
+    const epoch = rawTimestampEpoch(raw);
+    if (!Number.isFinite(epoch)) return false;
+    if (anchor && node.dataset.ts) {
+        const current = Number(node.dataset.ts);
+        const next = Number.isFinite(current) ? Math.min(current, epoch) : epoch;
+        if (node.dataset.ts !== String(next)) node.dataset.ts = String(next);
+        return Number.isFinite(current) && next < current;
+    }
+    if (node.dataset.ts !== String(epoch)) node.dataset.ts = String(epoch);
+    return false;
+}
+
 export function durableChatMediaUrl(value) {
     const url = String(value || '');
     return /^\/api\/tasks\/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\/artifacts\/chat-media-[0-9a-f]{64}\.(png|jpg|gif|webp|mp4|webm)$/.test(url) ? url : '';

@@ -435,9 +435,16 @@ async function renderMermaidNodes(root, state, onDomWrite) {
         const stage = document.createElement('div');
         stage.className = 'md-mermaid-stage';
         stage.setAttribute('aria-hidden', 'true');
+        // A collapsed/hidden fence measures 0 wide; fall back to the nearest
+        // visible ancestor before the 320px floor so the diagram is laid out
+        // for the container it will actually mount into.
+        const stageWidth = node.getBoundingClientRect?.().width
+            || node.closest?.('.message')?.getBoundingClientRect?.().width
+            || root.getBoundingClientRect?.().width
+            || 0;
         stage.style.setProperty(
             '--md-mermaid-stage-width',
-            `${Math.max(node.getBoundingClientRect?.().width || 0, 320)}px`,
+            `${Math.max(stageWidth, 320)}px`,
         );
         stage.append(rendered);
         document.body.append(stage);

@@ -73,6 +73,27 @@ export function showTaskIncidentToast(msg) {
     showToast(String(msg?.content || msg?.text || incident), 'error');
 }
 
+// Best-effort teardown of temporary uploads after a failed send; lives with
+// the attachment/media domain so chat.js stays within its byte ratchet.
+export async function cleanupUploadedAttachments(uploaded) {
+    const filenames = uploaded
+        .map((item) => item.filename)
+        .filter(Boolean);
+    if (!filenames.length) return;
+    const results = await Promise.allSettled(filenames.map(async (filename) => {
+        const resp = await apiFetch('/api/chat/upload', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename }),
+        });
+        if (!resp.ok) throw new Error(`DELETE ${filename} failed with HTTP ${resp.status}`);
+    }));
+    const failed = results.filter((result) => result.status === 'rejected');
+    if (failed.length) {
+        console.warn('Failed to clean up uploaded chat attachments after send failure', failed);
+    }
+}
+
 export function safeHttpUrl(value) {
     // safeExternalHrefAttr returns escaped markup; chat needs a raw URL before its own attribute escaping.
     const raw = String(value || '').trim();

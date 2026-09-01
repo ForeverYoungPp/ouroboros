@@ -4,7 +4,7 @@ import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { createSystemMessageAction } from './ui_helpers.js';
-import { createChatMedia, showTaskIncidentToast } from './chat_media.js';
+import { cleanupUploadedAttachments, createChatMedia, showTaskIncidentToast } from './chat_media.js';
 import { createChatDecision } from './chat_decision.js';
 import { clientSurfaceField } from './client_surface.js';
 import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
@@ -106,6 +106,7 @@ import {
     positiveTaskTerminalFact,
     projectIdFromTask,
     rawTimestampEpoch,
+    stampNodeTimestamp,
     reconcileHydratedDirectActivities,
     reconnectBannerText,
     saveChatInputHistory,
@@ -364,25 +365,6 @@ export function createChatInstance({
         updateAttachmentPreview();
     }
 
-    async function cleanupUploadedAttachments(uploaded) {
-        const filenames = uploaded
-            .map((item) => item.filename)
-            .filter(Boolean);
-        if (!filenames.length) return;
-        const results = await Promise.allSettled(filenames.map(async (filename) => {
-            const resp = await apiFetch('/api/chat/upload', {
-                method: 'DELETE',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename }),
-            });
-            if (!resp.ok) throw new Error(`DELETE ${filename} failed with HTTP ${resp.status}`);
-        }));
-        const failed = results.filter((result) => result.status === 'rejected');
-        if (failed.length) {
-            console.warn('Failed to clean up uploaded chat attachments after send failure', failed);
-        }
-    }
-
     function setAttachmentUploadState(uploading) {
         attachmentsUploading = uploading;
         attachBtn.disabled = uploading;
@@ -629,21 +611,6 @@ export function createChatInstance({
         }
     }
 
-    function stampNodeTimestamp(node, raw, { anchor = false } = {}) {
-        if (!node) return false;
-        const epoch = rawTimestampEpoch(raw);
-        if (!Number.isFinite(epoch)) return false;
-        if (anchor && node.dataset.ts) {
-            const current = Number(node.dataset.ts);
-            const next = Number.isFinite(current) ? Math.min(current, epoch) : epoch;
-            if (node.dataset.ts !== String(next)) node.dataset.ts = String(next);
-            return Number.isFinite(current) && next < current;
-        } else {
-            if (node.dataset.ts !== String(epoch)) node.dataset.ts = String(epoch);
-        }
-        return false;
-    }
-
     function setStatus(kind, text) {
         // perf2 P4.3: replay frames never touch the badge; the reducer
         // (syncChatStatus) writes it once after the batch.
@@ -743,21 +710,33 @@ export function createChatInstance({
 
         const followBottom = forceFollow || isNearBottom();
         const anchor = followBottom ? null : captureVisibleTimelineAnchor(excludeAnchorNode);
-        let completed = false;
+        // Pre-mutation geometry, not the mutate() return, decides restore/
+        // follow: the reader survives a throwing mutation and a lying change-
+        // flag alike. Booleans keep only the activity marker and write
+        // idempotence duties.
+        const preScrollHeight = messagesDiv.scrollHeight;
+        const preScrollTop = messagesDiv.scrollTop;
         let result;
         _viewportMutationDepth = 1;
         try {
             result = mutate();
-            completed = true;
             return result;
         } finally {
             _viewportMutationDepth = 0;
             if (isInstanceVisible()) {
-                if (completed && result !== false) {
-                    if (followBottom) messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                    else restoreVisibleTimelineAnchor(anchor);
-                    if (remoteContent && result && !followBottom) _hasNewActivity = true;
+                if (followBottom) {
+                    if (forceFollow || messagesDiv.scrollHeight !== preScrollHeight) {
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                    } else if (messagesDiv.scrollTop !== preScrollTop) {
+                        // Engine drift on a no-op frame: put the reader back.
+                        messagesDiv.scrollTop = preScrollTop;
+                    }
+                } else {
+                    // Restores the captured offset; a zero-delta frame re-lands
+                    // on the same position.
+                    restoreVisibleTimelineAnchor(anchor);
                 }
+                if (remoteContent && result && !followBottom) _hasNewActivity = true;
                 _savedScrollTop = messagesDiv.scrollTop;
                 _savedStick = isNearBottom();
                 updateScrollButton();
@@ -2257,7 +2236,7 @@ export function createChatInstance({
         const lifecycleParent = taskKey(msg?.parent_task_id);
         if (msg?.subagent_event && lifecycleParent) {
             const updated = updateSubagentCardFromEvent(msg, rawTs);
-            return Boolean(changed || updated);
+            if (updated !== undefined) return Boolean(changed || updated);
         }
         if (subagentChildParents.has(taskId)) {
             const updated = routeSubagentProgressToCard(taskId, msg);
@@ -2311,10 +2290,12 @@ export function createChatInstance({
     }
 
     function updateSubagentCardFromEvent(evt, tsValue) {
-        if (!evt || String(evt.delegation_role || '').toLowerCase() !== 'subagent') return false;
+        // undefined = not a subagent frame (legacy rows without
+        // delegation_role): callers fall through to the ordinary card path.
+        if (!evt || String(evt.delegation_role || '').toLowerCase() !== 'subagent') return undefined;
         const parentId = taskKey(evt.parent_task_id);
         const childId = String(evt.subagent_task_id || evt.task_id || '').trim();
-        if (!parentId || !childId || parentId === childId) return false;
+        if (!parentId || !childId || parentId === childId) return undefined;
         const event = String(evt.subagent_event || '').toLowerCase();
         const role = taskKey(evt.subagent_role);
         setSubagentParent(childId, { parentId, role, model: evt.model });
@@ -2444,7 +2425,7 @@ export function createChatInstance({
                 : cancelled ? 'cancelled'
                     : rejected ? 'rejected'
                         : (severity === 'warn' ? 'completed_warn' : 'completed');
-        return updateSubagentCardFromEvent({
+        return Boolean(updateSubagentCardFromEvent({
             delegation_role: 'subagent',
             parent_task_id: info.parentId,
             subagent_task_id: childId,
@@ -2460,7 +2441,7 @@ export function createChatInstance({
             error: evt.error || '',
             reason_code: evt.reason_code || '',
             ...costMetaKeys(evt),
-        }, evt.ts || evt.timestamp || new Date().toISOString());
+        }, evt.ts || evt.timestamp || new Date().toISOString()));
     }
 
     function updateLiveCardFromLogEvent(evt) {
@@ -3159,6 +3140,9 @@ export function createChatInstance({
                 // First load jumps to latest; reconnect preserves older-message reading.
                 if (wasFirstLoad || (fromReconnect ? scrollBeforeSync.nearBottom : isNearBottom())) {
                     updateMessagesPadding();
+                    // Bootstrap pin: a fresh feed starts at scrollTop 0, where
+                    // the ordinary boundary would not land on the newest row.
+                    if (wasFirstLoad) scrollToBottomAfterLayout();
                 } else if (fromReconnect) {
                     // Rebuild may add rows both ABOVE and BELOW the viewport; a
                     // scrollHeight delta cannot tell them apart and over-scrolls
@@ -4065,7 +4049,7 @@ export function createChatInstance({
                     projectId: msg.project_id || '',
                     projectName: msg.project_name || '',
                 });
-                incrementUnreadIfNeeded(msg);
+                if (added) incrementUnreadIfNeeded(msg);
                 syncChatStatus();
                 return Boolean(added);
             }
@@ -4127,14 +4111,14 @@ export function createChatInstance({
             if (msg.system_type === 'task_summary') {
                 const changed = appendTaskSummaryToLiveCard(msg);
                 if (!finalizing) markAssistantReply(explicitTaskId);
-                incrementUnreadIfNeeded(msg);
+                if (changed) incrementUnreadIfNeeded(msg);
                 syncChatStatus();
                 return Boolean(ephemeral || changed);
             }
             if (explicitTaskId && subagentChildParents.has(explicitTaskId)) {
                 const changed = routeSubagentFinalMessageToCard(explicitTaskId, msg);
                 if (typedTerminal) markAssistantReply(explicitTaskId);
-                incrementUnreadIfNeeded(msg);
+                if (changed) incrementUnreadIfNeeded(msg);
                 syncChatStatus();
                 return Boolean(ephemeral || changed);
             }
@@ -4150,7 +4134,7 @@ export function createChatInstance({
                 source: msg.source || '',
                 taskId: explicitTaskId,
             });
-            incrementUnreadIfNeeded(msg);
+            if (added || changed) incrementUnreadIfNeeded(msg);
             syncChatStatus();
             return Boolean(added || changed || routingCleared);
             });
