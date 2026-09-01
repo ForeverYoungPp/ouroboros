@@ -217,8 +217,11 @@ def test_block_aware_chunking_keeps_quote_and_table_blocks_whole():
 
 
 # Termination guards: pytest-timeout, not ``signal.alarm`` — Windows has no
-# SIGALRM, and an unhandled alarm would kill the whole pytest worker.
-@pytest.mark.timeout(10)
+# SIGALRM, and an unhandled alarm would kill the whole pytest worker. The
+# bound is a HANG guard, not a perf budget: the 100 KB single-block case takes
+# ~4 s on a fast Linux host and exceeded 10 s on windows-latest under xdist
+# (a thread-method timeout kills the worker), while the CI ceiling is 300 s.
+@pytest.mark.timeout(120)
 def test_chunker_terminates_for_oversized_link_tag_and_pre_block():
     _plugin, telegram_api = _load_skill()
     link_source = (
@@ -240,7 +243,7 @@ def test_chunker_terminates_for_oversized_link_tag_and_pre_block():
         _assert_balanced(chunk)
 
 
-@pytest.mark.timeout(10)
+@pytest.mark.timeout(120)
 def test_chunker_balances_100kb_single_block_paragraph_within_timeout():
     _plugin, telegram_api = _load_skill()
     source = "**" + ("word " * 20_000) + "**"
