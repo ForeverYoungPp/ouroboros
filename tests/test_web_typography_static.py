@@ -412,3 +412,45 @@ def test_every_root_token_has_a_reader() -> None:
         "(docs/DESIGN.md 'Status and chips').\n"
         + "\n".join(f"  {name}" for name in orphans)
     )
+
+
+# ---------------------------------------------------------------------------
+# Focus canon: one ring vocabulary across the whole app (docs/DESIGN.md "Focus")
+# ---------------------------------------------------------------------------
+
+FOCUS_FILES = ("web/style.css", "web/settings.css", "web/onboarding.css")
+FOCUS_TOKENS = ("var(--focus-accent-border)", "var(--focus-accent-ring)")
+
+
+def test_every_focus_visible_selector_gets_the_canonical_ring() -> None:
+    """Keyboard focus has ONE appearance (docs/DESIGN.md 'Focus'): the
+    `--focus-accent-border` outline (or the field idiom's
+    `--focus-accent-ring` box-shadow). A `:focus-visible` rule painted in some
+    other colour is a second focus vocabulary; a `:focus-visible` selector with
+    no ring anywhere is hover paint masquerading as focus.
+
+    The unit is the SELECTOR, not the block: the sanctioned hybrid pattern
+    keeps shared hover/focus paint in one rule (no ring) and puts the ring in a
+    dedicated `:focus-visible` rule beside it, so a selector passes when ANY of
+    its blocks names a focus token. The exception allowlist is empty — a
+    legitimate exception must be added here with its justification."""
+    per_selector: dict[str, list[bool]] = {}
+    for rel in FOCUS_FILES:
+        source = _decommented(_read(rel))
+        for selector_list, body in RULE.findall(source):
+            has_token = any(token in body for token in FOCUS_TOKENS)
+            for selector in selector_list.split(","):
+                selector = " ".join(selector.split())
+                if ":focus-visible" not in selector:
+                    continue
+                per_selector.setdefault(f"{rel}: {selector}", []).append(has_token)
+    assert per_selector, "no :focus-visible rules found; is the parse broken?"
+    unringed = sorted(
+        selector for selector, hits in per_selector.items() if not any(hits)
+    )
+    assert not unringed, (
+        "these :focus-visible selectors never name var(--focus-accent-border) "
+        "or var(--focus-accent-ring) in any of their rule blocks, so keyboard "
+        "focus there is either invisible or a second colour vocabulary "
+        "(docs/DESIGN.md 'Focus'):\n" + "\n".join(f"  {s}" for s in unringed)
+    )
