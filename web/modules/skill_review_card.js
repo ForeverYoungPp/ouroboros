@@ -79,6 +79,11 @@ function renderDetailState(full, entry, render, onDomWrite = writeDirectly) {
     if (!full || !entry) return false;
     return onDomWrite(() => {
         full.dataset.state = entry.state;
+        // Every state this renderer writes is HTML (a status div or rendered
+        // markdown), never authored plain text: opt the node out of the chat
+        // bubble's pre-wrap so block markup does not gain a blank line per
+        // source newline. Host-owned marker, same attribute the chat bubble uses.
+        full.dataset.chatMarkdownEnhanced = '1';
         full.setAttribute?.('aria-busy', entry.state === 'loading' ? 'true' : 'false');
         if (entry.state === 'loading') {
             full.innerHTML = '<div class="skill-review-loading" role="status" aria-live="polite">Loading review details…</div>';

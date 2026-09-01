@@ -1562,6 +1562,19 @@ body.resizing-panels { user-select: none; }
     white-space: normal;
 }
 
+/* Same opt-out idiom, applied to the rest of the class: a surface whose body is
+   RENDERED markdown (block elements) must not also honour the bubble's
+   `pre-wrap`, or every source newline becomes an extra blank line. The marker
+   attribute is authored by the renderer that writes the markdown, so a surface
+   that still shows plain multi-line text (an un-hydrated attempt detail) keeps
+   pre-wrap and its authored line breaks. */
+.chat-live-line-body,
+[data-chat-markdown-enhanced].chat-live-line-title,
+[data-chat-markdown-enhanced].skill-review-full,
+[data-chat-markdown-enhanced].chat-review-attempt-detail {
+    white-space: normal;
+}
+
 .chat-photo {
     max-width: 100%;
     border-radius: var(--radius-sm);
@@ -6729,10 +6742,20 @@ textarea.chat-input {
     display: grid;
     gap: 8px;
     min-width: 0;
+    /* Structural markup, not owner prose: the bubble's `pre-wrap` would turn
+       every newline of the card template into a rendered blank line. Captions
+       below opt back in, because those line breaks are the owner's. */
+    white-space: normal;
 }
 
 .chat-bubble.is-multiple .chat-gallery-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+/* The links bubble's own .message is a container (title + list), so the same
+   structural rule applies to it directly. */
+.chat-links-message {
+    white-space: normal;
 }
 
 .chat-group-title,
@@ -6768,6 +6791,8 @@ textarea.chat-input {
     font-size: var(--type-meta);
     line-height: var(--line-meta);
     overflow-wrap: anywhere;
+    /* Owner-authored text inside a structural container: keep its line breaks. */
+    white-space: pre-wrap;
 }
 
 .chat-photo-actions {
@@ -6924,6 +6949,9 @@ textarea.chat-input {
 .chat-media-player {
     overflow: hidden;
     min-width: 250px;
+    /* Structural markup (see .chat-gallery-grid): no phantom lines between the
+       stage and the control row. */
+    white-space: normal;
     border: 1px solid var(--ui-card-border);
     border-radius: var(--radius);
     background: var(--ui-modal-bg);

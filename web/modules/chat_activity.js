@@ -66,7 +66,7 @@ export function buildTimelineItemHtml(item, record) {
     const isProgressLine = item.phase === 'working' || item.phase === 'thinking';
     const bodyId = `chat-live-line-body-${String(record.groupId || 'task').replace(/[^A-Za-z0-9_-]/g, '-')}-${String(item.lineKey || '').replace(/[^A-Za-z0-9_-]/g, '-')}`;
     const headContent = `
-        <span class="chat-live-line-title">${isProgressLine ? renderMarkdown(displayHeadline) : escapeHtml(displayHeadline)}</span>
+        <span class="chat-live-line-title"${isProgressLine ? ' data-chat-markdown-enhanced' : ''}>${isProgressLine ? renderMarkdown(displayHeadline) : escapeHtml(displayHeadline)}</span>
         <span class="chat-live-line-repeat" ${item.count > 1 ? '' : 'hidden'}>${item.count > 1 ? `${item.count}x` : ''}</span>
         ${item.ts ? `<span class="chat-live-line-time">${escapeHtml(item.ts)}</span>` : ''}
     `;
