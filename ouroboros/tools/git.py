@@ -3285,26 +3285,28 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
     ]
     targets_system = binding_targets_system_repo(ctx, binding)
     affected_protected = protected_paths_in(dirty_files) if targets_system else []
-    # Normalize each requested path ONCE, and both the protected-path gate below
-    # and the checkout/clean action further down consume that identical value.
-    # A divergent normalizer was a protected-path bypass: the gate used
-    # normalize_repo_path() while the action used lstrip("./"), which strips
-    # leading '.' AND '/' characters — so `../ouroboros/safety.py` passed the gate
-    # (not equal to `ouroboros/safety.py`) and was then checked out against the
-    # real protected file. Reject anything that escapes the repository root so the
-    # two stages can never disagree.
+    # Resolve each requested path to the SETTLED form git itself will act on, and
+    # let both the protected-path gate below and the checkout/clean action consume
+    # that identical value. A divergent normalizer was a protected-path bypass:
+    # the gate used normalize_repo_path() while the action used lstrip("./"),
+    # which strips leading '.' AND '/' characters, so `../ouroboros/safety.py`
+    # was judged as a different (unprotected) string and then checked out against
+    # the real protected file. Collapsing is the load-bearing half: git resolves
+    # `..` inside a pathspec, while normalize_repo_path() does not, so a gate fed
+    # the uncollapsed string reads `tests/../ouroboros/safety.py` as unprotected
+    # and the action still lands on `ouroboros/safety.py`. Judge and act on the
+    # collapsed value, and refuse anything that leaves the repository root.
     normalized_paths: List[str] = []
     for _p in (paths or []):
         _raw = str(_p or "").strip()
         if not _raw:
             continue
-        _norm = normalize_repo_path(_raw)
-        _collapsed = posixpath.normpath(_norm)
+        _collapsed = posixpath.normpath(normalize_repo_path(_raw))
         if posixpath.isabs(_collapsed) or _collapsed == ".." or _collapsed.startswith("../"):
             return _vcs_result(
                 f"⚠️ RESTORE_ERROR: path escapes the repository root: {_raw}", binding,
             )
-        normalized_paths.append(_norm)
+        normalized_paths.append(_collapsed)
     if paths and not normalized_paths:
         return _vcs_result("⚠️ RESTORE_ERROR: No valid paths provided.", binding)
     if normalized_paths and targets_system:

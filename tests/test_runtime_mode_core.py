@@ -829,6 +829,34 @@ def test_restore_to_head_gate_and_action_share_one_normalizer(tmp_path, monkeypa
     assert safety.read_text(encoding="utf-8") == "REAL = 'uncommitted local edit'\n"
 
 
+def test_restore_to_head_gate_collapses_inner_parent_segments(tmp_path, monkeypatch):
+    """D8, second form: an INNER '..' does not escape the repository, so a
+    containment check alone lets it through — but normalize_repo_path() does not
+    collapse '..' while git resolves it inside a pathspec. The gate therefore read
+    'tests/../ouroboros/safety.py' as an unprotected string while the checkout
+    landed on the real protected file. The gate and the action must both judge the
+    COLLAPSED path."""
+    from ouroboros.tools import git as git_mod
+
+    repo = _git_repo(tmp_path)
+    (repo / "ouroboros").mkdir()
+    (repo / "tests").mkdir()
+    safety = repo / "ouroboros" / "safety.py"
+    safety.write_text("REAL = 'committed'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "safety"], cwd=repo, check=True, capture_output=True)
+    safety.write_text("REAL = 'uncommitted local edit'\n", encoding="utf-8")
+
+    ctx = _CommitCtx(repo, tmp_path / "drive")
+    result = git_mod._restore_to_head(
+        ctx, confirm=True, paths=["tests/../ouroboros/safety.py"],
+    )
+
+    assert "RESTORE_BLOCKED" in result, result[:300]
+    assert "ouroboros/safety.py" in result
+    assert safety.read_text(encoding="utf-8") == "REAL = 'uncommitted local edit'\n"
+
+
 def test_restore_to_head_does_not_mangle_leading_dot_paths(tmp_path, monkeypatch):
     """D8: lstrip("./") turned `.gitignore` into `gitignore`, so the restore acted
     on the wrong (or a nonexistent) path. The normalizer must preserve a leading
