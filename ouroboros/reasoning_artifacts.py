@@ -21,10 +21,13 @@ OPAQUENESS IS DECIDED BY TYPE, never by the mere presence of a ``data`` key: a
 sidecar ``data`` on a readable type must not seal the transcript, or #468 returns
 in a new costume.
 
-FAIL-CLOSED on shapes we do not recognize (unknown ``reasoning_details`` type, a
-malformed non-list ``reasoning_details``): an unknown artifact is treated as
-sealed for a non-roster family. The reactive 400 strip-and-retry in ``llm.py`` is
-the safety net for a misclassification in either direction.
+FAIL-CLOSED on shapes that CLAIM content we cannot read (unknown
+``reasoning_details`` type, a TRUTHY non-list ``reasoning_details``, a truthy
+non-string signature or flat reasoning field): sealed for a non-roster family.
+A FALSY-present carrier (explicit null / "" / {} / 0) is the common JSON idiom
+for "no reasoning at all" and is not an artifact — sealing it would pin
+zero-reasoning transcripts, the response_id bug class. The reactive 400
+strip-and-retry in ``llm.py`` is the safety net either way.
 """
 from typing import Any, Iterable, List, Optional
 

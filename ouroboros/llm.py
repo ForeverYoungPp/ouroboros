@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import contextvars
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -145,6 +146,18 @@ def _route_normalizes_cache_breakpoints(target: Dict[str, Any]) -> bool:
         and supports_message_cache_control(model)
         and model.startswith("anthropic/")
     )
+
+
+# Sealed-reasoning pin disclosure slot. A ContextVar isolates threads AND
+# concurrent asyncio tasks (a thread-local let sibling coroutines clear or
+# consume each other's staged note on one loop).
+_REASONING_PIN_CVAR = contextvars.ContextVar("ouroboros_reasoning_pin_note", default=None)
+
+
+def _pop_reasoning_pin_note() -> Optional[Dict[str, Any]]:
+    pending = _REASONING_PIN_CVAR.get()
+    _REASONING_PIN_CVAR.set(None)
+    return pending if isinstance(pending, dict) else None
 
 
 _OR_PROVIDER_PRESETS = {
@@ -1004,9 +1017,8 @@ class LLMClient:
 
     def _pop_thread_disclosure(self, slot: str) -> Optional[Dict[str, Any]]:
         """Take and clear the disclosure staged in thread-local ``slot`` for THIS
-        thread's in-flight call. Clamp/cache slots stage before send; the
-        reasoning-pin slot stages on send SUCCESS and is discarded at ladder
-        entry, so an aborted ladder cannot leak a stale note into a later call."""
+        thread's in-flight call; every consumer of these slots stages before or
+        at send. (The reasoning-pin note lives in a ContextVar, not here.)"""
         tls = getattr(self, slot, None)
         pending = getattr(tls, "pending", None) if tls is not None else None
         if tls is not None:
@@ -2176,19 +2188,16 @@ class LLMClient:
         return self._pop_thread_disclosure("_cache_breakpoint_tls")
 
     def _stage_reasoning_pin_disclosure(self, candidate: Dict[str, Any]) -> None:
-        """Record whether the candidate JUST SENT carried the sealed-reasoning pin.
-        Staged on send SUCCESS so the fact describes the TERMINAL sent candidate (the
-        recovery ladder can strip and unpin). Reports a pin only when the wire carries
-        ``allow_fallbacks=false`` AND the transcript is genuinely sealed: an owner
-        ``repro`` pin on a portable transcript is never laundered into our diagnosis."""
-        if not hasattr(self, "_reasoning_pin_tls"):
-            self._reasoning_pin_tls = threading.local()
+        """Stage the pin fact on send SUCCESS so it describes the TERMINAL sent
+        candidate (the recovery ladder can strip and unpin). Only a wire
+        ``allow_fallbacks=false`` over a genuinely sealed transcript reports; an
+        owner ``repro`` pin on a portable transcript is never laundered in."""
         extra_body = candidate.get("extra_body")
         provider = extra_body.get("provider") if isinstance(extra_body, dict) else None
         pinned = isinstance(provider, dict) and provider.get("allow_fallbacks") is False
-        self._reasoning_pin_tls.pending = sealed_reasoning_pin_fact(
+        _REASONING_PIN_CVAR.set(sealed_reasoning_pin_fact(
             candidate.get("messages") or [], candidate.get("model"),
-        ) if pinned else None
+        ) if pinned else None)
 
     def _fetch_generation_cost(
         self,
@@ -3842,7 +3851,7 @@ class LLMClient:
             usage["prompt_cache_breakpoints_reduced"] = _cache_note
         # Why same-model provider failover was withheld on THIS call (issue #468):
         # typed, bounded, and read off the terminal sent candidate — never a guess.
-        _pin_note = self._pop_thread_disclosure("_reasoning_pin_tls")
+        _pin_note = _pop_reasoning_pin_note()
         if _pin_note:
             usage["reasoning_pin"] = _pin_note
         from ouroboros.openai_chat_dispatch import normalize_direct_openai_completion
@@ -3917,8 +3926,8 @@ class LLMClient:
         kwargs: Dict[str, Any],
         target: Dict[str, Any],
     ) -> Any:
-        # Discard a prior aborted ladder's staged pin note.
-        self._pop_thread_disclosure("_reasoning_pin_tls")
+        # Discard a prior aborted ladder's pin note.
+        _pop_reasoning_pin_note()
 
         def _send(candidate: Dict[str, Any]) -> Any:
             candidate = _physical_candidate(candidate)
@@ -4054,8 +4063,8 @@ class LLMClient:
         kwargs: Dict[str, Any],
         target: Dict[str, Any],
     ) -> Any:
-        # Discard a prior aborted ladder's staged pin note.
-        self._pop_thread_disclosure("_reasoning_pin_tls")
+        # Discard a prior aborted ladder's pin note.
+        _pop_reasoning_pin_note()
 
         async def _send(candidate: Dict[str, Any]) -> Any:
             candidate = _physical_candidate(candidate)
