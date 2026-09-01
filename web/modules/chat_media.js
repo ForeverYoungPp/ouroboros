@@ -600,12 +600,21 @@ export function createChatMedia({
         return true;
     }
 
+    // D12: the standard "two squares" copy icon, always visible on the bubble.
+    // Explicit closing tags (no self-closing) keep lightweight DOM stubs happy.
+    const COPY_ICON_SVG = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none"'
+        + ' stroke="currentColor" stroke-width="1.5" stroke-linecap="round"'
+        + ' stroke-linejoin="round" aria-hidden="true">'
+        + '<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"></rect>'
+        + '<path d="M10.5 2.5h-6a2 2 0 0 0-2 2v6"></path></svg>';
+
     function attachCopyControl(bubble, rawText) {
         if (!bubble || !String(rawText || '')) return null;
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'chat-message-copy';
-        button.textContent = 'Copy';
+        button.innerHTML = COPY_ICON_SVG;
+        button.title = 'Copy';
         button.setAttribute('aria-label', 'Copy message');
         const writeFallback = () => {
             const area = document.createElement('textarea');
@@ -633,12 +642,16 @@ export function createChatMedia({
                 ok = false;
             }
             button.textContent = ok ? '✓' : '✗';
+            button.title = ok ? 'Message copied' : 'Copy failed';
             button.setAttribute('aria-label', ok ? 'Message copied' : 'Copy failed');
             later(() => {
-                button.textContent = 'Copy';
+                button.innerHTML = COPY_ICON_SVG;
+                button.title = 'Copy';
                 button.setAttribute('aria-label', 'Copy message');
             }, 1500);
         });
+        // The bubble class reserves a timestamp gutter under the icon (style.css).
+        bubble.classList.add('has-copy');
         bubble.appendChild(button);
         return button;
     }

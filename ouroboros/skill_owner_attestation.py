@@ -24,6 +24,7 @@ from ouroboros.skill_loader import (
     SkillReviewState,
     compute_content_hash,
     find_skill,
+    load_review_state,
     save_review_state,
     skill_state_dir,
 )
@@ -41,10 +42,18 @@ def run_owner_attestation(ctx: Any, drive_root: pathlib.Path, skill: Any, conten
     PASS finding so the status serializes) and drop the owner-issued marker that
     load_review_state requires for the verdict to stay valid. Owner-only (the endpoint gates
     it); the agent can never forge the marker (it is an owner-state file)."""
-    # persist=False: a FAILED attestation attempt must not clobber the skill's existing
-    # review state — the endpoint surfaces the preflight failure (409) and leaves state as-is.
+    # A FAILED attestation preflight persists as a normal review result (so the gate's
+    # fresh ``preflight_failed`` fact and the Repair affordance appear) — but ONLY when
+    # persisting cannot clobber a FRESH valid verdict: review.json absent, or its recorded
+    # content_hash stale for the current payload bytes. A stale CLEAN is knowingly
+    # superseded by a FAIL at the current hash (the fact about the CURRENT bytes wins;
+    # the prior verdict stays in review_history.jsonl). With a fresh verdict on file the
+    # failure still surfaces only through the endpoint (409) and leaves state as-is.
+    persist_failed_preflight = load_review_state(
+        drive_root, skill.name, skill_dir=getattr(skill, "skill_dir", None),
+    ).is_stale_for(content_hash)
     preflight_outcome = _sr._run_deterministic_preflight(
-        ctx, drive_root, skill, content_hash, persist=False,
+        ctx, drive_root, skill, content_hash, persist=persist_failed_preflight,
         binding=getattr(ctx, "_skill_review_resolved_binding", None),
     )
     if preflight_outcome is not None:
