@@ -1,0 +1,130 @@
+"""Shape-first classification of replayed reasoning artifacts on OpenRouter.
+
+REASON-TO-CHANGE (why this is its own module and not part of ``llm.py``): it owns
+MUTABLE EXTERNAL PROVIDER FACTS — which upstream families' opaque reasoning
+artifacts survive a same-model cross-provider switch. That is an entry in the
+registry of decaying provider facts (docs/DEVELOPMENT.md), re-probed when a
+provider changes behavior; it does not change when the LLM client changes. Two
+consumers in ``llm.py``: the proactive dispatch continuity pin and the reactive
+same-model reroute.
+
+THE QUESTION: replaying an assistant turn that carries provider-private reasoning
+back to a DIFFERENT endpoint of the SAME model either works or 400s. It 400s only
+when the artifact is SEALED — cryptographically bound to the endpoint that minted
+it (a signature, an encrypted blob, a redacted block) AND not vouched as portable
+for its family. Readable text and summaries carry no binding at all: they replay
+anywhere. Pinning them to one endpoint costs same-model failover for nothing
+(issue #468: a 64-lane run died on one provider's 429s with 30 healthy sibling
+endpoints, holding a plain ``reasoning.text``).
+
+OPAQUENESS IS DECIDED BY TYPE, never by the mere presence of a ``data`` key: a
+sidecar ``data`` on a readable type must not seal the transcript, or #468 returns
+in a new costume.
+
+FAIL-CLOSED on shapes we do not recognize (unknown ``reasoning_details`` type, a
+malformed non-list ``reasoning_details``): an unknown artifact is treated as
+sealed for a non-roster family. The reactive 400 strip-and-retry in ``llm.py`` is
+the safety net for a misclassification in either direction.
+"""
+from typing import Any, Iterable, List, Optional
+
+# Families whose SEALED artifact forms are vouched to survive a same-model
+# cross-provider switch on OpenRouter (live replay probe 2026-06: Anthropic
+# across Anthropic/Bedrock/Vertex/Azure, Gemini across Vertex/AI-Studio).
+# The roster vouches EVERY non-plain form for its families — signed, encrypted,
+# redacted, unknown — which is exactly the exemption these families held before
+# the shape-first classifier, so their failover behavior is unchanged.
+#
+# ``openai/`` is DELIBERATELY ABSENT despite the 2026-06 probe: in the field
+# (2026-07, gpt-5.6-sol over 3x OpenAI + 2x Azure endpoints) replayed encrypted
+# items answered "The encrypted content for item rs_... could not be ..." with a
+# 400 after 429-driven reroutes and killed whole benchmark waves. Field evidence
+# beats the probe. Its readable artifacts stay portable like everyone else's; only
+# its encrypted/signed ones pin.
+#
+# Do not extend this roster by model-name resemblance — only by a fresh
+# cross-provider replay probe of the exact family.
+SIGNED_PORTABLE = ("anthropic/", "google/gemini-")
+
+_READABLE_DETAIL_TYPES = frozenset({"reasoning.text", "reasoning.summary"})
+_THINKING_BLOCK_TYPES = frozenset({"thinking", "reasoning"})
+
+
+def _roster_vouched(model: Any) -> bool:
+    normalized = str(model or "").strip().lstrip("~")
+    return normalized.startswith(SIGNED_PORTABLE)
+
+
+def _is_signed(value: Any) -> bool:
+    """A signature seals only when it is a NON-EMPTY string; ``None`` and ``""``
+    are how providers spell "unsigned" on an otherwise readable artifact."""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _sealing_detail_label(details: Any) -> Optional[str]:
+    if not isinstance(details, list):
+        # Present but malformed: we cannot read its shape, so we cannot vouch for it.
+        return "reasoning_details_malformed" if details else None
+    for entry in details:
+        if not isinstance(entry, dict):
+            return "unknown_type"
+        dtype = str(entry.get("type") or "").strip().lower()
+        if dtype == "reasoning.encrypted":
+            return "encrypted"
+        if dtype not in _READABLE_DETAIL_TYPES:
+            return "unknown_type"
+        if dtype == "reasoning.text" and _is_signed(entry.get("signature")):
+            return "signed_text"
+    return None
+
+
+def _sealing_block_label(content: Any) -> Optional[str]:
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = str(block.get("type") or "").strip().lower()
+        if btype == "redacted_thinking":
+            return "redacted_thinking"
+        if _is_signed(block.get("signature")):
+            # Any signed block, not just a thinking one: a stray signature is the
+            # endpoint binding wherever it rides (parity with the presence predicate).
+            return "signed_block"
+    return None
+
+
+def sealed_reasoning_artifact(messages: Iterable[Any], model: Any) -> Optional[str]:
+    """Label of the FIRST sealed reasoning artifact in ``messages``, else ``None``.
+
+    The label is a bounded host-owned vocabulary (``encrypted``, ``signed_text``,
+    ``signed_block``, ``redacted_thinking``, ``unknown_type``,
+    ``reasoning_details_malformed``) safe to disclose in usage telemetry."""
+    if _roster_vouched(model):
+        # The roster vouches every form for its families: nothing here can seal.
+        return None
+    for msg in messages or ():
+        if not isinstance(msg, dict):
+            continue
+        label = _sealing_detail_label(msg.get("reasoning_details"))
+        if label:
+            return label
+        label = _sealing_block_label(msg.get("content"))
+        if label:
+            return label
+    return None
+
+
+def transcript_has_sealed_reasoning(messages: Iterable[Any], model: Any) -> bool:
+    """Whether replaying ``messages`` on ``model`` is endpoint-BOUND — i.e. at least
+    one carried reasoning artifact is sealed. Flat ``reasoning``/``reasoning_content``
+    strings and a bare ``response_id`` are never sealing (a readable string replays
+    anywhere; an id is not an artifact at all)."""
+    return sealed_reasoning_artifact(messages, model) is not None
+
+
+def sealed_reasoning_pin_fact(messages: List[Any], model: Any) -> Optional[dict]:
+    """The typed usage disclosure for a continuity pin, or ``None`` when the
+    transcript is portable. Callers stamp it from the TERMINAL sent candidate."""
+    label = sealed_reasoning_artifact(messages, model)
+    return {"sealed": True, "artifact": label} if label else None

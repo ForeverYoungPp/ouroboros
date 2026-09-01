@@ -305,6 +305,71 @@ def test_empty_body_output_or_body_size_is_not_context_recovery(tmp_path):
         assert usage["_last_llm_error_kind"] == "request_too_large"
 
 
+_EMPTY_RESPONSE_EVENT_TYPES = {
+    "provider_body_error", "provider_incomplete_response", "llm_empty_response",
+}
+
+
+def _empty_response_event(drive_logs):
+    import json
+
+    return next(
+        event
+        for event in (
+            json.loads(line)
+            for line in (drive_logs / "events.jsonl").read_text().splitlines()
+        )
+        if event.get("type") in _EMPTY_RESPONSE_EVENT_TYPES
+    )
+
+
+def test_empty_response_event_attributes_the_upstream_provider(tmp_path):
+    """Issue #468: the live case is an HTTP-200 body error, so the upstream label never
+    reached ``llm_api_error`` — it belongs on the durable EMPTY-RESPONSE events, where
+    the usage carrying it is already in hand. Without it a same-model provider incident
+    names only the model and is unattributable after the fact."""
+
+    class _AttributedBodyErrorLLM:
+        calls = 0
+
+        def chat(self, **kwargs):
+            self.calls += 1
+            return (
+                {"content": "", "tool_calls": [], "finish_reason": "stop"},
+                {"response_provider": "DeepInfra",
+                 "provider_error": {"kind": "rate_limit", "code": "429", "message": "rate"}},
+            )
+
+    usage = {}
+    msg, _cost = call_llm_with_retry(
+        _AttributedBodyErrorLLM(), [{"role": "user", "content": "hi"}],
+        "deepseek/deepseek-v4-flash-0731", None, "medium", 1, tmp_path,
+        "task-attribution", 1, None, usage, "task", False, attempt_cap=1,
+    )
+
+    assert msg is None
+    event = _empty_response_event(tmp_path)
+    assert event["response_provider"] == "DeepInfra"
+    assert event["provider_error_kind"] == "rate_limit"
+    assert event["model"] == "deepseek/deepseek-v4-flash-0731"
+
+
+def test_empty_response_event_reports_absent_provider_attribution_as_null(tmp_path):
+    """A missing upstream label is reported as an explicit null — never guessed from a
+    neighbouring round's accumulated usage, and never silently dropped from the record."""
+    usage = {}
+    call_llm_with_retry(
+        _EmptyBodyErrorLLM({"kind": "provider_error", "code": 400, "message": "nope"}),
+        [{"role": "user", "content": "hi"}], "openai/gpt-5.5",
+        None, "medium", 1, tmp_path, "task-no-attribution", 1, None, usage,
+        "task", False, attempt_cap=1,
+    )
+
+    event = _empty_response_event(tmp_path)
+    assert event["response_provider"] is None
+    assert event["provider_error_kind"] == "provider_error"
+
+
 def test_empty_structured_context_overflow_event_carries_fit_projection(tmp_path):
     usage = {
         "_context_profile": "owner_low",

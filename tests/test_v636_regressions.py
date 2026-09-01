@@ -34,7 +34,8 @@ def test_reroute_same_model_strips_reasoning_and_unpins():
         "extra_body": {"provider": {"allow_fallbacks": False}, "reasoning": {"effort": "medium"}},
     }
     out = inst._reroute_same_model_kwargs(target, kwargs)
-    assert not LLMClient._has_openrouter_reasoning_details(out["messages"])
+    assert not any(m.get("reasoning_details") for m in out["messages"])
+    assert LLMClient._has_replayed_reasoning_metadata(out["messages"]) is False
     assert "allow_fallbacks" not in out.get("extra_body", {}).get("provider", {})
     # nothing pins a provider (no reasoning continuity) -> no reroute needed
     assert inst._reroute_same_model_kwargs(target, {"messages": [{"role": "user", "content": "x"}]}) is None

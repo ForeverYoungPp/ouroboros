@@ -25,6 +25,7 @@ from ouroboros.anthropic_native_custody import (
 )
 from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
 from ouroboros.provider_models import OPENROUTER_DEFAULTS, PROVIDER_PREFIXES, normalize_anthropic_model_id, normalize_model_identity, resolve_minimax_base_url
+from ouroboros.reasoning_artifacts import sealed_reasoning_pin_fact, transcript_has_sealed_reasoning
 from ouroboros.request_wire_recovery import (
     finalize_wire_response,
     note_provider_metadata_drop_fields,
@@ -143,16 +144,6 @@ def _route_normalizes_cache_breakpoints(target: Dict[str, Any]) -> bool:
         target.get("supports_openrouter_extensions")
         and supports_message_cache_control(model)
         and model.startswith("anthropic/")
-    )
-
-
-def _reasoning_signature_portable_across_or_providers(model: str) -> bool:
-    """Whether replay signatures are verified portable across same-model providers."""
-    m = str(model or "").strip().lstrip("~")
-    return (
-        m.startswith("anthropic/")
-        or m.startswith("google/gemini-")
-        or m.startswith("openai/")
     )
 
 
@@ -1011,13 +1002,20 @@ class LLMClient:
             }
         return applied
 
-    def _pop_effort_clamp_disclosure(self) -> Optional[Dict[str, Any]]:
-        """The pending clamp record for THIS thread's in-flight call, if any."""
-        tls = getattr(self, "_effort_clamp_tls", None)
+    def _pop_thread_disclosure(self, slot: str) -> Optional[Dict[str, Any]]:
+        """Take the pending disclosure staged in thread-local ``slot`` for THIS thread's
+        in-flight call, clearing it. Every staging site writes its slot before or at
+        send, so a popped note can never mis-attribute to a later, unrelated response
+        on this thread; an unclaimed note is discarded by the caller on a dead ladder."""
+        tls = getattr(self, slot, None)
         pending = getattr(tls, "pending", None) if tls is not None else None
         if tls is not None:
             tls.pending = None
         return pending if isinstance(pending, dict) else None
+
+    def _pop_effort_clamp_disclosure(self) -> Optional[Dict[str, Any]]:
+        """The pending clamp record for THIS thread's in-flight call, if any."""
+        return self._pop_thread_disclosure("_effort_clamp_tls")
 
     @classmethod
     def _record_effort_ceiling(cls, model_id: str, current_effort: str) -> None:
@@ -1754,21 +1752,16 @@ class LLMClient:
         flush_buffered()
         return out
 
-    @staticmethod
-    def _has_openrouter_reasoning_details(messages: List[Dict[str, Any]]) -> bool:
-        for msg in messages:
-            if isinstance(msg, dict) and msg.get("reasoning_details"):
-                return True
-        return False
-
     @classmethod
     def _has_replayed_reasoning_metadata(cls, messages: List[Dict[str, Any]]) -> bool:
-        """True if the transcript carries provider-private reasoning artifacts that
-        a DIFFERENT upstream family cannot validate: assistant ``reasoning``/
-        ``reasoning_details``/``reasoning_content``/``response_id`` keys, or
-        ``thinking``/``reasoning`` CONTENT blocks (or a stray ``signature`` on a
-        content block). Broader than ``_has_openrouter_reasoning_details`` (which
-        only sees the top-level ``reasoning_details`` field)."""
+        """PRESENCE predicate: True if the transcript carries ANY provider-private
+        reasoning round-trip artifact — assistant ``reasoning``/``reasoning_details``/
+        ``reasoning_content``/``response_id`` keys, or ``thinking``/``reasoning``
+        CONTENT blocks (or a stray ``signature`` on a content block). Shape-blind on
+        purpose: it answers "is there anything to strip?" for the REACTIVE paths
+        (400 strip-and-retry, reroute entry). Whether an artifact is actually
+        endpoint-BOUND is the separate SEALED question, answered shape-first by
+        ``transcript_has_sealed_reasoning`` (ouroboros/reasoning_artifacts.py)."""
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
@@ -1861,14 +1854,16 @@ class LLMClient:
         present (nothing to strip / no continuity pin to drop — default routing can
         already fall back across endpoints). NEVER switches model — only endpoint.
 
-        ``allow_portable_reasoning`` (set ONLY by the transient body-error path): for a
-        family whose reasoning signature is cross-provider portable
-        (``_reasoning_signature_portable_across_or_providers``) the replayed signature
-        survives the same-model sibling-provider switch, so PRESERVE it (retry the same
-        payload and let OpenRouter route to a healthy endpoint) rather than needlessly
-        dropping continuity on the very rate-limit path the failover exists for. The 400
-        signature-REJECTION path never sets this: a 400 means the signature WAS rejected,
-        so it must strip regardless of family."""
+        ``allow_portable_reasoning`` (set ONLY by the transient body-error path): when the
+        replayed artifact is NOT sealed (``transcript_has_sealed_reasoning`` — readable
+        text/summary, or an opaque form vouched by the signed-portable roster) it survives
+        the same-model sibling-provider switch, so PRESERVE it (retry the same payload and
+        let OpenRouter route to a healthy endpoint) rather than needlessly dropping
+        continuity on the very rate-limit path the failover exists for. The 400
+        signature-REJECTION path never sets this: a 400 means the artifact WAS rejected,
+        so it must strip regardless of shape. This is the SAME predicate as the proactive
+        dispatch pin — one artifact-shape truth for both directions (the pre-#468
+        openai/* carve-out here is now absorbed by the roster, which excludes openai/*)."""
         if not target.get("supports_openrouter_extensions"):
             return None
         messages = kwargs.get("messages")
@@ -1877,17 +1872,7 @@ class LLMClient:
         model_id = str(kwargs.get("model") or "").strip().lstrip("~")
         preserve_reasoning = (
             allow_portable_reasoning
-            and _reasoning_signature_portable_across_or_providers(model_id)
-            # OpenAI encrypted-reasoning items are NOT reliably portable across
-            # OpenRouter sibling upstreams in the field (2026-07, gpt-5.6-sol on
-            # 3x OpenAI + 2x Azure endpoints: "The encrypted content for item
-            # rs_... could not be ..." 400s after 429-reroutes killed whole
-            # benchmark runs; the 2026-06 replay probe did not cover this mix).
-            # openai/* therefore strips on reroute as it did before v6.49.0;
-            # preserve stays for Anthropic/Gemini whose signatures verified
-            # portable. The proactive continuity pin at dispatch (other callers
-            # of the predicate) is intentionally unchanged.
-            and not model_id.startswith("openai/")
+            and not transcript_has_sealed_reasoning(messages, model_id)
         )
         if preserve_reasoning:
             retry_kwargs = copy.deepcopy(kwargs)
@@ -1980,7 +1965,7 @@ class LLMClient:
     ) -> Optional[Dict[str, Any]]:
         """If an HTTP-200 response actually carries a TRANSIENT provider
         body-error, return same-model reroute kwargs (provider unpinned; reasoning
-        continuity preserved for cross-provider-portable families, dropped
+        continuity preserved when the replayed artifact is not sealed, dropped
         otherwise); None when not applicable."""
         try:
             resp_dict = resp.model_dump()
@@ -2187,13 +2172,25 @@ class LLMClient:
         return "default" if breakpoints else None
 
     def _pop_cache_breakpoint_disclosure(self) -> Optional[Dict[str, Any]]:
-        """The pending ≤4-cap reduction record for THIS thread's in-flight call (the
-        finalizer writes the slot before every send, so it never mis-attributes)."""
-        tls = getattr(self, "_cache_breakpoint_tls", None)
-        pending = getattr(tls, "pending", None) if tls is not None else None
-        if tls is not None:
-            tls.pending = None
-        return pending if isinstance(pending, dict) else None
+        """The pending ≤4-cap reduction record for THIS thread's in-flight call."""
+        return self._pop_thread_disclosure("_cache_breakpoint_tls")
+
+    def _stage_reasoning_pin_disclosure(self, candidate: Dict[str, Any]) -> None:
+        """Record whether the candidate JUST SENT carried the sealed-reasoning continuity
+        pin. Staged on send SUCCESS so the fact describes the TERMINAL sent candidate —
+        the recovery ladder can strip reasoning and drop the pin, and a build-time guess
+        would then disclose a pin that never reached the wire. Reports a pin only when the
+        wire provider block carries ``allow_fallbacks=false`` AND the sent transcript is
+        genuinely sealed: an owner ``repro`` policy pinning a portable transcript is the
+        owner's choice, not ours, and must not be laundered into our diagnosis."""
+        if not hasattr(self, "_reasoning_pin_tls"):
+            self._reasoning_pin_tls = threading.local()
+        extra_body = candidate.get("extra_body")
+        provider = extra_body.get("provider") if isinstance(extra_body, dict) else None
+        pinned = isinstance(provider, dict) and provider.get("allow_fallbacks") is False
+        self._reasoning_pin_tls.pending = sealed_reasoning_pin_fact(
+            candidate.get("messages") or [], candidate.get("model"),
+        ) if pinned else None
 
     def _fetch_generation_cost(
         self,
@@ -3604,29 +3601,21 @@ class LLMClient:
             extra_body["provider"] = {
                 "require_parameters": True,
             }
-        # Replayed reasoning is endpoint-bound ONLY for families whose thought-block
-        # signatures do not survive a same-model cross-provider switch. Anthropic, Gemini
-        # and OpenAI reasoning signatures ARE cross-provider portable on OpenRouter
-        # (Anthropic across Anthropic/Bedrock/Vertex/Azure; Gemini across Vertex/AI-Studio;
-        # OpenAI encrypted items across OpenAI/Azure — live same-model replay probe, 2026-06:
-        # each minted signature validated 200 on its sibling providers), so they must stay
-        # failover-eligible. Pinning them would defeat OpenRouter's same-model provider
-        # resilience and surface one upstream's rate-limit when a healthy sibling endpoint
-        # could serve the turn. OpenRouter routing is sticky (the same provider serves the
-        # happy path), so the prompt cache stays warm on the primary and only a real
-        # outage triggers the cross-provider failover — no throughput hopping. Unverified
-        # families (e.g. z-ai/glm, deepseek) keep the conservative pin; the reactive 400
-        # strip-and-retry (_openrouter_signature_retry_kwargs) is the safety net for all.
-        # The trigger is the BROAD replay-artifact contract (_has_replayed_reasoning_metadata
-        # — assistant reasoning/reasoning_content/response_id OR a signed reasoning/thinking
-        # CONTENT block), matching the reactive strip path, so an unverified signed block
-        # cannot slip past the pin via a non-`reasoning_details` artifact.
-        if self._has_replayed_reasoning_metadata(messages) and not _reasoning_signature_portable_across_or_providers(cache_model):
+        # Replayed reasoning is endpoint-bound only when the artifact itself is SEALED
+        # (opaque or signed, and not vouched by the signed-portable roster) — see
+        # transcript_has_sealed_reasoning. Readable text/summary artifacts replay fine on
+        # any sibling endpoint of the same model, so they must stay failover-eligible:
+        # pinning them surfaces one upstream's rate-limit while healthy siblings idle
+        # (issue #468). Routing is sticky, so the prompt cache stays warm on the primary
+        # and only a real outage triggers the cross-provider failover. The reactive 400
+        # strip-and-retry (_openrouter_signature_retry_kwargs) remains the safety net for a
+        # misclassification in either direction.
+        if transcript_has_sealed_reasoning(messages, cache_model):
             provider_body = extra_body.setdefault("provider", {})
             if isinstance(provider_body, dict):
                 provider_body["allow_fallbacks"] = False
         # Owner-configured OpenRouter provider routing (resilience/repro). Gap-merge:
-        # NEVER override the anthropic require_parameters pin or the (unverified-family)
+        # NEVER override the anthropic require_parameters pin or the (sealed-artifact)
         # reasoning-continuity allow_fallbacks=False pin set above. Affects same-model
         # provider routing only — it never changes the MODEL, so the P3 reviewer context
         # floor is untouched.
@@ -3711,6 +3700,7 @@ class LLMClient:
             # provider usage extensions must not spoof their provenance.
             usage.pop("response_finish_reason", None)
             usage.pop("response_provider", None)
+            usage.pop("reasoning_pin", None)
         # An HTTP-200 that carried a provider body-error (OpenRouter passes
         # 429/5xx through the body) reaches here only when a same-model reroute
         # was unavailable or also errored. Surface it as a typed marker so the
@@ -3851,6 +3841,11 @@ class LLMClient:
         _cache_note = self._pop_cache_breakpoint_disclosure()
         if _cache_note:
             usage["prompt_cache_breakpoints_reduced"] = _cache_note
+        # Why same-model provider failover was withheld on THIS call (issue #468):
+        # typed, bounded, and read off the terminal sent candidate — never a guess.
+        _pin_note = self._pop_thread_disclosure("_reasoning_pin_tls")
+        if _pin_note:
+            usage["reasoning_pin"] = _pin_note
         from ouroboros.openai_chat_dispatch import normalize_direct_openai_completion
 
         msg, usage = normalize_direct_openai_completion(msg, usage, wire_completion)
@@ -3936,6 +3931,7 @@ class LLMClient:
                     _candidate_before_dispatch(candidate, request),
                 )
                 note_wire_send_succeeded(last_physical_attempt_capture())
+                self._stage_reasoning_pin_disclosure(candidate)
                 return result
             except UsageAccountingError:
                 # Admission failure cannot leave its disclosure for a later call.
@@ -4069,6 +4065,7 @@ class LLMClient:
                     _candidate_before_dispatch(candidate, request),
                 )
                 note_wire_send_succeeded(last_physical_attempt_capture())
+                self._stage_reasoning_pin_disclosure(candidate)
                 return result
             except UsageAccountingError:
                 # Sync-driver parity: central UAE discard (triad r4).
