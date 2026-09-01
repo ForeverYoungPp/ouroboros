@@ -23,18 +23,24 @@ import { accountRows } from '../modules/harness_accounts.js';
 import { nextUpAccount } from '../modules/claudexor_status_store.js';
 import { indexProfilesByHarness } from '../modules/reviewer_slots.js';
 
+// Source pins below delimit across line breaks; normalize CRLF so a Windows
+// checkout (core.autocrlf) reads the same bytes the delimiters were written for.
 const repoFile = (rel) => readFileSync(
     fileURLToPath(new URL(`../../${rel}`, import.meta.url)), 'utf-8',
-);
+).replace(/\r\n?/g, '\n');
 const moduleFile = (rel) => readFileSync(
     fileURLToPath(new URL(`../modules/${rel}`, import.meta.url)), 'utf-8',
-);
+).replace(/\r\n?/g, '\n');
 
 /** Names inside a Python tuple literal assigned to `name = (...)`. */
 function pythonTupleNames(source, name) {
     const start = source.indexOf(`${name} = (`);
     assert.notEqual(start, -1, `${name} not found — the wire contract moved, update this test`);
-    const body = source.slice(start, source.indexOf('\n)\n', start));
+    const end = source.indexOf('\n)\n', start);
+    // A missing closer must fail loudly: a slice to EOF over-fills the name set
+    // and lets the subset assertions below pass vacuously.
+    assert.notEqual(end, -1, `${name} tuple closer not found — update this test`);
+    const body = source.slice(start, end);
     return new Set([...body.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]));
 }
 
