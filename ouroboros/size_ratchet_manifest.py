@@ -200,6 +200,7 @@ BAND_PATHS = {
     "tests/test_review_verification_v6544.py": None,
     "tests/test_reviewer_slot_config.py": "Existing suite grew by successor pins for the shared actor-row vocabulary (subagent_id round-trip, api_chat spelling); splitting the module would separate the contract from its historical pins.",
     "tests/test_safety_policy.py": None,
+    "tests/test_services_tool_v2.py": "race-free waits for observable service-log state (CI serial-lane flake fix, PR #482) pushed the suite past 1000 lines; the three affected tests keep their assertions and gain explicit waits",
     "tests/test_skill_review_runner.py": "Skill lifecycle/review terminal-state regression coverage stays one focused suite below the 1500-line band cap.",
     "tests/test_swe_pro_e1v2.py": None,
     "tests/test_telegram_miniapp_lifecycle.py": None,
