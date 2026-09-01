@@ -621,8 +621,14 @@ def _load_checklist_section() -> str:
     archive_path = _REPO_ROOT / "docs" / "CHECKLISTS_ARCHIVE.md"
     try:
         archive = archive_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        archive = ""
+    except OSError as e:
+        # Fail-closed like the checklist itself: the archive is the same
+        # binding reviewer contract (FROZEN_CONTRACT_PATHS) — silently
+        # reviewing without the standing disclosures would let settled
+        # owner-accepted narrowings be re-litigated.
+        raise FileNotFoundError(
+            f"docs/CHECKLISTS_ARCHIVE.md not readable: {e}"
+        ) from e
     if archive:
         section = f"{section}\n\n{archive}"
     return section

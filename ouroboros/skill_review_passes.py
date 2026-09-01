@@ -102,11 +102,12 @@ _SESSION_RETRIEVAL = (
     "`ouroboros/extension_ui_validation.py` in full. Treat those source reads as "
     "the governance and host-contract context for this review.\n\n"
     "Some skill payload files may be binary / non-UTF-8 and appear in the pack only "
-    "as {path,size,mime,sha256} descriptors instead of inlined content. You may "
+    "as {path,size,mime_from_name,sha256} descriptors instead of inlined content "
+    "(mime_from_name is guessed from the FILENAME, not the bytes). You may "
     "inspect such suspicious or binary files with your own read/search tools when "
     "their path is reachable inside your session root; on the default install "
     "layout the skill payload lives OUTSIDE your session root, so expect to "
-    "judge by the descriptor (size/mime/sha256) — and say which you did in the "
+    "judge by the descriptor (size/mime_from_name/sha256) — and say which you did in the "
     "finding.\n\n"
 )
 

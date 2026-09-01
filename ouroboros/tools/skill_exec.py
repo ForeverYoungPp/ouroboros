@@ -617,7 +617,11 @@ def _non_text_script_refusal(script_path: pathlib.Path, script_rel: str) -> str:
     renamed to a declared script name) to an interpreter. A declared script is
     a reviewed TEXT artifact by contract. Returns the typed refusal or ""."""
     try:
-        script_path.read_bytes()[:65536].decode("utf-8")
+        # Decode the WHOLE file: a 64 KiB prefix check would pass a script with
+        # a binary tail (and falsely refuse a multibyte char straddling the
+        # boundary). The file is about to be executed anyway — one full read
+        # here is not the expensive part.
+        script_path.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return (
             f"⚠️ SKILL_EXEC_ERROR: script {script_rel!r} is not valid UTF-8 "

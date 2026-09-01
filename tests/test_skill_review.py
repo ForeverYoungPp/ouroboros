@@ -1246,7 +1246,7 @@ def test_skill_review_session_prompt_allows_binary_inspection():
     that descriptor-only binary files may be inspected with its own tools."""
     from ouroboros.skill_review_passes import _SESSION_RETRIEVAL
 
-    assert "{path,size,mime,sha256}" in _SESSION_RETRIEVAL
+    assert "{path,size,mime_from_name,sha256}" in _SESSION_RETRIEVAL
     assert "your own read/search tools" in _SESSION_RETRIEVAL
     assert "judge by the descriptor" in _SESSION_RETRIEVAL
 

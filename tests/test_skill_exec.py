@@ -766,6 +766,46 @@ def test_skill_exec_queues_lifecycle_event_for_supervisor(tmp_path, monkeypatch)
     assert queued[-1]["exit_code"] == 0
 
 
+def test_skill_exec_refuses_non_utf8_declared_script(tmp_path, monkeypatch):
+    """#447 X4 exec seam: review admission carries non-UTF-8 payload files as
+    descriptors, so the exec layer must refuse to hand a binary blob (a
+    PK/zipapp renamed into the scripts list) to an interpreter — judged on the
+    WHOLE file, so a binary tail behind a text prefix cannot ride through."""
+    skills_root = tmp_path / "skills"
+    skill_dir = _build_skill(skills_root, "blobby", script_body="print('placeholder')\n")
+    # Overwrite the declared script with a text prefix + PK header + binary tail.
+    (skill_dir / "scripts" / "hello.py").write_bytes(
+        b"# looks like python\n" + b"PK\x03\x04" + b"\xff\xfe" * 40000
+    )
+    ctx = _make_ctx(tmp_path)
+    _mark_reviewed_and_enabled(ctx.drive_root, skill_dir, "blobby")
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+
+    raw = skill_exec_mod._handle_skill_exec(ctx, skill="blobby", script="scripts/hello.py")
+    assert "SKILL_EXEC_ERROR" in raw and "not valid UTF-8" in raw, raw[:300]
+
+
+def test_skill_exec_large_multibyte_script_survives_the_utf8_seam(tmp_path, monkeypatch):
+    """Positive pin for the seam (#447 item 21: name the surviving path): a
+    legitimate >64 KiB script with multibyte characters — including one that
+    would straddle a 64 KiB prefix boundary — still executes."""
+    skills_root = tmp_path / "skills"
+    filler = ("# коммент с не-ASCII содержимым\n" * 2000)  # ~70 KiB of UTF-8
+    skill_dir = _build_skill(
+        skills_root, "bigtext", script_body=filler + "print('ok-big')\n",
+    )
+    ctx = _make_ctx(tmp_path)
+    _mark_reviewed_and_enabled(ctx.drive_root, skill_dir, "bigtext")
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+
+    raw = skill_exec_mod._handle_skill_exec(ctx, skill="bigtext", script="scripts/hello.py")
+    payload = json.loads(raw)
+    assert payload["exit_code"] == 0, payload
+    assert "ok-big" in payload["stdout"]
+
+
 def test_skill_exec_runs_in_light_mode(tmp_path, monkeypatch):
     """v5.1.2 Frame A: ``light`` allows reviewed + enabled skills to
     execute. The privilege scope ``light`` controls is repo
