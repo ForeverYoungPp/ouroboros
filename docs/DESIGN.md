@@ -244,9 +244,11 @@ settles, as a record of the path taken. Anatomy, top to bottom:
    state change.
 
 The card is born on tokens even though the surrounding chat surface is not yet
-migrated: type sizes and every colour come from tokens (no new literals);
-component geometry (card min/max width, chip radius) keeps local literals like
-the rest of the chat surface until its migration pass.
+migrated: type sizes and every colour come from tokens (no new literals), the
+chip's pill radius and the option gap included; every focusable element in the
+card shares one keyboard ring (2px `--focus-accent-border`, 2px offset).
+Component geometry (card min/max width) keeps local literals like the rest of
+the chat surface until its migration pass.
 
 ## 6. Account group / row anatomy
 
