@@ -152,6 +152,12 @@
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
+/* The universal reset above also clears the UA's `dialog { margin: auto }`,
+   which is what centres a native modal dialog in its viewport — without it
+   every `showModal()` surface lands in the top-left corner. Restore it for
+   dialogs as a class, not per dialog. */
+dialog { margin: auto; }
+
 /* Color-only utility — never a font-size (docs/DESIGN.md ".muted"). */
 .muted { color: var(--text-meta); }
 
