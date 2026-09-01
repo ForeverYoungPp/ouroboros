@@ -74,10 +74,22 @@ caps with `text-transform`.
 | --- | --- |
 | `--text-primary` | The one thing this row/card is about; interactive control labels |
 | `--text-meta` | Real secondary content: labels, notes, hints, meta lines |
+| `--text-secondary` | A quieter step below meta, for a dense repeated field |
 | `--text-disabled` | Genuinely inert or incidental content only |
 
 `--text-muted` is a legacy alias of `--text-disabled`; new work names
 `--text-meta` or `--text-disabled` so the intent is readable in the diff.
+
+`--text-secondary` is a real fourth step, not an alias: it sits between meta
+and disabled and is written at ~50 call sites. Reach for it only when
+`--text-meta` is genuinely too loud — a value repeated on every row of a dense
+list, a chip's supporting word — and `--text-disabled` would be unreadable.
+The criterion is the same one that governs the whole table: **if the owner has
+to read it to act, it is `--text-meta` or brighter.** A load-bearing caveat, a
+one-off note, a hint that explains a control: those stay at meta. A tone or an
+unclassifiable ink is what produced the original "too much small
+high-contrast white text" report from the opposite direction, so a rule that
+declares a size and no colour is still the worst of the options.
 
 Two failure modes this table exists to prevent, both observed in this codebase:
 
