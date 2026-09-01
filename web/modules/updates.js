@@ -84,14 +84,15 @@ export function updateVerdict(data = {}, phase = '') {
         if (txPhase === 'corrupt') {
             // Boot recovery quarantines readable corruption when no live merge
             // is present. It deliberately leaves unreadable/rename-failed or
-            // merge-owned markers fail-closed, so offer one bounded restart
-            // without promising that every corrupt projection will clear.
+            // merge-owned markers fail-closed. The in-app restart is itself
+            // deferred while the marker is corrupt, so do not offer a control
+            // that cannot reach that boot recovery path.
             return {
                 ...base,
                 state: 'resolving', tone: 'error',
                 headline: 'The update transaction marker is corrupt.',
-                hint: 'Restart Ouroboros once so boot recovery can quarantine readable corruption. If this state remains, inspect the marker file (ouroboros-update-tx.json in the repository .git directory) manually, then check again.',
-                action: { id: 'restart', label: 'Restart now' },
+                hint: 'Quit and reopen Ouroboros so boot recovery can quarantine readable corruption when no merge is active. The in-app restart is deferred while this marker is corrupt. If this state remains after reopening, inspect the marker file (ouroboros-update-tx.json in the repository .git directory) manually, then check again.',
+                action: { id: 'check', label: 'Check again' },
             };
         }
         if (txPhase === 'pending_boot_smoke') {
