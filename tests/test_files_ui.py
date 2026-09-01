@@ -79,7 +79,7 @@ def test_chat_document_card_uses_dialog_and_safe_download_fallbacks():
     # Shared loopback guard reused by both bridge methods (DRY).
     assert "_resolve_bridge_file_url(url)" in launcher
 
-    assert "export async function openViaHostBridge(url, filename = 'file')" in helper
+    assert "export async function openViaHostBridge(url, filename = 'file', { browserUrl = '' } = {})" in helper
     assert "api?.open_file_with_default_app" in helper
     assert "api?.download_file_to_downloads" in helper
     assert "await downloadBridge(url, filename, true)" in helper
@@ -93,7 +93,7 @@ def test_chat_document_card_uses_dialog_and_safe_download_fallbacks():
     # bytes and fall back to the canonical one; the browser keeps the canonical.
     assert "dialogFile.source.bridge || dialogFile.source.durable," in chat
     assert 'data-file-action="download"' in chat
-    assert "await downloadViaHostBridge(source.bridge || source.durable, filename);" in chat
+    assert "await downloadViaHostBridge(source.bridge || source.durable, filename, { browserUrl: source.durable });" in chat
     assert "URL.createObjectURL(blob)" in chat
     assert ".chat-file-dialog {" in css
 
@@ -151,7 +151,7 @@ def test_desktop_bridge_version_skew_fallback_chain():
     # Existing file-method chain stays intact for the interceptor to reuse.
     assert "api?.open_file_with_default_app" in helper
     assert "api?.download_file_to_downloads" in helper
-    assert "window.open(url, '_blank', 'noopener');" in helper
+    assert "window.open(browserUrl || url, '_blank', 'noopener');" in helper
     # Without ANY file bridge the interceptor degrades the file class to the
     # copy-link fallback instead of looping the helpers back into its own shim.
     assert "fileBridgeReady" in helper
