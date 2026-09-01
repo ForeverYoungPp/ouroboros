@@ -54,6 +54,24 @@ function formatDuration(seconds) {
         : `${minutes}:${String(secs).padStart(2, '0')}`;
 }
 
+// Toast dedupe for task incident frames (moved from chat.js, byte-ratchet
+// extraction; the module-level set is deliberately shared across chat
+// instances so a Main and a Project panel never double-toast one incident).
+const shownIncidentToastKeys = new Set();
+
+export function showTaskIncidentToast(msg) {
+    const incident = String(msg?.task_incident || '').trim();
+    if (!incident) return;
+    const key = String(msg?.toast_once || `${msg?.task_id || ''}:${incident}`).trim();
+    if (!key || shownIncidentToastKeys.has(key)) return;
+    shownIncidentToastKeys.add(key);
+    if (shownIncidentToastKeys.size > 500) {
+        const oldest = shownIncidentToastKeys.values().next().value;
+        shownIncidentToastKeys.delete(oldest);
+    }
+    showToast(String(msg?.content || msg?.text || incident), 'error');
+}
+
 export function safeHttpUrl(value) {
     // safeExternalHrefAttr returns escaped markup; chat needs a raw URL before its own attribute escaping.
     const raw = String(value || '').trim();
@@ -191,19 +209,6 @@ export function createChatMedia({
         downloadBlob(await sourceBlob(source, mime), filename);
     }
 
-    async function shareSource(source, filename, mime) {
-        if (typeof navigator.share !== 'function' || typeof navigator.canShare !== 'function') {
-            throw new Error('Sharing is not supported on this device');
-        }
-        const blob = await sourceBlob(source, mime);
-        const file = typeof File === 'function'
-            ? new File([blob], filename, { type: mime })
-            : blob;
-        const payload = { files: [file], title: filename };
-        if (!navigator.canShare(payload)) throw new Error('This file cannot be shared');
-        await navigator.share(payload);
-    }
-
     function ensureFileDialog() {
         if (fileDialog) return fileDialog;
         fileDialog = document.createElement('dialog');
@@ -214,7 +219,6 @@ export function createChatMedia({
                 <div class="chat-file-dialog-actions">
                     <button type="button" data-file-action="open">Open</button>
                     <button type="button" data-file-action="download">Download</button>
-                    <button type="button" data-file-action="share">Share</button>
                     <button type="button" data-file-action="close">Close</button>
                 </div>
             </form>`;
@@ -244,15 +248,6 @@ export function createChatMedia({
                 showToast(`Could not download file: ${error?.message || error}`, 'error');
             }
         });
-        listen(fileDialog.querySelector('[data-file-action="share"]'), 'click', async () => {
-            if (!dialogFile) return;
-            try {
-                await shareSource(dialogFile.source, dialogFile.filename, dialogFile.mime);
-                close();
-            } catch (error) {
-                showToast(`Could not share file: ${error?.message || error}`, 'error');
-            }
-        });
         return fileDialog;
     }
 
@@ -262,8 +257,6 @@ export function createChatMedia({
         dialog.querySelector('.chat-file-dialog-title').textContent = file.filename;
         const open = dialog.querySelector('[data-file-action="open"]');
         open.hidden = !file.source.durable;
-        const share = dialog.querySelector('[data-file-action="share"]');
-        share.disabled = typeof navigator.share !== 'function' || typeof navigator.canShare !== 'function';
         if (typeof dialog.showModal === 'function') dialog.showModal();
         else dialog.setAttribute('open', '');
     }
@@ -388,7 +381,6 @@ export function createChatMedia({
                 <button type="button" data-photo-action="open">Open in new tab</button>
                 <button type="button" data-photo-action="download">Download</button>
                 <button type="button" data-photo-action="copy">Copy to clipboard</button>
-                <button type="button" data-photo-action="share">Share</button>
             </div>
         </details>`;
     }
@@ -419,10 +411,6 @@ export function createChatMedia({
             } catch (error) {
                 showToast(`Could not copy image: ${error?.message || error}`, 'error');
             }
-        });
-        listen(action('share'), 'click', async () => {
-            try { await shareSource(sourceRef, filename, mime); }
-            catch (error) { showToast(`Could not share image: ${error?.message || error}`, 'error'); }
         });
     }
 
@@ -582,12 +570,21 @@ export function createChatMedia({
         return true;
     }
 
+    // D12: the standard "two squares" copy icon, always visible on the bubble.
+    // Explicit closing tags (no self-closing) keep lightweight DOM stubs happy.
+    const COPY_ICON_SVG = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none"'
+        + ' stroke="currentColor" stroke-width="1.5" stroke-linecap="round"'
+        + ' stroke-linejoin="round" aria-hidden="true">'
+        + '<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"></rect>'
+        + '<path d="M10.5 2.5h-6a2 2 0 0 0-2 2v6"></path></svg>';
+
     function attachCopyControl(bubble, rawText) {
         if (!bubble || !String(rawText || '')) return null;
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'chat-message-copy';
-        button.textContent = 'Copy';
+        button.innerHTML = COPY_ICON_SVG;
+        button.title = 'Copy';
         button.setAttribute('aria-label', 'Copy message');
         const writeFallback = () => {
             const area = document.createElement('textarea');
@@ -615,12 +612,16 @@ export function createChatMedia({
                 ok = false;
             }
             button.textContent = ok ? '✓' : '✗';
+            button.title = ok ? 'Message copied' : 'Copy failed';
             button.setAttribute('aria-label', ok ? 'Message copied' : 'Copy failed');
             later(() => {
-                button.textContent = 'Copy';
+                button.innerHTML = COPY_ICON_SVG;
+                button.title = 'Copy';
                 button.setAttribute('aria-label', 'Copy message');
             }, 1500);
         });
+        // The bubble class reserves a timestamp gutter under the icon (style.css).
+        bubble.classList.add('has-copy');
         bubble.appendChild(button);
         return button;
     }

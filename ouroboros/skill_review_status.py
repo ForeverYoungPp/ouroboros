@@ -194,11 +194,14 @@ def skill_review_gate(
 
     ``findings`` is optional: a caller that has the persisted findings gets a
     ``preflight_failed`` key in the gate (the typed fact behind the Repair
-    affordance, #335). Absence of the key means the caller could not know —
-    it is never fabricated as False. A STALE review's persisted failure no
-    longer describes the current payload bytes (the owner may have fixed it
-    by hand), so the fact is True only while the findings are fresh — a stale
-    state honestly falls back to Re-review, which reruns the preflight.
+    affordance, #335) plus its companion ``preflight_failed_stale``. Absence
+    of the keys means the caller could not know — they are never fabricated.
+    A STALE review's persisted failure no longer describes the current payload
+    bytes (the owner may have fixed it by hand), so ``preflight_failed`` is
+    True only while the findings are fresh; the recorded-but-stale failure
+    surfaces as ``preflight_failed_stale`` instead, and the card offers BOTH
+    actions: the cheap Re-review (which reruns the preflight) stays primary,
+    with Repair offered based on the last recorded preflight.
     """
     raw_status = normalize_skill_review_status(status)
     if enforcement is None:
@@ -244,6 +247,8 @@ def skill_review_gate(
         "blocking_reason": reason,
         "review_enforcement": enforcement,
         "summary": summary,
-        **({"preflight_failed": (not stale) and preflight_failed(findings)}
-           if findings is not None else {}),
+        **({
+            "preflight_failed": (not stale) and preflight_failed(findings),
+            "preflight_failed_stale": bool(stale) and preflight_failed(findings),
+        } if findings is not None else {}),
     }

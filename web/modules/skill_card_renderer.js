@@ -3,6 +3,7 @@ import {
     grantReady,
     isRateLimitError,
     preflightFailed,
+    preflightFailedStale,
     preflightFindingText,
     reviewReady,
     safeExternalHrefAttr as safeExternalUrl,
@@ -31,17 +32,28 @@ function missingGrantLoadError(skill) {
     return !grantReady(skill) && String(skill.load_error || '').includes('missing owner grants');
 }
 
-function repairReady(skill) {
+function repairableSource(skill) {
     const source = (skill.source || 'native').toLowerCase();
     const payloadRoot = String(skill.payload_root || '');
     // self_authored payloads live under skills/external/ (config
     // SKILL_SOURCE_SUBDIRS has no self_authored bucket), so the payload-root
     // gate already matches them — only the source list kept them out (#335).
     return ['clawhub', 'ouroboroshub', 'external', 'self_authored'].includes(source)
-        && /^skills\/(external|clawhub|ouroboroshub)\//.test(payloadRoot)
+        && /^skills\/(external|clawhub|ouroboroshub)\//.test(payloadRoot);
+}
+
+function repairReady(skill) {
+    return repairableSource(skill)
         && (skill.review_status === 'blockers'
             || preflightFailed(skill)
             || (Boolean(skill.load_error) && !missingGrantLoadError(skill)));
+}
+
+// D11: the recorded preflight FAIL is STALE for the current payload bytes —
+// Re-review stays primary; Repair is offered from the menu, honestly labeled
+// as based on the last recorded preflight run.
+function staleRepairOffer(skill) {
+    return repairableSource(skill) && preflightFailedStale(skill) && !preflightFailed(skill);
 }
 
 function skillConflictReason(skill) {
@@ -321,6 +333,7 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
         ? `<div class="skills-card-menu"><button type="button" class="skills-card-menu-trigger" aria-label="More actions" aria-haspopup="menu" aria-expanded="false" data-skill-menu-trigger>⋮</button><dialog class="skills-card-menu-dialog" role="menu">
             ${makeRunnable ? `<button type="button" role="menuitem" class="skills-menu-item skills-make-runnable" data-skill="${safeName}" data-skill-action="repair" title="Author a runnable script for this instruction skill via the repair agent">Make runnable</button>` : ''}
             ${!reviewInProgress && !(preflightFailed(skill) && repairReady(skill)) ? `<button type="button" role="menuitem" class="skills-menu-item skills-review" data-skill="${safeName}">${skill.review_status === 'pending' ? 'Review' : (skill.review_stale ? 'Re-review' : 'Review again')}</button>` : ''}
+            ${!reviewInProgress && !repairInProgress && staleRepairOffer(skill) ? `<button type="button" role="menuitem" class="skills-menu-item skills-repair-stale" data-skill="${safeName}" data-skill-action="repair" title="Repair based on the last recorded preflight — the payload changed since that run, so Re-review would recheck it first">Repair</button>` : ''}
             ${ownerAttestable ? `<button type="button" role="menuitem" class="skills-menu-item skills-attest-review skills-attest-warn" data-skill="${safeName}" title="Skip the expensive LLM review for your own or verified official-hub skill. The deterministic safety preflight still runs, and this is logged for audit.">⚠️ Skip review</button>` : ''}
             ${submit.visible ? `<button type="button" role="menuitem" class="skills-menu-item skills-submit-hub ${submit.disabled ? 'is-disabled' : ''}" data-skill="${safeName}" title="${escapeHtml(submit.reason)}" data-submit-disabled="${submit.disabled ? 'true' : 'false'}" data-submit-reason="${escapeHtml(submit.reason)}" data-submit-state="${escapeHtml(submit.state || '')}" data-publication-ready="${submit.publication_ready === true ? 'true' : 'false'}" aria-disabled="${submit.disabled ? 'true' : 'false'}">Publish to OuroborosHub</button>` : ''}
             ${market ? `<button type="button" role="menuitem" class="skills-menu-item skills-update" data-skill="${safeName}" data-source="${escapeHtml(source)}">Update</button><button type="button" role="menuitem" class="skills-menu-item skills-uninstall" data-skill="${safeName}" data-source="${escapeHtml(source)}">Uninstall</button>` : ''}

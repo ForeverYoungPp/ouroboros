@@ -22,7 +22,7 @@ from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, subagent_message_meta
 from ouroboros.task_results import TASK_COST_META_FIELDS as _TASK_COST_META_FIELDS
-from ouroboros.utils import utc_now_iso
+from ouroboros.utils import strip_markdown, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -859,6 +859,10 @@ def _collect_chat_rows(
                 "telegram_chat_id": int(entry.get("telegram_chat_id") or 0),
             }
             if rec["system_type"] in {"project_started", "project_completion_summary"}:
+                # Read-side plain normalization for lifecycle rows persisted
+                # before the producer stripped markdown; a no-op on new rows.
+                # The durable chat.jsonl is never rewritten.
+                rec["text"] = strip_markdown(rec["text"])
                 for key in ("project_id", "project_name", "target_label", "status"):
                     if key in entry:
                         rec[key] = str(entry.get(key) or "")
