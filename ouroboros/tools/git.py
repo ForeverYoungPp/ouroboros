@@ -8,6 +8,7 @@ import hashlib
 import logging
 import os
 import pathlib
+import posixpath
 import re
 import subprocess
 import time
@@ -3284,9 +3285,30 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
     ]
     targets_system = binding_targets_system_repo(ctx, binding)
     affected_protected = protected_paths_in(dirty_files) if targets_system else []
-    if paths and targets_system:
-        for p in paths:
-            norm = normalize_repo_path(p)
+    # Normalize each requested path ONCE, and both the protected-path gate below
+    # and the checkout/clean action further down consume that identical value.
+    # A divergent normalizer was a protected-path bypass: the gate used
+    # normalize_repo_path() while the action used lstrip("./"), which strips
+    # leading '.' AND '/' characters — so `../ouroboros/safety.py` passed the gate
+    # (not equal to `ouroboros/safety.py`) and was then checked out against the
+    # real protected file. Reject anything that escapes the repository root so the
+    # two stages can never disagree.
+    normalized_paths: List[str] = []
+    for _p in (paths or []):
+        _raw = str(_p or "").strip()
+        if not _raw:
+            continue
+        _norm = normalize_repo_path(_raw)
+        _collapsed = posixpath.normpath(_norm)
+        if posixpath.isabs(_collapsed) or _collapsed == ".." or _collapsed.startswith("../"):
+            return _vcs_result(
+                f"⚠️ RESTORE_ERROR: path escapes the repository root: {_raw}", binding,
+            )
+        normalized_paths.append(_norm)
+    if paths and not normalized_paths:
+        return _vcs_result("⚠️ RESTORE_ERROR: No valid paths provided.", binding)
+    if normalized_paths and targets_system:
+        for norm in normalized_paths:
             if is_protected_runtime_path(norm):
                 return _vcs_result(
                     f"⚠️ RESTORE_BLOCKED: Cannot restore protected file: {norm}. "
@@ -3320,19 +3342,23 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
         preview.append("")
         preview.append("Call again with confirm=true to proceed.")
         return _vcs_result("\n".join(preview), binding)
-    if paths:
-        safe_paths = [os.path.normpath(p.strip().lstrip("./")) for p in paths if p.strip()]
-        if not safe_paths:
-            return _vcs_result("⚠️ RESTORE_ERROR: No valid paths provided.", binding)
+    if normalized_paths:
+        # Reuse the exact contained, normalized paths the gate above judged.
         try:
-            run_cmd(["git", "checkout", "HEAD", "--"] + safe_paths, cwd=repo_dir)
+            run_cmd(["git", "checkout", "HEAD", "--"] + normalized_paths, cwd=repo_dir)
         except Exception as e:
             return _vcs_result(f"⚠️ RESTORE_ERROR: git checkout failed: {e}", binding)
         try:
-            run_cmd(["git", "clean", "-fd", "--"] + safe_paths, cwd=repo_dir)
-        except Exception:
-            pass
-        return _vcs_result(f"Restored {len(safe_paths)} path(s) to HEAD.", binding)
+            run_cmd(["git", "clean", "-fd", "--"] + normalized_paths, cwd=repo_dir)
+        except Exception as e:
+            # Do not swallow: the checkout landed but untracked cleanup did not,
+            # so the working tree does NOT fully match HEAD. Report it.
+            return _vcs_result(
+                f"⚠️ RESTORE_PARTIAL: checked out {len(normalized_paths)} path(s), "
+                f"but `git clean` failed and untracked files may remain: {e}",
+                binding,
+            )
+        return _vcs_result(f"Restored {len(normalized_paths)} path(s) to HEAD.", binding)
     else:
         try:
             run_cmd(["git", "checkout", "HEAD", "--", "."], cwd=repo_dir)
@@ -3340,8 +3366,15 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
             return _vcs_result(f"⚠️ RESTORE_ERROR: git checkout failed: {e}", binding)
         try:
             run_cmd(["git", "clean", "-fd"], cwd=repo_dir)
-        except Exception:
-            pass
+        except Exception as e:
+            # A swallowed failure previously let this claim "matches HEAD" while
+            # untracked files survived. Surface it instead of asserting a state
+            # that was not verified.
+            return _vcs_result(
+                f"⚠️ RESTORE_PARTIAL: tracked changes discarded, but `git clean` "
+                f"failed and untracked files may remain: {e}",
+                binding,
+            )
         return _vcs_result(
             "All uncommitted changes discarded. Working directory matches HEAD.",
             binding,

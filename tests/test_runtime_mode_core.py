@@ -801,6 +801,54 @@ def test_restore_to_head_blocks_protected_rename_source(tmp_path, monkeypatch):
     assert "BIBLE.md" in result
 
 
+def test_restore_to_head_gate_and_action_share_one_normalizer(tmp_path, monkeypatch):
+    """D8: the protected-path gate and the checkout action must judge and act on
+    the IDENTICAL normalized path. The action used lstrip("./") (strips '.' and
+    '/'), so `../ouroboros/safety.py` passed the gate (not equal to the protected
+    literal) and was then checked out against the real protected file — a
+    protected-path bypass. An escaping path must be refused before any checkout,
+    and the dirty protected file must survive untouched."""
+    from ouroboros.tools import git as git_mod
+
+    repo = _git_repo(tmp_path)
+    (repo / "ouroboros").mkdir()
+    safety = repo / "ouroboros" / "safety.py"
+    safety.write_text("REAL = 'committed'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "safety"], cwd=repo, check=True, capture_output=True)
+    # Dirty the protected file with uncommitted work that must NOT be discarded.
+    safety.write_text("REAL = 'uncommitted local edit'\n", encoding="utf-8")
+
+    ctx = _CommitCtx(repo, tmp_path / "drive")
+    result = git_mod._restore_to_head(
+        ctx, confirm=True, paths=["../ouroboros/safety.py"],
+    )
+
+    assert "escapes the repository root" in result, result[:200]
+    # The bypass is closed: the uncommitted edit survives (no checkout ran).
+    assert safety.read_text(encoding="utf-8") == "REAL = 'uncommitted local edit'\n"
+
+
+def test_restore_to_head_does_not_mangle_leading_dot_paths(tmp_path, monkeypatch):
+    """D8: lstrip("./") turned `.gitignore` into `gitignore`, so the restore acted
+    on the wrong (or a nonexistent) path. The normalizer must preserve a leading
+    dot so an ordinary dotfile is actually restored."""
+    from ouroboros.tools import git as git_mod
+
+    repo = _git_repo(tmp_path)
+    (repo / ".gitignore").write_text("build/\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "gitignore"], cwd=repo, check=True, capture_output=True)
+    # Delete it (a dirty, restorable change).
+    (repo / ".gitignore").unlink()
+
+    ctx = _CommitCtx(repo, tmp_path / "drive")
+    result = git_mod._restore_to_head(ctx, confirm=True, paths=[".gitignore"])
+
+    assert "Restored 1 path" in result, result[:200]
+    assert (repo / ".gitignore").read_text(encoding="utf-8") == "build/\n"
+
+
 def test_revert_commit_blocks_protected_contract_path(tmp_path, monkeypatch):
     from ouroboros.tools import git as git_mod
 
