@@ -829,6 +829,54 @@ def test_restore_to_head_gate_and_action_share_one_normalizer(tmp_path, monkeypa
     assert safety.read_text(encoding="utf-8") == "REAL = 'uncommitted local edit'\n"
 
 
+def test_restore_to_head_gate_judges_the_pathspec_damage_set(tmp_path, monkeypatch):
+    """D8, third form: a pathspec is not a path. Git expands ".", directories,
+    and fnmatch wildcards to a FILE SET, so a gate that judged only the requested
+    STRING let `paths=["."]` / `["ouroboros"]` / `["ouroboros/safety.*"]` reach a
+    dirty protected file and report success. The gate must judge the files the
+    restore would actually mutate, resolved by git from the SAME pathspecs."""
+    from ouroboros.tools import git as git_mod
+
+    repo = _git_repo(tmp_path)
+    (repo / "ouroboros").mkdir()
+    safety = repo / "ouroboros" / "safety.py"
+    safety.write_text("REAL = 'committed'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "safety"], cwd=repo, check=True, capture_output=True)
+    safety.write_text("REAL = 'uncommitted local edit'\n", encoding="utf-8")
+    ctx = _CommitCtx(repo, tmp_path / "drive")
+
+    for spec in (["."], ["ouroboros"], ["ouroboros/safety.*"], ["tests/.."]):
+        result = git_mod._restore_to_head(ctx, confirm=True, paths=spec)
+        assert "RESTORE_BLOCKED" in result or "escapes the repository root" in result, (spec, result[:200])
+        assert safety.read_text(encoding="utf-8") == "REAL = 'uncommitted local edit'\n", spec
+
+    # Pathspec magic re-scopes behind the gate's back: refused outright.
+    result = git_mod._restore_to_head(ctx, confirm=True, paths=[":/ouroboros/safety.py"])
+    assert "pathspec magic is not supported" in result, result[:200]
+    assert safety.read_text(encoding="utf-8") == "REAL = 'uncommitted local edit'\n"
+
+
+def test_restore_to_head_directory_pathspec_still_restores_unprotected_files(tmp_path, monkeypatch):
+    """Capability preservation for the damage-set gate: a directory pathspec whose
+    matches are all unprotected must still restore (the gate judges damage, not
+    the shape of the request)."""
+    from ouroboros.tools import git as git_mod
+
+    repo = _git_repo(tmp_path)
+    (repo / "docs").mkdir()
+    doc = repo / "docs" / "notes.md"
+    doc.write_text("committed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "docs"], cwd=repo, check=True, capture_output=True)
+    doc.write_text("scratch edit\n", encoding="utf-8")
+    ctx = _CommitCtx(repo, tmp_path / "drive")
+
+    result = git_mod._restore_to_head(ctx, confirm=True, paths=["docs"])
+    assert "Restored" in result, result[:200]
+    assert doc.read_text(encoding="utf-8") == "committed\n"
+
+
 def test_restore_to_head_gate_collapses_inner_parent_segments(tmp_path, monkeypatch):
     """D8, second form: an INNER '..' does not escape the repository, so a
     containment check alone lets it through — but normalize_repo_path() does not

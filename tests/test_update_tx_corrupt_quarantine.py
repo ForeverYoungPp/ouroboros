@@ -66,3 +66,51 @@ def test_active_valid_tx_still_closes_admission(tmp_path, monkeypatch):
     monkeypatch.setattr(workers, "_repo_writer_gate_reason", "")
     update_merge.write_update_tx({"phase": "assisted_resolution", "task_id": "x"})
     assert workers.repo_writer_admission_closed() == "managed_update_tx:assisted_resolution"
+
+
+def test_unreadable_marker_is_left_in_place_fail_closed(tmp_path, monkeypatch):
+    """#447 S2: "corrupt" conflates unreadable with unparseable. A marker that
+    cannot be READ may still be a valid live transaction — boot must not
+    quarantine it, and admission stays closed."""
+    import os
+
+    import supervisor.workers as workers
+
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    monkeypatch.setattr(workers, "_repo_writer_gate_reason", "")
+    marker = update_merge._update_tx_marker_path()
+    marker.write_text('{"phase": "assisted_resolution", "task_id": "x"}', encoding="utf-8")
+    os.chmod(marker, 0)
+    try:
+        res = update_merge.finalize_managed_update_on_boot()
+    finally:
+        os.chmod(marker, 0o644)
+
+    assert res.get("finalized") is False
+    assert "fail closed" in str(res.get("reason") or ""), res
+    assert marker.exists()
+
+
+def test_second_quarantine_in_same_second_does_not_overwrite_first(tmp_path, monkeypatch):
+    """#447 S5: POSIX rename replaces its destination and the quarantine name has
+    one-second resolution — evidence must be uniquified, not clobbered."""
+    import supervisor.workers as workers
+
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    monkeypatch.setattr(workers, "_repo_writer_gate_reason", "")
+    import time as _time
+
+    monkeypatch.setattr(_time, "time", lambda: 1_756_000_000.0)
+
+    marker = update_merge._update_tx_marker_path()
+    marker.write_text("{ first garbage", encoding="utf-8")
+    update_merge.finalize_managed_update_on_boot()
+    marker.write_text("{ second garbage", encoding="utf-8")
+    update_merge.finalize_managed_update_on_boot()
+
+    quarantined = sorted((repo / ".git").glob("ouroboros-update-tx.json.corrupt-*"))
+    assert len(quarantined) == 2, quarantined
+    contents = {q.read_bytes() for q in quarantined}
+    assert contents == {b"{ first garbage", b"{ second garbage"}

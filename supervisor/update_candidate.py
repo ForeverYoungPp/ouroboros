@@ -85,7 +85,25 @@ def quarantine_corrupt_update_tx_marker() -> Dict[str, Any]:
         return {"finalized": False,
                 "reason": "corrupt tx marker over an in-flight merge — left for owner"}
     marker = _m._update_tx_marker_path()
+    try:
+        # "corrupt" conflates unreadable with unparseable (read_update_tx_strict:
+        # callers MUST fail closed). Only a marker we can actually READ is proven
+        # garbage; an unreadable one (permissions, transient I/O) may still be a
+        # valid live transaction — leave it in place, admission stays closed.
+        marker.read_bytes()
+    except OSError:
+        _m._log_supervisor({"type": "managed_update_tx_corrupt_on_boot",
+                            "unreadable": True})
+        return {"finalized": False,
+                "reason": "unreadable tx marker — left for owner (fail closed)"}
     quarantine = marker.with_name(f"{marker.name}.corrupt-{int(time.time())}")
+    # POSIX rename REPLACES an existing destination and the timestamp has
+    # one-second resolution: two quarantines in the same second would silently
+    # overwrite the first piece of evidence. Uniquify instead.
+    seq = 0
+    while quarantine.exists():
+        seq += 1
+        quarantine = marker.with_name(f"{marker.name}.corrupt-{int(time.time())}.{seq}")
     try:
         marker.rename(quarantine)
     except OSError:

@@ -814,7 +814,7 @@ def _integrate_subagent_patch(
     )
     return (
         f"✅ Integrated subagent patch from {child_task_id} into {target} ({len(touched)} file(s), staged).{note}\n"
-        f"{diffstat}\n"
+        f"{diffstat}{_format_patch_exclusions(manifest)}\n"
         f"Verdict: {verdict_path or '(unwritten)'}.\n"
         "Changes are staged but NOT committed — review and run commit_reviewed yourself (you are the sole committer)."
         f"{disposition_warning}"
@@ -1401,7 +1401,7 @@ def _integrate_delegated_patch(
         prot_note = f" Includes {len(protected)} protected path(s) (allowed: runtime_mode={runtime_mode})."
     return (
         f"✅ Integrated delegated run {rid}'s patch into {target} ({len(touched)} file(s), staged).{prot_note}\n"
-        f"{diffstat}\n"
+        f"{diffstat}{_format_patch_exclusions(manifest)}\n"
         f"Verdict: {verdict_path or '(unwritten)'}. Its execution snapshot is released.\n"
         "Changes are staged but NOT committed — review them yourself; you are the sole committer."
         f"{note}"
@@ -1458,7 +1458,7 @@ def _compare_subagent_patches(ctx: ToolContext, task_ids: Any = None) -> str:
             f"\n## {cid}\n"
             f"- patch status: {status or '(none)'} | child result status: {result_status or '(unknown)'}\n"
             f"- tracked changed: {len(tracked)} | untracked included: {len(untracked)}\n"
-            f"- diffstat: {diffstat or '(none)'}\n"
+            f"- diffstat: {diffstat or '(none)'}{_format_patch_exclusions(manifest)}\n"
             + (f"- child summary: {result_summary}\n" if result_summary else "")
             + (f"\n```diff\n{body}\n```\n" if body else "- (no patch body; nothing to apply)\n")
         )
@@ -1467,6 +1467,32 @@ def _compare_subagent_patches(ctx: ToolContext, task_ids: Any = None) -> str:
         "or synthesize across candidates yourself (you are the sole committer). Comparison is read-only."
     )
     return "\n".join(parts)
+
+
+def _format_patch_exclusions(manifest) -> str:
+    """One disclosure line for files the capture dropped per policy, or ''.
+
+    The per-file exclusions (#447 F5) live in the workspace_patch manifest,
+    which no parent-facing surface used to render — a dropped deliverable
+    hid behind an affirmative "Integrated N file(s)" success line."""
+    entries = []
+    for key in ("sensitive_blocked", "untracked_excluded", "tracked_excluded"):
+        for item in manifest.get(key) or []:
+            if isinstance(item, dict):
+                path, reason = str(item.get("path") or ""), str(item.get("reason") or "")
+            else:
+                path, reason = str(item or ""), ""
+            if path:
+                entries.append(f"{path} ({reason})" if reason else path)
+    if not entries:
+        return ""
+    shown = "; ".join(entries[:8])
+    more = f" and {len(entries) - 8} more" if len(entries) > 8 else ""
+    return (
+        f"\n⚠️ {len(entries)} file(s) EXCLUDED from this patch by capture policy: "
+        f"{shown}{more}. If one is a real deliverable, recover it from the child "
+        "workspace before it is released."
+    )
 
 
 def get_tools() -> List[ToolEntry]:

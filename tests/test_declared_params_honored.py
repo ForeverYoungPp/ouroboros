@@ -170,3 +170,24 @@ def test_structural_pagination_page_two_returns_the_next_rows(tmp_path):
     assert rows1 | rows2 | rows3 == {
         f"mod_{f}.py:{2 * i + 1} FunctionDef" for f in range(3) for i in range(30)
     }
+
+
+def test_structural_pagination_beyond_cap_is_typed_truncation_not_no_results(tmp_path):
+    """#447 S3: collection stops at the 200-row cap, so an offset beyond it used
+    to render honest matches as "No results" (success-shaped completeness lie).
+    It must be a typed truncation instead, and a capped full page must say the
+    collection was capped rather than imply "N of N" completeness."""
+    ctx = _ctx(tmp_path)
+    for f in range(8):
+        body = "\n".join(f"def fn_{f}_{i}():\n    return {i}" for i in range(30))
+        (ctx.repo_dir / f"mod_{f}.py").write_text(body + "\n", encoding="utf-8")
+
+    # The collector may overshoot the 200 cap by up to one file's rows; the tail
+    # page past the cap must disclose the cap instead of implying completeness.
+    tail = _structural_page(ctx, offset=200)
+    assert "collection capped at 200" in tail.splitlines()[0], tail[:200]
+    assert "No results" not in tail
+
+    beyond = _structural_page(ctx, offset=400)
+    assert beyond.startswith("⚠️ QUERY_CODE_TRUNCATED"), beyond[:200]
+    assert "No results" not in beyond

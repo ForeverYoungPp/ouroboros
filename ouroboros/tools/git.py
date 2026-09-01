@@ -70,7 +70,6 @@ from ouroboros.tools.review_helpers import (
     _run_review_preflight_tests,
     format_review_history_entry,
     paths_from_name_status,
-    paths_from_porcelain_line as _review_paths_from_porcelain_line,
 )
 from ouroboros.tools.core import _data_skill_path, _str_match_replace, is_skill_control_plane_path
 from ouroboros.contracts.task_constraint import normalize_task_constraint, resolve_payload_path
@@ -3288,16 +3287,20 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
         return f"⚠️ RESTORE_ERROR: {_sanitize_git_error(str(e))}"
     repo_dir = binding.base_path
     try:
-        status = run_cmd(["git", "status", "--porcelain"], cwd=repo_dir).strip()
+        # NUL-delimited porcelain via the shared review helper: run_cmd() strips
+        # its stdout, and a worktree-only modification renders as " M path", so
+        # the stripped first line lost its leading space and the column-based
+        # line parser dropped the first CHARACTER of that path — the protected
+        # gate then judged "IBLE.md" while the restore acted on BIBLE.md.
+        from ouroboros.tools.review_helpers import list_changed_paths_from_git_status
+
+        dirty_files = list_changed_paths_from_git_status(
+            pathlib.Path(repo_dir), include_sources_for_renames=True,
+        )
     except Exception as e:
         return _vcs_result(f"⚠️ RESTORE_ERROR: git status failed: {e}", binding)
-    if not status:
+    if not dirty_files:
         return _vcs_result("Nothing to restore — working directory is already clean.", binding)
-    dirty_files = [
-        path
-        for line in status.splitlines()
-        for path in _review_paths_from_porcelain_line(line)
-    ]
     targets_system = binding_targets_system_repo(ctx, binding)
     affected_protected = protected_paths_in(dirty_files) if targets_system else []
     # Resolve each requested path to the SETTLED form git itself will act on, and
@@ -3316,6 +3319,13 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
         _raw = str(_p or "").strip()
         if not _raw:
             continue
+        if _raw.startswith(":"):
+            # Pathspec magic (":/", ":(glob)", ":!", ...) re-scopes or negates a
+            # pathspec behind the gate's back; a plain repo-relative path never
+            # needs it, so refuse rather than judge a string git reads differently.
+            return _vcs_result(
+                f"⚠️ RESTORE_ERROR: pathspec magic is not supported: {_raw}", binding,
+            )
         _collapsed = posixpath.normpath(normalize_repo_path(_raw))
         if posixpath.isabs(_collapsed) or _collapsed == ".." or _collapsed.startswith("../"):
             return _vcs_result(
@@ -3325,6 +3335,14 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
     if paths and not normalized_paths:
         return _vcs_result("⚠️ RESTORE_ERROR: No valid paths provided.", binding)
     if normalized_paths and targets_system:
+        # A pathspec is not a path: git expands directories, fnmatch wildcards,
+        # and "." to a FILE SET, so judging the requested string alone let
+        # `paths=["."]`, `["ouroboros"]`, or `["ouroboros/safety.*"]` reach dirty
+        # protected files past a gate that only knew exact names. Judge the
+        # damage set instead: the files this restore would actually mutate —
+        # dirty tracked matches (checkout reverts them) and untracked matches
+        # (`git clean -fd` deletes them) — resolved by git itself from the SAME
+        # pathspecs the action below consumes.
         for norm in normalized_paths:
             if is_protected_runtime_path(norm):
                 return _vcs_result(
@@ -3332,6 +3350,29 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
                     "Protected core/contract/release paths must be changed through reviewed commits.",
                     binding,
                 )
+        try:
+            tracked_hits = run_cmd(
+                ["git", "ls-files", "--"] + normalized_paths, cwd=repo_dir,
+            ).splitlines()
+            untracked_hits = run_cmd(
+                ["git", "ls-files", "--others", "--exclude-standard", "--"] + normalized_paths,
+                cwd=repo_dir,
+            ).splitlines()
+        except Exception as e:
+            return _vcs_result(
+                f"⚠️ RESTORE_ERROR: could not resolve pathspec matches: {e}", binding,
+            )
+        dirty_matches = set(dirty_files) & set(tracked_hits)
+        damage_protected = sorted({
+            f for f in [*dirty_matches, *untracked_hits] if f and is_protected_runtime_path(f)
+        })
+        if damage_protected:
+            return _vcs_result(
+                f"⚠️ RESTORE_BLOCKED: pathspec matches protected file(s) with uncommitted "
+                f"changes: {format_protected_paths(damage_protected)}. "
+                "Protected core/contract/release paths must be changed through reviewed commits.",
+                binding,
+            )
     elif affected_protected:
         return _vcs_result(
             f"⚠️ RESTORE_BLOCKED: Uncommitted changes touch protected file(s): "

@@ -135,7 +135,21 @@ def _update_index_entry(ctx: ToolContext, topic: str):
     if index_path.exists():
         index_content = index_path.read_text(encoding="utf-8")
     else:
-        index_content = "# Knowledge Base Index\n\n"
+        # Seed a FULL index, not just this topic: with the read-path rebuild
+        # deleted (#447 J5, "index maintenance stays on the write path"), a
+        # one-topic seed would persist a partial index that hides every
+        # pre-existing topic file from all later listings.
+        seeded = []
+        for f in sorted(kdir.glob("*.md")) if kdir.exists() else []:
+            if f.name == INDEX_FILE or f.stem == topic:
+                continue
+            try:
+                seeded_topic = _sanitize_topic(f.stem)
+                summary = _extract_summary(f.read_text(encoding="utf-8").strip())
+                seeded.append(f"- **{seeded_topic}**: {summary}")
+            except Exception:
+                log.debug(f"Failed to seed index entry for: {f.stem}", exc_info=True)
+        index_content = "# Knowledge Base Index\n\n" + ("\n".join(seeded) + "\n" if seeded else "")
 
     lines = index_content.split("\n")
     header_end = 0

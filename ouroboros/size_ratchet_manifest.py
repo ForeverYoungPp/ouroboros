@@ -175,7 +175,6 @@ BAND_PATHS = {
     "supervisor/message_bus.py": "push_log gained the A2A frame suppression and explicit-addressing contract comments in the live log routing fix (fix/main-chat-leak sprint); the module sat at exactly 1000 lines before it",
     "supervisor/queue_transitions.py": "Queue-owned admission/quiescence transitions: the budget-pause predicate, the settled-tree fence release, and the restore-time orphan sweep join their resume/fence siblings (one queue authority).",
     "supervisor/terminal_delivery.py": None,
-    "tests/test_acting_subagents.py": None,
     "tests/test_advisory_observability.py": None,
     "tests/test_build_scripts.py": None,
     "tests/test_commit_gate.py": None,

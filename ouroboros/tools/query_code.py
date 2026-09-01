@@ -421,11 +421,23 @@ def _query_code(
     shown = rows[offset:offset + limit]
     next_offset = offset + limit
     label = query or scoped_path or "."
+    # Collection stops at min(_MAX_LIMIT, offset+limit): a full collection means
+    # more matches MAY exist beyond it, so "No results" / "N of N" would be a
+    # success-shaped lie about completeness (#447 S3). Say what was truncated.
+    collection_capped = total >= min(_MAX_LIMIT, offset + limit)
     if not shown:
+        if collection_capped:
+            return (
+                f"⚠️ QUERY_CODE_TRUNCATED: collection for op `{op}` `{label}` stops at "
+                f"{_MAX_LIMIT} rows and offset={offset} lies beyond what was collected. "
+                "Narrow the query or path= instead of paging past the cap."
+            )
         return f"No results for op `{op}` `{label}`. {_empty_hint(op, label)}"
     header = f"{op} `{label}` — {len(shown)} of {total}"
     if next_offset < total:
         header += f" — next offset={next_offset}"
+    elif collection_capped and total >= _MAX_LIMIT:
+        header += f" — collection capped at {_MAX_LIMIT}; more may exist (narrow query/path=)"
     return header + "\n\n" + "\n".join(shown) + _next_step_hint(op)
 
 

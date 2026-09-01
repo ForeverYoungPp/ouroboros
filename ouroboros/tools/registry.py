@@ -3269,12 +3269,28 @@ class ToolRegistry:
             "project folder)."
         )
 
+    @staticmethod
+    def _owner_settings_snapshot() -> Optional[str]:
+        """Text of the live settings.json, "" if absent, None if UNREADABLE.
+
+        None disarms the tripwire below: the deleted restore recorded an OSError
+        as "file absent" and could unlink the live settings.json — a baseline is
+        either read successfully or not used at all."""
+        from ouroboros import config as _cfg
+
+        path = pathlib.Path(_cfg.SETTINGS_PATH)
+        try:
+            return path.read_text(encoding="utf-8") if path.is_file() else ""
+        except OSError:
+            return None
+
     def _run_shell_post_checks(
         self,
         result: str,
         *,
         light_repo_before: Optional[Dict[str, Any]],
         workspace_refs_before: Optional[Dict[str, str]],
+        settings_before: Optional[str] = None,
         tool_name: str = "run_command",
     ) -> str:
         # The owner-state snapshot/restore (OWNER_STATE_RESTORED) that used to
@@ -3285,12 +3301,24 @@ class ToolRegistry:
         # while reading as "file absent", so the restore could UNLINK the live
         # settings.json after a transient read error. The light-lane guard
         # below refuses auto-rollback for exactly this reason. Pre-exec guards
-        # keep skill owner state (SKILL_STATE_WRITE_BLOCKED on any mention)
-        # and the subagent/light lanes for settings.json. Disclosed residual:
-        # a shell writer that gets past the pre-exec guards — including a
-        # main-agent advanced/pro-mode write to settings.json — is no longer
-        # post-hoc reverted; the LLM safety layer and the file-tools deny are
-        # the remaining coverage there.
+        # keep skill owner state (SKILL_STATE_WRITE_BLOCKED on any mention);
+        # the settings.json mention-gates are lexical, so an obfuscated
+        # argument-level writer (`S=settings; cat > data/$S.json`) can pass
+        # them — the tripwire below makes that LOUD (typed first-line marker)
+        # without re-introducing the unsound rollback. Disclosed residual: the
+        # write itself is not reverted; owner-surface restore is the remedy.
+        if settings_before is not None:
+            settings_after = self._owner_settings_snapshot()
+            if settings_after is not None and settings_after != settings_before:
+                result = (
+                    "⚠️ OWNER_SETTINGS_CHANGED: data/settings.json changed while this "
+                    "command ran. Owner settings change only through save_settings / the "
+                    "Settings UI; this write was NOT auto-reverted (a post-hoc rollback "
+                    "can clobber a concurrent legitimate owner edit) — the owner surface "
+                    "is the place to verify and restore.\n\n"
+                    "Original command output:\n"
+                    f"{result}"
+                )
         if light_repo_before is not None:
             light_repo_after = _light_repo_snapshot(system_repo_dir_for(self._ctx))
             if (
@@ -3819,20 +3847,20 @@ class ToolRegistry:
             else None
         )
         worktree_before = self._worktree_status_snapshot() if entry.mutates_worktree else None
+        settings_before = self._owner_settings_snapshot() if name in _PROCESS_COMMAND_TOOLS else None
         if interpreter_resolution is None:  # node: post-gates (A-F4)
             args, interpreter_resolution = resolve_node_postgates(self._ctx, name, args, runtime_mode=_runtime_mode, effective_constraint=effective_constraint, resolved_binding=resolved_binding)
         early_error, result = self._invoke_builtin_handler(
             name, entry, args, resolved_binding, interpreter_resolution, worktree_before,
         )
         if name in _PROCESS_COMMAND_TOOLS:
-            # Post-exec tripwires run on the TOOL_ERROR path too: two of the
-            # early_error returns fire AFTER the process already ran, and
-            # returning before the checks let a command that mutated the
-            # light-mode repo or moved workspace refs skip both (#447 B2).
+            # Tripwires run on the TOOL_ERROR path too: two early_error returns
+            # fire AFTER the process already ran (#447 B2).
             checked = self._run_shell_post_checks(
                 early_error if early_error is not None else result,
                 light_repo_before=light_repo_before,
                 workspace_refs_before=workspace_refs_before,
+                settings_before=settings_before,
                 tool_name=name,
             )
             if early_error is not None:

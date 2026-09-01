@@ -507,13 +507,18 @@ def prepare_wire_payload_for_send(
         # canonical source form) so a registered candidate keeps state.current
         # set and every retry rung stays reachable (E4). The generic clause
         # below used to swallow this and send the raw payload with the ladder
-        # severed. Deterministically safe: the identity/effort invariants were
-        # already validated on the way to the failed projection.
-        candidate = _prepare_direct_rung_candidate(
-            target, detached, api_surface,
-            dialect="function",
-            reason_code="requested_wire_form", ordinal=1,
-        )
+        # severed. The fallback bind gets its own catch: a catalog broken enough
+        # to also fail the FUNCTION bind (duplicate/unnamed tools) must degrade
+        # to the raw-send path below, not escape as a local ValueError that
+        # kills the call before anything reaches the provider.
+        try:
+            candidate = _prepare_direct_rung_candidate(
+                target, detached, api_surface,
+                dialect="function",
+                reason_code="requested_wire_form", ordinal=1,
+            )
+        except (TypeError, ValueError):
+            candidate = None
     except (TypeError, ValueError):
         candidate = None
     if candidate is None:
