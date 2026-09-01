@@ -2324,7 +2324,11 @@ export function createChatInstance({
         forceTaskCard(parentId, tsValue);
         const childState = getTaskUiState(childId, true);
         if (childState && !childState.completed) childState.forceCard = true;
-        getSubagentCardRecord(childId, parentId, role);
+        const childRecord = getSubagentCardRecord(childId, parentId, role);
+        // A child card carries sortable data-ts of its first lifecycle frame;
+        // the idempotent stamp keeps an exact repeated frame physically inert
+        // while only the top-level ancestor participates in feed chronology.
+        if (childRecord?.root) stampNodeTimestamp(childRecord.root, rawTs, { anchor: true });
         const reviewsChanged = attachTaskDetailReviews(childId, evt);
         const updated = queueTaskLiveUpdate(
             summary,
