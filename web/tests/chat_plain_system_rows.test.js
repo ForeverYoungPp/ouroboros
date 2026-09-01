@@ -361,14 +361,16 @@ test('system row without a markdown flag renders plain (cancel_receipt class)', 
     try {
         const made = makeInstance(mount);
         instance = made.instance;
+        // Owner D14: the salvage text arrives VERBATIM (markers preserved) and
+        // renders as escaped plain text — literal markers, no elements.
         made.handlers.get('chat')({
             chat_id: 2, role: 'system', system_type: 'cancel_receipt',
-            content: 'Task cancelled.\nPreserved text below.',
+            content: 'Task cancelled. Preserved below.\n## Heading **bold** `code`',
             ts: '2026-08-31T00:00:03Z',
         });
         const bubble = findBubble('system');
-        assert.match(bubble.innerHTML, /Task cancelled\.\nPreserved text below\./);
-        assert.doesNotMatch(bubble.innerHTML, /<br>/);
+        assert.match(bubble.innerHTML, /Task cancelled\. Preserved below\.\n## Heading \*\*bold\*\* `code`/);
+        assert.doesNotMatch(bubble.innerHTML, /<br>|<h2|md-h2|<strong/);
         assert.equal(bubble.getAttribute('data-chat-markdown-enhanced'), '');
     } finally {
         instance?.destroy();

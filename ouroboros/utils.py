@@ -728,14 +728,15 @@ def short(s: Any, n: int = 120) -> str:
 
 
 def strip_markdown(text: str) -> str:
-    """Best-effort markdown-to-plain-text fallback.
+    """Best-effort markdown-to-plain-text projection.
 
     Shared SSOT for every plain-text projection of markdown-shaped output: the
-    live chat bridge fallback (``supervisor/message_bus.py`` re-exports it as
-    ``_strip_markdown``), the Project lifecycle excerpt producer, and the
-    read-side normalization of old persisted lifecycle rows. Line-anchored
-    patterns (headings, list bullets) only match while newlines still exist, so
-    callers must strip BEFORE flattening whitespace.
+    Project lifecycle excerpt producer and the read-side normalization of old
+    persisted lifecycle rows. Live chat delivery does NOT strip — text rides
+    verbatim and plain rendering is the client's decision (system rows without
+    ``markdown: true``). Line-anchored patterns (headings, list bullets) only
+    match while newlines still exist, so callers must strip BEFORE flattening
+    whitespace.
     """
     text = _re.sub(r"```[^\n]*\n([\s\S]*?)```", r"\1", text)
     text = _re.sub(r"`([^`]+)`", r"\1", text)
