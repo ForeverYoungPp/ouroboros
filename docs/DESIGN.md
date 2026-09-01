@@ -88,6 +88,24 @@ Two failure modes this table exists to prevent, both observed in this codebase:
   This is the loudest of all failures because it is invisible in the CSS — the
   rule simply declares a size and says nothing about colour.
 
+### Brand accent
+
+The brand red is **one value**, `--accent`. Every appearance of it is either
+that token, the named roles built on it (`--accent-light` for text on dark,
+`--accent-dim` for a fill, `--focus-accent-border` / `--focus-accent-ring` for
+focus), or a rung of the accent alpha ladder (`--accent-04` … `--accent-65`).
+A new alpha is a rung added to the ladder, never an `rgba()` literal in a rule:
+the ladder is what makes "make the accent calmer" a one-line change instead of
+a grep.
+
+The first-run wizard carried a *second* brand red for a while, so the first
+screen a new owner saw was the one screen that did not match the app.
+`web/onboarding.css` is inlined standalone and cannot import `web/style.css`,
+so it mirrors the shared tokens **by value**, and
+`tests/test_web_typography_static.py` fails if a name declared in both `:root`
+blocks resolves differently. A wizard-only token is fine; a wizard-only *value*
+for a shared name is not.
+
 ### `.muted`
 
 `.muted` is a **colour-only utility**: `color: var(--text-meta)`, nothing else.

@@ -111,13 +111,58 @@ def test_type_scale_tokens_are_declared_once_in_the_root_block() -> None:
     )
 
 
+def _root_declarations(rel: str) -> dict[str, str]:
+    """The ``:root`` block of a stylesheet as ``{token: value}``.
+
+    The block is the first rule of both files; reading only it keeps a
+    component-local ``--foo`` override out of the comparison."""
+    css = _decommented(_read(rel))
+    root = css[: css.index("\n}")]
+    assert root.lstrip().startswith(":root"), f"expected :root to open {rel}"
+    return {
+        name: " ".join(value.split())
+        for name, value in re.findall(r"(--[a-z0-9-]+)\s*:\s*([^;]+);", root)
+    }
+
+
 def test_onboarding_mirrors_the_scale_by_value() -> None:
     """onboarding.css is INLINED into a standalone first-run page and cannot
     import style.css, so it must carry the same tokens itself or every wizard
-    rule that names one silently resolves to nothing."""
-    css = _read("web/onboarding.css")
+    rule that names one silently resolves to nothing.
+
+    Carrying them is not enough: a mirror that drifts is worse than no mirror,
+    because both sides look tokenised while the wizard quietly renders a
+    different product. The wizard shipped its own brand red (``#e85d6f``
+    against the app's ``#c93545``), its own green, and its own foreground greys
+    — so the first screen a new owner saw was the one screen that did not match
+    the app. Every name declared in BOTH files must therefore resolve to the
+    SAME value; a name that exists on only one side stays free."""
+    style = _root_declarations("web/style.css")
+    onboarding = _root_declarations("web/onboarding.css")
+
     for token in TYPE_TOKENS + LINE_TOKENS + FOREGROUND_TOKENS + STATUS_TOKENS:
-        assert f"{token}:" in css, f"{token} missing from web/onboarding.css :root"
+        assert token in onboarding, f"{token} missing from web/onboarding.css :root"
+
+    shared = sorted(set(style) & set(onboarding))
+    # Guard against a vacuous pass if either :root is reshaped: the mirror is
+    # the point, so it has to actually overlap.
+    assert len(shared) > 20, f"only {len(shared)} shared tokens; is the mirror still real?"
+    drifted = {
+        token: (style[token], onboarding[token])
+        for token in shared
+        if style[token] != onboarding[token]
+    }
+    assert not drifted, (
+        "web/onboarding.css mirrors web/style.css BY VALUE (docs/DESIGN.md "
+        "header): it is inlined standalone and cannot import the app "
+        "stylesheet, so a shared token name that resolves differently is a "
+        "second product. Fix the value, or rename the wizard-local token so it "
+        "stops claiming to be the shared one.\n"
+        + "\n".join(
+            f"  {token}: style.css={s!r} onboarding.css={o!r}"
+            for token, (s, o) in sorted(drifted.items())
+        )
+    )
 
 
 def test_no_tiny_raw_font_sizes_on_migrated_surfaces() -> None:
@@ -197,10 +242,13 @@ def test_settings_field_labels_use_the_named_meta_foreground() -> None:
     --text-meta, in both stylesheets that carried a copy of it."""
     for rel in ("web/settings.css", "web/onboarding.css"):
         css = _read(rel)
-        assert "rgba(255, 255, 255, 0.68)" not in css
-        assert "rgba(237, 242, 247, 0.68)" not in css.replace(
-            "--text-meta: rgba(237, 242, 247, 0.68)", ""
-        )
+        # The token's own declaration is the one place the literal may appear:
+        # onboarding.css mirrors style.css by value and has no import.
+        body = css.replace("--text-meta: rgba(255, 255, 255, 0.68)", "")
+        assert "rgba(255, 255, 255, 0.68)" not in body
+        # The wizard's former private grey family, retired when it started
+        # mirroring style.css by value.
+        assert "rgba(237, 242, 247, 0.68)" not in css
         assert "var(--text-meta)" in css, f"{rel} never names --text-meta"
 
 
