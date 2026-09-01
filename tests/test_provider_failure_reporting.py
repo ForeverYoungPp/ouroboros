@@ -1371,3 +1371,74 @@ def test_aborted_ladder_discards_staged_reasoning_pin(monkeypatch):
     _msg, usage = client._normalize_remote_response(
         resp.model_dump(), target, skip_cost_fetch=True)
     assert "reasoning_pin" not in usage
+
+
+def test_concurrent_async_ladders_keep_pin_notes_isolated(monkeypatch):
+    """Two overlapping async calls on ONE event loop must not clear or consume
+    each other's staged reasoning_pin note (final-gate finding: the ContextVar
+    isolation needs a contract test — a threading.local slot fails this)."""
+    import asyncio
+    from ouroboros.llm import LLMClient
+
+    client = LLMClient()
+    monkeypatch.setattr(client, "_get_supported_parameters", lambda _m: None)
+
+    sealed_msgs = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant",
+         "reasoning_details": [{"type": "reasoning.encrypted", "data": "b"}]},
+    ]
+    plain_msgs = [{"role": "user", "content": "q"}]
+
+    def _resp(rid):
+        class _R:
+            def model_dump(self):
+                return {"id": rid, "provider": "P",
+                        "choices": [{"message": {"content": "ok"},
+                                     "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1}}
+        return _R()
+
+    sealed_staged = asyncio.Event()
+    sibling_done = asyncio.Event()
+
+    async def sealed_call():
+        target = client._resolve_remote_target("z-ai/glm-4.6")
+        kwargs = client._build_remote_kwargs(
+            target, sealed_msgs, "medium", 128, "auto", None, None)
+
+        async def create_fn(**_kw):
+            return _resp("gen-sealed")
+
+        resp = await client._create_chat_completion_with_retries_async(
+            create_fn, kwargs, target)
+        # The note is staged now; let the sibling run its WHOLE cycle
+        # (ladder-entry discard + stage-None + normalize) before we normalize.
+        sealed_staged.set()
+        await sibling_done.wait()
+        _msg, usage = client._normalize_remote_response(
+            resp.model_dump(), target, skip_cost_fetch=True)
+        return usage
+
+    async def plain_call():
+        await sealed_staged.wait()
+        target = client._resolve_remote_target("deepseek/deepseek-v4-flash-0731")
+        kwargs = client._build_remote_kwargs(
+            target, plain_msgs, "medium", 128, "auto", None, None)
+
+        async def create_fn(**_kw):
+            return _resp("gen-plain")
+
+        resp = await client._create_chat_completion_with_retries_async(
+            create_fn, kwargs, target)
+        _msg, usage = client._normalize_remote_response(
+            resp.model_dump(), target, skip_cost_fetch=True)
+        sibling_done.set()
+        return usage
+
+    async def main():
+        return await asyncio.gather(sealed_call(), plain_call())
+
+    sealed_usage, plain_usage = asyncio.run(main())
+    assert sealed_usage["reasoning_pin"] == {"sealed": True, "artifact": "encrypted"}
+    assert "reasoning_pin" not in plain_usage
