@@ -671,3 +671,20 @@ test('a compat URL that is not the files-download form is rejected, not trusted'
         fx.restore();
     }
 });
+
+test('a live data: photo still hands the bridge the frame addresses', () => {
+    const { controller, restore } = fixture();
+    try {
+        const msg = {
+            msg_type: 'photo', task_id: 't9', ts: '2026-09-01T10:00:00+00:00',
+            mime: 'image/png', image_base64: 'aGk=',
+            download_url: '/api/tasks/t9/artifacts/chat-media-' + 'a'.repeat(64) + '.png',
+            download_url_compat: '/api/files/download?path=x/chat-media.png',
+        };
+        const bubble = controller.buildMediaBubble(msg);
+        assert.ok(bubble, 'bubble built from base64');
+        const html = String(bubble.innerHTML || '');
+        assert.ok(html.includes('data:image/png'), 'display stays base64');
+        assert.ok(!html.includes('/api/files/download'), 'compat address is bridge-only, not the display');
+    } finally { restore(); }
+});

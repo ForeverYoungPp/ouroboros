@@ -478,6 +478,7 @@
  * @property {string=} decision_id
  * @property {string=} state
  * @property {number=} answered_index
+ * @property {string=} comment
  * @property {boolean=} duplicate
  * @property {string=} error
  * @property {string=} dispatched

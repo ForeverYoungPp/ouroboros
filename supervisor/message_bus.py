@@ -578,6 +578,13 @@ class LocalChatBridge:
             "chat_id": int(chat_id or 0),
             "task_id": str(task_id or ""),
         }
+        # The durable addresses ride the LIVE frame too: without them a
+        # packaged desktop shell can only save this media after a history
+        # reload (the bridge cannot be handed a data: URI).
+        if download_url:
+            msg["download_url"] = download_url
+        if download_url_compat:
+            msg["download_url_compat"] = download_url_compat
         stamp_project_thread(DATA_DIR, msg)
         if self._broadcast_fn:
             self._broadcast_fn(msg)
@@ -633,6 +640,13 @@ class LocalChatBridge:
             "chat_id": int(chat_id or 0),
             "task_id": str(task_id or ""),
         }
+        # The durable addresses ride the LIVE frame too: without them a
+        # packaged desktop shell can only save this media after a history
+        # reload (the bridge cannot be handed a data: URI).
+        if download_url:
+            msg["download_url"] = download_url
+        if download_url_compat:
+            msg["download_url_compat"] = download_url_compat
         stamp_project_thread(DATA_DIR, msg)
         if self._broadcast_fn:
             self._broadcast_fn(msg)

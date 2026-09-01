@@ -542,6 +542,37 @@ def test_replay_returns_the_recorded_zero_index(tmp_path, monkeypatch):
     assert body["duplicate"] is True and body["answered_index"] == 0
 
 
+def test_free_answer_replay_never_becomes_an_option(tmp_path, monkeypatch):
+    """A same-request_id retry may legally carry a different payload (a 503
+    retry pressed as an option after a free answer). The recorded block is the
+    only truth: the replay confirmation and the task frame keep the free
+    answer, and no answered_index is fabricated from the retry's payload."""
+    record_asked(tmp_path, "task-1", quiz_id="q1", question="?", options=["A", "B"])
+    app = _decision_app(tmp_path, monkeypatch, live_task={"id": "task-1"})
+    first = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1",
+                        "comment": "my own plan"})
+    assert first.status_code == 200 and "answered_index" not in first.json()
+    replay = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1",
+                         "option_index": 1})
+    assert replay.status_code == 200
+    body = replay.json()
+    assert body["duplicate"] is True
+    assert "answered_index" not in body
+    assert body["comment"] == "my own plan"
+
+
+def test_replay_keeps_the_recorded_comment(tmp_path, monkeypatch):
+    """A retry with a rewritten comment cannot overwrite what was recorded."""
+    record_asked(tmp_path, "task-1", quiz_id="q1", question="?", options=["A", "B"])
+    app = _decision_app(tmp_path, monkeypatch, live_task={"id": "task-1"})
+    _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1",
+                "option_index": 0, "comment": "recorded note"})
+    replay = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1",
+                         "option_index": 0, "comment": "rewritten note"})
+    assert replay.status_code == 200
+    assert replay.json()["comment"] == "recorded note"
+
+
 def test_comment_is_verbatim_or_refused(tmp_path, monkeypatch):
     record_asked(tmp_path, "task-1", quiz_id="q1", question="?", options=["A", "B"])
     app = _decision_app(tmp_path, monkeypatch, live_task={"id": "task-1"})

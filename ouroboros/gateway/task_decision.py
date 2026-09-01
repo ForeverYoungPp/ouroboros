@@ -243,6 +243,8 @@ async def api_decision_answer(request: Request) -> JSONResponse:
                 # The loser of a first-wins race settles honestly: the card
                 # learns the WINNING option, never a false expiry.
                 payload["answered_index"] = refused_block["answered_index"]
+            if str(refused_block.get("comment") or ""):
+                payload["comment"] = str(refused_block["comment"])
             if error in {"option_out_of_range", "answer_empty"}:
                 status = 400
             return JSONResponse(payload, status_code=status)
@@ -263,10 +265,14 @@ async def api_decision_answer(request: Request) -> JSONResponse:
             # same-id retry attempt (reset_attempt_controls_for_retry revokes
             # only hurry/finalize kinds), and the model judges freshness from
             # the frame's stamps (30=A). No lock spans both writes on purpose.
+            # The recorded block is the ONLY answer truth: a same-request_id
+            # retry may legally carry a different payload (a 503 retry pressed
+            # as an option after a free answer), and echoing that payload would
+            # hand the task a choice the projection never recorded.
             answered_index = (int(block["answered_index"])
                               if isinstance(block.get("answered_index"), int)
-                              else raw_index)  # None: the owner's own answer
-            frame = _quiz_answer_frame(block, answered_index, str(block.get("comment") or comment))
+                              else None)  # None: the owner's own free answer
+            frame = _quiz_answer_frame(block, answered_index, str(block.get("comment") or ""))
             drive = _task_drive_for_task(task, task_id)
             if not write_owner_message(
                 drive, frame, task_id,
@@ -299,11 +305,13 @@ async def api_decision_answer(request: Request) -> JSONResponse:
     }
     recorded_index = (int(block["answered_index"])
                       if isinstance(block.get("answered_index"), int)
-                      else raw_index)
+                      else None)
     if recorded_index is not None:
         # ABSENT, never fabricated: an answer with no option has no index,
         # and a 0 would settle the card on an option the owner refused.
         payload_ok["answered_index"] = recorded_index
+    if str(block.get("comment") or ""):
+        payload_ok["comment"] = str(block["comment"])
     return JSONResponse(payload_ok)
 
 

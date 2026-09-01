@@ -50,7 +50,7 @@ export function renderSkillReviewDisclosure(text, ref = null, deps = {}) {
                     <span class="skill-review-toggle-label">Show review</span>
                 </span>
             </button>
-            <div class="skill-review-full" data-skill-review-full hidden>${jobRef ? '' : render(text)}</div>
+            <div class="skill-review-full" data-skill-review-full data-chat-markdown-enhanced="1" hidden>${jobRef ? '' : render(text)}</div>
         </div>
     `;
 }

@@ -200,12 +200,15 @@ export function createChatMedia({
     // canonical same-origin URL used for fetches; `bridge` is what a host-bridge
     // call should be given.
     function mediaSourceRef(msg, source) {
+        // The displayed source may be a data: URI (live delivery) while the
+        // frame still carries durable addresses; the bridge can only be handed
+        // a URL, so those addresses are read from the frame, not the display.
         const isData = source.startsWith('data:');
-        const durable = isData ? '' : source;
+        const canonical = isData ? durableChatMediaUrl(msg?.download_url) : source;
         return {
             base64: isData ? source.split(',')[1] || '' : '',
-            durable,
-            bridge: durable ? (compatMediaUrl(msg?.download_url_compat) || durable) : '',
+            durable: canonical,
+            bridge: canonical ? (compatMediaUrl(msg?.download_url_compat) || canonical) : '',
         };
     }
 

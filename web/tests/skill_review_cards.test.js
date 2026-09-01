@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -37,7 +38,7 @@ test('reference rows render an empty lazy container carrying the job reference',
     });
     assert.match(html, /data-skill-review-skill="alpha"/);
     assert.match(html, /data-skill-review-job="skill-job-1"/);
-    assert.match(html, /<div class="skill-review-full" data-skill-review-full hidden><\/div>/);
+    assert.match(html, /<div class="skill-review-full" data-skill-review-full data-chat-markdown-enhanced="1" hidden><\/div>/);
     // Collapsed layout is unchanged: same summary button + toggle label.
     assert.match(html, /data-skill-review-toggle/);
     assert.match(html, /Show review/);
@@ -360,4 +361,9 @@ test('wiring: Retry click clears the error state and refetches', async () => {
 test('wiring: non-review bubbles are left untouched', () => {
     const bubble = { querySelector: () => null };
     assert.equal(wireSkillReviewDisclosure(bubble), false);
+});
+
+test('the inline review body opts out of the chat pre-wrap in the template itself', () => {
+    const source = fs.readFileSync(new URL('../modules/skill_review_card.js', import.meta.url), 'utf8');
+    assert.match(source, /class="skill-review-full" data-skill-review-full data-chat-markdown-enhanced="1"/);
 });

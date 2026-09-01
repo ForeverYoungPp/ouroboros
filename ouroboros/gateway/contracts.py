@@ -1354,6 +1354,7 @@ class DecisionResponse(TypedDict, total=False):
     decision_id: str
     state: str
     answered_index: int
+    comment: str
     duplicate: bool
     error: str
     dispatched: str
