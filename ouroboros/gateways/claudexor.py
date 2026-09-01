@@ -46,7 +46,8 @@ _CONNECT_TIMEOUT_SEC = 5.0
 # purpose: most calls here would rather wait than fail, and a run start can take a while
 # to answer.
 _READ_TIMEOUT_SEC = 60.0
-# The FLOOR under such a caller's ask, not a bound anything asks for by name. Every
+# The FLOOR under non-strict bounded wait/admission asks. Owned-daemon startup also
+# imports it as the CEILING for each fast loopback liveness probe. Every ordinary
 # `delegate_wait` poll asks for what its window has left; this is where that narrowing
 # stops, because a nearly spent window asking for its own 0.2s turns a healthy daemon
 # into a timeout, while the 60s default would outrun the very deadline the wait clamps
