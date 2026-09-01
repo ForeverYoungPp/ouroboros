@@ -821,7 +821,7 @@ class MCPManager:
         collided: List[str] = []
         for tool in normalized:
             if tool.prefixed_name in seen:
-                collided.append(tool.name)
+                collided.append(tool.raw_name)
                 continue
             seen.add(tool.prefixed_name)
             deduped.append(tool)
@@ -917,10 +917,18 @@ class MCPManager:
             tools_raw = _run_async(lambda: self._async_list_tools(cfg, timeout), join_timeout=timeout + 3)
         except BaseException as exc:  # noqa: BLE001
             return {"ok": False, "error": f"{type(exc).__name__}: {_redact_error_text(exc, cfg)}"}
+        truncated = any(
+            isinstance(t, dict) and t.get("_pagination_truncated") for t in tools_raw
+        )
+        tools_raw = [
+            t for t in tools_raw
+            if not (isinstance(t, dict) and t.get("_pagination_truncated"))
+        ]
         return {
             "ok": True,
             "server_id": cfg.id,
             "tool_count": len(tools_raw),
+            **({"pagination_truncated": True} if truncated else {}),
             "tools": [
                 {
                     "name": str(t.get("name") or ""),

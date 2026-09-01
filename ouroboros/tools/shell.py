@@ -518,12 +518,14 @@ def _register_process_outputs(
                 # the task log so the omission stays resolvable (#447 P1).
                 shown = "; ".join(skipped_members[:5])
                 more = (
-                    f" (+{len(skipped_members) - 5} more; full list in the task log)"
+                    f" (+{len(skipped_members) - 5} more; full list in server.log,"
+                    f" task {getattr(ctx, 'task_id', '') or '?'})"
                     if len(skipped_members) > 5 else ""
                 )
                 if len(skipped_members) > 5:
                     log.info(
-                        "directory output %s: full export skip list (%d): %s",
+                        "task %s: directory output %s: full export skip list (%d): %s",
+                        getattr(ctx, "task_id", "") or "?",
                         text, len(skipped_members), "; ".join(skipped_members),
                     )
                 notes.append(

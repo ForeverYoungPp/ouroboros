@@ -409,7 +409,14 @@ def _query_code(
                 # Whole-repo map (folded from the former codebase_digest tool):
                 # a compact file/symbol inventory to orient in an unfamiliar repo.
                 from ouroboros.code_intelligence import render_codebase_digest
-                return render_codebase_digest(inventory)
+                digest_text = render_codebase_digest(inventory)
+                if normalized_root == "user_files":
+                    # Same В23 egress seam: a secret-shaped file/symbol NAME in
+                    # the owner's home must not surface raw (#447 s2r2).
+                    from ouroboros.secret_masking import mask_secret_bytes
+
+                    digest_text, _masked = mask_secret_bytes(digest_text)
+                return digest_text
             rows = _inventory_rows(ctx, inventory, repo_root, {
                 "op": op, "query": query, "path": scoped_path, "kind": kind,
                 "depth": depth, "limit": limit, "offset": offset,
