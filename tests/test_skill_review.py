@@ -1168,7 +1168,8 @@ def test_skill_review_non_utf8_yields_typed_descriptor(tmp_path):
     assert descriptor == {
         "path": "cert.png",
         "size": len(payload),
-        "mime": "image/png",
+        # guessed from the NAME (bytes are not a PNG) — the field name says so
+        "mime_from_name": "image/png",
         "sha256": _hashlib.sha256(payload).hexdigest(),
     }
 
@@ -1247,7 +1248,7 @@ def test_skill_review_session_prompt_allows_binary_inspection():
 
     assert "{path,size,mime,sha256}" in _SESSION_RETRIEVAL
     assert "your own read/search tools" in _SESSION_RETRIEVAL
-    assert "judge them by the descriptor" in _SESSION_RETRIEVAL
+    assert "judge by the descriptor" in _SESSION_RETRIEVAL
 
 
 def test_review_skill_fails_closed_on_unreadable_payload(tmp_path, monkeypatch):

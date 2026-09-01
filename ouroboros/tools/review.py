@@ -603,15 +603,29 @@ async def _multi_model_review_async(content: str, prompt: str,
 # Unified pre-commit review gate.
 
 def _load_checklist_section() -> str:
-    """Load Repo Commit Checklist, fail-closed if missing/malformed."""
+    """Load Repo Commit Checklist, fail-closed if missing/malformed.
+
+    The standing-disclosure archive rides along: packet-only (api) reviewers
+    have no repository tools, so a bare pointer to docs/CHECKLISTS_ARCHIVE.md
+    would be unresolvable for them and settled owner-accepted narrowings could
+    be re-raised (#447 stage-3 wave). The archive is small and binding — the
+    extraction slimmed the live checklist FILE, not the reviewer's contract."""
     try:
-        return _load_checklist_section_precise("Repo Commit Checklist")
+        section = _load_checklist_section_precise("Repo Commit Checklist")
     except (FileNotFoundError, ValueError):
         raise
     except Exception as e:
         raise FileNotFoundError(
             f"docs/CHECKLISTS.md not found or malformed: {e}"
         ) from e
+    archive_path = _REPO_ROOT / "docs" / "CHECKLISTS_ARCHIVE.md"
+    try:
+        archive = archive_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        archive = ""
+    if archive:
+        section = f"{section}\n\n{archive}"
+    return section
 
 
 # The triad prompt is assembled STABLE-FIRST for provider prompt caching:

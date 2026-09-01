@@ -104,7 +104,7 @@ def test_root_read_authorization_is_location_only(user_files_ctx, operation, rel
     "grep -rn sudo ouroboros/",
     "ls /usr/bin/sudo",
 ])
-def test_sudo_named_as_data_executes(tmp_path, cmd):
+def test_sudo_named_as_data_passes_the_deterministic_prefilter(tmp_path, cmd):
     registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
     assert registry._run_shell_safety_check({"cmd": cmd}, "advanced") is None
 

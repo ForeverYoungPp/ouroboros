@@ -28,6 +28,9 @@ _EXECUTABLE_MAGICS: Tuple[Tuple[bytes, str], ...] = (
     (b"\xce\xfa\xed\xfe", "Mach-O executable (32-bit, little-endian)"),
     (b"\xcf\xfa\xed\xfe", "Mach-O executable (64-bit, little-endian)"),
     (b"\xca\xfe\xba\xbe", "Mach-O universal (fat) binary / Java class"),
+    (b"\xca\xfe\xba\xbf", "Mach-O universal (fat, 64-bit) binary"),
+    (b"\xbe\xba\xfe\xca", "Mach-O universal (fat, byte-swapped) binary"),
+    (b"\xbf\xba\xfe\xca", "Mach-O universal (fat, 64-bit byte-swapped) binary"),
 )
 
 
@@ -49,10 +52,10 @@ def executable_magic_kind(data: bytes, *, is_utf8_text: bool) -> str:
     if not is_utf8_text:
         if data[:2] == b"MZ":
             return "PE/DOS executable"
-        if len(data) >= 4 and data[2:4] == b"\r\n":
-            # All CPython 3.x .pyc magics end in b"\r\n" — covers .pyc compiled
-            # by OTHER Python versions.
-            return "compiled Python bytecode (.pyc)"
+        # Deliberately NO looser .pyc heuristic here: "bytes 2-3 == CRLF" also
+        # matches legacy-encoded text files (false hard-block). A .pyc compiled
+        # by a DIFFERENT Python version cannot be imported by this host at all,
+        # so it falls to the descriptor path — disclosed residual, not a gap.
     return ""
 
 
@@ -78,7 +81,10 @@ def binary_file_descriptor(relpath: str, data: bytes, *, filename: str = "") -> 
     return {
         "path": relpath,
         "size": len(data),
-        "mime": mimetypes.guess_type(filename or relpath)[0] or "application/octet-stream",
+        # Named honestly: guessed from the FILENAME, not sniffed from bytes — a
+        # hostile blob named cert.png would present as image/png; the reviewer
+        # must not read this as a content attestation (size/sha256 do not lie).
+        "mime_from_name": mimetypes.guess_type(filename or relpath)[0] or "application/octet-stream",
         "sha256": hashlib.sha256(data).hexdigest(),
     }
 
@@ -98,8 +104,10 @@ _SESSION_RETRIEVAL = (
     "Some skill payload files may be binary / non-UTF-8 and appear in the pack only "
     "as {path,size,mime,sha256} descriptors instead of inlined content. You may "
     "inspect such suspicious or binary files with your own read/search tools when "
-    "their path is reachable inside your session root; when it is not, judge them "
-    "by the descriptor (size/mime/sha256) and say so in the finding.\n\n"
+    "their path is reachable inside your session root; on the default install "
+    "layout the skill payload lives OUTSIDE your session root, so expect to "
+    "judge by the descriptor (size/mime/sha256) — and say which you did in the "
+    "finding.\n\n"
 )
 
 

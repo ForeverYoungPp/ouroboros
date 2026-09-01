@@ -414,23 +414,29 @@ review pack:
   guard — otherwise a symlink to `/etc/passwd` would leak into the
   review pack sent to external reviewer models).
 
-Skill review is **text-only**: any non-UTF-8 file in the runtime-
-reachable skill surface (whether a recognised loadable-binary extension
-like `.so`/`.dylib`/`.pyc`/`.node`/`.wasm` or an extensionless
-disguised blob) is a hard review blocker. ``_read_capped_text`` raises
-``_SkillBinaryPayload`` for any such file and ``skill_review`` converts
-that into ``status="pending"`` with an actionable error — never a
-filename+size note that would let bytes the reviewer could not inspect
-slip past the gate. The subprocess runs with ``cwd=skill_dir`` so it
-could otherwise ``ctypes.CDLL('./payload')`` / ``import`` / ``require``
-opaque bytes, which breaks the "review is the primary gate" invariant.
-Media-carrying skills that need binary assets must fetch them on
-demand from a reviewable HTTPS source rather than vendoring opaque
-bytes inside the skill checkout. The text-only invariant is the
-current owner posture, not a permanent law: the owner can revisit it
-by an explicit decision. Today a future sandbox project (out-of-process
-/ WASM) is the prerequisite for trusting any opaque bytes inside the
-skill tree.
+Binary payloads are judged by CONTENT, not by filename (#447 X4). A
+file whose bytes start with a loader magic (ELF, PE, Mach-O incl. the
+fat/byte-swapped variants, WASM, the host interpreter's exact `.pyc`
+magic) is a hard review blocker regardless of its name or extension:
+``executable_magic_kind`` raises ``SkillBinaryPayload`` and
+``skill_review`` converts that into ``status="pending"`` with an
+actionable error. Any OTHER non-UTF-8 file is neither blocked nor
+inlined: the review pack carries a typed
+``{path,size,mime_from_name,sha256}`` descriptor instead of raw bytes.
+Judge such a descriptor on the merits: `mime_from_name` is guessed
+from the FILENAME and is not a content attestation; `size`/`sha256`
+are exact. An opaque blob is only dangerous through loader code the
+review CAN see (``ctypes.CDLL`` / ``zipimport`` / ``require`` /
+``sys.path`` insertion) — flag any code path that loads or executes a
+descriptor-only file, and treat an unexplained opaque blob in an
+executable position as a finding. ``skill_exec`` independently refuses
+to execute a declared script that is not valid UTF-8 text, so a blob
+renamed into the scripts list cannot run. Media-carrying skills should
+still prefer fetching binary assets on demand from a reviewable HTTPS
+source over vendoring opaque bytes. This content-judged posture is the
+current owner decision, revisitable explicitly; a future sandbox
+project (out-of-process / WASM) remains the prerequisite for trusting
+opaque bytes as EXECUTABLE payload inside the skill tree.
 
 Skills default to **disabled** and cannot be executed by `skill_exec`
 until review produces a fresh executable verdict. Skill review output is persisted
