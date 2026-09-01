@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_SALVAGE
-from ouroboros.utils import append_jsonl, iter_jsonl_objects, jsonl_append_lock_path, replace_atomic, utc_now_iso
+from ouroboros.utils import append_jsonl, iter_jsonl_objects, jsonl_append_lock_path, replace_atomic, strip_markdown, utc_now_iso
 
 _ANNOTATIONS_NAME = "chat_annotations.jsonl"
 _COMPACT_AT_BYTES = 800_000
@@ -770,10 +770,17 @@ def append_terminal_task_projection(
 
 
 def _completion_excerpt(result: Dict[str, Any]) -> str:
+    """One plain-text excerpt for BOTH lifecycle writers (event + task_summary).
+
+    Markdown markers are stripped BEFORE whitespace flattening: the stripper's
+    line-anchored heading/list patterns need the original newlines, and a
+    flatten-first order would glue a ``##`` mid-line where no pattern (and no
+    renderer) can treat it as markup again.
+    """
     if str(result.get("terminal_origin") or "") == TERMINAL_ORIGIN_HOST_SALVAGE:
         return ""
     for key in ("summary", "result", "error"):
-        text = " ".join(str(result.get(key) or "").split())
+        text = " ".join(strip_markdown(str(result.get(key) or "")).split())
         if text:
             return text if len(text) <= 240 else text[:239].rstrip() + "…"
     return ""

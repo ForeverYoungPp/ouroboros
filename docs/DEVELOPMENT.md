@@ -457,9 +457,16 @@ P7 makes context fit a maintenance constraint, not a line-count aesthetic.
   `scripts/regenerate_size_ratchet.py` validates its rendered candidate
   BEFORE writing it and refuses an unmerged index with a typed
   "merge in progress" error.
-- Prefer deleting dead/duplicate authority before raising a cap. Add an
-  abstraction only when it removes concrete coupling or preserves a stable
-  extension seam.
+- Treat a size gate as pressure to reduce total complexity, not as a design
+  reason for a helper or sibling module. First simplify where the change
+  belongs: reduce control/data flow, delete dead, duplicate, or trivial-wrapper
+  code, reuse an existing SSOT, and compact only redundant non-contract prose.
+  Extract only when the new unit would still be the right boundary with the
+  parent well under the cap: it owns a cohesive responsibility and explicit
+  boundary, and is not a passthrough. Relocating the same complexity, or
+  stripping contract-bearing comments, diagnostics, or tests to buy bytes, is
+  not paydown. If neither a safe simplification nor a natural boundary exists,
+  report the ratchet conflict instead of gaming or silently raising the cap.
 
 ### Pragmatic SOLID
 

@@ -4,7 +4,7 @@ import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { createSystemMessageAction } from './ui_helpers.js';
-import { createChatMedia } from './chat_media.js';
+import { createChatMedia, showTaskIncidentToast } from './chat_media.js';
 import { createChatDecision } from './chat_decision.js';
 import { clientSurfaceField } from './client_surface.js';
 import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
@@ -145,20 +145,6 @@ const CHAT_INPUT_HISTORY_KEY = 'ouro_chat_input_history';
 const MAX_PENDING_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_PENDING_ATTACHMENT_BYTES = 100 * 1024 * 1024;
-const shownIncidentToastKeys = new Set();
-
-function showTaskIncidentToast(msg) {
-    const incident = taskKey(msg?.task_incident);
-    if (!incident) return;
-    const key = String(msg?.toast_once || `${msg?.task_id || ''}:${incident}`).trim();
-    if (!key || shownIncidentToastKeys.has(key)) return;
-    shownIncidentToastKeys.add(key);
-    if (shownIncidentToastKeys.size > 500) {
-        const oldest = shownIncidentToastKeys.values().next().value;
-        shownIncidentToastKeys.delete(oldest);
-    }
-    showToast(String(msg?.content || msg?.text || incident), 'error');
-}
 
 export function initChat(ctx) {
     // Back-compat main-chat entry: one full-page instance bound to chat 1.
@@ -2668,7 +2654,9 @@ export function createChatInstance({
             ? escapeHtml(text)
             : role === 'system' && systemType === 'skill_review'
                 ? renderSkillReviewDisclosure(text, opts.skillReview || null)
-                : renderChatMarkdown(text);
+                : role === 'system' && systemType !== 'skill_review' && markdown !== true
+                    ? escapeHtml(text)
+                    : renderChatMarkdown(text);
         const timeFmt = formatMsgTime(ts);
         const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
         const pendingHtml = pending ? `<div class="msg-pending">Queued until reconnect</div>` : '';
@@ -2693,7 +2681,7 @@ export function createChatInstance({
         wireSkillReviewDisclosure(bubble, () => requestAnimationFrame(() => !destroyed && updateMessagesPadding({ preserveStickiness: true })));
         stampNodeTimestamp(bubble, ts);
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
-        if (role !== 'user' && systemType !== 'skill_review') enhanceChatMarkdown(bubble);
+        if (role !== 'user' && systemType !== 'skill_review' && (role !== 'system' || markdown === true)) enhanceChatMarkdown(bubble);
         chatDecision.renderRoutingDecision(bubble, opts.chatAnnotation);
         rememberMessageKey(messageKey);
         if (pending && clientMessageId) pendingUserBubbles.set(clientMessageId, bubble);

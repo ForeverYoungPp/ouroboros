@@ -1512,11 +1512,13 @@ def test_login_job_browser_envelopes_keep_their_required_discriminators():
 
 def test_skill_review_gate_key_set_is_frozen_with_optional_preflight_fact():
     """ABI §11.1: the browser consumes review_gate keys; the set is pinned.
-    ``preflight_failed`` is additive-optional — present exactly when the
-    producer supplied findings (#335), never fabricated in absence."""
+    ``preflight_failed`` and its D11 companion ``preflight_failed_stale`` are
+    additive-optional — present exactly when the producer supplied findings
+    (#335), never fabricated in absence."""
     from ouroboros.skill_review_status import skill_review_gate
 
     base_keys = {"status", "stale", "executable_review", "blocking_reason",
                  "review_enforcement", "summary"}
     assert set(skill_review_gate("pending")) == base_keys
-    assert set(skill_review_gate("pending", findings=[])) == base_keys | {"preflight_failed"}
+    assert set(skill_review_gate("pending", findings=[])) == base_keys | {
+        "preflight_failed", "preflight_failed_stale"}
