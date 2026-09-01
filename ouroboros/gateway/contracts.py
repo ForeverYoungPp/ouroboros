@@ -235,6 +235,15 @@ class PhotoOutbound(TypedDict):
     mime: str
     ts: str
     caption: NotRequired[str]
+    # Durable task-artifact URL for the stored media, replayed by chat history
+    # (the live frame carries the bytes inline instead).
+    download_url: NotRequired[str]
+    # Second address for the SAME bytes on the long-shipped
+    # /api/files/download route, present only when the stored file resolves
+    # inside the current file-browser root. Packaged desktop launchers gate
+    # their file bridge to a URL allowlist that predates the artifact route,
+    # so the browser uses download_url and the host bridge prefers this one.
+    download_url_compat: NotRequired[str]
     content: NotRequired[str]
     source: NotRequired[str]
     sender_label: NotRequired[str]
@@ -259,6 +268,15 @@ class VideoOutbound(TypedDict):
     mime: str
     ts: str
     caption: NotRequired[str]
+    # Durable task-artifact URL for the stored media, replayed by chat history
+    # (the live frame carries the bytes inline instead).
+    download_url: NotRequired[str]
+    # Second address for the SAME bytes on the long-shipped
+    # /api/files/download route, present only when the stored file resolves
+    # inside the current file-browser root. Packaged desktop launchers gate
+    # their file bridge to a URL allowlist that predates the artifact route,
+    # so the browser uses download_url and the host bridge prefers this one.
+    download_url_compat: NotRequired[str]
     content: NotRequired[str]
     source: NotRequired[str]
     sender_label: NotRequired[str]

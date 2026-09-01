@@ -719,7 +719,15 @@ def store_chat_media_bytes(
     path = media_dir / name
     if path.is_symlink() or not path.is_file():
         write_bytes_atomic(path, data)
-    return {"name": name, "mime": normalized_mime, "sha256": digest, "size": len(data)}
+    # ``path`` is reported so a caller can derive a second, launcher-compatible
+    # URL for the same bytes (see supervisor.message_bus).
+    return {
+        "name": name,
+        "mime": normalized_mime,
+        "sha256": digest,
+        "size": len(data),
+        "path": str(path),
+    }
 
 
 def resolve_chat_media_path(

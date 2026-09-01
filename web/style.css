@@ -152,6 +152,12 @@
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
+/* The universal reset above also clears the UA's `dialog { margin: auto }`,
+   which is what centres a native modal dialog in its viewport — without it
+   every `showModal()` surface lands in the top-left corner. Restore it for
+   dialogs as a class, not per dialog. */
+dialog { margin: auto; }
+
 /* Color-only utility — never a font-size (docs/DESIGN.md ".muted"). */
 .muted { color: var(--text-meta); }
 
@@ -1562,6 +1568,19 @@ body.resizing-panels { user-select: none; }
     white-space: normal;
 }
 
+/* Same opt-out idiom, applied to the rest of the class: a surface whose body is
+   RENDERED markdown (block elements) must not also honour the bubble's
+   `pre-wrap`, or every source newline becomes an extra blank line. The marker
+   attribute is authored by the renderer that writes the markdown, so a surface
+   that still shows plain multi-line text (an un-hydrated attempt detail) keeps
+   pre-wrap and its authored line breaks. */
+.chat-live-line-body,
+[data-chat-markdown-enhanced].chat-live-line-title,
+[data-chat-markdown-enhanced].skill-review-full,
+[data-chat-markdown-enhanced].chat-review-attempt-detail {
+    white-space: normal;
+}
+
 .chat-photo {
     max-width: 100%;
     border-radius: var(--radius-sm);
@@ -1591,6 +1610,14 @@ body.resizing-panels { user-select: none; }
 .ui-rich-content li {
     margin-block: 3px;
 }
+/* Rendered markdown outside a chat bubble had no paragraph rhythm at all: the
+   global reset zeroes <p> margins and nothing put them back, so a multi-
+   paragraph card body read as one wall of text. */
+.ui-rich-content p {
+    margin-block: var(--space-2);
+}
+.ui-rich-content p:first-child { margin-block-start: 0; }
+.ui-rich-content p:last-child { margin-block-end: 0; }
 
 .chat-bubble.system[data-system-type="skill_review"] {
     padding: 0;
@@ -2375,7 +2402,8 @@ body.resizing-panels { user-select: none; }
 
 .chat-live-line-body {
     color: rgba(226, 232, 240, 0.64);
-    white-space: pre-wrap;
+    /* white-space is set with the other rendered-markdown surfaces, next to the
+       chat bubble's pre-wrap default this body has to opt out of. */
     word-break: break-word;
     font-size: 13px;
     line-height: 1.5;
@@ -2480,22 +2508,27 @@ body.resizing-panels { user-select: none; }
     background: var(--surface-card-soft);
     color: var(--text-meta);
 }
-.chat-bubble .message .md-table {
+/* The markdown renderer emits .md-table everywhere it runs — live activity
+   lines, quiz cards, skill review bodies, review attempt details — but the
+   table styling was scoped to the chat bubble, so every other surface showed
+   an unseparated run of cells. The class travels with the renderer, like
+   .md-h1 / .md-quote / .md-link above. */
+.md-table {
     width: max-content;
     min-width: 100%;
     border-collapse: collapse;
     color: var(--text-primary);
     font-size: var(--type-body);
 }
-.chat-bubble .message .md-table th,
-.chat-bubble .message .md-table td {
+.md-table th,
+.md-table td {
     min-width: 140px;
     padding: var(--space-2) var(--space-3);
     border-bottom: 1px solid var(--surface-border);
     text-align: left;
     white-space: nowrap;
 }
-.chat-bubble .message .md-table th {
+.md-table th {
     font-weight: 600;
     color: var(--text-primary);
 }
@@ -4663,6 +4696,9 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     -webkit-backdrop-filter: blur(14px);
     font-size: 13px;
     line-height: 1.45;
+    /* Error text can be a long unbroken token (a path, a URL, a serialized
+       body); without this it overflows the toast instead of wrapping. */
+    overflow-wrap: anywhere;
     pointer-events: auto;
     cursor: pointer;
     animation: toast-in 160ms ease-out;
@@ -5181,6 +5217,44 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .widget-subscription-render {
     margin-top: 10px;
 }
+
+/* Publisher markdown in a widget is DOMPurify-sanitized HTML, not the chat
+   renderer's classed output, and the renderer stays unchanged (ARCHITECTURE,
+   "Declarative widgets"). Its block elements therefore need element-level
+   rhythm inside this one scope; paragraphs come from .ui-rich-content, which
+   the widget host already applies alongside .widget-markdown. */
+.widget-markdown h1,
+.widget-markdown h2,
+.widget-markdown h3 {
+    margin: var(--space-4) 0 var(--space-2);
+    color: var(--text-primary);
+    line-height: var(--line-title);
+}
+.widget-markdown h1 { font-size: var(--type-section); }
+.widget-markdown h2,
+.widget-markdown h3 { font-size: var(--type-body); }
+.widget-markdown blockquote {
+    margin: var(--space-3) 0;
+    padding: var(--space-2) var(--space-3);
+    border-left: 3px solid var(--accent);
+    background: var(--surface-card-soft);
+    color: var(--text-meta);
+}
+.widget-markdown table {
+    width: 100%;
+    margin: var(--space-4) 0;
+    border-collapse: collapse;
+    color: var(--text-primary);
+    font-size: var(--type-body);
+}
+.widget-markdown th,
+.widget-markdown td {
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--surface-border);
+    color: var(--text-primary);
+    text-align: left;
+}
+.widget-markdown th { font-weight: 600; }
 
 .widget-json {
     min-width: 0;
@@ -6729,10 +6803,21 @@ textarea.chat-input {
     display: grid;
     gap: 8px;
     min-width: 0;
+    /* Structural markup, not owner prose: the bubble's `pre-wrap` would turn
+       every newline of the card template into a rendered blank line. Captions
+       below opt back in, because those line breaks are the owner's. */
+    white-space: normal;
 }
 
 .chat-bubble.is-multiple .chat-gallery-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+/* The links bubble's own .message is a container (title + list), so the same
+   structural rule applies to it directly — at the specificity of the
+   `.chat-bubble .message` pre-wrap default it has to beat. */
+.chat-bubble .message.chat-links-message {
+    white-space: normal;
 }
 
 .chat-group-title,
@@ -6768,6 +6853,8 @@ textarea.chat-input {
     font-size: var(--type-meta);
     line-height: var(--line-meta);
     overflow-wrap: anywhere;
+    /* Owner-authored text inside a structural container: keep its line breaks. */
+    white-space: pre-wrap;
 }
 
 .chat-photo-actions {
@@ -6924,6 +7011,9 @@ textarea.chat-input {
 .chat-media-player {
     overflow: hidden;
     min-width: 250px;
+    /* Structural markup (see .chat-gallery-grid): no phantom lines between the
+       stage and the control row. */
+    white-space: normal;
     border: 1px solid var(--ui-card-border);
     border-radius: var(--radius);
     background: var(--ui-modal-bg);

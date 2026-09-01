@@ -593,3 +593,81 @@ test('reset disposes listeners, stops players, clears groups, and destroy is fin
         fx.restore();
     }
 });
+
+test('media host-bridge calls prefer the compat URL while the browser keeps the canonical one', async () => {
+    const fx = fixture();
+    const bridged = [];
+    globalThis.window.pywebview = {
+        api: {
+            download_file_to_downloads: async (url, name, external) => {
+                bridged.push([url, name, external]);
+                return { ok: true };
+            },
+        },
+    };
+    try {
+        const canonical = '/api/tasks/t-1/artifacts/chat-media-aa.png';
+        const compat = '/api/files/download?path=tasks/t-1/chat-media-aa.png';
+        const photo = fx.controller.buildMediaBubble({
+            type: 'photo',
+            role: 'assistant',
+            mime: 'image/png',
+            download_url: canonical,
+            download_url_compat: compat,
+        });
+        // The rendered element addresses the canonical route: the browser has
+        // no gate, and the compat form is only an alternative address.
+        assert.ok(photo.innerHTML.includes(`src="${canonical}"`), photo.innerHTML);
+        await photo.querySelector('[data-photo-action="download"]').click();
+        assert.deepEqual(bridged, [[compat, 'image.png', false]]);
+    } finally {
+        fx.controller.destroy();
+        fx.restore();
+    }
+});
+
+test('a media frame without a compat URL still reaches the bridge on the canonical route', async () => {
+    const fx = fixture();
+    const bridged = [];
+    globalThis.window.pywebview = {
+        api: {
+            download_file_to_downloads: async (url) => { bridged.push(url); return { ok: true }; },
+        },
+    };
+    try {
+        const canonical = '/api/tasks/t-1/artifacts/chat-media-bb.png';
+        const photo = fx.controller.buildMediaBubble({
+            type: 'photo', role: 'assistant', mime: 'image/png', download_url: canonical,
+        });
+        await photo.querySelector('[data-photo-action="download"]').click();
+        assert.deepEqual(bridged, [canonical]);
+    } finally {
+        fx.controller.destroy();
+        fx.restore();
+    }
+});
+
+test('a compat URL that is not the files-download form is rejected, not trusted', async () => {
+    const fx = fixture();
+    const bridged = [];
+    globalThis.window.pywebview = {
+        api: {
+            download_file_to_downloads: async (url) => { bridged.push(url); return { ok: true }; },
+        },
+    };
+    try {
+        const canonical = '/api/tasks/t-1/artifacts/chat-media-cc.png';
+        const photo = fx.controller.buildMediaBubble({
+            type: 'photo',
+            role: 'assistant',
+            mime: 'image/png',
+            download_url: canonical,
+            download_url_compat: 'https://evil.example/steal',
+        });
+        await photo.querySelector('[data-photo-action="download"]').click();
+        assert.deepEqual(bridged, [canonical]);
+    } finally {
+        fx.controller.destroy();
+        fx.restore();
+    }
+});
