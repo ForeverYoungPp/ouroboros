@@ -4373,6 +4373,8 @@ def _publish_model_forced_candidate(
     llm_trace: Dict[str, Any],
     full_text: str,
     reason_code: str,
+    *,
+    degraded_reason: str = "",
 ) -> Optional[DeliveryCandidate]:
     """Replace the retained answer and old verdict."""
 
@@ -4390,7 +4392,7 @@ def _publish_model_forced_candidate(
         tools, candidate, reason_code,
     )
     candidate.degraded = True
-    candidate.degraded_reason = reason_code
+    candidate.degraded_reason = degraded_reason or reason_code
     _publish_delivery_candidate(tools, candidate, llm_trace)
     ctx.delivery_candidate = candidate
     return candidate
@@ -4489,6 +4491,7 @@ def _forced_fallback_result(
         if composed != candidate.full_text:
             candidate = _publish_model_forced_candidate(
                 ctx, llm_trace, composed, reason_code,
+                degraded_reason=candidate_reason,
             )
             ctx.accumulated_usage["_best_effort_extracted"] = True
             _record_forced_finalization(
@@ -4795,15 +4798,13 @@ def _forced_final_answer(
             ctx.accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL
         candidate = _publish_model_forced_candidate(
             ctx, llm_trace, full_text, reason_code,
+            degraded_reason=degraded,
         )
         if degraded and candidate is not None:
-            candidate.degraded_reason = degraded
             llm_trace.setdefault("reasoning_notes", []).append(
                 "Forced finalization received an invalid delivery-control object; "
                 "preserved the retained complete answer."
             )
-            if getattr(ctx, "tools", None) is not None:
-                _publish_delivery_candidate(ctx.tools, candidate, llm_trace)
         _record_forced_finalization(
             ctx,
             llm_trace,

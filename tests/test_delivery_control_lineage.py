@@ -358,36 +358,83 @@ def test_provider_terminal_incomplete_replace_prefers_current_candidate(
     assert returned_trace["forced_finalization"]["source"] == "retained_candidate"
 
 
-def test_provider_terminal_incomplete_armed_invalid_keeps_typed_reason(
-    tmp_path, monkeypatch,
+@pytest.mark.parametrize(
+    ("raw", "response_meta", "host_suffix", "provider_unavailable"),
+    [
+        pytest.param(
+            '{"delivery_control":"publish"}',
+            {"finish_reason_present": False, "finish_reason": None, "tool_call_count": 1},
+            False, False, id="plain-current",
+        ),
+        *[
+            pytest.param(raw, meta, True, False, id=f"host-{shape}-{finish}")
+            for shape, raw in (
+                ("unknown", '{"delivery_control":"publish"}'),
+                ("duplicate", '{"delivery_control":"keep","delivery_control":"replace"}'),
+            )
+            for finish, meta in (
+                ("length", {"finish_reason_present": True, "finish_reason": "length", "tool_call_count": 0}),
+                ("null", {"finish_reason_present": True, "finish_reason": None, "tool_call_count": 0}),
+                ("tool", {"finish_reason_present": False, "finish_reason": None, "tool_call_count": 1}),
+            )
+        ],
+        pytest.param(
+            '{"delivery_control":"publish"}',
+            {"finish_reason_present": True, "finish_reason": "length", "tool_call_count": 0},
+            True, True, id="provider-unavailable",
+        ),
+    ],
+)
+def test_incomplete_armed_invalid_keeps_typed_reason(
+    tmp_path, monkeypatch, raw, response_meta, host_suffix, provider_unavailable,
 ):
-    loop, registry, ctx, trace, retained = _start_control_episode(tmp_path)
+    if host_suffix:
+        loop, registry, ctx, trace = _forced_test_context(tmp_path)
+        retained = loop._replace_delivery_candidate(
+            registry, ctx, trace, "Answer\nHOST FACT",
+            control="host_suffix", model_text="Answer",
+        )
+    else:
+        loop, registry, ctx, trace, retained = _start_control_episode(tmp_path)
     loop._arm_delivery_control(registry, ctx, trace)
-    raw = '{"delivery_control":"publish"}'
     monkeypatch.setattr(
         loop,
         "_call_forced_model_once",
-        lambda _ctx: (
-            raw,
-            {"finish_reason_present": False, "finish_reason": None, "tool_call_count": 1},
-        ),
+        lambda _ctx: (raw, response_meta),
     )
 
-    text, _usage, returned_trace = loop._forced_final_answer(
-        ctx,
-        prompt="finalize",
-        fallback_text="fallback",
-        reason_code="provider_terminal",
-        provider_terminal=True,
-    )
+    if provider_unavailable:
+        text, usage, returned_trace = loop._handle_provider_unavailable(ctx)
+        external_reason, execution_status = "provider_unavailable", "infra_failed"
+    else:
+        text, usage, returned_trace = loop._forced_final_answer(
+            ctx, prompt="finalize", fallback_text="fallback",
+            reason_code="provider_terminal", provider_terminal=True,
+        )
+        external_reason, execution_status = "provider_terminal", "failed"
 
     published = registry._ctx._delivery_candidate
-    assert text == retained.full_text
+    assert text == ("Answer" if host_suffix else retained.full_text)
     assert raw not in text
     assert published.degraded_reason == loop.REASON_DELIVERY_CONTROL_DEGRADED
+    assert registry._ctx._delivery_control_required is False
+    assert usage["execution_status"] == execution_status
+    assert usage["reason_code"] == external_reason
+    assert usage["terminal_origin"] == loop.TERMINAL_ORIGIN_MODEL_FINAL
     assert returned_trace["delivery_candidate"]["degraded_reason"] == (
         loop.REASON_DELIVERY_CONTROL_DEGRADED
     )
+    if host_suffix:
+        assert published is not retained
+        assert published.full_text == published.model_text == text
+        assert published.finalization_control == f"forced_replace:{external_reason}"
+        assert published.acceptance_binding["degraded_reason"] == external_reason
+        assert returned_trace["forced_finalization"]["source"] == (
+            "retained_candidate_with_host_suffix"
+        )
+    else:
+        assert published is retained
+        assert returned_trace["forced_finalization"]["source"] == "retained_candidate"
 
 
 @pytest.mark.parametrize(
