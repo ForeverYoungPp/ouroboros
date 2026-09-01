@@ -150,6 +150,7 @@ BAND_PATHS = {
     "ouroboros/preflight_runner.py": None,
     "ouroboros/projects_registry.py": "Entered the band from 999 lines: the stuck-Working liveness sprint homed the project-thread membership lens (mtime-cached) and its broadcast-choke marker here \u2014 registry semantics belong to the registry, not to message_bus.",
     "ouroboros/protected_artifacts.py": None,
+    "ouroboros/request_wire_recovery.py": "E4 (#447): typed CustomToolProjectionError fallback keeps the wire-recovery ladder alive; includes the one-site-sufficient decision record at both retry catch sites",
     "ouroboros/review.py": "Entered the band from 952 lines: re-anchoring the size ratchet on the official line added the candidate and pairwise base-vs-tip transition validators (validate_size_ratchet_candidate/validate_size_ratchet_transition_against_base) with merge-aware previous-manifest resolution, replacing the retired first-parent history audit (update-flow-redesign sprint, Q7-C/Q18-A/Q19-A owner decisions).",
     "ouroboros/review_custody.py": "Review custody now owns the shared typed retry-rail history and frozen actor reconstruction so physical outcomes cannot be lost between the substrate and reconciliation.",
     "ouroboros/review_execution.py": "Verdict extraction and the native tool-round executor moved to their own modules (generic reviewer-actor sprint); the transport seam re-enters the band smaller and more cohesive.",
