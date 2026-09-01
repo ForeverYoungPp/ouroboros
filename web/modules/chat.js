@@ -711,9 +711,8 @@ export function createChatInstance({
         const followBottom = forceFollow || isNearBottom();
         const anchor = followBottom ? null : captureVisibleTimelineAnchor(excludeAnchorNode);
         // Pre-mutation geometry, not the mutate() return, decides restore/
-        // follow: the reader survives a throwing mutation and a lying change-
-        // flag alike. Booleans keep only the activity marker and write
-        // idempotence duties.
+        // follow (survives throws and lying change-flags); booleans keep only
+        // the activity-marker and write-idempotence duties.
         const preScrollHeight = messagesDiv.scrollHeight;
         const preScrollTop = messagesDiv.scrollTop;
         let result;
@@ -2290,8 +2289,7 @@ export function createChatInstance({
     }
 
     function updateSubagentCardFromEvent(evt, tsValue) {
-        // undefined = not a subagent frame (legacy rows without
-        // delegation_role): callers fall through to the ordinary card path.
+        // undefined = not a subagent frame: callers fall through.
         if (!evt || String(evt.delegation_role || '').toLowerCase() !== 'subagent') return undefined;
         const parentId = taskKey(evt.parent_task_id);
         const childId = String(evt.subagent_task_id || evt.task_id || '').trim();
@@ -2324,11 +2322,7 @@ export function createChatInstance({
         forceTaskCard(parentId, tsValue);
         const childState = getTaskUiState(childId, true);
         if (childState && !childState.completed) childState.forceCard = true;
-        const childRecord = getSubagentCardRecord(childId, parentId, role);
-        // A child card carries sortable data-ts of its first lifecycle frame;
-        // the idempotent stamp keeps an exact repeated frame physically inert
-        // while only the top-level ancestor participates in feed chronology.
-        if (childRecord?.root) stampNodeTimestamp(childRecord.root, rawTs, { anchor: true });
+        stampNodeTimestamp(getSubagentCardRecord(childId, parentId, role)?.root, rawTs, { anchor: true });
         const reviewsChanged = attachTaskDetailReviews(childId, evt);
         const updated = queueTaskLiveUpdate(
             summary,
