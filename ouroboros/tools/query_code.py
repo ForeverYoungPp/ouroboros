@@ -372,8 +372,12 @@ def _query_code(
 
     try:
         if op == "structural":
+            # Collect through the requested page (offset+limit, like relevant_files
+            # above): collecting only `limit` rows made rows[offset:] empty on every
+            # page after the first and blamed the query for it (#447 D6).
             rows = _structural(
-                ctx, repo_root, query, scoped_path, str(lang or "any"), limit, binding
+                ctx, repo_root, query, scoped_path, str(lang or "any"),
+                min(_MAX_LIMIT, offset + limit), binding
             )
         else:
             from ouroboros.code_intelligence import build_code_inventory

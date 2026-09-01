@@ -470,6 +470,7 @@ def _repo_read(
     path: str,
     max_lines: int = 2000,
     start_line: int = 1,
+    start_char: int = 0,
     display_path: str | None = None,
     _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
@@ -498,7 +499,8 @@ def _repo_read(
                 f"`read_file(root='runtime_data', path='memory/{base}')`."
             )
         return f"⚠️ NOT_FOUND: file does not exist: {target}"
-    return _render_line_slice(display_path or path, content, max_lines=max_lines, start_line=start_line)
+    return _render_line_slice(display_path or path, content, max_lines=max_lines, start_line=start_line,
+                              start_char=start_char)
 
 
 def _repo_list(
@@ -539,6 +541,7 @@ def _data_read(
     path: str,
     max_lines: int = 2000,
     start_line: int = 1,
+    start_char: int = 0,
     display_path: str | None = None,
     _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
@@ -587,16 +590,22 @@ def _data_read(
         else pathlib.Path(ctx.drive_root)
     )
     if _is_skill_owner_state_target(target, state_root) and target.name.lower() != "review.json":
-        return "DATA_READ_BLOCKED: skill owner state is not readable through generic data tools."
+        # The marker carries the ⚠️ prefix like its three siblings above: the
+        # status classifier only reads a first line that starts with it, so the
+        # bare form degraded a typed policy denial into a generic tool failure.
+        return "⚠️ DATA_READ_BLOCKED: skill owner state is not readable through generic data tools."
     try:
         content = read_text(target)
         start_raw, max_raw = _coerce_line_window(start_line, max_lines)
-        if _is_cognitive_data_path(norm) and start_raw == 1 and max_raw == 2000:
+        # The cognitive full-read shortcut only applies to a DEFAULT read: an explicit
+        # start_char is a sub-line cursor request and must be honored, not swallowed.
+        if _is_cognitive_data_path(norm) and start_raw == 1 and max_raw == 2000 and not _coerce_start_char(start_char):
             if display_path is None:
                 return content
             full_line_count = max(1, len(content.splitlines()))
             return _render_line_slice(display_path, content, max_lines=full_line_count, start_line=1)
-        return _render_line_slice(display_path or norm, content, max_lines=max_raw, start_line=start_raw)
+        return _render_line_slice(display_path or norm, content, max_lines=max_raw, start_line=start_raw,
+                                  start_char=start_char)
     except FileNotFoundError:
         if norm.replace("\\", "/").startswith("memory/"):
             explanation = (
@@ -1153,18 +1162,20 @@ def _read_file(
             path,
             max_lines=max_lines,
             start_line=start_line,
+            start_char=start_char,
             display_path=display_path,
             _resolved_binding=binding,
-        ))
+        ), start_char=start_char)
     if normalized == "runtime_data":
         return _annotate_reread(ctx, target, start_line, max_lines, _data_read(
             ctx,
             path,
             max_lines=max_lines,
             start_line=start_line,
+            start_char=start_char,
             display_path=_root_display_path(normalized, path),
             _resolved_binding=binding,
-        ))
+        ), start_char=start_char)
     block_msg = _local_readonly_resource_block(
         ctx, normalized, target, binding.base_path, action="READ_FILE"
     )
@@ -1327,7 +1338,7 @@ def _write_file(
         from ouroboros.tools.git import _repo_write
 
         return _repo_write(
-            ctx, path=path, content=content, files=files or [], force=force,
+            ctx, path=path, content=content, files=files or [], mode=mode, force=force,
             display_root=normalized, _resolved_binding=bindings,
         )
     if normalized == "runtime_data":
@@ -1404,13 +1415,21 @@ def _write_file(
                         results.append(f"⚠️ WRITE_FILE_BLOCKED: artifact_store path blocked: {block_reason}")
                         continue
                 target.parent.mkdir(parents=True, exist_ok=True)
-                # Deferral 5: batch items overwrite too — shrink-guard each (parity with the
-                # single-file path), force=true bypasses.
-                if (shrink := _check_data_shrink_guard(target, str(item.get("content") or ""), force)):
-                    results.append(shrink)
-                    continue
-                write_text_atomic(target, str(item.get("content") or ""))  # crash-safe (G)
-                result = f"OK: wrote {_root_display_path(normalized, rel_path)} ({len(str(item.get('content') or ''))} chars)"
+                body = str(item.get("content") or "")
+                if mode == "append":
+                    # Batch items honor the declared mode like the single-file path below:
+                    # silently overwriting here destroyed every prior chunk of a chunked
+                    # large-file write while reporting success (#447 D2).
+                    with target.open("a", encoding="utf-8") as fh:
+                        fh.write(body)  # append is intentionally NOT atomized
+                else:
+                    # Deferral 5: batch items overwrite too — shrink-guard each (parity with the
+                    # single-file path), force=true bypasses.
+                    if (shrink := _check_data_shrink_guard(target, body, force)):
+                        results.append(shrink)
+                        continue
+                    write_text_atomic(target, body)  # crash-safe (G)
+                result = f"OK: wrote {_root_display_path(normalized, rel_path)} ({len(body)} chars)"
                 if normalized == "user_files":
                     record = copy_file_to_task_artifacts(ctx, target, kind="user_file")
                     if record:

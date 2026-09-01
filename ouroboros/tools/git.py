@@ -1952,12 +1952,19 @@ def _check_shrink_guard(
 
 def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
                 files: Optional[List[Dict[str, str]]] = None,
+                mode: str = "overwrite",
                 force: bool = False,
                 display_root: str = "active_workspace",
                 _resolved_binding: (
                     ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] | None
                 ) = None) -> str:
-    """Write file(s) to the repo working directory without committing."""
+    """Write file(s) to the repo working directory without committing.
+
+    ``mode="append"`` appends instead of overwriting (#447 D2: write_file declares
+    the parameter for every root — dropping it here turned a chunked large-file
+    write into an overwrite that destroyed every prior chunk while reporting
+    success). An append chunk is not a full file, so the full-file syntax guard,
+    the shrink guard, and the overwrite diff do not apply to it."""
     write_list: List[Dict[str, str]] = []
     if files:
         for entry in files:
@@ -2021,26 +2028,28 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     syntax_bypass_notes: List[str] = []
     from ouroboros.tools.edit_ops import _syntax_check
 
-    for e, binding in zip(write_list, binding_items):
-        rel_path = _binding_repo_rel(binding)
-        syntax_err = _syntax_check(rel_path, e["content"])
-        if not syntax_err:
-            continue
-        if force:
-            syntax_bypass_notes.append(f"{rel_path}: {syntax_err}")
-            continue
-        return (
-            f"⚠️ WRITE_BLOCKED_SYNTAX: {syntax_err} for '{e['path']}'. "
-            "Nothing was written. Fix the content, or pass force=true for an "
-            "intentionally invalid file."
-        )
+    if mode != "append":  # an append chunk is not a full file — the guard would block every chunk
+        for e, binding in zip(write_list, binding_items):
+            rel_path = _binding_repo_rel(binding)
+            syntax_err = _syntax_check(rel_path, e["content"])
+            if not syntax_err:
+                continue
+            if force:
+                syntax_bypass_notes.append(f"{rel_path}: {syntax_err}")
+                continue
+            return (
+                f"⚠️ WRITE_BLOCKED_SYNTAX: {syntax_err} for '{e['path']}'. "
+                "Nothing was written. Fix the content, or pass force=true for an "
+                "intentionally invalid file."
+            )
 
     written = []
     written_paths: List[str] = []
     overwrite_diffs: List[str] = []
     for e, binding in zip(write_list, binding_items):
         rel_path = _binding_repo_rel(binding)
-        shrink_warning = _check_shrink_guard(binding, e["content"], force=force)
+        # Append can only grow a file, so the truncation shrink-guard does not apply.
+        shrink_warning = None if mode == "append" else _check_shrink_guard(binding, e["content"], force=force)
         if shrink_warning:
             if written:
                 _invalidate_advisory(
@@ -2052,13 +2061,19 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             return shrink_warning
         try:
             target = binding.target_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if mode == "append":
+                with target.open("a", encoding="utf-8") as fh:
+                    fh.write(e["content"])  # append is intentionally NOT atomized
+                written.append(f"{display_root}:{rel_path} (+{len(e['content'])} chars appended)")
+                written_paths.append(rel_path)
+                continue
             old_content: Optional[str] = None
             if target.exists():
                 try:
                     old_content = target.read_text(encoding="utf-8")
                 except Exception:
                     old_content = None
-            target.parent.mkdir(parents=True, exist_ok=True)
             write_text(target, e["content"])
             written.append(f"{display_root}:{rel_path} ({len(e['content'])} chars)")
             written_paths.append(rel_path)
