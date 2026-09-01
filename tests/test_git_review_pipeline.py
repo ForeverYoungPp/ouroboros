@@ -1524,6 +1524,9 @@ class TestAdvisorySkipTests:
             status="preflight_blocked",
             ts="2026-04-20T00:00:00Z",
             raw_result="SyntaxError: invalid syntax at foo.py:3",
+            # H4 (capinv-447): the specific problem-class claim now requires the
+            # typed cause; an untyped legacy record gets the generic wording.
+            reason_kind="syntax",
         )
         state = AdvisoryReviewState()
 

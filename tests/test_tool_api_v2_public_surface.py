@@ -246,11 +246,13 @@ def test_user_files_root_blocks_ouroboros_control_plane(tmp_path, monkeypatch):
     assert not case_variant.exists()
 
 
-def test_user_files_root_blocks_workspace_parent_and_home_secrets(tmp_path, monkeypatch):
+def test_user_files_root_blocks_workspace_parent_reads_home_secrets(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     home = pathlib.Path.home()
+    (home / ".ssh").mkdir()
+    (home / ".ssh" / "id_rsa").write_text("plain marker content", encoding="utf-8")
 
     parent_result = registry.execute(
         "write_file",
@@ -263,22 +265,29 @@ def test_user_files_root_blocks_workspace_parent_and_home_secrets(tmp_path, monk
 
     assert "WRITE_FILE_ERROR" in parent_result
     assert "user_files path blocked" in parent_result
-    # Read-tool confinement refusals carry the TYPED policy-denial prefix
-    # (v6.57.0 partition) instead of a generic READ_FILE_ERROR wrap.
-    assert "USER_FILES_PATH_BLOCKED" in secret_result
-    assert "credential-like" in secret_result
+    # capinv-447 / В23=A: the ROOT principal READS credential-shaped home
+    # paths (secret BYTES are masked at egress, not refused at read time).
+    assert "USER_FILES_PATH_BLOCKED" not in secret_result
+    assert "plain marker content" in secret_result
     assert not (home / "Ouroboros" / "AGENTS.md").exists()
 
 
-def test_user_files_root_blocks_case_insensitive_home_secrets(tmp_path, monkeypatch):
+def test_user_files_root_blocks_case_insensitive_home_secret_writes(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    home = pathlib.Path.home()
+    keychain = home / "library" / "Keychains" / "login.keychain-db"
+    keychain.parent.mkdir(parents=True)
+    keychain.write_text("keychain marker", encoding="utf-8")
 
+    # READS of credential-shaped paths are allowed for root (capinv-447 / В23=A)...
     library = registry.execute("read_file", {"root": "user_files", "path": "library/Keychains/login.keychain-db"})
+    # ...while credential-shaped WRITES keep the shape deny, case-insensitively.
     creds = registry.execute("write_file", {"root": "user_files", "path": "Desktop/Credentials.json", "content": "{}"})
     pem = registry.execute("write_file", {"root": "user_files", "path": "Desktop/id_rsa.PEM", "content": "secret"})
 
-    assert "credential-like" in library
+    assert "USER_FILES_PATH_BLOCKED" not in library
+    assert "keychain marker" in library
     assert "credential-like" in creds
     assert "credential-like" in pem
 

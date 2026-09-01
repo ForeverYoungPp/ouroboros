@@ -1005,7 +1005,9 @@ class TaskCreateRequest(_TaskCreateRequestRequired, total=False):
     memory_mode: str
     project_id: str
     attachments: list[Dict[str, Any]]
-    # Explicit raw-API opt-in. Browser/UI callers omit it and remain atomic.
+    # Partial staging is the default (В25c, capinv-447): omitted/true stages
+    # the good attachments and discloses rejected rows; explicit false keeps
+    # the old atomic all-or-nothing admission.
     allow_partial_attachments: bool
     acceptance_claims: list[Dict[str, Any]]
     # v6.60.0: "" | "final_answer_line" — adapter-declared machine-extractable answer

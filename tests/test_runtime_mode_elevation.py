@@ -2074,8 +2074,10 @@ def test_shell_settings_tripwire_flags_obfuscated_owner_settings_write(tmp_path,
     """#447 S1/SC2: the lexical settings.json mention-gates are bypassable by an
     obfuscated argument-level writer, and the deleted X2 restore used to be the
     only thing that made such a write visible. The surviving tripwire must flag
-    the change with a typed FIRST-LINE marker (detect-and-report; deliberately
-    no auto-revert — a rollback can clobber a concurrent legitimate owner edit)."""
+    the change with a typed ``tripwire`` fact in the result envelope plus an
+    appended ⚠️ note AFTER the payload (#447 В12: line 1 stays with the command
+    output; detect-and-report — deliberately no auto-revert, a rollback can
+    clobber a concurrent legitimate owner edit)."""
     import ouroboros.safety as safety_mod
     from ouroboros import config as _cfg
     from ouroboros.tools.registry import ToolRegistry
@@ -2098,8 +2100,11 @@ def test_shell_settings_tripwire_flags_obfuscated_owner_settings_write(tmp_path,
     reg.override_handler("run_command", _sneaky_writer)
     result = reg.execute("run_command", {"cmd": ["true"]})
 
-    assert result.lstrip().startswith("⚠️ OWNER_SETTINGS_CHANGED"), result[:300]
-    assert "done" in result  # the command payload is appended, not replaced
+    from ouroboros.tools.result_envelope import typed_result_meta
+
+    assert result.lstrip().startswith("done"), result[:300]  # payload owns line 1
+    assert "⚠️ OWNER_SETTINGS_CHANGED" in result, result[:300]  # note appended, payload not replaced
+    assert (typed_result_meta(result) or {}).get("tripwire") == "owner_settings_changed"
     # Detect-and-report: the write is disclosed, not silently reverted.
     assert settings.read_text(encoding="utf-8") == '{"OWNER": "hijacked"}'
 

@@ -113,8 +113,15 @@ class MCPServerRuntime:
     last_attempted: str = ""
 
 
-def _slugify(value: str, *, max_len: int) -> str:
-    """Return a provider-safe slug, hashing truncated tails to avoid collisions."""
+def _slugify(value: str, *, max_len: int, injective: bool = False) -> str:
+    """Return a provider-safe slug, hashing truncated tails to avoid collisions.
+
+    ``injective=True`` (E5, capinv-447) also appends the hash tail whenever the
+    character-class normalization was LOSSY (case folding, ``-``/``.`` → ``_``),
+    so distinct legal MCP tool names like ``get-user`` / ``get_user`` /
+    ``get.User`` can no longer collide into one slug and silently drop tools.
+    Server ids stay non-injective: their slugs are persisted settings/UI keys.
+    """
     text = str(value or "").strip()
     if not text:
         return ""
@@ -122,7 +129,8 @@ def _slugify(value: str, *, max_len: int) -> str:
     safe = re.sub(r"_+", "_", safe).strip("_").lower()
     if not safe:
         return ""
-    if len(safe) <= max_len:
+    lossy = injective and safe != text
+    if len(safe) <= max_len and not lossy:
         return safe
     digest = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()[:6]
     keep = max_len - len(digest) - 1
@@ -139,7 +147,7 @@ def canonical_server_id(value: str) -> str:
 def make_tool_name(server_id: str, tool_name: str) -> str:
     """Return provider-safe ``mcp_<server>__<tool>``."""
     server_slug = canonical_server_id(server_id)
-    tool_slug = _slugify(tool_name, max_len=_MAX_TOOL_SLUG)
+    tool_slug = _slugify(tool_name, max_len=_MAX_TOOL_SLUG, injective=True)
     if not server_slug or not tool_slug:
         return ""
     candidate = f"{TOOL_NAME_PREFIX}{server_slug}__{tool_slug}"
@@ -433,16 +441,26 @@ async def _list_tools_async(cfg: MCPServerConfig, *, timeout_sec: int) -> List[D
                 read, write = streams.read, streams.write  # pragma: no cover
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                result = await session.list_tools()
+                # Follow nextCursor (E5, capinv-447): the MCP listing is paginated
+                # and a single call silently loses every tool after page one. The
+                # page bound only guards against a cursor loop from a broken server.
                 tools_raw: List[Dict[str, Any]] = []
-                for tool in result.tools or []:
-                    tools_raw.append(
-                        {
-                            "name": getattr(tool, "name", ""),
-                            "description": getattr(tool, "description", "") or "",
-                            "input_schema": getattr(tool, "inputSchema", {}) or {},
-                        }
+                cursor: Any = None
+                for _page in range(50):
+                    result = await (
+                        session.list_tools(cursor=cursor) if cursor else session.list_tools()
                     )
+                    for tool in result.tools or []:
+                        tools_raw.append(
+                            {
+                                "name": getattr(tool, "name", ""),
+                                "description": getattr(tool, "description", "") or "",
+                                "input_schema": getattr(tool, "inputSchema", {}) or {},
+                            }
+                        )
+                    cursor = getattr(result, "nextCursor", None)
+                    if not cursor:
+                        break
                 return tools_raw
 
     return await asyncio.wait_for(
@@ -487,11 +505,16 @@ def _stringify_call_result(result: Any) -> str:
             parts.append(json.dumps(_serialize_content_part(item), ensure_ascii=False))
         except Exception:
             parts.append(repr(item))
-    if not parts and getattr(result, "structuredContent", None):
+    # structuredContent is protocol data in its own right (E5, capinv-447):
+    # carry it even when text/content parts exist, unless it duplicates one.
+    structured = getattr(result, "structuredContent", None)
+    if structured is not None:
         try:
-            parts.append(json.dumps(result.structuredContent, ensure_ascii=False))
+            dumped = json.dumps(structured, ensure_ascii=False)
         except Exception:
-            parts.append(repr(result.structuredContent))
+            dumped = repr(structured)
+        if dumped not in parts:
+            parts.append(f"structuredContent: {dumped}" if parts else dumped)
     body = "\n\n".join(parts).strip() or "(empty result)"
     if is_error:
         return f"⚠️ MCP_TOOL_ERROR: {body}"
@@ -505,6 +528,19 @@ def _serialize_content_part(item: Any) -> Dict[str, Any]:
         value = getattr(item, attr, None)
         if value is not None and not callable(value):
             out[attr] = value
+    # EmbeddedResource carries its payload in a NESTED resource object (E5,
+    # capinv-447): omitting it dropped the text/blob of every embedded resource.
+    resource = getattr(item, "resource", None)
+    if resource is not None and not callable(resource):
+        nested: Dict[str, Any] = {}
+        for attr in ("uri", "mimeType", "text", "blob"):
+            value = getattr(resource, attr, None)
+            if value is not None and not callable(value):
+                nested[attr] = str(value) if attr == "uri" else value
+        if nested:
+            out["resource"] = nested
+    if "uri" in out:
+        out["uri"] = str(out["uri"])  # AnyUrl is not JSON-serializable
     return out
 
 

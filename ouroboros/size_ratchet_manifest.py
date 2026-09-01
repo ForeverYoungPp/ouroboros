@@ -163,6 +163,7 @@ BAND_PATHS = {
     "ouroboros/tools/commit_gate.py": "Grew INTO the band by the review-wave fix binding the actor reference (delivery class) into the commit review contract fingerprint \u2014 same-module contract identity, splitting it would separate the fingerprint from its gate.",
     "ouroboros/tools/plan_review_runtime.py": "Entered the band from 986 lines: timeout custody synthesis joined the existing plan-review runtime owner while preserving profile-continuity disclosures and typed health facts during target integration.",
     "ouroboros/tools/review_context_atlas.py": "Grew INTO the band by the #284 pack-arithmetic fixes: measured render charged at admission, exact per-row costs, target capped at the hard rail, honest eviction diagnostics \u2014 all in the module that owns the arithmetic.",
+    "ouroboros/tools/shell.py": "SHRANK into the band from 1598 lines: the deliverable-export eligibility policy moved to tools/output_export_policy.py (capinv-447 D4).",
     "ouroboros/tools/skill_exec.py": None,
     "ouroboros/tools/skill_publish.py": "Entered the band from 952 lines: publish now writes the OuroborosHub publication receipt at pr_opened through the shared locked-update seam and maps the receipt from the validated serialized form (hubflow sprint, receipt-as-only-stored-fact design).",
     "ouroboros/utils.py": None,
