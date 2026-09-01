@@ -350,19 +350,26 @@ def test_run_shell_blocks_self_authored_marker_writes(tmp_path, monkeypatch):
     assert ".self_authored.json" in result
 
 
-def test_run_shell_restores_obfuscated_self_authored_state_marker(tmp_path):
+def test_run_shell_blocks_obfuscated_self_authored_marker_write_pre_exec(tmp_path, monkeypatch):
+    """Pre-execution proof replacing the deleted snapshot/restore pin (issue #447).
+
+    A shell path that merely NAMES state/skills/self_authored.json is refused
+    BEFORE execution (SKILL_STATE_WRITE_BLOCKED) — no post-hoc restore exists
+    any more, so the block plus the absent file is the whole property.
+    """
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     ctx = _make_ctx(tmp_path)
     marker = ctx.drive_root / "state" / "skills" / "alpha" / "self_authored.json"
     marker.parent.mkdir(parents=True)
     registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
     registry._ctx = ctx
 
-    before = registry._snapshot_owner_files()
-    marker.write_text('{"origin":"self_authored"}', encoding="utf-8")
+    result = registry.execute(
+        "run_command",
+        {"cmd": ["bash", "-c", f"printf '{{}}' > {marker}"]},
+    )
 
-    restored = registry._restore_owner_files(before)
-
-    assert restored is True
+    assert "SKILL_STATE_WRITE_BLOCKED" in result
     assert not marker.exists()
 
 

@@ -89,7 +89,6 @@ from ouroboros.process_interpreters import (
 from ouroboros.utils import safe_relpath
 from ouroboros.contracts.task_constraint import TaskConstraint, VALID_WRITE_SURFACES, normalize_task_constraint
 from ouroboros.contracts.skill_payload_policy import (
-    SKILL_OWNER_STATE_FILENAMES,
     SKILL_OWNER_STATE_STEMS,
     SKILL_PAYLOAD_CONTROL_DIRNAMES,
     SKILL_PAYLOAD_CONTROL_FILENAMES,
@@ -769,8 +768,8 @@ _PROCESS_COMMAND_TOOLS = frozenset({"run_command", "run_script", "start_service"
 # protected-root / workspace-state / light-mode writes) — that pre-exec filter is the
 # security boundary and blocks a forbidden mutation BEFORE the handler runs, so a guarded
 # check cannot mutate protected state and then leave a host-attested PASS receipt. It is
-# deliberately NOT in _PROCESS_COMMAND_TOOLS: those POST-execution checks (owner-file
-# restore, light-repo diff, git-ref tripwire) run AFTER the handler has already written the
+# deliberately NOT in _PROCESS_COMMAND_TOOLS: those POST-execution checks (light-repo
+# diff, git-ref tripwire) run AFTER the handler has already written the
 # receipt, so they would only annotate the returned text, not gate the durable receipt —
 # adding them would give false assurance while the pre-exec guards already do the gating.
 _SHELL_GUARDED_TOOLS = _PROCESS_COMMAND_TOOLS | {"verify_and_record"}
@@ -1337,13 +1336,6 @@ def _binding_set_is_light_restricted(ctx: Any, binding: Any) -> bool:
         or (item.root == "runtime_data" and item.source == "runtime_data")
         for item in items
     )
-
-
-def _binding_state_drive_root(ctx: Any, binding: Any) -> pathlib.Path:
-    items = _binding_items(binding)
-    if items:
-        return pathlib.Path(items[0].state_drive_root)
-    return pathlib.Path(ctx.drive_root)
 
 
 def _light_binding_failure_redirect(name: str, args: dict[str, Any]) -> str:
@@ -3277,89 +3269,28 @@ class ToolRegistry:
             "project folder)."
         )
 
-    def _snapshot_owner_files(
-        self, state_drive_root: pathlib.Path | None = None,
-    ) -> Dict[pathlib.Path, Optional[str]]:
-        from ouroboros import config as _cfg
-        out: Dict[pathlib.Path, Optional[str]] = {}
-        settings_path = pathlib.Path(_cfg.SETTINGS_PATH)
-        try:
-            out[settings_path] = settings_path.read_text(encoding="utf-8") if settings_path.is_file() else None
-        except OSError:
-            out[settings_path] = None
-        root = pathlib.Path(state_drive_root or self._ctx.drive_root) / "state" / "skills"
-        if not root.is_dir():
-            return out
-        for path in root.glob("*/*"):
-            if path.name.lower() not in SKILL_OWNER_STATE_FILENAMES:
-                continue
-            try:
-                out[path] = path.read_text(encoding="utf-8")
-            except OSError:
-                out[path] = None
-        return out
-
-    def _restore_owner_files(
-        self,
-        before: Dict[pathlib.Path, Optional[str]],
-        state_drive_root: pathlib.Path | None = None,
-    ) -> bool:
-        from ouroboros import config as _cfg
-        root = pathlib.Path(state_drive_root or self._ctx.drive_root) / "state" / "skills"
-        current = set()
-        if root.is_dir():
-            current.update(
-                path for path in root.glob("*/*")
-                if path.name.lower() in SKILL_OWNER_STATE_FILENAMES
-            )
-        settings_path = pathlib.Path(_cfg.SETTINGS_PATH)
-        current.add(settings_path)
-        changed = False
-        for path in current - set(before):
-            try:
-                path.unlink()
-                changed = True
-            except OSError:
-                pass
-        for path, content in before.items():
-            try:
-                if content is None:
-                    if path.exists():
-                        path.unlink()
-                        changed = True
-                    continue
-                if not path.exists() or path.read_text(encoding="utf-8") != content:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(content, encoding="utf-8")
-                    changed = True
-            except OSError:
-                pass
-        return changed
-
     def _run_shell_post_checks(
         self,
         result: str,
         *,
-        owner_snapshot: Dict[pathlib.Path, Optional[str]],
-        state_drive_root: pathlib.Path,
         light_repo_before: Optional[Dict[str, Any]],
         workspace_refs_before: Optional[Dict[str, str]],
         tool_name: str = "run_command",
     ) -> str:
-        import time
-
-        restored_owner_state = False
-        for _ in range(4):
-            time.sleep(0.3)
-            restored_owner_state = (
-                self._restore_owner_files(owner_snapshot, state_drive_root)
-                or restored_owner_state
-            )
-        if restored_owner_state:
-            result = (
-                f"{result}\n\n⚠️ OWNER_STATE_RESTORED: run_command attempted to "
-                "change owner-only settings or skill trust state; protected files were restored."
-            )
+        # The owner-state snapshot/restore (OWNER_STATE_RESTORED) that used to
+        # run here was DELETED (issue #447, owner decision): it reverted ANY
+        # post-command difference without proving the command caused it, so a
+        # concurrent owner edit (Settings UI, grant click) was silently rolled
+        # back and blamed on the command; and its snapshot recorded an OSError
+        # while reading as "file absent", so the restore could UNLINK the live
+        # settings.json after a transient read error. The light-lane guard
+        # below refuses auto-rollback for exactly this reason. Pre-exec guards
+        # keep skill owner state (SKILL_STATE_WRITE_BLOCKED on any mention)
+        # and the subagent/light lanes for settings.json. Disclosed residual:
+        # a shell writer that gets past the pre-exec guards — including a
+        # main-agent advanced/pro-mode write to settings.json — is no longer
+        # post-hoc reverted; the LLM safety layer and the file-tools deny are
+        # the remaining coverage there.
         if light_repo_before is not None:
             light_repo_after = _light_repo_snapshot(system_repo_dir_for(self._ctx))
             if (
@@ -3870,11 +3801,6 @@ class ToolRegistry:
         )
         if not is_safe:
             return safety_msg
-        state_drive_root = _binding_state_drive_root(self._ctx, resolved_binding)
-        owner_snapshot = (
-            self._snapshot_owner_files(state_drive_root)
-            if name in _PROCESS_COMMAND_TOOLS else {}
-        )
         light_repo_before = (
             _light_repo_snapshot(system_repo_dir_for(self._ctx))
             if (
@@ -3898,17 +3824,22 @@ class ToolRegistry:
         early_error, result = self._invoke_builtin_handler(
             name, entry, args, resolved_binding, interpreter_resolution, worktree_before,
         )
-        if early_error is not None:
-            return early_error
         if name in _PROCESS_COMMAND_TOOLS:
-            result = self._run_shell_post_checks(
-                result,
-                owner_snapshot=owner_snapshot,
-                state_drive_root=state_drive_root,
+            # Post-exec tripwires run on the TOOL_ERROR path too: two of the
+            # early_error returns fire AFTER the process already ran, and
+            # returning before the checks let a command that mutated the
+            # light-mode repo or moved workspace refs skip both (#447 B2).
+            checked = self._run_shell_post_checks(
+                early_error if early_error is not None else result,
                 light_repo_before=light_repo_before,
                 workspace_refs_before=workspace_refs_before,
                 tool_name=name,
             )
+            if early_error is not None:
+                return checked
+            result = checked
+        if early_error is not None:
+            return early_error
         return _compose_execute_result(result, _route_note, safety_msg)
 
     def _worktree_status_snapshot(self) -> str:
