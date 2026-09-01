@@ -485,6 +485,7 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     ),
     "task_exception": (False, "agent.py:777 the attempt ran and crashed; an honest failure"),
     "capability_profile_mismatch": (False, "control_delegation.py:81 rejected delegate call"),
+    "option_index_required": (False, "gateway/task_decision.py quiz-answer HTTP 400 validation; an owner-UI refusal, never a trial rail"),
     "delegation_rights_may_delegate": (False, "control_delegation.py explicit parent recursion-right refusal"),
     "delegation_rights_may_fan_out": (False, "control_delegation.py explicit parent fan-out refusal"),
     "delegation_rights_depth_exhausted": (False, "control_delegation.py exhausted typed depth budget refusal"),
