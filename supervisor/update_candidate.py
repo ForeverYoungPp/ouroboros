@@ -66,6 +66,38 @@ def _merge_head_sha() -> str:
     return out if rc == 0 else ""
 
 
+def quarantine_corrupt_update_tx_marker() -> Dict[str, Any]:
+    """Move an unparseable update-tx marker aside byte-intact.
+
+    A corrupt marker used to be LEFT in place, which latched
+    ``repo_writer_admission_closed`` ("managed_update_tx:corrupt") for the whole
+    install with no recovery path (#447). Renaming it to ``*.corrupt-<ts>``
+    keeps the corruption evidence for the owner while releasing the admission
+    latch. A visible in-flight merge (MERGE_HEAD) is the one sign the marker may
+    still cover a genuinely active transaction — that case stays fail-closed."""
+    import time
+
+    from supervisor import update_merge as _m
+
+    if _merge_head_sha():
+        _m._log_supervisor({"type": "managed_update_tx_corrupt_on_boot",
+                            "merge_in_progress": True})
+        return {"finalized": False,
+                "reason": "corrupt tx marker over an in-flight merge — left for owner"}
+    marker = _m._update_tx_marker_path()
+    quarantine = marker.with_name(f"{marker.name}.corrupt-{int(time.time())}")
+    try:
+        marker.rename(quarantine)
+    except OSError:
+        _m._log_supervisor({"type": "managed_update_tx_corrupt_on_boot"})
+        return {"finalized": False,
+                "reason": "corrupt tx marker — quarantine rename failed"}
+    _m._log_supervisor({"type": "managed_update_tx_corrupt_quarantined",
+                        "quarantine": str(quarantine)})
+    return {"finalized": False, "reason": "corrupt tx marker quarantined",
+            "quarantine": str(quarantine)}
+
+
 def worktree_snapshot_tree(base_ref: str, *, cwd: Optional[str] = None) -> Tuple[str, str]:
     """Serialize the LIVE worktree (tracked edits, deletions, untracked files —
     conflict markers as plain file content) into a tree object via a PRIVATE
