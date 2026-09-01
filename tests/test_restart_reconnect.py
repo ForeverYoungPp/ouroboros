@@ -213,7 +213,12 @@ def test_progress_bubbles_have_subdued_styling():
     """Progress/reasoning bubbles should be visually muted compared to regular ones."""
     css = _read("web/style.css")
     assert ".chat-bubble.progress .message" in css, "Missing progress-specific message style"
-    assert "font-size: 13px" in css, "Progress font should be smaller than default 15.5px"
+    progress_block = css.split(".chat-bubble.progress .message", 1)[1]
+    progress_block = progress_block[: progress_block.index("}")]
+    assert "font-size: var(--type-body)" in progress_block, (
+        "Progress font should be the 14px body token, smaller than the "
+        "16px --type-section chat default"
+    )
 
 
 def test_working_live_cards_are_subdued_and_expandable():

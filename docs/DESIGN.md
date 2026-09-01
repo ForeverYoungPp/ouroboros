@@ -331,12 +331,12 @@ settles, as a record of the path taken. Anatomy, top to bottom:
    record of what the agent did without an answer. It is never dropped on
    state change.
 
-The card is born on tokens even though the surrounding chat surface is not yet
-migrated: type sizes and every colour come from tokens (no new literals), the
-chip's pill radius and the option gap included; every focusable element in the
-card shares one keyboard ring (2px `--focus-accent-border`, 2px offset).
-Component geometry (card min/max width) keeps local literals like the rest of
-the chat surface until its migration pass.
+The card was born on tokens ahead of the rest of the chat surface (which has
+since migrated too): type sizes and every colour come from tokens (no new
+literals), the chip's pill radius and the option gap included; every focusable
+element in the card shares one keyboard ring (2px `--focus-accent-border`,
+2px offset). Component geometry (card min/max width) keeps local literals like
+the rest of the chat surface.
 
 ## 6. Account group / row anatomy
 
@@ -392,12 +392,17 @@ The scale is applied surface by surface. Migrated today:
 - `web/settings.css` (settings shell, model/effort cards, MCP cards)
 - `web/onboarding.css` (the whole first-run wizard)
 - `web/style.css` between the `design-system:migrated-begin` and
-  `design-system:migrated-end` markers — harness accounts, reviewer slots,
-  and the Dashboard → Updates tab (status card, one action row, collapsed
-  Recovery with a single restore list)
+  `design-system:migrated-end` marker pairs (several — migrated surfaces are
+  not contiguous in the file): harness accounts, reviewer slots, the
+  Dashboard → Updates tab (status card, one action row, collapsed Recovery
+  with a single restore list), and chat (typography, foreground and status
+  colour; component geometry keeps its local literals per the viewport
+  reserve contract, and the glass surface tints — frosted header/composer
+  backgrounds, bubble gradients and their border tints — remain local
+  literals with no token equivalents yet)
 - the global `.muted`, `.form-section h3` and shared `.ui-status` tone rules
 
-Not yet migrated: chat, skills, marketplace, widgets, logs, evolution. They are
+Not yet migrated: skills, marketplace, widgets, logs, evolution. They are
 historical and keep their literals until their own pass. Do not part-migrate a
 surface: a half-tokenised stylesheet is harder to reason about than an untouched
 one. The semantic status/action/notification contract above already applies to

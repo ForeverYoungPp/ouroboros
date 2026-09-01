@@ -14,13 +14,16 @@ independent causes produced it (docs/DESIGN.md):
    mutually inconsistent grey families.
 
 This guard keeps that class closed on the **migrated** surfaces only. It is
-deliberately NOT a sweep of the historical stylesheet: ``web/style.css`` is
-~6000 lines of unmigrated chat/skills/marketplace/widget rules whose literals
-are a later pass, and a guard that fails on all of them would be turned off.
-The migrated slice of ``style.css`` is delimited in the file itself by
-``design-system:migrated-begin`` / ``design-system:migrated-end`` markers, so
-migrating a new surface means moving a marker (or adding a file below) in the
-same commit that migrates it.
+deliberately NOT a sweep of the historical stylesheet: ``web/style.css`` still
+carries unmigrated skills/marketplace/widget/log rules whose literals are a
+later pass, and a guard that fails on all of them would be turned off. The
+migrated slices of ``style.css`` are delimited in the file itself by
+``design-system:migrated-begin`` / ``design-system:migrated-end`` marker PAIRS
+— several, because migrated surfaces (harness accounts, the chat transcript,
+the chat page chrome, structured chat delivery) are not contiguous in the file
+and moving hundreds of unrelated lines to join them would destroy blame. So
+migrating a new surface means moving a marker or adding a pair (or a file
+below) in the same commit that migrates it.
 
 Pattern follows ``tests/test_web_dialogs_static.py``: read the sources, assert
 the structural fact, no browser needed.
@@ -51,7 +54,25 @@ STATUS_TOKENS = (
     "--status-neutral-fg", "--status-neutral-bg",
 )
 
-TINY_FONT_SIZE = re.compile(r"font-size\s*:\s*(?:10|11)px")
+# Any numeric font-size below the 12px meta floor, in any unit the stylesheets
+# actually write: px directly; rem against the 16px root; em against the same
+# 16px equivalence (an em resolves against the parent, but a sub-0.75em value
+# is sub-meta against every parent size in the four-token scale). Fractions
+# (10.5px, 11.5px, 0.7em) count — the old integer-only pattern waved them by.
+FONT_SIZE_VALUE = re.compile(r"font-size\s*:\s*(\d+(?:\.\d+)?)(px|rem|em)\b")
+TINY_FONT_FLOOR_PX = 12.0
+
+
+def _is_tiny_font(line: str) -> bool:
+    m = FONT_SIZE_VALUE.search(line)
+    if not m:
+        return False
+    value, unit = float(m.group(1)), m.group(2)
+    if unit == "px":
+        return value < TINY_FONT_FLOOR_PX
+    return value * 16.0 < TINY_FONT_FLOOR_PX  # rem/em vs the 12px equivalent
+
+
 UPPERCASE = re.compile(r"text-transform\s*:\s*uppercase")
 # Innermost rule blocks only: the body pattern forbids braces, so an @media
 # wrapper cannot match as a selector and the rules nested inside it are matched
@@ -75,19 +96,44 @@ def _decommented(css: str) -> str:
     return COMMENT.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), css)
 
 
-def _migrated_style_region(raw: bool = False) -> str:
-    """The marked harness-accounts + reviewer-slots slice of style.css."""
+def _style_marker_spans() -> list[tuple[int, int]]:
+    """Every ``(begin, end)`` marker pair of style.css, structurally validated.
+
+    N pairs are allowed (migrated surfaces are not contiguous in the file), but
+    the pairing itself must stay honest: as many ends as begins, strictly
+    alternating begin/end — which rules out nested and overlapping regions and
+    a stray marker mention that would silently truncate a guarded slice."""
     css = _read("web/style.css")
-    start = css.index(BEGIN_MARKER)
-    end = css.index(END_MARKER, start + len(BEGIN_MARKER))
-    return css[start:end] if raw else _decommented(css[start:end])
+    events = sorted(
+        [(m.start(), "begin") for m in re.finditer(re.escape(BEGIN_MARKER), css)]
+        + [(m.start(), "end") for m in re.finditer(re.escape(END_MARKER), css)]
+    )
+    assert events, "no design-system markers in web/style.css"
+    kinds = [kind for _, kind in events]
+    assert kinds == ["begin", "end"] * (len(events) // 2), (
+        "design-system markers must be strictly alternating begin/end pairs — "
+        "nesting, overlap, or an unpaired mention silently reshapes the "
+        f"guarded regions; got sequence {kinds}"
+    )
+    return [
+        (events[i][0], events[i + 1][0]) for i in range(0, len(events), 2)
+    ]
+
+
+def _migrated_style_region(raw: bool = False) -> str:
+    """The concatenated marked (migrated) slices of style.css."""
+    css = _read("web/style.css")
+    slices = [css[start:end] for start, end in _style_marker_spans()]
+    if not raw:
+        slices = [_decommented(s) for s in slices]
+    return "\n".join(slices)
 
 
 def _migrated_sources() -> dict[str, str]:
     return {
         "web/settings.css": _decommented(_read("web/settings.css")),
         "web/onboarding.css": _decommented(_read("web/onboarding.css")),
-        "web/style.css (migrated region)": _migrated_style_region(),
+        "web/style.css (migrated regions)": _migrated_style_region(),
     }
 
 
@@ -169,10 +215,10 @@ def test_no_tiny_raw_font_sizes_on_migrated_surfaces() -> None:
     violations: list[str] = []
     for label, source in _migrated_sources().items():
         for lineno, line in enumerate(source.splitlines(), 1):
-            if TINY_FONT_SIZE.search(line):
+            if _is_tiny_font(line):
                 violations.append(f"{label}:{lineno}: {line.strip()}")
     assert not violations, (
-        "Raw 10px/11px text is retired on migrated surfaces: below 12px this "
+        "Raw sub-12px text is retired on migrated surfaces: below 12px this "
         "dark theme forces a choice between illegible and glaring, and glaring "
         "is what the owner reported. Use var(--type-meta) (docs/DESIGN.md "
         "'Type scale').\n" + "\n".join(violations)
@@ -254,11 +300,13 @@ def test_settings_field_labels_use_the_named_meta_foreground() -> None:
 
 def test_migrated_region_markers_do_not_swallow_unmigrated_surfaces() -> None:
     """Root cause #4's guard rail: the scoping must stay honest in BOTH
-    directions. The region has to actually contain the migrated rules, and it
-    must not creep over neighbours that still carry their historical literals —
-    `.chat-live-executor-chip` sits immediately after the end marker and stays
-    outside the region until Chat gets its own guard pass (its sizes already
-    moved to tokens with the chat typography decisions)."""
+    directions. The regions have to actually contain the migrated rules —
+    including the chat surface and its `.chat-live-executor-chip`, which
+    migrated with the chat typography pass — and they must not creep over
+    neighbours (skills, marketplace, logs, evolution) that still carry their
+    historical literals. Marker-pair structure itself (as many ends as begins,
+    strictly alternating) is asserted by ``_style_marker_spans`` on every call
+    that reads a region."""
     region = _migrated_style_region(raw=True)
     assert ".reviewer-slots-heading" in region
     assert ".harness-account-row" in region
@@ -266,17 +314,25 @@ def test_migrated_region_markers_do_not_swallow_unmigrated_surfaces() -> None:
     # inside the guarded region so a later edit cannot drift them out of it.
     assert ".updates-status" in region
     assert ".updates-restore-row" in region
-    assert ".chat-live-executor-chip" not in region
-    css = _read("web/style.css")
-    assert css.count(BEGIN_MARKER) == 1
-    assert css.count(END_MARKER) == 1, (
-        "the end marker must appear exactly once — a second mention (even "
-        "inside a comment) silently truncates the guarded region"
-    )
+    # Chat migrated on 2026-09-01 (frontend sprint, Q1=B): page chrome,
+    # transcript/bubbles/live cards/composer, and the structured-delivery +
+    # quiz-card slice, executor chip now included.
+    assert ".chat-page-header" in region
+    assert ".chat-bubble.progress" in region
+    assert ".chat-live-title" in region
+    assert ".chat-live-executor-chip" in region
+    assert ".chat-quiz-card" in region
+    # Unmigrated neighbours stay out until their own pass. (`.log-entry` and
+    # `.evo-runtime-pill` are NOT in this list: the shared status-tone rules
+    # inside the chat region legitimately name them as co-selectors.)
+    for selector in (".skills-card", ".marketplace-card", ".widgets-card", ".evo-runtime-card"):
+        assert selector not in region, (
+            f"{selector} is an unmigrated surface; a marker crept over it"
+        )
     # NOTE: deliberately NOT asserting that debt still exists out there. A guard
     # that fails when someone independently improves an unmigrated surface would
-    # punish exactly the work it wants. The markers' own uniqueness (above) is
-    # what proves the region is really scoped.
+    # punish exactly the work it wants. The marker pairing (asserted in
+    # ``_style_marker_spans``) is what proves the regions are really scoped.
 
 
 # ---------------------------------------------------------------------------
