@@ -91,6 +91,12 @@ def test_render_markdown_safe_strips_dangerous_tags_and_attrs():
         assert f"'{forbidden_tag}'" in block, f"renderMarkdownSafe must FORBID_TAGS {forbidden_tag}"
     for forbidden_attr in ("style", "src", "srcset", "srcdoc"):
         assert f"'{forbidden_attr}'" in block, f"renderMarkdownSafe must FORBID_ATTR {forbidden_attr}"
+    # A same-window navigation out of a widget replaces the whole desktop shell
+    # with no way back, so publisher markdown carries the same link contract the
+    # chat markdown renderer applies.
+    assert "a[href]" in block
+    assert "'target', '_blank'" in block
+    assert "'rel', 'noopener noreferrer'" in block
 
 
 def test_marketplace_does_not_redeclare_shared_helpers():
