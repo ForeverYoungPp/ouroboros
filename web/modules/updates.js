@@ -82,16 +82,16 @@ export function updateVerdict(data = {}, phase = '') {
         const txPhase = String(data.update_tx.phase || '');
         const task = data.update_tx.task_id ? ` (task ${data.update_tx.task_id})` : '';
         if (txPhase === 'corrupt') {
-            // Truthful dead-end disclosure: boot recovery deliberately leaves a
-            // corrupt marker for the owner, and apply (Replace included) 409s
-            // while any marker is active — so neither restart nor the Recovery
-            // panel clears this state (final-review finding, 2026-08-31).
+            // Boot recovery quarantines readable corruption when no live merge
+            // is present. It deliberately leaves unreadable/rename-failed or
+            // merge-owned markers fail-closed, so offer one bounded restart
+            // without promising that every corrupt projection will clear.
             return {
                 ...base,
                 state: 'resolving', tone: 'error',
                 headline: 'The update transaction marker is corrupt.',
-                hint: 'Updates are blocked and a restart will not clear this. Inspect and remove the marker file (ouroboros-update-tx.json in the repository .git directory) manually, then check again.',
-                action: null,
+                hint: 'Restart Ouroboros once so boot recovery can quarantine readable corruption. If this state remains, inspect the marker file (ouroboros-update-tx.json in the repository .git directory) manually, then check again.',
+                action: { id: 'restart', label: 'Restart now' },
             };
         }
         if (txPhase === 'pending_boot_smoke') {

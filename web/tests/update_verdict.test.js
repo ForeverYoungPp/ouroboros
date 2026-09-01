@@ -111,11 +111,14 @@ test('non-assisted and corrupt update transactions are named honestly, never "un
     assert.match(assisted.headline, /resolved under review/);
 });
 
-test('a corrupt marker discloses the true dead end: no restart promise, no Replace advertisement', () => {
+test('a corrupt marker offers bounded boot recovery without promising success or Replace', () => {
     const corrupt = updateVerdict({ managed: true, update_tx: { active: true, phase: 'corrupt' } }, '');
-    assert.equal(corrupt.action, null);
-    assert.match(corrupt.hint, /restart will not clear/);
+    assert.equal(corrupt.action?.id, 'restart');
+    assert.equal(corrupt.action?.label, 'Restart now');
+    assert.match(corrupt.hint, /Restart Ouroboros once/);
+    assert.match(corrupt.hint, /If this state remains/);
     assert.match(corrupt.hint, /ouroboros-update-tx\.json/);
+    assert.doesNotMatch(corrupt.hint, /restart will not clear/i);
     assert.doesNotMatch(corrupt.hint, /Replace with Official/);
 });
 
