@@ -773,9 +773,11 @@ def test_skill_exec_refuses_non_utf8_declared_script(tmp_path, monkeypatch):
     WHOLE file, so a binary tail behind a text prefix cannot ride through."""
     skills_root = tmp_path / "skills"
     skill_dir = _build_skill(skills_root, "blobby", script_body="print('placeholder')\n")
-    # Overwrite the declared script with a text prefix + PK header + binary tail.
+    # Overwrite the declared script with >64 KiB of VALID UTF-8 text followed by
+    # a binary tail: a prefix-only (64 KiB) check accepts this file — only the
+    # whole-file decode refuses it, which is exactly the seam being pinned.
     (skill_dir / "scripts" / "hello.py").write_bytes(
-        b"# looks like python\n" + b"PK\x03\x04" + b"\xff\xfe" * 40000
+        (b"# looks like python\n" * 4000) + b"PK\x03\x04" + b"\xff\xfe" * 4000
     )
     ctx = _make_ctx(tmp_path)
     _mark_reviewed_and_enabled(ctx.drive_root, skill_dir, "blobby")
@@ -791,9 +793,16 @@ def test_skill_exec_large_multibyte_script_survives_the_utf8_seam(tmp_path, monk
     legitimate >64 KiB script with multibyte characters — including one that
     would straddle a 64 KiB prefix boundary — still executes."""
     skills_root = tmp_path / "skills"
-    filler = ("# коммент с не-ASCII содержимым\n" * 2000)  # ~70 KiB of UTF-8
-    skill_dir = _build_skill(
-        skills_root, "bigtext", script_body=filler + "print('ok-big')\n",
+    skill_dir = _build_skill(skills_root, "bigtext", script_body="print('placeholder')\n")
+    # Construct the file so a 2-byte UTF-8 character STRADDLES byte 65536
+    # exactly: a prefix-only decode cuts mid-character and falsely refuses;
+    # the whole-file decode accepts. A comment pad of ASCII up to offset
+    # 65535, then "я" (2 bytes at 65535..65536), then the real payload.
+    # One long COMMENT line whose "я" occupies bytes 65535..65536 exactly.
+    body = b"#" + b"x" * 65534 + "я".encode("utf-8") + b"\n"
+    assert body[65535:65537] == "я".encode("utf-8")
+    (skill_dir / "scripts" / "hello.py").write_bytes(
+        body + b"print('ok-big')\n"
     )
     ctx = _make_ctx(tmp_path)
     _mark_reviewed_and_enabled(ctx.drive_root, skill_dir, "bigtext")
