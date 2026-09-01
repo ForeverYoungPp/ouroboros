@@ -253,7 +253,7 @@ def test_typed_meta_flows_handler_to_trace_item_to_error_record(tmp_path):
     assert isinstance(item["duration_ms"], int)
     buckets = _classify_tool_errors(llm_trace)
     assert buckets["unresolved"] and not buckets["cosmetic"]
-    assert buckets["unresolved"][0]["signal"] == "SIGKILL"
+    assert buckets["unresolved"][0]["signal"] == _KILL_NAME
 
 
 def test_typed_absence_beats_regex_signal_from_stdout(tmp_path):
