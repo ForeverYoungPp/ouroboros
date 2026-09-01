@@ -122,6 +122,9 @@ def run_chat_viewport_smoke(
         _emit_ws_frame(page, frame)
         assert_noop_read(page, before)
 
+    def hold_first_route(routes):
+        return lambda route: routes.append(route) if not routes else route.fallback()
+
     def visible_card_anchor(page):
         return page.evaluate(
             """() => {
@@ -636,21 +639,6 @@ def run_chat_viewport_smoke(
                 assert page.locator(
                     '.chat-live-card[data-task-id="vp-cancel-authority"] [data-cancel-run]'
                 ).count() == 0
-                set_remaining(page, 300)
-                authority_anchor = visible_card_anchor(page)
-                _emit_ws_frame(page, {**cancel_authority, "cancelable": True})
-                assert page.locator(
-                    '.chat-live-card[data-task-id="vp-cancel-authority"] [data-cancel-run]'
-                ).count() == 1
-                assert abs(card_top(page, authority_anchor["id"]) - authority_anchor["top"]) <= 6
-                assert not jump_state(page)["dotHidden"]
-                button.click()
-                page.evaluate(_SETTLE_TWO_FRAMES)
-                page.wait_for_timeout(800)  # drain the prior task_done history debounce
-
-                # A delayed, unchanged pending detail only re-enables the
-                # control. Disabled styling has no transcript geometry and
-                # must not consume the 40px follow zone after the await.
                 cancel_active_ids = page.locator(
                     '.chat-live-card[data-finished="0"]'
                 ).evaluate_all("cards => cards.map(card => card.dataset.taskId)")
@@ -666,8 +654,23 @@ def run_chat_viewport_smoke(
                         } for task_id in cancel_active_ids]}),
                     ),
                 )
+                set_remaining(page, 300)
+                authority_anchor = visible_card_anchor(page)
+                _emit_ws_frame(page, {**cancel_authority, "cancelable": True})
+                assert page.locator(
+                    '.chat-live-card[data-task-id="vp-cancel-authority"] [data-cancel-run]'
+                ).count() == 1
+                assert abs(card_top(page, authority_anchor["id"]) - authority_anchor["top"]) <= 6
+                assert not jump_state(page)["dotHidden"]
+                button.click()
+                page.evaluate(_SETTLE_TWO_FRAMES)
+                page.wait_for_timeout(800)  # drain the prior task_done history debounce
+
+                # A delayed, unchanged pending detail only re-enables the
+                # control. Disabled styling has no transcript geometry and
+                # must not consume the 40px follow zone after the await.
                 held_cancel_details = []
-                page.route("**/api/tasks/vp-cancel-noop", lambda route: held_cancel_details.append(route))
+                page.route("**/api/tasks/vp-cancel-noop", hold_first_route(held_cancel_details))
                 page.route(
                     "**/api/tasks/vp-cancel-noop/cancel",
                     lambda route: route.fulfill(status=202, content_type="application/json", body=json.dumps({
@@ -768,10 +771,7 @@ def run_chat_viewport_smoke(
                 # Remote provenance survives the GET: the reference can arrive
                 # at bottom, then the reader can move away before Reviews lands.
                 held_review_routes = []
-                page.route(
-                    "**/api/tasks/vp-review-race",
-                    lambda route: held_review_routes.append(route),
-                )
+                page.route("**/api/tasks/vp-review-race", hold_first_route(held_review_routes))
                 set_remaining(page, 0)
                 delayed_reference = {
                     "type": "chat", "role": "system", "system_type": "review_reference",
@@ -877,7 +877,7 @@ def run_chat_viewport_smoke(
                 held_full_line = []
                 page.route(
                     "**/api/tasks/vp-late-child",
-                    lambda route: held_full_line.append(route),
+                    hold_first_route(held_full_line),
                 )
                 review_child.locator("[data-live-line-toggle]").first.click()
                 for _ in range(100):
@@ -911,7 +911,7 @@ def run_chat_viewport_smoke(
                 held_missing_detail = []
                 page.route(
                     "**/api/tasks/vp-detail-noop",
-                    lambda route: held_missing_detail.append(route),
+                    hold_first_route(held_missing_detail),
                 )
                 active_ids = page.locator(
                     '.chat-live-card[data-finished="0"]'

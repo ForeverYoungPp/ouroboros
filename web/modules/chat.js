@@ -3973,7 +3973,6 @@ export function createChatInstance({
         }
         for (const taskId of globallyActiveActivityIds) missingManagedTaskIds.delete(taskId);
         for (const row of settledDirectRows) {
-            // Reusable slots host many cycles: never settle them into the ledger.
             if (!REUSABLE_TASK_IDS.has(row.activityId)) recordConcludedActivity(row.activityId);
             if (row.clientMessageId) pendingSubmissions.delete(row.clientMessageId);
         }
@@ -3983,7 +3982,7 @@ export function createChatInstance({
             Array.from(liveCardRecords, ([id, r]) => ({
                 id, finished: r.finished, isSubagent: r.isSubagent, connected: r.root?.isConnected,
             })),
-            globallyActiveActivityIds,
+            new Set([...globallyActiveActivityIds, ...activeDirectActivities.keys()]),
         )) observeMissingManagedTask(taskId);
         for (const taskId of missingManagedTaskIds) {
             if (!activeDirectActivities.has(taskId)) void reconcileMissingManagedTask(taskId);

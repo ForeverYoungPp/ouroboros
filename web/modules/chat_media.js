@@ -2,6 +2,7 @@ import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
 import { showToast } from './toast.js';
 import { downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
 import { MAX_LINK_ACTIONS } from './api_types.js';
+import { apiFetch } from './api_client.js';
 
 const MIME_RE = /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/;
 const BASE64_RE = /^[A-Za-z0-9+/=\s]+$/;
@@ -164,7 +165,7 @@ export function createChatMedia({
             return new Blob([bytes], { type: mime });
         }
         if (!source.durable) throw new Error('File data is unavailable');
-        const response = await fetch(source.durable);
+        const response = await apiFetch(source.durable);
         if (!response.ok) throw new Error(`Download failed (${response.status})`);
         return response.blob();
     }
