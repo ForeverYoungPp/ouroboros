@@ -7118,7 +7118,7 @@ textarea.chat-input {
 }
 .chat-quiz-chip {
     padding: 1px 8px;
-    border-radius: 999px;
+    border-radius: var(--pill-radius);
     font-size: var(--type-meta);
     color: var(--status-neutral-fg);
     background: var(--status-neutral-bg);
@@ -7159,7 +7159,7 @@ textarea.chat-input {
     display: flex;
     flex-direction: column;
     align-items: flex-start;
-    gap: 2px;
+    gap: var(--space-1, 4px);
     padding: var(--space-2, 8px) var(--space-3, 12px);
     border: 1px solid var(--ui-card-border);
     border-radius: var(--radius-sm);
@@ -7185,12 +7185,60 @@ textarea.chat-input {
     color: var(--text-meta);
 }
 .chat-quiz-option:disabled .chat-quiz-option-detail { color: var(--text-disabled); }
+/* Free answer: the owner's own words when no offered option fits. */
+.chat-quiz-comment-box {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1, 4px);
+}
+.chat-quiz-comment {
+    width: 100%;
+    box-sizing: border-box;
+    padding: var(--space-2, 8px);
+    border: 1px solid var(--ui-card-border);
+    border-radius: var(--radius-sm);
+    background: var(--ui-card-bg-soft);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: var(--type-body);
+    line-height: var(--line-body, 1.5);
+    resize: vertical;
+}
+.chat-quiz-comment::placeholder { color: var(--text-meta); }
+.chat-quiz-send {
+    align-self: flex-start;
+    padding: var(--space-1, 4px) var(--space-3, 12px);
+    border: 1px solid var(--ui-card-border);
+    border-radius: var(--radius-sm);
+    background: var(--ui-card-bg-soft);
+    color: var(--text-primary);
+    font-size: var(--type-meta);
+    cursor: pointer;
+}
+.chat-quiz-send:hover:not(:disabled) {
+    border-color: var(--focus-accent-border);
+    background: var(--accent-08);
+}
+.chat-quiz-send:disabled { color: var(--text-disabled); cursor: default; }
+.chat-quiz-option:focus-visible,
+.chat-quiz-comment:focus-visible,
+.chat-quiz-send:focus-visible,
+.chat-quiz-more:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: 2px;
+}
+/* The settled record of what the owner answered: a second primary line. */
+.chat-quiz-answer {
+    font-size: var(--type-body);
+    line-height: var(--line-body, 1.5);
+    color: var(--text-primary);
+}
 .chat-quiz-more {
     align-self: flex-start;
     padding: var(--space-1, 4px) 0;
     border: none;
     background: none;
-    color: var(--text-link, var(--text-meta));
+    color: var(--accent-light);
     font-size: var(--type-meta);
     cursor: pointer;
 }

@@ -312,6 +312,123 @@ test('applyQuizStateFrame settles an existing card and ignores unknown ids', asy
     }
 });
 
+// ---- free answer (the owner's own option) ----
+
+function commentParts(card) {
+    return {
+        field: card.querySelector('.chat-quiz-comment'),
+        send: card.querySelector('.chat-quiz-send'),
+    };
+}
+
+test('a typed remark rides WITH an option click as one answer', async () => {
+    const fx = fixture();
+    try {
+        const card = fx.decision.buildQuizCard(WS_MSG);
+        const { field, send } = commentParts(card);
+        assert.ok(field && send);
+        field.value = 'yes, but only after CI';
+        field.listeners.get('input')();
+        assert.equal(send.disabled, false);
+        card.querySelectorAll('.chat-quiz-option')[0].click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const body = JSON.parse(fx.calls[0].init.body);
+        assert.equal(body.option_index, 0);
+        assert.equal(body.comment, 'yes, but only after CI');
+        // Settled: the draft field is gone and the words are the record.
+        assert.equal(card.querySelector('.chat-quiz-comment-box'), null);
+        assert.equal(card.querySelector('.chat-quiz-answer').textContent,
+            "Owner's answer: yes, but only after CI");
+    } finally { fx.restore(); }
+});
+
+test('the send button answers WITHOUT an option_index', async () => {
+    const fx = fixture();
+    try {
+        const card = fx.decision.buildQuizCard(WS_MSG);
+        const { field, send } = commentParts(card);
+        field.value = '  neither — do C  ';
+        field.listeners.get('input')();
+        send.click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(fx.calls.length, 1);
+        const body = JSON.parse(fx.calls[0].init.body);
+        assert.equal('option_index' in body, false, 'no option was taken — the key must be absent');
+        assert.equal(body.comment, 'neither — do C');
+        assert.equal(card.dataset.state, 'answered');
+        // No option is highlighted: the owner chose none of them.
+        assert.ok(card.querySelectorAll('.chat-quiz-option').every((btn) => !btn.classList.contains('chosen')));
+    } finally { fx.restore(); }
+});
+
+test('an empty field leaves the send button disabled and sends nothing', async () => {
+    const fx = fixture();
+    try {
+        const card = fx.decision.buildQuizCard(WS_MSG);
+        const { field, send } = commentParts(card);
+        assert.equal(send.disabled, true);
+        field.value = '   ';
+        field.listeners.get('input')();
+        assert.equal(send.disabled, true);
+        send.click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(fx.calls.length, 0);
+        assert.equal(card.dataset.state, 'open');
+    } finally { fx.restore(); }
+});
+
+test('an over-long answer is refused client-side, not truncated', async () => {
+    const fx = fixture();
+    try {
+        const card = fx.decision.buildQuizCard(WS_MSG);
+        const { field, send } = commentParts(card);
+        field.value = 'x'.repeat(2001);
+        field.listeners.get('input')();
+        assert.equal(send.disabled, true, 'the cap is the ingress limit, mirrored');
+        send.click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(fx.calls.length, 0);
+        assert.match(fx.toasts[0].text, /under 2000 characters/);
+        assert.equal(card.dataset.state, 'open');
+    } finally { fx.restore(); }
+});
+
+test('a settled replayed card shows the owner answer and offers no field', () => {
+    const fx = fixture();
+    try {
+        const card = fx.decision.buildQuizCard({
+            msg_type: 'quiz', role: 'assistant', task_id: 't-1', text: 'Merge now?', ts: 'x',
+            quiz: {
+                quiz_id: 'qz-3', state: 'answered', stake: '', assumption: 'merging meanwhile',
+                options: [{ label: 'Yes' }, { label: 'No' }],
+                comment: 'neither — revert first',
+            },
+        });
+        assert.equal(card.querySelector('.chat-quiz-comment-box'), null);
+        assert.equal(card.querySelector('.chat-quiz-answer').textContent,
+            "Owner's answer: neither — revert first");
+        assert.ok(card.querySelectorAll('.chat-quiz-option').every((btn) => btn.disabled));
+        assert.ok(card.querySelectorAll('.chat-quiz-option').every((btn) => !btn.classList.contains('chosen')));
+    } finally { fx.restore(); }
+});
+
+test('a live state frame for an open card never wipes the typed draft', () => {
+    const fx = fixture();
+    if (!globalThis.CSS) globalThis.CSS = { escape: (v) => String(v) };
+    try {
+        const card = fx.decision.buildQuizCard(WS_MSG);
+        const { field } = commentParts(card);
+        field.value = 'half-written thought';
+        field.listeners.get('input')();
+        const root = { querySelector: () => card };
+        assert.equal(fx.decision.applyQuizStateFrame(root, {
+            quiz_id: 'qz-1', task_id: 't-1', state: 'open',
+        }), false, 'an open→open frame is a no-op');
+        assert.equal(card.querySelector('.chat-quiz-comment').value, 'half-written thought');
+        assert.ok(card.querySelector('.chat-quiz-comment-box'));
+    } finally { fx.restore(); }
+});
+
 // ---- routing picker (#198) ----
 
 function routingBubble(cmid = 'cm-1') {

@@ -226,16 +226,29 @@ settles, as a record of the path taken. Anatomy, top to bottom:
    After settlement buttons drop to `--text-disabled`; the chosen option keeps
    the ok pair. Options are capped by the shared Python↔JS constant
    (`MAX_QUIZ_OPTIONS`).
-5. **Assumption** — the signature line (`Continuing meanwhile: …`),
+5. **Free answer** — while the card is open, a compact always-visible field
+   (`Your answer or comment…`) with a `Send my answer` button, enabled only
+   once something is typed. No option ever has to be the least wrong one: the
+   text rides with an option click as the owner's remark, or goes alone as the
+   owner's own answer. It uses the card's own ink and surface tokens (never
+   the legacy chat input), is capped by the shared Python↔JS constant
+   (`MAX_DECISION_COMMENT`), and disappears the moment the card settles.
+   A settled card instead carries what the owner said as a second primary
+   line (`Owner's answer: …`, `--type-body`, `--text-primary`) under the
+   options — beside the highlighted option when one was chosen, and as the
+   whole answer when none was.
+6. **Assumption** — the signature line (`Continuing meanwhile: …`),
    `--type-meta`, `--text-meta`, separated by a hairline. While the card is
    open it names the default path; once the card settles it is the durable
    record of what the agent did without an answer. It is never dropped on
    state change.
 
 The card is born on tokens even though the surrounding chat surface is not yet
-migrated: type sizes and every colour come from tokens (no new literals);
-component geometry (card min/max width, chip radius) keeps local literals like
-the rest of the chat surface until its migration pass.
+migrated: type sizes and every colour come from tokens (no new literals), the
+chip's pill radius and the option gap included; every focusable element in the
+card shares one keyboard ring (2px `--focus-accent-border`, 2px offset).
+Component geometry (card min/max width) keeps local literals like the rest of
+the chat surface until its migration pass.
 
 ## 6. Account group / row anatomy
 

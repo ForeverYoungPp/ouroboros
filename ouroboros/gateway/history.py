@@ -915,8 +915,9 @@ def _collect_chat_rows(
                     _live = quiz_projection_cache[_qtid].get(str(quiz.get("quiz_id") or ""))
                     if isinstance(_live, dict):
                         quiz["state"] = str(_live.get("state") or quiz.get("state") or "open")
-                        if "answered_index" in _live:
-                            quiz["answered_index"] = _live["answered_index"]
+                        for key in ("answered_index", "comment"):  # the recorded answer itself
+                            if key in _live:
+                                quiz[key] = _live[key]
                 rec.update(msg_type="quiz", quiz=quiz)
             if "task_terminal_status" in entry:
                 rec["task_terminal_status"] = str(entry.get("task_terminal_status") or "")

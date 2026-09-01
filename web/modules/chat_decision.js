@@ -5,7 +5,7 @@
 // assumption, so it must read correctly both as "you can redirect me" (open)
 // and as a record of what happened (answered / expired). The routing picker
 // settles into the plain routing ack line once its dispatch is confirmed.
-import { MAX_QUIZ_OPTIONS } from './api_types.js';
+import { MAX_DECISION_COMMENT, MAX_QUIZ_OPTIONS } from './api_types.js';
 import { renderRoutingAnnotation, routingOptionLabel } from './chat_activity.js';
 
 const QUIZ_STATUS_TEXT = {
@@ -55,6 +55,10 @@ export function createChatDecision({
             taskId: String(msg.task_id || ''),
             ts: msg.ts || null,
             answeredIndex: Number.isInteger(src.answered_index) ? src.answered_index : null,
+            // The owner's verbatim words on a settled card (history replay
+            // merges them from the projection). With no answeredIndex they
+            // ARE the answer, not a remark beside one.
+            comment: String(src.comment || ''),
         };
     }
 
@@ -63,9 +67,13 @@ export function createChatDecision({
         return QUIZ_STATUS_TEXT[state] || 'Closed';
     }
 
-    async function submitAnswer(card, quiz, index) {
+    async function submitAnswer(card, quiz, index, comment) {
         if (card.dataset.pending === '1') return;
         card.dataset.pending = '1';
+        const text = String(comment || '');
+        // Remembered for settlement: the card renders the owner's answer from
+        // here, so a fresh answer reads exactly like a replayed one.
+        if (text) card.dataset.ownerComment = text;
         // STABLE per-card idempotency key: a retry after a transient failure
         // must replay the SAME request, or the server-side first-wins latch
         // reads the retry as a competing second answer.
@@ -79,13 +87,18 @@ export function createChatDecision({
                 body: JSON.stringify({
                     request_id: card.dataset.requestId,
                     decision_id: `quiz:${quiz.taskId}:${quiz.quizId}`,
-                    option_index: index,
+                    // Omitted, never null: no option means the owner took none
+                    // of them and the comment carries the whole answer.
+                    ...(Number.isInteger(index) ? { option_index: index } : {}),
+                    ...(text ? { comment: text } : {}),
                 }),
             });
             let body = null;
             try { body = res && res.json ? await res.json() : null; } catch (parseErr) { body = null; }
             if (res && res.ok) {
-                const answered = body && Number.isInteger(body.answered_index) ? body.answered_index : index;
+                const answered = body && Number.isInteger(body.answered_index)
+                    ? body.answered_index
+                    : (Number.isInteger(index) ? index : null);
                 setCardState(card, 'answered', answered);
                 return;
             }
@@ -113,11 +126,43 @@ export function createChatDecision({
         }
     }
 
+    function renderOwnerAnswer(card, comment) {
+        // The owner's own words are a SECOND primary line under the question:
+        // with no chosen option they are the entire answer, and beside a
+        // chosen one they qualify it.
+        let line = card.querySelector('.chat-quiz-answer');
+        if (!comment) {
+            if (!line) return false;
+            line.remove();
+            return true;
+        }
+        const text = `Owner's answer: ${comment}`;
+        if (line) {
+            if (line.textContent === text) return false;
+            line.textContent = text;
+            return true;
+        }
+        line = document.createElement('div');
+        line.className = 'chat-quiz-answer';
+        line.textContent = text;
+        const assumption = card.querySelector('.chat-quiz-assumption');
+        if (assumption) assumption.before(line);
+        else card.append(line);
+        return true;
+    }
+
     function setCardState(card, state, answeredIndex) {
         if (!card) return false;
         return onDomWrite(() => {
             let changed = card.dataset.state !== state;
             if (changed) card.dataset.state = state;
+            if (state !== 'open') {
+                // A settled card takes no more input: the draft field goes,
+                // and what the owner actually said takes its place.
+                const box = card.querySelector('.chat-quiz-comment-box');
+                if (box) { box.remove(); changed = true; }
+                if (renderOwnerAnswer(card, String(card.dataset.ownerComment || ''))) changed = true;
+            }
             const status = card.querySelector('.chat-quiz-status-text');
             const nextStatus = statusText(state);
             if (status && status.textContent !== nextStatus) {
@@ -181,6 +226,9 @@ export function createChatDecision({
             card.append(stake);
         }
 
+        let commentField = null;
+        const commentText = () => String((commentField && commentField.value) || '').trim();
+
         const optionsBox = document.createElement('div');
         optionsBox.className = 'chat-quiz-options';
         quiz.options.forEach((option, index) => {
@@ -200,11 +248,53 @@ export function createChatDecision({
             }
             btn.addEventListener('click', () => {
                 if (card.dataset.state !== 'open') return;
-                submitAnswer(card, quiz, index);
+                // A typed remark rides WITH the click: the owner picked this
+                // option and said why, one answer, one request.
+                submitAnswer(card, quiz, index, commentText());
             });
             optionsBox.append(btn);
         });
         card.append(optionsBox);
+
+        // Free answer: none of the options may fit, and the owner must not be
+        // forced to pick the least wrong one. Always visible while the card is
+        // open (no disclosure to discover), removed once it settles.
+        if (quiz.state === 'open') {
+            const box = document.createElement('div');
+            box.className = 'chat-quiz-comment-box';
+            commentField = document.createElement('textarea');
+            commentField.className = 'chat-quiz-comment';
+            commentField.rows = 2;
+            commentField.maxLength = MAX_DECISION_COMMENT;
+            commentField.placeholder = 'Your answer or comment…';
+            const send = document.createElement('button');
+            send.type = 'button';
+            send.className = 'chat-quiz-send';
+            send.textContent = 'Send my answer';
+            send.disabled = true;
+            const syncSend = () => {
+                const text = commentText();
+                const enabled = Boolean(text) && text.length <= MAX_DECISION_COMMENT;
+                if (send.disabled === !enabled) return;
+                send.disabled = !enabled;
+            };
+            commentField.addEventListener('input', () => onDomWrite(() => { syncSend(); return true; }));
+            send.addEventListener('click', () => {
+                if (card.dataset.state !== 'open') return;
+                const text = commentText();
+                if (!text) return;
+                if (text.length > MAX_DECISION_COMMENT) {
+                    // The ingress refuses it rather than truncating the
+                    // owner's words — say so here instead of sending.
+                    showToast(`Keep the answer under ${MAX_DECISION_COMMENT} characters — `
+                        + 'it is delivered word for word.', 'error');
+                    return;
+                }
+                submitAnswer(card, quiz, null, text);
+            });
+            box.append(commentField, send);
+            card.append(box);
+        }
 
         // The signature line: what the agent keeps doing while the owner has
         // not answered — and, once the card settles, the record of the path
@@ -216,6 +306,7 @@ export function createChatDecision({
             card.append(assumption);
         }
 
+        if (quiz.comment) card.dataset.ownerComment = quiz.comment;
         setCardState(card, quiz.state, quiz.answeredIndex);
         const framed = frameNode(msg, card);
         if (enhanceMarkdown && renderMarkdown) enhanceMarkdown(card);

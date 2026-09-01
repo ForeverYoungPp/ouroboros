@@ -356,7 +356,10 @@ class QuizOutbound(TypedDict):
     Fire-and-continue: the asking task keeps working under ``assumption``
     while the card is open. ``state`` is the card's lifecycle word
     (``open`` in this display phase; answered/expired arrive with the
-    answer ingress).
+    answer ingress). History replay of a SETTLED card additionally merges the
+    projection's record of the answer: ``answered_index`` when an offered
+    option was taken, and the owner's verbatim ``comment`` (the whole answer
+    when the owner took none of the options).
     """
 
     type: Literal["quiz"]
@@ -368,6 +371,8 @@ class QuizOutbound(TypedDict):
     assumption: str
     state: str
     ts: str
+    answered_index: NotRequired[int]
+    comment: NotRequired[str]
     chat_id: NotRequired[int]
     task_id: NotRequired[str]
     project_thread: NotRequired[bool]
@@ -1322,11 +1327,16 @@ class DecisionRequest(TypedDict):
     {routing_token}`` (#198), ``interaction:{task_id}:{run_id}:
     {interaction_id}`` (#204). ``request_id`` is the idempotency key; a
     replayed request returns the recorded confirmation instead of acting
-    twice. ``comment`` is the owner's optional verbatim remark."""
+    twice. ``comment`` is the owner's optional verbatim remark.
+
+    ``option_index`` is optional for the ``quiz`` family ONLY: an owner who
+    takes none of the offered options answers with a non-empty ``comment``
+    and no index. Every other family still requires the integer — a routing
+    choice IS its option."""
 
     request_id: str
     decision_id: str
-    option_index: int
+    option_index: NotRequired[int]
     comment: NotRequired[str]
 
 
