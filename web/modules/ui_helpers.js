@@ -309,7 +309,13 @@ async function shellBytesPayload(url, filename, win) {
     };
 }
 
-async function copyShellLink(url, win, doc) {
+/**
+ * Clipboard write with the execCommand-textarea fallback. Non-secure origins
+ * and the desktop shell have no async clipboard, so a bare
+ * `navigator.clipboard?.writeText(...)` is a silently dead control there.
+ * Throws when nothing could be copied, so every caller can report honestly.
+ */
+async function copyTextToClipboard(url, win, doc) {
     try {
         if (!win.navigator?.clipboard?.writeText) throw new Error('no async clipboard');
         await win.navigator.clipboard.writeText(url);
@@ -328,6 +334,29 @@ async function copyShellLink(url, win, doc) {
     }
 }
 
+/**
+ * Copy owner-visible text and report the outcome through the shared toast host.
+ * ONE clipboard contract for controls whose whole job is "put this on the
+ * clipboard" (a sign-in link, a device code, a setup command).
+ */
+export async function copyTextWithToast(text, {
+    okMessage = 'Copied.', win = window, doc = document, toast = showToast,
+} = {}) {
+    const value = String(text ?? '');
+    if (!value) {
+        toast('Nothing to copy.', 'warn');
+        return false;
+    }
+    try {
+        await copyTextToClipboard(value, win, doc);
+    } catch (error) {
+        toast(`Could not copy: ${error?.message || error}`, 'error');
+        return false;
+    }
+    toast(okMessage, 'ok');
+    return true;
+}
+
 // With NO file-bridge method at all, openViaHostBridge/downloadViaHostBridge
 // fall back to window.open / anchor clicks — dead in the shell, and a re-entry
 // into the interceptor's own shim. routeShellUrl degrades that case to the
@@ -339,7 +368,7 @@ function absoluteShellUrl(url, win) {
 }
 
 async function copyShellLinkWithToast(url, win, doc, toast) {
-    await copyShellLink(url, win, doc);
+    await copyTextToClipboard(url, win, doc);
     toast('Link copied — open it in your browser.', 'info');
 }
 

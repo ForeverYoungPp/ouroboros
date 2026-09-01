@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import {
     classifyShellUrl,
+    copyTextWithToast,
     downloadViaHostBridge,
     installDesktopShellLinkInterceptor,
     openViaHostBridge,
@@ -435,4 +436,50 @@ test('a refusal the owner cannot even copy still surfaces as an error to the cal
         globalThis.window = prior.window;
         globalThis.document = prior.document;
     }
+});
+
+// --- shared copy contract --------------------------------------------------
+
+test('copyTextWithToast falls back to the textarea path and always reports', async () => {
+    const toasts = [];
+    const toast = (message, tone) => toasts.push({ message, tone });
+    const selected = [];
+    const doc = {
+        createElement: () => ({
+            value: '',
+            setAttribute() {},
+            select() { selected.push(this.value); },
+            remove() {},
+        }),
+        body: { appendChild() {} },
+        execCommand: () => true,
+    };
+
+    // No async clipboard at all (non-secure origin / desktop shell).
+    const win = { navigator: {} };
+    assert.equal(await copyTextWithToast('device-code-42', { win, doc, toast, okMessage: 'Code copied.' }), true);
+    assert.deepEqual(selected, ['device-code-42']);
+    assert.deepEqual(toasts, [{ message: 'Code copied.', tone: 'ok' }]);
+
+    // Nothing copyable at all is reported, never a silent no-op.
+    toasts.length = 0;
+    assert.equal(await copyTextWithToast('', { win, doc, toast }), false);
+    assert.deepEqual(toasts, [{ message: 'Nothing to copy.', tone: 'warn' }]);
+
+    // A genuinely failing copy is an honest error, not a fake success.
+    toasts.length = 0;
+    assert.equal(
+        await copyTextWithToast('x', { win, doc: { ...doc, execCommand: () => false }, toast }),
+        false,
+    );
+    assert.equal(toasts[0].tone, 'error');
+});
+
+test('the agent login card never writes to the clipboard without a fallback', () => {
+    const source = readFileSync(new URL('../modules/harness_login_cards.js', import.meta.url), 'utf8');
+    // Copying the sign-in link, the device code, and the attach command are
+    // STEPS of signing in; a bare optional-chained clipboard write is a control
+    // that dies silently on every non-secure origin.
+    assert.equal(source.includes('navigator.clipboard'), false);
+    assert.equal((source.match(/copyTextWithToast\(/g) || []).length, 3);
 });
