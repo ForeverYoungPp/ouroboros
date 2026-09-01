@@ -213,14 +213,22 @@ def test_glued_dash_c_selects_the_same_base_as_split(tmp_path):
     runtime.mkdir()
     outside = tmp_path / "proj"
     outside.mkdir()
-    for spelling in (f"git -C {runtime} commit -m x", f"git -C{runtime} commit -m x"):
+    # argv lists, not f-strings: the POSIX lexer eats the backslashes of a
+    # Windows path inside a shell STRING (3-OS CI matrix rule).
+    for spelling in (
+        ["git", "-C", str(runtime), "commit", "-m", "x"],
+        ["git", f"-C{runtime}", "commit", "-m", "x"],
+    ):
         assert external_workspace_git_violation(
             spelling,
             active_root=outside,
             cwd=str(outside),
             protected_roots=[runtime],
         ), spelling
-    for spelling in (f"git -C {outside} commit -m x", f"git -C{outside} commit -m x"):
+    for spelling in (
+        ["git", "-C", str(outside), "commit", "-m", "x"],
+        ["git", f"-C{outside}", "commit", "-m", "x"],
+    ):
         assert external_workspace_git_violation(
             spelling,
             active_root=outside,

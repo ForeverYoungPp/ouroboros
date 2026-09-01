@@ -4,7 +4,6 @@ import asyncio
 import base64
 import importlib.util
 import json
-import signal
 import sys
 import types
 from pathlib import Path
@@ -217,6 +216,9 @@ def test_block_aware_chunking_keeps_quote_and_table_blocks_whole():
         _assert_balanced(chunk)
 
 
+# Termination guards: pytest-timeout, not ``signal.alarm`` — Windows has no
+# SIGALRM, and an unhandled alarm would kill the whole pytest worker.
+@pytest.mark.timeout(10)
 def test_chunker_terminates_for_oversized_link_tag_and_pre_block():
     _plugin, telegram_api = _load_skill()
     link_source = (
@@ -228,12 +230,8 @@ def test_chunker_terminates_for_oversized_link_tag_and_pre_block():
     )
     pre_source = "```text\n" + ("x" * 12_000) + "\n```"
 
-    signal.alarm(10)
-    try:
-        link_chunks = telegram_api.markdown_to_telegram_chunks(link_source)
-        pre_chunks = telegram_api.markdown_to_telegram_chunks(pre_source)
-    finally:
-        signal.alarm(0)
+    link_chunks = telegram_api.markdown_to_telegram_chunks(link_source)
+    pre_chunks = telegram_api.markdown_to_telegram_chunks(pre_source)
 
     assert link_chunks
     assert pre_chunks
@@ -242,15 +240,12 @@ def test_chunker_terminates_for_oversized_link_tag_and_pre_block():
         _assert_balanced(chunk)
 
 
-def test_chunker_balances_100kb_single_block_paragraph_within_alarm():
+@pytest.mark.timeout(10)
+def test_chunker_balances_100kb_single_block_paragraph_within_timeout():
     _plugin, telegram_api = _load_skill()
     source = "**" + ("word " * 20_000) + "**"
 
-    signal.alarm(10)
-    try:
-        chunks = telegram_api.markdown_to_telegram_chunks(source)
-    finally:
-        signal.alarm(0)
+    chunks = telegram_api.markdown_to_telegram_chunks(source)
 
     assert len(chunks) > 1
     assert all(telegram_api._u16len(chunk) <= 4096 for chunk in chunks)
