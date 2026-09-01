@@ -898,10 +898,10 @@ def _collect_chat_rows(
                 if "size_bytes" in entry:
                     rec["size_bytes"] = coerce_int(entry.get("size_bytes"), 0)
             elif entry.get("type") in {"photo", "video"} and entry.get("download_url"):
-                rec["msg_type"] = str(entry["type"])
-                rec["mime"] = str(entry.get("mime") or "")
-                rec["download_url"] = str(entry["download_url"])
-                rec["caption"] = str(entry.get("caption") or "")
+                rec.update(msg_type=str(entry["type"]), mime=str(entry.get("mime") or ""),
+                           download_url=str(entry["download_url"]),
+                           download_url_compat=str(entry.get("download_url_compat") or ""),
+                           caption=str(entry.get("caption") or ""))
             elif entry.get("type") == "links":
                 rec.update(msg_type="links", actions=list(entry.get("actions") or []), title=str(entry.get("title") or ""))
             elif entry.get("type") == "quiz" and isinstance(entry.get("quiz"), dict):

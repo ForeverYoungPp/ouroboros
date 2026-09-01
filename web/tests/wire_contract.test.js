@@ -188,9 +188,9 @@ test('delivered photo, video, and document rows keep their replay wire fields', 
 
     const mediaBranchStart = history.indexOf('elif entry.get("type") in {"photo", "video"}');
     const mediaBranch = history.slice(mediaBranchStart, history.indexOf('\n            if ', mediaBranchStart));
-    for (const field of ['msg_type', 'mime', 'download_url', 'caption']) {
-        assert.match(mediaBranch, new RegExp(`rec\\["${field}"\\]`),
-            `photo/video replay no longer emits ${field}`);
+    // Same keyword-argument idiom as the links branch below.
+    for (const field of ['msg_type=', 'mime=', 'download_url=', 'download_url_compat=', 'caption=']) {
+        assert.ok(mediaBranch.includes(field), `photo/video replay no longer emits ${field}`);
     }
 
     const linksBranchStart = history.indexOf('elif entry.get("type") == "links"');

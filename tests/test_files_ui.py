@@ -89,9 +89,11 @@ def test_chat_document_card_uses_dialog_and_safe_download_fallbacks():
     assert "className = 'chat-file-dialog'" in chat
     assert 'data-file-action="open"' in chat
     assert "open.hidden = !file.source.durable;" in chat
-    assert "await openViaHostBridge(dialogFile.source.durable, dialogFile.filename);" in chat
+    # Host-bridge calls prefer the launcher-compatible address for the same
+    # bytes and fall back to the canonical one; the browser keeps the canonical.
+    assert "dialogFile.source.bridge || dialogFile.source.durable," in chat
     assert 'data-file-action="download"' in chat
-    assert "await downloadViaHostBridge(source.durable, filename);" in chat
+    assert "await downloadViaHostBridge(source.bridge || source.durable, filename);" in chat
     assert "URL.createObjectURL(blob)" in chat
     assert ".chat-file-dialog {" in css
 

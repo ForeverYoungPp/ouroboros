@@ -363,6 +363,8 @@
  * @property {string} mime
  * @property {string} ts
  * @property {string=} caption
+ * @property {string=} download_url  // durable task-artifact URL, replayed by chat history
+ * @property {string=} download_url_compat  // same bytes on /api/files/download; host-bridge form for launchers whose gate predates the artifact route
  * @property {string=} content
  * @property {string=} source
  * @property {string=} sender_label
@@ -383,6 +385,8 @@
  * @property {string} mime
  * @property {string} ts
  * @property {string=} caption
+ * @property {string=} download_url  // durable task-artifact URL, replayed by chat history
+ * @property {string=} download_url_compat  // same bytes on /api/files/download; host-bridge form for launchers whose gate predates the artifact route
  * @property {string=} content
  * @property {string=} source
  * @property {string=} sender_label

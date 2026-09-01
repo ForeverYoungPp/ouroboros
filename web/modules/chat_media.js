@@ -165,6 +165,29 @@ export function createChatMedia({
         return base64 ? `data:${mime};base64,${base64}` : durable;
     }
 
+    // Compat address for the same media bytes: packaged desktop launchers gate
+    // their file bridge to a URL allowlist that predates the task-artifact
+    // route, so the bridge is handed this form when the server offered one.
+    // The browser keeps the canonical URL — this is an extra address, not a
+    // replacement, and it is validated exactly like the document form.
+    function compatMediaUrl(value) {
+        const raw = String(value || '');
+        return FILE_URL_RE.test(raw) ? raw : '';
+    }
+
+    // Bridge-facing view of one delivered media item. `durable` is the
+    // canonical same-origin URL used for fetches; `bridge` is what a host-bridge
+    // call should be given.
+    function mediaSourceRef(msg, source) {
+        const isData = source.startsWith('data:');
+        const durable = isData ? '' : source;
+        return {
+            base64: isData ? source.split(',')[1] || '' : '',
+            durable,
+            bridge: durable ? (compatMediaUrl(msg?.download_url_compat) || durable) : '',
+        };
+    }
+
     function fileSource(msg, mime) {
         const base64 = cleanBase64(msg.file_base64);
         const durable = FILE_URL_RE.test(String(msg.download_url || ''))
@@ -173,6 +196,8 @@ export function createChatMedia({
         return {
             base64,
             durable,
+            // Documents already ship on the files route the gate admits.
+            bridge: durable,
             src: base64 ? `data:${mime};base64,${base64}` : durable,
         };
     }
@@ -204,7 +229,7 @@ export function createChatMedia({
 
     async function downloadSource(source, filename, mime) {
         if (source.durable) {
-            await downloadViaHostBridge(source.durable, filename);
+            await downloadViaHostBridge(source.bridge || source.durable, filename);
             return;
         }
         downloadBlob(await sourceBlob(source, mime), filename);
@@ -234,7 +259,10 @@ export function createChatMedia({
         listen(fileDialog.querySelector('[data-file-action="open"]'), 'click', async () => {
             if (!dialogFile?.source.durable) return;
             try {
-                await openViaHostBridge(dialogFile.source.durable, dialogFile.filename);
+                await openViaHostBridge(
+                    dialogFile.source.bridge || dialogFile.source.durable,
+                    dialogFile.filename,
+                );
                 close();
             } catch (error) {
                 showToast(`Could not open file: ${error?.message || error}`, 'error');
@@ -386,11 +414,7 @@ export function createChatMedia({
         </details>`;
     }
 
-    function wirePhotoActions(item, source, filename, mime) {
-        const sourceRef = {
-            base64: source.startsWith('data:') ? source.split(',')[1] || '' : '',
-            durable: source.startsWith('data:') ? '' : source,
-        };
+    function wirePhotoActions(item, source, sourceRef, filename, mime) {
         const action = (name) => item.querySelector(`[data-photo-action="${name}"]`);
         listen(item.querySelector('.chat-photo'), 'click', () => window.open(source, '_blank', 'noopener'));
         listen(action('open'), 'click', () => window.open(source, '_blank', 'noopener'));
@@ -427,10 +451,7 @@ export function createChatMedia({
         const caption = String(msg.caption || '');
         if (type === 'video') {
             const extension = (mime.split('/')[1]?.split('+')[0] || '').slice(0, 10) || 'mp4';
-            const sourceRef = {
-                base64: source.startsWith('data:') ? source.split(',')[1] || '' : '',
-                durable: source.startsWith('data:') ? '' : source,
-            };
+            const sourceRef = mediaSourceRef(msg, source);
             const body = `${caption ? `<div class="message">${escapeHtml(caption)}</div>` : ''}
                 <div class="message">${playerHtml({ src: source })}</div>`;
             const bubble = bubbleFrame(msg, body);
@@ -449,7 +470,7 @@ export function createChatMedia({
             </figure>
         </div></div>`;
         const bubble = bubbleFrame(msg, body);
-        wirePhotoActions(bubble, source, filename, mime);
+        wirePhotoActions(bubble, source, mediaSourceRef(msg, source), filename, mime);
         return bubble;
     }
 
