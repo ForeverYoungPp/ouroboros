@@ -206,6 +206,7 @@ BAND_PATHS = {
     "tests/test_usage_accounting.py": None,
     "tests/test_v6730_origin_invariant.py": None,
     "tests/test_v678_receipt_reconciliation.py": None,
+    "tests/ui_chat_viewport_smoke.py": "Entered the band from 992 lines: the terminal-summary shrink bound gained its calibration rationale for the owner-approved 16px chat scale (frontend sprint 2026-09-01).",
     "web/modules/api_types.js": "The shared browser contract module now includes issue 265 publication-preflight types alongside the target settings and subagent contracts.",
     "web/modules/harness_accounts.js": None,
     "web/modules/log_events.js": None,

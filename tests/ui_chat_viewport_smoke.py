@@ -586,7 +586,12 @@ def run_chat_viewport_smoke(
                 }
                 _emit_ws_frame(page, parent_summary)
                 assert parent.get_attribute("data-expanded") == "1"
-                assert parent.evaluate("card => card.getBoundingClientRect().height") >= parent_before_finish - 32
+                # A terminal summary is legally shorter than live narration by a
+                # couple of wrapped lines; three --type-body line boxes
+                # (14px * 1.45 * 3 ~ 61) bound that legitimate shrink after the
+                # owner-approved chat scale migration, while a collapsed
+                # reserved band would shrink far more and still fail here.
+                assert parent.evaluate("card => card.getBoundingClientRect().height") >= parent_before_finish - 61
                 assert abs(card_top(page, anchor_id) - anchor_before) <= 6
                 assert_noop_frame(page, parent_summary)
                 assert_noop_frame(page, parent_name)
