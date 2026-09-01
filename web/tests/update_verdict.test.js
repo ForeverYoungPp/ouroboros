@@ -45,6 +45,8 @@ test('restarting and restart_required stay distinct states with distinct actions
     const restarting = updateVerdict({}, 'restarting');
     assert.equal(restarting.state, 'restarting');
     assert.equal(restarting.action.disabled, true);
+    assert.match(restarting.hint, /page updates itself/);
+    assert.doesNotMatch(restarting.hint, /reload/i);
     const required = updateVerdict({}, 'restart_required');
     assert.equal(required.state, 'restart_required');
     assert.equal(required.action.id, 'restart');
