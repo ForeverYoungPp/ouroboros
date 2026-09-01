@@ -1118,6 +1118,17 @@ def _sealed(details=None, content=None, model="z-ai/glm-4.6", **extra):
     # Non-string truthy flat reasoning fields are unrecognized shapes => fail-closed.
     ({"reasoning": {"weird": "dict"}}, True),
     ({"reasoning_content": ["weird", "list"]}, True),
+    # A truthy NON-STRING signature is an unrecognized shape => fail-closed too.
+    ({"details": [{"type": "reasoning.text", "text": "t", "signature": 123}]}, True),
+    ({"content": [{"type": "thinking", "thinking": "p", "signature": b"sig"}]}, True),
+    # FALSY-present reasoning_details is the common JSON idiom for "no reasoning at
+    # all" — NOT an artifact. Sealing it would pin transcripts with zero reasoning
+    # (the response_id bug class); parity with the presence predicate's truthiness.
+    ({"details": {}}, False),
+    ({"details": ""}, False),
+    ({"details": 0}, False),
+    ({"details": False}, False),
+    ({"reasoning_details": None}, False),  # explicit present-null via **extra
     ({"details": [{"type": "reasoning.encrypted", "data": "blob"}]}, True),
     ({"details": [{"type": "reasoning.brand_new_shape"}]}, True),  # unknown => fail-closed
     ({"details": [{"no_type": 1}]}, True),

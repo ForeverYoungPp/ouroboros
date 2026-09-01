@@ -264,7 +264,7 @@ def _record_and_emit_empty_response(
     Returns ``(event_type, is_provider_glitch, permanent_body_error)`` for the caller's
     retry decision. Extracted from call_llm_with_retry to keep that loop readable."""
     finish_reason = msg.get("finish_reason") or msg.get("stop_reason")
-    body_error = usage.get("provider_error") if isinstance(usage.get("provider_error"), dict) else {}
+    body_error = usage.get("provider_error") if isinstance(usage, dict) and isinstance(usage.get("provider_error"), dict) else {}
     event_type, is_provider_glitch, permanent_body_error = _classify_empty_response(usage, msg)
     log_msg = _empty_response_log_msg(usage, is_provider_glitch)
     log.warning("%s, attempt %d/%d", log_msg, attempt + 1, transient_budget)

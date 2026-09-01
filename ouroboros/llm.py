@@ -1003,10 +1003,10 @@ class LLMClient:
         return applied
 
     def _pop_thread_disclosure(self, slot: str) -> Optional[Dict[str, Any]]:
-        """Take the pending disclosure staged in thread-local ``slot`` for THIS thread's
-        in-flight call, clearing it. Every staging site writes its slot before or at
-        send, so a popped note can never mis-attribute to a later, unrelated response
-        on this thread; an unclaimed note is discarded by the caller on a dead ladder."""
+        """Take and clear the disclosure staged in thread-local ``slot`` for THIS
+        thread's in-flight call. Clamp/cache slots stage before send; the
+        reasoning-pin slot stages on send SUCCESS and is discarded at ladder
+        entry, so an aborted ladder cannot leak a stale note into a later call."""
         tls = getattr(self, slot, None)
         pending = getattr(tls, "pending", None) if tls is not None else None
         if tls is not None:
@@ -2176,13 +2176,11 @@ class LLMClient:
         return self._pop_thread_disclosure("_cache_breakpoint_tls")
 
     def _stage_reasoning_pin_disclosure(self, candidate: Dict[str, Any]) -> None:
-        """Record whether the candidate JUST SENT carried the sealed-reasoning continuity
-        pin. Staged on send SUCCESS so the fact describes the TERMINAL sent candidate —
-        the recovery ladder can strip reasoning and drop the pin, and a build-time guess
-        would then disclose a pin that never reached the wire. Reports a pin only when the
-        wire provider block carries ``allow_fallbacks=false`` AND the sent transcript is
-        genuinely sealed: an owner ``repro`` policy pinning a portable transcript is the
-        owner's choice, not ours, and must not be laundered into our diagnosis."""
+        """Record whether the candidate JUST SENT carried the sealed-reasoning pin.
+        Staged on send SUCCESS so the fact describes the TERMINAL sent candidate (the
+        recovery ladder can strip and unpin). Reports a pin only when the wire carries
+        ``allow_fallbacks=false`` AND the transcript is genuinely sealed: an owner
+        ``repro`` pin on a portable transcript is never laundered into our diagnosis."""
         if not hasattr(self, "_reasoning_pin_tls"):
             self._reasoning_pin_tls = threading.local()
         extra_body = candidate.get("extra_body")
@@ -3701,6 +3699,7 @@ class LLMClient:
             usage.pop("response_finish_reason", None)
             usage.pop("response_provider", None)
             usage.pop("reasoning_pin", None)
+            usage.pop("provider_error", None)
         # An HTTP-200 that carried a provider body-error (OpenRouter passes
         # 429/5xx through the body) reaches here only when a same-model reroute
         # was unavailable or also errored. Surface it as a typed marker so the
@@ -3918,6 +3917,9 @@ class LLMClient:
         kwargs: Dict[str, Any],
         target: Dict[str, Any],
     ) -> Any:
+        # Discard a prior aborted ladder's staged pin note.
+        self._pop_thread_disclosure("_reasoning_pin_tls")
+
         def _send(candidate: Dict[str, Any]) -> Any:
             candidate = _physical_candidate(candidate)
             candidate = prepare_wire_payload_for_send(
@@ -4052,6 +4054,9 @@ class LLMClient:
         kwargs: Dict[str, Any],
         target: Dict[str, Any],
     ) -> Any:
+        # Discard a prior aborted ladder's staged pin note.
+        self._pop_thread_disclosure("_reasoning_pin_tls")
+
         async def _send(candidate: Dict[str, Any]) -> Any:
             candidate = _physical_candidate(candidate)
             candidate = prepare_wire_payload_for_send(

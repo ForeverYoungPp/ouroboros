@@ -47,7 +47,6 @@ from typing import Any, Iterable, List, Optional
 SIGNED_PORTABLE = ("anthropic/", "google/gemini-")
 
 _READABLE_DETAIL_TYPES = frozenset({"reasoning.text", "reasoning.summary"})
-_THINKING_BLOCK_TYPES = frozenset({"thinking", "reasoning"})
 
 
 def _roster_vouched(model: Any) -> bool:
@@ -56,14 +55,22 @@ def _roster_vouched(model: Any) -> bool:
 
 
 def _is_signed(value: Any) -> bool:
-    """A signature seals only when it is a NON-EMPTY string; ``None`` and ``""``
-    are how providers spell "unsigned" on an otherwise readable artifact."""
-    return isinstance(value, str) and bool(value.strip())
+    """Falsy values (``None``, ``""``, whitespace) are how providers spell
+    "unsigned" on a readable artifact. A truthy NON-STRING signature is a shape
+    we do not recognize and seals (fail-closed), like every other malformed
+    carrier here."""
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
 
 
 def _sealing_detail_label(details: Any) -> Optional[str]:
     if not isinstance(details, list):
-        # Present but malformed: we cannot read its shape, so we cannot vouch for it.
+        # TRUTHY non-list: an unreadable carrier that claims content — sealed.
+        # FALSY non-list (explicit null / "" / {} / 0): the common JSON idiom for
+        # "no reasoning at all" — not an artifact (sealing it would pin transcripts
+        # with zero reasoning, the response_id bug class; parity with the presence
+        # predicate's truthiness contract).
         return "reasoning_details_malformed" if details else None
     for entry in details:
         if not isinstance(entry, dict):

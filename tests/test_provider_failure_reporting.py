@@ -1289,3 +1289,85 @@ def test_successful_round_pops_the_retry_wall_marker(tmp_path):
     assert msg == {"content": "ok"}
     assert RETRY_WALL_EXHAUSTED_KEY not in accumulated
     assert "execution_status" not in accumulated
+
+
+def test_llm_usage_durable_row_carries_reasoning_pin(monkeypatch, tmp_path):
+    """The typed pin fact must reach the DURABLE llm_usage row in events.jsonl —
+    disclosure that survives only in observability blobs is not grep-able
+    (issue #468 triad finding). Mirrors the web_search_sources projection."""
+    import pathlib
+    from supervisor import events as sup_events
+
+    captured = {}
+    monkeypatch.setattr(sup_events, "append_jsonl", lambda path, row: captured.update(row))
+
+    class _Ctx:
+        RUNNING = {}
+        DRIVE_ROOT = pathlib.Path(str(tmp_path))
+
+        @staticmethod
+        def update_budget_from_usage(usage):
+            return None
+
+    pin = {"sealed": True, "artifact": "encrypted"}
+    evt = {"type": "llm_usage", "task_id": "t1",
+           "usage": {"prompt_tokens": 1, "reasoning_pin": pin}}
+    sup_events._handle_llm_usage(evt, _Ctx())
+    assert captured.get("reasoning_pin") == pin
+
+    # And absent stays absent — no null-noise on every unpinned row.
+    captured.clear()
+    sup_events._handle_llm_usage(
+        {"type": "llm_usage", "task_id": "t1", "usage": {"prompt_tokens": 1}}, _Ctx())
+    assert "reasoning_pin" not in captured
+
+
+def test_provider_error_usage_key_is_host_owned(monkeypatch):
+    """``usage.provider_error`` feeds retry classification and the durable
+    empty-response events, so a provider usage EXTENSION must not be able to
+    supply it: the host assigns it from the designated outer body-error shape
+    only (adversarial R1 finding — spoof-pop parity with response_provider)."""
+    from ouroboros.llm import LLMClient
+
+    client = LLMClient()
+    target = client._resolve_remote_target("deepseek/deepseek-v4-flash-0731")
+    resp = {
+        "id": "gen-1", "provider": "Real",
+        "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1,
+                  "provider_error": {"kind": "x" * 200, "code": "999"}},
+    }
+    _msg, usage = client._normalize_remote_response(resp, target, skip_cost_fetch=True)
+    assert "provider_error" not in usage
+
+
+def test_aborted_ladder_discards_staged_reasoning_pin(monkeypatch):
+    """A ladder that stages the pin fact and then ABORTS (no normalize ran) must
+    not leak that fact into a later unrelated call on the same thread
+    (adversarial R1/R2 finding: false honesty disclosure)."""
+    from ouroboros.llm import LLMClient
+
+    client = LLMClient()
+    monkeypatch.setattr(client, "_get_supported_parameters", lambda _m: None)
+    # Simulate the abort residue: a staged pin note nobody popped.
+    client._stage_reasoning_pin_disclosure({
+        "model": "z-ai/glm-4.6",
+        "extra_body": {"provider": {"allow_fallbacks": False}},
+        "messages": [{"role": "assistant",
+                      "reasoning_details": [{"type": "reasoning.encrypted", "data": "b"}]}],
+    })
+
+    target = client._resolve_remote_target("deepseek/deepseek-v4-flash-0731")
+    kwargs = client._build_remote_kwargs(
+        target, [{"role": "user", "content": "hi"}], "medium", 128, "auto", None, None)
+
+    class _Resp:
+        def model_dump(self):
+            return {"id": "gen-2", "provider": "Clean",
+                    "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1}}
+
+    resp = client._create_chat_completion_with_retries(lambda **_kw: _Resp(), kwargs, target)
+    _msg, usage = client._normalize_remote_response(
+        resp.model_dump(), target, skip_cost_fetch=True)
+    assert "reasoning_pin" not in usage
