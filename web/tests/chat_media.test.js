@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { createChatMedia, safeHttpUrl } from '../modules/chat_media.js';
 import { createRebuildBatch } from '../modules/chat_render_batch.js';
+
+const styleCss = await readFile(new URL('../style.css', import.meta.url), 'utf8');
 
 class Classes {
     constructor(node) { this.node = node; this.values = new Set(); }
@@ -435,6 +438,7 @@ test('throwing execCommand reports failure and removes the fallback textarea', a
         await button.click();
 
         assert.equal(button.textContent, '✗');
+        assert.equal(button.title, 'Copy failed');
         assert.equal(button.attributes.get('aria-label'), 'Copy failed');
         assert.equal(globalThis.document.body.querySelectorAll('.chat-copy-fallback').length, 0);
     } finally {
@@ -475,11 +479,25 @@ test('copy control is an always-visible icon button that marks the bubble (D12)'
 
         await button.click();
         assert.equal(button.textContent, '✓', 'success swaps the icon for a checkmark');
+        assert.equal(button.title, 'Message copied', 'title swaps in step with aria-label');
         assert.equal(button.attributes.get('aria-label'), 'Message copied');
     } finally {
         fx.controller.destroy();
         fx.restore();
     }
+});
+
+test('stylesheet pins the always-visible copy icon and the timestamp reserve (D12)', () => {
+    // (a) The copy control is anchored bottom-right and PERMANENTLY visible:
+    // a non-zero base opacity, never the old hover-reveal opacity 0.
+    assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*position:\s*absolute/);
+    assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*right:\s*\d+px/);
+    assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*bottom:\s*\d+px/);
+    assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*opacity:\s*0?\.\d+/);
+    assert.doesNotMatch(styleCss, /\.chat-message-copy\s*\{[^}]*opacity:\s*0\s*;/);
+    // (b) has-copy bubbles reserve a right gutter so the timestamp can never
+    // sit under the icon (the structural overlap fix).
+    assert.match(styleCss, /\.chat-bubble\.has-copy\s+\.msg-time\s*\{[^}]*margin-right:\s*\d+px/);
 });
 
 test('reset disposes listeners, stops players, clears groups, and destroy is final', () => {

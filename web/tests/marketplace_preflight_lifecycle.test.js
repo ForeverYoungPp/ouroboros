@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { lifecycleFor } from '../modules/marketplace.js';
+import { lifecycleFor, staleRepairSecondaryHtml } from '../modules/marketplace.js';
 
 // #335: a preflight-failed install must offer Repair in the marketplace
 // lifecycle, not a Re-review that deterministically fails the same way.
@@ -54,6 +54,27 @@ test('a stale recorded FAIL keeps Re-review primary with the recorded diagnosis 
     assert.equal(lifecycle.label, 'Review stale');
     assert.match(lifecycle.hint, /Last recorded preflight/);
     assert.match(lifecycle.hint, /missing or escaping entry: plugin\.py/);
+});
+
+test('stale-Repair secondary renders only while no lifecycle work is pending', () => {
+    const installed = installedWithPreflightFail();
+    installed.review_stale = true;
+    installed.review_gate = {
+        executable_review: false, preflight_failed: false, preflight_failed_stale: true,
+    };
+    // No pending lifecycle job -> the secondary Repair button renders.
+    const html = staleRepairSecondaryHtml('minecraft-widget', installed, null);
+    assert.match(html, /data-mp-action="fix"/);
+    assert.match(html, /data-slug="minecraft-widget"/);
+    assert.match(html, />Repair</);
+    assert.match(html, /based on the last recorded preflight/);
+    // A queued/running lifecycle job suppresses it (the primary's pending
+    // discipline): no concurrent repair while other work runs.
+    assert.equal(staleRepairSecondaryHtml('minecraft-widget', installed, { label: 'Working' }), '');
+    // Fresh FAIL or no recorded fact -> the secondary never renders.
+    const fresh = installedWithPreflightFail();
+    assert.equal(staleRepairSecondaryHtml('minecraft-widget', fresh, null), '');
+    assert.equal(staleRepairSecondaryHtml('minecraft-widget', null, null), '');
 });
 
 test('a stale review without a recorded FAIL keeps the generic stale branch', () => {

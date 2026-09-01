@@ -624,9 +624,11 @@ export function createChatMedia({
                 ok = false;
             }
             button.textContent = ok ? '✓' : '✗';
+            button.title = ok ? 'Message copied' : 'Copy failed';
             button.setAttribute('aria-label', ok ? 'Message copied' : 'Copy failed');
             later(() => {
                 button.innerHTML = COPY_ICON_SVG;
+                button.title = 'Copy';
                 button.setAttribute('aria-label', 'Copy message');
             }, 1500);
         });
