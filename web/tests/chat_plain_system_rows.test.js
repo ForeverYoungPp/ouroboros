@@ -10,8 +10,12 @@ import { readFileSync } from 'node:fs';
 
 import { createChatInstance } from '../modules/chat.js';
 
-const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-const styleSource = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
+// Source pins below match across line breaks; normalize CRLF so a Windows
+// checkout (core.autocrlf) reads the same bytes the regexes were written for.
+const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8')
+    .replace(/\r\n?/g, '\n');
+const styleSource = readFileSync(new URL('../style.css', import.meta.url), 'utf8')
+    .replace(/\r\n?/g, '\n');
 
 // --- DOM harness (same stub family as chat_instance_dom.test.js) ---
 
