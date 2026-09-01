@@ -435,7 +435,7 @@
     "id": "test_styles_cover_chat_header_controls_and_grouped_cards",
     "path": "web/style.css",
     "kind": "regex",
-    "value": "\\.chat-live-line-body\\s*\\{[^}]*font-size:\\s*\\d+px;"
+    "value": "\\.chat-live-line-body\\s*\\{[^}]*font-size:\\s*var\\(--type-body\\);"
   },
   {
     "id": "test_chat_only_polls_state_when_active",
