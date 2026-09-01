@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { classifyShellUrl, installDesktopShellLinkInterceptor } from '../modules/ui_helpers.js';
+import {
+    classifyShellUrl,
+    downloadViaHostBridge,
+    installDesktopShellLinkInterceptor,
+    openViaHostBridge,
+} from '../modules/ui_helpers.js';
 
 const BASE = 'http://127.0.0.1:8765/';
 
@@ -35,6 +40,11 @@ test('classifyShellUrl routes any other http(s) target to the external opener', 
     );
     // Different port on the loopback host is NOT the file bridge.
     assert.equal(classifyShellUrl('http://127.0.0.1:9999/api/files/download?path=a', BASE).kind, 'external');
+    // mailto: is a real chat-link surface and belongs to the OS default handler.
+    assert.deepEqual(
+        classifyShellUrl('mailto:owner@example.com', BASE),
+        { kind: 'external', url: 'mailto:owner@example.com' },
+    );
 });
 
 test('classifyShellUrl routes data:/blob: payloads to byte saving', () => {
@@ -44,7 +54,6 @@ test('classifyShellUrl routes data:/blob: payloads to byte saving', () => {
 
 test('classifyShellUrl leaves everything else to the default handler', () => {
     assert.equal(classifyShellUrl('', BASE).kind, 'default');
-    assert.equal(classifyShellUrl('mailto:owner@example.com', BASE).kind, 'default');
     assert.equal(classifyShellUrl('javascript:void(0)', BASE).kind, 'default');
     assert.equal(classifyShellUrl('#anchor', '').kind, 'default');
 });
@@ -164,7 +173,7 @@ test('the onboarding wizard document installs the shell interceptor (source pin)
 
 // --- click routing --------------------------------------------------------
 
-test('external link rides open_external_url and surfaces bridge refusals', async () => {
+test('external link rides open_external_url; a settled bridge failure degrades to copy-link', async () => {
     const external = [];
     let hx = makeHarness({ api: { open_external_url: async (url) => { external.push(url); return { ok: true }; } } });
     const event = await hx.click(makeAnchor({ href: 'https://example.com/docs', target: '_blank' }));
@@ -172,9 +181,20 @@ test('external link rides open_external_url and surfaces bridge refusals', async
     assert.deepEqual(external, ['https://example.com/docs']);
     assert.deepEqual(hx.calls.toasts, [], 'success is silent — the browser opening IS the feedback');
 
-    hx = makeHarness({ api: { open_external_url: async () => ({ ok: false, error: 'refused' }) } });
+    // {ok:false} = the host PROVED no browser could be launched: same honest
+    // hand-the-owner-the-link degradation as a launcher without the method.
+    hx = makeHarness({ api: { open_external_url: async () => ({ ok: false, error: 'no handler found' }) } });
     await hx.click(makeAnchor({ href: 'https://example.com/x', target: '_blank' }));
-    assert.match(hx.calls.toasts[0].message, /Could not open link: refused/);
+    assert.deepEqual(hx.calls.copied, ['https://example.com/x']);
+    assert.deepEqual(hx.calls.toasts, [{ message: 'Link copied — open it in your browser.', tone: 'info' }]);
+});
+
+test('mailto links route through the external opener like any OS-handled link', async () => {
+    const external = [];
+    const hx = makeHarness({ api: { open_external_url: async (url) => { external.push(url); return { ok: true }; } } });
+    const event = await hx.click(makeAnchor({ href: 'mailto:owner@example.com', target: '_blank' }));
+    assert.equal(event.defaultPrevented, true);
+    assert.deepEqual(external, ['mailto:owner@example.com']);
 });
 
 test('old launcher without open_external_url copies the link with an honest toast', async () => {
@@ -241,12 +261,14 @@ test('loopback artifact link opens via the host bridge; download attr downloads 
     assert.deepEqual(hx.calls.downloadFile, [['/api/files/download?path=logs/run.txt', 'run.txt']]);
 });
 
-test('without ANY file bridge method the file class keeps the native default (no loop)', async () => {
+test('without ANY file bridge method the file class degrades to copy-link (no loop, no silence)', async () => {
     const hx = makeHarness({ api: {} });
     const event = await hx.click(makeAnchor({ href: '/api/files/download?path=a.txt', target: '_blank' }));
-    assert.equal(event.defaultPrevented, false, 'default kept: helpers would fall back into the shim');
-    assert.deepEqual(hx.calls.openFile, []);
+    assert.equal(event.defaultPrevented, true, 'the dead native default is never left in place');
+    assert.deepEqual(hx.calls.openFile, [], 'helpers skipped: they would fall back into the shim');
     assert.deepEqual(hx.calls.downloadFile, []);
+    assert.deepEqual(hx.calls.copied, [`${BASE}api/files/download?path=a.txt`], 'copied as an absolute URL');
+    assert.deepEqual(hx.calls.toasts, [{ message: 'Link copied — open it in your browser.', tone: 'info' }]);
 });
 
 test('ordinary same-tab anchors and non-anchor clicks stay untouched', async () => {
@@ -276,13 +298,55 @@ test('window.open shim opens durable media via the file bridge and passes the re
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.deepEqual(hx.calls.openFile, [['/api/tasks/t-1/artifacts/chat-media-aa.png', 'chat-media-aa.png']]);
     // Unclassifiable targets keep the native behavior.
-    assert.equal(hx.win.open('mailto:o@example.com'), 'native-window');
+    assert.equal(hx.win.open('javascript:void(0)'), 'native-window');
     assert.equal(hx.calls.open.length, 1);
 });
 
-test('window.open shim keeps native default for file URLs on an ancient launcher', async () => {
+test('window.open shim degrades file URLs to copy-link on an ancient launcher', async () => {
     const hx = makeHarness({ api: {} });
-    assert.equal(hx.win.open('/api/files/download?path=a.txt', '_blank'), 'native-window');
-    assert.deepEqual(hx.calls.open, [['/api/files/download?path=a.txt', '_blank', undefined]]);
+    assert.equal(hx.win.open('/api/files/download?path=a.txt', '_blank'), null);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(hx.calls.open, [], 'the dead native open is not reached');
     assert.deepEqual(hx.calls.openFile, []);
+    assert.deepEqual(hx.calls.copied, [`${BASE}api/files/download?path=a.txt`]);
+    assert.deepEqual(hx.calls.toasts, [{ message: 'Link copied — open it in your browser.', tone: 'info' }]);
+});
+
+test('inside the framed wizard the file helpers reach the PARENT bridge (no window.open loop)', async () => {
+    const prior = globalThis.window;
+    try {
+        const opened = [];
+        const downloads = [];
+        const win = {
+            open: () => { throw new Error('window.open must never be reached with a live parent bridge'); },
+            parent: {
+                pywebview: { api: {
+                    open_file_with_default_app: async (url, name) => { opened.push([url, name]); return { ok: true }; },
+                    download_file_to_downloads: async (url, name, ext) => { downloads.push([url, name, ext]); return { ok: true }; },
+                } },
+            },
+        };
+        globalThis.window = win;
+        const openResult = await openViaHostBridge('/api/tasks/t/artifacts/chat-media-aa.png', 'a.png');
+        assert.deepEqual(openResult, { ok: true, native: true });
+        assert.deepEqual(opened, [['/api/tasks/t/artifacts/chat-media-aa.png', 'a.png']]);
+        const downloadResult = await downloadViaHostBridge('/api/files/download?path=x.txt', 'x.txt');
+        assert.deepEqual(downloadResult, { ok: true, native: true });
+        assert.deepEqual(downloads, [['/api/files/download?path=x.txt', 'x.txt', false]]);
+    } finally {
+        globalThis.window = prior;
+    }
+});
+
+test('the parent pywebviewready listener is released when the framed document unloads', () => {
+    const parentListeners = [];
+    const parent = { addEventListener(type, fn, options) { parentListeners.push({ type, fn, options }); } };
+    const hx = makeHarness({ pywebview: false, parent });
+    const armed = parentListeners.find((entry) => entry.type === 'pywebviewready');
+    assert.ok(armed, 'parent window armed for the bridge announcement');
+    assert.ok(armed.options?.signal, 'parent listener carries an abort signal (disposer rule)');
+    const pagehide = (hx.winListeners.pagehide || [])[0];
+    assert.ok(pagehide, 'the framed document arms its own unload disposer');
+    pagehide();
+    assert.equal(armed.options.signal.aborted, true, 'unloading the frame releases the parent listener');
 });

@@ -111,8 +111,12 @@ def test_desktop_bridge_exposes_external_open_and_byte_save():
 
     # New MainApi methods keep the established {ok, error} bridge shape.
     assert "def open_external_url(self, url: str) -> dict:" in launcher
-    assert 'raw.lower().startswith(("http://", "https://"))' in launcher
-    assert "_open_browser_detached(raw)" in launcher
+    assert 'raw.lower().startswith(("http://", "https://", "mailto:"))' in launcher
+    # Bounded join on the detached opener: a settled failure (False/exception
+    # recorded in the outcome list) is reported honestly; a still-running open
+    # keeps the detached semantics.
+    assert "_open_browser_detached(raw, outcome).join(timeout=3.0)" in launcher
+    assert "if outcome and outcome[0] is not True:" in launcher
     assert "def save_bytes_to_downloads(self, filename: str, b64: str) -> dict:" in launcher
     assert 'base64.b64decode(str(b64 or ""), validate=True)' in launcher
     # Byte saves reuse the shared ~/Downloads collision helper.
@@ -146,9 +150,40 @@ def test_desktop_bridge_version_skew_fallback_chain():
     assert "api?.open_file_with_default_app" in helper
     assert "api?.download_file_to_downloads" in helper
     assert "window.open(url, '_blank', 'noopener');" in helper
-    # Recursion guard: without ANY file bridge the interceptor must keep the
-    # native default instead of looping the helpers back into its own shim.
+    # Without ANY file bridge the interceptor degrades the file class to the
+    # copy-link fallback instead of looping the helpers back into its own shim.
     assert "fileBridgeReady" in helper
+    # Framed-wizard parity: the helpers resolve the bridge through the shared
+    # resolver (the bridge lives on the PARENT window inside the overlay iframe).
+    assert helper.count("shellBridgeApi(window)") == 2
+
+
+def test_open_browser_detached_records_outcome(monkeypatch):
+    """The detached opener reports its settled result through the outcome list:
+    ``webbrowser.open`` returning False and raising are both honest failures
+    the desktop bridge surfaces instead of a silent {ok: True}."""
+    import launcher
+
+    monkeypatch.setattr(launcher.webbrowser, "open", lambda url: True)
+    outcome: list = []
+    launcher._open_browser_detached("https://example.com", outcome).join(timeout=5)
+    assert outcome == [True]
+
+    monkeypatch.setattr(launcher.webbrowser, "open", lambda url: False)
+    outcome = []
+    launcher._open_browser_detached("https://example.com", outcome).join(timeout=5)
+    assert outcome == [False]
+
+    boom = RuntimeError("no browser association")
+    def _raise(url):
+        raise boom
+    monkeypatch.setattr(launcher.webbrowser, "open", _raise)
+    outcome = []
+    launcher._open_browser_detached("https://example.com", outcome).join(timeout=5)
+    assert outcome == [boom]
+
+    # Callers without an outcome list keep the fire-and-forget contract.
+    launcher._open_browser_detached("https://example.com").join(timeout=5)
 
 
 def test_files_confirm_dialog_results_are_normalized():

@@ -137,7 +137,10 @@ export function setInlineStatus(el, text, tone = 'muted') {
 }
 
 export async function openViaHostBridge(url, filename = 'file') {
-    const api = window.pywebview?.api;
+    // Resolved through the shared shell resolver: in the framed onboarding
+    // wizard the bridge lives on the PARENT window, and reading only our own
+    // window here would silently fall through to the dead window.open path.
+    const api = shellBridgeApi(window);
     const openBridge = api?.open_file_with_default_app;
     if (openBridge) {
         const result = await openBridge(url, filename);
@@ -164,7 +167,7 @@ export async function openViaHostBridge(url, filename = 'file') {
 }
 
 export async function downloadViaHostBridge(url, filename = 'download', { openExternal = false, fetchOptions = {} } = {}) {
-    const bridge = window.pywebview?.api?.download_file_to_downloads;
+    const bridge = shellBridgeApi(window)?.download_file_to_downloads;
     if (bridge) {
         const result = await bridge(url, filename, Boolean(openExternal));
         if (!result?.ok) throw new Error(result?.error || 'desktop download failed');
@@ -220,6 +223,9 @@ export function classifyShellUrl(rawUrl, baseHref = '') {
     const raw = String(rawUrl || '').trim();
     if (!raw) return { kind: 'default', url: '' };
     if (/^(data|blob):/i.test(raw)) return { kind: 'bytes', url: raw };
+    // mailto: is a real chat-link surface (utils.js safeExternalUrl allows it)
+    // and belongs to the OS default handler, exactly like an external page.
+    if (/^mailto:/i.test(raw)) return { kind: 'external', url: raw };
     let parsed;
     try { parsed = new URL(raw, baseHref || undefined); } catch { return { kind: 'default', url: raw }; }
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return { kind: 'default', url: raw };
@@ -303,23 +309,41 @@ async function copyShellLink(url, win, doc) {
     }
 }
 
+// With NO file-bridge method at all, openViaHostBridge/downloadViaHostBridge
+// fall back to window.open / anchor clicks — dead in the shell, and a re-entry
+// into the interceptor's own shim. routeShellUrl degrades that case to the
+// copy-link fallback instead of routing through the helpers.
+const fileBridgeReady = (api) => Boolean(api?.open_file_with_default_app || api?.download_file_to_downloads);
+
+function absoluteShellUrl(url, win) {
+    try { return new URL(url, win?.location?.href).href; } catch { return url; }
+}
+
+async function copyShellLinkWithToast(url, win, doc, toast) {
+    await copyShellLink(url, win, doc);
+    toast('Link copied — open it in your browser.', 'info');
+}
+
 async function routeShellUrl(kind, url, deps) {
     const { api, win, doc, toast, openFile, downloadFile, filename = '', wantsDownload = false } = deps;
     try {
         if (kind === 'file') {
+            if (!fileBridgeReady(api)) {
+                // Ancient launcher with no file bridge at all: window.open and
+                // anchor downloads are dead here, so hand the owner the link.
+                await copyShellLinkWithToast(absoluteShellUrl(url, win), win, doc, toast);
+                return;
+            }
             const name = filename || bridgeFilenameFromUrl(url);
             if (wantsDownload) await downloadFile(url, name);
             else await openFile(url, name);
         } else if (kind === 'external') {
-            if (api?.open_external_url) {
-                const result = await api.open_external_url(url);
-                if (!result?.ok) throw new Error(result?.error || 'open failed');
-            } else {
-                // Old packaged launcher without open_external_url: hand the
-                // owner the link instead of leaving a silently dead control.
-                await copyShellLink(url, win, doc);
-                toast('Link copied — open it in your browser.', 'info');
-            }
+            // Version-skew fallback (no open_external_url on an old packaged
+            // launcher) and an honest bridge failure ({ok:false}: no browser
+            // could be launched) degrade the same way: hand the owner the link
+            // instead of leaving a silently dead control.
+            const result = api?.open_external_url ? await api.open_external_url(url) : null;
+            if (!result?.ok) await copyShellLinkWithToast(url, win, doc, toast);
         } else if (kind === 'bytes') {
             if (!api?.save_bytes_to_downloads) {
                 toast("Saving isn't available in the app — open in a browser.", 'warn');
@@ -359,10 +383,6 @@ export function installDesktopShellLinkInterceptor({
         const deps = (extra) => ({
             api: shellBridgeApi(win), win, doc, toast, openFile, downloadFile, ...extra,
         });
-        // With NO file-bridge method at all, openViaHostBridge/downloadViaHostBridge
-        // fall back to window.open / anchor clicks — which would re-enter this
-        // interceptor. Keep the native default for that (ancient-launcher) case.
-        const fileBridgeReady = (api) => Boolean(api?.open_file_with_default_app || api?.download_file_to_downloads);
         doc.addEventListener('click', (event) => {
             const api = shellBridgeApi(win);
             if (!api || event.defaultPrevented) return;
@@ -371,7 +391,7 @@ export function installDesktopShellLinkInterceptor({
             const wantsDownload = anchor.hasAttribute('download');
             if (anchor.getAttribute('target') !== '_blank' && !wantsDownload) return;
             const { kind, url } = classifyShellUrl(anchor.getAttribute('href'), win.location?.href);
-            if (kind === 'default' || (kind === 'file' && !fileBridgeReady(api))) return;
+            if (kind === 'default') return;
             event.preventDefault();
             void routeShellUrl(kind, url, deps({
                 wantsDownload,
@@ -383,9 +403,7 @@ export function installDesktopShellLinkInterceptor({
             const { kind, url: routed } = api
                 ? classifyShellUrl(url, win.location?.href)
                 : { kind: 'default', url };
-            if (kind === 'default' || (kind === 'file' && !fileBridgeReady(api))) {
-                return nativeOpen(url, target, features);
-            }
+            if (kind === 'default') return nativeOpen(url, target, features);
             void routeShellUrl(kind, routed, deps({}));
             return null;
         };
@@ -398,8 +416,15 @@ export function installDesktopShellLinkInterceptor({
     // A framed document (the onboarding wizard) never receives pywebviewready
     // itself — the bridge announcement fires on the top-level window. The
     // frame is same-origin by contract; a cross-origin parent just no-ops.
+    // Disposer rule: in an ordinary browser that parent listener never fires,
+    // and it must not outlive the framed document — reopening the overlay
+    // would otherwise accumulate closures on the parent window.
     try {
-        if (win.parent && win.parent !== win) win.parent.addEventListener?.('pywebviewready', install, { once: true });
+        if (win.parent && win.parent !== win && typeof win.parent.addEventListener === 'function') {
+            const disposer = typeof AbortController === 'function' ? new AbortController() : null;
+            win.parent.addEventListener('pywebviewready', install, { once: true, signal: disposer?.signal });
+            if (disposer) win.addEventListener?.('pagehide', () => disposer.abort(), { once: true });
+        }
     } catch { /* not our shell */ }
 }
 
