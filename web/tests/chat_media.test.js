@@ -493,11 +493,12 @@ test('stylesheet pins the always-visible copy icon and the timestamp reserve (D1
     assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*position:\s*absolute/);
     assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*right:\s*\d+px/);
     assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*bottom:\s*\d+px/);
-    assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*opacity:\s*0?\.\d+/);
+    // The fractional part must carry a non-zero digit: 0.0 / .0 are invisible.
+    assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*opacity:\s*0?\.\d*[1-9]/);
     assert.doesNotMatch(styleCss, /\.chat-message-copy\s*\{[^}]*opacity:\s*0\s*;/);
     // (b) has-copy bubbles reserve a right gutter so the timestamp can never
-    // sit under the icon (the structural overlap fix).
-    assert.match(styleCss, /\.chat-bubble\.has-copy\s+\.msg-time\s*\{[^}]*margin-right:\s*\d+px/);
+    // sit under the icon (the structural overlap fix); 0px is no reserve.
+    assert.match(styleCss, /\.chat-bubble\.has-copy\s+\.msg-time\s*\{[^}]*margin-right:\s*[1-9]\d*px/);
 });
 
 test('reset disposes listeners, stops players, clears groups, and destroy is final', () => {
