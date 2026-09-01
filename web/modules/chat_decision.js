@@ -236,7 +236,10 @@ export function createChatDecision({
         }
 
         let commentField = null;
-        const commentText = () => String((commentField && commentField.value) || '').trim();
+        // The raw field value is the answer (VERBATIM to the model); the
+        // trimmed view only decides whether there IS one.
+        const commentText = () => String((commentField && commentField.value) || '');
+        const commentPresent = () => commentText().trim().length > 0;
 
         const optionsBox = document.createElement('div');
         optionsBox.className = 'chat-quiz-options';
@@ -283,7 +286,7 @@ export function createChatDecision({
             send.disabled = true;
             const syncSend = () => {
                 const text = commentText();
-                const enabled = Boolean(text) && text.length <= MAX_DECISION_COMMENT;
+                const enabled = commentPresent() && text.length <= MAX_DECISION_COMMENT;
                 if (send.disabled === !enabled) return;
                 send.disabled = !enabled;
             };
@@ -291,7 +294,7 @@ export function createChatDecision({
             send.addEventListener('click', () => {
                 if (card.dataset.state !== 'open') return;
                 const text = commentText();
-                if (!text) return;
+                if (!commentPresent()) return;
                 if (text.length > MAX_DECISION_COMMENT) {
                     // The ingress refuses it rather than truncating the
                     // owner's words — say so here instead of sending.

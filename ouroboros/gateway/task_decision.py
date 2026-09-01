@@ -138,7 +138,9 @@ async def api_decision_answer(request: Request) -> JSONResponse:
     raw_comment = body.get("comment")
     if raw_comment is not None and not isinstance(raw_comment, str):
         return json_error("comment must be a string", 400, reason_code="comment_invalid")
-    comment = (raw_comment or "").strip()
+    # VERBATIM: the owner's exact characters, edges included, reach the
+    # projection and the frame — the only transformations are validation.
+    comment = raw_comment or ""
     if len(comment) > _COMMENT_MAX:
         # VERBATIM contract: the frame signs the comment as the owner's exact
         # words — refuse instead of silently truncating them.
@@ -179,7 +181,7 @@ async def api_decision_answer(request: Request) -> JSONResponse:
         # rejected every offered option and wrote their own answer, which the
         # comment carries verbatim. The routing family has no such verb — its
         # option IS the destination — so it keeps the integer requirement.
-        if family != "quiz" or not comment:
+        if family != "quiz" or not comment.strip():
             return json_error(
                 "option_index is required (a quiz answer may instead carry a "
                 "non-empty comment as the owner's own answer)",

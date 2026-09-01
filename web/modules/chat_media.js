@@ -441,8 +441,19 @@ export function createChatMedia({
 
     function wirePhotoActions(item, source, sourceRef, filename, mime) {
         const action = (name) => item.querySelector(`[data-photo-action="${name}"]`);
-        listen(item.querySelector('.chat-photo'), 'click', () => window.open(source, '_blank', 'noopener'));
-        listen(action('open'), 'click', () => window.open(source, '_blank', 'noopener'));
+        // A durable photo rides the host-bridge helper with BOTH addresses
+        // (bridge form for the launcher gate, canonical for browsers); a data:
+        // display keeps window.open, whose shell interceptor saves the bytes.
+        const openPhoto = () => {
+            if (sourceRef.durable) {
+                openViaHostBridge(sourceRef.bridge || sourceRef.durable, filename, { browserUrl: sourceRef.durable })
+                    .catch((error) => showToast(`Could not open image: ${error?.message || error}`, 'error'));
+                return;
+            }
+            window.open(source, '_blank', 'noopener');
+        };
+        listen(item.querySelector('.chat-photo'), 'click', openPhoto);
+        listen(action('open'), 'click', openPhoto);
         listen(action('download'), 'click', async () => {
             try { await downloadSource(sourceRef, filename, mime); }
             catch (error) { showToast(`Could not download image: ${error?.message || error}`, 'error'); }

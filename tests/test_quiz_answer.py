@@ -573,6 +573,17 @@ def test_replay_keeps_the_recorded_comment(tmp_path, monkeypatch):
     assert replay.json()["comment"] == "recorded note"
 
 
+def test_comment_edges_survive_verbatim(tmp_path, monkeypatch):
+    """The frame signs the comment as the owner's exact words: leading and
+    trailing whitespace is part of the answer, not transport noise."""
+    record_asked(tmp_path, "task-1", quiz_id="q1", question="?", options=["A", "B"])
+    app = _decision_app(tmp_path, monkeypatch, live_task={"id": "task-1"})
+    resp = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1",
+                       "option_index": 0, "comment": "  edges kept  "})
+    assert resp.status_code == 200
+    assert resp.json()["comment"] == "  edges kept  "
+
+
 def test_comment_is_verbatim_or_refused(tmp_path, monkeypatch):
     record_asked(tmp_path, "task-1", quiz_id="q1", question="?", options=["A", "B"])
     app = _decision_app(tmp_path, monkeypatch, live_task={"id": "task-1"})

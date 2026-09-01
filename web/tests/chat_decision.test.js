@@ -354,7 +354,8 @@ test('the send button answers WITHOUT an option_index', async () => {
         assert.equal(fx.calls.length, 1);
         const body = JSON.parse(fx.calls[0].init.body);
         assert.equal('option_index' in body, false, 'no option was taken — the key must be absent');
-        assert.equal(body.comment, 'neither — do C');
+        // VERBATIM: the owner's exact characters, edges included.
+        assert.equal(body.comment, '  neither — do C  ');
         assert.equal(card.dataset.state, 'answered');
         // No option is highlighted: the owner chose none of them.
         assert.ok(card.querySelectorAll('.chat-quiz-option').every((btn) => !btn.classList.contains('chosen')));

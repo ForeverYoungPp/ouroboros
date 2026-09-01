@@ -144,9 +144,11 @@ export function setInlineStatus(el, text, tone = 'muted') {
  * no-bridge-at-all path already uses. The refusal is rethrown only when even
  * copying fails, so the caller's own error toast still gets its turn.
  */
-async function bridgeRefusalFallback(url, error) {
+async function bridgeRefusalFallback(url, error, browserUrl = '') {
     try {
-        await copyShellLinkWithToast(absoluteShellUrl(url, window), window, document, showToast);
+        // Copy the canonical address when the caller carries both: the compat
+        // form tracks the CURRENT file-browser root and may already dangle.
+        await copyShellLinkWithToast(absoluteShellUrl(browserUrl || url, window), window, document, showToast);
     } catch {
         throw error;
     }
@@ -161,7 +163,7 @@ export async function openViaHostBridge(url, filename = 'file', { browserUrl = '
     const openBridge = api?.open_file_with_default_app;
     if (openBridge) {
         const result = await openBridge(url, filename);
-        if (!result?.ok) return bridgeRefusalFallback(url, new Error(result?.error || 'open failed'));
+        if (!result?.ok) return bridgeRefusalFallback(url, new Error(result?.error || 'open failed'), browserUrl);
         return { ...result, native: true };
     }
     // Version-skew fallback: the served frontend auto-updates via the managed
@@ -174,7 +176,7 @@ export async function openViaHostBridge(url, filename = 'file', { browserUrl = '
     const downloadBridge = api?.download_file_to_downloads;
     if (downloadBridge) {
         const result = await downloadBridge(url, filename, true);
-        if (!result?.ok) return bridgeRefusalFallback(url, new Error(result?.error || 'open failed'));
+        if (!result?.ok) return bridgeRefusalFallback(url, new Error(result?.error || 'open failed'), browserUrl);
         return { ...result, native: true };
     }
     // True web / non-desktop: open in a new tab. This never navigates the app
@@ -190,7 +192,7 @@ export async function downloadViaHostBridge(url, filename = 'download', { openEx
     if (bridge) {
         const result = await bridge(url, filename, Boolean(openExternal));
         if (!result?.ok) {
-            return bridgeRefusalFallback(url, new Error(result?.error || 'desktop download failed'));
+            return bridgeRefusalFallback(url, new Error(result?.error || 'desktop download failed'), browserUrl);
         }
         return { ...result, native: true };
     }
