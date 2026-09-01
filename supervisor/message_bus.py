@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import logging
 import queue
-import re
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -345,13 +344,17 @@ class LocalChatBridge:
         skill event — so it can never be rendered as Ouroboros's own speech
         (Q4 non-mimicry). Absent = the historical assistant framing.
         """
-        clean_text = _strip_markdown(text) if not parse_mode else text
+        # Text rides VERBATIM end to end: the live frame carries the same
+        # bytes as the durable chat.jsonl row, and plain-vs-rich presentation
+        # is the client's decision via the ``markdown`` flag (system rows
+        # without it render escaped). The old best-effort strip here predated
+        # that client contract and only made live diverge from history replay.
         message_ts = ts or utc_now_iso()
         transport = dict(self._chat_transports.get(int(chat_id or 0), {}) or {})
         meta = dict(progress_meta or {})
         msg = {
             "type": "text",
-            "content": clean_text,
+            "content": text,
             "markdown": bool(parse_mode),
             "is_progress": bool(is_progress),
             "ts": message_ts,
@@ -364,14 +367,14 @@ class LocalChatBridge:
                     if cid == chat_id and not is_progress]
         for sid, cb in subs:
             try:
-                cb(clean_text)
+                cb(text)
             except Exception:
                 log.debug("A2A response callback error for sub %s", sid, exc_info=True)
         if self._broadcast_fn and not is_a2a_chat_id(chat_id):
             payload = {
                 "type": "chat",
                 "role": str(role or "") or "assistant",
-                "content": clean_text,
+                "content": text,
                 "markdown": bool(parse_mode),
                 "is_progress": bool(is_progress),
                 "ts": message_ts,
@@ -390,7 +393,7 @@ class LocalChatBridge:
         if not is_a2a_chat_id(chat_id):
             event = {
                 "chat_id": int(chat_id or 0),
-                "text": clean_text,
+                "text": text,
                 "markdown": bool(parse_mode),
                 "is_progress": bool(is_progress),
                 "ts": message_ts,
@@ -931,23 +934,6 @@ class LocalChatBridge:
             task_metadata=task_metadata,
         )
 
-
-
-def _strip_markdown(text: str) -> str:
-    """Best-effort markdown-to-plain-text fallback."""
-    text = re.sub(r"```[^\n]*\n([\s\S]*?)```", r"\1", text)
-    text = re.sub(r"`([^`]+)`", r"\1", text)
-    text = re.sub(r"\*\*\*(.+?)\*\*\*", r"\1", text)
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text)
-    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)
-    text = re.sub(r"~~(.+?)~~", r"\1", text)
-    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^[\*\-]\s+", "• ", text, flags=re.MULTILINE)
-    text = text.replace("**", "").replace("__", "").replace("~~", "")
-    text = text.replace("`", "")
-    return text
 
 
 def _send_markdown(

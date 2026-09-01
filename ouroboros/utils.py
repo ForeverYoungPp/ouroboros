@@ -727,6 +727,32 @@ def short(s: Any, n: int = 120) -> str:
     return t[:n] + "..." if len(t) > n else t
 
 
+def strip_markdown(text: str) -> str:
+    """Best-effort markdown-to-plain-text projection.
+
+    Shared SSOT for every plain-text projection of markdown-shaped output: the
+    Project lifecycle excerpt producer and the read-side normalization of old
+    persisted lifecycle rows. Live chat delivery does NOT strip — text rides
+    verbatim and plain rendering is the client's decision (system rows without
+    ``markdown: true``). Line-anchored patterns (headings, list bullets) only
+    match while newlines still exist, so callers must strip BEFORE flattening
+    whitespace.
+    """
+    text = _re.sub(r"```[^\n]*\n([\s\S]*?)```", r"\1", text)
+    text = _re.sub(r"`([^`]+)`", r"\1", text)
+    text = _re.sub(r"\*\*\*(.+?)\*\*\*", r"\1", text)
+    text = _re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = _re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text)
+    text = _re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)
+    text = _re.sub(r"~~(.+?)~~", r"\1", text)
+    text = _re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = _re.sub(r"^#{1,6}\s+", "", text, flags=_re.MULTILINE)
+    text = _re.sub(r"^[\*\-]\s+", "• ", text, flags=_re.MULTILINE)
+    text = text.replace("**", "").replace("__", "").replace("~~", "")
+    text = text.replace("`", "")
+    return text
+
+
 def estimate_tokens(text: str) -> int:
     """Rough token estimate (chars/4 heuristic)."""
     return max(1, (len(str(text or "")) + 3) // 4)

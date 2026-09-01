@@ -54,6 +54,24 @@ function formatDuration(seconds) {
         : `${minutes}:${String(secs).padStart(2, '0')}`;
 }
 
+// Toast dedupe for task incident frames (moved from chat.js, byte-ratchet
+// extraction; the module-level set is deliberately shared across chat
+// instances so a Main and a Project panel never double-toast one incident).
+const shownIncidentToastKeys = new Set();
+
+export function showTaskIncidentToast(msg) {
+    const incident = String(msg?.task_incident || '').trim();
+    if (!incident) return;
+    const key = String(msg?.toast_once || `${msg?.task_id || ''}:${incident}`).trim();
+    if (!key || shownIncidentToastKeys.has(key)) return;
+    shownIncidentToastKeys.add(key);
+    if (shownIncidentToastKeys.size > 500) {
+        const oldest = shownIncidentToastKeys.values().next().value;
+        shownIncidentToastKeys.delete(oldest);
+    }
+    showToast(String(msg?.content || msg?.text || incident), 'error');
+}
+
 export function safeHttpUrl(value) {
     // safeExternalHrefAttr returns escaped markup; chat needs a raw URL before its own attribute escaping.
     const raw = String(value || '').trim();
