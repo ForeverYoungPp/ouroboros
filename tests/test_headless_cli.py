@@ -1577,53 +1577,108 @@ def test_workspace_patch_manifest_excludes_env_cache_dirs(tmp_path):
     assert any(item["kind"] == "workspace_patch_manifest" for item in artifacts)
 
 
-def test_workspace_patch_fails_on_sensitive_untracked_file(tmp_path):
+def test_workspace_patch_excludes_sensitive_untracked_file_but_keeps_tracked_diff(tmp_path):
+    """One credential-shaped untracked NAME must not annihilate the whole patch:
+    the file is a disclosed per-file exclusion, the tracked diff survives (#447)."""
     repo = tmp_path / "repo"
     _init_repo_with_file(repo)
+    (repo / "tracked.txt").write_text("new\n", encoding="utf-8")
     (repo / ".npmrc").write_text("//registry.npmjs.org/:_authToken=secret\n", encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
 
-    artifacts, manifest = write_workspace_patch_artifacts(repo, tmp_path / "artifacts", task={})
+    artifacts, manifest = write_workspace_patch_artifacts(repo, artifact_dir, task={})
 
-    assert manifest["status"] == ARTIFACT_STATUS_FAILED
-    assert manifest["errors"][0]["type"] == "sensitive_untracked_files"
+    assert manifest["status"] == ARTIFACT_STATUS_READY_WITH_CHANGES
+    assert manifest["errors"] == []
     assert manifest["sensitive_blocked"][0]["path"] == ".npmrc"
-    assert not any(item["kind"] == "workspace_patch" for item in artifacts)
+    assert any(item["kind"] == "workspace_patch" for item in artifacts)
+    patch_text = (artifact_dir / "workspace.patch").read_text(encoding="utf-8")
+    assert "tracked.txt" in patch_text
+    assert "_authToken" not in patch_text
 
 
-def test_workspace_patch_fails_on_sensitive_untracked_file_inside_excluded_dir(tmp_path):
+def test_workspace_patch_excludes_public_pem_and_disclosed_keeps_tracked_work(tmp_path):
     repo = tmp_path / "repo"
     _init_repo_with_file(repo)
+    (repo / "tracked.txt").write_text("new\n", encoding="utf-8")
+    (repo / "public.pem").write_text("-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n", encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+
+    artifacts, manifest = write_workspace_patch_artifacts(repo, artifact_dir, task={})
+
+    assert manifest["status"] == ARTIFACT_STATUS_READY_WITH_CHANGES
+    assert manifest["sensitive_blocked"] == [
+        {"path": "public.pem", "reason": "private key or certificate"}
+    ]
+    assert any(item["kind"] == "workspace_patch" for item in artifacts)
+    patch_text = (artifact_dir / "workspace.patch").read_text(encoding="utf-8")
+    assert "tracked.txt" in patch_text
+    assert "public.pem" not in patch_text
+
+
+def test_workspace_patch_excludes_private_key_material_by_content(tmp_path):
+    """An innocently NAMED file whose bytes carry a PEM private-key header is
+    excluded on content evidence; the tracked diff still survives (#447)."""
+    repo = tmp_path / "repo"
+    _init_repo_with_file(repo)
+    (repo / "tracked.txt").write_text("new\n", encoding="utf-8")
+    (repo / "notes.txt").write_text(
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n",
+        encoding="utf-8",
+    )
+    artifact_dir = tmp_path / "artifacts"
+
+    artifacts, manifest = write_workspace_patch_artifacts(repo, artifact_dir, task={})
+
+    assert manifest["status"] == ARTIFACT_STATUS_READY_WITH_CHANGES
+    assert {item["path"]: item["reason"] for item in manifest["untracked_excluded"]} == {
+        "notes.txt": "private key material (PEM private-key header)"
+    }
+    assert any(item["kind"] == "workspace_patch" for item in artifacts)
+    patch_text = (artifact_dir / "workspace.patch").read_text(encoding="utf-8")
+    assert "tracked.txt" in patch_text
+    assert "PRIVATE KEY" not in patch_text
+
+
+def test_workspace_patch_excludes_sensitive_untracked_file_inside_excluded_dir(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo_with_file(repo)
+    (repo / "tracked.txt").write_text("new\n", encoding="utf-8")
     secret = repo / "node_modules" / "pkg" / "service-account.json"
     secret.parent.mkdir(parents=True)
     secret.write_text("TOKEN=secret\n", encoding="utf-8")
 
     artifacts, manifest = write_workspace_patch_artifacts(repo, tmp_path / "artifacts", task={})
 
-    assert manifest["status"] == ARTIFACT_STATUS_FAILED
+    assert manifest["status"] == ARTIFACT_STATUS_READY_WITH_CHANGES
     assert manifest["counts"]["sensitive_blocked"] == 1
     assert manifest["sensitive_blocked"][0]["path"] == "node_modules/pkg/service-account.json"
-    assert not any(item["kind"] == "workspace_patch" for item in artifacts)
+    assert any(item["kind"] == "workspace_patch" for item in artifacts)
 
 
-def test_workspace_patch_fails_on_common_credential_paths(tmp_path):
+def test_workspace_patch_excludes_common_credential_paths_but_still_produces_patch(tmp_path):
     repo = tmp_path / "repo"
     _init_repo_with_file(repo)
+    (repo / "tracked.txt").write_text("new\n", encoding="utf-8")
     (repo / "credentials").write_text("secret\n", encoding="utf-8")
     (repo / "prod.env").write_text("SECRET=1\n", encoding="utf-8")
     (repo / "settings.env.local").write_text("SECRET=1\n", encoding="utf-8")
     (repo / ".aws").mkdir()
     (repo / ".aws" / "credentials").write_text("secret\n", encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
 
-    artifacts, manifest = write_workspace_patch_artifacts(repo, tmp_path / "artifacts", task={})
+    artifacts, manifest = write_workspace_patch_artifacts(repo, artifact_dir, task={})
 
-    assert manifest["status"] == ARTIFACT_STATUS_FAILED
+    assert manifest["status"] == ARTIFACT_STATUS_READY_WITH_CHANGES
     assert {item["path"] for item in manifest["sensitive_blocked"]} == {
         "credentials",
         "prod.env",
         "settings.env.local",
         ".aws/credentials",
     }
-    assert not any(item["kind"] == "workspace_patch" for item in artifacts)
+    assert any(item["kind"] == "workspace_patch" for item in artifacts)
+    patch_text = (artifact_dir / "workspace.patch").read_text(encoding="utf-8")
+    assert "SECRET" not in patch_text
 
 
 def test_workspace_patch_allows_benign_tokenizer_json(tmp_path):
@@ -1650,7 +1705,10 @@ def test_failed_refinalization_drops_stale_workspace_patch_metadata(tmp_path):
     result = json.loads((parent / "task_results" / "task-stale.json").read_text(encoding="utf-8"))
     assert any(item.get("kind") == "workspace_patch" for item in result["artifacts"])
 
-    (repo / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+    # A sensitive-shaped file no longer fails the patch (#447); break the HEAD
+    # ref instead to force a genuinely FAILED refinalization.
+    head_ref = subprocess.run(["git", "symbolic-ref", "--quiet", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    (repo / ".git" / head_ref).unlink()
     finalize_task_artifacts(parent, task)
 
     result = json.loads((parent / "task_results" / "task-stale.json").read_text(encoding="utf-8"))
