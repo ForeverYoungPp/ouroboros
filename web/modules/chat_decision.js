@@ -71,9 +71,6 @@ export function createChatDecision({
         if (card.dataset.pending === '1') return;
         card.dataset.pending = '1';
         const text = String(comment || '');
-        // Remembered for settlement: the card renders the owner's answer from
-        // here, so a fresh answer reads exactly like a replayed one.
-        if (text) card.dataset.ownerComment = text;
         // STABLE per-card idempotency key: a retry after a transient failure
         // must replay the SAME request, or the server-side first-wins latch
         // reads the retry as a competing second answer.
@@ -96,9 +93,17 @@ export function createChatDecision({
             let body = null;
             try { body = res && res.json ? await res.json() : null; } catch (parseErr) { body = null; }
             if (res && res.ok) {
+                // The confirmation is the display truth: a same-request_id
+                // retry may have carried a different payload, and the server
+                // answers with what was actually RECORDED — index absent for a
+                // free answer, comment as stored. Never render this attempt's
+                // own click over it.
                 const answered = body && Number.isInteger(body.answered_index)
                     ? body.answered_index
-                    : (Number.isInteger(index) ? index : null);
+                    : (body && body.duplicate ? null : (Number.isInteger(index) ? index : null));
+                const recorded = body && typeof body.comment === 'string' ? body.comment : text;
+                if (recorded) card.dataset.ownerComment = recorded;
+                else delete card.dataset.ownerComment;
                 setCardState(card, 'answered', answered);
                 return;
             }
@@ -108,6 +113,10 @@ export function createChatDecision({
                 // an already-answered quiz settles as answered (with the
                 // winning option when known), never as a false expiry.
                 const answered = Number.isInteger(body.answered_index) ? body.answered_index : null;
+                // The 409 loser learns the WINNING answer, comment included —
+                // the local draft must not survive as the displayed record.
+                if (typeof body.comment === 'string' && body.comment) card.dataset.ownerComment = body.comment;
+                else delete card.dataset.ownerComment;
                 setCardState(card, body.state, answered);
                 showToast(body.state === 'answered'
                     ? 'Already answered.' : 'This question is no longer open.', 'error');

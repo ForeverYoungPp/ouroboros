@@ -542,3 +542,37 @@ test('more than eight options hide behind a show-all control', () => {
         assert.equal(card.querySelector('.chat-quiz-more'), null);
     } finally { fx.restore(); }
 });
+
+test('a duplicate confirmation renders the recorded free answer, not the retried click', async () => {
+    const fx = fixture({ fetchImpl: async () => ({
+        ok: true, status: 200,
+        json: async () => ({ ok: true, state: 'answered', duplicate: true, comment: 'my own plan' }),
+    }) });
+    try {
+        const card = fx.decision.buildQuizCard(WS_MSG);
+        const area = card.querySelector('.chat-quiz-comment');
+        area.value = 'rewritten retry';
+        card.querySelectorAll('.chat-quiz-option')[1].click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(card.dataset.state, 'answered');
+        assert.equal(card.dataset.ownerComment, 'my own plan');
+        // No option is fabricated for a recorded free answer.
+        assert.ok(!card.querySelectorAll('.chat-quiz-option')[1].classList.contains('chosen'));
+    } finally { fx.restore(); }
+});
+
+test('a 409 loser adopts the winning comment over its local draft', async () => {
+    const fx = fixture({ fetchImpl: async () => ({
+        ok: false, status: 409,
+        json: async () => ({ ok: false, error: 'quiz_closed', state: 'answered', answered_index: 0, comment: 'winning note' }),
+    }) });
+    try {
+        const card = fx.decision.buildQuizCard(WS_MSG);
+        const area = card.querySelector('.chat-quiz-comment');
+        area.value = 'losing draft';
+        card.querySelectorAll('.chat-quiz-option')[1].click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(card.dataset.state, 'answered');
+        assert.equal(card.dataset.ownerComment, 'winning note');
+    } finally { fx.restore(); }
+});

@@ -483,3 +483,32 @@ test('the agent login card never writes to the clipboard without a fallback', ()
     assert.equal(source.includes('navigator.clipboard'), false);
     assert.equal((source.match(/copyTextWithToast\(/g) || []).length, 3);
 });
+
+test('without a bridge the download fetches the canonical URL, not the compat form', async () => {
+    // downloadViaHostBridge reads the real module globals: give it a bridgeless
+    // window, a stub DOM, and a recording fetch.
+    const priorWindow = globalThis.window;
+    const priorDocument = globalThis.document;
+    const priorFetch = globalThis.fetch;
+    const priorURL = globalThis.URL;
+    const fetched = [];
+    globalThis.window = { location: { href: BASE } };
+    globalThis.document = {
+        createElement: () => ({ click() {}, remove() {}, setAttribute() {} }),
+        body: { appendChild() {} },
+    };
+    globalThis.fetch = async (url) => { fetched.push(String(url)); return { ok: true, blob: async () => ({}) }; };
+    globalThis.URL = Object.assign(function URLStub(u) { return new priorURL(u, BASE); }, priorURL, {
+        createObjectURL: () => 'blob:stub', revokeObjectURL: () => {},
+    });
+    try {
+        await downloadViaHostBridge('/api/files/download?path=x.png', 'x.png', { browserUrl: '/api/tasks/t/artifacts/chat-media-aa.png' });
+        assert.equal(fetched.length, 1);
+        assert.ok(fetched[0].includes('/api/tasks/t/artifacts/chat-media-aa.png'), fetched[0]);
+    } finally {
+        globalThis.window = priorWindow;
+        globalThis.document = priorDocument;
+        globalThis.fetch = priorFetch;
+        globalThis.URL = priorURL;
+    }
+});

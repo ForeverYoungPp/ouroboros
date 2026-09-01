@@ -153,7 +153,7 @@ async function bridgeRefusalFallback(url, error) {
     return { ok: false, native: false, degraded: 'copy-link' };
 }
 
-export async function openViaHostBridge(url, filename = 'file') {
+export async function openViaHostBridge(url, filename = 'file', { browserUrl = '' } = {}) {
     // Resolved through the shared shell resolver: in the framed onboarding
     // wizard the bridge lives on the PARENT window, and reading only our own
     // window here would silently fall through to the dead window.open path.
@@ -179,11 +179,13 @@ export async function openViaHostBridge(url, filename = 'file') {
     }
     // True web / non-desktop: open in a new tab. This never navigates the app
     // itself; the browser previews (e.g. PDF) or downloads per its own handling.
-    window.open(url, '_blank', 'noopener');
+    // A launcher-gate compat address is bridge-only — the browser gets the
+    // canonical URL when the caller carries both.
+    window.open(browserUrl || url, '_blank', 'noopener');
     return { ok: true, native: false };
 }
 
-export async function downloadViaHostBridge(url, filename = 'download', { openExternal = false, fetchOptions = {} } = {}) {
+export async function downloadViaHostBridge(url, filename = 'download', { openExternal = false, fetchOptions = {}, browserUrl = '' } = {}) {
     const bridge = shellBridgeApi(window)?.download_file_to_downloads;
     if (bridge) {
         const result = await bridge(url, filename, Boolean(openExternal));
@@ -192,7 +194,10 @@ export async function downloadViaHostBridge(url, filename = 'download', { openEx
         }
         return { ...result, native: true };
     }
-    const resp = await apiFetch(url, fetchOptions);
+    // Browser fallback fetches the canonical address when the caller carries
+    // both: the compat form depends on the CURRENT file-browser root and may
+    // dangle after the owner re-roots it, while the artifact URL stays valid.
+    const resp = await apiFetch(browserUrl || url, fetchOptions);
     if (!resp.ok) throw new Error(`download failed: HTTP ${resp.status}`);
     const blobUrl = URL.createObjectURL(await resp.blob());
     const link = document.createElement('a');

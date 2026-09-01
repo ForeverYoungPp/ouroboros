@@ -253,7 +253,7 @@ export function createChatMedia({
 
     async function downloadSource(source, filename, mime) {
         if (source.durable) {
-            await downloadViaHostBridge(source.bridge || source.durable, filename);
+            await downloadViaHostBridge(source.bridge || source.durable, filename, { browserUrl: source.durable });
             return;
         }
         downloadBlob(await sourceBlob(source, mime), filename);
@@ -286,6 +286,7 @@ export function createChatMedia({
                 await openViaHostBridge(
                     dialogFile.source.bridge || dialogFile.source.durable,
                     dialogFile.filename,
+                    { browserUrl: dialogFile.source.durable },
                 );
                 close();
             } catch (error) {
