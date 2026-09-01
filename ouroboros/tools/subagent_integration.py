@@ -423,7 +423,7 @@ def _maybe_coop_noop_verdict(
         f"coop tree {target} (verified read-only against its patch; nothing to apply). "
         f"The tree is checkpoint-committed by the host when this task tree finalizes. "
         f"Touched files: {', '.join(touched[:10]) or '(none listed)'}. "
-        f"Verdict: {verdict_path or '(unwritten)'}.{disposition_warning}"
+        f"Verdict: {verdict_path or '(unwritten)'}.{_format_patch_exclusions(manifest)}{disposition_warning}"
     )
 
 
@@ -1341,6 +1341,7 @@ def _integrate_delegated_patch(
                 "was reversed — your tree is back to its pre-apply state and NOTHING is "
                 "left half-applied. The snapshot and the patch are preserved; fix the "
                 f"index problem, then call this tool again. Verdict: {verdict_path or '(unwritten)'}."
+                f"{_format_patch_exclusions(manifest)}"
             )
         recorded, _ = _dispose("applied", cleanup=False)
         tail = "" if recorded else (
@@ -1354,7 +1355,7 @@ def _integrate_delegated_patch(
             "changes are already in your working tree and a second apply would double "
             "them. Inspect with vcs_diff, stage what you accept yourself, and note that "
             "the run is recorded as applied. Its execution snapshot is preserved for "
-            f"comparison. Verdict: {verdict_path or '(unwritten)'}.{tail}"
+            f"comparison. Verdict: {verdict_path or '(unwritten)'}.{_format_patch_exclusions(manifest)}{tail}"
         )
 
     if proc.returncode != 0:
@@ -1489,7 +1490,11 @@ def _format_patch_exclusions(manifest) -> str:
     if not entries:
         return ""
     shown = "; ".join(entries[:8])
-    more = f" and {len(entries) - 8} more" if len(entries) > 8 else ""
+    more = (
+        f" and {len(entries) - 8} more (full list with reasons: the child's "
+        "workspace_patch.json artifact)"
+        if len(entries) > 8 else ""
+    )
     return (
         f"\n⚠️ {len(entries)} file(s) EXCLUDED from this patch by capture policy: "
         f"{shown}{more}. Excluded content is NOT in this patch: if one is a real "

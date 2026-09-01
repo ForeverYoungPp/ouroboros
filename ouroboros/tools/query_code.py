@@ -441,8 +441,14 @@ def _query_code(
     header = f"{op} `{label}` — {len(shown)} of {total}"
     if next_offset < total:
         header += f" — next offset={next_offset}"
-    elif collection_capped and total >= _MAX_LIMIT:
-        header += f" — collection capped at {_MAX_LIMIT}; more may exist (narrow query/path=)"
+    elif collection_capped:
+        # The collector filled exactly the requested page: "N of N" would claim
+        # completeness it never verified, below the 200 cap included.
+        header += (
+            f" — collection capped at {_MAX_LIMIT}; more may exist (narrow query/path=)"
+            if total >= _MAX_LIMIT
+            else f" — more may exist; continue with offset={next_offset}"
+        )
     return header + "\n\n" + "\n".join(shown) + _next_step_hint(op)
 
 
