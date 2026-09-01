@@ -71,6 +71,52 @@ def test_post_episode_invalid_whole_body_preserves_without_repair(tmp_path, raw)
     assert ctx.messages == before_messages
 
 
+def test_repair_prompt_starts_control_episode_lineage(tmp_path):
+    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    candidate = loop._replace_delivery_candidate(
+        registry, ctx, trace, "Initial complete answer.", control="candidate",
+    )
+    candidate.finalization_control = loop._SKILL_ACTION_HOLD_CONTROL
+
+    assert candidate.control_episode_seen is False
+    assert loop._resolve_delivery_control(
+        '{"delivery_control":"keep"}', registry, ctx, trace,
+    ) == ("retry", "")
+    assert candidate.control_episode_seen is True
+    assert any(
+        "[DELIVERY_CONTROL_REPAIR]" in str(message.get("content") or "")
+        for message in ctx.messages
+    )
+
+    repaired_text = "Repaired complete answer."
+    assert loop._resolve_delivery_control(
+        json.dumps({
+            "delivery_control": "replace",
+            "full_answer": repaired_text,
+        }),
+        registry,
+        ctx,
+        trace,
+    ) == ("resolved", repaired_text)
+    repaired = registry._ctx._delivery_candidate
+    before_messages = copy.deepcopy(ctx.messages)
+
+    assert repaired.control_episode_seen is True
+    assert loop._resolve_delivery_control(
+        '{"delivery_control":"publish"}', registry, ctx, trace,
+    ) == ("resolved", repaired_text)
+    assert ctx.messages == before_messages
+
+
+def test_forced_resolver_ignores_non_candidate_state(tmp_path):
+    loop, registry, _ctx, _trace = _forced_test_context(tmp_path)
+    registry._ctx._delivery_candidate = object()
+
+    assert loop._resolve_forced_delivery_control(
+        registry._ctx, "Plain complete answer.",
+    ) == ("Plain complete answer.", "", False)
+
+
 @pytest.mark.parametrize(
     "raw",
     [

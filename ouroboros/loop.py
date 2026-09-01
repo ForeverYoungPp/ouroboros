@@ -3613,6 +3613,7 @@ def _resolve_delivery_control(
                 ),
             ),
         )
+        candidate.control_episode_seen = True
         _publish_delivery_candidate(tools, candidate, llm_trace)
         return "retry", ""
 
@@ -4621,9 +4622,8 @@ def _resolve_forced_delivery_control(
     if tools_ctx is None or not extracted:
         return extracted, "", False
     candidate = getattr(tools_ctx, "_delivery_candidate", None)
-    candidate = candidate if isinstance(candidate, DeliveryCandidate) else None
     armed = bool(getattr(tools_ctx, "_delivery_control_required", False)) or (
-        candidate is not None and _delivery_replace_required(candidate)
+        isinstance(candidate, DeliveryCandidate) and _delivery_replace_required(candidate)
     )
     resolved, retained, degraded, consumed = _resolve_forced_delivery_control_body(
         extracted, candidate, armed=armed,

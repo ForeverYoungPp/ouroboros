@@ -212,6 +212,8 @@ def resolve_forced_delivery_control_body(
 ) -> Tuple[str, bool, bool, bool]:
     """Return text plus retained/degraded/consumed facts for a forced body."""
 
+    if not isinstance(candidate, DeliveryCandidate):
+        candidate = None
     parsed, duplicate_protocol_key, embedded_protocol = parse_delivery_control_body(raw)
     control_kind, replacement, _error = classify_parsed_delivery_control(
         parsed, duplicate_protocol_key, embedded_protocol,
