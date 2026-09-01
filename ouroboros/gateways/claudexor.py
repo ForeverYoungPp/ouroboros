@@ -29,14 +29,18 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from ouroboros.config import CLAUDEXOR_MIN_VERSION, CLAUDEXOR_PROTOCOL_MAJOR
+from ouroboros.config import (
+    CLAUDEXOR_MIN_VERSION,
+    CLAUDEXOR_PROTOCOL_MAJOR,
+    get_claudexor_quota_refresh_timeout_sec,
+)
 
 log = logging.getLogger(__name__)
 
 CONTROL_API_REL = ".claudexor/v3/daemon/control-api.json"
 PROTOCOL_HEADER = "X-Claudexor-Protocol-Major"
 _CONNECT_TIMEOUT_SEC = 5.0
-# The client-wide read default, and the CEILING on any self-bounding caller's ask
+# The client-wide read default, and the CEILING on any polling/self-bounding caller's ask
 # (`delegate_progress.poll_bound` reads it): a per-request value above it is not a bound
 # at all, it is a hung read granted more rope than it would have had. Generous on
 # purpose: most calls here would rather wait than fail, and a run start can take a while
@@ -427,6 +431,15 @@ class ClaudexorGateway:
         """GET /v2/quota once, retaining its one-epoch evidence envelope."""
         body = self._request("GET", "/v2/quota")
         return body if isinstance(body, dict) else {}
+
+    def refresh_quota(self) -> Dict[str, Any]:
+        """POST /v2/quota once, returning the foreground evidence envelope."""
+        return self._request(
+            "POST",
+            "/v2/quota",
+            json_body={},
+            timeout_sec=get_claudexor_quota_refresh_timeout_sec(),
+        )
 
     def quota_snapshots(self) -> List[Dict[str, Any]]:
         body = self.quota_state()
