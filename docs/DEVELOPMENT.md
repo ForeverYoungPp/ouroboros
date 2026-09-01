@@ -2431,6 +2431,16 @@ near-white primary ink across the settings panels;
 files. Migrating a new surface and extending that guard to it are the same
 commit.
 
+The variable contract is checked in **both** directions by the same file, and
+unlike the typography guard it covers the whole stylesheet, migrated or not.
+A `var(--x)` must resolve — declared in `web/style.css` / `web/settings.css`,
+or written at runtime by a module — because an undeclared one is silent: the
+rule renders its hardcoded fallback and the fallback becomes the real value
+nobody can find. And a `:root` token must have a reader, with no allowlist for
+reserves: a documented token that resolves nowhere is precisely what makes
+surfaces reach for literals. Fixing a dangling name means pointing it at an
+existing token, not declaring a new one.
+
 ### Layout and controls
 
 - Top-level pages use a fixed `renderPageHeader` outside an independently
