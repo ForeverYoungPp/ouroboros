@@ -12,8 +12,10 @@ import pytest
 from tests.test_delivery_forced_finalization import _forced_test_context
 
 
-def _start_control_episode(tmp_path, text="Controlled complete answer."):
-    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+def _start_control_episode(
+    tmp_path, text="Controlled complete answer.", *, incoming=None,
+):
+    loop, registry, ctx, trace = _forced_test_context(tmp_path, incoming=incoming)
     initial = loop._replace_delivery_candidate(
         registry, ctx, trace, "Initial complete answer.", control="candidate",
     )
@@ -64,8 +66,8 @@ def test_post_episode_invalid_whole_body_preserves_without_repair(tmp_path, raw)
     assert registry._ctx._delivery_control_required is False
     assert raw not in text
 
-    forced, reason = loop._resolve_forced_delivery_control(registry._ctx, raw)
-    assert (forced, reason) == (candidate.full_text, "")
+    forced, reason, retained = loop._resolve_forced_delivery_control(registry._ctx, raw)
+    assert (forced, reason, retained) == (candidate.full_text, "", True)
     assert ctx.messages == before_messages
 
 
@@ -76,6 +78,8 @@ def test_post_episode_invalid_whole_body_preserves_without_repair(tmp_path, raw)
         '{"delivery_control":"replace","full_answer":"JSON document"}',
         '{"delivery_control":"publish"}',
         ' \n{"delivery_control":"keep"}\n ',
+        '{"other":1,"other":2}',
+        '{"payload":{"other":1,"other":2}}',
     ],
 )
 def test_no_episode_protocol_json_is_byte_exact_passthrough(tmp_path, raw):
@@ -87,7 +91,9 @@ def test_no_episode_protocol_json_is_byte_exact_passthrough(tmp_path, raw):
 
     assert candidate.control_episode_seen is False
     assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("fresh", raw)
-    assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (raw, "")
+    assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
+        raw, "", False,
+    )
     assert (candidate.revision, candidate.content_sha256, candidate.acceptance_binding) == before
 
 
@@ -99,6 +105,8 @@ def test_no_episode_protocol_json_is_byte_exact_passthrough(tmp_path, raw):
         '{"delivery_control":"replace","full_answer":"cut',
         '{"payload":{"delivery_control":"keep","delivery_control":"replace"}}',
         '{"full_answer":"one","full_answer":"two"}',
+        '{"other":1,"other":2}',
+        '{"payload":{"other":1,"other":2}}',
     ],
 )
 def test_post_episode_latch_off_residuals_stay_byte_exact(tmp_path, raw):
@@ -107,7 +115,9 @@ def test_post_episode_latch_off_residuals_stay_byte_exact(tmp_path, raw):
     before = (candidate.revision, candidate.content_sha256, copy.deepcopy(candidate.acceptance_binding))
 
     assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("fresh", raw)
-    assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (raw, "")
+    assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
+        raw, "", False,
+    )
     assert ctx.messages == before_messages
     assert (candidate.revision, candidate.content_sha256, candidate.acceptance_binding) == before
 
@@ -143,28 +153,42 @@ def test_duplicate_full_answer_without_verb_preserves_stronger_control_rails(
     loop, registry, _ctx, _trace, candidate = _start_control_episode(tmp_path)
     registry._ctx._delivery_control_required = True
     assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
-        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED,
+        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED, True,
     )
+
+
+def test_arbitrary_duplicates_remain_prose_on_ordinary_unarmed_rails(tmp_path):
+    raw = '{"other":1,"other":2}'
+    loop, registry, ctx, trace, candidate = _start_control_episode(tmp_path)
+    candidate.finalization_control = "owner_revision_required"
+    assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("fresh", raw)
+
+    loop, registry, ctx, trace, candidate = _start_control_episode(tmp_path)
+    candidate.finalization_control = loop._SKILL_ACTION_HOLD_CONTROL
+    assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("fresh", raw)
 
     loop, registry, _ctx, _trace, candidate = _start_control_episode(tmp_path)
     candidate.finalization_control = "skill_revision_required"
     assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
-        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED,
+        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED, True,
     )
 
 
 @pytest.mark.parametrize(
-    ("raw", "expected"),
+    ("raw", "expected", "retained"),
     [
-        ('{"delivery_control":"keep"}', "Free-form improvement."),
+        ('{"delivery_control":"keep"}', "Free-form improvement.", True),
         (
             '```json\n{"delivery_control":"replace",'
             '"full_answer":"Forced **replacement**\\nline two"}\n```',
             "Forced **replacement**\nline two",
+            False,
         ),
     ],
 )
-def test_forced_latch_off_after_episode_resolves_stale_control(tmp_path, raw, expected):
+def test_forced_latch_off_after_episode_resolves_stale_control(
+    tmp_path, raw, expected, retained,
+):
     loop, registry, ctx, trace, _candidate = _start_control_episode(tmp_path)
     candidate = loop._replace_delivery_candidate(
         registry, ctx, trace, "Free-form improvement.", control="candidate",
@@ -172,8 +196,158 @@ def test_forced_latch_off_after_episode_resolves_stale_control(tmp_path, raw, ex
 
     assert candidate.control_episode_seen is True
     assert registry._ctx._delivery_control_required is False
-    assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (expected, "")
+    assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
+        expected, "", retained,
+    )
     assert raw not in expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"other":1,"other":2}',
+        '{"payload":{"other":1,"other":2}}',
+    ],
+)
+def test_forced_armed_arbitrary_duplicate_preserves_candidate(
+    tmp_path, monkeypatch, raw,
+):
+    loop, registry, ctx, trace, candidate = _start_control_episode(tmp_path)
+    loop._arm_delivery_control(registry, ctx, trace)
+    parsed, duplicate, embedded = loop._parse_delivery_control_body(raw)
+    assert getattr(parsed, "has_duplicate_keys", False) is True
+    assert (duplicate, embedded) == (False, False)
+    monkeypatch.setattr(
+        loop,
+        "call_llm_with_retry",
+        lambda *_args, **_kwargs: ({"role": "assistant", "content": raw}, 0.0),
+    )
+
+    text, _usage, returned_trace = loop._forced_final_answer(
+        ctx, prompt="finalize", fallback_text="fallback", reason_code="round_limit",
+    )
+
+    assert text == candidate.full_text
+    assert raw not in text
+    published = registry._ctx._delivery_candidate
+    assert published.degraded_reason == loop.REASON_DELIVERY_CONTROL_DEGRADED
+    assert returned_trace["delivery_candidate"]["degraded_reason"] == (
+        loop.REASON_DELIVERY_CONTROL_DEGRADED
+    )
+
+
+def test_forced_historical_keep_after_late_owner_directive_stays_stale(
+    tmp_path, monkeypatch,
+):
+    incoming = queue.Queue()
+    loop, registry, ctx, trace, _candidate = _start_control_episode(
+        tmp_path, incoming=incoming,
+    )
+    retained = loop._replace_delivery_candidate(
+        registry, ctx, trace, "Free-form improvement.", control="candidate",
+    )
+    calls = 0
+
+    def forced_model(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            incoming.put("Late answer constraint")
+            content = "Draft before the late owner constraint."
+        else:
+            content = '{"delivery_control":"keep"}'
+        return {"role": "assistant", "content": content}, 0.0
+
+    monkeypatch.setattr(loop, "call_llm_with_retry", forced_model)
+    text, _usage, returned_trace = loop._forced_final_answer(
+        ctx, prompt="finalize", fallback_text="fallback", reason_code="round_limit",
+    )
+
+    published = registry._ctx._delivery_candidate
+    assert calls == 2
+    assert text.startswith(retained.full_text)
+    assert "STALE-EVIDENCE NOTICE — RESUME REQUIRED (host)" in text
+    assert published.evidence_revision == retained.evidence_revision
+    assert published.acceptance_binding["stale_evidence"] is True
+    assert returned_trace["delivery_candidate"]["evidence_current"] is False
+    forced = returned_trace["forced_finalization"]
+    assert forced["source"] == (
+        "model_control_retained_stale_evidence_resume_required"
+    )
+    assert forced["current_evidence_revision"] > retained.evidence_revision
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_degraded_reason"),
+    [
+        ('{"delivery_control":"keep"}', "round_limit"),
+        ('{"delivery_control":"publish"}', "delivery_control_degraded"),
+    ],
+)
+def test_forced_armed_retained_control_after_evidence_change_stays_stale(
+    tmp_path, monkeypatch, raw, expected_degraded_reason,
+):
+    loop, registry, ctx, trace, retained = _start_control_episode(tmp_path)
+    loop._arm_delivery_control(registry, ctx, trace)
+    trace["tool_calls"].append({
+        "tool": "write_file",
+        "status": "ok",
+        "result": "new evidence",
+        "is_error": False,
+    })
+    monkeypatch.setattr(
+        loop,
+        "call_llm_with_retry",
+        lambda *_args, **_kwargs: (
+            {"role": "assistant", "content": raw}, 0.0,
+        ),
+    )
+
+    text, _usage, returned_trace = loop._forced_final_answer(
+        ctx, prompt="finalize", fallback_text="fallback", reason_code="round_limit",
+    )
+
+    published = registry._ctx._delivery_candidate
+    assert text.startswith(retained.full_text)
+    assert "STALE-EVIDENCE NOTICE — RESUME REQUIRED (host)" in text
+    assert published.evidence_revision == retained.evidence_revision
+    assert published.acceptance_binding["stale_evidence"] is True
+    assert published.degraded_reason == expected_degraded_reason
+    assert returned_trace["delivery_candidate"]["evidence_current"] is False
+
+
+def test_forced_equal_text_replace_after_evidence_change_is_fresh(tmp_path, monkeypatch):
+    loop, registry, ctx, trace, old = _start_control_episode(tmp_path)
+    loop._arm_delivery_control(registry, ctx, trace)
+    trace["tool_calls"].append({
+        "tool": "write_file",
+        "status": "ok",
+        "result": "new evidence",
+        "is_error": False,
+    })
+    replacement = json.dumps({
+        "delivery_control": "replace",
+        "full_answer": old.full_text,
+    })
+    monkeypatch.setattr(
+        loop,
+        "call_llm_with_retry",
+        lambda *_args, **_kwargs: (
+            {"role": "assistant", "content": replacement}, 0.0,
+        ),
+    )
+
+    text, _usage, returned_trace = loop._forced_final_answer(
+        ctx, prompt="finalize", fallback_text="fallback", reason_code="round_limit",
+    )
+
+    published = registry._ctx._delivery_candidate
+    assert text == old.full_text
+    assert "STALE-EVIDENCE NOTICE" not in text
+    assert published is not old
+    assert published.evidence_revision > old.evidence_revision
+    assert "stale_evidence" not in published.acceptance_binding
+    assert returned_trace["delivery_candidate"]["evidence_current"] is True
 
 
 def test_ordinary_latch_off_after_episode_resolves_stale_keep(tmp_path):

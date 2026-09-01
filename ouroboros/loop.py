@@ -37,7 +37,7 @@ from ouroboros.acceptance_dialogue import (  # noqa: F401 — re-export
 )
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
 from ouroboros.outcomes import ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_DELIVERY_CONTROL_DEGRADED, REASON_OWNER_REQUESTED_FINALIZATION, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
-from ouroboros.observability import new_execution_id, strip_protocol_fence
+from ouroboros.observability import new_execution_id
 # Protocol leaf keeps historical names importable at this module's size ceiling.
 from ouroboros.delivery_protocol import (
     CHILD_ABSORPTION_HOLD_CONTROL as _CHILD_ABSORPTION_HOLD_CONTROL,
@@ -51,6 +51,7 @@ from ouroboros.delivery_protocol import (
     extract_plain_text_from_content as _extract_plain_text_from_content,
     parse_delivery_control_body as _parse_delivery_control_body,
     parse_delivery_control_object as _parse_delivery_control_object,  # noqa: F401
+    resolve_forced_delivery_control_body as _resolve_forced_delivery_control_body,
 )
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
@@ -4454,6 +4455,7 @@ def _forced_fallback_result(
     source: str = "host_fallback",
     retained_source: str = "",
     retained_control: str = "",
+    candidate_degraded_reason: str = "",
     provider_terminal: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Return a current or fallback candidate."""
@@ -4525,6 +4527,9 @@ def _forced_fallback_result(
             suffix,
         )
         if candidate is not None:
+            if candidate_degraded_reason:
+                candidate.degraded_reason = candidate_degraded_reason
+                _publish_delivery_candidate(ctx.tools, candidate, llm_trace)
             if provider_terminal:
                 ctx.accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_HOST_SALVAGE
             ctx.accumulated_usage["_best_effort_extracted"] = True
@@ -4611,45 +4616,21 @@ def _forced_swarm_router_result(
 def _resolve_forced_delivery_control(
     tools_ctx: Any,
     extracted: str,
-) -> Tuple[str, str]:
-    """Resolve an armed delivery-control object without another model round."""
+) -> Tuple[str, str, bool]:
+    """Resolve forced control to text, degradation reason, and retained provenance."""
     if tools_ctx is None or not extracted:
-        return extracted, ""
+        return extracted, "", False
     candidate = getattr(tools_ctx, "_delivery_candidate", None)
     candidate = candidate if isinstance(candidate, DeliveryCandidate) else None
-    parsed, duplicate_protocol_key, embedded_protocol = _parse_delivery_control_body(extracted)
-    control_kind, replacement, _error = _classify_parsed_delivery_control(
-        parsed, duplicate_protocol_key, embedded_protocol,
-    )
     armed = bool(getattr(tools_ctx, "_delivery_control_required", False)) or (
         candidate is not None and _delivery_replace_required(candidate)
     )
-    historical_control = bool(
-        not armed
-        and candidate is not None
-        and candidate.control_episode_seen
-        and control_kind in {"keep", "replace", "invalid"}
+    resolved, retained, degraded, consumed = _resolve_forced_delivery_control_body(
+        extracted, candidate, armed=armed,
     )
-    if not armed and not historical_control:
-        return extracted, ""
-    tools_ctx._delivery_control_required = False
-    if control_kind == "replace":
-        return replacement, ""
-    if control_kind == "keep" and candidate is not None:
-        return candidate.full_text, ""
-    if historical_control:
-        return candidate.full_text, ""
-    protocol_intent = control_kind != "none" or (
-        parsed is None and strip_protocol_fence(extracted).startswith("{")
-    )
-    if not protocol_intent:
-        return extracted, ""
-    # Malformed/duplicate/prose-embedded/invalid control: preserve the retained
-    # candidate (with none retained, the caller's fallback stands) and say so.
-    return (
-        candidate.full_text if candidate is not None else "",
-        REASON_DELIVERY_CONTROL_DEGRADED,
-    )
+    if consumed:
+        tools_ctx._delivery_control_required = False
+    return resolved, REASON_DELIVERY_CONTROL_DEGRADED if degraded else "", retained
 
 
 def _forced_delegation_note(tools_ctx: Any, llm_trace: Dict[str, Any]) -> str:
@@ -4791,7 +4772,19 @@ def _forced_final_answer(
             source="forced_model_incomplete", provider_terminal=True,
         )
 
-    extracted, control_degraded = _resolve_forced_delivery_control(tools_ctx, extracted)
+    extracted, control_degraded, retained_candidate = _resolve_forced_delivery_control(
+        tools_ctx, extracted,
+    )
+    if retained_candidate and _current_delivery_candidate(ctx, llm_trace) is None:
+        return _forced_fallback_result(
+            ctx,
+            llm_trace,
+            extracted,
+            reason_code,
+            source="model_control_retained",
+            candidate_degraded_reason=control_degraded,
+            provider_terminal=provider_terminal,
+        )
     if extracted:
         ctx.accumulated_usage["_best_effort_extracted"] = True
         plan_suffix = (

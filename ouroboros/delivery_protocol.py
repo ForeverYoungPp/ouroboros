@@ -4,8 +4,8 @@ Extracted from ``ouroboros/loop.py`` at its module-size ceiling; loop
 re-exports the historical underscore names, so its callers, tests, and
 monkeypatch targets keep one import surface. Protocol domain ONLY — the
 candidate dataclass, the control/hold vocabulary, the typed control prompt,
-and the pure parsers. The ctx-touching resolvers (arming, holding, resolving
-a control round) stay in ``loop``.
+and pure parsing/body-resolution. Ctx-touching arming, holding, and state
+publication stay in ``loop``.
 """
 
 from __future__ import annotations
@@ -91,20 +91,25 @@ def parse_delivery_control_object(
     """Parse a body while rejecting duplicates in a control envelope.
 
     The boolean preserves top-level protocol intent when duplicate keys made a
-    recognizable control envelope invalid. Duplicate metadata on a top-level
-    ``full_answer`` without a verb remains available to stronger armed/action
-    rails, while history-gated and nested control-shaped JSON remain prose.
+    recognizable control envelope invalid. Per-object metadata supports the
+    stronger armed/action rails; an aggregate duplicate marker restores the
+    forced armed malformed-body rule without widening history-gated parsing.
     """
 
     class _ParsedObject(dict):
         duplicate_keys: set[str]
+        has_duplicate_keys: bool
+
+    has_duplicate_keys = False
 
     def _unique_object(pairs: List[Tuple[str, Any]]) -> _ParsedObject:
+        nonlocal has_duplicate_keys
         result = _ParsedObject()
         result.duplicate_keys = set()
         for key, value in pairs:
             if key in result:
                 result.duplicate_keys.add(key)
+                has_duplicate_keys = True
             result[key] = value
         return result
 
@@ -116,6 +121,7 @@ def parse_delivery_control_object(
         return None, False
     if not isinstance(payload, dict):
         return None, False
+    payload.has_duplicate_keys = has_duplicate_keys
     duplicate_keys = getattr(payload, "duplicate_keys", set())
     if duplicate_keys:
         if "delivery_control" in payload:
@@ -123,7 +129,7 @@ def parse_delivery_control_object(
         # Keep per-object duplicate metadata for stronger control rails while
         # stopping parse_delivery_control_body from rescanning this whole body.
         return payload, False
-    return dict(payload), False
+    return payload if has_duplicate_keys else dict(payload), False
 
 
 def parse_delivery_control_body(
@@ -196,6 +202,43 @@ def classify_parsed_delivery_control(
             return "replace", replacement, ""
         return "invalid", "", "replace requires a non-empty complete full_answer"
     return "invalid", "", exact_error
+
+
+def resolve_forced_delivery_control_body(
+    raw: str,
+    candidate: Optional[DeliveryCandidate],
+    *,
+    armed: bool,
+) -> Tuple[str, bool, bool, bool]:
+    """Return text plus retained/degraded/consumed facts for a forced body."""
+
+    parsed, duplicate_protocol_key, embedded_protocol = parse_delivery_control_body(raw)
+    control_kind, replacement, _error = classify_parsed_delivery_control(
+        parsed, duplicate_protocol_key, embedded_protocol,
+    )
+    historical = bool(
+        not armed
+        and candidate is not None
+        and candidate.control_episode_seen
+        and control_kind in {"keep", "replace", "invalid"}
+    )
+    if not armed and not historical:
+        return raw, False, False, False
+    if control_kind == "replace":
+        return replacement, False, False, True
+    if control_kind == "keep" and candidate is not None:
+        return candidate.full_text, True, False, True
+    if historical:
+        return candidate.full_text, True, False, True
+    protocol_intent = (
+        control_kind != "none"
+        or (parsed is None and strip_protocol_fence(raw).startswith("{"))
+        or bool(getattr(parsed, "has_duplicate_keys", False))
+    )
+    if not protocol_intent:
+        return raw, False, False, True
+    retained = candidate is not None
+    return candidate.full_text if retained else "", retained, True, True
 
 
 def extract_plain_text_from_content(content: Any) -> str:
