@@ -124,42 +124,6 @@ def _extract_summary(text: str, max_chars: int = 150) -> str:
     return summary
 
 
-def _rebuild_index(ctx: ToolContext, *, _locked: bool = False):
-    """Rebuild the knowledge index from all topic files."""
-    kdir = _knowledge_dir(ctx)
-    if not _locked:
-        with _knowledge_write_lock(kdir):
-            _rebuild_index(ctx, _locked=True)
-        return
-    if not kdir.exists():
-        return
-
-    entries = []
-    for f in sorted(kdir.glob("*.md")):
-        if f.name == INDEX_FILE:
-            continue
-        try:
-            topic = _sanitize_topic(f.stem)
-        except ValueError:
-            continue
-
-        try:
-            text = f.read_text(encoding="utf-8").strip()
-            summary = _extract_summary(text)
-            entries.append(f"- **{topic}**: {summary}")
-        except Exception:
-            log.debug(f"Failed to read knowledge file for index rebuild: {topic}", exc_info=True)
-            entries.append(f"- **{topic}**: (unreadable)")
-
-    index_content = "# Knowledge Base Index\n\n"
-    if entries:
-        index_content += "\n".join(entries) + "\n"
-    else:
-        index_content += "(empty)\n"
-
-    (kdir / INDEX_FILE).write_text(index_content, encoding="utf-8")
-
-
 def _update_index_entry(ctx: ToolContext, topic: str):
     """Update the index entry for one topic."""
     kdir = _knowledge_dir(ctx)
@@ -359,11 +323,28 @@ def _knowledge_list(ctx: ToolContext) -> str:
     if index_path.exists():
         return index_path.read_text(encoding="utf-8")
 
-    if kdir.exists():
-        _rebuild_index(ctx)
-        if index_path.exists():
-            return index_path.read_text(encoding="utf-8")
+    # No index: render the listing IN MEMORY from the topic files. knowledge_list
+    # is registered read-only (safety.py POLICY_SKIP) and granted to children that
+    # may not write cognitive memory — the old on-miss index rebuild here created
+    # the knowledge dir, a lock sidecar and index-full.md on a pure read. Index
+    # maintenance stays on the write path (_update_index_entry).
+    entries = []
+    for f in sorted(kdir.glob("*.md")) if kdir.exists() else []:
+        if f.name == INDEX_FILE:
+            continue
+        try:
+            topic = _sanitize_topic(f.stem)
+        except ValueError:
+            continue
+        try:
+            summary = _extract_summary(f.read_text(encoding="utf-8").strip())
+            entries.append(f"- **{topic}**: {summary}")
+        except Exception:
+            log.debug(f"Failed to read knowledge file for listing: {topic}", exc_info=True)
+            entries.append(f"- **{topic}**: (unreadable)")
 
+    if entries:
+        return "# Knowledge Base Index\n\n" + "\n".join(entries) + "\n"
     return "Knowledge base is empty. Use knowledge_write to add topics."
 
 
