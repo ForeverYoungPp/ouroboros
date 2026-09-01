@@ -246,6 +246,51 @@ def run_media_delivery_smoke(direct_server_with_data):
                     "liveGroups": 2, "liveGalleryItems": 2, "liveLinks": 1,
                     "bridge": True, "blob": True, "copied": "raw **message** text",
                 }
+                # V-4 regression pins. The chat bubble's `white-space: pre-wrap`
+                # used to be inherited by structural card markup, so every
+                # newline of a template became a rendered blank line: a file
+                # card measured ~203px instead of ~68px and a gallery item ~531px
+                # instead of ~369px. Measure real geometry rather than CSS text.
+                # The dialog pin covers the universal margin reset killing the UA
+                # `dialog { margin: auto }` that centres a modal.
+                geometry = page.evaluate("""() => {
+                    const card = document.querySelector('.chat-file-card');
+                    const item = card.closest('.chat-file-item');
+                    const caption = item.querySelector('.chat-file-caption');
+                    const gallery = document.querySelector('.chat-bubble.is-multiple .chat-gallery-item');
+                    const photo = gallery.querySelector('.chat-photo');
+                    const figcaption = gallery.querySelector('figcaption');
+                    card.click();
+                    const dialog = [...document.querySelectorAll('.chat-file-dialog')].find((node) => node.open);
+                    const box = dialog.getBoundingClientRect();
+                    const measured = {
+                        cardHeight: card.getBoundingClientRect().height,
+                        itemHeight: item.getBoundingClientRect().height,
+                        captionHeight: caption ? caption.getBoundingClientRect().height : 0,
+                        galleryHeight: gallery.getBoundingClientRect().height,
+                        photoHeight: photo.getBoundingClientRect().height,
+                        figcaptionHeight: figcaption ? figcaption.getBoundingClientRect().height : 0,
+                        dialogWidth: box.width,
+                        dx: (box.left + box.width / 2) - window.innerWidth / 2,
+                        dy: (box.top + box.height / 2) - window.innerHeight / 2,
+                    };
+                    dialog.querySelector('[data-file-action="close"]').click();
+                    return measured;
+                }""")
+                assert 0 < geometry["cardHeight"] < 90, geometry
+                assert geometry["captionHeight"] > 0, geometry
+                assert abs(
+                    geometry["itemHeight"] - geometry["cardHeight"] - geometry["captionHeight"]
+                ) <= 1, geometry
+                assert geometry["photoHeight"] > 0 and geometry["figcaptionHeight"] > 0, geometry
+                # The figure adds its own 1px border top and bottom; anything
+                # beyond that is a phantom line between photo and caption.
+                assert abs(
+                    geometry["galleryHeight"] - geometry["photoHeight"] - geometry["figcaptionHeight"] - 2
+                ) <= 1, geometry
+                assert geometry["dialogWidth"] > 0, geometry
+                assert abs(geometry["dx"]) <= 2 and abs(geometry["dy"]) <= 2, geometry
+
                 page.wait_for_timeout(100)
                 assert console_errors == []
             finally:
