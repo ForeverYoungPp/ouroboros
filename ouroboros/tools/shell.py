@@ -513,9 +513,19 @@ def _register_process_outputs(
                 binding=binding,
             )
             if skipped_members:
-                # Per-member receipt (D4): the export is PARTIAL, never silently so.
+                # Per-member receipt (D4): the export is PARTIAL, never silently
+                # so. The rendered note is bounded; the COMPLETE list goes to
+                # the task log so the omission stays resolvable (#447 P1).
                 shown = "; ".join(skipped_members[:5])
-                more = f" (+{len(skipped_members) - 5} more)" if len(skipped_members) > 5 else ""
+                more = (
+                    f" (+{len(skipped_members) - 5} more; full list in the task log)"
+                    if len(skipped_members) > 5 else ""
+                )
+                if len(skipped_members) > 5:
+                    log.info(
+                        "directory output %s: full export skip list (%d): %s",
+                        text, len(skipped_members), "; ".join(skipped_members),
+                    )
                 notes.append(
                     f"skipped {len(skipped_members)} member(s) of directory output {text}: {shown}{more}"
                 )

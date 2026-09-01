@@ -133,15 +133,27 @@ _PEM_PRIVATE_KEY_RE = re.compile(
     re.DOTALL,
 )
 
+# EGRESS-ONLY long-opaque-run rule (never used by observability redaction — a
+# different false-positive budget). Line-oriented egresses (search match lines,
+# a read slice that starts past the PEM header) surface key MATERIAL without
+# the block markers or provider prefixes the patterns above key on: a PEM body
+# line is 64 unbroken base64 chars, an AWS secret key is 40. Any unbroken run
+# of 40+ base64/hex-ish chars in owner-home output is treated as opaque
+# credential material. Known accepted FP: long hashes/data-URI fragments in
+# owner files get masked too — the disclosure note tells the agent to
+# reference them by location.
+_LONG_OPAQUE_RUN_RE = re.compile(r"[A-Za-z0-9+/=_\-]{40,}")
+
 
 def mask_secret_bytes(text: str) -> Tuple[str, int]:
     """Mask secret-shaped byte spans in final tool output; return (text, count).
 
-    Egress seam for owner-home (``user_files``) reads: the root agent may read
-    the file, but raw credential bytes never enter model context/history — the
-    masked form (``***``) may (#447 X1/В23). Matches are limited to the known
-    entropy formats above plus PEM private-key blocks; a span split across two
-    paginated read slices is a disclosed residual of the slice boundary.
+    Egress seam for owner-home (``user_files``) content: the root agent may
+    read the file, but raw credential bytes never enter model context/history —
+    the masked form (``***``) may (#447 X1/В23). Coverage: the known entropy
+    formats above, PEM private-key blocks, and any unbroken 40+ char opaque run
+    (closes line-oriented egresses — search match lines, mid-file read slices).
+    Disclosed residual: a dictionary-word password has no shape to match.
     """
     out = str(text or "")
     count = 0
@@ -159,6 +171,7 @@ def mask_secret_bytes(text: str) -> Tuple[str, int]:
     out = _PEM_PRIVATE_KEY_RE.sub(_mask, out)
     for rule, pattern in SECRET_TOKEN_PATTERNS:
         out = pattern.sub(_mask_url if rule == "url_credentials" else _mask, out)
+    out = _LONG_OPAQUE_RUN_RE.sub(_mask, out)
     return out, count
 
 

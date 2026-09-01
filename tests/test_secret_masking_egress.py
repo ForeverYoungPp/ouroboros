@@ -62,10 +62,25 @@ def test_mask_secret_bytes_masks_unterminated_pem_to_end():
 
 
 def test_mask_secret_bytes_leaves_plain_text_untouched():
-    text = "ordinary notes\nsha256: " + "a" * 64 + "\nmodel: anthropic/claude-fable-5\n"
+    text = "ordinary notes\nmodel: anthropic/claude-fable-5\npath: ~/.config/app/settings.toml\n"
     masked, count = mask_secret_bytes(text)
     assert masked == text
     assert count == 0
+
+
+def test_mask_secret_bytes_masks_long_opaque_runs():
+    """s2r2 F1: line-oriented egresses surface key MATERIAL without block
+    markers (a PEM body line, an AWS secret key). Any unbroken 40+ char opaque
+    run is masked; a long hash is the documented accepted false positive."""
+    body_line = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMw" + "x" * 10
+    masked, count = mask_secret_bytes(f"match: {body_line}\n")
+    assert body_line not in masked and count == 1
+    aws_secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    masked2, count2 = mask_secret_bytes(f"aws_secret_access_key = {aws_secret}\n")
+    assert aws_secret not in masked2 and count2 == 1
+    # accepted FP, disclosed by design: a bare sha256 is an opaque run too
+    masked3, count3 = mask_secret_bytes("sha256: " + "a" * 64 + "\n")
+    assert "a" * 64 not in masked3 and count3 == 1
 
 
 @pytest.fixture()
@@ -171,8 +186,11 @@ def test_search_user_files_masks_secret_bytes_on_both_egresses(user_files_ctx, m
 
     out_rg = _search_code(ctx, "openrouter", root="user_files")
     assert OPENROUTER_KEY not in out_rg, out_rg[:300]
-    if "No matches" not in out_rg:
-        assert "SECRET_BYTES_MASKED" in out_rg
+    # The fixture guarantees a match: an empty result here means the rg binary
+    # is genuinely unavailable AND the fallback was not reached — fail loudly
+    # rather than skip the masking assert silently.
+    assert "No matches" not in out_rg, out_rg[:300]
+    assert "SECRET_BYTES_MASKED" in out_rg
 
     # Force the Python fallback by making rg unavailable.
     import ouroboros.code_search_rg as rg_mod

@@ -2144,19 +2144,32 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         # per-project store (reachable only via the scoped knowledge tools).
         from ouroboros.code_intelligence import SKIP_DIRS
 
+        # SKIP_DIRS pruning is a documented walk convention (parity with rg's
+        # skip of .git/node_modules); POLICY prunes below are counted — a whole
+        # subtree removed by policy must not read as "0 files searched" with no
+        # receipt (#447 D3).
         dirnames[:] = [d for d in sorted(dirnames) if d not in SKIP_DIRS]
         if normalized == "runtime_data" and str(pathlib.Path(dirpath).resolve(strict=False)) == _rt_search_root:
+            for d in dirnames:
+                if d.casefold() == "projects":
+                    _drop("project_store_scoped")
             dirnames[:] = [d for d in dirnames if d.casefold() != "projects"]
         if normalized == "user_files":
-            dirnames[:] = [
-                d for d in dirnames
-                if not user_files_path_block_reason(ctx, pathlib.Path(dirpath) / d, operation="search")
-            ]
+            kept_dirs = []
+            for d in dirnames:
+                if user_files_path_block_reason(ctx, pathlib.Path(dirpath) / d, operation="search"):
+                    _drop("user_files_policy")
+                else:
+                    kept_dirs.append(d)
+            dirnames[:] = kept_dirs
         if subagent_readonly:
-            dirnames[:] = [
-                d for d in dirnames
-                if not _local_readonly_resource_block(ctx, normalized, pathlib.Path(dirpath) / d, root_path, action="SEARCH")
-            ]
+            kept_dirs = []
+            for d in dirnames:
+                if _local_readonly_resource_block(ctx, normalized, pathlib.Path(dirpath) / d, root_path, action="SEARCH"):
+                    _drop("restricted_subagent")
+                else:
+                    kept_dirs.append(d)
+            dirnames[:] = kept_dirs
 
         for fname in sorted(filenames):
             fp = pathlib.Path(dirpath) / fname

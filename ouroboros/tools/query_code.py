@@ -438,6 +438,21 @@ def _query_code(
                 "Narrow the query or path= instead of paging past the cap."
             )
         return f"No results for op `{op}` `{label}`. {_empty_hint(op, label)}"
+    def _mask_user_files_rows(text: str) -> str:
+        # Same egress seam as read_file/search (#447 В23): query_code snippets
+        # over the owner's home must not carry raw credential bytes.
+        if normalized_root != "user_files":
+            return text
+        from ouroboros.secret_masking import mask_secret_bytes
+
+        masked, count = mask_secret_bytes(text)
+        if count:
+            masked += (
+                f"\n⚠️ SECRET_BYTES_MASKED: {count} secret-shaped span(s) were "
+                "replaced with ***; raw credentials never enter model context."
+            )
+        return masked
+
     header = f"{op} `{label}` — {len(shown)} of {total}"
     if next_offset < total:
         header += f" — next offset={next_offset}"
@@ -449,7 +464,7 @@ def _query_code(
             if total >= _MAX_LIMIT
             else f" — more may exist; continue with offset={next_offset}"
         )
-    return header + "\n\n" + "\n".join(shown) + _next_step_hint(op)
+    return _mask_user_files_rows(header + "\n\n" + "\n".join(shown)) + _next_step_hint(op)
 
 
 def _empty_hint(op: str, label: str) -> str:

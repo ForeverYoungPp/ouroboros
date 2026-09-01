@@ -132,7 +132,7 @@ def _slugify(value: str, *, max_len: int, injective: bool = False) -> str:
     lossy = injective and safe != text
     if len(safe) <= max_len and not lossy:
         return safe
-    digest = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()[:6]
+    digest = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()[:12]
     keep = max_len - len(digest) - 1
     if keep <= 0:
         return digest
@@ -461,6 +461,18 @@ async def _list_tools_async(cfg: MCPServerConfig, *, timeout_sec: int) -> List[D
                     cursor = getattr(result, "nextCursor", None)
                     if not cursor:
                         break
+                else:
+                    if cursor:
+                        # Cap exhausted with pages remaining: a partial catalog
+                        # must not read as the complete one (#447 P1).
+                        tools_raw.append({
+                            "name": "",
+                            "_pagination_truncated": True,
+                        })
+                        log.warning(
+                            "MCP tool listing stopped at the 50-page bound with "
+                            "nextCursor still present; catalog is PARTIAL",
+                        )
                 return tools_raw
 
     return await asyncio.wait_for(
@@ -781,6 +793,14 @@ class MCPManager:
                     target.tools = []
             return {"ok": False, "error": err_text}
 
+        pagination_truncated = any(
+            isinstance(item, dict) and item.get("_pagination_truncated")
+            for item in tools_raw
+        )
+        tools_raw = [
+            item for item in tools_raw
+            if not (isinstance(item, dict) and item.get("_pagination_truncated"))
+        ]
         normalized = [
             MCPTool(
                 server_id=cfg.id,
@@ -793,14 +813,33 @@ class MCPManager:
             if str(item.get("name") or "").strip()
         ]
         normalized = [tool for tool in normalized if tool.prefixed_name]
-        # Drop duplicates caused by slug collisions.
+        # A residual slug collision (12-hex tail makes it astronomically rare)
+        # drops a tool — that is a capability omission and must be DISCLOSED,
+        # not silently swallowed (#447 P1).
         seen: set = set()
         deduped: List[MCPTool] = []
+        collided: List[str] = []
         for tool in normalized:
             if tool.prefixed_name in seen:
+                collided.append(tool.name)
                 continue
             seen.add(tool.prefixed_name)
             deduped.append(tool)
+        omission_notes: List[str] = []
+        if collided:
+            log.warning(
+                "MCP server %s: %d tool(s) dropped by slug collision: %s",
+                server_id, len(collided), ", ".join(collided[:5]),
+            )
+            omission_notes.append(
+                f"{len(collided)} tool(s) unavailable due to slug collision: "
+                + ", ".join(collided[:5])
+            )
+        if pagination_truncated:
+            omission_notes.append(
+                "tool catalog is PARTIAL: listing stopped at the 50-page bound "
+                "with more pages remaining"
+            )
 
         finished_at = datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -812,7 +851,10 @@ class MCPManager:
                 }
             if target is not None:
                 target.tools = deduped
-                target.last_error = ""
+                # A successful refresh with omissions keeps the omission note
+                # visible (#447 P1): partial catalog / collided tools must not
+                # read as a clean complete listing.
+                target.last_error = "; ".join(omission_notes)
                 target.last_attempted = attempted_at
                 target.last_refreshed = finished_at
         return {
