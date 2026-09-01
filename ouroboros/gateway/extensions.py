@@ -1005,7 +1005,8 @@ async def api_owner_skill_attest_review(request: Request) -> JSONResponse:
         log.debug("Failed to write owner attestation audit event", exc_info=True)
     if status != "clean":
         # Deterministic preflight floor failed, the skill is not owner-own, or it could not
-        # be loaded/hashed: 409 — not attestable (existing review state is left untouched).
+        # be loaded/hashed: 409 — not attestable. A failed preflight persists as the recorded
+        # review result when review.json was absent/stale; a fresh valid verdict stays untouched.
         return JSONResponse(payload, status_code=409)
     return JSONResponse(payload)
 

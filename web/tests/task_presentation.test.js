@@ -21,6 +21,7 @@ import {
 const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
 const activitySource = readFileSync(new URL('../modules/chat_activity.js', import.meta.url), 'utf8');
 const logEventsSource = readFileSync(new URL('../modules/log_events.js', import.meta.url), 'utf8');
+const chatMediaSource = readFileSync(new URL('../modules/chat_media.js', import.meta.url), 'utf8');
 
 const terminalCases = [
     ['clean Done', { status: 'completed' }, { phase: 'done', headline: 'Done' }],
@@ -339,7 +340,10 @@ test('nonterminal diagnostics stay visible facts but never promote the task', ()
         assert.equal(diagnostic.terminal, false);
     }
     assert.doesNotMatch(chatSource, /showContextFitToast|context-fit:/);
-    assert.match(chatSource, /function showTaskIncidentToast\(msg\)/);
+    // The dedupe-keyed incident toast lives in chat_media.js (byte-ratchet
+    // extraction) while chat.js's progress fan-out still invokes it.
+    assert.match(chatMediaSource, /export function showTaskIncidentToast\(msg\)/);
+    assert.match(chatSource, /showTaskIncidentToast\(msg\);/);
     const success = summarizeChatLiveEvent({ type: 'task_done', status: 'completed' });
     assert.deepEqual({ phase: success.phase, headline: success.headline }, { phase: 'done', headline: 'Done' });
     assert.match(chatSource, /const shouldPromote = Boolean\(summary\.promote\) \|\| record\.finished;/);

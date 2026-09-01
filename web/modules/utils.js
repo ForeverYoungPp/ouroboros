@@ -98,6 +98,13 @@ export function preflightFailed(entity) {
     return entity?.review_gate?.preflight_failed === true;
 }
 
+// #335 follow-up (D11): a recorded preflight FAIL whose findings are STALE for
+// the current payload bytes. Re-review stays primary (it reruns the preflight);
+// Repair is additionally offered based on the last recorded preflight.
+export function preflightFailedStale(entity) {
+    return entity?.review_gate?.preflight_failed_stale === true;
+}
+
 // #335: a deterministic-preflight finding carries the raw preflight JSON in
 // its reason; render the failed entries as a human-readable diagnosis.
 // Fail-soft: anything unparseable falls back to the caller's raw rendering.

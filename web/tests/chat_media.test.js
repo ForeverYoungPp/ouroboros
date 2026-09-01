@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { createChatMedia, safeHttpUrl } from '../modules/chat_media.js';
 import { createRebuildBatch } from '../modules/chat_render_batch.js';
+
+const styleCss = await readFile(new URL('../style.css', import.meta.url), 'utf8');
 
 class Classes {
     constructor(node) { this.node = node; this.values = new Set(); }
@@ -414,6 +417,31 @@ test('media and document builders render upgraded DOM shapes with type-anchored 
     }
 });
 
+test('file dialog and photo menu expose no Share action (owner removal)', async () => {
+    const fx = fixture();
+    try {
+        const bubble = fx.controller.buildDocumentBubble({
+            type: 'document', role: 'assistant', filename: 'notes.txt', mime: 'text/plain',
+            file_base64: 'aGVsbG8=', ts: '2026-08-30T00:00:00Z',
+        });
+        await bubble.querySelector('.chat-file-card').click();
+        const dialog = globalThis.document.body.querySelector('.chat-file-dialog');
+        assert.ok(dialog, 'card click creates the action dialog');
+        assert.ok(dialog.querySelector('[data-file-action="download"]'));
+        assert.ok(dialog.querySelector('[data-file-action="close"]'));
+        assert.equal(dialog.querySelector('[data-file-action="share"]'), null,
+            'Share was removed everywhere by owner decision');
+        const photo = fx.controller.buildMediaBubble({
+            type: 'photo', role: 'assistant', image_base64: 'aGVsbG8=', mime: 'image/png',
+        });
+        assert.ok(photo.querySelector('[data-photo-action="copy"]'));
+        assert.equal(photo.querySelector('[data-photo-action="share"]'), null);
+    } finally {
+        fx.controller.destroy();
+        fx.restore();
+    }
+});
+
 test('video download filename follows the validated MIME subtype', async () => {
     const fx = fixture();
     const originalCreateObjectURL = URL.createObjectURL;
@@ -477,6 +505,7 @@ test('throwing execCommand reports failure and removes the fallback textarea', a
         await button.click();
 
         assert.equal(button.textContent, '✗');
+        assert.equal(button.title, 'Copy failed');
         assert.equal(button.attributes.get('aria-label'), 'Copy failed');
         assert.equal(globalThis.document.body.querySelectorAll('.chat-copy-fallback').length, 0);
     } finally {
@@ -499,6 +528,44 @@ test('copy fallback reports failure when execCommand is unavailable', async () =
         fx.controller.destroy();
         fx.restore();
     }
+});
+
+test('copy control is an always-visible icon button that marks the bubble (D12)', async () => {
+    const fx = fixture();
+    try {
+        const bubble = new NodeStub('div', fx.tracker);
+        const button = fx.controller.attachCopyControl(bubble, 'raw message');
+
+        assert.equal(button.type, 'button');
+        assert.equal(button.title, 'Copy');
+        assert.equal(button.attributes.get('aria-label'), 'Copy message');
+        assert.ok(button.querySelector('svg'), 'inline copy-icon SVG is present');
+        assert.match(button.innerHTML, /currentColor/);
+        assert.equal(bubble.classList.contains('has-copy'), true,
+            'bubble carries has-copy so CSS reserves the timestamp gutter');
+
+        await button.click();
+        assert.equal(button.textContent, '✓', 'success swaps the icon for a checkmark');
+        assert.equal(button.title, 'Message copied', 'title swaps in step with aria-label');
+        assert.equal(button.attributes.get('aria-label'), 'Message copied');
+    } finally {
+        fx.controller.destroy();
+        fx.restore();
+    }
+});
+
+test('stylesheet pins the always-visible copy icon and the timestamp reserve (D12)', () => {
+    // (a) The copy control is anchored bottom-right and PERMANENTLY visible:
+    // a non-zero base opacity, never the old hover-reveal opacity 0.
+    assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*position:\s*absolute/);
+    assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*right:\s*\d+px/);
+    assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*bottom:\s*\d+px/);
+    // The fractional part must carry a non-zero digit: 0.0 / .0 are invisible.
+    assert.match(styleCss, /\.chat-message-copy\s*\{[^}]*opacity:\s*0?\.\d*[1-9]/);
+    assert.doesNotMatch(styleCss, /\.chat-message-copy\s*\{[^}]*opacity:\s*0\s*;/);
+    // (b) has-copy bubbles reserve a right gutter so the timestamp can never
+    // sit under the icon (the structural overlap fix); 0px is no reserve.
+    assert.match(styleCss, /\.chat-bubble\.has-copy\s+\.msg-time\s*\{[^}]*margin-right:\s*[1-9]\d*px/);
 });
 
 test('reset disposes listeners, stops players, clears groups, and destroy is final', () => {

@@ -18,6 +18,7 @@ import {
     grantReady,
     isRateLimitError,
     preflightFailed,
+    preflightFailedStale,
     renderHubCard,
     renderSkillRepairPrompt,
     reviewReady,
@@ -160,6 +161,21 @@ export function lifecycleFor(summary, installed, pending) {
             button: 'Repair',
         };
     }
+    // D11: the recorded preflight FAIL is stale for the current payload bytes —
+    // the cheap Re-review (which reruns the preflight) stays primary; the card
+    // adds a secondary Repair based on the last recorded preflight.
+    if (preflightFailedStale(installed) && !reviewReady(installed, { requireFresh: true })) {
+        const finding = topReviewFinding(installed);
+        return {
+            tone: 'warn',
+            label: 'Review stale',
+            hint: finding
+                ? `Last recorded preflight: ${finding}`
+                : 'The last recorded preflight failed for a previous version of this skill; Re-review reruns it.',
+            action: 'review',
+            button: 'Re-review',
+        };
+    }
     if (!reviewReady(installed, { requireFresh: true })) {
         const finding = topReviewFinding(installed);
         return {
@@ -243,6 +259,17 @@ function buildHealPrompt(installed, summary) {
 }
 
 
+// D11 secondary affordance with the primary's pending discipline: a queued or
+// running lifecycle job suppresses the stale-Repair button entirely (the card's
+// pending chip already explains the state), so a concurrent repair cannot be
+// enqueued while other work runs. Exported for renderer-level tests.
+export function staleRepairSecondaryHtml(slug, installed, pending) {
+    if (pending || !installed) return '';
+    if (!preflightFailedStale(installed) || preflightFailed(installed)) return '';
+    return `<button class="btn btn-default" data-mp-action="fix" data-slug="${escapeHtml(slug)}" title="Repair based on the last recorded preflight — the payload changed since that run">Repair</button>`;
+}
+
+
 function summaryCard(summary, installedMap, isPlugin) {
     const slug = summary.slug;
     const pending = getPending(slug);
@@ -269,6 +296,7 @@ function summaryCard(summary, installedMap, isPlugin) {
         ? ''
         : isInstalled
             ? `
+                ${staleRepairSecondaryHtml(slug, installed, pending)}
                 ${updateAvailable ? `<button class="btn btn-default" data-mp-update="${escapeHtml(slug)}">Update</button>` : ''}
                 ${installed.enabled && installed.type === 'extension' ? `<button class="btn btn-default" data-mp-action="disable" data-slug="${escapeHtml(slug)}">Disable</button>` : ''}
                 <button class="btn btn-default" data-mp-uninstall="${escapeHtml(slug)}" data-name="${escapeHtml(installed.name || '')}">Uninstall</button>

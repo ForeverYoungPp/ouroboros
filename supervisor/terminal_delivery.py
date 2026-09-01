@@ -694,9 +694,8 @@ def build_completed_result_event(
         "chat_id": chat_id,
         "task_id": tid,
         "text": core_text + unreconciled_runs_note(unreconciled_runs),
-        # The natural final answer is rendered as markdown; a re-delivered copy
-        # that drops the format renders as a different message than the one the
-        # owner would have got.
+        # The natural final answer is rendered as markdown; a re-delivered
+        # copy that drops the format renders as a different message.
         "format": "markdown",
         "delivery_id": delivery_id_for(tid, core_text),
     }
@@ -719,11 +718,11 @@ def project_terminal_result_event(
 ) -> Dict[str, Any]:
     """Project one terminal event from producer-stamped origin.
 
-    ``host_salvage`` becomes one short keyed System receipt while the full
-    bytes stay in task details. ``model_final`` and a missing legacy origin
-    keep the assistant projection. No text/status/length inference occurs.
-    The delivery id always digests the stable core result rather than a
-    mutable disclosure suffix.
+    ``host_salvage`` becomes one short keyed plain System receipt (inherited
+    ``format``/``log_text`` dropped; the full bytes stay in task details);
+    ``model_final`` and a missing legacy origin keep the assistant projection
+    untouched — no text/status/length inference. The delivery id always
+    digests the stable core result rather than a mutable disclosure suffix.
     """
     tid = str(task_id or "")
     core_text = str(result_text or "")
@@ -741,6 +740,7 @@ def project_terminal_result_event(
             "terminal_origin": TERMINAL_ORIGIN_HOST_SALVAGE,
         })
         event.pop("log_text", None)
+        event.pop("format", None)
         return event
     if origin == TERMINAL_ORIGIN_MODEL_FINAL:
         event["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL
