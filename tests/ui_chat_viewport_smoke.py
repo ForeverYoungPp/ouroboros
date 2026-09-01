@@ -549,10 +549,10 @@ def run_chat_viewport_smoke(
                 _emit_ws_frame(page, late_child_frame)
                 assert parent.evaluate("card => card.getBoundingClientRect().height") > parent_before_mount + 30
                 assert abs(card_top(page, anchor_id) - anchor_before) <= 6
-
-                # An exact lifecycle repeat is internal reconciliation, not a
-                # visible mutation allowed to consume the 40px follow zone.
+                parent.evaluate("""card => { window.__subagentNoopMutations = []; window.__subagentNoopObserver = new MutationObserver(records => window.__subagentNoopMutations.push(...records)); window.__subagentNoopObserver.observe(card, {attributes: true, attributeOldValue: true, childList: true, characterData: true, subtree: true}); }""")
                 assert_noop_frame(page, late_child_frame)
+                noop_mutations = page.evaluate("""() => { window.__subagentNoopObserver.disconnect(); return window.__subagentNoopMutations.map(record => `${record.type}:${record.target.dataset?.taskId || record.target.dataset?.subagentsFor || record.target.className}:${record.attributeName || ''}:${record.oldValue || ''}->${record.target.getAttribute?.(record.attributeName) || ''}`); }""")
+                assert noop_mutations == [], noop_mutations
                 put_at_viewport_top(page, anchor_selector)
                 enriched_child = {
                     **late_child_frame,

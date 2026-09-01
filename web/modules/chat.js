@@ -868,12 +868,11 @@ export function createChatInstance({
     ) {
         if (!record || seen.has(record.groupId)) return false;
         seen.add(record.groupId);
-        const movedEarlier = stampNodeTimestamp(record.root, rawTs, { anchor: true });
         if (record.isSubagent) {
             const parent = liveCardRecords.get(record.parentGroupId);
-            const parentMoved = reanchorTaskCard(parent, rawTs, { suppressDomInsert }, seen);
-            return movedEarlier || parentMoved;
+            return reanchorTaskCard(parent, rawTs, { suppressDomInsert }, seen);
         }
+        const movedEarlier = stampNodeTimestamp(record.root, rawTs, { anchor: true });
         if (!movedEarlier) return false;
         if (suppressDomInsert || _syncPass1Active) {
             record._anchorOrderDirty = true;
@@ -1615,9 +1614,7 @@ export function createChatInstance({
         let changed = record.suggestedName !== nm || titleChanged;
         record.suggestedName = nm;
         if (titleChanged) record.titleEl.textContent = nm;
-        // P1 (v6.82): the collapsed activity line was suppressed while the card
-        // was unnamed; populate it now from the remembered candidate so the live
-        // task_named direct-DOM path does not depend on the next frame.
+        // Restore the deferred collapsed activity after naming.
         changed = renderCollapsedActivity(record, projectCollapsedActivity({
             suggestedName: nm,
             headline: record.collapsedActivity,
@@ -1626,8 +1623,7 @@ export function createChatInstance({
         return Boolean(changed && record.root?.isConnected);
     }
 
-    // One renderer for the bounded collapsed projection. Full narration is
-    // owned by timeline disclosure, never by a mouse-only title attribute.
+    // Full narration stays in the timeline, not a mouse-only title.
     function renderCollapsedActivity(record, text) {
         if (!record?.activityEl) return false;
         const changed = record.activityEl.textContent !== text
@@ -1643,10 +1639,10 @@ export function createChatInstance({
         let container = parentRecord.subagentsEl;
         if (!container) {
             container = document.createElement('div');
+            container.className = 'chat-subagents';
+            container.dataset.subagentsFor = parentId;
             parentRecord.subagentsEl = container;
         }
-        container.className = 'chat-subagents';
-        container.dataset.subagentsFor = parentId;
         const anchor = parentRecord.reviewsHostEl || parentRecord.timelineEl;
         if (container.parentNode !== parentRecord.root || container.previousElementSibling !== anchor) {
             anchor?.insertAdjacentElement('afterend', container);
@@ -1675,13 +1671,18 @@ export function createChatInstance({
             parentGroupId: parentId,
             role,
         });
+        const promoted = !record.isSubagent;
         record.isSubagent = true;
         record.parentGroupId = parentId;
         record.subagentRole = role || record.subagentRole || '';
-        record.root.classList.add('subagent');
-        record.root.dataset.subagent = '1';
-        record.root.dataset.parentTaskId = parentId;
-        record.root.dataset.subagentRole = record.subagentRole;
+        if (promoted) {
+            record.root.classList.add('subagent');
+            record.root.dataset.subagent = '1';
+        }
+        if (record.root.dataset.parentTaskId !== parentId) record.root.dataset.parentTaskId = parentId;
+        if (record.root.dataset.subagentRole !== record.subagentRole) {
+            record.root.dataset.subagentRole = record.subagentRole;
+        }
         if (existing && !explicitCardExpansion.has(childId)) {
             setLiveCardExpanded(record, nestedSubagentsExpanded);
         }
@@ -1753,12 +1754,14 @@ export function createChatInstance({
 
     function setLiveCardExpanded(record, expanded) {
         const mutate = () => {
-            if (!record?.root) return;
-            record.root.dataset.expanded = expanded ? '1' : '0';
-            // perf2 P4.4: first expand materializes a lazily-deferred timeline
-            // (its DOM was skipped while the card was collapsed/display:none).
+            if (!record?.root) return false;
+            const value = expanded ? '1' : '0';
+            if (record.root.dataset.expanded === value) return false;
+            record.root.dataset.expanded = value;
+            // First expansion materializes its deferred timeline.
             if (expanded && record._timelineDirty) renderLiveCardTimeline(record);
             syncLiveCardToggle(record);
+            return Boolean(record.root.isConnected);
         };
         return record?.root?.isConnected ? withStableViewport(mutate) : mutate();
     }
