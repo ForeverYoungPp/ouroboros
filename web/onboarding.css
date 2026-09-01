@@ -35,11 +35,10 @@
   --shadow: 0 28px 64px rgba(0, 0, 0, 0.45);
   /* Shared design-system vocabulary (C7.2): the onboarding page is inlined
      standalone (it cannot import style.css), so it mirrors the same role tokens
-     by VALUE — project fuchsia and the owner-voice blue match style.css exactly.
+     by VALUE — the project fuchsia matches style.css exactly.
      tests/test_web_typography_static.py pins that every name declared in BOTH
      :root blocks resolves to the same value here as it does there. */
   --project: #e879f9;
-  --user: #6e96d2;
   /* Type scale — the same four sizes as style.css, no fifth. */
   --type-meta: 12px;
   --type-body: 14px;

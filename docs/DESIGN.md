@@ -157,12 +157,12 @@ relabel the whole still-working task. A failed child keeps a compact factual
 authoritative status. Internal reason codes belong in details and diagnostics,
 not compact headlines.
 
-| Role | Foreground | Background |
-| --- | --- | --- |
-| Success / connected | `--status-ok-fg` | `--status-ok-bg` |
-| Warning / degraded | `--status-warn-fg` | `--status-warn-bg` |
-| Error / failed | `--status-error-fg` | `--status-error-bg` |
-| Neutral / classification | `--status-neutral-fg` | `--status-neutral-bg` |
+| Role | Foreground | Background | Border |
+| --- | --- | --- | --- |
+| Success / connected | `--status-ok-fg` | `--status-ok-bg` | `--status-ok-border` |
+| Warning / degraded | `--status-warn-fg` | `--status-warn-bg` | `--status-warn-border` |
+| Error / failed | `--status-error-fg` | `--status-error-bg` | `--status-error-border` |
+| Neutral / classification | `--status-neutral-fg` | `--status-neutral-bg` | `--status-neutral-border` |
 
 - **Status renders as dot + text.** The dot carries the state at a glance, so
   the sentence does not have to shout it in saturated colour and can sit at
@@ -172,9 +172,37 @@ not compact headlines.
   A tone value the code actually emits (`muted`) must have a rule; falling
   through to a default is how chips end up white.
 - Chips are `--type-meta`, not smaller, and are not uppercased.
-- `--tone-ok` / `--tone-warn` / `--tone-danger` remain the saturated role hues
-  for large fills, borders and indicators. The `--status-*-fg` tints are for
-  12px text on near-black; do not swap them.
+- `--green` / `--amber` / `--red` are the saturated hues, and they are for
+  things that are not text: dots, switch tracks, progress. The `--status-*-fg`
+  tints are for text on near-black; do not swap them. (There was also a
+  `--tone-ok` / `--tone-warn` / `--tone-danger` alias family, plus
+  `--accent-task` / `--accent-system` / `--accent-user` / `--accent-project`
+  and `--ui-tone-*`. They were named here and referenced by nothing at all, so
+  every surface kept inventing its own literal instead. They are gone; the
+  vocabulary above is the whole vocabulary.)
+
+### The tone primitive
+
+Two shapes carry a tone, and they are not interchangeable:
+
+- **A status sentence** — `.ui-status[data-tone]`. Foreground only, rendered as
+  dot + text. Filling it would turn every inline status into a badge and make
+  "connected" the loudest thing on the panel.
+- **A status chip** — `.ui-chip[data-tone]`. The full triple, because the chip
+  *is* the status and has nothing else to carry it.
+
+Surfaces whose tone is a class suffix rather than `data-tone`
+(`.skills-status-*`, `.skills-badge-*`, `.toast-*`, `.marketplace-state-*`,
+`.chat-live-phase`, `.log-phase`, `.evo-runtime-pill`, `.widget-table-status`,
+`.widget-metric` / `.widget-callout`) name the same tokens. A surface that
+paints only its edge (a card tinted by its state, a callout's left rule) takes
+the border and leaves its own background alone; a toast keeps its glass
+background, because a translucent status fill over live page content costs the
+text its contrast.
+
+Adopting these tokens is applying the semantic status contract, which already
+governs every surface — it is not a token migration of those surfaces and does
+not move them into the migrated set in section 8.
 
 ## 5. Card and section composition
 

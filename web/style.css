@@ -1,7 +1,6 @@
 :root {
     --bg-primary: #0d0b0f;
     --bg-secondary: #1a1520;
-    --bg-tertiary: #201828;
     --bg-card: rgba(255, 255, 255, 0.06);
     --bg-hover: rgba(255, 255, 255, 0.08);
     /* Type scale + foreground semantics: docs/DESIGN.md. Four sizes, no fifth. */
@@ -20,7 +19,6 @@
     --accent: #c93545;
     --accent-light: #f07a86;
     --accent-dim: rgba(201, 53, 69, 0.15);
-    --accent-glow: rgba(201, 53, 69, 0.08);
     /* Accent alpha tokens; keep future tweaks off hardcoded rgba literals. */
     --accent-04: rgba(201, 53, 69, 0.04);
     --accent-05: rgba(201, 53, 69, 0.05);
@@ -41,16 +39,11 @@
        blue and the two blurred together; fuchsia is unmistakably its own role.
        Base is legible-on-dark fuchsia-400; every tint shares the SAME hue (C7.3). */
     --project: #e879f9;
-    --project-light: #f0abfc;
-    --project-dim: rgba(232, 121, 249, 0.15);
     --project-08: rgba(232, 121, 249, 0.08);
     --project-12: rgba(232, 121, 249, 0.12);
     --project-18: rgba(232, 121, 249, 0.18);
-    --project-25: rgba(232, 121, 249, 0.25);
     /* User / owner voice: the owner's chat bubble + sender accents. Tokenized so
        the hue lives in one place and stays clear of the project fuchsia (C7.2). */
-    --user: #6e96d2;
-    --user-light: #9bb9f0;
     --user-bubble-from: rgba(80, 120, 190, 0.14);
     --user-bubble-to: rgba(55, 85, 155, 0.12);
     --user-border: rgba(110, 150, 210, 0.18);
@@ -64,7 +57,6 @@
     --system-sender: rgba(245, 158, 11, 0.9);
     --system-text: rgba(255, 240, 210, 0.78);
     --blue: #3b82f6;
-    --blue-dim: rgba(30, 64, 175, 0.3);
     --amber: #f59e0b;
     --amber-dim: rgba(245, 158, 11, 0.15);
     --green: #22c55e;
@@ -89,31 +81,22 @@
     --ui-card-bg-soft: var(--surface-card-soft);
     --ui-card-border: var(--surface-border);
     --ui-modal-bg: rgba(18, 20, 26, 0.98);
-    --ui-tone-ok: #22c55e;
-    --ui-tone-warn: #f59e0b;
-    --ui-tone-danger: #ef4444;
-    /* Semantic role palette (SSOT, C7.2): name a color by the ROLE it signals, so
-       a component references the role rather than a raw hue. task = red accent (a
-       running task), system = amber (system / owner-control notices), user = blue
-       (the owner's voice), project = fuchsia (a project identity). Tones map ok /
-       warn / danger. Re-point a role here and every surface follows. */
-    --accent-task: var(--accent);
-    --accent-system: var(--amber);
-    --accent-user: var(--user);
-    --accent-project: var(--project);
-    --tone-ok: var(--green);
-    --tone-warn: var(--amber);
-    --tone-danger: var(--red);
-    /* Status pairs: fg/bg named together, never derived (docs/DESIGN.md).
-       --tone-* stays the saturated hue for fills; these are for 12px text. */
+    /* Status triples: fg/bg/border named together, never derived
+       (docs/DESIGN.md "Status and chips"). The fg tints are readable at 12px on
+       near-black; the saturated --green/--amber/--red stay for dots, tracks and
+       other large indicators. */
     --status-ok-fg: #6ee7b7;
     --status-ok-bg: var(--green-dim);
+    --status-ok-border: rgba(34, 197, 94, 0.28);
     --status-warn-fg: #fcd34d;
     --status-warn-bg: var(--amber-dim);
+    --status-warn-border: rgba(245, 158, 11, 0.30);
     --status-error-fg: #fca5a5;
     --status-error-bg: var(--red-dim);
+    --status-error-border: rgba(239, 68, 68, 0.30);
     --status-neutral-fg: var(--text-meta);
     --status-neutral-bg: rgba(255, 255, 255, 0.06);
+    --status-neutral-border: rgba(255, 255, 255, 0.12);
     --focus-accent-border: rgba(201, 53, 69, 0.4);
     --focus-accent-ring: var(--accent-10);
     --radius-xs: 3px;
@@ -146,7 +129,6 @@
     --space-3: 12px;
     --space-4: 16px;
     --space-5: 24px;
-    --space-6: 32px;
     /* Bounded scroll region for the Updates restore list (DESIGN section 5:
        a new visual dimension becomes a variable before a page-local literal). */
     --updates-list-max-height: 320px;
@@ -1866,31 +1848,35 @@ body.resizing-panels { user-select: none; }
     animation: thinking-pulse 1.5s ease-in-out infinite;
 }
 
+/* Phase pills are status chips with class-named tones; the triple is the
+   canonical one. The saturated --green/--amber/--red they used to carry are
+   dot-and-indicator hues, not small-text hues (docs/DESIGN.md "Status and
+   chips"). */
 .chat-live-phase:is(.done, .ready, .ok, .result, .usage, .metrics),
 .chat-live-line-phase:is(.done, .ready, .ok, .result, .usage, .metrics),
 .log-entry .log-phase:is(.done, .ready, .ok, .result, .usage, .metrics),
 .evo-runtime-pill.online {
-    color: var(--green);
-    border-color: rgba(34, 197, 94, 0.22);
-    background: rgba(34, 197, 94, 0.10);
+    color: var(--status-ok-fg);
+    border-color: var(--status-ok-border);
+    background: var(--status-ok-bg);
 }
 
 .chat-live-phase:is(.warn, .alive, .empty, .cancelled),
 .chat-live-line-phase:is(.warn, .alive, .empty, .cancelled),
 .log-entry .log-phase:is(.warn, .alive, .empty, .cancelled),
 .evo-runtime-pill.starting {
-    color: var(--amber);
-    border-color: rgba(245, 158, 11, 0.25);
-    background: rgba(245, 158, 11, 0.10);
+    color: var(--status-warn-fg);
+    border-color: var(--status-warn-border);
+    background: var(--status-warn-bg);
 }
 
 .chat-live-phase:is(.error, .timeout, .lifecycle_error),
 .chat-live-line-phase:is(.error, .timeout, .lifecycle_error),
 .log-entry .log-phase:is(.error, .timeout, .lifecycle_error),
 .evo-runtime-pill.error {
-    color: var(--red);
-    border-color: rgba(239, 68, 68, 0.25);
-    background: rgba(239, 68, 68, 0.10);
+    color: var(--status-error-fg);
+    border-color: var(--status-error-border);
+    background: var(--status-error-bg);
 }
 
 /* Live-card typing dots. */
@@ -3197,15 +3183,53 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     white-space: nowrap;
 }
 
+/* The chip primitive reserves its border so a tone can paint it without
+   changing the chip's size. The aliases above keep their own geometry. */
+.ui-chip {
+    border: 1px solid transparent;
+}
+
 .ui-status,
 :where(.settings-inline-status, .marketplace-status, .wizard-runtime-status) {
     color: var(--text-secondary);
-    font-size: 13px;
-    line-height: 1.45;
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
 }
 
-/* Tone is a STATE and must outrank the `.muted` utility: `#mp-status` carries
+/* Tone primitive (docs/DESIGN.md "Status and chips"). A status states a fact
+   with an EXPLICIT pair; it never derives its foreground from whatever generic
+   opacity happens to sit on the element.
+   Two shapes, because a status appears as two things:
+     - `.ui-status[data-tone]` — a status SENTENCE: foreground only, rendered as
+       dot + text. Giving it a fill would turn every inline status into a badge
+       and make the loudest thing on the panel the one that says "connected".
+     - `.ui-chip[data-tone]` — a status CHIP: the full triple, because the chip
+       itself is the status and has nothing else to carry it.
+   Tone is a STATE and must outrank the `.muted` utility: `#mp-status` carries
    both classes, so a :where()-wrapped tone (specificity 0) would lose to it. */
+.ui-chip[data-tone="ok"] {
+    color: var(--status-ok-fg);
+    background: var(--status-ok-bg);
+    border-color: var(--status-ok-border);
+}
+.ui-chip[data-tone="warn"] {
+    color: var(--status-warn-fg);
+    background: var(--status-warn-bg);
+    border-color: var(--status-warn-border);
+}
+.ui-chip[data-tone="danger"],
+.ui-chip[data-tone="error"] {
+    color: var(--status-error-fg);
+    background: var(--status-error-bg);
+    border-color: var(--status-error-border);
+}
+.ui-chip[data-tone="neutral"],
+.ui-chip[data-tone="muted"] {
+    color: var(--status-neutral-fg);
+    background: var(--status-neutral-bg);
+    border-color: var(--status-neutral-border);
+}
+
 .ui-status[data-tone="ok"],
 .settings-inline-status[data-tone="ok"],
 .settings-test-result[data-tone="ok"],
@@ -4041,6 +4065,12 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 /* P2: main-screen Update pill — a pointer to Dashboard -> Updates. */
+/* "An update is available" is a classification, not an alarm and not a
+   success: it is a pointer to Dashboard -> Updates and it reads NEUTRAL
+   (docs/DESIGN.md "Status and chips"). The sky blue it used to carry belonged
+   to no role in the system and was the only place that hue appeared.
+   Uncommitted local changes ARE a caveat about what an update would do, so
+   that variant keeps the warn triple. */
 .update-pill {
     display: inline-flex;
     align-items: center;
@@ -4048,22 +4078,23 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     margin: 6px 8px;
     padding: 5px 11px;
     border-radius: 999px;
-    border: 1px solid rgba(56, 189, 248, 0.5);
-    background: rgba(56, 189, 248, 0.14);
-    color: #bae6fd;
+    border: 1px solid var(--status-neutral-border);
+    background: var(--status-neutral-bg);
+    color: var(--status-neutral-fg);
     font-size: 12px;
     font-weight: 600;
     cursor: pointer;
 }
 
 .update-pill:hover {
-    background: rgba(56, 189, 248, 0.22);
+    background: var(--bg-hover);
+    color: var(--text-primary);
 }
 
 .update-pill.has-local {
-    border-color: rgba(251, 191, 36, 0.55);
-    background: rgba(251, 191, 36, 0.14);
-    color: #fde68a;
+    border-color: var(--status-warn-border);
+    background: var(--status-warn-bg);
+    color: var(--status-warn-fg);
 }
 
 .settings-embedded-content {
@@ -4182,28 +4213,29 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     filter: brightness(1.12);
 }
 
+/* Canonical status triples (docs/DESIGN.md "Status and chips"). */
 .skills-status-ok {
-    background: rgba(34, 197, 94, 0.12);
-    color: #4ade80;
-    border-color: rgba(34, 197, 94, 0.3);
+    background: var(--status-ok-bg);
+    color: var(--status-ok-fg);
+    border-color: var(--status-ok-border);
 }
 
 .skills-status-warn {
-    background: rgba(245, 158, 11, 0.12);
-    color: #fbbf24;
-    border-color: rgba(245, 158, 11, 0.3);
+    background: var(--status-warn-bg);
+    color: var(--status-warn-fg);
+    border-color: var(--status-warn-border);
 }
 
 .skills-status-danger {
-    background: rgba(239, 68, 68, 0.12);
-    color: #f87171;
-    border-color: rgba(239, 68, 68, 0.3);
+    background: var(--status-error-bg);
+    color: var(--status-error-fg);
+    border-color: var(--status-error-border);
 }
 
 .skills-status-muted {
-    background: rgba(250, 250, 250, 0.06);
-    color: rgba(250, 250, 250, 0.65);
-    border-color: rgba(250, 250, 250, 0.12);
+    background: var(--status-neutral-bg);
+    color: var(--status-neutral-fg);
+    border-color: var(--status-neutral-border);
 }
 
 .skills-switch {
@@ -4611,9 +4643,9 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .skills-source-warn {
-    background: rgba(245, 158, 11, 0.1);
+    background: var(--status-warn-bg);
     color: var(--status-warn-fg);
-    border-color: rgba(245, 158, 11, 0.25);
+    border-color: var(--status-warn-border);
 }
 
 .skills-source-muted {
@@ -4637,10 +4669,10 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     letter-spacing: 0.5px;
 }
 
-.skills-badge-ok { background: rgba(34, 197, 94, 0.15); color: #22c55e; }
-.skills-badge-danger { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
-.skills-badge-warn { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
-.skills-badge-muted { background: rgba(250, 250, 250, 0.06); color: rgba(250, 250, 250, 0.55); }
+.skills-badge-ok { background: var(--status-ok-bg); color: var(--status-ok-fg); }
+.skills-badge-danger { background: var(--status-error-bg); color: var(--status-error-fg); }
+.skills-badge-warn { background: var(--status-warn-bg); color: var(--status-warn-fg); }
+.skills-badge-muted { background: var(--status-neutral-bg); color: var(--status-neutral-fg); }
 
 .toast-stack {
     position: fixed;
@@ -4675,11 +4707,13 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     animation: toast-out 160ms ease-in forwards;
 }
 
-.toast-ok { border-color: rgba(34, 197, 94, 0.28); color: #bbf7d0; }
-.toast-danger { border-color: rgba(239, 68, 68, 0.35); color: #fecaca; }
-.toast-warn { border-color: rgba(245, 158, 11, 0.35); color: #fde68a; }
+/* A toast keeps its own glass background (a translucent status fill over the
+   page would cost the text its contrast); the tone paints edge + foreground. */
+.toast-ok { border-color: var(--status-ok-border); color: var(--status-ok-fg); }
+.toast-danger { border-color: var(--status-error-border); color: var(--status-error-fg); }
+.toast-warn { border-color: var(--status-warn-border); color: var(--status-warn-fg); }
 .toast-muted,
-.toast-info { color: rgba(250, 250, 250, 0.78); }
+.toast-info { color: var(--status-neutral-fg); }
 
 @keyframes toast-in {
     from { opacity: 0; transform: translateY(8px); }
@@ -4905,15 +4939,15 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .marketplace-state-ok {
-    border-color: rgba(34, 197, 94, 0.25);
+    border-color: var(--status-ok-border);
 }
 
 .marketplace-state-warn {
-    border-color: rgba(245, 158, 11, 0.30);
+    border-color: var(--status-warn-border);
 }
 
 .marketplace-state-danger {
-    border-color: rgba(239, 68, 68, 0.30);
+    border-color: var(--status-error-border);
 }
 
 .marketplace-card-meta {
@@ -5297,10 +5331,11 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .widget-metric > strong { font-size: 18px; }
 .widget-metric small { color: var(--text-secondary); font-size: 11px; font-weight: 500; }
 .widget-callout { font-size: 13px; line-height: 1.45; background: rgba(96, 165, 250, 0.06); }
-.widget-metric[data-tone="ok"], .widget-callout[data-tone="ok"] { border-left-color: #34d399; }
-.widget-metric[data-tone="warn"], .widget-callout[data-tone="warn"] { border-left-color: #fbbf24; }
-.widget-metric[data-tone="danger"], .widget-callout[data-tone="danger"] { border-left-color: #e85d6f; }
-.widget-metric[data-tone="info"], .widget-callout[data-tone="info"] { border-left-color: #60a5fa; }
+.widget-metric[data-tone="ok"], .widget-callout[data-tone="ok"] { border-left-color: var(--status-ok-fg); }
+.widget-metric[data-tone="warn"], .widget-callout[data-tone="warn"] { border-left-color: var(--status-warn-fg); }
+.widget-metric[data-tone="danger"], .widget-callout[data-tone="danger"] { border-left-color: var(--status-error-fg); }
+/* `info` is a widget-only tone with no status role; it stays the plain blue. */
+.widget-metric[data-tone="info"], .widget-callout[data-tone="info"] { border-left-color: var(--blue); }
 
 .widget-kv-row {
     display: flex;
@@ -5334,9 +5369,11 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .widget-table a { color: #93c5fd; overflow-wrap: anywhere; }
 .widget-table-status { font-weight: 600; }
-.widget-table-status[data-tone="ok"] { color: #6ee7b7; }
-.widget-table-status[data-tone="warn"] { color: #fcd34d; }
-.widget-table-status[data-tone="danger"] { color: #fb7185; }
+.widget-table-status[data-tone="ok"] { color: var(--status-ok-fg); }
+.widget-table-status[data-tone="warn"] { color: var(--status-warn-fg); }
+.widget-table-status[data-tone="danger"] { color: var(--status-error-fg); }
+.widget-table-status[data-tone="neutral"],
+.widget-table-status[data-tone="muted"] { color: var(--status-neutral-fg); }
 
 .widget-media img,
 .widget-media video {
