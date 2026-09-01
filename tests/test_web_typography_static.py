@@ -276,3 +276,82 @@ def test_migrated_region_markers_do_not_swallow_unmigrated_surfaces() -> None:
     # that fails when someone independently improves an unmigrated surface would
     # punish exactly the work it wants. The markers' own uniqueness (above) is
     # what proves the region is really scoped.
+
+
+# ---------------------------------------------------------------------------
+# Token hygiene: declared <-> used, in both directions
+# ---------------------------------------------------------------------------
+
+# Files that resolve their variables against web/style.css `:root`. They are
+# loaded together by web/index.html, so a token declared in one and named in
+# the other is correct. web/onboarding.css is NOT here: it is inlined into a
+# standalone page with its own `:root` and is covered by the mirror test above.
+ROOT_CONSUMERS = ("web/style.css", "web/settings.css")
+
+VAR_REFERENCE = re.compile(r"var\(\s*(--[a-z0-9-]+)")
+DECLARATION = re.compile(r"^\s*(--[a-z0-9-]+)\s*:", re.MULTILINE)
+
+
+def _js_sources() -> str:
+    """Every web module, concatenated.
+
+    JS participates in the variable contract from both ends: it writes measured
+    values with ``setProperty('--chat-input-reserve', …)`` and it reads themed
+    ones with ``getComputedStyle(...).getPropertyValue('--diagram-bg')``. A
+    token at either end is live even though no CSS rule mentions it."""
+    return "".join(
+        path.read_text(encoding="utf-8") for path in sorted((WEB / "modules").rglob("*.js"))
+    )
+
+
+def test_every_css_variable_is_declared_somewhere() -> None:
+    """A `var(--typo)` is silent: the declaration simply does not apply and the
+    property keeps whatever it inherited. This codebase had six of them —
+    `--surface-1`, `--surface-2`, `--danger`, `--warning`, `--mono` and
+    `--text-link` — each carrying a hardcoded fallback that was the value
+    actually rendering, and three of those fallbacks (`#e5534b`, `#b58900`,
+    `#16181d`) were colours from no palette in this product."""
+    declared = set()
+    for rel in ROOT_CONSUMERS:
+        declared |= set(DECLARATION.findall(_decommented(_read(rel))))
+    js = _js_sources()
+
+    dangling: list[str] = []
+    for rel in ROOT_CONSUMERS:
+        source = _decommented(_read(rel))
+        for lineno, line in enumerate(source.splitlines(), 1):
+            for name in VAR_REFERENCE.findall(line):
+                if name in declared or name in js:
+                    continue
+                dangling.append(f"{rel}:{lineno}: var({name})")
+    assert not dangling, (
+        "these variables are never declared, in CSS or by a JS setProperty, so "
+        "every rule naming one silently renders its fallback (or nothing). Name "
+        "an existing token instead of declaring a new one — the point of the "
+        "palette is that it is small (docs/DESIGN.md).\n" + "\n".join(dangling)
+    )
+
+
+def test_every_root_token_has_a_reader() -> None:
+    """The other direction, and the one that actually bites. `--tone-ok`,
+    `--tone-warn`, `--tone-danger`, `--accent-task/system/user/project` and
+    `--ui-tone-*` were named in docs/DESIGN.md as the shared vocabulary and
+    referenced by NOTHING — so seven surfaces each invented their own literal
+    for the same four states while the file said they were unified. A token
+    with no reader is not a reserve; it is a claim the code does not make.
+
+    There is no allowlist. If a token is worth keeping, something uses it."""
+    root = _root_declarations("web/style.css")
+    used = set()
+    for rel in ROOT_CONSUMERS:
+        used |= set(VAR_REFERENCE.findall(_decommented(_read(rel))))
+    js = _js_sources()
+
+    orphans = sorted(name for name in root if name not in used and name not in js)
+    assert not orphans, (
+        "these :root tokens in web/style.css have no reader in the stylesheets "
+        "or the web modules. Either use them or delete them: a documented token "
+        "that resolves nowhere is why surfaces reach for literals "
+        "(docs/DESIGN.md 'Status and chips').\n"
+        + "\n".join(f"  {name}" for name in orphans)
+    )

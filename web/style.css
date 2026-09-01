@@ -5973,7 +5973,7 @@ textarea.chat-input {
     padding: 4px;
     border: 1px solid var(--divider);
     border-radius: var(--radius-md, 8px);
-    background: var(--surface-1, #16181d);
+    background: var(--ui-modal-bg);
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
     max-width: min(260px, calc(100vw - 16px));
 }
@@ -5994,7 +5994,7 @@ textarea.chat-input {
 }
 
 .project-row-menu button.danger {
-    color: var(--danger, #e5534b);
+    color: var(--status-error-fg);
 }
 
 /* New Project dialog */
@@ -6090,7 +6090,7 @@ textarea.chat-input {
 
 .new-project-trust-note {
     padding: 8px 10px;
-    border: 1px solid var(--warning, #b58900);
+    border: 1px solid var(--status-warn-border);
     border-radius: var(--radius-md, 8px);
     color: var(--text-primary);
     font-size: 12.5px;
@@ -6098,7 +6098,7 @@ textarea.chat-input {
 }
 
 .new-project-error {
-    color: var(--danger, #e5534b);
+    color: var(--status-error-fg);
     font-size: 12.5px;
     margin: 0 0 var(--space-2);
     white-space: pre-wrap;
@@ -6536,7 +6536,7 @@ textarea.chat-input {
 .harness-device-code p { margin: 4px 0; }
 /* Device code: display size is the point; nearest token, not a one-off 22px. */
 .harness-code {
-    font-family: var(--mono, ui-monospace, monospace);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     font-size: var(--type-page);
     letter-spacing: 0.18em;
     padding: 8px 12px;
@@ -6546,7 +6546,7 @@ textarea.chat-input {
     user-select: all;
 }
 .harness-attach-command {
-    font-family: var(--mono, ui-monospace, monospace);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     font-size: var(--type-meta);
     padding: 8px 10px;
     border-radius: 8px;
@@ -6564,7 +6564,7 @@ textarea.chat-input {
 .harness-code-entry label { font-size: var(--type-meta); line-height: var(--line-meta); color: var(--text-meta); }
 .harness-code-entry-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .harness-code-entry-row input {
-    font-family: var(--mono, ui-monospace, monospace);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     font-size: var(--type-body);
     padding: 6px 10px;
     border: 1px solid var(--ui-card-border);
@@ -7044,7 +7044,7 @@ textarea.chat-input {
 .chat-media-time {
     flex: 0 0 auto;
     color: var(--text-meta);
-    font-family: var(--mono, ui-monospace, monospace);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     font-size: var(--type-meta);
     white-space: nowrap;
 }
@@ -7160,7 +7160,7 @@ textarea.chat-input {
     padding: var(--space-1, 4px) 0;
     border: none;
     background: none;
-    color: var(--text-link, var(--text-meta));
+    color: var(--accent-light);
     font-size: var(--type-meta);
     cursor: pointer;
 }
