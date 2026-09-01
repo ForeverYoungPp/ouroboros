@@ -106,6 +106,33 @@ so it mirrors the shared tokens **by value**, and
 blocks resolves differently. A wizard-only token is fine; a wizard-only *value*
 for a shared name is not.
 
+### Focus
+
+Keyboard focus has **one** appearance:
+
+```css
+outline: 2px solid var(--focus-accent-border);
+outline-offset: 2px;
+```
+
+`outline-offset: -2px` is the only sanctioned variant, for a control that sits
+flush inside a strip that clips an outer ring (sidebar rows, header buttons).
+Nothing else: not a blue ring, not a green one, not a `box-shadow` standing in
+for an outline, and not a colour picked to match the control it is on. A focus
+ring is the reader's cursor; if it changes colour per surface, it stops
+reading as one thing.
+
+**Hover paint is not a focus ring.** A rule written as
+`.x:hover, .x:focus-visible { background: … }` gives a keyboard user exactly
+what a mouse user gets by accident and nothing that says "you are here". Where
+a control wants both, the shared paint stays in the hybrid rule and the ring
+goes in a `:focus-visible`-only rule of its own.
+
+Text fields are the exception, and they keep their own established idiom:
+`border-color: var(--focus-accent-border)` plus
+`box-shadow: 0 0 0 3px var(--focus-accent-ring)`. A field already has a border
+to recolour, so an outline outside it would be a second frame.
+
 ### `.muted`
 
 `.muted` is a **colour-only utility**: `color: var(--text-meta)`, nothing else.
