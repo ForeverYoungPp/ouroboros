@@ -15,6 +15,74 @@ import hashlib
 import json
 from typing import Any, Callable, Dict, List, Tuple
 
+# Payload-file binary policy (X4/В21). Loadable native code is unreviewable by
+# LLMs: files whose CONTENT starts with a loader magic number are hard-blocked
+# from the skill payload surface — judged by magic bytes, never by filename.
+# These prefixes are unambiguous (never legitimate text), so they block
+# regardless of UTF-8 validity.
+_EXECUTABLE_MAGICS: Tuple[Tuple[bytes, str], ...] = (
+    (b"\x7fELF", "ELF executable / shared object"),
+    (b"\x00asm", "WebAssembly module"),
+    (b"\xfe\xed\xfa\xce", "Mach-O executable (32-bit)"),
+    (b"\xfe\xed\xfa\xcf", "Mach-O executable (64-bit)"),
+    (b"\xce\xfa\xed\xfe", "Mach-O executable (32-bit, little-endian)"),
+    (b"\xcf\xfa\xed\xfe", "Mach-O executable (64-bit, little-endian)"),
+    (b"\xca\xfe\xba\xbe", "Mach-O universal (fat) binary / Java class"),
+)
+
+
+def executable_magic_kind(data: bytes, *, is_utf8_text: bool) -> str:
+    """Return the loadable-executable kind for ``data``'s magic bytes, or ``""``.
+
+    PE (``MZ``, 2 bytes) and other-version .pyc magics are too short /
+    version-varying to be unambiguous on text, so they are judged only on
+    content that is NOT valid UTF-8 — a genuine PE or .pyc body never is."""
+    for magic, kind in _EXECUTABLE_MAGICS:
+        if data.startswith(magic):
+            return kind
+    import importlib.util
+
+    if data.startswith(importlib.util.MAGIC_NUMBER):
+        # The current interpreter's .pyc magic (the .pyc the host could actually
+        # import) is 4 exact bytes — unambiguous, so judged on any content.
+        return "compiled Python bytecode (.pyc)"
+    if not is_utf8_text:
+        if data[:2] == b"MZ":
+            return "PE/DOS executable"
+        if len(data) >= 4 and data[2:4] == b"\r\n":
+            # All CPython 3.x .pyc magics end in b"\r\n" — covers .pyc compiled
+            # by OTHER Python versions.
+            return "compiled Python bytecode (.pyc)"
+    return ""
+
+
+class SkillBinaryPayload(RuntimeError):
+    """Raised for loadable-executable skill payloads (judged by content magic
+    bytes); other non-UTF-8 files become ``{path,size,mime,sha256}`` descriptors."""
+
+    def __init__(self, relpath: str, size_bytes: int, kind: str = "") -> None:
+        super().__init__(
+            f"Skill file {relpath!r} is a loadable executable ({kind or 'magic bytes'}, "
+            f"{size_bytes} bytes); review hard-blocks native code in the skill surface."
+        )
+        self.relpath = relpath
+        self.size_bytes = size_bytes
+        self.kind = kind
+
+
+def binary_file_descriptor(relpath: str, data: bytes, *, filename: str = "") -> Dict[str, Any]:
+    """Typed descriptor for a non-UTF-8, non-executable payload file: the review
+    pack carries ``{path,size,mime,sha256}`` instead of raw bytes."""
+    import mimetypes
+
+    return {
+        "path": relpath,
+        "size": len(data),
+        "mime": mimetypes.guess_type(filename or relpath)[0] or "application/octet-stream",
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
 _SINGLE_CONTENT = (
     "Review the skill package whose manifest and payload are included above, using the "
     "Skill Review Checklist. Return ONLY the JSON array described in the output contract."
@@ -27,6 +95,11 @@ _SESSION_RETRIEVAL = (
     "`docs/CREATING_SKILLS.md`, `ouroboros/contracts/plugin_api.py`, and "
     "`ouroboros/extension_ui_validation.py` in full. Treat those source reads as "
     "the governance and host-contract context for this review.\n\n"
+    "Some skill payload files may be binary / non-UTF-8 and appear in the pack only "
+    "as {path,size,mime,sha256} descriptors instead of inlined content. You may "
+    "inspect such suspicious or binary files with your own read/search tools when "
+    "their path is reachable inside your session root; when it is not, judge them "
+    "by the descriptor (size/mime/sha256) and say so in the finding.\n\n"
 )
 
 
