@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { classifyShellUrl, installDesktopShellLinkInterceptor } from '../modules/ui_helpers.js';
@@ -65,7 +66,7 @@ function makeEvent(anchor) {
     };
 }
 
-function makeHarness({ api, pywebview = true } = {}) {
+function makeHarness({ api, pywebview = true, parent = null, openFileImpl = null, downloadFileImpl = null } = {}) {
     const calls = { open: [], copied: [], toasts: [], openFile: [], downloadFile: [] };
     const docListeners = {};
     const winListeners = {};
@@ -82,12 +83,14 @@ function makeHarness({ api, pywebview = true } = {}) {
         open(...args) { calls.open.push(args); return 'native-window'; },
     };
     if (pywebview) win.pywebview = { api: api || {} };
+    // A top-level window is its own parent; a framed document gets a fake one.
+    win.parent = parent || win;
     installDesktopShellLinkInterceptor({
         win,
         doc,
         toast: (message, tone) => calls.toasts.push({ message, tone }),
-        openFile: async (url, name) => { calls.openFile.push([url, name]); },
-        downloadFile: async (url, name) => { calls.downloadFile.push([url, name]); },
+        openFile: openFileImpl || (async (url, name) => { calls.openFile.push([url, name]); }),
+        downloadFile: downloadFileImpl || (async (url, name) => { calls.downloadFile.push([url, name]); }),
     });
     const click = async (anchor) => {
         const event = makeEvent(anchor);
@@ -119,6 +122,44 @@ test('a late pywebviewready announcement installs the interceptor', async () => 
     const event = await hx.click(makeAnchor({ href: 'https://example.com/x', target: '_blank' }));
     assert.equal(event.defaultPrevented, true);
     assert.deepEqual(external, ['https://example.com/x']);
+});
+
+// --- framed wizard document (two-document pattern) ------------------------
+
+test('a framed document resolves the bridge from the PARENT window: sign-in link routes external', async () => {
+    const external = [];
+    const parent = {
+        pywebview: { api: { open_external_url: async (url) => { external.push(url); return { ok: true }; } } },
+        addEventListener() {},
+    };
+    const hx = makeHarness({ pywebview: false, parent });
+    assert.equal(hx.docListeners.click.length, 1, 'parent bridge present at load: installed immediately');
+    // The Agents step's primary action is exactly this anchor shape.
+    const event = await hx.click(makeAnchor({ href: 'https://vendor.example/oauth/device', target: '_blank', rel: 'noopener' }));
+    assert.equal(event.defaultPrevented, true);
+    assert.deepEqual(external, ['https://vendor.example/oauth/device']);
+});
+
+test('a late pywebviewready on the PARENT window installs the framed interceptor', async () => {
+    const parentListeners = {};
+    const parent = { addEventListener(type, fn) { (parentListeners[type] ||= []).push(fn); } };
+    const hx = makeHarness({ pywebview: false, parent });
+    assert.equal(hx.docListeners.click, undefined, 'nothing installed before the bridge exists');
+    assert.equal(parentListeners.pywebviewready.length, 1, 'armed on the top-level window too');
+    const external = [];
+    parent.pywebview = { api: { open_external_url: async (url) => { external.push(url); return { ok: true }; } } };
+    for (const fn of parentListeners.pywebviewready) fn();
+    assert.equal(hx.docListeners.click.length, 1);
+    const event = await hx.click(makeAnchor({ href: 'https://vendor.example/signin', target: '_blank' }));
+    assert.equal(event.defaultPrevented, true);
+    assert.deepEqual(external, ['https://vendor.example/signin']);
+});
+
+test('the onboarding wizard document installs the shell interceptor (source pin)', () => {
+    const source = readFileSync(new URL('../modules/onboarding_wizard.js', import.meta.url), 'utf8');
+    assert.match(source, /installDesktopShellLinkInterceptor\(\);/,
+        'the wizard is a separate document and must install its own interceptor');
+    assert.match(source, /import \{ installAltMenuSuppression, installDesktopShellLinkInterceptor \} from '\.\/ui_helpers\.js';/);
 });
 
 // --- click routing --------------------------------------------------------
@@ -162,6 +203,25 @@ test('a download-named anchor keeps its filename for byte saves', async () => {
     });
     await hx.click(makeAnchor({ href: 'data:text/plain;base64,aGk=', download: 'notes.txt' }));
     assert.deepEqual(saved, [['notes.txt', 'aGk=']]);
+});
+
+test('text/plain data: payload saves with the conventional .txt extension', async () => {
+    const saved = [];
+    const hx = makeHarness({
+        api: { save_bytes_to_downloads: async (name, b64) => { saved.push([name, b64]); return { ok: true } } },
+    });
+    await hx.click(makeAnchor({ href: 'data:text/plain;base64,aGk=', download: '' }));
+    assert.deepEqual(saved, [['download.txt', 'aGk=']]);
+});
+
+test('bridge failures toast with the verb of what actually failed', async () => {
+    let hx = makeHarness({ api: FILE_API, downloadFileImpl: async () => { throw new Error('guard refused'); } });
+    await hx.click(makeAnchor({ href: '/api/files/download?path=a.txt', download: '' }));
+    assert.deepEqual(hx.calls.toasts, [{ message: 'Could not download file: guard refused', tone: 'error' }]);
+
+    hx = makeHarness({ api: FILE_API, openFileImpl: async () => { throw new Error('guard refused'); } });
+    await hx.click(makeAnchor({ href: '/api/tasks/t-1/artifacts/chat-media-aa.png', target: '_blank' }));
+    assert.deepEqual(hx.calls.toasts, [{ message: 'Could not open file: guard refused', tone: 'error' }]);
 });
 
 test('old launcher without save_bytes_to_downloads toasts that saving is unavailable', async () => {

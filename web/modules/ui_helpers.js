@@ -199,6 +199,22 @@ export async function downloadViaHostBridge(url, filename = 'download', { openEx
 
 const BRIDGE_ARTIFACTS_RE = /^\/api\/tasks\/[^/]+\/artifacts\//;
 
+/**
+ * Resolve the pywebview bridge for a document. The onboarding wizard is its
+ * OWN document inside a same-origin overlay iframe, where pywebview injects
+ * the bridge only into the top-level window — so a framed document reads it
+ * from the parent. A cross-origin parent (not our shell) throws and resolves
+ * to null.
+ */
+function shellBridgeApi(win) {
+    try {
+        const host = win.pywebview || (win.parent && win.parent !== win ? win.parent.pywebview : null);
+        return host?.api || null;
+    } catch {
+        return null;
+    }
+}
+
 /** Classify a URL for the desktop shell: file | external | bytes | default. */
 export function classifyShellUrl(rawUrl, baseHref = '') {
     const raw = String(rawUrl || '').trim();
@@ -230,8 +246,12 @@ function bridgeFilenameFromUrl(url, fallback = 'download') {
     } catch { return fallback; }
 }
 
+// Subtypes whose conventional file extension differs from the MIME token.
+const MIME_EXT_ALIASES = { plain: 'txt' };
+
 function filenameForMime(mime) {
-    const ext = String(mime || '').split('/')[1]?.split(/[+;]/)[0]?.toLowerCase() || '';
+    const subtype = String(mime || '').split('/')[1]?.split(/[+;]/)[0]?.toLowerCase() || '';
+    const ext = MIME_EXT_ALIASES[subtype] || subtype;
     return `download.${/^[a-z0-9]{1,10}$/.test(ext) ? ext : 'bin'}`;
 }
 
@@ -312,7 +332,10 @@ async function routeShellUrl(kind, url, deps) {
             toast(`Saved to Downloads: ${saved}`, 'ok');
         }
     } catch (error) {
-        toast(`Could not ${kind === 'bytes' ? 'save file' : 'open link'}: ${error?.message || error}`, 'error');
+        const verb = kind === 'bytes' ? 'save file'
+            : kind === 'file' ? (wantsDownload ? 'download file' : 'open file')
+                : 'open link';
+        toast(`Could not ${verb}: ${error?.message || error}`, 'error');
     }
 }
 
@@ -334,14 +357,14 @@ export function installDesktopShellLinkInterceptor({
         installed = true;
         const nativeOpen = typeof win.open === 'function' ? win.open.bind(win) : () => null;
         const deps = (extra) => ({
-            api: win.pywebview?.api, win, doc, toast, openFile, downloadFile, ...extra,
+            api: shellBridgeApi(win), win, doc, toast, openFile, downloadFile, ...extra,
         });
         // With NO file-bridge method at all, openViaHostBridge/downloadViaHostBridge
         // fall back to window.open / anchor clicks — which would re-enter this
         // interceptor. Keep the native default for that (ancient-launcher) case.
         const fileBridgeReady = (api) => Boolean(api?.open_file_with_default_app || api?.download_file_to_downloads);
         doc.addEventListener('click', (event) => {
-            const api = win.pywebview?.api;
+            const api = shellBridgeApi(win);
             if (!api || event.defaultPrevented) return;
             const anchor = typeof event.target?.closest === 'function' ? event.target.closest('a[href]') : null;
             if (!anchor) return;
@@ -356,7 +379,7 @@ export function installDesktopShellLinkInterceptor({
             }));
         });
         win.open = (url, target, features) => {
-            const api = win.pywebview?.api;
+            const api = shellBridgeApi(win);
             const { kind, url: routed } = api
                 ? classifyShellUrl(url, win.location?.href)
                 : { kind: 'default', url };
@@ -367,8 +390,17 @@ export function installDesktopShellLinkInterceptor({
             return null;
         };
     };
-    if (win.pywebview?.api) install();
-    else win.addEventListener?.('pywebviewready', install, { once: true });
+    if (shellBridgeApi(win)) {
+        install();
+        return;
+    }
+    win.addEventListener?.('pywebviewready', install, { once: true });
+    // A framed document (the onboarding wizard) never receives pywebviewready
+    // itself — the bridge announcement fires on the top-level window. The
+    // frame is same-origin by contract; a cross-origin parent just no-ops.
+    try {
+        if (win.parent && win.parent !== win) win.parent.addEventListener?.('pywebviewready', install, { once: true });
+    } catch { /* not our shell */ }
 }
 
 /**

@@ -1458,39 +1458,27 @@ def main():
                 shutil.copyfileobj(resp, fh)
 
     class MainApi:
+        @staticmethod
+        def _native_confirm(title: str, message: str) -> bool:
+            return bool(_webview_window and _webview_window.create_confirmation_dialog(title, message))
+
         def request_runtime_mode_change(self, mode: str) -> dict:
             try:
-                return _request_runtime_mode_change(
-                    mode,
-                    lambda title, message: bool(
-                        _webview_window and _webview_window.create_confirmation_dialog(title, message)
-                    ),
-                )
+                return _request_runtime_mode_change(mode, self._native_confirm)
             except Exception as exc:
                 log.warning("Runtime mode native confirmation failed: %s", exc, exc_info=True)
                 return {"ok": False, "error": f"Native confirmation failed: {exc}"}
 
         def request_auto_grant_reviewed_skills_change(self, enabled: bool) -> dict:
             try:
-                return _request_auto_grant_reviewed_skills_change(
-                    bool(enabled),
-                    lambda title, message: bool(
-                        _webview_window and _webview_window.create_confirmation_dialog(title, message)
-                    ),
-                )
+                return _request_auto_grant_reviewed_skills_change(bool(enabled), self._native_confirm)
             except Exception as exc:
                 log.warning("Reviewed-skill auto-grant confirmation failed: %s", exc, exc_info=True)
                 return {"ok": False, "error": f"Native confirmation failed: {exc}"}
 
         def request_skill_key_grant(self, skill: str, keys: list) -> dict:
             try:
-                return _request_skill_key_grant(
-                    skill,
-                    keys,
-                    lambda title, message: bool(
-                        _webview_window and _webview_window.create_confirmation_dialog(title, message)
-                    ),
-                )
+                return _request_skill_key_grant(skill, keys, self._native_confirm)
             except Exception as exc:
                 log.warning("Skill grant native confirmation failed: %s", exc, exc_info=True)
                 return {"ok": False, "error": f"Native confirmation failed: {exc}"}
@@ -1508,11 +1496,15 @@ def main():
                 return {"ok": False, "error": str(exc)}
 
         def open_external_url(self, url: str) -> dict:
-            raw = str(url or "")
-            if not raw.lower().startswith(("http://", "https://")):
-                return {"ok": False, "error": "Only absolute http:// or https:// links can be opened."}
-            _open_browser_detached(raw)
-            return {"ok": True}
+            try:
+                raw = str(url or "")
+                if not raw.lower().startswith(("http://", "https://")):
+                    return {"ok": False, "error": "Only absolute http:// or https:// links can be opened."}
+                _open_browser_detached(raw)
+                return {"ok": True}
+            except Exception as exc:
+                log.warning("Desktop external-URL open failed: %s", exc, exc_info=True)
+                return {"ok": False, "error": str(exc)}
 
         def save_bytes_to_downloads(self, filename: str, b64: str) -> dict:
             try:
