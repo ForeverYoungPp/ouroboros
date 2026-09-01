@@ -573,6 +573,7 @@ A pre-existing cross-platform residual remains: shutdown admission is not atomic
 │   │   ├── ARCHITECTURE.md ← This document
 │   │   ├── DEVELOPMENT.md  ← Engineering handbook (naming, entity types, review protocol)
 │   │   ├── CHECKLISTS.md   ← Pre-commit review checklists (single source of truth)
+│   │   ├── CHECKLISTS_ARCHIVE.md ← Standing-disclosure archive for checklist items (binding on reviewers; kept out of the live checklist pack)
 │   │   ├── CREATING_SKILLS.md ← Skill author guide (manifest schema, PluginAPI, widgets, publishing)
 │   │   ├── DESIGN.md       ← Design system semantics (type scale, colour claims, status conventions; engineering rules live in DEVELOPMENT.md § Design System)
 │   │   └── DEPLOYMENT.md ← Deployment notes, including trusted Docker/Kubernetes non-local bind policy

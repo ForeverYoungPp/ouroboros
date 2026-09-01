@@ -1068,9 +1068,13 @@ def _build_critical_block_message(
 
     return (
         f"⚠️ REVIEW_BLOCKED{iteration_note}: Critical issues found by reviewers.\n"
-        "Commit has NOT been created. Fix the issues and try again. Use review_rebuttal\n"
-        "ONLY if a finding is factually incorrect — not to argue against requested tests\n"
-        "or artifacts. If the same finding repeats after a rebuttal, implement the fix\n"
+        "Commit has NOT been created. Fix the issues and try again. review_rebuttal is\n"
+        "legitimate when a finding is factually incorrect, when its evidence does not\n"
+        "support the claimed severity, or when the requested remedy is disproportionate —\n"
+        "e.g. it would remove or restrict a working capability that the accepted plan\n"
+        "did not narrow. Argue for a capability-preserving remedy: change what you can\n"
+        "argue for, not what you can override — a rebuttal never overrides owner-chosen\n"
+        "enforcement. If the same finding repeats after a rebuttal, implement the fix\n"
         "instead of re-arguing.\n\n"
         + "Critical findings:\n"
         + "\n".join(f"  - {_format_review_entry(f, default_severity='critical')}" for f in critical_entries)

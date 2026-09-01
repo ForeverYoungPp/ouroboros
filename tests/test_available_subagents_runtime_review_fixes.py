@@ -396,7 +396,10 @@ def test_delegate_start_recipes_match_the_fresh_start_schema():
         "prompts/SYSTEM.md",
         "docs/ARCHITECTURE.md",
         "docs/DEVELOPMENT.md",
-        "docs/CHECKLISTS.md",
+        # #447 stage 3: the standing disclosures (which carry the delegate_start
+        # recipe) moved to the binding archive; its recipes must stay
+        # schema-valid too.
+        "docs/CHECKLISTS_ARCHIVE.md",
         "ouroboros/subagent_dispatch_notes.py",
         "ouroboros/tools/control.py",
         "ouroboros/tools/delegate.py",
