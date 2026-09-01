@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -12,6 +13,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 import webbrowser
 from logging.handlers import RotatingFileHandler
 from typing import Optional
@@ -1107,7 +1110,7 @@ def _headless_signal_handler(signum, frame) -> None:
     _shutdown_event.set()
 
 
-def _open_browser_detached(url: str) -> threading.Thread:
+def _open_browser_detached(url: str, outcome: Optional[list] = None) -> threading.Thread:
     """Open the default browser without ever blocking the caller.
 
     `webbrowser.open` waits for the child on a stdlib-resolved console
@@ -1117,6 +1120,10 @@ def _open_browser_detached(url: str) -> threading.Thread:
     so a short-lived caller (the already-running notice) can bound-join it
     before process exit would kill the daemon thread under the opener.
 
+    An ``outcome`` list, when given, receives exactly one entry — True/False
+    from ``webbrowser.open`` or the raised exception — so a bounded-join
+    caller (the desktop bridge) can report failure honestly.
+
     DELIBERATE (owner-approved): the opened browser is the USER'S own
     application, intentionally outside process custody and launcher teardown —
     the Emergency-Stop invariant governs the AGENT'S tree, and killing the
@@ -1125,9 +1132,12 @@ def _open_browser_detached(url: str) -> threading.Thread:
     """
     def _open() -> None:
         try:
-            webbrowser.open(url)
-        except Exception:
+            result: object = bool(webbrowser.open(url))
+        except Exception as exc:
+            result = exc
             log.info("Could not open the default browser for %s", url, exc_info=True)
+        if outcome is not None:
+            outcome.append(result)
 
     thread = threading.Thread(target=_open, name="ouroboros-open-browser", daemon=True)
     thread.start()
@@ -1423,8 +1433,6 @@ def main():
         Shared SSOT for both the download-to-Downloads and open-in-default-app
         bridge methods so the loopback guard cannot drift between them.
         """
-        import urllib.parse
-
         full_url = urllib.parse.urljoin(f"http://127.0.0.1:{actual_port}", str(raw_url or ""))
         parsed = urllib.parse.urlparse(full_url)
         if parsed.scheme != "http":
@@ -1433,16 +1441,15 @@ def main():
             raise ValueError("desktop file access is limited to the local Ouroboros server")
         if parsed.port != actual_port:
             raise ValueError("file URL port must match the local Ouroboros server")
-        if parsed.path != "/api/files/download" and not parsed.path.startswith("/api/extensions/"):
-            raise ValueError("file URL path must be /api/files/download or /api/extensions/<skill>/...")
+        if parsed.path != "/api/files/download" and not parsed.path.startswith(("/api/extensions/", "/api/tasks/")):
+            raise ValueError("file URL path must be /api/files/download, /api/extensions/<skill>/... or /api/tasks/...")
         return full_url
 
     def _unique_bridge_target(directory: pathlib.Path, filename: str) -> pathlib.Path:
         safe_name = pathlib.Path(str(filename or "download")).name or "download"
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / safe_name
-        stem = target.stem
-        suffix = target.suffix
+        stem, suffix = target.stem, target.suffix
         counter = 1
         while target.exists():
             target = directory / f"{stem}-{counter}{suffix}"
@@ -1450,46 +1457,31 @@ def main():
         return target
 
     def _fetch_bridge_url_to(full_url: str, target: pathlib.Path) -> None:
-        import urllib.request
-
-        with urllib.request.urlopen(full_url, timeout=60) as resp:  # noqa: S310 - localhost validated above
-            with target.open("wb") as fh:
-                shutil.copyfileobj(resp, fh)
+        with urllib.request.urlopen(full_url, timeout=60) as resp, target.open("wb") as fh:  # noqa: S310 - localhost validated above
+            shutil.copyfileobj(resp, fh)
 
     class MainApi:
+        @staticmethod
+        def _native_confirm(title: str, message: str) -> bool:
+            return bool(_webview_window and _webview_window.create_confirmation_dialog(title, message))
+
         def request_runtime_mode_change(self, mode: str) -> dict:
             try:
-                return _request_runtime_mode_change(
-                    mode,
-                    lambda title, message: bool(
-                        _webview_window and _webview_window.create_confirmation_dialog(title, message)
-                    ),
-                )
+                return _request_runtime_mode_change(mode, self._native_confirm)
             except Exception as exc:
                 log.warning("Runtime mode native confirmation failed: %s", exc, exc_info=True)
                 return {"ok": False, "error": f"Native confirmation failed: {exc}"}
 
         def request_auto_grant_reviewed_skills_change(self, enabled: bool) -> dict:
             try:
-                return _request_auto_grant_reviewed_skills_change(
-                    bool(enabled),
-                    lambda title, message: bool(
-                        _webview_window and _webview_window.create_confirmation_dialog(title, message)
-                    ),
-                )
+                return _request_auto_grant_reviewed_skills_change(bool(enabled), self._native_confirm)
             except Exception as exc:
                 log.warning("Reviewed-skill auto-grant confirmation failed: %s", exc, exc_info=True)
                 return {"ok": False, "error": f"Native confirmation failed: {exc}"}
 
         def request_skill_key_grant(self, skill: str, keys: list) -> dict:
             try:
-                return _request_skill_key_grant(
-                    skill,
-                    keys,
-                    lambda title, message: bool(
-                        _webview_window and _webview_window.create_confirmation_dialog(title, message)
-                    ),
-                )
+                return _request_skill_key_grant(skill, keys, self._native_confirm)
             except Exception as exc:
                 log.warning("Skill grant native confirmation failed: %s", exc, exc_info=True)
                 return {"ok": False, "error": f"Native confirmation failed: {exc}"}
@@ -1504,6 +1496,30 @@ def main():
                 return {"ok": True, "path": str(target)}
             except Exception as exc:
                 log.warning("Desktop file download failed: %s", exc, exc_info=True)
+                return {"ok": False, "error": str(exc)}
+
+        def open_external_url(self, url: str) -> dict:
+            try:
+                raw = str(url or "")
+                if not raw.lower().startswith(("http://", "https://", "mailto:")):
+                    return {"ok": False, "error": "Only absolute http://, https:// or mailto: links can be opened."}
+                outcome: list = []
+                # Bounded join: settled failure reported honestly; still-running stays detached.
+                _open_browser_detached(raw, outcome).join(timeout=3.0)
+                if outcome and outcome[0] is not True:
+                    return {"ok": False, "error": f"The default browser could not be opened: {outcome[0] or 'no handler found'}"}
+                return {"ok": True}
+            except Exception as exc:
+                log.warning("Desktop external-URL open failed: %s", exc, exc_info=True)
+                return {"ok": False, "error": str(exc)}
+
+        def save_bytes_to_downloads(self, filename: str, b64: str) -> dict:
+            try:
+                target = _unique_bridge_target(pathlib.Path.home() / "Downloads", filename)
+                target.write_bytes(base64.b64decode(str(b64 or ""), validate=True))
+                return {"ok": True, "path": str(target)}
+            except Exception as exc:
+                log.warning("Desktop save-to-Downloads failed: %s", exc, exc_info=True)
                 return {"ok": False, "error": str(exc)}
 
         def open_file_with_default_app(self, url: str, filename: str) -> dict:
