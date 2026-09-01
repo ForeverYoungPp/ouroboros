@@ -122,6 +122,11 @@
     --sidebar-width: 280px;
     --project-panel-width: clamp(340px, 36vw, 440px);
     --nav-item-radius: 10px;
+    /* One hover fill for an item in a popup menu or a picker list. Six menus
+       used five different fills (0.04 / 0.06 / 0.08 / an accent tint / an
+       undeclared --surface-2), so the same gesture looked like a different
+       control depending on which menu you opened. */
+    --menu-item-hover: rgba(255, 255, 255, 0.07);
     /* 8pt spacing scale (Apple HIG / common 8pt grid) — use these instead of
        ad-hoc pixel values so spacing stays consistent across components. */
     --space-1: 4px;
@@ -406,7 +411,7 @@ body.resizing-panels { user-select: none; }
 
 .task-control-item:hover:not(:disabled) {
     color: var(--text-primary);
-    background: var(--surface-control);
+    background: var(--menu-item-hover);
 }
 
 .task-control-item.danger {
@@ -890,7 +895,7 @@ body.resizing-panels { user-select: none; }
 }
 
 .files-context-item:hover {
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--menu-item-hover);
 }
 
 .files-context-item-danger {
@@ -1197,7 +1202,7 @@ body.resizing-panels { user-select: none; }
 
 .chat-header-menu-item:hover {
     color: var(--text-primary);
-    background: var(--surface-control);
+    background: var(--menu-item-hover);
 }
 
 /* Evolve/Consciousness live in this menu now; show their on-state in place. */
@@ -4632,7 +4637,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 .skills-menu-item:hover {
-    background: var(--accent-10);
+    background: var(--menu-item-hover);
     color: var(--text-primary);
 }
 
@@ -5985,7 +5990,7 @@ textarea.chat-input {
 }
 
 .project-row-menu button:hover {
-    background: var(--surface-2, rgba(255, 255, 255, 0.06));
+    background: var(--menu-item-hover);
 }
 
 .project-row-menu button.danger {
@@ -6070,7 +6075,7 @@ textarea.chat-input {
 }
 
 .new-project-dir-row:hover {
-    background: var(--surface-2, rgba(255, 255, 255, 0.06));
+    background: var(--menu-item-hover);
 }
 
 .new-project-dir-up {
@@ -6873,7 +6878,7 @@ textarea.chat-input {
 }
 
 .chat-photo-menu button:last-child { border-bottom: 0; }
-.chat-photo-menu button:hover { background: var(--bg-hover); }
+.chat-photo-menu button:hover { background: var(--menu-item-hover); }
 
 .chat-file-card {
     display: grid;

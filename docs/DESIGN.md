@@ -245,6 +245,9 @@ not move them into the migrated set in section 8.
   that floats equidistant between two groups belongs to neither.
 - Spacing comes from the 8pt tokens (`--space-*`); a new visual dimension
   becomes a CSS variable before it becomes a page-local literal.
+- An item in a popup menu or a picker list highlights with
+  `--menu-item-hover`. One gesture, one fill: a menu that highlights at a
+  different strength than the menu beside it reads as a different control.
 
 ### Reviews inside task cards
 
