@@ -32,6 +32,7 @@ class DeliveryCandidate:
     degraded: bool = False
     degraded_reason: str = ""
     model_text: str = ""
+    control_episode_seen: bool = False
 
 
 # Action-gate holds: a gate closable ONLY by a tool call (skill lifecycle
@@ -87,22 +88,23 @@ def delivery_keep_allowed(
 def parse_delivery_control_object(
     raw: str,
 ) -> Tuple[Optional[Dict[str, Any]], bool]:
-    """Parse a delivery-control object while rejecting duplicate JSON keys.
+    """Parse a body while rejecting duplicates in a control envelope.
 
-    The boolean preserves protocol intent for the repair path when a duplicate
-    ``delivery_control`` or ``full_answer`` key made the object invalid.
+    The boolean preserves top-level protocol intent when duplicate keys made a
+    recognizable control envelope invalid. Duplicate metadata on a top-level
+    ``full_answer`` without a verb remains available to stronger armed/action
+    rails, while history-gated and nested control-shaped JSON remain prose.
     """
 
-    duplicate_protocol_key = False
+    class _ParsedObject(dict):
+        duplicate_keys: set[str]
 
-    def _unique_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-        nonlocal duplicate_protocol_key
-        result: Dict[str, Any] = {}
+    def _unique_object(pairs: List[Tuple[str, Any]]) -> _ParsedObject:
+        result = _ParsedObject()
+        result.duplicate_keys = set()
         for key, value in pairs:
             if key in result:
-                if key in {"delivery_control", "full_answer"}:
-                    duplicate_protocol_key = True
-                raise ValueError(f"duplicate key: {key}")
+                result.duplicate_keys.add(key)
             result[key] = value
         return result
 
@@ -111,10 +113,17 @@ def parse_delivery_control_object(
     except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
         # RecursionError: a degenerate deeply-nested blob (repetition-loop
         # model output) must classify as not-a-control, not crash the round.
-        return None, duplicate_protocol_key
+        return None, False
     if not isinstance(payload, dict):
         return None, False
-    return payload, False
+    duplicate_keys = getattr(payload, "duplicate_keys", set())
+    if duplicate_keys:
+        if "delivery_control" in payload:
+            return None, True
+        # Keep per-object duplicate metadata for stronger control rails while
+        # stopping parse_delivery_control_body from rescanning this whole body.
+        return payload, False
+    return dict(payload), False
 
 
 def parse_delivery_control_body(
@@ -155,6 +164,38 @@ def parse_delivery_control_body(
     if isinstance(tail_parsed, dict) and "delivery_control" in tail_parsed:
         return tail_parsed, False, True
     return None, False, False
+
+
+def classify_parsed_delivery_control(
+    parsed: Optional[Dict[str, Any]],
+    duplicate_protocol_key: bool,
+    embedded: bool,
+) -> Tuple[str, str, str]:
+    """Return ``(kind, replacement, error)`` for a parsed control body."""
+
+    exact_error = "control must be one exact JSON object"
+    if embedded:
+        return "embedded", "", exact_error
+    if duplicate_protocol_key:
+        return "invalid", "", exact_error
+    if (
+        isinstance(parsed, dict)
+        and "full_answer" in getattr(parsed, "duplicate_keys", set())
+    ):
+        # Without a top-level verb this is not historical protocol, but an
+        # already armed/action rail must retain the base malformed-control rule.
+        return "rail_invalid", "", exact_error
+    if not isinstance(parsed, dict) or "delivery_control" not in parsed:
+        return "none", "", exact_error
+    selected = str(parsed.get("delivery_control") or "")
+    if selected == "keep" and set(parsed) == {"delivery_control"}:
+        return "keep", "", ""
+    if selected == "replace" and set(parsed) == {"delivery_control", "full_answer"}:
+        replacement = parsed.get("full_answer")
+        if isinstance(replacement, str) and replacement.strip():
+            return "replace", replacement, ""
+        return "invalid", "", "replace requires a non-empty complete full_answer"
+    return "invalid", "", exact_error
 
 
 def extract_plain_text_from_content(content: Any) -> str:
