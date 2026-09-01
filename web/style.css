@@ -3383,24 +3383,25 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     background: var(--accent-25);
     border-color: var(--accent-35);
 }
+/* An action the owner can take is legible at rest (docs/DESIGN.md section 6):
+   a button label parked at secondary ink reads as disabled next to the one
+   beside it. */
 .btn-secondary {
     background: rgba(255, 255, 255, 0.04);
-    color: var(--text-secondary);
+    color: var(--text-primary);
     border-color: rgba(255, 255, 255, 0.10);
 }
 .btn-secondary:hover {
     background: rgba(255, 255, 255, 0.07);
-    color: var(--text-primary);
     border-color: var(--accent-25);
 }
 .btn-ghost {
     background: transparent;
-    color: var(--text-secondary);
+    color: var(--text-primary);
     border-color: rgba(255, 255, 255, 0.08);
 }
 .btn-ghost:hover {
     background: rgba(255, 255, 255, 0.04);
-    color: var(--text-primary);
 }
 .btn-danger {
     background: rgba(220, 38, 38, 0.2);

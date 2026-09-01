@@ -696,19 +696,14 @@ textarea:focus {
 
 .btn-secondary {
   background: rgba(255, 255, 255, 0.04);
-  color: var(--text-secondary);
+  color: var(--text);
   border-color: rgba(255, 255, 255, 0.10);
 }
 
 .btn-ghost {
   background: transparent;
-  color: var(--text-secondary);
-  border-color: rgba(255, 255, 255, 0.08);
-}
-
-.btn-secondary:hover:not(:disabled),
-.btn-ghost:hover:not(:disabled) {
   color: var(--text);
+  border-color: rgba(255, 255, 255, 0.08);
 }
 
 .btn-default {
