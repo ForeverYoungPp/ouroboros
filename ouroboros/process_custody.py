@@ -390,10 +390,24 @@ def start_parent_lifeline(*, poll_sec: float = 5.0, label: str = "") -> None:
 
     initial_ppid = os.getppid()
     if initial_ppid <= 1:
-        # The parent died before we even got here (import-delay race after an
-        # abrupt supervisor kill). These entrypoints are always spawned by a
-        # live Ouroboros parent, so an orphan at startup is already a leak.
-        _suicide()
+        # In a container the ouroboros server often IS pid 1 (docker
+        # entrypoint ``exec``), so a fork/spawn child legitimately sees
+        # ppid == 1 with a live parent. Only treat it as an orphan when
+        # pid 1 is NOT our own server. Otherwise the lifeline would
+        # group-suicide every freshly forked worker at boot.
+        _own_server_markers = (b"ouroboros", b"server.py", b"ouroboros.cli")
+        _is_own_server = False
+        try:
+            with open(f"/proc/{initial_ppid}/cmdline", "rb") as _f:
+                _cmd = _f.read().replace(b"\x00", b" ")
+            _is_own_server = any(m in _cmd for m in _own_server_markers)
+        except Exception:
+            _is_own_server = False
+        if not _is_own_server:
+            # The parent died before we even got here (import-delay race after an
+            # abrupt supervisor kill). These entrypoints are always spawned by a
+            # live Ouroboros parent, so an orphan at startup is already a leak.
+            _suicide()
         return
 
     def _watch() -> None:
