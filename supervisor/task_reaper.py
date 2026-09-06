@@ -1145,17 +1145,40 @@ def _finish_self_finalized_task(
         log.debug("Reaper: failed to emit task_done for self-finalized %s", task_id, exc_info=True)
 
 
+def _row_is_current_attempt(row: Dict[str, Any], started_at: float) -> bool:
+    """Freshness guard against same-id retries: evolution/subagent retries reuse the task
+    id and the monotonic reducer blocks running-over-completed (task_results.py), so a
+    completed row persists across attempts. A terminal row older than THIS attempt's
+    start is a predecessor's result and must not be honored over a live retry."""
+    from supervisor.queue import parse_iso_to_ts
+
+    raw = str(row.get("updated_at") or row.get("ts") or "")
+    epoch = parse_iso_to_ts(raw) or 0.0
+    if epoch <= 0.0:
+        return False
+    return epoch >= float(started_at or 0.0) - 1.0
+
+
 def _load_post_kill_terminal_result(
-    q: Any, task: Dict[str, Any], task_id: str,
+    q: Any, task: Dict[str, Any], task_id: str, started_at: float = 0.0,
 ) -> tuple[str, Optional[Dict[str, Any]]]:
-    """Return terminal truth that won the worker-death boundary, if any."""
+    """Return terminal truth that won the worker-death boundary, if any.
+
+    ``started_at`` is THIS attempt's start (threaded from the reap job): a terminal row
+    older than it is a predecessor attempt's result and is not honored
+    (_row_is_current_attempt). ``started_at=0.0`` (unknown) keeps the legacy fail-open
+    behavior so an unidentifiable attempt never clobbers a genuine self-finalized result."""
     from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
 
     self_status = ""
     existing: Optional[Dict[str, Any]] = None
     try:
         existing = load_task_result(q.DRIVE_ROOT, task_id)
-        if existing and str(existing.get("status") or "") in _TRULY_TERMINAL_STATUSES:
+        if (
+            existing
+            and str(existing.get("status") or "") in _TRULY_TERMINAL_STATUSES
+            and _row_is_current_attempt(existing, started_at)
+        ):
             self_status = str(existing.get("status") or "")
     except Exception:
         log.debug("Reaper: post-kill terminal re-check failed for %s", task_id, exc_info=True)
@@ -1168,7 +1191,11 @@ def _load_post_kill_terminal_result(
             from ouroboros.headless import copy_child_task_result
 
             child = copy_child_task_result(pathlib.Path(q.DRIVE_ROOT), task)
-            if child and str(child.get("status") or "") in _TRULY_TERMINAL_STATUSES:
+            if (
+                child
+                and str(child.get("status") or "") in _TRULY_TERMINAL_STATUSES
+                and _row_is_current_attempt(child, started_at)
+            ):
                 existing = child
                 self_status = str(child.get("status") or "")
         except Exception:
@@ -1228,6 +1255,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
     task_type = str(job.get("task_type") or "")
     terminal_reason = str(job.get("terminal_reason") or "idle_timeout")
     attempt = int(job.get("attempt") or 1)
+    attempt_started_at = float(job.get("started_at") or 0.0)
     owner_chat_id = int(job.get("owner_chat_id") or 0)
     runtime_sec = float(job.get("runtime_sec") or 0.0)
     hb_lag_sec = float(job.get("hb_lag_sec") or 0.0)
@@ -1283,7 +1311,9 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
 
     # 2. POST-KILL already-terminal re-check: the worker may have self-finalized right at
     #    the boundary. The process is dead now, so this decision is final.
-    self_status, _existing = _load_post_kill_terminal_result(_q, task, task_id)
+    self_status, _existing = _load_post_kill_terminal_result(
+        _q, task, task_id, started_at=attempt_started_at,
+    )
 
     if self_status:
         _finish_self_finalized_task(

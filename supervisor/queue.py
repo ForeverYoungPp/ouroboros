@@ -156,6 +156,7 @@ from supervisor.task_reaper import (  # noqa: E402,F401 — re-exported for enfo
     reap_timed_out_task as _reap_timed_out_task,
     request_finalization_grace as _request_finalization_grace,
     resolve_grace_episode_for_spared_task as _resolve_grace_episode_for_spared_task,
+    _row_is_current_attempt,
 )
 
 
@@ -1240,6 +1241,31 @@ def _has_pending_descendant(task_id: str) -> bool:
             return True
     return False
 
+def _probe_row_terminal_now(task: Dict[str, Any], task_id: str, started_at: float) -> bool:
+    """One-shot, read-only, bounded (1-3 tiny JSON reads): is a truly-terminal result row
+    already on disk for THIS attempt? Raw parent + child rows only — never the effective
+    projection (its orphan heal fabricates FAILED and must not authorize a kill;
+    task_status.reconcile_orphaned_running_tasks owns that lane)."""
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+
+    try:
+        row = load_task_result(DRIVE_ROOT, task_id) or {}
+        candidates = [row]
+        child_drive = _task_drive_for_task(task, task_id)
+        if child_drive != pathlib.Path(DRIVE_ROOT):
+            candidates.append(load_task_result(child_drive, task_id) or {})
+        for r in candidates:
+            if (
+                str(r.get("status") or "") in _TRULY_TERMINAL_STATUSES
+                and _row_is_current_attempt(r, started_at)
+            ):
+                return True
+        return False
+    except Exception:
+        log.debug("row-terminal probe failed for %s", task_id, exc_info=True)
+        return False
+
+
 def _enforce_task_timeouts_locked(
     workers: Any, now: float, owner_chat_id: int, st: Dict[str, Any]
 ) -> None:
@@ -1336,22 +1362,40 @@ def _enforce_task_timeouts_locked(
             terminal_reason = "deadline"
         else:
             terminal_reason = "idle_timeout"
+        # Terminal-row crosscheck, one-shot per attempt (the `_row_terminal_probed` flag
+        # dies with the RUNNING.pop below, so each new attempt probes fresh). Closes the
+        # lost-task_done incident: a worker that finished normally leaves RUNNING with a
+        # frozen last_progress_at, and without this probe it sits out the full grace
+        # window and is killed ~FINALIZATION_GRACE_SEC after it already completed. A
+        # positive probe falls through to the Variant-A teardown below, which
+        # re-linearizes cancel/evolution and enqueues into _reap_queue exactly as the
+        # grace-expiry path does — the reaper's post-kill re-check then honors the
+        # terminal row (idempotent task_done, nothing live killed, no fake incident).
+        # Budget-paused tasks need NO guard: a replay-safe pause pops the task from
+        # RUNNING synchronously in the same event drain (events.py) and its durable row
+        # is running/scheduled (non-terminal rank), so the probe is negative during the
+        # only exposure window.
+        row_terminal_now = False
+        if not meta.get("_row_terminal_probed"):
+            meta["_row_terminal_probed"] = True
+            row_terminal_now = _probe_row_terminal_now(task, str(task_id), started_at)
         finalization_requested_at = float(meta.get("finalization_requested_at") or 0.0)
-        if finalization_requested_at <= 0 and FINALIZATION_GRACE_SEC > 0:
-            meta["finalization_requested_at"] = now
-            meta["finalization_reason"] = terminal_reason
-            # The control's msg_id IS the episode's identity: it is what the
-            # symmetric withdraw revokes, so the latch and the mailbox control
-            # can never name different episodes.
-            meta["finalization_control_msg_id"] = _request_finalization_grace(
-                _task_drive_for_task(task, str(task_id)), str(task_id), terminal_reason,
-                chat_id=int(task.get("chat_id") or owner_chat_id or 0),
-                stamp=int(now),
-            )
-            RUNNING[task_id] = meta
-            continue
-        if finalization_requested_at > 0 and now - finalization_requested_at < FINALIZATION_GRACE_SEC:
-            continue
+        if not row_terminal_now:
+            if finalization_requested_at <= 0 and FINALIZATION_GRACE_SEC > 0:
+                meta["finalization_requested_at"] = now
+                meta["finalization_reason"] = terminal_reason
+                # The control's msg_id IS the episode's identity: it is what the
+                # symmetric withdraw revokes, so the latch and the mailbox control
+                # can never name different episodes.
+                meta["finalization_control_msg_id"] = _request_finalization_grace(
+                    _task_drive_for_task(task, str(task_id)), str(task_id), terminal_reason,
+                    chat_id=int(task.get("chat_id") or owner_chat_id or 0),
+                    stamp=int(now),
+                )
+                RUNNING[task_id] = meta
+                continue
+            if finalization_requested_at > 0 and now - finalization_requested_at < FINALIZATION_GRACE_SEC:
+                continue
 
         # NOTE: "worker self-finalized at the idle boundary" is handled by the reaper's
         # POST-KILL terminal re-check (kill+join FIRST, then honor an on-disk terminal
@@ -1451,6 +1495,7 @@ def _enforce_task_timeouts_locked(
             "task_type": task_type,
             "terminal_reason": terminal_reason,
             "attempt": attempt,
+            "started_at": float(started_at),
             "owner_chat_id": owner_chat_id,
             "runtime_sec": runtime_sec,
             "hb_lag_sec": hb_lag_sec,
