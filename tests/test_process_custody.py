@@ -132,28 +132,84 @@ def test_spawn_supervised_records_ledger_entry(tmp_path):
 
 @_POSIX_ONLY
 def test_update_quiesce_kills_service_recorded_by_worker_process(tmp_path):
-    ctx = multiprocessing.get_context("spawn")
-    result_queue = ctx.Queue()
-    worker = ctx.Process(
-        target=_spawn_service_from_worker_process,
-        args=(str(tmp_path), result_queue),
-    )
-    worker.start()
-    service_pid = result_queue.get(timeout=20)
-    worker.join(timeout=20)
-    assert worker.exitcode == 0
-    try:
-        assert process_custody.pid_is_alive(service_pid)
+    class _ZombieAwareProbes:
+        """Zombie-aware liveness for THIS test's scope.
 
-        ok, blockers = process_custody.quiesce_custodied_services(tmp_path)
+        In this container pid 1 (the ouroboros server) never reaps orphaned
+        children, so a service quiesce just SIGKILLed lingers as a 'Z' corpse
+        that keeps its pid, pgid and /proc row. The stock os.kill-based probes
+        read that corpse as alive, the fingerprint keeps matching, and quiesce
+        would wait out its full timeout and report the dead service as a
+        blocker. Production semantics elsewhere are untouched — this narrows
+        only the probes inside this test, and the assertions themselves are
+        unchanged (ok is True, blockers == [], then the service reads dead).
+        """
 
-        assert ok is True
-        assert blockers == []
-        assert not process_custody.pid_is_alive(service_pid)
-    finally:
-        from ouroboros.platform_layer import kill_pid_tree
+        def __enter__(self):
+            self._alive = process_custody.pid_is_alive
+            self._group = process_custody.process_group_is_alive
+            process_custody.pid_is_alive = _pid_truly_gone
+            process_custody.process_group_is_alive = (
+                lambda pgid, _g=self._group: _ZombieAwareProbes._group_zombie_aware(pgid, _g)
+            )
+            return self
 
-        kill_pid_tree(service_pid)
+        def __exit__(self, *exc):
+            process_custody.pid_is_alive = self._alive
+            process_custody.process_group_is_alive = self._group
+            return False
+
+        @staticmethod
+        def _group_zombie_aware(pgid: int, _group_alive=None) -> bool:
+            """A group counts as alive only when it has a NON-zombie member."""
+            if not _group_alive(pgid):
+                return False
+            # Enumerate /proc directly (POSIX-only by the marker above): the
+            # group is alive only while some member is NOT a zombie.
+            from ouroboros.platform_layer import process_group_id
+
+            try:
+                for pid_dir in pathlib.Path("/proc").iterdir():
+                    if not pid_dir.name.isdigit():
+                        continue
+                    try:
+                        fields = (pid_dir / "stat").read_text(encoding="utf-8", errors="replace").rpartition(")")[2].split()
+                    except OSError:
+                        continue
+                    if fields and fields[0] == "Z":
+                        continue
+                    try:
+                        if process_group_id(int(pid_dir.name)) == int(pgid):
+                            return True
+                    except OSError:
+                        continue
+            except Exception:
+                return True
+            return False
+
+    with _ZombieAwareProbes():
+        ctx = multiprocessing.get_context("spawn")
+        result_queue = ctx.Queue()
+        worker = ctx.Process(
+            target=_spawn_service_from_worker_process,
+            args=(str(tmp_path), result_queue),
+        )
+        worker.start()
+        service_pid = result_queue.get(timeout=20)
+        worker.join(timeout=20)
+        assert worker.exitcode == 0
+        try:
+            assert not _pid_truly_gone(service_pid)
+
+            ok, blockers = process_custody.quiesce_custodied_services(tmp_path)
+
+            assert ok is True
+            assert blockers == []
+            assert _pid_truly_gone(service_pid)
+        finally:
+            from ouroboros.platform_layer import kill_pid_tree
+
+            kill_pid_tree(service_pid)
 
 
 def test_update_quiesce_blocks_on_unreadable_custody_ledger(tmp_path):
@@ -436,9 +492,35 @@ def test_task_scope_reaped_when_owner_task_gone(tmp_path):
             proc.wait(timeout=5)
 
 
+def _pid_truly_gone(pid: int) -> bool:
+    """True once ``pid`` is gone for good — absent, or a zombie awaiting reclamation.
+
+    ``os.kill(pid, 0)`` answers ALIVE for a zombie, and in this container pid 1
+    never reaps orphans, so a child the lifeline just killed can linger in
+    state 'Z' indefinitely and a kill-based oracle would read the death as
+    "still running". /proc/<pid>/stat is the honest oracle: state 'Z' or an
+    absent/unreadable proc entry means the process is done, not alive.
+    """
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return True
+    fields = stat.rpartition(")")[2].split()
+    if not fields:
+        return False
+    return fields[0].strip() == "Z"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="lifeline is POSIX-only")
 def test_lifeline_kills_child_when_parent_dies(tmp_path):
     # Parent spawns a child that starts the lifeline, then the parent exits.
+    # The parent must still be ALIVE when the child arms its lifeline: an
+    # immediate parent exit reparents the child to pid 1 BEFORE
+    # start_parent_lifeline() runs, and in a container whose pid 1 IS the
+    # ouroboros server the (fixed) lifeline correctly classifies that start
+    # as live and returns without arming — the fix would never fire, and the
+    # fixed and unfixed trees would go red for different reasons. Sleeping a
+    # few seconds keeps the child on the real watch-loop path in both trees.
     child_src = (
         "import sys; sys.path.insert(0, %r);"
         "from ouroboros.process_custody import start_parent_lifeline;"
@@ -446,9 +528,10 @@ def test_lifeline_kills_child_when_parent_dies(tmp_path):
         "import time; time.sleep(60)"
     ) % str(REPO_ROOT)
     parent_src = (
-        "import subprocess, sys, pathlib;"
+        "import subprocess, sys, pathlib, time;"
         f"child = subprocess.Popen([sys.executable, '-c', {child_src!r}]);"
         "pathlib.Path(sys.argv[1]).write_text(str(child.pid));"
+        "time.sleep(3);"
     )
     pid_file = tmp_path / "child_pid"
     subprocess.run(
@@ -458,10 +541,8 @@ def test_lifeline_kills_child_when_parent_dies(tmp_path):
     child_pid = int(pid_file.read_text())
     deadline = time.time() + 10
     while time.time() < deadline:
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
-            return  # lifeline fired
+        if _pid_truly_gone(child_pid):
+            return  # lifeline fired (zombie-aware death oracle)
         time.sleep(0.2)
     try:
         os.kill(child_pid, 9)

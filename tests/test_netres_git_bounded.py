@@ -91,6 +91,25 @@ def test_git_network_bounded_rejects_missing_cwd(tmp_path):
     assert "cwd" in err
 
 
+def _git_zombie_aware_gone(pid: int) -> bool:
+    """True once ``pid`` is gone for good — absent, or a zombie nobody reaps.
+
+    The shim's ``sleep 300 &`` child is SIGKILLed with the git process tree and
+    then reparented to pid 1, which in this container is the ouroboros server
+    and never reaps orphans — so the corpse lingers in state ``Z`` with its pid
+    intact and the stock ``os.kill(pid, 0)`` oracle reads the kill as a
+    survival. /proc/<pid>/stat is the honest oracle, matching the zombie-aware
+    probes already used by tests/test_process_custody.py.
+    """
+    try:
+        fields = pathlib.Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="replace").rpartition(")")[2].split()
+    except OSError:
+        return True
+    if not fields:
+        return False
+    return fields[0] == "Z"
+
+
 @_posix_shim
 def test_git_network_bounded_timeout_kills_tree_and_repo_stays_operable(tmp_path, monkeypatch):
     """A hung network git is killed together with its children (kill + reap)
@@ -147,9 +166,7 @@ def test_git_network_bounded_timeout_kills_tree_and_repo_stays_operable(tmp_path
     deadline = time.monotonic() + 5
     for pid in pids:
         while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if _git_zombie_aware_gone(pid):
                 break
             time.sleep(0.05)
         else:
