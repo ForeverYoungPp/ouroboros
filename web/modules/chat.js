@@ -2538,6 +2538,7 @@ export function createChatInstance({
         const clientMessageId = opts.clientMessageId || '';
         const senderLabelOverride = opts.senderLabel || '';
         const senderSessionId = opts.senderSessionId || '';
+        const senderIdentity = opts.senderIdentity || '';
         const source = opts.source || '';
         const systemType = opts.systemType || '';
         const taskId = opts.taskId || '';
@@ -2551,6 +2552,7 @@ export function createChatInstance({
             source,
             senderLabel: senderLabelOverride,
             senderSessionId,
+            senderIdentity,
             taskId,
         });
         if (messageKey && seenMessageKeys.has(messageKey)) return false;
@@ -2592,6 +2594,7 @@ export function createChatInstance({
 
         const sender = senderLabel(role, isProgress, systemType, {
             source, senderLabel: senderLabelOverride, senderSessionId,
+            senderIdentity,
         }, chatSessionId);
         const rendered = role === 'user'
             ? escapeHtml(text)
@@ -2975,6 +2978,7 @@ export function createChatInstance({
                         source: msg.source || '',
                         senderLabel: msg.sender_label || '',
                         senderSessionId: msg.sender_session_id || '',
+                        senderIdentity: msg.sender_identity || '',
                         clientMessageId: msg.client_message_id || '',
                         taskId,
                         chatAnnotation: msg.chat_annotation || null,
@@ -4130,6 +4134,7 @@ export function createChatInstance({
             const added = addMessage(msg.content, msg.role, msg.markdown, msg.ts || null, false, {
                 systemType: msg.system_type || '',
                 source: msg.source || '',
+                senderIdentity: msg.sender_identity || '',
                 taskId: explicitTaskId,
             });
             if (added || changed) incrementUnreadIfNeeded(msg);

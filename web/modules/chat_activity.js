@@ -40,6 +40,9 @@ export function senderLabel(role, isProgress = false, systemType = '', opts = {}
         return '📋 System';
     }
     if (isProgress) return '💬 Thought';
+    // C-scheme sender identity (v6.114.3): a producer-stamped background
+    // identity renders distinctly; everything else stays 'Ouroboros'.
+    if (opts.senderIdentity === 'background') return '🧠 Background';
     return 'Ouroboros';
 }
 
@@ -626,6 +629,7 @@ export function buildMessageKey(role, text, timestamp, opts = {}) {
             role,
             opts.systemType || '',
             opts.source || '',
+            opts.senderIdentity || '',
             opts.taskId,
             text,
         ].join('|');
@@ -638,6 +642,7 @@ export function buildMessageKey(role, text, timestamp, opts = {}) {
         opts.source || '',
         opts.senderLabel || '',
         opts.senderSessionId || '',
+        opts.senderIdentity || '',
         opts.taskId || '',
         timestamp,
         text,
