@@ -102,4 +102,4 @@ MagicMock/
 # deliberately does not measure, and leaving them untracked dirties the seed gate.
 devtools/benchmarks/editbench/fixtures_v2/
 
-.ua
+.ua/
