@@ -356,6 +356,7 @@ class LocalChatBridge:
         progress_meta: Optional[Dict[str, Any]] = None,
         role: str = "",
         system_type: str = "",
+        sender_identity: str = "",
     ) -> Tuple[bool, str]:
         """Send text to UI, A2A subscribers, and host event stream.
 
@@ -404,6 +405,8 @@ class LocalChatBridge:
             }
             if system_type:
                 payload["system_type"] = str(system_type)
+            if sender_identity:
+                payload["sender_identity"] = str(sender_identity)
             if meta:
                 payload.update(meta)
             # Last writer on the FINAL chat_id: meta cannot spoof/erase the stamp.
@@ -981,6 +984,7 @@ def _send_markdown(
     progress_meta: Optional[Dict[str, Any]] = None,
     role: str = "",
     system_type: str = "",
+    sender_identity: str = "",
 ) -> Tuple[bool, str]:
     """Send markdown text through the bridge."""
     bridge = get_bridge()
@@ -1103,6 +1107,7 @@ def log_chat(
     size_bytes: Optional[int] = None,
     client_surface: Optional[Dict[str, Any]] = None,
     message_meta: Optional[Dict[str, Any]] = None,
+    sender_identity: str = "",
 ) -> None:
     if DATA_DIR:
         record = {
@@ -1120,6 +1125,11 @@ def log_chat(
             "transport": dict(transport or {}),
             "task_id": str(task_id or ""),
         }
+        if sender_identity:
+            # C-scheme sender identity (v6.114.3): optional column, absent on
+            # legacy rows and on producers that do not stamp one. Empty never
+            # mints a field, keeping old rows byte-compatible.
+            record["sender_identity"] = str(sender_identity)
         # Media rows (e.g. delivered documents) carry a variable ``type`` plus
         # lightweight metadata so /api/chat/history can rebuild the bubble on
         # reload WITHOUT persisting base64. ``type`` is set from a variable (not a
@@ -1172,7 +1182,8 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
                      is_progress: bool = False, task_id: str = "",
                      progress_meta: Optional[Dict[str, Any]] = None,
                      ts: Optional[str] = None,
-                     role: str = "", system_type: str = "") -> None:
+                     role: str = "", system_type: str = "",
+                     sender_identity: str = "") -> None:
     st = load_state()
     owner_id = int(st.get("owner_id") or 0)
     _text = str(text or "")
@@ -1193,6 +1204,12 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
             progress_record.update(dict(progress_meta))
         append_jsonl(DATA_DIR / "logs" / "progress.jsonl", progress_record)
     else:
+        # C-scheme sender identity (v6.114.3): a host-authored SYSTEM receipt
+        # stays "system" unless an explicit identity arrived; otherwise the
+        # identity travels with the event from its producer. Absent = legacy
+        # rows keep no field (backward compatible).
+        if not sender_identity and role == "system":
+            sender_identity = "system"
         log_chat(
             # S3 (Q4): a typed SYSTEM row persists as direction="system", the
             # role history replay already maps to a system rendering — so the
@@ -1206,6 +1223,7 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
             task_id=task_id,
             record_type=system_type,
             message_meta=progress_meta,
+            sender_identity=sender_identity,
         )
 
     if _text.strip() in ("", "\u200b"):
@@ -1225,6 +1243,7 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
             progress_meta=progress_meta,
             role=role,
             system_type=system_type,
+            sender_identity=sender_identity,
         )
         return
 
@@ -1238,4 +1257,5 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
         progress_meta=progress_meta,
         role=role,
         system_type=system_type,
+        sender_identity=sender_identity,
     )

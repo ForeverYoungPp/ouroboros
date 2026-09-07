@@ -1070,6 +1070,7 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             meta.get("root_task_id") or evt.get("root_task_id"),
         )
         system_type = str(evt.get("system_type") or "")
+        sender_identity = str(evt.get("sender_identity") or "")
         # Project lifecycle rows pin Main; others keep lineage routing.
         chat_id = int(evt["chat_id"]) if system_type in ("project_started", "project_completion_summary") else bound_chat or int(evt["chat_id"])
         ctx.send_with_budget(
@@ -1084,6 +1085,9 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             # S3 (Q4): a typed system receipt keeps its role/type end to end.
             role=str(evt.get("role") or ""),
             system_type=system_type,
+            # C-scheme sender identity (v6.114.3): producer-stamped identity
+            # travels end to end; absent stays legacy (empty -> no field).
+            sender_identity=sender_identity,
         )
         # Register only after send; a failed first copy must not suppress retry.
         if delivery_id:
