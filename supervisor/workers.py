@@ -1516,6 +1516,10 @@ def _run_chat_task(
             log.debug("Suppressed exception", exc_info=True)
 
 
+_ephemeral_waiters = 0
+_ephemeral_waiters_lock = _threading.Lock()
+
+
 def handle_chat_ephemeral(
     chat_id: int,
     text: str,
@@ -1528,7 +1532,17 @@ def handle_chat_ephemeral(
     instance — bypassing _chat_agent_lock so it never freezes/injects into the
     running turn, while keeping the SAME ROUTE (same make_agent config: model /
     mode / effort, not a cheaper lane). Ephemeral turns are serialized among
-    themselves and are barred from long-term memory/reflection/evolution writes."""
+    themselves and are barred from long-term memory/reflection/evolution writes.
+
+    Fix 8 (hangs froze the main chat): (a) the turn gets a wall-clock deadline
+    (deadline_at) so a provider request that streams keepalive bytes — which
+    resets the per-read-interval transport timeout forever — is bounded by the
+    retry ladder's existing deadline checks and must release the lock; (b) the
+    serialization lock no longer lets an unbounded waiter stack pile up: past
+    OUROBOROS_EPHEMERAL_QUEUE_MAX queued turns, a new owner message gets a
+    visible acknowledgment and is dropped instead of silently waiting forever;
+    (c) make_agent runs OUTSIDE the lock so agent construction never contributes
+    to the held critical section."""
     from supervisor.state import budget_remaining, load_state
     try:
         remaining = budget_remaining(load_state(), strict=True)
@@ -1544,15 +1558,63 @@ def handle_chat_ephemeral(
     if not getattr(sys, 'frozen', False):
         sys.path.insert(0, str(REPO_DIR))
     from ouroboros.agent import make_agent
+    from ouroboros.config import get_ephemeral_queue_max, get_ephemeral_turn_deadline_sec
 
-    with _ephemeral_chat_lock:
-        if not _repo_writer_turn_allowed(chat_id):
-            return
+    # 8b: bound the waiter stack BEFORE building anything. The count is the
+    # number of turns currently running OR queued on the lock; past the cap,
+    # acknowledge and drop instead of silently accumulating threads.
+    global _ephemeral_waiters
+    queue_max = get_ephemeral_queue_max()
+    accepted = False
+    with _ephemeral_waiters_lock:
+        if _ephemeral_waiters <= queue_max:
+            _ephemeral_waiters += 1
+            accepted = True
+    if not accepted:
+        try:
+            send_with_budget(
+                chat_id,
+                "📥 前一条消息仍在处理中，这条稍后再发（已避免排队堆积）。",
+            )
+            append_jsonl(
+                DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "direct_chat_dropped",
+                    "chat_id": int(chat_id or 0),
+                    "reason": "ephemeral_queue_full",
+                    "queue_max": queue_max,
+                    "waiters": _ephemeral_waiters,
+                },
+            )
+        except Exception:
+            log.debug("Ephemeral queue-full receipt failed", exc_info=True)
+        return
+    try:
+        # 8a: bound the whole turn with a wall-clock deadline. The retry ladder
+        # (_sleep_within_deadline / _deadline_not_dispatched / transport clamp)
+        # already honours deadline_at; a hung streaming response must hit it and
+        # release the lock instead of holding it indefinitely.
+        meta = dict(task_metadata) if isinstance(task_metadata, dict) else {}
+        if not str(meta.get("deadline_at") or "").strip():
+            import datetime as _dt
+            from ouroboros.deadline_utils import utc_now
+
+            deadline_sec = get_ephemeral_turn_deadline_sec()
+            meta["deadline_at"] = (utc_now() + _dt.timedelta(seconds=deadline_sec)).isoformat()
+        # 8c: build the agent OUTSIDE the lock — construction is pure setup and
+        # must not extend the critical section.
         agent = make_agent(repo_dir=str(REPO_DIR), drive_root=str(DRIVE_ROOT), event_queue=get_event_q())
-        _run_chat_task(
-            agent, chat_id, text, image_data,
-            task_constraint=task_constraint, task_metadata=task_metadata, ephemeral=True,
-        )
+        with _ephemeral_chat_lock:
+            if not _repo_writer_turn_allowed(chat_id):
+                return
+            _run_chat_task(
+                agent, chat_id, text, image_data,
+                task_constraint=task_constraint, task_metadata=meta, ephemeral=True,
+            )
+    finally:
+        with _ephemeral_waiters_lock:
+            _ephemeral_waiters = max(0, _ephemeral_waiters - 1)
 
 
 def auto_resume_after_restart() -> None:
