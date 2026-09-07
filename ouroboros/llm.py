@@ -57,6 +57,46 @@ from ouroboros.utils import in_worker_process, sanitize_tool_result_for_log
 
 log = logging.getLogger(__name__)
 
+
+def _openai_compatible_extra_headers(configured, base_url: str) -> dict:
+    """Per-endpoint extra headers for the openai-compatible lane.
+
+    Reads OPENAI_COMPATIBLE_EXTRA_HEADERS as JSON of the shape
+    ``{url_prefix: {header: value}}`` and returns the headers whose prefix
+    matches ``base_url`` (longest prefix wins). Unknown base_urls get {} so a
+    provider without header requirements (e.g. a plain OpenAI-compatible
+    gateway) stays byte-identical to the pre-feature behavior. Invalid JSON
+    degrades to {} with a warning — never raises on a config typo.
+    """
+    raw = (str(configured("OPENAI_COMPATIBLE_EXTRA_HEADERS", "") or "").strip())
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        log.warning(
+            "OPENAI_COMPATIBLE_EXTRA_HEADERS is not valid JSON; ignoring: %r", raw[:120],
+        )
+        return {}
+    if not isinstance(parsed, dict):
+        log.warning(
+            "OPENAI_COMPATIBLE_EXTRA_HEADERS must be a JSON object; ignoring: %r", raw[:120],
+        )
+        return {}
+    norm_base = (base_url or "").rstrip("/")
+    best_headers: dict = {}
+    best_len = -1
+    for prefix, headers in parsed.items():
+        if not isinstance(prefix, str) or not isinstance(headers, dict):
+            continue
+        norm_prefix = prefix.rstrip("/")
+        if not norm_prefix:
+            continue  # an empty prefix would match every base_url via "".startswith() == True
+        if norm_base.startswith(norm_prefix) and len(norm_prefix) > best_len:
+            best_headers = dict(headers)
+            best_len = len(norm_prefix)
+    return best_headers
+
 DEFAULT_LIGHT_MODEL = OPENROUTER_DEFAULTS["light"]
 _FALSE_LIKE_ENV_VALUES = {"", "0", "false", "no", "off"}
 # Provider-valid Anthropic ephemeral-cache tiers.
@@ -1418,7 +1458,7 @@ class LLMClient:
                 "usage_model": usage_model,
                 "api_key": api_key,
                 "base_url": base_url,
-                "default_headers": {},
+                "default_headers": _openai_compatible_extra_headers(configured, base_url),
                 "supports_openrouter_extensions": False,
                 "supports_generation_cost": False,
             }
