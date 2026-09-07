@@ -12,7 +12,7 @@
 [![Linux](https://img.shields.io/badge/Linux-x86__64-orange.svg)](https://ouroboros-agent.ai/install/#linux)
 [![Windows](https://img.shields.io/badge/Windows-x64-blue.svg)][download-windows-x64]
 [![OuroborosHub](https://img.shields.io/badge/OuroborosHub-skills%20marketplace-8A2BE2.svg)](https://github.com/razzant/OuroborosHub)
-[![Version 6.114.3](https://img.shields.io/badge/version-6.114.3-green.svg)](VERSION)
+[![Version 6.114.4](https://img.shields.io/badge/version-6.114.4-green.svg)](VERSION)
 
 Ouroboros is an open-source, general-purpose AI agent whose identity, durable memory, and history continue across tasks and restarts. It works on external projects, coordinates a live swarm of specialist agents, and can rewrite the implementation it runs on, including its code, architecture, prompts, tools, and dependencies. Reflection can also change how it understands itself without severing that continuity.
 
@@ -64,13 +64,13 @@ The desktop packages already contain an optional CLI installer. On macOS, after 
 
 </details>
 
-[download-macos-arm64]: https://github.com/razzant/ouroboros/releases/download/v6.114.3/Ouroboros-6.114.3.dmg
-[download-windows-x64]: https://github.com/razzant/ouroboros/releases/download/v6.114.3/Ouroboros-6.114.3-windows-x64.zip
-[download-linux-deb-amd64]: https://github.com/razzant/ouroboros/releases/download/v6.114.3/ouroboros_6.114.3_amd64.deb
-[download-linux-rpm-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.3/ouroboros-6.114.3-1.x86_64.rpm
-[download-linux-rpm-red80-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.3/ouroboros-6.114.3-1.red80.x86_64.rpm
-[download-linux-appimage-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.3/Ouroboros-6.114.3-linux-x86_64.AppImage
-[download-linux-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.3/Ouroboros-6.114.3-linux-x86_64.tar.gz
+[download-macos-arm64]: https://github.com/razzant/ouroboros/releases/download/v6.114.4/Ouroboros-6.114.4.dmg
+[download-windows-x64]: https://github.com/razzant/ouroboros/releases/download/v6.114.4/Ouroboros-6.114.4-windows-x64.zip
+[download-linux-deb-amd64]: https://github.com/razzant/ouroboros/releases/download/v6.114.4/ouroboros_6.114.4_amd64.deb
+[download-linux-rpm-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.4/ouroboros-6.114.4-1.x86_64.rpm
+[download-linux-rpm-red80-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.4/ouroboros-6.114.4-1.red80.x86_64.rpm
+[download-linux-appimage-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.4/Ouroboros-6.114.4-linux-x86_64.AppImage
+[download-linux-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.4/Ouroboros-6.114.4-linux-x86_64.tar.gz
 
 Ouroboros bundles [Claudexor](https://github.com/razzant/claudexor) as its local execution layer for delegated coding and hosted-agent review. Ouroboros owns the task, memory, review, and final integration, while Claudexor runs the selected connected coding harness and returns durable execution evidence. [Explore Claudexor](https://claudexor.ai/).
 
@@ -449,6 +449,7 @@ and the reason.
 
 | Version | Date | Description |
 |---------|------|-------------|
+| 6.114.4 | 2026-09-08 | **fix(plan_task): spec_file support and inline size guard (ibl-5f3d7d49634e).** `plan_task` now accepts a `spec_file` path whose JSON SPEC is read from the workspace and runs through the same normalize → fingerprint → evidence pipeline as an inline spec, so large SPECs no longer depend on one huge generated tool-call arguments string; an inline spec whose serialization exceeds 4000 characters returns the typed `PLAN_SPEC_TOO_LARGE` error directing callers to `spec_file`, eliminating the ~4850-char model/transport tool-call truncation class (`TOOL_ARG_ERROR: Extra data`). New module `ouroboros/tools/plan_spec_file.py`. Carriers synced to 6.114.4. |
 | 6.114.3 | 2026-09-08 | **feat(chat): sender identity (C scheme) — main chat distinguishes agent / BG / other identities.** The BG send path (`owner_delivery.py`) stamps `sender_identity: "background"` on background-consciousness frames (foreground proactive messages stamp `"agent"` in `control.py`); `log_chat`/`send_with_budget`/`MessageBus.send_message` carry the field through the durable row and live WS frame, the history projection passes it through without inference, and `chat_activity.js` `senderLabel()` renders `🧠 Background` for a background identity while everything else stays `Ouroboros`. Legacy rows without the field render unchanged. Regression tests: `tests/test_sender_identity.py` (data + projection) and `web/tests/sender_identity.test.js` (UI). Carriers synced to 6.114.3. |
 | 6.114.2 | 2026-09-08 | **fix(consciousness): BG replies route to the originating chat, not owner fallback.** Human-message injects from `server.py` (`_route_owner_message`, both the skill-repair branch and the main lane) now carry `chat_id` into `BackgroundConsciousness.inject_observation`, which persists it on the observation row and caches it (`_last_observation_chat_id`); `_execute_tool` prefers the cached chat_id over the owner-chat fallback (line 1271 only — the 958 progress stream is untouched). Cache is set only on non-None so chat_id-less digest injects (`supervisor/events.py:2908`) inherit the last user message's chat once warm, falling back to owner chat otherwise. kw-only optional param, fully backward compatible. Carriers synced to 6.114.2. |
 | 6.114.1 | 2026-09-06 | **fix(tests): zombie-aware liveness probes for pid-1 containers.** Three test-side latent defects, all exposed where the ouroboros server IS pid 1 and never reaps orphaned children: the lifeline test's parent exited before the child armed its lifeline (parent now sleeps 3s so the child arms through the untouched `_watch` loop); the `os.kill(pid, 0)` oracle cannot see a zombie, so a completed kill read as a survival (assertions now use a `/proc/<pid>/stat` zombie-aware oracle — `tests/test_process_custody.py` lifeline + quiesce probes narrowed to that test's scope, and the same oracle in `tests/test_netres_git_bounded.py`'s bounded-git kill test). Production semantics untouched, no assertion relaxed. uv.lock version row synced; other carriers synced to 6.114.1. |

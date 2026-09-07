@@ -48,7 +48,7 @@ from ouroboros.task_results import (
     load_plan_review_state, load_task_result, mark_current_plan_review_unavailable,
     plan_review_wave, current_plan_review_wave, record_plan_review_dispositions,
 )
-from ouroboros.tools import plan_evidence, plan_spec
+from ouroboros.tools import plan_evidence, plan_spec, plan_spec_file
 from ouroboros.tools.plan_render import _next_step, _quote_control_lines, _render_wave  # noqa: F401 — engine renderers
 from ouroboros.tools.plan_review_runtime import (
     PLAN_NO_SNAPSHOT as _PLAN_NO_SNAPSHOT,
@@ -248,6 +248,18 @@ def get_tools():
                         "goal": {"type": "string", "description": "Why — the outcome the work serves."},
                         "plan": {"type": "string", "description": "Accompanying prose: how you intend to do it (context for reviewers; the spec is what is judged)."},
                         "spec": _SPEC_SCHEMA,
+                        "spec_file": {
+                            "type": "string",
+                            "description": (
+                                "Path to a JSON spec file instead of an inline `spec` object. "
+                                "Use this for LARGE specs (>~4KB): the full SPEC is read by the "
+                                "host from the file and enters the spec hash/fingerprint exactly "
+                                "like an inline spec. The file must be valid JSON matching the "
+                                "same schema as `spec` (see the spec parameter description) and "
+                                "live under the active workspace or the system repository. "
+                                "Mutually exclusive with `spec`."
+                            ),
+                        },
                         "review_disposition": _DISPOSITION_SCHEMA,
                     },
                     # Two exclusive modes: goal+plan+spec (review) or review_disposition alone.
@@ -270,6 +282,16 @@ def _vacuous_disposition(value: object) -> bool:
     return not str(value.get("review_fingerprint") or "").strip() and not value.get("items")
 
 
+def _plan_inline_spec_bytes(params: dict) -> int:
+    """Serialized size of the inline ``spec`` envelope (delegates to the spec_file leaf)."""
+    return plan_spec_file.plan_inline_spec_chars(params.get("spec"))
+
+
+def _load_spec_file(ctx: ToolContext, spec_file: str) -> str:
+    """Resolve + parse a ``spec_file`` locator (delegates to the spec_file leaf)."""
+    return plan_spec_file.load_spec_file(ctx, spec_file)
+
+
 def _handle_plan_task(ctx: ToolContext, **params) -> str:
     raw_disposition = params.get("review_disposition")
     envelope_fields = sorted(set(params) - {"review_disposition"})
@@ -288,8 +310,30 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
             "ERROR: PLAN_REVIEW_DISPOSITION_EMPTY: submit goal, plan and spec for review "
             "mode, or a complete review_disposition as the only field. No plan attempt was recorded."
         )
+    if params.get("spec_file") is not None and params.get("spec") is not None:
+        return (
+            "ERROR: PLAN_REVIEW_SPEC_FILE_MIXED: submit either an inline `spec` object OR a "
+            "`spec_file` path, never both. No plan attempt was recorded."
+        )
+    spec = params.get("spec")
+    if params.get("spec_file") is not None:
+        loaded = _load_spec_file(ctx, str(params.get("spec_file") or ""))
+        if isinstance(loaded, str):
+            return loaded
+        spec = loaded
+    elif isinstance(spec, dict):
+        size = _plan_inline_spec_bytes(params)
+        if size > plan_spec_file.PLAN_SPEC_INLINE_LIMIT_CHARS:
+            return (
+                f"ERROR: PLAN_SPEC_TOO_LARGE: inline `spec` serializes to ~{size} chars "
+                f"(limit {plan_spec_file.PLAN_SPEC_INLINE_LIMIT_CHARS}). A spec this large risks being cut "
+                "mid-JSON by the model/transport (the ibl-5f3d7d49634e failure class). Write "
+                "the full SPEC to a JSON file under the active workspace and pass its path as "
+                "`spec_file` instead; the host reads it verbatim into the spec hash. "
+                "No plan attempt was recorded."
+            )
     request = _PlanRequest(
-        goal=str(params.get("goal") or ""), plan=str(params.get("plan") or ""), spec=params.get("spec"),
+        goal=str(params.get("goal") or ""), plan=str(params.get("plan") or ""), spec=spec,
     )
     # The ToolEntry envelope is the outer settlement bound. The substrate
     # owns each review slot's logical window and late-result custody; nesting a
