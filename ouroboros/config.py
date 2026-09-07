@@ -150,6 +150,8 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # idle window = no real progress AND no progressing subtree; abs ceiling = the
     # unconditional per-task backstop (budget/cost stays a separate hard axis).
     "OUROBOROS_TASK_IDLE_TIMEOUT_SEC": 900,
+    "OUROBOROS_EPHEMERAL_TURN_DEADLINE_SEC": 600,
+    "OUROBOROS_EPHEMERAL_QUEUE_MAX": 2,
     "OUROBOROS_TASK_ABS_CEILING_SEC": 21600,
     "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC": 1800,
     "OUROBOROS_FINALIZATION_GRACE_SEC": FINALIZATION_GRACE_DEFAULT_SEC,
@@ -696,6 +698,24 @@ def get_task_idle_timeout_sec() -> int:
     no REAL progress (its own last_progress_at) AND has no progressing subtree for
     this long. The periodic 30s process heartbeat is liveness, NOT progress."""
     return _clamped_number_setting("OUROBOROS_TASK_IDLE_TIMEOUT_SEC", low=60, cast=int)
+
+
+def get_ephemeral_turn_deadline_sec() -> int:
+    """Wall-clock deadline imposed on an owner-chat ephemeral decision turn. The
+    regular read timeout is per-read-interval and a streaming/keepalive provider
+    response can reset it indefinitely; this bounds the WHOLE turn so a hung LLM
+    call releases _ephemeral_chat_lock instead of freezing the main chat."""
+    return _clamped_number_setting("OUROBOROS_EPHEMERAL_TURN_DEADLINE_SEC", low=30, high=7200, cast=int)
+
+
+def get_ephemeral_queue_max() -> int:
+    """Max ephemeral decision turns allowed to be RUNNING OR QUEUED at once
+    (the counter is the number of turns in flight, whether executing or
+    waiting on the serialization lock). Past this, a new owner message is
+    acknowledged and dropped instead of silently piling up waiters. A value
+    of N therefore permits N concurrent in-flight turns; the N+1th is
+    acknowledged and dropped."""
+    return max(0, int(str(os.environ.get("OUROBOROS_EPHEMERAL_QUEUE_MAX", "2") or "2").strip() or 2))
 
 
 def get_task_abs_ceiling_sec() -> int:
