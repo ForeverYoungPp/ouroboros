@@ -1,6 +1,8 @@
+import os
+
 import pytest
 
-from ouroboros.llm import LLMClient
+from ouroboros.llm import LLMClient, _openai_compatible_extra_headers
 from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
 
 
@@ -852,6 +854,80 @@ def test_resolve_openai_compatible_target_prefers_dedicated_credentials(monkeypa
     assert target["api_key"] == "compat-key"
     assert target["base_url"] == "https://compat.example/v1"
     assert target["usage_model"] == "openai-compatible/meta-llama/compatible"
+
+
+@pytest.mark.parametrize("env,base,expected", [
+    # no config -> no extra headers (pre-feature behavior)
+    ("{}", "https://anywhere.example/v1", {}),
+    # unmatched prefix -> no extra headers (switching back to scnet is clean)
+    ('{"https://opencode.ai/zen/go/": {"x-opencode-session": "s1"}}',
+     "https://api.scnet.cn/api/llm/v1", {}),
+    # matched prefix -> injected
+    ('{"https://opencode.ai/zen/go/": {"x-opencode-session": "s1"}}',
+     "https://opencode.ai/zen/go/v1/chat/completions", {"x-opencode-session": "s1"}),
+    # longest prefix wins when several match
+    ('{"https://opencode.ai/": {"x-opencode-session": "short"}, '
+     '"https://opencode.ai/zen/go/": {"x-opencode-session": "long"}}',
+     "https://opencode.ai/zen/go/v1", {"x-opencode-session": "long"}),
+    # trailing-slash normalization on both sides
+    ('{"https://opencode.ai/zen/go/": {"x-opencode-session": "s"}}',
+     "https://opencode.ai/zen/go", {"x-opencode-session": "s"}),
+    # empty (after normalization) prefix must NOT match everything
+    ('{"": {"x-opencode-session": "evil"}}',
+     "https://anywhere.example/v1", {}),
+    ('{"///": {"x-opencode-session": "evil"}}',
+     "https://anywhere.example/v1", {}),
+])
+def test_openai_compatible_extra_headers_matching(monkeypatch, env, base, expected):
+    monkeypatch.setenv("OPENAI_COMPATIBLE_EXTRA_HEADERS", env)
+    target = LLMClient()._resolve_remote_target("openai-compatible::omen-alpha")
+    # force the helper's view of base_url independent of the target's env resolution
+    headers = _openai_compatible_extra_headers(
+        lambda k, d="": os.environ.get(k, d), base)
+    assert headers == expected
+
+
+def test_openai_compatible_extra_headers_invalid_json_returns_empty(monkeypatch, caplog):
+    monkeypatch.setenv("OPENAI_COMPATIBLE_EXTRA_HEADERS", "{not-json")
+    headers = _openai_compatible_extra_headers(
+        lambda k, d="": os.environ.get(k, d), "https://opencode.ai/zen/go/v1")
+    assert headers == {}
+    assert any("not valid JSON" in r.message for r in caplog.records)
+
+
+def test_openai_compatible_extra_headers_non_dict_returns_empty(monkeypatch, caplog):
+    monkeypatch.setenv("OPENAI_COMPATIBLE_EXTRA_HEADERS", '["not", "a", "map"]')
+    headers = _openai_compatible_extra_headers(
+        lambda k, d="": os.environ.get(k, d), "https://opencode.ai/zen/go/v1")
+    assert headers == {}
+    assert any("JSON object" in r.message for r in caplog.records)
+
+
+def test_openai_compatible_extra_headers_reach_http_client(monkeypatch):
+    """The injected header must actually reach the httpx/OpenAI client layer."""
+    monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "compat-key")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_BASE_URL", "https://opencode.ai/zen/go/v1/")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_EXTRA_HEADERS",
+                       '{"https://opencode.ai/zen/go/": {"x-opencode-session": "sess-1"}}')
+    captured = {}
+
+    import openai
+
+    def fake_openai(**kwargs):
+        captured["kwargs"] = kwargs
+        # minimal stand-in: callers only use _client attributes lazily
+        class _Stub:
+            base_url = kwargs.get("base_url")
+            api_key = kwargs.get("api_key")
+        return _Stub()
+
+    monkeypatch.setattr(openai, "OpenAI", fake_openai)
+    from ouroboros.llm import LLMClient
+    client = LLMClient()
+    target = client._resolve_remote_target("openai-compatible::omen-alpha")
+    assert target["default_headers"] == {"x-opencode-session": "sess-1"}
+    client._new_remote_client(target)
+    assert captured["kwargs"].get("default_headers") == {"x-opencode-session": "sess-1"}
 
 
 def test_resolve_cloudru_target_uses_default_base_url(monkeypatch):
