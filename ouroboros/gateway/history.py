@@ -856,6 +856,7 @@ def _collect_chat_rows(
                 "sender_session_id": str(entry.get("sender_session_id", "")),
                 "client_message_id": str(entry.get("client_message_id", "")),
                 "task_id": str(entry.get("task_id", "")),
+                "sender_identity": str(entry.get("sender_identity", "")),
                 "telegram_chat_id": int(entry.get("telegram_chat_id") or 0),
             }
             if rec["system_type"] in {"project_started", "project_completion_summary"}:

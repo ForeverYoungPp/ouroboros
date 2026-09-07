@@ -65,6 +65,11 @@ def deliver_owner_event(ctx: Any, evt: Dict[str, Any]) -> str:
     from ouroboros.tool_capabilities import BACKGROUND_DELEGATION_ROLE
 
     if str(meta.get("delegation_role") or "") == BACKGROUND_DELEGATION_ROLE:
+        # C-scheme sender identity (v6.114.3): background-consciousness frames
+        # are stamped here so the durable row and live replay can distinguish
+        # BG from the foreground agent. Plain task frames stay legacy (no
+        # field), keeping old rows and other producers byte-compatible.
+        evt.setdefault("sender_identity", "background")
         return _deferred()
 
     evt.setdefault("task_id", str(getattr(ctx, "task_id", "") or ""))

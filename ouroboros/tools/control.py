@@ -2225,6 +2225,10 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "") -> str:
         # via log_chat(record_type=...) exactly like media rows.
         "system_type": "proactive_message",
         "ts": utc_now_iso(),
+        # C-scheme sender identity (v6.114.3): a foreground proactive message
+        # is the agent by default; background-consciousness frames override
+        # this to "background" in owner_delivery before persistence.
+        "sender_identity": "agent",
     })
     append_jsonl(ctx.drive_logs() / "events.jsonl", {
         "ts": utc_now_iso(),

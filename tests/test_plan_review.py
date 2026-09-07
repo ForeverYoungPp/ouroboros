@@ -492,6 +492,77 @@ class TestPlanReviewInputValidation(unittest.TestCase):
         self.assertIn("spec: must be an object", result)
 
 
+class TestPlanReviewSpecFile(unittest.TestCase):
+    """spec_file support (ibl-5f3d7d49634e): a large SPEC can be referenced by path
+    instead of trusting one huge generated tool-call arguments string."""
+
+    def setUp(self):
+        import tempfile
+
+        from ouroboros.tools.plan_review import _handle_plan_task
+        from ouroboros.tools.registry import ToolContext
+
+        self.handler = _handle_plan_task
+        self.root = pathlib.Path(tempfile.mkdtemp())
+        self.ctx = ToolContext(repo_dir=self.root, system_repo_dir=self.root, drive_root=self.root, task_id="plan-review-test")
+        self.ctx.emit_progress_fn = lambda _m: None
+
+    def test_spec_file_reads_large_spec_verbatim(self):
+        import json
+        from unittest.mock import patch
+
+        spec = {
+            "in_scope": ["item-" + str(i) + "-" + ("x" * 100) for i in range(60)],
+            "non_goals": ["nogoal"],
+            "affected_resources": [],
+            "evidence": [],
+        }
+        # >6KB spec (the task's bar for "large").
+        self.assertGreater(len(json.dumps(spec)), 6_000)
+        path = self.root / "big_spec.json"
+        path.write_text(json.dumps(spec), encoding="utf-8")
+
+        # Never dispatch real reviewers from a unit test: an empty slot set lands in
+        # the availability refusal AFTER the spec has been read + normalized, which
+        # is exactly the seam this test wants to prove.
+        with patch("ouroboros.tools.plan_review._plan_review_slots", return_value=()):
+            result = self.handler(self.ctx, plan="some plan", goal="some goal", spec_file=str(path))
+        self.assertNotIn("ERROR: PLAN_SPEC_INVALID", result)
+        self.assertNotIn("PLAN_SPEC_FILE", result)
+        # A valid spec with no reviewers configured lands in the availability refusal,
+        # proving it passed normalization (PLAN_SPEC_INVALID would appear otherwise).
+        self.assertIn("No review models configured", result)
+
+    def test_spec_file_plus_inline_spec_is_typed_refusal(self):
+        result = self.handler(self.ctx, plan="p", goal="g", spec={"in_scope": ["x"]}, spec_file="spec.json")
+        self.assertIn("ERROR: PLAN_REVIEW_SPEC_FILE_MIXED", result)
+
+    def test_inline_spec_over_limit_is_typed_refusal(self):
+        spec = {"in_scope": ["y" * 300] * 20}  # ~6K chars
+        result = self.handler(self.ctx, plan="p", goal="g", spec=spec)
+        self.assertIn("ERROR: PLAN_SPEC_TOO_LARGE", result)
+        self.assertIn("spec_file", result)
+
+    def test_missing_spec_file_is_typed_refusal(self):
+        result = self.handler(self.ctx, plan="p", goal="g", spec_file="no-such-spec.json")
+        self.assertIn("ERROR: PLAN_SPEC_FILE_MISSING", result)
+
+    def test_invalid_json_spec_file_is_typed_refusal(self):
+        path = self.root / "bad_spec.json"
+        path.write_text("{not json", encoding="utf-8")
+        result = self.handler(self.ctx, plan="p", goal="g", spec_file=str(path))
+        self.assertIn("ERROR: PLAN_SPEC_FILE_INVALID_JSON", result)
+
+    def test_spec_file_outside_roots_is_typed_refusal(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as outside:
+            path = pathlib.Path(outside) / "spec.json"
+            path.write_text('{"in_scope": ["x"]}', encoding="utf-8")
+            result = self.handler(self.ctx, plan="p", goal="g", spec_file=str(path))
+            self.assertIn("ERROR: PLAN_SPEC_FILE_OUTSIDE_ROOTS", result)
+
+
 class TestPlanReviewChecklist(unittest.TestCase):
     def test_checklist_section_exists_and_non_empty(self):
         """Plan Review Checklist section must exist in CHECKLISTS.md (consumed by heading)."""
@@ -508,7 +579,9 @@ class TestPlanReviewToolRegistration(unittest.TestCase):
         from ouroboros.tools.plan_review import get_tools
         tool = next(t for t in get_tools() if t.name == "plan_task")
         params = tool.schema["parameters"]["properties"]
-        self.assertEqual(set(params), {"plan", "goal", "spec", "review_disposition"})
+        self.assertEqual(set(params), {"plan", "goal", "spec", "spec_file", "review_disposition"})
+        self.assertIn("type", params["spec_file"])
+        self.assertEqual(params["spec_file"]["type"], "string")
         spec = params["spec"]["properties"]
         self.assertEqual(set(spec), {
             "in_scope", "non_goals", "acceptance_claims", "invariants", "decisions",
