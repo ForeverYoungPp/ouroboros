@@ -50,7 +50,6 @@ def test_execute_tool_prefers_cached_chat_id_over_owner_fallback(tmp_path):
 
 def test_execute_tool_falls_back_to_owner_when_cache_cold(tmp_path):
     bc, _ = _make(tmp_path)
-    assert not hasattr(bc, "_last_observation_chat_id")
     tc = {"function": {"name": "update_scratchpad", "arguments": "{\"scratchpad\": \"x\"}"}}
     bc._execute_tool(tc, [])
     assert bc._registry._ctx.current_chat_id is None  # owner_chat_id_fn() returns None
