@@ -279,6 +279,7 @@ class BackgroundConsciousness:
         self,
         text: Any,
         *,
+        chat_id: Optional[int] = None,
         observation_id: Optional[str] = None,
         source: str = "runtime",
         kind: str = "text",
@@ -295,6 +296,7 @@ class BackgroundConsciousness:
         """
         if isinstance(text, dict):
             record = dict(text)
+            chat_id = chat_id if chat_id is not None else record.get("chat_id")
             payload = record.get("payload", record.get("text", payload))
             observation_id = observation_id or record.get("id") or record.get("observation_id")
             source = str(record.get("source") or source)
@@ -303,6 +305,8 @@ class BackgroundConsciousness:
             ref = ref if ref is not None else record.get("ref")
         if payload is None:
             payload = text
+        if chat_id is not None:
+            self._last_observation_chat_id = chat_id
         identifier = str(observation_id or uuid.uuid4().hex)
         row = {
             "id": identifier,
@@ -310,6 +314,7 @@ class BackgroundConsciousness:
             "kind": str(kind or "text"),
             "time": str(observed_at or utc_now_iso()),
             "payload": payload,
+            "chat_id": chat_id,
             "ref": ref,
         }
         path = self._observation_store_path()
@@ -1268,7 +1273,8 @@ class BackgroundConsciousness:
             timeout_sec=self._registry.get_timeout(fn_name),
         )
 
-        chat_id = self._owner_chat_id_fn()
+        chat_id = getattr(self, "_last_observation_chat_id", None)
+        chat_id = self._owner_chat_id_fn() if chat_id is None else chat_id
         self._registry._ctx.current_chat_id = chat_id
         self._registry._ctx.pending_events = []
         self._registry._ctx.event_queue = self._event_queue

@@ -1434,7 +1434,8 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         from supervisor.events import _handle_promote_chat_to_task
 
         ctx.consciousness.inject_observation(
-            f"Message from my human: {incoming.get('log_text') or ''}"
+            f"Message from my human: {incoming.get('log_text') or ''}",
+            chat_id=chat_id,
         )
         task_id = uuid.uuid4().hex[:16]
         event = {
@@ -1499,7 +1500,10 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
             status="project_unavailable",
         )
         return
-    ctx.consciousness.inject_observation(f"Message from my human: {incoming.get('log_text') or ''}")
+    ctx.consciousness.inject_observation(
+        f"Message from my human: {incoming.get('log_text') or ''}",
+        chat_id=chat_id,
+    )
     task_metadata = _scoped_task_metadata(project_id, task_metadata)
     swarm_intent = bool(
         isinstance(task_metadata, dict) and task_metadata.get("force_plan")
