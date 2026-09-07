@@ -54,6 +54,7 @@ from ouroboros.task_finalization import (
     deliver_final_message_live, prepare_terminal_send_event, register_final_answer_owed, stamp_root_final_phase,
     sealed_final_prompt_section, terminal_result_fields,
 )
+from ouroboros.usage_accounting import BudgetExceeded
 from ouroboros.dialogue_provenance import is_presence_task, presence_provenance_fields
 from ouroboros.presence_runner import build_presence_result_event
 
@@ -912,13 +913,30 @@ def emit_task_results(
             parent_task = {**task, "drive_root": budget_drive_root, "child_drive_root": str(env.drive_root)}
 
         if not _ephemeral and not _root_post_task_already_completed(env, task):
-            _dispatch_root_post_task(
-                env, task, str(send_event.get("text") or ""), event_queue, pending_events,
-                post_usage, llm_trace, review_evidence, drive_logs,
-                budget_drive_root=budget_drive_root, split_drive=split_drive,
-                project_scoped=_project_scoped, project_task=_project_task,
-                parent_env=parent_env, parent_task=parent_task,
-            )
+            try:
+                _dispatch_root_post_task(
+                    env, task, str(send_event.get("text") or ""), event_queue, pending_events,
+                    post_usage, llm_trace, review_evidence, drive_logs,
+                    budget_drive_root=budget_drive_root, split_drive=split_drive,
+                    project_scoped=_project_scoped, project_task=_project_task,
+                    parent_env=parent_env, parent_task=parent_task,
+                )
+            except BudgetExceeded:
+                raise  # monetary rail: caller at agent.py owns the budget-pause transition
+            except Exception:
+                # The caller catches ONLY BudgetExceeded (ouroboros/agent.py); any
+                # other exception propagates to worker_main, which logs a worker
+                # crash and returns — pending_events never flush and the buffered
+                # task_done is lost (incident ec2db052). Fail-soft so the delivery
+                # contract (task_done rides pending_events; agent_task_pipeline.py
+                # task_done block above + ouroboros/task_finalization.py header)
+                # survives post-task failures: the buffered events fall through to
+                # the caller's flush and the queue terminalizes instead of idling.
+                log.exception(
+                    "Post-task dispatch failed for task %s; flushing buffered terminal events "
+                    "(task_done) so the queue terminalizes instead of idling out",
+                    str(task.get("id") or ""),
+                )
 
 
 def _dispatch_root_post_task(
