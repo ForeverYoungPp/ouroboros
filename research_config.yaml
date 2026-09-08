@@ -1,4 +1,4 @@
-task: "对比 ARCHITECTURE.md 加载策略（现状全文 / nav map 化 / 文档分区 / hot-section）在 ouroboros review 装配链路中的优劣并落地：硬约束=文档内容不许删（P1 索引化是重定位非省略，判据=nav map 行区间为 ground truth、agent ≤K 次 read_file 命中目标节、计 tokens/轮次）、P3 required fail-closed 不放宽；INIT 先从 ~/Ouroboros/data/memory/consciousness_observations.json 提取 campaign 4518 touched-path 集合做装配 fixture 对比 token 账（170,660→~766，释放 ~211k）；先验排序 #1 nav map 全覆盖先解锁 → #5 混合终态，#4 分区与 #1 正交可并行；详见 repo 根 ARBOR_CONTRACT.md"
+task: "Compare ARCHITECTURE.md loading strategies (current full-text / nav-map conversion / doc partitioning / hot-sections) in the ouroboros review-assembly lanes and implement the best one. Hard constraints: no content deletion (P1: indexing is relocation, not omission; acceptance: nav-map line ranges as ground truth, agent hits target section within <=K read_file calls, tokens/turns counted), P3 required fail-closed semantics must not be relaxed. INIT: extract campaign 4518 touched-path set from ~/Ouroboros/data/memory/consciousness_observations.json (~18-26 contracts files + ci.yml) to build the assembly fixture and compare token accounting (170,660 rendered row_cost -> ~766 nav map, ~211k freed). Prior ordering: #1 full nav-map coverage unlocks first -> #5 hybrid end-state; #4 partitioning is orthogonal to #1. Details: repo-root ARBOR_CONTRACT.md"
 coordinator:
   max_cycles: 6
   max_depth: 2
@@ -6,5 +6,5 @@ coordinator:
 ui:
   interaction_mode: review
 search:
-  enabled: false
+  backends: []
 executor_max_turns: 50
