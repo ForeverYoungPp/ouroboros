@@ -356,7 +356,7 @@ def test_ingress_captures_origin_and_threads_it_into_turn_metadata(tmp_path, mon
         load_state=lambda: {"owner_id": 1, "owner_chat_id": 1},
         update_state=lambda fn: fn({"owner_id": 1, "owner_chat_id": 1}),
         consciousness=SimpleNamespace(
-            inject_observation=lambda _t: None, pause=lambda: None, resume=lambda: None,
+            inject_observation=lambda _t, **_k: None, pause=lambda: None, resume=lambda: None,
         ),
         get_chat_agent=lambda: SimpleNamespace(_busy=False),
         handle_chat_ephemeral=_ephemeral,

@@ -17,7 +17,7 @@ class _ImmediateThread:
 
 
 class _Consciousness:
-    def inject_observation(self, _text):
+    def inject_observation(self, _text, **_kwargs):
         return None
 
     def pause(self):

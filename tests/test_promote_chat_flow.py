@@ -1853,7 +1853,7 @@ def test_busy_project_chat_routes_to_ephemeral_decision_turn(tmp_path, monkeypat
             }]
 
     class _Consciousness:
-        def inject_observation(self, _text):
+        def inject_observation(self, _text, **_kwargs):
             return None
 
     def _ephemeral(cid, text, image_data, *, task_constraint=None, task_metadata=None):
