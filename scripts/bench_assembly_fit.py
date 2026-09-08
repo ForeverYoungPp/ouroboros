@@ -316,11 +316,13 @@ def main() -> int:
         print(f"ERROR: fixture {fixture_path} is not a non-empty JSON list", file=sys.stderr)
         return 2
 
-    data_dir = _hermetic_environment()
-    _freeze_evidence(data_dir)
-
+    # Code under test always resolves from --repo-root (the worktree), no matter
+    # which physical copy of this harness file is being executed.
     os.chdir(repo_root)
     sys.path.insert(0, str(repo_root))
+
+    data_dir = _hermetic_environment()
+    _freeze_evidence(data_dir)
 
     import ouroboros.capability_evidence  # noqa: F401  (patch already applied)
     from ouroboros.tools import scope_review as sr
