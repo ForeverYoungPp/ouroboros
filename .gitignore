@@ -103,3 +103,4 @@ MagicMock/
 devtools/benchmarks/editbench/fixtures_v2/
 
 .ua/
+.arbor/
