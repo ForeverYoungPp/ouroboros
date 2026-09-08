@@ -30,7 +30,7 @@ def test_constrained_repair_promotes_managed_task_before_busy_ephemeral_lane(mon
         load_state=lambda: {"owner_id": 1},
         save_state=lambda st: None,
         update_state=lambda mutator: (lambda st: (mutator(st), st)[1])({"owner_id": 1}),
-        consciousness=SimpleNamespace(inject_observation=lambda *_: None, pause=lambda: None, resume=lambda: None),
+        consciousness=SimpleNamespace(inject_observation=lambda *_a, **_k: None, pause=lambda: None, resume=lambda: None),
         get_chat_agent=lambda: agent,
         send_with_budget=lambda chat_id, text: calls["sent"].append((chat_id, text)),
         handle_chat_direct=lambda cid, txt, img, task_constraint=None, task_metadata=None: calls["direct"].append(task_constraint),
@@ -79,7 +79,7 @@ def test_constrained_repair_promotes_managed_task_before_busy_ephemeral_lane(mon
 def test_constrained_repair_refusal_is_reported_to_owner(monkeypatch):
     sent = []
     ctx = SimpleNamespace(
-        consciousness=SimpleNamespace(inject_observation=lambda *_: None),
+        consciousness=SimpleNamespace(inject_observation=lambda *_a, **_k: None),
         send_with_budget=lambda chat_id, text: sent.append((chat_id, text)),
     )
     monkeypatch.setattr(
@@ -135,7 +135,7 @@ def test_ordinary_busy_message_still_uses_ephemeral_lane(monkeypatch):
         load_state=lambda: {"owner_id": 1},
         save_state=lambda st: None,
         update_state=lambda mutator: (lambda st: (mutator(st), st)[1])({"owner_id": 1}),
-        consciousness=SimpleNamespace(inject_observation=lambda *_: None, pause=lambda: None, resume=lambda: None),
+        consciousness=SimpleNamespace(inject_observation=lambda *_a, **_k: None, pause=lambda: None, resume=lambda: None),
         get_chat_agent=lambda: SimpleNamespace(_busy=True),
         handle_chat_direct=lambda *args, **kwargs: calls["direct"].append((args, kwargs)),
         handle_chat_ephemeral=lambda *args, **kwargs: calls["ephemeral"].append((args, kwargs)),
