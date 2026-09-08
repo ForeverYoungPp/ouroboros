@@ -104,3 +104,7 @@ devtools/benchmarks/editbench/fixtures_v2/
 
 .ua/
 .arbor/
+.autoresearch/
+.coordinator/
+results/
+cache_old_*/
