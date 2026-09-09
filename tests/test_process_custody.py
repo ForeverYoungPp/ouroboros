@@ -148,7 +148,7 @@ def test_update_quiesce_kills_service_recorded_by_worker_process(tmp_path):
         def __enter__(self):
             self._alive = process_custody.pid_is_alive
             self._group = process_custody.process_group_is_alive
-            process_custody.pid_is_alive = _pid_truly_gone
+            process_custody.pid_is_alive = _pid_not_reclaimable_alive
             process_custody.process_group_is_alive = (
                 lambda pgid, _g=self._group: _ZombieAwareProbes._group_zombie_aware(pgid, _g)
             )
@@ -500,6 +500,12 @@ def _pid_truly_gone(pid: int) -> bool:
     state 'Z' indefinitely and a kill-based oracle would read the death as
     "still running". /proc/<pid>/stat is the honest oracle: state 'Z' or an
     absent/unreadable proc entry means the process is done, not alive.
+
+    (Assert-oracle only. The quiesce shim below binds a stricter variant:
+    ``_pid_not_reclaimable_alive`` answers dead for a RECLAIMED row too,
+    because quiesce's fingerprint treats an empty live token as "cannot
+    disprove" and would otherwise affirm a match for a row the kernel has
+    already dropped — a finished kill surfacing as a blocker.)
     """
     try:
         stat = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
@@ -509,6 +515,28 @@ def _pid_truly_gone(pid: int) -> bool:
     if not fields:
         return False
     return fields[0].strip() == "Z"
+
+
+def _pid_not_reclaimable_alive(pid: int) -> bool:
+    """Liveness oracle for the quiesce path: a reclaimed /proc row is dead.
+
+    The assert oracle above deliberately reads a reclaimed row as "gone for
+    good" (True) — but feeding that same answer to ``pid_is_alive`` inside
+    ``_fingerprint_matches`` resurrects the dead pid there: with the /proc row
+    absent, every live token (boot start time, command hash) reads empty, and
+    the fingerprint's empty-live-token guard falls through to a match. The
+    finished kill then registers as a blocker and quiesce reports False. This
+    variant keeps stock-parity semantics (row absent → dead) while still
+    reading a lingering zombie as dead via the state field.
+    """
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    fields = stat.rpartition(")")[2].split()
+    if not fields:
+        return False
+    return fields[0].strip() != "Z"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="lifeline is POSIX-only")
