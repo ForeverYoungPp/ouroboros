@@ -12,7 +12,7 @@
 [![Linux](https://img.shields.io/badge/Linux-x86__64-orange.svg)](https://ouroboros-agent.ai/install/#linux)
 [![Windows](https://img.shields.io/badge/Windows-x64-blue.svg)][download-windows-x64]
 [![OuroborosHub](https://img.shields.io/badge/OuroborosHub-skills%20marketplace-8A2BE2.svg)](https://github.com/razzant/OuroborosHub)
-[![Version 6.114.8](https://img.shields.io/badge/version-6.114.8-green.svg)](VERSION)
+[![Version 6.114.9](https://img.shields.io/badge/version-6.114.9-green.svg)](VERSION)
 
 Ouroboros is an open-source, general-purpose AI agent whose identity, durable memory, and history continue across tasks and restarts. It works on external projects, coordinates a live swarm of specialist agents, and can rewrite the implementation it runs on, including its code, architecture, prompts, tools, and dependencies. Reflection can also change how it understands itself without severing that continuity.
 
@@ -64,13 +64,13 @@ The desktop packages already contain an optional CLI installer. On macOS, after 
 
 </details>
 
-[download-macos-arm64]: https://github.com/razzant/ouroboros/releases/download/v6.114.8/Ouroboros-6.114.8.dmg
-[download-windows-x64]: https://github.com/razzant/ouroboros/releases/download/v6.114.8/Ouroboros-6.114.8-windows-x64.zip
-[download-linux-deb-amd64]: https://github.com/razzant/ouroboros/releases/download/v6.114.8/ouroboros_6.114.8_amd64.deb
-[download-linux-rpm-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.8/ouroboros-6.114.8-1.x86_64.rpm
-[download-linux-rpm-red80-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.8/ouroboros-6.114.8-1.red80.x86_64.rpm
-[download-linux-appimage-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.8/Ouroboros-6.114.8-linux-x86_64.AppImage
-[download-linux-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.8/Ouroboros-6.114.8-linux-x86_64.tar.gz
+[download-macos-arm64]: https://github.com/razzant/ouroboros/releases/download/v6.114.9/Ouroboros-6.114.9.dmg
+[download-windows-x64]: https://github.com/razzant/ouroboros/releases/download/v6.114.9/Ouroboros-6.114.9-windows-x64.zip
+[download-linux-deb-amd64]: https://github.com/razzant/ouroboros/releases/download/v6.114.9/ouroboros_6.114.9_amd64.deb
+[download-linux-rpm-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.9/ouroboros-6.114.9-1.x86_64.rpm
+[download-linux-rpm-red80-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.9/ouroboros-6.114.9-1.red80.x86_64.rpm
+[download-linux-appimage-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.9/Ouroboros-6.114.9-linux-x86_64.AppImage
+[download-linux-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.9/Ouroboros-6.114.9-linux-x86_64.tar.gz
 
 Ouroboros bundles [Claudexor](https://github.com/razzant/claudexor) as its local execution layer for delegated coding and hosted-agent review. Ouroboros owns the task, memory, review, and final integration, while Claudexor runs the selected connected coding harness and returns durable execution evidence. [Explore Claudexor](https://claudexor.ai/).
 
@@ -449,6 +449,7 @@ and the reason.
 
 | Version | Date | Description |
 |---------|------|-------------|
+| 6.114.9 | 2026-09-09 | **feat(devtools): bulk repository inventory tool (`bulk_inventory`) — one call reports per-pattern file/line coverage (grep -c semantics) across hundreds of files, replacing per-file search_code sweeps (the 818-skill inventory class; backlog ibl-616d8525673b).** Read-only pure-stdlib CLI in `devtools/` with JSON stdout; every skip (binary, oversize, symlink, unreadable, glob filter, walk error) is counted and disclosed — never silent; verified by 16 fixture tests and a real-repo run cross-checked against `grep -rIc` with exact agreement (13 files / 119 lines over `docs/`). Carriers synced to 6.114.9. |
 | 6.114.8 | 2026-09-08 | **fix(chat): BG proactive replies now stamp `sender_identity: "background"` instead of leaking the foreground `"agent"` preset.** C-scheme (6.114.3) gated the background stamp in `owner_delivery.py` with `setdefault`, but `control.py`'s `_send_user_message` presets `sender_identity="agent"`, so a genuine BG reply through `send_user_message` kept the wrong identity and the web renderer showed "Ouroboros" instead of "🧠 Background". The BG role on `ctx.task_metadata` is the single reliable authority, so the gate now FORCES the background identity for BG-role frames; foreground proactive frames keep "agent" and legacy producer frames stay unchanged. Regression tests: `test_background_role_overrides_preset_agent_identity` and `test_non_background_preset_identity_passes_through` in `tests/test_owner_live_delivery.py`. Carriers synced to 6.114.8. |
 | 6.114.7 | 2026-09-08 | **fix(tests): make project-naming tests hermetic.** The three LLM-first `test_project_from_task_auto_names_from_*` / `test_project_from_task_uses_objective_hint_*` tests asserted an exact Russian name the LLM could only coin deterministically under no credentials (the real fail-soft heuristic fallback). In a credentialed environment `llm_project_name_async` legitimately coins a different valid title (P5), so the tests flaked. All three now patch `ouroboros.project_naming.llm_project_name_async` with a deterministic namer that returns the first non-empty fallback candidate (the derived objective/hint), making them pass in live and CI environments alike while preserving the real assertions (whitespace collapse, cap, no bare task id / "New project"). Carriers synced to 6.114.7. |
 | 6.114.6 | 2026-09-08 | **fix(tests): unblock the commit gate by repairing the pre-existing test-suite debt.** The landed BG-routing fix (6.114.2) changed `server.py` to pass `chat_id` into `BackgroundConsciousness.inject_observation`, but the test doubles in six files (`test_client_surface`, `test_task_constraint_server_routing`, `test_project_routing_v664`, `test_project_chat_continuity`, `test_promote_chat_flow`, `test_v6730_origin_invariant`) still used `lambda *_: None` / `def inject_observation(self, _text)` and rejected the new keyword — a batch of tests failed with `TypeError: got an unexpected keyword argument 'chat_id'`. Four `test_settings_effort` tests set up exclusive-direct-provider conditions but did not delete `OPENAI_COMPATIBLE_BASE_URL`, so on hosts that configure a compatible endpoint the exclusive-direct fallback never engaged and `get_review_models()` returned unmigrated `openai/gpt-...` models instead of `openai::` — fixed by deleting that env var in the four tests (the local-only test already did). Verified: the directly-affected suites pass. Carriers synced to 6.114.6. |
