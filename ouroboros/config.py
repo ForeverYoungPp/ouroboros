@@ -55,10 +55,8 @@ TCP_KEEPALIVE_IDLE_SEC = 60
 TCP_KEEPALIVE_INTERVAL_SEC = 60
 TCP_KEEPALIVE_PROBE_COUNT = 5
 
-
 def _guard_live_settings_write() -> None:
     _settings_integrity.guard_live_settings_write(SETTINGS_PATH, HOME)
-
 
 # Settings defaults
 SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
@@ -360,34 +358,28 @@ CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION: str = "3.3.0"
 # Engine floor for the delegated ``workspaceRoot`` field (#362 stable-target routes).
 CLAUDEXOR_DELEGATED_WORKSPACE_ROOT_MIN_VERSION: str = "3.8.1"
 
-
 def _main_model() -> str:
     return (
         str(os.environ.get("OUROBOROS_MODEL", "") or "").strip()
         or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL"])
     )
 
-
 def get_light_model() -> str:
     """Light slot; empty falls back to Main (heavy/consciousness stay empty->main)."""
     return str(os.environ.get("OUROBOROS_MODEL_LIGHT", "") or "").strip() or _main_model()
-
 
 def get_heavy_model() -> str:
     """Return the heavy (strong acting/coding) lane slot; empty falls back to
     OUROBOROS_MODEL. Renamed from the legacy code slot."""
     return str(os.environ.get("OUROBOROS_MODEL_HEAVY", "") or "").strip() or _main_model()
 
-
 def get_vision_model() -> str:
     """Return the vision/caption model slot; empty falls back to OUROBOROS_MODEL."""
     return str(os.environ.get("OUROBOROS_MODEL_VISION", "") or "").strip() or _main_model()
 
-
 def get_image_input_mode() -> str:
     raw = str(os.environ.get("OUROBOROS_IMAGE_INPUT_MODE", SETTINGS_DEFAULTS["OUROBOROS_IMAGE_INPUT_MODE"]) or "").strip().lower()
     return raw if raw in {"auto", "caption", "inline", "off"} else "auto"
-
 
 def parse_fallback_chain() -> list[str]:
     """Parse the raw ordered cross-model fallback chain — SSOT for every consumer
@@ -403,7 +395,6 @@ def parse_fallback_chain() -> list[str]:
     )
     return [m.strip() for m in _parse_model_list(raw) if str(m or "").strip()]
 
-
 def get_fallback_models(active_model: str = "") -> list[str]:
     """Return the ordered cross-model resilience CHAIN (deduped, with the active model
     removed so a benchmark all-slots-one-model setup collapses the chain to a no-op)."""
@@ -416,7 +407,6 @@ def get_fallback_models(active_model: str = "") -> list[str]:
             out.append(m)
     return out
 
-
 # v6.39 slot rename-alias migration (same shape as the retention-key rename):
 # OUROBOROS_MODEL_CODE -> _HEAVY, USE_LOCAL_CODE -> USE_LOCAL_HEAVY,
 # OUROBOROS_MODEL_FALLBACK -> _FALLBACKS.
@@ -426,7 +416,6 @@ _LEGACY_SLOT_RENAMES = (
     ("USE_LOCAL_CODE", "USE_LOCAL_HEAVY"),
     ("OUROBOROS_MODEL_FALLBACK", "OUROBOROS_MODEL_FALLBACKS"),
 )
-
 
 def migrate_legacy_slot_keys(settings: dict) -> dict:
     """In-place settings migration, applied BEFORE defaults are merged.
@@ -444,7 +433,6 @@ def migrate_legacy_slot_keys(settings: dict) -> dict:
         settings["OUROBOROS_SCOPE_REVIEW_MODELS"] = _pin
     return settings
 
-
 def get_consciousness_model() -> str:
     """Return the high-horizon background-consciousness model slot."""
     return str(os.environ.get("OUROBOROS_MODEL_CONSCIOUSNESS", "") or "").strip() or _main_model()
@@ -454,24 +442,20 @@ def get_consciousness_model() -> str:
 # vendor tier above `max`; above-ceiling tiers adapt per route (API wire recovery / delegated).
 EFFORT_SCALE: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
-
 def effort_rank(value: str) -> int:
     """Index of an effort in EFFORT_SCALE (−1 if unknown). Strength-ordering SSOT."""
     v = str(value or "").strip().lower()
     return EFFORT_SCALE.index(v) if v in EFFORT_SCALE else -1
-
 
 def clamp_effort_to(value: str, ceiling: str) -> str:
     """Clamp ``value`` down to ``ceiling`` on EFFORT_SCALE; unknown inputs pass through."""
     vi, ci = effort_rank(value), effort_rank(ceiling)
     return ceiling if (vi >= 0 and ci >= 0 and vi > ci) else str(value or "").strip().lower()
 
-
 def effort_one_step_down(value: str) -> str:
     """Next-lower effort on EFFORT_SCALE (reject-and-retry walk); floors at `none`."""
     idx = effort_rank(value)
     return EFFORT_SCALE[idx - 1] if idx > 0 else ("none" if idx == 0 else "medium")
-
 
 _DIRECT_PROVIDER_REVIEW_RUNS = 3
 
@@ -488,14 +472,12 @@ _RUNTIME_MODE_RANK = {"light": 0, "advanced": 1, "pro": 2}
 _BOOT_RUNTIME_MODE: Optional[str] = None
 BOOT_RUNTIME_MODE_ENV_KEY = "OUROBOROS_BOOT_RUNTIME_MODE"
 
-
 def _resolve_baseline_from_env() -> Optional[str]:
     """Return the parent-pinned runtime-mode baseline inherited via env."""
     raw = os.environ.get(BOOT_RUNTIME_MODE_ENV_KEY, "")
     if not raw:
         return None
     return normalize_runtime_mode(raw)
-
 
 def initialize_runtime_mode_baseline(mode: Optional[str] = None) -> None:
     """Pin the immutable runtime-mode baseline before any agent code runs: call it after
@@ -514,17 +496,14 @@ def initialize_runtime_mode_baseline(mode: Optional[str] = None) -> None:
     # Propagate the pin to subprocesses.
     os.environ[BOOT_RUNTIME_MODE_ENV_KEY] = _BOOT_RUNTIME_MODE
 
-
 def reset_runtime_mode_baseline_for_tests() -> None:
     """Test-only helper to clear the pinned baseline and env export."""
     global _BOOT_RUNTIME_MODE
     _BOOT_RUNTIME_MODE = None
     os.environ.pop(BOOT_RUNTIME_MODE_ENV_KEY, None)
 
-
 def _parse_model_list(value: str) -> list[str]:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
-
 
 def _exclusive_direct_remote_provider_env() -> str:
     has_openrouter = bool(str(os.environ.get("OPENROUTER_API_KEY", "") or "").strip())
@@ -549,7 +528,6 @@ def _exclusive_direct_remote_provider_env() -> str:
         ("cloudru", has_cloudru), ("gigachat", has_gigachat),
     ) if present]
     return direct[0] if len(direct) == 1 else ""
-
 
 def resolve_effort(task_type: str) -> str:
     """Return the configured reasoning effort for the given task type."""
@@ -578,11 +556,9 @@ def resolve_effort(task_type: str) -> str:
     raw = os.environ.get(key, default)
     return raw if raw in EFFORT_SCALE else default
 
-
 # Prompt-cache TTL scale (owner decision 2026-08-08): 'default' = bare markers (provider default tier), '5m'/'1h' =
 # the two documented Anthropic ephemeral tiers. Deliberately NO 'auto' (dead until an adaptive design exists) and NO '24h' (Anthropic would clamp it — a value that mostly lies).
 PROMPT_CACHE_TTL_SCALE: tuple[str, ...] = ("default", "5m", "1h")
-
 
 def resolve_prompt_cache_ttl() -> str:
     """The owner-configured global prompt-cache TTL ('default' | '5m' | '1h').
@@ -596,7 +572,6 @@ def resolve_prompt_cache_ttl() -> str:
     default = str(SETTINGS_DEFAULTS["OUROBOROS_PROMPT_CACHE_TTL"])
     raw = str(os.environ.get("OUROBOROS_PROMPT_CACHE_TTL", default) or "").strip().lower()
     return raw if raw in PROMPT_CACHE_TTL_SCALE else default
-
 
 def direct_provider_review_models_fallback(provider: str) -> list[str]:
     """Return the exact review-models list a direct-provider fallback emits."""
@@ -614,7 +589,6 @@ def direct_provider_review_models_fallback(provider: str) -> list[str]:
         review_runs=_DIRECT_PROVIDER_REVIEW_RUNS,
     )
 
-
 def adaptive_quorum(n_slots: int) -> int:
     """Reviewer-quorum SSOT for an ARBITRARY configured slot count, reused by
     triad/scope/plan/skill/acceptance review. One configured reviewer needs 1 (a loud
@@ -622,7 +596,6 @@ def adaptive_quorum(n_slots: int) -> int:
     majority. DISTINCT from "configured >= quorum but fewer responded", which stays a loud
     infra quorum FAILURE at the call site."""
     return 2 if n_slots >= 3 else max(1, n_slots)
-
 
 def get_review_models() -> list[str]:
     """Return the configured pre-commit review model list."""
@@ -648,13 +621,11 @@ def get_review_models() -> list[str]:
         return direct_provider_review_models_fallback(provider)
     return migrated
 
-
 def get_review_enforcement() -> str:
     """Return the configured pre-commit review enforcement mode."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_ENFORCEMENT"])
     raw = (os.environ.get("OUROBOROS_REVIEW_ENFORCEMENT", default_val) or default_val).strip().lower()
     return raw if raw in {"advisory", "blocking"} else default_val
-
 
 def get_scope_review_models() -> list[str]:
     """Return configured scope reviewer slots, preserving duplicate model IDs."""
@@ -682,16 +653,13 @@ def get_scope_review_models() -> list[str]:
     fallback = direct_provider_review_models_fallback(provider)
     return fallback[:1] if fallback else migrated
 
-
 def get_deep_self_review_model() -> str:
     """Return the configured deep self-review model slot."""
     return (str(os.environ.get("OUROBOROS_MODEL_DEEP_SELF_REVIEW", "") or "").strip()
             or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]))
 
-
 def get_max_workers() -> int:
     return _clamped_number_setting("OUROBOROS_MAX_WORKERS", low=1, cast=int)
-
 
 def get_task_idle_timeout_sec() -> int:
     """Idle window before a task is eligible for an activity-based stop: it has made
@@ -699,14 +667,12 @@ def get_task_idle_timeout_sec() -> int:
     this long. The periodic 30s process heartbeat is liveness, NOT progress."""
     return _clamped_number_setting("OUROBOROS_TASK_IDLE_TIMEOUT_SEC", low=60, cast=int)
 
-
 def get_ephemeral_turn_deadline_sec() -> int:
     """Wall-clock deadline imposed on an owner-chat ephemeral decision turn. The
     regular read timeout is per-read-interval and a streaming/keepalive provider
     response can reset it indefinitely; this bounds the WHOLE turn so a hung LLM
     call releases _ephemeral_chat_lock instead of freezing the main chat."""
     return _clamped_number_setting("OUROBOROS_EPHEMERAL_TURN_DEADLINE_SEC", low=30, high=7200, cast=int)
-
 
 def get_ephemeral_queue_max() -> int:
     """Max ephemeral decision turns allowed to be RUNNING OR QUEUED at once
@@ -717,24 +683,20 @@ def get_ephemeral_queue_max() -> int:
     acknowledged and dropped."""
     return max(0, int(str(os.environ.get("OUROBOROS_EPHEMERAL_QUEUE_MAX", "2") or "2").strip() or 2))
 
-
 def get_task_abs_ceiling_sec() -> int:
     """Absolute wall-clock backstop per task, independent of activity — the only hard
     time axis (budget/cost is the other, separate hard axis). A productively-waiting
     orchestrator survives to this ceiling instead of a flat 1800s wall-clock kill."""
     return _clamped_number_setting("OUROBOROS_TASK_ABS_CEILING_SEC", low=300, cast=int)
 
-
 def get_per_call_timeout_ceiling_sec() -> int:
     """SSOT ceiling for an explicit per-call run_command/run_script timeout_sec
     (and the outer tool-execution cap that accommodates it)."""
     return _clamped_number_setting("OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", low=1, cast=int)
 
-
 def get_restart_drain_max_sec() -> int:
     return _clamped_number_setting(
         "OUROBOROS_RESTART_DRAIN_MAX_SEC", low=0, cast=lambda v: int(float(v)))
-
 
 def get_post_task_evolution_enabled() -> bool:
     """V4 envelope: is owner-enabled post-task self-evolution on? Default OFF."""
@@ -744,9 +706,7 @@ def get_post_task_evolution_enabled() -> bool:
     ) or "").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
-
 _EVERY_N_CADENCE_RE = re.compile(r"^every_n:[1-9][0-9]*$")
-
 
 def is_valid_post_task_evolution_cadence(raw: str) -> bool:
     """SSOT predicate: True iff `raw` is an exact valid cadence — 'off' | 'llm' |
@@ -755,7 +715,6 @@ def is_valid_post_task_evolution_cadence(raw: str) -> bool:
     never silently force an evolution cycle after every task."""
     value = str(raw or "").strip().lower()
     return value in {"off", "llm"} or bool(_EVERY_N_CADENCE_RE.match(value))
-
 
 def get_post_task_evolution_cadence() -> str:
     """Cadence for post-task evolution: 'off' | 'llm' | 'every_n:<k>'. Default 'llm'.
@@ -767,7 +726,6 @@ def get_post_task_evolution_cadence() -> str:
     ) or "").strip().lower()
     return raw if is_valid_post_task_evolution_cadence(raw) else "llm"
 
-
 def get_evolution_persistent_objective() -> str:
     """Optional owner-set standing steer APPENDED to each evolution cycle's
     objective. Never overrides the LLM-first promotion; empty = pure LLM choice."""
@@ -776,12 +734,10 @@ def get_evolution_persistent_objective() -> str:
         SETTINGS_DEFAULTS["OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE"],
     ) or "").strip()
 
-
 def get_post_task_evolution_budget_usd() -> float:
     """Optional per-window USD budget for post-task evolution (0 = use the
     existing EVOLUTION_BUDGET_RESERVE / TOTAL_BUDGET gating only)."""
     return _clamped_number_setting("OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD", low=0.0)
-
 
 def _bounded_positive_int_setting(key: str, *, default: int, hard_max: int, min_value: int = 1) -> int:
     """Bounded int setting; below ``min_value`` it is a typo and falls back to ``default``. Only
@@ -795,10 +751,8 @@ def _bounded_positive_int_setting(key: str, *, default: int, hard_max: int, min_
         parsed = default
     return max(min_value, min(parsed, hard_max))
 
-
 # Per-root active-child ceiling (v6.82: 50->500) and absolute host-visible nesting ceiling, used by supervisor gates and ARCHITECTURE §7.
 MAX_ACTIVE_SUBAGENTS_HARD_CAP, MAX_SUBAGENT_DEPTH_HARD_CAP = 500, 10
-
 
 def get_max_active_subagents_per_root() -> int:
     return _bounded_positive_int_setting(
@@ -806,7 +760,6 @@ def get_max_active_subagents_per_root() -> int:
         default=int(SETTINGS_DEFAULTS["OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT"]),
         hard_max=MAX_ACTIVE_SUBAGENTS_HARD_CAP,
     )
-
 
 def get_max_subagent_depth() -> int:
     """Structural nesting cap; 0 = NO delegation at all (every child refused, root tasks still
@@ -817,7 +770,6 @@ def get_max_subagent_depth() -> int:
         hard_max=MAX_SUBAGENT_DEPTH_HARD_CAP,
         min_value=0,
     )
-
 
 def get_allow_mutative_subagents(write_surface: str = "") -> bool:
     """Whether the parent may spawn mutative (acting) subagents.
@@ -847,7 +799,6 @@ def get_allow_mutative_subagents(write_surface: str = "") -> bool:
     # reports True because SOME acting children are allowed.
     return not surface or surface in {"external_workspace", "genesis"}
 
-
 def get_subagent_worktree_root() -> str:
     """Filesystem root for acting self_worktree checkouts (outside repo/ and data/)."""
     raw = str(
@@ -856,26 +807,22 @@ def get_subagent_worktree_root() -> str:
     ).strip()
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "subagent_worktrees"))
 
-
 # delegate_wait's ToolEntry per-call timeout (above it a configured ceiling buys a
 # KILLED call, not a longer wait; pinned by test) and the hard max WINDOW per call
 # (F5): 1800 < 2100 (kill) < 2400 (lease) — decoupled, a raised timeout never widens it.
 DELEGATE_WAIT_CEILING_SEC = 2100
 DELEGATE_WAIT_WINDOW_MAX_SEC = 1800
 
-
 def get_delegate_wait_max_sec() -> int:
     """delegate_wait window ceiling: the setting NARROWS, never widens past 1800."""
     return _clamped_number_setting(
         "OUROBOROS_DELEGATE_WAIT_MAX_SEC", low=1, high=DELEGATE_WAIT_WINDOW_MAX_SEC, cast=int)
-
 
 def get_delegate_wait_sec() -> int:
     """Default WINDOW one ``delegate_wait`` call holds — not a quiet cutoff: the
     wait holds, returns its advances, and bounds the nanny's mailbox absence."""
     return _clamped_number_setting(
         "OUROBOROS_DELEGATE_WAIT_SEC", low=1, high=get_delegate_wait_max_sec(), cast=int)
-
 
 def get_subagent_projects_root() -> str:
     """Durable root for genesis ("from scratch") subagent projects.
@@ -888,13 +835,11 @@ def get_subagent_projects_root() -> str:
     ).strip()
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "projects"))
 
-
 def get_search_code_wall_sec() -> float:
     """Total wall-clock budget (seconds) for ONE search_code call — bounds both the rg
     directory walk and the batched rg loop so a scan over a very large root cannot run
     unbounded. Env/setting: ``OUROBOROS_SEARCH_CODE_WALL_SEC`` (floored at 5s)."""
     return _clamped_number_setting("OUROBOROS_SEARCH_CODE_WALL_SEC", low=5.0)
-
 
 def get_deliverables_root() -> str:
     """Visible container for UNNAMED user deliverables: a bare filename (no directory) lands here
@@ -907,12 +852,10 @@ def get_deliverables_root() -> str:
     ).strip()
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "Deliverables"))
 
-
 def get_task_review_mode() -> str:
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_TASK_REVIEW_MODE"])
     raw = (os.environ.get("OUROBOROS_TASK_REVIEW_MODE", default_val) or default_val).strip().lower()
     return raw if raw in {"off", "auto", "required"} else default_val
-
 
 def _settings_flag_enabled(key: str) -> bool:
     """Disk-then-env-then-default boolean: an explicitly STORED value wins, so a UI toggle
@@ -930,23 +873,19 @@ def _settings_flag_enabled(key: str) -> bool:
         raw = os.environ.get(key, SETTINGS_DEFAULTS[key])
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
-
 def get_auto_grant_enabled() -> bool:
     """Return whether reviewed skills should receive requested grants."""
     return _settings_flag_enabled("OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS")
 
-
 def get_trust_native_seeded_skills() -> bool:
     """Whether launcher-seeded native skills get the hash-pinned trust verdict."""
     return _settings_flag_enabled("OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS")
-
 
 def normalize_runtime_mode(value: Any) -> str:
     """Clamp caller-supplied runtime mode to the canonical closed enum."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_RUNTIME_MODE"])
     text = str(value or "").strip().lower()
     return text if text in VALID_RUNTIME_MODES else default_val
-
 
 def get_runtime_mode() -> str:
     """Return the configured runtime mode (light / advanced / pro)."""
@@ -958,16 +897,13 @@ def get_runtime_mode() -> str:
         return normalize_runtime_mode(inherited)
     return normalize_runtime_mode(os.environ.get("OUROBOROS_RUNTIME_MODE", default_val) or default_val)
 
-
 VALID_SAFETY_MODES = ("full", "light", "off")
-
 
 def normalize_safety_mode(value: Any) -> str:
     """Clamp caller-supplied safety mode to the closed enum (full / light / off)."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MODE"])
     text = str(value or "").strip().lower()
     return text if text in VALID_SAFETY_MODES else default_val
-
 
 def get_safety_mode() -> str:
     """Return the owner-selected LLM-safety-supervisor coverage (full | light | off).
@@ -979,7 +915,6 @@ def get_safety_mode() -> str:
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MODE"])
     return normalize_safety_mode(os.environ.get("OUROBOROS_SAFETY_MODE", default_val) or default_val)
 
-
 def _clamped_number_setting(key: str, *, low, high=float("inf"), cast=float):
     """Env-or-default numeric setting clamped to [low, high]; a typo falls back to the
     shipped default. SSOT for the clamped scalar getters below — the seven of them were
@@ -990,21 +925,17 @@ def _clamped_number_setting(key: str, *, low, high=float("inf"), cast=float):
         value = cast(SETTINGS_DEFAULTS[key])
     return max(low, min(value, high))
 
-
 def get_safety_max_tokens() -> int:
     """Output-token budget for safety-supervisor LLM calls (parse-bug fix)."""
     return _clamped_number_setting("OUROBOROS_SAFETY_MAX_TOKENS", low=256, high=16384, cast=int)
-
 
 def get_safety_call_timeout_sec() -> float:
     """Transport timeout for safety-supervisor LLM calls (prevents indefinite hang)."""
     return _clamped_number_setting("OUROBOROS_SAFETY_CALL_TIMEOUT_SEC", low=5.0, high=600.0)
 
-
 def get_websearch_timeout_sec() -> float:
     """Per-attempt transport timeout for provider-backed web_search calls."""
     return _clamped_number_setting("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", low=30.0, high=3600.0)
-
 
 def get_llm_transport_read_timeout_sec() -> float:
     """Default httpx read/write timeout for no_proxy LLM clients (v6.54.3, D).
@@ -1012,21 +943,17 @@ def get_llm_transport_read_timeout_sec() -> float:
     The DEAD-SOCKET bound, not a latency target; explicit per-call timeouts win."""
     return _clamped_number_setting("OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC", low=60.0, high=7200.0)
 
-
 def get_acceptance_review_est_sec() -> float:
     """Estimated duration of one acceptance review/improvement pass (v6.54.4)."""
     return _clamped_number_setting("OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC", low=10.0, high=3600.0)
-
 
 def get_acceptance_reserve_pct() -> int:
     """Default finalization-reserve percentage of the total budget (v6.54.4)."""
     return _clamped_number_setting("OUROBOROS_ACCEPTANCE_RESERVE_PCT", low=0, high=50, cast=int)
 
-
 def get_plan_task_deadline_min_sec() -> float:
     """Minimum useful deadline-scaled planning-swarm window (v6.54.3, 1.5)."""
     return _clamped_number_setting("OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC", low=30.0, high=3600.0)
-
 
 def get_context_mode() -> str:
     """The EFFECTIVE working-context mode (low | max) used by context sizing.
@@ -1038,7 +965,6 @@ def get_context_mode() -> str:
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_CONTEXT_MODE"])
     return normalize_context_mode(os.environ.get("OUROBOROS_CONTEXT_MODE", default_val) or default_val)
 
-
 def get_owner_context_mode() -> str:
     """The OWNER-SELECTED context mode during the auto-Low compatibility window.
 
@@ -1049,7 +975,6 @@ def get_owner_context_mode() -> str:
     if get_context_mode() != "low":
         return "max"
     return "low" if owner_declared_low(os.environ.get("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "")) else "max"
-
 
 def _settings_file_value(key: str, default: str) -> str:
     """Read ONE persisted setting off disk, without normalizing the whole file. DISK ONLY, for EVERY caller: env
@@ -1065,7 +990,6 @@ def _settings_file_value(key: str, default: str) -> str:
             pass
     return default
 
-
 # The same keys from the other side: load_settings overlays env onto disk-ABSENT keys, so without this an
 # ordinary load->save round-trip in a process whose env says low/off would launder that value onto disk
 # unauthorised — or, once the guard reads disk, raise a PermissionError nobody authored. Owner endpoints
@@ -1075,7 +999,6 @@ _DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUT
 # ENDPOINT-AUTHORED, DISK-ONLY: install-time facts POST /api/onboarding/complete alone writes. The ratchets above are
 # disk-authored yet DO project once the file carries them; these never leave disk in EITHER direction — an env timestamp alone closed the onboarding window on a fresh install, and an env marker was then persisted by a save.
 ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_SUBAGENT_PRESET_RECEIPT", "OUROBOROS_ONBOARDING_COMPLETED_AT"})
-
 
 def _guard_context_mode_lowering(settings: dict, *, allow_context_lowering: bool = False) -> None:
     """Refuse agent-reachable settings writes that lower the cognitive horizon.
@@ -1101,7 +1024,6 @@ def _guard_context_mode_lowering(settings: dict, *, allow_context_lowering: bool
             "Authoring explicit owner-Low is owner-controlled; use the dedicated owner endpoint/UI/CLI."
         )
 
-
 def prepare_settings_for_persist(settings: dict, *, authored_keys: Sequence[str] = (),
         allow_context_lowering: bool = False, allow_safety_lowering: bool = False) -> dict:
     """THE prologue EVERY writer that persists settings.json must call; returns the dict to write.
@@ -1124,9 +1046,7 @@ def prepare_settings_for_persist(settings: dict, *, authored_keys: Sequence[str]
     _guard_safety_mode_lowering(prepared, allow_safety_lowering=allow_safety_lowering)
     return strip_masked_secrets(prepared, known_setting_keys=SETTINGS_DEFAULTS)
 
-
 _SAFETY_MODE_RANK = {"full": 2, "light": 1, "off": 0}
-
 
 def _guard_safety_mode_lowering(settings: dict, *, allow_safety_lowering: bool = False) -> None:
     """Refuse agent-reachable settings writes that lower LLM-safety coverage.
@@ -1141,7 +1061,6 @@ def _guard_safety_mode_lowering(settings: dict, *, allow_safety_lowering: bool =
             "Safety mode is owner-controlled — use the dedicated /api/owner/safety-mode endpoint."
         )
 
-
 def get_skills_repo_path() -> str:
     """Return the configured external skills checkout path, expanding ``~``."""
     raw = (os.environ.get("OUROBOROS_SKILLS_REPO_PATH", "") or "").strip()
@@ -1151,7 +1070,6 @@ def get_skills_repo_path() -> str:
         return str(pathlib.Path(raw).expanduser())
     except Exception:
         return raw
-
 
 # Skills data layout: runtime skill packages live under ``data/skills/<source>/<slug>/``.
 # The git-tracked ``repo/skills/`` tree is only a launcher seed; the optional
@@ -1171,7 +1089,6 @@ SKILL_SOURCE_SUBDIRS = (
     SKILL_SOURCE_OUROBOROSHUB,
 )
 
-
 def ensure_data_skills_dir(data_dir: pathlib.Path) -> pathlib.Path:
     """Create and return the data skills root plus source subdirectories."""
     root = data_dir / "skills"
@@ -1183,23 +1100,19 @@ def ensure_data_skills_dir(data_dir: pathlib.Path) -> pathlib.Path:
         pass
     return root
 
-
 def resolve_data_skills_dir(data_dir: pathlib.Path) -> Optional[pathlib.Path]:
     """Return existing ``<data_dir>/skills/`` without creating it."""
     candidate = data_dir / "skills"
     return candidate if candidate.is_dir() else None
 
-
 def get_ouroboroshub_catalog_url() -> str:
     """Return the official OuroborosHub static catalog URL."""
     return str(load_settings().get("OUROBOROS_HUB_CATALOG_URL") or SETTINGS_DEFAULTS["OUROBOROS_HUB_CATALOG_URL"]).strip()
-
 
 def get_ouroboroshub_skills_dir() -> pathlib.Path:
     """Return ``<DATA_DIR>/skills/ouroboroshub/`` (created on demand by
     ``ensure_data_skills_dir``, which makes every source subdir)."""
     return ensure_data_skills_dir(DATA_DIR) / SKILL_SOURCE_OUROBOROSHUB
-
 
 def get_clawhub_registry_url() -> str:
     """Return the normalized ClawHub registry URL; callers enforce host allowlists."""
@@ -1214,7 +1127,6 @@ def get_clawhub_registry_url() -> str:
     )
     return cleaned
 
-
 # Version
 def read_version() -> str:
     try:
@@ -1226,12 +1138,10 @@ def read_version() -> str:
     except Exception:
         return "0.0.0"
 
-
 # Settings file locking
 def _settings_lock_path() -> pathlib.Path:
     # Call-time so a repointed SETTINGS_PATH locks beside its own file.
     return pathlib.Path(str(SETTINGS_PATH) + ".lock")
-
 
 def _acquire_settings_lock(timeout: float = 2.0) -> Optional[int]:
     # None means the lock was NOT taken: every WRITER must abort on it (`save_settings` raises
@@ -1255,7 +1165,6 @@ def _acquire_settings_lock(timeout: float = 2.0) -> Optional[int]:
             break
     return None
 
-
 def _release_settings_lock(fd: Optional[int]) -> None:
     if fd is None:  # never acquired; a concurrent writer's lock must stay
         return
@@ -1267,7 +1176,6 @@ def _release_settings_lock(fd: Optional[int]) -> None:
         _settings_lock_path().unlink()
     except Exception:
         pass
-
 
 def _coerce_setting_value(key: str, value):
     default = SETTINGS_DEFAULTS.get(key)
@@ -1311,11 +1219,9 @@ def _coerce_setting_value(key: str, value):
             return default
     return str(value or "")
 
-
 def verify_settings_integrity() -> str | None:
     """Verify the strict child pin, returning the observed digest when present."""
     return _settings_integrity.verify_settings_integrity(SETTINGS_PATH)
-
 
 # Load / Save
 # Setting keys a release DELETED. `load_settings` keeps unrecognized keys so a rename never destroys
@@ -1331,7 +1237,6 @@ RETIRED_SETTING_KEYS: tuple[str, ...] = (
     "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC",
 )
 
-
 def _seed_review_cycles_from_legacy_passes(loaded: dict) -> None:
     """Migrate the retired acceptance-pass key into ``OUROBOROS_REVIEW_MAX_CYCLES`` (cycles =
     passes + 1) at LOAD: a runtime "is it customized?" test cannot tell a deliberate "2" from
@@ -1344,14 +1249,12 @@ def _seed_review_cycles_from_legacy_passes(loaded: dict) -> None:
     if passes != 1 and "OUROBOROS_REVIEW_MAX_CYCLES" not in loaded:  # 1 = shipped legacy default
         loaded["OUROBOROS_REVIEW_MAX_CYCLES"] = str(max(0, passes) + 1)
 
-
 def load_settings() -> dict:
     fd = _acquire_settings_lock()
     try:
         return load_settings_lock_held(_settings_lock_held=fd is not None)
     finally:
         _release_settings_lock(fd)
-
 
 def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
     """The same read, for a caller that ALREADY holds the settings lock. The lock is not
@@ -1412,7 +1315,6 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
             continue
         settings[key] = _coerce_setting_value(key, raw_env)
     return settings
-
 
 def save_settings(
     settings: dict,
@@ -1488,10 +1390,8 @@ def save_settings(
     finally:
         _release_settings_lock(fd)
 
-
 def get_mcp_servers() -> list:
     return list(_coerce_setting_value("MCP_SERVERS", load_settings().get("MCP_SERVERS")))
-
 
 def get_mcp_tool_timeout_sec() -> int:
     raw = os.environ.get("MCP_TOOL_TIMEOUT_SEC")
@@ -1508,14 +1408,12 @@ def get_mcp_tool_timeout_sec() -> int:
         parsed = 0
     return parsed if parsed > 0 else int(SETTINGS_DEFAULTS["MCP_TOOL_TIMEOUT_SEC"])
 
-
 def get_vision_caption_timeout_sec() -> int:
     return _clamped_number_setting("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", low=1, cast=int)
 def get_claudexor_quota_refresh_timeout_sec() -> int:
     return _clamped_number_setting("OUROBOROS_CLAUDEXOR_QUOTA_REFRESH_TIMEOUT_SEC", low=1, high=90, cast=int)
 def get_claudexor_harness_install_timeout_sec() -> int:
     return _clamped_number_setting("OUROBOROS_CLAUDEXOR_HARNESS_INSTALL_TIMEOUT_SEC", low=1, cast=int)
-
 
 def get_finalization_grace_sec(settings: Optional[dict] = None) -> int:
     raw = os.environ.get("OUROBOROS_FINALIZATION_GRACE_SEC")
@@ -1532,7 +1430,6 @@ def get_finalization_grace_sec(settings: Optional[dict] = None) -> int:
         parsed = int(FINALIZATION_GRACE_DEFAULT_SEC)
     return max(0, min(parsed, 300))
 
-
 def get_pacing_interval_sec(settings: Optional[dict] = None) -> int:
     """Intrinsic self-pacing checkpoint cadence in seconds (0 disables)."""
     raw = os.environ.get("OUROBOROS_PACING_INTERVAL_SEC")
@@ -1544,7 +1441,6 @@ def get_pacing_interval_sec(settings: Optional[dict] = None) -> int:
         parsed = int(PACING_INTERVAL_DEFAULT_SEC)
     return max(0, parsed)
 
-
 def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int:
     """Supervisor-loop stall deadline in seconds (0 disables the watchdog)."""
     raw = os.environ.get("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC")
@@ -1555,7 +1451,6 @@ def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int
     except (TypeError, ValueError):
         parsed = int(SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC)
     return max(0, parsed)
-
 
 # Settings keys deliberately NOT projected into the environment. Everything else in SETTINGS_DEFAULTS IS
 # exported, by derivation rather than a parallel hand-kept list: such a list drifts silently and the failure
@@ -1574,11 +1469,9 @@ SETTINGS_KEYS_NOT_EXPORTED_TO_ENV = frozenset({
     "OUROBOROS_SERVER_HOST",
 }) | ENDPOINT_AUTHORED_SETTINGS  # disk-only in BOTH directions (never read from env, never exported to it)
 
-
 def settings_env_keys() -> list:
     """Settings keys projected into os.environ, derived from SETTINGS_DEFAULTS."""
     return [k for k in SETTINGS_DEFAULTS if k not in SETTINGS_KEYS_NOT_EXPORTED_TO_ENV]
-
 
 def apply_settings_to_env(settings: dict) -> None:
     """Push settings into environment variables for supervisor modules."""
@@ -1609,13 +1502,11 @@ def apply_settings_to_env(settings: dict) -> None:
     if not os.environ.get("OUROBOROS_TASK_REVIEW_MODE"):
         os.environ["OUROBOROS_TASK_REVIEW_MODE"] = str(SETTINGS_DEFAULTS["OUROBOROS_TASK_REVIEW_MODE"])
 
-
 # PID lock: platform_layer uses OS-released locks on Unix and Windows.
 
 def acquire_pid_lock() -> bool:
     APP_ROOT.mkdir(parents=True, exist_ok=True)
     return _compat_pid_lock_acquire(str(PID_FILE))
-
 
 def release_pid_lock() -> None:
     _compat_pid_lock_release(str(PID_FILE))

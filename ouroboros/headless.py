@@ -973,8 +973,16 @@ def write_workspace_patch_artifacts(
                 allow_rc={0},
                 errors=errors,
             )
+            # The flag tail pins the prefix spelling: a host with
+            # ``diff.mnemonicprefix`` (or a custom prefix config) would emit
+            # ``c/``/``w/`` headers that downstream ``git apply`` consumers and
+            # the payload symlink parser do not expect. ``--src-prefix=a/
+            # --dst-prefix=b/`` beats every prefix config (diff.noprefix,
+            # diff.mnemonicprefix, diff.srcPrefix/dstPrefix), mirroring the
+            # preflight candidate assembler's pinning.
             total_size += _append_git_output(
-                ["git", "diff", "--binary", "--no-ext-diff", "--no-color", base_ref, *tracked_pathspec],
+                ["git", "diff", "--binary", "--no-ext-diff", "--no-color",
+                 "--src-prefix=a/", "--dst-prefix=b/", base_ref, *tracked_pathspec],
                 root,
                 fh,
                 hasher,

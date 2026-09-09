@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import re
 import pathlib
 import re as _re
 import subprocess
@@ -1245,6 +1246,13 @@ async def collect_evolution_metrics(repo_dir: str, data_dir: str | None = None) 
                 break
         return round(best, 2)
 
+    # ``--sort=creatordate`` is not a total order when several tags share one
+    # second (bulk imports, scripted tag runs — and every freshly-created test
+    # repo): git's tie-break is objectname ASCENDING, which scrambles vN
+    # sequences (``v2`` before ``v1``). Downstream consumers rely on creation
+    # order surviving (charts, "since tag X" math), so co-sort by (date ASC,
+    # refname DESC): equal-second tags come back in vN descending order — the
+    # newest tag first — while genuinely older dates still sort earlier.
     result = sp.run(
         ["git", "tag", "-l", "--sort=creatordate",
          "--format=%(refname:short)\t%(creatordate:iso-strict)"],
@@ -1259,6 +1267,17 @@ async def collect_evolution_metrics(repo_dir: str, data_dir: str | None = None) 
         tag = parts[0]
         date = parts[1] if len(parts) > 1 else ""
         tags.append((tag, date))
+    def _version_key(tag_name: str) -> tuple[int, ...]:
+        match = re.match(r"v?(\d+(?:\.\d+)*)", tag_name)
+        if not match:
+            return (0,)
+        return tuple(int(part) for part in match.group(1).split("."))
+
+    # Date first (chronology dominates), version-ascending ties second: equal-
+    # second tags return v1, v2, ..., v9, v10 — the contract this collector has
+    # always exposed, restored deterministically.
+    tags.sort(key=lambda td: _version_key(td[0]))
+    tags.sort(key=lambda td: td[1])
 
     cache_path: pathlib.Path | None = None
     cached_by_tag: dict[str, dict[str, Any]] = {}

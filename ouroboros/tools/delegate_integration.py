@@ -1183,14 +1183,28 @@ def _candidate_symlink_escapes(
             is_link = True
         elif line.startswith(b"+++ "):
             name = line[4:].split(b"\t")[0].decode("utf-8", errors="surrogateescape")
-            if name.startswith("b/"):
-                path = name[2:]
-            elif name.startswith('"'):
+            # git's diff prefix is configurable: the default ``b/`` spelling AND
+            # ``diff.mnemonicprefix`` spellings (``c/`` preimage, ``i/`` index
+            # postimage, ``o/``/``w/`` worktree variants) all name the same
+            # postimage path. A mnemonic-prefix host must not fail closed here —
+            # that would refuse every symlink-introducing entry as unparseable
+            # instead of judging the link target. Strip any single-letter
+            # prefix; a path GENUINELY named ``<letter>/...`` in a payload is
+            # still judged for escape by the same resolved-landing check.
+            for prefix in ("b/", "i/", "w/", "o/", "c/", "a/"):
+                if name.startswith(prefix) and len(name) > 2:
+                    name = name[2:]
+                    break
+            if name.startswith('"'):
                 # git-quoted (control/non-ASCII bytes in the name): fail closed
                 # rather than guess the octal unescaping for a symlink entry.
                 path = ""
+            else:
+                path = name
         elif line.startswith(b"@@"):
             in_hunk = True
+        elif line.startswith(b"\ No newline at end of file"):
+            continue  # git metadata, never link content
         elif is_link and in_hunk and line.startswith(b"+") and link_target is None:
             link_target = line[1:].decode("utf-8", errors="surrogateescape")
     err = _flush()
