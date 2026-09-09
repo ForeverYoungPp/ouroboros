@@ -59,6 +59,37 @@ class TestDeliverOwnerEvent:
         # BG frames stay exactly as before the seam: buffered, no pseudo-lineage.
         assert "task_id" not in ctx.pending_events[0]
 
+    def test_background_role_overrides_preset_agent_identity(self):
+        # v6.114.8: control.py's _send_user_message presets
+        # sender_identity="agent"; owner_delivery must FORCE "background" for a
+        # genuine BG reply instead of leaving the wrong preset on the frame.
+        # Regression for the web renderer showing "Ouroboros" instead of
+        # "🧠 Background" on BG proactive replies.
+        from ouroboros.tool_capabilities import BACKGROUND_DELEGATION_ROLE
+
+        ctx = _ctx(meta={"delegation_role": BACKGROUND_DELEGATION_ROLE})
+        deliver_owner_event(ctx, {
+            "type": "send_message",
+            "chat_id": 1,
+            "text": "bg reply",
+            "sender_identity": "agent",
+        })
+        assert ctx.pending_events[0]["sender_identity"] == "background"
+
+    def test_non_background_preset_identity_passes_through(self):
+        # The foreground proactive path (control.py presets "agent") must keep
+        # its identity unchanged; only the BG role forces the override.
+        q = _Queue()
+        ctx = _ctx(event_queue=q)
+        deliver_owner_event(ctx, {
+            "type": "send_message",
+            "chat_id": 1,
+            "text": "fg reply",
+            "sender_identity": "agent",
+        })
+        assert q.items[0]["sender_identity"] == "agent"
+        assert ctx.pending_events == []
+
     def test_consciousness_stamps_the_shared_background_role(self):
         # Literal-drift pin: the producer (consciousness) and the gate
         # (owner_delivery) must share ONE constant, not two literals.

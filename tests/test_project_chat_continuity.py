@@ -505,7 +505,7 @@ def test_owner_project_message_survives_into_history_with_annotation(tmp_path, m
             return None
 
     class _Consciousness:
-        def inject_observation(self, _text):
+        def inject_observation(self, _text, **_kwargs):
             return None
 
     ctx = types.SimpleNamespace(

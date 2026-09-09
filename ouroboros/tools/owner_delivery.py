@@ -69,7 +69,12 @@ def deliver_owner_event(ctx: Any, evt: Dict[str, Any]) -> str:
         # are stamped here so the durable row and live replay can distinguish
         # BG from the foreground agent. Plain task frames stay legacy (no
         # field), keeping old rows and other producers byte-compatible.
-        evt.setdefault("sender_identity", "background")
+        # v6.114.8: FORCE the background identity instead of setdefault —
+        # control.py's _send_user_message presets sender_identity="agent", and
+        # setdefault would leave that wrong value on a genuine BG reply, so the
+        # web renderer showed "Ouroboros" instead of "🧠 Background". The BG
+        # role on ctx.task_metadata is the single reliable authority here.
+        evt["sender_identity"] = "background"
         return _deferred()
 
     evt.setdefault("task_id", str(getattr(ctx, "task_id", "") or ""))

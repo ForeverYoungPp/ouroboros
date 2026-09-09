@@ -38,7 +38,7 @@ from ouroboros.acceptance_dialogue import (  # noqa: F401 — re-export
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
 from ouroboros.outcomes import ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_DELIVERY_CONTROL_DEGRADED, REASON_OWNER_REQUESTED_FINALIZATION, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_execution_id
-# Protocol leaf keeps historical names importable at this module's size ceiling.
+from ouroboros import empty_round_guard
 from ouroboros.delivery_protocol import (
     CHILD_ABSORPTION_HOLD_CONTROL as _CHILD_ABSORPTION_HOLD_CONTROL,
     DELIVERY_HOLD_CONTROLS as _DELIVERY_HOLD_CONTROLS,
@@ -4037,10 +4037,8 @@ def _no_tool_final_answer(
             _arm_delivery_control(tools, limit_ctx, llm_trace)
         return None
 
-    # Declared service outputs and teardown failures are acceptance evidence,
-    # not postscript cleanup: finalize them before the host panel and, when
-    # that changes evidence, require one complete replacement answer bound to
-    # the new revision. The finally-path reuses the same idempotent helper.
+    # Service outputs/teardown failures are acceptance evidence: finalize
+    # before the host panel; changed evidence needs a complete replacement.
     service_exit_ctx = _LoopExitContext(
         tools=tools,
         drive_root=limit_ctx.drive_root,
@@ -4069,6 +4067,11 @@ def _no_tool_final_answer(
             )
             _arm_delivery_control(tools, limit_ctx, llm_trace)
             return None
+    if empty_round_guard.maybe_inject_empty_round_reminder(
+        limit_ctx, llm_trace, content, messages, emit_progress,
+        append_or_merge_user_message=_append_or_merge_user_message,
+    ):
+        return None
 
     _project_child_result_dispositions(limit_ctx, llm_trace)
     plan_suffix = _force_plan_disclosure(tools._ctx, llm_trace)
@@ -6325,7 +6328,6 @@ def run_llm_loop(
             )
             content = msg.get("content")
             _latch_final_answer_marker(llm_trace, content, current_tool_calls=tool_calls)
-            # Every metered response counts as nanny progress.
             _note_nanny_delegate_activity(tools._ctx, round_idx, accumulated_usage, [])
             if not tool_calls:
                 final_result = _no_tool_final_answer(

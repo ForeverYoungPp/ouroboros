@@ -1853,7 +1853,7 @@ def test_busy_project_chat_routes_to_ephemeral_decision_turn(tmp_path, monkeypat
             }]
 
     class _Consciousness:
-        def inject_observation(self, _text):
+        def inject_observation(self, _text, **_kwargs):
             return None
 
     def _ephemeral(cid, text, image_data, *, task_constraint=None, task_metadata=None):
@@ -1906,12 +1906,24 @@ def test_project_from_task_endpoint_creates_binding(tmp_path):
     assert project_binding_for_task(tmp_path, "abc123")["project_id"] == "task-abc123"
 
 
-def test_project_from_task_auto_names_from_objective(tmp_path):
+def test_project_from_task_auto_names_from_objective(tmp_path, monkeypatch):
     """One-click convert (owner P1): with NO name supplied the project name is
     derived from the task's own objective, not the live progress headline, and
     long objectives are collapsed/truncated. No human input, no extra LLM call."""
     import asyncio
     import json
+
+    # Deterministic namer: replicate the real fail-soft behavior under no
+    # credentials (returns the first fallback candidate = the derived objective)
+    # so the test is hermetic in BOTH live and CI environments (P5 LLM-first
+    # naming may coin any valid title when credentials exist).
+    async def _hermetic_namer(owner_text, *, fallback_candidates=(), **kwargs):
+        for c in fallback_candidates:
+            if str(c or "").strip():
+                return str(c).strip()
+        return None
+
+    monkeypatch.setattr("ouroboros.project_naming.llm_project_name_async", _hermetic_namer)
 
     from ouroboros.gateway.projects import api_project_from_task
     from ouroboros.projects_registry import get_project
@@ -2022,12 +2034,20 @@ def test_project_from_task_names_skill_lifecycle_task(tmp_path):
     assert len(name) <= 60
 
 
-def test_project_from_task_uses_objective_hint_for_in_progress_direct_chat(tmp_path):
+def test_project_from_task_uses_objective_hint_for_in_progress_direct_chat(tmp_path, monkeypatch):
     """A still in-progress DIRECT chat task has no server-side title/objective/queue
     source, so the frontend's objective_hint (the owner's original request) names
     the project — not 'New project' or the bare id (P1, scope-review fix)."""
     import asyncio
     import json
+
+    async def _hermetic_namer(owner_text, *, fallback_candidates=(), **kwargs):
+        for c in fallback_candidates:
+            if str(c or "").strip():
+                return str(c).strip()
+        return None
+
+    monkeypatch.setattr("ouroboros.project_naming.llm_project_name_async", _hermetic_namer)
 
     from ouroboros.gateway.projects import api_project_from_task
 
@@ -2046,12 +2066,20 @@ def test_project_from_task_uses_objective_hint_for_in_progress_direct_chat(tmp_p
     assert len(name) <= 60
 
 
-def test_project_from_task_auto_names_from_live_queue_snapshot(tmp_path):
+def test_project_from_task_auto_names_from_live_queue_snapshot(tmp_path, monkeypatch):
     """An in-progress conversion (no task_result objective written yet) derives the
     name from the LIVE queue snapshot, not the bare task id (F1 — fixes the observed
     task-id fallback when converting a still-running card)."""
     import asyncio
     import json
+
+    async def _hermetic_namer(owner_text, *, fallback_candidates=(), **kwargs):
+        for c in fallback_candidates:
+            if str(c or "").strip():
+                return str(c).strip()
+        return None
+
+    monkeypatch.setattr("ouroboros.project_naming.llm_project_name_async", _hermetic_namer)
 
     from ouroboros.gateway.projects import api_project_from_task
 
