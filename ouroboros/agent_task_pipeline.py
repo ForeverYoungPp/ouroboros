@@ -60,7 +60,6 @@ from ouroboros.presence_runner import build_presence_result_event
 
 log = logging.getLogger(__name__)
 
-
 def build_trace_summary(llm_trace: dict) -> str:
     """Return a compact human-readable summary of tool calls and agent notes."""
     tool_calls = llm_trace.get("tool_calls", []) or []
@@ -144,7 +143,6 @@ def build_trace_summary(llm_trace: dict) -> str:
         summary = _truncate_with_notice(summary, 4000)
     return summary
 
-
 def _update_improvement_backlog(
     env: Any,
     reflection_entry: Dict[str, Any] | None,
@@ -168,7 +166,6 @@ def _update_improvement_backlog(
         log.debug("Improvement backlog update failed", exc_info=True)
         return 0
 
-
 def _apply_reflection_memory_actions(
     env: Any,
     reflection_entry: Dict[str, Any] | None,
@@ -190,7 +187,6 @@ def _apply_reflection_memory_actions(
     except Exception:
         log.debug("Reflection memory action application failed", exc_info=True)
         return 0
-
 
 def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> str:
     """Return compact evidence from child/subagent results for parent experience review."""
@@ -221,7 +217,6 @@ def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> s
     except Exception:
         log.debug("Failed to collect child task evidence", exc_info=True)
         return ""
-
 
 def _pre_synthesis_usage_snapshot(
     env: Any,
@@ -280,7 +275,6 @@ def _pre_synthesis_usage_snapshot(
         })
     return snapshot
 
-
 # The synthesis cost/snapshot projections live in `ouroboros/synthesis_cost_text.py`
 # (extracted at this module's size ceiling); re-exported here because the
 # synthesis prompts, the tests and monkeypatch targets name them on THIS surface.
@@ -292,7 +286,6 @@ from ouroboros.synthesis_cost_text import (  # noqa: F401,E402
     _synthesis_usage_snapshot_text,
 )
 
-
 def _compact_review_projection(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     """Build the public review projection without copying raw actor output."""
     try:
@@ -302,7 +295,6 @@ def _compact_review_projection(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         log.debug("Failed to build compact review projection", exc_info=True)
         return {"panels": []}
-
 
 def _run_post_task_processing_async(
     env: Any,
@@ -439,7 +431,6 @@ def _run_post_task_processing_async(
         raise
     return None
 
-
 def recover_pending_root_post_task_synthesis(
     drive_root: Any, repo_dir: Any = None,
 ) -> int:
@@ -517,7 +508,6 @@ def recover_pending_root_post_task_synthesis(
         recovered += 1
     return recovered
 
-
 def _run_global_backlog_promotion_only(
     env: Any,
     task: Dict[str, Any],
@@ -552,7 +542,6 @@ def _run_global_backlog_promotion_only(
         maybe_promote(env, global_task, sanitized_entry, llm)
     except Exception:
         log.debug("Canonical post-task promotion-only path failed", exc_info=True)
-
 
 def _attach_host_mutation_projection(
     env: Any,
@@ -591,7 +580,6 @@ def _attach_host_mutation_projection(
             llm_trace["mutation_attribution"] = projection
             return
 
-
 def _derive_host_bound_loop_outcome(
     env: Any,
     task: Dict[str, Any],
@@ -603,7 +591,6 @@ def _derive_host_bound_loop_outcome(
     _attach_host_mutation_projection(env, task, llm_trace)
     loop_outcome = apply_skill_publish_receipt_veto(derive_loop_outcome(text or "", usage, llm_trace), task, llm_trace)
     return _apply_terminal_custody_outcome(env, task, loop_outcome)
-
 
 def _apply_terminal_custody_outcome(
     env: Any, task: Dict[str, Any], loop_outcome: Dict[str, Any],
@@ -938,7 +925,6 @@ def emit_task_results(
                     str(task.get("id") or ""),
                 )
 
-
 def _dispatch_root_post_task(
     env: Any, task: Dict[str, Any], text: str,
     event_queue: Any, pending_events: List[Dict[str, Any]],
@@ -994,7 +980,6 @@ def _dispatch_root_post_task(
             on_reflection=global_reflection_callback,
             sealed_final=sealed_final,
         )
-
 
 def _store_task_result(env: Any, task: Dict[str, Any], text: str,
                        usage: Dict[str, Any], llm_trace: Dict[str, Any],
@@ -1193,7 +1178,6 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
     except Exception as e:
         log.warning("Failed to store task result: %s", e)
 
-
 _TASK_SUMMARY_PROMPT = """\
 Summarize this completed task for Ouroboros's episodic memory.
 Be specific about: what was tried, what worked, what failed, key decisions made.
@@ -1309,7 +1293,6 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
     except Exception:
         log.debug("Task summary generation failed (non-critical)", exc_info=True)
 
-
 def _run_chat_consolidation(env, memory, llm, task, drive_logs):
     """Run dialogue-block consolidation inside the root post-task worker."""
     try:
@@ -1354,7 +1337,6 @@ def _run_chat_consolidation(env, memory, llm, task, drive_logs):
     except Exception:
         log.warning("Chat block consolidation setup failed", exc_info=True)
 
-
 def _run_scratchpad_consolidation(env: Any, memory: Any, llm: Any) -> None:
     """Run scratchpad consolidation inside the root post-task worker."""
     try:
@@ -1385,7 +1367,6 @@ def _run_scratchpad_consolidation(env: Any, memory: Any, llm: Any) -> None:
                 update_budget_from_usage(u)
     except Exception:
         log.debug("Scratchpad consolidation setup failed", exc_info=True)
-
 
 def _run_reflection(env: Any, llm: Any, task: Dict[str, Any],
                     usage: Dict[str, Any], llm_trace: Dict[str, Any],
@@ -1426,7 +1407,6 @@ def _run_reflection(env: Any, llm: Any, task: Dict[str, Any],
     except Exception:
         log.debug("Execution reflection setup failed", exc_info=True)
     return None
-
 
 def build_review_context(env: Any) -> str:
     """Build a compact review continuity section for the main reasoning context."""
