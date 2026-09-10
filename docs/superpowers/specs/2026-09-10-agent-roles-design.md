@@ -17,11 +17,11 @@
 |---|---|---|
 | 权威来源 | task contract / owner 委派 | P0 agency（`BIBLE.md:42-45` 具名实现） |
 | 循环 | `agent.py:1217 run_llm_loop` → `loop.py:6087` | 自有 `_loop:627` / `_think:694` / `_think_scoped:714`，**不调** `run_llm_loop` |
-| 工具可见性 | 全量注册表 | **独立 `ToolRegistry` 实例**（`consciousness.py:1203`）+ `_BG_TOOL_WHITELIST`（`:1193`）在 `_execute_tool:1244` **强制** |
+| 工具可见性 | 全量注册表 | **同为全量注册表实例**（`_build_registry:1203` 调 `ToolRegistry(...)` → `_load_modules()` 加载 36 个冻结模块），天花板由**两层结构性过滤**实现：`_tool_schemas()` 按 `_BG_TOOL_WHITELIST`（`:1193`）过滤给模型的 schema，`_execute_tool:1244` 在执行期**强制**白名单 |
+| 单次工具执行 | `loop_tool_execution._execute_with_timeout:973` | **不是同一个实现**——BG 有自己的 `self._tool_executor.submit(...)` + `future.result(timeout=...)` + 自己的超时处理/`reset()`/live log/周期收据（`consciousness.py:1293-1330`） |
 | 上下文 | `context.build_llm_messages(mode, task)` | 自有 `_build_context`（`partition="all"`） |
 | 触发 | 队列准入 / owner 消息 / 排程 | 定时自唤醒 + 观察注入 |
 | 生命周期 | 有界：租约 / custody / deadline | 无界：单例（`server.py:2208`），R1 运行时 `pause`（`server.py:1597/1607`） |
-| 单次工具执行 | `loop_tool_execution._execute_with_timeout:973` | 同左（**共用**） |
 
 ### 1.2 `task_type` 是**现存的**认知面轴
 
@@ -29,17 +29,20 @@
 
 **已存在的面**（不完整，因为无枚举）：
 
-| 面 | 证据 |
-|---|---|
-| `task`（默认/隐式） | `agent.py:233` 的 `str(task.get("type") or "task")` |
-| `evolution` | `supervisor/evolution_lifecycle.py:212` 造 `{"type": "evolution"}` |
-| `review` | `config.py:540`；`gateway/tasks.py:467` |
-| `deep_self_review` | `config.py:543`；`agent.py:1154` |
-| `scope_review` **与** `scope-review` | `config.py:546` —— **同一面两种拼写并存** |
-| `consciousness` | `config.py:545`；`loop_llm_call.py:1477` |
-| `summarize` | `loop_llm_call.py:1477` |
+| 面 | **生产者**（实测 `grep '"type": "…"'`） | 消费者（策略所在） |
+|---|---|---|
+| `task`（默认） | 10 处，如 `supervisor/task_dispatch.py:51`、`gateway/schedules.py:74`、`supervisor/workers.py:723/1313` | `config.py:561`（`else` → `medium`） |
+| `consciousness` | `consciousness.py:1027` | `config.py:545`；`loop_llm_call.py:1477` |
+| **`presence`** | `presence_runner.py:316` ← **原表漏列**（它也是 InteractionScout 发现的第二条执行车道） | `context.py:234`、`context.py:1463` 的集合分支 |
+| `evolution` | `supervisor/evolution_lifecycle.py:212` | `config.py:536`；`tools/git.py`/`tools/control.py` 的闸门；`queue.py` 的调度序 |
+| `deep_self_review` | `supervisor/queue.py:1434` | `config.py:543`；`agent.py:1154`；`tools=None` |
+| **`skill_publish`** | `web/modules/skill_publish_flow.js:221` ← **原表漏列** | 待核 |
+| `review` / `summarize` | **未找到生产者**（只在消费者出现：`config.py:540`、`loop_llm_call.py:1477`）| 待判定：是死词汇还是由别处构造 |
+| `scope_review` 与 `scope-review` | **不在本轴上**（`config.py:546` 是 `resolve_effort` 的**入参字符串**，非 task `type`）| 待判定 |
 
-**每面策略已经存在，但散落在至少 8 处**：
+**并且 `/api/tasks` 接受任意 `type` 字符串**（`web/modules/skill_publish_flow.js:221` 就是前端造的值）——所以这个轴**没有封闭取值集**，任何声明表都必须定义对未知值的处理。
+
+**每面策略已经存在，但散布范围比原稿估计的大得多**——原稿说「至少 8 处」，审计实测 **≥19 处**（含 `supervisor/queue.py:183-188` 的 `_task_priority` 调度序与 `:1218/1353/1384/1392/1429-1434` 的 evolution/deep_self_review 专属分支、`context.py:210/226-234/1463`、`loop_tool_execution` 等）。
 
 | # | 位置 | 该处编码的 per-surface 策略 |
 |---|---|---|
@@ -144,7 +147,7 @@ CognitionSurface {
 
 ## 4. 不变量（不可违反）
 
-1. **能力上限是结构性的，不是 prompt 级的。** 需要更少工具的面拿到**更小的注册表**（`deep_self_review` 拿到的是**空**），绝不拿到全量注册表 + 指令。
+1. **能力上限是结构性的，不是 prompt 级的。** 但准确的机制**不是「更小的注册表」**——实测：`ToolRegistry.__init__` 走 `_load_modules()` 加载全部 **36 个冻结模块**（`tools/registry.py:1564-1581`），BG 拿到的是**全量注册表实例**；而 `deep_self_review` 是 `tools=None`（根本没有工具）。两种形态说明「工具可见性」的正确语义是**三层之一**：全量 / 白名单过滤 / 无。**BG 那一层的结构性来自两个都不可省的部分**：`_tool_schemas()` 的 schema 过滤（模型看不到未授权工具）**与** `_execute_tool:1244` 的执行期强制（伪造调用也执行不了）。只做前者是不够的。
 2. **轴 A 与轴 C 不动**：`delegation_role` 的 host 持有、防伪造、`subagent` 只能经内部工具产生（`cli.py:187-188`、`gateway/tasks.py:487-488`），以及 `sender_identity` 的呈现语义，一律保持原样。
 3. **已正确使用面轴的三个面（`evolution` / `review` / `deep_self_review`）行为不变**——本设计是给它们补上声明，不是改它们。
 4. **R2 是 P0 的实现，不是 R1 的一种模式。** 不因「共用代码更省」而把 R2 变成 R1 的一次任务。
@@ -157,7 +160,7 @@ CognitionSurface {
 |---|---|
 | LLM 客户端与 wire 契约 | `llm.py`（provider 路由、物理发送台账） |
 | 工具目录 | `tools/*` + `ToolRegistry` / `ToolEntry`（各建**实例**，同一目录） |
-| 单次工具执行 | `loop_tool_execution._execute_with_timeout:973` |
+| 单次工具执行 | `loop_tool_execution._execute_with_timeout:973` —— ⚠️ **实测只有 R1 在用**；BG 有自己的并行实现（`consciousness.py:1293-1330`）。这是**应当共用但目前没有**的一项，不是既成事实 |
 | 上下文捕获原语 | `context.py` 的 section builders（已按 surface/partition 参数化） |
 | 记忆访问 | Engram + 三个受保护文件（见主规格 §3.4） |
 | 可观测性 | live log / progress / telemetry |

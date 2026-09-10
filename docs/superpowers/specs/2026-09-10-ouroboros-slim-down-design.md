@@ -23,7 +23,12 @@
 - **不引入 pi / TypeScript。** 理由**不是**跨语言边界——本仓已有 `claudexor_runtime_pin.json`（钉 claudexor 3.9.5 + Node 24.16.0，含 `archive_url`/`sha256`/`size_bytes`）+ `claudexor_daemon.py` 用 `process_custody` 拉起外部 Node daemon 的约 4,510 行已验证胶水，Node 伴随进程是既有模式而非新风险。理由是**能力覆盖**：pi 的 `Agent`/`agentLoop` 能替换的只有第①层（`while True` + tool dispatch + 事件流），而本循环真实拥有、SDK 没有的机制有 12 项（物理发送台账、不重发相同字节谓词、wire 投影逐项匹配、发送副本≠canonical transcript、fit/reclaim 三级节拍、轮顶外部权威改写、付费收尾、交付候选+验收绑定、可重入轮、cache_control 锚点、工具执行侧非功能约束、每轮可路由改写）。换来的复杂度大于省下的。
 - **不重构 `run_llm_loop` 的形态**。轮顶顺序、tool 回填、终止判定不变。
 - **不动 `consciousness`（第二个 agent 角色）**。本仓对 agent 定义了两个不同职责——任务 agent（`agent.py` → `run_llm_loop`，全量工具）与后台意识（`consciousness.py`，自有循环 + 独立 registry + 白名单）。本规格既不删也不合并这层边界（§5.13）。
-- **不动交互层**（presence 合并、hurry 降级、client_surface 删除留作后续独立规格）。
+- **不动交互层的车道与表面**（presence 合并、hurry 降级、client_surface 删除留作后续独立规格）。
+  ⚠️ **但有一个接缝必须交代**：`project_dialogue.py`(909 行) 是**跨面模块**——它既是交互面（项目房、路由注解、`build_owner_message_ref`），又承载两个**非交互面**的读取器，且这两个的实现落在 A 面的删除清单上：
+  - `project_recent_dialogue`(`:140-160`) 读 `memory.read_unconsolidated_chat` + `memory.load_dialogue_meta`；唯一消费者 `context.py:1089`（**prompt 路径**）
+  - `resolve_owner_message_source`(`:210-222`) import `consolidator._ordered_chat_generation_paths`；唯一消费者 `agent_startup_checks.py:213`（**任务准入闸门** `validate_task_authority_sources`）
+
+  因此「不动交互层」的准确含义是**不动它的车道与控制面**，而 `project_dialogue.py` 的这两条读取路径属 A 面迁移目标（§5.12）。
 - **不动 supervisor 的任务生命周期**。
 
 ## 3. 宪法约束（硬边界，先于一切设计选择）
@@ -172,7 +177,7 @@ Engram 的读**默认按 project 分域**，但 observation 有第三个维度 `
 **§5.6 的表只覆盖了工具名，遗漏了三类下游：**
 
 1. **被跨模块 import 的非工具符号**（`tools/knowledge.py` 导出，非工具）：`_sanitize_topic`（`presence_context.py:9/25-30`）、`_knowledge_write_lock`（`reflection.py:738-739`）、`_rebuild_knowledge_index`（见 §5.11）。§5.12 已把它们列入待迁移。
-2. **被删工具名的下游引用面**——提示词与策略/配额表会留下永不命中的死条目：`prompts/SYSTEM.md:703`（`knowledge_write`/`update_scratchpad`）、`:813`（`knowledge_list`）、`:815-817`（Memory Registry 小节）、`prompts/CONSCIOUSNESS.md:15/44-45/124`、`ouroboros/tool_access.py:720-733`（写 `memory/` 的重定向文案）、`ouroboros/tools/core.py:454-458/488-492/603-614`、`safety.py:47-48/56/99/101`、`tool_capabilities.py:38-40/116/177`、`_outcome_tool_errors.py:236-240`、`outcomes.py:528-531`、`project_facts.py:141-143`。**后果**：提示词会持续指示 agent 调用已不存在的工具。这些随 §9.2 的载体同步一并改。
+2. **被删工具名的下游引用面**——提示词与策略/配额表会留下永不命中的死条目：`prompts/SYSTEM.md:703`（`knowledge_write`/`update_scratchpad`）、`:813`（`knowledge_list`）、`:815-817`（Memory Registry 小节）、`prompts/CONSCIOUSNESS.md:15/44-45/124`、`ouroboros/tool_access.py:720-733`（写 `memory/` 的重定向文案）、`ouroboros/tools/core.py:454-458/488-492/603-614`、`safety.py:47-48/56/99/101`、`tool_capabilities.py:38-40/116/177`、`_outcome_tool_errors.py:236-240`、`outcomes.py:528-531`、`project_facts.py:141-143`。**后果**：提示词会持续指示 agent 调用已不存在的工具。这些随 §9.4 的载体同步一并改。
 3. **`memory/registry.md` 的残余读者群**（工具删了但读的人还在）：`context.py:997`（BG 面 `partition="all"` 直读）、`:1186-1190 _build_registry_digest`（`:1440` 调用）、`deep_self_review.py:49`、`headless.py:1143`。删工具后这些读者全部悬空或恒为 `""`。
 
 ### 5.6.1 ⚠️ 与 §5.13 的直接冲突：BG 的身份改写闸门
@@ -296,6 +301,13 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 **量级**：整删仅 `tools/memory_tools.py`(114) 与 `semantic_dedup.py` 之外的部分；其余是**部分删 + 迁移**，合计约 3,266 行的"不再由本仓承载"规模不变，但**迁移工作量远大于原估**。
 
 `ouroboros/retention.py`（110 行）**保留**——GC 保留天数，与认知记忆无关。
+
+**跨面迁移目标（§2 的「不动交互层」不覆盖它们）**：
+
+| 文件 | 迁出什么 | 消费者 |
+|---|---|---|
+| `ouroboros/project_dialogue.py` | `project_recent_dialogue`(`:140-160`) 依赖 `memory.read_unconsolidated_chat` + `memory.load_dialogue_meta` | `context.py:1089`（prompt 路径） |
+| 同上 | `resolve_owner_message_source`(`:210-222`) 依赖 `consolidator._ordered_chat_generation_paths` | `agent_startup_checks.py:213`（**任务准入闸门**，`agent.py:775/1117` 无 try/except） |
 
 **`memory/` 目录不可删**：`owner_mailbox.py:13` 的 `_MAILBOX_DIR = "memory/owner_mailbox"` 与三个受保护文件都住在这里。§5.14 的迁移表**遗漏了以下文件**，需一并处置：`memory/deep_review.md`（写 `agent.py:1191-1193`、读 `context.py:1418-1421`）、`memory/dialogue_summary.md`（遗留，读 `context.py:992-994`）、`memory/knowledge/knowledge_journal.jsonl`（写 `tools/knowledge.py:316-330`，无生产读者）、`memory/knowledge/patterns_history.jsonl`（写 `reflection.py:727-733`）。
 
@@ -436,7 +448,7 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 
 ### 6.6 连带项之二：`BIBLE.md` P1/P8 的预算漂移告警
 
-`supervisor/state.py:268-362/471/487/634` 是整套预算权威，`:550-630` 是**预算漂移告警机**，而 `BIBLE.md` 的 P1/P8 明文引用了这条告警链。删除它属于 §3.3 的「能力变更」类，需要在 §9.2 的载体同步里一并处理 `BIBLE.md`（`BIBLE.md:343-347` 另有把 reviewer 覆盖上限归因于「upstream Claudexor capability」的表述，随工作面 C 失效）。
+`supervisor/state.py:268-362/471/487/634` 是整套预算权威，`:550-630` 是**预算漂移告警机**，而 `BIBLE.md` 的 P1/P8 明文引用了这条告警链。删除它属于 §3.3 的「能力变更」类，需要在 §9.4 的载体同步里一并处理 `BIBLE.md`（`BIBLE.md:343-347` 另有把 reviewer 覆盖上限归因于「upstream Claudexor capability」的表述，随工作面 C 失效）。
 
 **其余连带面**（本规格点名，实施计划逐处核）：owner 唯一的预算设置入口 `settings_setup_contract._BUDGET_FIELDS`（`:124-162` → `settings.js` / `onboarding_wizard.js`）；web 侧除 `costs.js` 外还有 7 个模块读成本字段，含 `chat.js:204-209/643-648` 的 header 预算药丸与 `chat_activity.js:252-345` 的 `headerBudgetPresentation`/`taskCostMeta`/`taskCostProjection`；`devtools/benchmarks/swe_bench_pro/e1v2/run_pro.py:1016-1018` 的 campaign **以 `spent>=budget` 为唯一停止条件**。
 
@@ -617,7 +629,7 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 
 **棘轮账**：`size_ratchet_manifest.py:24/67` 点名 `tests/test_claudexor_owned_daemon.py` 与 `ouroboros/claudexor_runtime.py`，删文件必须**同 commit** 改账（§10 已有该纪律，此处补具体条目）。
 
-**载体（§9.2 表遗漏）**：`docs/DELEGATED_ADMISSION.md:1-13` 自述「change it in the same commit as the code」，并具名 4 个 owner（`config.py` 两个 floor、`subagents.route_health`、`gateways.claudexor.attempt_containment`、`tools/delegate.py`）——**全部在本面被删改**；`BIBLE.md:343-347` 把 retrieving reviewer 覆盖上限归因于「upstream Claudexor capability」，随本面失效。
+**载体（§9.4 表遗漏）**：`docs/DELEGATED_ADMISSION.md:1-13` 自述「change it in the same commit as the code」，并具名 4 个 owner（`config.py` 两个 floor、`subagents.route_health`、`gateways.claudexor.attempt_containment`、`tools/delegate.py`）——**全部在本面被删改**；`BIBLE.md:343-347` 把 retrieving reviewer 覆盖上限归因于「upstream Claudexor capability」，随本面失效。
 
 ## 8. 工作面 D — 循环
 
@@ -633,11 +645,48 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 
 ### 9.1 顺序
 
+**0. 先做 §9.2**——切 import 图。**这不是可选项**：不切就删，`server.py` 起不来（见 §9.2 的证据链）。这一步不删任何文件，可独立验证。
+
+然后：
+
 1. **B 删计费投影**（托管台账先迁出 `usage_accounting` → `physical_attempt.py`，再删计费，再按 §6.3 换 evolution 刹车）——耦合最低。
 2. **C 按路由裁 harness**——对 `AGENT_SESSION` 路由换后端；API_CHAT 与 native 分支不动。
-3. **A 接 Engram + 记忆改造**——最大；含 §5.7 二进制供给、§5.8 memory protocol、§5.14 迁移。
+3. **A 接 Engram + 记忆改造**——最大；含 §5.7 二进制供给、§9.3 打包面、§5.8 memory protocol、§5.14 迁移。
 
-### 9.2 文档 / 提示词 / 版本载体必须同 commit 更新
+### 9.2 先切 import 图，再删模块（实施顺序的硬前置）
+
+第二轮审计推翻了两份规格的一个默认假设：**删掉被删模块不是「路由 404」，而是 server 进程 import 崩溃（全站起不来）**。
+
+证据链：
+
+| 环节 | 位置 | 后果 |
+|---|---|---|
+| `server.py` **顶层** import 计费符号 | `server.py:35` 的 `usage_accounting.ensure_legacy_imported` | 进程启动即失败 |
+| `server.py` **模块级**调用 `collect_routes()` | `server.py:2730-2740` | 那一刻 `router.py` 里所有**函数内** import 全部执行 |
+| 扩展面被硬绑在计费链上 | `gateway/extensions.py:45-48` → `skill_review_usage.py:10-12` → `_usage_rows`/`_usage_rows_memo`/`usage_ledger` | **技能/扩展 HTTP 面**随计费删除一起崩 |
+| supervisor 内部链 | `supervisor/events.py:33` 顶层 import `cost_projection` | supervisor 线程启动即失败 |
+| Web 模块图 | `settings.js:21` → `claudexor_status_store.js`，后者被 **7 个模块** import | 整删该文件 → **整站白屏**，不是空页 |
+| 自更新的静默回滚 | `update_merge.py:1085-1088` 的 post-apply smoke 子进程 import 清单 | 路由崩溃 → 自更新「应用成功但 smoke 失败」→ **静默回滚** |
+
+**因此实施顺序必须多一道前置工序**：
+
+1. **先切 import 图**：把所有「保留下来的模块」对「将删模块」的 import 改成显式处理（迁出符号、或换成保留实现的调用）。这一步**不删任何文件**，可独立验证（server 能起、`collect_routes()` 成功、`web` 模块图不断）。
+2. **再按 §9.1 的顺序删**。
+
+**这一道催生两条具体纪律**：
+
+- **禁用「`except Exception: pass` 包住 import」的既有写法**（`server_control.py:161-165` 就是这种，删模块后 panic 静默失去进程组 kill）。所有被删模块的 import 点必须显式处理。
+- **`endpoint_index.py` 是契约表**：`tests/test_gateway_parity.py` 断言它与 `collect_routes()` 逐条相等。删除 11 条路由（cost-breakdown 1 + claudexor 10）必须**同 commit** 改这张表，否则 parity 测试红。
+
+### 9.3 Engram 二进制在整个打包面缺失
+
+`§5.7` 只写了「pin + 校验 + 落在 `DATA_DIR` 内」，但审计实测：**`engram` 字样在整个仓库的打包 / 构建 / CI 面零出现**——只存在于这两份规格文档里。
+
+一个外部二进制要进 DMG / ZIP / deb / rpm / AppImage，涉及**至少 10 处**：`scripts/fetch_claudexor_runtime.py`（被删，需等价物）、`scripts/release_proof.py:55-60`（`COMMON_SMOKE_CHECKS` 必需集）、`build.sh` / `build_linux.sh` / `build_windows.ps1`（各自有 fetch 步骤，且被 `tests/test_build_scripts.py` 按顺序钉死）、`Ouroboros.spec`（PyInstaller）、`packaging/{cli,systemd,appimage}`、`Dockerfile*`、`tools/release_sync.py` 的 `RELEASE_ASSET_TEMPLATES`（新增发布资产种类必须登记）。
+
+**既有先例可参照**：`betterleaks_runtime.py` 是第二个外部二进制的完整供给样板（bundled + managed 双解析 + build-output 安装形态），`platform_layer.py` 是 bundled payload 的解析阶梯（node / ripgrep / python candidates）——**但没有 engram 解析器**。§5.7 必须把这份清单写全，否则「本仓供给 Engram」在打包面上落不了地。
+
+### 9.4 文档 / 提示词 / 版本载体必须同 commit 更新
 
 这不是风格要求，是 P6 + P7 的硬约束：
 
@@ -685,7 +734,7 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 | **删错层：把 BG 永久刹死** | `consciousness.py:675-691 _check_budget` 是 BG 唯一自动停止，读 `usage_projection`；删除后其 `except` 分支 fail-closed → BG 永久 `budget_blocked`，而 §5.13 声明不动它 | §6.5：删除计费时必须同时处理 `_check_budget`（改非货币轮次上限，或显式摘除并记账） |
 | **删错层：`pricing.py` 里有安全闸门** | `infer_api_key_type` 是 `safety.py:600-623` 后端可达性闸门的输入，`:603-606` 且**静默 fail-open**；平铺删除 → 闸门永久放行 | §6.4：`pricing.py` 按符号切，`infer_*` 迁出保留 |
 | **悬空引用：panic 路径静默吞 ImportError** | `server_control.py:161-165` 的 `from ouroboros.claudexor_daemon import get_owned_daemon` 在 `except Exception: pass` 内 → 删模块后 panic **不再杀掉委托 run 的进程组** | §7.2：所有被删模块的 import 点必须改为显式处理，**尤其吞异常的路径** |
-| **违宪：身体的地图与被删子系统不符** | P7 `BIBLE.md:604-607`「all references update in the same commit」；P6 `:517`「Operational Map of the Body」；`docs/ARCHITECTURE.md` 含 **89 处 `claudexor`**、7 处 `usage_accounting`、整节 Usage-ledger 与 Delegated-subagents，而规格此前零提及 | §9.2：三个工作面各自**同 commit** 更新 `docs/ARCHITECTURE.md` / `DEVELOPMENT.md` / `CHECKLISTS.md` / `DESIGN.md` / `prompts/SYSTEM.md` / `CONSCIOUSNESS.md` / `SAFETY.md` |
+| **违宪：身体的地图与被删子系统不符** | P7 `BIBLE.md:604-607`「all references update in the same commit」；P6 `:517`「Operational Map of the Body」；`docs/ARCHITECTURE.md` 含 **89 处 `claudexor`**、7 处 `usage_accounting`、整节 Usage-ledger 与 Delegated-subagents，而规格此前零提及 | §9.4：三个工作面各自**同 commit** 更新 `docs/ARCHITECTURE.md` / `DEVELOPMENT.md` / `CHECKLISTS.md` / `DESIGN.md` / `prompts/SYSTEM.md` / `CONSCIOUSNESS.md` / `SAFETY.md` |
 | 版本载体 desync | `context_health.py:253-256` 读 `ARCHITECTURE.md` 版本并比对（`desync_parts`）；`agent_startup_checks.py:403-411` 启动检查 | 版本载体随文档同 commit 移动（`tools/release_sync.py`） |
 | `size_ratchet` CI lane 阻塞 | `GIANT_PATHS` 含 `loop.py` `llm.py` `server.py` `supervisor/workers.py` `tools/control.py`，48 条精确记账 | 删除是棘轮允许方向；`BYTE_DEBT` 与文件同 commit 移动；用 `scripts/regenerate_size_ratchet.py` 重新生成 |
 | 测试直接 import 私有符号 | `_drain_incoming_messages`（`test_available_subagents_core_followup.py:312`）、`_check_budget_limits`（`test_budget_limits.py:10`）、`maybe_inject_finalization_nudges`（`test_delegation_phase_b.py:301`）、`seal_task_transcript`（`test_anthropic_empty_block_fix.py:13`） | 下划线前缀在本仓是名义上的；删除前 `lsp references` 核对 |
@@ -721,7 +770,7 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 - 冒烟任务：提交 → 多轮 tool-use → 收尾，行为与重构前一致。
 - `size_ratchet` lane 通过。
 
-**跨面：文档 / 提示词 / 版本载体（§9.2）**
+**跨面：文档 / 提示词 / 版本载体（§9.4）**
 - 逐载体核对计数归零或只剩保留项（如 `grep -c claudexor docs/ARCHITECTURE.md`、`usage_accounting` 7 处、`cost-breakdown` 2 处）；`docs/ARCHITECTURE.md` 的版本载体与 `VERSION` 一致（`context_health.py:253-256` 的 `desync_parts` 为空、`agent_startup_checks.py:403-411` 无告警）。
 - 被删工具名在 `prompts/*.md`、`safety.py`、`tool_capabilities.py`、`tool_access.py`、`tools/core.py` 中无残留（§5.6 第 2 类）。
 - **内容钉定型测试全绿**——它们**不会因 import 失败而暴露**，必须人工对齐：`tests/test_docs_sync.py:57-60`、`tests/test_context_budget_ssot.py:79-81`、`tests/test_scratchpad_consolidation.py:64-88`、`tests/test_gateway_parity.py:14-20/225-298`、`tests/test_public_site_metadata.py:145-157`。
@@ -730,16 +779,25 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 
 ### 12.1 代码减重 — 能力不变，P7 背书，常规工作
 
+**第二轮审计逐行复核了本表，结论：8 行里只有 2 行确认是纯代码减重**（托管台账迁出、不采用 pi），1 行部分成立（循环合回，但会打断测试契约），**5 行被改判**。改判明细见 §15.1；下表已按结论重排。
+
+**确认是代码减重**：
+
 | 项 | 内容 | 后果 |
 |---|---|---|
-| 情景/语义记忆外置 Engram | 只外置情景压缩、语义知识、反思正文、prompt 历史 | account 级知识用 `scope: personal`/`global` 跨 project 可见，project 级随 canonical project 解析（§5.5） |
-| 上下文注入换源 | `build_memory_sections` / `build_knowledge_sections` / `build_recent_sections` 改读 Engram | 3 段 cache_control 结构与 `core_sha256` 契约不变 |
-| 计费投影删除 | 删 `pricing`/`cost_projection`/`_usage_*`/`costs.js`/cost-breakdown 路由 | 终止出口 8 类 → 7 类 |
-| 托管台账迁出而非删除 | `usage_accounting` → `physical_attempt.py` | 模块改名 + 迁移成本；保住「不重复发送」能力 |
-| evolution 刹车换实现 | `EVOLUTION_BUDGET_RESERVE`（美元）→ campaign cycle 上限 | 保住「自迭代有自动停止条件」；失败暂停/模式门/idle 节流本就非货币，不受影响 |
-| Claudexor 按路由裁 | 只裁 `AGENT_SESSION` 路由后端 | 后端改为 `omp --mode rpc` 常驻会话（§7.4）；API_CHAT 与 native 分支不动 |
-| 循环内合回行数规避物 | `_account_compaction_usage`、`_force_plan_*`、`_project_room_fact` | `loop.py` 字节棘轮只能缩，这是机会 |
+| 托管台账迁出而非删除 | `usage_accounting` → `physical_attempt.py` | 模块改名 + 迁移成本；保住「不重复发送」能力。纯改名，`contracts/` 不含该模块 |
 | 不采用 pi | 循环留 Python | 形态不变；12 项治理不需跨语言重建 |
+
+**已改判为「能力变更」或「成本/测试面」**（审计结论，详见 §15.1）：
+
+| 项 | 原写 | 改判 | 去向 |
+|---|---|---|---|
+| 情景/语义记忆外置 Engram | 能力不变，只换实现 | **能力变更**：三个自动写触发器（`should_consolidate` / `should_consolidate_scratchpad`）移除后，粒度从**确定性触发**变成 agent 自觉；对话块/era 摘要层失去唯一生产者（§15.1-1a/1b） | §12.2 + §15.1 |
+| evolution 刹车换实现 | 保住自动停止条件 | **能力变更**：§13 自陈「N 是语义变化，需 Owner 定」——那条自陈本身就是能力变更的标志 | §12.2 |
+| Claudexor 按路由裁 | 只裁 `AGENT_SESSION` 路由后端 | **能力变更**：含 owner 可见的账号/配额/登录端点（`endpoint_index.py:72-81` 的 10 条）与首装编译链 | §12.2 + §7.5 |
+| 上下文注入换源 | 「3 段结构不变」 | **成本面变更**：`context.py:1414-1416` 把 memory/knowledge 放进 **semi_stable**，而该段带 `cache_control: ephemeral`（`context_fit.py:249-258`）——换内容源即换**可缓存前缀** | §15.1 |
+| 计费投影删除 | 「终止出口 8 类 → 7 类」 | **测试契约 + 账本一致性面**：`test_context.py` 把 health 输出的 `monetary lock` 字面量钉死；账本一致性断言未列 | §15.1 |
+| 循环内合回行数规避物 | 「纯行数/字节规避」 | **打断测试**：`test_loop_compaction.py:217`、`test_delivery_forced_finalization.py:608/648` monkeypatch 这些符号 | §11 测试面 |
 
 ### 12.2 触碰 P0/P1/P3 的四项 — 前三项「不动」，第四项需 Owner 定
 
@@ -770,6 +828,14 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 - **§6.5 的替代形态**：BG 的 `_check_budget` 改为非货币轮次上限，还是显式摘除并记账。
 - **§6.10 的替代形态**：owner 可见的钱面是否保留一个非货币的「消耗自知」面（P8 要求 awareness 属 agency，但未规定必须是美元）。
 - **§14.3-5**：C 面的首装 onboarding 编译链按 §3.3 属能力变更，需重新归类（§12.1 原标为「能力不变」）。
+
+**第二轮审计新增（§15）**：
+
+- **`docs/CHECKLISTS.md:179` item 21 是一套可执行程序**（含 guard-change 触发条件与 owner-acceptance 定义），本规格只满足其判据方向、不满足 guard 分支与接受流程。需在实施计划里补这道程序。
+- **一个「名字像钱、实为 deadline 百分比」的配置键**存在误删风险（§15.4）——需在实施第一步逐个键判定。
+- **`memory/dialogue_blocks.json` 的粒度层由谁生产**（§15.1-1b）：§5.8 的替代协议只约束 agent 主动 `mem_save`，没有规定谁继续产出压缩粒度。这是 §5.8 的一个缺口，需与 §5.11 的 `[MEMORY GAP]` 接收端一起定。
+- **`semi_stable` 缓存前缀的成本面**（§15.1）：换内容源即换可缓存前缀，需在 §11 加一条跨任务 cache 命中率的验证。
+- **数据平面 5 类 `state/` 文件的生产者可随删除消失**（§15.4），需逐个判定是「随之作废」还是「需替代生产者」。
 
 **仍未决**：
 
@@ -844,4 +910,55 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 
 ### 14.5 低危 16 项
 
-A：scratchpad 三个预算常量悬空（`context_budget.py:208/210/212`）；`config.py:227-228` 注释承诺的「low = 更深记忆整合」无实现；**第三类记忆文件无归属**（`deep_review.md`、`dialogue_summary.md`、`knowledge_journal.jsonl`、`patterns_history.jsonl`）；`memory/` 仍是协议存储的家（`owner_mailbox.py:13`）；`utils.py:152-156` 的注释语义失真。B：`physical_attempt_limit`/`_claim_physical_dispatch` 未进名单；`usage_from_response`（已列）；`record_unmetered_external_dispatch`（已列）；`ARCHITECTURE.md:105-112/1271-1273/2729-2740/2871-2875/2956-2957` 与 `DEVELOPMENT.md:1974-1994` 的 money 不变量章节。C：12 处注释/文档字符串残留；fixture 实际 **4** 个（原稿写 2）；`README.md:75/197` + `site/*` 的公开承诺**被测试钉死**（`test_public_site_metadata.py:145-157` 逐面断言 `claudexor.ai` 存在）——§9.2 载体表不含 README/站点；`CHECKLISTS_ARCHIVE.md:17`；`BIBLE.md:343-347`。
+A：scratchpad 三个预算常量悬空（`context_budget.py:208/210/212`）；`config.py:227-228` 注释承诺的「low = 更深记忆整合」无实现；**第三类记忆文件无归属**（`deep_review.md`、`dialogue_summary.md`、`knowledge_journal.jsonl`、`patterns_history.jsonl`）；`memory/` 仍是协议存储的家（`owner_mailbox.py:13`）；`utils.py:152-156` 的注释语义失真。B：`physical_attempt_limit`/`_claim_physical_dispatch` 未进名单；`usage_from_response`（已列）；`record_unmetered_external_dispatch`（已列）；`ARCHITECTURE.md:105-112/1271-1273/2729-2740/2871-2875/2956-2957` 与 `DEVELOPMENT.md:1974-1994` 的 money 不变量章节。C：12 处注释/文档字符串残留；fixture 实际 **4** 个（原稿写 2）；`README.md:75/197` + `site/*` 的公开承诺**被测试钉死**（`test_public_site_metadata.py:145-157` 逐面断言 `claudexor.ai` 存在）——§9.4 载体表不含 README/站点；`CHECKLISTS_ARCHIVE.md:17`；`BIBLE.md:343-347`。
+
+## 15. 第二轮审计（非功能面：打包 / 死面 / 错标，只读）
+
+**方法**：第一轮三份审计按「面」切（记忆 / 计费 / harness），结构上碰不到非功能面。第二轮按**类别**切，各带 file:line。
+
+合计 **约 60 项**：`AuditPackaging` 21（2 高 / 12 中 / 7 低）、`AuditDeadSurfaces` ~20、`AuditMislabeled` ~19。
+
+### 15.1 §12.1 的逐行改判
+
+| 原行 | 原写 | 改判 | 证据 |
+|---|---|---|---|
+| 情景/语义记忆外置 | 能力不变 | **能力变更** | ① 三个自动写触发器移除（`consolidator.py:99/680` 的 `should_consolidate`/`should_consolidate_scratchpad` → `agent_task_pipeline.py:1246-1252/1290-1294`）→ 压缩粒度从**确定性触发**变 agent 自觉，而 P1（`BIBLE.md:113-114`）要求粒度机制存在；② **对话块/era 摘要层失去唯一生产者**（`dialogue_blocks.json` 现场 33.4KB / 2h 前仍在写，§5.12 删模块、§5.14 只做一次性导入、§5.8 的替代协议只约束 agent 主动 `mem_save`） |
+| evolution 刹车换实现 | 保住自动停止 | **能力变更** | §13 自陈「N 是语义变化，需 Owner 定」——该自陈本身即标志 |
+| Claudexor 按路由裁 | 只裁一个路由后端 | **能力变更** | owner 可见的账号/配额/登录端点（`endpoint_index.py:72-81` 的 10 条）+ 首装编译链（`gateway/onboarding.py:441-446`） |
+| 上下文注入换源 | 「3 段结构不变」 | **成本面变更** | `context.py:1414-1416` 把 memory/knowledge 写进 **semi_stable**，而该段带 `cache_control: ephemeral`（`context_fit.py:249-258`）→ 换内容源 = 换**可缓存前缀**，跨任务 cache 成本随动 |
+| 计费投影删除 | 只影响终止出口 | **测试契约 + 账本面** | `test_context.py` 把 health 输出的 `monetary lock` 字面量钉死 |
+| 循环内合回 | 纯行数规避 | **打断测试** | `test_loop_compaction.py:217`、`test_delivery_forced_finalization.py:608/648` monkeypatch 这些符号 |
+
+### 15.2 结构性发现：删模块 = import 崩溃（已落地为 §9.2）
+
+见 §9.2 的证据链表。**这是本轮最重要的一条**：它把「删文件」变成「先切图再删」，并给出两条纪律（禁用吞异常的 import 写法、`endpoint_index.py` 契约表同 commit）。
+
+### 15.3 死面清单
+
+- **HTTP 路由**：`endpoint_index.py` 的 `HTTP_ENDPOINTS` 共 110 条，需删 **11 条**（cost-breakdown 1 + claudexor 10），**3 处测试逐条钉死**它（`test_gateway_parity.py` 断言与 `collect_routes()` 相等；`test_claudexor_owned_daemon.py:3599-3606` 断言路径存在且必须在 ARCHITECTURE 地图里被点名）。
+- **Web**：`claudexor_status_store.js` 被 **7 个模块** import，`settings.js:21` 把它挂在 `app.js` 的模块图上 → 整删 = **整站白屏**。导航抽屉 6 个 `data-nav-page`；`settings_ui.js` 的 Agents 面板(`:398-413`)与 Advanced→MCP 面板(`:733-762`)；`dashboard.js` 的 `DASHBOARD_TABS`（logs/evolution/costs/updates/activity）；`costs.js` 三处预算输入域。
+- **CLI**：`cli.py` 的 `--memory-mode` 与 `_await_cost_finality`；`packaged_cli.py` 的 `--start` 参数扫描表含 `--memory-mode`；`entry_points.txt` 的 `ouroboros-web` 指向会 ImportError 的 `server:main`。
+- **MCP**：**§5.2 的两条候选在死面层不等价**——选 MCP 会让 Engram 变成用户可禁用/可删的 MCP 卡片（正是 §5.2 自己要防的事）。这独立于 §5.2 已有的理由，构成钉死 stdio 的**第三条**论据。
+- **supervisor**：`update_*` 五件套与 Claudexor **无关**（是 git 自更新），唯一耦合点是 `update_merge.py:1085-1088` 的 post-apply smoke import 清单——路由崩 → 自更新「应用成功但 smoke 失败」→ **静默回滚**。
+- `skills/telegram/lib/telegram_state.py`：subagent 终局 `cost_usd` 累积与 budget 指标模板（§6.10 的 skills 面又一处）。
+
+### 15.4 打包 / 依赖 / 配置 / 数据面
+
+- **依赖面是干净的**：25 项直接依赖逐个核对，**0 项**在删除后失去消费者（`httpx` 有 7 个保留消费者，非 claudexor 专用）；`Ouroboros.spec` 用整目录 `datas` 且 hiddenimports 不点名被删模块 → **删除本身不需要改打包**。
+- **但新增依赖完全没落地** → §9.3。
+- **新悬空的配置键**：`OUROBOROS_PRICING_TTL_SEC`、`OUROBOROS_RUB_USD_RATE`、`OUROBOROS_SUBAGENT_PROFILE`、`OUROBOROS_CLAUDEXOR_BIN`，另有 2 个安装期键的**生产者**将死。⚠️ **另有 1 个键名字像钱、实为 deadline 百分比——误删风险**。
+- **A 面（记忆六模块）读 0 个配置键**——记忆外置不产生配置键悬空。
+- **配置键受测试强制登记**：`test_packaged_runtime_and_lifecycle.py` 断言全键覆盖 → 删键必须同 commit 改它。
+- **数据平面**：5 类 `state/` 文件的生产者随删除消失（含 `evolution_checkpoints.jsonl` 的 cost 列、`usage_attempts.jsonl` 的 monetary 文案面，后者有一条字面量钉死测试）。
+- **版本载体族** 8 处与删除集合**无交集**、不触发 desync；但**新增发布资产种类**（Engram 二进制）必须登记进 `tools/release_sync.py` 的 `RELEASE_ASSET_TEMPLATES`。
+
+### 15.5 角色规格的自证结果（已落地）
+
+| 原断言 | 实测 | 处置 |
+|---|---|---|
+| 「需要更少工具的面拿到**更小的注册表**」 | **假**——`ToolRegistry.__init__` 走 `_load_modules()` 加载全部 36 个冻结模块（`tools/registry.py:1564-1581`），BG 拿到的是**全量注册表实例**；天花板靠 schema 过滤 + **执行期强制**两层 | 角色规格 §4 不变量 1 已改写（机制错，意图对） |
+| 「单次工具执行共用 `_execute_with_timeout`」 | **假**——BG 有并行实现（`consciousness.py:1293-1330`） | §1.1 表与共享基底表已改（这是「应当共用但目前没有」） |
+| 「per-surface 策略散落在至少 8 处」 | **≥19 处**（含 `queue.py:183-188` 调度序、`:1218/1353/1384/1392/1429-1434` 专属分支） | §1.2 已改 |
+| 面取值表（7 个） | **6 个真实生产者**（`task`/`consciousness`/**`presence`**/`evolution`/`deep_self_review`/**`skill_publish`**），`review`/`summarize` **无生产者**，`scope_review` **不在本轴上**；且 API 接受任意字符串 | §1.2 已按实测生产者重写 |
+
+**`docs/CHECKLISTS.md:179` 的 item 21 是一套可执行程序**（含 guard-change 触发条件与 owner-acceptance 定义）——本规格目前只满足其**判据方向**，**不满足 guard 分支与接受流程**。这是第三轮之前需要补的一道程序要求。
