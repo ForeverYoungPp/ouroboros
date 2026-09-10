@@ -243,6 +243,8 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 | `ouroboros/tools/memory_tools.py` | 114 | 死机制 |
 | `ouroboros/tools/knowledge.py` | 420 | 替换为 Engram 工具（`patterns.md`/`improvement-backlog.md` 的读写路径除外） |
 
+**量级**：上表合计 3,266 行，其中 `reflection.py`(742) 是**部分删除**——保留 `should_generate_reflection`、结构化候选提取（§5.9）与 `_update_patterns`（`patterns.md` 的唯一自动写者，§5.12 上表行），只删反思正文的本地渲染路径（正文改由 Engram 承载）。**`consciousness.py`(1,386) 不在其中**——它是第二个 agent 角色，本规格不动（§5.13）。早期草案里「记忆净删 ~4.6k 行」的说法因此作废：那时的数包含意识，且把 reflection 当成整删。
+
 `ouroboros/retention.py`（110 行）**保留**——GC 保留天数，与认知记忆无关。
 
 ### 5.13 `consciousness` 是第二个 agent 角色——本规格不动它
