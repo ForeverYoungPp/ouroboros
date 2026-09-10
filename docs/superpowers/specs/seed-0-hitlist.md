@@ -99,7 +99,7 @@
 | `supervisor/task_reaper.py` | 878 | **`explicitly-unavailable`** | `carry_cost_meta` 在收割路径 |
 | `gateway/tasks.py` | 868 | `severing` | `honest_accounted_amount` + `usage_breakdown`（在本阶段不摘端点的前提下改为不可用标记） |
 
-## 五、`severing` / `explicitly-unavailable`：`claudexor*` 的引用方
+## 五、`explicitly-unavailable` / `relocating`：`claudexor*` 的引用方
 
 `claudexor_daemon` / `claudexor_runtime` / `gateways.claudexor` / `gateway.claudexor_accounts` /
 `gateway.claudexor_quota` 全部删除。引用方按「该路径是否仍需要一次显式拒绝」分两类。
@@ -123,12 +123,20 @@
 | `delegate_recovery.py` | 291, 746 | `ensure_owned_gateway` |
 | `delegate_containment.py` | 132, 184 | `attempt_containment` / `operator_home` |
 
-**`severing`（HTTP 面整体摘除，随端点一起走）**：
+**⚠️ 本阶段不得摘除端点——先前把 `router.py` 判为 `severing` 是错的**
 
-| 文件 | 行 | 依据 |
-|---|---|---|
-| `gateway/router.py` | 65, 73 | `collect_routes()` 里注册的 claudexor 端点（**11 条路由**：cost-breakdown 1 + claudexor 10） |
-| `gateway/onboarding.py` | 444 | `_status_payload` 只服务于 onboarding 面板的 claudexor 视图 |
+Seed 自身的绑定约束写明：「摘除端点不在本阶段：AC-0.4/AC-0.9 要求 `collect_routes()` 条目数不变」。
+而 `collect_routes()` 的签名是 `-> list[BaseRoute]`（`router.py:17-21`），`router.py:65,73` 正是把
+claudexor 的 handler 登记进那个列表的地方。**删掉它们必然改变 `len(collect_routes())` → AC-0.9
+（「两次调用输出同一整数」）确定性失败，并连带打掉 AC-0.4 的 parity 断言。** 故本阶段：
+
+| 文件 | 行 | 处置（修正后） | 依据 |
+|---|---|---|---|
+| `gateway/router.py` | 65, 73 | **`relocating` + `explicitly-unavailable`** | 路由条目**原样保留**；被 import 的 handler 符号必须迁到**保留模块**（或新建的显式不可用 shim），使其仍可被 `collect_routes()` 登记并返回 503 不可用。**不得**从 `collect_routes()` 里删条目 |
+| `gateway/onboarding.py` | 444 | **`relocating` + `explicitly-unavailable`** | 同上：`_status_payload` 须由保留模块提供不可用形态的等价实现，而非删掉 onboarding 的该分支 |
+
+> 口径一致性说明：第四节对 `gateway/tasks.py:868` 已写明「在本阶段不摘端点的前提下改为不可用标记」，
+> 与本节的修正后口径一致。此前第五节的两行 `severing` 与 seed 约束冲突，已按磁盘取证后改正。
 
 ## 六、`relocating` / `severing`：`memory` 的引用方
 
@@ -147,7 +155,7 @@
 
 ## 覆盖性自查（AC-0.11 的判定条件）
 
-- **49 个文件全部落格**：一(5) + 二(11) + 三(11 行 + 1 备注) + 四(15) + 五(16 行 explicit + 2 行 severing) + 六(7)。
+- **49 个文件全部落格**：一(5) + 二(11) + 三(11 行 + 1 备注) + 四(15) + 五(16 行 explicit + 2 行 relocating+explicitly-unavailable) + 六(7)。
 - **无未覆盖条目**：每一个命中行都在上面某张表里出现。
 - **两类盲区均被点名**：
   - (a) 函数内局部 import → 第五节 `server_control.py:162`（panic 分支，被 `except: pass` 吞掉）。
@@ -180,7 +188,7 @@ AC-0.11 的扫描口径只覆盖 `ouroboros/ supervisor/ server.py`。另有两�
 
 ### 2. `ouroboros/gateway/endpoint_index.py` —— 契约表（非 import）
 
-实测 **124 行**，其中待摘路由**恰好 11 条**：
+实测 **124 行**，其中与本次改动相关的路由**恰好 11 条**：
 
 | 行 | 条目 |
 |---|---|
@@ -196,9 +204,17 @@ AC-0.11 的扫描口径只覆盖 `ouroboros/ supervisor/ server.py`。另有两�
 | 80 | `DELETE /api/claudexor/credential-profiles/{harness}/{profile_id}` |
 | 81 | `PATCH /api/claudexor/credential-profiles/{harness}/{profile_id}` |
 
-`tests/test_gateway_parity.py` 断言该表等于 `collect_routes()`，因此第五节 `router.py:65,73`
-的摘除**必须同 commit 改这里**，否则 parity 测试红。这**不受任何 import 探针覆盖**。
+`tests/test_gateway_parity.py` 断言该表等于 `collect_routes()`。**本阶段该文件必须原样不动**——
+因为本阶段不摘任何端点（见第五节修正后的口径），条目数不变，parity 自然保持绿。
 
-**结论**：本阶段有三个**探针探不到的失效点**——`server_control.py:162`（AC-0.5 靶点）、
-`endpoint_index.py` 的 11 条路由、`update_merge.py` smoke 清单里多出的三个入口。
-AC-0.11 的价值即在此。
+**修正一处此前的错误要求**：本文件早先的版本要求「同 commit 从 `endpoint_index.py` 移除这 11 条」，
+那与 seed 的绑定约束（AC-0.4/AC-0.9 要求 `collect_routes()` 条目数不变）**直接冲突**，已在磁盘取证后撤销。
+端点摘除属于**后续阶段**，届时 `router.py` 与 `endpoint_index.py` 才需要同 commit 一起改。
+
+**本阶段该文件的真实风险**：它不是 import，探针照不到；但因本阶段只改 handler 的实现（改为显式不可用）
+而保留路由条目，parity 断言恰好充当了「你没有误删路由」的哨兵——**它是本阶段的保护网，不是待改项**。
+
+**结论**：本阶段有两个**探针探不到的失效点**——`server_control.py:162`（AC-0.5 靶点，函数内局部
+import，被 `except: pass` 吞掉）与 `update_merge.py` smoke 清单里多出的三个入口（`gateway.router`、
+`supervisor.queue`、`tools.registry`）。`endpoint_index.py` **不是**失效点：本阶段不摘端点，它反而
+是「没有误删路由」的哨兵。AC-0.11 的价值即在前两者。

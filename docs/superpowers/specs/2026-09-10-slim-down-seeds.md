@@ -343,8 +343,22 @@ ModuleNotFoundError: No module named 'ouroboros.mcp'
 
 | 修法 | 做法 | 副作用 |
 |---|---|---|
-| A. 给 ooo 条目加 `PYTHONSAFEPATH=1` | `~/.omp/agent/mcp.json` 的 `ooo` 条目加 `"env": {"PYTHONSAFEPATH": "1"}`（schema **支持** stdio 的 `env` 与 `cwd` 两个字段）。实测该变量下 worker 可正常解析（`usage: python -m ouroboros.mcp.detached_worker REQUEST.json`） | ⚠️ **会毒化探针**：执行器 spawn 的每个子进程都继承该变量，而 AC-0.1/0.2/0.3 跑的是 `python -c "import server"`——它**依赖 cwd 在 `sys.path` 上**。`PYTHONSAFEPATH=1` 让 cwd 不入路径 → **本 Seed 的三条核心 AC 全部失效** |
+| A. 给 ooo 条目加 `PYTHONSAFEPATH=1` | `~/.omp/agent/mcp.json` 的 `ooo` 条目加 `"env": {"PYTHONSAFEPATH": "1"}`（schema **支持** stdio 的 `env` 与 `cwd` 两个字段）。实测该变量下 worker 可正常解析（`usage: python -m ouroboros.mcp.detached_worker REQUEST.json`） | ⚠️ **影响半径远超三条探针**：执行器 spawn 的每个子进程都继承该变量，凡**依赖 cwd 在 `sys.path` 上**的命令全部失效。逐条清点本 Seed：**11 条里坏 5 条**——AC-0.1/0.2/0.3（`python -c "import server"`）、AC-0.9（`from ouroboros.gateway.router import collect_routes`）、AC-0.10（`import ouroboros.semantic_dedup, ...`）。且因 `runtime_backend: omp`，该变量会传染进 **omp 自身**，影响面比「本 Seed 的 AC」更宽且更难预测 |
 | B. 换 cwd 到仓库之外 | 传一个不含 `ouroboros/` 的 `cwd` | worker 与执行都会在**错误目录**工作（`request.cwd` 同时是执行工作目录），任务目标即仓库本身 |
+
+**第三个候选（外科式 `.pth`）已实测证伪**：思路是在 ooo venv 的 site-packages 放一个 `.pth`，
+**只对 detached worker 那个进程**剔除 cwd，从而不影响它派生的探针（blast radius = 1 个进程）。
+实测否掉，两个独立原因，都是 CPython 启动顺序决定的：
+
+1. `.pth` 执行时 **cwd 尚未进入 `sys.path`**。实测记录：
+   `at_pth path0='.../python312.zip' cwd_in=False` —— `sys.path[0]` 那时还是 stdlib zip，
+   cwd 项是**之后**由 `pymain_run_python` 插入的。故 `.pth` 阶段无物可剔。
+2. `.pth` 执行时 **`sys.argv` 为空**（实测 `argv1=[]`），**连「本进程是不是 worker」都判断不了**，
+   面向 worker 的守卫写法根本无法成立。
+
+> 过程纠错：第一次 spike 得出「SHADOWED → 证伪」是**假阴性**——`.pth` 里只有**以 `import ` 开头的行**
+> 会被执行，其余行被当作路径，我那个 `if` 守卫落在第二行故从未运行。重写为单行后 `.pth` 确实执行，
+> 才拿到上面两条真结论。（教训与 §6.7 同源：否定性结论也要先证明「检测本身有效」。）
 
 **冲突的本质**：两者需要**相反的** `sys.path` 行为——工具要 cwd **不在**路径上（才能解析自己的 `ouroboros`），而探针要 cwd **在**路径上（才能 `import server`）。同一环境变量无法同时满足。
 
