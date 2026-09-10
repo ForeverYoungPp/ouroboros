@@ -35,13 +35,15 @@
 
 ### acceptance_criteria
 
-- **AC-01** `python -c "import server"` 退出码 0；且把 `ouroboros/usage_accounting.py` **临时移走**后**仍**退出码 0。
-- **AC-02** `python -c "import supervisor.events"` 退出码 0；且把 `ouroboros/cost_projection.py` 临时移走后**仍**退出码 0（该模块当前在 `supervisor/events.py:33` 被顶层 import）。
-- **AC-03** `python -c "import ouroboros.gateway.extensions"` 退出码 0；且把 `ouroboros/_usage_rows.py` 临时移走后**仍**退出码 0（当前经 `skill_review_usage.py:10-12` 被硬绑）。
-- **AC-04** `pytest tests/test_gateway_parity.py` 全绿——`endpoint_index.HTTP_ENDPOINTS` 与 `collect_routes()` 逐条相等。
-- **AC-05** 对每个将被删除的模块名，全仓不存在「用 `except Exception: pass`（或 `except Exception` 后仅 log）吞掉其 import」的写法；`server_control.py:161-165` 已改为显式处理，且 panic 仍能终止委托 run 的进程组（由 `tests/test_server_control_panic_daemon.py` 覆盖）。
-- **AC-06** `web` 模块图不断：`web/modules/claudexor_status_store.js` 被 **7 个模块** import（含 `settings.js:21` 挂在 `app.js` 上）。改造后 `web/tests/` 的现有冒烟测试全绿，且不存在「删掉该文件导致整站白屏」的路径。
-- **AC-07** 本阶段 `git diff --stat` **不含任何文件删除**——只有 import 点与适配代码的改动。
+- **AC-0.1** `python -c "import server"` 退出码 0；且把 `ouroboros/usage_accounting.py` **临时移走**后**仍**退出码 0。
+- **AC-0.2** `python -c "import supervisor.events"` 退出码 0；且把 `ouroboros/cost_projection.py` 临时移走后**仍**退出码 0（该模块当前在 `supervisor/events.py:33` 被顶层 import）。
+- **AC-0.3** `python -c "import ouroboros.gateway.extensions"` 退出码 0；且把 `ouroboros/_usage_rows.py` 临时移走后**仍**退出码 0（当前经 `skill_review_usage.py:10-12` 被硬绑）。
+- **AC-0.4** `pytest tests/test_gateway_parity.py` 全绿——`endpoint_index.HTTP_ENDPOINTS` 与 `collect_routes()` 逐条相等。
+- **AC-0.5** 对每个将被删除的模块名，全仓不存在「用 `except Exception: pass`（或 `except Exception` 后仅 log）吞掉其 import」的写法；`server_control.py:161-165` 已改为显式处理，且 panic 仍能终止委托 run 的进程组（由 `tests/test_server_control_panic_daemon.py` 覆盖）。
+- **AC-0.6** `web` 模块图不断：`web/modules/claudexor_status_store.js` 被 **7 个模块** import（含 `settings.js:21` 挂在 `app.js` 上）。改造后 `web/tests/` 的现有冒烟测试全绿，且不存在「删掉该文件导致整站白屏」的路径。
+- **AC-0.7** 本阶段 `git diff --stat` **不含任何文件删除**——只有 import 点与适配代码的改动。
+- **AC-0.8**（由 `ooo auto` 的 round 1 问题逼出，见 §6.2）每个被切断的能力，其触发路径返回**显式不可用**（typed error 或明确的 unavailable 响应），且不产生日志以外的副作用。抽查 `POST /api/cost-breakdown` 与一个 memory 工具调用，断言**不是**「返回空但 HTTP 200」。**禁止静默降级。**
+- **AC-0.9** 切断后 `collect_routes()` 的**条目数不变**——摘除端点属后续 seed 的活（那时连同 `endpoint_index.py` 契约表一起改）。
 
 ### constraints
 
@@ -64,15 +66,15 @@
 
 ### acceptance_criteria（骨架——**待 §5 的第 1 项定稿后补全**）
 
-- **AC-11**（往返）一次会话 `mem_save` 一条知识 → 重启运行时 → 新会话 `mem_search` 取回。
-- **AC-12**（读路径，§5.5）写入一条 `scope: global` 的 observation → 在**任意 project** 的任务里被召回；project 级观察不串味。
-- **AC-13**（会话映射，§5.15）**并发跑两个任务**，两者都写记忆 → **两次写入都成功**（证明显式 `session_id` 生效、未落进 Engram 的 `fails closed when multiple candidates remain`）；任务终点后该 session 在 `sessions/recent` 可见且带 summary。
-- **AC-14**（捕获期，§5.4）同一次任务中 max 与 low 两次投影的 `core_sha256` 一致。
-- **AC-15**（降级，§5.11）停掉 Engram → tier-0 的 Engram 块显示**显式缺口标记**，且 `identity` / `patterns` / `improvement-backlog` **仍然渲染**。
-- **AC-16**（迁移，§5.14）迁移后原文件仍在原位（逐文件断言）；`mem_search` 能命中迁移前 `knowledge/` 的已知 topic。
-- **AC-17**（工作记忆有界，§5.15-a）连续 N 次 scratchpad 更新后，该 topic 的字节数**不单调增长**。
-- **AC-18**（冲突裁决，§5.15-b）构造一次命中候选的 `mem_save` → `judgment_required: true` → agent **确实调用** `mem_judge`；随后 `mem_search` 带出 `supersedes:` / `conflicts:` 注解。
-- **AC-19**（缺口通道，§5.15-c）造一个缺口 → 它出现在 tier-0，且 BG 的 `update_identity` 返回 `IDENTITY_UPDATE_ABSTAINED`。
+- **AC-1.1**（往返）一次会话 `mem_save` 一条知识 → 重启运行时 → 新会话 `mem_search` 取回。
+- **AC-1.2**（读路径，§5.5）写入一条 `scope: global` 的 observation → 在**任意 project** 的任务里被召回；project 级观察不串味。
+- **AC-1.3**（会话映射，§5.15）**并发跑两个任务**，两者都写记忆 → **两次写入都成功**（证明显式 `session_id` 生效、未落进 Engram 的 `fails closed when multiple candidates remain`）；任务终点后该 session 在 `sessions/recent` 可见且带 summary。
+- **AC-1.4**（捕获期，§5.4）同一次任务中 max 与 low 两次投影的 `core_sha256` 一致。
+- **AC-1.5**（降级，§5.11）停掉 Engram → tier-0 的 Engram 块显示**显式缺口标记**，且 `identity` / `patterns` / `improvement-backlog` **仍然渲染**。
+- **AC-1.6**（迁移，§5.14）迁移后原文件仍在原位（逐文件断言）；`mem_search` 能命中迁移前 `knowledge/` 的已知 topic。
+- **AC-1.7**（工作记忆有界，§5.15-a）连续 N 次 scratchpad 更新后，该 topic 的字节数**不单调增长**。
+- **AC-1.8**（冲突裁决，§5.15-b）构造一次命中候选的 `mem_save` → `judgment_required: true` → agent **确实调用** `mem_judge`；随后 `mem_search` 带出 `supersedes:` / `conflicts:` 注解。
+- **AC-1.9**（缺口通道，§5.15-c）造一个缺口 → 它出现在 tier-0，且 BG 的 `update_identity` 返回 `IDENTITY_UPDATE_ABSTAINED`。
 - **AC-1.10**（自迭代链，§5.9）一次触发反思的任务后，`improvement-backlog.md` 出现新候选，且 `maybe_promote` 的输入仍来自 `reflection_entry`。
 - **AC-1.11**（反例，§5.2）把 Engram 条目的 MCP `enabled` 改 false → **不影响** tier-0（独立通道生效）。
 
@@ -131,6 +133,56 @@
 
 ## 6. 给 `ooo auto` 的调用建议
 
-- **Seed 0 现在就能跑**：它阻塞项为零，且是 Seed 1/2/3 的前置。
+### 6.1 实测：`ooo auto` 需要 10 个 section，AC 必须**结构化**传入
+
+用 Seed 0 实跑了一次 `ooo auto`（`skip_run: true`，session `auto_44a0cd52588e`），ledger 显示它要求 10 个 section：
+
+| section | 实测状态 |
+|---|---|
+| `goal` / `constraints` / `non_goals` / `runtime_context` | ✅ 被吸收（来自 goal 正文 + `user_preferences`） |
+| `verification_plan` | ✅ 1 条（它把我写在 goal 正文里的 AC-0.4 归到了这里） |
+| **`acceptance_criteria`** | ❌ **0 条** |
+| **`actors`** | ❌ 0 |
+| **`inputs`** | ❌ 0 |
+| **`outputs`** | ❌ 0 |
+| **`failure_modes`** | ❌ 0 |
+
+**两条必须照做的格式要求**：
+
+1. **AC 不能写在 goal 正文里**——实测它不会结构化吸收。必须作为**列表**传给 `user_preferences.acceptance_criteria`。
+2. **必须显式提供 `actors` / `inputs` / `outputs` / `failure_modes`**——否则会进入自我访谈（`ooo auto` 用 `omp --mode json` 自答），每个问题一次 omp 调用，在 251k 行的 brownfield 仓库上很慢（实测 round 1 的应答超过 4 分钟）。
+
+### 6.2 实测暴露的 Seed 0 缺口：降级契约
+
+`ooo auto` 的 round 1 问题**指出了一个 Seed 0 的真实漏洞**（我没有写）：
+
+> 切断后，那些被删模块原本支撑的运行时能力（usage 计费查询、cost 成本投影、memory 读写、ClaudeX 进程组委托）在模块缺席时该以什么契约呈现——静默降级、显式报「功能不可用」，还是端点与工具入口一并摘除？
+
+**本规格的答案（依据 §9.2 的纪律 1 + AC-0.4）**：
+
+| 面 | Seed 0 的契约 | 依据 |
+|---|---|---|
+| 工具 | **显式「不可用」**，不静默降级 | §9.2 纪律 1「所有被删模块的 import 点必须显式处理」；静默降级等于制造隐性故障 |
+| HTTP 端点 | **保留注册**，处理器短路返回 typed 错误 | AC-0.4 要求 `HTTP_ENDPOINTS` 与 `collect_routes()` 逐条相等——摘端点属后续 seed 的活（那时连同契约表一起改） |
+| 降级痕 | 记一条结构化日志/事件，不吞 | 与「不静默截断」同源 |
+
+**须补进 Seed 0 的 AC**：
+
+- **AC-0.8** 每个被切断的能力，其触发路径返回**显式不可用**（typed error 或明确的 unavailable 响应），且不写日志以外的副作用；抽查 `POST /api/cost-breakdown` 与一个 memory 工具调用，断言不是「返回空但 HTTP 200」。
+- **AC-0.9** 切断后 `collect_routes()` 的条目**数不变**（摘除端点留给后续 seed）。
+
+### 6.3 调用方式（避开 30s MCP 超时）
+
+**实测：`ooo auto` 必然 MCP 超时**——客户端限制 30s，而 ooo 自身 pipeline deadline 默认 7200s。超时后 `ooo auto` **仍在服务端继续执行**（本次实测：会话文件 `~/.ouroboros/data/auto_44a0cd52588e.json` 持续更新），返回的是「outcome unknown」而不是失败。
+
+**因此**：
+
+- **绝不能用同样参数重发**——会造重复 run。收口用 `resume`（带 auto session id）或 `reconcile_run: true`。
+- 会话状态在 `~/.ouroboros/data/`：`auto_<id>.json`（auto 会话）、`interview_<id>.json`（访谈）、`ouroboros.db`。
+- `ouroboros_project_status` 对 `skip_run` 的会话显示 `Runs: 0` 是**正常的**——它统计的是 run，而 `skip_run` 停在 Seed。
+
+### 6.4 范围建议
+
+- **Seed 0 现在就能跑**：阻塞项为零，且是 Seed 1/2/3 的前置。
 - **Seed 1/2/3/4 建议走 `generate_seed` 的无访谈路径**（`session_context`），而非 `ooo auto` 的访谈路径——因为 goal / constraints / decisions 已在这两份规格里定稿，访谈只会在已定事项上打转。等 §5 的阻塞项定稿后再补 AC。
-- **不要**把 E+A+B+C 合成一个 goal：AC 无法穷举，A-grade 门过不去，执行会无界。
+- **不要**把 Seed 0+1+2+3 合成一个 goal：AC 无法穷举，A-grade 门过不去，执行会无界。
