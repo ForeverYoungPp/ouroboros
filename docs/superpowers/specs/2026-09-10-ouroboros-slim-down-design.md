@@ -318,8 +318,40 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 - **删除**：`pricing.py`、`cost_projection.py`、`_usage_response.py`、`_usage_rows.py`、`_usage_rows_memo.py`、`usage_ledger.py` 的计费部分、`web/modules/costs.js`、gateway 的 cost-breakdown 路由（`gateway/router.py` + `gateway/endpoint_index.py`）。
 - **保留，但移出 `usage_accounting`**：物理尝试托管那一组符号，迁到一个**以托管命名**的模块（例如 `ouroboros/physical_attempt.py`），使「这个模块是账单」的误读不再可能。
 - **`BudgetExceeded`** 随计费删除；`PhysicalAttemptLimitExceeded` 保留（它限的是尝试次数，不是钱）。
+- **保留节流功能，但不保留其货币实现**——见 §6.3。这是**第三条**会随计费静默消失的能力（前两条是物理发送托管与 evolution 的成本刹车）。
 
-### 6.3 循环内删除（终止出口 8 类 → 7 类）
+### 6.3 连带项：evolution campaign 的成本刹车
+
+`supervisor/state.py:269` 的 `EVOLUTION_BUDGET_RESERVE: float = 2.0`，注释即「Stop evolution when remaining < this」——**以美元计价**。这是 evolution campaign 的成本刹车，闸在 4 处：`evolution_lifecycle.py:189`、`supervisor/queue.py:1506`、`supervisor/workers.py:4010` 与 `:4025`（超预算行由 `_drop_assignable_evolution_tasks` 丢弃，`reason="evolution_dropped_budget"`）。另有 `config.py:738 get_post_task_evolution_budget_usd` 的 per-window USD 预算。
+
+**删计费会连带删掉它，而 §2 明确要保留「自迭代能力」。** 所以必须逐个闸门判定存活：
+
+| evolution 的闸门 | 位置 | 删计费后 |
+|---|---|---|
+| `consecutive_failures >= 3` → `paused_failures` | `queue.py:1497` | ✅ 存活（**非货币**的自动刹车） |
+| `evolution_block_reason()`（runtime mode `light` 硬阻断） | `evolution_lifecycle.py:274` | ✅ 存活 |
+| `/evolve on\|off`（`evolution_mode_enabled`） | owner | ✅ 存活（人工） |
+| `PENDING or RUNNING` → `waiting_for_idle` | `queue.py:1512` | ✅ 存活（节流） |
+| `remaining < EVOLUTION_BUDGET_RESERVE` → `budget_blocked` | `queue.py:1506` | ❌ **消失** |
+| `not accounting_available` → `accounting_unavailable` | `queue.py:1494` | ❌ 概念随之消失（它只在这个账务世界里存在） |
+| `_budget_pause` / `queue.BUDGET_ROOT_FENCES` | `workers.py:4005/4007` | ❌ 消失 |
+| per-window USD 预算 | `config.py:738` | ❌ 消失 |
+
+**结论**：进化**不会完全失守**（失败暂停、模式门、idle 节流、人工开关都在），但**失去唯一的成本刹车**。
+
+**要求**：保留**节流功能**，换成非货币实现。现状**没有任何 cycle 上限**（`evolution_lifecycle.py` 与 `evolution_checkpoints.py` 里不存在 `MAX_CYCLES` 类常量），而 campaign 本身早已按 `cycle: int` 计数（`evolution_lifecycle.py:443 begin_evolution_transaction`），因此「每 campaign 最多 N 个 cycle」是可实现的自然替代。N 的取值由 Owner 定（§13）。
+
+### 6.4 `usage_accounting.py` 的分界小结
+
+一个模块里住着三件事，只有一件该删：
+
+| 件 | 去留 |
+|---|---|
+| 物理发送托管（正确性护栏） | **保留**，迁出到 `physical_attempt.py` |
+| 计费投影（报表/定价/成本路由） | **删除** |
+| 汇总与刷新（`last_root_accounting` / `refresh_root_accounting` / `record_subscription_session`） | 删除（它们唯一服务的是计费投影） |
+
+### 6.5 循环内删除（终止出口 8 类 → 7 类）
 
 | 位置 | 机制 |
 |---|---|
@@ -341,11 +373,13 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 
 另两条非循环归属、不受影响：派发前的 deadline 拒绝（`loop_llm_call.py:396`，不发车而非终止）与外部上限（supervisor 6h、owner Stop，`loop_transport.py:266-268` 明说不在此复制）。
 
-### 6.4 必须保留
+### 6.6 必须保留
 
 **`ouroboros/context_budget.py` 不要删。** 它是 **token / 字符**预算：`OWNER_LOW_TARGET_TOKENS = 200_000`、`MAX_RECENT_CHAT_TAIL = 1000`、`CONTEXT_OVERFLOW_CODES`。消费者：`llm.py:108/236`、`context_fit.py:305/382`、`main_context_authority.py:15`、`agent_startup_checks.py:711/794`、`request_wire_recovery.py:578`。
 
 同理保留 `context_fit.measure_main_fit` 与 reclaim 三级节拍（是上下文回收，不是计费），以及 `loop_llm_call` 的 token 计数（`context_fit` 依赖它）。
+
+**evolution 的节流功能必须保留（§6.3）**：`EVOLUTION_BUDGET_RESERVE` 的货币实现随计费删除，但「自迭代必须有自动停止条件」这条功能不能一起消失。替代实现是 campaign 级 cycle 上限（campaign 已按 `cycle: int` 计数，`evolution_lifecycle.py:443`），或把 `waiting_for_idle` 收紧为唯一节流。**保留下来的是失败暂停（`consecutive_failures >= 3`）、runtime mode 门、owner `/evolve on|off`、idle 节流——它们都不依赖计费。**
 
 ## 7. 工作面 C — Claudexor：按**路由**裁，不按模块裁
 
@@ -462,6 +496,7 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 | **违宪：把 identity 当记忆处理** | `BIBLE.md:40-41`「Not a config and not memory, but direction」 | §5.6/§5.14：identity 保留文件写入，不进 Engram |
 | **误动 P0 命名的主动性实现** | `BIBLE.md:42-45` 明列 background consciousness 为 P0 实现；它是本仓两个 agent 职责之一 | §5.13：本规格不动它。减重是独立子项目，先做对照分析 |
 | **删错层：把物理托管当账单删掉** | `loop_llm_call.py:799-802` 靠它禁止重发 | §6.1/§6.2 按投影层切，托管迁出保留 |
+| **删错层：连 evolution 的成本刹车一起删掉** | `EVOLUTION_BUDGET_RESERVE`（`state.py:269`，美元）闸在 `evolution_lifecycle.py:189`、`queue.py:1506`、`workers.py:4010/4025`；而 §2 要保留自迭代 | §6.3/§6.6：保留**节流功能**、换非货币实现（cycle 上限）；失败暂停与模式门本就非货币，自动存活 |
 | `size_ratchet` CI lane 阻塞 | `GIANT_PATHS` 含 `loop.py` `llm.py` `server.py` `supervisor/workers.py` `tools/control.py`，48 条精确记账 | 删除是棘轮允许方向；`BYTE_DEBT` 与文件同 commit 移动；用 `scripts/regenerate_size_ratchet.py` 重新生成 |
 | 测试直接 import 私有符号 | `_drain_incoming_messages`（`test_available_subagents_core_followup.py:312`）、`_check_budget_limits`（`test_budget_limits.py:10`）、`maybe_inject_finalization_nudges`（`test_delegation_phase_b.py:301`）、`seal_task_transcript`（`test_anthropic_empty_block_fix.py:13`） | 下划线前缀在本仓是名义上的；删除前 `lsp references` 核对 |
 | Engram 项目解析歧义 | 本仓一个 MCP server 下操作多项目目录 | §5.3 透传 typed 失败，禁止吞错误后降级写错项目 |
@@ -483,6 +518,7 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 **B 面（计费）**
 - 一次正常任务跑完不抛 `BudgetExceeded`；cost-breakdown 路由 404。
 - **托管回归**：构造一次 dispatched/unresolved 的发送，确认同模型重试仍被禁止（`loop_llm_call.py:799-802` 行为不变）。
+- **evolution 刹车回归（§6.3）**：`remaining < EVOLUTION_BUDGET_RESERVE` 这个场景已随计费消失，改为逐条验证存活闸门——① 达到 cycle 上限 N 后 campaign 按选定语义停下；② `consecutive_failures >= 3` 仍能暂停；③ `light` 模式仍硬阻断（`evolution_block_reason`）；④ `/evolve off` 仍能停；⑤ `waiting_for_idle` 仍生效。
 - 终止出口回归：逐条触发 7 类剩余出口。
 
 **C 面（harness）**
@@ -505,6 +541,7 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 | 上下文注入换源 | `build_memory_sections` / `build_knowledge_sections` / `build_recent_sections` 改读 Engram | 3 段 cache_control 结构与 `core_sha256` 契约不变 |
 | 计费投影删除 | 删 `pricing`/`cost_projection`/`_usage_*`/`costs.js`/cost-breakdown 路由 | 终止出口 8 类 → 7 类 |
 | 托管台账迁出而非删除 | `usage_accounting` → `physical_attempt.py` | 模块改名 + 迁移成本；保住「不重复发送」能力 |
+| evolution 刹车换实现 | `EVOLUTION_BUDGET_RESERVE`（美元）→ campaign cycle 上限 | 保住「自迭代有自动停止条件」；失败暂停/模式门/idle 节流本就非货币，不受影响 |
 | Claudexor 按路由裁 | 只裁 `AGENT_SESSION` 路由后端 | 后端改为 `omp --mode rpc` 常驻会话（§7.4）；API_CHAT 与 native 分支不动 |
 | 循环内合回行数规避物 | `_account_compaction_usage`、`_force_plan_*`、`_project_room_fact` | `loop.py` 字节棘轮只能缩，这是机会 |
 | 不采用 pi | 循环留 Python | 形态不变；12 项治理不需跨语言重建 |
@@ -534,6 +571,7 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 
 - §5.14 中 `task_reflections.jsonl` 的导入量（全量 vs 最近 N 条；**原文一律保留**已是定论）。
 - §7.3 的缺口实测：`omp --resume <不存在的 id>` 的退出码/错误码，能否支撑 `daemon_says_absent` 的正向「不存在」回答。**这是本规格唯一可能超出「删文件 + 改接口」范围的风险点。**
+- **§6.3 的 cycle 上限 N 取值**：这是「自迭代能跑多久」的语义变化，需 Owner 定。现状无任何 cycle 上限，替代 `EVOLUTION_BUDGET_RESERVE` 后 N 是唯一的定量上界。另需定：N 用尽后 campaign 是**暂停**（可恢复）还是**完成**（需重新 `/evolve`）。
 - Engram 的 `scope: global` 是否会被 `all_projects=true` 之外的操作意外包含，需确认它对 tier-0 的语义（是否真的跨 project 可见且不污染 project 级召回）。
 - Engram `--tools=agent` 的 19 项里，`mem_review` / `mem_judge` / `mem_compare` 是否暴露给主循环，还是只给评审面。属工具面配置，不阻塞规格。
 
