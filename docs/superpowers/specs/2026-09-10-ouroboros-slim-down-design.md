@@ -111,6 +111,8 @@ harness：executor 轴按路由裁，AGENT_SESSION 路由换后端；delegate_cu
 
 ## 5. 工作面 A — 记忆外接 Engram
 
+> **读法**：§5.1–§5.14 是**怎么换**（通道、工具面、迁移、降级、删除清单）；**§5.15 是换完之后的记忆模型**（种类、生命周期、冲突裁决、检索序）。两者缺一不可——初稿只有前者。
+
 ### 5.1 为什么是 Engram
 
 Go 单二进制 + SQLite/FTS5，四个表面（CLI / HTTP API / MCP stdio / TUI），默认数据 `~/.engram/engram.db`。按 **project** 分域——与 `data/projects/<id>/` 天然对齐。模型是**策展记忆**（observations / session summary / prompt），不是原始日志。
@@ -236,6 +238,9 @@ Engram 是**策展式**记忆——写不写取决于 agent 自己被要求写�
 | session 结束 / 压缩前 | `mem_session_summary`（goal / instructions / discoveries / accomplished / next steps / relevant files） |
 | 用户请求需强历史上下文 | `mem_save_prompt` |
 | account 级知识（跨 project） | `scope: global` / `personal`（§5.5） |
+| **`mem_save` 返回 `judgment_required: true`** | **必须**调 `mem_judge` 裁决 `candidates[]`；`confidence < 0.7` 时**先问 owner**（§5.15-b） |
+| **scratchpad 超过阈值** | **重写**该 topic（不是 append），被挤出的内容转成一条 episodic observation（§5.15-a） |
+| **发现记忆缺口** | 写入缺口通道，由捕获期显式接到 `_identity_unresolved_sources`（§5.15-c） |
 
 ### 5.9 必须保留：产出结构化候选的反思步
 
@@ -379,6 +384,82 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 | `logs/task_reflections.jsonl` | 2.3MB | 反思正文导入 Engram；原文**保留原位** |
 
 **原则**：迁移是**复制到 Engram**，不是**从磁盘搬走**。P1 要求历史不中断，所以本地语料一律保留，不做「导入后删除」。§11 的验证必须包含「迁移后原文件仍在」。
+
+### 5.15 记忆模型（规格此前只做了迁移，没做模型）
+
+**问题**：§5.1–§5.14 回答的是**迁移与接口**——删什么、工具名换成什么、走哪条通道、怎么降级。但「重构之后的记忆长什么样」没有写。而 Engram 不是「KV + 检索」，它有一套**成体系的记忆生命周期**，原规格一条都没用上。
+
+#### Engram 提供、原规格未使用的生命周期面
+
+| 机制 | 字段 / 工具 | 原规格 |
+|---|---|---|
+| **类型驱动的复核周期** | `type` → decay policy → `review_after`；`state: active\|needs_review`；`mem_review(action=list\|mark_reviewed)` | 未使用 |
+| **精确去重** | `normalized_hash` + `duplicate_count`（content hash + project + scope + type + title 的滚动窗口） | 未使用 |
+| **冲突裁决** | `memory_relations` + `mem_judge`（裁决 `mem_save` 返回的 `candidates[]` 与 `judgment_required: true`）/ `mem_compare`（主动建关系）；关系取值 `related\|compatible\|scoped\|conflicts_with\|supersedes\|not_conflict`；检索结果自带 `supersedes: #id` / `superseded_by: #id` / `conflicts: #id` / `conflict: contested by #id (pending)` 注解 | **完全未使用** |
+| 主题演进 | `topic_key` upsert → `revision_count` 递增 | 部分使用（§5.5/§5.6） |
+| 钉选 | `pinned`（**local-only，不参与同步**） | 未使用 |
+| 过期 | `expires_at` | 未使用 |
+| prompt 记忆 | `mem_save_prompt` + `capture_prompt` 的进程内 prompt 上下文 | 只提了「自动写入传 `false`」 |
+
+#### 记忆种类在重构后的模型
+
+| 种类 | 旧实现 | 新载体 | `type` | `scope` | 生命周期 |
+|---|---|---|---|---|---|
+| 身份 | `identity.md` + journal | **文件**（§3.4），不进 Engram | —— | —— | 永久 |
+| 工作记忆 | scratchpad 三写 + 有界 FIFO | Engram `topic_key` upsert | `learning` | `global` | **见 (a)，有缺口** |
+| 情景 | `dialogue_blocks.json` + era 摘要 | `mem_session_summary` + observations | `discovery` | `project` | 复核周期 |
+| 语义 | `knowledge/*.md`（≈47 主题） | `topic_key` upsert 的 observations | `decision` / `architecture` / `pattern` / `config` | 多为 `project` | 复核周期 |
+| 过程 | `task_reflections.jsonl` 正文 | typed observations | `bugfix` / `learning` | `project` | 复核周期 |
+| 免疫 | `patterns.md` / `improvement-backlog.md` | **文件**（§3.4） | —— | —— | Ship-of-Theseus |
+| 意识收件箱 | `consciousness_observations.jsonl` | **不动**（§5.13） | —— | —— | 跨任务 |
+
+#### 三处必须设计、原规格缺的
+
+**(a) 工作记忆的有界性丢了。** 旧实现是**有界 FIFO**（`memory.py` 的 `_SCRATCHPAD_MAX_BLOCKS = 10`）+ 逐块 journal + 淘汰记录（`block_evicted`）。改成 `topic_key: self/scratchpad` 的 upsert 后，它变成**单行持续增长**——Engram 只有字节上限与 `truncated` 警告，**没有淘汰语义**。
+
+**设计**：保留有界性，规则落在 agent 侧——超过阈值时**重写**该 topic（而非 append），被挤出的内容转成一条 episodic observation。阈值沿用 `context_budget` 里 `SCRATCHPAD_*` 的既有量级。**这条必须写进 §5.8 的 memory protocol**，否则工作记忆会无界增长。
+
+**(b) 冲突裁决的职责分界。** Engram 的 `mem_judge` 契约要求：`mem_save` 返回 `candidates[]` + `judgment_required: true` 时 agent **应当**裁决，且 `confidence < 0.7` 时**应当问 owner**。而 §5.12 要保留的 `semantic_dedup` 也在做「改写措辞即漏重」的检测——但只覆盖 backlog 与 review obligation 两条 P2/P3 队列。
+
+**设计（分界）**：
+
+| 谁 | 管什么 | 依据 |
+|---|---|---|
+| Engram `mem_judge` / `mem_compare` | knowledge / observation 之间的冲突与取代 | `memory_relations` + 检索注解 |
+| `semantic_dedup`（§5.12 保留） | **仅**那两条免疫队列的条目去重 | `improvement_backlog.py:245`、`review_state.py:1414` |
+
+**两者不互相替代**——这是 §5.12 把 `semantic_dedup` 保留的完整理由，也产生一条必须写进 memory protocol 的义务：`judgment_required: true` 时必须调 `mem_judge`，否则冲突永远停在 `pending`。
+
+**(c) `[MEMORY GAP]` 的替代契约。** 旧语义由 `consolidator` 产生、由 `memory.py:394` 识别，缺口喂进 BG 的身份闸门（§5.6.1）。Engram 侧的 `state: needs_review` + `review_after` 是**陈旧复核**，**不是缺口**。
+
+**设计**：缺口需要一条独立通道。最小做法是保留一个本地 gap 记录（文件，或 Engram 里一条专门的 `topic_key: self/memory-gaps` observation），由 `_capture_context_core` 读取并**显式接到** `_identity_unresolved_sources`。§5.11 的「沿用既有语义」只有这样才落地。
+
+#### 检索设计（原为「一次 `mem_context` + 按需 `mem_search`」一句描述）
+
+`_capture_context_core`（§5.4：必须在捕获期，不在渲染期）的调用序与边界：
+
+| 段 | 调用 | 参数 | 边界 |
+|---|---|---|---|
+| account 级稳定块 | `mem_context` | **显式** `scope`（§5.5） | 客户端按 `context_budget` 限界 |
+| project 级稳定块 | `mem_context` / `mem_search` | **显式** `project` | 同上 |
+| 待复核知识 | `mem_review(action="list")` | `limit`（默认 10） | 进 **dynamic** 段，不进 semi_stable（否则破坏缓存前缀，§15.1） |
+| 活跃冲突注解 | 随 `mem_search` 结果**自带** | —— | 不需额外调用 |
+| 近期原文尾部 | 本地 `logs/chat.jsonl` | —— | **不经 Engram** |
+
+#### 明确声明**不复用**的 Engram 面（每条给理由，避免实施者自行发挥）
+
+| 面 | 理由 |
+|---|---|
+| `pinned` | **local-only，不参与同步**——pin 不改变 `updated_at`、不产生 mutation，多机/多 drive 下会不一致 |
+| `expires_at` | 过期即删除，与 P1「never silent truncation」（`BIBLE.md:113-114`）冲突；若要用必须配显式披露 |
+| `mem_compare` | 主动建关系是 agent 的推理行为，**不由捕获期自动调用**（会把上下文捕获变成写入路径） |
+| embedding 列 | 保留为 Engram 内部实现；本仓不直接读 |
+
+**Engram 的 `sessions` 面也不复用**：它是 Engram 的记录单位，而本仓的会话身份是 `task_id` / `chat_id` 体系；两者不做映射，只靠 `project` + `scope` 对齐——否则会出现两套会话身份。
+
+---
+
+**小结**：§5.1–§5.14 是**怎么换**，本节是**换完是什么**。两者缺一不可，而后者原稿是空白。
 
 ## 6. 工作面 B — 删除计费**投影**，保留物理发送台账
 
@@ -754,6 +835,12 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 - **自迭代链（§5.9）**：一次触发反思的任务后，`improvement-backlog.md` 出现新候选，且 `maybe_promote` 的输入仍来自 `reflection_entry`。
 - **反例**：把 Engram 条目的 `enabled` 改 false → **不影响** Tier-0（§5.2 的独立通道生效）。
 
+**A 面：记忆模型（§5.15）**
+- **工作记忆有界（§5.15-a）**：连续 N 次 scratchpad 更新后，该 topic 的字节数**不单调增长**（重写而非 append）；被挤出的内容确实以 episodic observation 形式存在。
+- **冲突裁决（§5.15-b）**：构造一次 `mem_save` 命中候选 → 返回 `judgment_required: true` → agent **确实调用** `mem_judge`；随后 `mem_search` 结果带出 `supersedes:` / `conflicts:` 注解。
+- **缺口通道（§5.15-c）**：造一个记忆缺口 → 它出现在 tier-0 且 BG 的 `update_identity` 被 abstain（回到 §5.6.1 的闸门）。
+- **复核分段（§5.15 检索表）**：`mem_review(action="list")` 的产物只出现在 **dynamic** 段——**不得**进 semi_stable（否则破坏缓存前缀，§15.1）。可对同一次任务断言 max/low 两次投影的 `core_sha256` 仍一致。
+
 **B 面（计费）**
 - 一次正常任务跑完不抛 `BudgetExceeded`；cost-breakdown 路由 404。
 - **托管回归**：构造一次 dispatched/unresolved 的发送，确认同模型重试仍被禁止（`loop_llm_call.py:799-802` 行为不变）。
@@ -836,6 +923,13 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 - **`memory/dialogue_blocks.json` 的粒度层由谁生产**（§15.1-1b）：§5.8 的替代协议只约束 agent 主动 `mem_save`，没有规定谁继续产出压缩粒度。这是 §5.8 的一个缺口，需与 §5.11 的 `[MEMORY GAP]` 接收端一起定。
 - **`semi_stable` 缓存前缀的成本面**（§15.1）：换内容源即换可缓存前缀，需在 §11 加一条跨任务 cache 命中率的验证。
 - **数据平面 5 类 `state/` 文件的生产者可随删除消失**（§15.4），需逐个判定是「随之作废」还是「需替代生产者」。
+
+**§5.15 记忆模型带出的决策（需 Owner 定）**：
+
+- **工作记忆的阈值与形态**（§5.15-a）：沿用 `context_budget` 的 `SCRATCHPAD_*` 量级，还是重定？被挤出的内容转 episodic observation 时，是否需要一个受控的确定性步骤（而非全靠 agent 自觉）？
+- **`pinned` 与 `expires_at` 是否启用**（§5.15 声明暂不复用）：`pinned` 是 local-only，多机不一致；`expires_at` 过期即删，与 P1「不静默截断」冲突。两者都要 Owner 明确表态，不能默认关。
+- **缺口通道的形态**（§5.15-c）：本地文件，还是 Engram 里一条 `topic_key: self/memory-gaps` 的 observation？后者可被检索但会在跨机同步里传播。
+- **`mem_compare` 是否开放给 agent**（§5.15 声明不由捕获期调用）：主动建关系是推理行为，是否给它一条显式工具面？
 
 **仍未决**：
 
