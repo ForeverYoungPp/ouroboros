@@ -25,7 +25,7 @@ from ouroboros.anthropic_native_custody import (
     scrub_native_custody,
 )
 from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
-from ouroboros.provider_models import OPENROUTER_DEFAULTS, PROVIDER_PREFIXES, normalize_anthropic_model_id, normalize_model_identity, resolve_minimax_base_url
+from ouroboros.provider_models import OPENROUTER_DEFAULTS, PROVIDER_PREFIXES, normalize_anthropic_model_id, normalize_model_identity, requires_reasoning_content_echo, resolve_minimax_base_url
 from ouroboros.reasoning_artifacts import sealed_reasoning_pin_fact, transcript_has_sealed_reasoning
 from ouroboros.request_wire_recovery import (
     finalize_wire_response,
@@ -1650,7 +1650,12 @@ class LLMClient:
     _REASONING_CONTENT_BLOCK_TYPES = frozenset({"thinking", "reasoning", "redacted_thinking"})
 
     @classmethod
-    def _strip_openrouter_roundtrip_metadata(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _strip_openrouter_roundtrip_metadata(
+        cls,
+        messages: List[Dict[str, Any]],
+        *,
+        keep_reasoning_content: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Strip provider-private reasoning round-trip artifacts that a DIFFERENT
         upstream family rejects: assistant-level ``reasoning``/``reasoning_details``/
         ``reasoning_content``/``response_id`` keys AND ``thinking``/``reasoning``
@@ -1662,14 +1667,22 @@ class LLMClient:
         OpenRouter/Anthropic ``reasoning``/``reasoning_details`` shapes. Strict
         OpenAI-compatible servers (vLLM/SGLang) reject an echoed ``reasoning_content``
         with HTTP 400 ``Extra inputs are not permitted``, so it must be scrubbed on
-        the cloudru / openai-compatible / local lanes too."""
+        the cloudru / openai-compatible / local lanes too.
+
+        ``keep_reasoning_content`` is set ONLY for the DeepSeek thinking-mode route
+        contract (``requires_reasoning_content_echo``): that API, with ``tools``
+        present, 400s ("The ``reasoning_content`` in the thinking mode must be
+        passed back to the API.") unless every prior assistant turn's CoT is
+        replayed. It is the mirror image of the strict-server rule, so the two
+        behaviors must never be collapsed into one."""
         cleaned = scrub_native_custody(messages)
         for msg in cleaned:
             if not isinstance(msg, dict) or msg.get("role") != "assistant":
                 continue
             msg.pop("reasoning", None)
             msg.pop("reasoning_details", None)
-            msg.pop("reasoning_content", None)
+            if not keep_reasoning_content:
+                msg.pop("reasoning_content", None)
             msg.pop("response_id", None)
             content = msg.get("content")
             if isinstance(content, list):
@@ -1683,6 +1696,41 @@ class LLMClient:
                     kept.append(block)
                 msg["content"] = kept
         return cleaned
+
+    @staticmethod
+    def _route_requires_reasoning_content_echo(target: Dict[str, Any]) -> bool:
+        """Whether ``target``'s API contract requires replayed ``reasoning_content``.
+
+        DeepSeek's OpenAI-compatible thinking mode (tools present) is the documented
+        case; the predicate lives in provider_models.py with the rest of the
+        per-route capability facts. Read the RESOLVED model and the concrete
+        base_url: a route is only echo-required when it is the openai-compatible
+        lane pointing at DeepSeek (host or model family)."""
+        return requires_reasoning_content_echo(
+            str(target.get("provider") or ""),
+            str(target.get("resolved_model") or ""),
+            str(target.get("base_url") or ""),
+        )
+
+    @staticmethod
+    def _backfill_reasoning_content_echo(messages: List[Dict[str, Any]]) -> None:
+        """Make every assistant turn satisfy the DeepSeek presence check.
+
+        With ``tools`` in the request the API validates ``reasoning_content`` on
+        EVERY assistant turn (not only tool-call turns) and 400s on a missing key.
+        A turn that never had a chain of thought — a reasoning-disabled answer, a
+        prior model's turn, or a transcript persisted before the CoT was preserved —
+        would otherwise strand the whole session. Inject the minimum value the
+        contract accepts (a single space, the same placeholder DeepSeek-compatible
+        clients use) into the SEND-TIME copy only; the canonical transcript is not
+        rewritten. The model sees a blank chain for that turn, which is honest: we
+        do not have one to replay."""
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            value = msg.get("reasoning_content")
+            if not isinstance(value, str) or not value.strip():
+                msg["reasoning_content"] = " "
 
     @staticmethod
     def _replace_image_blocks_with_placeholder(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3574,13 +3622,20 @@ class LLMClient:
                 {k: v for k, v in tool.items() if k != "cache_control"}
                 for tool in self._sanitize_chat_completion_tools(tools)
             ]
+            keep_reasoning_echo = self._route_requires_reasoning_content_echo(target)
             clean_messages = self._strip_openrouter_roundtrip_metadata(
                 self._copy_messages_with_cache_policy(
                     messages,
                     allow_message_cache_control=False,
                     flatten_tool_content_blocks=True,
-                )
+                ),
+                # DeepSeek thinking mode (tools present) REQUIRES the CoT it emitted
+                # to be replayed; every other direct lane rejects it. Route fact,
+                # never a blanket keep.
+                keep_reasoning_content=keep_reasoning_echo,
             )
+            if prepared_tools and keep_reasoning_echo:
+                self._backfill_reasoning_content_echo(clean_messages)
             kwargs: Dict[str, Any] = {
                 "model": resolved_model,
                 "messages": clean_messages,
@@ -3813,7 +3868,19 @@ class LLMClient:
         # their OWN echoed ``reasoning_content`` with a 400 ``Extra inputs are not
         # permitted`` on the very next same-model turn. Drop it here so it never enters
         # the canonical transcript; the outbound scrubber is the second layer.
-        msg.pop("reasoning_content", None)
+        #
+        # DeepSeek thinking mode is the documented EXCEPTION (mirror contract): with
+        # ``tools`` present, the API requires every prior turn's ``reasoning_content``
+        # back and answers 400 "The `reasoning_content` in the thinking mode must be
+        # passed back to the API." when it is missing. Keeping it on THAT route is what
+        # makes the tool round survivable; the outbound scrubber keeps it for the same
+        # route and still strips it everywhere else. A malformed non-string value is
+        # never echoed (fail-closed; the strict-server rejection shape).
+        if self._route_requires_reasoning_content_echo(target):
+            if not isinstance(msg.get("reasoning_content"), str) or not msg["reasoning_content"].strip():
+                msg.pop("reasoning_content", None)
+        else:
+            msg.pop("reasoning_content", None)
 
         if not usage.get("cached_tokens"):
             prompt_details = usage.get("prompt_tokens_details") or {}

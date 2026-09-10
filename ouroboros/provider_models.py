@@ -515,6 +515,51 @@ def supports_vision(model_id: str) -> bool:
     return normalized.startswith(_VISION_MODEL_PREFIXES)
 
 
+# --- Thinking-mode ``reasoning_content`` replay contract -----------------------
+# DeepSeek's OpenAI-compatible API (thinking mode is ON by default) is the route
+# family that REQUIRES the chain-of-thought it emitted to be replayed: as soon as
+# the request carries ``tools``, every previous assistant turn's top-level
+# ``reasoning_content`` must be passed back, or the API answers 400 with "The
+# `reasoning_content` in the thinking mode must be passed back to the API."
+# (api-docs.deepseek.com/guides/thinking_mode -> Tool Calls).
+#
+# This is the EXACT OPPOSITE of the strict vLLM/SGLang + GLM/Z.AI OpenAI-compatible
+# servers the outbound scrubber protects, which reject their OWN echoed
+# ``reasoning_content`` with a 400 "Extra inputs are not permitted". The echo is
+# therefore an explicit PER-ROUTE fact (a decaying provider fact, not a blanket
+# behavior): without it DeepSeek thinking-mode tool rounds die on the second
+# request; with it applied everywhere the strict servers die instead.
+#
+# Match the official host (authoritative) OR a DeepSeek-named model on the
+# openai-compatible lane (proxies/aggregators re-expose the same contract under
+# their own host). Extend ONLY with a fresh live probe of the exact route.
+_REASONING_CONTENT_ECHO_HOSTS = ("deepseek.com",)
+_REASONING_CONTENT_ECHO_MODEL_PREFIXES = ("deepseek",)
+
+
+def _base_url_host(base_url: str) -> str:
+    """Lower-cased host of an OpenAI-compatible base URL (scheme optional)."""
+    text = str(base_url or "").strip().lower()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    return text.split("/", 1)[0].split("@")[-1].split(":", 1)[0]
+
+
+def requires_reasoning_content_echo(provider: str, model: str, base_url: str = "") -> bool:
+    """Whether this OpenAI-compatible route requires replayed ``reasoning_content``.
+
+    Only the openai-compatible lane can carry a DeepSeek-style thinking-mode route:
+    the direct cloudru/openai/minimax lanes have their own transcripts, and the
+    OpenRouter lane owns reasoning continuity through ``reasoning_details``."""
+    if str(provider or "").strip().lower() != "openai-compatible":
+        return False
+    host = _base_url_host(base_url)
+    if any(host == candidate or host.endswith(f".{candidate}") for candidate in _REASONING_CONTENT_ECHO_HOSTS):
+        return True
+    tail = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    return tail.startswith(_REASONING_CONTENT_ECHO_MODEL_PREFIXES)
+
+
 # NOTE (v6.33.0): the static per-model context-window table was REMOVED. It
 # perpetually went stale (1M-beta models hard-coded to 200K, [1m] ignored). The
 # agent's OWN operating window is the owner low/max context MODE (the SSOT — see
