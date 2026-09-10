@@ -318,13 +318,23 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 - 独立 `ToolRegistry` 实例 + 白名单强制是**安全边界**，不是重复代码。并进任务平面等于把 119 项工具交给后台意识。
 - 意识没有队列/租约/交付语义，把它变成 task 会引入它本不需要的生命周期面。
 
-**本规格对 `consciousness` 的处理：不动它的角色边界与工具上限。** 既不删（P0 具名实现，见 §3.2），也不合并（角色边界）。`consciousness.py` **不在 §5.12 的删除清单内**。
+**本规格对 `consciousness` 的处理：不改它的代码，但它的输入随 A/B 两面变化——因此这是行为变更，不是「不动」。**
 
-⚠️ **但「不动」有一处必须收窄**：§5.6.1 记录了 A 面与本节的原发冲突——BG 的身份改写闸门按工具名 `knowledge_read` 认账，记忆工具改名会让它**永久 abstain**。因此本节的「不动」精确含义是：
+三份审计独立收敛到同一结论：按现文的「不动」**不可实现**，因为 BG 有三条输入分属 A/B 两面，且**每一条都会 fail-closed**：
 
-> **不改角色边界、不改工具上限、不改循环形态；允许为接口改名做最小适配**（读证钩子的工具名、`dialogue-gap` 缺口源接 Engram）。
+| # | 输入 | 来自哪一面 | 断了会怎样 | 处置 |
+|---|---|---|---|---|
+| ① | 记忆工具名 `knowledge_read` —— 读证钩子 `consciousness.py:1352-1367` 按**名字**认账，销掉 source requirement | **A 面**（§5.6 改名） | 唯一销账路径永不触发 → **`update_identity` 永久 abstain** | 保留旧名作 alias，或改读证钩子（§5.6.1 的三选一） |
+| ② | 缺口源 `dialogue_blocks.json` —— `:1042-1048` 把每个缺口登记为 `dialogue-gap:<id>` | **A 面**（§5.12 删 `consolidator`） | 「不得跨越已知传记缺口重写身份」**失去全部输入** | 把缺口信号接到 Engram，或保留该缺口源 |
+| ③ | 预算 `usage_projection` —— `_check_budget:675-691`，调用点 `:640`/`:831` 与 `_think` 的 `UsageScope(origin="background")`(`:696-713`) | **B 面**（§6 删计费投影） | `except` 分支 fail-closed → **BG 永久 `budget_blocked`** | §6.5：改非货币轮次上限，或显式摘除并记账 |
 
-不这么收窄的后果不是「少了个功能」，而是**直接削弱 P0 的具名实现**，属 §3.2 的禁项。
+**三条都是 P0（`BIBLE.md:42-45` 的具名实现）+ P1（`:113-114` 不得静默截断）量级的后果。** 因此本节的准确含义是：
+
+> **不改 BG 的角色边界、工具上限与循环形态；但其输入源随 A/B 两面的改造而变化，属**行为变更**，需按上表逐条决定「保留输入」还是「记账删除」。**
+
+**先定这三条，再动 A/B 面**——否则整合时会变成三个补丁打在同一个模块上，而不是一条修正的断言。
+
+（`consciousness.py` 本身**不在 §5.12 的删除清单内**；既不删（P0 具名实现，§3.2），也不合并（角色边界）。）
 
 **它的减重是另一个独立子项目**，且我尚未做完判定「哪些是真重复、哪些是角色必需」的分析，因此**不在本规格内断言做法**。已能看出的大致分布（供后续立项，非结论）：
 
@@ -468,7 +478,7 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 |---|---|---|
 | 托管（保） | 见 §6.1 表 | — |
 | 计费（删） | 见 §6.4 表 | — |
-| **归因 / 身份**（**两边名单都没收，共 8 个**） | `AttemptRequest`（携带 model/provider/route_is_loopback/candidate_* 哈希，只有 2 个钱字段）、`AttemptReservation`（**托管转移的句柄**，无它则 `mark_dispatched`/`mark_unresolved`/`settle_attempt` 无法表达）、`UsageScope`/`usage_scope`/`current_usage_scope`（task/root/parent/category/source/**review_skill/wave_id/slot_id** 是身份，只有两个 `*_limit_usd` 是钱）、`capture_attempt_ids`（评审**执行收据**的凭据链，消费于 `review_execution_projection.py:58-63` 的 `_API_EXECUTION_RECEIPT_KEYS`）、`_usage_rows.REVIEW_ATTRIBUTION_KEYS`（委派 registration 的**幂等/指纹**字段，消费于 `delegate_registration_policy.py:23/77-78/100-101`） | 若按钱删，评审「按物理 attempt id 证明执行」与委派 registration 幂等同时断 |
+| **归因 / 身份**（**两边名单都没收**） | `AttemptRequest`（携带 model/provider/route_is_loopback/candidate_* 哈希，只有 2 个钱字段）、`AttemptReservation`（**托管转移的句柄**，无它则 `mark_dispatched`/`mark_unresolved`/`settle_attempt` 无法表达）、`UsageScope`/`usage_scope`/`current_usage_scope`（task/root/parent/category/source/**review_skill/wave_id/slot_id** 是身份，只有两个 `*_limit_usd` 是钱；**BG 的 `_think` 就在用 `UsageScope(origin="background")`**）、`capture_attempt_ids`（评审**执行收据**的凭据链，消费于 `review_execution_projection.py:58-63` 的 `_API_EXECUTION_RECEIPT_KEYS`）、`_usage_rows.REVIEW_ATTRIBUTION_KEYS`（委派 registration 的**幂等/指纹**字段）、`record_unmetered_external_dispatch`（4 个 skill/extension 落点，**同时承担外部派发留痕与行身份幂等**）、`physical_attempt_limit`（次数 rail 设置器，消费于 `llm_probe.py:367`、`review_native_episode.py:68-70`、`review_substrate.py:1424`） | 若按钱删，评审「按物理 attempt id 证明执行」、委派 registration 幂等、外部派发留痕同时断 |
 | **跨层错误类型**（**未点名，共 3 个**） | `UsageAccountingError`、`UsageLedgerCorrupt`、`PhysicalAttemptPreparationFailed` | 20+ 个**保留**模块用它们区分「rail 失败 ≠ provider 故障」（`llm.py:2583-2584/3217-3241/4065-4172`、`supervisor/events.py:2524-2596` 等）；`PhysicalAttemptLimitExceeded` **继承**它们，托管迁移必须带上 |
 
 **另有两处名字像计费、实为能力/凭据**（原判删除，**审计建议改判**）：
@@ -601,6 +611,8 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 
 **另有 11 项中危**，实施计划逐处核：`delegate_progress.py:358/367/468` 的超时常量与异常类型全 import 自被删网关；`subagent_work_order.py:111-124` 的 `route_source_request_channel` 能力证据来自 Claudexor manifest（消费者 `subagent_bootstrap.py:646`、`subagent_runtime.py:876`、`delegate_interactions.py:446`）；`review_thread_continuity.py` **整模块**是 v3 thread 操作，换后端后成孤儿（唯一消费者 `review_execution.py:737/811/895`）；`reviewer_window.py:38-45/110-126` 的 `SESSION_ROUTE_PROVIDER` 与「agent_session 行的 model_id 是 opaque harness 路由 spec」语义无落点；`config.py:141-142/331-359/1413-1416` 的 **4 个 `CLAUDEXOR_*` 常量 + 2 个 timeout getter + 2 个 `SETTINGS_DEFAULTS` 项**唯一生产消费者全在被删模块里。
 
+**"无 `claudexor` 字面但语义同样悬空" 的关联文件**（审计另列，**不在 56 个引用文件内**，极易漏）：`tools/scope_review.py:1004/1071-1074/1304-1327`（harness 路由无模型元数据 → owner-ack 是唯一到达 floor 的路径）、`tools/scope_review_session.py:228-231`（`SESSION_WINDOW_FLOOR`）、`delegate_evidence.py:80-83/231-236`、`delegate_custody_usage.py:15-21`、**`delegate_output.py:343-368`（引擎 256 KiB preview 契约）**、**`nanny_pacing.py:154`（「dollars keep accumulating」）**、`supervisor/queue.py:672-677`、`supervisor/events.py:1720-1724`、`supervisor/subagent_task_truth.py:19-27`。
+
 **构建/发布面（原稿完全未提）**：`scripts/release_proof.py:55-60` 把 `embedded_claudexor_runtime` 列在 `COMMON_SMOKE_CHECKS` **必需集**；另有 `build.sh:66-67`、`build_linux.sh:65-66`、`build_windows.ps1:80-82`、`Ouroboros.spec:92-100`、`scripts/fetch_claudexor_runtime.py` 的 import，以及 `.github/workflows/{ci.yml, claudexor-platform-gate.yml, dependency-graph.yml}` 三个 workflow（含 3-OS platform gate）。**删 Claudexor 会同时红掉 release 必需检查与 CI。**
 
 **棘轮账**：`size_ratchet_manifest.py:24/67` 点名 `tests/test_claudexor_owned_daemon.py` 与 `ouroboros/claudexor_runtime.py`，删文件必须**同 commit** 改账（§10 已有该纪律，此处补具体条目）。
@@ -637,7 +649,8 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 
 | 载体 | 行数 | 本规格的影响面 | 证据 |
 |---|---|---|---|
-| `docs/ARCHITECTURE.md` | 3,227 | **89 处 `claudexor`**；整节 `### Usage ledger substrate vs. accounting policy`(:1270)、`### Delegated subagents (Claudexor transport + the nanny)`(:1273)、`### Review delivery (retired Claude runtime)`(:1260)、`#### Background consciousness and Evolution`(:1152)、`## 1 … ### Data layout (~/Ouroboros/)`(:563) 会失实；`usage_accounting` 7 处、`cost-breakdown` 2 处 | `grep` |
+| `docs/ARCHITECTURE.md` | 3,227 | **89 处 `claudexor`**；整节 `### Usage ledger substrate vs. accounting policy`(:1270-1272)、`### Delegated subagents (Claudexor transport + the nanny)`(:1273-1275)、`### Review delivery (retired Claude runtime)`(:1260)、`#### Background consciousness and Evolution`(:1152)、`### Budget tracking`(:2728-2730，直写「`usage_accounting.py` is the single monetary policy authority」)、`### Planning, deep review, reflection, memory`(:2651-2653)、`## 1 … ### Data layout (~/Ouroboros/)`(:563) 会失实；`usage_accounting` 7 处、`cost-breakdown` 2 处 | `grep` |
+| **`README.md`** | — | **原表遗漏**：`:75`、`:197`（「drives them through Claudexor」）、`:407`（`## Architecture and Runtime Data`）；`tests/test_public_site_metadata.py:145-157` 逐面断言 `claudexor.ai` 存在 | 审计 |
 | `docs/DEVELOPMENT.md` | 2,884 | 模块模式 / 文件大小预算若点名被删模块 | 待逐处核 |
 | `docs/CHECKLISTS.md` | 859 | 评审清单里的记忆 / 计费 / 委派条目 | 待逐处核 |
 | `docs/DESIGN.md` | 412 | UI 语义若含 Agents 页（§7.2 删 harness/账号面） | 待逐处核 |
@@ -650,6 +663,10 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 | **`ouroboros/size_ratchet_manifest.py`** | — | **原表遗漏**：`:24/67` 点名 `tests/test_claudexor_owned_daemon.py` 与 `ouroboros/claudexor_runtime.py`，删文件必须同 commit 改账 | 审计 |
 
 **`ARCHITECTURE.md` 的版本行是一个被检查的载体**，不是纯文档：`context_health.py:253-256` 读它并比对版本（`desync_parts`）、`agent_startup_checks.py:403-411` 在启动时检查。所以「改了子系统却没改这个载体」会触发真实检查。
+
+**更强的一条：它不是「文档漂移」，是「持续误导 agent」。** `context_layout.py:14` 的 doc matrix 写着「ARCHITECTURE | **full — ALWAYS, every task class**」，`:19` 补一句「follows the OWNER CONTEXT MODE alone — no per-task downgrade」，`architecture_context_section():125` 的实现是「full in max, navigation map in low」。即 **max 模式下它被全文载入每一个任务的上下文**。删掉三个子系统却留着 `:2728-2730`（`usage_accounting.py is the single monetary policy authority`）、`:1270-1272`（usage ledger substrate vs accounting policy）、`:1273-1275`（Claudexor transport）、`:2651-2653`（planning/deep-review/reflection/memory）这些专节，等于**让 agent 在每一次任务里读到一份对自己身体的错误描述**——这比普通文档漂移严重一档，也是 P6「Operational Map of the Body」的正面违反。
+
+**`README.md` 同样在列**（原表遗漏）：`:75`（「Ouroboros bundles Claudexor as its local execution layer」）、`:197`（「drives them through Claudexor」）、`:407`（`## Architecture and Runtime Data`），且 `tests/test_public_site_metadata.py:145-157` **逐面断言 `claudexor.ai` 存在**——它是被测试钉死的公开承诺。
 
 **要求**：工作面 A / B / C 各自落地时，**同 commit** 更新上表中受影响的载体；`ARCHITECTURE.md` 的版本载体随之移动（沿用该文件 §10「Key Invariants」第 2 条「Release metadata has one projection」的既有机制，由 `ouroboros/tools/release_sync.py` 承载）。上表末尾四项的逐处核查属于实施计划的第一步，不在本规格内断言具体改法。
 
@@ -703,6 +720,11 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 **D 面（循环）**
 - 冒烟任务：提交 → 多轮 tool-use → 收尾，行为与重构前一致。
 - `size_ratchet` lane 通过。
+
+**跨面：文档 / 提示词 / 版本载体（§9.2）**
+- 逐载体核对计数归零或只剩保留项（如 `grep -c claudexor docs/ARCHITECTURE.md`、`usage_accounting` 7 处、`cost-breakdown` 2 处）；`docs/ARCHITECTURE.md` 的版本载体与 `VERSION` 一致（`context_health.py:253-256` 的 `desync_parts` 为空、`agent_startup_checks.py:403-411` 无告警）。
+- 被删工具名在 `prompts/*.md`、`safety.py`、`tool_capabilities.py`、`tool_access.py`、`tools/core.py` 中无残留（§5.6 第 2 类）。
+- **内容钉定型测试全绿**——它们**不会因 import 失败而暴露**，必须人工对齐：`tests/test_docs_sync.py:57-60`、`tests/test_context_budget_ssot.py:79-81`、`tests/test_scratchpad_consolidation.py:64-88`、`tests/test_gateway_parity.py:14-20/225-298`、`tests/test_public_site_metadata.py:145-157`。
 
 ## 12. 取舍台账（按 §3.3 分两类，不可混同）
 
@@ -793,7 +815,7 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 | 4 | A | `semantic_dedup` 是免疫队列去重器 | `semantic_dedup.py:1-16`、`improvement_backlog.py:245`、`review_state.py:1414` | §5.12 **改判保留** |
 | 5 | A | `index-full.md` 生产者链断（**tier-0 冻结**） | 写 `consolidator.py:646-673` 等 4 处；tier-0 `context_layout.py:51-59` | §5.11 |
 | 6 | A | task narrative 借 consolidator 车道且失败被静默吞 | `agent_task_pipeline.py:1157-1158/1198/1217-1218/1235` | §5.12 |
-| 7 | B | `consciousness._check_budget` 是 BG 唯一自动停止（删后 fail-closed 永久停摆） | `consciousness.py:675-691/640/831/696-713/690-692` | **§6.5**（新增） |
+| 7 | B | `consciousness._check_budget` 是 BG 唯一自动停止（删后 fail-closed 永久停摆） | `consciousness.py:675-691/640/831/696-713/690-692` | **§6.5**（新增）；**并同步修正了角色规格的 R2 权威闸门列**（`docs/superpowers/specs/2026-09-10-agent-roles-design.md` 的 §6 表，原来只写「identity 完整度」） |
 | 8 | B | `reserve_attempt`/`settle_attempt`/`AttemptRequest`/`AttemptReservation` 是托管状态机本体 | `usage_accounting.py:255/1020/684-772/211-252`；`loop_llm_call.py:799-806`、`review_custody.py:50-52`、`tools/search.py:590/673/689` | §6.4「第三类」 |
 | 9 | B | `pricing.py` 里的 safety 闸门 | `safety.py:600-623`、`:603-606` fail-open | §6.4 |
 | 10 | B | owner 唯一的预算设置入口 `_BUDGET_FIELDS` | `settings_setup_contract.py:124-162` → 4 个 web 模块 + onboarding 步 + 3 个测试 | §6.10 |

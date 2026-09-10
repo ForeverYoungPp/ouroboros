@@ -170,7 +170,7 @@ CognitionSurface {
 | dispatch 策略 | 并行判定 + 截断 + 原文 custody + `llm_trace` | 周期收据 | 单次调用 |
 | 上下文面 | 随 mode / task 变化 | `partition="all"` | 只读包 + 无工具提示 |
 | 触发与生命周期 | queue / lease / deadline | timer / inbox / singleton / pause | on-demand |
-| 权威闸门 | 预算 / deadline / 验收 | identity 完整度 | —— |
+| 权威闸门 | 预算 / deadline / 验收 | identity 完整度 + **预算**（`consciousness._check_budget:675-691` 读 `usage_projection`，是 R2 **唯一**的自动停止条件；主规格 §6.5 记录它将随计费删除而改形） | —— |
 | 投递模式 | 常规 | cycle-end 延迟 | 无投递 |
 
 `sender_identity`（轴 C）**不在此表**——它不是面专有项：两个面都可能产出 `agent` 呈现，BG 只是**强制**覆盖成 `background`。
