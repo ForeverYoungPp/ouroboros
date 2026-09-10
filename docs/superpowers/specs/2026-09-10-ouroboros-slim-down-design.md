@@ -467,7 +467,13 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 > When a write omits it, Engram uses the current process directory only to narrow **active non-manual runtime sessions** for the resolved project. It attaches to a session **only when exactly one candidate remains**, uses the project manual-save session when none remain, and **fails closed when multiple candidates remain**.
 > **Directory is not session identity**; callers with concurrent sessions **must supply `session_id`** or end other active matching sessions.
 
-**Ouroboros 天然并发执行多个任务**（worker 池 + 直聊 + 意识 + presence）→ 不显式传 `session_id` 就是「multiple candidates remain」→ **写入 fail-closed**。同时 `observations.session_id` 与 `user_prompts.session_id` 都是**外键**（`DOCS.md:54/56`），无会话的观察在结构上就是残缺的。
+**Ouroboros 天然并发执行多个任务**（worker 池 + 直聊 + 意识 + presence）→ 不显式传 `session_id` 就是「multiple candidates remain」→ **写入 fail-closed**。
+
+**三条独立的理由，任何一条都足以否掉「不复用 sessions」**：
+
+1. **写入会 fail-closed**（上引 `:855`）——并发是本仓的常态（`supervisor/workers.py` 的 `init(..., max_workers, ...)`），不是边角情况。
+2. **外键约束**：`observations.session_id`（`DOCS.md:54`）与 `user_prompts.session_id`（`:56`）都是 FK，且 `POST /observations`（`:157`）与 `POST /prompts`（`:196`）的 body **都带 `session_id`**——无会话的写入在结构上就是残缺的。
+3. **`mem_context` 的定义依赖会话存在**：它是「Get recent memory context from previous sessions — **shows sessions, prompts, and observations**」（`DOCS.md:985`）。没有 session，那一节**恒为空**——而 §5.15 的检索表正是用 `mem_context` 取 account 级与 project 级的稳定块。**这同时也解掉了「检索表调用 `mem_context`」与「不复用 sessions」在本文内部的自相矛盾。**
 
 **设计（映射）**：
 
