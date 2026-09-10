@@ -35,16 +35,25 @@ acceptance_criteria:
     ouroboros/_usage_response.py ouroboros/_usage_rows.py ouroboros/_usage_rows_memo.py
     ouroboros/claudexor_daemon.py ouroboros/claudexor_runtime.py ouroboros/gateways/claudexor.py
     ouroboros/gateway/claudexor_accounts.py ouroboros/gateway/claudexor_quota.py;
-    do mv "$m" /tmp/probe_moved.py; python -c "import server" >/dev/null 2>&1; rc=$?;
-    mv /tmp/probe_moved.py "$m"; echo "$m EXIT=$rc"; done` 期望：输出 12 行，每行以 `EXIT=0`
-    结尾。行数少于 12 即失败；任一行非 0 即失败。'
-  semantic_ac_key: ac_d63066648422011b
-- description: 'AC-0.2 同一 12 个模块，探针换成 `python -c "import supervisor.events"`。期望：12
-    行，每行 `EXIT=0`。'
-  semantic_ac_key: ac_8e81f0d3d87b8c7d
-- description: 'AC-0.3 同一 12 个模块，探针换成 `python -c "import ouroboros.gateway.extensions"`。期望：12
-    行，每行 `EXIT=0`。'
-  semantic_ac_key: ac_40ab93d2dba0cb93
+    do mv "$m" /tmp/probe_moved_ac01.py; python -c "import server" >/dev/null 2>&1; rc=$?;
+    mv /tmp/probe_moved_ac01.py "$m"; echo "$m EXIT=$rc"; done` 期望：输出 12 行，每行以 `EXIT=0`
+    结尾。行数少于 12 即失败；任一行非 0 即失败。临时文件路径 /tmp/probe_moved_ac01.py 专属于本 AC，禁止与其他 AC 共用。'
+- description: 'AC-0.2 同一 12 个模块，但探针换成 `python -c "import supervisor.events"`。命令：`for m in ouroboros/memory.py
+    ouroboros/consolidator.py ouroboros/tools/memory_tools.py ouroboros/cost_projection.py
+    ouroboros/_usage_response.py ouroboros/_usage_rows.py ouroboros/_usage_rows_memo.py
+    ouroboros/claudexor_daemon.py ouroboros/claudexor_runtime.py ouroboros/gateways/claudexor.py
+    ouroboros/gateway/claudexor_accounts.py ouroboros/gateway/claudexor_quota.py;
+    do mv "$m" /tmp/probe_moved_ac02.py; python -c "import supervisor.events" >/dev/null 2>&1; rc=$?;
+    mv /tmp/probe_moved_ac02.py "$m"; echo "$m EXIT=$rc"; done` 期望：输出 12 行，每行以 `EXIT=0`
+    结尾。行数少于 12 即失败；任一行非 0 即失败。本 AC 自带完整命令，不得引用 AC-0.1：若省略 mv 步骤，模块从未被移走，import 会无条件成功而变成空转通过。临时文件路径 /tmp/probe_moved_ac02.py 专属于本 AC。'
+- description: 'AC-0.3 同一 12 个模块，但探针换成 `python -c "import ouroboros.gateway.extensions"`。命令：`for m in ouroboros/memory.py
+    ouroboros/consolidator.py ouroboros/tools/memory_tools.py ouroboros/cost_projection.py
+    ouroboros/_usage_response.py ouroboros/_usage_rows.py ouroboros/_usage_rows_memo.py
+    ouroboros/claudexor_daemon.py ouroboros/claudexor_runtime.py ouroboros/gateways/claudexor.py
+    ouroboros/gateway/claudexor_accounts.py ouroboros/gateway/claudexor_quota.py;
+    do mv "$m" /tmp/probe_moved_ac03.py; python -c "import ouroboros.gateway.extensions" >/dev/null 2>&1; rc=$?;
+    mv /tmp/probe_moved_ac03.py "$m"; echo "$m EXIT=$rc"; done` 期望：输出 12 行，每行以 `EXIT=0`
+    结尾。行数少于 12 即失败；任一行非 0 即失败。本 AC 自带完整命令，不得引用 AC-0.1：若省略 mv 步骤，会空转通过。临时文件路径 /tmp/probe_moved_ac03.py 专属于本 AC。'
 - description: 'AC-0.4 命令 `pytest tests/test_gateway_parity.py -q` 期望：退出码 0，stdout
     含 `passed`，无 `failed`。'
   semantic_ac_key: ac_6b5f5d58b5f6546d
