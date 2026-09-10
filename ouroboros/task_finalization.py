@@ -397,3 +397,81 @@ def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | N
     except Exception:
         log.debug("swarm efficiency rollup failed", exc_info=True)
         return None
+
+
+def record_project_letters_home(
+    task: Dict[str, Any], pending_events: List[Dict[str, Any]],
+    outcome_axes: Dict[str, Any], env_drive_root: Any, ephemeral: bool,
+) -> bool:
+    """Letters home (v6.32.0) for a REAL pooled project task; returns project_scoped.
+
+    Called from ``emit_task_results`` inside its ``_is_root_post_task`` block; the
+    bool return is the caller's ``project_scoped`` flag for the post-task dispatch,
+    written even when no letters go home.
+
+    Gating (v6.33.0 WS10 idempotency contract; claudexor B5): a project THREAD
+    conversation runs on the fast direct-chat lane. It is project-scoped only for
+    CONTEXT (it sees the project's knowledge/journal), but it is NOT a pooled task
+    completion: it must not block the reply on LLM post-processing and must not
+    write letters home (that would turn every "как дела?" into a journal milestone
+    + a consciousness observation and stall the global chat lock). Ephemeral
+    same-route turns are PROHIBITED from ALL durable memory — chat/scratchpad
+    consolidation and letters-home included; the locked main path owns those. Only
+    real pooled project tasks (project-scoped, not a direct chat, not ephemeral)
+    get the letters-home treatment.
+
+    Full project awareness: this is a crisp "task finished" summary, not an
+    isolation boundary — the one mind already sees the project thread in its
+    unified memory; only per-cycle RAW internal facts stay in the per-project
+    store. The full objective IS the meaning of the cycle — carried whole into
+    the journal milestone and the consciousness digest (BIBLE P1: no silent/lossy
+    clip of cognitive text); the task and task_results remain the durable record.
+    """
+    from ouroboros.project_facts import resolve_project_id
+
+    project_scoped = bool(resolve_project_id(task))
+    if not project_scoped or bool(task.get("_is_direct_chat")) or ephemeral:
+        return project_scoped
+    pid = resolve_project_id(task)
+    objective = str(
+        task.get("objective") or task.get("description") or task.get("text") or ""
+    )
+    exec_status = str((outcome_axes.get("execution") or {}).get("status") or "unknown")
+    from ouroboros.outcomes import EXECUTION_BEST_EFFORT, EXECUTION_OK
+
+    try:
+        # One fail-soft seam (project_journal.record_task_finalization) for the
+        # durable letters home: the task-finished milestone, the Q8 off-registry
+        # work-location row, and — for the swarm ROOT — the tree-ledger
+        # coordination mirror. Kind compares against the canonical execution-axis
+        # constants (EXECUTION_OK is "ok"; a raw "success" literal never matched —
+        # the C9.1 seed bug).
+        from ouroboros.tools.project_journal import record_task_finalization
+
+        record_task_finalization(
+            pid,
+            task,
+            objective=objective,
+            kind="done" if exec_status in (EXECUTION_OK, EXECUTION_BEST_EFFORT) else "blocked",
+            exec_status=exec_status,
+            # Registry lives on the canonical drive; stamps the durable
+            # per-project last-result pointer.
+            drive_root=pathlib.Path(str(task.get("budget_drive_root") or env_drive_root)),
+        )
+    except Exception:
+        log.debug("project journal finalization entries failed", exc_info=True)
+    try:
+        from ouroboros.utils import utc_now_iso
+
+        pending_events.append({
+            "type": "project_digest",
+            "project_id": pid,
+            "task_id": str(task.get("id") or ""),
+            "objective": objective,
+            "execution_status": exec_status,
+            "objective_status": str((outcome_axes.get("objective") or {}).get("status") or "not_evaluated"),
+            "ts": utc_now_iso(),
+        })
+    except Exception:
+        log.debug("project digest emission failed", exc_info=True)
+    return project_scoped
