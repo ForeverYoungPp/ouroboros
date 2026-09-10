@@ -99,6 +99,43 @@ def test_predicate_leaves_strict_and_other_lanes_alone():
         "openrouter", "deepseek/deepseek-v4-pro", "") is False
 
 
+# --- forced tool_choice is an ENDPOINT fact, not a model fact -------------------
+
+def test_forced_tool_choice_is_rejected_only_on_the_official_endpoint():
+    """api.deepseek.com pins tool_choice while thinking mode is on (measured 400),
+    while the gateways re-exposing the SAME models accept it (122/123 parseable).
+    A model-name rule would misclassify every gateway."""
+    from ouroboros.provider_models import rejects_forced_tool_choice as rejects
+
+    assert rejects("openai-compatible", "openai-compatible/deepseek-flash",
+                   "https://api.deepseek.com") is True
+    assert rejects("openai-compatible", "deepseek-flash", "api.deepseek.com") is True
+    # the same model family, served by a gateway that accepts a forced choice
+    assert rejects("openai-compatible", "DeepSeek-V4-Flash",
+                   "https://api.scnet.cn/api/llm/v1") is False
+    assert rejects("openai-compatible", "DeepSeek-V4-Flash",
+                   "https://opencode.ai/zen/go/v1") is False
+    # omen-alpha is owner-acked behind all three hosts, so model identity alone
+    # cannot decide it — only the host can
+    assert rejects("openai-compatible", "omen-alpha", "https://api.deepseek.com") is True
+    assert rejects("openai-compatible", "omen-alpha",
+                   "https://api.scnet.cn/api/llm/v1") is False
+
+
+def test_forced_tool_choice_fails_open_on_unknown_routes():
+    """An unresolved host keeps the forced choice: never silently weaken a route
+    that has not been measured to refuse it."""
+    from ouroboros.provider_models import rejects_forced_tool_choice as rejects
+
+    assert rejects("openai-compatible", "deepseek-flash", "") is False
+    assert rejects("", "", "") is False
+    assert rejects("anthropic", "claude-sonnet-5", "https://api.deepseek.com") is False
+    assert rejects("openrouter", "deepseek/deepseek-v4-pro", "https://api.deepseek.com") is False
+    # a look-alike host must not match
+    assert rejects("openai-compatible", "deepseek-flash", "https://api.deepseek.com.evil.test") is False
+    assert rejects("openai-compatible", "deepseek-flash", "https://notdeepseek.com") is False
+
+
 # --- response normalization ---------------------------------------------------
 
 def _response(reasoning_content="secret deepseek CoT"):

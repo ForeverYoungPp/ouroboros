@@ -255,13 +255,8 @@ def test_complete_summarizer_payload_has_no_head_or_structural_omission(
     assert usage["prompt_tokens"] == 17
 
 
-def test_summarizer_never_forces_a_tool_choice_the_route_rejects(monkeypatch, tmp_path):
-    """DeepSeek's thinking mode (ON by default; this lane sends no reasoning control
-    at all) answers 400 "Thinking mode does not support this tool_choice" to a forced
-    tool_choice. Every recorded compaction attempt that forced it took that 400 and
-    fell through to the JSON path, so the structured branch had a 0-for-N success
-    record. The prompt already names the tool, and "auto" is measured to call it on
-    the real payloads, so the forced choice is never sent again."""
+def _summarizer_call(monkeypatch, tmp_path, spec_extra=None):
+    """Drive _call_summarizer once and return the kwargs it sent."""
     from ouroboros import llm, llm_observability
 
     part = cc._part("unit:1:1:aaaa", "some source text")
@@ -280,15 +275,49 @@ def test_summarizer_never_forces_a_tool_choice_the_route_rejects(monkeypatch, tm
 
     monkeypatch.setattr(llm, "LLMClient", lambda: object())
     monkeypatch.setattr(llm_observability, "chat_observed", fake_chat_observed)
+    spec = {"model": "m", "effort": "low", "use_local": False}
+    spec.update(spec_extra or {})
     summaries = cc._call_summarizer(
         [part],
         drive_root=tmp_path,
         task_id="task",
         phase="map",
-        spec={"model": "m", "effort": "low", "use_local": False},
+        spec=spec,
         summary_budgets={part.root_id: 700},
         usage_total={},
     )
+    return seen, summaries, part
+
+
+def test_summarizer_keeps_the_forced_choice_on_routes_that_accept_it(monkeypatch, tmp_path):
+    """A forced choice is the stronger ask, so it is the default: the DeepSeek
+    GATEWAYS accept it (measured 122/123 parseable on DeepSeek-V4-Flash), and an
+    unknown route must never be silently weakened."""
+    for extra in (
+        {},  # no route resolved at all -> fail open to the forced choice
+        {"provider": "openai-compatible", "resolved_model": "DeepSeek-V4-Flash",
+         "base_url": "https://api.scnet.cn/api/llm/v1"},
+        {"provider": "openai-compatible", "resolved_model": "DeepSeek-V4-Flash",
+         "base_url": "https://opencode.ai/zen/go/v1"},
+    ):
+        seen, summaries, part = _summarizer_call(monkeypatch, tmp_path, extra)
+        assert seen["tool_choice"] == "required", extra
+        assert summaries == {part.source_id: "s"}
+
+
+def test_summarizer_drops_the_forced_choice_on_the_official_deepseek_route(
+    monkeypatch, tmp_path,
+):
+    """api.deepseek.com pins tool_choice while thinking mode is on: forcing it is a
+    deterministic 400 ("Thinking mode does not support this tool_choice"), so there
+    the model is asked instead of coerced. The prompt already names the tool, and a
+    prose answer falls through to the JSON path with no extra call."""
+    seen, summaries, part = _summarizer_call(monkeypatch, tmp_path, {
+        "provider": "openai-compatible",
+        "resolved_model": "openai-compatible/deepseek-flash",
+        # the owner-acked route for route_fp 857480e5ab78e1cb38815b03
+        "base_url": "https://api.deepseek.com",
+    })
     assert seen["tool_choice"] == "auto"
     # the tool is still offered, and the call is still validated/continued
     assert [t["function"]["name"] for t in seen["tools"]] == ["emit_context_summaries"]
