@@ -16,6 +16,7 @@ import logging
 
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
 from ouroboros import task_pacing
+from ouroboros.system_projection import strip_relocated
 # The acceptance obligations/dialogue/decision machinery moved WHOLE into
 # `acceptance_dialogue.py`; loop.py keeps the fence, checkpoint, panel-execution
 # and message rails. Names unused here are re-exported on purpose: external
@@ -1283,7 +1284,8 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
     request = ReviewRequest(
         surface="task_acceptance",
         goal=(
-            _extract_plain_text_from_content(ctx.messages[1].get("content"))
+            _extract_plain_text_from_content(
+                strip_relocated(ctx.messages[1].get("content")))
             if len(ctx.messages) > 1 else ""
         ),
         subject=str(ctx.content or ""),

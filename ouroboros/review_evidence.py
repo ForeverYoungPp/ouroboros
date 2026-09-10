@@ -9,6 +9,7 @@ import pathlib
 import subprocess
 from typing import Any, Dict, List
 
+from ouroboros.system_projection import is_relocated_block
 from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
 from ouroboros.utils import truncate_review_artifact, truncate_within_limit
 log = logging.getLogger(__name__)
@@ -753,6 +754,12 @@ def _owner_content_projection(content: Any) -> str:
     for block in content:
         if not isinstance(block, dict):
             parts.append(str(block))
+            continue
+        if is_relocated_block(block):
+            # Harness-relocated SYSTEM text riding on the task turn — it is not
+            # the owner's words and must never reach the host-attested corpus
+            # (it also varies with VERSION, which would make an "immutable
+            # verbatim" corpus task-dependent).
             continue
         block_type = str(block.get("type") or "")
         if block_type in {"text", "input_text"}:

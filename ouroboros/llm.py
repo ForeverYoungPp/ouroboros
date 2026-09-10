@@ -318,12 +318,16 @@ def _canonical_candidate_bytes(payload: Dict[str, Any]) -> bytes:
 
 
 def _physical_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the send copy with capsule metadata removed only from context turns."""
+    """Return the send copy with harness-private keys removed from context turns."""
     candidate = copy.deepcopy(payload)
 
     def _strip(value: Any) -> None:
         if isinstance(value, dict):
             value.pop("_context_capsule", None)
+            # ``system_projection`` marks the block it relocated out of the system
+            # prefix so reprojection and owner-evidence readers can find it; the
+            # provider supports neither key.
+            value.pop("_system_relocated", None)
             for child in value.values():
                 _strip(child)
         elif isinstance(value, list):
