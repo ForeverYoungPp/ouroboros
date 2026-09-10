@@ -48,3 +48,12 @@ test('buildMessageKey separates identities so dedupe cannot swallow a sibling', 
     });
     assert.notEqual(agentKey, bgKey);
 });
+
+test('the offline sessionStorage snapshot carries sender identity', () => {
+    // Regression: the snapshot projection dropped the identity, so an offline
+    // bootstrap repainted a BG message as "Ouroboros" with a DIFFERENT key than
+    // its live/durable bubble — the same record showed twice (one per label)
+    // until a full rebuild. Write side and read side must both carry it.
+    assert.match(chat, /senderSessionId,\s*\n\s*senderIdentity,/);
+    assert.match(chat, /senderIdentity: msg\.senderIdentity \|\| ''/);
+});

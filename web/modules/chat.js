@@ -2567,6 +2567,7 @@ export function createChatInstance({
                 source,
                 senderLabel: senderLabelOverride,
                 senderSessionId,
+                senderIdentity,
                 clientMessageId,
                 taskId,
                 projectId,
@@ -3228,6 +3229,9 @@ export function createChatInstance({
                     source: msg.source || '',
                     senderLabel: msg.senderLabel || '',
                     senderSessionId: msg.senderSessionId || '',
+                    // Identity rides the snapshot too: without it a BG row
+                    // repaints as "Ouroboros" and stops deduping its sibling.
+                    senderIdentity: msg.senderIdentity || '',
                     clientMessageId: msg.clientMessageId || '',
                     taskId: msg.taskId || '',
                     projectId: msg.projectId || '',
