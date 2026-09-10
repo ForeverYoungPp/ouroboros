@@ -113,9 +113,16 @@ Go 单二进制 + SQLite/FTS5，四个表面（CLI / HTTP API / MCP stdio / TUI�
 
 把 tier-0 记忆挂在这条链上，等于让用户（或 agent 自己）关一个开关就静默丢掉 identity/scratchpad/knowledge——正好撞 P1 的「never silent truncation」。
 
-**决策**：Engram 走**独立的、不受 MCP 开关管辖的通道**（自有 client 实例，或 `engram serve` + 直连 HTTP）。若最终仍复用 MCP 客户端，则必须把 Engram 条目及其 enable 态声明为 **tier-0 不变量**，不可被普通设置关闭，且 `allowed_tools` 对它无效。
+**决策**：Engram 走**独立的、不受 MCP 开关管辖的通道**。两条候选，都是 Engram 的一等表面：
 
-启动命令 `engram mcp --tools=agent`（19 个 agent 面向工具；不带则该档为 23 个）。已有一个 `engram serve` 时可经 `ENGRAM_URL` 指向它。
+| 通道 | 形态 | 取舍 |
+|---|---|---|
+| MCP stdio（自有 client 实例） | `engram mcp --tools=agent`（19 个 agent 面向工具；不带该档为全部 23 个） | 复用 `mcp_client.py` 的实现，但**必须绕开其 enable/allowlist 管辖** |
+| 本地 HTTP | `engram serve`，默认 `127.0.0.1:7437`；或 **`ENGRAM_SOCKET`** 指定的 POSIX Unix socket（socket 模式独占监听，不可与显式 `ENGRAM_PORT` 并用）；`ENGRAM_HTTP_TOKEN` 给 DELETE/export/import 加 Bearer | 不经过 MCP 开关，天生独立；且 `/context` 直接给了服务端渲染能力 |
+
+**倾向 HTTP/Socket**：它天然满足「不受 MCP 开关管辖」，并且 `/context` 端点提供了本方案需要的两个原语（见 §5.11）——`?max_bytes=N`（UTF-8 安全截断 + `[truncated]` 标记，上限 65536）与 `/context/compaction?session_id=X`（严格限定到单个已持久化会话的运行时压缩上下文）。
+
+若最终仍选 MCP，则必须把 Engram 条目及其 enable 态声明为 **tier-0 不变量**，不可被普通设置关闭，且 `allowed_tools` 对它无效。
 
 ### 5.3 项目绑定
 
@@ -129,11 +136,22 @@ Go 单二进制 + SQLite/FTS5，四个表面（CLI / HTTP API / MCP stdio / TUI�
 
 **因此 Engram 召回必须在 `context.py:1310 _capture_context_core` 完成并落进 `ContextCore`，作为「第七个捕获源」。** 若把跨进程调用放进 `_render_context_system_content` / `_projection`，max 与 low 会基于不同召回结果，determinism 契约与 core 身份同时破裂。
 
-### 5.5 读路径不对称必须写死
+### 5.5 读路径用 `scope` 解决，不用固定 project
 
-Engram 的读是**按 project 分域**的：`mem_context` / `mem_search` 缺省解析到当前 canonical project，只有显式 `all_projects=true`（CLI `--all`）才跨域。若 `self/identity` 存进一个固定的 `ouroboros-self` project，它在任何 project 任务的召回里都不会出现——tier-0 静默变空。
+Engram 的读**默认按 project 分域**，但 observation 有第三个维度 `scope: project | personal | global`。`DOCS.md:902` 明说：
 
-**决策**：`_capture_context_core` 每次**至少两次召回**（当前 project + 固定的 `ouroboros-self`），或一律使用显式 `project` 参数、不依赖解析。§11 的验证必须覆盖这一条（只验「写入后能搜回」是不够的）。
+> When `scope: personal` is passed without an explicit `project` override, the project filter is cleared and personal observations are searched across all projects (cross-project personal scope).
+
+因此 account 级知识用 `scope: personal` / `global` 写入并以同样 scope 召回即可，**不需要固定 project + 每次两次召回**——那是在绕过一个已设计好的机制。
+
+**决策**：
+
+- tier-0 的 account 级块（如 `self/scratchpad`、跨项目约定）：`scope: global`（或 `personal`），跨 project 可见。
+- project 级块：默认 `scope: project`，随 canonical project 解析。
+- `_capture_context_core` 用**显式** `scope`/`project` 参数，不依赖 cwd 解析兜底。
+- `identity` / `patterns` / `improvement-backlog` 仍走文件通道（§3.4），不经此路径。
+
+§11 的验证必须覆盖这一条（只验「写入后能搜回」是不够的）。
 
 ### 5.6 工具面替换（对 agent 可见的接口变化）
 
@@ -162,15 +180,20 @@ Engram 是**策展式**记忆——写不写取决于 agent 自己被要求写�
 
 若只把工具名换成 `mem_save` 而不规定**何时**写，重构后记忆写入会静默停摆——比丢掉 reflection 的 backlog 更彻底，且违反 P1。
 
+**Engram 自己就提供了这一节的内容**，不必重新发明：`DOCS.md` 的 §Memory Protocol（`:1098` 起）明说「The Memory Protocol teaches agents **when** and **how** to use Engram's MCP tools. **Without it, the agent has the tools but no behavioral guidance.** Add this to your agent's prompt file.」本方案的这一节应从它裁剪并适配本仓的 `prompts/SYSTEM.md`。
+
+`mem_save` 的可用参数（决定这一节能写得多具体）：`type` ∈ `decision|architecture|bugfix|pattern|config|discovery|learning`、`scope` ∈ `project|personal|global`、`topic_key`、`capture_prompt`（默认 `true`；**自动化产物写入应显式传 `false`**，因为 `capture_prompt` 会把当前 prompt 一并记下）、`content` 建议结构 `**What** / **Why** / **Where** / **Learned**`。
+
 **必须补的契约**（落在 `prompts/SYSTEM.md` 或对应 section，遵守 P7 的「prompts are code」）：
 
 | 时机 | 动作 |
 |---|---|
 | session 开始 | `mem_current_project` 确认 + `mem_context` 恢复最近历史 |
-| 完成一个 bug fix / 决策 / 发现 / 约定 / 配置变更 | `mem_save`（结构化：What / Why / Where / Learned） |
-| 演进中的主题 | 复用稳定 `topic_key`（如 `architecture/auth-model`）原地更新，不新建竞争记忆 |
+| 完成一个 bug fix / 决策 / 发现 / 约定 / 配置变更 | `mem_save`（`type` 选上表值；内容用 What / Why / Where / Learned） |
+| 演进中的主题 | 复用稳定 `topic_key`（如 `architecture/auth-model`）原地更新，不新建竞争记忆（无把握时先 `mem_suggest_topic_key`） |
 | session 结束 / 压缩前 | `mem_session_summary`（goal / instructions / discoveries / accomplished / next steps / relevant files） |
 | 用户请求需强历史上下文 | `mem_save_prompt` |
+| account 级知识（跨 project） | `scope: global` / `personal`（§5.5） |
 
 ### 5.9 必须保留：产出结构化候选的反思步
 
@@ -355,13 +378,36 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 2. **崩溃后仍可查的缺席原语**：`daemon_says_absent` + `close_absent_run`
 3. **启动时和解**：`_reconcile_one`（`delegate_custody.py:1496`）
 
-**换/加后端时按这三条验收。** omp 若给不出**持久 run 身份**与**缺席查询**，这层保护无法平移——那才是本面真正的工作量，而不是删文件。
+**换/加后端时按这三条验收。** 对照 §7.4 的 omp 能力面：
 
-### 7.4 语义落差
+| custody 要求 | omp 侧对应 | 状态 |
+|---|---|---|
+| 持久 run 身份 | `--mode rpc` 会话 + `--provider-session-id` + `--session-dir` | ✅ 有 |
+| 崩溃后可达 | `--resume <id>` / `--session <id>` | ⚠️ 有「恢复」，**需实测「查询存在性/缺席」的正向回答**（`daemon_says_absent` 语义） |
+| 自有句柄 | 本仓自起 `omp --mode rpc` 子进程，用 `process_custody` 托管（沿用 `claudexor_daemon.py` 的 spawn 模板） | ✅ 机制已有 |
+| 启动和解 | 需新建：rpc 的 `ready` 帧 + 会话列表查询 | 🔨 待建 |
 
-Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设备码登录。omp 的 headless 面是**一次性子进程**：`omp -p "<prompt>"`（`--print` / `--print-thoughts` / `--prompt-cache-key`，见 omp `docs/cli-reference.md:39,163-190`）。
+**唯一可能真正的缺口**是「缺席查询」：`daemon_says_absent` 需要「**这个 run 不存在**」的正向回答，而 `--resume` 在会话不存在时的行为（错误码/退出码）尚未实测。这是本面唯一可能超出「删文件 + 改接口」范围的工作量。
 
-这不是 drop-in：会话连续性假设要重设计；并发控制从 daemon 自带改为本仓自管（`model_concurrency.py` 的 `model_call_slot` 可复用）；账号由 code agent 自持（这与 `claudexor_daemon.py` docstring 里「Zero auth logic lives here」的既有立场一致，是延续而非倒退）；钉定对象从「Node 运行时 + archive sha256」改为「code agent 版本 + 启动方式」。
+### 7.4 语义落差（比我初判小）
+
+Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设备码登录。
+
+**我初判 omp 只有一次性子进程（`omp -p`），这是错的。** 实测（omp `docs/cli-reference.md:154,163-203`、`docs/rpc.md:1-40`）：
+
+| 能力 | omp 的对应面 |
+|---|---|
+| 常驻会话服务 | **`--mode rpc`** — newline-delimited JSON over stdio。启动先写 `ready` 帧，advertise `protocolVersion` 1/2 与传输上限（`maxFrameBytes` 1 MiB、`maxReassembledFrameBytes` 64 MiB）；协议 v2 有 `rpc_chunk` 无损分片；stdin 关闭时排空后退出码 0 |
+| 标准 agent 协议 | `--mode acp`（Agent Client Protocol over stdio）、`acp` 子命令 |
+| 运行身份持久化 | `--provider-session-id <id>`（原文「Reuse a specific provider-side session id **for continuity and cache scoping**」）、`--session-dir`、`--no-session` |
+| 崩溃后可达 | `--resume [id]` / `--session [id]` / `--continue` / `--fork <session>` |
+| prompt cache | `--prompt-cache-key <key>` |
+| 单次调用 | `omp -p`（text 默认）/ `omp -p --mode json`（结构化事件流） |
+| 有界运行 | `--max-time <duration>` |
+
+**结论**：§7.3 的 custody 契约要的「**持久 run 身份**」omp 给得出（rpc 会话 + `--provider-session-id` + `--resume`）。所以本面不是「daemon 降级为一次性子进程」，而是在 **`-p` 单次委派** 与 **`--mode rpc` 常驻会话** 之间做选择——这是一个待定的设计选择（§13），不是被迫的退让。
+
+仍成立的落差：账号由 code agent 自持（延续 `claudexor_daemon.py` docstring 的「Zero auth logic lives here」立场，是延续而非倒退）；钉定对象从「Node 运行时 + archive sha256」改为「code agent 版本 + 启动方式」。
 
 ## 8. 工作面 D — 循环
 
@@ -395,13 +441,13 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 | Engram 项目解析歧义 | 本仓一个 MCP server 下操作多项目目录 | §5.3 透传 typed 失败，禁止吞错误后降级写错项目 |
 | Engram 可用性 | 外部二进制依赖 | §5.7 本仓供给 + pin 校验；缺失时 fail-fast，不静默降级成「无记忆」（会退化成每次冷启动） |
 | tier-0 变空 | `context_layout.py` 的 `TIER0_ALWAYS_FULL` 是数据不变量 | §5.11 分级降级契约 |
-| 身份读路径不对称 | Engram 读按 project 分域 | §5.5 每次两次召回或显式 `project` |
+| account 级知识读路径 | Engram 读默认按 project 分域 | §5.5 用 `scope: personal`/`global` 并传显式 scope，不依赖 cwd 解析 |
 
 ## 11. 验证策略
 
 **A 面（记忆）**
 - 现象：一次会话 `mem_save` 一条知识 → 重启运行时 → 新会话 `mem_search` 取回。
-- **读路径（§5.5）**：在一个 project 任务里确认 account 级 topic（如 `self/scratchpad`）仍被召回（只验「写入后能搜回」不够）。tier-0 的 `identity` / `patterns` / `improvement-backlog` 走文件通道，不经此路径。
+- **读路径（§5.5）**：写入一条 `scope: global` 的 account 级 observation → 在**任意一个 project** 的任务里确认它被召回；同时确认 project 级观察没有串味。tier-0 的 `identity` / `patterns` / `improvement-backlog` 走文件通道，不经此路径。
 - **捕获期（§5.4）**：同一次任务中 max 与 low 两次投影的 `core_sha256` 一致。
 - **降级（§5.11）**：停掉 Engram → tier-0 的 Engram 块显示显式缺口标记，且 `identity` / `patterns` / `improvement-backlog` **仍然渲染**。
 - **迁移（§5.14）**：迁移后原文件仍在原位（逐文件断言）；`mem_search` 能命中迁移前 `knowledge/` 的已知 topic。
@@ -450,8 +496,17 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 
 ## 13. 待定项
 
-- §5.14 中 `task_reflections.jsonl` 的导入策略（全量导入 vs 最近 N 条；**原文一律保留**已是定论，待定的是导入量）。
-- §5.5 里 `self/*` 的固定 project 名（建议 `ouroboros-self`）是否采用；若采用，需确认它与 `.engram/config.json` 的 `project_name` 校验规则相容（Engram 对未背书名 fail-loud）。
-- §7.4 code agent 的**首发后端**（omp 已确认是目标）与钉定形态；是否需同时支持多 code agent 探测。
-- Engram 的 `--tools=agent`（19 个）中**具体哪几个进主循环工具面** vs 只给评审面（`mem_review` / `mem_judge` / `mem_compare` 的归属）。
-- §5.8 memory protocol 落在 `prompts/SYSTEM.md` 的具体位置与篇幅（受 P7「prompts are code」约束，需与现有 section 预算协调）。
+**已由本轮调研解决**（原待定项）：
+
+- ~~Engram MCP 工具档与具体裁剪~~ → 用 `--tools=agent`（19 个）。是否暴露 `mem_review` / `mem_judge` / `mem_compare` 给主循环仍待剪裁，但这是**工具面配置**，不阻塞规格。
+- ~~`self/*` 的固定 project 名与 `.engram/config.json` 相容性~~ → 不需要固定 project。改用 Engram 的 `scope: personal|global`（§5.5）。
+- ~~code agent 钉定形态~~ → omp 有 `--mode rpc`（常驻 JSON-over-stdio，带 `ready` 帧与协议版本协商）+ `--provider-session-id` + `--resume`，钉定对象是 omp 版本与启动方式（§7.4）。
+- ~~memory protocol 的落点~~ → 从 Engram 自带的 `DOCS.md §Memory Protocol` 裁剪进 `prompts/SYSTEM.md`（§5.8）。
+
+**仍未决**：
+
+- §5.14 中 `task_reflections.jsonl` 的导入量（全量 vs 最近 N 条；**原文一律保留**已是定论）。
+- §5.2 的通道选择：MCP stdio（绕开开关）vs 本地 HTTP/Socket。规格倾向后者，但需要一次实测确认 `/context` 的 `max_bytes` 与 `compact` 组合能否满足 §5.11 的 tier-0 渲染契约。
+- §7.4 的委派形态：`omp -p` 单次 vs `omp --mode rpc` 常驻会话。取决于 §7.3 的「缺席查询」实测结果。
+- §7.3 的缺口实测：`omp --resume <不存在的 id>` 的退出码/错误码，能否支撑 `daemon_says_absent` 的正向「不存在」回答。
+- Engram 的 `scope: global` 是否会被 `all_projects=true` 之外的操作意外包含，需确认它对 tier-0 的语义（是否真的跨 project 可见且不污染 project 级召回）。
