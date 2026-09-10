@@ -1,5 +1,5 @@
 goal: 在 /home/fy/Projects/code/ouroboros 切断「保留下来的模块」对「将被删除的模块」的全部 import 依赖，使 server 与 supervisor 在探针集 12 个「将被整体删除」的模块缺席时仍能正常启动。本阶段不删除任何文件，只改接线。第 11 条 AC 专门覆盖局部 import 与子进程 import 清单这两个探针盲区。
-task_type: artifact
+task_type: code
 brownfield_context:
   project_type: brownfield
   context_references: []
@@ -67,3 +67,5 @@ metadata:
   degraded: false
   unresolved_slots: []
   recovery_reason: null
+orchestrator:
+  execution_mode: legacy

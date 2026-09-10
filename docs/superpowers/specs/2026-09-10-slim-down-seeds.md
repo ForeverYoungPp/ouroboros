@@ -557,16 +557,18 @@ reason='Fat-harness verifier failed (unsupported evidence claims:
 
 **而 AC-0.1 的机械门其实是通过的**（实测：worktree 里 12 行探针全 `EXIT=0`）——被拒是**证据接地**问题。
 
-**为什么 `code` profile 必然拒**：`profiles/code.yaml` 的
+**触发的是 unsupported-claims 路径，不是 `tests_passed == []`**：`orchestrator/evidence/verification.py:104`
+逐字段用 `_runtime_messages_support_command_claim` 核对叶子声明的每条命令，`:129` 生成
+`no concrete claim values`。完整 reason 显示**叶子确实产出了非空 `tests_passed`**（其中包含
+`uv run --locked python -m pytest tests/test_gateway_parity.py …` 这类真命令），**也**把那段 `mv` 循环
+同时记进 `commands_run` 与 `tests_passed` —— 两类**运行时记录支持不了的声明**才是被拒的原因。
 
-```yaml
-verifier_capability: subprocess_test_runner
-evidence_schema:
-  required: [files_touched, commands_run, tests_passed]
-  rejected_if: [tests_passed == []]
-```
-
-要求非空 `tests_passed`，而移文件跑 import / `git diff` / 静态 grep 这类 AC **结构上产不出**。
+**两个推论**：
+1. 换 `artifact` profile 只去掉 `tests_passed` 这条**轴**（`code` 的 `required` 含它、且
+   `rejected_if: tests_passed == []`），**`commands_run` 仍然会被逐条核对** —— 所以那段 mv 循环的声明
+   **换不换 profile 都必须消失**。
+2. 治本的是「让叶子报出的命令**确实被执行且可接地**」。改成**单条**命令即可同时消掉两类未接地声明：
+   mv 循环的声明、以及「把探针伪装成测试」。
 
 **两项修法（已落地并双树实测）**：
 
