@@ -35,7 +35,7 @@
 
 ### acceptance_criteria
 
-> **权威版在 `docs/superpowers/specs/seed-0-import-graph.yaml`（`seed_934e30c1d249`，10 条 AC）。** 下面是同一内容的可读摘要；形态已按 §6.1 第 2 条的要求写成「命令 + 逐字期望输出/退出码」。
+> **权威版在 `docs/superpowers/specs/seed-0-import-graph.yaml`（`seed_e9c361a11a71`，**11** 条 AC——第 11 条 `AC-0.11` 专门覆盖 import 探针的盲区，见 `seed-0-hitlist.md`）。** 下面是同一内容的可读摘要；形态已按 §6.1 第 2 条的要求写成「命令 + 逐字期望输出/退出码」。
 
 **两个模块集合（这是原稿最大的缺口——它从未列出模块，只各探一个，执行器可能漏一批而 AC 全绿）：**
 
@@ -217,11 +217,11 @@
 
 | | `ooo auto`（访谈路径） | `generate_seed`（无访谈） |
 |---|---|---|
-| Seed | `seed_a9a10a35dff0` | **`seed_934e30c1d249`**（已存 `docs/superpowers/specs/seed-0-import-graph.yaml`） |
+| Seed | `seed_a9a10a35dff0` | **`seed_e9c361a11a71`**（已存 `docs/superpowers/specs/seed-0-import-graph.yaml`；落盘后补入 `AC-0.11`，故为 11 条） |
 | 等级 | **B** | 歧义 0.20（结构性上限，非评分）；`degraded: false` |
 | `unresolved_slots` | **`[acceptance_criteria]`** | **`[]`（零）** |
 | 中断原因 | `Partial product: yes (reason: interview_phase_deadline)` | —— |
-| AC 是否结构化 | ❌（只把 AC-0.4 收进 `verification_plan`） | ✅ 10 条全带 `semantic_ac_key` |
+| AC 是否结构化 | ❌（只把 AC-0.4 收进 `verification_plan`） | ✅ 11 条全带 `semantic_ac_key` |
 
 **结论：Seed 1/2/3/4 一律走 `session_context`。** 但**理由不是「访谈路径在这个仓收敛不了」**（那是我的错误归因），而是：**访谈跑满了它的 10 轮预算、自我裁决了 13 项、只在 `acceptance_criteria` 这一项上没收敛——而 AC 恰好就是我从错误通道（`user_preferences`）送进去的那一项。** 详见 §6.5.1 的权威记录与 §6.1 第 2 条的机制。
 
@@ -360,6 +360,8 @@ ModuleNotFoundError: No module named 'ouroboros.mcp'
 > 会被执行，其余行被当作路径，我那个 `if` 守卫落在第二行故从未运行。重写为单行后 `.pth` 确实执行，
 > 才拿到上面两条真结论。（教训与 §6.7 同源：否定性结论也要先证明「检测本身有效」。）
 
+**另有一条已实测的更优修法（`-P`，argv 作用域，零传播）**，见下节「首选修法」。
+
 **冲突的本质**：两者需要**相反的** `sys.path` 行为——工具要 cwd **不在**路径上（才能解析自己的 `ouroboros`），而探针要 cwd **在**路径上（才能 `import server`）。同一环境变量无法同时满足。
 
 **可行的收口（择一，均需 Owner 决定）**：
@@ -371,3 +373,41 @@ ModuleNotFoundError: No module named 'ouroboros.mcp'
 **本文件保持不篡改 `~/.omp/agent/mcp.json`**：那是用户的 harness 配置，且改它需要重启 omp 才生效，副作用又如上。
 
 **可以确定的结论**：`ooo` 无法干净地在「自己的源码仓」上执行——这是**工具与项目同名**导致的，不是配置疏漏。
+
+### 6.9 首选修法（已实测）：给 worker 的 argv 插一个 `-P`
+
+`ooo` 0.54.3 的 `_spawn_worker` 用固定 argv 启动 worker：
+
+```python
+[sys.executable, "-m", "ouroboros.mcp.detached_worker", str(request_path)]
+```
+
+补上 `-P`（`PYTHONSAFEPATH` 的 **CLI 等价物**）即可：
+
+```python
+[sys.executable, "-P", "-m", "ouroboros.mcp.detached_worker", str(request_path)]
+```
+
+**为什么 `-P` 是正确形状**：`-P` 是 **argv 作用域**，**不经 env 传播**——worker 自己解析到已安装的
+`ouroboros.mcp`，而它派生的每一个子进程（AC-0.1/0.2/0.3/0.9/0.10 的探针、`runtime_backend: omp`）
+**照旧保留 cwd 在 `sys.path` 上**。影响半径 = **恰好这一个进程**，且 **11 条 AC 一条都不用改写**。
+
+**实测三条**（均在仓库 cwd 下）：
+
+| 检查 | 结果 |
+|---|---|
+| `python -m ouroboros.mcp.detached_worker` | ❌ `ModuleNotFoundError: No module named 'ouroboros.mcp'` |
+| `python -P -m ouroboros.mcp.detached_worker` | ✅ `usage: python -m ouroboros.mcp.detached_worker REQUEST.json` |
+| `python -P -c "… subprocess.run([sys.executable,'-c','…'])"` | ✅ 子进程 `sys.path[0] == ''`、cwd 下可见 `server.py` → **不传播** |
+
+**⚠️ 我先前提出的「删掉 `Popen` 的 `cwd=`」是错的（空操作）**：父 `ooo mcp serve` 进程的 cwd
+本身就是仓库（实测 pid 3816794 → `/home/fy/Projects/code/ouroboros`），删掉 `cwd=` 后子进程**继承父
+的 cwd，照样被遮蔽**。`cwd=` 之所以可去，只是因为 `detached_worker.py:184` 会自己 `os.chdir(request.cwd)`
+——所以正确形态是**钉到中性目录**（如 `tempfile.gettempdir()`）**或**加 `-P`，而**不是删掉**。
+
+**部署与维护**：
+- 打补丁于 `~/.local/share/uv/tools/ouroboros-ai/lib/python3.12/site-packages/ouroboros/mcp/detached_jobs.py:297`，
+  已留备份 `detached_jobs.py.orig-backup`。
+- **`uv tool upgrade ouroboros-ai` 会覆盖它**，升级后需重打（这是本方案唯一的长期成本）。
+- **值得上报上游**：工具本该用 `-P` 启动自己的 worker，否则任何顶层包名为 `ouroboros` 的项目都无法被它驱动。
+- **生效范围**：对**新起进程**立即生效（如 `ooo` CLI）；但**已加载该模块的长驻 `ooo mcp serve` 不会受影响**，走 MCP 路径需重启该 server。

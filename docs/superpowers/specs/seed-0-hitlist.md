@@ -11,8 +11,14 @@
 (b) **子进程 import 清单**——典型是 `update_merge.py:1085-1088` 的 post-apply smoke，
 路由崩会变成「应用成功但 smoke 失败」→ 静默回滚。
 
-**扫描口径**：`(from|import)\s+.*\b(memory|consolidator|memory_tools|cost_projection|_usage_response|_usage_rows|_usage_rows_memo|claudexor_daemon|claudexor_runtime|claudexor|claudexor_accounts|claudexor_quota)\b`
-（`\b` 使 `claudexor` 不误吞 `claudexor_daemon`）。结果：**49 个文件命中**。
+**扫描口径**（与 seed 里 AC-0.11 的**逐字命令**一致，即 `(from|import)[^\n]*\b$m\b`，注意**没有** `\s+`）：
+`(from|import)[^\n]*\b(memory|consolidator|memory_tools|cost_projection|_usage_response|_usage_rows|_usage_rows_memo|claudexor_daemon|claudexor_runtime|claudexor|claudexor_accounts|claudexor_quota)\b`
+（末尾 `\b` 使 `claudexor` 不误吞 `claudexor_daemon`）。结果：**50 个文件命中**。
+
+> 口径必须与 AC 的 oracle 一致：宽松式（无 `\s+`）比严格式**多出 1 个文件**——`ouroboros/gateway/projects.py:713`，
+> 那是 `log.debug("api_project_from_task: in-memory project_id update failed for %s", ...)`，
+> 其中 `project_from_task` 提供 `from`、`in-memory` 提供 `memory`，是**散文不是 import**（归 `not-a-target`）。
+> 若按严格式只报 49 个，执行器照 AC 的逐字命令复跑会多找到 1 条未处置条目，AC-0.11 的判定即失败。
 
 **处置口径**：
 - `not-a-target` — 命中落在**本身就要被整体删除**的文件内（随文件一起消失），或落在注释/文档字符串里（非 import 语句）。
@@ -51,6 +57,7 @@
 | `server.py:1275` | 注释（project B's memory） |
 | `workers.py:1535` | 注释（long-term memory） |
 | `tools/knowledge.py:34` | 文档字符串（`memory/knowledge`） |
+| **`gateway/projects.py:713`** | **字符串**：`log.debug("api_project_from_task: in-memory project_id update failed for %s", …)`——`project_from_task` 提供 `from`、`in-memory` 提供 `memory`。**只有宽松式正则命中它** |
 
 ## 三、`relocating`：保护集/保留模块引用了将被删除模块的符号（符号必须存活）
 
@@ -155,7 +162,7 @@ claudexor 的 handler 登记进那个列表的地方。**删掉它们必然改�
 
 ## 覆盖性自查（AC-0.11 的判定条件）
 
-- **49 个文件全部落格**：一(5) + 二(11) + 三(11 行 + 1 备注) + 四(15) + 五(16 行 explicit + 2 行 relocating+explicitly-unavailable) + 六(7)。
+- **50 个文件全部落格**：一(5) + 二(12) + 三(11 行 + 1 备注) + 四(15) + 五(16 行 explicit + 2 行 relocating+explicitly-unavailable) + 六(7)。
 - **无未覆盖条目**：每一个命中行都在上面某张表里出现。
 - **两类盲区均被点名**：
   - (a) 函数内局部 import → 第五节 `server_control.py:162`（panic 分支，被 `except: pass` 吞掉）。
