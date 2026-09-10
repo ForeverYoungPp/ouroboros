@@ -53,6 +53,7 @@ from ouroboros.task_finalization import (
     build_swarm_efficiency as _build_swarm_efficiency,  # moved (module ceiling); tests import it here
     deliver_final_message_live, prepare_terminal_send_event, register_final_answer_owed, stamp_root_final_phase,
     sealed_final_prompt_section, terminal_result_fields,
+    record_project_letters_home,
 )
 from ouroboros.usage_accounting import BudgetExceeded
 from ouroboros.dialogue_provenance import is_presence_task, presence_provenance_fields
@@ -825,67 +826,12 @@ def emit_task_results(
         # letters-home too — the locked main path owns those (v6.33.0 WS10
         # idempotency contract; claudexor B5). ``_ephemeral`` is computed once near
         # the top of this function (it also gates the durable task-record writes).
-        from ouroboros.project_facts import resolve_project_id
-
-        _project_scoped = bool(resolve_project_id(task))
-        # A project THREAD conversation runs on the fast direct-chat lane. It is
-        # project-scoped only for CONTEXT (it sees the project's knowledge/
-        # journal), but it is NOT a pooled task completion: it must not block the
-        # reply on LLM post-processing and must not write letters home (that
-        # would turn every "как дела?" into a journal milestone + a consciousness
-        # observation and stall the global chat lock). Only real pooled project
-        # tasks get the letters-home + blocking treatment.
-        _is_direct_chat = bool(task.get("_is_direct_chat"))
-        _project_task = _project_scoped and not _is_direct_chat and not _ephemeral
-        if _project_task:
-            # Letters home (v6.32.0): record the cycle in the project's own
-            # journal and emit a concise completion digest for consciousness
-            # (project_id + full objective + outcome). Full project awareness:
-            # this is a crisp "task finished" summary, not an isolation boundary —
-            # the one mind already sees the project thread in its unified memory;
-            # only per-cycle RAW internal facts stay in the per-project store.
-            _pid = resolve_project_id(task)
-            # The full objective IS the meaning of the cycle — carry it whole into
-            # the journal milestone and the consciousness digest (BIBLE P1: no
-            # silent/lossy clip of cognitive text). Objectives are concise by
-            # nature; the task and task_results remain the durable record.
-            _objective = str(
-                task.get("objective") or task.get("description") or task.get("text") or ""
-            )
-            _exec_status = str((outcome_axes.get("execution") or {}).get("status") or "unknown")
-            try:
-                # One fail-soft seam (project_journal.record_task_finalization) for
-                # the durable letters home: the task-finished milestone, the Q8
-                # off-registry work-location row, and — for the swarm ROOT — the
-                # tree-ledger coordination mirror. Kind compares against the
-                # canonical execution-axis constants (EXECUTION_OK is "ok"; a raw
-                # "success" literal never matched — the C9.1 seed bug).
-                from ouroboros.tools.project_journal import record_task_finalization
-
-                record_task_finalization(
-                    _pid,
-                    task,
-                    objective=_objective,
-                    kind="done" if _exec_status in (EXECUTION_OK, EXECUTION_BEST_EFFORT) else "blocked",
-                    exec_status=_exec_status,
-                    # Registry lives on the canonical drive; stamps the durable
-                    # per-project last-result pointer.
-                    drive_root=pathlib.Path(str(task.get("budget_drive_root") or env.drive_root)),
-                )
-            except Exception:
-                log.debug("project journal finalization entries failed", exc_info=True)
-            try:
-                pending_events.append({
-                    "type": "project_digest",
-                    "project_id": _pid,
-                    "task_id": str(task.get("id") or ""),
-                    "objective": _objective,
-                    "execution_status": _exec_status,
-                    "objective_status": str((outcome_axes.get("objective") or {}).get("status") or "not_evaluated"),
-                    "ts": utc_now_iso(),
-                })
-            except Exception:
-                log.debug("project digest emission failed", exc_info=True)
+    _project_scoped = record_project_letters_home(
+        task, pending_events, outcome_axes,
+        env_drive_root=str(env.drive_root), ephemeral=_ephemeral,
+    )
+    _is_direct_chat = bool(task.get("_is_direct_chat"))
+    _project_task = _project_scoped and not _is_direct_chat and not _ephemeral
         budget_drive_root = str(task.get("budget_drive_root") or "").strip()
         split_drive = bool(
             budget_drive_root

@@ -1203,7 +1203,7 @@ def _candidate_symlink_escapes(
                 path = name
         elif line.startswith(b"@@"):
             in_hunk = True
-        elif line.startswith(b"\ No newline at end of file"):
+        elif line.startswith(b"\\ No newline at end of file"):
             continue  # git metadata, never link content
         elif is_link and in_hunk and line.startswith(b"+") and link_target is None:
             link_target = line[1:].decode("utf-8", errors="surrogateescape")

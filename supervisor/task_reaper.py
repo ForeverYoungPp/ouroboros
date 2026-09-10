@@ -1228,6 +1228,56 @@ def _respawn_after_reap(q: Any, workers_mod: Any, worker_id: int) -> None:
         log.debug("Reaper: failed to persist queue snapshot after respawn", exc_info=True)
 
 
+def _send_reaper_incident_notice(notice: Dict[str, Any]) -> None:
+    """Deliver the reaper's incident notice to the task's chat (guarded, C4).
+
+    ``notice`` keys: chat_id, task_id, terminal_reason, runtime_sec, worker_id,
+    requeued, new_attempt, retry_suppression, ceiling_reached, deadline_reached,
+    orchestrator, toast_once. A notification failure (e.g. a torn-down bus
+    during shutdown) must never abort the reaper before respawn.
+    """
+    if notice.get("chat_id") is None:
+        return
+    task_id = str(notice.get("task_id") or "")
+    try:
+        if notice.get("requeued"):
+            send_with_budget(
+                notice["chat_id"],
+                f"🛑 {notice['terminal_reason']}: task {task_id} killed after {int(notice['runtime_sec'])}s.\n"
+                f"Worker {notice['worker_id']} restarted. Task queued for retry attempt={notice['new_attempt']}.",
+                is_progress=True, task_id=task_id,
+                progress_meta={"task_incident": "task_reaper_retry", "toast_once": notice["toast_once"]},
+            )
+        elif notice["retry_suppression"].get("kind") == "cancel_intent":
+            send_with_budget(
+                notice["chat_id"],
+                f"🛑 {notice['terminal_reason']}: task {task_id} killed after {int(notice['runtime_sec'])}s.\n"
+                "Its retry was suppressed because cancellation won the "
+                "admission race; cancellation custody is settling the task.",
+                is_progress=True,
+                task_id=task_id,
+                progress_meta={
+                    "task_incident": "task_reaper_cancel_suppressed_retry",
+                    "toast_once": notice["toast_once"],
+                },
+            )
+        elif not notice["retry_suppression"]:
+            stop_detail = _stop_detail(
+                notice.get("ceiling_reached"),
+                notice.get("deadline_reached"),
+                notice.get("orchestrator"),
+            )
+            send_with_budget(
+                notice["chat_id"],
+                f"🛑 {notice['terminal_reason']}: task {task_id} killed after {int(notice['runtime_sec'])}s.\n"
+                f"Worker {notice['worker_id']} restarted. {stop_detail}",
+                is_progress=True, task_id=task_id,
+                progress_meta={"task_incident": "task_reaper_stopped", "toast_once": notice["toast_once"]},
+            )
+    except Exception:
+        log.debug("Reaper: failed to send owner notification for %s", task_id, exc_info=True)
+
+
 def reap_timed_out_task(job: Dict[str, Any]) -> None:
     """Full teardown for a timed-out task, run OFF the supervisor loop (Variant A).
 
@@ -1484,40 +1534,20 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
         # abort the reaper before respawn, or the slot would stay reaping=True forever.
         # C4: the notice goes to the TASK'S chat; owner chat only as absent-binding fallback.
         incident_chat_id = _incident_chat_id(task, owner_chat_id)
-        if incident_chat_id is not None:
-            try:
-                if requeued:
-                    send_with_budget(
-                        incident_chat_id,
-                        f"🛑 {terminal_reason}: task {task_id} killed after {int(runtime_sec)}s.\n"
-                        f"Worker {worker_id} restarted. Task queued for retry attempt={new_attempt}.",
-                        is_progress=True, task_id=task_id,
-                        progress_meta={"task_incident": "task_reaper_retry", "toast_once": incident_toast_once},
-                    )
-                elif retry_suppression.get("kind") == "cancel_intent":
-                    send_with_budget(
-                        incident_chat_id,
-                        f"🛑 {terminal_reason}: task {task_id} killed after {int(runtime_sec)}s.\n"
-                        "Its retry was suppressed because cancellation won the "
-                        "admission race; cancellation custody is settling the task.",
-                        is_progress=True,
-                        task_id=task_id,
-                        progress_meta={
-                            "task_incident": "task_reaper_cancel_suppressed_retry",
-                            "toast_once": incident_toast_once,
-                        },
-                    )
-                elif not retry_suppression:
-                    stop_detail = _stop_detail(ceiling_reached, deadline_reached, orchestrator)
-                    send_with_budget(
-                        incident_chat_id,
-                        f"🛑 {terminal_reason}: task {task_id} killed after {int(runtime_sec)}s.\n"
-                        f"Worker {worker_id} restarted. {stop_detail}",
-                        is_progress=True, task_id=task_id,
-                        progress_meta={"task_incident": "task_reaper_stopped", "toast_once": incident_toast_once},
-                    )
-            except Exception:
-                log.debug("Reaper: failed to send owner notification for %s", task_id, exc_info=True)
+        _send_reaper_incident_notice({
+            "chat_id": incident_chat_id,
+            "task_id": task_id,
+            "terminal_reason": terminal_reason,
+            "runtime_sec": runtime_sec,
+            "worker_id": worker_id,
+            "requeued": requeued,
+            "new_attempt": new_attempt,
+            "retry_suppression": retry_suppression,
+            "ceiling_reached": ceiling_reached,
+            "deadline_reached": deadline_reached,
+            "orchestrator": orchestrator,
+            "toast_once": incident_toast_once,
+        })
 
         if not requeued and not retry_suppression:
             # AR2-5a ordering: salvage first (it registers the answer as OWED in
