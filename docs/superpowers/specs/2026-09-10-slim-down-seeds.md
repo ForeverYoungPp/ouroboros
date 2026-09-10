@@ -594,3 +594,32 @@ reason='Fat-harness verifier failed (unsupported evidence claims:
 - **AC-6** 写了 `pytest web/tests -q`，但那 60 个用例是 **Node** 的（`web/package.json`:
   `"test": "node --test tests/*.test.js"`）→ pytest 收集不到、exit 5。已改为 `node --test web/tests/*.test.js`。
 - **AC-9** 写了 `collect_routes()`，而签名是 `collect_routes(*, data_dir, …)`，`data_dir` 必填 → 恒 TypeError。已传 `data_dir=pathlib.Path('.')`（对齐 `server.py:2731`）。
+
+**换 `artifact` profile 也救不了（实测）**：用包自己的
+`_effective_evidence_schema_for_ac` 逐条算「生效 schema」，两个 profile 各只挪动一个字段：
+
+```
+task_type=code      → 每条 required=[files_touched, commands_run, tests_passed]
+                       rejected_if=[tests_passed == []]
+task_type=artifact  → 每条 required=[files_touched, commands_run]
+                       rejected_if=[files_touched == []]
+（只有 AC-4/AC-5 命中 validation-only，丢掉 files_touched；判定在
+ orchestrator/evidence/ac_classification.py，要「英文动作词 + 测试信号词」同时出现）
+```
+
+→ `artifact` 只是把要求从 `tests_passed` 挪到 `files_touched`，而 AC-7（`git diff`）/AC-9
+（`collect_routes`）/AC-10（保护集 import）/AC-11（静态扫荡）**只读、不碰文件**，`files_touched == []`
+照样把它们拒掉。
+
+**根因是形态不匹配**：fat-harness 的证据契约假设「每条 AC = 一处小代码改动 + 跑项目测试」，而本 seed 的 AC 是
+**全仓机械断言**（命令 + 期望退出码）。把探针包成 pytest 用例、或把描述措辞调到能过 validation-only 正则，
+都是**让判据去迁就门**，而不是迁就任务。
+
+**决定：`orchestrator.execution_mode: legacy`**（`run.py:468-492` 原文：*"Explicit opt-out of
+verify-by-default: fall back to the self-report runner. **This is the supported escape hatch, not an
+error.**"*）。`task_type` 回到 `code`（工具/axis/min_unit 更贴合重构）。
+
+- **放弃的保证**：LLM 验收器 + typed-evidence 绑定。
+- **补偿**：每条 AC 都带精确 `verify_command`，且这些命令已被**独立地在真实 worktree 上跑过**，
+  复现出预期的通过/失败集合（见本节末的双树表）。
+- **保留**（在任何验收器下都正确）：三条探针**不再移动文件**，叶子无法再报出不可接地的 mv 循环声明。
