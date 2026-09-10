@@ -37,6 +37,32 @@
 
 取值：`"root"`（默认）| `"subagent"` | `"background"`（`tool_capabilities.py:8`）。
 
+**取值没有类型级校验器**——`grep` 全仓找不到 `VALID_DELEGATION_ROLES` 之类的枚举，拒绝只发生在**表面**（`cli.py:187-188`、`gateway/tasks.py:487-488` 对外部面拒绝任何非 `root` 值）。
+
+**但「单一来源」已经被测试钉住**，这是本设计的重要支持性证据：
+
+```python
+# tests/test_owner_live_delivery.py:93-102
+def test_consciousness_stamps_the_shared_background_role(self):
+    # Literal-drift pin: the producer (consciousness) and the gate
+    # (owner_delivery) must share ONE constant, not two literals.
+    import inspect
+    from ouroboros import consciousness
+    src = inspect.getsource(consciousness)
+    assert "BACKGROUND_DELEGATION_ROLE" in src
+    assert '"delegation_role": "background"' not in src
+```
+
+即：本仓**已经**用源码文本断言强制「角色值只能有一个定义、消费方引用它而非复制字面量」。轴 B 的设计正是把这条既有纪律从「一个值」扩展到「一整组属性」。
+
+### 1.3 第三个轴：`sender_identity`（呈现层，**不动**）
+
+| 轴 | 字段 | 取值 | 消费点 |
+|---|---|---|---|
+| **C：呈现** | `sender_identity` | `"agent"`（`tools/control.py:2231` 预设）/ `"background"`（`tools/owner_delivery.py:77` 强制） | `gateway/history.py:859`（渲染用） |
+
+它决定 UI 怎么标这条消息，不决定谁能做什么。**本设计不动它。**
+
 ## 2. 关键发现：两个轴被压进一个字段
 
 | 轴 | 含义 | 取值 | 本质量 |
@@ -47,7 +73,7 @@
 `background` 是**轴 B 的值被写进了轴 A 的字段**。证据链：
 
 1. **BG 没有血缘。** 它不建 task、无 `parent_task_id`、不参与任务树、不经队列准入、无委派预算。它是单例 + 自有触发。
-2. **但消费点按轴 A 读它。** `tools/owner_delivery.py:67` 用同一个字段决定投递模式（BG → `sender_identity="background"` + cycle-end 延迟）；`tools/core.py:2397` 用同一个字段拒绝 `escalate`（「background cognition has no owner-interactive loop and no parent」——**这句注释自己就承认了它是「无父」的血缘异常**）。
+2. **但消费点按轴 A 读它。** `tools/owner_delivery.py:67-77` 用同一个字段做**两件不同的事**——强制 `sender_identity="background"`（轴 C，呈现，**保留**）并返回 `_deferred()`（轴 B，投递模式，**应迁走**）。`tools/core.py:2397` 用同一个字段拒绝 `escalate`（「background cognition has no owner-interactive loop and no parent」——**这句注释自己就承认了它是「无父」的血缘异常**）。
 3. **`tools/core.py` 同一函数里两轴各判一次，且依赖检查顺序才没出事。**
 
    ```
@@ -89,20 +115,23 @@ CognitionSurface {
 }
 ```
 
-| 现由 `delegation_role` 承担 | 改由轴 B 承担 |
-|---|---|
-| `owner_delivery.py:67` 的投递模式 | `surface.delivery` |
-| `core.py:2397` 的 escalate 拒绝 | `surface.gates` |
-| `consciousness.py` 的白名单与 partition | `surface.tool_visibility` / `surface.context` |
+| 现由 `delegation_role` 承担 | 归属 | 处理 |
+|---|---|---|
+| `owner_delivery.py:67-77` 的 `_deferred()`（cycle-end 延迟） | 轴 B | → `surface.delivery` |
+| `owner_delivery.py:77` 的 `sender_identity="background"` | **轴 C（呈现）** | **不动** |
+| `core.py:2397` 的 escalate 拒绝 | 轴 B | → `surface.gates` |
+| `consciousness.py` 的白名单与 partition | 轴 B | → `surface.tool_visibility` / `surface.context` |
 
 轴 A 的判定（`== "subagent"`）**一处不改**。
 
 **收益**：第三个认知面 = 一条新声明，不是给血缘字段加值、也不是再散一组 `if`。
 
+**实现约束（沿用既有纪律，不新发明）**：`tests/test_owner_live_delivery.py:93-102` 已经用 `inspect.getsource` 钉住「角色值只有一个定义、消费方引用常量而非复制字面量」。轴 B 的每个 surface 值必须遵守同一条，并让该测试覆盖新声明——否则这次重构会亲手把自己想消除的问题重新引进来。
+
 ## 5. 不变量（不可违反）
 
 1. **能力上限是结构性的，不是 prompt 级的。** 需要更少工具的角色拿到**更小的注册表**，绝不拿到全量注册表 + 指令。
-2. **轴 A 的安全属性不动**：host 持有、防伪造、`subagent` 只能经内部工具产生。
+2. **轴 A 与轴 C 不动**：`delegation_role` 的 host 持有、防伪造、`subagent` 只能经内部工具产生（`cli.py:187-188`、`gateway/tasks.py:487-488`），以及 `sender_identity` 的呈现语义（`agent` / `background`），一律保持原样。
 3. **R2 是 P0 的实现，不是 R1 的一种模式。** 不因「共用代码更省」而把 R2 变成 R1 的一次任务。
 4. **角色失败互相隔离**：R2 异常不得影响 R1 的任务执行，反之亦然。
 5. **identity 写入路径保持单一**，两个角色经同一工具，R2 额外承担完整度闸门。
@@ -131,6 +160,8 @@ CognitionSurface {
 | 权威闸门 | 预算 / deadline / 验收 | identity 完整度 |
 | 投递模式 | 常规 | cycle-end 延迟 |
 
+`sender_identity`（轴 C）**不在此表**——它不是角色专有项：两个角色都可能产出 `agent` 呈现，BG 只是**强制**覆盖成 `background`（`owner_delivery.py:77`）。它保持现状，不并入 surface 声明。
+
 ## 8. 明确不合并的一项：两个收件箱
 
 | | `owner_mailbox.py` | `consciousness` 观察收件箱 |
@@ -144,7 +175,7 @@ CognitionSurface {
 
 ## 9. 提议的改法（按依赖顺序）
 
-1. **引入轴 B 的声明（`CognitionSurface`）**，把投递模式、escalate 闸门、白名单、partition 从 `delegation_role` 的读取中移出。轴 A 一处不改。**行为不变，可独立验证。**
+1. **引入轴 B 的声明（`CognitionSurface`）**，把投递模式、escalate 闸门、白名单、partition 从 `delegation_role` 的读取中移出。轴 A 与轴 C 一处不改。**行为不变，可独立验证。** 每个 surface 值只定义一次，并扩展 `tests/test_owner_live_delivery.py:93-102` 的 `inspect.getsource` pin 覆盖新声明（§4 的实现约束）。
 2. **把 deep self-review 登记为第三个 surface**，消除「面存在但无声明」的不一致。
 3. **收缩 `consciousness._execute_tool`**：保留白名单、identity 闸门、周期收据；把 ctx 绑定与执行交给共享原语。前置条件见 §10。
 4. **让 BG 不再伪造 task 身份**——依赖第 1 步把「工具读 `delegation_role`」的消费点全部改到轴 B 之后才可能。
