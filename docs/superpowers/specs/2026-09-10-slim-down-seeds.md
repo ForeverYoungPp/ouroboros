@@ -56,6 +56,7 @@
 - **AC-0.8** 三条逐字契约（HTTP 503 body 形状 / 异常类型与定义位置 / 工具缺席时的返回）——见 seed 文件与 §6.2。
 - **AC-0.9** `collect_routes()` 在改动前后输出**同一个整数**。
 - **AC-0.10** 保护集 6 个模块**仍可 import**：一条 `python -c "import ouroboros.semantic_dedup, ouroboros.usage_accounting, ouroboros.usage_ledger, ouroboros.pricing, ouroboros.reflection, ouroboros.tools.knowledge; print('OK')"` 期望输出 `OK` 且退出码 0。
+- **AC-0.11（探针盲区的静态兜底）** 对 12 个模块名逐个 `grep -rn --include='*.py'` 扫 `ouroboros/ supervisor/ server.py`，交出**完整命中清单**，且**每一处命中**都标注处置结论（`severing` / `relocating` / `explicitly-unavailable` / `not-a-target`）。判定：不允许存在未被覆盖的条目。**为什么必需**：AC-0.1/0.2/0.3 的探针只覆盖三个入口的 **import 期传递闭包**，下列两类命中在那时**根本不会执行**因此永远探不到——(a) **函数内局部 import**（`server_control.py:161-165` 的 panic 分支，且被 `except Exception: pass` 吞掉）；(b) **子进程 import 清单**（`update_merge.py:1085-1088` 的 post-apply smoke，路由崩会变成「应用成功但 smoke 失败」→ 静默回滚）。另需逐条判定：`gateway/onboarding.py:441-446`、`delegate_containment.py:132/184`、`subagents.py:419-491`、`review_thread_continuity.py`、`tools/delegate.py`、`tools/plan_review_runtime.py`。
 
 ### constraints
 
@@ -222,7 +223,7 @@
 | 中断原因 | `Partial product: yes (reason: interview_phase_deadline)` | —— |
 | AC 是否结构化 | ❌（只把 AC-0.4 收进 `verification_plan`） | ✅ 10 条全带 `semantic_ac_key` |
 
-**结论：对这个 251k 行的 brownfield 仓，访谈路径收敛不了** —— Seed 1/2/3/4 一律走 `session_context`。
+**结论：Seed 1/2/3/4 一律走 `session_context`。** 但**理由不是「访谈路径在这个仓收敛不了」**（那是我的错误归因），而是：**访谈跑满了它的 10 轮预算、自我裁决了 13 项、只在 `acceptance_criteria` 这一项上没收敛——而 AC 恰好就是我从错误通道（`user_preferences`）送进去的那一项。** 详见 §6.5.1 的权威记录与 §6.1 第 2 条的机制。
 
 ### 6.5.1 根因是 AC 的**形态**，不是内容
 
@@ -237,11 +238,25 @@ Open gaps: acceptance_criteria
 
 `flags.jsonl` 给出闭环原因：`closure_route: partial_seed_from_evidence`、`ledger_ready: False`、`degraded_seed` 且 `recovery_reason: interview_phase_deadline`。
 
-**`questions.jsonl` 的前 4 条是同一个点**（「不可用契约」/AC-0.8 的断言欠定），ambiguity 逐轮上升 **0.21 → 0.33 → 0.35**；第 2 条原文就点破了原因：
+**`questions.jsonl` 的逐条正文长度（实测）**：
 
-> 被切断能力在模块缺席时的「显式不可用」契约，**本轮上下文里同一面给出了三套互相矛盾的写法**……
+```
+ 1. len=173   切断后，那些被删模块原本支撑的运行时能力……该以什么契约呈现
+ 2. len=501   被切断能力在模块缺席时的「显式不可用」契约，本轮上下文里同一面给出了三套互相矛盾的写法……
+ 3. len=501   (ambiguity: 0.21) AC-0.8 的断言（status≠200 且 body 含 "unavailable"）对三种候选 503 body 全通过，测试因此欠定……
+ 4. len=396   (ambiguity: 0.33) AC-0.8 对 POST /api/cost-breakdown 的断言……同样全通过
+ 5..10. len=0   ← 空
+```
 
-而 `Decision provenance: user_confirmed 10` 说明**我送去的 `user_preferences` 被记成了 10 条「用户确认」**——其中就包括把我整份 AC 列表当成某个具体问题的答案。**那三套互相矛盾的写法，源头是我自己发过两版 AC-0.8**（第一版散文、第二版带逐字 tuple），两版在 ledger 里并存。
+**以及轮预算（实测 `~/.ouroboros/config.yaml`）**：`clarification.max_interview_rounds: **10**`——它**覆盖**了 auto 会话里记的 50。所以访谈是**跑满预算**的。
+
+**准确表述**：
+
+> 它在**同一个点**上连问 **4 轮未收敛**（ambiguity 0.21 → 0.33）→ 随后 **6 个空槽空转** → 由 phase deadline 以 **partial seed** 收场。
+
+两个我先前说错的表述：❌「停在 round 1」——那是被访谈会话文件的 `rounds: 1` 误导；❌「跑了 10 个有效问题」——其中 6 条正文为空。
+
+**`Decision provenance: user_confirmed 10`** 则是我 `user_preferences` 污染的量化证据：我那批偏好被记成了 10 条「用户确认的决策」，其中就包括把我整份 AC 列表当成某个具体问题的答案。**访谈第 3/4 轮抱怨的「三套互相矛盾的 503 写法」，源头是我自己发过两版 AC-0.8**（第一版散文、第二版带逐字 tuple），两版在 ledger 里并存。
 
 **形态要求**（访谈应答器的系统提示）：
 
