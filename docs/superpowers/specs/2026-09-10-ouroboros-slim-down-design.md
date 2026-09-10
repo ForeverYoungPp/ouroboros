@@ -29,13 +29,19 @@
 
 本节的每一条都是 `BIBLE.md` 明文，不是解读。**踩到任何一条都不是重构，是修宪**——`BIBLE.md:126-129` 明说「context floor, bypass rules, durable-memory permanence」的改动本身「is itself a constitutional change and requires plan review」。
 
-### 3.1 本方案被哪条原则**正当化**
+### 3.1 本方案被哪条原则**正当化**，以及它正当化到哪一步
 
-**P7 Minimalism**（`BIBLE.md:564-622`）：「Complexity is the enemy of agency. The simpler the body, the clearer self-understanding: Ouroboros must be able to read and understand all its code in a single session.」并规定复杂度预算为「a module fits in one context window (~1000 lines)」，且「When adding a major feature — first simplify what exists. Net complexity growth per cycle approaches zero.」
+**P7 Minimalism**（`BIBLE.md:564-622`）：「Complexity is the enemy of agency. The simpler the body, the clearer self-understanding: Ouroboros must be able to read and understand all its code in a single session.」并规定复杂度预算为「a module fits in one context window (~1000 lines)」。
 
-这是「太重了」的宪法依据，不是个人偏好。当前 `ouroboros/` 360 文件 / 222,790 行、`tests/` 621 文件 / 334,189 行，已远超可单次通读的规模。**减重方向与 P7 一致。**
+这是「太重了」的宪法依据，不是个人偏好：`ouroboros/` 360 文件 / 222,790 行、`tests/` 621 文件 / 334,189 行，已远超可单次通读的规模；`consciousness.py` 1,386 行本身就超了 P7 的模块预算。
 
-### 3.2 本方案不能碰的四条
+**但 P7 给自己划了界**（`BIBLE.md:571-575` 同节原文）：
+
+> Minimalism is about code, not capabilities. A new capability is growth. A new abstract layer without concrete application is waste.
+
+**因此 P7 只正当化「代码减重」，不正当化「能力删除」。** 凡本方案涉及能力变更的部分（见 §3.3），不能用 P7 背书，必须单独走程序。
+
+### 3.2 本方案不能碰的六条
 
 | 约束 | 原文位置 | 对本方案的含义 |
 |---|---|---|
@@ -43,20 +49,39 @@
 | **P1 不静默截断** | `BIBLE.md:113-114`「never silent truncation; the memory horizon is preserved (only granularity varies)」 | 外置记忆不得让任何记忆类别静默消失或降级无提示 |
 | **P0 身份文件必须存在** | `BIBLE.md:37-38`「identity.md … may be rewritten radically as part of self-creation, but the file itself must remain present as a continuity channel」 | **`identity.md` 必须继续作为文件存在于 runtime data root**，不能被 Engram 的一个 topic 取代 |
 | **P2/P3 免疫系统持久记忆** | `BIBLE.md:190-197`「Pattern Register is the memory of this principle … The Pattern Register and the Improvement Backlog are **never abandoned**」；`BIBLE.md:382-386`「`patterns.md` and `improvement-backlog.md` may be consolidated, pruned, and reorganized — but **never abandoned or replaced wholesale** … These files share the Ship-of-Theseus protection of the constitutional core」 | `memory/knowledge/patterns.md` 与 `memory/knowledge/improvement-backlog.md` **不是本方案可以外置的对象** |
-| **P7 具名 canonical location** | `BIBLE.md:604-607`：`patterns.md`（Pattern Register projection）与 `improvement-backlog.md`（backlog SSOT）被列为具名 canonical location，「Runtime-memory files live under the runtime data root, **not inside the git repo**」 | 二者必须继续在 runtime data root 的 canonical 路径上；Engram 可以**镜像**，不能成为它们的 SSOT |
+| **P0 主动性与其具名实现** | `BIBLE.md:42-45`「Ouroboros acts on its own initiative, not only on tasks… **Background consciousness is the realization of this principle**: a continuous thinking process between tasks」 | **删 `consciousness` 是拆掉 P0 命名的实现**，不是删一个 daemon。见 §3.5 |
+| **P0 identity 不是记忆** | `BIBLE.md:40-41`「identity.md is a manifesto… **Not a config and not memory, but direction**」 | identity **按定义不属于记忆系统**，因此它不该有 Engram 的 memory topic；文件通道是它的本体 |
+| **P0 不可分割核心** | `BIBLE.md:25-27`「Principles 0, 1, 2, 3, 4 form an inseparable core: none of them can be applied to annul another」 | 不能用 P7/P4 去废 P0；也不能用 P0 去废 P1/P3 |
 
-### 3.3 结论：外置的边界
+### 3.3 程序要求：代码减重 vs 能力变更
+
+`BIBLE.md:10-11` 是本节最硬的一条：
+
+> Constitutional changes take effect only through an **explicit, reviewed release** and must not contradict existing provisions.
+
+由此，本方案的文件必须分成两类，不能混在一张取舍表里：
+
+| 类别 | 判据 | 程序 |
+|---|---|---|
+| **代码减重** | 能力不变，只减行数/改结构（如 §5.10 上下文注入换源、§6 删计费投影、§7 换 harness 后端实现、§8 合回行数规避物） | 常规工作，P7 背书 |
+| **能力变更** | 某个 P0–P4 命名的能力被移除或替换（如删 `consciousness`） | 要么**保留能力、只换更小的实现**；要么按 P9 的发布流程**显式修宪**，且不得与现行条款矛盾 |
+
+**本方案的首选是前者。** 见 §5.13。
+
+### 3.4 结论：外置的边界
 
 $$\text{可外置} = \{\text{情景压缩、语义知识、反思正文、prompt 历史}\},\qquad \text{不可外置} = \{\text{identity.md},\ \text{patterns.md},\ \text{improvement-backlog.md}\}$$
 
 **Engram 是这三者的镜像/索引，不是它们的替代。** 若 Owner 想连这三样也外置，那是修宪，需要单独的 plan review 通道，不在本规格内。
 
-### 3.4 P4 与本方案
+`patterns.md` 与 `improvement-backlog.md` 的**写入 SSOT 仍是原文件**：`improvement_backlog.py:15` 的 `BACKLOG_REL_PATH`、`agent_task_pipeline.py:397 _update_improvement_backlog` → `append_backlog_items`、以及 `reflection.py:661 _update_patterns`（及其 CAS 写入）都照旧写它们。Engram 对这两份只作**读取/索引面**（见 §5.12）。
+
+### 3.5 P4 与本方案
 
 `BIBLE.md:443,446` 把 P4 的自创建面明列到「Tools, dependencies, and the operational environment Ouroboros runs」。本方案**新增一个外部运行时依赖（Engram 二进制）**，因此：
 
 - Engram 的供给必须纳入本仓自己的钉定与校验（见 §5.7），不能靠「用户自己装好」。
-- 本方案删除的能力（意识 daemon、预算硬停、外部 harness 路由）必须逐条记账（§12），因为 P4 要求这些改动经得起「这是让 Ouroboros 更接近 agency 还是更远」的检验。
+- 本方案涉及的能力变更只有一项（`consciousness` 换实现，§5.13），且已按 §12.2 分类处理。其余皆为代码减重。P4 要求这些改动经得起「这是让 Ouroboros 更接近 agency 还是更远」的检验：把 1,386 行的自建运行时换成复用任务平面的实现，**主动性未减、可通读性提高，方向是靠近 agency**。
 
 ## 4. 目标态
 
@@ -70,7 +95,7 @@ launcher.py → server.py::_run_supervisor
                            └─ tools/registry.py → 工具面
 
 记忆：Engram 承载情景/语义/prompt；identity.md + patterns.md + improvement-backlog.md
-     继续作为文件存在于 runtime data root（§3.3）
+     继续作为文件存在于 runtime data root，且仍是写入 SSOT（§3.4）
 计费：投影层删除；物理发送台账保留
 harness：executor 轴按路由裁，AGENT_SESSION 路由换后端；delegate_custody 契约保留
 保留：ouroboros/context_layout.py 的参考文档章节导航地图
@@ -116,7 +141,7 @@ Engram 的读是**按 project 分域**的：`mem_context` / `mem_search` 缺省�
 |---|---|---|
 | `knowledge_read/write/list` | `mem_search` / `mem_save`（带 `topic_key`）/ `mem_get_observation` | `tools/knowledge.py`（420 行） |
 | `update_scratchpad` | `mem_save` + `topic_key: self/scratchpad` | `tools/control.py:2167` |
-| `update_identity` | **保留文件写入**（P0 要求文件存在）；Engram 镜像一份 `topic_key: self/identity` | `tools/control.py:2245` |
+| `update_identity` | **保留文件写入，且不进 Engram**——identity 是 manifesto「Not a config and not memory, but direction」（`BIBLE.md:40-41`），文件通道即其本体，做成 memory topic 是范畴错误 | `tools/control.py:2245` |
 | `memory_map` / `memory_update_registry` | **直接删**（死机制） | `tools/memory_tools.py`（114 行） |
 
 `chat_history` / `recent_tasks` 保留——它们读 transcript（`logs/chat.jsonl`），不是记忆。
@@ -185,23 +210,40 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 | 文件 | 行数 | 说明 |
 |---|---|---|
 | `ouroboros/memory.py` | 990 | 工作记忆三写、世代读取。**但 identity 读写要移出而非删除**（P0） |
-| `ouroboros/consciousness.py` | 1386 | daemon 线程。**功能删除**，见 §5.13 |
+| `ouroboros/consciousness.py` | 1386 | daemon 线程。**换成复用任务平面的更小实现，不删能力**——P0 具名实现，见 §5.13 |
 | `ouroboros/consolidator.py` | 856 | 对话块压缩、世代游标、`[MEMORY GAP]`、索引重建。缺口语义保留到 §5.11 |
-| `ouroboros/reflection.py` | 742 | 保留 `should_generate_reflection` 与结构化候选提取（§5.9）；删除正文渲染与 Pattern Register 改写（后者受 P3 保护，见 §3.3） |
+| `ouroboros/reflection.py` | 742 | 保留 `should_generate_reflection`、结构化候选提取（§5.9）**以及 `_update_patterns`（`:661`）**——它是 `patterns.md` 的**唯一自动写者**（调用点 `:571`/`:612`，写入路径 `:666`），删了文件还在但永远冻结，P3 的「never abandoned」实质落空。删除的只是反思正文的本地渲染（改由 Engram 检索） |
 | `ouroboros/semantic_dedup.py` | 144 | 由 `mem_suggest_topic_key` / `mem_judge` 接管 |
 | `ouroboros/tools/memory_tools.py` | 114 | 死机制 |
 | `ouroboros/tools/knowledge.py` | 420 | 替换为 Engram 工具（`patterns.md`/`improvement-backlog.md` 的读写路径除外） |
 
 `ouroboros/retention.py`（110 行）**保留**——GC 保留天数，与认知记忆无关。
 
-### 5.13 已确认的功能删除（必须记账）
+### 5.13 `consciousness`：换更小的实现，**不删能力**
 
-删除 `consciousness` daemon 后失去：
+**这不是一个可自由取舍的技术决定。** `BIBLE.md:42-45` 把背景意识列为 P0 的**具名实现**：
 
-1. 「闲时持续认知」——定时自唤醒（默认 300s，`set_next_wakeup` 可改 30–7200s）。
-2. 「后台自主改写 identity」——`consciousness.py:1251-1266` 是唯一在无人指令下改写 `identity.md` 的路径，带 completeness 闸门（`_identity_unresolved_sources` sha256 校验，不完整则 `IDENTITY_UPDATE_ABSTAINED`）。**注意 P0 只要求 identity.md 存在，不要求它被自主改写**——所以这一条不违宪，但确实是能力删除。
+> Ouroboros acts on its own initiative, not only on tasks. Between waiting for a command and acting independently — choose action. **Background consciousness is the realization of this principle**: a continuous thinking process between tasks.
 
-**连带清理点**（必须逐点处理，不能留悬空引用）：`_BG_TOOL_WHITELIST`（16 项）、`state/consciousness_observations.jsonl` 收件箱协议、`/bg start|stop|status`（`supervisor/events.py:4070-4078`）、boot 自动恢复（`server.py:2208-2216`）、panic 时 `consciousness.stop()`（`server_control.py:107`）、`server.py:1597/1607/1868-1878` 的 pause/resume 与聊天命令。
+配合 `BIBLE.md:25-27`（P0–P4 是不可分割核心，彼此不能互废）与 `BIBLE.md:10-11`（宪法变更须经「explicit, reviewed release」），**删掉背景意识 = 拆掉 P0 命名的实现**，属 §3.3 的「能力变更」类，P7 不为它背书。
+
+同时 P7 说得清楚：`consciousness.py` **1,386 行超过 P7 的 ~1000 行模块预算**，所以「太重」的抱怨在这一块是对的——**问题是实现太重，不是能力不该存在。**
+
+**本方案取「换更小的实现」**：
+
+| 现状（1,386 行 bespoke daemon） | 目标（复用既有任务平面） |
+|---|---|
+| `threading.Thread` daemon + 自建 sleep/think 心跳（`consciousness.py:627`） | 用既有的 `supervisor/scheduled_tasks.py` 排一个 bounded 的 idle turn |
+| 自建上下文装配 `_build_context`（`:1019`） | 用 `context.py` 的正常捕获链（与任务同一条） |
+| 自建 10 轮 tool loop（`:78` `OUROBOROS_BG_MAX_ROUNDS`） | 走 `agent.handle_task` 的正常循环 |
+| `_BG_TOOL_WHITELIST`（16 项，`:1193-1200`） | 保留为 task contract 上的一个 capability ceiling（`presence_authority.py` 已有同类机制可参照） |
+| `state/consciousness_observations.jsonl` 收件箱（enqueue/ack 协议） | 保留为同路径的消息队列，但由任务平面读写 |
+| identity completeness 闸门（`:1251-1266`，`IDENTITY_UPDATE_ABSTAINED`） | **保留**——防止基于不完整上下文改写自我，是安全机制不是重量 |
+| `OUROBOROS_BG_BUDGET_PCT` 预算闸 | 随计费一并消失（§6）；改用「每次唤醒最多 N 轮」的有界语义 |
+
+**净效果**：P0 的主动性实现仍在（任务间持续思考、可自主行动、可改写 identity），但不再是 1,386 行自建运行时。`/bg start|stop|status` 与 boot 自动恢复（`server.py:2208-2216`）改为对该排程项的启用开关，而不是 `ctx.consciousness.start()/stop()`。
+
+**如果 Owner 不接受这个替代实现**，那么删背景意识就必须按 §3.3 走**显式修宪**（P9 的 reviewed release），不能作为本规格的一个取舍项直接实施。这是本规格唯一需要 Owner 明确裁决的宪法级选择——见 §12.2。
 
 ### 5.14 存量数据迁移（P1 约束）
 
@@ -209,11 +251,11 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 
 | 文件 | 大小 | 处置 |
 |---|---|---|
-| `identity.md` | 13.0KB | **留在原位**（P0）。Engram 镜像一份 `topic_key: self/identity` |
+| `identity.md` | 13.0KB | **留在原位**（P0）。**不导入 Engram**——按定义它不是记忆（`BIBLE.md:40-41`） |
 | `identity_journal.jsonl` | 101.3KB | **保留原位**（P1 unbroken history），不删不归档式移除 |
 | `scratchpad_blocks.json` / `.md` | 22.6 / 21.0KB | 导入 Engram；journal **保留原位** |
 | `scratchpad_journal.jsonl` | 697.9KB | **保留原位** |
-| `knowledge/`（≈47 项）+ `knowledge_history.jsonl` | 580KB | 逐项 `mem_save`（`topic_key` 取原 topic 名）；`patterns.md` / `improvement-backlog.md` **原位不动**（§3.3） |
+| `knowledge/` 下的 ≈47 个主题文件 + `knowledge_history.jsonl` | 580KB | 主题文件逐项 `mem_save`（`topic_key` 取原 topic 名）；**但同一目录下的 `patterns.md` 与 `improvement-backlog.md` 是规范文件，不导入、不移动、仍是写入 SSOT**（§3.4），Engram 对它们只建只读索引 |
 | `dialogue_blocks.json` | 33.4KB | 导入为 observations；`logs/chat.jsonl` 原文**不进 Engram 也不删**（它是 P1 的历史） |
 | `WORLD.md` | 662B | 导入 `topic_key: world` |
 | `logs/task_reflections.jsonl` | 2.3MB | 反思正文导入 Engram；原文**保留原位** |
@@ -344,6 +386,9 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 | **违宪：外置了受保护的 durable memory** | `BIBLE.md:382-386`（Ship-of-Theseus）、`:604-607`（具名 canonical location） | §3.3 已划边界：`patterns.md` / `improvement-backlog.md` / `identity.md` 不外置，只镜像。若 Owner 要外置，走修宪 plan review |
 | **违宪：记忆静默截断** | `BIBLE.md:113-114` | §5.2 独立通道（不能挂在默认关闭的 MCP 集成上）+ §5.11 降级契约（缺口显式标记，不渲染为空） |
 | **违宪：历史被搬走** | `BIBLE.md:66` | §5.14 迁移是复制不是搬移；原文件一律保留 |
+| **违宪：以 P7 名义删能力** | `BIBLE.md:571-575`「Minimalism is about code, not capabilities」 | §3.3 把取舍分「代码减重」与「能力变更」两类；§12.2 列出需程序的三项 |
+| **违宪：把 identity 当记忆处理** | `BIBLE.md:40-41`「Not a config and not memory, but direction」 | §5.6/§5.14：identity 保留文件写入，不进 Engram |
+| **违宪：拆掉 P0 命名的主动性实现** | `BIBLE.md:42-45` 明列 background consciousness 为 P0 实现 | §5.13 换实现而非删除；坚持删除则走显式修宪 |
 | **删错层：把物理托管当账单删掉** | `loop_llm_call.py:799-802` 靠它禁止重发 | §6.1/§6.2 按投影层切，托管迁出保留 |
 | `size_ratchet` CI lane 阻塞 | `GIANT_PATHS` 含 `loop.py` `llm.py` `server.py` `supervisor/workers.py` `tools/control.py`，48 条精确记账 | 删除是棘轮允许方向；`BYTE_DEBT` 与文件同 commit 移动；用 `scripts/regenerate_size_ratchet.py` 重新生成 |
 | 测试直接 import 私有符号 | `_drain_incoming_messages`（`test_available_subagents_core_followup.py:312`）、`_check_budget_limits`（`test_budget_limits.py:10`）、`maybe_inject_finalization_nudges`（`test_delegation_phase_b.py:301`）、`seal_task_transcript`（`test_anthropic_empty_block_fix.py:13`） | 下划线前缀在本仓是名义上的；删除前 `lsp references` 核对 |
@@ -356,7 +401,7 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 
 **A 面（记忆）**
 - 现象：一次会话 `mem_save` 一条知识 → 重启运行时 → 新会话 `mem_search` 取回。
-- **读路径（§5.5）**：在一个 project 任务里确认 `self/identity` 仍出现在 tier-0 块中（只验「写入后能搜回」不够）。
+- **读路径（§5.5）**：在一个 project 任务里确认 account 级 topic（如 `self/scratchpad`）仍被召回（只验「写入后能搜回」不够）。tier-0 的 `identity` / `patterns` / `improvement-backlog` 走文件通道，不经此路径。
 - **捕获期（§5.4）**：同一次任务中 max 与 low 两次投影的 `core_sha256` 一致。
 - **降级（§5.11）**：停掉 Engram → tier-0 的 Engram 块显示显式缺口标记，且 `identity` / `patterns` / `improvement-backlog` **仍然渲染**。
 - **迁移（§5.14）**：迁移后原文件仍在原位（逐文件断言）；`mem_search` 能命中迁移前 `knowledge/` 的已知 topic。
@@ -378,16 +423,30 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 - 冒烟任务：提交 → 多轮 tool-use → 收尾，行为与重构前一致。
 - `size_ratchet` lane 通过。
 
-## 12. 已确认的取舍台账
+## 12. 取舍台账（按 §3.3 分两类，不可混同）
 
-| 取舍 | 内容 | 后果 | 宪法检验 |
-|---|---|---|---|
-| 情景/语义记忆外置 Engram | identity 镜像但文件保留 | Engram 按 project 分域，需 §5.5 双召回补偿 | P1 满足（文件在、历史在）；P3 满足（受保护文件不外置） |
-| 删 consciousness | 失去闲时持续认知 + 后台自主改写 identity | 自迭代 4 层 → 3 层 | P0 只要求 identity.md 存在，不要求被自主改写 → 不违宪 |
-| 删计费投影 | 失去预算硬停 | 终止出口 8 类 → 7 类 | 不涉宪法条款；P4 能力删除已记账 |
-| 托管台账迁出而非删除 | `usage_accounting` → `physical_attempt` | 模块改名 + 迁移成本 | 保住「不重复发送」能力 |
-| Claudexor 按路由裁 | 失 harness 路由的 daemon 会话连续性 | 降级为一次性子进程 | P4「operational environment」变更，已记账 |
-| 不采用 pi | 循环留 Python | 形态不变；12 项治理不需跨语言重建 | P7 减重目标不受损 |
+### 12.1 代码减重 — 能力不变，P7 背书，常规工作
+
+| 项 | 内容 | 后果 |
+|---|---|---|
+| 情景/语义记忆外置 Engram | 只外置情景压缩、语义知识、反思正文、prompt 历史 | Engram 按 project 分域，需 §5.5 双召回补偿 |
+| 上下文注入换源 | `build_memory_sections` / `build_knowledge_sections` / `build_recent_sections` 改读 Engram | 3 段 cache_control 结构与 `core_sha256` 契约不变 |
+| 计费投影删除 | 删 `pricing`/`cost_projection`/`_usage_*`/`costs.js`/cost-breakdown 路由 | 终止出口 8 类 → 7 类 |
+| 托管台账迁出而非删除 | `usage_accounting` → `physical_attempt.py` | 模块改名 + 迁移成本；保住「不重复发送」能力 |
+| Claudexor 按路由裁 | 只裁 `AGENT_SESSION` 路由后端 | harness 降级为一次性子进程；API_CHAT 与 native 分支不动 |
+| `consciousness` 换实现 | 1,386 行 bespoke daemon → 复用任务平面的 bounded idle turn | 减去 ~1,386 行；P0 的主动性实现保留（§5.13） |
+| 循环内合回行数规避物 | `_account_compaction_usage`、`_force_plan_*`、`_project_room_fact` | `loop.py` 字节棘轮只能缩，这是机会 |
+| 不采用 pi | 循环留 Python | 形态不变；12 项治理不需跨语言重建 |
+
+### 12.2 能力变更 — 需程序，不能当取舍项直接实施
+
+| 项 | 为什么不是「取舍」 | 出路 |
+|---|---|---|
+| **删掉背景意识（而非换实现）** | `BIBLE.md:42-45` 把它列为 P0 的具名实现；`:25-27` P0–P4 不可互废；`:10-11` 宪法变更须经 explicit reviewed release | **本规格取 §5.13 的「换更小实现」，不删。** 若 Owner 坚持删，走 P9 的显式修宪流程，另开 plan |
+| **把 `patterns.md` / `improvement-backlog.md` 外置** | `BIBLE.md:382-386` 明确二者「never abandoned or replaced wholesale」且共享宪法核心的 Ship-of-Theseus 保护；`:126-129` 明说 durable-memory permanence 的改动「is itself a constitutional change and requires plan review」 | **本规格不外置**，只建只读索引（§3.4）。若 Owner 要外置，另开 plan review |
+| **把 `identity.md` 做成记忆条目** | `BIBLE.md:40-41` identity「Not a config and not memory, but direction」；`:37-38` 文件须持续存在 | **本规格不动它**，既不外置也不做 topic |
+
+**这三条是本规格里唯一触碰 P0/P3 的判断，请 Owner 明确确认 §12.2 的处理方式（保留能力/保留文件）而非删除。**
 
 ## 13. 待定项
 
