@@ -142,6 +142,8 @@ Go 单二进制 + SQLite/FTS5，四个表面（CLI / HTTP API / MCP stdio / TUI�
 
 **`ambiguous_project` 在本仓是常态路径**（一个 MCP server 下操作多个项目目录）。Engram 要求调用方不得猜测，只能从 `available_projects` 精确选一，再用 `project` + `project_choice_reason: "user_selected_after_ambiguous_project"` 重试；另有 `project_name_collision`。封装层必须把它透传成 agent 可见的 typed 失败，**不得吞掉后降级写入错误项目**。
 
+**但常规写入路径不必依赖这条兜底**：§5.15 的 session 映射要求**永远显式传 `session_id`**，而 Engram 的写解析优先级里 `session_id` 的项目**先于** cwd 探测（`DOCS.md:846`）——所以会话内的写入项目是确定的。`ambiguous_project` 只在与既有会话无关的、显式的跨项目写入上才会遇到。
+
 ### 5.4 召回必须在捕获期，不在渲染期
 
 `context_fit.py:52-54` 的 `ContextFitProjection` docstring 是「One deterministic Low/Max rendering of a shared **immutable** context core」；`_projection(mode)` 会对 max 与 low **各渲染一次**（`:530`、`:567-568`）；`core_sha256` 由捕获到的 core 载荷算出（`:589`）。
@@ -232,7 +234,7 @@ Engram 是**策展式**记忆——写不写取决于 agent 自己被要求写�
 
 | 时机 | 动作 |
 |---|---|
-| session 开始 | `mem_current_project` 确认 + `mem_context` 恢复最近历史 |
+| session 开始 | `mem_current_project` 确认 + **`mem_session_start`（§5.15 的 session 映射，必须在首次写入之前）** + `mem_context` 恢复最近历史 |
 | 完成一个 bug fix / 决策 / 发现 / 约定 / 配置变更 | `mem_save`（`type` 选上表值；内容用 What / Why / Where / Learned） |
 | 演进中的主题 | 复用稳定 `topic_key`（如 `architecture/auth-model`）原地更新，不新建竞争记忆（无把握时先 `mem_suggest_topic_key`） |
 | session 结束 / 压缩前 | `mem_session_summary`（goal / instructions / discoveries / accomplished / next steps / relevant files） |
@@ -446,16 +448,43 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 | 活跃冲突注解 | 随 `mem_search` 结果**自带** | —— | 不需额外调用 |
 | 近期原文尾部 | 本地 `logs/chat.jsonl` | —— | **不经 Engram** |
 
-#### 明确声明**不复用**的 Engram 面（每条给理由，避免实施者自行发挥）
+#### 明确声明**不复用**的 Engram 面（**sessions 不在此列**——它必须映射，见下）
 
 | 面 | 理由 |
 |---|---|
 | `pinned` | **local-only，不参与同步**——pin 不改变 `updated_at`、不产生 mutation，多机/多 drive 下会不一致 |
-| `expires_at` | 过期即删除，与 P1「never silent truncation」（`BIBLE.md:113-114`）冲突；若要用必须配显式披露 |
+| `expires_at` | ⚠️ **待核实**：`DOCS.md` 的 schema 章节只给出列定义（`:54`），**查不到过期后的删除语义**（是软删、硬删，还是仅标记）。在核实前**不要启用**——若它确实会删除，则与 P1「never silent truncation」（`BIBLE.md:113-114`）冲突；若只是标记，则需定义谁读该标记 |
 | `mem_compare` | 主动建关系是 agent 的推理行为，**不由捕获期自动调用**（会把上下文捕获变成写入路径） |
 | embedding 列 | 保留为 Engram 内部实现；本仓不直接读 |
 
-**Engram 的 `sessions` 面也不复用**：它是 Engram 的记录单位，而本仓的会话身份是 `task_id` / `chat_id` 体系；两者不做映射，只靠 `project` + `scope` 对齐——否则会出现两套会话身份。
+#### Sessions：必须映射，不能声明「不复用」
+
+**原稿这句是错的，而且与 §5.8 直接冲突**（§5.8 要求「session 结束 / 压缩前 → `mem_session_summary`」）。更重要的是，**不映射会 fail-closed**：
+
+`DOCS.md:853-855` 的 `mem_save` 护栏原文——
+
+> If a non-empty `session_id` is supplied and **no session exists**, `mem_save` **fails with a structured error** and does not write.
+> When a write omits it, Engram uses the current process directory only to narrow **active non-manual runtime sessions** for the resolved project. It attaches to a session **only when exactly one candidate remains**, uses the project manual-save session when none remain, and **fails closed when multiple candidates remain**.
+> **Directory is not session identity**; callers with concurrent sessions **must supply `session_id`** or end other active matching sessions.
+
+**Ouroboros 天然并发执行多个任务**（worker 池 + 直聊 + 意识 + presence）→ 不显式传 `session_id` 就是「multiple candidates remain」→ **写入 fail-closed**。同时 `observations.session_id` 与 `user_prompts.session_id` 都是**外键**（`DOCS.md:54/56`），无会话的观察在结构上就是残缺的。
+
+**设计（映射）**：
+
+| 写作单位 | `session_id` | 建立 | 收尾 |
+|---|---|---|---|
+| 任务 | `task-<task_id>` | 该任务的**首次** `mem_save` 前调 `mem_session_start`（带 `directory` 与显式 `project`） | 任务终点的 post-task checkpoint（§5.9）里 `mem_session_end` + `mem_session_summary` |
+| 直聊轮次 | `chat-<chat_id>` | 该 chat 的首次写入 | 不单独收尾（`mem_session_summary` 属任务面） |
+| 后台意识 | `bg-consciousness`（**长期复用**） | 运行时启动时一次 | 不结束（它是 P0 的持续过程，§5.13） |
+| presence turn | `presence-<turn_id>` | 该 turn 的首次写入 | turn 终点 |
+
+**三条硬规则**：
+
+1. **永远显式传 `session_id`**，绝不依赖 cwd 附着——这是 `:855` 的明文要求，也是并发下的唯一正确做法。
+2. **`mem_session_start` 必须在首次写入之前**，否则 `:853` 的「no session exists」会把 `mem_save` 打回。
+3. **副产品：传 `session_id` 同时钉住了 project**（`:846` 的写解析优先级里 `session_id` 的项目先于 cwd 探测）——这**顺带消除了 §5.3 的 `ambiguous_project` 风险**（写入路径不再依赖 cwd 解析）。§5.3 仍需要对显式 `project` 的校验，但常规写入路径变确定了。
+
+**顺带解锁一个能力**：`GET /context/compaction?session_id=X` 是「严格限定到单个已持久化会话的运行时压缩上下文」——有了 session 映射，§5.4 的捕获期召回可以多一个精确入口。
 
 ---
 
@@ -840,6 +869,7 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 - **冲突裁决（§5.15-b）**：构造一次 `mem_save` 命中候选 → 返回 `judgment_required: true` → agent **确实调用** `mem_judge`；随后 `mem_search` 结果带出 `supersedes:` / `conflicts:` 注解。
 - **缺口通道（§5.15-c）**：造一个记忆缺口 → 它出现在 tier-0 且 BG 的 `update_identity` 被 abstain（回到 §5.6.1 的闸门）。
 - **复核分段（§5.15 检索表）**：`mem_review(action="list")` 的产物只出现在 **dynamic** 段——**不得**进 semi_stable（否则破坏缓存前缀，§15.1）。可对同一次任务断言 max/low 两次投影的 `core_sha256` 仍一致。
+- **session 映射（§5.15）**：并发跑两个任务，两者都写记忆 → **两次写入都成功**（证明显式 `session_id` 生效，没有落进 Engram 的 `fails closed when multiple candidates remain` 分支）；任务终点后 `mem_sessions/recent` 能看到该 session 且带 summary。
 
 **B 面（计费）**
 - 一次正常任务跑完不抛 `BudgetExceeded`；cost-breakdown 路由 404。
@@ -927,7 +957,8 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 **§5.15 记忆模型带出的决策（需 Owner 定）**：
 
 - **工作记忆的阈值与形态**（§5.15-a）：沿用 `context_budget` 的 `SCRATCHPAD_*` 量级，还是重定？被挤出的内容转 episodic observation 时，是否需要一个受控的确定性步骤（而非全靠 agent 自觉）？
-- **`pinned` 与 `expires_at` 是否启用**（§5.15 声明暂不复用）：`pinned` 是 local-only，多机不一致；`expires_at` 过期即删，与 P1「不静默截断」冲突。两者都要 Owner 明确表态，不能默认关。
+- **`pinned` 是否启用**（§5.15 声明暂不复用）：它是 **local-only、不参与同步**，多机/多 drive 下会不一致。
+- **`expires_at` 先核实再决定**（§5.15 标为待核实）：`DOCS.md` 只给列定义、没有删除语义；若是真删除则撞 P1「不静默截断」，若只是标记则要定义谁读它。**核实前不启用。**
 - **缺口通道的形态**（§5.15-c）：本地文件，还是 Engram 里一条 `topic_key: self/memory-gaps` 的 observation？后者可被检索但会在跨机同步里传播。
 - **`mem_compare` 是否开放给 agent**（§5.15 声明不由捕获期调用）：主动建关系是推理行为，是否给它一条显式工具面？
 
