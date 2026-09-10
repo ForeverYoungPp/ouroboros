@@ -22,6 +22,7 @@
 
 - **不引入 pi / TypeScript。** 理由**不是**跨语言边界——本仓已有 `claudexor_runtime_pin.json`（钉 claudexor 3.9.5 + Node 24.16.0，含 `archive_url`/`sha256`/`size_bytes`）+ `claudexor_daemon.py` 用 `process_custody` 拉起外部 Node daemon 的约 4,510 行已验证胶水，Node 伴随进程是既有模式而非新风险。理由是**能力覆盖**：pi 的 `Agent`/`agentLoop` 能替换的只有第①层（`while True` + tool dispatch + 事件流），而本循环真实拥有、SDK 没有的机制有 12 项（物理发送台账、不重发相同字节谓词、wire 投影逐项匹配、发送副本≠canonical transcript、fit/reclaim 三级节拍、轮顶外部权威改写、付费收尾、交付候选+验收绑定、可重入轮、cache_control 锚点、工具执行侧非功能约束、每轮可路由改写）。换来的复杂度大于省下的。
 - **不重构 `run_llm_loop` 的形态**。轮顶顺序、tool 回填、终止判定不变。
+- **不动 `consciousness`（第二个 agent 角色）**。本仓对 agent 定义了两个不同职责——任务 agent（`agent.py` → `run_llm_loop`，全量工具）与后台意识（`consciousness.py`，自有循环 + 独立 registry + 白名单）。本规格既不删也不合并这层边界（§5.13）。
 - **不动交互层**（presence 合并、hurry 降级、client_surface 删除留作后续独立规格）。
 - **不动 supervisor 的任务生命周期**。
 
@@ -64,9 +65,9 @@
 | 类别 | 判据 | 程序 |
 |---|---|---|
 | **代码减重** | 能力不变，只减行数/改结构（如 §5.10 上下文注入换源、§6 删计费投影、§7 换 harness 后端实现、§8 合回行数规避物） | 常规工作，P7 背书 |
-| **能力变更** | 某个 P0–P4 命名的能力被移除或替换（如删 `consciousness`） | 要么**保留能力、只换更小的实现**；要么按 P9 的发布流程**显式修宪**，且不得与现行条款矛盾 |
+| **能力变更** | 某个 P0–P4 命名的能力被移除或替换（本规格范围内**没有**此类改动——见 §12.2） | 要么**保留能力、只换更小的实现**；要么按 P9 的发布流程**显式修宪**，且不得与现行条款矛盾 |
 
-**本方案的首选是前者。** 见 §5.13。
+**本规格全部属于前者（代码减重）**——它的取舍台账（§12.1）不含任何能力变更项，涉及 P0/P3 保护对象的判断一律是「不动」（§12.2）。
 
 ### 3.4 结论：外置的边界
 
@@ -81,7 +82,7 @@ $$\text{可外置} = \{\text{情景压缩、语义知识、反思正文、prompt
 `BIBLE.md:443,446` 把 P4 的自创建面明列到「Tools, dependencies, and the operational environment Ouroboros runs」。本方案**新增一个外部运行时依赖（Engram 二进制）**，因此：
 
 - Engram 的供给必须纳入本仓自己的钉定与校验（见 §5.7），不能靠「用户自己装好」。
-- 本方案涉及的能力变更只有一项（`consciousness` 换实现，§5.13），且已按 §12.2 分类处理。其余皆为代码减重。P4 要求这些改动经得起「这是让 Ouroboros 更接近 agency 还是更远」的检验：把 1,386 行的自建运行时换成复用任务平面的实现，**主动性未减、可通读性提高，方向是靠近 agency**。
+- **本规格范围内不含任何 P0–P4 命名的能力变更**：`consciousness`（P0 具名实现）与 `identity.md` / `patterns.md` / `improvement-backlog.md`（P0/P2/P3 保护）全部不动（§12.2）。P4 的检验因此针对的是「新增一个外部运行时依赖是否让 Ouroboros 更接近还是更远 agency」——Engram 接管的是**记忆的实现**而非**记忆的决策权**，身份与免疫记忆的规范位置不变，方向是靠近。
 
 ## 4. 目标态
 
@@ -113,16 +114,18 @@ Go 单二进制 + SQLite/FTS5，四个表面（CLI / HTTP API / MCP stdio / TUI�
 
 把 tier-0 记忆挂在这条链上，等于让用户（或 agent 自己）关一个开关就静默丢掉 identity/scratchpad/knowledge——正好撞 P1 的「never silent truncation」。
 
-**决策**：Engram 走**独立的、不受 MCP 开关管辖的通道**。两条候选，都是 Engram 的一等表面：
+**决策：钉死 MCP stdio，不用 HTTP。** 用**专为本仓持有的独立 client 实例**（不是用户可管理的 server 条目）。
 
-| 通道 | 形态 | 取舍 |
-|---|---|---|
-| MCP stdio（自有 client 实例） | `engram mcp --tools=agent`（19 个 agent 面向工具；不带该档为全部 23 个） | 复用 `mcp_client.py` 的实现，但**必须绕开其 enable/allowlist 管辖** |
-| 本地 HTTP | `engram serve`，默认 `127.0.0.1:7437`；或 **`ENGRAM_SOCKET`** 指定的 POSIX Unix socket（socket 模式独占监听，不可与显式 `ENGRAM_PORT` 并用）；`ENGRAM_HTTP_TOKEN` 给 DELETE/export/import 加 Bearer | 不经过 MCP 开关，天生独立；且 `/context` 直接给了服务端渲染能力 |
+**安全理由（决定性）**：`ENGRAM_HTTP_TOKEN` 是**可选**的，且未设置时只有 `DELETE /sessions|observations|prompts`、`GET /export`、`POST /import`、`POST /projects/rescue-ownership` 要求 Bearer，**其余路由保持开放**——包括 `GET /context`、`GET /observations`、**`POST /observations`**（`DOCS.md:527`）。服务默认监听 `127.0.0.1:7437`（或 `ENGRAM_SOCKET` 的 socket）。选 HTTP 意味着**本机任意进程都能读写 Ouroboros 的知识库与工作记忆**。
 
-**倾向 HTTP/Socket**：它天然满足「不受 MCP 开关管辖」，并且 `/context` 端点提供了本方案需要的两个原语（见 §5.11）——`?max_bytes=N`（UTF-8 安全截断 + `[truncated]` 标记，上限 65536）与 `/context/compaction?session_id=X`（严格限定到单个已持久化会话的运行时压缩上下文）。
+而这批数据目前是带 flock 的本地文件、**此前没有任何监听面**。新增一个回环端口是纯粹新增的信任边界，与本仓既有 data-boundary 纪律（P3、`safety.py`、`agent_startup_checks.py`）相悖。stdio 是子进程 + 管道，**无监听面**，与「记忆是本仓的内部认知依赖」的定位一致。
 
-若最终仍选 MCP，则必须把 Engram 条目及其 enable 态声明为 **tier-0 不变量**，不可被普通设置关闭，且 `allowed_tools` 对它无效。
+**代价与缓解**：HTTP 的 `/context` 提供 `?max_bytes=N`（UTF-8 安全截断 + `[truncated]`，上限 65536）；MCP 的 `mem_context` **没有**对应的字节上限参数。缓解：本仓本来就在 `context_budget.py` 里管各 section 的字符预算，把 Engram 块的边界控制放在**客户端**（`_capture_context_core` 内），与既有做法一致，不引入新机制。
+
+**MCP 侧要做的两件事**：
+
+1. `engram mcp --tools=agent`（19 个 agent 面向工具；不带该档为全部 23 个）。
+2. **绕开 `mcp_client.py` 的 enable/allowlist 管辖**——见本节开头的证据，那套开关默认是关的，而 Engram 是认知依赖不是可选集成。做法：走独立的 client 实例，不注册进用户可见的 MCP server 列表；或把 Engram 条目声明为 **tier-0 不变量**，不可被普通设置关闭，`allowed_tools` 对它无效。
 
 ### 5.3 项目绑定
 
@@ -172,11 +175,12 @@ Engram 的读**默认按 project 分域**，但 observation 有第三个维度 `
 
 ### 5.8 必须补一节 memory protocol
 
-Engram 是**策展式**记忆——写不写取决于 agent 自己被要求写。本方案删掉了所有自动写入触发器：
+Engram 是**策展式**记忆——写不写取决于 agent 自己被要求写。本方案移除了两个**自动写入触发器**（它们的写入目标变成 Engram）：
 
-- `reflection.py::should_generate_reflection`（错误标记 / ≥15 轮 / ≥$5 / evolution 类门槛）
 - `consolidator.should_consolidate`（100 行门槛）
 - `should_consolidate_scratchpad`（≥3 块且 >30K 字符）
+
+**注意 `reflection.py::should_generate_reflection` 不在此列**——它被 §5.12 明确**保留**，因为它驱动的反思步正是 §5.9 要保住的自修改入口。只有其输出目标变了：正文进 Engram，`backlog_candidates` 仍进 `improvement-backlog.md`。
 
 若只把工具名换成 `mem_save` 而不规定**何时**写，重构后记忆写入会静默停摆——比丢掉 reflection 的 backlog 更彻底，且违反 P1。
 
@@ -233,7 +237,6 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 | 文件 | 行数 | 说明 |
 |---|---|---|
 | `ouroboros/memory.py` | 990 | 工作记忆三写、世代读取。**但 identity 读写要移出而非删除**（P0） |
-| `ouroboros/consciousness.py` | 1386 | daemon 线程。**换成复用任务平面的更小实现，不删能力**——P0 具名实现，见 §5.13 |
 | `ouroboros/consolidator.py` | 856 | 对话块压缩、世代游标、`[MEMORY GAP]`、索引重建。缺口语义保留到 §5.11 |
 | `ouroboros/reflection.py` | 742 | 保留 `should_generate_reflection`、结构化候选提取（§5.9）**以及 `_update_patterns`（`:661`）**——它是 `patterns.md` 的**唯一自动写者**（调用点 `:571`/`:612`，写入路径 `:666`），删了文件还在但永远冻结，P3 的「never abandoned」实质落空。删除的只是反思正文的本地渲染（改由 Engram 检索） |
 | `ouroboros/semantic_dedup.py` | 144 | 由 `mem_suggest_topic_key` / `mem_judge` 接管 |
@@ -242,31 +245,39 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 
 `ouroboros/retention.py`（110 行）**保留**——GC 保留天数，与认知记忆无关。
 
-### 5.13 `consciousness`：换更小的实现，**不删能力**
+### 5.13 `consciousness` 是第二个 agent 角色——本规格不动它
 
-**这不是一个可自由取舍的技术决定。** `BIBLE.md:42-45` 把背景意识列为 P0 的**具名实现**：
+**本仓对 agent 定义了两个不同职责，后台意识是其中之一**，且这是硬分界（实测）：
 
-> Ouroboros acts on its own initiative, not only on tasks. Between waiting for a command and acting independently — choose action. **Background consciousness is the realization of this principle**: a continuous thinking process between tasks.
+| | 任务 agent | 后台意识 |
+|---|---|---|
+| 循环 | `agent.py:1217 run_llm_loop` | 自有 `_loop:627` / `_think:694` / `_think_scoped:714`，**不调** `run_llm_loop` |
+| 工具面 | 全量注册表 | **独立的 `ToolRegistry` 实例**（`_build_registry:1203`）+ `_BG_TOOL_WHITELIST`（`:1193`）在 `_execute_tool:1244` **强制** |
+| 上下文 | `context.build_llm_messages` | 自有 `_build_context`（`partition="all"`） |
+| 触发 | owner / 队列 / 租约 | 定时自唤醒 + 观察注入 |
+| 生命周期 | worker 池按需 | 单例，`server.py:2208`、boot 自动恢复 |
 
-配合 `BIBLE.md:25-27`（P0–P4 是不可分割核心，彼此不能互废）与 `BIBLE.md:10-11`（宪法变更须经「explicit, reviewed release」），**删掉背景意识 = 拆掉 P0 命名的实现**，属 §3.3 的「能力变更」类，P7 不为它背书。
+`context_layout.py:6-7` 也明列**三个认知面**：main task context、background consciousness、deep self-review。
 
-同时 P7 说得清楚：`consciousness.py` **1,386 行超过 P7 的 ~1000 行模块预算**，所以「太重」的抱怨在这一块是对的——**问题是实现太重，不是能力不该存在。**
+**我上一版写的「`consciousness` 换成复用任务平面的 bounded idle turn」是错的，已撤回。** 那会拆掉角色边界：
 
-**本方案取「换更小的实现」**：
+- 独立 `ToolRegistry` 实例 + 白名单强制是**安全边界**，不是重复代码。并进任务平面等于把 119 项工具交给后台意识。
+- 意识没有队列/租约/交付语义，把它变成 task 会引入它本不需要的生命周期面。
 
-| 现状（1,386 行 bespoke daemon） | 目标（复用既有任务平面） |
-|---|---|
-| `threading.Thread` daemon + 自建 sleep/think 心跳（`consciousness.py:627`） | 用既有的 `supervisor/scheduled_tasks.py` 排一个 bounded 的 idle turn |
-| 自建上下文装配 `_build_context`（`:1019`） | 用 `context.py` 的正常捕获链（与任务同一条） |
-| 自建 10 轮 tool loop（`:78` `OUROBOROS_BG_MAX_ROUNDS`） | 走 `agent.handle_task` 的正常循环 |
-| `_BG_TOOL_WHITELIST`（16 项，`:1193-1200`） | 保留为 task contract 上的一个 capability ceiling（`presence_authority.py` 已有同类机制可参照） |
-| `state/consciousness_observations.jsonl` 收件箱（enqueue/ack 协议） | 保留为同路径的消息队列，但由任务平面读写 |
-| identity completeness 闸门（`:1251-1266`，`IDENTITY_UPDATE_ABSTAINED`） | **保留**——防止基于不完整上下文改写自我，是安全机制不是重量 |
-| `OUROBOROS_BG_BUDGET_PCT` 预算闸 | 随计费一并消失（§6）；改用「每次唤醒最多 N 轮」的有界语义 |
+**本规格对 `consciousness` 的处理：不动。** 既不删（P0 具名实现，见 §3.2），也不合并（角色边界）。`consciousness.py` **不在 §5.12 的删除清单内**。
 
-**净效果**：P0 的主动性实现仍在（任务间持续思考、可自主行动、可改写 identity），但不再是 1,386 行自建运行时。`/bg start|stop|status` 与 boot 自动恢复（`server.py:2208-2216`）改为对该排程项的启用开关，而不是 `ctx.consciousness.start()/stop()`。
+**它的减重是另一个独立子项目**，且我尚未做完判定「哪些是真重复、哪些是角色必需」的分析，因此**不在本规格内断言做法**。已能看出的大致分布（供后续立项，非结论）：
 
-**如果 Owner 不接受这个替代实现**，那么删背景意识就必须按 §3.3 走**显式修宪**（P9 的 reviewed release），不能作为本规格的一个取舍项直接实施。这是本规格唯一需要 Owner 明确裁决的宪法级选择——见 §12.2。
+| 块 | 行数 | 线索 |
+|---|---|---|
+| `_think_scoped` 单周期编排 | 246 | 角色必需 |
+| `_build_context` 自有上下文装配 | 184 | `context.py` 已支持 `partition="all"` 供此面使用，可能有重复 |
+| `_execute_tool` registry 管道 | 154 | `loop_tool_execution.py`(1546) 有相似管道；白名单部分角色必需 |
+| 观察收件箱协议（10 个函数：enqueue/ack/validate/index/summary/settlement-gap/锁） | ~352 | 与 `owner_mailbox.py`(550) 的 append-only + ack 形态相似 |
+| 心跳 `_loop` | 48 | 角色必需 |
+| 进度/遥测发射（4 个） | ~80 | 角色必需 |
+
+**线索不是结论**：收件箱与工具管道的「相似」是否真能共用，需要单独的对照分析（语义差异、并发假设、锁域）。列在这里只为说明这个子项目的规模，不为指示方案。
 
 ### 5.14 存量数据迁移（P1 约束）
 
@@ -405,9 +416,20 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 | 单次调用 | `omp -p`（text 默认）/ `omp -p --mode json`（结构化事件流） |
 | 有界运行 | `--max-time <duration>` |
 
-**结论**：§7.3 的 custody 契约要的「**持久 run 身份**」omp 给得出（rpc 会话 + `--provider-session-id` + `--resume`）。所以本面不是「daemon 降级为一次性子进程」，而是在 **`-p` 单次委派** 与 **`--mode rpc` 常驻会话** 之间做选择——这是一个待定的设计选择（§13），不是被迫的退让。
+**结论与决定**：§7.3 的 custody 契约要「**持久 run 身份**」，而**一次性 `-p` 无法满足**——每次调用都是新进程，没有可寻址的身份，崩溃后无从和解。因此本面的后端按 **`--mode rpc` 常驻会话**设计，不是 `-p` 单次委派：
 
-仍成立的落差：账号由 code agent 自持（延续 `claudexor_daemon.py` docstring 的「Zero auth logic lives here」立场，是延续而非倒退）；钉定对象从「Node 运行时 + archive sha256」改为「code agent 版本 + 启动方式」。
+| 需要 | 用什么 |
+|---|---|
+| 常驻会话 + 控制面 | `omp --mode rpc`（替代 Claudexor 的 socket + `/v2`）；`rpc.md` 有 `Session` / `Queue modes` / `Compaction` / `Retry` / `State` / `Prompting` 命令族，`/v2` 的控制面有对应落点 |
+| run 身份 | `--provider-session-id <id>` + `--session-dir <dir>` |
+| 崩溃后可达 | `--resume <id>` / `--session <id>`（配对 §7.3 的 `_reconcile_one`） |
+| 单次运行上界 | `--max-time <duration>`（对应原 daemon 的 per-call `timeout_sec` 语义，`gateways/claudexor.py:301-311`） |
+| 自有句柄 | 本仓自起该进程，用 `process_custody` 托管（沿用 `claudexor_daemon.py` 的 spawn 模板） |
+| 协议版本协商 | `ready` 帧 advertise `protocolVersion` 1/2；v2 提供 `rpc_chunk` 无损分片 |
+
+`--mode acp` 是备选（标准 Agent Client Protocol，若将来要接非本仓的宿主）。
+
+仍成立的落差：账号由 code agent 自持（延续 `claudexor_daemon.py` docstring 的「Zero auth logic lives here」立场，是延续而非倒退）；钉定对象从「Node 运行时 + archive sha256」改为「code agent 版本 + 启动方式」。**唯一待实测的缺口**见 §7.3 的「缺席查询」。
 
 ## 8. 工作面 D — 循环
 
@@ -434,7 +456,7 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 | **违宪：历史被搬走** | `BIBLE.md:66` | §5.14 迁移是复制不是搬移；原文件一律保留 |
 | **违宪：以 P7 名义删能力** | `BIBLE.md:571-575`「Minimalism is about code, not capabilities」 | §3.3 把取舍分「代码减重」与「能力变更」两类；§12.2 列出需程序的三项 |
 | **违宪：把 identity 当记忆处理** | `BIBLE.md:40-41`「Not a config and not memory, but direction」 | §5.6/§5.14：identity 保留文件写入，不进 Engram |
-| **违宪：拆掉 P0 命名的主动性实现** | `BIBLE.md:42-45` 明列 background consciousness 为 P0 实现 | §5.13 换实现而非删除；坚持删除则走显式修宪 |
+| **误动 P0 命名的主动性实现** | `BIBLE.md:42-45` 明列 background consciousness 为 P0 实现；它是本仓两个 agent 职责之一 | §5.13：本规格不动它。减重是独立子项目，先做对照分析 |
 | **删错层：把物理托管当账单删掉** | `loop_llm_call.py:799-802` 靠它禁止重发 | §6.1/§6.2 按投影层切，托管迁出保留 |
 | `size_ratchet` CI lane 阻塞 | `GIANT_PATHS` 含 `loop.py` `llm.py` `server.py` `supervisor/workers.py` `tools/control.py`，48 条精确记账 | 删除是棘轮允许方向；`BYTE_DEBT` 与文件同 commit 移动；用 `scripts/regenerate_size_ratchet.py` 重新生成 |
 | 测试直接 import 私有符号 | `_drain_incoming_messages`（`test_available_subagents_core_followup.py:312`）、`_check_budget_limits`（`test_budget_limits.py:10`）、`maybe_inject_finalization_nudges`（`test_delegation_phase_b.py:301`）、`seal_task_transcript`（`test_anthropic_empty_block_fix.py:13`） | 下划线前缀在本仓是名义上的；删除前 `lsp references` 核对 |
@@ -480,7 +502,6 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 | 计费投影删除 | 删 `pricing`/`cost_projection`/`_usage_*`/`costs.js`/cost-breakdown 路由 | 终止出口 8 类 → 7 类 |
 | 托管台账迁出而非删除 | `usage_accounting` → `physical_attempt.py` | 模块改名 + 迁移成本；保住「不重复发送」能力 |
 | Claudexor 按路由裁 | 只裁 `AGENT_SESSION` 路由后端 | harness 降级为一次性子进程；API_CHAT 与 native 分支不动 |
-| `consciousness` 换实现 | 1,386 行 bespoke daemon → 复用任务平面的 bounded idle turn | 减去 ~1,386 行；P0 的主动性实现保留（§5.13） |
 | 循环内合回行数规避物 | `_account_compaction_usage`、`_force_plan_*`、`_project_room_fact` | `loop.py` 字节棘轮只能缩，这是机会 |
 | 不采用 pi | 循环留 Python | 形态不变；12 项治理不需跨语言重建 |
 
@@ -488,7 +509,7 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 
 | 项 | 为什么不是「取舍」 | 出路 |
 |---|---|---|
-| **删掉背景意识（而非换实现）** | `BIBLE.md:42-45` 把它列为 P0 的具名实现；`:25-27` P0–P4 不可互废；`:10-11` 宪法变更须经 explicit reviewed release | **本规格取 §5.13 的「换更小实现」，不删。** 若 Owner 坚持删，走 P9 的显式修宪流程，另开 plan |
+| **改动 `consciousness`（删或合并）** | `BIBLE.md:42-45` 把它列为 P0 的具名实现；它还与本仓已定的「两个 agent 职责」分界重合（独立 registry + 白名单强制）；`:25-27` P0–P4 不可互废；`:10-11` 宪法变更须经 explicit reviewed release | **本规格完全不动它**——不删、不合并、不在 §5.12 的删除清单内。它的减重是**独立子项目**，需先做「哪些是真重复、哪些是角色必需」的对照分析，再按需走 P0 程序（§5.13） |
 | **把 `patterns.md` / `improvement-backlog.md` 外置** | `BIBLE.md:382-386` 明确二者「never abandoned or replaced wholesale」且共享宪法核心的 Ship-of-Theseus 保护；`:126-129` 明说 durable-memory permanence 的改动「is itself a constitutional change and requires plan review」 | **本规格不外置**，只建只读索引（§3.4）。若 Owner 要外置，另开 plan review |
 | **把 `identity.md` 做成记忆条目** | `BIBLE.md:40-41` identity「Not a config and not memory, but direction」；`:37-38` 文件须持续存在 | **本规格不动它**，既不外置也不做 topic |
 
@@ -506,7 +527,11 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 **仍未决**：
 
 - §5.14 中 `task_reflections.jsonl` 的导入量（全量 vs 最近 N 条；**原文一律保留**已是定论）。
-- §5.2 的通道选择：MCP stdio（绕开开关）vs 本地 HTTP/Socket。规格倾向后者，但需要一次实测确认 `/context` 的 `max_bytes` 与 `compact` 组合能否满足 §5.11 的 tier-0 渲染契约。
-- §7.4 的委派形态：`omp -p` 单次 vs `omp --mode rpc` 常驻会话。取决于 §7.3 的「缺席查询」实测结果。
-- §7.3 的缺口实测：`omp --resume <不存在的 id>` 的退出码/错误码，能否支撑 `daemon_says_absent` 的正向「不存在」回答。
+- §7.3 的缺口实测：`omp --resume <不存在的 id>` 的退出码/错误码，能否支撑 `daemon_says_absent` 的正向「不存在」回答。**这是本规格唯一可能超出「删文件 + 改接口」范围的风险点。**
 - Engram 的 `scope: global` 是否会被 `all_projects=true` 之外的操作意外包含，需确认它对 tier-0 的语义（是否真的跨 project 可见且不污染 project 级召回）。
+- Engram `--tools=agent` 的 19 项里，`mem_review` / `mem_judge` / `mem_compare` 是否暴露给主循环，还是只给评审面。属工具面配置，不阻塞规格。
+
+**明确排除在本规格之外**：
+
+- `consciousness` 的任何改动（§5.13）。它的减重是独立子项目，需先做对照分析。
+- 交互层（presence 合并、hurry 降级、client_surface 删除）。
