@@ -493,23 +493,27 @@ def _call_summarizer(
         prompt = (_SUMMARY_GUIDANCE
                   + "\nCall emit_context_summaries exactly once, with one entry for every source_id.\n"
                   + source_json)
+        # A FORCED tool choice is the stronger ask, so it stays the default and is
+        # kept on every route that accepts it (the DeepSeek gateways: 122/123
+        # parseable on DeepSeek-V4-Flash). Only the official DeepSeek endpoint
+        # pins tool_choice while thinking mode is on, where forcing it is a
+        # deterministic 400 and "auto" is what the endpoint accepts; the model is
+        # then asked rather than coerced, and a prose answer lands on the JSON path
+        # below with no extra call (no tool_calls => the validation wrapper returns
+        # immediately). See provider_models.rejects_forced_tool_choice.
+        from ouroboros.provider_models import rejects_forced_tool_choice
+
+        tool_choice = "required" if not rejects_forced_tool_choice(
+            str(spec.get("provider") or ""),
+            str(spec.get("resolved_model") or spec.get("model") or ""),
+            str(spec.get("base_url") or ""),
+        ) else "auto"
         try:
             from ouroboros.openai_chat_dispatch import call_with_custom_validation_continuation
             message, observed_usage, executable = call_with_custom_validation_continuation(
                 lambda request_messages: chat_observed(
                     client, messages=request_messages,
-                    # "auto", never "required": DeepSeek's thinking mode (ON by
-                    # default, and this lane sends no reasoning control at all)
-                    # rejects a forced tool_choice outright with 400
-                    # "Thinking mode does not support this tool_choice". Every
-                    # recorded compaction attempt that forced the choice took that
-                    # 400 and fell through to the JSON path, so the structured
-                    # branch had a 0-for-N success record (probed 2026-09-10).
-                    # The prompt already names the tool and demands one entry per
-                    # source_id, and the field is measured to be called under
-                    # "auto"; if a model answers in prose instead, the JSON path
-                    # below is exactly where a forced call would have landed.
-                    tools=[_CONTEXT_SUMMARIES_TOOL], tool_choice="auto", **common,
+                    tools=[_CONTEXT_SUMMARIES_TOOL], tool_choice=tool_choice, **common,
                 ),
                 [{"role": "user", "content": prompt}],
             )

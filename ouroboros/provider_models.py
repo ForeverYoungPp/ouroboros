@@ -587,6 +587,47 @@ def requires_reasoning_content_echo(provider: str, model: str, base_url: str = "
     return tail.startswith(_REASONING_CONTENT_ECHO_MODEL_PREFIXES)
 
 
+# --- Thinking-mode forced-``tool_choice`` constraint ---------------------------
+# DeepSeek's OFFICIAL endpoint pins ``tool_choice`` while thinking mode is on: a
+# forced choice is answered 400 "Thinking mode does not support this tool_choice"
+# and only auto/none are accepted. Measured 2026-09-10 against api.deepseek.com:
+#
+#     tool_choice=required                        -> 400
+#     tool_choice=required + thinking disabled    -> 200, tool_calls=1
+#     tool_choice=required + reasoning_effort=none-> 200, tool_calls=1
+#     tool_choice=auto                            -> 200, tool_calls=1
+#     tool_choice=required + reasoning_effort=minimal -> 400  ("minimal" does NOT
+#                                                     disable thinking; only "none" does)
+#
+# This is an ENDPOINT fact, not a model fact — which is why it cannot reuse the
+# echo predicate above. The same model is served by different hosts with different
+# behavior: owner_acks record ``omen-alpha`` behind api.deepseek.com AND
+# api.scnet.cn AND opencode.ai, and the gateways DO accept a forced choice
+# (paired with the compaction summarizer: DeepSeek-V4-Flash 122/123 parseable).
+# Match the host only; a model-name rule would misclassify every gateway.
+#
+# CAVEAT: still a route-name inference, in the same family as the echo contract
+# above. Extend ONLY with a fresh live probe of the exact route, and keep the
+# fail-open default (an unresolved host keeps the forced choice) so an unknown
+# route is never silently weakened.
+_FORCED_TOOL_CHOICE_REJECTING_HOSTS = ("api.deepseek.com",)
+
+
+def rejects_forced_tool_choice(provider: str, model: str = "", base_url: str = "") -> bool:
+    """Whether this route's thinking mode rejects a forced ``tool_choice``.
+
+    Read the RESOLVED model and the concrete base_url. Returns False (the forced
+    choice stands) whenever the lane or the host is unknown, so this only ever
+    withholds coercion from a route that has been measured to refuse it."""
+    if str(provider or "").strip().lower() != "openai-compatible":
+        return False
+    host = _base_url_host(base_url)
+    if not host:
+        return False
+    return any(host == candidate or host.endswith(f".{candidate}")
+               for candidate in _FORCED_TOOL_CHOICE_REJECTING_HOSTS)
+
+
 # NOTE (v6.33.0): the static per-model context-window table was REMOVED. It
 # perpetually went stale (1M-beta models hard-coded to 200K, [1m] ignored). The
 # agent's OWN operating window is the owner low/max context MODE (the SSOT — see
