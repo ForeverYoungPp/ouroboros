@@ -281,6 +281,8 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 
 **线索不是结论**：收件箱与工具管道的「相似」是否真能共用，需要单独的对照分析（语义差异、并发假设、锁域）。列在这里只为说明这个子项目的规模，不为指示方案。
 
+**该子项目已另立规格**：`docs/superpowers/specs/2026-09-10-agent-roles-design.md`。其核心发现是 `delegation_role` 是 **host 持有的血缘字段**（`root`/`subagent`，约 150 处消费者，防伪造），而 `background` 被塞进了这个字段——它属于「认知面」而非「血缘」维度。那份规格主张把两轴拆开，并**不动**轴 A 的安全属性。
+
 ### 5.14 存量数据迁移（P1 约束）
 
 现场 `/home/fy/Ouroboros/data/memory/`：
