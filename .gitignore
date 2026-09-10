@@ -108,3 +108,5 @@ devtools/benchmarks/editbench/fixtures_v2/
 .coordinator/
 results/
 cache_old_*/
+
+.ouroboros/

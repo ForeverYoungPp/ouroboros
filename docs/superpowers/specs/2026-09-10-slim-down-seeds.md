@@ -35,26 +35,42 @@
 
 ### acceptance_criteria
 
-- **AC-0.1** `python -c "import server"` 退出码 0；且把 `ouroboros/usage_accounting.py` **临时移走**后**仍**退出码 0。
-- **AC-0.2** `python -c "import supervisor.events"` 退出码 0；且把 `ouroboros/cost_projection.py` 临时移走后**仍**退出码 0（该模块当前在 `supervisor/events.py:33` 被顶层 import）。
-- **AC-0.3** `python -c "import ouroboros.gateway.extensions"` 退出码 0；且把 `ouroboros/_usage_rows.py` 临时移走后**仍**退出码 0（当前经 `skill_review_usage.py:10-12` 被硬绑）。
-- **AC-0.4** `pytest tests/test_gateway_parity.py` 全绿——`endpoint_index.HTTP_ENDPOINTS` 与 `collect_routes()` 逐条相等。
-- **AC-0.5** 对每个将被删除的模块名，全仓不存在「用 `except Exception: pass`（或 `except Exception` 后仅 log）吞掉其 import」的写法；`server_control.py:161-165` 已改为显式处理，且 panic 仍能终止委托 run 的进程组（由 `tests/test_server_control_panic_daemon.py` 覆盖）。
-- **AC-0.6** `web` 模块图不断：`web/modules/claudexor_status_store.js` 被 **7 个模块** import（含 `settings.js:21` 挂在 `app.js` 上）。改造后 `web/tests/` 的现有冒烟测试全绿，且不存在「删掉该文件导致整站白屏」的路径。
-- **AC-0.7** 本阶段 `git diff --stat` **不含任何文件删除**——只有 import 点与适配代码的改动。
-- **AC-0.8**（由 `ooo auto` 的 round 1 问题逼出，见 §6.2）每个被切断的能力，其触发路径返回**显式不可用**（typed error 或明确的 unavailable 响应），且不产生日志以外的副作用。抽查 `POST /api/cost-breakdown` 与一个 memory 工具调用，断言**不是**「返回空但 HTTP 200」。**禁止静默降级。**
-- **AC-0.9** 切断后 `collect_routes()` 的**条目数不变**——摘除端点属后续 seed 的活（那时连同 `endpoint_index.py` 契约表一起改）。
+> **权威版在 `docs/superpowers/specs/seed-0-import-graph.yaml`（`seed_934e30c1d249`，10 条 AC）。** 下面是同一内容的可读摘要；形态已按 §6.1 第 2 条的要求写成「命令 + 逐字期望输出/退出码」。
+
+**两个模块集合（这是原稿最大的缺口——它从未列出模块，只各探一个，执行器可能漏一批而 AC 全绿）：**
+
+| 集合 | 成员 | 用途 |
+|---|---|---|
+| **探针集**（将被【整体】删除，12 个；本阶段只切依赖不删文件） | `memory.py`、`consolidator.py`、`tools/memory_tools.py`、`cost_projection.py`、`_usage_response.py`、`_usage_rows.py`、`_usage_rows_memo.py`、`claudexor_daemon.py`、`claudexor_runtime.py`、`gateways/claudexor.py`、`gateway/claudexor_accounts.py`、`gateway/claudexor_quota.py` | AC-0.1/0.2/0.3 的**逐个**探测对象 |
+| **保护集**（部分保留或全部保留，**不得当整删**，也不是探针目标） | `semantic_dedup.py`（全保留，P2/P3 免疫队列去重器）、`usage_accounting.py` 与 `usage_ledger.py`（保留托管与尝试状态机）、`pricing.py`（保留 `infer_*`）、`reflection.py`（保留 `should_generate_reflection`/结构化候选/`_update_patterns`）、`tools/knowledge.py`（保留 patterns/backlog 路径与三个跨模块符号） | AC-0.10 的**仍可 import** 断言对象 |
+
+**AC（10 条）**：
+
+- **AC-0.1** 探针集 **12 个逐个**跑 server 导入探针——用一条 bash 循环把它们依次 `mv` 走、跑 `import server`、`mv` 回。期望：输出 **12 行**，每行以 `EXIT=0` 结尾。**行数少于 12 即失败，任一行非 0 即失败。**
+- **AC-0.2** 同上 12 个，探针换成 `import supervisor.events`。期望 12 行全 `EXIT=0`。
+- **AC-0.3** 同上 12 个，探针换成 `import ouroboros.gateway.extensions`。期望 12 行全 `EXIT=0`。
+- **AC-0.4** `pytest tests/test_gateway_parity.py -q` 期望退出码 0 且含 `passed`。
+- **AC-0.5** `pytest tests/test_server_control_panic_daemon.py -q` 期望退出码 0；附加静态检查——`grep -n -A2 claudexor_daemon ouroboros/server_control.py` 的输出中不得存在「import 位于 `except Exception: pass`（或仅 log）的 try 块内」。
+- **AC-0.6** `pytest web/tests -q` 期望退出码 0；`claudexor_status_store.js` 的 7 个 importer 仍可解析。
+- **AC-0.7** `git diff --stat --diff-filter=D` 期望**输出为空**（零删除）。
+- **AC-0.8** 三条逐字契约（HTTP 503 body 形状 / 异常类型与定义位置 / 工具缺席时的返回）——见 seed 文件与 §6.2。
+- **AC-0.9** `collect_routes()` 在改动前后输出**同一个整数**。
+- **AC-0.10** 保护集 6 个模块**仍可 import**：一条 `python -c "import ouroboros.semantic_dedup, ouroboros.usage_accounting, ouroboros.usage_ledger, ouroboros.pricing, ouroboros.reflection, ouroboros.tools.knowledge; print('OK')"` 期望输出 `OK` 且退出码 0。
 
 ### constraints
 
 - 主规格 §3 的九条宪法约束逐条适用（尤其 P1「never silent truncation」、P7「Minimalism is about code, not capabilities」）。
+- **探针集与保护集如上表逐字列出**——约束里必须带这两张清单，否则执行器拿不到删除目标全貌（`context_references` 不被 `session_context` 接受，规格路径也传不进去）。
 - 本阶段额外：**不删任何文件**；**不动 `run_llm_loop` 的形态**；**不动 `consciousness` 的角色边界与工具上限**（主规格 §5.13）。
 - 每个被删模块的 import 点必须**显式处理**，禁止新增吞异常的写法。
+- `size_ratchet_manifest.py` 的 `GIANT_PATHS` 是单向字节棘轮；改动其中文件必须同 commit 更新 manifest。
 
 ### decisions
 
 - 禁用「`except Exception: pass` 包住 import」这一既有写法（主规格 §9.2 纪律 1）。
 - `endpoint_index.py` 是契约表，改动必须同 commit（§9.2 纪律 2）。
+- 降级契约取「显式不可用」；HTTP 503 是本仓既有 unavailable 码；工具层返回标记字符串而非抛异常（依据见 §6.2）。
+- 异常类型必须定义在删除后仍存在的模块里——`ouroboros/errors.py::OuroborosUnavailableError(RuntimeError)`。
 
 ---
 
@@ -200,30 +216,45 @@
 
 | | `ooo auto`（访谈路径） | `generate_seed`（无访谈） |
 |---|---|---|
-| Seed | `seed_a9a10a35dff0` | **`seed_a8af8b9801e5`**（已存 `docs/superpowers/specs/seed-0-import-graph.yaml`） |
+| Seed | `seed_a9a10a35dff0` | **`seed_934e30c1d249`**（已存 `docs/superpowers/specs/seed-0-import-graph.yaml`） |
 | 等级 | **B** | 歧义 0.20（结构性上限，非评分）；`degraded: false` |
 | `unresolved_slots` | **`[acceptance_criteria]`** | **`[]`（零）** |
 | 中断原因 | `Partial product: yes (reason: interview_phase_deadline)` | —— |
-| AC 是否结构化 | ❌（只把 AC-0.4 收进 `verification_plan`） | ✅ 9 条全带 `semantic_ac_key` |
+| AC 是否结构化 | ❌（只把 AC-0.4 收进 `verification_plan`） | ✅ 10 条全带 `semantic_ac_key` |
 
 **结论：对这个 251k 行的 brownfield 仓，访谈路径收敛不了** —— Seed 1/2/3/4 一律走 `session_context`。
 
 ### 6.5.1 根因是 AC 的**形态**，不是内容
 
-`ooo status auto auto_44a0cd52588e` 的实测：它为同一个问题**连问了 4 轮**，ambiguity 逐轮上升 **0.21 → 0.33 → 0.35**，而把我整份 AC 列表原样记成了对某个具体问题的回答（`round 2/3/4 [user_preference]`）。
+**权威记录**是访谈 trace（`<repo>/.ouroboros/traces/auto_44a0cd52588e/summary.md`，由 `ooo auto` 写在项目目录里）：
 
-原因是访谈应答器的系统提示要求：
+```
+Status: complete · Grade: B · Seed: seed_a9a10a35dff0 (origin: auto_pipeline)
+Questions: 10 · Decisions: 15 (promoted 13, rejected 2) · Flags: 4
+Decision provenance: maintainer_policy 3, user_confirmed 10
+Open gaps: acceptance_criteria
+```
+
+`flags.jsonl` 给出闭环原因：`closure_route: partial_seed_from_evidence`、`ledger_ready: False`、`degraded_seed` 且 `recovery_reason: interview_phase_deadline`。
+
+**`questions.jsonl` 的前 4 条是同一个点**（「不可用契约」/AC-0.8 的断言欠定），ambiguity 逐轮上升 **0.21 → 0.33 → 0.35**；第 2 条原文就点破了原因：
+
+> 被切断能力在模块缺席时的「显式不可用」契约，**本轮上下文里同一面给出了三套互相矛盾的写法**……
+
+而 `Decision provenance: user_confirmed 10` 说明**我送去的 `user_preferences` 被记成了 10 条「用户确认」**——其中就包括把我整份 AC 列表当成某个具体问题的答案。**那三套互相矛盾的写法，源头是我自己发过两版 AC-0.8**（第一版散文、第二版带逐字 tuple），两版在 ledger 里并存。
+
+**形态要求**（访谈应答器的系统提示）：
 
 > ONE concrete, committed, testable decision — **specific values, exact commands/flags, a small sample input and its exact expected output, and explicit error/stderr/exit-code behavior**.
 
-而我第一版 AC 是**散文式行为描述**，落到 ledger 里只算 `[user_preference]`，**不算 committed** → 访谈必须继续追问。
+散文式行为描述落到 ledger 只算 `[user_preference]`，**不算 committed** → 访谈必须继续追问。
 
-**因此 AC 必须写成「可复制命令 + 逐字期望输出/退出码」**。对照：
+**对照**：
 
 | 形态 | 例 |
 |---|---|
 | ❌ 散文 | 「`python -c "import server"` 退出码 0；且把模块临时移走后仍退出码 0」 |
-| ✅ committed | 「命令 `python -c "import server"` 期望：退出码 0、stderr 为空。变体命令 `mv ouroboros/usage_accounting.py /tmp/ && python -c "import server"; echo EXIT=$?; mv /tmp/usage_accounting.py ouroboros/` 期望：打印 `EXIT=0`」 |
+| ✅ committed | 「运行 `for m in <12 个模块>; do mv "$m" /tmp/probe_moved.py; python -c "import server" >/dev/null 2>&1; rc=$?; mv /tmp/probe_moved.py "$m"; echo "$m EXIT=$rc"; done` 期望：输出 **12 行**，每行以 `EXIT=0` 结尾；行数少于 12 即失败」 |
 
 ### 6.5.2 `session_context` 的键：`project_type` 有效，`context_references` **无效**
 
@@ -254,6 +285,6 @@
 | 报告 | 声称 | 磁盘实测 |
 |---|---|---|
 | A | `seed-0-import-graph.yaml` 的 `semantic_ac_key` **整体错位**，`AC-0.8` 出现两次且互相矛盾，并给出两个「文件里存在」的 key | **当时**确实逐条与返回体一致（9 条、各一 key、`AC-0.8` 仅 1 次）；那两个 key 不存在。报告随后**自行撤回** |
-| B | 新 seed 落盘后，`AC-0.2`…`AC-0.7` 仍是**旧 seed 的 key**，只有 AC-0.1/0.8/0.9 是新的；理由是返回体在 AC 块有 `[…20ln elided…]` | **新 seed 的 key 共 9 个，旧 seed 的 key 共 0 个**；`seed_id: seed_a8af8b9801e5`；返回体 9 条 AC 与 key 当时全部可见，无 elision |
+| B | 新 seed 落盘后，`AC-0.2`…`AC-0.7` 仍是**旧 seed 的 key**，只有 AC-0.1/0.8/0.9 是新的；理由是返回体在 AC 块有 `[…20ln elided…]` | **新 seed 的 key 共 9 个，旧 seed 的 key 共 0 个**；`seed_id: seed_a8af8b9801e5`；返回体 9 条 AC 与 key 当时全部可见，无 elision。报告随后**自行撤回**（「我那次 grep 读到的是覆盖前的瞬时状态，不是终态」） |
 
 **纪律**：收到具体到 file:line / 具体到字符串的指控时，**一律先对磁盘取一次证再动**——这两次都是「先核实」避免了改坏一个本来正确的文件。反之，形态类结论（AC 的形态、`brownfield_context` 默认值、`user_preferences` 污染问答流）三次全部为真，也都已在 §6.1 / §6.5.1 / §6.5.2 落地。
