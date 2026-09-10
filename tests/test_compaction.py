@@ -255,6 +255,46 @@ def test_complete_summarizer_payload_has_no_head_or_structural_omission(
     assert usage["prompt_tokens"] == 17
 
 
+def test_summarizer_never_forces_a_tool_choice_the_route_rejects(monkeypatch, tmp_path):
+    """DeepSeek's thinking mode (ON by default; this lane sends no reasoning control
+    at all) answers 400 "Thinking mode does not support this tool_choice" to a forced
+    tool_choice. Every recorded compaction attempt that forced it took that 400 and
+    fell through to the JSON path, so the structured branch had a 0-for-N success
+    record. The prompt already names the tool, and "auto" is measured to call it on
+    the real payloads, so the forced choice is never sent again."""
+    from ouroboros import llm, llm_observability
+
+    part = cc._part("unit:1:1:aaaa", "some source text")
+    seen: dict = {}
+
+    def fake_chat_observed(_client, **kwargs):
+        seen.update(kwargs)
+        arguments = json.dumps({
+            "summaries": [{"source_id": part.source_id, "summary": "s"}],
+        })
+        return ({
+            "content": "",
+            "tool_calls": [{"function": {
+                "name": "emit_context_summaries", "arguments": arguments}}],
+        }, {"prompt_tokens": 3, "completion_tokens": 1, "provider": "test"})
+
+    monkeypatch.setattr(llm, "LLMClient", lambda: object())
+    monkeypatch.setattr(llm_observability, "chat_observed", fake_chat_observed)
+    summaries = cc._call_summarizer(
+        [part],
+        drive_root=tmp_path,
+        task_id="task",
+        phase="map",
+        spec={"model": "m", "effort": "low", "use_local": False},
+        summary_budgets={part.root_id: 700},
+        usage_total={},
+    )
+    assert seen["tool_choice"] == "auto"
+    # the tool is still offered, and the call is still validated/continued
+    assert [t["function"]["name"] for t in seen["tools"]] == ["emit_context_summaries"]
+    assert summaries == {part.source_id: "s"}
+
+
 def test_structured_summary_requires_exactly_one_tool_call():
     payload = json.dumps({
         "summaries": [{"source_id": "source", "summary": "complete"}],
