@@ -133,7 +133,7 @@
 
 ## 6. 给 `ooo auto` 的调用建议
 
-### 6.1 实测：`ooo auto` 需要 10 个 section，AC 必须**结构化**传入
+### 6.1 实测：`ooo auto` 需要 10 个 section，而 AC 的**唯一可行入口**是 `session_context`
 
 用 Seed 0 实跑了一次 `ooo auto`（`skip_run: true`，session `auto_44a0cd52588e`），ledger 显示它要求 10 个 section：
 
@@ -147,10 +147,15 @@
 | **`outputs`** | ❌ 0 |
 | **`failure_modes`** | ❌ 0 |
 
-**两条必须照做的格式要求**：
+**三条结论，第 2 条是修正后的**：
 
-1. **AC 不能写在 goal 正文里**——实测它不会结构化吸收。必须作为**列表**传给 `user_preferences.acceptance_criteria`。
-2. **必须显式提供 `actors` / `inputs` / `outputs` / `failure_modes`**——否则会进入自我访谈（`ooo auto` 用 `omp --mode json` 自答），每个问题一次 omp 调用，在 251k 行的 brownfield 仓库上很慢（实测 round 1 的应答超过 4 分钟）。
+1. **AC 不能写在 goal 正文里**——实测不被结构化吸收（我写在正文里的 7 条只有 AC-0.4 被收进 `verification_plan`，`acceptance_criteria` 仍为 0 条）。
+
+2. ⚠️ **也不要用 `user_preferences` 送 AC**（这一条推翻本文件早先的写法）。实测它会**挤进问答流**：当某个 section 恰好有 pending 问题时，你送去的该 section 会被**当作那个问题的答案**记入 `Recent auto answers`——`round 2/3/4 [user_preference]` 的 `A:` 字段就是我的整份 AC 列表，而问题是关于「不可用契约」这一个点的。后果是访谈在同一个点上反复追问，ambiguity 逐轮上升 **0.21 → 0.33 → 0.35**，最终在 phase deadline 上以 B 级部分产物收场。更糟的是我发过**两版** AC-0.8（第一版散文、第二版带逐字 tuple），两版在 ledger 里并存，访谈因此报出「同一面给出了三套互相矛盾的 503 写法」——**那个矛盾是我自己造成的**。
+
+3. **唯一正确路径是 `generate_seed` 的 `session_context`（无访谈）**——AC 直接成为 Seed 的 `acceptance_criteria` 条目并带 `semantic_ac_key`，不经过问答流，也不与任何 pending 问题竞争。Seed 1/2/3/4 一律走这条。
+
+（附带：`user_preferences` 送 `constraints` / `non_goals` / `runtime_context` 时**没有**被当作答案——因为当时没有针对这些 section 的 pending 问题。所以它是**条件性有害**：只要该 section 有 pending 问题，就会被消费成答案。结论不变：别用它送 AC。）
 
 ### 6.2 实测暴露的 Seed 0 缺口：降级契约
 
@@ -166,10 +171,12 @@
 | HTTP 端点 | **保留注册**，处理器短路返回 typed 错误 | AC-0.4 要求 `HTTP_ENDPOINTS` 与 `collect_routes()` 逐条相等——摘端点属后续 seed 的活（那时连同契约表一起改） |
 | 降级痕 | 记一条结构化日志/事件，不吞 | 与「不静默截断」同源 |
 
-**须补进 Seed 0 的 AC**：
+**须补进 Seed 0 的 AC**（**已以 committed 形态落进 §2 与 `seed-0-import-graph.yaml`，这里不再复述散文版**）：
 
-- **AC-0.8** 每个被切断的能力，其触发路径返回**显式不可用**（typed error 或明确的 unavailable 响应），且不写日志以外的副作用；抽查 `POST /api/cost-breakdown` 与一个 memory 工具调用，断言不是「返回空但 HTTP 200」。
-- **AC-0.9** 切断后 `collect_routes()` 的条目**数不变**（摘除端点留给后续 seed）。
+- **AC-0.8** 三条逐字契约（HTTP 503 body 形状 / 异常类型与定义位置 / 工具缺席时的返回），**以「断言命令 + 期望结果」的形态**给出，见 §2 与 seed 文件。
+- **AC-0.9** `collect_routes()` 在改动前后输出同一个整数——**以命令 + 期望不变量的形态**给出。
+
+> ⚠️ 本节早先的散文版 AC 已被 committed 版取代。散文版就是 §6.1 第 2 条里那个「被 `user_preferences` 消费成答案、且两版并存造成自相矛盾」的来源。
 
 ### 6.3 调用方式（避开 30s MCP 超时）
 
@@ -239,3 +246,14 @@
 | 访谈状态机库 | `~/.ouroboros/data/ouroboros.db` |
 | **访谈路径产出的 Seed** | `~/.ouroboros/seeds/seed_<id>.yaml`（自动落盘） |
 | **无访谈路径产出的 Seed** | ⚠️ **只在工具有返回体里，不自动落盘**——必须自己存（本仓存在 `docs/superpowers/specs/seed-0-import-graph.yaml`） |
+
+### 6.7 已证伪的报告（记录下来，避免后续会话重复争论）
+
+本文件写作过程中收到过两份与磁盘不符的审计报告，**均经逐条核实后否决**：
+
+| 报告 | 声称 | 磁盘实测 |
+|---|---|---|
+| A | `seed-0-import-graph.yaml` 的 `semantic_ac_key` **整体错位**，`AC-0.8` 出现两次且互相矛盾，并给出两个「文件里存在」的 key | **当时**确实逐条与返回体一致（9 条、各一 key、`AC-0.8` 仅 1 次）；那两个 key 不存在。报告随后**自行撤回** |
+| B | 新 seed 落盘后，`AC-0.2`…`AC-0.7` 仍是**旧 seed 的 key**，只有 AC-0.1/0.8/0.9 是新的；理由是返回体在 AC 块有 `[…20ln elided…]` | **新 seed 的 key 共 9 个，旧 seed 的 key 共 0 个**；`seed_id: seed_a8af8b9801e5`；返回体 9 条 AC 与 key 当时全部可见，无 elision |
+
+**纪律**：收到具体到 file:line / 具体到字符串的指控时，**一律先对磁盘取一次证再动**——这两次都是「先核实」避免了改坏一个本来正确的文件。反之，形态类结论（AC 的形态、`brownfield_context` 默认值、`user_preferences` 污染问答流）三次全部为真，也都已在 §6.1 / §6.5.1 / §6.5.2 落地。
