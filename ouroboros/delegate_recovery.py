@@ -13,6 +13,7 @@ from typing import Any, Mapping, Optional
 
 from ouroboros import delegate_custody as custody
 from ouroboros.subagent_work_order import work_order_fingerprint
+from ouroboros.subagents import CLAUDEXOR_RETIRED
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -286,17 +287,12 @@ def _holder_value(holder: Any, name: str, *, pending: bool) -> str:
 
 
 def _run_probe_error(run_id: str) -> str:
-    gateway = None
-    try:
-        from ouroboros.claudexor_daemon import ensure_owned_gateway
-        gateway = ensure_owned_gateway()
-        gateway.get_run(run_id)
-        return ""
-    except Exception as exc:
-        return type(exc).__name__
-    finally:
-        if gateway is not None:  # pragma: no branch - paired with the acquisition above
-            gateway.close()
+    # The engine poll that PROVED a run exists retired with Claudexor: nothing can be
+    # re-probed any more, so the shared retirement marker is the honest answer. Callers
+    # read any non-empty value as "unprovable" (fail-closed) — the same verdict the
+    # unreachable-daemon path produced.
+    log.debug("Run probe unavailable for %s: %s", run_id, CLAUDEXOR_RETIRED)
+    return CLAUDEXOR_RETIRED
 
 
 def _successor_binding_mismatch(row: Mapping[str, Any], task: Mapping[str, Any]) -> str:
@@ -741,19 +737,12 @@ def pre_adopt_planned_handoffs(
             if len(runs) != 1 or not _holder_matches(row, runs[0], pending=False):
                 veto_handoff(drive_root, task_id, "startup_run_binding_mismatch")
                 continue
-            gateway = None
-            try:
-                from ouroboros.claudexor_daemon import ensure_owned_gateway
-
-                gateway = ensure_owned_gateway()
-                gateway.get_run(runs[0].run_id)
-            except Exception:
-                veto_handoff(drive_root, task_id, "startup_run_unprovable")
-                continue
-            finally:
-                if gateway is not None:
-                    gateway.close()
-            adopted_run_id = runs[0].run_id
+            # The engine poll that proved a live run ACTUALLY exists retired with
+            # Claudexor: nothing can re-probe it any more, so the handoff stays
+            # unprovable and is vetoed — the same outcome the unreachable-daemon
+            # path produced (fail-closed, never a silent adoption).
+            veto_handoff(drive_root, task_id, "startup_run_unprovable")
+            continue
         row.update({"status": "pre_adopted", "pre_adopted_at": utc_now_iso()})
         try:
             _write(drive_root, row)

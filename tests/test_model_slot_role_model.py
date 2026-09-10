@@ -522,10 +522,6 @@ def _enqueue_through_supervisor(tmp_path, monkeypatch, *, parent_lane: str = "",
         is_session = legacy_executor == "harness"
         if is_session:
             target = "claude=route-a"
-            monkeypatch.setattr(
-                "ouroboros.subagents.route_health",
-                lambda *_args, **_kwargs: ("configured_session_route_unavailable", ""),
-            )
         else:
             monkeypatch.setattr(
                 "ouroboros.provider_models.model_has_credentials", lambda _model: True,
@@ -601,36 +597,6 @@ def test_the_request_reaches_the_worker_and_only_the_request(tmp_path, monkeypat
                     "reasoning_effort", "effective_executor", "capability_delta"):
         assert derived not in task, derived
         assert derived not in task["metadata"], derived
-
-
-def test_availability_is_a_dispatch_fact_not_a_schedule_fact(tmp_path, monkeypatch):
-    """The reason there is exactly one resolution and it runs at dispatch.
-
-    A child scheduled while no harness route exists can wait out the whole outage in
-    the queue. Resolving at schedule time froze the answer onto the record forever;
-    resolving again at dispatch produced a SECOND record that disagreed with the first
-    about the same child. With the D28 correction the down state is a typed BLOCK, so
-    freezing it at schedule time would have refused a child whose route came back
-    while it sat in the queue."""
-    from ouroboros.agent import resolve_dispatch_axes
-    import ouroboros.subagents as subagent_module
-
-    task = _enqueue_through_supervisor(tmp_path, monkeypatch, executor="harness")
-
-    state = {"reason": "subscription_window_exhausted"}
-    monkeypatch.setattr(
-        subagent_module, "route_health",
-        lambda *_args, **_kwargs: (state["reason"], "2030-01-01T00:00:00Z"),
-    )
-    down = resolve_dispatch_axes(dict(task))
-    assert (down.executor, down.route) == ("blocked", "")
-    assert down.blocked is True and down.delta.reduced is True
-
-    # The exact configured route comes back while the same immutable task waits.
-    state["reason"] = ""
-    up = resolve_dispatch_axes(dict(task))
-    assert (up.executor, up.route) == ("harness", "claude=route-a")
-    assert up.delta.reduced is False
 
 
 def test_deadline_at_narrows_but_never_extends(tmp_path, monkeypatch):
@@ -951,7 +917,7 @@ def test_a_reduction_reaches_the_record_the_child_and_the_parents_readback(tmp_p
     assert task["effective_executor"] == "blocked"
     delta = task["capability_delta"]
     assert delta["reduced"] is True
-    assert delta["reason"] == "configured_session_route_unavailable"
+    assert delta["reason"] == "claudexor_retired"
     assert task["subagent_envelope"]["capability_delta"] == delta
     assert task["subagent_envelope"]["executor"] == "harness"
 
@@ -965,7 +931,7 @@ def test_a_reduction_reaches_the_record_the_child_and_the_parents_readback(tmp_p
     write_task_result(tmp_path / "readback", "child1", "completed",
                       result="done", capability_delta=delta)
     out = _get_task_result(ctx, "child1")
-    assert "capability_delta" in out and "configured_session_route_unavailable" in out
+    assert "capability_delta" in out and "claudexor_retired" in out
 
     # ...and the scheduling result no longer pretends to know: it states the request.
     from ouroboros.tools.control import _schedule_task
@@ -1005,9 +971,9 @@ def test_an_explicit_harness_pin_is_a_typed_blocker_not_a_paid_reroute(tmp_path,
 
     This resolved to `native` with a loud `capability_delta`, which discloses the wrong
     thing: however loudly it is announced, re-routing the pin to native execution
-    spends exactly the metered money the parent refused. The reason string matches
-    `cxi/p34-converged`'s rule table so synthesis adopts that table without a
-    behavioural diff (synthesis hazard H1)."""
+    spends exactly the metered money the parent refused. The typed reason is the
+    retired-transport constant `claudexor_retired` (the rule table below keeps
+    `cxi/p34-converged`'s own strings for the pure resolution)."""
     from ouroboros import subagents as sub
 
     monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
@@ -1017,7 +983,7 @@ def test_an_explicit_harness_pin_is_a_typed_blocker_not_a_paid_reroute(tmp_path,
     assert dispatch.executor == "blocked" and dispatch.blocked is True
     assert dispatch.route == ""
     assert task["effective_executor"] == "blocked"
-    assert dispatch.delta.reason == "configured_session_route_unavailable"
+    assert dispatch.delta.reason == "claudexor_retired"
     assert dispatch.delta.reduced is True
 
     # AUTO with no route: native, and quiet — nothing was asked for.
@@ -1098,7 +1064,7 @@ def test_blocked_configured_session_terminals_unrun_without_a_model_round(tmp_pa
     assert record["effective_executor"] == "blocked"
     assert record["model"] == "provider::parent"
     assert record["configured_subagent"]["selected_subagent_id"] == "session-actor"
-    assert record["capability_delta"]["reason"] == "configured_session_route_unavailable"
+    assert record["capability_delta"]["reason"] == "claudexor_retired"
     assert float(record.get("cost_usd") or 0.0) == 0.0
     assert "NOT run on metered API tokens" in str(record.get("result") or "")
 

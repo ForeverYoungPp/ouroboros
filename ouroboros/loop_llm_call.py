@@ -31,7 +31,7 @@ from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
 from ouroboros.provider_models import provider_for_model
 from ouroboros.transport_custody import attempt_custody_event_fields, is_pre_dispatch_transport_failure
-from ouroboros._usage_response import provider_cost_value as _provider_cost_value
+from ouroboros.usage_rows import provider_cost_value as _provider_cost_value
 from ouroboros.usage_accounting import (
     PhysicalAttemptContext,
     UsageAccountingError,
@@ -873,7 +873,7 @@ def _normalize_usage_cost(
     elif provider_reported_cost and cost is None:
         # MISSING falls through to the catalog estimate; a cost the provider DID
         # send but that cannot be trusted is honestly unknown RIGHT HERE. Shared
-        # predicate: `_usage_response.provider_cost_value` — the lanes cannot fork.
+        # predicate: `usage_rows.provider_cost_value` — the lanes cannot fork.
         log.warning(
             "Provider reported an invalid cost (type=%s, value=%s) for %s; recording "
             "cost as unknown and skipping estimation",

@@ -6,10 +6,11 @@ goal reached the run only if the nanny hand-copied it into every prompt, and
 (b) the finalization nudge went permanently silent after the first successful
 delegated run (old loop.py `if evidence.get("delegated_runs_succeeded"): return ""`).
 
-Phase B replaces both: the task contract's objective/expected_output ride
-STRUCTURALLY in the host-authored run `instructions`, and the silence is
-proportional to the measured metered burn since the last delegated-run activity
-(config thresholds; owner decision 2=B — reminders only, never a cap).
+Phase B replaced both: the contract rode STRUCTURALLY in the host-authored run
+`instructions` (that wire retired with the delegated-run transport, Seed 0), and
+the silence is proportional to the measured metered burn since the last
+delegated-run activity (config thresholds; owner decision 2=B — reminders only,
+never a cap).
 """
 
 import json
@@ -30,143 +31,6 @@ def _owned_gateway_uses_each_test_transport(monkeypatch):
         "ensure_owned_gateway",
         lambda: gateway_module.ClaudexorGateway(),
     )
-
-
-# -- B1.1: the contract rides the host instructions ----------------------------
-
-
-def _start_with_contract(
-    tmp_path, monkeypatch, contract, *, prompt="run the tests", compiled_work_order=False,
-):
-    import ouroboros.tools.delegate as delegate
-    from ouroboros import subagent_runtime
-    from ouroboros.contracts.task_constraint import TaskConstraint
-    from ouroboros.gateways import claudexor as gw
-    from ouroboros.tools.registry import ToolContext
-
-    repo = tmp_path / "repo"
-    repo.mkdir(exist_ok=True)
-    ctx = ToolContext(
-        repo_dir=repo, drive_root=tmp_path,
-        task_constraint=TaskConstraint(mode="local_readonly_subagent"),
-    )
-    ctx.task_id = "t-nanny"
-    ctx.task_metadata = {"root_task_id": "t-root", "parent_task_id": "t-root"}
-    ctx.task_contract = dict(contract)
-
-    seen = {}
-
-    class _Stub:
-        engine_version = "3.3.6"
-
-        def handshake(self, **_kw): return {}
-        def agent_capabilities(self):
-            return {"harnesses": [{
-                "id": "some-route", "enabled": True, "status": "ok",
-                "accessProfilesSupported": ["readonly", "workspace_write"],
-            }]}
-        def quota_snapshots(self): return []
-        def find_project_id(self, root): return "prj-existing"
-        def register_project(self, root): raise AssertionError("must reuse the registration")
-        def start_run(self, request, *, idempotency_key=""):
-            seen["request"] = request
-            return {"runId": "run-1", "runDir": "/tmp/run-1"}
-        def close(self): pass
-
-    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
-    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
-    delegate._CUSTODY.clear()
-    snapshot = {
-        "schema": 1,
-        "selected_subagent_id": "economics-fixture",
-        "config_fingerprint": "economics-fixture-v1",
-        "route": {
-            "kind": "agent_session",
-            "target_id": "some-route=weak-model",
-            "credential_profile_id": "",
-        },
-        "effort": "low",
-    }
-    payload = json.loads(subagent_runtime.exact_start(ctx, prompt, {
-        "snapshot": snapshot,
-        "compiled_work_order": compiled_work_order,
-    }))
-    delegate._CUSTODY.clear()
-    assert payload["status"] == "started", payload
-    return seen["request"]
-
-
-def test_the_contract_objective_rides_the_run_instructions_structurally(tmp_path, monkeypatch):
-    request = _start_with_contract(tmp_path, monkeypatch, {
-        "objective": "Build the ghost-core module of the poltergeist game",
-        "expected_output": "a verified module with passing tests",
-    })
-    instructions = request["instructions"]
-    assert "HOST TASK OBJECTIVE" in instructions
-    assert "ghost-core module" in instructions
-    assert "HOST EXPECTED OUTPUT" in instructions
-    assert "verified module with passing tests" in instructions
-    # The nanny did NOT have to copy the contract into the prompt.
-    assert "ghost-core" not in request["prompt"]
-    # The prohibitions stay the opening statement of the channel.
-    assert instructions.index("git commit") < instructions.index("HOST TASK OBJECTIVE")
-
-
-def test_direct_start_request_carries_complete_normalized_contract_authority(tmp_path, monkeypatch):
-    context = " \nAPI_CONTEXT_EXACT\n "
-    contract = {
-        "objective": "delegate the Cat build",
-        "context": context,
-        "constraints": "Claudexor only; no native edits",
-        "acceptance_claims": [{"id": "nested", "claim": "L1 asks L2 to spawn L3"}],
-        "delegation_budget": {"may_delegate": True, "depth_remaining": 3,
-                              "intent_note": "L1\nL2\nL3"},
-        "allowed_resources": {"network": False},
-        "predecessor_authority": {
-            "source": {"kind": "task_result", "task_id": "cat-old"},
-            "task_contract": {
-                "objective": "CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3",
-                "context": "never use native/API fallback",
-            },
-        },
-    }
-
-    request = _start_with_contract(tmp_path, monkeypatch, contract)
-    marker = "HOST TASK CONTRACT AUTHORITY (complete normalized JSON; exact strings are authority):\n"
-    payload = request["instructions"].split(marker, 1)[1]
-    normalized = json.loads(payload)
-
-    assert normalized["context"] == context
-    assert normalized["constraints"] == contract["constraints"]
-    assert normalized["acceptance_claims"][0]["claim"] == "L1 asks L2 to spawn L3"
-    assert normalized["delegation_budget"]["intent_note"] == "L1\nL2\nL3"
-    assert normalized["allowed_resources"]["network"] is False
-    assert normalized["predecessor_authority"] == contract["predecessor_authority"]
-
-
-def test_a_missing_contract_contributes_nothing(tmp_path, monkeypatch):
-    request = _start_with_contract(tmp_path, monkeypatch, {})
-    assert "HOST TASK OBJECTIVE" not in request["instructions"]
-    assert "HOST EXPECTED OUTPUT" not in request["instructions"]
-
-
-def test_retry_replays_the_stored_wire_body_not_a_rebuilt_one():
-    """Byte-identical retry stays intact: the retry path replays the STORED
-    canonical body under the stored key; the contract block is derived only on
-    the fresh-start path (`_start_request` is never called on recovery)."""
-    import inspect
-
-    from ouroboros.tools import delegate
-
-    src = inspect.getsource(delegate._delegate_start)
-    recovering_branch = src.split("if recovering:", 1)[1].split("else:", 1)[0]
-    assert "_assignment_instructions" not in recovering_branch
-    assert "_start_request" not in recovering_branch
-    # C1 extracted the stored-record read into `_resolve_retry_invocation`
-    # (re-exported on the delegate surface); the recovering branch must go
-    # through it, and the resolver itself is what replays the STORED body.
-    assert "_resolve_retry_invocation" in recovering_branch
-    assert 'record["request"]' in inspect.getsource(delegate._resolve_retry_invocation)
 
 
 # -- B1.2/B1.3: proportional reminder ------------------------------------------
@@ -786,46 +650,6 @@ def test_over_budget_source_request_is_a_small_partial_lens_without_a_prefix():
     }
     assert envelope["source"]["projection"] == "canonical_work_order"
     assert "cannot_verify" in prompt
-
-
-def test_an_ordinary_contract_field_reaches_the_run_instructions_complete(tmp_path, monkeypatch):
-    """End to end, the old per-field 4k prefix is gone from the wire."""
-    request = _start_with_contract(tmp_path, monkeypatch, {
-        "objective": "O" * 4050,
-        "expected_output": "ok",
-    })
-    instructions = request["instructions"]
-    start = instructions.index("HOST TASK OBJECTIVE")
-    end = instructions.index("HOST EXPECTED OUTPUT")
-    field = instructions[start:end]
-    assert "OMISSION NOTE" not in field
-    assert "O" * 4050 in field
-
-
-def test_atomic_compiled_work_order_sends_dynamic_brief_once(tmp_path, monkeypatch):
-    from ouroboros.subagent_work_order import compile_external_work_order
-
-    objective = "UNIQUE_ATOMIC_OBJECTIVE"
-    task = {
-        "id": "t-nanny",
-        "objective": objective,
-        "expected_output": "verified patch",
-        "task_contract": {
-            "objective": objective,
-            "expected_output": "verified patch",
-        },
-    }
-    work_order = compile_external_work_order(task)
-    request = _start_with_contract(
-        tmp_path,
-        monkeypatch,
-        task["task_contract"],
-        prompt=work_order,
-        compiled_work_order=True,
-    )
-    assert request["prompt"].count(objective) == 1
-    assert objective not in request["instructions"]
-    assert "git commit" in request["instructions"]
 
 
 def test_compiled_work_order_carries_exact_context_and_contract_tail():

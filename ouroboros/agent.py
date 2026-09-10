@@ -29,7 +29,7 @@ from ouroboros.usage_accounting import BudgetExceeded
 from ouroboros.llm import LLMClient
 from ouroboros.tools import ToolRegistry
 from ouroboros.tools.registry import ToolContext
-from ouroboros.memory import Memory
+from ouroboros.memory_files import Memory
 from ouroboros.context import build_llm_messages
 from ouroboros.loop import run_llm_loop
 from ouroboros.config import EFFORT_SCALE, resolve_effort

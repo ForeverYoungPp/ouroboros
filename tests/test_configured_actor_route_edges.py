@@ -52,15 +52,19 @@ def test_planned_restart_kill_keeps_selected_child_even_if_parent_is_interrupted
     workers.RUNNING.clear()
 
 
-def test_api_row_is_refused_by_root_direct_exact_start_before_daemon(monkeypatch, tmp_path):
-    import ouroboros.claudexor_daemon as daemon
+def test_root_direct_exact_start_fences_selection_then_refuses_the_retired_transport(
+    monkeypatch, tmp_path,
+):
+    """The root-direct edge: the selection fence still runs (a missing or
+    conflicting selector is answered as such), and a configured row — the API
+    actor included — then meets the same typed retirement refusal every
+    delegated start gets, carrying ``definitely_unrun`` so nothing has to be
+    waited on or cancelled. No harness lane is reachable from here."""
     import ouroboros.tools.delegate as delegate
     from ouroboros.tools.registry import ToolContext
 
     settings = _settings(_api_row())
     monkeypatch.setattr("ouroboros.config.load_settings", lambda: settings)
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: (_ for _ in ()).throw(
-        AssertionError("API rows never POST to Claudexor")))
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "root1"
     schema = next(e.schema for e in delegate.get_tools() if e.name == "delegate_start")["parameters"]
@@ -70,7 +74,8 @@ def test_api_row_is_refused_by_root_direct_exact_start_before_daemon(monkeypatch
     out = json.loads(delegate.exact_start(
         ctx, "bounded leaf", {"subagent_id": "api-builder"},
     ))
-    assert out["reason"] == "api_actor_requires_schedule_subagent"
+    assert out["status"] == "refused" and out["reason"] == "claudexor_retired", out
+    assert out["definitely_unrun"] is True
     retry = json.loads(delegate.exact_start(
         ctx, "bounded leaf", {"subagent_id": "api-builder", "retry_of": "inv-old"},
     ))

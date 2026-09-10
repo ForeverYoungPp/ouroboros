@@ -17,14 +17,17 @@ capability row (``delegation.available``) is likewise not consulted: Ouroboros
 runs never request the belt (no ``extra_mcp_servers``).
 
 What still refuses, pinned or not: catalog absence, access-profile fit for the
-shape, the delegated-marker version floor, and positively-known quota
-exhaustion for the route's model.
+shape, a DELEGATED (acting) shape outright — the delegated-marker floor was read
+through the engine version predicate, which retired with the daemon family, so an
+acting run now names that retirement (``claudexor_retired``) instead of being
+assumed admitted on an unread gate — and positively-known quota exhaustion for
+the route's model.
 
 Offline unit fixtures only: a duck-typed gateway answering the manifest
 questions route_health asks. No daemon, no network.
 """
 
-from ouroboros.subagents import delegated_run_shape, route_health
+from ouroboros.subagents import CLAUDEXOR_RETIRED, delegated_run_shape, route_health
 
 
 class _Gateway:
@@ -103,12 +106,16 @@ def test_shape_checks_still_refuse_pinned_or_not():
     assert unavailable == "access_profile_unsupported:workspace_write"
     unavailable, _ = route_health(_ReadOnly(), "agy-like", acting)
     assert unavailable == "access_profile_unsupported:workspace_write"
-    # And the delegated-marker version floor stays: an engine that would 400 the
-    # marker is refused before a token is spent, pinned or not.
+    # And the retired delegated-marker gate: its floor was read through the engine
+    # version predicate, which is gone, so a DELEGATED (acting) run is refused with
+    # the retirement marker rather than admitted on an unread gate — pinned or not,
+    # and independent of the version the engine reports.
     old = _Gateway(status="ok", enabled=True)
     old.engine_version = "0.0.1"
     unavailable, _ = route_health(old, "agy-like", acting, pinned_profile="acct-1")
-    assert unavailable == "engine_rejects_delegated_marker"
+    assert unavailable == CLAUDEXOR_RETIRED
+    unavailable, _ = route_health(old, "agy-like", acting)
+    assert unavailable == CLAUDEXOR_RETIRED
 
 
 def test_the_belt_capability_row_is_not_consulted():
@@ -117,12 +124,17 @@ def test_the_belt_capability_row_is_not_consulted():
     request. Refusing (or decorating a refusal) on it manufactured a
     "structurally cannot delegate" verdict the engine never gave and blocked
     routes that admit marker-based delegated runs (cursor acting runs under a
-    pinned profile). It is ignored for every shape."""
+    pinned profile). It is ignored for every shape: a read-only run is admitted
+    on the row's other facts alone, and an acting run is refused by the retired
+    delegated-marker gate (``claudexor_retired``) — never by the belt row, whose
+    own reason never surfaces."""
     structural = _Gateway(
         delegation={"available": False, "reason": "manifest_unsupported"})
-    assert route_health(structural, "agy-like", delegated_run_shape(True)) == ("", "")
     assert route_health(structural, "agy-like", delegated_run_shape(False)) == ("", "")
-    assert route_health(_Gateway(delegation={}), "agy-like", delegated_run_shape(True)) == ("", "")
+    assert route_health(
+        structural, "agy-like", delegated_run_shape(True)) == (CLAUDEXOR_RETIRED, "")
+    assert route_health(
+        _Gateway(delegation={}), "agy-like", delegated_run_shape(True)) == (CLAUDEXOR_RETIRED, "")
 
 
 def test_blocked_pin_wording_is_uniform_without_the_structural_verdict():

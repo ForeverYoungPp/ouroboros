@@ -875,8 +875,7 @@ def _emit_cancel_suppressed_retry_task_done(
         return False
     try:
         from ouroboros.cancel_intents import active_intent
-        from ouroboros.cost_projection import carry_cost_meta
-        from ouroboros.task_results import load_task_result
+        from ouroboros.task_results import carry_cost_meta, load_task_result
         from ouroboros.task_status import SETTLED_STATUSES
 
         if active_intent(q.DRIVE_ROOT, cancel_target, strict=True) is not None:

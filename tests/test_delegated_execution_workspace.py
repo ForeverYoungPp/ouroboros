@@ -1,4 +1,9 @@
-"""Version-negotiated Claudexor execution-workspace wire contract."""
+"""Claudexor execution-workspace wire contract, now version-independent.
+
+The strict-schema version predicate that used to earn ``execution.workspaceRoot``
+retired with the gateway family, so the field is withheld for every engine version
+and the request keeps the byte-compatible legacy shape (private snapshot as the
+scope root)."""
 
 from types import SimpleNamespace
 
@@ -29,14 +34,17 @@ def test_legacy_strict_schema_keeps_the_byte_compatible_execution_shape():
     assert request["execution"] == {"isolation": "live", "delegated": True}
 
 
-def test_new_schema_receives_the_private_snapshot_as_execution_workspace():
+def test_the_workspace_field_is_withheld_for_every_engine_version():
+    """The strict-schema version predicate retired with the gateway family.
+
+    ``delegated_execution_workspace_root`` cannot evaluate its floor any more, so
+    the field is WITHHELD rather than claimed on an unread gate — an engine whose
+    strict schema lacks the key answers the start with a 400 and no run exists.
+    Even the version that used to earn the field therefore keeps the byte-compatible
+    withheld shape, with the private snapshot as the scope root."""
     request = _request("3.8.1", acting=True)
-    assert request["scope"]["root"] == "/tmp/stable-project"
-    assert request["execution"] == {
-        "isolation": "live",
-        "delegated": True,
-        "workspaceRoot": "/tmp/private-execution-snapshot",
-    }
+    assert request["scope"]["root"] == "/tmp/private-execution-snapshot"
+    assert request["execution"] == {"isolation": "live", "delegated": True}
 
 
 def test_readonly_shape_never_sends_a_live_execution_workspace():

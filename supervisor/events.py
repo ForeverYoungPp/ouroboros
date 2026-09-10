@@ -27,10 +27,12 @@ from ouroboros.task_results import (
     STATUS_INTERRUPTED,
     STATUS_REJECTED_DUPLICATE,
     STATUS_SCHEDULED,
+    carry_cost_meta,
+    live_root_cost_projection,
     load_task_result,
+    with_cost_aliases,
     write_task_result,
 )
-from ouroboros.cost_projection import carry_cost_meta, live_root_cost_projection, with_cost_aliases
 from ouroboros.outcomes import infra_failed_axes, normalize_outcome_axes
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.subagents import intended_lane as intended_subagent_lane
@@ -1266,7 +1268,7 @@ def _authoritative_terminal_cost(
     task_id: str, task: Dict[str, Any], result: Dict[str, Any], evt: Dict[str, Any], drive_root: pathlib.Path,
 ) -> Dict[str, Any]:
     """Project one terminal task/root from the physical-attempt authority."""
-    from ouroboros.cost_projection import honest_accounted_amount
+    from ouroboros.task_results import honest_accounted_amount
     from supervisor.state import reconstruct_task_cost
 
     authority_root = pathlib.Path(task.get("budget_drive_root") or drive_root)

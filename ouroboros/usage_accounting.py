@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Dict, Iterator, Literal, Optional, Sequence, Tuple, get_args
 
 from ouroboros.pricing import estimate_cost_optional
-from ouroboros._usage_response import _reported_token_count, usage_from_response
+from ouroboros.usage_rows import _reported_token_count, usage_from_response
 from ouroboros.review_dispatch import invoke_bound_api_review_paid_stamp
 from ouroboros.transport_custody import release_pre_dispatch_attempt
 from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
@@ -47,7 +47,7 @@ from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
     _write_bytes_atomic_fsync,
 )
 from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso
-from ouroboros._usage_rows import (  # noqa: F401  (re-exported substrate vocabulary)
+from ouroboros.usage_rows import (  # noqa: F401  (re-exported substrate vocabulary)
     REVIEW_ATTRIBUTION_KEYS,
     _breakdown_bucket,
     _physical_call_count,
@@ -371,7 +371,7 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
     if request.global_limit_usd is None and scope.global_limit_usd is not None:
         request = replace(request, global_limit_usd=scope.global_limit_usd)
     return request, scope
-from ouroboros._usage_rows_memo import (  # noqa: F401,E402  (re-exported seam)
+from ouroboros.usage_rows import (  # noqa: F401,E402  (re-exported seam)
     _LedgerRowsMemo, _ROWS_MEMO, _ROWS_MEMO_LOCK,
     _memoized_final_rows, _read_records_locked_cached, _render_cached,
 )

@@ -189,7 +189,7 @@ def _serialize_backlog(items: List[Dict[str, Any]]) -> str:
 
 def _rebuild_index(path: pathlib.Path) -> None:
     try:
-        from ouroboros.consolidator import _rebuild_knowledge_index
+        from ouroboros.memory_files import _rebuild_knowledge_index
 
         _rebuild_knowledge_index(path.parent)
     except Exception:

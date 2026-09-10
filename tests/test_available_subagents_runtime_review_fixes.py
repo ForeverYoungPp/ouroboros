@@ -29,18 +29,19 @@ def _session_snapshot(subagent_id: str, config_fingerprint: str) -> dict:
 
 
 @pytest.mark.parametrize("has_initial_actor", [True, False])
-def test_d24_adopts_unique_explicit_replacement_or_root_direct_holder(
-    monkeypatch, tmp_path, has_initial_actor,
+def test_d24_binds_unique_explicit_replacement_or_root_direct_holder(
+    tmp_path, has_initial_actor,
 ):
     """The current durable leaf, not the nanny's initial actor, owns recovery.
 
     The two configured rows intentionally share one list fingerprint.  ``session-b``
     is a later explicit same-nanny replacement when ``has_initial_actor`` is true,
-    and an explicit root-direct leaf otherwise.
+    and an explicit root-direct leaf otherwise.  The ownership BINDING is what the
+    handoff names; the resume itself can no longer be proven live (the engine poll
+    retired with the gateway family), so adoption fails closed over it.
     """
 
     from ouroboros import delegate_custody as custody
-    import ouroboros.claudexor_daemon as daemon
     import ouroboros.delegate_recovery as recovery
     from ouroboros.tools.registry import ToolContext
     from ouroboros.utils import atomic_write_json
@@ -103,22 +104,19 @@ def test_d24_adopts_unique_explicit_replacement_or_root_direct_holder(
     assert handoff["snapshot_id"] == "snapshot-b"
     assert handoff["execution_root"] == str(private_tree)
 
-    class Gateway:
-        def get_run(self, run_id):
-            assert run_id == "run-b"
-            return {"id": run_id, "state": "running"}
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: Gateway())
+    # The binding the D24 decision produced survives; what retired is the engine
+    # poll that could PROVE run-b live. With no reader left, the unique holder no
+    # longer authorizes a resume: the handoff fails CLOSED and records exactly
+    # what could not be proven.
     ctx = ToolContext(repo_dir=workspace, drive_root=tmp_path, task_id="nanny-1")
     ctx.budget_drive_root = str(tmp_path)
     assert recovery.adopt_handoff(ctx, task) == {
-        "status": "adopted",
-        "run_id": "run-b",
-        "cause": recovery.CAUSE_WORKER_CRASH,
+        "status": "recovery_required",
+        "reason": "run_unprovable",
     }
+    assert recovery._read(tmp_path, "nanny-1")["veto_reason"] == (
+        "run_unprovable:claudexor_retired"
+    )
 
 
 def test_d24_still_refuses_multiple_current_custody_holders(tmp_path):
@@ -332,8 +330,6 @@ def test_api_actor_strips_only_the_canonical_local_marker():
 def test_configured_actor_preserves_requested_effort_until_request_wire(
     monkeypatch, route_kind,
 ):
-    import ouroboros.claudexor_daemon as daemon
-    import ouroboros.subagents as subagents
     from ouroboros.llm import LLMClient
     from ouroboros.subagent_runtime import resolve_configured_actor_dispatch
 
@@ -345,16 +341,14 @@ def test_configured_actor_preserves_requested_effort_until_request_wire(
         )
         route = {"kind": route_kind, "target_id": f"openai::review-fix-{route_kind}"}
         cognitive = {}
+        expected_reasons = ()
     else:
         route = {"kind": route_kind, "target_id": "codex=gpt-5.6-sol"}
         cognitive = {"model": nanny_model, "effort": "max"}
-
-        class Gateway:
-            def close(self):
-                pass
-
-        monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: Gateway())
-        monkeypatch.setattr(subagents, "route_health", lambda *_a, **_k: ("", ""))
+        # A configured session adds ONE reduction: the harness lane retired with
+        # the gateway family, so the executor axis is disclosed as a blocker. The
+        # EFFORT axes are untouched — that is what this test pins.
+        expected_reasons = ("claudexor_retired",)
 
     dispatch = resolve_configured_actor_dispatch(
         {
@@ -373,9 +367,10 @@ def test_configured_actor_preserves_requested_effort_until_request_wire(
     )
     assert dispatch.delta.derived_effort == "max"
     assert dispatch.delta.effective_effort == "max"
-    assert dispatch.delta.reduction_reasons == ()
-    assert dispatch.delta.reason == ""
-    assert dispatch.delta.reduced is False
+    assert dispatch.delta.reduction_reasons == expected_reasons
+    assert dispatch.delta.reason == ("claudexor_retired" if expected_reasons else "")
+    assert dispatch.delta.reduced is bool(expected_reasons)
+    assert dispatch.effort == "max"
 
 
 def test_delegate_start_recipes_match_the_fresh_start_schema():

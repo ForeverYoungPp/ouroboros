@@ -11,10 +11,10 @@ import time
 from dataclasses import replace
 from typing import Any, Callable, Dict, List
 
-from ouroboros.cost_projection import cost_projection
 from ouroboros.task_results import (
     STATUS_COMPLETED,
     STATUS_FAILED,
+    cost_projection,
     load_task_result,
     write_task_result,
 )
@@ -363,7 +363,7 @@ def _run_post_task_processing_async(
         checkpoint_status = "degraded"
         try:
             from ouroboros.llm import LLMClient
-            from ouroboros.memory import Memory
+            from ouroboros.memory_files import Memory
 
             llm_client = LLMClient()
             task_memory = Memory(drive_root=env.drive_root, repo_dir=env.repo_dir)
@@ -686,7 +686,7 @@ def emit_task_results(
     # SSOT cost naming (C2): both spellings on every terminal frame this
     # pipeline emits (the reconstruct path already aliases; the unavailable
     # fallback above must not ship without the honest name).
-    from ouroboros.cost_projection import with_cost_aliases
+    from ouroboros.task_results import with_cost_aliases
 
     task_cost_fields = with_cost_aliases(task_cost_fields)
     if _is_root_post_task(task) and not _root_post_task_already_completed(env, task):
@@ -939,7 +939,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
     """
     try:
         trace_summary = build_trace_summary(llm_trace)
-        from ouroboros.cost_projection import with_cost_aliases
+        from ouroboros.task_results import with_cost_aliases
 
         cost_fields = with_cost_aliases(cost_fields or {
             "cost_accounting_status": "unavailable", "cost_final": False,
@@ -1155,7 +1155,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
     try:
         from ouroboros.project_dialogue import append_authored_task_summary, completion_status_label
         from ouroboros.projects_registry import project_thread_note_for_task
-        from ouroboros.consolidator import CONSOLIDATION_REASONING_EFFORT, _consolidation_route
+        from ouroboros.memory_files import CONSOLIDATION_REASONING_EFFORT, _consolidation_route
         task_id = str(task.get("id") or "unknown")
         canonical_root = pathlib.Path(task.get("budget_drive_root") or drive_logs.parent)
         summary_id = f"task-narrative:{task_id}"
@@ -1238,79 +1238,30 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
         log.debug("Task summary generation failed (non-critical)", exc_info=True)
 
 def _run_chat_consolidation(env, memory, llm, task, drive_logs):
-    """Run dialogue-block consolidation inside the root post-task worker."""
-    try:
-        from ouroboros import consolidator as _c
+    """Chat-block consolidation is retired with ``ouroboros.consolidator``.
 
-        should_consolidate = _c.should_consolidate
-        consolidate = _c.consolidate
-        chat_path = drive_logs / "chat.jsonl"
-        blocks_path = env.drive_path("memory") / "dialogue_blocks.json"
-        meta_path = env.drive_path("memory") / "dialogue_meta.json"
-        if should_consolidate(meta_path, chat_path):
-            _id, _ident, _llm, _logs = task.get("id"), memory.load_identity(), llm, drive_logs
-            from ouroboros.usage_accounting import UsageScope, current_usage_scope, usage_scope
-
-            base_scope = current_usage_scope()
-            chat_scope = (
-                replace(base_scope, category="consolidation", source="chat_consolidation")
-                if base_scope is not None
-                else UsageScope(
-                    drive_root=task.get("budget_drive_root") or env.drive_root,
-                    task_id=str(_id or ""),
-                    root_task_id=str(task.get("root_task_id") or _id or ""),
-                    category="consolidation",
-                    source="chat_consolidation",
-                )
-            )
-
-            with usage_scope(chat_scope):
-                u = consolidate(chat_path=chat_path, blocks_path=blocks_path,
-                                meta_path=meta_path, llm_client=_llm, identity_text=_ident)
-            if u:
-                append_jsonl(_logs / "events.jsonl", {"ts": utc_now_iso(),
-                    "type": "chat_block_consolidation", "task_id": _id,
-                    "cost_usd": (
-                        round(float(u["cost"]), 6)
-                        if u.get("cost") is not None
-                        else None
-                    )})
-                if u.get("cost") or u.get("prompt_tokens"):
-                    from supervisor.state import update_budget_from_usage
-                    update_budget_from_usage(u)
-    except Exception:
-        log.warning("Chat block consolidation setup failed", exc_info=True)
+    That module owned the chat.jsonl → dialogue_blocks write pipeline; nothing
+    has replaced it yet (the Engram-backed equivalent is a follow-up
+    workstream). So the call site takes its "not consolidating" branch and
+    says so out loud — the signature stays for the existing callers, and no
+    merge is ever reported that did not happen.
+    """
+    log.warning(
+        "Chat block consolidation retired with ouroboros.consolidator; "
+        "chat.jsonl left unconsolidated (Engram replacement is a follow-up workstream)"
+    )
 
 def _run_scratchpad_consolidation(env: Any, memory: Any, llm: Any) -> None:
-    """Run scratchpad consolidation inside the root post-task worker."""
-    try:
-        from ouroboros import consolidator as _c
+    """Scratchpad consolidation is retired with ``ouroboros.consolidator``.
 
-        should_consolidate = _c.should_consolidate_scratchpad
-        consolidate = _c.consolidate_scratchpad
-        if should_consolidate(memory):
-            kb_dir = env.drive_path("memory/knowledge")
-            _identity = memory.load_identity()
-            from ouroboros.usage_accounting import UsageScope, current_usage_scope, usage_scope
-
-            base_scope = current_usage_scope()
-            scratch_scope = (
-                replace(base_scope, category="consolidation", source="scratchpad_consolidation")
-                if base_scope is not None
-                else UsageScope(
-                    drive_root=env.drive_root,
-                    category="consolidation",
-                    source="scratchpad_consolidation",
-                )
-            )
-
-            with usage_scope(scratch_scope):
-                u = consolidate(memory, kb_dir, llm, _identity)
-            if u and (u.get("cost") or u.get("prompt_tokens")):
-                from supervisor.state import update_budget_from_usage
-                update_budget_from_usage(u)
-    except Exception:
-        log.debug("Scratchpad consolidation setup failed", exc_info=True)
+    Same retirement as :func:`_run_chat_consolidation`: the scratchpad →
+    knowledge-file merge pipeline left with that module and has no live
+    replacement yet, so this is an explicit no-op that says so.
+    """
+    log.warning(
+        "Scratchpad consolidation retired with ouroboros.consolidator; "
+        "scratchpad left unconsolidated (Engram replacement is a follow-up workstream)"
+    )
 
 def _run_reflection(env: Any, llm: Any, task: Dict[str, Any],
                     usage: Dict[str, Any], llm_trace: Dict[str, Any],

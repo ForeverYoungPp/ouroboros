@@ -1108,36 +1108,36 @@ def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconc
 
 
 def _reconcile_delegated_runs(running_task_ids: set) -> None:
-    """Settle or cancel delegated runs whose owning task is gone (startup + tick)."""
+    """Settle or cancel delegated runs whose owning task is gone (startup + tick).
+
+    The settlement transport was the Claudexor owned daemon's gateway (retired
+    in Seed 0), so this sweep is explicitly unavailable rather than merely
+    degraded: ``gateway_factory`` refuses with ``OuroborosUnavailableError``
+    carrying the shared ``CLAUDEXOR_RETIRED`` marker, instead of handing back a
+    gateway the sweep would try to handshake and then misreport as unreachable.
+    Nothing can be settled any more, so no outcome-dependent refresh lives here
+    any more either — these custody rows are left to the cursor and boot passes
+    (``_cursor_refresh_settled_terminals`` / ``backfill_terminal_reconciliations``).
+    The typed refusal is consumed below, never swallowed as an empty sweep.
+    """
     try:
-        from ouroboros.claudexor_daemon import ensure_owned_gateway
         from ouroboros.delegate_custody import reconcile_orphaned_runs
         from ouroboros.delegate_recovery import recoverable_task_ids
+        from ouroboros.errors import OuroborosUnavailableError
+        from ouroboros.subagents import CLAUDEXOR_RETIRED
 
-        # The tick runs on the supervisor loop thread: a daemon sitting in its
-        # recovery-only admission window must not hold that thread for the default
-        # admission wait — skip-until-next-sweep is this caller's normal posture.
-        outcomes = reconcile_orphaned_runs(
+        def _retired_gateway():
+            # The retired transport: never a degraded/None gateway, which the
+            # sweep would try to handshake and then misreport as unreachable.
+            raise OuroborosUnavailableError(CLAUDEXOR_RETIRED)
+
+        reconcile_orphaned_runs(
             DATA_DIR, running_task_ids=running_task_ids,
-            gateway_factory=lambda: ensure_owned_gateway(admission_wait_sec=0),
+            gateway_factory=_retired_gateway,
             recoverable_task_ids=recoverable_task_ids(DATA_DIR),
         )
-        if outcomes:
-            log.info("Delegated-run reconciliation handled %d orphan(s): %s", len(outcomes), outcomes)
-            # A run settled by this sweep may belong to a task that already wrote
-            # its terminal result with a non-empty unreconciled disclosure — the
-            # stored projection then lies forever (nanny-leaf S1). Audit-only
-            # refresh; never cancels.
-            from ouroboros.delegate_terminal import refresh_terminal_reconciliation
-
-            for tid in {str(o.get("task_id") or "") for o in outcomes
-                        if o.get("task_id") and (o.get("settled") or str(
-                            o.get("action") or "") in (
-                                "absent", "cancelled", "invocation_retired"))}:
-                try:
-                    refresh_terminal_reconciliation(DATA_DIR, tid)
-                except Exception:
-                    log.debug("Sweep terminal-result refresh failed for %s", tid, exc_info=True)
+    except OuroborosUnavailableError:
+        log.debug("Delegated-run reconciliation skipped: transport retired", exc_info=True)
     except Exception:
         log.debug("Delegated-run reconciliation failed", exc_info=True)
 

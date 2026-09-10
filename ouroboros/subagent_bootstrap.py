@@ -11,7 +11,6 @@ from ouroboros.subagent_work_order import (
     WorkOrderBudgetExceeded,
     build_work_order_source_request,
     compile_external_work_order,
-    route_source_request_channel,
 )
 
 
@@ -41,7 +40,7 @@ def _with_coordination_context(ctx: Any, raw: str) -> str:
 # spirit; the set errs toward the episode, never toward the terminal).
 # LOAD-BEARING COUPLING: "malformed_response"/"daemon_unreachable" can also be
 # raised post-POST (a run may be live) — they are safe here ONLY because the
-# ClaudexorUnavailable handler in tools/delegate attaches the pending
+# OuroborosUnavailableError handler in tools/delegate attaches the pending
 # invocation handle to every non-4xx fault, and the custody-handle guard
 # below then forces the wake. Refactors of that error path must keep
 # post-POST refusals carrying a handle.
@@ -639,25 +638,17 @@ def _prepare_actor_first_bootstrap(
         route_id = str(route.get("target_id") or "")
         resolved_route = getattr(getattr(dispatch, "executor_resolution", None), "route", None)
         channel_route_id = str(getattr(resolved_route, "route_id", "") or route_id)
-        gateway = None
-        try:
-            from ouroboros.claudexor_daemon import ensure_owned_gateway
+        # Claudexor retired (Seed 0): there is no owned gateway left to read the
+        # route's live interaction capability from, so the source channel stays
+        # UNVERIFIED — the same degradation the probe failure produced, now for
+        # the retired capability instead of an unreachable daemon.
+        from ouroboros.subagents import CLAUDEXOR_RETIRED
 
-            gateway = ensure_owned_gateway()
-            source_channel = route_source_request_channel(gateway, channel_route_id)
-        except Exception as channel_error:  # noqa: BLE001 - unknown is typed
-            source_channel = {
-                "status": "unverified",
-                "reason": "capability_probe_failed",
-                "detail": type(channel_error).__name__,
-                "route": channel_route_id,
-            }
-        finally:
-            if gateway is not None:
-                try:
-                    gateway.close()
-                except Exception:
-                    pass
+        source_channel = {
+            "status": "unverified",
+            "reason": CLAUDEXOR_RETIRED,
+            "route": channel_route_id,
+        }
         work_order = ""
         work_order_fingerprint = exc.sha256
         work_order_chars = exc.chars

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 
-from ouroboros._usage_rows import REVIEW_ATTRIBUTION_KEYS
+from ouroboros.usage_rows import REVIEW_ATTRIBUTION_KEYS
 
 
 def session_invocation_fields(invocation: Any) -> Tuple[Any, ...]:

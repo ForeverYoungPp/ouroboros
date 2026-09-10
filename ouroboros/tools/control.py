@@ -2146,7 +2146,7 @@ def _chat_history(
     ctx: ToolContext, count: int = 100, offset: int = 0, search: str = "",
     snapshot: str = "", **filters: str,
 ) -> str:
-    from ouroboros.memory import Memory
+    from ouroboros.memory_files import Memory
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(
         getattr(ctx, "task_metadata", {}), dict
     ) else {}
@@ -2179,7 +2179,7 @@ def _update_scratchpad(ctx: ToolContext, content: str) -> str:
             "Scratchpad must have meaningful content (10+ chars). "
             "This likely means the tool call was malformed — check your arguments."
         )
-    from ouroboros.memory import Memory
+    from ouroboros.memory_files import Memory
     mem = Memory(drive_root=ctx.drive_root)
     mem.ensure_files()
     try:
@@ -2256,7 +2256,7 @@ def _update_identity(ctx: ToolContext, content: str) -> str:
             "Identity must be a substantial text (50+ chars). "
             "This likely means the tool call was malformed — check your arguments."
         )
-    from ouroboros.memory import Memory
+    from ouroboros.memory_files import Memory
     mem = Memory(drive_root=ctx.drive_root)
     mem.ensure_files()
 
@@ -2445,7 +2445,7 @@ def _get_task_result(
     child_result_sha256 = _child_result_sha256(data)
     # SSOT cost projection (C2): unknown never renders as $0.00 (and a null in
     # the stored result no longer crashes the f-string with a TypeError).
-    from ouroboros.cost_projection import cost_display
+    from ouroboros.task_results import cost_display
 
     if status == STATUS_COMPLETED:
         output = (
@@ -2751,7 +2751,7 @@ def _children_roster_projection(
         )
     except Exception:
         return empty
-    from ouroboros.cost_projection import cost_projection
+    from ouroboros.task_results import cost_projection
 
     roster: List[Dict[str, Any]] = []
     for row in rows:
@@ -2786,7 +2786,7 @@ def _wait_for_tasks(
     if not isinstance(task_ids, list) or not task_ids:
         return "⚠️ TOOL_ARG_ERROR (wait_tasks): task_ids must be a non-empty list."
     from ouroboros.config import MAX_ACTIVE_SUBAGENTS_HARD_CAP
-    from ouroboros.cost_projection import cost_projection
+    from ouroboros.task_results import cost_projection
 
     if len(task_ids) > MAX_ACTIVE_SUBAGENTS_HARD_CAP:
         return (

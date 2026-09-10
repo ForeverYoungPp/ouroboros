@@ -62,15 +62,15 @@ def collect_routes(
         api_ouroboroshub_uninstall,
         api_ouroboroshub_update,
     )
-    from ouroboros.gateway.claudexor_accounts import (
+    from ouroboros.gateway.claudexor_unavailable import (
         api_claudexor_credential_profile,
         api_claudexor_login,
         api_claudexor_login_job,
         api_claudexor_login_job_reconcile,
+        api_claudexor_quota_refresh,
         api_claudexor_status,
         api_claudexor_wake,
     )
-    from ouroboros.gateway.claudexor_quota import api_claudexor_quota_refresh
     from ouroboros.gateway.onboarding import (
         api_onboarding_complete,
         api_onboarding_subagents_preview,

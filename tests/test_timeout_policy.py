@@ -828,8 +828,8 @@ def test_strict_poll_phase_budget_is_bounded_in_wall_time():
     import pytest
     import threading
     import time
-    from ouroboros.delegate_progress import bounded_poll
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    from ouroboros.delegate_progress import bounded_poll, expiring_poll
+    from ouroboros.errors import OuroborosUnavailableError
 
     # Margins are deliberately coarse: the previous 0.06s-sleep-inside-a-0.08s
     # budget with a <0.1s wall assertion measured OS scheduler precision, not
@@ -837,7 +837,9 @@ def test_strict_poll_phase_budget_is_bounded_in_wall_time():
     # contract under test is discrimination, not stopwatch accuracy: a phase
     # answering within the budget returns as soon as it answers (seconds, not
     # the 30s budget), and a stalled phase is cut at the small budget (seconds,
-    # not the 30s stall).
+    # not the 30s stall) with the poll's own typed refusal — the Claudexor
+    # gateway class retired with its module, the code stays as the message
+    # prefix.
 
     class OneSlowPhase:
         def get_run(self, _run_id, *, timeout_sec=None):
@@ -857,10 +859,14 @@ def test_strict_poll_phase_budget_is_bounded_in_wall_time():
             return {"summary": {"state": "succeeded"}}
 
     started = time.monotonic()
-    with pytest.raises(ClaudexorUnavailable, match="wall-clock bound"):
+    with pytest.raises(OuroborosUnavailableError, match="poll_wall_timeout"):
         bounded_poll(StalledPhase(), "run-2", 0.25, strict=True)
     assert time.monotonic() - started < 5.0
-    # Let the abandoned daemon poll thread exit now instead of in 30s.
+
+    # The ONE poll whose silence is not a failure: a SPENT window's last read
+    # answers None instead of raising, so expiry is the caller's report to make.
+    assert expiring_poll(StalledPhase(), "run-2", strict=True) is None
+    # Let the abandoned daemon poll threads exit now instead of in 30s.
     stall_release.set()
 
 

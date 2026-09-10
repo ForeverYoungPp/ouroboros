@@ -1,42 +1,22 @@
-"""Poltergeist phase B (B4): the nanny answers its run's questions.
+"""Poltergeist phase B (B4): the nanny's question surfaces.
 
-The engine has carried the ENTIRE interactive-question pipeline since 3.3.x —
-durable store, full question text/options on the run detail
-(``pendingInteractions``), a typed answer endpoint, a 15-minute benign-decline
-timeout — while our ``delegate_wait`` read only ``bool(summary.waitingOnUser)``
-and showed it at window expiry. A paused run therefore burned metered polling
-for up to the whole engine timeout. Phase B: the wait returns IMMEDIATELY with
-the typed question set, and the custody-gated ``delegate_answer`` delivers the
-nanny's answer (owner decision 7=A: the nanny answers from task context;
-above-authority questions ride the escalation verb up the task hierarchy
-while the run waits out the engine timeout).
+The question READERS survived the Claudexor retirement; the delivery path they
+fed did not. Both verbs that spoke to the engine — ``delegate_wait`` (the run's
+journal/question stream) and ``delegate_answer`` (the custody-gated answer POST)
+— rode the retired gateway, so each now reports the retirement as a typed
+refusal: no run state is invented, and no answer is pretended delivered.
+
+What stays worth pinning is what outlived the transport: the gateway readers that
+normalize the question shape, the budget-bounded question projection that rides
+the expiry payload and its notes, and the STRICT argument/custody gates inside
+``delegate_answer`` — those still refuse exactly as before, one step before the
+retirement is reached.
 """
 
 import json
 import queue as stdqueue
 
 import pytest
-
-
-@pytest.fixture(autouse=True)
-def _owned_gateway_uses_each_test_transport(monkeypatch):
-    from ouroboros import claudexor_daemon
-    from ouroboros.gateways import claudexor as gateway_module
-
-    monkeypatch.setattr(
-        claudexor_daemon,
-        "ensure_owned_gateway",
-        lambda: gateway_module.ClaudexorGateway(),
-    )
-
-
-@pytest.fixture(autouse=True)
-def _fresh_interaction_memo():
-    from ouroboros.tools import delegate
-
-    delegate._REPORTED_INTERACTIONS.clear()
-    yield
-    delegate._REPORTED_INTERACTIONS.clear()
 
 
 def _pending_row(iid="int-1", question="Which port should the server use?"):
@@ -125,7 +105,7 @@ def test_answer_interaction_returns_typed_statuses_at_any_http_code(monkeypatch)
     assert exc.value.status_code == 501
 
 
-# -- delegate_wait surfaces the question ----------------------------------------
+# -- delegate_wait: the retired transport ---------------------------------------
 
 
 def _wait_ctx(tmp_path):
@@ -141,23 +121,6 @@ def _wait_ctx(tmp_path):
     return ctx
 
 
-def _waiting_stub(monkeypatch, pending_rows):
-    from ouroboros.gateways import claudexor as gw
-
-    class _Stub:
-        engine_version = "3.3.6"
-
-        def handshake(self, **_kw): return {}
-        def get_run(self, rid, *, timeout_sec=None):
-            return {"lastSeq": 5,
-                    "pendingInteractions": list(pending_rows),
-                    "summary": {"state": "running", "effectiveAccess": "readonly",
-                                "waitingOnUser": bool(pending_rows)}}
-        def close(self): pass
-
-    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
-
-
 def _own_run(delegate):
     delegate._CUSTODY.clear()
     delegate._CUSTODY["run-1"] = delegate._RunCustody(
@@ -166,85 +129,18 @@ def _own_run(delegate):
     )
 
 
-def test_a_new_question_returns_immediately_with_the_full_text(tmp_path, monkeypatch):
+def test_the_wait_verb_reports_the_retired_transport(tmp_path):
+    """The engine poll retired with its gateway, so delegate_wait can no longer
+    read a run — and it says that instead of reporting a state. A quiet wait
+    would read as a run that finished and said nothing."""
     import ouroboros.tools.delegate as delegate
 
-    _waiting_stub(monkeypatch, [_pending_row()])
     ctx = _wait_ctx(tmp_path)
-    _own_run(delegate)
     out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=600, since_seq=5))
-    delegate._CUSTODY.clear()
-    assert out["status"] == "waiting_on_user"
-    assert out["last_seq"] == 5
-    row = out["pending_interactions"][0]
-    assert row["interaction_id"] == "int-1"
-    assert row["questions"][0]["question"] == "Which port should the server use?"
-    assert row["questions"][0]["options"][0]["label"] == "8080"
-    assert "delegate_answer" in out["note"]
-    assert "ABOVE your authority" in out["note"]
-
-
-def test_the_same_question_does_not_busy_loop_the_next_wait(tmp_path, monkeypatch):
-    """A nanny that escalated up the hierarchy and re-waits must HOLD its
-    window, not spin: the known question rides the expiry payload instead."""
-    import ouroboros.tools.delegate as delegate
-
-    _waiting_stub(monkeypatch, [_pending_row()])
-    ctx = _wait_ctx(tmp_path)
-    _own_run(delegate)
-    first = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=600, since_seq=5))
-    assert first["status"] == "waiting_on_user"
-    second = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1, since_seq=5))
-    delegate._CUSTODY.clear()
-    assert second["status"] == "no_progress"
-    assert second["waiting_on_user"] is True
-    assert second["pending_interactions"][0]["interaction_id"] == "int-1"
-
-
-def test_a_reask_with_a_new_interaction_id_is_news_again(tmp_path, monkeypatch):
-    import ouroboros.tools.delegate as delegate
-
-    rows = [_pending_row()]
-    _waiting_stub(monkeypatch, rows)
-    ctx = _wait_ctx(tmp_path)
-    _own_run(delegate)
-    assert json.loads(delegate._delegate_wait(
-        ctx, "run-1", wait_sec=600, since_seq=5))["status"] == "waiting_on_user"
-    rows[0] = _pending_row(iid="int-2")
-    out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=600, since_seq=5))
-    delegate._CUSTODY.clear()
-    assert out["status"] == "waiting_on_user"
-    assert out["pending_interactions"][0]["interaction_id"] == "int-2"
-
-
-def test_an_oversized_question_set_spills_whole_with_a_receipt(tmp_path, monkeypatch):
-    import ouroboros.tools.delegate as delegate
-
-    big = [_pending_row(iid=f"int-{i}", question=("What about part %d? " % i) + "x" * 900)
-           for i in range(24)]
-    _waiting_stub(monkeypatch, big)
-    ctx = _wait_ctx(tmp_path)
-    _own_run(delegate)
-    out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=600, since_seq=5))
-    delegate._CUSTODY.clear()
-    assert out["status"] == "waiting_on_user"
-    delivery = out["interactions_delivery"]
-    artifact = delivery["artifact"]
-    assert artifact["sha256"] and artifact["bytes"] > 0
-    assert artifact["path"].endswith(".interactions.json")
-    staged = json.loads((tmp_path / "task_drive" / artifact["path"]).read_text(encoding="utf-8")
-                        if (tmp_path / "task_drive" / artifact["path"]).exists()
-                        else (tmp_path / artifact["path"]).read_text(encoding="utf-8")
-                        if (tmp_path / artifact["path"]).exists()
-                        else open(artifact["abs_path"], encoding="utf-8").read())
-    assert len(staged["pending_interactions"]) == 24
-    # The inline view is a COUNTED preview, and the whole payload respects the budget.
-    from ouroboros.tool_capabilities import tool_result_limit
-
-    assert len(json.dumps(out, ensure_ascii=False, indent=2)) <= tool_result_limit("delegate_wait")
-
-
-# -- delegate_answer ------------------------------------------------------------
+    assert out["status"] == "refused"
+    assert out["tool"] == "delegate_wait"
+    assert out["reason"] == "claudexor_retired"
+    assert out["run_id"] == "run-1"
 
 
 def _answer_ctx(tmp_path):
@@ -268,70 +164,6 @@ def _answer_stub(monkeypatch, *, result=None, error=None, detail_pending=()):
         def close(self): pass
 
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
-
-
-def test_delivered_answer_relays_typed_and_writes_the_custody_row(tmp_path, monkeypatch):
-    import ouroboros.tools.delegate as delegate
-
-    _answer_stub(monkeypatch, result={"accepted": True, "status": "delivered"})
-    ctx = _answer_ctx(tmp_path)
-    _own_run(delegate)
-    out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "selected_labels": ["8080"]},
-    ]))
-    delegate._CUSTODY.clear()
-    assert out["status"] == "delivered" and out["accepted"] is True
-    assert "delegate_wait" in out["note"]
-    events = [json.loads(line) for line in
-              (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
-    answered = [e for e in events if e["type"] == "delegate_interaction_answered"]
-    assert answered and answered[0]["interaction_id"] == "int-1"
-    assert answered[0]["status"] == "delivered"
-
-
-def test_already_resolved_tells_the_nanny_not_to_repost(tmp_path, monkeypatch):
-    import ouroboros.tools.delegate as delegate
-
-    _answer_stub(monkeypatch, result={"accepted": False, "status": "already_resolved",
-                                      "message": "timed out"})
-    ctx = _answer_ctx(tmp_path)
-    _own_run(delegate)
-    out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "free_text": "9090"},
-    ]))
-    delegate._CUSTODY.clear()
-    assert out["status"] == "already_resolved"
-    assert "do NOT re-post" in out["note"]
-
-
-def test_ambiguous_transport_becomes_delivery_unknown_with_a_reread(tmp_path, monkeypatch):
-    import ouroboros.tools.delegate as delegate
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
-    # Re-read shows the interaction still pending: retry the SAME answer.
-    _answer_stub(monkeypatch,
-                 error=ClaudexorUnavailable("daemon_unreachable", "boom"),
-                 detail_pending=[_pending_row()])
-    ctx = _answer_ctx(tmp_path)
-    _own_run(delegate)
-    out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "free_text": "9090"},
-    ]))
-    assert out["status"] == "delivery_unknown"
-    assert out["still_pending"] is True
-    assert "SAME answers" in out["note"]
-
-    # Re-read shows it gone: never re-post, never a different answer.
-    _answer_stub(monkeypatch,
-                 error=ClaudexorUnavailable("daemon_unreachable", "boom"),
-                 detail_pending=[])
-    out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "free_text": "9090"},
-    ]))
-    delegate._CUSTODY.clear()
-    assert out["status"] == "delivery_unknown"
-    assert out["still_pending"] is False
-    assert "NEVER post a different answer" in out["note"]
 
 
 def test_answers_are_validated_and_custody_gated(tmp_path, monkeypatch):
@@ -359,242 +191,40 @@ def test_answers_are_validated_and_custody_gated(tmp_path, monkeypatch):
     assert out["status"] == "refused" and out["reason"] == "run_not_owned"
 
 
-def test_unsupported_engine_build_is_a_typed_refusal(tmp_path, monkeypatch):
-    import ouroboros.tools.delegate as delegate
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
-    _answer_stub(monkeypatch, error=ClaudexorUnavailable(
-        "http_501", "interaction answers are not supported", status_code=501))
-    ctx = _answer_ctx(tmp_path)
-    _own_run(delegate)
-    out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "free_text": "x"},
-    ]))
-    delegate._CUSTODY.clear()
-    assert out["status"] == "refused"
-    assert out["reason"] == "interaction_answers_unsupported"
-    assert "benign-decline" in out["detail"]
-
-
-# -- fix batch: refusal mapping, memo, budget, validation ------------------------
-
-
-def test_definite_4xx_maps_to_the_rejected_shape_not_delivery_unknown(tmp_path, monkeypatch):
-    """F3 (races #1): a definite engine 4xx is an ANSWER about these bytes.
-    Relaying it as `delivery_unknown` invited re-posting the same bytes; the
-    rejected shape says fix the rows. `delivery_unknown` stays reserved for
-    status 0 / 5xx / transport death."""
-    import ouroboros.tools.delegate as delegate
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
-    ctx = _answer_ctx(tmp_path)
-
-    # A 400 ControlProblem (typed refusal without an interaction status).
-    _answer_stub(monkeypatch, error=ClaudexorUnavailable(
-        "http_400", "ControlProblem: answers failed schema validation", status_code=400))
-    _own_run(delegate)
-    out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "free_text": "x"},
-    ]))
-    assert out["status"] == "rejected", out
-    assert out["accepted"] is False
-    assert "do not re-post the same bytes" in out["note"]
-    assert "HTTP 400" in out["note"]
-
-    # A 409 whose body carried NO typed status (the untyped-conflict fake).
-    _answer_stub(monkeypatch, error=ClaudexorUnavailable(
-        "http_409", "conflict without a typed body", status_code=409))
-    out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "free_text": "x"},
-    ]))
-    assert out["status"] == "rejected", out
-    assert "HTTP 409" in out["note"]
-
-    # 413/422 are payload-semantic too (R2-1): still the rejected shape.
-    for code in (413, 422):
-        _answer_stub(monkeypatch, error=ClaudexorUnavailable(
-            f"http_{code}", "typed refusal", status_code=code))
-        out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-            {"question_id": "q1", "free_text": "x"},
-        ]))
-        assert out["status"] == "rejected", out
-        assert f"HTTP {code}" in out["note"]
-
-    # A 503 stays ambiguous: the answer MAY have landed.
-    _answer_stub(monkeypatch, error=ClaudexorUnavailable(
-        "http_503", "bad gateway", status_code=503))
-    out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "free_text": "x"},
-    ]))
-    delegate._CUSTODY.clear()
-    assert out["status"] == "delivery_unknown", out
-
-
-def test_auth_and_rate_4xx_stay_delivery_unknown_not_rejected(tmp_path, monkeypatch):
-    """R2-1 (two reviewers converged): only the payload-semantic codes
-    (400/409/413/422) are a verdict about these bytes. A 401/403/408/429 says
-    nothing about the rows, so it is the AMBIGUOUS shape — whose bounded
-    re-read then correctly advises retrying the SAME answers while the row is
-    still pending. The old blanket 4xx→rejected told the nanny to REWRITE
-    answers an auth blip never even judged."""
-    import ouroboros.tools.delegate as delegate
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
-    ctx = _answer_ctx(tmp_path)
-    for code in (401, 403, 408, 429):
-        _answer_stub(monkeypatch,
-                     error=ClaudexorUnavailable(f"http_{code}", "no", status_code=code),
-                     detail_pending=[_pending_row()])
-        _own_run(delegate)
-        out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-            {"question_id": "q1", "free_text": "x"},
-        ]))
-        assert out["status"] == "delivery_unknown", (code, out)
-        assert out["still_pending"] is True
-        assert "SAME answers" in out["note"]
-    delegate._CUSTODY.clear()
-
-
-def test_a_spent_subscription_window_is_schedulable_not_flattened(tmp_path, monkeypatch):
-    """R2-1: ClaudexorSubscriptionWindowExhausted keeps its own typed outcome
-    carrying reset_at — a schedulable condition (review_execution plans against
-    the same class), never flattened into `rejected` (which would tell the
-    nanny to rewrite perfectly valid rows)."""
-    import ouroboros.tools.delegate as delegate
-    from ouroboros.gateways.claudexor import ClaudexorSubscriptionWindowExhausted
-
-    _answer_stub(monkeypatch, error=ClaudexorSubscriptionWindowExhausted(
-        "window spent", reset_at="2026-08-11T22:00:00Z", status_code=429))
-    ctx = _answer_ctx(tmp_path)
-    _own_run(delegate)
-    out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "free_text": "x"},
-    ]))
-    delegate._CUSTODY.clear()
-    assert out["status"] == "subscription_window_exhausted", out
-    assert out["reset_at"] == "2026-08-11T22:00:00Z"
-    assert out["accepted"] is False
-    assert "SAME answers" in out["note"]
-
-
-def test_a_delivered_answer_pops_the_reported_memo_so_the_next_wait_reports(tmp_path, monkeypatch):
-    """F6 (gemini #2): after the engine resolves an interaction, the memo of
-    already-shown questions is stale — a re-ask (or the rest of the set) must be
-    news again on the very next wait, not held for a full window."""
+def test_a_valid_owned_answer_reports_the_retired_transport(tmp_path, monkeypatch):
+    """Past every gate — owned run, well-formed rows — the answer is reported
+    UNAVAILABLE: the gateway that carried the POST retired. Never a pretended
+    delivery, and no durable 'answered' row for an answer that never left this
+    machine (the engine never resolved anything)."""
     import ouroboros.tools.delegate as delegate
 
     _answer_stub(monkeypatch, result={"accepted": True, "status": "delivered"})
     ctx = _answer_ctx(tmp_path)
     _own_run(delegate)
-    delegate._REPORTED_INTERACTIONS["run-1"] = frozenset({"int-1"})
     out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
         {"question_id": "q1", "selected_labels": ["8080"]},
     ]))
-    assert out["status"] == "delivered"
-    assert "run-1" not in delegate._REPORTED_INTERACTIONS
-
-    # already_resolved pops it too; a plain refusal does not.
-    _answer_stub(monkeypatch, result={"accepted": False, "status": "already_resolved"})
-    delegate._REPORTED_INTERACTIONS["run-1"] = frozenset({"int-1"})
-    json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "free_text": "x"},
-    ]))
-    assert "run-1" not in delegate._REPORTED_INTERACTIONS
-
-    _answer_stub(monkeypatch, result={"accepted": False, "status": "rejected",
-                                      "message": "bad rows"})
-    delegate._REPORTED_INTERACTIONS["run-1"] = frozenset({"int-1"})
-    json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "free_text": "x"},
-    ]))
     delegate._CUSTODY.clear()
-    assert delegate._REPORTED_INTERACTIONS.get("run-1") == frozenset({"int-1"})
+    assert out["status"] == "unavailable"
+    assert out["reason"] == "claudexor_retired"
+    assert out["run_id"] == "run-1" and out["interaction_id"] == "int-1"
+    events_path = tmp_path / "logs" / "events.jsonl"
+    events = ([json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+              if events_path.exists() else [])
+    assert [e for e in events if e.get("type") == "delegate_interaction_answered"] == []
 
 
-def test_an_unexpected_exception_becomes_typed_delivery_unknown_not_a_traceback(tmp_path, monkeypatch):
-    """F7 (gemini #3): a broken gateway body (or any unexpected failure around
-    the call) reaches the model as the typed ambiguous outcome, never as a raw
-    traceback it can only retry blindly against."""
-    import ouroboros.tools.delegate as delegate
-
-    _answer_stub(monkeypatch, error=KeyError("malformed body surprise"))
-    ctx = _answer_ctx(tmp_path)
-    _own_run(delegate)
-    out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "free_text": "x"},
-    ]))
-    delegate._CUSTODY.clear()
-    assert out["status"] == "delivery_unknown", out
-    assert "NEVER post a different answer" in out["note"]
-
-
-def test_an_exhausted_internal_budget_returns_typed_without_further_wire_calls(tmp_path, monkeypatch):
-    """F8 (sol #5): the call runs under an internal monotonic deadline strictly
-    below its 120s ToolEntry timeout; once it is spent, the POST and the re-read
-    are both SKIPPED and the outcome is the typed delivery_unknown."""
-    import ouroboros.delegate_interactions as interactions
-    import ouroboros.tools.delegate as delegate
-    from ouroboros.gateways import claudexor as gw
-
-    assert interactions._ANSWER_DEADLINE_SEC < 120
-
-    wire_calls = []
-
-    class _Stub:
-        engine_version = "3.3.6"
-
-        def handshake(self, **_kw): return {}
-        def get_run(self, rid, *, timeout_sec=None):
-            wire_calls.append(("get_run", rid))
-            return {"lastSeq": 5, "summary": {"state": "running"}}
-        def answer_interaction(self, rid, iid, answers):
-            wire_calls.append(("answer", rid))
-            raise AssertionError("the POST must not be sent on a spent budget")
-        def close(self): pass
-
-    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
-    # Spend the budget instantly: the deadline computes to "already passed".
-    monkeypatch.setattr(interactions, "_ANSWER_DEADLINE_SEC", -1.0)
-    ctx = _answer_ctx(tmp_path)
-    _own_run(delegate)
-    out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "free_text": "x"},
-    ]))
-    delegate._CUSTODY.clear()
-    assert out["status"] == "delivery_unknown", out
-    assert out["still_pending"] is None
-    assert "time budget" in out["transport_error"] or "time budget" in out["note"]
-    assert wire_calls == [], "no wire calls after budget exhaustion"
-
-
-def test_answer_rows_are_validated_strictly_before_the_post(tmp_path, monkeypatch):
+def test_answer_rows_are_validated_strictly(tmp_path):
     """F14 (sol #13): string-only labels, non-empty label-or-freeText per row,
-    typed refusal on malformed input — no silent coercion that changes intent."""
+    typed refusal on malformed input — no silent coercion that changes intent.
+    The POST these rows used to travel on retired with its gateway; the strict
+    validation that gated it did not, and it still runs before the retirement."""
     import ouroboros.tools.delegate as delegate
 
-    sent = []
-
-    def _capture_stub(monkeypatch):
-        from ouroboros.gateways import claudexor as gw
-
-        class _Stub:
-            engine_version = "3.3.6"
-
-            def handshake(self, **_kw): return {}
-            def get_run(self, rid, *, timeout_sec=None):
-                return {"lastSeq": 5, "summary": {"state": "running"}}
-            def answer_interaction(self, rid, iid, answers):
-                sent.append(answers)
-                return {"accepted": True, "status": "delivered"}
-            def close(self): pass
-
-        monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
-
-    _capture_stub(monkeypatch)
     ctx = _answer_ctx(tmp_path)
     _own_run(delegate)
 
-    # Non-string label: refused, nothing posted (8080 as an int is NOT "8080").
+    # Non-string label: refused (8080 as an int is NOT "8080").
     out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
         {"question_id": "q1", "selected_labels": [8080]},
     ]))
@@ -606,23 +236,12 @@ def test_answer_rows_are_validated_strictly_before_the_post(tmp_path, monkeypatc
     ]))
     assert out["status"] == "refused" and out["reason"] == "answer_row_invalid"
 
-    # Empty row (no labels, no text): refused as empty, not posted as "an answer".
+    # Empty row (no labels, no text): refused as empty, never as "an answer".
     out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
         {"question_id": "q1", "selected_labels": [], "free_text": "  "},
     ]))
-    assert out["status"] == "refused" and out["reason"] == "answer_row_empty"
-    assert sent == [], "nothing malformed ever reached the wire"
-
-    # A valid row still flows, uncoerced.
-    out = json.loads(delegate._delegate_answer(ctx, "run-1", "int-1", [
-        {"question_id": "q1", "selected_labels": ["8080"]},
-    ]))
     delegate._CUSTODY.clear()
-    assert out["status"] == "delivered"
-    assert sent == [[{"questionId": "q1", "selectedLabels": ["8080"], "freeText": None}]]
-
-
-# -- fix batch: expiry-path measurement, notes, spill identity, advances ---------
+    assert out["status"] == "refused" and out["reason"] == "answer_row_empty"
 
 
 def _expiry_payload(pending_rows, *, advances=0, budget=None):
@@ -709,43 +328,6 @@ def test_bounded_interactions_bounds_every_harness_authored_scalar():
     assert out["interaction_id"] == "i" * 9_000  # a KEY, never truncated
     assert out["questions"][0]["question_id"] == "q" * 9_000
     assert "OMISSION NOTE" in out["questions"][0]["header"]
-
-
-def test_answer_keys_ride_whole_through_the_inline_preview(tmp_path, monkeypatch):
-    """R2-8: 200-char ids (over the old 160-char preview cut) must reach the
-    model VERBATIM in the immediate waiting payload — they are echoed into
-    delegate_answer, and a cut with an embedded marker yields engine
-    not_found."""
-    import ouroboros.tools.delegate as delegate
-
-    iid = "I" * 200
-    qid = "Q" * 200
-
-    # The small-set path: full rows ride inline, ids untouched.
-    row = _pending_row(iid=iid)
-    row["questions"][0]["id"] = qid
-    _waiting_stub(monkeypatch, [row])
-    ctx = _wait_ctx(tmp_path)
-    _own_run(delegate)
-    out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=600, since_seq=5))
-    assert out["status"] == "waiting_on_user"
-    shown = out["pending_interactions"][0]
-    assert shown["interaction_id"] == iid
-    assert shown["questions"][0]["question_id"] == qid
-
-    # The SPILLED path: the bounded preview cuts display fields, never the keys.
-    big = _pending_row(iid="R" * 200, question="x" * 30_000)
-    big["questions"][0]["id"] = "S" * 200
-    _waiting_stub(monkeypatch, [big])
-    delegate._REPORTED_INTERACTIONS.clear()
-    out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=600, since_seq=5))
-    delegate._CUSTODY.clear()
-    assert out["status"] == "waiting_on_user"
-    assert out["interactions_delivery"]["complete"] is False
-    shown = out["pending_interactions"][0]
-    assert shown["interaction_id"] == "R" * 200
-    assert shown["questions"][0]["question_id"] == "S" * 200
-    assert len(shown["questions"][0]["question"]) <= 600
 
 
 def test_even_one_unfittable_row_yields_to_the_counted_marker():
@@ -859,80 +441,6 @@ def test_the_paused_expiry_note_never_hints_a_cancel(tmp_path):
 
     silent_progress = _expiry_payload([], advances=4)
     assert "do not cancel over it" not in silent_progress["note"]
-
-
-def test_interaction_spill_name_is_interaction_addressed_and_immutable(tmp_path, monkeypatch):
-    """F15 (sol #14): a second, different pending set writes a DIFFERENT file —
-    the first spill's sha256/size receipt keeps describing bytes that exist."""
-    import ouroboros.tools.delegate as delegate
-
-    rows = [_pending_row(iid=f"int-{i}", question=("Part %d? " % i) + "x" * 900)
-            for i in range(24)]
-    _waiting_stub(monkeypatch, rows)
-    ctx = _wait_ctx(tmp_path)
-    _own_run(delegate)
-    first = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=600, since_seq=5))
-    first_artifact = first["interactions_delivery"]["artifact"]
-
-    # A NEW question set (new ids) spills again — to a NEW name.
-    rows2 = [_pending_row(iid=f"reask-{i}", question=("Again %d? " % i) + "y" * 900)
-             for i in range(24)]
-    _waiting_stub(monkeypatch, rows2)
-    second = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=600, since_seq=5))
-    delegate._CUSTODY.clear()
-    second_artifact = second["interactions_delivery"]["artifact"]
-
-    assert first_artifact["path"].endswith(".interactions.json")
-    assert second_artifact["path"] != first_artifact["path"]
-    # BOTH files exist and BOTH receipts still verify.
-    import hashlib as _hashlib
-    import pathlib as _pathlib
-
-    for artifact in (first_artifact, second_artifact):
-        data = _pathlib.Path(artifact["abs_path"]).read_bytes()
-        assert _hashlib.sha256(data).hexdigest() == artifact["sha256"]
-        assert len(data) == artifact["bytes"]
-
-
-def test_the_immediate_waiting_payload_carries_the_windows_advances(tmp_path, monkeypatch):
-    """F17 (grok): a window cut short by a question must not lose the journal
-    sequence it already observed — a compact `advances` list rides the immediate
-    waiting_on_user return."""
-    import ouroboros.tools.delegate as delegate
-    from ouroboros.gateways import claudexor as gw
-
-    run_calls = {"n": 0}
-
-    class _AdvancingThenAsking:
-        engine_version = "3.3.6"
-
-        def handshake(self, **_kw): return {}
-        def get_run(self, rid, *, timeout_sec=None):
-            run_calls["n"] += 1
-            if run_calls["n"] == 1:
-                return {"lastSeq": 5, "summary": {"state": "running",
-                                                  "effectiveAccess": "readonly"},
-                        "timeline": [{"type": "tool", "title": "step one"}]}
-            return {"lastSeq": 6,
-                    "pendingInteractions": [_pending_row()],
-                    "summary": {"state": "running", "effectiveAccess": "readonly",
-                                "waitingOnUser": True},
-                    "timeline": [{"type": "tool", "title": "step one"},
-                                 {"type": "tool", "title": "step two"}]}
-        def close(self): pass
-
-    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _AdvancingThenAsking())
-    ctx = _wait_ctx(tmp_path)
-    _own_run(delegate)
-    out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=600, since_seq=5))
-    delegate._CUSTODY.clear()
-    assert out["status"] == "waiting_on_user"
-    assert out["advances"], out
-    assert any("step two" in json.dumps(row, ensure_ascii=False)
-               for row in out["advances"])
-
-
-# -- codex lane: the terminal question ------------------------------------------
 
 
 def test_an_input_required_terminal_names_the_new_start_path():

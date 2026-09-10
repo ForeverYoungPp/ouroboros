@@ -15,6 +15,7 @@ import subprocess
 import pytest
 
 from ouroboros import delegate_custody as custody
+from ouroboros.errors import OuroborosUnavailableError
 from ouroboros.subagent_worktrees import (
     find_execution_snapshot,
     provision_execution_snapshot,
@@ -459,29 +460,6 @@ class TestSensitiveVeto:
         assert (exec_root / "tracked.txt").read_text(encoding="utf-8") == "one\ntwo\n"
 
 
-class TestLegacyRetry:
-    def test_pre_isolation_mutating_retry_is_refused(self, tmp_path, monkeypatch):
-        # F5: a stored PRE-C1 row has no snapshot binding and its recorded body's
-        # scope.root IS the live tree — replaying it would write straight into the
-        # shared tree in the in-place regime C1 retired.
-        from ouroboros.tools.delegate import _delegate_start
-
-        target = _seed_target(tmp_path)
-        ctx = _nanny_ctx(tmp_path, target, monkeypatch)
-        drive = custody.custody_root(ctx)
-        assert custody.record_start_requested(
-            drive, run_id="", task_id="t-nanny", idempotency_key="k",
-            invocation_id="inv-legacy", request={
-                "prompt": "do the thing", "access": "workspace_write", "mode": "agent",
-                "scope": {"kind": "project", "root": str(target)},
-                "execution": {"isolation": "live", "delegated": True},
-                "primaryHarness": "some-route",
-            }, project_id="p", project_owned=False, route="some-route")
-        out = _delegate_start(ctx, "do the thing", retry_of="inv-legacy")
-        assert "retry_binding_absent" in out, out
-        custody._CUSTODY.clear()
-
-
 class TestDurableBinding:
     def test_binding_rides_start_rows_and_replays(self, tmp_path):
         drive = tmp_path / "drive"
@@ -766,6 +744,16 @@ class TestOrphanReconciliation:
         custody._CUSTODY.clear()
 
 
+class _AbsentRun(OuroborosUnavailableError):
+    """A transport that ANSWERED that the run does not exist.
+
+    The 404 is the fact ``daemon_says_absent`` classifies on, and it rides the
+    surviving typed refusal's ``status_code`` (the retired gateway's own error
+    class went with the transport)."""
+
+    status_code = 404
+
+
 class _AbsentGateway:
     """A daemon that answers 404 for every run — the reconcile 'absent' branch.
 
@@ -777,14 +765,10 @@ class _AbsentGateway:
         return {"compatible": True}
 
     def get_run(self, rid, **_kw):
-        from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
-        raise ClaudexorUnavailable("not_found", "no such run", status_code=404)
+        raise _AbsentRun("no such run")
 
     def cancel_run(self, rid, reason=""):
-        from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
-        raise ClaudexorUnavailable("not_found", "no such run", status_code=404)
+        raise _AbsentRun("no such run")
 
     def remove_project(self, pid):
         return {}

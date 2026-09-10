@@ -1,7 +1,6 @@
 """WS8: swarm_fanout telemetry shape + reject-meta marker."""
 from __future__ import annotations
 
-import hashlib
 import json
 import types
 
@@ -132,73 +131,17 @@ def test_delegated_run_fanout_silent_when_start_uncustodied(tmp_path):
     assert _fanout_events(tmp_path) == []
 
 
-def _real_delegate_start(
-    tmp_path, monkeypatch, *, metadata, custody_durable=True,
-    actor_first_work_order="", coordination_context="",
-):
-    """Run the REAL _delegate_start against a stubbed gateway with an explicit
-    exact-start selection (the test_delegated_subagent_transport idiom) and
-    return its parsed payload."""
+def _refused_delegate_start(tmp_path, metadata):
+    """Run the REAL delegate_start against a minimal host context.
+
+    The delegated-run transport retired with its own modules (Seed 0), so every
+    metadata shape meets the same typed refusal: nothing was started, and there
+    is no run for swarm telemetry to fold in.
+    """
     import ouroboros.tools.delegate as delegate
-    from ouroboros import claudexor_daemon, delegate_custody, subagent_runtime, subagents
-    from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
     from ouroboros.contracts.task_constraint import TaskConstraint
-    from ouroboros.gateways import claudexor as gw
     from ouroboros.tools.registry import ToolContext
 
-    class _Stub:
-        engine_version = CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
-
-        def handshake(self, **_kw):
-            return {}
-
-        def agent_capabilities(self):
-            return {"harnesses": [{
-                "id": "some-route", "enabled": True, "status": "ok",
-                "accessProfilesSupported": ["readonly", "workspace_write"],
-            }]}
-
-        def quota_snapshots(self):
-            return []
-
-        def find_project_id(self, root):
-            return "prj-existing"
-
-        def register_project(self, root):
-            raise AssertionError("must reuse the registration")
-
-        def start_run(self, request, *, idempotency_key=""):
-            return {"runId": "run-real", "runDir": "/tmp/run-real"}
-
-        def close(self):
-            pass
-
-    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
-    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
-    monkeypatch.setattr(claudexor_daemon, "ensure_owned_gateway", lambda: _Stub())
-    original_actor = delegate.prepare_delegate_start_actor
-
-    def explicit_transport_actor(ctx, drive_root, **kwargs):
-        route = subagents.get_subagent_harness()
-        target = route.route_id + (f"={route.model}" if route.model else "")
-        token = subagent_runtime._EXACT_START_SELECTION.set({
-            "snapshot": {
-                "schema": 1, "selected_subagent_id": "transport-fixture",
-                "config_fingerprint": "transport-fixture-v1",
-                "route": {"kind": "agent_session", "target_id": target,
-                          "credential_profile_id": route.profile_id},
-                "effort": route.effort,
-            },
-        })
-        try:
-            return original_actor(ctx, drive_root, **kwargs)
-        finally:
-            subagent_runtime._EXACT_START_SELECTION.reset(token)
-
-    if not actor_first_work_order:
-        monkeypatch.setattr(delegate, "prepare_delegate_start_actor", explicit_transport_actor)
-    if not custody_durable:
-        monkeypatch.setattr(delegate, "record_started_custody", lambda *a, **k: False)
     repo = tmp_path / "repo"
     repo.mkdir(exist_ok=True)
     ctx = ToolContext(
@@ -208,116 +151,21 @@ def _real_delegate_start(
     ctx.task_id = "t-nanny"
     ctx.task_depth = 1
     ctx.task_metadata = metadata
-    delegate_custody._CUSTODY.clear()
-    if actor_first_work_order:
-        target = "some-route=weak-model:low"
-        snapshot = {
-            "schema": 1,
-            "selected_subagent_id": "transport-fixture",
-            "config_fingerprint": "transport-fixture-v1",
-            "route": {
-                "kind": "agent_session",
-                "target_id": target,
-                "credential_profile_id": "",
-            },
-            "effort": "low",
-        }
-        ctx._configured_actor_bootstrap = {
-            "snapshot": snapshot,
-            "selected_subagent_id": "transport-fixture",
-            "config_fingerprint": "transport-fixture-v1",
-            "canonical_work_order": actor_first_work_order,
-            "work_order_fingerprint": hashlib.sha256(
-                actor_first_work_order.encode("utf-8")
-            ).hexdigest(),
-            "source_request": {},
-            "source_channel": {},
-            "exact_start_pending": True,
-            "physical_started": False,
-            "route_available": True,
-        }
-        payload = json.loads(
-            subagent_runtime.delegate_start_entry(ctx, coordination_context)
-        )
-    else:
-        payload = json.loads(delegate._delegate_start(ctx, "edit the README"))
-    delegate_custody._CUSTODY.clear()
-    return payload
+    return json.loads(delegate._delegate_start(ctx, "edit the README"))
 
 
-def test_delegate_start_emits_fanout_after_custody_under_swarm_intent(tmp_path, monkeypatch):
-    payload = _real_delegate_start(tmp_path, monkeypatch, metadata={
-        "root_task_id": "t-root", "parent_task_id": "t-root",
-        "force_plan_source": "swarm",
-    })
-    assert payload["status"] == "started" and payload["custody_durable"] is True
-    evts = _fanout_events(tmp_path)
-    assert len(evts) == 1
-    evt = evts[0]
-    assert evt["task_ids"] == [payload["run_id"]]
-    assert evt["parent_task_id"] == "t-nanny"
-    assert evt["root_task_id"] == "t-root"
-    assert evt["requested_count"] == 1
-    assert evt["role"] == "delegated_run"
-    assert evt["requested_model_lane"] == payload["route"]
-
-
-def test_delegate_start_without_swarm_intent_stays_out_of_swarm_telemetry(tmp_path, monkeypatch):
-    payload = _real_delegate_start(tmp_path, monkeypatch, metadata={
-        "root_task_id": "t-root", "parent_task_id": "t-root",
-    })
-    assert payload["status"] == "started"
-    assert _fanout_events(tmp_path) == []
-
-
-def test_delegate_start_uncustodied_emits_no_fanout_even_under_swarm_intent(tmp_path, monkeypatch):
-    payload = _real_delegate_start(
-        tmp_path, monkeypatch, custody_durable=False, metadata={
-            "root_task_id": "t-root", "parent_task_id": "t-root",
-            "force_plan_source": "swarm",
-        },
-    )
-    assert payload["status"] == "started_uncustodied"
-    assert _fanout_events(tmp_path) == []
-
-
-def test_actor_first_swarm_fanout_uses_frozen_work_order_after_custody(
-    tmp_path, monkeypatch,
-):
-    canonical = "CANONICAL_WORK_ORDER:" + ("source-owned " * 30)
-    appendix = "COORDINATION_APPENDIX_ONLY"
-    payload = _real_delegate_start(
-        tmp_path,
-        monkeypatch,
-        metadata={
-            "root_task_id": "t-root",
-            "parent_task_id": "t-root",
-            "force_plan_source": "swarm",
-        },
-        actor_first_work_order=canonical,
-        coordination_context=appendix,
-    )
-
-    assert payload["status"] == "started" and payload["custody_durable"] is True
-    events = _fanout_events(tmp_path)
-    assert len(events) == 1
-    assert events[0]["objective_preview"] == canonical[:200]
-    assert appendix not in events[0]["objective_preview"]
-
-
-def test_actor_first_uncustodied_start_stays_out_of_swarm_telemetry(
-    tmp_path, monkeypatch,
-):
-    payload = _real_delegate_start(
-        tmp_path,
-        monkeypatch,
-        custody_durable=False,
-        metadata={"force_plan_source": "swarm"},
-        actor_first_work_order="CANONICAL_WORK_ORDER",
-        coordination_context="coordination only",
-    )
-
-    assert payload["status"] == "started_uncustodied"
+def test_refused_delegate_start_emits_no_swarm_fanout_telemetry(tmp_path):
+    # A refusal is not a delegation: no run exists, so a wave event here would
+    # mint a phantom child card — under Swarm intent most of all.
+    for metadata in (
+        {},
+        {"force_plan_source": "operator"},
+        {"force_plan": True},
+        {"force_plan_source": "swarm", "root_task_id": "t-root"},
+    ):
+        payload = _refused_delegate_start(tmp_path, metadata)
+        assert payload["status"] == "refused"
+        assert payload["reason"] == "claudexor_retired"
     assert _fanout_events(tmp_path) == []
 
 

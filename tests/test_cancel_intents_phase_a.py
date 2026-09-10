@@ -2914,39 +2914,6 @@ def test_kill_path_clean_audit_clears_a_stale_unreconciled_list(qenv, monkeypatc
     assert only_write["delegate_terminal_reconciliation"]["trigger"] == "cancel_publication"
 
 
-def test_nested_scoped_home_is_disclosed_even_with_an_os_boundary(tmp_path, monkeypatch):
-    """A-F13: a nested home + recorded boundary was promoted to verified=true and
-    its durable unconfined row was suppressed."""
-    from ouroboros.gateways.claudexor import AttemptContainment
-    from ouroboros.tools import delegate as dg
-
-    operator_home = tmp_path / "home"
-    nested = operator_home / ".claudexor" / "v3" / "scoped" / "a01"
-    nested.mkdir(parents=True)
-    attempts = [AttemptContainment(
-        attempt_id="a01", home_isolated=True, home_dir=str(nested),
-        boundary_mechanism="seatbelt",
-    )]
-    monkeypatch.setattr("ouroboros.gateways.claudexor.attempt_containment",
-                        lambda run_dir: attempts)
-    monkeypatch.setattr("ouroboros.gateways.claudexor.operator_home",
-                        lambda: str(operator_home))
-    detail = {"summary": {"runDir": str(tmp_path / "run")}}
-
-    evidence = dg._containment_evidence(detail)
-
-    assert evidence["nested_under_operator_home"] is True
-    assert evidence["verified"] is False, "a nested home is not isolation"
-    assert "not isolation from the operator's home" in evidence["note"]
-    assert "seatbelt boundary WAS applied" in evidence["note"]
-
-    # And the durable unconfined row is still emitted for that shape.
-    emitted: list = []
-    monkeypatch.setattr(dg, "_emit", lambda ctx, kind, payload: emitted.append((kind, payload)))
-    dg._record_containment(None, None, {"containment": evidence, "state": "succeeded"})
-    assert emitted and emitted[0][1]["nested_under_operator_home"] is True
-
-
 def test_steering_refusal_covers_the_legacy_latch_too(tmp_path, monkeypatch):
     """A-F19: a pre-migration wedged task must not accept new owner messages."""
     import supervisor.events as events_mod

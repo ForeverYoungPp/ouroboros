@@ -11,12 +11,16 @@ enforced as a fault.
 
 from __future__ import annotations
 
+import logging
 import pathlib
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from ouroboros import delegate_custody as custody
+from ouroboros.subagents import CLAUDEXOR_RETIRED
 from ouroboros.utils import resolve_path_allow_missing
+
+log = logging.getLogger(__name__)
 
 _TERMINAL_STATES = custody.TERMINAL_STATES
 
@@ -126,45 +130,15 @@ def _home_isolation_breach(detail: Dict[str, Any]) -> Optional[_Breach]:
       already holds a shell in this worktree, and the marginal step from "shell"
       to "``~``-relative token reachability" does not justify cutting the lane on
       every boundary-less host (AGENTS.md "Disclose instead of forbid";
-      Proportionality). ``confinement_unavailable_reason`` from the same attempt
+      ``confinement_unavailable_reason`` from the same attempt
       artifact amplifies that disclosure — telemetry, never an admission token.
-    """
-    from ouroboros.gateways.claudexor import attempt_containment, operator_home
 
-    run_dir = str(custody.summary_of(detail).get("runDir") or "")
-    if not run_dir:
-        return None
-    attempts = attempt_containment(run_dir)
-    if not attempts:
-        return None
-    real_home = _resolved(operator_home())
-    for attempt in attempts:
-        if attempt.home_isolated is None:
-            continue
-        if attempt.home_isolated is False:
-            return _Breach(
-                "home_isolation_not_applied",
-                "The delegated run asked for a scoped harness HOME and the engine "
-                "recorded that none was applied, leaving the harness in the "
-                "operator's own home, where the Claudexor daemon token grants the "
-                "entire control API.",
-                {"attempt_id": attempt.attempt_id, "harness_home_dir": attempt.home_dir,
-                 "harness_home_isolated": attempt.home_isolated},
-            )
-        applied = _resolved(attempt.home_dir) if attempt.home_dir else None
-        # EQUALITY is never excused: an "isolated" home naming the operator's own
-        # verbatim is the lie itself. Both sides resolved, so a symlink cannot
-        # launder it. (Nested-under-$HOME is the engine's own layout — disclosed,
-        # not refused; see the docstring.)
-        if applied is not None and real_home is not None and applied == real_home:
-            return _Breach(
-                "home_isolation_not_applied",
-                "The delegated run claims an isolated harness HOME that IS the "
-                "operator's own home, where the Claudexor daemon token grants the "
-                "entire control API.",
-                {"attempt_id": attempt.attempt_id, "harness_home_dir": attempt.home_dir,
-                 "harness_home_isolated": attempt.home_isolated},
-            )
+    THE READER RETIRED WITH CLAUDEXOR: the applied facts live only in the engine's
+    own run tree (``attempt_containment`` / ``operator_home``), so no attempt record
+    is readable any more. This reports the same honest ``None`` an ABSENT fact always
+    produced — absence stays absence, never a fabricated breach.
+    """
+    log.debug("home-isolation verification unavailable: %s", CLAUDEXOR_RETIRED)
     return None
 
 
@@ -180,18 +154,11 @@ def home_nested_under_operator_home(detail: Dict[str, Any]) -> bool:
     unconfined row is only emitted for runs with no boundary, the disclosure
     disappeared entirely. Absence of the fact stays absence: a run that recorded
     no home is unproven, not nested.
-    """
-    from ouroboros.gateways.claudexor import attempt_containment, operator_home
 
-    run_dir = str(custody.summary_of(detail).get("runDir") or "")
-    if not run_dir:
-        return False
-    real_home = _resolved(operator_home())
-    if real_home is None:
-        return False
-    for attempt in attempt_containment(run_dir):
-        applied = _resolved(attempt.home_dir) if attempt.home_dir else None
-        if applied is not None and real_home in applied.parents:
-            return True
+    THE READER RETIRED WITH CLAUDEXOR (``attempt_containment`` / ``operator_home``):
+    no attempt record is readable any more, so this answers the same ``False`` an
+    unrecorded home always did — unproven, never asserted as nested.
+    """
+    log.debug("nested-home reporting unavailable: %s", CLAUDEXOR_RETIRED)
     return False
 

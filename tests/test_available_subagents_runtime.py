@@ -191,22 +191,9 @@ def test_api_actor_dispatch_is_exact_recursive_route_without_slot_substitution(m
     assert dispatch.availability["route_kind"] == "api_model"
 
 
-def test_session_dispatch_pins_exact_route_and_inherits_parent_cognition(monkeypatch):
+def test_session_dispatch_pins_exact_route_and_inherits_parent_cognition():
     import ouroboros.subagents as subagents
-    import ouroboros.claudexor_daemon as daemon
 
-    class Gateway:
-        def close(self):
-            pass
-
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: Gateway())
-    seen = {}
-
-    def health(_gateway, route_id, _shape, *, route_model="", pinned_profile=""):
-        seen.update(route_id=route_id, model=route_model, profile=pinned_profile)
-        return "", ""
-
-    monkeypatch.setattr(subagents, "route_health", health)
     snapshot = _snapshot(_settings(_session_row()), "session-builder")
     dispatch = subagents.resolve_subagent_dispatch({
         "id": "child1",
@@ -220,10 +207,18 @@ def test_session_dispatch_pins_exact_route_and_inherits_parent_cognition(monkeyp
         },
         "task_constraint": {},
     }, task_type="task")
-    assert dispatch.executor == "harness"
+    # The harness lane retired with the gateway family: a configured session
+    # dispatch is now a typed blocker with the retirement as its reason — never a
+    # ready route — while the route the snapshot named stays exactly pinned.
+    assert dispatch.executor == "blocked"
+    assert dispatch.executor_resolution.reason == "claudexor_retired"
+    assert dispatch.executor_resolution.route == subagents.DelegationRoute(
+        route_id="codex", model="gpt-5.6-sol", effort="high", profile_id="profile-1",
+    )
+    # The native axes are untouched: the child still runs on the parent's own
+    # cognitive route and effort.
     assert dispatch.lane.model == "anthropic/parent-exact"
     assert dispatch.effort == "max"
-    assert seen == {"route_id": "codex", "model": "gpt-5.6-sol", "profile": "profile-1"}
 
 
 def test_selected_session_visibility_failure_blocks_without_native_substitution(monkeypatch):
@@ -261,33 +256,14 @@ def test_selected_session_visibility_failure_blocks_without_native_substitution(
     assert amended.executor_resolution.reason == "delegate_tools_invisible"
 
 
-@pytest.mark.parametrize(
-    ("interactive", "expected_reason"),
-    [
-        (True, ""),
-        (False, "work_order_source_channel_unavailable"),
-    ],
-)
-def test_over_budget_bootstrap_uses_only_a_live_interaction_channel(
-    monkeypatch, tmp_path, interactive, expected_reason,
+def test_over_budget_bootstrap_refuses_when_the_source_channel_is_retired(
+    monkeypatch, tmp_path,
 ):
     from ouroboros import delegate_custody as custody
-    import ouroboros.claudexor_daemon as daemon
     import ouroboros.subagent_bootstrap as bootstrap
     import ouroboros.subagent_runtime as runtime
     from ouroboros.subagent_work_order import work_order_fingerprint
 
-    class Gateway:
-        def harnesses(self):
-            return [{
-                "id": "codex",
-                "manifest": {"capabilities": {"interactive": interactive}},
-            }]
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: Gateway())
     calls = []
     monkeypatch.setattr(runtime, "exact_start", lambda ctx, prompt, spec: (
         calls.append((prompt, spec))
@@ -315,156 +291,31 @@ def test_over_budget_bootstrap_uses_only_a_live_interaction_channel(
         "task_contract": {"objective": "THIS MUST NOT BE SENT AS A PREFIX " + ("x" * 250_100)},
     }
     full_sha = work_order_fingerprint(task)
-    # Charter D1: the host pre-starts the leaf during bootstrap, through the
-    # same wrapper the model's delegate_start(prompt="") uses — and does NOT
-    # wait on it (owner 1=A). With a live interactive channel the oversized
-    # order rides the source-request lens; without one, the definite refusal
-    # ends the child unrun and typed at $0.
+    # The route-manifest channel reader retired with the gateway family, so no
+    # route can offer a source lens any more: the oversized canonical order is
+    # refused typed at $0, the child ends unrun, and the complete work order is
+    # never sent as a prefix.
     raw = bootstrap.bootstrap_before_context(ctx, task, dispatch)
     custody_rows = [
         json.loads(line)
         for line in custody.event_log_path(tmp_path).read_text().splitlines()
     ]
 
-    if interactive:
-        out = json.loads(raw)
-        assert out["status"] == "configured_session_started"
-        assert out["startup"]["status"] == "started"
-        assert out["startup"]["run_id"] == "run-source"
-        assert len(calls) == 1
-        prompt, spec = calls[0]
-        assert "WORK ORDER SOURCE REQUEST" in prompt
-        assert "THIS MUST NOT BE SENT AS A PREFIX" not in prompt
-        assert spec["compiled_work_order"] is True
-        assert spec["work_order_fingerprint"] == full_sha
-        assert spec["work_order_source_request"]["complete_sha256"] == full_sha
-        assert custody_rows[-1]["type"] == "configured_subagent_work_order_source_request"
-        assert custody_rows[-1]["status"] == "attempted"
-        assert custody_rows[-1]["source_channel"] == {
-            "status": "available",
-            "reason": "interactive",
-            "route": "codex",
-        }
-    else:
-        assert raw == ""
-        assert ctx._configured_startup_refusal["reason"] == expected_reason
-        assert calls == []
-        assert custody_rows[-1]["type"] == "delegate_run_start_blocked"
-        assert custody_rows[-2]["type"] == "configured_subagent_work_order_refused"
-        assert custody_rows[-2]["reason"] == expected_reason
-
-
-@pytest.mark.parametrize(
-    ("bootstrap_interactive", "start_interactive", "expected_status", "expected_reason"),
-    [
-        (True, False, "refused", "work_order_source_channel_unavailable"),
-        (None, True, "started", ""),
-        (True, None, "refused", "work_order_source_channel_unverified"),
-    ],
-)
-def test_over_budget_start_reprobes_live_interaction_capability(
-    monkeypatch, tmp_path, bootstrap_interactive, start_interactive,
-    expected_status, expected_reason,
-):
-    from ouroboros import delegate_custody as custody
-    import ouroboros.claudexor_daemon as daemon
-    import ouroboros.subagent_bootstrap as bootstrap
-    import ouroboros.subagent_runtime as runtime
-
-    observations = iter([bootstrap_interactive, start_interactive])
-    closed = []
-
-    class Gateway:
-        def harnesses(self):
-            interactive = next(observations)
-            capabilities = (
-                {} if interactive is None else {"interactive": interactive}
-            )
-            return [{
-                "id": "codex",
-                "manifest": {"capabilities": capabilities},
-            }]
-
-        def close(self):
-            closed.append(True)
-
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", Gateway)
-    starts = []
-    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, prompt, spec: (
-        starts.append((prompt, spec))
-        or json.dumps({"status": "started", "run_id": "run-live-probe"})
-    ))
-    import ouroboros.delegate_supervision as supervision
-
-    monkeypatch.setattr(
-        supervision, "supervised_wait",
-        lambda *_a, **_kw: pytest.fail("the host must not wait inside bootstrap (owner 1=A)"),
-    )
-    snapshot = _snapshot(
-        _settings(_session_row(target="codex=gpt-5.6-sol")),
-        "session-builder",
-    )
-    dispatch = SimpleNamespace(
-        executor="harness", blocked=False,
-        executor_resolution=SimpleNamespace(route=SimpleNamespace(route_id="codex")),
-    )
-    ctx = SimpleNamespace(
-        task_id="child-live-probe",
-        drive_root=tmp_path,
-        budget_drive_root=str(tmp_path),
-        task_metadata={},
-    )
-    task = {
-        "id": "child-live-probe",
-        "objective": "x" * 250_100,
-        "configured_subagent": snapshot,
-        "task_contract": {"objective": "x" * 250_100},
+    assert raw == ""
+    assert ctx._configured_startup_refusal["reason"] == "work_order_source_channel_unavailable"
+    assert calls == []
+    assert custody_rows[-1]["type"] == "delegate_run_start_blocked"
+    assert custody_rows[-1]["reason"] == "configured_work_order_source_refused"
+    refused = custody_rows[-2]
+    assert refused["type"] == "configured_subagent_work_order_refused"
+    assert refused["reason"] == "work_order_source_channel_unavailable"
+    assert refused["route"] == "codex"
+    assert refused["complete_sha256"] == full_sha
+    assert refused["source_channel"] == {
+        "status": "unavailable",
+        "reason": "claudexor_retired",
+        "route": "codex",
     }
-
-    # Charter D1: both observations happen inside the bootstrap now — the
-    # cached channel probe at authority-freeze time, then the LIVE re-probe
-    # inside the pre-start's delegate_start_entry. The (True→False) row proves
-    # the cached "available" observation is context only, never start
-    # authority: the live probe overrides it into a typed $0 refusal.
-    raw = bootstrap.bootstrap_before_context(ctx, task, dispatch)
-    custody_rows = [
-        json.loads(line)
-        for line in custody.event_log_path(tmp_path).read_text().splitlines()
-    ]
-
-    assert len(closed) == 2
-    assert ctx._configured_actor_bootstrap["source_channel"]["route"] == "codex"
-    if expected_reason:
-        assert raw == ""
-        assert ctx._configured_startup_refusal["reason"] == expected_reason
-        assert starts == []
-        # The refusal row plus the D5 attempt fact: a pre-custody refusal is
-        # still a durable delegate_start ATTEMPT (triad 2026-08-30).
-        assert custody_rows[-1]["type"] == "delegate_run_start_blocked"
-        assert custody_rows[-1]["reason"] == "configured_work_order_source_refused"
-        refused = custody_rows[-2]
-        assert refused["route"] == "codex"
-        assert refused["type"] == "configured_subagent_work_order_refused"
-        assert refused["reason"] == expected_reason
-        assert refused["source_channel"]["reason"] == (
-            "interactive_unsupported"
-            if start_interactive is False
-            else "interactive_capability_missing"
-        )
-    else:
-        out = json.loads(raw)
-        assert out["status"] == "configured_session_started"
-        assert out["startup"]["status"] == expected_status
-        assert len(starts) == 1
-        assert "WORK ORDER SOURCE REQUEST" in starts[0][0]
-        assert custody_rows[-1]["route"] == "codex"
-        assert custody_rows[-1]["type"] == "configured_subagent_work_order_source_request"
-        assert custody_rows[-1]["status"] == "attempted"
-        assert custody_rows[-1]["source_channel"] == {
-            "status": "available",
-            "reason": "interactive",
-            "route": "codex",
-        }
 
 
 def test_pending_over_budget_recovery_replays_compact_body_and_full_fingerprint(
@@ -553,12 +404,11 @@ def test_pending_over_budget_recovery_replays_compact_body_and_full_fingerprint(
     custody._CUSTODY.clear()
 
 
-def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tmp_path):
+def test_real_task_context_refuses_retired_configured_session_before_any_llm(
+    monkeypatch, tmp_path,
+):
     from ouroboros import agent as agent_module
-    import ouroboros.claudexor_daemon as daemon
-    import ouroboros.delegate_supervision as supervision
     import ouroboros.subagent_runtime as runtime
-    import ouroboros.subagents as subagents
     from ouroboros.agent import Env, OuroborosAgent
 
     repo, drive = tmp_path / "repo", tmp_path / "drive"
@@ -566,27 +416,15 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
     drive.mkdir()
     order = []
 
-    class Gateway:
-        def close(self):
-            pass
-
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: Gateway())
-    monkeypatch.setattr(
-        subagents, "route_health",
-        lambda *_a, **_k: ("", ""),
-    )
     monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
-    # Charter D1 + owner 1=A: the host pre-starts the exact leaf during
-    # bootstrap, before the context build and any model call — and does NOT
-    # wait on it: the first round arrives immediately with the live receipt.
+    # The harness lane retired with the gateway family, so a configured session
+    # can no longer reach a physical start: the start primitive must not even be
+    # called, and the child must not burn a metered round proving it.
     monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: (
         order.append("physical_start")
         or json.dumps({"status": "started", "run_id": "run-pre-start"})
     ))
-    monkeypatch.setattr(
-        supervision, "supervised_wait",
-        lambda *_a, **_kw: pytest.fail("the host must not wait inside bootstrap (owner 1=A)"),
-    )
+
     def build_context(**_kwargs):
         order.append("context_build")
         return [], {}
@@ -608,18 +446,15 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
         "task_contract": {"objective": "Build", "expected_output": "Patch"},
         "drive_root": str(drive), "budget_drive_root": str(drive),
     })
-    assert order == ["physical_start", "context_build"]
-    assert any("CONFIGURED SESSION STARTUP / WAKE RECEIPT" in item["content"] for item in messages)
-    receipt = next(item["content"] for item in messages if "CONFIGURED SESSION STARTUP / WAKE RECEIPT" in item["content"])
-    assert "configured_session_started" in receipt
-    assert "run-pre-start" in receipt
-    assert "Waiting is your decision" in receipt
+    assert order == ["context_build"]
+    assert _ctx._configured_startup_refusal["reason"] == "claudexor_retired"
     assert _ctx._configured_actor_bootstrap["selected_subagent_id"] == "session-builder"
-    assert _ctx._configured_actor_bootstrap["canonical_work_order"]
-    assert _ctx._configured_actor_bootstrap["physical_started"] is True
-    # The physical run exists before the first round, so the pacing baseline
-    # starts seeded — burn is measured from the live delegated activity.
-    assert _ctx._nanny_delegate_baseline == {"round": 0, "cost": 0.0}
+    assert _ctx._configured_actor_bootstrap["physical_started"] is False
+    # The executor axis is disclosed to the child rather than silently dropped:
+    # it is told to do the work natively and to say so.
+    delta = next(item["content"] for item in messages if "[CAPABILITY DELTA]" in item["content"])
+    assert "executor harness->blocked" in delta
+    assert "claudexor_retired" in delta
 
 
 def test_actor_first_delegate_start_binds_snapshot_and_canonical_work_order(monkeypatch, tmp_path):
@@ -882,16 +717,7 @@ def test_actor_first_delegate_start_rejects_alternate_snapshot(monkeypatch, tmp_
 
 def test_actor_first_retry_cannot_turn_coordination_prompt_into_work_order_prefix(monkeypatch, tmp_path):
     import ouroboros.subagent_runtime as runtime
-    import ouroboros.claudexor_daemon as daemon
 
-    class Gateway:
-        def harnesses(self):
-            return [{"id": "codex", "manifest": {"capabilities": {}}}]
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", Gateway)
     snapshot = _snapshot(_settings(_session_row()), "session-builder")
 
     ctx = SimpleNamespace(
@@ -915,53 +741,14 @@ def test_actor_first_retry_cannot_turn_coordination_prompt_into_work_order_prefi
     out = json.loads(runtime.delegate_start_entry(
         ctx, "coordination text is not the canonical assignment", retry_of="inv-1",
     ))
+    # The source channel is permanently unavailable now — its reader retired with
+    # the gateway family — so the refusal names that rather than an unverified
+    # probe, and the frozen route the channel was re-derived from rides along.
     assert out["status"] == "refused"
-    assert out["reason"] == "work_order_source_channel_unverified"
-
-
-def test_actor_first_over_budget_retry_reprobes_source_channel(monkeypatch, tmp_path):
-    import ouroboros.claudexor_daemon as daemon
-    import ouroboros.subagent_runtime as runtime
-
-    class Gateway:
-        def harnesses(self):
-            return [{
-                "id": "codex",
-                "manifest": {"capabilities": {"interactive": True}},
-            }]
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", Gateway)
-    starts = []
-    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, prompt, spec: (
-        starts.append((prompt, spec))
-        or json.dumps({"status": "started", "run_id": "run-retry"})
-    ))
-    snapshot = _snapshot(_settings(_session_row()), "session-builder")
-    ctx = SimpleNamespace(
-        task_id="child-over-budget-retry",
-        drive_root=tmp_path,
-        budget_drive_root=str(tmp_path),
-        _configured_actor_bootstrap={
-            "snapshot": snapshot,
-            "selected_subagent_id": "session-builder",
-            "canonical_work_order": "",
-            "source_prompt": "WORK ORDER SOURCE REQUEST\ncoverage=partial",
-            "source_request": {"kind": "complete_work_order", "sha256": "f" * 64},
-            "source_channel": {"status": "unavailable", "route": "cursor"},
-            "work_order_fingerprint": "f" * 64,
-            "work_order_chars": 250001,
-        },
-    )
-
-    out = json.loads(runtime.delegate_start_entry(ctx, "ignored", retry_of="inv-1"))
-
-    assert out["status"] == "started"
-    assert len(starts) == 1
-    assert starts[0][1]["retry_of"] == "inv-1"
-    assert ctx._configured_actor_bootstrap["source_channel"]["route"] == "codex"
+    assert out["reason"] == "work_order_source_channel_unavailable"
+    assert out["source_channel"] == {
+        "status": "unavailable", "reason": "claudexor_retired", "route": "codex",
+    }
 
 
 def test_actor_first_bootstrap_adopts_existing_handoff_without_new_start(monkeypatch, tmp_path):
@@ -1211,64 +998,6 @@ def test_ancestor_can_relay_to_a_true_grandchild_without_owner_spoof(tmp_path):
     assert "TASK_FORBIDDEN" in _forward_to_worker(ctx, "cycle-a", "must not deliver")
 
 
-def test_replacement_is_refused_before_gateway_or_post(monkeypatch, tmp_path):
-    from ouroboros import delegate_custody as custody
-    import ouroboros.tools.delegate as delegate
-    from ouroboros.tools.registry import ToolContext
-    import ouroboros.claudexor_daemon as daemon
-
-    custody._CUSTODY.clear()
-    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "codex=gpt-5.6-sol:high")
-    old = custody.RunCustody(
-        run_id="run-old", task_id="child1", route_id="codex", snapshot_id="snap-old",
-    )
-    custody.record_started(tmp_path, old)
-    custody.emit(tmp_path, custody.SETTLED, {"run_id": "run-old", "task_id": "child1"})
-    custody.record_patch_captured(tmp_path, old)
-    custody._CUSTODY.clear()
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: (_ for _ in ()).throw(
-        AssertionError("gateway must not open before settlement guard")))
-    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
-    ctx.task_id = "child1"
-    snapshot = _snapshot(_settings(_session_row()), "session-builder")
-    out = json.loads(delegate.exact_start(
-        ctx, "replacement work", {"snapshot": snapshot},
-    ))
-    assert out["status"] == "refused"
-    assert out["reason"] == "replacement_requires_settlement"
-    assert out["undisposed_patch_run_ids"] == ["run-old"]
-
-
-def test_replacement_refuses_unreadable_custody_before_fail_soft_scan(
-    monkeypatch, tmp_path,
-):
-    from ouroboros import delegate_custody as custody
-    from ouroboros import delegate_recovery
-    import ouroboros.claudexor_daemon as daemon
-    import ouroboros.tools.delegate as delegate
-    from ouroboros.tools.registry import ToolContext
-
-    monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: True)
-    monkeypatch.setattr(
-        delegate_recovery,
-        "unsettled_start_ids",
-        lambda *_a, **_k: pytest.fail("unreadable custody must stop before scan"),
-    )
-    monkeypatch.setattr(
-        daemon,
-        "ensure_owned_gateway",
-        lambda: pytest.fail("unreadable custody must stop before gateway work"),
-    )
-    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
-    ctx.task_id = "child-unknown"
-    snapshot = _snapshot(_settings(_session_row()), "session-builder")
-    out = json.loads(delegate.exact_start(
-        ctx, "replacement work", {"snapshot": snapshot},
-    ))
-    assert out["status"] == "refused"
-    assert out["reason"] == "replacement_custody_unknown"
-
-
 def test_terminal_boundary_reaudits_durable_pending_starts(monkeypatch, tmp_path):
     from ouroboros import delegate_custody as custody
     from ouroboros import delegate_terminal
@@ -1336,9 +1065,8 @@ def test_worker_crash_mismatch_vetoes_without_post_and_cause_matrix(monkeypatch,
     assert "child1" in recovery.recoverable_task_ids(tmp_path)
 
 
-def test_same_run_crash_adoption_uses_exact_binding_and_never_posts(monkeypatch, tmp_path):
+def test_same_run_crash_handoff_is_never_adopted_without_a_live_run_probe(monkeypatch, tmp_path):
     from ouroboros import delegate_custody as custody
-    import ouroboros.claudexor_daemon as daemon
     import ouroboros.delegate_recovery as recovery
     import ouroboros.tools.delegate as delegate
     from ouroboros.contracts.task_constraint import normalize_task_constraint
@@ -1382,21 +1110,19 @@ def test_same_run_crash_adoption_uses_exact_binding_and_never_posts(monkeypatch,
     )
     assert handoff["run_id"] == "run-1"
 
-    class Gateway:
-        def get_run(self, run_id):
-            assert run_id == "run-1"
-            return {"id": run_id, "state": "running"}
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: Gateway())
-    monkeypatch.setattr(delegate, "exact_start", lambda *_a, **_k: (_ for _ in ()).throw(
-        AssertionError("a verified live run must be adopted without a second POST")
+    # The engine poll that PROVED a run live retired with the gateway family, so
+    # no crash handoff can be adopted any more: the durable binding above still
+    # describes the run, and adoption fails CLOSED — no POST of a second start,
+    # and the veto names exactly what could not be proven.
+    monkeypatch.setattr(delegate, "exact_start", lambda *_a, **_k: pytest.fail(
+        "an unprovable run must never POST a second start"
     ))
     assert recovery.adopt_handoff(ctx, task) == {
-        "status": "adopted", "run_id": "run-1", "cause": recovery.CAUSE_WORKER_CRASH,
+        "status": "recovery_required", "reason": "run_unprovable",
     }
+    assert recovery._read(tmp_path, "child1")["veto_reason"] == (
+        "run_unprovable:claudexor_retired"
+    )
 
 
 def test_settled_terminal_wake_survives_worker_crash_without_a_new_post(monkeypatch, tmp_path):
@@ -1448,105 +1174,6 @@ def test_settled_terminal_wake_survives_worker_crash_without_a_new_post(monkeypa
     out = recovery.adopt_handoff(ctx, task)
     assert out["status"] == "settled_recovered"
     assert out["wake"] == terminal
-
-
-def test_planned_restart_selectively_restores_sleeping_leaf_and_wait_state(monkeypatch, tmp_path):
-    from ouroboros import delegate_custody as custody
-    import ouroboros.claudexor_daemon as daemon
-    import ouroboros.delegate_recovery as recovery
-    import ouroboros.delegate_interactions as interactions
-    import ouroboros.tools.delegate as delegate
-    from ouroboros.contracts.task_constraint import normalize_task_constraint
-    from ouroboros.subagent_work_order import work_order_fingerprint
-    from ouroboros.tools.registry import ToolContext
-    from ouroboros.utils import atomic_write_json
-
-    custody._CUSTODY.clear()
-    interactions._REPORTED_INTERACTIONS.clear()
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    snapshot = _snapshot(_settings(_session_row()), "session-builder")
-    task = {
-        "id": "child1", "_attempt": 1, "configured_subagent": snapshot,
-        "workspace_root": str(workspace), "workspace_mode": "workspace_write",
-        "drive_root": str(tmp_path), "task_constraint": {},
-        "task_contract": {"objective": "Build", "expected_output": "Patch"},
-    }
-    authority = recovery.authority_fingerprint_from_task(task)
-    custody.record_started(tmp_path, custody.RunCustody(
-        run_id="run-1", task_id="child1", route_id="codex",
-        selected_subagent_id="session-builder",
-        config_fingerprint=snapshot["config_fingerprint"],
-        authority_fingerprint=authority,
-        work_order_fingerprint=work_order_fingerprint(task),
-    ))
-    wait_path = tmp_path / "state" / "delegate_supervision" / "child1.json"
-    wait_path.parent.mkdir(parents=True)
-    atomic_write_json(wait_path, {
-        "schema": 1, "run_id": "run-1", "status": "wake_pending", "journal_cursor": 7,
-        "mailbox_acknowledged_ids": ["m-old"],
-        "interaction_acknowledged_ids": [],
-        "pending_wake": {
-            "wake_id": "wake-1",
-            "payload": {
-                "status": "waiting_on_user", "supervision_wake_id": "wake-1",
-                "pending_interactions": [{"interaction_id": "quiz-1", "question": "Choose"}],
-            },
-            "mailbox_ids": [], "interaction_ids": ["quiz-1"],
-        },
-        "checkpoint": {"reason": "inspect artifact", "consumed": False},
-    })
-    [preserved] = recovery.prepare_planned_restart_handoffs(
-        tmp_path, {"child1": {"task": task, "attempt": 1, "worker_id": 3}},
-    )
-    assert preserved == "child1"
-    handoff = recovery._read(tmp_path, "child1")
-    assert handoff["no_resume_veto_causes"] == list(recovery.NO_RESUME_CAUSES)
-
-    old_pid = handoff["supervisor_pid"]
-    assert not recovery.acknowledge_observed_restart_exit(
-        tmp_path, supervisor_pid=old_pid + 1, exit_code=42,
-    )
-    assert not recovery.acknowledge_observed_restart_exit(
-        tmp_path, supervisor_pid=old_pid, exit_code=1,
-    )
-    assert recovery.acknowledge_observed_restart_exit(
-        tmp_path, supervisor_pid=old_pid, exit_code=42,
-    )
-    monkeypatch.setattr(recovery.os, "getpid", lambda: old_pid + 100_000)
-    monkeypatch.setattr(recovery, "_pid_alive", lambda _pid: False)
-
-    class Gateway:
-        def get_run(self, run_id):
-            assert run_id == "run-1"
-            return {"id": run_id, "state": "running"}
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: Gateway())
-    successor = {**task, "_attempt": 2}
-    assert recovery.pre_adopt_planned_handoffs(tmp_path, [successor]) == {"child1"}
-    ctx = ToolContext(
-        repo_dir=workspace, drive_root=tmp_path, workspace_root=workspace,
-        workspace_mode="workspace_write", task_id="child1",
-        task_metadata={"drive_root": str(tmp_path)},
-        task_constraint=normalize_task_constraint({}), task_contract=task["task_contract"],
-    )
-    monkeypatch.setattr(delegate, "exact_start", lambda *_a, **_k: (_ for _ in ()).throw(
-        AssertionError("planned handoff must adopt, never POST")
-    ))
-    adopted = recovery.adopt_handoff(ctx, successor)
-    assert adopted["status"] == "adopted"
-    assert adopted["wake"]["pending_interactions"][0]["question"] == "Choose"
-    restored = json.loads(wait_path.read_text(encoding="utf-8"))
-    assert restored["journal_cursor"] == 7
-    assert restored["mailbox_acknowledged_ids"] == ["m-old"]
-    assert restored["checkpoint"]["reason"] == "inspect artifact"
-    assert "run-1" not in interactions._REPORTED_INTERACTIONS
-    from ouroboros.delegate_supervision import acknowledge_pending_wake
-    assert acknowledge_pending_wake(ctx, adopted["wake"])
-    assert interactions._REPORTED_INTERACTIONS["run-1"] == frozenset({"quiz-1"})
 
 
 def test_only_approved_restart_causes_reserve_and_abrupt_gap_vetoes(monkeypatch, tmp_path):

@@ -358,7 +358,9 @@ def test_panic_stop_kills_services_without_log_finalization(monkeypatch, tmp_pat
             kill_workers_fn=lambda **kw: worker_calls.append(kw),
             data_dir=tmp_path,
             panic_exit_code=120,
-            log=SimpleNamespace(critical=lambda *a, **k: None),
+            # `warning` too: panic discloses the retired Claudexor daemon custody on
+            # that level (see test_server_control_panic_daemon).
+            log=SimpleNamespace(critical=lambda *a, **k: None, warning=lambda *a, **k: None),
         )
     except ExitCalled:
         pass

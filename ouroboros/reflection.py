@@ -522,7 +522,7 @@ def apply_memory_actions(env: Any, actions: List[Dict[str, Any]], *, project_id:
             continue
         try:
             if atype == "scratchpad_append":
-                from ouroboros.memory import Memory
+                from ouroboros.memory_files import Memory
 
                 Memory(env.drive_root, getattr(env, "repo_dir", None)).append_scratchpad_block(
                     content,
@@ -541,7 +541,7 @@ def apply_memory_actions(env: Any, actions: List[Dict[str, Any]], *, project_id:
                 _knowledge_write(ctx, topic, content, mode="append")
                 applied += 1
             elif atype == "identity_update_candidate":
-                from ouroboros.memory import Memory
+                from ouroboros.memory_files import Memory
 
                 Memory(env.drive_root, getattr(env, "repo_dir", None)).append_scratchpad_block(
                     "IDENTITY UPDATE CANDIDATE (review before applying to identity.md):\n" + content,
@@ -735,7 +735,7 @@ def _update_patterns(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
             return
         write_text_atomic(patterns_path, updated + "\n")
         try:
-            from ouroboros.consolidator import _rebuild_knowledge_index
+            from ouroboros.memory_files import _rebuild_knowledge_index
             _rebuild_knowledge_index(patterns_path.parent, _locked=True)
         except Exception:
             log.debug("Failed to rebuild knowledge index after patterns update", exc_info=True)

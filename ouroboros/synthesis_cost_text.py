@@ -11,8 +11,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict
 
-from ouroboros.cost_projection import cost_display
-from ouroboros.task_results import TASK_COST_META_FIELDS
+from ouroboros.task_results import TASK_COST_META_FIELDS, cost_display
 
 
 def _synthesis_cost_usd(usage: Dict[str, Any]) -> float | None:

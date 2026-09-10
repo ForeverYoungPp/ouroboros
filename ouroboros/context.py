@@ -51,7 +51,7 @@ from ouroboros.context_health import (
 )
 from ouroboros.context_layout import architecture_context_section
 from ouroboros.contracts.task_contract import normalize_bool
-from ouroboros.memory import Memory
+from ouroboros.memory_files import Memory
 from ouroboros.utils import (
     get_git_info,
     read_json_dict,

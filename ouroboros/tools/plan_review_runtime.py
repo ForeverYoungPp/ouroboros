@@ -50,6 +50,12 @@ PLAN_REVIEW_SLOT_TIMEOUT_SEC = None
 HOST_FILE_READ_ASSEMBLED = "host_assembled_packet"
 HOST_FILE_READ_UNOBSERVED = "unobserved"
 HOST_FILE_READ_OBSERVED = "host_observed"
+# Re-homed from the retired Claudexor gateway (Seed 0): these two codes are durable
+# VOCABULARY — a route health answer and a stored wave row carry them as strings, so
+# the readers below must keep recognising what was already recorded. The transport
+# that minted them is gone; a surviving reader does not import a deleted module for
+# two literals.
+WINDOW_EXHAUSTED_CODES = ("subscription_window_exhausted", "credential_pool_exhausted")
 
 log = logging.getLogger(__name__)
 
@@ -741,10 +747,11 @@ def plan_payload_roots(ctx: ToolContext, locators: List[str]) -> list[pathlib.Pa
 # of a spent lane into $0 typed skip rows that stay in the quorum denominator
 # (BIBLE P3: the quorum never silently narrows). Unknown health DISPATCHES
 # (fail-open); transient daemon states (`daemon_recovery_only`, a dead socket)
-# are never skip evidence and never enter the epoch (roast pt 9). Side effect,
-# disclosed: `ensure_owned_gateway` may lazily SPAWN the owned daemon and runs
-# its per-ensure rotation reconcile — both bounded and fail-open (a spawn/probe
-# failure returns None here, never an exception).
+# are never skip evidence and never enter the epoch (roast pt 9). The snapshot
+# itself retired with the owned Claudexor transport (Seed 0) — it could only be
+# taken through that daemon's gateway — so no snapshot is captured now and every
+# panel reads UNKNOWN health. `plan_panel_health_snapshot` says so in one debug
+# line; it never reports an empty (healed-looking) result in its place.
 #
 # SCOPE OF THE ANSWER: `subagents.route_health` — the ONE manifest reader — judges
 # a ROUTE (harness id + pinned model) NARROWED to the slot's pinned credential
@@ -787,7 +794,6 @@ def _structural_skip_code(reason: str, reset_at: str) -> str:
     still ahead, or a typed dead-pool code. An UNDATED exhaustion, a stale reset and
     every other reason (route_disabled, transient daemon states, unknown) dispatch —
     the pre-dispatch admission and the run itself refuse typed downstream at ~$0."""
-    from ouroboros.gateways.claudexor import WINDOW_EXHAUSTED_CODES
 
     if reset_at:
         instant = parse_deadline_ts(reset_at)
@@ -806,51 +812,19 @@ def _structural_skip_code(reason: str, reset_at: str) -> str:
 def plan_panel_health_snapshot(slots: list) -> Optional[Dict[str, Dict[str, str]]]:
     """``{slot_id: {failure_code, reset_at}}`` for the slots a pre-fan-out snapshot
     proves structurally dead; ``{}`` when the snapshot ran and found none; ``None``
-    when no snapshot could be captured (daemon unprovisioned/unreachable) — unknown
-    health dispatches, and a FAILED snapshot must never read as "everything healed"
-    at the replay seam."""
+    when no snapshot could be captured (owned harness transport retired/unreachable)
+    — unknown health dispatches, and a FAILED snapshot must never read as "everything
+    healed" at the replay seam."""
     session_slots = [slot for slot in slots if slot_is_session(slot)]
     if not session_slots:
         return {}
-    from ouroboros.claudexor_daemon import ensure_owned_gateway, owned_daemon_provisioned
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
-    from ouroboros.subagents import delegated_run_shape, route_health
-
-    if not owned_daemon_provisioned():
-        return None
-    shape = delegated_run_shape(False)  # a reviewer reads and answers
-    evidence: Dict[str, Dict[str, str]] = {}
-    by_route: Dict[tuple, tuple[str, str]] = {}
-    gateway = None
-    try:
-        gateway = ensure_owned_gateway()
-        for slot in session_slots:
-            route = _slot_session_route(slot)
-            if route is None:
-                continue
-            # The PIN is part of the subject, so it is part of the memo key: two
-            # rows on the same harness+model but different accounts must never
-            # share one verdict (a spent pin would otherwise be vouched for by a
-            # sibling's health, or vice versa).
-            pin = str(getattr(route, "profile_id", "") or "")
-            key = (route.route_id, route.model, pin)
-            if key not in by_route:
-                by_route[key] = route_health(gateway, route.route_id, shape,
-                                             route_model=route.model,
-                                             pinned_profile=pin)
-            code = _structural_skip_code(*by_route[key])
-            if code:
-                evidence[str(getattr(slot, "slot_id", "") or "")] = {
-                    "failure_code": code, "reset_at": by_route[key][1]}
-    except ClaudexorUnavailable:
-        return None  # transient (incl. daemon_recovery_only): never a skip row
-    except Exception:
-        log.debug("plan panel health snapshot failed (fail-open)", exc_info=True)
-        return None
-    finally:
-        if gateway is not None:
-            gateway.close()
-    return evidence
+    # The snapshot could only be taken through the owned Claudexor daemon's gateway, and
+    # that transport retired with its modules (Seed 0): no daemon can ever be
+    # provisioned, which is exactly the unprovisioned/unreachable answer this reader
+    # already returned as `None`. Unknown health still dispatches (fail-open), and the
+    # absence is a logged fact rather than an empty result that reads as healed.
+    log.debug("plan panel health snapshot unavailable: owned Claudexor transport retired")
+    return None
 
 
 def plan_health_skip_rows(slots: list, evidence: Optional[Dict[str, Dict[str, str]]]) -> tuple[list, list[dict]]:
@@ -1046,8 +1020,6 @@ def plan_quorum_unreachable_facts(slot_records: List[dict], *, quorum: int) -> D
     whose recorded reset already passed may have healed and never counts.
     ``earliest_reset`` is the earliest parseable reset among the dead rows (empty
     when none names one)."""
-    from ouroboros.gateways.claudexor import WINDOW_EXHAUSTED_CODES
-
     def _is_dead(r: dict) -> bool:
         if str(r.get("failure_code") or "") not in WINDOW_EXHAUSTED_CODES:
             return False

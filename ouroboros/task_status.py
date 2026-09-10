@@ -1120,7 +1120,7 @@ def _handoff_snippet(value: Any) -> Dict[str, Any]:
 def format_handoff_message(children: List[Dict[str, Any]]) -> str:
     from ouroboros.tools.join_ledger import _child_result_sha256
 
-    from ouroboros.cost_projection import cost_projection
+    from ouroboros.task_results import cost_projection
 
     payload = []
     for child in children:
@@ -1231,7 +1231,7 @@ def format_subagent_absorption_message(
     ]
     spent = 0
     omitted = 0
-    from ouroboros.cost_projection import cost_display
+    from ouroboros.task_results import cost_display
 
     for child in terminal:
         cid = str(child.get("task_id") or child.get("id") or "")

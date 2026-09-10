@@ -257,55 +257,6 @@ def test_malformed_named_authority_shapes_refuse_before_model_or_tool_work(monke
     assert tool_context_calls == []
 
 
-def test_context_build_exception_after_pre_start_still_propagates(monkeypatch, tmp_path):
-    # Charter (owner 2026-08-28): the leaf pre-starts BEFORE the context build,
-    # so a context-assembly failure now happens with a LIVE run behind it.
-    # The failure must still propagate loudly (the durable custody rows let the
-    # retry adopt the running leaf instead of starting a duplicate).
-    from ouroboros import agent as agent_module
-    import ouroboros.claudexor_daemon as daemon
-    import ouroboros.delegate_supervision as supervision
-    import ouroboros.subagent_runtime as runtime
-    import ouroboros.subagents as subagents
-    from ouroboros.agent import Env, OuroborosAgent
-
-    repo, drive = tmp_path / "repo", tmp_path / "drive"
-    repo.mkdir()
-    drive.mkdir()
-    order = []
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: SimpleNamespace(close=lambda: None))
-    monkeypatch.setattr(subagents, "route_health", lambda *_a, **_k: ("", ""))
-    monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
-    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: (
-        order.append("physical_start")
-        or json.dumps({"status": "started", "run_id": "run-pre"})
-    ))
-    monkeypatch.setattr(
-        supervision, "supervised_wait",
-        lambda *_a, **_kw: pytest.fail("the host must not wait inside bootstrap (owner 1=A)"),
-    )
-    def fail_context(**_kwargs):
-        order.append("context_build_failed")
-        raise RuntimeError("context assembly failed after the exact leaf start")
-
-    monkeypatch.setattr(agent_module, "build_llm_messages", fail_context)
-    snapshot = _snapshot(_settings(_session_row()), "session-builder")
-    agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
-    agent.tools.available_tools = lambda: ["delegate_start", "delegate_wait", "delegate_cancel"]
-    with pytest.raises(RuntimeError, match="after the exact leaf start"):
-        agent._prepare_task_context({
-            "id": "child1", "type": "task", "chat_id": 1, "text": "Build",
-            "delegation_role": "subagent", "configured_subagent": snapshot,
-            "parent_cognitive_route": {
-                "model": "openai/parent", "effort": "high", "use_local_model": False,
-            },
-            "task_constraint": {},
-            "task_contract": {"objective": "Build", "expected_output": "Patch"},
-            "drive_root": str(drive), "budget_drive_root": str(drive),
-        })
-    assert order == ["physical_start", "context_build_failed"]
-
-
 @pytest.mark.parametrize("message_kind", ["owner", "task"])
 def test_awake_loop_durably_acks_injected_mailbox_before_next_sleep(tmp_path, message_kind):
     import ouroboros.delegate_supervision as supervision

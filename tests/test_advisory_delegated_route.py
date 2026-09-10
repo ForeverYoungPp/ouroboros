@@ -4,12 +4,16 @@ An ``api_chat`` advisory row runs the bounded NATIVE inspection episode on a
 routed catalog model — its availability follows the model's provider
 credentials (loud typed auto-bypass at the gate, typed error on a direct
 call), never a hardcoded ANTHROPIC_API_KEY probe. An ``agent_session`` row is
-a delegated Claudexor run, unchanged. The retired legacy ``api`` kind parses
-and migrates same-model; an untranslatable target force-disables the row with
-a typed reason.
+a delegated run whose transport retired with Claudexor: its delivery is a
+typed unavailable error, pinned at the gate by the route-driven availability
+projection below. The retired legacy ``api`` kind parses and migrates
+same-model; an untranslatable target force-disables the row with a typed
+reason.
 
 Offline fixtures throughout (owner test rule): the FakeGateway from the
-agent-session route tests stands in for the Claudexor control plane.
+agent-session route tests stands in for the Claudexor control plane; the
+delegated route's own executor is stubbed at its seam where the advisory's
+invocation plumbing is the subject.
 """
 
 import json
@@ -20,7 +24,7 @@ from types import SimpleNamespace
 import pytest
 
 import ouroboros.tools.claude_advisory_review as advisory
-from tests.test_review_agent_session_route import FakeGateway, _terminal_detail
+from tests.test_review_agent_session_route import FakeGateway
 
 
 @pytest.fixture(autouse=True)
@@ -99,51 +103,6 @@ def test_native_route_without_model_credentials_errors_typed(tmp_path, monkeypat
     assert raw.startswith("⚠️ ADVISORY_ERROR: no provider credentials for advisory model")
 
 
-def test_delegated_route_runs_without_the_key(tmp_path, monkeypatch, fake_route):
-    """The whole free-route walk: no key anywhere, route=agent_session, and the
-    advisory runs as a delegated session whose checklist comes back parsed."""
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "agent_session")
-    # No catalog `json_schema_output` is set here: `CatalogHarness` carries NO
-    # transport flags (agent-capabilities.ts), the reader takes the flag off the
-    # /v2/harnesses manifest row, and the invented catalog key was a dead no-op that
-    # modelled a response Claudexor cannot emit.
-    fake_route.detail = _terminal_detail(_ADVISORY_ITEMS)
-    ctx = _ctx(tmp_path)
-    items, raw, model, chars = advisory._run_claude_advisory(
-        ctx.repo_dir, "msg", ctx, options={"include_repo_diff": False},
-    )
-    assert not raw.startswith("⚠️ ADVISORY_ERROR")
-    assert [i["item"] for i in items] == ["correctness"]
-    assert model  # the effective session model/route is reported
-    start = fake_route.instances[0].start_requests[0]
-    assert start["authPreference"] == "subscription"
-    assert start["access"] == "readonly"
-
-
-def test_delegated_advisory_passes_expired_owner_deadline_before_dispatch(
-    tmp_path, monkeypatch, fake_route,
-):
-    """The advisory consumer must pass its task deadline into the shared runner.
-
-    An expired deadline is a host-side admission refusal, so the paid Claudexor
-    start must never be posted.  This exercises the real advisory caller rather
-    than only testing ``SessionInvocation`` in isolation.
-    """
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "agent_session")
-    ctx = _ctx(tmp_path)
-    ctx.task_metadata = {"deadline_at": "2000-01-01T00:00:00Z"}
-
-    result, _model = advisory._run_advisory_delegated(
-        "review", pathlib.Path(ctx.repo_dir), ctx,
-    )
-
-    assert result.success is False
-    assert "owner deadline leaves no dispatch window" in result.error
-    assert not any(instance.start_requests for instance in fake_route.instances)
-
-
 def test_delegated_advisory_narrows_poll_window_to_owner_deadline(
     tmp_path, monkeypatch, fake_route,
 ):
@@ -178,52 +137,6 @@ def test_delegated_advisory_narrows_poll_window_to_owner_deadline(
     invocation = captured["invocation"]
     assert invocation.owner_deadline_at == deadline
     assert 0 < invocation.timeout_sec <= 45
-
-
-def test_delegated_advisory_does_not_start_inside_finalization_reserve(
-    tmp_path, monkeypatch, fake_route,
-):
-    from datetime import datetime, timedelta, timezone
-
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "agent_session")
-    monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
-    ctx = _ctx(tmp_path)
-    ctx.task_metadata = {
-        "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat(),
-    }
-
-    result, _model = advisory._run_advisory_delegated(
-        "review", pathlib.Path(ctx.repo_dir), ctx,
-    )
-
-    assert result.success is False
-    assert "owner deadline leaves no dispatch window" in result.error
-    assert not any(instance.start_requests for instance in fake_route.instances)
-
-
-def test_structured_session_without_effort_preserves_the_route_default(
-    tmp_path, monkeypatch, fake_route,
-):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", json.dumps({
-        "triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "openai/x"}}],
-        "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "openai/y"}}],
-        "advisory": {
-            "enabled": True,
-            "route": {"kind": "agent_session", "target_id": "fake-review=fake-small"},
-        },
-    }))
-    fake_route.detail = _terminal_detail(_ADVISORY_ITEMS)
-    ctx = _ctx(tmp_path)
-
-    items, raw, _model, _chars = advisory._run_claude_advisory(
-        ctx.repo_dir, "msg", ctx,
-        options={"include_repo_diff": False},
-    )
-    assert not raw.startswith("⚠️ ADVISORY_ERROR")
-    assert [item["item"] for item in items] == ["correctness"]
-    assert "effort" not in fake_route.instances[0].start_requests[0]
 
 
 def test_unknown_route_token_is_a_loud_error_not_a_transport_pick(tmp_path, monkeypatch):

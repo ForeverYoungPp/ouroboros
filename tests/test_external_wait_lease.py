@@ -11,7 +11,6 @@ not kill threads; a lease is a number).
 """
 
 import datetime as dt
-import json
 import queue as stdqueue
 import time
 import types
@@ -22,18 +21,6 @@ from ouroboros.delegate_progress import (
     DELEGATE_WAIT_LEASE_GRACE_SEC,
     EXTERNAL_WAIT_LEASE_CEILING_SEC,
 )
-
-
-@pytest.fixture(autouse=True)
-def _owned_gateway_uses_each_test_transport(monkeypatch):
-    from ouroboros import claudexor_daemon
-    from ouroboros.gateways import claudexor as gateway_module
-
-    monkeypatch.setattr(
-        claudexor_daemon,
-        "ensure_owned_gateway",
-        lambda: gateway_module.ClaudexorGateway(),
-    )
 
 
 # -- the bound ------------------------------------------------------------------
@@ -75,59 +62,6 @@ def test_lease_until_never_exceeds_the_absolute_ceiling():
     now = time.time()
     until = _external_wait_lease_until(_ctx(), 10_000_000, None, 0)
     assert until <= now + EXTERNAL_WAIT_LEASE_CEILING_SEC + 2.0
-
-
-# -- the wait grants and releases ----------------------------------------------
-
-
-def test_delegate_wait_grants_the_lease_and_releases_it(tmp_path, monkeypatch):
-    import ouroboros.tools.delegate as delegate
-    from ouroboros.contracts.task_constraint import TaskConstraint
-    from ouroboros.gateways import claudexor as gw
-    from ouroboros.tools.registry import ToolContext
-
-    class _Stub:
-        engine_version = "3.3.6"
-
-        def handshake(self, **_kw): return {}
-        def get_run(self, rid, *, timeout_sec=None):
-            return {"lastSeq": 1, "summary": {
-                "state": "running", "effectiveAccess": "readonly",
-            }}
-        def close(self): pass
-
-    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    ctx = ToolContext(repo_dir=repo, drive_root=tmp_path,
-                      task_constraint=TaskConstraint(mode="local_readonly_subagent"))
-    ctx.task_id = "t-nanny"
-    ctx.event_queue = stdqueue.Queue()
-    delegate._CUSTODY.clear()
-    delegate._CUSTODY["run-1"] = delegate._RunCustody(
-        task_id="t-nanny", route_id="some-route", model="m",
-        project_id="prj", project_owned=False,
-    )
-    out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1, since_seq=1))
-    delegate._CUSTODY.clear()
-    assert out["status"] in ("progress", "no_progress"), out
-
-    events = []
-    while True:
-        try:
-            events.append(ctx.event_queue.get_nowait())
-        except stdqueue.Empty:
-            break
-    leases = [e for e in events if e.get("type") == "external_wait_lease"]
-    assert len(leases) == 2, events
-    grant, release = leases
-    assert grant["task_id"] == "t-nanny" and grant["run_id"] == "run-1"
-    assert grant["until_ts"] > time.time()
-    assert grant["until_ts"] <= time.time() + 1 + DELEGATE_WAIT_LEASE_GRACE_SEC + 2.0
-    assert release["until_ts"] == 0.0
-    # F5b lease identity: the grant minted an id and the release names the SAME
-    # one, so the supervisor can match them.
-    assert grant["lease_id"] and grant["lease_id"] == release["lease_id"]
 
 
 # -- the supervisor handler -----------------------------------------------------

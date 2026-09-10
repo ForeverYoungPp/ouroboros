@@ -35,7 +35,7 @@ from ouroboros.context_budget import (
 )
 from ouroboros.llm import LLMClient, add_usage
 from ouroboros.loop_tool_execution import StatefulToolExecutor, _truncate_tool_result
-from ouroboros.memory import Memory
+from ouroboros.memory_files import Memory
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 from ouroboros.pricing import infer_provider_from_model
 from ouroboros.utils import (

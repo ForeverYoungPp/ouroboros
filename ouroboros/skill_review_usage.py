@@ -5,9 +5,8 @@ from __future__ import annotations
 import pathlib
 from typing import Any, Dict
 
-from ouroboros._usage_rows import _skill_review_usage_bucket
-from ouroboros._usage_rows_memo import _render_cached
 from ouroboros.usage_ledger import _drive_root
+from ouroboros.usage_rows import _render_cached, _skill_review_usage_bucket
 
 
 def skill_review_usage_markdown(

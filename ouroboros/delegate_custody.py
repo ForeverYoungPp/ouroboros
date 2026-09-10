@@ -27,12 +27,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-from ouroboros._usage_rows import REVIEW_ATTRIBUTION_KEYS
 from ouroboros.delegate_custody_usage import (
     disclosed_spend,
     disclosed_tokens,
     summary_of,
 )
+from ouroboros.errors import OuroborosUnavailableError
+from ouroboros.subagents import CLAUDEXOR_RETIRED
+from ouroboros.usage_rows import REVIEW_ATTRIBUTION_KEYS
 from ouroboros.utils import append_jsonl, utc_now_iso
 log = logging.getLogger(__name__)
 # The harness's own terminal vocabulary — one definition for the tool, the settler and
@@ -1127,8 +1129,6 @@ def cancel_and_verify(drive_root: Any, gateway: Any, custody: RunCustody, reason
     mutating, and an unverifiable attempt is a containment fault. The old path answered
     all four with ``status: cancelled``.
     """
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
     # The same durable fact ``settle_run`` short-circuits on, consulted by its twin. A run
     # this module already recorded as terminal is not an overpowered live process, and a
     # later ordinary cancel of it must not manufacture a permanent CRITICAL against a run
@@ -1141,7 +1141,7 @@ def cancel_and_verify(drive_root: Any, gateway: Any, custody: RunCustody, reason
         receipt = gateway.cancel_run(custody.run_id, reason=str(reason or ""))
         accepted = bool((receipt or {}).get("accepted"))
         control_status = str((receipt or {}).get("status") or "")
-    except ClaudexorUnavailable as exc:
+    except OuroborosUnavailableError as exc:
         if daemon_says_absent(exc):
             close_absent_run(drive_root, gateway, custody, "cancel_run_absent")
             return _cancel_result(drive_root, custody, CANCEL_CONFIRMED, accepted=False,
@@ -1149,10 +1149,10 @@ def cancel_and_verify(drive_root: Any, gateway: Any, custody: RunCustody, reason
         # A refused control is not a verdict on the RUN. The read below is what decides
         # whether anything is still mutating; declaring the fault here — with the read
         # sitting three lines away, unused — faulted runs that had already stopped.
-        control_error = f"{exc.code}: {exc}"
+        control_error = str(exc)
     try:
         detail = gateway.get_run(custody.run_id)
-    except ClaudexorUnavailable as exc:
+    except OuroborosUnavailableError as exc:
         if daemon_says_absent(exc):
             close_absent_run(drive_root, gateway, custody, "get_run_absent")
             return _cancel_result(drive_root, custody, CANCEL_CONFIRMED, accepted=accepted,
@@ -1160,7 +1160,7 @@ def cancel_and_verify(drive_root: Any, gateway: Any, custody: RunCustody, reason
         return _cancel_result(drive_root, custody, CANCEL_CONTAINMENT_FAULT, accepted=accepted,
                               control_status=control_status, state="",
                               fault_reason="cancel_unreachable" if control_error else "cancel_unverified",
-                              detail=control_error or f"{exc.code}: {exc}")
+                              detail=control_error or str(exc))
     state = str(summary_of(detail).get("state") or "")
     if state in TERMINAL_STATES:
         settle_run(drive_root, gateway, custody, detail)
@@ -1349,21 +1349,16 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
                      and row.project_id not in unsettled_projects]
     if not runs and not pending and not registrations:
         return []
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
     if gateway_factory is None:
-        # The startup sweep REAPS the prior generation's owned daemon just
-        # before this, so a discovery-only gateway always found a corpse and
-        # reconciliation silently no-opped on every restart. The ensure path
-        # starts our own daemon when there is real work (never on the empty
-        # early-return above), activating any staged runtime update.
-        from ouroboros.claudexor_daemon import ensure_owned_gateway
-
-        gateway_factory = ensure_owned_gateway
+        # The owned-daemon transport (`ensure_owned_gateway`) retired with Claudexor:
+        # without a caller-supplied factory there is no way to reach a delegated run,
+        # so the sweep reports the same empty result the unreachable daemon produced.
+        log.debug("delegated-run reconciliation skipped: %s", CLAUDEXOR_RETIRED)
+        return []
     try:
         gateway = gateway_factory()
         gateway.handshake()
-    except ClaudexorUnavailable:
+    except OuroborosUnavailableError:
         log.debug("delegated-run reconciliation skipped: transport unavailable", exc_info=True)
         return []
     outcomes: List[Dict[str, Any]] = []
@@ -1390,29 +1385,21 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
 
     The stored canonical body is re-POSTed under the invocation's own wire key:
     the engine returns the ORIGINAL handle when the first POST was accepted, and
-    starts fresh only when the daemon truly never saw it. A definite 4xx retires
-    the invocation and its registration; an unknown outcome stays pending.
+    starts fresh only when the daemon truly never saw it. An unavailable transport
+    — the delegated route retired with Claudexor — is not a verdict on the
+    invocation: the unknown outcome stays pending for the next sweep.
     """
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
     invocation_id = str(record["invocation_id"])
     task_id = str(record["task_id"])
     try:
         handle = gateway.start_run(dict(record["request"]), idempotency_key=invocation_id)
-    except ClaudexorUnavailable as exc:
-        status = int(getattr(exc, "status_code", 0) or 0)
-        if 400 <= status < 500:
-            retired = _retire_recovered_registration(gateway, record)
-            emit(drive_root, START_FAILED, {
-                "run_id": "", "task_id": task_id, "project_id": record["project_id"],
-                "project_retired": retired, "reason": f"recovery_refused_{exc.code}",
-                "invocation_id": invocation_id, "definite": True,
-            })
-            result = {"invocation_id": invocation_id, "task_id": task_id,
-                      "action": "invocation_retired"}
-        else:
-            result = {"invocation_id": invocation_id, "task_id": task_id,
-                      "action": "recovery_unreachable"}
+    except OuroborosUnavailableError:
+        # The definite-4xx classification rode Claudexor's own wire status and retired
+        # with it; with no status left to classify on, the outcome is unknown, so the
+        # invocation stays pending instead of being retired on a guess.
+        log.debug("pending-invocation recovery unavailable: delegated transport retired")
+        result = {"invocation_id": invocation_id, "task_id": task_id,
+                  "action": "recovery_unreachable"}
         emit(drive_root, RECONCILED, result)
         return result
     run_id = str(handle.get("runId") or handle.get("jobId") or "")
@@ -1494,17 +1481,16 @@ def _retire_recovered_registration(gateway: Any, record: Dict[str, Any]) -> bool
 
 
 def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[str, Any]:
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.tools.delegate_integration import capture_stranded_patch
 
     try:
         detail = gateway.get_run(custody.run_id)
-    except ClaudexorUnavailable as exc:
+    except OuroborosUnavailableError as exc:
         if daemon_says_absent(exc):
             close_absent_run(drive_root, gateway, custody, "reconcile_absent")
             result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "absent"}
         else:
-            record_containment_fault(drive_root, custody, "reconcile_unreadable", f"{exc.code}: {exc}")
+            record_containment_fault(drive_root, custody, "reconcile_unreadable", str(exc))
             result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "unreadable"}
         # NO capture here (C1-R2): across the D30 boundary an absent run may
         # still be WRITING its snapshot; an eager capture would freeze an

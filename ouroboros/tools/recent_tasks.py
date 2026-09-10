@@ -54,7 +54,7 @@ def _task_record(
         return None, {"path": str(path), "error": error}
     data = effective_task_result(drive_root, data)
     result = str(data.get("result") or "")
-    from ouroboros.cost_projection import cost_projection
+    from ouroboros.task_results import cost_projection
 
     _cost = cost_projection(data)
     record: Dict[str, Any] = {

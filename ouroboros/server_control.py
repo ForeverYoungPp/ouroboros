@@ -96,10 +96,11 @@ def execute_panic_stop(
 ) -> None:
     """Full emergency stop: kill everything, write panic flag, hard-exit.
 
-    Known limit (disclosed residual): an ATTACHED Claudexor daemon — one this
-    process did not spawn — is left alive, because ``get_owned_daemon().stop()``
-    only ever kills a self-started daemon's process group (delegated harness
-    runs die with that group); cross-generation cleanup of a stale owned daemon
+    Known limit (disclosed residual): no Claudexor daemon is stopped at panic.
+    The owned-daemon custody path retired along with ``ouroboros.claudexor_daemon``,
+    so neither a self-spawned daemon nor an ATTACHED one has its process group
+    killed here; the panic log says so explicitly instead of leaving the operator
+    to infer it from silence. Cross-generation cleanup of a stale owned daemon
     belongs to the process-custody reaper at the next manual start.
     """
     log.critical("PANIC STOP initiated.")
@@ -154,16 +155,16 @@ def execute_panic_stop(
     except Exception:
         pass
 
-    # Owned Claudexor daemon: panic is instant and hard, so no network run-cancel
-    # calls — stop() kills the self-spawned daemon's whole process group, taking
-    # the delegated harness runs (its children) down with it. Attached daemons
-    # are never killed (see docstring residual).
-    try:
-        from ouroboros.claudexor_daemon import get_owned_daemon
-
-        get_owned_daemon().stop()
-    except Exception:
-        pass
+    # The owned Claudexor daemon is gone: ``ouroboros.claudexor_daemon`` is in the
+    # delete set, so the panic-time process-group kill it used to provide (which
+    # took the self-spawned daemon's delegated harness runs down with it) no
+    # longer exists. State that explicitly instead of swallowing the ImportError:
+    # a silent loss of this capability is exactly what the panic path must not
+    # have, since the operator reads a clean panic as "everything was stopped".
+    log.warning(
+        "PANIC STOP: owned Claudexor daemon custody is unavailable "
+        "(ouroboros.claudexor_daemon is retired) — no daemon process group is killed."
+    )
 
     try:
         from ouroboros.tools.shell import kill_all_tracked_subprocesses

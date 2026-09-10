@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Tuple
 
-from ouroboros._usage_rows import REVIEW_ATTRIBUTION_KEYS
+from ouroboros.usage_rows import REVIEW_ATTRIBUTION_KEYS
 
 
 def persistent_registration(execution_root: str, access: str) -> bool:

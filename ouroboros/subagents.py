@@ -106,6 +106,15 @@ def normalize_subagent_executor(value: Any) -> str:
     return executor
 
 
+# The unavailable reason for every path that used to READ the owned Claudexor
+# gateway — route health, source-channel evidence, the engine version floors. The
+# gateway family retired, so the degradation those paths already had ("the daemon
+# could not be reached") now names a permanent cause instead: the capability is
+# gone and no retry heals it. One string, because the same fact is reported by
+# the dispatcher, the nanny's own start and the bootstrap.
+CLAUDEXOR_RETIRED = "claudexor_retired"
+
+
 @dataclass(frozen=True)
 class DelegatedRunShape:
     """The complete run shape a child's own authority entitles it to.
@@ -148,13 +157,16 @@ def delegated_run_shape(acting: bool) -> DelegatedRunShape:
 def delegated_execution_workspace_root(
     gateway: Any, shape: DelegatedRunShape, root: str,
 ) -> str:
-    """Return the live-workspace field only when the engine's strict schema accepts it."""
-    from ouroboros.config import CLAUDEXOR_DELEGATED_WORKSPACE_ROOT_MIN_VERSION
-    from ouroboros.gateways.claudexor import engine_at_least
+    """Return the live-workspace field only when the engine's strict schema accepts it.
 
-    version = str(getattr(gateway, "engine_version", "") or "")
-    supported = engine_at_least(version, CLAUDEXOR_DELEGATED_WORKSPACE_ROOT_MIN_VERSION)
-    return str(root) if supported and shape.delegated and shape.isolation == "live" else ""
+    The acceptance floor was read through ``gateways.claudexor.engine_at_least``,
+    which retired with the daemon family. The predicate cannot be evaluated any more,
+    so the field is WITHHELD — the answer an engine below the floor always got —
+    rather than claimed on an unread gate: an engine whose STRICT schema lacks the key
+    answers the start with a 400 and no run exists. Signature kept for the existing
+    call sites, which still own the gateway shape they pass in.
+    """
+    return ""
 
 
 @dataclass(frozen=True)
@@ -432,7 +444,9 @@ def route_health(
     (``delegation.available`` — MCP-injection for Claudexor's own delegate
     strategy) is likewise not consulted: Ouroboros runs never request the belt
     (no ``extra_mcp_servers``), and the only structural engine gate for a
-    mutating run is the ``execution.delegated`` marker floor checked below.
+    mutating run — the ``execution.delegated`` marker floor — was read through
+    the retired engine version predicate, so a delegated run is now refused here
+    (see the retirement note on that check below).
 
     ``pinned_profile`` (``DelegationRoute.profile_id``; authors: reviewer-slot
     rows and the Delegation account pin, unified-accounts D-U5) narrows the
@@ -442,9 +456,6 @@ def route_health(
     harness-wide judgement: WHICH profile an unpinned run lands on stays
     Claudexor's business.
     """
-    from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
-    from ouroboros.gateways.claudexor import engine_at_least
-
     catalog = gateway.agent_capabilities()
     entry = None
     for row in catalog.get("harnesses") or []:
@@ -476,18 +487,16 @@ def route_health(
         return f"access_profile_unsupported:{shape.access}", ""
     # An engine below the marker floor REJECTS `execution.delegated` outright — the field
     # is absent from a `.strict()` schema, so the start is a 400 and no run exists. That
-    # is the only thing this version answers, and it is asked here so the refusal is typed
-    # and arrives before a token is spent instead of as an opaque HTTP error mid-dispatch.
-    # It says NOTHING about whether an admitted engine applies an OS boundary: that is a
-    # per-attempt fact, read back from the run's own artifacts by
-    # `tools.delegate._containment_evidence` and DISCLOSED rather than refused. The floor
-    # cannot be a capability probe either — the marker is nested under `execution`, and
-    # the catalog derives its key list from TOP-LEVEL request keys only.
-    if shape.delegated and not engine_at_least(
-        str(getattr(gateway, "engine_version", "") or ""),
-        CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION,
-    ):
-        return "engine_rejects_delegated_marker", ""
+    # floor was read through `gateways.claudexor.engine_at_least`, which retired with the
+    # daemon family: the predicate cannot be evaluated any more, so a DELEGATED run is
+    # refused HERE instead of being assumed admitted — an unread gate must not authorize a
+    # start the engine may answer with a 400. The floor never answered whether an admitted
+    # engine applies an OS boundary: that is a per-attempt fact, read back from the run's
+    # own artifacts and DISCLOSED rather than refused. It cannot become a capability probe
+    # either — the marker is nested under `execution`, and the catalog derives its key list
+    # from TOP-LEVEL request keys only.
+    if shape.delegated:
+        return CLAUDEXOR_RETIRED, ""
     exhausted, reset_at = _exhausted_window(gateway, route_id, route_model, pinned_profile)
     if exhausted and not reset_at:
         # Spent with no named healing instant: still spent. The old shape carried
@@ -630,65 +639,48 @@ def _exhausted_window(gateway: Any, route_id: str, route_model: str = "",
     return True, min(resets) if resets else ""
 
 
-def probe_subagent_executor(
-    requested: Any = "auto", *, shape: DelegatedRunShape | None = None,
-) -> SubagentExecutorResolution:
+def probe_subagent_executor(requested: Any = "auto") -> SubagentExecutorResolution:
     """Impure companion to the pure table: gather the health facts, then apply it.
 
     Kept separate so the rule table itself stays a pure function of stated facts. No
-    route configured means no daemon call at all — the ordinary install pays nothing
-    for an axis it does not use. ``shape`` defaults to the read-only shape: a caller
-    that states nothing is asking for the narrowest run there is.
+    route configured means no probe at all — the ordinary install pays nothing for an
+    axis it does not use.
+
+    The health facts were read from the OWNED gateway, which retired with the daemon
+    family: no reader is left to ask, so a configured route degrades to the explicit
+    unavailable branch it used to get when the daemon was unreachable — a ``harness``
+    pin becomes a typed blocker, ``auto`` falls back to a native child with the
+    visible marker. Never a healthy verdict, and never a silent metered drift.
     """
     route = get_subagent_harness()
     if route is None:
         return resolve_subagent_executor(requested, route=None)
-    from ouroboros.claudexor_daemon import ensure_owned_gateway
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
-    run_shape = shape if shape is not None else delegated_run_shape(False)
-    gateway = None
-    try:
-        gateway = ensure_owned_gateway()
-        unavailable, reset_at = route_health(
-            gateway, route.route_id, run_shape, route_model=route.model,
-            pinned_profile=route.profile_id,
-        )
-    except ClaudexorUnavailable as exc:
-        return resolve_subagent_executor(
-            requested, route=route, unavailable_reason=exc.code,
-            reset_at=str(getattr(exc, "reset_at", "") or ""),
-        )
-    finally:
-        if gateway is not None:
-            gateway.close()
-    return resolve_subagent_executor(
-        requested, route=route, unavailable_reason=unavailable, reset_at=reset_at,
+    log.info(
+        "Subagent executor probe degraded (%s): the Claudexor route-health reader "
+        "retired with the gateway family; route %s",
+        CLAUDEXOR_RETIRED, route.route_id,
     )
+    return resolve_subagent_executor(requested, route=route, unavailable_reason=CLAUDEXOR_RETIRED)
 
 
 def dispatch_executor_resolution(task: Mapping[str, Any]) -> SubagentExecutorResolution:
     """The executor axis of ONE dispatch: the typed rule table fed with live health.
 
-    The whole shape, from the one owner of it: health is checked against the run
-    this child would really start — a mutating child probes the `workspace_write`
-    + delegated shape, a read-only one the narrow default — not against a profile
-    string reassembled by the caller. `native` asks the daemon nothing. Tolerant
-    of stored garbage: the schema refused anything invalid at schedule time, so an
-    unknown STORED executor is stale data, not an argument error.
+    `native` asks nothing of any transport. Tolerant of stored garbage: the schema
+    refused anything invalid at schedule time, so an unknown STORED executor is
+    stale data, not an argument error.
+
+    The run SHAPE no longer narrows the probe: it existed to check the route against
+    the exact run the child would start (a mutating child's `workspace_write` +
+    delegated shape, a read-only one's narrow default), and that reader retired with
+    the gateway family — every configured route now degrades identically.
     """
     requested = str(task.get("requested_executor") or "auto").strip().lower() or "auto"
     if requested not in SUBAGENT_EXECUTORS:
         requested = "auto"
     if requested == "native":
-        return resolve_subagent_executor("native")  # nothing to ask the daemon
-    from ouroboros.contracts.task_constraint import normalize_task_constraint
-    from ouroboros.tool_access import predicted_subagent_profile
-
-    constraint = normalize_task_constraint(task.get("task_constraint"))
-    surface = str(getattr(constraint, "surface", "") or "")
-    shape = delegated_run_shape(predicted_subagent_profile(write_surface=surface) == "acting_subagent")
-    return probe_subagent_executor(requested, shape=shape)
+        return resolve_subagent_executor("native")  # nothing to ask
+    return probe_subagent_executor(requested)
 
 
 @dataclass(frozen=True)

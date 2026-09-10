@@ -44,6 +44,7 @@ from ouroboros.delegate_supervision import (
     supervision_checkpoint,
     write_unknown_hold,
 )
+from ouroboros.subagents import CLAUDEXOR_RETIRED
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -90,20 +91,14 @@ def _leaf_probe_live(ctx: Any, run_id: str) -> bool:
     """READ-ONLY liveness probe: one short engine poll, no lease/settle/cancel.
 
     Requires a POSITIVE non-terminal engine state. A gateway failure, refusal,
-    or state-less payload is not evidence of a live leaf (fail-closed)."""
-    import contextlib
+    or state-less payload is not evidence of a live leaf (fail-closed).
 
-    try:
-        from ouroboros.claudexor_daemon import ensure_owned_gateway
-        from ouroboros.delegate_progress import bounded_poll
-
-        with contextlib.closing(ensure_owned_gateway(admission_wait_sec=0)) as gateway:
-            detail = bounded_poll(gateway, run_id, 5.0)
-        state = str(custody.summary_of(detail).get("state") or "")
-    except Exception:
-        log.debug("Hold eligibility leaf probe failed", exc_info=True)
-        return False
-    return bool(state) and state not in custody.TERMINAL_STATES
+    The engine poll itself retired with Claudexor, so no state is readable any
+    more: this stays fail-closed (``False``), exactly the answer an unreachable
+    daemon produced, and a hold never latches on an unproven leaf.
+    """
+    log.debug("Hold eligibility leaf probe unavailable: %s", CLAUDEXOR_RETIRED)
+    return False
 
 
 def _single_live_run(ctx: Any) -> str:

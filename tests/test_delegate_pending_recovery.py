@@ -248,16 +248,21 @@ def test_definite_retry_refusal_retires_handoff_without_false_pending_claim(
     custody._CUSTODY.clear()
 
 
-def test_started_retry_race_adopts_same_durable_invocation(monkeypatch, tmp_path):
-    import ouroboros.claudexor_daemon as daemon
+def test_started_retry_race_cannot_be_adopted_without_the_run_probe(monkeypatch, tmp_path):
+    """A retry whose durable fate already says ``started`` used to adopt that run
+    after probing it. The probe retired with the Claudexor gateway, so the run
+    can no longer be PROVEN — the adoption refuses (fail-closed, no second POST)
+    instead of claiming a run this build cannot see."""
     import ouroboros.tools.delegate as delegate
     from ouroboros.tools.registry import ToolContext
 
     custody, recovery, task, snapshot, invocation_id, fingerprint, authority = (
         _pending_handoff(tmp_path, "recovery-started-race")
     )
+    posts = []
 
     def expose_started_race(*_args, **_kwargs):
+        posts.append(_args)
         assert custody.record_started(tmp_path, custody.RunCustody(
             run_id="run-started-race",
             task_id=task["id"],
@@ -274,25 +279,15 @@ def test_started_retry_race_adopts_same_durable_invocation(monkeypatch, tmp_path
             "run_id": "run-started-race",
         })
 
-    class Gateway:
-        def get_run(self, run_id):
-            assert run_id == "run-started-race"
-            return {"id": run_id, "state": "running"}
-
-        def close(self):
-            pass
-
     monkeypatch.setattr(delegate, "exact_start", expose_started_race)
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: Gateway())
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id=task["id"])
     ctx.budget_drive_root = str(tmp_path)
 
     result = recovery.adopt_handoff(ctx, task)
 
-    assert result == {
-        "status": "adopted",
-        "run_id": "run-started-race",
-        "cause": recovery.CAUSE_WORKER_CRASH,
-    }
-    assert recovery._read(tmp_path, task["id"])["status"] == "adopted"
+    assert result["status"] == "recovery_required"
+    assert result["reason"] == "pending_recovery_run_unprovable"
+    assert result["run_id"] == "run-started-race"
+    assert result["detail"]["reason"] == "invocation_already_started"
+    assert len(posts) == 1  # the durable invocation was never re-posted
     custody._CUSTODY.clear()

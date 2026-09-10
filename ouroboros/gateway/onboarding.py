@@ -439,11 +439,28 @@ def _harness_capability(snapshot: Dict[str, Any], connected: Sequence[str]) -> D
 
 
 def _read_harness_snapshot() -> Dict[str, Any]:
-    """The ONE blocking Claudexor read, through the SAME projection the accounts
-    panel uses (no second discovery path)."""
-    from ouroboros.gateway.claudexor_accounts import _status_payload
+    """The ONE blocking read the install preset compiles from — explicitly
+    unavailable.
 
-    return _status_payload(True)
+    It used to be the accounts panel's own ``_status_payload`` (one discovery
+    path, no second one). That panel's data source was the Claudexor agent
+    engine, which this build no longer ships (Seed 0), so the read now returns
+    the panel's unavailable form instead of importing a retired module: a
+    non-running daemon state plus the panel's unconditional empty facets.
+    ``verified_harness_discoveries`` already turns exactly that into the typed
+    ``daemon_unavailable`` preset failure, so subscriptions still cannot be
+    guessed at — the wizard keeps its explicit "finish without agent defaults"
+    escape hatch. No silent degradation: an install that declares
+    subscriptions gets a refusal, never a fabricated preset."""
+    return {
+        "daemon": {
+            "state": "unavailable",
+            "last_error": "the Claudexor agent engine was retired",
+        },
+        "harnesses": [],
+        "profiles": {},
+        "quota": [],
+    }
 
 
 async def resolve_install_preset(

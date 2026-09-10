@@ -21,9 +21,20 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from ouroboros.config import DELEGATE_WAIT_CEILING_SEC
+from ouroboros.errors import OuroborosUnavailableError
 from ouroboros.utils import truncate_review_artifact
 
 log = logging.getLogger(__name__)
+
+# The bounds `poll_bound` narrows an ask against. Both came from the Claudexor
+# gateway client, which retires with the rest of the subsystem: the VALUES are
+# unchanged (they were tuned there, see the comments they arrived with), only
+# their home moves, because a bound has to keep bounding something a caller can
+# still read. `_READ_TIMEOUT_SEC` is the client-wide read default and the CEILING
+# on any self-bounding caller's ask; `SHORT_POLL_TIMEOUT_SEC` is the FLOOR under
+# non-strict bounded wait/admission asks.
+_READ_TIMEOUT_SEC = 60.0
+SHORT_POLL_TIMEOUT_SEC = 5.0
 
 _TIMELINE_TAIL = 12
 _TIMELINE_LABEL_CHARS = 300
@@ -355,8 +366,6 @@ def poll_bound(seconds_left: float, *, strict: bool = False) -> float:
 
     ONE place computes it, for both entry points below, so the two cannot drift.
     """
-    from ouroboros.gateways.claudexor import _READ_TIMEOUT_SEC, SHORT_POLL_TIMEOUT_SEC
-
     if strict:
         return min(_READ_TIMEOUT_SEC, max(0.001, float(seconds_left)))
     return min(_READ_TIMEOUT_SEC, max(SHORT_POLL_TIMEOUT_SEC, float(seconds_left)))
@@ -364,8 +373,6 @@ def poll_bound(seconds_left: float, *, strict: bool = False) -> float:
 
 def _strict_poll(gateway: Any, run_id: str, timeout: float) -> Dict[str, Any]:
     """Give each HTTP phase the full remainder, while bounding total wall time."""
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
     holder: Dict[str, Any] = {}
     done = threading.Event()
 
@@ -379,8 +386,10 @@ def _strict_poll(gateway: Any, run_id: str, timeout: float) -> Dict[str, Any]:
 
     threading.Thread(target=call, name=f"review-poll-{run_id}", daemon=True).start()
     if not done.wait(timeout=timeout):
-        raise ClaudexorUnavailable(
-            "poll_wall_timeout", f"Claudexor poll exceeded {timeout:g}s wall-clock bound",
+        # The typed transport refusal, now the shared one: the class that named it
+        # retires with the Claudexor gateway, the CODE stays as the message prefix.
+        raise OuroborosUnavailableError(
+            f"poll_wall_timeout: delegated-run poll exceeded {timeout:g}s wall-clock bound",
         )
     if "error" in holder:
         raise holder["error"]
@@ -466,11 +475,9 @@ def expiring_poll(
     bound is this window's EXPIRY, which the caller knows how to report, and never a
     transport failure raised out of a tool holding a live overpowered run.
     """
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
     try:
         return bounded_poll(gateway, run_id, 0.0, strict=strict)
-    except ClaudexorUnavailable:
+    except OuroborosUnavailableError:
         log.debug("the last poll of a spent delegate_wait window went unanswered", exc_info=True)
         return None
 

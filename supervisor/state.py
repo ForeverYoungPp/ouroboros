@@ -715,7 +715,7 @@ def reconstruct_task_cost(
         }
     else:
         try:
-            from ouroboros.cost_projection import honest_accounted_amount
+            from ouroboros.task_results import honest_accounted_amount
             from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown
 
             authority_root = pathlib.Path(drive_root) if drive_root is not None else DRIVE_ROOT
@@ -756,7 +756,7 @@ def reconstruct_task_cost(
         # SSOT cost naming (C2): the additive honest name rides beside the
         # deprecated `cost_usd` alias with the same value on every field
         # projection this authority hands out.
-        from ouroboros.cost_projection import with_cost_aliases
+        from ouroboros.task_results import with_cost_aliases
 
         return with_cost_aliases(projection)
     if projection.get("cost_accounting_status") != "available":

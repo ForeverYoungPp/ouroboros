@@ -456,7 +456,7 @@ def _peek_task(ctx: ToolContext, task_id: str, view: str = "summary") -> str:
     status = str(data.get("status") or "unknown")
     # SSOT cost projection (C2): a missing/unknown cost says "unknown", never a
     # confident $0.00, and an open amount is labelled as the upper bound it is.
-    from ouroboros.cost_projection import cost_display
+    from ouroboros.task_results import cost_display
 
     parts = [
         f"Task {tid} [{status}] cost={cost_display(data)} (peek — NOT absorbed)",

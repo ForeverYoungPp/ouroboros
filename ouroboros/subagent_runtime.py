@@ -344,15 +344,14 @@ def resolve_configured_actor_dispatch(
     from ouroboros.config import resolve_effort
     from ouroboros.provider_models import model_has_credentials
     from ouroboros.subagents import (
+        CLAUDEXOR_RETIRED,
         CapabilityDelta,
         DelegationRoute,
         SubagentDispatch,
         SubagentExecutorResolution,
         SubagentLaneResolution,
-        delegated_run_shape,
         derive_capability_reason,
         parse_subagent_harness,
-        route_health,
     )
     from ouroboros.tools.control_delegation import profile_from_task_constraint
 
@@ -420,31 +419,12 @@ def resolve_configured_actor_dispatch(
             effort=selected_effort or parsed.effort,
             profile_id=str(route_spec.get("credential_profile_id") or ""),
         )
-        from ouroboros.contracts.task_constraint import normalize_task_constraint
-        from ouroboros.tool_access import predicted_subagent_profile
-
-        normalized = normalize_task_constraint(task.get("task_constraint"))
-        surface = str(getattr(normalized, "surface", "") or "")
-        shape = delegated_run_shape(
-            predicted_subagent_profile(write_surface=surface) == "acting_subagent"
-        )
-        gateway = None
-        try:
-            from ouroboros.claudexor_daemon import ensure_owned_gateway
-
-            gateway = ensure_owned_gateway()
-            unavailable, reset_at = route_health(
-                gateway, exact_route.route_id, shape, route_model=exact_route.model,
-                pinned_profile=exact_route.profile_id,
-            )
-        except Exception as exc:
-            unavailable, reset_at = (
-                str(getattr(exc, "code", "") or type(exc).__name__),
-                str(getattr(exc, "reset_at", "") or ""),
-            )
-        finally:
-            if gateway is not None:
-                gateway.close()
+        # The route-health read went through the OWNED Claudexor gateway, which
+        # retired with the daemon family: there is no reader left to ask, so a
+        # configured session route degrades to the SAME explicit unavailable branch
+        # the unreachable-daemon path used — now naming a permanent cause (the
+        # capability is gone) instead of a transport fault that might heal.
+        unavailable, reset_at = CLAUDEXOR_RETIRED, ""
 
     cognitive = task.get("parent_cognitive_route") if isinstance(task.get("parent_cognitive_route"), dict) else {}
     nanny_model = str(cognitive.get("model") or "").strip()
@@ -845,8 +825,11 @@ def _actor_work_order_for_start(
     A bootstrap capability observation is useful context for the actor, but it
     cannot authorize a later partial-lens start: manifests may change in either
     direction while the actor reasons.  Every over-budget attempt therefore
-    probes the exact frozen route again and records the live observation.
+    re-derived the frozen route's live channel observation; that reader retired with
+    the Claudexor gateway family, so the observation now records the retirement.
     """
+
+    from ouroboros.subagents import CLAUDEXOR_RETIRED
 
     canonical = str(bootstrap.get("canonical_work_order") or "")
     source_request = bootstrap.get("source_request")
@@ -860,34 +843,24 @@ def _actor_work_order_for_start(
     except Exception as exc:  # noqa: BLE001 - invalid frozen authority is UNKNOWN
         channel_route_id = ""
         route_error = str(getattr(exc, "code", "") or type(exc).__name__)
-    gateway = None
-    try:
-        from ouroboros.claudexor_daemon import ensure_owned_gateway
-        from ouroboros.subagent_work_order import route_source_request_channel
-
-        if route_error:
-            source_channel = {
-                "status": "unverified",
-                "reason": "frozen_route_invalid",
-                "detail": route_error,
-                "route": channel_route_id,
-            }
-        else:
-            gateway = ensure_owned_gateway()
-            source_channel = route_source_request_channel(gateway, channel_route_id)
-    except Exception as exc:  # noqa: BLE001 - unknown is a typed authority fact
+    if route_error:
         source_channel = {
             "status": "unverified",
-            "reason": "capability_probe_failed",
-            "detail": type(exc).__name__,
+            "reason": "frozen_route_invalid",
+            "detail": route_error,
             "route": channel_route_id,
         }
-    finally:
-        if gateway is not None:
-            try:
-                gateway.close()
-            except Exception:
-                pass
+    else:
+        # The source-channel probe read the route's manifest through the OWNED
+        # Claudexor gateway, which retired with the daemon family. No reader is left
+        # to produce capability evidence, so the channel is a permanent
+        # "unavailable" — the terminal the probe itself used to return when the
+        # daemon was unreachable, now naming the retirement rather than a fault.
+        source_channel = {
+            "status": "unavailable",
+            "reason": CLAUDEXOR_RETIRED,
+            "route": channel_route_id,
+        }
     bootstrap["source_channel"] = source_channel
 
     status = str(source_channel.get("status") or "unverified")
