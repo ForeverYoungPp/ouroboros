@@ -20,10 +20,8 @@ from ouroboros.task_results import (
 )
 from ouroboros.artifacts import collect_task_artifact_records, merge_artifact_records
 from ouroboros.outcomes import (
-    EXECUTION_BEST_EFFORT,
     EXECUTION_FAILED,
     EXECUTION_INFRA_FAILED,
-    EXECUTION_OK,
     apply_receipt_absent_flag,
     artifact_bundle_from_result,
     build_verification_ledger,
@@ -826,12 +824,12 @@ def emit_task_results(
         # letters-home too — the locked main path owns those (v6.33.0 WS10
         # idempotency contract; claudexor B5). ``_ephemeral`` is computed once near
         # the top of this function (it also gates the durable task-record writes).
-    _project_scoped = record_project_letters_home(
-        task, pending_events, outcome_axes,
-        env_drive_root=str(env.drive_root), ephemeral=_ephemeral,
-    )
-    _is_direct_chat = bool(task.get("_is_direct_chat"))
-    _project_task = _project_scoped and not _is_direct_chat and not _ephemeral
+        _project_scoped = record_project_letters_home(
+            task, pending_events, outcome_axes,
+            env_drive_root=str(env.drive_root), ephemeral=_ephemeral,
+        )
+        _is_direct_chat = bool(task.get("_is_direct_chat"))
+        _project_task = _project_scoped and not _is_direct_chat and not _ephemeral
         budget_drive_root = str(task.get("budget_drive_root") or "").strip()
         split_drive = bool(
             budget_drive_root
