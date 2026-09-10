@@ -17,17 +17,17 @@
 
 | Seed | 范围 | 依赖 | 现在能否开跑 |
 |---|---|---|---|
-| **E** | 切 import 图（主规格 §9.2） | 无 | ✅ **阻塞项为零** |
-| **A** | 记忆外接 Engram（§5，含 §5.15 记忆模型） | E | ❌ 1 项未决 |
-| **B** | 删计费投影（§6） | E | ❌ 4 项未决 |
-| **C** | Claudexor → omp（§7） | E | ❌ 1 项待实测 |
-| **D** | 面轴收敛（角色规格 §4-§9） | A、B | ❌ 需先做 150 处分类 |
+| **0** | 切 import 图（主规格 §9.2） | 无 | ✅ **阻塞项为零** |
+| **1** | 记忆外接 Engram（§5，含 §5.15 记忆模型） | 0 | ❌ 1 项未决 |
+| **2** | 删计费投影（§6） | 0 | ❌ 4 项未决 |
+| **3** | Claudexor → omp（§7） | 0 | ❌ 1 项待实测 |
+| **4** | 面轴收敛（角色规格 §4-§9） | 1、2 | ❌ 需先做 150 处分类 |
 
 **为什么必须拆**：`ooo` 的 A-grade 门要求 AC 可穷举可判定；「把三件事都做完」这种 goal 的 AC 无法穷举，且执行会无界。writing-plans 的 Scope Check 也明说多子系统必须各成 plan，每份自己产出可运行可测的软件。
 
 ---
 
-## 2. Seed E —— 切 import 图（**可直接开跑**）
+## 2. Seed 0 —— 切 import 图（**可直接开跑**）
 
 ### goal
 
@@ -35,13 +35,13 @@
 
 ### acceptance_criteria
 
-- **AC-E1** `python -c "import server"` 退出码 0；且把 `ouroboros/usage_accounting.py` **临时移走**后**仍**退出码 0。
-- **AC-E2** `python -c "import supervisor.events"` 退出码 0；且把 `ouroboros/cost_projection.py` 临时移走后**仍**退出码 0（该模块当前在 `supervisor/events.py:33` 被顶层 import）。
-- **AC-E3** `python -c "import ouroboros.gateway.extensions"` 退出码 0；且把 `ouroboros/_usage_rows.py` 临时移走后**仍**退出码 0（当前经 `skill_review_usage.py:10-12` 被硬绑）。
-- **AC-E4** `pytest tests/test_gateway_parity.py` 全绿——`endpoint_index.HTTP_ENDPOINTS` 与 `collect_routes()` 逐条相等。
-- **AC-E5** 对每个将被删除的模块名，全仓不存在「用 `except Exception: pass`（或 `except Exception` 后仅 log）吞掉其 import」的写法；`server_control.py:161-165` 已改为显式处理，且 panic 仍能终止委托 run 的进程组（由 `tests/test_server_control_panic_daemon.py` 覆盖）。
-- **AC-E6** `web` 模块图不断：`web/modules/claudexor_status_store.js` 被 **7 个模块** import（含 `settings.js:21` 挂在 `app.js` 上）。改造后 `web/tests/` 的现有冒烟测试全绿，且不存在「删掉该文件导致整站白屏」的路径。
-- **AC-E7** 本阶段 `git diff --stat` **不含任何文件删除**——只有 import 点与适配代码的改动。
+- **AC-01** `python -c "import server"` 退出码 0；且把 `ouroboros/usage_accounting.py` **临时移走**后**仍**退出码 0。
+- **AC-02** `python -c "import supervisor.events"` 退出码 0；且把 `ouroboros/cost_projection.py` 临时移走后**仍**退出码 0（该模块当前在 `supervisor/events.py:33` 被顶层 import）。
+- **AC-03** `python -c "import ouroboros.gateway.extensions"` 退出码 0；且把 `ouroboros/_usage_rows.py` 临时移走后**仍**退出码 0（当前经 `skill_review_usage.py:10-12` 被硬绑）。
+- **AC-04** `pytest tests/test_gateway_parity.py` 全绿——`endpoint_index.HTTP_ENDPOINTS` 与 `collect_routes()` 逐条相等。
+- **AC-05** 对每个将被删除的模块名，全仓不存在「用 `except Exception: pass`（或 `except Exception` 后仅 log）吞掉其 import」的写法；`server_control.py:161-165` 已改为显式处理，且 panic 仍能终止委托 run 的进程组（由 `tests/test_server_control_panic_daemon.py` 覆盖）。
+- **AC-06** `web` 模块图不断：`web/modules/claudexor_status_store.js` 被 **7 个模块** import（含 `settings.js:21` 挂在 `app.js` 上）。改造后 `web/tests/` 的现有冒烟测试全绿，且不存在「删掉该文件导致整站白屏」的路径。
+- **AC-07** 本阶段 `git diff --stat` **不含任何文件删除**——只有 import 点与适配代码的改动。
 
 ### constraints
 
@@ -56,7 +56,7 @@
 
 ---
 
-## 3. Seed A —— 记忆外接 Engram
+## 3. Seed 1 —— 记忆外接 Engram
 
 ### goal
 
@@ -64,17 +64,17 @@
 
 ### acceptance_criteria（骨架——**待 §5 的第 1 项定稿后补全**）
 
-- **AC-A1**（往返）一次会话 `mem_save` 一条知识 → 重启运行时 → 新会话 `mem_search` 取回。
-- **AC-A2**（读路径，§5.5）写入一条 `scope: global` 的 observation → 在**任意 project** 的任务里被召回；project 级观察不串味。
-- **AC-A3**（会话映射，§5.15）**并发跑两个任务**，两者都写记忆 → **两次写入都成功**（证明显式 `session_id` 生效、未落进 Engram 的 `fails closed when multiple candidates remain`）；任务终点后该 session 在 `sessions/recent` 可见且带 summary。
-- **AC-A4**（捕获期，§5.4）同一次任务中 max 与 low 两次投影的 `core_sha256` 一致。
-- **AC-A5**（降级，§5.11）停掉 Engram → tier-0 的 Engram 块显示**显式缺口标记**，且 `identity` / `patterns` / `improvement-backlog` **仍然渲染**。
-- **AC-A6**（迁移，§5.14）迁移后原文件仍在原位（逐文件断言）；`mem_search` 能命中迁移前 `knowledge/` 的已知 topic。
-- **AC-A7**（工作记忆有界，§5.15-a）连续 N 次 scratchpad 更新后，该 topic 的字节数**不单调增长**。
-- **AC-A8**（冲突裁决，§5.15-b）构造一次命中候选的 `mem_save` → `judgment_required: true` → agent **确实调用** `mem_judge`；随后 `mem_search` 带出 `supersedes:` / `conflicts:` 注解。
-- **AC-A9**（缺口通道，§5.15-c）造一个缺口 → 它出现在 tier-0，且 BG 的 `update_identity` 返回 `IDENTITY_UPDATE_ABSTAINED`。
-- **AC-A10**（自迭代链，§5.9）一次触发反思的任务后，`improvement-backlog.md` 出现新候选，且 `maybe_promote` 的输入仍来自 `reflection_entry`。
-- **AC-A11**（反例，§5.2）把 Engram 条目的 MCP `enabled` 改 false → **不影响** tier-0（独立通道生效）。
+- **AC-11**（往返）一次会话 `mem_save` 一条知识 → 重启运行时 → 新会话 `mem_search` 取回。
+- **AC-12**（读路径，§5.5）写入一条 `scope: global` 的 observation → 在**任意 project** 的任务里被召回；project 级观察不串味。
+- **AC-13**（会话映射，§5.15）**并发跑两个任务**，两者都写记忆 → **两次写入都成功**（证明显式 `session_id` 生效、未落进 Engram 的 `fails closed when multiple candidates remain`）；任务终点后该 session 在 `sessions/recent` 可见且带 summary。
+- **AC-14**（捕获期，§5.4）同一次任务中 max 与 low 两次投影的 `core_sha256` 一致。
+- **AC-15**（降级，§5.11）停掉 Engram → tier-0 的 Engram 块显示**显式缺口标记**，且 `identity` / `patterns` / `improvement-backlog` **仍然渲染**。
+- **AC-16**（迁移，§5.14）迁移后原文件仍在原位（逐文件断言）；`mem_search` 能命中迁移前 `knowledge/` 的已知 topic。
+- **AC-17**（工作记忆有界，§5.15-a）连续 N 次 scratchpad 更新后，该 topic 的字节数**不单调增长**。
+- **AC-18**（冲突裁决，§5.15-b）构造一次命中候选的 `mem_save` → `judgment_required: true` → agent **确实调用** `mem_judge`；随后 `mem_search` 带出 `supersedes:` / `conflicts:` 注解。
+- **AC-19**（缺口通道，§5.15-c）造一个缺口 → 它出现在 tier-0，且 BG 的 `update_identity` 返回 `IDENTITY_UPDATE_ABSTAINED`。
+- **AC-1.10**（自迭代链，§5.9）一次触发反思的任务后，`improvement-backlog.md` 出现新候选，且 `maybe_promote` 的输入仍来自 `reflection_entry`。
+- **AC-1.11**（反例，§5.2）把 Engram 条目的 MCP `enabled` 改 false → **不影响** tier-0（独立通道生效）。
 
 ### constraints
 
@@ -86,9 +86,9 @@
 
 ---
 
-## 4. Seed B / C / D —— 骨架与阻塞项
+## 4. Seed 2 / 3 / 4 —— 骨架与阻塞项
 
-### Seed B — 删计费投影
+### Seed 2 — 删计费投影
 
 **goal**：删除计费**投影层**（`pricing` 的定价部分 / `cost_projection` / `_usage_*` / cost-breakdown 路由 / web 成本面），**保留**物理发送托管与 evolution 的节流功能（换非货币实现）。
 
@@ -96,7 +96,7 @@
 
 **阻塞（4 项，见 §5）**：BG `_check_budget` 替代形态；owner 钱面替代形态；cycle 上限 N 与用尽后语义；`pricing.py` 的 `infer_*` 迁出落点。
 
-### Seed C — Claudexor → omp
+### Seed 3 — Claudexor → omp
 
 **goal**：只裁 `AGENT_SESSION` 路由的 Claudexor 后端，改由 `omp --mode rpc` 常驻会话承担；`API_CHAT` 与 native 分支不动。
 
@@ -104,7 +104,7 @@
 
 **阻塞（1 项）**：`omp --resume <不存在的 id>` 的退出码/错误码实测——**这是唯一可能超出「删文件 + 改接口」范围的点**。
 
-### Seed D — 面轴收敛（角色规格）
+### Seed 4 — 面轴收敛（角色规格）
 
 **goal**：把已有的 `task_type` 认知面轴收敛成一处声明，并把 `delegation_role="background"` 迁回它；轴 A（血缘）与轴 C（呈现）不动。
 
@@ -114,7 +114,7 @@
 
 ---
 
-## 5. 阻塞项清单（不定这些，A/B/C/D 都不是 A-grade）
+## 5. 阻塞项清单（不定这些，Seed 1/2/3/4 都不是 A-grade）
 
 | # | 阻塞项 | 阻塞 | 谁能定 |
 |---|---|---|---|
@@ -131,6 +131,6 @@
 
 ## 6. 给 `ooo auto` 的调用建议
 
-- **Seed E 现在就能跑**：它阻塞项为零，且是 A/B/C 的前置。
-- **A/B/C/D 建议走 `generate_seed` 的无访谈路径**（`session_context`），而非 `ooo auto` 的访谈路径——因为 goal / constraints / decisions 已在这两份规格里定稿，访谈只会在已定事项上打转。等 §5 的阻塞项定稿后再补 AC。
+- **Seed 0 现在就能跑**：它阻塞项为零，且是 Seed 1/2/3 的前置。
+- **Seed 1/2/3/4 建议走 `generate_seed` 的无访谈路径**（`session_context`），而非 `ooo auto` 的访谈路径——因为 goal / constraints / decisions 已在这两份规格里定稿，访谈只会在已定事项上打转。等 §5 的阻塞项定稿后再补 AC。
 - **不要**把 E+A+B+C 合成一个 goal：AC 无法穷举，A-grade 门过不去，执行会无界。
