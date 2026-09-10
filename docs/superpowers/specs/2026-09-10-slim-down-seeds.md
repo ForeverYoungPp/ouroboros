@@ -374,6 +374,43 @@ ModuleNotFoundError: No module named 'ouroboros.mcp'
 
 **可以确定的结论**：`ooo` 无法干净地在「自己的源码仓」上执行——这是**工具与项目同名**导致的，不是配置疏漏。
 
+### 6.10 ⚠️ 跑之前的必做项：必须显式 `--project-dir`
+
+Seed 0 的 `brownfield_context` **不含任何 project dir**（只有 `project_type: brownfield` + 三个空列表，
+见 `seed-0-import-graph.yaml:4-10`）。因此 `ooo run workflow` 会**兜底**把 project dir 解析成 **seed 文件的父目录**：
+
+```
+Project directory: /home/fy/Projects/code/ouroboros/docs/superpowers/specs   ← 错
+```
+
+且这个错误目录**会一路带进 worktree 作为 runtime 的 cwd**，干跑日志实测：
+
+```
+orchestrator.adapter.initialized … cwd=/home/fy/.ouroboros/worktrees/ouroboros/orch_0a5339a30e80/docs/superpowers/specs
+```
+
+**为什么这会让本 Seed 全灭**：AC-0.1/0.2/0.3 是**以仓库根为基准写的 shell 探针**——`mv ouroboros/memory.py`、
+`python -c "import server"`、`import supervisor.events`。cwd 在 `docs/superpowers/specs` 下时
+`ouroboros/`、`server.py`、`supervisor/` **一个都找不到**，12 行探针会整批失败（`EXIT≠0`）。
+
+**修法**（`run.py:281-311` 的优先级：显式 `--project-dir` > seed metadata > brownfield target > 兜底；
+`:299-300` 显式值直接 return，最高优先）：
+
+```sh
+cd /home/fy/Projects/code/ouroboros
+ooo run workflow docs/superpowers/specs/seed-0-import-graph.yaml \
+  --project-dir /home/fy/Projects/code/ouroboros \
+  --runtime <claude-cli|pi|omp> \
+  --no-qa
+```
+
+**跑之前先验证这一个数**：`--dry-run` 的输出里 `Project directory:` 必须是仓库根，
+**不是** `docs/superpowers/specs`。这一条不确认就不要进长执行。
+
+> 另注：`--dry-run` **也会真的建 worktree**（`~/.ouroboros/worktrees/ouroboros/orch_<id>` + 分支
+> `ooo/orch_<id>`），所以每次干跑后要么留着、要么手动清（`git worktree remove` + `git branch -D`）。
+> 已清过一次。
+
 ### 6.9 首选修法（已实测）：给 worker 的 argv 插一个 `-P`
 
 `ooo` 0.54.3 的 `_spawn_worker` 用固定 argv 启动 worker：
