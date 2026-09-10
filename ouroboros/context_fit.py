@@ -18,12 +18,35 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from ouroboros.context_layout import reference_doc_sections
+from ouroboros.system_projection import (
+    project as project_system_content,
+    relocated_block,
+    strip_relocated,
+)
 from ouroboros.utils import estimate_tokens
 
 log = logging.getLogger(__name__)
 
 ContextProfile = Literal["owner_max", "owner_low", "task_local_low"]
 MeasurementBasis = Literal["fresh_route_usage", "fresh_model_usage", "cold_estimate"]
+
+
+def _append_relocated(user_content: Any, relocated_text: str) -> Any:
+    """The task turn's content with cross-task-unstable system text appended.
+
+    ``system_projection`` lifts per-task bytes (for example the project version in
+    the inlined ARCHITECTURE title) out of the shared system prefix.  They still
+    have to reach the model, so they ride after the task turn — the position where
+    a change costs only the tail of the request rather than everything behind it.
+    """
+    if not relocated_text:
+        return user_content
+    if isinstance(user_content, list):
+        return [*user_content, relocated_block(relocated_text)]
+    return [
+        {"type": "text", "text": str(user_content)},
+        relocated_block(relocated_text),
+    ]
 
 
 @dataclass(frozen=True)
@@ -36,9 +59,20 @@ class ContextFitProjection:
     calibrated_tokens: int
     calibration_ratio: float
     fits_known_window: Optional[bool]
+    #: Content lifted out of the shared system prefix and carried AFTER the task
+    #: turn instead (see ``ouroboros.system_projection``).  Empty when the whole
+    #: assembled system message is already cross-task stable.  It is rendered
+    #: into ``user_message`` so a per-task token inside the static block (the
+    #: project version in the inlined ARCHITECTURE title) stops invalidating the
+    #: hundreds of kilobytes in front of it.
+    relocated_text: str = ""
 
     def system_message(self) -> Dict[str, Any]:
         return {"role": "system", "content": json.loads(self.system_content_json)}
+
+    def user_message(self, user_content: Any) -> Dict[str, Any]:
+        """The task turn, with any relocated content riding after it."""
+        return {"role": "user", "content": _append_relocated(user_content, self.relocated_text)}
 
 
 @dataclass(frozen=True)
@@ -100,7 +134,7 @@ class ContextFitPlan:
         projection = self.projection(mode)
         return [
             projection.system_message(),
-            {"role": "user", "content": json.loads(self.user_content_json)},
+            projection.user_message(json.loads(self.user_content_json)),
         ]
 
     def reproject_transcript(
@@ -108,14 +142,41 @@ class ContextFitPlan:
         messages: List[Dict[str, Any]],
         mode: str,
     ) -> List[Dict[str, Any]]:
-        """Replace only the captured system view; preserve every dialogue/tool turn."""
+        """Replace the captured system view and re-derive the relocated bytes.
+
+        Every dialogue/tool turn is preserved.  The relocated block is NOT
+        preserved verbatim: it is derived from the system projection, so a mode
+        switch has to re-derive it.  Leaving the old block in place would send a
+        request whose task turn disagrees with the projection that was priced —
+        a low->max switch would silently DROP the title, and max->low would keep
+        a title the low projection never removed.
+        """
         if not messages:
             return self.messages_for(mode)
+        projection = self.projection(mode)
         rebuilt = list(messages)
         if str(rebuilt[0].get("role") or "") == "system":
-            rebuilt[0] = self.projection(mode).system_message()
+            rebuilt[0] = projection.system_message()
         else:
-            rebuilt.insert(0, self.projection(mode).system_message())
+            rebuilt.insert(0, projection.system_message())
+        return self._reproject_relocated(rebuilt, projection)
+
+    @staticmethod
+    def _reproject_relocated(
+        rebuilt: List[Dict[str, Any]],
+        projection: ContextFitProjection,
+    ) -> List[Dict[str, Any]]:
+        """Re-derive the relocated block on the first user turn of *rebuilt*."""
+        for index, message in enumerate(rebuilt):
+            if not isinstance(message, dict) or str(message.get("role") or "") != "user":
+                continue
+            cleaned = strip_relocated(message.get("content"))
+            content = _append_relocated(cleaned, projection.relocated_text)
+            if content == message.get("content"):
+                return rebuilt
+            updated = list(rebuilt)
+            updated[index] = {**message, "content": content}
+            return updated
         return rebuilt
 
     def projected_tokens_with_tools(
@@ -468,9 +529,19 @@ def build_context_fit_plan(
 
     def _projection(mode: str) -> ContextFitProjection:
         system_content = _render_context_system_content(env, core, mode=mode)
+        # D-CACHE (2026-09-10): split the assembled system message into the part
+        # that is byte-identical for every task on a route and the part that is
+        # not.  Only the first may live in the shared prompt prefix.
+        sent, relocated = project_system_content(system_content)
+        relocated_text = "\n".join(
+            str(block.get("text") or "")
+            for message in relocated
+            for block in (message.get("content") or [])
+            if isinstance(block, dict)
+        )
         messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content},
+            {"role": "system", "content": sent},
+            {"role": "user", "content": _append_relocated(user_content, relocated_text)},
         ]
         estimated = estimate_context_prompt_tokens(messages)
         calibrated = int(estimated * ratio)
@@ -482,7 +553,7 @@ def build_context_fit_plan(
         return ContextFitProjection(
             mode=mode,
             system_content_json=json.dumps(
-                system_content,
+                sent,
                 ensure_ascii=False,
                 sort_keys=True,
             ),
@@ -490,6 +561,7 @@ def build_context_fit_plan(
             calibrated_tokens=calibrated,
             calibration_ratio=ratio,
             fits_known_window=fits,
+            relocated_text=relocated_text,
         )
 
     max_projection = _projection("max")
