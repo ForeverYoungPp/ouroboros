@@ -532,3 +532,63 @@ uv 在 **worktree 内**建自己的环境并对 worktree 做 editable 安装 →
 
 （与 §6.8 的 import-graph 判断一致：`events.py:33` 顶层引 `cost_projection`；`extensions→skill_review_usage` 链引
 `_usage_rows*`；`server` 经 `collect_routes()` 引 `claudexor_accounts`/`claudexor_quota`。探针非破坏性：跑完 worktree 干净。）
+
+### 6.13 首跑的失败真相：fat-harness 的**证据契约**，不是代码
+
+`ooo run` 首跑结果 `Success 0/11 · Failed 1 · Blocked 10`。UI 顶部的 `Frugality proof:
+insufficient_data` 是**事后尸检**，不是原因：时间戳链 `execution.completed` 17:58:18.571 →
+`session.failed` 17:58:18.583 → `frugality_proof.evaluated` 17:58:18.712 →
+`frugality_retrospective.reported` 17:58:18.739，且后者自带 `trigger: execution_finalized` /
+`evidence_only: true`。它的阈值是 `min_triads: 20 / min_runs: 3` 而 `counted_rows: 0` ——
+**队列级统计门，任何单跑都必然 `insufficient_data`**，别去改配置找开关。
+
+**真因**（`~/.ouroboros/logs/ouroboros.log:9866`，逐字）：
+
+```
+reason='Fat-harness verifier failed (unsupported evidence claims:
+    commands_run: for m in ouroboros/memory.py …; do mv "$m" /tmp/probe_moved_ac01.py; …; done;
+    tests_passed: for m in ouroboros/memory.py …; do mv "$m" …; done; …)'
+```
+
+叶子把那段 **12 次迭代的 `mv` 循环**同时填进 `commands_run` 和 `tests_passed`，验收器的
+`orchestrator/evidence/claims.py:_runtime_messages_support_command_claim` 无法把它与运行时记录对上
+→ 判 `FABRICATION_SUSPECTED`（`recovery_exhausted.last_failure_class`），重试 2 次后
+`repeated_failure_early_stop`，其余 AC 全部 `blocked`。
+
+**而 AC-0.1 的机械门其实是通过的**（实测：worktree 里 12 行探针全 `EXIT=0`）——被拒是**证据接地**问题。
+
+**为什么 `code` profile 必然拒**：`profiles/code.yaml` 的
+
+```yaml
+verifier_capability: subprocess_test_runner
+evidence_schema:
+  required: [files_touched, commands_run, tests_passed]
+  rejected_if: [tests_passed == []]
+```
+
+要求非空 `tests_passed`，而移文件跑 import / `git diff` / 静态 grep 这类 AC **结构上产不出**。
+
+**两项修法（已落地并双树实测）**：
+
+1. **探针不再移动文件**，改成单条可接地的闭包断言：
+   `import <入口>; mods=(...); still=[m for m in mods if m in sys.modules]; assert not still`
+   —— 单命令、无需声明 `files_touched`、非破坏性，**也因此消掉了「必须 `--sequential`」的那个理由**。
+2. **`task_type: code` → `artifact`**：`profiles/artifact.yaml` 只要
+   `required: [files_touched, commands_run]`（**无 `tests_passed`**），
+   `verifier_capability: read_only_discovery`，且 `verifier_focus` 明写
+   「**Prefer the Seed `verify_command` … over worker self-reports**」——正合本 seed。
+   注意 profile 是 `runner.py:3469` 从 seed 现取的，所以**改它对 resume 也生效**；
+   被持久值钉住的只有 `fat_harness_mode` 的**开关**（`_resolve_resume_fat_harness_mode`：
+   "that durable value always wins"）。
+
+双树验证（含 stderr；此前一次「两树都失败」是我命令里 tuple 用了裸双引号导致 shell 截断的**假象**）：
+
+| 树 | AC-1 | AC-2 | AC-3 |
+|---|---|---|---|
+| 基线 `f7926459` | exit 1（6 个模块） | exit 1（`cost_projection`） | exit 1（4 个模块） |
+| agent worktree | exit 0 `still: []` | exit 1（`cost_projection`） | exit 0 `still: []` |
+
+**顺带发现并修掉两条我自己写坏的 AC**（无论实现如何都不可能通过）：
+- **AC-6** 写了 `pytest web/tests -q`，但那 60 个用例是 **Node** 的（`web/package.json`:
+  `"test": "node --test tests/*.test.js"`）→ pytest 收集不到、exit 5。已改为 `node --test web/tests/*.test.js`。
+- **AC-9** 写了 `collect_routes()`，而签名是 `collect_routes(*, data_dir, …)`，`data_dir` 必填 → 恒 TypeError。已传 `data_dir=pathlib.Path('.')`（对齐 `server.py:2731`）。
