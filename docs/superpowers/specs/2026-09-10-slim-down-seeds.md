@@ -303,3 +303,57 @@ Open gaps: acceptance_criteria
 | B | 新 seed 落盘后，`AC-0.2`…`AC-0.7` 仍是**旧 seed 的 key**，只有 AC-0.1/0.8/0.9 是新的；理由是返回体在 AC 块有 `[…20ln elided…]` | **新 seed 的 key 共 9 个，旧 seed 的 key 共 0 个**；`seed_id: seed_a8af8b9801e5`；返回体 9 条 AC 与 key 当时全部可见，无 elision。报告随后**自行撤回**（「我那次 grep 读到的是覆盖前的瞬时状态，不是终态」） |
 
 **纪律**：收到具体到 file:line / 具体到字符串的指控时，**一律先对磁盘取一次证再动**——这两次都是「先核实」避免了改坏一个本来正确的文件。反之，形态类结论（AC 的形态、`brownfield_context` 默认值、`user_preferences` 污染问答流）三次全部为真，也都已在 §6.1 / §6.5.1 / §6.5.2 落地。
+
+### 6.8 ⛔ 硬性阻断：`ooo` 的执行通道在本仓不可用（包名冲突）
+
+**实测结论：`start_execute_seed` 在本仓必然失败，且原因不可从工具参数层绕过。**
+
+首次执行 Seed 0 的返回：
+
+```
+Error: Tool execution failed: detached worker exited before persisting job
+acceptance server=ouroboros-mcp
+```
+
+`~/.ouroboros/logs/ouroboros.log` 显示它在 **124 ms** 内就退出（不是等满 `startup_timeout_seconds = 20`），`~/.ouroboros/detached-jobs/` 为空——worker 连自己的 job 文件都没写出。
+
+**根因（逐层取证）**：
+
+1. worker 的 spawn 命令是固定的 `[sys.executable, "-m", "ouroboros.mcp.detached_worker", request_path]`，且 `stdout`/`stderr` 全为 `DEVNULL`（`detached_jobs.py:279-297`）——**所以现场看不到它的报错**。
+2. `Popen(..., cwd=cwd)` 里的 `cwd` 就是 `start_execute_seed` 传入的 `request.cwd`（`detached_jobs.py:335-346`）。
+3. worker 入口在 `os.chdir(request.cwd)` 之前就要解析自身模块（`detached_worker.py:184`）。
+
+而**工具自己的包名是 `ouroboros`，与被重构的项目同名**。实测：
+
+| cwd | `import ouroboros` 解析到 | `ouroboros.mcp` |
+|---|---|---|
+| `~` | 已安装的 ouroboros-ai | ✅ True |
+| **仓库根** | **仓库自己的 `ouroboros/__init__.py`** | ❌ False |
+
+仓库里只有 `ouroboros/mcp_client.py`、**没有 `ouroboros/mcp/` 子包**，所以：
+
+```
+$ cd <repo> && python -m ouroboros.mcp.detached_worker
+ModuleNotFoundError: No module named 'ouroboros.mcp'
+```
+
+**为什么访谈阶段没暴露这个问题**：访谈跑在已加载好自身包的 `ooo mcp serve` 进程**内部**（同进程，不重新解析模块）；而 execution 走的是**新进程的 detached worker**。所以 `ooo auto` 的访谈能跑、`execute_seed` 必挂。
+
+**两个候选修法，都有副作用，不能直接照加**：
+
+| 修法 | 做法 | 副作用 |
+|---|---|---|
+| A. 给 ooo 条目加 `PYTHONSAFEPATH=1` | `~/.omp/agent/mcp.json` 的 `ooo` 条目加 `"env": {"PYTHONSAFEPATH": "1"}`（schema **支持** stdio 的 `env` 与 `cwd` 两个字段）。实测该变量下 worker 可正常解析（`usage: python -m ouroboros.mcp.detached_worker REQUEST.json`） | ⚠️ **会毒化探针**：执行器 spawn 的每个子进程都继承该变量，而 AC-0.1/0.2/0.3 跑的是 `python -c "import server"`——它**依赖 cwd 在 `sys.path` 上**。`PYTHONSAFEPATH=1` 让 cwd 不入路径 → **本 Seed 的三条核心 AC 全部失效** |
+| B. 换 cwd 到仓库之外 | 传一个不含 `ouroboros/` 的 `cwd` | worker 与执行都会在**错误目录**工作（`request.cwd` 同时是执行工作目录），任务目标即仓库本身 |
+
+**冲突的本质**：两者需要**相反的** `sys.path` 行为——工具要 cwd **不在**路径上（才能解析自己的 `ouroboros`），而探针要 cwd **在**路径上（才能 `import server`）。同一环境变量无法同时满足。
+
+**可行的收口（择一，均需 Owner 决定）**：
+
+1. **A + 改写探针**：加 `PYTHONSAFEPATH=1` 的同时，把 AC-0.1/0.2/0.3 的探针改成 `env -u PYTHONSAFEPATH python -c "import server"`。代价：把 AC 与一个工具环境怪癖耦合。
+2. **本仓不用 ooo 执行**：改用其他执行器（本 harness 的 worktree / 子代理流程）。代价：放弃 `ooo` 的 AC 追踪与评估链。
+3. **把仓库放到不含顶层 `ouroboros/` 包的位置**执行：不可行——被重构的就是那个包。
+
+**本文件保持不篡改 `~/.omp/agent/mcp.json`**：那是用户的 harness 配置，且改它需要重启 omp 才生效，副作用又如上。
+
+**可以确定的结论**：`ooo` 无法干净地在「自己的源码仓」上执行——这是**工具与项目同名**导致的，不是配置疏漏。
