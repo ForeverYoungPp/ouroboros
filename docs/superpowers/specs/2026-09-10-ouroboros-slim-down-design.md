@@ -41,7 +41,7 @@
 
 **因此 P7 只正当化「代码减重」，不正当化「能力删除」。** 凡本方案涉及能力变更的部分（见 §3.3），不能用 P7 背书，必须单独走程序。
 
-### 3.2 本方案不能碰的六条
+### 3.2 本方案不能碰的七条
 
 | 约束 | 原文位置 | 对本方案的含义 |
 |---|---|---|
@@ -49,7 +49,7 @@
 | **P1 不静默截断** | `BIBLE.md:113-114`「never silent truncation; the memory horizon is preserved (only granularity varies)」 | 外置记忆不得让任何记忆类别静默消失或降级无提示 |
 | **P0 身份文件必须存在** | `BIBLE.md:37-38`「identity.md … may be rewritten radically as part of self-creation, but the file itself must remain present as a continuity channel」 | **`identity.md` 必须继续作为文件存在于 runtime data root**，不能被 Engram 的一个 topic 取代 |
 | **P2/P3 免疫系统持久记忆** | `BIBLE.md:190-197`「Pattern Register is the memory of this principle … The Pattern Register and the Improvement Backlog are **never abandoned**」；`BIBLE.md:382-386`「`patterns.md` and `improvement-backlog.md` may be consolidated, pruned, and reorganized — but **never abandoned or replaced wholesale** … These files share the Ship-of-Theseus protection of the constitutional core」 | `memory/knowledge/patterns.md` 与 `memory/knowledge/improvement-backlog.md` **不是本方案可以外置的对象** |
-| **P0 主动性与其具名实现** | `BIBLE.md:42-45`「Ouroboros acts on its own initiative, not only on tasks… **Background consciousness is the realization of this principle**: a continuous thinking process between tasks」 | **删 `consciousness` 是拆掉 P0 命名的实现**，不是删一个 daemon。见 §3.5 |
+| **P0 主动性与其具名实现** | `BIBLE.md:42-45`「Ouroboros acts on its own initiative, not only on tasks… **Background consciousness is the realization of this principle**: a continuous thinking process between tasks」 | **删 `consciousness` 是拆掉 P0 命名的实现**，不是删一个 daemon。见 §3.3 与 §5.13 |
 | **P0 identity 不是记忆** | `BIBLE.md:40-41`「identity.md is a manifesto… **Not a config and not memory, but direction**」 | identity **按定义不属于记忆系统**，因此它不该有 Engram 的 memory topic；文件通道是它的本体 |
 | **P0 不可分割核心** | `BIBLE.md:25-27`「Principles 0, 1, 2, 3, 4 form an inseparable core: none of them can be applied to annul another」 | 不能用 P7/P4 去废 P0；也不能用 P0 去废 P1/P3 |
 
@@ -189,7 +189,7 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 | 现函数 | 处理 |
 |---|---|
 | `context.build_memory_sections`（`context.py:963`） | 内容来源改为捕获期召回的 Engram 块；**identity 仍读文件**（§3.2） |
-| `context.build_knowledge_sections`（`context.py:882`） | 改为 Engram 召回；`patterns.md` 索引仍从 runtime data root 读（§3.3） |
+| `context.build_knowledge_sections`（`context.py:882`） | 改为 Engram 召回；`patterns.md` 索引仍从 runtime data root 读（§3.4） |
 | `context.build_recent_sections`（`context.py:1062`） | 保留「未压缩原文尾部」（读 `chat.jsonl`）；删掉 `task_reflections.jsonl` 渲染（改由 Engram 检索） |
 
 `ouroboros/system_projection.py`（145 行）**保留不动**。
@@ -200,7 +200,7 @@ Engram 的 observation 是无结构自由文本，替代不了 `backlog_candidat
 
 | 类别 | 缺失时行为 |
 |---|---|
-| `identity` / `patterns` / `improvement-backlog` | **不可降级**——它们仍是本地文件（§3.3），不依赖 Engram |
+| `identity` / `patterns` / `improvement-backlog` | **不可降级**——它们仍是本地文件（§3.4），不依赖 Engram |
 | Engram 承载的块（情景/语义/反思正文） | **可降级**：整块替换为一条显式缺口标记（沿用既有 `[MEMORY GAP]` 语义），并在 health 面上告警；**不得静默渲染为空** |
 
 `context_layout.py` 的 `TIER0_ALWAYS_FULL` 与 docstring 文档矩阵需同步改写（记忆 section 名在 A 面后不再存在）。
@@ -383,7 +383,7 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 
 | 风险 | 证据 | 对策 |
 |---|---|---|
-| **违宪：外置了受保护的 durable memory** | `BIBLE.md:382-386`（Ship-of-Theseus）、`:604-607`（具名 canonical location） | §3.3 已划边界：`patterns.md` / `improvement-backlog.md` / `identity.md` 不外置，只镜像。若 Owner 要外置，走修宪 plan review |
+| **违宪：外置了受保护的 durable memory** | `BIBLE.md:382-386`（Ship-of-Theseus）、`:604-607`（具名 canonical location） | §3.4 已划边界：`patterns.md` / `improvement-backlog.md` / `identity.md` 不外置，只镜像。若 Owner 要外置，走修宪 plan review |
 | **违宪：记忆静默截断** | `BIBLE.md:113-114` | §5.2 独立通道（不能挂在默认关闭的 MCP 集成上）+ §5.11 降级契约（缺口显式标记，不渲染为空） |
 | **违宪：历史被搬走** | `BIBLE.md:66` | §5.14 迁移是复制不是搬移；原文件一律保留 |
 | **违宪：以 P7 名义删能力** | `BIBLE.md:571-575`「Minimalism is about code, not capabilities」 | §3.3 把取舍分「代码减重」与「能力变更」两类；§12.2 列出需程序的三项 |
