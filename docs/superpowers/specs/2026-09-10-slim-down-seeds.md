@@ -448,3 +448,87 @@ ooo run workflow docs/superpowers/specs/seed-0-import-graph.yaml \
 > 另注：`--dry-run` **也会真的建 worktree**（`~/.ouroboros/worktrees/ouroboros/orch_<id>` + 分支
 > `ooo/orch_<id>`），所以每次干跑后要么留着、要么手动清（`git worktree remove` + `git branch -D`）。
 > 已清过一次。
+
+### 6.11 用隔离 omp profile 给 ooo 一个「干净身份」
+
+动机：omp 的既有配置（`advisor.enabled: true`、TTSR rules、mnemopi、extensions）会随
+**每个 ooo 派生的 omp 会话**一起生效并被成倍放大。ooo 侧**无法**关掉它——`omp_runtime.py:236-256`
+只传 `--model` / `--resume` / `--append-system-prompt` / `--tools`（或 `--no-tools`），**从不传 `--advisor`**；
+顾问是 omp 自己的配置项。杠杆是 **profile**。
+
+**机制**：omp 支持 `OMP_PROFILE`（隔离 auth/sessions/settings/caches）。ooo 的 `OmpRuntime._build_child_env`
+是 `os.environ.copy()`（只摘掉 `OUROBOROS_AGENT_RUNTIME` / `OUROBOROS_LLM_BACKEND`）→ **`OMP_PROFILE` 会原样传给 omp 子进程**。
+
+**实测**：默认 profile `advisor.enabled = true`；`OMP_PROFILE=ooo` 时 config 路径变为
+`~/.omp/profiles/ooo/agent`，`advisor.enabled = false`。
+
+**必须拷的文件（缺一不可）**：
+
+| 文件 | 作用 |
+|---|---|
+| **`agent.db`** | ⚠️ **provider 凭据在这里**（表 `auth_credentials`）。**漏了它就 429** |
+| `config.yml` | 设置（在副本里把 `advisor.enabled` 改成 `false`） |
+| `models.yml` / `models.db` | 模型定义与缓存 |
+| `.env` / `secret-placeholder.key` | 搜索键等 |
+
+> `agent.db` 必须用 **SQLite backup API** 拷（该库正被当前 omp 会话写 WAL，直接 `cp` 会拿到不一致快照）：
+> `sqlite3 ~/.omp/agent/agent.db ".backup ~/.omp/profiles/ooo/agent/agent.db"`
+
+**⛔ 不要拷 `mcp.json`**：它含 `ooo`（**自己套自己**——被驱动的 agent 会拿到 `ooo_start_execute_seed` 等工具，
+理论上递归再起执行，即「循环风暴」）、`arbor`、以及带 bearer token 的 `context7`/`evomap`（等于多存一份凭据）。
+实测：拷过去时，ooo 驱动的那次运行日志里加载了 `mcp:arbor` / `mcp:codebase-memory-mcp` / `mcp:context7` / **`mcp:ooo`**；
+把它改名移除后，**只有 `mcp:codebase-memory-mcp` 仍在**（来自 omp 内置，非该文件），`ooo` 不再被加载。
+
+**用法**：`OMP_PROFILE=ooo` **行内写，别 `export`**（export 会让交互式 omp 也落到这个空 profile）：
+
+```sh
+OMP_PROFILE=ooo ooo run workflow <seed> --runtime omp --project-dir <repo> --no-qa --sequential
+```
+
+**代价**：隔离 profile 是**空目录起步**——没有 auth、没有 modelRoles、没有 memories/rules/extensions。
+前四项靠上面的拷贝清单补齐；后三项**没有**正是「干净」的含义。
+
+### 6.12 探针必须走 `uv run --locked`，否则 10/12 个模块恒假绿
+
+**这是本轮最贵的坑。** 仓库 venv 里有本项目的 **editable 安装**，而它的 finder 把
+`ouroboros` / `server` / `supervisor` / `web` 的**直接子模块强制从主仓库解析**：
+
+```python
+# .venv/lib/python3.12/site-packages/__editable___ouroboros_6_114_9_finder.py
+MAPPING = {'ouroboros': '/home/fy/Projects/code/ouroboros/ouroboros', 'server': ..., 'supervisor': ..., 'web': ...}
+if parent and parent in MAPPING:
+    return PathFinder.find_spec(fullname, path=[MAPPING[parent]])
+```
+
+**实测**（从 worktree 跑、用仓库 venv）：
+
+```
+ouroboros.__path__     = ['/tmp/wt-diag/ouroboros']                              ← 顶层来自 worktree
+ouroboros.cost_projection 来自 = /home/fy/Projects/code/ouroboros/ouroboros/...   ← 子模块来自主仓库
+```
+
+后果：把 worktree 里的 `ouroboros/<直接子模块>.py` 移走**完全不影响** import → 那些模块**恒假绿**；
+只有 `ouroboros/gateway/claudexor_*.py`（父包 `ouroboros.gateway` 不在 MAPPING）才会真失败。
+这精确解释了旧探针为什么只有那两个 `EXIT=1`、而 AC-0.2/0.3 在**未修的树上就全绿**。
+
+**同时被否掉的两种形态**：
+- 相对 `.venv/bin/python` —— 执行 cwd 是 **git worktree**，而 `.venv/` 被 gitignore（实测 `git ls-files .venv` = 0，
+  新建 worktree 里不存在）→ 「No such file or directory」全灭。
+- 仓库 venv 的**绝对路径** —— 顶层包确实来自 worktree（`sys.path[0]=''` 胜出），**但子模块仍被 MAPPING 抓回主仓库**，
+  所以同样不可用。
+
+**正解**：`uv run --locked python -c "…"` / `uv run --locked python -m pytest …`。
+uv 在 **worktree 内**建自己的环境并对 worktree 做 editable 安装 → `MAPPING` 指向被测那棵树。
+实测：移走 `cost_projection.py` 后 `uv run --locked python -c "import ouroboros.cost_projection"`
+正确抛 `ModuleNotFoundError`；还原后解析到 worktree；同解释器跑 pytest 11 passed。首次约 1.8s（包已缓存）。
+
+**预修基线（三条探针此刻都应当失败，且只应在这几个模块上失败）**：
+
+| 探针 | 入口 | 承重模块 |
+|---|---|---|
+| AC-0.1 | `import server` | `cost_projection`、`_usage_response`、`_usage_rows`、`_usage_rows_memo`、`gateway/claudexor_accounts`、`gateway/claudexor_quota` |
+| AC-0.2 | `import supervisor.events` | `cost_projection` |
+| AC-0.3 | `import ouroboros.gateway.extensions` | `cost_projection`、`_usage_response`、`_usage_rows`、`_usage_rows_memo` |
+
+（与 §6.8 的 import-graph 判断一致：`events.py:33` 顶层引 `cost_projection`；`extensions→skill_review_usage` 链引
+`_usage_rows*`；`server` 经 `collect_routes()` 引 `claudexor_accounts`/`claudexor_quota`。探针非破坏性：跑完 worktree 干净。）
