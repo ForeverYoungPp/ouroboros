@@ -497,29 +497,31 @@ Claudexor 是**长驻 daemon**：socket + `/v2` 控制 API + 并发会话 + 设�
 
 | 项 | 内容 | 后果 |
 |---|---|---|
-| 情景/语义记忆外置 Engram | 只外置情景压缩、语义知识、反思正文、prompt 历史 | Engram 按 project 分域，需 §5.5 双召回补偿 |
+| 情景/语义记忆外置 Engram | 只外置情景压缩、语义知识、反思正文、prompt 历史 | account 级知识用 `scope: personal`/`global` 跨 project 可见，project 级随 canonical project 解析（§5.5） |
 | 上下文注入换源 | `build_memory_sections` / `build_knowledge_sections` / `build_recent_sections` 改读 Engram | 3 段 cache_control 结构与 `core_sha256` 契约不变 |
 | 计费投影删除 | 删 `pricing`/`cost_projection`/`_usage_*`/`costs.js`/cost-breakdown 路由 | 终止出口 8 类 → 7 类 |
 | 托管台账迁出而非删除 | `usage_accounting` → `physical_attempt.py` | 模块改名 + 迁移成本；保住「不重复发送」能力 |
-| Claudexor 按路由裁 | 只裁 `AGENT_SESSION` 路由后端 | harness 降级为一次性子进程；API_CHAT 与 native 分支不动 |
+| Claudexor 按路由裁 | 只裁 `AGENT_SESSION` 路由后端 | 后端改为 `omp --mode rpc` 常驻会话（§7.4）；API_CHAT 与 native 分支不动 |
 | 循环内合回行数规避物 | `_account_compaction_usage`、`_force_plan_*`、`_project_room_fact` | `loop.py` 字节棘轮只能缩，这是机会 |
 | 不采用 pi | 循环留 Python | 形态不变；12 项治理不需跨语言重建 |
 
-### 12.2 能力变更 — 需程序，不能当取舍项直接实施
+### 12.2 触碰 P0/P3 的三项 — 本规格一律「不动」，改动另开规格
 
-| 项 | 为什么不是「取舍」 | 出路 |
+下表不是「取舍」，而是记录**为什么这三项在本规格里没有可选的余地**：
+
+| 项 | 为什么不能在本规格里改 | 本规格的处理 |
 |---|---|---|
-| **改动 `consciousness`（删或合并）** | `BIBLE.md:42-45` 把它列为 P0 的具名实现；它还与本仓已定的「两个 agent 职责」分界重合（独立 registry + 白名单强制）；`:25-27` P0–P4 不可互废；`:10-11` 宪法变更须经 explicit reviewed release | **本规格完全不动它**——不删、不合并、不在 §5.12 的删除清单内。它的减重是**独立子项目**，需先做「哪些是真重复、哪些是角色必需」的对照分析，再按需走 P0 程序（§5.13） |
-| **把 `patterns.md` / `improvement-backlog.md` 外置** | `BIBLE.md:382-386` 明确二者「never abandoned or replaced wholesale」且共享宪法核心的 Ship-of-Theseus 保护；`:126-129` 明说 durable-memory permanence 的改动「is itself a constitutional change and requires plan review」 | **本规格不外置**，只建只读索引（§3.4）。若 Owner 要外置，另开 plan review |
-| **把 `identity.md` 做成记忆条目** | `BIBLE.md:40-41` identity「Not a config and not memory, but direction」；`:37-38` 文件须持续存在 | **本规格不动它**，既不外置也不做 topic |
+| **`consciousness`（删或合并）** | `BIBLE.md:42-45` 把它列为 P0 的具名实现；它还与本仓已定的「两个 agent 职责」分界重合（独立 registry + 白名单强制）；`:25-27` P0–P4 不可互废；`:10-11` 宪法变更须经 explicit reviewed release | **完全不动**——不删、不合并、不在 §5.12 的删除清单内。减重是**独立子项目**，需先做「哪些是真重复、哪些是角色必需」的对照分析（§5.13） |
+| **把 `patterns.md` / `improvement-backlog.md` 外置** | `BIBLE.md:382-386` 明确二者「never abandoned or replaced wholesale」且共享宪法核心的 Ship-of-Theseus 保护；`:126-129` 明说 durable-memory permanence 的改动「is itself a constitutional change and requires plan review」 | **不外置**，只建只读索引（§3.4） |
+| **把 `identity.md` 做成记忆条目** | `BIBLE.md:40-41` identity「Not a config and not memory, but direction」；`:37-38` 文件须持续存在 | **不动**，既不外置也不做 topic |
 
-**这三条是本规格里唯一触碰 P0/P3 的判断，请 Owner 明确确认 §12.2 的处理方式（保留能力/保留文件）而非删除。**
+**这三项在本规格里都是「不动」，没有备选方案需要 Owner 裁决**（对照 §3.3：本规格全部属于代码减重）。若要改变其中任何一项，都是**另开一份规格**的事，且前两项须先走 P9 的发布流程。
 
 ## 13. 待定项
 
 **已由本轮调研解决**（原待定项）：
 
-- ~~Engram MCP 工具档与具体裁剪~~ → 用 `--tools=agent`（19 个）。是否暴露 `mem_review` / `mem_judge` / `mem_compare` 给主循环仍待剪裁，但这是**工具面配置**，不阻塞规格。
+- ~~Engram MCP 工具档~~ → 用 `--tools=agent`（19 个 agent 面向工具；不带该档为全部 23 个）。
 - ~~`self/*` 的固定 project 名与 `.engram/config.json` 相容性~~ → 不需要固定 project。改用 Engram 的 `scope: personal|global`（§5.5）。
 - ~~code agent 钉定形态~~ → omp 有 `--mode rpc`（常驻 JSON-over-stdio，带 `ready` 帧与协议版本协商）+ `--provider-session-id` + `--resume`，钉定对象是 omp 版本与启动方式（§7.4）。
 - ~~memory protocol 的落点~~ → 从 Engram 自带的 `DOCS.md §Memory Protocol` 裁剪进 `prompts/SYSTEM.md`（§5.8）。
