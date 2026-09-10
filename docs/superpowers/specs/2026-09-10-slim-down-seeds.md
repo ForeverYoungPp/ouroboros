@@ -178,7 +178,7 @@
 **因此**：
 
 - **绝不能用同样参数重发**——会造重复 run。收口用 `resume`（带 auto session id）或 `reconcile_run: true`。
-- 会话状态在 `~/.ouroboros/data/`：`auto_<id>.json`（auto 会话）、`interview_<id>.json`（访谈）、`ouroboros.db`。
+- **权威读取入口是 CLI，不是翻文件**：`ooo status auto <auto_session_id>`（id 形如 `auto_<hex>`，可从 `ooo status project <dir>` 取）。它给的是 event store 的权威视图，含 `Phase` / `Terminal` / `Last progress` / `Pending question` / `Recent auto answers` / `IntentGuard`。会话状态的**权威存储在 event store（SQLite，`ouroboros.persistence.event_store` + `resolve_event_store_path()`）**；`~/.ouroboros/data/*.json` 是同源的旁路快照，可读但不是权威。
 - `ouroboros_project_status` 对 `skip_run` 的会话显示 `Runs: 0` 是**正常的**——它统计的是 run，而 `skip_run` 停在 Seed。
 
 ### 6.4 范围建议
@@ -193,15 +193,42 @@
 
 | | `ooo auto`（访谈路径） | `generate_seed`（无访谈） |
 |---|---|---|
-| Seed | `seed_a9a10a35dff0` | **`seed_7dfa54923630`**（已存 `docs/superpowers/specs/seed-0-import-graph.yaml`） |
+| Seed | `seed_a9a10a35dff0` | **`seed_a8af8b9801e5`**（已存 `docs/superpowers/specs/seed-0-import-graph.yaml`） |
 | 等级 | **B** | 歧义 0.20（结构性上限，非评分）；`degraded: false` |
 | `unresolved_slots` | **`[acceptance_criteria]`** | **`[]`（零）** |
 | 中断原因 | `Partial product: yes (reason: interview_phase_deadline)` | —— |
 | AC 是否结构化 | ❌（只把 AC-0.4 收进 `verification_plan`） | ✅ 9 条全带 `semantic_ac_key` |
 
-**结论：对这个 251k 行的 brownfield 仓，访谈路径收敛不了。** 它停在 **round 1**（`max_interview_rounds` 是 50，不是轮数用尽），因为**每个访谈问题的 omp 自答要 4 分钟以上**，phase deadline 在 round 2 之前就到了。而根因之一是 AC 写在 goal 正文里、没被结构化吸收，导致访谈要从零推导本可直给的字段。
+**结论：对这个 251k 行的 brownfield 仓，访谈路径收敛不了** —— Seed 1/2/3/4 一律走 `session_context`。
 
-**因此 Seed 1/2/3/4 一律走 `session_context` 路径**，且提交时必须**一次给全**五件：`goal` + `acceptance_criteria`（列表）+ `constraints` + `decisions` + `project_type`。缺 `acceptance_criteria` 会得到 gap questions 而不是 block（工具契约明说），但那就退化成访谈了。
+### 6.5.1 根因是 AC 的**形态**，不是内容
+
+`ooo status auto auto_44a0cd52588e` 的实测：它为同一个问题**连问了 4 轮**，ambiguity 逐轮上升 **0.21 → 0.33 → 0.35**，而把我整份 AC 列表原样记成了对某个具体问题的回答（`round 2/3/4 [user_preference]`）。
+
+原因是访谈应答器的系统提示要求：
+
+> ONE concrete, committed, testable decision — **specific values, exact commands/flags, a small sample input and its exact expected output, and explicit error/stderr/exit-code behavior**.
+
+而我第一版 AC 是**散文式行为描述**，落到 ledger 里只算 `[user_preference]`，**不算 committed** → 访谈必须继续追问。
+
+**因此 AC 必须写成「可复制命令 + 逐字期望输出/退出码」**。对照：
+
+| 形态 | 例 |
+|---|---|
+| ❌ 散文 | 「`python -c "import server"` 退出码 0；且把模块临时移走后仍退出码 0」 |
+| ✅ committed | 「命令 `python -c "import server"` 期望：退出码 0、stderr 为空。变体命令 `mv ouroboros/usage_accounting.py /tmp/ && python -c "import server"; echo EXIT=$?; mv /tmp/usage_accounting.py ouroboros/` 期望：打印 `EXIT=0`」 |
+
+### 6.5.2 `session_context` 的键：`project_type` 有效，`context_references` **无效**
+
+第二个 seed 的 `brownfield_context`：
+
+| 字段 | 第一版（我传 `project_type: "coding"`） | 第二版（我传 `project_type: "brownfield"`） |
+|---|---|---|
+| `project_type` | ❌ `greenfield`（默认） | ✅ `brownfield` |
+| `context_references` | `[]` | **仍 `[]`** —— 该键**不被接受**（schema 也没列它） |
+| `task_type` | `code` | `code` |
+
+**所以**：`project_type` 是有效键且必须显式给 `brownfield`（否则默认 `greenfield`，执行器会丢掉「先找既有模式与既有消费者」的信号——而这正是 AC-0.5 与「不得把 `semantic_dedup.py` / `tools/knowledge.py` 当整删模块」要防的事）。`context_references` 当前不接受，规格路径要写进 `goal` 或 `constraints` 里。
 
 ### 6.6 `ooo auto` 与 `generate_seed` 的会话/产物位置
 

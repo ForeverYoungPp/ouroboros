@@ -2,7 +2,7 @@ goal: 在 /home/fy/Projects/code/ouroboros 切断「保留下来的模块」对�
   与 supervisor 在被删模块缺席时仍能正常启动。本阶段不删除任何文件，只改接线。
 task_type: code
 brownfield_context:
-  project_type: greenfield
+  project_type: brownfield
   context_references: []
   existing_patterns: []
   existing_dependencies: []
@@ -18,46 +18,53 @@ constraints:
 - 本仓有精确路径的单向字节棘轮：ouroboros/size_ratchet_manifest.py 的 GIANT_PATHS 列出 48 个既有超大文件，字节数只能减不能增；改动这些文件必须同
   commit 更新 manifest。
 - semantic_dedup.py 与 tools/knowledge.py 是部分保留、不是整删；切依赖时不得把它们当整删模块处理。
-- 降级契约取「显式不可用」而非静默降级：依据是主规格 §9.2 纪律 1（所有被删模块的 import 点必须显式处理）。
+- 降级契约取「显式不可用」而非静默降级，依据主规格 §9.2 纪律 1。
 - HTTP 503 是本仓既有的 unavailable 码（gateway/_helpers.py:208 的 json_exception(exc, 503)、gateway/claudexor_accounts.py:535）。
-- 工具层一律返回标记字符串而非抛异常，与 ⚠️ ESCALATE_UNAVAILABLE、IDENTITY_UPDATE_ABSTAINED、custom_tool_argument_error
+- 工具层一律返回标记字符串而非抛异常，与 ESCALATE_UNAVAILABLE、IDENTITY_UPDATE_ABSTAINED、custom_tool_argument_error
   的既有模式一致。
 - 异常类型必须定义在一个删除后仍然存在的模块里；被删模块内定义会使类型随模块消失。
 - 摘除端点不在本阶段：AC-0.4/AC-0.9 要求 collect_routes() 条目不变。
 acceptance_criteria:
-- description: AC-0.1 运行 python -c "import server" 退出码为 0；然后把 ouroboros/usage_accounting.py
-    临时移走（mv 到 /tmp），同一命令仍退出码 0；随后移回。
-  semantic_ac_key: ac_ca412ada5bffc1a3
-- description: AC-0.2 运行 python -c "import supervisor.events" 退出码为 0；把 ouroboros/cost_projection.py
-    临时移走后仍退出码 0（该模块当前在 supervisor/events.py:33 被顶层 import）。
-  semantic_ac_key: ac_a663fce8308bab7a
-- description: AC-0.3 运行 python -c "import ouroboros.gateway.extensions" 退出码为 0；把
-    ouroboros/_usage_rows.py 临时移走后仍退出码 0（当前经 gateway/extensions.py:45-48 → skill_review_usage.py:10-12
-    被硬绑）。
-  semantic_ac_key: ac_8585173d80d79741
-- description: AC-0.4 pytest tests/test_gateway_parity.py 全绿——endpoint_index.HTTP_ENDPOINTS
-    与 collect_routes() 逐条相等。
-  semantic_ac_key: ac_1d3c08aef671d77d
-- description: AC-0.5 对每个将被删除的模块名，全仓不存在「用 except Exception（或 except Exception 后仅 log）吞掉其
-    import」的写法；server_control.py:161-165 已改为显式处理，且 panic 仍能终止委托 run 的进程组（由 tests/test_server_control_panic_daemon.py
-    覆盖）。
-  semantic_ac_key: ac_e76265f095228f23
-- description: AC-0.6 web 模块图不断：web/modules/claudexor_status_store.js 被 7 个模块 import（含
-    settings.js:21 挂在 app.js 模块图上）。改造后 web/tests/ 的现有冒烟测试全绿，且不存在「删掉该文件导致整站白屏」的路径。
-  semantic_ac_key: ac_fd1740531123ba7c
-- description: AC-0.7 本阶段 git diff --stat 不含任何文件删除——只有 import 点与适配代码的改动。
-  semantic_ac_key: ac_1f3a126ecaeff466
-- description: 'AC-0.8 每个被切断的能力，其触发路径返回显式不可用，禁止静默降级。三项逐字定死，实现不得再选：(1) HTTP 层复用本仓既有信封
-    json_error（ouroboros/gateway/_helpers.py:179-183），状态码 503，body 恰为 {"error":"<capability>
-    unavailable"}，capability ∈ {usage, cost_projection}；(2) 异常类型为 ouroboros/errors.py
-    中新建的 class OuroborosUnavailableError(RuntimeError)——必须是新模块，禁止定义在被删模块内；(3) memory
-    工具缺席时不抛异常，返回工具结果字符串 {"status":"unavailable","reason":"<capability>"}。验收抽查：POST
-    /api/cost-breakdown 返回 503 且 body 形状如上；一个 money 工具调用返回上述信封字符串；两者都不得是「HTTP 200
-    + 空 body」。'
-  semantic_ac_key: ac_446431d9d6611887
-- description: AC-0.9 切断后 collect_routes() 的条目数不变——摘除端点属后续 seed 的活（那时连同 endpoint_index.py
-    契约表一起改）。
-  semantic_ac_key: ac_4c4c9d56659d5302
+- description: 'AC-0.1 命令 `python -c "import server"` 期望：退出码 0、stderr 为空。变体命令 `mv ouroboros/usage_accounting.py
+    /tmp/ && python -c "import server"; echo EXIT=$?; mv /tmp/usage_accounting.py
+    ouroboros/` 期望：打印 `EXIT=0`。'
+  semantic_ac_key: ac_b555c6fb20bd502a
+- description: 'AC-0.2 命令 `python -c "import supervisor.events"` 期望：退出码 0。变体命令 `mv
+    ouroboros/cost_projection.py /tmp/ && python -c "import supervisor.events"; echo
+    EXIT=$?; mv /tmp/cost_projection.py ouroboros/` 期望：打印 `EXIT=0`。'
+  semantic_ac_key: ac_04a40bbbe41db00a
+- description: 'AC-0.3 命令 `python -c "import ouroboros.gateway.extensions"` 期望：退出码
+    0。变体命令 `mv ouroboros/_usage_rows.py /tmp/ && python -c "import ouroboros.gateway.extensions";
+    echo EXIT=$?; mv /tmp/_usage_rows.py ouroboros/` 期望：打印 `EXIT=0`。'
+  semantic_ac_key: ac_4ff20dc1765e79c0
+- description: 'AC-0.4 命令 `pytest tests/test_gateway_parity.py -q` 期望：退出码 0，stdout
+    含 `passed`，无 `failed`。该测试断言 endpoint_index.HTTP_ENDPOINTS 与 collect_routes() 逐条相等。'
+  semantic_ac_key: ac_47bc98fb9e91225d
+- description: 'AC-0.5 命令 `pytest tests/test_server_control_panic_daemon.py -q` 期望：退出码
+    0。附加静态检查：`grep -n -A2 ''claudexor_daemon'' ouroboros/server_control.py` 期望输出中不存在「该
+    import 位于一个其 except 分支为 `except Exception: pass` 或 `except Exception` 后仅 log 的
+    try 块内」的情形——即 import 失败必须显式处理（抛错或显式的不可用分支），不得被吞。'
+  semantic_ac_key: ac_bd0de5384870a30f
+- description: 'AC-0.6 命令 `pytest web/tests -q` 期望：退出码 0。前置条件：web/modules/claudexor_status_store.js
+    被 7 个模块 import（含 settings.js:21 挂在 app.js 模块图上），改造后这 7 处仍可解析——不存在「删掉该文件导致整站白屏」的路径。'
+  semantic_ac_key: ac_869e18c35b44fa0c
+- description: 'AC-0.7 命令 `git diff --stat --diff-filter=D` 期望：输出为空（零个被删除文件）。正例反证：`git
+    diff --stat` 允许有改动行，但不得有 `delete mode` 行。'
+  semantic_ac_key: ac_a0344f0085d28f2b
+- description: 'AC-0.8 三条逐字契约，实现不得再选。(1) HTTP：复用本仓既有信封函数 ouroboros/gateway/_helpers.py:179
+    的 json_error(message, status)，断言 `json_error("usage unavailable", 503).status_code
+    == 503` 且其 body 解码后恰等于 `{"error":"usage unavailable"}`（capability ∈ {usage, cost_projection}）。(2)
+    异常：在新建文件 ouroboros/errors.py 中定义 `class OuroborosUnavailableError(RuntimeError)`；断言
+    `python -c "from ouroboros.errors import OuroborosUnavailableError as E; assert
+    issubclass(E, RuntimeError); print(''OK'')"` 输出 `OK` 且退出码 0；该类不得定义在任何将被删除的模块内。(3)
+    工具：memory 工具缺席时不抛异常，返回工具结果字符串，断言该字符串恰等于 `{"status":"unavailable","reason":"usage"}`。综合抽查：对
+    `POST /api/cost-breakdown` 断言状态码 503 且 body 恰为 `{"error":"usage unavailable"}`；断言其不是「状态码
+    200 且 body 为空」。'
+  semantic_ac_key: ac_c154bc1ce6b3edab
+- description: 'AC-0.9 命令 `python -c "from ouroboros.gateway.router import collect_routes;
+    print(len(collect_routes()))"` 在改动前后输出**同一个整数**。摘除端点属后续 seed 的活（那时连同 endpoint_index.py
+    契约表一起改），本阶段条目数不变。'
+  semantic_ac_key: ac_e718208926f76fdb
 ontology_schema:
   name: SessionSettledContract
   description: Requirements the session already settled, crystallized without an interview.
@@ -73,9 +80,9 @@ exit_conditions:
   description: All session-settled requirements are satisfied.
   criteria: Every listed acceptance criterion passes.
 metadata:
-  seed_id: seed_7dfa54923630
+  seed_id: seed_a8af8b9801e5
   version: 1.0.0
-  created_at: '2026-09-10T16:17:52.136120Z'
+  created_at: '2026-09-10T16:20:21.877553Z'
   ambiguity_score: 0.2
   interview_id: session-context
   parent_seed_id: null
