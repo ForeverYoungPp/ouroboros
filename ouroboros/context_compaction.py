@@ -498,7 +498,18 @@ def _call_summarizer(
             message, observed_usage, executable = call_with_custom_validation_continuation(
                 lambda request_messages: chat_observed(
                     client, messages=request_messages,
-                    tools=[_CONTEXT_SUMMARIES_TOOL], tool_choice="required", **common,
+                    # "auto", never "required": DeepSeek's thinking mode (ON by
+                    # default, and this lane sends no reasoning control at all)
+                    # rejects a forced tool_choice outright with 400
+                    # "Thinking mode does not support this tool_choice". Every
+                    # recorded compaction attempt that forced the choice took that
+                    # 400 and fell through to the JSON path, so the structured
+                    # branch had a 0-for-N success record (probed 2026-09-10).
+                    # The prompt already names the tool and demands one entry per
+                    # source_id, and the field is measured to be called under
+                    # "auto"; if a model answers in prose instead, the JSON path
+                    # below is exactly where a forced call would have landed.
+                    tools=[_CONTEXT_SUMMARIES_TOOL], tool_choice="auto", **common,
                 ),
                 [{"role": "user", "content": prompt}],
             )
