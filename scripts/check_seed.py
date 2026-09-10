@@ -106,7 +106,8 @@ def main() -> int:
         passed = sum(1 for r in results if r["status"] == "pass")
         failed = sum(1 for r in results if r["status"] in ("fail", "timeout"))
         skipped = sum(1 for r in results if r["status"] == "skip")
-        print(f"\n  {passed} passed, {failed} failed, {skipped} skipped")
+        tail = f", {skipped} manual/skipped (no verify_command — not counted as passed)" if skipped else ""
+        print(f"\n  {passed} passed, {failed} failed{tail}")
 
     return 1 if any(r["status"] in ("fail", "timeout") for r in results) else 0
 
