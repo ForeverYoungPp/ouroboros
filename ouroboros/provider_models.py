@@ -517,22 +517,34 @@ def supports_vision(model_id: str) -> bool:
 
 # --- Thinking-mode ``reasoning_content`` replay contract -----------------------
 # DeepSeek's OpenAI-compatible API (thinking mode is ON by default) is the route
-# family that REQUIRES the chain-of-thought it emitted to be replayed: as soon as
-# the request carries ``tools``, every previous assistant turn's top-level
-# ``reasoning_content`` must be passed back, or the API answers 400 with "The
-# `reasoning_content` in the thinking mode must be passed back to the API."
-# (api-docs.deepseek.com/guides/thinking_mode -> Tool Calls).
+# family whose chain-of-thought this harness replays.  What the replay buys is
+# CONTINUITY, not request acceptance: passing a prior turn's reasoning back lets
+# the model resume its own line of thought inside a tool round, and it is the only
+# channel by which a gateway that re-encodes the conversation for another vendor
+# can recover that turn's thinking signature (it hashes the replayed text).
+#
+# The 2026-09-10 probe settled the acceptance question, and it is NOT what this
+# comment used to claim.  14 minimal requests against api.deepseek.com
+# (``deepseek-flash`` and ``deepseek-v4-pro``; tools present and absent; the field
+# absent, empty, null, and a single space; explicit ``thinking``; explicit
+# ``reasoning_effort``; a mixed history where an earlier turn carries CoT and a
+# later one does not; a two-tool-call round) were ALL accepted with HTTP 200.  The
+# only 400s observed were structural — an assistant ``tool_calls`` turn with no
+# matching ``tool`` message.  So a turn that never had a chain of thought keeps NO
+# ``reasoning_content`` field; the harness does not invent a placeholder for it.
 #
 # This is the EXACT OPPOSITE of the strict vLLM/SGLang + GLM/Z.AI OpenAI-compatible
 # servers the outbound scrubber protects, which reject their OWN echoed
-# ``reasoning_content`` with a 400 "Extra inputs are not permitted". The echo is
+# ``reasoning_content`` with a 400 "Extra inputs are not permitted". The keep is
 # therefore an explicit PER-ROUTE fact (a decaying provider fact, not a blanket
-# behavior): without it DeepSeek thinking-mode tool rounds die on the second
-# request; with it applied everywhere the strict servers die instead.
+# behavior): replay on the DeepSeek family, scrub everywhere else.
 #
-# Match the official host (authoritative) OR a DeepSeek-named model on the
-# openai-compatible lane (proxies/aggregators re-expose the same contract under
-# their own host). Extend ONLY with a fresh live probe of the exact route.
+# Match the official host OR a DeepSeek-named model on the openai-compatible lane
+# (proxies/aggregators re-expose the same behaviour under their own host).  This is
+# an inference from the route's NAME, not a declared route fact — a gateway that
+# both forwards to DeepSeek and rejects the field, or a non-DeepSeek host that
+# requires it, would be mis-classified in either direction.  Extend ONLY with a
+# fresh live probe of the exact route.
 _REASONING_CONTENT_ECHO_HOSTS = ("deepseek.com",)
 _REASONING_CONTENT_ECHO_MODEL_PREFIXES = ("deepseek",)
 
@@ -546,11 +558,13 @@ def _base_url_host(base_url: str) -> str:
 
 
 def requires_reasoning_content_echo(provider: str, model: str, base_url: str = "") -> bool:
-    """Whether this OpenAI-compatible route requires replayed ``reasoning_content``.
+    """Whether this OpenAI-compatible route REPLAYS ``reasoning_content``.
 
-    Only the openai-compatible lane can carry a DeepSeek-style thinking-mode route:
-    the direct cloudru/openai/minimax lanes have their own transcripts, and the
-    OpenRouter lane owns reasoning continuity through ``reasoning_details``."""
+    The field is kept on the DeepSeek family for reasoning continuity, not because
+    the endpoint demands it (see the contract note above).  Only the
+    openai-compatible lane can carry such a route: the direct
+    cloudru/openai/minimax lanes have their own transcripts, and the OpenRouter
+    lane owns reasoning continuity through ``reasoning_details``."""
     if str(provider or "").strip().lower() != "openai-compatible":
         return False
     host = _base_url_host(base_url)
