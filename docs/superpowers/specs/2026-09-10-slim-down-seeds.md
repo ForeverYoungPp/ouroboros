@@ -184,5 +184,31 @@
 ### 6.4 范围建议
 
 - **Seed 0 现在就能跑**：阻塞项为零，且是 Seed 1/2/3 的前置。
-- **Seed 1/2/3/4 建议走 `generate_seed` 的无访谈路径**（`session_context`），而非 `ooo auto` 的访谈路径——因为 goal / constraints / decisions 已在这两份规格里定稿，访谈只会在已定事项上打转。等 §5 的阻塞项定稿后再补 AC。
+- **Seed 1/2/3/4 建议走 `generate_seed` 的无访谈路径**（`session_context`），而非 `ooo auto` 的访谈路径——见 §6.5 的实测依据。
 - **不要**把 Seed 0+1+2+3 合成一个 goal：AC 无法穷举，A-grade 门过不去，执行会无界。
+
+### 6.5 实测对比：访谈路径 vs 无访谈路径
+
+同一个 Seed 0，两条路径都跑过：
+
+| | `ooo auto`（访谈路径） | `generate_seed`（无访谈） |
+|---|---|---|
+| Seed | `seed_a9a10a35dff0` | **`seed_7dfa54923630`**（已存 `docs/superpowers/specs/seed-0-import-graph.yaml`） |
+| 等级 | **B** | 歧义 0.20（结构性上限，非评分）；`degraded: false` |
+| `unresolved_slots` | **`[acceptance_criteria]`** | **`[]`（零）** |
+| 中断原因 | `Partial product: yes (reason: interview_phase_deadline)` | —— |
+| AC 是否结构化 | ❌（只把 AC-0.4 收进 `verification_plan`） | ✅ 9 条全带 `semantic_ac_key` |
+
+**结论：对这个 251k 行的 brownfield 仓，访谈路径收敛不了。** 它停在 **round 1**（`max_interview_rounds` 是 50，不是轮数用尽），因为**每个访谈问题的 omp 自答要 4 分钟以上**，phase deadline 在 round 2 之前就到了。而根因之一是 AC 写在 goal 正文里、没被结构化吸收，导致访谈要从零推导本可直给的字段。
+
+**因此 Seed 1/2/3/4 一律走 `session_context` 路径**，且提交时必须**一次给全**五件：`goal` + `acceptance_criteria`（列表）+ `constraints` + `decisions` + `project_type`。缺 `acceptance_criteria` 会得到 gap questions 而不是 block（工具契约明说），但那就退化成访谈了。
+
+### 6.6 `ooo auto` 与 `generate_seed` 的会话/产物位置
+
+| 对象 | 路径 |
+|---|---|
+| auto 会话状态 | `~/.ouroboros/data/auto_<id>.json` |
+| 访谈会话状态 | `~/.ouroboros/data/interview_<id>.json` |
+| 访谈状态机库 | `~/.ouroboros/data/ouroboros.db` |
+| **访谈路径产出的 Seed** | `~/.ouroboros/seeds/seed_<id>.yaml`（自动落盘） |
+| **无访谈路径产出的 Seed** | ⚠️ **只在工具有返回体里，不自动落盘**——必须自己存（本仓存在 `docs/superpowers/specs/seed-0-import-graph.yaml`） |

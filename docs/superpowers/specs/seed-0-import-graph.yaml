@@ -1,0 +1,85 @@
+goal: 在 /home/fy/Projects/code/ouroboros 切断「保留下来的模块」对「将被删除的模块」的全部 import 依赖，使 server
+  与 supervisor 在被删模块缺席时仍能正常启动。本阶段不删除任何文件，只改接线。
+task_type: code
+brownfield_context:
+  project_type: greenfield
+  context_references: []
+  existing_patterns: []
+  existing_dependencies: []
+constraints:
+- 本阶段不删除任何文件。
+- 不重构 run_llm_loop 的形态：轮顶顺序、tool 回填、终止判定保持原样。
+- 不动 background consciousness 的角色边界与工具上限——它是 BIBLE.md:42-45 的 P0 具名实现。
+- 不动 identity.md / patterns.md / improvement-backlog.md——它们是 BIBLE P0/P2/P3 保护的本地文件，保持原位且仍是写入
+  SSOT。
+- 每个被删模块的 import 点必须显式处理；禁止新增或保留「吞异常的 import」写法。
+- endpoint_index.py 是契约表，任何路由改动必须与 collect_routes() 同 commit，否则 tests/test_gateway_parity.py
+  会红。
+- 本仓有精确路径的单向字节棘轮：ouroboros/size_ratchet_manifest.py 的 GIANT_PATHS 列出 48 个既有超大文件，字节数只能减不能增；改动这些文件必须同
+  commit 更新 manifest。
+- semantic_dedup.py 与 tools/knowledge.py 是部分保留、不是整删；切依赖时不得把它们当整删模块处理。
+- 降级契约取「显式不可用」而非静默降级：依据是主规格 §9.2 纪律 1（所有被删模块的 import 点必须显式处理）。
+- HTTP 503 是本仓既有的 unavailable 码（gateway/_helpers.py:208 的 json_exception(exc, 503)、gateway/claudexor_accounts.py:535）。
+- 工具层一律返回标记字符串而非抛异常，与 ⚠️ ESCALATE_UNAVAILABLE、IDENTITY_UPDATE_ABSTAINED、custom_tool_argument_error
+  的既有模式一致。
+- 异常类型必须定义在一个删除后仍然存在的模块里；被删模块内定义会使类型随模块消失。
+- 摘除端点不在本阶段：AC-0.4/AC-0.9 要求 collect_routes() 条目不变。
+acceptance_criteria:
+- description: AC-0.1 运行 python -c "import server" 退出码为 0；然后把 ouroboros/usage_accounting.py
+    临时移走（mv 到 /tmp），同一命令仍退出码 0；随后移回。
+  semantic_ac_key: ac_ca412ada5bffc1a3
+- description: AC-0.2 运行 python -c "import supervisor.events" 退出码为 0；把 ouroboros/cost_projection.py
+    临时移走后仍退出码 0（该模块当前在 supervisor/events.py:33 被顶层 import）。
+  semantic_ac_key: ac_a663fce8308bab7a
+- description: AC-0.3 运行 python -c "import ouroboros.gateway.extensions" 退出码为 0；把
+    ouroboros/_usage_rows.py 临时移走后仍退出码 0（当前经 gateway/extensions.py:45-48 → skill_review_usage.py:10-12
+    被硬绑）。
+  semantic_ac_key: ac_8585173d80d79741
+- description: AC-0.4 pytest tests/test_gateway_parity.py 全绿——endpoint_index.HTTP_ENDPOINTS
+    与 collect_routes() 逐条相等。
+  semantic_ac_key: ac_1d3c08aef671d77d
+- description: AC-0.5 对每个将被删除的模块名，全仓不存在「用 except Exception（或 except Exception 后仅 log）吞掉其
+    import」的写法；server_control.py:161-165 已改为显式处理，且 panic 仍能终止委托 run 的进程组（由 tests/test_server_control_panic_daemon.py
+    覆盖）。
+  semantic_ac_key: ac_e76265f095228f23
+- description: AC-0.6 web 模块图不断：web/modules/claudexor_status_store.js 被 7 个模块 import（含
+    settings.js:21 挂在 app.js 模块图上）。改造后 web/tests/ 的现有冒烟测试全绿，且不存在「删掉该文件导致整站白屏」的路径。
+  semantic_ac_key: ac_fd1740531123ba7c
+- description: AC-0.7 本阶段 git diff --stat 不含任何文件删除——只有 import 点与适配代码的改动。
+  semantic_ac_key: ac_1f3a126ecaeff466
+- description: 'AC-0.8 每个被切断的能力，其触发路径返回显式不可用，禁止静默降级。三项逐字定死，实现不得再选：(1) HTTP 层复用本仓既有信封
+    json_error（ouroboros/gateway/_helpers.py:179-183），状态码 503，body 恰为 {"error":"<capability>
+    unavailable"}，capability ∈ {usage, cost_projection}；(2) 异常类型为 ouroboros/errors.py
+    中新建的 class OuroborosUnavailableError(RuntimeError)——必须是新模块，禁止定义在被删模块内；(3) memory
+    工具缺席时不抛异常，返回工具结果字符串 {"status":"unavailable","reason":"<capability>"}。验收抽查：POST
+    /api/cost-breakdown 返回 503 且 body 形状如上；一个 money 工具调用返回上述信封字符串；两者都不得是「HTTP 200
+    + 空 body」。'
+  semantic_ac_key: ac_446431d9d6611887
+- description: AC-0.9 切断后 collect_routes() 的条目数不变——摘除端点属后续 seed 的活（那时连同 endpoint_index.py
+    契约表一起改）。
+  semantic_ac_key: ac_4c4c9d56659d5302
+ontology_schema:
+  name: SessionSettledContract
+  description: Requirements the session already settled, crystallized without an interview.
+    Every entry is verbatim host-supplied material — no LLM composed any part of this
+    Seed.
+  fields: []
+evaluation_principles:
+- name: settled_requirements
+  description: Evaluate only the session-settled requirements.
+  weight: 1.0
+exit_conditions:
+- name: settled_requirements_met
+  description: All session-settled requirements are satisfied.
+  criteria: Every listed acceptance criterion passes.
+metadata:
+  seed_id: seed_7dfa54923630
+  version: 1.0.0
+  created_at: '2026-09-10T16:17:52.136120Z'
+  ambiguity_score: 0.2
+  interview_id: session-context
+  parent_seed_id: null
+  generation_mode: normal
+  degraded: false
+  unresolved_slots: []
+  recovery_reason: null
