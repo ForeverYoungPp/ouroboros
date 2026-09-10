@@ -44,7 +44,7 @@
 | **探针集**（将被【整体】删除，12 个；本阶段只切依赖不删文件） | `memory.py`、`consolidator.py`、`tools/memory_tools.py`、`cost_projection.py`、`_usage_response.py`、`_usage_rows.py`、`_usage_rows_memo.py`、`claudexor_daemon.py`、`claudexor_runtime.py`、`gateways/claudexor.py`、`gateway/claudexor_accounts.py`、`gateway/claudexor_quota.py` | AC-0.1/0.2/0.3 的**逐个**探测对象 |
 | **保护集**（部分保留或全部保留，**不得当整删**，也不是探针目标） | `semantic_dedup.py`（全保留，P2/P3 免疫队列去重器）、`usage_accounting.py` 与 `usage_ledger.py`（保留托管与尝试状态机）、`pricing.py`（保留 `infer_*`）、`reflection.py`（保留 `should_generate_reflection`/结构化候选/`_update_patterns`）、`tools/knowledge.py`（保留 patterns/backlog 路径与三个跨模块符号） | AC-0.10 的**仍可 import** 断言对象 |
 
-**AC（10 条）**：
+**AC（11 条）**：
 
 - **AC-0.1** 探针集 **12 个逐个**跑 server 导入探针——用一条 bash 循环把它们依次 `mv` 走、跑 `import server`、`mv` 回。期望：输出 **12 行**，每行以 `EXIT=0` 结尾。**行数少于 12 即失败，任一行非 0 即失败。**
 - **AC-0.2** 同上 12 个，探针换成 `import supervisor.events`。期望 12 行全 `EXIT=0`。
