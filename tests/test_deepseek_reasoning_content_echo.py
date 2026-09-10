@@ -5,13 +5,25 @@ The forensic failure (OpenAI Compatible provider, thinking-mode model, tool roun
     BadRequestError("Error code: 400 - ... 'The `reasoning_content` in the
     thinking mode must be passed back to the API.'")
 
-DeepSeek's OpenAI-compatible API (thinking mode ON by default) requires the CoT it
-emitted to be replayed on EVERY assistant turn once the request carries ``tools``
+DeepSeek's OpenAI-compatible API (thinking mode ON by default) accepts the CoT it
+emitted when replayed on a request that carries ``tools``
 (api-docs.deepseek.com/guides/thinking_mode -> Tool Calls). ouroboros treated
 ``reasoning_content`` as provider-private noise on every direct lane — dropped it
 before the transcript AND scrubbed it on the way out — so the second request of any
-tool round died. These guards lock in the per-route exception while keeping the
-strict vLLM/SGLang + GLM/Z.AI scrub for every other OpenAI-compatible route."""
+tool round lost the model's own chain of thought. These guards lock in the
+per-route exception while keeping the strict vLLM/SGLang + GLM/Z.AI scrub for
+every other OpenAI-compatible route.
+
+SCOPE OF THE CONTRACT (probed 2026-09-10, 14 minimal requests against
+api.deepseek.com, ``deepseek-flash`` and ``deepseek-v4-pro``, thinking confirmed
+ON by a control call that returned ``reasoning_content``): the endpoint ACCEPTS an
+assistant turn whose ``reasoning_content`` is absent, empty, null, or a single
+space, with or without ``tools``, on tool-call turns and plain turns alike, and
+with ``thinking``/``reasoning_effort`` set explicitly.  The only 400s observed
+were structural (a dangling ``tool_call``).  So a turn that never had a chain of
+thought keeps NO field: the harness must not invent a placeholder for it.  What
+the replay buys is reasoning CONTINUITY, not request acceptance.
+"""
 
 
 def _deepseek_target(**overrides):
@@ -153,9 +165,13 @@ def test_build_replays_reasoning_content_on_deepseek_route():
     assert _history()[1]["reasoning_content"] == "I should call get_weather."
 
 
-def test_build_backfills_missing_reasoning_content_when_tools_present():
-    """A turn with no preserved CoT (reasoning-disabled answer, prior model, or a
-    session persisted before the fix) must still satisfy the presence check."""
+def test_build_does_not_invent_reasoning_content_when_tools_present():
+    """A turn with no preserved CoT keeps NO field.
+
+    The endpoint accepts an absent ``reasoning_content`` (probe in the module
+    docstring), so injecting a single-space placeholder would only add a fake
+    chain of thought the model never produced.
+    """
     history = [
         {"role": "user", "content": "q"},
         {"role": "assistant", "content": "old answer"},
@@ -166,11 +182,11 @@ def test_build_backfills_missing_reasoning_content_when_tools_present():
         history, tools=[_TOOL],
     )
     asst = kwargs["messages"][1]
-    assert asst["reasoning_content"] == " "
+    assert "reasoning_content" not in asst
     assert "reasoning_content" not in history[1]
 
 
-def test_build_does_not_backfill_without_tools():
+def test_build_does_not_invent_reasoning_content_without_tools():
     history = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
     kwargs = _build(_deepseek_target(), history, tools=None)
     assert "reasoning_content" not in kwargs["messages"][1]
