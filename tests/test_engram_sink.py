@@ -220,6 +220,107 @@ def test_per_run_emit_cap_is_enforced(stub, tmp_path):
     assert len(_saved(state)) == MAX_EMITS_PER_RUN
 
 
+def test_the_cap_is_per_run_not_per_process(stub, tmp_path):
+    """F1: the sink is cached process-globally and a worker process is long-lived.
+
+    Without a run boundary the cap decayed into "per process lifetime": once a
+    worker had emitted its 20, every later knowledge / narrative / verdict /
+    dialogue write was refused for the rest of that process's life — and refused
+    before the spool, so not durable anywhere either.
+    """
+    state, url = stub
+    sink = _sink(tmp_path, url)
+    sink.max_emits = 1
+    assert sink.emit("memory_action", title="a", content="first").status == "sent"
+    assert sink.emit("memory_action", title="b", content="second").status == "capped"
+
+    sink.begin_run()
+
+    assert sink.emit("memory_action", title="c", content="third").status == "sent"
+
+
+def test_begin_engram_run_resets_every_sink_for_the_drive(stub, tmp_path, monkeypatch):
+    """The reset must not assume one sink per drive.
+
+    `sink_for` keys on ``(drive_root, repo_root)``, so a caller holding only a drive
+    root — the consolidator's knowledge context is built exactly that way — gets a
+    DIFFERENT instance for the same drive. Resetting one of them left the other's
+    counter running for the life of the process, which is the bug itself.
+    """
+    from types import SimpleNamespace
+
+    from ouroboros.engram_sink import begin_engram_run, reset_sinks, sink_for
+
+    state, url = stub
+    # `sink_for` resolves its endpoint from the environment, so the stub's URL has
+    # to be the one it sees; `_sink()` above passes it explicitly instead.
+    monkeypatch.setenv("ENGRAM_BASE_URL", url)
+    reset_sinks()
+    drive = tmp_path / "drive"
+    for name in ("drive", "repo_a", "repo_b"):
+        (tmp_path / name).mkdir(parents=True, exist_ok=True)
+    env_a = SimpleNamespace(drive_root=drive, repo_dir=tmp_path / "repo_a")
+    env_b = SimpleNamespace(drive_root=drive, repo_dir=tmp_path / "repo_b")
+
+    sink_a, sink_b = sink_for(env_a), sink_for(env_b)
+    assert sink_a is not sink_b, "these two callers must not share one sink"
+    try:
+        for index, sink in enumerate((sink_a, sink_b)):
+            sink.max_emits = 1
+            assert sink.emit("memory_action", title=f"a{index}", content=f"one {index}").status == "sent"
+            assert sink.emit("memory_action", title=f"b{index}", content=f"two {index}").status == "capped"
+
+        assert begin_engram_run(env_a) >= 2
+
+        for index, sink in enumerate((sink_a, sink_b)):
+            assert sink.emit("memory_action", title=f"c{index}", content=f"three {index}").status == "sent"
+    finally:
+        reset_sinks()
+
+
+def test_a_capped_emit_is_disclosed_under_its_own_event_type(stub, tmp_path):
+    """A cap is not an outage.
+
+    It has to be visible, and it must not be recorded as an unreachable store: the
+    channel it is written to has consumers that look for transport failures, and
+    naming a healthy store unreachable sends the operator down the wrong trail.
+    """
+    state, url = stub
+    sink = _sink(tmp_path, url)
+    sink.max_emits = 1
+    sink.emit("memory_action", title="a", content="first")
+    assert sink.emit("memory_action", title="b", content="second").status == "capped"
+
+    log = tmp_path / "logs" / "engram.jsonl"
+    rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert [row["type"] for row in rows] == ["engram_emit_capped"]
+
+    # Disclosed ONCE per run, not once per refused record.
+    sink.emit("memory_action", title="c", content="third")
+    assert len([line for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]) == 1
+
+
+def test_a_deferred_fragment_is_exempt_from_the_cap(stub, tmp_path):
+    """Its only destination IS the spool.
+
+    A deferred fragment exists because the write side could not read the record it
+    appends to; capping it would drop exactly what that mechanism exists to
+    preserve — while its caller is told the fragment "is spooled and will be
+    merged", i.e. that nothing was lost.
+    """
+    state, url = stub
+    sink = _sink(tmp_path, url)
+    sink.max_emits = 1
+    sink.emit("memory_action", title="a", content="first")
+
+    receipt = sink.emit_deferred_append(
+        title="Knowledge: t", content="the fragment", identity="knowledge:t"
+    )
+
+    assert receipt.status != "capped", receipt
+    assert receipt.accepted, receipt
+
+
 def test_empty_content_is_rejected(stub, tmp_path):
     state, url = stub
     sink = _sink(tmp_path, url)

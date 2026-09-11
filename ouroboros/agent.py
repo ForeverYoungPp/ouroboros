@@ -36,6 +36,7 @@ from ouroboros.config import EFFORT_SCALE, resolve_effort
 from ouroboros.agent_startup_checks import (
     inject_crash_report,
     persist_early_origin_stub as _persist_early_origin_stub_impl,
+    run_engram_boot_actions,
     validate_task_authority_sources,
     verify_restart,
     verify_system_state,
@@ -642,17 +643,22 @@ class OuroborosAgent:
                 if _worker_boot_logged:
                     return
                 _worker_boot_logged = True
+            # FIRST, and in its own guard. The durable-memory work (spool drain +
+            # dialogue carry-over) must not depend on any other boot check: they
+            # used to share one handler whose once-guard is set above, so a raise
+            # in a git or budget check muted the memory path for the whole life of
+            # the process rather than just this call.
+            try:
+                run_engram_boot_actions(self.env)
+            except Exception:
+                log.warning("Engram boot actions failed", exc_info=True)
             git_branch, git_sha = get_git_info(self.env.repo_dir)
             append_jsonl(self.env.drive_path('logs') / 'events.jsonl', {
                 'ts': utc_now_iso(), 'type': 'worker_boot',
                 'pid': os.getpid(), 'git_branch': git_branch, 'git_sha': git_sha,
             })
-            # Its OWN guard. This used to share the outer try with everything
-            # below, and the once-guard above is set BEFORE the work: a raise in
-            # verify_restart therefore skipped verify_system_state — and with it
-            # the Engram spool drain and dialogue carry-over — for the WHOLE life
-            # of the process, not just this call, because the guard was already
-            # set and nothing re-runs it.
+            # Its OWN guard, for the same reason: a failing restart check must not
+            # skip the system-state verification below.
             try:
                 verify_restart(self.env, git_sha)
             except Exception:
@@ -1061,6 +1067,18 @@ class OuroborosAgent:
 
     def handle_task(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Run one task under the root/subtree monetary attribution scope."""
+        # A new memory-emit run starts here. C3 caps how many memory records ONE
+        # RUN may emit, but the sink is cached process-globally and this worker is
+        # long-lived, so without this boundary the cap decayed into "per process
+        # lifetime" — after 20 emits, every later memory write was refused for the
+        # rest of the process's life, before the spool, hence not even durable.
+        # Best-effort (C6): a run boundary must never fail a task.
+        try:
+            from ouroboros.engram_sink import begin_engram_run
+
+            begin_engram_run(self.env)
+        except Exception:
+            log.debug("Engram run boundary failed", exc_info=True)
         # A reused worker agent still carries the PREVIOUS task's chat binding;
         # events emitted before _handle_task_scoped rebinds it would be
         # addressed to the old thread. No binding lets the supervisor stamp

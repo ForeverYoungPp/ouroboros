@@ -281,6 +281,10 @@ class EngramSink:
     max_emits: int = MAX_EMITS_PER_RUN
     _emits: int = field(default=0, init=False, repr=False)
     _disclosed: bool = field(default=False, init=False, repr=False)
+    #: Its own flag, and its own event type on the wire. The cap is not an outage,
+    #: so it must not consume — or be masked by — the unreachable-Engram
+    #: disclosure, which records a transport failure.
+    _capped_disclosed: bool = field(default=False, init=False, repr=False)
     _ready: bool = field(default=False, init=False, repr=False)
     _ready_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     #: identity -> content fingerprint already emitted this run. Same identity
@@ -292,6 +296,19 @@ class EngramSink:
     @property
     def spool_path(self) -> pathlib.Path:
         return pathlib.Path(self.drive_root) / SPOOL_REL
+
+    def begin_run(self) -> None:
+        """Reset the per-run counters (C3). See ``begin_engram_run`` for the caller.
+
+        Clearing the cap is safe: it only LOOSENS a bound, so it cannot drop a
+        record. Clearing ``_seen`` weakens the in-run identity+content dedupe, whose
+        worst case is one redundant emit across a run boundary — the server upserts
+        it, so that is an extra update, never a duplicate record.
+        """
+        self._emits = 0
+        self._disclosed = False
+        self._capped_disclosed = False
+        self._seen.clear()
 
     # -- bootstrap (Engram's own recommended flow) ------------------------- #
 
@@ -620,8 +637,14 @@ class EngramSink:
         }
         if not safe_fields and fields:
             return SinkReceipt(kind, "", "rejected", reason="todo_only_payload")
-        # C3: per-run cap.
-        if self._emits >= int(self.max_emits):
+        # C3: per-run cap. A DEFERRED fragment is exempt: its only destination is
+        # the spool (it is merged onto the live record at forward time, because the
+        # write side could not read that record), so a capped fragment would be
+        # dropped outright — while its caller is told the fragment "is spooled and
+        # will be merged … nothing was lost". The cap bounds how much memory one run
+        # may SEND; it must not be the thing that deletes an append.
+        if not deferred_merge and self._emits >= int(self.max_emits):
+            self._disclose_capped_once()
             return SinkReceipt(kind, "", "capped", reason="per_run_emit_cap")
 
         clean_title = _sanitize(title)
@@ -817,6 +840,36 @@ class EngramSink:
                     # A socket-only deployment is a client limitation, not an
                     # outage; naming it here keeps the operator off the wrong trail.
                     "socket_configured": bool(_env_socket()),
+                    "spooled": self.pending_count(),
+                },
+            )
+        except Exception:
+            pass
+
+    def _disclose_capped_once(self) -> None:
+        """Disclose at most ONE capped emit per run, under its own event type.
+
+        A cap is not an outage, so it gets its own flag and its own ``type``: folding
+        it into ``engram_unavailable`` would both report a healthy store as
+        unreachable and let a cap swallow the transport notice the two consumers of
+        that channel actually need.
+        """
+        if self._capped_disclosed:
+            return
+        self._capped_disclosed = True
+        try:
+            from ouroboros.utils import append_jsonl
+
+            append_jsonl(
+                pathlib.Path(self.drive_root) / "logs" / "engram.jsonl",
+                {
+                    "ts": _now(),
+                    "type": "engram_emit_capped",
+                    "cap": int(self.max_emits),
+                    "detail": (
+                        f"this run emitted its cap of {int(self.max_emits)} memory "
+                        "records; further records were refused, not spooled"
+                    ),
                     "spooled": self.pending_count(),
                 },
             )
@@ -1074,6 +1127,43 @@ def reset_sinks() -> None:
         _SINKS.clear()
 
 
+def begin_engram_run(env: Any = None) -> int:
+    """Start a new emit run: reset the per-run counters on every sink for the drive.
+
+    C3 caps how many memory records one RUN may emit. The sink is cached
+    process-globally while a worker process is long-lived, so without this the cap
+    was really "per process lifetime": once a worker had emitted its 20, every
+    later knowledge / narrative / verdict / dialogue write was refused for the rest
+    of that process's life — and refused before the spool, so not even durable.
+    Resetting at the task boundary is what makes "per run" true.
+
+    EVERY sink for the drive is reset, not the one this env resolves.
+    ``sink_for`` keys on ``(drive_root, repo_root)``, and a caller holding only a
+    drive root gets a different instance for the same drive — the consolidator's
+    knowledge context is built exactly that way — so resetting just one would leave
+    the other's counter running for the life of the process.
+
+    Returns how many sinks were reset. Never raises.
+    """
+    try:
+        explicit = getattr(env, "drive_root", None) or getattr(env, "DRIVE_ROOT", None)
+        drive = str(pathlib.Path(explicit).resolve(strict=False)) if explicit else ""
+    except Exception:
+        drive = ""
+    with _SINKS_LOCK:
+        cached = list(_SINKS.items())
+    reset = 0
+    for key, sink in cached:
+        try:
+            if drive and str(key[0]) != drive:
+                continue
+            sink.begin_run()
+            reset += 1
+        except Exception:
+            continue
+    return reset
+
+
 def flush_engram_spool(env: Any, *, limit: int = MAX_EMITS_PER_RUN) -> int:
     """Forward whatever a previous run had to spool. Returns how many landed.
 
@@ -1160,12 +1250,14 @@ def reconcile_local_dialogue_blocks(
     is the boot half of that; the consolidator's own mirror covers everything
     distilled from now on.
 
-    Only the MISSING intervals are pushed, so a boot against a settled mirror costs
-    ONE BOUNDED READ and no writes at all. Bounded, not cheap: Engram's recency
-    endpoint returns full observation bodies, so the limit below is what keeps this
-    from pulling the store's whole ceiling every start. The local file it is
-    compared against is itself bounded (~10-15 blocks plus eras), and a read that
-    is too small to see an existing record is harmless — see the third property.
+    Only the MISSING intervals are pushed, so a settled mirror normally costs one
+    bounded read and no writes. NOT a guarantee, and the distinction matters:
+    Engram's recency endpoint returns full observation bodies and the ``global``
+    scope is shared with other records (the scratchpad mirrors into it too), so a
+    busy drive can push a dialogue record out of the read's window. That block is
+    then pushed again — an UPDATE keyed on the same identity, never a duplicate and
+    never a loss, but a write, and one that bumps the record's ``updated_at``. The
+    local file being compared against is itself bounded (~10-15 blocks plus eras).
 
     Three properties make it safe to run on every boot:
 
@@ -1255,6 +1347,7 @@ __all__ = [
     "EngramSink",
     "SinkReceipt",
     "build_sink",
+    "begin_engram_run",
     "emit_evolution_outcome",
     "push_local_dialogue_blocks",
     "reconcile_local_dialogue_blocks",

@@ -414,34 +414,14 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
         # read-only archive of what was learned before the switch (C2 / P1).
         new_content = _merged_content(base_content, content, mode)
 
-    # The durable record. Identity is the topic, so an evolving topic upserts in
-    # place instead of piling up near-duplicates (and the append base above was
-    # read from exactly this identity).
+    # The LOCAL provenance row FIRST, and that order is load-bearing. Now that the
+    # canonical ``.md`` write is retired, this row IS the local copy of the memory,
+    # and the sink emit below can legitimately be REFUSED — C3's per-run cap, which
+    # returns before the spool, so a refused record is not durable anywhere. Writing
+    # the row first is what makes a refused write a DELAYED memory instead of a lost
+    # one (P1). It used to be written after the emit, which made that only a hope.
+    history_path = _knowledge_dir(ctx).parent / "knowledge_history.jsonl"
     try:
-        from ouroboros.engram_sink import sink_for
-
-        sink = sink_for(ctx)
-        payload = {
-            "title": f"Knowledge: {sanitized_topic}",
-            "content": new_content or content,
-            "identity": f"knowledge:{sanitized_topic}",
-            "type": "knowledge",
-            "scope": scope,
-            "fields": {
-                "task_id": str(getattr(ctx, "task_id", "") or ""),
-                "topic": sanitized_topic,
-                "mode": mode,
-            },
-        }
-        if deferred:
-            sink.emit_deferred_append(**payload)
-        else:
-            sink.emit("knowledge", document=True, **payload)
-    except Exception:
-        log.debug("Engram knowledge mirror failed", exc_info=True)
-
-    try:
-        history_path = _knowledge_dir(ctx).parent / "knowledge_history.jsonl"
         # The canonical write no longer runs ``_ensure_dir`` (nothing local is
         # written), so the audit trail's directory is created here. Losing the
         # old/new provenance of a memory write is exactly the silent erosion the
@@ -460,7 +440,34 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
                 "new_content": new_content,
             }, ensure_ascii=False) + "\n")
     except Exception:
-        pass
+        log.warning("Knowledge provenance row could not be written", exc_info=True)
+
+    # Then the durable remote record. Identity is the topic, so an evolving topic
+    # upserts in place instead of piling up near-duplicates (and the append base
+    # above was read from exactly this identity).
+    receipt = None
+    try:
+        from ouroboros.engram_sink import sink_for
+
+        sink = sink_for(ctx)
+        payload = {
+            "title": f"Knowledge: {sanitized_topic}",
+            "content": new_content or content,
+            "identity": f"knowledge:{sanitized_topic}",
+            "type": "knowledge",
+            "scope": scope,
+            "fields": {
+                "task_id": str(getattr(ctx, "task_id", "") or ""),
+                "topic": sanitized_topic,
+                "mode": mode,
+            },
+        }
+        if deferred:
+            receipt = sink.emit_deferred_append(**payload)
+        else:
+            receipt = sink.emit("knowledge", document=True, **payload)
+    except Exception:
+        log.debug("Engram knowledge mirror failed", exc_info=True)
 
     try:
         journal_path = _knowledge_dir(ctx).parent / "knowledge_journal.jsonl"
@@ -485,18 +492,41 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
     except Exception:
         pass
 
-    if deferred:
+    # Report what ACTUALLY happened. Claiming "saved to Engram" for a spooled,
+    # capped, refused or failed write tells the model a memory is durable when it
+    # is not — the one lie this whole path exists to prevent. The local row above
+    # is what keeps the pessimistic branches honest rather than lossy.
+    status = str(getattr(receipt, "status", "") or "")
+    reason = str(getattr(receipt, "reason", "") or "")
+    if deferred and status in {"sent", "spooled"}:
         return (
             f"✅ Knowledge '{sanitized_topic}' append ({mode}) DEFERRED: Engram is unreachable, so "
             "the fragment is spooled and will be merged onto the existing record when it can be "
             "read. Nothing was overwritten and nothing was lost."
         )
-    if not live_local:
+    if status == "sent":
+        if not live_local:
+            return (
+                f"✅ Knowledge '{sanitized_topic}' saved ({mode}) to Engram — the canonical local "
+                "knowledge file is no longer written; the on-disk copy is the pre-switch archive."
+            )
+        return f"✅ Knowledge '{sanitized_topic}' saved ({mode})."
+    if status == "spooled":
         return (
-            f"✅ Knowledge '{sanitized_topic}' saved ({mode}) to Engram — the canonical local "
-            "knowledge file is no longer written; the on-disk copy is the pre-switch archive."
+            f"✅ Knowledge '{sanitized_topic}' ({mode}) is QUEUED, not yet in Engram "
+            f"({reason or 'send failed'}). It is spooled locally and forwarded on the next run."
         )
-    return f"✅ Knowledge '{sanitized_topic}' saved ({mode})."
+    if status == "duplicate":
+        return (
+            f"✅ Knowledge '{sanitized_topic}' ({mode}) was already in Engram unchanged; "
+            "the existing record still holds it."
+        )
+    return (
+        f"⚠️ Knowledge '{sanitized_topic}' ({mode}) reached the LOCAL provenance log "
+        f"({history_path.name}) but NOT Engram "
+        f"({status or 'no receipt'}: {reason or 'unknown'}). Nothing was lost — the local row is "
+        "the record — but the remote memory is missing."
+    )
 
 
 def _merged_content(base: str, content: str, mode: str) -> str:

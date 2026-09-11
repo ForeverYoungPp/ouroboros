@@ -323,10 +323,38 @@ def _never_touch_a_live_engram_service():
     os.environ["ENGRAM_PORT"] = str(dead_port)
     for name in ("ENGRAM_PROJECT", "ENGRAM_SOCKET"):
         os.environ.pop(name, None)
+    # ...AND refuse the operator's endpoint at the TRANSPORT, which is the only
+    # guarantee that does not depend on the environment staying the way we set it.
+    # A test may delete both knobs on purpose to prove the client's own default
+    # applies (`test_engram_port_is_honoured` does exactly that), and any test may
+    # `monkeypatch.undo()`, which reverts every patch on the shared fixture instance
+    # rather than just its own. In either window the resolution chain lands on
+    # `DEFAULT_BASE_URL` — the operator's LIVE endpoint — and anything that emits at
+    # that moment writes into the real store. That is not hypothetical: it is how a
+    # `review_verdict` reached the live `ouroboros` project during a full-suite run.
+    # Every request in this client goes through `_request`, so refusing there covers
+    # writes and reads alike, whatever a test has done to the environment.
+    from ouroboros.engram_client import DEFAULT_BASE_URL, EngramClient, EngramResult
+
+    live = str(DEFAULT_BASE_URL).rstrip("/")
+    original_request = EngramClient._request
+
+    def _request_without_the_live_endpoint(self, method, path, **kwargs):
+        base = str(getattr(getattr(self, "config", None), "base_url", "")).rstrip("/")
+        if base == live:
+            return EngramResult(
+                False,
+                error_kind="transport",
+                detail=f"the test suite refused a request to the live Engram endpoint {live}",
+            )
+        return original_request(self, method, path, **kwargs)
+
+    EngramClient._request = _request_without_the_live_endpoint
     reset_sinks()
     try:
         yield
     finally:
+        EngramClient._request = original_request
         for name, value in saved.items():
             if value is None:
                 os.environ.pop(name, None)

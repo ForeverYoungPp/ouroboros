@@ -319,6 +319,42 @@ def test_knowledge_write_keeps_the_provenance_audit_trail(stub):
     assert rows[-1]["new_content"] == "second take"
 
 
+def test_a_refused_knowledge_write_says_so_and_keeps_the_local_row(stub):
+    """F1: never claim Engram durability the sink did not deliver.
+
+    A capped emit returns BEFORE the spool, and the canonical local file is
+    retired, so the local provenance row is the record. The message has to say
+    what actually happened, and that row has to be on disk BEFORE the sink is
+    asked — otherwise the "nothing was lost" it claims is only a hope.
+    """
+    import json
+
+    from ouroboros.engram_sink import sink_for
+    from ouroboros.tools.knowledge import _knowledge_write
+
+    state, env = stub
+    ctx = _tool_ctx(env)
+    sink_for(ctx).max_emits = 0  # every emit is refused by the cap
+
+    out = _knowledge_write(ctx, "capped-topic", "a lesson that never reached Engram")
+
+    assert "NOT Engram" in out, out
+    assert "capped" in out, out
+    assert "saved" not in out, out
+    rows = [
+        json.loads(line)
+        for line in (env.drive_root / "memory" / "knowledge_history.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert rows[-1]["topic"] == "capped-topic"
+    assert rows[-1]["new_content"] == "a lesson that never reached Engram"
+    assert not [
+        r for r in _saved_observations(state)
+        if r["body"].get("topic_key") == "knowledge:capped-topic"
+    ]
+
+
 def test_evolving_topic_upserts_rather_than_piling_up(stub):
     from ouroboros.tools.knowledge import _knowledge_write
 
@@ -843,6 +879,32 @@ def test_engram_port_is_honoured(monkeypatch):
 
     monkeypatch.setenv("ENGRAM_BASE_URL", "http://127.0.0.1:9999")
     assert env_base_url() == "http://127.0.0.1:9999"  # explicit override wins
+
+
+def test_deleting_both_knobs_still_cannot_reach_the_live_endpoint(monkeypatch, tmp_path):
+    """The suite guard has to survive a test that removes both knobs on purpose.
+
+    `test_engram_port_is_honoured` above does exactly that, and any test may call
+    `monkeypatch.undo()` — which reverts every patch on the shared fixture instance,
+    not just its own. In either window the client's resolution chain lands on
+    `DEFAULT_BASE_URL`, the operator's LIVE endpoint. Setting the two knobs is
+    therefore not enough: the transport itself refuses that endpoint, and the
+    refusal is what this asserts (asserting "unreachable" would also pass on a
+    machine that simply has no daemon running, which proves nothing).
+    """
+    from ouroboros.engram_sink import reset_sinks, sink_for
+
+    monkeypatch.delenv("ENGRAM_BASE_URL", raising=False)
+    monkeypatch.delenv("ENGRAM_PORT", raising=False)
+    reset_sinks()
+    try:
+        sink = sink_for(tmp_path / "drive")
+        result = sink.client.health()
+        assert result.ok is False
+        assert "refused a request to the live Engram endpoint" in str(result.detail), result.detail
+        assert sink.emit("memory_action", title="t", content="must never land").status != "sent"
+    finally:
+        reset_sinks()
 
 
 def test_the_engram_knobs_are_projectable_from_settings():

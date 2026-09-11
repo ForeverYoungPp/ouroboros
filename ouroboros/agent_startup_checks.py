@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import subprocess
+import threading
 import time
 from typing import Any, Dict, Tuple
 
@@ -820,6 +821,59 @@ def check_extension_health(env: Any) -> Tuple[Dict[str, Any], int]:
     return {"status": "ok"}, 0
 
 
+#: The Engram boot actions run at most once per process, tracked separately from
+#: ``verify_system_state`` on purpose — see ``run_engram_boot_actions``.
+_engram_boot_actions_done = False
+_engram_boot_actions_lock = threading.Lock()
+
+
+def run_engram_boot_actions(env: Any) -> Dict[str, Any]:
+    """The durable-memory work that must happen on every start. Returns what it did.
+
+    Two jobs: drain the spool a previous run could not forward (write-then-forward,
+    C17), and carry over the dialogue blocks distilled before the prompt seam moved
+    to Engram, so the distilled biography does not simply begin at the changeover.
+
+    This is deliberately its OWN function, with its own once-flag, called BEFORE
+    ``verify_system_state`` and never from inside it. It used to sit inside that
+    function, after the git and budget checks, under the caller's single broad
+    handler: a raise in any of those checks returned out of the handler and the
+    durable-memory work never ran — and never would in that process, because the
+    caller's once-guard had already been set. Nothing about a git or budget check
+    should be able to mute the memory path, so the dependency was removed rather
+    than documented.
+
+    The flag is set only AFTER the work, so a call that did not get to run is
+    retried rather than recorded as done. Every step is best-effort (C6): an
+    unreachable Engram leaves its records for the next start instead of failing a
+    boot.
+    """
+    global _engram_boot_actions_done
+    with _engram_boot_actions_lock:
+        if _engram_boot_actions_done:
+            return {}
+    done: Dict[str, Any] = {}
+    try:
+        from ouroboros.engram_sink import flush_engram_spool
+
+        forwarded = flush_engram_spool(env)
+        if forwarded:
+            done["engram_spool_forwarded"] = forwarded
+    except Exception:
+        pass
+    try:
+        from ouroboros.engram_sink import reconcile_local_dialogue_blocks
+
+        reconciled = reconcile_local_dialogue_blocks(env)
+        if reconciled:
+            done["engram_dialogue_reconciled"] = reconciled
+    except Exception:
+        pass
+    with _engram_boot_actions_lock:
+        _engram_boot_actions_done = True
+    return done
+
+
 def verify_system_state(env: Any, git_sha: str) -> None:
     """Bible Principle 1: verify system state on every startup."""
     checks: Dict[str, Any] = {}
@@ -834,34 +888,6 @@ def verify_system_state(env: Any, git_sha: str) -> None:
 
     checks["budget"], issue_count = check_budget(env)
     issues += issue_count
-
-    # Second half of write-then-forward (C17): a run that could not reach Engram
-    # left records in the local spool. Drain them now that we are starting up
-    # again. Best-effort and silent — a still-unreachable Engram keeps them
-    # spooled for the next start rather than losing them.
-    try:
-        from ouroboros.engram_sink import flush_engram_spool
-
-        forwarded = flush_engram_spool(env)
-        if forwarded:
-            checks["engram_spool_forwarded"] = forwarded
-    except Exception:
-        pass
-
-    # The prompt seam reads dialogue history from Engram now, so the blocks the
-    # consolidator distilled BEFORE that changed have to be carried across or the
-    # distilled biography would simply start at the changeover. Only the missing
-    # intervals are pushed, so a start against a settled mirror reads once and
-    # writes nothing. Best-effort: an unreachable Engram leaves this for the next
-    # start rather than blocking startup (C6).
-    try:
-        from ouroboros.engram_sink import reconcile_local_dialogue_blocks
-
-        reconciled = reconcile_local_dialogue_blocks(env)
-        if reconciled:
-            checks["engram_dialogue_reconciled"] = reconciled
-    except Exception:
-        pass
 
     memory_dir = env.drive_path("memory")
     identity_path = memory_dir / "identity.md"
