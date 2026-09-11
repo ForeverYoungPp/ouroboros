@@ -1012,8 +1012,10 @@ def _append_cycle_outcome_tag(env: Any, *, campaign: Any, transaction: Any, sour
 
             tx = transaction if isinstance(transaction, dict) else {}
             camp = campaign if isinstance(campaign, dict) else {}
+            # ``env`` carries both roots; passing the bare drive path would
+            # resolve the project from ``.../data``.
             emit_evolution_outcome(
-                env.drive_root,
+                env,
                 {
                     "kind": "cycle_outcome",
                     "task_id": str(tx.get("task_id") or ""),

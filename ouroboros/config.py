@@ -60,6 +60,14 @@ def _guard_live_settings_write() -> None:
 
 # Settings defaults
 SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
+    # Engram durable-memory service. Empty defaults so an absent key never
+    # overwrites a legitimately forwarded environment value (see
+    # apply_settings_to_env's disk-authored rule): an empty ENGRAM_BASE_URL means
+    # "derive from ENGRAM_PORT, else the service default".
+    "ENGRAM_BASE_URL": "",
+    "ENGRAM_PROJECT": "",
+    "ENGRAM_HTTP_TOKEN": "",
+    "OUROBOROS_REPO_DIR": "",
     "OPENROUTER_API_KEY": "",
     "OPENAI_API_KEY": "",
     "OPENAI_BASE_URL": "",

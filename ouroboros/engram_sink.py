@@ -726,28 +726,35 @@ def build_sink(
 # a fresh sink per emit would defeat both.
 # --------------------------------------------------------------------------- #
 
-_SINKS: Dict[str, EngramSink] = {}
+_SINKS: Dict[Any, EngramSink] = {}
 _SINKS_LOCK = threading.Lock()
 
 
 def sink_for(target: Any) -> EngramSink:
     """Process-scoped sink for a drive root. Never raises.
 
-    ``target`` may be an ``env``-like object (``drive_root`` / ``repo_dir``) or a
-    bare path to the drive root — several call sites only have the root in hand.
-    A bare drive root still resolves its *project* against the repository, not
-    against ``.../data``: the project name is a memory-scope anchor, and letting
-    the drive's directory name win would split one system's memory across two
-    Engram projects.
+    ``target`` may be an ``env``-like object or a bare path to the drive root —
+    several call sites only have the root in hand. Both attribute spellings are
+    accepted (``drive_root``/``repo_dir`` as ``Env`` uses them, and
+    ``DRIVE_ROOT``/``REPO_DIR`` as the supervisor's ctx uses them): a shape
+    mismatch here silently resolves the WRONG PROJECT rather than failing, and a
+    wrong project is the one error this function exists to prevent.
+
+    The cache is keyed on the drive root **and** the resolved repo root. Keying on
+    the drive alone made the project the whole process uses depend on which caller
+    happened to touch the sink first — a bare-drive caller (an evolution
+    checkpoint at boot) would pin every later Env-shaped caller to the drive's own
+    directory name. Two callers that would resolve different projects must never
+    share a sink.
     """
     try:
-        explicit = getattr(target, "drive_root", None)
+        explicit = getattr(target, "drive_root", None) or getattr(target, "DRIVE_ROOT", None)
         drive_root = pathlib.Path(explicit) if explicit else pathlib.Path(target)
-        repo_attr = getattr(target, "repo_dir", None)
+        repo_attr = getattr(target, "repo_dir", None) or getattr(target, "REPO_DIR", None)
         repo_root = pathlib.Path(repo_attr) if repo_attr else _repo_root_hint(drive_root)
-        key = str(drive_root.resolve(strict=False))
+        key = (str(drive_root.resolve(strict=False)), str(repo_root.resolve(strict=False)))
     except Exception:
-        drive_root, repo_root, key = pathlib.Path("."), pathlib.Path("."), "."
+        drive_root, repo_root, key = pathlib.Path("."), pathlib.Path("."), (".", ".")
     with _SINKS_LOCK:
         sink = _SINKS.get(key)
         if sink is None:

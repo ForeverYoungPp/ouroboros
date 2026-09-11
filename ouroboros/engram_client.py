@@ -53,12 +53,29 @@ MAX_TIMELINE_RADIUS = 10
 DEFAULT_CONTEXT_MAX_BYTES = 16_384
 
 DEFAULT_BASE_URL = "http://127.0.0.1:7437"
+#: The port Engram's own ``engram serve`` binds when no port is given.
+DEFAULT_PORT = 7437
 DEFAULT_TIMEOUT_SECONDS = 5.0
 
 
 def env_base_url() -> str:
-    """Operator override for the Engram endpoint (read at call time, not import)."""
-    return str(os.environ.get("ENGRAM_BASE_URL", "") or "").strip()
+    """The Engram endpoint, honouring the SERVICE'S OWN knobs.
+
+    ``ENGRAM_BASE_URL`` is an Ouroboros-specific override (Engram does not define
+    it). ``ENGRAM_PORT`` IS Engram's documented knob for ``engram serve``, so it is
+    read as well — an operator who starts the daemon on a non-default port must not
+    have this client keep talking to 7437 and silently report "unreachable".
+    ``ENGRAM_SOCKET`` (Unix-socket-only mode) is NOT supported: this client is
+    HTTP-only, and that case must surface as unreachable rather than as a wrong
+    answer.
+    """
+    explicit = str(os.environ.get("ENGRAM_BASE_URL", "") or "").strip()
+    if explicit:
+        return explicit
+    port = str(os.environ.get("ENGRAM_PORT", "") or "").strip()
+    if port.isdigit() and 1 <= int(port) <= 65535:
+        return f"http://127.0.0.1:{int(port)}"
+    return ""
 
 
 def env_project() -> str:

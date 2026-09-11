@@ -111,7 +111,7 @@ _ENGRAM_REVIEW_ITEMS = 12
 _ENGRAM_REVIEW_CHARS = 4_000
 
 
-def _engram_review_section(drive_root: pathlib.Path) -> str:
+def _engram_review_section(drive_root: pathlib.Path, repo_dir: Any = None) -> str:
     """Bounded Engram-derived review input (C15 / AC17c). Never raises.
 
     The knowledge / pattern / backlog files in ``_MEMORY_WHITELIST`` stop being
@@ -127,7 +127,10 @@ def _engram_review_section(drive_root: pathlib.Path) -> str:
     try:
         from ouroboros.engram_read import client_for, digest, type_digest
 
-        client = client_for(drive_root)
+        # Scope from BOTH roots: the review holds them, and a bare drive root would
+        # resolve the project from ``.../data`` — filing this system's memories
+        # under a second project name.
+        client = client_for(_scope(drive_root, repo_dir))
         read = digest(client, limit=_ENGRAM_REVIEW_ITEMS, max_chars=_ENGRAM_REVIEW_CHARS)
         scratch = type_digest(
             client, "scratchpad_block", limit=_ENGRAM_REVIEW_ITEMS, max_chars=_ENGRAM_REVIEW_CHARS
@@ -154,11 +157,19 @@ def _engram_review_section(drive_root: pathlib.Path) -> str:
     return body
 
 
+def _scope(drive_root: Any, repo_dir: Any) -> Any:
+    """An env-shaped pair so the Engram scope resolves against the repository."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(drive_root=pathlib.Path(drive_root), repo_dir=repo_dir or drive_root)
+
+
 def _append_memory_whitelist(
     parts: list[str],
     skipped: list[str],
     *,
     drive_root: pathlib.Path,
+    repo_dir: Any = None,
 ) -> int:
     file_count = 0
     for rel_mem in _MEMORY_WHITELIST:
@@ -180,7 +191,7 @@ def _append_memory_whitelist(
     # The remote half of the same inputs. Counted separately from ``file_count``
     # because it is not a file, and hiding that would make the pack's provenance
     # a lie.
-    parts.append(_engram_review_section(drive_root))
+    parts.append(_engram_review_section(drive_root, repo_dir))
     return file_count
 
 
@@ -297,7 +308,9 @@ def build_review_pack(
 
     skipped: list[str] = []
     memory_parts: list[str] = []
-    memory_count = _append_memory_whitelist(memory_parts, skipped, drive_root=drive_root)
+    memory_count = _append_memory_whitelist(
+        memory_parts, skipped, drive_root=drive_root, repo_dir=repo_dir
+    )
     memory_text = "\n".join(memory_parts)
 
     # Low context mode: render ARCHITECTURE.md as a navigation map (full sections

@@ -1501,8 +1501,12 @@ def _handle_evolution_task_done(
 
                 campaign = _read_evolution_campaign() or {}
                 settled_tx = recorded_transaction or transaction
+                from types import SimpleNamespace as _NS
+
+                # Both roots: the supervisor ctx spells them uppercase, and a
+                # bare drive root would resolve the project from ``.../data``.
                 emit_evolution_outcome(
-                    ctx.DRIVE_ROOT,
+                    _NS(drive_root=ctx.DRIVE_ROOT, repo_dir=ctx.REPO_DIR),
                     {
                         "kind": "evolution_checkpoint",
                         "task_id": str(task_id or ""),

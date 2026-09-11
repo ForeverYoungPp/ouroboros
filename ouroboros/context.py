@@ -550,7 +550,11 @@ def _task_authority_projection(env: Any, task: Dict[str, Any]) -> Dict[str, Any]
     )
     from ouroboros.main_context_authority import project_main_task_authority
 
-    projection = project_main_task_authority(task, drive_root=canonical_root)
+    # Both roots: the Engram read inside the projection must resolve the
+    # project against the repository, not against ``.../data``.
+    projection = project_main_task_authority(
+        task, drive_root=canonical_root, repo_dir=getattr(env, "repo_dir", None)
+    )
     task_id = str(task.get("id") or "").strip()
     if not task_id:
         return projection

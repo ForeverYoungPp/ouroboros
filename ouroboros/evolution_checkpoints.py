@@ -61,7 +61,7 @@ def _git_value(repo_dir: pathlib.Path, args: list[str]) -> str:
         return ""
 
 
-def _engram_memory_version(drive_root: Any) -> Dict[str, Any]:
+def _engram_memory_version(drive_root: Any, repo_dir: Any = None) -> Dict[str, Any]:
     """Engram-side memory version for a checkpoint. Never raises.
 
     Bounded (Engram's own 500 ceiling) and soft: an unreachable store records
@@ -74,9 +74,13 @@ def _engram_memory_version(drive_root: Any) -> Dict[str, Any]:
         "engram_memory_count": 0,
     }
     try:
+        from types import SimpleNamespace
+
         from ouroboros.engram_read import client_for, memory_version
 
-        read = memory_version(client_for(drive_root))
+        # Both roots: a bare drive root resolves the project from ``.../data``.
+        scope = SimpleNamespace(drive_root=drive_root, repo_dir=repo_dir or drive_root)
+        read = memory_version(client_for(scope))
         return {
             "engram_memory_version": read.version,
             "engram_memory_version_status": read.status,
@@ -255,7 +259,7 @@ def append_evolution_checkpoint(
         # Record an Engram-side version together with its status, so a reader can
         # tell "memory unchanged" from "memory could not be read" — the old sha
         # could not, because a missing file and a stable file both looked stable.
-        **_engram_memory_version(drive_root),
+        **_engram_memory_version(drive_root, repo_dir),
         "outcome_axes": normalize_outcome_axes({"outcome_axes": outcome_axes or {}}),
         "cost_usd": (
             float(cost_usd) if cost_accounting_status == "available" and cost_usd is not None

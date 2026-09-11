@@ -737,3 +737,160 @@ def test_startup_flush_forwards_a_deferred_append(stub):
     stored = _knowledge_read(ctx, "protocol")
     assert "step one" in stored and "step two" in stored
     reset_sinks()
+
+
+# --------------------------------------------------------------------------- #
+# Loop-closing: one process must speak to ONE project, whatever its callers do
+# --------------------------------------------------------------------------- #
+
+
+def test_every_production_call_shape_resolves_the_same_project(stub, monkeypatch, tmp_path):
+    """The project must not depend on WHICH caller touches the sink first.
+
+    Production holds two shapes: ``Env`` (lowercase) for the agent/context paths,
+    and the supervisor's ctx (UPPERCASE ``DRIVE_ROOT``/``REPO_DIR``). A shape
+    mismatch does not fail — it silently resolves a DIFFERENT project, which splits
+    one system's memory in two. And because the sink is process-cached, the first
+    caller used to decide for everyone: a bare-drive caller at boot pinned every
+    later caller to the drive's own directory name.
+    """
+    from types import SimpleNamespace
+
+    from ouroboros.engram_sink import reset_sinks, sink_for
+
+    state, env = stub
+    repo, drive = env.repo_dir, env.drive_root
+    monkeypatch.setenv("OUROBOROS_REPO_DIR", str(repo))
+    reset_sinks()
+
+    # A bare drive root FIRST (the shape an evolution checkpoint uses at boot)...
+    assert sink_for(drive).client.config.project == "repo"
+    # ...must not decide for the Env-shaped callers that follow.
+    assert sink_for(env).client.config.project == "repo"
+    assert sink_for(SimpleNamespace(DRIVE_ROOT=drive, REPO_DIR=repo)).client.config.project == "repo"
+    # And the reverse order agrees.
+    reset_sinks()
+    assert sink_for(env).client.config.project == "repo"
+    assert sink_for(SimpleNamespace(DRIVE_ROOT=drive, REPO_DIR=repo)).client.config.project == "repo"
+    assert sink_for(drive).client.config.project == "repo"
+    reset_sinks()
+
+
+def test_the_supervisor_ctx_spelling_is_accepted(stub):
+    """Uppercase roots must resolve, not silently degrade to the drive's name."""
+    from types import SimpleNamespace
+
+    from ouroboros.engram_sink import reset_sinks, sink_for
+
+    state, env = stub
+    ctx = SimpleNamespace(DRIVE_ROOT=env.drive_root, REPO_DIR=env.repo_dir)
+    assert sink_for(ctx).client.config.project == "repo"
+    reset_sinks()
+
+
+def test_a_bare_drive_root_never_silently_becomes_its_own_project(stub, monkeypatch):
+    """With no repo root knowable, the caller must pass one — not guess.
+
+    ``_repo_root_hint`` falls back to the drive root only as a last resort; this
+    pins the fact that the fallback IS the drive name, so a future caller that
+    drops its repo root is caught by ``test_every_production_call_shape...`` rather
+    than discovered as two half-empty memory stores.
+    """
+    from ouroboros.engram_sink import reset_sinks, sink_for
+
+    state, env = stub
+    monkeypatch.delenv("OUROBOROS_REPO_DIR", raising=False)
+    reset_sinks()
+    assert sink_for(env.drive_root).client.config.project == env.drive_root.name
+    reset_sinks()
+
+
+def test_engram_port_is_honoured(monkeypatch):
+    """`ENGRAM_PORT` is the SERVICE's own knob; ignoring it means a silent miss."""
+    from ouroboros.engram_client import DEFAULT_BASE_URL, env_base_url
+
+    monkeypatch.delenv("ENGRAM_BASE_URL", raising=False)
+    monkeypatch.delenv("ENGRAM_PORT", raising=False)
+    assert env_base_url() == ""  # the client's own default applies
+    assert DEFAULT_BASE_URL.endswith(":7437")
+
+    monkeypatch.setenv("ENGRAM_PORT", "8123")
+    assert env_base_url() == "http://127.0.0.1:8123"
+
+    monkeypatch.setenv("ENGRAM_PORT", "not-a-port")
+    assert env_base_url() == ""  # garbage never becomes an endpoint
+
+    monkeypatch.setenv("ENGRAM_BASE_URL", "http://127.0.0.1:9999")
+    assert env_base_url() == "http://127.0.0.1:9999"  # explicit override wins
+
+
+def test_the_engram_knobs_are_projectable_from_settings():
+    """The operator's normal surface is settings.json, not a hand-exported env."""
+    from ouroboros.config import settings_env_keys
+
+    keys = set(settings_env_keys())
+    for name in ("ENGRAM_BASE_URL", "ENGRAM_PROJECT", "ENGRAM_HTTP_TOKEN", "OUROBOROS_REPO_DIR"):
+        assert name in keys, f"{name} cannot be set through settings.json"
+
+
+# --------------------------------------------------------------------------- #
+# The bug class itself: a caller holding ONLY the drive root
+# --------------------------------------------------------------------------- #
+# A drive root cannot identify the repository, so it resolves the project from the
+# drive's own directory name (or its `.engram/config.json` pin). That is not a
+# crash — it is a second, half-empty memory store, which is exactly how "the
+# feature is wired" and "the feature works" drift apart. This scan fails on a NEW
+# bare-drive call site rather than waiting for someone to notice two stores.
+
+_SCOPE_FUNCS = (
+    "client_for(",
+    "sink_for(",
+    "flush_engram_spool(",
+    "emit_reflection_memory_actions(",
+    "emit_task_narrative(",
+    "emit_evolution_outcome(",
+    "emit_review_verdicts(",
+)
+
+#: Call sites that legitimately hold only a drive root. Each relies on the DRIVE
+#: carrying the project pin (``<drive>/.engram/config.json``), which is why the
+#: live drive is pinned as well as the repository. Adding an entry here is a
+#: deliberate decision, not a way to silence the check:
+#: ``save_state``/``append_authored_task_summary`` are reached from dozens of call
+#: sites that hold no repository root, so threading one through them all would be a
+#: far larger change than the pin it replaces.
+_DRIVE_ONLY_CALLERS = {
+    "ouroboros/project_dialogue.py",
+    "ouroboros/review_state.py",
+}
+
+
+def _bare_drive_call_sites() -> list:
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "ouroboros"
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        for index, line in enumerate(source.splitlines(), start=1):
+            if not any(name in line for name in _SCOPE_FUNCS):
+                continue
+            if "def " in line and any(name.rstrip("(") in line for name in _SCOPE_FUNCS):
+                continue
+            if not re.search(r"\b(drive_root|DRIVE_ROOT|canonical_root)\b", line):
+                continue
+            if re.search(r"\b(repo_dir|REPO_DIR|_scope\(|context_env)\b", line):
+                continue
+            offenders.append(f"{path.relative_to(root.parent)}:{index}: {line.strip()}")
+    return offenders
+
+
+def test_no_production_caller_hands_engram_a_bare_drive_root():
+    """Every scope resolution must see the repository, or be pinned on the drive."""
+    offenders = [row for row in _bare_drive_call_sites() if row.split(":")[0] not in _DRIVE_ONLY_CALLERS]
+    assert not offenders, (
+        "these pass only a drive root, so they would resolve the project from the "
+        "drive's directory name and write to a SECOND memory store:\n  "
+        + "\n  ".join(offenders)
+    )

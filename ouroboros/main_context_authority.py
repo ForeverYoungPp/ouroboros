@@ -53,7 +53,7 @@ def _authority_identity(value: Any) -> str:
 
 
 def _narrative_for(
-    node: Mapping[str, Any], task_id: str, drive_root: Any,
+    node: Mapping[str, Any], task_id: str, drive_root: Any, repo_dir: Any = None,
 ) -> tuple[Optional[Dict[str, Any]], str]:
     """``(narrative, status)`` where status explains a miss.
 
@@ -83,10 +83,12 @@ def _narrative_for(
         # A missing or malformed legacy row is represented by the caller's
         # typed gap.  Main context assembly must not become a second writer.
         pass
-    return _narrative_from_engram(task_id, drive_root)
+    return _narrative_from_engram(task_id, drive_root, repo_dir)
 
 
-def _narrative_from_engram(task_id: str, drive_root: Any) -> tuple[Optional[Dict[str, Any]], str]:
+def _narrative_from_engram(
+    task_id: str, drive_root: Any, repo_dir: Any = None
+) -> tuple[Optional[Dict[str, Any]], str]:
     """The Engram copy of the authored narrative, if it can be read.
 
     Reconstructed in the *same shape* the local record has — including the
@@ -95,9 +97,13 @@ def _narrative_from_engram(task_id: str, drive_root: Any) -> tuple[Optional[Dict
     because provenance is part of the memory.
     """
     try:
+        from types import SimpleNamespace
+
         from ouroboros.engram_read import client_for, continuation_narrative
 
-        read = continuation_narrative(client_for(drive_root), task_id)
+        # BOTH roots: a bare drive root resolves the project from ``.../data``.
+        scope = SimpleNamespace(drive_root=drive_root, repo_dir=repo_dir or drive_root)
+        read = continuation_narrative(client_for(scope), task_id)
     except Exception:
         return None, "unknown"
     if read.status == "unavailable":
@@ -126,9 +132,10 @@ def _narrative_value(
     node: Mapping[str, Any],
     drive_root: Any,
     seen_narratives: MutableSet[str],
+    repo_dir: Any = None,
 ) -> Dict[str, Any]:
     source = _task_result_source(node, task_id)
-    narrative, miss_status = _narrative_for(node, task_id, drive_root)
+    narrative, miss_status = _narrative_for(node, task_id, drive_root, repo_dir)
     narrative_id = f"task-narrative:{task_id}"
     base = {
         "raw_result_resident": False,
@@ -178,6 +185,7 @@ def _project_value(
     authority_node: Optional[Mapping[str, Any]] = None,
     drive_root: Any = None,
     seen_narratives: MutableSet[str],
+    repo_dir: Any = None,
 ) -> Any:
     if key in _RAW_AUTHORITY_KEYS and isinstance(value, str) and len(value) > PREDECESSOR_RESULT_INLINE_CHARS:
         return _narrative_value(
@@ -186,6 +194,7 @@ def _project_value(
             node=authority_node or {},
             drive_root=drive_root,
             seen_narratives=seen_narratives,
+            repo_dir=repo_dir,
         )
     if isinstance(value, Mapping):
         current_id = str(value.get("task_id") or task_id or "").strip()
@@ -198,6 +207,7 @@ def _project_value(
                 task_id=current_id,
                 drive_root=drive_root,
                 seen_narratives=seen_narratives,
+                repo_dir=repo_dir,
             )
         return {
             copy.deepcopy(k): _project_value(
@@ -207,6 +217,7 @@ def _project_value(
                 authority_node=authority_node,
                 drive_root=drive_root,
                 seen_narratives=seen_narratives,
+                repo_dir=repo_dir,
             )
             for k, child in value.items()
         }
@@ -218,6 +229,7 @@ def _project_value(
                 authority_node=authority_node,
                 drive_root=drive_root,
                 seen_narratives=seen_narratives,
+                repo_dir=repo_dir,
             )
             for child in value
         ]
@@ -229,6 +241,7 @@ def _project_value(
                 authority_node=authority_node,
                 drive_root=drive_root,
                 seen_narratives=seen_narratives,
+                repo_dir=repo_dir,
             )
             for child in value
         )
@@ -241,6 +254,7 @@ def _project_authority_node(
     task_id: str,
     drive_root: Any,
     seen_narratives: MutableSet[str],
+    repo_dir: Any = None,
 ) -> Dict[str, Any]:
     current_id = str(node.get("task_id") or task_id or "").strip()
     projected = {
@@ -251,6 +265,7 @@ def _project_authority_node(
             authority_node=node,
             drive_root=drive_root,
             seen_narratives=seen_narratives,
+            repo_dir=repo_dir,
         )
         for key, value in node.items()
     }
@@ -269,7 +284,7 @@ def _project_authority_node(
 
 
 def project_main_task_authority(
-    task: Mapping[str, Any], *, drive_root: Any = None,
+    task: Mapping[str, Any], *, drive_root: Any = None, repo_dir: Any = None,
 ) -> Dict[str, Any]:
     """Build the provider-only authority section without mutating ``task``."""
     seen_narratives: set[str] = set()
@@ -283,6 +298,7 @@ def project_main_task_authority(
             task_id=str(predecessor.get("task_id") or "").strip(),
             drive_root=drive_root,
             seen_narratives=seen_narratives,
+            repo_dir=repo_dir,
         )
     if isinstance(contract, Mapping):
         projected_contract = _project_value(
@@ -291,6 +307,7 @@ def project_main_task_authority(
             authority_node=predecessor if isinstance(predecessor, Mapping) else {},
             drive_root=drive_root,
             seen_narratives=seen_narratives,
+            repo_dir=repo_dir,
         )
         nested = projected_contract.get("predecessor_authority") if isinstance(projected_contract, dict) else None
         if isinstance(projected_contract, dict) and isinstance(nested, Mapping) and isinstance(predecessor, Mapping):
