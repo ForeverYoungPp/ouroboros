@@ -74,6 +74,13 @@ SINK_KINDS = frozenset(
 # C18 — the memory / to-do boundary
 # --------------------------------------------------------------------------- #
 
+#: Stamped onto an identity refinement so it can never read back as an established
+#: trait (W1: "标为候选而非既成事实").
+IDENTITY_CANDIDATE_MARKER = (
+    "IDENTITY UPDATE CANDIDATE — a PROPOSAL, not an adopted trait. "
+    "Pending review; never treat this as an established fact about who I am."
+)
+
 #: Content whose *job* is to say what to do next. Refused by the sink.
 _TODO_LEAD = re.compile(
     r"^\s*(?:[-*•]\s*)?(?:"
@@ -283,6 +290,16 @@ class EngramSink:
         topic = str(payload.get("topic") or "").strip()
         action_type = str(payload.get("type") or "memory_action")
         title = _sanitize(payload.get("title") or topic or f"memory action ({action_type})")
+        if action_type == "identity_update_candidate":
+            # W1: an identity refinement is a PROPOSAL, and Engram is read back as
+            # memory — so an unmarked one would surface, on demand retrieval, as a
+            # trait the agent already has. The whole point of routing identity
+            # through a review candidate is that autonomous learning cannot drift
+            # the personality; storing it as a bare fact would defeat that at the
+            # one place a future reader actually looks.
+            content = f"{IDENTITY_CANDIDATE_MARKER}\n\n{content}"
+            if not str(payload.get("title") or "").strip():
+                title = _sanitize(f"Identity update candidate: {topic or content[:120]}")
         return self.emit(
             "memory_action",
             title=title,

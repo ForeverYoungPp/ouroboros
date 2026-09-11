@@ -669,3 +669,30 @@ def test_a_torn_spool_tail_is_skipped_not_fatal(stub, tmp_path):
     recovered = sink.pending()
     assert [rec["spool_id"] for rec in recovered] == [good[0]["spool_id"]]
     assert sink.flush() == 1
+
+
+def test_an_identity_candidate_is_stored_as_a_proposal_not_a_fact(stub, tmp_path):
+    """W1: retrieval must not surface a proposed trait as one the agent has.
+
+    Identity is the one memory that must not drift autonomously — the reflection
+    path routes refinements through a review candidate precisely so nothing is
+    auto-applied. Engram is read back AS memory, so an unmarked candidate would
+    defeat that at the one place a future reader actually looks.
+    """
+    from ouroboros.engram_sink import IDENTITY_CANDIDATE_MARKER
+
+    state, url = stub
+    sink = _sink(tmp_path, url)
+
+    sink.emit_memory_action(
+        {"type": "identity_update_candidate", "content": "I am rigorous and always verify."},
+        task_id="t1",
+    )
+
+    body = _saved(state)[-1]["body"]
+    assert body["type"] == "identity_update_candidate"
+    assert body["content"].startswith(IDENTITY_CANDIDATE_MARKER)
+    assert "I am rigorous and always verify." in body["content"]
+    assert "candidate" in body["title"].lower()
+    # Not mistaken for a to-do either: it is a memory, just an unadopted one.
+    assert body["content"].startswith("IDENTITY")
