@@ -474,9 +474,9 @@ class EngramSink:
     def emit_dialogue_summary(self, block: Mapping[str, Any]) -> SinkReceipt:
         """One distilled dialogue block from the consolidator.
 
-        Identity is content-addressed, so re-pushing the same local block (a
-        startup reconciliation, a retried consolidation) UPDATES the one record
-        instead of piling up near-duplicates.
+        Identity is interval-addressed, so re-summarising the same span (a
+        startup reconciliation, a retried consolidation, a cursor that did not
+        advance) UPDATES the one record instead of piling up near-duplicates.
         """
         return self._guard("dialogue_summary", self._dialogue_summary, block)
 
@@ -485,11 +485,31 @@ class EngramSink:
         content = str(row.get("content") or "")
         block_kind = str(row.get("type") or "summary")
         span = _sanitize(row.get("range"), 120)
+        gap_id = _sanitize(row.get("gap_id"), 120)
+        # The interval, when there is one, is the span the consolidator derived
+        # from the chunk's endpoints — a pure function of them, so the same span
+        # retried produces the same identity and therefore an update rather than
+        # a second record for one interval.
+        #
+        # Two cases have no usable interval and must NOT collapse onto one shared
+        # identity (P1: a memory gap is a fact, and two gaps are two facts):
+        #   * a gap marker, whose range is the literal "unknown" sentinel while
+        #     the distinguishing datum lives in gap_id;
+        #   * any block with no range at all (this function takes arbitrary
+        #     mappings, so it cannot assume the consolidator's producers).
+        # Those fall back to a label that is unique per block, and only a block
+        # with neither label nor interval falls back to the content fingerprint.
+        interval = span if span and span != "unknown" else ""
+        label = gap_id or interval
+        # One label drives BOTH the title and the identity so they cannot drift:
+        # Engram's fallback dedupe keys on the title as well as the content hash,
+        # so two records that must stay distinct must not share a title.
+        identity = f"dialogue:{block_kind}:{label or _fingerprint(block_kind, span, content)}"
         return self.emit(
             "dialogue_summary",
-            title=_sanitize(f"Dialogue {block_kind}: {span}".strip()),
+            title=_sanitize(f"Dialogue {block_kind}: {label or span}".strip()),
             content=content,
-            identity=f"dialogue:{_fingerprint(block_kind, span, content)}",
+            identity=identity,
             type="dialogue_summary",
             # Repo-wide: this is the one identity's continuity, not a project fact.
             scope="global",
@@ -498,6 +518,9 @@ class EngramSink:
                 "range": span,
                 "block_kind": block_kind,
                 "message_count": str(row.get("message_count") or ""),
+                # Carried so a gap record read back from Engram still says WHICH
+                # discontinuity it marks; the local block is keyed on this too.
+                "gap_id": gap_id,
             },
         )
 

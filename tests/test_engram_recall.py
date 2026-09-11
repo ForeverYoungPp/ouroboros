@@ -40,7 +40,7 @@ def _seed(state, blocks, *, start_id: int = 500) -> None:
             "id": start_id + offset,
             "type": "dialogue_summary",
             "title": f"Dialogue {block['type']}: {block['range']}",
-            "topic_key": f"dialogue:{block['range']}",
+            "topic_key": f"dialogue:{block['type']}:{block['range']}",
             "scope": "global",
             "content": block["content"],
             "created_at": "2026-09-11",
@@ -263,6 +263,80 @@ def test_pushing_the_same_blocks_twice_upserts_rather_than_piling_up(engram_stub
     keys = [r["topic_key"] for r in state.knowledge.values() if r.get("type") == "dialogue_summary"]
     assert len(keys) == 2
     assert len(set(keys)) == 2
+    reset_sinks()
+
+
+def test_resummarising_the_same_span_updates_its_record(engram_stub):
+    """A retry emitting different prose is the SAME interval, not a second one.
+
+    Content addressing made these two records, because the prose differs — which
+    is exactly how one interval ends up duplicated. The interval is what the
+    block IS; the prose is only how it was phrased this time.
+    """
+    state, env = engram_stub
+    from ouroboros.engram_sink import sink_for
+
+    sink_for(env).emit_dialogue_summary(_block("2026-09-09 10:00 - 12:00", "first pass"))
+    reset_sinks()
+    sink_for(env).emit_dialogue_summary(_block("2026-09-09 10:00 - 12:00", "second pass"))
+
+    stored = [r for r in state.knowledge.values() if r.get("type") == "dialogue_summary"]
+    assert len(stored) == 1
+    assert stored[0]["topic_key"] == "dialogue:summary:2026-09-09 10:00 - 12:00"
+    assert stored[0]["content"] == "second pass"
+    reset_sinks()
+
+
+def test_two_memory_gap_markers_do_not_collapse_into_one(engram_stub):
+    """Two lost generations are two P1 facts, not one overwritten record.
+
+    A gap marker carries `range="unknown"`, so it has no interval at all and the
+    distinguishing datum lives in `gap_id`. Keying on the span alone would fold
+    every discontinuity in the biography onto one identity — and because the gap
+    body is a fixed constant, content addressing folded them together too.
+    """
+    state, env = engram_stub
+    from ouroboros.engram_sink import sink_for
+
+    gap = {
+        "ts": "2026-09-11T00:00:00+00:00",
+        "type": "summary",
+        "range": "unknown",
+        "message_count": 0,
+        "content": "[MEMORY GAP] an un-consolidated span precedes this point.",
+    }
+    sink_for(env).emit_dialogue_summary({**gap, "gap_id": "gap:aaaa:100"})
+    reset_sinks()
+    sink_for(env).emit_dialogue_summary({**gap, "gap_id": "gap:bbbb:200"})
+
+    stored = [r for r in state.knowledge.values() if r.get("type") == "dialogue_summary"]
+    assert len(stored) == 2
+    assert {r["topic_key"] for r in stored} == {
+        "dialogue:summary:gap:aaaa:100",
+        "dialogue:summary:gap:bbbb:200",
+    }
+    # Distinct titles as well: the live store's fallback dedupe keys on the title
+    # too, so two records that must stay apart must not share one.
+    assert len({r["title"] for r in stored}) == 2
+    reset_sinks()
+
+
+def test_a_block_with_no_range_does_not_collapse_into_another(engram_stub):
+    """`push_local_dialogue_blocks` takes arbitrary mappings.
+
+    A missing range is not a shared interval, so the mirror must not treat it as
+    one — that would silently destroy every range-less block but the last.
+    """
+    state, env = engram_stub
+    from ouroboros.engram_sink import sink_for
+
+    sink_for(env).emit_dialogue_summary({"type": "summary", "content": "no range at all"})
+    reset_sinks()
+    sink_for(env).emit_dialogue_summary({"type": "summary", "content": "another range-less block"})
+
+    stored = [r for r in state.knowledge.values() if r.get("type") == "dialogue_summary"]
+    assert len(stored) == 2
+    assert len({r["topic_key"] for r in stored}) == 2
     reset_sinks()
 
 
