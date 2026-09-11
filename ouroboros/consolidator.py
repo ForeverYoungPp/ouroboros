@@ -786,10 +786,10 @@ Respond with JSON only (no fences):
 
         from ouroboros.tools.knowledge import _knowledge_write_lock
 
+        # Knowledge FIRST, outside the lock: the one writer takes the same
+        # non-reentrant lock internally, so nesting would deadlock.
+        _write_knowledge_entries(knowledge_dir, result.get("knowledge_entries", []))
         with _knowledge_write_lock(knowledge_dir):
-            _write_knowledge_entries(
-                knowledge_dir, result.get("knowledge_entries", []), _locked=True,
-            )
             _rebuild_knowledge_index(knowledge_dir, _locked=True)
 
         compressed_block = {
@@ -841,36 +841,59 @@ Respond with JSON only (no fences):
         return None
 
 
+def _knowledge_ctx_for(knowledge_dir: pathlib.Path) -> Any:
+    """A canonical knowledge context for whichever layout this knowledge dir is.
+
+    ``<drive>/memory/knowledge`` is the canonical shape; anything else (a test
+    fixture, a project store) is treated as ``<root>/knowledge``.
+    """
+    from ouroboros.tools.registry import ToolContext
+
+    parent = knowledge_dir.parent
+    drive_root = parent.parent if parent.name == "memory" else parent
+    return ToolContext(repo_dir=drive_root, drive_root=drive_root)
+
+
 def _write_knowledge_entries(
     knowledge_dir: pathlib.Path,
     entries: List[Dict[str, Any]],
     *,
     _locked: bool = False,
 ) -> None:
-    # Validate topics through the ONE knowledge-topic validator (P7/C9.4) instead of
-    # a private char-filter that silently munged names into a different file than
-    # the knowledge tool would. An invalid topic is skipped + logged, never coerced.
-    from ouroboros.tools.knowledge import _sanitize_topic
+    """Send consolidation-extracted knowledge through the ONE knowledge writer.
 
-    if not _locked:
-        from ouroboros.tools.knowledge import _knowledge_write_lock
+    Owner decision: consolidation's PROCESS is unchanged — 100 messages per block,
+    4 blocks per era, scratchpad blocks distilled into knowledge — but its FIXED
+    KNOWLEDGE output belongs in Engram. Routing through ``_knowledge_write`` is what
+    makes that true without inventing a second knowledge path: that function owns
+    the topic validator, the write lock, the provenance history and the Engram
+    mirror, so this branch now lands exactly where every other knowledge write
+    lands.
 
-        with _knowledge_write_lock(knowledge_dir):
-            _write_knowledge_entries(knowledge_dir, entries, _locked=True)
-            _rebuild_knowledge_index(knowledge_dir, _locked=True)
-        return
+    ``_locked`` is accepted and IGNORED on purpose. ``_knowledge_write`` takes its
+    own lock, and that lock is a plain non-reentrant file lock — calling this from
+    inside one deadlocks rather than nesting. Callers must invoke it outside.
+    """
+    from ouroboros.tools.knowledge import _knowledge_write, _sanitize_topic
 
-    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    ctx = _knowledge_ctx_for(knowledge_dir)
     for entry in entries:
-        topic = entry.get("topic", "").strip()
-        kb_content = entry.get("content", "").strip()
-        if not topic or not kb_content:
+        topic = str(entry.get("topic") or "").strip()
+        content = str(entry.get("content") or "").strip()
+        if not topic or not content:
             continue
+        # Validate through the ONE knowledge-topic validator (P7/C9.4) instead of a
+        # private char-filter that silently munged names into a different file than
+        # the knowledge tool would. An invalid topic is skipped + logged, never
+        # coerced.
         try:
-            safe_topic = _sanitize_topic(topic)
+            _sanitize_topic(topic)
         except ValueError:
             log.debug("consolidator: skipping invalid knowledge topic %r", topic)
             continue
-        kb_path = knowledge_dir / f"{safe_topic}.md"
-        existing = read_text(kb_path) if kb_path.exists() else ""
-        write_text(kb_path, existing.rstrip() + "\n\n" + kb_content if existing else f"# {topic}\n\n{kb_content}\n")
+        try:
+            _knowledge_write(ctx, topic, content, mode="overwrite")
+        except Exception:
+            # A learned lesson that silently fails to land is invisible learning
+            # erosion; warn so the loss is owner-greppable.
+            log.warning("consolidator: knowledge write failed for %r", topic, exc_info=True)

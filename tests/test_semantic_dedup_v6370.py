@@ -134,16 +134,31 @@ def test_project_scoped_backlog_write_routes_to_global_store(tmp_path, monkeypat
 # C9.4 — consolidator validates topics through the single sanitizer
 # --------------------------------------------------------------------------- #
 
-def test_consolidator_skips_invalid_topic(tmp_path):
-    from ouroboros.consolidator import _write_knowledge_entries
+def test_consolidator_skips_invalid_topic(engram_stub):
+    """C9.4, retargeted: consolidation's knowledge output lands in Engram.
 
-    kdir = tmp_path / "knowledge"
+    Owner decision — consolidation's PROCESS is unchanged, but its fixed-knowledge
+    output goes to Engram. It does that by routing through the ONE knowledge
+    writer, so the sanitizer under test is the same one the tool uses; the
+    assertion moves from "a local file appeared" to "the valid topic reached
+    Engram and the invalid one did not".
+    """
+    from ouroboros.consolidator import _write_knowledge_entries
+    from ouroboros.engram_sink import reset_sinks
+
+    state, env = engram_stub
+    kdir = env.drive_root / "memory" / "knowledge"
+
     _write_knowledge_entries(kdir, [
         {"topic": "valid-topic", "content": "ok"},
         {"topic": "has spaces!", "content": "should be skipped"},
     ])
-    assert (kdir / "valid-topic.md").exists()
-    assert not list(kdir.glob("*spaces*"))
+
+    keys = [r["body"]["topic_key"] for r in state.requests
+            if r["path"] == "/observations" and isinstance(r.get("body"), dict)]
+    assert keys == ["knowledge:valid-topic"], keys
+    assert not list(kdir.glob("*spaces*")) if kdir.exists() else True
+    reset_sinks()
 
 
 # --------------------------------------------------------------------------- #
