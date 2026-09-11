@@ -110,7 +110,13 @@ def test_read_returns_exactly_one_record(engram_stub):
 
     assert "memory 3" in out
     assert "memory 4" not in out
-    assert [r["path"] for r in state.requests] == ["/observations/3"]
+    # Exactly one observation fetch, plus the single allowed resolver call —
+    # pinned in order, so extra traffic of ANY kind is visible.
+    assert [r["path"] for r in state.requests] == [
+        "/project/current",   # the server owns project policy
+        "/sessions",          # one bootstrap, so the scoped read is not a 404
+        "/observations/3",
+    ]
     reset_sinks()
 
 

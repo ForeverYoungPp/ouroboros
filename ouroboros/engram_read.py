@@ -7,15 +7,20 @@ memory loop re-inflates exactly the context it was built to shrink.
 
 It also fixes the failure that makes the old instruments lie (C15 / AC17). The
 local probes answered "is this file big / how many bytes", and an *empty* answer
-was indistinguishable from a *broken* one. Here the three outcomes are separate
-and named:
+was indistinguishable from a *broken* one. Here the outcomes this module mints
+are separate and named (``stale`` is not one of them — ``engram_cache`` mints it
+at the read-through layer when it serves the last good read):
 
 * ``status="ok"``          — read succeeded, data present
 * ``status="empty"``       — read succeeded, the store genuinely holds nothing
 * ``status="unavailable"`` — the store could not be read at all
+* ``status="rejected"``    — the request was REFUSED: the store ANSWERED and refused it
+                             (a 4xx), or the CLIENT refused to send it because the scope is
+                             unresolved — never a transport failure
 
-A consumer that cannot tell the last two apart will report "no memory" when the
-truth is "no service", which is how a memory-loss signal becomes noise.
+A consumer that cannot tell ``empty`` from ``unavailable``/``rejected`` apart will
+report "no memory" when the truth is "no service" (or a refused request), which is
+how a memory-loss signal becomes noise.
 """
 
 from __future__ import annotations
@@ -24,6 +29,8 @@ import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, List
+
+from ouroboros.engram_client import EngramConfigError
 
 #: Mirrors ``improvement_backlog.format_backlog_digest(max_chars=3000)``.
 MAX_DIGEST_CHARS = 3_000
@@ -58,7 +65,7 @@ class MachineRead:
     """Outcome of one machine-side read. Never an exception."""
 
     ok: bool
-    status: str = "ok"            # ok | empty | unavailable
+    status: str = "ok"            # ok | empty | rejected | unavailable | stale
     count: int = 0
     version: str = ""
     text: str = ""
@@ -66,8 +73,13 @@ class MachineRead:
 
     @property
     def readable(self) -> bool:
-        """True when the store answered — regardless of whether it held anything."""
-        return self.status in {"ok", "empty"}
+        """True when the caller has CONTENT — including a cached-but-stale read."""
+        return self.status in {"ok", "empty", "stale"}
+
+    @property
+    def stale(self) -> bool:
+        """True when the content came from cache because the store could not be read."""
+        return self.status == "stale"
 
     @property
     def unknown(self) -> bool:
@@ -121,14 +133,21 @@ def _read_failure(result: Any) -> MachineRead:
     invalid selector. Calling that "unavailable" told the reader the service was
     down when it was up and had refused the request, which sends the operator to
     the wrong problem entirely.
+
+    The same reasoning covers a CLIENT-side refusal: when the scope could not be
+    resolved the request is never sent at all, and reporting that as
+    ``unavailable`` would print "the memory service could not be reached" for a
+    configuration problem. The status WORD is what the section renderers print, so
+    the `detail` alone cannot carry it.
     """
     kind = str(getattr(result, "error_kind", "") or "unknown")
     status = getattr(result, "status", None)
     detail = str(getattr(result, "detail", ""))[:200]
     http_rejected = kind == "http" and isinstance(status, int) and 400 <= status < 500
+    refused = http_rejected or kind == "config"
     return MachineRead(
         False,
-        status="rejected" if http_rejected else "unavailable",
+        status="rejected" if refused else "unavailable",
         detail=f"{kind} {status if status is not None else ''}: {detail}".strip(),
     )
 
@@ -188,13 +207,24 @@ def entry_count(client: Any) -> MachineRead:
     return MachineRead(True, status="ok" if count else "empty", count=count)
 
 
-def digest(client: Any, *, limit: int = MAX_DIGEST_ITEMS, max_chars: int = MAX_DIGEST_CHARS) -> MachineRead:
+def digest(
+    client: Any,
+    *,
+    limit: int = MAX_DIGEST_ITEMS,
+    max_chars: int = MAX_DIGEST_CHARS,
+    window: int = MAX_WINDOW,
+) -> MachineRead:
     """A bounded, human-readable digest — the shape ``format_backlog_digest`` had.
 
     Bounds come from the local predecessor by default, so a repointed consumer
     costs what it used to cost rather than whatever the store happens to hold.
+
+    ``window`` is the same knob ``type_digest`` exposes, for the same reason: the
+    recency read returns full bodies, so asking for 50 to render 5 lines is ten
+    times the traffic for the same answer. A caller that wants only a few lines
+    passes the few it wants.
     """
-    read = recent(client, limit=MAX_WINDOW)
+    read = recent(client, limit=_bounded_items(window, MAX_COUNT_LIMIT))
     if not read.ok:
         return read
     if read.status == "empty":
@@ -306,8 +336,16 @@ def search_titles(
     type_name: str = "",
     limit: int = MAX_DIGEST_ITEMS,
     max_chars: int = MAX_DIGEST_CHARS,
+    match_mode: str = "",
 ) -> MachineRead:
     """Layer-1 keyword recall: ONE title line per hit, never a body.
+
+    ``match_mode="any"`` is what makes a natural-language query usable as a
+    retrieval question: under Engram's default (AND) a sentence only matches a
+    record that contains EVERY one of its tokens, so a multi-word query from an
+    owner message or an observation payload returns nothing and the caller
+    silently falls back to recency. Callers that want precision pass "" (the
+    server default) instead.
 
     The server returns full observations from ``/search`` (verified against
     ``buildSearchFTSQuery``), so the layering is enforced HERE: rendering titles
@@ -318,7 +356,9 @@ def search_titles(
     if not text:
         return MachineRead(True, status="empty", count=0, detail="empty query")
     wanted = _bounded_items(limit, MAX_DIGEST_ITEMS)
-    result = client.search(text, limit=wanted, type=type_name or "")
+    result = client.search(
+        text, limit=wanted, type=type_name or "", match_mode=match_mode or ""
+    )
     if not result.ok:
         return _read_failure(result)
     items: List[Dict[str, Any]] = result.items()
@@ -447,10 +487,20 @@ def client_for(target: Any) -> Any:
     The sink is made ready first, because a project-scoped READ is also refused
     until the project exists in the store (``404 unknown_project``). Reads create
     nothing beyond that one idempotent session call.
+
+    When the project cannot be resolved offline (blank/forbidden name), the sink
+    builds a client marked ``_unresolved`` and its WRITE path refuses at
+    ``_send`` — but its read methods would still go to the wire and come back
+    as a bare 404, which reads ``there is no memory`` rather than ``this is a
+    configuration fact``. Reads must fail closed on the same signal, so an
+    unresolvable scope raises here; every call site already carries the typed
+    not-configured / unknown branch for exactly this outcome.
     """
     from ouroboros.engram_sink import sink_for
 
     sink = sink_for(target)
+    if sink.config_error:
+        raise EngramConfigError(str(sink.config_error))
     sink.ensure_ready()
     return sink.client
 

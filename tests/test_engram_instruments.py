@@ -979,6 +979,104 @@ def test_no_production_caller_hands_engram_a_bare_drive_root():
     )
 
 
+# A drive root handed to a REPOSITORY-scoped argument is the same second-store
+# failure one step harder to see: the call names a ``repo_dir``, so the token
+# check above passes, while the VALUE still resolves the project from the drive
+# directory. The class is only closed when the value is checked, not the shape.
+_DRIVE_ROOT_TOKEN = r"(?:drive_root|DRIVE_ROOT|canonical_root)"
+
+
+def _repo_dir_is_the_drive_root_sites(package_root=None) -> list:
+    """Call sites passing a DRIVE root as the repository root (F7 by value).
+
+    Catches the two shapes the value can take: a bare drive-root token
+    (``repo_dir=drive_root``) and the same expression used for both roots
+    (``Memory(drive_root=root, repo_dir=root)``) — the shape that is literally a
+    drive root bound to a variable and then handed over twice.
+    """
+    import pathlib as _pathlib
+    import re
+
+    root = (
+        _pathlib.Path(package_root)
+        if package_root is not None
+        else _pathlib.Path(__file__).resolve().parents[1] / "ouroboros"
+    )
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        for index, line in enumerate(source.splitlines(), start=1):
+            if "repo_dir" not in line:
+                continue
+            value = re.search(r"\brepo_dir\s*=\s*([^,)\n]+)", line)
+            if value is None:
+                continue
+            expression = value.group(1).strip()
+            if re.fullmatch(rf"{_DRIVE_ROOT_TOKEN}(?:\.[A-Za-z_]\w*\(\))*", expression):
+                offenders.append(f"{path.relative_to(root.parent)}:{index}: {line.strip()}")
+                continue
+            drive = re.search(rf"\b{_DRIVE_ROOT_TOKEN}\s*=\s*([A-Za-z_][\w.]*)\b", line)
+            if drive is not None and expression == drive.group(1):
+                offenders.append(f"{path.relative_to(root.parent)}:{index}: {line.strip()}")
+    return offenders
+
+
+#: Class B call sites whose repository root is genuinely unavailable at that
+#: layer: ``consolidator._knowledge_ctx_for`` derives its ctx from a knowledge
+#: DIRECTORY (``<drive>/memory/knowledge`` or a test fixture's
+#: ``<root>/knowledge``), so it has no repository to thread through — the drive's
+#: ``.engram/config.json`` pin is what keeps it on the right project. Flagged by
+#: the value check when it was added (line 896), kept here as a declared
+#: decision; a caller that CAN name a repository root must not be added.
+_DRIVE_ROOT_AS_REPO_DIR_CALLERS = {
+    "ouroboros/consolidator.py",
+}
+
+
+def test_no_production_caller_passes_the_drive_root_as_the_repo_dir():
+    """The value, not only the shape: ``repo_dir=<drive root>`` is F7 by value.
+
+    Invisible on a drive that carries the ``.engram/config.json`` pin, and a
+    second, half-empty store on one that does not — which is why the check is on
+    the value. The sanctioned fallback idiom that deliberately degrades to the
+    drive root (``repo_dir=getattr(ctx, "repo_dir", None) or ctx.drive_root``)
+    stays green: it is an expression, not a bare drive-root token.
+    """
+    offenders = [
+        row
+        for row in _repo_dir_is_the_drive_root_sites()
+        if row.split(":")[0] not in _DRIVE_ROOT_AS_REPO_DIR_CALLERS
+    ]
+    assert not offenders, (
+        "these hand a DRIVE root to a repository-scoped argument, so they resolve "
+        "the project from the drive's directory name:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_the_repo_dir_value_check_catches_both_shapes_and_spares_real_roots(tmp_path):
+    """The detector's own contract, on sources whose answer is known."""
+    package = tmp_path / "ouroboros"
+    package.mkdir()
+    (package / "offender.py").write_text(
+        "memory = Memory(drive_root=root, repo_dir=root)\n"
+        "sink = sink_for(drive_root=drive_root, repo_dir=drive_root)\n",
+        encoding="utf-8",
+    )
+    (package / "legit.py").write_text(
+        "ctx = ToolContext(repo_dir=repo_dir, drive_root=drive_root)\n"
+        'mem = Memory(drive_root=ctx.drive_root, repo_dir=getattr(ctx, "repo_dir", None) or ctx.drive_root)\n'
+        "sink = sink_for(drive_root, repo_dir=env.repo_dir)\n"
+        "other = Memory(env.drive_root, getattr(env, \"repo_dir\", None))\n",
+        encoding="utf-8",
+    )
+
+    offenders = _repo_dir_is_the_drive_root_sites(package)
+
+    assert len(offenders) == 2, offenders
+    assert all("offender.py" in row for row in offenders)
+    assert [row for row in offenders if "legit.py" in row] == []
+
+
 # --------------------------------------------------------------------------- #
 # The bootstrap Engram's own client performs, and which we were missing
 # --------------------------------------------------------------------------- #

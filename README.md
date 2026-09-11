@@ -12,7 +12,7 @@
 [![Linux](https://img.shields.io/badge/Linux-x86__64-orange.svg)](https://ouroboros-agent.ai/install/#linux)
 [![Windows](https://img.shields.io/badge/Windows-x64-blue.svg)][download-windows-x64]
 [![OuroborosHub](https://img.shields.io/badge/OuroborosHub-skills%20marketplace-8A2BE2.svg)](https://github.com/razzant/OuroborosHub)
-[![Version 6.114.10](https://img.shields.io/badge/version-6.114.10-green.svg)](VERSION)
+[![Version 6.114.11](https://img.shields.io/badge/version-6.114.11-green.svg)](VERSION)
 
 Ouroboros is an open-source, general-purpose AI agent whose identity, durable memory, and history continue across tasks and restarts. It works on external projects, coordinates a live swarm of specialist agents, and can rewrite the implementation it runs on, including its code, architecture, prompts, tools, and dependencies. Reflection can also change how it understands itself without severing that continuity.
 
@@ -64,13 +64,13 @@ The desktop packages already contain an optional CLI installer. On macOS, after 
 
 </details>
 
-[download-macos-arm64]: https://github.com/razzant/ouroboros/releases/download/v6.114.10/Ouroboros-6.114.10.dmg
-[download-windows-x64]: https://github.com/razzant/ouroboros/releases/download/v6.114.10/Ouroboros-6.114.10-windows-x64.zip
-[download-linux-deb-amd64]: https://github.com/razzant/ouroboros/releases/download/v6.114.10/ouroboros_6.114.10_amd64.deb
-[download-linux-rpm-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.10/ouroboros-6.114.10-1.x86_64.rpm
-[download-linux-rpm-red80-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.10/ouroboros-6.114.10-1.red80.x86_64.rpm
-[download-linux-appimage-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.10/Ouroboros-6.114.10-linux-x86_64.AppImage
-[download-linux-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.10/Ouroboros-6.114.10-linux-x86_64.tar.gz
+[download-macos-arm64]: https://github.com/razzant/ouroboros/releases/download/v6.114.11/Ouroboros-6.114.11.dmg
+[download-windows-x64]: https://github.com/razzant/ouroboros/releases/download/v6.114.11/Ouroboros-6.114.11-windows-x64.zip
+[download-linux-deb-amd64]: https://github.com/razzant/ouroboros/releases/download/v6.114.11/ouroboros_6.114.11_amd64.deb
+[download-linux-rpm-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.11/ouroboros-6.114.11-1.x86_64.rpm
+[download-linux-rpm-red80-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.11/ouroboros-6.114.11-1.red80.x86_64.rpm
+[download-linux-appimage-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.11/Ouroboros-6.114.11-linux-x86_64.AppImage
+[download-linux-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.114.11/Ouroboros-6.114.11-linux-x86_64.tar.gz
 
 Ouroboros bundles [Claudexor](https://github.com/razzant/claudexor) as its local execution layer for delegated coding and hosted-agent review. Ouroboros owns the task, memory, review, and final integration, while Claudexor runs the selected connected coding harness and returns durable execution evidence. [Explore Claudexor](https://claudexor.ai/).
 
@@ -449,6 +449,7 @@ and the reason.
 
 | Version | Date | Description |
 |---------|------|-------------|
+| 6.114.11 | 2026-09-12 | **fix(memory): make the Engram seam honest end to end — scope guard, typed refusals, per-cycle emit budget, locatable cap disclosure.** Read side: a blank project scope is refused as a typed `config` fact instead of a bare 404 an operator reads as "no memory"; a single record the project-scoped `/timeline` cannot resolve retries ONCE with `all_projects=true`; `knowledge_list` discloses that the local index is the pre-switch archive; `rejected` now also covers a CLIENT-side refusal (unresolved scope), not only a store refusal. Write side: the per-run emit cap is now per CYCLE for the background loop and consolidation — it was a process-lifetime quota, so one boot burst starved every later write (observed live: `knowledge:infrastructure_gates` refused at 19:34, absent from the store); redundant verdict re-emissions are damped by a spool witness; a capped disclosure carries `run_emits`/`run_reset_at` so the refused record's run is locatable; `emit`'s except clause names `exc.__class__.__name__` (the `type` parameter shadowed the builtin). Plus: an F7 value-guard that flags `repo_dir=<drive root>` (it caught `consolidator.py:896`, declared and left to the owner), BG-answer arbitration (a duplicate reply to an already-answered owner message becomes an observation-inbox note instead of a second chat frame), the AC8(c) PATCH-leg test, and two comment/doc corrections (the Pattern Register is LOCAL — there is no `knowledge:patterns` mirror). Carriers synced to 6.114.11. |
 | 6.114.10 | 2026-09-10 | **refactor(queue): extract scheduled-task CRUD into `supervisor/scheduled_tasks.py` (P7 module-size relief).** The six scheduled-task table functions (path/list/write/upsert/remove and the schedule→task builder) move out of `supervisor/queue.py` (1,638 → ~1,541 lines, under the 1,600-line GIANT gate); every historical name stays importable from `supervisor.queue` via re-exports (the `schedule_time.py` precedent), and cross-module calls resolve lazily at call time so the test monkeypatch surface and the process-wide queue lock survive unchanged. Also re-lands the `ouroboros/tools/delegate_integration.py:1206` git-quoted-symlink escape fix (double backslash — kills the recurring SyntaxWarning; the fix was lost in concurrent merge resolution and is recovered from the preserved branch tip). Carriers synced to 6.114.10. |
 | 6.114.9 | 2026-09-09 | **feat(devtools): bulk repository inventory tool (`bulk_inventory`) — one call reports per-pattern file/line coverage (grep -c semantics) across hundreds of files, replacing per-file search_code sweeps (the 818-skill inventory class; backlog ibl-616d8525673b).** Read-only pure-stdlib CLI in `devtools/` with JSON stdout; every skip (binary, oversize, symlink, unreadable, glob filter, walk error) is counted and disclosed — never silent; verified by 16 fixture tests and a real-repo run cross-checked against `grep -rIc` with exact agreement (13 files / 119 lines over `docs/`). Carriers synced to 6.114.9. |
 | 6.114.8 | 2026-09-08 | **fix(chat): BG proactive replies now stamp `sender_identity: "background"` instead of leaking the foreground `"agent"` preset.** C-scheme (6.114.3) gated the background stamp in `owner_delivery.py` with `setdefault`, but `control.py`'s `_send_user_message` presets `sender_identity="agent"`, so a genuine BG reply through `send_user_message` kept the wrong identity and the web renderer showed "Ouroboros" instead of "🧠 Background". The BG role on `ctx.task_metadata` is the single reliable authority, so the gate now FORCES the background identity for BG-role frames; foreground proactive frames keep "agent" and legacy producer frames stay unchanged. Regression tests: `test_background_role_overrides_preset_agent_identity` and `test_non_background_preset_identity_passes_through` in `tests/test_owner_live_delivery.py`. Carriers synced to 6.114.8. |

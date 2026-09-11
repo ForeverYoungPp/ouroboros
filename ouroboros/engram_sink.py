@@ -285,6 +285,14 @@ class EngramSink:
     #: so it must not consume — or be masked by — the unreachable-Engram
     #: disclosure, which records a transport failure.
     _capped_disclosed: bool = field(default=False, init=False, repr=False)
+    #: Same discipline for the GATE refusals (C6's 被过滤 case): a filtered record
+    #: must be visible to an operator, and one line per run is the bound.
+    _filtered_disclosed: bool = field(default=False, init=False, repr=False)
+    #: When this run's counters were last reset (ISO; "" before the first
+    #: ``begin_run``). The capped line counts records emitted EARLIER in the run,
+    #: so without this an operator reading the line at time T looks for them in the
+    #: spool at T, finds nothing, and distrusts a disclosure that is in fact true.
+    _run_reset_at: str = field(default="", init=False, repr=False)
     _ready: bool = field(default=False, init=False, repr=False)
     _ready_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     #: identity -> content fingerprint already emitted this run. Same identity
@@ -306,8 +314,10 @@ class EngramSink:
         it, so that is an extra update, never a duplicate record.
         """
         self._emits = 0
+        self._run_reset_at = _now()
         self._disclosed = False
         self._capped_disclosed = False
+        self._filtered_disclosed = False
         self._seen.clear()
 
     # -- bootstrap (Engram's own recommended flow) ------------------------- #
@@ -382,7 +392,13 @@ class EngramSink:
         except Exception as exc:  # absolutely nothing may escape into a task
             return SinkReceipt(
                 kind=str(kind), spool_id="", status="failed",
-                reason="internal_error", detail=f"{type(exc).__name__}: {exc}",
+                # ``type`` is a PARAMETER of this method (the record's type string),
+                # so the builtin cannot be named here: `type(exc)` called that string
+                # and raised TypeError — the branch that exists to keep a memory
+                # failure from escaping raised instead. ``__class__`` is the same
+                # value without the shadow (renaming the parameter instead would
+                # touch every `emit(..., type=...)` call site).
+                reason="internal_error", detail=f"{exc.__class__.__name__}: {exc}",
             )
 
     def flush(self, *, limit: int = MAX_EMITS_PER_RUN) -> int:
@@ -603,14 +619,55 @@ class EngramSink:
         verdict = _sanitize(entry.get("verdict") or entry.get("status"), 120)
         tid = task_id or str(entry.get("task_id") or "")
         detail = _sanitize(entry.get("summary") or entry.get("reason") or entry.get("detail"))
+        title = _sanitize(f"Review verdict: {verdict or 'unknown'}")
+        content = _sanitize(
+            f"verdict: {verdict or 'unknown'}" + (f" | {detail}" if detail else ""),
+            FIELD_CAP_CHARS * 4,
+        )
+        identity = f"review_verdict:{tid}:{entry.get('attempt') or entry.get('id') or ''}"
+        # Cross-PROCESS damping (see ``_content_already_in_spool``): a pool boot of
+        # N workers each re-mirrors the same verdict, and every one of those upserts
+        # is a visible revision bump on ONE record. The in-run ``_seen`` dedupe
+        # cannot see its siblings' work; the spool can.
+        if self._content_already_in_spool(identity, title, content):
+            return SinkReceipt(
+                "review_verdict", "", "duplicate", reason="content_already_in_spool"
+            )
         return self.emit(
             "review_verdict",
-            title=_sanitize(f"Review verdict: {verdict or 'unknown'}"),
-            content=f"verdict: {verdict or 'unknown'}" + (f" | {detail}" if detail else ""),
-            identity=f"review_verdict:{tid}:{entry.get('attempt') or entry.get('id') or ''}",
+            title=title,
+            content=content,
+            identity=identity,
             type="review_verdict",
             fields={"task_id": tid, "verdict": verdict},
         )
+
+    def _content_already_in_spool(self, identity: str, title: str, content: str) -> bool:
+        """True when this exact (identity, content) is already in the spool.
+
+        Why it exists: ``_seen`` is per-instance and cleared at every run boundary
+        by design, so N workers booting together each emit their own copy of the
+        same record — a pool boot produced ELEVEN identical ``review_verdict``
+        upserts on one record, ``revision_count 36 -> 47``. The spool is the only
+        durable, cross-PROCESS witness of what this drive has already sent, and its
+        rows carry exactly the sanitized title/content an emit would send.
+
+        Deliberately TRANSIENT rather than a remembered "last sent" key: the spool
+        is compacted once idle, so the witness expires. That is the point — the
+        damping is burst-scoped, and a store that LOST the record is re-mirrored by
+        the next emit instead of being suppressed forever by a stale key. Reading
+        is best-effort: any spool problem returns False (emit as before).
+        """
+        key = _fingerprint(title, content)
+        try:
+            for row in _read_spool(self.spool_path):
+                if row.get("op") != "add" or str(row.get("identity") or "") != identity:
+                    continue
+                if _fingerprint(row.get("title") or "", row.get("content") or "") == key:
+                    return True
+        except Exception:
+            return False
+        return False
 
     # -- internals --------------------------------------------------------- #
 
@@ -628,38 +685,62 @@ class EngramSink:
         deferred_merge: bool = False,
     ) -> SinkReceipt:
         if kind not in SINK_KINDS:
+            self._disclose_filtered_once(
+                kind=str(kind), identity=identity, title=title, reason="unknown_kind"
+            )
             return SinkReceipt(kind, "", "rejected", reason="unknown_kind")
         # C18: a work item is not a memory.
         if _looks_like_todo(content) or _looks_like_todo(title):
+            self._disclose_filtered_once(
+                kind=kind, identity=identity, title=title, reason="todo_not_memory"
+            )
             return SinkReceipt(kind, "", "rejected", reason="todo_not_memory")
         safe_fields = {
             k: v for k, v in (fields or {}).items() if k not in _TODO_FIELDS and v not in (None, "")
         }
         if not safe_fields and fields:
+            self._disclose_filtered_once(
+                kind=kind, identity=identity, title=title, reason="todo_only_payload"
+            )
             return SinkReceipt(kind, "", "rejected", reason="todo_only_payload")
+        clean_title = _sanitize(title)
+        clean_content = (
+            _sanitize_document(content) if document else _sanitize(content, FIELD_CAP_CHARS * 4)
+        )
+        if not clean_title or not clean_content:
+            self._disclose_filtered_once(
+                kind=kind, identity=identity, title=title, reason="empty"
+            )
+            return SinkReceipt(kind, "", "rejected", reason="empty")
+
         # C3: per-run cap. A DEFERRED fragment is exempt: its only destination is
         # the spool (it is merged onto the live record at forward time, because the
         # write side could not read that record), so a capped fragment would be
         # dropped outright — while its caller is told the fragment "is spooled and
         # will be merged … nothing was lost". The cap bounds how much memory one run
         # may SEND; it must not be the thing that deletes an append.
+        #
+        # The empty check runs FIRST on purpose: the cap disclosure is written once
+        # per run, so spending it on a record no free slot would have stored either
+        # would waste the one line that names what was actually lost. (Such a record
+        # is disclosed under its own `engram_emit_filtered` event instead.)
+        # Addressed exactly as the record would have been, so the refused identity
+        # an operator greps for is the one the sink stamps (Engram may normalize
+        # the value further on its own side).
+        clean_identity = _sanitize(identity or _fingerprint(kind, clean_title), 200)
+        content_key = _fingerprint(clean_title, clean_content)
         if not deferred_merge and self._emits >= int(self.max_emits):
-            self._disclose_capped_once()
+            # An exact repeat of a record this run already SENT is not lost to the
+            # cap — the store holds it — so it must not spend the run's one line,
+            # which has to name the first record that really was lost.
+            if self._seen.get(clean_identity) != content_key:
+                self._disclose_capped_once(kind=kind, identity=clean_identity, title=clean_title)
             return SinkReceipt(kind, "", "capped", reason="per_run_emit_cap")
-
-        clean_title = _sanitize(title)
-        clean_content = (
-            _sanitize_document(content) if document else _sanitize(content, FIELD_CAP_CHARS * 4)
-        )
-        if not clean_title or not clean_content:
-            return SinkReceipt(kind, "", "rejected", reason="empty")
 
         # In-run dedupe (F2: writing the same thing twice is a failure). The key
         # is identity AND content, not identity alone: C19's second evolution
         # write shares the task_id identity but carries the real verdict, so it
         # must go through as an update. Only an exact repeat is dropped.
-        clean_identity = _sanitize(identity or _fingerprint(kind, clean_title), 200)
-        content_key = _fingerprint(clean_title, clean_content)
         if self._seen.get(clean_identity) == content_key:
             return SinkReceipt(kind, "", "duplicate", reason="identity_and_content_already_emitted")
         self._seen[clean_identity] = content_key
@@ -846,13 +927,69 @@ class EngramSink:
         except Exception:
             pass
 
-    def _disclose_capped_once(self) -> None:
+    def _disclose_filtered_once(
+        self, *, kind: str, identity: str = "", title: str = "", reason: str = ""
+    ) -> None:
+        """Disclose at most ONE gate-refused emit per run, under its own event type.
+
+        C6 names three ways memory degrades without being lost: unreachable,
+        over the cap, and FILTERED. The first two are on the wire; the third is
+        not, because a rejected record does not spool and does not send — and the
+        emitters that discard their receipts (verdicts, dialogue blocks, task
+        narratives, reflection actions) would then leave no trace that the record
+        was seen and refused. The local payload still lands, so the memory is not
+        lost — but an operator asking "did this get filtered?" had nothing to read.
+
+        NOT folded into ``engram_unavailable`` (the record was refused by OUR
+        gate, not by a store that failed) and NOT written to ``logs/events.jsonl``
+        (whose consumers depend on the last event's ordering). Like the capped
+        line, only the FIRST refusal per run is itemised: it names the record the
+        gate refused and why, and later ones are silent — the caller still gets
+        its own ``rejected`` receipt with the same reason.
+        """
+        if self._filtered_disclosed:
+            return
+        self._filtered_disclosed = True
+        try:
+            from ouroboros.utils import append_jsonl
+
+            append_jsonl(
+                pathlib.Path(self.drive_root) / "logs" / "engram.jsonl",
+                {
+                    "ts": _now(),
+                    "type": "engram_emit_filtered",
+                    "reason": _sanitize(reason, 120),
+                    "refused_kind": str(kind or ""),
+                    "refused_identity": _sanitize(
+                        identity or _fingerprint(str(kind or ""), _sanitize(title)), 200
+                    ),
+                    "refused_title": _sanitize(title, 200),
+                    "detail": (
+                        f"this run's first record refused by the memory gate "
+                        f"({_sanitize(reason, 120)}); it was not sent to Engram — "
+                        "further refusals in this run are not itemised"
+                    ),
+                    "spooled": self.pending_count(),
+                },
+            )
+        except Exception:
+            pass
+
+    def _disclose_capped_once(
+        self, *, kind: str = "", identity: str = "", title: str = ""
+    ) -> None:
         """Disclose at most ONE capped emit per run, under its own event type.
 
         A cap is not an outage, so it gets its own flag and its own ``type``: folding
         it into ``engram_unavailable`` would both report a healthy store as
         unreachable and let a cap swallow the transport notice the two consumers of
         that channel actually need.
+
+        The FIRST refusal is also the most informative one, so it names the record:
+        "the cap was reached" says nothing an operator can act on, while
+        ``kind``/``identity`` say which memory was not stored. Later refusals in the
+        same run are silent (the cap is per run, and one line already tells the
+        story) — the caller still gets its own ``capped`` receipt.
         """
         if self._capped_disclosed:
             return
@@ -866,10 +1003,20 @@ class EngramSink:
                     "ts": _now(),
                     "type": "engram_emit_capped",
                     "cap": int(self.max_emits),
+                    "refused_kind": str(kind or ""),
+                    "refused_identity": _sanitize(identity, 200),
+                    "refused_title": _sanitize(title, 200),
                     "detail": (
-                        f"this run emitted its cap of {int(self.max_emits)} memory "
-                        "records; further records were refused, not spooled"
+                        f"this run has already emitted its cap of {int(self.max_emits)} memory "
+                        "records; further records are refused, not spooled — starting "
+                        "with the one named above"
                     ),
+                    # The counter is at (or over) the cap and the 20 it counts were
+                    # emitted EARLIER in this run — these two fields are what let an
+                    # operator find them in the spool instead of reading the line as
+                    # a claim about the moment it was written.
+                    "run_emits": int(self._emits),
+                    "run_reset_at": str(self._run_reset_at or ""),
                     "spooled": self.pending_count(),
                 },
             )

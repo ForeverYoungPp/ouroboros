@@ -176,6 +176,63 @@ def test_todo_only_field_payload_is_rejected(stub, tmp_path):
     assert receipt.status == "rejected" and receipt.reason == "todo_only_payload"
 
 
+def test_a_filtered_emit_is_disclosed_once_naming_the_record(stub, tmp_path):
+    """C6's third degradation — 被过滤 — had no channel at all.
+
+    Unreachable and over-cap both disclose; a record refused by the GATE (C18: a
+    work item is not a memory) spools nothing and sends nothing, so its receipt
+    was the only trace — and the emitters that discard receipts (verdicts,
+    dialogue blocks, task narratives, reflection actions) left none. The local
+    payload still lands, so nothing was lost, but "did this get filtered?" has to
+    be answerable from the log, and it has to name WHICH record.
+    """
+    state, url = stub
+    sink = _sink(tmp_path, url)
+    receipt = sink.emit("memory_action", title="next", content="下一步：把 gate 修了")
+    assert receipt.status == "rejected" and receipt.reason == "todo_not_memory"
+    assert _saved(state) == [] and sink.pending() == []
+
+    rows = [row for row in _events(tmp_path) if row["type"] == "engram_emit_filtered"]
+    assert len(rows) == 1, "the C18 refusal was silent"
+    assert rows[0]["reason"] == "todo_not_memory"
+    assert rows[0]["refused_kind"] == "memory_action"
+    assert rows[0]["refused_title"] == "next"
+
+    # Bounded: the FIRST refusal of the run is itemised, later ones are not.
+    sink.emit("memory_action", title="another", content="TODO: rotate the token")
+    sink.emit("memory_action", title="third", content="Action items: ship it")
+    assert len([row for row in _events(tmp_path) if row["type"] == "engram_emit_filtered"]) == 1
+
+
+def test_a_new_run_re_arms_the_filtered_disclosure(stub, tmp_path):
+    """Once per RUN, not once per process: the next run can filter something new,
+    and its own first refusal is what an operator needs named."""
+    state, url = stub
+    sink = _sink(tmp_path, url)
+    sink.emit("memory_action", title="first", content="TODO: rotate the token")
+    assert len([row for row in _events(tmp_path) if row["type"] == "engram_emit_filtered"]) == 1
+
+    sink.begin_run()
+    sink.emit("memory_action", title="second", content="待办：再跑一次 suite")
+
+    rows = [row for row in _events(tmp_path) if row["type"] == "engram_emit_filtered"]
+    assert len(rows) == 2
+    assert rows[1]["refused_title"] == "second"
+
+
+def test_the_filtered_disclosure_never_lands_in_the_events_log(stub, tmp_path):
+    """C6: the order-sensitive log has consumers of its last event, so a
+    disclosure appended there would evict what they read. An unknown `kind` is a
+    gate refusal too, and it is disclosed the same way."""
+    state, url = stub
+    sink = _sink(tmp_path, url)
+    assert sink.emit("not_a_kind", title="t", content="c").reason == "unknown_kind"
+
+    events = tmp_path / "logs" / "events.jsonl"
+    assert not events.exists() or "engram_emit_filtered" not in events.read_text(encoding="utf-8")
+    assert [row for row in _events(tmp_path) if row["type"] == "engram_emit_filtered"]
+
+
 def test_proposed_next_step_is_not_forwarded_on_a_real_memory(stub, tmp_path):
     """C18: the field is dropped, the memory still lands."""
     state, url = stub
@@ -287,6 +344,7 @@ def test_a_capped_emit_is_disclosed_under_its_own_event_type(stub, tmp_path):
     """
     state, url = stub
     sink = _sink(tmp_path, url)
+    sink.begin_run()  # a run boundary: records WHEN this run's counters started
     sink.max_emits = 1
     sink.emit("memory_action", title="a", content="first")
     assert sink.emit("memory_action", title="b", content="second").status == "capped"
@@ -295,9 +353,75 @@ def test_a_capped_emit_is_disclosed_under_its_own_event_type(stub, tmp_path):
     rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert [row["type"] for row in rows] == ["engram_emit_capped"]
 
+    # "The cap was reached" is not actionable; the refused record must be named.
+    assert rows[0]["refused_kind"] == "memory_action"
+    assert rows[0]["refused_title"] == "b"
+
+    # The count belongs to the RUN, not to the instant the line was written: the
+    # tense says so, and the two fields let an operator locate the emissions.
+    assert rows[0]["detail"].startswith(
+        "this run has already emitted its cap of 1 memory records"
+    )
+    assert rows[0]["run_emits"] == 1  # the counter at the refusal (>= cap)
+    assert rows[0]["run_reset_at"] == sink._run_reset_at  # the run's own start time
+    assert rows[0]["run_reset_at"].strip()  # never empty once a run has begun
+
     # Disclosed ONCE per run, not once per refused record.
     sink.emit("memory_action", title="c", content="third")
     assert len([line for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]) == 1
+
+
+def test_an_unstorable_emit_does_not_spend_the_cap_disclosure(stub, tmp_path):
+    """An empty record was never storable, so the cap is not its real cause and the
+    run's single cap line must not be spent naming it (it gets its own filtered
+    line instead)."""
+    state, url = stub
+    sink = _sink(tmp_path, url)
+    sink.max_emits = 1
+    sink.emit("memory_action", title="stored", content="the one that landed")
+
+    assert sink.emit("memory_action", title="", content="").reason == "empty"
+
+    assert not [row for row in _events(tmp_path) if row["type"] == "engram_emit_capped"]
+
+    assert sink.emit("memory_action", title="real", content="a memory worth naming").status == "capped"
+    capped = [row for row in _events(tmp_path) if row["type"] == "engram_emit_capped"]
+    assert capped[0]["refused_title"] == "real"
+
+
+def test_an_exact_repeat_does_not_spend_the_cap_disclosure(stub, tmp_path):
+    """The cap names the first record that was actually LOST. An exact repeat of
+    something this run already sent is not lost — the store holds it — so it must
+    not consume the run's one line, or the operator greps an address that IS
+    present and never learns which record the cap really dropped."""
+    state, url = stub
+    sink = _sink(tmp_path, url)
+    sink.max_emits = 1
+    sink.emit("memory_action", title="stored", content="the one that landed")
+
+    # Same title AND content ⇒ same identity and same content key: a repeat.
+    assert sink.emit("memory_action", title="stored", content="the one that landed").status == "capped"
+    assert not [row for row in _events(tmp_path) if row["type"] == "engram_emit_capped"]
+
+    assert sink.emit("memory_action", title="real", content="a memory worth naming").status == "capped"
+    capped = [row for row in _events(tmp_path) if row["type"] == "engram_emit_capped"]
+    assert len(capped) == 1
+    assert capped[0]["refused_title"] == "real"
+
+
+def test_a_multiline_identity_is_disclosed_as_the_sink_stamps_it(stub, tmp_path):
+    """The disclosed address must be the address the SINK stamps (Engram may
+    normalize it further on its own side), or an operator grepping for it misses
+    the record."""
+    state, url = stub
+    sink = _sink(tmp_path, url)
+    sink.max_emits = 0
+
+    sink.emit("memory_action", title="t", content="c", identity="knowledge:auth\n\ntokens")
+
+    capped = [row for row in _events(tmp_path) if row["type"] == "engram_emit_capped"]
+    assert len(capped) == 1
+    assert capped[0]["refused_identity"] == "knowledge:auth tokens"
 
 
 def test_a_deferred_fragment_is_exempt_from_the_cap(stub, tmp_path):
@@ -402,6 +526,26 @@ def test_sink_never_raises_on_garbage_input(tmp_path):
     for bad in (None, 123, {"weird": object()}):
         receipt = sink.emit_memory_action(bad, task_id="t")  # type: ignore[arg-type]
         assert receipt.status in {"sent", "spooled", "rejected", "capped", "failed"}
+
+
+def test_emit_returns_its_receipt_when_its_own_body_raises(stub, tmp_path):
+    """C6/F1: the guard branch must yield ITS receipt, not a second TypeError.
+
+    ``emit``'s except formats the failure with the builtin ``type`` — but ``type``
+    is a PARAMETER of ``emit`` (the record's type string), so ``type(exc)`` called a
+    str: the branch that exists to keep a memory failure from escaping raised
+    instead. Forced with an internal failure (a non-int cap) that hits the branch
+    before any spool write, so nothing is left behind either way.
+    """
+    state, url = stub
+    sink = _sink(tmp_path, url)
+    sink.max_emits = "not-an-int"
+
+    receipt = sink.emit("memory_action", title="t", content="a durable fact")
+
+    assert receipt.status == "failed" and receipt.reason == "internal_error"
+    assert "ValueError" in receipt.detail, receipt.detail  # the REAL cause, not a TypeError
+    assert _saved(state) == [] and sink.pending() == []
 
 
 # --------------------------------------------------------------------------- #
@@ -856,6 +1000,48 @@ def test_compaction_leaves_nothing_pending_and_keeps_the_bytes_sane(stub, tmp_pa
     assert sink.pending_count() == 0
 
 
+def test_a_pool_boot_does_not_re_upsert_an_unchanged_verdict(stub, tmp_path):
+    """A worker-pool boot mirrors the same verdict once per PROCESS.
+
+    Observed live: ten boots inside 65 ms each ran the boot check → the verdict
+    mirror → one identical ``review_verdict:<tid>:1`` POST each, collapsing
+    server-side into ONE record whose ``revision_count`` grew 36 -> 47. ``_seen``
+    cannot see its siblings (per instance, cleared at every run boundary); the
+    spool — the same drive, the same file — can.
+    """
+    state, url = stub
+    row = {"verdict": "blocked", "task_id": "T1", "attempt": 1, "summary": "gate"}
+
+    first = _sink(tmp_path, url)                      # process 1
+    assert first.emit_review_verdict(row, task_id="T1").status == "sent"
+
+    second = _sink(tmp_path, url)                     # a DIFFERENT process, same drive
+    receipt = second.emit_review_verdict(row, task_id="T1")
+
+    assert receipt.status == "duplicate", receipt
+    assert receipt.reason == "content_already_in_spool"
+    assert len(_saved(state)) == 1, "a pool boot re-upserted an unchanged verdict"
+
+
+def test_a_changed_verdict_is_still_emitted_from_a_fresh_process(stub, tmp_path):
+    """The damping must not swallow a real update.
+
+    Same identity, different content is the C21 update path — only an EXACT repeat
+    is damped, so the record layer's identity-keyed upsert semantics are untouched.
+    """
+    state, url = stub
+    first = _sink(tmp_path, url)
+    first.emit_review_verdict({"verdict": "blocked", "task_id": "T2", "attempt": 1}, task_id="T2")
+
+    second = _sink(tmp_path, url)
+    receipt = second.emit_review_verdict(
+        {"verdict": "approved", "task_id": "T2", "attempt": 1}, task_id="T2"
+    )
+
+    assert receipt.status == "sent", receipt
+    assert len(_saved(state)) == 2
+
+
 def test_the_suite_cannot_reach_a_live_engram_service(tmp_path):
     """The autouse guard is the only thing between this suite and a real store.
 
@@ -925,3 +1111,57 @@ def test_the_guard_survives_a_tests_monkeypatch_undo(monkeypatch):
         "talk to the operator's live service"
     )
     assert not after.endswith(":7437")
+
+
+def test_a_cycle_boundary_resets_the_emit_budget(tmp_path):
+    """The per-run cap must not decay into a per-process quota.
+
+    A long-lived lane (the background loop, the consolidator's knowledge context)
+    never crosses ``agent.py``'s task boundary, so without a cycle-time reset the
+    20 slots are spent once and every later write is refused BEFORE the spool —
+    the observed live starvation: ``knowledge:infrastructure_gates`` refused at
+    19:34 while the store held no such record.
+
+    The sink comes from the REAL cache (``sink_for``), because that registry is
+    what ``begin_engram_run`` walks — a hand-built sink would prove nothing about
+    the production seam. Its transport is the suite's guarded one, so a genuine
+    emit reads ``spooled`` here and the assertion is the cap, not the wire.
+    """
+    from ouroboros.consciousness import BackgroundConsciousness
+    from ouroboros.engram_sink import reset_sinks, sink_for
+
+    reset_sinks()
+    try:
+        sink = sink_for(tmp_path)
+        sink.max_emits = 1
+        first = sink.emit("memory_action", title="a", content="first")
+        second = sink.emit("memory_action", title="b", content="second")
+        assert first.status in ("sent", "spooled")  # a real slot
+        assert second.status == "capped"  # the run's only slot is spent
+
+        BackgroundConsciousness._begin_cycle_emit_budget()
+
+        # A NEW cycle gets a NEW budget: a genuine write is no longer starved for
+        # the life of the process.
+        third = sink.emit("memory_action", title="c", content="third")
+        assert third.status in ("sent", "spooled"), third
+    finally:
+        reset_sinks()
+
+
+def test_both_reset_less_lanes_call_the_cycle_boundary():
+    """Literal-drift pin: a boundary nobody calls fixes nothing.
+
+    There is no cheap behavioural driver for a full BG cycle or a consolidation
+    run (both need an LLM and a store), so the wiring is pinned at the source —
+    the same discipline as the sender-identity literal pin.
+    """
+    import inspect
+
+    from ouroboros import consolidator
+    from ouroboros.consciousness import BackgroundConsciousness
+
+    assert "_begin_cycle_emit_budget()" in inspect.getsource(
+        BackgroundConsciousness._think_scoped
+    )
+    assert "begin_engram_run(" in inspect.getsource(consolidator.consolidate)

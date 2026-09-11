@@ -168,8 +168,12 @@ def test_read_returns_exactly_one_record(stub):
     out = engram_tool._engram(ctx, op="read", observation_id=7)
     assert "the full body" in out
     assert "[7] (decision) the one" in out
-    # One read ⇒ exactly one observation fetch.
-    assert [r["path"] for r in state.requests] == ["/observations/7"]
+    # The whole sequence, not just the observation fetch: an HTTP sequence is this
+    # integration's contract, and a filtered count would stop detecting an extra
+    # re-resolution, a duplicated session bootstrap, or a stray fan-out.
+    # This stub is GET-only, so the session bootstrap is not part of its surface:
+    # the resolver call plus exactly one observation fetch is the whole sequence.
+    assert [r["path"] for r in state.requests] == ["/project/current", "/observations/7"]
 
 
 def test_read_truncates_a_huge_record(stub):
@@ -241,3 +245,35 @@ def test_tool_schema_is_advertised():
     schema = entries["engram"].schema
     assert schema["parameters"]["properties"]["op"]["enum"] == ["search", "timeline", "read"]
     assert "engram" in json.dumps(schema["description"]).lower()
+
+
+# --------------------------------------------------------------------------- #
+# operator overrides — the tool honours the SAME set as the write sink
+# --------------------------------------------------------------------------- #
+def test_engram_project_env_override_pins_the_tool(stub, monkeypatch):
+    """An operator who pins the scope via ENGRAM_PROJECT (the container shape:
+    no local .engram/) must get tool READS in the same project as writes —
+    not a silent split where the tool reads the repo basename."""
+    monkeypatch.setenv("ENGRAM_PROJECT", "pinned-scope")
+    state, ctx = stub
+    engram_tool._engram(ctx, op="search", query="x")
+    assert state.requests[-1]["params"]["project"] == "pinned-scope"
+
+
+def test_without_override_the_tool_resolves_the_repo_basename(stub):
+    """No override: the offline resolution (repo basename) stands, matching
+    the write path's offline-first resolution for the same repo."""
+    state, ctx = stub
+    engram_tool._engram(ctx, op="search", query="x")
+    assert state.requests[-1]["params"]["project"] == "ouroboros"
+
+
+def test_an_unresolvable_project_refuses_config_not_a_bare_404(stub, monkeypatch):
+    """Fail-closed reads: a blank/forbidden offline scope is a CONFIGURATION
+    fact (typed refusal), never a wire request against project "_unresolved"
+    that comes back as a 404 and reads as "no memory"."""
+    monkeypatch.setenv("ENGRAM_PROJECT", "local")  # forbidden name in ENGRAM's own registry
+    state, ctx = stub
+    out = engram_tool._engram(ctx, op="search", query="x")
+    assert out.startswith("ENGRAM NOT CONFIGURED")
+    assert all(r["path"] != "/search" for r in state.requests)

@@ -288,6 +288,19 @@ _ENGRAM_ENV_KNOBS = ("ENGRAM_BASE_URL", "ENGRAM_PORT", "ENGRAM_PROJECT", "ENGRAM
 
 
 @pytest.fixture(autouse=True)
+def _reset_engram_read_cache():
+    """The read-through cache is process-scoped, like the sinks and the turn
+    budgets: a previous test's warmed entry must not answer the next test."""
+    from ouroboros.engram_cache import reset_cache
+
+    reset_cache()
+    try:
+        yield
+    finally:
+        reset_cache()
+
+
+@pytest.fixture(autouse=True)
 def _never_touch_a_live_engram_service():
     """Point Engram at a dead port unless a test opts into a stub.
 
@@ -687,6 +700,18 @@ def _engram_stub_handler(state):
                 params = parse_qs(parsed.query)
                 needle = str(params.get("q", [""])[0]).lower()
                 wanted_type = str(params.get("type", [""])[0])
+                # Engram builds a DIFFERENT expression per match_mode: the default
+                # quotes the whole query (``sanitizeFTS``), while any-mode joins the
+                # surviving FIELDS (``sanitizeFTSCandidates`` -> ``candidateTerms``),
+                # which drops a field that is empty once quotes are trimmed. A
+                # quote-only query therefore becomes an EMPTY match expression under
+                # any-mode, ``MATCH ''`` raises, and server.go answers 500 — which
+                # the read layer types as ``unavailable``. A single-token query is
+                # the same expression either way (pinned by Engram's own
+                # TestSearchMatchMode_SingleToken).
+                mode = str(params.get("match_mode", [""])[0])
+                if mode and not [field for field in needle.split() if field.strip("\"'")]:
+                    return self._down()
                 body = [
                     (dict(rec) if state.search_returns_content else {
                         k: v for k, v in rec.items() if k != "content"

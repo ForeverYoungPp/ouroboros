@@ -133,6 +133,20 @@ def consolidate(
             log.info("Chat block consolidation already running, skipping")
             return None
 
+        # A consolidation cycle IS one emit run (see
+        # BackgroundConsciousness._begin_cycle_emit_budget for the incident and the
+        # doctrine): the knowledge context this cycle writes through is a
+        # bare-drive sink whose C3 counter is otherwise never reset in this
+        # process, so a quota spent by an earlier cycle would refuse every later
+        # cycle's knowledge write BEFORE the spool. Reset only once the lock is
+        # held, so a skipped duplicate run cannot hand away another run's budget.
+        try:
+            from ouroboros.engram_sink import begin_engram_run
+
+            begin_engram_run(None)
+        except Exception:
+            log.debug("consolidation: emit budget reset failed", exc_info=True)
+
         return _run_block_consolidation(
             source_path=chat_path,
             blocks_path=blocks_path,

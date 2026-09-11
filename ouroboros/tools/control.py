@@ -2180,7 +2180,10 @@ def _update_scratchpad(ctx: ToolContext, content: str) -> str:
             "This likely means the tool call was malformed — check your arguments."
         )
     from ouroboros.memory import Memory
-    mem = Memory(drive_root=ctx.drive_root)
+    # Carry the repo root: without it ``sink_for`` falls back to the drive's own
+    # directory name and this block lands in a DIFFERENT Engram project than the
+    # identity mirror written by the same turn (F7 — one system, one project).
+    mem = Memory(drive_root=ctx.drive_root, repo_dir=getattr(ctx, "repo_dir", None) or ctx.drive_root)
     mem.ensure_files()
     try:
         block = mem.append_scratchpad_block(
@@ -2239,6 +2242,11 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "") -> str:
     })
     if mode == "live":
         return "OK: message sent to owner chat."
+    if mode == "noted":
+        return (
+            "OK: the owner chat already carries a foreground answer to this message — "
+            "kept as a background note in the observation inbox, not sent as a second chat frame."
+        )
     return "OK: message queued for delivery."
 
 
@@ -2271,6 +2279,40 @@ def _update_identity(ctx: ToolContext, content: str) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
+    # The additive remote half (S1), AFTER the local write: the local file is the
+    # source of truth, so the mirror is a follow-up that can never gate it.
+    # Identity was the one memory with NO Engram copy at all — the local file was
+    # its only home, so a lost drive lost the self. The key is NAMESPACED (every
+    # other sink identity is prefixed) because a reflection-nominated
+    # memory_action with topic "identity" would otherwise upsert straight over the
+    # manifest. Never raises and never changes the tool's result (C6): a
+    # to-do-shaped identity is CORRECTLY refused by the C18 gate.
+    mirror = "not_attempted"
+    try:
+        from ouroboros.engram_sink import sink_for
+
+        receipt = sink_for(ctx).emit(
+            "memory_action",
+            title="Identity",
+            content=content,
+            identity="identity:manifest",
+            type="identity",
+            scope="global",
+            document=True,
+            fields={"task_id": str(getattr(ctx, "task_id", "") or "")},
+        )
+        # A refusal (C18) or a per-run cap returns BEFORE the spool append, so the
+        # outcome is recorded in the local journal: otherwise a dropped mirror is
+        # indistinguishable from a delivered one.
+        mirror = (
+            f"sent:{receipt.status}"
+            if receipt.accepted
+            else f"refused:{receipt.reason or receipt.status}"
+        )
+    except Exception as exc:
+        mirror = f"failed:{type(exc).__name__}"
+        log.debug("Identity Engram mirror failed", exc_info=True)
+
     append_jsonl(mem.identity_journal_path(), {
         "ts": utc_now_iso(),
         "task_id": str(getattr(ctx, "task_id", "") or ""),
@@ -2283,6 +2325,7 @@ def _update_identity(ctx: ToolContext, content: str) -> str:
         "new_content": content,
         "old_preview": old_content[:500],
         "new_preview": content[:500],
+        "engram_mirror": mirror,
     })
 
     result = f"OK: identity updated ({len(content)} chars)"

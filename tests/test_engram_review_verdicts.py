@@ -222,3 +222,18 @@ def test_the_local_ledger_still_wins_when_it_has_something(scaffold):
     assert "## Advisory Pre-Review Status" in text
     assert "local ledger row" in text
     assert "## Review verdicts (Engram" not in text
+
+
+def test_an_unresolvable_scope_is_not_rendered_as_no_verdicts(scaffold, monkeypatch):
+    """`client_for` fails closed on an unresolvable project. The verdict seam
+    must map that to the UNKNOWN-family disclosure, not the blank that reads
+    as "no verdicts ever recorded"."""
+    monkeypatch.setenv("ENGRAM_PROJECT", "local")  # forbidden name
+    from ouroboros.engram_sink import reset_sinks
+
+    reset_sinks()
+    state, env, _mem = scaffold
+    section = _engram_verdict_section(env)
+    assert "UNKNOWN" in section
+    assert "not absent" in section
+    reset_sinks()

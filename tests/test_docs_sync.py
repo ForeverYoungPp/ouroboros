@@ -256,7 +256,7 @@ def test_no_new_module_ships_without_an_architecture_entry():
 
 def test_the_engram_subsystem_is_documented_where_its_readers_will_look():
     arch = _read("docs/ARCHITECTURE.md")
-    for module in ("engram_client.py", "engram_sink.py", "engram_read.py", "engram_conflicts.py"):
+    for module in ("engram_client.py", "engram_sink.py", "engram_read.py", "engram_cache.py", "engram_conflicts.py"):
         assert module in arch, f"{module} has no architecture entry"
     assert "#### Engram — the external durable memory store" in arch
     # Its non-obvious decisions are the reason it earns an entry.

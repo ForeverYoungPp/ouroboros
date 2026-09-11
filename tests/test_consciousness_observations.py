@@ -408,3 +408,22 @@ def test_restart_replays_unacknowledged_observation_by_id(tmp_path):
     bc.inject_observation("survive", observation_id="restart-id")
     restarted, _ = _make(tmp_path)
     assert [row["id"] for row in restarted._snapshot_pending_observations()] == ["restart-id"]
+
+
+def test_the_instance_writer_lock_shares_the_module_level_lockfile(tmp_path):
+    """ONE lock implementation for the observation store.
+
+    ``inject_observation`` (the instance path) and the module-level seam used by
+    producers that hold no instance handle must contend for the SAME sidecar
+    file — a divergent lock path would admit two writers to the same JSONL.
+    """
+    from ouroboros.consciousness import observation_writer_lock
+    from ouroboros.utils import jsonl_append_lock_path
+
+    bc, _ = _make(tmp_path)
+    store = bc._observation_store_path()
+    with observation_writer_lock(store) as held:
+        assert held is True
+        assert jsonl_append_lock_path(store).exists()
+        with bc._observation_writer_lock(store) as inner:
+            assert inner is False

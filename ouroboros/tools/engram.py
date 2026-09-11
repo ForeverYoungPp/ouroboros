@@ -113,20 +113,28 @@ def _budget_refusal(ctx: Any, *, op: str) -> str:
 
 
 def _client(ctx: Any):
-    """Build a repo-pinned client from the tool context.
+    """The write sink's client, not a parallel construction.
 
-    Honours the same operator overrides as the write path (``ENGRAM_BASE_URL`` /
-    ``ENGRAM_HTTP_TOKEN``) so reads and writes can never disagree about which
-    service or project they are talking to.
+    Resolution parity is the whole point: the write side resolves the project
+    through THREE defenses the tool must not skip if reads and writes are to
+    never disagree — an explicit ``ENGRAM_PROJECT`` override, a drive-local
+    ``.engram/config.json`` pin (an operator who pins the drive means it for
+    every consumer of that drive), and the server's own ``/project/current``
+    answer. Building a client here from ``repo_dir`` alone pretended the
+    basename was enough; the container shape (no local pin anywhere) is exactly
+    where that split reads project "repo" while writes land in "ouroboros".
+
+    ``client_for`` accepts an env/ctx-shaped object (``drive_root`` or
+    ``REPO_DIR`` spellings) and makes the sink ready so the project-scoped routes
+    do not 404 on a store that does not yet know the project. It raises
+    ``EngramConfigError`` when the scope cannot be resolved (a blank or forbidden
+    project name), so every caller must carry the typed not-configured branch —
+    ``_engram`` returns its ``ENGRAM NOT CONFIGURED`` notice — rather than letting
+    the raise escape into a task.
     """
-    from ouroboros.engram_client import EngramClient, env_base_url, env_token
+    from ouroboros.engram_read import client_for
 
-    repo_root = getattr(ctx, "repo_dir", None) or getattr(ctx, "drive_root", None)
-    overrides: Dict[str, Any] = {"token": env_token()}
-    base = env_base_url()
-    if base:
-        overrides["base_url"] = base
-    return EngramClient.from_repo(repo_root, **overrides)
+    return client_for(ctx)
 
 
 def _unavailable(result: Any) -> str:
@@ -211,7 +219,18 @@ def _engram(
             after=max(0, min(int(after or 5), 10)),
         )
         if not result.ok:
-            return _unavailable(result)
+            if getattr(result, "unavailable", False):
+                return _unavailable(result)
+            # Not a transport failure: name the project this client asked IN and the
+            # route that can still reach the record, so the reader never has to guess
+            # whether the id or the scope was wrong.
+            return (
+                f"ENGRAM TIMELINE MISS — observation {int(observation_id)} is not in project "
+                f"{client.config.project!r} (status={getattr(result, 'status', None)}): "
+                f"{str(getattr(result, 'detail', '') or '')[:200]} "
+                "Re-find it with op='search' (a search can match records outside this project), "
+                "then op='read' the id it returns."
+            )
         items = result.items()
         if not items:
             return f"No timeline around observation {observation_id}."

@@ -32,13 +32,13 @@ from ouroboros.context_fit import (
     estimate_context_prompt_tokens as estimate_context_prompt_tokens,
 )
 from ouroboros.context_health import (
+    _STRAY_PROBE_CACHE as _STRAY_PROBE_CACHE,
+)
+from ouroboros.context_health import (
     _compute_cache_hit_rate as _compute_cache_hit_rate,
 )
 from ouroboros.context_health import (
     _iter_recent_jsonl as _iter_recent_jsonl,
-)
-from ouroboros.context_health import (
-    _STRAY_PROBE_CACHE as _STRAY_PROBE_CACHE,
 )
 from ouroboros.context_health import (
     _stray_server_note as _stray_server_note,
@@ -949,7 +949,10 @@ def build_knowledge_sections(
     return sections
 
 
-def build_governance_sections(env: Any, *, warn_large: bool = False, warn_label: str = "context") -> List[str]:
+def build_governance_sections(
+    env: Any, *, warn_large: bool = False, warn_label: str = "context",
+    context_mode: str = "",
+) -> List[str]:
     sections: List[str] = []
     bible_text = safe_read(env.repo_path("BIBLE.md"))
     if bible_text:
@@ -957,7 +960,12 @@ def build_governance_sections(env: Any, *, warn_large: bool = False, warn_label:
             log.warning("%s: BIBLE.md is large (%d chars)", warn_label, len(bible_text))
         sections.append("## BIBLE.md\n\n" + bible_text)
     # ARCHITECTURE: full in max, navigation map in low (context_layout SSOT).
-    arch_section = architecture_context_section(env, context_mode=get_context_mode())
+    # ``context_mode`` lets one caller request the cheap projection for a SINGLE
+    # build — the task-local Low a caller falls back to on confirmed overflow —
+    # without mutating the owner's global selection.
+    arch_section = architecture_context_section(
+        env, context_mode=context_mode or get_context_mode()
+    )
     if arch_section:
         sections.append(arch_section)
     else:
@@ -970,6 +978,15 @@ MAX_RECALL_ITEMS = 5
 #: Largest rendered recall section. The section it replaces had NO budget and
 #: reached 30,344 chars; a replacement without a bound would repeat that.
 DIALOGUE_RECALL_BUDGET_CHARS = 2_000
+#: When a section carries BOTH halves (query hits + newest summaries), each half
+#: gets this much of the budget, minus the two sub-headings that separate them.
+#: Split rather than shared, so a long hit list cannot squeeze the continuity
+#: block out of the section that exists to anchor it.
+_RECALL_HALF_BUDGET_CHARS = (DIALOGUE_RECALL_BUDGET_CHARS - 90) // 2
+#: The sub-headings a two-half section renders. The reader must be able to tell
+#: "matched what I asked" from "happened lately" without guessing.
+_RECALL_MATCHED_HEADING = "### Matched this query\n"
+_RECALL_NEWEST_HEADING = "### Newest remembered (continuity)\n"
 
 _SECTION_BUDGETS = {"scratchpad": SCRATCHPAD_SECTION_BUDGET_CHARS, "identity": 80_000, "registry": 30_000, "world": 16_000, "dialogue_recall": DIALOGUE_RECALL_BUDGET_CHARS}
 
@@ -1020,41 +1037,149 @@ def _engram_recall_section(memory: Memory, query: str = "") -> str:
 
     Fills the seam `## Dialogue History` occupied, with its content now living in
     Engram: fetched per turn instead of billed to every prompt in full. Two
-    properties matter and pull in opposite directions, so the shape is
-    "relevance first, recency as the fallback":
+    properties matter and pull in opposite directions, so the section carries
+    BOTH instead of trading one for the other:
 
-    * RELEVANCE - what the owner just said is the natural query, and it is what
-      makes the section worth its bytes. Engram's search is the retrieval.
+    * RELEVANCE - what the owner just said (for a wake-up, the newest pending
+      observation) is the retrieval query, and the hits for it are what make the
+      section worth its bytes. Engram's search is the retrieval, and it runs with
+      ``match_mode="any"``: under the server's default (FTS5 AND) a
+      natural-language query only matches a record holding EVERY one of its
+      tokens, so multi-word recall came back empty and the seam silently
+      answered with recency instead.
     * CONTINUITY - the section it replaces was an unconditional narrative of
-      "what has been happening", not a keyword hit list. When the query matches
-      nothing (a fresh store, an unusual phrasing), the NEWEST blocks are shown
-      instead, so the agent still knows where it left off.
+      "what has been happening", not a keyword hit list. OR matching makes a
+      non-empty hit set the NORMAL outcome of a natural-language query, so hits
+      alone would quietly displace that narrative with keyword overlap. A
+      MULTI-WORD query therefore renders the newest summaries under their own
+      sub-heading beside the hits, inside the same budget, split between them. A
+      ONE-WORD query is exact under either match mode (OR and AND agree on a
+      single token), so it renders exactly the hits, as it always did; a query
+      that genuinely matches nothing still renders the newest blocks alone.
 
     Layer 1 only: one title line per hit, never a body. Bodies are what the
     `engram` tool is for, and shipping them here is how the removed 30 KB would
     come straight back.
     """
-    try:
-        from ouroboros.engram_read import client_for, digest, search_titles
+    from ouroboros.engram_cache import cached_read
+    from ouroboros.engram_client import EngramConfigError
+    from ouroboros.engram_read import MachineRead, client_for, digest, search_titles
 
+    body = ""
+    status = "empty"
+    detail = ""
+    try:
         client = client_for(memory)
-        body = ""
-        status = "empty"
-        if str(query or "").strip():
+
+        def _newest(max_chars: int) -> Any:
+            # Small window on purpose: the recency read carries full bodies, so a
+            # 50-record pull to render 5 titles is pure over-fetch.
+            return digest(
+                client,
+                limit=MAX_RECALL_ITEMS,
+                max_chars=max_chars,
+                window=MAX_RECALL_ITEMS,
+            )
+
+        def _fetch() -> Any:
+            text = str(query or "").strip()
+            # A query with no alphanumeric character carries no keyword to retrieve
+            # on, and Engram's expression builders cannot represent it: under the
+            # default mode the WHOLE query is quoted, so `'" "'` becomes a
+            # multi-phrase expression whose production parsing is unverified, and
+            # under any-mode the empty fields are dropped, which the engine rejects
+            # (SQL error -> HTTP 500 -> typed `unavailable`, i.e. a healthy store
+            # reported as unreachable). Not sending the request avoids depending on
+            # either — the recency branch is the honest answer for a query with
+            # nothing to match. This also covers the single-token spellings, and it
+            # is provably sufficient: if ANY field holds an alphanumeric character,
+            # that field survives any-mode's quote-trim, so a real query can never
+            # fall into the empty-expression case.
+            if not text or not any(ch.isalnum() for ch in text):
+                return _newest(DIALOGUE_RECALL_BUDGET_CHARS)
+            # A one-word query renders exactly what it rendered before the
+            # continuity half existed — same request, same byte budget — because
+            # OR and AND agree on a single token, so there is nothing here to
+            # disambiguate. Only a multi-word query (the natural-language owner
+            # message, the wake-up's observation payload) splits the budget.
+            carry_newest = len(text.split()) > 1
             found = search_titles(
-                client, str(query), type_name="dialogue_summary", limit=MAX_RECALL_ITEMS
+                client,
+                text,
+                type_name="dialogue_summary",
+                limit=MAX_RECALL_ITEMS,
+                max_chars=(
+                    _RECALL_HALF_BUDGET_CHARS if carry_newest
+                    else DIALOGUE_RECALL_BUDGET_CHARS
+                ),
+                # "any": a natural-language question shares only SOME words with
+                # the memory that answers it, and under Engram's default (FTS5
+                # AND) it can only match a block containing every token, so it
+                # returned nothing and the seam always fell through to recency.
+                # `carry_newest` above decides when asking for it is safe.
+                match_mode="any" if carry_newest else "",
             )
-            status, body = found.status, found.text
-        # Only a genuine "nothing matched" justifies the recency fallback. A
-        # refusal or an outage must keep its own status: falling back would
-        # overwrite it with "empty" and tell the reader there is no history.
-        if not body.strip() and status == "empty":
-            fallback = digest(
-                client, limit=MAX_RECALL_ITEMS, max_chars=DIALOGUE_RECALL_BUDGET_CHARS
+            hits = str(found.text or "").strip()
+            # Only a genuine "nothing matched" justifies the recency fallback. A
+            # refusal or an outage must keep its own status: falling back would
+            # overwrite it with "empty" and tell the reader there is no history.
+            if found.status == "empty" and not hits:
+                return _newest(DIALOGUE_RECALL_BUDGET_CHARS)
+            if not hits or not carry_newest:
+                return found
+            # A multi-word query is natural language, and an OR hit set is keyword
+            # OVERLAP — usually non-empty now, and no promise that the newest
+            # summaries (the continuity anchor) are in it. Carry both halves.
+            newest = _newest(_RECALL_HALF_BUDGET_CHARS)
+            if not (newest.readable and newest.status == "ok" and str(newest.text or "").strip()):
+                return found
+            # ADVISORY bookkeeping of the SEARCH half — `count` sums the two halves
+            # (a record can be in both, so it can double-count) and `version`
+            # describes only the search result. Nothing renders them today (they
+            # reach the cache entry, and a query-keyed entry is never persisted), so
+            # a future consumer must NOT present them as "N memories": the halves
+            # are separate lists precisely because their overlap is unknown here.
+            return MachineRead(
+                True,
+                status="ok",
+                count=int(found.count or 0) + int(newest.count or 0),
+                version=found.version,
+                text=(
+                    _RECALL_MATCHED_HEADING + hits + "\n\n"
+                    + _RECALL_NEWEST_HEADING + str(newest.text).strip()
+                ),
             )
-            status, body = fallback.status, (fallback.text or body)
+
+        read = cached_read(
+            "recall", client, _fetch,
+            drive_root=memory.drive_root,
+            key=str(query or ""),
+            max_chars=DIALOGUE_RECALL_BUDGET_CHARS,
+        )
+        status, body, detail = read.status, read.text, read.detail
+    except EngramConfigError:
+        # An unresolvable project is a configuration fact, not a transport
+        # outage: the store might be full of this project's history while the
+        # scope is mis-wired. The blank return would read as "no history", so
+        # this keeps status in the "presence is UNKNOWN" family.
+        status = "rejected"
     except Exception:
         return ""
+    if status == "stale":
+        # The CAUSE is not decoration: "the store refused" and "the store is down"
+        # send the operator to different fixes, and serving cache must not collapse
+        # the distinction the typed reads exist to preserve.
+        why = (
+            "the store REFUSED the re-read (a scope/session problem, not an outage)"
+            if "rejected" in detail
+            else "the memory service could not be reached this turn"
+        )
+        return (
+            "## Remembered History (Engram)\n\n"
+            f"(cached from the last successful read — {why}, so this may be BEHIND. "
+            "`chat_history` still reads the raw log.)\n\n"
+            + body[:DIALOGUE_RECALL_BUDGET_CHARS]
+        )
     if status == "unavailable":
         return (
             "## Remembered History (Engram)\n\n"
@@ -1100,9 +1225,11 @@ def build_memory_sections(memory: Memory, partition: str = "all", durable_dialog
 
     if include_volatile:
         # The seam `## Dialogue History` occupied. Its content lives in Engram
-        # now, so the SAME position is filled from there: relevance-first against
-        # what the owner just said, newest-first when that matches nothing,
-        # titles only, and hard-bounded.
+        # now, so the SAME position is filled from there: what the owner just
+        # said retrieves the matches, the newest summaries ride along beside them
+        # for a multi-word query (relevance alone does not restore the
+        # unconditional narrative this section replaced), newest-first only when
+        # nothing matches, titles only, and hard-bounded.
         recall_section = _engram_recall_section(memory, recall_query)
         if recall_section:
             _warn_if_over_budget("dialogue_recall", recall_section)
@@ -1334,12 +1461,32 @@ def _engram_verdict_section(env: Any) -> str:
     as "no verdicts", because the two lead to opposite conclusions about whether
     this repo has ever been reviewed.
     """
-    try:
-        from ouroboros.engram_read import client_for, type_digest
+    from ouroboros.engram_cache import cached_read
+    from ouroboros.engram_client import EngramConfigError
+    from ouroboros.engram_read import client_for, type_digest
 
-        read = type_digest(client_for(env), "review_verdict")
+    try:
+        client = client_for(env)
+        read = cached_read(
+            "verdict", client,
+            lambda: type_digest(client, "review_verdict"),
+            drive_root=getattr(env, "drive_root", None),
+        )
+    except EngramConfigError:
+        # An unresolvable project is a configuration fact, same family as the
+        # recall seam: presence is UNKNOWN, never "no verdicts".
+        return (
+            "## Review verdicts (Engram)\n\n"
+            "(the project scope could not be resolved — whether any verdict was "
+            "recorded is UNKNOWN for this turn, not absent)"
+        )
     except Exception:
         return ""
+    if read.stale:
+        return (
+            "## Review verdicts (Engram)\n\n"
+            f"(cached from the last successful read — {read.detail})\n\n{read.text}"
+        )
     if read.unknown:
         return (
             "## Review verdicts (Engram)\n\n"
@@ -1586,9 +1733,13 @@ def _capture_context_core(
     semi_stable_parts.extend(build_memory_sections(context_memory, partition="stable"))
 
     # Reading side (AC10): the derived-knowledge inputs leave the main chat
-    # prompt. Durable knowledge and the Pattern Register now live in Engram and
-    # are retrieved on demand; the per-project journal/workpad stay, because they
-    # are live project working state rather than accumulated learning.
+    # prompt. Durable KNOWLEDGE lives in Engram and is retrieved on demand; the
+    # Pattern Register is still LOCAL (`memory/knowledge/patterns.md`, written by
+    # `reflection._update_patterns`) and is read on demand via
+    # `knowledge_read('patterns')`, which falls back to that local file when the
+    # store holds no `knowledge:patterns` record; the per-project journal/workpad
+    # stay, because they are live project working state rather than accumulated
+    # learning.
     semi_stable_parts.extend(
         build_knowledge_sections(
             context_env,

@@ -95,6 +95,14 @@ def _narrative_from_engram(
     ``result_ref`` / ``source_coverage`` pair the validator requires — so a consumer
     never has to branch on where the account came from. Only ``origin`` records that,
     because provenance is part of the memory.
+
+    Deliberately NOT routed through ``engram_cache.cached_read``: this read is
+    per-task (the ``task_id`` IS the lookup key) and happens at most once per
+    assembly, and an entry keyed on one task can never be asked for again by a
+    later turn — so there is no stale copy the cache could serve and nothing for
+    it to save. Its outage behaviour is this read's own typed gap (the caller
+    emits ``continuation_narrative_unavailable``), which is the honest disclosure
+    for a per-task read; a stale disclosure has no meaning here.
     """
     try:
         from types import SimpleNamespace

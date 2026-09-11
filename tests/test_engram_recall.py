@@ -7,9 +7,11 @@ pins the properties that make the replacement faithful rather than merely
 different:
 
 * **relevance first** — the owner's own message is the retrieval query;
-* **continuity as the fallback** — the section it replaces was an unconditional
-  narrative, so a query that matches nothing must still show the newest blocks
-  rather than going blank;
+* **continuity beside it** — the section it replaces was an unconditional
+  narrative, so a multi-word query renders the newest blocks under their own
+  sub-heading next to the hits (the two halves share the budget), and a query
+  that matches nothing still shows the newest blocks alone rather than going
+  blank;
 * **titles only** — the server returns full bodies from `/search`, so shipping
   them here is exactly how the removed 30 KB would come straight back;
 * **typed degradation** — an unreachable or refusing store must say UNKNOWN, not
@@ -477,4 +479,52 @@ def test_the_consolidator_mirrors_what_it_just_wrote(engram_stub, tmp_path, monk
     # leave the next start pushing this block, not re-summarising the same window
     # and appending a second block for one interval.
     assert cursor_when_mirrored == [consolidator.BLOCK_SIZE]
+    reset_sinks()
+
+
+# --------------------------------------------------------------------------- #
+# fail-closed reads: an unresolvable project is a configuration fact
+# --------------------------------------------------------------------------- #
+
+
+def test_an_unresolvable_scope_discloses_refusal_not_a_blank(engram_stub, monkeypatch):
+    """`client_for` fails closed on an unresolvable project. The recall seam
+    must keep that distinction (a typed 'refused' disclosure) instead of the
+    blanket ``except Exception: return ""`` that would read as "no history"."""
+    from ouroboros.engram_client import EngramConfigError  # noqa: F401 (documents the typed raise)
+
+    monkeypatch.setenv("ENGRAM_PROJECT", "local")  # forbidden name
+    state, env = engram_stub
+    memory = Memory(env.drive_root, env.repo_dir)
+    section = _engram_recall_section(memory, "anything")
+    assert section.startswith("## Remembered History (Engram)")
+    assert "refused" in section or "scope" in section
+    reset_sinks()
+
+
+def test_an_unresolved_scope_never_renders_as_a_service_outage(engram_stub, monkeypatch):
+    """NEGATIVE half of the same contract, for a client that EXISTS but is unscoped.
+
+    ``client_for`` raises for an unresolvable scope (above); this covers the other
+    shape — a client whose ``config.project`` is blank, so the client itself
+    refuses the (never-sent) request with ``error_kind="config"``. Mapped to
+    ``unavailable`` that refusal would print "the memory service could not be
+    reached" and send the operator to the wrong fix; it must render as the refusal
+    it is, naming the scope.
+    """
+    import ouroboros.engram_read as read_mod
+    from ouroboros.engram_cache import reset_cache
+    from ouroboros.engram_client import EngramClient, EngramConfig
+
+    state, env = engram_stub
+    reset_sinks()
+    reset_cache()
+    unscoped = EngramClient(config=EngramConfig(base_url="http://127.0.0.1:9", project=""))
+    monkeypatch.setattr(read_mod, "client_for", lambda target: unscoped)
+    memory = Memory(env.drive_root, env.repo_dir)
+
+    section = _engram_recall_section(memory, "an unscoped-scope probe")
+
+    assert "refused" in section, section
+    assert "could not be reached" not in section, section
     reset_sinks()

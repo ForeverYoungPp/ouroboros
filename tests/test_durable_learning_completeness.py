@@ -8,6 +8,18 @@ import pathlib
 import threading
 
 
+def _section_headings(context: str) -> list:
+    """The section headings an assembled prompt actually carries.
+
+    A heading is a LINE beginning with ``## `` — the same shape
+    ``tests/test_context_reading_side.py`` asserts over builder output. A substring
+    scan cannot do this job: governance documents legitimately NAME a removed
+    section in prose (``docs/ARCHITECTURE.md`` describes the removal in its own
+    words), and a mention must not read as an injected section.
+    """
+    return [line for line in context.splitlines() if line.startswith("## ")]
+
+
 def test_pattern_register_rewrite_receives_complete_tail(tmp_path, monkeypatch):
     from ouroboros import reflection
 
@@ -509,7 +521,14 @@ def test_bgc_durable_dialogue_gap_blocks_direct_identity_update(tmp_path):
         assert "[MEMORY GAP]" in context
         assert "## Memory Gaps" in context
         assert "dialogue-gap-123" in context
-        assert "## Dialogue History" not in context
+        # Structural, not a substring scan: an injected section is a `## ` heading
+        # LINE, while governance prose that merely names the removed section
+        # (docs/ARCHITECTURE.md describes the removal in its own words) must not
+        # read as one. The positive control keeps the negative assertion from
+        # passing vacuously: this context really does carry heading lines.
+        headings = _section_headings(context)
+        assert any(h.startswith("## Memory Gaps") for h in headings)
+        assert not any(h.startswith("## Dialogue History") for h in headings)
         content = "I must not rewrite identity across a known durable biography gap."
         result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
         assert "IDENTITY_UPDATE_ABSTAINED" in result

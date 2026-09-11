@@ -53,12 +53,25 @@ def test_list_with_no_knowledge_dir_creates_nothing(tmp_path):
 
 
 def test_list_prefers_existing_index_verbatim(tmp_path):
-    """0-regression: when the write path has maintained an index, list returns it."""
+    """0-regression: when the write path has maintained an index, list returns it.
+
+    Re-anchored for the scope note (the draft adds one): the INDEX CONTENT is still
+    carried verbatim and the file is never rewritten on a read, while the result now
+    also names what the list is — the local archive — so a topic that lives only in
+    Engram cannot read as absent. Both facts are asserted; neither replaces the other.
+    """
     ctx = _Ctx(tmp_path / "drive")
     kdir = ctx.drive_root / "memory" / "knowledge"
     kdir.mkdir(parents=True)
-    (kdir / INDEX_FILE).write_text("# Knowledge Base Index\n\n- **a**: alpha\n", encoding="utf-8")
-    assert _knowledge_list(ctx) == "# Knowledge Base Index\n\n- **a**: alpha\n"
+    index_body = "# Knowledge Base Index\n\n- **a**: alpha\n"
+    (kdir / INDEX_FILE).write_text(index_body, encoding="utf-8")
+
+    listing = _knowledge_list(ctx)
+
+    assert index_body in listing, "the maintained index must be carried, not rebuilt"
+    assert "ARCHIVE INDEX" in listing, "the list must name its scope"
+    assert "Engram" in listing, "and the route to the remote records"
+    assert (kdir / INDEX_FILE).read_text(encoding="utf-8") == index_body, "a read never rewrites it"
 
 
 def test_first_write_into_indexless_store_seeds_the_full_index(tmp_path, monkeypatch):

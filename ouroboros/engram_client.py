@@ -298,6 +298,20 @@ class EngramClient:
         # default all_projects=False silently strips the project from every call
         # and memories leak across projects (failure mode F7).
         wants_all = str(clean.get("all_projects", "")).strip().lower() in {"true", "1", "yes"}
+        # AC2/F7: a project-aware call must never go out UNSCOPED so the server's
+        # own detection decides the scope. `/health` and `/project/current` are
+        # unscoped by definition (the latter IS the resolver), and an explicit
+        # ``all_projects=true`` is a deliberate cross-project read; every other path
+        # needs the resolved project or it must not be sent at all.
+        if not self.config.project and not wants_all and path not in _UNSCOPED_PATHS:
+            return EngramResult(
+                False,
+                error_kind="config",
+                detail=(
+                    f"{path} needs a resolved Engram project; refusing to send an "
+                    "unscoped request (server-side detection would decide the scope)"
+                ),
+            )
         # /health is unscoped by definition, and /project/current IS the resolver —
         # injecting a project into either would make the client assert the answer it
         # is asking the server for.
@@ -350,8 +364,16 @@ class EngramClient:
         type: str = "",
         scope: str = "",
         all_projects: bool = False,
+        match_mode: str = "",
     ) -> EngramResult:
         """``GET /search`` — FTS5 hit list, **bodies included**.
+
+        ``match_mode`` is Engram's own knob (``""``/``"all"`` = FTS5 AND over every
+        token, ``"any"`` = OR). The server accepts those three values and answers
+        HTTP 400 for anything else, so the value is normalized HERE (trimmed,
+        lowercased, unknown → the server default) rather than letting a caller's
+        typo travel as a request the store "refused" — which the read layer would
+        report as a scope/session problem instead of a client bug.
 
         Verified against the server implementation rather than assumed:
         ``store.buildSearchFTSQuery`` selects the full observation (including
@@ -360,6 +382,33 @@ class EngramClient:
         ``GET /observations/{id}``. Engram only has a *preview* shape for the
         endpoints that ask for it explicitly.
         """
+        # A query with no alphanumeric character has nothing to match on, so it is
+        # never sent: Engram is a store, not a parser for queries like `'" "'`.
+        # The recall seam guards its own hot path; this boundary guard exists for
+        # the caller whose query is ARBITRARY TEXT — the model-facing `engram`
+        # tool's ``op='search'``, where a punctuation-only query comes straight
+        # from the model (a knowledge topic cannot be one: ``_VALID_TOPIC``
+        # requires a leading alphanumeric). The answer is the shape a zero-hit
+        # search already returns — ``ok`` with no items — so every caller keeps its
+        # existing semantics: the tool still says "No candidate memories…",
+        # ``search_titles`` stays ``empty``, nothing is fabricated, nothing raises.
+        #
+        # Evidence (throwaway FTS5 db, never the live store): the DEFAULT-mode
+        # expression for `'"'`, `'""'` and `'" "'` is `""` / `""` / `"" ""`, which
+        # PARSES and returns zero rows — so this is transport hygiene, not a crash
+        # fix. The crash case is any-mode's EMPTY expression, which the seam avoids.
+        if not any(ch.isalnum() for ch in str(query or "")):
+            return EngramResult(True, status=200, data=[])
+        # Server-validated: "" | "all" (default, FTS5 AND over every token) |
+        # "any" (OR — broader recall). A multi-token natural language query can
+        # only match under AND if ONE record holds every token, which is why a
+        # recall caller asks for "any". Anything else is a caller bug, and the
+        # server answers it with HTTP 400 — which the read layer maps to
+        # ``rejected`` and the reader to "the memory service refused this
+        # request". Normalize instead: never put an invalid value on the wire.
+        mode = str(match_mode or "").strip().lower()
+        if mode not in ("all", "any"):
+            mode = ""
         return self._request(
             "GET",
             "/search",
@@ -369,6 +418,7 @@ class EngramClient:
                 "type": type or None,
                 "scope": scope or None,
                 "all_projects": all_projects or None,
+                "match_mode": mode or None,
             },
         )
 
@@ -464,22 +514,43 @@ class EngramClient:
     def timeline(
         self, observation_id: int, *, before: int = 5, after: int = 5
     ) -> EngramResult:
-        """``GET /timeline`` — chronological neighbourhood of one record."""
-        return self._request(
-            "GET",
-            "/timeline",
-            params={
-                "observation_id": int(observation_id),
-                "before": _clamp(before, 0, MAX_TIMELINE_RADIUS, 5),
-                "after": _clamp(after, 0, MAX_TIMELINE_RADIUS, 5),
-            },
-        )
+        """``GET /timeline`` — chronological neighbourhood of one record.
+
+        A single-record lookup, so a record that is not in the project THIS client
+        resolved may simply belong to another project (a ``/search`` hit can be a
+        cross-project match when the caller asked for one). Re-ask once with the
+        scope dropped — ``all_projects=true`` is the only expressible form, since it
+        is mutually exclusive with an explicit project — so the RECORD's own project
+        decides; if that does not answer either, the first typed failure is kept
+        because its detail is the one that names the scope problem.
+        """
+        params = {
+            "observation_id": int(observation_id),
+            "before": _clamp(before, 0, MAX_TIMELINE_RADIUS, 5),
+            "after": _clamp(after, 0, MAX_TIMELINE_RADIUS, 5),
+        }
+        first = self._request("GET", "/timeline", params=dict(params))
+        if _record_scope_miss(first):
+            retry = self._request("GET", "/timeline", params={**params, "all_projects": True})
+            return retry if retry.ok else first
+        return first
 
     # -- layer 3: one full record (C20) ------------------------------------ #
 
     def get(self, observation_id: Any) -> EngramResult:
-        """``GET /observations/{id}`` — one full record. Callers fetch one at a time."""
-        return self._request("GET", f"/observations/{observation_id}")
+        """``GET /observations/{id}`` — one full record. Callers fetch one at a time.
+
+        Same single-record scope fallback as ``timeline``: the id the caller holds
+        may have come from a cross-project search hit, and a wrong-project 404 must
+        not read as "this record does not exist".
+        """
+        first = self._request("GET", f"/observations/{observation_id}")
+        if _record_scope_miss(first):
+            retry = self._request(
+                "GET", f"/observations/{observation_id}", params={"all_projects": True}
+            )
+            return retry if retry.ok else first
+        return first
 
     # -- writes ------------------------------------------------------------ #
 
@@ -660,6 +731,23 @@ class EngramClient:
 #: Routes that must never carry the client's project: one is unscoped by
 #: definition, the other is the authority the client asks ABOUT the project.
 _UNSCOPED_PATHS = frozenset({"/health", "/project/current", "/sessions"})
+
+#: The store's own words for "this id is not in the project I resolved".
+_SCOPE_MISS_DETAIL = "observation not found in resolved project"
+
+
+def _record_scope_miss(result: "EngramResult") -> bool:
+    """True when the store ANSWERED that this id is not in the resolved project.
+
+    Deliberately narrow: a 404 whose body carries this sentence. The other 404 on
+    these routes is ``unknown_project`` (the project does not exist at all), which
+    is a configuration fact and must keep its typed failure rather than be retried.
+    """
+    return (
+        not result.ok
+        and result.status == 404
+        and _SCOPE_MISS_DETAIL in str(result.detail or "")
+    )
 
 _RELATIONS = frozenset(
     {"related", "compatible", "scoped", "conflicts_with", "supersedes", "not_conflict"}

@@ -1,4 +1,5 @@
 """Live-first owner delivery: gates, lineage stamping, and final-answer pick."""
+import json
 import queue
 import types
 
@@ -235,3 +236,194 @@ class TestSupervisorPhotoChatZero:
                "caption": "", "mime": "image/png"}
         _handle_send_photo(evt, ctx)
         assert sent == [0]
+
+
+# --------------------------------------------------------------------------- #
+# Option (a): BG answer arbitration against an already-handled owner message.
+# --------------------------------------------------------------------------- #
+
+_BG_CHAT_BASE = "2026-09-11T19:18:26+00:00"
+
+
+def _bg_ctx(drive_root, *, chat_id=1):
+    from ouroboros.tool_capabilities import BACKGROUND_DELEGATION_ROLE
+
+    ctx = _ctx(chat_id=chat_id, meta={"delegation_role": BACKGROUND_DELEGATION_ROLE})
+    ctx.drive_root = drive_root
+    return ctx
+
+
+def _iso(seconds_offset: float = 0.0) -> str:
+    from datetime import datetime, timedelta
+
+    base = datetime.fromisoformat(_BG_CHAT_BASE)
+    return (base + timedelta(seconds=seconds_offset)).isoformat()
+
+
+def _now_iso(seconds_offset: float = 0.0) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds_offset)).isoformat()
+
+
+def _write_chat(drive_root, rows):
+    logs = drive_root / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "chat.jsonl").write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _inbox_rows(drive_root):
+    path = drive_root / "state" / "consciousness_observations.jsonl"
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+class TestBackgroundAnswerArbitration:
+    """A BG reply that would duplicate an answered owner message becomes an
+    observation-inbox note instead of a second chat frame."""
+
+    def test_notes_instead_of_duplicating_an_answered_message(self, tmp_path):
+        _write_chat(tmp_path, [
+            {"ts": _iso(0), "direction": "in", "chat_id": 1, "text": "owner question"},
+            {"ts": _iso(2), "direction": "out", "chat_id": 1,
+             "sender_identity": "", "text": "foreground answer"},
+        ])
+        ctx = _bg_ctx(tmp_path)
+        text = "bg would-be duplicate"
+        mode = deliver_owner_event(
+            ctx, {"type": "send_message", "chat_id": 1, "text": text, "ts": _iso(5)}
+        )
+        assert mode == "noted"
+        assert ctx.pending_events == []  # no owner-facing frame
+        rows = _inbox_rows(tmp_path)
+        assert len(rows) == 1
+        assert rows[0]["op"] == "enqueue"
+        assert rows[0]["source"] == "owner_delivery"
+        assert rows[0]["kind"] == "note"
+        assert rows[0]["payload"] == text
+        assert rows[0]["chat_id"] == 1
+        assert rows[0]["ref"]["arbitration"] == "foreground_answer_recent"
+
+    def test_sends_normally_without_a_foreground_answer(self, tmp_path):
+        _write_chat(tmp_path, [
+            {"ts": _iso(0), "direction": "in", "chat_id": 1, "text": "owner question"},
+        ])
+        ctx = _bg_ctx(tmp_path)
+        mode = deliver_owner_event(
+            ctx, {"type": "send_message", "chat_id": 1, "text": "bg answer", "ts": _iso(5)}
+        )
+        assert mode == "deferred"
+        assert ctx.pending_events[0]["sender_identity"] == "background"
+        assert _inbox_rows(tmp_path) == []
+
+    def test_a_stale_foreground_answer_does_not_arbitrate(self, tmp_path):
+        from ouroboros.tools.owner_delivery import (
+            BG_ANSWER_ARBITRATION_WINDOW_SECONDS as window,
+        )
+
+        _write_chat(tmp_path, [
+            {"ts": _iso(0), "direction": "in", "chat_id": 1, "text": "owner question"},
+            {"ts": _iso(2), "direction": "out", "chat_id": 1,
+             "sender_identity": "", "text": "foreground answer"},
+        ])
+        ctx = _bg_ctx(tmp_path)
+        mode = deliver_owner_event(ctx, {
+            "type": "send_message", "chat_id": 1, "text": "late bg answer",
+            "ts": _iso(2 + window + 1),
+        })
+        assert mode == "deferred"
+        assert ctx.pending_events[0]["sender_identity"] == "background"
+
+    def test_a_running_foreground_turn_arbitrates(self, tmp_path):
+        # The observed case: the BG answered while the turn triggered by the
+        # owner's message was still running, so no foreground row existed yet.
+        _write_chat(tmp_path, [
+            {"ts": _iso(0), "direction": "in", "chat_id": 1, "text": "owner question"},
+        ])
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "queue_snapshot.json").write_text(json.dumps({
+            "ts": _iso(1),
+            "running": [{"id": "t-fg", "task": {"id": "t-fg", "chat_id": 1}}],
+        }), encoding="utf-8")
+        ctx = _bg_ctx(tmp_path)
+        mode = deliver_owner_event(
+            ctx, {"type": "send_message", "chat_id": 1, "text": "bg answer", "ts": _iso(5)}
+        )
+        assert mode == "noted"
+        assert ctx.pending_events == []
+        assert _inbox_rows(tmp_path)[0]["ref"]["arbitration"] == "foreground_turn_running"
+
+    def test_a_failed_note_write_never_loses_the_message(self, tmp_path, monkeypatch):
+        _write_chat(tmp_path, [
+            {"ts": _iso(0), "direction": "in", "chat_id": 1, "text": "owner question"},
+            {"ts": _iso(2), "direction": "out", "chat_id": 1,
+             "sender_identity": "", "text": "foreground answer"},
+        ])
+        import ouroboros.consciousness as consciousness
+
+        monkeypatch.setattr(consciousness, "append_observation_row", lambda *a, **k: False)
+        ctx = _bg_ctx(tmp_path)
+        mode = deliver_owner_event(
+            ctx, {"type": "send_message", "chat_id": 1, "text": "bg answer", "ts": _iso(5)}
+        )
+        assert mode == "deferred"
+        assert ctx.pending_events[0]["text"] == "bg answer"
+
+    def test_non_message_frames_are_not_arbitrated(self, tmp_path):
+        # Only the send-message family answers an owner message; a media frame
+        # keeps its existing transport decision under the same evidence.
+        _write_chat(tmp_path, [
+            {"ts": _iso(0), "direction": "in", "chat_id": 1, "text": "owner question"},
+            {"ts": _iso(2), "direction": "out", "chat_id": 1,
+             "sender_identity": "", "text": "foreground answer"},
+        ])
+        ctx = _bg_ctx(tmp_path)
+        mode = deliver_owner_event(ctx, {"type": "send_photo", "chat_id": 1, "ts": _iso(5)})
+        assert mode == "deferred"
+        assert len(ctx.pending_events) == 1
+
+    def test_the_note_is_readable_by_the_wake_loop(self, tmp_path):
+        # Not just written: the running loop's own reader must index the row as
+        # a pending observation (stable-ID index, no gap), or a suppressed frame
+        # would be lost to a store the cycle never consults.
+        import ouroboros.consciousness as consciousness_module
+
+        _write_chat(tmp_path, [
+            {"ts": _iso(0), "direction": "in", "chat_id": 1, "text": "owner question"},
+            {"ts": _iso(2), "direction": "out", "chat_id": 1,
+             "sender_identity": "", "text": "foreground answer"},
+        ])
+        ctx = _bg_ctx(tmp_path)
+        assert deliver_owner_event(
+            ctx, {"type": "send_message", "chat_id": 1, "text": "bg note body", "ts": _iso(5)}
+        ) == "noted"
+        instance = object.__new__(consciousness_module.BackgroundConsciousness)
+        instance._drive_root = tmp_path
+        state = instance._read_observation_state(force=True)
+        assert state.get("gap_reasons") == []
+        payloads = [row.get("payload") for row in state["rows"].values()]
+        assert "bg note body" in payloads
+
+    def test_the_tool_receipt_reports_the_note_honestly(self, tmp_path):
+        from ouroboros.tools.control import _send_user_message
+
+        _write_chat(tmp_path, [
+            {"ts": _now_iso(-5), "direction": "in", "chat_id": 1, "text": "owner question"},
+            {"ts": _now_iso(-2), "direction": "out", "chat_id": 1,
+             "sender_identity": "", "text": "foreground answer"},
+        ])
+        ctx = _bg_ctx(tmp_path)
+        ctx.drive_logs = lambda: tmp_path
+        result = _send_user_message(ctx, "bg reply")
+        assert "background note" in result
+        assert "queued for delivery" not in result
+        assert ctx.pending_events == []

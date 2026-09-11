@@ -1487,11 +1487,15 @@ def _mirror_latest_verdict(drive_root: pathlib.Path, state: AdvisoryReviewState)
     """Mirror the newest review verdict into Engram (W9). Never raises.
 
     BOTH mutation paths call this — ``save_state`` and ``update_state``, the one
-    production actually uses — so it leans on the sink's in-run identity+content
-    dedupe: an unchanged verdict is dropped as a duplicate and only a genuinely
-    new verdict is sent. ``obligation_ids`` and the finding bodies are
-    deliberately NOT forwarded — those are work items, and Engram stores memories,
-    not to-dos (C18).
+    production actually uses — so it leans on TWO dedupes, neither of which is a
+    "remember the last verdict" cache: the sink's in-run identity+content check
+    (per instance, cleared at every run boundary) and, across processes, the spool
+    witness that answers "this exact record already went out from this drive". The
+    second one exists because a worker-pool boot of N processes each call this
+    once: ten identical ``review_verdict:<tid>:1`` upserts landed on ONE record
+    (``revision_count 36 -> 47``) before it. ``obligation_ids`` and the finding
+    bodies are deliberately NOT forwarded — those are work items, and Engram stores
+    memories, not to-dos (C18).
     """
     try:
         attempt = state.latest_attempt()

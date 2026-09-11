@@ -17,6 +17,15 @@ log = logging.getLogger(__name__)
 
 KNOWLEDGE_DIR = "memory/knowledge"
 INDEX_FILE = "index-full.md"
+#: The listing is the LOCAL (pre-switch) archive index. Topics written to Engram
+#: after the canonical local write was retired do NOT appear in it, so the list has
+#: to say so — otherwise it reads as "these are all the topics" (the same
+#: misreading ``_engram_list_note`` guards on the empty path).
+_LOCAL_INDEX_SCOPE_NOTE = (
+    "ℹ️ LOCAL (pre-switch) ARCHIVE INDEX — `memory/knowledge` on this drive. Durable "
+    "knowledge written to Engram after the local write was retired does NOT appear "
+    "here; reach those with the `engram` tool (op=search, then op=read).\n\n"
+)
 # The immune improvement backlog is ONE global store, never per-project (C10.1).
 BACKLOG_TOPIC = "improvement-backlog"
 
@@ -605,7 +614,14 @@ def _engram_list_note(ctx: ToolContext) -> str:
 
         read = recent(client_for(ctx), limit=MAX_REVIEW_ITEMS)
     except Exception:
-        return ""
+        # An unresolvable project scope (EngramConfigError) reaches here, and a
+        # blank would let the caller's "Knowledge base is empty" stand as a claim
+        # about the REMOTE store — the one thing this note exists to prevent.
+        return (
+            " The memory service is unreachable OR its project scope could not be "
+            "resolved, so whether durable knowledge exists remotely is UNKNOWN, not "
+            "absent — do not conclude nothing was learned."
+        )
     if read.unknown:
         return (
             " Engram could not answer, so whether durable knowledge exists remotely is "
@@ -625,7 +641,7 @@ def _knowledge_list(ctx: ToolContext) -> str:
     index_path = kdir / INDEX_FILE
 
     if index_path.exists():
-        return index_path.read_text(encoding="utf-8")
+        return _LOCAL_INDEX_SCOPE_NOTE + index_path.read_text(encoding="utf-8")
 
     # No index: render the listing IN MEMORY from the topic files. knowledge_list
     # is registered read-only (safety.py POLICY_SKIP) and granted to children that
@@ -648,7 +664,7 @@ def _knowledge_list(ctx: ToolContext) -> str:
             entries.append(f"- **{topic}**: (unreadable)")
 
     if entries:
-        return "# Knowledge Base Index\n\n" + "\n".join(entries) + "\n"
+        return _LOCAL_INDEX_SCOPE_NOTE + "# Knowledge Base Index\n\n" + "\n".join(entries) + "\n"
     return "Knowledge base is empty. Use knowledge_write to add topics." + _engram_list_note(ctx)
 
 

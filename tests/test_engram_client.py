@@ -186,6 +186,63 @@ def test_search_limit_is_clamped_to_model_facing_max(stub, tmp_path):
     assert int(state.requests[-1]["params"]["limit"]) == ec.MAX_SEARCH_LIMIT
 
 
+def test_a_bogus_match_mode_never_reaches_the_wire(stub, tmp_path):
+    """Engram's server accepts only ""/"all"/"any" and answers HTTP 400 for
+    anything else — which the read layer maps to ``rejected``, so a caller's typo
+    surfaces to the operator as "the memory service refused this request".
+
+    Asserted on the outgoing request, not on an internal variable: the value the
+    store sees is the only thing that can turn a typo into a fake outage.
+    """
+    state, url = stub
+    client = _client(url, tmp_path)
+
+    # Values the server would refuse: dropped, never forwarded.
+    for bogus in (False, "or", "none", "OR", "xyzzy"):
+        client.search("q", match_mode=bogus)
+        assert state.requests[-1]["params"].get("match_mode") is None, bogus
+
+    # Case/whitespace variants of the two literals are the SAME value, so they are
+    # normalized rather than forwarded as the caller spelled them.
+    client.search("q", match_mode=" ANY ")
+    assert state.requests[-1]["params"]["match_mode"] == "any"
+    client.search("q", match_mode="ALL")
+    assert state.requests[-1]["params"]["match_mode"] == "all"
+
+    # The empty default stays absent from the wire, exactly as it was.
+    client.search("q")
+    assert "match_mode" not in state.requests[-1]["params"]
+
+
+def test_a_query_with_no_usable_word_never_reaches_the_store(stub, tmp_path):
+    """`search` is the choke point every caller shares, and one of them — the
+    model-facing `engram` tool's ``op='search'`` — takes its query straight from
+    the model, so it can be punctuation or quotes. Such a query has nothing to
+    match on, so the request is not sent at all: the assertion is the ABSENT
+    request (the one thing a stubbed server cannot fake), and the caller-visible
+    outcome is the zero-hit shape rather than a failure.
+    """
+    state, url = stub
+    client = _client(url, tmp_path)
+
+    for query in ('"', '" "'):
+        before = len(state.requests)
+        result = client.search(query)
+        assert len(state.requests) == before, query
+        assert result.ok and result.items() == [], query
+        assert not result.unavailable, query
+
+    # A normal query is unaffected: it still goes to the wire, and it carries
+    # match_mode ONLY when the caller asked for it.
+    client.search("which span did we ship")
+    entry = state.requests[-1]
+    assert entry["path"] == "/search" and entry["params"]["q"] == "which span did we ship"
+    assert "match_mode" not in entry["params"]
+
+    client.search("which span did we ship", match_mode="any")
+    assert state.requests[-1]["params"]["match_mode"] == "any"
+
+
 def test_context_max_bytes_is_clamped_to_engram_ceiling(stub, tmp_path):
     state, url = stub
     client = _client(url, tmp_path)
@@ -336,3 +393,102 @@ def test_unknown_relation_is_rejected_before_sending(stub, tmp_path):
             memory_id_a=1, memory_id_b=2, relation="whatever", confidence=0.9, reasoning="r"
         )
     assert state.requests == []
+
+
+# --------------------------------------------------------------------------- #
+# F1/F7 draft: the scope must never be decided by the SERVER (AC2), and a
+# single-record lookup must not read "wrong project" as "no such record".
+# --------------------------------------------------------------------------- #
+
+
+def test_a_blank_project_refuses_scoped_paths_but_not_the_resolver(stub, tmp_path):
+    state, url = stub
+    client = ec.EngramClient(config=ec.EngramConfig(base_url=url, project=""))
+
+    for call in (
+        lambda: client.timeline(123),
+        lambda: client.get(123),
+        lambda: client.search("q"),
+        lambda: client.recent(),
+    ):
+        result = call()
+        assert result.ok is False and result.error_kind == "config", result.detail
+        assert "unscoped" in result.detail
+    assert state.requests == [], "an unscoped scoped-path request reached the wire"
+
+    # The resolver itself (and /health) are unscoped BY DEFINITION and still run.
+    client.project_current(cwd="/tmp")
+    client.health()
+    assert [r["path"] for r in state.requests] == ["/project/current", "/health"]
+
+
+def test_a_wrong_project_timeline_miss_is_retried_scope_dropped(stub, tmp_path):
+    state, url = stub
+    state.responses["/timeline"] = (404, {"error": "observation not found in resolved project"})
+    client = _client(url, tmp_path)
+
+    result = client.timeline(123)
+
+    assert len(state.requests) == 2, state.requests
+    first, second = state.requests
+    assert first["params"]["project"] and "all_projects" not in first["params"]
+    assert second["params"].get("all_projects") == "true"
+    assert "project" not in second["params"], "the retry must drop the resolved scope"
+    # Both attempts answered the same 404, so the FIRST typed failure is kept: it is
+    # the one whose detail names the scope problem.
+    assert result.ok is False and result.status == 404
+
+
+def test_the_same_fallback_covers_the_single_record_read(stub, tmp_path):
+    state, url = stub
+    state.responses["/observations/9"] = (
+        404, {"error": "observation not found in resolved project"},
+    )
+    client = _client(url, tmp_path)
+
+    client.get(9)
+
+    assert len(state.requests) == 2, state.requests
+    assert state.requests[1]["params"].get("all_projects") == "true"
+
+
+def test_an_unknown_project_404_is_not_retried(stub, tmp_path):
+    """The OTHER 404 on these routes is a configuration fact, not a scope miss."""
+    state, url = stub
+    state.responses["/timeline"] = (404, {"error": 'project "x" not found', "code": "unknown_project"})
+    client = _client(url, tmp_path)
+
+    result = client.timeline(123)
+
+    assert len(state.requests) == 1, "an unknown_project 404 must keep its typed failure"
+    assert result.ok is False and result.status == 404
+
+
+
+def test_patch_updates_one_record_and_drops_unchanged_fields(stub, tmp_path):
+    """AC8(c)'s PATCH leg — the update path, which no other test exercises.
+
+    The seed names this behaviour explicitly: "内容有实质更新 → 走 PATCH", i.e. a
+    change to an existing record is an UPDATE of it, not a second POST. The
+    contract is the whole observable surface — the request targets one record's
+    id, carries ONLY the fields being changed (a ``None`` means "leave it as it
+    is", so it must not travel as a null), returns the store's answer as an
+    ``EngramResult``, and a refusal comes back TYPED rather than raised (C6: no
+    memory path may fail a task).
+    """
+    state, url = stub
+    client = _client(url, tmp_path)
+
+    result = client.patch(7, title="T", content="C", topic_key="k", scope=None)
+
+    entry = state.requests[-1]
+    assert entry["method"] == "PATCH" and entry["path"] == "/observations/7"
+    assert entry["body"] == {"title": "T", "content": "C", "topic_key": "k"}
+    assert result.ok is True and result.status == 200
+
+    # A refusal is typed, never raised.
+    state.responses["/observations/7"] = (404, {"code": "unknown_observation"})
+    refused = client.patch(7, title="T")
+
+    assert refused.ok is False and refused.error_kind == "http"
+    assert refused.status == 404 and refused.unavailable is False
