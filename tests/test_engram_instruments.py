@@ -597,9 +597,10 @@ def test_a_topic_below_the_search_window_is_still_resolved(stub):
 
     ``/search`` answers with a RANKED SLICE (limit=8); a target can sit below it,
     and the pre-fix code then reported "no Engram record" — an under-report shown
-    as a whole-set absence. The bounded exact-key scan resolves it.
+    as a whole-set absence. The bounded exact-key scan resolves it — bounded by
+    ``MAX_WINDOW``, the module's record-shaped recency bound, never the ceiling.
     """
-    from ouroboros.engram_read import MAX_DIGEST_ITEMS, MAX_TOPIC_KEY_SCAN, knowledge_topic
+    from ouroboros.engram_read import MAX_DIGEST_ITEMS, MAX_WINDOW, knowledge_topic
 
     state, env = stub
     # The window fills with decoys that MATCH the query but are not the target...
@@ -617,13 +618,13 @@ def test_a_topic_below_the_search_window_is_still_resolved(stub):
     paths = [r["path"] for r in state.requests]
     assert "/search" in paths, "the fast path still runs first"
     assert "/observations/recent" in paths, "the fallback scan ran on the window miss"
-    assert int(_params(state, "/observations/recent")["limit"]) == MAX_TOPIC_KEY_SCAN
+    assert int(_params(state, "/observations/recent")["limit"]) == MAX_WINDOW
     assert _params(state, "/observations/recent")["project"] == "repo"   # same scope, no leak
 
 
 def test_a_genuinely_absent_topic_reports_a_bounded_absence(stub):
     """C15-style truthfulness: a bounded read must not claim the SET is empty."""
-    from ouroboros.engram_read import MAX_DIGEST_ITEMS, MAX_TOPIC_KEY_SCAN, knowledge_topic
+    from ouroboros.engram_read import MAX_DIGEST_ITEMS, MAX_WINDOW, knowledge_topic
 
     state, env = stub
     _seed_knowledge_recorded(state, "some-other-topic", "unrelated body", obs_id=101)
@@ -632,7 +633,7 @@ def test_a_genuinely_absent_topic_reports_a_bounded_absence(stub):
 
     assert read.ok and read.status == "empty" and read.count == 0
     assert f"limit={MAX_DIGEST_ITEMS}" in read.detail
-    assert str(MAX_TOPIC_KEY_SCAN) in read.detail
+    assert str(MAX_WINDOW) in read.detail
     for forbidden in ("never learned", "does not exist", "not stored at all"):
         assert forbidden not in read.detail.lower()
 

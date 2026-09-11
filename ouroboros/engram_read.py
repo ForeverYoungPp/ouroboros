@@ -53,10 +53,6 @@ MAX_WINDOW = 50
 MAX_REVIEW_ITEMS = 8
 #: Largest body returned for a single knowledge topic.
 MAX_TOPIC_CHARS = 4_000
-#: Bound for the exact-key fallback scan: how many of the newest records
-#: ``knowledge_topic`` may sweep by ``topic_key`` when the ranked search
-#: window misses. One bounded GET, only in the miss case.
-MAX_TOPIC_KEY_SCAN = 200
 #: Safety ceiling for a read-modify-write base. Deliberately far above any real
 #: topic: truncating the base of an append is SILENT DATA LOSS (the write would
 #: upsert a shortened record), so this is a guard against an unbounded read, not
@@ -412,11 +408,14 @@ def knowledge_topic(
         # A search window is a RANKED SLICE, not the set: the store grew from 3 to
         # 45 knowledge records, so a target can rank below ``limit`` and the old
         # code called that "no Engram record" — an under-report dressed as a
-        # whole-set absence, which this module's own doctrine forbids. One bounded
-        # exact-key scan (the same GET shape the app already uses, same scope,
-        # only in the miss case) settles it; a second miss is reported as the
-        # BOUNDED absence it is.
-        scan = client.recent(limit=MAX_TOPIC_KEY_SCAN, scope=scope)
+        # whole-set absence, which this module's own doctrine forbids. The fallback
+        # sweeps the newest records by exact ``topic_key``, and it is bounded by
+        # ``MAX_WINDOW`` — the module's own bound for record-shaped recency reads
+        # (see that block above): ``/observations/recent`` has no type filter and no
+        # compact mode, so EVERY row carries its full body, which makes this a
+        # bounded read and not a store dump. Same resolved scope, only in the miss
+        # case; a second miss is reported as the BOUNDED absence it is.
+        scan = client.recent(limit=MAX_WINDOW, scope=scope)
         if scan.ok:
             scanned: List[Dict[str, Any]] = scan.items()
             match = next(
@@ -435,8 +434,8 @@ def knowledge_topic(
             detail=(
                 f"no Engram record for {identity!r} within the read bounds: the knowledge "
                 f"search window (limit={MAX_DIGEST_ITEMS}) and an exact-key scan of the "
-                f"newest {MAX_TOPIC_KEY_SCAN} records — absent from these bounds is not "
-                "proof the record was never stored"
+                f"newest {MAX_WINDOW} records — absent from these bounds is not proof the "
+                "record was never stored"
             ),
         )
     # The server's search shape already carries the body (``buildSearchFTSQuery``
