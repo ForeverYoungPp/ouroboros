@@ -1486,11 +1486,12 @@ def save_state(drive_root: pathlib.Path, state: AdvisoryReviewState) -> None:
 def _mirror_latest_verdict(drive_root: pathlib.Path, state: AdvisoryReviewState) -> None:
     """Mirror the newest review verdict into Engram (W9). Never raises.
 
-    ``save_state`` runs on every mutation, so this leans on the sink's in-run
-    identity+content dedupe: an unchanged verdict is dropped as a duplicate and
-    only a genuinely new verdict is sent. ``obligation_ids`` and the finding
-    bodies are deliberately NOT forwarded — those are work items, and Engram
-    stores memories, not to-dos (C18).
+    BOTH mutation paths call this — ``save_state`` and ``update_state``, the one
+    production actually uses — so it leans on the sink's in-run identity+content
+    dedupe: an unchanged verdict is dropped as a duplicate and only a genuinely
+    new verdict is sent. ``obligation_ids`` and the finding bodies are
+    deliberately NOT forwarded — those are work items, and Engram stores memories,
+    not to-dos (C18).
     """
     try:
         attempt = state.latest_attempt()
@@ -1528,9 +1529,20 @@ def update_state(
         state = _load_state_unlocked(drive_root, strict_attempt_authority=True)
         result = mutator(state)
         _save_state_unlocked(drive_root, state)
-        return state if result is None else result
     finally:
         release_review_state_lock(drive_root, lock_fd)
+    # W9 mirrors on THIS path too, and it is the path that matters: every
+    # production mutation goes through here, while ``save_state`` has no caller
+    # outside the tests. Mirroring only in ``save_state`` therefore sent no
+    # verdict at all, however many were recorded — while the prompt section that
+    # reads them kept rendering.
+    #
+    # Deliberately OUTSIDE the lock: the sink talks HTTP, and holding the
+    # review-state lock across a network call would block the commit gate. A
+    # mutator that raises propagates past this line, so a half-applied state is
+    # never mirrored.
+    _mirror_latest_verdict(drive_root, state)
+    return state if result is None else result
 
 
 def acquire_review_state_lock(

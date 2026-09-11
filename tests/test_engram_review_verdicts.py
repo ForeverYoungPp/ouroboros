@@ -90,6 +90,41 @@ def test_only_the_verdict_reaches_engram(scaffold):
     reset_sinks()
 
 
+def test_a_mutation_through_update_state_mirrors_the_verdict(scaffold):
+    """The PRODUCTION mutation path must mirror, not just ``save_state``.
+
+    Every real mutation goes through ``update_state``; ``save_state`` has no caller
+    outside the tests. Mirroring only in ``save_state`` sent no verdict at all,
+    however many were recorded — while the prompt section that reads them kept
+    rendering, so the two halves never met. This drives the path production uses.
+    """
+    from ouroboros.review_state import AdvisoryReviewState, CommitAttemptRecord, update_state
+
+    state, env, _mem = scaffold
+
+    def _record(review_state: AdvisoryReviewState) -> None:
+        # An ATTEMPT is what the mirror reads (`latest_attempt`); advisory runs are
+        # a different ledger.
+        review_state.attempts.append(
+            CommitAttemptRecord(
+                ts="2026-01-01T00:00:00+00:00",
+                status="FAIL",
+                snapshot_hash="feedfacecafe",
+                block_reason="gate refused: missing receipt",
+                commit_message="the commit the gate refused",
+                task_id="t-update-state",
+                attempt=1,
+            )
+        )
+
+    update_state(env.drive_root, _record)
+
+    stored = [rec for rec in state.knowledge.values() if rec.get("type") == "review_verdict"]
+    assert len(stored) == 1
+    assert "FAIL" in stored[0]["content"]
+    reset_sinks()
+
+
 # --------------------------------------------------------------------------- #
 # The read half — bounded, typed, and only on the cold path
 # --------------------------------------------------------------------------- #

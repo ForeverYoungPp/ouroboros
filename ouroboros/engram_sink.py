@@ -1190,10 +1190,14 @@ def reconcile_local_dialogue_blocks(env: Any, *, limit: int = ENGRAM_HARD_LIMIT)
 
 
 def push_local_dialogue_blocks(target: Any, blocks: Any) -> int:
-    """Mirror the local distilled dialogue blocks into Engram. Returns how many landed.
+    """Mirror the given distilled dialogue blocks into Engram. Returns how many landed.
 
-    Idempotent by identity, so calling it on every boot costs a few no-op upserts
-    and can never duplicate a block. This is the one-time/repeatable half of
+    Idempotent by identity, so a caller may hand it a block Engram already holds —
+    that costs one no-op upsert and can never duplicate a record. Both callers do
+    exactly that: the consolidator pushes the blocks it just distilled, and
+    `reconcile_local_dialogue_blocks` pushes the pre-switch backlog at startup
+    (only the intervals the store is missing, so it does not lean on this
+    idempotence for its own cost). This is the one-time/repeatable half of
     replacing `## Dialogue History` with an Engram injection: without it, the
     distilled history that already exists locally would simply stop being
     reachable when the seam changes.
