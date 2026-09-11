@@ -315,6 +315,10 @@ def _run_block_consolidation(
     existing_blocks = _load_blocks(blocks_path)
     all_blocks = existing_blocks + new_blocks
 
+    # Defined OUTSIDE the branch: the mirror below reads it on every path, and a
+    # name that only exists inside an `if` raised a NameError that the mirror's own
+    # `except Exception` swallowed — the mirror silently did nothing.
+    era: Optional[Dict[str, Any]] = None
     if len(all_blocks) > MAX_SUMMARY_BLOCKS:
         compress_count = min(ERA_COMPRESS_COUNT, len(all_blocks) - 1)
         old_blocks = all_blocks[:compress_count]
@@ -348,6 +352,22 @@ def _run_block_consolidation(
                     total_usage["cost"] += float(era_usage["cost"])
 
     _write_locked_json(blocks_path, all_blocks)
+
+    # Mirror the blocks that were just distilled (W-dialogue). The local file
+    # stays the durable record; Engram is what the prompt seam reads now that
+    # `## Dialogue History` is gone. Identity is content-addressed, so a retried
+    # consolidation upserts rather than duplicating. Soft: a memory-transport
+    # failure must never fail a consolidation that already succeeded on disk.
+    try:
+        from ouroboros.engram_sink import push_local_dialogue_blocks
+
+        # The era block counts too: compressing four blocks into one creates a
+        # NEW record, and a mirror that skipped it would leave the distilled
+        # history readable only as its four un-compressed parts.
+        freshly_written = [*new_blocks, *([era] if era is not None else [])]
+        push_local_dialogue_blocks(blocks_path.parent.parent, freshly_written)
+    except Exception:
+        log.debug("Dialogue-block Engram mirror failed", exc_info=True)
 
     _advance_cursor(meta, segments, segment_sigs, segment_entries, last_offset + processed)
     meta["last_consolidated_at"] = utc_now_iso()

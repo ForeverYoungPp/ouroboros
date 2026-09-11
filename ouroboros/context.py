@@ -965,7 +965,13 @@ def build_governance_sections(env: Any, *, warn_large: bool = False, warn_label:
     return sections
 
 
-_SECTION_BUDGETS = {"scratchpad": SCRATCHPAD_SECTION_BUDGET_CHARS, "identity": 80_000, "registry": 30_000, "world": 16_000}
+#: How many remembered dialogue blocks one turn may surface.
+MAX_RECALL_ITEMS = 5
+#: Largest rendered recall section. The section it replaces had NO budget and
+#: reached 30,344 chars; a replacement without a bound would repeat that.
+DIALOGUE_RECALL_BUDGET_CHARS = 2_000
+
+_SECTION_BUDGETS = {"scratchpad": SCRATCHPAD_SECTION_BUDGET_CHARS, "identity": 80_000, "registry": 30_000, "world": 16_000, "dialogue_recall": DIALOGUE_RECALL_BUDGET_CHARS}
 
 
 def _warn_if_over_budget(name: str, content: str) -> None:
@@ -1009,7 +1015,69 @@ def _format_durable_gap_section(blocks: List[Dict[str, Any]]) -> str:
     )
 
 
-def build_memory_sections(memory: Memory, partition: str = "all", durable_dialogue_gaps_out: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+def _engram_recall_section(memory: Memory, query: str = "") -> str:
+    """Relevant remembered history, straight from Engram. Never raises.
+
+    Fills the seam `## Dialogue History` occupied, with its content now living in
+    Engram: fetched per turn instead of billed to every prompt in full. Two
+    properties matter and pull in opposite directions, so the shape is
+    "relevance first, recency as the fallback":
+
+    * RELEVANCE - what the owner just said is the natural query, and it is what
+      makes the section worth its bytes. Engram's search is the retrieval.
+    * CONTINUITY - the section it replaces was an unconditional narrative of
+      "what has been happening", not a keyword hit list. When the query matches
+      nothing (a fresh store, an unusual phrasing), the NEWEST blocks are shown
+      instead, so the agent still knows where it left off.
+
+    Layer 1 only: one title line per hit, never a body. Bodies are what the
+    `engram` tool is for, and shipping them here is how the removed 30 KB would
+    come straight back.
+    """
+    try:
+        from ouroboros.engram_read import client_for, digest, search_titles
+
+        client = client_for(memory)
+        body = ""
+        status = "empty"
+        if str(query or "").strip():
+            found = search_titles(
+                client, str(query), type_name="dialogue_summary", limit=MAX_RECALL_ITEMS
+            )
+            status, body = found.status, found.text
+        # Only a genuine "nothing matched" justifies the recency fallback. A
+        # refusal or an outage must keep its own status: falling back would
+        # overwrite it with "empty" and tell the reader there is no history.
+        if not body.strip() and status == "empty":
+            fallback = digest(
+                client, limit=MAX_RECALL_ITEMS, max_chars=DIALOGUE_RECALL_BUDGET_CHARS
+            )
+            status, body = fallback.status, (fallback.text or body)
+    except Exception:
+        return ""
+    if status == "unavailable":
+        return (
+            "## Remembered History (Engram)\n\n"
+            "(the memory service could not be reached, so recalled history is UNKNOWN "
+            "for this turn - not absent. `chat_history` still reads the raw log.)"
+        )
+    if status == "rejected":
+        return (
+            "## Remembered History (Engram)\n\n"
+            "(the memory service refused this request - a scope/session problem, not an "
+            "empty memory. Do not read this as 'there is no history'.)"
+        )
+    if not body.strip():
+        return ""
+    return (
+        "## Remembered History (Engram)\n\n"
+        "Relevant recalled memory - titles only. Use the `engram` tool "
+        "(`op='timeline'`, then `op='read'`) for a body, or `chat_history` for the "
+        "raw log.\n\n" + body[:DIALOGUE_RECALL_BUDGET_CHARS]
+    )
+
+
+def build_memory_sections(memory: Memory, partition: str = "all", durable_dialogue_gaps_out: Optional[List[Dict[str, Any]]] = None, recall_query: str = "") -> List[str]:
     sections = []
 
     include_stable = partition in {"all", "stable"}
@@ -1031,6 +1099,15 @@ def build_memory_sections(memory: Memory, partition: str = "all", durable_dialog
             sections.append("## Environment Profile (from `memory/WORLD.md` — already loaded; delete WORLD.md and restart to regenerate if the host environment changes)\n\n" + world_raw)
 
     if include_volatile:
+        # The seam `## Dialogue History` occupied. Its content lives in Engram
+        # now, so the SAME position is filled from there: relevance-first against
+        # what the owner just said, newest-first when that matches nothing,
+        # titles only, and hard-bounded.
+        recall_section = _engram_recall_section(memory, recall_query)
+        if recall_section:
+            _warn_if_over_budget("dialogue_recall", recall_section)
+            sections.append(recall_section)
+
         # `## Dialogue History` used to be injected here from
         # `dialogue_blocks.json`. Consolidation now exits the prompt: its blocks
         # are LLM-authored, doubly lossy (100 msgs → block, 4 blocks → era at
@@ -1538,7 +1615,13 @@ def _capture_context_core(
     dynamic_parts = []
     if health_section:
         dynamic_parts.append(health_section)
-    dynamic_parts.extend(build_memory_sections(context_memory, partition="volatile"))
+    dynamic_parts.extend(build_memory_sections(
+        context_memory,
+        partition="volatile",
+        # The owner's message is the natural retrieval query, and this is the
+        # turn's own text - not a cached impression of it.
+        recall_query=str(task.get("text") or ""),
+    ))
 
     registry_digest = _build_registry_digest(context_env)
     if registry_digest:

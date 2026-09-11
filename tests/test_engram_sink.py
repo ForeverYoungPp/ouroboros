@@ -781,3 +781,46 @@ def test_the_suite_cannot_reach_a_live_engram_service(tmp_path):
     sink.emit("memory_action", title="t", content="a durable fact")
 
     assert sink.pending_count() == 1, "a write escaped to a live service"
+
+
+def test_clearing_the_base_url_still_cannot_reach_the_default_endpoint(monkeypatch):
+    """One env var was not enough of a guard.
+
+    Several tests legitimately inspect env resolution and clear ENGRAM_BASE_URL.
+    With only that variable pinned, ``base_url or env_base_url() or
+    DEFAULT_BASE_URL`` fell through to the operator's live endpoint, and a
+    consolidator test mirrored a real block into their store. The port is pinned
+    too, so the fallback chain has nowhere live to land.
+    """
+    from ouroboros.engram_client import DEFAULT_BASE_URL, env_base_url
+
+    monkeypatch.delenv("ENGRAM_BASE_URL", raising=False)
+    resolved = env_base_url()
+
+    assert resolved, "the port pin is missing: resolution fell through to the default"
+    assert resolved != DEFAULT_BASE_URL
+    assert not resolved.endswith(":7437")
+
+
+def test_the_guard_survives_a_tests_monkeypatch_undo(monkeypatch):
+    """`monkeypatch.undo()` is not scoped to the test that calls it.
+
+    A test here uses it mid-test to drop its own patch, and it reverted the whole
+    suite's Engram guard with it — after which the client fell through to
+    DEFAULT_BASE_URL, the operator's live endpoint, and a consolidator test wrote a
+    real record into their store. The guard owns its own save/restore for exactly
+    that reason.
+    """
+    from ouroboros.engram_client import DEFAULT_BASE_URL, env_base_url
+
+    before = env_base_url()
+    assert before and before != DEFAULT_BASE_URL
+
+    monkeypatch.undo()
+
+    after = env_base_url()
+    assert after and after != DEFAULT_BASE_URL, (
+        "monkeypatch.undo() dismantled the Engram guard; a stray sink would now "
+        "talk to the operator's live service"
+    )
+    assert not after.endswith(":7437")

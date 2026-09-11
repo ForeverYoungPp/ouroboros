@@ -299,6 +299,43 @@ def type_digest(
     )
 
 
+def search_titles(
+    client: Any,
+    query: str,
+    *,
+    type_name: str = "",
+    limit: int = MAX_DIGEST_ITEMS,
+    max_chars: int = MAX_DIGEST_CHARS,
+) -> MachineRead:
+    """Layer-1 keyword recall: ONE title line per hit, never a body.
+
+    The server returns full observations from ``/search`` (verified against
+    ``buildSearchFTSQuery``), so the layering is enforced HERE: rendering titles
+    is what keeps an automatic per-turn recall from shipping bodies into the
+    prompt — which is exactly how the section this replaces reached 30 KB.
+    """
+    text = str(query or "").strip()
+    if not text:
+        return MachineRead(True, status="empty", count=0, detail="empty query")
+    wanted = _bounded_items(limit, MAX_DIGEST_ITEMS)
+    result = client.search(text, limit=wanted, type=type_name or "")
+    if not result.ok:
+        return _read_failure(result)
+    items: List[Dict[str, Any]] = result.items()
+    if type_name:
+        items = [item for item in items if str(item.get("type") or "") == type_name]
+    if not items:
+        return MachineRead(True, status="empty", count=0, detail=f"no {type_name or 'record'} matched")
+    latest = max(str(item.get("updated_at") or item.get("created_at") or "") for item in items)
+    return MachineRead(
+        True,
+        status="ok",
+        count=len(items),
+        version=_version_token(str(client.config.project or ""), len(items), latest),
+        text=_bounded_body([_line(item) for item in items[:wanted]], max_chars),
+    )
+
+
 def knowledge_topic(
     client: Any,
     topic: str,
@@ -452,5 +489,6 @@ __all__ = [
     "knowledge_topic",
     "memory_version",
     "recent",
+    "search_titles",
     "type_digest",
 ]

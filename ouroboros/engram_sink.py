@@ -79,6 +79,11 @@ SINK_KINDS = frozenset(
     {
         "memory_action",
         "knowledge",
+        # The consolidator's distilled dialogue blocks. They are the agent's
+        # continuity memory (100 messages -> one block, 4 blocks -> one era) and
+        # they used to ride in every prompt as `## Dialogue History`; mirroring
+        # them is what lets that seam inject Engram instead of a local file.
+        "dialogue_summary",
         "continuation_narrative",
         "evolution_checkpoint",
         "evolution_cycle_outcome",
@@ -463,6 +468,36 @@ class EngramSink:
                 k: row.get(k)
                 for k in ("task_id", "campaign_id", "cycle_outcome", "commit_sha", "git_sha")
                 if row.get(k)
+            },
+        )
+
+    def emit_dialogue_summary(self, block: Mapping[str, Any]) -> SinkReceipt:
+        """One distilled dialogue block from the consolidator.
+
+        Identity is content-addressed, so re-pushing the same local block (a
+        startup reconciliation, a retried consolidation) UPDATES the one record
+        instead of piling up near-duplicates.
+        """
+        return self._guard("dialogue_summary", self._dialogue_summary, block)
+
+    def _dialogue_summary(self, block: Any) -> SinkReceipt:
+        row = _as_mapping(block)
+        content = str(row.get("content") or "")
+        block_kind = str(row.get("type") or "summary")
+        span = _sanitize(row.get("range"), 120)
+        return self.emit(
+            "dialogue_summary",
+            title=_sanitize(f"Dialogue {block_kind}: {span}".strip()),
+            content=content,
+            identity=f"dialogue:{_fingerprint(block_kind, span, content)}",
+            type="dialogue_summary",
+            # Repo-wide: this is the one identity's continuity, not a project fact.
+            scope="global",
+            document=True,
+            fields={
+                "range": span,
+                "block_kind": block_kind,
+                "message_count": str(row.get("message_count") or ""),
             },
         )
 
@@ -1009,6 +1044,24 @@ def emit_task_narrative(env: Any, narrative: Any, *, task_id: str) -> bool:
         return False
 
 
+def push_local_dialogue_blocks(target: Any, blocks: Any) -> int:
+    """Mirror the local distilled dialogue blocks into Engram. Returns how many landed.
+
+    Idempotent by identity, so calling it on every boot costs a few no-op upserts
+    and can never duplicate a block. This is the one-time/repeatable half of
+    replacing `## Dialogue History` with an Engram injection: without it, the
+    distilled history that already exists locally would simply stop being
+    reachable when the seam changes.
+    """
+    count = 0
+    sink = sink_for(target)
+    for block in blocks or ():
+        receipt = sink.emit_dialogue_summary(_as_mapping(block))
+        if receipt.accepted:
+            count += 1
+    return count
+
+
 def emit_evolution_outcome(env: Any, entry: Any) -> bool:
     """WO — an evolution cycle's outcome (task-done or the later cycle verdict)."""
     try:
@@ -1040,6 +1093,7 @@ __all__ = [
     "SinkReceipt",
     "build_sink",
     "emit_evolution_outcome",
+    "push_local_dialogue_blocks",
     "emit_reflection_memory_actions",
     "emit_review_verdicts",
     "emit_task_narrative",

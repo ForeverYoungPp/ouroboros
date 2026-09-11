@@ -283,17 +283,30 @@ def pytest_runtest_call(item):  # noqa: ARG001
     asyncio.set_event_loop(None)
 
 
+#: Engram knobs the suite must never let point at a real service.
+_ENGRAM_ENV_KNOBS = ("ENGRAM_BASE_URL", "ENGRAM_PORT", "ENGRAM_PROJECT", "ENGRAM_SOCKET")
+
+
 @pytest.fixture(autouse=True)
-def _never_touch_a_live_engram_service(monkeypatch):
+def _never_touch_a_live_engram_service():
     """Point Engram at a dead port unless a test opts into a stub.
 
     The durable-memory integration emits from ORDINARY production paths —
     reflection memory actions, authored task summaries, review state, boot
-    reconciliation, evolution checkpoints — so any test that exercises one of
-    those and does not stub the service will write records into whatever Engram
-    is reachable. On a developer machine that is the operator's REAL memory
-    store, and because the scope resolves from the tmp directory the suite gets
-    one junk project per test. Observed live: 28 such projects.
+    reconciliation, evolution checkpoints, dialogue consolidation — so any test
+    that exercises one of those and does not stub the service writes records into
+    whatever Engram is reachable. On a developer machine that is the operator's
+    REAL memory store, and because the scope resolves from the tmp directory the
+    suite gets one junk project per run. Observed live: 28 such projects, and a
+    later leak that created a session named after the pytest session directory.
+
+    Deliberately NOT `monkeypatch`. A test is allowed to call
+    `monkeypatch.undo()` — one here does, mid-test, to drop its own patch — and
+    that undo is not scoped to what that test added: it reverts EVERY patch on the
+    shared fixture instance, this guard's included. With the variable gone, the
+    client fell through to `DEFAULT_BASE_URL` (the operator's live endpoint) and a
+    consolidator test mirrored a real block into it. Owning the save/restore here
+    makes the guard survive any test's undo.
     """
     import socket
 
@@ -303,13 +316,23 @@ def _never_touch_a_live_engram_service(monkeypatch):
         probe.bind(("127.0.0.1", 0))
         dead_port = probe.getsockname()[1]
 
-    monkeypatch.setenv("ENGRAM_BASE_URL", f"http://127.0.0.1:{dead_port}")
-    monkeypatch.delenv("ENGRAM_PROJECT", raising=False)
-    monkeypatch.delenv("ENGRAM_SOCKET", raising=False)
-    monkeypatch.delenv("ENGRAM_PORT", raising=False)
+    saved = {name: os.environ.get(name) for name in _ENGRAM_ENV_KNOBS}
+    # Both URL and PORT, so the fallback chain has nowhere live to land even if a
+    # later patch removes one of them.
+    os.environ["ENGRAM_BASE_URL"] = f"http://127.0.0.1:{dead_port}"
+    os.environ["ENGRAM_PORT"] = str(dead_port)
+    for name in ("ENGRAM_PROJECT", "ENGRAM_SOCKET"):
+        os.environ.pop(name, None)
     reset_sinks()
-    yield
-    reset_sinks()
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        reset_sinks()
 
 
 @pytest.fixture(autouse=True)
@@ -547,6 +570,10 @@ class EngramStubState:
         self.detect_error_hint = ""
         # Sessions that exist. POST /observations requires one.
         self.sessions: set = set()
+        # Monotonic, like the real AUTOINCREMENT primary key. Deriving ids from
+        # len() reused a live id whenever an upsert kept the table size constant,
+        # which overwrote an unrelated record instead of adding one.
+        self.next_id = 1000
         self.fail = False
 
 
@@ -672,7 +699,8 @@ def _engram_stub_handler(state):
                 # lands in BOTH projections: ``knowledge`` (id -> record, serving the
                 # search/get read path) and ``observations`` (the recency feed) —
                 # a real store serves both from one table.
-                new_id = len(state.knowledge) + 1000
+                new_id = state.next_id
+                state.next_id += 1
                 written = {
                     "id": new_id,
                     "type": body.get("type"),
