@@ -848,6 +848,21 @@ def verify_system_state(env: Any, git_sha: str) -> None:
     except Exception:
         pass
 
+    # The prompt seam reads dialogue history from Engram now, so the blocks the
+    # consolidator distilled BEFORE that changed have to be carried across or the
+    # distilled biography would simply start at the changeover. Only the missing
+    # intervals are pushed, so a start against a settled mirror reads once and
+    # writes nothing. Best-effort: an unreachable Engram leaves this for the next
+    # start rather than blocking startup (C6).
+    try:
+        from ouroboros.engram_sink import reconcile_local_dialogue_blocks
+
+        reconciled = reconcile_local_dialogue_blocks(env)
+        if reconciled:
+            checks["engram_dialogue_reconciled"] = reconciled
+    except Exception:
+        pass
+
     memory_dir = env.drive_path("memory")
     identity_path = memory_dir / "identity.md"
     scratchpad_path = memory_dir / "scratchpad.md"

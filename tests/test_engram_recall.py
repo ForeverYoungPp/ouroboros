@@ -18,13 +18,19 @@ different:
 
 from __future__ import annotations
 
+import json
+
 from ouroboros.context import (
     DIALOGUE_RECALL_BUDGET_CHARS,
     _engram_recall_section,
     build_memory_sections,
 )
 from ouroboros.engram_read import client_for, search_titles
-from ouroboros.engram_sink import push_local_dialogue_blocks, reset_sinks
+from ouroboros.engram_sink import (
+    _dialogue_block_identity,
+    push_local_dialogue_blocks,
+    reset_sinks,
+)
 from ouroboros.memory import Memory
 
 
@@ -340,6 +346,83 @@ def test_a_block_with_no_range_does_not_collapse_into_another(engram_stub):
     reset_sinks()
 
 
+def test_the_offset_interval_keeps_two_same_span_chunks_apart(engram_stub):
+    """Minute-resolution timestamps CAN collide; message offsets cannot.
+
+    A burst of a hundred messages inside one minute hands two different chunks the
+    same `range` string. Addressing the record by that string would let the second
+    overwrite the first, so the offsets win whenever the block carries them — and
+    the title stays the readable span, because that is all the recall seam shows.
+    """
+    state, env = engram_stub
+    from ouroboros.engram_sink import sink_for
+
+    span = "2026-09-07 03:28 - 03:28"
+    first, second = _block(span, "chunk one"), _block(span, "chunk two")
+    first["offset_range"], second["offset_range"] = "0-100", "100-200"
+
+    sink_for(env).emit_dialogue_summary(first)
+    reset_sinks()
+    sink_for(env).emit_dialogue_summary(second)
+
+    stored = [r for r in state.knowledge.values() if r.get("type") == "dialogue_summary"]
+    assert len(stored) == 2
+    assert {r["topic_key"] for r in stored} == {
+        "dialogue:summary:0-100",
+        "dialogue:summary:100-200",
+    }
+    # Titles may coincide: two intervals can share a span. The identity is what
+    # keeps them apart, and the title must stay human-readable for the seam.
+    assert {r["title"] for r in stored} == {f"Dialogue summary: {span}"}
+    reset_sinks()
+
+
+def test_boot_reconciliation_pushes_only_the_blocks_engram_lacks(engram_stub):
+    """The carried-over history must arrive once, not on every start.
+
+    The seam reads dialogue history from Engram, so the blocks distilled before
+    the seam changed have to be mirrored — but a settled mirror must cost no
+    writes at all, or every boot would bump every record's revision forever.
+    """
+    state, env = engram_stub
+    from ouroboros.engram_sink import reconcile_local_dialogue_blocks, sink_for
+
+    blocks = [_block("2026-09-05", "one"), _block("2026-09-06", "two")]
+    (env.drive_root / "memory" / "dialogue_blocks.json").write_text(
+        json.dumps(blocks), encoding="utf-8"
+    )
+    sink_for(env).emit_dialogue_summary(blocks[0])  # already mirrored
+    reset_sinks()
+
+    assert reconcile_local_dialogue_blocks(env) == 1
+
+    stored = [r for r in state.knowledge.values() if r.get("type") == "dialogue_summary"]
+    assert len(stored) == 2
+    reset_sinks()
+    assert reconcile_local_dialogue_blocks(env) == 0
+    reset_sinks()
+
+
+def test_reconciliation_pushes_nothing_when_engram_is_unreachable(engram_stub):
+    """A down daemon must not be handed the whole backlog on every start.
+
+    Pushing blind would spool every block, so a daemon that stays down would
+    accumulate the same records start after start. Doing nothing costs only a
+    later start, when the mirror is up.
+    """
+    state, env = engram_stub
+    from ouroboros.engram_sink import reconcile_local_dialogue_blocks, sink_for
+
+    (env.drive_root / "memory" / "dialogue_blocks.json").write_text(
+        json.dumps([_block("2026-09-05", "one")]), encoding="utf-8"
+    )
+    state.fail = True
+
+    assert reconcile_local_dialogue_blocks(env) == 0
+    assert sink_for(env).pending_count() == 0
+    reset_sinks()
+
+
 def test_the_consolidator_mirrors_what_it_just_wrote(engram_stub, tmp_path, monkeypatch):
     """The mirror is wired to the write, so new history is reachable immediately."""
     from ouroboros import consolidator
@@ -365,7 +448,7 @@ def test_the_consolidator_mirrors_what_it_just_wrote(engram_stub, tmp_path, monk
     seen: list = []
     monkeypatch.setattr(
         "ouroboros.engram_sink.push_local_dialogue_blocks",
-        lambda target, blocks: seen.append([b.get("content") for b in blocks]) or len(list(blocks)),
+        lambda target, blocks: seen.append(list(blocks)) or len(list(blocks)),
     )
     monkeypatch.setattr(consolidator, "_consolidation_route", lambda: ("test-model", False))
     monkeypatch.setattr(
@@ -376,5 +459,10 @@ def test_the_consolidator_mirrors_what_it_just_wrote(engram_stub, tmp_path, monk
     consolidator.consolidate(chat, blocks_path, meta_path, llm_client=object(), identity_text="i")
 
     assert seen, "the consolidator did not push the blocks it distilled"
-    assert any("# distilled" in str(entry) for group in seen for entry in group)
+    pushed = seen[0][0]
+    assert "# distilled" in str(pushed.get("content"))
+    # End to end: the consolidator records the offsets it covered and the mirror
+    # addresses the record by them, so two chunks sharing a minute cannot collide.
+    assert pushed["offset_range"] == f"0-{consolidator.BLOCK_SIZE}"
+    assert _dialogue_block_identity(pushed) == f"dialogue:summary:0-{consolidator.BLOCK_SIZE}"
     reset_sinks()

@@ -299,6 +299,14 @@ def _run_block_consolidation(
                 "ts": utc_now_iso(),
                 "type": "summary",
                 "range": range_str,
+                # The message offsets this block covers. `range` is minute-resolution
+                # timestamps, so a burst of BLOCK_SIZE messages inside one minute can
+                # hand two different chunks the SAME range string — and because the
+                # Engram mirror addresses a record by its interval, a collision there
+                # silently overwrites one interval with another (Bible P1). Offsets
+                # are unique by construction and stable when the same window is
+                # re-processed, which is exactly what that identity needs.
+                "offset_range": f"{last_offset + i * BLOCK_SIZE}-{last_offset + (i + 1) * BLOCK_SIZE}",
                 "message_count": len(chunk),
                 "content": content.strip(),
             })
@@ -430,6 +438,25 @@ Create a detailed episodic memory entry from these {message_count} messages.
     return _call_consolidation_llm(llm_client, prompt, "Block summary LLM call")
 
 
+def _blocks_offset_range(blocks: List[Dict[str, Any]]) -> str:
+    """The message-offset interval a run of blocks covers, or ``""`` if unknown.
+
+    An era's own ``range`` is date-only, so two eras built from blocks that all
+    fall on the same day(s) would carry the SAME range string and collide in the
+    Engram mirror's interval identity — the older era silently overwriting the
+    newer. Deriving the span from the blocks instead keeps them distinct.
+
+    Blocks distilled before offsets were recorded have none, and ``""`` makes the
+    mirror fall back to their timestamps.
+    """
+    spans = [str(block.get("offset_range") or "") for block in blocks]
+    first = spans[0].split("-")[0] if spans and spans[0] else ""
+    last = spans[-1].split("-")[-1] if spans and spans[-1] else ""
+    if not first or not last:
+        return ""
+    return f"{first}-{last}"
+
+
 def _compress_blocks_to_era(
     blocks: List[Dict[str, Any]],
     llm_client: Any,
@@ -466,6 +493,7 @@ Write as Ouroboros (first person). Aim for 30-40% of original length.
         "ts": utc_now_iso(),
         "type": "era",
         "range": f"{start_date} to {end_date}",
+        "offset_range": _blocks_offset_range(blocks),
         "message_count": sum(b.get("message_count", 0) for b in blocks),
         "content": content.strip(),
     }

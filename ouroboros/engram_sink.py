@@ -40,6 +40,7 @@ log = logging.getLogger(__name__)
 
 from ouroboros.engram_client import (  # noqa: E402
     _FORBIDDEN_PROJECTS,
+    ENGRAM_HARD_LIMIT,
     EngramClient,
     EngramResult,
     resolve_project,
@@ -62,6 +63,11 @@ SPOOL_MAX_ENTRIES = 500
 #: reused because no equivalent document cap exists, and it is generous enough
 #: that truncation is a genuine anomaly worth a visible marker.
 KNOWLEDGE_DOC_CHARS = 16_000
+
+#: Every distilled dialogue record is written to this scope. It is the one
+#: identity's repo-wide continuity rather than a per-project fact, and the boot
+#: reconciliation reads it back through the same constant so the two cannot drift.
+_DIALOGUE_SCOPE = "global"
 
 SPOOL_REL = pathlib.Path("state") / "engram_spool.jsonl"
 #: When a spool with NOTHING pending exceeds this, it is rewritten empty.
@@ -161,6 +167,53 @@ def _fingerprint(*parts: Any) -> str:
 
     key = " | ".join(re.sub(r"\s+", " ", str(p or "")).strip().lower() for p in parts)
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+
+
+def _dialogue_block_identity(block: Any) -> str:
+    """The Engram ``topic_key`` one distilled dialogue block is addressed by.
+
+    Interval-addressed, not content-addressed: the interval is what the block IS,
+    the prose is only how it was phrased this time, so re-summarising a span (a
+    retry, a lost ack, a cursor that did not advance) must UPDATE that interval's
+    record instead of adding a second one for it.
+
+    Three interval sources, most precise first:
+
+    * ``gap_id`` — a memory-gap marker has no interval at all (its range is the
+      ``"unknown"`` sentinel) and puts its distinguishing datum here, so two gaps
+      stay two facts instead of collapsing into one (P1);
+    * ``offset_range`` — the message offsets the block covers, unique by
+      construction, unlike the minute-resolution timestamps in ``range`` where a
+      burst of 100 messages inside one minute can label two chunks alike;
+    * ``range`` — what blocks distilled before offsets were recorded carry.
+
+    Only a block with none of the three falls back to its content fingerprint.
+
+    Used by the write path AND by the boot reconciliation, so the two can never
+    disagree about which interval a record belongs to.
+    """
+    row = _as_mapping(block)
+    kind = str(row.get("type") or "summary")
+    span = _sanitize(row.get("range"), 120)
+    interval = (
+        _sanitize(row.get("gap_id"), 120)
+        or _sanitize(row.get("offset_range"), 120)
+        or (span if span and span != "unknown" else "")
+    )
+    if interval:
+        return f"dialogue:{kind}:{interval}"
+    return f"dialogue:{kind}:{_fingerprint(kind, span, str(row.get('content') or ''))}"
+
+
+def _normalized_topic_key(value: Any) -> str:
+    """Mirror Engram's ``normalizeTopicKey``: lowercased, fields joined by ``-``, 120 max.
+
+    Only ever used to decide whether a push would be redundant. A mismatch here
+    cannot duplicate a record: the server normalises the pushed identity the same
+    way, so a redundant push updates that record rather than creating a second.
+    """
+    text = re.sub(r"\s+", " ", str(value or "")).strip().lower()
+    return "-".join(text.split(" "))[:120]
 
 
 def _as_mapping(value: Any) -> Dict[str, Any]:
@@ -486,33 +539,21 @@ class EngramSink:
         block_kind = str(row.get("type") or "summary")
         span = _sanitize(row.get("range"), 120)
         gap_id = _sanitize(row.get("gap_id"), 120)
-        # The interval, when there is one, is the span the consolidator derived
-        # from the chunk's endpoints — a pure function of them, so the same span
-        # retried produces the same identity and therefore an update rather than
-        # a second record for one interval.
-        #
-        # Two cases have no usable interval and must NOT collapse onto one shared
-        # identity (P1: a memory gap is a fact, and two gaps are two facts):
-        #   * a gap marker, whose range is the literal "unknown" sentinel while
-        #     the distinguishing datum lives in gap_id;
-        #   * any block with no range at all (this function takes arbitrary
-        #     mappings, so it cannot assume the consolidator's producers).
-        # Those fall back to a label that is unique per block, and only a block
-        # with neither label nor interval falls back to the content fingerprint.
-        interval = span if span and span != "unknown" else ""
-        label = gap_id or interval
-        # One label drives BOTH the title and the identity so they cannot drift:
-        # Engram's fallback dedupe keys on the title as well as the content hash,
-        # so two records that must stay distinct must not share a title.
-        identity = f"dialogue:{block_kind}:{label or _fingerprint(block_kind, span, content)}"
+        # The title and the identity are separate on purpose. The recall seam
+        # renders titles only, so the title stays the human-readable span — while
+        # the identity is whatever is uniquely addressable (an offset range, for
+        # instance, which no reader could make sense of as a caption). The two
+        # agree wherever the span is the address, and a gap marker, which has no
+        # span, captions itself by the gap_id that keeps it distinct from the
+        # other gaps.
         return self.emit(
             "dialogue_summary",
-            title=_sanitize(f"Dialogue {block_kind}: {label or span}".strip()),
+            title=_sanitize(f"Dialogue {block_kind}: {gap_id or span}".strip()),
             content=content,
-            identity=identity,
+            identity=_dialogue_block_identity(row),
             type="dialogue_summary",
             # Repo-wide: this is the one identity's continuity, not a project fact.
-            scope="global",
+            scope=_DIALOGUE_SCOPE,
             document=True,
             fields={
                 "range": span,
@@ -1067,6 +1108,87 @@ def emit_task_narrative(env: Any, narrative: Any, *, task_id: str) -> bool:
         return False
 
 
+def _read_local_dialogue_blocks(drive_root: Any) -> List[Dict[str, Any]]:
+    """The consolidator's distilled blocks, or ``[]`` when they cannot be read.
+
+    Read straight off disk rather than through ``Memory``: ``memory`` imports this
+    module, so this module must not import it back.
+    """
+    try:
+        path = pathlib.Path(drive_root) / "memory" / "dialogue_blocks.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [block for block in payload if isinstance(block, dict)]
+
+
+def _mirrored_dialogue_keys(client: Any, *, limit: int) -> Optional[set]:
+    """Normalised identities of the dialogue records Engram already holds.
+
+    ``None`` means "could not find out". The caller must then do NOTHING rather
+    than treat the store as empty — that would re-push the whole backlog on every
+    boot of an unreachable or refusing daemon.
+    """
+    read = client.recent(scope=_DIALOGUE_SCOPE, limit=limit)
+    if not read.ok:
+        return None
+    return {
+        _normalized_topic_key(row.get("topic_key"))
+        for row in read.items()
+        if str(row.get("type") or "") == "dialogue_summary" and row.get("topic_key")
+    }
+
+
+def reconcile_local_dialogue_blocks(env: Any, *, limit: int = ENGRAM_HARD_LIMIT) -> int:
+    """Mirror the local dialogue blocks Engram does not hold yet. Returns how many.
+
+    The prompt seam reads dialogue history from Engram now, so the blocks distilled
+    *before* the seam changed have to be carried across once or they simply stop
+    being reachable — the distilled biography would begin at the changeover. This
+    is the boot half of that; the consolidator's own mirror covers everything
+    distilled from now on.
+
+    Only the MISSING intervals are pushed, so a boot against a settled mirror costs
+    one cheap read and no writes at all.
+
+    Three properties make it safe to run on every boot:
+
+    * **one-way** — the local file stays the durable record; nothing is written
+      back to it and nothing is ever deleted from Engram;
+    * **never guesses** — an unresolvable project, an unreachable daemon or an
+      unreadable local store all mean "do nothing now", never "push blind". A
+      blind push would also be a write storm: with Engram down, every block would
+      land in the spool and stay there;
+    * **worst case is a redundant upsert** — a block that is already mirrored, or
+      that the read's bound hid, is pushed again, and the server keys on the same
+      normalised identity, so that updates one record instead of duplicating it.
+    """
+    try:
+        sink = sink_for(env)
+        if sink.config_error:
+            return 0
+        blocks = _read_local_dialogue_blocks(sink.drive_root)
+        if not blocks:
+            return 0
+        if not sink.client.health().ok:
+            return 0
+        mirrored = _mirrored_dialogue_keys(sink.client, limit=limit)
+        if mirrored is None:
+            return 0
+        missing = [
+            block
+            for block in blocks
+            if _normalized_topic_key(_dialogue_block_identity(block)) not in mirrored
+        ]
+        if not missing:
+            return 0
+        return push_local_dialogue_blocks(env, missing)
+    except Exception:
+        return 0
+
+
 def push_local_dialogue_blocks(target: Any, blocks: Any) -> int:
     """Mirror the local distilled dialogue blocks into Engram. Returns how many landed.
 
@@ -1117,6 +1239,7 @@ __all__ = [
     "build_sink",
     "emit_evolution_outcome",
     "push_local_dialogue_blocks",
+    "reconcile_local_dialogue_blocks",
     "emit_reflection_memory_actions",
     "emit_review_verdicts",
     "emit_task_narrative",
