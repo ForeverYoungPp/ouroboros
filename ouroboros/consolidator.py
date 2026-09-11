@@ -361,11 +361,31 @@ def _run_block_consolidation(
 
     _write_locked_json(blocks_path, all_blocks)
 
+    # The cursor is made durable BEFORE the mirror, and that order is the point.
+    # A process that dies between the two leaves a block on disk with the cursor
+    # already past it — a state the next start repairs, because the boot
+    # carry-over pushes whatever intervals Engram is missing. The other order puts
+    # the whole mirror (one HTTP round trip per block, each with a timeout) inside
+    # the window where the block is durable and the cursor is not, so a death
+    # there re-summarises the SAME window on the next run and appends a second
+    # block for one interval.
+    _advance_cursor(meta, segments, segment_sigs, segment_entries, last_offset + processed)
+    meta["last_consolidated_at"] = utc_now_iso()
+    atomic_write_json(meta_path, meta)
+
+    # Durable work is finished. Everything below is a best-effort follow-up, and
+    # the record of what was consolidated is written first so a mirror that hangs
+    # on an unreachable daemon cannot delay the operator-visible result.
+    log.info("Block consolidation: %d messages -> %d new blocks (total %d)",
+             processed, len(new_blocks), len(all_blocks))
+
     # Mirror the blocks that were just distilled (W-dialogue). The local file
     # stays the durable record; Engram is what the prompt seam reads now that
-    # `## Dialogue History` is gone. Identity is content-addressed, so a retried
-    # consolidation upserts rather than duplicating. Soft: a memory-transport
-    # failure must never fail a consolidation that already succeeded on disk.
+    # `## Dialogue History` is gone. Identity is the INTERVAL a block covers, so a
+    # retried consolidation updates that interval's record instead of adding a
+    # second one for it. Soft: a memory-transport failure must never fail a
+    # consolidation that already succeeded on disk, and a block this misses is
+    # carried over on the next start.
     try:
         from ouroboros.engram_sink import push_local_dialogue_blocks
 
@@ -377,12 +397,6 @@ def _run_block_consolidation(
     except Exception:
         log.debug("Dialogue-block Engram mirror failed", exc_info=True)
 
-    _advance_cursor(meta, segments, segment_sigs, segment_entries, last_offset + processed)
-    meta["last_consolidated_at"] = utc_now_iso()
-    atomic_write_json(meta_path, meta)
-
-    log.info("Block consolidation: %d messages -> %d new blocks (total %d)",
-             processed, len(new_blocks), len(all_blocks))
     return total_usage
 
 

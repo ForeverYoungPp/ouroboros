@@ -446,10 +446,18 @@ def test_the_consolidator_mirrors_what_it_just_wrote(engram_stub, tmp_path, monk
     )
 
     seen: list = []
-    monkeypatch.setattr(
-        "ouroboros.engram_sink.push_local_dialogue_blocks",
-        lambda target, blocks: seen.append(list(blocks)) or len(list(blocks)),
-    )
+    cursor_when_mirrored: list = []
+
+    def _capture(target, blocks):
+        # What the NEXT process would resume from, read off disk at the moment the
+        # mirror runs.
+        cursor_when_mirrored.append(
+            json.loads(meta_path.read_text(encoding="utf-8")).get("last_consolidated_offset")
+        )
+        seen.append(list(blocks))
+        return len(list(blocks))
+
+    monkeypatch.setattr("ouroboros.engram_sink.push_local_dialogue_blocks", _capture)
     monkeypatch.setattr(consolidator, "_consolidation_route", lambda: ("test-model", False))
     monkeypatch.setattr(
         consolidator, "_create_block_summary",
@@ -465,4 +473,8 @@ def test_the_consolidator_mirrors_what_it_just_wrote(engram_stub, tmp_path, monk
     # addresses the record by them, so two chunks sharing a minute cannot collide.
     assert pushed["offset_range"] == f"0-{consolidator.BLOCK_SIZE}"
     assert _dialogue_block_identity(pushed) == f"dialogue:summary:0-{consolidator.BLOCK_SIZE}"
+    # The cursor is durable BEFORE the mirror runs. A death during the mirror must
+    # leave the next start pushing this block, not re-summarising the same window
+    # and appending a second block for one interval.
+    assert cursor_when_mirrored == [consolidator.BLOCK_SIZE]
     reset_sinks()
