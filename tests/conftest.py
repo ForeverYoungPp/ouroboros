@@ -723,6 +723,15 @@ def _engram_stub_handler(state):
                          or needle in str(rec.get("content", "")).lower())
                     and (not wanted_type or str(rec.get("type")) == wanted_type)
                 ]
+                # The real /search honours ``limit`` (a RANKED SLICE, not the set).
+                # Without this the stub always returned every match, so a target
+                # below the window could never be exercised.
+                try:
+                    _limit = int(str(params.get("limit", [""])[0]) or 0)
+                except ValueError:
+                    _limit = 0
+                if _limit > 0:
+                    body = body[:_limit]
             elif parsed.path.startswith("/observations/"):
                 tail = parsed.path.rsplit("/", 1)[-1]
                 body = _engram_all_records(state).get(int(tail)) if tail.isdigit() else None

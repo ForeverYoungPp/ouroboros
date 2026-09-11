@@ -585,6 +585,58 @@ def _params(state, path):
     return next(r["params"] for r in state.requests if r["path"] == path)
 
 
+def _seed_knowledge_recorded(state, topic: str, content: str, *, obs_id: int) -> None:
+    """Seed BOTH projections: the real write path mirrors one row into the search
+    table and the recency feed, and the fallback scan reads the recency feed."""
+    _seed_knowledge(state, topic, content, obs_id=obs_id)
+    state.observations.append(dict(state.knowledge[obs_id]))
+
+
+def test_a_topic_below_the_search_window_is_still_resolved(stub):
+    """The live risk the 3 -> 45 knowledge growth created.
+
+    ``/search`` answers with a RANKED SLICE (limit=8); a target can sit below it,
+    and the pre-fix code then reported "no Engram record" — an under-report shown
+    as a whole-set absence. The bounded exact-key scan resolves it.
+    """
+    from ouroboros.engram_read import MAX_DIGEST_ITEMS, MAX_TOPIC_KEY_SCAN, knowledge_topic
+
+    state, env = stub
+    # The window fills with decoys that MATCH the query but are not the target...
+    for i in range(MAX_DIGEST_ITEMS + 2):
+        _seed_knowledge_recorded(
+            state, f"decoy-{i}", "a body mentioning under-the-window in passing",
+            obs_id=300 + i,
+        )
+    # ...and the target is seeded last, so it sorts BELOW the window.
+    _seed_knowledge_recorded(state, "under-the-window", "the real body", obs_id=101)
+
+    read = knowledge_topic(client_for(env), "under-the-window")
+
+    assert read.ok and read.status == "ok" and read.text == "the real body"
+    paths = [r["path"] for r in state.requests]
+    assert "/search" in paths, "the fast path still runs first"
+    assert "/observations/recent" in paths, "the fallback scan ran on the window miss"
+    assert int(_params(state, "/observations/recent")["limit"]) == MAX_TOPIC_KEY_SCAN
+    assert _params(state, "/observations/recent")["project"] == "repo"   # same scope, no leak
+
+
+def test_a_genuinely_absent_topic_reports_a_bounded_absence(stub):
+    """C15-style truthfulness: a bounded read must not claim the SET is empty."""
+    from ouroboros.engram_read import MAX_DIGEST_ITEMS, MAX_TOPIC_KEY_SCAN, knowledge_topic
+
+    state, env = stub
+    _seed_knowledge_recorded(state, "some-other-topic", "unrelated body", obs_id=101)
+
+    read = knowledge_topic(client_for(env), "never-written")
+
+    assert read.ok and read.status == "empty" and read.count == 0
+    assert f"limit={MAX_DIGEST_ITEMS}" in read.detail
+    assert str(MAX_TOPIC_KEY_SCAN) in read.detail
+    for forbidden in ("never learned", "does not exist", "not stored at all"):
+        assert forbidden not in read.detail.lower()
+
+
 def test_knowledge_topic_body_is_bounded(stub):
     from ouroboros.engram_read import MAX_TOPIC_CHARS, knowledge_topic
 
