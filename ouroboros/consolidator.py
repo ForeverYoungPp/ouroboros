@@ -912,6 +912,13 @@ def _write_knowledge_entries(
     mirror, so this branch now lands exactly where every other knowledge write
     lands.
 
+    ``mode="append"``, because this branch used to APPEND to the topic body and
+    still must: consolidation re-extracts a topic as new dialogue teaches more
+    about it, and the earlier extraction is not superseded — it is the other half.
+    Engram's upsert only bumps ``revision_count`` and keeps no revision history, so
+    an overwrite here would delete the prior body outright from the only store that
+    still has it (the canonical local file is retired), which is a P1 loss.
+
     ``_locked`` is accepted and IGNORED on purpose. ``_knowledge_write`` takes its
     own lock, and that lock is a plain non-reentrant file lock — calling this from
     inside one deadlocks rather than nesting. Callers must invoke it outside.
@@ -934,7 +941,7 @@ def _write_knowledge_entries(
             log.debug("consolidator: skipping invalid knowledge topic %r", topic)
             continue
         try:
-            _knowledge_write(ctx, topic, content, mode="overwrite")
+            _knowledge_write(ctx, topic, content, mode="append")
         except Exception:
             # A learned lesson that silently fails to land is invisible learning
             # erosion; warn so the loss is owner-greppable.
