@@ -284,6 +284,35 @@ def pytest_runtest_call(item):  # noqa: ARG001
 
 
 @pytest.fixture(autouse=True)
+def _never_touch_a_live_engram_service(monkeypatch):
+    """Point Engram at a dead port unless a test opts into a stub.
+
+    The durable-memory integration emits from ORDINARY production paths —
+    reflection memory actions, authored task summaries, review state, boot
+    reconciliation, evolution checkpoints — so any test that exercises one of
+    those and does not stub the service will write records into whatever Engram
+    is reachable. On a developer machine that is the operator's REAL memory
+    store, and because the scope resolves from the tmp directory the suite gets
+    one junk project per test. Observed live: 28 such projects.
+    """
+    import socket
+
+    from ouroboros.engram_sink import reset_sinks
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        dead_port = probe.getsockname()[1]
+
+    monkeypatch.setenv("ENGRAM_BASE_URL", f"http://127.0.0.1:{dead_port}")
+    monkeypatch.delenv("ENGRAM_PROJECT", raising=False)
+    monkeypatch.delenv("ENGRAM_SOCKET", raising=False)
+    monkeypatch.delenv("ENGRAM_PORT", raising=False)
+    reset_sinks()
+    yield
+    reset_sinks()
+
+
+@pytest.fixture(autouse=True)
 def _reset_engram_turn_budgets():
     """The ``engram`` tool's per-turn retrieval budget is process-scoped state.
 

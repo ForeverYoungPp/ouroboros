@@ -696,3 +696,88 @@ def test_an_identity_candidate_is_stored_as_a_proposal_not_a_fact(stub, tmp_path
     assert "candidate" in body["title"].lower()
     # Not mistaken for a to-do either: it is a memory, just an unadopted one.
     assert body["content"].startswith("IDENTITY")
+
+
+# --------------------------------------------------------------------------- #
+# The spool is append-only — so it must also be allowed to stop growing
+# --------------------------------------------------------------------------- #
+
+
+def test_a_fully_acked_spool_is_compacted(stub, tmp_path, monkeypatch):
+    """Append-only keeps a crash recoverable; it must not keep the file forever.
+
+    Measured before this existed: 12 successful writes left 24 rows / 4.5 KB, and
+    every send re-read the whole file to count pending records.
+    """
+    from ouroboros import engram_sink as sink_mod
+
+    state, url = stub
+    monkeypatch.setattr(sink_mod, "SPOOL_COMPACT_BYTES", 512)
+    sink = _sink(tmp_path, url, max_emits=200)
+
+    for index in range(40):
+        sink.emit("memory_action", title=f"fact {index}", content=f"durable fact {index}")
+
+    assert sink.pending_count() == 0
+    assert sink.spool_path.stat().st_size <= 512, "the spool grew without bound"
+    # Nothing was lost: every record reached the store.
+    assert len(_saved(state)) == 40
+
+
+def test_a_spool_with_pending_records_is_never_compacted(stub, tmp_path, monkeypatch):
+    """Unforwarded memory is not ours to drop — the bound must not touch it."""
+    from ouroboros import engram_sink as sink_mod
+
+    state, url = stub
+    monkeypatch.setattr(sink_mod, "SPOOL_COMPACT_BYTES", 1)  # compact eagerly
+    sink = _sink(tmp_path, url, max_emits=200)
+    state.fail = True
+    for index in range(5):
+        sink.emit("memory_action", title=f"fact {index}", content=f"durable fact {index}")
+    state.fail = False
+
+    assert sink.pending_count() == 5
+    assert sink.compact_if_idle() is False
+    assert sink.pending_count() == 5, "compaction ate a record that never landed"
+
+
+def test_compaction_leaves_nothing_pending_and_keeps_the_bytes_sane(stub, tmp_path, monkeypatch):
+    """Compaction is idempotent and cheap when there is nothing to do."""
+    from ouroboros import engram_sink as sink_mod
+
+    state, url = stub
+    monkeypatch.setattr(sink_mod, "SPOOL_COMPACT_BYTES", 0)
+    sink = _sink(tmp_path, url, max_emits=200)
+    sink.emit("memory_action", title="fact", content="a durable fact")
+
+    assert sink.pending_count() == 0
+    assert sink.compact_if_idle() is False  # already idle and empty
+    assert sink.pending_count() == 0
+
+
+def test_the_suite_cannot_reach_a_live_engram_service(tmp_path):
+    """The autouse guard is the only thing between this suite and a real store.
+
+    The durable-memory integration emits from ordinary production paths
+    (reflection, task summaries, review state, boot reconciliation, evolution
+    checkpoints), so a test that exercises one of those and forgets to stub the
+    service writes into whatever Engram is reachable — on a developer machine,
+    the operator's own memory, one junk project per tmp_path. That happened: 28
+    such projects were found in a live store.
+    """
+    from ouroboros.engram_client import DEFAULT_BASE_URL, env_base_url
+    from ouroboros.engram_sink import build_sink
+
+    url = env_base_url()
+    assert url, "no redirect is in place: a stray sink would talk to the real service"
+    assert url != DEFAULT_BASE_URL, "the suite is pointed at the operator's default endpoint"
+
+    # And a write with no stub goes to the spool instead of to a live service.
+    repo = tmp_path / "repo"
+    drive = tmp_path / "drive"
+    (repo / ".engram").mkdir(parents=True)
+    (repo / ".engram" / "config.json").write_text('{"project_name": "guard-probe"}')
+    sink = build_sink(repo, drive)
+    sink.emit("memory_action", title="t", content="a durable fact")
+
+    assert sink.pending_count() == 1, "a write escaped to a live service"

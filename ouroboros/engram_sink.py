@@ -26,6 +26,8 @@ See ``.ouroboros/seed-engram-memory.yaml`` for the full contract.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import pathlib
 import re
 import threading
@@ -34,7 +36,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
 
-from ouroboros.engram_client import (
+log = logging.getLogger(__name__)
+
+from ouroboros.engram_client import (  # noqa: E402
     _FORBIDDEN_PROJECTS,
     EngramClient,
     EngramResult,
@@ -60,6 +64,13 @@ SPOOL_MAX_ENTRIES = 500
 KNOWLEDGE_DOC_CHARS = 16_000
 
 SPOOL_REL = pathlib.Path("state") / "engram_spool.jsonl"
+#: When a spool with NOTHING pending exceeds this, it is rewritten empty.
+#: Housekeeping only, not a correctness bound: a fully-acknowledged spool carries
+#: no information, and the append-only format keeps two rows per write forever — so
+#: without this the file grows without bound AND every send re-reads all of it
+#: (``_send`` asks ``pending_count()``). A spool that still holds unforwarded memory
+#: is NEVER touched.
+SPOOL_COMPACT_BYTES = 256 * 1024
 SPOOL_SCHEMA_VERSION = 1
 
 #: Recognised sink kinds. ``evolution_cycle_outcome`` shares the checkpoint's
@@ -552,6 +563,7 @@ class EngramSink:
         if result.ok:
             _spool_append(self.spool_path, {"v": SPOOL_SCHEMA_VERSION, "op": "ack",
                                             "spool_id": spool_id, "ts": _now()})
+            self.compact_if_idle()
             return SinkReceipt(kind, spool_id, "sent")
         self._disclose_once(result)
         return SinkReceipt(kind, spool_id, "spooled",
@@ -622,6 +634,43 @@ class EngramSink:
             topic_key=identity,
         )
 
+    def compact_if_idle(self) -> bool:
+        """Rewrite the spool empty when it holds nothing pending. Never raises.
+
+        Follows the canonical JSONL-rewrite pattern in this codebase (see
+        ``process_custody._rewrite_ledger``): take the SAME sidecar lock the
+        appenders take, write a temp file, ``replace_atomic``. Somebody else's
+        in-flight append can therefore never be lost to this rewrite, and a crash
+        leaves either the old file or the new one — never a partial one.
+        """
+        try:
+            path = self.spool_path
+            if not path.exists() or path.stat().st_size <= SPOOL_COMPACT_BYTES:
+                return False
+            from ouroboros.platform_layer import (
+                acquire_exclusive_file_lock,
+                release_exclusive_file_lock,
+            )
+            from ouroboros.utils import jsonl_append_lock_path, replace_atomic
+
+            lock_path = jsonl_append_lock_path(path)
+            lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=2.0, stale_sec=10.0)
+            try:
+                # Decided UNDER the lock: a record appended after this point would
+                # be erased by the rewrite, and unforwarded memory is not ours to
+                # drop.
+                if _pending_records(path):
+                    return False
+                tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+                tmp.write_text("", encoding="utf-8")
+                replace_atomic(tmp, path)
+                return True
+            finally:
+                release_exclusive_file_lock(lock_path, lock_fd)
+        except Exception:
+            log.debug("Engram spool compaction failed", exc_info=True)
+            return False
+
     def _flush(self, *, limit: int) -> int:
         acked = 0
         for record in self.pending()[: max(1, int(limit))]:
@@ -632,6 +681,7 @@ class EngramSink:
             _spool_append(self.spool_path, {"v": SPOOL_SCHEMA_VERSION, "op": "ack",
                                             "spool_id": record.get("spool_id"), "ts": _now()})
             acked += 1
+        self.compact_if_idle()
         return acked
 
     def _disclose_once(self, result: EngramResult) -> None:
