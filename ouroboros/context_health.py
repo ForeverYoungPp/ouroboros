@@ -41,10 +41,10 @@ def _thin_local_memory_note(env: Any, filename: str, local_chars: int) -> str:
         read = entry_count(client_for(env))
     except Exception as exc:
         return f"NOTE: LOCAL THIN MEMORY — {headline}; Engram not configured ({type(exc).__name__})."
-    if read.status == "unavailable":
+    if read.unknown:
         return (
-            f"NOTE: LOCAL THIN MEMORY — {headline}; Engram unreachable, so memory presence "
-            "is UNKNOWN (not absent)."
+            f"NOTE: LOCAL THIN MEMORY — {headline}; Engram could not answer "
+            f"({read.status}), so memory presence is UNKNOWN (not absent)."
         )
     if read.count > 0:
         return f"OK: {filename} thin locally ({local_chars} chars); {read.count} memories in Engram."

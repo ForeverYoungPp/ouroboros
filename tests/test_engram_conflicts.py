@@ -68,8 +68,12 @@ def test_the_policy_never_invents_a_comparison(engram_stub):
     state, env = engram_stub
     persist_verdict(client_for(env), memory_id_a=1, memory_id_b=2, relation="not_conflict")
 
-    # No client-side similarity/FTS probing, no reads at all: one write, nothing else.
-    assert [r["path"] for r in state.requests] == ["/conflicts/compare"]
+    # No client-side similarity/FTS probing and no reads at all: the bootstrap
+    # pair the documented client flow makes, then the one write.
+    assert [
+        r["path"] for r in state.requests
+        if r["path"] not in ("/project/current", "/sessions")
+    ] == ["/conflicts/compare"]
     reset_sinks()
 
 

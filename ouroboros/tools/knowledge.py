@@ -306,10 +306,11 @@ def _engram_topic_fallback(ctx: ToolContext, topic: str) -> str:
             f"Topic '{topic}' not found locally, and Engram could not be reached "
             f"({type(exc).__name__}) — whether a durable record exists is UNKNOWN, not absent."
         )
-    if read.status == "unavailable":
+    if read.unknown:
         return (
-            f"Topic '{topic}' not found locally, and Engram is unreachable — whether a durable "
-            "record exists is UNKNOWN, not absent. Do not conclude the knowledge was never learned."
+            f"Topic '{topic}' not found locally, and Engram could not answer "
+            f"({read.status}) — whether a durable record exists is UNKNOWN, not absent. "
+            "Do not conclude the knowledge was never learned."
         )
     if read.status == "ok" and read.text.strip():
         return (
@@ -543,7 +544,7 @@ def _write_base(
         )
         if read.status == "ok" and read.text:
             return read.text, "engram"
-        unreachable = read.status == "unavailable"
+        unreachable = read.unknown
     except Exception:
         unreachable = True
 
@@ -575,9 +576,9 @@ def _engram_list_note(ctx: ToolContext) -> str:
         read = recent(client_for(ctx), limit=MAX_REVIEW_ITEMS)
     except Exception:
         return ""
-    if read.status == "unavailable":
+    if read.unknown:
         return (
-            " Engram is unreachable, so whether durable knowledge exists remotely is "
+            " Engram could not answer, so whether durable knowledge exists remotely is "
             "UNKNOWN, not absent — do not conclude nothing was learned."
         )
     if read.count <= 0:

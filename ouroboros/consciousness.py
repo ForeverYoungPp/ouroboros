@@ -1162,7 +1162,7 @@ class BackgroundConsciousness:
             from ouroboros.engram_read import client_for, due_for_review
 
             batch = due_for_review(client_for(env))
-            if batch.read.status == "unavailable":
+            if batch.read.unknown:
                 parts.append(
                     "## Engram review cycle\n\n"
                     "(unavailable — what is due for review is UNKNOWN this cycle, "

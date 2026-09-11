@@ -78,6 +78,17 @@ def env_base_url() -> str:
     return ""
 
 
+def env_socket() -> str:
+    """Engram's Unix-socket transport knob. Supported only to REPORT the mismatch.
+
+    Engram's own reference client selects its transport with ``ENGRAM_PORT`` or
+    ``ENGRAM_SOCKET``. This client speaks HTTP over TCP only, so a socket-only
+    deployment is not a service outage and must not be reported as one: the
+    disclosure names the socket so the operator sees the real reason.
+    """
+    return str(os.environ.get("ENGRAM_SOCKET", "") or "").strip()
+
+
 def env_project() -> str:
     """Operator override for the Engram project name.
 
@@ -287,7 +298,10 @@ class EngramClient:
         # default all_projects=False silently strips the project from every call
         # and memories leak across projects (failure mode F7).
         wants_all = str(clean.get("all_projects", "")).strip().lower() in {"true", "1", "yes"}
-        if self.config.project and path != "/health" and not wants_all:
+        # /health is unscoped by definition, and /project/current IS the resolver —
+        # injecting a project into either would make the client assert the answer it
+        # is asking the server for.
+        if self.config.project and path not in _UNSCOPED_PATHS and not wants_all:
             clean["project"] = self.config.project
         try:
             response = requests.request(
@@ -369,6 +383,38 @@ class EngramClient:
                 "limit": _clamp(limit, 1, ENGRAM_HARD_LIMIT, DEFAULT_SEARCH_LIMIT),
                 "scope": scope or None,
                 "all_projects": all_projects or None,
+            },
+        )
+
+    def project_current(self, cwd: str = "") -> EngramResult:
+        """``GET /project/current`` — the SERVER's project policy for one directory.
+
+        Engram's own reference client resolves the project this way rather than
+        reimplementing the rules (its helper is commented "Resolve the project
+        through the server, which owns project policy"). The envelope carries
+        ``project``, ``project_source`` and, for an ambiguous directory,
+        ``available_projects`` + ``error_hint`` rather than an error.
+        """
+        return self._request("GET", "/project/current", params={"cwd": cwd or None})
+
+    def create_session(
+        self, session_id: str, project: str, directory: str = ""
+    ) -> EngramResult:
+        """``POST /sessions`` — create (or re-assert) one session.
+
+        Idempotent in practice, and it is the ONLY way a project comes into
+        existence over HTTP: ``POST /observations`` requires a session that already
+        exists, and project-scoped routes reject an explicit project the store does
+        not know (``404 unknown_project``). So this call is the bootstrap, not an
+        optional nicety.
+        """
+        return self._request(
+            "POST",
+            "/sessions",
+            body={
+                "id": str(session_id),
+                "project": str(project),
+                "directory": str(directory or ""),
             },
         )
 
@@ -466,8 +512,12 @@ class EngramClient:
                 "title": title,
                 "content": content,
                 "tool_name": tool_name or None,
-                # Project is a body field on create, not just a query param.
-                "project": project or self.config.project,
+                # Deliberately NOT defaulted to the client's project. Engram
+                # inherits the project from the SESSION ("Normal writes should not
+                # pass `project` as an arbitrary override"), and an inherited scope
+                # can never disagree with the session that authorises the write.
+                # Pass an explicit project only to target another known project.
+                "project": project or None,
                 "scope": scope,
                 "topic_key": topic_key or None,
             },
@@ -499,7 +549,8 @@ class EngramClient:
                 "content": content,
                 "session_id": session_id,
                 "source": source or None,
-                "project": project or self.config.project,
+                # Same rule as save(): the session owns the project association.
+                "project": project or None,
             },
         )
 
@@ -605,6 +656,10 @@ class EngramClient:
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+
+#: Routes that must never carry the client's project: one is unscoped by
+#: definition, the other is the authority the client asks ABOUT the project.
+_UNSCOPED_PATHS = frozenset({"/health", "/project/current", "/sessions"})
 
 _RELATIONS = frozenset(
     {"related", "compatible", "scoped", "conflicts_with", "supersedes", "not_conflict"}

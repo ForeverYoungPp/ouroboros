@@ -137,7 +137,7 @@ def _engram_review_section(drive_root: pathlib.Path, repo_dir: Any = None) -> st
         )
     except Exception as exc:
         return f"## ENGRAM MEMORY\n(not configured: {type(exc).__name__})\n"
-    if read.status == "unavailable":
+    if read.unknown:
         return (
             "## ENGRAM MEMORY\n(unavailable — memory presence is UNKNOWN for this review, "
             "not absent; do not read this as 'nothing was learned')\n"
@@ -147,7 +147,7 @@ def _engram_review_section(drive_root: pathlib.Path, repo_dir: Any = None) -> st
     body = f"## ENGRAM MEMORY ({read.count} records)\n{read.text}\n"
     if scratch.status == "ok":
         body += f"\n### Working memory in Engram ({scratch.count} block(s))\n{scratch.text}\n"
-    elif scratch.status == "unavailable":
+    elif scratch.unknown:
         body += (
             "\n### Working memory in Engram\n(unavailable — whether the agent's working memory "
             "was recorded is UNKNOWN for this review, not absent)\n"

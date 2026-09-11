@@ -1263,11 +1263,11 @@ def _engram_verdict_section(env: Any) -> str:
         read = type_digest(client_for(env), "review_verdict")
     except Exception:
         return ""
-    if read.status == "unavailable":
+    if read.unknown:
         return (
             "## Review verdicts (Engram)\n\n"
-            "(unreachable — whether any verdict was recorded is UNKNOWN for this turn, "
-            "not absent)"
+            f"(could not be read: {read.status} — whether any verdict was recorded is "
+            "UNKNOWN for this turn, not absent)"
         )
     if read.status != "ok" or not read.text.strip():
         return ""

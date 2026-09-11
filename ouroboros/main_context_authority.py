@@ -106,7 +106,7 @@ def _narrative_from_engram(
         read = continuation_narrative(client_for(scope), task_id)
     except Exception:
         return None, "unknown"
-    if read.status == "unavailable":
+    if read.unknown:
         return None, "unknown"
     if read.status != "ok" or not read.text.strip():
         return None, "absent"

@@ -512,6 +512,12 @@ class EngramStubState:
         # The real search shape carries the full observation; False models a
         # body-less (preview-style) response so both read paths stay covered.
         self.search_returns_content = False
+        # Engram's server-owned project policy, as /project/current answers it.
+        self.detected_project = "repo"
+        self.detected_source = "config"
+        self.detect_error_hint = ""
+        # Sessions that exist. POST /observations requires one.
+        self.sessions: set = set()
         self.fail = False
 
 
@@ -561,6 +567,18 @@ def _engram_stub_handler(state):
             parsed = urlparse(self.path)
             if parsed.path == "/observations/recent":
                 body = state.observations
+            elif parsed.path == "/project/current":
+                # Detection never requires the project to exist (verified against
+                # handleCurrentProject), which is what makes bootstrap possible.
+                body = {
+                    "project": state.detected_project,
+                    "project_source": state.detected_source,
+                    "project_path": str(state.detected_project),
+                    "cwd": str(parse_qs(parsed.query).get("cwd", [""])[0]),
+                    "available_projects": None,
+                }
+                if state.detect_error_hint:
+                    body["error_hint"] = state.detect_error_hint
             elif parsed.path == "/stats":
                 # Body-free: a count question gets a count. One table backs both
                 # projections, so the count is the distinct-id union.
@@ -615,6 +633,11 @@ def _engram_stub_handler(state):
                 return self._down()
             parsed = urlparse(self.path)
             if parsed.path in ("/observations", "/observations/passive") and isinstance(body, dict):
+                if str(body.get("session_id") or "") not in state.sessions:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"session not found"}')
+                    return
                 # Keep the fake store coherent with what was written, so a
                 # write-then-read round trip can be exercised end to end. The record
                 # lands in BOTH projections: ``knowledge`` (id -> record, serving the
@@ -645,6 +668,10 @@ def _engram_stub_handler(state):
                                 if item.get("topic_key") != body.get("topic_key")
                             ]
                 state.observations.append(written)
+            if parsed.path == "/sessions" and isinstance(body, dict):
+                state.sessions.add(str(body.get("id") or ""))
+                self._reply({"id": body.get("id"), "status": "created"})
+                return
             if parsed.path == "/conflicts/compare" and isinstance(body, dict):
                 sync = f"rel-{len(state.relations):04x}" if state.compare_returns_sync else ""
                 state.relations.append({

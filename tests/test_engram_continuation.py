@@ -96,7 +96,7 @@ def test_one_round_trip_when_the_hit_carries_the_body(engram_stub):
     read = continuation_narrative(client_for(env), "task-one")
 
     assert read.ok and read.text == "body included in the hit"
-    assert [r["path"] for r in state.requests] == ["/search"]
+    assert [r["path"] for r in state.requests if r["path"] not in ("/project/current", "/sessions")] == ["/search"]
 
 
 def test_a_body_less_hit_still_resolves(engram_stub):
@@ -108,7 +108,7 @@ def test_a_body_less_hit_still_resolves(engram_stub):
     read = continuation_narrative(client_for(env), "task-two")
 
     assert read.ok and read.text == "body fetched separately"
-    assert [r["path"] for r in state.requests] == ["/search", "/observations/700"]
+    assert [r["path"] for r in state.requests if r["path"] not in ("/project/current", "/sessions")] == ["/search", "/observations/700"]
 
 
 def test_the_narrative_read_is_bounded_and_typed(engram_stub):
@@ -137,7 +137,11 @@ def test_knowledge_topic_also_uses_a_single_round_trip_when_it_can(engram_stub):
     read = knowledge_topic(client_for(env), "auth")
 
     assert read.ok and read.text == "tokens rotate atomically"
-    assert [r["path"] for r in state.requests] == ["/search"]
+    # The bootstrap pair precedes it; the DATA read is still a single round trip.
+    assert [
+        r["path"] for r in state.requests
+        if r["path"] not in ("/project/current", "/sessions")
+    ] == ["/search"]
 
 
 # --------------------------------------------------------------------------- #

@@ -69,6 +69,23 @@ class MachineRead:
         """True when the store answered — regardless of whether it held anything."""
         return self.status in {"ok", "empty"}
 
+    @property
+    def unknown(self) -> bool:
+        """True when the store did NOT answer, so presence is UNKNOWN, not absent.
+
+        Two different failures live here and both mean "absence is unproven":
+
+        * ``unavailable`` — the service could not be reached (transport/timeout);
+        * ``rejected`` — the service answered and refused the request (an unknown
+          project, a missing session, a bad selector).
+
+        They are kept distinct because the FIX differs (start the service vs. fix
+        the scope), but every consumer that would otherwise conclude "there is no
+        memory" must treat both as unknown. Collapsing them into one status made a
+        configuration error read as "Engram is unreachable" while /health was 200.
+        """
+        return self.status in {"unavailable", "rejected"}
+
     def as_metadata(self) -> Dict[str, Any]:
         """Compact projection for a durable record (no bodies)."""
         return {"status": self.status, "count": self.count, "version": self.version}
@@ -98,10 +115,21 @@ class ReviewBatch:
 
 
 def _read_failure(result: Any) -> MachineRead:
+    """Classify a failed read from what the store actually did.
+
+    A 4xx is the server ANSWERING — an unknown project, a missing session, an
+    invalid selector. Calling that "unavailable" told the reader the service was
+    down when it was up and had refused the request, which sends the operator to
+    the wrong problem entirely.
+    """
+    kind = str(getattr(result, "error_kind", "") or "unknown")
+    status = getattr(result, "status", None)
+    detail = str(getattr(result, "detail", ""))[:200]
+    http_rejected = kind == "http" and isinstance(status, int) and 400 <= status < 500
     return MachineRead(
         False,
-        status="unavailable",
-        detail=f"{getattr(result, 'error_kind', 'unknown')}: {str(getattr(result, 'detail', ''))[:200]}",
+        status="rejected" if http_rejected else "unavailable",
+        detail=f"{kind} {status if status is not None else ''}: {detail}".strip(),
     )
 
 
@@ -377,10 +405,17 @@ def continuation_narrative(
 
 
 def client_for(target: Any) -> Any:
-    """Repo-pinned client for reads — same configuration path as the write sink."""
+    """Repo-pinned client for reads — same configuration path as the write sink.
+
+    The sink is made ready first, because a project-scoped READ is also refused
+    until the project exists in the store (``404 unknown_project``). Reads create
+    nothing beyond that one idempotent session call.
+    """
     from ouroboros.engram_sink import sink_for
 
-    return sink_for(target).client
+    sink = sink_for(target)
+    sink.ensure_ready()
+    return sink.client
 
 
 def _version_token(project: str, count: int, latest: str) -> str:

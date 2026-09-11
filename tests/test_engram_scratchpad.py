@@ -214,7 +214,7 @@ def test_type_digest_filters_by_type_over_a_bounded_window(engram_stub):
     assert "block one" in read.text and "block two" in read.text
     assert "not a block" not in read.text
     # One bounded request, not a sweep.
-    assert len(state.requests) == 1
+    assert [r["path"] for r in state.requests if r["path"] not in ("/project/current", "/sessions")] == ["/observations/recent"]
     assert int(state.requests[-1]["params"]["limit"]) == 50
 
 

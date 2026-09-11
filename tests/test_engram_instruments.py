@@ -536,7 +536,11 @@ def test_knowledge_topic_reads_one_record_by_topic_key(stub):
 
     assert read.ok and read.text == "tokens rotate atomically"
     # Bounded + targeted: one search, one body fetch — never a store sweep.
-    assert [r["path"] for r in state.requests] == ["/search", "/observations/101"]
+    # The bootstrap pair comes first: the server owns project policy, and the
+    # session is created before any read can be scoped to an existing project.
+    assert [r["path"] for r in state.requests] == [
+        "/project/current", "/sessions", "/search", "/observations/101",
+    ]
     assert int(_params(state, "/search")["limit"]) == 8
     assert _params(state, "/search")["project"] == "repo"
 
@@ -788,18 +792,35 @@ def test_the_supervisor_ctx_spelling_is_accepted(stub):
     reset_sinks()
 
 
-def test_a_bare_drive_root_never_silently_becomes_its_own_project(stub, monkeypatch):
-    """With no repo root knowable, the caller must pass one — not guess.
+def test_a_bare_drive_root_is_resolved_by_the_server(stub, monkeypatch):
+    """When the service answers, it owns the answer — even for a bare drive root.
 
-    ``_repo_root_hint`` falls back to the drive root only as a last resort; this
-    pins the fact that the fallback IS the drive name, so a future caller that
-    drops its repo root is caught by ``test_every_production_call_shape...`` rather
-    than discovered as two half-empty memory stores.
+    Engram's reference client resolves through the server for exactly this reason,
+    so the client cannot invent a scope the service disagrees with. The drive's own
+    directory name is only what is LEFT when nothing better can be learned.
     """
     from ouroboros.engram_sink import reset_sinks, sink_for
 
     state, env = stub
     monkeypatch.delenv("OUROBOROS_REPO_DIR", raising=False)
+    state.detected_project = "resolved-by-server"
+    reset_sinks()
+    assert sink_for(env.drive_root).client.config.project == "resolved-by-server"
+    reset_sinks()
+
+
+def test_the_offline_fallback_is_the_drive_name_when_nothing_can_answer(stub, monkeypatch):
+    """Offline with no repo root, the fallback IS the drive name.
+
+    That is the last resort, not a design: it is why every production caller passes
+    a root (``test_no_production_caller_hands_engram_a_bare_drive_root``) and why
+    the drive carries its own ``.engram/config.json`` pin.
+    """
+    from ouroboros.engram_sink import reset_sinks, sink_for
+
+    state, env = stub
+    monkeypatch.delenv("OUROBOROS_REPO_DIR", raising=False)
+    state.fail = True  # nothing to ask
     reset_sinks()
     assert sink_for(env.drive_root).client.config.project == env.drive_root.name
     reset_sinks()
@@ -894,3 +915,195 @@ def test_no_production_caller_hands_engram_a_bare_drive_root():
         "drive's directory name and write to a SECOND memory store:\n  "
         + "\n  ".join(offenders)
     )
+
+
+# --------------------------------------------------------------------------- #
+# The bootstrap Engram's own client performs, and which we were missing
+# --------------------------------------------------------------------------- #
+
+
+def test_the_project_comes_from_the_server_not_from_our_own_rules(stub):
+    """One GET /project/current?cwd= — the server owns project policy.
+
+    Reimplementing the rules client-side is how the two sides end up disagreeing;
+    Engram's reference client asks, and so do we.
+    """
+    from ouroboros.engram_sink import reset_sinks, sink_for
+
+    state, env = stub
+    state.detected_project = "server-says-so"
+    state.detected_source = "config"
+    reset_sinks()
+
+    sink = sink_for(env)
+
+    assert sink.client.config.project == "server-says-so"
+    detect = next(r for r in state.requests if r["path"] == "/project/current")
+    assert detect["params"]["cwd"] == str(env.repo_dir.resolve())
+    # The resolver must not be told the answer it is being asked for.
+    assert "project" not in detect["params"]
+    reset_sinks()
+
+
+def test_an_ambiguous_detection_is_not_adopted(stub):
+    """`error_hint` means detection did not decide; keep the offline resolution."""
+    from ouroboros.engram_sink import reset_sinks, sink_for
+
+    state, env = stub
+    state.detected_project = ""
+    state.detected_source = "ambiguous"
+    state.detect_error_hint = "10 repositories under this directory"
+    reset_sinks()
+
+    assert sink_for(env).client.config.project == "repo"  # the .engram/config.json name
+    reset_sinks()
+
+
+def test_a_forbidden_detection_is_refused(stub):
+    """`local` is exactly the cross-project leak F7 names; never adopt it."""
+    from ouroboros.engram_sink import reset_sinks, sink_for
+
+    state, env = stub
+    state.detected_project = "local"
+    state.detected_source = "process_override"
+    reset_sinks()
+
+    assert sink_for(env).client.config.project == "repo"
+    reset_sinks()
+
+
+def test_an_operator_override_beats_the_server(stub, monkeypatch):
+    from ouroboros.engram_sink import reset_sinks, sink_for
+
+    state, env = stub
+    state.detected_project = "server-says-so"
+    monkeypatch.setenv("ENGRAM_PROJECT", "operator-says-so")
+    reset_sinks()
+
+    assert sink_for(env).client.config.project == "operator-says-so"
+    reset_sinks()
+
+
+def test_the_session_is_created_before_anything_is_written(stub):
+    """`POST /observations` requires a session; without this every write 404s."""
+    from ouroboros.engram_sink import reset_sinks
+    from ouroboros.tools.knowledge import _knowledge_write
+
+    state, env = stub
+    reset_sinks()
+    ctx = _tool_ctx(env)
+    _knowledge_write(ctx, "bootstrap", "a fact")
+
+    paths = [r["path"] for r in state.requests]
+    assert paths.index("/sessions") < paths.index("/observations")
+    session = next(r for r in state.requests if r["path"] == "/sessions")
+    assert session["body"]["project"] == "repo"
+    assert session["body"]["id"] == "repo"
+    assert session["body"]["directory"] == str(env.repo_dir.resolve())
+    reset_sinks()
+
+
+def test_the_write_inherits_the_project_from_the_session(stub):
+    """Engram: "Normal writes should not pass `project` as an arbitrary override"."""
+    from ouroboros.engram_sink import reset_sinks
+    from ouroboros.tools.knowledge import _knowledge_write
+
+    state, env = stub
+    reset_sinks()
+    _knowledge_write(_tool_ctx(env), "inherit", "a fact")
+
+    body = _saved_observations(state)[-1]["body"]
+    assert body["session_id"] == "repo"
+    assert not str(body.get("project") or "").strip(), (
+        "the write asserted a project instead of inheriting the session's"
+    )
+    reset_sinks()
+
+
+def test_reads_also_bootstrap_once(stub):
+    """A project-scoped READ 404s until the project exists, so reads bootstrap too."""
+    from ouroboros.engram_read import client_for
+    from ouroboros.engram_sink import reset_sinks
+
+    state, env = stub
+    reset_sinks()
+    client_for(env)
+
+    assert [r["path"] for r in state.requests] == ["/project/current", "/sessions"]
+    reset_sinks()
+
+
+def test_the_bootstrap_happens_once_per_process(stub):
+    from ouroboros.engram_read import client_for
+    from ouroboros.engram_sink import reset_sinks
+
+    state, env = stub
+    reset_sinks()
+    for _ in range(4):
+        client_for(env)
+
+    assert [r["path"] for r in state.requests].count("/sessions") == 1
+    reset_sinks()
+
+
+def test_a_failed_bootstrap_stays_visible(stub):
+    """A refused session must not be assumed away: the write spools and discloses."""
+    from ouroboros.engram_sink import reset_sinks, sink_for
+    from ouroboros.tools.knowledge import _knowledge_write
+
+    state, env = stub
+    state.fail = True
+    reset_sinks()
+    _knowledge_write(_tool_ctx(env), "no-bootstrap", "a fact")
+
+    sink = sink_for(env)
+    assert sink.ensure_ready() is False
+    assert sink.pending_count() == 1
+    assert (env.drive_root / "logs" / "engram.jsonl").exists()
+    reset_sinks()
+
+
+def test_a_4xx_is_reported_as_rejected_not_as_unreachable():
+    """The store ANSWERED and refused.
+
+    Reporting that as "unreachable" is what sent me chasing a dead service while
+    /health was 200 — the failure the operator can fix (an unknown project, a
+    missing session) was hidden behind the one they cannot.
+    """
+    from ouroboros.engram_client import EngramResult
+    from ouroboros.engram_read import MachineRead, _read_failure
+
+    refused = _read_failure(
+        EngramResult(False, status=404, error_kind="http",
+                     detail='{"code":"unknown_project","error":"project \"ouroboros\" not found"}')
+    )
+    assert refused.status == "rejected"
+    assert refused.unknown is True and refused.readable is False
+    assert "404" in refused.detail and "unknown_project" in refused.detail
+
+    for status in (400, 401, 403, 409, 422):
+        assert _read_failure(
+            EngramResult(False, status=status, error_kind="http", detail="x")
+        ).status == "rejected"
+
+    # A transport failure keeps its own name: the fix is different.
+    assert _read_failure(
+        EngramResult(False, error_kind="transport", detail="connection refused")
+    ).status == "unavailable"
+    assert _read_failure(
+        EngramResult(False, status=503, error_kind="http", detail="upstream")
+    ).status == "unavailable"
+    # ...and both mean "absence is unproven", which is the question consumers ask.
+    for status in ("rejected", "unavailable"):
+        assert MachineRead(False, status=status).unknown is True
+    assert MachineRead(True, status="empty").unknown is False
+
+
+def test_the_socket_transport_mismatch_is_named(monkeypatch):
+    """Socket-only mode is a CLIENT limitation, not an outage."""
+    from ouroboros.engram_client import env_socket
+
+    monkeypatch.setenv("ENGRAM_SOCKET", "/tmp/engram.sock")
+    assert env_socket() == "/tmp/engram.sock"
+    monkeypatch.delenv("ENGRAM_SOCKET", raising=False)
+    assert env_socket() == ""

@@ -285,7 +285,9 @@ def test_save_sends_project_in_body_and_path_is_correct(stub, tmp_path):
     client.save(session_id="s1", type="learning", title="T", content="C")
     entry = state.requests[-1]
     assert entry["method"] == "POST" and entry["path"] == "/observations"
-    assert entry["body"]["project"] == client.config.project
+    # Engram inherits the project from the session, and its own guidance says not to
+    # pass it as an arbitrary override. An explicit project still wins when given.
+    assert entry["body"]["project"] is None
     assert entry["body"]["title"] == "T"
 
 

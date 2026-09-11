@@ -34,7 +34,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
 
-from ouroboros.engram_client import EngramClient, EngramResult, resolve_project
+from ouroboros.engram_client import (
+    _FORBIDDEN_PROJECTS,
+    EngramClient,
+    EngramResult,
+    resolve_project,
+)
 
 # --------------------------------------------------------------------------- #
 # Policy constants (all reused from existing local conventions — C3)
@@ -189,6 +194,9 @@ class EngramSink:
     client: EngramClient
     drive_root: pathlib.Path
     session_id: str = ""
+    #: The repository this sink speaks for. The session is created with it, and it
+    #: is what the server resolves the project from when no override was given.
+    repo_root: Any = None
     #: Non-empty when the sink could not resolve a safe project scope. Every
     #: send is then refused locally so nothing is scattered into a wrong
     #: project; records still spool and disclose (C6 + F7).
@@ -196,6 +204,8 @@ class EngramSink:
     max_emits: int = MAX_EMITS_PER_RUN
     _emits: int = field(default=0, init=False, repr=False)
     _disclosed: bool = field(default=False, init=False, repr=False)
+    _ready: bool = field(default=False, init=False, repr=False)
+    _ready_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     #: identity -> content fingerprint already emitted this run. Same identity
     #: with *different* content is an update (C19) and must still be sent.
     _seen: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
@@ -205,6 +215,47 @@ class EngramSink:
     @property
     def spool_path(self) -> pathlib.Path:
         return pathlib.Path(self.drive_root) / SPOOL_REL
+
+    # -- bootstrap (Engram's own recommended flow) ------------------------- #
+
+    @property
+    def session(self) -> str:
+        """The session this sink writes under.
+
+        Engram requires a session on every observation and inherits the PROJECT
+        from it, so the session is the write identity. Ouroboros has no runtime
+        session id of its own, so one session per project is the stable choice.
+        """
+        return str(self.session_id or self.client.config.project or "ouroboros")
+
+    def ensure_ready(self) -> bool:
+        """Create the session once per process. True when reads/writes may proceed.
+
+        Engram's documented client flow is ``GET /project/current`` (the server owns
+        project policy) then ``POST /sessions`` — and the second call is not
+        bookkeeping: project-scoped routes reject a project the store does not know,
+        and ``POST /observations`` rejects a session that does not exist. Until the
+        session exists EVERY read and write 404s, which is how a "wired up"
+        integration can be entirely non-functional while looking fine.
+
+        Idempotent (re-creating returns 201 and changes nothing), best-effort, and
+        cached; a failure leaves it unready so the next call retries.
+        """
+        if self._ready or self.config_error:
+            return self._ready
+        with self._ready_lock:
+            if self._ready:
+                return True
+            try:
+                result = self.client.create_session(
+                    self.session,
+                    self.client.config.project,
+                    str(self.repo_root or self.client.config.drive_root or ""),
+                )
+            except Exception:
+                return False
+            self._ready = bool(result.ok)
+            return self._ready
 
     # -- public API -------------------------------------------------------- #
 
@@ -513,10 +564,14 @@ class EngramSink:
             return EngramResult(False, error_kind="config", detail=self.config_error)
         if self.pending_count() > SPOOL_MAX_ENTRIES:
             return EngramResult(False, error_kind="config", detail="spool over bound")
+        if not self.ensure_ready():
+            return EngramResult(
+                False, error_kind="config", detail="session bootstrap failed"
+            )
         if record.get("deferred_merge"):
             return self._send_deferred_merge(record)
         return self.client.save(
-            session_id=self.session_id or "ouroboros",
+            session_id=self.session,
             type=str(record.get("type") or "memory"),
             title=str(record.get("title") or ""),
             content=str(record.get("content") or ""),
@@ -559,7 +614,7 @@ class EngramSink:
         if fragment.strip() and base.rstrip().endswith(fragment.rstrip()):
             return EngramResult(True, data={"already_applied": True})
         return self.client.save(
-            session_id=self.session_id or "ouroboros",
+            session_id=self.session,
             type=str(record.get("type") or "knowledge"),
             title=str(record.get("title") or ""),
             content=_merge_document(base, fragment),
@@ -602,6 +657,9 @@ class EngramSink:
                     "error_kind": result.error_kind,
                     "status": result.status,
                     "detail": str(result.detail or "")[:300],
+                    # A socket-only deployment is a client limitation, not an
+                    # outage; naming it here keeps the operator off the wrong trail.
+                    "socket_configured": bool(_env_socket()),
                     "spooled": self.pending_count(),
                 },
             )
@@ -690,10 +748,12 @@ def build_sink(
 
     resolved_base = str(base_url or env_base_url() or DEFAULT_BASE_URL)
     explicit = str(project or env_project() or "")
+    token = env_token()
     config_error = ""
     try:
-        # Resolve now so a forbidden/blank name is caught here rather than on the
-        # first send.
+        # Offline first so a forbidden/blank name is caught here rather than on the
+        # first send, and so there is always something usable when the server is
+        # down.
         resolved_project = resolve_project(repo_root, explicit=explicit)
     except Exception as exc:
         # The name is unusable. Build a client that CANNOT send — the placeholder
@@ -701,11 +761,25 @@ def build_sink(
         # so a bad scope spools and discloses instead of scattering memories.
         resolved_project = "_unresolved"
         config_error = f"{type(exc).__name__}: {exc}"
+
+    # Then let the SERVER own project policy, which is what Engram's own reference
+    # client does ("Resolve the project through the server, which owns project
+    # policy"): one GET /project/current?cwd=, so the two sides cannot disagree
+    # about which project this repository is. An operator override still wins, and
+    # an unusable answer (blank/forbidden/ambiguous) is ignored rather than
+    # adopted — the offline resolution then stands.
+    if not explicit and not config_error:
+        server_project = _server_project(
+            resolved_base, token, repo_root, timeout=float(timeout or 5.0)
+        )
+        if server_project:
+            resolved_project = server_project
+
     client = EngramClient(
         config=EngramConfig(
             base_url=resolved_base,
             project=resolved_project,
-            token=env_token(),
+            token=token,
             timeout=float(timeout or 5.0),
         )
     )
@@ -713,8 +787,43 @@ def build_sink(
         client=client,
         drive_root=pathlib.Path(drive_root),
         session_id=session_id,
+        repo_root=pathlib.Path(repo_root),
         config_error=config_error,
     )
+
+
+def _server_project(
+    base_url: str, token: str, repo_root: Any, *, timeout: float
+) -> str:
+    """Ask the service which project this repository is. Best-effort, never raises.
+
+    Returns "" when the service is unreachable, the answer is ambiguous, or the
+    answer is a name this client refuses (blank / ``local``) — in every one of
+    those cases the caller keeps its offline resolution rather than adopting a
+    scope nobody vouched for.
+    """
+    try:
+        from ouroboros.engram_client import (
+            EngramClient,
+            EngramConfig,
+            normalize_project_name,
+        )
+
+        probe = EngramClient(
+            config=EngramConfig(base_url=base_url, project="", token=token, timeout=timeout)
+        )
+        result = probe.project_current(cwd=str(repo_root or ""))
+        if not result.ok:
+            return ""
+        payload = result.one() or {}
+        if str(payload.get("error_hint") or "").strip():
+            return ""  # ambiguous or refused: detection did not decide
+        name = normalize_project_name(payload.get("project"))
+        if not name or name in _FORBIDDEN_PROJECTS:
+            return ""
+        return name
+    except Exception:
+        return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -771,6 +880,15 @@ def _repo_root_hint(drive_root: pathlib.Path) -> pathlib.Path:
     if candidate is not None and candidate.is_dir():
         return candidate
     return drive_root
+
+
+def _env_socket() -> str:
+    try:
+        from ouroboros.engram_client import env_socket
+
+        return env_socket()
+    except Exception:
+        return ""
 
 
 def _drive_local_project(drive_root: pathlib.Path) -> str:

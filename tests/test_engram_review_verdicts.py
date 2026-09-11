@@ -133,7 +133,7 @@ def test_an_unreachable_store_is_not_rendered_as_no_verdicts(scaffold):
 
     section = _engram_verdict_section(env)
 
-    assert "unreachable" in section
+    assert "could not be read" in section
     assert "UNKNOWN" in section
     assert "not absent" in section
 
