@@ -312,9 +312,13 @@ class TestBackgroundAnswerArbitration:
         assert rows[0]["chat_id"] == 1
         assert rows[0]["ref"]["arbitration"] == "foreground_answer_recent"
 
-    def test_sends_normally_without_a_foreground_answer(self, tmp_path):
+    def test_sends_normally_when_no_owner_row_is_pending(self, tmp_path):
+        # No owner row for THIS chat (the only row belongs to another thread), so
+        # nothing is in flight and the BG frame is sent as before.
         _write_chat(tmp_path, [
-            {"ts": _iso(0), "direction": "in", "chat_id": 1, "text": "owner question"},
+            {"ts": _iso(0), "direction": "in", "chat_id": 2, "text": "another thread"},
+            {"ts": _iso(1), "direction": "out", "chat_id": 2, "sender_identity": "",
+             "text": "answered there"},
         ])
         ctx = _bg_ctx(tmp_path)
         mode = deliver_owner_event(
@@ -342,25 +346,65 @@ class TestBackgroundAnswerArbitration:
         assert mode == "deferred"
         assert ctx.pending_events[0]["sender_identity"] == "background"
 
-    def test_a_running_foreground_turn_arbitrates(self, tmp_path):
-        # The observed case: the BG answered while the turn triggered by the
-        # owner's message was still running, so no foreground row existed yet.
+    def test_an_unanswered_owner_row_arbitrates(self, tmp_path):
+        # The observed case, twice over (19:19:11 and 22:32:43): the BG answered
+        # while the turn the owner's message had started was still running. The
+        # turn is witnessed by the TAIL — the owner row no out row answers — and
+        # deliberately NOT by the queue snapshot, which witnessed neither case
+        # (that is the live miss this clause was re-sourced for). This test
+        # therefore writes no snapshot at all.
         _write_chat(tmp_path, [
             {"ts": _iso(0), "direction": "in", "chat_id": 1, "text": "owner question"},
         ])
-        state = tmp_path / "state"
-        state.mkdir(parents=True, exist_ok=True)
-        (state / "queue_snapshot.json").write_text(json.dumps({
-            "ts": _iso(1),
-            "running": [{"id": "t-fg", "task": {"id": "t-fg", "chat_id": 1}}],
-        }), encoding="utf-8")
         ctx = _bg_ctx(tmp_path)
         mode = deliver_owner_event(
             ctx, {"type": "send_message", "chat_id": 1, "text": "bg answer", "ts": _iso(5)}
         )
         assert mode == "noted"
         assert ctx.pending_events == []
-        assert _inbox_rows(tmp_path)[0]["ref"]["arbitration"] == "foreground_turn_running"
+        assert _inbox_rows(tmp_path)[0]["ref"]["arbitration"] == "owner_turn_pending"
+
+    def test_an_unanswered_owner_row_stops_arbitrating_past_the_bound(self, tmp_path):
+        # The bound exists because an unanswered row is NOT proof of a live turn:
+        # a turn can error, be cancelled, or the tab can close. Without it the
+        # clause stays true forever and the lane is silently muted in that chat.
+        from ouroboros.tools.owner_delivery import BG_OWNER_TURN_PENDING_MAX_SECONDS as bound
+
+        _write_chat(tmp_path, [
+            {"ts": _iso(0), "direction": "in", "chat_id": 1, "text": "owner question"},
+        ])
+
+        young = _bg_ctx(tmp_path)
+        assert deliver_owner_event(
+            young, {"type": "send_message", "chat_id": 1, "text": "young bg", "ts": _iso(bound - 1)}
+        ) == "noted"
+
+        # The SAME unanswered row, past the bound: the normal frame is sent.
+        late = _bg_ctx(tmp_path)
+        assert deliver_owner_event(
+            late, {"type": "send_message", "chat_id": 1, "text": "late bg", "ts": _iso(bound + 1)}
+        ) == "deferred"
+        assert late.pending_events[0]["sender_identity"] == "background"
+
+    def test_an_answered_row_is_not_pending_however_old(self, tmp_path):
+        # The newest-row test decides first: an answered chat is never "pending",
+        # whatever the age — so a long-settled conversation keeps its normal BG
+        # frame even far beyond the pending bound and the answer window.
+        from ouroboros.tools import owner_delivery as arbitration
+
+        _write_chat(tmp_path, [
+            {"ts": _iso(0), "direction": "in", "chat_id": 1, "text": "owner question"},
+            {"ts": _iso(2), "direction": "out", "chat_id": 1,
+             "sender_identity": "", "text": "foreground answer"},
+        ])
+        ctx = _bg_ctx(tmp_path)
+        mode = deliver_owner_event(ctx, {
+            "type": "send_message", "chat_id": 1, "text": "bg after it settled",
+            "ts": _iso(2 + max(arbitration.BG_ANSWER_ARBITRATION_WINDOW_SECONDS,
+                             arbitration.BG_OWNER_TURN_PENDING_MAX_SECONDS) + 60),
+        })
+        assert mode == "deferred"
+        assert _inbox_rows(tmp_path) == []
 
     def test_a_failed_note_write_never_loses_the_message(self, tmp_path, monkeypatch):
         _write_chat(tmp_path, [

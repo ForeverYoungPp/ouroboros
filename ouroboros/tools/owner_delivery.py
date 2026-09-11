@@ -54,6 +54,18 @@ _STICKY_ATTR = "_owner_delivery_sticky_deferred"
 # lowering it trades the other way. One number, no other behaviour depends on it.
 BG_ANSWER_ARBITRATION_WINDOW_SECONDS = 30
 
+# PRODUCT PARAMETER — tuneable, and deliberately NOT the window above: that one
+# answers clause (a)'s question ("was this answered recently?"), while this bounds
+# clause (b)'s much slower one ("is a turn still plausibly running?"). It bounds
+# how long an UNANSWERED owner row may keep the BG quiet in that chat. It must
+# exist: an unanswered row is not proof of a live turn — the turn can error, be
+# cancelled, or the tab can close — and without this bound the clause stays true
+# FOREVER, muting the lane silently in that chat with its text reaching only the
+# observation inbox. That is worse than the duplicate it fixes: silent and
+# unbounded. Too small ⇒ the duplicate returns for very long turns; too large ⇒
+# a long mute after a crash. 900 s ≈ a generous single-turn budget.
+BG_OWNER_TURN_PENDING_MAX_SECONDS = 900
+
 # Bounded scan of the recent chat rows the predicate inspects. The newest owner
 # row is always far inside this window (the reader is tail-bounded anyway).
 _ARBITRATION_SCAN_ROWS = 200
@@ -114,31 +126,43 @@ def _recent_chat_rows(drive_root: Any, limit: int = _ARBITRATION_SCAN_ROWS) -> l
     return rows
 
 
-def _foreground_turn_running(drive_root: Any, chat_id: int) -> bool:
-    """Whether the persisted RUNNING set holds a foreground task for this chat.
+def _owner_turn_pending(entries: list, chat_id: int, now_ts: float) -> bool:
+    """Whether this chat's NEWEST row is a RECENT owner row no out row answers.
 
-    Read from the supervisor's own durable snapshot
-    (`state/queue_snapshot.json`, `running[].task.chat_id`) rather than the live
-    registry: the BG's ctx is a plain ToolContext with no supervisor handle, so
-    the snapshot IS the cross-process seam. A stale entry can therefore mute a
-    BG frame (the text survives as an inbox note); an unreadable snapshot reads
-    as "not running" (fail open), so a broken read can only cost a duplicate.
+    This is clause (b)'s source, and it is deliberately the SAME chat tail the
+    predicate already reads — not the supervisor's queue snapshot. The snapshot
+    was the cross-process seam at first, but its ``running[].task`` copy is not a
+    reliable witness for this lane: on 2026-09-11 22:32:43 a foreground turn for
+    chat 1 was provably running (received 22:31:44, ``task_done`` 22:33:26, six
+    ``llm_usage`` rounds spanning the BG frame) and the predicate still saw
+    nothing — the frame went out and not one ``owner_delivery`` note was ever
+    written, which is the fail-open read its docstring allowed. The chat tail
+    cannot miss it: the owner's own row is what the turn is answering.
+
+    An owner row no out row answers means the owner's turn is in flight (or was
+    dropped): the BG has nothing to add that the turn will not say. An ANSWERED
+    row is never pending, however old it is — the newest-row test decides that
+    before age is consulted at all.
+
+    The pending read is BOUNDED by ``BG_OWNER_TURN_PENDING_MAX_SECONDS``: an
+    unanswered row is not proof of a live turn (a turn can error, be cancelled,
+    or the tab can close), and an unbounded clause would mute the lane silently
+    and forever — worse than the duplicate it fixes. Past the bound the frame is
+    sent normally, fail-open like every other absent/unusable input here.
     """
-    try:
-        snapshot = json.loads(
-            (pathlib.Path(drive_root) / "state" / "queue_snapshot.json").read_text(
-                encoding="utf-8"
-            )
-        )
-    except Exception:
-        return False
-    for row in snapshot.get("running") or []:
+    newest_ts = 0.0
+    newest_dir = ""
+    for row in entries:
         if not isinstance(row, dict):
             continue
-        task = row.get("task") if isinstance(row.get("task"), dict) else {}
-        if _row_chat_id(task) == chat_id:
-            return True
-    return False
+        if _row_chat_id(row) != chat_id:
+            continue
+        ts = _as_epoch(row.get("ts"))
+        if ts >= newest_ts:
+            newest_ts, newest_dir = ts, str(row.get("direction") or "")
+    if newest_dir != "in":
+        return False
+    return 0.0 <= now_ts - newest_ts <= BG_OWNER_TURN_PENDING_MAX_SECONDS
 
 
 def _foreground_answer_recent(ctx: Any, evt: Dict[str, Any]) -> str:
@@ -150,9 +174,13 @@ def _foreground_answer_recent(ctx: Any, evt: Dict[str, Any]) -> str:
        (``direction == "in"``) already has a non-background answer row
        (``direction == "out"``, ``sender_identity != "background"``) inside the
        window.
-    2. ``foreground_turn_running``: the persisted RUNNING set carries a task
-       bound to this chat — the observed case (BG answered at 19:19:11 while the
-       turn triggered by the owner's 19:18:26 message answered at 19:19:17).
+    2. ``owner_turn_pending``: this chat's newest row is an OWNER row that no out
+       row answers and that is younger than ``BG_OWNER_TURN_PENDING_MAX_SECONDS``,
+       so the owner's turn is still plausibly in flight — the observed case
+       (the BG answered at 19:19:11 and again at 22:32:43 while the turn the
+       owner's message had started was mid-flight; the queue snapshot witnessed
+       neither, which is why the tail is the source). The bound is what keeps a
+       crashed/abandoned turn from muting the lane forever.
 
     Precedence: the rule only ever PREVENTS a frame that has not been sent. A BG
     answer already delivered is never withdrawn, and a later foreground answer is
@@ -171,11 +199,11 @@ def _foreground_answer_recent(ctx: Any, evt: Dict[str, Any]) -> str:
         return ""
     frame_ts = _as_epoch(evt.get("ts")) or time.time()
     window = BG_ANSWER_ARBITRATION_WINDOW_SECONDS
-    if _foreground_turn_running(drive_root, chat_id):
-        return "foreground_turn_running"
     entries = _recent_chat_rows(drive_root)
     if not entries:
         return ""
+    if _owner_turn_pending(entries, chat_id, frame_ts):
+        return "owner_turn_pending"
     owner_ts = 0.0
     for row in entries:
         if not isinstance(row, dict) or str(row.get("direction") or "") != "in":

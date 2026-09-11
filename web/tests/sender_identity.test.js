@@ -57,3 +57,49 @@ test('the offline sessionStorage snapshot carries sender identity', () => {
     assert.match(chat, /senderSessionId,\s*\n\s*senderIdentity,/);
     assert.match(chat, /senderIdentity: msg\.senderIdentity \|\| ''/);
 });
+
+test('a live frame and its replay row build the SAME key (parity contract)', () => {
+    // The live WS frame carries no `source`, `sender_label` or `sender_session_id`
+    // (supervisor/message_bus.py:396-410) while the replay passes them off the
+    // durable row (web/modules/chat.js:2977-2990). Hashing on fields one side
+    // cannot know made the same row render twice — the owner's "Ouroboros and
+    // 🧠 Background at once, refreshing collapses it to one" — so the key must be
+    // built only from fields BOTH paths have.
+    const text = 'the same durable row';
+    const ts = '2026-09-11T19:19:11.675716+00:00';
+    const liveOpts = {
+        role: 'assistant', text, timestamp: ts, isProgress: false,
+        systemType: 'proactive_message', source: '', senderIdentity: 'background',
+        senderLabel: '', senderSessionId: '', taskId: '',
+    };
+    const replayOpts = {
+        ...liveOpts, source: 'web', senderLabel: 'GB', senderSessionId: 'sess-1234',
+    };
+
+    assert.equal(
+        buildMessageKey('assistant', text, ts, liveOpts),
+        buildMessageKey('assistant', text, ts, replayOpts),
+    );
+
+    // Task-keyed branch (taskId present) must have parity too.
+    const liveTask = { ...liveOpts, taskId: 'bg-consciousness' };
+    const replayTask = { ...replayOpts, taskId: 'bg-consciousness' };
+    assert.equal(
+        buildMessageKey('assistant', text, ts, liveTask),
+        buildMessageKey('assistant', text, ts, replayTask),
+    );
+
+    // …and the key must still DISCRIMINATE, or the parity would dedupe real rows.
+    assert.notEqual(
+        buildMessageKey('assistant', text, ts, liveOpts),
+        buildMessageKey('assistant', `${text} (a different message)`, ts, liveOpts),
+    );
+    assert.notEqual(
+        buildMessageKey('assistant', text, ts, liveOpts),
+        buildMessageKey('assistant', text, ts, { ...liveOpts, senderIdentity: 'agent' }),
+    );
+    assert.notEqual(
+        buildMessageKey('assistant', text, ts, liveTask),
+        buildMessageKey('assistant', text, ts, { ...liveTask, taskId: 'other-task' }),
+    );
+});
