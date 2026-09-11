@@ -284,6 +284,20 @@ def pytest_runtest_call(item):  # noqa: ARG001
 
 
 @pytest.fixture(autouse=True)
+def _reset_engram_turn_budgets():
+    """The ``engram`` tool's per-turn retrieval budget is process-scoped state.
+
+    Without this, one test's reads would count against the next test's budget and
+    the suite would depend on execution order.
+    """
+    from ouroboros.tools.engram import reset_turn_budgets
+
+    reset_turn_budgets()
+    yield
+    reset_turn_budgets()
+
+
+@pytest.fixture(autouse=True)
 def _rebind_runtime_roots_between_tests():
     _bind_pytest_runtime_roots()
     yield
@@ -469,3 +483,218 @@ def pytest_runtest_teardown(item, nextitem):  # noqa: ARG001
 # contexts under ``tmp_path`` because the per-test layouts diverged enough that a
 # shared fixture was always wrong (different branch names, different ``ToolContext``
 # shapes, ``MagicMock`` vs real, etc.).
+
+
+# --------------------------------------------------------------------------- #
+# Shared Engram HTTP stub
+# --------------------------------------------------------------------------- #
+# The Engram integration has three test modules that need the same fake service:
+# the instrument probes, the review cycle, and the knowledge write/read pair.
+# Duplicating the handler three times is how the stubs drift until they disagree
+# with the real client, so it lives here.
+
+
+class EngramStubState:
+    """Mutable state behind the fake Engram service."""
+
+    def __init__(self) -> None:
+        self.requests: list = []
+        self.observations: list = []
+        self.review: list = []
+        self.marked: list = []
+        # ``id -> record`` for the knowledge read path (search hit + body fetch).
+        self.knowledge: dict = {}
+        # Recorded memory relations (``GET /conflicts``).
+        self.relations: list = []
+        # A real store can accept a verdict and still return no relation id;
+        # the policy has to be able to see that case.
+        self.compare_returns_sync = True
+        # The real search shape carries the full observation; False models a
+        # body-less (preview-style) response so both read paths stay covered.
+        self.search_returns_content = False
+        self.fail = False
+
+
+def _engram_all_records(state) -> dict:
+    """One table, two projections: search/get see what recency sees."""
+    combined = {item.get("id"): item for item in state.observations}
+    combined.update(state.knowledge)
+    return combined
+
+
+def _engram_stub_handler(state):
+    import json as _json
+    from http.server import BaseHTTPRequestHandler
+    from urllib.parse import parse_qs, urlparse
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            return
+
+        def _record(self, body):
+            parsed = urlparse(self.path)
+            state.requests.append(
+                {"path": parsed.path,
+                 "params": {k: v[0] for k, v in parse_qs(parsed.query).items()},
+                 "body": body}
+            )
+
+        def _reply(self, body):
+            import json as __json
+
+            payload = __json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _down(self):
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b'{"error":"down"}')
+
+        def do_GET(self):
+            self._record(None)
+            if state.fail:
+                return self._down()
+            parsed = urlparse(self.path)
+            if parsed.path == "/observations/recent":
+                body = state.observations
+            elif parsed.path == "/stats":
+                # Body-free: a count question gets a count. One table backs both
+                # projections, so the count is the distinct-id union.
+                rows = {item.get("id") for item in state.observations} | set(state.knowledge)
+                body = {
+                    "total_sessions": 1,
+                    "total_observations": len(rows),
+                    "total_prompts": 0,
+                    "projects": ["repo"],
+                }
+            elif parsed.path == "/conflicts":
+                body = [
+                    row for row in state.relations
+                    if not parse_qs(parsed.query).get("status")
+                    or str(row.get("judgment_status")) == parse_qs(parsed.query)["status"][0]
+                ]
+            elif parsed.path == "/review":
+                # Engram's own decay decides what is due; a marked record leaves
+                # the due set, which is what makes double consumption observable.
+                body = [i for i in state.review if int(i.get("id", -1)) not in state.marked]
+            elif parsed.path == "/search":
+                params = parse_qs(parsed.query)
+                needle = str(params.get("q", [""])[0]).lower()
+                wanted_type = str(params.get("type", [""])[0])
+                body = [
+                    (dict(rec) if state.search_returns_content else {
+                        k: v for k, v in rec.items() if k != "content"
+                    })
+                    for rec in _engram_all_records(state).values()
+                    if needle
+                    and (needle in str(rec.get("topic_key", "")).lower()
+                         or needle in str(rec.get("title", "")).lower()
+                         or needle in str(rec.get("content", "")).lower())
+                    and (not wanted_type or str(rec.get("type")) == wanted_type)
+                ]
+            elif parsed.path.startswith("/observations/"):
+                tail = parsed.path.rsplit("/", 1)[-1]
+                body = _engram_all_records(state).get(int(tail)) if tail.isdigit() else None
+            else:
+                body = []
+            self._reply(body)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                body = _json.loads(raw.decode("utf-8")) if raw else None
+            except ValueError:
+                body = None
+            self._record(body)
+            if state.fail:
+                return self._down()
+            parsed = urlparse(self.path)
+            if parsed.path in ("/observations", "/observations/passive") and isinstance(body, dict):
+                # Keep the fake store coherent with what was written, so a
+                # write-then-read round trip can be exercised end to end. The record
+                # lands in BOTH projections: ``knowledge`` (id -> record, serving the
+                # search/get read path) and ``observations`` (the recency feed) —
+                # a real store serves both from one table.
+                new_id = len(state.knowledge) + 1000
+                written = {
+                    "id": new_id,
+                    "type": body.get("type"),
+                    "title": body.get("title"),
+                    "topic_key": body.get("topic_key"),
+                    "scope": body.get("scope"),
+                    "content": body.get("content"),
+                    "created_at": "2026-01-01",
+                    "updated_at": "2026-01-02",
+                }
+                state.knowledge[new_id] = written
+                state.observations = [
+                    item for item in state.observations if item.get("id") != new_id
+                ]
+                if body.get("topic_key"):
+                    for existing_id, rec in list(state.knowledge.items()):
+                        if existing_id != new_id and rec.get("topic_key") == body.get("topic_key"):
+                            del state.knowledge[existing_id]
+                            state.observations = [
+                                item
+                                for item in state.observations
+                                if item.get("topic_key") != body.get("topic_key")
+                            ]
+                state.observations.append(written)
+            if parsed.path == "/conflicts/compare" and isinstance(body, dict):
+                sync = f"rel-{len(state.relations):04x}" if state.compare_returns_sync else ""
+                state.relations.append({
+                    "id": len(state.relations) + 1,
+                    "sync_id": sync,
+                    "relation": body.get("relation"),
+                    "judgment_status": "judged",
+                    "reason": body.get("reasoning"),
+                })
+                self._reply({"sync_id": sync})
+                return
+            if parsed.path == "/review/mark_reviewed" and isinstance(body, dict):
+                obs_id = body.get("observation_id")
+                if isinstance(obs_id, int):
+                    state.marked.append(obs_id)
+            self._reply({"id": len(state.requests)})
+
+    return _Handler
+
+
+@pytest.fixture()
+def engram_stub(monkeypatch, tmp_path):
+    """A fake Engram over real HTTP, plus an env-like object for a repo + drive.
+
+    Real HTTP (not a patched client) is the point: the project scope, the bounds
+    and the request sequence are exactly the contracts under test.
+    """
+    import threading
+    from http.server import ThreadingHTTPServer
+    from types import SimpleNamespace
+
+    from ouroboros.engram_sink import reset_sinks
+
+    state = EngramStubState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _engram_stub_handler(state))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("ENGRAM_BASE_URL", f"http://127.0.0.1:{server.server_address[1]}")
+    reset_sinks()  # the process-scoped cache must not leak a previous base_url
+    repo = tmp_path / "repo"
+    (repo / "prompts").mkdir(parents=True, exist_ok=True)
+    drive = tmp_path / "drive"
+    (drive / "memory").mkdir(parents=True, exist_ok=True)
+    try:
+        yield state, SimpleNamespace(
+            repo_dir=repo,
+            drive_root=drive,
+            drive_path=lambda rel: drive / rel,
+            repo_path=lambda rel: repo / rel,
+        )
+    finally:
+        reset_sinks()
+        server.shutdown()
+        server.server_close()

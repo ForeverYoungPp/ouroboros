@@ -153,6 +153,17 @@ def test_forked_context_uses_canonical_global_cognition_not_child_noise():
         "CANONICAL_DEEP_REVIEW", encoding="utf-8",
     )
     (child / "memory" / "deep_review.md").write_text("CHILD_DEEP_NOISE", encoding="utf-8")
+    # Re-anchor the canonical-vs-child discriminator on sources that are still
+    # injected. The old anchors (patterns register, deep review) were removed
+    # from the prompt by the reading-side change, so asserting on them would
+    # have tested a guarantee that no longer has evidence behind it.
+    for root, tag in ((canonical, "CANONICAL"), (child, "CHILD")):
+        (root / "memory" / "identity.md").write_text(
+            f"{tag}_IDENTITY_BODY", encoding="utf-8",
+        )
+        (root / "memory" / "scratchpad.md").write_text(
+            f"{tag}_SCRATCHPAD_BODY", encoding="utf-8",
+        )
     env = Env(repo_dir=canonical_env.repo_dir, drive_root=child, budget_drive_root=canonical)
 
     messages, _ = build_llm_messages(
@@ -162,8 +173,15 @@ def test_forked_context_uses_canonical_global_cognition_not_child_noise():
     )
     rendered = json.dumps(messages, ensure_ascii=False)
 
-    assert "CANONICAL_PATTERN_REGISTER" in rendered
-    assert "CANONICAL_DEEP_REVIEW" in rendered
+    # Canonical cognition is what the fork sees...
+    assert "CANONICAL_IDENTITY_BODY" in rendered
+    assert "CANONICAL_SCRATCHPAD_BODY" in rendered
+    # ...and the child drive's own cognition never leaks in.
+    assert "CHILD_IDENTITY_BODY" not in rendered
+    assert "CHILD_SCRATCHPAD_BODY" not in rendered
+    # Neither drive's removed sections are rendered any more (AC10).
+    assert "CANONICAL_PATTERN_REGISTER" not in rendered
+    assert "CANONICAL_DEEP_REVIEW" not in rendered
     assert "CHILD_PATTERN_NOISE" not in rendered
     assert "CHILD_DEEP_NOISE" not in rendered
 

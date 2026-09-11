@@ -918,18 +918,29 @@ def test_toggle_evolution_tool_refuses_in_light_mode(monkeypatch):
     assert pending == []
 
 
-def test_memory_provenance_records_old_and_new_content(tmp_path):
+def test_memory_provenance_records_old_and_new_content(engram_stub):
+    """Provenance must survive the move of the canonical store into Engram.
+
+    ``old_content`` used to come from the local file the write was about to
+    replace. The canonical local write is retired (S2), so the base now comes from
+    the LIVE store — which is exactly what this asserts, by making the store
+    readable. A provenance chain that silently became empty would hide the loss of
+    the previous version (BIBLE P1).
+    """
     from ouroboros.tools.control import _update_identity
     from ouroboros.tools.knowledge import _knowledge_write
     from ouroboros.tools.registry import ToolContext
 
-    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    _state, env = engram_stub
+    drive = env.drive_root
+    ctx = ToolContext(repo_dir=env.repo_dir, drive_root=drive)
     _knowledge_write(ctx, "facts", "old", mode="overwrite")
     _knowledge_write(ctx, "facts", "new", mode="overwrite")
     history = [
         json.loads(line)
-        for line in (tmp_path / "memory" / "knowledge_history.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (drive / "memory" / "knowledge_history.jsonl").read_text(encoding="utf-8").splitlines()
     ]
+    assert history[-1]["base_source"] == "engram"
     assert history[-1]["old_content"] == "old"
     assert history[-1]["new_content"] == "new"
 
@@ -937,7 +948,7 @@ def test_memory_provenance_records_old_and_new_content(tmp_path):
     _update_identity(ctx, "I am v2 with enough detail to satisfy the identity update length gate.")
     identity_history = [
         json.loads(line)
-        for line in (tmp_path / "memory" / "identity_journal.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (drive / "memory" / "identity_journal.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert identity_history[-1]["old_content"].startswith("I am v1")
     assert identity_history[-1]["new_content"].startswith("I am v2")
@@ -1202,6 +1213,14 @@ def test_reflection_validate_memory_actions_filters_types():
 
 
 def test_apply_memory_actions_writes_to_parent_drive(tmp_path):
+    """Reflection actions land on the canonical drive.
+
+    The knowledge action's landing point is now the provenance trail rather than a
+    ``<topic>.md`` file (S2 retired the canonical local write), so the assertion
+    follows the record to where it lives now instead of dropping the guard. This
+    action is an APPEND and Engram is unreachable in this test, so it also lands in
+    the spool — the C17 no-loss path — which is asserted below.
+    """
     from ouroboros.reflection import apply_memory_actions
 
     env = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path)
@@ -1213,9 +1232,10 @@ def test_apply_memory_actions_writes_to_parent_drive(tmp_path):
 
     assert apply_memory_actions(env, actions) == 3
 
-    knowledge = (tmp_path / "memory" / "knowledge" / "review_process.md").read_text(encoding="utf-8")
-    assert "reusable fact" in knowledge
-    assert (tmp_path / "memory" / "knowledge_history.jsonl").exists()
+    assert not (tmp_path / "memory" / "knowledge" / "review_process.md").exists()
+    history = (tmp_path / "memory" / "knowledge_history.jsonl").read_text(encoding="utf-8")
+    assert "reusable fact" in history
+    assert '"mode": "append"' in history
 
     scratchpad = (tmp_path / "memory" / "scratchpad.md").read_text(encoding="utf-8")
     assert "durable note" in scratchpad

@@ -835,6 +835,19 @@ def verify_system_state(env: Any, git_sha: str) -> None:
     checks["budget"], issue_count = check_budget(env)
     issues += issue_count
 
+    # Second half of write-then-forward (C17): a run that could not reach Engram
+    # left records in the local spool. Drain them now that we are starting up
+    # again. Best-effort and silent — a still-unreachable Engram keeps them
+    # spooled for the next start rather than losing them.
+    try:
+        from ouroboros.engram_sink import flush_engram_spool
+
+        forwarded = flush_engram_spool(env)
+        if forwarded:
+            checks["engram_spool_forwarded"] = forwarded
+    except Exception:
+        pass
+
     memory_dir = env.drive_path("memory")
     identity_path = memory_dir / "identity.md"
     scratchpad_path = memory_dir / "scratchpad.md"
@@ -990,6 +1003,30 @@ def _append_cycle_outcome_tag(env: Any, *, campaign: Any, transaction: Any, sour
             source=source,
             backlog_id=backlog_id,
         )
+        # Additive remote sink (WO, second phase). This is the run where the
+        # real verdict becomes known, so it carries the same task_id as the
+        # task-done row and upserts it in Engram instead of leaving a permanent
+        # `waiting_for_restart` half-memory (C19).
+        try:
+            from ouroboros.engram_sink import emit_evolution_outcome
+
+            tx = transaction if isinstance(transaction, dict) else {}
+            camp = campaign if isinstance(campaign, dict) else {}
+            emit_evolution_outcome(
+                env.drive_root,
+                {
+                    "kind": "cycle_outcome",
+                    "task_id": str(tx.get("task_id") or ""),
+                    "campaign_id": str(camp.get("id") or tx.get("campaign_id") or ""),
+                    "campaign_objective": str(camp.get("objective") or ""),
+                    "cycle_outcome": str(tx.get("cycle_outcome") or ""),
+                    "abandoned_reason": str(tx.get("abandoned_reason") or ""),
+                    "commit_sha": str(tx.get("commit_sha") or ""),
+                    "outcome_axes": tx.get("outcome_axes") or {},
+                },
+            )
+        except Exception:
+            log.debug("Engram cycle-outcome mirror failed", exc_info=True)
     except Exception:
         log.debug("Failed to append %s cycle-outcome checkpoint", source, exc_info=True)
 

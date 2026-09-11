@@ -98,6 +98,12 @@ class BackgroundConsciousness:
         self._identity_source_requirements: Dict[str, pathlib.Path] = {}
         self._identity_source_reads: Dict[str, str] = {}
         self._identity_unresolved_sources: set[str] = set()
+        # Engram review cycle (C16): what this cycle read as "due", and whether
+        # the cycle actually finished.  Held per cycle so a paused, stopped or
+        # empty-thought wake-up never advances the decay clock for records it
+        # did not really consider.
+        self._review_batch_ids: tuple = ()
+        self._review_batch_version: str = ""
 
         self._bg_spent_usd: float = 0.0
         self._bg_budget_pct: float = float(
@@ -942,6 +948,13 @@ class BackgroundConsciousness:
                 self._last_idle_reason = "observation_ack_pending"
                 return False
 
+            # AC14(c): advance the review cycle only after the cycle genuinely
+            # completed.  A paused, stopped or empty-thought wake-up leaves the
+            # due set untouched, so the next wake-up sees exactly the same
+            # records rather than skipping memory it never actually considered.
+            if not self.is_paused and not self._stop_requested():
+                self._advance_review_cycle()
+
         except Exception as e:
             self._cycle_ack_allowed = False
             self._emit_live_log("llm_round_error", round=round_idx, model=model, error=repr(e))
@@ -956,6 +969,44 @@ class BackgroundConsciousness:
             return False
 
         return True
+
+    def _advance_review_cycle(self) -> int:
+        """``POST /review/mark_reviewed`` for the records this cycle reviewed.
+
+        C16 advances the cycle through Engram's own endpoint; consciousness keeps
+        no watermark file of its own. Best-effort by construction: an unreachable
+        store must not fail a cycle that already finished its thinking, and the
+        unmarked records simply come back due on the next wake-up.
+        """
+        ids = tuple(getattr(self, "_review_batch_ids", ()) or ())
+        if not ids:
+            return 0
+        # Drop the batch first: if marking dies halfway, the records that were
+        # not marked must be re-read next cycle rather than assumed consumed.
+        self._review_batch_ids = ()
+        marked = 0
+        try:
+            from ouroboros.agent import Env
+            from ouroboros.engram_read import client_for
+
+            # Resolve through the repo-anchored scope, not the drive's directory
+            # name: the drive is ``.../data`` and would otherwise file this
+            # system's memories under a second Engram project.
+            scope = Env(repo_dir=self._repo_dir, drive_root=self._drive_root)
+            client = client_for(scope)
+            for observation_id in ids:
+                result = client.mark_reviewed(observation_id)
+                if result.ok:
+                    marked += 1
+                else:
+                    log.debug(
+                        "consciousness: mark_reviewed failed for %s (%s)",
+                        observation_id,
+                        getattr(result, "error_kind", "unknown"),
+                    )
+        except Exception:
+            log.debug("Failed to advance Engram review cycle", exc_info=True)
+        return marked
 
     def _emit_progress(self, content: str) -> None:
         if not content or not content.strip():
@@ -1030,6 +1081,8 @@ class BackgroundConsciousness:
         self._identity_source_requirements = {}
         self._identity_source_reads = {}
         self._identity_unresolved_sources = set()
+        self._review_batch_ids = ()
+        self._review_batch_version = ""
 
         parts = [self._load_bg_prompt()]
 
@@ -1096,6 +1149,37 @@ class BackgroundConsciousness:
             except Exception:
                 pass
             log.debug("Failed to include improvement backlog in consciousness context", exc_info=True)
+
+        # Engram's own review cycle (C16 / AC14).  This is deliberately *not* a
+        # watermark the cycle maintains itself: Engram decides what is due via
+        # review_after, and `duplicate_count` / `last_seen_at` /
+        # `normalized_hash` / `topic_key` are what stop a record being consumed
+        # twice.  The local improvement backlog above is untouched — it is the
+        # *action queue* (KEPT-1), whereas this is the *memory* grooming input.
+        # Bounded to 8 records / 3000 chars, the same class of bound its local
+        # predecessor carried, so a wake-up can never become an unbounded pull.
+        try:
+            from ouroboros.engram_read import client_for, due_for_review
+
+            batch = due_for_review(client_for(env))
+            if batch.read.status == "unavailable":
+                parts.append(
+                    "## Engram review cycle\n\n"
+                    "(unavailable — what is due for review is UNKNOWN this cycle, "
+                    "not empty; do not read this as 'nothing to review')"
+                )
+            elif batch.read.status == "ok":
+                self._review_batch_ids = batch.ids
+                self._review_batch_version = batch.read.version
+                parts.append(
+                    f"## Engram review cycle ({batch.read.count} due)\n\n"
+                    f"{batch.read.text}\n\n"
+                    "(These are recalled memories due for review — verify, correct, "
+                    "merge or retract them. Advancing the cycle is automatic once "
+                    "this wake-up completes.)"
+                )
+        except Exception:
+            log.debug("Failed to include Engram review cycle in consciousness context", exc_info=True)
 
         health_section = build_health_invariants(env)
         if health_section:

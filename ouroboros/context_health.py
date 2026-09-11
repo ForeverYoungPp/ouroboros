@@ -23,6 +23,37 @@ from ouroboros.utils import iter_jsonl_objects, read_json_dict, read_text
 log = logging.getLogger(__name__)
 
 
+def _thin_local_memory_note(env: Any, filename: str, local_chars: int) -> str:
+    """Report a thin LOCAL memory file without crying wolf (C15 / AC17b).
+
+    Durable memory may live in Engram now, so "this file is short" is no longer a
+    decay signal on its own. Three distinguishable outcomes, three different
+    strings — an unreadable store must never be reported as an empty one:
+
+    * Engram readable and non-empty → OK; memory is remote, not lost.
+    * Engram readable and empty     → WARNING; neither store holds memory.
+    * Engram unreadable             → a neutral NOTE; unusable is not absent.
+    """
+    headline = f"{filename} is only {local_chars} chars locally"
+    try:
+        from ouroboros.engram_read import client_for, entry_count
+
+        read = entry_count(client_for(env))
+    except Exception as exc:
+        return f"NOTE: LOCAL THIN MEMORY — {headline}; Engram not configured ({type(exc).__name__})."
+    if read.status == "unavailable":
+        return (
+            f"NOTE: LOCAL THIN MEMORY — {headline}; Engram unreachable, so memory presence "
+            "is UNKNOWN (not absent)."
+        )
+    if read.count > 0:
+        return f"OK: {filename} thin locally ({local_chars} chars); {read.count} memories in Engram."
+    return (
+        f"WARNING: MEMORY LOSS — {headline} and Engram holds nothing for this project. "
+        "Neither store has memory."
+    )
+
+
 def safe_read(path: pathlib.Path, fallback: str = "") -> str:
     try:
         exists = path.exists()
@@ -298,14 +329,17 @@ def build_health_invariants(env: Any, task_id: str = "") -> str:
     try:
         identity_content = read_text(env.drive_path("memory/identity.md"))
         if len(identity_content.strip()) < 200:
-            checks.append(f"WARNING: THIN IDENTITY — identity.md is only {len(identity_content)} chars. Cognitive decay signal.")
+            # C15/AC17(b): a thin LOCAL file is no longer by itself a decay
+            # signal — durable memory may simply live in Engram now. The warning
+            # must mean "no memory anywhere", never "this file is short".
+            checks.append(_thin_local_memory_note(env, "identity.md", len(identity_content)))
     except Exception:
         pass
 
     try:
         sp_len = len(read_text(env.drive_path("memory/scratchpad.md")).strip())
         if sp_len < 50:
-            checks.append("WARNING: EMPTY SCRATCHPAD — scratchpad is nearly empty. Memory loss signal.")
+            checks.append(_thin_local_memory_note(env, "scratchpad.md", sp_len))
         elif sp_len > SCRATCHPAD_BLOAT_WARN_CHARS:
             checks.append(f"WARNING: BLOATED SCRATCHPAD — {sp_len} chars. Extract durable insights to knowledge base.")
         else:

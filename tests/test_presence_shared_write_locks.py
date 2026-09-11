@@ -10,10 +10,20 @@ from ouroboros.tools.registry import ToolContext
 
 
 def test_knowledge_topic_and_index_update_share_one_stable_file_lock(tmp_path, monkeypatch):
+    """The topic write and the index update stay one critical section.
+
+    Retargeted to a project-scoped context: S2 retired the CANONICAL local write
+    (its record goes to Engram), so the only path that still performs a local
+    topic + index update is the per-project facts store. The lock contract is
+    unchanged and still guarded there rather than dropped.
+    """
+    from ouroboros import config as cfg
     from ouroboros.tools import knowledge
 
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path / "data-root")
     drive = tmp_path / "data"
-    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive, project_id="proj_lock")
+    kdir = knowledge._knowledge_dir(ctx)
     entered_index = threading.Event()
     release_index = threading.Event()
     real_update = knowledge._update_index_entry
@@ -40,14 +50,14 @@ def test_knowledge_topic_and_index_update_share_one_stable_file_lock(tmp_path, m
     assert entered_index.wait(2)
     second.start()
     time.sleep(0.05)
-    assert not (drive / "memory" / "knowledge" / "beta.md").exists()
+    assert not (kdir / "beta.md").exists()
     release_index.set()
     first.join(2)
     second.join(2)
 
     assert not first.is_alive() and not second.is_alive()
     assert len(results) == 2
-    index = (drive / "memory" / "knowledge" / "index-full.md").read_text(encoding="utf-8")
+    index = (kdir / "index-full.md").read_text(encoding="utf-8")
     assert "**alpha**" in index
     assert "**beta**" in index
 

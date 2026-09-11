@@ -1,0 +1,243 @@
+"""Contract tests for the `engram` read tool.
+
+Covers the read side of the seed (``.ouroboros/seed-engram-memory.yaml``), which
+is what makes AC12's prompt rule actionable rather than aspirational:
+
+- AC23 progressive disclosure is enforced by the tool's shape, not by asking the
+       model to behave: `search` yields titles only, `timeline` a neighbourhood,
+       `read` exactly one record
+- AC23 each layer is bounded, and a single retrieval costs less than the prompt
+       section it stands in for
+- C6   an unreachable service is a typed notice, never an exception and never an
+       empty result that reads as "nothing exists"
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
+
+import pytest
+
+from ouroboros.tools import engram as engram_tool
+
+
+class _State:
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+        self.payloads: dict[str, object] = {}
+        self.fail = False
+
+
+class _Handler(BaseHTTPRequestHandler):
+    state: _State
+
+    def log_message(self, *args):
+        return
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        self.state.requests.append(
+            {"path": parsed.path, "params": {k: v[0] for k, v in parse_qs(parsed.query).items()}}
+        )
+        if self.state.fail:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b'{"error":"down"}')
+            return
+        payload = json.dumps(self.state.payloads.get(parsed.path, [])).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+@pytest.fixture()
+def stub(monkeypatch, tmp_path):
+    state = _State()
+    handler = type("_H", (_Handler,), {"state": state})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("ENGRAM_BASE_URL", f"http://127.0.0.1:{server.server_address[1]}")
+    repo = tmp_path / "ouroboros"
+    repo.mkdir()
+    ctx = SimpleNamespace(repo_dir=repo, drive_root=tmp_path)
+    try:
+        yield state, ctx
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# --------------------------------------------------------------------------- #
+# layer 1 — search returns identity, not bodies
+# --------------------------------------------------------------------------- #
+
+
+def test_search_returns_titles_only(stub):
+    """AC23a: discovery must not pull bodies, or net subtraction is undone."""
+    state, ctx = stub
+    state.payloads["/search"] = [
+        {"id": 1, "type": "decision", "title": "Chose zstd frames", "created_at": "2026-01-01",
+         "content": "BODY-SHOULD-NOT-APPEAR"},
+        {"id": 2, "type": "bugfix", "title": "Fixed N+1", "created_at": "2026-01-02",
+         "content": "ALSO-SHOULD-NOT-APPEAR"},
+    ]
+    out = engram_tool._engram(ctx, op="search", query="zstd")
+    assert "[1] (decision) Chose zstd frames" in out
+    assert "[2] (bugfix) Fixed N+1" in out
+    assert "BODY-SHOULD-NOT-APPEAR" not in out
+    assert "ALSO-SHOULD-NOT-APPEAR" not in out
+
+
+def test_search_sends_project_and_bounded_limit(stub):
+    state, ctx = stub
+    engram_tool._engram(ctx, op="search", query="x", limit=999)
+    req = state.requests[-1]
+    assert req["params"]["project"] == "ouroboros"
+    assert int(req["params"]["limit"]) == engram_tool.MAX_SEARCH_LIMIT
+
+
+def test_search_output_is_bounded(stub):
+    state, ctx = stub
+    state.payloads["/search"] = [
+        {"id": i, "type": "t", "title": "T" * 300, "created_at": "2026-01-01"} for i in range(60)
+    ]
+    out = engram_tool._engram(ctx, op="search", query="x")
+    assert len(out) <= engram_tool.MAX_SEARCH_OUTPUT_CHARS + 100
+
+
+def test_search_without_query_says_so(stub):
+    _, ctx = stub
+    assert "needs a non-empty" in engram_tool._engram(ctx, op="search", query="  ")
+
+
+def test_empty_search_is_not_confused_with_unavailable(stub):
+    state, ctx = stub
+    state.payloads["/search"] = []
+    out = engram_tool._engram(ctx, op="search", query="nothing-here")
+    assert "No candidate memories" in out
+    assert "UNAVAILABLE" not in out
+
+
+# --------------------------------------------------------------------------- #
+# layer 2 — timeline
+# --------------------------------------------------------------------------- #
+
+
+def test_timeline_shows_the_neighbourhood_without_bodies(stub):
+    state, ctx = stub
+    state.payloads["/timeline"] = [
+        {"id": 9, "type": "discovery", "title": "before", "content": "NO-BODY"},
+        {"id": 10, "type": "decision", "title": "the hit", "content": "NO-BODY"},
+    ]
+    out = engram_tool._engram(ctx, op="timeline", observation_id=10, before=3, after=3)
+    assert "Neighbourhood of observation 10" in out
+    assert "[10] (decision) the hit" in out
+    assert "NO-BODY" not in out
+
+
+def test_timeline_radius_is_clamped(stub):
+    state, ctx = stub
+    engram_tool._engram(ctx, op="timeline", observation_id=5, before=99, after=99)
+    req = state.requests[-1]
+    assert int(req["params"]["before"]) == 10
+    assert int(req["params"]["after"]) == 10
+
+
+def test_timeline_needs_an_id(stub):
+    _, ctx = stub
+    assert "needs an `observation_id`" in engram_tool._engram(ctx, op="timeline")
+
+
+# --------------------------------------------------------------------------- #
+# layer 3 — one full record
+# --------------------------------------------------------------------------- #
+
+
+def test_read_returns_exactly_one_record(stub):
+    state, ctx = stub
+    state.payloads["/observations/7"] = {
+        "id": 7, "type": "decision", "title": "the one", "project": "ouroboros",
+        "scope": "project", "updated_at": "2026-01-01", "content": "the full body",
+    }
+    out = engram_tool._engram(ctx, op="read", observation_id=7)
+    assert "the full body" in out
+    assert "[7] (decision) the one" in out
+    # One read ⇒ exactly one observation fetch.
+    assert [r["path"] for r in state.requests] == ["/observations/7"]
+
+
+def test_read_truncates_a_huge_record(stub):
+    state, ctx = stub
+    state.payloads["/observations/8"] = {
+        "id": 8, "type": "t", "title": "big", "content": "x" * 50_000,
+    }
+    out = engram_tool._engram(ctx, op="read", observation_id=8)
+    assert len(out) <= engram_tool.MAX_READ_CONTENT_CHARS + 500
+    assert "[truncated]" in out
+
+
+def test_read_budget_is_below_the_sections_it_replaces(stub):
+    """AC23d: a read must not cost more than the section it stands in for."""
+    # Smallest replaced section measured on the live drive: `## Last Deep Self-Review` (307).
+    # The largest usable single read must stay well under the knowledge index (6,569).
+    assert engram_tool.MAX_READ_CONTENT_CHARS < 6_569
+    assert engram_tool.MAX_SEARCH_OUTPUT_CHARS < 6_569
+    assert engram_tool.MAX_TIMELINE_OUTPUT_CHARS < 6_569
+
+
+def test_read_needs_an_id(stub):
+    _, ctx = stub
+    assert "needs an `observation_id`" in engram_tool._engram(ctx, op="read")
+
+
+def test_read_missing_record_says_not_found(stub):
+    state, ctx = stub
+    state.payloads["/observations/999"] = None
+    out = engram_tool._engram(ctx, op="read", observation_id=999)
+    assert "not found" in out
+
+
+# --------------------------------------------------------------------------- #
+# C6 — unreachable is typed, not silent
+# --------------------------------------------------------------------------- #
+
+
+def test_unreachable_is_typed_and_never_raises(stub):
+    state, ctx = stub
+    state.fail = True
+    out = engram_tool._engram(ctx, op="search", query="x")
+    assert "ENGRAM READ FAILED" in out or "ENGRAM UNAVAILABLE" in out
+    assert "No candidate memories" not in out
+
+
+def test_unreachable_does_not_claim_memory_was_checked(stub):
+    state, ctx = stub
+    state.fail = True
+    out = engram_tool._engram(ctx, op="read", observation_id=1)
+    assert "NOT 'no relevant memory'" in out or "not found" not in out.lower()
+
+
+def test_unknown_op_is_reported(stub):
+    _, ctx = stub
+    assert "Unknown op" in engram_tool._engram(ctx, op="delete")
+
+
+def test_tool_is_registered_read_only():
+    """POLICY_SKIP: retrieval must not pay a per-call safety recheck."""
+    from ouroboros.safety import POLICY_SKIP, TOOL_POLICY
+
+    assert TOOL_POLICY["engram"] == POLICY_SKIP
+
+
+def test_tool_schema_is_advertised():
+    entries = {e.name: e for e in engram_tool.get_tools()}
+    assert "engram" in entries
+    schema = entries["engram"].schema
+    assert schema["parameters"]["properties"]["op"]["enum"] == ["search", "timeline", "read"]
+    assert "engram" in json.dumps(schema["description"]).lower()

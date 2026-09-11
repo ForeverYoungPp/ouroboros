@@ -13,6 +13,38 @@ from ouroboros.utils import append_jsonl, utc_now_iso
 
 CHECKPOINTS_REL = pathlib.Path("state") / "evolution_checkpoints.jsonl"
 
+#: The genuinely-pending outcome, recorded while a commit awaits its restart.
+PENDING_CYCLE_OUTCOME = "waiting_for_restart"
+
+
+def resolve_reported_cycle_outcome(transaction: Dict[str, Any] | None) -> str:
+    """What a task-done checkpoint may TRUTHFULLY say about the cycle's outcome.
+
+    The two-phase write exists because an absorbing cycle's verdict is only
+    confirmed after a restart verifies the commit. It is not a licence to report
+    "waiting_for_restart" for a cycle whose verdict is already known: the live
+    ledger shows nine consecutive cycles that are all ``no_op`` with
+    ``restart_required=False``, and none of them will ever reach a second write.
+    Filing those as pending would leave Engram holding a permanent lie, and the
+    memory of "which objectives actually improved the system" — the whole point of
+    this write — would be worthless.
+
+    Precedence is therefore:
+
+    1. a genuinely pending restart wins — an unverified commit is NOT yet an
+       absorbed outcome, and saying "absorbed" here would claim a verification
+       that has not happened;
+    2. otherwise the transaction's own verdict, passed through unchanged (a
+       verdict this function does not recognise is still its own word);
+    3. an absent verdict is ``unknown`` — never laundered into "pending".
+    """
+    tx = transaction if isinstance(transaction, dict) else {}
+    restart_pending = bool(tx.get("restart_required")) and not bool(tx.get("restart_verified"))
+    if restart_pending:
+        return PENDING_CYCLE_OUTCOME
+    return str(tx.get("cycle_outcome") or "").strip() or "unknown"
+
+
 
 def _sha_file(path: pathlib.Path) -> str:
     try:
@@ -27,6 +59,31 @@ def _git_value(repo_dir: pathlib.Path, args: list[str]) -> str:
         return proc.stdout.strip() if proc.returncode == 0 else ""
     except Exception:
         return ""
+
+
+def _engram_memory_version(drive_root: Any) -> Dict[str, Any]:
+    """Engram-side memory version for a checkpoint. Never raises.
+
+    Bounded (Engram's own 500 ceiling) and soft: an unreachable store records
+    ``status="unavailable"`` rather than an empty string that a later reader
+    would mistake for "nothing changed".
+    """
+    unavailable = {
+        "engram_memory_version": "",
+        "engram_memory_version_status": "unavailable",
+        "engram_memory_count": 0,
+    }
+    try:
+        from ouroboros.engram_read import client_for, memory_version
+
+        read = memory_version(client_for(drive_root))
+        return {
+            "engram_memory_version": read.version,
+            "engram_memory_version_status": read.status,
+            "engram_memory_count": read.count,
+        }
+    except Exception:
+        return unavailable
 
 
 def append_cycle_outcome_checkpoint(
@@ -193,7 +250,12 @@ def append_evolution_checkpoint(
         "git_branch": _git_value(pathlib.Path(repo_dir), ["rev-parse", "--abbrev-ref", "HEAD"]),
         "identity_sha256": _sha_file(memory / "identity.md"),
         "scratchpad_sha256": _sha_file(memory / "scratchpad.md"),
-        "knowledge_index_sha256": _sha_file(memory / "knowledge" / "index-full.md"),
+        # C15/AC17(a): durable knowledge lives in Engram now, so hashing a local
+        # index file would silently hash an EMPTY file and read as "unchanged".
+        # Record an Engram-side version together with its status, so a reader can
+        # tell "memory unchanged" from "memory could not be read" — the old sha
+        # could not, because a missing file and a stable file both looked stable.
+        **_engram_memory_version(drive_root),
         "outcome_axes": normalize_outcome_axes({"outcome_axes": outcome_axes or {}}),
         "cost_usd": (
             float(cost_usd) if cost_accounting_status == "available" and cost_usd is not None

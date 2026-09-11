@@ -1540,7 +1540,15 @@ def test_world_profile_is_loaded_with_stable_memory(tmp_path):
     assert "world-profile-data" in combined
 
 
-def test_retired_dialogue_summary_remains_visible_when_blocks_exist(tmp_path):
+def test_dialogue_history_is_not_injected_even_when_blocks_and_legacy_summary_exist(tmp_path):
+    """Reading side (AC9): consolidation leaves the prompt; its data does not.
+
+    This test used to assert the opposite — that `## Dialogue History` and the
+    retired flat summary were both rendered. They are deliberately not rendered
+    any more: the blocks are LLM-authored, doubly lossy, and unreclaimable by
+    runtime compaction, while duplicating the raw tail `## Recent chat` carries.
+    The layer is demoted to on-demand retrieval, so the *files must survive*.
+    """
     from ouroboros.context import build_memory_sections
     from ouroboros.memory import Memory
 
@@ -1555,25 +1563,46 @@ def test_retired_dialogue_summary_remains_visible_when_blocks_exist(tmp_path):
 
     combined = "\n\n".join(build_memory_sections(memory, partition="volatile"))
 
-    assert "## Dialogue History" in combined
-    assert "new dialogue block" in combined
-    assert "## Legacy Dialogue Summary (retired flat format, read-only fallback)" in combined
-    assert "legacy dialogue" in combined
+    assert "## Dialogue History" not in combined
+    assert "new dialogue block" not in combined
+    assert "## Legacy Dialogue Summary" not in combined
+    assert "legacy dialogue" not in combined
+    # Demoted, not deleted: both artefacts are still on disk for on-demand reads.
+    assert (memory_dir / "dialogue_blocks.json").exists()
+    assert (memory_dir / "dialogue_summary.md").exists()
 
 
-def test_retired_dialogue_summary_fallback_preserves_continuity_without_blocks(tmp_path):
+def test_volatile_partition_carries_scratchpad_and_still_projects_durable_gaps(tmp_path):
+    """The continuity signal that survives the section: durable gaps.
+
+    Continuity used to be asserted through the rendered legacy summary. That
+    rendering is gone, so the surviving guarantee is that a known history
+    discontinuity is still *reported* to its consumers rather than silently
+    dropped (BIBLE P1).
+    """
     from ouroboros.context import build_memory_sections
     from ouroboros.memory import Memory
 
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir(parents=True, exist_ok=True)
+    (memory_dir / "scratchpad.md").write_text("working memory", encoding="utf-8")
     (memory_dir / "dialogue_summary.md").write_text("legacy dialogue only", encoding="utf-8")
+    (memory_dir / "dialogue_blocks.json").write_text(
+        json.dumps([{"gap_id": "g1", "content": "[MEMORY GAP] a span is unknowable"}]),
+        encoding="utf-8",
+    )
     memory = Memory(drive_root=tmp_path)
 
-    combined = "\n\n".join(build_memory_sections(memory, partition="volatile"))
+    gaps: list = []
+    combined = "\n\n".join(
+        build_memory_sections(memory, partition="volatile", durable_dialogue_gaps_out=gaps)
+    )
 
-    assert "## Legacy Dialogue Summary (retired flat format, read-only fallback)" in combined
-    assert "legacy dialogue only" in combined
+    assert "## Scratchpad" in combined
+    assert "working memory" in combined
+    assert "## Dialogue History" not in combined
+    assert "## Legacy Dialogue Summary" not in combined
+    assert any(g.get("gap_id") == "g1" for g in gaps)
 
 
 def test_recent_sections_filter_process_logs_by_task_id(tmp_path):

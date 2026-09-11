@@ -1,0 +1,421 @@
+"""Bounded, machine-side Engram reads.
+
+This is the read half of Phase 4. Every machine consumer that gets repointed away
+from a local file must keep the bound its local predecessor had (seed constraint
+C14 / AC16) — if a "bounded digest" silently becomes an unbounded pull, the
+memory loop re-inflates exactly the context it was built to shrink.
+
+It also fixes the failure that makes the old instruments lie (C15 / AC17). The
+local probes answered "is this file big / how many bytes", and an *empty* answer
+was indistinguishable from a *broken* one. Here the three outcomes are separate
+and named:
+
+* ``status="ok"``          — read succeeded, data present
+* ``status="empty"``       — read succeeded, the store genuinely holds nothing
+* ``status="unavailable"`` — the store could not be read at all
+
+A consumer that cannot tell the last two apart will report "no memory" when the
+truth is "no service", which is how a memory-loss signal becomes noise.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+#: Mirrors ``improvement_backlog.format_backlog_digest(max_chars=3000)``.
+MAX_DIGEST_CHARS = 3_000
+#: Mirrors ``improvement_backlog.format_backlog_digest(limit=8)``.
+MAX_DIGEST_ITEMS = 8
+#: Engram's own ceiling for any ``limit``.
+MAX_COUNT_LIMIT = 500
+#: How many records a RECORD-SHAPED recency read may pull. Separate from
+#: ``MAX_COUNT_LIMIT`` on purpose, and much smaller.
+#:
+#: ``GET /observations/recent`` (and its ``GET /observations`` alias) accepts only
+#: project / scope / limit / sort: there is no type filter and no ``compact`` mode,
+#: so every row that comes back carries its full body. Asking for the ceiling would
+#: therefore mean "fetch the entire store's bodies in one request" — exactly the
+#: unbounded pull the three-layer design exists to prevent. A bounded window is the
+#: honest substitute, and callers that filter it (``type_digest``) disclose when the
+#: window saturated rather than implying they saw everything.
+MAX_WINDOW = 50
+#: How many due-for-review records one wake-up processes (AC16 backlog class).
+MAX_REVIEW_ITEMS = 8
+#: Largest body returned for a single knowledge topic.
+MAX_TOPIC_CHARS = 4_000
+#: Safety ceiling for a read-modify-write base. Deliberately far above any real
+#: topic: truncating the base of an append is SILENT DATA LOSS (the write would
+#: upsert a shortened record), so this is a guard against an unbounded read, not
+#: a tuning knob to be trimmed.
+KNOWLEDGE_BASE_HARD_CHARS = 1_000_000
+
+
+@dataclass(frozen=True)
+class MachineRead:
+    """Outcome of one machine-side read. Never an exception."""
+
+    ok: bool
+    status: str = "ok"            # ok | empty | unavailable
+    count: int = 0
+    version: str = ""
+    text: str = ""
+    detail: str = ""
+
+    @property
+    def readable(self) -> bool:
+        """True when the store answered — regardless of whether it held anything."""
+        return self.status in {"ok", "empty"}
+
+    def as_metadata(self) -> Dict[str, Any]:
+        """Compact projection for a durable record (no bodies)."""
+        return {"status": self.status, "count": self.count, "version": self.version}
+
+
+@dataclass(frozen=True)
+class ReviewBatch:
+    """Records Engram says are due, plus the ids needed to advance the cycle.
+
+    C16 moves consciousness onto Engram's own ``review_after`` decay instead of a
+    locally maintained watermark. Advancing the cycle is a separate, later step
+    (``POST /review/mark_reviewed``) and must not happen when the cycle did not
+    actually complete — the ids ride back with the read so the caller can decide.
+    """
+
+    read: MachineRead
+    ids: tuple = ()
+    titles: tuple = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.read.ok
+
+    @property
+    def readable(self) -> bool:
+        return self.read.readable
+
+
+def _read_failure(result: Any) -> MachineRead:
+    return MachineRead(
+        False,
+        status="unavailable",
+        detail=f"{getattr(result, 'error_kind', 'unknown')}: {str(getattr(result, 'detail', ''))[:200]}",
+    )
+
+
+def recent(client: Any, *, limit: int = MAX_WINDOW) -> MachineRead:
+    """Bounded read of the newest records. Returns counts and a version token."""
+    bounded = max(1, min(int(limit or MAX_WINDOW), MAX_COUNT_LIMIT))
+    result = client.recent(limit=bounded)
+    if not result.ok:
+        return _read_failure(result)
+    items: List[Dict[str, Any]] = result.items()
+    if not items:
+        return MachineRead(True, status="empty", count=0, version=_version_token("", 0, ""))
+    latest = max(str(item.get("updated_at") or item.get("created_at") or "") for item in items)
+    project = str(client.config.project or "")
+    return MachineRead(
+        True,
+        status="ok",
+        count=len(items),
+        version=_version_token(project, len(items), latest),
+        text="\n".join(_line(item) for item in items[:MAX_DIGEST_ITEMS]),
+    )
+
+
+def memory_version(client: Any) -> MachineRead:
+    """A stable token that changes when the project's Engram memory changes.
+
+    Replaces the old ``knowledge_index_sha256`` for records whose knowledge no
+    longer lives in a local file. It reports ``status`` alongside the token so a
+    reader can tell "unchanged" from "could not read" — the old sha could not,
+    and an unreadable file hashed exactly like an empty one.
+    """
+    return recent(client)
+
+
+def entry_count(client: Any) -> MachineRead:
+    """How many records this project holds. Typed when unreachable, and BODY-FREE.
+
+    ``GET /stats`` answers a count question with a count (``total_observations``);
+    pulling a window of full records just to take ``len()`` of them would be the
+    same "one request, all bodies" mistake in miniature. The version token is left
+    empty here because a count is not a version — ``memory_version`` is.
+    """
+    try:
+        result = client.stats()
+    except Exception as exc:
+        return MachineRead(False, status="unavailable", detail=type(exc).__name__)
+    if not result.ok:
+        return _read_failure(result)
+    payload = result.one() or {}
+    total = payload.get("total_observations")
+    if not str(total if total is not None else "").lstrip("-").isdigit():
+        return MachineRead(
+            True, status="empty", count=0, detail="stats carried no total_observations"
+        )
+    count = int(total)
+    return MachineRead(True, status="ok" if count else "empty", count=count)
+
+
+def digest(client: Any, *, limit: int = MAX_DIGEST_ITEMS, max_chars: int = MAX_DIGEST_CHARS) -> MachineRead:
+    """A bounded, human-readable digest — the shape ``format_backlog_digest`` had.
+
+    Bounds come from the local predecessor by default, so a repointed consumer
+    costs what it used to cost rather than whatever the store happens to hold.
+    """
+    read = recent(client, limit=MAX_WINDOW)
+    if not read.ok:
+        return read
+    if read.status == "empty":
+        return read
+    lines = read.text.splitlines()[: _bounded_items(limit, MAX_WINDOW)]
+    body = _bounded_body(lines, max_chars)
+    return MachineRead(True, status="ok", count=read.count, version=read.version, text=body)
+
+
+def due_for_review(
+    client: Any, *, limit: int = MAX_REVIEW_ITEMS, max_chars: int = MAX_DIGEST_CHARS
+) -> ReviewBatch:
+    """``GET /review`` — the native consumption cursor, bounded like its predecessor.
+
+    Consciousness used to keep its own watermark file; C16 replaces that with
+    Engram's ``review_after`` decay. The bound stays explicit (AC16) so one
+    wake-up cannot silently turn into an unbounded pull of the whole store.
+    """
+    result = client.review(limit=_bounded_items(limit, MAX_REVIEW_ITEMS))
+    if not result.ok:
+        return ReviewBatch(_read_failure(result))
+    items: List[Dict[str, Any]] = result.items()
+    if not items:
+        return ReviewBatch(MachineRead(True, status="empty", count=0, version=_version_token("", 0, "")))
+    ids = tuple(int(item["id"]) for item in items[:MAX_REVIEW_ITEMS] if str(item.get("id", "")).lstrip("-").isdigit())
+    titles = tuple(" ".join(str(item.get("title") or "").split())[:120] for item in items[:MAX_REVIEW_ITEMS])
+    latest = max(str(item.get("updated_at") or item.get("created_at") or "") for item in items)
+    project = str(client.config.project or "")
+    return ReviewBatch(
+        MachineRead(
+            True,
+            status="ok",
+            count=len(items),
+            version=_version_token(project, len(items), latest),
+            text=_bounded_body([_line(item) for item in items[:MAX_REVIEW_ITEMS]], max_chars),
+        ),
+        ids=ids,
+        titles=titles,
+    )
+
+
+def _bounded_items(limit: Any, ceiling: int) -> int:
+    return max(1, min(int(limit or ceiling), int(ceiling)))
+
+
+def _bounded_body(lines: List[str], max_chars: Any) -> str:
+    budget = max(200, min(int(max_chars or MAX_DIGEST_CHARS), MAX_DIGEST_CHARS))
+    body = "\n".join(lines)
+    if len(body) > budget:
+        body = body[: max(0, budget - 30)].rstrip() + "\n…[truncated]"
+    return body
+
+
+def type_digest(
+    client: Any,
+    type_name: str,
+    *,
+    limit: int = MAX_DIGEST_ITEMS,
+    max_chars: int = MAX_DIGEST_CHARS,
+    window: int = MAX_WINDOW,
+) -> MachineRead:
+    """Bounded digest of the newest records of ONE type.
+
+    Engram has no type-filtered recency read: ``GET /observations/recent`` and its
+    ``GET /observations`` alias accept only project / scope / limit / sort, and
+    ``GET /search`` requires a text query. So the type filter is applied here, over
+    a **bounded window** of the newest records.
+
+    When the window is full and holds fewer matches than were asked for, the result
+    says so: there may be older records of this type that the window could not
+    reach. Under-reporting a bounded read is acceptable; presenting it as the
+    complete set is not, and that distinction is the whole point of this module.
+    """
+    wanted = _bounded_items(limit, MAX_DIGEST_ITEMS)
+    span = _bounded_items(window, MAX_COUNT_LIMIT)
+    raw = client.recent(limit=span)
+    if not raw.ok:
+        return _read_failure(raw)
+    items: List[Dict[str, Any]] = raw.items()
+    if not items:
+        return MachineRead(True, status="empty", count=0, version=_version_token("", 0, ""))
+    matches = [item for item in items if str(item.get("type") or "") == str(type_name)]
+    if not matches:
+        return MachineRead(
+            True, status="empty", count=0, detail=f"no {type_name!r} record in the newest {span}"
+        )
+    chosen = matches[:wanted]
+    latest = max(str(item.get("updated_at") or item.get("created_at") or "") for item in matches)
+    text = _bounded_body([_line(item) for item in chosen], max_chars)
+    if len(matches) < wanted and len(items) >= span:
+        # The window saturated before it could satisfy the request. Say it.
+        text += (
+            f"\n(window saturated at {span} records: older {type_name!r} records may exist "
+            "beyond this window)"
+        )
+    return MachineRead(
+        True,
+        status="ok",
+        count=len(matches),
+        version=_version_token(str(client.config.project or ""), len(matches), latest),
+        text=text,
+    )
+
+
+def knowledge_topic(
+    client: Any,
+    topic: str,
+    *,
+    scope: str = "",
+    max_chars: int = MAX_TOPIC_CHARS,
+) -> MachineRead:
+    """One knowledge topic by ``topic_key`` — bounded, targeted, typed.
+
+    The local ``memory/knowledge/<topic>.md`` write is what S2 stops, so this is
+    the read path that must exist *before* the stop (C13 read-before-stop). It is
+    a single-record fetch, not a store sweep: layer 2 searches for the row, layer
+    3 reads its body. An unreachable store reports ``unavailable`` so a caller can
+    say "unknown" instead of "you never learned this".
+    """
+    name = str(topic or "").strip()
+    if not name:
+        return MachineRead(False, status="empty", detail="empty topic")
+    identity = f"knowledge:{name}"
+    found = client.search(name, limit=MAX_DIGEST_ITEMS, type="knowledge", scope=scope)
+    if not found.ok:
+        return _read_failure(found)
+    items: List[Dict[str, Any]] = found.items()
+    match = next((r for r in items if str(r.get("topic_key") or "") == identity), None)
+    if match is None:
+        # Defensive: an Engram build that omits ``topic_key`` from search hits
+        # still carries the title the sink wrote.
+        match = next((r for r in items if str(r.get("title") or "") == f"Knowledge: {name}"), None)
+    if match is None:
+        return MachineRead(True, status="empty", count=0, detail=f"no Engram record for {identity!r}")
+    # The server's search shape already carries the body (``buildSearchFTSQuery``
+    # selects the full observation), so a hit with content costs ONE round trip.
+    # Only fall back to fetching the record when the store answered with a
+    # body-less shape — a preview-style response or an older build.
+    record = match
+    if not str(match.get("content") or "").strip():
+        raw_id = str(match.get("id", ""))
+        if not raw_id.lstrip("-").isdigit():
+            return MachineRead(
+                True, status="empty", count=len(items), detail="match carried no usable id"
+            )
+        got = client.get(int(raw_id))
+        if not got.ok:
+            return _read_failure(got)
+        record = got.one() or {}
+    body = str(record.get("content") or "")
+    budget = max(200, min(int(max_chars or MAX_TOPIC_CHARS), KNOWLEDGE_BASE_HARD_CHARS))
+    if len(body) > budget:
+        body = body[: max(0, budget - 30)].rstrip() + "\n…[truncated]"
+    return MachineRead(
+        True,
+        status="ok",
+        count=1,
+        version=_version_token(
+            str(client.config.project or ""), 1, str(record.get("updated_at") or "")
+        ),
+        text=body,
+    )
+
+
+def continuation_narrative(
+    client: Any, task_id: str, *, max_chars: int = MAX_TOPIC_CHARS
+) -> MachineRead:
+    """The authored end-of-task narrative Engram holds for ``task_id`` (W4 / S4).
+
+    Located by the identity the sink writes (``continuation:<task_id>``), which the
+    server indexes as part of ``topic_key``, so a task_id query finds it. The match
+    is confirmed on the identity rather than trusted from ranking: a task_id also
+    appears inside other records' bodies, and returning one of those as "the
+    predecessor's own account" would be a fabrication, not a lookup.
+    """
+    tid = str(task_id or "").strip()
+    if not tid:
+        return MachineRead(False, status="empty", detail="empty task_id")
+    identity = f"continuation:{tid}"
+    found = client.search(tid, limit=MAX_DIGEST_ITEMS, type="episodic_memory")
+    if not found.ok:
+        return _read_failure(found)
+    items: List[Dict[str, Any]] = found.items()
+    match = next((r for r in items if str(r.get("topic_key") or "") == identity), None)
+    if match is None:
+        return MachineRead(
+            True, status="empty", count=0, detail=f"no {identity!r} record in the newest matches"
+        )
+    body = str(match.get("content") or "")
+    if not body.strip():
+        raw_id = str(match.get("id", ""))
+        if not raw_id.lstrip("-").isdigit():
+            return MachineRead(True, status="empty", count=len(items), detail="match had no body or id")
+        got = client.get(int(raw_id))
+        if not got.ok:
+            return _read_failure(got)
+        body = str((got.one() or {}).get("content") or "")
+    budget = max(200, min(int(max_chars or MAX_TOPIC_CHARS), KNOWLEDGE_BASE_HARD_CHARS))
+    if len(body) > budget:
+        body = body[: max(0, budget - 30)].rstrip() + "\n…[truncated]"
+    return MachineRead(
+        True,
+        status="ok" if body.strip() else "empty",
+        count=1,
+        version=_version_token(str(client.config.project or ""), 1, str(match.get("updated_at") or "")),
+        text=body,
+    )
+
+
+def client_for(target: Any) -> Any:
+    """Repo-pinned client for reads — same configuration path as the write sink."""
+    from ouroboros.engram_sink import sink_for
+
+    return sink_for(target).client
+
+
+def _version_token(project: str, count: int, latest: str) -> str:
+    payload = json.dumps(
+        {"project": project, "count": int(count), "latest": latest},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _line(record: Dict[str, Any]) -> str:
+    obs_id = record.get("id", "?")
+    kind = str(record.get("type") or "?").strip() or "?"
+    title = " ".join(str(record.get("title") or "").split())[:120]
+    return f"- [{obs_id}] ({kind}) {title}"
+
+
+__all__ = [
+    "KNOWLEDGE_BASE_HARD_CHARS",
+    "MAX_COUNT_LIMIT",
+    "MAX_DIGEST_CHARS",
+    "MAX_DIGEST_ITEMS",
+    "MAX_REVIEW_ITEMS",
+    "MAX_TOPIC_CHARS",
+    "MAX_WINDOW",
+    "MachineRead",
+    "ReviewBatch",
+    "client_for",
+    "continuation_narrative",
+    "digest",
+    "due_for_review",
+    "entry_count",
+    "knowledge_topic",
+    "memory_version",
+    "recent",
+    "type_digest",
+]

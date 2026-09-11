@@ -1483,6 +1483,40 @@ def _handle_evolution_task_done(
                 rounds=rounds,
                 transaction=recorded_transaction or transaction,
             )
+            # Additive remote sink (WO). The local ledger above stays the
+            # promotion chooser's source of truth; this mirrors the cycle
+            # outcome into Engram. An ABSORBING cycle records
+            # `waiting_for_restart` here because its verdict is only confirmed
+            # after the restart, and the real verdict then lands through
+            # `_append_cycle_outcome_tag` under the SAME task_id so Engram upserts
+            # rather than storing a half-finished memory (C19).
+            #
+            # A cycle whose verdict is ALREADY known must say so now: it has no
+            # second phase coming, so a pending state would be a permanent lie.
+            # The live ledger is nine for nine such cycles (`no_op`, no restart
+            # required), none of which would ever have been corrected.
+            try:
+                from ouroboros.engram_sink import emit_evolution_outcome
+                from ouroboros.evolution_checkpoints import resolve_reported_cycle_outcome
+
+                campaign = _read_evolution_campaign() or {}
+                settled_tx = recorded_transaction or transaction
+                emit_evolution_outcome(
+                    ctx.DRIVE_ROOT,
+                    {
+                        "kind": "evolution_checkpoint",
+                        "task_id": str(task_id or ""),
+                        "campaign_id": str(campaign.get("id") or ""),
+                        "campaign_objective": str(campaign.get("objective") or ""),
+                        "cycle_outcome": resolve_reported_cycle_outcome(settled_tx),
+                        "abandoned_reason": str(settled_tx.get("abandoned_reason") or ""),
+                        "commit_sha": str(settled_tx.get("commit_sha") or ""),
+                        "outcome_axes": outcome_axes,
+                        "git_sha": "",
+                    },
+                )
+            except Exception:
+                log.debug("Engram evolution-checkpoint mirror failed", exc_info=True)
         except Exception:
             log.debug("Failed to append evolution checkpoint", exc_info=True)
     except Exception:

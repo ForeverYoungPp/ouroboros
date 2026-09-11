@@ -54,12 +54,23 @@ def _authority_identity(value: Any) -> str:
 
 def _narrative_for(
     node: Mapping[str, Any], task_id: str, drive_root: Any,
-) -> Optional[Dict[str, Any]]:
+) -> tuple[Optional[Dict[str, Any]], str]:
+    """``(narrative, status)`` where status explains a miss.
+
+    Local sources first — they are authoritative and free. Engram is the third
+    source (S4): it holds the same authored narrative as one episodic-memory record
+    per task, so a predecessor's account survives the loss of the local drive.
+
+    The miss status is returned rather than collapsed into ``None`` because the
+    caller owes the reader a typed gap, and "no narrative was ever written" is a
+    different fact from "none could be read right now" (C15). Reporting the second
+    as the first is how a memory-loss signal becomes noise.
+    """
     from ouroboros.project_dialogue import continuation_narrative_is_valid
 
     candidate = node.get("continuation_narrative")
     if continuation_narrative_is_valid(candidate, task_id):
-        return copy.deepcopy(dict(candidate))
+        return copy.deepcopy(dict(candidate)), "node"
     try:
         from ouroboros.project_dialogue import resolve_legacy_continuation_narrative
 
@@ -67,12 +78,45 @@ def _narrative_for(
             drive_root, task_id, _canonical_result_ref(task_id),
         )
         if isinstance(legacy, dict) and continuation_narrative_is_valid(legacy, task_id):
-            return copy.deepcopy(legacy)
+            return copy.deepcopy(legacy), "legacy"
     except Exception:
         # A missing or malformed legacy row is represented by the caller's
         # typed gap.  Main context assembly must not become a second writer.
-        return None
-    return None
+        pass
+    return _narrative_from_engram(task_id, drive_root)
+
+
+def _narrative_from_engram(task_id: str, drive_root: Any) -> tuple[Optional[Dict[str, Any]], str]:
+    """The Engram copy of the authored narrative, if it can be read.
+
+    Reconstructed in the *same shape* the local record has — including the
+    ``result_ref`` / ``source_coverage`` pair the validator requires — so a consumer
+    never has to branch on where the account came from. Only ``origin`` records that,
+    because provenance is part of the memory.
+    """
+    try:
+        from ouroboros.engram_read import client_for, continuation_narrative
+
+        read = continuation_narrative(client_for(drive_root), task_id)
+    except Exception:
+        return None, "unknown"
+    if read.status == "unavailable":
+        return None, "unknown"
+    if read.status != "ok" or not read.text.strip():
+        return None, "absent"
+    ref = _canonical_result_ref(task_id)
+    return (
+        {
+            "summary_id": f"task-narrative:{task_id}",
+            "summary_kind": "authored_root_summary",
+            "task_id": task_id,
+            "result_ref": copy.deepcopy(ref),
+            "source_coverage": {"task_result": copy.deepcopy(ref)},
+            "text": read.text,
+            "origin": "engram",
+        },
+        "engram",
+    )
 
 
 def _narrative_value(
@@ -84,7 +128,7 @@ def _narrative_value(
     seen_narratives: MutableSet[str],
 ) -> Dict[str, Any]:
     source = _task_result_source(node, task_id)
-    narrative = _narrative_for(node, task_id, drive_root)
+    narrative, miss_status = _narrative_for(node, task_id, drive_root)
     narrative_id = f"task-narrative:{task_id}"
     base = {
         "raw_result_resident": False,
@@ -93,13 +137,18 @@ def _narrative_value(
         "source": copy.deepcopy(source),
     }
     if not narrative:
+        # C15 / AC15 (S4): the reason distinguishes "there is no such record" from
+        # "the store that would hold it could not be read". Both leave the
+        # projection unavailable; only one of them means the memory is gone.
+        unavailable = miss_status != "unknown"
         return {
             **base,
             "status": "unavailable",
             "narrative_status": "unavailable",
             "narrative_gap": {
                 "kind": "continuation_narrative_unavailable",
-                "reason": "no_exact_authored_summary",
+                "reason": "no_exact_authored_summary" if unavailable else "engram_unreadable",
+                "memory_presence": "absent" if unavailable else "unknown",
             },
         }
     if narrative_id in seen_narratives:

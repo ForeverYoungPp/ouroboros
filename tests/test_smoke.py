@@ -139,6 +139,7 @@ EXPECTED_TOOLS = [
     "list_available_tools", "enable_tools",
     "analyze_screenshot", "vlm_query", "view_image",
     "ocr_pdf", "youtube_transcript", "extract_video_frames",
+    "engram",
 ]
 
 

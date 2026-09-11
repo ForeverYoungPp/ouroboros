@@ -503,7 +503,13 @@ def test_bgc_durable_dialogue_gap_blocks_direct_identity_update(tmp_path):
             "content": "[MEMORY GAP] A durable biography interval is unavailable.",
         }]), encoding="utf-8")
         context = bc._build_context()
-        assert "## Dialogue History" in context and "[MEMORY GAP]" in context
+        # The gap must remain VISIBLE to the background consciousness (BIBLE P1),
+        # but its old carrier — the lossy `## Dialogue History` narrative — left
+        # the prompt. The disclosure is rendered on its own now, bounded.
+        assert "[MEMORY GAP]" in context
+        assert "## Memory Gaps" in context
+        assert "dialogue-gap-123" in context
+        assert "## Dialogue History" not in context
         content = "I must not rewrite identity across a known durable biography gap."
         result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
         assert "IDENTITY_UPDATE_ABSTAINED" in result

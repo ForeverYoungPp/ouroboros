@@ -61,14 +61,22 @@ def test_list_prefers_existing_index_verbatim(tmp_path):
     assert _knowledge_list(ctx) == "# Knowledge Base Index\n\n- **a**: alpha\n"
 
 
-def test_first_write_into_indexless_store_seeds_the_full_index(tmp_path):
-    """#447 C1: the write path is now the ONLY index author, so a first write
-    into a store that has topic files but no index must seed ALL of them —
-    a one-topic seed would hide every pre-existing topic from later listings."""
+def test_first_write_into_indexless_store_seeds_the_full_index(tmp_path, monkeypatch):
+    """#447 C1, retargeted to the store whose write path still authors an index.
+
+    The guard is unchanged: a first write into a store that has topic files but no
+    index must seed ALL of them, because a one-topic seed would hide every
+    pre-existing topic from later listings. Only the PATH moved — S2 retired the
+    canonical local write, so the per-project facts store is now the only local
+    write path that maintains ``index-full.md``.
+    """
+    import ouroboros.config as cfg
+    from ouroboros.project_facts import project_knowledge_dir
     from ouroboros.tools.knowledge import _knowledge_write
 
-    ctx = _Ctx(tmp_path / "drive")
-    kdir = ctx.drive_root / "memory" / "knowledge"
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path / "data-root")
+    ctx = _Ctx(tmp_path / "drive", project_id="proj_idx")
+    kdir = project_knowledge_dir("proj_idx")
     kdir.mkdir(parents=True)
     (kdir / "alpha.md").write_text("# alpha\n\nSummary of alpha.\n", encoding="utf-8")
     (kdir / "beta.md").write_text("# beta\n\nSummary of beta.\n", encoding="utf-8")
@@ -80,3 +88,15 @@ def test_first_write_into_indexless_store_seeds_the_full_index(tmp_path):
     for topic in ("alpha", "beta", "gamma"):
         assert topic in listing, (topic, listing)
     assert (kdir / INDEX_FILE).exists()
+
+
+def test_canonical_write_no_longer_authors_a_local_index(tmp_path):
+    """S2: the canonical write path stops maintaining ``index-full.md`` too."""
+    from ouroboros.tools.knowledge import _knowledge_write
+
+    ctx = _Ctx(tmp_path / "drive")
+    _knowledge_write(ctx, topic="gamma", content="# gamma\n\nSummary of gamma.\n")
+
+    kdir = ctx.drive_root / "memory" / "knowledge"
+    assert not (kdir / INDEX_FILE).exists()
+    assert not (kdir / "gamma.md").exists()

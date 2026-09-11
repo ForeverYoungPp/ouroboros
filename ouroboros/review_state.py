@@ -1480,6 +1480,40 @@ def save_state(drive_root: pathlib.Path, state: AdvisoryReviewState) -> None:
         _save_state_unlocked(drive_root, state)
     finally:
         release_review_state_lock(drive_root, lock_fd)
+    _mirror_latest_verdict(drive_root, state)
+
+
+def _mirror_latest_verdict(drive_root: pathlib.Path, state: AdvisoryReviewState) -> None:
+    """Mirror the newest review verdict into Engram (W9). Never raises.
+
+    ``save_state`` runs on every mutation, so this leans on the sink's in-run
+    identity+content dedupe: an unchanged verdict is dropped as a duplicate and
+    only a genuinely new verdict is sent. ``obligation_ids`` and the finding
+    bodies are deliberately NOT forwarded — those are work items, and Engram
+    stores memories, not to-dos (C18).
+    """
+    try:
+        attempt = state.latest_attempt()
+        if attempt is None:
+            return
+        fails = sum(
+            1
+            for finding in (attempt.critical_findings or [])
+            if isinstance(finding, dict) and str(finding.get("verdict") or "").upper() == "FAIL"
+        )
+        verdict = str(attempt.status or "").strip() or ("FAIL" if fails else "unknown")
+        row = {
+            "verdict": verdict,
+            "task_id": str(attempt.task_id or ""),
+            "attempt": int(attempt.attempt or 0),
+            "summary": str(attempt.block_reason or attempt.commit_message or ""),
+            "fail_findings": fails,
+        }
+        from ouroboros.engram_sink import emit_review_verdicts
+
+        emit_review_verdicts(drive_root, [row], task_id=str(attempt.task_id or ""))
+    except Exception:
+        return
 
 
 def update_state(

@@ -469,9 +469,10 @@ def append_authored_task_summary(
 ) -> bool:
     """Append the authored row and persist its identical continuation narrative."""
     appended = append_canonical_task_summary(canonical_root, row)
+    task_id = str(row.get("task_id") or "")
     persist_continuation_narrative(
         result_root,
-        str(row.get("task_id") or ""),
+        task_id,
         str(row.get("text") or ""),
         summary_id=str(row.get("summary_id") or ""),
         summary_kind=str(row.get("summary_kind") or ""),
@@ -479,6 +480,15 @@ def append_authored_task_summary(
         source_coverage=row.get("source_coverage") if isinstance(row.get("source_coverage"), dict) else {},
         status=status,
     )
+    # Additive remote sink (W4). The authored narrative already reached local
+    # durable storage above; this mirrors it into Engram as one episodic-memory
+    # record per task (same task_id ⇒ upsert, never a duplicate). Soft-fails.
+    try:
+        from ouroboros.engram_sink import emit_task_narrative
+
+        emit_task_narrative(canonical_root, {"text": row.get("text")}, task_id=task_id)
+    except Exception:
+        pass
     return appended
 
 

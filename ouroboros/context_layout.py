@@ -49,13 +49,26 @@ from typing import Any, List
 
 # Protected core: always rendered in full, in every context mode. Encoded as
 # data so a drift-guard test can assert no future change demotes it.
+#
+# `knowledge_index` left this set when durable knowledge stopped being prompt-
+# resident: it is retrieved from Engram on demand (see `prompts/SYSTEM.md`
+# § Memory and Context and `ouroboros/tools/engram.py`). That is a DEMOTION, so
+# it is declared rather than silently dropped — the guarantee that replaced
+# "always resident in full" is a DIFFERENT promise ("always retrievable, bounded,
+# and disclosed when unreachable"), and a reader has to be able to see the swap.
 TIER0_ALWAYS_FULL = frozenset({
     "system",
     "bible",
     "identity",
     "scratchpad",
-    "knowledge_index",
     "recent_dialogue",
+})
+
+#: Sections that left the always-resident core and are satisfied by bounded
+#: on-demand retrieval instead. Kept as data so the replacement is auditable
+#: rather than an invisible deletion.
+TIER0_RETRIEVAL_BACKED = frozenset({
+    "knowledge_index",
 })
 
 

@@ -20,6 +20,28 @@ INDEX_FILE = "index-full.md"
 # The immune improvement backlog is ONE global store, never per-project (C10.1).
 BACKLOG_TOPIC = "improvement-backlog"
 
+#: S2 stop switch. The CANONICAL ``memory/knowledge/<topic>.md`` + ``index-full.md``
+#: write is RETIRED: its readers (main chat, consciousness, deep self-review) now
+#: read Engram, so leaving the local write on would keep feeding a store nobody
+#: consults — and would keep 20 KB of always-on context alive in the background
+#: loop. It is an explicit switch rather than a deleted code path so the stop is
+#: greppable and a rollback is one line (C2 asks for "comment out / disable", not
+#: for removal). Existing local files are NEVER deleted: they stay as the
+#: read-only archive of everything learned before the switch (C2 / BIBLE P1).
+CANONICAL_LOCAL_WRITE = False
+
+
+def _local_write_live(ctx: ToolContext) -> bool:
+    """Whether this write still lands in a local ``<topic>.md`` file.
+
+    Project-scoped facts keep their local store. The stop names only the canonical
+    ``memory/knowledge/`` path, and per-project isolation lives in the *path*
+    (``projects/<id>/knowledge``) with no Engram scope equivalent — stopping it
+    would silently merge one project's facts into the repo-wide scope, which is a
+    guarded contract (see ``tests/test_project_facts.py``), not a free win.
+    """
+    return bool(str(getattr(ctx, "project_id", "") or "").strip()) or CANONICAL_LOCAL_WRITE
+
 
 def _backlog_root(ctx: ToolContext) -> Path:
     """Canonical drive root for the global immune backlog. Prefer the canonical
@@ -217,9 +239,85 @@ def _knowledge_read(ctx: ToolContext, topic: str) -> str:
     except ValueError as e:
         return f"⚠️ Invalid topic: {e}"
 
-    if not path.exists():
-        return f"Topic '{sanitized_topic}' not found. Use knowledge_list to see available topics."
-    return path.read_text(encoding="utf-8")
+    # Where the local write is still live (project facts), the local file is the
+    # authoritative copy and is read first. Where it has been retired (the
+    # canonical store, S2), Engram holds anything written since the switch, so a
+    # local-first read would happily serve a STALE file for a topic that was
+    # overwritten afterwards. Read the live store first, and fall back to the
+    # local archive for the topics written before the switch.
+    if not _local_write_live(ctx):
+        remote = _engram_topic_read(ctx, sanitized_topic)
+        if remote is not None:
+            return remote
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    return _engram_topic_fallback(ctx, sanitized_topic)
+
+
+def _engram_topic_read(ctx: ToolContext, topic: str) -> str | None:
+    """The Engram record for one topic, or ``None`` when it has none / is down.
+
+    ``None`` means "the local archive is the best answer available" — including
+    when the store is unreachable, because the archive is strictly more
+    informative than an error for a topic that predates the switch. The
+    *unreachable-and-nothing-local* case is reported by the caller, where it can
+    be phrased as UNKNOWN rather than as an absence.
+    """
+    try:
+        from ouroboros.engram_read import client_for, knowledge_topic
+
+        read = knowledge_topic(client_for(ctx), topic, scope=_engram_scope(ctx))
+    except Exception:
+        return None
+    if read.status == "ok" and read.text.strip():
+        return (
+            f"# {topic}\n\n{read.text}\n\n"
+            "_(from Engram: durable knowledge is stored remotely. The local file, if any, "
+            "is the pre-switch archive and may be older.)_"
+        )
+    return None
+
+
+def _engram_scope(ctx: ToolContext) -> str:
+    """Engram scope matching how this caller writes: project facts vs global."""
+    return "project" if str(getattr(ctx, "project_id", "") or "").strip() else "global"
+
+
+def _engram_topic_fallback(ctx: ToolContext, topic: str) -> str:
+    """Read path for topics whose local file is gone (or never existed).
+
+    S2 stops the local ``<topic>.md`` write, so a topic written after that point
+    lives only in Engram. Without this, ``knowledge_write`` followed by
+    ``knowledge_read`` would report "not found" for a record the agent had just
+    durably stored — the tool pair would lie about its own memory (C13
+    read-before-stop). The three outcomes stay distinct: an unreachable store is
+    *unknown*, not *absent*.
+    """
+    try:
+        from ouroboros.engram_read import client_for, knowledge_topic
+
+        read = knowledge_topic(
+            client_for(ctx),
+            topic,
+            scope="project" if str(getattr(ctx, "project_id", "") or "").strip() else "global",
+        )
+    except Exception as exc:
+        return (
+            f"Topic '{topic}' not found locally, and Engram could not be reached "
+            f"({type(exc).__name__}) — whether a durable record exists is UNKNOWN, not absent."
+        )
+    if read.status == "unavailable":
+        return (
+            f"Topic '{topic}' not found locally, and Engram is unreachable — whether a durable "
+            "record exists is UNKNOWN, not absent. Do not conclude the knowledge was never learned."
+        )
+    if read.status == "ok" and read.text.strip():
+        return (
+            f"# {topic}\n\n{read.text}\n\n"
+            "_(from Engram: this topic has no local file — durable knowledge is stored remotely "
+            "once the local write is retired.)_"
+        )
+    return f"Topic '{topic}' not found. Use knowledge_list to see available topics."
 
 
 def _record_backlog_history(backlog_file: Path, topic: str, mode: str, task_id: str) -> None:
@@ -275,39 +373,89 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
     except ValueError as e:
         return f"⚠️ Invalid topic: {e}"
 
-    _ensure_dir(ctx)
-    with _knowledge_write_lock(_knowledge_dir(ctx)):
-        old_content = path.read_text(encoding="utf-8") if path.exists() else ""
+    scope = _engram_scope(ctx)
+    live_local = _local_write_live(ctx)
+    base_content, base_source = _write_base(ctx, sanitized_topic, path, scope, live_local=live_local)
 
-        if mode == "append":
-            needs_newline = False
-            if path.exists() and path.stat().st_size > 0:
-                with open(path, "rb") as rf:
-                    rf.seek(-1, 2)
-                    if rf.read(1) != b"\n":
-                        needs_newline = True
+    # An append must build on what is ACTUALLY there. When the live store could
+    # not be read, the merge is DEFERRED rather than guessed: merging onto a
+    # guessed base would upsert over content nobody saw and delete the older half
+    # (BIBLE P1), while refusing outright would drop the fragment for the whole
+    # outage. The fragment goes to the spool and is merged on the next forward,
+    # when the base can be read (C17).
+    deferred = mode == "append" and base_source == "unreachable"
 
-            with open(path, "a", encoding="utf-8") as f:
-                if needs_newline:
-                    f.write("\n")
-                f.write(content)
+    if live_local:
+        _ensure_dir(ctx)
+        with _knowledge_write_lock(_knowledge_dir(ctx)):
+            if mode == "append":
+                needs_newline = False
+                if path.exists() and path.stat().st_size > 0:
+                    with open(path, "rb") as rf:
+                        rf.seek(-1, 2)
+                        if rf.read(1) != b"\n":
+                            needs_newline = True
+
+                with open(path, "a", encoding="utf-8") as f:
+                    if needs_newline:
+                        f.write("\n")
+                    f.write(content)
+            else:
+                path.write_text(content, encoding="utf-8")
+
+            _update_index_entry(ctx, sanitized_topic)
+            new_content = path.read_text(encoding="utf-8") if path.exists() else ""
+    elif deferred:
+        new_content = content
+    else:
+        # S2: the canonical local write is retired. The record goes to Engram, and
+        # the local file — if one exists — is left exactly as it is, as the
+        # read-only archive of what was learned before the switch (C2 / P1).
+        new_content = _merged_content(base_content, content, mode)
+
+    # The durable record. Identity is the topic, so an evolving topic upserts in
+    # place instead of piling up near-duplicates (and the append base above was
+    # read from exactly this identity).
+    try:
+        from ouroboros.engram_sink import sink_for
+
+        sink = sink_for(ctx)
+        payload = {
+            "title": f"Knowledge: {sanitized_topic}",
+            "content": new_content or content,
+            "identity": f"knowledge:{sanitized_topic}",
+            "type": "knowledge",
+            "scope": scope,
+            "fields": {
+                "task_id": str(getattr(ctx, "task_id", "") or ""),
+                "topic": sanitized_topic,
+                "mode": mode,
+            },
+        }
+        if deferred:
+            sink.emit_deferred_append(**payload)
         else:
-            path.write_text(content, encoding="utf-8")
-
-        _update_index_entry(ctx, sanitized_topic)
-        new_content = path.read_text(encoding="utf-8") if path.exists() else ""
+            sink.emit("knowledge", document=True, **payload)
+    except Exception:
+        log.debug("Engram knowledge mirror failed", exc_info=True)
 
     try:
         history_path = _knowledge_dir(ctx).parent / "knowledge_history.jsonl"
+        # The canonical write no longer runs ``_ensure_dir`` (nothing local is
+        # written), so the audit trail's directory is created here. Losing the
+        # old/new provenance of a memory write is exactly the silent erosion the
+        # history exists to prevent.
+        history_path.parent.mkdir(parents=True, exist_ok=True)
         with open(history_path, "a", encoding="utf-8") as hf:
             hf.write(json.dumps({
                 "ts": utc_now_iso(),
                 "task_id": str(getattr(ctx, "task_id", "") or ""),
                 "topic": sanitized_topic,
                 "mode": mode,
-                "old_sha256": hashlib.sha256(old_content.encode("utf-8")).hexdigest() if old_content else "",
+                "base_source": base_source,
+                "old_sha256": hashlib.sha256(base_content.encode("utf-8")).hexdigest() if base_content else "",
                 "new_sha256": hashlib.sha256(new_content.encode("utf-8")).hexdigest() if new_content else "",
-                "old_content": old_content,
+                "old_content": base_content,
                 "new_content": new_content,
             }, ensure_ascii=False) + "\n")
     except Exception:
@@ -315,6 +463,7 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
 
     try:
         journal_path = _knowledge_dir(ctx).parent / "knowledge_journal.jsonl"
+        journal_path.parent.mkdir(parents=True, exist_ok=True)
         total_kb = 0
         knowledge_dir = _knowledge_dir(ctx)
         if knowledge_dir.exists():
@@ -325,15 +474,118 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
             "ts": utc_now_iso(),
             "topic": sanitized_topic,
             "mode": mode,
-            "file_kb": path.stat().st_size / 1024,
+            "content_chars": len(new_content),
             "total_knowledge_kb": round(total_kb, 2),
         }
+        if path.exists():
+            entry["file_kb"] = path.stat().st_size / 1024
         with open(journal_path, "a", encoding="utf-8") as jf:
             jf.write(json.dumps(entry) + "\n")
     except Exception:
         pass
 
+    if deferred:
+        return (
+            f"✅ Knowledge '{sanitized_topic}' append ({mode}) DEFERRED: Engram is unreachable, so "
+            "the fragment is spooled and will be merged onto the existing record when it can be "
+            "read. Nothing was overwritten and nothing was lost."
+        )
+    if not live_local:
+        return (
+            f"✅ Knowledge '{sanitized_topic}' saved ({mode}) to Engram — the canonical local "
+            "knowledge file is no longer written; the on-disk copy is the pre-switch archive."
+        )
     return f"✅ Knowledge '{sanitized_topic}' saved ({mode})."
+
+
+def _merged_content(base: str, content: str, mode: str) -> str:
+    """The record an ``append`` produces, matching the local file's byte behaviour."""
+    if mode != "append":
+        return content
+    if base and not base.endswith("\n"):
+        return base + "\n" + content
+    return base + content
+
+
+def _write_base(
+    ctx: ToolContext,
+    topic: str,
+    path: Path,
+    scope: str,
+    *,
+    live_local: bool,
+) -> tuple[str, str]:
+    """``(content, source)`` that a write builds on.
+
+    ``source`` is ``local`` | ``engram`` | ``none`` | ``unreachable``. The last one
+    is the signal that makes a blind append refusable rather than destructive, so
+    it is reported separately from "the store genuinely has nothing".
+    """
+    if live_local:
+        # Project facts: the local file is the authoritative copy.
+        try:
+            if path.exists():
+                return path.read_text(encoding="utf-8"), "local"
+        except Exception:
+            log.debug("Failed to read project knowledge file", exc_info=True)
+        return "", "none"
+
+    unreachable = False
+    try:
+        from ouroboros.engram_read import (
+            KNOWLEDGE_BASE_HARD_CHARS,
+            client_for,
+            knowledge_topic,
+        )
+
+        read = knowledge_topic(
+            client_for(ctx), topic, scope=scope, max_chars=KNOWLEDGE_BASE_HARD_CHARS
+        )
+        if read.status == "ok" and read.text:
+            return read.text, "engram"
+        unreachable = read.status == "unavailable"
+    except Exception:
+        unreachable = True
+
+    if unreachable:
+        # The archive cannot stand in for the live store: it may be older than a
+        # remote record we simply could not read, and appending to it would then
+        # overwrite that newer record.
+        return "", "unreachable"
+    return "", "none"
+
+
+def _engram_list_note(ctx: ToolContext) -> str:
+    """Spoken only when the LOCAL answer is "empty" — the one case that lies.
+
+    A non-empty local listing is an honest answer to "what does the local
+    knowledge base hold"; SYSTEM.md already says durable knowledge lives in
+    Engram and how to reach it. But "Knowledge base is empty" reads as "I know
+    nothing", and after S2 that is false: knowledge written since the local write
+    was retired exists only remotely. So this is emitted on the empty path only —
+    where the misreading is severe — and it costs a network call only there.
+
+    It is deliberately a pointer, not a pull (C20 progressive disclosure):
+    inlining the remote index would recreate the always-on injection this phase
+    removed.
+    """
+    try:
+        from ouroboros.engram_read import MAX_REVIEW_ITEMS, client_for, recent
+
+        read = recent(client_for(ctx), limit=MAX_REVIEW_ITEMS)
+    except Exception:
+        return ""
+    if read.status == "unavailable":
+        return (
+            " Engram is unreachable, so whether durable knowledge exists remotely is "
+            "UNKNOWN, not absent — do not conclude nothing was learned."
+        )
+    if read.count <= 0:
+        return ""
+    return (
+        f" Engram additionally holds {read.count} durable record(s) for this project; "
+        "use the `engram` tool (op=search, then op=read) to reach them."
+    )
 
 
 def _knowledge_list(ctx: ToolContext) -> str:
@@ -366,14 +618,14 @@ def _knowledge_list(ctx: ToolContext) -> str:
 
     if entries:
         return "# Knowledge Base Index\n\n" + "\n".join(entries) + "\n"
-    return "Knowledge base is empty. Use knowledge_write to add topics."
+    return "Knowledge base is empty. Use knowledge_write to add topics." + _engram_list_note(ctx)
 
 
 def get_tools() -> List[ToolEntry]:
     return [
         ToolEntry("knowledge_read", {
             "name": "knowledge_read",
-            "description": "Read a topic from the persistent knowledge base on Drive. On a project-scoped task, reads from that project's per-project facts store (isolated from global knowledge).",
+            "description": "Read a topic from the persistent knowledge base on Drive. On a project-scoped task, reads from that project's per-project facts store (isolated from global knowledge). When the topic has no local file, the durable Engram record is read instead (the local write is being retired), so a not-found local file never means the topic was never learned.",
             "parameters": {
                 "type": "object",
                 "properties": {

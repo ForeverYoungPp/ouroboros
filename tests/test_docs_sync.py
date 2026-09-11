@@ -199,3 +199,84 @@ def test_architecture_mirror_matches_the_split_axes_contracts():
     # Both wait_tasks projection enumerations disclose capability_delta.
     assert "trace_summary, capability_delta when the child has something to disclose" in arch_flat
     assert "trace_summary, capability_delta when disclosable, duplicate_of" in dev_flat
+
+
+# --------------------------------------------------------------------------- #
+# BIBLE: "any structural change (new module, endpoint, data file, log, config)
+# updates docs/ARCHITECTURE.md in the same commit"
+# --------------------------------------------------------------------------- #
+# That rule had no guard, so it could only be honoured by remembering. The check
+# below is deliberately a NO-REGRESSION bound rather than "every module must
+# appear": the tree is curated (14 small/private helper modules have never had an
+# entry), and a blanket rule would fail on history instead of on the change in
+# front of the author. A NEW undocumented module grows the set and fails.
+
+#: Modules with no ARCHITECTURE.md entry, as of the Engram memory phase. Shrinking
+#: this set is progress; growing it means a new module shipped undocumented.
+_UNDOCUMENTED_MODULES = {
+    "_usage_response.py",
+    "context_mode_compat.py",
+    "credential_shapes.py",
+    "delegate_custody_usage.py",
+    "empty_round_guard.py",
+    "evolution_fingerprint.py",
+    "review_actor_aggregation.py",
+    "review_session_usage.py",
+    "review_thread_continuity.py",
+    "settings_integrity.py",
+    "skill_owner_attestation.py",
+    "system_projection.py",
+    "transport_custody.py",
+    "version.py",
+}
+
+
+def test_no_new_module_ships_without_an_architecture_entry():
+    arch = _read("docs/ARCHITECTURE.md")
+    modules = sorted(
+        path.name
+        for path in (REPO / "ouroboros").glob("*.py")
+        if path.name != "__init__.py"
+    )
+    undocumented = {name for name in modules if name not in arch}
+
+    grew = sorted(undocumented - _UNDOCUMENTED_MODULES)
+    assert not grew, (
+        "new module(s) with no docs/ARCHITECTURE.md entry (BIBLE: same commit): "
+        f"{grew}"
+    )
+    # ...and the baseline itself stays honest: an entry for a listed module means
+    # the list should have been trimmed in the same commit.
+    stale = sorted(_UNDOCUMENTED_MODULES - undocumented)
+    assert not stale, (
+        "these are documented now, so drop them from _UNDOCUMENTED_MODULES: "
+        f"{stale}"
+    )
+
+
+def test_the_engram_subsystem_is_documented_where_its_readers_will_look():
+    arch = _read("docs/ARCHITECTURE.md")
+    for module in ("engram_client.py", "engram_sink.py", "engram_read.py", "engram_conflicts.py"):
+        assert module in arch, f"{module} has no architecture entry"
+    assert "#### Engram — the external durable memory store" in arch
+    # Its non-obvious decisions are the reason it earns an entry.
+    for rationale in (
+        "does NOT route through `mcp_client.py`",
+        "never stores what to DO next",
+        "DEFERRED rather than guessed",
+        "per-turn budget",
+        "READ-ONLY archive",
+    ):
+        assert rationale in arch, rationale
+
+
+def test_the_engram_state_and_log_files_are_documented():
+    arch = _read("docs/ARCHITECTURE.md")
+    assert "state/engram_spool.jsonl" in arch
+    assert "logs/engram.jsonl" in arch
+
+
+def test_the_engram_environment_variables_are_documented():
+    arch = _read("docs/ARCHITECTURE.md")
+    for name in ("ENGRAM_BASE_URL", "ENGRAM_PROJECT", "ENGRAM_HTTP_TOKEN", "OUROBOROS_REPO_DIR"):
+        assert f"| {name} |" in arch, f"{name} is undocumented"

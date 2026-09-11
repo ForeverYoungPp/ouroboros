@@ -182,7 +182,20 @@ def _apply_reflection_memory_actions(
             return 0
         from ouroboros.reflection import apply_memory_actions
 
-        return apply_memory_actions(env, actions, project_id=project_id)
+        applied = apply_memory_actions(env, actions, project_id=project_id)
+        # Additive remote sink (W1). The local application above is unchanged and
+        # remains the source of truth for this run; this mirrors the same
+        # already-validated actions into Engram. It never raises and never blocks
+        # the task (C6) — an unreachable Engram spools instead.
+        try:
+            from ouroboros.engram_sink import emit_reflection_memory_actions
+
+            emit_reflection_memory_actions(
+                env, actions, task_id=str((reflection_entry or {}).get("task_id") or "")
+            )
+        except Exception:
+            log.debug("Engram memory-action mirror failed", exc_info=True)
+        return applied
     except Exception:
         log.debug("Reflection memory action application failed", exc_info=True)
         return 0

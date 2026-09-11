@@ -130,6 +130,26 @@ def _chat_history_snapshot_id(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _scratchpad_block_fingerprint(block: Dict[str, Any]) -> str:
+    """Stable identity for one scratchpad block, used as its Engram topic key.
+
+    Content-addressed rather than timestamp-addressed: a spool retry after a crash
+    must land on the SAME record (C17 idempotency), and two blocks written in the
+    same second by different sources must not collapse into one.
+    """
+    payload = json.dumps(
+        {
+            "ts": str(block.get("ts") or ""),
+            "source": str(block.get("source") or ""),
+            "content": str(block.get("content") or ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
 class Memory:
     def __init__(self, drive_root: pathlib.Path, repo_dir: Optional[pathlib.Path] = None):
         self.drive_root = drive_root
@@ -274,11 +294,52 @@ class Memory:
                 "source": source,
                 "metadata": dict(metadata or {}),
                 "block": dict(new_block),
+                # S3: where the Engram mirror of this block ended up. Recorded per
+                # block rather than logged once, so "the working memory is also in
+                # Engram" stays an auditable claim rather than an assumption.
+                "engram_mirror": self._mirror_block_to_engram(new_block, source=source),
             })
         except Exception:
             log.debug("Failed to write scratchpad size to journal", exc_info=True)
 
         return new_block
+
+    def _mirror_block_to_engram(self, block: Dict[str, Any], *, source: str) -> str:
+        """Mirror one scratchpad block into Engram. Returns a status token, never raises.
+
+        The local store stays the source of truth for the prompt section (see
+        ``prompts/SYSTEM.md``: the scratchpad is working state, not reference
+        material — see also the AC11/AC-S3 resolution in the phase log). This is the
+        additive half: the agent's working memory becomes a durable remote memory
+        too, retrievable when the local drive is gone.
+
+        Identity is a fingerprint of the block itself, so a spool retry after a
+        crash updates the same record instead of appending a duplicate (C17).
+        """
+        try:
+            from ouroboros.engram_sink import sink_for
+
+            fingerprint = _scratchpad_block_fingerprint(block)
+            receipt = sink_for(self).emit(
+                "memory_action",
+                title=f"Scratchpad block ({source or 'task'})",
+                content=str(block.get("content") or ""),
+                identity=f"scratchpad:{fingerprint}",
+                type="scratchpad_block",
+                scope="global",
+                document=True,
+                fields={"source": str(source or ""), "block_ts": str(block.get("ts") or "")},
+            )
+            if receipt.accepted:
+                return "sent" if receipt.status == "sent" else "spooled"
+            # A to-do-shaped block is CORRECTLY refused (C18) — the working memory
+            # may legitimately hold "what I am doing next", and that is not a
+            # memory. The refusal is recorded rather than hidden so the partial
+            # mirror is visible in the journal instead of looking like a success.
+            return f"skipped:{receipt.reason or receipt.status}"
+        except Exception as exc:
+            log.debug("Scratchpad Engram mirror failed", exc_info=True)
+            return f"failed:{type(exc).__name__}"
 
     def regenerate_scratchpad_md(self) -> None:
         bp = self.scratchpad_blocks_path()

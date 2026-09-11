@@ -46,6 +46,9 @@ TOOL_POLICY: Dict[str, str] = {
     "recent_tasks": POLICY_SKIP,
     "knowledge_read": POLICY_SKIP,
     "knowledge_list": POLICY_SKIP,
+    # Engram reads are pure retrieval (search/timeline/read). The tool has no
+    # write op, so a per-call LLM recheck would only add latency to a read.
+    "engram": POLICY_SKIP,
     "journal_read": POLICY_SKIP,
     "workpad_read": POLICY_SKIP,
     "web_search": POLICY_SKIP,

@@ -57,7 +57,6 @@ from ouroboros.utils import (
     read_json_dict,
     read_text,
     safe_relpath,
-    truncate_review_artifact,
     utc_now_iso,
 )
 
@@ -885,29 +884,40 @@ def build_knowledge_sections(
     project_id: str = "",
     warn_large: bool = False,
     pattern_header: str = "## Known error patterns (Pattern Register)",
+    include_derived_knowledge: bool = True,
 ) -> List[str]:
+    """Knowledge-base index, Pattern Register, and per-project working state.
+
+    ``include_derived_knowledge=False`` drops the two *derived-learning* inputs
+    (the knowledge index and the Pattern Register) while keeping the per-project
+    journal/workpad, which are live project working state rather than learning.
+    The main-chat assembly uses that — durable knowledge is retrieved from Engram
+    on demand now, but a project's own progress memory is not something the agent
+    should have to go and ask for. The default preserves every other caller.
+    """
     sections: List[str] = []
     # Knowledge base index: for a project-scoped task load ONLY the current
     # project's facts (`projects/<id>/knowledge`), isolated from the global
     # memory/knowledge tree and from any other project (Phase 3b). The Pattern
     # Register stays global (general error patterns are cross-project cognition).
     pid = str(project_id or "").strip()
-    if pid:
-        from ouroboros.project_facts import project_knowledge_dir
+    if include_derived_knowledge:
+        if pid:
+            from ouroboros.project_facts import project_knowledge_dir
 
-        knowledge_index = (project_knowledge_dir(pid) / "index-full.md", f"## Project knowledge ({pid})", "project knowledge index")
-    else:
-        knowledge_index = (env.drive_path("memory/knowledge/index-full.md"), "## Knowledge base", "knowledge index")
-    for path, header, label in (
-        knowledge_index,
-        (env.drive_path("memory/knowledge/patterns.md"), pattern_header, "patterns register"),
-    ):
-        text = safe_read(path)
-        if not text.strip():
-            continue
-        if warn_large and len(text) > _LARGE_CONTEXT_SECTION_CHARS:
-            log.warning("context: %s is large (%d chars)", label, len(text))
-        sections.append(f"{header}\n\n{text}")
+            knowledge_index = (project_knowledge_dir(pid) / "index-full.md", f"## Project knowledge ({pid})", "project knowledge index")
+        else:
+            knowledge_index = (env.drive_path("memory/knowledge/index-full.md"), "## Knowledge base", "knowledge index")
+        for path, header, label in (
+            knowledge_index,
+            (env.drive_path("memory/knowledge/patterns.md"), pattern_header, "patterns register"),
+        ):
+            text = safe_read(path)
+            if not text.strip():
+                continue
+            if warn_large and len(text) > _LARGE_CONTEXT_SECTION_CHARS:
+                log.warning("context: %s is large (%d chars)", label, len(text))
+            sections.append(f"{header}\n\n{text}")
     if pid:
         # Bounded per-project journal tail + workpad (multi-project, v6.32.0):
         # the project's durable progress memory rides along with its knowledge.
@@ -960,6 +970,41 @@ def _warn_if_over_budget(name: str, content: str) -> None:
         log.warning("Context section '%s' exceeds budget: %d chars > %d", name, len(content), budget)
 
 
+_DURABLE_GAP_SECTION_MAX = 10
+_DURABLE_GAP_EXCERPT_CHARS = 240
+
+
+def _format_durable_gap_section(blocks: List[Dict[str, Any]]) -> str:
+    """Bounded disclosure of durable biography gaps (BIBLE P1).
+
+    A gap is a fact in memory, not a silent absence. The narrative section that
+    used to carry this fact left the prompt (see ``build_memory_sections``), so
+    the disclosure is rendered on its own instead of disappearing with it. It is
+    deliberately tiny and only emitted when a gap actually exists — the whole
+    point of dropping the narrative was that history is no longer billed to
+    every prompt.
+    """
+    lines: List[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        gap_id = str(block.get("gap_id") or "").strip()
+        content = str(block.get("content") or "")
+        if not gap_id and "[MEMORY GAP]" not in content:
+            continue
+        excerpt = content if "[MEMORY GAP]" in content else f"[MEMORY GAP] {content}"
+        lines.append(f"- {gap_id or '(unnamed gap)'}: {excerpt[:_DURABLE_GAP_EXCERPT_CHARS]}")
+        if len(lines) >= _DURABLE_GAP_SECTION_MAX:
+            break
+    if not lines:
+        return ""
+    return (
+        "## Memory Gaps (durable history discontinuities)\n\n"
+        "These spans are recorded as unknowable. Do not read the history around "
+        "them as complete, and do not rewrite identity across one.\n\n" + "\n".join(lines)
+    )
+
+
 def build_memory_sections(memory: Memory, partition: str = "all", durable_dialogue_gaps_out: Optional[List[Dict[str, Any]]] = None) -> List[str]:
     sections = []
 
@@ -982,16 +1027,33 @@ def build_memory_sections(memory: Memory, partition: str = "all", durable_dialog
             sections.append("## Environment Profile (from `memory/WORLD.md` — already loaded; delete WORLD.md and restart to regenerate if the host environment changes)\n\n" + world_raw)
 
     if include_volatile:
+        # `## Dialogue History` used to be injected here from
+        # `dialogue_blocks.json`. Consolidation now exits the prompt: its blocks
+        # are LLM-authored, doubly lossy (100 msgs → block, 4 blocks → era at
+        # 30-40%), and unreclaimable by runtime compaction because they live in
+        # the system message — while duplicating the raw tail `## Recent chat`
+        # already carries. The blocks remain on disk as an on-demand retrieval
+        # layer (tools/core.py routes the read hint).
+        #
+        # The durable-gap projection is still computed: it is the "this span of
+        # history is unknowable" signal, and it has live consumers that are NOT
+        # this section — consciousness (consciousness.py), the chat_history
+        # snapshot id (memory.py `_chat_history_snapshot_id`) and context health.
+        # Dropping it with the section would silently retire a BIBLE P1
+        # disclosure.
         dialogue_blocks = memory.load_dialogue_blocks()
         if dialogue_blocks:
-            blocks_md = memory.format_blocks_as_markdown(dialogue_blocks)
-            if blocks_md.strip():
-                if durable_dialogue_gaps_out is not None:
-                    durable_dialogue_gaps_out.extend(memory._durable_dialogue_gaps(dialogue_blocks)[0])
-                sections.append("## Dialogue History\n\n" + blocks_md)
-        legacy_summary = safe_read(memory.drive_root / "memory" / "dialogue_summary.md").strip()
-        if legacy_summary:
-            sections.append("## Legacy Dialogue Summary (retired flat format, read-only fallback)\n\n" + legacy_summary)
+            gaps, _identities = memory._durable_dialogue_gaps(dialogue_blocks)
+            if durable_dialogue_gaps_out is not None:
+                durable_dialogue_gaps_out.extend(gaps)
+            # BIBLE P1: the gap must stay VISIBLE, not merely computable. Its
+            # old carrier was the narrative above, so it is re-rendered on its
+            # own — bounded, and only when a gap exists.
+            gap_section = _format_durable_gap_section(dialogue_blocks)
+            if gap_section:
+                sections.append(gap_section)
+        # `dialogue_summary.md` was a retired flat-format read-only fallback; the
+        # file does not exist on disk. It is no longer rendered.
 
     if partition == "all":
         registry_path = memory.drive_root / "memory" / "registry.md"
@@ -1181,6 +1243,35 @@ def build_recent_sections(
 
     return sections
 
+
+
+def _engram_verdict_section(env: Any) -> str:
+    """Bounded Engram-backed review-verdict digest (S6). Never raises.
+
+    Emitted only when the local review ledger has nothing to say, and it keeps the
+    three states apart: an unreachable store reports UNKNOWN rather than rendering
+    as "no verdicts", because the two lead to opposite conclusions about whether
+    this repo has ever been reviewed.
+    """
+    try:
+        from ouroboros.engram_read import client_for, type_digest
+
+        read = type_digest(client_for(env), "review_verdict")
+    except Exception:
+        return ""
+    if read.status == "unavailable":
+        return (
+            "## Review verdicts (Engram)\n\n"
+            "(unreachable — whether any verdict was recorded is UNKNOWN for this turn, "
+            "not absent)"
+        )
+    if read.status != "ok" or not read.text.strip():
+        return ""
+    return (
+        f"## Review verdicts (Engram, {read.count})\n"
+        "(historical — the live gate state is `review_status`)\n\n"
+        f"{read.text}"
+    )
 
 
 def _build_registry_digest(env: Any) -> str:
@@ -1413,19 +1504,27 @@ def _capture_context_core(
         log.debug("Failed to build Available subagents catalog", exc_info=True)
     semi_stable_parts.extend(build_memory_sections(context_memory, partition="stable"))
 
-    semi_stable_parts.extend(build_knowledge_sections(context_env, project_id=resolve_project_id(task)))
+    # Reading side (AC10): the derived-knowledge inputs leave the main chat
+    # prompt. Durable knowledge and the Pattern Register now live in Engram and
+    # are retrieved on demand; the per-project journal/workpad stay, because they
+    # are live project working state rather than accumulated learning.
+    semi_stable_parts.extend(
+        build_knowledge_sections(
+            context_env,
+            project_id=resolve_project_id(task),
+            include_derived_knowledge=False,
+        )
+    )
 
-    deep_review_path = context_env.drive_path("memory/deep_review.md")
-    try:
-        if deep_review_path.exists():
-            dr_text = deep_review_path.read_text(encoding="utf-8")
-            if dr_text.strip():
-                semi_stable_parts.append(
-                    "## Last Deep Self-Review\n\n"
-                    + truncate_review_artifact(dr_text, limit=8000)
-                )
-    except Exception:
-        pass
+    # `## Last Deep Self-Review` used to be injected here for every task class.
+    # It is a derived-learning artefact (same class as the knowledge base) and it
+    # was measured as a broken read — the file's content was a build failure
+    # notice, not a review. It is no longer rendered; the file stays on disk and
+    # `deep_self_review` still consumes it directly as its own input.
+    #
+    # (The `## Improvement Backlog` digest below is untouched: it is gated to
+    # evolution/deep_self_review tasks, which genuinely need it as action input —
+    # it is the self-evolution queue, not prompt decoration.)
 
     semi_stable_text = "\n\n".join(semi_stable_parts)
 
@@ -1484,6 +1583,16 @@ def _capture_context_core(
                 )
                 if advisory_section:
                     dynamic_parts.append(advisory_section)
+            else:
+                # S6 read path. The local review ledger is a live STATE MACHINE
+                # (the commit gate's attempts, obligations and debts), so it stays
+                # local; Engram holds the verdicts. Without this, a lost or fresh
+                # drive made "No advisory runs recorded yet" the only answer the
+                # agent could get, even though the verdicts exist — and a durable
+                # verdict nobody can reach is not a memory.
+                verdict_section = _engram_verdict_section(context_env)
+                if verdict_section:
+                    dynamic_parts.append(verdict_section)
         except Exception:
             log.debug("Failed to build advisory review status section", exc_info=True)
 
