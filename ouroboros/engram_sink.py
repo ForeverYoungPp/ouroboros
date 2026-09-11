@@ -40,7 +40,6 @@ log = logging.getLogger(__name__)
 
 from ouroboros.engram_client import (  # noqa: E402
     _FORBIDDEN_PROJECTS,
-    ENGRAM_HARD_LIMIT,
     EngramClient,
     EngramResult,
     resolve_project,
@@ -68,6 +67,15 @@ KNOWLEDGE_DOC_CHARS = 16_000
 #: identity's repo-wide continuity rather than a per-project fact, and the boot
 #: reconciliation reads it back through the same constant so the two cannot drift.
 _DIALOGUE_SCOPE = "global"
+
+#: How many records the boot carry-over reads back to decide what is already
+#: mirrored. The recency endpoint returns FULL observation bodies, so asking for
+#: Engram's 500 ceiling would pull the store's whole allowance on every start for
+#: a comparison that only ever needs the dialogue records — and the local file it
+#: is compared against holds ~10-15 blocks plus eras. A bound too small to see an
+#: existing record is harmless: that block is pushed again and the server upserts
+#: it, which costs an update and never a duplicate.
+_DIALOGUE_MIRROR_READ_LIMIT = 100
 
 SPOOL_REL = pathlib.Path("state") / "engram_spool.jsonl"
 #: When a spool with NOTHING pending exceeds this, it is rewritten empty.
@@ -1141,7 +1149,9 @@ def _mirrored_dialogue_keys(client: Any, *, limit: int) -> Optional[set]:
     }
 
 
-def reconcile_local_dialogue_blocks(env: Any, *, limit: int = ENGRAM_HARD_LIMIT) -> int:
+def reconcile_local_dialogue_blocks(
+    env: Any, *, limit: int = _DIALOGUE_MIRROR_READ_LIMIT
+) -> int:
     """Mirror the local dialogue blocks Engram does not hold yet. Returns how many.
 
     The prompt seam reads dialogue history from Engram now, so the blocks distilled
@@ -1151,7 +1161,11 @@ def reconcile_local_dialogue_blocks(env: Any, *, limit: int = ENGRAM_HARD_LIMIT)
     distilled from now on.
 
     Only the MISSING intervals are pushed, so a boot against a settled mirror costs
-    one cheap read and no writes at all.
+    ONE BOUNDED READ and no writes at all. Bounded, not cheap: Engram's recency
+    endpoint returns full observation bodies, so the limit below is what keeps this
+    from pulling the store's whole ceiling every start. The local file it is
+    compared against is itself bounded (~10-15 blocks plus eras), and a read that
+    is too small to see an existing record is harmless — see the third property.
 
     Three properties make it safe to run on every boot:
 

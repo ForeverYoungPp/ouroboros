@@ -647,7 +647,16 @@ class OuroborosAgent:
                 'ts': utc_now_iso(), 'type': 'worker_boot',
                 'pid': os.getpid(), 'git_branch': git_branch, 'git_sha': git_sha,
             })
-            verify_restart(self.env, git_sha)
+            # Its OWN guard. This used to share the outer try with everything
+            # below, and the once-guard above is set BEFORE the work: a raise in
+            # verify_restart therefore skipped verify_system_state — and with it
+            # the Engram spool drain and dialogue carry-over — for the WHOLE life
+            # of the process, not just this call, because the guard was already
+            # set and nothing re-runs it.
+            try:
+                verify_restart(self.env, git_sha)
+            except Exception:
+                log.warning("Restart verification failed", exc_info=True)
             verify_system_state(self.env, git_sha)
             inject_crash_report(self.env)
         except Exception:
