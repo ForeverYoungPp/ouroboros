@@ -276,6 +276,11 @@ _SURFACE_ENGRAM_READ = "op='read' offset={offset}"
 #: offset into the joined text would point at nothing a reader could act on, so the
 #: note has to say what actually continues: a narrower query, or one record's body.
 _SURFACE_LIST = "a narrower query, or the engram tool's op='read' for a single record"
+#: The surface for the authored task narrative, which is INJECTED into a prompt by
+#: its reader (`main_context_authority`), never fetched by the model that reads it:
+#: an `offset=` promise would be unactionable by construction, since `op='read'`
+#: refuses without an observation_id the injected view never carries.
+_SURFACE_NARRATIVE = "the whole record via op='search' on this task id, then op='read'"
 
 
 def _truncation_note(shown: int, total: int, *, surface: str) -> str:
@@ -629,7 +634,9 @@ def continuation_narrative(
             )
         body = str(fetched.get("content") or "")
     budget = max(200, min(int(max_chars or MAX_TOPIC_CHARS), KNOWLEDGE_BASE_HARD_CHARS))
-    body = _truncate_body(body, budget)
+    # The narrative surface, not the default: this text is injected into a prompt by
+    # its reader, so a resume offset would name an argument nobody upstream can use.
+    body = _truncate_body(body, budget, surface=_SURFACE_NARRATIVE)
     return MachineRead(
         True,
         # The record was obtained; ``empty`` here would claim absence. An existing

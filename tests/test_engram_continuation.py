@@ -117,7 +117,14 @@ def test_the_narrative_read_is_bounded_and_typed(engram_stub):
     state, env = engram_stub
     state.search_returns_content = True
     _seed_narrative(state, "task-big", "x" * 30_000)
-    assert len(continuation_narrative(client_for(env), "task-big").text) <= MAX_TOPIC_CHARS
+    read = continuation_narrative(client_for(env), "task-big")
+    assert len(read.text) <= MAX_TOPIC_CHARS
+    # The narrative is INJECTED into a prompt, not fetched by the model that reads
+    # it, so the note must not promise an offset argument nobody upstream can pass
+    # (`op='read'` refuses without an observation_id the injected view never has).
+    assert "truncated at char " in read.text
+    assert "the whole record via op='search' on this task id, then op='read'" in read.text
+    assert "offset=" not in read.text
 
     state.fail = True
     down = continuation_narrative(client_for(env), "task-two")
@@ -225,3 +232,32 @@ def test_the_projection_still_does_not_mutate_its_input(engram_stub):
 
     assert node == before
     reset_sinks()
+
+
+def test_an_injected_narrative_keeps_its_shape_and_an_honest_note(engram_stub):
+    """The caller's injection contract is unchanged; only the note changed.
+
+    ``main_context_authority`` hands this text to the prompt as
+    ``authored_root_summary`` — the model never made the call, so the note must not
+    name an argument the injected view cannot carry. Everything else about the
+    summary (id, kind, coverage, bound) stays exactly as it was.
+    """
+    from ouroboros.engram_read import MAX_TOPIC_CHARS
+    from ouroboros.main_context_authority import _narrative_from_engram
+
+    state, env = engram_stub
+    state.search_returns_content = True
+    _seed_narrative(state, "task-injected", "x" * 30_000)
+
+    summary, status = _narrative_from_engram(
+        "task-injected", drive_root=env.drive_root, repo_dir=env.repo_dir,
+    )
+
+    assert status == "engram" and summary is not None
+    assert summary["summary_kind"] == "authored_root_summary"
+    assert summary["summary_id"] == "task-narrative:task-injected"
+    assert summary["origin"] == "engram"
+    assert summary["source_coverage"]
+    assert len(summary["text"]) <= MAX_TOPIC_CHARS
+    assert "offset=" not in summary["text"]
+    assert "op='search' on this task id" in summary["text"]
