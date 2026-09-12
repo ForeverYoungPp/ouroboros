@@ -1992,12 +1992,15 @@ def test_discovery_path_consistent_with_policy():
 
 
 def test_ephemeral_turn_discloses_the_withheld_built_in_tools(tmp_path):
-    """CW3's allowlist must not be a silent subtraction.
+    """CW3's allowlist must not be a silent subtraction, and `engram` must not be in it.
 
     The extensions and mcp surfaces each disclose that an ephemeral turn removed
-    them, while the built-ins the allowlist excludes — the whole Engram/knowledge
-    surface, send_user_message, update_scratchpad — produced no manifest row at all,
-    so a lane could only learn its own shape by probing for tools it does not hold.
+    them, while the built-ins the allowlist excludes — the knowledge surface,
+    send_user_message, update_scratchpad — produced no manifest row at all, so a lane
+    could only learn its own shape by probing for tools it does not hold. The owner
+    later ruled `engram` IN (the ruling comment in `_EPHEMERAL_ALLOWED_TOOLS`): the
+    lane's own prompt carries the recall injection that tells it to use that tool, so
+    withholding it made the pointer unactionable. Both halves are asserted here.
     """
     from ouroboros.tool_policy import format_capability_omissions
     from ouroboros.tools.registry import (
@@ -2015,19 +2018,53 @@ def test_ephemeral_turn_discloses_the_withheld_built_in_tools(tmp_path):
     registry = ToolRegistry(repo_dir=system_repo, drive_root=data)
     registry.set_context(ctx)
 
-    registry.schemas()
+    schemas = registry.schemas()
+    names = {(schema.get("function", {}) or {}).get("name") for schema in schemas}
 
+    # (a) the ruling: the recall seam's own tool is advertised to this lane.
+    assert "engram" in names
+    # (b) the disclosure row still names everything the allowlist withholds — and
+    #     `engram` is no longer one of them, while the others still are.
     rows = [
         item for item in registry._capability_omissions
         if item.get("surface") == "tools" and item.get("reason") == "ephemeral_turn"
     ]
     assert len(rows) == 1, registry._capability_omissions
     withheld = set(rows[0]["tools"])
-    for name in ("engram", "knowledge_read", "knowledge_write", "send_user_message",
-                 "update_scratchpad"):
+    assert "engram" not in withheld, "the granted tool must leave the withheld set"
+    for name in ("knowledge_read", "knowledge_write", "knowledge_list",
+                 "send_user_message", "update_scratchpad"):
         assert name in withheld, f"{name} is withheld from an ephemeral turn but undisclosed"
-    # Nothing the allowlist actually grants may be listed as withheld.
     assert not (withheld & set(_EPHEMERAL_ALLOWED_TOOLS))
     # The one shared formatter renders the names as the row's detail.
     rendered = "\n".join(format_capability_omissions(registry._capability_omissions))
     assert "ephemeral_turn" in rendered and "knowledge_read" in rendered
+
+
+def test_the_ephemeral_engram_grant_touches_no_other_lane(tmp_path):
+    """The owner ruling is scoped to the ephemeral decision turn.
+
+    A plain turn already holds `engram`; the two constrained subagent lanes do not,
+    and the ruling must not have leaked into either (the acting lane keeps its
+    knowledge read tools, the read-only lane keeps neither).
+    """
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    system_repo = tmp_path / "system"
+    data = tmp_path / "data"
+    for path in (system_repo, data):
+        path.mkdir(parents=True, exist_ok=True)
+
+    def names_for(constraint=None):
+        ctx = ToolContext(repo_dir=system_repo, drive_root=data, task_constraint=constraint)
+        registry = ToolRegistry(repo_dir=system_repo, drive_root=data)
+        registry.set_context(ctx)
+        return {(s.get("function", {}) or {}).get("name") for s in registry.schemas()}
+
+    assert "engram" in names_for()
+    acting = names_for(TaskConstraint(
+        mode="acting_subagent", allow_enable=False, surface="external_workspace"))
+    assert "engram" not in acting and "knowledge_read" in acting
+    readonly = names_for(TaskConstraint(mode="local_readonly_subagent", allow_enable=False))
+    assert "engram" not in readonly and "knowledge_read" not in readonly

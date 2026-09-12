@@ -1417,6 +1417,11 @@ _EPHEMERAL_ALLOWED_TOOLS = frozenset({
     "analyze_screenshot", "vlm_query",
     # decide / route / spawn-owner-task / reply
     "route_to_project", "promote_chat_to_task", "steer_task", "list_projects", "send_photo",
+    # Owner ruling (CW3): the ephemeral decision turn's OWN prompt carries the Engram
+    # recall injection, whose seam text reads "Use the `engram` tool" for the bodies —
+    # and CW3 skips only WRITES (supervisor/workers.py:1300-1301). Read-only, self-budgeted
+    # (3 reads / 30,345 chars per turn), so the lane can act on the pointer it is given.
+    "engram",
 })
 
 
