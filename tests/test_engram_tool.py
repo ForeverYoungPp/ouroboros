@@ -177,13 +177,46 @@ def test_read_returns_exactly_one_record(stub):
 
 
 def test_read_truncates_a_huge_record(stub):
+    """The marker names the exact resume point, not merely that text stopped."""
     state, ctx = stub
     state.payloads["/observations/8"] = {
         "id": 8, "type": "t", "title": "big", "content": "x" * 50_000,
     }
     out = engram_tool._engram(ctx, op="read", observation_id=8)
     assert len(out) <= engram_tool.MAX_READ_CONTENT_CHARS + 500
-    assert "[truncated]" in out
+    assert f"truncated at char {engram_tool.MAX_READ_CONTENT_CHARS} of 50000" in out
+    assert f"continue with op='read' offset={engram_tool.MAX_READ_CONTENT_CHARS}" in out
+
+
+def test_read_with_offset_continues_the_record(stub):
+    """The record is here in full: the bound is a display bound, so it continues."""
+    state, ctx = stub
+    body = "A" * 4_000 + "B" * 4_000 + "C" * 100
+    state.payloads["/observations/9"] = {"id": 9, "type": "t", "title": "long", "content": body}
+
+    first = engram_tool._engram(ctx, op="read", observation_id=9)
+    assert "A" * 3_900 in first and "B" not in first
+    assert "truncated at char 4000 of 8100 — continue with op='read' offset=4000" in first
+
+    second = engram_tool._engram(ctx, op="read", observation_id=9, offset=4_000)
+    assert "[continued from char 4000 of 8100]" in second
+    assert "B" * 3_900 in second and "A" not in second
+    assert "continue with op='read' offset=8000" in second
+
+    third = engram_tool._engram(ctx, op="read", observation_id=9, offset=8_000)
+    assert "[continued from char 8000 of 8100]" in third
+    assert "C" * 100 in third
+    assert "truncated" not in third, "the end of the record must not be marked as truncated"
+
+
+def test_read_offset_past_the_end_is_disclosed(stub):
+    state, ctx = stub
+    state.payloads["/observations/10"] = {"id": 10, "type": "t", "title": "short", "content": "short"}
+
+    out = engram_tool._engram(ctx, op="read", observation_id=10, offset=99)
+
+    assert "offset 99 is past the end" in out and "5 chars" in out
+    assert "truncated" not in out
 
 
 def test_read_budget_is_below_the_sections_it_replaces(stub):

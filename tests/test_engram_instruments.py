@@ -727,6 +727,10 @@ def test_knowledge_topic_body_is_bounded(stub):
     _seed_knowledge(state, "big", "x" * 20_000)
     read = knowledge_topic(client_for(env), "big")
     assert read.ok and len(read.text) <= MAX_TOPIC_CHARS
+    # The bound is unchanged, and the truncation now names where the record
+    # continues: the full body is already in the store, this is a display bound.
+    assert "truncated at char " in read.text and "of 20000" in read.text
+    assert "continue with the engram tool: op='read' offset=" in read.text
 
 
 def test_knowledge_topic_absent_and_unreachable_are_distinct(stub):

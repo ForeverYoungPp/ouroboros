@@ -175,6 +175,7 @@ def _engram(
     limit: int = 10,
     before: int = 5,
     after: int = 5,
+    offset: int = 0,
     **kwargs: Any,
 ) -> str:
     """Retrieve durable memory from Engram. Never raises."""
@@ -256,8 +257,27 @@ def _engram(
         if not record:
             return f"Observation {observation_id} not found."
         content = str(record.get("content") or "")
-        if len(content) > MAX_READ_CONTENT_CHARS:
-            content = content[:MAX_READ_CONTENT_CHARS].rstrip() + "\n…[truncated]"
+        total = len(content)
+        start = max(0, int(offset or 0))
+        if start and start >= total:
+            return (
+                f"offset {start} is past the end of observation {int(observation_id)} "
+                f"({total} chars) — nothing further to read."
+            )
+        window = content[start:start + MAX_READ_CONTENT_CHARS]
+        pieces = []
+        if start:
+            pieces.append(f"[continued from char {start} of {total}]")
+        pieces.append(window)
+        following = start + len(window)
+        if following < total:
+            # The record is here in full: the bound is a display bound, so the note
+            # names where to resume rather than just saying the text stopped.
+            pieces.append(
+                f"…[truncated at char {following} of {total} — continue with op='read' "
+                f"offset={following}]"
+            )
+        content = "\n".join(pieces)
         out = _bounded(
             [
                 _one_line(record),
@@ -321,6 +341,11 @@ def get_tools() -> List[ToolEntry]:
                             "type": "integer",
                             "description": "op='timeline': records after the hit (default 5, max 10).",
                             "default": 5,
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "op='read': character offset to continue a truncated record — pass the exact offset named in the truncation note.",
+                            "default": 0,
                         },
                     },
                     "required": ["op"],

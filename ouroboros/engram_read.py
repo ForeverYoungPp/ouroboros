@@ -270,12 +270,42 @@ def _bounded_items(limit: Any, ceiling: int) -> int:
     return max(1, min(int(limit or ceiling), int(ceiling)))
 
 
+def _truncation_note(shown: int, total: int) -> str:
+    """The truncation marker, carrying the offset that continues the record.
+
+    A bare ``…[truncated]`` says the text stopped but not where to resume, and the
+    record is already here in full — the bound is a display bound. The note
+    therefore names the exact resume point and the surface that takes it.
+    """
+    return (
+        f"\n…[truncated at char {shown} of {total} — continue with the engram tool: "
+        f"op='read' offset={shown} (id from op='search')]"
+    )
+
+
+def _truncate_body(body: str, budget: int) -> str:
+    """Cut a body to ``budget`` INCLUDING the note, so the caller's bound still holds.
+
+    The note costs more than the 30 chars the bare marker did, so the cut has to
+    account for it: a continuation hint that pushes the text past the bound it was
+    supposed to respect would trade one dishonesty for another.
+    """
+    if len(body) <= budget:
+        return body
+    total = len(body)
+    shown = max(0, budget - 30)
+    for _ in range(3):
+        note = _truncation_note(shown, total)
+        if shown + len(note) <= budget:
+            break
+        shown = max(0, budget - len(note))
+    trimmed = body[:shown].rstrip()
+    return trimmed + _truncation_note(len(trimmed), total)
+
+
 def _bounded_body(lines: List[str], max_chars: Any) -> str:
     budget = max(200, min(int(max_chars or MAX_DIGEST_CHARS), MAX_DIGEST_CHARS))
-    body = "\n".join(lines)
-    if len(body) > budget:
-        body = body[: max(0, budget - 30)].rstrip() + "\n…[truncated]"
-    return body
+    return _truncate_body("\n".join(lines), budget)
 
 
 def type_digest(
@@ -481,8 +511,7 @@ def knowledge_topic(
         record = fetched
     body = str(record.get("content") or "")
     budget = max(200, min(int(max_chars or MAX_TOPIC_CHARS), KNOWLEDGE_BASE_HARD_CHARS))
-    if len(body) > budget:
-        body = body[: max(0, budget - 30)].rstrip() + "\n…[truncated]"
+    body = _truncate_body(body, budget)
     return MachineRead(
         True,
         status="ok",
@@ -547,8 +576,7 @@ def continuation_narrative(
             )
         body = str(fetched.get("content") or "")
     budget = max(200, min(int(max_chars or MAX_TOPIC_CHARS), KNOWLEDGE_BASE_HARD_CHARS))
-    if len(body) > budget:
-        body = body[: max(0, budget - 30)].rstrip() + "\n…[truncated]"
+    body = _truncate_body(body, budget)
     return MachineRead(
         True,
         # The record was obtained; ``empty`` here would claim absence. An existing
