@@ -270,20 +270,27 @@ def _bounded_items(limit: Any, ceiling: int) -> int:
     return max(1, min(int(limit or ceiling), int(ceiling)))
 
 
-def _truncation_note(shown: int, total: int) -> str:
+#: The `engram` tool's own read op — the default continuation surface.
+_SURFACE_ENGRAM_READ = "op='read' offset={offset}"
+
+
+def _truncation_note(shown: int, total: int, *, surface: str) -> str:
     """The truncation marker, carrying the offset that continues the record.
 
     A bare ``…[truncated]`` says the text stopped but not where to resume, and the
-    record is already here in full — the bound is a display bound. The note
-    therefore names the exact resume point and the surface that takes it.
+    record is already here in full — the bound is a display bound. ``surface`` is a
+    parameter because the note lands in whatever tool produced the text: a lane that
+    holds ``knowledge_read`` and not ``engram`` cannot act on a pointer to the wrong
+    one, and an ephemeral turn holds neither.
     """
     return (
-        f"\n…[truncated at char {shown} of {total} — continue with the engram tool: "
-        f"op='read' offset={shown} (id from op='search')]"
+        f"\n…[truncated at char {shown} of {total} — continue with "
+        + surface.format(offset=shown)
+        + "]"
     )
 
 
-def _truncate_body(body: str, budget: int) -> str:
+def _truncate_body(body: str, budget: int, *, surface: str = _SURFACE_ENGRAM_READ) -> str:
     """Cut a body to ``budget`` INCLUDING the note, so the caller's bound still holds.
 
     The note costs more than the 30 chars the bare marker did, so the cut has to
@@ -295,12 +302,40 @@ def _truncate_body(body: str, budget: int) -> str:
     total = len(body)
     shown = max(0, budget - 30)
     for _ in range(3):
-        note = _truncation_note(shown, total)
+        note = _truncation_note(shown, total, surface=surface)
         if shown + len(note) <= budget:
             break
         shown = max(0, budget - len(note))
     trimmed = body[:shown].rstrip()
-    return trimmed + _truncation_note(len(trimmed), total)
+    return trimmed + _truncation_note(len(trimmed), total, surface=surface)
+
+
+def _window_body(
+    body: str, *, offset: int, budget: int, surface: str, past_end: str
+) -> str:
+    """One window of a full body, with head and tail continuation markers.
+
+    Offsets index the RECORD, so the offset a note names is directly reusable as the
+    next call's argument — that is the whole point of naming it. The result never
+    exceeds ``budget``, and an offset that starts past the end is disclosed by the
+    caller's own sentence rather than answered with an empty body.
+    """
+    total = len(body)
+    start = max(0, int(offset or 0))
+    if start and start >= total:
+        return past_end
+    head = f"[continued from char {start} of {total}]\n" if start else ""
+    room = max(0, budget - len(head))
+    window = body[start:start + room]
+    following = start + len(window)
+    if following >= total:
+        return head + window
+    note = _truncation_note(following, total, surface=surface)
+    if len(head) + len(window) + len(note) > budget:
+        window = window[:max(0, budget - len(head) - len(note))]
+        following = start + len(window)
+        note = _truncation_note(following, total, surface=surface)
+    return head + window + note
 
 
 def _bounded_body(lines: List[str], max_chars: Any) -> str:
@@ -412,6 +447,7 @@ def knowledge_topic(
     *,
     scope: str = "",
     max_chars: int = MAX_TOPIC_CHARS,
+    offset: int = 0,
 ) -> MachineRead:
     """One knowledge topic by ``topic_key`` — bounded, targeted, typed.
 
@@ -511,7 +547,18 @@ def knowledge_topic(
         record = fetched
     body = str(record.get("content") or "")
     budget = max(200, min(int(max_chars or MAX_TOPIC_CHARS), KNOWLEDGE_BASE_HARD_CHARS))
-    body = _truncate_body(body, budget)
+    body = _window_body(
+        body,
+        offset=offset,
+        budget=budget,
+        # The note must name a tool THIS reader holds: `knowledge_read` carries the
+        # same offset argument, so a lane without the `engram` tool can still continue.
+        surface=f"knowledge_read({topic!r}, offset={{offset}})",
+        past_end=(
+            f"offset {max(0, int(offset or 0))} is past the end of this topic "
+            f"({len(body)} chars) — nothing further to read."
+        ),
+    )
     return MachineRead(
         True,
         status="ok",

@@ -727,10 +727,36 @@ def test_knowledge_topic_body_is_bounded(stub):
     _seed_knowledge(state, "big", "x" * 20_000)
     read = knowledge_topic(client_for(env), "big")
     assert read.ok and len(read.text) <= MAX_TOPIC_CHARS
-    # The bound is unchanged, and the truncation now names where the record
-    # continues: the full body is already in the store, this is a display bound.
+    # The bound is unchanged, and the truncation names where the record continues —
+    # through the tool THIS reader holds, not one it may not have.
     assert "truncated at char " in read.text and "of 20000" in read.text
-    assert "continue with the engram tool: op='read' offset=" in read.text
+    assert "continue with knowledge_read('big', offset=" in read.text
+    assert "the engram tool" not in read.text
+
+
+def test_knowledge_read_continues_a_truncated_topic(stub):
+    """A lane with `knowledge_read` and no `engram` tool can still continue."""
+    from ouroboros.engram_read import MAX_TOPIC_CHARS
+    from ouroboros.tools.knowledge import _knowledge_read
+
+    state, env = stub
+    body = "A" * 4_000 + "B" * MAX_TOPIC_CHARS
+    _seed_knowledge(state, "long-topic", body)
+
+    first = _knowledge_read(_tool_ctx(env), "long-topic")
+    assert "knowledge_read('long-topic', offset=" in first
+    assert "the engram tool" not in first
+
+    offset = int(first.rsplit("offset=", 1)[1].split(")")[0])
+    continued = _knowledge_read(_tool_ctx(env), "long-topic", offset)
+    assert f"[continued from char {offset} of {len(body)}]" in continued
+    # The window resumes exactly where the note said: the only A's left are the
+    # tail of the first run (the cut lands mid-run by construction).
+    assert "B" in continued
+    assert continued.count("A") <= 4000 - offset
+
+    past = _knowledge_read(_tool_ctx(env), "long-topic", 10 ** 7)
+    assert "is past the end of this topic" in past and "nothing further to read" in past
 
 
 def test_knowledge_topic_absent_and_unreachable_are_distinct(stub):

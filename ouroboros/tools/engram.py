@@ -259,25 +259,18 @@ def _engram(
         content = str(record.get("content") or "")
         total = len(content)
         start = max(0, int(offset or 0))
-        if start and start >= total:
-            return (
+        from ouroboros.engram_read import _SURFACE_ENGRAM_READ, _window_body
+
+        content = _window_body(
+            content,
+            offset=start,
+            budget=MAX_READ_CONTENT_CHARS,
+            surface=_SURFACE_ENGRAM_READ,
+            past_end=(
                 f"offset {start} is past the end of observation {int(observation_id)} "
                 f"({total} chars) — nothing further to read."
-            )
-        window = content[start:start + MAX_READ_CONTENT_CHARS]
-        pieces = []
-        if start:
-            pieces.append(f"[continued from char {start} of {total}]")
-        pieces.append(window)
-        following = start + len(window)
-        if following < total:
-            # The record is here in full: the bound is a display bound, so the note
-            # names where to resume rather than just saying the text stopped.
-            pieces.append(
-                f"…[truncated at char {following} of {total} — continue with op='read' "
-                f"offset={following}]"
-            )
-        content = "\n".join(pieces)
+            ),
+        )
         out = _bounded(
             [
                 _one_line(record),

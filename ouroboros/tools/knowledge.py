@@ -233,8 +233,8 @@ def _update_index_entry(ctx: ToolContext, topic: str):
     temp_path.replace(index_path)
 
 
-def _knowledge_read(ctx: ToolContext, topic: str) -> str:
-    """Read a knowledge topic."""
+def _knowledge_read(ctx: ToolContext, topic: str, offset: int = 0) -> str:
+    """Read a knowledge topic, optionally continuing a truncated body at ``offset``."""
     try:
         sanitized_topic = _sanitize_topic(topic)
     except ValueError as e:
@@ -267,7 +267,7 @@ def _knowledge_read(ctx: ToolContext, topic: str) -> str:
     # that gap; `patterns` and `index-full` stay local by design, and the backlog
     # is its own branch above.
     if not _local_write_live(ctx):
-        remote = _engram_topic_read(ctx, sanitized_topic)
+        remote = _engram_topic_read(ctx, sanitized_topic, offset)
         if remote is not None:
             return remote
         if sanitized_topic in LOCAL_ARCHIVE_TOPICS and path.exists():
@@ -278,19 +278,22 @@ def _knowledge_read(ctx: ToolContext, topic: str) -> str:
     return _engram_topic_fallback(ctx, sanitized_topic)
 
 
-def _engram_topic_read(ctx: ToolContext, topic: str) -> str | None:
+def _engram_topic_read(ctx: ToolContext, topic: str, offset: int = 0) -> str | None:
     """The Engram record for one topic, or ``None`` when it has none / is down.
 
     ``None`` means "the local archive is the best answer available" — including
     when the store is unreachable, because the archive is strictly more
     informative than an error for a topic that predates the switch. The
     *unreachable-and-nothing-local* case is reported by the caller, where it can
-    be phrased as UNKNOWN rather than as an absence.
+    be phrased as UNKNOWN rather than as an absence. ``offset`` continues a
+    truncated body; it indexes the record's own content.
     """
     try:
         from ouroboros.engram_read import client_for, knowledge_topic
 
-        read = knowledge_topic(client_for(ctx), topic, scope=_engram_scope(ctx))
+        read = knowledge_topic(
+            client_for(ctx), topic, scope=_engram_scope(ctx), offset=offset,
+        )
     except Exception:
         return None
     if read.status == "ok" and read.text.strip():
@@ -687,13 +690,18 @@ def get_tools() -> List[ToolEntry]:
     return [
         ToolEntry("knowledge_read", {
             "name": "knowledge_read",
-            "description": "Read a topic from the persistent knowledge base on Drive. On a project-scoped task, reads from that project's per-project facts store (isolated from global knowledge). When the topic has no local file, the durable Engram record is read instead (the local write is being retired), so a not-found local file never means the topic was never learned.",
+            "description": "Read a topic from the persistent knowledge base on Drive. On a project-scoped task, reads from that project's per-project facts store (isolated from global knowledge). When the topic has no local file, the durable Engram record is read instead (the local write is being retired), so a not-found local file never means the topic was never learned. A truncated body names the offset that continues it.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "topic": {
                         "type": "string",
                         "description": "Topic name (alphanumeric, hyphens, underscores). E.g. 'browser-automation', 'git-recipes'"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Character offset to continue a truncated body — pass the exact offset named in the truncation note.",
+                        "default": 0
                     }
                 },
                 "required": ["topic"]

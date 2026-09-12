@@ -1989,3 +1989,45 @@ def test_discovery_path_consistent_with_policy():
             assert name in output, (
                 f"tool_policy says '{name}' is non-core but discovery doesn't show it"
             )
+
+
+def test_ephemeral_turn_discloses_the_withheld_built_in_tools(tmp_path):
+    """CW3's allowlist must not be a silent subtraction.
+
+    The extensions and mcp surfaces each disclose that an ephemeral turn removed
+    them, while the built-ins the allowlist excludes — the whole Engram/knowledge
+    surface, send_user_message, update_scratchpad — produced no manifest row at all,
+    so a lane could only learn its own shape by probing for tools it does not hold.
+    """
+    from ouroboros.tool_policy import format_capability_omissions
+    from ouroboros.tools.registry import (
+        _EPHEMERAL_ALLOWED_TOOLS,
+        ToolContext,
+        ToolRegistry,
+    )
+
+    system_repo = tmp_path / "system"
+    data = tmp_path / "data"
+    for path in (system_repo, data):
+        path.mkdir(parents=True, exist_ok=True)
+    ctx = ToolContext(repo_dir=system_repo, drive_root=data)
+    ctx.is_ephemeral_turn = True
+    registry = ToolRegistry(repo_dir=system_repo, drive_root=data)
+    registry.set_context(ctx)
+
+    registry.schemas()
+
+    rows = [
+        item for item in registry._capability_omissions
+        if item.get("surface") == "tools" and item.get("reason") == "ephemeral_turn"
+    ]
+    assert len(rows) == 1, registry._capability_omissions
+    withheld = set(rows[0]["tools"])
+    for name in ("engram", "knowledge_read", "knowledge_write", "send_user_message",
+                 "update_scratchpad"):
+        assert name in withheld, f"{name} is withheld from an ephemeral turn but undisclosed"
+    # Nothing the allowlist actually grants may be listed as withheld.
+    assert not (withheld & set(_EPHEMERAL_ALLOWED_TOOLS))
+    # The one shared formatter renders the names as the row's detail.
+    rendered = "\n".join(format_capability_omissions(registry._capability_omissions))
+    assert "ephemeral_turn" in rendered and "knowledge_read" in rendered

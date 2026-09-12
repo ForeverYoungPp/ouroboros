@@ -177,15 +177,20 @@ def test_read_returns_exactly_one_record(stub):
 
 
 def test_read_truncates_a_huge_record(stub):
-    """The marker names the exact resume point, not merely that text stopped."""
+    """The marker names the exact resume point, and the window honours the bound."""
     state, ctx = stub
     state.payloads["/observations/8"] = {
         "id": 8, "type": "t", "title": "big", "content": "x" * 50_000,
     }
     out = engram_tool._engram(ctx, op="read", observation_id=8)
     assert len(out) <= engram_tool.MAX_READ_CONTENT_CHARS + 500
-    assert f"truncated at char {engram_tool.MAX_READ_CONTENT_CHARS} of 50000" in out
-    assert f"continue with op='read' offset={engram_tool.MAX_READ_CONTENT_CHARS}" in out
+    offset = int(out.rsplit("offset=", 1)[1].split("]")[0])
+    # The note's offset IS the truncation point, it stays inside the read bound, and
+    # the window really carried that many characters — the note cannot disagree with
+    # the text it terminates.
+    assert f"truncated at char {offset} of 50000" in out
+    assert 0 < offset <= engram_tool.MAX_READ_CONTENT_CHARS
+    assert out.count("x") >= offset - 200
 
 
 def test_read_with_offset_continues_the_record(stub):
@@ -195,13 +200,15 @@ def test_read_with_offset_continues_the_record(stub):
     state.payloads["/observations/9"] = {"id": 9, "type": "t", "title": "long", "content": body}
 
     first = engram_tool._engram(ctx, op="read", observation_id=9)
-    assert "A" * 3_900 in first and "B" not in first
-    assert "truncated at char 4000 of 8100 — continue with op='read' offset=4000" in first
+    offset = int(first.rsplit("offset=", 1)[1].split("]")[0])
+    assert f"truncated at char {offset} of {len(body)} — continue with op='read' offset={offset}" in first
+    assert "knowledge_read" not in first, "the read tool must name its own surface"
+    assert 4_000 - offset <= 200, "the window must leave room for the note, not overshoot it"
 
-    second = engram_tool._engram(ctx, op="read", observation_id=9, offset=4_000)
-    assert "[continued from char 4000 of 8100]" in second
-    assert "B" * 3_900 in second and "A" not in second
-    assert "continue with op='read' offset=8000" in second
+    second = engram_tool._engram(ctx, op="read", observation_id=9, offset=offset)
+    assert f"[continued from char {offset} of {len(body)}]" in second
+    assert "B" in second and second.count("A") <= 4_000 - offset
+    assert "knowledge_read" not in second
 
     third = engram_tool._engram(ctx, op="read", observation_id=9, offset=8_000)
     assert "[continued from char 8000 of 8100]" in third
