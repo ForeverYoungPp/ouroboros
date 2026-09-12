@@ -29,6 +29,13 @@ _LOCAL_INDEX_SCOPE_NOTE = (
 # The immune improvement backlog is ONE global store, never per-project (C10.1).
 BACKLOG_TOPIC = "improvement-backlog"
 
+#: Topics whose only home is the LOCAL archive under the Engram-only ruling
+#: (option i): `patterns` and the local index have no Engram record, and the
+#: improvement backlog is its own branch above (C10.1). Every other topic
+#: resolves in Engram alone — a miss there is not an invitation to serve a
+#: pre-switch local file that Engram has since superseded.
+LOCAL_ARCHIVE_TOPICS = frozenset({"patterns", "index-full", BACKLOG_TOPIC})
+
 #: S2 stop switch. The CANONICAL ``memory/knowledge/<topic>.md`` + ``index-full.md``
 #: write is RETIRED: its readers (main chat, consciousness, deep self-review) now
 #: read Engram, so leaving the local write on would keep feeding a store nobody
@@ -253,11 +260,19 @@ def _knowledge_read(ctx: ToolContext, topic: str) -> str:
     # canonical store, S2), Engram holds anything written since the switch, so a
     # local-first read would happily serve a STALE file for a topic that was
     # overwritten afterwards. Read the live store first, and fall back to the
-    # local archive for the topics written before the switch.
+    # local archive ONLY for the topics that live there (LOCAL_ARCHIVE_TOPICS).
+    #
+    # Owner ruling (option i): knowledge topics live in Engram and the pre-switch
+    # local archive is no longer consulted for them — the 43-topic backfill closed
+    # that gap; `patterns` and `index-full` stay local by design, and the backlog
+    # is its own branch above.
     if not _local_write_live(ctx):
         remote = _engram_topic_read(ctx, sanitized_topic)
         if remote is not None:
             return remote
+        if sanitized_topic in LOCAL_ARCHIVE_TOPICS and path.exists():
+            return path.read_text(encoding="utf-8")
+        return _engram_topic_fallback(ctx, sanitized_topic)
     if path.exists():
         return path.read_text(encoding="utf-8")
     return _engram_topic_fallback(ctx, sanitized_topic)

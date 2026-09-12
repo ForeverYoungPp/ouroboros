@@ -789,8 +789,13 @@ def test_knowledge_read_prefers_the_live_store_over_the_archive(stub):
     assert "stale archive copy" not in out
 
 
-def test_knowledge_read_falls_back_to_the_archive(stub):
-    """Pre-switch topics have no Engram record; the archive still answers."""
+def test_knowledge_read_no_longer_falls_back_to_the_archive(stub):
+    """Owner ruling (option i): an ordinary topic resolves in Engram alone.
+
+    The local file is the pre-switch archive, not a fallback — a store miss is
+    reported as not found (or as UNKNOWN when the store cannot answer) instead of
+    serving text Engram may since have superseded.
+    """
     from ouroboros.tools.knowledge import _knowledge_read
 
     state, env = stub
@@ -800,7 +805,27 @@ def test_knowledge_read_falls_back_to_the_archive(stub):
 
     out = _knowledge_read(_tool_ctx(env), "legacy")
 
-    assert out == "learned before the switch"
+    assert "learned before the switch" not in out
+    assert "not found" in out
+
+
+def test_knowledge_read_keeps_the_local_exceptions(stub):
+    """`patterns` has no Engram record, so it stays local.
+
+    `index-full` is the other local exception, but ``knowledge_read`` refuses it
+    outright — it is a reserved internal name (SYSTEM.md: "do NOT call it
+    directly"), so only the internal readers touch that file.
+    """
+    from ouroboros.tools.knowledge import _knowledge_read
+
+    state, env = stub
+    archive = env.drive_root / "memory" / "knowledge"
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / "patterns.md").write_text("local patterns body", encoding="utf-8")
+    (archive / "index-full.md").write_text("local index body", encoding="utf-8")
+
+    assert _knowledge_read(_tool_ctx(env), "patterns") == "local patterns body"
+    assert "Reserved topic name" in _knowledge_read(_tool_ctx(env), "index-full")
 
 
 def test_knowledge_read_says_unknown_when_engram_is_down(stub):
@@ -871,7 +896,10 @@ def test_project_facts_keep_a_live_local_write():
 def test_stopping_the_write_did_not_delete_the_archive(stub):
     """C2 / P1: the local files stay on disk, readable, forever.
 
-    A stop that deletes its predecessor is not a stop, it is amnesia.
+    A stop that deletes its predecessor is not a stop, it is amnesia. Under the
+    owner's Engram-only ruling these files are no longer the READ answer for an
+    ordinary topic — which is exactly why this asserts the FILE, byte-for-byte,
+    rather than trusting a read to prove it is still there.
     """
     from ouroboros.tools.knowledge import _knowledge_read, _knowledge_write
 
@@ -881,8 +909,9 @@ def test_stopping_the_write_did_not_delete_the_archive(stub):
     original = "# legacy\n\nlearned before the switch\n"
     (archive / "legacy.md").write_text(original, encoding="utf-8")
 
-    # No Engram record for this topic, so the archive is the answer...
-    assert "learned before the switch" in _knowledge_read(_tool_ctx(env), "legacy")
+    # The archive is still on disk; it is no longer the read path for this topic.
+    assert (archive / "legacy.md").read_text(encoding="utf-8") == original
+    assert "learned before the switch" not in _knowledge_read(_tool_ctx(env), "legacy")
 
     # ...and a write to a DIFFERENT topic does not disturb it.
     _knowledge_write(_tool_ctx(env), "other", "something new")

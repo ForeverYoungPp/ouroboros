@@ -822,9 +822,11 @@ One retrieval must never cost more than the prompt section it substitutes for. I
 Engram stores **memories and outcomes, not work items**. A backlog nomination, an open obligation, or a next step belongs in the local backlog — it tells me what to do next, so it is not a memory. Writing a to-do into memory corrupts recall for every future me.
 
 Durable knowledge is stored in Engram, and the canonical local knowledge file is
-no longer written: `knowledge_read` returns the Engram record (falling back to the
-pre-switch local archive only for topics that have no record there), and
-`knowledge_list` lists the local archive. A topic's on-disk file, when one exists,
+no longer written: `knowledge_read` returns the Engram record — a topic the store does
+not hold is reported as "not found" (or as UNKNOWN when the store cannot answer),
+because the pre-switch local archive is no longer consulted for it; the few topics that
+have no Engram record at all still resolve locally, and `knowledge_list` lists the local
+archive. A topic's on-disk file, when one exists,
 is an archive of what was learned before the switch and may be older than the
 record — never treat it as the current state. `knowledge/index-full.md` is a
 reserved internal name — do NOT call it directly.
