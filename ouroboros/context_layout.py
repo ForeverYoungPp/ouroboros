@@ -34,10 +34,13 @@ direct-chat turn in a PROJECT ROOM with no workspace bound keeps the handbook.
 Project MEMBERSHIP is deliberately not the signal — an id in a room does not mean
 the work left Ouroboros's body.
 
-The TIER-0 protected core (SYSTEM, BIBLE, identity, scratchpad, knowledge index,
-recent dialogue) is ALWAYS full in every mode (BIBLE P1 cognitive-horizon / P4)
-and is declared here as a data invariant. Memory-section SIZE (not inclusion) is
-governed separately by consolidation granularity, not by this layout.
+The TIER-0 protected core (SYSTEM, BIBLE, identity, scratchpad, recent dialogue)
+is ALWAYS full in every mode (BIBLE P1 cognitive-horizon / P4) and is declared
+here as a data invariant. The knowledge index is no longer part of that core:
+durable knowledge is retrieved on demand now, so the index sits in
+``TIER0_RETRIEVAL_BACKED`` (a declared demotion, not a silent drop).
+Memory-section SIZE (not inclusion) is governed separately by consolidation
+granularity, not by this layout.
 
 No imports from ``ouroboros.context`` (avoids a circular import); docs are read
 directly via ``env.repo_path``.

@@ -622,6 +622,88 @@ def test_a_topic_below_the_search_window_is_still_resolved(stub):
     assert _params(state, "/observations/recent")["project"] == "repo"   # same scope, no leak
 
 
+def test_a_failed_fallback_scan_is_not_reported_as_an_absence(stub):
+    """Isomorphic with the two sibling reads: a FAILED read is not an absence.
+
+    The fallback scan must route its own failure through ``_read_failure`` — falling
+    through to the bounded-absence branch would assert "an exact-key scan of the
+    newest N records" for a scan that never completed.
+    """
+    from ouroboros.engram_read import MAX_DIGEST_ITEMS, MAX_WINDOW, knowledge_topic
+
+    state, env = stub
+    for i in range(MAX_DIGEST_ITEMS + 2):   # fill the search window; target sorts below it
+        _seed_knowledge_recorded(
+            state, f"decoy-{i}", "a body mentioning under-the-window in passing", obs_id=300 + i,
+        )
+    _seed_knowledge_recorded(state, "under-the-window", "the real body", obs_id=101)
+    state.fail_paths.add("/observations/recent")   # ONLY the fallback's read fails
+
+    read = knowledge_topic(client_for(env), "under-the-window")
+
+    assert read.ok is False, read
+    assert read.status == "unavailable", read      # what _read_failure maps a 500 to
+    assert read.status != "empty", read
+    assert f"newest {MAX_WINDOW} records" not in read.detail, read.detail
+
+
+def test_a_match_with_an_unusable_id_is_not_reported_as_an_absence(stub):
+    """A MATCH was found; ``empty`` would claim the store holds nothing."""
+    from ouroboros.engram_read import knowledge_topic
+
+    state, env = stub
+    state.knowledge[999] = {
+        "id": "weird", "type": "knowledge", "title": "Knowledge: odd-topic",
+        "topic_key": "knowledge:odd-topic", "content": "",
+        "created_at": "2026-01-01", "updated_at": "2026-01-02",
+    }
+    read = knowledge_topic(client_for(env), "odd-topic")
+
+    assert read.ok is False and read.status == "unavailable", read
+    assert "matched" in read.detail and "not an absence" in read.detail
+
+
+def test_a_match_whose_payload_never_arrives_is_not_a_success(stub):
+    """``got.ok`` with no record must not become status="ok" with an empty body."""
+    from ouroboros.engram_read import knowledge_topic
+
+    state, env = stub
+    # the search hit carries id 102, but the store holds no record under it
+    state.knowledge[101] = {
+        "id": 102, "type": "knowledge", "title": "Knowledge: ghost-topic",
+        "topic_key": "knowledge:ghost-topic", "content": "",
+        "created_at": "2026-01-01", "updated_at": "2026-01-02",
+    }
+    read = knowledge_topic(client_for(env), "ghost-topic")
+
+    assert read.ok is False and read.status == "unavailable", read
+    assert "no record" in read.detail and "not an absence" in read.detail
+
+
+def test_continuation_match_failures_are_not_absences_either(stub):
+    """The same two branches in ``continuation_narrative``: unusable id, then no payload."""
+    from ouroboros.engram_read import continuation_narrative
+
+    state, env = stub
+    state.knowledge[900] = {
+        "id": "weird", "type": "episodic_memory", "title": "Task narrative t-1",
+        "topic_key": "continuation:t-1", "content": "",
+        "created_at": "2026-01-01", "updated_at": "2026-01-02",
+    }
+    bad_id = continuation_narrative(client_for(env), "t-1")
+    assert bad_id.ok is False and bad_id.status == "unavailable", bad_id
+    assert "not an absence" in bad_id.detail
+
+    state.knowledge[901] = {
+        "id": 902, "type": "episodic_memory", "title": "Task narrative t-2",
+        "topic_key": "continuation:t-2", "content": "",
+        "created_at": "2026-01-01", "updated_at": "2026-01-02",
+    }
+    no_payload = continuation_narrative(client_for(env), "t-2")
+    assert no_payload.ok is False and no_payload.status == "unavailable", no_payload
+    assert "no record" in no_payload.detail and "not an absence" in no_payload.detail
+
+
 def test_a_genuinely_absent_topic_reports_a_bounded_absence(stub):
     """C15-style truthfulness: a bounded read must not claim the SET is empty."""
     from ouroboros.engram_read import MAX_DIGEST_ITEMS, MAX_WINDOW, knowledge_topic

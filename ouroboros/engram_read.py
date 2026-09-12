@@ -416,16 +416,21 @@ def knowledge_topic(
         # bounded read and not a store dump. Same resolved scope, only in the miss
         # case; a second miss is reported as the BOUNDED absence it is.
         scan = client.recent(limit=MAX_WINDOW, scope=scope)
-        if scan.ok:
-            scanned: List[Dict[str, Any]] = scan.items()
+        if not scan.ok:
+            # Isomorphic with the two sibling reads above: a FAILED read is not an
+            # absence. Falling through to the bounded-absence branch would assert
+            # "an exact-key scan of the newest N records" for a scan that never
+            # completed — the collapse `unavailable`/`rejected` exist to prevent.
+            return _read_failure(scan)
+        scanned: List[Dict[str, Any]] = scan.items()
+        match = next(
+            (r for r in scanned if str(r.get("topic_key") or "") == identity), None
+        )
+        if match is None:
             match = next(
-                (r for r in scanned if str(r.get("topic_key") or "") == identity), None
+                (r for r in scanned if str(r.get("title") or "") == f"Knowledge: {name}"),
+                None,
             )
-            if match is None:
-                match = next(
-                    (r for r in scanned if str(r.get("title") or "") == f"Knowledge: {name}"),
-                    None,
-                )
     if match is None:
         return MachineRead(
             True,
@@ -446,13 +451,34 @@ def knowledge_topic(
     if not str(match.get("content") or "").strip():
         raw_id = str(match.get("id", ""))
         if not raw_id.lstrip("-").isdigit():
+            # A MATCH was found: reporting it as ``empty`` would claim the store
+            # holds nothing, which is the collapse every other branch here refuses.
             return MachineRead(
-                True, status="empty", count=len(items), detail="match carried no usable id"
+                False,
+                status="unavailable",
+                count=len(items),
+                detail=(
+                    f"matched {identity!r} but its id is unusable ({raw_id!r}): the record "
+                    "exists and could not be read — this is not an absence"
+                ),
             )
         got = client.get(int(raw_id))
         if not got.ok:
             return _read_failure(got)
-        record = got.one() or {}
+        fetched = got.one()
+        if not fetched:
+            # got.ok with no record is a FAILURE dressed as success: never return
+            # ``status="ok"`` with an empty body for a record that never arrived.
+            return MachineRead(
+                False,
+                status="unavailable",
+                count=len(items),
+                detail=(
+                    f"matched {identity!r} but the store answered id {raw_id} with no record: "
+                    "the record exists and could not be read — this is not an absence"
+                ),
+            )
+        record = fetched
     body = str(record.get("content") or "")
     budget = max(200, min(int(max_chars or MAX_TOPIC_CHARS), KNOWLEDGE_BASE_HARD_CHARS))
     if len(body) > budget:
@@ -496,17 +522,39 @@ def continuation_narrative(
     if not body.strip():
         raw_id = str(match.get("id", ""))
         if not raw_id.lstrip("-").isdigit():
-            return MachineRead(True, status="empty", count=len(items), detail="match had no body or id")
+            return MachineRead(
+                False,
+                status="unavailable",
+                count=len(items),
+                detail=(
+                    f"matched {identity!r} but its id is unusable ({raw_id!r}): the record "
+                    "exists and could not be read — this is not an absence"
+                ),
+            )
         got = client.get(int(raw_id))
         if not got.ok:
             return _read_failure(got)
-        body = str((got.one() or {}).get("content") or "")
+        fetched = got.one()
+        if not fetched:
+            return MachineRead(
+                False,
+                status="unavailable",
+                count=len(items),
+                detail=(
+                    f"matched {identity!r} but the store answered id {raw_id} with no record: "
+                    "the record exists and could not be read — this is not an absence"
+                ),
+            )
+        body = str(fetched.get("content") or "")
     budget = max(200, min(int(max_chars or MAX_TOPIC_CHARS), KNOWLEDGE_BASE_HARD_CHARS))
     if len(body) > budget:
         body = body[: max(0, budget - 30)].rstrip() + "\n…[truncated]"
     return MachineRead(
         True,
-        status="ok" if body.strip() else "empty",
+        # The record was obtained; ``empty`` here would claim absence. An existing
+        # record with no body is a successful read of an empty record, and the
+        # version token carries which one — never a claim that nothing exists.
+        status="ok",
         count=1,
         version=_version_token(str(client.config.project or ""), 1, str(match.get("updated_at") or "")),
         text=body,

@@ -602,6 +602,10 @@ class EngramStubState:
         # A real store can accept a verdict and still return no relation id;
         # the policy has to be able to see that case.
         self.compare_returns_sync = True
+        # FIDELITY ADDITION: a SCOPED failure flag, so a test can fail exactly
+        # one route (``state.fail`` fails everything). Used by the knowledge_topic
+        # fallback test, where only the second read may fail.
+        self.fail_paths: set = set()
         # The real search shape carries the full observation; False models a
         # body-less (preview-style) response so both read paths stay covered.
         self.search_returns_content = False
@@ -662,6 +666,8 @@ def _engram_stub_handler(state):
             if state.fail:
                 return self._down()
             parsed = urlparse(self.path)
+            if parsed.path in state.fail_paths:
+                return self._down()
             if parsed.path == "/observations/recent":
                 body = state.observations
             elif parsed.path == "/project/current":
@@ -750,6 +756,8 @@ def _engram_stub_handler(state):
             if state.fail:
                 return self._down()
             parsed = urlparse(self.path)
+            if parsed.path in state.fail_paths:
+                return self._down()
             if parsed.path in ("/observations", "/observations/passive") and isinstance(body, dict):
                 if str(body.get("session_id") or "") not in state.sessions:
                     self.send_response(404)
