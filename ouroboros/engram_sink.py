@@ -109,13 +109,6 @@ SINK_KINDS = frozenset(
 # C18 — the memory / to-do boundary
 # --------------------------------------------------------------------------- #
 
-#: Stamped onto an identity refinement so it can never read back as an established
-#: trait (W1: "标为候选而非既成事实").
-IDENTITY_CANDIDATE_MARKER = (
-    "IDENTITY UPDATE CANDIDATE — a PROPOSAL, not an adopted trait. "
-    "Pending review; never treat this as an established fact about who I am."
-)
-
 #: Content whose *job* is to say what to do next. Refused by the sink.
 _TODO_LEAD = re.compile(
     r"^\s*(?:[-*•]\s*)?(?:"
@@ -451,16 +444,6 @@ class EngramSink:
         topic = str(payload.get("topic") or "").strip()
         action_type = str(payload.get("type") or "memory_action")
         title = _sanitize(payload.get("title") or topic or f"memory action ({action_type})")
-        if action_type == "identity_update_candidate":
-            # W1: an identity refinement is a PROPOSAL, and Engram is read back as
-            # memory — so an unmarked one would surface, on demand retrieval, as a
-            # trait the agent already has. The whole point of routing identity
-            # through a review candidate is that autonomous learning cannot drift
-            # the personality; storing it as a bare fact would defeat that at the
-            # one place a future reader actually looks.
-            content = f"{IDENTITY_CANDIDATE_MARKER}\n\n{content}"
-            if not str(payload.get("title") or "").strip():
-                title = _sanitize(f"Identity update candidate: {topic or content[:120]}")
         return self.emit(
             "memory_action",
             title=title,
@@ -689,6 +672,21 @@ class EngramSink:
                 kind=str(kind), identity=identity, title=title, reason="unknown_kind"
             )
             return SinkReceipt(kind, "", "rejected", reason="unknown_kind")
+        # Identity stays LOCAL-ONLY by owner decision (S1 reversed): the fixed
+        # manifesto has no search scenario and no consumer in Engram, so nothing
+        # addressed at the identity key may be stored — neither the retired
+        # `identity:manifest` mirror nor a reflection-nominated identity action,
+        # whose old candidate marker existed only to keep such a record honest.
+        addressed_identity = str(identity or "").strip()
+        if (
+            str(type or "") == "identity_update_candidate"
+            or addressed_identity == "identity"
+            or addressed_identity.startswith("identity:")
+        ):
+            self._disclose_filtered_once(
+                kind=str(kind), identity=identity, title=title, reason="identity_local_only"
+            )
+            return SinkReceipt(kind, "", "rejected", reason="identity_local_only")
         # C18: a work item is not a memory.
         if _looks_like_todo(content) or _looks_like_todo(title):
             self._disclose_filtered_once(

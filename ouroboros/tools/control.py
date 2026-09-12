@@ -2279,39 +2279,11 @@ def _update_identity(ctx: ToolContext, content: str) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
-    # The additive remote half (S1), AFTER the local write: the local file is the
-    # source of truth, so the mirror is a follow-up that can never gate it.
-    # Identity was the one memory with NO Engram copy at all — the local file was
-    # its only home, so a lost drive lost the self. The key is NAMESPACED (every
-    # other sink identity is prefixed) because a reflection-nominated
-    # memory_action with topic "identity" would otherwise upsert straight over the
-    # manifest. Never raises and never changes the tool's result (C6): a
-    # to-do-shaped identity is CORRECTLY refused by the C18 gate.
-    mirror = "not_attempted"
-    try:
-        from ouroboros.engram_sink import sink_for
-
-        receipt = sink_for(ctx).emit(
-            "memory_action",
-            title="Identity",
-            content=content,
-            identity="identity:manifest",
-            type="identity",
-            scope="global",
-            document=True,
-            fields={"task_id": str(getattr(ctx, "task_id", "") or "")},
-        )
-        # A refusal (C18) or a per-run cap returns BEFORE the spool append, so the
-        # outcome is recorded in the local journal: otherwise a dropped mirror is
-        # indistinguishable from a delivered one.
-        mirror = (
-            f"sent:{receipt.status}"
-            if receipt.accepted
-            else f"refused:{receipt.reason or receipt.status}"
-        )
-    except Exception as exc:
-        mirror = f"failed:{type(exc).__name__}"
-        log.debug("Identity Engram mirror failed", exc_info=True)
+    # Identity stays LOCAL-ONLY by owner decision (S1 reversed): the fixed
+    # manifesto has no search scenario, and no code path needs to find it in
+    # Engram — so the mirror, its namespaced key, and the receipt bookkeeping are
+    # retired together. The local file is the single source of truth; journaling
+    # and provenance below are unchanged, and nothing here reaches the network.
 
     append_jsonl(mem.identity_journal_path(), {
         "ts": utc_now_iso(),
@@ -2325,7 +2297,6 @@ def _update_identity(ctx: ToolContext, content: str) -> str:
         "new_content": content,
         "old_preview": old_content[:500],
         "new_preview": content[:500],
-        "engram_mirror": mirror,
     })
 
     result = f"OK: identity updated ({len(content)} chars)"
