@@ -735,7 +735,7 @@ def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
         (
             "state/usage_attempts.jsonl",
             USAGE_LEDGER_WARN_BYTES,
-            "Append-only and unbounded: ~1.2 KB per reservation row. The per-process "
+            "Append-only and unbounded. The per-process "
             "read cache (usage_ledger._LedgerRowsMemo) makes the steady-state in-lock "
             "read incremental, but the COLD path — a restart, cache-slot eviction "
             "(_LEDGER_READ_CACHE_MAX_ROOTS = 8), or any read failure — still parses and "

@@ -465,6 +465,11 @@ class TestHotStoreGrowthInvariant:
         assert "COLD path" in result
         assert "_LEDGER_READ_CACHE_MAX_ROOTS" in result
         assert "neither implemented" in result
+        assert "No compaction, rotation or trimming primitive exists" in result
+        # ...and no SIZE figure of its own: the line already prints the live size, and an
+        # unsupported per-row constant is the same class of claim we just removed.
+        assert "per reservation row" not in result
+        assert "KB per" not in result
 
     def test_the_growth_notes_promise_no_remediation_that_does_not_exist(self, tmp_path):
         """Honesty pin (owner report): the ledger note named a compaction primitive that
@@ -489,6 +494,10 @@ class TestHotStoreGrowthInvariant:
             "tracked as a GitHub issue",
             "ledger compaction is the remediation",
             "compaction is the remediation",
+            # A figure without its basis is the same class, one notch finer: the line
+            # already prints the measured size at render time.
+            "per reservation row",
+            "KB per",
         ):
             assert banned not in result, f"{banned!r} must not be rendered"
         # What IS rendered: the candidate remediations, named as unimplemented.
