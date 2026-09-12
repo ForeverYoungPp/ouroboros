@@ -718,3 +718,36 @@ def test_bgc_complete_observation_source_keeps_direct_identity_update_available(
         )
     finally:
         bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bg_injects_the_bounded_drive_state_projection(tmp_path):
+    """BG used to inject state/state.json WHOLE; it now shares the main chat's projection.
+
+    Measured live at 211,112 chars / 33 top-level keys against a 1,200,000-char cap, the
+    raw blob was one of the two sections that overflowed the background context. The
+    bounded projection is the one `context._drive_state_section` already renders for the
+    main chat: the keys an agent reasons about, the rest NAMED, the full file one read
+    away (P1: the omission is disclosed, never silent).
+    """
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        big = "z" * 300_000
+        (tmp_path / "state" / "state.json").write_text(json.dumps({
+            "session_id": "s-bg",
+            "current_branch": "dev/engram",
+            "huge_internal_cache": big,
+        }), encoding="utf-8")
+
+        context = bc._build_context()
+
+        assert "## Drive state" in context
+        assert '"session_id": "s-bg"' in context, "the projected key must be there"
+        assert big[:2_000] not in context, "the raw blob must NOT be injected"
+        assert "huge_internal_cache" in context, "an omitted key must still be NAMED"
+        assert "Omitted keys:" in context
+        assert "read_file(root='runtime_data', path='state/state.json')" in context
+
+        section = context.split("## Drive state", 1)[1].split("\n## ", 1)[0]
+        assert len(section) < 2_000, f"the injected section is {len(section)} chars"
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)

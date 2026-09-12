@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 from ouroboros.config import get_consciousness_model, resolve_effort
 from ouroboros.context import (
+    _drive_state_section,
     build_governance_sections,
     build_health_invariants,
     build_knowledge_sections,
@@ -1499,13 +1500,19 @@ class BackgroundConsciousness:
         if health_section:
             parts.append(health_section)
 
-        # Full drive state: no clip_text here.
+        # The SAME bounded projection the main chat renders (`_drive_state_section`):
+        # the keys an agent reasons about, the rest NAMED, the full file one read away.
+        # This site injected the whole file — measured 211,112 chars / 33 top-level keys
+        # against a 1,200,000-char cap — and that unbounded section is what overflowed
+        # the background context. The warn below stays, but it now flags the FILE (which
+        # still costs a full read+parse per cycle), not the size of what we inject.
         state_json = safe_read(env.drive_path("state/state.json"), fallback="{}")
         if len(state_json) > BG_STATE_JSON_WARN_CHARS:
             log.warning(
-                "consciousness: drive state JSON is large (%d chars)", len(state_json)
+                "consciousness: drive state FILE is large (%d chars; the injected section "
+                "is the bounded projection)", len(state_json),
             )
-        parts.append("## Drive state\n\n" + state_json)
+        parts.append(_drive_state_section(env))
 
         scheduled_tasks_digest: Dict[str, Any] = {}
         parts.append(build_runtime_section(
