@@ -25,6 +25,9 @@ import tempfile
 # Unique sentinel placed inside the ARCHITECTURE body so we can prove the full
 # body is inlined (max) vs replaced by a structure-only nav map (low).
 _ARCH_BODY_SENTINEL = "ARCH_BODY_SENTINEL_XYZ"
+# Unique sentinel for the DEVELOPMENT body, for the same reason: the handbook's
+# non-inlined form is a navigation map, which names the doc WITHOUT inlining it.
+_DEV_BODY_SENTINEL = "DEV_BODY_SENTINEL_XYZ"
 
 
 def _make_env_and_memory(tmpdir: pathlib.Path):
@@ -48,7 +51,10 @@ def _make_env_and_memory(tmpdir: pathlib.Path):
         + "## Section B\n\nbeta\n",
         encoding="utf-8",
     )
-    (repo_dir / "docs" / "DEVELOPMENT.md").write_text("# DEVELOPMENT.md — Dev Guide", encoding="utf-8")
+    (repo_dir / "docs" / "DEVELOPMENT.md").write_text(
+        f"# DEVELOPMENT.md — Dev Guide\n\n## Dev Section A\n\n{_DEV_BODY_SENTINEL}\n",
+        encoding="utf-8",
+    )
     (repo_dir / "README.md").write_text('[![Version 5.5.0](https://img.shields.io/badge/version-5.5.0-green.svg)](VERSION)', encoding="utf-8")
     (repo_dir / "docs" / "CHECKLISTS.md").write_text("## Repo Commit Checklist\n| # | item |", encoding="utf-8")
     (drive_root / "state" / "state.json").write_text('{"spent_usd": 0}', encoding="utf-8")
@@ -337,10 +343,11 @@ def test_named_owner_source_resolves_beyond_automatic_recent_generations():
     assert task["origin_message_text"] == text
 
 
-def test_max_mode_external_workspace_keeps_arch_full_but_drops_development():
+def test_max_mode_external_workspace_keeps_arch_full_and_maps_development():
     """D-ARCH: ARCHITECTURE is full-resident in max for EVERY class, including
     the external-surface class; DEVELOPMENT (the self-engineering handbook)
-    is the on-demand pointer there — external work targets OTHER codebases."""
+    arrives as a navigation MAP there — external work targets OTHER codebases, so
+    the handbook's body stays out while its structure stays visible and addressable."""
     from ouroboros.contracts.task_contract import build_task_contract
 
     external = _build_system_text(
@@ -354,9 +361,11 @@ def test_max_mode_external_workspace_keeps_arch_full_but_drops_development():
     )
     assert "## ARCHITECTURE.md" in external
     assert _ARCH_BODY_SENTINEL in external  # capability map stays resident
-    assert "navigation map" not in external
-    assert "## DEVELOPMENT.md" not in external  # handbook is the pointer
-    assert "DEVELOPMENT.md" in external  # ...but visibly named (P1)
+    assert "## ARCHITECTURE.md (navigation map)" not in external  # ARCH is FULL in max
+    assert _DEV_BODY_SENTINEL not in external  # handbook body is not inlined
+    assert "## DEVELOPMENT.md (navigation map)" in external  # ...but it IS indexed
+    assert "DEVELOPMENT.md" in external  # ...and visibly named (P1)
+    assert "knowledge:govdoc:development:1" in external  # entries name their records
 
     self_body = _build_system_text(
         {
@@ -387,7 +396,7 @@ def test_max_mode_external_workspace_keeps_arch_full_but_drops_development():
     assert contract_false["context_requires_self_body_docs"] is False
 
 
-def test_low_mode_external_workspace_gets_nav_arch_and_dev_pointer():
+def test_low_mode_external_workspace_gets_nav_arch_and_a_dev_map():
     external = _build_system_text(
         {
             "workspace_root": "/tmp/example-workspace",
@@ -399,7 +408,9 @@ def test_low_mode_external_workspace_gets_nav_arch_and_dev_pointer():
     )
     assert "navigation map" in external
     assert _ARCH_BODY_SENTINEL not in external
-    assert "## DEVELOPMENT.md" not in external
+    assert _DEV_BODY_SENTINEL not in external
+    assert "## DEVELOPMENT.md (navigation map)" in external
+    assert "knowledge:govdoc:development:1" in external
 
 
 def test_max_mode_evolution_task_keeps_arch_and_development_full():
@@ -435,8 +446,9 @@ def test_development_keys_on_the_repo_binding_not_project_membership():
         context_mode="max",
     )
     assert _ARCH_BODY_SENTINEL in folder_max  # ARCH full in max, always
-    assert "## DEVELOPMENT.md" not in folder_max
-    assert "DEVELOPMENT.md" in folder_max  # named in the on-demand pointer
+    assert _DEV_BODY_SENTINEL not in folder_max  # handbook body is not inlined
+    assert "## DEVELOPMENT.md (navigation map)" in folder_max  # indexed, not dropped
+    assert "DEVELOPMENT.md" in folder_max  # named in the map header
 
     # A direct-chat turn in a PROJECT ROOM binds no workspace: still Ouroboros's
     # own body, so it KEEPS the handbook. This is the case the project_id-keyed
@@ -485,7 +497,8 @@ def test_development_keys_on_the_repo_binding_not_project_membership():
     explicit_off = _build_system_text(
         {"project_id": "proj_sub", "context_requires_development": False}, context_mode="max"
     )
-    assert "## DEVELOPMENT.md" not in explicit_off
+    assert _DEV_BODY_SENTINEL not in explicit_off
+    assert "## DEVELOPMENT.md (navigation map)" in explicit_off
 
 
 def test_readme_and_checklists_are_on_demand_pointer_in_both_modes():
@@ -505,6 +518,8 @@ def test_low_mode_architecture_is_navigation_map_not_full_body():
     assert "  - Section A child — lines 7-12" in text
     assert "    - Section A detail — lines 9-12" in text
     assert _ARCH_BODY_SENTINEL not in text  # full body NOT inlined in low
+    # ...and every entry points at the Engram record holding its lines
+    assert "knowledge:govdoc:architecture:1" in text
 
 
 def test_low_mode_development_full_for_direct_chat_tasks_unless_explicitly_disabled():
@@ -518,8 +533,8 @@ def test_low_mode_development_full_for_direct_chat_tasks_unless_explicitly_disab
         {"_is_direct_chat": True, "context_requires_development": False},
         context_mode="low",
     )
-    assert "## DEVELOPMENT.md" not in pure_chat_text
-    assert "DEVELOPMENT.md" in pure_chat_text  # but named in the on-demand pointer
+    assert _DEV_BODY_SENTINEL not in pure_chat_text
+    assert "## DEVELOPMENT.md (navigation map)" in pure_chat_text  # named, indexed
 
 
 # Predicted route pressure no longer changes the document projection. The
