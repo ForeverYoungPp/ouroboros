@@ -360,11 +360,13 @@ def generate_doc_nav_map(
         out += [
             "",
             f"Ingested: this doc is also mirrored into Engram, one record per chunk of "
-            f"≤ {GOVDOC_CHUNK_CHARS} chars — `{title} § <section>` is addressed as "
-            f"`knowledge:govdoc:{engram_slug}:<n>`, and each entry below names the one "
-            f"holding its lines. Fetch it with the `engram` tool (op=\"search\" on the "
-            f"title, then op=\"read\" the observation_id): one read returns a whole "
-            f"chunk untruncated and names its successor. `{rel_path}` stays canonical.",
+            f"≤ {GOVDOC_CHUNK_CHARS} chars — each entry below names the record holding "
+            f"its lines, as `knowledge:govdoc:{engram_slug}:<n>`. Fetch one with the "
+            f"`engram` tool: op=\"search\" the entry's LINE RANGE or its identity — the "
+            f"heading words are a weak handle, because the server caps /search at 20 "
+            f"hits and a phrase shared with every other record can rank below them — "
+            f"then op=\"read\" the observation_id: one read returns a whole chunk "
+            f"untruncated and names its successor. `{rel_path}` stays canonical.",
         ]
     out.append("")
     if not headings:

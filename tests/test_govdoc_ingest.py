@@ -287,6 +287,34 @@ def test_a_linked_map_names_the_chunk_holding_each_entry():
         assert chunk.start <= heading_line <= chunk.end
 
 
+def test_the_linked_map_sends_a_reader_to_the_sharp_search_handles():
+    """The retrieval clause must name the handles that actually work.
+
+    Measured against the live store: the heading phrase missed the top 20 under
+    EVERY match_mode (chunk 123's full title ranked 17th) because the server caps
+    /search at 20 hits and the leading title tokens are shared by all 312 records,
+    while its LINE RANGE and its `knowledge:govdoc:<doc>:<n>` identity both ranked
+    FIRST. A clause that sends a reader to the title is therefore a wrong
+    instruction, not a style choice — and a map with no clause at all is worse.
+    """
+    text, _lines = _doc("architecture")
+    rendered = cl.generate_doc_nav_map(
+        text, title="ARCHITECTURE.md", rel_path="docs/ARCHITECTURE.md", engram_slug="architecture"
+    )
+    hint = next(ln for ln in rendered.splitlines() if ln.startswith("Ingested:"))
+
+    # the sharp handles are named, and the tool call shape is spelled out
+    assert 'op="search"' in hint and 'op="read"' in hint
+    assert "LINE RANGE" in hint and "identity" in hint
+    assert "knowledge:govdoc:architecture:<n>" in hint
+    # the weak handle is explicitly disclaimed, with the reason
+    assert "weak handle" in hint and "/search at 20" in hint
+    # the canonical file is still named as authoritative
+    assert "docs/ARCHITECTURE.md` stays canonical" in hint
+    # ...and the instruction no longer tells a reader to search the title
+    assert 'search" on the title' not in hint
+
+
 def test_a_map_without_a_slug_is_unchanged_apart_from_the_linkage():
     """The four existing callers pass no slug and must see byte-identical output."""
     text = "## A\n\nbody A\n\n### A child\n\nchild body\n"
