@@ -1207,11 +1207,66 @@ def test_automatic_recent_context_materializes_a_bounded_row_suffix(tmp_path):
 
     assert [entry["text"] for entry in entries] == ["row-19999"]
     assert coverage["generations"][0]["rows"] <= 100
+    # Policy split: a bounded PREFIX is disclosed rather than unknown, but this
+    # fixture also omits tail rows (20,000 rows against the scan bound), and a
+    # tail-rows omission is still a real unknown.
     assert coverage["omitted_matching_rows_unknown"] is True
     assert any(
         gap["kind"] in {"generation_prefix_unscanned", "generation_tail_rows_unscanned"}
         for gap in coverage["gaps"]
     )
+
+
+def test_bounded_prefix_discloses_without_inflating_the_unknown_flag(tmp_path):
+    """The split: a prefix alone is disclosed; tail rows or a rotated generation stay unknown."""
+    from ouroboros.memory import Memory
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True)
+    (logs / "chat.jsonl").write_text(
+        "".join(
+            json.dumps({"direction": "in", "text": "x" * 30_000}) + "\n"
+            for _ in range(22)
+        ),
+        encoding="utf-8",
+    )
+
+    _, prefix_only = Memory(tmp_path).read_unconsolidated_chat({}, 40)
+
+    assert all(
+        gap["kind"] == "generation_prefix_unscanned" for gap in prefix_only["gaps"]
+    )
+    assert prefix_only["omitted_matching_rows_unknown"] is False
+
+    (logs / "chat.jsonl").write_text(
+        "".join(
+            json.dumps({"direction": "in", "text": "y" * 200}) + "\n"
+            for _ in range(6000)
+        ),
+        encoding="utf-8",
+    )
+
+    _, with_tail_rows = Memory(tmp_path).read_unconsolidated_chat({}, 40)
+
+    assert any(
+        gap["kind"] == "generation_tail_rows_unscanned" for gap in with_tail_rows["gaps"]
+    )
+    assert with_tail_rows["omitted_matching_rows_unknown"] is True
+
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    for index in range(4):
+        (archive / f"chat_20260821T{index:02d}0000.jsonl").write_text(
+            json.dumps({"direction": "in", "text": f"archive-{index}"}) + "\n",
+            encoding="utf-8",
+        )
+
+    _, rotated = Memory(tmp_path).read_unconsolidated_chat({}, 40)
+
+    assert any(
+        gap["kind"] == "unscanned_unconsolidated_generations" for gap in rotated["gaps"]
+    )
+    assert rotated["omitted_matching_rows_unknown"] is True
 
 
 def test_chat_history_surfaces_malformed_gap_even_when_search_matches_nothing(tmp_path):

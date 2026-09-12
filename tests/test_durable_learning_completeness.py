@@ -360,6 +360,17 @@ def _write_schedules(tmp_path, count):
     )
 
 
+def _write_chat(tmp_path, *, rows, text_bytes=8):
+    """One chat generation; ``text_bytes`` pushes it past the automatic scan tail."""
+    (tmp_path / "logs" / "chat.jsonl").write_text(
+        "".join(
+            json.dumps({"chat_id": idx + 1, "direction": "in", "text": "x" * text_bytes}) + "\n"
+            for idx in range(rows)
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_bgc_direct_identity_update_requires_complete_named_omission(tmp_path):
     bc = _bg_fixture(tmp_path)
     try:
@@ -500,6 +511,40 @@ def test_bgc_complete_recent_chat_keeps_direct_identity_update_available(tmp_pat
         result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
         assert result.startswith("OK: identity updated")
         assert content in (tmp_path / "memory" / "identity_journal.jsonl").read_text(encoding="utf-8")
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_bounded_chat_prefix_no_longer_blocks_direct_identity_update(tmp_path):
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        # Policy: the lane's bounded tail read is the canonical chat reader, so a
+        # prefix past `_AUTOMATIC_CHAT_TAIL_BYTES` is disclosed, not a veto.
+        _write_chat(tmp_path, rows=22, text_bytes=30_000)
+        bc._build_context()
+        assert "recent-chat" not in bc._identity_unresolved_sources
+        content = "I keep direct identity authority on the owner's bounded-chat policy."
+        result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
+        assert "IDENTITY_UPDATE_ABSTAINED" not in result
+        assert result.startswith("OK: identity updated")
+        assert content in (tmp_path / "memory" / "identity_journal.jsonl").read_text(encoding="utf-8")
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_row_count_gap_still_blocks_direct_identity_update(tmp_path):
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        # The same oversized generation, but with rows past the scan bound: a
+        # row-count gap is not a bounded prefix, so it still blocks, fail-closed.
+        _write_chat(tmp_path, rows=6000, text_bytes=200)
+        bc._build_context()
+        assert "recent-chat" in bc._identity_unresolved_sources
+        content = "I must not rewrite identity while tail rows of the chat remain unscanned."
+        result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
+        assert "IDENTITY_UPDATE_ABSTAINED" in result
+        assert "recent-chat" in result
+        assert not (tmp_path / "memory" / "identity_journal.jsonl").exists()
     finally:
         bc._tool_executor.shutdown(wait=False, cancel_futures=True)
 

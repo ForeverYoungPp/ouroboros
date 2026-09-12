@@ -883,7 +883,15 @@ class Memory:
             "matched_rows": len(suffix),
             "shown_rows": len(shown),
             "omitted_matching_rows": max(0, len(suffix) - len(shown)),
-            "omitted_matching_rows_unknown": bool(omitted_generations or bounded_prefix),
+            # Policy: the lane's bounded tail read is the canonical reader for the
+            # chat source — a prefix omission is DISCLOSED via its coverage gap
+            # entry, not unknown; the owner's ruling: identity may be updated from
+            # the bounded chat view.  A `generation_tail_rows_unscanned` omission,
+            # every other non-prefix gap kind, and an omitted generation are still
+            # real unknowns and still veto.
+            "omitted_matching_rows_unknown": bool(omitted_generations) or any(
+                gap.get("kind") != "generation_prefix_unscanned" for gap in gaps
+            ),
             "gaps": gaps,
             "reader": "chat_history(count, offset, search)",
         }

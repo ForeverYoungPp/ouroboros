@@ -1520,8 +1520,15 @@ class BackgroundConsciousness:
         parts.extend(build_recent_sections(
             memory, env, task_id="", chat_coverage_out=recent_chat_coverage,
         ))
+        # Policy: the lane's bounded tail read is the canonical reader for the
+        # chat source.  Its prefix omission is DISCLOSED via the coverage gap entry,
+        # not a completeness veto — the owner's ruling: identity may be updated from
+        # the bounded chat view.  Every other gap kind still blocks, fail-closed.
         if (
-            recent_chat_coverage.get("gaps")
+            any(
+                g.get("kind") != "generation_prefix_unscanned"
+                for g in (recent_chat_coverage.get("gaps") or ())
+            )
             or int(recent_chat_coverage.get("omitted_matching_rows") or 0) > 0
             or bool(recent_chat_coverage.get("omitted_matching_rows_unknown"))
         ):
