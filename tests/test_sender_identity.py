@@ -57,6 +57,40 @@ def test_send_with_budget_persists_sender_identity(tmp_path, monkeypatch):
     assert rows[0]["sender_identity"] == "background"
 
 
+def test_send_with_budget_live_frame_carries_sender_identity(tmp_path, monkeypatch):
+    """BOTH send branches hand the identity to the live frame, not just the row.
+
+    Regression (v6.114.19): ``_send_markdown`` declared ``sender_identity`` from
+    v6.114.3 on but never forwarded it, so every markdown frame — which is what
+    ``send_user_message`` sends, for the BG lane and the foreground alike —
+    reached the SPA without the field while its durable row kept it. The SPA
+    keys a row on its identity, so the live bubble ("Ouroboros") never deduped
+    against the same durable row replayed from /api/chat/history
+    ("🧠 Background"): one message, two bubbles, until a refresh rebuilt the
+    list from history alone. The durable-row assertion above cannot see this —
+    only the frame kwargs can.
+    """
+    import supervisor.message_bus as mb
+
+    monkeypatch.setattr(mb, "DATA_DIR", tmp_path)
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+
+    class _FakeBridge:
+        def __init__(self):
+            self.sent = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.sent.append((chat_id, text, kwargs))
+            return True, "ok"
+
+    fake = _FakeBridge()
+    monkeypatch.setattr(mb, "_BRIDGE", fake)
+    # Markdown branch (_send_markdown) and the plain branch must agree.
+    mb.send_with_budget(1, "bg reply", fmt="markdown", sender_identity="background")
+    mb.send_with_budget(1, "agent reply", sender_identity="agent")
+    assert [frame[2].get("sender_identity") for frame in fake.sent] == ["background", "agent"]
+
+
 # ---------------------------------------------------------------------------
 # Projection layer: history passes the field through (never infers)
 # ---------------------------------------------------------------------------
