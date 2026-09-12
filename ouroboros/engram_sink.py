@@ -34,7 +34,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 log = logging.getLogger(__name__)
 
@@ -68,14 +68,14 @@ KNOWLEDGE_DOC_CHARS = 16_000
 #: reconciliation reads it back through the same constant so the two cannot drift.
 _DIALOGUE_SCOPE = "global"
 
-#: How many records the boot carry-over reads back to decide what is already
-#: mirrored. The recency endpoint returns FULL observation bodies, so asking for
-#: Engram's 500 ceiling would pull the store's whole allowance on every start for
-#: a comparison that only ever needs the dialogue records — and the local file it
-#: is compared against holds ~10-15 blocks plus eras. A bound too small to see an
-#: existing record is harmless: that block is pushed again and the server upserts
-#: it, which costs an update and never a duplicate.
-_DIALOGUE_MIRROR_READ_LIMIT = 100
+#: How many search hits one per-block mirror check may see. The check is an exact
+#: identity lookup per block, NOT a recency window: ``GET /observations/recent``
+#: ignores ``scope`` server-side, so a windowed check reads the newest rows of the
+#: whole project — which the govdoc backfill now owns. The dialogue rows, created
+#: before every one of those records, could never appear in that window again, so
+#: every boot re-upserted all of them. The local file bounds the request count
+#: (~10-15 blocks plus eras); this bound only trims one lookup's ranking.
+_DIALOGUE_MIRROR_SEARCH_LIMIT = 8
 
 SPOOL_REL = pathlib.Path("state") / "engram_spool.jsonl"
 #: When a spool with NOTHING pending exceeds this, it is rewritten empty.
@@ -1367,25 +1367,45 @@ def _read_local_dialogue_blocks(drive_root: Any) -> List[Dict[str, Any]]:
     return [block for block in payload if isinstance(block, dict)]
 
 
-def _mirrored_dialogue_keys(client: Any, *, limit: int) -> Optional[set]:
-    """Normalised identities of the dialogue records Engram already holds.
+def _mirrored_dialogue_keys(client: Any, *, keys: Sequence[str], limit: int) -> Optional[set]:
+    """Normalised identities of the GIVEN dialogue blocks that Engram already holds.
 
-    ``None`` means "could not find out". The caller must then do NOTHING rather
-    than treat the store as empty — that would re-push the whole backlog on every
-    boot of an unreachable or refusing daemon.
+    Per-key lookups, never a recency window. ``GET /observations/recent`` ignores
+    ``scope`` server-side, so it answers with the newest rows of the PROJECT: the
+    govdoc backfill owns that window outright, and the dialogue rows — created
+    before every one of those records — can never enter it again. A windowed check
+    therefore concluded "nothing is mirrored" on every boot and re-upserted the
+    whole set, which is visible as ``updated_at`` churn while ``created_at`` stays
+    frozen.
+
+    One bounded search per block costs a request per block (the local file itself
+    is the bound — ~8 rows, eras included) and needs no new state. ``None`` still
+    means "could not find out": the caller must then do NOTHING, so an unreachable
+    or refusing daemon never pushes blind, while a record the store genuinely lost
+    is found missing and re-mirrored.
     """
-    read = client.recent(scope=_DIALOGUE_SCOPE, limit=limit)
-    if not read.ok:
-        return None
-    return {
-        _normalized_topic_key(row.get("topic_key"))
-        for row in read.items()
-        if str(row.get("type") or "") == "dialogue_summary" and row.get("topic_key")
-    }
+    mirrored: set = set()
+    for key in keys:
+        wanted = _normalized_topic_key(key)
+        if not wanted:
+            continue
+        try:
+            read = client.search(query=str(key), type="dialogue_summary", limit=limit)
+        except Exception:
+            return None
+        if not read.ok:
+            return None
+        if any(
+            _normalized_topic_key(row.get("topic_key")) == wanted
+            for row in read.items()
+            if str(row.get("type") or "") == "dialogue_summary" and row.get("topic_key")
+        ):
+            mirrored.add(wanted)
+    return mirrored
 
 
 def reconcile_local_dialogue_blocks(
-    env: Any, *, limit: int = _DIALOGUE_MIRROR_READ_LIMIT
+    env: Any, *, limit: int = _DIALOGUE_MIRROR_SEARCH_LIMIT
 ) -> int:
     """Mirror the local dialogue blocks Engram does not hold yet. Returns how many.
 
@@ -1395,26 +1415,26 @@ def reconcile_local_dialogue_blocks(
     is the boot half of that; the consolidator's own mirror covers everything
     distilled from now on.
 
-    Only the MISSING intervals are pushed, so a settled mirror normally costs one
-    bounded read and no writes. NOT a guarantee, and the distinction matters:
-    Engram's recency endpoint returns full observation bodies and the ``global``
-    scope is shared with other records (the scratchpad mirrors into it too), so a
-    busy drive can push a dialogue record out of the read's window. That block is
-    then pushed again — an UPDATE keyed on the same identity, never a duplicate and
-    never a loss, but a write, and one that bumps the record's ``updated_at``. The
-    local file being compared against is itself bounded (~10-15 blocks plus eras).
+    Only the MISSING intervals are pushed, so a settled mirror costs one exact
+    lookup per locally held block and no writes. The lookup is per identity, so it
+    does not depend on how busy the project's recency window is: the earlier
+    windowed check (``recent``) silently ignored ``scope`` server-side and was
+    permanently blinded once the govdoc backfill owned the newest rows, which made
+    every boot re-upsert the same blocks. The local file being compared against is
+    itself bounded (~10-15 blocks plus eras).
 
     Three properties make it safe to run on every boot:
 
     * **one-way** — the local file stays the durable record; nothing is written
       back to it and nothing is ever deleted from Engram;
-    * **never guesses** — an unresolvable project, an unreachable daemon or an
-      unreadable local store all mean "do nothing now", never "push blind". A
-      blind push would also be a write storm: with Engram down, every block would
-      land in the spool and stay there;
-    * **worst case is a redundant upsert** — a block that is already mirrored, or
-      that the read's bound hid, is pushed again, and the server keys on the same
-      normalised identity, so that updates one record instead of duplicating it.
+    * **never guesses** — an unresolvable project, an unreachable daemon, a failing
+      lookup or an unreadable local store all mean "do nothing now", never "push
+      blind". A blind push would also be a write storm: with Engram down, every
+      block would land in the spool and stay there;
+    * **worst case is a redundant upsert** — a block that is already mirrored is
+      pushed again, and the server keys on the same normalised identity, so that
+      updates one record instead of duplicating it. A record the store genuinely
+      lost is found missing and re-mirrored.
     """
     try:
         sink = sink_for(env)
@@ -1425,7 +1445,11 @@ def reconcile_local_dialogue_blocks(
             return 0
         if not sink.client.health().ok:
             return 0
-        mirrored = _mirrored_dialogue_keys(sink.client, limit=limit)
+        mirrored = _mirrored_dialogue_keys(
+            sink.client,
+            keys=[_dialogue_block_identity(block) for block in blocks],
+            limit=limit,
+        )
         if mirrored is None:
             return 0
         missing = [
@@ -1452,10 +1476,28 @@ def push_local_dialogue_blocks(target: Any, blocks: Any) -> int:
     replacing `## Dialogue History` with an Engram injection: without it, the
     distilled history that already exists locally would simply stop being
     reachable when the seam changes.
+
+    ONE emit per normalised identity, last occurrence winning. Two local entries
+    can address the SAME store record — a re-distilled interval, or long
+    ``range``/``gap_id`` values colliding under ``_normalized_topic_key``'s
+    120-char cap — and emitting both sends two upserts of one record in a single
+    batch, of which only the last can survive. An entry whose identity cannot be
+    resolved at all is left alone rather than merged with another.
     """
+    ordered: List[Any] = []
+    seen: Dict[str, int] = {}
+    for block in blocks or ():
+        identity = _normalized_topic_key(_dialogue_block_identity(block))
+        if not identity:
+            ordered.append(block)
+        elif identity in seen:
+            ordered[seen[identity]] = block
+        else:
+            seen[identity] = len(ordered)
+            ordered.append(block)
     count = 0
     sink = sink_for(target)
-    for block in blocks or ():
+    for block in ordered:
         receipt = sink.emit_dialogue_summary(_as_mapping(block))
         if receipt.accepted:
             count += 1

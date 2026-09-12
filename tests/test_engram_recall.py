@@ -528,3 +528,111 @@ def test_an_unresolved_scope_never_renders_as_a_service_outage(engram_stub, monk
     assert "refused" in section, section
     assert "could not be reached" not in section, section
     reset_sinks()
+
+
+# --------------------------------------------------------------------------- #
+# The boot carry-over: per-identity lookups, never the recency window
+# --------------------------------------------------------------------------- #
+
+
+def _write_local_blocks(env, blocks) -> None:
+    (env.drive_root / "memory" / "dialogue_blocks.json").write_text(
+        json.dumps(blocks), encoding="utf-8",
+    )
+
+
+def test_reconcile_looks_each_block_up_by_identity(engram_stub):
+    """The mirror check must not read the recency window.
+
+    ``GET /observations/recent`` ignores ``scope`` server-side and answers with the
+    newest rows of the PROJECT, so once the govdoc backfill owned that window the
+    eight dialogue rows — older than all of them — could never appear in it again
+    and every boot re-upserted the whole set. Each block is now looked up by its own
+    identity, which no other record can displace.
+    """
+    from ouroboros.engram_sink import reconcile_local_dialogue_blocks
+
+    state, env = engram_stub
+    reset_sinks()
+    blocks = [_block("2026-09-05", "era body"), _block("2026-09-06", "second body")]
+    _seed(state, blocks)
+    _write_local_blocks(env, blocks)
+    state.requests.clear()
+
+    assert reconcile_local_dialogue_blocks(env) == 0
+    paths = [request["path"] for request in state.requests]
+    assert "/search" in paths, "every block must be looked up by identity"
+    assert "/observations/recent" not in paths, (
+        "the flooded recency window must not be what decides the mirror"
+    )
+    reset_sinks()
+
+
+def test_reconcile_pushes_only_the_blocks_the_store_lacks(engram_stub):
+    from ouroboros.engram_sink import reconcile_local_dialogue_blocks
+
+    state, env = engram_stub
+    reset_sinks()
+    both = [_block("2026-09-05", "era body"), _block("2026-09-07", "later body")]
+    _seed(state, both[:1])
+    _write_local_blocks(env, both)
+
+    assert reconcile_local_dialogue_blocks(env) == 1
+    stored = [r for r in state.knowledge.values() if r.get("type") == "dialogue_summary"]
+    assert {r["topic_key"] for r in stored} == {
+        f"dialogue:{b['type']}:{b['range']}" for b in both
+    }
+    reset_sinks()
+
+
+def test_reconcile_does_nothing_when_a_lookup_fails(engram_stub):
+    """``None`` still means "could not find out" — never "the store is empty"."""
+    from ouroboros.engram_sink import reconcile_local_dialogue_blocks
+
+    state, env = engram_stub
+    reset_sinks()
+    blocks = [_block("2026-09-05", "era body")]
+    _write_local_blocks(env, blocks)
+    state.fail_paths.add("/search")
+
+    assert reconcile_local_dialogue_blocks(env) == 0
+    assert not [r for r in state.knowledge.values() if r.get("type") == "dialogue_summary"]
+    reset_sinks()
+
+
+def test_reconcile_does_nothing_when_the_store_is_down(engram_stub):
+    from ouroboros.engram_sink import reconcile_local_dialogue_blocks
+
+    state, env = engram_stub
+    reset_sinks()
+    blocks = [_block("2026-09-05", "era body")]
+    _write_local_blocks(env, blocks)
+    state.fail = True
+
+    assert reconcile_local_dialogue_blocks(env) == 0
+    reset_sinks()
+
+
+def test_push_sends_one_emit_per_normalised_identity(engram_stub):
+    """Three local entries that normalise to ONE key are one record, not three POSTs.
+
+    A re-distilled interval, or long ``range``/``gap_id`` values colliding under
+    ``_normalized_topic_key``'s 120-char cap, used to emit that many upserts of the
+    same record in a single batch — and since the store keys on that identity, only
+    the last could ever survive. The LAST occurrence still wins, as before.
+    """
+    from ouroboros.engram_sink import push_local_dialogue_blocks
+
+    state, env = engram_stub
+    reset_sinks()
+    blocks = [_block("2026-09-05", "first pass"), _block("2026-09-05", "second pass"),
+              _block("2026-09-05", "third pass")]
+    state.requests.clear()
+
+    assert push_local_dialogue_blocks(env, blocks) == 1
+    posts = [r for r in state.requests if r["path"] in ("/observations", "/observations/passive")]
+    assert len(posts) == 1, f"one identity was emitted {len(posts)} times"
+    stored = [r for r in state.knowledge.values() if r.get("type") == "dialogue_summary"]
+    assert len(stored) == 1
+    assert "third pass" in str(stored[0]["content"])
+    reset_sinks()
