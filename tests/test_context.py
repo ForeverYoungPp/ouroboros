@@ -460,7 +460,39 @@ class TestHotStoreGrowthInvariant:
         result = build_health_invariants(env)
         assert "HOT STORE GROWTH" in result
         assert "state/usage_attempts.jsonl" in result
+        # The note states the real cost: the COLD path, not "every reservation".
         assert "monetary lock" in result
+        assert "COLD path" in result
+        assert "_LEDGER_READ_CACHE_MAX_ROOTS" in result
+        assert "neither implemented" in result
+
+    def test_the_growth_notes_promise_no_remediation_that_does_not_exist(self, tmp_path):
+        """Honesty pin (owner report): the ledger note named a compaction primitive that
+        exists nowhere in the usage surfaces, and both notes carried a "tracked as a
+        GitHub issue" pointer that is dead on this fork (issues are disabled). A
+        remediation we cannot perform must not be rendered as the answer."""
+        from ouroboros.context_budget import (
+            EVENTS_LOG_WARN_BYTES,
+            TOOLS_LOG_WARN_BYTES,
+            USAGE_LEDGER_WARN_BYTES,
+        )
+
+        env = _make_health_env(tmp_path)
+        _grow_ledger(tmp_path / "state" / "usage_attempts.jsonl", USAGE_LEDGER_WARN_BYTES + 1)
+        _grow_file(tmp_path / "logs" / "events.jsonl", EVENTS_LOG_WARN_BYTES + 1)
+        _grow_file(tmp_path / "logs" / "tools.jsonl", TOOLS_LOG_WARN_BYTES + 1)
+
+        result = build_health_invariants(env)
+
+        assert result.count("HOT STORE GROWTH") >= 3, "all three stores are over threshold"
+        for banned in (
+            "tracked as a GitHub issue",
+            "ledger compaction is the remediation",
+            "compaction is the remediation",
+        ):
+            assert banned not in result, f"{banned!r} must not be rendered"
+        # What IS rendered: the candidate remediations, named as unimplemented.
+        assert "candidate remediation" in result
 
     def test_events_and_tools_thresholds_are_generous_but_live(self, tmp_path):
         from ouroboros.context_budget import EVENTS_LOG_WARN_BYTES, TOOLS_LOG_WARN_BYTES
