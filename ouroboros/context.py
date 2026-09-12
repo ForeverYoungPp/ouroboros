@@ -998,6 +998,13 @@ _RECALL_MATCHED_HEADING = "### Matched this query\n"
 _RECALL_NEWEST_HEADING = "### Newest remembered (continuity)\n"
 _RECALL_KNOWLEDGE_HEADING = "### Related knowledge (titles only)\n"
 
+#: Budget for the resident store-side knowledge index (``_knowledge_index_section``).
+#: Sized BELOW the 6,569-char local index this seam replaced, so reviving the tier-0
+#: element is a net reduction instead of a new cost: at the current topic set the whole
+#: index is ~4.8 K chars, so the budget binds only as the store grows, and when it does
+#: the omitted topics are NAMED with the path to the full index (never a silent clip).
+KNOWLEDGE_INDEX_BUDGET_CHARS = 4_000
+
 _SECTION_BUDGETS = {"scratchpad": SCRATCHPAD_SECTION_BUDGET_CHARS, "identity": 80_000, "registry": 30_000, "world": 16_000, "dialogue_recall": DIALOGUE_RECALL_BUDGET_CHARS + KNOWLEDGE_RECALL_BUDGET_CHARS}
 
 
@@ -1669,6 +1676,62 @@ def _drive_state_section(env: Any) -> str:
             + "\n\n" + note)
 
 
+def _knowledge_index_section(env: Any) -> str:
+    """Bounded, WRITE-THROUGH index of the topics the store mirrors. MAIN CHAT ONLY.
+
+    BIBLE.md:116-118 names the "durable knowledge index" among the tier-0 elements that
+    must "stay always-loaded in full", and the main chat is the one assembly that stopped
+    carrying it (``include_derived_knowledge=False``, which dropped the retired LOCAL
+    archive index). This is its replacement: the store-side index, which can name
+    post-switch topics the archive never could.
+
+    Deliberately NOT injected into the background lane: BG already renders the full
+    archive index plus the Pattern Register through the un-gated builder (21,814 chars as
+    measured), so a titles-only list there would duplicate most of its rows with less
+    information per row. BG keeps the archive; this section closes the main-chat gap.
+
+    Shape follows ``_drive_state_section``: a bounded projection plus a NAMED-omission
+    disclosure and an on-demand pointer, never a silent clip (BIBLE P1).
+    """
+    try:
+        from ouroboros.tools.knowledge import knowledge_index_line, knowledge_index_rows
+
+        rows = knowledge_index_rows(env)
+    except Exception:
+        log.debug("knowledge index section unavailable", exc_info=True)
+        return ""
+    if not rows:
+        return ""
+
+    lines = [knowledge_index_line(row) for row in rows]
+    header = "## Knowledge index (titles only)\n\n"
+    base_note = (
+        f"Write-through index of the {len(rows)} topic(s) mirrored to Engram since the local "
+        "write was retired (titles only). It names what exists — it is not proof a record is "
+        "still present, so read one with `knowledge_read(topic=…)`. "
+        "The pre-switch archive stays at `memory/knowledge/index-full.md`."
+    )
+
+    def _render(shown: int) -> str:
+        note = base_note
+        if shown < len(lines):
+            note += (
+                f" {len(lines) - shown} older topic(s) are not listed here (budget "
+                f"{KNOWLEDGE_INDEX_BUDGET_CHARS} chars); the full index is "
+                "`read_file(root='runtime_data', path='memory/knowledge_index.jsonl')`."
+            )
+        body = "\n".join(lines[:shown])
+        return f"{header}{body}\n\n{note}" if shown else f"{header.rstrip()}\n\n{note}"
+
+    # The BUDGET COVERS THE SECTION, not just its rows: the disclosure has to fit inside
+    # the same bound, or the section would exceed what it claims to respect. Drop rows
+    # from the OLDEST end until it fits, and name what was dropped.
+    shown = len(lines)
+    while shown > 0 and len(_render(shown)) > KNOWLEDGE_INDEX_BUDGET_CHARS:
+        shown -= 1
+    return _render(shown)
+
+
 def _capture_context_core(
     env: Any,
     memory: Memory,
@@ -1823,6 +1886,15 @@ def _capture_context_core(
     installed_skills = _build_installed_skills_section(context_env)
     if installed_skills:
         dynamic_parts.append(installed_skills)
+    # The tier-0 knowledge index (BIBLE.md:116-118), MAIN CHAT ONLY: the write-through
+    # store index replaces the derived-learning input this assembly deliberately dropped
+    # (`include_derived_knowledge=False` at the `build_knowledge_sections` call above),
+    # and is what makes a topic nameable at all. It is not gated by that flag — the flag
+    # governs the retired LOCAL archive index, this is its replacement. BG keeps the
+    # un-gated archive index it already renders through its own builder call.
+    knowledge_index = _knowledge_index_section(context_env)
+    if knowledge_index:
+        dynamic_parts.append(knowledge_index)
     dynamic_parts.extend([
         _drive_state_section(context_env),
         build_runtime_section(env, task, ctx=ctx),

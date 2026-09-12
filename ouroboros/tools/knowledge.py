@@ -1,17 +1,17 @@
 """Persistent topic-based knowledge files with an auto-maintained index."""
 
-import json
 import hashlib
+import json
 import logging
 import os
 import re
 from contextlib import contextmanager
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
-from ouroboros.tools.registry import ToolEntry, ToolContext
-from ouroboros.utils import utc_now_iso
 from ouroboros.platform_layer import file_lock_exclusive, file_unlock
+from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +36,25 @@ BACKLOG_TOPIC = "improvement-backlog"
 #: pre-switch local file that Engram has since superseded.
 LOCAL_ARCHIVE_TOPICS = frozenset({"patterns", "index-full", BACKLOG_TOPIC})
 
+#: The STORE-SIDE title index, maintained by the write path. It is the answer to a
+#: question nothing else on this drive could answer: WHICH topics exist in Engram.
+#: `index-full.md` is the retired canonical local index — frozen at the pre-switch
+#: archive and unable to name anything written since — and Engram itself has no
+#: type-enumerating route (`/observations/recent` takes no type filter, `/stats` has
+#: no breakdown, `/search` needs a non-empty query). So the index is built where the
+#: facts already are: the write path holds the topic, the identity and the outcome
+#: at the moment it mirrors the record.
+INDEX_LEDGER = "knowledge_index.jsonl"
+
+#: Bound on DISTINCT indexed topics (not on writes). Past it the least-recently
+#: written topic is evicted and the eviction is written as its own audit row, so a
+#: drop is recoverable and never silent (BIBLE P1 / no silent truncation).
+KNOWLEDGE_INDEX_TOPIC_CAP = 400
+
+#: Status for a row reconstructed from the provenance log by the seed: the write is
+#: recorded there, but that file does not carry the transport outcome.
+INDEX_STATUS_SEEDED = "seeded"
+
 #: S2 stop switch. The CANONICAL ``memory/knowledge/<topic>.md`` + ``index-full.md``
 #: write is RETIRED: its readers (main chat, consciousness, deep self-review) now
 #: read Engram, so leaving the local write on would keep feeding a store nobody
@@ -57,6 +76,220 @@ def _local_write_live(ctx: ToolContext) -> bool:
     guarded contract (see ``tests/test_project_facts.py``), not a free win.
     """
     return bool(str(getattr(ctx, "project_id", "") or "").strip()) or CANONICAL_LOCAL_WRITE
+
+
+def _valid_topic_or_empty(topic: Any) -> str:
+    """``topic`` when it is a usable topic name, else ``""`` (never raises)."""
+    try:
+        return _sanitize_topic(str(topic or ""))
+    except ValueError:
+        return ""
+
+
+# --------------------------------------------------------------------------- #
+# The store-side title index (see INDEX_LEDGER).
+# --------------------------------------------------------------------------- #
+
+
+def _history_path(ctx: ToolContext) -> Path:
+    """The provenance log this index is seeded from — same dir, same expression."""
+    return _knowledge_dir(ctx).parent / "knowledge_history.jsonl"
+
+
+def _index_ledger_path(ctx: ToolContext) -> Path:
+    return _knowledge_dir(ctx).parent / INDEX_LEDGER
+
+
+def _index_rows_from_history(ctx: ToolContext) -> List[dict]:
+    """Newest row per topic, reconstructed from the provenance log. Never raises.
+
+    This is what makes the index useful on a drive that predates it: the log already
+    records every topic written since the switch (including the backlog's
+    topic-only rows — see ``_record_backlog_history``), so a reader never needs a
+    window read or a server change to name them. Rows the log cannot describe
+    (patterns/index-full, which are local-only by ruling) are left to the archive.
+    """
+    path = _history_path(ctx)
+    if not path.exists():
+        return []
+    rows: dict[str, dict] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            topic = _valid_topic_or_empty(row.get("topic"))
+            if not topic or topic in LOCAL_ARCHIVE_TOPICS:
+                continue
+            ts = str(row.get("ts") or "")
+            previous = rows.get(topic)
+            if previous is not None and str(previous.get("ts") or "") > ts:
+                continue
+            rows[topic] = {
+                "ts": ts,
+                "topic": topic,
+                "identity": f"knowledge:{topic}",
+                "scope": "",
+                "mode": str(row.get("mode") or ""),
+                "status": INDEX_STATUS_SEEDED,
+            }
+    except Exception:
+        log.debug("knowledge index: provenance log unreadable", exc_info=True)
+        return []
+    return list(rows.values())
+
+
+def _index_rows_from_ledger(path: Path) -> List[dict]:
+    """Newest row per topic from the ledger itself. Eviction rows are audit only."""
+    rows: dict[str, dict] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if str(row.get("event") or ""):
+                continue  # an audit row (an eviction), not a topic row
+            topic = _valid_topic_or_empty(row.get("topic"))
+            if not topic:
+                continue
+            ts = str(row.get("ts") or "")
+            previous = rows.get(topic)
+            if previous is not None and str(previous.get("ts") or "") > ts:
+                continue
+            rows[topic] = {
+                "ts": ts,
+                "topic": topic,
+                "identity": str(row.get("identity") or f"knowledge:{topic}"),
+                "scope": str(row.get("scope") or ""),
+                "mode": str(row.get("mode") or ""),
+                "status": str(row.get("status") or ""),
+            }
+    except Exception:
+        log.debug("knowledge index: ledger unreadable", exc_info=True)
+        return []
+    return list(rows.values())
+
+
+def knowledge_index_rows(ctx: ToolContext) -> List[dict]:
+    """Newest row per topic, newest first — the ONE reader both surfaces use.
+
+    Ledger first (it also carries the transport outcome); the provenance log stands
+    in until the first write has seeded the ledger, so the index works on a drive
+    that has never written since this feature landed. Reads only: no file is created
+    here, which is what lets ``knowledge_list`` stay a POLICY_SKIP read.
+    """
+    path = _index_ledger_path(ctx)
+    rows = (
+        _index_rows_from_ledger(path)
+        if path.exists()
+        else _index_rows_from_history(ctx)
+    )
+    rows = [r for r in rows if str(r.get("topic") or "") not in LOCAL_ARCHIVE_TOPICS]
+    rows.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("topic") or "")), reverse=True)
+    return rows
+
+
+def knowledge_index_line(row: dict) -> str:
+    """One rendered index entry. Shared so the listing and the prompt cannot drift."""
+    line = f"- {row.get('topic')} — updated {str(row.get('ts') or '')[:10]}"
+    identity = str(row.get("identity") or "")
+    if identity:
+        line += f" · {identity}"
+    status = str(row.get("status") or "")
+    if status == "spooled":
+        line += " (queued, not yet in Engram)"
+    elif status in ("refused", "failed", "capped", "no_receipt"):
+        line += f" ({status or 'not in Engram'})"
+    return line
+
+
+def _index_write_rows(path: Path, rows: List[dict]) -> bool:
+    """Atomically replace the ledger with ``rows`` (tmp + rename). Never raises."""
+    try:
+        from ouroboros.utils import replace_atomic
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        tmp.write_text(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8"
+        )
+        replace_atomic(tmp, path)
+        return True
+    except Exception:
+        log.debug("knowledge index: rewrite failed", exc_info=True)
+        return False
+
+
+def _index_seed(ctx: ToolContext) -> None:
+    """Materialise the ledger from the provenance log, ONCE, before the first append.
+
+    Idempotent (a ledger that exists is never re-seeded) and atomic (a partial seed
+    would hide every topic it did not reach from later readers — the same trap the
+    local index seeds against, see ``_update_index_entry``). Never raises.
+    """
+    path = _index_ledger_path(ctx)
+    if path.exists():
+        return
+    rows = _index_rows_from_history(ctx)
+    if not rows:
+        return
+    _index_write_rows(path, rows)
+
+
+def _index_record(
+    ctx: ToolContext, *, topic: str, scope: str, mode: str, status: str
+) -> None:
+    """Append this write to the ledger (write-through), then keep it bounded.
+
+    Best-effort by design: the memory is already durable (the provenance row and the
+    sink), so an index failure must degrade the LISTING, never the write (C6).
+    """
+    path = _index_ledger_path(ctx)
+    row = {
+        "ts": utc_now_iso(),
+        "topic": topic,
+        "identity": f"knowledge:{topic}",
+        "scope": scope,
+        "mode": mode,
+        "status": status,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        log.debug("knowledge index: append failed", exc_info=True)
+        return
+
+    # Bound maintenance, on the write path only (reads never rewrite anything):
+    # collapse superseded rows, then enforce the topic cap by evicting the
+    # least-recently-written topics WITH an audit row each.
+    try:
+        current = _index_rows_from_ledger(path)
+        keep, evicted = current, []
+        if len(current) > KNOWLEDGE_INDEX_TOPIC_CAP:
+            ordered = sorted(
+                current,
+                key=lambda r: (str(r.get("ts") or ""), str(r.get("topic") or "")),
+                reverse=True,
+            )
+            keep = ordered[:KNOWLEDGE_INDEX_TOPIC_CAP]
+            evicted = ordered[KNOWLEDGE_INDEX_TOPIC_CAP:]
+        if evicted or len(current) > len({r["topic"] for r in current}):
+            audit = [
+                {"ts": row["ts"], "event": "evict", "topic": r["topic"]}
+                for r in evicted
+            ]
+            _index_write_rows(path, keep + audit)
+    except Exception:
+        log.debug("knowledge index: maintenance skipped", exc_info=True)
+
 
 
 def _backlog_root(ctx: ToolContext) -> Path:
@@ -403,6 +636,12 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
 
     scope = _engram_scope(ctx)
     live_local = _local_write_live(ctx)
+    # Seed the store-side index from the provenance log ONCE, before this write's own
+    # row is appended: this is the moment the log is complete for everything written
+    # before this feature landed, and seeding then means the very first post-landing
+    # write makes every earlier topic visible (the same "seed a FULL index, never a
+    # one-topic seed" rule the local index follows in ``_update_index_entry``).
+    _index_seed(ctx)
     base_content, base_source = _write_base(ctx, sanitized_topic, path, scope, live_local=live_local)
 
     # An append must build on what is ACTUALLY there. When the live store could
@@ -525,6 +764,12 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
     # is what keeps the pessimistic branches honest rather than lossy.
     status = str(getattr(receipt, "status", "") or "")
     reason = str(getattr(receipt, "reason", "") or "")
+    # WRITE-THROUGH INDEX, after the outcome is known: this is the one place that can
+    # name the topic AND say whether the record actually reached Engram. A status of
+    # "" (the sink was never reached: no receipt) is recorded as such rather than
+    # dropped — a topic missing from the index is indistinguishable from a topic that
+    # was never learned, which is the misreading this index exists to prevent.
+    _index_record(ctx, topic=sanitized_topic, scope=scope, mode=mode, status=status or "no_receipt")
     if deferred and status in {"sent", "spooled"}:
         return (
             f"✅ Knowledge '{sanitized_topic}' append ({mode}) DEFERRED: Engram is unreachable, so "
@@ -653,36 +898,83 @@ def _engram_list_note(ctx: ToolContext) -> str:
     )
 
 
+_INDEX_ENTRY_RE = re.compile(r"^- \*\*([^:*]+)\*\*")
+
+
+def _index_entry_topic(line: str) -> str:
+    """The topic an ``index-full.md`` entry line names, else ``""`` (other lines)."""
+    match = _INDEX_ENTRY_RE.match(line.strip())
+    return _valid_topic_or_empty(match.group(1)) if match else ""
+
+
 def _knowledge_list(ctx: ToolContext) -> str:
-    """List knowledge topics with summaries."""
+    """List knowledge topics: the STORE index first, then the local archive half.
+
+    Two surfaces, because there are two homes. The store-side index names every topic
+    the write path has mirrored to Engram — the ONLY place a post-switch topic is
+    nameable, since the local archive froze at the switch and Engram has no
+    type-enumerating route (see ``INDEX_LEDGER``). The local ``index-full.md`` is the
+    pre-switch archive and stays, under its own scope note, because three topics live
+    there by ruling (``LOCAL_ARCHIVE_TOPICS``). The archive half is FILTERED to the
+    topics the store half does not already name, so the answer is one line per topic
+    rather than the same name twice — and a topic whose only local file predates the
+    provenance log still appears (that is what the filter keeps).
+    """
     kdir = _knowledge_dir(ctx)
     index_path = kdir / INDEX_FILE
+    store_rows = knowledge_index_rows(ctx)
+    known = {str(row.get("topic") or "") for row in store_rows}
+
+    parts: List[str] = []
+    if store_rows:
+        header = (
+            f"ℹ️ STORE INDEX (Engram) — {len(store_rows)} topic(s) written since the local "
+            "write was retired; read one with `knowledge_read(topic=…)`. Durable memory "
+            "lives in Engram, so a name absent here was never written to the store.\n\n"
+        )
+        if len(store_rows) >= KNOWLEDGE_INDEX_TOPIC_CAP:
+            header += (
+                f"(at the {KNOWLEDGE_INDEX_TOPIC_CAP}-topic cap: older topics were evicted; "
+                f"each eviction is audited in `{INDEX_LEDGER}`.)\n\n"
+            )
+        parts.append(header + "\n".join(knowledge_index_line(r) for r in store_rows) + "\n")
 
     if index_path.exists():
-        return _LOCAL_INDEX_SCOPE_NOTE + index_path.read_text(encoding="utf-8")
+        kept = [
+            line
+            for line in index_path.read_text(encoding="utf-8").splitlines()
+            if _index_entry_topic(line) not in known
+        ]
+        archive = "\n".join(kept).strip()
+        if archive:
+            parts.append(_LOCAL_INDEX_SCOPE_NOTE + archive + "\n")
+    else:
+        # No index: render the archive listing IN MEMORY from the topic files.
+        # knowledge_list is registered read-only (safety.py POLICY_SKIP) and granted
+        # to children that may not write cognitive memory — the old on-miss index
+        # rebuild here created the knowledge dir, a lock sidecar and index-full.md on
+        # a pure read. Index maintenance stays on the write path (_update_index_entry).
+        entries = []
+        for f in sorted(kdir.glob("*.md")) if kdir.exists() else []:
+            if f.name == INDEX_FILE or f.stem in known:
+                continue
+            try:
+                topic = _sanitize_topic(f.stem)
+            except ValueError:
+                continue
+            try:
+                summary = _extract_summary(f.read_text(encoding="utf-8").strip())
+                entries.append(f"- **{topic}**: {summary}")
+            except Exception:
+                log.debug(f"Failed to read knowledge file for listing: {topic}", exc_info=True)
+                entries.append(f"- **{topic}**: (unreadable)")
+        if entries:
+            parts.append(
+                _LOCAL_INDEX_SCOPE_NOTE + "# Knowledge Base Index\n\n" + "\n".join(entries) + "\n"
+            )
 
-    # No index: render the listing IN MEMORY from the topic files. knowledge_list
-    # is registered read-only (safety.py POLICY_SKIP) and granted to children that
-    # may not write cognitive memory — the old on-miss index rebuild here created
-    # the knowledge dir, a lock sidecar and index-full.md on a pure read. Index
-    # maintenance stays on the write path (_update_index_entry).
-    entries = []
-    for f in sorted(kdir.glob("*.md")) if kdir.exists() else []:
-        if f.name == INDEX_FILE:
-            continue
-        try:
-            topic = _sanitize_topic(f.stem)
-        except ValueError:
-            continue
-        try:
-            summary = _extract_summary(f.read_text(encoding="utf-8").strip())
-            entries.append(f"- **{topic}**: {summary}")
-        except Exception:
-            log.debug(f"Failed to read knowledge file for listing: {topic}", exc_info=True)
-            entries.append(f"- **{topic}**: (unreadable)")
-
-    if entries:
-        return _LOCAL_INDEX_SCOPE_NOTE + "# Knowledge Base Index\n\n" + "\n".join(entries) + "\n"
+    if parts:
+        return "\n".join(parts)
     return "Knowledge base is empty. Use knowledge_write to add topics." + _engram_list_note(ctx)
 
 
@@ -732,7 +1024,7 @@ def get_tools() -> List[ToolEntry]:
         }, _knowledge_write),
         ToolEntry("knowledge_list", {
             "name": "knowledge_list",
-            "description": "List all topics in the knowledge base with summaries. On a project-scoped task, lists only the current project's facts store.",
+            "description": "List knowledge topics. Names the STORE index first — every topic the write path has mirrored to Engram, i.e. what durable knowledge exists — then the local pre-switch archive for the few topics that live on disk by ruling. On a project-scoped task, lists that project's store.",
             "parameters": {
                 "type": "object",
                 "properties": {},
